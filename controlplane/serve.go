@@ -1509,12 +1509,15 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// with the handler itself rendering the real
 	// authz.ActionViewCapabilities verdict (everyone including viewer,
 	// §13.3 row 1). capabilities/gatekeeperInstalled are the SAME two
-	// values built once, above, before this router -- capabilities is
-	// re-checked per request by the handler's own reg.State call, never
-	// cached here.
+	// values built once, above, before this router, closed over by
+	// capabilityResponseBuilder (modules.go, next to where capabilities
+	// itself is built) -- re-checked per request by that closure's own
+	// reg.State call, never cached here. httpapi itself never sees
+	// capabilities or license.Capability at all; see
+	// httpapi/capabilities.go's own doc comment for why.
 	router.Route("/api/capabilities", func(r chi.Router) {
 		r.Use(auth.Middleware(userSessionStore, userStore))
-		r.Get("/", httpapi.GetCapabilities(capabilities, gatekeeperInstalled))
+		r.Get("/", httpapi.GetCapabilities(capabilityResponseBuilder(capabilities, gatekeeperInstalled)))
 	})
 
 	// /api/me ("web UI: sign-in", §12.2 item 7/§13.1): the
@@ -2228,7 +2231,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		Capabilities: capabilities,
 		RequireAuth:  requireAuth,
 		RequireCapability: func(c extension.Capability) func(http.Handler) http.Handler {
-			return httpapi.RequireCapability(capabilities, c)
+			return httpapi.RequireCapability(func() bool { return capabilities.Enabled(c) })
 		},
 		PublicBaseURL: cfg.PublicBaseURL,
 		Audit: func(ctx context.Context, actorUserID string, action, targetType, targetID string, detail map[string]any) error {

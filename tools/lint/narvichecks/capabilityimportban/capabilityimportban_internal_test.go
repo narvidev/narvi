@@ -16,10 +16,7 @@ import "testing"
 func TestSkipFile_DecidesOnPackagePathNotCheckoutLocation(t *testing.T) {
 	t.Parallel()
 
-	const (
-		shadow  = "github.com/narvidev/narvi/internal/app/shadowscm"
-		httpapi = "github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
-	)
+	const shadow = "github.com/narvidev/narvi/internal/app/shadowscm"
 
 	tests := []struct {
 		name     string
@@ -58,24 +55,6 @@ func TestSkipFile_DecidesOnPackagePathNotCheckoutLocation(t *testing.T) {
 			want:     true,
 		},
 		{
-			name:     "an allowed httpapi file",
-			pkgPath:  httpapi,
-			filename: "/repo/internal/adapters/inbound/httpapi/requirecapability.go",
-			want:     true,
-		},
-		{
-			name:     "another file in the same allowed package is NOT allowed",
-			pkgPath:  httpapi,
-			filename: "/repo/internal/adapters/inbound/httpapi/scmcredentials.go",
-			want:     false,
-		},
-		{
-			name:     "an allowed base name in the WRONG package is not allowed",
-			pkgPath:  shadow,
-			filename: "/repo/internal/app/shadowscm/requirecapability.go",
-			want:     false,
-		},
-		{
 			name:     "tests are exempt wherever they live",
 			pkgPath:  shadow,
 			filename: "/repo/internal/app/shadowscm/synthetic_test.go",
@@ -88,6 +67,58 @@ func TestSkipFile_DecidesOnPackagePathNotCheckoutLocation(t *testing.T) {
 			t.Parallel()
 			if got := skipFile(tt.pkgPath, tt.filename); got != tt.want {
 				t.Errorf("skipFile(%q, %q) = %v, want %v", tt.pkgPath, tt.filename, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSkipFile_NoFileLevelExemption pins the fix for a bridge an exit
+// audit of this guarantee found: this analyzer's allow-list is
+// package-level only, with no per-file
+// entry inside an otherwise-banned package. There used to be one --
+// internal/adapters/inbound/httpapi/capabilities.go and
+// requirecapability.go were each individually exempted inside httpapi, a
+// package this analyzer otherwise bans like any other. That was
+// dodgeable: Go imports are per file, but identifiers are per package, so
+// a package-level helper either exempted file declared was callable,
+// with no import of its own, from any OTHER file in httpapi --
+// scmcredentials.go, a real §30 suppression path, in the audit's own
+// reproduction. Every row below must come back false: no file in httpapi
+// is exempt any more, including the two that used to be, and a file's
+// own base name never matters to skipFile at all now -- only its
+// package.
+func TestSkipFile_NoFileLevelExemption(t *testing.T) {
+	t.Parallel()
+
+	const httpapi = "github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
+
+	tests := []struct {
+		name     string
+		filename string
+	}{
+		{
+			name:     "the former capabilities.go exemption",
+			filename: "/repo/internal/adapters/inbound/httpapi/capabilities.go",
+		},
+		{
+			name:     "the former requirecapability.go exemption",
+			filename: "/repo/internal/adapters/inbound/httpapi/requirecapability.go",
+		},
+		{
+			name:     "scmcredentials.go, the file the audit actually bridged through",
+			filename: "/repo/internal/adapters/inbound/httpapi/scmcredentials.go",
+		},
+		{
+			name:     "a file merely NAMED like a former exemption, in a different package, was already covered -- this pins the converse: the real package, any file",
+			filename: "/repo/internal/adapters/inbound/httpapi/helpers.go",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := skipFile(httpapi, tt.filename); got {
+				t.Errorf("skipFile(%q, %q) = true, want false -- the allow-list is package-level only now", httpapi, tt.filename)
 			}
 		})
 	}

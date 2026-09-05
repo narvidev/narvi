@@ -24,6 +24,7 @@ import (
 	migratepg "github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 
+	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/extension"
 	"github.com/narvidev/narvi/internal/app/capability"
 	"github.com/narvidev/narvi/internal/app/ports"
@@ -179,6 +180,63 @@ func buildCapabilityRegistry(logger *slog.Logger, cfg *platform.Config, modules 
 	reg := capability.New(installed, grant, parseErr, time.Now, cfg.Timeouts.LicenseNotBeforeSkew)
 	logLicenseBoot(logger, modules, reg, grant, parseErr, time.Now(), cfg.Timeouts.LicenseNotBeforeSkew)
 	return reg
+}
+
+// buildCapabilitiesResponse assembles GET /api/capabilities' own response
+// body (technical plan §34, docs/design/boundaries-design.md, section 4):
+// one row per license.All entry, in that package's own fixed order, via
+// reg.State -- see that method's own doc comment for why this is
+// diagnostics only, never a second decision point. reg may be nil (the
+// public binary's own "no module composed" shape) -- Registry.State/
+// ExpiresAt are both nil-safe, so this needs no nil check of its own.
+//
+// gatekeeperInstalled is threaded in separately from reg, deliberately
+// NOT derived from reg itself: "any module is composed" and "capability
+// c's own installed bit" are two different facts that only happen to
+// coincide when every composed module declares at least one capability
+// (reg's own installed set is the UNION of every module's declared
+// Capabilities, capability.New's own doc comment), so a module composed
+// with zero declared capabilities (nothing in validateModules forbids
+// one) would leave every row below reading "not_installed" while
+// gatekeeperInstalled is still, correctly, true.
+//
+// This is the loop that used to live in httpapi/capabilities.go, back
+// when that file held its own file-level exemption from
+// tools/lint/narvichecks/capabilityimportban's own import ban. It lives
+// here now, next to buildCapabilityRegistry, because controlplane is the
+// one place that legitimately imports both internal/app/capability and
+// internal/domain/license -- see capabilityResponseBuilder's own doc
+// comment for how httpapi.GetCapabilities calls this without importing
+// either itself.
+func buildCapabilitiesResponse(reg *capability.Registry, gatekeeperInstalled bool) restdtos.CapabilitiesResponse {
+	rows := make([]restdtos.CapabilityStatus, 0, len(license.All))
+	for _, c := range license.All {
+		rows = append(rows, restdtos.CapabilityStatus{
+			Name:  restdtos.CapabilityStatusName(c),
+			State: restdtos.CapabilityState(reg.State(c)),
+		})
+	}
+	return restdtos.CapabilitiesResponse{
+		GatekeeperInstalled: gatekeeperInstalled,
+		LicenseExpiresAt:    reg.ExpiresAt(),
+		Capabilities:        rows,
+	}
+}
+
+// capabilityResponseBuilder returns the func httpapi.GetCapabilities
+// calls once per request -- see buildCapabilitiesResponse's own doc
+// comment for what it builds. Kept here, alongside buildCapabilitiesResponse
+// itself, specifically so Build's own route wiring (serve.go) never needs
+// to import restdtos, capability, or license just to construct this
+// closure: reg and gatekeeperInstalled are captured here, where both
+// banned imports this file already needs are legitimate, and Build gets
+// back a plain func() restdtos.CapabilitiesResponse -- a shape httpapi
+// itself can accept without naming any of the three packages
+// tools/lint/narvichecks/capabilityimportban bans.
+func capabilityResponseBuilder(reg *capability.Registry, gatekeeperInstalled bool) func() restdtos.CapabilitiesResponse {
+	return func() restdtos.CapabilitiesResponse {
+		return buildCapabilitiesResponse(reg, gatekeeperInstalled)
+	}
 }
 
 // logLicenseBoot writes docs/design/boundaries-design.md, section 1.3's

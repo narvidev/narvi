@@ -51,7 +51,8 @@ func TestRequireCapability_503WhenDisabled(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var reached bool
-			mw := httpapi.RequireCapability(tt.reg, license.CapabilityOrganizationGovernance)
+			reg := tt.reg
+			mw := httpapi.RequireCapability(func() bool { return reg.Enabled(license.CapabilityOrganizationGovernance) })
 			handler := mw(okHandler(&reached))
 
 			rec := httptest.NewRecorder()
@@ -77,7 +78,7 @@ func TestRequireCapability_PassesWhenEnabled(t *testing.T) {
 		nil, func() time.Time { return now }, 0)
 
 	var reached bool
-	mw := httpapi.RequireCapability(reg, license.CapabilityOrganizationGovernance)
+	mw := httpapi.RequireCapability(func() bool { return reg.Enabled(license.CapabilityOrganizationGovernance) })
 	handler := mw(okHandler(&reached))
 
 	rec := httptest.NewRecorder()
@@ -107,7 +108,7 @@ func TestRequireCapability_ReEvaluatesPerRequest(t *testing.T) {
 		func() time.Time { return current }, 0)
 
 	var reached bool
-	mw := httpapi.RequireCapability(reg, license.CapabilityOrganizationGovernance)
+	mw := httpapi.RequireCapability(func() bool { return reg.Enabled(license.CapabilityOrganizationGovernance) })
 	handler := mw(okHandler(&reached))
 
 	rec := httptest.NewRecorder()
