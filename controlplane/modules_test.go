@@ -78,7 +78,7 @@ func TestValidateModules(t *testing.T) {
 		{name: "one well-formed module, no capabilities", modules: []extension.Module{{Name: "acme"}}, wantErr: false},
 		{
 			name:    "one well-formed module, a known capability",
-			modules: []extension.Module{{Name: "acme", Capabilities: []extension.Capability{extension.CapabilityGovernance}}},
+			modules: []extension.Module{{Name: "acme", Capabilities: []extension.Capability{extension.CapabilityOrganizationGovernance}}},
 			wantErr: false,
 		},
 		{
@@ -129,7 +129,7 @@ func TestValidateModules(t *testing.T) {
 			name: "supplies a ranker while declaring only an unrelated capability",
 			modules: []extension.Module{{
 				Name:            "acme",
-				Capabilities:    []extension.Capability{extension.CapabilityGovernance},
+				Capabilities:    []extension.Capability{extension.CapabilityOrganizationGovernance},
 				KnowledgeRanker: fakeRanker{name: "acme-ranker"},
 			}},
 			wantErr: true,
@@ -173,12 +173,12 @@ func TestValidateModules_JoinsEveryProblem(t *testing.T) {
 // union of every composed module's own declared Capabilities.
 func TestUnionCapabilities(t *testing.T) {
 	modules := []extension.Module{
-		{Name: "a", Capabilities: []extension.Capability{extension.CapabilityGovernance}},
-		{Name: "b", Capabilities: []extension.Capability{extension.CapabilityGovernance, extension.CapabilityKnowledgeRetrieval}},
+		{Name: "a", Capabilities: []extension.Capability{extension.CapabilityOrganizationGovernance}},
+		{Name: "b", Capabilities: []extension.Capability{extension.CapabilityOrganizationGovernance, extension.CapabilityKnowledgeRetrieval}},
 	}
 
 	got := unionCapabilities(modules)
-	want := map[license.Capability]bool{license.CapabilityGovernance: true, license.CapabilityKnowledgeRetrieval: true}
+	want := map[license.Capability]bool{license.CapabilityOrganizationGovernance: true, license.CapabilityKnowledgeRetrieval: true}
 
 	if len(got) != len(want) {
 		t.Fatalf("unionCapabilities() = %v, want exactly %d entries matching %v", got, len(want), want)
@@ -277,7 +277,7 @@ func TestBuild_WithoutModules_NeverConsultsCapabilities(t *testing.T) {
 	stub := &countingCapabilities{}
 	now := time.Now()
 	grant := &license.Grant{
-		Capabilities: []license.Capability{license.CapabilityGovernance, license.CapabilityKnowledgeRetrieval},
+		Capabilities: []license.Capability{license.CapabilityOrganizationGovernance, license.CapabilityKnowledgeRetrieval},
 		NotBefore:    now.Add(-time.Hour),
 		ExpiresAt:    now.Add(time.Hour),
 	}
@@ -299,7 +299,7 @@ func TestLogLicenseBoot_WithModules_ConsultsCapabilities(t *testing.T) {
 	stub := &countingCapabilities{}
 	now := time.Now()
 	grant := &license.Grant{
-		Capabilities: []license.Capability{license.CapabilityGovernance},
+		Capabilities: []license.Capability{license.CapabilityOrganizationGovernance},
 		NotBefore:    now.Add(-time.Hour),
 		ExpiresAt:    now.Add(time.Hour),
 	}

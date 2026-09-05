@@ -11,11 +11,11 @@ import (
 
 // State names WHY a capability answers the way it does -- Enabled
 // collapses all of this to a bare bool; State exists purely for
-// diagnostics (boot logging, and the future GET /api/capabilities read
-// model), never as a second way to decide behavior. The values mirror
-// docs/design/boundaries-design.md, sections 1.2 and 4.2's own wire enum
-// exactly -- changing one is a breaking contract change once that wire
-// enum ships.
+// diagnostics (boot logging, and GET /api/capabilities), never as a
+// second way to decide behavior. The values mirror docs/design/
+// boundaries-design.md, sections 1.2 and 4.2's own wire enum exactly --
+// changing one is now a breaking contract change: that wire enum
+// (CapabilityState, contracts/rest/v1/dtos.schema.json) has shipped.
 type State string
 
 // The six states a capability can be in -- see this type's own doc
@@ -133,8 +133,8 @@ func (r *Registry) State(c license.Capability) State {
 
 // ExpiresAt returns the configured grant's own expiry, or nil if there is
 // no grant (no key, an unparseable key, or a nil *Registry) -- for
-// display only (the future GET /api/capabilities read model's own
-// licenseExpiresAt field), never consulted by [Registry.Enabled] itself
+// display only (GET /api/capabilities' own licenseExpiresAt field), never
+// consulted by [Registry.Enabled] itself
 // (which re-derives validity from [license.Grant.ValidAt] on every call
 // instead). Returns a pointer to a COPY of the grant's own ExpiresAt, so
 // a caller mutating the returned value cannot reach this Registry's own

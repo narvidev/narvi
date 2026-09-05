@@ -976,6 +976,19 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// buildCapabilityRegistry's own doc comment.
 	capabilities := buildCapabilityRegistry(slog.Default(), cfg, modules)
 
+	// gatekeeperInstalled (docs/design/boundaries-design.md, section 4.2)
+	// is GET /api/capabilities' own "whether ANY module is composed,
+	// never which one" fact -- computed here, once, straight from modules
+	// rather than derived from capabilities above: the registry's own
+	// installed set is the UNION of every composed module's declared
+	// Capabilities (buildCapabilityRegistry/unionCapabilities), which is
+	// a DIFFERENT fact from "at least one module was composed at all"
+	// whenever a module composes with zero declared capabilities --
+	// nothing in validateModules forbids that. Keeping the two facts
+	// separate here means GetCapabilities never has to guess one from
+	// the other.
+	gatekeeperInstalled := len(modules) > 0
+
 	// knowledgeRanker (docs/design/boundaries-design.md, section 2) is
 	// selected here, alongside capabilities: the public default
 	// (knowledge.RecencyRanker{}) unless a composed module supplies its
@@ -1484,6 +1497,24 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	router.Route("/api/integrations", func(r chi.Router) {
 		r.Use(auth.Middleware(userSessionStore, userStore))
 		r.Get("/", httpapi.GetIntegrations(cfg, outboxStore, webhookDeliveryStore))
+	})
+
+	// /api/capabilities (technical plan §34, docs/design/
+	// boundaries-design.md, section 4): the extension & licensing
+	// boundaries surface's own derived read model -- one row per
+	// internal/domain/license.All entry, never the licence key or the
+	// grant's own subject (httpapi/capabilities.go's own doc comment).
+	// Deployment-wide like /api/integrations and /api/me above (no
+	// {owner}/{repo} in the path), gated behind auth.Middleware only,
+	// with the handler itself rendering the real
+	// authz.ActionViewCapabilities verdict (everyone including viewer,
+	// §13.3 row 1). capabilities/gatekeeperInstalled are the SAME two
+	// values built once, above, before this router -- capabilities is
+	// re-checked per request by the handler's own reg.State call, never
+	// cached here.
+	router.Route("/api/capabilities", func(r chi.Router) {
+		r.Use(auth.Middleware(userSessionStore, userStore))
+		r.Get("/", httpapi.GetCapabilities(capabilities, gatekeeperInstalled))
 	})
 
 	// /api/me ("web UI: sign-in", §12.2 item 7/§13.1): the

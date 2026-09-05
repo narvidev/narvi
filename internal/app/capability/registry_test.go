@@ -16,13 +16,14 @@ type window struct{ nbf, exp time.Time }
 // buildScenarios returns the eight Registry states docs/design/
 // boundaries-design.md, section 1.6's own TestEnabled_Matrix names, keyed by
 // name, all sharing nowFunc/skew=0. Every scenario installs (or omits)
-// and grants (or omits) ONLY [license.CapabilityGovernance] -- never
+// and grants (or omits) ONLY [license.CapabilityOrganizationGovernance] --
+// never [license.CapabilityCompliance] or
 // [license.CapabilityKnowledgeRetrieval] -- so across the full 8-scenario
-// x 2-capability matrix exactly one cell (scenario "both", capability
-// governance) is ever expected to be enabled.
+// x 3-capability matrix exactly one cell (scenario "both", capability
+// organization governance) is ever expected to be enabled.
 func buildScenarios(now time.Time) map[string]*capability.Registry {
 	nowFunc := func() time.Time { return now }
-	governance := license.CapabilityGovernance
+	governance := license.CapabilityOrganizationGovernance
 
 	valid := window{now.Add(-time.Hour), now.Add(time.Hour)}
 	expired := window{now.Add(-2 * time.Hour), now.Add(-time.Hour)}
@@ -74,7 +75,7 @@ func TestEnabled_Matrix(t *testing.T) {
 	for name, reg := range scenarios {
 		for _, c := range license.All {
 			got := reg.Enabled(c)
-			want := name == "both" && c == license.CapabilityGovernance
+			want := name == "both" && c == license.CapabilityOrganizationGovernance
 			if got != want {
 				t.Errorf("scenario %q, capability %q: Enabled() = %v, want %v", name, c, got, want)
 			}
@@ -119,12 +120,14 @@ func TestState_MatchesEnabled(t *testing.T) {
 			}
 
 			// wantState above is keyed by scenario alone: every scenario
-			// was built naming ONLY CapabilityGovernance, so
-			// CapabilityKnowledgeRetrieval is "not installed" in every
-			// one of them (never granted, never installed) except where
-			// the scenario itself has nothing installed at all.
+			// was built naming ONLY CapabilityOrganizationGovernance, so
+			// every OTHER capability (CapabilityCompliance,
+			// CapabilityKnowledgeRetrieval -- and any future addition to
+			// license.All) is "not installed" in every one of them (never
+			// granted, never installed) except where the scenario itself
+			// has nothing installed at all.
 			want := wantState[name]
-			if c == license.CapabilityKnowledgeRetrieval {
+			if c != license.CapabilityOrganizationGovernance {
 				want = capability.StateNotInstalled
 			}
 			if state != want {
@@ -141,7 +144,7 @@ func TestState_MatchesEnabled(t *testing.T) {
 func TestEnabled_ExpiryMidProcess(t *testing.T) {
 	current := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	nowFunc := func() time.Time { return current }
-	governance := license.CapabilityGovernance
+	governance := license.CapabilityOrganizationGovernance
 
 	grant := &license.Grant{
 		Capabilities: []license.Capability{governance},

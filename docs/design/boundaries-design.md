@@ -78,11 +78,12 @@ package license
 type Capability string
 
 const (
-    CapabilityGovernance         Capability = "governance"
-    CapabilityKnowledgeRetrieval Capability = "knowledge-retrieval"
+    CapabilityOrganizationGovernance Capability = "organization_governance"
+    CapabilityCompliance             Capability = "compliance"
+    CapabilityKnowledgeRetrieval     Capability = "knowledge_retrieval"
 )
 
-var All = []Capability{CapabilityGovernance, CapabilityKnowledgeRetrieval}
+var All = []Capability{CapabilityOrganizationGovernance, CapabilityCompliance, CapabilityKnowledgeRetrieval}
 
 // Product is the audience every key must carry.
 const Product = "narvi-gatekeeper"
@@ -862,7 +863,7 @@ pinning the public commit the bundle is built from.
    the `KnowledgeRanker` hook from (2), and can precede it with `RecencyRanker`
    hardwired.
 
-## 7. Decisions applied, and the one left open
+## 7. Decisions applied
 
 Applied here rather than deferred: no host binding in the key (v1);
 `NARVI_LICENSE_KEY` only, no Settings paste-in (v1); per-module migrations table,
@@ -871,7 +872,10 @@ public analyzers; no ninth Settings tab (mockup parity preserved; the affordance
 rides the repo-settings card column); `license_*` gauges deferred until the
 registry has shipped.
 
-**Left to the repository owner: the v1 capability vocabulary.** `governance` and
-`knowledge-retrieval` are placeholders. The names enter a published wire enum, and
-changing an enum value later is a breaking contract change — so the vocabulary is
-worth settling before item 4 ships, not after.
+**The v1 capability vocabulary, decided:** `organization_governance`, `compliance`,
+`knowledge_retrieval` — snake_case, matching this repository's own REST enum
+convention (`not_a_pr`, `public_api`, `needs_human`, `data_layer`), not the
+kebab-case `governance`/`knowledge-retrieval` placeholders this section used to
+carry. Settled here, before item 4 shipped: the names enter a published wire enum
+the moment that item ships, and changing an enum value afterward is a breaking
+contract change.

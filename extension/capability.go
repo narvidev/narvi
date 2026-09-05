@@ -11,16 +11,19 @@ import "github.com/narvidev/narvi/internal/domain/license"
 // Capability is license.Capability, re-exported as a type alias so a
 // value of this type IS a license.Capability (not merely convertible to
 // one) on both sides of the module boundary. See internal/domain/license's
-// own doc comment for why the two constants below are placeholders
-// pending a product decision -- nothing on the wire names either yet.
+// own doc comment for the vocabulary's naming history -- all three
+// constants below are now a published wire enum (GET /api/capabilities'
+// own CapabilityStatus.name), not placeholders.
 type Capability = license.Capability
 
-// CapabilityGovernance and CapabilityKnowledgeRetrieval mirror
-// license.CapabilityGovernance/CapabilityKnowledgeRetrieval exactly --
-// see this file's own doc comment for why both names are placeholders.
+// CapabilityOrganizationGovernance, CapabilityCompliance and
+// CapabilityKnowledgeRetrieval mirror license.
+// CapabilityOrganizationGovernance/CapabilityCompliance/
+// CapabilityKnowledgeRetrieval exactly -- see this file's own doc comment.
 const (
-	CapabilityGovernance         = license.CapabilityGovernance
-	CapabilityKnowledgeRetrieval = license.CapabilityKnowledgeRetrieval
+	CapabilityOrganizationGovernance = license.CapabilityOrganizationGovernance
+	CapabilityCompliance             = license.CapabilityCompliance
+	CapabilityKnowledgeRetrieval     = license.CapabilityKnowledgeRetrieval
 )
 
 // Capabilities is what a module receives (Runtime.Capabilities) to ask

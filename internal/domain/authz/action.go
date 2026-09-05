@@ -30,6 +30,19 @@ const (
 	// that point), so this has no Resource.OwnedOrJoined dependency at
 	// all, unlike that action.
 	ActionViewOwnProfile Action = "view_own_profile"
+	// ActionViewCapabilities is read access to GET /api/capabilities (the
+	// extension & licensing boundaries surface, technical plan §34,
+	// docs/design/boundaries-design.md section 4) -- the SAME row as
+	// ActionViewSessions/ActionViewAnalytics/ActionViewOwnProfile above,
+	// not a stretch reuse of any of them: a distinct Action for a
+	// distinct resource, mirroring how ActionViewOwnProfile's own doc
+	// comment already reasons about this row. Every role including
+	// viewer may read it -- the response is a derived read model that
+	// never carries a licence key or a subject (internal/adapters/
+	// inbound/httpapi/capabilities.go's own doc comment), so there is
+	// nothing here for a viewer to be denied. No own/joined carve-out:
+	// this is a deployment-wide fact, not a per-resource one.
+	ActionViewCapabilities Action = "view_capabilities"
 
 	// -- Row 2: "Create sessions, prompt, approve plans on own/joined
 	// sessions" — admin, maintainer, member (never viewer). Prompting and
@@ -519,6 +532,7 @@ var AllActions = []Action{
 	ActionViewSessions,
 	ActionViewAnalytics,
 	ActionViewOwnProfile,
+	ActionViewCapabilities,
 	ActionCreateSession,
 	ActionPromptSession,
 	ActionApprovePlan,

@@ -38,12 +38,12 @@ func TestRequireCapability_503WhenDisabled(t *testing.T) {
 		{
 			name: "capability not installed",
 			reg: capability.New(nil,
-				&license.Grant{Capabilities: []license.Capability{license.CapabilityGovernance}, NotBefore: now.Add(-time.Hour), ExpiresAt: now.Add(time.Hour)},
+				&license.Grant{Capabilities: []license.Capability{license.CapabilityOrganizationGovernance}, NotBefore: now.Add(-time.Hour), ExpiresAt: now.Add(time.Hour)},
 				nil, func() time.Time { return now }, 0),
 		},
 		{
 			name: "no grant at all",
-			reg: capability.New([]license.Capability{license.CapabilityGovernance}, nil, nil,
+			reg: capability.New([]license.Capability{license.CapabilityOrganizationGovernance}, nil, nil,
 				func() time.Time { return now }, 0),
 		},
 	}
@@ -51,7 +51,7 @@ func TestRequireCapability_503WhenDisabled(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var reached bool
-			mw := httpapi.RequireCapability(tt.reg, license.CapabilityGovernance)
+			mw := httpapi.RequireCapability(tt.reg, license.CapabilityOrganizationGovernance)
 			handler := mw(okHandler(&reached))
 
 			rec := httptest.NewRecorder()
@@ -72,12 +72,12 @@ func TestRequireCapability_503WhenDisabled(t *testing.T) {
 // genuinely enables the capability lets the request through untouched.
 func TestRequireCapability_PassesWhenEnabled(t *testing.T) {
 	now := time.Now()
-	reg := capability.New([]license.Capability{license.CapabilityGovernance},
-		&license.Grant{Capabilities: []license.Capability{license.CapabilityGovernance}, NotBefore: now.Add(-time.Hour), ExpiresAt: now.Add(time.Hour)},
+	reg := capability.New([]license.Capability{license.CapabilityOrganizationGovernance},
+		&license.Grant{Capabilities: []license.Capability{license.CapabilityOrganizationGovernance}, NotBefore: now.Add(-time.Hour), ExpiresAt: now.Add(time.Hour)},
 		nil, func() time.Time { return now }, 0)
 
 	var reached bool
-	mw := httpapi.RequireCapability(reg, license.CapabilityGovernance)
+	mw := httpapi.RequireCapability(reg, license.CapabilityOrganizationGovernance)
 	handler := mw(okHandler(&reached))
 
 	rec := httptest.NewRecorder()
@@ -99,15 +99,15 @@ func TestRequireCapability_PassesWhenEnabled(t *testing.T) {
 func TestRequireCapability_ReEvaluatesPerRequest(t *testing.T) {
 	current := time.Now()
 	grant := &license.Grant{
-		Capabilities: []license.Capability{license.CapabilityGovernance},
+		Capabilities: []license.Capability{license.CapabilityOrganizationGovernance},
 		NotBefore:    current.Add(-time.Hour),
 		ExpiresAt:    current.Add(time.Hour),
 	}
-	reg := capability.New([]license.Capability{license.CapabilityGovernance}, grant, nil,
+	reg := capability.New([]license.Capability{license.CapabilityOrganizationGovernance}, grant, nil,
 		func() time.Time { return current }, 0)
 
 	var reached bool
-	mw := httpapi.RequireCapability(reg, license.CapabilityGovernance)
+	mw := httpapi.RequireCapability(reg, license.CapabilityOrganizationGovernance)
 	handler := mw(okHandler(&reached))
 
 	rec := httptest.NewRecorder()

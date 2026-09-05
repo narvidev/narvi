@@ -107,6 +107,10 @@ var matrix = map[Action]actionRule{
 	// ActionLinkChatGPTAccount's own (admin/maintainer + owned-member,
 	// viewer excluded) row.
 	ActionViewOwnProfile: {allow: roles(RoleAdmin, RoleMaintainer, RoleMember, RoleViewer)},
+	// ActionViewCapabilities (technical plan §34, GET /api/capabilities)
+	// -- same row, same reasoning as ActionViewOwnProfile immediately
+	// above: see action.go's own doc comment.
+	ActionViewCapabilities: {allow: roles(RoleAdmin, RoleMaintainer, RoleMember, RoleViewer)},
 
 	// Row 2: create/prompt/approve-plan on own/joined -- viewer excluded
 	// entirely; member gated by ownership on the two actions that name an

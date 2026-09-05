@@ -7,8 +7,8 @@
 // entirely", where 503 unambiguously says "this deployment knows about
 // this capability, and it is not usable here".
 //
-// This file and capabilities.go (the future GET /api/capabilities read
-// model, not built in this PR) are the only two files in this package
+// This file and capabilities.go (GET /api/capabilities, the derived read
+// model) are the only two files in this package
 // tools/lint/narvichecks/capabilityimportban allows to import
 // internal/app/capability, internal/domain/license, or
 // github.com/narvidev/narvi/extension at all -- see that analyzer's own

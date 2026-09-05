@@ -120,6 +120,11 @@ export const integrationQueryKeys = {
   list: () => ['integrations', 'list'] as const,
 }
 
+// capabilityQueryKeys (technical plan §34, docs/design/boundaries-design.md section 4) -- ext/useCapabilities.ts's own data source. One key, no params: GET /api/capabilities always returns one row per internal/domain/license.All entry, deployment-wide, like integrationQueryKeys above.
+export const capabilityQueryKeys = {
+  list: () => ['capabilities', 'list'] as const,
+}
+
 // chatgptLinkQueryKeys (§29.3/§29.9) -- the Integrations screen's own ChatGPT-account link status, scoped to "the current caller" like authQueryKeys above, not parameterized per user (there is no admin view of another member's link).
 export const chatgptLinkQueryKeys = {
   status: () => ['chatgpt-link', 'status'] as const,

@@ -23,6 +23,7 @@ import type {
   Automation,
   ArtifactsResponse,
   AuditLogEntry,
+  CapabilitiesResponse,
   ChatGPTLinkStatus,
   CloudIdentityBinding,
   ClusterBinding,
@@ -359,6 +360,13 @@ export function listAuditLog(params: { limit: number; offset: number }, signal?:
 /** getIntegrations calls GET /api/integrations -- one row per ingress surface (Slack/Linear/GitHub, §12.5's own "integrations read model & routes" amendment). Admin-only server-side (authz.ActionManageIntegrations). A DERIVED read: configured plus last-inbound/last-outbound evidence, never a stored connection row and never the secrets themselves in any form -- see restdtos.Integration's own doc comment for why configured/lastOutboundStatus are facts with timestamps, never a health verdict. */
 export function getIntegrations(signal?: AbortSignal): Promise<ListIntegrationsResponse> {
   return request<ListIntegrationsResponse>('/api/integrations', { signal })
+}
+
+// -- extension & licensing boundaries (technical plan §34, docs/design/boundaries-design.md section 4). --
+
+/** getCapabilities calls GET /api/capabilities -- one row per internal/domain/license.All entry (organization_governance, compliance, knowledge_retrieval), in that package's own fixed order. Readable by every role including viewer (authz.ActionViewCapabilities). A DERIVED read model: whether Narvi Gatekeeper's own module is composed into this binary, and each capability's installed/licensed/valid-now state -- never the licence key, a fingerprint of it, or the grant's own subject. Drives ext/useCapabilities.ts and, through it, the runtime slot registry (ext/slots.tsx) and GatekeeperAffordance. */
+export function getCapabilities(signal?: AbortSignal): Promise<CapabilitiesResponse> {
+  return request<CapabilitiesResponse>('/api/capabilities', { signal })
 }
 
 /** startChatGPTLink calls POST /api/me/chatgpt-link (§29.3 step 1: "Connect ChatGPT account") -- begins (or reuses a still-live) device-flow attempt for the authenticated caller. Self-service, own-user only server-side (authz.ActionLinkChatGPTAccount, member+ -- viewers excluded). */

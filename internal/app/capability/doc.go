@@ -20,6 +20,6 @@
 // Capability decisions are made in exactly two kinds of place: the
 // composition root (controlplane), choosing which implementation to wire
 // into an app-layer seam, and the two named HTTP route-group gates in
-// internal/adapters/inbound/httpapi (RequireCapability, and the future
-// GetCapabilities read model). Nowhere else.
+// internal/adapters/inbound/httpapi (RequireCapability, and
+// GetCapabilities, the derived read model). Nowhere else.
 package capability

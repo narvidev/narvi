@@ -112,8 +112,8 @@ var allowedPackages = []string{
 // allowedFiles are the two httpapi handler files docs/design/
 // boundaries-design.md, section 1.2, names as the only place a capability decision
 // is allowed at an HTTP route boundary: capabilities.go (GET
-// /api/capabilities -- separate, later work; pre-declared here so landing
-// it never requires touching this analyzer) and requirecapability.go
+// /api/capabilities, the derived read model; pre-declared here so landing
+// it never required touching this analyzer) and requirecapability.go
 // (RequireCapability, this PR).
 var allowedFiles = []struct{ pkg, base string }{
 	{"github.com/narvidev/narvi/internal/adapters/inbound/httpapi", "capabilities.go"},

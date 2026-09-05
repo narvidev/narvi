@@ -77,7 +77,7 @@ type Module struct {
 	// every other API route (rt.RequireAuth) -- so a module route is
 	// authenticated by construction, never by remembering to apply
 	// rt.RequireAuth itself. A module gates any route that backs a
-	// specific paid capability with rt.RequireCapability, per route
+	// specific licensed capability with rt.RequireCapability, per route
 	// group; this repository's own capabilityimportban analyzer cannot
 	// see into a private module, so a route that forgets that gate is
 	// the private repository's own defect (docs/design/

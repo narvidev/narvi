@@ -12,22 +12,22 @@
 // caller besides the composition root (controlplane) and the extension
 // façade.
 //
-// # The v1 capability vocabulary is not fixed yet
+// # The v1 capability vocabulary is fixed
 //
-// [CapabilityGovernance] and [CapabilityKnowledgeRetrieval] are
-// PLACEHOLDERS pending a product decision -- see
-// docs/design/boundaries-design.md, section 7 ("left to the repository owner:
-// the v1 capability vocabulary"). Nothing in this repository puts either
-// name on the wire in this PR: there is no contracts/rest/v1/
-// dtos.schema.json entry for either constant, and no REST handler reads
-// this package at all yet (GET /api/capabilities is later, separate
-// work). That is deliberate, not an oversight -- once a capability name
-// crosses into a published wire contract, renaming it becomes a breaking
-// change (technical plan §34.4); until then, renaming either constant is
-// a private, self-contained edit to this package and its two callers
-// (internal/app/capability, extension), never a contract migration.
-// Treat every reference to either name in this codebase as provisional
-// until that contract PR lands.
+// [CapabilityOrganizationGovernance], [CapabilityCompliance] and
+// [CapabilityKnowledgeRetrieval] are the three capabilities this build
+// defines, snake_case throughout to match this repository's own REST
+// enum convention (e.g. not_a_pr, public_api, needs_human, data_layer).
+// The first two originally shipped as PLACEHOLDERS pending a product
+// decision -- CapabilityGovernance ("governance") and
+// CapabilityKnowledgeRetrieval ("knowledge-retrieval"), kebab-case -- see
+// docs/design/boundaries-design.md, section 7, for that decision's own
+// history. It has now been made: GET /api/capabilities
+// (contracts/rest/v1/dtos.schema.json's own CapabilityStatus.name enum)
+// is the published wire contract the three constants above now feed, so
+// renaming any of them from here on is the breaking contract change
+// technical plan §34.4 warns a published enum value becomes -- treat all
+// three names as durable, not provisional.
 //
 // # Key custody
 //

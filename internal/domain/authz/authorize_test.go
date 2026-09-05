@@ -68,6 +68,16 @@ func TestAuthorize_ExhaustiveMatrix(t *testing.T) {
 		{"member views own profile", authz.RoleMember, authz.ActionViewOwnProfile, false, true},
 		{"viewer views own profile", authz.RoleViewer, authz.ActionViewOwnProfile, false, true},
 
+		// Row 1 (cont'd, technical plan §34, GET /api/capabilities): the
+		// SAME everyone-including-viewer row -- a capability's OWN state
+		// is not a secret, and the response never carries a licence key or
+		// a subject (internal/adapters/inbound/httpapi/capabilities.go's
+		// own doc comment).
+		{"admin views capabilities", authz.RoleAdmin, authz.ActionViewCapabilities, false, true},
+		{"maintainer views capabilities", authz.RoleMaintainer, authz.ActionViewCapabilities, false, true},
+		{"member views capabilities", authz.RoleMember, authz.ActionViewCapabilities, false, true},
+		{"viewer views capabilities", authz.RoleViewer, authz.ActionViewCapabilities, false, true},
+
 		// Row 2a: create session -- admin/maintainer/member, viewer
 		// never. No ownership concept (new resource) -- OwnedOrJoined is
 		// irrelevant, asserted both false and true to prove that.
