@@ -73,6 +73,16 @@
 // blobstoreerror.go's own doc comment for why) and its own typed
 // not-found sentinel, ErrBlobNotFound.
 //
+// KnowledgeRanker (knowledgeranker.go) is the NINTH port, added at §34.7
+// (docs/design/boundaries-design.md, section 2): orders the prior
+// architecture decisions a server-derived gate has already admitted --
+// Score returns one score per already-gated candidate and nothing else,
+// so gate-then-rank (§31.6) is the shape of the signature rather than a
+// convention an implementer has to remember. internal/domain/knowledge.
+// RecencyRanker (public, no opinion) is the first implementation; a
+// private hybrid ranker is expected to be the second, entering only
+// through extension.Module.KnowledgeRanker.
+//
 // The remaining §4.3 ports — SessionStore/TurnStore/SandboxStore, Outbox,
 // TimerScheduler, Clock — are out of scope for this Step and land in their
 // own later Steps, each adding its own interface file here without

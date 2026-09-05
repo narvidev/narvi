@@ -41,7 +41,9 @@ type Module struct {
 	// docs/design/boundaries-design.md, section 1.1's own "installed" input to
 	// the capability registry's conjunction. Every entry must be a
 	// capability this build defines (license.All); controlplane.Build
-	// refuses to boot otherwise.
+	// refuses to boot otherwise. CapabilityKnowledgeRetrieval carries one
+	// further requirement of its own -- see KnowledgeRanker's own doc
+	// comment immediately below.
 	Capabilities []Capability
 
 	// Migrations, when non-nil, is applied after Narvi's own public
@@ -51,6 +53,24 @@ type Module struct {
 	// state: schema presence is not licensed behavior (only what reads
 	// or writes through it is).
 	Migrations fs.FS
+
+	// KnowledgeRanker, when non-nil, replaces the public product's own
+	// recency ordering (internal/domain/knowledge.RecencyRanker) for this
+	// module's own declared CapabilityKnowledgeRetrieval --
+	// controlplane.Build wraps it so the capability registry is consulted
+	// on every call, never once at boot, so an expiring licence reverts
+	// to the public ranker at the very next review with no restart. This
+	// field and CapabilityKnowledgeRetrieval are a BICONDITIONAL, both
+	// halves enforced by controlplane.Build refusing to boot otherwise
+	// (validateModules' own doc comment): a module declaring the
+	// capability without supplying a ranker has advertised ranking
+	// behavior it does not implement, and one supplying a ranker without
+	// declaring the capability would run private ranking logic the
+	// capability registry never gates. See the port's own doc comment
+	// (internal/app/ports/knowledgeranker.go) for why its Score method
+	// can only ever reorder the candidates a server-derived gate already
+	// admitted, never add, drop, or replace one.
+	KnowledgeRanker KnowledgeRanker
 
 	// Mount registers this module's own routes on r, which is already
 	// mounted at /api/ext/<Name>/ behind the same authentication as

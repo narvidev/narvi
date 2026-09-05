@@ -9,6 +9,7 @@
 package controlplane
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -25,6 +26,8 @@ import (
 
 	"github.com/narvidev/narvi/extension"
 	"github.com/narvidev/narvi/internal/app/capability"
+	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/domain/knowledge"
 	"github.com/narvidev/narvi/internal/domain/license"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -57,8 +60,9 @@ func (e *InvalidModuleError) Error() string {
 // violation, not just one" precedent -- so a boot refusal names every
 // defect at once.
 //
-// Two checks, per extension.Module's own Name and Capabilities doc
-// comments (docs/design/boundaries-design.md, section 3.2):
+// Three checks, per extension.Module's own Name, Capabilities and
+// KnowledgeRanker doc comments (docs/design/boundaries-design.md,
+// section 3.2):
 //
 //   - Name must match moduleNamePattern and be unique among every
 //     composed module -- two modules sharing a Name would collide on
@@ -66,11 +70,17 @@ func (e *InvalidModuleError) Error() string {
 //     "<Name>_schema_migrations" migrations table.
 //   - Every declared Capability must be a member of license.All: a
 //     module cannot implement a capability this build does not even
-//     define. (The stronger, per-capability "and vice versa" biconditional
-//     docs/design/boundaries-design.md, section 3.2, describes for a future
-//     KnowledgeRanker-shaped hook does not yet apply to anything in this
-//     PR's own Module shape -- see this repository's own PR history for
-//     why that hook is deferred.)
+//     define.
+//   - CapabilityKnowledgeRetrieval and KnowledgeRanker are a
+//     BICONDITIONAL -- completing the check the paragraph above used to
+//     defer, from when this struct had no hook to check it against. A
+//     module declaring the capability without supplying a ranker has
+//     advertised ranking behavior it does not implement; one supplying a
+//     ranker without declaring the capability would run private ranking
+//     logic capabilitySwitchRanker (knowledgeranker.go) never gates,
+//     since that wrapper is the only place this codebase ever reads
+//     CapabilityKnowledgeRetrieval to decide which ranker runs. Both
+//     halves refuse boot the same way the first two checks do.
 func validateModules(modules []extension.Module) error {
 	var errs []error
 	seen := make(map[string]bool, len(modules))
@@ -84,10 +94,21 @@ func validateModules(modules []extension.Module) error {
 		}
 		seen[m.Name] = true
 
+		declaresKnowledgeRetrieval := false
 		for _, c := range m.Capabilities {
 			if !isKnownCapability(c) {
 				errs = append(errs, &InvalidModuleError{Name: m.Name, Reason: fmt.Sprintf("declares capability %q, which this build does not implement", c)})
 			}
+			if c == license.CapabilityKnowledgeRetrieval {
+				declaresKnowledgeRetrieval = true
+			}
+		}
+
+		switch {
+		case declaresKnowledgeRetrieval && m.KnowledgeRanker == nil:
+			errs = append(errs, &InvalidModuleError{Name: m.Name, Reason: fmt.Sprintf("declares capability %q but supplies no KnowledgeRanker", license.CapabilityKnowledgeRetrieval)})
+		case !declaresKnowledgeRetrieval && m.KnowledgeRanker != nil:
+			errs = append(errs, &InvalidModuleError{Name: m.Name, Reason: fmt.Sprintf("supplies a KnowledgeRanker but does not declare capability %q", license.CapabilityKnowledgeRetrieval)})
 		}
 	}
 
@@ -290,4 +311,96 @@ func applyModuleMigrations(dsn, tableName string, fsys fs.FS) error {
 	}
 
 	return nil
+}
+
+// capabilitySwitchRanker is the ONLY place in this codebase
+// license.CapabilityKnowledgeRetrieval is ever read to decide which
+// ports.KnowledgeRanker actually runs (docs/design/boundaries-design.md,
+// section 2.2) -- it lives here, in controlplane, because this package
+// is one of the few tools/lint/narvichecks/capabilityimportban lets
+// import internal/app/capability at all (that analyzer's own doc
+// comment).
+//
+// reg is consulted PER CALL, in both Name and Score, never cached at
+// construction: a licence that expires mid-process reverts to public at
+// the very next call, and one activated mid-process takes effect the
+// same way -- neither direction needs a restart. That is this switch's
+// entire job, deciding WHICH ranker runs, and nothing more: it has no
+// opinion of its own on ordering (every KnowledgeRanker's Score can only
+// ever return scores, never candidates -- see the port's own doc
+// comment), and a failure or timeout in private is returned to the
+// caller UNCHANGED, never silently retried against public. Falling back
+// to the gate's own order on a ranker failure, never to empty, is
+// reviewcontext.FetchPriorArchDecisions' own job (a later Step), not
+// this switch's -- conflating the two would mean two different places in
+// this codebase each partially implementing degradation.
+type capabilitySwitchRanker struct {
+	reg     *capability.Registry
+	private ports.KnowledgeRanker
+	public  ports.KnowledgeRanker
+	timeout time.Duration
+}
+
+// Name returns whichever ranker Score would currently delegate to's own
+// Name, re-decided on every call exactly like Score itself -- so a
+// caller recording which ranker actually ran never needs its own copy of
+// this switch's own licence check.
+func (r capabilitySwitchRanker) Name() string {
+	if r.reg.Enabled(license.CapabilityKnowledgeRetrieval) {
+		return r.private.Name()
+	}
+	return r.public.Name()
+}
+
+// Score delegates to private when CapabilityKnowledgeRetrieval is
+// currently enabled, to public otherwise -- re-decided on every call. The
+// private call alone is bounded by timeout, layered onto ctx via
+// context.WithTimeout: a composed module's own ranker is third-party
+// code this switch cannot trust to respect ctx's own deadline
+// unprompted, unlike public (first-party, synchronous, zero I/O, needs no
+// bound of its own). Returns whatever the chosen ranker itself returns,
+// value or error, unmodified.
+func (r capabilitySwitchRanker) Score(ctx context.Context, q knowledge.Query, cands []knowledge.Candidate) ([]float64, error) {
+	if !r.reg.Enabled(license.CapabilityKnowledgeRetrieval) {
+		return r.public.Score(ctx, q, cands)
+	}
+	cctx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+	// A composed module's ranker gets a deep copy, never the caller's own
+	// slices. The port's signature stops it adding or dropping a
+	// candidate, but a []Candidate is a slice header: an implementation
+	// receiving one can rewrite the elements the caller still holds, and
+	// substituted prose would then reach the review prompt having bypassed
+	// the sanitization applied when the decision was written. Same
+	// reasoning as the timeout above -- this is the boundary where a
+	// module's own code starts, so it is where the caller stops trusting
+	// it. The public branch above is first-party and gets no copy.
+	sq, scands := knowledge.CloneForRanking(q, cands)
+	return r.private.Score(cctx, sq, scands)
+}
+
+// selectKnowledgeRanker returns the ports.KnowledgeRanker Build wires in:
+// knowledge.RecencyRanker{} when no composed module supplies one, or a
+// capabilitySwitchRanker over the LAST module's own KnowledgeRanker
+// otherwise -- mirrors selectWebAssets' own identical "last supplier
+// wins" reasoning (composition is always zero or one module today).
+//
+// The no-module (and no-KnowledgeRanker-supplying-module) branch never
+// touches reg at all -- it returns knowledge.RecencyRanker{} directly,
+// without even reading the field -- preserving
+// TestBuild_WithoutModules_NeverConsultsCapabilities' own guarantee: this
+// function is as much a part of "nothing Build does ever consults the
+// registry with zero modules composed" as buildCapabilityRegistry/
+// logLicenseBoot already are.
+func selectKnowledgeRanker(reg *capability.Registry, modules []extension.Module, timeout time.Duration) ports.KnowledgeRanker {
+	var private ports.KnowledgeRanker
+	for _, m := range modules {
+		if m.KnowledgeRanker != nil {
+			private = m.KnowledgeRanker
+		}
+	}
+	if private == nil {
+		return knowledge.RecencyRanker{}
+	}
+	return capabilitySwitchRanker{reg: reg, private: private, public: knowledge.RecencyRanker{}, timeout: timeout}
 }

@@ -2530,6 +2530,43 @@ type Timeouts struct {
 	// licence grant's own activation instant, never an HMAC bearer
 	// token's freshness window.
 	LicenseNotBeforeSkew time.Duration
+
+	// KnowledgeRankerTimeout bounds a single call to a composed module's
+	// own ports.KnowledgeRanker.Score (docs/design/boundaries-design.md,
+	// section 2.2), layered onto the caller's own context by
+	// controlplane's capabilitySwitchRanker before delegating to it --
+	// never applied to the public knowledge.RecencyRanker, which is
+	// first-party, synchronous, zero-I/O code this codebase already
+	// trusts not to block. A composed module's own ranker is arbitrary
+	// third-party code this switch cannot assume respects ctx's own
+	// deadline unprompted, so the deadline is set explicitly rather than
+	// left to the implementation to impose on itself (the KnowledgeRanker
+	// port's own doc comment: "an implementation should still honor ctx's
+	// own deadline ... it must never assume it will always be given
+	// unlimited time").
+	//
+	// What this bound is, precisely, and what it is not. A Go deadline is
+	// cooperative: context.WithTimeout signals, it does not interrupt. A
+	// ranker that selects on ctx.Done returns at the deadline; a ranker
+	// that ignores ctx entirely runs to completion and Score returns only
+	// when it does -- measured at 2s against a 20ms bound while writing
+	// this. So the guarantee here is "a well-behaved module ranker is
+	// bounded", never "no module ranker can stall a review turn". Making
+	// the stronger claim true would mean abandoning the call in a
+	// goroutine and returning early, which converts a stall into a leak:
+	// the goroutine still runs, still holds the caller's candidates, and
+	// nothing joins it. A stall is observable and attributable; a leak is
+	// neither, so the weaker guarantee is the deliberate choice and this
+	// comment states it rather than letting the field name imply the
+	// stronger one.
+	//
+	// Not given an explicit figure by any technical-plan section --
+	// chosen as 10 seconds, matching GitHubAppScopeCheckTimeout/
+	// OpenCodeConfigFetchTimeout/CloudIdentityConfigFetchTimeout's own
+	// shared "a single, bounded external call" reasoning: generous enough
+	// for a real hybrid lexical+embeddings retrieval call, short enough
+	// that a cooperative ranker degrades to the gate's own order promptly.
+	KnowledgeRankerTimeout time.Duration
 }
 
 // DefaultTimeouts returns the shipped defaults for every field, each
@@ -2750,6 +2787,8 @@ func DefaultTimeouts() Timeouts {
 		GitHubAppMintTimeout:       20 * time.Second, // §30.4; not specified, chosen -- see field doc comment
 
 		LicenseNotBeforeSkew: 5 * time.Minute, // design note section 1.5, explicit ("default 5 minutes")
+
+		KnowledgeRankerTimeout: 10 * time.Second, // design note section 2.2; not specified numerically, chosen -- see field doc comment
 	}
 }
 

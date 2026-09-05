@@ -139,6 +139,17 @@ type App struct {
 	// "registry" in this codebase.
 	capabilities *capability.Registry
 
+	// knowledgeRanker is docs/design/boundaries-design.md, section 2's own
+	// ranker: knowledge.RecencyRanker{} unless a composed module supplies
+	// its own (extension.Module.KnowledgeRanker), in which case it is
+	// capabilitySwitchRanker wrapping that ranker over the SAME
+	// capabilities registry immediately above -- see
+	// selectKnowledgeRanker's own doc comment. Not yet read anywhere in
+	// this file: the review-turn producers that will thread it into their
+	// own prompt composition are a later Step's own seam, built against
+	// this already-wired value rather than inventing the wiring itself.
+	knowledgeRanker ports.KnowledgeRanker
+
 	// moduleWorkers is the combined list of every worker every composed
 	// module contributed (extension.Module.Workers) -- started through
 	// Run's own errgroup exactly like every internal background loop.
@@ -964,6 +975,17 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// re-checked per request rather than once at boot -- see
 	// buildCapabilityRegistry's own doc comment.
 	capabilities := buildCapabilityRegistry(slog.Default(), cfg, modules)
+
+	// knowledgeRanker (docs/design/boundaries-design.md, section 2) is
+	// selected here, alongside capabilities: the public default
+	// (knowledge.RecencyRanker{}) unless a composed module supplies its
+	// own, wrapped so THAT capability is re-checked per call rather than
+	// once at boot -- see selectKnowledgeRanker's own doc comment. With
+	// zero modules composed this never touches capabilities at all,
+	// preserving TestBuild_WithoutModules_NeverConsultsCapabilities'
+	// own guarantee exactly as buildCapabilityRegistry does immediately
+	// above.
+	knowledgeRanker := selectKnowledgeRanker(capabilities, modules, cfg.Timeouts.KnowledgeRankerTimeout)
 
 	router := chi.NewRouter()
 	router.Use(middleware.Recoverer)
@@ -2378,8 +2400,9 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		providerCredentialStore: providerCredentialStore,
 		chatGPTDeviceFlow:       chatGPTDeviceFlow,
 
-		capabilities:  capabilities,
-		moduleWorkers: moduleWorkers,
+		capabilities:    capabilities,
+		knowledgeRanker: knowledgeRanker,
+		moduleWorkers:   moduleWorkers,
 	}, nil
 }
 
