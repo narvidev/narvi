@@ -27,6 +27,31 @@ func capabilitiesRequest(role authz.Role) *http.Request {
 	return req.WithContext(platform.WithUser(req.Context(), platform.AuthenticatedUser{ID: "00000000-0000-0000-0000-000000000001", Role: string(role)}))
 }
 
+// buildResponse mirrors controlplane.buildCapabilitiesResponse's own
+// row-building loop, necessarily duplicated here rather than imported:
+// GetCapabilities itself no longer accepts a *capability.Registry at all
+// (capabilities.go's own doc comment explains why), and controlplane's
+// own builder is unexported composition-root wiring this package must
+// not reach into either way. A _test.go file may still import
+// internal/app/capability and internal/domain/license directly --
+// demotionsweep.skipFile's own "a test constructing a registry is not a
+// production decision point" reasoning, applied by
+// capabilityimportban's own identical _test.go exemption.
+func buildResponse(reg *capability.Registry, gatekeeperInstalled bool) restdtos.CapabilitiesResponse {
+	rows := make([]restdtos.CapabilityStatus, 0, len(license.All))
+	for _, c := range license.All {
+		rows = append(rows, restdtos.CapabilityStatus{
+			Name:  restdtos.CapabilityStatusName(c),
+			State: restdtos.CapabilityState(reg.State(c)),
+		})
+	}
+	return restdtos.CapabilitiesResponse{
+		GatekeeperInstalled: gatekeeperInstalled,
+		LicenseExpiresAt:    reg.ExpiresAt(),
+		Capabilities:        rows,
+	}
+}
+
 // TestGetCapabilities_EveryRole proves authz.ActionViewCapabilities is
 // genuinely a §13.3 row 1 action: every one of the four roles, viewer
 // included, gets 200 -- and, since this response is a deployment-wide
@@ -40,7 +65,7 @@ func TestGetCapabilities_EveryRole(t *testing.T) {
 		ExpiresAt:    now.Add(time.Hour),
 	}
 	reg := capability.New([]license.Capability{license.CapabilityOrganizationGovernance}, grant, nil, func() time.Time { return now }, 0)
-	handler := httpapi.GetCapabilities(reg, true)
+	handler := httpapi.GetCapabilities(func() restdtos.CapabilitiesResponse { return buildResponse(reg, true) })
 
 	var firstBody string
 	for _, role := range authz.AllRoles {
@@ -84,7 +109,7 @@ func TestGetCapabilities_NeverCarriesTheKey(t *testing.T) {
 		[]license.Capability{license.CapabilityOrganizationGovernance, license.CapabilityCompliance, license.CapabilityKnowledgeRetrieval},
 		grant, nil, func() time.Time { return now }, 0,
 	)
-	handler := httpapi.GetCapabilities(reg, true)
+	handler := httpapi.GetCapabilities(func() restdtos.CapabilitiesResponse { return buildResponse(reg, true) })
 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, capabilitiesRequest(authz.RoleAdmin))
@@ -154,7 +179,7 @@ func TestGetCapabilities_StatesMatchRegistry(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handler := httpapi.GetCapabilities(tt.reg, tt.gatekeeperInstalled)
+			handler := httpapi.GetCapabilities(func() restdtos.CapabilitiesResponse { return buildResponse(tt.reg, tt.gatekeeperInstalled) })
 
 			rec := httptest.NewRecorder()
 			handler.ServeHTTP(rec, capabilitiesRequest(authz.RoleAdmin))
@@ -195,5 +220,33 @@ func TestGetCapabilities_StatesMatchRegistry(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestGetCapabilities_CallsBuildPerRequest proves build is invoked fresh
+// on every request, never cached from Mount time -- the same "no stale
+// snapshot" requirement RequireCapability's own
+// TestRequireCapability_ReEvaluatesPerRequest pins for the sibling
+// capability gate, applied here to the func GetCapabilities itself now
+// takes. controlplane's own capabilityResponseBuilder closes over the
+// registry, not a value already read from it, specifically so this
+// property holds in production too.
+func TestGetCapabilities_CallsBuildPerRequest(t *testing.T) {
+	var calls int
+	handler := httpapi.GetCapabilities(func() restdtos.CapabilitiesResponse {
+		calls++
+		return restdtos.CapabilitiesResponse{}
+	})
+
+	for i := 1; i <= 3; i++ {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, capabilitiesRequest(authz.RoleAdmin))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want %d", i, rec.Code, http.StatusOK)
+		}
+		if calls != i {
+			t.Fatalf("after request %d: build called %d times, want %d -- GetCapabilities must call build fresh per request, never cache it", i, calls, i)
+		}
 	}
 }

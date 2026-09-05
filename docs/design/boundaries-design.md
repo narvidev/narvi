@@ -180,17 +180,23 @@ type Capabilities interface {
 }
 ```
 
-**`internal/adapters/inbound/httpapi`**: two files, both on the analyzer's
-allow-list by exact name:
+**`internal/adapters/inbound/httpapi`**: two files, neither on the analyzer's
+allow-list — this package imports none of the three banned packages, by file or
+by package (see section 1.4 for why a former *file*-level entry for exactly
+these two was removed rather than kept or widened):
 
-- `capabilities.go`: `GetCapabilities` for `GET /api/capabilities` (item 4).
-- `requirecapability.go`: `RequireCapability(reg, c)`, the exact shape of
-  `RequireCloudIdentityCapability` (`cloudidentitycapability.go:60`): 503 with a
-  stable message when `!reg.Enabled(c)`, evaluated per request so an expiry
+- `capabilities.go`: `GetCapabilities(build func() restdtos.CapabilitiesResponse)`
+  for `GET /api/capabilities` (item 4). `build` is called inside the handler, once
+  per request, never cached; `controlplane` closes over the registry and
+  `gatekeeperInstalled` and hands this file only the already-assembled response.
+- `requirecapability.go`: `RequireCapability(enabled func() bool)`, the exact
+  shape of `RequireCloudIdentityCapability` (`cloudidentitycapability.go:60`): 503
+  with a stable message when `!enabled()`, evaluated per request so an expiry
   mid-process closes the route on the next request. That precedent's argument
   applies verbatim — a capability that is off must be observable as off, never
   indistinguishable from a route that was never built. Only module routes are ever
-  wrapped with it.
+  wrapped with it. `controlplane` supplies `enabled` as
+  `func() bool { return reg.Enabled(c) }`.
 
 **`controlplane`** (item 3) is where the key is parsed once, the boot log line is
 written, and the registry is constructed with `installed` = the union of every
@@ -218,10 +224,11 @@ reads the registry (section 1.6, test 3).
 contributor cannot silently put a capability check on a shadow-mode suppression
 path. An arch-test scanning for `.Enabled(` selectors is a by-name call ban (the
 `demotionsweep` shape) and can be dodged by a method value or a wrapper. An
-**import ban** cannot: the only way to reach the registry, the grant, or the façade
-is to import one of three packages, and an import declaration is a syntactic fact.
-This is `execimportban`'s mechanism with `demotionsweep`'s allow-list discipline.
-It runs in `make lint` and in `lint-web-assets` like the other six.
+**import ban** is harder to dodge: the only way for a FILE to reach the registry,
+the grant, or the façade is for that file itself to import one of three packages,
+and an import declaration is a syntactic fact. This is `execimportban`'s mechanism
+with `demotionsweep`'s allow-list discipline. It runs in `make lint` and in
+`lint-web-assets` like the other six.
 
 **What it bans.** Any import of
 
@@ -229,12 +236,36 @@ It runs in `make lint` and in `lint-web-assets` like the other six.
 - `github.com/narvidev/narvi/internal/app/capability`
 - `github.com/narvidev/narvi/extension`
 
-from any file outside: allowed dirs (substring) `/controlplane/`, `/extension/`,
-`/internal/app/capability/`, `/internal/domain/license/`; allowed files (suffix)
-`/internal/adapters/inbound/httpapi/capabilities.go`,
-`/internal/adapters/inbound/httpapi/requirecapability.go`; and `_test.go` files (a
-test constructing a registry is not a production decision point —
-`demotionsweep.skipFile`'s reasoning).
+from any file outside: the allowed **packages**
+`github.com/narvidev/narvi/controlplane`, `github.com/narvidev/narvi/extension`,
+`github.com/narvidev/narvi/internal/app/capability`,
+`github.com/narvidev/narvi/internal/domain/license` — matched on the exact Go
+import path, never a filesystem substring, so a checkout under a directory that
+happens to share one of those names cannot silently exempt every file in it; and
+`_test.go` files (a test constructing a registry is not a production decision
+point — `demotionsweep.skipFile`'s reasoning).
+
+**There is no file-level entry on this allow-list — and there used to be one.**
+`internal/adapters/inbound/httpapi/capabilities.go` and `requirecapability.go`
+were each individually exempted by name, inside `httpapi`, a package this
+analyzer otherwise bans like any other. That is dodgeable, and an exit audit of
+this guarantee reproduced it directly: Go import declarations are per FILE, but
+identifier scope is per PACKAGE, so a package-level `var`/`func` either exempted
+file declared was callable — with no import of its own — from any OTHER file in
+`httpapi`, including `scmcredentials.go`, a real §30 suppression path in that
+same package. The reproduction added a package-level helper closing over a
+`*capability.Registry` to `capabilities.go`, then called it from
+`scmcredentials.go` with no new import there; `go build`, `go vet` and this
+analyzer all passed, and a licence state had become an input to that file's own
+shadow-substitution decision with nothing reporting it. The fix was not to widen
+the allow-list (a second file-level entry is the same shape of hole) or to move
+the two files into their own sub-package (a package-level entry then, still
+reachable from every file inside it): it was to make `httpapi` need neither
+banned import at all. `RequireCapability` and `GetCapabilities` (section 1.2
+above) each now take an already-evaluated decision — a `func() bool`, and a func
+building the response DTO, respectively — injected by `controlplane`, so neither
+file, nor any other file in that package, ever holds a `*capability.Registry` or
+a `license.Capability` for a sibling file to reach through.
 
 Diagnostic text names the requirement: "a capability check is a decision point at a
 system boundary; the shadow-mode suppression guarantees are structural and must
@@ -317,10 +348,17 @@ repo therefore runs the same analyzers with the same directory layout.
    no key).
 4. `capabilityimportban`: `analysistest` fixtures — a violation in
    `internal/app/shadowscm`, in `internal/app/sessionactor`, in
-   `internal/domain/review`; silence in `controlplane`, `extension`,
-   `httpapi/capabilities.go`, and in a `_test.go`.
+   `internal/domain/review`, and (the fixture for section 1.4's own
+   file-level-exemption bridge) in a file inside the `httpapi` fixture package
+   itself; silence in `controlplane`, `extension`, `internal/app/capability`,
+   `internal/domain/license`, in `httpapi/capabilities.go`/`requirecapability.go`
+   (silent only because, like the real files, they import nothing banned any
+   more), and in a `_test.go`. `TestSkipFile_NoFileLevelExemption` pins that no
+   file in `httpapi` is exempt by
+   name.
 5. `httpapi`: `TestRequireCapability_503WhenDisabled`, `_PassesWhenEnabled`,
-   `_ReEvaluatesPerRequest`.
+   `_ReEvaluatesPerRequest`; `TestGetCapabilities_CallsBuildPerRequest` pins the
+   same "evaluated per request, never cached" property for the read model.
 
 ### 1.7 Rejected alternatives
 

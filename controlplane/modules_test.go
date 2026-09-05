@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/extension"
 	"github.com/narvidev/narvi/internal/app/capability"
 	"github.com/narvidev/narvi/internal/app/ports"
@@ -308,6 +309,128 @@ func TestLogLicenseBoot_WithModules_ConsultsCapabilities(t *testing.T) {
 
 	if stub.calls == 0 {
 		t.Error("logLicenseBoot() with a composed module called Capabilities.Enabled() 0 times, want at least 1 -- otherwise the zero-modules test proves nothing")
+	}
+}
+
+// TestBuildCapabilitiesResponse proves the row-building logic that used
+// to live in httpapi/capabilities.go, before this analyzer's file-level
+// exemption on that file was removed (tools/lint/narvichecks/
+// capabilityimportban's own doc comment): one row per license.All entry,
+// in that package's own fixed order, each State computed independently
+// via *capability.Registry.State, plus GatekeeperInstalled/
+// LicenseExpiresAt threaded straight through from this func's own two
+// parameters. This is the ONLY place this logic is tested against the
+// REAL controlplane.buildCapabilitiesResponse -- httpapi's own
+// TestGetCapabilities_StatesMatchRegistry exercises an identical, but
+// separately maintained, copy of this same loop (necessarily: httpapi
+// itself may import neither internal/app/capability nor
+// internal/domain/license, so it cannot call this func directly).
+func TestBuildCapabilitiesResponse(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	nowFunc := func() time.Time { return now }
+	expiry := now.Add(30 * 24 * time.Hour)
+
+	tests := []struct {
+		name                string
+		reg                 *capability.Registry
+		gatekeeperInstalled bool
+	}{
+		{
+			name:                "nil registry: no module composed at all",
+			reg:                 nil,
+			gatekeeperInstalled: false,
+		},
+		{
+			name: "module composed, no licence key",
+			reg: capability.New(
+				[]license.Capability{license.CapabilityOrganizationGovernance, license.CapabilityCompliance, license.CapabilityKnowledgeRetrieval},
+				nil, nil, nowFunc, 0,
+			),
+			gatekeeperInstalled: true,
+		},
+		{
+			name: "module composed, one capability fully enabled, others not granted",
+			reg: capability.New(
+				[]license.Capability{license.CapabilityOrganizationGovernance, license.CapabilityCompliance, license.CapabilityKnowledgeRetrieval},
+				&license.Grant{Capabilities: []license.Capability{license.CapabilityOrganizationGovernance}, NotBefore: now.Add(-time.Hour), ExpiresAt: expiry},
+				nil, nowFunc, 0,
+			),
+			gatekeeperInstalled: true,
+		},
+		{
+			name: "module composed, licence expired",
+			reg: capability.New(
+				[]license.Capability{license.CapabilityCompliance},
+				&license.Grant{Capabilities: []license.Capability{license.CapabilityCompliance}, NotBefore: now.Add(-2 * time.Hour), ExpiresAt: now.Add(-time.Hour)},
+				nil, nowFunc, 0,
+			),
+			gatekeeperInstalled: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := buildCapabilitiesResponse(tt.reg, tt.gatekeeperInstalled)
+
+			if resp.GatekeeperInstalled != tt.gatekeeperInstalled {
+				t.Errorf("GatekeeperInstalled = %v, want %v", resp.GatekeeperInstalled, tt.gatekeeperInstalled)
+			}
+
+			wantExpiresAt := tt.reg.ExpiresAt()
+			switch {
+			case wantExpiresAt == nil && resp.LicenseExpiresAt != nil:
+				t.Errorf("LicenseExpiresAt = %v, want nil", resp.LicenseExpiresAt)
+			case wantExpiresAt != nil && (resp.LicenseExpiresAt == nil || !resp.LicenseExpiresAt.Equal(*wantExpiresAt)):
+				t.Errorf("LicenseExpiresAt = %v, want %v", resp.LicenseExpiresAt, wantExpiresAt)
+			}
+
+			if len(resp.Capabilities) != len(license.All) {
+				t.Fatalf("len(Capabilities) = %d, want %d (one row per license.All entry, always)", len(resp.Capabilities), len(license.All))
+			}
+			for i, c := range license.All {
+				row := resp.Capabilities[i]
+				if string(row.Name) != string(c) {
+					t.Errorf("Capabilities[%d].Name = %q, want %q (license.All's own fixed order)", i, row.Name, c)
+				}
+				wantState := restdtos.CapabilityState(tt.reg.State(c))
+				if row.State != wantState {
+					t.Errorf("Capabilities[%d] (%s).State = %q, want %q (capability.Registry.State(%s) computed independently)", i, c, row.State, wantState, c)
+				}
+			}
+		})
+	}
+}
+
+// TestCapabilityResponseBuilder_EvaluatesPerCall proves the func Build
+// hands httpapi.GetCapabilities is never a cached snapshot: calling it
+// twice, with the underlying registry's own clock advanced past the
+// grant's expiry in between, returns two DIFFERENT responses off the
+// SAME *capability.Registry -- the property GetCapabilities' own doc
+// comment requires of build, mirroring
+// TestRequireCapability_ReEvaluatesPerRequest's identical requirement
+// for the sibling capability gate.
+func TestCapabilityResponseBuilder_EvaluatesPerCall(t *testing.T) {
+	current := time.Now()
+	grant := &license.Grant{
+		Capabilities: []license.Capability{license.CapabilityOrganizationGovernance},
+		NotBefore:    current.Add(-time.Hour),
+		ExpiresAt:    current.Add(time.Hour),
+	}
+	reg := capability.New([]license.Capability{license.CapabilityOrganizationGovernance}, grant, nil,
+		func() time.Time { return current }, 0)
+
+	build := capabilityResponseBuilder(reg, true)
+
+	first := build()
+	if first.Capabilities[0].State != restdtos.CapabilityStateEnabled {
+		t.Fatalf("first call: Capabilities[0].State = %q, want %q (grant valid)", first.Capabilities[0].State, restdtos.CapabilityStateEnabled)
+	}
+
+	current = current.Add(2 * time.Hour) // advance past ExpiresAt -- same *Registry, same build func
+
+	second := build()
+	if second.Capabilities[0].State != restdtos.CapabilityStateLicenseExpired {
+		t.Fatalf("second call (post-expiry): Capabilities[0].State = %q, want %q -- build must re-evaluate the registry per call, never cache", second.Capabilities[0].State, restdtos.CapabilityStateLicenseExpired)
 	}
 }
 

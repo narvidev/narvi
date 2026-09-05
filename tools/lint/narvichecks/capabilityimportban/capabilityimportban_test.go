@@ -10,13 +10,19 @@ import (
 
 // TestAnalyzer proves the analyzer fires on an import of any of the three
 // banned packages planted in a shadow package (internal/app/shadowscm),
-// in internal/app/sessionactor, and in internal/domain/review -- three
-// real production packages this analyzer must keep off the capability
-// registry entirely (docs/design/boundaries-design.md, section 1.4) -- and stays
-// silent in every allowed location (controlplane, extension,
-// internal/app/capability -- which legitimately imports license itself --
-// and the two named httpapi gate files) and in a _test.go file (package
-// "d").
+// in internal/app/sessionactor, in internal/domain/review, and -- the
+// fixture for the bridge an exit audit of this guarantee found -- in a
+// file inside internal/adapters/inbound/httpapi itself (that fixture
+// package's own scmcredentials.go): four real production packages this
+// analyzer must keep off the capability registry entirely (docs/design/
+// boundaries-design.md, section 1.4). It stays silent in every allowed
+// PACKAGE (controlplane, extension, internal/app/capability -- which
+// legitimately imports license itself) and in a _test.go file (package
+// "d") -- but no longer by FILE inside any other package: this fixture
+// package's own capabilities.go and requirecapability.go, standing in
+// for the two real files that used to be individually exempted, are
+// silent here only because -- like the real files after this fix --
+// they import nothing banned at all any more.
 //
 // Every fixture package below lives under
 // testdata/src/github.com/narvidev/narvi/... , mirroring this

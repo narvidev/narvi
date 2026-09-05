@@ -5299,10 +5299,18 @@ the current instant. Consequences that are requirements, not implementation note
   required to be structural — a future contributor cannot silently un-make them — and a
   licence state must never be an input to a suppression decision. This is enforced by a
   `narvichecks` analyzer that bans *importing* the registry, the licence domain or the
-  `extension` façade outside a named allow-list (the composition root, the façade, and
-  two named handler files). An import is a syntactic fact; a banned call by name is not,
-  because a wrapper or a method value dodges it. No shadow, egress, outbox, mint or
-  session-actor package can reach the registry at all.
+  `extension` façade outside a named allow-list of **packages** (the composition root,
+  the façade, and the registry/licence packages themselves). An import is a syntactic
+  fact; a banned call by name is not, because a wrapper or a method value dodges it —
+  and, for the same reason, so is a **file**-level exemption inside an otherwise-banned
+  package: Go import declarations are per file, but identifier scope is per package, so
+  any other file there can call a package-scope helper an exempted file declares with no
+  import of its own. The two HTTP handlers that gate a capability at a route boundary
+  (`RequireCapability`, `GetCapabilities`) therefore hold no file-level exemption either
+  — each takes the already-evaluated decision (a `func() bool`, and a func building the
+  read-model response) instead of importing the registry or the licence domain itself.
+  No shadow, egress, outbox, mint or session-actor package can reach the registry at
+  all.
 - **The registry type cannot express "deny".** It has no method that turns a public
   behavior off. Every consumer reads
   `if enabled { private implementation } else { the public one }`, and the `else` branch
