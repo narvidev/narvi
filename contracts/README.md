@@ -70,11 +70,12 @@ file identical to go-jsonschema's output, and it is idempotent, so
 `contracts-check`'s regenerate-and-diff stays clean. Pointees that are
 predeclared basic types (`*string`, `*int`, …) are deliberately left as
 defined types: they can never carry methods, so `encoding/json` handles them
-natively — 155 of the 161 generated pointer declarations today. The six that
-are aliased are the nullable `date-time` fields: `AutomationLastRunAt`,
+natively — 155 of the 162 generated pointer declarations today. The seven
+that are aliased are the nullable `date-time` fields: `AutomationLastRunAt`,
 `AutomationInvocationClosedAt`, `AutomationRunCompletedAt`,
-`AutomationRunRunningAt`, `ReleaseManifestReadoutComputedAt`, and
-`ShadowLedgerSummaryLiveEgressPromotedAt`.
+`AutomationRunRunningAt`, `ReleaseManifestReadoutComputedAt`,
+`ShadowLedgerSummaryLiveEgressPromotedAt`, and
+`CapabilitiesResponseLicenseExpiresAt`.
 
 The same rule also covers a case no schema exercises yet: a nullable
 *object* property. There, a defined pointer type would bypass the generated

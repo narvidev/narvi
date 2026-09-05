@@ -1,6 +1,6 @@
-// capabilities.go stands for the real (future) GET /api/capabilities
-// handler file -- one of the two named httpapi files allowed to import
-// the capability registry directly.
+// capabilities.go stands in for the real GET /api/capabilities handler
+// file -- one of the two named httpapi files allowed to import the
+// capability registry directly.
 package httpapi
 
 import (

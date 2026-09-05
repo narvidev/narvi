@@ -805,6 +805,177 @@ func (j *Automation) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// GET /api/capabilities's own response body (technical plan §34,
+// docs/design/boundaries-design.md section 4) -- a DERIVED read model, mounted
+// behind auth.Middleware and readable by every role including viewer. Drives the
+// SPA's own runtime slot registry and GatekeeperAffordance: a capability is part
+// of Narvi Gatekeeper, a companion module composed into a second binary from a
+// separate repository (technical plan §34) -- this response says only whether it
+// is installed, licensed, and valid now, never a licence key, a fingerprint of
+// one, or the grant's own subject (technical plan §34.4's own 'a read model may
+// say that a capability is present, absent, or unlicensed; it may never carry a
+// licence key, a subject, or a module's own vocabulary').
+type CapabilitiesResponse struct {
+	// One row per internal/domain/license.All entry, in that package's own fixed
+	// order (organization_governance, compliance, knowledge_retrieval) -- always all
+	// three, regardless of gatekeeperInstalled or licence state.
+	Capabilities []CapabilityStatus `json:"capabilities" yaml:"capabilities" mapstructure:"capabilities"`
+
+	// Whether ANY module is composed into this binary, never which one -- true iff
+	// this deployment's own composition root (controlplane.Build) was given at least
+	// one extension.Module, independent of whether that module implements any
+	// particular capability. A licence key can never make this true on its own -- it
+	// is a fact about the BINARY, not the licence (technical plan §34.5's own 'a key
+	// can entitle; it can never create behavior').
+	GatekeeperInstalled bool `json:"gatekeeperInstalled" yaml:"gatekeeperInstalled" mapstructure:"gatekeeperInstalled"`
+
+	// The configured licence grant's own expiry
+	// (internal/app/capability.Registry.ExpiresAt), or null when there is no grant at
+	// all (no key configured, or a key that failed to parse). Never the key itself,
+	// never the grant's own subject -- display only, for the license_expired
+	// affordance's own 'expired on {date}' sentence.
+	LicenseExpiresAt CapabilitiesResponseLicenseExpiresAt `json:"licenseExpiresAt" yaml:"licenseExpiresAt" mapstructure:"licenseExpiresAt"`
+}
+
+// The configured licence grant's own expiry
+// (internal/app/capability.Registry.ExpiresAt), or null when there is no grant at
+// all (no key configured, or a key that failed to parse). Never the key itself,
+// never the grant's own subject -- display only, for the license_expired
+// affordance's own 'expired on {date}' sentence.
+type CapabilitiesResponseLicenseExpiresAt = *time.Time
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *CapabilitiesResponse) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["capabilities"]; raw != nil && !ok {
+		return fmt.Errorf("field capabilities in CapabilitiesResponse: required")
+	}
+	if _, ok := raw["gatekeeperInstalled"]; raw != nil && !ok {
+		return fmt.Errorf("field gatekeeperInstalled in CapabilitiesResponse: required")
+	}
+	if _, ok := raw["licenseExpiresAt"]; raw != nil && !ok {
+		return fmt.Errorf("field licenseExpiresAt in CapabilitiesResponse: required")
+	}
+	type Plain CapabilitiesResponse
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = CapabilitiesResponse(plain)
+	return nil
+}
+
+type CapabilityState string
+
+const CapabilityStateEnabled CapabilityState = "enabled"
+const CapabilityStateLicenseExpired CapabilityState = "license_expired"
+const CapabilityStateLicenseInvalid CapabilityState = "license_invalid"
+const CapabilityStateLicenseNotYetValid CapabilityState = "license_not_yet_valid"
+const CapabilityStateNotInstalled CapabilityState = "not_installed"
+const CapabilityStateNotLicensed CapabilityState = "not_licensed"
+
+var enumValues_CapabilityState = []interface{}{
+	"enabled",
+	"not_installed",
+	"not_licensed",
+	"license_expired",
+	"license_not_yet_valid",
+	"license_invalid",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *CapabilityState) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_CapabilityState {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_CapabilityState, v)
+	}
+	*j = CapabilityState(v)
+	return nil
+}
+
+// One row of GET /api/capabilities's own response body (technical plan §34,
+// docs/design/boundaries-design.md section 4) -- one row per
+// internal/domain/license.All entry, in that package's own fixed order. Never
+// carries the licence key, a fingerprint of it, or the grant's own subject --
+// state is the only fact this shape exposes about why a capability answers the way
+// it does.
+type CapabilityStatus struct {
+	// Matches internal/domain/license.Capability exactly -- the closed, three-value
+	// vocabulary (internal/domain/license/capability.go). Adding a value here is a
+	// deliberate contract change, mirroring that package's own 'adding one is a
+	// reviewable PR' rule.
+	Name CapabilityStatusName `json:"name" yaml:"name" mapstructure:"name"`
+
+	// State corresponds to the JSON schema field "state".
+	State CapabilityState `json:"state" yaml:"state" mapstructure:"state"`
+}
+
+type CapabilityStatusName string
+
+const CapabilityStatusNameCompliance CapabilityStatusName = "compliance"
+const CapabilityStatusNameKnowledgeRetrieval CapabilityStatusName = "knowledge_retrieval"
+const CapabilityStatusNameOrganizationGovernance CapabilityStatusName = "organization_governance"
+
+var enumValues_CapabilityStatusName = []interface{}{
+	"organization_governance",
+	"compliance",
+	"knowledge_retrieval",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *CapabilityStatusName) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_CapabilityStatusName {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_CapabilityStatusName, v)
+	}
+	*j = CapabilityStatusName(v)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *CapabilityStatus) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["name"]; raw != nil && !ok {
+		return fmt.Errorf("field name in CapabilityStatus: required")
+	}
+	if _, ok := raw["state"]; raw != nil && !ok {
+		return fmt.Errorf("field state in CapabilityStatus: required")
+	}
+	type Plain CapabilityStatus
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = CapabilityStatus(plain)
+	return nil
+}
+
 // Response body for POST/GET /api/me/chatgpt-link (§29.3/§29.9): the
 // ChatGPT-account-OAuth link flow's own status, read by the Settings page's own
 // poll loop -- there is no background worker driving this flow forward; the human

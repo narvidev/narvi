@@ -119,6 +119,8 @@ import {
   reviewDepthModeLabel,
 } from './repoSettingsFormat'
 import { truncateForDisplay } from './textSafety'
+import { GatekeeperAffordance } from '../ext/GatekeeperAffordance'
+import { SlotOutlet } from '../ext/slots'
 
 const MAX_FIELD_CHARS = 500
 
@@ -827,6 +829,7 @@ export function RepoSettingsView() {
               <RiskPolicyCard owner={owner} repo={repo} settings={query.data} canEdit={isAdmin(role)} />
               <AutoMergeCard owner={owner} repo={repo} settings={query.data} canEdit={isAdmin(role)} />
               <ShadowLedgerCard owner={owner} repo={repo} role={role} />
+              <SlotOutlet id="repo-settings.governance" fallback={<GatekeeperAffordance />} />
               <AutoRetriggerReviewCard owner={owner} repo={repo} settings={query.data} canEdit={isAdmin(role)} />
               <DescriptionAutofixCard owner={owner} repo={repo} settings={query.data} canEdit={isAdmin(role)} />
               <AutoApprovalCard owner={owner} repo={repo} settings={query.data} canEdit={isMaintainerPlus(role)} />

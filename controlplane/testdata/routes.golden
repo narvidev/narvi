@@ -20,6 +20,7 @@ GET /api/audit-log
 GET /api/automations
 GET /api/automations/{automationID}
 GET /api/automations/{automationID}/invocations
+GET /api/capabilities
 GET /api/cloud-identity-bindings
 GET /api/decision-inbox
 GET /api/environments

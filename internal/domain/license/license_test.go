@@ -53,7 +53,7 @@ func validClaims() wireClaims {
 		IssuedAt:     now.Add(-time.Hour).Unix(),
 		NotBefore:    now.Add(-time.Hour).Unix(),
 		ExpiresAt:    now.Add(24 * time.Hour).Unix(),
-		Capabilities: []string{string(license.CapabilityGovernance)},
+		Capabilities: []string{string(license.CapabilityOrganizationGovernance)},
 	}
 }
 
@@ -181,8 +181,8 @@ func TestParse_ValidPayloadDecodesGrant(t *testing.T) {
 	if grant.Subject != c.Subject {
 		t.Errorf("grant.Subject = %q, want %q", grant.Subject, c.Subject)
 	}
-	if !grant.Has(license.CapabilityGovernance) {
-		t.Errorf("grant.Has(CapabilityGovernance) = false, want true (claims named %v)", c.Capabilities)
+	if !grant.Has(license.CapabilityOrganizationGovernance) {
+		t.Errorf("grant.Has(CapabilityOrganizationGovernance) = false, want true (claims named %v)", c.Capabilities)
 	}
 	if got := grant.IssuedAt.Unix(); got != c.IssuedAt {
 		t.Errorf("grant.IssuedAt.Unix() = %d, want %d", got, c.IssuedAt)
@@ -198,9 +198,9 @@ func TestParse_ValidPayloadDecodesGrant(t *testing.T) {
 // TestGrant_Has proves Has checks membership only, never epistemic
 // validity (that is ValidAt's own, separate job).
 func TestGrant_Has(t *testing.T) {
-	g := license.Grant{Capabilities: []license.Capability{license.CapabilityGovernance}}
-	if !g.Has(license.CapabilityGovernance) {
-		t.Error("Has(CapabilityGovernance) = false, want true")
+	g := license.Grant{Capabilities: []license.Capability{license.CapabilityOrganizationGovernance}}
+	if !g.Has(license.CapabilityOrganizationGovernance) {
+		t.Error("Has(CapabilityOrganizationGovernance) = false, want true")
 	}
 	if g.Has(license.CapabilityKnowledgeRetrieval) {
 		t.Error("Has(CapabilityKnowledgeRetrieval) = true, want false")
