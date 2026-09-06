@@ -206,6 +206,8 @@ func DecidePlanOnTx(
 	sessions *postgres.SessionStore,
 	turns *postgres.TurnStore,
 	plans *postgres.PlanStore,
+	events *postgres.EventStore,
+	planDocuments *postgres.PlanDocumentStore,
 	outbox *postgres.OutboxStore,
 	linearAgentSessions *postgres.LinearAgentSessionStore,
 	auditLog *postgres.AuditLogStore,
@@ -319,6 +321,22 @@ func DecidePlanOnTx(
 	}
 
 	if verdict == PlanVerdictApprove {
+		// §31.3's durability fix: snapshot the approved version's own prose
+		// into plan_documents FIRST, in this SAME transaction as the
+		// guarded UPDATE above that just flipped this row to 'approved' --
+		// before anything else this branch does, including dispatching the
+		// implementation turn below. See snapshotApprovedPlanContent's own
+		// doc comment for why a failure here is propagated (never logged
+		// and continued, unlike enqueuePlanDecisionNotifications' own
+		// best-effort notify below): this call's only job is making "an
+		// approved plan with no durable snapshot" unrepresentable, so it
+		// must abort this whole decision -- and, via the caller's own
+		// tx.Rollback, the guarded UPDATE with it -- rather than let either
+		// one commit without the other.
+		if err := snapshotApprovedPlanContent(ctx, tx, turns, events, planDocuments, sessionRow.ID, planRow); err != nil {
+			return DecidePlanOutcome{}, fmt.Errorf("httpapi: snapshot approved plan content: %w", err)
+		}
+
 		// F6 (adversarial review): the SAME shared gate
 		// createTurnLocked/CreateSessionOnTx/dispatchNextAttempt also route
 		// through (internal/domain/turn.MaybeInjectEpistemicPreamble).
@@ -388,6 +406,66 @@ func DecidePlanOnTx(
 	}
 
 	return outcome, nil
+}
+
+// snapshotApprovedPlanContent recovers planRow's own approved prose (the
+// SAME bounded events-log scan the plan-mode UI and the Slack/Linear
+// notifiers already use, plandomain.ExtractContent via turnContentBounds,
+// plans.go) and durably persists it into plan_documents, on tx -- §31.3's
+// durability fix: an approved plan's prose used to live ONLY in the events
+// log, which cascades away with its session exactly like plans' own
+// session_id does (see migrations/000112_plan_documents.up.sql's own
+// comment for the full "why").
+//
+// Called from DecidePlanOnTx's own PlanVerdictApprove branch, ONLY once
+// the guarded UPDATE has already won, BEFORE that branch does anything
+// else (including dispatching the implementation turn) -- see that call
+// site's own comment for why a returned error here is propagated, never
+// logged-and-continued: it must abort the whole decision, undoing the
+// guarded UPDATE via the caller's own tx.Rollback, so "approved" and "has
+// a durable snapshot" can never come apart.
+//
+// Content EXTRACTION itself stays exactly as best-effort as every existing
+// caller of plandomain.ExtractContent (sessionactor.planContentText,
+// plans.go's own planContentMap): an events-log read hiccup, or a
+// producing turn turnContentBounds cannot find (should be unreachable --
+// plans.turn_id is a NOT NULL FK to an already-dispatched turn by the time
+// a plan row exists at all), degrades to plandomain.ContentFallbackText
+// rather than failing the approval. Only the WRITE into plan_documents
+// itself is strict: a plan approved through this path always gets a row
+// here, and that row's content is never LESS honest than what every other
+// reader of this same log has always shown a human.
+//
+// turns is read via tx (turns.WithTx(tx).ListForSession): sessionRow's own
+// row lock (GetActorEpochForUpdate, taken earlier in DecidePlanOnTx) is
+// what makes "every turn dispatched in this session so far" a stable
+// snapshot for the rest of this transaction's duration, mirroring
+// DecidePlanOnTx's own pre-existing hasOpenTurn fetch immediately above.
+// events is read via the POOL-based EventStore, never WithTx --
+// EventStore's own doc comment ("no such transactional requirement...
+// never WithTx") and sessionactor.planContentText's own identical
+// precedent: every event this scan can possibly find was already
+// committed by the producing turn's own terminal-state write, long before
+// this approval could even begin.
+func snapshotApprovedPlanContent(ctx context.Context, tx pgx.Tx, turns *postgres.TurnStore, events *postgres.EventStore, planDocuments *postgres.PlanDocumentStore, sessionID pgtype.UUID, planRow sqlcgen.Plan) error {
+	sessionTurns, err := turns.WithTx(tx).ListForSession(ctx, sessionID)
+	if err != nil {
+		return fmt.Errorf("httpapi: list turns for plan snapshot: %w", err)
+	}
+
+	content := plandomain.ContentFallbackText
+	if lower, upper, ok := turnContentBounds(sessionTurns, planRow.TurnID); ok {
+		recentEvents, err := events.ListRecentForSession(ctx, sessionID, planContentEventFetchLimit)
+		if err != nil {
+			return fmt.Errorf("httpapi: list events for plan snapshot: %w", err)
+		}
+		content = plandomain.ExtractContent(sessionactor.ToContentEvents(recentEvents), lower, upper)
+	}
+
+	if _, err := planDocuments.WithTx(tx).Create(ctx, planRow.ID, content); err != nil {
+		return fmt.Errorf("httpapi: create plan document snapshot: %w", err)
+	}
+	return nil
 }
 
 // enqueuePlanDecisionNotifications implements this Step's own point 6
@@ -510,6 +588,8 @@ func DecidePlan(
 	sessions *postgres.SessionStore,
 	turns *postgres.TurnStore,
 	plans *postgres.PlanStore,
+	events *postgres.EventStore,
+	planDocuments *postgres.PlanDocumentStore,
 	outbox *postgres.OutboxStore,
 	linearAgentSessions *postgres.LinearAgentSessionStore,
 	auditLog *postgres.AuditLogStore,
@@ -532,7 +612,7 @@ func DecidePlan(
 		return DecidePlanOutcome{}, fmt.Errorf("httpapi: get session for plan decision: %w", err)
 	}
 
-	outcome, err := DecidePlanOnTx(ctx, tx, sessions, turns, plans, outbox, linearAgentSessions, auditLog, sessionRow, planID, verdict, decidedBy, epistemicCheckDefault)
+	outcome, err := DecidePlanOnTx(ctx, tx, sessions, turns, plans, events, planDocuments, outbox, linearAgentSessions, auditLog, sessionRow, planID, verdict, decidedBy, epistemicCheckDefault)
 	if err != nil {
 		return DecidePlanOutcome{}, err
 	}

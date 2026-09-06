@@ -205,6 +205,8 @@ func newSlackTestRigWithEpistemicCheckDefault(t *testing.T, pool *pgxpool.Pool, 
 	deliveries := narvipg.NewWebhookDeliveryStore(pool)
 	threads := narvipg.NewSlackThreadSessionStore(pool)
 	plans := narvipg.NewPlanStore(pool)
+	events := narvipg.NewEventStore(pool)
+	planDocuments := narvipg.NewPlanDocumentStore(pool)
 	auditLog := narvipg.NewAuditLogStore(pool)
 
 	registry, err := sessionactor.NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "http://localhost:8080", nil, nil, "", nil, false)
@@ -214,15 +216,17 @@ func newSlackTestRigWithEpistemicCheckDefault(t *testing.T, pool *pgxpool.Pool, 
 	t.Cleanup(func() { _ = registry.Shutdown() })
 
 	handler := slack.NewHandler(slack.Deps{
-		Pool:         pool,
-		Sessions:     sessions,
-		Turns:        turns,
-		Environments: environments,
-		Registry:     registry,
-		Deliveries:   deliveries,
-		Threads:      threads,
-		Plans:        plans,
-		AuditLog:     auditLog,
+		Pool:          pool,
+		Sessions:      sessions,
+		Turns:         turns,
+		Environments:  environments,
+		Registry:      registry,
+		Deliveries:    deliveries,
+		Threads:       threads,
+		Plans:         plans,
+		Events:        events,
+		PlanDocuments: planDocuments,
+		AuditLog:      auditLog,
 		// Participants (§13.2's own SECOND fix-pass addition, "identities
 		// + full RBAC", §13.2/§13.3): authorizeSessionAction (identity.go)
 		// needs this even though this rig's own fixture users never

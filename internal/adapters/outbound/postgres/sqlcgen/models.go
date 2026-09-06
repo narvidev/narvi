@@ -1888,6 +1888,13 @@ type Plan struct {
 	SlackMessageTs *string            `json:"slack_message_ts"`
 }
 
+type PlanDocument struct {
+	ID        pgtype.UUID        `json:"id"`
+	PlanID    pgtype.UUID        `json:"plan_id"`
+	Content   *string            `json:"content"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
 type PromptTemplate struct {
 	Name      string             `json:"name"`
 	Template  string             `json:"template"`

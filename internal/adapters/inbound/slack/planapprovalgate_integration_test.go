@@ -56,6 +56,8 @@ func newSlackPlanGateTestRig(t *testing.T, pool *pgxpool.Pool, recordingSlackSer
 	deliveries := narvipg.NewWebhookDeliveryStore(pool)
 	threads := narvipg.NewSlackThreadSessionStore(pool)
 	plans := narvipg.NewPlanStore(pool)
+	events := narvipg.NewEventStore(pool)
+	planDocuments := narvipg.NewPlanDocumentStore(pool)
 	outbox := narvipg.NewOutboxStore(pool, false)
 	linearAgentSessions := narvipg.NewLinearAgentSessionStore(pool)
 
@@ -74,6 +76,8 @@ func newSlackPlanGateTestRig(t *testing.T, pool *pgxpool.Pool, recordingSlackSer
 		Deliveries:          deliveries,
 		Threads:             threads,
 		Plans:               plans,
+		Events:              events,
+		PlanDocuments:       planDocuments,
 		Outbox:              outbox,
 		LinearAgentSessions: linearAgentSessions,
 		AuditLog:            auditLog,

@@ -375,6 +375,8 @@ func TestHandlePlanVerdict_UnauthorizedActor_DeniedByOwnAuthorizationCheck(t *te
 	sessions := narvipg.NewSessionStore(pool)
 	turns := narvipg.NewTurnStore(pool)
 	plans := narvipg.NewPlanStore(pool)
+	events := narvipg.NewEventStore(pool)
+	planDocuments := narvipg.NewPlanDocumentStore(pool)
 	outbox := narvipg.NewOutboxStore(pool, false)
 	linearAgentSessions := narvipg.NewLinearAgentSessionStore(pool)
 	participants := narvipg.NewParticipantStore(pool)
@@ -407,6 +409,8 @@ func TestHandlePlanVerdict_UnauthorizedActor_DeniedByOwnAuthorizationCheck(t *te
 		Sessions:            sessions,
 		Turns:               turns,
 		Plans:               plans,
+		Events:              events,
+		PlanDocuments:       planDocuments,
 		Outbox:              outbox,
 		LinearAgentSessions: linearAgentSessions,
 		AuditLog:            auditLog,

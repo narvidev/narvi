@@ -144,6 +144,8 @@ func TestInteractivityHandler_BlockActions_ApprovePlan_AutoLinksUniqueMatch(t *t
 	sessions := narvipg.NewSessionStore(pool)
 	turns := narvipg.NewTurnStore(pool)
 	plans := narvipg.NewPlanStore(pool)
+	events := narvipg.NewEventStore(pool)
+	planDocuments := narvipg.NewPlanDocumentStore(pool)
 	auditLog := narvipg.NewAuditLogStore(pool)
 
 	registry, err := sessionactor.NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "http://localhost:8080", nil, nil, "", nil, false)
@@ -157,6 +159,8 @@ func TestInteractivityHandler_BlockActions_ApprovePlan_AutoLinksUniqueMatch(t *t
 		Sessions:            sessions,
 		Turns:               turns,
 		Plans:               plans,
+		Events:              events,
+		PlanDocuments:       planDocuments,
 		Outbox:              narvipg.NewOutboxStore(pool, false),
 		LinearAgentSessions: narvipg.NewLinearAgentSessionStore(pool),
 		Registry:            registry,
@@ -245,6 +249,8 @@ func TestInteractivityHandler_BlockActions_ApprovePlan_DeniedForUnownedMember(t 
 	sessions := narvipg.NewSessionStore(pool)
 	turns := narvipg.NewTurnStore(pool)
 	plans := narvipg.NewPlanStore(pool)
+	events := narvipg.NewEventStore(pool)
+	planDocuments := narvipg.NewPlanDocumentStore(pool)
 	auditLog := narvipg.NewAuditLogStore(pool)
 
 	registry, err := sessionactor.NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "http://localhost:8080", nil, nil, "", nil, false)
@@ -258,6 +264,8 @@ func TestInteractivityHandler_BlockActions_ApprovePlan_DeniedForUnownedMember(t 
 		Sessions:            sessions,
 		Turns:               turns,
 		Plans:               plans,
+		Events:              events,
+		PlanDocuments:       planDocuments,
 		Outbox:              narvipg.NewOutboxStore(pool, false),
 		LinearAgentSessions: narvipg.NewLinearAgentSessionStore(pool),
 		Registry:            registry,
@@ -339,6 +347,8 @@ func TestInteractivityHandler_BlockActions_ApprovePlan_DeniedForViewerEvenIfOwne
 	sessions := narvipg.NewSessionStore(pool)
 	turns := narvipg.NewTurnStore(pool)
 	plans := narvipg.NewPlanStore(pool)
+	events := narvipg.NewEventStore(pool)
+	planDocuments := narvipg.NewPlanDocumentStore(pool)
 	auditLog := narvipg.NewAuditLogStore(pool)
 
 	registry, err := sessionactor.NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "http://localhost:8080", nil, nil, "", nil, false)
@@ -352,6 +362,8 @@ func TestInteractivityHandler_BlockActions_ApprovePlan_DeniedForViewerEvenIfOwne
 		Sessions:            sessions,
 		Turns:               turns,
 		Plans:               plans,
+		Events:              events,
+		PlanDocuments:       planDocuments,
 		Outbox:              narvipg.NewOutboxStore(pool, false),
 		LinearAgentSessions: narvipg.NewLinearAgentSessionStore(pool),
 		Registry:            registry,
@@ -426,6 +438,8 @@ func TestInteractivityHandler_ViewSubmission_DeniedForUnownedMember(t *testing.T
 	sessions := narvipg.NewSessionStore(pool)
 	turns := narvipg.NewTurnStore(pool)
 	plans := narvipg.NewPlanStore(pool)
+	events := narvipg.NewEventStore(pool)
+	planDocuments := narvipg.NewPlanDocumentStore(pool)
 	auditLog := narvipg.NewAuditLogStore(pool)
 
 	registry, err := sessionactor.NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "http://localhost:8080", nil, nil, "", nil, false)
@@ -439,6 +453,8 @@ func TestInteractivityHandler_ViewSubmission_DeniedForUnownedMember(t *testing.T
 		Sessions:            sessions,
 		Turns:               turns,
 		Plans:               plans,
+		Events:              events,
+		PlanDocuments:       planDocuments,
 		Outbox:              narvipg.NewOutboxStore(pool, false),
 		LinearAgentSessions: narvipg.NewLinearAgentSessionStore(pool),
 		Registry:            registry,
@@ -1083,6 +1099,8 @@ func TestInteractivityHandler_ViewSubmission_UnknownActorDeniedAndNoticeDelivere
 	sessions := narvipg.NewSessionStore(pool)
 	turns := narvipg.NewTurnStore(pool)
 	plans := narvipg.NewPlanStore(pool)
+	events := narvipg.NewEventStore(pool)
+	planDocuments := narvipg.NewPlanDocumentStore(pool)
 	auditLog := narvipg.NewAuditLogStore(pool)
 
 	registry, err := sessionactor.NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "http://localhost:8080", nil, nil, "", nil, false)
@@ -1096,6 +1114,8 @@ func TestInteractivityHandler_ViewSubmission_UnknownActorDeniedAndNoticeDelivere
 		Sessions:            sessions,
 		Turns:               turns,
 		Plans:               plans,
+		Events:              events,
+		PlanDocuments:       planDocuments,
 		Outbox:              narvipg.NewOutboxStore(pool, false),
 		LinearAgentSessions: narvipg.NewLinearAgentSessionStore(pool),
 		Registry:            registry,
@@ -1242,6 +1262,8 @@ func TestInteractivityHandler_BlockActions_ApprovePlan_RetrySucceedsOnceLinked(t
 	sessions := narvipg.NewSessionStore(pool)
 	turns := narvipg.NewTurnStore(pool)
 	plans := narvipg.NewPlanStore(pool)
+	events := narvipg.NewEventStore(pool)
+	planDocuments := narvipg.NewPlanDocumentStore(pool)
 	auditLog := narvipg.NewAuditLogStore(pool)
 	identityLinkDeps := newIdentityLinkDepsForTest(pool, auditLog)
 
@@ -1256,6 +1278,8 @@ func TestInteractivityHandler_BlockActions_ApprovePlan_RetrySucceedsOnceLinked(t
 		Sessions:            sessions,
 		Turns:               turns,
 		Plans:               plans,
+		Events:              events,
+		PlanDocuments:       planDocuments,
 		Outbox:              narvipg.NewOutboxStore(pool, false),
 		LinearAgentSessions: narvipg.NewLinearAgentSessionStore(pool),
 		Registry:            registry,

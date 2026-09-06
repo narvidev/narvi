@@ -203,6 +203,13 @@ type Deps struct {
 	// plan mode keep working unchanged.
 	Plans *postgres.PlanStore
 
+	// Events/PlanDocuments (§31.3) -- handlePlanVerdict's own
+	// httpapi.DecidePlan call (below) needs these for its own
+	// approved-plan snapshot dependency (decideplan.go), mirroring
+	// Linear's identical Deps.Events/Deps.PlanDocuments (webhook.go).
+	Events        *postgres.EventStore
+	PlanDocuments *postgres.PlanDocumentStore
+
 	// Outbox/LinearAgentSessions are this batch's own addition ("honour a
 	// typed plan verdict"): handlePlanVerdict below now calls the SAME
 	// shared httpapi.DecidePlan every other plan-decision entry point uses
@@ -939,7 +946,7 @@ func (deps Deps) handlePlanVerdict(ctx context.Context, logger *slog.Logger, cha
 		return handleEventResult{OK: false}
 	}
 
-	outcome, err := httpapi.DecidePlan(ctx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.Outbox, deps.LinearAgentSessions, deps.AuditLog, deps.Registry, sessionID, planID, httpapi.PlanVerdict(verdict), actorUserID, deps.EpistemicCheckDefault)
+	outcome, err := httpapi.DecidePlan(ctx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.Events, deps.PlanDocuments, deps.Outbox, deps.LinearAgentSessions, deps.AuditLog, deps.Registry, sessionID, planID, httpapi.PlanVerdict(verdict), actorUserID, deps.EpistemicCheckDefault)
 
 	var text string
 	switch {

@@ -43,6 +43,8 @@ func TestWebhookHandler_Prompted_AuthzBackendErrorReleasesClaim(t *testing.T) {
 	pool := newTestPool(t)
 	deps := newHandlerDeps(t, pool)
 	deps.Plans = narvipg.NewPlanStore(pool)
+	deps.Events = narvipg.NewEventStore(pool)
+	deps.PlanDocuments = narvipg.NewPlanDocumentStore(pool)
 	deps.Outbox = narvipg.NewOutboxStore(pool, false)
 	deps.Participants = narvipg.NewParticipantStore(pool)
 
@@ -149,6 +151,8 @@ func TestWebhookHandler_PlanVerdict_AuthzBackendErrorReleasesClaim(t *testing.T)
 	pool := newTestPool(t)
 	deps := newHandlerDeps(t, pool)
 	deps.Plans = narvipg.NewPlanStore(pool)
+	deps.Events = narvipg.NewEventStore(pool)
+	deps.PlanDocuments = narvipg.NewPlanDocumentStore(pool)
 	deps.Outbox = narvipg.NewOutboxStore(pool, false)
 	deps.Participants = narvipg.NewParticipantStore(pool)
 
