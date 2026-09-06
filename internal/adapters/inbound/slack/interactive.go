@@ -104,10 +104,16 @@ import (
 // linear already gives its OAuth-install handlers and its webhook handler
 // each their own parameter shape rather than one bloated shared struct.
 type InteractiveDeps struct {
-	Pool                *pgxpool.Pool
-	Sessions            *postgres.SessionStore
-	Turns               *postgres.TurnStore
-	Plans               *postgres.PlanStore
+	Pool     *pgxpool.Pool
+	Sessions *postgres.SessionStore
+	Turns    *postgres.TurnStore
+	Plans    *postgres.PlanStore
+	// Events/PlanDocuments (§31.3) -- decideAndUpdateMessage's own
+	// httpapi.DecidePlan call (below) needs these for its own
+	// approved-plan snapshot dependency (decideplan.go), mirroring
+	// slack.Deps's/linear.Deps's identical fields exactly.
+	Events              *postgres.EventStore
+	PlanDocuments       *postgres.PlanDocumentStore
 	Outbox              *postgres.OutboxStore
 	LinearAgentSessions *postgres.LinearAgentSessionStore
 	Registry            *sessionactor.Registry
@@ -617,7 +623,7 @@ func (deps InteractiveDeps) decideAndUpdateMessage(ctx context.Context, logger *
 		return
 	}
 
-	outcome, err := httpapi.DecidePlan(decideCtx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.Outbox, deps.LinearAgentSessions, deps.AuditLog, deps.Registry, sessionID, planID, verdict, decidedBy, deps.EpistemicCheckDefault)
+	outcome, err := httpapi.DecidePlan(decideCtx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.Events, deps.PlanDocuments, deps.Outbox, deps.LinearAgentSessions, deps.AuditLog, deps.Registry, sessionID, planID, verdict, decidedBy, deps.EpistemicCheckDefault)
 
 	var text string
 	switch {

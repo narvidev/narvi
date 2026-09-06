@@ -134,6 +134,13 @@ type Deps struct {
 	Plans  *postgres.PlanStore
 	Outbox *postgres.OutboxStore
 
+	// Events/PlanDocuments (§31.3) -- handlePrompted's own
+	// httpapi.DecidePlan call (below) needs these for its own
+	// approved-plan snapshot dependency (decideplan.go), mirroring
+	// Slack's identical Deps.Events/Deps.PlanDocuments (handler.go).
+	Events        *postgres.EventStore
+	PlanDocuments *postgres.PlanDocumentStore
+
 	// Participants is §13.2's own addition ("identities + full RBAC",
 	// §13.2/§13.3) -- identity.go's own authorizeSessionAction/ownedOrJoined
 	// need this to resolve a `member` actor's own "own/joined" carve-out
@@ -1009,7 +1016,7 @@ func (deps Deps) handlePlanVerdict(ctx context.Context, logger *slog.Logger, ses
 		return false
 	}
 
-	outcome, err := httpapi.DecidePlan(ctx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.Outbox, deps.AgentSessions, deps.AuditLog, deps.Registry, sessionID, planID, httpapi.PlanVerdict(verdict), decidedBy, deps.EpistemicCheckDefault)
+	outcome, err := httpapi.DecidePlan(ctx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.Events, deps.PlanDocuments, deps.Outbox, deps.AgentSessions, deps.AuditLog, deps.Registry, sessionID, planID, httpapi.PlanVerdict(verdict), decidedBy, deps.EpistemicCheckDefault)
 	if err != nil {
 		if errors.Is(err, httpapi.ErrPlanOpenTurnInFlight) {
 			deps.postPlanOutcomeActivity(ctx, logger, organizationID, agentSessionID, "A revision is already in progress for this plan -- try again once it completes.", identityNotice)

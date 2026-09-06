@@ -582,6 +582,13 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	planStore := postgres.NewPlanStore(pool)
 	participantStore := postgres.NewParticipantStore(pool)
 
+	// planDocumentStore (§31.3) backs the approved-plan durability
+	// snapshot DecidePlanOnTx now writes in the SAME transaction as the
+	// plans row's own guarded approve UPDATE (decideplan.go) -- shared by
+	// every entry point below (REST, Slack, Linear) exactly like planStore
+	// itself already is.
+	planDocumentStore := postgres.NewPlanDocumentStore(pool)
+
 	// auditLogStore is §13.2's ("identities + full RBAC", §13.3) own
 	// addition -- every Authorize-gated state change (CreateSession,
 	// CreateTurn, ApprovePlan/RejectPlan below) writes one audit_log row
@@ -1212,6 +1219,12 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// needs this to find a mapped session's own awaiting_approval plan,
 		// if any, exactly like Linear's identical Deps.Plans wiring below.
 		Plans: planStore,
+		// Events/PlanDocuments (§31.3): DecidePlan's own approved-plan
+		// snapshot dependencies (decideplan.go) -- the SAME eventStore/
+		// planDocumentStore instances every other caller of DecidePlan
+		// already uses, never a second, independently-constructed copy.
+		Events:        eventStore,
+		PlanDocuments: planDocumentStore,
 		// Outbox/LinearAgentSessions (this batch's own addition, "honour a
 		// typed plan verdict"): handlePlanVerdict's own httpapi.DecidePlan
 		// call (handler.go) needs these exactly like the interactivity
@@ -1267,6 +1280,8 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		Sessions:            sessionStore,
 		Turns:               turnStore,
 		Plans:               planStore,
+		Events:              eventStore,
+		PlanDocuments:       planDocumentStore,
 		Outbox:              outboxStore,
 		LinearAgentSessions: linearAgentSessionStore,
 		Registry:            registry,
@@ -1705,8 +1720,8 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// doc comment for the full sequencing. outboxStore/
 		// linearAgentSessionStore (§8.1, "plan mode, cross-channel") feed
 		// DecidePlanOnTx's own cross-channel-notify step (decideplan.go).
-		r.Post("/{sessionID}/plans/{planId}/approve", httpapi.ApprovePlan(pool, sessionStore, turnStore, planStore, participantStore, outboxStore, linearAgentSessionStore, auditLogStore, registry, cfg.EpistemicCheckDefault))
-		r.Post("/{sessionID}/plans/{planId}/reject", httpapi.RejectPlan(pool, sessionStore, turnStore, planStore, participantStore, outboxStore, linearAgentSessionStore, auditLogStore, cfg.EpistemicCheckDefault))
+		r.Post("/{sessionID}/plans/{planId}/approve", httpapi.ApprovePlan(pool, sessionStore, turnStore, planStore, eventStore, planDocumentStore, participantStore, outboxStore, linearAgentSessionStore, auditLogStore, registry, cfg.EpistemicCheckDefault))
+		r.Post("/{sessionID}/plans/{planId}/reject", httpapi.RejectPlan(pool, sessionStore, turnStore, planStore, eventStore, planDocumentStore, participantStore, outboxStore, linearAgentSessionStore, auditLogStore, cfg.EpistemicCheckDefault))
 		// Audit-fix batch (completeness/discoverability, M3): the read half
 		// plans/{planId}/approve|reject above was always missing -- a web
 		// client had no way to ever discover a planId to approve. See
@@ -2196,6 +2211,12 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// handlePrompted's own new plan-verdict keyword check.
 		Plans:  planStore,
 		Outbox: outboxStore,
+		// Events/PlanDocuments (§31.3): DecidePlan's own approved-plan
+		// snapshot dependencies (decideplan.go) -- the SAME eventStore/
+		// planDocumentStore instances every other caller of DecidePlan
+		// already uses, never a second, independently-constructed copy.
+		Events:        eventStore,
+		PlanDocuments: planDocumentStore,
 		// AuditLog/IdentityLink/Participants ("identities + full
 		// RBAC", §13.2/§13.3): Participants is the SAME participantStore
 		// instance §8.1's own REST plan approve/reject endpoints already

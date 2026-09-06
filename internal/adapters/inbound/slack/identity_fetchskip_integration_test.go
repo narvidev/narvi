@@ -181,6 +181,8 @@ func TestInteractivityHandler_BlockActions_AlreadyLinkedIdentity_SkipsUsersInfoF
 	sessions := narvipg.NewSessionStore(pool)
 	turns := narvipg.NewTurnStore(pool)
 	plans := narvipg.NewPlanStore(pool)
+	events := narvipg.NewEventStore(pool)
+	planDocuments := narvipg.NewPlanDocumentStore(pool)
 	auditLog := narvipg.NewAuditLogStore(pool)
 
 	registry, err := sessionactor.NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "http://localhost:8080", nil, nil, "", nil, false)
@@ -194,6 +196,8 @@ func TestInteractivityHandler_BlockActions_AlreadyLinkedIdentity_SkipsUsersInfoF
 		Sessions:            sessions,
 		Turns:               turns,
 		Plans:               plans,
+		Events:              events,
+		PlanDocuments:       planDocuments,
 		Outbox:              narvipg.NewOutboxStore(pool, false),
 		LinearAgentSessions: narvipg.NewLinearAgentSessionStore(pool),
 		Registry:            registry,
@@ -264,6 +268,8 @@ func TestInteractivityHandler_BlockActions_UnlinkedIdentity_CallsUsersInfoFetch(
 	sessions := narvipg.NewSessionStore(pool)
 	turns := narvipg.NewTurnStore(pool)
 	plans := narvipg.NewPlanStore(pool)
+	events := narvipg.NewEventStore(pool)
+	planDocuments := narvipg.NewPlanDocumentStore(pool)
 	auditLog := narvipg.NewAuditLogStore(pool)
 
 	registry, err := sessionactor.NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "http://localhost:8080", nil, nil, "", nil, false)
@@ -277,6 +283,8 @@ func TestInteractivityHandler_BlockActions_UnlinkedIdentity_CallsUsersInfoFetch(
 		Sessions:            sessions,
 		Turns:               turns,
 		Plans:               plans,
+		Events:              events,
+		PlanDocuments:       planDocuments,
 		Outbox:              narvipg.NewOutboxStore(pool, false),
 		LinearAgentSessions: narvipg.NewLinearAgentSessionStore(pool),
 		Registry:            registry,

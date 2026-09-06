@@ -101,6 +101,11 @@ type testRig struct {
 	plans        *narvipg.PlanStore
 	participants *narvipg.ParticipantStore
 
+	// planDocuments (§31.3) backs the approved-plan durability snapshot
+	// DecidePlanOnTx now writes in the same transaction as the plans row's
+	// own guarded approve UPDATE (decideplan.go).
+	planDocuments *narvipg.PlanDocumentStore
+
 	// outbox/linearAgentSessions are §8.1's ("plan mode, cross-channel",
 	// §8.1/§13.3) own additions -- DecidePlanOnTx's own cross-channel-notify
 	// dependencies (decideplan.go), now threaded through the approve/reject
@@ -408,6 +413,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		provider:              &fakeSnapshotProvider{},
 		plans:                 narvipg.NewPlanStore(pool),
 		participants:          narvipg.NewParticipantStore(pool),
+		planDocuments:         narvipg.NewPlanDocumentStore(pool),
 		outbox:                narvipg.NewOutboxStore(pool, false),
 		linearAgentSessions:   narvipg.NewLinearAgentSessionStore(pool),
 		auditLog:              narvipg.NewAuditLogStore(pool),
@@ -493,8 +499,8 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		r.Get("/{sessionID}/uploads/{uploadID}/content", httpapi.UploadContentAPI(rig.sessions, rig.artifacts, rig.blobStore, rig.objCfg, platform.DefaultTimeouts()))
 		r.Post("/{sessionID}/ws-token", httpapi.MintWSToken(rig.sessions, rig.wsTokens, platform.DefaultTimeouts()))
 		r.Post("/{sessionID}/turns", httpapi.CreateTurn(rig.pool, rig.sessions, rig.turns, rig.plans, rig.participants, rig.auditLog, rig.registry, nil, rig.objCfg, false))
-		r.Post("/{sessionID}/plans/{planId}/approve", httpapi.ApprovePlan(rig.pool, rig.sessions, rig.turns, rig.plans, rig.participants, rig.outbox, rig.linearAgentSessions, rig.auditLog, rig.registry, false))
-		r.Post("/{sessionID}/plans/{planId}/reject", httpapi.RejectPlan(rig.pool, rig.sessions, rig.turns, rig.plans, rig.participants, rig.outbox, rig.linearAgentSessions, rig.auditLog, false))
+		r.Post("/{sessionID}/plans/{planId}/approve", httpapi.ApprovePlan(rig.pool, rig.sessions, rig.turns, rig.plans, rig.events, rig.planDocuments, rig.participants, rig.outbox, rig.linearAgentSessions, rig.auditLog, rig.registry, false))
+		r.Post("/{sessionID}/plans/{planId}/reject", httpapi.RejectPlan(rig.pool, rig.sessions, rig.turns, rig.plans, rig.events, rig.planDocuments, rig.participants, rig.outbox, rig.linearAgentSessions, rig.auditLog, false))
 		// Audit-fix batch (completeness/discoverability, M3) -- see
 		// httpapi/plans.go's own doc comment.
 		r.Get("/{sessionID}/plans", httpapi.ListPlans(rig.sessions, rig.plans, rig.turns, rig.events))

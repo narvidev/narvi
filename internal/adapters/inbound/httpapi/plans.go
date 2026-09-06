@@ -138,21 +138,6 @@ func planContentMap(ctx context.Context, turns *postgres.TurnStore, events *post
 		return nil, err
 	}
 
-	dispatched := make([]sqlcgen.Turn, 0, len(allTurns))
-	for _, t := range allTurns {
-		if t.DispatchedEventID != nil {
-			dispatched = append(dispatched, t)
-		}
-	}
-	sort.Slice(dispatched, func(i, j int) bool {
-		return *dispatched[i].DispatchedEventID < *dispatched[j].DispatchedEventID
-	})
-
-	turnIndexByID := make(map[string]int, len(dispatched))
-	for i, t := range dispatched {
-		turnIndexByID[t.ID.String()] = i
-	}
-
 	recentEvents, err := events.ListRecentForSession(ctx, sessionID, planContentEventFetchLimit)
 	if err != nil {
 		return nil, err
@@ -161,7 +146,7 @@ func planContentMap(ctx context.Context, turns *postgres.TurnStore, events *post
 
 	out := make(map[string]string, len(planRows))
 	for _, p := range planRows {
-		idx, ok := turnIndexByID[p.TurnID.String()]
+		lower, upper, ok := turnContentBounds(allTurns, p.TurnID)
 		if !ok {
 			// Defensive: plans.turn_id is a NOT NULL FK to turns and a plan
 			// row is only ever created once its producing turn has already
@@ -172,14 +157,53 @@ func planContentMap(ctx context.Context, turns *postgres.TurnStore, events *post
 			out[p.ID.String()] = plandomain.ContentFallbackText
 			continue
 		}
-		lower := dispatched[idx].DispatchedEventID
-		var upper *int64
-		if idx+1 < len(dispatched) {
-			upper = dispatched[idx+1].DispatchedEventID
-		}
 		out[p.ID.String()] = plandomain.ExtractContent(contentEvents, lower, upper)
 	}
 	return out, nil
+}
+
+// turnContentBounds returns plandomain.ExtractContent's own (lower, upper)
+// bounds for turnID, given every turn dispatched in the session so far (any
+// order, any kind -- an approval-dispatched IMPLEMENTATION turn counts
+// exactly like a plan-producing one, see this file's own top doc comment):
+// lower is turnID's own DispatchedEventID; upper is the DispatchedEventID
+// of whichever DISPATCHED turn ran next in the session, if any (nil when
+// turnID's own turn is the most recently dispatched one so far). ok is
+// false when turnID names no turn in sessionTurns with a DispatchedEventID
+// set at all -- should be unreachable for any real plan's producing turn
+// (a plan row is only ever created once its producing turn has already
+// been dispatched), but is surfaced as a plain bool rather than a panic or
+// a silent unbounded scan, so every caller degrades the SAME honest way
+// (plandomain.ContentFallbackText) instead of assuming it can't happen.
+//
+// Factored out of planContentMap above so httpapi's OTHER caller of this
+// exact bounds calculation (decideplan.go's own approved-plan snapshot,
+// §31.3) shares ONE implementation of an algorithm this package has
+// already been bitten by an off-by-one in once (see plandomain.
+// ExtractContent's own doc comment) -- never a second, independently
+// re-derived copy that can silently drift from this one.
+func turnContentBounds(sessionTurns []sqlcgen.Turn, turnID pgtype.UUID) (lower, upper *int64, ok bool) {
+	dispatched := make([]sqlcgen.Turn, 0, len(sessionTurns))
+	for _, t := range sessionTurns {
+		if t.DispatchedEventID != nil {
+			dispatched = append(dispatched, t)
+		}
+	}
+	sort.Slice(dispatched, func(i, j int) bool {
+		return *dispatched[i].DispatchedEventID < *dispatched[j].DispatchedEventID
+	})
+
+	for i, t := range dispatched {
+		if t.ID != turnID {
+			continue
+		}
+		lower = dispatched[i].DispatchedEventID
+		if i+1 < len(dispatched) {
+			upper = dispatched[i+1].DispatchedEventID
+		}
+		return lower, upper, true
+	}
+	return nil, nil, false
 }
 
 // planWireMap maps one sqlcgen.Plan row (plus its own separately-computed

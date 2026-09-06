@@ -39,6 +39,8 @@ func TestWebhookHandler_Prompted_ApproveKeyword_DecidesPlan(t *testing.T) {
 	pool := newTestPool(t)
 	deps := newHandlerDeps(t, pool)
 	deps.Plans = narvipg.NewPlanStore(pool)
+	deps.Events = narvipg.NewEventStore(pool)
+	deps.PlanDocuments = narvipg.NewPlanDocumentStore(pool)
 	deps.Outbox = narvipg.NewOutboxStore(pool, false)
 	deps.Participants = narvipg.NewParticipantStore(pool)
 
@@ -122,6 +124,8 @@ func TestWebhookHandler_Prompted_NonKeywordNonReviseText_BlockedByAwaitingPlan(t
 	pool := newTestPool(t)
 	deps := newHandlerDeps(t, pool)
 	deps.Plans = narvipg.NewPlanStore(pool)
+	deps.Events = narvipg.NewEventStore(pool)
+	deps.PlanDocuments = narvipg.NewPlanDocumentStore(pool)
 	deps.Outbox = narvipg.NewOutboxStore(pool, false)
 	deps.Participants = narvipg.NewParticipantStore(pool)
 
@@ -212,6 +216,8 @@ func TestWebhookHandler_Prompted_RevisePrefix_CreatesPlanModeTurnWithStrippedFee
 	pool := newTestPool(t)
 	deps := newHandlerDeps(t, pool)
 	deps.Plans = narvipg.NewPlanStore(pool)
+	deps.Events = narvipg.NewEventStore(pool)
+	deps.PlanDocuments = narvipg.NewPlanDocumentStore(pool)
 	deps.Outbox = narvipg.NewOutboxStore(pool, false)
 	deps.Participants = narvipg.NewParticipantStore(pool)
 
@@ -304,6 +310,8 @@ func TestWebhookHandler_Prompted_ApproveKeyword_UnknownActorDenied(t *testing.T)
 	pool := newTestPool(t)
 	deps := newHandlerDeps(t, pool)
 	deps.Plans = narvipg.NewPlanStore(pool)
+	deps.Events = narvipg.NewEventStore(pool)
+	deps.PlanDocuments = narvipg.NewPlanDocumentStore(pool)
 	deps.Outbox = narvipg.NewOutboxStore(pool, false)
 	deps.Participants = narvipg.NewParticipantStore(pool)
 

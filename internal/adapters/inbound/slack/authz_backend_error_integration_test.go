@@ -171,6 +171,8 @@ func TestInteractivityHandler_BlockActions_ApprovePlan_AuthzBackendError(t *test
 	sessions := narvipg.NewSessionStore(pool)
 	turns := narvipg.NewTurnStore(pool)
 	plans := narvipg.NewPlanStore(pool)
+	events := narvipg.NewEventStore(pool)
+	planDocuments := narvipg.NewPlanDocumentStore(pool)
 	auditLog := narvipg.NewAuditLogStore(pool)
 
 	registry, err := sessionactor.NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "http://localhost:8080", nil, nil, "", nil, false)
@@ -208,6 +210,8 @@ func TestInteractivityHandler_BlockActions_ApprovePlan_AuthzBackendError(t *test
 		Sessions:            brokenSessions, // the deliberately-broken store
 		Turns:               turns,
 		Plans:               plans,
+		Events:              events,
+		PlanDocuments:       planDocuments,
 		Outbox:              narvipg.NewOutboxStore(pool, false),
 		LinearAgentSessions: narvipg.NewLinearAgentSessionStore(pool),
 		Registry:            registry,
@@ -288,6 +292,8 @@ func TestInteractivityHandler_ViewSubmission_AuthzBackendError(t *testing.T) {
 	sessions := narvipg.NewSessionStore(pool)
 	turns := narvipg.NewTurnStore(pool)
 	plans := narvipg.NewPlanStore(pool)
+	events := narvipg.NewEventStore(pool)
+	planDocuments := narvipg.NewPlanDocumentStore(pool)
 	auditLog := narvipg.NewAuditLogStore(pool)
 
 	registry, err := sessionactor.NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "http://localhost:8080", nil, nil, "", nil, false)
@@ -323,6 +329,8 @@ func TestInteractivityHandler_ViewSubmission_AuthzBackendError(t *testing.T) {
 		Sessions:            brokenSessions, // the deliberately-broken store
 		Turns:               turns,
 		Plans:               plans,
+		Events:              events,
+		PlanDocuments:       planDocuments,
 		Outbox:              narvipg.NewOutboxStore(pool, false),
 		LinearAgentSessions: narvipg.NewLinearAgentSessionStore(pool),
 		Registry:            registry,

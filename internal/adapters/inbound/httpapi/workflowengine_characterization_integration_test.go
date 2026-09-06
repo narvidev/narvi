@@ -337,7 +337,9 @@ func TestCharacterization_PlanLane_ApprovalTurn_UnaffectedByEngine(t *testing.T)
 
 	outbox := postgres.NewOutboxStore(rig.pool, false)
 	linearAgentSessions := postgres.NewLinearAgentSessionStore(rig.pool)
-	outcome, err := DecidePlan(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, outbox, linearAgentSessions, rig.auditLog, rig.registry, session.ID, plan.ID, PlanVerdictApprove, pgtype.UUID{}, false)
+	events := postgres.NewEventStore(rig.pool)
+	planDocuments := postgres.NewPlanDocumentStore(rig.pool)
+	outcome, err := DecidePlan(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, events, planDocuments, outbox, linearAgentSessions, rig.auditLog, rig.registry, session.ID, plan.ID, PlanVerdictApprove, pgtype.UUID{}, false)
 	if err != nil {
 		t.Fatalf("DecidePlan: %v", err)
 	}

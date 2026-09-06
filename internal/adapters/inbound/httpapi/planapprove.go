@@ -139,7 +139,10 @@ func authorizePlanAction(w http.ResponseWriter, r *http.Request, participants *p
 // item 3's own "Approve & build" action). See this file's own top doc
 // comment for the full sequencing; the actual decision now runs through
 // DecidePlanOnTx (decideplan.go), shared with every other entry point.
-func ApprovePlan(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, participants *postgres.ParticipantStore, outbox *postgres.OutboxStore, linearAgentSessions *postgres.LinearAgentSessionStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, epistemicCheckDefault bool) http.HandlerFunc {
+// events/planDocuments (§31.3) are DecidePlanOnTx's own approved-plan
+// snapshot dependencies -- threaded through here rather than constructed
+// inline, exactly like every other store this handler already receives.
+func ApprovePlan(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, events *postgres.EventStore, planDocuments *postgres.PlanDocumentStore, participants *postgres.ParticipantStore, outbox *postgres.OutboxStore, linearAgentSessions *postgres.LinearAgentSessionStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, epistemicCheckDefault bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sessionID, ok := parseSessionID(w, r)
 		if !ok {
@@ -171,7 +174,7 @@ func ApprovePlan(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *pos
 			return
 		}
 
-		outcome, err := DecidePlanOnTx(ctx, tx, sessions, turns, plans, outbox, linearAgentSessions, auditLog, sessionRow, planID, PlanVerdictApprove, actorUserID, epistemicCheckDefault)
+		outcome, err := DecidePlanOnTx(ctx, tx, sessions, turns, plans, events, planDocuments, outbox, linearAgentSessions, auditLog, sessionRow, planID, PlanVerdictApprove, actorUserID, epistemicCheckDefault)
 		if err != nil {
 			if errors.Is(err, ErrPlanOpenTurnInFlight) {
 				// Mirrors CreateTurn's own hasOpenTurn 409 gate (turn.go)
@@ -244,7 +247,7 @@ func ApprovePlan(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *pos
 // this codebase (turn.go's own doc comment on CreateTurnCore: "every call
 // site must compile-time-decide what to pass, exactly like planMode
 // itself").
-func RejectPlan(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, participants *postgres.ParticipantStore, outbox *postgres.OutboxStore, linearAgentSessions *postgres.LinearAgentSessionStore, auditLog *postgres.AuditLogStore, epistemicCheckDefault bool) http.HandlerFunc {
+func RejectPlan(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, events *postgres.EventStore, planDocuments *postgres.PlanDocumentStore, participants *postgres.ParticipantStore, outbox *postgres.OutboxStore, linearAgentSessions *postgres.LinearAgentSessionStore, auditLog *postgres.AuditLogStore, epistemicCheckDefault bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sessionID, ok := parseSessionID(w, r)
 		if !ok {
@@ -276,7 +279,7 @@ func RejectPlan(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *post
 			return
 		}
 
-		outcome, err := DecidePlanOnTx(ctx, tx, sessions, turns, plans, outbox, linearAgentSessions, auditLog, sessionRow, planID, PlanVerdictReject, actorUserID, epistemicCheckDefault)
+		outcome, err := DecidePlanOnTx(ctx, tx, sessions, turns, plans, events, planDocuments, outbox, linearAgentSessions, auditLog, sessionRow, planID, PlanVerdictReject, actorUserID, epistemicCheckDefault)
 		if err != nil {
 			logger.Error("httpapi: decide plan (reject) failed", "error", err)
 			writeError(w, http.StatusInternalServerError, "internal error")
