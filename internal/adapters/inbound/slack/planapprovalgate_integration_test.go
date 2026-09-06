@@ -67,6 +67,13 @@ func newSlackPlanGateTestRig(t *testing.T, pool *pgxpool.Pool, recordingSlackSer
 	}
 	t.Cleanup(func() { _ = registry.Shutdown() })
 
+	// prSessions (§31.4): see newSlackTestRigWithEpistemicCheckDefault's own
+	// identical addition (handler_integration_test.go).
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
+	if err := prSessions.EnsureRow(ctx, "narvidev/narvi", 1); err != nil {
+		t.Fatalf("seed github_pr_sessions entitlement: %v", err)
+	}
+
 	handler := slack.NewHandler(slack.Deps{
 		Pool:                pool,
 		Sessions:            sessions,
@@ -81,6 +88,7 @@ func newSlackPlanGateTestRig(t *testing.T, pool *pgxpool.Pool, recordingSlackSer
 		Outbox:              outbox,
 		LinearAgentSessions: linearAgentSessions,
 		AuditLog:            auditLog,
+		PRSessions:          prSessions,
 		Participants:        narvipg.NewParticipantStore(pool),
 		SigningSecret:       testSigningSecret,
 		DefaultRepoName:     "narvi",

@@ -66,6 +66,7 @@ func TestCreateSessionOnTx_RolloutGate_OpenMode_NoOpEvenWithNoRepoSettingsRow(t 
 	environments := narvipg.NewEnvironmentStore(pool)
 	auditLog := narvipg.NewAuditLogStore(pool)
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
 
 	repoURL, _ := rolloutTestRepo(t)
 	req := newRolloutGateTestReq(repoURL)
@@ -77,7 +78,7 @@ func TestCreateSessionOnTx_RolloutGate_OpenMode_NoOpEvenWithNoRepoSettingsRow(t 
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	created, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeOpen, repoSettings)
+	created, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeOpen, repoSettings, prSessions)
 	if cerr != nil {
 		t.Fatalf("CreateSessionOnTx: status=%d message=%q, want success (open mode is a byte-for-byte no-op, even with zero repo_settings rows for this repo)", cerr.Status, cerr.Message)
 	}
@@ -97,6 +98,7 @@ func TestCreateSessionOnTx_RolloutGate_CohortMode_EnrolledRepoAdmitted(t *testin
 	environments := narvipg.NewEnvironmentStore(pool)
 	auditLog := narvipg.NewAuditLogStore(pool)
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
 
 	repoURL, fullName := rolloutTestRepo(t)
 	if _, err := repoSettings.UpsertSessionsEnabled(ctx, fullName, true); err != nil {
@@ -112,7 +114,7 @@ func TestCreateSessionOnTx_RolloutGate_CohortMode_EnrolledRepoAdmitted(t *testin
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	created, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings)
+	created, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings, prSessions)
 	if cerr != nil {
 		t.Fatalf("CreateSessionOnTx: status=%d message=%q, want success (repo is enrolled)", cerr.Status, cerr.Message)
 	}
@@ -132,6 +134,7 @@ func TestCreateSessionOnTx_RolloutGate_CohortMode_AbsentRowRefused(t *testing.T)
 	environments := narvipg.NewEnvironmentStore(pool)
 	auditLog := narvipg.NewAuditLogStore(pool)
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
 
 	repoURL, _ := rolloutTestRepo(t)
 	req := newRolloutGateTestReq(repoURL)
@@ -143,7 +146,7 @@ func TestCreateSessionOnTx_RolloutGate_CohortMode_AbsentRowRefused(t *testing.T)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	_, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings)
+	_, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings, prSessions)
 	if cerr == nil {
 		t.Fatal("CreateSessionOnTx: got nil error, want refusal for an unenrolled (no row at all) repo under ModeCohort")
 	}
@@ -167,6 +170,7 @@ func TestCreateSessionOnTx_RolloutGate_CohortMode_DisabledRowRefused(t *testing.
 	environments := narvipg.NewEnvironmentStore(pool)
 	auditLog := narvipg.NewAuditLogStore(pool)
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
 
 	repoURL, fullName := rolloutTestRepo(t)
 	// Explicitly write sessions_enabled=false (as opposed to
@@ -185,7 +189,7 @@ func TestCreateSessionOnTx_RolloutGate_CohortMode_DisabledRowRefused(t *testing.
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	_, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings)
+	_, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings, prSessions)
 	if cerr == nil {
 		t.Fatal("CreateSessionOnTx: got nil error, want refusal for a repo whose row explicitly sets sessions_enabled=false")
 	}
@@ -209,6 +213,7 @@ func TestCreateSessionOnTx_RolloutGate_CohortMode_MultiRepoRequiresAllEnrolled(t
 	environments := narvipg.NewEnvironmentStore(pool)
 	auditLog := narvipg.NewAuditLogStore(pool)
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
 
 	enrolledURL, enrolledFullName := "https://github.com/acme/"+t.Name()+"-enrolled.git", "acme/"+t.Name()+"-enrolled"
 	unenrolledURL := "https://github.com/acme/" + t.Name() + "-unenrolled.git"
@@ -225,7 +230,7 @@ func TestCreateSessionOnTx_RolloutGate_CohortMode_MultiRepoRequiresAllEnrolled(t
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	_, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings)
+	_, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings, prSessions)
 	if cerr == nil {
 		t.Fatal("CreateSessionOnTx: got nil error, want refusal -- one of the two named repos is not enrolled")
 	}
@@ -241,7 +246,7 @@ func TestCreateSessionOnTx_RolloutGate_CohortMode_MultiRepoRequiresAllEnrolled(t
 // derive the identical owner/repo via reposource.ParseOwnerRepo's own
 // deliberately host-agnostic parsing. This must be refused.
 //
-// Mutation anchor: removing resolveRolloutRepoFullName's own
+// Mutation anchor: removing resolveTrustedRepoFullName's own
 // reposource.CheckRepoHost call (rolloutgate.go) -- i.e. calling
 // reposource.ParseOwnerRepo directly on repo.Url with no host check first
 // -- makes this test incorrectly PASS admission (spoofed as the real
@@ -255,6 +260,7 @@ func TestCreateSessionOnTx_RolloutGate_CohortMode_CrossHostSpoofRefused(t *testi
 	environments := narvipg.NewEnvironmentStore(pool)
 	auditLog := narvipg.NewAuditLogStore(pool)
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
 
 	ownerRepo := "acme/" + t.Name() + "-spoof"
 	if _, err := repoSettings.UpsertSessionsEnabled(ctx, ownerRepo, true); err != nil {
@@ -275,7 +281,7 @@ func TestCreateSessionOnTx_RolloutGate_CohortMode_CrossHostSpoofRefused(t *testi
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	_, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings)
+	_, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings, prSessions)
 	if cerr == nil {
 		t.Fatal("CreateSessionOnTx: got nil error, want refusal -- evil.example must never be treated as the github.com repo it happens to share an owner/repo path with")
 	}
@@ -324,6 +330,7 @@ func TestCreateSessionOnTx_RolloutGate_CohortMode_ReadErrorFailsClosedButNotAsPo
 	environments := narvipg.NewEnvironmentStore(pool)
 	auditLog := narvipg.NewAuditLogStore(pool)
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
 
 	repoURL, _ := rolloutTestRepo(t)
 	req := newRolloutGateTestReq(repoURL)
@@ -342,7 +349,7 @@ func TestCreateSessionOnTx_RolloutGate_CohortMode_ReadErrorFailsClosedButNotAsPo
 	// query, which pgx surfaces the SAME way: a non-nil, non-ErrNoRows
 	// error on the query call).
 
-	_, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings)
+	_, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings, prSessions)
 	if cerr == nil {
 		t.Fatal("CreateSessionOnTx: got nil error, want refusal -- a genuine repo_settings read failure must fail CLOSED, never silently admit")
 	}

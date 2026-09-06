@@ -61,7 +61,14 @@ func newFixture(t *testing.T) *testFixture {
 	t.Cleanup(func() { _ = registry.Shutdown() })
 
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
-	engine := automation.NewEngine(automations, invocations, runs, sessions, turns, environments, auditLog, pool, registry, platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings)
+	// prSessions (§31.4): threaded through like every other
+	// CreateSessionOnTx-reaching caller now requires -- createAutomation
+	// below (this file's own shared target-repo fixture) always makes its
+	// generated targets known via EnsureRow, so this Engine's own
+	// entitlement gate admits them exactly like it would a real,
+	// previously-mentioned repo.
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
+	engine := automation.NewEngine(automations, invocations, runs, sessions, turns, environments, auditLog, pool, registry, platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings, prSessions)
 
 	return &testFixture{
 		pool: pool, automations: automations, invocations: invocations, runs: runs,
@@ -77,10 +84,21 @@ func (f *testFixture) createAutomation(t *testing.T, name string, numTargets int
 	ctx := context.Background()
 
 	targets := make([]domainautomation.Target, numTargets)
+	prSessions := narvipg.NewGitHubPRSessionStore(f.pool)
 	for i := range targets {
 		targets[i] = domainautomation.Target{
 			Name: fmt.Sprintf("repo-%d", i),
 			URL:  fmt.Sprintf("https://github.com/acme/repo-%d", i),
+		}
+		// §31.4: CreateSessionOnTx's own entitlement gate now requires
+		// every named repo to be known (github_pr_sessions) regardless of
+		// rollout mode -- every test in this file that expects fan-out to
+		// actually create a session depends on this fixture's own targets
+		// being admitted, not merely well-formed, so this is seeded HERE,
+		// once, rather than by each test individually (mirrors this
+		// function's own existing "one shared target-repo fixture" role).
+		if err := prSessions.EnsureRow(ctx, fmt.Sprintf("acme/repo-%d", i), 1); err != nil {
+			t.Fatalf("seed github_pr_sessions entitlement for repo-%d: %v", i, err)
 		}
 	}
 	reposJSON, err := json.Marshal(targets)

@@ -21,6 +21,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
+	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/automation"
 	domainautomation "github.com/narvidev/narvi/internal/domain/automation"
@@ -35,6 +36,14 @@ func (f *testFixture) createCronAutomation(t *testing.T, name, schedule string, 
 	ctx := context.Background()
 
 	targets := []domainautomation.Target{{Name: "repo", URL: "https://github.com/acme/repo"}}
+	// §31.4: CreateSessionOnTx's own entitlement gate now requires this
+	// fixture repo to be known -- see automation_integration_test.go's own
+	// createAutomation, which seeds its OWN distinct target repos the SAME
+	// way (this file uses a fixed "acme/repo" instead of that helper's
+	// per-index names, so it is seeded here, independently).
+	if err := narvipg.NewGitHubPRSessionStore(f.pool).EnsureRow(ctx, "acme/repo", 1); err != nil {
+		t.Fatalf("seed github_pr_sessions entitlement: %v", err)
+	}
 	reposJSON, err := json.Marshal(targets)
 	if err != nil {
 		t.Fatalf("marshal repos: %v", err)
@@ -231,6 +240,14 @@ func TestFanOut_HonorsSandboxSettings(t *testing.T) {
 	ctx := context.Background()
 
 	targets := []domainautomation.Target{{Name: "repo", URL: "https://github.com/acme/repo"}}
+	// §31.4: CreateSessionOnTx's own entitlement gate now requires this
+	// fixture repo to be known -- see automation_integration_test.go's own
+	// createAutomation, which seeds its OWN distinct target repos the SAME
+	// way (this file uses a fixed "acme/repo" instead of that helper's
+	// per-index names, so it is seeded here, independently).
+	if err := narvipg.NewGitHubPRSessionStore(f.pool).EnsureRow(ctx, "acme/repo", 1); err != nil {
+		t.Fatalf("seed github_pr_sessions entitlement: %v", err)
+	}
 	reposJSON, err := json.Marshal(targets)
 	if err != nil {
 		t.Fatalf("marshal repos: %v", err)
@@ -302,6 +319,14 @@ func TestFanOut_ThreadsEnvVarsIntoDispatchedPrompt(t *testing.T) {
 	ctx := context.Background()
 
 	targets := []domainautomation.Target{{Name: "repo", URL: "https://github.com/acme/repo"}}
+	// §31.4: CreateSessionOnTx's own entitlement gate now requires this
+	// fixture repo to be known -- see automation_integration_test.go's own
+	// createAutomation, which seeds its OWN distinct target repos the SAME
+	// way (this file uses a fixed "acme/repo" instead of that helper's
+	// per-index names, so it is seeded here, independently).
+	if err := narvipg.NewGitHubPRSessionStore(f.pool).EnsureRow(ctx, "acme/repo", 1); err != nil {
+		t.Fatalf("seed github_pr_sessions entitlement: %v", err)
+	}
 	reposJSON, err := json.Marshal(targets)
 	if err != nil {
 		t.Fatalf("marshal repos: %v", err)

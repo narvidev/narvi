@@ -586,6 +586,13 @@ func newSlackHandlerRigForIdentityTests(t *testing.T, pool *pgxpool.Pool, record
 	}
 	t.Cleanup(func() { _ = registry.Shutdown() })
 
+	// prSessions (§31.4): see newSlackTestRigWithEpistemicCheckDefault's own
+	// identical addition (handler_integration_test.go).
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
+	if err := prSessions.EnsureRow(ctx, "narvidev/narvi", 1); err != nil {
+		t.Fatalf("seed github_pr_sessions entitlement: %v", err)
+	}
+
 	handler := slack.NewHandler(slack.Deps{
 		Pool:         pool,
 		Sessions:     sessions,
@@ -595,6 +602,7 @@ func newSlackHandlerRigForIdentityTests(t *testing.T, pool *pgxpool.Pool, record
 		Deliveries:   deliveries,
 		Threads:      threads,
 		AuditLog:     auditLog,
+		PRSessions:   prSessions,
 		// Participants (§13.2's own SECOND fix-pass addition, "identities
 		// + full RBAC", §13.2/§13.3): authorizeSessionAction (identity.go)
 		// needs this to resolve a `member` actor's own "own/joined"

@@ -184,8 +184,9 @@ func TestSentinelAutoFixNotifier_SpawnsChildSessionAndUpdatesStores(t *testing.T
 
 	sourceControl := &fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef"}
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
 	notifier := outboxworker.NewSentinelAutoFixNotifier(pool, sessions, turns, environments, auditLog, registry, sentinelFixes, reviewFindings,
-		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings,
+		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings, prSessions,
 		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool))
 
 	payload, err := json.Marshal(ports.SentinelAutoFixPayload{
@@ -354,8 +355,9 @@ func TestSentinelAutoFixNotifier_ResolveBranchSHAFails_NeverSpawnsChildSession(t
 
 	sourceControl := &fakeSentinelAutoFixSourceControl{nextSHAErr: errors.New("simulated GitHub API failure resolving origin head branch")}
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
 	notifier := outboxworker.NewSentinelAutoFixNotifier(pool, sessions, turns, environments, auditLog, registry, sentinelFixes, reviewFindings,
-		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings,
+		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings, prSessions,
 		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool))
 
 	payload, err := json.Marshal(ports.SentinelAutoFixPayload{
@@ -421,8 +423,9 @@ func TestSentinelAutoFixNotifier_CreateBranchFails_NeverSpawnsChildSession(t *te
 
 	sourceControl := &fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef", createBranchErr: errors.New("simulated GitHub API failure creating branch")}
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
 	notifier := outboxworker.NewSentinelAutoFixNotifier(pool, sessions, turns, environments, auditLog, registry, sentinelFixes, reviewFindings,
-		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings,
+		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings, prSessions,
 		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool))
 
 	payload, err := json.Marshal(ports.SentinelAutoFixPayload{
@@ -524,8 +527,9 @@ func TestSentinelAutoFixNotifier_ConcurrentDeliver_NeverDoubleSpawnsChildSession
 
 	sourceControl := &fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef"}
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
 	notifier := outboxworker.NewSentinelAutoFixNotifier(pool, sessions, turns, environments, auditLog, registry, sentinelFixes, reviewFindings,
-		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings,
+		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings, prSessions,
 		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool))
 
 	buildPayload := func(hash string) []byte {
@@ -666,8 +670,9 @@ func TestSentinelAutoFixNotifier_SecondOutboxRowForSameClaim_ReusesWinningSessio
 
 	sourceControl := &fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef"}
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
 	notifier := outboxworker.NewSentinelAutoFixNotifier(pool, sessions, turns, environments, auditLog, registry, sentinelFixes, reviewFindings,
-		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings,
+		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings, prSessions,
 		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool))
 
 	buildPayload := func(hash string) []byte {
@@ -837,8 +842,9 @@ func TestSentinelAutoFixNotifier_MissingFindingRow_IsBenignNoOp(t *testing.T) {
 
 	sourceControl := &fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef"}
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
 	notifier := outboxworker.NewSentinelAutoFixNotifier(pool, sessions, turns, environments, auditLog, registry, sentinelFixes, reviewFindings,
-		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings,
+		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings, prSessions,
 		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool))
 
 	// Deliberately NO reviewFindings.Upsert call for this hash -- it never

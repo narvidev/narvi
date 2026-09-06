@@ -64,9 +64,9 @@ import (
 // (whether through this function, or -- as internal/app/outboxworker's
 // own sentinelAutoFixNotifier now does, since the Finding-1 audit fix --
 // through the identical CreateSessionOnTx parameter directly).
-// rolloutMode/repoSettings (§32) mirror CreateSessionOnTx's own
-// identical required parameters -- see that function's own doc comment.
-// This function has no real production caller today (childsession.go's
+// rolloutMode/repoSettings (§32) and prSessions (§31.4) mirror
+// CreateSessionOnTx's own identical required parameters -- see that
+// function's own doc comment. This function has no real production caller today (childsession.go's
 // own top doc comment), but stays parameter-complete/consistent
 // regardless, exactly like every other CreateSessionOnTx-adjacent entry
 // point in this package.
@@ -85,6 +85,7 @@ func SpawnChildSession(
 	epistemicCheckDefault bool,
 	rolloutMode platform.RolloutMode,
 	repoSettings *postgres.RepoSettingsStore,
+	prSessions *postgres.GitHubPRSessionStore,
 ) (sqlcgen.Session, *CreateSessionError) {
 	logger := platform.Logger(ctx)
 
@@ -100,7 +101,7 @@ func SpawnChildSession(
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	tag := provenanceTag
-	created, hasPrompt, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, pgtype.UUID{}, epistemicCheckDefault, rolloutMode, repoSettings, ChildSessionOptions{
+	created, hasPrompt, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, pgtype.UUID{}, epistemicCheckDefault, rolloutMode, repoSettings, prSessions, ChildSessionOptions{
 		ParentSessionID: parentSessionID,
 		SpawnDepth:      spawnDepth,
 		ProvenanceTag:   &tag,

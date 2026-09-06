@@ -195,6 +195,17 @@ type Deps struct {
 	RolloutMode  platform.RolloutMode
 	RepoSettings *postgres.RepoSettingsStore
 
+	// PRSessions (§31.4) is the SAME further REQUIRED
+	// httpapi.CreateSessionCore parameter every other caller now threads
+	// through -- see RolloutMode/RepoSettings' own doc comment immediately
+	// above for the identical "required, not optional" reasoning. Linear
+	// sessions, like Slack's, always target the SAME operator-configured
+	// default repo (DefaultRepoURL below), never a per-message human
+	// choice, so this deployment's admin must ensure that repository has
+	// had at least one real GitHub PR mention (github_pr_sessions row)
+	// before Linear-originated sessions succeed.
+	PRSessions *postgres.GitHubPRSessionStore
+
 	WebhookSecret      []byte
 	TokenEncryptionKey []byte
 	DefaultRepoName    string
@@ -521,7 +532,7 @@ func (deps Deps) handleCreated(ctx context.Context, payload agentSessionEventWeb
 		return true
 	}
 
-	created, cerr := httpapi.CreateSessionCore(ctx, deps.Pool, deps.Sessions, deps.Turns, deps.Environments, deps.AuditLog, deps.Registry, req, creator, deps.EpistemicCheckDefault, deps.RolloutMode, deps.RepoSettings)
+	created, cerr := httpapi.CreateSessionCore(ctx, deps.Pool, deps.Sessions, deps.Turns, deps.Environments, deps.AuditLog, deps.Registry, req, creator, deps.EpistemicCheckDefault, deps.RolloutMode, deps.RepoSettings, deps.PRSessions)
 	if cerr != nil {
 		// (§10 Phase 6, §32): a RolloutRefusal is a PERMANENT
 		// policy refusal, never a transient failure -- checked

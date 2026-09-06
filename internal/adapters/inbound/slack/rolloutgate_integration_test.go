@@ -69,6 +69,19 @@ func newSlackAckTestRigWithRolloutMode(t *testing.T, pool *pgxpool.Pool, mode pl
 	}
 	t.Cleanup(func() { _ = registry.Shutdown() })
 
+	// prSessions (§31.4): this rig's own entitlement gate runs BEFORE the
+	// rollout gate mode/repoSettings above exist to exercise -- see
+	// newSlackTestRigWithEpistemicCheckDefault's own identical addition
+	// (handler_integration_test.go). Entitlement and rollout enrollment are
+	// orthogonal: this repo is made KNOWN here regardless of mode, so
+	// TestHandler_NewMention_RolloutRefusal_PostsHonestAckAndKeepsClaims's
+	// own refusal is demonstrably a ROLLOUT refusal, never an entitlement
+	// one reaching the same observable (ack) shape for the wrong reason.
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
+	if err := prSessions.EnsureRow(ctx, "narvidev/narvi", 1); err != nil {
+		t.Fatalf("seed github_pr_sessions entitlement: %v", err)
+	}
+
 	handler := slack.NewHandler(slack.Deps{
 		Pool:            pool,
 		Sessions:        sessions,
@@ -79,6 +92,7 @@ func newSlackAckTestRigWithRolloutMode(t *testing.T, pool *pgxpool.Pool, mode pl
 		Threads:         threads,
 		AuditLog:        auditLog,
 		Participants:    narvipg.NewParticipantStore(pool),
+		PRSessions:      prSessions,
 		SigningSecret:   testSigningSecret,
 		DefaultRepoName: "narvi",
 		DefaultRepoURL:  "https://github.com/narvidev/narvi",

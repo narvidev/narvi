@@ -299,6 +299,19 @@ type Deps struct {
 	RolloutMode  platform.RolloutMode
 	RepoSettings *postgres.RepoSettingsStore
 
+	// PRSessions (§31.4) is the SAME further REQUIRED
+	// httpapi.CreateSessionCore parameter every other caller now threads
+	// through -- see RolloutMode/RepoSettings' own doc comment immediately
+	// above for the identical "required, not optional" reasoning. Slack
+	// sessions always target the SAME operator-configured DefaultRepoURL
+	// below (never a per-message human choice), so this deployment's
+	// admin must ensure that default repository has had at least one real
+	// GitHub PR mention (github_pr_sessions row) before Slack-originated
+	// sessions succeed -- the same "known repo" bar reposettings.go's own
+	// resolveKnownRepo already imposes on that repo's admin-config
+	// endpoints.
+	PRSessions *postgres.GitHubPRSessionStore
+
 	SigningSecret   string
 	DefaultRepoName string
 	DefaultRepoURL  string
@@ -1066,7 +1079,7 @@ func resolveOrClaimSession(ctx context.Context, deps Deps, logger *slog.Logger, 
 		Repos: []restdtos.CreateSessionRequestReposElem{
 			{Name: deps.DefaultRepoName, Url: deps.DefaultRepoURL},
 		},
-	}, creator, deps.EpistemicCheckDefault, deps.RolloutMode, deps.RepoSettings)
+	}, creator, deps.EpistemicCheckDefault, deps.RolloutMode, deps.RepoSettings, deps.PRSessions)
 	if cerr != nil {
 		// (§10 Phase 6, §32): a RolloutRefusal is a PERMANENT
 		// policy refusal, never a transient failure -- checked

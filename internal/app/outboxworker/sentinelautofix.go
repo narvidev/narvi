@@ -124,6 +124,24 @@ type sentinelAutoFixNotifier struct {
 	// dead-letter path.
 	rolloutMode  platform.RolloutMode
 	repoSettings *postgres.RepoSettingsStore
+	// prSessions (§31.4) is the SAME further REQUIRED
+	// httpapi.CreateSessionOnTx parameter every other caller now threads
+	// through. spawnClaimedChildSession's own req.SpawnSource below is
+	// restdtos.CreateSessionRequestSpawnSourceGithub, so
+	// CreateSessionOnTx's own checkRepoEntitlementGate
+	// (httpapi/repoentitlementgate.go) exempts this call unconditionally
+	// and never actually dereferences this field -- which is the CORRECT
+	// outcome, not merely a convenient one: payload.RepoCloneURL (below)
+	// "lets the child session check out the SAME repo the origin session
+	// did" (ports.SentinelAutoFixPayload's own doc comment), and for a
+	// cross-repo/fork PR the origin session's own clone URL is the fork,
+	// which has no github_pr_sessions row of its own -- re-deriving
+	// entitlement from it here (rather than exempting this spawn source)
+	// would wrongly deny every fix session for a fork-based finding. Still
+	// threaded through as the real store, never a nil/fake stand-in, for
+	// the same "an omittable gate dependency is an omitted gate" reason
+	// coalesce.go's own identical parameter is.
+	prSessions *postgres.GitHubPRSessionStore
 
 	// isLive and ledger are §30.7/§30.9's own resolved sentinel-fix lane
 	// short-circuit (no git mirror; suppression happens BEFORE the
@@ -172,6 +190,7 @@ func NewSentinelAutoFixNotifier(
 	epistemicCheckDefault bool,
 	rolloutMode platform.RolloutMode,
 	repoSettings *postgres.RepoSettingsStore,
+	prSessions *postgres.GitHubPRSessionStore,
 	isLive func(ctx context.Context, repoFullName string) bool,
 	ledger shadowledger.Store,
 ) ports.Notifier {
@@ -182,6 +201,7 @@ func NewSentinelAutoFixNotifier(
 		epistemicCheckDefault: epistemicCheckDefault,
 		rolloutMode:           rolloutMode,
 		repoSettings:          repoSettings,
+		prSessions:            prSessions,
 		isLive:                isLive,
 		ledger:                ledger,
 	}
@@ -564,7 +584,7 @@ func (n *sentinelAutoFixNotifier) spawnClaimedChildSession(ctx context.Context, 
 	// ProvenanceTag wants a *string, and provenance.SentinelAutoFix is a
 	// Go const -- its address cannot be taken directly.
 	provenanceTag := provenance.SentinelAutoFix
-	created, hasPrompt, cerr := httpapi.CreateSessionOnTx(ctx, tx, n.sessions, n.turns, n.environments, n.auditLog, req, pgtype.UUID{}, n.epistemicCheckDefault, n.rolloutMode, n.repoSettings, httpapi.ChildSessionOptions{
+	created, hasPrompt, cerr := httpapi.CreateSessionOnTx(ctx, tx, n.sessions, n.turns, n.environments, n.auditLog, req, pgtype.UUID{}, n.epistemicCheckDefault, n.rolloutMode, n.repoSettings, n.prSessions, httpapi.ChildSessionOptions{
 		ParentSessionID: parentSessionID,
 		SpawnDepth:      1,
 		ProvenanceTag:   &provenanceTag,

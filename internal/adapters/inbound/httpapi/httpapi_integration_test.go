@@ -470,6 +470,27 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 	}
 	t.Cleanup(func() { _ = rig.registry.Shutdown() })
 
+	// §31.4: CreateSessionOnTx's own entitlement gate (checkRepoEntitlementGate,
+	// repoentitlementgate.go) now requires every named repo to be known to
+	// this deployment (github_pr_sessions, via GitHubPRSessionStore.RepoKnown)
+	// for every spawnSource other than github -- and POST /api/sessions
+	// (the ONLY REST session-creation surface this rig's own router mounts)
+	// hard-rejects any spawnSource other than "web" (create.go's own audit
+	// remediation), so it is NEVER exempt. This package's two dominant,
+	// repo-wide test-fixture repos -- "narvidev/narvi" and "acme/widgets"
+	// (grepped across every *_test.go file in this package before choosing
+	// these two, by far the most common) -- are made known HERE, once, so
+	// every one of this rig's own ~170 existing CreateSession-reaching
+	// tests keeps passing without each one separately simulating a GitHub
+	// PR mention. A test that deliberately wants an UNKNOWN repo (proving
+	// this gate's own refusal) uses a repo name that is NOT one of these
+	// two -- see repoentitlementgate_integration_test.go.
+	for _, fullName := range []string{"narvidev/narvi", "acme/widgets"} {
+		if err := rig.prSessions.EnsureRow(ctx, fullName, 1); err != nil {
+			t.Fatalf("seed github_pr_sessions entitlement for %s: %v", fullName, err)
+		}
+	}
+
 	for _, m := range mutate {
 		m(&rig)
 	}
@@ -486,7 +507,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 
 	router.Route("/api/sessions", func(r chi.Router) {
 		r.Use(auth.Middleware(rig.userSessions, rig.users))
-		r.Post("/", httpapi.CreateSession(rig.pool, rig.sessions, rig.turns, rig.environments, rig.auditLog, rig.registry, nil, false, rig.rolloutMode, rig.repoSettings))
+		r.Post("/", httpapi.CreateSession(rig.pool, rig.sessions, rig.turns, rig.environments, rig.auditLog, rig.registry, nil, false, rig.rolloutMode, rig.repoSettings, rig.prSessions))
 		r.Get("/{sessionID}", httpapi.GetSession(rig.sessions))
 		r.Get("/{sessionID}/events", httpapi.ListEvents(rig.sessions, rig.events))
 		r.Get("/{sessionID}/artifacts", httpapi.ListArtifacts(rig.sessions, rig.artifacts))
@@ -1214,7 +1235,7 @@ func TestCreateSession_HappyPath_WritesSessionCreateAuditRow(t *testing.T) {
 	ctx := context.Background()
 	user, token := rig.createAuthenticatedUser(ctx, t)
 
-	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://example.com","branch":null}],"modelId":null,"effort":null,"planMode":false}`)
+	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://github.com/narvidev/narvi","branch":null}],"modelId":null,"effort":null,"planMode":false}`)
 	var got restdtos.Session
 	status := rig.doJSON(t, http.MethodPost, "/api/sessions", body, &got, token)
 	if status != http.StatusCreated {
@@ -1259,7 +1280,7 @@ func TestCreateSession_NoPrompt_NoTurnCreated(t *testing.T) {
 	ctx := context.Background()
 	_, token := rig.createAuthenticatedUser(ctx, t)
 
-	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://example.com","branch":null}],"modelId":null,"effort":null,"planMode":false}`)
+	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://github.com/narvidev/narvi","branch":null}],"modelId":null,"effort":null,"planMode":false}`)
 
 	var got restdtos.Session
 	status := rig.doJSON(t, http.MethodPost, "/api/sessions", body, &got, token)
@@ -1283,7 +1304,7 @@ func TestCreateSession_NoPrompt_NoTurnCreated(t *testing.T) {
 func TestCreateSession_NoAuth(t *testing.T) {
 	rig := newTestRig(t)
 
-	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://example.com","branch":null}],"modelId":null,"effort":null,"planMode":false}`)
+	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://github.com/narvidev/narvi","branch":null}],"modelId":null,"effort":null,"planMode":false}`)
 	status := rig.doJSON(t, http.MethodPost, "/api/sessions", body, nil, "" /* no cookie */)
 	if status != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d", status, http.StatusUnauthorized)
@@ -1347,7 +1368,7 @@ func TestCreateSession_InvalidRepoName_PathTraversal_Rejected(t *testing.T) {
 	ctx := context.Background()
 	user, token := rig.createAuthenticatedUser(ctx, t)
 
-	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"../escaped","url":"https://example.com","branch":null}],"modelId":null,"effort":null,"planMode":false}`)
+	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"../escaped","url":"https://github.com/narvidev/narvi","branch":null}],"modelId":null,"effort":null,"planMode":false}`)
 	status := rig.doJSON(t, http.MethodPost, "/api/sessions", body, nil, token)
 	if status != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d", status, http.StatusBadRequest)
@@ -1366,7 +1387,7 @@ func TestCreateSession_InvalidRepoBranch_DashPrefix_Rejected(t *testing.T) {
 	ctx := context.Background()
 	user, token := rig.createAuthenticatedUser(ctx, t)
 
-	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://example.com","branch":"--upload-pack=evil"}],"modelId":null,"effort":null,"planMode":false}`)
+	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://github.com/narvidev/narvi","branch":"--upload-pack=evil"}],"modelId":null,"effort":null,"planMode":false}`)
 	status := rig.doJSON(t, http.MethodPost, "/api/sessions", body, nil, token)
 	if status != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d", status, http.StatusBadRequest)
@@ -1385,7 +1406,7 @@ func TestCreateSession_NilBranch_Succeeds(t *testing.T) {
 	ctx := context.Background()
 	_, token := rig.createAuthenticatedUser(ctx, t)
 
-	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://example.com","branch":null}],"modelId":null,"effort":null,"planMode":false}`)
+	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://github.com/narvidev/narvi","branch":null}],"modelId":null,"effort":null,"planMode":false}`)
 	status := rig.doJSON(t, http.MethodPost, "/api/sessions", body, nil, token)
 	if status != http.StatusCreated {
 		t.Errorf("status = %d, want %d", status, http.StatusCreated)
@@ -1400,7 +1421,7 @@ func TestCreateSession_MultipleRepos_SecondInvalid_Rejected(t *testing.T) {
 	ctx := context.Background()
 	user, token := rig.createAuthenticatedUser(ctx, t)
 
-	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://example.com","branch":null},{"name":"../escaped","url":"https://example.com","branch":null}],"modelId":null,"effort":null,"planMode":false}`)
+	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://github.com/narvidev/narvi","branch":null},{"name":"../escaped","url":"https://github.com/narvidev/narvi","branch":null}],"modelId":null,"effort":null,"planMode":false}`)
 	status := rig.doJSON(t, http.MethodPost, "/api/sessions", body, nil, token)
 	if status != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d", status, http.StatusBadRequest)
@@ -1443,7 +1464,7 @@ func TestCreateSession_NonWebSpawnSource_Rejected(t *testing.T) {
 			ctx := context.Background()
 			user, token := rig.createAuthenticatedUser(ctx, t)
 
-			body := []byte(fmt.Sprintf(`{"spawnSource":%q,"title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://example.com","branch":null}],"modelId":null,"effort":null,"planMode":false}`, tc.spawnSource))
+			body := []byte(fmt.Sprintf(`{"spawnSource":%q,"title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://github.com/narvidev/narvi","branch":null}],"modelId":null,"effort":null,"planMode":false}`, tc.spawnSource))
 			var errBody map[string]string
 			status := rig.doJSON(t, http.MethodPost, "/api/sessions", body, &errBody, token)
 			if status != http.StatusBadRequest {
@@ -1470,7 +1491,7 @@ func TestCreateSession_WebSpawnSource_PersistsAsWeb(t *testing.T) {
 	ctx := context.Background()
 	_, token := rig.createAuthenticatedUser(ctx, t)
 
-	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://example.com","branch":null}],"modelId":null,"effort":null,"planMode":false}`)
+	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://github.com/narvidev/narvi","branch":null}],"modelId":null,"effort":null,"planMode":false}`)
 	var got restdtos.Session
 	status := rig.doJSON(t, http.MethodPost, "/api/sessions", body, &got, token)
 	if status != http.StatusCreated {
@@ -1513,7 +1534,7 @@ func TestCreateSession_EpistemicCheckEnabled_PersistsToPostgres(t *testing.T) {
 	t.Run("true carries through", func(t *testing.T) {
 		_, token := rig.createAuthenticatedUser(ctx, t)
 
-		body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://example.com","branch":null}],"modelId":null,"effort":null,"planMode":false,"epistemicCheckEnabled":true}`)
+		body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://github.com/narvidev/narvi","branch":null}],"modelId":null,"effort":null,"planMode":false,"epistemicCheckEnabled":true}`)
 		var got restdtos.Session
 		status := rig.doJSON(t, http.MethodPost, "/api/sessions", body, &got, token)
 		if status != http.StatusCreated {
@@ -1536,7 +1557,7 @@ func TestCreateSession_EpistemicCheckEnabled_PersistsToPostgres(t *testing.T) {
 	t.Run("false carries through", func(t *testing.T) {
 		_, token := rig.createAuthenticatedUser(ctx, t)
 
-		body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://example.com","branch":null}],"modelId":null,"effort":null,"planMode":false,"epistemicCheckEnabled":false}`)
+		body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://github.com/narvidev/narvi","branch":null}],"modelId":null,"effort":null,"planMode":false,"epistemicCheckEnabled":false}`)
 		var got restdtos.Session
 		status := rig.doJSON(t, http.MethodPost, "/api/sessions", body, &got, token)
 		if status != http.StatusCreated {
@@ -1559,7 +1580,7 @@ func TestCreateSession_EpistemicCheckEnabled_PersistsToPostgres(t *testing.T) {
 	t.Run("absent leaves NULL, not coerced false", func(t *testing.T) {
 		_, token := rig.createAuthenticatedUser(ctx, t)
 
-		body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://example.com","branch":null}],"modelId":null,"effort":null,"planMode":false}`)
+		body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://github.com/narvidev/narvi","branch":null}],"modelId":null,"effort":null,"planMode":false}`)
 		var got restdtos.Session
 		status := rig.doJSON(t, http.MethodPost, "/api/sessions", body, &got, token)
 		if status != http.StatusCreated {
@@ -1597,7 +1618,7 @@ func TestCreateSession_InvalidPathScope_Rejected(t *testing.T) {
 		"spawnSource": "web",
 		"title": null,
 		"prompt": null,
-		"repos": [{"name": "narvi", "url": "https://example.com", "branch": null}],
+		"repos": [{"name": "narvi", "url": "https://github.com/narvidev/narvi", "branch": null}],
 		"modelId": null,"effort":null,
 		"planMode": false,
 		"pathScope": ["apps/../etc"]
@@ -1626,7 +1647,7 @@ func TestCreateSession_ValidPathScope_CreatesEnvironment(t *testing.T) {
 		"spawnSource": "web",
 		"title": null,
 		"prompt": null,
-		"repos": [{"name": "narvi", "url": "https://example.com", "branch": null}],
+		"repos": [{"name": "narvi", "url": "https://github.com/narvidev/narvi", "branch": null}],
 		"modelId": null,"effort":null,
 		"planMode": false,
 		"pathScope": ["/apps/web/*", "/apps/api/*"]
@@ -1686,7 +1707,7 @@ func TestCreateSession_NilPathScope_LeavesEnvironmentUnset(t *testing.T) {
 	ctx := context.Background()
 	_, token := rig.createAuthenticatedUser(ctx, t)
 
-	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://example.com","branch":null}],"modelId":null,"effort":null,"planMode":false,"pathScope":null}`)
+	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://github.com/narvidev/narvi","branch":null}],"modelId":null,"effort":null,"planMode":false,"pathScope":null}`)
 
 	var got restdtos.Session
 	status := rig.doJSON(t, http.MethodPost, "/api/sessions", body, &got, token)
@@ -1735,7 +1756,7 @@ func TestCreateSession_AbsentPathScope_LeavesEnvironmentUnset(t *testing.T) {
 	// No "pathScope" key at all -- this is TestCreateSession_HappyPath's own
 	// exact request body, re-run unmodified to confirm this batch changed
 	// nothing about it.
-	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://example.com","branch":null}],"modelId":null,"effort":null,"planMode":false}`)
+	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://github.com/narvidev/narvi","branch":null}],"modelId":null,"effort":null,"planMode":false}`)
 
 	var got restdtos.Session
 	status := rig.doJSON(t, http.MethodPost, "/api/sessions", body, &got, token)
@@ -1774,7 +1795,7 @@ func TestCreateSession_EmptyPathScope_LeavesEnvironmentUnset(t *testing.T) {
 	ctx := context.Background()
 	_, token := rig.createAuthenticatedUser(ctx, t)
 
-	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://example.com","branch":null}],"modelId":null,"effort":null,"planMode":false,"pathScope":[]}`)
+	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://github.com/narvidev/narvi","branch":null}],"modelId":null,"effort":null,"planMode":false,"pathScope":[]}`)
 
 	var got restdtos.Session
 	status := rig.doJSON(t, http.MethodPost, "/api/sessions", body, &got, token)
@@ -1812,7 +1833,7 @@ func TestCreateSession_MockConfigPresent_ContractsPathOmitted_DefaultsAndCreates
 		"spawnSource": "web",
 		"title": null,
 		"prompt": null,
-		"repos": [{"name": "narvi", "url": "https://example.com", "branch": null}],
+		"repos": [{"name": "narvi", "url": "https://github.com/narvidev/narvi", "branch": null}],
 		"modelId": null,"effort":null,
 		"planMode": false,
 		"mockConfig": {}
@@ -1866,7 +1887,7 @@ func TestCreateSession_MockConfigPresent_ContractsPathSet_StoredVerbatim(t *test
 		"spawnSource": "web",
 		"title": null,
 		"prompt": null,
-		"repos": [{"name": "narvi", "url": "https://example.com", "branch": null}],
+		"repos": [{"name": "narvi", "url": "https://github.com/narvidev/narvi", "branch": null}],
 		"modelId": null,"effort":null,
 		"planMode": false,
 		"mockConfig": {"contractsPath": "services/mock-api/contracts"}
@@ -1918,7 +1939,7 @@ func TestCreateSession_MockConfigPresent_PathScopeAbsent_StillCreatesEnvironment
 	ctx := context.Background()
 	_, token := rig.createAuthenticatedUser(ctx, t)
 
-	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://example.com","branch":null}],"modelId":null,"effort":null,"planMode":false,"mockConfig":{}}`)
+	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://github.com/narvidev/narvi","branch":null}],"modelId":null,"effort":null,"planMode":false,"mockConfig":{}}`)
 
 	var got restdtos.Session
 	status := rig.doJSON(t, http.MethodPost, "/api/sessions", body, &got, token)
@@ -1967,7 +1988,7 @@ func TestCreateSession_NeitherPathScopeNorMockConfig_NoEnvironmentRow(t *testing
 	ctx := context.Background()
 	_, token := rig.createAuthenticatedUser(ctx, t)
 
-	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://example.com","branch":null}],"modelId":null,"effort":null,"planMode":false}`)
+	body := []byte(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":"narvi","url":"https://github.com/narvidev/narvi","branch":null}],"modelId":null,"effort":null,"planMode":false}`)
 
 	var got restdtos.Session
 	status := rig.doJSON(t, http.MethodPost, "/api/sessions", body, &got, token)
@@ -2009,7 +2030,7 @@ func TestCreateSession_ContractsPathTraversal_Rejected(t *testing.T) {
 		"spawnSource": "web",
 		"title": null,
 		"prompt": null,
-		"repos": [{"name": "narvi", "url": "https://example.com", "branch": null}],
+		"repos": [{"name": "narvi", "url": "https://github.com/narvidev/narvi", "branch": null}],
 		"modelId": null,"effort":null,
 		"planMode": false,
 		"mockConfig": {"contractsPath": "contracts/../etc"}
@@ -2037,7 +2058,7 @@ func TestCreateSession_ContractsPathQueryChar_Rejected(t *testing.T) {
 		"spawnSource": "web",
 		"title": null,
 		"prompt": null,
-		"repos": [{"name": "narvi", "url": "https://example.com", "branch": null}],
+		"repos": [{"name": "narvi", "url": "https://github.com/narvidev/narvi", "branch": null}],
 		"modelId": null,"effort":null,
 		"planMode": false,
 		"mockConfig": {"contractsPath": "contracts/api?ref=attacker"}
@@ -2065,7 +2086,7 @@ func TestCreateSession_ContractsPathFragmentChar_Rejected(t *testing.T) {
 		"spawnSource": "web",
 		"title": null,
 		"prompt": null,
-		"repos": [{"name": "narvi", "url": "https://example.com", "branch": null}],
+		"repos": [{"name": "narvi", "url": "https://github.com/narvidev/narvi", "branch": null}],
 		"modelId": null,"effort":null,
 		"planMode": false,
 		"mockConfig": {"contractsPath": "contracts/api#evil"}
@@ -2100,7 +2121,7 @@ func TestCreateSession_OversizedBody(t *testing.T) {
 	// cap -- json.Decoder will hit http.MaxBytesReader's own limit before
 	// ever producing a complete value.
 	huge := strings.Repeat("a", 2<<20) // 2 MiB
-	body := []byte(fmt.Sprintf(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":%q,"url":"https://example.com","branch":null}],"modelId":null,"effort":null,"planMode":false}`, huge))
+	body := []byte(fmt.Sprintf(`{"spawnSource":"web","title":null,"prompt":null,"repos":[{"name":%q,"url":"https://github.com/narvidev/narvi","branch":null}],"modelId":null,"effort":null,"planMode":false}`, huge))
 
 	status := rig.doJSON(t, http.MethodPost, "/api/sessions", body, nil, token)
 	if status != http.StatusRequestEntityTooLarge {
