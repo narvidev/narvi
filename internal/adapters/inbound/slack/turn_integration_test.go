@@ -90,6 +90,14 @@ func newSlackAckTestRig(t *testing.T, pool *pgxpool.Pool) *slackAckTestRig {
 	}
 	t.Cleanup(func() { _ = registry.Shutdown() })
 
+	// prSessions (§31.4): see newSlackTestRigWithEpistemicCheckDefault's own
+	// identical addition (handler_integration_test.go) -- this rig's own
+	// DefaultRepoURL below is the SAME fixed repo, made known here once.
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
+	if err := prSessions.EnsureRow(ctx, "narvidev/narvi", 1); err != nil {
+		t.Fatalf("seed github_pr_sessions entitlement: %v", err)
+	}
+
 	handler := slack.NewHandler(slack.Deps{
 		Pool:            pool,
 		Sessions:        sessions,
@@ -100,6 +108,7 @@ func newSlackAckTestRig(t *testing.T, pool *pgxpool.Pool) *slackAckTestRig {
 		Threads:         threads,
 		AuditLog:        auditLog,
 		Participants:    narvipg.NewParticipantStore(pool),
+		PRSessions:      prSessions,
 		SigningSecret:   testSigningSecret,
 		DefaultRepoName: "narvi",
 		DefaultRepoURL:  "https://github.com/narvidev/narvi",

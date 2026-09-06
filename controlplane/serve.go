@@ -933,7 +933,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		automationStore, automationInvocationStore, automationRunStore,
 		sessionStore, turnStore, environmentStore, auditLogStore,
 		pool, registry, cfg.Timeouts, cfg.EpistemicCheckDefault,
-		cfg.RolloutMode, repoSettingsStore,
+		cfg.RolloutMode, repoSettingsStore, githubPRSessionStore,
 	)
 
 	// The 3 stores backing §13.1's ("auth v1", §13.1/§13.4) own GitHub
@@ -1248,8 +1248,13 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// RolloutMode/RepoSettings (§10 Phase 6, §32): the SAME
 		// cfg.RolloutMode/repoSettingsStore every other CreateSessionCore-
 		// reaching caller in this file also receives.
-		RolloutMode:     cfg.RolloutMode,
-		RepoSettings:    repoSettingsStore,
+		RolloutMode:  cfg.RolloutMode,
+		RepoSettings: repoSettingsStore,
+		// PRSessions (§31.4): the SAME githubPRSessionStore
+		// instance every other CreateSessionCore-reaching caller in this
+		// file also receives -- slack.Deps.PRSessions' own doc comment
+		// explains why Slack's own fixed default repo needs it too.
+		PRSessions:      githubPRSessionStore,
 		SigningSecret:   cfg.SlackSigningSecret,
 		DefaultRepoName: cfg.SlackDefaultRepoName,
 		DefaultRepoURL:  cfg.SlackDefaultRepoURL,
@@ -1352,6 +1357,14 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 			// SessionCoalescer.RolloutMode's own doc comment for why).
 			RolloutMode:  cfg.RolloutMode,
 			RepoSettings: repoSettingsStore,
+			// PRSessions is already set above (githubPRSessionStore) --
+			// SessionCoalescer.PRSessions is not a §31.4-only addition, it
+			// predates this Step (§8.2's own per-PR claim coalescing) and
+			// this WINNER path's own CreateSessionOnTx call now also
+			// receives it as that function's new prSessions parameter --
+			// see coalesce.go's own call-site comment for why this
+			// deployment's own entitlement gate is exempt, not merely
+			// satisfied, for every session this struct creates.
 			// F7 correction (adversarial review): SessionCoalescer
 			// no longer has an EpistemicCheckDefault field -- both of its
 			// own CreateSessionOnTx/CreateTurnForBot call sites now
@@ -1690,7 +1703,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// Authorization header.
 	router.Route("/api/sessions", func(r chi.Router) {
 		r.Use(auth.Middleware(userSessionStore, userStore))
-		r.Post("/", httpapi.CreateSession(pool, sessionStore, turnStore, environmentStore, auditLogStore, registry, intentClassifierSvc, cfg.EpistemicCheckDefault, cfg.RolloutMode, repoSettingsStore))
+		r.Post("/", httpapi.CreateSession(pool, sessionStore, turnStore, environmentStore, auditLogStore, registry, intentClassifierSvc, cfg.EpistemicCheckDefault, cfg.RolloutMode, repoSettingsStore, githubPRSessionStore))
 		// GET / (list, §12.2 item 1's own sidebar addition) -- mounted
 		// alongside POST / above; chi disambiguates the two by method,
 		// and separately from GET /{sessionID} below by the literal "/"
@@ -2234,6 +2247,11 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// reaching caller in this file also receives.
 		RolloutMode:  cfg.RolloutMode,
 		RepoSettings: repoSettingsStore,
+		// PRSessions (§31.4): the SAME githubPRSessionStore
+		// instance every other CreateSessionCore-reaching caller in this
+		// file also receives -- linear.Deps.PRSessions' own doc comment
+		// explains why Linear's own fixed default repo needs it too.
+		PRSessions: githubPRSessionStore,
 	}))
 
 	// Module routes (docs/design/boundaries-design.md, section 3.2): mounted
@@ -2305,7 +2323,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// sentinelAutoFixNotifier ("sentinels + suggestions", §17.2)
 	// spawns the child session -- reviewFindingStore/sentinelFixStore are
 	// the SAME instances every other caller above already uses.
-	sentinelAutoFixNotifier := outboxworker.NewSentinelAutoFixNotifier(pool, sessionStore, turnStore, environmentStore, auditLogStore, registry, sentinelFixStore, reviewFindingStore, sourceControl, cfg.GitHubBotToken, cfg.Timeouts, cfg.EpistemicCheckDefault, cfg.RolloutMode, repoSettingsStore, isLiveEgress, shadowLedger)
+	sentinelAutoFixNotifier := outboxworker.NewSentinelAutoFixNotifier(pool, sessionStore, turnStore, environmentStore, auditLogStore, registry, sentinelFixStore, reviewFindingStore, sourceControl, cfg.GitHubBotToken, cfg.Timeouts, cfg.EpistemicCheckDefault, cfg.RolloutMode, repoSettingsStore, githubPRSessionStore, isLiveEgress, shadowLedger)
 	// handoffNotifier ("handoff-readiness sentinel", §14.4) posts
 	// the handoff-readiness comment and applies the "handoff" label on a
 	// scoped session's PR -- the SAME sourceControl/cfg.GitHubBotToken

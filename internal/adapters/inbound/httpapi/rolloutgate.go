@@ -87,23 +87,29 @@ func recordRolloutRefusal(ctx context.Context, spawnSource string) {
 	sessionRolloutRefusedTotalCounter().Add(ctx, 1, metric.WithAttributes(attribute.String("spawn_source", spawnSource)))
 }
 
-// resolveRolloutRepoFullName resolves rawURL to a trusted "owner/repo"
-// identity for the rollout gate specifically -- reposource.CheckRepoHost
-// FIRST, then ParseOwnerRepo, exactly the pairing every other
-// ParseOwnerRepo call site in this codebase already uses (app/
-// sessionactor's pushpr.go/contractdrift.go/imageresolve.go, app/
-// outboxworker's sentinelautofix.go, app/imagebuild's builder.go). This
-// pairing is load-bearing, not defensive decoration: ParseOwnerRepo is
-// deliberately host-agnostic (its own doc comment: "it never inspects
-// rawURL's host at all"), so https://evil.example/acme/widgets.git
-// derives the SAME "acme/widgets" a genuine https://github.com/acme/
-// widgets.git would -- without the host check running FIRST, a repo
-// enrolled under github.com could be spoofed by ANY host that happens to
-// reuse its owner/repo path. ok is false for either a rejected host or an
-// unparseable path -- the caller folds either into RepoAdmission.
-// Enrolled == false (fail-closed), never distinguishing the two beyond
-// its own log line.
-func resolveRolloutRepoFullName(rawURL string) (fullName string, ok bool) {
+// resolveTrustedRepoFullName resolves rawURL to a trusted "owner/repo"
+// identity -- reposource.CheckRepoHost FIRST, then ParseOwnerRepo, exactly
+// the pairing every other ParseOwnerRepo call site in this codebase
+// already uses (app/sessionactor's pushpr.go/contractdrift.go/
+// imageresolve.go, app/outboxworker's sentinelautofix.go, app/imagebuild's
+// builder.go). This pairing is load-bearing, not defensive decoration:
+// ParseOwnerRepo is deliberately host-agnostic (its own doc comment: "it
+// never inspects rawURL's host at all"), so https://evil.example/acme/
+// widgets.git derives the SAME "acme/widgets" a genuine https://
+// github.com/acme/widgets.git would -- without the host check running
+// FIRST, a repo enrolled/known under github.com could be spoofed by ANY
+// host that happens to reuse its owner/repo path. ok is false for either a
+// rejected host or an unparseable path -- every caller folds either into
+// its own fail-closed "not admitted" fact, never distinguishing the two
+// beyond its own log line.
+//
+// Shared by BOTH of this package's repo-keyed session-creation gates --
+// checkRolloutGate (§32.3, this file) and checkRepoEntitlementGate
+// (§31.4, repoentitlementgate.go) -- exactly one implementation of this
+// check in the package, not two independently-maintained copies (mirrors
+// resolveKnownRepo's own identical "exactly one implementation" value,
+// reposettings.go).
+func resolveTrustedRepoFullName(rawURL string) (fullName string, ok bool) {
 	if err := reposource.CheckRepoHost(rawURL, ports.SupportedSourceControlHosts()...); err != nil {
 		return "", false
 	}
@@ -127,7 +133,7 @@ func resolveRolloutRepoFullName(rawURL string) (fullName string, ok bool) {
 // In rollout.ModeCohort, every repo in repos is resolved and looked up,
 // on tx (repoSettings.WithTx(tx).Get) -- fail-closed per §32: an absent
 // row (pgx.ErrNoRows), any OTHER read error, or an unresolvable/
-// unsupported-host URL (resolveRolloutRepoFullName's own ok=false) all
+// unsupported-host URL (resolveTrustedRepoFullName's own ok=false) all
 // fold into RepoAdmission.Enrolled == false identically. §32's own
 // reasoning for why this is nearly free: this read runs inside the SAME
 // transaction that was about to insert the session two statements later,
@@ -180,7 +186,7 @@ func checkRolloutGate(ctx context.Context, tx pgx.Tx, repoSettings *postgres.Rep
 	admissions := make([]rollout.RepoAdmission, 0, len(req.Repos))
 	readErrored := make([]bool, 0, len(req.Repos))
 	for _, repo := range req.Repos {
-		fullName, resolved := resolveRolloutRepoFullName(repo.Url)
+		fullName, resolved := resolveTrustedRepoFullName(repo.Url)
 		if !resolved {
 			logger.Warn("httpapi: rollout gate: repo url could not be resolved to a trusted, host-verified owner/repo identity; treating as not enrolled",
 				"url", repo.Url, "spawn_source", string(req.SpawnSource), "rollout_mode", string(mode))

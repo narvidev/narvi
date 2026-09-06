@@ -48,7 +48,8 @@ func newFixtureWithRolloutMode(t *testing.T, mode platform.RolloutMode) *testFix
 	t.Cleanup(func() { _ = registry.Shutdown() })
 
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
-	engine := automation.NewEngine(automations, invocations, runs, sessions, turns, environments, auditLog, pool, registry, platform.DefaultTimeouts(), false, mode, repoSettings)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
+	engine := automation.NewEngine(automations, invocations, runs, sessions, turns, environments, auditLog, pool, registry, platform.DefaultTimeouts(), false, mode, repoSettings, prSessions)
 
 	return &testFixture{
 		pool: pool, automations: automations, invocations: invocations, runs: runs,
@@ -106,6 +107,12 @@ func TestPumpOnce_RolloutGate_EnrolledReposStillRun(t *testing.T) {
 	f := newFixtureWithRolloutMode(t, platform.RolloutModeCohort)
 	ctx := context.Background()
 
+	// §31.4: createAutomation below already makes every target repo known
+	// (github_pr_sessions, via EnsureRow) -- CreateSessionOnTx's own
+	// entitlement gate runs BEFORE the rollout gate this test exercises,
+	// unconditionally, so without that this positive control would be
+	// refused by entitlement instead, never even reaching the rollout
+	// decision it means to prove.
 	auto, targets := f.createAutomation(t, "rollout enrolled fan-out test", 2)
 	repoSettings := narvipg.NewRepoSettingsStore(f.pool)
 	for _, target := range targets {

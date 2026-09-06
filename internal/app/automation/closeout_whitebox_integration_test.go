@@ -53,7 +53,12 @@ func newWhiteboxEngine(t *testing.T) (*Engine, *narvipg.AutomationStore, *narvip
 	t.Cleanup(func() { _ = registry.Shutdown() })
 
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
-	engine := NewEngine(automations, invocations, runs, sessions, turns, environments, auditLog, pool, registry, platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings)
+	// prSessions (§31.4): threaded through like every other
+	// CreateSessionOnTx-reaching caller now requires -- never actually
+	// dereferenced by this file's own tests, which drive applyFailureStrike/
+	// closeInvocation directly and never call PumpOnce/fan-out.
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
+	engine := NewEngine(automations, invocations, runs, sessions, turns, environments, auditLog, pool, registry, platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings, prSessions)
 	return engine, automations, invocations
 }
 

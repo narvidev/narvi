@@ -156,6 +156,16 @@ func newHandlerDeps(t *testing.T, pool *pgxpool.Pool) linear.Deps {
 	}
 	t.Cleanup(func() { _ = registry.Shutdown() })
 
+	// prSessions (§31.4): CreateSessionCore's own entitlement gate
+	// (checkRepoEntitlementGate, httpapi/repoentitlementgate.go) now
+	// requires the fixed DefaultRepoURL below to be known to this
+	// deployment (github_pr_sessions) -- Linear always targets that SAME
+	// repo, never a per-message choice, so it is made known HERE, once.
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
+	if err := prSessions.EnsureRow(ctx, "narvidev/narvi", 1); err != nil {
+		t.Fatalf("seed github_pr_sessions entitlement: %v", err)
+	}
+
 	return linear.Deps{
 		Pool:               pool,
 		Sessions:           narvipg.NewSessionStore(pool),
@@ -166,6 +176,7 @@ func newHandlerDeps(t *testing.T, pool *pgxpool.Pool) linear.Deps {
 		AgentSessions:      narvipg.NewLinearAgentSessionStore(pool),
 		Installations:      narvipg.NewLinearInstallationStore(pool),
 		AuditLog:           narvipg.NewAuditLogStore(pool),
+		PRSessions:         prSessions,
 		LinearClient:       linearapi.New(nil, "http://127.0.0.1:0"), // never actually called: no installation row exists for this test's organization, so postAcknowledgment skips before any HTTP call.
 		WebhookSecret:      []byte(testWebhookSecret),
 		TokenEncryptionKey: bytes.Repeat([]byte("k"), 32),

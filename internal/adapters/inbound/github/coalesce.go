@@ -581,7 +581,23 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 	// forces high effort" summary.
 	req.ModelId = restdtos.CreateSessionRequestModelId(triageModelID)
 	req.Effort = restdtos.CreateSessionRequestEffort(triageEffort)
-	created, hasPrompt, cerr := httpapi.CreateSessionOnTx(ctx, tx, c.Sessions, c.Turns, c.Environments, c.AuditLog, req, actor, false, c.RolloutMode, c.RepoSettings, httpapi.ChildSessionOptions{ReviewHeadSHA: reviewHeadSHAPtr, ReviewDepth: reviewDepthPtr, ReviewDepthDecision: triageRecordJSON})
+	// prSessions (§31.4): the plain, pool-backed c.PRSessions --
+	// NOT txPRSessions above -- exactly mirroring c.RepoSettings/c.AuditLog
+	// immediately alongside it. req.SpawnSource is
+	// restdtos.CreateSessionRequestSpawnSourceGithub for every request this
+	// WINNER path builds, so CreateSessionOnTx's own
+	// checkRepoEntitlementGate (repoentitlementgate.go) exempts it
+	// unconditionally and never actually dereferences this parameter here
+	// -- see that gate's own doc comment for exactly why re-deriving
+	// entitlement from req.Repos[0].Url would be actively WRONG for this
+	// path (a cross-repo/fork PR's own clone URL is deliberately the
+	// fork, never repoFullName's own base/upstream claim key above), not
+	// merely redundant. Still threaded through as the real store, never a
+	// nil/fake stand-in: CreateSessionOnTx's own required-parameter
+	// discipline treats an omittable gate dependency as an omitted gate,
+	// and a future change to the exemption's own conditions must not find
+	// a nil pointer waiting here.
+	created, hasPrompt, cerr := httpapi.CreateSessionOnTx(ctx, tx, c.Sessions, c.Turns, c.Environments, c.AuditLog, req, actor, false, c.RolloutMode, c.RepoSettings, c.PRSessions, httpapi.ChildSessionOptions{ReviewHeadSHA: reviewHeadSHAPtr, ReviewDepth: reviewDepthPtr, ReviewDepthDecision: triageRecordJSON})
 	if cerr != nil {
 		if cerr.RolloutRefusal {
 			// §32's own permanent-denial idiom -- see ErrRolloutNotEnrolled's
