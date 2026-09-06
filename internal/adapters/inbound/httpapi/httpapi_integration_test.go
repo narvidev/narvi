@@ -1448,6 +1448,19 @@ func TestCreateSession_MultipleRepos_SecondInvalid_Rejected(t *testing.T) {
 // repo/pathScope/mockConfig rejection-test precedent above exactly
 // (asserting zero session rows for the calling user, not merely the status
 // code).
+//
+// This test now carries a SECOND property it did not when it was written,
+// and the two must not be separated. checkRepoEntitlementGate exempts
+// spawnSource == github from the per-repository entitlement check
+// entirely, because a cross-repo PR's clone URL is deliberately the fork
+// while the trusted claim key is the base repo. That exemption is only
+// safe because of the rejection below: it means "github" can never be a
+// caller's assertion on this endpoint, only something a server-side
+// ingress path set for itself. Relaxing this rejection -- for an internal
+// caller, a new surface, any reason -- reopens the clone amplification
+// that gate exists to close, and it would do so silently, because nothing
+// in the gate can observe how the field got its value. Anyone changing
+// this test should read checkRepoEntitlementGate's own doc comment first.
 func TestCreateSession_NonWebSpawnSource_Rejected(t *testing.T) {
 	tests := []struct {
 		name        string

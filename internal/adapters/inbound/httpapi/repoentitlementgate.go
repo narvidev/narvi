@@ -156,6 +156,19 @@ func actorFromCreatedBy(createdBy pgtype.UUID) authz.Actor {
 // even iterated -- NOT a convenience short-circuit, a correctness
 // requirement. Two reasons, both load-bearing:
 //
+// What makes the exemption SAFE is a guard in another file, and the
+// dependency is worth naming because nothing here can observe it: the
+// session-creation endpoint rejects any request body claiming a
+// spawnSource other than "web" with a 400, before any write. So on this
+// gate's own reasoning, "github" is never a caller's assertion -- it is
+// only ever a value a server-side ingress path (the webhook handler,
+// coalesce's winner, the sentinel auto-fix child) set for itself from a
+// verified payload. Were that rejection ever relaxed, an authenticated
+// caller could name any repository, claim github provenance, and skip
+// this gate entirely -- the exact clone amplification it exists to close.
+// TestCreateSession_NonWebSpawnSource_Rejected is what holds that end;
+// its own doc comment points back here.
+//
 //  1. Trust: §31.4's own words are that "sessions.repos is lower-trust
 //     than github_pr_sessions.repo_full_name (verified webhook payload)" --
 //     this predicate exists SPECIFICALLY to compensate for sessions.repos
