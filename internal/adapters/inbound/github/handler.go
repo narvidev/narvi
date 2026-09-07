@@ -726,6 +726,7 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 				Roots:        archRoots,
 				ChangedPaths: prCtx.ChangedPaths,
 				Title:        prCtx.Title,
+				PRNumber:     m.PRNumber,
 			})
 			if archBlock != "" {
 				m.CommentBody = archBlock + m.CommentBody

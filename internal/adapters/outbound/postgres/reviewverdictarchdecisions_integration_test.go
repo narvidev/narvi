@@ -80,7 +80,7 @@ func TestListGatedArchDecisions_OverlapMatches(t *testing.T) {
 	insertArchDecisionVerdict(ctx, t, store, repo, 2, "sha-root-overlap", []byte(`["unrelated-tag"]`), []byte(`["internal"]`), false)
 	insertArchDecisionVerdict(ctx, t, store, repo, 3, "sha-no-overlap", []byte(`["unrelated-tag"]`), []byte(`["unrelated-root"]`), false)
 
-	cands, err := store.ListGatedArchDecisions(ctx, repo, []string{"database"}, []string{"internal"}, 20)
+	cands, err := store.ListGatedArchDecisions(ctx, repo, 0, []string{"database"}, []string{"internal"}, 20)
 	if err != nil {
 		t.Fatalf("ListGatedArchDecisions: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestListGatedArchDecisions_NeverReadsBlastRadius(t *testing.T) {
 	insertArchDecisionVerdict(ctx, t, store, repo, 1, "sha-real-tag-match", []byte(`["database"]`), []byte(`[]`), false)
 	insertArchDecisionVerdict(ctx, t, store, repo, 2, "sha-blast-radius-only", []byte(`["unrelated"]`), []byte(`[]`), false)
 
-	cands, err := store.ListGatedArchDecisions(ctx, repo, []string{"database"}, nil, 20)
+	cands, err := store.ListGatedArchDecisions(ctx, repo, 0, []string{"database"}, nil, 20)
 	if err != nil {
 		t.Fatalf("ListGatedArchDecisions: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestListGatedArchDecisions_ExcludesShadowEpoch(t *testing.T) {
 
 	insertArchDecisionVerdict(ctx, t, store, repo, 1, "sha-shadow", []byte(`["database"]`), nil, true)
 
-	cands, err := store.ListGatedArchDecisions(ctx, repo, []string{"database"}, nil, 20)
+	cands, err := store.ListGatedArchDecisions(ctx, repo, 0, []string{"database"}, nil, 20)
 	if err != nil {
 		t.Fatalf("ListGatedArchDecisions: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestListGatedArchDecisions_ExcludesContestedPR(t *testing.T) {
 		t.Fatalf("seed contest: %v", err)
 	}
 
-	cands, err := store.ListGatedArchDecisions(ctx, repo, []string{"database"}, nil, 20)
+	cands, err := store.ListGatedArchDecisions(ctx, repo, 0, []string{"database"}, nil, 20)
 	if err != nil {
 		t.Fatalf("ListGatedArchDecisions: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestListGatedArchDecisions_ExcludesContestedPR(t *testing.T) {
 
 	// A DIFFERENT, never-contested PR in the SAME repo must still surface.
 	insertArchDecisionVerdict(ctx, t, store, repo, prNumber+1, "sha-uncontested", []byte(`["database"]`), nil, false)
-	cands, err = store.ListGatedArchDecisions(ctx, repo, []string{"database"}, nil, 20)
+	cands, err = store.ListGatedArchDecisions(ctx, repo, 0, []string{"database"}, nil, 20)
 	if err != nil {
 		t.Fatalf("ListGatedArchDecisions (second call): %v", err)
 	}
@@ -206,7 +206,7 @@ func TestListRecentArchDecisions_IgnoresOverlapButKeepsExclusions(t *testing.T) 
 		t.Fatalf("seed contest: %v", err)
 	}
 
-	cands, err := store.ListRecentArchDecisions(ctx, repo, 20)
+	cands, err := store.ListRecentArchDecisions(ctx, repo, 0, 20)
 	if err != nil {
 		t.Fatalf("ListRecentArchDecisions: %v", err)
 	}

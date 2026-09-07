@@ -267,6 +267,7 @@ func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns 
 				Roots:        archRoots,
 				ChangedPaths: prCtx.ChangedPaths,
 				Title:        prCtx.Title,
+				PRNumber:     prSession.PrNumber,
 			})
 			if archBlock != "" {
 				prompt = archBlock + prompt

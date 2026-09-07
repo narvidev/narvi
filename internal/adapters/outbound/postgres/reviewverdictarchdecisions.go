@@ -109,9 +109,10 @@ func candidatesFromReviewVerdicts(rows []sqlcgen.ReviewVerdict) []knowledge.Cand
 // and uncontested only, newest first, bounded by limit. See
 // ListGatedArchDecisions' own generated doc comment (queries/
 // reviewverdicts.sql) for the full exclusion/overlap reasoning.
-func (s *ReviewVerdictStore) ListGatedArchDecisions(ctx context.Context, repoFullName string, tags, roots []string, limit int32) ([]knowledge.Candidate, error) {
+func (s *ReviewVerdictStore) ListGatedArchDecisions(ctx context.Context, repoFullName string, excludePR int32, tags, roots []string, limit int32) ([]knowledge.Candidate, error) {
 	rows, err := s.q.ListGatedArchDecisions(ctx, sqlcgen.ListGatedArchDecisionsParams{
 		RepoFullName: repoFullName,
+		ExcludePr:    excludePR,
 		Tags:         tags,
 		Roots:        roots,
 		ResultLimit:  limit,
@@ -127,9 +128,10 @@ func (s *ReviewVerdictStore) ListGatedArchDecisions(ctx context.Context, repoFul
 // overlap -- the IDENTICAL two exclusions as ListGatedArchDecisions
 // above, no tag/root predicate. See ListRecentArchDecisions' own
 // generated doc comment (queries/reviewverdicts.sql).
-func (s *ReviewVerdictStore) ListRecentArchDecisions(ctx context.Context, repoFullName string, limit int32) ([]knowledge.Candidate, error) {
+func (s *ReviewVerdictStore) ListRecentArchDecisions(ctx context.Context, repoFullName string, excludePR int32, limit int32) ([]knowledge.Candidate, error) {
 	rows, err := s.q.ListRecentArchDecisions(ctx, sqlcgen.ListRecentArchDecisionsParams{
 		RepoFullName: repoFullName,
+		ExcludePr:    excludePR,
 		ResultLimit:  limit,
 	})
 	if err != nil {

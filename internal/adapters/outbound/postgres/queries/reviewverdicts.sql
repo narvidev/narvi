@@ -220,6 +220,18 @@ WHERE rv.repo_full_name = $1 AND rv.created_at > $2
 ORDER BY rv.created_at ASC
 LIMIT $3;
 
+-- Excludes the PR under review (rv.pr_number <> exclude_pr). This is
+-- "prior decisions from this repository", and a PR's own earlier verdict
+-- is not that: it is the same review's first pass. Without the exclusion
+-- it is not merely POSSIBLE but the single most likely match, because a
+-- re-review computes its tags and roots from the same changed paths that
+-- stamped that verdict -- so the overlap is near-certain and recency puts
+-- it first. Two things go wrong then: a re-review, whose whole purpose is
+-- to reconsider after a push, is handed its own first-pass conclusions and
+-- biased toward agreeing with itself; and the verdict it produces is
+-- stamped knowledge-influenced on pure self-reference, which is exactly
+-- the population a later Step would ingest and the phase KPI joins
+-- contestation against.
 -- name: ListGatedArchDecisions :many
 -- The knowledge-retrieval GATE itself (§31.6) -- the candidate set BOTH
 -- mode A and (a later Step's) mode B share, owned by this Step:
@@ -271,6 +283,7 @@ LIMIT $3;
 -- finer-grained check would have caught.
 SELECT rv.* FROM review_verdicts rv
 WHERE rv.repo_full_name = $1
+    AND rv.pr_number <> sqlc.arg(exclude_pr)
     AND rv.digest_arch_decisions IS NOT NULL
     AND jsonb_array_length(rv.digest_arch_decisions) > 0
     AND NOT rv.suppressed_in_shadow
@@ -284,6 +297,18 @@ WHERE rv.repo_full_name = $1
 ORDER BY rv.created_at DESC
 LIMIT sqlc.arg(result_limit);
 
+-- Excludes the PR under review (rv.pr_number <> exclude_pr). This is
+-- "prior decisions from this repository", and a PR's own earlier verdict
+-- is not that: it is the same review's first pass. Without the exclusion
+-- it is not merely POSSIBLE but the single most likely match, because a
+-- re-review computes its tags and roots from the same changed paths that
+-- stamped that verdict -- so the overlap is near-certain and recency puts
+-- it first. Two things go wrong then: a re-review, whose whole purpose is
+-- to reconsider after a push, is handed its own first-pass conclusions and
+-- biased toward agreeing with itself; and the verdict it produces is
+-- stamped knowledge-influenced on pure self-reference, which is exactly
+-- the population a later Step would ingest and the phase KPI joins
+-- contestation against.
 -- name: ListRecentArchDecisions :many
 -- The gate's own RECENCY FALLBACK (§31.6) -- the IDENTICAL two
 -- exclusions as ListGatedArchDecisions above (shadow-epoch, contested),
@@ -297,6 +322,7 @@ LIMIT sqlc.arg(result_limit);
 -- legitimate to exploit".
 SELECT rv.* FROM review_verdicts rv
 WHERE rv.repo_full_name = $1
+    AND rv.pr_number <> sqlc.arg(exclude_pr)
     AND rv.digest_arch_decisions IS NOT NULL
     AND jsonb_array_length(rv.digest_arch_decisions) > 0
     AND NOT rv.suppressed_in_shadow

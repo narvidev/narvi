@@ -47,10 +47,10 @@ type ArchDecisionsFetcher interface {
 	// ListGatedArchDecisions is the GATE (§31.6): verdicts whose
 	// INSERT-time tags/roots overlap (tags, roots), live-epoch only,
 	// uncontested, newest first, LIMIT k. Mode-invariant.
-	ListGatedArchDecisions(ctx context.Context, repoFullName string, tags, roots []string, k int32) ([]knowledge.Candidate, error)
+	ListGatedArchDecisions(ctx context.Context, repoFullName string, excludePR int32, tags, roots []string, k int32) ([]knowledge.Candidate, error)
 	// ListRecentArchDecisions is the SAME gate's own recency fallback,
 	// fired on empty overlap -- no tag/root predicate, same exclusions.
-	ListRecentArchDecisions(ctx context.Context, repoFullName string, k int32) ([]knowledge.Candidate, error)
+	ListRecentArchDecisions(ctx context.Context, repoFullName string, excludePR int32, k int32) ([]knowledge.Candidate, error)
 }
 
 // Selector values recorded on knowledge.InjectedRecord.Selector -- which
@@ -112,7 +112,7 @@ func FetchPriorArchDecisions(ctx context.Context, logger *slog.Logger, fetcher A
 		ranker = knowledge.RecencyRanker{}
 	}
 
-	cands, err := fetcher.ListGatedArchDecisions(ctx, q.RepoFullName, q.Tags, q.Roots, gateCandidatePoolSize)
+	cands, err := fetcher.ListGatedArchDecisions(ctx, q.RepoFullName, q.PRNumber, q.Tags, q.Roots, gateCandidatePoolSize)
 	if err != nil {
 		logger.Warn("reviewcontext: fetch gated arch decisions failed, review turn will carry no prior-decisions block",
 			"error", err, "repo_full_name", q.RepoFullName)
@@ -122,7 +122,7 @@ func FetchPriorArchDecisions(ctx context.Context, logger *slog.Logger, fetcher A
 	selector := SelectorPathOverlap
 	if len(cands) == 0 {
 		selector = SelectorRecencyFallback
-		cands, err = fetcher.ListRecentArchDecisions(ctx, q.RepoFullName, gateCandidatePoolSize)
+		cands, err = fetcher.ListRecentArchDecisions(ctx, q.RepoFullName, q.PRNumber, gateCandidatePoolSize)
 		if err != nil {
 			logger.Warn("reviewcontext: fetch recent arch decisions (recency fallback) failed, review turn will carry no prior-decisions block",
 				"error", err, "repo_full_name", q.RepoFullName)

@@ -96,6 +96,13 @@ type Query struct {
 
 	// Title is the current PR's own title.
 	Title string
+
+	// PRNumber is the pull request being reviewed right now, so the gate
+	// can exclude it. A PR's own earlier verdict is not "prior decisions
+	// from this repository" -- it is the same review's first pass, and it
+	// is the most likely match of all, because a re-review derives its
+	// tags and roots from the same changed paths that stamped it.
+	PRNumber int32
 }
 
 // MaxInjected is the hard cap on how many candidates ever reach a rendered

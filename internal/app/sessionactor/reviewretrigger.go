@@ -745,6 +745,7 @@ func (a *Actor) composeAutoRetriggerPrompt(ctx context.Context, repoFullName str
 			Roots:        archRoots,
 			ChangedPaths: reviewCtx.ChangedPaths,
 			Title:        reviewCtx.Title,
+			PRNumber:     prNumber,
 		})
 		if archBlock != "" {
 			prompt = archBlock + prompt

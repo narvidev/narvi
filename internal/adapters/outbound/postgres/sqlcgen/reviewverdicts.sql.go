@@ -337,10 +337,11 @@ func (q *Queries) InsertReviewVerdict(ctx context.Context, arg InsertReviewVerdi
 const listGatedArchDecisions = `-- name: ListGatedArchDecisions :many
 SELECT rv.id, rv.repo_full_name, rv.pr_number, rv.head_sha, rv.risk_level, rv.premise, rv.blast_radius, rv.files_changed, rv.tests_coverage, rv.docs_drift, rv.proposed_shippable, rv.shippable, rv.session_id, rv.created_at, rv.digest_summary, rv.digest_arch_decisions, rv.digest_stack_risks, rv.digest_unverified_limits, rv.digest_description_adequacy, rv.digest_adequacy_explanation, rv.digest_proposed_body, rv.review_path, rv.counter_review, rv.fact_check, rv.fact_check_killed, rv.digest_contested_points, rv.suppressed_in_shadow, rv.arch_decision_tags, rv.arch_decision_roots, rv.knowledge_mode, rv.knowledge_influenced FROM review_verdicts rv
 WHERE rv.repo_full_name = $1
+    AND rv.pr_number <> $2
     AND rv.digest_arch_decisions IS NOT NULL
     AND jsonb_array_length(rv.digest_arch_decisions) > 0
     AND NOT rv.suppressed_in_shadow
-    AND (rv.arch_decision_tags ?| $2::text[] OR rv.arch_decision_roots ?| $3::text[])
+    AND (rv.arch_decision_tags ?| $3::text[] OR rv.arch_decision_roots ?| $4::text[])
     AND NOT EXISTS (
         SELECT 1 FROM review_digest_section_feedback f
         WHERE f.repo_full_name = rv.repo_full_name
@@ -348,16 +349,29 @@ WHERE rv.repo_full_name = $1
           AND f.section = 'arch_recap'
     )
 ORDER BY rv.created_at DESC
-LIMIT $4
+LIMIT $5
 `
 
 type ListGatedArchDecisionsParams struct {
 	RepoFullName string   `json:"repo_full_name"`
+	ExcludePr    int32    `json:"exclude_pr"`
 	Tags         []string `json:"tags"`
 	Roots        []string `json:"roots"`
 	ResultLimit  int32    `json:"result_limit"`
 }
 
+// Excludes the PR under review (rv.pr_number <> exclude_pr). This is
+// "prior decisions from this repository", and a PR's own earlier verdict
+// is not that: it is the same review's first pass. Without the exclusion
+// it is not merely POSSIBLE but the single most likely match, because a
+// re-review computes its tags and roots from the same changed paths that
+// stamped that verdict -- so the overlap is near-certain and recency puts
+// it first. Two things go wrong then: a re-review, whose whole purpose is
+// to reconsider after a push, is handed its own first-pass conclusions and
+// biased toward agreeing with itself; and the verdict it produces is
+// stamped knowledge-influenced on pure self-reference, which is exactly
+// the population a later Step would ingest and the phase KPI joins
+// contestation against.
 // The knowledge-retrieval GATE itself (§31.6) -- the candidate set BOTH
 // mode A and (a later Step's) mode B share, owned by this Step:
 // "decisions from verdicts whose tags/directory-roots -- stamped at
@@ -409,6 +423,7 @@ type ListGatedArchDecisionsParams struct {
 func (q *Queries) ListGatedArchDecisions(ctx context.Context, arg ListGatedArchDecisionsParams) ([]ReviewVerdict, error) {
 	rows, err := q.db.Query(ctx, listGatedArchDecisions,
 		arg.RepoFullName,
+		arg.ExcludePr,
 		arg.Tags,
 		arg.Roots,
 		arg.ResultLimit,
@@ -649,6 +664,7 @@ func (q *Queries) ListNonShadowReviewVerdictsInWindow(ctx context.Context, arg L
 const listRecentArchDecisions = `-- name: ListRecentArchDecisions :many
 SELECT rv.id, rv.repo_full_name, rv.pr_number, rv.head_sha, rv.risk_level, rv.premise, rv.blast_radius, rv.files_changed, rv.tests_coverage, rv.docs_drift, rv.proposed_shippable, rv.shippable, rv.session_id, rv.created_at, rv.digest_summary, rv.digest_arch_decisions, rv.digest_stack_risks, rv.digest_unverified_limits, rv.digest_description_adequacy, rv.digest_adequacy_explanation, rv.digest_proposed_body, rv.review_path, rv.counter_review, rv.fact_check, rv.fact_check_killed, rv.digest_contested_points, rv.suppressed_in_shadow, rv.arch_decision_tags, rv.arch_decision_roots, rv.knowledge_mode, rv.knowledge_influenced FROM review_verdicts rv
 WHERE rv.repo_full_name = $1
+    AND rv.pr_number <> $2
     AND rv.digest_arch_decisions IS NOT NULL
     AND jsonb_array_length(rv.digest_arch_decisions) > 0
     AND NOT rv.suppressed_in_shadow
@@ -659,14 +675,27 @@ WHERE rv.repo_full_name = $1
           AND f.section = 'arch_recap'
     )
 ORDER BY rv.created_at DESC
-LIMIT $2
+LIMIT $3
 `
 
 type ListRecentArchDecisionsParams struct {
 	RepoFullName string `json:"repo_full_name"`
+	ExcludePr    int32  `json:"exclude_pr"`
 	ResultLimit  int32  `json:"result_limit"`
 }
 
+// Excludes the PR under review (rv.pr_number <> exclude_pr). This is
+// "prior decisions from this repository", and a PR's own earlier verdict
+// is not that: it is the same review's first pass. Without the exclusion
+// it is not merely POSSIBLE but the single most likely match, because a
+// re-review computes its tags and roots from the same changed paths that
+// stamped that verdict -- so the overlap is near-certain and recency puts
+// it first. Two things go wrong then: a re-review, whose whole purpose is
+// to reconsider after a push, is handed its own first-pass conclusions and
+// biased toward agreeing with itself; and the verdict it produces is
+// stamped knowledge-influenced on pure self-reference, which is exactly
+// the population a later Step would ingest and the phase KPI joins
+// contestation against.
 // The gate's own RECENCY FALLBACK (§31.6) -- the IDENTICAL two
 // exclusions as ListGatedArchDecisions above (shadow-epoch, contested),
 // with NO tag/root predicate at all. Still THE GATE, not an escape hatch
@@ -678,7 +707,7 @@ type ListRecentArchDecisionsParams struct {
 // window, unranked -- "a pure-recency set gives a ranker nothing
 // legitimate to exploit".
 func (q *Queries) ListRecentArchDecisions(ctx context.Context, arg ListRecentArchDecisionsParams) ([]ReviewVerdict, error) {
-	rows, err := q.db.Query(ctx, listRecentArchDecisions, arg.RepoFullName, arg.ResultLimit)
+	rows, err := q.db.Query(ctx, listRecentArchDecisions, arg.RepoFullName, arg.ExcludePr, arg.ResultLimit)
 	if err != nil {
 		return nil, err
 	}

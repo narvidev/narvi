@@ -3,6 +3,7 @@ package reviewcontext_test
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"math"
 	"strings"
 	"testing"
@@ -25,18 +26,24 @@ type fakeArchDecisionsFetcher struct {
 
 	gatedCalls  int
 	recentCalls int
+
+	// gotExcludePR records what the gate was asked to exclude, so a test
+	// can assert the PR under review is passed rather than assumed.
+	gotExcludePR int32
 }
 
-func (f *fakeArchDecisionsFetcher) ListGatedArchDecisions(_ context.Context, _ string, _, _ []string, _ int32) ([]knowledge.Candidate, error) {
+func (f *fakeArchDecisionsFetcher) ListGatedArchDecisions(_ context.Context, _ string, excludePR int32, _, _ []string, _ int32) ([]knowledge.Candidate, error) {
 	f.gatedCalls++
+	f.gotExcludePR = excludePR
 	if f.gatedErr != nil {
 		return nil, f.gatedErr
 	}
 	return f.gated, nil
 }
 
-func (f *fakeArchDecisionsFetcher) ListRecentArchDecisions(_ context.Context, _ string, _ int32) ([]knowledge.Candidate, error) {
+func (f *fakeArchDecisionsFetcher) ListRecentArchDecisions(_ context.Context, _ string, excludePR int32, _ int32) ([]knowledge.Candidate, error) {
 	f.recentCalls++
+	f.gotExcludePR = excludePR
 	if f.recentErr != nil {
 		return nil, f.recentErr
 	}
@@ -302,5 +309,58 @@ func TestFetchPriorArchDecisions_CapAppliedAfterOrdering(t *testing.T) {
 	wantTopID := cands[12].ID
 	if rec.IDs[0] != wantTopID {
 		t.Errorf("rec.IDs[0] = %q, want %q (the highest-scored candidate, regardless of the gate's own pre-rank position)", rec.IDs[0], wantTopID)
+	}
+}
+
+// TestFetchPriorArchDecisions_ExcludesThePRUnderReview pins the property
+// three independent adversarial lenses raised about this pipeline.
+//
+// The block is "prior architecture decisions from this repository". A
+// PR's own earlier verdict is not that: it is the same review's first
+// pass. And it is not a rare match but the most likely one, because a
+// re-review derives its tags and roots from the same changed paths that
+// stamped that verdict, so the overlap is near-certain and recency puts
+// it first.
+//
+// Two things go wrong without the exclusion, and the second is why this
+// is a test rather than a note. A re-review, whose whole purpose is to
+// reconsider after a push, is handed its own first-pass conclusions and
+// biased toward agreeing with itself. And the verdict it then produces
+// is stamped knowledge-influenced on pure self-reference -- entering the
+// population a later Step would ingest, and the one the phase KPI joins
+// contestation against, so the measurement would report something other
+// than what it claims.
+func TestFetchPriorArchDecisions_ExcludesThePRUnderReview(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		fetcher *fakeArchDecisionsFetcher
+		query   knowledge.Query
+	}{
+		{
+			name:    "gate path",
+			fetcher: &fakeArchDecisionsFetcher{gated: []knowledge.Candidate{{ID: "v1:0", Decision: "use a queue"}}},
+			query:   knowledge.Query{RepoFullName: "o/r", Tags: []string{"api"}, PRNumber: 42},
+		},
+		{
+			name:    "recency fallback path",
+			fetcher: &fakeArchDecisionsFetcher{recent: []knowledge.Candidate{{ID: "v1:0", Decision: "use a queue"}}},
+			query:   knowledge.Query{RepoFullName: "o/r", PRNumber: 42},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, _ = reviewcontext.FetchPriorArchDecisions(t.Context(), slog.New(slog.DiscardHandler),
+				tt.fetcher, knowledge.RecencyRanker{}, platform.DefaultTimeouts(), tt.query)
+
+			if tt.fetcher.gotExcludePR != 42 {
+				t.Errorf("gate asked to exclude PR %d, want 42 -- the PR under review must never be its own prior decision",
+					tt.fetcher.gotExcludePR)
+			}
+		})
 	}
 }
