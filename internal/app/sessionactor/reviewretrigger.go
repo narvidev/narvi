@@ -79,6 +79,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
 	appreviewtriage "github.com/narvidev/narvi/internal/app/reviewtriage"
+	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
@@ -295,7 +296,11 @@ func (a *Actor) handleReviewRetriggerDebounceTimer(ctx context.Context) error {
 			if flooredDepth == domainreviewtriage.DepthDeep && a.reviewModelDeep == "" {
 				a.logger.Info("sessionactor: automatic re-review routed deep but no deep-tier model configured (NARVI_REVIEW_MODEL_DEEP unset), dispatching with the default model at forced high effort", "repo_full_name", decision.repoFullName, "pr_number", decision.prNumber)
 			}
-			if recordJSON, marshalErr := json.Marshal(domainreviewtriage.NewDecisionRecord(triageDecision, triageConfig, flooredDepth, triageProvenance, decision.triageModelID, decision.triageEffort, reviewCtx.ChangedFilesCount, reviewCtx.Diff == "", reviewCtx.DiffTruncated)); marshalErr != nil {
+			// (§31.6): see internal/adapters/inbound/github/handler.go's
+			// own identical addition for the full "why this carrier" reasoning.
+			archDecisionTags := autoapproval.TagStrings(autoapproval.ClassifyChangedPaths(reviewCtx.ChangedPaths))
+			archDecisionRoots := autoapproval.ClassifyChangedRoots(reviewCtx.ChangedPaths)
+			if recordJSON, marshalErr := json.Marshal(domainreviewtriage.NewDecisionRecord(triageDecision, triageConfig, flooredDepth, triageProvenance, decision.triageModelID, decision.triageEffort, reviewCtx.ChangedFilesCount, reviewCtx.Diff == "", reviewCtx.DiffTruncated, archDecisionTags, archDecisionRoots)); marshalErr != nil {
 				a.logger.Warn("sessionactor: marshal review-depth decision record failed, turn will carry review_depth but no review_depth_decision", "error", marshalErr, "repo_full_name", decision.repoFullName, "pr_number", decision.prNumber)
 			} else {
 				decision.reviewDepthDecisionJSON = recordJSON

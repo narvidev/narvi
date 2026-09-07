@@ -40,6 +40,13 @@
 -- function's own doc comment for the resolution formula (egressmode.
 -- Resolve, the identical single-authority resolver postgres.OutboxStore.
 -- Create already uses for the outbox's own enqueue-time stamp).
+--
+-- arch_decision_tags/arch_decision_roots (§31.6, migrations/
+-- 000113_review_verdicts_arch_decision_tags_roots.up.sql) forward
+-- turns.review_depth_decision's own ArchDecisionTags/ArchDecisionRoots
+-- verbatim -- see that migration's own doc comment for the full "why
+-- this carrier, computed once at turn-creation time" reasoning. JSONB
+-- arrays of plain strings, mirroring blast_radius's own identical shape.
 INSERT INTO review_verdicts (
     repo_full_name, pr_number, head_sha,
     risk_level, premise, blast_radius, files_changed, tests_coverage, docs_drift,
@@ -48,9 +55,10 @@ INSERT INTO review_verdicts (
     digest_description_adequacy, digest_adequacy_explanation, digest_proposed_body,
     review_path,
     counter_review, fact_check, fact_check_killed, digest_contested_points,
-    suppressed_in_shadow
+    suppressed_in_shadow,
+    arch_decision_tags, arch_decision_roots
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
 RETURNING *;
 
 -- name: GetLatestReviewVerdict :one

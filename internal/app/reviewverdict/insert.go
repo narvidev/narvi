@@ -97,7 +97,17 @@ import (
 // queries (GetLatestNonShadowReviewVerdict, ListLatestAutoApprovedInRepo,
 // ListNonShadowReviewVerdictsInWindow) -- §30.8: "never call-site
 // checks".
-func Insert(ctx context.Context, store *postgres.ReviewVerdictStore, repoSettings *postgres.RepoSettingsStore, platformShadow bool, repoFullName string, prNumber int32, headSHA string, sessionID pgtype.UUID, verdict review.Verdict, digest reviewpost.Digest, reviewPath reviewtriage.ReviewDepth, counterReview review.CounterReviewStatus, factCheck reviewpost.FactCheckStatus, factCheckKilled int) (reviewverdict.Record, error) {
+//
+// archDecisionTags/archDecisionRoots (§31.6) are forwarded verbatim onto
+// this row's own arch_decision_tags/arch_decision_roots columns
+// (migrations/000113) -- the caller has already read them off THIS
+// verdict's own turn (turns.review_depth_decision's own ArchDecisionTags/
+// ArchDecisionRoots, computed once at turn-creation time via
+// autoapproval.ClassifyChangedPaths/ClassifyChangedRoots over that
+// turn's own ChangedPaths). This function does no classification of its
+// own -- exactly like it forwards reviewPath/counterReview/factCheck
+// verbatim rather than re-deriving any of them.
+func Insert(ctx context.Context, store *postgres.ReviewVerdictStore, repoSettings *postgres.RepoSettingsStore, platformShadow bool, repoFullName string, prNumber int32, headSHA string, sessionID pgtype.UUID, verdict review.Verdict, digest reviewpost.Digest, reviewPath reviewtriage.ReviewDepth, counterReview review.CounterReviewStatus, factCheck reviewpost.FactCheckStatus, factCheckKilled int, archDecisionTags, archDecisionRoots []string) (reviewverdict.Record, error) {
 	if headSHA == "" {
 		return reviewverdict.Record{}, fmt.Errorf("reviewverdict: insert: refusing to persist a verdict with no known head sha for %s#%d", repoFullName, prNumber)
 	}

@@ -2042,6 +2042,8 @@ type ReviewVerdict struct {
 	FactCheckKilled           *int32             `json:"fact_check_killed"`
 	DigestContestedPoints     *string            `json:"digest_contested_points"`
 	SuppressedInShadow        bool               `json:"suppressed_in_shadow"`
+	ArchDecisionTags          []byte             `json:"arch_decision_tags"`
+	ArchDecisionRoots         []byte             `json:"arch_decision_roots"`
 }
 
 type Sandbox struct {

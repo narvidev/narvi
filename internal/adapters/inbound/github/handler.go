@@ -15,6 +15,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
 	appreviewtriage "github.com/narvidev/narvi/internal/app/reviewtriage"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
+	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/review"
 	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
@@ -729,7 +730,17 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 		if flooredDepth == domainreviewtriage.DepthDeep && coalescer.ReviewModelDeep == "" {
 			logger.Info("github: review routed deep but no deep-tier model configured (NARVI_REVIEW_MODEL_DEEP unset), dispatching with the default model at forced high effort", "repo", m.RepoFullName, "pr_number", m.PRNumber)
 		}
-		triageRecordJSON, triageRecordErr := json.Marshal(domainreviewtriage.NewDecisionRecord(triageDecision, triageConfig, flooredDepth, triageProvenance, triageModelID, triageEffort, prCtx.ChangedFilesCount, prCtx.Diff == "", prCtx.DiffTruncated))
+		// (§31.6): this turn's own server-derived knowledge-gate
+		// key -- the SAME deterministic classifiers the gate query itself
+		// (a later Step) overlaps against, computed here (never from
+		// anything a reviewing model posts) and carried onto
+		// triageRecordJSON below so it survives to verdict-post time --
+		// see reviewtriage.DecisionRecord.ArchDecisionTags/ArchDecisionRoots'
+		// own doc comment for the full "why this carrier, not a new
+		// column" reasoning.
+		archDecisionTags := autoapproval.TagStrings(autoapproval.ClassifyChangedPaths(prCtx.ChangedPaths))
+		archDecisionRoots := autoapproval.ClassifyChangedRoots(prCtx.ChangedPaths)
+		triageRecordJSON, triageRecordErr := json.Marshal(domainreviewtriage.NewDecisionRecord(triageDecision, triageConfig, flooredDepth, triageProvenance, triageModelID, triageEffort, prCtx.ChangedFilesCount, prCtx.Diff == "", prCtx.DiffTruncated, archDecisionTags, archDecisionRoots))
 		if triageRecordErr != nil {
 			logger.Warn("github: marshal review-depth decision record failed, turn will carry review_depth but no review_depth_decision", "error", triageRecordErr, "repo", m.RepoFullName, "pr_number", m.PRNumber)
 			triageRecordJSON = nil

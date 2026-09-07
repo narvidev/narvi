@@ -1,0 +1,46 @@
+-- review_verdicts.arch_decision_tags/arch_decision_roots (§31.6's own
+-- candidate GATE, mode-invariant): the server-derived key the mode A/mode
+-- B knowledge-retrieval selector overlaps a PR's own freshly computed
+-- tags/roots against -- "decisions from verdicts whose tags/directory-
+-- roots -- stamped at INSERT time from ClassifyChangedPaths
+-- (prCtx.ChangedPaths), never from the posted blast_radius column --
+-- overlap the current PR's own freshly computed tags/roots". §21.2's own
+-- rule, restated here because this is exactly the mistake it exists to
+-- prevent one section later: review_verdicts.blast_radius (migrations/
+-- 000067) is the REVIEWING MODEL's own self-reported assessment,
+-- forwarded verbatim by internal/app/reviewverdict.Insert with no
+-- server-side re-derivation -- keying the gate on it would let an
+-- attacker who induces a false ArchDecision also choose, in the SAME
+-- verdict call, the blast_radius tags that later decide where that false
+-- decision surfaces. arch_decision_tags/arch_decision_roots are instead
+-- computed the SAME deterministic way this migration's own two
+-- classifiers already compute review_verdicts.blast_radius's sibling
+-- fact for an unrelated purpose (autoapproval.ClassifyChangedPaths) plus
+-- this Step's own new autoapproval.ClassifyChangedRoots -- both driven
+-- from the PR's own server-fetched changed-file paths, never from
+-- anything the reviewing model posted.
+--
+-- JSONB, mirroring blast_radius's own "plain JSON array of strings"
+-- precedent one column over -- NOT NULL DEFAULT '[]'::jsonb, the SAME
+-- polarity, for the SAME reason: a row inserted by some future write path
+-- that forgets to pass these columns explicitly stays with an EMPTY
+-- tag/root set, which can only ever fail an overlap match (never
+-- fabricate a false one) and remains eligible for the gate's own recency
+-- fallback -- safe by construction, never a reason to make either column
+-- nullable the way review_path/counter_review (columns forwarded from an
+-- OPTIONAL turn-side fact) are.
+--
+-- Values arrive here via turns.review_depth_decision (migrations/
+-- 000083) -- internal/domain/reviewtriage.DecisionRecord's own new
+-- ArchDecisionTags/ArchDecisionRoots fields, computed once at review-turn
+-- CREATION time (where the diff fetch that produces ChangedPaths already
+-- runs) and forwarded verbatim at verdict-POST time, exactly the "shape
+-- to follow" §31.6 itself names: "turns.review_depth_decision's own
+-- already-stored 'distinct roots' is the shape to follow" -- riding the
+-- SAME already-threaded JSONB carrier DistinctRoots (an unrelated,
+-- routing-scoped reduction of the identical underlying ChangedPaths
+-- fact) already uses to cross from turn-creation time to verdict-post
+-- time, rather than a second new turns column pair mirroring
+-- review_head_sha/review_depth's own dedicated-column treatment.
+ALTER TABLE review_verdicts ADD COLUMN arch_decision_tags JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE review_verdicts ADD COLUMN arch_decision_roots JSONB NOT NULL DEFAULT '[]'::jsonb;

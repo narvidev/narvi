@@ -38,6 +38,7 @@ import (
 	appreviewtriage "github.com/narvidev/narvi/internal/app/reviewtriage"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/domain/authz"
+	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/review"
 	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
@@ -319,7 +320,11 @@ func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns 
 		if flooredDepth == domainreviewtriage.DepthDeep && reviewModelDeep == "" {
 			logger.Info("httpapi: review routed deep but no deep-tier model configured (NARVI_REVIEW_MODEL_DEEP unset), dispatching with the default model at forced high effort", "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
 		}
-		triageRecordJSON, triageRecordErr := json.Marshal(domainreviewtriage.NewDecisionRecord(triageDecision, triageConfig, flooredDepth, triageProvenance, triageModelID, triageEffort, prCtx.ChangedFilesCount, prCtx.Diff == "", prCtx.DiffTruncated))
+		// (§31.6): see internal/adapters/inbound/github/handler.go's
+		// own identical addition for the full "why this carrier" reasoning.
+		archDecisionTags := autoapproval.TagStrings(autoapproval.ClassifyChangedPaths(prCtx.ChangedPaths))
+		archDecisionRoots := autoapproval.ClassifyChangedRoots(prCtx.ChangedPaths)
+		triageRecordJSON, triageRecordErr := json.Marshal(domainreviewtriage.NewDecisionRecord(triageDecision, triageConfig, flooredDepth, triageProvenance, triageModelID, triageEffort, prCtx.ChangedFilesCount, prCtx.Diff == "", prCtx.DiffTruncated, archDecisionTags, archDecisionRoots))
 		if triageRecordErr != nil {
 			logger.Warn("httpapi: marshal review-depth decision record failed, turn will carry review_depth but no review_depth_decision", "error", triageRecordErr, "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
 			triageRecordJSON = nil

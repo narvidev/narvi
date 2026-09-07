@@ -323,6 +323,7 @@ func PostReviewVerdict(
 		var reviewDepth reviewtriage.ReviewDepth
 		var serverComputedChangedFiles int
 		var diffDelivered bool
+		var archDecisionTags, archDecisionRoots []string
 		// dispatchedSandboxGen/dispatchedEventID (§26.4/§7.1) are
 		// this SAME processing turn's own turns.dispatched_sandbox_gen/
 		// dispatched_event_id -- the sandbox gen this turn's prompt was
@@ -365,6 +366,18 @@ func PostReviewVerdict(
 				} else {
 					serverComputedChangedFiles = decisionRecord.ChangedFilesCount
 					diffDelivered = !decisionRecord.DiffEmpty && !decisionRecord.DiffTruncated
+					// The gate's own key, read back from where the
+					// dispatching path stamped it rather than recomputed
+					// here: this endpoint never sees the PR's changed
+					// paths, only what the sandbox posts, and the one
+					// thing the gate must never key on is anything the
+					// model authored. An unmarshal failure above leaves
+					// both nil, so the verdict is stamped with no tags
+					// and no roots -- it becomes reachable only through
+					// the selector's recency fallback, never wrongly
+					// matched, which is the safe direction.
+					archDecisionTags = decisionRecord.ArchDecisionTags
+					archDecisionRoots = decisionRecord.ArchDecisionRoots
 				}
 			}
 		}
@@ -635,7 +648,7 @@ func PostReviewVerdict(
 		// an unpersisted verdict.
 		if verdictHeadSHA == "" {
 			logger.Warn("httpapi: review-verdict: no review head sha on record, skipping review_verdicts insert", "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
-		} else if _, insertErr := appreviewverdict.Insert(ctx, reviewVerdicts.WithTx(tx), repoSettings.WithTx(tx), platformShadow, prSession.RepoFullName, prSession.PrNumber, verdictHeadSHA, sessionID, verdict, input.Digest, reviewDepth, input.CounterReview, input.FactCheck, input.FactCheckKilled); insertErr != nil {
+		} else if _, insertErr := appreviewverdict.Insert(ctx, reviewVerdicts.WithTx(tx), repoSettings.WithTx(tx), platformShadow, prSession.RepoFullName, prSession.PrNumber, verdictHeadSHA, sessionID, verdict, input.Digest, reviewDepth, input.CounterReview, input.FactCheck, input.FactCheckKilled, archDecisionTags, archDecisionRoots); insertErr != nil {
 			logger.Error("httpapi: review-verdict: insert review_verdicts row failed", "error", insertErr)
 			writeError(w, http.StatusInternalServerError, "internal error")
 			return

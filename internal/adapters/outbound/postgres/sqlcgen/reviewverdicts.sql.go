@@ -12,7 +12,7 @@ import (
 )
 
 const getLatestNonShadowReviewVerdict = `-- name: GetLatestNonShadowReviewVerdict :one
-SELECT id, repo_full_name, pr_number, head_sha, risk_level, premise, blast_radius, files_changed, tests_coverage, docs_drift, proposed_shippable, shippable, session_id, created_at, digest_summary, digest_arch_decisions, digest_stack_risks, digest_unverified_limits, digest_description_adequacy, digest_adequacy_explanation, digest_proposed_body, review_path, counter_review, fact_check, fact_check_killed, digest_contested_points, suppressed_in_shadow FROM review_verdicts rv
+SELECT id, repo_full_name, pr_number, head_sha, risk_level, premise, blast_radius, files_changed, tests_coverage, docs_drift, proposed_shippable, shippable, session_id, created_at, digest_summary, digest_arch_decisions, digest_stack_risks, digest_unverified_limits, digest_description_adequacy, digest_adequacy_explanation, digest_proposed_body, review_path, counter_review, fact_check, fact_check_killed, digest_contested_points, suppressed_in_shadow, arch_decision_tags, arch_decision_roots FROM review_verdicts rv
 WHERE rv.repo_full_name = $1 AND rv.pr_number = $2
     AND NOT rv.suppressed_in_shadow
     AND rv.created_at > COALESCE(
@@ -73,12 +73,14 @@ func (q *Queries) GetLatestNonShadowReviewVerdict(ctx context.Context, arg GetLa
 		&i.FactCheckKilled,
 		&i.DigestContestedPoints,
 		&i.SuppressedInShadow,
+		&i.ArchDecisionTags,
+		&i.ArchDecisionRoots,
 	)
 	return i, err
 }
 
 const getLatestReviewVerdict = `-- name: GetLatestReviewVerdict :one
-SELECT id, repo_full_name, pr_number, head_sha, risk_level, premise, blast_radius, files_changed, tests_coverage, docs_drift, proposed_shippable, shippable, session_id, created_at, digest_summary, digest_arch_decisions, digest_stack_risks, digest_unverified_limits, digest_description_adequacy, digest_adequacy_explanation, digest_proposed_body, review_path, counter_review, fact_check, fact_check_killed, digest_contested_points, suppressed_in_shadow FROM review_verdicts
+SELECT id, repo_full_name, pr_number, head_sha, risk_level, premise, blast_radius, files_changed, tests_coverage, docs_drift, proposed_shippable, shippable, session_id, created_at, digest_summary, digest_arch_decisions, digest_stack_risks, digest_unverified_limits, digest_description_adequacy, digest_adequacy_explanation, digest_proposed_body, review_path, counter_review, fact_check, fact_check_killed, digest_contested_points, suppressed_in_shadow, arch_decision_tags, arch_decision_roots FROM review_verdicts
 WHERE repo_full_name = $1 AND pr_number = $2
 ORDER BY created_at DESC
 LIMIT 1
@@ -140,6 +142,8 @@ func (q *Queries) GetLatestReviewVerdict(ctx context.Context, arg GetLatestRevie
 		&i.FactCheckKilled,
 		&i.DigestContestedPoints,
 		&i.SuppressedInShadow,
+		&i.ArchDecisionTags,
+		&i.ArchDecisionRoots,
 	)
 	return i, err
 }
@@ -154,10 +158,11 @@ INSERT INTO review_verdicts (
     digest_description_adequacy, digest_adequacy_explanation, digest_proposed_body,
     review_path,
     counter_review, fact_check, fact_check_killed, digest_contested_points,
-    suppressed_in_shadow
+    suppressed_in_shadow,
+    arch_decision_tags, arch_decision_roots
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
-RETURNING id, repo_full_name, pr_number, head_sha, risk_level, premise, blast_radius, files_changed, tests_coverage, docs_drift, proposed_shippable, shippable, session_id, created_at, digest_summary, digest_arch_decisions, digest_stack_risks, digest_unverified_limits, digest_description_adequacy, digest_adequacy_explanation, digest_proposed_body, review_path, counter_review, fact_check, fact_check_killed, digest_contested_points, suppressed_in_shadow
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+RETURNING id, repo_full_name, pr_number, head_sha, risk_level, premise, blast_radius, files_changed, tests_coverage, docs_drift, proposed_shippable, shippable, session_id, created_at, digest_summary, digest_arch_decisions, digest_stack_risks, digest_unverified_limits, digest_description_adequacy, digest_adequacy_explanation, digest_proposed_body, review_path, counter_review, fact_check, fact_check_killed, digest_contested_points, suppressed_in_shadow, arch_decision_tags, arch_decision_roots
 `
 
 type InsertReviewVerdictParams struct {
@@ -186,6 +191,8 @@ type InsertReviewVerdictParams struct {
 	FactCheckKilled           *int32      `json:"fact_check_killed"`
 	DigestContestedPoints     *string     `json:"digest_contested_points"`
 	SuppressedInShadow        bool        `json:"suppressed_in_shadow"`
+	ArchDecisionTags          []byte      `json:"arch_decision_tags"`
+	ArchDecisionRoots         []byte      `json:"arch_decision_roots"`
 }
 
 // Queries backing ReviewVerdictStore (§21.1) -- see
@@ -228,6 +235,13 @@ type InsertReviewVerdictParams struct {
 // function's own doc comment for the resolution formula (egressmode.
 // Resolve, the identical single-authority resolver postgres.OutboxStore.
 // Create already uses for the outbox's own enqueue-time stamp).
+//
+// arch_decision_tags/arch_decision_roots (§31.6, migrations/
+// 000113_review_verdicts_arch_decision_tags_roots.up.sql) forward
+// turns.review_depth_decision's own ArchDecisionTags/ArchDecisionRoots
+// verbatim -- see that migration's own doc comment for the full "why
+// this carrier, computed once at turn-creation time" reasoning. JSONB
+// arrays of plain strings, mirroring blast_radius's own identical shape.
 func (q *Queries) InsertReviewVerdict(ctx context.Context, arg InsertReviewVerdictParams) (ReviewVerdict, error) {
 	row := q.db.QueryRow(ctx, insertReviewVerdict,
 		arg.RepoFullName,
@@ -255,6 +269,8 @@ func (q *Queries) InsertReviewVerdict(ctx context.Context, arg InsertReviewVerdi
 		arg.FactCheckKilled,
 		arg.DigestContestedPoints,
 		arg.SuppressedInShadow,
+		arg.ArchDecisionTags,
+		arg.ArchDecisionRoots,
 	)
 	var i ReviewVerdict
 	err := row.Scan(
@@ -285,13 +301,15 @@ func (q *Queries) InsertReviewVerdict(ctx context.Context, arg InsertReviewVerdi
 		&i.FactCheckKilled,
 		&i.DigestContestedPoints,
 		&i.SuppressedInShadow,
+		&i.ArchDecisionTags,
+		&i.ArchDecisionRoots,
 	)
 	return i, err
 }
 
 const listLatestAutoApprovedInRepo = `-- name: ListLatestAutoApprovedInRepo :many
-SELECT id, repo_full_name, pr_number, head_sha, risk_level, premise, blast_radius, files_changed, tests_coverage, docs_drift, proposed_shippable, shippable, session_id, created_at, digest_summary, digest_arch_decisions, digest_stack_risks, digest_unverified_limits, digest_description_adequacy, digest_adequacy_explanation, digest_proposed_body, review_path, counter_review, fact_check, fact_check_killed, digest_contested_points, suppressed_in_shadow FROM (
-    SELECT DISTINCT ON (rv.repo_full_name, rv.pr_number) rv.id, rv.repo_full_name, rv.pr_number, rv.head_sha, rv.risk_level, rv.premise, rv.blast_radius, rv.files_changed, rv.tests_coverage, rv.docs_drift, rv.proposed_shippable, rv.shippable, rv.session_id, rv.created_at, rv.digest_summary, rv.digest_arch_decisions, rv.digest_stack_risks, rv.digest_unverified_limits, rv.digest_description_adequacy, rv.digest_adequacy_explanation, rv.digest_proposed_body, rv.review_path, rv.counter_review, rv.fact_check, rv.fact_check_killed, rv.digest_contested_points, rv.suppressed_in_shadow
+SELECT id, repo_full_name, pr_number, head_sha, risk_level, premise, blast_radius, files_changed, tests_coverage, docs_drift, proposed_shippable, shippable, session_id, created_at, digest_summary, digest_arch_decisions, digest_stack_risks, digest_unverified_limits, digest_description_adequacy, digest_adequacy_explanation, digest_proposed_body, review_path, counter_review, fact_check, fact_check_killed, digest_contested_points, suppressed_in_shadow, arch_decision_tags, arch_decision_roots FROM (
+    SELECT DISTINCT ON (rv.repo_full_name, rv.pr_number) rv.id, rv.repo_full_name, rv.pr_number, rv.head_sha, rv.risk_level, rv.premise, rv.blast_radius, rv.files_changed, rv.tests_coverage, rv.docs_drift, rv.proposed_shippable, rv.shippable, rv.session_id, rv.created_at, rv.digest_summary, rv.digest_arch_decisions, rv.digest_stack_risks, rv.digest_unverified_limits, rv.digest_description_adequacy, rv.digest_adequacy_explanation, rv.digest_proposed_body, rv.review_path, rv.counter_review, rv.fact_check, rv.fact_check_killed, rv.digest_contested_points, rv.suppressed_in_shadow, rv.arch_decision_tags, rv.arch_decision_roots
     FROM review_verdicts rv
     WHERE rv.repo_full_name = $1 AND rv.created_at > $2
         AND NOT rv.suppressed_in_shadow
@@ -375,6 +393,8 @@ func (q *Queries) ListLatestAutoApprovedInRepo(ctx context.Context, arg ListLate
 			&i.FactCheckKilled,
 			&i.DigestContestedPoints,
 			&i.SuppressedInShadow,
+			&i.ArchDecisionTags,
+			&i.ArchDecisionRoots,
 		); err != nil {
 			return nil, err
 		}
@@ -387,7 +407,7 @@ func (q *Queries) ListLatestAutoApprovedInRepo(ctx context.Context, arg ListLate
 }
 
 const listNonShadowReviewVerdictsInWindow = `-- name: ListNonShadowReviewVerdictsInWindow :many
-SELECT rv.id, rv.repo_full_name, rv.pr_number, rv.head_sha, rv.risk_level, rv.premise, rv.blast_radius, rv.files_changed, rv.tests_coverage, rv.docs_drift, rv.proposed_shippable, rv.shippable, rv.session_id, rv.created_at, rv.digest_summary, rv.digest_arch_decisions, rv.digest_stack_risks, rv.digest_unverified_limits, rv.digest_description_adequacy, rv.digest_adequacy_explanation, rv.digest_proposed_body, rv.review_path, rv.counter_review, rv.fact_check, rv.fact_check_killed, rv.digest_contested_points, rv.suppressed_in_shadow FROM review_verdicts rv
+SELECT rv.id, rv.repo_full_name, rv.pr_number, rv.head_sha, rv.risk_level, rv.premise, rv.blast_radius, rv.files_changed, rv.tests_coverage, rv.docs_drift, rv.proposed_shippable, rv.shippable, rv.session_id, rv.created_at, rv.digest_summary, rv.digest_arch_decisions, rv.digest_stack_risks, rv.digest_unverified_limits, rv.digest_description_adequacy, rv.digest_adequacy_explanation, rv.digest_proposed_body, rv.review_path, rv.counter_review, rv.fact_check, rv.fact_check_killed, rv.digest_contested_points, rv.suppressed_in_shadow, rv.arch_decision_tags, rv.arch_decision_roots FROM review_verdicts rv
 WHERE rv.repo_full_name = $1 AND rv.created_at > $2
     AND NOT rv.suppressed_in_shadow
     AND rv.created_at > COALESCE(
@@ -453,6 +473,8 @@ func (q *Queries) ListNonShadowReviewVerdictsInWindow(ctx context.Context, arg L
 			&i.FactCheckKilled,
 			&i.DigestContestedPoints,
 			&i.SuppressedInShadow,
+			&i.ArchDecisionTags,
+			&i.ArchDecisionRoots,
 		); err != nil {
 			return nil, err
 		}
@@ -465,7 +487,7 @@ func (q *Queries) ListNonShadowReviewVerdictsInWindow(ctx context.Context, arg L
 }
 
 const listReviewVerdictsForPR = `-- name: ListReviewVerdictsForPR :many
-SELECT id, repo_full_name, pr_number, head_sha, risk_level, premise, blast_radius, files_changed, tests_coverage, docs_drift, proposed_shippable, shippable, session_id, created_at, digest_summary, digest_arch_decisions, digest_stack_risks, digest_unverified_limits, digest_description_adequacy, digest_adequacy_explanation, digest_proposed_body, review_path, counter_review, fact_check, fact_check_killed, digest_contested_points, suppressed_in_shadow FROM review_verdicts
+SELECT id, repo_full_name, pr_number, head_sha, risk_level, premise, blast_radius, files_changed, tests_coverage, docs_drift, proposed_shippable, shippable, session_id, created_at, digest_summary, digest_arch_decisions, digest_stack_risks, digest_unverified_limits, digest_description_adequacy, digest_adequacy_explanation, digest_proposed_body, review_path, counter_review, fact_check, fact_check_killed, digest_contested_points, suppressed_in_shadow, arch_decision_tags, arch_decision_roots FROM review_verdicts
 WHERE repo_full_name = $1 AND pr_number = $2
 ORDER BY created_at DESC
 LIMIT $3
@@ -520,6 +542,8 @@ func (q *Queries) ListReviewVerdictsForPR(ctx context.Context, arg ListReviewVer
 			&i.FactCheckKilled,
 			&i.DigestContestedPoints,
 			&i.SuppressedInShadow,
+			&i.ArchDecisionTags,
+			&i.ArchDecisionRoots,
 		); err != nil {
 			return nil, err
 		}
@@ -532,7 +556,7 @@ func (q *Queries) ListReviewVerdictsForPR(ctx context.Context, arg ListReviewVer
 }
 
 const listReviewVerdictsInWindow = `-- name: ListReviewVerdictsInWindow :many
-SELECT id, repo_full_name, pr_number, head_sha, risk_level, premise, blast_radius, files_changed, tests_coverage, docs_drift, proposed_shippable, shippable, session_id, created_at, digest_summary, digest_arch_decisions, digest_stack_risks, digest_unverified_limits, digest_description_adequacy, digest_adequacy_explanation, digest_proposed_body, review_path, counter_review, fact_check, fact_check_killed, digest_contested_points, suppressed_in_shadow FROM review_verdicts
+SELECT id, repo_full_name, pr_number, head_sha, risk_level, premise, blast_radius, files_changed, tests_coverage, docs_drift, proposed_shippable, shippable, session_id, created_at, digest_summary, digest_arch_decisions, digest_stack_risks, digest_unverified_limits, digest_description_adequacy, digest_adequacy_explanation, digest_proposed_body, review_path, counter_review, fact_check, fact_check_killed, digest_contested_points, suppressed_in_shadow, arch_decision_tags, arch_decision_roots FROM review_verdicts
 WHERE repo_full_name = $1 AND created_at > $2
 ORDER BY created_at ASC
 LIMIT $3
@@ -589,6 +613,8 @@ func (q *Queries) ListReviewVerdictsInWindow(ctx context.Context, arg ListReview
 			&i.FactCheckKilled,
 			&i.DigestContestedPoints,
 			&i.SuppressedInShadow,
+			&i.ArchDecisionTags,
+			&i.ArchDecisionRoots,
 		); err != nil {
 			return nil, err
 		}
