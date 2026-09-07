@@ -19,6 +19,8 @@ import (
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/app/reviewcontext"
+	"github.com/narvidev/narvi/internal/domain/knowledge"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -905,5 +907,88 @@ func TestReviewRetriggerDebounceTimer_AlwaysLightConfig_SkipsFloor_StaysLight(t 
 	// disagree on their own face.
 	if record.Mode == "always_light" && record.Depth == "deep" {
 		t.Errorf("review_depth_decision = %+v, self-contradictory: mode always_light alongside depth deep", record)
+	}
+}
+
+// TestReviewRetriggerDebounceTimer_Enqueue_PersistsKnowledgeModeAndDecision
+// is this Step's own regression test for the automatic re-review lane's
+// own half of §31.2/§31.6/§31.7's "mode buffer": insertAutoRetriggerTurn
+// (reviewretrigger.go) stamps turns.review_knowledge_mode/
+// review_knowledge_decision on EVERY turn it creates -- composeAutoRetriggerPrompt's
+// own knowledgeMode/knowledgeDecisionJSON return values, computed one
+// call earlier. Before this test, nothing anywhere in this repository
+// asserted either column is ever actually written by a real timer firing
+// through a real Actor -- an adversarial audit of this branch confirmed
+// both fields can be silently reset to nil at this exact call site (Insert's
+// own last two turn-creation arguments) with the WHOLE suite, this package
+// included, still reporting green.
+//
+// This automatic lane is chosen as this Step's own turn-side coverage
+// over the OTHER two review-turn producers (httpapi.RetriggerReview's own
+// manual button, internal/adapters/inbound/github/handler.go's own
+// mention/label lanes) because it is the only one of the three that fires
+// completely unattended, repeatedly, for as long as a PR keeps receiving
+// pushes -- the highest-volume path in production, and, per this same
+// file's own TestReviewRetriggerDebounceTimer_Enqueue_PromptIncludesFalsePositiveAdvisoryAndAlreadyAnsweredFacts
+// doc comment, the one lane with an actual track record of silently
+// diverging from its own two siblings. The manual-button and mention/
+// label lanes remain genuinely UNCOVERED for this specific pair of
+// columns after this change -- both are structurally identical call sites
+// (commit eae059e's own wiring: CreateTurnOptions.ReviewKnowledgeMode/
+// ReviewKnowledgeDecision threaded through CreateTurnCore/CreateTurnForBot),
+// left for a follow-up rather than covered here.
+//
+// No prior review_verdicts row exists anywhere in this fixture's own
+// repo (newAutoRetriggerFixture seeds none, and this test deliberately
+// never calls insertVerdict/insertVerdictWithReviewPath) -- so
+// FetchPriorArchDecisions' own gate finds nothing to gate against AND
+// nothing recent (reviewcontext/archdecisions.go's own "nothing gated,
+// nothing recent -- an honestly empty repository history" branch),
+// producing a real, non-nil, but EMPTY knowledge.InjectedRecord. That is
+// deliberate: this test's own point is that the STAMP survives to the
+// turn row at all, not that this particular fixture's history is
+// non-empty (TestPostReviewVerdict_PersistsKnowledgeAndArchDecisionStamps,
+// internal/adapters/inbound/httpapi, covers the non-empty/knowledge-
+// influenced case, one layer further down this same pipeline, at
+// verdict-post time).
+func TestReviewRetriggerDebounceTimer_Enqueue_PersistsKnowledgeModeAndDecision(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	f := newAutoRetriggerFixture(ctx, t, pool)
+	if _, err := f.repoSettings.UpsertAutoRetriggerReviewToggle(ctx, f.repoFullName, true); err != nil {
+		t.Fatalf("enable auto-retrigger-review: %v", err)
+	}
+	f.setPendingHeadSHA(ctx, t, "sha-pending-knowledge")
+	f.armDebounceTimer(ctx, t)
+
+	diffFetcher := &fakeReviewDiffFetcher{nextHeadSHA: "sha-live-knowledge", nextBaseRef: "main", nextDiff: "+ line changed"}
+	r := newAutoRetriggerRegistry(ctx, t, pool, diffFetcher)
+	fireDebounceTimer(ctx, t, r, f)
+
+	turns, err := f.turns.ListForSession(ctx, f.sessionID)
+	if err != nil {
+		t.Fatalf("list turns: %v", err)
+	}
+	if len(turns) != 1 {
+		t.Fatalf("turns created = %d, want 1", len(turns))
+	}
+	got := turns[0]
+
+	if got.ReviewKnowledgeMode == nil || *got.ReviewKnowledgeMode != knowledge.ModeA {
+		t.Errorf("ReviewKnowledgeMode = %v, want %q -- every automatically-created review turn must be stamped with the mode buffer's own fixed value, never left NULL", got.ReviewKnowledgeMode, knowledge.ModeA)
+	}
+
+	if len(got.ReviewKnowledgeDecision) == 0 {
+		t.Fatal("ReviewKnowledgeDecision is empty, want a marshaled knowledge.InjectedRecord -- even an honestly-empty repo history must still be RECORDED (Selector/Ranker populated), never left NULL")
+	}
+	var injected knowledge.InjectedRecord
+	if err := json.Unmarshal(got.ReviewKnowledgeDecision, &injected); err != nil {
+		t.Fatalf("unmarshal ReviewKnowledgeDecision: %v", err)
+	}
+	if injected.Selector != reviewcontext.SelectorRecencyFallback {
+		t.Errorf("ReviewKnowledgeDecision.Selector = %q, want %q (this fixture's repo has no prior review_verdicts row at all, gated or recent)", injected.Selector, reviewcontext.SelectorRecencyFallback)
+	}
+	if !injected.Empty() {
+		t.Errorf("ReviewKnowledgeDecision = %+v, want Empty() true (no candidates exist anywhere in this fixture's repo to inject)", injected)
 	}
 }
