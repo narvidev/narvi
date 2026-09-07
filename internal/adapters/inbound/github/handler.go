@@ -11,11 +11,13 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/releasereview"
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
 	appreviewtriage "github.com/narvidev/narvi/internal/app/reviewtriage"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
+	"github.com/narvidev/narvi/internal/domain/knowledge"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/review"
 	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
@@ -151,6 +153,28 @@ type Config struct {
 	// entirely. *postgres.FalsePositivePatternStore (cmd/control-plane/
 	// main.go) satisfies this directly.
 	FalsePositivePatterns reviewcontext.FalsePositivePatternsFetcher
+
+	// ArchDecisions (§31.6, the "prior architecture decisions" block)
+	// fetches this repo's own gated (or, on empty overlap, recent) prior
+	// arch-decisions and renders them via internal/app/reviewcontext.
+	// FetchPriorArchDecisions -- prepended to every review turn's own
+	// prompt exactly like FalsePositivePatterns'/ReviewFindings' own
+	// blocks. Nil-safe: nil (this package's own handler_test.go) simply
+	// skips this fetch entirely -- FetchPriorArchDecisions itself already
+	// treats a nil fetcher as "render nothing", but the field is typed as
+	// the narrow reviewcontext.ArchDecisionsFetcher interface, not that
+	// function, so nil-safety is stated here too rather than assumed.
+	// *postgres.ReviewVerdictStore (cmd/control-plane/main.go, the SAME
+	// instance every other review_verdicts reader in this deployment
+	// shares) satisfies this directly.
+	ArchDecisions reviewcontext.ArchDecisionsFetcher
+
+	// KnowledgeRanker (§31.6/§34.7) orders whatever ArchDecisions' own
+	// gate admits -- knowledge.RecencyRanker{} (the public product's own
+	// default, controlplane.selectKnowledgeRanker's return value with no
+	// module composed) when nil, mirroring FetchPriorArchDecisions' own
+	// identical "nil ranker degrades to RecencyRanker{}" fail-safe.
+	KnowledgeRanker ports.KnowledgeRanker
 
 	// FalsePositivePatternCapture (§22.2) is this handler's own
 	// dispatch-before-router capture surface -- see
@@ -645,6 +669,53 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 			}
 		}
 
+		// (§31.6): this turn's own server-derived knowledge-gate
+		// key, computed ONCE here (immediately after prCtx resolves,
+		// never from anything a reviewing model posts) and reused both
+		// for the prior-decisions fetch immediately below AND for the
+		// write-time stamp further down (archDecisionTags/
+		// archDecisionRoots on triageRecordJSON) -- a single computation
+		// keeps the gate query's own key and the write-time stamp always
+		// in agreement, never two independently-derived values that
+		// could disagree.
+		archTags := autoapproval.ClassifyChangedPaths(prCtx.ChangedPaths)
+		archTagStrings := autoapproval.TagStrings(archTags)
+		archRoots := autoapproval.ClassifyChangedRoots(prCtx.ChangedPaths)
+
+		// (§31.6 item 1, "the flagship"): prepend this repo's own
+		// gated (or, on empty overlap, recent) prior architecture
+		// decisions -- placed as the FIRST prepend among this handler's
+		// own prCtx-dependent blocks (it runs before the already-answered
+		// block immediately below, mirroring that block's own "moved
+		// here so prCtx.ChangedPaths is available" precedent), so it
+		// still lands entirely BEFORE review.RenderTurnPrompt renders
+		// m.CommentBody a few lines down. cfg.ArchDecisions == nil (this
+		// package's own handler_test.go, or any minimal wiring that
+		// doesn't care about this Step) simply skips this fetch --
+		// FetchPriorArchDecisions' own nil-fetcher fail-safe handles it,
+		// but the block is only ever called at all when a fetcher is
+		// configured, mirroring FalsePositivePatterns/ReviewFindings' own
+		// identical `if cfg.X != nil` guard one field over.
+		knowledgeMode := knowledge.ModeA
+		var knowledgeDecisionJSON []byte
+		if cfg.ArchDecisions != nil {
+			archBlock, injected := reviewcontext.FetchPriorArchDecisions(ctx, logger, cfg.ArchDecisions, cfg.KnowledgeRanker, cfg.Timeouts, knowledge.Query{
+				RepoFullName: m.RepoFullName,
+				Tags:         archTagStrings,
+				Roots:        archRoots,
+				ChangedPaths: prCtx.ChangedPaths,
+				Title:        prCtx.Title,
+			})
+			if archBlock != "" {
+				m.CommentBody = archBlock + m.CommentBody
+			}
+			if recJSON, marshalErr := json.Marshal(injected); marshalErr != nil {
+				logger.Warn("github: marshal knowledge injected-ids record failed, turn will carry review_knowledge_mode but no review_knowledge_decision", "error", marshalErr, "repo", m.RepoFullName, "pr_number", m.PRNumber)
+			} else {
+				knowledgeDecisionJSON = recJSON
+			}
+		}
+
 		// (§26.3): the depth decision, computed from prCtx above.
 		// Adversarial-review fix D2 ("deep-path digest requirement
 		// contradicts the prompt the agent actually receives"): this MUST
@@ -731,16 +802,13 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 			logger.Info("github: review routed deep but no deep-tier model configured (NARVI_REVIEW_MODEL_DEEP unset), dispatching with the default model at forced high effort", "repo", m.RepoFullName, "pr_number", m.PRNumber)
 		}
 		// (§31.6): this turn's own server-derived knowledge-gate
-		// key -- the SAME deterministic classifiers the gate query itself
-		// (a later Step) overlaps against, computed here (never from
-		// anything a reviewing model posts) and carried onto
+		// key -- archTagStrings/archRoots, computed once above (never
+		// from anything a reviewing model posts) and carried onto
 		// triageRecordJSON below so it survives to verdict-post time --
 		// see reviewtriage.DecisionRecord.ArchDecisionTags/ArchDecisionRoots'
 		// own doc comment for the full "why this carrier, not a new
 		// column" reasoning.
-		archDecisionTags := autoapproval.TagStrings(autoapproval.ClassifyChangedPaths(prCtx.ChangedPaths))
-		archDecisionRoots := autoapproval.ClassifyChangedRoots(prCtx.ChangedPaths)
-		triageRecordJSON, triageRecordErr := json.Marshal(domainreviewtriage.NewDecisionRecord(triageDecision, triageConfig, flooredDepth, triageProvenance, triageModelID, triageEffort, prCtx.ChangedFilesCount, prCtx.Diff == "", prCtx.DiffTruncated, archDecisionTags, archDecisionRoots))
+		triageRecordJSON, triageRecordErr := json.Marshal(domainreviewtriage.NewDecisionRecord(triageDecision, triageConfig, flooredDepth, triageProvenance, triageModelID, triageEffort, prCtx.ChangedFilesCount, prCtx.Diff == "", prCtx.DiffTruncated, archTagStrings, archRoots))
 		if triageRecordErr != nil {
 			logger.Warn("github: marshal review-depth decision record failed, turn will carry review_depth but no review_depth_decision", "error", triageRecordErr, "repo", m.RepoFullName, "pr_number", m.PRNumber)
 			triageRecordJSON = nil
@@ -794,7 +862,7 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 			return
 		}
 
-		session, turn, isNew, err := coalescer.CreateOrJoin(ctx, m.RepoFullName, m.PRNumber, req, actor, m.IsLabelRetrigger, mentionText, fetchedHeadSHA, &reviewDepthStr, triageModelID, triageEffort, triageRecordJSON)
+		session, turn, isNew, err := coalescer.CreateOrJoin(ctx, m.RepoFullName, m.PRNumber, req, actor, m.IsLabelRetrigger, mentionText, fetchedHeadSHA, &reviewDepthStr, triageModelID, triageEffort, triageRecordJSON, &knowledgeMode, knowledgeDecisionJSON)
 		if err != nil {
 			if errors.Is(err, ErrActorNotAuthorized) {
 				// ErrActorNotAuthorized fires for TWO distinct reasons

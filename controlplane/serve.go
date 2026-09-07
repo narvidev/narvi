@@ -1006,6 +1006,11 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// own guarantee exactly as buildCapabilityRegistry does immediately
 	// above.
 	knowledgeRanker := selectKnowledgeRanker(capabilities, modules, cfg.Timeouts.KnowledgeRankerTimeout)
+	// registry (§31.6) was already constructed, above, before capabilities/
+	// knowledgeRanker existed -- see Registry.SetKnowledgeRanker's own doc
+	// comment for why this is safe: no Actor is hydrated before Run starts
+	// serving real traffic, strictly after this function returns.
+	registry.SetKnowledgeRanker(knowledgeRanker)
 
 	router := chi.NewRouter()
 	router.Use(middleware.Recoverer)
@@ -1398,6 +1403,15 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 			// falsePositivePatternStore instance, satisfying this
 			// structurally different (write) interface.
 			FalsePositivePatternCapture: falsePositivePatternStore,
+			// ArchDecisions/KnowledgeRanker (§31.6): the SAME
+			// reviewVerdictStore instance every other review_verdicts
+			// reader above already uses (it satisfies reviewcontext.
+			// ArchDecisionsFetcher directly, reviewverdictarchdecisions.go)
+			// and the SAME knowledgeRanker every other review-turn
+			// producer in this file shares (knowledge.RecencyRanker{}
+			// unless a composed module supplies its own).
+			ArchDecisions:   reviewVerdictStore,
+			KnowledgeRanker: knowledgeRanker,
 			// ArchRecapContestCapture/ArchRecapVerdicts (§26.5):
 			// reviewDigestSectionFeedbackStore is the SAME instance this
 			// deployment has exactly one of; reviewVerdictDeps is the SAME
@@ -1746,7 +1760,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// sourceControl/cfg.GitHubBotToken are the SAME instances the
 		// GitHub webhook ingress wiring above already constructs, never a
 		// second, independently-constructed copy.
-		r.Post("/{sessionID}/review/retrigger", httpapi.RetriggerReview(pool, sessionStore, turnStore, planStore, auditLogStore, registry, githubPRSessionStore, sourceControl, reviewFindingStore, falsePositivePatternStore, cfg.GitHubBotToken, cfg.Timeouts, appreviewtriage.Deps{RepoSettings: repoSettingsStore, ReviewVerdicts: reviewVerdictStore, Artifacts: artifactStore, Sessions: sessionStore}, cfg.ReviewModelDeep))
+		r.Post("/{sessionID}/review/retrigger", httpapi.RetriggerReview(pool, sessionStore, turnStore, planStore, auditLogStore, registry, githubPRSessionStore, sourceControl, reviewFindingStore, falsePositivePatternStore, reviewVerdictStore, knowledgeRanker, cfg.GitHubBotToken, cfg.Timeouts, appreviewtriage.Deps{RepoSettings: repoSettingsStore, ReviewVerdicts: reviewVerdictStore, Artifacts: artifactStore, Sessions: sessionStore}, cfg.ReviewModelDeep))
 		// review/findings/{identityHash}/rebut + apply-suggestion (
 		// "sentinels + suggestions", §12.2 item 2/§22.1) -- maintainer+
 		// only (authz.ActionEditReviewVerdict, checked inside each

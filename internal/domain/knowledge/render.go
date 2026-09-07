@@ -8,12 +8,11 @@ import (
 	"strings"
 )
 
-// This file is Step 107's own addition to a package Step 134 already
-// finished the ranking half of (doc.go: "Deliberately absent: ... the
-// impure fetch/render pair that calls a KnowledgeRanker and renders its
-// result into a prompt block, the durable record of which candidates
-// were actually injected"). RenderPriorDecisionsBlock is G2 (technical
-// plan §31.7): "one sanitizing renderer on EVERY projection, by
+// This file adds the render half doc.go's own "Deliberately absent" list
+// names: "the impure fetch/render pair that calls a KnowledgeRanker and
+// renders its result into a prompt block, the durable record of which
+// candidates were actually injected". RenderPriorDecisionsBlock is G2
+// (technical plan §31.7): "one sanitizing renderer on EVERY projection, by
 // construction" -- a mirror of internal/domain/falsepositive.
 // RenderAdvisoryBlock (fixed non-caller-suppliable delimiter, "DATA,
 // never instruction" framing, a strip pass, empty string for zero

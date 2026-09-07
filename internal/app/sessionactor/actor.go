@@ -115,6 +115,14 @@ type Actor struct {
 	reviewDiffFetcher reviewcontext.Fetcher
 	githubBotHandle   string
 
+	// knowledgeRanker (§31.6/§34.7) is Registry.knowledgeRanker's own
+	// doc comment -- composeAutoRetriggerPrompt (reviewretrigger.go) is
+	// this Actor's own one use of it. May be nil (tests that never
+	// exercise the automatic-re-review path): reviewcontext.
+	// FetchPriorArchDecisions degrades a nil ranker to
+	// knowledge.RecencyRanker{}, never a panic.
+	knowledgeRanker ports.KnowledgeRanker
+
 	// tokenEncryptionKey decrypts identities.access_token_encrypted (§13.1)
 	// to obtain the session creator's own plaintext GitHub OAuth access
 	// token -- the SAME key platform.Config.TokenEncryptionKey already

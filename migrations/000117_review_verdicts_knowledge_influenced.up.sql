@@ -1,4 +1,4 @@
--- review_verdicts.knowledge_influenced (Step 107, §31.7's own G5 --
+-- review_verdicts.knowledge_influenced (§31.7's own G5 --
 -- "cut self-reinforcement by capping provenance, never by barring
 -- entry"): "A verdict produced by a turn whose prompt carried
 -- prior-decision concepts -- injected by mode A's selector or retrieved
@@ -8,24 +8,25 @@
 -- never satisfy 'agent-authored, uncontested' authority."
 --
 -- BOOLEAN NOT NULL DEFAULT false -- unlike review_path/knowledge_mode
--- (nullable, "posted before this Step existed"), false is never
--- ambiguous here: every row that predates this Step predates prior-
--- decision injection entirely (Step 107 is where injection starts, on
--- all three review-turn producers, in the SAME PR this stamp ships in),
+-- (nullable, "posted before this column existed"), false is never
+-- ambiguous here: every row that predates this column predates prior-
+-- decision injection entirely (this column and the injection pipeline
+-- ship in the same change, on all three review-turn producers at once),
 -- so "no stamp" and "genuinely not influenced" are the identical fact
 -- for every historical row -- false is not a fabricated value for them,
--- it is the true one. Every row from this Step forward gets a REAL,
+-- it is the true one. Every row from this column forward gets a REAL,
 -- computed answer (internal/app/reviewverdict.Insert derives it from
 -- this verdict's own posting turn's turns.review_knowledge_decision --
 -- migrations/000116 -- via unmarshalling: influenced iff that record
 -- carries at least one injected id), never the zero-value default by
 -- omission -- see that function's own doc comment.
 --
--- Ships here, with the mode buffer, rather than waiting for Step 108:
--- "the stamp ships at Step 107 with the mode buffer -- injection starts
--- there, so no unstamped-but-influenced verdict ever exists in the
--- population Step 108 ingests." §31.6's own injected-ids record
--- (turns.review_knowledge_decision) is this stamp's evidence trail,
--- never its substitute -- this column is what a future gate query can
--- cheaply filter/weight on without joining back through turns at all.
+-- Ships here, with the mode buffer, rather than waiting for mode B's own
+-- ingestion to exist: the stamp ships alongside the mode buffer --
+-- injection starts here, so no unstamped-but-influenced verdict ever
+-- exists in the population a future mode-B ingestion pass would read.
+-- §31.6's own injected-ids record (turns.review_knowledge_decision) is
+-- this stamp's evidence trail, never its substitute -- this column is
+-- what a future gate query can cheaply filter/weight on without joining
+-- back through turns at all.
 ALTER TABLE review_verdicts ADD COLUMN knowledge_influenced BOOLEAN NOT NULL DEFAULT false;

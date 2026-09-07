@@ -373,6 +373,19 @@ type CreateTurnOptions struct {
 	ReviewDepth         *string
 	ReviewDepthDecision []byte
 
+	// ReviewKnowledgeMode/ReviewKnowledgeDecision (§31.2/§31.6's own mode
+	// buffer) mirror ReviewDepth/ReviewDepthDecision's own identical
+	// shape two fields further: non-nil ONLY for a review-session turn,
+	// the SAME callers that set ReviewDepth/ReviewDepthDecision. Stored
+	// verbatim onto turns.review_knowledge_mode/review_knowledge_decision
+	// (migrations/000114_turns_review_knowledge_mode.up.sql,
+	// 000116_turns_review_knowledge_decision.up.sql) at INSERT time
+	// below. ReviewKnowledgeDecision is pre-marshaled JSON (internal/
+	// domain/knowledge.InjectedRecord) -- this core does no encoding of
+	// its own, mirroring ReviewDepthDecision's own identical convention.
+	ReviewKnowledgeMode     *string
+	ReviewKnowledgeDecision []byte
+
 	// ClassifyText (a follow-up fix, review Finding 1) is the raw,
 	// unprefixed human reply text the plan_followup block below (just
 	// before tx.Begin) should classify -- mirrors github/coalesce.go's own
@@ -565,6 +578,8 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 	var classifyText *string
 	var reviewDepth *string
 	var reviewDepthDecision []byte
+	var reviewKnowledgeMode *string
+	var reviewKnowledgeDecision []byte
 	if len(opts) > 0 {
 		attachmentIDs = opts[0].AttachmentIDs
 		storageConfigured = opts[0].StorageConfigured
@@ -573,6 +588,8 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 		classifyText = opts[0].ClassifyText
 		reviewDepth = opts[0].ReviewDepth
 		reviewDepthDecision = opts[0].ReviewDepthDecision
+		reviewKnowledgeMode = opts[0].ReviewKnowledgeMode
+		reviewKnowledgeDecision = opts[0].ReviewKnowledgeDecision
 	}
 
 	// §23 ("plan mode: follow-up intent classification", §23.1/§23.2):
@@ -923,15 +940,17 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 	}
 
 	created, err := turns.WithTx(tx).Create(ctx, sqlcgen.CreateTurnParams{
-		SessionID:           sessionID,
-		Status:              sqlcgen.TurnStatusPending,
-		Prompt:              &effectivePrompt,
-		ModelID:             effectiveModelID,
-		Effort:              effectiveEffort,
-		PlanMode:            planMode,
-		ReviewHeadSha:       reviewHeadSHA,
-		ReviewDepth:         reviewDepth,
-		ReviewDepthDecision: reviewDepthDecision,
+		SessionID:               sessionID,
+		Status:                  sqlcgen.TurnStatusPending,
+		Prompt:                  &effectivePrompt,
+		ModelID:                 effectiveModelID,
+		Effort:                  effectiveEffort,
+		PlanMode:                planMode,
+		ReviewHeadSha:           reviewHeadSHA,
+		ReviewDepth:             reviewDepth,
+		ReviewDepthDecision:     reviewDepthDecision,
+		ReviewKnowledgeMode:     reviewKnowledgeMode,
+		ReviewKnowledgeDecision: reviewKnowledgeDecision,
 		// answerOnly (§23.2) is nil ("classification did not
 		// apply") for every turn that predates this Step, or that never hit
 		// the plan_followup block above -- see that block's own doc

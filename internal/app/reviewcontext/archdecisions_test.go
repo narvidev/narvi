@@ -49,7 +49,7 @@ type fakeRanker struct {
 
 	scores  []float64
 	err     error
-	block   bool          // if true, Score blocks until ctx is done
+	block   bool            // if true, Score blocks until ctx is done
 	blockOn <-chan struct{} // closed to release a blocked Score call, if set
 
 	calls int

@@ -391,8 +391,8 @@ type ListGatedArchDecisionsParams struct {
 //
 // Two exclusions, both in the SQL, never at call sites (§30.8's own
 // discipline, extended here): NOT suppressed_in_shadow excludes every
-// shadow-epoch verdict via the egress-mode stamp Step 98 already puts on
-// every verdict row (no new stamp, per this Step's own scope); the NOT
+// shadow-epoch verdict via the egress-mode stamp §30.8 already puts on
+// every verdict row (no new stamp introduced here); the NOT
 // EXISTS excludes every verdict whose PR has EVER had its arch-recap
 // contested (review_digest_section_feedback, migration 000086) --
 // scoped to (repo_full_name, pr_number, section), coarser than that

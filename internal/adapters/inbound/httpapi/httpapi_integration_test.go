@@ -544,7 +544,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		// -- no new store, no new pool connection. reviewModelDeep stays ""
 		// (unconfigured) -- no test in this package needs a specific
 		// deep-tier model id, only the depth decision itself.
-		r.Post("/{sessionID}/review/retrigger", httpapi.RetriggerReview(rig.pool, rig.sessions, rig.turns, rig.plans, rig.auditLog, rig.registry, rig.prSessions, rig.diffFetcher, rig.reviewFindings, rig.falsePositivePatterns, rig.botToken, platform.DefaultTimeouts(), appreviewtriage.Deps{RepoSettings: rig.repoSettings, ReviewVerdicts: rig.reviewVerdicts}, ""))
+		r.Post("/{sessionID}/review/retrigger", httpapi.RetriggerReview(rig.pool, rig.sessions, rig.turns, rig.plans, rig.auditLog, rig.registry, rig.prSessions, rig.diffFetcher, rig.reviewFindings, rig.falsePositivePatterns, rig.reviewVerdicts, nil, rig.botToken, platform.DefaultTimeouts(), appreviewtriage.Deps{RepoSettings: rig.repoSettings, ReviewVerdicts: rig.reviewVerdicts}, ""))
 		// review/findings/{identityHash}/rebut + apply-suggestion (§8.2)
 		// -- see reviewfindings.go's own doc comment.
 		r.Post("/{sessionID}/review/findings/{identityHash}/rebut", httpapi.RebutReviewFinding(rig.sessions, rig.prSessions, rig.reviewFindings, rig.auditLog))

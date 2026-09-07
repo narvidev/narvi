@@ -34,11 +34,13 @@ import (
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
 	appreviewtriage "github.com/narvidev/narvi/internal/app/reviewtriage"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/domain/authz"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
+	"github.com/narvidev/narvi/internal/domain/knowledge"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/review"
 	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
@@ -107,7 +109,13 @@ const manualRetriggerPromptText = "Manual re-review requested via the web review
 // reviewTriageDeps/reviewModelDeep (§26.3) mirror internal/
 // adapters/inbound/github's own identical SessionCoalescer.ReviewTriage/
 // ReviewModelDeep fields -- see that struct's own doc comment.
-func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, prSessions *postgres.GitHubPRSessionStore, diffFetcher reviewcontext.Fetcher, reviewFindings reviewcontext.FindingsFetcher, falsePositivePatterns reviewcontext.FalsePositivePatternsFetcher, botToken string, timeouts platform.Timeouts, reviewTriageDeps appreviewtriage.Deps, reviewModelDeep string) http.HandlerFunc {
+// archDecisions/knowledgeRanker (§31.6) mirror reviewTriageDeps/
+// reviewModelDeep's own identical "own SessionCoalescer.ReviewTriage/
+// ReviewModelDeep fields" cross-reference in spirit, and
+// internal/adapters/inbound/github's own identical Config.ArchDecisions/
+// KnowledgeRanker fields (handler.go) in shape -- see this function's own
+// FetchPriorArchDecisions call site for the full "why".
+func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, prSessions *postgres.GitHubPRSessionStore, diffFetcher reviewcontext.Fetcher, reviewFindings reviewcontext.FindingsFetcher, falsePositivePatterns reviewcontext.FalsePositivePatternsFetcher, archDecisions reviewcontext.ArchDecisionsFetcher, knowledgeRanker ports.KnowledgeRanker, botToken string, timeouts platform.Timeouts, reviewTriageDeps appreviewtriage.Deps, reviewModelDeep string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sessionID, ok := parseSessionID(w, r)
 		if !ok {
@@ -230,6 +238,39 @@ func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns 
 			}
 		}
 
+		// (§31.6): see internal/adapters/inbound/github/handler.go's
+		// own identical addition for the full "why this carrier, computed
+		// once, reused for both the fetch below and the write-time stamp
+		// further down" reasoning.
+		archTags := autoapproval.ClassifyChangedPaths(prCtx.ChangedPaths)
+		archTagStrings := autoapproval.TagStrings(archTags)
+		archRoots := autoapproval.ClassifyChangedRoots(prCtx.ChangedPaths)
+
+		// (§31.6 item 1): see handler.go's own identical addition for
+		// the full "why placed here, why this order" reasoning -- this
+		// manual re-trigger lane's own prCtx-dependent prepend, placed
+		// FIRST among them (before the already-answered block below),
+		// still entirely before RenderTurnPrompt.
+		knowledgeMode := knowledge.ModeA
+		var knowledgeDecisionJSON []byte
+		if archDecisions != nil {
+			archBlock, injected := reviewcontext.FetchPriorArchDecisions(ctx, logger, archDecisions, knowledgeRanker, timeouts, knowledge.Query{
+				RepoFullName: prSession.RepoFullName,
+				Tags:         archTagStrings,
+				Roots:        archRoots,
+				ChangedPaths: prCtx.ChangedPaths,
+				Title:        prCtx.Title,
+			})
+			if archBlock != "" {
+				prompt = archBlock + prompt
+			}
+			if recJSON, marshalErr := json.Marshal(injected); marshalErr != nil {
+				logger.Warn("httpapi: marshal knowledge injected-ids record failed, turn will carry review_knowledge_mode but no review_knowledge_decision", "error", marshalErr, "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
+			} else {
+				knowledgeDecisionJSON = recJSON
+			}
+		}
+
 		// (§26.3): the depth decision, computed from prCtx above.
 		// Adversarial-review fix D2 ("deep-path digest requirement
 		// contradicts the prompt the agent actually receives"): this MUST
@@ -320,11 +361,10 @@ func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns 
 		if flooredDepth == domainreviewtriage.DepthDeep && reviewModelDeep == "" {
 			logger.Info("httpapi: review routed deep but no deep-tier model configured (NARVI_REVIEW_MODEL_DEEP unset), dispatching with the default model at forced high effort", "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
 		}
-		// (§31.6): see internal/adapters/inbound/github/handler.go's
-		// own identical addition for the full "why this carrier" reasoning.
-		archDecisionTags := autoapproval.TagStrings(autoapproval.ClassifyChangedPaths(prCtx.ChangedPaths))
-		archDecisionRoots := autoapproval.ClassifyChangedRoots(prCtx.ChangedPaths)
-		triageRecordJSON, triageRecordErr := json.Marshal(domainreviewtriage.NewDecisionRecord(triageDecision, triageConfig, flooredDepth, triageProvenance, triageModelID, triageEffort, prCtx.ChangedFilesCount, prCtx.Diff == "", prCtx.DiffTruncated, archDecisionTags, archDecisionRoots))
+		// (§31.6): archTagStrings/archRoots, computed once above --
+		// see internal/adapters/inbound/github/handler.go's own identical
+		// addition for the full "why this carrier" reasoning.
+		triageRecordJSON, triageRecordErr := json.Marshal(domainreviewtriage.NewDecisionRecord(triageDecision, triageConfig, flooredDepth, triageProvenance, triageModelID, triageEffort, prCtx.ChangedFilesCount, prCtx.Diff == "", prCtx.DiffTruncated, archTagStrings, archRoots))
 		if triageRecordErr != nil {
 			logger.Warn("httpapi: marshal review-depth decision record failed, turn will carry review_depth but no review_depth_decision", "error", triageRecordErr, "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
 			triageRecordJSON = nil
@@ -358,7 +398,7 @@ func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns 
 		// to the safe, deterministic pre-existing "decline while a plan is
 		// awaiting approval" behavior instead of guessing from
 		// manualRetriggerPromptText/the pre-fetched diff.
-		created, _, cerr := CreateTurnCore(ctx, pool, sessions, turns, plans, nil, auditLog, registry, sessionID, prompt, triageModelID, false, false, actorUserID, AlwaysQueue, CreateTurnOptions{ReviewHeadSHA: reviewHeadSHA, Effort: triageEffort, ReviewDepth: &reviewDepthStr, ReviewDepthDecision: triageRecordJSON})
+		created, _, cerr := CreateTurnCore(ctx, pool, sessions, turns, plans, nil, auditLog, registry, sessionID, prompt, triageModelID, false, false, actorUserID, AlwaysQueue, CreateTurnOptions{ReviewHeadSHA: reviewHeadSHA, Effort: triageEffort, ReviewDepth: &reviewDepthStr, ReviewDepthDecision: triageRecordJSON, ReviewKnowledgeMode: &knowledgeMode, ReviewKnowledgeDecision: knowledgeDecisionJSON})
 		if cerr != nil {
 			logger.Error("httpapi: retrigger review (create turn) failed", "status", cerr.Status, "message", cerr.Message)
 			writeError(w, cerr.Status, cerr.Message)

@@ -1,4 +1,4 @@
--- turns.review_knowledge_decision (Step 107, §31.6 item 1's own "durable
+-- turns.review_knowledge_decision (§31.6 item 1's own "durable
 -- record of the injected knowledge -- ids and content hashes of the
 -- injected decisions, in a JSONB column on the turn, the exact shape of
 -- review_depth_decision (migration 000083)"). Mirrors turns.

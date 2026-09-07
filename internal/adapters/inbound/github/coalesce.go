@@ -386,7 +386,17 @@ type SessionCoalescer struct {
 // have a prior verdict/depth to floor against in practice -- Floor(fresh,
 // "") is a no-op by construction (domainreviewtriage.Floor's own doc
 // comment) regardless.
-func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string, prNumber int32, req restdtos.CreateSessionRequest, actor pgtype.UUID, isLabelRetrigger bool, classifyText string, reviewHeadSHA string, reviewDepth *string, triageModelID *string, triageEffort *string, triageRecordJSON []byte) (session sqlcgen.Session, turn sqlcgen.Turn, isNewSession bool, err error) {
+// knowledgeMode/knowledgeDecisionJSON (§31.2/§31.6) mirror
+// reviewDepth/triageRecordJSON's own identical "resolved upstream, just
+// threaded through and persisted here" shape, one pair further --
+// handler.go's own FetchPriorArchDecisions call resolves both BEFORE
+// review.RenderTurnPrompt renders req.Prompt, for the identical D2-fix
+// reason reviewDepth/triageRecordJSON already do: the prompt this
+// function's own WINNER/REUSE branches persist is the EXACT text the
+// reviewing agent will read, block and all, so the record of what that
+// block actually contained must be captured from the SAME resolution,
+// never recomputed here.
+func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string, prNumber int32, req restdtos.CreateSessionRequest, actor pgtype.UUID, isLabelRetrigger bool, classifyText string, reviewHeadSHA string, reviewDepth *string, triageModelID *string, triageEffort *string, triageRecordJSON []byte, knowledgeMode *string, knowledgeDecisionJSON []byte) (session sqlcgen.Session, turn sqlcgen.Turn, isNewSession bool, err error) {
 	var reviewHeadSHAPtr *string
 	if reviewHeadSHA != "" {
 		reviewHeadSHAPtr = &reviewHeadSHA
@@ -564,7 +574,7 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 		// REUSE-path turn ever gets -- light leaves both nil (today's
 		// unchanged behavior), deep forces high effort (and, when
 		// c.ReviewModelDeep is configured, a specific frontier model).
-		createdTurn, err := httpapi.CreateTurnForBot(ctx, c.Pool, c.Sessions, c.Turns, c.Plans, c.IntentClassifier, c.AuditLog, c.Registry, existing, prompt, triageModelID, req.PlanMode, false, actor, reviewHeadSHAPtr, &classifyText, triageEffort, reviewDepthPtr, triageRecordJSON)
+		createdTurn, err := httpapi.CreateTurnForBot(ctx, c.Pool, c.Sessions, c.Turns, c.Plans, c.IntentClassifier, c.AuditLog, c.Registry, existing, prompt, triageModelID, req.PlanMode, false, actor, reviewHeadSHAPtr, &classifyText, triageEffort, reviewDepthPtr, triageRecordJSON, knowledgeMode, knowledgeDecisionJSON)
 		if err != nil {
 			return sqlcgen.Session{}, sqlcgen.Turn{}, false, fmt.Errorf("github: create turn on existing session: %w", err)
 		}
@@ -634,7 +644,7 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 	// function's own top doc comment ("§31.4 (Defect-1 audit fix)") for
 	// the full "why" and exactly why it is always the exempt/admitted
 	// decision on this path.
-	created, hasPrompt, cerr := httpapi.CreateSessionOnTx(ctx, tx, c.Sessions, c.Turns, c.Environments, c.AuditLog, req, actor, false, c.RolloutMode, c.RepoSettings, entitlement, httpapi.ChildSessionOptions{ReviewHeadSHA: reviewHeadSHAPtr, ReviewDepth: reviewDepthPtr, ReviewDepthDecision: triageRecordJSON})
+	created, hasPrompt, cerr := httpapi.CreateSessionOnTx(ctx, tx, c.Sessions, c.Turns, c.Environments, c.AuditLog, req, actor, false, c.RolloutMode, c.RepoSettings, entitlement, httpapi.ChildSessionOptions{ReviewHeadSHA: reviewHeadSHAPtr, ReviewDepth: reviewDepthPtr, ReviewDepthDecision: triageRecordJSON, ReviewKnowledgeMode: knowledgeMode, ReviewKnowledgeDecision: knowledgeDecisionJSON})
 	if cerr != nil {
 		if cerr.RolloutRefusal {
 			// §32's own permanent-denial idiom -- see ErrRolloutNotEnrolled's

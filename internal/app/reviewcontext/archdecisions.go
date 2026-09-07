@@ -11,11 +11,11 @@ import (
 )
 
 // This file implements §31.6 item 1's own "prior architecture decisions"
-// block -- the flagship consumer of the knowledge-retrieval seam Step 134
-// finished the ranking half of (internal/domain/knowledge,
-// internal/app/ports.KnowledgeRanker) and this Step finishes the gate half
-// of (*postgres.ReviewVerdictStore's own ListGatedArchDecisions/
-// ListRecentArchDecisions, reviewverdictarchdecisions.go).
+// block -- the flagship consumer of the knowledge-retrieval seam: the
+// ranking half already lives in internal/domain/knowledge and
+// internal/app/ports.KnowledgeRanker; the gate half lives in
+// *postgres.ReviewVerdictStore's own ListGatedArchDecisions/
+// ListRecentArchDecisions (reviewverdictarchdecisions.go).
 // FetchPriorArchDecisions is this package's OWN impure fetch, exact
 // sibling of FetchFalsePositivePatterns/FetchAlreadyAnswered: "impure
 // fetch here, pure render in a sibling domain package" (knowledge.
@@ -28,9 +28,9 @@ import (
 // result is exactly the newest MaxInjected of this pool regardless of
 // pool size, but a future ranker (mode B's hybrid RRF) needs real
 // candidates beyond pure recency to re-rank at all. 30 mirrors §31.6's
-// own illustrative figure for mode A's pre-Step-107 behavior ("at a few
-// PRs/week, a 30-decision window covers months and recency approximates
-// relevance").
+// own illustrative figure for mode A's pre-gate, inject-all-window
+// behavior ("at a few PRs/week, a 30-decision window covers months and
+// recency approximates relevance").
 const gateCandidatePoolSize int32 = 30
 
 // ArchDecisionsFetcher is the narrow slice of *postgres.ReviewVerdictStore

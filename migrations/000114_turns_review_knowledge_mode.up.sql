@@ -1,27 +1,27 @@
--- turns.review_knowledge_mode (Step 107, §31.2's own "mode buffer this
--- codebase has already paid to learn"): mirrors turns.review_depth
--- (migrations/000080_turns_review_depth.up.sql) verbatim, one concern
--- over -- "set exactly once, at creation … never re-derived", the SAME
--- hard-won rule Step 69's own D2/D9 fixes wrote into review_depth after a
--- mutable repo_settings flag resolved at two different instants once
+-- turns.review_knowledge_mode (§31.2's own "mode buffer this codebase
+-- has already paid to learn"): mirrors turns.review_depth (migrations/
+-- 000080_turns_review_depth.up.sql) verbatim, one concern over -- "set
+-- exactly once, at creation … never re-derived", the SAME hard-won rule
+-- an earlier D2/D9 adversarial-review fix wrote into review_depth after
+-- a mutable repo_settings flag resolved at two different instants once
 -- produced a self-contradictory decision record.
 --
 -- Nullable TEXT, NULL for every non-review turn (every existing call
--- site before this Step), set exactly once, at creation, by every
--- review-turn-creation path (internal/adapters/inbound/httpapi's
+-- site before this column existed), set exactly once, at creation, by
+-- every review-turn-creation path (internal/adapters/inbound/httpapi's
 -- createTurnLocked/CreateSessionOnTx, internal/adapters/inbound/github's
 -- CreateOrJoin, internal/app/sessionactor's own automatic re-review turn
 -- insert, internal/adapters/inbound/httpapi's own manual-retrigger path)
 -- -- the SAME four review-turn producers review_depth already threads
 -- through.
 --
--- Step 107 ships mode A only (§31.1/§31.2): repo_settings.
--- review_knowledge_mode, the admin-facing switch a future Step reads to
--- decide which value this column gets, does not exist yet (it is Step
--- 108's own content, §31.2's "residence and actor"). Every row this
--- Step writes therefore carries the SAME literal value,
--- internal/domain/knowledge.ModeA ("mode_a") -- the column exists now,
--- ahead of the switch, so Step 108 extends an already-proven buffer
+-- Mode A only for now (§31.1/§31.2): repo_settings.
+-- review_knowledge_mode, the admin-facing switch a future change reads
+-- to decide which value this column gets, does not exist yet (it is
+-- mode B's own content, §31.2's "residence and actor"). Every row
+-- written here therefore carries the SAME literal value, internal/
+-- domain/knowledge.ModeA ("mode_a") -- the column exists now, ahead of
+-- the switch, so mode B's own work extends an already-proven buffer
 -- rather than retrofitting one onto live traffic.
 --
 -- Read back at verdict-post time (the SAME turns.GetProcessingTurnForSession

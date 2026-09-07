@@ -153,12 +153,12 @@ func TestCreateTurnForBot_EnqueuesTurnOnExistingSession(t *testing.T) {
 		t.Fatalf("CreateSessionForBot (setup): %v", err)
 	}
 
-	first, err := CreateTurnForBot(ctx, pool, sessions, turns, plans, nil, auditLog, registry, created.ID, "first mention", nil, false, false, pgtype.UUID{}, nil, nil, nil, nil, nil)
+	first, err := CreateTurnForBot(ctx, pool, sessions, turns, plans, nil, auditLog, registry, created.ID, "first mention", nil, false, false, pgtype.UUID{}, nil, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateTurnForBot (first): %v", err)
 	}
 
-	second, err := CreateTurnForBot(ctx, pool, sessions, turns, plans, nil, auditLog, registry, created.ID, "second concurrent mention", nil, false, false, pgtype.UUID{}, nil, nil, nil, nil, nil)
+	second, err := CreateTurnForBot(ctx, pool, sessions, turns, plans, nil, auditLog, registry, created.ID, "second concurrent mention", nil, false, false, pgtype.UUID{}, nil, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateTurnForBot (second, while first still pending): %v", err)
 	}
@@ -218,7 +218,7 @@ func TestCreateTurnForBot_WritesAuditLogRowWithActor(t *testing.T) {
 		t.Fatalf("CreateSessionForBot (setup): %v", err)
 	}
 
-	turnRow, err := CreateTurnForBot(ctx, pool, sessions, turns, plans, nil, auditLog, registry, created.ID, "please take a look", nil, false, false, actor.ID, nil, nil, nil, nil, nil)
+	turnRow, err := CreateTurnForBot(ctx, pool, sessions, turns, plans, nil, auditLog, registry, created.ID, "please take a look", nil, false, false, actor.ID, nil, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateTurnForBot: %v", err)
 	}
@@ -304,7 +304,7 @@ func TestCreateTurnForBot_PlanAwaitingApproval_PreservesSentinel(t *testing.T) {
 		t.Fatalf("seed awaiting_approval plan: %v", err)
 	}
 
-	_, err = CreateTurnForBot(ctx, pool, sessions, turns, plans, nil, auditLog, registry, created.ID, "please build this now", nil, false, false, pgtype.UUID{}, nil, nil, nil, nil, nil)
+	_, err = CreateTurnForBot(ctx, pool, sessions, turns, plans, nil, auditLog, registry, created.ID, "please build this now", nil, false, false, pgtype.UUID{}, nil, nil, nil, nil, nil, nil, nil)
 	if err == nil {
 		t.Fatal("CreateTurnForBot() error = nil, want a non-nil error wrapping ErrPlanAwaitingApproval")
 	}
