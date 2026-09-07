@@ -277,7 +277,7 @@ const defaultContractsPath = "contracts/api"
 // intentSvc is nil-safe (see recordExplicitIntentDecision's own doc
 // comment) so every existing call site that doesn't care about §8.3
 // can keep passing nil unchanged.
-func CreateSession(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, environments *postgres.EnvironmentStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, intentSvc *intentclassifier.Service, epistemicCheckDefault bool, rolloutMode platform.RolloutMode, repoSettings *postgres.RepoSettingsStore) http.HandlerFunc {
+func CreateSession(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, environments *postgres.EnvironmentStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, intentSvc *intentclassifier.Service, epistemicCheckDefault bool, rolloutMode platform.RolloutMode, repoSettings *postgres.RepoSettingsStore, prSessions *postgres.GitHubPRSessionStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 
@@ -347,7 +347,7 @@ func CreateSession(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *p
 		// outbox), which route an ordinary error down a retry path that
 		// must be bypassed for a permanent policy refusal (see each of
 		// those call sites' own doc comments).
-		created, cerr := CreateSessionCore(ctx, pool, sessions, turns, environments, auditLog, registry, req, createdBy, epistemicCheckDefault, rolloutMode, repoSettings)
+		created, cerr := CreateSessionCore(ctx, pool, sessions, turns, environments, auditLog, registry, req, createdBy, epistemicCheckDefault, rolloutMode, repoSettings, prSessions)
 		if cerr != nil {
 			writeError(w, cerr.Status, cerr.Message)
 			return
@@ -410,6 +410,26 @@ type CreateSessionError struct {
 	// (never Message, which is prose, not an API) is how each of those
 	// three call sites tells the two apart structurally.
 	RolloutRefusal bool
+
+	// RepoEntitlementDenied (§31.4) is true iff this error came
+	// from ResolveRepoEntitlement (repoentitlementgate.go) with a
+	// DEMONSTRATED (never merely transient) denial -- a further
+	// machine-checkable refusal marker, mirroring RolloutRefusal's own
+	// exact shape and reasoning immediately above: a repo that is not
+	// entitled will be refused identically on every retry until it is
+	// (i.e. until it has a real github_pr_sessions row), so a caller that
+	// routes ANY error down a blind retry path should tell the two apart
+	// structurally, never by string-matching Message. Defect-2 audit fix:
+	// all four non-REST ingress paths (slack/handler.go, linear/
+	// webhook.go, github/coalesce.go, outboxworker/sentinelautofix.go) now
+	// check this field, mirroring RolloutRefusal's own established
+	// terminal-vs-retry handling on each of those four surfaces exactly --
+	// before this fix, this field existed but had no production reader, so
+	// a permanent entitlement denial fell into each surface's own generic,
+	// retried-forever transient-failure branch. See ResolveRepoEntitlement's
+	// own doc comment for the full fail-closed-vs-terminal split this
+	// field depends on.
+	RepoEntitlementDenied bool
 }
 
 func (e *CreateSessionError) Error() string { return e.Message }
@@ -715,7 +735,30 @@ func checkSubstrateCapabilitiesUpFront(registry *sessionactor.Registry, req rest
 // supplies both -- see rolloutgate.go's own checkRolloutGate, called
 // immediately below, right after validateCreateSessionRequest and BEFORE
 // the environment/session inserts, on this SAME tx.
-func CreateSessionOnTx(ctx context.Context, tx pgx.Tx, sessions *postgres.SessionStore, turns *postgres.TurnStore, environments *postgres.EnvironmentStore, auditLog *postgres.AuditLogStore, req restdtos.CreateSessionRequest, createdBy pgtype.UUID, epistemicCheckDefault bool, rolloutMode platform.RolloutMode, repoSettings *postgres.RepoSettingsStore, childOpts ...ChildSessionOptions) (session sqlcgen.Session, hasPrompt bool, cerr *CreateSessionError) {
+//
+// entitlement (§31.4) is the IDENTICAL required-parameter
+// discipline, one Step later, but ONE LEVEL further removed than
+// rolloutMode/repoSettings: this is not a store CreateSessionOnTx queries
+// itself, it is the ALREADY-MADE RepoEntitlementDecision the caller's own
+// ResolveRepoEntitlement call (repoentitlementgate.go) produced BEFORE
+// this function was ever invoked, with no transaction open at all -- see
+// that function's own doc comment, and RepoEntitlementDecision's own, for
+// the full "why" (the Defect-1 audit fix: the OLD in-tx
+// checkRepoEntitlementGate needed a SECOND pool connection for its own
+// denial audit write while tx was still open, and could wedge the whole
+// pool under concurrent denials). CreateSessionOnTx only ever CONSULTS
+// entitlement (right after validation, before checkRolloutGate below) --
+// it never re-resolves it, and never touches prSessions/auditLog for this
+// purpose itself. It closes the clone amplification §31.4 names -- the
+// sandbox credential helper (internal/sandboxagent/gitclone/clone.go)
+// serves whatever repo list sessions.repos ends up naming, so an
+// unentitled repo must be refused before that column is ever written, for
+// every caller of this function (unlike rolloutMode, this predicate has
+// no NARVI_ROLLOUT_MODE-shaped no-op escape hatch) -- with exactly one
+// deliberate exemption, req.SpawnSource == github, see
+// ResolveRepoEntitlement's own doc comment for why that one is a
+// correctness requirement, not a convenience.
+func CreateSessionOnTx(ctx context.Context, tx pgx.Tx, sessions *postgres.SessionStore, turns *postgres.TurnStore, environments *postgres.EnvironmentStore, auditLog *postgres.AuditLogStore, req restdtos.CreateSessionRequest, createdBy pgtype.UUID, epistemicCheckDefault bool, rolloutMode platform.RolloutMode, repoSettings *postgres.RepoSettingsStore, entitlement RepoEntitlementDecision, childOpts ...ChildSessionOptions) (session sqlcgen.Session, hasPrompt bool, cerr *CreateSessionError) {
 	logger := platform.Logger(ctx)
 	opts := childSessionOptionsFrom(childOpts)
 
@@ -737,6 +780,35 @@ func CreateSessionOnTx(ctx context.Context, tx pgx.Tx, sessions *postgres.Sessio
 	hasDocker := validated.hasDocker
 	egressPolicy := validated.egressPolicy
 	hasEgressPolicy := validated.hasEgressPolicy
+
+	// §31.4's own entitlement gate: entitlement was already fully
+	// RESOLVED by the caller's own ResolveRepoEntitlement call
+	// (repoentitlementgate.go), before this transaction ever began -- this
+	// just consults that already-made decision, right after validation and
+	// BEFORE checkRolloutGate below. See entitlement's own parameter doc
+	// comment above, and RepoEntitlementDecision's own doc comment
+	// (repoentitlementgate.go), for the full "why a decision, not a
+	// decider" reasoning (the Defect-1 audit fix).
+	if !entitlement.admitted {
+		// Defensive fail-closed backstop ONLY -- every real caller of this
+		// function already called ResolveRepoEntitlement itself and
+		// returned ITS OWN non-nil *CreateSessionError immediately, before
+		// ever reaching pool.Begin, so production code never actually
+		// reaches this branch (see repoentitlementgate.go's own top doc
+		// comment for the full list of callers). It exists purely so a
+		// caller that some future edit accidentally lets skip the resolver
+		// -- or that constructs RepoEntitlementDecision's own zero value
+		// some other way -- still fails CLOSED here rather than silently
+		// creating an unentitled session; RepoEntitlementDecision's own
+		// zero value is unadmitted BY CONSTRUCTION for exactly this
+		// reason. Treated like every other caller-wiring defect in this
+		// function (mirrors the nil-prSessions precedent this used to
+		// guard against, in the old in-tx gate): 503, not counted or
+		// audited as a genuine policy denial, since this is not a
+		// demonstrated fact about any specific repository.
+		logger.Error("httpapi: repo entitlement decision was never resolved before session creation; failing closed")
+		return sqlcgen.Session{}, false, &CreateSessionError{Status: http.StatusServiceUnavailable, Message: "repository entitlement could not be verified: not resolved"}
+	}
 
 	// §10's own primary gate (§10 Phase 6, §32): checked AFTER
 	// validation, BEFORE the environment/session inserts below, on this
@@ -960,10 +1032,14 @@ func TriggerDispatch(ctx context.Context, registry *sessionactor.Registry, sessi
 // already-open tx, and call TriggerDispatch itself once its own outer
 // transaction has committed and hasPrompt is true.
 //
-// rolloutMode/repoSettings (§32) are threaded straight through to
-// CreateSessionOnTx below, unchanged -- see that function's own doc
-// comment for why both are required, not optional.
-func CreateSessionCore(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, environments *postgres.EnvironmentStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, req restdtos.CreateSessionRequest, createdBy pgtype.UUID, epistemicCheckDefault bool, rolloutMode platform.RolloutMode, repoSettings *postgres.RepoSettingsStore) (sqlcgen.Session, *CreateSessionError) {
+// rolloutMode/repoSettings (§32) and prSessions (§31.4) are
+// threaded straight through -- rolloutMode/repoSettings unchanged, all the
+// way to CreateSessionOnTx below; prSessions instead feeds THIS function's
+// own ResolveRepoEntitlement call, below, BEFORE pool.Begin -- see that
+// function's own doc comment (repoentitlementgate.go) for why all three
+// remain required, not optional, and why entitlement resolution
+// specifically must happen here, this early.
+func CreateSessionCore(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, environments *postgres.EnvironmentStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, req restdtos.CreateSessionRequest, createdBy pgtype.UUID, epistemicCheckDefault bool, rolloutMode platform.RolloutMode, repoSettings *postgres.RepoSettingsStore, prSessions *postgres.GitHubPRSessionStore) (sqlcgen.Session, *CreateSessionError) {
 	logger := platform.Logger(ctx)
 
 	// Validate BEFORE ever acquiring a pooled connection -- see
@@ -991,6 +1067,16 @@ func CreateSessionCore(ctx context.Context, pool *pgxpool.Pool, sessions *postgr
 		return sqlcgen.Session{}, verr
 	}
 
+	// §31.4 (Defect-1 audit fix): resolved with NO transaction open --
+	// see ResolveRepoEntitlement's own doc comment (repoentitlementgate.go)
+	// for why this must run strictly BEFORE pool.Begin below, never inside
+	// the transaction it opens. A denial returns here directly, often
+	// without this function ever acquiring a pooled connection at all.
+	entitlement, everr := ResolveRepoEntitlement(ctx, prSessions, auditLog, createdBy, req)
+	if everr != nil {
+		return sqlcgen.Session{}, everr
+	}
+
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		logger.Error("httpapi: begin create-session tx failed", "error", err)
@@ -1002,7 +1088,7 @@ func CreateSessionCore(ctx context.Context, pool *pgxpool.Pool, sessions *postgr
 	// own transact.
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	created, hasPrompt, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, createdBy, epistemicCheckDefault, rolloutMode, repoSettings)
+	created, hasPrompt, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, createdBy, epistemicCheckDefault, rolloutMode, repoSettings, entitlement)
 	if cerr != nil {
 		return sqlcgen.Session{}, cerr
 	}

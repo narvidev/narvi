@@ -44,8 +44,8 @@ import (
 // deliberately calls CreateSessionOnTx directly instead, for connection-
 // pool safety) -- kept parameter-complete/consistent regardless, exactly
 // like every other createTurnLocked-adjacent entry point in this package.
-func CreateSessionForBot(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, environments *postgres.EnvironmentStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, req restdtos.CreateSessionRequest, epistemicCheckDefault bool, rolloutMode platform.RolloutMode, repoSettings *postgres.RepoSettingsStore) (sqlcgen.Session, error) {
-	created, cerr := CreateSessionCore(ctx, pool, sessions, turns, environments, auditLog, registry, req, pgtype.UUID{}, epistemicCheckDefault, rolloutMode, repoSettings)
+func CreateSessionForBot(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, environments *postgres.EnvironmentStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, req restdtos.CreateSessionRequest, epistemicCheckDefault bool, rolloutMode platform.RolloutMode, repoSettings *postgres.RepoSettingsStore, prSessions *postgres.GitHubPRSessionStore) (sqlcgen.Session, error) {
+	created, cerr := CreateSessionCore(ctx, pool, sessions, turns, environments, auditLog, registry, req, pgtype.UUID{}, epistemicCheckDefault, rolloutMode, repoSettings, prSessions)
 	if cerr != nil {
 		return sqlcgen.Session{}, cerr
 	}

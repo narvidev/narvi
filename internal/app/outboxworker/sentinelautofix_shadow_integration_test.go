@@ -49,6 +49,7 @@ func TestSentinelAutoFixNotifier_ShadowRepo_ShortCircuitsBeforeClaim_NeverFixPen
 	sentinelFixes := narvipg.NewSentinelFixStore(pool)
 	reviewFindings := narvipg.NewReviewFindingStore(pool)
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
 	shadowLedgerStore := narvipg.NewShadowSCMWriteStore(pool)
 
 	registry, err := sessionactor.NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "http://localhost:8080", nil, nil, "", nil, false)
@@ -83,7 +84,7 @@ func TestSentinelAutoFixNotifier_ShadowRepo_ShortCircuitsBeforeClaim_NeverFixPen
 	sourceControl := &fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef"}
 	shadowRepo := func(context.Context, string) bool { return false }
 	notifier := outboxworker.NewSentinelAutoFixNotifier(pool, sessions, turns, environments, auditLog, registry, sentinelFixes, reviewFindings,
-		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings,
+		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings, prSessions,
 		shadowRepo, shadowLedgerStore)
 
 	payload, err := json.Marshal(ports.SentinelAutoFixPayload{
@@ -216,6 +217,7 @@ func TestSentinelAutoFixNotifier_BornShadowRow_DeliveredAfterPromotion_StillShor
 	sentinelFixes := narvipg.NewSentinelFixStore(pool)
 	reviewFindings := narvipg.NewReviewFindingStore(pool)
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
 	shadowLedgerStore := narvipg.NewShadowSCMWriteStore(pool)
 
 	registry, err := sessionactor.NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "http://localhost:8080", nil, nil, "", nil, false)
@@ -250,7 +252,7 @@ func TestSentinelAutoFixNotifier_BornShadowRow_DeliveredAfterPromotion_StillShor
 	sourceControl := &fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef"}
 	shadowRepo := func(context.Context, string) bool { return true } // promoted since enqueue
 	notifier := outboxworker.NewSentinelAutoFixNotifier(pool, sessions, turns, environments, auditLog, registry, sentinelFixes, reviewFindings,
-		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings,
+		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings, prSessions,
 		shadowRepo, shadowLedgerStore)
 
 	payload, err := json.Marshal(ports.SentinelAutoFixPayload{

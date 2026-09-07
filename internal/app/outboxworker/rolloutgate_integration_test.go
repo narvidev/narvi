@@ -50,6 +50,7 @@ func TestSentinelAutoFixNotifier_RolloutRefusal_SkipsTerminallyNeverRetried(t *t
 	sentinelFixes := narvipg.NewSentinelFixStore(pool)
 	reviewFindings := narvipg.NewReviewFindingStore(pool)
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
 
 	registry, err := sessionactor.NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "http://localhost:8080", nil, nil, "", nil, false)
 	if err != nil {
@@ -83,7 +84,7 @@ func TestSentinelAutoFixNotifier_RolloutRefusal_SkipsTerminallyNeverRetried(t *t
 
 	sourceControl := &fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef"}
 	notifier := outboxworker.NewSentinelAutoFixNotifier(pool, sessions, turns, environments, auditLog, registry, sentinelFixes, reviewFindings,
-		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeCohort, repoSettings,
+		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeCohort, repoSettings, prSessions,
 		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool))
 
 	payload, err := json.Marshal(ports.SentinelAutoFixPayload{
@@ -154,6 +155,7 @@ func TestSentinelAutoFixNotifier_RolloutGate_EnrolledRepoStillSpawns(t *testing.
 	sentinelFixes := narvipg.NewSentinelFixStore(pool)
 	reviewFindings := narvipg.NewReviewFindingStore(pool)
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
 
 	registry, err := sessionactor.NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "http://localhost:8080", nil, nil, "", nil, false)
 	if err != nil {
@@ -190,7 +192,7 @@ func TestSentinelAutoFixNotifier_RolloutGate_EnrolledRepoStillSpawns(t *testing.
 
 	sourceControl := &fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef"}
 	notifier := outboxworker.NewSentinelAutoFixNotifier(pool, sessions, turns, environments, auditLog, registry, sentinelFixes, reviewFindings,
-		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeCohort, repoSettings,
+		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeCohort, repoSettings, prSessions,
 		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool))
 
 	payload, err := json.Marshal(ports.SentinelAutoFixPayload{

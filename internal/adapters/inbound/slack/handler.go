@@ -136,6 +136,21 @@ const (
 	// and the thread is left exactly as usable as ackNotAuthorizedText
 	// leaves it (no retry ever changes the outcome).
 	ackNotEnrolledText = "This repository is not yet enrolled in Narvi's session rollout."
+
+	// ackRepoNotEntitledText (§31.4, Defect-2 audit fix) is posted
+	// instead of ackNewSessionText when ResolveRepoEntitlement refuses
+	// because this deployment's own default repo failed §31.4's
+	// per-repository entitlement predicate -- mirrors ackNotEnrolledText's
+	// own terminal-in-thread-ack idiom immediately above exactly (same
+	// shape, different reason): a permanent policy refusal, never a
+	// transient failure, posted once. Worded to say what is true without
+	// leaking whether this repository is otherwise known to Narvi at all
+	// (never "not entitled"/"not known", either of which would confirm
+	// this deployment has SOME notion of this specific repository) --
+	// "not configured" reads identically whether the repo is a total
+	// stranger or a real one that simply has not yet had a qualifying
+	// GitHub PR mention.
+	ackRepoNotEntitledText = "This deployment is not configured for this repository."
 )
 
 // ackPlanAwaitingText is this batch's own honest reply (§8.1
@@ -298,6 +313,19 @@ type Deps struct {
 	// gap.
 	RolloutMode  platform.RolloutMode
 	RepoSettings *postgres.RepoSettingsStore
+
+	// PRSessions (§31.4) is the SAME further REQUIRED
+	// httpapi.CreateSessionCore parameter every other caller now threads
+	// through -- see RolloutMode/RepoSettings' own doc comment immediately
+	// above for the identical "required, not optional" reasoning. Slack
+	// sessions always target the SAME operator-configured DefaultRepoURL
+	// below (never a per-message human choice), so this deployment's
+	// admin must ensure that default repository has had at least one real
+	// GitHub PR mention (github_pr_sessions row) before Slack-originated
+	// sessions succeed -- the same "known repo" bar reposettings.go's own
+	// resolveKnownRepo already imposes on that repo's admin-config
+	// endpoints.
+	PRSessions *postgres.GitHubPRSessionStore
 
 	SigningSecret   string
 	DefaultRepoName string
@@ -1066,7 +1094,7 @@ func resolveOrClaimSession(ctx context.Context, deps Deps, logger *slog.Logger, 
 		Repos: []restdtos.CreateSessionRequestReposElem{
 			{Name: deps.DefaultRepoName, Url: deps.DefaultRepoURL},
 		},
-	}, creator, deps.EpistemicCheckDefault, deps.RolloutMode, deps.RepoSettings)
+	}, creator, deps.EpistemicCheckDefault, deps.RolloutMode, deps.RepoSettings, deps.PRSessions)
 	if cerr != nil {
 		// (§10 Phase 6, §32): a RolloutRefusal is a PERMANENT
 		// policy refusal, never a transient failure -- checked
@@ -1086,6 +1114,24 @@ func resolveOrClaimSession(ctx context.Context, deps Deps, logger *slog.Logger, 
 			logger.Warn("slack: create bare session refused: repo not enrolled in cohort rollout", "channel", channel, "thread_key", key)
 			if ackErr := postAckBounded(ctx, deps.SlackClient, deps.AckTimeout, channel, key, ackNotEnrolledText); ackErr != nil {
 				logger.Warn("slack: post not-enrolled ack failed", "error", ackErr)
+			}
+			return sessionResolution{Skip: true}, true
+		}
+		// §31.4 (Defect-2 audit fix): a RepoEntitlementDenied is the
+		// IDENTICAL permanent-policy-refusal shape as RolloutRefusal
+		// immediately above -- before this fix, this branch did not exist
+		// at all, so an entitlement denial fell into the generic
+		// transient-failure branch below, releasing the webhook-delivery
+		// claim for a Slack retry that would only ever reproduce the SAME
+		// refusal forever (github_pr_sessions does not change between
+		// redeliveries), with no acknowledgement ever posted. Mirrors the
+		// RolloutRefusal branch immediately above exactly: post
+		// ackRepoNotEntitledText and return {Skip: true}, true (claim
+		// kept, never released).
+		if cerr.RepoEntitlementDenied {
+			logger.Warn("slack: create bare session refused: repo not entitled", "channel", channel, "thread_key", key)
+			if ackErr := postAckBounded(ctx, deps.SlackClient, deps.AckTimeout, channel, key, ackRepoNotEntitledText); ackErr != nil {
+				logger.Warn("slack: post not-entitled ack failed", "error", ackErr)
 			}
 			return sessionResolution{Skip: true}, true
 		}

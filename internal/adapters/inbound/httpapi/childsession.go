@@ -64,12 +64,15 @@ import (
 // (whether through this function, or -- as internal/app/outboxworker's
 // own sentinelAutoFixNotifier now does, since the Finding-1 audit fix --
 // through the identical CreateSessionOnTx parameter directly).
-// rolloutMode/repoSettings (§32) mirror CreateSessionOnTx's own
-// identical required parameters -- see that function's own doc comment.
-// This function has no real production caller today (childsession.go's
-// own top doc comment), but stays parameter-complete/consistent
-// regardless, exactly like every other CreateSessionOnTx-adjacent entry
-// point in this package.
+// rolloutMode/repoSettings (§32) and prSessions (§31.4) mirror
+// CreateSessionCore's own identical required parameters -- prSessions
+// specifically feeds THIS function's own ResolveRepoEntitlement call,
+// below, BEFORE pool.Begin (repoentitlementgate.go's own doc comment,
+// "Defect-1 audit fix"), exactly mirroring CreateSessionCore's own
+// identical sequencing. This function has no real production caller today
+// (childsession.go's own top doc comment), but stays
+// parameter-complete/consistent regardless, exactly like every other
+// CreateSessionOnTx-adjacent entry point in this package.
 func SpawnChildSession(
 	ctx context.Context,
 	pool *pgxpool.Pool,
@@ -85,11 +88,21 @@ func SpawnChildSession(
 	epistemicCheckDefault bool,
 	rolloutMode platform.RolloutMode,
 	repoSettings *postgres.RepoSettingsStore,
+	prSessions *postgres.GitHubPRSessionStore,
 ) (sqlcgen.Session, *CreateSessionError) {
 	logger := platform.Logger(ctx)
 
 	if _, verr := validateCreateSessionRequest(req); verr != nil {
 		return sqlcgen.Session{}, verr
+	}
+
+	// §31.4 (Defect-1 audit fix): resolved with NO transaction open --
+	// see ResolveRepoEntitlement's own doc comment (repoentitlementgate.go)
+	// for why this must run strictly BEFORE pool.Begin below, mirroring
+	// CreateSessionCore's own identical sequencing exactly.
+	entitlement, everr := ResolveRepoEntitlement(ctx, prSessions, auditLog, pgtype.UUID{}, req)
+	if everr != nil {
+		return sqlcgen.Session{}, everr
 	}
 
 	tx, err := pool.Begin(ctx)
@@ -100,7 +113,7 @@ func SpawnChildSession(
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	tag := provenanceTag
-	created, hasPrompt, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, pgtype.UUID{}, epistemicCheckDefault, rolloutMode, repoSettings, ChildSessionOptions{
+	created, hasPrompt, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, pgtype.UUID{}, epistemicCheckDefault, rolloutMode, repoSettings, entitlement, ChildSessionOptions{
 		ParentSessionID: parentSessionID,
 		SpawnDepth:      spawnDepth,
 		ProvenanceTag:   &tag,

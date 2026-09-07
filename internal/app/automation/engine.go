@@ -65,6 +65,14 @@ type Engine struct {
 	// existing right thing, unmodified").
 	rolloutMode  platform.RolloutMode
 	repoSettings *postgres.RepoSettingsStore
+	// prSessions (§31.4) is the SAME further REQUIRED
+	// httpapi.CreateSessionOnTx parameter every other caller now threads
+	// through -- see rolloutMode/repoSettings' own doc comment immediately
+	// above for why an automation-created session is never itself refused
+	// TODAY in practice; the identical "no hardcoded bypass" reasoning
+	// applies here too, one gate later: this Engine passes the SAME real
+	// githubPRSessionStore every other caller does, never a carve-out.
+	prSessions *postgres.GitHubPRSessionStore
 }
 
 // NewEngine builds an Engine backed by the given stores/pool (pool is
@@ -90,6 +98,7 @@ func NewEngine(
 	epistemicCheckDefault bool,
 	rolloutMode platform.RolloutMode,
 	repoSettings *postgres.RepoSettingsStore,
+	prSessions *postgres.GitHubPRSessionStore,
 ) *Engine {
 	return &Engine{
 		automations:           automations,
@@ -105,6 +114,7 @@ func NewEngine(
 		epistemicCheckDefault: epistemicCheckDefault,
 		rolloutMode:           rolloutMode,
 		repoSettings:          repoSettings,
+		prSessions:            prSessions,
 	}
 }
 

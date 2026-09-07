@@ -215,6 +215,18 @@ func newSlackTestRigWithEpistemicCheckDefault(t *testing.T, pool *pgxpool.Pool, 
 	}
 	t.Cleanup(func() { _ = registry.Shutdown() })
 
+	// prSessions (§31.4): CreateSessionCore's own entitlement gate
+	// (checkRepoEntitlementGate, httpapi/repoentitlementgate.go) now
+	// requires the fixed DefaultRepoURL below to be known to this
+	// deployment (github_pr_sessions) -- Slack always targets that SAME
+	// repo, never a per-message choice, so it is made known HERE, once,
+	// exactly like every other REQUIRED-but-otherwise-uninteresting
+	// dependency this rig already constructs unconditionally.
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
+	if err := prSessions.EnsureRow(ctx, "narvidev/narvi", 1); err != nil {
+		t.Fatalf("seed github_pr_sessions entitlement: %v", err)
+	}
+
 	handler := slack.NewHandler(slack.Deps{
 		Pool:          pool,
 		Sessions:      sessions,
@@ -224,6 +236,7 @@ func newSlackTestRigWithEpistemicCheckDefault(t *testing.T, pool *pgxpool.Pool, 
 		Deliveries:    deliveries,
 		Threads:       threads,
 		Plans:         plans,
+		PRSessions:    prSessions,
 		Events:        events,
 		PlanDocuments: planDocuments,
 		AuditLog:      auditLog,

@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -366,6 +367,15 @@ func TestHandler_DualDelivery_FailedFirstAttemptReleasesBothClaimsForRedelivery(
 	}
 	t.Cleanup(func() { _ = registry.Shutdown() })
 
+	// prSessions (§31.4): shared by both handlers below -- see
+	// newSlackTestRigWithEpistemicCheckDefault's own identical addition
+	// (handler_integration_test.go) for why this fixed default repo is
+	// made known here.
+	prSessionsForBackendErrorTest := narvipg.NewGitHubPRSessionStore(pool)
+	if err := prSessionsForBackendErrorTest.EnsureRow(ctx, "narvidev/narvi", 1); err != nil {
+		t.Fatalf("seed github_pr_sessions entitlement: %v", err)
+	}
+
 	brokenHandler := slack.NewHandler(slack.Deps{
 		Pool:            pool,
 		Sessions:        brokenSessions, // the deliberately-broken store
@@ -377,6 +387,7 @@ func TestHandler_DualDelivery_FailedFirstAttemptReleasesBothClaimsForRedelivery(
 		AuditLog:        auditLog,
 		Participants:    narvipg.NewParticipantStore(pool),
 		SigningSecret:   testSigningSecret,
+		PRSessions:      prSessionsForBackendErrorTest,
 		DefaultRepoName: "narvi",
 		DefaultRepoURL:  "https://github.com/narvidev/narvi",
 		TimestampWindow: 5 * time.Minute,
@@ -445,6 +456,7 @@ func TestHandler_DualDelivery_FailedFirstAttemptReleasesBothClaimsForRedelivery(
 		AuditLog:        auditLog,
 		Participants:    narvipg.NewParticipantStore(pool),
 		SigningSecret:   testSigningSecret,
+		PRSessions:      prSessionsForBackendErrorTest,
 		DefaultRepoName: "narvi",
 		DefaultRepoURL:  "https://github.com/narvidev/narvi",
 		TimestampWindow: 5 * time.Minute,
@@ -647,6 +659,18 @@ func newSlackAckTestRigWithRepo(t *testing.T, pool *pgxpool.Pool, defaultRepoNam
 	}
 	t.Cleanup(func() { _ = registry.Shutdown() })
 
+	// prSessions (§31.4): unlike newSlackAckTestRig's own fixed repo, this
+	// rig's own defaultRepoURL is caller-chosen (empty, for this file's own
+	// TestHandler_DualDelivery_NoDefaultRepoSkip_ClaimNotReleased) -- only
+	// seed github_pr_sessions when a real repo was actually supplied.
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
+	if defaultRepoURL != "" {
+		fullName := strings.TrimSuffix(strings.TrimPrefix(defaultRepoURL, "https://github.com/"), ".git")
+		if err := prSessions.EnsureRow(ctx, fullName, 1); err != nil {
+			t.Fatalf("seed github_pr_sessions entitlement for %s: %v", fullName, err)
+		}
+	}
+
 	handler := slack.NewHandler(slack.Deps{
 		Pool:            pool,
 		Sessions:        sessions,
@@ -657,6 +681,7 @@ func newSlackAckTestRigWithRepo(t *testing.T, pool *pgxpool.Pool, defaultRepoNam
 		Threads:         threads,
 		AuditLog:        auditLog,
 		Participants:    narvipg.NewParticipantStore(pool),
+		PRSessions:      prSessions,
 		SigningSecret:   testSigningSecret,
 		DefaultRepoName: defaultRepoName,
 		DefaultRepoURL:  defaultRepoURL,

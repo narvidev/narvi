@@ -852,6 +852,22 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 				w.WriteHeader(http.StatusOK)
 				return
 			}
+			if errors.Is(err, ErrRepoEntitlementDenied) {
+				// §31.4's own permanent-denial idiom (Defect-2 audit fix):
+				// this repo failed the per-repository entitlement
+				// predicate -- coalesce.go's own ErrRepoEntitlementDenied
+				// doc comment for the full "why". Mirrors
+				// ErrRolloutNotEnrolled's own "acknowledge without
+				// releasing the claim, post no reply" shape immediately
+				// above in every respect, including reachability: today
+				// this branch can never actually fire (the WINNER path's
+				// own spawn source is always exempt from this predicate),
+				// but is kept for the same defensive-symmetry reason
+				// ErrRolloutNotEnrolled's own check is.
+				logger.Info("github: mention refused: repo not entitled", "repo", m.RepoFullName, "pr_number", m.PRNumber)
+				w.WriteHeader(http.StatusOK)
+				return
+			}
 			if errors.Is(err, httpapi.ErrPlanAwaitingApproval) {
 				// a follow-up fix (Finding 1): the session's plan
 				// is currently awaiting approval, so the REUSE path's own

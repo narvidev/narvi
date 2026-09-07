@@ -195,6 +195,17 @@ type Deps struct {
 	RolloutMode  platform.RolloutMode
 	RepoSettings *postgres.RepoSettingsStore
 
+	// PRSessions (§31.4) is the SAME further REQUIRED
+	// httpapi.CreateSessionCore parameter every other caller now threads
+	// through -- see RolloutMode/RepoSettings' own doc comment immediately
+	// above for the identical "required, not optional" reasoning. Linear
+	// sessions, like Slack's, always target the SAME operator-configured
+	// default repo (DefaultRepoURL below), never a per-message human
+	// choice, so this deployment's admin must ensure that repository has
+	// had at least one real GitHub PR mention (github_pr_sessions row)
+	// before Linear-originated sessions succeed.
+	PRSessions *postgres.GitHubPRSessionStore
+
 	WebhookSecret      []byte
 	TokenEncryptionKey []byte
 	DefaultRepoName    string
@@ -521,7 +532,7 @@ func (deps Deps) handleCreated(ctx context.Context, payload agentSessionEventWeb
 		return true
 	}
 
-	created, cerr := httpapi.CreateSessionCore(ctx, deps.Pool, deps.Sessions, deps.Turns, deps.Environments, deps.AuditLog, deps.Registry, req, creator, deps.EpistemicCheckDefault, deps.RolloutMode, deps.RepoSettings)
+	created, cerr := httpapi.CreateSessionCore(ctx, deps.Pool, deps.Sessions, deps.Turns, deps.Environments, deps.AuditLog, deps.Registry, req, creator, deps.EpistemicCheckDefault, deps.RolloutMode, deps.RepoSettings, deps.PRSessions)
 	if cerr != nil {
 		// (§10 Phase 6, §32): a RolloutRefusal is a PERMANENT
 		// policy refusal, never a transient failure -- checked
@@ -544,6 +555,29 @@ func (deps Deps) handleCreated(ctx context.Context, payload agentSessionEventWeb
 				logger.Error("linear: release agent session claim failed", "error", releaseErr, "agent_session_id", payload.AgentSession.ID)
 			}
 			deps.postAcknowledgment(ctx, payload.OrganizationID, payload.AgentSession.ID, "This repository is not yet enrolled in Narvi's session rollout.", notice)
+			return true
+		}
+
+		// §31.4 (Defect-2 audit fix): a RepoEntitlementDenied is the
+		// IDENTICAL permanent-policy-refusal shape as RolloutRefusal
+		// immediately above -- before this fix, this branch did not exist
+		// at all, so an entitlement denial fell into the generic
+		// transient-failure branch below, releasing BOTH claims for a
+		// Linear redelivery that would only ever reproduce the SAME
+		// refusal forever (github_pr_sessions does not change between
+		// redeliveries), with no acknowledgement ever posted. Mirrors the
+		// RolloutRefusal branch immediately above exactly: release only
+		// the linear_agent_sessions claim, post an honest ack, and ack
+		// terminally (return true, webhook-delivery claim never released).
+		// Worded like Slack's own identical ackRepoNotEntitledText (slack/
+		// handler.go) -- true without leaking whether this repository is
+		// otherwise known to Narvi at all.
+		if cerr.RepoEntitlementDenied {
+			logger.Warn("linear: create session refused: repo not entitled", "agent_session_id", payload.AgentSession.ID)
+			if releaseErr := deps.AgentSessions.Release(ctx, payload.AgentSession.ID); releaseErr != nil {
+				logger.Error("linear: release agent session claim failed", "error", releaseErr, "agent_session_id", payload.AgentSession.ID)
+			}
+			deps.postAcknowledgment(ctx, payload.OrganizationID, payload.AgentSession.ID, "This deployment is not configured for this repository.", notice)
 			return true
 		}
 

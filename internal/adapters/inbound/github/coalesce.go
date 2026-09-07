@@ -60,6 +60,29 @@ var ErrActorNotAuthorized = errors.New("github: actor not authorized")
 // nothing honest to tell them beyond silence.
 var ErrRolloutNotEnrolled = errors.New("github: repo not enrolled in cohort rollout")
 
+// ErrRepoEntitlementDenied is CreateOrJoin's own sentinel for "the WINNER
+// path's own httpapi.CreateSessionOnTx call refused because a named repo
+// failed §31.4's per-repository entitlement predicate"
+// (httpapi.CreateSessionError.RepoEntitlementDenied, checked structurally,
+// never by string-matching cerr.Message) -- Defect-2 audit fix, mirroring
+// ErrRolloutNotEnrolled's own identical shape immediately above in every
+// respect, including WHY: this is a PERMANENT policy refusal (retrying
+// the same GitHub redelivery would reproduce the identical refusal every
+// time), so handler.go checks for this one specifically and takes §31.4's
+// own permanent-denial idiom -- acknowledge (200) WITHOUT releasing the
+// claimed webhook delivery, and post NO reply on the PR thread, mirroring
+// ErrRolloutNotEnrolled's own "an unenrolled repo has no action a
+// commenter could take to fix this themselves" reasoning exactly: an
+// entitlement denial is equally not something a commenter can resolve.
+// In practice this can never actually fire here: the WINNER path's own
+// req.SpawnSource is always restdtos.CreateSessionRequestSpawnSourceGithub,
+// which httpapi.ResolveRepoEntitlement exempts unconditionally before any
+// repo is even checked (repoentitlementgate.go's own doc comment) -- this
+// sentinel exists for the SAME defensive-symmetry reason
+// ErrRolloutNotEnrolled's own check runs at this identical call site
+// regardless of reachability today.
+var ErrRepoEntitlementDenied = errors.New("github: repo not entitled")
+
 // SessionCoalescer bundles the stores/registry CreateOrJoin needs -- a
 // small struct rather than a long positional-parameter list, constructed
 // once at wiring time (cmd/control-plane/main.go), mirroring this
@@ -381,6 +404,31 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 	// DIFFERENT, already-existing session.
 	createAuthorized := actorauthz.AuthorizeLinkedActor(ctx, logger, authzSurface, c.Users, actor, authz.ActionCreateSession, authz.Resource{})
 
+	// §31.4 (Defect-1 audit fix): resolved BEFORE any transaction opens,
+	// for the IDENTICAL reason createAuthorized immediately above is --
+	// see httpapi.ResolveRepoEntitlement's own doc comment
+	// (repoentitlementgate.go) for the full "why", and this function's own
+	// top doc comment ("connection-pool safety note") for why a SECOND
+	// pool connection while tx is open is exactly the deadlock risk this
+	// whole function exists to avoid. Only actually consulted by the
+	// WINNER branch below (REUSE never creates a session, so it never
+	// touches entitlement either) -- the SAME "resolved once, up front,
+	// consulted only where relevant" shape createAuthorized already uses.
+	// req.SpawnSource is always restdtos.CreateSessionRequestSpawnSourceGithub
+	// for every request this package ever builds, so this always takes
+	// ResolveRepoEntitlement's own unconditional exemption fast path (no
+	// I/O) -- see that function's own doc comment for exactly why
+	// re-deriving entitlement from req.Repos[0].Url would be actively
+	// WRONG here (a cross-repo/fork PR's own clone URL is deliberately the
+	// fork, never repoFullName's own base/upstream claim key). Still
+	// resolved via the real function, never hand-rolled admitted-true, so
+	// a future change to the exemption's own conditions is honored here
+	// too, with no separate copy to keep in sync.
+	entitlement, everr := httpapi.ResolveRepoEntitlement(ctx, c.PRSessions, c.AuditLog, actor, req)
+	if everr != nil {
+		return sqlcgen.Session{}, sqlcgen.Turn{}, false, fmt.Errorf("github: resolve repo entitlement: %w", everr)
+	}
+
 	tx, err := c.Pool.Begin(ctx)
 	if err != nil {
 		return sqlcgen.Session{}, sqlcgen.Turn{}, false, fmt.Errorf("github: begin claim tx: %w", err)
@@ -581,7 +629,12 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 	// forces high effort" summary.
 	req.ModelId = restdtos.CreateSessionRequestModelId(triageModelID)
 	req.Effort = restdtos.CreateSessionRequestEffort(triageEffort)
-	created, hasPrompt, cerr := httpapi.CreateSessionOnTx(ctx, tx, c.Sessions, c.Turns, c.Environments, c.AuditLog, req, actor, false, c.RolloutMode, c.RepoSettings, httpapi.ChildSessionOptions{ReviewHeadSHA: reviewHeadSHAPtr, ReviewDepth: reviewDepthPtr, ReviewDepthDecision: triageRecordJSON})
+	// entitlement (§31.4): the RepoEntitlementDecision already resolved,
+	// with no transaction open, before tx.Begin above -- see this
+	// function's own top doc comment ("§31.4 (Defect-1 audit fix)") for
+	// the full "why" and exactly why it is always the exempt/admitted
+	// decision on this path.
+	created, hasPrompt, cerr := httpapi.CreateSessionOnTx(ctx, tx, c.Sessions, c.Turns, c.Environments, c.AuditLog, req, actor, false, c.RolloutMode, c.RepoSettings, entitlement, httpapi.ChildSessionOptions{ReviewHeadSHA: reviewHeadSHAPtr, ReviewDepth: reviewDepthPtr, ReviewDepthDecision: triageRecordJSON})
 	if cerr != nil {
 		if cerr.RolloutRefusal {
 			// §32's own permanent-denial idiom -- see ErrRolloutNotEnrolled's
@@ -595,6 +648,18 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 			// reposettings.go) can never bootstrap itself for this repo --
 			// see internal/app/seed/reposettings.go's own doc comment.
 			return sqlcgen.Session{}, sqlcgen.Turn{}, false, ErrRolloutNotEnrolled
+		}
+		if cerr.RepoEntitlementDenied {
+			// §31.4's own permanent-denial idiom (Defect-2 audit fix) --
+			// see ErrRepoEntitlementDenied's own doc comment for the full
+			// "why", mirroring ErrRolloutNotEnrolled's own branch
+			// immediately above in every respect, including the claim-row
+			// handling. Structurally unreachable today (entitlement was
+			// already resolved, exempt, before tx.Begin above) but kept
+			// anyway, for the identical defensive-symmetry reason that
+			// resolution itself is -- see this function's own top doc
+			// comment.
+			return sqlcgen.Session{}, sqlcgen.Turn{}, false, ErrRepoEntitlementDenied
 		}
 		return sqlcgen.Session{}, sqlcgen.Turn{}, false, fmt.Errorf("github: create session: %w", cerr)
 	}
