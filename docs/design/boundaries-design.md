@@ -844,32 +844,22 @@ section sign). `operatorcopy` covers the copy mechanically.
 
 ### 4.5 The harder question: private Gatekeeper screens
 
-**Out of scope for this seam, as separate later work.** A real Gatekeeper screen
-needs a bundle built from the public `web/` sources plus private components,
-embedded in the private binary. That is a build-pipeline design (a private Vite
-project consuming `web/` as a dependency, its own `outDir`, its own `go:embed`,
-route-tree composition, its own DTO guard) and must not be folded into a
-capability-affordance change.
+**Out of scope for this seam, and not designed in this repository.** A real Gatekeeper
+screen needs a bundle built from this repository's `web/` sources plus components that
+live elsewhere; designing that build pipeline here would be specifying another
+repository's work in this one. It is specified as Step E8 of that repository's own plan.
 
-**What this seam must not preclude, and therefore does now:**
+**What this seam must not preclude, and therefore does now** — three costs paid up front,
+all of them properties of this repository:
 
 1. `extension.Module.WebAssets fs.FS`. `webui.Mount(r chi.Router, assets fs.FS)` is
-   already generic over `fs.FS`; the composition root passes the module's assets
-   when present. Five lines today; the future bundle drops in with no public-repo
-   change.
-2. `main.tsx` refactored into an exported
-   `bootstrap(options: { slots?: Partial<Record<SlotId, Component>> })` that builds
-   the QueryClient, router and providers exactly as today, with `main.tsx` reduced
-   to `bootstrap({})`.
-3. The slot registry is runtime, not build-time conditional imports, and slot ids
-   are the only coupling; the wire read model is the one both the affordance and
-   the private screens consult, so they cannot disagree about state.
-
-**Named for the later work, not designed here:** route additions (the file-based
-route tree is per project; a private build needs virtual-route composition or a
-merged routes directory); `web/package.json` `exports`/`files` so `web/` is
-consumable as a dependency; the private project's own DTO-redeclaration guard;
-pinning the public commit the bundle is built from.
+   already generic over `fs.FS`; the composition root passes a module's assets when
+   present. Five lines today.
+2. `main.tsx` refactored into an exported `bootstrap(options)` that builds the QueryClient,
+   router and providers exactly as today, with `main.tsx` reduced to `bootstrap({})`.
+3. The slot registry is runtime, not build-time conditional imports, and slot ids are the
+   only coupling; the wire read model is the one thing both the affordance and any future
+   screen consult, so they cannot disagree about state.
 
 ### 4.6 Rejected alternatives
 
