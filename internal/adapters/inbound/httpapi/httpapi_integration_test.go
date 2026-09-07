@@ -470,7 +470,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 	}
 	t.Cleanup(func() { _ = rig.registry.Shutdown() })
 
-	// §31.4: CreateSessionOnTx's own entitlement gate (checkRepoEntitlementGate,
+	// §31.4: CreateSessionOnTx's own entitlement gate (ResolveRepoEntitlement,
 	// repoentitlementgate.go) now requires every named repo to be known to
 	// this deployment (github_pr_sessions, via GitHubPRSessionStore.RepoKnown)
 	// for every spawnSource other than github -- and POST /api/sessions
@@ -1450,7 +1450,7 @@ func TestCreateSession_MultipleRepos_SecondInvalid_Rejected(t *testing.T) {
 // code).
 //
 // This test now carries a SECOND property it did not when it was written,
-// and the two must not be separated. checkRepoEntitlementGate exempts
+// and the two must not be separated. ResolveRepoEntitlement exempts
 // spawnSource == github from the per-repository entitlement check
 // entirely, because a cross-repo PR's clone URL is deliberately the fork
 // while the trusted claim key is the base repo. That exemption is only
@@ -1460,7 +1460,7 @@ func TestCreateSession_MultipleRepos_SecondInvalid_Rejected(t *testing.T) {
 // caller, a new surface, any reason -- reopens the clone amplification
 // that gate exists to close, and it would do so silently, because nothing
 // in the gate can observe how the field got its value. Anyone changing
-// this test should read checkRepoEntitlementGate's own doc comment first.
+// this test should read ResolveRepoEntitlement's own doc comment first.
 func TestCreateSession_NonWebSpawnSource_Rejected(t *testing.T) {
 	tests := []struct {
 		name        string

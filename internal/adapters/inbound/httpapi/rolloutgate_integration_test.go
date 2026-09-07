@@ -72,13 +72,18 @@ func TestCreateSessionOnTx_RolloutGate_OpenMode_NoOpEvenWithNoRepoSettingsRow(t 
 	req := newRolloutGateTestReq(repoURL)
 	var nilCreator pgtype.UUID
 
+	entitlement, everr := ResolveRepoEntitlement(ctx, prSessions, auditLog, nilCreator, req)
+	if everr != nil {
+		t.Fatalf("ResolveRepoEntitlement: status=%d message=%q", everr.Status, everr.Message)
+	}
+
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("pool.Begin: %v", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	created, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeOpen, repoSettings, prSessions)
+	created, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeOpen, repoSettings, entitlement)
 	if cerr != nil {
 		t.Fatalf("CreateSessionOnTx: status=%d message=%q, want success (open mode is a byte-for-byte no-op, even with zero repo_settings rows for this repo)", cerr.Status, cerr.Message)
 	}
@@ -108,13 +113,18 @@ func TestCreateSessionOnTx_RolloutGate_CohortMode_EnrolledRepoAdmitted(t *testin
 	req := newRolloutGateTestReq(repoURL)
 	var nilCreator pgtype.UUID
 
+	entitlement, everr := ResolveRepoEntitlement(ctx, prSessions, auditLog, nilCreator, req)
+	if everr != nil {
+		t.Fatalf("ResolveRepoEntitlement: status=%d message=%q", everr.Status, everr.Message)
+	}
+
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("pool.Begin: %v", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	created, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings, prSessions)
+	created, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings, entitlement)
 	if cerr != nil {
 		t.Fatalf("CreateSessionOnTx: status=%d message=%q, want success (repo is enrolled)", cerr.Status, cerr.Message)
 	}
@@ -140,13 +150,18 @@ func TestCreateSessionOnTx_RolloutGate_CohortMode_AbsentRowRefused(t *testing.T)
 	req := newRolloutGateTestReq(repoURL)
 	var nilCreator pgtype.UUID
 
+	entitlement, everr := ResolveRepoEntitlement(ctx, prSessions, auditLog, nilCreator, req)
+	if everr != nil {
+		t.Fatalf("ResolveRepoEntitlement: status=%d message=%q", everr.Status, everr.Message)
+	}
+
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("pool.Begin: %v", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	_, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings, prSessions)
+	_, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings, entitlement)
 	if cerr == nil {
 		t.Fatal("CreateSessionOnTx: got nil error, want refusal for an unenrolled (no row at all) repo under ModeCohort")
 	}
@@ -183,13 +198,18 @@ func TestCreateSessionOnTx_RolloutGate_CohortMode_DisabledRowRefused(t *testing.
 	req := newRolloutGateTestReq(repoURL)
 	var nilCreator pgtype.UUID
 
+	entitlement, everr := ResolveRepoEntitlement(ctx, prSessions, auditLog, nilCreator, req)
+	if everr != nil {
+		t.Fatalf("ResolveRepoEntitlement: status=%d message=%q", everr.Status, everr.Message)
+	}
+
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("pool.Begin: %v", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	_, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings, prSessions)
+	_, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings, entitlement)
 	if cerr == nil {
 		t.Fatal("CreateSessionOnTx: got nil error, want refusal for a repo whose row explicitly sets sessions_enabled=false")
 	}
@@ -224,13 +244,18 @@ func TestCreateSessionOnTx_RolloutGate_CohortMode_MultiRepoRequiresAllEnrolled(t
 	req := newRolloutGateTestReq(enrolledURL, unenrolledURL)
 	var nilCreator pgtype.UUID
 
+	entitlement, everr := ResolveRepoEntitlement(ctx, prSessions, auditLog, nilCreator, req)
+	if everr != nil {
+		t.Fatalf("ResolveRepoEntitlement: status=%d message=%q", everr.Status, everr.Message)
+	}
+
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("pool.Begin: %v", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	_, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings, prSessions)
+	_, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings, entitlement)
 	if cerr == nil {
 		t.Fatal("CreateSessionOnTx: got nil error, want refusal -- one of the two named repos is not enrolled")
 	}
@@ -275,13 +300,18 @@ func TestCreateSessionOnTx_RolloutGate_CohortMode_CrossHostSpoofRefused(t *testi
 	req := newRolloutGateTestReq(spoofedURL)
 	var nilCreator pgtype.UUID
 
+	entitlement, everr := ResolveRepoEntitlement(ctx, prSessions, auditLog, nilCreator, req)
+	if everr != nil {
+		t.Fatalf("ResolveRepoEntitlement: status=%d message=%q", everr.Status, everr.Message)
+	}
+
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("pool.Begin: %v", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	_, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings, prSessions)
+	_, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings, entitlement)
 	if cerr == nil {
 		t.Fatal("CreateSessionOnTx: got nil error, want refusal -- evil.example must never be treated as the github.com repo it happens to share an owner/repo path with")
 	}
@@ -336,6 +366,17 @@ func TestCreateSessionOnTx_RolloutGate_CohortMode_ReadErrorFailsClosedButNotAsPo
 	req := newRolloutGateTestReq(repoURL)
 	var nilCreator pgtype.UUID
 
+	// Resolved BEFORE the fault-injection setup below, and unaffected by
+	// it: ResolveRepoEntitlement takes no tx parameter at all (Defect-1
+	// audit fix, repoentitlementgate.go) and req.SpawnSource is always
+	// github here (newRolloutGateTestReq), so this always takes that
+	// function's own unconditional exemption fast path -- no I/O, no
+	// dependency on the tx this test is about to deliberately break.
+	entitlement, everr := ResolveRepoEntitlement(ctx, prSessions, auditLog, nilCreator, req)
+	if everr != nil {
+		t.Fatalf("ResolveRepoEntitlement: status=%d message=%q", everr.Status, everr.Message)
+	}
+
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("pool.Begin: %v", err)
@@ -349,7 +390,7 @@ func TestCreateSessionOnTx_RolloutGate_CohortMode_ReadErrorFailsClosedButNotAsPo
 	// query, which pgx surfaces the SAME way: a non-nil, non-ErrNoRows
 	// error on the query call).
 
-	_, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings, prSessions)
+	_, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeCohort, repoSettings, entitlement)
 	if cerr == nil {
 		t.Fatal("CreateSessionOnTx: got nil error, want refusal -- a genuine repo_settings read failure must fail CLOSED, never silently admit")
 	}

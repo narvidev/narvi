@@ -127,20 +127,13 @@ func (e *Engine) fanOut(ctx context.Context, inv sqlcgen.AutomationInvocation) {
 // spawnSource is deliberately restdtos.CreateSessionRequestSpawnSourceWeb,
 // not a new dedicated enum value -- a judgment call, see this function's
 // own inline comment at the assignment below for the full reasoning.
+//
+// req is built, and §31.4's own entitlement decision resolved against it
+// (httpapi.ResolveRepoEntitlement), BEFORE e.pool.Begin below -- Defect-1
+// audit fix, see that function's own doc comment (repoentitlementgate.go)
+// for why this must run with NO transaction open, mirroring
+// httpapi.CreateSessionCore's own identical sequencing.
 func (e *Engine) createRunAndSession(ctx context.Context, logger *slog.Logger, inv sqlcgen.AutomationInvocation, automationRow sqlcgen.Automation, target domainautomation.Target) {
-	tx, err := e.pool.Begin(ctx)
-	if err != nil {
-		logger.Error("automation: begin fan-out tx failed", "error", err, "target", target.Name)
-		e.createFailedRun(ctx, logger, inv, target)
-		return
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback(ctx)
-		}
-	}()
-
 	req := restdtos.CreateSessionRequest{
 		// Judgment call: session_spawn_source (migrations/000004_sessions.
 		// up.sql) has exactly four values (web/slack/linear/github), each
@@ -185,13 +178,40 @@ func (e *Engine) createRunAndSession(ctx context.Context, logger *slog.Logger, i
 	title := fmt.Sprintf("Automation: %s", automationRow.Name)
 	req.Title = &title
 
+	// §31.4 (Defect-1 audit fix): resolved against the now-fully-built req,
+	// with NO transaction open -- see httpapi.ResolveRepoEntitlement's own
+	// doc comment (repoentitlementgate.go) for why this must run strictly
+	// BEFORE e.pool.Begin below. Any refusal here is handled identically
+	// to every other CreateSessionOnTx refusal below (createFailedRun,
+	// unmodified -- see Engine's own prSessions field doc comment for why
+	// this Engine never carves out a special case for it).
+	entitlement, everr := httpapi.ResolveRepoEntitlement(ctx, e.prSessions, e.auditLog, pgtype.UUID{}, req)
+	if everr != nil {
+		logger.Warn("automation: resolve repo entitlement for target failed", "error", everr, "target", target.Name)
+		e.createFailedRun(ctx, logger, inv, target)
+		return
+	}
+
+	tx, err := e.pool.Begin(ctx)
+	if err != nil {
+		logger.Error("automation: begin fan-out tx failed", "error", err, "target", target.Name)
+		e.createFailedRun(ctx, logger, inv, target)
+		return
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
 	// createdBy is deliberately invalid/NULL -- an automation run has no
 	// direct human user, exactly like httpapi.CreateSessionForBot's own
 	// identical choice for every other unattended session-creation path
 	// this codebase already has (sessions.created_by's own nullability,
 	// migrations/000004_sessions.up.sql: "bot/automation-created sessions
 	// may have no direct human user").
-	session, hasPrompt, cerr := httpapi.CreateSessionOnTx(ctx, tx, e.sessions, e.turns, e.environments, e.auditLog, req, pgtype.UUID{}, e.epistemicCheckDefault, e.rolloutMode, e.repoSettings, e.prSessions)
+	session, hasPrompt, cerr := httpapi.CreateSessionOnTx(ctx, tx, e.sessions, e.turns, e.environments, e.auditLog, req, pgtype.UUID{}, e.epistemicCheckDefault, e.rolloutMode, e.repoSettings, entitlement)
 	if cerr != nil {
 		logger.Warn("automation: create session for target failed", "error", cerr, "target", target.Name)
 		e.createFailedRun(ctx, logger, inv, target)

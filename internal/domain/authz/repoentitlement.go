@@ -17,7 +17,7 @@ import (
 // seen real, externally-verified traffic for, a genuine read error while
 // checking, OR a repo whose clone URL could not be resolved to a trusted,
 // host-verified owner/repo identity at all -- the caller (internal/
-// adapters/inbound/httpapi's checkRepoEntitlementGate) folds every one of
+// adapters/inbound/httpapi's ResolveRepoEntitlement) folds every one of
 // those into Known == false BEFORE ever calling AuthorizeRepo, the same
 // discipline internal/domain/rollout.RepoAdmission.Enrolled already
 // established for the cohort-rollout gate.
@@ -71,7 +71,7 @@ func (e *RepoForbiddenError) Unwrap() error { return ErrRepoForbidden }
 // bolting actor on afterward would touch every call site a second time.
 //
 // This function does no I/O of its own (§11) -- the caller (httpapi's
-// checkRepoEntitlementGate) resolves admission.Known from a real
+// ResolveRepoEntitlement) resolves admission.Known from a real
 // github_pr_sessions read BEFORE ever calling this function, exactly like
 // checkRolloutGate resolves rollout.RepoAdmission.Enrolled from
 // repo_settings before calling rollout.Decide. See that gate's own doc

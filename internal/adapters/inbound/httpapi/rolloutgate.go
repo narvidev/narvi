@@ -104,7 +104,7 @@ func recordRolloutRefusal(ctx context.Context, spawnSource string) {
 // beyond its own log line.
 //
 // Shared by BOTH of this package's repo-keyed session-creation gates --
-// checkRolloutGate (§32.3, this file) and checkRepoEntitlementGate
+// checkRolloutGate (§32.3, this file) and ResolveRepoEntitlement
 // (§31.4, repoentitlementgate.go) -- exactly one implementation of this
 // check in the package, not two independently-maintained copies (mirrors
 // resolveKnownRepo's own identical "exactly one implementation" value,

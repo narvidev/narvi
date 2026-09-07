@@ -157,7 +157,7 @@ func newHandlerDeps(t *testing.T, pool *pgxpool.Pool) linear.Deps {
 	t.Cleanup(func() { _ = registry.Shutdown() })
 
 	// prSessions (§31.4): CreateSessionCore's own entitlement gate
-	// (checkRepoEntitlementGate, httpapi/repoentitlementgate.go) now
+	// (ResolveRepoEntitlement, httpapi/repoentitlementgate.go) now
 	// requires the fixed DefaultRepoURL below to be known to this
 	// deployment (github_pr_sessions) -- Linear always targets that SAME
 	// repo, never a per-message choice, so it is made known HERE, once.

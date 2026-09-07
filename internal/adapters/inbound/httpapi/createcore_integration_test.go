@@ -201,12 +201,17 @@ func TestCreateSessionOnTx_CallerRollback_PersistsNothing(t *testing.T) {
 
 	var nilCreator pgtype.UUID
 
+	entitlement, everr := ResolveRepoEntitlement(ctx, prSessions, auditLog, nilCreator, req)
+	if everr != nil {
+		t.Fatalf("ResolveRepoEntitlement: status=%d message=%q", everr.Status, everr.Message)
+	}
+
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("pool.Begin: %v", err)
 	}
 
-	created, hasPrompt, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeOpen, repoSettings, prSessions)
+	created, hasPrompt, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeOpen, repoSettings, entitlement)
 	if cerr != nil {
 		// The tx is still open at this point -- roll it back before
 		// failing the test so we don't leak a connection.
@@ -270,12 +275,17 @@ func TestCreateSessionOnTx_CallerCommit_Persists(t *testing.T) {
 
 	var nilCreator pgtype.UUID
 
+	entitlement, everr := ResolveRepoEntitlement(ctx, prSessions, auditLog, nilCreator, req)
+	if everr != nil {
+		t.Fatalf("ResolveRepoEntitlement: status=%d message=%q", everr.Status, everr.Message)
+	}
+
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("pool.Begin: %v", err)
 	}
 
-	created, hasPrompt, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeOpen, repoSettings, prSessions)
+	created, hasPrompt, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeOpen, repoSettings, entitlement)
 	if cerr != nil {
 		_ = tx.Rollback(ctx)
 		t.Fatalf("CreateSessionOnTx: status=%d message=%q", cerr.Status, cerr.Message)
@@ -332,13 +342,18 @@ func TestCreateSessionOnTx_ValidationFailure_NeverTouchesTx(t *testing.T) {
 
 	var nilCreator pgtype.UUID
 
+	entitlement, everr := ResolveRepoEntitlement(ctx, prSessions, auditLog, nilCreator, req)
+	if everr != nil {
+		t.Fatalf("ResolveRepoEntitlement: status=%d message=%q", everr.Status, everr.Message)
+	}
+
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("pool.Begin: %v", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	_, hasPrompt, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeOpen, repoSettings, prSessions)
+	_, hasPrompt, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeOpen, repoSettings, entitlement)
 	if cerr == nil {
 		t.Fatal("CreateSessionOnTx: got nil error, want a CreateSessionError for empty repos")
 	}
@@ -473,11 +488,16 @@ func TestTriggerDispatch_ExistingSession_SucceedsAndSpawns(t *testing.T) {
 
 	var nilCreator pgtype.UUID
 
+	entitlement, everr := ResolveRepoEntitlement(ctx, prSessions, auditLog, nilCreator, req)
+	if everr != nil {
+		t.Fatalf("ResolveRepoEntitlement: status=%d message=%q", everr.Status, everr.Message)
+	}
+
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("pool.Begin: %v", err)
 	}
-	created, hasPrompt, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeOpen, repoSettings, prSessions)
+	created, hasPrompt, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeOpen, repoSettings, entitlement)
 	if cerr != nil {
 		_ = tx.Rollback(ctx)
 		t.Fatalf("CreateSessionOnTx: status=%d message=%q", cerr.Status, cerr.Message)

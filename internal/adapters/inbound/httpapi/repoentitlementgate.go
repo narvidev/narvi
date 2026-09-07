@@ -1,13 +1,20 @@
 // This file (repoentitlementgate.go) implements §31.4's own remaining
 // deliverable (the four-handler URL-authorization fix -- reposettings.go's
 // own resolveKnownRepo -- is a separate, already-shipped half of the SAME
-// decision): checkRepoEntitlementGate, called from CreateSessionOnTx
-// (create.go) BEFORE the environment/session inserts, on the SAME
-// transaction that is about to insert the session -- closing the clone
-// amplification §31.4 names: the sandbox credential helper
-// (internal/sandboxagent/gitclone/clone.go) serves whatever repo list
-// sessions.repos names, so an entry that was never entitled must never
-// reach that column at all.
+// decision): ResolveRepoEntitlement, called by every CreateSessionOnTx
+// caller in this codebase (create.go's own CreateSessionCore,
+// childsession.go, internal/app/automation/fanout.go, internal/app/
+// outboxworker/sentinelautofix.go, internal/adapters/inbound/github/
+// coalesce.go) BEFORE any of them opens the transaction the eventual
+// session insert runs on -- closing the clone amplification §31.4 names:
+// the sandbox credential helper (internal/sandboxagent/gitclone/clone.go)
+// serves whatever repo list sessions.repos names, so an entry that was
+// never entitled must never reach that column at all. CreateSessionOnTx
+// itself (create.go) never resolves this on its own -- it takes the
+// already-made RepoEntitlementDecision as a required parameter and simply
+// refuses on it -- see this file's own "Defect-1 audit fix" section below
+// for why resolution and consultation are deliberately two different
+// functions, run at two different times, never one.
 //
 // # Why github_pr_sessions is the entitlement source of truth
 //
@@ -39,7 +46,7 @@
 // GitHub-originated sessions (req.SpawnSource == github --
 // coalesce.go's own WINNER path, and outboxworker's own sentinel-auto-fix
 // child sessions spawned from one) are EXEMPT from this gate entirely,
-// not merely coincidentally passing -- see checkRepoEntitlementGate's own
+// not merely coincidentally passing -- see ResolveRepoEntitlement's own
 // doc comment for why re-deriving identity from req.Repos[i].Url would be
 // actively WRONG there (a cross-repo/fork PR's own clone URL is
 // deliberately the fork, never the github_pr_sessions claim key), not
@@ -72,8 +79,51 @@
 // amplification attempt, not merely an unfinished rollout), so it is both
 // counted (session_repo_entitlement_denied_total, mirroring
 // session_rollout_refused_total's own shape) AND audit-logged -- see
-// denyRepoEntitlement's own doc comment for why that write must NOT run on
-// tx.
+// denyRepoEntitlement's own doc comment for the full "how" this stays
+// reliable under load.
+//
+// # Defect-1 audit fix: resolve the decision before any transaction exists
+//
+// This function used to be checkRepoEntitlementGate, taking a `tx pgx.Tx`
+// parameter and called from INSIDE CreateSessionOnTx, on the SAME
+// transaction the caller was already holding open. That was correct for
+// the entitlement READ itself (prSessions.WithTx(tx).RepoKnown -- same
+// connection, same tx, free), but wrong for the denial AUDIT WRITE:
+// denyRepoEntitlement's own write always ran through the plain,
+// POOL-backed auditLog store (never .WithTx(tx)) -- necessary so that row
+// survives the caller's own eventual rollback of the session it just
+// refused (every CreateSessionOnTx caller rolls its own tx back on any
+// non-nil *CreateSessionError). A pool-backed write issued while the
+// caller's OWN transaction is still open needs a SECOND connection out of
+// the SAME pool. Reproduced twice against a real Postgres: with
+// DBPoolMaxConns=1, a single denial blocked for the full context deadline
+// (a known-repo control returned in ~2ms); with DBPoolMaxConns=4, four
+// concurrent denials starved an unrelated query for its own deadline, and
+// the audit write itself failed with context canceled on every single one
+// of them -- so under exactly the concurrent-denial burst this gate
+// exists to detect, it produced the metric but NOT the audit row,
+// defeating this Step's own "loud, never silent" requirement above.
+// pgxpool.Acquire has no acquire timeout of its own, and the HTTP server
+// sets none either, so N >= DBPoolMaxConns concurrent denials was a
+// circular wait any authenticated session-creation caller could reach.
+//
+// The fix is not an acquire timeout (that bounds the stall but still
+// loses the audit row under load, which is the half that actually
+// matters) -- it is moving the ENTIRE decision, denial side effects
+// included, to run with NO transaction open at all: ResolveRepoEntitlement
+// takes no tx parameter, is called by every CreateSessionOnTx caller
+// BEFORE that caller's own pool.Begin/tx acquisition of any kind, and
+// returns a RepoEntitlementDecision (admitted) plus, on refusal, the
+// *CreateSessionError to return immediately -- often, on a denial, before
+// a doomed transaction is ever even opened at all. With no tx in scope,
+// the audit write needs only the ONE connection it always needed, and
+// nothing can roll it back -- denyRepoEntitlement's own "why not
+// .WithTx(tx)" framing no longer even applies, since there is no tx here
+// to have used in the first place. CreateSessionOnTx itself now takes the
+// resolved RepoEntitlementDecision as a required parameter and only ever
+// consults it -- see RepoEntitlementDecision's own doc comment for why it
+// is impossible, not just discouraged, for a caller to fabricate an
+// admitting one without actually calling this resolver.
 
 package httpapi
 
@@ -82,7 +132,6 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -109,7 +158,7 @@ var sessionRepoEntitlementDeniedTotalCounter = sync.OnceValue(newSessionRepoEnti
 func newSessionRepoEntitlementDeniedTotalCounter() metric.Int64Counter {
 	c, err := otel.Meter(repoEntitlementGateMeterName).Int64Counter(
 		"session_repo_entitlement_denied_total",
-		metric.WithDescription("Count of every session-creation attempt refused by §31.4's per-repository entitlement predicate (authz.AuthorizeRepo) because a named repo has never been confirmed known to this deployment (github_pr_sessions, via GitHubPRSessionStore.RepoKnown) -- checkRepoEntitlementGate's own session-creation-time denials. Tagged by the \"spawn_source\" attribute. A misconfigured entitlement is loud here, never silent: a sustained nonzero rate on a repo an operator believes IS connected means it has not yet had a GitHub PR mention (see checkRepoEntitlementGate's own doc comment), not that Narvi is broken."),
+		metric.WithDescription("Count of every session-creation attempt refused by §31.4's per-repository entitlement predicate (authz.AuthorizeRepo) because a named repo has never been confirmed known to this deployment (github_pr_sessions, via GitHubPRSessionStore.RepoKnown) -- ResolveRepoEntitlement's own session-creation-time denials. Tagged by the \"spawn_source\" attribute. A misconfigured entitlement is loud here, never silent: a sustained nonzero rate on a repo an operator believes IS connected means it has not yet had a GitHub PR mention (see ResolveRepoEntitlement's own doc comment), not that Narvi is broken."),
 		metric.WithUnit("{denial}"),
 	)
 	if err != nil {
@@ -139,13 +188,44 @@ func actorFromCreatedBy(createdBy pgtype.UUID) authz.Actor {
 	return authz.Actor{UserID: createdBy.String()}
 }
 
-// checkRepoEntitlementGate is §31.4's own primary gate, called from
-// CreateSessionOnTx (create.go) BEFORE the environment/session inserts, on
-// the SAME transaction that is about to insert the session -- see this
-// file's own top doc comment for the full "why here, why github_pr_
-// sessions" reasoning.
+// RepoEntitlementDecision is §31.4's own entitlement verdict for one
+// session-creation request, ALREADY RESOLVED by ResolveRepoEntitlement
+// before any transaction was opened -- see this file's own top doc
+// comment ("Defect-1 audit fix") for the full "why". CreateSessionOnTx
+// (create.go) takes this as a required parameter and refuses on it
+// directly, never re-deriving or re-resolving it itself: re-resolving on
+// the tx CreateSessionOnTx is handed would reintroduce the exact defect
+// this type exists to close (a genuine Postgres read/write racing the
+// caller's own already-open transaction for a second pool connection).
 //
-// UNLIKE checkRolloutGate, this gate has no mode-gated "byte-for-byte
+// The zero value, RepoEntitlementDecision{}, is DENIED: admitted defaults
+// false, and is unexported -- settable only from within this file, by
+// ResolveRepoEntitlement's own successful return. This mirrors
+// RequireCapability's own "inject the decision, not the decider" shape
+// (requirecapability.go's own doc comment) one level stricter: that
+// function takes a bare func() bool a caller could still fake by closing
+// over one that always answers true, where this type's unexported field
+// means the ONLY way any other package can ever construct an admitting
+// value is to call ResolveRepoEntitlement and receive one back. A caller
+// that forgets to call it -- and passes this type's own zero value
+// through some other path -- fails CLOSED, forced through the resolver at
+// compile time to get anything else.
+type RepoEntitlementDecision struct {
+	admitted bool
+}
+
+// ResolveRepoEntitlement is §31.4's own resolver -- the I/O half of the
+// "inject the decision, not the decider" split RepoEntitlementDecision's
+// own doc comment describes, and this file's own top doc comment's
+// "Defect-1 audit fix" section. Every CreateSessionOnTx caller in this
+// codebase (create.go's own CreateSessionCore, childsession.go,
+// automation/fanout.go, outboxworker/sentinelautofix.go, github/
+// coalesce.go) calls this FIRST, with NO transaction open (strictly
+// before its own pool.Begin/tx acquisition of any kind), and either bails
+// out immediately on a non-nil *CreateSessionError or threads the
+// returned RepoEntitlementDecision through to CreateSessionOnTx.
+//
+// UNLIKE checkRolloutGate, this resolver has no mode-gated "byte-for-byte
 // no-op" escape hatch: §31.4's own vulnerability (an unentitled repo
 // becoming a credentialed clone) exists on every deployment, in every
 // stage, regardless of whether an operator has ever touched
@@ -227,15 +307,15 @@ func actorFromCreatedBy(createdBy pgtype.UUID) authz.Actor {
 //     blip with a genuine, repeatable policy denial would make both the
 //     metric and the audit trail lie to an operator about how many repos
 //     are actually being kept out by this gate.
-func checkRepoEntitlementGate(ctx context.Context, tx pgx.Tx, prSessions *postgres.GitHubPRSessionStore, auditLog *postgres.AuditLogStore, createdBy pgtype.UUID, req restdtos.CreateSessionRequest) *CreateSessionError {
+func ResolveRepoEntitlement(ctx context.Context, prSessions *postgres.GitHubPRSessionStore, auditLog *postgres.AuditLogStore, createdBy pgtype.UUID, req restdtos.CreateSessionRequest) (RepoEntitlementDecision, *CreateSessionError) {
 	if req.SpawnSource == restdtos.CreateSessionRequestSpawnSourceGithub {
-		return nil
+		return RepoEntitlementDecision{admitted: true}, nil
 	}
 
 	logger := platform.Logger(ctx)
 
 	// A nil prSessions is a caller-wiring defect (every real caller of
-	// CreateSessionOnTx is REQUIRED to supply one, per this function's own
+	// this resolver is REQUIRED to supply one, per this function's own
 	// doc comment), never a legitimate "no repos to check" signal --
 	// exactly the "actor whose entitlement cannot be determined" case this
 	// Step's own brief names explicitly. Fails closed the SAME way a
@@ -247,7 +327,7 @@ func checkRepoEntitlementGate(ctx context.Context, tx pgx.Tx, prSessions *postgr
 	if prSessions == nil {
 		logger.Error("httpapi: repo entitlement gate: prSessions is nil; failing closed (treating as not known)",
 			"spawn_source", string(req.SpawnSource))
-		return &CreateSessionError{
+		return RepoEntitlementDecision{}, &CreateSessionError{
 			Status:  http.StatusServiceUnavailable,
 			Message: "repository entitlement could not be verified: entitlement store unavailable",
 		}
@@ -260,50 +340,52 @@ func checkRepoEntitlementGate(ctx context.Context, tx pgx.Tx, prSessions *postgr
 		if !resolved {
 			logger.Warn("httpapi: repo entitlement gate: repo url could not be resolved to a trusted, host-verified owner/repo identity; treating as not known",
 				"url", repo.Url, "spawn_source", string(req.SpawnSource))
-			return denyRepoEntitlement(ctx, auditLog, createdBy, actor, authz.RepoAdmission{FullName: repo.Url, Known: false}, req.SpawnSource)
+			return RepoEntitlementDecision{}, denyRepoEntitlement(ctx, auditLog, createdBy, actor, authz.RepoAdmission{FullName: repo.Url, Known: false}, req.SpawnSource)
 		}
 
-		known, err := prSessions.WithTx(tx).RepoKnown(ctx, fullName)
+		// Plain, pool-backed read -- deliberately not .WithTx(tx): no
+		// transaction is open at any point during this resolver's own
+		// execution (this file's own top doc comment, "Defect-1 audit
+		// fix"), so there is no tx left to scope this query to. A single,
+		// ordinary pooled connection is acquired and released for this one
+		// query, exactly like any other standalone read in this codebase.
+		known, err := prSessions.RepoKnown(ctx, fullName)
 		if err != nil {
 			// Case 3 above -- fail-closed, but NOT a demonstrated policy
 			// outcome. See this function's own doc comment.
 			logger.Warn("httpapi: repo entitlement gate: read github_pr_sessions failed; failing closed (treating as not known)",
 				"repo", fullName, "error", err, "spawn_source", string(req.SpawnSource))
-			return &CreateSessionError{
+			return RepoEntitlementDecision{}, &CreateSessionError{
 				Status:  http.StatusServiceUnavailable,
 				Message: "repository entitlement could not be verified: " + fullName,
 			}
 		}
 
 		if aerr := authz.AuthorizeRepo(actor, authz.RepoAdmission{FullName: fullName, Known: known}); aerr != nil {
-			return denyRepoEntitlement(ctx, auditLog, createdBy, actor, authz.RepoAdmission{FullName: fullName, Known: known}, req.SpawnSource)
+			return RepoEntitlementDecision{}, denyRepoEntitlement(ctx, auditLog, createdBy, actor, authz.RepoAdmission{FullName: fullName, Known: known}, req.SpawnSource)
 		}
 	}
 
-	return nil
+	return RepoEntitlementDecision{admitted: true}, nil
 }
 
 // denyRepoEntitlement renders a genuine, DEMONSTRATED entitlement denial
-// (cases 1/2 in checkRepoEntitlementGate's own doc comment) into the
+// (cases 1/2 in ResolveRepoEntitlement's own doc comment) into the
 // side effects §31.4 explicitly requires -- a Warn log, the denial
 // counter, and an audit_log row -- and the *CreateSessionError every
 // caller already knows how to propagate.
 //
-// The audit_log write deliberately does NOT run on tx: tx belongs to the
-// caller that is about to return this exact error, and every
-// CreateSessionOnTx caller in this codebase rolls its own transaction back
-// on ANY non-nil *CreateSessionError (create.go's own CreateSessionCore,
-// childsession.go's SpawnChildSession, and every direct-tx caller's own
-// "defer rollback" -- see each one's own doc comment). An INSERT issued
-// via auditLog.WithTx(tx) would therefore be discarded along with
-// everything else the instant that rollback runs, silently losing the
-// exact audit trail this Step requires. auditLog here is the plain,
-// pool-backed store every CreateSessionOnTx caller already threads
-// through (the SAME parameter the SUCCESS-path audit row further down in
-// CreateSessionOnTx binds to tx via .WithTx(tx) -- this is the one call
-// site in this package that deliberately does NOT) -- writing through it
-// directly commits this row on its own, independent connection,
-// regardless of what happens to tx afterward.
+// The audit_log write deliberately does NOT run on any transaction: this
+// function runs entirely from ResolveRepoEntitlement, called by every
+// CreateSessionOnTx caller BEFORE that caller ever opens the transaction
+// the eventual session insert (and its own success-path audit row) will
+// run on -- see this file's own top doc comment ("Defect-1 audit fix") for
+// the full "why". There is no tx in scope here to bind this write to, or
+// to have it discarded by: auditLog is the plain, pool-backed store every
+// ResolveRepoEntitlement caller already threads through, and writing
+// through it directly commits this row on its own, ordinary connection,
+// independently of whatever transaction the caller goes on to open (or,
+// on this denial, never opens at all) afterward.
 //
 // A failure to write the audit row itself is logged and swallowed, never
 // promoted to the returned error: the entitlement denial is already a
