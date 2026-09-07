@@ -135,6 +135,21 @@ func Insert(ctx context.Context, store *postgres.ReviewVerdictStore, repoSetting
 		return reviewverdict.Record{}, fmt.Errorf("reviewverdict: insert: marshal digest arch decisions: %w", err)
 	}
 
+	// Marshalled through marshalStrings, never json.Marshal directly: a
+	// nil slice marshals to "null", which the gate's own containment
+	// operator cannot match and which is indistinguishable from a decode
+	// failure. marshalStrings' copy through make gives an honestly empty
+	// "[]" instead, so a verdict with no tags is reachable by the
+	// selector's recency fallback and by nothing else.
+	archDecisionTagsJSON, err := marshalStrings(archDecisionTags)
+	if err != nil {
+		return reviewverdict.Record{}, fmt.Errorf("reviewverdict: marshal arch decision tags: %w", err)
+	}
+	archDecisionRootsJSON, err := marshalStrings(archDecisionRoots)
+	if err != nil {
+		return reviewverdict.Record{}, fmt.Errorf("reviewverdict: marshal arch decision roots: %w", err)
+	}
+
 	row, err := store.Insert(ctx, sqlcgen.InsertReviewVerdictParams{
 		RepoFullName:              repoFullName,
 		PrNumber:                  prNumber,
@@ -161,6 +176,8 @@ func Insert(ctx context.Context, store *postgres.ReviewVerdictStore, repoSetting
 		FactCheckKilled:           factCheckKilledPtr(factCheckKilled),
 		DigestContestedPoints:     nonEmptyStringPtr(digest.ContestedPoints),
 		SuppressedInShadow:        suppressedInShadow,
+		ArchDecisionTags:          archDecisionTagsJSON,
+		ArchDecisionRoots:         archDecisionRootsJSON,
 	})
 	if err != nil {
 		return reviewverdict.Record{}, err
