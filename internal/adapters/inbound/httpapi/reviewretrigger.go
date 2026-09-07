@@ -174,8 +174,13 @@ func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns 
 		// re-review alike": a manual re-trigger is exactly a re-review
 		// pass. Independent of diffFetcher (a review turn can still carry
 		// the advisory block even with no diff fetcher wired).
+		// advisory is hoisted to this outer scope so the §31.2 token-gauge
+		// call below (alongside the arch-decisions fetch) can see both
+		// this block and archBlock together.
+		var advisory string
 		if falsePositivePatterns != nil {
-			if advisory := reviewcontext.FetchFalsePositivePatterns(ctx, logger, falsePositivePatterns, prSession.RepoFullName); advisory != "" {
+			advisory = reviewcontext.FetchFalsePositivePatterns(ctx, logger, falsePositivePatterns, prSession.RepoFullName)
+			if advisory != "" {
 				prompt = advisory + prompt
 			}
 		}
@@ -253,8 +258,10 @@ func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns 
 		// still entirely before RenderTurnPrompt.
 		knowledgeMode := knowledge.ModeA
 		var knowledgeDecisionJSON []byte
+		var archBlock string
 		if archDecisions != nil {
-			archBlock, injected := reviewcontext.FetchPriorArchDecisions(ctx, logger, archDecisions, knowledgeRanker, timeouts, knowledge.Query{
+			var injected knowledge.InjectedRecord
+			archBlock, injected = reviewcontext.FetchPriorArchDecisions(ctx, logger, archDecisions, knowledgeRanker, timeouts, knowledge.Query{
 				RepoFullName: prSession.RepoFullName,
 				Tags:         archTagStrings,
 				Roots:        archRoots,
@@ -270,6 +277,9 @@ func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns 
 				knowledgeDecisionJSON = recJSON
 			}
 		}
+		// (§31.2's own "instrumented trigger"): the token gauge, mirrors
+		// handler.go's own identical call site.
+		reviewcontext.RecordKnowledgeBlockTokens(ctx, advisory, archBlock)
 
 		// (§26.3): the depth decision, computed from prCtx above.
 		// Adversarial-review fix D2 ("deep-path digest requirement

@@ -724,7 +724,8 @@ func (a *Actor) reviewSessionHasAwaitingApprovalPlan(ctx context.Context, tx pgx
 // decision" shape.
 func (a *Actor) composeAutoRetriggerPrompt(ctx context.Context, repoFullName string, prNumber int32, reviewCtx review.PreFetchedContext, archTags, archRoots []string) (string, []byte) {
 	prompt := autoRetriggerPromptText
-	if advisory := reviewcontext.FetchFalsePositivePatterns(ctx, a.logger, a.stores.falsePositivePattern, repoFullName); advisory != "" {
+	advisory := reviewcontext.FetchFalsePositivePatterns(ctx, a.logger, a.stores.falsePositivePattern, repoFullName)
+	if advisory != "" {
 		prompt = advisory + prompt
 	}
 	// (§31.6 item 1): placed between the advisory and already-answered
@@ -735,8 +736,10 @@ func (a *Actor) composeAutoRetriggerPrompt(ctx context.Context, repoFullName str
 	// ArchDecisionsFetcher directly (reviewverdictarchdecisions.go); no
 	// separate fetcher field needed on this Actor.
 	var knowledgeDecisionJSON []byte
+	var archBlock string
 	if a.stores.reviewVerdict != nil {
-		archBlock, injected := reviewcontext.FetchPriorArchDecisions(ctx, a.logger, a.stores.reviewVerdict, a.knowledgeRanker, a.timeouts, knowledge.Query{
+		var injected knowledge.InjectedRecord
+		archBlock, injected = reviewcontext.FetchPriorArchDecisions(ctx, a.logger, a.stores.reviewVerdict, a.knowledgeRanker, a.timeouts, knowledge.Query{
 			RepoFullName: repoFullName,
 			Tags:         archTags,
 			Roots:        archRoots,
@@ -752,6 +755,9 @@ func (a *Actor) composeAutoRetriggerPrompt(ctx context.Context, repoFullName str
 			knowledgeDecisionJSON = recJSON
 		}
 	}
+	// (§31.2's own "instrumented trigger"): the token gauge, mirrors
+	// handler.go's own identical call site.
+	reviewcontext.RecordKnowledgeBlockTokens(ctx, advisory, archBlock)
 	if alreadyAnswered := reviewcontext.FetchAlreadyAnswered(ctx, a.logger, a.stores.reviewFinding, repoFullName, prNumber, reviewCtx.ChangedPaths, reviewCtx.DiffTruncated); alreadyAnswered != "" {
 		prompt = alreadyAnswered + prompt
 	}

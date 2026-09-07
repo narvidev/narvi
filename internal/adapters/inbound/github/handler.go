@@ -621,8 +621,15 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 		// alike" applies to every mention this handler ever processes,
 		// coalesced or not, since both CreateOrJoin branches share this
 		// SAME prompt-building code, upstream of the branch itself.
+		// advisory is hoisted to this outer scope (unlike its own prior,
+		// block-local declaration) so the §31.2 token-gauge call below --
+		// alongside the arch-decisions fetch, once prCtx resolves -- can
+		// see both this block and archBlock together, per that metric's
+		// own "split into three numbers" requirement.
+		var advisory string
 		if cfg.FalsePositivePatterns != nil {
-			if advisory := reviewcontext.FetchFalsePositivePatterns(ctx, logger, cfg.FalsePositivePatterns, m.RepoFullName); advisory != "" {
+			advisory = reviewcontext.FetchFalsePositivePatterns(ctx, logger, cfg.FalsePositivePatterns, m.RepoFullName)
+			if advisory != "" {
 				m.CommentBody = advisory + m.CommentBody
 			}
 		}
@@ -698,8 +705,10 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 		// identical `if cfg.X != nil` guard one field over.
 		knowledgeMode := knowledge.ModeA
 		var knowledgeDecisionJSON []byte
+		var archBlock string
 		if cfg.ArchDecisions != nil {
-			archBlock, injected := reviewcontext.FetchPriorArchDecisions(ctx, logger, cfg.ArchDecisions, cfg.KnowledgeRanker, cfg.Timeouts, knowledge.Query{
+			var injected knowledge.InjectedRecord
+			archBlock, injected = reviewcontext.FetchPriorArchDecisions(ctx, logger, cfg.ArchDecisions, cfg.KnowledgeRanker, cfg.Timeouts, knowledge.Query{
 				RepoFullName: m.RepoFullName,
 				Tags:         archTagStrings,
 				Roots:        archRoots,
@@ -715,6 +724,13 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 				knowledgeDecisionJSON = recJSON
 			}
 		}
+		// (§31.2's own "instrumented trigger"): the token gauge, split
+		// into false-positive/arch-decisions/total -- emitted here,
+		// regardless of which (or neither) block above actually fired,
+		// so an empty turn still contributes a real zero data point
+		// rather than silently skewing the distribution toward turns
+		// that HAD something to inject.
+		reviewcontext.RecordKnowledgeBlockTokens(ctx, advisory, archBlock)
 
 		// (§26.3): the depth decision, computed from prCtx above.
 		// Adversarial-review fix D2 ("deep-path digest requirement
