@@ -1,0 +1,21 @@
+-- review_verdicts.knowledge_mode (Step 107, §31.2 item 2): "A
+-- knowledge-mode column on review_verdicts, stamped at write. Without it
+-- the flagship A/B KPI is contaminated at the instant of any flip:
+-- review_verdicts is append-only, and joining the CURRENT flag against
+-- history attributes every pre-flip verdict to the post-flip mode."
+-- Mirrors review_verdicts.review_path (migrations/
+-- 000081_review_verdicts_review_path.up.sql) verbatim, one concern over:
+-- the SAME turns.review_knowledge_mode value (migrations/000114)
+-- recorded at THIS verdict's own turn-creation time, forwarded verbatim
+-- by internal/app/reviewverdict.Insert.
+--
+-- Nullable TEXT, mirroring every OTHER review_verdicts column added
+-- after the original table: NULL means "posted before this Step
+-- existed, or whose own turn never had a resolvable mode", never a
+-- fabricated mode for an old row.
+--
+-- The exclusion/attribution logic this stamp exists to feed lives
+-- entirely in the query that joins it against the §26.5 contestation KPI
+-- (a later Step's own read), never at call sites -- the SAME in-query
+-- discipline §30.8 imposes on its own egress-mode stamp.
+ALTER TABLE review_verdicts ADD COLUMN knowledge_mode TEXT;

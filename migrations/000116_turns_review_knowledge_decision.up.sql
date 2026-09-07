@@ -1,0 +1,29 @@
+-- turns.review_knowledge_decision (Step 107, §31.6 item 1's own "durable
+-- record of the injected knowledge -- ids and content hashes of the
+-- injected decisions, in a JSONB column on the turn, the exact shape of
+-- review_depth_decision (migration 000083)"). Mirrors turns.
+-- review_depth_decision (migrations/
+-- 000083_turns_review_depth_decision.up.sql, §18.4's own precedent)
+-- verbatim, one concern over: nullable JSONB, NULL for every non-review
+-- turn, set exactly once, at creation, alongside review_knowledge_mode
+-- (migrations/000114) -- by the SAME four review-turn-creation paths.
+--
+-- Stores internal/domain/knowledge.InjectedRecord (candidate.go's
+-- sibling render.go), never internal/domain/reviewtriage.DecisionRecord
+-- -- a structurally different fact (WHICH prior-decision candidates this
+-- turn's own prompt actually carried, plus the selector/ranker that
+-- produced them and any degradation), riding its own column rather than
+-- an extra field bolted onto review_depth_decision, because the two
+-- records answer unrelated questions and this one must survive
+-- independently of §26.3's own routing record.
+--
+-- Not logs: logs are not durable joinable state, and without this
+-- record, when a maintainer contests a recap, no trace survives of
+-- which corpus rows induced it (the events stream is ON DELETE CASCADE)
+-- -- the anti-poisoning loop would be a fiction.
+--
+-- Read back at verdict-post time so review_verdicts.knowledge_influenced
+-- (migrations/000117, §31.7's own G5) can be derived from whether THIS
+-- turn's own record actually carries at least one injected id, never
+-- inferred from anything else.
+ALTER TABLE turns ADD COLUMN review_knowledge_decision JSONB;
