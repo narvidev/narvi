@@ -180,6 +180,8 @@ func (f *autoRetriggerFixture) insertVerdict(ctx context.Context, t *testing.T, 
 		ProposedShippable: "auto",
 		Shippable:         "auto",
 		SessionID:         f.sessionID,
+		ArchDecisionTags:  []byte(`[]`),
+		ArchDecisionRoots: []byte(`[]`),
 	}); err != nil {
 		t.Fatalf("insert review verdict: %v", err)
 	}
@@ -205,6 +207,8 @@ func (f *autoRetriggerFixture) insertVerdictWithReviewPath(ctx context.Context, 
 		Shippable:         "auto",
 		SessionID:         f.sessionID,
 		ReviewPath:        &reviewPath,
+		ArchDecisionTags:  []byte(`[]`),
+		ArchDecisionRoots: []byte(`[]`),
 	}); err != nil {
 		t.Fatalf("insert review verdict with review_path: %v", err)
 	}
