@@ -47,10 +47,9 @@ func (f *fakeArchDecisionsFetcher) ListRecentArchDecisions(_ context.Context, _ 
 type fakeRanker struct {
 	name string
 
-	scores  []float64
-	err     error
-	block   bool            // if true, Score blocks until ctx is done
-	blockOn <-chan struct{} // closed to release a blocked Score call, if set
+	scores []float64
+	err    error
+	block  bool // if true, Score blocks until ctx is done
 
 	calls int
 }
@@ -62,7 +61,7 @@ func (r *fakeRanker) Name() string {
 	return r.name
 }
 
-func (r *fakeRanker) Score(ctx context.Context, _ knowledge.Query, cands []knowledge.Candidate) ([]float64, error) {
+func (r *fakeRanker) Score(ctx context.Context, _ knowledge.Query, _ []knowledge.Candidate) ([]float64, error) {
 	r.calls++
 	if r.block {
 		<-ctx.Done()

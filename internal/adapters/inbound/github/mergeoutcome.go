@@ -15,6 +15,7 @@
 // (this file's own concern) and a sentinel-fix's own origin PR
 // (pullrequestevent.go's concern) -- the two facts are unrelated, and
 // both deserve to be recorded independently.
+
 package github
 
 import (
