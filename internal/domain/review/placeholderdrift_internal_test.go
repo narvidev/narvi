@@ -173,3 +173,146 @@ func domainRootForTest(t *testing.T) string {
 	}
 	return filepath.Dir(filepath.Dir(thisFile))
 }
+
+// delimiterConstNamePattern matches every constant identifier this
+// codebase uses for a fixed prompt-block delimiter tag -- "XxxDelimiter"
+// by convention (diffContentDelimiter, stackContentDelimiter,
+// descriptionContentDelimiter, all three in context.go one file over;
+// reviewpost.alreadyAnsweredDelimiter, falsepositive.advisoryDelimiter,
+// upload.downloadContentDelimiter, knowledge.priorDecisionsDelimiter,
+// technical plan §31.7's own G2). Matched by IDENTIFIER NAME, unlike
+// placeholderTokenLiteralPattern above (which matches by VALUE shape): a
+// delimiter's own value is an ordinary lowercase, underscore-separated
+// word ("pr_diff", "already_answered_findings") indistinguishable in
+// shape from any number of unrelated short string literals (JSON field
+// names, log keys, ...) this codebase has nothing to do with a prompt
+// delimiter at all -- there is no safe value-shape regex the way
+// "{{ALL_CAPS}}" safely identifies a placeholder. The "XxxDelimiter"
+// naming convention every existing delimiter constant already follows is
+// the one reliable signal available.
+var delimiterConstNamePattern = regexp.MustCompile(`Delimiter$`)
+
+// knownDelimiters is every prompt-block delimiter tag this codebase
+// currently defines, by VALUE -- this package's own three
+// (diffContentDelimiter/stackContentDelimiter/descriptionContentDelimiter,
+// context.go, referenced directly: this file is IN internal/domain/
+// review) plus every sibling domain package's own, duplicated as raw
+// string literals for the identical "zero external imports" reason
+// placeholderTokens (sanitize.go) duplicates turn's/upload's own
+// placeholder literals one section up -- add a new one here in the SAME
+// PR that introduces it; a fresh "XxxDelimiter" constant whose value is
+// absent from this list fails
+// TestDelimiterTokens_DiscoversEveryDomainDelimiterLiteral below.
+var knownDelimiters = []string{
+	diffContentDelimiter,
+	stackContentDelimiter,
+	descriptionContentDelimiter,
+	"already_answered_findings",       // reviewpost.alreadyAnsweredDelimiter (reconcile.go)
+	"learned_false_positive_patterns", // falsepositive.advisoryDelimiter (advisory.go)
+	"upload_attachments",              // upload.downloadContentDelimiter (prompt.go)
+	"prior_architecture_decisions",    // knowledge.priorDecisionsDelimiter (render.go, §31.7 G2)
+}
+
+// TestDelimiterTokens_DiscoversEveryDomainDelimiterLiteral is
+// TestPlaceholderTokens_DiscoversEveryDomainPlaceholderLiteral's own
+// sibling scan (this file's own top doc comment's "self-updating scan"
+// precedent, applied to a second, unrelated drift hazard): every
+// "XxxDelimiter" constant anywhere under internal/domain must have its
+// own VALUE registered in knownDelimiters above, AND no two such
+// constants may share the same value. A collision would mean one
+// package's own rendered content-block content could forge a
+// "</the_shared_tag>" close early and splice a fake instruction into
+// what a reviewing model reads as a DIFFERENT package's own supposedly
+// closed, untrusted-data block -- every projection in this codebase
+// (RenderTurnPrompt's diff/stack/description blocks, reviewpost's
+// already-answered-facts block, falsepositive's advisory block, upload's
+// attachment-listing block, knowledge's prior-decisions block, §31.7's
+// own G2) assumes its own tag is unique across the whole assembled
+// prompt; nothing before this test ever checked that assumption still
+// holds as new packages add their own delimiters.
+func TestDelimiterTokens_DiscoversEveryDomainDelimiterLiteral(t *testing.T) {
+	t.Parallel()
+
+	domainDir := domainRootForTest(t)
+
+	found := map[string][]string{} // value -> declaring "file:identifier" location(s)
+	fset := token.NewFileSet()
+	err := filepath.WalkDir(domainDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		file, perr := parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			return perr
+		}
+		rel, relErr := filepath.Rel(domainDir, path)
+		if relErr != nil {
+			rel = path
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			gd, ok := n.(*ast.GenDecl)
+			if !ok || gd.Tok != token.CONST {
+				return true
+			}
+			for _, spec := range gd.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for i, name := range vs.Names {
+					if !delimiterConstNamePattern.MatchString(name.Name) {
+						continue
+					}
+					if i >= len(vs.Values) {
+						continue
+					}
+					lit, ok := vs.Values[i].(*ast.BasicLit)
+					if !ok || lit.Kind != token.STRING {
+						continue
+					}
+					val, uerr := strconv.Unquote(lit.Value)
+					if uerr != nil {
+						continue
+					}
+					found[val] = append(found[val], rel+":"+name.Name)
+				}
+			}
+			return true
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scanning internal/domain (%s) for delimiter constant literals: %v", domainDir, err)
+	}
+
+	// Defensive sanity check on the scan itself, mirroring
+	// TestPlaceholderTokens_DiscoversEveryDomainPlaceholderLiteral's own
+	// identical precedent immediately above: finding zero means the scan
+	// itself is almost certainly broken, not that the codebase suddenly
+	// defines no delimiters at all.
+	if len(found) == 0 {
+		t.Fatalf(`scan of %s found zero "XxxDelimiter"-named constants -- the scan itself is almost certainly broken (this package's own diffContentDelimiter/stackContentDelimiter/descriptionContentDelimiter should always be found)`, domainDir)
+	}
+
+	known := make(map[string]bool, len(knownDelimiters))
+	for _, want := range knownDelimiters {
+		known[want] = true
+	}
+	for val, decls := range found {
+		if !known[val] {
+			t.Errorf("found delimiter constant with value %q (declared as %v), but it is NOT in knownDelimiters (placeholderdrift_internal_test.go) -- add it there", val, decls)
+		}
+		// Pairwise distinctness: two DIFFERENT delimiter constants
+		// sharing the SAME value is exactly the collision this test's
+		// own doc comment describes -- decls holds every "file:identifier"
+		// location that declared THIS value, so more than one entry here
+		// already is the collision, regardless of whether the value is
+		// also a known one.
+		if len(decls) > 1 {
+			t.Errorf("delimiter value %q is declared by more than one constant: %v -- every prompt-block delimiter must be unique across the whole codebase", val, decls)
+		}
+	}
+}
