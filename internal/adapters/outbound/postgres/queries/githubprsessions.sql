@@ -168,3 +168,25 @@ SELECT EXISTS(
 -- what a TimerFired command carries -- there is no separate (repo,
 -- pr_number) identity to look this row up by at that point) -- no new
 -- query needed for it.
+
+-- name: RecordMergeOutcome :one
+-- §31.7's own G4 arming write (migrations/
+-- 000118_github_pr_sessions_merge_outcome.up.sql): captures the SAME
+-- `pull_request` "closed" webhook's own pull_request.merged/closed_at
+-- fields verbatim -- never re-derived, never polled. Guarded on
+-- session_id IS NOT NULL, mirroring UpsertPendingRetriggerHeadSHA's own
+-- identical guard: a claim row with no session ever attached was never
+-- actually reviewed, so it has nothing for a merge outcome to arm
+-- eligibility for. pgx.ErrNoRows (unwrapped) means exactly that --
+-- either no github_pr_sessions row exists for this PR at all (Narvi was
+-- never mentioned on it), or one exists with session_id still NULL --
+-- both acknowledged and ignored by the caller, the SAME "no session to
+-- act on" outcome UpsertPendingRetriggerHeadSHA's own callers already
+-- treat identically. Overwrites (never appends) on every event, the SAME
+-- "last observed wins" polarity UpsertPendingRetriggerHeadSHA's own doc
+-- comment states for a re-opened-then-re-closed PR (a real but rare
+-- GitHub possibility this table does not attempt to model as history).
+UPDATE github_pr_sessions
+SET pr_merged = $3, pr_closed_at = $4
+WHERE repo_full_name = $1 AND pr_number = $2 AND session_id IS NOT NULL
+RETURNING *;

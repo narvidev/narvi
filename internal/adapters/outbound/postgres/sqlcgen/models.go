@@ -1753,6 +1753,8 @@ type GithubPrSession struct {
 	PendingRetriggerHeadSha         *string            `json:"pending_retrigger_head_sha"`
 	AutoRetriggerCount              int32              `json:"auto_retrigger_count"`
 	AutoRetriggerBudgetNoticeSentAt pgtype.Timestamptz `json:"auto_retrigger_budget_notice_sent_at"`
+	PrMerged                        *bool              `json:"pr_merged"`
+	PrClosedAt                      pgtype.Timestamptz `json:"pr_closed_at"`
 }
 
 type HandoffSentinelRun struct {

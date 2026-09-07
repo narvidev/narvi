@@ -376,6 +376,18 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 
 		eventType := r.Header.Get("X-GitHub-Event")
 
+		// (§31.7's own G4 arming write): captured for EVERY `pull_request`
+		// "closed" event, unconditionally -- deliberately NOT gated behind
+		// cfg.SentinelFixes (immediately below) or any other lane's own
+		// nil-guard, and deliberately never `return`s: this is a pure,
+		// best-effort side effect onto github_pr_sessions, independent of
+		// whichever OTHER "closed" lane also runs for the SAME delivery.
+		// See mergeoutcome.go's own top doc comment for the full "why
+		// alongside, never instead of" reasoning.
+		if eventType == eventTypePullRequest && coalescer.PRSessions != nil && readPullRequestEventAction(body) == "closed" {
+			captureMergeOutcome(ctx, logger, coalescer.PRSessions, body)
+		}
+
 		// (§17.4/§17.5): a `pull_request` event whose own action is
 		// "closed" is the merge-gating trigger -- a STRUCTURALLY DIFFERENT
 		// thing from the "labeled" manual re-trigger lane parseMention

@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -142,6 +143,22 @@ func (s *GitHubPRSessionStore) MarkAutoRetriggerBudgetNoticeSent(ctx context.Con
 	return s.q.MarkAutoRetriggerBudgetNoticeSent(ctx, sqlcgen.MarkAutoRetriggerBudgetNoticeSentParams{
 		RepoFullName: repoFullName,
 		PrNumber:     prNumber,
+	})
+}
+
+// RecordMergeOutcome captures a `pull_request` "closed" webhook's own
+// merged/closed_at facts onto (repoFullName, prNumber)'s claim row --
+// §31.7's own G4 arming write. Guarded on session_id IS NOT NULL; a
+// pgx.ErrNoRows (unwrapped) result means "no session to arm eligibility
+// for" -- see RecordMergeOutcome's own generated doc comment for the full
+// "why" -- callers acknowledge and ignore it, never treat it as a real
+// failure.
+func (s *GitHubPRSessionStore) RecordMergeOutcome(ctx context.Context, repoFullName string, prNumber int32, merged bool, closedAt time.Time) (sqlcgen.GithubPrSession, error) {
+	return s.q.RecordMergeOutcome(ctx, sqlcgen.RecordMergeOutcomeParams{
+		RepoFullName: repoFullName,
+		PrNumber:     prNumber,
+		PrMerged:     &merged,
+		PrClosedAt:   pgtype.Timestamptz{Time: closedAt, Valid: true},
 	})
 }
 
