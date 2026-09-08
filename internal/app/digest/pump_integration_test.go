@@ -108,7 +108,7 @@ func (rs *digestTestRig) seedRepoWithSlackChannel(ctx context.Context, t *testin
 	if _, err := repoSettings.UpsertLiveEgressEnabled(ctx, repoFullName, true); err != nil {
 		t.Fatalf("promote repo to live egress: %v", err)
 	}
-	if _, err := appreviewverdict.Insert(ctx, rs.reviewVerdicts, repoSettings, false, repoFullName, prNumber, "sha-digest", session.ID, verdict, reviewpost.Digest{Summary: "Test-seeded verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0); err != nil {
+	if _, err := appreviewverdict.Insert(ctx, rs.reviewVerdicts, repoSettings, false, repoFullName, prNumber, "sha-digest", session.ID, verdict, reviewpost.Digest{Summary: "Test-seeded verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false); err != nil {
 		t.Fatalf("seed review_verdicts row: %v", err)
 	}
 }

@@ -97,7 +97,32 @@ import (
 // queries (GetLatestNonShadowReviewVerdict, ListLatestAutoApprovedInRepo,
 // ListNonShadowReviewVerdictsInWindow) -- §30.8: "never call-site
 // checks".
-func Insert(ctx context.Context, store *postgres.ReviewVerdictStore, repoSettings *postgres.RepoSettingsStore, platformShadow bool, repoFullName string, prNumber int32, headSHA string, sessionID pgtype.UUID, verdict review.Verdict, digest reviewpost.Digest, reviewPath reviewtriage.ReviewDepth, counterReview review.CounterReviewStatus, factCheck reviewpost.FactCheckStatus, factCheckKilled int) (reviewverdict.Record, error) {
+//
+// archDecisionTags/archDecisionRoots (§31.6) are forwarded verbatim onto
+// this row's own arch_decision_tags/arch_decision_roots columns
+// (migrations/000113) -- the caller has already read them off THIS
+// verdict's own turn (turns.review_depth_decision's own ArchDecisionTags/
+// ArchDecisionRoots, computed once at turn-creation time via
+// autoapproval.ClassifyChangedPaths/ClassifyChangedRoots over that
+// turn's own ChangedPaths). This function does no classification of its
+// own -- exactly like it forwards reviewPath/counterReview/factCheck
+// verbatim rather than re-deriving any of them.
+//
+// knowledgeMode/knowledgeInfluenced (§31.2/§31.7's own mode buffer and
+// G5) mirror reviewPath's own identical "forwarded verbatim from this
+// verdict's own posting turn" shape, one column further:
+// knowledgeMode is turns.review_knowledge_mode (migrations/000114),
+// persisted as review_verdicts.knowledge_mode (migrations/000115) --
+// empty forwards as a genuine SQL NULL via nonEmptyStringPtr below,
+// exactly like reviewPath's own identical degradation.
+// knowledgeInfluenced is NOT forwarded from a turn column directly: the
+// caller has already derived it (knowledge.InjectedRecord, unmarshalled
+// from that SAME turn's turns.review_knowledge_decision, migrations/
+// 000116) as "this record carries at least one injected id" --
+// review_verdicts.knowledge_influenced (migrations/000117) is NOT NULL
+// DEFAULT false, so a caller that has no turn to read (this function's
+// own zero value) safely persists false, never an ambiguous NULL.
+func Insert(ctx context.Context, store *postgres.ReviewVerdictStore, repoSettings *postgres.RepoSettingsStore, platformShadow bool, repoFullName string, prNumber int32, headSHA string, sessionID pgtype.UUID, verdict review.Verdict, digest reviewpost.Digest, reviewPath reviewtriage.ReviewDepth, counterReview review.CounterReviewStatus, factCheck reviewpost.FactCheckStatus, factCheckKilled int, archDecisionTags, archDecisionRoots []string, knowledgeMode string, knowledgeInfluenced bool) (reviewverdict.Record, error) {
 	if headSHA == "" {
 		return reviewverdict.Record{}, fmt.Errorf("reviewverdict: insert: refusing to persist a verdict with no known head sha for %s#%d", repoFullName, prNumber)
 	}
@@ -123,6 +148,21 @@ func Insert(ctx context.Context, store *postgres.ReviewVerdictStore, repoSetting
 	archDecisionsJSON, err := marshalArchDecisions(digest.ArchDecisions)
 	if err != nil {
 		return reviewverdict.Record{}, fmt.Errorf("reviewverdict: insert: marshal digest arch decisions: %w", err)
+	}
+
+	// Marshalled through marshalStrings, never json.Marshal directly: a
+	// nil slice marshals to "null", which the gate's own containment
+	// operator cannot match and which is indistinguishable from a decode
+	// failure. marshalStrings' copy through make gives an honestly empty
+	// "[]" instead, so a verdict with no tags is reachable by the
+	// selector's recency fallback and by nothing else.
+	archDecisionTagsJSON, err := marshalStrings(archDecisionTags)
+	if err != nil {
+		return reviewverdict.Record{}, fmt.Errorf("reviewverdict: marshal arch decision tags: %w", err)
+	}
+	archDecisionRootsJSON, err := marshalStrings(archDecisionRoots)
+	if err != nil {
+		return reviewverdict.Record{}, fmt.Errorf("reviewverdict: marshal arch decision roots: %w", err)
 	}
 
 	row, err := store.Insert(ctx, sqlcgen.InsertReviewVerdictParams{
@@ -151,6 +191,10 @@ func Insert(ctx context.Context, store *postgres.ReviewVerdictStore, repoSetting
 		FactCheckKilled:           factCheckKilledPtr(factCheckKilled),
 		DigestContestedPoints:     nonEmptyStringPtr(digest.ContestedPoints),
 		SuppressedInShadow:        suppressedInShadow,
+		ArchDecisionTags:          archDecisionTagsJSON,
+		ArchDecisionRoots:         archDecisionRootsJSON,
+		KnowledgeMode:             nonEmptyStringPtr(knowledgeMode),
+		KnowledgeInfluenced:       knowledgeInfluenced,
 	})
 	if err != nil {
 		return reviewverdict.Record{}, err

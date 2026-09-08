@@ -13,22 +13,24 @@ import (
 
 const createTurn = `-- name: CreateTurn :one
 
-INSERT INTO turns (session_id, status, prompt, model_id, plan_mode, effort, review_head_sha, answer_only, review_depth, review_depth_decision)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd
+INSERT INTO turns (session_id, status, prompt, model_id, plan_mode, effort, review_head_sha, answer_only, review_depth, review_depth_decision, review_knowledge_mode, review_knowledge_decision)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision
 `
 
 type CreateTurnParams struct {
-	SessionID           pgtype.UUID `json:"session_id"`
-	Status              TurnStatus  `json:"status"`
-	Prompt              *string     `json:"prompt"`
-	ModelID             *string     `json:"model_id"`
-	PlanMode            bool        `json:"plan_mode"`
-	Effort              *string     `json:"effort"`
-	ReviewHeadSha       *string     `json:"review_head_sha"`
-	AnswerOnly          *bool       `json:"answer_only"`
-	ReviewDepth         *string     `json:"review_depth"`
-	ReviewDepthDecision []byte      `json:"review_depth_decision"`
+	SessionID               pgtype.UUID `json:"session_id"`
+	Status                  TurnStatus  `json:"status"`
+	Prompt                  *string     `json:"prompt"`
+	ModelID                 *string     `json:"model_id"`
+	PlanMode                bool        `json:"plan_mode"`
+	Effort                  *string     `json:"effort"`
+	ReviewHeadSha           *string     `json:"review_head_sha"`
+	AnswerOnly              *bool       `json:"answer_only"`
+	ReviewDepth             *string     `json:"review_depth"`
+	ReviewDepthDecision     []byte      `json:"review_depth_decision"`
+	ReviewKnowledgeMode     *string     `json:"review_knowledge_mode"`
+	ReviewKnowledgeDecision []byte      `json:"review_knowledge_decision"`
 }
 
 // Queries backing TurnStore (§4.3). Just enough to prove the pipeline end
@@ -74,6 +76,16 @@ type CreateTurnParams struct {
 // §18.4's own precedent) is review_depth's own richer sibling --
 // the full internal/domain/reviewtriage.DecisionRecord, JSON-marshaled by
 // the caller (this query does no encoding of its own).
+//
+// review_knowledge_mode/review_knowledge_decision (migrations/
+// 000114_turns_review_knowledge_mode.up.sql,
+// 000116_turns_review_knowledge_decision.up.sql, §31.2/§31.6) mirror
+// review_depth/review_depth_decision's own identical shape two columns
+// further: nil/absent for every non-review turn, set exactly once, at
+// creation, by the SAME review-turn-creation paths.
+// review_knowledge_decision is pre-marshaled JSON (internal/domain/
+// knowledge.InjectedRecord) -- this core does no encoding of its own,
+// mirroring review_depth_decision's own identical convention.
 func (q *Queries) CreateTurn(ctx context.Context, arg CreateTurnParams) (Turn, error) {
 	row := q.db.QueryRow(ctx, createTurn,
 		arg.SessionID,
@@ -86,6 +98,8 @@ func (q *Queries) CreateTurn(ctx context.Context, arg CreateTurnParams) (Turn, e
 		arg.AnswerOnly,
 		arg.ReviewDepth,
 		arg.ReviewDepthDecision,
+		arg.ReviewKnowledgeMode,
+		arg.ReviewKnowledgeDecision,
 	)
 	var i Turn
 	err := row.Scan(
@@ -109,12 +123,14 @@ func (q *Queries) CreateTurn(ctx context.Context, arg CreateTurnParams) (Turn, e
 		&i.ReviewDepthDecision,
 		&i.DispatchedEventID,
 		&i.CostUsd,
+		&i.ReviewKnowledgeMode,
+		&i.ReviewKnowledgeDecision,
 	)
 	return i, err
 }
 
 const getProcessingTurnForSession = `-- name: GetProcessingTurnForSession :one
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision FROM turns
 WHERE session_id = $1 AND status = 'processing'
 `
 
@@ -151,12 +167,14 @@ func (q *Queries) GetProcessingTurnForSession(ctx context.Context, sessionID pgt
 		&i.ReviewDepthDecision,
 		&i.DispatchedEventID,
 		&i.CostUsd,
+		&i.ReviewKnowledgeMode,
+		&i.ReviewKnowledgeDecision,
 	)
 	return i, err
 }
 
 const getTurn = `-- name: GetTurn :one
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision FROM turns
 WHERE id = $1
 `
 
@@ -184,6 +202,8 @@ func (q *Queries) GetTurn(ctx context.Context, id pgtype.UUID) (Turn, error) {
 		&i.ReviewDepthDecision,
 		&i.DispatchedEventID,
 		&i.CostUsd,
+		&i.ReviewKnowledgeMode,
+		&i.ReviewKnowledgeDecision,
 	)
 	return i, err
 }
@@ -249,7 +269,7 @@ func (q *Queries) ListSessionCostTotalsWithRepos(ctx context.Context) ([]ListSes
 }
 
 const listTurnsForSession = `-- name: ListTurnsForSession :many
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision FROM turns
 WHERE session_id = $1
 ORDER BY created_at ASC
 `
@@ -287,6 +307,8 @@ func (q *Queries) ListTurnsForSession(ctx context.Context, sessionID pgtype.UUID
 			&i.ReviewDepthDecision,
 			&i.DispatchedEventID,
 			&i.CostUsd,
+			&i.ReviewKnowledgeMode,
+			&i.ReviewKnowledgeDecision,
 		); err != nil {
 			return nil, err
 		}
@@ -448,7 +470,7 @@ SET status = $2,
     dispatched_sandbox_gen = COALESCE($5, dispatched_sandbox_gen),
     dispatched_event_id = COALESCE($6, dispatched_event_id)
 WHERE id = $1
-RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd
+RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision
 `
 
 type UpdateTurnStatusParams struct {
@@ -517,6 +539,8 @@ func (q *Queries) UpdateTurnStatus(ctx context.Context, arg UpdateTurnStatusPara
 		&i.ReviewDepthDecision,
 		&i.DispatchedEventID,
 		&i.CostUsd,
+		&i.ReviewKnowledgeMode,
+		&i.ReviewKnowledgeDecision,
 	)
 	return i, err
 }

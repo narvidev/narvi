@@ -611,6 +611,8 @@ func TestRetriggerReview_DeepToLight_StaysFloorAtDeep(t *testing.T) {
 		Shippable:         "auto",
 		SessionID:         session.ID,
 		ReviewPath:        &deepPath,
+		ArchDecisionTags:  []byte(`[]`),
+		ArchDecisionRoots: []byte(`[]`),
 	}); err != nil {
 		t.Fatalf("seed prior deep review verdict: %v", err)
 	}

@@ -1753,6 +1753,8 @@ type GithubPrSession struct {
 	PendingRetriggerHeadSha         *string            `json:"pending_retrigger_head_sha"`
 	AutoRetriggerCount              int32              `json:"auto_retrigger_count"`
 	AutoRetriggerBudgetNoticeSentAt pgtype.Timestamptz `json:"auto_retrigger_budget_notice_sent_at"`
+	PrMerged                        *bool              `json:"pr_merged"`
+	PrClosedAt                      pgtype.Timestamptz `json:"pr_closed_at"`
 }
 
 type HandoffSentinelRun struct {
@@ -2042,6 +2044,10 @@ type ReviewVerdict struct {
 	FactCheckKilled           *int32             `json:"fact_check_killed"`
 	DigestContestedPoints     *string            `json:"digest_contested_points"`
 	SuppressedInShadow        bool               `json:"suppressed_in_shadow"`
+	ArchDecisionTags          []byte             `json:"arch_decision_tags"`
+	ArchDecisionRoots         []byte             `json:"arch_decision_roots"`
+	KnowledgeMode             *string            `json:"knowledge_mode"`
+	KnowledgeInfluenced       bool               `json:"knowledge_influenced"`
 }
 
 type Sandbox struct {
@@ -2152,26 +2158,28 @@ type SlackThreadSession struct {
 }
 
 type Turn struct {
-	ID                   pgtype.UUID           `json:"id"`
-	SessionID            pgtype.UUID           `json:"session_id"`
-	Status               TurnStatus            `json:"status"`
-	ConversationID       *string               `json:"conversation_id"`
-	CreatedAt            pgtype.Timestamptz    `json:"created_at"`
-	DispatchedAt         pgtype.Timestamptz    `json:"dispatched_at"`
-	CompletedAt          pgtype.Timestamptz    `json:"completed_at"`
-	Prompt               *string               `json:"prompt"`
-	ModelID              *string               `json:"model_id"`
-	PlanMode             bool                  `json:"plan_mode"`
-	DispatchedSandboxGen *int32                `json:"dispatched_sandbox_gen"`
-	ProgressNotifiedAt   pgtype.Timestamptz    `json:"progress_notified_at"`
-	Effort               *string               `json:"effort"`
-	EpistemicOutcome     *TurnEpistemicOutcome `json:"epistemic_outcome"`
-	ReviewHeadSha        *string               `json:"review_head_sha"`
-	AnswerOnly           *bool                 `json:"answer_only"`
-	ReviewDepth          *string               `json:"review_depth"`
-	ReviewDepthDecision  []byte                `json:"review_depth_decision"`
-	DispatchedEventID    *int64                `json:"dispatched_event_id"`
-	CostUsd              pgtype.Numeric        `json:"cost_usd"`
+	ID                      pgtype.UUID           `json:"id"`
+	SessionID               pgtype.UUID           `json:"session_id"`
+	Status                  TurnStatus            `json:"status"`
+	ConversationID          *string               `json:"conversation_id"`
+	CreatedAt               pgtype.Timestamptz    `json:"created_at"`
+	DispatchedAt            pgtype.Timestamptz    `json:"dispatched_at"`
+	CompletedAt             pgtype.Timestamptz    `json:"completed_at"`
+	Prompt                  *string               `json:"prompt"`
+	ModelID                 *string               `json:"model_id"`
+	PlanMode                bool                  `json:"plan_mode"`
+	DispatchedSandboxGen    *int32                `json:"dispatched_sandbox_gen"`
+	ProgressNotifiedAt      pgtype.Timestamptz    `json:"progress_notified_at"`
+	Effort                  *string               `json:"effort"`
+	EpistemicOutcome        *TurnEpistemicOutcome `json:"epistemic_outcome"`
+	ReviewHeadSha           *string               `json:"review_head_sha"`
+	AnswerOnly              *bool                 `json:"answer_only"`
+	ReviewDepth             *string               `json:"review_depth"`
+	ReviewDepthDecision     []byte                `json:"review_depth_decision"`
+	DispatchedEventID       *int64                `json:"dispatched_event_id"`
+	CostUsd                 pgtype.Numeric        `json:"cost_usd"`
+	ReviewKnowledgeMode     *string               `json:"review_knowledge_mode"`
+	ReviewKnowledgeDecision []byte                `json:"review_knowledge_decision"`
 }
 
 type TurnStepCost struct {

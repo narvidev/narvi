@@ -326,6 +326,17 @@ type Registry struct {
 	// panic.
 	reviewDiffFetcher reviewcontext.Fetcher
 
+	// knowledgeRanker (§31.6/§34.7) orders whatever the automatic
+	// re-review lane's own arch-decisions gate admits (a.stores.
+	// reviewVerdict, which already satisfies reviewcontext.
+	// ArchDecisionsFetcher directly -- no separate field needed for the
+	// fetcher half) -- threaded through to every Actor this Registry
+	// hydrates exactly like reviewDiffFetcher above. Nil is a valid,
+	// common value (RegistryOptions.KnowledgeRanker's own doc comment):
+	// reviewcontext.FetchPriorArchDecisions degrades a nil ranker to
+	// knowledge.RecencyRanker{}, never a panic.
+	knowledgeRanker ports.KnowledgeRanker
+
 	// githubBotHandle is §24's own further addition -- the SAME
 	// configured bot/app username internal/adapters/inbound/github's own
 	// mention-pattern compiler already matches comment bodies against
@@ -518,6 +529,7 @@ func NewRegistry(
 		openCodeRuntimeVersion: openCodeRuntimeVersion,
 		diffFetcher:            diffFetcher,
 		reviewDiffFetcher:      opt.ReviewDiffFetcher,
+		knowledgeRanker:        opt.KnowledgeRanker,
 		githubBotHandle:        opt.GitHubBotHandle,
 		githubBotToken:         opt.GitHubBotToken,
 		reviewModelDeep:        opt.ReviewModelDeep,
@@ -548,6 +560,11 @@ type RegistryOptions struct {
 	// ReviewDiffFetcher is §24's own addition -- see Registry.
 	// reviewDiffFetcher's own doc comment.
 	ReviewDiffFetcher reviewcontext.Fetcher
+	// KnowledgeRanker (§31.6/§34.7) is Registry.knowledgeRanker's own
+	// doc comment -- knowledge.RecencyRanker{} (the public product's own
+	// default, controlplane.selectKnowledgeRanker's return value with no
+	// module composed) when nil.
+	KnowledgeRanker ports.KnowledgeRanker
 	// ReviewModelDeep is §26.3's own addition (§26.3): platform.Config.
 	// ReviewModelDeep, threaded through to reviewretrigger.go's own
 	// automatic re-review turn insert exactly like internal/adapters/
@@ -610,6 +627,24 @@ type RegistryOptions struct {
 // consumer in this package already does.
 func (r *Registry) Provider() ports.SandboxProvider {
 	return r.provider
+}
+
+// SetKnowledgeRanker sets this Registry's own knowledgeRanker AFTER
+// construction -- the one exception to every other RegistryOptions field's
+// "set once, at NewRegistry time, read-only forever after" convention,
+// needed because controlplane.Build's own knowledgeRanker (selectKnowledgeRanker's
+// return value, docs/design/boundaries-design.md section 2) is not
+// resolved until AFTER this Registry already exists: it depends on the
+// composed modules' own declared capabilities, computed later in that
+// SAME function for reasons unrelated to session-actor wiring. Safe to
+// call with no lock (mirroring every other field here, which is likewise
+// read without one): this Registry hydrates its first Actor only once
+// Run starts serving real traffic, strictly after Build (and therefore
+// this call) has already returned -- see hydrate.go's own
+// knowledgeRanker: r.knowledgeRanker copy for the one place this value is
+// ever read.
+func (r *Registry) SetKnowledgeRanker(ranker ports.KnowledgeRanker) {
+	r.knowledgeRanker = ranker
 }
 
 // GetOrSpawn returns the live local Actor for sessionID if this process

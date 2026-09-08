@@ -142,8 +142,13 @@ func CreateSessionForBot(ctx context.Context, pool *pgxpool.Pool, sessions *post
 // own REUSE-path caller" shape, one field further -- see
 // CreateTurnOptions.Effort/ReviewDepth/ReviewDepthDecision's own doc
 // comments (turn.go).
-func CreateTurnForBot(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, intentSvc *intentclassifier.Service, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, sessionID pgtype.UUID, prompt string, modelID *string, planMode bool, epistemicCheckDefault bool, actorUserID pgtype.UUID, reviewHeadSHA *string, classifyText *string, effort *string, reviewDepth *string, reviewDepthDecision []byte) (sqlcgen.Turn, error) {
-	created, _, cerr := createTurnLocked(ctx, pool, sessions, turns, plans, intentSvc, auditLog, registry, sessionID, prompt, modelID, planMode, epistemicCheckDefault, actorUserID, AlwaysQueue, CreateTurnOptions{ReviewHeadSHA: reviewHeadSHA, ClassifyText: classifyText, Effort: effort, ReviewDepth: reviewDepth, ReviewDepthDecision: reviewDepthDecision})
+//
+// reviewKnowledgeMode/reviewKnowledgeDecision (§31.2/§31.6) mirror
+// reviewDepth/reviewDepthDecision's own identical shape one field
+// further -- see CreateTurnOptions.ReviewKnowledgeMode/
+// ReviewKnowledgeDecision's own doc comment (turn.go).
+func CreateTurnForBot(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, intentSvc *intentclassifier.Service, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, sessionID pgtype.UUID, prompt string, modelID *string, planMode bool, epistemicCheckDefault bool, actorUserID pgtype.UUID, reviewHeadSHA *string, classifyText *string, effort *string, reviewDepth *string, reviewDepthDecision []byte, reviewKnowledgeMode *string, reviewKnowledgeDecision []byte) (sqlcgen.Turn, error) {
+	created, _, cerr := createTurnLocked(ctx, pool, sessions, turns, plans, intentSvc, auditLog, registry, sessionID, prompt, modelID, planMode, epistemicCheckDefault, actorUserID, AlwaysQueue, CreateTurnOptions{ReviewHeadSHA: reviewHeadSHA, ClassifyText: classifyText, Effort: effort, ReviewDepth: reviewDepth, ReviewDepthDecision: reviewDepthDecision, ReviewKnowledgeMode: reviewKnowledgeMode, ReviewKnowledgeDecision: reviewKnowledgeDecision})
 	if cerr != nil {
 		// %w, NOT %s (a follow-up fix, Finding 1): cerr's own
 		// Error() method returns exactly cerr.Message, so this produces the

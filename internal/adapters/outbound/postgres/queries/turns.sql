@@ -43,8 +43,18 @@
 -- §18.4's own precedent) is review_depth's own richer sibling --
 -- the full internal/domain/reviewtriage.DecisionRecord, JSON-marshaled by
 -- the caller (this query does no encoding of its own).
-INSERT INTO turns (session_id, status, prompt, model_id, plan_mode, effort, review_head_sha, answer_only, review_depth, review_depth_decision)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+--
+-- review_knowledge_mode/review_knowledge_decision (migrations/
+-- 000114_turns_review_knowledge_mode.up.sql,
+-- 000116_turns_review_knowledge_decision.up.sql, §31.2/§31.6) mirror
+-- review_depth/review_depth_decision's own identical shape two columns
+-- further: nil/absent for every non-review turn, set exactly once, at
+-- creation, by the SAME review-turn-creation paths.
+-- review_knowledge_decision is pre-marshaled JSON (internal/domain/
+-- knowledge.InjectedRecord) -- this core does no encoding of its own,
+-- mirroring review_depth_decision's own identical convention.
+INSERT INTO turns (session_id, status, prompt, model_id, plan_mode, effort, review_head_sha, answer_only, review_depth, review_depth_decision, review_knowledge_mode, review_knowledge_decision)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 RETURNING *;
 
 -- name: GetTurn :one

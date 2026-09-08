@@ -179,7 +179,7 @@ func TestInsert_AllTenPlaceholderTokensStrippedFromStoredDigest(t *testing.T) {
 		},
 	}
 
-	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, digest, reviewtriage.DepthDeep, review.CounterReviewDone, reviewpost.FactCheckDone, 0); err != nil {
+	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, digest, reviewtriage.DepthDeep, review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
 

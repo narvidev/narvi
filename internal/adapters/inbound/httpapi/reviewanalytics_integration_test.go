@@ -98,7 +98,7 @@ func TestGetReviewAnalytics_RendersComputedRollups(t *testing.T) {
 			{Decision: "Use a shared retry helper.", RejectedAlternative: "Inline retry logic per call site.", ConventionConformance: "Matches internal/platform's existing retry helper pattern."},
 		},
 	}
-	insertedRecord, err := appreviewverdict.Insert(ctx, rig.reviewVerdicts, narvipg.NewRepoSettingsStore(rig.pool), false, repoFullName, 7, "deadbeef", pgtype.UUID{}, verdict, seededDigest, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0)
+	insertedRecord, err := appreviewverdict.Insert(ctx, rig.reviewVerdicts, narvipg.NewRepoSettingsStore(rig.pool), false, repoFullName, 7, "deadbeef", pgtype.UUID{}, verdict, seededDigest, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false)
 	if err != nil {
 		t.Fatalf("seed review_verdicts row: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestGetReviewAnalytics_DigestContestationRate_ComputedFromDeepPathAndContes
 	}
 	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
 	digest := reviewpost.Digest{Summary: "Deep-path test-seeded verdict."}
-	if _, err := appreviewverdict.Insert(ctx, rig.reviewVerdicts, narvipg.NewRepoSettingsStore(rig.pool), false, repoFullName, 9, "deadbeef2", pgtype.UUID{}, verdict, digest, reviewtriage.DepthDeep, review.CounterReviewDone, reviewpost.FactCheckDone, 0); err != nil {
+	if _, err := appreviewverdict.Insert(ctx, rig.reviewVerdicts, narvipg.NewRepoSettingsStore(rig.pool), false, repoFullName, 9, "deadbeef2", pgtype.UUID{}, verdict, digest, reviewtriage.DepthDeep, review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false); err != nil {
 		t.Fatalf("seed deep-path review_verdicts row: %v", err)
 	}
 

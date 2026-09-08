@@ -74,6 +74,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
+	"github.com/narvidev/narvi/internal/domain/knowledge"
 	"github.com/narvidev/narvi/internal/domain/provenance"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/review"
@@ -323,6 +324,21 @@ func PostReviewVerdict(
 		var reviewDepth reviewtriage.ReviewDepth
 		var serverComputedChangedFiles int
 		var diffDelivered bool
+		var archDecisionTags, archDecisionRoots []string
+		// knowledgeMode/knowledgeInfluenced (§31.2/§31.7's own mode
+		// buffer and G5) mirror archDecisionTags/archDecisionRoots' own
+		// identical "read back from where the dispatching path stamped
+		// it" shape, immediately above: knowledgeMode is this SAME
+		// processing turn's own turns.review_knowledge_mode, forwarded
+		// verbatim; knowledgeInfluenced is derived, not forwarded --
+		// "this turn's prompt actually carried a prior-decisions block"
+		// iff its own turns.review_knowledge_decision record is
+		// non-empty. Both stay at their zero value (empty mode, not
+		// influenced) for every case that skips or fails the turn lookup
+		// below -- the safe direction: an un-attributable verdict is
+		// never wrongly stamped as knowledge-influenced.
+		var knowledgeMode string
+		var knowledgeInfluenced bool
 		// dispatchedSandboxGen/dispatchedEventID (§26.4/§7.1) are
 		// this SAME processing turn's own turns.dispatched_sandbox_gen/
 		// dispatched_event_id -- the sandbox gen this turn's prompt was
@@ -357,6 +373,18 @@ func PostReviewVerdict(
 			}
 			dispatchedSandboxGen = processingTurn.DispatchedSandboxGen
 			dispatchedEventID = processingTurn.DispatchedEventID
+			if processingTurn.ReviewKnowledgeMode != nil {
+				knowledgeMode = *processingTurn.ReviewKnowledgeMode
+			}
+			if len(processingTurn.ReviewKnowledgeDecision) > 0 {
+				var injected knowledge.InjectedRecord
+				if unmarshalErr := json.Unmarshal(processingTurn.ReviewKnowledgeDecision, &injected); unmarshalErr != nil {
+					logger.Warn("httpapi: review-verdict: unmarshal review_knowledge_decision failed, verdict will be stamped as not knowledge-influenced",
+						"error", unmarshalErr, "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
+				} else {
+					knowledgeInfluenced = !injected.Empty()
+				}
+			}
 			if len(processingTurn.ReviewDepthDecision) > 0 {
 				var decisionRecord reviewtriage.DecisionRecord
 				if unmarshalErr := json.Unmarshal(processingTurn.ReviewDepthDecision, &decisionRecord); unmarshalErr != nil {
@@ -365,6 +393,18 @@ func PostReviewVerdict(
 				} else {
 					serverComputedChangedFiles = decisionRecord.ChangedFilesCount
 					diffDelivered = !decisionRecord.DiffEmpty && !decisionRecord.DiffTruncated
+					// The gate's own key, read back from where the
+					// dispatching path stamped it rather than recomputed
+					// here: this endpoint never sees the PR's changed
+					// paths, only what the sandbox posts, and the one
+					// thing the gate must never key on is anything the
+					// model authored. An unmarshal failure above leaves
+					// both nil, so the verdict is stamped with no tags
+					// and no roots -- it becomes reachable only through
+					// the selector's recency fallback, never wrongly
+					// matched, which is the safe direction.
+					archDecisionTags = decisionRecord.ArchDecisionTags
+					archDecisionRoots = decisionRecord.ArchDecisionRoots
 				}
 			}
 		}
@@ -635,7 +675,7 @@ func PostReviewVerdict(
 		// an unpersisted verdict.
 		if verdictHeadSHA == "" {
 			logger.Warn("httpapi: review-verdict: no review head sha on record, skipping review_verdicts insert", "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
-		} else if _, insertErr := appreviewverdict.Insert(ctx, reviewVerdicts.WithTx(tx), repoSettings.WithTx(tx), platformShadow, prSession.RepoFullName, prSession.PrNumber, verdictHeadSHA, sessionID, verdict, input.Digest, reviewDepth, input.CounterReview, input.FactCheck, input.FactCheckKilled); insertErr != nil {
+		} else if _, insertErr := appreviewverdict.Insert(ctx, reviewVerdicts.WithTx(tx), repoSettings.WithTx(tx), platformShadow, prSession.RepoFullName, prSession.PrNumber, verdictHeadSHA, sessionID, verdict, input.Digest, reviewDepth, input.CounterReview, input.FactCheck, input.FactCheckKilled, archDecisionTags, archDecisionRoots, knowledgeMode, knowledgeInfluenced); insertErr != nil {
 			logger.Error("httpapi: review-verdict: insert review_verdicts row failed", "error", insertErr)
 			writeError(w, http.StatusInternalServerError, "internal error")
 			return

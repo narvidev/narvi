@@ -613,7 +613,7 @@ func TestRevalidateForMerge_LyingVerdictAgainstReal300FileSensitivePR(t *testing
 	if lyingVerdict.Shippable != review.ShippableAuto {
 		t.Fatalf("test setup: lyingVerdict.Shippable = %v, want auto", lyingVerdict.Shippable)
 	}
-	if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, lyingVerdict, reviewpost.Digest{Summary: "Test-seeded lying verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0); err != nil {
+	if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, lyingVerdict, reviewpost.Digest{Summary: "Test-seeded lying verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false); err != nil {
 		t.Fatalf("seed lying review_verdicts row: %v", err)
 	}
 

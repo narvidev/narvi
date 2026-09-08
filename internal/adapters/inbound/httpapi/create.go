@@ -110,6 +110,14 @@ type ChildSessionOptions struct {
 	// (turn.go) for the full "why".
 	ReviewDepth         *string
 	ReviewDepthDecision []byte
+
+	// ReviewKnowledgeMode/ReviewKnowledgeDecision (§31.2/§31.6) mirror
+	// ReviewDepth/ReviewDepthDecision's own identical shape immediately
+	// above -- see CreateTurnOptions.ReviewKnowledgeMode/
+	// ReviewKnowledgeDecision's own doc comment (turn.go) for the full
+	// "why".
+	ReviewKnowledgeMode     *string
+	ReviewKnowledgeDecision []byte
 }
 
 // childSessionOptionsFrom returns opts[0] if the caller supplied one, or
@@ -962,15 +970,17 @@ func CreateSessionOnTx(ctx context.Context, tx pgx.Tx, sessions *postgres.Sessio
 		// excludes per §20.3 exactly like every other caller.
 		firstTurnPrompt := turn.MaybeInjectEpistemicPreamble(epistemicCheckDefault, created.EpistemicCheckEnabled, req.PlanMode, *req.Prompt)
 		if _, err := turns.WithTx(tx).Create(ctx, sqlcgen.CreateTurnParams{
-			SessionID:           created.ID,
-			Status:              sqlcgen.TurnStatusPending,
-			Prompt:              &firstTurnPrompt,
-			ModelID:             (*string)(req.ModelId),
-			Effort:              (*string)(req.Effort),
-			PlanMode:            req.PlanMode,
-			ReviewHeadSha:       opts.ReviewHeadSHA,
-			ReviewDepth:         opts.ReviewDepth,
-			ReviewDepthDecision: opts.ReviewDepthDecision,
+			SessionID:               created.ID,
+			Status:                  sqlcgen.TurnStatusPending,
+			Prompt:                  &firstTurnPrompt,
+			ModelID:                 (*string)(req.ModelId),
+			Effort:                  (*string)(req.Effort),
+			PlanMode:                req.PlanMode,
+			ReviewHeadSha:           opts.ReviewHeadSHA,
+			ReviewDepth:             opts.ReviewDepth,
+			ReviewDepthDecision:     opts.ReviewDepthDecision,
+			ReviewKnowledgeMode:     opts.ReviewKnowledgeMode,
+			ReviewKnowledgeDecision: opts.ReviewKnowledgeDecision,
 		}); err != nil {
 			logger.Error("httpapi: create turn failed", "error", err)
 			return sqlcgen.Session{}, false, &CreateSessionError{Status: http.StatusInternalServerError, Message: "internal error"}

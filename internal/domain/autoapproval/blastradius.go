@@ -142,6 +142,28 @@ func ClassifyChangedPaths(paths []string) []review.Tag {
 	return out
 }
 
+// TagStrings converts tags (typically ClassifyChangedPaths' own return
+// value, above) into plain strings -- the JSON-serializable shape a
+// caller needs to persist tags OUTSIDE this package, e.g. internal/
+// domain/reviewtriage.DecisionRecord.ArchDecisionTags (this Step's own
+// §31.6 knowledge-gate carrier, riding turns.review_depth_decision) --
+// mirrors internal/app/reviewverdict's own identical marshalTags
+// conversion for review_verdicts.blast_radius one field over, and
+// NewDecisionRecord's own pre-existing inline conversion of
+// decision.MatchedSensitiveTags. nil in, nil out (never a
+// zero-length-but-non-nil slice), matching ClassifyChangedPaths' own
+// identical contract.
+func TagStrings(tags []review.Tag) []string {
+	if len(tags) == 0 {
+		return nil
+	}
+	out := make([]string, len(tags))
+	for i, t := range tags {
+		out[i] = string(t)
+	}
+	return out
+}
+
 // normalizeChangedPath trims a leading "/" (GitHub's own changed-file
 // paths never carry one, but a defensive normalization costs nothing) and
 // lower-cases the result -- every classifier in this file matches

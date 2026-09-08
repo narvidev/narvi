@@ -59,6 +59,24 @@ func unmarshalTags(raw []byte) []review.Tag {
 	return tags
 }
 
+// marshalStrings converts ss into JSONB bytes -- review_verdicts.
+// arch_decision_tags/arch_decision_roots's own shared wire shape
+// (migrations/000113: "JSONB, mirroring blast_radius's own... precedent"),
+// mirroring marshalTags' own identical "a nil/empty input always
+// marshals to '[]', never a JSON null" guarantee one function above --
+// both columns are NOT NULL DEFAULT '[]'::jsonb, and a bare
+// json.Marshal(ss) on a genuinely nil ss would encode the JSON scalar
+// null (a valid, non-NULL jsonb VALUE, but the wrong one: it would make
+// this row's own tags/roots unmatchable by the gate's own ?| operator in
+// a way indistinguishable from a real decode failure, rather than the
+// intended, honestly-empty "[]"). make's own "always non-nil, even at
+// length zero" property is what closes that gap with no extra branch.
+func marshalStrings(ss []string) ([]byte, error) {
+	out := make([]string, len(ss))
+	copy(out, ss)
+	return json.Marshal(out)
+}
+
 // recordFromRow converts a freshly-inserted-or-read sqlcgen.ReviewVerdict
 // into the pure reviewverdict.Record shape -- the one seam every domain-
 // layer analytics/eligibility caller in this package goes through, never

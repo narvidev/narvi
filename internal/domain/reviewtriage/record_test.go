@@ -13,7 +13,7 @@ func TestNewDecisionRecord(t *testing.T) {
 	decision := reviewtriage.Decide(sig, cfg)
 
 	t.Run("not floored", func(t *testing.T) {
-		got := reviewtriage.NewDecisionRecord(decision, cfg, decision.Depth, reviewtriage.Provenance{}, nil, nil, 0, false, false)
+		got := reviewtriage.NewDecisionRecord(decision, cfg, decision.Depth, reviewtriage.Provenance{}, nil, nil, 0, false, false, nil, nil)
 		want := reviewtriage.DecisionRecord{
 			Depth:                "deep",
 			Reason:               string(reviewtriage.ReasonSensitiveGlob),
@@ -33,7 +33,7 @@ func TestNewDecisionRecord(t *testing.T) {
 		lightDecision := reviewtriage.Decide(lightSig, cfg)
 		floored := reviewtriage.Floor(lightDecision.Depth, reviewtriage.DepthDeep)
 
-		got := reviewtriage.NewDecisionRecord(lightDecision, cfg, floored, reviewtriage.Provenance{}, nil, nil, 0, false, false)
+		got := reviewtriage.NewDecisionRecord(lightDecision, cfg, floored, reviewtriage.Provenance{}, nil, nil, 0, false, false, nil, nil)
 		if got.Depth != "deep" {
 			t.Errorf("Depth = %q, want deep", got.Depth)
 		}
@@ -50,7 +50,7 @@ func TestNewDecisionRecord(t *testing.T) {
 	t.Run("resolved model/effort recorded verbatim", func(t *testing.T) {
 		modelID := "anthropic/claude-frontier"
 		effort := reviewtriage.EffortHigh
-		got := reviewtriage.NewDecisionRecord(decision, cfg, decision.Depth, reviewtriage.Provenance{}, &modelID, &effort, 0, false, false)
+		got := reviewtriage.NewDecisionRecord(decision, cfg, decision.Depth, reviewtriage.Provenance{}, &modelID, &effort, 0, false, false, nil, nil)
 		if got.ResolvedModelID != modelID {
 			t.Errorf("ResolvedModelID = %q, want %q", got.ResolvedModelID, modelID)
 		}
@@ -60,7 +60,7 @@ func TestNewDecisionRecord(t *testing.T) {
 	})
 
 	t.Run("nil resolved model/effort records as empty, never a nil-pointer panic", func(t *testing.T) {
-		got := reviewtriage.NewDecisionRecord(decision, cfg, decision.Depth, reviewtriage.Provenance{}, nil, nil, 0, false, false)
+		got := reviewtriage.NewDecisionRecord(decision, cfg, decision.Depth, reviewtriage.Provenance{}, nil, nil, 0, false, false, nil, nil)
 		if got.ResolvedModelID != "" || got.ResolvedEffort != "" {
 			t.Errorf("ResolvedModelID/ResolvedEffort = %q/%q, want both empty", got.ResolvedModelID, got.ResolvedEffort)
 		}
@@ -71,14 +71,14 @@ func TestNewDecisionRecord(t *testing.T) {
 	// to carry it, unmodified, from turn-creation time to verdict-post
 	// time (DecisionRecord.ChangedFilesCount's own doc comment).
 	t.Run("changed files count recorded verbatim", func(t *testing.T) {
-		got := reviewtriage.NewDecisionRecord(decision, cfg, decision.Depth, reviewtriage.Provenance{}, nil, nil, 42, false, false)
+		got := reviewtriage.NewDecisionRecord(decision, cfg, decision.Depth, reviewtriage.Provenance{}, nil, nil, 42, false, false, nil, nil)
 		if got.ChangedFilesCount != 42 {
 			t.Errorf("ChangedFilesCount = %d, want 42", got.ChangedFilesCount)
 		}
 	})
 
 	t.Run("zero changed files count records as zero, indistinguishable from unset", func(t *testing.T) {
-		got := reviewtriage.NewDecisionRecord(decision, cfg, decision.Depth, reviewtriage.Provenance{}, nil, nil, 0, false, false)
+		got := reviewtriage.NewDecisionRecord(decision, cfg, decision.Depth, reviewtriage.Provenance{}, nil, nil, 0, false, false, nil, nil)
 		if got.ChangedFilesCount != 0 {
 			t.Errorf("ChangedFilesCount = %d, want 0", got.ChangedFilesCount)
 		}
@@ -90,7 +90,7 @@ func TestNewDecisionRecord(t *testing.T) {
 	// unmodified from turn-creation time to verdict-post time
 	// (DecisionRecord.DiffEmpty/DiffTruncated's own doc comment).
 	t.Run("diff-delivery facts recorded verbatim: diff empty", func(t *testing.T) {
-		got := reviewtriage.NewDecisionRecord(decision, cfg, decision.Depth, reviewtriage.Provenance{}, nil, nil, 0, true, false)
+		got := reviewtriage.NewDecisionRecord(decision, cfg, decision.Depth, reviewtriage.Provenance{}, nil, nil, 0, true, false, nil, nil)
 		if !got.DiffEmpty {
 			t.Error("DiffEmpty = false, want true")
 		}
@@ -100,7 +100,7 @@ func TestNewDecisionRecord(t *testing.T) {
 	})
 
 	t.Run("diff-delivery facts recorded verbatim: diff truncated", func(t *testing.T) {
-		got := reviewtriage.NewDecisionRecord(decision, cfg, decision.Depth, reviewtriage.Provenance{}, nil, nil, 0, false, true)
+		got := reviewtriage.NewDecisionRecord(decision, cfg, decision.Depth, reviewtriage.Provenance{}, nil, nil, 0, false, true, nil, nil)
 		if got.DiffEmpty {
 			t.Error("DiffEmpty = true, want false")
 		}
@@ -110,9 +110,33 @@ func TestNewDecisionRecord(t *testing.T) {
 	})
 
 	t.Run("diff fully delivered records both facts as false", func(t *testing.T) {
-		got := reviewtriage.NewDecisionRecord(decision, cfg, decision.Depth, reviewtriage.Provenance{}, nil, nil, 0, false, false)
+		got := reviewtriage.NewDecisionRecord(decision, cfg, decision.Depth, reviewtriage.Provenance{}, nil, nil, 0, false, false, nil, nil)
 		if got.DiffEmpty || got.DiffTruncated {
 			t.Errorf("DiffEmpty/DiffTruncated = %v/%v, want both false", got.DiffEmpty, got.DiffTruncated)
+		}
+	})
+
+	// §31.6: ArchDecisionTags/ArchDecisionRoots are carried onto the
+	// record VERBATIM -- this function does no classification of its
+	// own (the caller has already run autoapproval.ClassifyChangedPaths/
+	// ClassifyChangedRoots before calling this function), exactly like
+	// ChangedFilesCount/DiffEmpty/DiffTruncated above.
+	t.Run("arch-decision tags/roots recorded verbatim", func(t *testing.T) {
+		tags := []string{"auth", "migrations"}
+		roots := []string{"internal", "migrations"}
+		got := reviewtriage.NewDecisionRecord(decision, cfg, decision.Depth, reviewtriage.Provenance{}, nil, nil, 0, false, false, tags, roots)
+		if !reflect.DeepEqual(got.ArchDecisionTags, tags) {
+			t.Errorf("ArchDecisionTags = %v, want %v", got.ArchDecisionTags, tags)
+		}
+		if !reflect.DeepEqual(got.ArchDecisionRoots, roots) {
+			t.Errorf("ArchDecisionRoots = %v, want %v", got.ArchDecisionRoots, roots)
+		}
+	})
+
+	t.Run("nil arch-decision tags/roots record as nil, never a nil-pointer panic", func(t *testing.T) {
+		got := reviewtriage.NewDecisionRecord(decision, cfg, decision.Depth, reviewtriage.Provenance{}, nil, nil, 0, false, false, nil, nil)
+		if got.ArchDecisionTags != nil || got.ArchDecisionRoots != nil {
+			t.Errorf("ArchDecisionTags/ArchDecisionRoots = %v/%v, want both nil", got.ArchDecisionTags, got.ArchDecisionRoots)
 		}
 	})
 }

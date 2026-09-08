@@ -79,6 +79,8 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
 	appreviewtriage "github.com/narvidev/narvi/internal/app/reviewtriage"
+	"github.com/narvidev/narvi/internal/domain/autoapproval"
+	"github.com/narvidev/narvi/internal/domain/knowledge"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
@@ -152,6 +154,14 @@ type reviewRetriggerDecision struct {
 	reviewDepthDecisionJSON []byte
 	triageModelID           *string
 	triageEffort            *string
+
+	// knowledgeDecisionJSON (§31.6) is composeAutoRetriggerPrompt's own
+	// marshaled knowledge.InjectedRecord -- mirrors reviewDepthDecisionJSON's
+	// own identical "computed between phase 2 and phase 3" shape, one
+	// field over. Set only when composeAutoRetriggerPrompt actually runs
+	// (the Enqueue branch); nil otherwise, exactly like
+	// reviewDepthDecisionJSON.
+	knowledgeDecisionJSON []byte
 }
 
 type reviewRetriggerAction int
@@ -295,7 +305,14 @@ func (a *Actor) handleReviewRetriggerDebounceTimer(ctx context.Context) error {
 			if flooredDepth == domainreviewtriage.DepthDeep && a.reviewModelDeep == "" {
 				a.logger.Info("sessionactor: automatic re-review routed deep but no deep-tier model configured (NARVI_REVIEW_MODEL_DEEP unset), dispatching with the default model at forced high effort", "repo_full_name", decision.repoFullName, "pr_number", decision.prNumber)
 			}
-			if recordJSON, marshalErr := json.Marshal(domainreviewtriage.NewDecisionRecord(triageDecision, triageConfig, flooredDepth, triageProvenance, decision.triageModelID, decision.triageEffort, reviewCtx.ChangedFilesCount, reviewCtx.Diff == "", reviewCtx.DiffTruncated)); marshalErr != nil {
+			// (§31.6): computed once, reused both for the write-time
+			// stamp immediately below AND for the prior-decisions fetch
+			// composeAutoRetriggerPrompt performs -- see internal/
+			// adapters/inbound/github/handler.go's own identical addition
+			// for the full "why this carrier, why computed once" reasoning.
+			archTagStrings := autoapproval.TagStrings(autoapproval.ClassifyChangedPaths(reviewCtx.ChangedPaths))
+			archRoots := autoapproval.ClassifyChangedRoots(reviewCtx.ChangedPaths)
+			if recordJSON, marshalErr := json.Marshal(domainreviewtriage.NewDecisionRecord(triageDecision, triageConfig, flooredDepth, triageProvenance, decision.triageModelID, decision.triageEffort, reviewCtx.ChangedFilesCount, reviewCtx.Diff == "", reviewCtx.DiffTruncated, archTagStrings, archRoots)); marshalErr != nil {
 				a.logger.Warn("sessionactor: marshal review-depth decision record failed, turn will carry review_depth but no review_depth_decision", "error", marshalErr, "repo_full_name", decision.repoFullName, "pr_number", decision.prNumber)
 			} else {
 				decision.reviewDepthDecisionJSON = recordJSON
@@ -328,7 +345,7 @@ func (a *Actor) handleReviewRetriggerDebounceTimer(ctx context.Context) error {
 			// block's own doc comment) -- reviewCtx.DeepPath/
 			// ReviewCostBudgetUSD must already reflect the FLOORED depth
 			// this turn is about to persist before its own prompt renders.
-			prompt = a.composeAutoRetriggerPrompt(ctx, decision.repoFullName, decision.prNumber, reviewCtx)
+			prompt, decision.knowledgeDecisionJSON = a.composeAutoRetriggerPrompt(ctx, decision.repoFullName, decision.prNumber, reviewCtx, archTagStrings, archRoots)
 		}
 	}
 
@@ -697,15 +714,55 @@ func (a *Actor) reviewSessionHasAwaitingApprovalPlan(ctx context.Context, tx pgx
 // runs before that transaction ever opens, exactly like
 // fetchAutoRetriggerReviewContext's own live network fetch already does
 // for the same reason (this file's own top comment).
-func (a *Actor) composeAutoRetriggerPrompt(ctx context.Context, repoFullName string, prNumber int32, reviewCtx review.PreFetchedContext) string {
+// archTags/archRoots (§31.6) are the SAME server-derived gate key the
+// caller already computed (once) for the write-time stamp -- passed in
+// rather than recomputed here, mirroring reviewCtx itself. Returns the
+// composed prompt AND the marshaled knowledge.InjectedRecord (nil when
+// a.stores.reviewVerdict is nil, or on a marshal failure) for the caller
+// to persist onto decision.knowledgeDecisionJSON, exactly like
+// reviewDepthDecisionJSON's own identical "computed here, stored on
+// decision" shape.
+func (a *Actor) composeAutoRetriggerPrompt(ctx context.Context, repoFullName string, prNumber int32, reviewCtx review.PreFetchedContext, archTags, archRoots []string) (string, []byte) {
 	prompt := autoRetriggerPromptText
-	if advisory := reviewcontext.FetchFalsePositivePatterns(ctx, a.logger, a.stores.falsePositivePattern, repoFullName); advisory != "" {
+	advisory := reviewcontext.FetchFalsePositivePatterns(ctx, a.logger, a.stores.falsePositivePattern, repoFullName)
+	if advisory != "" {
 		prompt = advisory + prompt
 	}
+	// (§31.6 item 1): placed between the advisory and already-answered
+	// blocks above/below, mirroring the OTHER two review-turn producers'
+	// own identical relative ordering (handler.go, httpapi/
+	// reviewretrigger.go) -- still entirely before RenderTurnPrompt.
+	// a.stores.reviewVerdict already satisfies reviewcontext.
+	// ArchDecisionsFetcher directly (reviewverdictarchdecisions.go); no
+	// separate fetcher field needed on this Actor.
+	var knowledgeDecisionJSON []byte
+	var archBlock string
+	if a.stores.reviewVerdict != nil {
+		var injected knowledge.InjectedRecord
+		archBlock, injected = reviewcontext.FetchPriorArchDecisions(ctx, a.logger, a.stores.reviewVerdict, a.knowledgeRanker, a.timeouts, knowledge.Query{
+			RepoFullName: repoFullName,
+			Tags:         archTags,
+			Roots:        archRoots,
+			ChangedPaths: reviewCtx.ChangedPaths,
+			Title:        reviewCtx.Title,
+			PRNumber:     prNumber,
+		})
+		if archBlock != "" {
+			prompt = archBlock + prompt
+		}
+		if recJSON, marshalErr := json.Marshal(injected); marshalErr != nil {
+			a.logger.Warn("sessionactor: marshal knowledge injected-ids record failed, turn will carry review_knowledge_mode but no review_knowledge_decision", "error", marshalErr, "repo_full_name", repoFullName, "pr_number", prNumber)
+		} else {
+			knowledgeDecisionJSON = recJSON
+		}
+	}
+	// (§31.2's own "instrumented trigger"): the token gauge, mirrors
+	// handler.go's own identical call site.
+	reviewcontext.RecordKnowledgeBlockTokens(ctx, advisory, archBlock)
 	if alreadyAnswered := reviewcontext.FetchAlreadyAnswered(ctx, a.logger, a.stores.reviewFinding, repoFullName, prNumber, reviewCtx.ChangedPaths, reviewCtx.DiffTruncated); alreadyAnswered != "" {
 		prompt = alreadyAnswered + prompt
 	}
-	return review.RenderTurnPrompt(prompt, reviewCtx)
+	return review.RenderTurnPrompt(prompt, reviewCtx), knowledgeDecisionJSON
 }
 
 // insertAutoRetriggerTurn is §24.3 step 4's own turn creation -- CANNOT
@@ -782,16 +839,22 @@ func (a *Actor) insertAutoRetriggerTurn(ctx context.Context, tx pgx.Tx, decision
 	if decision.finalReviewDepth != "" {
 		reviewDepth = &decision.finalReviewDepth
 	}
+	// knowledgeMode (§31.2) is unconditionally knowledge.ModeA today --
+	// see that constant's own doc comment for why (the admin-facing
+	// mode switch does not exist yet).
+	knowledgeMode := knowledge.ModeA
 	created, err := a.stores.turn.WithTx(tx).Create(ctx, sqlcgen.CreateTurnParams{
-		SessionID:           a.sessionID,
-		Status:              sqlcgen.TurnStatusPending,
-		Prompt:              &prompt,
-		ModelID:             decision.triageModelID,
-		Effort:              decision.triageEffort,
-		PlanMode:            false,
-		ReviewHeadSha:       &headSHA,
-		ReviewDepth:         reviewDepth,
-		ReviewDepthDecision: decision.reviewDepthDecisionJSON,
+		SessionID:               a.sessionID,
+		Status:                  sqlcgen.TurnStatusPending,
+		Prompt:                  &prompt,
+		ModelID:                 decision.triageModelID,
+		Effort:                  decision.triageEffort,
+		PlanMode:                false,
+		ReviewHeadSha:           &headSHA,
+		ReviewDepth:             reviewDepth,
+		ReviewDepthDecision:     decision.reviewDepthDecisionJSON,
+		ReviewKnowledgeMode:     &knowledgeMode,
+		ReviewKnowledgeDecision: decision.knowledgeDecisionJSON,
 	})
 	if err != nil {
 		return fmt.Errorf("sessionactor: insert automatic re-review turn: %w", err)

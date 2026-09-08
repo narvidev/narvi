@@ -254,7 +254,7 @@ func seedAutoApprovedVerdict(ctx context.Context, t *testing.T, pool *pgxpool.Po
 	// caller uses (migrations/000105's own doc comment) -- this fixture
 	// does not need to promote repoFullName to live for that read to see
 	// it, unlike internal/app/automerge's own seedEligiblePR.
-	if _, err := appreviewverdict.Insert(ctx, store, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0); err != nil {
+	if _, err := appreviewverdict.Insert(ctx, store, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false); err != nil {
 		t.Fatalf("seed auto-approved review_verdicts row for %s#%d: %v", repoFullName, prNumber, err)
 	}
 }

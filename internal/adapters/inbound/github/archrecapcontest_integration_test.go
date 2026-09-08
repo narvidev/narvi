@@ -89,7 +89,7 @@ func seedDeepVerdictWithArchDecisions(ctx context.Context, t *testing.T, reviewV
 		AdequacyExplanation: "matches the diff",
 		ArchDecisions:       decisions,
 	}
-	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, digest, "deep", review.CounterReviewDone, reviewpost.FactCheckDone, 0); err != nil {
+	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, digest, "deep", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false); err != nil {
 		t.Fatalf("seed deep review_verdicts row: %v", err)
 	}
 }

@@ -126,6 +126,47 @@ type DecisionRecord struct {
 	// this canary must never confidently fire on an unknown.
 	DiffEmpty     bool `json:"diffEmpty,omitempty"`
 	DiffTruncated bool `json:"diffTruncated,omitempty"`
+
+	// ArchDecisionTags/ArchDecisionRoots (technical plan §31.6, the
+	// knowledge-retrieval gate both mode A and mode B share) are this
+	// SAME turn's own review.PreFetchedContext.ChangedPaths, run through
+	// autoapproval.ClassifyChangedPaths/ClassifyChangedRoots at the
+	// IDENTICAL point ChangedFilesCount (immediately above) is captured
+	// -- carried here for the IDENTICAL reason: a value computed at
+	// turn-CREATION time (where the diff fetch that produces ChangedPaths
+	// already runs) that would otherwise have no way to reach verdict-
+	// POST time (internal/app/reviewverdict.Insert, which stamps them
+	// onto review_verdicts.arch_decision_tags/arch_decision_roots,
+	// migrations/000113) short of a new dedicated turns column pair --
+	// deliberately not done, riding this already-threaded carrier
+	// instead, exactly the "shape to follow" §31.6 itself names for this
+	// very field: "turns.review_depth_decision's own already-stored
+	// 'distinct roots' is the shape to follow". Unlike DistinctRoots
+	// (an int, feeding ONLY this package's own depth-routing threshold),
+	// these two are the actual root/tag STRING sets a later gate query
+	// overlaps against -- reviewtriage.Decide never reads either field,
+	// exactly like it never reads ChangedFilesCount: this package is a
+	// pure, unwitting CARRIER for a fact a different domain (internal/
+	// domain/knowledge) owns the meaning of, not a producer or consumer
+	// of it.
+	//
+	// Plain []string, never []review.Tag or a knowledge-package type:
+	// this package's own doc.go fixes its import surface, and the
+	// CALLER (which already imports both autoapproval and this package)
+	// converts before calling NewDecisionRecord, mirroring how
+	// MatchedSensitiveTags above is built from decision.MatchedSensitiveTags
+	// as plain strings for the identical reason.
+	//
+	// nil for every turn that predates this field, or whose own diff
+	// fetch degraded to no ChangedPaths at all (ClassifyChangedPaths/
+	// ClassifyChangedRoots' own "nil in, nil out" contract) --
+	// indistinguishable from "this PR's diff touched nothing classifiable
+	// -- an empty set is always a safe, conservative gate input (it can
+	// only ever fail an overlap match, never fabricate a false one), the
+	// SAME reasoning migrations/000113's own NOT NULL DEFAULT '[]'::jsonb
+	// polarity already encodes for the column these two fields feed.
+	ArchDecisionTags  []string `json:"archDecisionTags,omitempty"`
+	ArchDecisionRoots []string `json:"archDecisionRoots,omitempty"`
 }
 
 // Provenance is internal/app/reviewtriage.ResolveProvenance's own return
@@ -159,7 +200,15 @@ type Provenance struct {
 // calls this function (Diff/ChangedFilesCount are what Decide's own
 // Signals were themselves built from, one call earlier) -- all passed
 // straight through, never re-derived.
-func NewDecisionRecord(decision Decision, cfg Config, finalDepth ReviewDepth, provenance Provenance, resolvedModelID, resolvedEffort *string, changedFilesCount int, diffEmpty, diffTruncated bool) DecisionRecord {
+//
+// archDecisionTags/archDecisionRoots (§31.6) are DecisionRecord.
+// ArchDecisionTags/ArchDecisionRoots' own doc comment's identical
+// carried-verbatim value -- the caller has already computed them, via
+// autoapproval.ClassifyChangedPaths/ClassifyChangedRoots over this SAME
+// turn's own ChangedPaths, before calling this function; this function
+// does no classification of its own, exactly like it does no depth
+// classification of its own for resolvedModelID/resolvedEffort.
+func NewDecisionRecord(decision Decision, cfg Config, finalDepth ReviewDepth, provenance Provenance, resolvedModelID, resolvedEffort *string, changedFilesCount int, diffEmpty, diffTruncated bool, archDecisionTags, archDecisionRoots []string) DecisionRecord {
 	tags := make([]string, len(decision.MatchedSensitiveTags))
 	for i, t := range decision.MatchedSensitiveTags {
 		tags[i] = string(t)
@@ -186,5 +235,7 @@ func NewDecisionRecord(decision Decision, cfg Config, finalDepth ReviewDepth, pr
 		ChangedFilesCount:    changedFilesCount,
 		DiffEmpty:            diffEmpty,
 		DiffTruncated:        diffTruncated,
+		ArchDecisionTags:     archDecisionTags,
+		ArchDecisionRoots:    archDecisionRoots,
 	}
 }

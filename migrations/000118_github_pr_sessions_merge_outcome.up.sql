@@ -1,0 +1,44 @@
+-- github_pr_sessions.pr_merged/pr_closed_at (§31.7's own G4 --
+-- "quarantine/promotion as first-class persisted state": the
+-- eligibility condition for the one type this corpus admits,
+-- arch-decision, is "merged + quarantine age + zero contestations" --
+-- and merge-outcome capture is what arms the "merged" half of that
+-- condition for every verdict this deployment produces going forward.
+--
+-- Captured from the GitHub `pull_request` webhook's own "closed" action
+-- (the SAME event type internal/adapters/inbound/github/pullrequestevent.go
+-- already parses for the sentinel-auto-fix merge gate, and
+-- pullrequestsynchronize.go already parses for "synchronize" -- this is
+-- that event's own THIRD action, dispatched the same "one generic
+-- pull_request handler, switching on action" way) -- never re-derived,
+-- never polled: GitHub reports both facts directly on the SAME payload
+-- that announces the close.
+--
+-- pr_merged BOOLEAN, nullable: NULL means "not yet observed closed at
+-- all" (the common case, and every row that predates this pair of
+-- columns); true/false, once set, is GitHub's own authoritative
+-- pull_request.merged field at the moment it closed -- true for a real
+-- merge, false for a close-without-merge. Never flips back to NULL.
+--
+-- pr_closed_at TIMESTAMPTZ, nullable, set alongside pr_merged from the
+-- SAME payload's own pull_request.closed_at -- the timestamp a future
+-- quarantine-age calculation (G4's own "quarantine age" condition,
+-- deferred to the corpus Step that actually ingests against it) measures
+-- from, never the time this webhook happened to be delivered/processed.
+--
+-- No backfill (a forcing fact this design already accepts elsewhere,
+-- e.g. plan_documents/migrations/000112's own irreversible pre-Step
+-- loss): a PR that closed before this pair of columns existed has no
+-- retroactive way to learn its own outcome from Postgres alone, and nothing
+-- here re-derives it from GitHub's own API after the fact -- both columns
+-- simply stay NULL for that PR forever, correctly read as "outcome
+-- unknown", never as "still open" or "closed without merging".
+--
+-- Guarded, in the query that sets these (RecordMergeOutcome, queries/
+-- githubprsessions.sql), on session_id IS NOT NULL -- mirrors
+-- UpsertPendingRetriggerHeadSHA's own identical guard one column family
+-- over: a github_pr_sessions row with no session ever attached was never
+-- actually reviewed, so it has no verdicts for this outcome to arm
+-- eligibility for in the first place.
+ALTER TABLE github_pr_sessions ADD COLUMN pr_merged BOOLEAN;
+ALTER TABLE github_pr_sessions ADD COLUMN pr_closed_at TIMESTAMPTZ;

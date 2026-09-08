@@ -254,6 +254,8 @@ func TestComputeDecision_PriorHighVerdict_RoutesDeep(t *testing.T) {
 		DocsDrift:         "none",
 		ProposedShippable: "auto",
 		Shippable:         "auto",
+		ArchDecisionTags:  []byte(`[]`),
+		ArchDecisionRoots: []byte(`[]`),
 	}); err != nil {
 		t.Fatalf("seed prior high-risk review verdict: %v", err)
 	}
