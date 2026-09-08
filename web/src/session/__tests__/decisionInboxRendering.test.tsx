@@ -46,6 +46,10 @@ function baseItem(overrides: Partial<DecisionInboxItem> = {}): DecisionInboxItem
     isHandoff: null,
     hasApprovingReview: null,
     hasChangesRequested: null,
+    isRelease: null,
+    manifestFindingsCount: null,
+    manifestCoveragePartial: null,
+    aggregateReviewTriggered: null,
     planId: null,
     sessionId: null,
     failureReason: null,
@@ -176,6 +180,44 @@ describe('DecisionInboxRow -- htmlUrl is the ONLY field that becomes an href, an
     const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
     expect(html).not.toContain('href=""')
     expect(html).toContain('link unavailable')
+  })
+})
+
+// OpenReviewLink/OpenReleaseReviewLink both render a TanStack Router
+// <Link>, which -- like ApprovePlanButton's own identical <Link> above --
+// needs a real RouterProvider/router context this file's own
+// renderToStaticMarkup harness does not provide (this file's own top
+// comment on the adversarial-title sweep explains why the plan shape is
+// excluded for the identical reason). Every case below therefore holds
+// sessionId at its default null, which is exactly the branch that must
+// NEVER attempt to render either Link: a null sessionId means the server
+// found no review session for this PR, and DecisionInboxRow falls back to
+// OpenOnGitHubLink instead -- proving that fallback fires (and no Link
+// is attempted) is exactly what CAN be proven at this render layer
+// without a router; that a REAL sessionId instead renders a working
+// review link is covered by decisionInboxFormat.test.ts's own rowKind
+// coverage and by the backend's own wire-level tests (aggregate_
+// integration_test.go, decisioninbox_integration_test.go).
+describe('DecisionInboxRow -- a PR-shaped row with no resolvable review session falls back to the external GitHub link', () => {
+  it('a needs_review PR row with sessionId=null renders "Open on GitHub", never attempts the review-screen Link', () => {
+    const item = prItem({ kind: 'needs_review', sessionId: null, htmlUrl: 'https://github.com/acme/widgets/pull/100' })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).toContain('Open on GitHub')
+    expect(html).not.toContain('Open review')
+  })
+
+  it('a release-cut row with sessionId=null ALSO falls back to the external GitHub link', () => {
+    const item = prItem({ kind: 'needs_review', isRelease: true, sessionId: null, htmlUrl: 'https://github.com/acme/widgets/pull/200' })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).toContain('Open on GitHub')
+    expect(html).not.toContain('Open release review')
+  })
+
+  it('a release-cut row renders its own manifest chip, never the ordinary PR risk/CI chips', () => {
+    const item = prItem({ kind: 'needs_review', isRelease: true, manifestFindingsCount: 2, riskLabel: 'review:high-risk', ciGreen: true })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).toContain('manifest: 2 flags')
+    expect(html).not.toContain('review: high risk')
   })
 })
 

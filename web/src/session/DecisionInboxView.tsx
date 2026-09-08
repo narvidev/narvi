@@ -61,6 +61,7 @@ import {
   formatDecisionLatencySeconds,
   prChipData,
   provenanceText,
+  releaseChipData,
   rowKeyFor,
   rowKind,
   SECTION_ORDER,
@@ -95,10 +96,50 @@ function OpenOnGitHubLink({ htmlUrl }: { htmlUrl: string | null }) {
   )
 }
 
+/**
+ * OpenReviewLink navigates into Narvi's own code-review screen for the
+ * review session sessionId names -- ONLY ever rendered when the server
+ * has already resolved a real session id for THIS exact PR
+ * (DecisionInboxItem.sessionId's own doc comment), so this never links to
+ * a screen that 400s at click time. A PR Narvi has never reviewed still
+ * falls back to OpenOnGitHubLink instead (see DecisionInboxRow below) --
+ * the honest "stays external" outcome for a row this client cannot offer
+ * a working in-app action for.
+ */
+function OpenReviewLink({ sessionId }: { sessionId: string }) {
+  return (
+    <Link to="/session/$sessionId/review" params={{ sessionId }} className="btn" style={{ textDecoration: 'none' }}>
+      Open review →
+    </Link>
+  )
+}
+
+/** OpenReleaseReviewLink is OpenReviewLink's own release-cut sibling, linking into the release-review screen instead -- same "only ever rendered with a real, server-resolved session id" guarantee. */
+function OpenReleaseReviewLink({ sessionId }: { sessionId: string }) {
+  return (
+    <Link to="/session/$sessionId/release-review" params={{ sessionId }} className="btn" style={{ textDecoration: 'none' }}>
+      Open release review →
+    </Link>
+  )
+}
+
 function PrChips({ item }: { item: DecisionInboxItem }) {
   return (
     <>
       {prChipData(item).map((chip) => (
+        <span key={chip.text} className={`chip ${chip.tone}`}>
+          <span className="dot" />
+          {chip.text}
+        </span>
+      ))}
+    </>
+  )
+}
+
+function ReleaseChips({ item }: { item: DecisionInboxItem }) {
+  return (
+    <>
+      {releaseChipData(item).map((chip) => (
         <span key={chip.text} className={`chip ${chip.tone}`}>
           <span className="dot" />
           {chip.text}
@@ -275,6 +316,7 @@ export function DecisionInboxRow({ item, canMerge }: { item: DecisionInboxItem; 
       </span>
 
       {(kind === 'pr' || kind === 'handoff') && <PrChips item={item} />}
+      {kind === 'release' && <ReleaseChips item={item} />}
       {kind === 'plan' && (
         <span className="chip warn">
           <span className="dot" />
@@ -314,7 +356,21 @@ export function DecisionInboxRow({ item, canMerge }: { item: DecisionInboxItem; 
       </span>
 
       {item.kind === 'ready_to_merge' && <MergeButton item={item} canMerge={canMerge} />}
-      {kind === 'pr' && item.kind === 'needs_review' && <OpenOnGitHubLink htmlUrl={item.htmlUrl} />}
+      {/*
+        Open review links into Narvi's own code-review screen, but ONLY
+        when the server has already resolved a real review session for
+        THIS exact PR (item.sessionId's own doc comment) -- a PR Narvi has
+        never been mentioned on falls back to the external GitHub link
+        instead, exactly like before this row could ever carry a session
+        id at all. This never offers an action that fails: the id, when
+        present, always names a session GetReviewReadout can actually
+        serve.
+      */}
+      {kind === 'pr' &&
+        item.kind === 'needs_review' &&
+        (item.sessionId !== null ? <OpenReviewLink sessionId={item.sessionId} /> : <OpenOnGitHubLink htmlUrl={item.htmlUrl} />)}
+      {kind === 'release' &&
+        (item.sessionId !== null ? <OpenReleaseReviewLink sessionId={item.sessionId} /> : <OpenOnGitHubLink htmlUrl={item.htmlUrl} />)}
       {kind === 'handoff' && <OpenOnGitHubLink htmlUrl={item.htmlUrl} />}
       {kind === 'plan' && item.sessionId !== null && item.planId !== null && <ApprovePlanButton sessionId={item.sessionId} planId={item.planId} />}
       {kind === 'session' && item.sessionId !== null && <ResumeSessionButton sessionId={item.sessionId} />}

@@ -51,6 +51,27 @@ WHERE repo_full_name = $1 AND pr_number = $2;
 SELECT * FROM github_pr_sessions
 WHERE session_id = $1;
 
+-- name: GetGitHubPRSessionByRepoAndPRNumber :one
+-- The FORWARD, non-locking, non-claiming read this table's own primary
+-- key already supports for free but which, before the decision inbox's
+-- own "open review" action needed it, had no plain SELECT of its own --
+-- every existing forward-direction query (EnsureGitHubPRSessionRow/
+-- LockGitHubPRSessionForUpdate/SetGitHubPRSessionID above) is part of
+-- §8.2's own atomic first-mention CLAIM sequence and must run inside that
+-- one transaction, with LockGitHubPRSessionForUpdate's own FOR UPDATE
+-- serializing every concurrent claimant for the same PR behind it. A
+-- caller that only wants to READ "does a review session already exist
+-- for this PR, and if so which one" -- decisioninbox.buildPROpenItem,
+-- deciding whether a PR-shaped row can link to Narvi's own review readout
+-- instead of GitHub -- has no claim to make and must never take that
+-- lock itself (it would needlessly serialize behind, or itself block, a
+-- real concurrent @mention claim for the same PR). pgx.ErrNoRows means
+-- exactly what it means at GetGitHubPRSessionBySessionID above: Narvi has
+-- never been mentioned on this PR, so there is no review session to
+-- link to -- a common, legitimate negative, never an error.
+SELECT * FROM github_pr_sessions
+WHERE repo_full_name = $1 AND pr_number = $2;
+
 -- SetGitHubPRSessionHeadSHA (and pending_head_sha, migrations/000068) is
 -- REMOVED as of migrations/000072_turns_review_head_sha.up.sql (§21
 -- review finding C2, CRITICAL, fixed) -- superseded by turns.
