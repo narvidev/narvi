@@ -85,6 +85,7 @@ import (
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
 	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // reviewAutoRetriggerBudget is §24.6's own per-PR budget on the AUTOMATIC
@@ -843,6 +844,15 @@ func (a *Actor) insertAutoRetriggerTurn(ctx context.Context, tx pgx.Tx, decision
 	// see that constant's own doc comment for why (the admin-facing
 	// mode switch does not exist yet).
 	knowledgeMode := knowledge.ModeA
+	// correlationID (§12.2 item 1's own session-rail gap, migrations/
+	// 000121_turns_correlation_id.up.sql): the debounce timer firing here
+	// carries no live request of its own, so this is nil (an honest "no
+	// request context") unless a caller further up the stack happened to
+	// leave one on ctx -- never invented.
+	var correlationID *string
+	if id, ok := platform.CorrelationIDFromContext(ctx); ok && id != "" {
+		correlationID = &id
+	}
 	created, err := a.stores.turn.WithTx(tx).Create(ctx, sqlcgen.CreateTurnParams{
 		SessionID:               a.sessionID,
 		Status:                  sqlcgen.TurnStatusPending,
@@ -855,6 +865,7 @@ func (a *Actor) insertAutoRetriggerTurn(ctx context.Context, tx pgx.Tx, decision
 		ReviewDepthDecision:     decision.reviewDepthDecisionJSON,
 		ReviewKnowledgeMode:     &knowledgeMode,
 		ReviewKnowledgeDecision: decision.knowledgeDecisionJSON,
+		CorrelationID:           correlationID,
 	})
 	if err != nil {
 		return fmt.Errorf("sessionactor: insert automatic re-review turn: %w", err)

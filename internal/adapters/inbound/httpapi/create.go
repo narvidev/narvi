@@ -969,6 +969,13 @@ func CreateSessionOnTx(ctx context.Context, tx pgx.Tx, sessions *postgres.Sessio
 		// request sees it take effect on this exact first turn. req.PlanMode
 		// excludes per §20.3 exactly like every other caller.
 		firstTurnPrompt := turn.MaybeInjectEpistemicPreamble(epistemicCheckDefault, created.EpistemicCheckEnabled, req.PlanMode, *req.Prompt)
+		// correlationID (§12.2 item 1's own session-rail gap, migrations/
+		// 000121_turns_correlation_id.up.sql): this request's own id, when
+		// the ingress that created it minted one.
+		var correlationID *string
+		if id, ok := platform.CorrelationIDFromContext(ctx); ok && id != "" {
+			correlationID = &id
+		}
 		if _, err := turns.WithTx(tx).Create(ctx, sqlcgen.CreateTurnParams{
 			SessionID:               created.ID,
 			Status:                  sqlcgen.TurnStatusPending,
@@ -981,6 +988,7 @@ func CreateSessionOnTx(ctx context.Context, tx pgx.Tx, sessions *postgres.Sessio
 			ReviewDepthDecision:     opts.ReviewDepthDecision,
 			ReviewKnowledgeMode:     opts.ReviewKnowledgeMode,
 			ReviewKnowledgeDecision: opts.ReviewKnowledgeDecision,
+			CorrelationID:           correlationID,
 		}); err != nil {
 			logger.Error("httpapi: create turn failed", "error", err)
 			return sqlcgen.Session{}, false, &CreateSessionError{Status: http.StatusInternalServerError, Message: "internal error"}

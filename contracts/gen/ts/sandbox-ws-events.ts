@@ -40,6 +40,14 @@ export interface Ready {
   sessionId: string;
   gen: number;
   timestamp: string;
+  /**
+   * §12.2 item 1's own runtime-fingerprint gap (§5.3's own boot fingerprint, sandboxboot.BootFingerprint.AgentVersion): this gen's own sandbox-agent binary version. Always a real, non-empty string -- 'dev' when NARVI_AGENT_VERSION is unset (no build-time version-stamping pipeline exists yet), never omitted.
+   */
+  agentVersion: string;
+  /**
+   * §12.2 item 1's own runtime-fingerprint gap (sandboxboot.BootFingerprint.ImageDigest): this gen's own sandbox image digest. Always a real, non-empty string -- 'unknown' when NARVI_IMAGE_DIGEST is unset (a documented, honest gap: no mechanism yet injects it into a spawned sandbox), never omitted.
+   */
+  imageDigest: string;
 }
 /**
  * §6.1: every 30s; carries conversation id + last_boot_phase so liveness (last_seen_at, §3.2) and turn-resume state stay current even with no other traffic.

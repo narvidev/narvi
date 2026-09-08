@@ -92,6 +92,36 @@ describe('AutomationRow rendering -- adversarial name/prompt stays text, never m
   })
 })
 
+// §12.2 item 4's own health-column success ratio: the ratio
+// only replaces the plain "active" status chip when there is no active
+// failure streak and no pause -- AutomationsView.tsx's own three-way
+// branch (paused / strikes / else), unchanged by this addition except
+// for what the "else" branch itself renders.
+describe('AutomationRow health column -- the §12.2 item 4 success ratio', () => {
+  it('renders the real ratio when runHealth is present', () => {
+    const html = withQueryClient(<AutomationRow automation={baseAutomation({ runHealth: { succeededRuns: 47, terminalRuns: 48 } })} canManage={false} />)
+    expect(html).toContain('47/48 ok')
+  })
+
+  it('falls back to the plain status chip when runHealth is null -- an honest "no runs yet", never a fabricated 0/0', () => {
+    const html = withQueryClient(<AutomationRow automation={baseAutomation({ runHealth: null })} canManage={false} />)
+    expect(html).not.toContain('/0 ok')
+    expect(html).toContain('active')
+  })
+
+  it('a strike in progress still wins over a real runHealth ratio -- the mockup never shows both at once', () => {
+    const html = withQueryClient(<AutomationRow automation={baseAutomation({ consecutiveFailures: 2, runHealth: { succeededRuns: 10, terminalRuns: 12 } })} canManage={false} />)
+    expect(html).toContain('strikes before auto-pause')
+    expect(html).not.toContain('10/12 ok')
+  })
+
+  it('a paused automation still wins over a real runHealth ratio', () => {
+    const html = withQueryClient(<AutomationRow automation={baseAutomation({ status: 'paused', runHealth: { succeededRuns: 10, terminalRuns: 12 } })} canManage={false} />)
+    expect(html).toContain('auto-paused')
+    expect(html).not.toContain('10/12 ok')
+  })
+})
+
 describe('RunRow rendering -- adversarial target.name stays text, never markup, and never becomes a link', () => {
   it('a hostile run.target.name renders as text', () => {
     const html = withQueryClient(<RunRow invocation={baseInvocation()} run={baseRun({ target: { name: XSS_SCRIPT, url: 'https://github.com/acme/widgets', branch: null } })} />)

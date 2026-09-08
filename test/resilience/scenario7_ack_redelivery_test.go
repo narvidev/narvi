@@ -552,7 +552,7 @@ func runAckRedeliveryCase(t *testing.T, h *Harness, backendWsURL string, tc ackR
 		SandboxToken:      "scenario7-test-token", // any non-empty value: token_hash is NULL on a freshly created sandbox row (verifySandboxToken's own documented nil-hash bridge).
 		SessionId:         sessionID.String(),
 	}
-	bridge := wsbridge.New(sc, "sbx-scenario7-"+tc.eventType, noopCommandHandler{},
+	bridge := wsbridge.New(sc, "sbx-scenario7-"+tc.eventType, "test-agent-version", "test-image-digest", noopCommandHandler{},
 		ackTestDialTimeout, ackTestHeartbeat, ackTestMinBackoff, ackTestMaxBackoff)
 
 	runCtx, cancel := context.WithCancel(ctx)

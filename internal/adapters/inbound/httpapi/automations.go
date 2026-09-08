@@ -49,6 +49,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -86,7 +87,13 @@ func parseAutomationID(w http.ResponseWriter, r *http.Request) (pgtype.UUID, boo
 // here (a bearer credential, returned in plaintext exactly once, at
 // creation, mirroring MintWSToken's own identical convention) -- this
 // function has no field for it at all.
-func automationToDTO(a sqlcgen.Automation) restdtos.Automation {
+//
+// runHealth is resolved by the caller (ListAutomations/GetAutomation, a
+// single batched ListRunHealthForAutomations query rather than one query
+// per row) and passed through verbatim -- nil means this automation has
+// never had a terminal run (§12.2 item 4's own gap, an honest "no runs
+// yet" rather than a fabricated 0/0).
+func automationToDTO(a sqlcgen.Automation, runHealth *restdtos.AutomationRunHealth) restdtos.Automation {
 	var prompt *string
 	if a.Prompt != nil {
 		prompt = a.Prompt
@@ -153,7 +160,55 @@ func automationToDTO(a sqlcgen.Automation) restdtos.Automation {
 		LastRunAt:             lastRunAt,
 		LastRunStatus:         lastRunStatus,
 		ArtifactSummary:       a.ArtifactSummary,
+		RunHealth:             runHealth,
 	}
+}
+
+// runHealthDTO converts one sqlcgen.ListRunHealthForAutomationsRow into
+// its wire shape -- the one place both lookupRunHealth (single row) and
+// lookupRunHealthBatch (many rows, below) build a restdtos.
+// AutomationRunHealth, so the two never drift.
+func runHealthDTO(row sqlcgen.ListRunHealthForAutomationsRow) *restdtos.AutomationRunHealth {
+	return &restdtos.AutomationRunHealth{
+		SucceededRuns: int(row.SucceededRuns),
+		TerminalRuns:  int(row.TerminalRuns),
+	}
+}
+
+// lookupRunHealth resolves ONE automation's own §12.2 item 4 health ratio
+// -- nil (never an error) when this id has no terminal runs at all yet,
+// exactly like ListRunHealthForAutomations' own generated doc comment
+// describes. Used by every single-automation response (Get/Pause/Resume/
+// Rotate/Revoke) -- ListAutomations below uses the batched form instead,
+// one query for the whole page rather than one per row.
+func lookupRunHealth(ctx context.Context, runs *postgres.AutomationRunStore, automationID pgtype.UUID) (*restdtos.AutomationRunHealth, error) {
+	rows, err := runs.ListRunHealth(ctx, []pgtype.UUID{automationID})
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	return runHealthDTO(rows[0]), nil
+}
+
+// lookupRunHealthBatch resolves §12.2 item 4's own health ratio for EVERY
+// id in automationIDs in one query -- the ListAutomations page-load path,
+// where issuing lookupRunHealth per row would mean N extra round trips
+// for a page of N automations. Returns a map keyed by the row's own
+// String() id (sqlcgen.Automation.ID.String(), the same key
+// automationToDTO's own caller already has in hand) -- an id absent from
+// the map has no terminal runs, mirrors lookupRunHealth's own nil.
+func lookupRunHealthBatch(ctx context.Context, runs *postgres.AutomationRunStore, automationIDs []pgtype.UUID) (map[string]*restdtos.AutomationRunHealth, error) {
+	rows, err := runs.ListRunHealth(ctx, automationIDs)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[string]*restdtos.AutomationRunHealth, len(rows))
+	for _, row := range rows {
+		byID[row.AutomationID.String()] = runHealthDTO(row)
+	}
+	return byID, nil
 }
 
 // CreateAutomation backs POST /api/automations (§8.4). 403 if the
@@ -297,7 +352,9 @@ func CreateAutomation(automations *postgres.AutomationStore) http.HandlerFunc {
 		}
 
 		writeJSON(w, http.StatusCreated, restdtos.CreateAutomationResponse{
-			Automation:   automationToDTO(created),
+			// runHealth is nil directly, no query: a row this handler just
+			// inserted moments ago cannot have any automation_runs yet.
+			Automation:   automationToDTO(created, nil),
 			WebhookToken: webhookToken,
 		})
 	}
@@ -435,7 +492,7 @@ func buildTriggerConfig(triggerType domainautomation.TriggerType, raw *json.RawM
 // automation doesn't exist; 200 with restdtos.Automation otherwise. No
 // extra RBAC beyond "must be logged in" -- see this file's own top doc
 // comment for why.
-func GetAutomation(automations *postgres.AutomationStore) http.HandlerFunc {
+func GetAutomation(automations *postgres.AutomationStore, runs *postgres.AutomationRunStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		logger := platform.Logger(ctx)
@@ -456,7 +513,14 @@ func GetAutomation(automations *postgres.AutomationStore) http.HandlerFunc {
 			return
 		}
 
-		writeJSON(w, http.StatusOK, automationToDTO(a))
+		health, err := lookupRunHealth(ctx, runs, id)
+		if err != nil {
+			logger.Error("httpapi: lookup automation run health failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+
+		writeJSON(w, http.StatusOK, automationToDTO(a, health))
 	}
 }
 
@@ -469,7 +533,7 @@ func GetAutomation(automations *postgres.AutomationStore) http.HandlerFunc {
 // file's own top doc comment); either query param absent means "no
 // filter" for that dimension. An unrecognized status value is a 400, not
 // a silently-ignored filter.
-func ListAutomations(automations *postgres.AutomationStore) http.HandlerFunc {
+func ListAutomations(automations *postgres.AutomationStore, runs *postgres.AutomationRunStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		logger := platform.Logger(ctx)
@@ -507,9 +571,20 @@ func ListAutomations(automations *postgres.AutomationStore) http.HandlerFunc {
 			return
 		}
 
+		ids := make([]pgtype.UUID, len(rows))
+		for i, row := range rows {
+			ids[i] = row.ID
+		}
+		health, err := lookupRunHealthBatch(ctx, runs, ids)
+		if err != nil {
+			logger.Error("httpapi: batch lookup automation run health failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+
 		wire := make([]restdtos.Automation, len(rows))
 		for i, row := range rows {
-			wire[i] = automationToDTO(row)
+			wire[i] = automationToDTO(row, health[row.ID.String()])
 		}
 		writeJSON(w, http.StatusOK, restdtos.ListAutomationsResponse{Automations: wire})
 	}
@@ -524,7 +599,7 @@ func ListAutomations(automations *postgres.AutomationStore) http.HandlerFunc {
 // guard makes both cases indistinguishable from a plain row lookup, so
 // this handler does a separate existence check first to give a genuine
 // "not found" a distinct message from "already paused").
-func PauseAutomation(automations *postgres.AutomationStore) http.HandlerFunc {
+func PauseAutomation(automations *postgres.AutomationStore, runs *postgres.AutomationRunStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		logger := platform.Logger(ctx)
@@ -558,14 +633,21 @@ func PauseAutomation(automations *postgres.AutomationStore) http.HandlerFunc {
 			return
 		}
 
-		writeJSON(w, http.StatusOK, automationToDTO(a))
+		health, err := lookupRunHealth(ctx, runs, id)
+		if err != nil {
+			logger.Error("httpapi: lookup automation run health failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+
+		writeJSON(w, http.StatusOK, automationToDTO(a, health))
 	}
 }
 
 // ResumeAutomation backs POST /api/automations/{automationID}/resume --
 // applies internal/domain/automation.TriggerResume. Same existence-check-
 // then-CAS shape as PauseAutomation immediately above.
-func ResumeAutomation(automations *postgres.AutomationStore) http.HandlerFunc {
+func ResumeAutomation(automations *postgres.AutomationStore, runs *postgres.AutomationRunStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		logger := platform.Logger(ctx)
@@ -599,7 +681,14 @@ func ResumeAutomation(automations *postgres.AutomationStore) http.HandlerFunc {
 			return
 		}
 
-		writeJSON(w, http.StatusOK, automationToDTO(a))
+		health, err := lookupRunHealth(ctx, runs, id)
+		if err != nil {
+			logger.Error("httpapi: lookup automation run health failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+
+		writeJSON(w, http.StatusOK, automationToDTO(a, health))
 	}
 }
 
@@ -618,7 +707,7 @@ func ResumeAutomation(automations *postgres.AutomationStore) http.HandlerFunc {
 // webhook-triggered automation -- rotating a token that could never have
 // existed in the first place is a conflict, not a silent success); 200
 // with restdtos.RotateAutomationWebhookTokenResponse otherwise.
-func RotateAutomationWebhookToken(automations *postgres.AutomationStore) http.HandlerFunc {
+func RotateAutomationWebhookToken(automations *postgres.AutomationStore, runs *postgres.AutomationRunStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		logger := platform.Logger(ctx)
@@ -671,8 +760,15 @@ func RotateAutomationWebhookToken(automations *postgres.AutomationStore) http.Ha
 			return
 		}
 
+		health, err := lookupRunHealth(ctx, runs, id)
+		if err != nil {
+			logger.Error("httpapi: lookup automation run health failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+
 		writeJSON(w, http.StatusOK, restdtos.RotateAutomationWebhookTokenResponse{
-			Automation:   automationToDTO(a),
+			Automation:   automationToDTO(a, health),
 			WebhookToken: token,
 		})
 	}
@@ -688,7 +784,7 @@ func RotateAutomationWebhookToken(automations *postgres.AutomationStore) http.Ha
 // effect. 403 if the caller fails authz.ActionManageAutomations; 404 if the
 // automation doesn't exist; 200 with the updated restdtos.Automation
 // otherwise (no plaintext token to ever return here, unlike rotate/create).
-func RevokeAutomationWebhookToken(automations *postgres.AutomationStore) http.HandlerFunc {
+func RevokeAutomationWebhookToken(automations *postgres.AutomationStore, runs *postgres.AutomationRunStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		logger := platform.Logger(ctx)
@@ -718,6 +814,13 @@ func RevokeAutomationWebhookToken(automations *postgres.AutomationStore) http.Ha
 			return
 		}
 
-		writeJSON(w, http.StatusOK, automationToDTO(a))
+		health, err := lookupRunHealth(ctx, runs, id)
+		if err != nil {
+			logger.Error("httpapi: lookup automation run health failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+
+		writeJSON(w, http.StatusOK, automationToDTO(a, health))
 	}
 }

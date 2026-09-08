@@ -1,0 +1,23 @@
+-- §12.2 item 1's session rail also names a "correlation id" alongside the
+-- runtime fingerprint (migrations/000120) and, until now, could only ever
+-- render "not reported yet" for it: correlation_id is a PER-REQUEST
+-- concept (internal/platform/correlation.go, §5.3: "minted at ingress,
+-- propagated: webhook -> CP -> provider -> sandbox-agent -> OpenCode
+-- wrapper -> back"), already persisted onto audit_log/outbox/
+-- automation_runs rows, but never onto anything a session's own rail
+-- could read back.
+--
+-- Deliberately a column on TURNS, not sandboxes: a sandbox's own
+-- fingerprint is one fact for its whole gen (migrations/000120's own doc
+-- comment), but a correlation id belongs to the REQUEST that dispatched
+-- ONE turn -- a session's sandbox lives across many turns, each with its
+-- own, potentially different, originating request. Nullable and set
+-- ONCE, at turn-creation time, from whatever correlation id (if any) the
+-- creating request's own context carried -- mirrors review_head_sha/
+-- review_depth/answer_only's own identical "nil/absent for every existing
+-- call site, set exactly once at creation" shape (queries/turns.sql's own
+-- doc comment chain). The rail reads the SESSION's own most recently
+-- created turn's value back -- "what request is/was this session's
+-- sandbox last talking to" -- never a stored, and therefore potentially
+-- stale, per-sandbox fact.
+ALTER TABLE turns ADD COLUMN correlation_id TEXT;

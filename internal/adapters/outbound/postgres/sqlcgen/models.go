@@ -1755,14 +1755,17 @@ type GithubPrSession struct {
 	AutoRetriggerBudgetNoticeSentAt pgtype.Timestamptz `json:"auto_retrigger_budget_notice_sent_at"`
 	PrMerged                        *bool              `json:"pr_merged"`
 	PrClosedAt                      pgtype.Timestamptz `json:"pr_closed_at"`
+	MentionCount                    int32              `json:"mention_count"`
 }
 
 type HandoffSentinelRun struct {
-	ID           pgtype.UUID        `json:"id"`
-	RepoFullName string             `json:"repo_full_name"`
-	PrNumber     int32              `json:"pr_number"`
-	SessionID    pgtype.UUID        `json:"session_id"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	ID                   pgtype.UUID        `json:"id"`
+	RepoFullName         string             `json:"repo_full_name"`
+	PrNumber             int32              `json:"pr_number"`
+	SessionID            pgtype.UUID        `json:"session_id"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	ContractDriftFlagged bool               `json:"contract_drift_flagged"`
+	TodoCount            int32              `json:"todo_count"`
 }
 
 type Identity struct {
@@ -2069,6 +2072,8 @@ type Sandbox struct {
 	PendingPushSuppressedInShadow *bool              `json:"pending_push_suppressed_in_shadow"`
 	PendingPushCancelled          bool               `json:"pending_push_cancelled"`
 	DemotionTerminateRequestedAt  pgtype.Timestamptz `json:"demotion_terminate_requested_at"`
+	AgentVersion                  *string            `json:"agent_version"`
+	ImageDigest                   *string            `json:"image_digest"`
 }
 
 type SandboxHistory struct {
@@ -2180,6 +2185,7 @@ type Turn struct {
 	CostUsd                 pgtype.Numeric        `json:"cost_usd"`
 	ReviewKnowledgeMode     *string               `json:"review_knowledge_mode"`
 	ReviewKnowledgeDecision []byte                `json:"review_knowledge_decision"`
+	CorrelationID           *string               `json:"correlation_id"`
 }
 
 type TurnStepCost struct {

@@ -3,8 +3,9 @@
 // lastSeenAt): the WS subscribe reply's own `state.sandbox`
 // (internal/adapters/inbound/wshub/client.go's own sandboxWireMap,
 // verified directly against that Go source -- `{id, gen, status,
-// lastSeenAt, createdAt, updatedAt}`, deliberately excluding
-// tokenHash/providerId/spawnFailureCount/lastSpawnFailureAt, proven by
+// lastSeenAt, createdAt, updatedAt, agentVersion, imageDigest}`,
+// deliberately excluding tokenHash/providerId/spawnFailureCount/
+// lastSpawnFailureAt, proven by
 // TestClientHandler_SubscribedPayloadExcludesSandboxTokenHash). No REST
 // endpoint exposes this at all (GET /api/sessions/:id/`sandboxStatus` is
 // always null on the single-session view by design -- Session.
@@ -29,6 +30,10 @@ export interface SandboxSnapshot {
   lastSeenAt: string | null
   createdAt: string
   updatedAt: string
+  /** §12.2 item 1's own runtime-fingerprint gap: this gen's own sandbox-agent binary version, or null until this gen's own first "ready" event reports it (or after a respawn resets it, client.go's own UpsertSandboxForSpawn doc comment). */
+  agentVersion: string | null
+  /** Pairs with agentVersion -- this gen's own sandbox image digest, same null-until-ready/reset-on-respawn shape. */
+  imageDigest: string | null
 }
 
 /**
@@ -42,9 +47,20 @@ export interface SandboxSnapshot {
  */
 export function parseSandboxSnapshot(raw: unknown): SandboxSnapshot | null {
   if (!isPlainObject(raw)) return null
-  const { id, gen, status, lastSeenAt, createdAt, updatedAt } = raw
+  const { id, gen, status, lastSeenAt, createdAt, updatedAt, agentVersion, imageDigest } = raw
   if (typeof id !== 'string' || typeof gen !== 'number' || typeof status !== 'string') return null
   if (typeof createdAt !== 'string' || typeof updatedAt !== 'string') return null
   if (lastSeenAt !== null && typeof lastSeenAt !== 'string') return null
-  return { id, gen, status, lastSeenAt: lastSeenAt ?? null, createdAt, updatedAt }
+  if (agentVersion !== null && agentVersion !== undefined && typeof agentVersion !== 'string') return null
+  if (imageDigest !== null && imageDigest !== undefined && typeof imageDigest !== 'string') return null
+  return {
+    id,
+    gen,
+    status,
+    lastSeenAt: lastSeenAt ?? null,
+    createdAt,
+    updatedAt,
+    agentVersion: agentVersion ?? null,
+    imageDigest: imageDigest ?? null,
+  }
 }

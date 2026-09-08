@@ -14,12 +14,20 @@ func TestSandboxEventsRoundTrip(t *testing.T) {
 	sch := compileSchema(t, "sandbox-ws/v1/events.schema.json", "")
 
 	t.Run("Ready", func(t *testing.T) {
+		// AgentVersion/ImageDigest (§12.2 item 1's own runtime-fingerprint
+		// gap) are given real, non-empty sample values deliberately -- a
+		// zero-value "" would round-trip trivially (Go's own string zero
+		// value marshals as a present, schema-valid empty string) without
+		// ever proving a REAL value survives the marshal/validate/unmarshal
+		// cycle intact.
 		roundTrip(t, sch, sandboxws.Ready{
-			Type:      "ready",
-			MessageId: "e1",
-			SessionId: testSessionID,
-			Gen:       1,
-			Timestamp: testTimestamp,
+			Type:         "ready",
+			MessageId:    "e1",
+			SessionId:    testSessionID,
+			Gen:          1,
+			Timestamp:    testTimestamp,
+			AgentVersion: "v1.4.2",
+			ImageDigest:  "sha256:9f31c00abcdef",
 		})
 	})
 

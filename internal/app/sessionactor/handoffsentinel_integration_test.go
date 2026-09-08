@@ -91,6 +91,22 @@ func countHandoffSentinelRuns(ctx context.Context, t *testing.T, pool *pgxpool.P
 	return count
 }
 
+// getHandoffSentinelRunSummary reads back contract_drift_flagged/
+// todo_count (§12.2 item 2's own "handoff-readiness display" gap,
+// migrations/000123_handoff_sentinel_runs_summary.up.sql) for one claim
+// row -- t.Fatal if the row does not exist (callers already know it
+// should, via countHandoffSentinelRuns immediately above).
+func getHandoffSentinelRunSummary(ctx context.Context, t *testing.T, pool *pgxpool.Pool, repoFullName string, prNumber int) (contractDriftFlagged bool, todoCount int) {
+	t.Helper()
+	if err := pool.QueryRow(ctx,
+		`SELECT contract_drift_flagged, todo_count FROM handoff_sentinel_runs WHERE repo_full_name = $1 AND pr_number = $2`,
+		repoFullName, prNumber,
+	).Scan(&contractDriftFlagged, &todoCount); err != nil {
+		t.Fatalf("get handoff_sentinel_runs summary: %v", err)
+	}
+	return contractDriftFlagged, todoCount
+}
+
 func scopedProvenanceTag() *string {
 	tag := provenance.ScopedEnvironment
 	return &tag
@@ -166,6 +182,14 @@ func TestHandoffSentinel_ScopedPR_DriftAndTODOs_PostsCommentAndLabel(t *testing.
 
 	if got := countHandoffSentinelRuns(ctx, t, pool, "acme/"+repoName, 77); got != 1 {
 		t.Errorf("handoff_sentinel_runs row count = %d, want 1", got)
+	}
+	// §12.2 item 2's own "handoff-readiness display" gap: the SAME
+	// contractDrifted/todos values that decided this run posted at all
+	// (both real here -- seeded drift + the diff's one TODO line above)
+	// must land on the claim row itself, not just in the rendered comment
+	// body this test already checks below.
+	if driftFlagged, todoCount := getHandoffSentinelRunSummary(ctx, t, pool, "acme/"+repoName, 77); !driftFlagged || todoCount != 1 {
+		t.Errorf("handoff_sentinel_runs summary = (contractDriftFlagged=%v, todoCount=%d), want (true, 1)", driftFlagged, todoCount)
 	}
 
 	payload := getOutboxPayloadForSessionKind(ctx, t, pool, sessionID, string(ports.NotificationKindHandoffSentinel))

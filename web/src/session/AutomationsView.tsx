@@ -44,7 +44,7 @@ import { createAutomation, listAutomationInvocations, listAutomations, resumeAut
 import { ApiError } from '../api/http'
 import { automationQueryKeys } from '../api/queryKeys'
 import { meQueryOptions } from '../auth/session'
-import { AUTO_PAUSE_THRESHOLD, automationStatusTone, lastRunTone, nextRunSummary, runStatusTone, targetsSummary, triggerSummary } from './automationFormat'
+import { AUTO_PAUSE_THRESHOLD, automationStatusTone, lastRunTone, nextRunSummary, runHealthLabel, runStatusTone, targetsSummary, triggerSummary } from './automationFormat'
 import { formatRelativeTime } from './relativeTime'
 import { truncateForDisplay } from './textSafety'
 
@@ -173,6 +173,8 @@ export function AutomationRow({ automation, canManage }: { automation: Automatio
             <span className="strike">
               ▲ {automation.consecutiveFailures}/{AUTO_PAUSE_THRESHOLD} strikes before auto-pause
             </span>
+          ) : runHealthLabel(automation.runHealth) !== null ? (
+            <span className="num">{runHealthLabel(automation.runHealth)}</span>
           ) : (
             <span className={`chip ${automationStatusTone(automation.status)}`}>
               <span className="dot" />

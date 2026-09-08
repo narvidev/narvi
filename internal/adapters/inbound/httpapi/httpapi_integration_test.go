@@ -226,6 +226,11 @@ type testRig struct {
 	reviewFindings *narvipg.ReviewFindingStore
 	sentinelFixes  *narvipg.SentinelFixStore
 
+	// handoffSentinelRuns (§14.4, §12.2 item 2's own "handoff-readiness
+	// display" gap) backs this rig's own review-readout route's
+	// handoffReadiness field (reviewreadout_integration_test.go).
+	handoffSentinelRuns *narvipg.HandoffSentinelStore
+
 	// falsePositivePatterns ("review: learned false-positive
 	// patterns", §22.2/§22.3/§22.4) backs this rig's own advisory-
 	// injection/lifecycle behavior on the retrigger and verdict-posting
@@ -428,6 +433,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		rolloutMode:           platform.RolloutModeOpen,
 		reviewFindings:        narvipg.NewReviewFindingStore(pool),
 		sentinelFixes:         narvipg.NewSentinelFixStore(pool),
+		handoffSentinelRuns:   narvipg.NewHandoffSentinelStore(pool),
 		falsePositivePatterns: narvipg.NewFalsePositivePatternStore(pool),
 		reviewVerdicts:        narvipg.NewReviewVerdictStore(pool),
 		automations:           narvipg.NewAutomationStore(pool),
@@ -495,6 +501,27 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		m(&rig)
 	}
 
+	// reviewVerdictDeps (§21.1/§21.2) is built fresh here, from stores this
+	// rig already constructs elsewhere (rig.reviewVerdicts/rig.reviewFindings)
+	// plus two one-off stores no other route in this rig needs -- mirrors
+	// cmd/control-plane/main.go's own identical bundle, never a second,
+	// independently-maintained Deps shape. Declared here, before router
+	// construction, so both the /api/sessions block's own review-readout
+	// route and the review-analytics/repo-settings routes further down can
+	// share this SAME value.
+	reviewVerdictDeps := appreviewverdict.Deps{
+		ReviewVerdicts:       rig.reviewVerdicts,
+		RepoSettings:         rig.repoSettings,
+		ReviewFindings:       rig.reviewFindings,
+		AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(rig.pool),
+		// DigestSectionFeedback (§26.5) backs
+		// appreviewverdict.DigestContestationRate -- the SAME one-off
+		// "constructed inline, no dedicated rig field" treatment
+		// AutoApprovalOutcomes immediately above already gets.
+		DigestSectionFeedback: narvipg.NewReviewDigestSectionFeedbackStore(rig.pool),
+		Timeouts:              platform.DefaultTimeouts(),
+	}
+
 	router := chi.NewRouter()
 	// OIDC discovery + JWKS (§27.3) -- mounted PUBLICLY,
 	// UNAUTHENTICATED, exactly like cmd/control-plane/main.go's own real
@@ -545,6 +572,14 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		// (unconfigured) -- no test in this package needs a specific
 		// deep-tier model id, only the depth decision itself.
 		r.Post("/{sessionID}/review/retrigger", httpapi.RetriggerReview(rig.pool, rig.sessions, rig.turns, rig.plans, rig.auditLog, rig.registry, rig.prSessions, rig.diffFetcher, rig.reviewFindings, rig.falsePositivePatterns, rig.reviewVerdicts, nil, rig.botToken, platform.DefaultTimeouts(), appreviewtriage.Deps{RepoSettings: rig.repoSettings, ReviewVerdicts: rig.reviewVerdicts}, ""))
+		// review readout (§26.1's merge readout, §12.2 item 2) -- see
+		// reviewreadout.go's own doc comment. rig.diffFetcher/rig.
+		// positionResolver default nil, mirroring review/retrigger's own
+		// identical precedent immediately above (both nil-safe by
+		// construction); a test exercising the live-fetch title/visualQa
+		// path or the relocation fallback overrides them via newTestRig's
+		// own mutate func.
+		r.Get("/{sessionID}/review", httpapi.GetReviewReadout(rig.sessions, rig.prSessions, reviewVerdictDeps, rig.reviewFindings, rig.turns, rig.diffFetcher, rig.positionResolver, rig.sentinelFixes, rig.handoffSentinelRuns, rig.botToken, platform.DefaultTimeouts()))
 		// review/findings/{identityHash}/rebut + apply-suggestion (§8.2)
 		// -- see reviewfindings.go's own doc comment.
 		r.Post("/{sessionID}/review/findings/{identityHash}/rebut", httpapi.RebutReviewFinding(rig.sessions, rig.prSessions, rig.reviewFindings, rig.auditLog))
@@ -684,25 +719,10 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 	})
 	// /api/repos/{owner}/{repo}/settings (§8.2) -- mounted behind
 	// auth.Middleware, exactly like cmd/control-plane/main.go's own wiring
-	// (see reposettings.go's own doc comment).
-	//
-	// reviewVerdictDeps (§21.1/§21.2) is built fresh here, from
-	// stores this rig already constructs elsewhere (rig.reviewVerdicts/
-	// rig.reviewFindings) plus two one-off stores no other route in this
-	// rig needs -- mirrors cmd/control-plane/main.go's own identical
-	// bundle, never a second, independently-maintained Deps shape.
-	reviewVerdictDeps := appreviewverdict.Deps{
-		ReviewVerdicts:       rig.reviewVerdicts,
-		RepoSettings:         rig.repoSettings,
-		ReviewFindings:       rig.reviewFindings,
-		AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(rig.pool),
-		// DigestSectionFeedback (§26.5) backs
-		// appreviewverdict.DigestContestationRate -- the SAME one-off
-		// "constructed inline, no dedicated rig field" treatment
-		// AutoApprovalOutcomes immediately above already gets.
-		DigestSectionFeedback: narvipg.NewReviewDigestSectionFeedbackStore(rig.pool),
-		Timeouts:              platform.DefaultTimeouts(),
-	}
+	// (see reposettings.go's own doc comment). reviewVerdictDeps is built
+	// once, near this function's own top (see its own doc comment there)
+	// -- shared with the /api/sessions block's own review-readout route
+	// above, and with review-analytics below.
 	router.Route("/api/repos/{owner}/{repo}/settings", func(r chi.Router) {
 		r.Use(auth.Middleware(rig.userSessions, rig.users))
 		r.Get("/", httpapi.GetRepoSettings(rig.repoSettings, reviewVerdictDeps, rig.prSessions))
@@ -943,13 +963,13 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 	router.Route("/api/automations", func(r chi.Router) {
 		r.Use(auth.Middleware(rig.userSessions, rig.users))
 		r.Post("/", httpapi.CreateAutomation(rig.automations))
-		r.Get("/", httpapi.ListAutomations(rig.automations))
-		r.Get("/{automationID}", httpapi.GetAutomation(rig.automations))
+		r.Get("/", httpapi.ListAutomations(rig.automations, rig.automationRuns))
+		r.Get("/{automationID}", httpapi.GetAutomation(rig.automations, rig.automationRuns))
 		r.Get("/{automationID}/invocations", httpapi.ListAutomationInvocations(rig.automations, rig.automationInvocations, rig.automationRuns))
-		r.Post("/{automationID}/pause", httpapi.PauseAutomation(rig.automations))
-		r.Post("/{automationID}/resume", httpapi.ResumeAutomation(rig.automations))
-		r.Post("/{automationID}/webhook-token", httpapi.RotateAutomationWebhookToken(rig.automations))
-		r.Delete("/{automationID}/webhook-token", httpapi.RevokeAutomationWebhookToken(rig.automations))
+		r.Post("/{automationID}/pause", httpapi.PauseAutomation(rig.automations, rig.automationRuns))
+		r.Post("/{automationID}/resume", httpapi.ResumeAutomation(rig.automations, rig.automationRuns))
+		r.Post("/{automationID}/webhook-token", httpapi.RotateAutomationWebhookToken(rig.automations, rig.automationRuns))
+		r.Delete("/{automationID}/webhook-token", httpapi.RevokeAutomationWebhookToken(rig.automations, rig.automationRuns))
 	})
 	// /webhooks/automations/{automationID} -- mounted OUTSIDE auth.Middleware
 	// entirely, exactly like cmd/control-plane/main.go's own real wiring

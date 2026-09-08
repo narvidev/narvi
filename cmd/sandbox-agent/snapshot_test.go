@@ -166,7 +166,7 @@ func newTestBridgeHandler(ctx context.Context, t *testing.T, fcp *fakeSnapshotCP
 	timeouts := platform.DefaultTimeouts()
 
 	handler := &commandHandler{runCtx: ctx, cfg: boot.Config{SessionConfig: &cfg, CredentialCacheDir: credentialCacheDir}, timeouts: timeouts}
-	bridge := wsbridge.New(cfg, "sbx-1", handler,
+	bridge := wsbridge.New(cfg, "sbx-1", "test-agent-version", "test-image-digest", handler,
 		timeouts.SandboxWSDialTimeout, timeouts.SandboxWSHeartbeatInterval,
 		timeouts.SandboxWSReconnectMinBackoff, timeouts.SandboxWSReconnectMaxBackoff)
 	handler.bridge = bridge

@@ -164,7 +164,7 @@ func TestHandlePrompt_RunsFullSubstitutionChainInOrder(t *testing.T) {
 	// connection is needed for SendCritical/SendBestEffort/
 	// SetConversationID to behave as safe no-ops (see this file's own top
 	// doc comment).
-	bridge := wsbridge.New(sessionCfg, "sbx-test", h,
+	bridge := wsbridge.New(sessionCfg, "sbx-test", "test-agent-version", "test-image-digest", h,
 		timeouts.SandboxWSDialTimeout, timeouts.SandboxWSHeartbeatInterval,
 		timeouts.SandboxWSReconnectMinBackoff, timeouts.SandboxWSReconnectMaxBackoff)
 	h.bridge = bridge

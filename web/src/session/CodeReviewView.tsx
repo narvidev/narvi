@@ -40,12 +40,24 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 
-import type { ArchDecision, ReviewReadoutFinding, ReviewReadoutVerdict, ReviewVerdictHistoryEntry } from '@narvi/contracts/rest-dtos'
+import type { ArchDecision, ReviewReadout, ReviewReadoutFinding, ReviewReadoutSessionReuse, ReviewReadoutVerdict, ReviewVerdictHistoryEntry } from '@narvi/contracts/rest-dtos'
+
+// sentinelFix/handoffReadiness (unlike sessionReuse) have no standalone
+// named export -- their JSON Schema defs use an inline `type:
+// ["object","null"]` rather than a $ref (dtos.schema.json's own comment on
+// each: the $ref form collided with go-jsonschema's auto-derived wrapper
+// name on the Go side, e.g. Automation.runHealth hit the exact same
+// collision first). Indexed-access off ReviewReadout itself, rather than a
+// hand-duplicated shape, so these two can never silently drift from the
+// wire type they name.
+type SentinelFix = NonNullable<ReviewReadout['sentinelFix']>
+type HandoffReadiness = NonNullable<ReviewReadout['handoffReadiness']>
 
 import { applySuggestion, getReviewReadout, listFalsePositivePatterns, rebutReviewFinding, retireFalsePositivePattern, retriggerReview } from '../api/endpoints'
 import { falsePositivePatternQueryKeys, reviewQueryKeys } from '../api/queryKeys'
 import { meQueryOptions } from '../auth/session'
-import { descriptionAdequacyTone, findingStatusLabel, findingStatusTone, riskTone, shippableLabel, shippableTone } from './reviewFormat'
+import { formatRelativeTime } from './relativeTime'
+import { descriptionAdequacyTone, findingStatusLabel, findingStatusTone, riskTone, sentinelFixLabel, sentinelFixTone, shippableLabel, shippableTone, visualQaTone } from './reviewFormat'
 import { truncateForDisplay } from './textSafety'
 import { isSafeHref } from './urlSafety'
 
@@ -285,29 +297,138 @@ export function FindingsAppendix({ findings, canAct, sessionId }: { findings: Re
 }
 
 /**
- * PrGitHubLink builds the "Open PR on GitHub" link from repoFullName/prNumber
- * -- server-resolved fields, never raw review-content text, but still
- * passed through urlSafety.ts's isSafeHref before ever becoming an href
- * (this view's own top comment: "the ONE href this view ever constructs
- * from review content"). Exported for direct render-safety testing
- * (mirrors DigestSections/FindingCard's own precedent): a hostile
+ * PrGitHubLink builds an "Open PR on GitHub"-style link from repoFullName/
+ * prNumber -- server-resolved fields, never raw review-content text, but
+ * still passed through urlSafety.ts's isSafeHref before ever becoming an
+ * href (this view's own top comment: "the ONE href this view ever
+ * constructs from review content"). Exported for direct render-safety
+ * testing (mirrors DigestSections/FindingCard's own precedent): a hostile
  * repoFullName (e.g. one somehow containing a `javascript:`-shaped
  * segment) must degrade to the plain-text fallback below, never an
- * anchor.
+ * anchor. label defaults to "Open PR on GitHub" (every pre-existing call
+ * site's own unchanged behavior); SentinelAutoFixPanel below overrides it
+ * to name the FIX pr distinctly from the origin PR this whole view is
+ * already about.
  */
-export function PrGitHubLink({ repoFullName, prNumber }: { repoFullName: string; prNumber: number }) {
+export function PrGitHubLink({ repoFullName, prNumber, label = 'Open PR on GitHub' }: { repoFullName: string; prNumber: number; label?: string }) {
   const href = `https://github.com/${repoFullName}/pull/${prNumber}`
   if (!isSafeHref(href)) {
     return <span className="sub">PR link unavailable</span>
   }
   return (
     <a className="btn" href={href} target="_blank" rel="noreferrer noopener" style={{ textAlign: 'center', textDecoration: 'none' }}>
-      Open PR on GitHub
+      {label}
     </a>
   )
 }
 
-function SentinelsPanel({ verdict }: { verdict: ReviewReadoutVerdict | null }) {
+/**
+ * ReviewSessionPanel is §12.2 item 2's own "coalesced-mention/session-
+ * reuse info" gap (mockups.html's own "Review session" rail panel,
+ * decision 10: "trigger: @mention x2 -> coalesced" / "session: reused
+ * (same PR)"). Only trigger/session are rendered -- the mockup's own
+ * adjacent "model"/"diff" rows name facts this readout has no field for
+ * at all (no per-turn model id or diff-prefetch flag on ReviewReadout),
+ * so this panel renders exactly what is real rather than a fabricated
+ * pair of rows alongside them.
+ */
+export function ReviewSessionPanel({ sessionReuse }: { sessionReuse: ReviewReadoutSessionReuse }) {
+  const reused = sessionReuse.mentionCount > 1
+  return (
+    <div>
+      <h3>Review session</h3>
+      <dl className="kv">
+        <dt>trigger</dt>
+        <dd>{reused ? `@mention ×${sessionReuse.mentionCount} → coalesced` : 'single @mention'}</dd>
+        <dt>session</dt>
+        <dd>{reused ? 'reused (same PR)' : 'new'}</dd>
+      </dl>
+    </div>
+  )
+}
+
+/**
+ * SentinelAutoFixPanel is §12.2 item 2's own "sentinel auto-fix PR link
+ * with its merge-gated state" gap (§17). Renders nothing at all when no
+ * sentinel-fix was ever triggered for this PR (sentinelFix null) -- an
+ * honest absence, never an empty panel. mockups.html names this gap in
+ * §12.2's own inventory text but draws no screenshot state for it; this
+ * panel derives its layout from the SAME kv/chip/link component patterns
+ * every other rail panel on this screen already establishes (§12's own
+ * "derive an undrawn state from the established design system" rule)
+ * rather than inventing a new visual idiom.
+ */
+export function SentinelAutoFixPanel({ sentinelFix, repoFullName }: { sentinelFix: SentinelFix | null; repoFullName: string }) {
+  if (sentinelFix === null) return null
+  return (
+    <div>
+      <h3>Sentinel auto-fix</h3>
+      <dl className="kv">
+        <dt>status</dt>
+        <dd>
+          <span className={`chip ${sentinelFixTone(sentinelFix.status)}`}>
+            <span className="dot" />
+            {sentinelFixLabel(sentinelFix.status)}
+          </span>
+        </dd>
+      </dl>
+      {sentinelFix.fixPrNumber !== null && (
+        <div className="btnrow" style={{ marginTop: 6 }}>
+          <PrGitHubLink repoFullName={repoFullName} prNumber={sentinelFix.fixPrNumber} label="View fix PR on GitHub" />
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * HandoffReadinessCard is §12.2 item 2's own "handoff-readiness display"
+ * gap (§14.4) -- mirrors mockups.html's own "Handoff-readiness sentinel"
+ * timeline card (avatar + area/status table + verdict-foot), scoped to
+ * THIS review's own PR (the mockup's own example instead narrates a
+ * DIFFERENT, related PR as a cross-PR notification -- this readout has no
+ * data about any PR other than the one it is already about, so this card
+ * reports only what is real for THIS one). Renders nothing when this PR's
+ * session was never a scoped-Environment prototype (handoffReadiness
+ * null).
+ */
+export function HandoffReadinessCard({ handoffReadiness }: { handoffReadiness: HandoffReadiness | null }) {
+  if (handoffReadiness === null) return null
+  return (
+    <div className="card">
+      <div className="who">
+        <span className="avatar b">R</span>
+        <b>Handoff-readiness sentinel</b>
+        <span className="chip neutral" style={{ marginLeft: 8 }}>
+          <span className="dot" />
+          handoff
+        </span>
+        <time>{formatRelativeTime(handoffReadiness.flaggedAt)} ago</time>
+      </div>
+      <dl className="kv">
+        <dt>contract drift</dt>
+        <dd>
+          <span className={`chip ${handoffReadiness.contractDriftFlagged ? 'warn' : 'ok'}`}>
+            <span className="dot" />
+            {handoffReadiness.contractDriftFlagged ? 'drifted' : 'none'}
+          </span>
+        </dd>
+        <dt>backend TODOs</dt>
+        <dd>
+          <span className={`chip ${handoffReadiness.todoCount > 0 ? 'warn' : 'ok'}`}>
+            <span className="dot" />
+            {handoffReadiness.todoCount > 0 ? `${handoffReadiness.todoCount} found` : 'none'}
+          </span>
+        </dd>
+      </dl>
+      <div className="verdict-foot">
+        <span className="lock">⛨ posted via the handoff-sentinel notifier</span>
+      </div>
+    </div>
+  )
+}
+
+export function SentinelsPanel({ verdict, visualQa }: { verdict: ReviewReadoutVerdict | null; visualQa: string | null }) {
   return (
     <div>
       <h3>Sentinels</h3>
@@ -326,12 +447,25 @@ function SentinelsPanel({ verdict }: { verdict: ReviewReadoutVerdict | null }) {
             {verdict?.docsDrift ?? 'not reviewed yet'}
           </span>
         </dd>
+        {/* visual QA (§12.2 item 2's own gap): read live from this PR's
+            own "visual-qa:" GitHub label -- a human applies it, Narvi
+            never computes it. Null means either no such label exists yet,
+            or the live label fetch itself degraded (reviewreadout.go's
+            own doc comment) -- the two are indistinguishable here, same
+            as prTitle's own identical degrade. */}
         <dt>visual QA</dt>
         <dd>
-          <span className="chip neutral">
-            <span className="dot" />
-            not tracked here
-          </span>
+          {visualQa !== null ? (
+            <span className={`chip ${visualQaTone(visualQa)}`}>
+              <span className="dot" />
+              <T text={visualQa} />
+            </span>
+          ) : (
+            <span className="chip neutral">
+              <span className="dot" />
+              not set
+            </span>
+          )}
         </dd>
         <dt>fact check</dt>
         <dd>{verdict?.factCheck ?? '—'}</dd>
@@ -431,6 +565,15 @@ export function CodeReviewView({ sessionId }: { sessionId: string }) {
 
   const readout = readoutQuery.data
   const verdict = readout.latestVerdict ?? null
+  // The four gap fields (§12.2 item 2) are all optional on the wire --
+  // absent (undefined) whenever the underlying row/label/fetch genuinely
+  // has nothing to report, per each field's own doc comment in
+  // dtos.schema.json. Normalized to null once, here, mirroring verdict's
+  // own line above, so every render site below can use a single "is this
+  // present" check instead of juggling undefined and null separately.
+  const visualQa = readout.visualQa ?? null
+  const sentinelFix = readout.sentinelFix ?? null
+  const handoffReadiness = readout.handoffReadiness ?? null
 
   return (
     <div className="app two">
@@ -456,6 +599,13 @@ export function CodeReviewView({ sessionId }: { sessionId: string }) {
             </span>
           )}
           <span className="spacer" />
+          {/* session reuse (§12.2 item 2's own gap) rides the SAME "cost"
+              slot the mockup's own header uses ("review session · reused
+              ×2") -- shown only when this PR's own claim was genuinely
+              reused (a solo @mention says nothing new here, mirroring
+              PresenceIndicator's own "only show when there is something
+              notable" precedent, SessionHeader.tsx). */}
+          {readout.sessionReuse.mentionCount > 1 && <span className="cost">review session · reused ×{readout.sessionReuse.mentionCount}</span>}
           {verdict?.riskLevel && (
             <span className="cost">
               <span className={`chip ${riskTone(verdict.riskLevel)}`}>
@@ -473,12 +623,15 @@ export function CodeReviewView({ sessionId }: { sessionId: string }) {
             </div>
           )}
           {verdict && <DigestSections verdict={verdict} />}
+          <HandoffReadinessCard handoffReadiness={handoffReadiness} />
           <FindingsAppendix findings={readout.findings} canAct={canAct} sessionId={sessionId} />
         </div>
       </section>
 
       <aside className="rail" aria-label="Review details">
-        <SentinelsPanel verdict={verdict} />
+        <ReviewSessionPanel sessionReuse={readout.sessionReuse} />
+        <SentinelAutoFixPanel sentinelFix={sentinelFix} repoFullName={readout.repoFullName} />
+        <SentinelsPanel verdict={verdict} visualQa={visualQa} />
         <div>
           <h3>Actions</h3>
           <div className="btnrow" style={{ flexDirection: 'column', alignItems: 'stretch' }}>

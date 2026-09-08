@@ -344,6 +344,13 @@ func DecidePlanOnTx(
 		// PlanMode below -- this is deliberately the POST-approval
 		// implementation turn, never itself a plan-mode turn.
 		prompt := turn.MaybeInjectEpistemicPreamble(epistemicCheckDefault, sessionRow.EpistemicCheckEnabled, false, implementPlanPrompt)
+		// correlationID (§12.2 item 1's own session-rail gap, migrations/
+		// 000121_turns_correlation_id.up.sql): this decision request's own
+		// id, when the caller minted one.
+		var correlationID *string
+		if id, ok := platform.CorrelationIDFromContext(ctx); ok && id != "" {
+			correlationID = &id
+		}
 		createdTurn, err := turns.WithTx(tx).Create(ctx, sqlcgen.CreateTurnParams{
 			SessionID: sessionRow.ID,
 			Status:    sqlcgen.TurnStatusPending,
@@ -360,8 +367,9 @@ func DecidePlanOnTx(
 			// on a plain (non-workflow) plan-mode session -- §29.8 forbids a
 			// dispatch-time session-level fallback for a NULL turn effort,
 			// so there was no rescue.
-			Effort:   sessionRow.BuildEffort,
-			PlanMode: false,
+			Effort:        sessionRow.BuildEffort,
+			PlanMode:      false,
+			CorrelationID: correlationID,
 		})
 		if err != nil {
 			return DecidePlanOutcome{}, fmt.Errorf("httpapi: create implementation turn: %w", err)

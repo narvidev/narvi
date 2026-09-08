@@ -1167,8 +1167,21 @@ func (j *Push) UnmarshalJSON(value []byte) error {
 // First event on a fresh WS connection, once the agent is ready to receive
 // commands.
 type Ready struct {
+	// §12.2 item 1's own runtime-fingerprint gap (§5.3's own boot fingerprint,
+	// sandboxboot.BootFingerprint.AgentVersion): this gen's own sandbox-agent binary
+	// version. Always a real, non-empty string -- 'dev' when NARVI_AGENT_VERSION is
+	// unset (no build-time version-stamping pipeline exists yet), never omitted.
+	AgentVersion string `json:"agentVersion" yaml:"agentVersion" mapstructure:"agentVersion"`
+
 	// Gen corresponds to the JSON schema field "gen".
 	Gen int `json:"gen" yaml:"gen" mapstructure:"gen"`
+
+	// §12.2 item 1's own runtime-fingerprint gap
+	// (sandboxboot.BootFingerprint.ImageDigest): this gen's own sandbox image digest.
+	// Always a real, non-empty string -- 'unknown' when NARVI_IMAGE_DIGEST is unset
+	// (a documented, honest gap: no mechanism yet injects it into a spawned sandbox),
+	// never omitted.
+	ImageDigest string `json:"imageDigest" yaml:"imageDigest" mapstructure:"imageDigest"`
 
 	// MessageId corresponds to the JSON schema field "messageId".
 	MessageId string `json:"messageId" yaml:"messageId" mapstructure:"messageId"`
@@ -1189,8 +1202,14 @@ func (j *Ready) UnmarshalJSON(value []byte) error {
 	if err := json.Unmarshal(value, &raw); err != nil {
 		return err
 	}
+	if _, ok := raw["agentVersion"]; raw != nil && !ok {
+		return fmt.Errorf("field agentVersion in Ready: required")
+	}
 	if _, ok := raw["gen"]; raw != nil && !ok {
 		return fmt.Errorf("field gen in Ready: required")
+	}
+	if _, ok := raw["imageDigest"]; raw != nil && !ok {
+		return fmt.Errorf("field imageDigest in Ready: required")
 	}
 	if _, ok := raw["messageId"]; raw != nil && !ok {
 		return fmt.Errorf("field messageId in Ready: required")

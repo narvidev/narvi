@@ -316,7 +316,13 @@ type SessionCoalescer struct {
 // then no transaction is open at all, so there is nothing to protect there
 // either. Denying here (either path) leaves the claim row exactly as safe
 // as an authorized denial always was -- see this function's own "claim row
-// on the deny path" note further down, at each denial site, for why.
+// on the deny path" note further down, at each denial site, for why. This
+// now genuinely covers mention_count too (audit fix): a REUSE attempt
+// denied here, or one CreateTurnForBot below goes on to decline/fail,
+// writes nothing to the claim row at all -- see the REUSE branch's own
+// IncrementMentionCount call site, near its end, for where that write
+// moved to make this true (it used to run before this path's own
+// tx.Commit, so a denial/failure here could not undo it).
 //
 // isLabelRetrigger (mention.IsLabelRetrigger, handler.go) selects the
 // REUSE branch's own authz action (see this function's own "REUSE-branch
@@ -469,13 +475,29 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 	}
 
 	if existing.Valid {
-		// Reuse case: this PR already has a review session. Nothing to
-		// write to the claim row itself -- commit now (releasing the
-		// lock, and this transaction's own connection, for whoever, if
-		// anyone, is still queued behind it) BEFORE doing the SEPARATE,
-		// independent work of enqueuing a new turn on the existing
-		// session. Only one connection is ever open at a time on this
-		// path.
+		// Reuse case: this PR already has a review session. Commit now
+		// (releasing the lock, and this transaction's own connection, for
+		// whoever, if anyone, is still queued behind it) BEFORE doing the
+		// SEPARATE, independent work of authorizing the actor and
+		// enqueuing a new turn on the existing session. Only one
+		// connection is ever open at a time on this path.
+		//
+		// mention_count (§12.2 item 2's own "coalesced-mention/session-
+		// reuse info" gap) is deliberately NOT incremented here anymore --
+		// audit fix: it used to be, still under LockForUpdate's own row
+		// lock, right at this spot, immediately before this same commit.
+		// That let a REUSE attempt this function goes on to DENY (the
+		// ownership-aware authz check below) or fail to enqueue
+		// (CreateTurnForBot below) permanently inflate the counter for
+		// zero actual coalescing -- confirmed reachable via a plain
+		// member's own denied label re-trigger, no fault injection
+		// needed. Every OTHER denial this function can produce (the
+		// WINNER path's own createAuthorized deny, further down) leaves
+		// no trace at all ("claim row on the deny path" below); this one
+		// must match it. See this branch's own new IncrementMentionCount
+		// call site, near its end, for where the write moved to and why
+		// that position -- after authorization AND turn creation both
+		// succeed, on the bare pool with no transaction open -- is safe.
 		if err := tx.Commit(ctx); err != nil {
 			return sqlcgen.Session{}, sqlcgen.Turn{}, false, fmt.Errorf("github: commit claim tx (reuse path): %w", err)
 		}
@@ -536,6 +558,12 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 		}
 		if !actorauthz.AuthorizeLinkedActor(ctx, logger, authzSurface, c.Users, actor, reuseAction, authz.Resource{OwnedOrJoined: joined}) {
 			logger.Warn("github: prompt/retrigger on existing session denied by authz", "session_id", existingSession.ID, "repo", repoFullName, "pr_number", prNumber, "user_id", actor.String(), "action", string(reuseAction))
+			// mention_count on the deny path (audit fix): the increment
+			// that used to sit before this branch's own tx.Commit above
+			// has moved past this return entirely (this branch's own
+			// bottom, after CreateTurnForBot succeeds) -- a denied REUSE
+			// now leaves it untouched, mirroring the WINNER path's own
+			// "claim row on the deny path" guarantee further down.
 			return sqlcgen.Session{}, sqlcgen.Turn{}, false, ErrActorNotAuthorized
 		}
 
@@ -576,7 +604,46 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 		// c.ReviewModelDeep is configured, a specific frontier model).
 		createdTurn, err := httpapi.CreateTurnForBot(ctx, c.Pool, c.Sessions, c.Turns, c.Plans, c.IntentClassifier, c.AuditLog, c.Registry, existing, prompt, triageModelID, req.PlanMode, false, actor, reviewHeadSHAPtr, &classifyText, triageEffort, reviewDepthPtr, triageRecordJSON, knowledgeMode, knowledgeDecisionJSON)
 		if err != nil {
+			// mention_count untouched here too (audit fix): this is the
+			// OTHER denial route the increment used to run ahead of --
+			// CreateTurnForBot declining post-authorization (e.g.
+			// ErrPlanAwaitingApproval) or genuinely failing must count as
+			// zero coalescing, exactly like the authz deny immediately
+			// above. Nothing to undo: the increment call has not run yet.
 			return sqlcgen.Session{}, sqlcgen.Turn{}, false, fmt.Errorf("github: create turn on existing session: %w", err)
+		}
+
+		// mention_count (§12.2 item 2's own "coalesced-mention/session-
+		// reuse info" gap) increments HERE now -- audit fix, moved from
+		// this branch's own critical section, before its early commit
+		// above, to this exact spot: only reached once a real turn has
+		// actually been created on the existing session, i.e. only when
+		// this REUSE attempt is genuine, never on an authz denial or a
+		// failed turn creation (both return above, before this line).
+		//
+		// c.PRSessions, deliberately NOT txPRSessions: tx committed
+		// several steps above (committed == true already), so
+		// txPRSessions' own queries would fail against a closed
+		// transaction -- this runs on the bare pool, no transaction open,
+		// mirroring every other post-commit call in this branch
+		// (c.Sessions.Get, AuthorizeLinkedActor, OwnedOrJoined,
+		// CreateTurnForBot above).
+		//
+		// No CAS guard needed despite holding no lock here:
+		// IncrementGitHubPRSessionMentionCount is one single
+		// `UPDATE ... SET mention_count = mention_count + 1` statement,
+		// and Postgres holds the target row's lock for that ONE
+		// statement's own duration regardless of any ambient transaction
+		// -- two concurrent callers for the SAME PR (each already past
+		// its own commit above, so genuinely running concurrently here,
+		// unlike the fully-serialized-by-LockForUpdate pre-fix ordering)
+		// still cannot lose an update to each other; they simply apply in
+		// whichever order Postgres schedules the two UPDATE statements,
+		// and the final count reflects both regardless of that order.
+		// See IncrementMentionCount's own doc comment (postgres/
+		// githubprsession_store.go) for the full "why".
+		if _, err := c.PRSessions.IncrementMentionCount(ctx, repoFullName, prNumber); err != nil {
+			return sqlcgen.Session{}, sqlcgen.Turn{}, false, fmt.Errorf("github: increment mention count: %w", err)
 		}
 
 		logger.Info("github: coalesced mention onto existing review session",

@@ -939,6 +939,13 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 		effectivePrompt = turn.MaybeInjectEpistemicPreamble(epistemicCheckDefault, epistemicCheckOverride, planMode, effectivePrompt)
 	}
 
+	// correlationID (§12.2 item 1's own session-rail gap, migrations/
+	// 000121_turns_correlation_id.up.sql): this request's own id, when the
+	// ingress that dispatched it minted one.
+	var correlationID *string
+	if id, ok := platform.CorrelationIDFromContext(ctx); ok && id != "" {
+		correlationID = &id
+	}
 	created, err := turns.WithTx(tx).Create(ctx, sqlcgen.CreateTurnParams{
 		SessionID:               sessionID,
 		Status:                  sqlcgen.TurnStatusPending,
@@ -958,7 +965,8 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 		// value it can hold here is a pointer to false: the awaiting-plan
 		// gate above already returned early (no row ever inserted) for
 		// every case answerOnly points to true.
-		AnswerOnly: answerOnly,
+		AnswerOnly:    answerOnly,
+		CorrelationID: correlationID,
 	})
 	if err != nil {
 		logger.Error("httpapi: create turn failed", "error", err)

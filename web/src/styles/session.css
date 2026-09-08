@@ -198,6 +198,28 @@
   padding: var(--space-1) var(--space-4);
   border-radius: var(--radius-sm);
 }
+/* ---- multiplayer presence (§8.11) ---- */
+.presence {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.avatar-stack {
+  display: inline-flex;
+}
+.avatar-stack .avatar {
+  border: 2px solid var(--surface);
+  margin-left: -6px;
+}
+.avatar-stack .avatar:first-child {
+  margin-left: 0;
+}
+.presence .watching {
+  font-family: var(--mono);
+  font-size: var(--text-sm);
+  color: var(--muted);
+  white-space: nowrap;
+}
 .srcicon {
   display: inline-flex;
   align-items: center;

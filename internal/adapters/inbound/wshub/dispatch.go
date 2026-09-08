@@ -31,6 +31,14 @@ type envelope struct {
 	AckID          string  `json:"ackId"`
 	LastBootPhase  *string `json:"lastBootPhase"`
 	ConversationID *string `json:"conversationId"`
+	// AgentVersion/ImageDigest (§12.2 item 1's own runtime-fingerprint
+	// gap) are non-empty only on a "ready" event (sandbox-ws's own Ready
+	// def, the only event type that carries them) -- absent from JSON on
+	// every other event type, decoding to nil here exactly like
+	// LastBootPhase/ConversationID already do for their own single
+	// carrying type.
+	AgentVersion *string `json:"agentVersion"`
+	ImageDigest  *string `json:"imageDigest"`
 }
 
 // readLoop reads and dispatches inbound sandbox-WS frames on conn until
@@ -73,6 +81,8 @@ func readLoop(ctx context.Context, conn *websocket.Conn, actor *sessionactor.Act
 			Raw:            json.RawMessage(data),
 			LastBootPhase:  env.LastBootPhase,
 			ConversationID: env.ConversationID,
+			AgentVersion:   env.AgentVersion,
+			ImageDigest:    env.ImageDigest,
 			Reply:          reply,
 		}
 

@@ -1519,7 +1519,7 @@ func run() error {
 	var handler *commandHandler
 	if cfg.SessionConfig != nil {
 		handler = &commandHandler{adapter: agentRuntime, runCtx: ctx, cfg: cfg, timeouts: timeouts, sup: sup, reviewCostBudgetURL: reviewCostBudgetURL}
-		bridge = wsbridge.New(*cfg.SessionConfig, cfg.SandboxID, handler,
+		bridge = wsbridge.New(*cfg.SessionConfig, cfg.SandboxID, cfg.AgentVersion, cfg.ImageDigest, handler,
 			timeouts.SandboxWSDialTimeout, timeouts.SandboxWSHeartbeatInterval,
 			timeouts.SandboxWSReconnectMinBackoff, timeouts.SandboxWSReconnectMaxBackoff)
 		handler.bridge = bridge

@@ -772,6 +772,14 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// shared, never a second independently-constructed copy.
 	reviewFindingStore := postgres.NewReviewFindingStore(pool)
 	sentinelFixStore := postgres.NewSentinelFixStore(pool)
+	// handoffSentinelStore (§12.2 item 2's own "handoff-readiness display"
+	// gap): a second, independently-constructed instance is fine -- the
+	// SAME cheap, stateless "wraps sqlcgen.Queries" shape every other store
+	// here already has; sessionactor.NewRegistry's own internal instance
+	// (registry.go) is the sentinel's own WRITE side, this one is the
+	// review readout's own READ side, and the two never need to be the
+	// same Go value to agree on what Postgres holds.
+	handoffSentinelStore := postgres.NewHandoffSentinelStore(pool)
 	// releaseManifestCheckStore (§12.2 item 9, "dedicated release-review
 	// screen") persists the release manifest check's own typed result --
 	// see internal/app/releasereview/persist.go's own doc comment. Shared
@@ -1068,7 +1076,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 
 	router.Get("/sessions/{sessionID}/ws", wshub.NewHandler(
 		wshub.NewSandboxHandler(registry, sandboxStore, commander, cfg.Timeouts),
-		wshub.NewClientHandler(registry, sessionStore, turnStore, sandboxStore, eventStore, artifactStore, wsTokenStore, hub, cfg.Timeouts),
+		wshub.NewClientHandler(registry, sessionStore, turnStore, sandboxStore, eventStore, artifactStore, wsTokenStore, userStore, hub, cfg.Timeouts),
 	))
 
 	// scm-credentials (§9.3, "e2e happy path", design decision 8):
@@ -1775,7 +1783,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// comment. sourceControl/findingRelocationResolver/cfg.GitHubBotToken
 		// are the SAME instances every other GitHub-facing route above
 		// already uses.
-		r.Get("/{sessionID}/review", httpapi.GetReviewReadout(sessionStore, githubPRSessionStore, reviewVerdictDeps, reviewFindingStore, turnStore, sourceControl, findingRelocationResolver, cfg.GitHubBotToken, cfg.Timeouts))
+		r.Get("/{sessionID}/review", httpapi.GetReviewReadout(sessionStore, githubPRSessionStore, reviewVerdictDeps, reviewFindingStore, turnStore, sourceControl, findingRelocationResolver, sentinelFixStore, handoffSentinelStore, cfg.GitHubBotToken, cfg.Timeouts))
 		// release-manifest (§15.2/§15.3, §12.2 item 9) -- the dedicated
 		// release-review screen's own read model, see httpapi/
 		// releasemanifestreadout.go's own doc comment.
@@ -2144,8 +2152,8 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	router.Route("/api/automations", func(r chi.Router) {
 		r.Use(auth.Middleware(userSessionStore, userStore))
 		r.Post("/", httpapi.CreateAutomation(automationStore))
-		r.Get("/", httpapi.ListAutomations(automationStore))
-		r.Get("/{automationID}", httpapi.GetAutomation(automationStore))
+		r.Get("/", httpapi.ListAutomations(automationStore, automationRunStore))
+		r.Get("/{automationID}", httpapi.GetAutomation(automationStore, automationRunStore))
 		// invocations ("automations health/runs table", §12.2 item 4): the
 		// expandable invocation -> runs read model automations.go's own
 		// automation-level lastRunAt/lastRunStatus/artifactSummary fields
@@ -2153,10 +2161,10 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// own doc comment. Same "no extra RBAC beyond logged in" gate as
 		// Get/List immediately above.
 		r.Get("/{automationID}/invocations", httpapi.ListAutomationInvocations(automationStore, automationInvocationStore, automationRunStore))
-		r.Post("/{automationID}/pause", httpapi.PauseAutomation(automationStore))
-		r.Post("/{automationID}/resume", httpapi.ResumeAutomation(automationStore))
-		r.Post("/{automationID}/webhook-token", httpapi.RotateAutomationWebhookToken(automationStore))
-		r.Delete("/{automationID}/webhook-token", httpapi.RevokeAutomationWebhookToken(automationStore))
+		r.Post("/{automationID}/pause", httpapi.PauseAutomation(automationStore, automationRunStore))
+		r.Post("/{automationID}/resume", httpapi.ResumeAutomation(automationStore, automationRunStore))
+		r.Post("/{automationID}/webhook-token", httpapi.RotateAutomationWebhookToken(automationStore, automationRunStore))
+		r.Delete("/{automationID}/webhook-token", httpapi.RevokeAutomationWebhookToken(automationStore, automationRunStore))
 	})
 
 	// /webhooks/automations/{automationID} (§8.4's own "webhook-

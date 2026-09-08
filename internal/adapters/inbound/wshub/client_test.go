@@ -43,6 +43,7 @@ type clientTestRig struct {
 	events    *narvipg.EventStore
 	artifacts *narvipg.ArtifactStore
 	wsTokens  *narvipg.WSTokenStore
+	users     *narvipg.UserStore
 	registry  *sessionactor.Registry
 	hub       *wshub.Hub
 	wsURL     string
@@ -100,11 +101,12 @@ func newClientTestRigImpl(t *testing.T, timeouts platform.Timeouts, wireBroadcas
 		events:    narvipg.NewEventStore(pool),
 		artifacts: narvipg.NewArtifactStore(pool),
 		wsTokens:  narvipg.NewWSTokenStore(pool),
+		users:     narvipg.NewUserStore(pool),
 		registry:  registry,
 		hub:       hub,
 	}
 
-	server, wsURL := newDispatcherTestServer(rig.registry, rig.sessions, rig.turns, rig.sandboxes, rig.events, rig.artifacts, rig.wsTokens, rig.hub, timeouts)
+	server, wsURL := newDispatcherTestServer(rig.registry, rig.sessions, rig.turns, rig.sandboxes, rig.events, rig.artifacts, rig.wsTokens, rig.users, rig.hub, timeouts)
 	t.Cleanup(server.Close)
 	rig.wsURL = wsURL
 
@@ -296,7 +298,7 @@ func TestClientHandler_TokenLookupBackendError(t *testing.T) {
 	brokenWSTokens := narvipg.NewWSTokenStore(brokenPool)
 	brokenPool.Close() // any subsequent query now fails with a real, non-ErrNoRows error.
 
-	server, wsURL := newDispatcherTestServer(rig.registry, rig.sessions, rig.turns, rig.sandboxes, rig.events, rig.artifacts, brokenWSTokens, rig.hub, platform.DefaultTimeouts())
+	server, wsURL := newDispatcherTestServer(rig.registry, rig.sessions, rig.turns, rig.sandboxes, rig.events, rig.artifacts, brokenWSTokens, rig.users, rig.hub, platform.DefaultTimeouts())
 	t.Cleanup(server.Close)
 
 	conn, _, err := websocket.Dial(ctx, wsURL+"/sessions/"+sessionRow.ID.String()+"/ws?type=client", nil)
@@ -323,9 +325,12 @@ func TestClientHandler_TokenLookupBackendError(t *testing.T) {
 
 // TestClientHandler_ValidHandshakeSubscribes proves a fully valid
 // handshake replies with a single `subscribed` payload of the right
-// shape: sessionId matches, participants is an empty array (§6.2 design
-// decision -- participants stays untouched this Step), and events/
-// artifacts/state are present.
+// shape: sessionId matches, participants is an empty array (this token
+// carries no user_id -- createTestWSToken's own established convention,
+// mirroring a pre-auth-v1 or since-deleted-user row -- so there is no
+// real user for §8.11's presence tracking to report; see
+// TestClientHandler_ParticipantsReflectsLiveConnections below for the
+// real-user case), and events/artifacts/state are present.
 func TestClientHandler_ValidHandshakeSubscribes(t *testing.T) {
 	rig, sessionRow := newClientTestRig(t, platform.DefaultTimeouts())
 	ctx := context.Background()
@@ -381,6 +386,207 @@ func TestClientHandler_ValidHandshakeSubscribes(t *testing.T) {
 			t.Errorf("State missing key %q", key)
 		}
 	}
+}
+
+// TestClientHandler_ParticipantsReflectsLiveConnections is §8.11's own
+// ("multiplayer presence") end-to-end proof that Participants is now a
+// REAL, live signal rather than the permanently-empty array it used to
+// be: two distinct real users subscribing to the SAME session must
+// each see the other in their own subscribed reply's Participants (once
+// both are connected), and a participant who disconnects must stop being
+// reported to a FRESH subscriber -- proven by driving the real handshake
+// twice concurrently and inspecting the actual wire payload each
+// connection receives, never by calling Hub.Participants directly (that
+// would only prove the Hub's own bookkeeping, not that NewClientHandler
+// actually wires it into what a browser receives).
+func TestClientHandler_ParticipantsReflectsLiveConnections(t *testing.T) {
+	rig, sessionRow := newClientTestRig(t, platform.DefaultTimeouts())
+	ctx := context.Background()
+
+	userA := createTestUser(ctx, t, rig.pool, "participants-a@example.com", "Alice Anderson")
+	userB := createTestUser(ctx, t, rig.pool, "participants-b@example.com", "Bob Baker")
+	tokenA := createTestWSTokenForUser(ctx, t, rig.pool, sessionRow.ID, userA, time.Now().Add(24*time.Hour))
+	tokenB := createTestWSTokenForUser(ctx, t, rig.pool, sessionRow.ID, userB, time.Now().Add(24*time.Hour))
+
+	connA, payloadA := dialAndSubscribe(ctx, t, rig.wsURL, sessionRow.ID.String(), tokenA)
+	defer func() { _ = connA.CloseNow() }()
+
+	if got, want := participantNames(t, payloadA), []string{"Alice Anderson"}; !equalUnordered(got, want) {
+		t.Errorf("first connection's own Participants = %v, want %v (only itself is live yet)", got, want)
+	}
+
+	connB, payloadB := dialAndSubscribe(ctx, t, rig.wsURL, sessionRow.ID.String(), tokenB)
+	defer func() { _ = connB.CloseNow() }()
+
+	if got, want := participantNames(t, payloadB), []string{"Alice Anderson", "Bob Baker"}; !equalUnordered(got, want) {
+		t.Errorf("second connection's own Participants = %v, want %v (both A and B are now live)", got, want)
+	}
+
+	// A disconnects; Hub's own unregister (deferred inside
+	// NewClientHandler) runs asynchronously relative to this CloseNow
+	// call, so poll rather than assert immediately.
+	_ = connA.CloseNow()
+	waitUntil(t, 5*time.Second, func() bool {
+		for _, id := range rig.hub.Participants(sessionRow.ID.String()) {
+			if id == userA.String() {
+				return false
+			}
+		}
+		return true
+	})
+
+	// A fresh, third subscribe must now see only B -- proves presence is
+	// live (reflects the CURRENT connection set), never a sticky "everyone
+	// who ever joined" record (that durable, distinct concept is
+	// postgres.ParticipantStore's own job, untouched by this feature; see
+	// doc.go's own "two different questions with two different lifetimes"
+	// paragraph).
+	tokenB2 := createTestWSTokenForUser(ctx, t, rig.pool, sessionRow.ID, userB, time.Now().Add(24*time.Hour))
+	connC, payloadC := dialAndSubscribe(ctx, t, rig.wsURL, sessionRow.ID.String(), tokenB2)
+	defer func() { _ = connC.CloseNow() }()
+
+	if got, want := participantNames(t, payloadC), []string{"Bob Baker"}; !equalUnordered(got, want) {
+		t.Errorf("Participants after A disconnected = %v, want %v", got, want)
+	}
+}
+
+// TestClientHandler_SubscribedPayloadCorrelationIdIsLatestTurn is §12.2
+// item 1's own session-rail gap: state.correlationId (client.go's own
+// latestTurnCorrelationID) must report the SESSION's own MOST RECENTLY
+// created turn's correlation id, not merely "some" turn's -- proven by
+// seeding two real turns with two DIFFERENT correlation ids (via the same
+// TurnStore.Create production call every real turn-creation path uses)
+// and asserting the subscribed reply reports the SECOND one.
+func TestClientHandler_SubscribedPayloadCorrelationIdIsLatestTurn(t *testing.T) {
+	rig, sessionRow := newClientTestRig(t, platform.DefaultTimeouts())
+	ctx := context.Background()
+
+	firstCorrelationID := "cor_first00"
+	if _, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{
+		SessionID:     sessionRow.ID,
+		Status:        sqlcgen.TurnStatusCompleted,
+		CorrelationID: &firstCorrelationID,
+	}); err != nil {
+		t.Fatalf("create first turn: %v", err)
+	}
+	secondCorrelationID := "cor_second1"
+	if _, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{
+		SessionID:     sessionRow.ID,
+		Status:        sqlcgen.TurnStatusPending,
+		CorrelationID: &secondCorrelationID,
+	}); err != nil {
+		t.Fatalf("create second turn: %v", err)
+	}
+
+	token := createTestWSToken(ctx, t, rig.pool, sessionRow.ID, time.Now().Add(24*time.Hour))
+	conn, payload := dialAndSubscribe(ctx, t, rig.wsURL, sessionRow.ID.String(), token)
+	defer func() { _ = conn.CloseNow() }()
+
+	got, ok := payload.State["correlationId"]
+	if !ok {
+		t.Fatal("State has no \"correlationId\" key at all")
+	}
+	if got != secondCorrelationID {
+		t.Errorf("State[correlationId] = %v, want the SECOND (newest) turn's own %q, not the first's", got, secondCorrelationID)
+	}
+}
+
+// TestClientHandler_SubscribedPayloadCorrelationIdNullWithNoTurns proves
+// the honest null case: a session with no turns at all reports
+// state.correlationId as null, never a fabricated value.
+func TestClientHandler_SubscribedPayloadCorrelationIdNullWithNoTurns(t *testing.T) {
+	rig, sessionRow := newClientTestRig(t, platform.DefaultTimeouts())
+	ctx := context.Background()
+
+	token := createTestWSToken(ctx, t, rig.pool, sessionRow.ID, time.Now().Add(24*time.Hour))
+	conn, payload := dialAndSubscribe(ctx, t, rig.wsURL, sessionRow.ID.String(), token)
+	defer func() { _ = conn.CloseNow() }()
+
+	got, ok := payload.State["correlationId"]
+	if !ok {
+		t.Fatal("State has no \"correlationId\" key at all")
+	}
+	if got != nil {
+		t.Errorf("State[correlationId] = %v, want nil (this session has no turns yet)", got)
+	}
+}
+
+// dialAndSubscribe connects, sends the subscribe frame, reads back and
+// parses the subscribed reply -- mirrors TestClientHandler_
+// ValidHandshakeSubscribes' own inline sequence, factored out because
+// TestClientHandler_ParticipantsReflectsLiveConnections needs the parsed
+// payload (not just an open, subscribed conn the way subscribeClient's
+// own existing callers do).
+func dialAndSubscribe(ctx context.Context, t *testing.T, wsURL, sessionID, token string) (*websocket.Conn, clientws.SubscribedPayload) {
+	t.Helper()
+
+	conn, _, err := websocket.Dial(ctx, wsURL+"/sessions/"+sessionID+"/ws?type=client", nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+
+	req := clientws.SubscribeRequest{Token: token, ClientId: "test-client-" + token[:8]}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal subscribe request: %v", err)
+	}
+	if err := conn.Write(ctx, websocket.MessageText, raw); err != nil {
+		t.Fatalf("Write subscribe: %v", err)
+	}
+
+	rc, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, data, err := conn.Read(rc)
+	if err != nil {
+		t.Fatalf("Read subscribed reply: %v", err)
+	}
+
+	var payload clientws.SubscribedPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("unmarshal SubscribedPayload: %v (%s)", err, data)
+	}
+	return conn, payload
+}
+
+// participantNames extracts displayName from every SubscribedPayload.
+// Participants element, failing the test outright on a missing/
+// wrong-typed field rather than silently skipping it -- a malformed
+// participant element here would be this Step's OWN bug (resolveParticipants,
+// client.go), never untrusted external input the way an event payload is.
+func participantNames(t *testing.T, payload clientws.SubscribedPayload) []string {
+	t.Helper()
+
+	names := make([]string, len(payload.Participants))
+	for i, p := range payload.Participants {
+		name, ok := p["displayName"].(string)
+		if !ok {
+			t.Fatalf("participant %d has no string displayName: %v", i, p)
+		}
+		names[i] = name
+	}
+	return names
+}
+
+// equalUnordered reports whether got and want contain the same elements,
+// ignoring order -- Hub.Participants (client.go) makes no ordering
+// promise (map iteration).
+func equalUnordered(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	counts := make(map[string]int, len(want))
+	for _, w := range want {
+		counts[w]++
+	}
+	for _, g := range got {
+		counts[g]--
+	}
+	for _, c := range counts {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // TestClientHandler_SubscribeReplaysFailedUploadStatusAndFailureReason is

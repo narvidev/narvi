@@ -41,25 +41,39 @@
 //   signal than the mockup's abstract stage names, just not the same
 //   granularity. Labeled in the UI as observed from this session's own
 //   events, never claimed as the authoritative transition ledger.
-// - runtime fingerprint / correlation id: NOT AVAILABLE ANYWHERE ON THE
-//   WIRE TODAY, confirmed by reading the full producer chain:
-//   sandboxboot.BootFingerprint (internal/domain/sandboxboot/
-//   fingerprint.go) is computed inside cmd/sandbox-agent and only ever
-//   passed to slog.Info -- it is never attached to any sandbox-ws event,
-//   never written to Postgres, never reaches the control plane at all.
-//   Correlation id is a PER-REQUEST concept (internal/platform/
-//   correlation.go's own X-Correlation-Id), persisted only onto
-//   audit_log/outbox/automation_runs rows -- never onto sessions or
-//   sandboxes. Closing this gap for real needs new sandbox-agent -> CP
-//   wire plumbing (a new event field or endpoint) and is out of this
-//   Step's own scope (a UI Step, not a wire-contract Step) -- named here,
-//   the same way §19.2 names image GC as future work, rather than
-//   fabricated or silently omitted. SessionRail.tsx renders an honest
-//   "not reported yet" for both rather than inventing a value.
+// - runtime fingerprint (agentVersion/imageDigest): REAL, sourced from
+//   snapshot ONLY (state.sandbox's own agentVersion/imageDigest,
+//   sandboxWireMap) -- never event-log-derived, because no CLIENT-visible
+//   event carries it (sandbox-ws's own "ready" event does, §12.2 item 1,
+//   but that fact reaches the browser only via the persisted sandboxes
+//   row this snapshot already reads). Null until this gen's own first
+//   "ready" event has landed server-side, or after a respawn resets it
+//   (client.go's own UpsertSandboxForSpawn doc comment) -- SessionRail.tsx
+//   renders an honest "not reported yet" for that window, never a stale
+//   previous-gen value.
+// - correlation id: a SEPARATE, per-request concept -- see
+//   sessionCorrelationId.ts, not this module. Deliberately not folded into
+//   SandboxRailModel alongside the fingerprint above even though both
+//   render in the same rail panel: a fingerprint is a property of the
+//   sandbox (this gen, stable for its whole life); a correlation id names
+//   a REQUEST (this session's latest turn), a materially different
+//   lifetime forcing the two into one shape would obscure.
 import type { EventEnvelope } from '../ws/types'
 import { isPlainObject } from '../ws/util'
 import { asBootProgress, asReady, asSandboxError } from './eventPayloads'
 import type { SandboxSnapshot } from './sandboxSnapshot'
+
+/** shortDigest truncates an image digest for display -- mirrors SessionRail.tsx's own ArtifactRow's established `sha.slice(0, 7)` short-SHA convention, but strips a leading "algo:" prefix first (e.g. "sha256:") when present, since truncating THAT unchanged would just show the algorithm name, never any of the digest itself. */
+export function shortDigest(digest: string): string {
+  const withoutAlgo = digest.includes(':') ? digest.slice(digest.indexOf(':') + 1) : digest
+  return withoutAlgo.slice(0, 7)
+}
+
+/** runtimeLabel renders the mockup's own "v1.4.2 · img 9f31c" convention (docs/design/mockups.html) from the sandbox's own real agentVersion/imageDigest -- null when either is still unreported (this gen's own "ready" event has not landed yet, or it was just reset by a respawn), so the caller (SessionRail.tsx) falls back to an honest "not reported yet" rather than a half-filled string. */
+export function runtimeLabel(agentVersion: string | null, imageDigest: string | null): string | null {
+  if (agentVersion === null || imageDigest === null) return null
+  return `${agentVersion} · img ${shortDigest(imageDigest)}`
+}
 
 export interface BootPhase {
   phase: string
@@ -87,6 +101,10 @@ export interface SandboxRailModel {
   transitions: SandboxTransition[]
   /** True once there is ANY evidence a sandbox exists (a snapshot, or at least one gen-bearing event) -- distinguishes "genuinely nothing yet" (a brand-new, not-yet-dispatched session) from "a sandbox exists but this session has nothing further to show". */
   hasSandbox: boolean
+  /** §12.2 item 1's own runtime-fingerprint gap -- see this file's own top comment for why this is snapshot-only, never event-log-derived. Null until this gen's own first "ready" event reports it. */
+  agentVersion: string | null
+  /** Pairs with agentVersion -- same null-until-ready shape. */
+  imageDigest: string | null
 }
 
 function extractGen(payload: unknown): number | null {
@@ -154,5 +172,14 @@ export function buildSandboxRailModel(events: readonly EventEnvelope[], snapshot
     }
   }
 
-  return { status, gen, lastSeenAt, bootPhases, transitions, hasSandbox }
+  return {
+    status,
+    gen,
+    lastSeenAt,
+    bootPhases,
+    transitions,
+    hasSandbox,
+    agentVersion: snapshot?.agentVersion ?? null,
+    imageDigest: snapshot?.imageDigest ?? null,
+  }
 }

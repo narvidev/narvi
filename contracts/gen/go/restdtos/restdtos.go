@@ -253,6 +253,13 @@ type Automation struct {
 	// own runs fan out against.
 	Repos []AutomationReposElem `json:"repos" yaml:"repos" mapstructure:"repos"`
 
+	// §12.2 item 4's own health-column success ratio ("12/12 ok", "47/48 ok") -- an
+	// ALL-TIME count over automation_runs
+	// (postgres.AutomationRunStore.ListRunHealth), computed fresh on every read,
+	// never a persisted counter. Null when this automation has never had a terminal
+	// (succeeded/failed) run -- an honest "no runs yet", never a fabricated 0/0.
+	RunHealth *AutomationRunHealth `json:"runHealth,omitempty,omitzero" yaml:"runHealth,omitempty" mapstructure:"runHealth,omitempty"`
+
 	// Meaningful only when sandboxMockConfigured is true; null means the default
 	// "contracts/api".
 	SandboxContractsPath AutomationSandboxContractsPath `json:"sandboxContractsPath" yaml:"sandboxContractsPath" mapstructure:"sandboxContractsPath"`
@@ -568,6 +575,47 @@ type AutomationRun struct {
 
 // Null while status is starting/running.
 type AutomationRunCompletedAt = *time.Time
+
+// §12.2 item 4's own health-column success ratio ("12/12 ok", "47/48 ok") -- an
+// ALL-TIME count over automation_runs (postgres.AutomationRunStore.ListRunHealth),
+// computed fresh on every read, never a persisted counter. Null when this
+// automation has never had a terminal (succeeded/failed) run -- an honest "no runs
+// yet", never a fabricated 0/0.
+type AutomationRunHealth struct {
+	// Runs that reached automation_run_status 'succeeded', all-time.
+	SucceededRuns int `json:"succeededRuns" yaml:"succeededRuns" mapstructure:"succeededRuns"`
+
+	// Runs that reached EITHER terminal status ('succeeded' or 'failed'), all-time --
+	// the ratio's own denominator.
+	TerminalRuns int `json:"terminalRuns" yaml:"terminalRuns" mapstructure:"terminalRuns"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *AutomationRunHealth) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["succeededRuns"]; raw != nil && !ok {
+		return fmt.Errorf("field succeededRuns in AutomationRunHealth: required")
+	}
+	if _, ok := raw["terminalRuns"]; raw != nil && !ok {
+		return fmt.Errorf("field terminalRuns in AutomationRunHealth: required")
+	}
+	type Plain AutomationRunHealth
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if 0 > plain.SucceededRuns {
+		return fmt.Errorf("field %s: must be >= %v", "succeededRuns", 0)
+	}
+	if 0 > plain.TerminalRuns {
+		return fmt.Errorf("field %s: must be >= %v", "terminalRuns", 0)
+	}
+	*j = AutomationRunHealth(plain)
+	return nil
+}
 
 // Null until this run's own linked turn first reaches Processing
 // (automation.RunTriggerProcessing).
@@ -7682,6 +7730,12 @@ type ReviewReadout struct {
 	// stored, potentially-stale line number.
 	Findings []ReviewReadoutFinding `json:"findings" yaml:"findings" mapstructure:"findings"`
 
+	// §12.2 item 2's own 'handoff-readiness display' gap (§14.4). Null when the
+	// handoff-readiness sentinel never flagged anything for this PR
+	// (handoff_sentinel_runs carries no row) -- including every PR that was never a
+	// scoped-session prototype in the first place.
+	HandoffReadiness *ReviewReadoutHandoffReadiness `json:"handoffReadiness,omitempty,omitzero" yaml:"handoffReadiness,omitempty" mapstructure:"handoffReadiness,omitempty"`
+
 	// This PR's own verdict history, newest first, bounded -- the rail's own
 	// 'History' panel (§26.1 item 5).
 	History []ReviewVerdictHistoryEntry `json:"history" yaml:"history" mapstructure:"history"`
@@ -7707,6 +7761,28 @@ type ReviewReadout struct {
 
 	// owner/repo, resolved server-side from github_pr_sessions.
 	RepoFullName string `json:"repoFullName" yaml:"repoFullName" mapstructure:"repoFullName"`
+
+	// §12.2 item 2's own 'sentinel auto-fix PR link with its merge-gated state' gap
+	// (§17). Null when no sentinel-fix was ever triggered for this PR (sentinel_fixes
+	// carries no row).
+	SentinelFix *ReviewReadoutSentinelFix `json:"sentinelFix,omitempty,omitzero" yaml:"sentinelFix,omitempty" mapstructure:"sentinelFix,omitempty"`
+
+	// §12.2 item 2's own 'coalesced-mention/session-reuse info' gap (mockups.html's
+	// own 'trigger: @mention x2 -> coalesced' / 'session: reused (same PR)'). Never
+	// null: this session was necessarily created via github_pr_sessions' own atomic
+	// claim for THIS PR to reach this handler at all (GetReviewReadout's own
+	// 400-if-absent check upstream).
+	SessionReuse ReviewReadoutSessionReuse `json:"sessionReuse" yaml:"sessionReuse" mapstructure:"sessionReuse"`
+
+	// §12.2 item 2's own 'visual-QA sentinel status' gap. Read live from this PR's
+	// own current GitHub labels (the SAME fetch prTitle/prState above already make --
+	// no second outbound call) for a 'visual-qa:' prefixed label; the suffix after
+	// the colon, verbatim and unvalidated (a human-applied external label, §8's own
+	// 'visual-qa: pass/skip' -- this is not a value Narvi computes or constrains).
+	// Null when no such label is present, OR on the same degraded-fetch condition
+	// prTitle/prState already document -- the two cases are indistinguishable here
+	// for the identical reason they are for those two fields.
+	VisualQa ReviewReadoutVisualQa `json:"visualQa,omitempty,omitzero" yaml:"visualQa,omitempty" mapstructure:"visualQa,omitempty"`
 }
 
 // The authoring session's own most recent non-'none' builder epistemic-check
@@ -7888,6 +7964,53 @@ func (j *ReviewReadoutFinding) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// §12.2 item 2's own 'handoff-readiness display' gap (§14.4). Null when the
+// handoff-readiness sentinel never flagged anything for this PR
+// (handoff_sentinel_runs carries no row) -- including every PR that was never a
+// scoped-session prototype in the first place.
+type ReviewReadoutHandoffReadiness struct {
+	// Whether the handoff-readiness sentinel's own contract-drift check (§14.3/§14.4,
+	// internal/domain/contractdrift) flagged this PR's repo as having drifted from
+	// contracts/api/* when this sentinel ran.
+	ContractDriftFlagged bool `json:"contractDriftFlagged" yaml:"contractDriftFlagged" mapstructure:"contractDriftFlagged"`
+
+	// When the handoff-readiness sentinel claimed (handoff_sentinel_runs.created_at)
+	// -- the moment it posted its label/comment for this PR.
+	FlaggedAt time.Time `json:"flaggedAt" yaml:"flaggedAt" mapstructure:"flaggedAt"`
+
+	// How many backend-adjacent TODO/FIXME markers
+	// (internal/domain/handoff.ScanTODOs) the sentinel found in this PR's own diff
+	// when it ran.
+	TodoCount int `json:"todoCount" yaml:"todoCount" mapstructure:"todoCount"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *ReviewReadoutHandoffReadiness) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["contractDriftFlagged"]; raw != nil && !ok {
+		return fmt.Errorf("field contractDriftFlagged in ReviewReadoutHandoffReadiness: required")
+	}
+	if _, ok := raw["flaggedAt"]; raw != nil && !ok {
+		return fmt.Errorf("field flaggedAt in ReviewReadoutHandoffReadiness: required")
+	}
+	if _, ok := raw["todoCount"]; raw != nil && !ok {
+		return fmt.Errorf("field todoCount in ReviewReadoutHandoffReadiness: required")
+	}
+	type Plain ReviewReadoutHandoffReadiness
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if 0 > plain.TodoCount {
+		return fmt.Errorf("field %s: must be >= %v", "todoCount", 0)
+	}
+	*j = ReviewReadoutHandoffReadiness(plain)
+	return nil
+}
+
 // Null when no verdict has ever been posted for this PR -- an honest 'not reviewed
 // yet' state, never a fabricated placeholder verdict.
 type ReviewReadoutLatestVerdict struct {
@@ -7983,6 +8106,95 @@ type ReviewReadoutPrState *string
 // internal/app/reviewcontext.Fetch's own established 'a failed fetch degrades
 // gracefully' posture).
 type ReviewReadoutPrTitle *string
+
+// §12.2 item 2's own 'sentinel auto-fix PR link with its merge-gated state' gap
+// (§17). Null when no sentinel-fix was ever triggered for this PR (sentinel_fixes
+// carries no row).
+type ReviewReadoutSentinelFix struct {
+	// The fix PR's own number, once it has actually been opened (§17.2) -- null while
+	// status is still 'pending'/'spawned'.
+	FixPrNumber ReviewReadoutSentinelFixFixPrNumber `json:"fixPrNumber" yaml:"fixPrNumber" mapstructure:"fixPrNumber"`
+
+	// Observability only, never authoritative (§17.6's own doc comment: the real
+	// answer is always a fresh GetPullRequest.Stack read) -- whether Narvi's own POST
+	// .../stacks registration call was last observed to succeed.
+	StackRegistered bool `json:"stackRegistered" yaml:"stackRegistered" mapstructure:"stackRegistered"`
+
+	// sentinel_fixes.status verbatim (a plain TEXT column, not a DB-level enum) --
+	// one of 'pending'/'spawned'/'fix_open'/'fix_merged'/'abandoned' today
+	// (migrations/000047_sentinel_fixes.up.sql), modeled here as an unconstrained
+	// string for the same reason ReviewReadoutVerdict.reviewPath is.
+	Status string `json:"status" yaml:"status" mapstructure:"status"`
+}
+
+// The fix PR's own number, once it has actually been opened (§17.2) -- null while
+// status is still 'pending'/'spawned'.
+type ReviewReadoutSentinelFixFixPrNumber *int
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *ReviewReadoutSentinelFix) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["fixPrNumber"]; raw != nil && !ok {
+		return fmt.Errorf("field fixPrNumber in ReviewReadoutSentinelFix: required")
+	}
+	if _, ok := raw["stackRegistered"]; raw != nil && !ok {
+		return fmt.Errorf("field stackRegistered in ReviewReadoutSentinelFix: required")
+	}
+	if _, ok := raw["status"]; raw != nil && !ok {
+		return fmt.Errorf("field status in ReviewReadoutSentinelFix: required")
+	}
+	type Plain ReviewReadoutSentinelFix
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = ReviewReadoutSentinelFix(plain)
+	return nil
+}
+
+// ReviewReadout.sessionReuse's own shape -- see that field's own description.
+type ReviewReadoutSessionReuse struct {
+	// When this PR's own claim row was first created (github_pr_sessions.claimed_at)
+	// -- the original @mention/label-trigger's own timestamp, never updated on reuse.
+	ClaimedAt time.Time `json:"claimedAt" yaml:"claimedAt" mapstructure:"claimedAt"`
+
+	// How many times github_pr_sessions' own atomic claim for (repoFullName,
+	// prNumber) has been taken -- 1 for the original @mention/label-trigger that
+	// created this review session, incremented once per REUSE (a later @mention or
+	// label re-trigger coalescing onto the SAME session, coalesce.go's own
+	// CreateOrJoin). All-time, never a windowed count. A manual 'Re-run review' click
+	// or §24's automatic on-commit re-review do NOT increment this -- they reach an
+	// already-known session directly, never through the coalescing claim this count
+	// measures.
+	MentionCount int `json:"mentionCount" yaml:"mentionCount" mapstructure:"mentionCount"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *ReviewReadoutSessionReuse) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["claimedAt"]; raw != nil && !ok {
+		return fmt.Errorf("field claimedAt in ReviewReadoutSessionReuse: required")
+	}
+	if _, ok := raw["mentionCount"]; raw != nil && !ok {
+		return fmt.Errorf("field mentionCount in ReviewReadoutSessionReuse: required")
+	}
+	type Plain ReviewReadoutSessionReuse
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if 1 > plain.MentionCount {
+		return fmt.Errorf("field %s: must be >= %v", "mentionCount", 1)
+	}
+	*j = ReviewReadoutSessionReuse(plain)
+	return nil
+}
 
 // One review_verdicts row's own full REST wire shape (§21.1/§26.1) -- the merge
 // readout's own header + digest content. Mirrors PostReviewVerdictRequest's own
@@ -8351,6 +8563,16 @@ func (j *ReviewReadoutVerdict) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// §12.2 item 2's own 'visual-QA sentinel status' gap. Read live from this PR's own
+// current GitHub labels (the SAME fetch prTitle/prState above already make -- no
+// second outbound call) for a 'visual-qa:' prefixed label; the suffix after the
+// colon, verbatim and unvalidated (a human-applied external label, §8's own
+// 'visual-qa: pass/skip' -- this is not a value Narvi computes or constrains).
+// Null when no such label is present, OR on the same degraded-fetch condition
+// prTitle/prState already document -- the two cases are indistinguishable here for
+// the identical reason they are for those two fields.
+type ReviewReadoutVisualQa *string
+
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *ReviewReadout) UnmarshalJSON(value []byte) error {
 	var raw map[string]interface{}
@@ -8368,6 +8590,9 @@ func (j *ReviewReadout) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["repoFullName"]; raw != nil && !ok {
 		return fmt.Errorf("field repoFullName in ReviewReadout: required")
+	}
+	if _, ok := raw["sessionReuse"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionReuse in ReviewReadout: required")
 	}
 	type Plain ReviewReadout
 	var plain Plain
@@ -11267,10 +11492,13 @@ type WorkflowStepRunOutcomeSummary *string
 type WorkflowStepRunStatus string
 
 const WorkflowStepRunStatusAwaitingDecision WorkflowStepRunStatus = "awaiting_decision"
-const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
 const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
 const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
 const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
+
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
+
+const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
 
 var enumValues_WorkflowStepRunStatus = []interface{}{
 	"awaiting_decision",
@@ -11361,5 +11589,3 @@ func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
 	*j = WorkflowStepRun(plain)
 	return nil
 }
-
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict

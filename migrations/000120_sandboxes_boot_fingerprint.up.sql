@@ -1,0 +1,30 @@
+-- §12.2 item 1's session rail names a "runtime fingerprint" alongside gen/
+-- last-seen/correlation id and, until now, could only ever render "not
+-- reported yet" for it: sandboxboot.BootFingerprint (internal/domain/
+-- sandboxboot/fingerprint.go) is computed inside cmd/sandbox-agent at
+-- boot but was only ever passed to slog.Info, never attached to any
+-- sandbox-ws event or persisted here (§5.2/§5.3).
+--
+-- agent_version/image_digest are a PROPERTY OF THE SANDBOX itself (this
+-- gen's own running binary/image), not a per-request fact -- they belong
+-- on this table, keyed by session_id exactly like status/gen already are,
+-- deliberately NOT alongside a correlation id (a property of a REQUEST,
+-- migrations/000121_turns_correlation_id.up.sql's own separate column on
+-- turns): the two are named side by side on the same screen but are not
+-- the same shape, and forcing them onto one row here would conflate a
+-- fact that is stable for a sandbox's whole gen with one that is fresh
+-- per turn.
+--
+-- Nullable: absent until this gen's own first "ready" event reports them
+-- (sandboxagent/wsbridge's own sendReady, §6.1) -- a sandbox row can
+-- exist (UpsertSandboxForSpawn, 'pending'/'spawning') well before that.
+-- UpsertSandboxForSpawn's own ON CONFLICT (respawn) branch resets both
+-- back to NULL for the SAME reason it does NOT do that for provider_id
+-- (that column's own doc comment) but in the OPPOSITE direction: a stale
+-- previous-gen provider_id is harmless because nothing ever renders it to
+-- a human, but a stale previous-gen fingerprint rendered on this rail
+-- would be actively misleading while the new gen is still connecting/
+-- booting -- "not reported yet" is the honest state for that window, not
+-- last gen's own now-obsolete value.
+ALTER TABLE sandboxes ADD COLUMN agent_version TEXT;
+ALTER TABLE sandboxes ADD COLUMN image_digest TEXT;

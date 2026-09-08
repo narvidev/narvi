@@ -394,7 +394,7 @@ function Section({ kind, items, canMerge }: { kind: DecisionInboxItem['kind']; i
  * mutually exclusive"). scmAsOf is only ever shown as a staleness
  * marker ("as of N ago"), never as live truth.
  */
-function ScmStatusBanner({ scmAsOf, scmFetchFailed }: { scmAsOf: string | null; scmFetchFailed: boolean }) {
+export function ScmStatusBanner({ scmAsOf, scmFetchFailed }: { scmAsOf: string | null; scmFetchFailed: boolean }) {
   if (scmFetchFailed) {
     return (
       <div className="sync-banner sync-banner-warn" role="status">

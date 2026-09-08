@@ -15,7 +15,7 @@ const clearPendingRetriggerHeadSHA = `-- name: ClearPendingRetriggerHeadSHA :one
 UPDATE github_pr_sessions
 SET pending_retrigger_head_sha = NULL
 WHERE repo_full_name = $1 AND pr_number = $2 AND pending_retrigger_head_sha = $3
-RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at
+RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count
 `
 
 type ClearPendingRetriggerHeadSHAParams struct {
@@ -63,6 +63,7 @@ func (q *Queries) ClearPendingRetriggerHeadSHA(ctx context.Context, arg ClearPen
 		&i.AutoRetriggerBudgetNoticeSentAt,
 		&i.PrMerged,
 		&i.PrClosedAt,
+		&i.MentionCount,
 	)
 	return i, err
 }
@@ -97,7 +98,7 @@ func (q *Queries) EnsureGitHubPRSessionRow(ctx context.Context, arg EnsureGitHub
 }
 
 const getGitHubPRSessionBySessionID = `-- name: GetGitHubPRSessionBySessionID :one
-SELECT repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at FROM github_pr_sessions
+SELECT repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count FROM github_pr_sessions
 WHERE session_id = $1
 `
 
@@ -122,6 +123,7 @@ func (q *Queries) GetGitHubPRSessionBySessionID(ctx context.Context, sessionID p
 		&i.AutoRetriggerBudgetNoticeSentAt,
 		&i.PrMerged,
 		&i.PrClosedAt,
+		&i.MentionCount,
 	)
 	return i, err
 }
@@ -130,7 +132,7 @@ const incrementAutoRetriggerCount = `-- name: IncrementAutoRetriggerCount :one
 UPDATE github_pr_sessions
 SET auto_retrigger_count = auto_retrigger_count + 1
 WHERE repo_full_name = $1 AND pr_number = $2
-RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at
+RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count
 `
 
 type IncrementAutoRetriggerCountParams struct {
@@ -158,6 +160,58 @@ func (q *Queries) IncrementAutoRetriggerCount(ctx context.Context, arg Increment
 		&i.AutoRetriggerBudgetNoticeSentAt,
 		&i.PrMerged,
 		&i.PrClosedAt,
+		&i.MentionCount,
+	)
+	return i, err
+}
+
+const incrementGitHubPRSessionMentionCount = `-- name: IncrementGitHubPRSessionMentionCount :one
+UPDATE github_pr_sessions
+SET mention_count = mention_count + 1
+WHERE repo_full_name = $1 AND pr_number = $2
+RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count
+`
+
+type IncrementGitHubPRSessionMentionCountParams struct {
+	RepoFullName string `json:"repo_full_name"`
+	PrNumber     int32  `json:"pr_number"`
+}
+
+// §12.2 item 2's own "coalesced-mention/session-reuse info" gap
+// (migrations/000122_github_pr_sessions_mention_count.up.sql's own doc
+// comment): called from coalesce.go's own REUSE branch, AFTER that
+// transaction's own early commit -- audit fix, moved off
+// LockGitHubPRSessionForUpdate's own row lock deliberately (it used to run
+// while still holding it, before that same commit): the increment must
+// only land once the REUSE attempt has actually cleared authorization AND
+// produced a real turn, both of which happen post-commit (coalesce.go's
+// own CreateOrJoin top doc comment explains why that ownership-aware
+// authz check itself cannot run any earlier), so counting had to move
+// with it or a denied/failed attempt would inflate this column with no
+// corresponding turn. Still needs no application-level CAS guard despite
+// holding no lock at call time: this is a single UPDATE statement, and
+// Postgres holds the target row's lock for that ONE statement's own
+// duration regardless of any ambient transaction -- two concurrent REUSE
+// callers for the SAME PR simply apply in whichever order Postgres
+// schedules their two UPDATE statements, never losing either one. Compare
+// IncrementAutoRetriggerCount's own DIFFERENT "only ever reached under a
+// lock/single-writer" reasoning immediately below -- that column has a
+// single writer (this PR's own session actor) and needs neither this
+// reasoning nor that one to be safe.
+func (q *Queries) IncrementGitHubPRSessionMentionCount(ctx context.Context, arg IncrementGitHubPRSessionMentionCountParams) (GithubPrSession, error) {
+	row := q.db.QueryRow(ctx, incrementGitHubPRSessionMentionCount, arg.RepoFullName, arg.PrNumber)
+	var i GithubPrSession
+	err := row.Scan(
+		&i.RepoFullName,
+		&i.PrNumber,
+		&i.SessionID,
+		&i.ClaimedAt,
+		&i.PendingRetriggerHeadSha,
+		&i.AutoRetriggerCount,
+		&i.AutoRetriggerBudgetNoticeSentAt,
+		&i.PrMerged,
+		&i.PrClosedAt,
+		&i.MentionCount,
 	)
 	return i, err
 }
@@ -191,7 +245,7 @@ const markAutoRetriggerBudgetNoticeSent = `-- name: MarkAutoRetriggerBudgetNotic
 UPDATE github_pr_sessions
 SET auto_retrigger_budget_notice_sent_at = now()
 WHERE repo_full_name = $1 AND pr_number = $2 AND auto_retrigger_budget_notice_sent_at IS NULL
-RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at
+RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count
 `
 
 type MarkAutoRetriggerBudgetNoticeSentParams struct {
@@ -219,6 +273,7 @@ func (q *Queries) MarkAutoRetriggerBudgetNoticeSent(ctx context.Context, arg Mar
 		&i.AutoRetriggerBudgetNoticeSentAt,
 		&i.PrMerged,
 		&i.PrClosedAt,
+		&i.MentionCount,
 	)
 	return i, err
 }
@@ -228,7 +283,7 @@ const recordMergeOutcome = `-- name: RecordMergeOutcome :one
 UPDATE github_pr_sessions
 SET pr_merged = $3, pr_closed_at = $4
 WHERE repo_full_name = $1 AND pr_number = $2 AND session_id IS NOT NULL
-RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at
+RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count
 `
 
 type RecordMergeOutcomeParams struct {
@@ -278,6 +333,7 @@ func (q *Queries) RecordMergeOutcome(ctx context.Context, arg RecordMergeOutcome
 		&i.AutoRetriggerBudgetNoticeSentAt,
 		&i.PrMerged,
 		&i.PrClosedAt,
+		&i.MentionCount,
 	)
 	return i, err
 }
@@ -339,7 +395,7 @@ const upsertPendingRetriggerHeadSHA = `-- name: UpsertPendingRetriggerHeadSHA :o
 UPDATE github_pr_sessions
 SET pending_retrigger_head_sha = $3
 WHERE repo_full_name = $1 AND pr_number = $2 AND session_id IS NOT NULL
-RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at
+RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count
 `
 
 type UpsertPendingRetriggerHeadSHAParams struct {
@@ -386,6 +442,7 @@ func (q *Queries) UpsertPendingRetriggerHeadSHA(ctx context.Context, arg UpsertP
 		&i.AutoRetriggerBudgetNoticeSentAt,
 		&i.PrMerged,
 		&i.PrClosedAt,
+		&i.MentionCount,
 	)
 	return i, err
 }

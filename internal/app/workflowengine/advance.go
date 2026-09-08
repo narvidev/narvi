@@ -247,13 +247,22 @@ func dispatchNextAttempt(ctx context.Context, deps Deps, runID pgtype.UUID, toSt
 	// plan-mode).
 	dispatchedPrompt := turn.MaybeInjectEpistemicPreamble(deps.EpistemicCheckDefault, sessionRow.EpistemicCheckEnabled, false, res.Prompt)
 
+	// correlationID (§12.2 item 1's own session-rail gap, migrations/
+	// 000121_turns_correlation_id.up.sql) -- nil when the workflow engine's
+	// own dispatch loop carries no live request context, mirroring every
+	// other CreateTurnParams call site's identical convention.
+	var correlationID *string
+	if id, ok := platform.CorrelationIDFromContext(ctx); ok && id != "" {
+		correlationID = &id
+	}
 	created, err := deps.Turns.Create(ctx, sqlcgen.CreateTurnParams{
-		SessionID: sessionRow.ID,
-		Status:    sqlcgen.TurnStatusPending,
-		Prompt:    &dispatchedPrompt,
-		ModelID:   res.ModelID,
-		Effort:    res.Effort,
-		PlanMode:  false,
+		SessionID:     sessionRow.ID,
+		Status:        sqlcgen.TurnStatusPending,
+		Prompt:        &dispatchedPrompt,
+		ModelID:       res.ModelID,
+		Effort:        res.Effort,
+		PlanMode:      false,
+		CorrelationID: correlationID,
 	})
 	if err != nil {
 		return pgtype.UUID{}, fmt.Errorf("create next turn: %w", err)
