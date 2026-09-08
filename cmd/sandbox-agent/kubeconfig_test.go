@@ -340,6 +340,13 @@ func TestApplyClusterBinding_KubeconfigPermissions(t *testing.T) {
 // a valid credential at the exact path the rendered kubeconfig names,
 // with no subcommand, no exec plugin, and no re-exposure of the
 // sandbox's own bearer token anywhere in that process tree.
+//
+// On the 5-second hookTimeout below: see
+// TestCloudIdentityTokenReachesRealSpawnedHook's own doc comment
+// (cloudidentity_test.go) for the full measurement this test shares --
+// both failed together under the same loaded `make test` run, and both
+// were re-measured together under two independent full-suite runs (0.33s
+// actual here, ~15x under budget). Left unchanged for the same reason.
 func TestOIDCClusterBindingTokenReachesRealSpawnedHook(t *testing.T) {
 	dir := t.TempDir()
 	params, _ := json.Marshal(map[string]string{"clientId": "real-spawn-client"})

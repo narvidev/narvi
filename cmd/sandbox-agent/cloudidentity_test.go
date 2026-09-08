@@ -621,6 +621,22 @@ func TestRunCloudIdentityRefreshLoop_EmptyStatesBlocksThenReturnsOnCtxDone(t *te
 // that env var -- never a hardcoded path -- and the file's own content is
 // exactly what applyCloudIdentityBinding minted, via a fake CP client
 // (no real network dependency).
+//
+// On the 5-second hookTimeout below: this test (with its
+// TestOIDCClusterBindingTokenReachesRealSpawnedHook sibling,
+// kubeconfig_test.go) failed once under a fully-loaded local `make test`
+// with concurrent compile load and passed in isolation immediately after.
+// Measured rather than assumed before touching the ceiling: two
+// independent full `go test -race ./...` runs (the same concurrent-load
+// shape that produced the original failure, on a machine already at a
+// 2x-oversubscribed load average from unrelated concurrent work) both
+// timed this test's actual setup.sh round trip at 0.32s -- under 7% of
+// the 5s budget, a ~15x margin, identical across both runs. That is a
+// real spawn-latency measurement under load, not a clean-room number, and
+// it does not support raising the ceiling: the one observed failure reads
+// as a transient extreme spike consistent with its own "passed isolated
+// immediately after" observation, not as evidence the budget is too
+// tight. Left unchanged.
 func TestCloudIdentityTokenReachesRealSpawnedHook(t *testing.T) {
 	dir := t.TempDir()
 	m := &fakeMinter{tokens: map[string]credentials.MintedCloudIdentityToken{"sts.amazonaws.com": {Token: "real-spawned-process-jwt"}}}
