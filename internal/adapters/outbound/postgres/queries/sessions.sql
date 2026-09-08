@@ -162,3 +162,47 @@ WHERE NOT s.archived
   )
 ORDER BY s.updated_at DESC, s.id DESC
 LIMIT sqlc.arg('row_limit');
+
+-- name: ListSessionOutcomeCountsInWindow :many
+-- §12.2 item 6's own platform-wide analytics rollup: the ONE
+-- Postgres read behind FOUR distinct reductions internal/domain/
+-- platformanalytics performs over its rows (mirrors internal/domain/
+-- reviewverdict.ListRecordsSince's own "one fetch, several pure
+-- reductions" precedent) -- the "Sessions" KPI tile (sum of every
+-- session_count row), "success rate" (completed vs completed+failed),
+-- "sessions per day by outcome" chart (grouped by day+status), and "top
+-- failure reasons" chart (grouped by failure_reason, for status IN
+-- (failed, cancelled)).
+--
+-- A GROUP BY reduction, deliberately NOT a bounded raw-row fetch like
+-- ListRecentlyDecided/ListRecordsSince use for their own, inherently
+-- narrower (per-repo or per-window-of-decisions) scopes: this rollup is
+-- explicitly platform-wide (every repo, every session), so its own true
+-- row count has no natural per-entity bound the way a repo-scoped fetch
+-- does, and an arbitrary LIMIT here would silently UNDERCOUNT the
+-- "Sessions" tile the moment a real deployment's window exceeds it --
+-- the exact kind of quietly-wrong number this Step exists to replace, not
+-- reintroduce. Aggregating in Postgres instead keeps the RESULT set
+-- small (at most a handful of days x 5 statuses x 5 failure reasons)
+-- regardless of how many session rows the window actually contains.
+--
+-- day is truncated to UTC calendar day (date_trunc(...) AT TIME ZONE
+-- 'UTC', converting back to a real timestamptz at UTC midnight) --
+-- mirrors internal/domain/reviewverdict's own truncateToUTCDay, done here
+-- in SQL rather than Go specifically because the day dimension IS the
+-- GROUP BY key (unlike reviewverdict's own Go-side truncation over an
+-- already-fetched, small, repo-scoped row set).
+--
+-- Bounded by sessions_created_at_idx (migrations/
+-- 000125_platform_analytics_indexes.up.sql) -- $1 is the window's own
+-- start (platform.Timeouts.PlatformAnalyticsWindow), never an unbounded
+-- scan.
+SELECT
+    (date_trunc('day', created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')::timestamptz AS day,
+    status,
+    failure_reason,
+    COUNT(*) AS session_count
+FROM sessions
+WHERE created_at >= $1
+GROUP BY (date_trunc('day', created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')::timestamptz, status, failure_reason
+ORDER BY day;

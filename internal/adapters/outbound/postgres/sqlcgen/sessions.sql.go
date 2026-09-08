@@ -249,6 +249,83 @@ func (q *Queries) ListFailedSessions(ctx context.Context, limit int32) ([]Sessio
 	return items, nil
 }
 
+const listSessionOutcomeCountsInWindow = `-- name: ListSessionOutcomeCountsInWindow :many
+SELECT
+    (date_trunc('day', created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')::timestamptz AS day,
+    status,
+    failure_reason,
+    COUNT(*) AS session_count
+FROM sessions
+WHERE created_at >= $1
+GROUP BY (date_trunc('day', created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')::timestamptz, status, failure_reason
+ORDER BY day
+`
+
+type ListSessionOutcomeCountsInWindowRow struct {
+	Day           pgtype.Timestamptz    `json:"day"`
+	Status        SessionStatus         `json:"status"`
+	FailureReason *SessionFailureReason `json:"failure_reason"`
+	SessionCount  int64                 `json:"session_count"`
+}
+
+// §12.2 item 6's own platform-wide analytics rollup: the ONE
+// Postgres read behind FOUR distinct reductions internal/domain/
+// platformanalytics performs over its rows (mirrors internal/domain/
+// reviewverdict.ListRecordsSince's own "one fetch, several pure
+// reductions" precedent) -- the "Sessions" KPI tile (sum of every
+// session_count row), "success rate" (completed vs completed+failed),
+// "sessions per day by outcome" chart (grouped by day+status), and "top
+// failure reasons" chart (grouped by failure_reason, for status IN
+// (failed, cancelled)).
+//
+// A GROUP BY reduction, deliberately NOT a bounded raw-row fetch like
+// ListRecentlyDecided/ListRecordsSince use for their own, inherently
+// narrower (per-repo or per-window-of-decisions) scopes: this rollup is
+// explicitly platform-wide (every repo, every session), so its own true
+// row count has no natural per-entity bound the way a repo-scoped fetch
+// does, and an arbitrary LIMIT here would silently UNDERCOUNT the
+// "Sessions" tile the moment a real deployment's window exceeds it --
+// the exact kind of quietly-wrong number this Step exists to replace, not
+// reintroduce. Aggregating in Postgres instead keeps the RESULT set
+// small (at most a handful of days x 5 statuses x 5 failure reasons)
+// regardless of how many session rows the window actually contains.
+//
+// day is truncated to UTC calendar day (date_trunc(...) AT TIME ZONE
+// 'UTC', converting back to a real timestamptz at UTC midnight) --
+// mirrors internal/domain/reviewverdict's own truncateToUTCDay, done here
+// in SQL rather than Go specifically because the day dimension IS the
+// GROUP BY key (unlike reviewverdict's own Go-side truncation over an
+// already-fetched, small, repo-scoped row set).
+//
+// Bounded by sessions_created_at_idx (migrations/
+// 000125_platform_analytics_indexes.up.sql) -- $1 is the window's own
+// start (platform.Timeouts.PlatformAnalyticsWindow), never an unbounded
+// scan.
+func (q *Queries) ListSessionOutcomeCountsInWindow(ctx context.Context, createdAt pgtype.Timestamptz) ([]ListSessionOutcomeCountsInWindowRow, error) {
+	rows, err := q.db.Query(ctx, listSessionOutcomeCountsInWindow, createdAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListSessionOutcomeCountsInWindowRow
+	for rows.Next() {
+		var i ListSessionOutcomeCountsInWindowRow
+		if err := rows.Scan(
+			&i.Day,
+			&i.Status,
+			&i.FailureReason,
+			&i.SessionCount,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSessions = `-- name: ListSessions :many
 SELECT s.id, s.title, s.status, s.failure_reason, s.archived, s.spawn_source, s.created_by, s.created_at, s.updated_at, s.actor_epoch, s.repos, s.opencode_conversation_id, s.environment_id, s.provenance_tag, s.intent_decision, s.build_model_id, s.parent_session_id, s.spawn_depth, s.build_effort, s.epistemic_check_enabled, sb.status AS sandbox_status FROM sessions s
 LEFT JOIN sandboxes sb ON sb.session_id = s.id

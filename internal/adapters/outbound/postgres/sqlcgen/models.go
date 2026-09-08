@@ -1738,6 +1738,12 @@ type Event struct {
 	MessageID string             `json:"message_id"`
 }
 
+type FalseFailure struct {
+	ID         pgtype.UUID        `json:"id"`
+	SessionID  pgtype.UUID        `json:"session_id"`
+	DetectedAt pgtype.Timestamptz `json:"detected_at"`
+}
+
 type GithubActorLinkNotice struct {
 	RepoFullName string             `json:"repo_full_name"`
 	PrNumber     int32              `json:"pr_number"`
