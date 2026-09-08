@@ -113,6 +113,25 @@ type Item struct {
 	// codebase); it says only that the mechanical criteria for running
 	// that pass were met, never that the pass itself produced anything.
 	AggregateReviewTriggered bool
+	// ManifestCoveragePartial is release_manifest_checks.coverage_partial
+	// -- the persisted record that the constituent-PR listing this
+	// manifest check ran over was TRUNCATED (MergedPRLister's own second
+	// return value, §15.2), so ManifestFindingsCount above is a lower
+	// bound over an incomplete set, never a complete audit. Set ONLY when
+	// IsRelease is true.
+	//
+	// Why this is its own field rather than folded into the count: the
+	// count is still a real, useful lower bound, and nulling it on the
+	// wire would collide with null's established meaning there ("not a
+	// release cut at all"). The alternative -- dropping the fact -- would
+	// render a truncated scan's zero findings identically to a genuinely
+	// clean release cut, which is precisely what reviewpost's own
+	// RenderManifestComment and httpapi's own GetReleaseManifestReadout
+	// (`coveragePartial`) already refuse to do for this SAME persisted
+	// row. The inbox is where the human actually decides; it must not be
+	// the one consumer of that row that claims a completeness guarantee
+	// the port call never gave.
+	ManifestCoveragePartial bool
 
 	// Plan fields (KindAwaitingApproval, non-handoff).
 	PlanID string

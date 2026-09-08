@@ -4161,6 +4161,7 @@
         "hasChangesRequested",
         "isRelease",
         "manifestFindingsCount",
+        "manifestCoveragePartial",
         "aggregateReviewTriggered",
         "planId",
         "sessionId",
@@ -4306,6 +4307,13 @@
             "null"
           ],
           "description": "§15.2's own mechanical manifest-findings count (admin overrides, red-at-merge, unreviewed reverts) -- set iff isRelease is true, null otherwise. NEVER the aggregate diff review's own composition findings (§15.3/§15.4), which nothing in this system computes yet -- this count can be zero on a clean release cut, which is why it is a separate nullable field rather than folded into a chip that would render '0' identically to 'unknown'."
+        },
+        "manifestCoveragePartial": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "True iff the constituent-PR listing that §15.2's manifest check ran over was TRUNCATED, so manifestFindingsCount above is a lower bound over an incomplete set rather than a complete audit -- the SAME fact GetReleaseManifestReadout exposes as `coveragePartial` and the posted manifest comment states in prose, for the same persisted row. Also true when the persisted findings blob could not be decoded at all, because a count that could not be read is not a count of zero. Set iff isRelease is true, null otherwise. A client must NEVER render manifestFindingsCount as a clean result while this is true: a truncated scan that found nothing and a complete scan that found nothing are different claims."
         },
         "aggregateReviewTriggered": {
           "type": [

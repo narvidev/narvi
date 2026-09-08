@@ -198,13 +198,27 @@ export function prChipData(item: Pick<DecisionInboxItem, 'riskLabel' | 'findings
  * -- aggregateReviewTriggered renders as its own, honestly-worded chip
  * instead, saying only that the trigger criteria were met, never
  * implying a finding count that does not exist.
+ *
+ * manifestCoveragePartial is what stops the count from over-claiming.
+ * When it is true the manifest scan ran over a TRUNCATED list of
+ * constituent PRs (or its persisted findings blob could not be decoded),
+ * so the count is a lower bound, not an audit -- and an `ok`-toned
+ * "manifest: 0 flags" would assert a clean release the server explicitly
+ * disclaims on the very same row. A partial scan therefore NEVER renders
+ * `ok`: it says so in the chip text and carries `warn` at worst, `crit`
+ * when it did find something. This mirrors what the release-review
+ * readout (`coveragePartial`) and the posted manifest comment already do
+ * with the identical fact.
  */
-export function releaseChipData(item: Pick<DecisionInboxItem, 'manifestFindingsCount' | 'aggregateReviewTriggered'>): DecisionInboxChip[] {
+export function releaseChipData(item: Pick<DecisionInboxItem, 'manifestFindingsCount' | 'manifestCoveragePartial' | 'aggregateReviewTriggered'>): DecisionInboxChip[] {
   const chips: DecisionInboxChip[] = []
 
   if (item.manifestFindingsCount !== null) {
     const count = item.manifestFindingsCount
-    chips.push({ tone: count > 0 ? 'crit' : 'ok', text: `manifest: ${count} flag${count === 1 ? '' : 's'}` })
+    const partial = item.manifestCoveragePartial === true
+    const text = `manifest: ${count} flag${count === 1 ? '' : 's'}${partial ? ' (partial scan)' : ''}`
+    const tone: DecisionInboxChip['tone'] = count > 0 ? 'crit' : partial ? 'warn' : 'ok'
+    chips.push({ tone, text })
   }
 
   if (item.aggregateReviewTriggered === true) {

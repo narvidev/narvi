@@ -884,6 +884,9 @@ func TestListDecisionInbox_SessionIdAndReleaseCut_FieldsPopulated(t *testing.T) 
 	if pr1400.AggregateReviewTriggered != nil {
 		t.Errorf("PR #1400 AggregateReviewTriggered = %v, want nil (not a release cut)", pr1400.AggregateReviewTriggered)
 	}
+	if pr1400.ManifestCoveragePartial != nil {
+		t.Errorf("PR #1400 ManifestCoveragePartial = %v, want nil (not a release cut -- the flag qualifies a count that is itself absent)", pr1400.ManifestCoveragePartial)
+	}
 
 	pr1401 := byPR[1401]
 	if pr1401 == nil {
@@ -911,6 +914,14 @@ func TestListDecisionInbox_SessionIdAndReleaseCut_FieldsPopulated(t *testing.T) 
 	}
 	if pr1402.SessionId == nil || *pr1402.SessionId != session1402.String() {
 		t.Errorf("PR #1402 SessionId = %v, want a non-nil pointer to %q (the review session that produced its own manifest check)", pr1402.SessionId, session1402.String())
+	}
+	// Its persisted check recorded coverage_partial=false, so the wire
+	// must say false -- present and false, never absent. A client cannot
+	// tell "complete scan" from "this server does not report coverage" if
+	// the field is simply missing, which is the whole reason it rides
+	// isRelease's own gate rather than being omitted when convenient.
+	if pr1402.ManifestCoveragePartial == nil || *pr1402.ManifestCoveragePartial {
+		t.Errorf("PR #1402 ManifestCoveragePartial = %v, want a non-nil pointer to false", pr1402.ManifestCoveragePartial)
 	}
 }
 

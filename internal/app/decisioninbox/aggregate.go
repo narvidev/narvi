@@ -447,7 +447,7 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 	// isReleaseCut/manifestFindingsCount/aggregateReviewTriggered resolve
 	// this PR's own release-cut status -- see resolveReleaseCut's own doc
 	// comment.
-	isReleaseCut, manifestFindingsCount, aggregateReviewTriggered := resolveReleaseCut(ctx, deps, repoFullName, pr.Number)
+	isReleaseCut, manifestFindingsCount, aggregateReviewTriggered, manifestCoveragePartial := resolveReleaseCut(ctx, deps, repoFullName, pr.Number)
 
 	item := Item{
 		RepoFullName:             repoFullName,
@@ -468,6 +468,7 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 		IsRelease:                isReleaseCut,
 		ManifestFindingsCount:    manifestFindingsCount,
 		AggregateReviewTriggered: aggregateReviewTriggered,
+		ManifestCoveragePartial:  manifestCoveragePartial,
 	}
 	item.AgeSeconds = int64(decisioninbox.Age(item.EnteredQueueAt, now).Seconds())
 	item.Stale = decisioninbox.IsStale(item.EnteredQueueAt, now, deps.Timeouts.DecisionInboxStaleAfter)
@@ -955,16 +956,26 @@ func resolveReviewSessionID(ctx context.Context, deps Deps, repoFullName string,
 // findings'"). aggregateReviewTriggered is §15.3's own real, already-
 // computed TRIGGER decision -- distinct from, and never a stand-in for,
 // a composition finding count.
-func resolveReleaseCut(ctx context.Context, deps Deps, repoFullName string, prNumber int) (isReleaseCut bool, manifestFindingsCount int, aggregateReviewTriggered bool) {
+//
+// manifestCoveragePartial carries the persisted coverage_partial flag
+// through unchanged. §15.2's finding computation runs over whatever
+// ListMergedBetween returned, and that port call is allowed to truncate
+// (its own second return value); when it did, len(findings) is a lower
+// bound over an incomplete set. Both other consumers of this same row
+// already refuse to hide that -- reviewpost.RenderManifestComment says so
+// in the posted comment, GetReleaseManifestReadout exposes it as
+// `coveragePartial` -- so the inbox row carries it too rather than being
+// the one place a truncated scan reads as a clean audit.
+func resolveReleaseCut(ctx context.Context, deps Deps, repoFullName string, prNumber int) (isReleaseCut bool, manifestFindingsCount int, aggregateReviewTriggered bool, manifestCoveragePartial bool) {
 	if deps.ReleaseManifestChecks == nil {
-		return false, 0, false
+		return false, 0, false, false
 	}
 	check, err := deps.ReleaseManifestChecks.GetLatest(ctx, repoFullName, int32(prNumber))
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			platform.Logger(ctx).Error("decisioninbox: resolve release cut failed", "error", err, "repo", repoFullName, "pr_number", prNumber)
 		}
-		return false, 0, false
+		return false, 0, false, false
 	}
 
 	var findings []json.RawMessage
@@ -977,9 +988,16 @@ func resolveReleaseCut(ctx context.Context, deps Deps, repoFullName string, prNu
 		// with an honest zero findings count rather than propagating a
 		// decode error into the whole inbox read.
 		platform.Logger(ctx).Error("decisioninbox: unmarshal release manifest findings failed, rendering as zero", "error", err, "repo", repoFullName, "pr_number", prNumber)
-		return true, 0, check.AggregateReviewTriggered
+		// ...and partial, unconditionally: a count that could not be
+		// decoded is not a count of zero. Reusing coverage_partial's own
+		// field for this says exactly the one thing both cases have in
+		// common and the one thing the reader needs -- "the number beside
+		// this row is not a complete audit" -- rather than inventing a
+		// second sentinel for a corrupt row nobody can act on
+		// differently.
+		return true, 0, check.AggregateReviewTriggered, true
 	}
-	return true, len(findings), check.AggregateReviewTriggered
+	return true, len(findings), check.AggregateReviewTriggered, check.CoveragePartial
 }
 
 // buildPlanItems returns every plan-mode plan actorUserID/actorRole is

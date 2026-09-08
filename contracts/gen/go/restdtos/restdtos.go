@@ -2659,6 +2659,17 @@ type DecisionInboxItem struct {
 	// LastError corresponds to the JSON schema field "lastError".
 	LastError DecisionInboxItemLastError `json:"lastError" yaml:"lastError" mapstructure:"lastError"`
 
+	// True iff the constituent-PR listing that §15.2's manifest check ran over was
+	// TRUNCATED, so manifestFindingsCount above is a lower bound over an incomplete
+	// set rather than a complete audit -- the SAME fact GetReleaseManifestReadout
+	// exposes as `coveragePartial` and the posted manifest comment states in prose,
+	// for the same persisted row. Also true when the persisted findings blob could
+	// not be decoded at all, because a count that could not be read is not a count of
+	// zero. Set iff isRelease is true, null otherwise. A client must NEVER render
+	// manifestFindingsCount as a clean result while this is true: a truncated scan
+	// that found nothing and a complete scan that found nothing are different claims.
+	ManifestCoveragePartial DecisionInboxItemManifestCoveragePartial `json:"manifestCoveragePartial" yaml:"manifestCoveragePartial" mapstructure:"manifestCoveragePartial"`
+
 	// §15.2's own mechanical manifest-findings count (admin overrides, red-at-merge,
 	// unreviewed reverts) -- set iff isRelease is true, null otherwise. NEVER the
 	// aggregate diff review's own composition findings (§15.3/§15.4), which nothing
@@ -2829,6 +2840,17 @@ func (j *DecisionInboxItemKind) UnmarshalJSON(value []byte) error {
 
 type DecisionInboxItemLastError *string
 
+// True iff the constituent-PR listing that §15.2's manifest check ran over was
+// TRUNCATED, so manifestFindingsCount above is a lower bound over an incomplete
+// set rather than a complete audit -- the SAME fact GetReleaseManifestReadout
+// exposes as `coveragePartial` and the posted manifest comment states in prose,
+// for the same persisted row. Also true when the persisted findings blob could not
+// be decoded at all, because a count that could not be read is not a count of
+// zero. Set iff isRelease is true, null otherwise. A client must NEVER render
+// manifestFindingsCount as a clean result while this is true: a truncated scan
+// that found nothing and a complete scan that found nothing are different claims.
+type DecisionInboxItemManifestCoveragePartial *bool
+
 // §15.2's own mechanical manifest-findings count (admin overrides, red-at-merge,
 // unreviewed reverts) -- set iff isRelease is true, null otherwise. NEVER the
 // aggregate diff review's own composition findings (§15.3/§15.4), which nothing in
@@ -2963,6 +2985,9 @@ func (j *DecisionInboxItem) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["lastError"]; raw != nil && !ok {
 		return fmt.Errorf("field lastError in DecisionInboxItem: required")
+	}
+	if _, ok := raw["manifestCoveragePartial"]; raw != nil && !ok {
+		return fmt.Errorf("field manifestCoveragePartial in DecisionInboxItem: required")
 	}
 	if _, ok := raw["manifestFindingsCount"]; raw != nil && !ok {
 		return fmt.Errorf("field manifestFindingsCount in DecisionInboxItem: required")
@@ -11989,13 +12014,10 @@ type WorkflowStepRunOutcomeSummary *string
 type WorkflowStepRunStatus string
 
 const WorkflowStepRunStatusAwaitingDecision WorkflowStepRunStatus = "awaiting_decision"
+const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
 const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
 const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
 const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
-
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
-
-const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
 
 var enumValues_WorkflowStepRunStatus = []interface{}{
 	"awaiting_decision",
@@ -12024,6 +12046,8 @@ func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 	*j = WorkflowStepRunStatus(v)
 	return nil
 }
+
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
 
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
 // sequential turn'). Null while an awaiting_decision (hitlBefore-gated) attempt

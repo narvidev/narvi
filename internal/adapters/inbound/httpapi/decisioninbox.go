@@ -154,7 +154,9 @@ func decisionInboxItemToDTO(it decisioninbox.Item) restdtos.DecisionInboxItem {
 		// render ONLY when isRelease is true: an ordinary PR row has no
 		// manifest check at all, and rendering a fabricated 0 there would
 		// be indistinguishable from a genuine, computed "zero findings"
-		// release-cut result.
+		// release-cut result. manifestCoveragePartial rides the same gate:
+		// it qualifies manifestFindingsCount, so it is meaningless
+		// wherever that count is absent.
 		isRelease := it.IsRelease
 		dto.IsRelease = &isRelease
 		if it.IsRelease {
@@ -162,6 +164,8 @@ func decisionInboxItemToDTO(it decisioninbox.Item) restdtos.DecisionInboxItem {
 			dto.ManifestFindingsCount = &manifestFindingsCount
 			aggregateReviewTriggered := it.AggregateReviewTriggered
 			dto.AggregateReviewTriggered = &aggregateReviewTriggered
+			manifestCoveragePartial := it.ManifestCoveragePartial
+			dto.ManifestCoveragePartial = &manifestCoveragePartial
 		}
 	}
 	if it.RiskLabel != "" {

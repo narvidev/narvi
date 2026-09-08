@@ -2316,6 +2316,10 @@ export interface DecisionInboxItem {
    */
   manifestFindingsCount: number | null;
   /**
+   * True iff the constituent-PR listing that §15.2's manifest check ran over was TRUNCATED, so manifestFindingsCount above is a lower bound over an incomplete set rather than a complete audit -- the SAME fact GetReleaseManifestReadout exposes as `coveragePartial` and the posted manifest comment states in prose, for the same persisted row. Also true when the persisted findings blob could not be decoded at all, because a count that could not be read is not a count of zero. Set iff isRelease is true, null otherwise. A client must NEVER render manifestFindingsCount as a clean result while this is true: a truncated scan that found nothing and a complete scan that found nothing are different claims.
+   */
+  manifestCoveragePartial: boolean | null;
+  /**
    * §15.3's own already-computed trigger decision (whether the constituent PRs' own shape met the criteria for an aggregate diff review) -- set iff isRelease is true, null otherwise. This is NOT a composition-findings count: the aggregate diff review pass itself is not dispatched anywhere in this system, so this field says only that its trigger criteria were met, never that the pass produced a finding.
    */
   aggregateReviewTriggered: boolean | null;

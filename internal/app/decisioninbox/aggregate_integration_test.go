@@ -678,6 +678,59 @@ func TestBuild_ReviewSessionIDAndReleaseCut(t *testing.T) {
 	}
 	seedAutoApprovedVerdict(ctx, t, pool, repo, 34, "sha34")
 
+	// PR #35: a release cut whose constituent-PR listing was TRUNCATED
+	// (coverage_partial), with ZERO mechanical findings -- the confident-
+	// zero case. Its findings count is honestly 0, but 0 over an
+	// incomplete set is not the same claim as 0 over a complete one, and
+	// nothing downstream may render the two identically.
+	platformSession35, err := sessions.Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub, CreatedBy: actor.ID})
+	if err != nil {
+		t.Fatalf("create platform session for PR #35: %v", err)
+	}
+	if _, err := artifacts.Create(ctx, sqlcgen.CreateArtifactParams{
+		SessionID: platformSession35.ID, Type: sqlcgen.ArtifactTypePr, Url: "https://github.com/acme/rockets/pull/35", Metadata: []byte("{}"),
+	}); err != nil {
+		t.Fatalf("create pr artifact for PR #35: %v", err)
+	}
+	session35 := claimReviewSession(t, repo, 35)
+	if _, err := releaseManifestChecks.Insert(ctx, sqlcgen.InsertReleaseManifestCheckParams{
+		SessionID: session35, RepoFullName: repo, PrNumber: 35, BaseRef: "main", HeadRef: "release/2026.09.02",
+		ConstituentPrCount: 250, CoveragePartial: true, AggregateReviewTriggered: false,
+		AggregateReviewTriggerReasons: []byte(`[]`),
+		Findings:                      []byte(`[]`),
+		MergedPrs:                     []byte(`[]`),
+	}); err != nil {
+		t.Fatalf("insert release manifest check for PR #35: %v", err)
+	}
+
+	// PR #36: a release cut whose persisted findings blob is CORRUPT --
+	// valid jsonb, but an object where the reader expects an array, so
+	// json.Unmarshal into []json.RawMessage fails. coverage_partial is
+	// deliberately false on this row: the truncation flag is NOT what
+	// makes this one partial. A count that could not be decoded is not a
+	// count of zero, and the row must not read as a clean release just
+	// because the decode failure happened to be logged rather than
+	// surfaced.
+	platformSession36, err := sessions.Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub, CreatedBy: actor.ID})
+	if err != nil {
+		t.Fatalf("create platform session for PR #36: %v", err)
+	}
+	if _, err := artifacts.Create(ctx, sqlcgen.CreateArtifactParams{
+		SessionID: platformSession36.ID, Type: sqlcgen.ArtifactTypePr, Url: "https://github.com/acme/rockets/pull/36", Metadata: []byte("{}"),
+	}); err != nil {
+		t.Fatalf("create pr artifact for PR #36: %v", err)
+	}
+	session36 := claimReviewSession(t, repo, 36)
+	if _, err := releaseManifestChecks.Insert(ctx, sqlcgen.InsertReleaseManifestCheckParams{
+		SessionID: session36, RepoFullName: repo, PrNumber: 36, BaseRef: "main", HeadRef: "release/2026.09.03",
+		ConstituentPrCount: 4, CoveragePartial: false, AggregateReviewTriggered: false,
+		AggregateReviewTriggerReasons: []byte(`[]`),
+		Findings:                      []byte(`{"not":"an array"}`),
+		MergedPrs:                     []byte(`[]`),
+	}); err != nil {
+		t.Fatalf("insert release manifest check for PR #36: %v", err)
+	}
+
 	fakeSCM := &fakeDecisionInboxSourceControl{
 		openPRsByExternalID: map[string][]ports.OpenPR{
 			actorGitHubExternalID: {
@@ -690,6 +743,10 @@ func TestBuild_ReviewSessionIDAndReleaseCut(t *testing.T) {
 				{Owner: "acme", Repo: "rockets", Number: 33, Title: "release/2026.09.01 -- 2 PRs", HTMLURL: "https://github.com/acme/rockets/pull/33", HeadSHA: "sha33",
 					Assignees: []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}}, CIConclusion: ports.CIConclusionSuccess, Labels: []string{"review:low-risk"}, CreatedAt: time.Now()},
 				{Owner: "acme", Repo: "rockets", Number: 34, Title: "PR 34", HTMLURL: "https://github.com/acme/rockets/pull/34", HeadSHA: "sha34",
+					Assignees: []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}}, CIConclusion: ports.CIConclusionSuccess, Labels: []string{"review:low-risk"}, CreatedAt: time.Now()},
+				{Owner: "acme", Repo: "rockets", Number: 35, Title: "release/2026.09.02 -- truncated scan", HTMLURL: "https://github.com/acme/rockets/pull/35", HeadSHA: "sha35",
+					Assignees: []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}}, CIConclusion: ports.CIConclusionSuccess, Labels: []string{"review:low-risk"}, CreatedAt: time.Now()},
+				{Owner: "acme", Repo: "rockets", Number: 36, Title: "release/2026.09.03 -- corrupt findings blob", HTMLURL: "https://github.com/acme/rockets/pull/36", HeadSHA: "sha36",
 					Assignees: []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}}, CIConclusion: ports.CIConclusionSuccess, Labels: []string{"review:low-risk"}, CreatedAt: time.Now()},
 			},
 		},
@@ -759,6 +816,9 @@ func TestBuild_ReviewSessionIDAndReleaseCut(t *testing.T) {
 	if pr33.SessionID != session33.String() {
 		t.Errorf("PR #33 SessionID = %q, want %q (the review session that produced its own manifest check)", pr33.SessionID, session33.String())
 	}
+	if pr33.ManifestCoveragePartial {
+		t.Error("PR #33 ManifestCoveragePartial = true, want false -- its persisted check recorded coverage_partial=false, and a complete scan must not be flagged as partial or the flag means nothing")
+	}
 
 	pr34 := findItemByPR(result.Items, 34)
 	if pr34 == nil {
@@ -769,6 +829,46 @@ func TestBuild_ReviewSessionIDAndReleaseCut(t *testing.T) {
 	}
 	if pr34.Kind != decisioninboxdomain.KindReadyToMerge {
 		t.Errorf("PR #34 Kind = %s, want ready_to_merge -- the SAME ready-to-merge-eligible shape as PR #33, minus the release-cut signal, must still classify normally", pr34.Kind)
+	}
+
+	pr35 := findItemByPR(result.Items, 35)
+	if pr35 == nil {
+		t.Fatal("PR #35 missing from the inbox entirely")
+	}
+	if !pr35.IsRelease {
+		t.Error("PR #35 IsRelease = false, want true (a persisted release manifest check exists)")
+	}
+	if pr35.ManifestFindingsCount != 0 {
+		t.Errorf("PR #35 ManifestFindingsCount = %d, want 0 -- its persisted findings blob is empty", pr35.ManifestFindingsCount)
+	}
+	// The point of this row: a zero findings count over a TRUNCATED
+	// constituent listing must arrive carrying the truncation, or the
+	// inbox becomes the one consumer of this persisted row that reads a
+	// partial scan as a clean audit -- the posted manifest comment
+	// (reviewpost.RenderManifestComment) and the release-review readout
+	// (httpapi's `coveragePartial`) both already refuse to.
+	if !pr35.ManifestCoveragePartial {
+		t.Error("PR #35 ManifestCoveragePartial = false, want true -- its persisted check recorded coverage_partial=true, so its zero findings count is a lower bound over an incomplete set, not a clean release")
+	}
+
+	pr36 := findItemByPR(result.Items, 36)
+	if pr36 == nil {
+		t.Fatal("PR #36 missing from the inbox entirely")
+	}
+	if !pr36.IsRelease {
+		t.Error("PR #36 IsRelease = false, want true -- the check row exists, so this PR unambiguously IS a release cut however corrupt its findings blob is")
+	}
+	if pr36.ManifestFindingsCount != 0 {
+		t.Errorf("PR #36 ManifestFindingsCount = %d, want 0 -- an undecodable blob yields no countable findings", pr36.ManifestFindingsCount)
+	}
+	// The distinct point of this row, and the reason it carries
+	// coverage_partial=false: the forced flag must come from the DECODE
+	// FAILURE itself, not from the truncation column. Without this, a
+	// corrupt row renders exactly like a clean release cut with zero
+	// findings, and the only trace is a log line nobody reading the inbox
+	// will ever see.
+	if !pr36.ManifestCoveragePartial {
+		t.Error("PR #36 ManifestCoveragePartial = false, want true -- its findings blob could not be decoded at all, and a count that could not be read is not a count of zero (its coverage_partial column is false, so this must come from the decode failure)")
 	}
 }
 

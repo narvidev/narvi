@@ -48,6 +48,7 @@ function baseItem(overrides: Partial<DecisionInboxItem> = {}): DecisionInboxItem
     hasChangesRequested: null,
     isRelease: null,
     manifestFindingsCount: null,
+    manifestCoveragePartial: null,
     aggregateReviewTriggered: null,
     planId: null,
     sessionId: null,
