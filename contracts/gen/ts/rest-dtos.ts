@@ -2308,11 +2308,23 @@ export interface DecisionInboxItem {
    */
   hasChangesRequested: boolean | null;
   /**
+   * True iff this PR is a release cut (§15) whose manifest check has already been computed and persisted. Set (to true or false) for any PR-shaped row, exactly like isHandoff above -- the field a client checks to render this row's own distinct release shape (a link to the release-review screen, never a Merge button: a release cut always renders under kind=needs_review) instead of the ordinary PR shape. A PR that a release-branch-pattern/label WOULD classify as a release cut but that Narvi has not yet reviewed (or reviewed too recently for the background check to have finished) renders false here -- an honest, temporary gap, never a fabricated one.
+   */
+  isRelease: boolean | null;
+  /**
+   * §15.2's own mechanical manifest-findings count (admin overrides, red-at-merge, unreviewed reverts) -- set iff isRelease is true, null otherwise. NEVER the aggregate diff review's own composition findings (§15.3/§15.4), which nothing in this system computes yet -- this count can be zero on a clean release cut, which is why it is a separate nullable field rather than folded into a chip that would render '0' identically to 'unknown'.
+   */
+  manifestFindingsCount: number | null;
+  /**
+   * §15.3's own already-computed trigger decision (whether the constituent PRs' own shape met the criteria for an aggregate diff review) -- set iff isRelease is true, null otherwise. This is NOT a composition-findings count: the aggregate diff review pass itself is not dispatched anywhere in this system, so this field says only that its trigger criteria were met, never that the pass produced a finding.
+   */
+  aggregateReviewTriggered: boolean | null;
+  /**
    * kind=awaiting_approval, a plan (not a handoff PR) only.
    */
   planId: string | null;
   /**
-   * Set for a plan (kind=awaiting_approval) or a failed session (kind=needs_attention).
+   * Set for a plan (kind=awaiting_approval), a failed session (kind=needs_attention), or a PR-shaped row (ready_to_merge/needs_review, including a release cut) for which Narvi has actually run a review session against this exact pull request -- a client uses this to link into that review (or release-review) screen instead of an external GitHub link. Left null for a PR-shaped row Narvi has never been mentioned on, which is common and not an error.
    */
   sessionId: string | null;
   /**
