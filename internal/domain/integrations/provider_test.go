@@ -71,6 +71,40 @@ func TestProviderForOutboxKind(t *testing.T) {
 	}
 }
 
+// TestParseProvider is table-driven over the three known spellings, a
+// near-miss typo of one of them, and an empty string -- proving ParseProvider
+// accepts exactly the canonical three and nothing else, the property
+// platform.Load leans on to turn a typo'd NARVI_INGRESS_ENABLED entry into
+// a loud boot failure rather than a silently-dropped one.
+func TestParseProvider(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		raw    string
+		want   integrations.Provider
+		wantOK bool
+	}{
+		{"slack", integrations.ProviderSlack, true},
+		{"linear", integrations.ProviderLinear, true},
+		{"github", integrations.ProviderGitHub, true},
+		{"slcak", "", false}, // a real near-miss typo of "slack".
+		{"Slack", "", false}, // case matters -- never normalized.
+		{"", "", false},
+		{"slack ", "", false}, // whitespace is the caller's job to trim, not this function's.
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.raw, func(t *testing.T) {
+			t.Parallel()
+			got, ok := integrations.ParseProvider(tc.raw)
+			if ok != tc.wantOK || got != tc.want {
+				t.Errorf("ParseProvider(%q) = (%q, %v), want (%q, %v)", tc.raw, got, ok, tc.want, tc.wantOK)
+			}
+		})
+	}
+}
+
 // TestConfiguredSlack proves a partially-configured surface (missing
 // EITHER required secret) reads as NOT connected -- one case per missing
 // secret, per this Step's own "Tests that must exist" requirement.

@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/narvidev/narvi/internal/domain/integrations"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/rollout"
 )
@@ -214,6 +215,116 @@ const (
 	publicBaseURLEnvVarName      = "NARVI_PUBLIC_BASE_URL"
 )
 
+// ingressEnabledEnvVarName is the process environment variable Load reads
+// for §12.5's own ingress-surface-optionality decision: an explicit,
+// comma-separated list of which of the three ingress surfaces (Slack,
+// Linear, GitHub -- internal/domain/integrations.Provider's own three
+// literal spellings) this deployment mounts at all. A surface named here
+// gets exactly today's pre-existing behavior: its own full credential set
+// is required, and Load fails fast (MissingRequiredEnvError) if any of it
+// is missing. A surface NOT named here is not mounted anywhere in
+// controlplane/serve.go's own wiring -- no webhook route, no outbox
+// notifier registered for any of its kinds -- and its own credential env
+// vars are read but never enforced, mirroring objectStoreEndpointEnvVarName's
+// own "endpoint absent, nothing else even inspected" gating rule one level
+// up (a whole surface instead of one sub-config).
+//
+// Deliberately NEVER inferred from which secrets happen to be present --
+// that would make a typo in one secret's own env var name indistinguishable
+// from a deliberate decision to leave that surface unconfigured, exactly
+// the fail direction this repository refuses everywhere else (see
+// InvalidHMACSecretError's own doc comment for the same principle applied
+// to a different var). An explicit list is the only way to tell those two
+// apart.
+//
+// UNSET means every surface is enabled -- chosen deliberately over the
+// alternative (unset means NONE enabled) after weighing both: every
+// deployment that exists before this Step already configures all three
+// surfaces' full credential sets, because Load already refused to boot
+// otherwise -- so "unset = all enabled" reproduces that deployment's own
+// existing behavior byte-for-byte, without it setting a single new env var,
+// mirroring rolloutModeEnvVarName's own identical "must land as a no-op for
+// every existing deployment" requirement. The rejected alternative --
+// unset means none enabled -- fails in exactly the way this whole feature
+// exists to prevent: it would silently unmount every ingress route on every
+// one of those already-correctly-configured deployments the moment this
+// binary was rebuilt, with no boot-time error to notice by (an unmounted
+// route answers 404, it does not refuse to start) -- inferring a surface's
+// intended state from this var's own absence, the identical failure mode
+// §12.5's decision refuses for a secret's absence, just moved one layer up.
+// A brand-new deployment that only wants GitHub still narrows scope
+// explicitly (NARVI_INGRESS_ENABLED=github); simply forgetting to set this
+// var at all reproduces today's existing "configure all three or refuse to
+// boot" behavior -- an annoyance, never a silent loss.
+//
+// Explicitly SET to an empty string is different from unset, and is the
+// one place in this file where that distinction matters enough to check
+// for it (os.LookupEnv, not the usual os.Getenv-returns-"" idiom every
+// other var in this file uses): a deployment that genuinely wants zero
+// ingress surfaces (web-UI-only) has no other way to say so, since an
+// empty comma-separated list and an absent one would otherwise collapse
+// into the same "" Load can't tell apart. Setting the var to "" is a
+// deliberate, explicit declaration of "no surfaces" -- consistent with
+// this whole feature's own "explicit, never inferred" principle -- while
+// never setting it at all keeps every existing deployment's own default.
+const ingressEnabledEnvVarName = "NARVI_INGRESS_ENABLED"
+
+// InvalidIngressEnabledError is returned by Load when NARVI_INGRESS_ENABLED
+// carries an entry that is not one of internal/domain/integrations.
+// Provider's three known spellings ("slack"/"linear"/"github"). Rejected
+// rather than silently dropped: a typo'd surface name here (e.g. "slcak")
+// must fail loudly -- the identical reasoning ingressEnabledEnvVarName's
+// own doc comment gives for never inferring a surface's intended state
+// from an absent secret applies just as much to an unrecognized entry in
+// this list, one layer up.
+type InvalidIngressEnabledError struct {
+	Value string
+}
+
+func (e *InvalidIngressEnabledError) Error() string {
+	return fmt.Sprintf(
+		"invalid entry %q in %s: must be one of %q, %q, %q",
+		e.Value, ingressEnabledEnvVarName,
+		integrations.ProviderSlack, integrations.ProviderLinear, integrations.ProviderGitHub,
+	)
+}
+
+// RWXPreviewsRequireGitHubIngressError is returned by Load when
+// NARVI_RWX_ACCESS_TOKEN is set (rwxAccessTokenEnvVarName's own doc
+// comment: an explicit, per-deployment opt-in into RWX previews) while
+// GitHub ingress is disabled (ingressEnabled[integrations.ProviderGitHub]
+// == false, §12.5). The combination can never work: the preview link half
+// of the feature (githubPreviewLinkNotifier, controlplane/serve.go) posts
+// through cfg.GitHubBotToken, and gitHubBotTokenEnvVarName's own doc
+// comment already establishes that this credential is bundled into the
+// GitHub ingress surface and left empty whenever that surface is disabled
+// -- so an operator who set the RWX token while leaving GitHub ingress off
+// asked for something structurally impossible, not a degraded-but-valid
+// posture.
+//
+// A hard boot refusal, not a startup warning, deliberately -- following
+// InvalidObjectStoreCredentialsError's own precedent immediately below
+// rather than the shadow-mode-suppression warnings in controlplane/
+// serve.go: like that credential pair, both sides of this condition are
+// known from env vars alone, with no I/O and no legitimate half-configured
+// reading (there is no valid deployment that wants RWX previews with no
+// way to ever post the GitHub half of them), so it belongs in Load's own
+// pure validation rather than a runtime slog.Warn that a deploy could run
+// past for months. Compare the shadow-mode warnings (controlplane/
+// serve.go's own "say out loud, at boot, what this deployment will and
+// will not send"): those warn-and-continue because the condition they
+// report is a deliberate, sometimes-correct operational posture that
+// needs a live DB read (CountSuppressedRepos) to even evaluate --
+// genuinely different in kind from this one.
+type RWXPreviewsRequireGitHubIngressError struct{}
+
+func (e *RWXPreviewsRequireGitHubIngressError) Error() string {
+	return fmt.Sprintf(
+		"%s is set but GitHub ingress is disabled (%s): RWX preview links can never be posted without %s, which is only ever configured when GitHub ingress is enabled -- either enable GitHub ingress or unset %s",
+		rwxAccessTokenEnvVarName, ingressEnabledEnvVarName, gitHubBotTokenEnvVarName, rwxAccessTokenEnvVarName,
+	)
+}
+
 // gitHubWebhookSecretEnvVarName and gitHubBotHandleEnvVarName configure
 // §8.2's ("GitHub ingress", §8.2) own webhook adapter --
 // internal/adapters/inbound/github. gitHubWebhookSecretEnvVarName is
@@ -225,13 +336,16 @@ const (
 // "X-Hub-Signature-256" with, configured on GitHub's own webhook settings
 // screen. gitHubBotHandleEnvVarName is the bot/app username §8.2's own
 // mention-detection matches comment bodies against (a plain "@handle"
-// substring check, internal/adapters/inbound/github). Both required in
-// every stage -- never defaulted, matching every other secret/credential
-// this file already reads (the 3 HMAC secrets, the GitHub OAuth
-// credentials, TokenEncryptionKey, Modal's own BaseURL/AuthToken): there
-// is no safe placeholder webhook secret, and a misconfigured/empty bot
-// handle would silently make this entire ingress route never detect a
-// single mention.
+// substring check, internal/adapters/inbound/github). Both required --
+// never defaulted, matching every other secret/credential this file
+// already reads (the 3 HMAC secrets, the GitHub OAuth credentials,
+// TokenEncryptionKey, Modal's own BaseURL/AuthToken) -- WHEN GitHub
+// ingress is enabled (ingressEnabledEnvVarName's own doc comment, §12.5):
+// there is no safe placeholder webhook secret, and a misconfigured/empty
+// bot handle would silently make this entire ingress route never detect a
+// single mention. A deployment that never enables GitHub ingress at all
+// never has either checked, and both simply read as "" (Config.
+// IngressEnabled gates the check, not this pair's own zero value).
 const (
 	gitHubWebhookSecretEnvVarName = "NARVI_GITHUB_WEBHOOK_SECRET"
 	gitHubBotHandleEnvVarName     = "NARVI_GITHUB_BOT_HANDLE"
@@ -240,8 +354,20 @@ const (
 // gitHubBotTokenEnvVarName configures §5.1's ("outbox delivery", §5.1)
 // own GitHub Notifier adapter (internal/adapters/outbound/githubapi's new
 // issue-comment-posting method) -- read from NARVI_GITHUB_BOT_TOKEN.
-// Required in every stage -- never defaulted, matching every other secret
-// this file already reads. Deliberately a SEPARATE credential from every
+// Required -- never defaulted, matching every other secret this file
+// already reads -- WHEN GitHub ingress is enabled (ingressEnabledEnvVarName's
+// own doc comment, §12.5): internal/domain/integrations.ConfiguredGitHub
+// bundles this credential together with GitHubWebhookSecret/GitHubBotHandle
+// as one surface (its own doc comment explains why -- posting a review
+// verdict/comment back to GitHub is the OUTBOUND half of the same "GitHub
+// ingress" surface the webhook adapter forms the INBOUND half of), so a
+// deployment that never enables GitHub ingress leaves this empty too, and
+// every GitHub-flavored outbox notifier this credential backs
+// (controlplane/serve.go's own outboxNotifiers map) is simply never
+// registered -- any stray row enqueued for one of those kinds anyway
+// dead-letters through outboxworker's existing "no notifier registered for
+// kind" path rather than posting with an empty credential. Deliberately a
+// SEPARATE credential from every
 // existing GitHub-flavored value in this struct: GitHubClientID/
 // GitHubClientSecret authenticate the OAuth APP a human signs into Narvi
 // through (§13.1); ports.SourceControl.CreatePR (githubapi.Adapter,
@@ -530,9 +656,11 @@ const defaultOpenCodeRuntimeVersion = "1.17.15"
 
 // linearWebhookSecretEnvVarName, linearOAuthClientIDEnvVarName, and
 // linearOAuthClientSecretEnvVarName are the env vars Load reads for
-// §8.10's ("Linear ingress") Linear wiring. All three are required in
-// every stage — never defaulted, matching every other "never a baked-in
-// default" secret this file already reads.
+// §8.10's ("Linear ingress") Linear wiring. All three are required --
+// never defaulted, matching every other "never a baked-in default" secret
+// this file already reads -- WHEN Linear ingress is enabled
+// (ingressEnabledEnvVarName's own doc comment, §12.5); a deployment that
+// never enables it never has any of the three checked.
 //
 // linearWebhookSecretEnvVarName is deliberately a SEPARATE secret from
 // hmacWebhookSecretEnvVarName above: that one backs platform.Sign/Verify's
@@ -562,7 +690,11 @@ const (
 
 // linearDefaultRepoNameEnvVarName and linearDefaultRepoURLEnvVarName name
 // the single repo a Linear-originated session's Repos field is populated
-// with (both required, no default). Scope note (§8.10): Linear's own
+// with (both required, no default, WHEN Linear ingress is enabled --
+// ingressEnabledEnvVarName's own doc comment, §12.5; a deployment that
+// never enables Linear ingress never has either checked, since no
+// Linear-originated session can ever exist to need one). Scope note
+// (§8.10): Linear's own
 // AgentSessionEvent webhook payload carries no repository information at
 // all (confirmed against Linear's real schema during this Step's
 // investigation — an agent is expected to either already know its own
@@ -589,9 +721,10 @@ const (
 // closed); SlackBotToken authenticates the one direct
 // chat.postMessage call this Step's own in-thread ack makes (see that
 // package's own doc.go for why this is a single direct API call, not the
-// general Notifier/outbox abstraction (§5.1)). Both required in
-// every stage -- never defaulted, matching every other secret this file
-// already reads.
+// general Notifier/outbox abstraction (§5.1)). Both required -- never
+// defaulted, matching every other secret this file already reads -- WHEN
+// Slack ingress is enabled (ingressEnabledEnvVarName's own doc comment,
+// §12.5); a deployment that never enables it never has either checked.
 const (
 	slackSigningSecretEnvVarName = "NARVI_SLACK_SIGNING_SECRET"
 	slackBotTokenEnvVarName      = "NARVI_SLACK_BOT_TOKEN"
@@ -1210,6 +1343,28 @@ type Config struct {
 	// is deliberately NOT left to pgxpool's own CPU-tied default.
 	DBPoolMaxConns int32
 
+	// IngressEnabled is §12.5's own ingress-surface-optionality decision,
+	// read from NARVI_INGRESS_ENABLED (ingressEnabledEnvVarName's own doc
+	// comment for the full "why explicit, why this default" reasoning). A
+	// map rather than three booleans so callers can key it by
+	// internal/domain/integrations.Provider directly, the SAME type/
+	// vocabulary GET /api/integrations already uses (httpapi.
+	// GetIntegrations) -- there is exactly one notion of "which surfaces
+	// exist", never a second, independently-spelled one.
+	//
+	// A surface absent from this map (Go's own zero value for a missing
+	// key: false) is not mounted anywhere in controlplane/serve.go's own
+	// wiring -- no webhook route, no outbox notifier registered for any of
+	// its kinds -- and Load never enforces that surface's own credential
+	// env vars. A surface present with value true has its own full
+	// credential set enforced exactly as every ingress surface always has
+	// been (a *MissingRequiredEnvError on anything missing). Load never
+	// stores an explicit false entry -- checking IngressEnabled[p] on a
+	// nil/missing key already reads false, so there is only ever one
+	// representation of "not enabled", never a second one worth telling
+	// apart from it.
+	IngressEnabled map[integrations.Provider]bool
+
 	// HMACSandboxSecret, HMACBotsSecret, and HMACWebhookSecret are the
 	// three direction-specific secrets §5.2 requires ("Separate secrets
 	// per direction (sandbox→CP, CP→bots, webhook ingress) so one
@@ -1678,6 +1833,30 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// ingressEnabled (§12.5): unset means every surface is enabled -- see
+	// ingressEnabledEnvVarName's own doc comment for the full "why this
+	// default, why the alternative is worse" reasoning. os.LookupEnv, not
+	// the usual os.Getenv-returns-"" idiom every other var in this
+	// function uses, because this is the one var in this file where "unset"
+	// and "explicitly set to empty" must mean two different things (that
+	// same doc comment's own last paragraph).
+	ingressEnabled := map[integrations.Provider]bool{
+		integrations.ProviderSlack:  true,
+		integrations.ProviderLinear: true,
+		integrations.ProviderGitHub: true,
+	}
+	if rawIngressEnabled, isSet := os.LookupEnv(ingressEnabledEnvVarName); isSet {
+		ingressEnabled = make(map[integrations.Provider]bool, len(integrations.Providers))
+		for _, entry := range parseCommaSeparatedList(rawIngressEnabled) {
+			p, ok := integrations.ParseProvider(entry)
+			if !ok {
+				errs = append(errs, &InvalidIngressEnabledError{Value: entry})
+				continue
+			}
+			ingressEnabled[p] = true
+		}
+	}
+
 	hmacSandboxSecret := os.Getenv(hmacSandboxSecretEnvVarName)
 	if hmacSandboxSecret == "" {
 		errs = append(errs, &InvalidHMACSecretError{EnvVar: hmacSandboxSecretEnvVarName})
@@ -1708,13 +1887,21 @@ func Load() (*Config, error) {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: publicBaseURLEnvVarName})
 	}
 
+	// WebhookSecret/BotHandle/BotToken (below) are required ONLY when
+	// GitHub ingress is enabled (ingressEnabled[integrations.ProviderGitHub]
+	// -- ingressEnabledEnvVarName's own doc comment, §12.5). A deployment
+	// that never enables GitHub ingress still reads whatever value happens
+	// to be set (never validated), but Config.IngressEnabled -- not this
+	// pair's own non-empty-ness -- is what every consumer downstream
+	// (controlplane/serve.go's route mounting, httpapi.
+	// configuredForProvider) actually gates on.
 	gitHubWebhookSecret := os.Getenv(gitHubWebhookSecretEnvVarName)
-	if gitHubWebhookSecret == "" {
+	if ingressEnabled[integrations.ProviderGitHub] && gitHubWebhookSecret == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: gitHubWebhookSecretEnvVarName})
 	}
 
 	gitHubBotHandle := os.Getenv(gitHubBotHandleEnvVarName)
-	if gitHubBotHandle == "" {
+	if ingressEnabled[integrations.ProviderGitHub] && gitHubBotHandle == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: gitHubBotHandleEnvVarName})
 	}
 
@@ -1740,7 +1927,7 @@ func Load() (*Config, error) {
 	}
 
 	gitHubBotToken := os.Getenv(gitHubBotTokenEnvVarName)
-	if gitHubBotToken == "" {
+	if ingressEnabled[integrations.ProviderGitHub] && gitHubBotToken == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: gitHubBotTokenEnvVarName})
 	}
 
@@ -1872,46 +2059,58 @@ func Load() (*Config, error) {
 	modalEgressProxyURL := os.Getenv(modalEgressProxyURLEnvVarName)
 
 	// rwxAccessToken is optional -- see its own env-var-name doc comment
-	// above. No MissingRequiredEnvError is ever appended for it.
+	// above. No MissingRequiredEnvError is ever appended for it. But
+	// RWXPreviewsRequireGitHubIngressError's own doc comment: setting it
+	// while GitHub ingress is disabled is rejected outright, not silently
+	// accepted -- the combination can never work (githubPreviewLinkNotifier
+	// needs cfg.GitHubBotToken, which is only ever populated when GitHub
+	// ingress is enabled), and both halves of the check are plain env vars
+	// with no I/O, so Load is where it belongs.
 	rwxAccessToken := os.Getenv(rwxAccessTokenEnvVarName)
+	if rwxAccessToken != "" && !ingressEnabled[integrations.ProviderGitHub] {
+		errs = append(errs, &RWXPreviewsRequireGitHubIngressError{})
+	}
 
 	openCodeRuntimeVersion := os.Getenv(openCodeRuntimeVersionEnvVarName)
 	if openCodeRuntimeVersion == "" {
 		openCodeRuntimeVersion = defaultOpenCodeRuntimeVersion
 	}
 
+	// All five Linear fields below (and both Slack fields further down) are
+	// required ONLY when their own ingress surface is enabled -- see the
+	// identical GitHub comment above this same pattern started with.
 	linearWebhookSecret := os.Getenv(linearWebhookSecretEnvVarName)
-	if linearWebhookSecret == "" {
+	if ingressEnabled[integrations.ProviderLinear] && linearWebhookSecret == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: linearWebhookSecretEnvVarName})
 	}
 
 	linearOAuthClientID := os.Getenv(linearOAuthClientIDEnvVarName)
-	if linearOAuthClientID == "" {
+	if ingressEnabled[integrations.ProviderLinear] && linearOAuthClientID == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: linearOAuthClientIDEnvVarName})
 	}
 
 	linearOAuthClientSecret := os.Getenv(linearOAuthClientSecretEnvVarName)
-	if linearOAuthClientSecret == "" {
+	if ingressEnabled[integrations.ProviderLinear] && linearOAuthClientSecret == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: linearOAuthClientSecretEnvVarName})
 	}
 
 	linearDefaultRepoName := os.Getenv(linearDefaultRepoNameEnvVarName)
-	if linearDefaultRepoName == "" {
+	if ingressEnabled[integrations.ProviderLinear] && linearDefaultRepoName == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: linearDefaultRepoNameEnvVarName})
 	}
 
 	linearDefaultRepoURL := os.Getenv(linearDefaultRepoURLEnvVarName)
-	if linearDefaultRepoURL == "" {
+	if ingressEnabled[integrations.ProviderLinear] && linearDefaultRepoURL == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: linearDefaultRepoURLEnvVarName})
 	}
 
 	slackSigningSecret := os.Getenv(slackSigningSecretEnvVarName)
-	if slackSigningSecret == "" {
+	if ingressEnabled[integrations.ProviderSlack] && slackSigningSecret == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: slackSigningSecretEnvVarName})
 	}
 
 	slackBotToken := os.Getenv(slackBotTokenEnvVarName)
-	if slackBotToken == "" {
+	if ingressEnabled[integrations.ProviderSlack] && slackBotToken == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: slackBotTokenEnvVarName})
 	}
 
@@ -2076,6 +2275,7 @@ func Load() (*Config, error) {
 		DatabaseURL:                databaseURL,
 		HTTPAddr:                   httpAddr,
 		DBPoolMaxConns:             dbPoolMaxConns,
+		IngressEnabled:             ingressEnabled,
 		HMACSandboxSecret:          hmacSandboxSecret,
 		HMACBotsSecret:             hmacBotsSecret,
 		HMACWebhookSecret:          hmacWebhookSecret,

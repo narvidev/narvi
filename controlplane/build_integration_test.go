@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -49,6 +50,8 @@ import (
 
 	"github.com/narvidev/narvi/extension"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/domain/integrations"
 	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/migrations"
 )
@@ -228,6 +231,144 @@ func formatRouteList(routes []string) string {
 		return "(none)"
 	}
 	return "\n  " + strings.Join(routes, "\n  ")
+}
+
+// TestBuild_IngressDisabled_RoutesUnmounted proves §12.5's own "a surface
+// not named is not mounted at all -- no route, no webhook endpoint" claim
+// against the REAL composition root and the REAL chi route table, not
+// merely against a unit-level boolean (httpapi.configuredForProvider's own
+// tests already cover that half). Narrowing NARVI_INGRESS_ENABLED to a
+// single surface removes every OTHER surface's own webhook/OAuth routes
+// from App.Routes() entirely, and a live request to one of the removed
+// paths 404s exactly like any other unknown path -- never a handler
+// quietly built against an empty secret and left reachable.
+func TestBuild_IngressDisabled_RoutesUnmounted(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("NARVI_INGRESS_ENABLED", "github")
+
+	pool, connStr := newTestPool(t)
+	t.Setenv("NARVI_DATABASE_URL", connStr)
+
+	cfg, err := platform.Load()
+	if err != nil {
+		t.Fatalf("platform.Load: %v", err)
+	}
+
+	app, err := Build(context.Background(), cfg, pool)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	gotRoutes := app.Routes()
+	gotSet := make(map[string]bool, len(gotRoutes))
+	for _, r := range gotRoutes {
+		gotSet[r] = true
+	}
+
+	// Slack/Linear routes must be entirely ABSENT from the live route
+	// table -- not merely unreachable behind some other gate.
+	for _, disabledRoute := range []string{
+		"POST /webhooks/slack",
+		"POST /webhooks/slack/interactive",
+		"GET /auth/linear/install",
+		"GET /auth/linear/callback",
+		"POST /webhooks/linear",
+	} {
+		if gotSet[disabledRoute] {
+			t.Errorf("App.Routes() contains %q, want absent (NARVI_INGRESS_ENABLED=github disables Slack/Linear entirely)", disabledRoute)
+		}
+	}
+	// GitHub's own webhook route must still be present -- only Slack/Linear
+	// were disabled, proving this isn't an accidental "everything got
+	// unmounted" failure mode.
+	if !gotSet["POST /webhooks/github"] {
+		t.Error(`App.Routes() does not contain "POST /webhooks/github", want present (GitHub is the one enabled surface)`)
+	}
+
+	// A live request to a disabled surface's own path 404s exactly like
+	// any other unknown path -- proving the absence end to end against a
+	// real http.Handler, not just against the route-table listing above.
+	for _, req := range []struct{ method, path string }{
+		{http.MethodPost, "/webhooks/slack"},
+		{http.MethodPost, "/webhooks/slack/interactive"},
+		{http.MethodPost, "/webhooks/linear"},
+		{http.MethodGet, "/auth/linear/install"},
+	} {
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest(req.method, req.path, nil)
+		app.Router.ServeHTTP(rec, r)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("%s %s = %d, want %d (surface disabled, route must not exist)", req.method, req.path, rec.Code, http.StatusNotFound)
+		}
+	}
+}
+
+// TestBuild_GitHubIngressDisabled_NoGitHubPreviewLinkNotifier proves the
+// fix for the leak TestBuild_IngressDisabled_RoutesUnmounted's own route
+// table could never see: with GitHub ingress disabled, cfg.GitHubBotToken
+// reads empty (gitHubBotTokenEnvVarName's own doc comment, platform/
+// config.go), yet the pre-fix outboxNotifiers wiring in Build still
+// registered github_preview_link -- githubapi.NewPreviewLinkNotifier
+// authenticated with that empty token -- whenever cfg.RWXAccessToken was
+// set, because that registration was gated on RWXAccessToken alone, never
+// on githubIngressEnabled. Any row enqueued for that kind (ordinary
+// steady-state traffic on a preview-enabled repo, not a stale/edge case --
+// see sessionactor.enqueuePreviewBestEffort's own call site) would then
+// post "Authorization: Bearer" with nothing after it, retry the full
+// backoff ladder, dead-letter, and (because the kind's "github" prefix
+// feeds the /api/integrations read model) misattribute the failure to
+// GitHub as configured=false/lastOutboundStatus=failed.
+//
+// platform.Load's own RWXPreviewsRequireGitHubIngressError now refuses to
+// boot a real deployment in this state at all, so this test builds its
+// *platform.Config the same way TestBuild_IngressDisabled_RoutesUnmounted
+// does and then mutates it directly, AFTER Load already succeeded on a
+// valid combination -- proving Build's own registration gate is a real,
+// independent backstop (as its own doc comment in serve.go claims), not
+// dead code that merely happens to never execute because Load rejects the
+// input first.
+//
+// Asserts on the registered notifier set itself
+// (outboxworker.Builder.HasNotifier), not on the route table --
+// TestBuild_IngressDisabled_RoutesUnmounted's own proof is blind to this
+// class of defect entirely, since routes and outbox notifiers are two
+// separate registrations in Build.
+func TestBuild_GitHubIngressDisabled_NoGitHubPreviewLinkNotifier(t *testing.T) {
+	setRequiredEnv(t)
+
+	pool, connStr := newTestPool(t)
+	t.Setenv("NARVI_DATABASE_URL", connStr)
+
+	cfg, err := platform.Load()
+	if err != nil {
+		t.Fatalf("platform.Load: %v", err)
+	}
+
+	// Mutate cfg AFTER a successful Load, to the exact state
+	// RWXPreviewsRequireGitHubIngressError refuses to let a real
+	// deployment boot into -- see this test's own top doc comment for why.
+	cfg.IngressEnabled = map[integrations.Provider]bool{
+		integrations.ProviderSlack:  true,
+		integrations.ProviderLinear: true,
+		integrations.ProviderGitHub: false,
+	}
+	cfg.RWXAccessToken = "test-rwx-access-token"
+	cfg.GitHubBotToken = "" // what an operator running this combination would actually have.
+
+	app, err := Build(context.Background(), cfg, pool)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if app.outboxBuilder.HasNotifier(ports.NotificationKindGitHubPreviewLink) {
+		t.Error("outboxBuilder has a notifier registered for github_preview_link with GitHub ingress disabled -- it would post with an empty GitHubBotToken")
+	}
+	// rwx_preview_dispatch needs no GitHub credential at all -- it must
+	// stay registered on RWXAccessToken alone, proving the fix narrowed
+	// the gate rather than disabling the whole RWX-configured block.
+	if !app.outboxBuilder.HasNotifier(ports.NotificationKindRWXPreviewDispatch) {
+		t.Error("outboxBuilder has no notifier registered for rwx_preview_dispatch, want registered (RWXAccessToken alone is sufficient for this kind)")
+	}
 }
 
 // TestBuild_EveryAPIRouteCarriesAGuardBeyondTheGlobalChain closes the half

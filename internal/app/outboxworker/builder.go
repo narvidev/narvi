@@ -120,6 +120,22 @@ func NewBuilder(store *postgres.OutboxStore, pool *pgxpool.Pool, notifiers map[p
 	}, nil
 }
 
+// HasNotifier reports whether kind has a notifier registered in this
+// Builder's own notifiers map -- the SAME map attempt() consults to
+// decide between actually delivering a row and dead-lettering it with "no
+// notifier registered for kind" (classification.go). Exists for
+// composition-root tests (controlplane's own Build, which wires this map
+// from cfg.IngressEnabled/cfg.RWXAccessToken/etc.) to assert directly on
+// what got registered, rather than on a proxy like the route table: a
+// notifier can be missing or wrongly present with the route table
+// unaffected either way, since routes and outbox notifiers are two
+// separate registrations gated by (usually, but not provably always) the
+// same condition.
+func (b *Builder) HasNotifier(kind ports.NotificationKind) bool {
+	_, ok := b.notifiers[kind]
+	return ok
+}
+
 // Run runs the process-wide outbox-delivery loop until ctx is done --
 // mirrors app/imagebuild.Builder.Run/app/reconciler.Reconciler.Run
 // exactly: a ticker on platform.Timeouts.OutboxPumpInterval, calling

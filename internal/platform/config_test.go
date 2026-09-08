@@ -6,6 +6,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/narvidev/narvi/internal/domain/integrations"
 	"github.com/narvidev/narvi/internal/domain/rollout"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -639,6 +640,202 @@ func TestLoadGitHubWebhookConfig(t *testing.T) {
 		}
 		if cfg.GitHubBotHandle != "test-bot" {
 			t.Errorf("Load().GitHubBotHandle = %q, want %q", cfg.GitHubBotHandle, "test-bot")
+		}
+	})
+}
+
+// TestLoadIngressEnabled covers §12.5's own ingress-surface-optionality
+// decision: NARVI_INGRESS_ENABLED gates which of the three ingress
+// surfaces' full credential sets Load actually enforces.
+func TestLoadIngressEnabled(t *testing.T) {
+	t.Run("unset enables all three (byte-for-byte no-op for every existing deployment)", func(t *testing.T) {
+		setRequiredEnv(t)
+		// Deliberately not set at all (t.Setenv is never called for this
+		// var in this sub-test) -- proves the DEFAULT, not merely a
+		// "happens to equal a set value" coincidence.
+
+		cfg, err := platform.Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v, want nil", err)
+		}
+		for _, p := range integrations.Providers {
+			if !cfg.IngressEnabled[p] {
+				t.Errorf("Load().IngressEnabled[%q] = false, want true when NARVI_INGRESS_ENABLED is unset", p)
+			}
+		}
+	})
+
+	t.Run("explicitly empty disables all three, and their secrets become optional", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("NARVI_INGRESS_ENABLED", "")
+		// Blank out every ingress-surface secret setRequiredEnv set --
+		// proves Load no longer enforces any of them once all three
+		// surfaces are explicitly disabled.
+		t.Setenv("NARVI_GITHUB_WEBHOOK_SECRET", "")
+		t.Setenv("NARVI_GITHUB_BOT_HANDLE", "")
+		t.Setenv("NARVI_GITHUB_BOT_TOKEN", "")
+		t.Setenv("NARVI_LINEAR_WEBHOOK_SECRET", "")
+		t.Setenv("NARVI_LINEAR_CLIENT_ID", "")
+		t.Setenv("NARVI_LINEAR_CLIENT_SECRET", "")
+		t.Setenv("NARVI_LINEAR_DEFAULT_REPO_NAME", "")
+		t.Setenv("NARVI_LINEAR_DEFAULT_REPO_URL", "")
+		t.Setenv("NARVI_SLACK_SIGNING_SECRET", "")
+		t.Setenv("NARVI_SLACK_BOT_TOKEN", "")
+
+		cfg, err := platform.Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v, want nil (every ingress surface explicitly disabled, none of their secrets should be enforced)", err)
+		}
+		for _, p := range integrations.Providers {
+			if cfg.IngressEnabled[p] {
+				t.Errorf("Load().IngressEnabled[%q] = true, want false when NARVI_INGRESS_ENABLED=\"\"", p)
+			}
+		}
+	})
+
+	t.Run("naming exactly one surface enables only that one", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("NARVI_INGRESS_ENABLED", "github")
+		// Slack/Linear secrets are irrelevant once their surface is
+		// disabled -- blank them out to prove Load truly does not check
+		// them, not merely that setRequiredEnv happened to leave valid
+		// values behind.
+		t.Setenv("NARVI_LINEAR_WEBHOOK_SECRET", "")
+		t.Setenv("NARVI_LINEAR_CLIENT_ID", "")
+		t.Setenv("NARVI_LINEAR_CLIENT_SECRET", "")
+		t.Setenv("NARVI_LINEAR_DEFAULT_REPO_NAME", "")
+		t.Setenv("NARVI_LINEAR_DEFAULT_REPO_URL", "")
+		t.Setenv("NARVI_SLACK_SIGNING_SECRET", "")
+		t.Setenv("NARVI_SLACK_BOT_TOKEN", "")
+
+		cfg, err := platform.Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v, want nil (only GitHub is enabled; Slack/Linear secrets must not be enforced)", err)
+		}
+		if !cfg.IngressEnabled[integrations.ProviderGitHub] {
+			t.Error("Load().IngressEnabled[github] = false, want true")
+		}
+		if cfg.IngressEnabled[integrations.ProviderSlack] {
+			t.Error("Load().IngressEnabled[slack] = true, want false")
+		}
+		if cfg.IngressEnabled[integrations.ProviderLinear] {
+			t.Error("Load().IngressEnabled[linear] = true, want false")
+		}
+	})
+
+	t.Run("naming a surface without its full credential set is a loud boot failure", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("NARVI_INGRESS_ENABLED", "slack")
+		t.Setenv("NARVI_SLACK_BOT_TOKEN", "") // Slack enabled but incomplete.
+
+		_, err := platform.Load()
+		if err == nil {
+			t.Fatal("Load() error = nil, want error (Slack is named enabled but missing a required secret)")
+		}
+		var missErr *platform.MissingRequiredEnvError
+		if !errors.As(err, &missErr) {
+			t.Fatalf("Load() error = %v, want *platform.MissingRequiredEnvError", err)
+		}
+		if missErr.EnvVar != "NARVI_SLACK_BOT_TOKEN" {
+			t.Errorf("MissingRequiredEnvError.EnvVar = %q, want %q", missErr.EnvVar, "NARVI_SLACK_BOT_TOKEN")
+		}
+	})
+
+	t.Run("an unrecognized entry fails loudly rather than being silently dropped", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("NARVI_INGRESS_ENABLED", "slack,slcak")
+
+		_, err := platform.Load()
+		if err == nil {
+			t.Fatal("Load() error = nil, want error (a typo'd surface name must never be silently ignored)")
+		}
+		var invErr *platform.InvalidIngressEnabledError
+		if !errors.As(err, &invErr) {
+			t.Fatalf("Load() error = %v, want *platform.InvalidIngressEnabledError", err)
+		}
+		if invErr.Value != "slcak" {
+			t.Errorf("InvalidIngressEnabledError.Value = %q, want %q", invErr.Value, "slcak")
+		}
+	})
+
+	t.Run("all three named explicitly is identical to unset", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("NARVI_INGRESS_ENABLED", "slack,linear,github")
+
+		cfg, err := platform.Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v, want nil", err)
+		}
+		for _, p := range integrations.Providers {
+			if !cfg.IngressEnabled[p] {
+				t.Errorf("Load().IngressEnabled[%q] = false, want true", p)
+			}
+		}
+	})
+}
+
+// TestLoadRWXPreviewsRequireGitHubIngress covers
+// RWXPreviewsRequireGitHubIngressError: NARVI_RWX_ACCESS_TOKEN configures
+// an explicit opt-in into RWX previews (§4.1.1/§4.1.2), whose GitHub half
+// (posting the preview link, controlplane/serve.go's own
+// githubPreviewLinkNotifier) can only ever work with cfg.GitHubBotToken --
+// itself only ever populated when GitHub ingress is enabled
+// (gitHubBotTokenEnvVarName's own doc comment). Setting the RWX token
+// while disabling GitHub ingress is therefore a config that can never
+// work, and Load refuses to boot with it rather than silently letting
+// controlplane/serve.go's own Build wire a GitHub-flavored notifier with
+// an empty credential.
+func TestLoadRWXPreviewsRequireGitHubIngress(t *testing.T) {
+	t.Run("RWX token set with GitHub ingress disabled is a loud boot failure", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("NARVI_INGRESS_ENABLED", "slack,linear") // GitHub left out.
+		t.Setenv("NARVI_RWX_ACCESS_TOKEN", "test-rwx-access-token")
+		// GitHub ingress secrets are irrelevant once GitHub ingress is
+		// disabled -- blank them out to prove this failure is about the
+		// RWX/GitHub combination, not a leftover missing GitHub secret.
+		t.Setenv("NARVI_GITHUB_WEBHOOK_SECRET", "")
+		t.Setenv("NARVI_GITHUB_BOT_HANDLE", "")
+		t.Setenv("NARVI_GITHUB_BOT_TOKEN", "")
+
+		_, err := platform.Load()
+		if err == nil {
+			t.Fatal("Load() error = nil, want error (RWX previews configured with GitHub ingress disabled can never post the GitHub half of a preview)")
+		}
+		var rwxErr *platform.RWXPreviewsRequireGitHubIngressError
+		if !errors.As(err, &rwxErr) {
+			t.Fatalf("Load() error = %v, want *platform.RWXPreviewsRequireGitHubIngressError", err)
+		}
+	})
+
+	t.Run("RWX token set with GitHub ingress enabled boots fine", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("NARVI_RWX_ACCESS_TOKEN", "test-rwx-access-token")
+		// NARVI_INGRESS_ENABLED deliberately left unset -- default enables
+		// all three surfaces, GitHub included.
+
+		cfg, err := platform.Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v, want nil (GitHub ingress enabled makes the RWX/GitHub combination valid)", err)
+		}
+		if cfg.RWXAccessToken != "test-rwx-access-token" {
+			t.Errorf("Load().RWXAccessToken = %q, want %q", cfg.RWXAccessToken, "test-rwx-access-token")
+		}
+	})
+
+	t.Run("RWX token unset with GitHub ingress disabled boots fine", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("NARVI_INGRESS_ENABLED", "slack,linear") // GitHub left out.
+		t.Setenv("NARVI_GITHUB_WEBHOOK_SECRET", "")
+		t.Setenv("NARVI_GITHUB_BOT_HANDLE", "")
+		t.Setenv("NARVI_GITHUB_BOT_TOKEN", "")
+		// NARVI_RWX_ACCESS_TOKEN deliberately left unset.
+
+		cfg, err := platform.Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v, want nil (no RWX token means the impossible combination never arises)", err)
+		}
+		if cfg.RWXAccessToken != "" {
+			t.Errorf("Load().RWXAccessToken = %q, want empty", cfg.RWXAccessToken)
 		}
 	})
 }

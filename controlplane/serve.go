@@ -80,6 +80,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/shadowscm"
 	"github.com/narvidev/narvi/internal/app/shadowslack"
 	"github.com/narvidev/narvi/internal/app/uploadsweep"
+	"github.com/narvidev/narvi/internal/domain/integrations"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -329,6 +330,22 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 			return nil, fmt.Errorf("apply module %q migrations: %w", m.Name, err)
 		}
 	}
+
+	// slackIngressEnabled/linearIngressEnabled/githubIngressEnabled (§12.5's
+	// own ingress-optionality decision) gate every route, webhook endpoint,
+	// and outbox notifier this function wires for that surface below -- the
+	// SAME cfg.IngressEnabled map httpapi.GetIntegrations reads (via
+	// configuredForProvider), never a second, independently-derived notion
+	// of "enabled". A surface not enabled here gets none of: its own
+	// router.Post/router.Route registration, its own entry in
+	// outboxNotifiers -- so a row that still somehow gets enqueued for one
+	// of its kinds dead-letters through outboxworker's existing "no
+	// notifier registered for kind" path, exactly like an unconfigured RWX/
+	// object-storage row already does, rather than posting with an empty
+	// credential or panicking.
+	slackIngressEnabled := cfg.IngressEnabled[integrations.ProviderSlack]
+	linearIngressEnabled := cfg.IngressEnabled[integrations.ProviderLinear]
+	githubIngressEnabled := cfg.IngressEnabled[integrations.ProviderGitHub]
 
 	// hub is the single shared piece of state connecting the app-layer
 	// actor to the adapter-layer client sockets (§6.2's "→ broadcast
@@ -1211,116 +1228,124 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	router.Get("/sessions/{sessionID}/uploads/{uploadID}/content",
 		httpapi.UploadContent(sandboxStore, artifactStore, blobStore, cfg.ObjectStorage, cfg.Timeouts))
 
-	// Slack ingress (§8.10): deliberately mounted OUTSIDE
-	// /api/sessions and outside auth.Middleware entirely -- Slack itself
-	// is the caller here, authenticated via its own request-signing
-	// scheme (X-Slack-Signature/X-Slack-Request-Timestamp), not a
-	// narvi_auth_session cookie. See internal/adapters/inbound/slack's
-	// own doc.go for the full request-handling writeup.
-	router.Post("/webhooks/slack", slack.NewHandler(slack.Deps{
-		Pool:         pool,
-		Sessions:     sessionStore,
-		Turns:        turnStore,
-		Environments: environmentStore,
-		Registry:     registry,
-		Deliveries:   webhookDeliveryStore,
-		Threads:      slackThreadSessionStore,
-		AuditLog:     auditLogStore,
-		// Plans (a follow-up fix, §8.1): the SAME planStore
-		// instance every other caller above already uses -- handleEvent's
-		// own awaiting-plan gate/verdict/revise-prefix check (handler.go)
-		// needs this to find a mapped session's own awaiting_approval plan,
-		// if any, exactly like Linear's identical Deps.Plans wiring below.
-		Plans: planStore,
-		// Events/PlanDocuments (§31.3): DecidePlan's own approved-plan
-		// snapshot dependencies (decideplan.go) -- the SAME eventStore/
-		// planDocumentStore instances every other caller of DecidePlan
-		// already uses, never a second, independently-constructed copy.
-		Events:        eventStore,
-		PlanDocuments: planDocumentStore,
-		// Outbox/LinearAgentSessions (this batch's own addition, "honour a
-		// typed plan verdict"): handlePlanVerdict's own httpapi.DecidePlan
-		// call (handler.go) needs these exactly like the interactivity
-		// route's own identical Outbox/LinearAgentSessions wiring
-		// immediately below -- the SAME outboxStore/linearAgentSessionStore
-		// instances every other caller of DecidePlan already uses, never a
-		// second, independently-constructed copy.
-		Outbox:              outboxStore,
-		LinearAgentSessions: linearAgentSessionStore,
-		// Participants (this Step's own SECOND fix-pass addition,
-		// "identities + full RBAC", §13.2/§13.3): the SAME participantStore
-		// instance every other caller (the interactivity route immediately
-		// below, Linear's own Deps) already uses, never a second,
-		// independently-constructed copy.
-		Participants:     participantStore,
-		IntentClassifier: intentClassifierSvc,
-		// EpistemicCheckDefault (§20.4): the SAME platform.Config
-		// value every other CreateTurnCore-reaching caller below also
-		// receives.
-		EpistemicCheckDefault: cfg.EpistemicCheckDefault,
-		// RolloutMode/RepoSettings (§10 Phase 6, §32): the SAME
-		// cfg.RolloutMode/repoSettingsStore every other CreateSessionCore-
-		// reaching caller in this file also receives.
-		RolloutMode:  cfg.RolloutMode,
-		RepoSettings: repoSettingsStore,
-		// PRSessions (§31.4): the SAME githubPRSessionStore
-		// instance every other CreateSessionCore-reaching caller in this
-		// file also receives -- slack.Deps.PRSessions' own doc comment
-		// explains why Slack's own fixed default repo needs it too.
-		PRSessions:      githubPRSessionStore,
-		SigningSecret:   cfg.SlackSigningSecret,
-		DefaultRepoName: cfg.SlackDefaultRepoName,
-		DefaultRepoURL:  cfg.SlackDefaultRepoURL,
-		TimestampWindow: cfg.Timeouts.WebhookTimestampFreshnessWindow,
-		AckTimeout:      cfg.Timeouts.SlackAckTimeout,
-		// IdentityLink/SlackClient/Timeouts ("identities + full
-		// RBAC", §13.2): SlackClient is the shadowslack-decorated wrapper
-		// (§30.3) around the SAME slackNotifier instance already
-		// constructed above (for the outbox delivery worker and the
-		// interactivity route immediately below), never a third,
-		// independently-constructed, gate-free client.
-		IdentityLink: appIdentityLinkDeps,
-		SlackClient:  slackDecorated,
-		Timeouts:     cfg.Timeouts,
-	}))
+	// Slack ingress (§8.10), both routes below (Events API + interactivity):
+	// deliberately mounted OUTSIDE /api/sessions and outside auth.Middleware
+	// entirely -- Slack itself is the caller here, authenticated via its
+	// own request-signing scheme (X-Slack-Signature/X-Slack-Request-
+	// Timestamp), not a narvi_auth_session cookie. See internal/adapters/
+	// inbound/slack's own doc.go for the full request-handling writeup.
+	//
+	// Gated on slackIngressEnabled (§12.5's own ingress-optionality
+	// decision, computed once near the top of this function): a
+	// deployment that never enables Slack ingress mounts NEITHER route at
+	// all, so a request to either path 404s rather than reaching a handler
+	// built against an empty SigningSecret/BotToken.
+	if slackIngressEnabled {
+		router.Post("/webhooks/slack", slack.NewHandler(slack.Deps{
+			Pool:         pool,
+			Sessions:     sessionStore,
+			Turns:        turnStore,
+			Environments: environmentStore,
+			Registry:     registry,
+			Deliveries:   webhookDeliveryStore,
+			Threads:      slackThreadSessionStore,
+			AuditLog:     auditLogStore,
+			// Plans (a follow-up fix, §8.1): the SAME planStore
+			// instance every other caller above already uses -- handleEvent's
+			// own awaiting-plan gate/verdict/revise-prefix check (handler.go)
+			// needs this to find a mapped session's own awaiting_approval plan,
+			// if any, exactly like Linear's identical Deps.Plans wiring below.
+			Plans: planStore,
+			// Events/PlanDocuments (§31.3): DecidePlan's own approved-plan
+			// snapshot dependencies (decideplan.go) -- the SAME eventStore/
+			// planDocumentStore instances every other caller of DecidePlan
+			// already uses, never a second, independently-constructed copy.
+			Events:        eventStore,
+			PlanDocuments: planDocumentStore,
+			// Outbox/LinearAgentSessions (this batch's own addition, "honour a
+			// typed plan verdict"): handlePlanVerdict's own httpapi.DecidePlan
+			// call (handler.go) needs these exactly like the interactivity
+			// route's own identical Outbox/LinearAgentSessions wiring
+			// immediately below -- the SAME outboxStore/linearAgentSessionStore
+			// instances every other caller of DecidePlan already uses, never a
+			// second, independently-constructed copy.
+			Outbox:              outboxStore,
+			LinearAgentSessions: linearAgentSessionStore,
+			// Participants (this Step's own SECOND fix-pass addition,
+			// "identities + full RBAC", §13.2/§13.3): the SAME participantStore
+			// instance every other caller (the interactivity route immediately
+			// below, Linear's own Deps) already uses, never a second,
+			// independently-constructed copy.
+			Participants:     participantStore,
+			IntentClassifier: intentClassifierSvc,
+			// EpistemicCheckDefault (§20.4): the SAME platform.Config
+			// value every other CreateTurnCore-reaching caller below also
+			// receives.
+			EpistemicCheckDefault: cfg.EpistemicCheckDefault,
+			// RolloutMode/RepoSettings (§10 Phase 6, §32): the SAME
+			// cfg.RolloutMode/repoSettingsStore every other CreateSessionCore-
+			// reaching caller in this file also receives.
+			RolloutMode:  cfg.RolloutMode,
+			RepoSettings: repoSettingsStore,
+			// PRSessions (§31.4): the SAME githubPRSessionStore
+			// instance every other CreateSessionCore-reaching caller in this
+			// file also receives -- slack.Deps.PRSessions' own doc comment
+			// explains why Slack's own fixed default repo needs it too.
+			PRSessions:      githubPRSessionStore,
+			SigningSecret:   cfg.SlackSigningSecret,
+			DefaultRepoName: cfg.SlackDefaultRepoName,
+			DefaultRepoURL:  cfg.SlackDefaultRepoURL,
+			TimestampWindow: cfg.Timeouts.WebhookTimestampFreshnessWindow,
+			AckTimeout:      cfg.Timeouts.SlackAckTimeout,
+			// IdentityLink/SlackClient/Timeouts ("identities + full
+			// RBAC", §13.2): SlackClient is the shadowslack-decorated wrapper
+			// (§30.3) around the SAME slackNotifier instance already
+			// constructed above (for the outbox delivery worker and the
+			// interactivity route immediately below), never a third,
+			// independently-constructed, gate-free client.
+			IdentityLink: appIdentityLinkDeps,
+			SlackClient:  slackDecorated,
+			Timeouts:     cfg.Timeouts,
+		}))
 
-	// Slack INTERACTIVITY ingress ("plan mode, cross-channel",
-	// §8.1/§13.3) -- a SEPARATE route from the Events API ingress
-	// immediately above (structurally different payload shape; see
-	// internal/adapters/inbound/slack/interactive.go's own top doc comment
-	// for the real, external "Interactivity & Shortcuts" App-config step
-	// this route requires before Slack ever sends it anything). Mounted
-	// OUTSIDE auth.Middleware entirely, mirroring the Events API route
-	// exactly -- authenticated via Slack's own request signature, not a
-	// cookie.
-	router.Post("/webhooks/slack/interactive", slack.NewInteractivityHandler(slack.InteractiveDeps{
-		Pool:                pool,
-		Sessions:            sessionStore,
-		Turns:               turnStore,
-		Plans:               planStore,
-		Events:              eventStore,
-		PlanDocuments:       planDocumentStore,
-		Outbox:              outboxStore,
-		LinearAgentSessions: linearAgentSessionStore,
-		Registry:            registry,
-		SlackClient:         slackDecorated,
-		AuditLog:            auditLogStore,
-		IdentityLink:        appIdentityLinkDeps,
-		// Participants ("identities + full RBAC", §13.2/§13.3):
-		// the SAME participantStore instance §8.1's own REST plan
-		// approve/reject endpoints already use (constructed once, above),
-		// never a second, independently-constructed copy.
-		Participants: participantStore,
-		// EpistemicCheckDefault (§20.4): see slack.Deps' own
-		// identical field above -- this route's own CreateTurnCore call
-		// always names planMode=true, so this value never actually
-		// changes behavior here today (§20.3), but is threaded for the
-		// same "correct by construction" reason documented on
-		// InteractiveDeps.EpistemicCheckDefault itself.
-		EpistemicCheckDefault: cfg.EpistemicCheckDefault,
-		SigningSecret:         cfg.SlackSigningSecret,
-		Timeouts:              cfg.Timeouts,
-	}))
+		// Slack INTERACTIVITY ingress ("plan mode, cross-channel",
+		// §8.1/§13.3) -- a SEPARATE route from the Events API ingress
+		// immediately above (structurally different payload shape; see
+		// internal/adapters/inbound/slack/interactive.go's own top doc comment
+		// for the real, external "Interactivity & Shortcuts" App-config step
+		// this route requires before Slack ever sends it anything). Mounted
+		// OUTSIDE auth.Middleware entirely, mirroring the Events API route
+		// exactly -- authenticated via Slack's own request signature, not a
+		// cookie.
+		router.Post("/webhooks/slack/interactive", slack.NewInteractivityHandler(slack.InteractiveDeps{
+			Pool:                pool,
+			Sessions:            sessionStore,
+			Turns:               turnStore,
+			Plans:               planStore,
+			Events:              eventStore,
+			PlanDocuments:       planDocumentStore,
+			Outbox:              outboxStore,
+			LinearAgentSessions: linearAgentSessionStore,
+			Registry:            registry,
+			SlackClient:         slackDecorated,
+			AuditLog:            auditLogStore,
+			IdentityLink:        appIdentityLinkDeps,
+			// Participants ("identities + full RBAC", §13.2/§13.3):
+			// the SAME participantStore instance §8.1's own REST plan
+			// approve/reject endpoints already use (constructed once, above),
+			// never a second, independently-constructed copy.
+			Participants: participantStore,
+			// EpistemicCheckDefault (§20.4): see slack.Deps' own
+			// identical field above -- this route's own CreateTurnCore call
+			// always names planMode=true, so this value never actually
+			// changes behavior here today (§20.3), but is threaded for the
+			// same "correct by construction" reason documented on
+			// InteractiveDeps.EpistemicCheckDefault itself.
+			EpistemicCheckDefault: cfg.EpistemicCheckDefault,
+			SigningSecret:         cfg.SlackSigningSecret,
+			Timeouts:              cfg.Timeouts,
+		}))
+	}
 
 	// GitHub webhook ingress ("GitHub ingress", §8.2): mounted
 	// OUTSIDE auth.Middleware entirely, mirroring scm-credentials/
@@ -1329,159 +1354,166 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// internal/adapters/inbound/github's own doc.go for the full
 	// verify -> dedupe-claim -> parse -> detect -> per-PR-coalesce
 	// sequencing.
-	router.Post("/webhooks/github", githubingress.NewHandler(
-		&githubingress.SessionCoalescer{
-			Pool:             pool,
-			PRSessions:       githubPRSessionStore,
-			Sessions:         sessionStore,
-			Turns:            turnStore,
-			Environments:     environmentStore,
-			Registry:         registry,
-			IntentClassifier: intentClassifierSvc,
-			AuditLog:         auditLogStore,
-			// Identities/Users/Participants (batch fix/audit-github-actor-
-			// rbac): the SAME identityStore/userStore/participantStore
-			// instances every other caller above already uses (§13.1's
-			// own auth wiring, §8.1's own plan approve/reject
-			// endpoints), never a second, independently-constructed copy.
-			Identities:   identityStore,
-			Users:        userStore,
-			Participants: participantStore,
-			// Plans (a follow-up fix, §8.1): the SAME planStore
-			// instance every other caller above already uses -- threaded
-			// through to CreateTurnForBot's own awaiting-plan gate.
-			Plans: planStore,
-			// ReviewTriage/ReviewModelDeep (§26.3): the SAME
-			// repoSettingsStore/reviewVerdictStore instances every other
-			// caller above already uses, never a second, independently-
-			// constructed copy.
-			ReviewTriage: appreviewtriage.Deps{
-				RepoSettings:   repoSettingsStore,
-				ReviewVerdicts: reviewVerdictStore,
-				Artifacts:      artifactStore,
-				Sessions:       sessionStore,
+	//
+	// Gated on githubIngressEnabled (§12.5's own ingress-optionality
+	// decision): a deployment that never enables GitHub ingress does not
+	// mount this route at all, so a webhook POST from GitHub 404s rather
+	// than reaching a handler built against an empty WebhookSecret.
+	if githubIngressEnabled {
+		router.Post("/webhooks/github", githubingress.NewHandler(
+			&githubingress.SessionCoalescer{
+				Pool:             pool,
+				PRSessions:       githubPRSessionStore,
+				Sessions:         sessionStore,
+				Turns:            turnStore,
+				Environments:     environmentStore,
+				Registry:         registry,
+				IntentClassifier: intentClassifierSvc,
+				AuditLog:         auditLogStore,
+				// Identities/Users/Participants (batch fix/audit-github-actor-
+				// rbac): the SAME identityStore/userStore/participantStore
+				// instances every other caller above already uses (§13.1's
+				// own auth wiring, §8.1's own plan approve/reject
+				// endpoints), never a second, independently-constructed copy.
+				Identities:   identityStore,
+				Users:        userStore,
+				Participants: participantStore,
+				// Plans (a follow-up fix, §8.1): the SAME planStore
+				// instance every other caller above already uses -- threaded
+				// through to CreateTurnForBot's own awaiting-plan gate.
+				Plans: planStore,
+				// ReviewTriage/ReviewModelDeep (§26.3): the SAME
+				// repoSettingsStore/reviewVerdictStore instances every other
+				// caller above already uses, never a second, independently-
+				// constructed copy.
+				ReviewTriage: appreviewtriage.Deps{
+					RepoSettings:   repoSettingsStore,
+					ReviewVerdicts: reviewVerdictStore,
+					Artifacts:      artifactStore,
+					Sessions:       sessionStore,
+				},
+				ReviewModelDeep: cfg.ReviewModelDeep,
+				// RolloutMode/RepoSettings (§10 Phase 6, §32): the
+				// SAME cfg.RolloutMode/repoSettingsStore every other
+				// CreateSessionOnTx-reaching caller in this file also
+				// receives -- a DEDICATED field pair, not a reuse of
+				// ReviewTriage.RepoSettings immediately above (see
+				// SessionCoalescer.RolloutMode's own doc comment for why).
+				RolloutMode:  cfg.RolloutMode,
+				RepoSettings: repoSettingsStore,
+				// PRSessions is already set above (githubPRSessionStore) --
+				// SessionCoalescer.PRSessions is not a §31.4-only addition, it
+				// predates this Step (§8.2's own per-PR claim coalescing) and
+				// this WINNER path's own CreateSessionOnTx call now also
+				// receives it as that function's new prSessions parameter --
+				// see coalesce.go's own call-site comment for why this
+				// deployment's own entitlement gate is exempt, not merely
+				// satisfied, for every session this struct creates.
+				// F7 correction (adversarial review): SessionCoalescer
+				// no longer has an EpistemicCheckDefault field -- both of its
+				// own CreateSessionOnTx/CreateTurnForBot call sites now
+				// hardcode false instead (coalesce.go's own doc comment on the
+				// removed field explains the full "why": every session/turn
+				// this package creates or joins is a PR review session, never a
+				// build turn, so the platform's real epistemic-check default
+				// must never reach it).
 			},
-			ReviewModelDeep: cfg.ReviewModelDeep,
-			// RolloutMode/RepoSettings (§10 Phase 6, §32): the
-			// SAME cfg.RolloutMode/repoSettingsStore every other
-			// CreateSessionOnTx-reaching caller in this file also
-			// receives -- a DEDICATED field pair, not a reuse of
-			// ReviewTriage.RepoSettings immediately above (see
-			// SessionCoalescer.RolloutMode's own doc comment for why).
-			RolloutMode:  cfg.RolloutMode,
-			RepoSettings: repoSettingsStore,
-			// PRSessions is already set above (githubPRSessionStore) --
-			// SessionCoalescer.PRSessions is not a §31.4-only addition, it
-			// predates this Step (§8.2's own per-PR claim coalescing) and
-			// this WINNER path's own CreateSessionOnTx call now also
-			// receives it as that function's new prSessions parameter --
-			// see coalesce.go's own call-site comment for why this
-			// deployment's own entitlement gate is exempt, not merely
-			// satisfied, for every session this struct creates.
-			// F7 correction (adversarial review): SessionCoalescer
-			// no longer has an EpistemicCheckDefault field -- both of its
-			// own CreateSessionOnTx/CreateTurnForBot call sites now
-			// hardcode false instead (coalesce.go's own doc comment on the
-			// removed field explains the full "why": every session/turn
-			// this package creates or joins is a PR review session, never a
-			// build turn, so the platform's real epistemic-check default
-			// must never reach it).
-		},
-		webhookDeliveryStore,
-		githubingress.Config{
-			WebhookSecret: cfg.GitHubWebhookSecret,
-			BotHandle:     cfg.GitHubBotHandle,
-			// ReReviewLabel/DiffFetcher ("review sessions", §8.2):
-			// the manual re-trigger-via-label lane's own configured label
-			// name, and the SAME instance already
-			// constructed above (sourceControl) as PullRequests/Comments --
-			// never a second, independently-constructed copy -- now ALSO
-			// wired as this Step's own diff/stack pre-fetch source.
-			ReReviewLabel: cfg.GitHubReReviewLabel,
-			DiffFetcher:   sourceControl,
-			// ReviewFindings (§22.1): the SAME reviewFindingStore
-			// instance every other caller above already uses.
-			ReviewFindings: reviewFindingStore,
-			// FalsePositivePatterns (§22.3): the SAME
-			// falsePositivePatternStore instance every other caller
-			// (RetriggerReview, the capture/lifecycle endpoints below)
-			// already uses.
-			FalsePositivePatterns: falsePositivePatternStore,
-			// FalsePositivePatternCapture (§22.2): the SAME
-			// falsePositivePatternStore instance, satisfying this
-			// structurally different (write) interface.
-			FalsePositivePatternCapture: falsePositivePatternStore,
-			// ArchDecisions/KnowledgeRanker (§31.6): the SAME
-			// reviewVerdictStore instance every other review_verdicts
-			// reader above already uses (it satisfies reviewcontext.
-			// ArchDecisionsFetcher directly, reviewverdictarchdecisions.go)
-			// and the SAME knowledgeRanker every other review-turn
-			// producer in this file shares (knowledge.RecencyRanker{}
-			// unless a composed module supplies its own).
-			ArchDecisions:   reviewVerdictStore,
-			KnowledgeRanker: knowledgeRanker,
-			// ArchRecapContestCapture/ArchRecapVerdicts (§26.5):
-			// reviewDigestSectionFeedbackStore is the SAME instance this
-			// deployment has exactly one of; reviewVerdictDeps is the SAME
-			// bundle every other review-verdict reader in this file already
-			// shares (constructed once, above, alongside reviewVerdictStore).
-			ArchRecapContestCapture: reviewDigestSectionFeedbackStore,
-			ArchRecapVerdicts:       reviewVerdictDeps,
-			// BotToken/PullRequests (batch fix/audit-github-pr-payload-
-			// correctness, H5 audit fix): resolve an issue_comment
-			// mention's TRUE head branch/repo via one authenticated
-			// GET /repos/{owner}/{repo}/pulls/{number} call. sourceControl
-			// is the SAME instance already constructed
-			// above for CreatePR/ResolveBranchSHA/ResolveContractsFingerprint
-			// -- never a second, independently-constructed copy -- and
-			// cfg.GitHubBotToken is the SAME bot credential githubNotifier
-			// (below) already authenticates its own PostIssueComment calls
-			// with, never a per-commenter credential.
-			BotToken:     cfg.GitHubBotToken,
-			PullRequests: sourceControl,
-			// Comments (a follow-up fix, Finding 1; also posts
-			// batch fix/deny-unlinked-github-actors' own "please sign in"
-			// reply): the SAME *githubapi.Adapter instance as
-			// PullRequests above -- never a second, independently-
-			// constructed copy. It is liveSourceControl rather than the
-			// decorator because PostIssueComment lives outside the port;
-			// its suppression comes from the transport gate underneath,
-			// which is why that layer exists (§30.2).
-			Comments: liveSourceControl,
-			Timeouts: cfg.Timeouts,
-			// PublicBaseURL/LinkNotices (batch fix/deny-unlinked-github-
-			// actors): PublicBaseURL is the SAME base identitylink.
-			// BuildMagicLinkURL already uses (appIdentityLinkDeps above),
-			// never a second, independently-configured base. LinkNotices
-			// is a freshly constructed store over the SAME pool every
-			// other store here already shares -- see
-			// githubActorLinkNoticeStore's own construction below.
-			PublicBaseURL: cfg.PublicBaseURL,
-			LinkNotices:   githubActorLinkNoticeStore,
-			// SentinelFixes/RepoSettings/AuditLog (§17.4/§17.5):
-			// the SAME instances every other caller above already uses.
-			SentinelFixes: sentinelFixStore,
-			RepoSettings:  repoSettingsStore,
-			AuditLog:      auditLogStore,
-			// PendingChecks/ReleaseLabel/ReleaseBranchPattern (
-			// "release PR review", §15; PendingChecks itself is
-			// blocking-finding fix #1): releaseManifestPendingStore is the
-			// SAME instance constructed above, alongside outboxStore --
-			// the webhook handler only ever writes ONE cheap row here now;
-			// the actual check (ListMergedBetween, sourceControl, and
-			// outboxStore's own release_manifest row) runs LATER, on
-			// releaseManifestWorker's own background loop (started below,
-			// alongside every other background loop), never inline on
-			// this request's own context.
-			PendingChecks:        releaseManifestPendingStore,
-			ReleaseLabel:         cfg.GitHubReleaseLabel,
-			ReleaseBranchPattern: cfg.GitHubReleaseBranchPattern,
-			// Timers (§24.1): the standalone timerStore instance
-			// constructed above, backing this lane's own direct,
-			// actor-bypassing review_retrigger_debounce timer arm.
-			Timers: timerStore,
-		},
-	))
+			webhookDeliveryStore,
+			githubingress.Config{
+				WebhookSecret: cfg.GitHubWebhookSecret,
+				BotHandle:     cfg.GitHubBotHandle,
+				// ReReviewLabel/DiffFetcher ("review sessions", §8.2):
+				// the manual re-trigger-via-label lane's own configured label
+				// name, and the SAME instance already
+				// constructed above (sourceControl) as PullRequests/Comments --
+				// never a second, independently-constructed copy -- now ALSO
+				// wired as this Step's own diff/stack pre-fetch source.
+				ReReviewLabel: cfg.GitHubReReviewLabel,
+				DiffFetcher:   sourceControl,
+				// ReviewFindings (§22.1): the SAME reviewFindingStore
+				// instance every other caller above already uses.
+				ReviewFindings: reviewFindingStore,
+				// FalsePositivePatterns (§22.3): the SAME
+				// falsePositivePatternStore instance every other caller
+				// (RetriggerReview, the capture/lifecycle endpoints below)
+				// already uses.
+				FalsePositivePatterns: falsePositivePatternStore,
+				// FalsePositivePatternCapture (§22.2): the SAME
+				// falsePositivePatternStore instance, satisfying this
+				// structurally different (write) interface.
+				FalsePositivePatternCapture: falsePositivePatternStore,
+				// ArchDecisions/KnowledgeRanker (§31.6): the SAME
+				// reviewVerdictStore instance every other review_verdicts
+				// reader above already uses (it satisfies reviewcontext.
+				// ArchDecisionsFetcher directly, reviewverdictarchdecisions.go)
+				// and the SAME knowledgeRanker every other review-turn
+				// producer in this file shares (knowledge.RecencyRanker{}
+				// unless a composed module supplies its own).
+				ArchDecisions:   reviewVerdictStore,
+				KnowledgeRanker: knowledgeRanker,
+				// ArchRecapContestCapture/ArchRecapVerdicts (§26.5):
+				// reviewDigestSectionFeedbackStore is the SAME instance this
+				// deployment has exactly one of; reviewVerdictDeps is the SAME
+				// bundle every other review-verdict reader in this file already
+				// shares (constructed once, above, alongside reviewVerdictStore).
+				ArchRecapContestCapture: reviewDigestSectionFeedbackStore,
+				ArchRecapVerdicts:       reviewVerdictDeps,
+				// BotToken/PullRequests (batch fix/audit-github-pr-payload-
+				// correctness, H5 audit fix): resolve an issue_comment
+				// mention's TRUE head branch/repo via one authenticated
+				// GET /repos/{owner}/{repo}/pulls/{number} call. sourceControl
+				// is the SAME instance already constructed
+				// above for CreatePR/ResolveBranchSHA/ResolveContractsFingerprint
+				// -- never a second, independently-constructed copy -- and
+				// cfg.GitHubBotToken is the SAME bot credential githubNotifier
+				// (below) already authenticates its own PostIssueComment calls
+				// with, never a per-commenter credential.
+				BotToken:     cfg.GitHubBotToken,
+				PullRequests: sourceControl,
+				// Comments (a follow-up fix, Finding 1; also posts
+				// batch fix/deny-unlinked-github-actors' own "please sign in"
+				// reply): the SAME *githubapi.Adapter instance as
+				// PullRequests above -- never a second, independently-
+				// constructed copy. It is liveSourceControl rather than the
+				// decorator because PostIssueComment lives outside the port;
+				// its suppression comes from the transport gate underneath,
+				// which is why that layer exists (§30.2).
+				Comments: liveSourceControl,
+				Timeouts: cfg.Timeouts,
+				// PublicBaseURL/LinkNotices (batch fix/deny-unlinked-github-
+				// actors): PublicBaseURL is the SAME base identitylink.
+				// BuildMagicLinkURL already uses (appIdentityLinkDeps above),
+				// never a second, independently-configured base. LinkNotices
+				// is a freshly constructed store over the SAME pool every
+				// other store here already shares -- see
+				// githubActorLinkNoticeStore's own construction below.
+				PublicBaseURL: cfg.PublicBaseURL,
+				LinkNotices:   githubActorLinkNoticeStore,
+				// SentinelFixes/RepoSettings/AuditLog (§17.4/§17.5):
+				// the SAME instances every other caller above already uses.
+				SentinelFixes: sentinelFixStore,
+				RepoSettings:  repoSettingsStore,
+				AuditLog:      auditLogStore,
+				// PendingChecks/ReleaseLabel/ReleaseBranchPattern (
+				// "release PR review", §15; PendingChecks itself is
+				// blocking-finding fix #1): releaseManifestPendingStore is the
+				// SAME instance constructed above, alongside outboxStore --
+				// the webhook handler only ever writes ONE cheap row here now;
+				// the actual check (ListMergedBetween, sourceControl, and
+				// outboxStore's own release_manifest row) runs LATER, on
+				// releaseManifestWorker's own background loop (started below,
+				// alongside every other background loop), never inline on
+				// this request's own context.
+				PendingChecks:        releaseManifestPendingStore,
+				ReleaseLabel:         cfg.GitHubReleaseLabel,
+				ReleaseBranchPattern: cfg.GitHubReleaseBranchPattern,
+				// Timers (§24.1): the standalone timerStore instance
+				// constructed above, backing this lane's own direct,
+				// actor-bypassing review_retrigger_debounce timer arm.
+				Timers: timerStore,
+			},
+		))
+	}
 
 	// Auth routes (§13.1/§13.4): how a session is obtained/
 	// discarded in the first place, so — obviously — mounted OUTSIDE any
@@ -2215,66 +2247,80 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// reasoning -- a confirmed audit finding: this was never actually
 	// role-gated, despite an earlier doc comment here deferring it to a
 	// later Step that never added it).
-	router.Route("/auth/linear", func(r chi.Router) {
-		r.Use(auth.Middleware(userSessionStore, userStore))
-		r.Get("/install", linear.NewInstallHandler(linearOAuthConfig, cfg.Timeouts, secureCookies))
-		r.Get("/callback", linear.NewInstallCallbackHandler(linearOAuthConfig, linearClient, pool, linearInstallationStore, auditLogStore, cfg.TokenEncryptionKey, secureCookies))
-	})
+	//
+	// Both routes below (this one and /webhooks/linear further down) are
+	// gated on linearIngressEnabled (§12.5's own ingress-optionality
+	// decision) -- a deployment that never enables Linear ingress mounts
+	// neither, so a request to either path 404s rather than reaching a
+	// handler built against an empty ClientID/ClientSecret/WebhookSecret.
+	// linearClient/linearDecorated/linearInstallationStore themselves stay
+	// constructed unconditionally above -- linearClient is also reused
+	// below (outside this gate) by the outbox's own LinearNotifier, which
+	// is registered into outboxNotifiers only when linearIngressEnabled
+	// too, so an ungated construction here costs nothing observable when
+	// the surface is disabled.
+	if linearIngressEnabled {
+		router.Route("/auth/linear", func(r chi.Router) {
+			r.Use(auth.Middleware(userSessionStore, userStore))
+			r.Get("/install", linear.NewInstallHandler(linearOAuthConfig, cfg.Timeouts, secureCookies))
+			r.Get("/callback", linear.NewInstallCallbackHandler(linearOAuthConfig, linearClient, pool, linearInstallationStore, auditLogStore, cfg.TokenEncryptionKey, secureCookies))
+		})
 
-	// /webhooks/linear: Linear's own real AgentSessionEvent webhook --
-	// deliberately mounted OUTSIDE auth.Middleware entirely, mirroring
-	// scm-credentials/snapshot-mint's own precedent above exactly: this
-	// is authenticated by Linear's own webhook signature (verified inside
-	// the handler itself), never a browser cookie.
-	router.Post("/webhooks/linear", linear.NewWebhookHandler(linear.Deps{
-		Pool:               pool,
-		Sessions:           sessionStore,
-		Turns:              turnStore,
-		Environments:       environmentStore,
-		Registry:           registry,
-		Deliveries:         webhookDeliveryStore,
-		AgentSessions:      linearAgentSessionStore,
-		Installations:      linearInstallationStore,
-		LinearClient:       linearDecorated,
-		IntentClassifier:   intentClassifierSvc,
-		WebhookSecret:      []byte(cfg.LinearWebhookSecret),
-		TokenEncryptionKey: cfg.TokenEncryptionKey,
-		DefaultRepoName:    cfg.LinearDefaultRepoName,
-		DefaultRepoURL:     cfg.LinearDefaultRepoURL,
-		Timeouts:           cfg.Timeouts,
-		// Plans/Outbox ("plan mode, cross-channel", §8.1/§13.3):
-		// handlePrompted's own new plan-verdict keyword check.
-		Plans:  planStore,
-		Outbox: outboxStore,
-		// Events/PlanDocuments (§31.3): DecidePlan's own approved-plan
-		// snapshot dependencies (decideplan.go) -- the SAME eventStore/
-		// planDocumentStore instances every other caller of DecidePlan
-		// already uses, never a second, independently-constructed copy.
-		Events:        eventStore,
-		PlanDocuments: planDocumentStore,
-		// AuditLog/IdentityLink/Participants ("identities + full
-		// RBAC", §13.2/§13.3): Participants is the SAME participantStore
-		// instance §8.1's own REST plan approve/reject endpoints already
-		// use (constructed once, above), never a second, independently-
-		// constructed copy.
-		AuditLog:     auditLogStore,
-		IdentityLink: appIdentityLinkDeps,
-		Participants: participantStore,
-		// EpistemicCheckDefault (§20.4): the SAME platform.Config
-		// value every other CreateTurnCore-reaching caller above also
-		// receives.
-		EpistemicCheckDefault: cfg.EpistemicCheckDefault,
-		// RolloutMode/RepoSettings (§10 Phase 6, §32): the SAME
-		// cfg.RolloutMode/repoSettingsStore every other CreateSessionCore-
-		// reaching caller in this file also receives.
-		RolloutMode:  cfg.RolloutMode,
-		RepoSettings: repoSettingsStore,
-		// PRSessions (§31.4): the SAME githubPRSessionStore
-		// instance every other CreateSessionCore-reaching caller in this
-		// file also receives -- linear.Deps.PRSessions' own doc comment
-		// explains why Linear's own fixed default repo needs it too.
-		PRSessions: githubPRSessionStore,
-	}))
+		// /webhooks/linear: Linear's own real AgentSessionEvent webhook --
+		// deliberately mounted OUTSIDE auth.Middleware entirely, mirroring
+		// scm-credentials/snapshot-mint's own precedent above exactly: this
+		// is authenticated by Linear's own webhook signature (verified inside
+		// the handler itself), never a browser cookie.
+		router.Post("/webhooks/linear", linear.NewWebhookHandler(linear.Deps{
+			Pool:               pool,
+			Sessions:           sessionStore,
+			Turns:              turnStore,
+			Environments:       environmentStore,
+			Registry:           registry,
+			Deliveries:         webhookDeliveryStore,
+			AgentSessions:      linearAgentSessionStore,
+			Installations:      linearInstallationStore,
+			LinearClient:       linearDecorated,
+			IntentClassifier:   intentClassifierSvc,
+			WebhookSecret:      []byte(cfg.LinearWebhookSecret),
+			TokenEncryptionKey: cfg.TokenEncryptionKey,
+			DefaultRepoName:    cfg.LinearDefaultRepoName,
+			DefaultRepoURL:     cfg.LinearDefaultRepoURL,
+			Timeouts:           cfg.Timeouts,
+			// Plans/Outbox ("plan mode, cross-channel", §8.1/§13.3):
+			// handlePrompted's own new plan-verdict keyword check.
+			Plans:  planStore,
+			Outbox: outboxStore,
+			// Events/PlanDocuments (§31.3): DecidePlan's own approved-plan
+			// snapshot dependencies (decideplan.go) -- the SAME eventStore/
+			// planDocumentStore instances every other caller of DecidePlan
+			// already uses, never a second, independently-constructed copy.
+			Events:        eventStore,
+			PlanDocuments: planDocumentStore,
+			// AuditLog/IdentityLink/Participants ("identities + full
+			// RBAC", §13.2/§13.3): Participants is the SAME participantStore
+			// instance §8.1's own REST plan approve/reject endpoints already
+			// use (constructed once, above), never a second, independently-
+			// constructed copy.
+			AuditLog:     auditLogStore,
+			IdentityLink: appIdentityLinkDeps,
+			Participants: participantStore,
+			// EpistemicCheckDefault (§20.4): the SAME platform.Config
+			// value every other CreateTurnCore-reaching caller above also
+			// receives.
+			EpistemicCheckDefault: cfg.EpistemicCheckDefault,
+			// RolloutMode/RepoSettings (§10 Phase 6, §32): the SAME
+			// cfg.RolloutMode/repoSettingsStore every other CreateSessionCore-
+			// reaching caller in this file also receives.
+			RolloutMode:  cfg.RolloutMode,
+			RepoSettings: repoSettingsStore,
+			// PRSessions (§31.4): the SAME githubPRSessionStore
+			// instance every other CreateSessionCore-reaching caller in this
+			// file also receives -- linear.Deps.PRSessions' own doc comment
+			// explains why Linear's own fixed default repo needs it too.
+			PRSessions: githubPRSessionStore,
+		}))
+	}
 
 	// Module routes (docs/design/boundaries-design.md, section 3.2): mounted
 	// AFTER every public route group, under /api/ext/<Name>/, behind the
@@ -2366,66 +2412,136 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 
 	// outboxStore is constructed earlier, alongside linearAgentSessionStore
 	// -- see that construction site's own doc comment for why.
-	outboxNotifiers := map[ports.NotificationKind]ports.Notifier{
-		ports.NotificationKindSlack:             slackNotifier,
-		ports.NotificationKindGitHub:            githubNotifier,
-		ports.NotificationKindLinear:            linearNotifier,
-		ports.NotificationKindLinearProgress:    linearNotifier,
-		ports.NotificationKindSlackPlanApproval: planSlackNotifier,
-		ports.NotificationKindSlackPlanDecided:  planSlackNotifier,
-		ports.NotificationKindGitHubVerdict:     githubVerdictNotifier,
-		ports.NotificationKindSentinelAutoFix:   sentinelAutoFixNotifier,
-		ports.NotificationKindHandoffSentinel:   handoffNotifier,
-		ports.NotificationKindReleaseManifest:   releaseManifestNotifier,
-		// §26.2 ("review digest: description adequacy + graduated
-		// remediation", §26.2): re-verifies Narvi-authorship and this
-		// repo's own descriptionAutofix flag, fresh, at delivery time,
-		// then rewrites a Narvi-authored PR's own body.
-		ports.NotificationKindGitHubDescriptionAutofix: descriptionAutofixNotifier,
+	//
+	// Every entry below is registered ONLY when its own surface's
+	// slackIngressEnabled/linearIngressEnabled/githubIngressEnabled is true
+	// (§12.5's own ingress-optionality decision, computed once near the
+	// top of this function) -- mirroring the RWX/blob_delete precedent
+	// immediately below this map's own construction exactly: a kind whose
+	// surface is disabled has no notifier registered for it at all, so any
+	// row that still somehow gets enqueued for it (nothing today should
+	// produce one -- every one of these kinds is only ever enqueued from a
+	// session/PR context that surface's own now-unmounted ingress route
+	// would have had to create or touch first, EXCEPT the review-verdict/
+	// workflow-step-outcome sandbox tools, which stay mounted
+	// unconditionally and could in principle still be called against a
+	// PR-linked session that did not originate from GitHub ingress at all)
+	// dead-letters through outboxworker's existing "no notifier registered
+	// for kind" path rather than posting with an empty bot token/signing
+	// secret.
+	outboxNotifiers := map[ports.NotificationKind]ports.Notifier{}
+	if slackIngressEnabled {
+		outboxNotifiers[ports.NotificationKindSlack] = slackNotifier
+		outboxNotifiers[ports.NotificationKindSlackPlanApproval] = planSlackNotifier
+		outboxNotifiers[ports.NotificationKindSlackPlanDecided] = planSlackNotifier
 		// §25.9 ("workflow HITL gate + circuit breaker", §25.9): a
 		// workflow step awaiting decision, or a run escalating to
 		// needs_review, notifies a human via whichever of these three the
 		// originating session supports (internal/app/workflowengine's own
-		// enqueueWorkflowNotice, notify.go). Slack/Linear reuse the SAME
-		// planSlackNotifier/linearNotifier instances already registered
-		// above, each now handling a THIRD kind (see those types' own
-		// updated Deliver switch); GitHub reuses the SAME githubNotifier
-		// instance too -- BotNotifier.Deliver never inspects notification.
-		// Kind at all, so registering it under a second key needs no new
-		// githubapi code whatsoever.
-		ports.NotificationKindSlackWorkflowDecision:  planSlackNotifier,
-		ports.NotificationKindLinearWorkflowDecision: linearNotifier,
-		ports.NotificationKindGitHubWorkflowDecision: githubNotifier,
+		// enqueueWorkflowNotice, notify.go). Reuses the SAME
+		// planSlackNotifier instance already registered above, now
+		// handling a second kind (see that type's own updated Deliver
+		// switch).
+		outboxNotifiers[ports.NotificationKindSlackWorkflowDecision] = planSlackNotifier
 		// §21 ("review verdict persistence, analytics, digest &
 		// automated approval", §21.3): the deterministic daily digest's
-		// own two outbox kinds. digestSlackNotifier reuses the SAME
-		// *slackapi.Client every other Slack notifier above already
-		// uses; digestLinearNotifier takes no dependencies at all -- see
-		// that type's own doc comment (outboxworker/digestlinearnotifier.go)
+		// own Slack kind. digestSlackNotifier reuses the SAME
+		// *slackapi.Client every other Slack notifier above already uses.
+		outboxNotifiers[ports.NotificationKindSlackDigest] = outboxworker.NewDigestSlackNotifier(slackNotifier)
+	}
+	if linearIngressEnabled {
+		// linearNotifier looks up each workspace's own real Linear API
+		// credential fresh, by organization_id, at delivery time
+		// (linearInstallationStore + cfg.TokenEncryptionKey) -- never a
+		// token cached in this map itself -- and, as of an audit-fix batch
+		// (finding M16, "completeness"), is registered under BOTH
+		// NotificationKindLinear and NotificationKindLinearProgress below
+		// (the SAME instance/Deliver implementation for both -- see that
+		// type's own doc comment, linearnotifier.go).
+		outboxNotifiers[ports.NotificationKindLinear] = linearNotifier
+		outboxNotifiers[ports.NotificationKindLinearProgress] = linearNotifier
+		outboxNotifiers[ports.NotificationKindLinearWorkflowDecision] = linearNotifier
+		// digestLinearNotifier takes no dependencies at all -- see that
+		// type's own doc comment (outboxworker/digestlinearnotifier.go)
 		// for why it always returns a clear, typed error rather than
 		// actually delivering anything (no organization-level Linear post
 		// capability exists in this codebase yet).
-		ports.NotificationKindSlackDigest:  outboxworker.NewDigestSlackNotifier(slackNotifier),
-		ports.NotificationKindLinearDigest: outboxworker.NewDigestLinearNotifier(),
+		outboxNotifiers[ports.NotificationKindLinearDigest] = outboxworker.NewDigestLinearNotifier()
+	}
+	if githubIngressEnabled {
+		// githubNotifier wraps the SAME sourceControl Adapter already
+		// constructed above (design decision: BotNotifier is a sibling
+		// type over the same Adapter/doPost machinery, not a second,
+		// independently-constructed client), authenticated with the NEW,
+		// separate cfg.GitHubBotToken rather than any per-session OAuth
+		// token (see internal/platform/config.go's own
+		// gitHubBotTokenEnvVarName doc comment for why).
+		outboxNotifiers[ports.NotificationKindGitHub] = githubNotifier
+		// githubVerdictNotifier ("server-side verdict", §8.2) wraps the
+		// SAME sourceControl *githubapi.Adapter instance every other
+		// GitHub-flavored notifier/caller above already uses, authenticated
+		// with the SAME cfg.GitHubBotToken githubNotifier itself uses --
+		// posting a verdict is a bot-attributed action, never a
+		// per-commenter credential.
+		outboxNotifiers[ports.NotificationKindGitHubVerdict] = githubVerdictNotifier
+		// sentinelAutoFixNotifier ("sentinels + suggestions", §17.2)
+		// spawns the child session.
+		outboxNotifiers[ports.NotificationKindSentinelAutoFix] = sentinelAutoFixNotifier
+		// handoffNotifier ("handoff-readiness sentinel", §14.4) posts the
+		// handoff-readiness comment and applies the "handoff" label on a
+		// scoped session's PR.
+		outboxNotifiers[ports.NotificationKindHandoffSentinel] = handoffNotifier
+		// releaseManifestNotifier ("release PR review", §15.2) posts the
+		// release manifest check's own summary comment.
+		outboxNotifiers[ports.NotificationKindReleaseManifest] = releaseManifestNotifier
+		// §26.2 ("review digest: description adequacy + graduated
+		// remediation", §26.2): re-verifies Narvi-authorship and this
+		// repo's own descriptionAutofix flag, fresh, at delivery time,
+		// then rewrites a Narvi-authored PR's own body.
+		outboxNotifiers[ports.NotificationKindGitHubDescriptionAutofix] = descriptionAutofixNotifier
+		// §25.9: GitHub reuses the SAME githubNotifier instance too --
+		// BotNotifier.Deliver never inspects notification.Kind at all, so
+		// registering it under a second key needs no new githubapi code
+		// whatsoever.
+		outboxNotifiers[ports.NotificationKindGitHubWorkflowDecision] = githubNotifier
 	}
 
 	// rwxPreviewNotifier/githubPreviewLinkNotifier ("RWX provider
-	// + previews", §4.1.1/§4.1.2) are registered ONLY when cfg.RWXAccessToken
-	// is configured -- see that env var's own doc comment (platform/
-	// config.go) for why this platform-wide credential is optional, unlike
-	// Modal's/GitHub's own mandatory secrets: RWX previews are an
-	// off-by-default, per-repo opt-in feature layered on top of it, and a
-	// deployment that never turns previews on for any repo should not be
-	// forced to configure a real RWX account just to boot. When absent, any
-	// row enqueued for either of these two kinds (which requires a repo
-	// admin to have separately opted in -- an operator misconfiguration,
-	// since the two are meant to be configured together) dead-letters with
-	// a clear, logged "no notifier registered for kind" error rather than
-	// silently vanishing. githubPreviewLinkNotifier reuses the SAME
-	// sourceControl *githubapi.Adapter instance and cfg.GitHubBotToken every
-	// other GitHub-flavored notifier above already uses -- a preview link
-	// is a system-generated fact about a commit, never attributed to any
-	// individual PR author or reviewer.
+	// + previews", §4.1.1/§4.1.2) are TWO SEPARATE gates, not one, even
+	// though both sit inside the same cfg.RWXAccessToken-configured block:
+	// rwxPreviewNotifier needs only cfg.RWXAccessToken (see that env var's
+	// own doc comment, platform/config.go, for why this platform-wide
+	// credential is optional, unlike Modal's/GitHub's own mandatory
+	// secrets -- RWX previews are an off-by-default, per-repo opt-in
+	// feature layered on top of it, and a deployment that never turns
+	// previews on for any repo should not be forced to configure a real
+	// RWX account just to boot). githubPreviewLinkNotifier additionally
+	// needs githubIngressEnabled, because unlike rwxPreviewNotifier it
+	// posts through cfg.GitHubBotToken -- reusing the SAME sourceControl
+	// *githubapi.Adapter instance and credential every other GitHub-
+	// flavored notifier above already uses (a preview link is a
+	// system-generated fact about a commit, never attributed to any
+	// individual PR author or reviewer) -- and gitHubBotTokenEnvVarName's
+	// own doc comment (platform/config.go) establishes that credential is
+	// only ever populated when GitHub ingress is enabled. Registering it
+	// on cfg.RWXAccessToken alone (the pre-fix state) authenticated
+	// githubPreviewLinkNotifier with an EMPTY cfg.GitHubBotToken whenever
+	// an operator had RWX previews configured on a deployment with GitHub
+	// ingress off -- exactly the "posting with an empty credential"
+	// failure mode this whole map's own doc comment above promises never
+	// happens, and the one entry that comment's own original audit
+	// missed. platform.Load's own RWXPreviewsRequireGitHubIngressError now
+	// refuses to boot a deployment in that state at all (see that error's
+	// own doc comment for why a hard refusal, not a warning), but the gate
+	// below stays as the actual enforcement this map depends on -- Load's
+	// check is a backstop against a config that should never reach here,
+	// not a substitute for this function's own registration matching its
+	// own comment. When githubIngressEnabled is false, any row enqueued
+	// for github_preview_link (unreachable in a deployment Load already
+	// accepted, but handled identically to every other disabled-surface
+	// kind rather than specially) dead-letters with the same clear,
+	// logged "no notifier registered for kind" error every other
+	// unconfigured kind gets, rather than posting with an empty bot token.
 	if cfg.RWXAccessToken != "" {
 		// http.DefaultClient, not nil: §30.2 removed the nil default from
 		// this constructor, so nil here builds a client whose transport
@@ -2433,7 +2549,9 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// dead the moment an operator configured it, silently.
 		rwxDispatchClient := rwx.NewDispatchClient(http.DefaultClient, "", cfg.RWXAccessToken)
 		outboxNotifiers[ports.NotificationKindRWXPreviewDispatch] = rwx.NewPreviewNotifier(rwxDispatchClient)
-		outboxNotifiers[ports.NotificationKindGitHubPreviewLink] = githubapi.NewPreviewLinkNotifier(liveSourceControl, cfg.GitHubBotToken)
+		if githubIngressEnabled {
+			outboxNotifiers[ports.NotificationKindGitHubPreviewLink] = githubapi.NewPreviewLinkNotifier(liveSourceControl, cfg.GitHubBotToken)
+		}
 	}
 
 	// blob_delete (§28.4) is registered ONLY when blobStore is
