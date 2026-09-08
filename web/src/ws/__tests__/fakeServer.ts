@@ -137,12 +137,14 @@ export function subscribedPayload(
   sessionId: string,
   events: FakeEventEnvelope[],
   state: Record<string, unknown> = {},
+  eventsTruncated = false,
 ): {
   sessionId: string
   state: Record<string, unknown>
   events: FakeEventEnvelope[]
+  eventsTruncated: boolean
   artifacts: unknown[]
   participants: unknown[]
 } {
-  return { sessionId, state, events, artifacts: [], participants: [] }
+  return { sessionId, state, events, eventsTruncated, artifacts: [], participants: [] }
 }

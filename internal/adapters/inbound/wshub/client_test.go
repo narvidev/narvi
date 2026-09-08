@@ -367,6 +367,9 @@ func TestClientHandler_ValidHandshakeSubscribes(t *testing.T) {
 	if payload.Events == nil {
 		t.Error("Events = nil, want a (possibly empty) array")
 	}
+	if payload.EventsTruncated {
+		t.Error("EventsTruncated = true, want false (a fresh session has no history to cut short)")
+	}
 	if payload.Artifacts == nil {
 		t.Error("Artifacts = nil, want a (possibly empty) array")
 	}
@@ -381,7 +384,7 @@ func TestClientHandler_ValidHandshakeSubscribes(t *testing.T) {
 }
 
 // TestClientHandler_SubscribeReplaysFailedUploadStatusAndFailureReason is
-// a review-fix coverage addition (FIX I): artifactWireMap (client.go)
+// a review-fix coverage addition (FIX I): ArtifactWireMap (client.go)
 // hand-builds its wire shape as a map[string]interface{}
 // (additionalProperties:true, this schema's own design) rather than a
 // generated, field-checked struct -- a typo'd or accidentally-dropped
@@ -460,7 +463,7 @@ func TestClientHandler_SubscribeReplaysFailedUploadStatusAndFailureReason(t *tes
 	// §12.2 item 1's own rail (the rail's own artifacts panel): filename/sizeBytes/
 	// contentType, the SAME addition as this test's own REST-side twin
 	// (httpapi_integration_test.go's TestListArtifacts_
-	// FailedUploadStatusAndFailureReason) -- artifactWireMap (client.go)
+	// FailedUploadStatusAndFailureReason) -- ArtifactWireMap (client.go)
 	// dropped all three before this Step.
 	if elem["filename"] != filename {
 		t.Errorf(`Artifacts[0]["filename"] = %v, want %q`, elem["filename"], filename)
@@ -678,6 +681,116 @@ func TestClientHandler_SubscribeSurvivesManyLargeEvents(t *testing.T) {
 	// client.
 	conn := subscribeClient(ctx, t, rig.wsURL, sessionRow.ID.String(), token)
 	_ = conn.CloseNow()
+}
+
+// TestClientHandler_SubscribeEventsTruncatedFlag confirms
+// SubscribedPayload.EventsTruncated (§6.2) is wired correctly end to end
+// through the real handler, for both real mechanisms that can cut the
+// replay short: the item-count cap (initialReplayLimit) and the
+// byte-size budget (maxInitialReplayBytes -- the same guard
+// TestClientHandler_SubscribeSurvivesManyLargeEvents above exercises).
+// Before this Step nothing set this field at all, so a reconnecting
+// client had no way to tell a complete replay from a cut one.
+//
+// The count-cap case cannot isolate that mechanism from the byte budget
+// the way the byte-budget case isolates itself from the count cap (5
+// events never approaches a 200-item cap regardless of size): 201 rows,
+// each carrying only the id/type/createdAt/payload keys' own fixed JSON
+// overhead, already total past maxInitialReplayBytes on their own -- see
+// client_unit_test.go's own TestTrimToReplayLimit for where the count
+// mechanism is actually pinned in isolation, against plain sqlcgen.Event
+// values with no marshaled-size entanglement at all. What this case adds
+// on top of that unit test is the len(Events) assertion below: proof
+// that the real handler still enforces the 200-item cap on the actual
+// wire response, not just that some internal helper's arithmetic is
+// correct.
+func TestClientHandler_SubscribeEventsTruncatedFlag(t *testing.T) {
+	cases := []struct {
+		name          string
+		eventCount    int
+		payloadBytes  int
+		wantTruncated bool
+	}{
+		{
+			name:          "well under both the count cap and the byte budget",
+			eventCount:    3,
+			payloadBytes:  8,
+			wantTruncated: false,
+		},
+		{
+			name:          "past the count cap (also past the byte budget -- see doc comment above)",
+			eventCount:    201,
+			payloadBytes:  8,
+			wantTruncated: true,
+		},
+		{
+			// 5 events, far under the 200-item count cap, but ~8KB each
+			// (the same per-event size TestClientHandler_
+			// SubscribeSurvivesManyLargeEvents above uses) -- comfortably
+			// over the 16KiB byte budget in total, isolating the byte
+			// budget as the only mechanism that could have tripped the
+			// flag.
+			name:          "under the count cap, past the byte budget",
+			eventCount:    5,
+			payloadBytes:  8 * 1024,
+			wantTruncated: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rig, sessionRow := newClientTestRig(t, platform.DefaultTimeouts())
+			ctx := context.Background()
+			token := createTestWSToken(ctx, t, rig.pool, sessionRow.ID, time.Now().Add(24*time.Hour))
+
+			largePayload := strings.Repeat("x", tc.payloadBytes)
+			for i := 0; i < tc.eventCount; i++ {
+				if _, err := rig.events.Create(ctx, sqlcgen.CreateEventParams{
+					SessionID: sessionRow.ID,
+					Type:      "token",
+					MessageID: fmt.Sprintf("msg-%d", i),
+					Payload:   []byte(fmt.Sprintf(`{"text":"%s"}`, largePayload)),
+				}); err != nil {
+					t.Fatalf("create event %d: %v", i, err)
+				}
+			}
+
+			conn, _, err := websocket.Dial(ctx, rig.wsURL+"/sessions/"+sessionRow.ID.String()+"/ws?type=client", nil)
+			if err != nil {
+				t.Fatalf("Dial: %v", err)
+			}
+			defer func() { _ = conn.CloseNow() }()
+
+			req := clientws.SubscribeRequest{Token: token, ClientId: "test-client"}
+			raw, err := json.Marshal(req)
+			if err != nil {
+				t.Fatalf("marshal subscribe request: %v", err)
+			}
+			if err := conn.Write(ctx, websocket.MessageText, raw); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+
+			readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			_, data, err := conn.Read(readCtx)
+			if err != nil {
+				t.Fatalf("Read subscribed reply: %v", err)
+			}
+
+			var payload clientws.SubscribedPayload
+			if err := json.Unmarshal(data, &payload); err != nil {
+				t.Fatalf("unmarshal SubscribedPayload: %v (%s)", err, data)
+			}
+
+			if payload.EventsTruncated != tc.wantTruncated {
+				t.Errorf("EventsTruncated = %v, want %v (len(Events) = %d, seeded %d events)",
+					payload.EventsTruncated, tc.wantTruncated, len(payload.Events), tc.eventCount)
+			}
+			if tc.eventCount > 200 && len(payload.Events) > 200 {
+				t.Errorf("len(Events) = %d, want <= 200 (the item-count cap must still bind on the real wire response)", len(payload.Events))
+			}
+		})
+	}
 }
 
 // TestClientHandler_LiveBroadcast subscribes a client, then has the

@@ -429,9 +429,12 @@ func verifyClientToken(ctx context.Context, conn *websocket.Conn, wsTokens *post
 // a genuinely minimal, honestly-scoped state map (session + turns +
 // sandbox-or-nil -- the full read-model shape is explicitly left to later
 // PRs by the schema's own doc comment), the first initialReplayLimit
-// events, every artifact (unbounded -- expected to stay small), and an
-// always-empty participants array (design decision: participants stays
-// completely untouched this Step, see this package's own doc.go).
+// events (EventsTruncated reports, exactly, whether that replay is the
+// session's complete history or a cut prefix of it -- see the field's own
+// schema doc comment), every artifact (unbounded -- expected to stay
+// small), and an always-empty participants array (design decision:
+// participants stays completely untouched this Step, see this package's
+// own doc.go).
 func buildSubscribedPayload(
 	ctx context.Context,
 	sessionID pgtype.UUID,
@@ -460,17 +463,29 @@ func buildSubscribedPayload(
 		return clientws.SubscribedPayload{}, err
 	}
 
-	eventRows, err := events.ListForSession(ctx, sessionID, 0, initialReplayLimit)
+	// Fetched one row past initialReplayLimit, deliberately: getting
+	// initialReplayLimit+1 rows back is an exact, cheap ("+1" cost, no
+	// second query) proof that more history exists beyond what this
+	// payload can carry, unlike the len(rows)==limit heuristic this
+	// file's own fetch_history handler (below) and httpapi's own
+	// ListEvents (events.go) each use for their nextCursor -- a
+	// heuristic tolerable there because a false "there might be more"
+	// only costs a client one empty extra page, but wrong here would
+	// mean EventsTruncated itself lies.
+	eventRows, err := events.ListForSession(ctx, sessionID, 0, initialReplayLimit+1)
 	if err != nil {
 		return clientws.SubscribedPayload{}, err
 	}
+	eventRows, countTruncated := trimToReplayLimit(eventRows)
 
 	artifactRows, err := artifacts.ListForSession(ctx, sessionID)
 	if err != nil {
 		return clientws.SubscribedPayload{}, err
 	}
 
-	wireEvents := truncateEventsToByteBudget(subscribedEventsWire(eventRows), maxInitialReplayBytes)
+	wireEventsAll := subscribedEventsWire(eventRows)
+	wireEvents := truncateEventsToByteBudget(wireEventsAll, maxInitialReplayBytes)
+	byteTruncated := len(wireEvents) < len(wireEventsAll)
 
 	return clientws.SubscribedPayload{
 		SessionId: sessionID.String(),
@@ -479,10 +494,27 @@ func buildSubscribedPayload(
 			"turns":   turnRows,
 			"sandbox": sandboxState,
 		},
-		Events:       wireEvents,
-		Artifacts:    subscribedArtifactsWire(artifactRows),
-		Participants: []clientws.SubscribedPayloadParticipantsElem{},
+		Events:          wireEvents,
+		EventsTruncated: countTruncated || byteTruncated,
+		Artifacts:       subscribedArtifactsWire(artifactRows),
+		Participants:    []clientws.SubscribedPayloadParticipantsElem{},
 	}, nil
+}
+
+// trimToReplayLimit caps fetched (the result of requesting
+// initialReplayLimit+1 rows, buildSubscribedPayload's own caller) at
+// initialReplayLimit, oldest-first order preserved, and reports whether
+// there was a limit+1'th row to cut -- the exact, cheap proof that more
+// history exists beyond initialReplayLimit, since fetched can only ever
+// hold limit+1 elements if a genuine limit+1'th row existed to fetch. A
+// pure slice op (no I/O, no time, no randomness -- safe and fast to unit
+// test directly, unlike the wire-shaped byte-budget check below, which
+// needs realistic marshaled sizes to mean anything).
+func trimToReplayLimit(fetched []sqlcgen.Event) (rows []sqlcgen.Event, truncated bool) {
+	if len(fetched) > initialReplayLimit {
+		return fetched[:initialReplayLimit], true
+	}
+	return fetched, false
 }
 
 // truncateEventsToByteBudget returns the longest PREFIX of wire (order
@@ -534,10 +566,19 @@ func eventWireMap(e sqlcgen.Event) map[string]interface{} {
 	}
 }
 
-// artifactWireMap is eventWireMap's own artifact counterpart --
+// ArtifactWireMap is eventWireMap's own artifact counterpart --
 // sqlcgen.Artifact.Metadata is likewise a plain []byte needing the same
 // json.RawMessage treatment to avoid base64-encoding.
-func artifactWireMap(a sqlcgen.Artifact) map[string]interface{} {
+//
+// Exported (unlike eventWireMap, httpapi/events.go's own sibling
+// function) so httpapi's REST twin (artifacts.go's ListArtifacts) can
+// call this exact function instead of maintaining a byte-identical
+// second copy that nothing enforced stayed in sync -- the same
+// package-boundary precedent HashSandboxToken (token.go) already sets
+// for httpapi's reuse of a small wshub-owned helper. eventWireMap's own
+// doc comment (httpapi/events.go) records a separately reasoned choice
+// for that sibling function; this decision does not revisit it.
+func ArtifactWireMap(a sqlcgen.Artifact) map[string]interface{} {
 	// status/failureReason (§28.6) are additive fields on the
 	// wire SubscribedPayload.artifacts shape, mirroring the sandbox-ws
 	// artifact event's own identical additive change -- always present
@@ -549,11 +590,11 @@ func artifactWireMap(a sqlcgen.Artifact) map[string]interface{} {
 	if a.FailureReason != nil {
 		failureReason = *a.FailureReason
 	}
-	// filename/sizeBytes/contentType (§12.2 item 1's own rail): the SAME
-	// addition as this function's own REST twin (httpapi/artifacts.go's artifactWireMap) --
-	// see that function's own doc comment for the full "why now" reasoning.
-	// Nil (-> JSON null) for a pr/preview row; only an upload row ever
-	// sets these three columns.
+	// filename/sizeBytes/contentType (§12.2 item 1's own rail): present
+	// for both this function's callers (subscribedArtifactsWire below,
+	// and httpapi's ListArtifacts in artifacts.go) since this is their
+	// one shared implementation. Nil (-> JSON null) for a pr/preview row;
+	// only an upload row ever sets these three columns.
 	var filename, contentType interface{}
 	if a.Filename != nil {
 		filename = *a.Filename
@@ -579,7 +620,7 @@ func artifactWireMap(a sqlcgen.Artifact) map[string]interface{} {
 	}
 }
 
-// sandboxWireMap is eventWireMap/artifactWireMap's own sandbox
+// sandboxWireMap is eventWireMap/ArtifactWireMap's own sandbox
 // counterpart: sqlcgen.Sandbox carries several fields with zero
 // legitimate client-side use -- TokenHash (the sandbox's own bearer-token
 // hash, an internal credential-verification artifact), ProviderID,
@@ -588,7 +629,7 @@ func artifactWireMap(a sqlcgen.Artifact) map[string]interface{} {
 // SubscribedPayload.state requires (that field is deliberately
 // additionalProperties:true, its own doc comment: "shape assembled by
 // later PRs" -- this package's own choice, exactly like eventWireMap/
-// artifactWireMap already exercise for their own siblings). Returns only
+// ArtifactWireMap already exercise for their own siblings). Returns only
 // what a client-side UI legitimately needs: id, gen, status, lastSeenAt,
 // createdAt, updatedAt.
 func sandboxWireMap(s sqlcgen.Sandbox) map[string]interface{} {
@@ -613,7 +654,7 @@ func subscribedEventsWire(rows []sqlcgen.Event) []clientws.SubscribedPayloadEven
 func subscribedArtifactsWire(rows []sqlcgen.Artifact) []clientws.SubscribedPayloadArtifactsElem {
 	wire := make([]clientws.SubscribedPayloadArtifactsElem, len(rows))
 	for i, a := range rows {
-		wire[i] = artifactWireMap(a)
+		wire[i] = ArtifactWireMap(a)
 	}
 	return wire
 }

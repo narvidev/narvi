@@ -2275,18 +2275,20 @@ func TestListArtifacts_HappyPath(t *testing.T) {
 }
 
 // TestListArtifacts_FailedUploadStatusAndFailureReason is a review-fix
-// coverage addition (FIX I): artifactWireMap (artifacts.go) hand-builds
-// its wire shape as a map[string]interface{} (additionalProperties:true,
-// this schema's own design) rather than a generated, field-checked
-// struct -- a typo'd or accidentally-dropped "status"/"failureReason" key
-// would decode cleanly and silently show a failed upload as ready, with a
-// 404ing download link. Seeds a genuinely 'failed' upload via the REAL
-// production path (CreateUpload + MarkUploadFailedIfPending), never a
-// hand-written INSERT, and asserts both fields land correctly on the REST
-// list response. Extended here (the rail's own artifacts panel, §12.2 item
-// 1, is the first real consumer of this endpoint) to also assert filename/
-// sizeBytes/contentType land -- artifactWireMap dropped all three before
-// this Step, even though sqlcgen.Artifact has carried them since migration
+// coverage addition (FIX I): wshub.ArtifactWireMap (the shared helper
+// this endpoint's ListArtifacts calls; see artifacts.go's own doc
+// comment) hand-builds its wire shape as a map[string]interface{}
+// (additionalProperties:true, this schema's own design) rather than a
+// generated, field-checked struct -- a typo'd or accidentally-dropped
+// "status"/"failureReason" key would decode cleanly and silently show a
+// failed upload as ready, with a 404ing download link. Seeds a genuinely
+// 'failed' upload via the REAL production path (CreateUpload +
+// MarkUploadFailedIfPending), never a hand-written INSERT, and asserts
+// both fields land correctly on the REST list response. Extended here
+// (the rail's own artifacts panel, §12.2 item 1, is the first real
+// consumer of this endpoint) to also assert filename/sizeBytes/
+// contentType land -- ArtifactWireMap dropped all three before this
+// Step, even though sqlcgen.Artifact has carried them since migration
 // 000060 and CreateUpload above already populates them on every row.
 func TestListArtifacts_FailedUploadStatusAndFailureReason(t *testing.T) {
 	rig := newTestRig(t)

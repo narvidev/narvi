@@ -524,36 +524,36 @@ execution mode. A batch has no exit criterion — Steps do, and this phase does.
   because they block scheduled work — that is the whole line between the two. Each was found by
   checking a UI row against the REST surface it assumes, which is worth doing for a row BEFORE
   starting it: three of the four remaining rows did not match the code.
-- **Phase 8**: 91 and 92 both depend on 90 (the resolver and its egress capability token) and may
-  run in parallel with each other. 93 (OS isolation) is independent of 90-92 and of 94 — a
+- **Phase 8**: 97 and 98 both depend on 96 (the resolver and its egress capability token) and may
+  run in parallel with each other. 99 (OS isolation) is independent of 96-98 and of 100 — a
   platform-wide hardening valid in live mode, parallelizable with any of them, but required
-  before 95 for that Step's guarantee statement to hold (§30.4/§30.5 are a deliberate
-  conjunction). 94 (GitHub App plumbing) is likewise independent of 90-93 but a **hard
-  prerequisite for 95**: the shadow mint substitutes an App-minted read-only installation token,
-  and 95's fail-closed scope introspection rides 94's plumbing. 95 depends on 90 (the flag), 94
-  (the token), and 93 (the isolation half of its guarantee). 96 depends on 90-91 (the
-  mandatory-gate constructors it extends to Slack/Linear). 97 depends on 91 (the ledger its
-  entries land in) and 95 (the persisted per-turn push decision it honors). 98 reads the ledger
-  91-92 populate and extends Step 86's Settings surfaces, so it comes last. Phase 8 may execute
-  any time after Phase 5's milestone — nothing in 90-97 waits on Phase 6 or 7 (§10-P8); only 98's
+  before 101 for that Step's guarantee statement to hold (§30.4/§30.5 are a deliberate
+  conjunction). 100 (GitHub App plumbing) is likewise independent of 96-99 but a **hard
+  prerequisite for 101**: the shadow mint substitutes an App-minted read-only installation token,
+  and 101's fail-closed scope introspection rides 100's plumbing. 101 depends on 96 (the flag), 100
+  (the token), and 99 (the isolation half of its guarantee). 102 depends on 96-97 (the
+  mandatory-gate constructors it extends to Slack/Linear). 103 depends on 97 (the ledger its
+  entries land in) and 101 (the persisted per-turn push decision it honors). 104 reads the ledger
+  97-98 populate and extends Step 86's Settings surfaces, so it comes last. Phase 8 may execute
+  any time after Phase 5's milestone — nothing in 96-103 waits on Phase 6 or 7 (§10-P8); only 104's
   Settings surface waits on Step 86.
-- **Phase 9**: 99 is independent of everything else in the phase (and of Phases 6-8) — it may run
-  first or in parallel. 100 is independent of 99 and 101 and gates only 103-104; it presumes the
-  in-flight four-handler authorization fix has landed (a dependency, not a Step). 101 needs Phase
-  5's milestone (the three seams, Step 62's persistence, Step 69's §26.5 instrument), Step 96's
+- **Phase 9**: 105 is independent of everything else in the phase (and of Phases 6-8) — it may run
+  first or in parallel. 106 is independent of 105 and 107 and gates only 109-110; it presumes the
+  in-flight four-handler authorization fix has landed (a dependency, not a Step). 107 needs Phase
+  5's milestone (the three seams, Step 62's persistence, Step 69's §26.5 instrument), Step 98's
   verdict egress-mode stamp (its SELECT's shadow-epoch exclusion rides it, §31.8), and the
-  in-flight G1 write-path sanitization; 102 additionally needs Step 94's resolver (its corpus
+  in-flight G1 write-path sanitization; 108 additionally needs Step 96's resolver (its corpus
   rows' own `captured_live` stamp);
-  it does not need 99 or 100. 102 needs 101 (the pipeline whose SELECT it swaps, the instrument
-  its A/B reads) and **its start is gated on reading 101's baseline window** — a calendar gate,
+  it does not need 105 or 106. 108 needs 107 (the pipeline whose SELECT it swaps, the instrument
+  its A/B reads) and **its start is gated on reading 107's baseline window** — a calendar gate,
   not a code dependency, but one that may resolve to "never": if that readout kills engagement,
-  102 does not execute at all, and its whole deliverable is the recorded kill decision (§31.9,
-  §31.10). When 102 does ship, it also extends Step 102's Activate for graduation — the barrier
-  logic is part of 102's own (engaged-branch) content, wired into Activate when both exist; under
-  a kill decision there is no mode B graduation surface to extend. 103 needs 100 and 102. 104
-  needs 100 and 102 — the export renders from 102's corpus tables and serves only promoted,
-  live-epoch content, so the promotion state it filters on does not exist before 102. Both 103 and
-  104 are therefore unreachable under a kill decision, same as 102 itself. 103 and 104 may run in
+  108 does not execute at all, and its whole deliverable is the recorded kill decision (§31.9,
+  §31.10). When 108 does ship, it also extends Step 102's Activate for graduation — the barrier
+  logic is part of 108's own (engaged-branch) content, wired into Activate when both exist; under
+  a kill decision there is no mode B graduation surface to extend. 109 needs 106 and 108. 110
+  needs 106 and 108 — the export renders from 108's corpus tables and serves only promoted,
+  live-epoch content, so the promotion state it filters on does not exist before 108. Both 109 and
+  110 are therefore unreachable under a kill decision, same as 108 itself. 109 and 110 may run in
   parallel with each other.
 - Go/no-go after Step 21 (~1 month).
 

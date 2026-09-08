@@ -41,6 +41,30 @@ func freePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
+// neverBoundPort is a fixed, low TCP port for the two tests
+// (TestRun_PrimaryTimeoutIsFatal, TestRun_SecondaryTimeoutLeavesProcessRunning)
+// that need a port GUARANTEED to stay closed for the readiness timeout's
+// entire duration, not merely at one instant -- freePort's own "bind,
+// read the port, close" pattern only proves the port was free the moment
+// it was checked. Once closed, the kernel is free to hand that exact
+// ephemeral port to any other process on the machine for the rest of the
+// test; when it does, portReady's TCP dial legitimately succeeds against
+// that unrelated listener, and Run wrongly observes PhaseReady instead of
+// PhaseTimeout -- not a bug in the code under test, but the test's own
+// port choice (observed once on a loaded CI runner).
+//
+// 1 (TCPMUX, RFC 1078) is below every mainstream OS's own ephemeral/
+// dynamic port range floor (Linux and macOS/BSD both start at 32768 or
+// higher), so the kernel's automatic port allocator -- the actual
+// mechanism that stole freePort's own released port above -- can never
+// hand it to an unrelated process, on a loaded machine or otherwise. That
+// holds independent of the test process's own privilege level: the
+// restriction is on what the kernel auto-assigns, not on who may
+// explicitly bind low ports. Nothing on an ordinary CI runner or dev
+// machine binds it on purpose either -- unlike e.g. 22 (ssh) or 631
+// (cups on macOS), TCPMUX has no real-world users to collide with.
+const neverBoundPort = 1
+
 // tcpListenerCmd is a real, separate process (python3, reliably present on
 // both macOS and Linux CI) that opens a TCP listener on port after
 // sleeping delaySeconds, then stays up long enough for the test to observe
@@ -393,7 +417,7 @@ func TestRun_SecondaryTimeoutLeavesProcessRunning(t *testing.T) {
 		{
 			Name:        "slow-secondary",
 			Cmd:         sleepWithPIDFileCmd(pidFile, 30),
-			Readiness:   servicemanifest.Readiness{Port: intPtr(freePort(t))}, // never opened by the script above
+			Readiness:   servicemanifest.Readiness{Port: intPtr(neverBoundPort)}, // never opened by the script above
 			Criticality: servicemanifest.CriticalitySecondary,
 		},
 	}}
@@ -424,7 +448,7 @@ func TestRun_PrimaryTimeoutIsFatal(t *testing.T) {
 		{
 			Name:        "slow-primary",
 			Cmd:         sleepWithPIDFileCmd(pidFile, 30),
-			Readiness:   servicemanifest.Readiness{Port: intPtr(freePort(t))}, // never opened by the script above
+			Readiness:   servicemanifest.Readiness{Port: intPtr(neverBoundPort)}, // never opened by the script above
 			Criticality: servicemanifest.CriticalityPrimary,
 		},
 	}}
