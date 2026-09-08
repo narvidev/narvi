@@ -346,7 +346,7 @@ its own exit criterion is checkable end to end.
 | 112 | sandbox boot-timing relay | The four sandbox-emitted histograms (`sandbox_agent_boot_duration_seconds`, `..._hook_rerun_...`, `..._git_fetch_...`, `..._git_checkout_...`) stop being recorded inside the sandbox and are recorded control-plane-side instead, from a new best-effort `boot_timing` sandbox-ws event carrying the **already-measured** seconds plus its low-cardinality tags — the fact crosses the wire, never raw observations or pre-aggregated buckets, so the value keeps being measured by the same `time.Since` bracket on the sandbox's own clock and §33.3's "identical semantics, same names, same buckets" property holds. Recording is gated on `appendRawEvent`'s own `inserted` flag, the Step 77 `turn_false_failure_total` precedent, because §6.1's reconnect resend would otherwise double-count. The repo name is dropped from metric attributes as unbounded cardinality (it still rides the event into the `events` log for per-session debugging). Deletes the two sandbox-side telemetry files; keeps sandbox-agent's `SetupOTel` bootstrap. Exit: a forced WS reconnect replay leaves each histogram holding its data point **exactly once** | §27, §33, §6.1 |
 
 
-## Phase 11 — Named gaps (additive, unscheduled)
+## Phase 11 — Named gaps (scheduled in full)
 
 A holding place for work that is real, is not speculative, and is **not blocking anything currently
 scheduled**. The rule that keeps it honest: a gap goes here only if the Step that found it shipped
@@ -355,9 +355,51 @@ scheduled Step is not filed here — it becomes a Step of its own, immediately b
 the way Steps 88 and 90 did — which is also why those two sit in Phase 7 despite being backend
 work, and why that phase's own title says so.
 
-This phase has no exit criterion of its own and gates nothing. Items are pulled from it when
-something starts needing them, or deleted when the need turns out never to arrive. Nothing here may
-be cited by a scheduled Step as a prerequisite — if it is, it has stopped belonging here.
+It was a holding list with no exit criterion, drained one item at a time when something started
+needing one. **That changed by decision, not by drift**: the owner chose to work it through in
+full, so this phase now has an execution order and a milestone like any other. The filing rule
+above still governs what may ENTER it; what changed is that entering no longer means waiting
+indefinitely.
+
+Execution order, by nature rather than by number — several of these are not "write the code" at
+all, and pretending otherwise is how a list like this quietly stalls:
+
+- **A, mechanical** (116, 115, 114, 118, 131, 117): clean corrections with no design risk. First,
+  because they are cheap and because 116 and 114 are debts a desktop client would otherwise pay
+  at the worst moment.
+- **B, wire and UI completions** (121, 123, 127, 122, 113): screens that today say "not available"
+  honestly, and the fields behind them.
+- **C, design first** (119, 120, 124, 125, 126): each needs a decision before any code. Two are
+  taken and recorded below.
+- **D, investigations** (129, 130): no known fix. 129 in particular may legitimately end in
+  "still no hypothesis" — its own row forbids stabilizing a timing test on a single data point,
+  and that prohibition survives this scheduling decision.
+- **E, the sweep** (128): 183 citations, each verified against the title of the row it names.
+  Never by arithmetic — that was tried once on the technical plan and got five wrong.
+
+**Two decisions taken, recorded here rather than left to be rediscovered at the Step:**
+
+*Step 120, where the analytics line falls.* A deployment's own numbers stay in this repository —
+sessions by outcome, success rate, false failures, cost by model, boot p95, top failure reasons.
+A deployment that cannot state its own success rate is incomplete, and no base capability moves
+out. What belongs to a composed module is the cross-cutting view: comparing repositories,
+aggregating by team, fleet trends. The operative test, so the question is not re-litigated at
+every new chart: **can the value be computed from this deployment's own rows?** If yes it is
+this repository's; if it only means something once aggregated ACROSS deployments or
+organizations, it is not. The same rule is stated in technical plan §34.
+
+*Step 119, how ingress surfaces become optional.* Not by inferring intent from absent secrets —
+that would make a typo in a variable name indistinguishable from a deliberate disabling, which is
+the fail direction this repository refuses everywhere else. An explicit declaration instead
+(`NARVI_INGRESS_ENABLED`): a surface not declared is not mounted, and a surface declared without
+its secrets is a loud boot failure. In every outcome, `configured` on the §12.5 read model must
+become honest or be removed — a field that cannot be false informs nobody.
+
+**Phase 11 milestone**: every row either shipped, or closed by a recorded decision that says why
+it will not be — the second being a legitimate outcome for 129 and 119's residue, never a silent
+omission. `configured` no longer reports a value it cannot fail to report. And the sweep in 128 is
+followed by widening the checker to the roots it audited, so the citations it corrected cannot
+rot again.
 
 | Step | Title | Content | Ref. |
 |---|---|---|---|
