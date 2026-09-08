@@ -25,6 +25,7 @@ import { ApiError } from '../../api/http'
 import { sessionQueryKeys } from '../../api/queryKeys'
 import { buildCostRollup } from '../../session/costRollup'
 import { Composer } from '../../session/Composer'
+import { parseParticipants } from '../../session/participants'
 import { parseSandboxSnapshot } from '../../session/sandboxSnapshot'
 import { buildSandboxRailModel } from '../../session/sandboxRail'
 import { SessionHeader } from '../../session/SessionHeader'
@@ -65,6 +66,7 @@ function SessionWorkspace() {
   const model = useMemo(() => buildTimelineModel(stream.events), [stream.events])
   const sandboxModel = useMemo(() => buildSandboxRailModel(stream.events, parseSandboxSnapshot(stream.sandboxState)), [stream.events, stream.sandboxState])
   const costModel = useMemo(() => buildCostRollup(stream.events), [stream.events])
+  const participants = useMemo(() => parseParticipants(stream.participantsState), [stream.participantsState])
   const hasOpenTurn = model.turns.length > 0 && (model.turns[model.turns.length - 1]?.live ?? false)
 
   return (
@@ -96,7 +98,7 @@ function SessionWorkspace() {
 
         {sessionQuery.isSuccess && (
           <>
-            <SessionHeader session={sessionQuery.data} model={model} cost={costModel} />
+            <SessionHeader session={sessionQuery.data} model={model} cost={costModel} participants={participants} />
             {stream.syncState === 'syncing' && (
               <div className="sync-banner" role="status">
                 Syncing session history…

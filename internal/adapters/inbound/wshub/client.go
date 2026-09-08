@@ -211,6 +211,7 @@ func NewClientHandler(
 	events *postgres.EventStore,
 	artifacts *postgres.ArtifactStore,
 	wsTokens *postgres.WSTokenStore,
+	users *postgres.UserStore,
 	hub *Hub,
 	timeouts platform.Timeouts,
 ) http.HandlerFunc {
@@ -256,7 +257,8 @@ func NewClientHandler(
 		}
 
 		// (5) verify the presented ws-token.
-		if !verifyClientToken(ctx, conn, wsTokens, sessionID, req.Token, logger) {
+		userID, ok := verifyClientToken(ctx, conn, wsTokens, sessionID, req.Token, logger)
+		if !ok {
 			return // verifyClientToken already closed the connection (4001/4002).
 		}
 
@@ -272,10 +274,20 @@ func NewClientHandler(
 		// down (canceled + joined) before this handler returns (including
 		// on every early-return path below), so no goroutine outlives the
 		// connection it serves.
+		//
+		// registerUserID is "" for a connection whose ws_tokens row carries
+		// no user (userID.Valid false -- a deleted minting user,
+		// migrations/000016's own nullable-user_id doc comment): Hub.
+		// Register/Participants treat an empty string as "not a presence
+		// participant", never as a real, anonymous user id.
+		var registerUserID string
+		if userID.Valid {
+			registerUserID = userID.String()
+		}
 		writerCtx, cancelWriter := context.WithCancel(ctx)
 		defer cancelWriter()
 		var writerGroup errgroup.Group
-		ch, unregister := hub.Register(sessionID.String(), conn)
+		ch, unregister := hub.Register(sessionID.String(), conn, registerUserID)
 		defer func() {
 			unregister()
 			cancelWriter()
@@ -288,8 +300,15 @@ func NewClientHandler(
 			(*hook)()
 		}
 
-		// (7) assemble + write the single `subscribed` reply.
-		payload, err := buildSubscribedPayload(ctx, sessionID, sessionRow, turns, sandboxes, events, artifacts)
+		// (7) assemble + write the single `subscribed` reply. Participants
+		// is resolved from the Hub's own live, in-process connection
+		// registry (§8's "multiplayer presence") -- the distinct set of
+		// real users currently subscribed to this session, INCLUDING the
+		// connection just registered above -- never from the dormant
+		// `participants` Postgres table (§13.3's separate "joined"
+		// authorization concept; see this package's own doc.go).
+		participants := resolveParticipants(ctx, users, hub.Participants(sessionID.String()), logger)
+		payload, err := buildSubscribedPayload(ctx, sessionID, sessionRow, turns, sandboxes, events, artifacts, participants)
 		if err != nil {
 			logger.Error("wshub: assembling subscribed payload failed", "error", err)
 			_ = conn.Close(websocket.StatusInternalError, "internal error")
@@ -392,7 +411,7 @@ func readSubscribeRequest(ctx context.Context, conn *websocket.Conn, timeouts pl
 // row belongs to a different session than sessionID (both cases are
 // deliberately indistinguishable to the caller -- never leak which);
 // closes 4002 if the row is a genuine match but already expired;
-// otherwise returns true (proceed) with the connection untouched. A
+// otherwise returns (userID, true) with the connection untouched. A
 // genuine backend error during the lookup (e.g. a transient Postgres
 // blip) is NOT folded into 4001 -- telling every subscribing client its
 // credential is bad during an unrelated infrastructure hiccup would be
@@ -400,29 +419,36 @@ func readSubscribeRequest(ctx context.Context, conn *websocket.Conn, timeouts pl
 // matching how the rest of this file's own error paths (e.g.
 // buildSubscribedPayload's) already distinguish "not found" from "we
 // failed to check".
-func verifyClientToken(ctx context.Context, conn *websocket.Conn, wsTokens *postgres.WSTokenStore, sessionID pgtype.UUID, token string, logger *slog.Logger) bool {
+//
+// userID is row.UserID verbatim -- ws_tokens.user_id is nullable (SET
+// NULL if the minting user is later deleted, migrations/000016's own doc
+// comment), so a caller must check userID.Valid before treating this
+// connection as belonging to a real, presence-worthy participant (§8's
+// own "multiplayer presence" -- Hub.Register, below, is this method's
+// one real caller that does exactly that).
+func verifyClientToken(ctx context.Context, conn *websocket.Conn, wsTokens *postgres.WSTokenStore, sessionID pgtype.UUID, token string, logger *slog.Logger) (userID pgtype.UUID, ok bool) {
 	row, err := wsTokens.GetByHash(ctx, platform.HashToken(token))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			logger.Warn("wshub: client subscribe: unknown ws token; closing 4001")
 			_ = conn.Close(websocket.StatusCode(4001), "re-auth required")
-			return false
+			return pgtype.UUID{}, false
 		}
 		logger.Error("wshub: ws-token lookup failed", "error", err)
 		_ = conn.Close(websocket.StatusInternalError, "internal error")
-		return false
+		return pgtype.UUID{}, false
 	}
 	if row.SessionID != sessionID {
 		logger.Warn("wshub: client subscribe: ws token belongs to a different session; closing 4001")
 		_ = conn.Close(websocket.StatusCode(4001), "re-auth required")
-		return false
+		return pgtype.UUID{}, false
 	}
 	if time.Now().After(row.ExpiresAt.Time) {
 		logger.Warn("wshub: client subscribe: expired ws token; closing 4002")
 		_ = conn.Close(websocket.StatusCode(4002), "token expired")
-		return false
+		return pgtype.UUID{}, false
 	}
-	return true
+	return row.UserID, true
 }
 
 // buildSubscribedPayload assembles the single reply to subscribe (§6.2):
@@ -432,9 +458,9 @@ func verifyClientToken(ctx context.Context, conn *websocket.Conn, wsTokens *post
 // events (EventsTruncated reports, exactly, whether that replay is the
 // session's complete history or a cut prefix of it -- see the field's own
 // schema doc comment), every artifact (unbounded -- expected to stay
-// small), and an always-empty participants array (design decision:
-// participants stays completely untouched this Step, see this package's
-// own doc.go).
+// small), and participants (§8's "multiplayer presence") -- resolved by
+// the caller (resolveParticipants, this file) from the Hub's own live
+// connection registry, never computed here.
 func buildSubscribedPayload(
 	ctx context.Context,
 	sessionID pgtype.UUID,
@@ -443,6 +469,7 @@ func buildSubscribedPayload(
 	sandboxes *postgres.SandboxStore,
 	events *postgres.EventStore,
 	artifacts *postgres.ArtifactStore,
+	participants []clientws.SubscribedPayloadParticipantsElem,
 ) (clientws.SubscribedPayload, error) {
 	turnRows, err := turns.ListForSession(ctx, sessionID)
 	if err != nil {
@@ -497,8 +524,45 @@ func buildSubscribedPayload(
 		Events:          wireEvents,
 		EventsTruncated: countTruncated || byteTruncated,
 		Artifacts:       subscribedArtifactsWire(artifactRows),
-		Participants:    []clientws.SubscribedPayloadParticipantsElem{},
+		Participants:    participants,
 	}, nil
+}
+
+// resolveParticipants resolves userIDs (Hub.Participants' own distinct,
+// currently-connected set for this session -- §8's "multiplayer
+// presence") into the wire shape's loosely-typed participant maps,
+// carrying exactly what the mockup's presence indicator needs to render
+// an avatar + display name: {"userId", "displayName"}. A userID that no
+// longer resolves to a real row (UserStore.GetByID errors -- the user was
+// deleted moments after this connection registered, or any other lookup
+// failure) is DROPPED, logged, never fabricated -- one stale/unresolvable
+// participant must not fail the whole subscribe reply, mirroring this
+// file's own established "a live GitHub degrade never blocks the
+// response" posture elsewhere in this package's sibling handlers. Always
+// returns a non-nil slice (nil and empty are not meaningfully different
+// on the wire, but SubscribedPayload.participants is schema-required, and
+// this package's own established convention -- see turnRows immediately
+// above -- is never to hand json.Marshal a nil slice for a required
+// array field).
+func resolveParticipants(ctx context.Context, users *postgres.UserStore, userIDs []string, logger *slog.Logger) []clientws.SubscribedPayloadParticipantsElem {
+	participants := make([]clientws.SubscribedPayloadParticipantsElem, 0, len(userIDs))
+	for _, id := range userIDs {
+		var uuid pgtype.UUID
+		if err := uuid.Scan(id); err != nil {
+			logger.Warn("wshub: participant user id did not parse as a uuid (bug); omitting", "user_id", id, "error", err)
+			continue
+		}
+		user, err := users.GetByID(ctx, uuid)
+		if err != nil {
+			logger.Warn("wshub: resolve participant user failed; omitting from presence", "user_id", id, "error", err)
+			continue
+		}
+		participants = append(participants, clientws.SubscribedPayloadParticipantsElem{
+			"userId":      user.ID.String(),
+			"displayName": user.DisplayName,
+		})
+	}
+	return participants
 }
 
 // trimToReplayLimit caps fetched (the result of requesting
@@ -862,12 +926,23 @@ const hubConnBufferSize = 64
 // or message-bus solution, genuinely out of scope here.
 type Hub struct {
 	mu    sync.Mutex
-	conns map[string]map[*websocket.Conn]chan []byte
+	conns map[string]map[*websocket.Conn]hubConn
+}
+
+// hubConn is one registered connection's own bookkeeping: its broadcast
+// delivery channel (the ONLY thing this type carried before §8's
+// "multiplayer presence") plus the real user id it authenticated as --
+// "" for a connection whose ws_tokens row named no user (verifyClientToken's
+// own doc comment: a deleted minting user), which Participants below
+// never counts as a presence participant.
+type hubConn struct {
+	ch     chan []byte
+	userID string
 }
 
 // NewHub builds an empty Hub.
 func NewHub() *Hub {
-	return &Hub{conns: make(map[string]map[*websocket.Conn]chan []byte)}
+	return &Hub{conns: make(map[string]map[*websocket.Conn]hubConn)}
 }
 
 var _ ports.EventBroadcaster = (*Hub)(nil)
@@ -895,14 +970,20 @@ var _ ports.EventBroadcaster = (*Hub)(nil)
 // The caller must call the returned unregister exactly once (typically
 // deferred), regardless of whether StartDelivery is ever called, so this
 // Hub stops tracking a connection that is going away.
-func (h *Hub) Register(sessionID string, conn *websocket.Conn) (ch chan []byte, unregister func()) {
+//
+// userID (§8's "multiplayer presence") is this connection's own
+// authenticated user id, or "" for one that has none (verifyClientToken's
+// own doc comment) -- recorded alongside ch purely so Participants below
+// can report who is live for sessionID; Register itself does nothing
+// else with it.
+func (h *Hub) Register(sessionID string, conn *websocket.Conn, userID string) (ch chan []byte, unregister func()) {
 	ch = make(chan []byte, hubConnBufferSize)
 
 	h.mu.Lock()
 	if h.conns[sessionID] == nil {
-		h.conns[sessionID] = make(map[*websocket.Conn]chan []byte)
+		h.conns[sessionID] = make(map[*websocket.Conn]hubConn)
 	}
-	h.conns[sessionID][conn] = ch
+	h.conns[sessionID][conn] = hubConn{ch: ch, userID: userID}
 	h.mu.Unlock()
 
 	return ch, func() {
@@ -913,6 +994,34 @@ func (h *Hub) Register(sessionID string, conn *websocket.Conn) (ch chan []byte, 
 		}
 		h.mu.Unlock()
 	}
+}
+
+// Participants returns the DISTINCT, currently-connected real user ids
+// for sessionID (§8's "multiplayer presence") -- one entry per unique
+// user regardless of how many tabs/connections that user currently has
+// open for this session, in no particular order (the caller,
+// resolveParticipants, does not require one). A connection registered
+// with userID "" (Register's own doc comment) contributes nothing here.
+// Returns nil for a session with no live connections at all (the common
+// case), which resolveParticipants' own make([], 0, len(nil)) already
+// treats identically to an empty slice.
+func (h *Hub) Participants(sessionID string) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	seen := make(map[string]struct{}, len(h.conns[sessionID]))
+	var ids []string
+	for _, c := range h.conns[sessionID] {
+		if c.userID == "" {
+			continue
+		}
+		if _, dup := seen[c.userID]; dup {
+			continue
+		}
+		seen[c.userID] = struct{}{}
+		ids = append(ids, c.userID)
+	}
+	return ids
 }
 
 // StartDelivery starts conn's own dedicated writer goroutine (via eg.Go --
@@ -971,9 +1080,9 @@ func (h *Hub) Broadcast(sessionID string, payload json.RawMessage) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	for _, ch := range h.conns[sessionID] {
+	for _, c := range h.conns[sessionID] {
 		select {
-		case ch <- payload:
+		case c.ch <- payload:
 		default:
 			platform.Logger(platform.WithSessionID(context.Background(), sessionID)).
 				Warn("wshub: dropping broadcast for a slow/non-draining client connection")

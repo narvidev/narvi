@@ -135,7 +135,7 @@ describe('SessionHeader cost -- one session, one total', () => {
     const session = baseSession({})
     const model = buildTimelineModel([])
     const cost = buildCostRollup([])
-    const html = renderToStaticMarkup(<SessionHeader session={session} model={model} cost={{ ...cost, sessionUsd: 0.75 }} />)
+    const html = renderToStaticMarkup(<SessionHeader session={session} model={model} cost={{ ...cost, sessionUsd: 0.75 }} participants={[]} />)
     expect(html).toContain('$0.75')
   })
 
@@ -143,7 +143,7 @@ describe('SessionHeader cost -- one session, one total', () => {
     const session = baseSession({})
     const model = buildTimelineModel([])
     const cost = buildCostRollup([])
-    const html = renderToStaticMarkup(<SessionHeader session={session} model={model} cost={{ ...cost, sessionUsd: null }} />)
+    const html = renderToStaticMarkup(<SessionHeader session={session} model={model} cost={{ ...cost, sessionUsd: null }} participants={[]} />)
     expect(html).not.toContain('$0.00')
   })
 })
@@ -152,7 +152,7 @@ describe('SessionHeader rendering -- a hostile session title stays text', () => 
   it('escapes a hostile session title', () => {
     const session = baseSession({ title: XSS_PAYLOAD })
     const model = buildTimelineModel([])
-    const html = renderToStaticMarkup(<SessionHeader session={session} model={model} cost={buildCostRollup([])} />)
+    const html = renderToStaticMarkup(<SessionHeader session={session} model={model} cost={buildCostRollup([])} participants={[]} />)
     expect(html).not.toContain('<img')
     expect(html).toContain('&lt;img')
   })
@@ -160,8 +160,62 @@ describe('SessionHeader rendering -- a hostile session title stays text', () => 
   it('escapes a hostile repo name', () => {
     const session = baseSession({ repos: [{ name: SCRIPT_PAYLOAD, url: 'https://example.invalid/x.git', branch: null }] })
     const model = buildTimelineModel([])
-    const html = renderToStaticMarkup(<SessionHeader session={session} model={model} cost={buildCostRollup([])} />)
+    const html = renderToStaticMarkup(<SessionHeader session={session} model={model} cost={buildCostRollup([])} participants={[]} />)
     expect(html).not.toContain('<script>')
     expect(html).toContain('&lt;script&gt;')
+  })
+})
+
+// §8.11 "multiplayer presence" (Step 121): the WS subscribe reply's own
+// real, live participants array is now rendered, not silently validated
+// and discarded (session/participants.ts's own parseParticipants feeds
+// this component). Proven at the render boundary like every other
+// SessionHeader case in this file: a hostile displayName must render as
+// text, never markup.
+describe('SessionHeader presence -- multiplayer indicator (§8.11)', () => {
+  const session = baseSession({})
+  const model = buildTimelineModel([])
+  const cost = buildCostRollup([])
+
+  it('renders nothing when nobody else is live (0 participants)', () => {
+    const html = renderToStaticMarkup(<SessionHeader session={session} model={model} cost={cost} participants={[]} />)
+    expect(html).not.toContain('watching')
+  })
+
+  it('renders nothing for a solo viewer (1 participant) -- the common case', () => {
+    const html = renderToStaticMarkup(<SessionHeader session={session} model={model} cost={cost} participants={[{ userId: 'u1', displayName: 'Solo Viewer' }]} />)
+    expect(html).not.toContain('watching')
+  })
+
+  it('renders an avatar per participant plus the live count for 2+ participants', () => {
+    const html = renderToStaticMarkup(
+      <SessionHeader
+        session={session}
+        model={model}
+        cost={cost}
+        participants={[
+          { userId: 'u1', displayName: 'Alice Anderson' },
+          { userId: 'u2', displayName: 'Bob Baker' },
+        ]}
+      />,
+    )
+    expect(html).toContain('2 watching')
+    expect(html).toContain('>AA<')
+    expect(html).toContain('>BB<')
+  })
+
+  it('escapes a hostile participant display name, never renders it as markup', () => {
+    const html = renderToStaticMarkup(
+      <SessionHeader
+        session={session}
+        model={model}
+        cost={cost}
+        participants={[
+          { userId: 'u1', displayName: XSS_PAYLOAD },
+          { userId: 'u2', displayName: 'Bob Baker' },
+        ]}
+      />,
+    )
+    expect(html).not.toContain('<img')
   })
 })

@@ -123,15 +123,37 @@
 //     MintWSToken) is gated behind internal/adapters/inbound/auth.
 //     Middleware and scopes ws_tokens.user_id to the real authenticated
 //     caller. This package's own client-WS subscribe-time verification
-//     (client.go) is UNCHANGED by that Step: it still only checks the
-//     presented ws-token's hash against ws_tokens, never anything
-//     per-participant beyond that. participants stays completely
-//     untouched (SubscribedPayload.participants is always an empty
-//     array) -- real user identity existing now is not the same as
-//     multiplayer/presence being wired, which is its own, distinct,
-//     not-yet-scoped concern (§8.11) -- see
-//     internal/adapters/inbound/httpapi/doc.go and
-//     internal/adapters/inbound/auth/doc.go for the full writeup.
+//     (client.go) was UNCHANGED by that Step: it only checked the
+//     presented ws-token's hash against ws_tokens, nothing
+//     per-participant beyond that -- participants stayed completely
+//     untouched (SubscribedPayload.participants was always an empty
+//     array).
+//   - UPDATE (§8.11, "multiplayer presence"): the gap immediately above
+//     is closed for LIVE presence specifically. verifyClientToken now
+//     returns row.UserID alongside its bool, threaded into Hub.Register
+//     as a new userID parameter Hub tracks per connection; Hub.
+//     Participants(sessionID) reports the distinct set of real users
+//     currently subscribed, and NewClientHandler resolves that set
+//     (postgres.UserStore.GetByID, best-effort -- one unresolvable id is
+//     dropped, never fails the whole reply) into SubscribedPayload.
+//     participants as this connection's own subscribe reply is built --
+//     so a fresh subscribe (including every reconnect) always reports
+//     who else, if anyone, is live on this session right now. This is
+//     DELIBERATELY separate from, and does NOT populate, the durable
+//     `participants` Postgres table (migrations/000011) postgres.
+//     ParticipantStore wraps -- that table backs §13.3's own "member on
+//     own/joined" authorization predicate, a different, still-unwired
+//     concern (see ParticipantStore's own doc comment, unchanged by
+//     this). Live presence and "has this user ever joined this session"
+//     are two different questions with two different lifetimes; this
+//     Hub answers only the first, in-process and ephemeral by
+//     construction (cleared the instant a connection drops, exactly
+//     like every other Hub bookkeeping this package already loses on
+//     process restart -- the same honest "cross-pod fan-out is NOT
+//     solved here" scope this package's own Hub doc comment already
+//     states applies here too: presence is only ever visible to a
+//     subscriber connected to the SAME control-plane process that also
+//     holds the OTHER participants' connections).
 //   - Cross-pod broadcast fan-out is NOT solved here: *Hub only ever
 //     reaches connections registered in the SAME process as the actor
 //     that persisted the event -- the same class of honest gap as

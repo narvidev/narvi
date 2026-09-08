@@ -1068,7 +1068,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 
 	router.Get("/sessions/{sessionID}/ws", wshub.NewHandler(
 		wshub.NewSandboxHandler(registry, sandboxStore, commander, cfg.Timeouts),
-		wshub.NewClientHandler(registry, sessionStore, turnStore, sandboxStore, eventStore, artifactStore, wsTokenStore, hub, cfg.Timeouts),
+		wshub.NewClientHandler(registry, sessionStore, turnStore, sandboxStore, eventStore, artifactStore, wsTokenStore, userStore, hub, cfg.Timeouts),
 	))
 
 	// scm-credentials (§9.3, "e2e happy path", design decision 8):

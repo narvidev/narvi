@@ -66,6 +66,23 @@ export interface SessionStreamSnapshot {
    * log on top (session/sandboxRail.ts does exactly that).
    */
   sandboxState: unknown
+  /**
+   * The subscribe reply's own top-level `participants` array (§8.11,
+   * "multiplayer presence") -- client.go's own resolveParticipants:
+   * `{userId, displayName}` per currently-live, distinct user, passed
+   * through verbatim and UNTYPED for the identical reason sandboxState
+   * stays `unknown` above (the deeper, type-checked narrowing belongs to
+   * session/participants.ts's own parseParticipants). Unlike sandboxState,
+   * this field lives at the payload's own top level, not inside `state`
+   * (protocol.schema.json's own SubscribedPayload shape) -- transport.ts's
+   * looksLikeSubscribedPayload already proves it is an array before this
+   * class ever sees it, so no defensive Array.isArray check is repeated
+   * here. Only refreshed on (re)subscribe, exactly like sandboxState --
+   * presence is a live, per-connection fact, so a client that stays
+   * connected sees it go stale only until its next reconnect (a bounded,
+   * honest staleness window, never presented as a push-updated roster).
+   */
+  participantsState: readonly { [k: string]: unknown }[]
 }
 
 export interface SessionStreamOptions {
@@ -109,6 +126,7 @@ export class SessionStream {
   private activity: SessionActivityState = initialSessionActivityState
   private lastError: string | null = null
   private sandboxState: unknown = null
+  private participantsState: readonly { [k: string]: unknown }[] = []
   private readonly listeners = new Set<() => void>()
   private backfillInFlight = false
   private backfillDirty = false
@@ -181,6 +199,7 @@ export class SessionStream {
         activity: this.activity,
         lastError: this.lastError,
         sandboxState: this.sandboxState,
+        participantsState: this.participantsState,
       }
     }
     return this.cachedSnapshot
@@ -205,6 +224,7 @@ export class SessionStream {
     // event of its own (see sandboxRail.ts's own top comment for the full
     // "what this can and cannot show" accounting).
     this.sandboxState = isPlainObject(payload.state) ? (payload.state.sandbox ?? null) : null
+    this.participantsState = payload.participants
     const inserted = this.log.appendMany(parseEnvelopes(payload.events))
     this.applyNewEvents(inserted)
     // Always run at least one backfill pass after a (re)subscribe: the

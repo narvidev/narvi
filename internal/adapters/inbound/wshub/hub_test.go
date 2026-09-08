@@ -39,9 +39,9 @@ func TestHub_BroadcastNonBlockingOnFullChannel(t *testing.T) {
 	fastCh := make(chan []byte, hubConnBufferSize)
 
 	h.mu.Lock()
-	h.conns[sessionID] = map[*websocket.Conn]chan []byte{
-		fullConn: fullCh,
-		fastConn: fastCh,
+	h.conns[sessionID] = map[*websocket.Conn]hubConn{
+		fullConn: {ch: fullCh},
+		fastConn: {ch: fastCh},
 	}
 	h.mu.Unlock()
 
@@ -95,7 +95,7 @@ func TestHub_RegisterUnregister(t *testing.T) {
 	ch := make(chan []byte, hubConnBufferSize)
 
 	h.mu.Lock()
-	h.conns[sessionID] = map[*websocket.Conn]chan []byte{conn: ch}
+	h.conns[sessionID] = map[*websocket.Conn]hubConn{conn: {ch: ch}}
 	h.mu.Unlock()
 
 	h.Broadcast(sessionID, json.RawMessage(`"before-unregister"`))
