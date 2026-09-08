@@ -74,7 +74,7 @@
 -- Workflow-driven plan HITL -- a REAL, useful capability, e.g. a
 -- multi-step plan → build workflow with a genuine human checkpoint in
 -- between -- is not abandoned, only DEFERRED: it becomes reachable once
--- the Phase 7 canvas editor (Step 88, §25.12) lets an operator author a
+-- the Phase 7 canvas editor (Step 91, §25.12) lets an operator author a
 -- CUSTOM (non-built-in) workflow definition and bind it explicitly, at
 -- which point that operator has made an affirmative choice to run
 -- workflow-driven HITL instead of classic plan mode for that lane/repo
