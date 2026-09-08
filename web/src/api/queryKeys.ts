@@ -142,6 +142,14 @@ export const repoAnalyticsQueryKeys = {
   reviewAnalytics: (repoFullName: string) => ['repo-review-analytics', repoFullName] as const,
 }
 
+// platformAnalyticsQueryKeys -- AnalyticsView.tsx's own platform-wide
+// rollup (GET /api/analytics), un-scoped by repo -- a single fixed key,
+// mirroring repoAnalyticsQueryKeys' shape one level up minus the
+// parameter, since there is only ever one platform-wide result to cache.
+export const platformAnalyticsQueryKeys = {
+  detail: () => ['platform-analytics'] as const,
+}
+
 // repoSettingsQueryKeys -- RepoSettingsView.tsx's own data source (§21,
 // §26.7, §26.8, §4.1.2), parameterized by repoFullName like
 // falsePositivePatternQueryKeys/repoAnalyticsQueryKeys above. One key: all
