@@ -124,6 +124,12 @@ type SubscribedPayload struct {
 	// Event replay.
 	Events []SubscribedPayloadEventsElem `json:"events" yaml:"events" mapstructure:"events"`
 
+	// True when events is a cut prefix of this session's full history rather than all
+	// of it -- the fixed item-count cap or the byte-size budget was hit. False means
+	// events is the session's complete history to date. A client that needs what was
+	// cut already has fetch_history.
+	EventsTruncated bool `json:"eventsTruncated" yaml:"eventsTruncated" mapstructure:"eventsTruncated"`
+
 	// Participants corresponds to the JSON schema field "participants".
 	Participants []SubscribedPayloadParticipantsElem `json:"participants" yaml:"participants" mapstructure:"participants"`
 
@@ -154,6 +160,9 @@ func (j *SubscribedPayload) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["events"]; raw != nil && !ok {
 		return fmt.Errorf("field events in SubscribedPayload: required")
+	}
+	if _, ok := raw["eventsTruncated"]; raw != nil && !ok {
+		return fmt.Errorf("field eventsTruncated in SubscribedPayload: required")
 	}
 	if _, ok := raw["participants"]; raw != nil && !ok {
 		return fmt.Errorf("field participants in SubscribedPayload: required")

@@ -429,9 +429,12 @@ func verifyClientToken(ctx context.Context, conn *websocket.Conn, wsTokens *post
 // a genuinely minimal, honestly-scoped state map (session + turns +
 // sandbox-or-nil -- the full read-model shape is explicitly left to later
 // PRs by the schema's own doc comment), the first initialReplayLimit
-// events, every artifact (unbounded -- expected to stay small), and an
-// always-empty participants array (design decision: participants stays
-// completely untouched this Step, see this package's own doc.go).
+// events (EventsTruncated reports, exactly, whether that replay is the
+// session's complete history or a cut prefix of it -- see the field's own
+// schema doc comment), every artifact (unbounded -- expected to stay
+// small), and an always-empty participants array (design decision:
+// participants stays completely untouched this Step, see this package's
+// own doc.go).
 func buildSubscribedPayload(
 	ctx context.Context,
 	sessionID pgtype.UUID,
@@ -460,17 +463,29 @@ func buildSubscribedPayload(
 		return clientws.SubscribedPayload{}, err
 	}
 
-	eventRows, err := events.ListForSession(ctx, sessionID, 0, initialReplayLimit)
+	// Fetched one row past initialReplayLimit, deliberately: getting
+	// initialReplayLimit+1 rows back is an exact, cheap ("+1" cost, no
+	// second query) proof that more history exists beyond what this
+	// payload can carry, unlike the len(rows)==limit heuristic this
+	// file's own fetch_history handler (below) and httpapi's own
+	// ListEvents (events.go) each use for their nextCursor -- a
+	// heuristic tolerable there because a false "there might be more"
+	// only costs a client one empty extra page, but wrong here would
+	// mean EventsTruncated itself lies.
+	eventRows, err := events.ListForSession(ctx, sessionID, 0, initialReplayLimit+1)
 	if err != nil {
 		return clientws.SubscribedPayload{}, err
 	}
+	eventRows, countTruncated := trimToReplayLimit(eventRows)
 
 	artifactRows, err := artifacts.ListForSession(ctx, sessionID)
 	if err != nil {
 		return clientws.SubscribedPayload{}, err
 	}
 
-	wireEvents := truncateEventsToByteBudget(subscribedEventsWire(eventRows), maxInitialReplayBytes)
+	wireEventsAll := subscribedEventsWire(eventRows)
+	wireEvents := truncateEventsToByteBudget(wireEventsAll, maxInitialReplayBytes)
+	byteTruncated := len(wireEvents) < len(wireEventsAll)
 
 	return clientws.SubscribedPayload{
 		SessionId: sessionID.String(),
@@ -479,10 +494,27 @@ func buildSubscribedPayload(
 			"turns":   turnRows,
 			"sandbox": sandboxState,
 		},
-		Events:       wireEvents,
-		Artifacts:    subscribedArtifactsWire(artifactRows),
-		Participants: []clientws.SubscribedPayloadParticipantsElem{},
+		Events:          wireEvents,
+		EventsTruncated: countTruncated || byteTruncated,
+		Artifacts:       subscribedArtifactsWire(artifactRows),
+		Participants:    []clientws.SubscribedPayloadParticipantsElem{},
 	}, nil
+}
+
+// trimToReplayLimit caps fetched (the result of requesting
+// initialReplayLimit+1 rows, buildSubscribedPayload's own caller) at
+// initialReplayLimit, oldest-first order preserved, and reports whether
+// there was a limit+1'th row to cut -- the exact, cheap proof that more
+// history exists beyond initialReplayLimit, since fetched can only ever
+// hold limit+1 elements if a genuine limit+1'th row existed to fetch. A
+// pure slice op (no I/O, no time, no randomness -- safe and fast to unit
+// test directly, unlike the wire-shaped byte-budget check below, which
+// needs realistic marshaled sizes to mean anything).
+func trimToReplayLimit(fetched []sqlcgen.Event) (rows []sqlcgen.Event, truncated bool) {
+	if len(fetched) > initialReplayLimit {
+		return fetched[:initialReplayLimit], true
+	}
+	return fetched, false
 }
 
 // truncateEventsToByteBudget returns the longest PREFIX of wire (order

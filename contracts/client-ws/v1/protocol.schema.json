@@ -18,7 +18,7 @@
       "type": "object",
       "additionalProperties": false,
       "description": "The single reply to subscribe. state/events/artifacts/participants are deliberately loosely typed here (additionalProperties: true) — the full session/turn/sandbox read-model shape is assembled by later PRs; this schema only fixes the top-level envelope.",
-      "required": ["sessionId", "state", "events", "artifacts", "participants"],
+      "required": ["sessionId", "state", "events", "eventsTruncated", "artifacts", "participants"],
       "properties": {
         "sessionId": { "type": "string", "format": "uuid" },
         "state": { "type": "object", "additionalProperties": true, "description": "Full session/turn/sandbox read model (shape assembled by later PRs)." },
@@ -27,6 +27,7 @@
           "description": "Event replay.",
           "items": { "type": "object", "additionalProperties": true }
         },
+        "eventsTruncated": { "type": "boolean", "description": "True when events is a cut prefix of this session's full history rather than all of it -- the fixed item-count cap or the byte-size budget was hit. False means events is the session's complete history to date. A client that needs what was cut already has fetch_history." },
         "artifacts": {
           "type": "array",
           "items": { "type": "object", "additionalProperties": true }

@@ -45,6 +45,10 @@ export interface SubscribedPayload {
   events: {
     [k: string]: unknown;
   }[];
+  /**
+   * True when events is a cut prefix of this session's full history rather than all of it -- the fixed item-count cap or the byte-size budget was hit. False means events is the session's complete history to date. A client that needs what was cut already has fetch_history.
+   */
+  eventsTruncated: boolean;
   artifacts: {
     [k: string]: unknown;
   }[];
