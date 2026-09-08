@@ -626,17 +626,38 @@ func TestRunCloudIdentityRefreshLoop_EmptyStatesBlocksThenReturnsOnCtxDone(t *te
 // TestOIDCClusterBindingTokenReachesRealSpawnedHook sibling,
 // kubeconfig_test.go) failed once under a fully-loaded local `make test`
 // with concurrent compile load and passed in isolation immediately after.
-// Measured rather than assumed before touching the ceiling: two
-// independent full `go test -race ./...` runs (the same concurrent-load
-// shape that produced the original failure, on a machine already at a
-// 2x-oversubscribed load average from unrelated concurrent work) both
-// timed this test's actual setup.sh round trip at 0.32s -- under 7% of
-// the 5s budget, a ~15x margin, identical across both runs. That is a
-// real spawn-latency measurement under load, not a clean-room number, and
-// it does not support raising the ceiling: the one observed failure reads
-// as a transient extreme spike consistent with its own "passed isolated
-// immediately after" observation, not as evidence the budget is too
-// tight. Left unchanged.
+// Measured, twice, before touching the ceiling: two independent full `go
+// test -race ./...` runs (the same concurrent-load shape that produced
+// the original failure, on a machine already at a 2x-oversubscribed load
+// average from unrelated concurrent work) both timed this test's actual
+// setup.sh round trip at 0.32s -- under 7% of the 5s budget, identical
+// across both runs.
+//
+// That measurement is real, but it is not the whole picture: a third
+// attempt, this one made WHILE gate-checking the fix these comments
+// belong to, reproduced the original failure outright (5.01s, this exact
+// test, under an ordinary `go test -race ./...`) -- so this is a live,
+// intermittent risk, not a closed one, and the two clean timings above
+// should not be read as if they were. What changed the conclusion from
+// "raise it" to "leave it, and say why" is where the 5s is actually
+// spent: runHook's hookCtx starts only AFTER supervisor.Spawn returns
+// (hooks.go) -- fork/exec latency is not inside this budget at all --
+// and Process.Wait (process.go) blocks on a channel a background reaper
+// goroutine closes once it observes the child has exited, not on the
+// child directly. Under -race, with GOMAXPROCS-many other
+// race-instrumented goroutines contending for real OS threads on an
+// oversubscribed machine, that reaper goroutine can itself go
+// unscheduled for seconds even after the (sub-millisecond) `cat` it is
+// waiting on has already exited. That is Go-runtime/OS scheduling
+// contention on a shared box, not a floor on how long a real setup.sh
+// spawn legitimately needs -- so it has no principled worst-case bound a
+// bigger constant would reliably clear, and picking one anyway (5s
+// clearly wasn't enough; is 10s? 30s?) would be exactly the ungrounded
+// guess this Step's own row warns against, bought at the cost of a
+// slower failure signal for a setup.sh that is genuinely hung. Left at
+// 5s: rare, environment-dependent, and a real fix (if one is wanted)
+// is a scheduling-isolation or retry-on-timeout design change, not a
+// bigger number here.
 func TestCloudIdentityTokenReachesRealSpawnedHook(t *testing.T) {
 	dir := t.TempDir()
 	m := &fakeMinter{tokens: map[string]credentials.MintedCloudIdentityToken{"sts.amazonaws.com": {Token: "real-spawned-process-jwt"}}}

@@ -343,10 +343,15 @@ func TestApplyClusterBinding_KubeconfigPermissions(t *testing.T) {
 //
 // On the 5-second hookTimeout below: see
 // TestCloudIdentityTokenReachesRealSpawnedHook's own doc comment
-// (cloudidentity_test.go) for the full measurement this test shares --
-// both failed together under the same loaded `make test` run, and both
-// were re-measured together under two independent full-suite runs (0.33s
-// actual here, ~15x under budget). Left unchanged for the same reason.
+// (cloudidentity_test.go) for the full measurement and the reasoning for
+// leaving it unchanged -- both tests failed together on the original
+// (2026-09-03) loaded run this Step's own row records, both were
+// re-measured together at 0.32-0.33s under two independent full-suite
+// runs, and this test's own timing stayed clean (0.41s) on the third
+// attempt where its sibling reproduced the original failure outright --
+// consistent with the sibling comment's own point that this is
+// goroutine-scheduling contention on a shared machine, not a deterministic
+// property of either script.
 func TestOIDCClusterBindingTokenReachesRealSpawnedHook(t *testing.T) {
 	dir := t.TempDir()
 	params, _ := json.Marshal(map[string]string{"clientId": "real-spawn-client"})
