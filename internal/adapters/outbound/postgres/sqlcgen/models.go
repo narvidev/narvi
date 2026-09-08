@@ -1900,10 +1900,11 @@ type Plan struct {
 }
 
 type PlanDocument struct {
-	ID        pgtype.UUID        `json:"id"`
-	PlanID    pgtype.UUID        `json:"plan_id"`
-	Content   *string            `json:"content"`
-	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	ID              pgtype.UUID        `json:"id"`
+	PlanID          pgtype.UUID        `json:"plan_id"`
+	Content         *string            `json:"content"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	StructuredSteps []byte             `json:"structured_steps"`
 }
 
 type PromptTemplate struct {

@@ -44,21 +44,43 @@
 // reached through the composer's own structured request instead of a
 // parsed chat reply.
 //
+// # Structured plans, and the honest fallback for one that isn't (§12.2
+// item 3's own missing piece, closed here)
+//
+// plan.content is ALWAYS present -- the producing turn's own rendered
+// prose, exactly as before this Step. plan.structured is the SAME content
+// string's own machine-recovered structure (internal/domain/plan.
+// ExtractStructured), present only when the model emitted a valid
+// ```plan-steps block; null otherwise. Null covers three cases
+// identically and deliberately (Plan's own schema doc comment,
+// contracts/rest/v1/dtos.schema.json): every plan that predates this
+// field, a plan-mode turn whose model never attempted the block, and one
+// that attempted and failed validation -- none of these is a "confident
+// empty plan", so PlanCard below never renders an empty numbered list for
+// any of them. It renders EXACTLY plan.content, in prose, precisely as
+// this view always has -- structured rendering is additive, never a
+// replacement path that could silently swallow a plan that has real
+// content but no recoverable structure.
+//
 // # Every third-party-authored string here is plain text
 //
-// plan.content (the plan document's own text -- model-authored, verbatim,
-// per Plan's own schema doc comment: "no structured plan schema anywhere
-// in this codebase... render as plain text only, never markdown-parsed")
-// and the revise feedback textarea's own value (human-authored, echoed
-// back nowhere in THIS view but sent to the server as a turn prompt, the
-// exact same trust level as anything else typed into the composer) are
-// the two attacker-reachable field families. Both render as plain React
-// text content only -- see the local T component below (identical
-// truncateForDisplay + JSX-text-interpolation shape CodeReviewView.tsx/
-// ReleaseReviewView.tsx already establish) -- never dangerouslySetInnerHTML,
-// never markdown/ANSI-parsed. This view constructs no href from plan
-// content at all, so urlSafety.ts has nothing to guard here (unlike
-// SessionRail.tsx's artifact links or CodeReviewView's PR link).
+// plan.content, plan.structured's own step title/description/fileRefs
+// entries and scopeEstimate (all model-authored, verbatim -- see Plan's
+// own schema doc comment), and the revise feedback textarea's own value
+// (human-authored, echoed back nowhere in THIS view but sent to the server
+// as a turn prompt, the exact same trust level as anything else typed into
+// the composer) are the attacker-reachable field families. All render as
+// plain React text content only -- see the local T component below
+// (identical truncateForDisplay + JSX-text-interpolation shape
+// CodeReviewView.tsx/ReleaseReviewView.tsx already establish) -- never
+// dangerouslySetInnerHTML, never markdown/ANSI-parsed. A step's own
+// fileRefs are rendered as inert `<code>` text only, NEVER as a clickable
+// or navigable link: this view constructs no href from any plan-authored
+// string at all (content, a step's title/description, or a file path), so
+// urlSafety.ts has nothing to guard here (unlike SessionRail.tsx's
+// artifact links or CodeReviewView's PR link) and a hostile fileRefs entry
+// (e.g. a path crafted to look like it escapes the repository, or one
+// containing a `javascript:`-scheme string) can never become navigation.
 import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
@@ -78,7 +100,36 @@ function T({ text }: { text: string }) {
   return <>{truncateForDisplay(text, MAX_CONTENT_CHARS)}</>
 }
 
-/** PlanCard renders one plan version's own content -- exported for direct render-safety testing (mirrors CodeReviewView.tsx's own DigestSections/FindingCard precedent): a hostile plan.content (markup, a `javascript:` URL as plain text, an XSS payload) must render as plain text only, never as markup or a link -- see this file's own top doc comment. */
+/** StructuredPlanSteps renders plan.structured's own numbered steps (docs/design/mockups.html's own `.planlist` shape, decision 15) -- exported alongside PlanCard for the identical render-safety testing this file's own top comment describes: every string here (title, description, each fileRefs entry) is model-authored and renders as plain text only, and no fileRefs entry is ever turned into an href. */
+export function StructuredPlanSteps({ structured }: { structured: NonNullable<Plan['structured']> }) {
+  return (
+    <ol className="planlist">
+      {structured.steps.map((step, i) => (
+        <li key={i}>
+          <div>
+            <b>
+              <T text={step.title} />
+            </b>
+            <p>
+              <T text={step.description} />
+            </p>
+            {step.fileRefs.length > 0 && (
+              <p>
+                {step.fileRefs.map((ref, j) => (
+                  <code key={j}>
+                    <T text={ref} />
+                  </code>
+                ))}
+              </p>
+            )}
+          </div>
+        </li>
+      ))}
+    </ol>
+  )
+}
+
+/** PlanCard renders one plan version -- as a structured numbered list when plan.structured is present, or plan.content's own prose otherwise (see this file's own top comment for why those are the ONLY two cases and why null is never mistaken for "zero steps"). Exported for direct render-safety testing (mirrors CodeReviewView.tsx's own DigestSections/FindingCard precedent): a hostile plan.content or a hostile structured field (markup, a `javascript:` URL as plain text, an XSS payload) must render as plain text only, never as markup or a link -- see this file's own top doc comment. */
 export function PlanCard({ plan }: { plan: Plan }) {
   return (
     <div className="card">
@@ -87,11 +138,14 @@ export function PlanCard({ plan }: { plan: Plan }) {
         <b>Plan</b>
         <time>{new Date(plan.createdAt).toLocaleString()}</time>
       </div>
-      <p className="plan-content">
-        <T text={plan.content} />
-      </p>
+      {plan.structured ? <StructuredPlanSteps structured={plan.structured} /> : <p className="plan-content"><T text={plan.content} /></p>}
       <div className="verdict-foot">
-        <span>
+        {plan.structured && (
+          <span>
+            estimated scope: <T text={plan.structured.scopeEstimate} />
+          </span>
+        )}
+        <span style={plan.structured ? { marginLeft: 'auto' } : undefined}>
           plan persisted · v{plan.version}
           {plan.decidedAt ? ` · decided ${new Date(plan.decidedAt).toLocaleString()}` : ''}
         </span>

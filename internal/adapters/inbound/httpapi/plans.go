@@ -30,6 +30,14 @@
 // is required here and was not needed by the single-turn notifier caller:
 // an older, already-superseded/decided plan version is never the session's
 // own most-recently-dispatched turn by the time anyone lists it.
+//
+// # Plan-mode UI addition: structured (§12.2 item 3's own missing schema)
+//
+// planWireMap additionally computes restdtos.Plan.structured from that SAME
+// content, via internal/domain/plan.ExtractStructured -- see that
+// function's and planWireMap's own doc comments for the extraction rule
+// and why nil (never a partial value) is the only "no structure"
+// representation.
 
 package httpapi
 
@@ -211,6 +219,16 @@ func turnContentBounds(sessionTurns []sqlcgen.Turn, turnID pgtype.UUID) (lower, 
 // dropping TurnID/SlackChannelID/SlackMessageTs, present on the underlying
 // row but not on the wire DTO (see Plan's own schema doc comment,
 // contracts/rest/v1/dtos.schema.json, for why).
+//
+// structured is recomputed live from content, via plandomain.
+// ExtractStructured, every time -- exactly like content itself is
+// recomputed live from the event log on every read, never cached from a
+// prior computation. This is what makes an already-persisted plan (from
+// before this field existed) and a freshly-created one behave identically
+// with no backfill: the SAME function runs against whatever content
+// happens to contain, so an old plan's prose (never asked to carry a
+// ```plan-steps block) simply extracts nil, the same nil a brand-new
+// plan's own failed extraction attempt would produce.
 func planWireMap(p sqlcgen.Plan, content string) restdtos.Plan {
 	var decidedAt *time.Time
 	if p.DecidedAt.Valid {
@@ -232,5 +250,28 @@ func planWireMap(p sqlcgen.Plan, content string) restdtos.Plan {
 		DecidedAt:   decidedAt,
 		DecidedBy:   decidedBy,
 		Content:     content,
+		Structured:  planStructuredWireMap(plandomain.ExtractStructured(content)),
+	}
+}
+
+// planStructuredWireMap maps plandomain.ExtractStructured's own output onto
+// restdtos.PlanStructured -- nil in, nil out, so a caller that got "no
+// structure" from the domain function reports the identical "no structure"
+// on the wire, never an empty-but-present object.
+func planStructuredWireMap(s *plandomain.Structured) *restdtos.PlanStructured {
+	if s == nil {
+		return nil
+	}
+	steps := make([]restdtos.PlanStep, len(s.Steps))
+	for i, step := range s.Steps {
+		steps[i] = restdtos.PlanStep{
+			Title:       step.Title,
+			Description: step.Description,
+			FileRefs:    step.FileRefs,
+		}
+	}
+	return &restdtos.PlanStructured{
+		Steps:         steps,
+		ScopeEstimate: s.ScopeEstimate,
 	}
 }

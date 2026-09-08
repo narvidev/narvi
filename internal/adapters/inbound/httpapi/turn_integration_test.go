@@ -26,6 +26,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -697,16 +698,28 @@ func TestCreateTurnCore_EpistemicCheckOn_BuildTurn_InjectsPreamble(t *testing.T)
 // TestCreateTurnCore_EpistemicCheckOn_PlanModeTurn_NoPreamble pins §20.3's
 // exclusion at the SAME wire-level fidelity as the two tests above: even
 // with the platform default on, a plan_mode=true turn's dispatched
-// Prompt.Text carries NO preamble text at all -- byte-for-byte identical
-// to the off case for the identical request, just with planMode flipped.
+// Prompt.Text carries NO epistemic preamble text at all. It is NOT
+// byte-for-byte identical to the caller's own raw prompt any more --
+// §12.2 item 3's own structured-plan-document instruction
+// (plandomain.MaybeInjectStructureInstruction) is unconditionally
+// prepended onto every plan_mode=true turn regardless of the epistemic
+// check, an unrelated mechanism this test does not exist to prove or
+// disprove -- so the assertion checks for that EXACT, expected prefix
+// (never a bare inequality that a later, unrelated prompt-shaping addition
+// could vacuously "fix" back to green) and, separately and explicitly,
+// that the epistemic preamble specifically is absent.
 func TestCreateTurnCore_EpistemicCheckOn_PlanModeTurn_NoPreamble(t *testing.T) {
 	rig := newEpistemicCheckTestRig(t, true)
 
 	body := []byte(`{"prompt": "make a plan for this", "modelId": null, "effort": null, "planMode": true}`)
 	gotText := dispatchAndCapturePrompt(t, rig, body)
 
-	if gotText != "make a plan for this" {
-		t.Fatalf("dispatched Prompt.Text = %q, want %q (plan-mode turns never get the preamble, §20.3, even with the check enabled)", gotText, "make a plan for this")
+	wantText := plandomain.MaybeInjectStructureInstruction(true, "make a plan for this")
+	if gotText != wantText {
+		t.Fatalf("dispatched Prompt.Text = %q, want %q (only the structured-plan-document instruction, never the epistemic preamble, §20.3, even with the check enabled)", gotText, wantText)
+	}
+	if strings.Contains(gotText, turn.RenderEpistemicPreamble()) {
+		t.Fatalf("dispatched Prompt.Text contains the epistemic preamble -- plan-mode turns must never get it (§20.3), even with the check enabled: %q", gotText)
 	}
 }
 

@@ -414,7 +414,7 @@ export interface LinkMemberIdentityRequest {
   externalId: string;
 }
 /**
- * One plan-mode VERSION's own REST wire shape (migrations/000034_plan_mode.up.sql), returned by GET /api/sessions/:id/plans (audit finding M3, completeness: §8.1 shipped approve/reject with no way for a web client to ever discover a planId to approve). Deliberately omits turnId and slack_channel_id/slack_message_ts, both present on the underlying plans row: turnId is an internal linkage to the producing turn's own event stream, never itself surfaced (the plan-mode UI needs what that stream CONTAINS -- content below -- never the linkage id itself); slack_channel_id/slack_message_ts (migrations/000035_plan_mode_cross_channel.up.sql) are Slack cross-channel-notify plumbing that should never leak into a REST response, mirroring PlanActionResponse's own equally minimal shape below. content (the plan-mode UI, §12.2 item 3) closes the gap this description used to name as out of scope ("not needed for a client whose job here is discovering/approving a planId") now that a client's job here also includes RENDERING the plan: the producing turn's own final streamed assistant text, best-effort recovered server-side by the SAME bounded event-log scan internal/domain/plan.ExtractContent already provides for the Slack/Linear cross-channel notifiers (internal/app/sessionactor/planapprovalcontent.go), just windowed per plan VERSION here (bounded above by the NEXT turn dispatched in this session, if any, so an already-decided plan's content is never contaminated by a later turn's own streamed text) rather than only ever the just-completed turn. There is deliberately no structured steps/fileRefs/scopeEstimate shape: internal/app/sessionactor/planapprovalcontent.go's own doc comment is explicit that no such schema exists anywhere in this codebase -- content is the model's own freeform prose, verbatim, rendered as plain text by the client (never markdown-parsed), exactly like every other model-authored field this schema already carries (finding.description, digest.summary).
+ * One plan-mode VERSION's own REST wire shape (migrations/000034_plan_mode.up.sql), returned by GET /api/sessions/:id/plans (audit finding M3, completeness: §8.1 shipped approve/reject with no way for a web client to ever discover a planId to approve). Deliberately omits turnId and slack_channel_id/slack_message_ts, both present on the underlying plans row: turnId is an internal linkage to the producing turn's own event stream, never itself surfaced (the plan-mode UI needs what that stream CONTAINS -- content below -- never the linkage id itself); slack_channel_id/slack_message_ts (migrations/000035_plan_mode_cross_channel.up.sql) are Slack cross-channel-notify plumbing that should never leak into a REST response, mirroring PlanActionResponse's own equally minimal shape below. content (the plan-mode UI, §12.2 item 3) closes the gap this description used to name as out of scope ("not needed for a client whose job here is discovering/approving a planId") now that a client's job here also includes RENDERING the plan: the producing turn's own final streamed assistant text, best-effort recovered server-side by the SAME bounded event-log scan internal/domain/plan.ExtractContent already provides for the Slack/Linear cross-channel notifiers (internal/app/sessionactor/planapprovalcontent.go), just windowed per plan VERSION here (bounded above by the NEXT turn dispatched in this session, if any, so an already-decided plan's content is never contaminated by a later turn's own streamed text) rather than only ever the just-completed turn. content is ALWAYS present and is always the model's own freeform prose, verbatim, rendered as plain text by the client (never markdown-parsed) -- exactly like every other model-authored string this schema carries -- and never stops being computed once structured (below) exists: structured is additive, never a replacement. structured (§12.2 item 3's own 'numbered steps with file refs, scope estimate' shape, internal/domain/plan.ExtractStructured) is the SAME content string's own machine-recovered structure, present only when the producing turn emitted a valid ```plan-steps block and null otherwise -- covering, identically and deliberately, every plan that predates this field, any plan whose model never attempted one, and one that attempted and failed validation: none of these is a distinguishable 'real zero', because there is no honest partial rendering for any of them beyond content's own prose (see ExtractStructured's own doc comment for the full reasoning, including why a genuinely empty steps array is folded into this SAME null case rather than kept as a distinct empty-but-real structured value). A client renders structured as a numbered list when present, and content as plain prose otherwise -- both fields are model-authored and attacker-influenceable, so title/description/fileRefs entries get the SAME plain-text-only treatment content itself always has.
  *
  * This interface was referenced by `RestDtos`'s JSON-Schema
  * via the `definition` "Plan".
@@ -447,6 +447,35 @@ export interface Plan {
    * Best-effort, server-extracted plan text (see this DTO's own top doc comment) -- never empty: falls back to a fixed, honest placeholder (internal/domain/plan.ContentFallbackText) when no token event could be recovered for this version's own window, mirroring planContentFallbackText's pre-existing identical fallback for the Slack/Linear notifiers. Model-authored freeform prose -- render as plain text only, never markdown-parsed, matching every other model-authored string this schema carries.
    */
   content: string;
+  /**
+   * §12.2 item 3's own structured plan document -- content's own machine-recovered structure (internal/domain/plan.ExtractStructured), present only when the producing turn emitted a valid ```plan-steps block; null covers every other case identically (see this DTO's own top doc comment for the full enumeration and why they are deliberately not distinguished). A client that gets null renders content in prose instead -- structured never replaces content, which is always present regardless.
+   */
+  structured: {
+    /**
+     * Always at least one step in a non-null structured value -- ExtractStructured folds a genuinely empty steps array into the SAME null case as no structure at all, so this array is never empty here.
+     *
+     * @minItems 1
+     */
+    steps: [PlanStep, ...PlanStep[]];
+    /**
+     * A short, non-empty, model-authored free-text summary of the plan's overall size (the mockup's own '6 files · 2 migrations' line, docs/design/mockups.html) -- plain text only, like every other model-authored string here.
+     */
+    scopeEstimate: string;
+  } | null;
+}
+/**
+ * One numbered step of a Plan's own structured document (§12.2 item 3: 'numbered steps with file refs') -- internal/domain/plan.Step's wire shape. Every field is model-authored, attacker-influenceable prose or a repository-relative path string; a client renders all three as plain text only (title/description) or inert text (fileRefs, never a clickable/navigable link built from an unvalidated path), never markup, matching content's own established discipline.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "PlanStep".
+ */
+export interface PlanStep {
+  title: string;
+  description: string;
+  /**
+   * Repository-relative file paths this step touches, as reported by the model -- possibly empty (a step that has not yet named specific files), never null. Not validated against the repository's real tree or resolved to a link server-side: display-only, like FilesChanged elsewhere in this schema.
+   */
+  fileRefs: string[];
 }
 /**
  * GET /api/sessions/:id/plans's own response body (audit finding M3, completeness) -- every plan VERSION for the session, ordered by version, so a web client can render v1->v2 history and find the currently awaiting_approval version's own id to approve/reject. Deliberately minimal: no pagination (a session's own plan history is expected to stay small, matching ArtifactsResponse's own identical 'unbounded' precedent above) and no new WS/event notification on plan creation -- later Steps (decision inbox, plan-mode UI) are already planned to build richer surfaces; this endpoint only closes the discoverability gap.
