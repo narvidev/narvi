@@ -28,7 +28,13 @@
 // in their own checkouts.
 package githarden
 
-import "github.com/narvidev/narvi/internal/sandboxagent/supervisor"
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
+)
 
 // noHooksPath points git at a location that holds no hooks and cannot be
 // made to hold any. /dev/null is not a directory, so every hook lookup
@@ -99,14 +105,53 @@ func hardeningFlags(repoDir string) []string {
 	}
 }
 
-// NOT covered, stated rather than left for the next audit to rediscover:
-// content filters (filter.<name>.clean / .smudge). They are named by the
-// repository's own .gitattributes, so there is no fixed key to neutralise
-// and git offers no flag that disables filters wholesale. A repository
-// that authors both .gitattributes and .git/config can still run a
-// command on checkout. The control for that is the UID boundary (§30.5)
-// and, for the credential specifically, the read-only token (§30.4) --
-// not this file. Do not read the list above as a complete perimeter.
+// Content filters (filter.<driver>.clean / .smudge) were deliberately left
+// off the list above, and NOT because they are safe -- the reason is
+// worth recording precisely, because the audit that reopened this found
+// the first-pass answer wrong.
+//
+// Unlike every key above, a filter's driver name is chosen by the
+// repository's own .gitattributes ("<path> filter=<anything>"), so there
+// is no fixed "filter.X.clean" key a -c entry could reset once and cover
+// every case: "-c filter.*.clean=" is not a wildcard to git, it names a
+// literal, useless config section called "*". git itself documents no
+// flag that disables the filter mechanism wholesale (gitattributes(5)).
+//
+// The tempting first-pass answer -- "the UID boundary (§30.5) already
+// covers this, since a repository-authored command either runs as the
+// runtime already, or never runs at all" -- does not survive contact
+// with what §30.5 actually grants. The runtime owns .git BECAUSE of that
+// boundary, which makes writing filter.<anything>.smudge into
+// .git/config, and a matching filter=<anything> into .gitattributes, an
+// ORDINARY, unprivileged act for it -- not a violation of the boundary.
+// The violation is what happens next: sandbox-agent's OWN later git
+// invocations against that SAME repository -- internal/sandboxagent/
+// gitclone's SyncAll reconciling an already-existing workspace exactly
+// like a repo_image/snapshot_restore boot presents one, and its
+// CleanForImageBuild running `checkout -- .` at image-bake time -- read
+// that config back and would run the planted command AS SANDBOX-AGENT.
+// Same shape as the pre-push-hook exploit this file's own top comment
+// documents, one call removed; verified the same way, not assumed (see
+// githarden_test.go and internal/sandboxagent/gitclone's own tests).
+//
+// NeutralizeFilters (below) closes it. Not a -c entry -- none exists for
+// an unbounded driver-name space -- but a write to $GIT_DIR/info/
+// attributes, gitattributes(5)'s own highest-precedence attributes
+// source, unsetting the `filter` attribute for every path so no driver
+// name is ever looked up at all. internal/sandboxagent/gitclone's runGit
+// calls it before every spawn, for the same "one function, not eight call
+// sites" reason hardeningFlags itself exists.
+//
+// The trade-off, decided here rather than left to be discovered by a
+// user with a checkout full of pointer files: git-lfs is itself
+// implemented as exactly this kind of content filter. Today that trade
+// is free -- deploy/sandbox-image/Dockerfile installs `git`, never
+// `git-lfs`, so no repository's LFS content is materialized by
+// sandbox-agent's own clone/sync regardless of this file; a repository
+// using LFS already gets pointer files, not real blobs, from
+// sandbox-agent's own checkout. If git-lfs is ever added to the image,
+// this blanket unset would need a deliberate, named exception for the
+// literal driver name "lfs" -- not a silent regression discovered later.
 
 // Args returns git's own arguments for a command operating on repoDir,
 // with the hardening ahead of whatever the caller wants to run.
@@ -148,4 +193,56 @@ func Harden(args []string) []string {
 		}
 	}
 	return args
+}
+
+// filterAttributesOverride is written into $GIT_DIR/info/attributes.
+// gitattributes(5): "the highest precedence" attributes source, ahead of
+// even the repository's own tracked .gitattributes. "-filter" UNSETS the
+// `filter` attribute (gitattributes(5)'s own dash-prefix syntax) for
+// every path ("*"), regardless of what any lower-precedence
+// .gitattributes assigns -- so no path is ever treated as having a
+// filter driver at all, under any name. gitattributes(5) also documents
+// what happens next: "a missing filter driver definition... is not an
+// error but makes the filter a no-op passthru" -- checkout still
+// succeeds, with the blob's real, unconverted content.
+const filterAttributesOverride = "* -filter\n"
+
+// NeutralizeFilters closes the one class hardeningFlags' own -c entries
+// cannot reach -- see the comment above hardeningFlags for why a content
+// filter's unbounded, repository-chosen driver name rules out a -c
+// entry, and why "the UID boundary already covers this" is not actually
+// true. Call it once for repoDir before any git command that can
+// populate a working tree (checkout, stash pop, or an internal one
+// either performs, such as switching branches) -- internal/sandboxagent/
+// gitclone's runGit does this for every hardened invocation it makes, so
+// callers routed through it never have to remember this themselves.
+//
+// Deliberately NOT one of hardeningFlags' -c entries: this is a file
+// write, not a command-line flag, and unlike that list it must be
+// RE-ASSERTED before every call that can populate a working tree,
+// because the agent runtime owns .git (§30.5) and can overwrite this
+// file between calls exactly as freely as it can write a filter driver
+// into .git/config in the first place. A single write at clone time
+// would not survive a single runtime turn.
+//
+// repoDir's .git/info directory is created if it does not already exist
+// (a fresh clone has no reason to have written to it yet). A write
+// failure is returned, never swallowed: silently proceeding without this
+// in place is the exact "quiet" failure direction this package exists to
+// close, not a recoverable degradation.
+//
+// Verified against real git, not assumed: githarden_test.go arms a
+// filter.<driver>.smudge that writes a marker file, and shows it does
+// NOT run once this has been called against the same repoDir, and DOES
+// run when it has not.
+func NeutralizeFilters(repoDir string) error {
+	infoDir := filepath.Join(repoDir, ".git", "info")
+	if err := os.MkdirAll(infoDir, 0o755); err != nil {
+		return fmt.Errorf("githarden: create %s: %w", infoDir, err)
+	}
+	path := filepath.Join(infoDir, "attributes")
+	if err := os.WriteFile(path, []byte(filterAttributesOverride), 0o644); err != nil {
+		return fmt.Errorf("githarden: write %s: %w", path, err)
+	}
+	return nil
 }

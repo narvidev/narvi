@@ -1,6 +1,9 @@
 package githarden
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -161,5 +164,151 @@ func TestArgs_CredentialHelperResetPrecedesTheCallersOwn(t *testing.T) {
 	}
 	if resetAt > oursAt {
 		t.Errorf("the reset is at %d and the caller's helper at %d: the reset must come FIRST, or it discards Narvi's own helper and leaves the repository's", resetAt, oursAt)
+	}
+}
+
+// runGitCmd runs a real git subprocess in dir, failing the test
+// immediately on any error -- these tests spawn real git, never a mock of
+// one, matching internal/sandboxagent/gitclone's own house style
+// (clone_test.go's identically-named helper) for exactly the same reason:
+// a hardening claim about real git behavior is only checkable against
+// real git.
+func runGitCmd(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s (dir=%s) failed: %v\n%s", strings.Join(args, " "), dir, err, out)
+	}
+}
+
+// writeScript writes an executable shell script at path -- mirroring
+// internal/sandboxagent/boot's own hooks_test.go helper of the same
+// shape, reused here rather than an inline "sh -c '...'" config value so
+// the armed filter command never has to worry about shell-quoting a
+// temp-dir path.
+func writeScript(t *testing.T, path, body string) {
+	t.Helper()
+	content := "#!/bin/sh\n" + body + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		t.Fatalf("write script %s: %v", path, err)
+	}
+}
+
+// TestNeutralizeFilters_ArmedSmudgeFilter is a mutation-verify
+// demonstration, run against a REAL git binary, not asserted from
+// documentation: it arms a filter.<driver>.smudge exactly the way an
+// attacker with write access to .git/config would -- which, per
+// hardeningFlags' own doc comment on why this class is reachable, is
+// precisely what the agent runtime has after §30.5's own chown, with no
+// privilege escalation of its own required -- then runs the real,
+// hardened `git checkout` this package exists to produce, and shows the
+// armed command did NOT run once NeutralizeFilters had been called for
+// the same repoDir, and DID run when it had not. Both directions are
+// pinned permanently, in the same table, so neither can silently regress
+// without the other one continuing to pass right alongside it.
+func TestNeutralizeFilters_ArmedSmudgeFilter(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		neutralize bool
+		wantRan    bool
+	}{
+		{name: "not neutralized: the armed filter runs", neutralize: false, wantRan: true},
+		{name: "neutralized: the armed filter does not run", neutralize: true, wantRan: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repoDir := t.TempDir()
+			marker := filepath.Join(t.TempDir(), "smudge-ran")
+
+			// Two commits with genuinely DIFFERENT content for the
+			// filtered path, on two different branches, so the checkout
+			// below MUST rewrite secret.bin from its blob -- never a
+			// same-content no-op real git could otherwise satisfy without
+			// ever invoking smudge at all.
+			runGitCmd(t, repoDir, "init", "-b", "main")
+			runGitCmd(t, repoDir, "config", "user.email", "test@example.com")
+			runGitCmd(t, repoDir, "config", "user.name", "Test")
+			if err := os.WriteFile(filepath.Join(repoDir, ".gitattributes"), []byte("secret.bin filter=evil\n"), 0o644); err != nil {
+				t.Fatalf("write .gitattributes: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(repoDir, "secret.bin"), []byte("v1\n"), 0o644); err != nil {
+				t.Fatalf("write secret.bin: %v", err)
+			}
+			runGitCmd(t, repoDir, "add", ".")
+			runGitCmd(t, repoDir, "commit", "-m", "v1")
+			runGitCmd(t, repoDir, "checkout", "-b", "other")
+			if err := os.WriteFile(filepath.Join(repoDir, "secret.bin"), []byte("v2\n"), 0o644); err != nil {
+				t.Fatalf("write secret.bin v2: %v", err)
+			}
+			runGitCmd(t, repoDir, "commit", "-am", "v2")
+			runGitCmd(t, repoDir, "checkout", "main")
+
+			// Arm the filter: a script that proves it ran (touches marker)
+			// and then behaves like a normal smudge filter (passes its
+			// input through unchanged), configured DIRECTLY into
+			// .git/config -- exactly what the agent runtime, owning this
+			// repository under §30.5, can do with no elevated access of
+			// its own.
+			smudgeScript := filepath.Join(t.TempDir(), "smudge.sh")
+			writeScript(t, smudgeScript, "touch '"+marker+"'\ncat")
+			runGitCmd(t, repoDir, "config", "filter.evil.smudge", smudgeScript)
+
+			if tc.neutralize {
+				if err := NeutralizeFilters(repoDir); err != nil {
+					t.Fatalf("NeutralizeFilters(%s) = %v, want nil", repoDir, err)
+				}
+			}
+
+			// The real, hardened invocation this whole package exists to
+			// produce -- exactly the shape internal/sandboxagent/gitclone's
+			// runGit spawns.
+			args := Args(repoDir, "checkout", "other", "--")
+			cmd := exec.Command("git", args...)
+			cmd.Dir = repoDir
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+			}
+
+			_, statErr := os.Stat(marker)
+			gotRan := statErr == nil
+			if gotRan != tc.wantRan {
+				t.Errorf("armed filter.evil.smudge ran = %v, want %v", gotRan, tc.wantRan)
+			}
+
+			data, err := os.ReadFile(filepath.Join(repoDir, "secret.bin"))
+			if err != nil {
+				t.Fatalf("read secret.bin after checkout: %v", err)
+			}
+			if string(data) != "v2\n" {
+				t.Errorf("secret.bin content = %q, want %q -- checkout must still produce the real blob content whether or not the filter ran", data, "v2\n")
+			}
+		})
+	}
+}
+
+// TestNeutralizeFilters_CreatesInfoDirectoryIfAbsent covers the one
+// filesystem precondition NeutralizeFilters' own doc comment asserts
+// without a test otherwise pinning it: a freshly-initialized repository
+// has $GIT_DIR/info at all (git itself creates it), but this must not
+// assume that -- a repoDir handed to it by a caller that never ran a real
+// `git init`/`clone` (a hand-built test fixture, for instance) should
+// still succeed.
+func TestNeutralizeFilters_CreatesInfoDirectoryIfAbsent(t *testing.T) {
+	repoDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repoDir, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll .git: %v", err)
+	}
+
+	if err := NeutralizeFilters(repoDir); err != nil {
+		t.Fatalf("NeutralizeFilters(%s) = %v, want nil", repoDir, err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(repoDir, ".git", "info", "attributes"))
+	if err != nil {
+		t.Fatalf("read .git/info/attributes: %v", err)
+	}
+	if string(got) != filterAttributesOverride {
+		t.Errorf(".git/info/attributes = %q, want %q", got, filterAttributesOverride)
 	}
 }

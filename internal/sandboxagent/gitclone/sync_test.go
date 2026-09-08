@@ -2039,3 +2039,146 @@ func TestSyncAll_RelaysGitFetchAndCheckoutTiming(t *testing.T) {
 		t.Errorf("checkoutCalls[0].seconds = %v, want >= 0", checkoutCalls[0].seconds)
 	}
 }
+
+// writeMarkerScript writes an executable shell script at path that
+// touches marker and then behaves like a normal git filter (passes its
+// stdin through unchanged) -- reused by both integration tests below so
+// an armed filter.<driver>.smudge/clean never has to shell-quote a
+// temp-dir path.
+func writeMarkerScript(t *testing.T, path, marker string) {
+	t.Helper()
+	content := "#!/bin/sh\ntouch '" + marker + "'\ncat\n"
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		t.Fatalf("write script %s: %v", path, err)
+	}
+}
+
+// TestSyncAll_ArmedContentFilterInExistingWorkspace_DoesNotExecute is the
+// end-to-end proof that the REAL production wiring -- gitclone.SyncAll,
+// not just githarden.NeutralizeFilters in isolation -- blocks the class
+// githarden's own doc comment names: a content filter
+// armed directly in .git/config, exactly as the agent runtime could have
+// left it in an ALREADY-EXISTING workspace (this file's own package
+// comment: SyncAll reconciles a workspace exactly like a
+// BootModeRepoImage/BootModeSnapshotRestore boot would find one baked
+// into an image or restored from a snapshot -- never a fresh clone, so a
+// prior turn's own config write is exactly what SyncAll must contend
+// with). The session's target branch differs from what is checked out,
+// with genuinely different content for the filtered path, so the
+// checkout below MUST rewrite it from its blob -- never a same-content
+// no-op that could satisfy the test without ever invoking smudge.
+func TestSyncAll_ArmedContentFilterInExistingWorkspace_DoesNotExecute(t *testing.T) {
+	t.Parallel()
+
+	workspaceDir := t.TempDir()
+	repoDir := filepath.Join(workspaceDir, "repo1")
+	initRepo(t, repoDir) // main, README.md = "hello\n"
+
+	if err := os.WriteFile(filepath.Join(repoDir, ".gitattributes"), []byte("secret.bin filter=evil\n"), 0o644); err != nil {
+		t.Fatalf("write .gitattributes: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "secret.bin"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatalf("write secret.bin: %v", err)
+	}
+	runGit(t, repoDir, "add", ".")
+	runGit(t, repoDir, "commit", "-m", "add filtered file")
+
+	targetBranch := "other"
+	runGit(t, repoDir, "checkout", "-b", targetBranch)
+	if err := os.WriteFile(filepath.Join(repoDir, "secret.bin"), []byte("v2\n"), 0o644); err != nil {
+		t.Fatalf("write secret.bin v2: %v", err)
+	}
+	runGit(t, repoDir, "commit", "-am", "secret.bin v2")
+	runGit(t, repoDir, "checkout", "main") // back to v1, matching a workspace the session did not just create
+
+	// Arm the filter directly in .git/config -- what a prior turn's agent
+	// runtime, owning this repository under §30.5, could have left behind
+	// with no elevated access of its own.
+	marker := filepath.Join(t.TempDir(), "smudge-ran")
+	smudgeScript := filepath.Join(t.TempDir(), "smudge.sh")
+	writeMarkerScript(t, smudgeScript, marker)
+	runGit(t, repoDir, "config", "filter.evil.smudge", smudgeScript)
+
+	repos := []sessionconfig.SessionConfigReposElem{
+		{Name: "repo1", Url: "https://example.invalid/repo1.git", Branch: &targetBranch},
+	}
+
+	sup := supervisor.New()
+	results, err := gitclone.SyncAll(context.Background(), sup, workspaceDir, repos, nil, "session-armed-filter",
+		testFetchStepTimeout, testSyncStepTimeout, testStopGrace, func(string, string, string) {}, noopGitFetchTiming, noopGitCheckoutTiming)
+	if err != nil {
+		t.Fatalf("SyncAll() error = %v, want nil", err)
+	}
+	if results[0].Err != nil {
+		t.Fatalf("results[0].Err = %v, want nil", results[0].Err)
+	}
+	if head := currentBranch(t, repoDir); head != targetBranch {
+		t.Errorf("checked-out branch = %q, want %q", head, targetBranch)
+	}
+
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Error("armed filter.evil.smudge RAN during SyncAll's own checkout -- NeutralizeFilters was not applied where it needed to be")
+	}
+
+	data, err := os.ReadFile(filepath.Join(repoDir, "secret.bin"))
+	if err != nil {
+		t.Fatalf("read secret.bin after sync: %v", err)
+	}
+	if string(data) != "v2\n" {
+		t.Errorf("secret.bin content = %q, want %q -- checkout must still produce the real blob content", data, "v2\n")
+	}
+}
+
+// TestCleanForImageBuild_ArmedContentFilter_DoesNotExecute is
+// TestSyncAll_ArmedContentFilterInExistingWorkspace_DoesNotExecute's own
+// counterpart for CleanForImageBuild's `checkout -- .` step (discarding a
+// dirty tracked modification before an image-bake snapshot) -- the OTHER
+// call site in this package that can populate a working tree from a
+// .git/config the agent runtime had a full session to write into first.
+func TestCleanForImageBuild_ArmedContentFilter_DoesNotExecute(t *testing.T) {
+	t.Parallel()
+
+	workspaceDir := t.TempDir()
+	repoDir := filepath.Join(workspaceDir, "repo1")
+	initRepo(t, repoDir) // README.md = "hello\n", committed
+
+	if err := os.WriteFile(filepath.Join(repoDir, ".gitattributes"), []byte("secret.bin filter=evil\n"), 0o644); err != nil {
+		t.Fatalf("write .gitattributes: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "secret.bin"), []byte("committed\n"), 0o644); err != nil {
+		t.Fatalf("write secret.bin: %v", err)
+	}
+	runGit(t, repoDir, "add", ".")
+	runGit(t, repoDir, "commit", "-m", "add filtered file")
+
+	// Dirty the tracked, filtered file -- what CleanForImageBuild's own
+	// `checkout -- .` must discard, forcing a real rewrite from the
+	// committed blob (never a same-content no-op).
+	if err := os.WriteFile(filepath.Join(repoDir, "secret.bin"), []byte("uncommitted residue\n"), 0o644); err != nil {
+		t.Fatalf("write dirty secret.bin: %v", err)
+	}
+
+	marker := filepath.Join(t.TempDir(), "smudge-ran")
+	smudgeScript := filepath.Join(t.TempDir(), "smudge.sh")
+	writeMarkerScript(t, smudgeScript, marker)
+	runGit(t, repoDir, "config", "filter.evil.smudge", smudgeScript)
+
+	sup := supervisor.New()
+	credentialCacheDir := filepath.Join(t.TempDir(), "credentials")
+	if err := gitclone.CleanForImageBuild(context.Background(), sup, workspaceDir, []string{"repo1"}, credentialCacheDir,
+		testSyncStepTimeout, testStopGrace); err != nil {
+		t.Fatalf("CleanForImageBuild() error = %v, want nil", err)
+	}
+
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Error("armed filter.evil.smudge RAN during CleanForImageBuild's own checkout -- NeutralizeFilters was not applied where it needed to be")
+	}
+
+	data, err := os.ReadFile(filepath.Join(repoDir, "secret.bin"))
+	if err != nil {
+		t.Fatalf("read secret.bin after clean: %v", err)
+	}
+	if string(data) != "committed\n" {
+		t.Errorf("secret.bin content = %q, want %q -- the committed content restored", data, "committed\n")
+	}
+}

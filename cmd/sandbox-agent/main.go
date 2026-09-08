@@ -493,6 +493,15 @@ func (h *commandHandler) HandlePush(_ context.Context, cmd sandboxws.Push) {
 // closes for clone, applied here for push's own two call-site-specific
 // fields (remote, in addition to name/branch). See reposource's own
 // package doc comment for the full reasoning.
+//
+// Neither this function's own `git push` nor headSHA's `git rev-parse
+// HEAD` below is preceded by githarden.NeutralizeFilters, unlike
+// internal/sandboxagent/gitclone's runGit/applySparseCheckout/
+// disableSparseCheckoutIfEnabled: neither populates a working tree from a
+// blob (push transfers already-committed objects verbatim; rev-parse
+// only reads a ref), so neither can ever invoke a clean/smudge filter
+// regardless of what .git/config says. See githarden.NeutralizeFilters'
+// own doc comment for what DOES need it.
 func (h *commandHandler) pushOneRepo(repoSpec sandboxws.PushReposElem) (string, error) {
 	if err := reposource.ValidateRepoName(repoSpec.Name); err != nil {
 		return "", fmt.Errorf("invalid repo name: %w", err)
