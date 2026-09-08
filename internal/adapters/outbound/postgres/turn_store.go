@@ -116,3 +116,18 @@ func (s *TurnStore) RecordStepCostUSD(ctx context.Context, sessionID pgtype.UUID
 		CostUsd:   Float64ToNumeric(&amountUSD),
 	})
 }
+
+// GetPlatformCostSummaryInWindow returns sinceTime's own platform-wide
+// cost summary (total + median-per-session, sample size) -- §12.2 item
+// 6's own "Cost" KPI tile. See GetPlatformCostSummaryInWindow's own generated
+// doc comment (sqlcgen/turns.sql.go, sourced from queries/turns.sql) for
+// the full definition.
+func (s *TurnStore) GetPlatformCostSummaryInWindow(ctx context.Context, sinceTime pgtype.Timestamptz) (sqlcgen.GetPlatformCostSummaryInWindowRow, error) {
+	return s.q.GetPlatformCostSummaryInWindow(ctx, sinceTime)
+}
+
+// ListCostByModelInWindow returns sinceTime's own per-model cost
+// breakdown, spend descending -- §12.2 item 6's own "cost by model" chart.
+func (s *TurnStore) ListCostByModelInWindow(ctx context.Context, sinceTime pgtype.Timestamptz) ([]sqlcgen.ListCostByModelInWindowRow, error) {
+	return s.q.ListCostByModelInWindow(ctx, sinceTime)
+}

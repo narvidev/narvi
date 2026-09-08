@@ -102,3 +102,14 @@ func (s *SessionStore) ListFailed(ctx context.Context, limit int32) ([]sqlcgen.S
 func (s *SessionStore) List(ctx context.Context, arg sqlcgen.ListSessionsParams) ([]sqlcgen.ListSessionsRow, error) {
 	return s.q.ListSessions(ctx, arg)
 }
+
+// ListOutcomeCountsInWindow returns sinceTime's own (day, status,
+// failure_reason) -> count breakdown -- the ONE Postgres read behind
+// every session-derived rollup §12.2 item 6's platform-wide analytics view
+// needs (internal/domain/platformanalytics). See
+// ListSessionOutcomeCountsInWindow's own generated doc comment
+// (sqlcgen/sessions.sql.go, sourced from queries/sessions.sql) for the
+// full "why aggregate in SQL, not a bounded row fetch" reasoning.
+func (s *SessionStore) ListOutcomeCountsInWindow(ctx context.Context, sinceTime pgtype.Timestamptz) ([]sqlcgen.ListSessionOutcomeCountsInWindowRow, error) {
+	return s.q.ListSessionOutcomeCountsInWindow(ctx, sinceTime)
+}

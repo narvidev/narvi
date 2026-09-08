@@ -5089,6 +5089,428 @@ func (j *Plan) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// GET /api/analytics response body (§12.2 item 6): the platform-wide analytics
+// rollup ReviewAnalytics above deliberately does NOT cover (that endpoint is
+// repo-scoped). windowDays names the rollup's own bounded window explicitly
+// (platform.Timeouts.PlatformAnalyticsWindow) rather than a client-side hardcoded
+// '30 days', mirroring RepoDigestScope.lookbackDays' own identical 'state the
+// window honestly, from the server' precedent. sessionsTotal and falseFailureCount
+// are a plain COUNT, a meaningful answer even at zero -- but that is only true of
+// a count this deployment actually MANAGED to compute, so both carry their own
+// computed sentinel too (sessionsTotalComputed/falseFailureCountComputed), false
+// iff that rollup's own fetch failed, never false merely because the count itself
+// is zero (internal/domain/platformanalytics's own doc comment explains the
+// distinction). Every field on this DTO carries its OWN independent
+// computed-or-not boolean, the SAME 'a repo with a real 0% and a repo with no data
+// yet must never render identically' discipline ReviewAnalytics already
+// establishes one level up -- see internal/app/platformanalytics for the full read
+// model. Gated by the SAME authz.ActionViewAnalytics (§13.3 row 1) -- every role,
+// including viewer.
+type PlatformAnalytics struct {
+	// False when bootP95SampleSize is below the minimum sample count a
+	// 95th-percentile estimate is considered trustworthy over
+	// (platformanalytics.BootP95MinSamples, 20) -- INCLUDING when it is exactly 0 (no
+	// boot_timing data at all). bootP95Seconds is only meaningful when this is true.
+	BootP95Computed bool `json:"bootP95Computed" yaml:"bootP95Computed" mapstructure:"bootP95Computed"`
+
+	// How many successful boot-duration samples were recorded within the window,
+	// always populated regardless of bootP95Computed -- lets a caller distinguish 'no
+	// data yet' (0) from 'too few samples so far' (nonzero but below the minimum),
+	// rather than collapsing both into one indistinguishable 'not available' state.
+	BootP95SampleSize int `json:"bootP95SampleSize" yaml:"bootP95SampleSize" mapstructure:"bootP95SampleSize"`
+
+	// The 95th percentile of every successful boot-to-ready duration recorded within
+	// the window (a failed boot attempt's own elapsed time is excluded -- it does not
+	// represent normal boot latency). Null iff bootP95Computed is false.
+	BootP95Seconds PlatformAnalyticsBootP95Seconds `json:"bootP95Seconds" yaml:"bootP95Seconds" mapstructure:"bootP95Seconds"`
+
+	// Every model this deployment dispatched a costed turn to within the window,
+	// spend descending. A turn whose own model_id was never recorded buckets under
+	// the literal string 'unknown' rather than being silently dropped, so these
+	// entries always sum to exactly costTotalUsd. Null iff costByModelComputed is
+	// false.
+	CostByModel *PlatformAnalyticsCostByModel `json:"costByModel" yaml:"costByModel" mapstructure:"costByModel"`
+
+	// False iff costComputed is false (the same underlying 'has any cost data
+	// arrived' fact) -- costByModel is then empty/null.
+	CostByModelComputed bool `json:"costByModelComputed" yaml:"costByModelComputed" mapstructure:"costByModelComputed"`
+
+	// False iff no turn anywhere in the window ever recorded a cost figure
+	// (turns.cost_usd IS NULL for all of them) --
+	// costTotalUsd/costMedianPerSessionUsd are only meaningful when this is true.
+	CostComputed bool `json:"costComputed" yaml:"costComputed" mapstructure:"costComputed"`
+
+	// The median of each SESSION's own total cost (summed across that session's
+	// turns) within the window -- the session is the unit, matching the tile's own
+	// 'median per session' label; a per-turn median would silently answer a different
+	// question. Null iff costComputed is false.
+	CostMedianPerSessionUsd PlatformAnalyticsCostMedianPerSessionUsd `json:"costMedianPerSessionUsd" yaml:"costMedianPerSessionUsd" mapstructure:"costMedianPerSessionUsd"`
+
+	// How many distinct sessions had at least one costed turn in the window -- the
+	// sample size behind both costTotalUsd and costMedianPerSessionUsd, always
+	// populated (0 when costComputed is false).
+	CostSampleSize int `json:"costSampleSize" yaml:"costSampleSize" mapstructure:"costSampleSize"`
+
+	// The straight sum of every costed turn's own cost_usd within the window. Null
+	// iff costComputed is false.
+	CostTotalUsd PlatformAnalyticsCostTotalUsd `json:"costTotalUsd" yaml:"costTotalUsd" mapstructure:"costTotalUsd"`
+
+	// How many 'watchdog kill later proven alive' incidents (a session the control
+	// plane terminalized Failed/timeout that a late, genuine execution_complete then
+	// proved had actually succeeded) were detected within the window -- target 0. A
+	// meaningful count even at zero -- an incident either happened or it did not --
+	// PROVIDED falseFailureCountComputed is true; 0 while it is false means the count
+	// was never fetched, not that the target was met.
+	FalseFailureCount int `json:"falseFailureCount" yaml:"falseFailureCount" mapstructure:"falseFailureCount"`
+
+	// False iff the false-failures COUNT query itself failed -- falseFailureCount
+	// then stays 0, its own zero value, but that 0 is NOT a claim that the target was
+	// met; it is 'unknown'. Never false merely because the real count itself is zero
+	// (a deployment that has genuinely never produced one renders exactly the same as
+	// any other computed value).
+	FalseFailureCountComputed bool `json:"falseFailureCountComputed" yaml:"falseFailureCountComputed" mapstructure:"falseFailureCountComputed"`
+
+	// One entry per UTC calendar day that had at least one session created within the
+	// window, oldest first. Null iff sessionsPerDayComputed is false.
+	SessionsPerDay *PlatformAnalyticsSessionsPerDay `json:"sessionsPerDay" yaml:"sessionsPerDay" mapstructure:"sessionsPerDay"`
+
+	// False iff sessionsTotal's own window contains no session rows at all --
+	// sessionsPerDay is then empty/null. Distinct from a real, computed set of
+	// buckets.
+	SessionsPerDayComputed bool `json:"sessionsPerDayComputed" yaml:"sessionsPerDayComputed" mapstructure:"sessionsPerDayComputed"`
+
+	// Every session row created within the window, regardless of status -- INCLUDING
+	// a session created but never dispatched a single turn (session.StatusCreated). A
+	// meaningful count even at zero -- 0 is a true fact for a brand-new deployment,
+	// never 'unknown' -- PROVIDED sessionsTotalComputed is true; 0 while it is false
+	// means the count was never fetched, not that it is zero.
+	SessionsTotal int `json:"sessionsTotal" yaml:"sessionsTotal" mapstructure:"sessionsTotal"`
+
+	// False iff the session-outcome-counts rollup this count is drawn from could not
+	// be fetched -- sessionsTotal then stays 0, its own zero value, but that 0 is NOT
+	// a claim that zero sessions were created; it is 'unknown'. Never false merely
+	// because the real count itself is zero (a brand-new deployment's true 0 renders
+	// exactly the same as any other computed value).
+	// sessionsPerDayComputed/successRateComputed/topFailureReasonsComputed share this
+	// SAME underlying fetch and go false together with this field, since all four are
+	// reductions over the one same read
+	// (internal/app/platformanalytics.SessionOutcomeCountsInWindow's own doc
+	// comment).
+	SessionsTotalComputed bool `json:"sessionsTotalComputed" yaml:"sessionsTotalComputed" mapstructure:"sessionsTotalComputed"`
+
+	// False iff no session in the window has DEFINITIVELY resolved (status completed
+	// or failed) -- a deployment with only Active/Created/Cancelled sessions has no
+	// success rate to report. successRatePercent is only meaningful when this is
+	// true.
+	SuccessRateComputed bool `json:"successRateComputed" yaml:"successRateComputed" mapstructure:"successRateComputed"`
+
+	// completed / (completed + failed), as a 0-100 percentage. Deliberately excludes
+	// cancelled sessions from both the numerator and the denominator (a human
+	// decision, not a system judgment of success or failure) and excludes
+	// active/created sessions (no outcome yet). Null iff successRateComputed is
+	// false.
+	SuccessRatePercent PlatformAnalyticsSuccessRatePercent `json:"successRatePercent" yaml:"successRatePercent" mapstructure:"successRatePercent"`
+
+	// completed + failed -- the denominator behind successRatePercent, always
+	// populated (0 when successRateComputed is false) so a caller can render e.g.
+	// '92% of 20 resolved sessions' rather than a bare percentage.
+	SuccessRateSampleSize int `json:"successRateSampleSize" yaml:"successRateSampleSize" mapstructure:"successRateSampleSize"`
+
+	// Every session.FailureReason that occurred on a Failed or Cancelled session
+	// within the window, count descending then reason ascending. Restricted to the
+	// four typed reasons this deployment's own schema actually persists
+	// (cancelled/failed/timeout/never_started) -- never the more granular, free-text
+	// examples a design mockup might draw, which this deployment's own rows cannot
+	// honestly attribute a session to. Null iff topFailureReasonsComputed is false.
+	TopFailureReasons *PlatformAnalyticsTopFailureReasons `json:"topFailureReasons" yaml:"topFailureReasons" mapstructure:"topFailureReasons"`
+
+	// False iff no session exists in the window at all. A non-null EMPTY
+	// topFailureReasons with this true is itself a real, computed answer (sessions
+	// existed, none failed or were cancelled) -- the boolean, never array emptiness
+	// alone, is what a client must branch on.
+	TopFailureReasonsComputed bool `json:"topFailureReasonsComputed" yaml:"topFailureReasonsComputed" mapstructure:"topFailureReasonsComputed"`
+
+	// The rollup's own bounded window, in whole days
+	// (platform.Timeouts.PlatformAnalyticsWindow) -- every field below is scoped to
+	// sessions/turns/events created within the last windowDays days of the request.
+	WindowDays int `json:"windowDays" yaml:"windowDays" mapstructure:"windowDays"`
+}
+
+// The 95th percentile of every successful boot-to-ready duration recorded within
+// the window (a failed boot attempt's own elapsed time is excluded -- it does not
+// represent normal boot latency). Null iff bootP95Computed is false.
+type PlatformAnalyticsBootP95Seconds *float64
+
+// Every model this deployment dispatched a costed turn to within the window, spend
+// descending. A turn whose own model_id was never recorded buckets under the
+// literal string 'unknown' rather than being silently dropped, so these entries
+// always sum to exactly costTotalUsd. Null iff costByModelComputed is false.
+type PlatformAnalyticsCostByModel []PlatformAnalyticsModelCost
+
+// The median of each SESSION's own total cost (summed across that session's turns)
+// within the window -- the session is the unit, matching the tile's own 'median
+// per session' label; a per-turn median would silently answer a different
+// question. Null iff costComputed is false.
+type PlatformAnalyticsCostMedianPerSessionUsd *float64
+
+// The straight sum of every costed turn's own cost_usd within the window. Null iff
+// costComputed is false.
+type PlatformAnalyticsCostTotalUsd *float64
+
+// One UTC calendar day's own per-status session counts --
+// PlatformAnalytics.sessionsPerDay's own per-day row
+// (internal/domain/platformanalytics.DayBucket). All five session_status values
+// are carried explicitly (unlike ReviewAnalyticsDayBucket's three Shippable
+// counts) so this bucket's own counts always sum to exactly that day's own
+// contribution to sessionsTotal -- a session still Active or merely Created is not
+// invisible here.
+type PlatformAnalyticsDayOutcomeBucket struct {
+	// ActiveCount corresponds to the JSON schema field "activeCount".
+	ActiveCount int `json:"activeCount" yaml:"activeCount" mapstructure:"activeCount"`
+
+	// CancelledCount corresponds to the JSON schema field "cancelledCount".
+	CancelledCount int `json:"cancelledCount" yaml:"cancelledCount" mapstructure:"cancelledCount"`
+
+	// CompletedCount corresponds to the JSON schema field "completedCount".
+	CompletedCount int `json:"completedCount" yaml:"completedCount" mapstructure:"completedCount"`
+
+	// CreatedCount corresponds to the JSON schema field "createdCount".
+	CreatedCount int `json:"createdCount" yaml:"createdCount" mapstructure:"createdCount"`
+
+	// Midnight UTC of this bucket's own calendar day.
+	Day time.Time `json:"day" yaml:"day" mapstructure:"day"`
+
+	// FailedCount corresponds to the JSON schema field "failedCount".
+	FailedCount int `json:"failedCount" yaml:"failedCount" mapstructure:"failedCount"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *PlatformAnalyticsDayOutcomeBucket) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["activeCount"]; raw != nil && !ok {
+		return fmt.Errorf("field activeCount in PlatformAnalyticsDayOutcomeBucket: required")
+	}
+	if _, ok := raw["cancelledCount"]; raw != nil && !ok {
+		return fmt.Errorf("field cancelledCount in PlatformAnalyticsDayOutcomeBucket: required")
+	}
+	if _, ok := raw["completedCount"]; raw != nil && !ok {
+		return fmt.Errorf("field completedCount in PlatformAnalyticsDayOutcomeBucket: required")
+	}
+	if _, ok := raw["createdCount"]; raw != nil && !ok {
+		return fmt.Errorf("field createdCount in PlatformAnalyticsDayOutcomeBucket: required")
+	}
+	if _, ok := raw["day"]; raw != nil && !ok {
+		return fmt.Errorf("field day in PlatformAnalyticsDayOutcomeBucket: required")
+	}
+	if _, ok := raw["failedCount"]; raw != nil && !ok {
+		return fmt.Errorf("field failedCount in PlatformAnalyticsDayOutcomeBucket: required")
+	}
+	type Plain PlatformAnalyticsDayOutcomeBucket
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = PlatformAnalyticsDayOutcomeBucket(plain)
+	return nil
+}
+
+// One session.FailureReason's own occurrence count across the window's
+// Failed/Cancelled sessions -- PlatformAnalytics.topFailureReasons' own per-reason
+// row.
+type PlatformAnalyticsFailureReasonCount struct {
+	// Count corresponds to the JSON schema field "count".
+	Count int `json:"count" yaml:"count" mapstructure:"count"`
+
+	// Reason corresponds to the JSON schema field "reason".
+	Reason PlatformAnalyticsFailureReasonCountReason `json:"reason" yaml:"reason" mapstructure:"reason"`
+}
+
+type PlatformAnalyticsFailureReasonCountReason string
+
+const PlatformAnalyticsFailureReasonCountReasonCancelled PlatformAnalyticsFailureReasonCountReason = "cancelled"
+const PlatformAnalyticsFailureReasonCountReasonFailed PlatformAnalyticsFailureReasonCountReason = "failed"
+const PlatformAnalyticsFailureReasonCountReasonNeverStarted PlatformAnalyticsFailureReasonCountReason = "never_started"
+const PlatformAnalyticsFailureReasonCountReasonTimeout PlatformAnalyticsFailureReasonCountReason = "timeout"
+
+var enumValues_PlatformAnalyticsFailureReasonCountReason = []interface{}{
+	"cancelled",
+	"failed",
+	"timeout",
+	"never_started",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *PlatformAnalyticsFailureReasonCountReason) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_PlatformAnalyticsFailureReasonCountReason {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_PlatformAnalyticsFailureReasonCountReason, v)
+	}
+	*j = PlatformAnalyticsFailureReasonCountReason(v)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *PlatformAnalyticsFailureReasonCount) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["count"]; raw != nil && !ok {
+		return fmt.Errorf("field count in PlatformAnalyticsFailureReasonCount: required")
+	}
+	if _, ok := raw["reason"]; raw != nil && !ok {
+		return fmt.Errorf("field reason in PlatformAnalyticsFailureReasonCount: required")
+	}
+	type Plain PlatformAnalyticsFailureReasonCount
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = PlatformAnalyticsFailureReasonCount(plain)
+	return nil
+}
+
+// One model's own spend across the window -- PlatformAnalytics.costByModel's own
+// per-model row.
+type PlatformAnalyticsModelCost struct {
+	// The dispatched model id (turns.model_id), or the literal 'unknown' for a turn
+	// that never recorded one.
+	ModelId string `json:"modelId" yaml:"modelId" mapstructure:"modelId"`
+
+	// TotalUsd corresponds to the JSON schema field "totalUsd".
+	TotalUsd float64 `json:"totalUsd" yaml:"totalUsd" mapstructure:"totalUsd"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *PlatformAnalyticsModelCost) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["modelId"]; raw != nil && !ok {
+		return fmt.Errorf("field modelId in PlatformAnalyticsModelCost: required")
+	}
+	if _, ok := raw["totalUsd"]; raw != nil && !ok {
+		return fmt.Errorf("field totalUsd in PlatformAnalyticsModelCost: required")
+	}
+	type Plain PlatformAnalyticsModelCost
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = PlatformAnalyticsModelCost(plain)
+	return nil
+}
+
+// One entry per UTC calendar day that had at least one session created within the
+// window, oldest first. Null iff sessionsPerDayComputed is false.
+type PlatformAnalyticsSessionsPerDay []PlatformAnalyticsDayOutcomeBucket
+
+// completed / (completed + failed), as a 0-100 percentage. Deliberately excludes
+// cancelled sessions from both the numerator and the denominator (a human
+// decision, not a system judgment of success or failure) and excludes
+// active/created sessions (no outcome yet). Null iff successRateComputed is false.
+type PlatformAnalyticsSuccessRatePercent *float64
+
+// Every session.FailureReason that occurred on a Failed or Cancelled session
+// within the window, count descending then reason ascending. Restricted to the
+// four typed reasons this deployment's own schema actually persists
+// (cancelled/failed/timeout/never_started) -- never the more granular, free-text
+// examples a design mockup might draw, which this deployment's own rows cannot
+// honestly attribute a session to. Null iff topFailureReasonsComputed is false.
+type PlatformAnalyticsTopFailureReasons []PlatformAnalyticsFailureReasonCount
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *PlatformAnalytics) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["bootP95Computed"]; raw != nil && !ok {
+		return fmt.Errorf("field bootP95Computed in PlatformAnalytics: required")
+	}
+	if _, ok := raw["bootP95SampleSize"]; raw != nil && !ok {
+		return fmt.Errorf("field bootP95SampleSize in PlatformAnalytics: required")
+	}
+	if _, ok := raw["bootP95Seconds"]; raw != nil && !ok {
+		return fmt.Errorf("field bootP95Seconds in PlatformAnalytics: required")
+	}
+	if _, ok := raw["costByModel"]; raw != nil && !ok {
+		return fmt.Errorf("field costByModel in PlatformAnalytics: required")
+	}
+	if _, ok := raw["costByModelComputed"]; raw != nil && !ok {
+		return fmt.Errorf("field costByModelComputed in PlatformAnalytics: required")
+	}
+	if _, ok := raw["costComputed"]; raw != nil && !ok {
+		return fmt.Errorf("field costComputed in PlatformAnalytics: required")
+	}
+	if _, ok := raw["costMedianPerSessionUsd"]; raw != nil && !ok {
+		return fmt.Errorf("field costMedianPerSessionUsd in PlatformAnalytics: required")
+	}
+	if _, ok := raw["costSampleSize"]; raw != nil && !ok {
+		return fmt.Errorf("field costSampleSize in PlatformAnalytics: required")
+	}
+	if _, ok := raw["costTotalUsd"]; raw != nil && !ok {
+		return fmt.Errorf("field costTotalUsd in PlatformAnalytics: required")
+	}
+	if _, ok := raw["falseFailureCount"]; raw != nil && !ok {
+		return fmt.Errorf("field falseFailureCount in PlatformAnalytics: required")
+	}
+	if _, ok := raw["falseFailureCountComputed"]; raw != nil && !ok {
+		return fmt.Errorf("field falseFailureCountComputed in PlatformAnalytics: required")
+	}
+	if _, ok := raw["sessionsPerDay"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionsPerDay in PlatformAnalytics: required")
+	}
+	if _, ok := raw["sessionsPerDayComputed"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionsPerDayComputed in PlatformAnalytics: required")
+	}
+	if _, ok := raw["sessionsTotal"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionsTotal in PlatformAnalytics: required")
+	}
+	if _, ok := raw["sessionsTotalComputed"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionsTotalComputed in PlatformAnalytics: required")
+	}
+	if _, ok := raw["successRateComputed"]; raw != nil && !ok {
+		return fmt.Errorf("field successRateComputed in PlatformAnalytics: required")
+	}
+	if _, ok := raw["successRatePercent"]; raw != nil && !ok {
+		return fmt.Errorf("field successRatePercent in PlatformAnalytics: required")
+	}
+	if _, ok := raw["successRateSampleSize"]; raw != nil && !ok {
+		return fmt.Errorf("field successRateSampleSize in PlatformAnalytics: required")
+	}
+	if _, ok := raw["topFailureReasons"]; raw != nil && !ok {
+		return fmt.Errorf("field topFailureReasons in PlatformAnalytics: required")
+	}
+	if _, ok := raw["topFailureReasonsComputed"]; raw != nil && !ok {
+		return fmt.Errorf("field topFailureReasonsComputed in PlatformAnalytics: required")
+	}
+	if _, ok := raw["windowDays"]; raw != nil && !ok {
+		return fmt.Errorf("field windowDays in PlatformAnalytics: required")
+	}
+	type Plain PlatformAnalytics
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = PlatformAnalytics(plain)
+	return nil
+}
+
 // Request body for POST /sessions/:id/turn/epistemic-outcome ('builder epistemic
 // pre-action check', §20.2) -- the devil's-advocate preamble's own reporting tool,
 // mirroring PostWorkflowStepOutcomeRequest/PostReviewVerdictRequest's own

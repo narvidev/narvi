@@ -67,6 +67,7 @@ import type {
   OpenCodeConfig,
   PlanActionResponse,
   PreviewIntentTemplateRequest,
+  PlatformAnalytics,
   PreviewIntentTemplateResponse,
   ProviderCredential,
   PutClusterBindingRequest,
@@ -418,6 +419,11 @@ export function getRepoDigestScope(owner: string, repo: string, signal?: AbortSi
 /** getReviewAnalytics calls GET /api/repos/:owner/:repo/review-analytics -- the review-risk analytics section's own read model (§21.1), each rollup carrying its own independent "not yet computed" sentinel. Every role including viewer. */
 export function getReviewAnalytics(owner: string, repo: string, signal?: AbortSignal): Promise<ReviewAnalytics> {
   return request<ReviewAnalytics>(`/api/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/review-analytics`, { signal })
+}
+
+/** getPlatformAnalytics calls GET /api/analytics -- the platform-wide rollup's own read model (sessions, success rate, false failures, cost, boot p95, and their charts), un-scoped by repo. Every rollup with a real sample-size gate carries its own independent "not yet computed" sentinel, mirroring getReviewAnalytics' identical discipline; sessionsTotal/falseFailureCount never do, since a COUNT is always a real answer. Every role including viewer. */
+export function getPlatformAnalytics(signal?: AbortSignal): Promise<PlatformAnalytics> {
+  return request<PlatformAnalytics>('/api/analytics', { signal })
 }
 
 // -- per-repository settings (§21, §26.7, §26.8, §4.1.2): the per-repo

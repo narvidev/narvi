@@ -142,6 +142,65 @@ func (q *Queries) CreateTurn(ctx context.Context, arg CreateTurnParams) (Turn, e
 	return i, err
 }
 
+const getPlatformCostSummaryInWindow = `-- name: GetPlatformCostSummaryInWindow :one
+WITH per_session AS (
+    SELECT session_id, SUM(cost_usd) AS total
+    FROM turns
+    WHERE cost_usd IS NOT NULL AND created_at >= $1
+    GROUP BY session_id
+)
+SELECT
+    COALESCE(SUM(total), 0)::numeric(14, 6) AS total_cost_usd,
+    COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY total), 0)::float8 AS median_cost_usd_per_session,
+    COUNT(*)::bigint AS costed_session_count
+FROM per_session
+`
+
+type GetPlatformCostSummaryInWindowRow struct {
+	TotalCostUsd            pgtype.Numeric `json:"total_cost_usd"`
+	MedianCostUsdPerSession float64        `json:"median_cost_usd_per_session"`
+	CostedSessionCount      int64          `json:"costed_session_count"`
+}
+
+// §12.2 item 6's own "Cost" KPI tile ("cost + median per
+// session"). total_cost_usd is the straight SUM of every costed turn in
+// the window; median_cost_usd_per_session is percentile_cont(0.5) over
+// each SESSION's own per-session total (the inner query), not over
+// individual turns -- "median per session" names the session as the
+// unit, exactly like the tile label says, and a per-turn median would
+// silently answer a different question (a session with many cheap turns
+// would drag a per-turn median down without changing what any session
+// actually spent). costed_session_count is the sample size behind BOTH
+// figures: 0 means no turn anywhere in the window ever recorded a cost
+// figure (turns.cost_usd IS NULL, "no cost data has arrived yet",
+// migrations/000098's own contract) -- the caller's own "not yet
+// computed" sentinel, distinct from a real, computed $0.00 (which would
+// require at least one costed turn summing to exactly zero -- rare, but
+// a real, honest answer when the sample size is nonzero).
+//
+// percentile_cont returns NULL over zero input rows. COALESCEd to 0
+// rather than left nullable -- unlike total_cost_usd (a real, meaningful
+// 0 either way), a NULL median here is not a distinct RENDERABLE state:
+// the caller gates on costed_session_count alone (0 => "not yet
+// computed") and must NEVER read this column when that count is 0,
+// exactly mirroring GetBootP95InWindow's own identical "gate on the
+// count, the percentile column is meaningless below the gate" contract
+// (queries/events.sql) -- collapsing to a real, non-NULL 0::float8 here
+// (rather than relying on sqlc's own nullability inference for an
+// aggregate expression, which does not reliably mark this NULLable) is
+// what keeps the generated Go field a plain float64 that pgx can always
+// scan into, never a runtime "cannot scan NULL into *float64" for the
+// empty-window case.
+//
+// Bounded by turns_cost_created_at_idx (migrations/
+// 000125_platform_analytics_indexes.up.sql).
+func (q *Queries) GetPlatformCostSummaryInWindow(ctx context.Context, createdAt pgtype.Timestamptz) (GetPlatformCostSummaryInWindowRow, error) {
+	row := q.db.QueryRow(ctx, getPlatformCostSummaryInWindow, createdAt)
+	var i GetPlatformCostSummaryInWindowRow
+	err := row.Scan(&i.TotalCostUsd, &i.MedianCostUsdPerSession, &i.CostedSessionCount)
+	return i, err
+}
+
 const getProcessingTurnForSession = `-- name: GetProcessingTurnForSession :one
 SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id FROM turns
 WHERE session_id = $1 AND status = 'processing'
@@ -221,6 +280,57 @@ func (q *Queries) GetTurn(ctx context.Context, id pgtype.UUID) (Turn, error) {
 		&i.CorrelationID,
 	)
 	return i, err
+}
+
+const listCostByModelInWindow = `-- name: ListCostByModelInWindow :many
+SELECT
+    COALESCE(model_id, 'unknown') AS model_id,
+    SUM(cost_usd)::numeric(14, 6) AS total_cost_usd
+FROM turns
+WHERE cost_usd IS NOT NULL AND created_at >= $1
+GROUP BY COALESCE(model_id, 'unknown')
+ORDER BY total_cost_usd DESC
+`
+
+type ListCostByModelInWindowRow struct {
+	ModelID      string         `json:"model_id"`
+	TotalCostUsd pgtype.Numeric `json:"total_cost_usd"`
+}
+
+// §12.2 item 6's own "cost by model" chart. Grouped in SQL
+// (never a bounded raw-turn fetch, mirroring
+// ListSessionOutcomeCountsInWindow's own identical reasoning,
+// queries/sessions.sql) -- the result set is bounded by the number of
+// distinct models this deployment has ever dispatched, not by turn
+// volume. COALESCE(model_id, 'unknown') buckets a turn whose own
+// model_id was never recorded (every turn created before migration
+// 000018, or a call site that legitimately never set it) into an
+// explicit "unknown" label rather than silently dropping it from the
+// chart -- the bars sum to EXACTLY the "Cost" KPI tile's own
+// total_cost_usd this way, never a smaller, unexplained partial sum.
+// Sorted by spend descending, matching the mockup's own horizontal-bar
+// ordering.
+//
+// Bounded by turns_cost_created_at_idx, the SAME partial index
+// GetPlatformCostSummaryInWindow uses.
+func (q *Queries) ListCostByModelInWindow(ctx context.Context, createdAt pgtype.Timestamptz) ([]ListCostByModelInWindowRow, error) {
+	rows, err := q.db.Query(ctx, listCostByModelInWindow, createdAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListCostByModelInWindowRow
+	for rows.Next() {
+		var i ListCostByModelInWindowRow
+		if err := rows.Scan(&i.ModelID, &i.TotalCostUsd); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listSessionCostTotalsWithRepos = `-- name: ListSessionCostTotalsWithRepos :many

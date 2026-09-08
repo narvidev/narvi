@@ -455,6 +455,16 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 // user's own decision, and a later contradicting "completed" for either
 // would be a wire anomaly (duplicate/corrupted redelivery), not a false
 // failure -- deliberately not counted here.
+//
+// §12.2 item 6's own platform-wide analytics rollup adds a
+// durable sibling to the OTel-only signal this function always recorded:
+// a false_failures row (migrations/000124_false_failures.up.sql),
+// inserted in the SAME transaction as everything else this call
+// participates in. turn_false_failure_total (the OTel counter,
+// recordFalseFailure below) is UNCHANGED -- a live dashboard still reads
+// it exactly as before -- this is a SECOND consumer of the identical
+// fact, queryable by time window and surviving a process restart, which
+// the counter alone never could.
 func (a *Actor) recordFalseFailureIfApplicable(ctx context.Context, tx pgx.Tx) error {
 	sessionRow, err := a.stores.session.WithTx(tx).Get(ctx, a.sessionID)
 	if err != nil {
@@ -465,6 +475,9 @@ func (a *Actor) recordFalseFailureIfApplicable(ctx context.Context, tx pgx.Tx) e
 	}
 	if sessionRow.FailureReason == nil || *sessionRow.FailureReason != sqlcgen.SessionFailureReasonTimeout {
 		return nil
+	}
+	if _, err := a.stores.falseFailure.WithTx(tx).Insert(ctx, a.sessionID); err != nil {
+		return fmt.Errorf("sessionactor: insert false_failures row: %w", err)
 	}
 	a.recordFalseFailure(ctx)
 	return nil

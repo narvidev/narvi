@@ -125,3 +125,12 @@ func (s *EventStore) ListSubTaskFinishesForTurn(ctx context.Context, sessionID p
 func (s *EventStore) MaxEventIDForSession(ctx context.Context, sessionID pgtype.UUID) (int64, error) {
 	return s.q.MaxEventIDForSession(ctx, sessionID)
 }
+
+// GetBootP95InWindow returns sinceTime's own platform-wide boot-duration
+// p95 (successful boots only) plus the sample size behind it -- §12.2
+// item 6's own "Boot p95" KPI tile. See GetBootP95InWindow's own generated
+// doc comment (sqlcgen/events.sql.go, sourced from queries/events.sql)
+// for the full definition.
+func (s *EventStore) GetBootP95InWindow(ctx context.Context, sinceTime pgtype.Timestamptz) (sqlcgen.GetBootP95InWindowRow, error) {
+	return s.q.GetBootP95InWindow(ctx, sinceTime)
+}

@@ -180,6 +180,14 @@ type storeBundle struct {
 	// own identical grouping one step earlier than that handler's own
 	// decrypt call).
 	providerCredential *postgres.ProviderCredentialStore
+
+	// falseFailure is §12.2 item 6's own platform-wide-analytics-rollup
+	// addition -- pushpr.go's own
+	// recordFalseFailureIfApplicable inserts one row here, in the SAME
+	// transaction as the rest of that call, the durable sibling of the
+	// turn_false_failure_total OTel counter it already incremented (see
+	// that function's own doc comment for the full "why").
+	falseFailure *postgres.FalseFailureStore
 }
 
 func newStoreBundle(pool *pgxpool.Pool, platformShadow bool) storeBundle {
@@ -210,6 +218,7 @@ func newStoreBundle(pool *pgxpool.Pool, platformShadow bool) storeBundle {
 		reviewVerdict:        postgres.NewReviewVerdictStore(pool),
 		falsePositivePattern: postgres.NewFalsePositivePatternStore(pool),
 		providerCredential:   postgres.NewProviderCredentialStore(pool),
+		falseFailure:         postgres.NewFalseFailureStore(pool),
 	}
 }
 

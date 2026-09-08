@@ -1344,3 +1344,26 @@ func TestDefaultTimeouts_Step75StandaloneField(t *testing.T) {
 		t.Fatalf("Validate() = %v, want nil (this field must not disturb either invariant chain)", err)
 	}
 }
+
+// TestDefaultTimeouts_Step120StandaloneField proves this Step's own
+// ("analytics: platform-wide rollup", §12.2 item 6) addition --
+// PlatformAnalyticsWindow -- ships with a sensible, non-zero default (the
+// same 30-day figure ReviewVerdictAnalyticsWindow already uses) and does
+// not disturb either invariant chain (it is a standalone field, wired
+// into neither).
+func TestDefaultTimeouts_Step120StandaloneField(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+
+	if to.PlatformAnalyticsWindow <= 0 {
+		t.Errorf("PlatformAnalyticsWindow = %v, want > 0", to.PlatformAnalyticsWindow)
+	}
+	if to.PlatformAnalyticsWindow != 30*24*time.Hour {
+		t.Errorf("PlatformAnalyticsWindow = %v, want %v", to.PlatformAnalyticsWindow, 30*24*time.Hour)
+	}
+
+	if err := to.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil (this field must not disturb either invariant chain)", err)
+	}
+}

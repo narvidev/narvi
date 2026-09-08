@@ -164,3 +164,52 @@ ORDER BY id ASC;
 -- BIGSERIAL id (which starts at 1), so a turn dispatched before any event
 -- exists correctly admits every event that follows it.
 SELECT COALESCE(MAX(id), 0)::bigint AS max_event_id FROM events WHERE session_id = $1;
+
+-- name: GetBootP95InWindow :one
+-- §12.2 item 6's own "Boot p95" KPI tile. Reads the SAME
+-- best-effort "boot_timing" sandbox-ws event (§33.3, contracts/sandbox-ws/
+-- v1/events.schema.json's own BootTiming def) internal/app/sessionactor's
+-- own recordBootTiming (boottiming.go) already relays into the
+-- sandbox_agent_boot_duration_seconds OTel histogram -- this is a
+-- DIFFERENT consumer of the identical already-persisted fact (every
+-- recognized event type is persisted verbatim, unconditionally,
+-- appendRawEvent's own "persist ALWAYS" contract), not a second
+-- measurement.
+--
+-- metric = 'boot_duration' selects the ONE of the four boot_timing
+-- metrics that measures a whole boot-to-ready sequence (the other three
+-- -- hook_rerun/git_fetch/git_checkout -- are sub-phases, not what "Boot
+-- p95" names). failed IS NULL OR failed = 'false' excludes a boot attempt
+-- that measured a duration but did not actually succeed -- "p95 boot
+-- latency" answers "how long does a boot normally take", which a failed
+-- attempt's own elapsed time (however long the sandbox spent failing to
+-- boot) does not honestly represent; a failed-boot rate is a separate,
+-- NOT-yet-built concern this tile does not conflate itself with.
+--
+-- p95_seconds is percentile_cont(0.95) over every admitted sample's own
+-- (payload->>'seconds')::float8, COALESCEd to 0 rather than left NULL --
+-- mirrors GetPlatformCostSummaryInWindow's own identical
+-- median_cost_usd_per_session treatment (queries/turns.sql) and for the
+-- same reason: the caller gates on sample_size alone and must never read
+-- this column when the gate fails, so collapsing NULL to a real,
+-- always-scannable 0::float8 here avoids depending on sqlc's own
+-- nullability inference for an aggregate expression (which does not
+-- reliably mark this NULLable) and the runtime "cannot scan NULL into
+-- *float64" it would otherwise risk for the empty/too-few-samples case.
+-- sample_size is additionally the input to a SECOND gate the caller
+-- applies on top of "zero samples" -- a real but small sample count
+-- (fewer than platformanalytics.MinBootP95Samples) still renders "too
+-- few samples", because a percentile computed over a handful of points
+-- is not a percentile anyone should trust, even though Postgres will
+-- always compute SOME number for it.
+--
+-- Bounded by events_boot_timing_created_at_idx (migrations/
+-- 000125_platform_analytics_indexes.up.sql).
+SELECT
+    COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY (payload->>'seconds')::float8), 0)::float8 AS p95_seconds,
+    COUNT(*)::bigint AS sample_size
+FROM events
+WHERE type = 'boot_timing'
+  AND payload->>'metric' = 'boot_duration'
+  AND created_at >= $1
+  AND (payload->>'failed' IS NULL OR payload->>'failed' = 'false');

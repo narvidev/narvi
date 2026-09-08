@@ -2567,6 +2567,24 @@ type Timeouts struct {
 	// for a real hybrid lexical+embeddings retrieval call, short enough
 	// that a cooperative ranker degrades to the gate's own order promptly.
 	KnowledgeRankerTimeout time.Duration
+
+	// -- §12.2 item 6 ("analytics: platform-wide rollup") --
+
+	// PlatformAnalyticsWindow bounds every platform-wide
+	// analytics rollup (sessions-per-day, success rate, top failure
+	// reasons, cost by model, boot p95) -- the SAME "explicit active/
+	// recent window, never an unbounded scan" discipline
+	// ReviewVerdictAnalyticsWindow already applies one section up in the
+	// technical plan (§21.1), at the SAME 30-day figure ("a month of
+	// history is long enough for a stable rollup, bounded"). A DISTINCT
+	// field from ReviewVerdictAnalyticsWindow rather than a shared one,
+	// even though the two values coincide today: one bounds a repo-scoped
+	// review-verdict read model, this one bounds a platform-wide
+	// session/turn/event read model over entirely different tables --
+	// mirrors DigestChannelDiscoveryLookback's own identical
+	// "conceptually separate axis, numerically the same 30 days" relationship
+	// to ReviewVerdictAnalyticsWindow.
+	PlatformAnalyticsWindow time.Duration
 }
 
 // DefaultTimeouts returns the shipped defaults for every field, each
@@ -2789,6 +2807,8 @@ func DefaultTimeouts() Timeouts {
 		LicenseNotBeforeSkew: 5 * time.Minute, // design note section 1.5, explicit ("default 5 minutes")
 
 		KnowledgeRankerTimeout: 10 * time.Second, // design note section 2.2; not specified numerically, chosen -- see field doc comment
+
+		PlatformAnalyticsWindow: 30 * 24 * time.Hour, // §12.2 item 6; not specified, mirrors ReviewVerdictAnalyticsWindow's own identical "a month, bounded" reasoning
 	}
 }
 
