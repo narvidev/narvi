@@ -390,6 +390,20 @@ func TestHandleTurnDeadlineTimer_ThenLateExecutionComplete_RecordsFalseFailure(t
 	if gotTurn.Status != sqlcgen.TurnStatusFailed {
 		t.Errorf("turn status = %s, want unchanged %s (the late completion must never resurrect a terminalized turn)", gotTurn.Status, sqlcgen.TurnStatusFailed)
 	}
+
+	// §12.2 item 6's own durable sibling: the SAME call that just
+	// incremented turn_false_failure_total must also have inserted
+	// exactly one false_failures row for this session, in the same
+	// transaction.
+	falseFailureStore := narvipg.NewFalseFailureStore(pool)
+	sinceEpoch := pgtype.Timestamptz{Time: time.Unix(0, 0), Valid: true}
+	gotCount, err := falseFailureStore.CountInWindow(ctx, sinceEpoch)
+	if err != nil {
+		t.Fatalf("count false_failures: %v", err)
+	}
+	if gotCount != 1 {
+		t.Errorf("false_failures count = %d, want 1 (one durable row for the one genuine false failure)", gotCount)
+	}
 }
 
 // TestHandleSandboxEvent_RedeliveredLateExecutionComplete_RecordsFalseFailureOnce
@@ -525,5 +539,19 @@ func TestHandleSandboxEvent_RedeliveredLateExecutionComplete_RecordsFalseFailure
 	}
 	if gotTurn.Status != sqlcgen.TurnStatusFailed {
 		t.Errorf("turn status = %s, want unchanged %s (redelivery must never resurrect a terminalized turn either)", gotTurn.Status, sqlcgen.TurnStatusFailed)
+	}
+
+	// The durable false_failures row must obey the identical "once, not
+	// once per redelivery" gate the OTel counter above was just proven to
+	// obey -- both are written from the SAME call, inside the SAME
+	// transaction (recordFalseFailureIfApplicable, pushpr.go).
+	falseFailureStore := narvipg.NewFalseFailureStore(pool)
+	sinceEpoch := pgtype.Timestamptz{Time: time.Unix(0, 0), Valid: true}
+	gotCount, err := falseFailureStore.CountInWindow(ctx, sinceEpoch)
+	if err != nil {
+		t.Fatalf("count false_failures: %v", err)
+	}
+	if gotCount != 1 {
+		t.Errorf("false_failures count = %d, want exactly 1 (a redelivery of an already-counted false failure must never insert a second row)", gotCount)
 	}
 }
