@@ -64,6 +64,7 @@ package decisioninbox
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -103,6 +104,27 @@ type Deps struct {
 	SentinelFixes  *postgres.SentinelFixStore
 	Artifacts      *postgres.ArtifactStore
 	Identities     *postgres.IdentityStore
+
+	// GitHubPRSessions backs the "open review" action: the forward,
+	// non-claiming (repoFullName, prNumber) -> session_id lookup a PR row
+	// needs to link to Narvi's own review readout instead of GitHub, when
+	// -- and ONLY when -- Narvi has actually been mentioned on that exact
+	// PR. Optional (nil-safe, mirroring ReleaseManifestChecks below): a
+	// caller that never wires this simply never resolves a session id for
+	// any PR row, which degrades the affordance (external GitHub link
+	// only) without ever failing the read.
+	GitHubPRSessions *postgres.GitHubPRSessionStore
+	// ReleaseManifestChecks backs release-cut rows (§15): the ALREADY-computed,
+	// ALREADY-persisted manifest check for a PR that internal/domain/
+	// intent.DetectRelease identified as a release PR at review-session-
+	// creation time (internal/adapters/inbound/github's own
+	// triggerReleaseManifestCheckBestEffort) and internal/app/
+	// releasereview.Run has since finished computing. A PR with no
+	// persisted check -- never mentioned at all, or mentioned but not yet
+	// processed by that background worker -- is simply not tagged as a
+	// release cut; this package never fabricates one. Optional (nil-safe,
+	// mirroring GitHubPRSessions above).
+	ReleaseManifestChecks *postgres.ReleaseManifestCheckStore
 
 	SCMCache *SCMCache
 
@@ -415,21 +437,37 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 	}
 	ciGreen := pr.CIConclusion == ports.CIConclusionSuccess
 
+	// sessionID resolves the review session Narvi has actually run
+	// against this EXACT (repoFullName, pr.Number), if any -- see
+	// resolveReviewSessionID's own doc comment for why this, and never
+	// artifacts.GetPRArtifactByURL's authoring session (isPlatformAuthored
+	// below), is the right session id for this purpose.
+	sessionID := resolveReviewSessionID(ctx, deps, repoFullName, pr.Number)
+
+	// isReleaseCut/manifestFindingsCount/aggregateReviewTriggered resolve
+	// this PR's own release-cut status -- see resolveReleaseCut's own doc
+	// comment.
+	isReleaseCut, manifestFindingsCount, aggregateReviewTriggered := resolveReleaseCut(ctx, deps, repoFullName, pr.Number)
+
 	item := Item{
-		RepoFullName:        repoFullName,
-		PRNumber:            pr.Number,
-		Title:               pr.Title,
-		HTMLURL:             pr.HTMLURL,
-		HeadSHA:             pr.HeadSHA,
-		Provenance:          &provenance,
-		RiskLabel:           riskLabel,
-		CIGreen:             ciGreen,
-		Findings:            openFindings,
-		FindingsUnknown:     findingsUnknown,
-		IsHandoff:           isHandoffPR,
-		HasApprovingReview:  pr.HasApprovingReview,
-		HasChangesRequested: pr.HasChangesRequested,
-		EnteredQueueAt:      pr.CreatedAt,
+		RepoFullName:             repoFullName,
+		PRNumber:                 pr.Number,
+		Title:                    pr.Title,
+		HTMLURL:                  pr.HTMLURL,
+		HeadSHA:                  pr.HeadSHA,
+		Provenance:               &provenance,
+		RiskLabel:                riskLabel,
+		CIGreen:                  ciGreen,
+		Findings:                 openFindings,
+		FindingsUnknown:          findingsUnknown,
+		IsHandoff:                isHandoffPR,
+		HasApprovingReview:       pr.HasApprovingReview,
+		HasChangesRequested:      pr.HasChangesRequested,
+		EnteredQueueAt:           pr.CreatedAt,
+		SessionID:                sessionID,
+		IsRelease:                isReleaseCut,
+		ManifestFindingsCount:    manifestFindingsCount,
+		AggregateReviewTriggered: aggregateReviewTriggered,
 	}
 	item.AgeSeconds = int64(decisioninbox.Age(item.EnteredQueueAt, now).Seconds())
 	item.Stale = decisioninbox.IsStale(item.EnteredQueueAt, now, deps.Timeouts.DecisionInboxStaleAfter)
@@ -437,6 +475,19 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 	switch {
 	case isHandoffPR:
 		item.Kind = decisioninbox.KindAwaitingApproval
+	case isReleaseCut:
+		// §16.1: "needs_review... includes release cuts with manifest
+		// flags (§15)" -- a release cut is ALWAYS a human-judgment row,
+		// never auto-merge-eligible, regardless of what the ordinary
+		// eligibility computation below would have said. This branch
+		// therefore never even runs isPlatformAuthored/
+		// computeRealEligibility for a release-cut PR -- a release PR is
+		// essentially never platform-authored anyway (it is opened by a
+		// human cutting a release, not pushed by a Narvi session), and
+		// even if it somehow were, §15's own manifest-check machinery
+		// exists precisely because a release cut needs a human looking at
+		// the compliance findings, not a fast-path auto-merge.
+		item.Kind = decisioninbox.KindNeedsReview
 	default:
 		platformAuthored := isPlatformAuthored(ctx, deps, pr.HTMLURL)
 		eligible := computeRealEligibility(ctx, deps, repoFullName, pr, ciGreen, hasNeedsHuman)
@@ -810,6 +861,125 @@ func countOpenFindings(ctx context.Context, deps Deps, repoFullName string, prNu
 func isPlatformAuthored(ctx context.Context, deps Deps, htmlURL string) bool {
 	_, err := deps.Artifacts.GetPRArtifactByURL(ctx, htmlURL)
 	return err == nil
+}
+
+// resolveReviewSessionID answers "a PR-shaped row carries no session id":
+// given repoFullName/prNumber, does a Narvi review session already exist
+// for THIS EXACT PR, and if so what is its id?
+//
+// Deliberately github_pr_sessions (deps.GitHubPRSessions), NEVER
+// artifacts.GetPRArtifactByURL's own authoring session (isPlatformAuthored
+// above): those answer two DIFFERENT questions that happen to often be
+// about the same PR. isPlatformAuthored's own artifact row records which
+// session PUSHED and OPENED a PR (recordPRArtifact, pushpr.go) -- that
+// session was never itself created via a GitHub @mention (it is the
+// ordinary create-session flow), so it carries no github_pr_sessions row
+// and GetReviewReadout/GetReleaseManifestReadout (both keyed on exactly
+// that row existing, "400 if it exists but was never created via a
+// GitHub PR mention") would 400 on it. github_pr_sessions' own forward
+// (repoFullName, prNumber) claim, by contrast, is EXACTLY the session
+// those two read endpoints require -- the one a human's own "@narvi
+// review" mention (or the release-manifest trigger, which fires on that
+// SAME winning mention, releasemanifest.go) created for this PR. Using
+// the wrong one here would silently offer an "Open review" action that
+// 400s at click time -- worse than the external-GitHub-link gap this
+// resolution replaces (this Step's own "an action offered must be one
+// the backend can actually perform" rule).
+//
+// repoFullName/prNumber both come from the SAME already-fetched OpenPR
+// this function's one caller (buildPROpenItem) is currently classifying
+// -- this can never return a session id belonging to a DIFFERENT PR,
+// since github_pr_sessions' own primary key is exactly (repo_full_name,
+// pr_number).
+//
+// deps.GitHubPRSessions == nil (a caller that never wires this optional
+// dependency) and pgx.ErrNoRows (Narvi has never been mentioned on this
+// PR) both resolve to "" identically -- neither is an error, and a
+// caller degrades gracefully to no "Open review" affordance either way.
+// Any OTHER store error is logged and also resolves to "" -- best-effort,
+// mirroring isPlatformAuthored's own identical "a lookup failure simply
+// means the enhanced affordance is unavailable" posture; this is a
+// display nicety, never something worth failing the whole inbox read
+// over.
+func resolveReviewSessionID(ctx context.Context, deps Deps, repoFullName string, prNumber int) string {
+	if deps.GitHubPRSessions == nil {
+		return ""
+	}
+	row, err := deps.GitHubPRSessions.GetByRepoAndPRNumber(ctx, repoFullName, int32(prNumber))
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			platform.Logger(ctx).Error("decisioninbox: resolve review session id failed", "error", err, "repo", repoFullName, "pr_number", prNumber)
+		}
+		return ""
+	}
+	if !row.SessionID.Valid {
+		// Cannot actually happen against a real Postgres instance --
+		// RepoKnownToDeployment's own generated doc comment: "a row only
+		// ever COMMITS with a non-NULL session_id" (coalesce.go's single-
+		// transaction EnsureRow+LockForUpdate+SetSessionID sequencing
+		// rolls back a denied/failed claim wholesale). Handled anyway,
+		// never a raw pgtype.UUID{}.String() call on an invalid value.
+		return ""
+	}
+	return row.SessionID.String()
+}
+
+// resolveReleaseCut answers "release-cut rows never appear": does
+// repoFullName/prNumber already have a persisted §15.2
+// manifest check (internal/app/releasereview.Run, written by
+// persistReleaseManifestCheck)? If so, this PR is a release cut --
+// §16.1: "needs_review... includes release cuts with manifest flags
+// (§15)" -- and manifestFindingsCount/aggregateReviewTriggered are its
+// own already-computed, honestly-scoped facts.
+//
+// A PR intent.DetectRelease would classify as a release PR but that has
+// never been mentioned (or was mentioned but whose background worker
+// hasn't finished yet, releasereview.Worker) has no persisted row and is
+// deliberately NOT tagged here -- this function never re-runs detection
+// itself (it has neither the fresh head/base branch fetch nor the
+// deployment's own configured branch-pattern/label that detection needs,
+// and re-deriving them here would be a second, drifting copy of logic
+// that already runs exactly once, at review-session-creation time). A
+// release cut that has not yet been discovered/checked simply renders as
+// an ordinary needs_review PR row for the short window until the
+// background worker catches up -- an honest "not yet available" gap,
+// never a fabricated one, matching GetReleaseManifestReadout's own
+// identical "computed=false... never a 404" posture for the SAME
+// underlying data.
+//
+// manifestFindingsCount is §15.2's own MECHANICAL findings only (admin
+// overrides, red-at-merge, unreviewed reverts) -- NEVER the aggregate
+// diff review's own composition findings (§15.3/§15.4), which nothing in
+// this codebase computes yet (GetReleaseManifestReadout's own top doc
+// comment: "this handler therefore never fabricates 'composition
+// findings'"). aggregateReviewTriggered is §15.3's own real, already-
+// computed TRIGGER decision -- distinct from, and never a stand-in for,
+// a composition finding count.
+func resolveReleaseCut(ctx context.Context, deps Deps, repoFullName string, prNumber int) (isReleaseCut bool, manifestFindingsCount int, aggregateReviewTriggered bool) {
+	if deps.ReleaseManifestChecks == nil {
+		return false, 0, false
+	}
+	check, err := deps.ReleaseManifestChecks.GetLatest(ctx, repoFullName, int32(prNumber))
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			platform.Logger(ctx).Error("decisioninbox: resolve release cut failed", "error", err, "repo", repoFullName, "pr_number", prNumber)
+		}
+		return false, 0, false
+	}
+
+	var findings []json.RawMessage
+	if err := json.Unmarshal(check.Findings, &findings); err != nil {
+		// findings is NOT NULL DEFAULT '[]'::jsonb (migrations/
+		// 000097_release_manifest_checks.up.sql) -- a genuinely malformed
+		// value here means the persisted row itself is corrupt, not that
+		// this PR isn't a release cut. Render the row anyway (this PR
+		// unambiguously IS a release cut -- the check row exists), just
+		// with an honest zero findings count rather than propagating a
+		// decode error into the whole inbox read.
+		platform.Logger(ctx).Error("decisioninbox: unmarshal release manifest findings failed, rendering as zero", "error", err, "repo", repoFullName, "pr_number", prNumber)
+		return true, 0, check.AggregateReviewTriggered
+	}
+	return true, len(findings), check.AggregateReviewTriggered
 }
 
 // buildPlanItems returns every plan-mode plan actorUserID/actorRole is

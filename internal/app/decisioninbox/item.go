@@ -87,8 +87,45 @@ type Item struct {
 	// HasApprovingReview.
 	HasChangesRequested bool
 
+	// IsRelease is true iff this PR-shaped row is a release cut (§15)
+	// whose §15.2 manifest check has already been computed and persisted
+	// -- see resolveReleaseCut's own doc comment (aggregate.go) for the
+	// full "why", including why a release PR not yet checked simply
+	// renders as an ordinary PR row rather than being fabricated as one.
+	// Populated unconditionally (true or false) for any PR-shaped row,
+	// mirroring IsHandoff immediately above -- the field a client checks
+	// to render this row's own distinct "release" shape (a link to the
+	// release-review screen, never a Merge button: a release cut always
+	// classifies KindNeedsReview, see buildPROpenItem) instead of the
+	// ordinary PR shape.
+	IsRelease bool
+	// ManifestFindingsCount is §15.2's own mechanical manifest-findings
+	// count (admin overrides, red-at-merge, unreviewed reverts) -- set
+	// ONLY when IsRelease is true; meaningless (left at its zero value)
+	// otherwise. NEVER the aggregate diff review's own composition
+	// findings (§15.3/§15.4), which this codebase does not compute
+	// anywhere -- see resolveReleaseCut's own doc comment.
+	ManifestFindingsCount int
+	// AggregateReviewTriggered is §15.3's own already-computed TRIGGER
+	// decision (review.ShouldRunAggregateReview) -- set ONLY when
+	// IsRelease is true. This is NOT a composition-findings count (§15.4
+	// explicitly leaves that pass undispatched anywhere in this
+	// codebase); it says only that the mechanical criteria for running
+	// that pass were met, never that the pass itself produced anything.
+	AggregateReviewTriggered bool
+
 	// Plan fields (KindAwaitingApproval, non-handoff).
-	PlanID           string
+	PlanID string
+	// SessionID is set whenever this row has a resolvable Narvi session:
+	// a plan (KindAwaitingApproval), a failed session (KindNeedsAttention),
+	// OR a PR-shaped row (ready_to_merge/needs_review, including a release
+	// cut) for which github_pr_sessions carries a forward claim, i.e.
+	// Narvi has actually run a review session against this exact PR (see
+	// resolveReviewSessionID's own doc comment, aggregate.go). Left empty
+	// for a PR Narvi has never been mentioned on -- a common, legitimate
+	// case, never an error -- in which case a client falls back to an
+	// external GitHub link instead of linking into a review screen that
+	// does not exist for this PR.
 	SessionID        string
 	PlanSessionTitle string
 
