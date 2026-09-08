@@ -20,7 +20,19 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/linearapi"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 )
+
+// promptOrNilText renders a *string turn prompt for a test failure message
+// as either its dereferenced text or the literal "<nil>" -- %v on a
+// *string prints a raw pointer address (e.g. "0xc0001a3710"), which tells
+// nobody debugging a failed assertion anything about the actual value.
+func promptOrNilText(p *string) string {
+	if p == nil {
+		return "<nil>"
+	}
+	return *p
+}
 
 // TestWebhookHandler_Prompted_ApproveKeyword_DecidesPlan proves a
 // deterministic approve-keyword reply calls the shared decide-plan path
@@ -291,8 +303,18 @@ func TestWebhookHandler_Prompted_RevisePrefix_CreatesPlanModeTurnWithStrippedFee
 	if !newTurn.PlanMode {
 		t.Error("new turn PlanMode = false, want true")
 	}
-	if newTurn.Prompt == nil || *newTurn.Prompt != "drop the retry logic" {
-		t.Errorf("new turn prompt = %v, want %q (the revise: prefix must be stripped)", newTurn.Prompt, "drop the retry logic")
+	// §12.2 item 3's own structured-plan-document instruction
+	// (plandomain.MaybeInjectStructureInstruction) is unconditionally
+	// prepended onto every plan_mode=true turn's prompt, at the SAME
+	// CreateTurnCore this revise reply dispatches through -- so the
+	// persisted prompt is the STRIPPED feedback with that fixed
+	// instruction prepended. Named via the transformation itself (never
+	// loosened to a substring/prefix check): this still fails if the
+	// revise: prefix stripping breaks, and still fails if the instruction
+	// text changes unexpectedly.
+	wantPrompt := plandomain.MaybeInjectStructureInstruction(true, "drop the retry logic")
+	if newTurn.Prompt == nil || *newTurn.Prompt != wantPrompt {
+		t.Errorf("new turn prompt = %q, want %q (the revise: prefix must be stripped, then the structured-plan instruction prepended)", promptOrNilText(newTurn.Prompt), wantPrompt)
 	}
 }
 
