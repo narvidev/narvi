@@ -59,6 +59,15 @@ type Bridge struct {
 	sessionGen   int
 	handler      CommandHandler
 
+	// agentVersion/imageDigest (§12.2 item 1's own runtime-fingerprint
+	// gap) are this gen's own sandboxboot.BootFingerprint.AgentVersion/
+	// ImageDigest, set once at New and reported on sendReady's own "ready"
+	// event (the only event that carries them) -- immutable for this
+	// Bridge's whole lifetime, unlike lastBootPhase/conversationID above,
+	// so neither needs its own mutex.
+	agentVersion string
+	imageDigest  string
+
 	dialTimeout         time.Duration
 	heartbeatInterval   time.Duration
 	reconnectMinBackoff time.Duration
@@ -102,10 +111,15 @@ type Bridge struct {
 // derivation, this field IS already the real WS connect target, no URL
 // surgery needed) and a CommandHandler for the 5 business commands.
 // sandboxID is this Step's own invented, HONEST-GAP value for the
-// X-Sandbox-ID header -- see doc.go.
+// X-Sandbox-ID header -- see doc.go. agentVersion/imageDigest (§12.2 item
+// 1's own runtime-fingerprint gap) are this gen's own already-resolved
+// boot.Config.AgentVersion/ImageDigest (cmd/sandbox-agent/main.go's own
+// caller already computed these for the boot-fingerprint log line, §5.3
+// -- New reuses that same value rather than re-reading the env itself).
 func New(
 	sc sessionconfig.SessionConfig,
 	sandboxID string,
+	agentVersion, imageDigest string,
 	handler CommandHandler,
 	dialTimeout, heartbeatInterval, reconnectMinBackoff, reconnectMaxBackoff time.Duration,
 ) *Bridge {
@@ -115,6 +129,8 @@ func New(
 		sandboxID:    sandboxID,
 		sessionID:    sc.SessionId,
 		sessionGen:   sc.Gen,
+		agentVersion: agentVersion,
+		imageDigest:  imageDigest,
 		handler:      handler,
 
 		dialTimeout:         dialTimeout,

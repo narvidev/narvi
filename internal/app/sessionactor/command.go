@@ -110,7 +110,15 @@ type SandboxEvent struct {
 	// sessions.opencode_conversation_id (§3.3, design decision 6 --
 	// migrations/000018_session_repos.up.sql).
 	ConversationID *string
-	Reply          chan<- SandboxEventOutcome
+	// AgentVersion/ImageDigest (§12.2 item 1's own runtime-fingerprint
+	// gap) mirror ConversationID's own shape exactly, for the "ready"
+	// event instead of "heartbeat": nil/absent for every other type.
+	// handleSandboxEvent persists a non-nil pair to sandboxes.
+	// agent_version/image_digest (migrations/000120_sandboxes_boot_fingerprint.
+	// up.sql).
+	AgentVersion *string
+	ImageDigest  *string
+	Reply        chan<- SandboxEventOutcome
 }
 
 func (SandboxEvent) isCommand() {}

@@ -67,6 +67,18 @@ export interface SessionStreamSnapshot {
    */
   sandboxState: unknown
   /**
+   * The subscribe reply's own `state.correlationId` (§12.2 item 1's own
+   * session-rail gap): the SESSION's own most-recently-created turn's
+   * correlation id (client.go's own latestTurnCorrelationID), or null
+   * when this session has no turns yet or its newest turn recorded none.
+   * UNTYPED for the same reason sandboxState is -- session/
+   * sessionCorrelationId.ts does the type-checked narrowing. Deliberately
+   * a SEPARATE field from sandboxState, never merged into it: a
+   * correlation id is a property of a request, not of the sandbox (see
+   * that module's own top comment).
+   */
+  correlationIdState: unknown
+  /**
    * The subscribe reply's own top-level `participants` array (§8.11,
    * "multiplayer presence") -- client.go's own resolveParticipants:
    * `{userId, displayName}` per currently-live, distinct user, passed
@@ -126,6 +138,7 @@ export class SessionStream {
   private activity: SessionActivityState = initialSessionActivityState
   private lastError: string | null = null
   private sandboxState: unknown = null
+  private correlationIdState: unknown = null
   private participantsState: readonly { [k: string]: unknown }[] = []
   private readonly listeners = new Set<() => void>()
   private backfillInFlight = false
@@ -199,6 +212,7 @@ export class SessionStream {
         activity: this.activity,
         lastError: this.lastError,
         sandboxState: this.sandboxState,
+        correlationIdState: this.correlationIdState,
         participantsState: this.participantsState,
       }
     }
@@ -224,6 +238,7 @@ export class SessionStream {
     // event of its own (see sandboxRail.ts's own top comment for the full
     // "what this can and cannot show" accounting).
     this.sandboxState = isPlainObject(payload.state) ? (payload.state.sandbox ?? null) : null
+    this.correlationIdState = isPlainObject(payload.state) ? (payload.state.correlationId ?? null) : null
     this.participantsState = payload.participants
     const inserted = this.log.appendMany(parseEnvelopes(payload.events))
     this.applyNewEvents(inserted)

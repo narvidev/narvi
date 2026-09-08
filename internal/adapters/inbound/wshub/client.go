@@ -520,6 +520,19 @@ func buildSubscribedPayload(
 			"session": sessionRow,
 			"turns":   turnRows,
 			"sandbox": sandboxState,
+			// correlationId (§12.2 item 1's own session-rail gap): the
+			// SESSION's own most-recently-created turn's correlation id
+			// (turnRows is ORDER BY created_at ASC, ListTurnsForSession's own
+			// doc comment -- the last element is the newest), or nil when
+			// this session has no turns yet, or its newest turn's own
+			// correlation_id is itself nil (created with no live request
+			// context, latestTurnCorrelationID's own doc comment). Deliberately
+			// a TOP-LEVEL state key, siblings with sandbox rather than nested
+			// inside it: a correlation id is a property of a REQUEST (this
+			// session's latest one), never of the sandbox itself -- see
+			// sandboxWireMap's own doc comment for the contrasting case
+			// (agentVersion/imageDigest, which ARE sandbox properties).
+			"correlationId": latestTurnCorrelationID(turnRows),
 		},
 		Events:          wireEvents,
 		EventsTruncated: countTruncated || byteTruncated,
@@ -695,16 +708,46 @@ func ArtifactWireMap(a sqlcgen.Artifact) map[string]interface{} {
 // later PRs" -- this package's own choice, exactly like eventWireMap/
 // ArtifactWireMap already exercise for their own siblings). Returns only
 // what a client-side UI legitimately needs: id, gen, status, lastSeenAt,
-// createdAt, updatedAt.
+// createdAt, updatedAt, agentVersion, imageDigest.
+//
+// agentVersion/imageDigest (§12.2 item 1's own runtime-fingerprint gap,
+// migrations/000120_sandboxes_boot_fingerprint.up.sql) are a PROPERTY OF
+// THIS SANDBOX (its own running binary/image for this gen) -- nil until
+// this gen's own first "ready" event reports them, and reset to nil again
+// on the next respawn (UpsertSandboxForSpawn's own doc comment) so a
+// connecting/booting new gen never displays its predecessor's now-stale
+// fingerprint. Deliberately NOT alongside correlationId (buildSubscribedPayload's
+// own top-level state key) -- that is a property of a REQUEST, not of the
+// sandbox, and forcing the two into one shape because a mockup happens to
+// show them side by side would conflate a fact that outlives many turns
+// with one that is fresh per turn.
 func sandboxWireMap(s sqlcgen.Sandbox) map[string]interface{} {
 	return map[string]interface{}{
-		"id":         s.ID,
-		"gen":        s.Gen,
-		"status":     s.Status,
-		"lastSeenAt": s.LastSeenAt,
-		"createdAt":  s.CreatedAt,
-		"updatedAt":  s.UpdatedAt,
+		"id":           s.ID,
+		"gen":          s.Gen,
+		"status":       s.Status,
+		"lastSeenAt":   s.LastSeenAt,
+		"createdAt":    s.CreatedAt,
+		"updatedAt":    s.UpdatedAt,
+		"agentVersion": s.AgentVersion,
+		"imageDigest":  s.ImageDigest,
 	}
+}
+
+// latestTurnCorrelationID returns the correlation id of turnRows' own
+// most-recently-created element (ListForSession/ListTurnsForSession's own
+// ORDER BY created_at ASC -- the last element is the newest), or nil for
+// an empty slice (no turns yet) or when that newest turn's own
+// correlation_id is itself nil (created with no live request context in
+// scope, queries/turns.sql's own CreateTurn doc comment). Never looks
+// further back than the single newest turn -- an older turn's own
+// correlation id would name a request that is no longer what this
+// session's sandbox is talking to.
+func latestTurnCorrelationID(turnRows []sqlcgen.Turn) *string {
+	if len(turnRows) == 0 {
+		return nil
+	}
+	return turnRows[len(turnRows)-1].CorrelationID
 }
 
 func subscribedEventsWire(rows []sqlcgen.Event) []clientws.SubscribedPayloadEventsElem {

@@ -27,6 +27,7 @@ import { buildCostRollup } from '../../session/costRollup'
 import { Composer } from '../../session/Composer'
 import { parseParticipants } from '../../session/participants'
 import { parseSandboxSnapshot } from '../../session/sandboxSnapshot'
+import { parseSessionCorrelationId } from '../../session/sessionCorrelationId'
 import { buildSandboxRailModel } from '../../session/sandboxRail'
 import { SessionHeader } from '../../session/SessionHeader'
 import { SessionRail } from '../../session/SessionRail'
@@ -67,6 +68,7 @@ function SessionWorkspace() {
   const sandboxModel = useMemo(() => buildSandboxRailModel(stream.events, parseSandboxSnapshot(stream.sandboxState)), [stream.events, stream.sandboxState])
   const costModel = useMemo(() => buildCostRollup(stream.events), [stream.events])
   const participants = useMemo(() => parseParticipants(stream.participantsState), [stream.participantsState])
+  const correlationId = useMemo(() => parseSessionCorrelationId(stream.correlationIdState), [stream.correlationIdState])
   const hasOpenTurn = model.turns.length > 0 && (model.turns[model.turns.length - 1]?.live ?? false)
 
   return (
@@ -121,7 +123,7 @@ function SessionWorkspace() {
           </>
         )}
       </section>
-      {sessionQuery.isSuccess && <SessionRail sessionId={sessionId} sandbox={sandboxModel} cost={costModel} />}
+      {sessionQuery.isSuccess && <SessionRail sessionId={sessionId} sandbox={sandboxModel} cost={costModel} correlationId={correlationId} />}
     </div>
   )
 }

@@ -1,26 +1,69 @@
 import { describe, expect, it } from 'vitest'
 
 import type { EventEnvelope } from '../../ws/types'
-import { buildSandboxRailModel } from '../sandboxRail'
+import { buildSandboxRailModel, runtimeLabel, shortDigest } from '../sandboxRail'
 import type { SandboxSnapshot } from '../sandboxSnapshot'
 
 function ev(id: number, type: string, payload: unknown, createdAt: string): EventEnvelope {
   return { id, type, payload, createdAt }
 }
 
+describe('shortDigest', () => {
+  it('strips a leading "algo:" prefix before truncating', () => {
+    expect(shortDigest('sha256:9f31c00abcdef')).toBe('9f31c00')
+  })
+
+  it('truncates a bare digest with no prefix the same way', () => {
+    expect(shortDigest('9f31c00abcdef')).toBe('9f31c00')
+  })
+})
+
+describe('runtimeLabel', () => {
+  it('renders "agentVersion · img shortDigest" (mockups.html\'s own "v1.4.2 · img 9f31c") when both are real', () => {
+    expect(runtimeLabel('v1.4.2', 'sha256:9f31c00')).toBe('v1.4.2 · img 9f31c00')
+  })
+
+  it('returns null when agentVersion is not yet reported', () => {
+    expect(runtimeLabel(null, 'sha256:9f31c00')).toBeNull()
+  })
+
+  it('returns null when imageDigest is not yet reported', () => {
+    expect(runtimeLabel('v1.4.2', null)).toBeNull()
+  })
+
+  it('returns null when neither is reported yet', () => {
+    expect(runtimeLabel(null, null)).toBeNull()
+  })
+})
+
 describe('buildSandboxRailModel', () => {
   it('with no snapshot and no events, reports nothing (honest "not started" state)', () => {
     const model = buildSandboxRailModel([], null)
-    expect(model).toEqual({ status: null, gen: null, lastSeenAt: null, bootPhases: [], transitions: [], hasSandbox: false })
+    expect(model).toEqual({ status: null, gen: null, lastSeenAt: null, bootPhases: [], transitions: [], hasSandbox: false, agentVersion: null, imageDigest: null })
   })
 
   it('seeds status/gen/lastSeenAt from the WS subscribe snapshot when there are no events yet', () => {
-    const snapshot: SandboxSnapshot = { id: 'sb-1', gen: 2, status: 'booting', lastSeenAt: '2026-08-20T10:00:00Z', createdAt: 'x', updatedAt: 'y' }
+    const snapshot: SandboxSnapshot = { id: 'sb-1', gen: 2, status: 'booting', lastSeenAt: '2026-08-20T10:00:00Z', createdAt: 'x', updatedAt: 'y', agentVersion: null, imageDigest: null }
     const model = buildSandboxRailModel([], snapshot)
     expect(model.status).toBe('booting')
     expect(model.gen).toBe(2)
     expect(model.lastSeenAt).toBe('2026-08-20T10:00:00Z')
     expect(model.hasSandbox).toBe(true)
+  })
+
+  it('seeds agentVersion/imageDigest from the WS subscribe snapshot -- §12.2 item 1\'s own runtime-fingerprint gap', () => {
+    const snapshot: SandboxSnapshot = { id: 'sb-1', gen: 3, status: 'ready', lastSeenAt: '2026-08-20T10:00:02Z', createdAt: 'x', updatedAt: 'y', agentVersion: 'v1.4.2', imageDigest: 'sha256:9f31c00' }
+    const model = buildSandboxRailModel([], snapshot)
+    expect(model.agentVersion).toBe('v1.4.2')
+    expect(model.imageDigest).toBe('sha256:9f31c00')
+  })
+
+  it('agentVersion/imageDigest stay null when the snapshot has not reported them yet -- never derived from any event', () => {
+    const snapshot: SandboxSnapshot = { id: 'sb-1', gen: 1, status: 'connecting', lastSeenAt: null, createdAt: 'x', updatedAt: 'y', agentVersion: null, imageDigest: null }
+    const events: EventEnvelope[] = [ev(1, 'ready', { type: 'ready', messageId: 'm1', sessionId: 's', gen: 1, timestamp: 'x' }, '2026-08-20T10:00:05.000Z')]
+    const model = buildSandboxRailModel(events, snapshot)
+    expect(model.agentVersion).toBeNull()
+    expect(model.imageDigest).toBeNull()
   })
 
   it('boot_progress events accumulate as phases with real, computed durations, and set status booting', () => {
@@ -57,7 +100,7 @@ describe('buildSandboxRailModel', () => {
   })
 
   it('a NON-fatal sandbox_error is recorded but does not change status', () => {
-    const snapshot: SandboxSnapshot = { id: 'sb-1', gen: 1, status: 'ready', lastSeenAt: null, createdAt: 'x', updatedAt: 'y' }
+    const snapshot: SandboxSnapshot = { id: 'sb-1', gen: 1, status: 'ready', lastSeenAt: null, createdAt: 'x', updatedAt: 'y', agentVersion: null, imageDigest: null }
     const events: EventEnvelope[] = [ev(1, 'error', { type: 'error', messageId: 'm1', sessionId: 's', gen: 1, ackId: 'error:m1', message: 'transient hiccup', fatal: false }, '2026-08-20T10:00:00Z')]
     const model = buildSandboxRailModel(events, snapshot)
     expect(model.status).toBe('ready')

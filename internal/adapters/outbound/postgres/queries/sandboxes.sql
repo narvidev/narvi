@@ -17,9 +17,19 @@ WHERE session_id = $1;
 -- UpdateTurnStatus) -- per §3.2 "Liveness = max of all signals",
 -- last_seen_at only ever moves forward on an actual signal, never as a
 -- side effect of a plain status write.
+--
+-- agent_version/image_digest (§12.2 item 1's own boot-fingerprint gap,
+-- migrations/000120) mirror last_seen_at's own sqlc.narg + COALESCE
+-- shape: every event type this query's one caller (handleSandboxEvent)
+-- handles passes both as nil EXCEPT a "ready" event (the only one that
+-- carries them, sandbox-ws's own Ready def), so an ordinary heartbeat/
+-- tool_call/etc. leaves whatever this gen's own "ready" event already
+-- recorded untouched rather than clobbering it back to NULL.
 UPDATE sandboxes
 SET status = $2,
     last_seen_at = COALESCE(sqlc.narg('last_seen_at'), last_seen_at),
+    agent_version = COALESCE(sqlc.narg('agent_version'), agent_version),
+    image_digest = COALESCE(sqlc.narg('image_digest'), image_digest),
     updated_at = now()
 WHERE session_id = $1
 RETURNING *;
@@ -65,6 +75,15 @@ RETURNING *;
 -- needed for the Skip guard above -- a fresh INSERT has no prior row for a
 -- concurrent caller to race against; maxTime(created_at, zero) ==
 -- created_at already reads as "just spawned".
+-- agent_version/image_digest (§12.2 item 1, migrations/000120) ARE
+-- cleared here, on the SAME respawn branch that leaves provider_id
+-- untouched -- the opposite call for the opposite reason (that column's
+-- own doc comment: harmless because nothing ever renders a stale
+-- provider_id to a human). A fingerprint IS rendered directly on the
+-- session rail, so a stale previous-gen value lingering through this
+-- gen's own connecting/booting window would be actively misleading --
+-- "not reported yet" (NULL) is the honest state until THIS gen's own
+-- first "ready" event repopulates them.
 INSERT INTO sandboxes (session_id, gen, status, token_hash)
 VALUES ($1, 1, 'spawning', $2)
 ON CONFLICT (session_id) DO UPDATE
@@ -72,6 +91,8 @@ SET gen = sandboxes.gen + 1,
     status = 'spawning',
     token_hash = $2,
     last_seen_at = now(),
+    agent_version = NULL,
+    image_digest = NULL,
     updated_at = now()
 RETURNING *;
 

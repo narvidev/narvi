@@ -1508,6 +1508,104 @@ func TestHandleSandboxEvent_AckReplySentBeforeSlowPostCommitSideEffects(t *testi
 	close(commander.release)
 }
 
+// TestHandleSandboxEvent_ReadyPersistsBootFingerprint is §12.2 item 1's
+// own runtime-fingerprint gap, end to end through handleSandboxEvent:
+// a "ready" event's real AgentVersion/ImageDigest lands on the sandboxes
+// row: a LATER, unrelated event (heartbeat, carrying neither field) must
+// never clobber them back to NULL (UpdateSandboxStatus's own
+// COALESCE-guarded columns); and a fresh respawn (UpsertSandboxForSpawn)
+// must reset them to NULL -- a connecting/booting new gen must never
+// display its predecessor's now-stale fingerprint.
+func TestHandleSandboxEvent_ReadyPersistsBootFingerprint(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessionID := createTestSession(ctx, t, pool)
+
+	sandboxStore := narvipg.NewSandboxStore(pool)
+	if _, err := sandboxStore.Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	send := func(t *testing.T, cmd SandboxEvent) SandboxEventOutcome {
+		t.Helper()
+		reply := make(chan SandboxEventOutcome, 1)
+		cmd.Reply = reply
+		if err := a.Send(ctx, cmd); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+		select {
+		case outcome := <-reply:
+			return outcome
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for SandboxEventOutcome")
+			return SandboxEventOutcome{}
+		}
+	}
+
+	agentVersion, imageDigest := "v1.4.2", "sha256:9f31c00"
+	readyRaw := json.RawMessage(`{"type":"ready","messageId":"r1","sessionId":"s","gen":1,"agentVersion":"v1.4.2","imageDigest":"sha256:9f31c00"}`)
+	outcome := send(t, SandboxEvent{Type: "ready", Gen: 1, MessageID: "r1", Raw: readyRaw, AgentVersion: &agentVersion, ImageDigest: &imageDigest})
+	if !outcome.Persisted {
+		t.Fatal("ready: Persisted = false, want true")
+	}
+
+	got, err := sandboxStore.Get(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("get sandbox: %v", err)
+	}
+	if got.AgentVersion == nil || *got.AgentVersion != agentVersion {
+		t.Errorf("AgentVersion = %v, want %q", got.AgentVersion, agentVersion)
+	}
+	if got.ImageDigest == nil || *got.ImageDigest != imageDigest {
+		t.Errorf("ImageDigest = %v, want %q", got.ImageDigest, imageDigest)
+	}
+
+	// A later, unrelated event (heartbeat, carrying neither field) must
+	// never clobber the fingerprint back to NULL.
+	hbRaw := json.RawMessage(`{"type":"heartbeat","messageId":"h1","sessionId":"s","gen":1,"conversationId":null,"lastBootPhase":null}`)
+	if outcome := send(t, SandboxEvent{Type: "heartbeat", Gen: 1, MessageID: "h1", Raw: hbRaw}); !outcome.Persisted {
+		t.Fatal("heartbeat: Persisted = false, want true")
+	}
+	got, err = sandboxStore.Get(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("get sandbox after heartbeat: %v", err)
+	}
+	if got.AgentVersion == nil || *got.AgentVersion != agentVersion {
+		t.Errorf("AgentVersion after unrelated heartbeat = %v, want unchanged %q (a non-ready event must never clobber the fingerprint)", got.AgentVersion, agentVersion)
+	}
+	if got.ImageDigest == nil || *got.ImageDigest != imageDigest {
+		t.Errorf("ImageDigest after unrelated heartbeat = %v, want unchanged %q", got.ImageDigest, imageDigest)
+	}
+
+	// A fresh respawn (the NEXT gen) must reset the fingerprint to NULL --
+	// UpsertSandboxForSpawn's own doc comment: a connecting/booting new
+	// gen must never display its predecessor's now-stale value.
+	respawned, err := sandboxStore.UpsertForSpawn(ctx, sqlcgen.UpsertSandboxForSpawnParams{SessionID: sessionID, TokenHash: nil})
+	if err != nil {
+		t.Fatalf("respawn: %v", err)
+	}
+	if respawned.Gen != 2 {
+		t.Fatalf("respawned gen = %d, want 2", respawned.Gen)
+	}
+	if respawned.AgentVersion != nil {
+		t.Errorf("AgentVersion after respawn = %v, want nil (reset -- this new gen has not reported 'ready' yet)", respawned.AgentVersion)
+	}
+	if respawned.ImageDigest != nil {
+		t.Errorf("ImageDigest after respawn = %v, want nil", respawned.ImageDigest)
+	}
+}
+
 // absDuration returns d's absolute value.
 func absDuration(d time.Duration) time.Duration {
 	if d < 0 {

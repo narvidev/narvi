@@ -8,13 +8,15 @@
       "type": "object",
       "additionalProperties": false,
       "description": "First event on a fresh WS connection, once the agent is ready to receive commands.",
-      "required": ["type", "messageId", "sessionId", "gen", "timestamp"],
+      "required": ["type", "messageId", "sessionId", "gen", "timestamp", "agentVersion", "imageDigest"],
       "properties": {
         "type": { "type": "string", "const": "ready" },
         "messageId": { "type": "string" },
         "sessionId": { "type": "string", "format": "uuid" },
         "gen": { "type": "integer" },
-        "timestamp": { "type": "string", "format": "date-time" }
+        "timestamp": { "type": "string", "format": "date-time" },
+        "agentVersion": { "type": "string", "description": "§12.2 item 1's own runtime-fingerprint gap (§5.3's own boot fingerprint, sandboxboot.BootFingerprint.AgentVersion): this gen's own sandbox-agent binary version. Always a real, non-empty string -- 'dev' when NARVI_AGENT_VERSION is unset (no build-time version-stamping pipeline exists yet), never omitted." },
+        "imageDigest": { "type": "string", "description": "§12.2 item 1's own runtime-fingerprint gap (sandboxboot.BootFingerprint.ImageDigest): this gen's own sandbox image digest. Always a real, non-empty string -- 'unknown' when NARVI_IMAGE_DIGEST is unset (a documented, honest gap: no mechanism yet injects it into a spawned sandbox), never omitted." }
       }
     },
     "Heartbeat": {

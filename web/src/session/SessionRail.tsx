@@ -2,10 +2,13 @@
 // §12.2's own "sandbox rail (transitions, gen, fingerprint, boot phases,
 // artifacts, cost incl. sub-task roll-up)". Four panels, each sourced from
 // real data only -- see sandboxRail.ts's own top comment for the full
-// accounting of what IS and is NOT available on the wire today (runtime
-// fingerprint and correlation id are named there as a genuine, documented
-// gap; this component renders an honest "not reported yet" for both
-// rather than a fabricated value).
+// accounting of what each panel can and cannot honestly show. Runtime
+// fingerprint (agentVersion/imageDigest, sandboxRail.ts) and correlation
+// id (sessionCorrelationId.ts) are both real now, sourced from two
+// DIFFERENT tables for the reason each module's own top comment gives (a
+// fingerprint is a property of the sandbox; a correlation id names a
+// request) -- either can still honestly render "not reported yet" when
+// its own gen/turn has not reported it yet.
 //
 // Every artifact-sourced string rendered here (filename, PR/preview repo
 // name) is plain React text content only -- never dangerouslySetInnerHTML
@@ -25,6 +28,7 @@ import type { ParsedArtifact } from './artifactPayloads'
 import { parseArtifacts } from './artifactPayloads'
 import type { CostRollup } from './costRollup'
 import { formatRelativeTime } from './relativeTime'
+import { runtimeLabel } from './sandboxRail'
 import type { SandboxRailModel } from './sandboxRail'
 import { formatUsd } from './money'
 import { isSafeHref } from './urlSafety'
@@ -47,7 +51,9 @@ function statusTone(status: string | null): 'ok' | 'warn' | 'crit' | 'neutral' {
   return 'neutral'
 }
 
-function SandboxPanel({ model }: { model: SandboxRailModel }) {
+/** Exported for direct render-safety testing (mirrors ArtifactRow's own identical precedent, __tests__/sessionRailRendering.test.tsx) -- no Router/QueryClient dependency of its own, unlike the sibling panels SessionRail composes. */
+export function SandboxPanel({ model, correlationId }: { model: SandboxRailModel; correlationId: string | null }) {
+  const runtime = runtimeLabel(model.agentVersion, model.imageDigest)
   return (
     <div>
       <h3>Sandbox</h3>
@@ -63,17 +69,16 @@ function SandboxPanel({ model }: { model: SandboxRailModel }) {
         <dd>{model.gen ?? '—'}</dd>
         <dt>last seen</dt>
         <dd>{model.lastSeenAt ? formatRelativeTime(model.lastSeenAt) : '—'}</dd>
-        {/* runtime fingerprint / correlation id: NOT available on the wire
-            today -- see sandboxRail.ts's own top comment for the full
-            "why" (sandbox-agent computes a real BootFingerprint but only
-            ever logs it locally; correlation id is a per-request concept
-            never persisted onto a session/sandbox row). Rendered honestly
-            rather than omitted or fabricated, so the gap stays visible
-            instead of silently disappearing from the UI. */}
+        {/* runtime fingerprint (agentVersion/imageDigest, sandboxRail.ts)
+            and correlation id (sessionCorrelationId.ts) are each real now,
+            sourced independently -- see this file's own top comment for
+            why they are never a single shape even though they render
+            side by side here. Each still honestly falls back to "not
+            reported yet" on its own, independent condition. */}
         <dt>runtime</dt>
-        <dd>not reported yet</dd>
+        <dd>{runtime ?? 'not reported yet'}</dd>
         <dt>trace</dt>
-        <dd>not reported yet</dd>
+        <dd>{correlationId ?? 'not reported yet'}</dd>
       </dl>
       {model.transitions.length > 0 && (
         <ul className="transitions">
@@ -274,10 +279,10 @@ function WorkflowRunsLinkPanel({ sessionId }: { sessionId: string }) {
   )
 }
 
-export function SessionRail({ sessionId, sandbox, cost }: { sessionId: string; sandbox: SandboxRailModel; cost: CostRollup }) {
+export function SessionRail({ sessionId, sandbox, cost, correlationId }: { sessionId: string; sandbox: SandboxRailModel; cost: CostRollup; correlationId: string | null }) {
   return (
     <aside className="rail" aria-label="Session details">
-      <SandboxPanel model={sandbox} />
+      <SandboxPanel model={sandbox} correlationId={correlationId} />
       <BootProgressPanel model={sandbox} />
       <ArtifactsPanel sessionId={sessionId} />
       <CostPanel cost={cost} />

@@ -99,6 +99,11 @@ type testEnvelope struct {
 	Phase          string  `json:"phase"`
 	LastBootPhase  *string `json:"lastBootPhase"`
 	ConversationID *string `json:"conversationId"`
+	// AgentVersion/ImageDigest (§12.2 item 1's own runtime-fingerprint
+	// gap) are only ever non-empty on a "ready" frame -- zero value ""
+	// for every other message type this shared peek struct decodes.
+	AgentVersion string `json:"agentVersion"`
+	ImageDigest  string `json:"imageDigest"`
 }
 
 // runInBackground launches bridge.Run(ctx) through an errgroup (never a
@@ -202,7 +207,7 @@ func TestRun_FatalStatus(t *testing.T) {
 			}))
 			t.Cleanup(server.Close)
 
-			bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", noopHandler{},
+			bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", "test-agent-version", "test-image-digest", noopHandler{},
 				testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
 
 			ctx, cancel := context.WithTimeout(context.Background(), testWait)
@@ -247,7 +252,7 @@ func TestRun_NonFatalRetryThenSucceeds(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", noopHandler{},
+	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", "test-agent-version", "test-image-digest", noopHandler{},
 		testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -313,7 +318,7 @@ func TestRun_ReadyFirstOnConnectAndReconnect(t *testing.T) {
 	server := httptest.NewServer(fake)
 	t.Cleanup(server.Close)
 
-	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", noopHandler{},
+	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", "test-agent-version", "test-image-digest", noopHandler{},
 		testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -327,6 +332,15 @@ func TestRun_ReadyFirstOnConnectAndReconnect(t *testing.T) {
 		}
 		if env.Type != "ready" {
 			t.Errorf("connection %d: first message type = %q, want %q", i+1, env.Type, "ready")
+		}
+		// §12.2 item 1's own runtime-fingerprint gap: every "ready" frame,
+		// including after a reconnect, must carry the SAME real
+		// agentVersion/imageDigest this Bridge was built with.
+		if env.AgentVersion != "test-agent-version" {
+			t.Errorf("connection %d: AgentVersion = %q, want %q", i+1, env.AgentVersion, "test-agent-version")
+		}
+		if env.ImageDigest != "test-image-digest" {
+			t.Errorf("connection %d: ImageDigest = %q, want %q", i+1, env.ImageDigest, "test-image-digest")
 		}
 	}
 
@@ -407,7 +421,7 @@ func TestSendCritical_ResendUntilAckedThenNeverAgain(t *testing.T) {
 	server := httptest.NewServer(fake)
 	t.Cleanup(server.Close)
 
-	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", noopHandler{},
+	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", "test-agent-version", "test-image-digest", noopHandler{},
 		testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -483,7 +497,7 @@ func TestDispatch_GenFencing(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	spy := &spyHandler{}
-	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", spy,
+	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", "test-agent-version", "test-image-digest", spy,
 		testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -536,7 +550,7 @@ func TestDispatch_UnrecognizedTypeIsSkippedNotFatal(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	spy := &spyHandler{}
-	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", spy,
+	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", "test-agent-version", "test-image-digest", spy,
 		testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -587,7 +601,7 @@ func TestSendBootProgress_Translation(t *testing.T) {
 	server := httptest.NewServer(fake)
 	t.Cleanup(server.Close)
 
-	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", noopHandler{},
+	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", "test-agent-version", "test-image-digest", noopHandler{},
 		testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -652,7 +666,7 @@ func TestSendBootProgress_ServiceNameWithColonIsEscaped(t *testing.T) {
 	server := httptest.NewServer(fake)
 	t.Cleanup(server.Close)
 
-	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", noopHandler{},
+	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", "test-agent-version", "test-image-digest", noopHandler{},
 		testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -726,7 +740,7 @@ func TestHeartbeat_TracksBootPhaseAndClearsOnComplete(t *testing.T) {
 	server := httptest.NewServer(fake)
 	t.Cleanup(server.Close)
 
-	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", noopHandler{},
+	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", "test-agent-version", "test-image-digest", noopHandler{},
 		testDialTimeout, testShortHeartbeat, testMinBackoff, testMaxBackoff)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -812,7 +826,7 @@ func TestHeartbeat_TracksConversationID(t *testing.T) {
 	server := httptest.NewServer(fake)
 	t.Cleanup(server.Close)
 
-	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", noopHandler{},
+	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", "test-agent-version", "test-image-digest", noopHandler{},
 		testDialTimeout, testShortHeartbeat, testMinBackoff, testMaxBackoff)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -899,7 +913,7 @@ func TestHeartbeat_SetConversationIDTriggersImmediateHeartbeat(t *testing.T) {
 	server := httptest.NewServer(fake)
 	t.Cleanup(server.Close)
 
-	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", noopHandler{},
+	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", "test-agent-version", "test-image-digest", noopHandler{},
 		testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -966,7 +980,7 @@ func TestHeartbeat_SetConversationIDUnchanged_NoRepeatedImmediateHeartbeat(t *te
 	server := httptest.NewServer(fake)
 	t.Cleanup(server.Close)
 
-	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", noopHandler{},
+	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", "test-agent-version", "test-image-digest", noopHandler{},
 		testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1046,7 +1060,7 @@ func TestRun_ShutdownCommandReturnsErrShutdownRequested(t *testing.T) {
 	server := httptest.NewServer(fake)
 	t.Cleanup(server.Close)
 
-	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", noopHandler{},
+	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", "test-agent-version", "test-image-digest", noopHandler{},
 		testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
 
 	ctx, cancel := context.WithTimeout(context.Background(), testWait)
@@ -1078,7 +1092,7 @@ func TestRun_StaleGenShutdownIsIgnored(t *testing.T) {
 	server := httptest.NewServer(fake)
 	t.Cleanup(server.Close)
 
-	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", noopHandler{},
+	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", "test-agent-version", "test-image-digest", noopHandler{},
 		testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)

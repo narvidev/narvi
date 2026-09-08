@@ -10,7 +10,8 @@ import { describe, expect, it } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
 
 import type { ParsedArtifact } from '../artifactPayloads'
-import { ArtifactRow } from '../SessionRail'
+import type { SandboxRailModel } from '../sandboxRail'
+import { ArtifactRow, SandboxPanel } from '../SessionRail'
 
 const XSS_PAYLOAD = '<img src=x onerror=alert(1)>'
 
@@ -85,5 +86,65 @@ describe('ArtifactRow -- a filename containing markup renders as text, never HTM
   it('a null filename renders the honest "(unnamed upload)" fallback rather than crashing or rendering nothing', () => {
     const html = renderToStaticMarkup(<ArtifactRow artifact={baseArtifact({ filename: null })} />)
     expect(html).toContain('(unnamed upload)')
+  })
+})
+
+// §12.2 item 1's own runtime-fingerprint/correlation-id gap: the sandbox
+// rail's own "runtime"/"trace" fields now render real data, sourced
+// independently (SandboxPanel takes them as two separate props/model
+// fields, never one shape -- see SessionRail.tsx's own top comment).
+// shortDigest/runtimeLabel themselves are unit-tested directly in
+// sandboxRail.test.ts, where they now live; this file covers only the
+// render boundary.
+
+function baseSandboxRailModel(overrides: Partial<SandboxRailModel> = {}): SandboxRailModel {
+  return {
+    status: 'ready',
+    gen: 3,
+    lastSeenAt: '2026-08-20T10:00:02Z',
+    bootPhases: [],
+    transitions: [],
+    hasSandbox: true,
+    agentVersion: null,
+    imageDigest: null,
+    ...overrides,
+  }
+}
+
+describe('SandboxPanel -- runtime fingerprint and correlation id', () => {
+  // MUTATION TEST: hardcode runtime/correlationId rendering to always show
+  // 'not reported yet' regardless of the real value, and re-run -- both
+  // "real value" assertions below fail.
+  it('renders the real runtime fingerprint and trace id when both are reported', () => {
+    const html = renderToStaticMarkup(
+      <SandboxPanel model={baseSandboxRailModel({ agentVersion: 'v1.4.2', imageDigest: 'sha256:9f31c00' })} correlationId="cor_8f3ka91" />,
+    )
+    expect(html).toContain('v1.4.2 · img 9f31c00')
+    expect(html).toContain('cor_8f3ka91')
+    expect(html).not.toContain('not reported yet')
+  })
+
+  it('falls back to "not reported yet" for the runtime fingerprint alone when the sandbox has not reported it yet', () => {
+    const html = renderToStaticMarkup(<SandboxPanel model={baseSandboxRailModel({ agentVersion: null, imageDigest: null })} correlationId="cor_8f3ka91" />)
+    expect(html).toContain('not reported yet')
+    expect(html).toContain('cor_8f3ka91')
+  })
+
+  it('falls back to "not reported yet" for the trace id alone when this session has no turns yet', () => {
+    const html = renderToStaticMarkup(<SandboxPanel model={baseSandboxRailModel({ agentVersion: 'v1.4.2', imageDigest: 'sha256:9f31c00' })} correlationId={null} />)
+    expect(html).toContain('v1.4.2 · img 9f31c00')
+    expect(html).toContain('not reported yet')
+  })
+
+  it('renders both as "not reported yet" independently -- proves the two are not accidentally coupled to one condition', () => {
+    const html = renderToStaticMarkup(<SandboxPanel model={baseSandboxRailModel({ agentVersion: null, imageDigest: null })} correlationId={null} />)
+    const occurrences = html.split('not reported yet').length - 1
+    expect(occurrences).toBe(2)
+  })
+
+  it('a hostile correlation id renders as text, never markup', () => {
+    const html = renderToStaticMarkup(<SandboxPanel model={baseSandboxRailModel()} correlationId={XSS_PAYLOAD} />)
+    expect(html).not.toContain('<img')
+    expect(html).toContain('&lt;img')
   })
 })

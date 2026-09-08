@@ -2069,6 +2069,8 @@ type Sandbox struct {
 	PendingPushSuppressedInShadow *bool              `json:"pending_push_suppressed_in_shadow"`
 	PendingPushCancelled          bool               `json:"pending_push_cancelled"`
 	DemotionTerminateRequestedAt  pgtype.Timestamptz `json:"demotion_terminate_requested_at"`
+	AgentVersion                  *string            `json:"agent_version"`
+	ImageDigest                   *string            `json:"image_digest"`
 }
 
 type SandboxHistory struct {
@@ -2180,6 +2182,7 @@ type Turn struct {
 	CostUsd                 pgtype.Numeric        `json:"cost_usd"`
 	ReviewKnowledgeMode     *string               `json:"review_knowledge_mode"`
 	ReviewKnowledgeDecision []byte                `json:"review_knowledge_decision"`
+	CorrelationID           *string               `json:"correlation_id"`
 }
 
 type TurnStepCost struct {

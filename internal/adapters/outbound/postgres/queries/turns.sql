@@ -53,8 +53,18 @@
 -- review_knowledge_decision is pre-marshaled JSON (internal/domain/
 -- knowledge.InjectedRecord) -- this core does no encoding of its own,
 -- mirroring review_depth_decision's own identical convention.
-INSERT INTO turns (session_id, status, prompt, model_id, plan_mode, effort, review_head_sha, answer_only, review_depth, review_depth_decision, review_knowledge_mode, review_knowledge_decision)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+--
+-- correlation_id (migrations/000121_turns_correlation_id.up.sql, §12.2
+-- item 1's own session-rail gap, §5.3) mirrors review_head_sha's own
+-- identical shape one column further: nil/absent for a caller with no
+-- correlation id in context (a turn dispatched with no live request
+-- context at all -- should not happen in production, but this column is
+-- not the place to enforce that), set exactly once, at creation, from
+-- whatever internal/platform.CorrelationIDFromContext(ctx) returns at
+-- EVERY call site that creates a turn, never re-derived or backfilled
+-- later.
+INSERT INTO turns (session_id, status, prompt, model_id, plan_mode, effort, review_head_sha, answer_only, review_depth, review_depth_decision, review_knowledge_mode, review_knowledge_decision, correlation_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 RETURNING *;
 
 -- name: GetTurn :one

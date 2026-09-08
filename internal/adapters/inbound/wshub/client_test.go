@@ -450,6 +450,67 @@ func TestClientHandler_ParticipantsReflectsLiveConnections(t *testing.T) {
 	}
 }
 
+// TestClientHandler_SubscribedPayloadCorrelationIdIsLatestTurn is §12.2
+// item 1's own session-rail gap: state.correlationId (client.go's own
+// latestTurnCorrelationID) must report the SESSION's own MOST RECENTLY
+// created turn's correlation id, not merely "some" turn's -- proven by
+// seeding two real turns with two DIFFERENT correlation ids (via the same
+// TurnStore.Create production call every real turn-creation path uses)
+// and asserting the subscribed reply reports the SECOND one.
+func TestClientHandler_SubscribedPayloadCorrelationIdIsLatestTurn(t *testing.T) {
+	rig, sessionRow := newClientTestRig(t, platform.DefaultTimeouts())
+	ctx := context.Background()
+
+	firstCorrelationID := "cor_first00"
+	if _, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{
+		SessionID:     sessionRow.ID,
+		Status:        sqlcgen.TurnStatusCompleted,
+		CorrelationID: &firstCorrelationID,
+	}); err != nil {
+		t.Fatalf("create first turn: %v", err)
+	}
+	secondCorrelationID := "cor_second1"
+	if _, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{
+		SessionID:     sessionRow.ID,
+		Status:        sqlcgen.TurnStatusPending,
+		CorrelationID: &secondCorrelationID,
+	}); err != nil {
+		t.Fatalf("create second turn: %v", err)
+	}
+
+	token := createTestWSToken(ctx, t, rig.pool, sessionRow.ID, time.Now().Add(24*time.Hour))
+	conn, payload := dialAndSubscribe(ctx, t, rig.wsURL, sessionRow.ID.String(), token)
+	defer func() { _ = conn.CloseNow() }()
+
+	got, ok := payload.State["correlationId"]
+	if !ok {
+		t.Fatal("State has no \"correlationId\" key at all")
+	}
+	if got != secondCorrelationID {
+		t.Errorf("State[correlationId] = %v, want the SECOND (newest) turn's own %q, not the first's", got, secondCorrelationID)
+	}
+}
+
+// TestClientHandler_SubscribedPayloadCorrelationIdNullWithNoTurns proves
+// the honest null case: a session with no turns at all reports
+// state.correlationId as null, never a fabricated value.
+func TestClientHandler_SubscribedPayloadCorrelationIdNullWithNoTurns(t *testing.T) {
+	rig, sessionRow := newClientTestRig(t, platform.DefaultTimeouts())
+	ctx := context.Background()
+
+	token := createTestWSToken(ctx, t, rig.pool, sessionRow.ID, time.Now().Add(24*time.Hour))
+	conn, payload := dialAndSubscribe(ctx, t, rig.wsURL, sessionRow.ID.String(), token)
+	defer func() { _ = conn.CloseNow() }()
+
+	got, ok := payload.State["correlationId"]
+	if !ok {
+		t.Fatal("State has no \"correlationId\" key at all")
+	}
+	if got != nil {
+		t.Errorf("State[correlationId] = %v, want nil (this session has no turns yet)", got)
+	}
+}
+
 // dialAndSubscribe connects, sends the subscribe frame, reads back and
 // parses the subscribed reply -- mirrors TestClientHandler_
 // ValidHandshakeSubscribes' own inline sequence, factored out because

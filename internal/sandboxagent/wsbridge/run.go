@@ -157,11 +157,13 @@ func (b *Bridge) runConnection(ctx context.Context, conn *websocket.Conn) error 
 // verbatim from a PRIOR connection's buffer.
 func (b *Bridge) sendReady(ctx context.Context, conn *websocket.Conn) error {
 	msg := sandboxws.Ready{
-		Type:      "ready",
-		MessageId: b.newMessageID(),
-		SessionId: b.sessionID,
-		Gen:       b.sessionGen,
-		Timestamp: time.Now(),
+		Type:         "ready",
+		MessageId:    b.newMessageID(),
+		SessionId:    b.sessionID,
+		Gen:          b.sessionGen,
+		Timestamp:    time.Now(),
+		AgentVersion: b.agentVersion,
+		ImageDigest:  b.imageDigest,
 	}
 	payload, err := json.Marshal(msg)
 	if err != nil {

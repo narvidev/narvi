@@ -367,9 +367,11 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 		// own: still persisted, liveness bumped.
 
 		if _, err := a.stores.sandbox.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
-			SessionID:  a.sessionID,
-			Status:     target,
-			LastSeenAt: pgtype.Timestamptz{Time: now, Valid: true},
+			SessionID:    a.sessionID,
+			Status:       target,
+			LastSeenAt:   pgtype.Timestamptz{Time: now, Valid: true},
+			AgentVersion: cmd.AgentVersion,
+			ImageDigest:  cmd.ImageDigest,
 		}); err != nil {
 			return fmt.Errorf("sessionactor: update sandbox status/liveness: %w", err)
 		}
