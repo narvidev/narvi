@@ -94,16 +94,44 @@ func ProviderForOutboxKind(kind string) (Provider, bool) {
 	return "", false
 }
 
+// ParseProvider reports whether raw is exactly one of the three known
+// Provider literal spellings ("slack"/"linear"/"github") -- the single
+// canonical spelling Provider's own doc comment describes, reused here so
+// platform.Load validates NARVI_INGRESS_ENABLED entries against the SAME
+// vocabulary this package already defines, rather than a second,
+// independently-typed switch. ok=false for anything else, including a
+// near-miss typo ("slcak") -- platform.Load turns that into a loud boot
+// failure (*platform.InvalidIngressEnabledError), never a silently-dropped
+// entry: a typo'd surface name here is exactly the "indistinguishable from
+// a deliberate disabling" failure mode this whole optionality design
+// refuses, one layer up from a secret.
+func ParseProvider(raw string) (Provider, bool) {
+	p := Provider(raw)
+	for _, known := range Providers {
+		if p == known {
+			return p, true
+		}
+	}
+	return "", false
+}
+
 // ConfiguredSlack reports whether every value §8.10's Slack ingress
 // adapter (internal/adapters/inbound/slack) needs to function is present:
 // signingSecret (platform.Config.SlackSigningSecret, verifies
 // "X-Slack-Signature" on every inbound webhook, fail-closed if absent)
 // and botToken (platform.Config.SlackBotToken, the one direct
 // chat.postMessage call the in-thread ack makes). Both are boot-required
-// with no default (internal/platform/config.go's own
-// slackSigningSecretEnvVarName/slackBotTokenEnvVarName doc comments) --
-// this function still checks both explicitly, independent of that
-// boot-time enforcement, since a caller here passes plain already-loaded
+// with no default WHEN THIS SURFACE IS ENABLED (platform.Config.
+// IngressEnabled -- internal/platform/config.go's own
+// slackSigningSecretEnvVarName/slackBotTokenEnvVarName doc comments); a
+// deployment that never enables Slack ingress at all (§12.5's own
+// ingress-optionality decision) leaves both empty by design, and this
+// function correctly reports false for it -- ConfiguredSlack alone cannot
+// tell "disabled" from "enabled but missing a secret" apart, which is why
+// its caller (httpapi.configuredForProvider) ALSO checks IngressEnabled
+// directly rather than relying on this predicate alone. This function
+// still checks both explicitly, independent of that boot-time enforcement,
+// since a caller here passes plain already-loaded
 // strings, not platform.Config itself (§11: no I/O in domain -- Config is
 // loaded by platform.Load() at boot, a concern this package stays
 // independent of), and unit tests construct partially-empty inputs
@@ -124,10 +152,15 @@ func ConfiguredSlack(signingSecret, botToken string) bool {
 // every inbound webhook), oauthClientID and oauthClientSecret
 // (platform.Config.LinearOAuthClientID/LinearOAuthClientSecret, the
 // workspace-installation OAuth2 app credentials §8.10's own adapter calls
-// Linear's API with) -- all three boot-required together
-// (linearWebhookSecretEnvVarName's own doc comment group,
-// internal/platform/config.go), so a genuinely working Linear ingress
-// always has all three.
+// Linear's API with) -- all three boot-required together WHEN THIS SURFACE
+// IS ENABLED (platform.Config.IngressEnabled, §12.5's own ingress-
+// optionality decision; linearWebhookSecretEnvVarName's own doc comment
+// group, internal/platform/config.go), so a genuinely working Linear
+// ingress always has all three. A deployment that never enables Linear
+// ingress leaves all three empty by design; see ConfiguredSlack's own doc
+// comment for why this predicate alone cannot distinguish that from a
+// half-configured enabled surface, and why its caller checks
+// IngressEnabled separately.
 //
 // Deliberately EXCLUDES LinearDefaultRepoName/LinearDefaultRepoURL, for
 // the identical reason ConfiguredSlack excludes their Slack counterparts
@@ -158,6 +191,13 @@ func ConfiguredLinear(webhookSecret, oauthClientID, oauthClientSecret string) bo
 // each individually optional with its own safe default or explicit
 // "not configured" zero value, none of them gating whether this ingress
 // surface can receive or send at all.
+//
+// All three are boot-required WHEN THIS SURFACE IS ENABLED
+// (platform.Config.IngressEnabled, §12.5's own ingress-optionality
+// decision) -- a deployment that never enables GitHub ingress leaves all
+// three empty by design; see ConfiguredSlack's own doc comment for why
+// this predicate alone cannot distinguish that from a half-configured
+// enabled surface, and why its caller checks IngressEnabled separately.
 func ConfiguredGitHub(webhookSecret, botHandle, botToken string) bool {
 	return webhookSecret != "" && botHandle != "" && botToken != ""
 }
