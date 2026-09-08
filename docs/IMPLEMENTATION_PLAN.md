@@ -4,13 +4,13 @@
 
 Narvi's technical specification (autonomous coding agents in sandboxes) is in
 [docs/TECHNICAL_PLAN.md](TECHNICAL_PLAN.md) (§0–§40), and the nine-view UI design spec is in
-[docs/design/mockups.html](design/mockups.html). This plan breaks 16 phases (0–15) into **151 Steps**.
-129 of them are scheduled work in this repository (Steps 108-110 were routed out to a separate
+[docs/design/mockups.html](design/mockups.html). This plan breaks 17 phases (0–16) into **159 Steps**.
+132 of them are scheduled work in this repository (Steps 108-110 were routed out to a separate
 repository when the extension boundary was drawn, and keep their numbers as pointers so every
-citation of them stays valid) — including Phase 4's own 5 additive Steps, 40-44, Phase 8's 9
+citation of them stays valid; Phase 16's 3 are gated on a product decision nobody has taken) — including Phase 4's own 5 additive Steps, 40-44, Phase 8's 9
 shadow-mode Steps, 96-104, Phase 9's 6 knowledge Steps, 105-110, and Phase 12's 4 boundary Steps,
 132-135, Phase 13's 7 silent-failure Steps, 136-142, Phase 14's 5 composition Steps, 143-147,
-and Phase 15's 4 guardrail Steps, 148-151. The other 19 are Phase 11 (Steps 113-131): named
+and Phase 15's 4 guardrail Steps, 148-151. The other 24 are Phase 11 (Steps 113-131, plus 152-156 appended after the phase was scheduled): named
 gaps, each filed as the shipping Step
 that found it declared it, and since scheduled in full with an execution order and a milestone of
 its own. They gate nothing else, which is why Phase 12 follows them numerically without waiting
@@ -419,7 +419,9 @@ the fail direction this repository refuses everywhere else. An explicit declarat
 its secrets is a loud boot failure. In every outcome, `configured` on the §12.5 read model must
 become honest or be removed — a field that cannot be false informs nobody.
 
-**Phase 11 milestone**: every row either shipped, or closed by a recorded decision that says why
+**Phase 11 milestone**: every row — including the five appended after the phase was scheduled
+(152-156, filed once a sweep of this session's own audits found real absences nothing recorded) —
+either shipped, or closed by a recorded decision that says why
 it will not be — the second being a legitimate outcome for 129 and 119's residue, never a silent
 omission. `configured` no longer reports a value it cannot fail to report. And the sweep in 128 is
 followed by widening the checker to the roots it audited, so the citations it corrected cannot
@@ -446,6 +448,40 @@ rot again.
 | 129 | opencode adapter: `TestRealTurn_Aborted` under the full suite | Fails intermittently under the full parallel `-race` run and passes in isolation every time; the package was untouched by the Phase 8 work that surfaced it (observed three times, 2026-08). Filed rather than patched: there is no hypothesis yet that explains the failure, and stabilizing a timing test without one is how flakes get papered over instead of understood (Step 118's own rule) | — |
 | 130 | githarden: the content-filter class | `githarden`'s shared `hardeningFlags` neutralizes hooks, fsmonitor, credential helpers, `core.sshCommand`, `diff.external` and the pager, and its own doc records that git content filters (`filter.<name>.clean`/`smudge`) are a class it does not cover. A checked-in `.gitattributes` alone cannot arm one — the command half lives in config, which the sandbox controls — but the class deserves either explicit neutralization (an empty `filter.*` reset, the `credential.helper=` precedent) or a recorded argument that no in-sandbox flow can supply the config half | — |
 | 131 | real-spawn hook tests time out under full-suite load | `TestCloudIdentityTokenReachesRealSpawnedHook` and `TestOIDCClusterBindingTokenReachesRealSpawnedHook` (`cmd/sandbox-agent`) run a real `setup.sh` under a 5-second ceiling; under a full local `make test` with concurrent compile load both timed out (2026-09-03) and passed isolated immediately after. Same family as Steps 118/173, same honesty rule: filed with the observation, and any raised ceiling should follow from a worst-case spawn-latency argument, not from one loaded run | — |
+| 152 | no un-entitlement, ever | A repository becomes eligible for session creation by having a `github_pr_sessions` row and never stops being so: nothing an operator can do — removing the GitHub App installation, revoking it, deleting the repository — takes that eligibility away. Found while auditing Step 106, where it was correctly ruled out as a defect of that Step: the predicate it added is sound, and this is the absence behind it. An authorization gate that can only ever open is worth a row of its own. The shape needs deciding before code: whether eligibility is recomputed from a live installation read, expired by age, or revoked by an explicit operator action — the third is the only one that stays true with no network | §31.4 |
+| 153 | the bot token is an egress credential in the ingress bundle | `NARVI_GITHUB_BOT_TOKEN` posts comments and commit statuses — pure egress — yet it lives in the same required-set as the webhook secret and bot handle, which are ingress. Step 119 made ingress optional and this bundling immediately produced a notifier registered with an empty token; the fix gated the notifier, and recorded that the bundling itself is the cause. Any future egress needing the bot token inherits the same silent tie to ingress being enabled. Untangling it means deciding which credentials belong to which axis, the same boundary question Step 119 already answered one way for GitHub OAuth login and the SCM adapter | §12.5 |
+| 154 | automerge polls on indefinitely through an auth failure | The automerge worker has no dead-letter and no backoff for an authentication failure: with a bad or empty bot token it keeps polling GitHub, forever, at full rate. Surfaced by Step 119's audit and correctly refuted as a defect of that Step — it is `main`'s behaviour verbatim, predating it. Every other outbound path in this repository either dead-letters or backs off; this one does neither, and an operator sees only rate-limit noise | §17 |
+| 155 | a repository rename splits its own corpus | `repo_full_name` is the scope key for per-repository knowledge, and that corpus outlives any PR session — so a rename or transfer silently leaves the old prose unreachable under a name nothing will ever query again, with no error and no migration. Named as an accepted residual limit in the spec rather than hidden, and filed here so it is not rediscovered as a bug. Consistency with `repo_settings` and `github_pr_sessions` argues for inheriting whatever rename fix those tables get, which is the cheapest correct answer and does not exist yet | §31.9 |
+| 156 | the embeddings provider is an un-closed egress channel | If mode B is ever built, a hosted embeddings provider receives customer-derived prose — a new egress channel, surfaced in the spec and left open. The named path to closing it for a self-hoster is a wire-compatible adapter, so the same corpus can be served by something the operator runs. Deferred, not dropped. **Moot under a kill decision on mode B**, and filed with that condition attached rather than as unconditional work | §31.5, §31.9 |
+
+## Phase 16 — External-client prerequisites (3 Steps, additive, gated)
+
+What this repository owes an external client before one can be built honestly. It is filed
+here because of where it was NOT filed: all three were specified in the *dependent's* plan —
+a separate repository for a client that does not exist — and nowhere in this one. A
+dependency recorded only by the party who needs it is a dependency that gets forgotten.
+
+**Gated on a decision that has not been taken**: whether an external client is built at all.
+Step 157 is worth doing regardless — a compatibility policy over `/contracts` is good
+hygiene for a repository whose wire shapes an embedded SPA and a growing test surface already
+consume. Steps 158 and 159 buy nothing until something outside this repository speaks to it,
+and should not be started on speculation.
+
+The rule that keeps this phase honest, and the reason it is not Phase 11: these are not gaps
+a shipped Step left behind. Nothing here is missing from what this repository set out to
+build. They are the price of a product decision, and they appear the moment it is made.
+
+| Step | Title | Content | Ref. |
+|---|---|---|---|
+| 157 | `/contracts` as a stable external API | A version marker, a written compatibility policy, changelog discipline, and CI that fails a breaking change rather than reporting it. Today those contracts are an internal convenience shared between this repository and its own SPA, regenerated in lockstep — which is exactly why a breaking change costs nothing today and would cost a shipped client tomorrow. Independent of any client decision, and the only one of the three worth doing before one is taken | §6.3 |
+| 158 | native-client authentication | A device flow and device tokens with per-client scopes. The web UI's cookie session is not a native client's authentication, and a long-lived token pasted into an application is not an answer. Note for whoever builds it: this repository already has a device flow, for linking a ChatGPT account to fetch provider credentials — a different purpose, and not to be widened into this one without deciding whether one mechanism should serve both | §13.1 |
+| 159 | cursor-resumable event stream | Catch-up from a last-seen offset after a disconnect, without re-pulling a session's history. Partly present already, which is why this needs an audit before code: `fetch_history` is cursor-paginated, and Step 114 gave the reconnect replay a truncation flag so a consumer can at least tell a cut replay from a complete one. What is missing is resuming the subscribe replay itself from an offset. Close the gap, not the whole surface | §6.1, §6.2 |
+
+**Phase 16 milestone**: a client outside this repository authenticates as a native client,
+follows a session to completion, survives a network drop and catches up from its own offset
+without re-pulling — demonstrated by a script client in this repository's own tests, so the
+guarantee does not depend on a repository this one cannot see. Under no client decision, the
+milestone is Step 157 alone, and 158/159 stay unstarted rather than half-built.
 
 ## Phase 12 — Extension boundaries (4 Steps, additive)
 
