@@ -113,17 +113,35 @@ func GetIntegrations(cfg *platform.Config, outbox *postgres.OutboxStore, deliver
 	}
 }
 
-// configuredForProvider dispatches to internal/domain/integrations' own
-// per-surface predicate (ConfiguredSlack/ConfiguredLinear/ConfiguredGitHub),
-// extracting exactly the platform.Config fields each one's own doc
-// comment documents as required -- see those doc comments for the full
-// "why this exact set, and why not GitHubClientID/GitHubClientSecret"
-// reasoning. The default branch is unreachable in practice
-// (integrations.Providers is this package's own fixed, exhaustive list)
-// but defended against anyway rather than a panic, mirroring
-// authz.Authorize's own "should be unreachable" ErrUnknownAction
+// configuredForProvider reports whether p reads as "connected": p must be
+// EXPLICITLY ENABLED on this deployment (cfg.IngressEnabled, §12.5's own
+// ingress-optionality decision) AND have its own full credential set
+// present, dispatched to internal/domain/integrations' own per-surface
+// predicate (ConfiguredSlack/ConfiguredLinear/ConfiguredGitHub) -- see
+// those doc comments for the full "why this exact set, and why not
+// GitHubClientID/GitHubClientSecret" reasoning. The default branch is
+// unreachable in practice (integrations.Providers is this package's own
+// fixed, exhaustive list) but defended against anyway rather than a panic,
+// mirroring authz.Authorize's own "should be unreachable" ErrUnknownAction
 // fallback.
+//
+// This is genuinely a two-valued question now, not the "structurally
+// always true" field an earlier draft of §12.5 shipped: a surface this
+// deployment never enabled reads configured=false, and a running process
+// can never observe "enabled but missing a secret" as a THIRD state --
+// platform.Load's own fail-fast boot gate refuses to start in that case,
+// so the only two states a live response can ever report are "enabled and
+// fully configured" and "not enabled here" (the cfg.IngressEnabled check
+// short-circuits before the predicate call, but the predicate is still
+// checked explicitly rather than assumed, exactly as its own doc comment
+// explains, since nothing here should quietly start trusting the boot
+// invariant instead of verifying it). A dedicated third wire value for
+// that unreachable state would encode a distinction no running deployment
+// can ever actually be in.
 func configuredForProvider(cfg *platform.Config, p integrations.Provider) bool {
+	if !cfg.IngressEnabled[p] {
+		return false
+	}
 	switch p {
 	case integrations.ProviderSlack:
 		return integrations.ConfiguredSlack(cfg.SlackSigningSecret, cfg.SlackBotToken)

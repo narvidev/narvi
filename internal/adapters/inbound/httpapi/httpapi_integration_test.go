@@ -55,6 +55,7 @@ import (
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/app/shadowledger"
+	"github.com/narvidev/narvi/internal/domain/integrations"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -464,6 +465,20 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		clusterBindings:        narvipg.NewClusterBindingStore(pool),
 		webhookDeliveries:      narvipg.NewWebhookDeliveryStore(pool),
 		cfg: &platform.Config{
+			// IngressEnabled: every one of this rig's own ~170 existing
+			// tests (and the §12.5 integration tests that assert
+			// configured=true against this exact fixture) predates
+			// NARVI_INGRESS_ENABLED and expects all three surfaces
+			// enabled, matching platform.Load's own "unset means every
+			// surface enabled" default (internal/platform/config.go's own
+			// ingressEnabledEnvVarName doc comment) -- this rig builds a
+			// Config literal directly rather than through Load, so that
+			// default must be spelled out explicitly here instead.
+			IngressEnabled: map[integrations.Provider]bool{
+				integrations.ProviderSlack:  true,
+				integrations.ProviderLinear: true,
+				integrations.ProviderGitHub: true,
+			},
 			SlackSigningSecret:      "test-slack-signing-secret",
 			SlackBotToken:           "test-slack-bot-token",
 			LinearWebhookSecret:     "test-linear-webhook-secret",

@@ -17,8 +17,23 @@ import (
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/domain/integrations"
 	"github.com/narvidev/narvi/internal/platform"
 )
+
+// allIngressEnabled is the §12.5 fixture shorthand this file's own
+// partially-configured/secret-leak tests reuse: every override below is
+// exercising a MISSING SECRET while the surface itself is enabled, never
+// the disabled-surface case (TestGetIntegrations_DisabledSurfaceReportsFalse
+// below is the one that exercises that), so each needs all three surfaces
+// enabled or configuredForProvider's own IngressEnabled short-circuit would
+// report false for the "wrong" reason and the test would stop proving what
+// its own name says it proves.
+var allIngressEnabled = map[integrations.Provider]bool{
+	integrations.ProviderSlack:  true,
+	integrations.ProviderLinear: true,
+	integrations.ProviderGitHub: true,
+}
 
 // TestGetIntegrations_MemberDenied proves an ordinary member is denied
 // (403) -- authz.ActionManageIntegrations is admin only (§13.3 row 6),
@@ -101,6 +116,8 @@ func TestGetIntegrations_AdminAllowed_AllConfigured(t *testing.T) {
 func TestGetIntegrations_PartiallyConfigured_AllThreeReportFalse(t *testing.T) {
 	rig := newTestRig(t, func(r *testRig) {
 		r.cfg = &platform.Config{
+			IngressEnabled: allIngressEnabled,
+
 			SlackSigningSecret: "present",
 			SlackBotToken:      "", // missing -- Slack incomplete.
 
@@ -124,6 +141,61 @@ func TestGetIntegrations_PartiallyConfigured_AllThreeReportFalse(t *testing.T) {
 	for _, row := range got.Integrations {
 		if row.Configured {
 			t.Errorf("Integrations (%s).Configured = true, want false (only partially configured)", row.Surface)
+		}
+	}
+}
+
+// TestGetIntegrations_DisabledSurfaceReportsFalse proves the OTHER half of
+// §12.5's now-genuinely-two-valued "configured" field: a surface with its
+// own FULL credential set present but not named in NARVI_INGRESS_ENABLED
+// (platform.Config.IngressEnabled) still reads configured=false -- the
+// point of this Step, since before it "every secret present" was the only
+// way this field could ever read true at all. Slack here has every secret
+// set (proving the false reading comes from IngressEnabled, never from a
+// missing secret this test forgot to set) while Linear/GitHub stay enabled
+// and fully configured, proving the other two are unaffected by Slack's
+// own disabled state.
+func TestGetIntegrations_DisabledSurfaceReportsFalse(t *testing.T) {
+	rig := newTestRig(t, func(r *testRig) {
+		r.cfg = &platform.Config{
+			IngressEnabled: map[integrations.Provider]bool{
+				integrations.ProviderLinear: true,
+				integrations.ProviderGitHub: true,
+				// Slack deliberately absent -- not enabled on this
+				// deployment, despite every secret below being present.
+			},
+
+			SlackSigningSecret: "present-but-disabled",
+			SlackBotToken:      "present-but-disabled",
+
+			LinearWebhookSecret:     "present",
+			LinearOAuthClientID:     "present",
+			LinearOAuthClientSecret: "present",
+
+			GitHubWebhookSecret: "present",
+			GitHubBotHandle:     "present",
+			GitHubBotToken:      "present",
+		}
+	})
+	ctx := context.Background()
+	_, token := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleAdmin)
+
+	var got restdtos.ListIntegrationsResponse
+	status := rig.doJSON(t, http.MethodGet, "/api/integrations", nil, &got, token)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", status, http.StatusOK)
+	}
+
+	for _, row := range got.Integrations {
+		switch row.Surface {
+		case restdtos.IntegrationSurfaceSlack:
+			if row.Configured {
+				t.Errorf("Integrations[slack].Configured = true, want false (not in IngressEnabled, despite every secret being present)")
+			}
+		case restdtos.IntegrationSurfaceLinear, restdtos.IntegrationSurfaceGithub:
+			if !row.Configured {
+				t.Errorf("Integrations[%s].Configured = false, want true (enabled and fully configured)", row.Surface)
+			}
 		}
 	}
 }
@@ -161,6 +233,8 @@ func TestGetIntegrations_NoSecretsInRawResponse(t *testing.T) {
 	}
 	rig := newTestRig(t, func(r *testRig) {
 		r.cfg = &platform.Config{
+			IngressEnabled: allIngressEnabled,
+
 			SlackSigningSecret:      distinctiveSecrets[0],
 			SlackBotToken:           distinctiveSecrets[1],
 			LinearWebhookSecret:     distinctiveSecrets[2],
