@@ -2339,6 +2339,24 @@
             "null"
           ],
           "description": "A short, one-sentence, mechanically generated description of the most recently closed invocation's own outcome (internal/domain/automation.BuildArtifactSummary). Null until lastRunAt is first set."
+        },
+        "runHealth": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "description": "§12.2 item 4's own health-column success ratio (\"12/12 ok\", \"47/48 ok\") -- an ALL-TIME count over automation_runs (postgres.AutomationRunStore.ListRunHealth), computed fresh on every read, never a persisted counter. Null when this automation has never had a terminal (succeeded/failed) run -- an honest \"no runs yet\", never a fabricated 0/0.",
+          "required": ["succeededRuns", "terminalRuns"],
+          "properties": {
+            "succeededRuns": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Runs that reached automation_run_status 'succeeded', all-time."
+            },
+            "terminalRuns": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Runs that reached EITHER terminal status ('succeeded' or 'failed'), all-time -- the ratio's own denominator."
+            }
+          }
         }
       }
     },

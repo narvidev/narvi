@@ -85,6 +85,17 @@ func (s *AutomationRunStore) CountTerminalForInvocation(ctx context.Context, inv
 	return s.q.CountTerminalRunsForInvocation(ctx, invocationID)
 }
 
+// ListRunHealth returns the all-time succeeded/terminal run counts for
+// every id in automationIDs that has at least one terminal run -- §12.2
+// item 4's own health-ratio gap (see ListRunHealthForAutomations' own
+// generated doc comment for the full "why per-request, why all-time").
+// An id with no terminal runs simply does not appear in the result; the
+// caller (httpapi's own automationToDTO) treats that as "no runs yet",
+// never a fabricated 0/0.
+func (s *AutomationRunStore) ListRunHealth(ctx context.Context, automationIDs []pgtype.UUID) ([]sqlcgen.ListRunHealthForAutomationsRow, error) {
+	return s.q.ListRunHealthForAutomations(ctx, automationIDs)
+}
+
 // ListForInvocation returns every run of invocationID, oldest first --
 // backs §8.4's own "artifact_summary populated" (app/automation's own
 // closeout.go).

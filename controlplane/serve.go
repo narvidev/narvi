@@ -2144,8 +2144,8 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	router.Route("/api/automations", func(r chi.Router) {
 		r.Use(auth.Middleware(userSessionStore, userStore))
 		r.Post("/", httpapi.CreateAutomation(automationStore))
-		r.Get("/", httpapi.ListAutomations(automationStore))
-		r.Get("/{automationID}", httpapi.GetAutomation(automationStore))
+		r.Get("/", httpapi.ListAutomations(automationStore, automationRunStore))
+		r.Get("/{automationID}", httpapi.GetAutomation(automationStore, automationRunStore))
 		// invocations ("automations health/runs table", §12.2 item 4): the
 		// expandable invocation -> runs read model automations.go's own
 		// automation-level lastRunAt/lastRunStatus/artifactSummary fields
@@ -2153,10 +2153,10 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// own doc comment. Same "no extra RBAC beyond logged in" gate as
 		// Get/List immediately above.
 		r.Get("/{automationID}/invocations", httpapi.ListAutomationInvocations(automationStore, automationInvocationStore, automationRunStore))
-		r.Post("/{automationID}/pause", httpapi.PauseAutomation(automationStore))
-		r.Post("/{automationID}/resume", httpapi.ResumeAutomation(automationStore))
-		r.Post("/{automationID}/webhook-token", httpapi.RotateAutomationWebhookToken(automationStore))
-		r.Delete("/{automationID}/webhook-token", httpapi.RevokeAutomationWebhookToken(automationStore))
+		r.Post("/{automationID}/pause", httpapi.PauseAutomation(automationStore, automationRunStore))
+		r.Post("/{automationID}/resume", httpapi.ResumeAutomation(automationStore, automationRunStore))
+		r.Post("/{automationID}/webhook-token", httpapi.RotateAutomationWebhookToken(automationStore, automationRunStore))
+		r.Delete("/{automationID}/webhook-token", httpapi.RevokeAutomationWebhookToken(automationStore, automationRunStore))
 	})
 
 	// /webhooks/automations/{automationID} (§8.4's own "webhook-

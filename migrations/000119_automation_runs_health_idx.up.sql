@@ -1,0 +1,13 @@
+-- Backs ListRunHealthForAutomations (queries/automationruns.sql, §12.2
+-- item 4's own health-ratio gap, §8.4) -- a per-automation aggregate over
+-- automation_runs' own terminal rows (status IN ('succeeded', 'failed')),
+-- grouped by automation_id. A partial index scoped to exactly the status
+-- set that query's own WHERE clause filters on, mirroring this table's
+-- own established convention immediately below in migrations/
+-- 000053_automation_runs.up.sql (automation_runs_starting_sweep_idx/
+-- automation_runs_running_sweep_idx: "each partial index scoped to
+-- exactly the one status/timestamp column its own sweep threshold
+-- compares against") -- an automation with a long run history should not
+-- force a full-table scan every time the automations list renders its own
+-- health column.
+CREATE INDEX automation_runs_health_idx ON automation_runs (automation_id) WHERE status IN ('succeeded', 'failed');

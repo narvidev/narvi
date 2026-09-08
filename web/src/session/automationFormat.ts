@@ -66,6 +66,19 @@ export function triggerSummary(triggerType: Automation['triggerType'], cfg: Reco
  * static "in 11 h" example would otherwise mislead this view into
  * fabricating).
  */
+/**
+ * runHealthLabel renders §12.2 item 4's own health-ratio text
+ * (mockups.html's own "12/12 ok" / "47/48 ok") from Automation.runHealth
+ * -- null when this automation has never had a terminal run (the field
+ * itself is null/undefined on the wire), rendered by the caller as
+ * whatever it already shows for "no data yet" rather than a fabricated
+ * ratio (AutomationsView.tsx's own existing plain status chip).
+ */
+export function runHealthLabel(runHealth: Automation['runHealth']): string | null {
+  if (runHealth == null) return null
+  return `${runHealth.succeededRuns}/${runHealth.terminalRuns} ok`
+}
+
 export function nextRunSummary(automation: Automation): string {
   if (automation.status === 'paused') return '—'
   if (automation.triggerType === 'cron') {

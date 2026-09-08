@@ -253,6 +253,13 @@ type Automation struct {
 	// own runs fan out against.
 	Repos []AutomationReposElem `json:"repos" yaml:"repos" mapstructure:"repos"`
 
+	// §12.2 item 4's own health-column success ratio ("12/12 ok", "47/48 ok") -- an
+	// ALL-TIME count over automation_runs
+	// (postgres.AutomationRunStore.ListRunHealth), computed fresh on every read,
+	// never a persisted counter. Null when this automation has never had a terminal
+	// (succeeded/failed) run -- an honest "no runs yet", never a fabricated 0/0.
+	RunHealth *AutomationRunHealth `json:"runHealth,omitempty,omitzero" yaml:"runHealth,omitempty" mapstructure:"runHealth,omitempty"`
+
 	// Meaningful only when sandboxMockConfigured is true; null means the default
 	// "contracts/api".
 	SandboxContractsPath AutomationSandboxContractsPath `json:"sandboxContractsPath" yaml:"sandboxContractsPath" mapstructure:"sandboxContractsPath"`
@@ -568,6 +575,47 @@ type AutomationRun struct {
 
 // Null while status is starting/running.
 type AutomationRunCompletedAt = *time.Time
+
+// §12.2 item 4's own health-column success ratio ("12/12 ok", "47/48 ok") -- an
+// ALL-TIME count over automation_runs (postgres.AutomationRunStore.ListRunHealth),
+// computed fresh on every read, never a persisted counter. Null when this
+// automation has never had a terminal (succeeded/failed) run -- an honest "no runs
+// yet", never a fabricated 0/0.
+type AutomationRunHealth struct {
+	// Runs that reached automation_run_status 'succeeded', all-time.
+	SucceededRuns int `json:"succeededRuns" yaml:"succeededRuns" mapstructure:"succeededRuns"`
+
+	// Runs that reached EITHER terminal status ('succeeded' or 'failed'), all-time --
+	// the ratio's own denominator.
+	TerminalRuns int `json:"terminalRuns" yaml:"terminalRuns" mapstructure:"terminalRuns"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *AutomationRunHealth) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["succeededRuns"]; raw != nil && !ok {
+		return fmt.Errorf("field succeededRuns in AutomationRunHealth: required")
+	}
+	if _, ok := raw["terminalRuns"]; raw != nil && !ok {
+		return fmt.Errorf("field terminalRuns in AutomationRunHealth: required")
+	}
+	type Plain AutomationRunHealth
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if 0 > plain.SucceededRuns {
+		return fmt.Errorf("field %s: must be >= %v", "succeededRuns", 0)
+	}
+	if 0 > plain.TerminalRuns {
+		return fmt.Errorf("field %s: must be >= %v", "terminalRuns", 0)
+	}
+	*j = AutomationRunHealth(plain)
+	return nil
+}
 
 // Null until this run's own linked turn first reaches Processing
 // (automation.RunTriggerProcessing).
@@ -11267,9 +11315,6 @@ type WorkflowStepRunOutcomeSummary *string
 type WorkflowStepRunStatus string
 
 const WorkflowStepRunStatusAwaitingDecision WorkflowStepRunStatus = "awaiting_decision"
-const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
-const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
-const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
 const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
 
 var enumValues_WorkflowStepRunStatus = []interface{}{
@@ -11299,11 +11344,6 @@ func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 	*j = WorkflowStepRunStatus(v)
 	return nil
 }
-
-// The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
-// sequential turn'). Null while an awaiting_decision (hitlBefore-gated) attempt
-// exists before any turn does.
-type WorkflowStepRunTurnId *string
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
@@ -11363,3 +11403,12 @@ func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
 }
 
 type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
+
+const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
+const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
+const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
+
+// The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
+// sequential turn'). Null while an awaiting_decision (hitlBefore-gated) attempt
+// exists before any turn does.
+type WorkflowStepRunTurnId *string

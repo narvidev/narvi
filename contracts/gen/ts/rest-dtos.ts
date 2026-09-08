@@ -1274,6 +1274,19 @@ export interface Automation {
    * A short, one-sentence, mechanically generated description of the most recently closed invocation's own outcome (internal/domain/automation.BuildArtifactSummary). Null until lastRunAt is first set.
    */
   artifactSummary: string | null;
+  /**
+   * §12.2 item 4's own health-column success ratio ("12/12 ok", "47/48 ok") -- an ALL-TIME count over automation_runs (postgres.AutomationRunStore.ListRunHealth), computed fresh on every read, never a persisted counter. Null when this automation has never had a terminal (succeeded/failed) run -- an honest "no runs yet", never a fabricated 0/0.
+   */
+  runHealth?: {
+    /**
+     * Runs that reached automation_run_status 'succeeded', all-time.
+     */
+    succeededRuns: number;
+    /**
+     * Runs that reached EITHER terminal status ('succeeded' or 'failed'), all-time -- the ratio's own denominator.
+     */
+    terminalRuns: number;
+  } | null;
 }
 /**
  * POST /api/automations's own request body (§8.4). Admin/maintainer only (authz.ActionManageAutomations).

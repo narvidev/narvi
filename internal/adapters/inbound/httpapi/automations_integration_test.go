@@ -407,3 +407,138 @@ func TestCreateAutomation_DuplicateEnvVarNameRejected(t *testing.T) {
 		t.Fatalf("status = %d, want %d", status, http.StatusBadRequest)
 	}
 }
+
+// TestGetAutomation_RunHealthReflectsRealTerminalRuns is §12.2 item 4's
+// own (§8.4) end-to-end proof: RunHealth is a real COUNT over
+// automation_runs, produced by seeding genuine invocation/run rows via the
+// SAME stores the engine itself writes through (mirrors
+// TestListAutomationInvocations_ReturnsNestedRunsNewestFirst's own
+// precedent in the sibling file), never asserted against a hand-built
+// response. One invocation fans out to three runs -- two succeeded, one
+// failed, one still 'running' (non-terminal, must not count in either
+// side of the ratio) -- so a mutation that dropped the status filter
+// entirely (counting every row) or counted 'succeeded' as the
+// denominator instead of "either terminal status" would both be caught.
+func TestGetAutomation_RunHealthReflectsRealTerminalRuns(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	owner, token := rig.createAuthenticatedUser(ctx, t)
+	automation := createManualAutomation(ctx, t, rig, owner.ID)
+
+	// Each run gets its OWN invocation (automation_runs_invocation_target_uniq,
+	// migrations/000054, is at-most-one row per (invocation_id, target) --
+	// a separate invocation per run is the simplest way to seed several
+	// runs without needing several distinct target repos, and is at least
+	// as representative of "all-time" as one invocation would be: real
+	// automations accumulate runs across MANY invocations over their
+	// lifetime, never all inside one).
+	target, err := json.Marshal(map[string]any{"name": "widgets", "url": "https://github.com/acme/widgets", "branch": nil})
+	if err != nil {
+		t.Fatalf("marshal target: %v", err)
+	}
+	for _, status := range []sqlcgen.AutomationRunStatus{sqlcgen.AutomationRunStatusSucceeded, sqlcgen.AutomationRunStatusSucceeded, sqlcgen.AutomationRunStatusFailed, sqlcgen.AutomationRunStatusRunning} {
+		inv, err := rig.automationInvocations.Create(ctx, sqlcgen.CreateAutomationInvocationParams{
+			AutomationID: automation.ID,
+			Targets:      []byte(`[{"name":"widgets","url":"https://github.com/acme/widgets","branch":null}]`),
+			TotalRuns:    1,
+		})
+		if err != nil {
+			t.Fatalf("create invocation (status %s): %v", status, err)
+		}
+		if _, err := rig.automationRuns.Create(ctx, sqlcgen.CreateAutomationRunParams{
+			InvocationID: inv.ID,
+			AutomationID: automation.ID,
+			Target:       target,
+			Status:       status,
+		}); err != nil {
+			t.Fatalf("create run (status %s): %v", status, err)
+		}
+	}
+
+	var got restdtos.Automation
+	status := rig.doJSON(t, http.MethodGet, "/api/automations/"+automation.ID.String(), nil, &got, token)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if got.RunHealth == nil {
+		t.Fatal("RunHealth = nil, want a real ratio (this automation has terminal runs)")
+	}
+	if got.RunHealth.SucceededRuns != 2 {
+		t.Errorf("RunHealth.SucceededRuns = %d, want 2", got.RunHealth.SucceededRuns)
+	}
+	if got.RunHealth.TerminalRuns != 3 {
+		t.Errorf("RunHealth.TerminalRuns = %d, want 3 (2 succeeded + 1 failed; the still-'running' 4th run must NOT count)", got.RunHealth.TerminalRuns)
+	}
+
+	// The list endpoint must report the identical ratio for the same
+	// automation -- ListAutomations' own BATCHED lookup must never drift
+	// from GetAutomation's own single-id lookup.
+	var list restdtos.ListAutomationsResponse
+	status = rig.doJSON(t, http.MethodGet, "/api/automations", nil, &list, token)
+	if status != http.StatusOK {
+		t.Fatalf("list status = %d, want 200", status)
+	}
+	found := false
+	for _, a := range list.Automations {
+		if a.Id != automation.ID.String() {
+			continue
+		}
+		found = true
+		if a.RunHealth == nil || a.RunHealth.SucceededRuns != 2 || a.RunHealth.TerminalRuns != 3 {
+			t.Errorf("list RunHealth = %+v, want {SucceededRuns:2 TerminalRuns:3}", a.RunHealth)
+		}
+	}
+	if !found {
+		t.Fatal("automation not present in ListAutomations response")
+	}
+}
+
+// TestGetAutomation_RunHealthNilWhenNoTerminalRunsYet proves a freshly
+// created automation with zero runs -- and, separately, one whose only
+// run is still non-terminal -- renders RunHealth as null, never a
+// fabricated 0/0: §12.2 item 4's own "an honest ratio... never a
+// fabricated 0/0" requirement.
+func TestGetAutomation_RunHealthNilWhenNoTerminalRunsYet(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	owner, token := rig.createAuthenticatedUser(ctx, t)
+	automation := createManualAutomation(ctx, t, rig, owner.ID)
+
+	var got restdtos.Automation
+	status := rig.doJSON(t, http.MethodGet, "/api/automations/"+automation.ID.String(), nil, &got, token)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if got.RunHealth != nil {
+		t.Errorf("RunHealth = %+v, want nil (no runs at all yet)", got.RunHealth)
+	}
+
+	target, err := json.Marshal(map[string]any{"name": "widgets", "url": "https://github.com/acme/widgets", "branch": nil})
+	if err != nil {
+		t.Fatalf("marshal target: %v", err)
+	}
+	inv, err := rig.automationInvocations.Create(ctx, sqlcgen.CreateAutomationInvocationParams{
+		AutomationID: automation.ID,
+		Targets:      []byte(`[{"name":"widgets","url":"https://github.com/acme/widgets","branch":null}]`),
+		TotalRuns:    1,
+	})
+	if err != nil {
+		t.Fatalf("create invocation: %v", err)
+	}
+	if _, err := rig.automationRuns.Create(ctx, sqlcgen.CreateAutomationRunParams{
+		InvocationID: inv.ID,
+		AutomationID: automation.ID,
+		Target:       target,
+		Status:       sqlcgen.AutomationRunStatusRunning,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	status = rig.doJSON(t, http.MethodGet, "/api/automations/"+automation.ID.String(), nil, &got, token)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if got.RunHealth != nil {
+		t.Errorf("RunHealth = %+v, want nil (its only run is still 'running', not terminal)", got.RunHealth)
+	}
+}

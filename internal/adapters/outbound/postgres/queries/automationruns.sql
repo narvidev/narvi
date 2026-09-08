@@ -121,3 +121,35 @@ SELECT * FROM automation_runs
 WHERE status = 'running' AND running_at < $1
 ORDER BY running_at
 LIMIT $2;
+
+-- name: ListRunHealthForAutomations :many
+-- Backs §12.2 item 4's own health-column ratio ("12/12 ok", "47/48 ok")
+-- and §8.4's own named gap ("Automation carries no aggregate; an honest
+-- ratio is a COUNT over automation_runs") -- computed PER REQUEST from
+-- this table directly, never persisted onto automations as a running
+-- counter: automation_runs.automation_id was denormalized from
+-- automation_invocations.automation_id back in migrations/
+-- 000053_automation_runs.up.sql specifically "so a per-automation health
+-- rollup... never has to join through automation_invocations at all" --
+-- this query is that rollup, and Postgres remains the single source of
+-- truth (§5.1) for a fact a plain aggregate query already answers
+-- correctly and cheaply (automation_runs_health_idx below), rather than
+-- a second, independently-written counter that could drift from the rows
+-- it summarizes.
+--
+-- ALL-TIME per automation (every terminal run ever, not a trailing
+-- window) -- the plan's own gap description names no window, and this is
+-- the same "cumulative, not windowed" shape CountTerminalRunsForInvocation
+-- above already uses one level down (per invocation instead of per
+-- automation). One row per automation_id that has AT LEAST ONE terminal
+-- run; an automation with zero terminal runs simply does not appear in
+-- the result (the caller's own job to render that as "no runs yet" rather
+-- than a fabricated 0/0).
+SELECT
+    automation_id,
+    count(*) FILTER (WHERE status = 'succeeded') AS succeeded_runs,
+    count(*) FILTER (WHERE status IN ('succeeded', 'failed')) AS terminal_runs
+FROM automation_runs
+WHERE automation_id = ANY(sqlc.arg('automation_ids')::uuid[])
+  AND status IN ('succeeded', 'failed')
+GROUP BY automation_id;

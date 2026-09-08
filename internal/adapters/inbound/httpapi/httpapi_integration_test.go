@@ -943,13 +943,13 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 	router.Route("/api/automations", func(r chi.Router) {
 		r.Use(auth.Middleware(rig.userSessions, rig.users))
 		r.Post("/", httpapi.CreateAutomation(rig.automations))
-		r.Get("/", httpapi.ListAutomations(rig.automations))
-		r.Get("/{automationID}", httpapi.GetAutomation(rig.automations))
+		r.Get("/", httpapi.ListAutomations(rig.automations, rig.automationRuns))
+		r.Get("/{automationID}", httpapi.GetAutomation(rig.automations, rig.automationRuns))
 		r.Get("/{automationID}/invocations", httpapi.ListAutomationInvocations(rig.automations, rig.automationInvocations, rig.automationRuns))
-		r.Post("/{automationID}/pause", httpapi.PauseAutomation(rig.automations))
-		r.Post("/{automationID}/resume", httpapi.ResumeAutomation(rig.automations))
-		r.Post("/{automationID}/webhook-token", httpapi.RotateAutomationWebhookToken(rig.automations))
-		r.Delete("/{automationID}/webhook-token", httpapi.RevokeAutomationWebhookToken(rig.automations))
+		r.Post("/{automationID}/pause", httpapi.PauseAutomation(rig.automations, rig.automationRuns))
+		r.Post("/{automationID}/resume", httpapi.ResumeAutomation(rig.automations, rig.automationRuns))
+		r.Post("/{automationID}/webhook-token", httpapi.RotateAutomationWebhookToken(rig.automations, rig.automationRuns))
+		r.Delete("/{automationID}/webhook-token", httpapi.RevokeAutomationWebhookToken(rig.automations, rig.automationRuns))
 	})
 	// /webhooks/automations/{automationID} -- mounted OUTSIDE auth.Middleware
 	// entirely, exactly like cmd/control-plane/main.go's own real wiring

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { Automation } from '@narvi/contracts/rest-dtos'
 
-import { AUTO_PAUSE_THRESHOLD, automationStatusTone, lastRunTone, nextRunSummary, runStatusTone, targetsSummary, triggerSummary } from '../automationFormat'
+import { AUTO_PAUSE_THRESHOLD, automationStatusTone, lastRunTone, nextRunSummary, runHealthLabel, runStatusTone, targetsSummary, triggerSummary } from '../automationFormat'
 
 function baseAutomation(overrides: Partial<Automation> = {}): Automation {
   return {
@@ -92,6 +92,21 @@ describe('triggerSummary', () => {
   it('manual and webhook render their own bare label', () => {
     expect(triggerSummary('manual', {})).toBe('manual')
     expect(triggerSummary('webhook', {})).toBe('webhook')
+  })
+})
+
+describe('runHealthLabel', () => {
+  it('renders "succeeded/terminal ok" (mockups.html\'s own "12/12 ok"/"47/48 ok")', () => {
+    expect(runHealthLabel({ succeededRuns: 12, terminalRuns: 12 })).toBe('12/12 ok')
+    expect(runHealthLabel({ succeededRuns: 47, terminalRuns: 48 })).toBe('47/48 ok')
+  })
+
+  it('returns null for null (never a fabricated 0/0 for "no runs yet")', () => {
+    expect(runHealthLabel(null)).toBeNull()
+  })
+
+  it('returns null for undefined (the field absent on the wire entirely)', () => {
+    expect(runHealthLabel(undefined)).toBeNull()
   })
 })
 
