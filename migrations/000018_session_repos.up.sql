@@ -20,7 +20,7 @@ ALTER TABLE sessions ADD COLUMN repos JSONB NOT NULL DEFAULT '[]'::jsonb;
 -- heartbeat) so follow-up prompts on a fresh sandbox resume the same
 -- conversation -- never lazily." This is deliberately a SESSION-level
 -- column, not a turns one, even though turns.conversation_id already
--- exists (migrations/000005_turns.up.sql, Step 08) -- a "heartbeat" event
+-- exists (migrations/000005_turns.up.sql, Step 4) -- a "heartbeat" event
 -- is a sandbox-level liveness signal, not a turn-scoped one (sandboxws.
 -- Heartbeat carries no turn id at all, per contracts/sandbox-ws/v1), so it
 -- can legitimately arrive with no turn Processing to attribute it to.

@@ -6,13 +6,13 @@
 -- doc comment for the full resolution).
 --
 -- Deliberately its OWN table, not a column/JSON blob on review_verdicts:
--- review_verdicts (Step 58, does not exist yet at this point in the plan's
+-- review_verdicts (Step 62, does not exist yet at this point in the plan's
 -- own sequence -- see this Step's own PR description) is explicitly
 -- append-only, one row per POST -- the wrong shape for a finding, which
 -- needs MUTABLE status (open -> rebutted / fix_pending / fix_open /
 -- fix_merged / fix_applied) that persists ACROSS re-posted verdicts, the
--- opposite of append-only. This table is designed so Step 58 can later
--- JOIN review_verdicts against it, and so Step 59's own learned-pattern
+-- opposite of append-only. This table is designed so Step 62 can later
+-- JOIN review_verdicts against it, and so Step 63's own learned-pattern
 -- table (a DIFFERENT, repo-scoped table of maintainer-taught false-
 -- positive TEXT patterns, out of this Step's own scope) can sit beside it
 -- -- forward-compatible, required by neither.
@@ -83,7 +83,7 @@ CREATE TABLE review_findings (
     -- first_seen_head_sha/last_seen_head_sha PAIR was considered and
     -- deliberately NOT added in this Step -- named here, not silently
     -- omitted: §21.1's own head_sha column belongs to review_verdicts
-    -- (Step 58, does not exist at this point in the plan's own sequence),
+    -- (Step 62, does not exist at this point in the plan's own sequence),
     -- and neither PostReviewVerdictRequest (this Step's own request DTO)
     -- nor the review turn's own rendered prompt (internal/domain/review.
     -- RenderTurnPrompt) carries a reliable head SHA a reviewing agent
@@ -94,7 +94,7 @@ CREATE TABLE review_findings (
     -- and leaving it permanently NULL (nothing to populate it with) would
     -- be worse than not having it: a NULL-forever column reads as a bug,
     -- not a deliberate scope decision. Whichever later Step threads a
-    -- real head SHA through to this handler (Step 58, or an earlier
+    -- real head SHA through to this handler (Step 62, or an earlier
     -- follow-up) should add it then, with a real value to store.
     first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),

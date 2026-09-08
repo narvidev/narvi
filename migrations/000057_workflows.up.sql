@@ -103,7 +103,7 @@ CREATE UNIQUE INDEX workflow_definitions_lane_name_uniq
 -- internal/domain/intent.AssembleTemplate); '{{prompt}}' is the
 -- caller's own text, making a passthrough step exactly that.
 -- canvas_position is the §25.10 layout attachment: an OPAQUE JSONB blob
--- ({x, y}) the canvas editor (Step 88, §25.12) round-trips and the
+-- ({x, y}) the canvas editor (Step 91, §25.12) round-trips and the
 -- server never interprets -- nullable because built-ins and
 -- API-authored definitions have no layout until a canvas first saves
 -- one.

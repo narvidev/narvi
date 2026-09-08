@@ -3,7 +3,7 @@
 -- SAME repo_settings table Step 47 already shaped for exactly this
 -- (migrations/000044_repo_settings.up.sql's own doc comment: "ADDED as
 -- further columns on this SAME table rather than one bespoke table per
--- toggle") -- NOT a new table. Phase 8's own Step 90 plans a further
+-- toggle") -- NOT a new table. Phase 8's own Step 104 plans a further
 -- sibling column on this same row (§32 names this explicitly) -- this
 -- migration is written so that lands as a sibling, never a rival: a
 -- single ALTER TABLE ADD COLUMN, no new table, no new endpoint family.
