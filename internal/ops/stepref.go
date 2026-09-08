@@ -115,10 +115,12 @@ var planDocRefPattern = regexp.MustCompile(`IMPLEMENTATION_PLAN`)
 // for the behavior of the code around them. They legitimately say "Step N"
 // while explaining why nothing else in the tree should.
 var stepRefCheckExemptFiles = map[string]bool{
-	"internal/ops/sectionref.go":      true,
-	"internal/ops/sectionref_test.go": true,
-	"internal/ops/stepref.go":         true,
-	"internal/ops/stepref_test.go":    true,
+	"internal/ops/sectionref.go":       true,
+	"internal/ops/sectionref_test.go":  true,
+	"internal/ops/stepref.go":          true,
+	"internal/ops/stepref_test.go":     true,
+	"internal/ops/stepref_pin.go":      true,
+	"internal/ops/stepref_pin_test.go": true,
 }
 
 // stepRefScanExtensions are the source extensions CheckStepRefs walks.
