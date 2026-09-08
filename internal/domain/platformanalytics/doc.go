@@ -41,10 +41,19 @@
 //
 // A COUNT is always a real, meaningful answer -- 0 sessions in the window
 // is a true fact, never "unknown" (unlike a RATE or a PERCENTILE, which
-// need a nonzero denominator/sample to mean anything). So "Sessions" and
-// "False failures" carry no not-yet-computed sentinel at all: their zero
-// value IS the honest answer. SuccessRate, boot p95, and the cost median
-// DO carry one, mirroring internal/domain/reviewverdict's own identical
-// (value, ok bool) discipline: ok=false means the denominator/sample was
-// empty, never collapsed into the same shape as "the data says zero".
+// need a nonzero denominator/sample to mean anything). "Sessions" and
+// "False failures" therefore carry no SAMPLE-SIZE/denominator sentinel of
+// the kind SuccessRate/boot p95/the cost median carry (their own
+// computed-or-not reflects whether enough data exists to make the VALUE
+// meaningful, not whether the fetch itself succeeded). That is a
+// statement about the shape of the DATA once fetched, not a license to
+// skip degrading it honestly when the fetch never happens: a query that
+// errors produces no count at all, and internal/adapters/inbound/httpapi.
+// GetPlatformAnalytics carries its OWN fetch-outcome sentinel for exactly
+// that case (sessionsTotalComputed/falseFailureCountComputed on
+// restdtos.PlatformAnalytics) -- this package stays pure and untouched by
+// that concern, mirroring internal/domain/reviewverdict's own identical
+// (value, ok bool) discipline for SuccessRate/TopFailureReasons: ok=false
+// means the denominator/sample was empty, never collapsed into the same
+// shape as "the data says zero".
 package platformanalytics

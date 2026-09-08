@@ -2218,15 +2218,17 @@
     "PlatformAnalytics": {
       "type": "object",
       "additionalProperties": false,
-      "description": "GET /api/analytics response body (§12.2 item 6): the platform-wide analytics rollup ReviewAnalytics above deliberately does NOT cover (that endpoint is repo-scoped). windowDays names the rollup's own bounded window explicitly (platform.Timeouts.PlatformAnalyticsWindow) rather than a client-side hardcoded '30 days', mirroring RepoDigestScope.lookbackDays' own identical 'state the window honestly, from the server' precedent. sessionsTotal and falseFailureCount are always real -- a COUNT is a meaningful answer even at zero, so neither carries a computed sentinel (internal/domain/platformanalytics's own doc comment explains why). Every other field carries its OWN independent computed-or-not boolean, the SAME 'a repo with a real 0% and a repo with no data yet must never render identically' discipline ReviewAnalytics already establishes one level up -- see internal/app/platformanalytics for the full read model. Gated by the SAME authz.ActionViewAnalytics (§13.3 row 1) -- every role, including viewer.",
+      "description": "GET /api/analytics response body (§12.2 item 6): the platform-wide analytics rollup ReviewAnalytics above deliberately does NOT cover (that endpoint is repo-scoped). windowDays names the rollup's own bounded window explicitly (platform.Timeouts.PlatformAnalyticsWindow) rather than a client-side hardcoded '30 days', mirroring RepoDigestScope.lookbackDays' own identical 'state the window honestly, from the server' precedent. sessionsTotal and falseFailureCount are a plain COUNT, a meaningful answer even at zero -- but that is only true of a count this deployment actually MANAGED to compute, so both carry their own computed sentinel too (sessionsTotalComputed/falseFailureCountComputed), false iff that rollup's own fetch failed, never false merely because the count itself is zero (internal/domain/platformanalytics's own doc comment explains the distinction). Every field on this DTO carries its OWN independent computed-or-not boolean, the SAME 'a repo with a real 0% and a repo with no data yet must never render identically' discipline ReviewAnalytics already establishes one level up -- see internal/app/platformanalytics for the full read model. Gated by the SAME authz.ActionViewAnalytics (§13.3 row 1) -- every role, including viewer.",
       "required": [
         "windowDays",
+        "sessionsTotalComputed",
         "sessionsTotal",
         "sessionsPerDayComputed",
         "sessionsPerDay",
         "successRateComputed",
         "successRatePercent",
         "successRateSampleSize",
+        "falseFailureCountComputed",
         "falseFailureCount",
         "costComputed",
         "costTotalUsd",
@@ -2245,9 +2247,13 @@
           "type": "integer",
           "description": "The rollup's own bounded window, in whole days (platform.Timeouts.PlatformAnalyticsWindow) -- every field below is scoped to sessions/turns/events created within the last windowDays days of the request."
         },
+        "sessionsTotalComputed": {
+          "type": "boolean",
+          "description": "False iff the session-outcome-counts rollup this count is drawn from could not be fetched -- sessionsTotal then stays 0, its own zero value, but that 0 is NOT a claim that zero sessions were created; it is 'unknown'. Never false merely because the real count itself is zero (a brand-new deployment's true 0 renders exactly the same as any other computed value). sessionsPerDayComputed/successRateComputed/topFailureReasonsComputed share this SAME underlying fetch and go false together with this field, since all four are reductions over the one same read (internal/app/platformanalytics.SessionOutcomeCountsInWindow's own doc comment)."
+        },
         "sessionsTotal": {
           "type": "integer",
-          "description": "Every session row created within the window, regardless of status -- INCLUDING a session created but never dispatched a single turn (session.StatusCreated). Always a real, meaningful count; 0 is a true fact for a brand-new deployment, never 'unknown'."
+          "description": "Every session row created within the window, regardless of status -- INCLUDING a session created but never dispatched a single turn (session.StatusCreated). A meaningful count even at zero -- 0 is a true fact for a brand-new deployment, never 'unknown' -- PROVIDED sessionsTotalComputed is true; 0 while it is false means the count was never fetched, not that it is zero."
         },
         "sessionsPerDayComputed": {
           "type": "boolean",
@@ -2270,9 +2276,13 @@
           "type": "integer",
           "description": "completed + failed -- the denominator behind successRatePercent, always populated (0 when successRateComputed is false) so a caller can render e.g. '92% of 20 resolved sessions' rather than a bare percentage."
         },
+        "falseFailureCountComputed": {
+          "type": "boolean",
+          "description": "False iff the false-failures COUNT query itself failed -- falseFailureCount then stays 0, its own zero value, but that 0 is NOT a claim that the target was met; it is 'unknown'. Never false merely because the real count itself is zero (a deployment that has genuinely never produced one renders exactly the same as any other computed value)."
+        },
         "falseFailureCount": {
           "type": "integer",
-          "description": "How many 'watchdog kill later proven alive' incidents (a session the control plane terminalized Failed/timeout that a late, genuine execution_complete then proved had actually succeeded) were detected within the window -- target 0. Always a real, meaningful count; never carries a not-yet-computed sentinel, since an incident either happened or it did not."
+          "description": "How many 'watchdog kill later proven alive' incidents (a session the control plane terminalized Failed/timeout that a late, genuine execution_complete then proved had actually succeeded) were detected within the window -- target 0. A meaningful count even at zero -- an incident either happened or it did not -- PROVIDED falseFailureCountComputed is true; 0 while it is false means the count was never fetched, not that the target was met."
         },
         "costComputed": {
           "type": "boolean",

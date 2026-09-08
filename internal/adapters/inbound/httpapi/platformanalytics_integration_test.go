@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
+	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	domainpa "github.com/narvidev/narvi/internal/domain/platformanalytics"
 )
@@ -25,8 +26,15 @@ import (
 // NothingComputedYet exactly one level up (platform-wide instead of
 // repo-scoped): (1) authz.ActionViewAnalytics genuinely allows a VIEWER;
 // (2) a freshly-migrated deployment with no session/turn/event/
-// false_failures rows at all renders every sentinel false/nil, sessionsTotal
-// and falseFailureCount as real zeros (never sentinels), and never a 500.
+// false_failures rows at all renders every SAMPLE-SIZE sentinel
+// false/nil, but sessionsTotalComputed/falseFailureCountComputed BOTH
+// true (their own underlying queries DID succeed here, they just found
+// nothing) with sessionsTotal/falseFailureCount as real, genuinely
+// computed zeros -- and never a 500. The genuinely-uncomputed case (a
+// FAILED fetch) is TestGetPlatformAnalytics_
+// SessionOutcomeCountsFetchFailedDegradesOnlyItsOwnFields and
+// TestGetPlatformAnalytics_FalseFailureCountFetchFailedDegradesOnlyItsOwnField,
+// below.
 func TestGetPlatformAnalytics_ViewerAllowed_NothingComputedYet(t *testing.T) {
 	rig := newTestRig(t)
 	ctx := context.Background()
@@ -41,11 +49,17 @@ func TestGetPlatformAnalytics_ViewerAllowed_NothingComputedYet(t *testing.T) {
 	if resp.WindowDays != 30 {
 		t.Errorf("WindowDays = %d, want 30", resp.WindowDays)
 	}
+	if !resp.SessionsTotalComputed {
+		t.Errorf("SessionsTotalComputed = false, want true (the fetch itself succeeded, it just found nothing)")
+	}
 	if resp.SessionsTotal != 0 {
-		t.Errorf("SessionsTotal = %d, want 0 (a real, meaningful zero)", resp.SessionsTotal)
+		t.Errorf("SessionsTotal = %d, want 0 (a real, meaningful, genuinely COMPUTED zero)", resp.SessionsTotal)
+	}
+	if !resp.FalseFailureCountComputed {
+		t.Errorf("FalseFailureCountComputed = false, want true (the fetch itself succeeded, it just found nothing)")
 	}
 	if resp.FalseFailureCount != 0 {
-		t.Errorf("FalseFailureCount = %d, want 0 (a real, meaningful zero)", resp.FalseFailureCount)
+		t.Errorf("FalseFailureCount = %d, want 0 (a real, meaningful, genuinely COMPUTED zero)", resp.FalseFailureCount)
 	}
 
 	if resp.SessionsPerDayComputed {
@@ -181,6 +195,9 @@ func TestGetPlatformAnalytics_RendersComputedRollups(t *testing.T) {
 		t.Fatalf("status = %d, want %d", status, http.StatusOK)
 	}
 
+	if !resp.SessionsTotalComputed {
+		t.Fatalf("SessionsTotalComputed = false, want true")
+	}
 	if resp.SessionsTotal != 7 {
 		t.Errorf("SessionsTotal = %d, want 7", resp.SessionsTotal)
 	}
@@ -225,6 +242,9 @@ func TestGetPlatformAnalytics_RendersComputedRollups(t *testing.T) {
 		t.Errorf("SuccessRatePercent = %v, want ~%v", got, wantRate)
 	}
 
+	if !resp.FalseFailureCountComputed {
+		t.Fatalf("FalseFailureCountComputed = false, want true")
+	}
 	if resp.FalseFailureCount != 1 {
 		t.Errorf("FalseFailureCount = %d, want 1", resp.FalseFailureCount)
 	}
@@ -294,6 +314,159 @@ func TestGetPlatformAnalytics_RendersComputedRollups(t *testing.T) {
 	}
 	if gotReasons["cancelled"] != 1 {
 		t.Errorf("TopFailureReasons[cancelled] = %d, want 1", gotReasons["cancelled"])
+	}
+}
+
+// TestGetPlatformAnalytics_SessionOutcomeCountsFetchFailedDegradesOnlyItsOwnFields
+// is the defect this Step's own fix exists for, pinned at the wire level
+// (web/src/session/__tests__/analyticsRendering.test.tsx proves the SAME
+// property at the rendered-screen level). Before the fix, sessionsTotal
+// carried NO computed sentinel at all -- a failed
+// SessionOutcomeCountsInWindow fetch left it at its own Go zero value and
+// the handler still answered 200, so a caller could not tell "0 sessions"
+// from "the count query itself failed". deps.Sessions is built here on a
+// pool that's already been Closed() -- every call through it fails
+// deterministically with pgxpool.ErrClosedPool, mirroring internal/
+// adapters/inbound/linear/authz_backend_error_integration_test.go's own
+// "deterministic backend error, no real dropped connection needed"
+// precedent -- while every OTHER store stays on the real pool. That
+// proves BOTH halves of the fix at once: (1) sessionsTotalComputed AND
+// the three other fields fed by this one shared read
+// (sessionsPerDayComputed/successRateComputed/topFailureReasonsComputed)
+// all go false together; (2) falseFailureCount/cost -- rollups whose OWN
+// fetch never touched the broken pool -- still render their real,
+// computed values, proving the handler's own deliberate
+// partial-degrade-not-whole-request-failure posture (this file's own top
+// comment) survives a real per-rollup failure, not just a "no session
+// data yet" empty-window case (which TestGetPlatformAnalytics_
+// ViewerAllowed_NothingComputedYet, above, already covers and could not
+// tell apart from this one before the fix).
+func TestGetPlatformAnalytics_SessionOutcomeCountsFetchFailedDegradesOnlyItsOwnFields(t *testing.T) {
+	rig := newTestRig(t, func(r *testRig) {
+		brokenPool, err := narvipg.NewPool(context.Background(), r.pool.Config().ConnString())
+		if err != nil {
+			t.Fatalf("open broken pool: %v", err)
+		}
+		brokenPool.Close()
+		r.sessions = narvipg.NewSessionStore(brokenPool)
+	})
+	ctx := context.Background()
+	_, token := rig.createAuthenticatedUser(ctx, t)
+
+	// Fixture data seeded through a SEPARATE, healthy SessionStore
+	// pointed at the SAME real pool (rig.pool) -- rig.sessions itself is
+	// the one deliberately broken above, and is exactly the dependency
+	// httpapi.GetPlatformAnalytics uses, so fixture setup must not route
+	// through it. rig.turns/rig.falseFailures are untouched by the
+	// mutate above and stay on the real pool throughout.
+	healthySessions := narvipg.NewSessionStore(rig.pool)
+	created, err := healthySessions.Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceWeb})
+	if err != nil {
+		t.Fatalf("create fixture session: %v", err)
+	}
+	seedCostedTurn(ctx, t, rig, created.ID, "sonnet-5", 10)
+	if _, err := rig.falseFailures.Insert(ctx, created.ID); err != nil {
+		t.Fatalf("seed false_failures row: %v", err)
+	}
+
+	var resp restdtos.PlatformAnalytics
+	status := rig.doJSON(t, http.MethodGet, "/api/analytics", nil, &resp, token)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want %d -- a per-rollup fetch failure must never fail the whole request", status, http.StatusOK)
+	}
+
+	// The failed rollup's own four fields: all uncomputed, all at their
+	// own zero/nil value -- but crucially, sessionsTotalComputed being
+	// false is what makes that zero honest rather than a lie.
+	if resp.SessionsTotalComputed {
+		t.Errorf("SessionsTotalComputed = true, want false (the fetch failed)")
+	}
+	if resp.SessionsTotal != 0 {
+		t.Errorf("SessionsTotal = %d, want 0 (its own Go zero value -- SessionsTotalComputed is the field that actually matters here)", resp.SessionsTotal)
+	}
+	if resp.SessionsPerDayComputed {
+		t.Errorf("SessionsPerDayComputed = true, want false")
+	}
+	if resp.SessionsPerDay != nil {
+		t.Errorf("SessionsPerDay = %v, want nil", resp.SessionsPerDay)
+	}
+	if resp.SuccessRateComputed {
+		t.Errorf("SuccessRateComputed = true, want false")
+	}
+	if resp.TopFailureReasonsComputed {
+		t.Errorf("TopFailureReasonsComputed = true, want false")
+	}
+
+	// The rollups that did NOT fail must still render their real
+	// computed values -- the partial-degrade property, not merely "no
+	// 500".
+	if !resp.FalseFailureCountComputed {
+		t.Fatalf("FalseFailureCountComputed = false, want true (this rollup's own fetch never touches the broken Sessions pool)")
+	}
+	if resp.FalseFailureCount != 1 {
+		t.Errorf("FalseFailureCount = %d, want 1", resp.FalseFailureCount)
+	}
+	if !resp.CostComputed {
+		t.Fatalf("CostComputed = false, want true")
+	}
+	if resp.CostTotalUsd == nil || *resp.CostTotalUsd != 10 {
+		t.Errorf("CostTotalUsd = %v, want 10", resp.CostTotalUsd)
+	}
+}
+
+// TestGetPlatformAnalytics_FalseFailureCountFetchFailedDegradesOnlyItsOwnField
+// is TestGetPlatformAnalytics_
+// SessionOutcomeCountsFetchFailedDegradesOnlyItsOwnFields' own mirror
+// image, over the OTHER field this Step's fix restored a sentinel to.
+// Before the fix, falseFailureCount carried NO computed sentinel either
+// -- a failed CountFalseFailuresInWindow fetch rendered "False failures:
+// 0, target 0" (the target reads as MET) on a query that never ran.
+// deps.FalseFailures alone is built on a Closed() pool here; every other
+// store, INCLUDING deps.Sessions, stays real.
+func TestGetPlatformAnalytics_FalseFailureCountFetchFailedDegradesOnlyItsOwnField(t *testing.T) {
+	rig := newTestRig(t, func(r *testRig) {
+		brokenPool, err := narvipg.NewPool(context.Background(), r.pool.Config().ConnString())
+		if err != nil {
+			t.Fatalf("open broken pool: %v", err)
+		}
+		brokenPool.Close()
+		r.falseFailures = narvipg.NewFalseFailureStore(brokenPool)
+	})
+	ctx := context.Background()
+	_, token := rig.createAuthenticatedUser(ctx, t)
+
+	// rig.sessions is untouched here, so the shared helpers are safe to
+	// use directly, unlike the sibling test above.
+	completed := mustCreateSession(ctx, t, rig)
+	seedCostedTurn(ctx, t, rig, completed, "sonnet-5", 10)
+	mustCompleteSession(ctx, t, rig, completed)
+
+	var resp restdtos.PlatformAnalytics
+	status := rig.doJSON(t, http.MethodGet, "/api/analytics", nil, &resp, token)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want %d -- a per-rollup fetch failure must never fail the whole request", status, http.StatusOK)
+	}
+
+	if resp.FalseFailureCountComputed {
+		t.Errorf("FalseFailureCountComputed = true, want false (the fetch failed)")
+	}
+	if resp.FalseFailureCount != 0 {
+		t.Errorf("FalseFailureCount = %d, want 0 (its own Go zero value -- FalseFailureCountComputed is the field that actually matters here)", resp.FalseFailureCount)
+	}
+
+	// Every OTHER rollup, including the one sharing the SessionStore this
+	// one does not touch, must still render its real computed value.
+	if !resp.SessionsTotalComputed {
+		t.Fatalf("SessionsTotalComputed = false, want true")
+	}
+	if resp.SessionsTotal != 1 {
+		t.Errorf("SessionsTotal = %d, want 1", resp.SessionsTotal)
+	}
+	if !resp.CostComputed {
+		t.Fatalf("CostComputed = false, want true")
+	}
+	if resp.CostTotalUsd == nil || *resp.CostTotalUsd != 10 {
+		t.Errorf("CostTotalUsd = %v, want 10", resp.CostTotalUsd)
 	}
 }
 

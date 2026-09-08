@@ -143,9 +143,13 @@ func BootP95InWindow(ctx context.Context, deps Deps, now time.Time) (BootP95, er
 }
 
 // FalseFailureCountInWindow fetches §12.2 item 6's own "False failures"
-// KPI tile (target 0) -- always a real, meaningful count (see
-// internal/domain/platformanalytics's own doc comment for why this tile
-// carries no not-yet-computed sentinel).
+// KPI tile (target 0) -- a real, meaningful count whenever this fetch
+// actually succeeds (see internal/domain/platformanalytics's own doc
+// comment for why the VALUE itself carries no sample-size sentinel).
+// A failed fetch is a distinct case the caller (internal/adapters/
+// inbound/httpapi.GetPlatformAnalytics) must NOT collapse into "0
+// incidents" -- it gates its own falseFailureCountComputed wire sentinel
+// on whether this call returned an error, never on the count's value.
 func FalseFailureCountInWindow(ctx context.Context, deps Deps, now time.Time) (int64, error) {
 	return deps.FalseFailures.CountInWindow(ctx, windowStart(deps, now))
 }

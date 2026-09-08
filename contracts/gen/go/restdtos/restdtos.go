@@ -5095,13 +5095,17 @@ func (j *Plan) UnmarshalJSON(value []byte) error {
 // (platform.Timeouts.PlatformAnalyticsWindow) rather than a client-side hardcoded
 // '30 days', mirroring RepoDigestScope.lookbackDays' own identical 'state the
 // window honestly, from the server' precedent. sessionsTotal and falseFailureCount
-// are always real -- a COUNT is a meaningful answer even at zero, so neither
-// carries a computed sentinel (internal/domain/platformanalytics's own doc comment
-// explains why). Every other field carries its OWN independent computed-or-not
-// boolean, the SAME 'a repo with a real 0% and a repo with no data yet must never
-// render identically' discipline ReviewAnalytics already establishes one level up
-// -- see internal/app/platformanalytics for the full read model. Gated by the SAME
-// authz.ActionViewAnalytics (§13.3 row 1) -- every role, including viewer.
+// are a plain COUNT, a meaningful answer even at zero -- but that is only true of
+// a count this deployment actually MANAGED to compute, so both carry their own
+// computed sentinel too (sessionsTotalComputed/falseFailureCountComputed), false
+// iff that rollup's own fetch failed, never false merely because the count itself
+// is zero (internal/domain/platformanalytics's own doc comment explains the
+// distinction). Every field on this DTO carries its OWN independent
+// computed-or-not boolean, the SAME 'a repo with a real 0% and a repo with no data
+// yet must never render identically' discipline ReviewAnalytics already
+// establishes one level up -- see internal/app/platformanalytics for the full read
+// model. Gated by the SAME authz.ActionViewAnalytics (§13.3 row 1) -- every role,
+// including viewer.
 type PlatformAnalytics struct {
 	// False when bootP95SampleSize is below the minimum sample count a
 	// 95th-percentile estimate is considered trustworthy over
@@ -5153,10 +5157,18 @@ type PlatformAnalytics struct {
 
 	// How many 'watchdog kill later proven alive' incidents (a session the control
 	// plane terminalized Failed/timeout that a late, genuine execution_complete then
-	// proved had actually succeeded) were detected within the window -- target 0.
-	// Always a real, meaningful count; never carries a not-yet-computed sentinel,
-	// since an incident either happened or it did not.
+	// proved had actually succeeded) were detected within the window -- target 0. A
+	// meaningful count even at zero -- an incident either happened or it did not --
+	// PROVIDED falseFailureCountComputed is true; 0 while it is false means the count
+	// was never fetched, not that the target was met.
 	FalseFailureCount int `json:"falseFailureCount" yaml:"falseFailureCount" mapstructure:"falseFailureCount"`
+
+	// False iff the false-failures COUNT query itself failed -- falseFailureCount
+	// then stays 0, its own zero value, but that 0 is NOT a claim that the target was
+	// met; it is 'unknown'. Never false merely because the real count itself is zero
+	// (a deployment that has genuinely never produced one renders exactly the same as
+	// any other computed value).
+	FalseFailureCountComputed bool `json:"falseFailureCountComputed" yaml:"falseFailureCountComputed" mapstructure:"falseFailureCountComputed"`
 
 	// One entry per UTC calendar day that had at least one session created within the
 	// window, oldest first. Null iff sessionsPerDayComputed is false.
@@ -5168,10 +5180,23 @@ type PlatformAnalytics struct {
 	SessionsPerDayComputed bool `json:"sessionsPerDayComputed" yaml:"sessionsPerDayComputed" mapstructure:"sessionsPerDayComputed"`
 
 	// Every session row created within the window, regardless of status -- INCLUDING
-	// a session created but never dispatched a single turn (session.StatusCreated).
-	// Always a real, meaningful count; 0 is a true fact for a brand-new deployment,
-	// never 'unknown'.
+	// a session created but never dispatched a single turn (session.StatusCreated). A
+	// meaningful count even at zero -- 0 is a true fact for a brand-new deployment,
+	// never 'unknown' -- PROVIDED sessionsTotalComputed is true; 0 while it is false
+	// means the count was never fetched, not that it is zero.
 	SessionsTotal int `json:"sessionsTotal" yaml:"sessionsTotal" mapstructure:"sessionsTotal"`
+
+	// False iff the session-outcome-counts rollup this count is drawn from could not
+	// be fetched -- sessionsTotal then stays 0, its own zero value, but that 0 is NOT
+	// a claim that zero sessions were created; it is 'unknown'. Never false merely
+	// because the real count itself is zero (a brand-new deployment's true 0 renders
+	// exactly the same as any other computed value).
+	// sessionsPerDayComputed/successRateComputed/topFailureReasonsComputed share this
+	// SAME underlying fetch and go false together with this field, since all four are
+	// reductions over the one same read
+	// (internal/app/platformanalytics.SessionOutcomeCountsInWindow's own doc
+	// comment).
+	SessionsTotalComputed bool `json:"sessionsTotalComputed" yaml:"sessionsTotalComputed" mapstructure:"sessionsTotalComputed"`
 
 	// False iff no session in the window has DEFINITIVELY resolved (status completed
 	// or failed) -- a deployment with only Active/Created/Cancelled sessions has no
@@ -5444,6 +5469,9 @@ func (j *PlatformAnalytics) UnmarshalJSON(value []byte) error {
 	if _, ok := raw["falseFailureCount"]; raw != nil && !ok {
 		return fmt.Errorf("field falseFailureCount in PlatformAnalytics: required")
 	}
+	if _, ok := raw["falseFailureCountComputed"]; raw != nil && !ok {
+		return fmt.Errorf("field falseFailureCountComputed in PlatformAnalytics: required")
+	}
 	if _, ok := raw["sessionsPerDay"]; raw != nil && !ok {
 		return fmt.Errorf("field sessionsPerDay in PlatformAnalytics: required")
 	}
@@ -5452,6 +5480,9 @@ func (j *PlatformAnalytics) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["sessionsTotal"]; raw != nil && !ok {
 		return fmt.Errorf("field sessionsTotal in PlatformAnalytics: required")
+	}
+	if _, ok := raw["sessionsTotalComputed"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionsTotalComputed in PlatformAnalytics: required")
 	}
 	if _, ok := raw["successRateComputed"]; raw != nil && !ok {
 		return fmt.Errorf("field successRateComputed in PlatformAnalytics: required")

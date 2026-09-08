@@ -29,9 +29,14 @@ type OutcomeCount struct {
 // case). This is a deliberate reading of "how many sessions" as "how many
 // session rows this deployment created", not "how many sessions did
 // meaningful work" -- the latter is what SuccessRate's own denominator
-// answers instead, over a narrower, explicitly-named subset. Always a
-// real, meaningful answer (see doc.go's own "COUNT is always real" note)
-// -- no ok return, unlike every other function in this file.
+// answers instead, over a narrower, explicitly-named subset. A real,
+// meaningful answer whenever counts was actually fetched (see doc.go's
+// own "COUNT is always real -- PROVIDED the fetch that produced it
+// succeeded" note) -- no ok return here, unlike every other function in
+// this file, because the caller (httpapi.GetPlatformAnalytics) already
+// knows whether that fetch succeeded and gates its OWN
+// sessionsTotalComputed sentinel on that, not on anything this pure
+// function could tell it.
 func TotalSessions(counts []OutcomeCount) int {
 	total := 0
 	for _, c := range counts {

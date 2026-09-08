@@ -20,8 +20,11 @@
 //   - "Sessions" counts EVERY session row created in the window,
 //     including one nobody ever dispatched a turn for. "False failures"
 //     (watchdog kills later proven alive, target 0) is likewise a plain
-//     count. Both are always real -- a COUNT is a meaningful answer even
-//     at zero, so neither ever renders "not available".
+//     count. Both are meaningful even at a real, computed zero -- but a
+//     failed backend fetch is not a computed zero, so both still carry
+//     their own sessionsTotalComputed/falseFailureCountComputed sentinel
+//     and render "not available" rather than a false 0 when that fetch
+//     failed (the very defect this Step's own fix comment names).
 //   - "Success rate" is completed / (completed + failed) -- a cancelled
 //     session is a human's own decision, not a system judgment, and an
 //     active/just-created one has no outcome yet, so both are excluded
@@ -53,6 +56,8 @@
 // 404s honestly rather than ever being silently offered as a choice).
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
+
+import type { PlatformAnalytics } from '@narvi/contracts/rest-dtos'
 
 import { getPlatformAnalytics, getRepoDigestScope, getReviewAnalytics } from '../api/endpoints'
 import { ApiError } from '../api/http'
@@ -302,7 +307,11 @@ function PlatformAnalyticsSection() {
   // A loading/error KPI row still renders all five tile SLOTS (never
   // collapses the row to nothing), so the layout never jumps once real
   // data lands -- each slot just reads "not available yet" until then,
-  // the same honest state a genuine sentinel produces.
+  // the same honest state a genuine sentinel produces. This is the
+  // WHOLE-REQUEST failure path (network error, 401/403, 5xx before any
+  // rollup ever ran) -- distinct from a PER-ROLLUP fetch failure inside
+  // an otherwise-200 response, which PlatformAnalyticsBody's own
+  // per-field Computed checks below handle instead.
   if (query.isPending || query.isError) {
     return (
       <>
@@ -320,7 +329,18 @@ function PlatformAnalyticsSection() {
     )
   }
 
-  const data = query.data
+  return <PlatformAnalyticsBody data={query.data} />
+}
+
+// PlatformAnalyticsBody is the pure, presentational half of
+// PlatformAnalyticsSection -- every tile/chart below is a function of
+// `data` alone, no query involved, so a test can drive every rollup's
+// own computed-or-not/error state directly (mutation-verify: force ONE
+// rollup's own *Computed field to false, as a real fetch failure would
+// leave it, and assert only THAT tile renders "not available", every
+// other tile still rendering its real value). Exported for exactly that
+// -- see analyticsRendering.test.tsx.
+export function PlatformAnalyticsBody({ data }: { data: PlatformAnalytics }) {
   const maxModelCost = data.costByModelComputed && data.costByModel && data.costByModel.length > 0 ? Math.max(...data.costByModel.map((m) => m.totalUsd), 0.01) : 1
   const maxDayTotal =
     data.sessionsPerDayComputed && data.sessionsPerDay
@@ -336,11 +356,15 @@ function PlatformAnalyticsSection() {
       </div>
 
       <div className="kpis">
-        <div className="tile">
-          <span className="tl">Sessions</span>
-          <span className="big">{data.sessionsTotal}</span>
-          <span className="delta">every session created in the window</span>
-        </div>
+        {data.sessionsTotalComputed ? (
+          <div className="tile">
+            <span className="tl">Sessions</span>
+            <span className="big">{data.sessionsTotal}</span>
+            <span className="delta">every session created in the window</span>
+          </div>
+        ) : (
+          <NotAvailableTile label="Sessions" detail="couldn't load this count" />
+        )}
 
         {data.successRateComputed && data.successRatePercent !== null ? (
           <div className="tile">
@@ -352,11 +376,15 @@ function PlatformAnalyticsSection() {
           <NotAvailableTile label="Success rate" detail="no resolved sessions yet" />
         )}
 
-        <div className="tile">
-          <span className="tl">False failures</span>
-          <span className="big">{data.falseFailureCount}</span>
-          <span className="delta">target 0 · watchdog kills later proven alive</span>
-        </div>
+        {data.falseFailureCountComputed ? (
+          <div className="tile">
+            <span className="tl">False failures</span>
+            <span className="big">{data.falseFailureCount}</span>
+            <span className="delta">target 0 · watchdog kills later proven alive</span>
+          </div>
+        ) : (
+          <NotAvailableTile label="False failures" detail="couldn't load this count" />
+        )}
 
         {data.costComputed && data.costTotalUsd !== null ? (
           <div className="tile">
