@@ -5336,6 +5336,20 @@ Module routes mount under a reserved prefix behind the same authentication as ev
 other API route; module migrations run in the module's own migrations table, never
 sharing a version counter with this repository's chain.
 
+### 34.6.1 Where the analytics line falls
+
+Analytics is the one surface where "per-repository stays here" does not settle the question by
+itself, because a number can be about one deployment or about many. The operative test, so it is
+not re-argued at every new chart: **can the value be computed from this deployment's own rows?**
+
+If yes, it belongs here — sessions by outcome, success rate, false failures, cost by model, boot
+p95, top failure reasons. A deployment that cannot state its own success rate is incomplete, and
+§34.1's rule applies unchanged: no capability leaves this repository.
+
+If the number only means something once aggregated ACROSS deployments, organizations or teams —
+comparing repositories against each other, fleet trends, an exportable compliance rollup — it is
+not this repository's, and it does not exist here today.
+
 ### 34.7 Gate-then-rank as a signature
 
 §31.6 requires that eligibility and ordering be separate: a deterministic, path-scoped
