@@ -534,10 +534,19 @@ func eventWireMap(e sqlcgen.Event) map[string]interface{} {
 	}
 }
 
-// artifactWireMap is eventWireMap's own artifact counterpart --
+// ArtifactWireMap is eventWireMap's own artifact counterpart --
 // sqlcgen.Artifact.Metadata is likewise a plain []byte needing the same
 // json.RawMessage treatment to avoid base64-encoding.
-func artifactWireMap(a sqlcgen.Artifact) map[string]interface{} {
+//
+// Exported (unlike eventWireMap, httpapi/events.go's own sibling
+// function) so httpapi's REST twin (artifacts.go's ListArtifacts) can
+// call this exact function instead of maintaining a byte-identical
+// second copy that nothing enforced stayed in sync -- the same
+// package-boundary precedent HashSandboxToken (token.go) already sets
+// for httpapi's reuse of a small wshub-owned helper. eventWireMap's own
+// doc comment (httpapi/events.go) records a separately reasoned choice
+// for that sibling function; this decision does not revisit it.
+func ArtifactWireMap(a sqlcgen.Artifact) map[string]interface{} {
 	// status/failureReason (§28.6) are additive fields on the
 	// wire SubscribedPayload.artifacts shape, mirroring the sandbox-ws
 	// artifact event's own identical additive change -- always present
@@ -549,11 +558,11 @@ func artifactWireMap(a sqlcgen.Artifact) map[string]interface{} {
 	if a.FailureReason != nil {
 		failureReason = *a.FailureReason
 	}
-	// filename/sizeBytes/contentType (§12.2 item 1's own rail): the SAME
-	// addition as this function's own REST twin (httpapi/artifacts.go's artifactWireMap) --
-	// see that function's own doc comment for the full "why now" reasoning.
-	// Nil (-> JSON null) for a pr/preview row; only an upload row ever
-	// sets these three columns.
+	// filename/sizeBytes/contentType (§12.2 item 1's own rail): present
+	// for both this function's callers (subscribedArtifactsWire below,
+	// and httpapi's ListArtifacts in artifacts.go) since this is their
+	// one shared implementation. Nil (-> JSON null) for a pr/preview row;
+	// only an upload row ever sets these three columns.
 	var filename, contentType interface{}
 	if a.Filename != nil {
 		filename = *a.Filename
@@ -579,7 +588,7 @@ func artifactWireMap(a sqlcgen.Artifact) map[string]interface{} {
 	}
 }
 
-// sandboxWireMap is eventWireMap/artifactWireMap's own sandbox
+// sandboxWireMap is eventWireMap/ArtifactWireMap's own sandbox
 // counterpart: sqlcgen.Sandbox carries several fields with zero
 // legitimate client-side use -- TokenHash (the sandbox's own bearer-token
 // hash, an internal credential-verification artifact), ProviderID,
@@ -588,7 +597,7 @@ func artifactWireMap(a sqlcgen.Artifact) map[string]interface{} {
 // SubscribedPayload.state requires (that field is deliberately
 // additionalProperties:true, its own doc comment: "shape assembled by
 // later PRs" -- this package's own choice, exactly like eventWireMap/
-// artifactWireMap already exercise for their own siblings). Returns only
+// ArtifactWireMap already exercise for their own siblings). Returns only
 // what a client-side UI legitimately needs: id, gen, status, lastSeenAt,
 // createdAt, updatedAt.
 func sandboxWireMap(s sqlcgen.Sandbox) map[string]interface{} {
@@ -613,7 +622,7 @@ func subscribedEventsWire(rows []sqlcgen.Event) []clientws.SubscribedPayloadEven
 func subscribedArtifactsWire(rows []sqlcgen.Artifact) []clientws.SubscribedPayloadArtifactsElem {
 	wire := make([]clientws.SubscribedPayloadArtifactsElem, len(rows))
 	for i, a := range rows {
-		wire[i] = artifactWireMap(a)
+		wire[i] = ArtifactWireMap(a)
 	}
 	return wire
 }

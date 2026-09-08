@@ -381,7 +381,7 @@ func TestClientHandler_ValidHandshakeSubscribes(t *testing.T) {
 }
 
 // TestClientHandler_SubscribeReplaysFailedUploadStatusAndFailureReason is
-// a review-fix coverage addition (FIX I): artifactWireMap (client.go)
+// a review-fix coverage addition (FIX I): ArtifactWireMap (client.go)
 // hand-builds its wire shape as a map[string]interface{}
 // (additionalProperties:true, this schema's own design) rather than a
 // generated, field-checked struct -- a typo'd or accidentally-dropped
@@ -460,7 +460,7 @@ func TestClientHandler_SubscribeReplaysFailedUploadStatusAndFailureReason(t *tes
 	// §12.2 item 1's own rail (the rail's own artifacts panel): filename/sizeBytes/
 	// contentType, the SAME addition as this test's own REST-side twin
 	// (httpapi_integration_test.go's TestListArtifacts_
-	// FailedUploadStatusAndFailureReason) -- artifactWireMap (client.go)
+	// FailedUploadStatusAndFailureReason) -- ArtifactWireMap (client.go)
 	// dropped all three before this Step.
 	if elem["filename"] != filename {
 		t.Errorf(`Artifacts[0]["filename"] = %v, want %q`, elem["filename"], filename)
