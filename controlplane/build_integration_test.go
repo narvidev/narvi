@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -228,6 +229,76 @@ func formatRouteList(routes []string) string {
 		return "(none)"
 	}
 	return "\n  " + strings.Join(routes, "\n  ")
+}
+
+// TestBuild_IngressDisabled_RoutesUnmounted proves §12.5's own "a surface
+// not named is not mounted at all -- no route, no webhook endpoint" claim
+// against the REAL composition root and the REAL chi route table, not
+// merely against a unit-level boolean (httpapi.configuredForProvider's own
+// tests already cover that half). Narrowing NARVI_INGRESS_ENABLED to a
+// single surface removes every OTHER surface's own webhook/OAuth routes
+// from App.Routes() entirely, and a live request to one of the removed
+// paths 404s exactly like any other unknown path -- never a handler
+// quietly built against an empty secret and left reachable.
+func TestBuild_IngressDisabled_RoutesUnmounted(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("NARVI_INGRESS_ENABLED", "github")
+
+	pool, connStr := newTestPool(t)
+	t.Setenv("NARVI_DATABASE_URL", connStr)
+
+	cfg, err := platform.Load()
+	if err != nil {
+		t.Fatalf("platform.Load: %v", err)
+	}
+
+	app, err := Build(context.Background(), cfg, pool)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	gotRoutes := app.Routes()
+	gotSet := make(map[string]bool, len(gotRoutes))
+	for _, r := range gotRoutes {
+		gotSet[r] = true
+	}
+
+	// Slack/Linear routes must be entirely ABSENT from the live route
+	// table -- not merely unreachable behind some other gate.
+	for _, disabledRoute := range []string{
+		"POST /webhooks/slack",
+		"POST /webhooks/slack/interactive",
+		"GET /auth/linear/install",
+		"GET /auth/linear/callback",
+		"POST /webhooks/linear",
+	} {
+		if gotSet[disabledRoute] {
+			t.Errorf("App.Routes() contains %q, want absent (NARVI_INGRESS_ENABLED=github disables Slack/Linear entirely)", disabledRoute)
+		}
+	}
+	// GitHub's own webhook route must still be present -- only Slack/Linear
+	// were disabled, proving this isn't an accidental "everything got
+	// unmounted" failure mode.
+	if !gotSet["POST /webhooks/github"] {
+		t.Error(`App.Routes() does not contain "POST /webhooks/github", want present (GitHub is the one enabled surface)`)
+	}
+
+	// A live request to a disabled surface's own path 404s exactly like
+	// any other unknown path -- proving the absence end to end against a
+	// real http.Handler, not just against the route-table listing above.
+	for _, req := range []struct{ method, path string }{
+		{http.MethodPost, "/webhooks/slack"},
+		{http.MethodPost, "/webhooks/slack/interactive"},
+		{http.MethodPost, "/webhooks/linear"},
+		{http.MethodGet, "/auth/linear/install"},
+	} {
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest(req.method, req.path, nil)
+		app.Router.ServeHTTP(rec, r)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("%s %s = %d, want %d (surface disabled, route must not exist)", req.method, req.path, rec.Code, http.StatusNotFound)
+		}
+	}
 }
 
 // TestBuild_EveryAPIRouteCarriesAGuardBeyondTheGlobalChain closes the half
