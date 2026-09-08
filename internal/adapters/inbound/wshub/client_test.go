@@ -388,10 +388,10 @@ func TestClientHandler_ValidHandshakeSubscribes(t *testing.T) {
 	}
 }
 
-// TestClientHandler_ParticipantsReflectsLiveConnections is Step 121's own
-// (§8.11, "multiplayer presence") end-to-end proof that Participants is
-// now a REAL, live signal rather than the permanently-empty array it used
-// to be: two distinct real users subscribing to the SAME session must
+// TestClientHandler_ParticipantsReflectsLiveConnections is §8.11's own
+// ("multiplayer presence") end-to-end proof that Participants is now a
+// REAL, live signal rather than the permanently-empty array it used to
+// be: two distinct real users subscribing to the SAME session must
 // each see the other in their own subscribed reply's Participants (once
 // both are connected), and a participant who disconnects must stop being
 // reported to a FRESH subscriber -- proven by driving the real handshake

@@ -166,7 +166,7 @@ describe('SessionHeader rendering -- a hostile session title stays text', () => 
   })
 })
 
-// §8.11 "multiplayer presence" (Step 121): the WS subscribe reply's own
+// §8.11 "multiplayer presence": the WS subscribe reply's own
 // real, live participants array is now rendered, not silently validated
 // and discarded (session/participants.ts's own parseParticipants feeds
 // this component). Proven at the render boundary like every other
