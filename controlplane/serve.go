@@ -2507,22 +2507,41 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	}
 
 	// rwxPreviewNotifier/githubPreviewLinkNotifier ("RWX provider
-	// + previews", §4.1.1/§4.1.2) are registered ONLY when cfg.RWXAccessToken
-	// is configured -- see that env var's own doc comment (platform/
-	// config.go) for why this platform-wide credential is optional, unlike
-	// Modal's/GitHub's own mandatory secrets: RWX previews are an
-	// off-by-default, per-repo opt-in feature layered on top of it, and a
-	// deployment that never turns previews on for any repo should not be
-	// forced to configure a real RWX account just to boot. When absent, any
-	// row enqueued for either of these two kinds (which requires a repo
-	// admin to have separately opted in -- an operator misconfiguration,
-	// since the two are meant to be configured together) dead-letters with
-	// a clear, logged "no notifier registered for kind" error rather than
-	// silently vanishing. githubPreviewLinkNotifier reuses the SAME
-	// sourceControl *githubapi.Adapter instance and cfg.GitHubBotToken every
-	// other GitHub-flavored notifier above already uses -- a preview link
-	// is a system-generated fact about a commit, never attributed to any
-	// individual PR author or reviewer.
+	// + previews", §4.1.1/§4.1.2) are TWO SEPARATE gates, not one, even
+	// though both sit inside the same cfg.RWXAccessToken-configured block:
+	// rwxPreviewNotifier needs only cfg.RWXAccessToken (see that env var's
+	// own doc comment, platform/config.go, for why this platform-wide
+	// credential is optional, unlike Modal's/GitHub's own mandatory
+	// secrets -- RWX previews are an off-by-default, per-repo opt-in
+	// feature layered on top of it, and a deployment that never turns
+	// previews on for any repo should not be forced to configure a real
+	// RWX account just to boot). githubPreviewLinkNotifier additionally
+	// needs githubIngressEnabled, because unlike rwxPreviewNotifier it
+	// posts through cfg.GitHubBotToken -- reusing the SAME sourceControl
+	// *githubapi.Adapter instance and credential every other GitHub-
+	// flavored notifier above already uses (a preview link is a
+	// system-generated fact about a commit, never attributed to any
+	// individual PR author or reviewer) -- and gitHubBotTokenEnvVarName's
+	// own doc comment (platform/config.go) establishes that credential is
+	// only ever populated when GitHub ingress is enabled. Registering it
+	// on cfg.RWXAccessToken alone (the pre-fix state) authenticated
+	// githubPreviewLinkNotifier with an EMPTY cfg.GitHubBotToken whenever
+	// an operator had RWX previews configured on a deployment with GitHub
+	// ingress off -- exactly the "posting with an empty credential"
+	// failure mode this whole map's own doc comment above promises never
+	// happens, and the one entry that comment's own original audit
+	// missed. platform.Load's own RWXPreviewsRequireGitHubIngressError now
+	// refuses to boot a deployment in that state at all (see that error's
+	// own doc comment for why a hard refusal, not a warning), but the gate
+	// below stays as the actual enforcement this map depends on -- Load's
+	// check is a backstop against a config that should never reach here,
+	// not a substitute for this function's own registration matching its
+	// own comment. When githubIngressEnabled is false, any row enqueued
+	// for github_preview_link (unreachable in a deployment Load already
+	// accepted, but handled identically to every other disabled-surface
+	// kind rather than specially) dead-letters with the same clear,
+	// logged "no notifier registered for kind" error every other
+	// unconfigured kind gets, rather than posting with an empty bot token.
 	if cfg.RWXAccessToken != "" {
 		// http.DefaultClient, not nil: §30.2 removed the nil default from
 		// this constructor, so nil here builds a client whose transport
@@ -2530,7 +2549,9 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// dead the moment an operator configured it, silently.
 		rwxDispatchClient := rwx.NewDispatchClient(http.DefaultClient, "", cfg.RWXAccessToken)
 		outboxNotifiers[ports.NotificationKindRWXPreviewDispatch] = rwx.NewPreviewNotifier(rwxDispatchClient)
-		outboxNotifiers[ports.NotificationKindGitHubPreviewLink] = githubapi.NewPreviewLinkNotifier(liveSourceControl, cfg.GitHubBotToken)
+		if githubIngressEnabled {
+			outboxNotifiers[ports.NotificationKindGitHubPreviewLink] = githubapi.NewPreviewLinkNotifier(liveSourceControl, cfg.GitHubBotToken)
+		}
 	}
 
 	// blob_delete (§28.4) is registered ONLY when blobStore is

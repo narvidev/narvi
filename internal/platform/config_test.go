@@ -774,6 +774,72 @@ func TestLoadIngressEnabled(t *testing.T) {
 	})
 }
 
+// TestLoadRWXPreviewsRequireGitHubIngress covers
+// RWXPreviewsRequireGitHubIngressError: NARVI_RWX_ACCESS_TOKEN configures
+// an explicit opt-in into RWX previews (§4.1.1/§4.1.2), whose GitHub half
+// (posting the preview link, controlplane/serve.go's own
+// githubPreviewLinkNotifier) can only ever work with cfg.GitHubBotToken --
+// itself only ever populated when GitHub ingress is enabled
+// (gitHubBotTokenEnvVarName's own doc comment). Setting the RWX token
+// while disabling GitHub ingress is therefore a config that can never
+// work, and Load refuses to boot with it rather than silently letting
+// controlplane/serve.go's own Build wire a GitHub-flavored notifier with
+// an empty credential.
+func TestLoadRWXPreviewsRequireGitHubIngress(t *testing.T) {
+	t.Run("RWX token set with GitHub ingress disabled is a loud boot failure", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("NARVI_INGRESS_ENABLED", "slack,linear") // GitHub left out.
+		t.Setenv("NARVI_RWX_ACCESS_TOKEN", "test-rwx-access-token")
+		// GitHub ingress secrets are irrelevant once GitHub ingress is
+		// disabled -- blank them out to prove this failure is about the
+		// RWX/GitHub combination, not a leftover missing GitHub secret.
+		t.Setenv("NARVI_GITHUB_WEBHOOK_SECRET", "")
+		t.Setenv("NARVI_GITHUB_BOT_HANDLE", "")
+		t.Setenv("NARVI_GITHUB_BOT_TOKEN", "")
+
+		_, err := platform.Load()
+		if err == nil {
+			t.Fatal("Load() error = nil, want error (RWX previews configured with GitHub ingress disabled can never post the GitHub half of a preview)")
+		}
+		var rwxErr *platform.RWXPreviewsRequireGitHubIngressError
+		if !errors.As(err, &rwxErr) {
+			t.Fatalf("Load() error = %v, want *platform.RWXPreviewsRequireGitHubIngressError", err)
+		}
+	})
+
+	t.Run("RWX token set with GitHub ingress enabled boots fine", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("NARVI_RWX_ACCESS_TOKEN", "test-rwx-access-token")
+		// NARVI_INGRESS_ENABLED deliberately left unset -- default enables
+		// all three surfaces, GitHub included.
+
+		cfg, err := platform.Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v, want nil (GitHub ingress enabled makes the RWX/GitHub combination valid)", err)
+		}
+		if cfg.RWXAccessToken != "test-rwx-access-token" {
+			t.Errorf("Load().RWXAccessToken = %q, want %q", cfg.RWXAccessToken, "test-rwx-access-token")
+		}
+	})
+
+	t.Run("RWX token unset with GitHub ingress disabled boots fine", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("NARVI_INGRESS_ENABLED", "slack,linear") // GitHub left out.
+		t.Setenv("NARVI_GITHUB_WEBHOOK_SECRET", "")
+		t.Setenv("NARVI_GITHUB_BOT_HANDLE", "")
+		t.Setenv("NARVI_GITHUB_BOT_TOKEN", "")
+		// NARVI_RWX_ACCESS_TOKEN deliberately left unset.
+
+		cfg, err := platform.Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v, want nil (no RWX token means the impossible combination never arises)", err)
+		}
+		if cfg.RWXAccessToken != "" {
+			t.Errorf("Load().RWXAccessToken = %q, want empty", cfg.RWXAccessToken)
+		}
+	})
+}
+
 // TestLoadOpenCodeRuntimeVersion covers §8.5's ("image builds") own
 // optional NARVI_OPENCODE_RUNTIME_VERSION: unset defaults to
 // defaultOpenCodeRuntimeVersion (pinned equal to .github/workflows/ci.yml's

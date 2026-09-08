@@ -289,6 +289,42 @@ func (e *InvalidIngressEnabledError) Error() string {
 	)
 }
 
+// RWXPreviewsRequireGitHubIngressError is returned by Load when
+// NARVI_RWX_ACCESS_TOKEN is set (rwxAccessTokenEnvVarName's own doc
+// comment: an explicit, per-deployment opt-in into RWX previews) while
+// GitHub ingress is disabled (ingressEnabled[integrations.ProviderGitHub]
+// == false, §12.5). The combination can never work: the preview link half
+// of the feature (githubPreviewLinkNotifier, controlplane/serve.go) posts
+// through cfg.GitHubBotToken, and gitHubBotTokenEnvVarName's own doc
+// comment already establishes that this credential is bundled into the
+// GitHub ingress surface and left empty whenever that surface is disabled
+// -- so an operator who set the RWX token while leaving GitHub ingress off
+// asked for something structurally impossible, not a degraded-but-valid
+// posture.
+//
+// A hard boot refusal, not a startup warning, deliberately -- following
+// InvalidObjectStoreCredentialsError's own precedent immediately below
+// rather than the shadow-mode-suppression warnings in controlplane/
+// serve.go: like that credential pair, both sides of this condition are
+// known from env vars alone, with no I/O and no legitimate half-configured
+// reading (there is no valid deployment that wants RWX previews with no
+// way to ever post the GitHub half of them), so it belongs in Load's own
+// pure validation rather than a runtime slog.Warn that a deploy could run
+// past for months. Compare the shadow-mode warnings (controlplane/
+// serve.go's own "say out loud, at boot, what this deployment will and
+// will not send"): those warn-and-continue because the condition they
+// report is a deliberate, sometimes-correct operational posture that
+// needs a live DB read (CountSuppressedRepos) to even evaluate --
+// genuinely different in kind from this one.
+type RWXPreviewsRequireGitHubIngressError struct{}
+
+func (e *RWXPreviewsRequireGitHubIngressError) Error() string {
+	return fmt.Sprintf(
+		"%s is set but GitHub ingress is disabled (%s): RWX preview links can never be posted without %s, which is only ever configured when GitHub ingress is enabled -- either enable GitHub ingress or unset %s",
+		rwxAccessTokenEnvVarName, ingressEnabledEnvVarName, gitHubBotTokenEnvVarName, rwxAccessTokenEnvVarName,
+	)
+}
+
 // gitHubWebhookSecretEnvVarName and gitHubBotHandleEnvVarName configure
 // §8.2's ("GitHub ingress", §8.2) own webhook adapter --
 // internal/adapters/inbound/github. gitHubWebhookSecretEnvVarName is
@@ -2023,8 +2059,17 @@ func Load() (*Config, error) {
 	modalEgressProxyURL := os.Getenv(modalEgressProxyURLEnvVarName)
 
 	// rwxAccessToken is optional -- see its own env-var-name doc comment
-	// above. No MissingRequiredEnvError is ever appended for it.
+	// above. No MissingRequiredEnvError is ever appended for it. But
+	// RWXPreviewsRequireGitHubIngressError's own doc comment: setting it
+	// while GitHub ingress is disabled is rejected outright, not silently
+	// accepted -- the combination can never work (githubPreviewLinkNotifier
+	// needs cfg.GitHubBotToken, which is only ever populated when GitHub
+	// ingress is enabled), and both halves of the check are plain env vars
+	// with no I/O, so Load is where it belongs.
 	rwxAccessToken := os.Getenv(rwxAccessTokenEnvVarName)
+	if rwxAccessToken != "" && !ingressEnabled[integrations.ProviderGitHub] {
+		errs = append(errs, &RWXPreviewsRequireGitHubIngressError{})
+	}
 
 	openCodeRuntimeVersion := os.Getenv(openCodeRuntimeVersionEnvVarName)
 	if openCodeRuntimeVersion == "" {
