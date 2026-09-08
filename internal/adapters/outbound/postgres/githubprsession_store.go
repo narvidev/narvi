@@ -136,12 +136,15 @@ func (s *GitHubPRSessionStore) IncrementAutoRetriggerCount(ctx context.Context, 
 }
 
 // IncrementMentionCount is §12.2 item 2's own "coalesced-mention/session-
-// reuse info" gap -- MUST be called on a WithTx-scoped store, still
-// holding LockForUpdate's own row lock from earlier in the SAME
-// transaction (coalesce.go's own REUSE branch, before its own early
-// commit) -- see IncrementGitHubPRSessionMentionCount's own generated doc
-// comment for why that ordering is what makes this plain increment safe
-// with no CAS guard.
+// reuse info" gap -- MUST be called on the bare, pool-backed store
+// (coalesce.go's own REUSE branch calls it on c.PRSessions, never
+// txPRSessions), AFTER that branch's own claim tx has already committed
+// AND its authorization check AND turn creation have both succeeded --
+// audit fix: a denied or failed REUSE attempt must not touch this column
+// at all, and by the time this runs, that has already been decided. See
+// IncrementGitHubPRSessionMentionCount's own generated doc comment for
+// why calling this with no transaction/lock held is still safe with no
+// CAS guard.
 func (s *GitHubPRSessionStore) IncrementMentionCount(ctx context.Context, repoFullName string, prNumber int32) (sqlcgen.GithubPrSession, error) {
 	return s.q.IncrementGitHubPRSessionMentionCount(ctx, sqlcgen.IncrementGitHubPRSessionMentionCountParams{
 		RepoFullName: repoFullName,

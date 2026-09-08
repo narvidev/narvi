@@ -119,14 +119,25 @@ RETURNING *;
 -- name: IncrementGitHubPRSessionMentionCount :one
 -- §12.2 item 2's own "coalesced-mention/session-reuse info" gap
 -- (migrations/000122_github_pr_sessions_mention_count.up.sql's own doc
--- comment): called from coalesce.go's own REUSE branch, while STILL
--- holding LockGitHubPRSessionForUpdate's own row lock from earlier in the
--- SAME transaction (never after that transaction's own early commit) --
--- concurrent reuse-branch callers for the SAME PR are therefore already
--- serialized by Postgres' own row lock, so this plain increment needs no
--- application-level CAS guard, mirroring IncrementAutoRetriggerCount's
--- own identical "only ever reached under a lock/single-writer" reasoning
--- immediately below.
+-- comment): called from coalesce.go's own REUSE branch, AFTER that
+-- transaction's own early commit -- audit fix, moved off
+-- LockGitHubPRSessionForUpdate's own row lock deliberately (it used to run
+-- while still holding it, before that same commit): the increment must
+-- only land once the REUSE attempt has actually cleared authorization AND
+-- produced a real turn, both of which happen post-commit (coalesce.go's
+-- own CreateOrJoin top doc comment explains why that ownership-aware
+-- authz check itself cannot run any earlier), so counting had to move
+-- with it or a denied/failed attempt would inflate this column with no
+-- corresponding turn. Still needs no application-level CAS guard despite
+-- holding no lock at call time: this is a single UPDATE statement, and
+-- Postgres holds the target row's lock for that ONE statement's own
+-- duration regardless of any ambient transaction -- two concurrent REUSE
+-- callers for the SAME PR simply apply in whichever order Postgres
+-- schedules their two UPDATE statements, never losing either one. Compare
+-- IncrementAutoRetriggerCount's own DIFFERENT "only ever reached under a
+-- lock/single-writer" reasoning immediately below -- that column has a
+-- single writer (this PR's own session actor) and needs neither this
+-- reasoning nor that one to be safe.
 UPDATE github_pr_sessions
 SET mention_count = mention_count + 1
 WHERE repo_full_name = $1 AND pr_number = $2

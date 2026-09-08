@@ -509,6 +509,14 @@ func TestGitHubIntegration_LabelRetrigger_ReusesExistingSession(t *testing.T) {
 // member carve-out -- a label re-trigger on an already-tracked PR must now
 // be denied for a member, even the session's own creator, unlike an
 // ordinary @mention on that same session (see the next test).
+//
+// Also this package's own regression test for a SECOND confirmed audit
+// finding, layered onto the same denied attempt this test already drives:
+// the REUSE branch's own mention_count column (§12.2 item 2) used to be
+// incremented BEFORE this exact authz check ran, so this identical denied
+// label re-trigger used to permanently inflate mention_count to 2 despite
+// coalescing nothing -- turnCount below already proved no turn was
+// created; mentionCount now proves the claim row's own counter agrees.
 func TestGitHubIntegration_LabelRetrigger_MemberDenied_EvenAsSessionCreator(t *testing.T) {
 	ctx := context.Background()
 	rig := newTestRig(t, func(cfg *githubingress.Config) {
@@ -546,6 +554,21 @@ func TestGitHubIntegration_LabelRetrigger_MemberDenied_EvenAsSessionCreator(t *t
 	}
 	if turnCount != 1 {
 		t.Errorf("turn count = %d, want exactly 1 (only the first mention's own turn -- the label retrigger must be DENIED for a member, even the session's own creator)", turnCount)
+	}
+
+	// mention_count regression (audit fix): starts at 1 (migrations/
+	// 000122_github_pr_sessions_mention_count.up.sql's own doc comment --
+	// the first mention's own WINNER claim); the denied label re-trigger
+	// above must leave it there. Before the fix, the REUSE branch's own
+	// increment ran before this exact authz denial, so this SAME scenario
+	// produced mention_count = 2 with turnCount still 1 above -- a
+	// permanently inflated counter for zero actual coalescing.
+	var mentionCount int
+	if err := rig.pool.QueryRow(ctx, `SELECT mention_count FROM github_pr_sessions WHERE repo_full_name = $1 AND pr_number = $2`, repoFullName, prNumber).Scan(&mentionCount); err != nil {
+		t.Fatalf("query mention_count: %v", err)
+	}
+	if mentionCount != 1 {
+		t.Errorf("mention_count = %d, want exactly 1 (unchanged by the denied label re-trigger -- only the first mention's own WINNER claim, no REUSE increment for an attempt that was denied)", mentionCount)
 	}
 }
 
@@ -1106,6 +1129,16 @@ func TestGitHubIntegration_IssueCommentGetPullRequestFailureFallsBack(t *testing
 // (never 500), the delivery claim is NOT released (a redelivery would
 // only ever reproduce this exact outcome again), and an honest reply is
 // posted back to the PR thread.
+//
+// Also this package's own regression coverage for the SECOND of two
+// mention_count denial routes an audit fix closed (§12.2 item 2): unlike
+// TestGitHubIntegration_LabelRetrigger_MemberDenied_EvenAsSessionCreator's
+// own pre-authorization denial, the second mention here CLEARS the REUSE
+// branch's own authz check (the same maintainer, prompting their own
+// session) and only then fails to produce a turn, inside
+// httpapi.CreateTurnForBot -- a distinct "post-authorization failure to
+// create the turn" shape the fix must ALSO cover, not just the authz
+// deny. mentionCount below proves it does.
 func TestGitHubIntegration_AwaitingPlanBlocksReuseTurn_HonestReplyNoRelease(t *testing.T) {
 	ctx := context.Background()
 
@@ -1183,6 +1216,25 @@ func TestGitHubIntegration_AwaitingPlanBlocksReuseTurn_HonestReplyNoRelease(t *t
 	}
 	if turnCount != 2 {
 		t.Errorf("turn count = %d, want exactly 2 (the first mention's own turn + the seeded producing turn -- the gate must block the second mention's own ordinary turn)", turnCount)
+	}
+
+	// mention_count regression (audit fix, the "post-authorization
+	// failure to create the turn" denial route): starts at 1 (migrations/
+	// 000122_github_pr_sessions_mention_count.up.sql's own doc comment --
+	// the first mention's own WINNER claim). The second mention above
+	// clears the REUSE branch's own authz check but is then blocked by
+	// the awaiting-plan gate INSIDE CreateTurnForBot, so no turn was ever
+	// created for it (turnCount already proved that) -- mention_count
+	// must therefore still read 1, not 2. Before the fix, the increment
+	// ran unconditionally before this same authz check, long before
+	// CreateTurnForBot could even be reached, so this scenario already
+	// produced mention_count = 2 despite the identical zero-turns outcome.
+	var mentionCount int
+	if err := rig.pool.QueryRow(ctx, `SELECT mention_count FROM github_pr_sessions WHERE repo_full_name = $1 AND pr_number = $2`, repoFullName, prNumber).Scan(&mentionCount); err != nil {
+		t.Fatalf("query mention_count: %v", err)
+	}
+	if mentionCount != 1 {
+		t.Errorf("mention_count = %d, want exactly 1 (unchanged by the second mention -- CreateTurnForBot declined to create a turn for it, the SAME 'no real coalescing' outcome as an authz denial)", mentionCount)
 	}
 
 	// An honest reply must have been posted back to the PR thread -- the
