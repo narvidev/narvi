@@ -8,6 +8,7 @@ import {
   formatDecisionLatencySeconds,
   prChipData,
   provenanceText,
+  releaseChipData,
   rowKeyFor,
   rowKind,
   sectionBlurb,
@@ -34,6 +35,9 @@ function baseItem(overrides: Partial<DecisionInboxItem> = {}): DecisionInboxItem
     isHandoff: null,
     hasApprovingReview: null,
     hasChangesRequested: null,
+    isRelease: null,
+    manifestFindingsCount: null,
+    aggregateReviewTriggered: null,
     planId: null,
     sessionId: null,
     failureReason: null,
@@ -53,6 +57,19 @@ describe('rowKind -- derives the row-type tag from field presence, never from `k
 
   it('a handoff PR row (isHandoff=true) inside kind=awaiting_approval is "handoff", not "pr"', () => {
     expect(rowKind(baseItem({ kind: 'awaiting_approval', repoFullName: 'acme/widgets', prNumber: 1, isHandoff: true }))).toBe('handoff')
+  })
+
+  it('a release-cut PR row (isRelease=true) inside kind=needs_review is "release", not "pr"', () => {
+    expect(rowKind(baseItem({ kind: 'needs_review', repoFullName: 'acme/rockets', prNumber: 5, isHandoff: false, isRelease: true }))).toBe('release')
+  })
+
+  it('isRelease takes precedence over isHandoff being false, but never over isHandoff being true', () => {
+    // A row cannot legitimately carry both flags true in practice (a
+    // scoped-session handoff PR is not also a release cut), but the
+    // dispatch ORDER itself is worth pinning: isHandoff is checked FIRST,
+    // so a (hypothetically) mis-tagged row never silently renders as a
+    // release cut instead of a handoff.
+    expect(rowKind(baseItem({ kind: 'awaiting_approval', repoFullName: 'acme/rockets', prNumber: 5, isHandoff: true, isRelease: true }))).toBe('handoff')
   })
 
   it('a plan row is "plan"', () => {
@@ -115,6 +132,39 @@ describe('riskLabel chips via prChipData -- the wire value is "review:high-risk"
   it('hasChangesRequested=true adds its own explicit chip', () => {
     const chips = prChipData({ riskLabel: null, findings: null, ciGreen: true, hasChangesRequested: true })
     expect(chips).toContainEqual({ tone: 'crit', text: 'changes requested' })
+  })
+})
+
+describe('releaseChipData -- a release-cut row never fabricates an aggregate-findings count', () => {
+  it('zero manifest findings renders an "ok"-toned chip, not "crit"', () => {
+    const chips = releaseChipData({ manifestFindingsCount: 0, aggregateReviewTriggered: false })
+    expect(chips).toEqual([{ tone: 'ok', text: 'manifest: 0 flags' }])
+  })
+
+  it('one manifest finding uses the singular "flag", not "flags"', () => {
+    const chips = releaseChipData({ manifestFindingsCount: 1, aggregateReviewTriggered: false })
+    expect(chips[0]).toEqual({ tone: 'crit', text: 'manifest: 1 flag' })
+  })
+
+  it('multiple manifest findings render a "crit"-toned chip', () => {
+    const chips = releaseChipData({ manifestFindingsCount: 3, aggregateReviewTriggered: false })
+    expect(chips[0]).toEqual({ tone: 'crit', text: 'manifest: 3 flags' })
+  })
+
+  it('a null manifestFindingsCount (not actually a release cut) renders no manifest chip at all', () => {
+    const chips = releaseChipData({ manifestFindingsCount: null, aggregateReviewTriggered: null })
+    expect(chips.some((c) => c.text.includes('manifest'))).toBe(false)
+  })
+
+  it('aggregateReviewTriggered=true adds an honest "needed" chip, never a fabricated finding count -- the aggregate diff review pass itself is not computed anywhere in this system', () => {
+    const chips = releaseChipData({ manifestFindingsCount: 0, aggregateReviewTriggered: true })
+    expect(chips).toContainEqual({ tone: 'warn', text: 'aggregate review needed' })
+    expect(chips.some((c) => /aggregate:\s*\d/.test(c.text))).toBe(false)
+  })
+
+  it('aggregateReviewTriggered=false renders no aggregate chip at all', () => {
+    const chips = releaseChipData({ manifestFindingsCount: 0, aggregateReviewTriggered: false })
+    expect(chips.some((c) => c.text.includes('aggregate'))).toBe(false)
   })
 })
 
