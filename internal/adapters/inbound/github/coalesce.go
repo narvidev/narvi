@@ -469,13 +469,19 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 	}
 
 	if existing.Valid {
-		// Reuse case: this PR already has a review session. Nothing to
-		// write to the claim row itself -- commit now (releasing the
-		// lock, and this transaction's own connection, for whoever, if
-		// anyone, is still queued behind it) BEFORE doing the SEPARATE,
-		// independent work of enqueuing a new turn on the existing
-		// session. Only one connection is ever open at a time on this
-		// path.
+		// Reuse case: this PR already has a review session. §12.2 item 2's
+		// own "coalesced-mention/session-reuse info" gap: record that this
+		// claim was taken again, still under LockForUpdate's own row lock
+		// (IncrementMentionCount's own doc comment explains why this plain
+		// increment needs no CAS guard) -- the ONLY write this branch makes
+		// to the claim row itself. Then commit now (releasing the lock, and
+		// this transaction's own connection, for whoever, if anyone, is
+		// still queued behind it) BEFORE doing the SEPARATE, independent
+		// work of enqueuing a new turn on the existing session. Only one
+		// connection is ever open at a time on this path.
+		if _, err := txPRSessions.IncrementMentionCount(ctx, repoFullName, prNumber); err != nil {
+			return sqlcgen.Session{}, sqlcgen.Turn{}, false, fmt.Errorf("github: increment mention count: %w", err)
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return sqlcgen.Session{}, sqlcgen.Turn{}, false, fmt.Errorf("github: commit claim tx (reuse path): %w", err)
 		}

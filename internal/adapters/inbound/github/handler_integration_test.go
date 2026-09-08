@@ -963,11 +963,22 @@ func TestGitHubIntegration_ConcurrentMentionsCoalesceToOneSessionManyTurns(t *te
 	}
 
 	var claimSessionID string
+	var mentionCount int
 	if err := rig.pool.QueryRow(ctx,
-		`SELECT session_id::text FROM github_pr_sessions WHERE repo_full_name = $1 AND pr_number = $2`,
+		`SELECT session_id::text, mention_count FROM github_pr_sessions WHERE repo_full_name = $1 AND pr_number = $2`,
 		repoFullName, prNumber,
-	).Scan(&claimSessionID); err != nil {
+	).Scan(&claimSessionID, &mentionCount); err != nil {
 		t.Fatalf("query claim row: %v", err)
+	}
+	// §12.2 item 2's own "coalesced-mention/session-reuse info" gap: N
+	// concurrent mentions on the SAME PR must produce a mention_count of
+	// EXACTLY N -- one WINNER claim + (N-1) REUSE increments, each
+	// serialized by LockForUpdate's own row lock (this test's own
+	// concurrency is the exact race that lock exists to make safe; a
+	// missing/wrong lock ordering would under- or over-count here, not
+	// just in theory).
+	if mentionCount != n {
+		t.Errorf("mention_count = %d, want exactly %d (1 winner claim + %d reuse increments, all %d concurrent mentions on the SAME PR)", mentionCount, n, n-1, n)
 	}
 
 	var turnCount int

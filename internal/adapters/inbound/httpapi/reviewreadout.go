@@ -37,6 +37,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
+	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/findingposition"
@@ -49,6 +50,15 @@ import (
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
 )
+
+// errNilReviewContextFetcher is GetReviewReadout's own internal "fetcher
+// is nil" signal -- never returned to a caller, only logged (the exact
+// same degrade-to-null treatment a real fetch error gets, see this
+// function's own doc comment). A production deployment always wires a
+// real fetcher (platform.Load's own boot-required GitHub ingress) --
+// this exists for a legitimately unconfigured/test caller, mirroring
+// every other reviewcontext.Fetcher caller's own explicit nil guard.
+var errNilReviewContextFetcher = errors.New("httpapi: review readout fetcher is nil")
 
 // GetReviewReadout backs GET /api/sessions/{sessionID}/review. 404 if
 // sessionID doesn't exist; 400 if it exists but was never created via a
@@ -66,6 +76,8 @@ func GetReviewReadout(
 	turns *postgres.TurnStore,
 	fetcher reviewcontext.Fetcher,
 	relocationResolver *findingposition.Resolver,
+	sentinelFixes *postgres.SentinelFixStore,
+	handoffSentinelRuns *postgres.HandoffSentinelStore,
 	botToken string,
 	timeouts platform.Timeouts,
 ) http.HandlerFunc {
@@ -116,16 +128,43 @@ func GetReviewReadout(
 			PrNumber:     int(prNumber),
 			Findings:     []restdtos.ReviewReadoutFinding{},
 			History:      []restdtos.ReviewVerdictHistoryEntry{},
+			// SessionReuse (§12.2 item 2's own "coalesced-mention/
+			// session-reuse info" gap): never null -- prSession above is
+			// this exact PR's own github_pr_sessions claim row, which
+			// must exist (the pgx.ErrNoRows branch just above already
+			// returned) and therefore carries a real mention_count/
+			// claimed_at by construction.
+			SessionReuse: restdtos.ReviewReadoutSessionReuse{
+				MentionCount: int(prSession.MentionCount),
+				ClaimedAt:    prSession.ClaimedAt.Time,
+			},
 		}
 
-		// Live GitHub read for title/state -- best-effort, degrades to null
-		// on failure (reviewcontext.Fetch's own established posture), never
-		// fatal to this endpoint.
-		prCtx, cancel := context.WithTimeout(ctx, timeouts.GitHubGetPRTimeout)
-		pr, prErr := fetcher.GetPullRequest(prCtx, owner, repo, prNumber, botToken)
-		cancel()
+		// Live GitHub read for title/state/labels -- best-effort, degrades
+		// to null on failure (reviewcontext.Fetch's own established
+		// posture), never fatal to this endpoint. VisualQa (§12.2 item 2's
+		// own "visual-QA sentinel status" gap) rides this SAME call --
+		// never a second outbound request just to re-read labels. fetcher
+		// == nil degrades identically to a live-fetch error -- mirrors
+		// every other reviewcontext.Fetcher caller's own explicit nil
+		// guard (internal/app/reviewcontext's own alreadyanswered.go/
+		// archdecisions.go/falsepositive.go, reviewretrigger.go's own
+		// documented "diffFetcher == nil... nil-safe" contract) -- a
+		// production deployment always wires a real adapter here
+		// (platform.Load's own boot-required GitHub ingress), so this
+		// guard exists for the SAME reason those callers' does: a
+		// legitimately unconfigured/test caller must degrade, never panic.
+		var pr githubapi.PullRequest
+		var prErr error
+		if fetcher == nil {
+			prErr = errNilReviewContextFetcher
+		} else {
+			prCtx, cancel := context.WithTimeout(ctx, timeouts.GitHubGetPRTimeout)
+			pr, prErr = fetcher.GetPullRequest(prCtx, owner, repo, prNumber, botToken)
+			cancel()
+		}
 		if prErr != nil {
-			logger.Warn("httpapi: live GetPullRequest for review readout failed, rendering title as unavailable", "error", prErr)
+			logger.Warn("httpapi: live GetPullRequest for review readout failed, rendering title/visualQa as unavailable", "error", prErr)
 		} else {
 			title := pr.Title
 			resp.PrTitle = &title
@@ -134,6 +173,31 @@ func GetReviewReadout(
 			// (adapter.go's own PullRequest struct) -- stays null rather
 			// than a guessed value, mirroring the degraded-fetch case
 			// immediately above.
+			resp.VisualQa = visualQaFromLabels(pr.Labels)
+		}
+
+		if sentinelFix, sfErr := sentinelFixes.Get(ctx, repoFullName, prNumber); sfErr != nil {
+			if !errors.Is(sfErr, pgx.ErrNoRows) {
+				logger.Error("httpapi: get sentinel fix for review readout failed", "error", sfErr)
+				writeError(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+			// pgx.ErrNoRows: no sentinel-fix was ever triggered for this PR
+			// -- resp.SentinelFix stays nil, its own honest zero value.
+		} else {
+			resp.SentinelFix = sentinelFixToWire(sentinelFix)
+		}
+
+		if handoffRun, hErr := handoffSentinelRuns.Get(ctx, repoFullName, prNumber); hErr != nil {
+			if !errors.Is(hErr, pgx.ErrNoRows) {
+				logger.Error("httpapi: get handoff sentinel run for review readout failed", "error", hErr)
+				writeError(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+			// pgx.ErrNoRows: the handoff-readiness sentinel never flagged
+			// this PR -- resp.HandoffReadiness stays nil.
+		} else {
+			resp.HandoffReadiness = handoffReadinessToWire(handoffRun)
 		}
 
 		latest, hasLatest, err := appreviewverdict.GetLatestRecord(ctx, reviewVerdictDeps, repoFullName, prNumber)
@@ -224,6 +288,57 @@ func GetReviewReadout(
 		}
 
 		writeJSON(w, http.StatusOK, resp)
+	}
+}
+
+// visualQaLabelPrefix is the GitHub label prefix a human applies to
+// record this PR's own visual-QA outcome (§8's own "visual-qa: pass/skip"
+// criterion, §12.2 item 2's own gap) -- Narvi never writes this label
+// itself, only reads it back.
+const visualQaLabelPrefix = "visual-qa:"
+
+// visualQaFromLabels scans labelNames (a live PR's own current GitHub
+// labels) for one starting with visualQaLabelPrefix and returns the text
+// after the colon, trimmed of surrounding whitespace (a human might type
+// "visual-qa: pass" or "visual-qa:pass" -- both are the same label in
+// intent) -- nil when no such label is present. The first match wins;
+// nothing here validates the suffix against a fixed vocabulary, since
+// this is human-authored external text Narvi does not own.
+func visualQaFromLabels(labelNames []string) *string {
+	for _, name := range labelNames {
+		if !strings.HasPrefix(name, visualQaLabelPrefix) {
+			continue
+		}
+		value := strings.TrimSpace(strings.TrimPrefix(name, visualQaLabelPrefix))
+		return &value
+	}
+	return nil
+}
+
+// sentinelFixToWire converts one sqlcgen.SentinelFix row into
+// restdtos.ReviewReadoutSentinelFix -- §12.2 item 2's own "sentinel
+// auto-fix PR link with its merge-gated state" gap.
+func sentinelFixToWire(row sqlcgen.SentinelFix) *restdtos.ReviewReadoutSentinelFix {
+	var fixPRNumber *int
+	if row.FixPrNumber != nil {
+		n := int(*row.FixPrNumber)
+		fixPRNumber = &n
+	}
+	return &restdtos.ReviewReadoutSentinelFix{
+		Status:          row.Status,
+		FixPrNumber:     fixPRNumber,
+		StackRegistered: row.StackRegistered,
+	}
+}
+
+// handoffReadinessToWire converts one sqlcgen.HandoffSentinelRun row into
+// restdtos.ReviewReadoutHandoffReadiness -- §12.2 item 2's own
+// "handoff-readiness display" gap.
+func handoffReadinessToWire(row sqlcgen.HandoffSentinelRun) *restdtos.ReviewReadoutHandoffReadiness {
+	return &restdtos.ReviewReadoutHandoffReadiness{
+		ContractDriftFlagged: row.ContractDriftFlagged,
+		TodoCount:            int(row.TodoCount),
+		FlaggedAt:            row.CreatedAt.Time,
 	}
 }
 

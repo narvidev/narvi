@@ -13,16 +13,18 @@ import (
 
 const claimHandoffSentinelRun = `-- name: ClaimHandoffSentinelRun :one
 
-INSERT INTO handoff_sentinel_runs (repo_full_name, pr_number, session_id)
-VALUES ($1, $2, $3)
+INSERT INTO handoff_sentinel_runs (repo_full_name, pr_number, session_id, contract_drift_flagged, todo_count)
+VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (repo_full_name, pr_number) DO NOTHING
 RETURNING id
 `
 
 type ClaimHandoffSentinelRunParams struct {
-	RepoFullName string      `json:"repo_full_name"`
-	PrNumber     int32       `json:"pr_number"`
-	SessionID    pgtype.UUID `json:"session_id"`
+	RepoFullName         string      `json:"repo_full_name"`
+	PrNumber             int32       `json:"pr_number"`
+	SessionID            pgtype.UUID `json:"session_id"`
+	ContractDriftFlagged bool        `json:"contract_drift_flagged"`
+	TodoCount            int32       `json:"todo_count"`
 }
 
 // Queries backing HandoffSentinelStore ("handoff-readiness
@@ -38,9 +40,52 @@ type ClaimHandoffSentinelRunParams struct {
 // needs the ALREADY-CLAIMED row's own data back, only a yes/no answer
 // (§17.1's own claim needs the existing row's fix_child_session_id;
 // this one does not have an equivalent follow-on read).
+//
+// contract_drift_flagged/todo_count (migrations/
+// 000123_handoff_sentinel_runs_summary.up.sql, §12.2 item 2's own
+// "handoff-readiness display" gap) are the SAME contractDrifted/
+// len(todos) values the caller (runHandoffSentinelBestEffort) already
+// computed to decide whether to claim at all -- persisted here, in this
+// SAME insert, rather than a second write.
 func (q *Queries) ClaimHandoffSentinelRun(ctx context.Context, arg ClaimHandoffSentinelRunParams) (pgtype.UUID, error) {
-	row := q.db.QueryRow(ctx, claimHandoffSentinelRun, arg.RepoFullName, arg.PrNumber, arg.SessionID)
+	row := q.db.QueryRow(ctx, claimHandoffSentinelRun,
+		arg.RepoFullName,
+		arg.PrNumber,
+		arg.SessionID,
+		arg.ContractDriftFlagged,
+		arg.TodoCount,
+	)
 	var id pgtype.UUID
 	err := row.Scan(&id)
 	return id, err
+}
+
+const getHandoffSentinelRun = `-- name: GetHandoffSentinelRun :one
+SELECT id, repo_full_name, pr_number, session_id, created_at, contract_drift_flagged, todo_count FROM handoff_sentinel_runs
+WHERE repo_full_name = $1 AND pr_number = $2
+`
+
+type GetHandoffSentinelRunParams struct {
+	RepoFullName string `json:"repo_full_name"`
+	PrNumber     int32  `json:"pr_number"`
+}
+
+// §12.2 item 2's own "handoff-readiness display" gap: the code-review
+// readout's own read of this PR's handoff-sentinel claim, if any.
+// pgx.ErrNoRows (unwrapped) means the handoff-readiness sentinel never
+// flagged anything for this PR -- including every PR that was never a
+// scoped-session prototype in the first place.
+func (q *Queries) GetHandoffSentinelRun(ctx context.Context, arg GetHandoffSentinelRunParams) (HandoffSentinelRun, error) {
+	row := q.db.QueryRow(ctx, getHandoffSentinelRun, arg.RepoFullName, arg.PrNumber)
+	var i HandoffSentinelRun
+	err := row.Scan(
+		&i.ID,
+		&i.RepoFullName,
+		&i.PrNumber,
+		&i.SessionID,
+		&i.CreatedAt,
+		&i.ContractDriftFlagged,
+		&i.TodoCount,
+	)
+	return i, err
 }

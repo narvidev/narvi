@@ -16,7 +16,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import type { ReleaseManifestPR, ReleaseManifestReadout, ReviewReadoutFinding, ReviewReadoutVerdict } from '@narvi/contracts/rest-dtos'
 
-import { DigestSections, FindingCard, FindingsAppendix, PrGitHubLink } from '../CodeReviewView'
+import { DigestSections, FindingCard, FindingsAppendix, HandoffReadinessCard, PrGitHubLink, ReviewSessionPanel, SentinelAutoFixPanel, SentinelsPanel } from '../CodeReviewView'
 import { ReleaseManifestBody } from '../ReleaseReviewView'
 import { isSafeHref } from '../urlSafety'
 
@@ -284,5 +284,92 @@ describe('ReleaseReviewView rendering -- adversarial manifest content stays text
 describe('mutation guard: urlSafety must actually reject a javascript: URL', () => {
   it('isSafeHref(javascript:...) is false -- if this ever flips true, PrGitHubLink\'s own guard silently stops working', () => {
     expect(isSafeHref(JS_URL)).toBe(false)
+  })
+})
+
+// §12.2 item 2's own four gap fields -- ReviewSessionPanel/SentinelAutoFixPanel/
+// HandoffReadinessCard/SentinelsPanel's own visualQa row. sentinelFix.status
+// (sentinel_fixes.status, an unconstrained TEXT column, dtos.schema.json's own
+// comment on it) and visualQa (a human-applied GitHub label suffix) are the
+// two genuinely free-form, externally-authored strings among these four
+// fields -- mentionCount/claimedAt/contractDriftFlagged/todoCount/flaggedAt
+// are all server-computed, never attacker text, so there is nothing to prove
+// adversarially for ReviewSessionPanel/HandoffReadinessCard beyond an honest
+// render of both states.
+describe('ReviewSessionPanel -- coalesced-mention/session-reuse info (§12.2 item 2)', () => {
+  it('a single, un-reused claim renders "single @mention" / "new"', () => {
+    const html = renderToStaticMarkup(<ReviewSessionPanel sessionReuse={{ mentionCount: 1, claimedAt: '2026-08-20T10:00:00Z' }} />)
+    expect(html).toContain('single @mention')
+    expect(html).toContain('new')
+    expect(html).not.toContain('coalesced')
+  })
+
+  it('a reused claim renders the real coalesced count, never a fabricated one', () => {
+    const html = renderToStaticMarkup(<ReviewSessionPanel sessionReuse={{ mentionCount: 4, claimedAt: '2026-08-20T10:00:00Z' }} />)
+    expect(html).toContain('@mention ×4 → coalesced')
+    expect(html).toContain('reused (same PR)')
+  })
+})
+
+describe('SentinelAutoFixPanel -- sentinel auto-fix PR link with merge-gated state (§12.2 item 2, §17)', () => {
+  it('renders nothing at all when no sentinel-fix was ever triggered, an honest absence rather than an empty panel', () => {
+    const html = renderToStaticMarkup(<SentinelAutoFixPanel sentinelFix={null} repoFullName="acme/widgets" />)
+    expect(html).toBe('')
+  })
+
+  it('a known in-flight status renders its label and no fix-PR link yet (fixPrNumber still null)', () => {
+    const html = renderToStaticMarkup(<SentinelAutoFixPanel sentinelFix={{ status: 'spawned', fixPrNumber: null, stackRegistered: true }} repoFullName="acme/widgets" />)
+    expect(html).toContain('fix session started')
+    expect(html).not.toContain('View fix PR on GitHub')
+  })
+
+  it('once a fix PR has actually opened, renders the distinctly-labeled link to it', () => {
+    const html = renderToStaticMarkup(<SentinelAutoFixPanel sentinelFix={{ status: 'fix_open', fixPrNumber: 77, stackRegistered: true }} repoFullName="acme/widgets" />)
+    expect(html).toContain('View fix PR on GitHub')
+    expect(html).toContain('href="https://github.com/acme/widgets/pull/77"')
+  })
+
+  it('an out-of-vocabulary status string (sentinel_fixes.status is an unconstrained TEXT column) renders as text, never markup', () => {
+    const hostile = `weird-status ${XSS_IMG}`
+    const html = renderToStaticMarkup(<SentinelAutoFixPanel sentinelFix={{ status: hostile, fixPrNumber: null, stackRegistered: false }} repoFullName="acme/widgets" />)
+    expect(html).not.toContain('<img')
+    expect(html).toContain('&lt;img')
+  })
+})
+
+describe('HandoffReadinessCard -- handoff-readiness display (§12.2 item 2, §14.4)', () => {
+  it('renders nothing at all when this PR was never a scoped-Environment prototype', () => {
+    const html = renderToStaticMarkup(<HandoffReadinessCard handoffReadiness={null} />)
+    expect(html).toBe('')
+  })
+
+  it('a clean run (no drift, no TODOs) renders both as honestly clean', () => {
+    const html = renderToStaticMarkup(<HandoffReadinessCard handoffReadiness={{ contractDriftFlagged: false, todoCount: 0, flaggedAt: '2026-08-20T10:00:00Z' }} />)
+    expect(html).toContain('none')
+    expect(html).not.toContain('drifted')
+  })
+
+  it('a flagged run renders the real drift/TODO facts, never suppressed', () => {
+    const html = renderToStaticMarkup(<HandoffReadinessCard handoffReadiness={{ contractDriftFlagged: true, todoCount: 3, flaggedAt: '2026-08-20T10:00:00Z' }} />)
+    expect(html).toContain('drifted')
+    expect(html).toContain('3 found')
+  })
+})
+
+describe('SentinelsPanel -- visual-QA sentinel status (§12.2 item 2)', () => {
+  it('renders "not set" when no visual-qa label exists (or the live fetch degraded) -- never a fabricated pass/fail', () => {
+    const html = withQueryClient(<SentinelsPanel verdict={null} visualQa={null} />)
+    expect(html).toContain('not set')
+  })
+
+  it('a real pass/fail/skip label renders as its own chip', () => {
+    const html = withQueryClient(<SentinelsPanel verdict={null} visualQa="pass" />)
+    expect(html).toContain('pass')
+  })
+
+  it('a hostile visual-qa label suffix (human-applied GitHub label text, never Narvi-validated) renders as text, never markup', () => {
+    const html = withQueryClient(<SentinelsPanel verdict={null} visualQa={XSS_SCRIPT} />)
+    expect(html).not.toContain('<script>')
+    expect(html).toContain('&lt;script&gt;')
   })
 })

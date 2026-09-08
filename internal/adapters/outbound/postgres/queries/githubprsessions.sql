@@ -116,6 +116,22 @@ SET pending_retrigger_head_sha = NULL
 WHERE repo_full_name = $1 AND pr_number = $2 AND pending_retrigger_head_sha = $3
 RETURNING *;
 
+-- name: IncrementGitHubPRSessionMentionCount :one
+-- §12.2 item 2's own "coalesced-mention/session-reuse info" gap
+-- (migrations/000122_github_pr_sessions_mention_count.up.sql's own doc
+-- comment): called from coalesce.go's own REUSE branch, while STILL
+-- holding LockGitHubPRSessionForUpdate's own row lock from earlier in the
+-- SAME transaction (never after that transaction's own early commit) --
+-- concurrent reuse-branch callers for the SAME PR are therefore already
+-- serialized by Postgres' own row lock, so this plain increment needs no
+-- application-level CAS guard, mirroring IncrementAutoRetriggerCount's
+-- own identical "only ever reached under a lock/single-writer" reasoning
+-- immediately below.
+UPDATE github_pr_sessions
+SET mention_count = mention_count + 1
+WHERE repo_full_name = $1 AND pr_number = $2
+RETURNING *;
+
 -- name: IncrementAutoRetriggerCount :one
 -- §24.6's own budget counter -- incremented exactly once per PR each
 -- time handleReviewRetriggerDebounceTimer actually enqueues an automatic

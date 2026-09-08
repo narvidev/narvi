@@ -782,6 +782,45 @@ export interface ReviewReadout {
    * The authoring session's own most recent non-'none' builder epistemic-check outcome (§20.1/§20.2), when this PR was authored by a Narvi session -- one of 'minor'/'strong' when present (internal/domain/turn.EpistemicOutcome), surfaced as a subtle 'Heads-up' indicator; null when no such outcome was ever recorded, or the reviewed PR was not authored by a Narvi session at all. Never 'none' itself -- a turn that reported 'none' carries nothing worth surfacing, indistinguishable here from never having reported anything.
    */
   epistemicOutcome?: string | null;
+  sessionReuse: ReviewReadoutSessionReuse;
+  /**
+   * §12.2 item 2's own 'visual-QA sentinel status' gap. Read live from this PR's own current GitHub labels (the SAME fetch prTitle/prState above already make -- no second outbound call) for a 'visual-qa:' prefixed label; the suffix after the colon, verbatim and unvalidated (a human-applied external label, §8's own 'visual-qa: pass/skip' -- this is not a value Narvi computes or constrains). Null when no such label is present, OR on the same degraded-fetch condition prTitle/prState already document -- the two cases are indistinguishable here for the identical reason they are for those two fields.
+   */
+  visualQa?: string | null;
+  /**
+   * §12.2 item 2's own 'sentinel auto-fix PR link with its merge-gated state' gap (§17). Null when no sentinel-fix was ever triggered for this PR (sentinel_fixes carries no row).
+   */
+  sentinelFix?: {
+    /**
+     * sentinel_fixes.status verbatim (a plain TEXT column, not a DB-level enum) -- one of 'pending'/'spawned'/'fix_open'/'fix_merged'/'abandoned' today (migrations/000047_sentinel_fixes.up.sql), modeled here as an unconstrained string for the same reason ReviewReadoutVerdict.reviewPath is.
+     */
+    status: string;
+    /**
+     * The fix PR's own number, once it has actually been opened (§17.2) -- null while status is still 'pending'/'spawned'.
+     */
+    fixPrNumber: number | null;
+    /**
+     * Observability only, never authoritative (§17.6's own doc comment: the real answer is always a fresh GetPullRequest.Stack read) -- whether Narvi's own POST .../stacks registration call was last observed to succeed.
+     */
+    stackRegistered: boolean;
+  } | null;
+  /**
+   * §12.2 item 2's own 'handoff-readiness display' gap (§14.4). Null when the handoff-readiness sentinel never flagged anything for this PR (handoff_sentinel_runs carries no row) -- including every PR that was never a scoped-session prototype in the first place.
+   */
+  handoffReadiness?: {
+    /**
+     * Whether the handoff-readiness sentinel's own contract-drift check (§14.3/§14.4, internal/domain/contractdrift) flagged this PR's repo as having drifted from contracts/api/* when this sentinel ran.
+     */
+    contractDriftFlagged: boolean;
+    /**
+     * How many backend-adjacent TODO/FIXME markers (internal/domain/handoff.ScanTODOs) the sentinel found in this PR's own diff when it ran.
+     */
+    todoCount: number;
+    /**
+     * When the handoff-readiness sentinel claimed (handoff_sentinel_runs.created_at) -- the moment it posted its label/comment for this PR.
+     */
+    flaggedAt: string;
+  } | null;
 }
 /**
  * One review_verdicts row's own full REST wire shape (§21.1/§26.1) -- the merge readout's own header + digest content. Mirrors PostReviewVerdictRequest's own fields (the posting shape) plus the persistence-layer facts that request never carries: the AUTHORITATIVE server-computed shippable (never proposedShippable), headSha, postedAt, and sessionId.
@@ -869,6 +908,35 @@ export interface ReviewVerdictHistoryEntry {
   riskLevel: 'low' | 'medium' | 'high';
   shippable: 'auto' | 'needs_human' | 'block';
   headSha: string;
+}
+/**
+ * §12.2 item 2's own 'coalesced-mention/session-reuse info' gap (mockups.html's own 'trigger: @mention x2 -> coalesced' / 'session: reused (same PR)'). Never null: this session was necessarily created via github_pr_sessions' own atomic claim for THIS PR to reach this handler at all (GetReviewReadout's own 400-if-absent check upstream).
+ */
+export interface ReviewReadoutSessionReuse {
+  /**
+   * How many times github_pr_sessions' own atomic claim for (repoFullName, prNumber) has been taken -- 1 for the original @mention/label-trigger that created this review session, incremented once per REUSE (a later @mention or label re-trigger coalescing onto the SAME session, coalesce.go's own CreateOrJoin). All-time, never a windowed count. A manual 'Re-run review' click or §24's automatic on-commit re-review do NOT increment this -- they reach an already-known session directly, never through the coalescing claim this count measures.
+   */
+  mentionCount: number;
+  /**
+   * When this PR's own claim row was first created (github_pr_sessions.claimed_at) -- the original @mention/label-trigger's own timestamp, never updated on reuse.
+   */
+  claimedAt: string;
+}
+/**
+ * ReviewReadout.sessionReuse's own shape -- see that field's own description.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "ReviewReadoutSessionReuse".
+ */
+export interface ReviewReadoutSessionReuse1 {
+  /**
+   * How many times github_pr_sessions' own atomic claim for (repoFullName, prNumber) has been taken -- 1 for the original @mention/label-trigger that created this review session, incremented once per REUSE (a later @mention or label re-trigger coalescing onto the SAME session, coalesce.go's own CreateOrJoin). All-time, never a windowed count. A manual 'Re-run review' click or §24's automatic on-commit re-review do NOT increment this -- they reach an already-known session directly, never through the coalescing claim this count measures.
+   */
+  mentionCount: number;
+  /**
+   * When this PR's own claim row was first created (github_pr_sessions.claimed_at) -- the original @mention/label-trigger's own timestamp, never updated on reuse.
+   */
+  claimedAt: string;
 }
 /**
  * 200 response body for GET /api/sessions/:id/release-manifest (§15.2/§15.3, §12.2 item 9's dedicated release-review screen) -- the release manifest check's own persisted, structured result (migrations/000097_release_manifest_checks.up.sql). computed=false when this release PR has never had a check persisted for it (a pre-existing PR, or a check whose own insert failed) -- an explicit sentinel distinct from a real, empty result, mirroring §21.1's own 'not yet computed' rollup convention; every other field is its own zero value in that case.

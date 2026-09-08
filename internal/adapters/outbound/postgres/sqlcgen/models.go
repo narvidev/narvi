@@ -1755,14 +1755,17 @@ type GithubPrSession struct {
 	AutoRetriggerBudgetNoticeSentAt pgtype.Timestamptz `json:"auto_retrigger_budget_notice_sent_at"`
 	PrMerged                        *bool              `json:"pr_merged"`
 	PrClosedAt                      pgtype.Timestamptz `json:"pr_closed_at"`
+	MentionCount                    int32              `json:"mention_count"`
 }
 
 type HandoffSentinelRun struct {
-	ID           pgtype.UUID        `json:"id"`
-	RepoFullName string             `json:"repo_full_name"`
-	PrNumber     int32              `json:"pr_number"`
-	SessionID    pgtype.UUID        `json:"session_id"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	ID                   pgtype.UUID        `json:"id"`
+	RepoFullName         string             `json:"repo_full_name"`
+	PrNumber             int32              `json:"pr_number"`
+	SessionID            pgtype.UUID        `json:"session_id"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	ContractDriftFlagged bool               `json:"contract_drift_flagged"`
+	TodoCount            int32              `json:"todo_count"`
 }
 
 type Identity struct {

@@ -66,3 +66,39 @@ export function descriptionAdequacyTone(adequacy: string): ChipTone {
   if (adequacy === 'misleading') return 'crit'
   return 'neutral'
 }
+
+// §12.2 item 2's own "the review readout's four missing fields" -- see
+// CodeReviewView.tsx's own top comment for where each of these renders.
+
+/** visualQaTone maps ReviewReadout.visualQa's own raw label suffix (human-authored external text, never Narvi-validated) to a chip tone -- "pass"/"skip"/"skipped" are recognized case-sensitively (the exact vocabulary §8/§12.2 name); anything else (a typo, a future value) renders neutral rather than guessing. */
+export function visualQaTone(visualQa: string): ChipTone {
+  if (visualQa === 'pass') return 'ok'
+  if (visualQa === 'fail') return 'crit'
+  if (visualQa === 'skip' || visualQa === 'skipped') return 'neutral'
+  return 'neutral'
+}
+
+/** sentinelFixTone maps ReviewReadoutSentinelFix.status (sentinel_fixes.status, an unconstrained TEXT column, §17) to a chip tone. */
+export function sentinelFixTone(status: string): ChipTone {
+  if (status === 'fix_merged') return 'ok'
+  if (status === 'abandoned') return 'neutral'
+  return 'warn' // pending/spawned/fix_open -- still in flight.
+}
+
+/** sentinelFixLabel renders ReviewReadoutSentinelFix.status as the short phrase the rail shows next to the fix-PR link. */
+export function sentinelFixLabel(status: string): string {
+  switch (status) {
+    case 'pending':
+      return 'fix pending'
+    case 'spawned':
+      return 'fix session started'
+    case 'fix_open':
+      return 'fix open, merges automatically once this PR lands'
+    case 'fix_merged':
+      return 'fix merged'
+    case 'abandoned':
+      return 'fix abandoned (this PR closed unmerged)'
+    default:
+      return status
+  }
+}

@@ -772,6 +772,14 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// shared, never a second independently-constructed copy.
 	reviewFindingStore := postgres.NewReviewFindingStore(pool)
 	sentinelFixStore := postgres.NewSentinelFixStore(pool)
+	// handoffSentinelStore (§12.2 item 2's own "handoff-readiness display"
+	// gap): a second, independently-constructed instance is fine -- the
+	// SAME cheap, stateless "wraps sqlcgen.Queries" shape every other store
+	// here already has; sessionactor.NewRegistry's own internal instance
+	// (registry.go) is the sentinel's own WRITE side, this one is the
+	// review readout's own READ side, and the two never need to be the
+	// same Go value to agree on what Postgres holds.
+	handoffSentinelStore := postgres.NewHandoffSentinelStore(pool)
 	// releaseManifestCheckStore (§12.2 item 9, "dedicated release-review
 	// screen") persists the release manifest check's own typed result --
 	// see internal/app/releasereview/persist.go's own doc comment. Shared
@@ -1775,7 +1783,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// comment. sourceControl/findingRelocationResolver/cfg.GitHubBotToken
 		// are the SAME instances every other GitHub-facing route above
 		// already uses.
-		r.Get("/{sessionID}/review", httpapi.GetReviewReadout(sessionStore, githubPRSessionStore, reviewVerdictDeps, reviewFindingStore, turnStore, sourceControl, findingRelocationResolver, cfg.GitHubBotToken, cfg.Timeouts))
+		r.Get("/{sessionID}/review", httpapi.GetReviewReadout(sessionStore, githubPRSessionStore, reviewVerdictDeps, reviewFindingStore, turnStore, sourceControl, findingRelocationResolver, sentinelFixStore, handoffSentinelStore, cfg.GitHubBotToken, cfg.Timeouts))
 		// release-manifest (§15.2/§15.3, §12.2 item 9) -- the dedicated
 		// release-review screen's own read model, see httpapi/
 		// releasemanifestreadout.go's own doc comment.

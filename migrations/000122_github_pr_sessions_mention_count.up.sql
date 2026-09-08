@@ -1,0 +1,19 @@
+-- §12.2 item 2's own "coalesced-mention/session-reuse info" gap: the
+-- code-review readout could name the concept (mockups.html's own
+-- "trigger: @mention x2 -> coalesced" / "session: reused (same PR)") but
+-- had no COUNT to render -- github_pr_sessions (migrations/
+-- 000028_github_pr_sessions.up.sql) tracks only claimed_at, never how
+-- many times the claim was taken.
+--
+-- mention_count starts at 1 (the WINNER branch's own original claim,
+-- coalesce.go's own CreateOrJoin -- the row's INSERT below defaults it,
+-- so every EXISTING row, created before this column existed, correctly
+-- reads as "claimed at least once" rather than a misleading 0) and is
+-- incremented by exactly 1 each time the REUSE branch runs (a later
+-- @mention or label re-trigger coalescing onto the SAME already-claimed
+-- session) -- see IncrementGitHubPRSessionMentionCount (queries/
+-- githubprsessions.sql) for the write, and IncrementAutoRetriggerCount's
+-- own identical "only this session's own single writer touches this
+-- column, no CAS guard needed" precedent immediately below it in that
+-- same file.
+ALTER TABLE github_pr_sessions ADD COLUMN mention_count INTEGER NOT NULL DEFAULT 1;

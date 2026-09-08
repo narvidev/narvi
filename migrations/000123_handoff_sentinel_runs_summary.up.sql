@@ -1,0 +1,28 @@
+-- §12.2 item 2's own "handoff-readiness display" gap (§14.4): the
+-- handoff-readiness sentinel already computes contractDrifted/todos
+-- (internal/app/sessionactor's own runHandoffSentinelBestEffort) before
+-- rendering them into a GitHub comment body and discarding the
+-- structured values -- handoff_sentinel_runs (migrations/
+-- 000049_handoff_sentinel_runs.up.sql) recorded only that a claim
+-- happened, never what was found.
+--
+-- contract_drift_flagged/todo_count are the SAME two already-computed
+-- values (contractDrifted bool, len(todos) int) persisted at the SAME
+-- claim point, in the SAME row, rather than a new query or a re-derivation
+-- against a freshly-fetched diff -- this migration adds no new discovery
+-- of its own, it stops throwing away a fact this sentinel already knows
+-- by the time it claims.
+--
+-- NOT NULL DEFAULT (false, 0) rather than nullable: correct for every row
+-- this column will ever see written going forward. Honestly WRONG,
+-- knowingly, for any row that already existed before this migration ran --
+-- such a row was claimed only because something WAS flagged (this table's
+-- own top doc comment: "a clean scoped-session PR ... posts nothing and
+-- claims nothing"), yet will read back as "nothing flagged" here, because
+-- the original contractDrifted/todos breakdown was never persisted
+-- anywhere and cannot be reconstructed after the fact. Only the row's own
+-- created_at plus the GitHub comment/label it already posted (§14.4 v1)
+-- carry the real historical answer for a pre-migration row -- this
+-- column is a forward-looking fix, not a backfill.
+ALTER TABLE handoff_sentinel_runs ADD COLUMN contract_drift_flagged BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE handoff_sentinel_runs ADD COLUMN todo_count INTEGER NOT NULL DEFAULT 0;

@@ -135,6 +135,20 @@ func (s *GitHubPRSessionStore) IncrementAutoRetriggerCount(ctx context.Context, 
 	})
 }
 
+// IncrementMentionCount is §12.2 item 2's own "coalesced-mention/session-
+// reuse info" gap -- MUST be called on a WithTx-scoped store, still
+// holding LockForUpdate's own row lock from earlier in the SAME
+// transaction (coalesce.go's own REUSE branch, before its own early
+// commit) -- see IncrementGitHubPRSessionMentionCount's own generated doc
+// comment for why that ordering is what makes this plain increment safe
+// with no CAS guard.
+func (s *GitHubPRSessionStore) IncrementMentionCount(ctx context.Context, repoFullName string, prNumber int32) (sqlcgen.GithubPrSession, error) {
+	return s.q.IncrementGitHubPRSessionMentionCount(ctx, sqlcgen.IncrementGitHubPRSessionMentionCountParams{
+		RepoFullName: repoFullName,
+		PrNumber:     prNumber,
+	})
+}
+
 // MarkAutoRetriggerBudgetNoticeSent is §24.6's own "post the notice
 // exactly once" claim -- guarded on auto_retrigger_budget_notice_sent_at
 // IS NULL; pgx.ErrNoRows (unwrapped) means this PR was already notified,

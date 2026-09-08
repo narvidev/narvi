@@ -158,7 +158,7 @@ func (a *Actor) runHandoffSentinelBestEffort(
 		correlationID = &id
 	}
 
-	if err := a.enqueueHandoffNotification(ctx, repoFullName, int32(prNumber), payload, correlationID); err != nil {
+	if err := a.enqueueHandoffNotification(ctx, repoFullName, int32(prNumber), payload, correlationID, contractDrifted, len(todos)); err != nil {
 		a.logger.Error("sessionactor: handoff sentinel: claim/enqueue failed", "error", err)
 	}
 }
@@ -314,9 +314,13 @@ func (a *Actor) fetchHandoffTODOs(ctx context.Context, owner, repoName string, p
 // sentinelFix-claim-then-outbox-enqueue precedent exactly. A losing claim
 // (another run already posted for this PR) is NOT an error -- it is the
 // idempotent no-op this function exists to guarantee.
-func (a *Actor) enqueueHandoffNotification(ctx context.Context, repoFullName string, prNumber int32, payload []byte, correlationID *string) error {
+//
+// contractDriftFlagged/todoCount (§12.2 item 2's own "handoff-readiness
+// display" gap) are the caller's own already-computed values, forwarded
+// verbatim into the claim.
+func (a *Actor) enqueueHandoffNotification(ctx context.Context, repoFullName string, prNumber int32, payload []byte, correlationID *string, contractDriftFlagged bool, todoCount int) error {
 	return a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
-		claimed, err := a.stores.handoffSentinelRuns.WithTx(tx).Claim(ctx, repoFullName, prNumber, a.sessionID)
+		claimed, err := a.stores.handoffSentinelRuns.WithTx(tx).Claim(ctx, repoFullName, prNumber, a.sessionID, contractDriftFlagged, int32(todoCount))
 		if err != nil {
 			return fmt.Errorf("sessionactor: handoff sentinel: claim run failed: %w", err)
 		}

@@ -44,11 +44,18 @@ func (s *HandoffSentinelStore) WithTx(tx pgx.Tx) *HandoffSentinelStore {
 // SAME PR already claimed it -- the caller must post NOTHING, satisfying
 // "running the sentinel twice must not duplicate the label, the comment,
 // or the issue"). Any other error is a genuine, unexpected failure.
-func (s *HandoffSentinelStore) Claim(ctx context.Context, repoFullName string, prNumber int32, sessionID pgtype.UUID) (bool, error) {
+//
+// contractDriftFlagged/todoCount (§12.2 item 2's own "handoff-readiness
+// display" gap) are the caller's own already-computed values, persisted
+// verbatim in this same claim -- see ClaimHandoffSentinelRun's own
+// generated doc comment.
+func (s *HandoffSentinelStore) Claim(ctx context.Context, repoFullName string, prNumber int32, sessionID pgtype.UUID, contractDriftFlagged bool, todoCount int32) (bool, error) {
 	_, err := s.q.ClaimHandoffSentinelRun(ctx, sqlcgen.ClaimHandoffSentinelRunParams{
-		RepoFullName: repoFullName,
-		PrNumber:     prNumber,
-		SessionID:    sessionID,
+		RepoFullName:         repoFullName,
+		PrNumber:             prNumber,
+		SessionID:            sessionID,
+		ContractDriftFlagged: contractDriftFlagged,
+		TodoCount:            todoCount,
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -59,4 +66,15 @@ func (s *HandoffSentinelStore) Claim(ctx context.Context, repoFullName string, p
 		return false, err
 	}
 	return true, nil
+}
+
+// Get returns repoFullName/prNumber's own handoff-sentinel claim row, if
+// any -- §12.2 item 2's own "handoff-readiness display" gap, the
+// code-review readout's own read side. pgx.ErrNoRows (unwrapped) means
+// the sentinel never flagged anything for this PR.
+func (s *HandoffSentinelStore) Get(ctx context.Context, repoFullName string, prNumber int32) (sqlcgen.HandoffSentinelRun, error) {
+	return s.q.GetHandoffSentinelRun(ctx, sqlcgen.GetHandoffSentinelRunParams{
+		RepoFullName: repoFullName,
+		PrNumber:     prNumber,
+	})
 }
