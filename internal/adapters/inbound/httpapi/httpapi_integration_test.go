@@ -49,6 +49,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/chatgptlink"
 	"github.com/narvidev/narvi/internal/app/findingposition"
+	apppa "github.com/narvidev/narvi/internal/app/platformanalytics"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
 	appreviewtriage "github.com/narvidev/narvi/internal/app/reviewtriage"
@@ -134,6 +135,11 @@ type testRig struct {
 	// below ("ui settings + analytics", §12.2 item 5, §21.3) -- see
 	// httpapi/digestscope.go's own doc comment.
 	digestChannels *narvipg.DigestChannelStore
+
+	// falseFailures backs GET /api/analytics below (§12.2 item 6's own
+	// "analytics: platform-wide rollup") -- see httpapi/
+	// platformanalytics.go's own doc comment.
+	falseFailures *narvipg.FalseFailureStore
 
 	// tokenEncryptionKey is a fixed, valid 32-byte AES-256-GCM key used by
 	// this rig's own scm-credentials tests (real EncryptToken/DecryptToken
@@ -437,6 +443,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		handoffSentinelRuns:   narvipg.NewHandoffSentinelStore(pool),
 		falsePositivePatterns: narvipg.NewFalsePositivePatternStore(pool),
 		reviewVerdicts:        narvipg.NewReviewVerdictStore(pool),
+		falseFailures:         narvipg.NewFalseFailureStore(pool),
 		automations:           narvipg.NewAutomationStore(pool),
 		automationInvocations: narvipg.NewAutomationInvocationStore(pool),
 		automationRuns:        narvipg.NewAutomationRunStore(pool),
@@ -535,6 +542,18 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		// AutoApprovalOutcomes immediately above already gets.
 		DigestSectionFeedback: narvipg.NewReviewDigestSectionFeedbackStore(rig.pool),
 		Timeouts:              platform.DefaultTimeouts(),
+	}
+
+	// platformAnalyticsDeps (§12.2 item 6's own "analytics: platform-wide
+	// rollup") mirrors reviewVerdictDeps' own identical
+	// "built fresh here, from stores this rig already constructs
+	// elsewhere" precedent immediately above.
+	platformAnalyticsDeps := apppa.Deps{
+		Sessions:      rig.sessions,
+		Turns:         rig.turns,
+		Events:        rig.events,
+		FalseFailures: rig.falseFailures,
+		Timeouts:      platform.DefaultTimeouts(),
 	}
 
 	router := chi.NewRouter()
@@ -843,6 +862,14 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 	router.Route("/api/repos/{owner}/{repo}/review-analytics", func(r chi.Router) {
 		r.Use(auth.Middleware(rig.userSessions, rig.users))
 		r.Get("/", httpapi.GetReviewAnalytics(reviewVerdictDeps, rig.prSessions))
+	})
+	// /api/analytics (§12.2 item 6's own "analytics: platform-wide
+	// rollup") -- mounted behind auth.Middleware exactly like
+	// cmd/control-plane/main.go's own wiring (see platformanalytics.go's
+	// own doc comment).
+	router.Route("/api/analytics", func(r chi.Router) {
+		r.Use(auth.Middleware(rig.userSessions, rig.users))
+		r.Get("/", httpapi.GetPlatformAnalytics(platformAnalyticsDeps))
 	})
 	// /api/repos/{owner}/{repo}/digest-scope ("ui settings +
 	// analytics", §12.2 item 5, §21.3) -- mounted exactly like

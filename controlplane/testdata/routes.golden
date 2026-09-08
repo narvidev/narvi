@@ -16,6 +16,7 @@ DELETE /api/workflow-definitions/{id}
 GET /.well-known/jwks.json
 GET /.well-known/openid-configuration
 GET /api/admin/shadow-compare
+GET /api/analytics
 GET /api/audit-log
 GET /api/automations
 GET /api/automations/{automationID}

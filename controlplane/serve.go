@@ -70,6 +70,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/imagebuild"
 	"github.com/narvidev/narvi/internal/app/intentclassifier"
 	"github.com/narvidev/narvi/internal/app/outboxworker"
+	apppa "github.com/narvidev/narvi/internal/app/platformanalytics"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/reconciler"
 	"github.com/narvidev/narvi/internal/app/releasereview"
@@ -569,6 +570,15 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	turnStore := postgres.NewTurnStore(pool)
 	sandboxStore := postgres.NewSandboxStore(pool)
 	eventStore := postgres.NewEventStore(pool)
+	// falseFailureStore (§12.2 item 6's own "analytics: platform-wide
+	// rollup") is the durable sibling of turn_false_failure_total --
+	// this pool-scoped instance backs the platform-analytics read model
+	// below; app/sessionactor's own registry.go constructs its own
+	// SEPARATE instance for the transactional write side
+	// (recordFalseFailureIfApplicable), the same "one store, two
+	// independently-constructed handles, one pool" precedent every other
+	// dual-use store in this file already follows.
+	falseFailureStore := postgres.NewFalseFailureStore(pool)
 	artifactStore := postgres.NewArtifactStore(pool)
 	wsTokenStore := postgres.NewWSTokenStore(pool)
 	environmentStore := postgres.NewEnvironmentStore(pool)
@@ -841,6 +851,19 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// moves the rate that justifies arming auto-merge.
 		PlatformShadow: cfg.ShadowMode,
 		Timeouts:       cfg.Timeouts,
+	}
+	// platformAnalyticsDeps (§12.2 item 6's own "analytics: platform-wide
+	// rollup") backs GET /api/analytics -- the
+	// platform-wide sibling of reviewVerdictDeps above. Reuses
+	// sessionStore/turnStore/eventStore, the SAME pool-scoped instances
+	// every other httpapi handler in this file already shares, plus the
+	// new falseFailureStore constructed immediately above.
+	platformAnalyticsDeps := apppa.Deps{
+		Sessions:      sessionStore,
+		Turns:         turnStore,
+		Events:        eventStore,
+		FalseFailures: falseFailureStore,
+		Timeouts:      cfg.Timeouts,
 	}
 	// digestChannelStore (§21.3) backs internal/app/digest's own
 	// channel-discovery step -- constructed here, alongside its own
@@ -1988,6 +2011,18 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	router.Route("/api/repos/{owner}/{repo}/review-analytics", func(r chi.Router) {
 		r.Use(auth.Middleware(userSessionStore, userStore))
 		r.Get("/", httpapi.GetReviewAnalytics(reviewVerdictDeps, githubPRSessionStore))
+	})
+
+	// /api/analytics (§12.2 item 6's own "analytics: platform-wide
+	// rollup"): read-only GET over the platform-wide rollup --
+	// review-analytics' own sibling above, un-scoped by repo (no
+	// {owner}/{repo} in the path, mirroring /api/capabilities' own
+	// identical un-scoped shape) -- see httpapi/platformanalytics.go's
+	// own doc comment. Gated by the SAME authz.ActionViewAnalytics as
+	// review-analytics immediately above.
+	router.Route("/api/analytics", func(r chi.Router) {
+		r.Use(auth.Middleware(userSessionStore, userStore))
+		r.Get("/", httpapi.GetPlatformAnalytics(platformAnalyticsDeps))
 	})
 
 	// /api/repos/{owner}/{repo}/digest-scope ("ui settings +
