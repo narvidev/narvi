@@ -3,14 +3,15 @@
 ## Context
 
 Narvi's technical specification (autonomous coding agents in sandboxes) is in
-[docs/TECHNICAL_PLAN.md](TECHNICAL_PLAN.md) (§0–§39), and the nine-view UI design spec is in
-[docs/design/mockups.html](design/mockups.html). This plan breaks 15 phases (0–14) into **147 Steps**.
-125 of them are scheduled work in this repository (Steps 108-110 were routed out to a separate
+[docs/TECHNICAL_PLAN.md](TECHNICAL_PLAN.md) (§0–§40), and the nine-view UI design spec is in
+[docs/design/mockups.html](design/mockups.html). This plan breaks 16 phases (0–15) into **151 Steps**.
+129 of them are scheduled work in this repository (Steps 108-110 were routed out to a separate
 repository when the extension boundary was drawn, and keep their numbers as pointers so every
 citation of them stays valid) — including Phase 4's own 5 additive Steps, 40-44, Phase 8's 9
 shadow-mode Steps, 96-104, Phase 9's 6 knowledge Steps, 105-110, and Phase 12's 4 boundary Steps,
-132-135, Phase 13's 7 silent-failure Steps, 136-142, and Phase 14's 5 composition Steps,
-143-147. The other 19 are Phase 11 (Steps 113-131): named gaps, each filed as the shipping Step
+132-135, Phase 13's 7 silent-failure Steps, 136-142, Phase 14's 5 composition Steps, 143-147,
+and Phase 15's 4 guardrail Steps, 148-151. The other 19 are Phase 11 (Steps 113-131): named
+gaps, each filed as the shipping Step
 that found it declared it, and since scheduled in full with an execution order and a milestone of
 its own. They gate nothing else, which is why Phase 12 follows them numerically without waiting
 on them. Each Step is individually shippable and CI-green,
@@ -607,6 +608,49 @@ starts its target with that payload in hand; a target whose conditions do not ma
 skipped and distinguishable from one that failed; and an attempt to make one automation both source
 and target of a chain is refused at the write, including when two edits race.
 
+## Phase 15 — Autonomy guardrails (4 Steps, additive)
+
+The four controls that make the autonomy this system already grants bounded and legible. Technical
+plan §40 is the normative specification: a spend cap that refuses the next turn (§40.1), one persisted
+freeze every automatic action consults (§40.2), session-level bounds in the timeout ladder (§40.3),
+and one per-repository level that constrains the automation-enabling toggles rather than replacing
+them (§40.4).
+
+What binds them is the question each answers, and that no shipped Step answers: not "is this loop
+bounded" — every loop is — but "how much may this session spend", "stop everything automatic, now",
+"how long may a session run", and "what is this repository allowed to do". Read against the levels of
+autonomy this product is positioned in, the first is a Level 3 prerequisite the plan did not meet, and
+the second is the sentence Level 4 rests on: a human can still step in.
+
+On placement: by content Steps 148-150 are Phase 2 and Phase 5 control work and 151 is a Phase 7
+Settings row. Appended rather than folded in, for the reason Phases 8 through 14 each give for
+themselves. Not filed in Phase 11 either, under that phase's own rule: nothing here was declared
+missing by the Step that shipped without it — these were found by reading the shipped controls
+against an external definition of what a control is.
+
+Execution order: **{148, 149, 150} → 151**. The first three are independent of one another and of
+Phase 14; 151 is last because its milestone reads the other three.
+
+**One constraint this phase places on Phase 14, in either direction**: §38.3's chain enqueue and
+§39.3's train advance consult the freeze. If Phase 14 ships first, Step 149 wires them; if Step 149
+ships first, Steps 144 and 146 consult it before they ship. §40.6 states the rule; this records that
+it binds whichever Step comes second.
+
+| Step | Title | Content | Ref. |
+|---|---|---|---|
+| 148 | the spend cap | `repo_settings.session_spend_cap_usd` and `automations.session_spend_cap_usd` (NULL = no cap; zero or less refused at write time per §37); checked at the turn-creation chokepoint against `SUM(cost_usd)` over the session's turns — derived, never a counter column; a refused turn leaves the session waiting on a human, never failed: persisted `warning`, one outbox notice, an audited raise re-admits. Applies to every turn regardless of who asked (§40.1's inversion of §24.6, stated in the code comment). Exit: a session at its cap refuses the next turn with the typed reason, and takes it after the cap is raised; overshoot bounded by one turn's own spend, documented not hidden | §40.1, §25.15, §37 |
+| 149 | the freeze | One persisted platform-wide boolean, admin-only, audited as `autonomy.frozen`/`autonomy.unfrozen`; consulted at the automatic-action sites §40.2 lists and at no human command; each site records `skipped` with reason `frozen`, distinguishable from `failed`, consuming nothing — a **call-site** check, deliberately not a query exclusion, with the reason in the code comment. Decision-inbox banner. Exit: with candidates pending, no merge, no auto-fix spawn, no re-review enqueue and no automation invocation occurs while frozen; every candidate is still a candidate after unfreeze; no running turn is severed | §40.2, §32.8, §16 |
+| 150 ∥ | session bounds | `MaxTurnsPerSession` and `SessionWallClock` in `platform/timeouts.go` and nowhere else, human and automation values, `SessionWallClock > turn_deadline` in the invariant test; turn count at the chokepoint as `COUNT(*)`; wall-clock as the sixth named timer `session_deadline`; a bound reached closes the session to new turns, lets the in-flight one end, and derives the terminal status with a new named reason through the transition table — never `failed`. Audited per-session extension. Exit: an automation-created session stops at its bound with the reason persisted and the last turn intact | §40.3, §5.4, §2, §3.1 |
+| 151 | the autonomy level | `repo_settings.autonomy_level` ∈ {`assisted`, `conditional`, `high`}, default `conditional`, migration backfilling `high` where auto-merge or sentinel auto-fix is already on (no behavior changes at migration); a ceiling on the toggles, not a replacement: forbidden toggles refused at write time naming the level, lowering turns off every toggle above it in one transaction with one audit row each, raising arms nothing; the permitted sets as a table in `internal/domain` with an exhaustiveness test over every automation-enabling `repo_settings` column (§13.3's matrix discipline). Settings row (admin-only, §13.3), `review_verdicts` analytics sliced by level. Exit: one field answers what a repository may do; a forbidden toggle is refused; a lowered level leaves one audit record per consequence | §40.4, §21.1, §21.2, §13.3 |
+
+**Phase 15 milestone**: a session at its cap or bound stops taking turns without being marked failed,
+with the reason persisted and the last turn intact, and resumes on an audited raise; the freeze stops
+every automatic action at once without severing a running turn or losing a single candidate, and a
+human command still works while it holds; a repository's level answers what it may do in one field,
+refuses a toggle above it at the write, and leaves one audit record per consequence when lowered.
+§9.3 scenario 15 green — gating this phase, on the Phase 4 precedent. Phase KPI: verdict precision
+(§21.1) reported per level from the first repository moved.
+
 ## Sequencing & parallelism
 
 - **Parallel streams in phase 1**: control-plane (07-08, 09-12, 18-20) ∥ sandbox-agent (13-17) — converge at 21.
@@ -690,5 +734,5 @@ and target of a chain is refused at the write, including when two edits race.
 ## Verification
 
 - Each Step: CI (lint, `go test -race`, contract tests) + its own criterion listed on its row.
-- Phase milestones = blocking gates: e2e via API/UI (P1), 12 resilience scenarios (P2), classifier shadow report (P3), review-verdict diff reviewed for precision (P5), flag-reversible rollout (P6), 9 views built to mockups + screenshot review (P7), a zero-egress evaluation run on a live customer repository verified against the suppression ledger (P8 — and P8 gates any customer-repo attachment, whatever the numeric order suggests), mode A live on all three seams with the mode-stamped KPI reporting and Step 107's baseline readout read with its three-way decision recorded (§31.9) (P9). Phase 4 (Steps 40-44) is additive scope, not a blocking gate — its own milestone verifies warm-boot behavior and compaction-retry recovery but never holds up Phase 5. Phases 10, 11 and 12 are appended scope on the same footing: Phase 10 additive (Step 111 closes P6's own criterion, Step 112 gates nothing), Phase 11 scheduled in full with a milestone of its own, Phase 12 additive — each has a gate, none holds up a phase before it. Phase 13 likewise: additive, gated on its own two §9.3 scenarios, which extend that catalogue rather than reopening Phase 2's closed criterion. Phase 14 is additive too, and the only phase gated on another: Steps 141 and 142 must ship before either capability it adds.
+- Phase milestones = blocking gates: e2e via API/UI (P1), 12 resilience scenarios (P2), classifier shadow report (P3), review-verdict diff reviewed for precision (P5), flag-reversible rollout (P6), 9 views built to mockups + screenshot review (P7), a zero-egress evaluation run on a live customer repository verified against the suppression ledger (P8 — and P8 gates any customer-repo attachment, whatever the numeric order suggests), mode A live on all three seams with the mode-stamped KPI reporting and Step 107's baseline readout read with its three-way decision recorded (§31.9) (P9). Phase 4 (Steps 40-44) is additive scope, not a blocking gate — its own milestone verifies warm-boot behavior and compaction-retry recovery but never holds up Phase 5. Phases 10, 11 and 12 are appended scope on the same footing: Phase 10 additive (Step 111 closes P6's own criterion, Step 112 gates nothing), Phase 11 scheduled in full with a milestone of its own, Phase 12 additive — each has a gate, none holds up a phase before it. Phase 13 likewise: additive, gated on its own two §9.3 scenarios, which extend that catalogue rather than reopening Phase 2's closed criterion. Phase 14 is additive too, and the only phase gated on another: Steps 141 and 142 must ship before either capability it adds. Phase 15 is additive, gated on §9.3 scenario 15, and binds Phase 14 in one respect: chain enqueue and train advance consult the freeze, wired by whichever of Step 149 or Steps 144 and 146 ships second.
 - Project end: `make dist` produces the standalone `narvi` binary; all phase gates green.

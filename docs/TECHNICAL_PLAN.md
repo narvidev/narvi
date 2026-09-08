@@ -65,7 +65,7 @@ Single Go module, hexagonal architecture. Domain has zero external dependencies.
 - **Hydration on demand**: actor loads state from Postgres on first command, evicts after idle TTL (default 30 min without commands or connected clients).
 - **Single-writer across replicas**: Postgres advisory lock keyed by session id, held for the actor's lifetime, plus a **fencing check**: every write includes the actor's `epoch` (bumped on each acquisition); writes with a stale epoch fail. A zombie actor on an old pod can never corrupt state.
 - **Transactional writes**: state transition + appended event + outbox entries commit in ONE Postgres transaction. There is no such thing as a fire-and-forget state write.
-- **Named persistent timers**: table `session_timers(session_id, name, fires_at)`. Names: `connecting_deadline`, `liveness_check`, `inactivity`, `turn_deadline`, `terminal_grace`. A per-pod timer pump polls due timers (`SELECT ... FOR UPDATE SKIP LOCKED`) and delivers them as actor commands. Timers survive restarts; each is armed/re-armed independently.
+- **Named persistent timers**: table `session_timers(session_id, name, fires_at)`. Names: `connecting_deadline`, `liveness_check`, `inactivity`, `turn_deadline`, `terminal_grace`, and — since §40.3 — `session_deadline`. A per-pod timer pump polls due timers (`SELECT ... FOR UPDATE SKIP LOCKED`) and delivers them as actor commands. Timers survive restarts; each is armed/re-armed independently.
 
 ## 3. Domain model & state machines
 
@@ -220,6 +220,7 @@ type AgentRuntime interface {
 One struct, validated at boot with the invariant chain asserted in a unit test:
 `provider hard cap (2h) > supervisor turn cap > CP turn_deadline > OpenCode SSE inactivity timeout`, each with explicit margin. Also: `providerHTTPClientTimeout > provider worst cold start`; `first_connect_budget > image pull + boot p99`. No timeout literal anywhere else in the codebase.
 **The first term is not a property of the turn.** A provider's hard cap runs from its sandbox's own creation, not from the turn running inside it, so this chain is asserted of a turn dispatched onto a *fresh* sandbox and is simply false of one dispatched onto an old one — the boot-time invariant test cannot see the difference, because at boot there is no sandbox. §35 is what makes the first term true at dispatch rather than only at spawn; `RotationRunwayFloor` is this file's own entry for it.
+**The ladder has a session-level tier above the turn (§40.3).** `SessionWallClock > turn_deadline`, and `MaxTurnsPerSession` beside it, both with a human-session value and a stricter automation-session value — this file's own entries, asserted in the same invariant test, and the reason a session created by an automation has an end that someone chose.
 
 ## 6. Wire contracts (frontend and sandbox protocol)
 
@@ -259,7 +260,7 @@ Problem this solves: some engine behaviors spawn multiple concurrent sub-agents 
 
 - The adapter assigns each spawned sub-task a stable `subTaskId` (derived from whatever correlator the engine itself exposes — OpenCode's own nested-task id today; not Narvi's own session concepts, per the note below) and tags every event that sub-task produces with it (§6.1), emitting `sub_task_start`/`sub_task_finish` to bracket its lifetime. `sub_task_start` additionally carries an optional `subAgentType` (Step 71, §26.4) sourced from the task tool's own real `subagent_type` dispatch parameter (VERIFIED LIVE: `{"description","prompt","subagent_type"}`) — unlike `label` (freeform, not correctness-bearing), this is the engine's own reliable dispatch parameter, which is why §26.4's post-hoc sub-task corroboration keys off it rather than `label`.
 - **Not a new domain entity.** A sub-task is a presentation/wire-level grouping of events belonging to one turn — not a new Postgres row, and not Narvi's own "child session" (§14.4: a full session with its own sandbox/turns, spawned by automation/sentinel features — a materially heavier mechanism; the naming here is deliberately distinct so the two are never confused). The turn state machine (§3.3) is unaffected: one turn still has exactly one `processing` state no matter how many sub-tasks ran underneath it.
-- **Cost rolls up — a real, shipped accumulator as of Step 70, but scoped to the OpenCode adapter's own in-memory turn state, not Postgres.** An earlier draft of this bullet claimed, in the present tense, that every `step_finish.cost` (§6.1) "is summed" into one turn/session total regardless of lane, before any such accumulator existed — **verified false at the time**: the only cost columns anywhere in the schema were `repo_settings.review_cost_budget_light_usd`/`..._deep_usd` (migration 000085), Step 69's own configured *ceilings*, and no running total existed anywhere. That gap is what Step 70 closes, but the fix landed adapter-side, not schema-side: `internal/adapters/outbound/opencode`'s own `turnState` (turn.go) carries a `spentUSD float64` field, summed by `dispatchPart`'s `"step-finish"` case (sse.go) for every step-finish this turn observes — main lane and every sub-task alike, since §7.1's own fan-out routes every sub-task's events back to the SAME `turnState` pointer, tagged only with a `subTaskId`, so the summation needs no lane-specific case at all. This total lives and dies with one turn's own in-process `turnState` — the individual per-step `cost` figures still flow to the control plane exactly as before, unchanged, on each `step_finish` event (§6.1), but the RUNNING SUM itself is never persisted to Postgres, never itself transmitted over the sandbox WS, and never visible outside the one `sandbox-agent` process running that turn. It exists to answer exactly one question, locally: "how much has THIS review spent so far", read back via `Adapter.CurrentTurnSpentUSD` (adapter.go) by `cmd/sandbox-agent`'s own new loopback HTTP server (§26.7's own mechanism, reviewcostbudgetserver.go) — a sandbox-process-local total is sufficient for that, and a Postgres-backed one would need a real wire-contract change and a migration this Step does not make. (Per-model cost attribution when a sub-task runs on a different model than its turn — §12.2 item 6's cost-by-model view — is still not designed here; that needs its own `step_finish` model field before it can be claimed, left to whichever future work actually adds it. A control-plane-visible, cross-turn/session cost total, if ever needed, is also still unbuilt — this accumulator does not attempt it.)
+- **Cost rolls up — a real, shipped accumulator as of Step 70, but scoped to the OpenCode adapter's own in-memory turn state, not Postgres.** An earlier draft of this bullet claimed, in the present tense, that every `step_finish.cost` (§6.1) "is summed" into one turn/session total regardless of lane, before any such accumulator existed — **verified false at the time**: the only cost columns anywhere in the schema were `repo_settings.review_cost_budget_light_usd`/`..._deep_usd` (migration 000085), Step 69's own configured *ceilings*, and no running total existed anywhere. That gap is what Step 70 closes, but the fix landed adapter-side, not schema-side: `internal/adapters/outbound/opencode`'s own `turnState` (turn.go) carries a `spentUSD float64` field, summed by `dispatchPart`'s `"step-finish"` case (sse.go) for every step-finish this turn observes — main lane and every sub-task alike, since §7.1's own fan-out routes every sub-task's events back to the SAME `turnState` pointer, tagged only with a `subTaskId`, so the summation needs no lane-specific case at all. This total lives and dies with one turn's own in-process `turnState` — the individual per-step `cost` figures still flow to the control plane exactly as before, unchanged, on each `step_finish` event (§6.1), but the RUNNING SUM itself is never persisted to Postgres, never itself transmitted over the sandbox WS, and never visible outside the one `sandbox-agent` process running that turn. It exists to answer exactly one question, locally: "how much has THIS review spent so far", read back via `Adapter.CurrentTurnSpentUSD` (adapter.go) by `cmd/sandbox-agent`'s own new loopback HTTP server (§26.7's own mechanism, reviewcostbudgetserver.go) — a sandbox-process-local total is sufficient for that, and a Postgres-backed one would need a real wire-contract change and a migration this Step does not make. (Per-model cost attribution when a sub-task runs on a different model than its turn — §12.2 item 6's cost-by-model view — is still not designed here; that needs its own `step_finish` model field before it can be claimed, left to whichever future work actually adds it. A control-plane-visible, cross-turn/session cost total, if ever needed, is also still unbuilt — this accumulator does not attempt it.) **Amended by §40.6, and true since §25.15 (Step 93): the running total IS now persisted, to `turns.cost_usd` and `turn_step_costs` (migrations 000098-000100), summed control-plane-side as each `step_finish` lands. The adapter-local accumulator described here still exists and is still not that figure — §25.15 keeps the two separate on purpose, and §40.1 is what finally enforces a ceiling on the persisted one.**
 - Phasing: adapter-side tagging is Step 17 (OpenCode adapter, alongside the other quirks on this line); UI rendering of sub-task lanes is Step 82 (session timeline, lane nesting) and Step 83 (session rail, cost-breakdown roll-up) — see §12.2 item 1.
 
 ### 7.2 Context-overflow compaction retry (Step 44)
@@ -324,6 +325,7 @@ These run as automated scenarios against a real (or provider-faked) stack. Minim
 12. Deploy rollout (rolling restart) → zero sessions marked failed.
 13. Turn dispatched onto a sandbox past its runway floor → rotation first, turn runs on the replacement, never a failure; and a deadline reached mid-turn → the turn stays `Processing`, a neutral warning is persisted, the same turn resumes after the rotation (§35.3, §35.4).
 14. Fresh-lineage respawn after a sandbox is lost → the recap reaches the agent framed as a third-party report, the continuity warning is persisted and survives a reload, and no claim in the recap is presented as the agent's own memory (§35.5).
+15. Session spend reaches its cap mid-run → the in-flight turn completes, the next dispatch is refused with a typed reason and one notice, the session is not marked failed, and an audited raise re-admits the next turn; and the freeze flipped with auto-merge candidates pending → no merge, no auto-fix spawn, no re-review enqueue and no automation invocation occurs while frozen, every candidate is still a candidate after unfreeze, a human command still works, and no running turn is severed (§40.1, §40.2).
 
 Scenarios 13-14 were added after Phase 2 closed, and they gate the appended phase that adds them — not Phase 2's own "12 scenarios" criterion, which is not reopened. This is the Phase 4 precedent: a later phase may extend this catalogue and gate itself on what it added, and a closed gate stays closed on the set it was signed off against.
 
@@ -395,6 +397,10 @@ Six ways this system can fail while looking like it succeeded, and the write-tim
 **Phase 14 — Decomposition and chaining (Steps 143-147; additive; see §38, §39)**
 Two capabilities that compose work this system already performs into more than one unit: one automation's own reported conclusion starting another, and a tracker ticket a team already decomposed landing as one pull request per sub-issue, each dependent link gated on its predecessor's recomputed verdict. Nothing here is a defect; both are capabilities this design did not have.
 *Exit: a parent ticket with a declared dependency between two sub-issues produces one PR per sub-issue with the dependent one gated on the recomputed verdict, and a reported outcome starts its target with the structured payload in hand. Gated on Phase 13's Steps 141 and 142.*
+
+**Phase 15 — Autonomy guardrails (Steps 148-151; additive; see §40)**
+The four controls that make the autonomy this system already grants bounded and legible: a spend cap that refuses the next turn, one persisted freeze every automatic action consults, session-level bounds in the timeout ladder, and one per-repository level that constrains the automation-enabling toggles rather than replacing them. Nothing here is a defect in a shipped Step; each is a control the design assumed and never named.
+*Exit: a session at its cap or bound stops taking turns without being marked failed and resumes on an audited raise; the freeze stops every automatic action without severing a running turn or losing a candidate; a repository's level answers what it may do in one field and one audit row. §9.3 scenario 15 green, gating this phase.*
 
 ## 11. Working conventions for the implementing agent
 
@@ -563,7 +569,7 @@ Roles (global, one per user): **admin > maintainer > member > viewer**.
 | Stop/resume any session; approve any plan | ✓ | ✓ | — | — |
 | Manage automations, environments, repo/env secrets | ✓ | ✓ | — | — |
 | Edit review verdicts; re-trigger reviews; auto-approval eligibility config (§21) | ✓ | ✓ | — | — |
-| Integrations, global secrets, prompt-template activation, members & roles, per-repo auto-merge toggle (§21), sentinel auto-fix toggle (§17 — stricter than auto-merge since it ends in an unattended merge with no per-repo arming step, not a human Merge click), per-repo automatic re-review opt-in toggle (§24 — off by default, same admin-only row as the other automation-enabling toggles here) | ✓ | — | — | — |
+| Integrations, global secrets, prompt-template activation, members & roles, per-repo auto-merge toggle (§21), sentinel auto-fix toggle (§17 — stricter than auto-merge since it ends in an unattended merge with no per-repo arming step, not a human Merge click), per-repo automatic re-review opt-in toggle (§24 — off by default, same admin-only row as the other automation-enabling toggles here), and — §40 — the per-repo autonomy level, spend cap and session-bound extension, and the platform-wide freeze (the level is a ceiling on the toggles in this row, so it is gated at least as strictly as any of them) | ✓ | — | — | — |
 
 Enforcement — **server-side only, channel-agnostic**:
 - `domain/authz`: a table-driven `Authorize(actor, action, resource) error` — the matrix above lives in the domain as data with exhaustive tests. Every state-changing actor command (session actor mailbox, plan approval, verdict edit, automation toggle) calls it, so a Slack approval passes exactly the same check as a web one.
@@ -5771,3 +5777,213 @@ sentinel pair is not a member of it.
 ### 39.7 Phasing
 Appended with §38, after Phase 13, and after §38 within the phase: both need §36's backstop, and
 the train additionally needs §24.8's exemption to exist before its first link is ever deferred.
+
+## 40. Autonomy guardrails: the cap, the freeze, the bounds and the level (new capability)
+
+Problem this solves: this design grants real autonomy — auto-merge (§21.2), sentinel auto-fix (§17),
+automatic re-review (§24), workflow auto-advance (§25), scheduled automations (§3.5), and, once Phase
+14 lands, chains (§38) and trains (§39) — and every grant is individually bounded: a per-PR re-review
+budget, a three-attempt loop guard, an auto-pause after three failed invocations, two per-path review
+ceilings. What no shipped Step provides is the four controls an operator reaches for when the question
+is not "is this loop bounded" but "how much may this session spend", "stop everything automatic, now",
+"how long may a session run", and "what is this repository allowed to do". Each was assumed by the
+design and named by none of it. Read against the vocabulary this product is positioned in — the
+asdlc.io levels of autonomy, where Level 3 is conditional autonomy under strict monetary caps and a
+human gate before merge, and Level 4 is high autonomy a human can still step into — the first is a
+Level 3 prerequisite this plan does not meet, and the second is the literal sentence Level 4 rests on.
+
+None of this is filed in Phase 11, for the reason Phases 13 and 14 give: nothing here was declared
+missing by the Step that shipped without it. These were found by reading the shipped controls against
+an external definition of what a control is.
+
+### 40.1 The spend cap refuses the next turn
+
+**What exists.** Cost is control-plane-visible and durable: `turns.cost_usd` (migration 000098) and
+`turn_step_costs` (000099, 000100), summed per §25.15 as each `step_finish` lands, idempotent on
+`stepId`. The only ceilings *enforced* anywhere are `repo_settings.review_cost_budget_light_usd` and
+`..._deep_usd` (000085), and §26.7 is explicit that they gate optional review passes only — "never the
+primary pass a verdict depends on". A session, an automation, a workflow run: none has a ceiling. An
+automation on a cron with fan-out at ten and turns that keep succeeding is bounded by nothing but its
+own schedule; §3.5's auto-pause counts failures, and a run-away that succeeds is not a failure.
+
+**The cap.** `repo_settings.session_spend_cap_usd` (NULL = no cap, today's exact behavior) and
+`automations.session_spend_cap_usd` for the sessions an automation creates — the automation's own
+value when present, the repository's otherwise. It is checked at the one place a turn is created,
+`createTurnLocked`/`CreateTurnCore` (the single dispatch chokepoint §23 and §25.6 already rely on),
+against `SUM(cost_usd)` over the session's own turns — derived from the rows that exist, never a
+counter column, the same discipline §25.5's loop guard and §21.1's `DISTINCT ON` reduction follow. At
+or past the cap, the turn is refused with a typed reason; the session is **not** failed and **not**
+cancelled: a persisted `warning` event and one outbox notice say the cap was reached and name the
+value, the session keeps its sandbox under §2's ordinary idle rules, and an admin or maintainer
+raising the cap (an audited write) re-admits the next turn. §3.1's taxonomy is preserved: a capped
+session is a session waiting on a human, not a failed one.
+
+**Who the cap applies to, and why this inverts §24.6's rule.** §24.6 exempts the human's manual
+re-trigger from the automatic re-review budget, because that budget exists to stop a *loop*, and a
+human pressing the button is not a loop. A spend cap exists to stop *money*, and a cap a prompt can
+walk past is not a cap. So it applies to every turn on the session regardless of who asked for it; the
+human's remedy is raising the cap, which is deliberate and audited, never bypassing it, which is
+neither. The asymmetry with §24.6 is intended and is the reason the two are separate controls.
+
+**A cap of zero is refused at write time.** §37's rule: a value that cannot function is rejected when
+written. A cap of zero or less permits nothing — the same shape as `loopguard.Config.MaxAttempts <= 0`,
+which §25.5 calls a misconfiguration — so the write is refused, and NULL remains the only spelling of
+"no cap".
+
+**What the cap cannot do, stated rather than implied.** It refuses the *next* turn. It does not stop
+the one in flight: this control plane has no cancel command and no channel into a running turn
+(§32.8's own stated limitation, and §26.7's reason for putting the review budget inside the sandbox).
+The overshoot is therefore bounded by one turn's own spend under `turn_deadline`, and by nothing
+tighter. And §25.15's attribution caveat carries over: a `step_finish` landing after its turn
+terminalized is attributed to whatever turn is processing then, so the sum the cap reads is a lower
+bound, never an exact bill. Neither is closed here; both are named so nobody reads the cap as a hard
+ceiling on a bill.
+
+### 40.2 The freeze: no new automatic action starts
+
+**What exists.** `auto_merge_enabled` is per repository (§21.2). `NARVI_ROLLOUT_MODE` (§32) gates the
+*admission of new sessions* and is never consulted by the auto-merge worker — grepped, not assumed:
+the worker's `PumpOnce` lists `auto_merge_enabled` repositories and re-validates each candidate, and
+reads no platform-wide flag. There is no single control that stops every automatic action at once.
+During an incident, an operator today turns off auto-merge on N repositories, pauses M automations,
+and hopes nothing else is armed.
+
+**The freeze.** One persisted, platform-wide boolean — a row, never an environment variable, because
+a flip must be one audited write with no restart, and its state must be readable by Settings like any
+other value. Admin-only (§13.3). Consulted, and only consulted, at the sites where an action starts
+*without a human asking for it right then*: the auto-merge worker before `RevalidateForAutoMerge`; the
+sentinel auto-fix spawn (§17); the automatic re-review enqueue (§24.3 step 4); the automation scheduler
+at invocation start (§3.5); the workflow engine's auto-advance (§25); and, when Phase 14 ships, the
+chain enqueue (§38.3) and the train's verdict-gated advance (§39.3). **Never** consulted by a human
+command: a prompt, a plan approval, a manual merge click, a manual re-trigger, a manual automation
+run. This is §24.6's asymmetry applied to the freeze — the freeze stops what runs by itself, not what
+a person decided.
+
+**A frozen action is skipped, not failed, and not lost.** Each site records `skipped` with reason
+`frozen`, distinguishable from `failed` — §38.3's own distinction, made the general rule. Nothing is
+consumed: an auto-merge candidate is still a candidate after the freeze lifts, a debounced re-review
+still fires, a due automation runs on its next tick. This is deliberately a **call-site** check, the
+opposite of the shadow guard's "query exclusion, never call-site checks" rule (`automerge/worker.go`,
+§30.8), and the difference is the point: shadow-era verdicts must *never* become candidates, whereas
+a frozen candidate must survive the freeze. A query exclusion would be the wrong tool here for the
+same reason a call-site check is the wrong tool there.
+
+**What the freeze does not do.** Sever a running turn (§32.8, inherited and not re-solved). Stop a
+human. Pause the outbox — notifications about work already done still deliver, because a freeze that
+also silences the audit trail is a freeze nobody can verify.
+
+**Surfaces.** The decision inbox (§16) shows one banner while frozen; `ready_to_merge` items remain
+listed, marked as held. Audit rows `autonomy.frozen` and `autonomy.unfrozen`, with actor, on the
+`auto_merge.merged` naming precedent.
+
+### 40.3 Session bounds: turns and wall-clock
+
+**What exists.** `turn_deadline` bounds one turn; the provider's cap bounds one sandbox and §35
+rotates it; `auto_retrigger_count` bounds re-review at ten per PR; `loopguard` bounds a workflow loop
+at three. Nothing bounds a session's total number of turns or its total wall-clock. A session created
+by an automation, whose turns keep succeeding, has no end that anyone chose.
+
+**The bounds.** Two new terms in `platform/timeouts.go` and nowhere else (§5.4): `MaxTurnsPerSession`
+and `SessionWallClock`, each with a value for human-created sessions and a stricter one for
+automation-created sessions — distinguished by the session's own origin, which §3.5's automation runs
+already record. The ladder gains its session-level tier, `SessionWallClock > turn_deadline`, asserted
+in the same boot-time invariant test. The turn count is checked at 40.1's chokepoint as `COUNT(*)`
+over the session's turns. The wall-clock is a sixth named persistent timer, `session_deadline`, in
+§2's `session_timers`, armed at session creation, surviving restarts like the other five.
+
+**What a bound does.** Same shape as the cap: the session becomes closed to new turns, the in-flight
+turn ends under its own `turn_deadline`, a `warning` is persisted and one notice sent, and the session
+derives its terminal status through §3.1's transition table with a new named reason — never `failed`,
+because nothing failed. A human may extend a bound on one session (audited); the extension is the
+remedy, exactly as raising the cap is.
+
+### 40.4 The autonomy level: one column that constrains the toggles
+
+**What exists.** A repository's autonomy posture is ten independent columns on `repo_settings`, each
+admin-gated, each off by default: `auto_merge_enabled`, `auto_retrigger_review_enabled`,
+`sentinel_autofix_enabled`, `description_autofix_enabled`, `epistemic_check_enabled`, `plan_mode`,
+`sessions_enabled`, `live_egress_enabled`, `review_depth_mode`, `max_auto_approve_files_changed`. An
+admin asked "what level is this repository at" reads ten toggles. Moving a repository from
+conditional to high autonomy is N separate writes with N separate audit rows and no record that they
+were one decision. Analytics (§21.1) cannot slice verdict precision by level, so the one instrument
+that should justify raising a repository's autonomy cannot be read per level.
+
+**The level.** `repo_settings.autonomy_level`, one of `assisted`, `conditional`, `high` — the
+external vocabulary's Levels 2, 3 and 4, named for what they permit rather than numbered, so nobody
+reads a number as a score. The level is a **ceiling on the toggles, not a replacement for them**:
+every toggle keeps its own column, its own admin-only write, and its own audit row. What the level
+adds is one rule and one act:
+
+- **The rule.** A toggle the current level forbids cannot be turned on — refused at write time (§37),
+  naming the level. `assisted` forbids every automation-enabling toggle and forces `plan_mode`.
+  `conditional` permits review, auto-approval surfaced in the inbox (§16's `ready_to_merge`) and
+  automatic re-review, and forbids `auto_merge_enabled` and `sentinel_autofix_enabled`. `high`
+  forbids nothing this row governs.
+- **The act.** Lowering the level turns off every toggle above it **in the same transaction**, one
+  audit row per toggle plus one for the level, so the decision and its consequences are one record.
+  Raising the level arms **nothing**: each toggle above it stays off until armed on its own, which
+  keeps §21.2's calibration posture and §30.8's promotion fence exactly where they are. The level
+  says what a repository *may* do; the toggles say what it *does*.
+
+**The permitted sets are a table in the domain, and the table is exhaustive by test.** A future
+toggle that arms an automation and is not classified under a level would be ungoverned by it, and
+nothing at runtime would say so. So the level's permitted sets live as data in `internal/domain`,
+on §13.3's own discipline for the RBAC matrix — table-driven, with a test that fails the build the
+moment a `repo_settings` column that enables an automatic path is absent from the table. The
+invariant `enabled ⊆ permitted(level)` is a pure function over that table, called from the settings
+write path and from the migration's backfill alike, so the two cannot disagree.
+
+**Default, and the migration.** `conditional`. Not `assisted`, because every repository today already
+runs at what `conditional` describes — review on, auto-approval in the inbox, auto-merge off — so
+`conditional` is the byte-identical default and `assisted` is a deliberate downgrade. The migration
+backfills `high` on any repository with `auto_merge_enabled` or `sentinel_autofix_enabled` already
+on, so no shipped behavior changes at migration time — §32.2's "`open` is a byte-for-byte no-op"
+precedent, applied to a schema change.
+
+**Shadow is not a level.** A repository in shadow (§30) is at whatever level it is; shadow is an
+egress property orthogonal to autonomy, and the two compose (a `high` repository in shadow
+would-have-merged and did not, §30.8). Stated so that nobody adds `shadow` as a fourth value.
+
+**Analytics.** §21.1's verdict history gains the level as a dimension: precision by level is the
+readout an admin looks at before raising one, on §30.8's "an informed decision, not a leap of faith"
+posture, and the phase KPI below.
+
+### 40.5 What this does not build: the durable objective
+
+The Level 4 trait this section does not touch is the one that defines it — a goal that outlives a
+session, owns a task list, and decides when it is done. Nothing in this domain is that object: §38's
+chain is one automation starting another, §39's train is bounded by a ticket's own decomposition, and
+§3.5's automation is a trigger. That is the correct state of this plan, for three reasons. The
+external framework names Level 3 the production ceiling and Level 4's risk "silent drift"; an
+objective without 40.1-40.3 in place is that drift with a name. This system has not yet run
+end-to-end against a real provider (the adapters' own doc comments say so), and an objective is the
+last thing to build on an unexercised base. And the operators this product is positioned for say, in
+their own words, that they are in no hurry. Recorded as the next design question, deliberately not as
+a Step.
+
+### 40.6 What this changes elsewhere, stated rather than left to be noticed
+
+- **§7's cost bullet** ("a real, shipped accumulator as of Step 70, but scoped to the OpenCode
+  adapter's own in-memory turn state, not Postgres") was true when written and is stale since §25.15
+  (Step 93) persisted the running total to `turns.cost_usd`. Amended in place with a pointer; the
+  adapter-local accumulator still exists and is still not the control-plane figure, exactly as
+  §25.15 says.
+- **§2** gains `session_deadline` as the sixth named timer. **§5.4** gains the session-level tier.
+- **§9.3** gains scenario 15, gating Phase 15 on the Phase 4 precedent.
+- **§13.3**'s admin-only row names the level, the freeze, the cap and the bounds; the level is gated
+  at least as strictly as any toggle it constrains.
+- **§16** shows the freeze and lists capped and bounded sessions as waiting on a human.
+- **§24.6**'s human-path exemption is restated for the freeze and *inverted* for the cap (40.1).
+- **§26.7** is unchanged: its per-path ceilings remain the review lane's own, beneath the session cap.
+- **§32.8**'s "never sever a running turn" is inherited by the cap, the bounds and the freeze — none
+  of them re-solves it, and the hard-kill mechanism it names stays its own future Step.
+- **§38.3 and §39.3** consult the freeze. Written now, while Phase 14 is unbuilt and it costs one line
+  each, on §24.8's own precedent — a constraint on those Steps, not a note about this one.
+
+### 40.7 Phasing
+
+Phase 15, Steps 148-151, appended after Phase 14 for the reason Phases 8 through 14 each give for
+themselves. Execution order: **{148, 149, 150} → 151**. The first three are independent of one
+another and of Phase 14; 151 last because its milestone reads the other three. Phase 15 places one
+constraint on Phase 14 in either direction: if Phase 14 ships first, Step 149 wires the freeze into
+§38.3 and §39.3; if Step 149 ships first, Steps 144 and 146 consult it before they ship.
