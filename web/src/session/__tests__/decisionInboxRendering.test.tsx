@@ -14,7 +14,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import type { DecisionInboxItem } from '@narvi/contracts/rest-dtos'
 
-import { DecisionInboxRow } from '../DecisionInboxView'
+import { DecisionInboxRow, ScmStatusBanner } from '../DecisionInboxView'
 import { isSafeHref } from '../urlSafety'
 
 const XSS_IMG = '<img src=x onerror=alert(1)>'
@@ -231,5 +231,49 @@ describe('DecisionInboxRow -- viewer role sees a read-only queue (§16.2)', () =
 describe('mutation guard: isSafeHref actually called on decision-inbox htmlUrl', () => {
   it('isSafeHref(javascript:...) is false -- if this ever flips true, DecisionInboxRow\'s own guard silently stops working', () => {
     expect(isSafeHref(JS_URL)).toBe(false)
+  })
+})
+
+// ScmStatusBanner's own three-way SCM state (§16.2, this file's own top
+// comment): the two wire fields, scmAsOf and scmFetchFailed, are NOT
+// mutually exclusive (ListDecisionInboxResponse.scmFetchFailed's own doc
+// comment) -- a partial-but-real fetch carries a real as-of instant AND
+// the "may be incomplete" flag together. Before this suite, none of the
+// three states had a render test at all.
+describe('ScmStatusBanner -- the three-way SCM state, never collapsed', () => {
+  it('no GitHub linked (scmAsOf null, scmFetchFailed false) renders the honest empty-link state, not a warning', () => {
+    const html = renderToStaticMarkup(<ScmStatusBanner scmAsOf={null} scmFetchFailed={false} />)
+    expect(html).toContain('No GitHub account linked')
+    expect(html).not.toContain('sync-banner-warn')
+  })
+
+  it('a real, complete fetch (scmAsOf set, scmFetchFailed false) renders only the as-of staleness marker, no warning', () => {
+    const html = renderToStaticMarkup(<ScmStatusBanner scmAsOf="2026-08-20T10:00:00Z" scmFetchFailed={false} />)
+    expect(html).toContain('Pull requests as of')
+    expect(html).not.toContain('sync-banner-warn')
+    expect(html).not.toContain('Temporarily unable')
+  })
+
+  it('a fetch that failed outright (scmAsOf null, scmFetchFailed true) renders the warning with no staleness marker -- no fetch was even attempted', () => {
+    const html = renderToStaticMarkup(<ScmStatusBanner scmAsOf={null} scmFetchFailed={true} />)
+    expect(html).toContain('sync-banner-warn')
+    expect(html).toContain('Temporarily unable to load your pull requests')
+    expect(html).not.toContain('Pull-request rows shown are as of')
+  })
+
+  // The genuine partial-fetch state this Step exists to cover: BOTH
+  // fields carried together, proving the two are read as independent
+  // signals rather than as an if/else pair that could only ever show
+  // one or the other.
+  it('a genuine partial fetch (scmAsOf set AND scmFetchFailed true) renders the warning WITH the as-of marker, distinctly from either field alone', () => {
+    const html = renderToStaticMarkup(<ScmStatusBanner scmAsOf="2026-08-20T10:00:00Z" scmFetchFailed={true} />)
+    expect(html).toContain('sync-banner-warn')
+    expect(html).toContain('Temporarily unable to load your pull requests')
+    expect(html).toContain('Pull-request rows shown are as of')
+    expect(html).toContain('may be incomplete')
+    // Distinct from the "failed outright" case above: this specific
+    // combination adds the staleness clause the outright-failure case
+    // must never show (no fetch to be stale from, in that case).
+    expect(html).not.toBe(renderToStaticMarkup(<ScmStatusBanner scmAsOf={null} scmFetchFailed={true} />))
   })
 })

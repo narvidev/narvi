@@ -100,13 +100,25 @@ type fakeMergeSourceControl struct {
 	// role-only pre-check BEFORE the expensive live SCM re-validation ever
 	// calls this method at all.
 	listOpenPRsCalls int
+
+	// truncated is threaded straight through to ListOpenPRsForUser's own
+	// return -- ports.SourceControl.ListOpenPRsForUser's own "one of
+	// GitHub's two underlying search queries itself failed while the
+	// other still returned a real, if incomplete, result" signal
+	// (scmcache.go's own doc comment on its identically-named return).
+	// Every existing test in this file leaves this at its bool
+	// zero-value (false, an ordinary complete fetch) -- only
+	// TestListDecisionInbox_ScmFetchFailedWithRealScmAsOf sets it, to
+	// drive a genuine partial-fetch read through the real SCMCache/Build
+	// pipeline, never a hand-built response.
+	truncated bool
 }
 
 var _ ports.SourceControl = (*fakeMergeSourceControl)(nil)
 
 func (f *fakeMergeSourceControl) ListOpenPRsForUser(context.Context, ports.ListOpenPRsForUserSpec) ([]ports.OpenPR, bool, error) {
 	f.listOpenPRsCalls++
-	return f.openPRs, false, nil
+	return f.openPRs, f.truncated, nil
 }
 func (f *fakeMergeSourceControl) ResolveCodeOwners(context.Context, ports.ResolveCodeOwnersSpec) ([]ports.Owner, error) {
 	return nil, nil
@@ -321,6 +333,76 @@ func TestListDecisionInbox_EmptyForFreshUser(t *testing.T) {
 	}
 	if got.DecisionLatencyComputed {
 		t.Error("DecisionLatencyComputed = true, want false (no decisions in the window yet)")
+	}
+}
+
+// TestListDecisionInbox_ScmFetchFailedWithRealScmAsOf_GenuinePartialFetch
+// is §16's own decision-inbox partial-fetch state, driven end to end
+// through this package's real HTTP route, decisioninbox.Build, and the
+// real *decisioninbox.SCMCache -- never a hand-built
+// restdtos.ListDecisionInboxResponse. Result.SCMFetchFailed's own doc
+// comment on aggregate.go documents this exact combination (scmAsOf
+// non-nil AND scmFetchFailed true) as a genuine, real state -- "a
+// partial-but-real fetch can legitimately carry both a real as-of
+// instant and a flag telling the caller not to present the rows present
+// as complete" -- but before this test, nothing exercised it beyond
+// internal/app/decisioninbox's own TestBuild_SCMFetchFailedSignal, which
+// calls decisioninbox.Build directly (the app layer only); this is the
+// same real condition, one layer further out, proving the wire response
+// this endpoint actually returns carries both fields together, not just
+// the Result the app layer builds internally.
+//
+// The ONLY fake in this test is fakeMergeSourceControl itself, at the
+// outermost ports.SourceControl seam -- truncated:true is exactly what a
+// real githubapi.Adapter would return had one of its own two paginated
+// GitHub search queries failed while the other still returned a real,
+// if incomplete, page (scmcache.go's own doc comment); everything
+// between that seam and the JSON this test decodes (SCMCache's TTL
+// cache, buildPRItems' degraded-folding, decisionInboxResultToDTO's own
+// wire mapping) is the real, unmodified production code path.
+func TestListDecisionInbox_ScmFetchFailedWithRealScmAsOf_GenuinePartialFetch(t *testing.T) {
+	const htmlURL = "https://github.com/acme/widgets/pull/1500"
+	fakeSCM := &fakeMergeSourceControl{
+		openPRs: []ports.OpenPR{
+			{
+				Owner: "acme", Repo: "widgets", Number: 1500, Title: "partial fetch", HTMLURL: htmlURL,
+				HeadSHA: "headsha1500", Assignees: []ports.PRPerson{{ExternalID: "9007", Login: "octocat"}},
+				CIConclusion: ports.CIConclusionSuccess, Labels: []string{"review:low-risk"},
+			},
+		},
+		truncated: true,
+	}
+	rig := newDecisionInboxTestRig(t, fakeSCM)
+	ctx := context.Background()
+
+	user, token := rig.createAuthenticatedUser(ctx, t, sqlcgen.UserRoleMember)
+	rig.linkGitHub(ctx, t, user.ID, "9007")
+
+	var got restdtos.ListDecisionInboxResponse
+	status := rig.doJSON(t, http.MethodGet, "/api/decision-inbox", nil, &got, token)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", status, http.StatusOK)
+	}
+
+	if got.ScmAsOf == nil {
+		t.Error("ScmAsOf = nil, want a real timestamp -- the fetch itself succeeded (truncated is a PARTIAL result, not a failed one)")
+	} else if got.ScmAsOf.IsZero() {
+		t.Error("ScmAsOf is the zero time, want a real fetch-completion instant")
+	}
+	if !got.ScmFetchFailed {
+		t.Error("ScmFetchFailed = false, want true -- a truncated GitHub read must not be presented as a complete one")
+	}
+	// The partial batch still surfaces what it DID get -- a degraded
+	// fetch must never suppress the rows it successfully read, only flag
+	// them as possibly incomplete via ScmFetchFailed above.
+	found := false
+	for _, it := range got.Items {
+		if it.PrNumber != nil && *it.PrNumber == 1500 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("PR #1500 missing from a partial-but-real fetch's own Items: %+v", got.Items)
 	}
 }
 
