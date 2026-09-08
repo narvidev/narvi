@@ -26,6 +26,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/decisioninbox"
 	"github.com/narvidev/narvi/internal/app/ports"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
+	domainautomerge "github.com/narvidev/narvi/internal/domain/automerge"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -51,12 +52,24 @@ type Deps struct {
 
 // Worker runs the auto-merge pump.
 type Worker struct {
-	deps Deps
+	deps      Deps
+	authGuard *authGuard
 }
 
-// New builds a Worker.
+// New builds a Worker. authGuard (authguard.go, docs/TECHNICAL_PLAN.md
+// §17's own automerge dead-letter fix) is constructed here, once per
+// Worker, from deps.Timeouts.AutoMergeAuthBackoffBase/
+// AutoMergeAuthBackoffMax -- mirroring every other backoff-config-holding
+// construction in this codebase (e.g. internal/app/outboxworker.Builder,
+// which reads OutboxBackoffBase/OutboxBackoffMax the same way).
 func New(deps Deps) *Worker {
-	return &Worker{deps: deps}
+	return &Worker{
+		deps: deps,
+		authGuard: newAuthGuard(domainautomerge.BackoffConfig{
+			BaseDelay: deps.Timeouts.AutoMergeAuthBackoffBase,
+			MaxDelay:  deps.Timeouts.AutoMergeAuthBackoffMax,
+		}),
+	}
 }
 
 // Run ticks every deps.Timeouts.AutoMergePumpInterval until ctx is
@@ -116,7 +129,7 @@ func (w *Worker) pumpRepo(ctx context.Context, repoFullName string, now time.Tim
 	}
 
 	for _, candidate := range candidates {
-		w.mergeCandidate(ctx, repoFullName, int(candidate.PrNumber))
+		w.mergeCandidate(ctx, repoFullName, int(candidate.PrNumber), now)
 	}
 }
 
@@ -127,11 +140,41 @@ func (w *Worker) pumpRepo(ctx context.Context, repoFullName string, now time.Tim
 // "the same allowance already made in the audit_log schema for actions
 // with no human actor" precedent (internal/adapters/inbound/github/
 // pullrequestevent.go's own sentinel-fix merge-gate-evaluated row).
-func (w *Worker) mergeCandidate(ctx context.Context, repoFullName string, prNumber int) {
+//
+// now is pumpRepo's own already-injected clock value, threaded through
+// unchanged rather than read fresh here (CLAUDE.md: no time.Now() outside
+// an injected clock) -- w.authGuard's own backoff/dead-letter decisions
+// (docs/TECHNICAL_PLAN.md §17) must be deterministic under it for tests
+// to drive multiple ticks without any real wall-clock sleep.
+func (w *Worker) mergeCandidate(ctx context.Context, repoFullName string, prNumber int, now time.Time) {
 	logger := platform.Logger(ctx)
 
+	if !w.authGuard.allow(repoFullName, now) {
+		// Already classified, backed off, and (past MaxAuthFailures)
+		// dead-lettered by an EARLIER call -- the one-time transition log
+		// + audit_log row already fired (recordAuthOutcome below); a
+		// repeat log line on every subsequent skipped candidate/tick would
+		// reproduce exactly the "rate-limit noise" this fix exists to
+		// remove, so this path is silent by design.
+		return
+	}
+
+	// NOTE: no w.authGuard.recordSuccess call on RevalidateForAutoMerge's
+	// own success below -- deliberately. A read-only GetOpenPR call
+	// succeeding is real evidence w.deps.BotToken can still READ, but it
+	// says nothing about whether it can still WRITE (merge) to this
+	// repository, which is the SEPARATE, narrower permission
+	// ports.ErrPermissionDenied's own repo-scope tracks -- and a real bot
+	// token that has lost ONLY merge/write access (branch protection
+	// requiring a role the bot lacks, while read access is untouched) is
+	// exactly the scenario where every OTHER candidate's own successful
+	// revalidate would otherwise reset this repo's own accumulating
+	// MergePR-failure streak back to zero on every tick, so
+	// domainautomerge.MaxAuthFailures could never actually be reached.
+	// Only a genuinely successful MergePR (below) resets either streak.
 	ok, headSHA, reason, err := decisioninbox.RevalidateForAutoMerge(ctx, w.deps.DecisionInbox, w.deps.SourceControl, repoFullName, prNumber, w.deps.BotToken)
 	if err != nil {
+		w.recordAuthOutcome(ctx, repoFullName, err, now)
 		logger.Error("automerge: revalidate for auto-merge failed", "error", err, "repo_full_name", repoFullName, "pr_number", prNumber)
 		return
 	}
@@ -181,9 +224,11 @@ func (w *Worker) mergeCandidate(ctx context.Context, repoFullName string, prNumb
 		return
 	}
 	if err != nil {
+		w.recordAuthOutcome(ctx, repoFullName, err, now)
 		logger.Error("automerge: merge pr failed", "error", err, "repo_full_name", repoFullName, "pr_number", prNumber)
 		return
 	}
+	w.authGuard.recordSuccess(repoFullName)
 
 	logger.Info("automerge: merged", "repo_full_name", repoFullName, "pr_number", prNumber, "merge_commit_sha", mergeSHA)
 
@@ -198,5 +243,53 @@ func (w *Worker) mergeCandidate(ctx context.Context, repoFullName string, prNumb
 		// must never claim otherwise, mirroring httpapi.MergePullRequest's
 		// own identical posture for the human-clicked path.
 		logger.Error("automerge: record audit log for merge failed", "error", err, "repo_full_name", repoFullName, "pr_number", prNumber)
+	}
+}
+
+// recordAuthOutcome feeds one failed GitHub call (from either of
+// mergeCandidate's own two call sites -- RevalidateForAutoMerge/MergePR)
+// into w.authGuard, and -- ONLY on a brand-new transition into a
+// dead-lettered state -- fires the one-time, durable operator-visible
+// record docs/TECHNICAL_PLAN.md §17 requires: a log line ALONE is what
+// the plan's own gap description calls "only rate-limit noise", so this
+// pairs an Error log (immediate, for anyone watching logs live) with an
+// audit_log row (durable and queryable after the fact, §17.5's own "no
+// actor" precedent this package already reuses for auto_merge.merged/
+// shadow.would_have_merged above) -- never a brand-new observability
+// mechanism of its own.
+//
+// A no-op for any error that does not classify as either
+// ports.ErrAuthenticationFailed/ports.ErrPermissionDenied (rate limits,
+// 5xxs, "not mergeable", a stale head SHA, etc.), and equally a no-op on
+// every call AFTER the one that actually tripped the transition --
+// authGuard.recordFailure's own doc comment covers both cases (see
+// authguard.go).
+func (w *Worker) recordAuthOutcome(ctx context.Context, repoFullName string, err error, now time.Time) {
+	scope, target, consecutiveFailures := w.authGuard.recordFailure(repoFullName, err, now)
+	if scope == authScopeNone {
+		return
+	}
+
+	logger := platform.Logger(ctx)
+	logger.Error("automerge: giving up -- authentication/permission failure exhausted retries, dead-lettering",
+		"scope", scope.String(), "repo_full_name", target, "consecutive_failures", consecutiveFailures, "last_error", err)
+
+	// resourceType/resourceID vary by scope: authScopeRepo names the one
+	// repository this token was denied for (a real "repository" resource,
+	// target non-empty); authScopeWorker has no single resource to name
+	// -- w.deps.BotToken itself is not a Postgres row -- so it is recorded
+	// against a fixed "automerge_worker" resource type instead, never the
+	// empty string mislabeled as a repository.
+	resourceType, resourceID := "repository", target
+	if scope == authScopeWorker {
+		resourceType, resourceID = "automerge_worker", "bot_token"
+	}
+	if auditErr := auditlog.Record(ctx, w.deps.AuditLog, pgtype.UUID{}, "automerge.auth_dead_lettered", resourceType, resourceID, map[string]any{
+		"scope":                scope.String(),
+		"repo_full_name":       target,
+		"consecutive_failures": consecutiveFailures,
+		"last_error":           err.Error(),
+	}); auditErr != nil {
+		logger.Error("automerge: record audit log for auth dead-letter failed", "error", auditErr, "repo_full_name", target)
 	}
 }

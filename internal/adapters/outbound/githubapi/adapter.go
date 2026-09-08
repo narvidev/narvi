@@ -318,6 +318,30 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("githubapi: http %d: %s", e.Status, e.Message)
 }
 
+// Unwrap lets errors.Is(err, ports.ErrAuthenticationFailed)/errors.Is(err,
+// ports.ErrPermissionDenied) see through this adapter-internal type to
+// the port-level, adapter-agnostic classification a caller like
+// internal/app/automerge needs (docs/TECHNICAL_PLAN.md §17's own
+// automerge dead-letter fix) -- reusing the SAME Status/RateLimited
+// fields every other classification on this type already relies on
+// (isRateLimitedResponse below), never a second, parallel
+// classification. A 401 is unambiguous (ports.ErrAuthenticationFailed's
+// own doc comment: GitHub never uses 401 for rate limiting). A 403
+// unwraps to ports.ErrPermissionDenied ONLY when RateLimited is false --
+// mirrors ports.MergePRError.Unwrap's own identical logic for MergePR's
+// own separately-typed error exactly, so a caller never has to know
+// which of this port's two error shapes it is holding to classify it.
+func (e *APIError) Unwrap() error {
+	switch {
+	case e.Status == http.StatusUnauthorized:
+		return ports.ErrAuthenticationFailed
+	case e.Status == http.StatusForbidden && !e.RateLimited:
+		return ports.ErrPermissionDenied
+	default:
+		return nil
+	}
+}
+
 // isRateLimitedResponse reports whether a 403 response resp actually
 // signals GitHub's own real primary or secondary rate-limit/abuse-detection
 // mechanism, rather than a genuine "this token cannot read this resource"
@@ -1324,9 +1348,17 @@ func (a *Adapter) CreateBranch(ctx context.Context, spec ports.CreateBranchSpec)
 // doPut performs one authenticated PUT against a.apiBaseURL+path with
 // reqBody as the JSON request body -- the doPost-analog this package's
 // own doc.go promises, needed because GitHub's Contents API create-or-
-// update-file-contents endpoint is specifically a PUT, never a POST.
-// Otherwise byte-for-byte the same bounded-read/error-envelope-parsing
-// shape as doGet/doPost.
+// update-file-contents endpoint (and MergePR's own merge endpoint,
+// mergepr.go) is specifically a PUT, never a POST. Otherwise byte-for-
+// byte the same bounded-read/error-envelope-parsing shape as doGet/
+// doPost, INCLUDING doGet's own isRateLimitedResponse classification on
+// a 403 (docs/TECHNICAL_PLAN.md §17's own automerge dead-letter fix):
+// MergePR is this package's one caller that converts this method's
+// *APIError into a SEPARATE typed error of its own (ports.MergePRError),
+// so RateLimited must be computed HERE, before that conversion, or it
+// would silently read as false for every 403 MergePR ever returns --
+// indistinguishable from a genuine permission denial to any caller
+// classifying via ports.ErrPermissionDenied.
 func (a *Adapter) doPut(ctx context.Context, path, token string, reqBody []byte) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, path, bytes.NewReader(reqBody))
 	if err != nil {
@@ -1355,7 +1387,13 @@ func (a *Adapter) doPut(ctx context.Context, path, token string, reqBody []byte)
 		} else if len(body) > 0 {
 			message = "error body did not match GitHub's expected error envelope"
 		}
-		return nil, &APIError{Status: resp.StatusCode, Message: message}
+		apiErr := &APIError{Status: resp.StatusCode, Message: message}
+		if resp.StatusCode == http.StatusForbidden {
+			// See this method's own doc comment above for why this must
+			// be computed here rather than left to a caller further up.
+			apiErr.RateLimited = isRateLimitedResponse(resp, message)
+		}
+		return nil, apiErr
 	}
 
 	return body, nil

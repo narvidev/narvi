@@ -2113,6 +2113,36 @@ type Timeouts struct {
 	// never eligibility itself.
 	AutoMergeCandidateLookback time.Duration
 
+	// AutoMergeAuthBackoffBase is domain/automerge.BackoffConfig.BaseDelay
+	// (docs/TECHNICAL_PLAN.md §17's own automerge dead-letter fix): the
+	// delay scheduled after internal/app/automerge.Worker's own authGuard
+	// observes the FIRST consecutive authentication/permission-classified
+	// failure (ports.ErrAuthenticationFailed/ports.ErrPermissionDenied)
+	// for a given scope (worker-wide, or one repository). Not specified in
+	// the plan; chosen as 2min -- see domain/automerge.EvaluateBackoff's
+	// own doc comment for the full schedule this produces alongside
+	// AutoMergeAuthBackoffMax below, and domain/automerge.MaxAuthFailures'
+	// own doc comment for why a materially SHORTER total tolerance window
+	// than OutboxBackoffBase/OutboxBackoffMax's own 10-attempt schedule is
+	// the correct choice here: an authentication failure, unlike a
+	// transient outbox delivery failure, has no realistic self-healing
+	// story to wait out.
+	AutoMergeAuthBackoffBase time.Duration
+
+	// AutoMergeAuthBackoffMax is domain/automerge.BackoffConfig.MaxDelay:
+	// the ceiling the exponential schedule above plateaus at. Not
+	// specified in the plan; chosen as 30min -- LONGER than OutboxBackoffMax's
+	// own 5min, in the same ~60x-the-pump-interval proportion
+	// OutboxBackoffMax already keeps relative to OutboxPumpInterval (5min
+	// is 60x OutboxPumpInterval's 5s; 30min is 30x AutoMergePumpInterval's
+	// 60s -- the same order of magnitude, not identical, since
+	// AutoMergePumpInterval's own cadence is already coarser to begin
+	// with), so a scope deep in backoff skips several ticks at a time
+	// rather than merely one, right up until domain/automerge.
+	// MaxAuthFailures is reached and this scope dead-letters for the rest
+	// of this process's own lifetime.
+	AutoMergeAuthBackoffMax time.Duration
+
 	// DigestPumpInterval is how often internal/app/digest.Pump's own
 	// background tick checks whether today's digest is due (§21.3) --
 	// deliberately much coarser than AutoMergePumpInterval/
@@ -2764,6 +2794,8 @@ func DefaultTimeouts() Timeouts {
 		ReviewVerdictAnalyticsWindow:   30 * 24 * time.Hour, // §21.1, explicit ("bounded from day one ... default 30 days, mirroring the decision inbox's own DecisionInboxLatencyWindow, §16.2 -- never DecisionInboxStaleAfter's own much narrower 48h item-staleness flag, §16.1, a different concept entirely") -- mirrors DecisionInboxLatencyWindow's own identical "a month, bounded" reasoning
 		AutoMergePumpInterval:          60 * time.Second,    // §21.2; not specified, mirrors AutomationEnginePumpInterval's own identical periodic-background-policy-engine reasoning
 		AutoMergeCandidateLookback:     7 * 24 * time.Hour,  // §21.2; not specified, chosen generously -- every candidate is re-confirmed live regardless
+		AutoMergeAuthBackoffBase:       2 * time.Minute,     // §17; not specified, chosen -- see domain/automerge.EvaluateBackoff's own doc comment for the schedule this produces
+		AutoMergeAuthBackoffMax:        30 * time.Minute,    // §17; not specified, chosen -- deliberately proportional to AutoMergePumpInterval, see field doc comment
 		DigestPumpInterval:             5 * time.Minute,     // §21.3; not specified, chosen -- a digest fires at most once per channel per day, so coarse polling is ample
 		DigestChannelDiscoveryLookback: 30 * 24 * time.Hour, // §21.3; not specified, mirrors ReviewVerdictAnalyticsWindow's own identical "a month, bounded" reasoning
 		DigestContentWindow:            24 * time.Hour,      // §21.3, explicit ("a daily digest") -- one calendar day of rollup content, distinct from the channel-discovery lookback above
