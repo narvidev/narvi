@@ -219,6 +219,7 @@ type AgentRuntime interface {
 ### 5.4 Timeout hierarchy (single source: `platform/timeouts.go`)
 One struct, validated at boot with the invariant chain asserted in a unit test:
 `provider hard cap (2h) > supervisor turn cap > CP turn_deadline > OpenCode SSE inactivity timeout`, each with explicit margin. Also: `providerHTTPClientTimeout > provider worst cold start`; `first_connect_budget > image pull + boot p99`. No timeout literal anywhere else in the codebase.
+**The first term is not a property of the turn.** A provider's hard cap runs from its sandbox's own creation, not from the turn running inside it, so this chain is asserted of a turn dispatched onto a *fresh* sandbox and is simply false of one dispatched onto an old one — the boot-time invariant test cannot see the difference, because at boot there is no sandbox. §35 is what makes the first term true at dispatch rather than only at spawn; `RotationRunwayFloor` is this file's own entry for it.
 
 ## 6. Wire contracts (frontend and sandbox protocol)
 
@@ -227,7 +228,7 @@ These are the canonical contracts the web UI and the sandbox agent speak. Formal
 ### 6.1 Sandbox WS (sandbox-agent ↔ control plane)
 - Connect: `wss://…/sessions/{id}/ws?type=sandbox`, `Authorization: Bearer <sandbox_token>`, `X-Sandbox-ID` (+ NEW: `X-Sandbox-Gen`). Server: 410 when session stopped, 403 on id/gen mismatch. Agent treats 401/403/404/410 as fatal (no retry); else exponential-backoff reconnect.
 - CP→agent commands: `prompt` (with author scmName/scmEmail for git attribution), `stop`, `push` (per-repo spec; CP awaits `push_complete`, 360s), `snapshot`, `shutdown`, `ack`, `git_sync_complete`.
-- Agent→CP events: `ready`, `heartbeat` (30s, carries conversation id + `last_boot_phase`), `boot_progress`, `token` (cumulative text, upsert-by-messageId not append), `tool_call`/`tool_result`, `step_start`/`step_finish` (carries `cost`; NOTE: `tokens` is an **object**, not a number — a number-vs-object mismatch here silently zeroes cost tracking, so pin it in the contract test), `sub_task_start`/`sub_task_finish` (§7.1; `sub_task_start` additionally carries an optional `subAgentType`, Step 71, §26.4 — the task tool's own real `subagent_type` dispatch parameter, distinct from `label`'s freeform text, used to corroborate a self-reported `counter-reviewer` dispatch against the persisted trace), `git_sync`, `artifact`, `execution_complete`, `push_complete`/`push_error`, `session_title`, `warning`, `error`, `snapshot_ready`.
+- Agent→CP events: `ready`, `heartbeat` (30s, carries conversation id + `last_boot_phase`), `boot_progress`, `token` (cumulative text, upsert-by-messageId not append; additionally carries an **optional** part id, §35.6 — one stored row per `(messageId, partId)`, absent meaning today's exact single-row behavior, so an older sandbox-agent degrades rather than breaks), `tool_call`/`tool_result`, `step_start`/`step_finish` (carries `cost`; NOTE: `tokens` is an **object**, not a number — a number-vs-object mismatch here silently zeroes cost tracking, so pin it in the contract test), `sub_task_start`/`sub_task_finish` (§7.1; `sub_task_start` additionally carries an optional `subAgentType`, Step 71, §26.4 — the task tool's own real `subagent_type` dispatch parameter, distinct from `label`'s freeform text, used to corroborate a self-reported `counter-reviewer` dispatch against the persisted trace), `git_sync`, `artifact`, `execution_complete`, `push_complete`/`push_error`, `session_title`, `warning`, `error`, `snapshot_ready`.
 - **Ack protocol**: 6 critical types (`execution_complete`, `error`, `snapshot_ready`, `push_complete`, `push_error`, `sub_task_finish`) carry deterministic `ackId = "{type}:{messageId}"`; sender buffers (1000 events, evict oldest non-critical) and re-sends on reconnect until acked; receiver dedupes by upsert-on-messageId. `sub_task_finish` joins the critical set because it closes an "active" state the UI tracks (§12.2 item 1's live sub-lane count) exactly like `execution_complete` does at the turn level — a dropped, never-redelivered `sub_task_finish` would leave a sub-lane stuck active forever, live and in history, with no reconciliation path (the same failure class §3.2's two-phase terminalization and §9.3 #4/#7 exist to prevent at the turn level).
 - **Sub-task fan-out** (§7.1): every event type emitted during turn processing additionally accepts an optional `subTaskId` (absent/null = the turn's main lane), for envelope uniformity — session/connection-lifecycle events (`ready`, `heartbeat`, `boot_progress`, `git_sync`, `session_title`, `warning`, `snapshot_ready`) never populate it, only turn/tool/step-scoped events do — so a lane is always unambiguous even when several sub-tasks' events interleave on the wire. `sub_task_start` (`subTaskId`, `label`, `parentMessageId` — the `messageId` of the main-lane `tool_call` event whose invocation spawned this sub-task) and `sub_task_finish` (`subTaskId`, `outcome`: `completed | failed | cancelled`, reusing the turn's own taxonomy, §3.3) bracket a sub-task's lifetime. The model is flat — a sub-task cannot itself spawn a further-nested sub-task.
 
@@ -321,6 +322,10 @@ These run as automated scenarios against a real (or provider-faked) stack. Minim
 10. Concurrent @mentions on one PR → exactly one review session (atomic claim).
 11. Dirty working tree at relaunch → stash → checkout session branch → pop; zero lost user edits.
 12. Deploy rollout (rolling restart) → zero sessions marked failed.
+13. Turn dispatched onto a sandbox past its runway floor → rotation first, turn runs on the replacement, never a failure; and a deadline reached mid-turn → the turn stays `Processing`, a neutral warning is persisted, the same turn resumes after the rotation (§35.3, §35.4).
+14. Fresh-lineage respawn after a sandbox is lost → the recap reaches the agent framed as a third-party report, the continuity warning is persisted and survives a reload, and no claim in the recap is presented as the agent's own memory (§35.5).
+
+Scenarios 13-14 were added after Phase 2 closed, and they gate the appended phase that adds them — not Phase 2's own "12 scenarios" criterion, which is not reopened. This is the Phase 4 precedent: a later phase may extend this catalogue and gate itself on what it added, and a closed gate stays closed on the set it was signed off against.
 
 ### 9.4 Shadow mode (phases 3-4, and §30 for the platform-wide capability)
 Intent classifier and code review run in shadow mode (log-only) on real traffic before activation; divergence report per decision. **Shadow mode is a permanent capability, not a one-time launch gate** (§18.5): activating a classifier or reviewer on a surface must never delete the shadow code path, its config, or its telemetry — the same mechanism is used again for every future model swap, prompt change, or new surface, not just the first activation. Skipping the shadow window on the reasoning that tests alone prove equivalence is not a default; it requires an explicit, documented exception.
@@ -369,7 +374,27 @@ The zero-trace evaluation capability: egress-mode flag + fail-toward-suppress re
 
 **Phase 9 — Per-repository knowledge, two modes (Steps 105-110; see §31)**
 The two-mode knowledge capability: approved-plan durability; the per-repository entitlement predicate + `sessions.repos` authorization; the mode A prior-arch-decisions block with its path-scoped selector, mode buffer, injected-ids record, and merge-outcome capture; the mode B index and hybrid retrieval (`Embeddings` port, `real[]` + `tsvector` schema, `RepoScope` isolation layers, RRF fusion, cold-corpus fallback) with its quarantine/provenance/self-reinforcement guards; `kb_search`; the OKF read-only export. Appended numerically after Phase 8; in execution order it needs only Phase 5's milestone (the review chain and its §26.5 instrument) plus Phase 8's Steps 96/98 for the epoch stamps its in-query exclusions ride — Step 108's engagement additionally waits on Step 107's own baseline readout (§31.6).
-*Exit: mode A's block live on all three review seams with the contestation-×-injection KPI reporting per mode stamp, plus EITHER a repository flipped to mode B serving retrieved context with the cold-corpus fallback verified and the two-repository isolation suite green OR a recorded kill decision (§31.9) citing Step 107's own baseline readout in place of Step 108's build; contested and shadow-epoch content demonstrably excluded from live retrieval in the SQL whenever mode B exists at all.*
+*Exit: mode A's block live on all three review seams with the contestation-×-injection KPI reporting per mode stamp, and Step 107's baseline readout read with its three-way decision recorded (§31.9) — kill, defer, or build in the separate repository. No clause waits on a retrieval substrate: none is built here under any of the three answers. Contested and shadow-epoch content demonstrably excluded from live reads in the gate's own SQL.*
+
+**Phase 10 — Metrics export (Steps 111-112; additive; see §33)**
+The path from an emitted metric to a backend that can evaluate an alert on it: a config-gated OTLP exporter in `platform.SetupOTel`, and the relay that carries the four sandbox-emitted histograms out of the sandbox.
+*Exit: an alert defined on a control-plane instrument fires from a real backend rather than from a process's own stdout, which is what closes P6's own exit criterion above. Step 112 gates no phase.*
+
+**Phase 11 — Named gaps (Steps 113-131)**
+Real, non-speculative work that each shipping Step declared it was leaving out. A holding list until the owner chose to work it through in full, at which point it gained an execution order and a milestone like any other; the filing rule still governs what may enter it.
+*Exit: every row either shipped, or closed by a recorded decision saying why it will not be — never a silent omission.*
+
+**Phase 12 — Extension boundaries (Steps 132-135; additive; see §34)**
+The seams that let an optional module compose a second binary on top of this repository without this repository ever knowing that module exists.
+*Exit: a binary composed in a separate repository builds against this repository's `main` and, with no module registered, serves a route table identical to the public binary's own golden.*
+
+**Phase 13 — Silent failures (Steps 136-142; additive; see §35, §36, §24.8, §37)**
+Six ways this system can fail while looking like it succeeded, and the write-time refusals that stop a seventh: sandbox lifetime rotation and the interrupted turn, fresh-lineage continuity and the stored text parts it rests on, the broken-contract backstop across all three surfaces that mandate an artifact, and the base-branch gate with its re-target lane.
+*Exit: each class produces a signal that can be told apart from the success it used to imitate; §9.3 scenarios 13 and 14 green, gating this phase and not Phase 2's own closed criterion.*
+
+**Phase 14 — Decomposition and chaining (Steps 143-147; additive; see §38, §39)**
+Two capabilities that compose work this system already performs into more than one unit: one automation's own reported conclusion starting another, and a tracker ticket a team already decomposed landing as one pull request per sub-issue, each dependent link gated on its predecessor's recomputed verdict. Nothing here is a defect; both are capabilities this design did not have.
+*Exit: a parent ticket with a declared dependency between two sub-issues produces one PR per sub-issue with the dependent one gated on the recomputed verdict, and a reported outcome starts its target with the structured payload in hand. Gated on Phase 13's Steps 141 and 142.*
 
 ## 11. Working conventions for the implementing agent
 
@@ -692,7 +717,7 @@ The merge is recorded in `audit_log` (§13.3) with `actor_user_id` NULL — usin
 
 GitHub has, since the rest of this section was first written, made stacked pull requests a first-class server-side object — `POST /repos/{owner}/{repo}/stacks`, `PullRequest.stack`/`stackEntry` in GraphQL (confirmed present via live schema introspection for this amendment; the `Mutation` type carries zero stack mutations, confirming GraphQL is read-only here), and a `stack` object riding on every PR REST resource and on native `pull_request` webhook events. §17.2 already opens the fix PR as a stacked PR in the informal, base-branch-convention sense that predates all of this. This section is about making that **existing** relationship legible to GitHub's own object model and consuming the context GitHub now supplies for free — it is not the introduction of a new capability, and nothing below changes what §17.1-§17.5 already do.
 
-**Scope: the one pair, not an N-deep producer.** Narvi registers exactly the origin+fix pair §17.2 already creates. It does not gain a capability to decompose arbitrary work into a chain of dependent PRs, because nothing else in this plan produces a chain of more than two dependent pull requests today. In particular, two mechanisms that superficially resemble a decomposition-into-multiple-units feature are not stack producers: the sub-task fan-out mechanism (§7.1) operates entirely within one turn — "a presentation/wire-level grouping of events belonging to one turn," not a new Postgres row, and, per its own doc comment, "the turn state machine (§3.3) is unaffected" no matter how many sub-tasks ran — it produces no pull request of any kind; and the product-prototyping handoff's v2 child session (§14.4) is spawned in a fresh, full-access Environment pre-loaded with the prototype diff purely as reading context for its plan-mode approval — §14.4's own text never bases that child session's own eventual work on the prototype PR's branch the way §17.2 explicitly does for the sentinel fix, so it produces an independent PR, not a second stack member. Designing an N-deep stack producer before anything in this plan actually generates that shape of work would be speculative scope with no consumer.
+**Scope: the one pair, not an N-deep producer.** Narvi registers exactly the origin+fix pair §17.2 already creates. It does not gain a capability to decompose arbitrary work into a chain of dependent PRs, because nothing else in this plan produces a chain of more than two dependent pull requests today. In particular, two mechanisms that superficially resemble a decomposition-into-multiple-units feature are not stack producers: the sub-task fan-out mechanism (§7.1) operates entirely within one turn — "a presentation/wire-level grouping of events belonging to one turn," not a new Postgres row, and, per its own doc comment, "the turn state machine (§3.3) is unaffected" no matter how many sub-tasks ran — it produces no pull request of any kind; and the product-prototyping handoff's v2 child session (§14.4) is spawned in a fresh, full-access Environment pre-loaded with the prototype diff purely as reading context for its plan-mode approval — §14.4's own text never bases that child session's own eventual work on the prototype PR's branch the way §17.2 explicitly does for the sentinel fix, so it produces an independent PR, not a second stack member. Designing an N-deep stack producer before anything in this plan actually generates that shape of work would be speculative scope with no consumer. **That last clause is what §39 ends** (amendment): a verdict-gated train does generate the shape, and registers its own links as their own chain. The conclusion here is unchanged — this section still registers the origin+fix pair and nothing more — but the reason is now that the sentinel pair is not a member of a train, not that no such shape exists.
 
 **Ingress: capturing stack context, honestly scoped to what's actually parsed today.** GitHub's own guarantee covers exactly two carriers: every PR's REST resource, and the native `pull_request` webhook event. Narvi's existing GitHub ingress (Step 32, `internal/adapters/inbound/github`) parses neither of those directly — `payload.go`'s two webhook payload structs (`issueCommentPayload`, `pullRequestReviewCommentPayload`) decode the `issue_comment` and `pull_request_review_comment` event types instead, and GitHub's own reference does not state that either of those two event types carries a `stack` object — only the dedicated `pull_request` event type is confirmed to (§24.1 already documents, independently of this amendment, that "nothing in this codebase today parses GitHub's `pull_request` event at all"). The one outbound REST round-trip this ingress already makes — `githubapi.Adapter.GetPullRequest`, called from `headresolve.go` to resolve an `issue_comment` mention's real head branch — decodes the PR resource today via `pullRequestResponse`/`PullRequest`, which model only `head.ref`/`head.repo`; neither type decodes `stack` yet. Capturing stack context therefore needs `pullRequestResponse` extended with a `stack {id, number, size, position, base{ref, sha}}` field (the same nullable-pointer discipline `head.repo` already gets, since a non-stacked PR carries no `stack` object at all) and `PullRequest`/`mention` threaded with the same — an incremental addition to a call this ingress already makes for every `issue_comment` mention, not a new outbound call. (Whether it is also worth adding to the `pull_request`/`synchronize` lane §24 introduces, once that lane exists, is a smaller, later question; the REST path above is sufficient for what §21.1's review-scope decision needs today.)
 
@@ -1068,6 +1093,41 @@ Once the counter reaches the budget, §24.3 step 4's "otherwise" branch stops en
 
 ### 24.7 Phasing
 Step 65, Phase 5, after Step 46 (the claim/coalescing primitives this extends with a second, automatic ingress lane) and Step 62 (`review_verdicts.head_sha`, this feature's own trigger-state source) — designing this after both means it reuses primitives that already exist rather than growing them in parallel. Gates nothing else in Phase 6/7. UI: the per-repo opt-in toggle ships in Settings → Analytics alongside the other per-repo automation toggles (§12.2 items 5-6, Step 86).
+
+### 24.8 The base branch is part of the trigger decision (amendment)
+§24.3's gate is per-repo opt-in, a head-SHA comparison against the latest verdict, and §24.6's
+per-PR budget. None of the three looks at what the pull request is **based on**, and for one shape
+of PR that is the only question that matters.
+
+A PR whose base is another unmerged PR has nothing stable to review: its diff changes the moment
+its parent moves. §24.2's trailing-edge debounce then fires on the parent's own pushes, and each
+firing spends a slot of §24.6's budget on a review that was stale before it was dispatched. The
+budget bounds the damage; it does not make any of those reviews worth running.
+
+- **A trunk-branch allowlist gates the automatic path only.** Empty or unset is inert, matching the
+  pre-existing behavior, and it sits with the other per-repo automation settings (§13.3). Every
+  explicit trigger — the label, the button, an @mention — stays ungated, deliberately: asking for a
+  review of a stacked PR before its parent merges is a legitimate request, and the escape hatch has
+  to exist for the deferral to be safe.
+- **The deferral is announced once and withdrawn.** The first time a PR is deferred, the review
+  session posts one server-side notice naming the base it actually has (§5.2 — never a raw
+  comment); it is removed the moment the gate passes.
+- **`pull_request` actions other than `synchronize` stop being uniformly ignored.** §24.1 parses
+  `synchronize` alone, which is right for "new commits landed". But when a parent merges, the
+  provider re-targets the stacked PR's base on its own and the head does not move — so no
+  `synchronize` follows, and the moment the PR *becomes* reviewable arrives as an action this
+  ingress drops. That re-target is the natural companion of the gate above: it is what turns a
+  deferred PR into a reviewable one.
+
+**Anything waiting on a verdict is exempt from the deferral, and this is a hard rule rather than a
+nicety.** A deferred review posts no verdict. Any mechanism that advances only when a verdict
+arrives therefore waits forever behind this gate, and a gate whose whole purpose is to avoid
+pointless work would instead have created a deadlock. No such mechanism exists in this design
+today — §17's fix PR waits on a *merge* event, not a verdict — which is exactly why the rule is
+written down now, while it costs nothing, rather than discovered by the first mechanism that does.
+
+Phasing: with §35 and §36, in the appended phase. It extends Step 65's own ingress lane and needs
+nothing that Step did not already build.
 
 ## 25. Configurable workflow engine per lane + visual canvas editor (new capability)
 
@@ -5361,3 +5421,353 @@ enter, so it cannot add, drop, replace or re-select — and the cap on how many 
 injected is applied by the caller, after ordering. Degradation (a slow, failing or
 inconsistent ranker) falls back to the gate's own order, never to empty, and is recorded
 on the turn so the mode A/B comparison never counts a degraded turn as the B arm.
+
+## 35. Sandbox lifetime rotation and turn continuity (new capability)
+
+Problem this solves: §5.4's timeout ladder is asserted as an invariant and validated at boot, and
+it is true only of a turn dispatched onto a **freshly created** sandbox. A provider's sandbox
+lifetime is measured from that sandbox's own creation, never from the turn running inside it. A
+turn dispatched onto a sandbox already 1h50 old has ten minutes of runway against a 60-minute
+`turn_deadline`: the ladder is inverted, and nothing in this design notices. What the user sees is
+a turn that failed for no reason they can act on, which is the exact class
+`docs/runbooks/turn-false-failures.md` exists to eliminate.
+
+### 35.1 Why this design makes it worse than it looks, and what the profile is
+Nothing here holds a sandbox open on a timer — §5.4's inactivity bound stops an idle one. What
+keeps a sandbox alive long enough to reach its provider deadline is **repeated work on one
+session**, and §24 (automatic re-review on new commits) is a mechanism built expressly to produce
+that: a PR pushed to through the day re-triggers its review session's own turns for as long as it
+stays open. Prior operational experience with a comparable control plane on the same provider puts
+the profile beyond doubt — deadline stops concentrated overwhelmingly in review sessions rather
+than in long single builds, and roughly half of them not a mid-turn kill at all but a **prompt
+dispatched into a socket that was already gone**, failing instantly with an elapsed time of zero.
+That second half is the cheaper one to close and needs nothing from the sandbox side.
+
+### 35.2 The deadline is persisted state, never inferred at use
+`sandbox.lifetime_deadline_at`, written in the same `UPDATE` that already stamps a spawn's or
+restore's `created_at`: a conservative estimate (`created_at + lifetime`, from the per-session-type
+lifetime constant this control plane already sends on the wire) overwritten by the exact value
+`sandbox-agent` reports on `ready` and on every `heartbeat` (§6.1). Estimate first, exact value
+when it arrives — because a restored sandbox runs whatever `sandbox-agent` its snapshot baked in,
+possibly for weeks, so no part of this may depend on an agent-side change having shipped. The
+per-session-type lifetime lives in one place, so a longer lifetime for a future session type is a
+one-line change and the rotation threshold follows it.
+
+### 35.3 Rotation is the existing restore path, given a second trigger
+A rotation is `snapshot → stopped → shutdown → restore`, every step of which §3.2 already
+specifies and this codebase already implements — a restore re-stamps a full fresh lifetime. **What
+is new is the trigger, not the mechanism**: today the only thing that stops a live sandbox is the
+inactivity bound; this adds runway. Nothing is ever timer-driven, and an idle sandbox is still
+stopped by inactivity and restored on the next prompt, exactly as now.
+
+- **Pre-dispatch gate**: a turn is never dispatched into a live sandbox with less than
+  `min(RotationRunwayFloor, lifetime/6)` left. The sandbox rotates first and the turn stays
+  `pending` for the replacement. A declined rotation (no provider capability, a spawn or rotation
+  already in flight) falls through to an ordinary dispatch, so the queue can never stall on this.
+- **A sandbox that died idle at its deadline** — abnormal close, status still live — is marked
+  `stopped`, so the next spawn decision restores from the last snapshot instead of waiting on a box
+  that is gone.
+- **Fencing is unchanged and load-bearing**: a rotation increments `sandbox.gen` like any other
+  restore, and the superseded identity is locked out immediately rather than at its natural expiry.
+  §9.3 scenario 6 already covers the stale-gen reconnect this produces.
+
+`RotationRunwayFloor` is a new entry in `platform/timeouts.go` and nowhere else (§11), and the gate
+itself is a pure decision function in `internal/domain/sandbox`, added to the exhaustive
+decision-function corpus §9.1 already requires of that package.
+
+### 35.4 A deadline stop is an interruption, not a failure
+This is the half that changes an existing state machine rather than adding to it, and it is worth
+stating as a rule: **a turn interrupted by its sandbox running out of life has not failed, and
+nothing downstream may be told that it has.** The turn stays `Processing` throughout — so Stop,
+the watchdog deferrals and the composer all keep working, and `turn_deadline` still bounds the
+whole turn, rotations included. A neutral `warning` event (§6.1) is persisted under the turn; no
+terminal event is written, nothing is completed or failed, no notification is enqueued into the
+outbox, no verdict fallback is posted. The rotation runs inline, and on reconnect the **same** turn
+is re-dispatched carrying an interrupted-turn context so the agent continues rather than redoing
+work or re-opening a pull request it already opened.
+
+Recognizing the stop must not depend on parsing an error message. `execution_complete` carries a
+typed reason for this case; the legacy-text path is a permanent fallback for snapshots running an
+older agent, never the primary signal. There is a specific trap here worth pinning in a test: a
+deadline message that embeds its own elapsed seconds is trivially misread as a transient
+provider error by any classifier matching on digits, which re-submits the turn into a dying
+sandbox.
+
+### 35.5 Fresh lineage: the conversation id is an identifier, not a memory
+§3.3 records the agent-runtime conversation id at turn start so a follow-up on a fresh sandbox
+resumes the same conversation, and §9.3 scenario 2 exercises exactly that. Both are correct for a
+**restore**, where the snapshot carries the runtime's own session storage. Neither holds for a
+**fresh lineage** — a spawn with no snapshot to restore — where the repository is re-cloned and the
+runtime opens an empty session: the recorded id names a conversation that does not exist on that
+box. The agent then has neither its prior context nor any uncommitted work, and answers as though
+nothing was ever in progress. Nothing tells the user that anything was lost.
+
+- A sandbox row is marked when it starts a **fresh lineage**, never on a successful restore or
+  resume, which keep the filesystem and the session.
+- The first turn dispatched after that mark carries a recap of the session's prior turns, built
+  from stored events by the same extractor the notification surfaces already use, and framed
+  explicitly as **a third-party report of a previous instance's work** with an instruction to
+  re-verify every claim against the current tree before acting on it — never as the agent's own
+  memory. The mark is cleared only once the prompt actually reaches the sandbox.
+- A `warning` event with a continuity scope is **persisted**, not broadcast. A broadcast is a
+  UI-only signal that does not survive a reload; §12.2's rail renders persisted events, and a user
+  who reloads must still be told their session lost its context.
+
+Coverage is deliberately narrow: only a fresh lineage ships a recap. A restore whose snapshot did
+not carry a usable runtime session loses context too and ships none yet — that case is instrumented
+first, so the decision to widen rests on how often it actually happens.
+
+### 35.6 One stored row per text part
+§6.1 pins the `token` event as cumulative text, upsert-by-`messageId`. Under that contract a
+sandbox lost mid-turn keeps only the **last text fragment** of a multi-part answer, and §35.5's
+recap is built from exactly those stored events — so the contract that makes the recap possible is
+also the one that makes it lossy. The event gains an **optional** part identifier and the
+repository stores one row per `(messageId, partId)`, with a part-scoped row's `created_at` pinned
+at first emission so narration sorts before the tool calls it introduced. Optional is the whole
+compatibility story in both directions: an older `sandbox-agent` sends no part id and degrades to
+today's exact behavior, which matters here for the same reason §35.2 does.
+
+This is an additive amendment to an already-merged `/contracts` schema, not a breaking one. The
+notification surfaces keep reading the last part and their posts stay byte-identical; what gains a
+consumer is the recap, and any replay of a wide session now needs a byte budget rather than only a
+row count.
+
+### 35.7 Phasing
+By content this is §3.2/§3.3 resilience work, and Phase 2 is its substrate. It lands appended
+rather than folded in, for the reason Phases 8 through 12 each give for themselves. Within it:
+§35.2 before §35.3 (a gate cannot read a deadline nobody stamps), §35.3 before §35.4 (the
+interruption path rotates), and §35.6 before §35.5 (a recap built on lossy storage is a recap worth
+less than the warning beside it). §9.3 gains two scenarios on the Phase 4 precedent — the new
+phase's own milestone gates on them, and Phase 2's "12 scenarios" gate is not reopened.
+
+## 36. The broken-contract backstop (new capability)
+
+Problem this solves: three surfaces in this design mandate that an agent turn end by emitting a
+structured artifact — §25.6's step-outcome tool, §8.2's verdict-posting tool, and any automation
+run (§3.5) whose whole purpose is a reported result. None of the three specifies what happens when
+the turn ends and the artifact never arrives. The defaults fill the silence in the worst available
+direction: §25.4 advances on the `ok` edge when no status was posted, an automation run whose
+session did not error is recorded `completed`, and §3.5's auto-pause counts consecutive *failed*
+invocations — so a run that broke its contract never reaches the threshold that would pause it.
+
+**The failure is not merely unreported; it is indistinguishable from success.** Nothing downstream
+— edge routing, auto-pause accounting, the §21 digest — can tell the two apart, which is what
+makes this one class rather than three unrelated omissions.
+
+### 36.1 A failing tool is not an error at the level that would catch it
+The obvious objection is that a turn whose tools failed should already look failed. It does not,
+and the reason is structural: a tool's failure is a **result handed to the model**, which is free
+to read it and carry on. The session ends successfully because the agent ended successfully. An
+automation whose only job is to read an external system therefore reports `completed` when that
+system was unreachable for the entire turn — and a supervision automation that cannot read
+production stays green indefinitely, which is the precise inversion of what it was built for.
+
+### 36.2 The rule, and the two limits that keep it from lying
+A turn that ends without the artifact it was mandated to emit is `failed`, with a typed reason
+naming the contract it broke, and that failure is the same signal accounting, logging and
+notification all read — never a status written in one place and absent from the others.
+
+Two limits, both there to avoid trading a silent-success bug for a noisy false-failure one:
+
+- **Only a mandated artifact.** A failing `bash` or `grep` is ordinary agent work: a test that
+  failed, a pattern that matched nothing. Only an artifact this design *requires* a turn to
+  produce counts, because only that is a contract rather than a finding.
+- **Only when nothing worked**, wherever the contract is about an external prerequisite. One
+  transient error a later call recovered from means the capability was available; only a
+  prerequisite with at least one failure and zero successes across the whole turn is reported.
+
+Two postures, both stated so a later implementation cannot quietly pick the other:
+
+- **Best-effort throughout.** A backstop that cannot answer must never invent a failure. An
+  unreadable actor, a database hiccup, a missing correlator: each leaves the turn's own verdict
+  standing. This is the one place where failing open is right, and it is right because a missed
+  backstop costs one mislabelled run while a spurious one costs a run that did its job.
+- **Never reconciled.** A late success signal does not resurrect a turn backstopped this way. The
+  broken contract is a historical fact about that turn, and §3.2's own reconciliation scope
+  (a late signal that still finds the turn `Processing`) does not extend to it.
+
+### 36.3 Where it is read, and why not in the sandbox
+The detection is control-plane-side, at turn completion, over events this design already persists
+— `tool_call`/`tool_result` carry status, and the artifact-posting tools are control-plane
+endpoints (§5.2), so the control plane already knows whether each was called. Putting it in
+`sandbox-agent` instead would buy nothing and would make the check unavailable to every sandbox
+running an older image, which §35.2 records is a state this system stays in for weeks at a time.
+
+### 36.4 Phasing
+Appended with §35, after it: §35.4 makes an interrupted turn stay `Processing` without a terminal
+event, and a backstop that ran before that distinction existed would read every rotation as a
+broken contract. One Step, all three surfaces at once — specifying the rule three times, once per
+surface, is how the three defaults drifted apart in the first place.
+
+## 37. Configuration that cannot work is refused at write time (new capability)
+
+Problem this solves: three settings in this design can each be given a value that is accepted,
+stored, and then silently never works. They are unrelated in subject and identical in shape — the
+failure surfaces far from the setting, wearing the face of an ordinary negative result — and one
+rule covers all three: **a configuration value that cannot function is rejected when it is
+written, never discovered when it runs.**
+
+- **A long tool-server name does not degrade, it kills the turn.** An agent runtime that exposes an
+  external tool server's tools as `server_tool` and never truncates will, past the 64-character
+  function-name ceiling both major model providers enforce, produce a request the provider rejects
+  outright. The whole turn fails, for a name. A length cap at write time, computed against the
+  longest tool name the server actually exposes rather than against the server name alone.
+- **A path expression missing its root prefix matches nothing, forever.** Any filter language this
+  design accepts for conditions (§25's edges, automation triggers) resolves an unrooted path to
+  "absent", and absent compares false for every operator but existence. The run is then recorded
+  skipped for "conditions not met" — byte-identical to the result a correct filter produces when
+  the data genuinely does not match. Validation belongs in the same function both the create and
+  the update handler already call, so an existing bad value surfaces on its next save.
+- **A binding may outlive the repository it names.** §25.4 establishes that `workflow_bindings`
+  has no row resolving to nothing, and that argument is about the *global* row always existing. It
+  says nothing about a repo-specific row whose repository has since been archived or removed from
+  the installation — a different failure, and one no lookup can fail closed on because the row is
+  right there.
+
+The rule is not "validate more". It is that these three are the cases where the runtime failure
+**cannot be attributed to its cause**: nothing in the resulting log, run record or verdict points
+back at the setting. That is the test for whether a fourth case belongs here.
+
+Phasing: with §35, §36 and §24.8, in the appended phase, as one Step. Three small validations in
+three subsystems, one rule, one PR — splitting them would produce three PRs whose only reviewable
+content is the rule they share.
+
+## 38. Outcome-gated automation chaining (new capability)
+
+Problem this solves: §3.5's model is `automation → invocation → run(s)` and stops there. There is
+no way to express "when this automation concludes X, start that one" — and the naive way to build
+it, letting the agent call the next automation itself, makes the model's judgment the thing that
+has to fire reliably. §25's workflow engine is not this: its edges live inside one definition,
+bound to a lane (`review`/`request`/`plan`), and automations are outside that vocabulary entirely.
+
+### 38.1 The agent reports; the server chains
+The agent's only obligation is to report a structured verdict as its mandatory closing action. A
+deterministic server-side path owns the chaining itself — the enqueue, the delay, the target's own
+filtering — so a chain that must fire is never resting on a model remembering to make a call. This
+is the same division §25.6 already draws for workflow steps, and it is drawn the same way here on
+purpose: the two are one mechanism at two scales, not two mechanisms.
+
+**The handoff is typed, and this is where the design earns its keep.** A chained run inherits the
+source's *structured* payload, not a prose field the tool documents as justification. A free-text
+hand-off looks adequate right up to the first terse report, at which point the target has nothing
+to act on and no indication why — and because the target then runs and finds nothing, the failure
+presents as an ordinary empty result. §25.6's rule is the one that applies: advisory summary,
+never re-parsed; structured payload, always. Reporting is mandatory whether or not the chain
+fires, so the report's presence is never itself a signal about the outcome.
+
+### 38.2 Cycles: structural here, counted in §25, and the difference is real
+§25.5's `loopguard` bounds iteration by count, and that is right there: a workflow's edges are one
+finite graph an admin authored in one artifact and can see whole (§25.12's canvas). A chain across
+automations is not that. It is assembled incrementally, by different people, each seeing one
+automation's settings — so a cycle can be built by two people neither of whom did anything wrong,
+and a counted bound would let it run to the bound every time before anyone noticed.
+
+The guard is therefore **structural, not counted**: an automation is either a source of a chain or
+a target of one, never both. That makes a cycle unrepresentable rather than merely bounded,
+including the self-target case, and the check must hold under concurrent edits — two automations
+each being pointed at the other at the same moment is exactly the race a per-row validation misses,
+so the invariant is enforced in the write itself, in the §5.1 tradition.
+
+### 38.3 Target-side conditions, and the two failure modes they hide
+A target may carry its own deterministic conditions, evaluated against the source's reported tags
+before it fires, and a target that does not match is **skipped, not failed** — a distinction that
+has to survive into the run record, because those two want different reactions from an operator.
+
+Both of this feature's silent failures are already specified elsewhere and are cited rather than
+re-solved: a source that never reports is §36's broken contract, and a condition written in a form
+that can never match is §37's write-time refusal. That §37 case is the sharper one here, because
+its symptom is a run recorded skipped for "conditions not met" — byte-identical to what a correct
+condition produces when the data genuinely does not match.
+
+### 38.4 Phasing
+Appended with §39, after Phase 13. It depends on Step 141 (§36): a chain whose source can silently
+report nothing is a chain that stalls with no signal, and building the chaining first would mean
+shipping that hole deliberately.
+
+## 39. Ticket decomposition into a verdict-gated PR train (new capability)
+
+Problem this solves: a tracker ticket that a team has already broken into sub-issues arrives here
+as one session producing one monolithic diff. The decomposition the team performed — which is the
+expensive part, and which they did deliberately — is discarded at the ingress. A train instead
+lands one pull request per sub-issue: each small, each scoped, each independently reviewable, and
+each dependent one stacked on the branch it actually depends on.
+
+### 39.1 The mother plans once and stops
+A parent ticket with sub-issues spawns a **mother session that never writes code**. It classifies
+each sub-issue as independent or dependent, submits that classification once through a
+server-side tool (§5.2 — the verdict-tool precedent, never a raw side effect), and ends. From that
+point the train's progression is a state machine over Postgres rows, driven by signals this design
+already produces, with no live agent supervising it: no idle supervisor session is paid for over
+the train's lifetime, and the train's state is inspectable rather than resident in a conversation.
+One row per sub-issue, with a short-lived claim state between waiting and spawned, and the whole
+thing owned by the same single-writer actor discipline §2 establishes.
+
+### 39.2 The tracker's own dependency graph is authoritative; the model's reading is the fallback
+The sequencing signal is the tracker's **declared** dependency relation between sub-issues, fetched
+at ingress and presented to the mother as authoritative. The mother's own judgment about which
+sub-issues touch overlapping code is a fallback for a sub-issue that declares no relation, and
+never an override of one that does.
+
+This is §18.1's `FallbackReason` and §21.2's recomputed `Shippable` discipline applied to a third
+place: **never trust the model for a fact the system can derive.** The submission is still
+validated for self-consistency — identifiers unique, every dependency naming another member of the
+same submission, no cycles, at most one successor per predecessor — but as a well-formedness check
+on a trusted agent's output, not as a security boundary, and a hallucinated identifier degrades to
+a link that cannot resolve its own ticket rather than to anything worse.
+
+### 39.3 The gate is the recomputed verdict, never a self-reported risk level
+A successor does not start because its predecessor opened a pull request. It starts because that
+PR's review came back clean — and *clean* here means §21.2's **server-recomputed** `Shippable` and
+the deterministic eligibility engine §21 already specifies, never a risk level the reviewing agent
+reported about its own work. §21.1's staleness rule applies unchanged: a verdict computed against
+anything but the PR's current head is stale by definition and cannot satisfy the gate.
+
+Two consequences worth stating, because both are cheap here and expensive to retrofit:
+
+- **The advance is claimed atomically before any asynchronous work.** A verdict route re-fires on
+  every re-review, so two verdicts for one PR can overlap; whichever call loses the claim no-ops
+  rather than both racing to spawn one successor from a stale read. This is §5.1's atomic-claim
+  idiom, not a new mechanism.
+- **A later verdict may contradict an earlier one.** A clean verdict can promote a successor before
+  a re-review of the same PR comes back worse. Blocking a link that is already running therefore
+  has to stop the work, not merely mark the row — otherwise the train's documented hard stop is a
+  hard stop only on paper.
+
+### 39.4 A blocked link self-corrects before it escalates
+A train that stops dead on a raised floor and waits for a human is the version of this feature
+built by a system with no self-correction loop. This design has one: §25's audit-fix edges with
+`loopguard` bounding them. A link whose verdict does not clear the gate re-enters that loop and
+escalates to a human only when the bound is reached — one notice, never repeated, in the §24.6
+tradition — and the escalation is surfaced on the **parent** ticket, which is the one carrying the
+context a human needs, not on the individual sub-issue.
+
+### 39.5 Three failure modes to design against, not discover
+Each of these is cheap to prevent and expensive to diagnose, and each is invisible from the design
+above:
+
+- **Plan mode arrives in front of the train.** A parent ticket describing a design split across
+  sub-issues reads exactly like something worth planning, so §18's classifier picks plan mode: the
+  mother produces a plan and stops for approval instead of submitting a train, and nothing on the
+  ticket says the train is waiting on a human. The classifier is not wrong — the ticket really does
+  read that way. The mother's own prompt and the ticket-side surfacing must both account for it.
+- **The chain head has nothing to stack on.** It is tempting to base the first dependent PR on the
+  mother's branch. A mother never writes code, so it never pushes one; that rule would silently
+  fall through to the default branch every time. Either the head targets the default branch and the
+  design says so, or the mother is given a branch of its own first. What is not acceptable is
+  documenting the first and shipping the second.
+- **A deferral gate starves the train.** Every link's PR targets a non-default base by
+  construction, which is precisely the shape §24.8 defers. §24.8's verdict-waiter exemption is not
+  optional here: without it, a successor waits forever on a verdict a deferred review never posts,
+  and a gate built to avoid pointless work would have produced a deadlock instead.
+
+### 39.6 What this changes in §17.6, stated rather than left to be noticed
+§17.6 declines to build an N-deep stack producer, on the ground that "nothing else in this plan
+produces a chain of more than two dependent pull requests today." That premise was true when
+written and this section is what ends it. The conclusion §17.6 draws for itself is unchanged —
+Narvi registers the origin+fix pair and nothing more — but the reason is no longer "no such shape
+exists"; it is that a train's own links are registered by §39, as their own chain, and that the
+sentinel pair is not a member of it.
+
+### 39.7 Phasing
+Appended with §38, after Phase 13, and after §38 within the phase: both need §36's backstop, and
+the train additionally needs §24.8's exemption to exist before its first link is ever deferred.

@@ -3,15 +3,17 @@
 ## Context
 
 Narvi's technical specification (autonomous coding agents in sandboxes) is in
-[docs/TECHNICAL_PLAN.md](TECHNICAL_PLAN.md) (§0–§33), and the nine-view UI design spec is in
-[docs/design/mockups.html](design/mockups.html). This plan breaks 13 phases (0–12) into **135 Steps**.
-113 of them are scheduled work in this repository (Steps 108-110 were routed out to a separate
+[docs/TECHNICAL_PLAN.md](TECHNICAL_PLAN.md) (§0–§39), and the nine-view UI design spec is in
+[docs/design/mockups.html](design/mockups.html). This plan breaks 15 phases (0–14) into **147 Steps**.
+125 of them are scheduled work in this repository (Steps 108-110 were routed out to a separate
 repository when the extension boundary was drawn, and keep their numbers as pointers so every
 citation of them stays valid) — including Phase 4's own 5 additive Steps, 40-44, Phase 8's 9
 shadow-mode Steps, 96-104, Phase 9's 6 knowledge Steps, 105-110, and Phase 12's 4 boundary Steps,
-132-135. The other 19 are Phase 11 (Steps 113-131): named gaps, additive and unscheduled, gating
-nothing — a holding list rather than a phase of work, which is why Phase 12 follows it numerically
-without waiting on it. Each Step is individually shippable and CI-green,
+132-135, Phase 13's 7 silent-failure Steps, 136-142, and Phase 14's 5 composition Steps,
+143-147. The other 19 are Phase 11 (Steps 113-131): named gaps, each filed as the shipping Step
+that found it declared it, and since scheduled in full with an execution order and a milestone of
+its own. They gate nothing else, which is why Phase 12 follows them numerically without waiting
+on them. Each Step is individually shippable and CI-green,
 executable by a developer assisted by coding agents (Sonnet 5).
 Every Step references the technical-plan section that specifies it. Each Step becomes exactly one PR when
 implemented — but a Step's number (e.g. Step 6) is the plan's own row number, not the GitHub PR number it
@@ -198,6 +200,13 @@ phase, seeds exactly what they build.
 | 77 | ops | Dashboards/alerts (false failures, outbox lag, orphans, boot p95), runbooks from the resilience catalog (§9.3) | §5.3 |
 | 78 | launch readiness | Production checklist, SLO alerts wired, on-call runbook; a per-surface user guide (web/Slack/Linear/GitHub) documenting what each surface accepts AND its honest negatives, shipped behavior only — a CI check ties every documented command to the `/contracts` route or classifier routing record (§18.4) that actually implements it, so the guide can never drift into aspirational text | §10-P6 |
 
+**Phase 6 milestone**: the platform serves production traffic under monitoring — a cohort flag
+moves real sessions with the documented rollback exercised at least once, Step 77's dashboards
+and alerts fire on real signals rather than synthetic ones, and `docs/PRODUCTION_CHECKLIST.md`
+is green. The monitoring half of that sentence is what Step 111 (Phase 10) makes real: until an
+OTLP backend can evaluate an alert, this milestone rests on instruments nobody aggregates, and
+Phase 10's own header says exactly that.
+
 ## Phase 7 — UI, and the backend surfaces it needs (17 Steps, visual spec = nine-view mockups)
 
 Fourteen UI Steps and two backend ones. The two (88, 90) are here rather than in an earlier phase
@@ -230,6 +239,13 @@ done.
 | 93 | backend: per-step model & cost attribution | The run view the next Step builds is specified to show **per-step model and cost**, and neither reaches it today. Cost is not persisted anywhere: the only accumulator is `internal/adapters/outbound/opencode`'s own in-process `turnState.spentUSD`, which answers one sandbox-local question (§26.7's budget check) and dies with the turn — §7.1 records this as debt in its own words, "left to whichever future work actually adds it", and §25.13 says this chantier "inherits, and must close" it at the workflow-step level. This is that work. Model needs no wire change and no new column: `turns.model_id` already persists what was dispatched, and a workflow step IS an ordinary turn (§25.6), so it is a join. Cost does: `step_finish.cost` (§6.1) already arrives per step but is only ever stored inside an `events` payload, and `events` has no `turn_id`, so a running total is accumulated onto the turn as those events land. The "edge actually taken" is deliberately NOT a new field — it is derivable from the ordered step runs and their outcome statuses, and inventing a column for a fact already on the wire would be the third copy of a truth. Out of scope, named not built: cross-session cost totals, and §12.2 item 6's cost-by-model view | §25.15, §6.1, §7.1 |
 | 94 | ui workflow runs & decisions | Step 91 authors a workflow; this one watches it run and unblocks it. A run view over the existing `workflow_runs`/`workflow_step_runs` read model — step sequence, current status, per-step model and cost, and the edge actually taken — plus the human decision gate the engine already persists: approve, reject, and revise, where **revise always re-runs the step with the human text as an additional instruction** and never substitutes a structured artifact, matching the semantics those same tables encode for plan mode. Without this the engine can pause a run awaiting a human and no surface can answer it. Decisions are own/joined-aware (`ActionDecideWorkflowStep`); an exhausted circuit breaker is shown as a terminal reason and never a retry button, since §24.6's budget exemption covers manual re-trigger, not a spent breaker | §7.1, §13.3 |
 | 95 | ui finalize | `make dist` single self-contained binary, screenshot review vs mockups, ship | §12.4 |
+
+**Phase 7 milestone**: all nine views of §12.2 built to the mockups, including the
+decision-inbox home (§16), plus the UX items of §12.3; a screenshot-level review against
+`docs/design/mockups.html`; `make dist` producing the single self-contained binary. Where a
+view honestly renders "not available yet" because the data behind it does not exist, that
+state is part of what the review signs off rather than a defect it hides — those rows are
+Phase 11's, named there one at a time.
 
 ## Phase 8 — Platform shadow mode (9 Steps)
 
@@ -303,6 +319,7 @@ never ship (§31.10).
 | 108 | mode B: index & retrieval — **routed out** | **No longer built in this repository.** Step 107's baseline readout is the input to a three-way decision, recorded and never defaulted: kill, defer, or build. Building it *here* is not one of the three — that was settled when the extension boundary was drawn (§34), and the same work is specified as Steps E5-E7 of the separate repository's own plan. What remains this repository's Step is the DECISION and its record: under a kill, this row's entire deliverable is that record, citing the readout, and Phase 9 closes on it (§31.9). The row keeps its number so every citation of it elsewhere stays valid | §31.10 |
 | 109 | kb_search — **routed out** | **No longer built in this repository.** The pull surface for builder sessions belongs with the corpus it reads, which is not here. Specified as part of Step E7 of the separate repository's plan. Whatever builds it inherits, unweakened, this repository's own rules: scope derived server-side AND verified against Step 106's entitlement predicate — derivation alone is laundering (§31.4) — and authorization against the turn's stamped mode, never the live setting (§31.2) | §31.10 |
 | 110 | OKF read-only export — **routed out** | **No longer built in this repository.** An export surface for a corpus that does not live here. Specified as part of Step E7 of the separate repository's plan. It remains, wherever it is built, an export surface and never an authority, never the retrieval substrate, and never written into any customer repository (§30's collision) | §31.10 |
+
 **Phase 9 milestone**: mode A's prior-decisions block live on all three review seams with the
 contestation-×-injection KPI reporting per verdict mode stamp, and Step 107's baseline readout
 read and its three-way decision recorded (§31.9) — kill, defer, or build in the separate
@@ -345,6 +362,12 @@ its own exit criterion is checkable end to end.
 | 111 | control-plane OTLP export | Config-gated OTLP exporter in `platform.SetupOTel` behind a new validated `platform.Config` endpoint field (the flag-by-config precedent the object-store endpoint already sets); **unset → stdout exactly as today**, so dev, CI and every existing deployment are byte-identical and this Step is a no-op until an operator opts in. Makes every control-plane-side instrument real in one change. sandbox-agent shares `SetupOTel` but is never given the endpoint — and could not reach a collector anyway, since §27.6's server-appended allowlist floor admits only the control-plane host plus the session's git hosts (`allowlistFloorHosts`), which is a property to preserve, not to widen. Exit: an integration test against a fake OTLP receiver observes the control plane's metrics, and the unset-endpoint path is proven unchanged | §5.3, §33 |
 | 112 | sandbox boot-timing relay | The four sandbox-emitted histograms (`sandbox_agent_boot_duration_seconds`, `..._hook_rerun_...`, `..._git_fetch_...`, `..._git_checkout_...`) stop being recorded inside the sandbox and are recorded control-plane-side instead, from a new best-effort `boot_timing` sandbox-ws event carrying the **already-measured** seconds plus its low-cardinality tags — the fact crosses the wire, never raw observations or pre-aggregated buckets, so the value keeps being measured by the same `time.Since` bracket on the sandbox's own clock and §33.3's "identical semantics, same names, same buckets" property holds. Recording is gated on `appendRawEvent`'s own `inserted` flag, the Step 77 `turn_false_failure_total` precedent, because §6.1's reconnect resend would otherwise double-count. The repo name is dropped from metric attributes as unbounded cardinality (it still rides the event into the `events` log for per-session debugging). Deletes the two sandbox-side telemetry files; keeps sandbox-agent's `SetupOTel` bootstrap. Exit: a forced WS reconnect replay leaves each histogram holding its data point **exactly once** | §27, §33, §6.1 |
 
+**Phase 10 milestone**: an alert defined on a control-plane instrument fires from a real
+backend rather than from a process's own stdout — which is what closes §10-P6's exit criterion,
+unmet until then and recorded as a launch blocker in `docs/PRODUCTION_CHECKLIST.md` item 5.
+Step 112 is deliberately not part of this gate: it reaches only the four sandbox-emitted
+histograms and gates no phase, and its own criterion is that SLO 1 and `BootDurationP95High`
+stop resting on a metric nobody can read.
 
 ## Phase 11 — Named gaps (scheduled in full)
 
@@ -435,8 +458,11 @@ each give for themselves — those phases' Steps were long since scoped and ship
 folding new Steps into a closed phase would rewrite history, and inserting them
 mid-sequence would shift every Step after them and every cross-reference that names one
 (the Phase 4 standing rule; Step 128's own 183 citations are the standing evidence). It
-follows Phase 11 numerically because Phase 11 is a holding list with no exit criterion,
-not a phase this one waits on.
+follows Phase 11 numerically without waiting on it. That ordering was recorded while
+Phase 11 was still a holding list with no exit criterion; it has since been scheduled in
+full and has a milestone of its own, which changes nothing here — numbering records the
+order in which work was appended, never a dependency, and no Step of this phase consumes
+a Phase 11 row.
 
 Execution order: **Step 132 → 133 → {134, 135}**. Step 132 is a prerequisite of
 everything else here (nothing can be injected into a `main` that cannot be imported).
@@ -476,6 +502,110 @@ other's output, but each still ships as its own PR with its own exit criterion g
 before the next begins, and each is audited on its own diff. Grouping Steps into a
 delivery batch is a scheduling convenience for whoever is driving; it never becomes an
 execution mode. A batch has no exit criterion — Steps do, and this phase does.
+
+## Phase 13 — Silent failures (7 Steps, additive)
+
+Six ways this system can fail while looking like it succeeded, and the write-time refusals that
+stop a seventh. Technical plan §35 (sandbox lifetime rotation and turn continuity), §36 (the
+broken-contract backstop), §24.8 (the base branch as part of the trigger decision) and §37
+(configuration refused at write time) are the normative specifications.
+
+What binds them is not a subsystem but a property: **in every one of these, the failure is
+indistinguishable from the ordinary success it displaces.** A turn killed because its sandbox ran
+out of life reads as a turn that failed on its merits. An agent with no memory of its own prior
+work reads as an agent that found nothing in progress. A workflow step that never posted a status
+advances on the `ok` edge. An automation that could not reach the system it exists to read reports
+`completed`. A review dispatched against a base that will move reads like any other review. A
+setting that can never match reads as data that genuinely did not match. None of these produces a
+signal anyone can act on, which is why none of them was found from inside this repository.
+
+On placement: by content Steps 136-139 are Phase 2 resilience work and 140-142 are Phase 5 review
+and automations work. Appended rather than folded in, for the reason Phases 8 through 12 each give
+for themselves — those phases' Steps were long since scoped, shipped and audited, folding new Steps
+into a closed phase would rewrite history, and inserting them mid-sequence would shift every Step
+after them and every cross-reference that names one (the Phase 4 standing rule; Step 128's own 183
+citations are the standing evidence).
+
+It is not filed in Phase 11 either, and that is a rule rather than a preference: Phase 11's filing
+rule is that **a gap goes there only if the Step that found it shipped correctly without it, having
+said on screen or in its own docs what is missing**. Nothing here was declared by the Step that
+shipped it — these are defects and omissions in shipped behavior, found from outside. Filing them
+under a self-declaration rule would be the one thing that makes that table stop meaning anything.
+
+Execution order: **136 → 137 → {139 after 138} → {140, 141, 142}**. Step 137 needs 136's persisted
+deadline (a gate cannot read what nobody stamps). Step 139 needs 138, because a recap assembled
+from single-row storage is worth less than the warning next to it. Step 141 is ordered after 140:
+a backstop that ran before an interrupted turn stopped being a failed one would read every rotation
+as a broken contract.
+
+**One hard ordering constraint this phase places on work outside it**: if any later mechanism is
+built to advance on a review verdict, it must be exempt from Step 142's deferral before it ships.
+A deferred review posts no verdict, so such a mechanism would wait forever behind a gate whose
+whole purpose is to avoid pointless work. §24.8 states the rule; this records that it is a
+constraint on future Steps, not a note about this one.
+
+| Step | Title | Content | Ref. |
+|---|---|---|---|
+| 136 | sandbox lifetime as persisted state | `sandbox.lifetime_deadline_at` written in the same UPDATE that already stamps a spawn's or restore's `created_at`: conservative estimate first, exact value when `sandbox-agent` reports it on `ready`/`heartbeat`, so nothing depends on an agent-side change having shipped into a weeks-old snapshot. Per-session-type lifetime centralised in one place. Exit: a live sandbox's row carries a deadline within the provider's own, and a restored one carries a fresh one | §35.2, §3.2 |
+| 137 | pre-dispatch runway gate and rotation | `RotationRunwayFloor` in `platform/timeouts.go` and nowhere else; a pure decision function in `internal/domain/sandbox` added to §9.1's exhaustive corpus; rotation as `snapshot → stopped → shutdown → restore` on the path §3.2 already specifies, gen incremented like any restore, superseded identity locked out at once. A declined rotation falls through to an ordinary dispatch so the queue can never stall; a sandbox that died idle at its deadline is marked `stopped`. §9.3 scenario 13, first half | §35.3, §5.4, §9.3 |
+| 138 ∥ | token parts | `/contracts` sandbox-WS amendment: optional part id on `token`, one stored row per `(messageId, partId)`, a part-scoped row's `created_at` pinned at first emission so narration sorts before the tool calls it introduced. **Additive, not breaking**: absent means today's exact behavior. Notification-surface posts pinned byte-identical; session replay gains a byte budget, not only a row count | §35.6, §6.1 |
+| 139 | fresh-lineage continuity | Mark a sandbox row that starts a fresh lineage, never a successful restore or resume; the first turn dispatched after the mark carries a recap built from stored events by the extractor the notification surfaces already use, framed as a third-party report to re-verify, cleared only once the prompt reaches the sandbox; a persisted continuity `warning`, never a broadcast, because §12.2's rail renders persisted events and a reload must still say the context was lost. Instrument the restore-without-a-usable-session case rather than widening to it. §9.3 scenario 14 | §35.5, §9.3, §6.1 |
+| 140 | a deadline stop is an interruption | The turn stays `Processing` (Stop, watchdog deferrals and composer keep working; `turn_deadline` still bounds the whole turn, rotations included); neutral persisted `warning`; no terminal event, no completion, no outbox notification, no fallback verdict; the same turn re-dispatched on reconnect with an interrupted-turn context. Recognised by a typed reason, with the legacy-text path a permanent fallback and never the primary signal. Pins the elapsed-seconds trap: a deadline message embedding its own duration must not match a transient-provider classifier. §9.3 scenario 13, second half | §35.4, §3.2, §3.3 |
+| 141 | the broken-contract backstop | One typed outcome for a turn that ends without its mandated artifact, applied to all three surfaces at once — §25.6's step-outcome tool, §8.2's verdict tool, §3.5's automation runs — through one path accounting, logging and notification all read. Best-effort (a backstop that cannot answer leaves the turn's own verdict standing) and never reconciled. Control-plane-side over already-persisted events; no image rebuild | §36, §25.6, §8.2, §3.5 |
+| 142 ∥ | base-branch gate, retarget lane, write-time refusals | Trunk allowlist gating §24's automatic paths only, every explicit trigger ungated; the one-time deferral notice, withdrawn when the gate passes; `pull_request` re-target routed, since a parent merging moves no head and so emits no `synchronize`. Plus §37's three refusals: tool-server name length against the provider ceiling, unrooted path expressions, bindings naming a repository that is gone. The verdict-waiter exemption is part of the gate, not a follow-up | §24.8, §37 |
+
+**Phase 13 milestone**: each class produces a signal that can be told apart from the success it used
+to imitate. A turn dispatched onto a sandbox under its runway floor rotates and completes instead
+of failing; a deadline reached mid-turn renders as a neutral notice with the turn still running,
+and no notification, verdict fallback or completion is emitted for the interrupted attempt; a
+fresh-lineage respawn ships a recap the agent is told to re-verify and a continuity warning that
+survives a reload; a workflow step, review verdict or automation run that ends without its mandated
+artifact is `failed` with a typed reason naming the contract, while an unreadable backstop leaves
+the run's own verdict standing; a PR based on an unmerged PR is deferred with its base named, and
+reviewed when the provider re-targets it. §9.3 scenarios 13 and 14 green — gating this phase, on
+the Phase 4 precedent, never Phase 2's own closed criterion.
+
+## Phase 14 — Decomposition and chaining (5 Steps, additive)
+
+Two capabilities that let work this system already knows how to do be composed into more than one
+unit: one automation's own conclusion starting another (§38), and a tracker ticket a team already
+decomposed landing as one pull request per sub-issue rather than one monolithic diff (§39).
+
+Unlike Phase 13, nothing here is a defect. These are capabilities this design does not have and
+could reasonably choose not to build; they are specified because the decision to build them was
+taken, not because their absence breaks anything. The two are grouped because they share their
+substrate — a server-owned state machine advancing on a typed report an agent produced, never an
+agent driving the next step itself — and because they share their prerequisite.
+
+On placement: appended after Phase 13, for the reason Phases 8 through 13 each give for themselves.
+
+**Phase 13 is a prerequisite of this phase, not merely earlier than it.** Both capabilities advance
+on a report that a turn is obliged to produce, so both inherit §36's question of what happens when
+that report never comes — a chain whose source silently reports nothing stalls with no signal, and
+a train link that reports nothing blocks its successors forever. Building either before Step 141
+would mean shipping that hole on purpose. The train additionally needs Step 142's verdict-waiter
+exemption to exist before its first link is ever deferred (§24.8, §39.5).
+
+Execution order: **143 → 144 → 145 → {146, 147}**. The chain (143-144) before the train, because
+the train's own advance is the same shape with a stricter gate and the two must not grow two
+implementations of it.
+
+| Step | Title | Content | Ref. |
+|---|---|---|---|
+| 143 | outcome reporting and the structural cycle guard | The mandatory closing report on the §25.6 tool shape — advisory summary, structured payload, never re-parsed prose — plus the source-or-target invariant enforced in the write itself, so a cycle is unrepresentable rather than bounded and two concurrent edits cannot assemble one. Exit: a chain of two fires on a real report; an attempt to point a source at one of its own sources is refused, including under concurrent writes | §38.1, §38.2 |
+| 144 | chained enqueue and target conditions | The deterministic server-side enqueue, and the target's own conditions evaluated against the reported payload with skipped and failed distinguished in the run record. §37's write-time refusal covers the condition that can never match; §36's backstop covers the source that never reports — both cited, neither re-solved here | §38.3, §37, §36 |
+| 145 | train plan submission and the link state machine | Sub-issue graph read at ingress with the tracker's declared dependency authoritative and the mother's own judgment a fallback only; the mother session that plans once and never writes code; the submission tool on the verdict-tool precedent, validated for self-consistency as well-formedness rather than as a boundary; one row per link with a short-lived claim state, under §2's single-writer discipline. Exit: a parent ticket with sub-issues produces the link rows and spawns the independent ones | §39.1, §39.2 |
+| 146 | verdict-gated advance | The successor spawns on §21.2's recomputed `Shippable` and §21's eligibility engine, never on a self-reported risk level, and never on a verdict §21.1 calls stale. The advance is claimed atomically before any asynchronous work, so two overlapping verdicts for one PR produce one spawn and one no-op. A later contradicting verdict stops a running link's work, not merely its row | §39.3 |
+| 147 ∥ | self-correction before escalation, and the three failure modes | A blocked link re-enters §25's audit-fix edges under `loopguard` and escalates only at the bound — one notice, never repeated — surfaced on the parent ticket, which carries the context a human needs. Plus the three §39.5 modes designed against rather than discovered: plan mode arriving in front of the train, the chain head's base, and the deferral gate that would otherwise starve it | §39.4, §39.5, §24.8 |
+
+**Phase 14 milestone**: a parent ticket carrying sub-issues with a declared dependency between two
+of them produces one pull request per sub-issue, the independent ones opened at once and the
+dependent one opened only after its predecessor's *recomputed* verdict clears the gate — with the
+train visibly paused, and its parent ticket told why, when a predecessor's verdict does not clear
+it even after the auto-fix loop reached its bound. An automation reporting a structured outcome
+starts its target with that payload in hand; a target whose conditions do not match is recorded
+skipped and distinguishable from one that failed; and an attempt to make one automation both source
+and target of a chain is refused at the write, including when two edits race.
 
 ## Sequencing & parallelism
 
@@ -560,5 +690,5 @@ execution mode. A batch has no exit criterion — Steps do, and this phase does.
 ## Verification
 
 - Each Step: CI (lint, `go test -race`, contract tests) + its own criterion listed on its row.
-- Phase milestones = blocking gates: e2e via API/UI (P1), 12 resilience scenarios (P2), classifier shadow report (P3), review-verdict diff reviewed for precision (P5), flag-reversible rollout (P6), 9 views built to mockups + screenshot review (P7), a zero-egress evaluation run on a live customer repository verified against the suppression ledger (P8 — and P8 gates any customer-repo attachment, whatever the numeric order suggests), mode A live on all three seams with the mode-stamped KPI reporting, plus EITHER a mode B flip with the cold-corpus fallback observed and the isolation suite green OR a recorded kill decision in Step 108's place (§31.9) (P9). Phase 4 (Steps 40-44) is additive scope, not a blocking gate — its own milestone verifies warm-boot behavior and compaction-retry recovery but never holds up Phase 5.
+- Phase milestones = blocking gates: e2e via API/UI (P1), 12 resilience scenarios (P2), classifier shadow report (P3), review-verdict diff reviewed for precision (P5), flag-reversible rollout (P6), 9 views built to mockups + screenshot review (P7), a zero-egress evaluation run on a live customer repository verified against the suppression ledger (P8 — and P8 gates any customer-repo attachment, whatever the numeric order suggests), mode A live on all three seams with the mode-stamped KPI reporting and Step 107's baseline readout read with its three-way decision recorded (§31.9) (P9). Phase 4 (Steps 40-44) is additive scope, not a blocking gate — its own milestone verifies warm-boot behavior and compaction-retry recovery but never holds up Phase 5. Phases 10, 11 and 12 are appended scope on the same footing: Phase 10 additive (Step 111 closes P6's own criterion, Step 112 gates nothing), Phase 11 scheduled in full with a milestone of its own, Phase 12 additive — each has a gate, none holds up a phase before it. Phase 13 likewise: additive, gated on its own two §9.3 scenarios, which extend that catalogue rather than reopening Phase 2's closed criterion. Phase 14 is additive too, and the only phase gated on another: Steps 141 and 142 must ship before either capability it adds.
 - Project end: `make dist` produces the standalone `narvi` binary; all phase gates green.
