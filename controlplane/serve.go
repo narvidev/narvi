@@ -1716,22 +1716,29 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// sentinel_fixes/artifacts, all already constructed above for their
 	// own existing purposes) plus decisionInboxSCMCache, the §16.2 short-
 	// TTL cache wrapping the SAME sourceControl instance every other
-	// GitHub-facing route already shares.
+	// GitHub-facing route already shares. GitHubPRSessions/
+	// ReleaseManifestChecks are the SAME githubPRSessionStore/
+	// releaseManifestCheckStore every other GitHub-review route already
+	// shares (constructed above) -- the "open review"/release-cut-row
+	// resolution (aggregate.go's resolveReviewSessionID/resolveReleaseCut)
+	// needs no dedicated store of its own.
 	decisionInboxSCMCache := decisioninbox.NewSCMCache(sourceControl, cfg.Timeouts)
 	decisionInboxDeps := decisioninbox.Deps{
-		Plans:              planStore,
-		Sessions:           sessionStore,
-		Participants:       participantStore,
-		Automations:        automationStore,
-		Outbox:             outboxStore,
-		ReviewFindings:     reviewFindingStore,
-		SentinelFixes:      sentinelFixStore,
-		Artifacts:          artifactStore,
-		Identities:         identityStore,
-		SCMCache:           decisionInboxSCMCache,
-		TokenEncryptionKey: cfg.TokenEncryptionKey,
-		Timeouts:           cfg.Timeouts,
-		ReviewVerdict:      reviewVerdictDeps,
+		Plans:                 planStore,
+		Sessions:              sessionStore,
+		Participants:          participantStore,
+		Automations:           automationStore,
+		Outbox:                outboxStore,
+		ReviewFindings:        reviewFindingStore,
+		SentinelFixes:         sentinelFixStore,
+		Artifacts:             artifactStore,
+		Identities:            identityStore,
+		GitHubPRSessions:      githubPRSessionStore,
+		ReleaseManifestChecks: releaseManifestCheckStore,
+		SCMCache:              decisionInboxSCMCache,
+		TokenEncryptionKey:    cfg.TokenEncryptionKey,
+		Timeouts:              cfg.Timeouts,
+		ReviewVerdict:         reviewVerdictDeps,
 	}
 
 	// automergeWorker/digestPump (§21.2 stage 2/§21.3): both

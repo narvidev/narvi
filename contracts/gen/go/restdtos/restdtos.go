@@ -2566,6 +2566,14 @@ type DecisionInboxItem struct {
 	// The response's own generation instant minus enteredQueueAt, in seconds.
 	AgeSeconds int `json:"ageSeconds" yaml:"ageSeconds" mapstructure:"ageSeconds"`
 
+	// §15.3's own already-computed trigger decision (whether the constituent PRs' own
+	// shape met the criteria for an aggregate diff review) -- set iff isRelease is
+	// true, null otherwise. This is NOT a composition-findings count: the aggregate
+	// diff review pass itself is not dispatched anywhere in this system, so this
+	// field says only that its trigger criteria were met, never that the pass
+	// produced a finding.
+	AggregateReviewTriggered DecisionInboxItemAggregateReviewTriggered `json:"aggregateReviewTriggered" yaml:"aggregateReviewTriggered" mapstructure:"aggregateReviewTriggered"`
+
 	// The automation's own last deterministic run summary (§8.4).
 	ArtifactSummary DecisionInboxItemArtifactSummary `json:"artifactSummary" yaml:"artifactSummary" mapstructure:"artifactSummary"`
 
@@ -2632,6 +2640,17 @@ type DecisionInboxItem struct {
 	// kind=awaiting_approval bucket.
 	IsHandoff DecisionInboxItemIsHandoff `json:"isHandoff" yaml:"isHandoff" mapstructure:"isHandoff"`
 
+	// True iff this PR is a release cut (§15) whose manifest check has already been
+	// computed and persisted. Set (to true or false) for any PR-shaped row, exactly
+	// like isHandoff above -- the field a client checks to render this row's own
+	// distinct release shape (a link to the release-review screen, never a Merge
+	// button: a release cut always renders under kind=needs_review) instead of the
+	// ordinary PR shape. A PR that a release-branch-pattern/label WOULD classify as a
+	// release cut but that Narvi has not yet reviewed (or reviewed too recently for
+	// the background check to have finished) renders false here -- an honest,
+	// temporary gap, never a fabricated one.
+	IsRelease DecisionInboxItemIsRelease `json:"isRelease" yaml:"isRelease" mapstructure:"isRelease"`
+
 	// Matches internal/domain/decisioninbox.Kind's own four values exactly (§16.1).
 	// needs_attention is only ever present for an admin caller (§16.1's own
 	// parenthetical) -- enforced server-side, never a client-side filter.
@@ -2639,6 +2658,25 @@ type DecisionInboxItem struct {
 
 	// LastError corresponds to the JSON schema field "lastError".
 	LastError DecisionInboxItemLastError `json:"lastError" yaml:"lastError" mapstructure:"lastError"`
+
+	// True iff the constituent-PR listing that §15.2's manifest check ran over was
+	// TRUNCATED, so manifestFindingsCount above is a lower bound over an incomplete
+	// set rather than a complete audit -- the SAME fact GetReleaseManifestReadout
+	// exposes as `coveragePartial` and the posted manifest comment states in prose,
+	// for the same persisted row. Also true when the persisted findings blob could
+	// not be decoded at all, because a count that could not be read is not a count of
+	// zero. Set iff isRelease is true, null otherwise. A client must NEVER render
+	// manifestFindingsCount as a clean result while this is true: a truncated scan
+	// that found nothing and a complete scan that found nothing are different claims.
+	ManifestCoveragePartial DecisionInboxItemManifestCoveragePartial `json:"manifestCoveragePartial" yaml:"manifestCoveragePartial" mapstructure:"manifestCoveragePartial"`
+
+	// §15.2's own mechanical manifest-findings count (admin overrides, red-at-merge,
+	// unreviewed reverts) -- set iff isRelease is true, null otherwise. NEVER the
+	// aggregate diff review's own composition findings (§15.3/§15.4), which nothing
+	// in this system computes yet -- this count can be zero on a clean release cut,
+	// which is why it is a separate nullable field rather than folded into a chip
+	// that would render '0' identically to 'unknown'.
+	ManifestFindingsCount DecisionInboxItemManifestFindingsCount `json:"manifestFindingsCount" yaml:"manifestFindingsCount" mapstructure:"manifestFindingsCount"`
 
 	// kind=needs_attention, a dead-lettered outbox delivery, only.
 	OutboxId DecisionInboxItemOutboxId `json:"outboxId" yaml:"outboxId" mapstructure:"outboxId"`
@@ -2675,8 +2713,13 @@ type DecisionInboxItem struct {
 	// The PR's own current review:*-risk label, or null if never risk-labeled.
 	RiskLabel DecisionInboxItemRiskLabel `json:"riskLabel" yaml:"riskLabel" mapstructure:"riskLabel"`
 
-	// Set for a plan (kind=awaiting_approval) or a failed session
-	// (kind=needs_attention).
+	// Set for a plan (kind=awaiting_approval), a failed session
+	// (kind=needs_attention), or a PR-shaped row (ready_to_merge/needs_review,
+	// including a release cut) for which Narvi has actually run a review session
+	// against this exact pull request -- a client uses this to link into that review
+	// (or release-review) screen instead of an external GitHub link. Left null for a
+	// PR-shaped row Narvi has never been mentioned on, which is common and not an
+	// error.
 	SessionId DecisionInboxItemSessionId `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
 
 	// True once age exceeds the configured staleness threshold (§16.1: '>48h,
@@ -2686,6 +2729,14 @@ type DecisionInboxItem struct {
 	// Title corresponds to the JSON schema field "title".
 	Title string `json:"title" yaml:"title" mapstructure:"title"`
 }
+
+// §15.3's own already-computed trigger decision (whether the constituent PRs' own
+// shape met the criteria for an aggregate diff review) -- set iff isRelease is
+// true, null otherwise. This is NOT a composition-findings count: the aggregate
+// diff review pass itself is not dispatched anywhere in this system, so this field
+// says only that its trigger criteria were met, never that the pass produced a
+// finding.
+type DecisionInboxItemAggregateReviewTriggered *bool
 
 // The automation's own last deterministic run summary (§8.4).
 type DecisionInboxItemArtifactSummary *string
@@ -2742,6 +2793,17 @@ type DecisionInboxItemHtmlUrl *string
 // kind=awaiting_approval bucket.
 type DecisionInboxItemIsHandoff *bool
 
+// True iff this PR is a release cut (§15) whose manifest check has already been
+// computed and persisted. Set (to true or false) for any PR-shaped row, exactly
+// like isHandoff above -- the field a client checks to render this row's own
+// distinct release shape (a link to the release-review screen, never a Merge
+// button: a release cut always renders under kind=needs_review) instead of the
+// ordinary PR shape. A PR that a release-branch-pattern/label WOULD classify as a
+// release cut but that Narvi has not yet reviewed (or reviewed too recently for
+// the background check to have finished) renders false here -- an honest,
+// temporary gap, never a fabricated one.
+type DecisionInboxItemIsRelease *bool
+
 type DecisionInboxItemKind string
 
 const DecisionInboxItemKindAwaitingApproval DecisionInboxItemKind = "awaiting_approval"
@@ -2777,6 +2839,25 @@ func (j *DecisionInboxItemKind) UnmarshalJSON(value []byte) error {
 }
 
 type DecisionInboxItemLastError *string
+
+// True iff the constituent-PR listing that §15.2's manifest check ran over was
+// TRUNCATED, so manifestFindingsCount above is a lower bound over an incomplete
+// set rather than a complete audit -- the SAME fact GetReleaseManifestReadout
+// exposes as `coveragePartial` and the posted manifest comment states in prose,
+// for the same persisted row. Also true when the persisted findings blob could not
+// be decoded at all, because a count that could not be read is not a count of
+// zero. Set iff isRelease is true, null otherwise. A client must NEVER render
+// manifestFindingsCount as a clean result while this is true: a truncated scan
+// that found nothing and a complete scan that found nothing are different claims.
+type DecisionInboxItemManifestCoveragePartial *bool
+
+// §15.2's own mechanical manifest-findings count (admin overrides, red-at-merge,
+// unreviewed reverts) -- set iff isRelease is true, null otherwise. NEVER the
+// aggregate diff review's own composition findings (§15.3/§15.4), which nothing in
+// this system computes yet -- this count can be zero on a clean release cut, which
+// is why it is a separate nullable field rather than folded into a chip that would
+// render '0' identically to 'unknown'.
+type DecisionInboxItemManifestFindingsCount *int
 
 // kind=needs_attention, a dead-lettered outbox delivery, only.
 type DecisionInboxItemOutboxId *string
@@ -2842,8 +2923,13 @@ type DecisionInboxItemRepoFullName *string
 // The PR's own current review:*-risk label, or null if never risk-labeled.
 type DecisionInboxItemRiskLabel *string
 
-// Set for a plan (kind=awaiting_approval) or a failed session
-// (kind=needs_attention).
+// Set for a plan (kind=awaiting_approval), a failed session
+// (kind=needs_attention), or a PR-shaped row (ready_to_merge/needs_review,
+// including a release cut) for which Narvi has actually run a review session
+// against this exact pull request -- a client uses this to link into that review
+// (or release-review) screen instead of an external GitHub link. Left null for a
+// PR-shaped row Narvi has never been mentioned on, which is common and not an
+// error.
 type DecisionInboxItemSessionId *string
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -2854,6 +2940,9 @@ func (j *DecisionInboxItem) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["ageSeconds"]; raw != nil && !ok {
 		return fmt.Errorf("field ageSeconds in DecisionInboxItem: required")
+	}
+	if _, ok := raw["aggregateReviewTriggered"]; raw != nil && !ok {
+		return fmt.Errorf("field aggregateReviewTriggered in DecisionInboxItem: required")
 	}
 	if _, ok := raw["artifactSummary"]; raw != nil && !ok {
 		return fmt.Errorf("field artifactSummary in DecisionInboxItem: required")
@@ -2888,11 +2977,20 @@ func (j *DecisionInboxItem) UnmarshalJSON(value []byte) error {
 	if _, ok := raw["isHandoff"]; raw != nil && !ok {
 		return fmt.Errorf("field isHandoff in DecisionInboxItem: required")
 	}
+	if _, ok := raw["isRelease"]; raw != nil && !ok {
+		return fmt.Errorf("field isRelease in DecisionInboxItem: required")
+	}
 	if _, ok := raw["kind"]; raw != nil && !ok {
 		return fmt.Errorf("field kind in DecisionInboxItem: required")
 	}
 	if _, ok := raw["lastError"]; raw != nil && !ok {
 		return fmt.Errorf("field lastError in DecisionInboxItem: required")
+	}
+	if _, ok := raw["manifestCoveragePartial"]; raw != nil && !ok {
+		return fmt.Errorf("field manifestCoveragePartial in DecisionInboxItem: required")
+	}
+	if _, ok := raw["manifestFindingsCount"]; raw != nil && !ok {
+		return fmt.Errorf("field manifestFindingsCount in DecisionInboxItem: required")
 	}
 	if _, ok := raw["outboxId"]; raw != nil && !ok {
 		return fmt.Errorf("field outboxId in DecisionInboxItem: required")

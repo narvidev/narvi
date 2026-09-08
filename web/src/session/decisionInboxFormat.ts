@@ -9,20 +9,16 @@ import type { DecisionInboxItem } from '@narvi/contracts/rest-dtos'
 import type { ChipTone } from './reviewFormat'
 
 // -- row "kind" tag (mockups.html's own `.qkind` column: pr/handoff/plan/
-// session/automation/outbox) --
+// session/automation/outbox/release) --
 //
 // This is DELIBERATELY a different axis from DecisionInboxItem.kind
 // (ready_to_merge/needs_review/awaiting_approval/needs_attention, the
-// SECTION a row lives in) -- mockups.html's own decision-inbox demo draws
-// a "release" tag too (a release-review row inside needs_review), but
-// internal/app/decisioninbox.Build (confirmed directly against its own
-// source, aggregate.go) never constructs one: buildPRItems/buildPlanItems/
-// buildAttentionItems are the ONLY producers of Item rows, and none of
-// them represents a release-manifest review. This function's own return
-// type is therefore the honest subset of the mockup's vocabulary this
-// Step's read model can actually produce -- never a fabricated "release"
-// case with no backing data.
-export type DecisionInboxRowKind = 'pr' | 'handoff' | 'plan' | 'session' | 'automation' | 'outbox'
+// SECTION a row lives in): mockups.html's own decision-inbox demo draws a
+// "release" tag inside the needs_review section, alongside ordinary PR
+// rows within that SAME kind=needs_review bucket -- distinguishing them
+// needs `isRelease`, exactly the way distinguishing a handoff PR from an
+// ordinary plan within kind=awaiting_approval needs `isHandoff`.
+export type DecisionInboxRowKind = 'pr' | 'handoff' | 'release' | 'plan' | 'session' | 'automation' | 'outbox'
 
 /**
  * rowKind derives the row's own type tag from which ID field the schema's
@@ -31,10 +27,12 @@ export type DecisionInboxRowKind = 'pr' | 'handoff' | 'plan' | 'session' | 'auto
  * never from `kind` itself, which cannot distinguish a handoff PR from an
  * ordinary plan within the SAME kind=awaiting_approval bucket (that is
  * exactly what `isHandoff` exists to answer, DecisionInboxItem.isHandoff's
- * own doc comment).
+ * own doc comment), nor a release cut from an ordinary PR within the SAME
+ * kind=needs_review bucket (`isRelease`'s own identical role).
  */
 export function rowKind(item: DecisionInboxItem): DecisionInboxRowKind {
   if (item.isHandoff) return 'handoff'
+  if (item.isRelease) return 'release'
   if (item.repoFullName !== null) return 'pr'
   if (item.planId !== null) return 'plan'
   if (item.automationId !== null) return 'automation'
@@ -183,6 +181,48 @@ export function prChipData(item: Pick<DecisionInboxItem, 'riskLabel' | 'findings
 
   if (item.hasChangesRequested === true) {
     chips.push({ tone: 'crit', text: 'changes requested' })
+  }
+
+  return chips
+}
+
+/**
+ * releaseChipData builds the mockup's own `.chip` sequence for a release-
+ * cut row ("manifest: 3 flags") -- deliberately NOT prChipData's own
+ * riskLabel/findings chips, which describe an ordinary code-review
+ * verdict a release cut never carries. manifestFindingsCount is §15.2's
+ * own mechanical findings only; this NEVER fabricates an "aggregate: N
+ * findings" chip the mockup also shows, because the aggregate diff
+ * review's own composition findings are not computed anywhere in this
+ * system (DecisionInboxItem.aggregateReviewTriggered's own doc comment)
+ * -- aggregateReviewTriggered renders as its own, honestly-worded chip
+ * instead, saying only that the trigger criteria were met, never
+ * implying a finding count that does not exist.
+ *
+ * manifestCoveragePartial is what stops the count from over-claiming.
+ * When it is true the manifest scan ran over a TRUNCATED list of
+ * constituent PRs (or its persisted findings blob could not be decoded),
+ * so the count is a lower bound, not an audit -- and an `ok`-toned
+ * "manifest: 0 flags" would assert a clean release the server explicitly
+ * disclaims on the very same row. A partial scan therefore NEVER renders
+ * `ok`: it says so in the chip text and carries `warn` at worst, `crit`
+ * when it did find something. This mirrors what the release-review
+ * readout (`coveragePartial`) and the posted manifest comment already do
+ * with the identical fact.
+ */
+export function releaseChipData(item: Pick<DecisionInboxItem, 'manifestFindingsCount' | 'manifestCoveragePartial' | 'aggregateReviewTriggered'>): DecisionInboxChip[] {
+  const chips: DecisionInboxChip[] = []
+
+  if (item.manifestFindingsCount !== null) {
+    const count = item.manifestFindingsCount
+    const partial = item.manifestCoveragePartial === true
+    const text = `manifest: ${count} flag${count === 1 ? '' : 's'}${partial ? ' (partial scan)' : ''}`
+    const tone: DecisionInboxChip['tone'] = count > 0 ? 'crit' : partial ? 'warn' : 'ok'
+    chips.push({ tone, text })
+  }
+
+  if (item.aggregateReviewTriggered === true) {
+    chips.push({ tone: 'warn', text: 'aggregate review needed' })
   }
 
   return chips
