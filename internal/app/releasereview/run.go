@@ -59,6 +59,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/app/reviewcontext"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
 	"github.com/narvidev/narvi/internal/platform"
@@ -93,7 +94,18 @@ type Deps struct {
 	// mirroring this package's own established "every internal failure
 	// degrades, never blocks" posture for a caller that doesn't wire one.
 	ReleaseManifestChecks ReleaseManifestCheckInserter
-	Timeouts              platform.Timeouts
+	// CompositionTemplates/CompositionDiffFetcher/CompositionTurns/
+	// CompositionDispatch (Step 125, §15.3) back dispatchCompositionReview
+	// (compositiondispatch.go) -- ALL nil-safe, mirroring
+	// ReleaseManifestChecks immediately above: any one of them left unset
+	// simply declines to dispatch the composition pass for a caller that
+	// doesn't wire this deliverable, never a panic or a degraded manifest
+	// check.
+	CompositionTemplates   CompositionTemplateFetcher
+	CompositionDiffFetcher reviewcontext.Fetcher
+	CompositionTurns       CompositionTurnInserter
+	CompositionDispatch    CompositionDispatcher
+	Timeouts               platform.Timeouts
 }
 
 // Input is what Run needs to know about the just-detected release PR.
@@ -179,6 +191,18 @@ func Run(ctx context.Context, logger *slog.Logger, deps Deps, in Input) {
 	// comment below -- see persist.go's own doc comment for why this
 	// exists and why it is best-effort.
 	persistReleaseManifestCheck(ctx, logger, deps.ReleaseManifestChecks, in, domainMerged, findings, aggregateReview, triggerReasons, truncated)
+
+	// Step 125 (§15.3): dispatch the actual composition review pass, once
+	// its own trigger decision (aggregateReview, above) fires -- see
+	// dispatchCompositionReview's own doc comment (compositiondispatch.go)
+	// for the full "why a second turn on this same session" design.
+	// Called AFTER persistReleaseManifestCheck above so the
+	// release_manifest_checks row this dispatches against already exists
+	// by the time the composition-findings-posting tool's own later call
+	// looks it up by session id.
+	if aggregateReview {
+		dispatchCompositionReview(ctx, logger, deps, in)
+	}
 
 	payload, err := json.Marshal(githubapi.ReleaseManifestPayload{
 		Owner:    in.Owner,

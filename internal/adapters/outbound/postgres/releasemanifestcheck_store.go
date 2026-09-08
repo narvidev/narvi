@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
@@ -38,5 +39,41 @@ func (s *ReleaseManifestCheckStore) GetLatest(ctx context.Context, repoFullName 
 	return s.q.GetLatestReleaseManifestCheck(ctx, sqlcgen.GetLatestReleaseManifestCheckParams{
 		RepoFullName: repoFullName,
 		PrNumber:     prNumber,
+	})
+}
+
+// GetBySessionID fetches sessionID's own most-recently-computed check --
+// Step 125's own session-scoped lookup, used by the composition-findings-
+// posting tool and the Block/Acknowledge actions, none of which know
+// (repoFullName, prNumber) up front. pgx.ErrNoRows means this session has
+// no release manifest check on record at all.
+func (s *ReleaseManifestCheckStore) GetBySessionID(ctx context.Context, sessionID pgtype.UUID) (sqlcgen.ReleaseManifestCheck, error) {
+	return s.q.GetLatestReleaseManifestCheckBySessionID(ctx, sessionID)
+}
+
+// UpdateCompositionFindings persists §15.3's own composition findings
+// against the release manifest check row named by id -- a guarded UPDATE
+// ("AND composition_reviewed_at IS NULL", see the underlying query's own
+// doc comment); pgx.ErrNoRows means findings were already posted for this
+// row (a retried/duplicate tool call), never a silent overwrite.
+func (s *ReleaseManifestCheckStore) UpdateCompositionFindings(ctx context.Context, id pgtype.UUID, findingsJSON []byte) (sqlcgen.ReleaseManifestCheck, error) {
+	return s.q.UpdateReleaseManifestCompositionFindings(ctx, sqlcgen.UpdateReleaseManifestCompositionFindingsParams{
+		ID:                  id,
+		CompositionFindings: findingsJSON,
+	})
+}
+
+// UpdateCompositionDecision persists §12.2 item 9's own Block release /
+// Acknowledge & ship decision against the release manifest check row
+// named by id -- a guarded compare-and-swap against expectedCurrent (the
+// SAME value the caller already validated via internal/domain/review.
+// TransitionCompositionDecision); pgx.ErrNoRows means a concurrent
+// decision already won the race, never a silent overwrite.
+func (s *ReleaseManifestCheckStore) UpdateCompositionDecision(ctx context.Context, id pgtype.UUID, expectedCurrent, newDecision string, decisionBy pgtype.UUID) (sqlcgen.ReleaseManifestCheck, error) {
+	return s.q.UpdateReleaseManifestCompositionDecision(ctx, sqlcgen.UpdateReleaseManifestCompositionDecisionParams{
+		ID:                    id,
+		CompositionDecision:   newDecision,
+		CompositionDecisionBy: decisionBy,
+		ExpectedDecision:      expectedCurrent,
 	})
 }

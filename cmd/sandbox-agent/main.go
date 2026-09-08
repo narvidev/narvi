@@ -386,6 +386,13 @@ func (h *commandHandler) HandlePrompt(_ context.Context, cmd sandboxws.Prompt) {
 	// that placeholder present (every non-review turn, and a review turn
 	// whose ceiling was never configured, review/context.go's own gating).
 	cmd.Text = renderReviewCostBudgetToolPromptText(cmd.Text, h.reviewCostBudgetURL)
+	// (Step 125, §15.3): the SAME mechanism once more, for the
+	// aggregate-diff composition review turn's own composition-findings-
+	// posting tool (internal/domain/review.RenderCompositionReviewPrompt,
+	// dispatched by internal/app/releasereview's own dispatchCompositionReview)
+	// -- a no-op for every turn without those placeholders present (every
+	// turn that isn't a composition-review turn).
+	cmd.Text = renderCompositionFindingsToolPromptText(cmd.Text, h.cfg.SessionConfig)
 
 	h.group.Go(func() error {
 		sink := func(event ports.AgentEvent) {

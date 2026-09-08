@@ -1686,7 +1686,9 @@
         "aggregateReviewTriggered",
         "aggregateReviewTriggerReasons",
         "findings",
-        "mergedPrs"
+        "mergedPrs",
+        "compositionFindings",
+        "compositionDecision"
       ],
       "properties": {
         "repoFullName": { "type": "string" },
@@ -1728,7 +1730,87 @@
           "type": "array",
           "description": "Every constituent pull request this check examined -- the manifest table's own row source.",
           "items": { "$ref": "#/$defs/ReleaseManifestPR" }
+        },
+        "compositionReviewedAt": {
+          "type": ["string", "null"],
+          "format": "date-time",
+          "description": "§15.3's own aggregate-diff composition review pass: when it actually POSTED its findings via the composition-findings tool. Null means 'not yet available' -- either the pass was never triggered (aggregateReviewTriggered is false), or it was triggered but has not completed (or its dispatch failed) -- distinct, by construction, from a real, empty compositionFindings array (the pass ran and found nothing to report). Never render an empty compositionFindings array as a confident 'no composition findings' while this is null."
+        },
+        "compositionFindings": {
+          "type": "array",
+          "description": "§15.3's own composition findings -- empty either because compositionReviewedAt is null (not yet available, see that field's own description) or because the pass genuinely found nothing to report.",
+          "items": { "$ref": "#/$defs/ReleaseCompositionFinding" }
+        },
+        "compositionDecision": {
+          "type": "string",
+          "enum": ["pending", "blocked", "acknowledged"],
+          "description": "§12.2 item 9's own 'Block release / Acknowledge & ship' human decision on compositionFindings -- 'pending' until a maintainer+ (block) or admin (acknowledge, an explicit override) acts."
+        },
+        "compositionDecisionBy": {
+          "type": ["string", "null"],
+          "description": "The user id who rendered compositionDecision -- null while it is still 'pending'."
+        },
+        "compositionDecisionAt": {
+          "type": ["string", "null"],
+          "format": "date-time",
+          "description": "When compositionDecision was rendered -- null while it is still 'pending'."
         }
+      }
+    },
+    "ReleaseCompositionFinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One composition finding from §15.3's own aggregate-diff review pass -- reported by the reviewing agent via the composition-findings-posting tool (POST /sessions/:id/release-manifest/composition-findings), never re-parsed from posted comment text. Distinct from ReleaseManifestFinding (§15.2's mechanical manifest audit) and from a per-PR review verdict's own findings -- this pass never computes or consumes riskLevel/premise/shippable/digest (§15.4).",
+      "required": ["kind", "detail"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["conflict", "duplication", "invalidated_assumption", "other"],
+          "description": "§15.3's own composition framing: do these already-individually-correct changes conflict, duplicate, or invalidate each other's assumptions."
+        },
+        "detail": {
+          "type": "string",
+          "description": "Free-text explanation of the composition issue, naming the constituent pull requests involved."
+        }
+      }
+    },
+    "PostReleaseCompositionFindingsRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Request body for POST /sessions/:id/release-manifest/composition-findings (§15.3) -- the composition-findings-posting tool's own sandbox-bearer-authenticated call, mirroring PostReviewVerdictRequest's own 'typed fields, never markers' discipline one level down.",
+      "required": ["findings"],
+      "properties": {
+        "findings": {
+          "type": "array",
+          "description": "Zero or more composition findings -- an empty array is a legitimate, positive result (this release composes cleanly).",
+          "items": { "$ref": "#/$defs/ReleaseCompositionFinding" }
+        }
+      }
+    },
+    "PostReleaseCompositionFindingsResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "201 response body for POST /sessions/:id/release-manifest/composition-findings.",
+      "required": ["sessionId", "reviewedAt", "findingsCount"],
+      "properties": {
+        "sessionId": { "type": "string" },
+        "reviewedAt": { "type": "string", "format": "date-time" },
+        "findingsCount": { "type": "integer" }
+      }
+    },
+    "PostReleaseCompositionDecisionResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "200 response body for POST /api/sessions/:id/release-manifest/{block,acknowledge} (§12.2 item 9) -- the same shape for either action, distinguished by compositionDecision's own value.",
+      "required": ["sessionId", "compositionDecision", "compositionDecisionBy", "compositionDecisionAt"],
+      "properties": {
+        "sessionId": { "type": "string" },
+        "compositionDecision": {
+          "type": "string",
+          "enum": ["blocked", "acknowledged"]
+        },
+        "compositionDecisionBy": { "type": "string" },
+        "compositionDecisionAt": { "type": "string", "format": "date-time" }
       }
     },
     "ReleaseManifestFinding": {

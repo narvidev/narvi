@@ -248,6 +248,12 @@ type testRig struct {
 	// own review_verdicts insert (reviewverdict.go).
 	reviewVerdicts *narvipg.ReviewVerdictStore
 
+	// releaseManifestChecks (Step 125, §15.3/§12.2 item 9) backs this
+	// rig's own composition-findings-posting tool route and Block/
+	// Acknowledge routes (releasecompositionfindings_integration_test.go/
+	// releasecompositiondecision_integration_test.go).
+	releaseManifestChecks *narvipg.ReleaseManifestCheckStore
+
 	// sourceControl backs the apply-suggestion route's own GetFileContent/
 	// UpdateFileContent calls -- defaults to nil (ApplySuggestion's own
 	// callers all fail closed on a nil port the same way every other
@@ -443,6 +449,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		handoffSentinelRuns:   narvipg.NewHandoffSentinelStore(pool),
 		falsePositivePatterns: narvipg.NewFalsePositivePatternStore(pool),
 		reviewVerdicts:        narvipg.NewReviewVerdictStore(pool),
+		releaseManifestChecks: narvipg.NewReleaseManifestCheckStore(pool),
 		falseFailures:         narvipg.NewFalseFailureStore(pool),
 		automations:           narvipg.NewAutomationStore(pool),
 		automationInvocations: narvipg.NewAutomationInvocationStore(pool),
@@ -618,6 +625,10 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		// -- see reviewfindings.go's own doc comment.
 		r.Post("/{sessionID}/review/findings/{identityHash}/rebut", httpapi.RebutReviewFinding(rig.sessions, rig.prSessions, rig.reviewFindings, rig.auditLog))
 		r.Post("/{sessionID}/review/findings/{identityHash}/apply-suggestion", httpapi.ApplySuggestion(rig.sessions, rig.prSessions, rig.reviewFindings, rig.identities, rig.sourceControl, rig.tokenEncryptionKey, platform.DefaultTimeouts()))
+		// release-manifest/{block,acknowledge} (Step 125, §12.2 item 9)
+		// -- see releasecompositiondecision.go's own doc comment.
+		r.Post("/{sessionID}/release-manifest/block", httpapi.BlockReleaseComposition(rig.sessions, rig.releaseManifestChecks, rig.auditLog))
+		r.Post("/{sessionID}/release-manifest/acknowledge", httpapi.AcknowledgeReleaseComposition(rig.sessions, rig.releaseManifestChecks, rig.auditLog))
 		// workflow-runs (§25.10's own two run-read routes) -- see
 		// httpapi/workflowruns.go's own doc comment.
 		r.Get("/{sessionID}/workflow-runs", httpapi.ListSessionWorkflowRuns(rig.sessions, rig.workflows))
@@ -714,6 +725,10 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 	// own doc comment.
 	router.Post("/sessions/{sessionID}/turn/epistemic-outcome",
 		httpapi.PostEpistemicOutcome(rig.sandboxes, rig.turns))
+	// release-manifest/composition-findings (Step 125, §15.3) is mounted
+	// the SAME way -- see releasecompositionfindings.go's own doc comment.
+	router.Post("/sessions/{sessionID}/release-manifest/composition-findings",
+		httpapi.PostReleaseCompositionFindings(rig.sandboxes, rig.releaseManifestChecks))
 	// uploads mint/confirm/content (§28.4/§28.5) sandbox-bearer
 	// variants are mounted the SAME way -- see uploadmint.go/
 	// uploadconfirm.go/uploadcontent.go's own doc comments.

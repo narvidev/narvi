@@ -107,6 +107,8 @@ function baseManifestReadout(overrides: Partial<ReleaseManifestReadout> = {}): R
     aggregateReviewTriggerReasons: [],
     findings: [],
     mergedPrs: [baseManifestPR()],
+    compositionFindings: [],
+    compositionDecision: 'pending',
     ...overrides,
   }
 }
@@ -255,14 +257,25 @@ describe('mutation guard: isSafeHref actually called on a genuinely free-form re
 describe('ReleaseReviewView rendering -- adversarial manifest content stays text, never markup', () => {
   it('a hostile constituent-PR title renders as text', () => {
     const readout = baseManifestReadout({ mergedPrs: [baseManifestPR({ title: `fix: bug ${XSS_IMG}` })] })
-    const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} />)
+    const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} sessionId="s1" />)
     expect(html).not.toContain('<img')
     expect(html).toContain('&lt;img')
   })
 
   it('a hostile aggregate-review trigger reason renders as text', () => {
     const readout = baseManifestReadout({ aggregateReviewTriggered: true, aggregateReviewTriggerReasons: [XSS_SCRIPT] })
-    const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} />)
+    const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} sessionId="s1" />)
+    expect(html).not.toContain('<script>')
+    expect(html).toContain('&lt;script&gt;')
+  })
+
+  it('a hostile composition finding detail renders as text', () => {
+    const readout = baseManifestReadout({
+      aggregateReviewTriggered: true,
+      compositionReviewedAt: '2026-08-20T11:00:00Z',
+      compositionFindings: [{ kind: 'conflict', detail: `two PRs collide ${XSS_SCRIPT}` }],
+    })
+    const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} sessionId="s1" />)
     expect(html).not.toContain('<script>')
     expect(html).toContain('&lt;script&gt;')
   })
@@ -270,14 +283,79 @@ describe('ReleaseReviewView rendering -- adversarial manifest content stays text
   it('does not hang on a 200KB constituent-PR title', () => {
     const readout = baseManifestReadout({ mergedPrs: [baseManifestPR({ title: 'x'.repeat(200_000) })] })
     const start = Date.now()
-    expect(() => renderToStaticMarkup(<ReleaseManifestBody readout={readout} />)).not.toThrow()
+    expect(() => renderToStaticMarkup(<ReleaseManifestBody readout={readout} sessionId="s1" />)).not.toThrow()
     expect(Date.now() - start).toBeLessThan(2000)
   })
 
-  it('renders an honest empty state, never fabricated composition findings', () => {
+  it('renders "not applicable" when the composition criteria were never met, never a fabricated result', () => {
     const readout = baseManifestReadout()
-    const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} />)
-    expect(html).toContain('Not yet available')
+    const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} sessionId="s1" />)
+    expect(html).not.toContain('Composition findings')
+    expect(html).toContain('None of the composition criteria were met')
+  })
+
+  it('renders "pending", never an empty findings list, while the composition pass has not completed', () => {
+    const readout = baseManifestReadout({ aggregateReviewTriggered: true })
+    const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} sessionId="s1" />)
+    expect(html).toContain('Pending')
+    expect(html).not.toContain('No composition findings')
+  })
+
+  it('renders an honest "no findings" result once the pass has actually completed clean', () => {
+    const readout = baseManifestReadout({ aggregateReviewTriggered: true, compositionReviewedAt: '2026-08-20T11:00:00Z' })
+    const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} sessionId="s1" />)
+    expect(html).toContain('No composition findings')
+    expect(html).not.toContain('Pending')
+  })
+
+  it('renders real composition findings once the pass has completed with something to report', () => {
+    const readout = baseManifestReadout({
+      aggregateReviewTriggered: true,
+      compositionReviewedAt: '2026-08-20T11:00:00Z',
+      compositionFindings: [{ kind: 'duplication', detail: 'PR #1 and #2 both add the same migration' }],
+    })
+    const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} sessionId="s1" />)
+    expect(html).toContain('duplication')
+    expect(html).toContain('PR #1 and #2 both add the same migration')
+  })
+
+  it('never renders Block/Acknowledge actions for a viewer/member (canBlock/canAcknowledge both false)', () => {
+    const readout = baseManifestReadout({
+      aggregateReviewTriggered: true,
+      compositionReviewedAt: '2026-08-20T11:00:00Z',
+      compositionFindings: [{ kind: 'other', detail: 'something worth a human look' }],
+    })
+    const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} sessionId="s1" />)
+    expect(html).not.toContain('Block release')
+    expect(html).not.toContain('Acknowledge & ship')
+  })
+
+  it('renders only Block for a maintainer, and both for an admin -- role-gated client-side, mirroring server RBAC', () => {
+    const readout = baseManifestReadout({
+      aggregateReviewTriggered: true,
+      compositionReviewedAt: '2026-08-20T11:00:00Z',
+      compositionFindings: [{ kind: 'other', detail: 'something worth a human look' }],
+    })
+    const maintainerHtml = withQueryClient(<ReleaseManifestBody readout={readout} sessionId="s1" canBlock={true} canAcknowledge={false} />)
+    expect(maintainerHtml).toContain('Block release')
+    expect(maintainerHtml).not.toContain('Acknowledge &amp; ship')
+
+    const adminHtml = withQueryClient(<ReleaseManifestBody readout={readout} sessionId="s1" canBlock={true} canAcknowledge={true} />)
+    expect(adminHtml).toContain('Block release')
+    expect(adminHtml).toContain('Acknowledge &amp; ship')
+  })
+
+  it('never renders Block/Acknowledge once a decision has already been made', () => {
+    const readout = baseManifestReadout({
+      aggregateReviewTriggered: true,
+      compositionReviewedAt: '2026-08-20T11:00:00Z',
+      compositionFindings: [{ kind: 'other', detail: 'something worth a human look' }],
+      compositionDecision: 'blocked',
+      compositionDecisionAt: '2026-08-20T12:00:00Z',
+    })
+    const html = withQueryClient(<ReleaseManifestBody readout={readout} sessionId="s1" canBlock={true} canAcknowledge={true} />)
+    expect(html).not.toContain('<button')
+    expect(html).toContain('Blocked')
   })
 })
 

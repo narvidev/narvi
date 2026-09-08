@@ -12,7 +12,7 @@ import (
 )
 
 const getLatestReleaseManifestCheck = `-- name: GetLatestReleaseManifestCheck :one
-SELECT id, session_id, repo_full_name, pr_number, base_ref, head_ref, constituent_pr_count, coverage_partial, aggregate_review_triggered, aggregate_review_trigger_reasons, findings, merged_prs, created_at FROM release_manifest_checks
+SELECT id, session_id, repo_full_name, pr_number, base_ref, head_ref, constituent_pr_count, coverage_partial, aggregate_review_triggered, aggregate_review_trigger_reasons, findings, merged_prs, created_at, composition_reviewed_at, composition_findings, composition_decision, composition_decision_by, composition_decision_at FROM release_manifest_checks
 WHERE repo_full_name = $1 AND pr_number = $2
 ORDER BY created_at DESC
 LIMIT 1
@@ -46,6 +46,53 @@ func (q *Queries) GetLatestReleaseManifestCheck(ctx context.Context, arg GetLate
 		&i.Findings,
 		&i.MergedPrs,
 		&i.CreatedAt,
+		&i.CompositionReviewedAt,
+		&i.CompositionFindings,
+		&i.CompositionDecision,
+		&i.CompositionDecisionBy,
+		&i.CompositionDecisionAt,
+	)
+	return i, err
+}
+
+const getLatestReleaseManifestCheckBySessionID = `-- name: GetLatestReleaseManifestCheckBySessionID :one
+SELECT id, session_id, repo_full_name, pr_number, base_ref, head_ref, constituent_pr_count, coverage_partial, aggregate_review_triggered, aggregate_review_trigger_reasons, findings, merged_prs, created_at, composition_reviewed_at, composition_findings, composition_decision, composition_decision_by, composition_decision_at FROM release_manifest_checks
+WHERE session_id = $1
+ORDER BY created_at DESC
+LIMIT 1
+`
+
+// Step 125's own session-scoped lookup: the composition-findings-posting
+// tool and the Block/Acknowledge actions all resolve their target row
+// from a sessionID alone (a sandbox-bearer-authenticated tool call, or an
+// authenticated browser request against /api/sessions/:id/release-manifest/*),
+// never from (repo_full_name, pr_number) -- mirrors GetLatestReleaseManifestCheck's
+// own identical "ORDER BY created_at DESC LIMIT 1" shape, backed by
+// release_manifest_checks_session_id_created_at_idx (migrations/
+// 000126_release_manifest_checks_composition.up.sql). pgx.ErrNoRows means
+// this session has no release manifest check on record at all.
+func (q *Queries) GetLatestReleaseManifestCheckBySessionID(ctx context.Context, sessionID pgtype.UUID) (ReleaseManifestCheck, error) {
+	row := q.db.QueryRow(ctx, getLatestReleaseManifestCheckBySessionID, sessionID)
+	var i ReleaseManifestCheck
+	err := row.Scan(
+		&i.ID,
+		&i.SessionID,
+		&i.RepoFullName,
+		&i.PrNumber,
+		&i.BaseRef,
+		&i.HeadRef,
+		&i.ConstituentPrCount,
+		&i.CoveragePartial,
+		&i.AggregateReviewTriggered,
+		&i.AggregateReviewTriggerReasons,
+		&i.Findings,
+		&i.MergedPrs,
+		&i.CreatedAt,
+		&i.CompositionReviewedAt,
+		&i.CompositionFindings,
+		&i.CompositionDecision,
+		&i.CompositionDecisionBy,
+		&i.CompositionDecisionAt,
 	)
 	return i, err
 }
@@ -59,7 +106,7 @@ INSERT INTO release_manifest_checks (
     findings, merged_prs
 )
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-RETURNING id, session_id, repo_full_name, pr_number, base_ref, head_ref, constituent_pr_count, coverage_partial, aggregate_review_triggered, aggregate_review_trigger_reasons, findings, merged_prs, created_at
+RETURNING id, session_id, repo_full_name, pr_number, base_ref, head_ref, constituent_pr_count, coverage_partial, aggregate_review_triggered, aggregate_review_trigger_reasons, findings, merged_prs, created_at, composition_reviewed_at, composition_findings, composition_decision, composition_decision_by, composition_decision_at
 `
 
 type InsertReleaseManifestCheckParams struct {
@@ -115,6 +162,117 @@ func (q *Queries) InsertReleaseManifestCheck(ctx context.Context, arg InsertRele
 		&i.Findings,
 		&i.MergedPrs,
 		&i.CreatedAt,
+		&i.CompositionReviewedAt,
+		&i.CompositionFindings,
+		&i.CompositionDecision,
+		&i.CompositionDecisionBy,
+		&i.CompositionDecisionAt,
+	)
+	return i, err
+}
+
+const updateReleaseManifestCompositionDecision = `-- name: UpdateReleaseManifestCompositionDecision :one
+UPDATE release_manifest_checks
+SET composition_decision = $2,
+    composition_decision_by = $3,
+    composition_decision_at = now()
+WHERE id = $1 AND composition_decision = $4
+RETURNING id, session_id, repo_full_name, pr_number, base_ref, head_ref, constituent_pr_count, coverage_partial, aggregate_review_triggered, aggregate_review_trigger_reasons, findings, merged_prs, created_at, composition_reviewed_at, composition_findings, composition_decision, composition_decision_by, composition_decision_at
+`
+
+type UpdateReleaseManifestCompositionDecisionParams struct {
+	ID                    pgtype.UUID `json:"id"`
+	CompositionDecision   string      `json:"composition_decision"`
+	CompositionDecisionBy pgtype.UUID `json:"composition_decision_by"`
+	ExpectedDecision      string      `json:"expected_decision"`
+}
+
+// Step 125's own Block release / Acknowledge & ship action write
+// (BlockReleaseComposition/AcknowledgeReleaseComposition, httpapi/
+// releasecompositiondecision.go): a guarded UPDATE comparing against
+// expectedCurrentDecision (the SAME current value the caller already
+// passed through internal/domain/review.TransitionCompositionDecision to
+// validate) -- pgx.ErrNoRows means a concurrent decision already won the
+// race between that validation and this write, reported back to the
+// caller as 409, never a silent overwrite of someone else's decision.
+func (q *Queries) UpdateReleaseManifestCompositionDecision(ctx context.Context, arg UpdateReleaseManifestCompositionDecisionParams) (ReleaseManifestCheck, error) {
+	row := q.db.QueryRow(ctx, updateReleaseManifestCompositionDecision,
+		arg.ID,
+		arg.CompositionDecision,
+		arg.CompositionDecisionBy,
+		arg.ExpectedDecision,
+	)
+	var i ReleaseManifestCheck
+	err := row.Scan(
+		&i.ID,
+		&i.SessionID,
+		&i.RepoFullName,
+		&i.PrNumber,
+		&i.BaseRef,
+		&i.HeadRef,
+		&i.ConstituentPrCount,
+		&i.CoveragePartial,
+		&i.AggregateReviewTriggered,
+		&i.AggregateReviewTriggerReasons,
+		&i.Findings,
+		&i.MergedPrs,
+		&i.CreatedAt,
+		&i.CompositionReviewedAt,
+		&i.CompositionFindings,
+		&i.CompositionDecision,
+		&i.CompositionDecisionBy,
+		&i.CompositionDecisionAt,
+	)
+	return i, err
+}
+
+const updateReleaseManifestCompositionFindings = `-- name: UpdateReleaseManifestCompositionFindings :one
+UPDATE release_manifest_checks
+SET composition_reviewed_at = now(),
+    composition_findings = $2
+WHERE id = $1 AND composition_reviewed_at IS NULL
+RETURNING id, session_id, repo_full_name, pr_number, base_ref, head_ref, constituent_pr_count, coverage_partial, aggregate_review_triggered, aggregate_review_trigger_reasons, findings, merged_prs, created_at, composition_reviewed_at, composition_findings, composition_decision, composition_decision_by, composition_decision_at
+`
+
+type UpdateReleaseManifestCompositionFindingsParams struct {
+	ID                  pgtype.UUID `json:"id"`
+	CompositionFindings []byte      `json:"composition_findings"`
+}
+
+// Step 125's own composition-findings-posting tool write
+// (PostReleaseCompositionFindings, httpapi/releasecompositionfindings.go):
+// a guarded UPDATE ("AND composition_reviewed_at IS NULL") so this can
+// only ever succeed ONCE per row -- a retried/duplicate tool call for the
+// same session is a no-op here (pgx.ErrNoRows), never a silent
+// overwrite of an already-posted result. Scoped by id (the caller already
+// resolved the target row via GetLatestReleaseManifestCheckBySessionID,
+// and passes its own id back here) rather than session_id directly, so a
+// future Step that DOES re-run this check on a later push (this table's
+// own append-only design, migrations/000097's doc comment) can never have
+// this guarded write silently target the WRONG one of several rows
+// sharing a session_id.
+func (q *Queries) UpdateReleaseManifestCompositionFindings(ctx context.Context, arg UpdateReleaseManifestCompositionFindingsParams) (ReleaseManifestCheck, error) {
+	row := q.db.QueryRow(ctx, updateReleaseManifestCompositionFindings, arg.ID, arg.CompositionFindings)
+	var i ReleaseManifestCheck
+	err := row.Scan(
+		&i.ID,
+		&i.SessionID,
+		&i.RepoFullName,
+		&i.PrNumber,
+		&i.BaseRef,
+		&i.HeadRef,
+		&i.ConstituentPrCount,
+		&i.CoveragePartial,
+		&i.AggregateReviewTriggered,
+		&i.AggregateReviewTriggerReasons,
+		&i.Findings,
+		&i.MergedPrs,
+		&i.CreatedAt,
+		&i.CompositionReviewedAt,
+		&i.CompositionFindings,
+		&i.CompositionDecision,
+		&i.CompositionDecisionBy,
+		&i.CompositionDecisionAt,
 	)
 	return i, err
 }

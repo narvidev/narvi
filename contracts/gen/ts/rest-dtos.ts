@@ -981,6 +981,26 @@ export interface ReleaseManifestReadout {
    * Every constituent pull request this check examined -- the manifest table's own row source.
    */
   mergedPrs: ReleaseManifestPR[];
+  /**
+   * §15.3's own aggregate-diff composition review pass: when it actually POSTED its findings via the composition-findings tool. Null means 'not yet available' -- either the pass was never triggered (aggregateReviewTriggered is false), or it was triggered but has not completed (or its dispatch failed) -- distinct, by construction, from a real, empty compositionFindings array (the pass ran and found nothing to report). Never render an empty compositionFindings array as a confident 'no composition findings' while this is null.
+   */
+  compositionReviewedAt?: string | null;
+  /**
+   * §15.3's own composition findings -- empty either because compositionReviewedAt is null (not yet available, see that field's own description) or because the pass genuinely found nothing to report.
+   */
+  compositionFindings: ReleaseCompositionFinding[];
+  /**
+   * §12.2 item 9's own 'Block release / Acknowledge & ship' human decision on compositionFindings -- 'pending' until a maintainer+ (block) or admin (acknowledge, an explicit override) acts.
+   */
+  compositionDecision: 'pending' | 'blocked' | 'acknowledged';
+  /**
+   * The user id who rendered compositionDecision -- null while it is still 'pending'.
+   */
+  compositionDecisionBy?: string | null;
+  /**
+   * When compositionDecision was rendered -- null while it is still 'pending'.
+   */
+  compositionDecisionAt?: string | null;
 }
 /**
  * One review.ManifestFinding's own REST wire shape (§15.2).
@@ -1023,6 +1043,57 @@ export interface ReleaseManifestPR {
   revertedAfterMergeSeconds: number | null;
   hadManualConflictResolution: boolean;
   highRiskFlagged: boolean;
+}
+/**
+ * One composition finding from §15.3's own aggregate-diff review pass -- reported by the reviewing agent via the composition-findings-posting tool (POST /sessions/:id/release-manifest/composition-findings), never re-parsed from posted comment text. Distinct from ReleaseManifestFinding (§15.2's mechanical manifest audit) and from a per-PR review verdict's own findings -- this pass never computes or consumes riskLevel/premise/shippable/digest (§15.4).
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "ReleaseCompositionFinding".
+ */
+export interface ReleaseCompositionFinding {
+  /**
+   * §15.3's own composition framing: do these already-individually-correct changes conflict, duplicate, or invalidate each other's assumptions.
+   */
+  kind: 'conflict' | 'duplication' | 'invalidated_assumption' | 'other';
+  /**
+   * Free-text explanation of the composition issue, naming the constituent pull requests involved.
+   */
+  detail: string;
+}
+/**
+ * Request body for POST /sessions/:id/release-manifest/composition-findings (§15.3) -- the composition-findings-posting tool's own sandbox-bearer-authenticated call, mirroring PostReviewVerdictRequest's own 'typed fields, never markers' discipline one level down.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "PostReleaseCompositionFindingsRequest".
+ */
+export interface PostReleaseCompositionFindingsRequest {
+  /**
+   * Zero or more composition findings -- an empty array is a legitimate, positive result (this release composes cleanly).
+   */
+  findings: ReleaseCompositionFinding[];
+}
+/**
+ * 201 response body for POST /sessions/:id/release-manifest/composition-findings.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "PostReleaseCompositionFindingsResponse".
+ */
+export interface PostReleaseCompositionFindingsResponse {
+  sessionId: string;
+  reviewedAt: string;
+  findingsCount: number;
+}
+/**
+ * 200 response body for POST /api/sessions/:id/release-manifest/{block,acknowledge} (§12.2 item 9) -- the same shape for either action, distinguished by compositionDecision's own value.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "PostReleaseCompositionDecisionResponse".
+ */
+export interface PostReleaseCompositionDecisionResponse {
+  sessionId: string;
+  compositionDecision: 'blocked' | 'acknowledged';
+  compositionDecisionBy: string;
+  compositionDecisionAt: string;
 }
 /**
  * GET/PUT /api/repos/{owner}/{repo}/settings response body (§8.2/§21.2) -- an admin, per-repo policy-flag row (migrations/000044_repo_settings.up.sql). Deliberately a small, extensible shape: §21's auto-merge toggle, §24's automatic-re-review opt-in (§24.5), and §26.2's description-autofix toggle (§26.2) each added a further boolean property here, never a bespoke DTO of their own -- future toggles are expected to follow the same pattern.

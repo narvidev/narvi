@@ -30,3 +30,53 @@ SELECT * FROM release_manifest_checks
 WHERE repo_full_name = $1 AND pr_number = $2
 ORDER BY created_at DESC
 LIMIT 1;
+
+-- name: GetLatestReleaseManifestCheckBySessionID :one
+-- Step 125's own session-scoped lookup: the composition-findings-posting
+-- tool and the Block/Acknowledge actions all resolve their target row
+-- from a sessionID alone (a sandbox-bearer-authenticated tool call, or an
+-- authenticated browser request against /api/sessions/:id/release-manifest/*),
+-- never from (repo_full_name, pr_number) -- mirrors GetLatestReleaseManifestCheck's
+-- own identical "ORDER BY created_at DESC LIMIT 1" shape, backed by
+-- release_manifest_checks_session_id_created_at_idx (migrations/
+-- 000126_release_manifest_checks_composition.up.sql). pgx.ErrNoRows means
+-- this session has no release manifest check on record at all.
+SELECT * FROM release_manifest_checks
+WHERE session_id = $1
+ORDER BY created_at DESC
+LIMIT 1;
+
+-- name: UpdateReleaseManifestCompositionFindings :one
+-- Step 125's own composition-findings-posting tool write
+-- (PostReleaseCompositionFindings, httpapi/releasecompositionfindings.go):
+-- a guarded UPDATE ("AND composition_reviewed_at IS NULL") so this can
+-- only ever succeed ONCE per row -- a retried/duplicate tool call for the
+-- same session is a no-op here (pgx.ErrNoRows), never a silent
+-- overwrite of an already-posted result. Scoped by id (the caller already
+-- resolved the target row via GetLatestReleaseManifestCheckBySessionID,
+-- and passes its own id back here) rather than session_id directly, so a
+-- future Step that DOES re-run this check on a later push (this table's
+-- own append-only design, migrations/000097's doc comment) can never have
+-- this guarded write silently target the WRONG one of several rows
+-- sharing a session_id.
+UPDATE release_manifest_checks
+SET composition_reviewed_at = now(),
+    composition_findings = $2
+WHERE id = $1 AND composition_reviewed_at IS NULL
+RETURNING *;
+
+-- name: UpdateReleaseManifestCompositionDecision :one
+-- Step 125's own Block release / Acknowledge & ship action write
+-- (BlockReleaseComposition/AcknowledgeReleaseComposition, httpapi/
+-- releasecompositiondecision.go): a guarded UPDATE comparing against
+-- expectedCurrentDecision (the SAME current value the caller already
+-- passed through internal/domain/review.TransitionCompositionDecision to
+-- validate) -- pgx.ErrNoRows means a concurrent decision already won the
+-- race between that validation and this write, reported back to the
+-- caller as 409, never a silent overwrite of someone else's decision.
+UPDATE release_manifest_checks
+SET composition_decision = $2,
+    composition_decision_by = $3,
+    composition_decision_at = now()
+WHERE id = $1 AND composition_decision = sqlc.arg(expected_decision)
+RETURNING *;
