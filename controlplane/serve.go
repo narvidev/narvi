@@ -1719,13 +1719,16 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// cfg.GitHubBotToken -- the bot credential, since a background
 	// worker has no clicking human's own token to reuse (see
 	// automerge.Deps' own doc comment).
-	automergeWorker := automerge.New(automerge.Deps{
+	automergeWorker, err := automerge.New(automerge.Deps{
 		DecisionInbox: decisionInboxDeps,
 		SourceControl: sourceControl,
 		AuditLog:      auditLogStore,
 		BotToken:      cfg.GitHubBotToken,
 		Timeouts:      cfg.Timeouts,
 	})
+	if err != nil {
+		return nil, fmt.Errorf("construct automerge worker: %w", err)
+	}
 	digestPump := digest.New(digest.Deps{
 		Channels:      digestChannelStore,
 		SendState:     digestSendStateStore,
