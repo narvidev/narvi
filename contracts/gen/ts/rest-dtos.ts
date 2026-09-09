@@ -1010,6 +1010,34 @@ export interface ReleaseManifestReadout {
    * Every constituent pull request this check examined -- the manifest table's own row source.
    */
   mergedPrs: ReleaseManifestPR[];
+  /**
+   * §15.3's own aggregate-diff composition review pass: when it actually POSTED its findings via the composition-findings tool. Null means 'not yet available' -- either the pass was never triggered (aggregateReviewTriggered is false), or it was triggered but has not completed (or its dispatch failed) -- distinct, by construction, from a real, empty compositionFindings array (the pass ran and found nothing to report). Never render an empty compositionFindings array as a confident 'no composition findings' while this is null.
+   */
+  compositionReviewedAt?: string | null;
+  /**
+   * §15.3's own composition findings -- empty either because compositionReviewedAt is null (not yet available, see that field's own description) or because the pass genuinely found nothing to report.
+   */
+  compositionFindings: ReleaseCompositionFinding[];
+  /**
+   * The commit sha compositionFindings was actually (or will be) reviewed against -- recorded once, at composition-review DISPATCH time (internal/app/releasereview.dispatchCompositionReview's own UpdateCompositionAnchor call, immediately after the composition-review turn is created), strictly BEFORE that turn ever completes and posts findings. Null means the pass was NEVER actually dispatched at all (its own prompt-template fetch, diff fetch, or turn insert declined/failed) -- a HONEST TERMINAL state this system does not retry, never merely 'not yet available'. Non-null does NOT imply compositionReviewedAt is also set: a real, live dispatch sets this field FIRST and compositionReviewedAt only later, once the turn actually completes -- so 'non-null head sha, still-null compositionReviewedAt' is the ordinary, expected shape of a genuinely in-flight pass, not a contradiction. A confirmed-major auditability fix: a verdict attributed to a diff nobody can identify afterward is not auditable, and (a related, confirmed-major fix) a caller that conflates 'never dispatched' with 'dispatched, still pending' renders a false promise of eventual completion for a pass that will never run. See web/src/session/ReleaseReviewView.tsx's own compositionPassState for the one place in this codebase that actually reads this field to distinguish 'declined' from 'pending'.
+   */
+  compositionHeadSha?: string | null;
+  /**
+   * Whether the diff fetch this composition review pass actually ran over was itself truncated at its own size cap -- distinct from coveragePartial above (that flag describes the CONSTITUENT-PR LISTING §15.2's manifest check ran over; this one describes the single aggregate baseRef..headRef diff §15.3's composition pass reviewed). Null exactly when compositionHeadSha is null (the pass was never dispatched) -- set at the SAME dispatch-time write as compositionHeadSha, so the two share an identical null/non-null pattern even though compositionHeadSha alone is what a client should branch render state on.
+   */
+  compositionDiffTruncated?: boolean | null;
+  /**
+   * §12.2 item 9's own 'Block release / Acknowledge & ship [/ Unblock]' human decision on compositionFindings -- 'pending' until a maintainer+ (block) or admin (acknowledge, an explicit override) acts, and 'pending' AGAIN after an admin unblocks an already-blocked release (internal/domain/review.CompositionDecisionActionUnblock) -- Unblock never jumps straight to 'acknowledged'.
+   */
+  compositionDecision: 'pending' | 'blocked' | 'acknowledged';
+  /**
+   * The user id who rendered the MOST RECENT block/acknowledge/unblock action against this release -- null only when no such action has ever been taken. NOT necessarily null when compositionDecision reads 'pending' again: an Unblock action also sets this (to the unblocking admin), which is why compositionDecision alone is not enough to tell 'never decided' apart from 'decided, then reopened' -- a client checking that distinction should treat this field as the tell, not compositionDecision.
+   */
+  compositionDecisionBy?: string | null;
+  /**
+   * When the MOST RECENT block/acknowledge/unblock action was rendered -- see compositionDecisionBy's own description for why this can be non-null even while compositionDecision itself reads 'pending' again.
+   */
+  compositionDecisionAt?: string | null;
 }
 /**
  * One review.ManifestFinding's own REST wire shape (§15.2).
@@ -1052,6 +1080,57 @@ export interface ReleaseManifestPR {
   revertedAfterMergeSeconds: number | null;
   hadManualConflictResolution: boolean;
   highRiskFlagged: boolean;
+}
+/**
+ * One composition finding from §15.3's own aggregate-diff review pass -- reported by the reviewing agent via the composition-findings-posting tool (POST /sessions/:id/release-manifest/composition-findings), never re-parsed from posted comment text. Distinct from ReleaseManifestFinding (§15.2's mechanical manifest audit) and from a per-PR review verdict's own findings -- this pass never computes or consumes riskLevel/premise/shippable/digest (§15.4).
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "ReleaseCompositionFinding".
+ */
+export interface ReleaseCompositionFinding {
+  /**
+   * §15.3's own composition framing: do these already-individually-correct changes conflict, duplicate, or invalidate each other's assumptions.
+   */
+  kind: 'conflict' | 'duplication' | 'invalidated_assumption' | 'other';
+  /**
+   * Free-text explanation of the composition issue, naming the constituent pull requests involved.
+   */
+  detail: string;
+}
+/**
+ * Request body for POST /sessions/:id/release-manifest/composition-findings (§15.3) -- the composition-findings-posting tool's own sandbox-bearer-authenticated call, mirroring PostReviewVerdictRequest's own 'typed fields, never markers' discipline one level down.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "PostReleaseCompositionFindingsRequest".
+ */
+export interface PostReleaseCompositionFindingsRequest {
+  /**
+   * Zero or more composition findings -- an empty array is a legitimate, positive result (this release composes cleanly).
+   */
+  findings: ReleaseCompositionFinding[];
+}
+/**
+ * 201 response body for POST /sessions/:id/release-manifest/composition-findings.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "PostReleaseCompositionFindingsResponse".
+ */
+export interface PostReleaseCompositionFindingsResponse {
+  sessionId: string;
+  reviewedAt: string;
+  findingsCount: number;
+}
+/**
+ * 200 response body for POST /api/sessions/:id/release-manifest/{block,acknowledge,unblock} (§12.2 item 9) -- the same shape for all three actions, distinguished by compositionDecision's own value. "pending" is Unblock's own result (the confirmed-major "unblock path" fix): it reopens an already-blocked release back to pending, never straight to acknowledged -- see internal/domain/review.CompositionDecisionActionUnblock's own doc comment.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "PostReleaseCompositionDecisionResponse".
+ */
+export interface PostReleaseCompositionDecisionResponse {
+  sessionId: string;
+  compositionDecision: 'pending' | 'blocked' | 'acknowledged';
+  compositionDecisionBy: string;
+  compositionDecisionAt: string;
 }
 /**
  * GET/PUT /api/repos/{owner}/{repo}/settings response body (§8.2/§21.2) -- an admin, per-repo policy-flag row (migrations/000044_repo_settings.up.sql). Deliberately a small, extensible shape: §21's auto-merge toggle, §24's automatic-re-review opt-in (§24.5), and §26.2's description-autofix toggle (§26.2) each added a further boolean property here, never a bespoke DTO of their own -- future toggles are expected to follow the same pattern.
@@ -2349,9 +2428,17 @@ export interface DecisionInboxItem {
    */
   manifestCoveragePartial: boolean | null;
   /**
-   * §15.3's own already-computed trigger decision (whether the constituent PRs' own shape met the criteria for an aggregate diff review) -- set iff isRelease is true, null otherwise. This is NOT a composition-findings count: the aggregate diff review pass itself is not dispatched anywhere in this system, so this field says only that its trigger criteria were met, never that the pass produced a finding.
+   * §15.3's own already-computed trigger decision (whether the constituent PRs' own shape met the criteria for an aggregate diff review, OR the constituent-PR listing was itself truncated -- a truncated scan is treated as its own trigger, never a silent skip) -- set iff isRelease is true, null otherwise. This says only that the composition pass was dispatched (or should have been); see compositionReviewed/compositionDecision below for whether it has actually completed and been decided.
    */
   aggregateReviewTriggered: boolean | null;
+  /**
+   * §15.3's own composition-review COMPLETION state -- the SAME fact GetReleaseManifestReadout exposes as compositionReviewedAt (non-null), rendered here as a plain boolean since this row has no use for the exact timestamp. Set iff isRelease is true, null otherwise. Confirmed-major fix: before this field existed, a client had no way to tell 'the composition pass has not run yet' apart from 'it ran, found nothing, and was decided' -- both rendered as the identical, permanent 'aggregate review needed' chip (aggregateReviewTriggered alone cannot express this: it only ever says the pass SHOULD run).
+   */
+  compositionReviewed?: boolean | null;
+  /**
+   * The SAME three-value enum GetReleaseManifestReadout's own compositionDecision renders ('pending' until a maintainer+ blocks or an admin acknowledges, and 'pending' again after an admin unblocks) -- meaningless (null) whenever compositionReviewed is false or isRelease is false. A client rendering this row's own chip should treat 'pending' identically whether compositionReviewed is true (a real decision is genuinely still outstanding) or aggregateReviewTriggered is true but compositionReviewed is false (the pass has not completed) -- decisionInboxFormat.ts's own releaseChipData is this contract's one intended reader, and it already distinguishes the two via compositionReviewed.
+   */
+  compositionDecision?: 'pending' | 'blocked' | 'acknowledged' | null;
   /**
    * kind=awaiting_approval, a plan (not a handoff PR) only.
    */

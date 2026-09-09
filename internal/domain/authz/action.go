@@ -485,6 +485,58 @@ const (
 	// instruction -- see httpapi/previewconfig.go's own doc comment for
 	// the full "why a separate endpoint" reasoning).
 	ActionConfigurePreviewLinks Action = "configure_preview_links"
+	// ActionAcknowledgeReleaseComposition covers the "Acknowledge & ship"
+	// action on a release's own composition findings (§12.2 item 9, §15.3
+	// — POST /api/sessions/{sessionID}/release-manifest/acknowledge,
+	// internal/adapters/inbound/httpapi/releasecompositiondecision.go).
+	// Admin only, this SAME row as every other unattended-consequence
+	// action above, by a DIFFERENT but equally row-6-justifying reasoning:
+	// this is not a toggle that arms future unattended behavior, it is a
+	// per-instance OVERRIDE of an already-computed risk signal a review
+	// pass just reported — shipping a release specifically DESPITE a
+	// composition finding the system flagged. §13.3's own row-2/row-5
+	// per-PR judgment calls (approve a plan, edit a verdict, dismiss a
+	// finding with a rebuttal) all presume the human is exercising
+	// ordinary reviewing judgment on a signal that might be a false
+	// positive; this one is a human electing to proceed AS IS, in spite
+	// of a flagged cross-PR risk the composition pass has no lower-stakes
+	// way to express, so it sits at the same admin-only tier this row
+	// already reserves for "this changes what ships/runs with the safety
+	// net now bypassed" decisions.
+	//
+	// The companion "Block release" action deliberately reuses
+	// ActionEditReviewVerdict (row 5) instead of a new action: blocking is
+	// the SAFETY-additive response to a composition finding — the exact
+	// same "maintainer-level review-adjacent write" shape
+	// ActionEditReviewVerdict/ActionRetriggerReview/reviewfindings.go's
+	// own rebuttal-dismissal action already cover, never an override of
+	// anything. Only the risk-accepting direction (ship anyway) gets the
+	// stricter, admin-only row.
+	ActionAcknowledgeReleaseComposition Action = "acknowledge_release_composition"
+	// ActionUnblockReleaseComposition covers the "Unblock" action that
+	// reopens a maintainer's own "Block release" decision back to pending
+	// (§12.2 item 9, §15.3 -- POST /api/sessions/{sessionID}/
+	// release-manifest/unblock, internal/adapters/inbound/httpapi/
+	// releasecompositiondecision.go). Admin only, this SAME row as
+	// ActionAcknowledgeReleaseComposition immediately above -- a confirmed-
+	// major fix: without this action a maintainer's Block was terminal
+	// (internal/domain/review.compositionDecisionTransitions carried no
+	// outgoing edge for CompositionDecisionBlocked at all), which
+	// permanently voided ActionAcknowledgeReleaseComposition's own
+	// admin-only override for that release -- a LOWER-privileged action
+	// (row 5, maintainer+) a HIGHER-privileged one (row 6, admin only)
+	// could never undo, inverting this matrix's own "admin can always do
+	// at least what a maintainer can" property everywhere else. Placed at
+	// row 6 rather than row 5 (unlike the companion "Block release"
+	// action's own ActionEditReviewVerdict reuse): undoing a
+	// safety-additive maintainer action is itself the SAME class of
+	// risk-accepting override ActionAcknowledgeReleaseComposition's own
+	// doc comment already reasons about, not an ordinary review-adjacent
+	// write -- only the tier that may ship DESPITE a composition finding
+	// may also remove the safety block a maintainer placed on one, even
+	// though removing it alone does not yet ship anything (that still
+	// requires the separate, still admin-only Acknowledge & ship call).
+	ActionUnblockReleaseComposition Action = "unblock_release_composition"
 
 	// ActionViewShadowLedger backs, alongside ActionActivateShadowLedger
 	// immediately below, the shadow-operator surface (§30.6/§30.9): the
@@ -570,6 +622,8 @@ var AllActions = []Action{
 	ActionConfigureReviewDepth,
 	ActionConfigureReviewCostBudget,
 	ActionConfigurePreviewLinks,
+	ActionAcknowledgeReleaseComposition,
+	ActionUnblockReleaseComposition,
 	ActionViewShadowLedger,
 	ActionActivateShadowLedger,
 }

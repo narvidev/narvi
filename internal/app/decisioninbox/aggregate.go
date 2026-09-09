@@ -444,10 +444,10 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 	// below), is the right session id for this purpose.
 	sessionID := resolveReviewSessionID(ctx, deps, repoFullName, pr.Number)
 
-	// isReleaseCut/manifestFindingsCount/aggregateReviewTriggered resolve
-	// this PR's own release-cut status -- see resolveReleaseCut's own doc
-	// comment.
-	isReleaseCut, manifestFindingsCount, aggregateReviewTriggered, manifestCoveragePartial := resolveReleaseCut(ctx, deps, repoFullName, pr.Number)
+	// isReleaseCut/manifestFindingsCount/aggregateReviewTriggered/
+	// compositionReviewed/compositionDecision resolve this PR's own
+	// release-cut status -- see resolveReleaseCut's own doc comment.
+	isReleaseCut, manifestFindingsCount, aggregateReviewTriggered, manifestCoveragePartial, compositionReviewed, compositionDecision := resolveReleaseCut(ctx, deps, repoFullName, pr.Number)
 
 	item := Item{
 		RepoFullName:             repoFullName,
@@ -469,6 +469,8 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 		ManifestFindingsCount:    manifestFindingsCount,
 		AggregateReviewTriggered: aggregateReviewTriggered,
 		ManifestCoveragePartial:  manifestCoveragePartial,
+		CompositionReviewed:      compositionReviewed,
+		CompositionDecision:      compositionDecision,
 	}
 	item.AgeSeconds = int64(decisioninbox.Age(item.EnteredQueueAt, now).Seconds())
 	item.Stale = decisioninbox.IsStale(item.EnteredQueueAt, now, deps.Timeouts.DecisionInboxStaleAfter)
@@ -966,17 +968,32 @@ func resolveReviewSessionID(ctx context.Context, deps Deps, repoFullName string,
 // in the posted comment, GetReleaseManifestReadout exposes it as
 // `coveragePartial` -- so the inbox row carries it too rather than being
 // the one place a truncated scan reads as a clean audit.
-func resolveReleaseCut(ctx context.Context, deps Deps, repoFullName string, prNumber int) (isReleaseCut bool, manifestFindingsCount int, aggregateReviewTriggered bool, manifestCoveragePartial bool) {
+//
+// compositionReviewed/compositionDecision (confirmed-major fix) carry
+// §15.3's own composition-review completion/decision state through --
+// the SAME composition_reviewed_at/composition_decision columns
+// GetReleaseManifestReadout already renders as compositionReviewedAt/
+// compositionDecision -- so this row's own chip (decisionInboxFormat.ts's
+// releaseChipData) can stop rendering "aggregate review needed" forever
+// once the pass has actually run and been decided. compositionDecision
+// defaults to "" (never review.CompositionDecisionPending's own "pending"
+// string) when compositionReviewed is false -- meaningless in that state,
+// mirroring manifestFindingsCount's own identical "meaningless unless
+// isReleaseCut" gate, and doc.go's own "an unset field is never confused
+// with a real value" discipline.
+func resolveReleaseCut(ctx context.Context, deps Deps, repoFullName string, prNumber int) (isReleaseCut bool, manifestFindingsCount int, aggregateReviewTriggered bool, manifestCoveragePartial bool, compositionReviewed bool, compositionDecision string) {
 	if deps.ReleaseManifestChecks == nil {
-		return false, 0, false, false
+		return false, 0, false, false, false, ""
 	}
 	check, err := deps.ReleaseManifestChecks.GetLatest(ctx, repoFullName, int32(prNumber))
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			platform.Logger(ctx).Error("decisioninbox: resolve release cut failed", "error", err, "repo", repoFullName, "pr_number", prNumber)
 		}
-		return false, 0, false, false
+		return false, 0, false, false, false, ""
 	}
+	compositionReviewed = check.CompositionReviewedAt.Valid
+	compositionDecision = check.CompositionDecision
 
 	var findings []json.RawMessage
 	if err := json.Unmarshal(check.Findings, &findings); err != nil {
@@ -995,9 +1012,9 @@ func resolveReleaseCut(ctx context.Context, deps Deps, repoFullName string, prNu
 		// this row is not a complete audit" -- rather than inventing a
 		// second sentinel for a corrupt row nobody can act on
 		// differently.
-		return true, 0, check.AggregateReviewTriggered, true
+		return true, 0, check.AggregateReviewTriggered, true, compositionReviewed, compositionDecision
 	}
-	return true, len(findings), check.AggregateReviewTriggered, check.CoveragePartial
+	return true, len(findings), check.AggregateReviewTriggered, check.CoveragePartial, compositionReviewed, compositionDecision
 }
 
 // buildPlanItems returns every plan-mode plan actorUserID/actorRole is

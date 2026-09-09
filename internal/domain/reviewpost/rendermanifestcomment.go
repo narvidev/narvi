@@ -62,7 +62,7 @@ func RenderManifestComment(findings []review.ManifestFinding, constituentPRCount
 	}
 
 	if aggregateReviewTriggered {
-		b.WriteString("**Composition check**: this release meets the criteria for an aggregate diff review (§15.3) -- multiple constituent PRs converge on the same subsystem, a high-risk PR is present, or a merge required manually resolving a conflict.\n\n")
+		b.WriteString("**Composition check**: this release meets the criteria for an aggregate diff review (§15.3) -- multiple constituent PRs converge on the same subsystem, a high-risk PR is present, a merge required manually resolving a conflict, or this check's own coverage of the release was partial (a truncated scan is itself treated as a reason to run the composition pass, never a silent skip).\n\n")
 	} else {
 		b.WriteString("**Composition check**: not triggered -- none of §15.3's OR-conditions were met.\n\n")
 	}

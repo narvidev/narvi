@@ -132,6 +132,27 @@ type Item struct {
 	// the one consumer of that row that claims a completeness guarantee
 	// the port call never gave.
 	ManifestCoveragePartial bool
+	// CompositionReviewed/CompositionDecision are §15.3's own composition-
+	// review COMPLETION/DECISION state -- confirmed-major fix: before this
+	// pair existed, this row's own chip rendering (decisionInboxFormat.ts's
+	// releaseChipData) had only AggregateReviewTriggered to go on, so it
+	// rendered the SAME "aggregate review needed" text forever, even after
+	// the composition pass had actually run, found (or not found) real
+	// findings, AND been decided (Block/Acknowledge/Unblock) -- a human
+	// acting on the queue could not tell "still needs the pass to run" from
+	// "already handled" without leaving this row entirely. Set ONLY when
+	// IsRelease is true, mirroring ManifestFindingsCount/
+	// ManifestCoveragePartial's own identical gate immediately above.
+	// CompositionReviewed is release_manifest_checks.composition_reviewed_at
+	// IS NOT NULL (§15.3's own "not yet available" sentinel, the SAME fact
+	// GetReleaseManifestReadout's own compositionReviewedAt renders).
+	// CompositionDecision mirrors internal/domain/review.CompositionDecision's
+	// own three values verbatim ("pending"/"blocked"/"acknowledged") --
+	// meaningless (left at its Go zero value, "") whenever
+	// CompositionReviewed is false, exactly like ManifestFindingsCount is
+	// meaningless whenever IsRelease is false.
+	CompositionReviewed bool
+	CompositionDecision string
 
 	// Plan fields (KindAwaitingApproval, non-handoff).
 	PlanID string
