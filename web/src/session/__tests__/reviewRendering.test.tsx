@@ -294,10 +294,40 @@ describe('ReleaseReviewView rendering -- adversarial manifest content stays text
     expect(html).toContain('None of the composition criteria were met')
   })
 
-  it('renders "pending", never an empty findings list, while the composition pass has not completed', () => {
-    const readout = baseManifestReadout({ aggregateReviewTriggered: true })
+  // Fixed for the right reason (coordinator-flagged regression): this
+  // test used to pass `aggregateReviewTriggered: true` ALONE, with no
+  // compositionHeadSha -- which is the EXACT wire shape a genuinely
+  // DECLINED dispatch produces (dispatchCompositionReview's own template/
+  // diff-fetch failure never gets this far, and never records
+  // composition_head_sha), not the "genuinely dispatched, awaiting
+  // completion" state its own name claims. It was passing for the wrong
+  // reason: "Pending" text happened to render for BOTH states, back when
+  // this file could not tell them apart at all. compositionHeadSha now
+  // added so this test actually exercises the "pending" branch of
+  // compositionPassState, not the "declined" one.
+  it('renders "pending", never an empty findings list, while the composition pass has been genuinely dispatched and is awaiting completion', () => {
+    const readout = baseManifestReadout({ aggregateReviewTriggered: true, compositionHeadSha: 'deadbeefcafe0102030405060708090a0b0c0d0e' })
     const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} sessionId="s1" />)
     expect(html).toContain('Pending')
+    expect(html).toContain('check back shortly')
+    expect(html).not.toContain('No composition findings')
+    expect(html).not.toContain('will not be retried automatically')
+  })
+
+  // New coverage for the state the fixed test above no longer covers:
+  // triggered, but compositionHeadSha is STILL null -- the pass was
+  // never actually dispatched (a declined template/diff fetch, or a
+  // failed turn insert) and never will be (no retry). This must render
+  // as an honest terminal state, never the "Pending... check back
+  // shortly" text that promises a completion this system will never
+  // deliver.
+  it('renders an honest "declined, will not retry" state when the pass was never actually dispatched (compositionHeadSha null)', () => {
+    const readout = baseManifestReadout({ aggregateReviewTriggered: true })
+    const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} sessionId="s1" />)
+    expect(html).toContain('could not be dispatched')
+    expect(html).toContain('will not be retried automatically')
+    expect(html).not.toContain('has been dispatched but has not completed yet')
+    expect(html).not.toContain('check back shortly')
     expect(html).not.toContain('No composition findings')
   })
 
@@ -397,6 +427,132 @@ describe('ReleaseReviewView rendering -- adversarial manifest content stays text
     const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} sessionId="s1" />)
     expect(html).not.toContain('acknowledged &amp; shipped')
     expect(html).not.toContain('acknowledged & shipped')
+  })
+
+  // Test-integrity fix: compositionDecisionSummaryText (the SECOND half
+  // of the closed-enum fix, alongside compositionDecisionChip immediately
+  // above) was never actually exercised with its own fail-open path
+  // reachable -- the out-of-enum test above never sets compositionDecisionAt,
+  // and `compositionDecisionSummaryText(...) && readout.compositionDecisionAt`
+  // short-circuits false regardless of what the function itself returns
+  // whenever decisionAt is absent, which baseManifestReadout's own
+  // defaults never set. This reproduces the SAME out-of-enum value WITH
+  // decisionAt populated (the shape that actually reaches this branch),
+  // proving the function's own default case, not just the chip's.
+  it('an out-of-enum compositionDecision with compositionDecisionAt SET never renders a fabricated summary line', () => {
+    const readout = baseManifestReadout({
+      aggregateReviewTriggered: true,
+      compositionReviewedAt: '2026-08-20T11:00:00Z',
+      compositionFindings: [],
+      // @ts-expect-error -- deliberately out-of-enum, see the test immediately above.
+      compositionDecision: 'garbled',
+      compositionDecisionAt: '2026-08-20T12:00:00Z',
+    })
+    const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} sessionId="s1" />)
+    expect(html).not.toContain('Acknowledged &amp; shipped')
+    expect(html).not.toContain('Acknowledged & shipped')
+    expect(html).not.toContain('Blocked')
+  })
+
+  // Minor fix: coveragePartial describes §15.2's own CONSTITUENT-PR
+  // LISTING completeness (ListMergedBetween's own truncated return) --
+  // NEVER the composition diff itself (that is compositionDiffTruncated,
+  // a separate field). A prior version of this caveat's own wording
+  // conflated the two ("treat the composition result below as run over a
+  // possibly-incomplete diff"), blaming the wrong artifact.
+  it('the coveragePartial caveat names the constituent-PR listing, never the composition diff', () => {
+    const readout = baseManifestReadout({ coveragePartial: true, aggregateReviewTriggered: true })
+    const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} sessionId="s1" />)
+    expect(html).toContain('constituent-PR listing')
+    expect(html).not.toContain('possibly-incomplete diff')
+  })
+
+  it('renders no coveragePartial caveat at all when coveragePartial is false', () => {
+    const readout = baseManifestReadout({ coveragePartial: false, aggregateReviewTriggered: true })
+    const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} sessionId="s1" />)
+    expect(html).not.toContain('constituent-PR listing')
+  })
+
+  // Minor fix: the head-sha anchor line (compositionHeadSha, §15.3's own
+  // auditability fix) had no render test at all -- deletable with the
+  // suite green.
+  it('renders the reviewed-against head-sha anchor line once the pass has completed, including the truncated-diff caveat when set', () => {
+    const readout = baseManifestReadout({
+      aggregateReviewTriggered: true,
+      compositionReviewedAt: '2026-08-20T11:00:00Z',
+      compositionHeadSha: 'deadbeefcafe0102030405',
+      compositionDiffTruncated: true,
+    })
+    const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} sessionId="s1" />)
+    expect(html).toContain('Reviewed against')
+    expect(html).toContain('deadbeefcafe')
+    expect(html).toContain('truncated at its own fetch size cap')
+  })
+
+  it('omits the truncated-diff caveat on the anchor line when compositionDiffTruncated is false', () => {
+    const readout = baseManifestReadout({
+      aggregateReviewTriggered: true,
+      compositionReviewedAt: '2026-08-20T11:00:00Z',
+      compositionHeadSha: 'deadbeefcafe0102030405',
+      compositionDiffTruncated: false,
+    })
+    const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} sessionId="s1" />)
+    expect(html).toContain('Reviewed against')
+    expect(html).not.toContain('truncated at its own fetch size cap')
+  })
+
+  // Minor fix: the Unblock button (the confirmed-major "unblock path"
+  // fix's own UI half) had no render test at all -- deletable with the
+  // suite green.
+  it('renders the Unblock button only when compositionDecision is blocked AND canUnblock is true', () => {
+    const blockedReadout = baseManifestReadout({
+      aggregateReviewTriggered: true,
+      compositionReviewedAt: '2026-08-20T11:00:00Z',
+      compositionFindings: [{ kind: 'other', detail: 'something worth a human look' }],
+      compositionDecision: 'blocked',
+      compositionDecisionAt: '2026-08-20T12:00:00Z',
+    })
+
+    const withUnblock = withQueryClient(<ReleaseManifestBody readout={blockedReadout} sessionId="s1" canUnblock={true} />)
+    expect(withUnblock).toContain('Unblock')
+
+    const withoutUnblock = withQueryClient(<ReleaseManifestBody readout={blockedReadout} sessionId="s1" canUnblock={false} />)
+    expect(withoutUnblock).not.toContain('Unblock')
+
+    const pendingReadout = baseManifestReadout({
+      aggregateReviewTriggered: true,
+      compositionReviewedAt: '2026-08-20T11:00:00Z',
+      compositionDecision: 'pending',
+    })
+    const pendingWithCanUnblock = withQueryClient(<ReleaseManifestBody readout={pendingReadout} sessionId="s1" canUnblock={true} />)
+    expect(pendingWithCanUnblock).not.toContain('Unblock')
+  })
+
+  // Minor fix: an Unblock reopens compositionDecision back to 'pending'
+  // (internal/domain/review.CompositionDecisionActionUnblock) but WITH
+  // compositionDecisionAt populated (every transition sets it, including
+  // this one) -- before this fix that combination rendered byte-for-byte
+  // identically to a release nobody had ever decided on, leaving a prior
+  // Block with no trace on this screen at all.
+  it('a reopened (pending, but compositionDecisionAt set) release renders a distinct "Reopened" note, never identical to never-decided', () => {
+    const neverDecided = baseManifestReadout({
+      aggregateReviewTriggered: true,
+      compositionReviewedAt: '2026-08-20T11:00:00Z',
+      compositionDecision: 'pending',
+      compositionDecisionAt: null,
+    })
+    const neverDecidedHtml = renderToStaticMarkup(<ReleaseManifestBody readout={neverDecided} sessionId="s1" />)
+    expect(neverDecidedHtml).not.toContain('Reopened')
+
+    const reopened = baseManifestReadout({
+      aggregateReviewTriggered: true,
+      compositionReviewedAt: '2026-08-20T11:00:00Z',
+      compositionDecision: 'pending',
+      compositionDecisionAt: '2026-08-20T12:00:00Z',
+    })
+    const reopenedHtml = renderToStaticMarkup(<ReleaseManifestBody readout={reopened} sessionId="s1" />)
+    expect(reopenedHtml).toContain('Reopened')
+    expect(reopenedHtml).not.toEqual(neverDecidedHtml)
   })
 })
 

@@ -242,3 +242,58 @@ func TestGetReleaseManifestReadout_CompositionDecided_PopulatesDecisionFields(t 
 		t.Error("CompositionDecisionAt is nil, want a real timestamp")
 	}
 }
+
+// TestGetReleaseManifestReadout_LegacyNullTriggerReasons_RendersEmptyArray
+// is a minor fix's own regression test, against a real Postgres round
+// trip: aggregate_review_trigger_reasons is inserted here as a LITERAL
+// JSON null -- exactly the bytes persist.go's own pre-fix marshalJSONArray
+// used to write for every non-triggering release (see that function's
+// own doc comment) and exactly what a row already sitting in a real
+// database from before that fix still contains today. The wire response
+// must render a present, empty array, never a JSON null -- the SAME
+// "never persist/render a JSON null for a required array" discipline
+// this Step's own blocking finding already established for
+// compositionFindings, applied here to a second field the adversarial
+// review separately caught leaking the identical defect.
+func TestGetReleaseManifestReadout_LegacyNullTriggerReasons_RendersEmptyArray(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	owner, token := rig.createAuthenticatedUser(ctx, t)
+	const repoFullName = "acme/readout-legacy-null-reasons"
+	const prNumber = 55
+	session := rig.createOwnedGitHubReviewSession(ctx, t, owner.ID, repoFullName, prNumber)
+
+	if _, err := rig.releaseManifestChecks.Insert(ctx, sqlcgen.InsertReleaseManifestCheckParams{
+		SessionID: session.ID, RepoFullName: repoFullName, PrNumber: prNumber,
+		BaseRef: "main", HeadRef: "release/2026.09", ConstituentPrCount: 1,
+		AggregateReviewTriggered: false,
+		// The literal bytes a pre-fix marshalJSONArray(nil) produced.
+		AggregateReviewTriggerReasons: []byte(`null`),
+		Findings:                      []byte(`[]`),
+		MergedPrs:                     []byte(`[]`),
+	}); err != nil {
+		t.Fatalf("insert release manifest check: %v", err)
+	}
+
+	raw := map[string]any{}
+	status := rig.doJSON(t, http.MethodGet, "/api/sessions/"+session.ID.String()+"/release-manifest", nil, &raw, token)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", status, http.StatusOK)
+	}
+	reasons, ok := raw["aggregateReviewTriggerReasons"].([]any)
+	if !ok {
+		t.Fatalf("aggregateReviewTriggerReasons = %v (%T), want a present JSON array, never null", raw["aggregateReviewTriggerReasons"], raw["aggregateReviewTriggerReasons"])
+	}
+	if len(reasons) != 0 {
+		t.Errorf("aggregateReviewTriggerReasons = %v, want empty", reasons)
+	}
+
+	var typed restdtos.ReleaseManifestReadout
+	status = rig.doJSON(t, http.MethodGet, "/api/sessions/"+session.ID.String()+"/release-manifest", nil, &typed, token)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", status, http.StatusOK)
+	}
+	if typed.AggregateReviewTriggerReasons == nil {
+		t.Error("typed AggregateReviewTriggerReasons is nil, want a non-nil (possibly empty) slice")
+	}
+}

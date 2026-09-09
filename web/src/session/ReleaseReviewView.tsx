@@ -4,19 +4,28 @@
 //
 // This closes the screen's own named gap: the composition-focused
 // aggregate diff review pass (§15.3) is now actually dispatched, and this
-// view renders its real result -- but the result has THREE genuinely
-// distinct states, never collapsed into one:
+// view renders its real result -- but the result has FOUR genuinely
+// distinct states, never collapsed into one (see compositionPassState's
+// own doc comment for the full "declined vs. pending" reasoning a prior
+// version of this file got wrong):
 //
 //   1. aggregateReviewTriggered is false: none of §15.3's composition
 //      criteria were met for this release, so no aggregate-diff pass
 //      ever runs for it -- "not applicable", not a gap.
-//   2. aggregateReviewTriggered is true but compositionReviewedAt is
-//      null: the pass was dispatched but has not completed (or its
-//      dispatch itself failed) -- "pending", never rendered as zero
+//   2. aggregateReviewTriggered is true, compositionHeadSha is null:
+//      the pass was NEVER actually dispatched (its own template/diff/
+//      head-sha fetch failed, or the turn insert itself failed) --
+//      "declined", a HONEST TERMINAL state, never rendered as "pending"/
+//      "check back shortly" (this system has no retry for a declined
+//      composition dispatch, releasemanifestpending.go's own "no
+//      revisit, no retry, no backoff" precedent).
+//   3. aggregateReviewTriggered is true, compositionHeadSha is set,
+//      compositionReviewedAt is null: the pass WAS genuinely dispatched
+//      and is awaiting completion -- "pending", never rendered as zero
 //      findings. This is the sentinel §21's own "not yet computed" rule
-//      exists to protect: a real zero (state 3, empty findings) and "we
+//      exists to protect: a real zero (state 4, empty findings) and "we
 //      do not know yet" (this state) must never render identically.
-//   3. compositionReviewedAt is set: a real result, findings or none,
+//   4. compositionReviewedAt is set: a real result, findings or none,
 //      plus the Block release / Acknowledge & ship actions when
 //      compositionDecision is still "pending".
 //
@@ -146,6 +155,42 @@ function compositionDecisionChip(decision: string) {
     default:
       return null
   }
+}
+
+/**
+ * compositionPassState distinguishes "genuinely dispatched, awaiting
+ * completion" from "never actually dispatched at all" -- both of which
+ * render as compositionReviewedAt == null, the ONE signal a prior
+ * version of this file used alone (`!readout.compositionReviewedAt`) to
+ * mean "Pending... has been dispatched but has not completed yet...
+ * check back shortly". That claim is false whenever
+ * dispatchCompositionReview itself declined (a failed template fetch, a
+ * failed diff fetch -- exactly the failure mode a LARGE, truncated
+ * release is most likely to hit, since run.go now also treats
+ * coveragePartial as its own trigger) -- and this system has NO retry
+ * for a declined dispatch (release_manifest_pending's own claim-and-
+ * delete-in-one-statement design, "no revisit, no retry, no backoff"),
+ * so "check back shortly" was not just momentarily wrong, it was a
+ * promise this system would never keep.
+ *
+ * compositionHeadSha is the fact that tells the two apart: it is
+ * recorded at DISPATCH time (internal/app/releasereview.
+ * dispatchCompositionReview's own UpdateCompositionAnchor call),
+ * immediately after the composition review turn is successfully
+ * created -- strictly BEFORE that turn ever completes and posts
+ * findings (compositionReviewedAt). A row can therefore be in
+ * exactly one of three states once aggregateReviewTriggered is true:
+ * headSha null (dispatch never happened), headSha set + reviewedAt null
+ * (dispatched, awaiting completion), or reviewedAt set (a real result).
+ * The server already shipped compositionHeadSha; this function is what
+ * was missing to actually read it.
+ */
+export type CompositionPassState = 'declined' | 'pending' | 'reviewed'
+
+export function compositionPassState(readout: Pick<ReleaseManifestReadout, 'compositionReviewedAt' | 'compositionHeadSha'>): CompositionPassState {
+  if (readout.compositionReviewedAt) return 'reviewed'
+  if (readout.compositionHeadSha) return 'pending'
+  return 'declined'
 }
 
 function compositionDecisionSummaryText(decision: string): string | null {
@@ -333,11 +378,17 @@ export function ReleaseManifestBody({ readout, sessionId, canBlock = false, canA
 
           {readout.coveragePartial && (
             <p style={{ margin: '6px 0 0', color: 'var(--warn)', fontSize: 'var(--text-base)' }}>
-              This release's own constituent PR listing was incomplete when this check ran -- treat the composition result below as run over a possibly-incomplete diff, never a complete audit.
+              This release's own constituent PR listing (§15.2, the manifest table above) was incomplete when this check ran -- whether this composition pass was triggered at all may not reflect every constituent PR in this release. This describes the constituent-PR listing, never the composition diff itself below.
             </p>
           )}
 
-          {!readout.compositionReviewedAt && (
+          {compositionPassState(readout) === 'declined' && (
+            <p style={{ color: 'var(--crit)', fontSize: 'var(--text-base)' }}>
+              This release's own composition pass could not be dispatched (its prompt template or its diff could not be fetched) and will not be retried automatically for this release -- there is no result, and none is coming. A maintainer may need to re-trigger the review manually.
+            </p>
+          )}
+
+          {compositionPassState(readout) === 'pending' && (
             <p style={{ color: 'var(--faint)', fontSize: 'var(--text-base)' }}>
               Pending: the composition-focused aggregate diff review pass has been dispatched but has not completed yet. This is not a result -- check back shortly.
             </p>
@@ -379,6 +430,29 @@ export function ReleaseManifestBody({ readout, sessionId, canBlock = false, canA
           )}
 
           {readout.compositionDecision === 'blocked' && canUnblock && <UnblockAction sessionId={sessionId} />}
+
+          {/*
+            Minor fix: a Block that was later Unblocked reopens
+            compositionDecision back to 'pending' (internal/domain/review.
+            CompositionDecisionActionUnblock's own doc comment) -- with NO
+            trace of that on this screen, a reopened-but-not-yet-redecided
+            release rendered byte-for-byte identically to a release nobody
+            had ever looked at. compositionDecisionAt IS still populated
+            by an Unblock (UpdateCompositionDecision sets it on every
+            transition, including this one) even though compositionDecision
+            itself reads 'pending' again -- that combination (pending AND
+            a real decisionAt) can ONLY mean "reopened", never "never
+            decided" (a truly-never-decided row has decisionAt null), so
+            it is what this note keys on. No user name shown, matching
+            the summary line immediately below for blocked/acknowledged --
+            compositionDecisionBy is a raw id with no display-name
+            resolution wired into this readout.
+          */}
+          {readout.compositionDecision === 'pending' && readout.compositionDecisionAt && (
+            <p style={{ color: 'var(--faint)', fontSize: 'var(--text-base)', marginTop: 8 }}>
+              Reopened {formatRelativeTime(readout.compositionDecisionAt)} -- a previous Block was undone; nothing is currently blocking this release.
+            </p>
+          )}
 
           {compositionDecisionSummaryText(readout.compositionDecision) && readout.compositionDecisionAt && (
             <p style={{ color: 'var(--faint)', fontSize: 'var(--text-base)', marginTop: 8 }}>

@@ -415,3 +415,90 @@ func TestBlockReleaseComposition_RecordsAuditLog(t *testing.T) {
 	}
 }
 
+// TestBlockReleaseComposition_AuditLogWriteFails_RollsBackDecision proves
+// the transactional-audit fix (M5, decideReleaseCompositionOnTx) for
+// real, with a genuine database-level fault -- NO production code seam
+// of any kind: a CHECK(false) constraint added directly to audit_log
+// makes every subsequent INSERT into it fail, exactly simulating "the
+// audit half of this transaction failed" without touching a single line
+// of the handler under test. Proves the guarded composition_decision
+// UPDATE rolled back with it (the row stays 'pending', decision_by stays
+// unset) -- an audit failure must never leave an irreversible,
+// unattributed override. The SAME call is then repeated once the fault
+// is cleared, proving it succeeds normally afterward.
+//
+// Deliberately NOT t.Parallel(): this temporarily degrades the audit_log
+// table this whole package's test binary shares (httpapi_integration_
+// test.go's own "one pool, shared with every other test in this
+// package" precedent -- every OTHER test that records an audit_log
+// entry would also fail while the constraint is active). go test's own
+// scheduling already guarantees this needs no further isolation: every
+// non-t.Parallel() top-level test (this one included) runs to full
+// completion -- add constraint, assert, drop constraint, assert again --
+// before the test binary's own parked t.Parallel() siblings ever begin
+// executing their bodies, so no other test's audit_log write can
+// possibly race this constraint's own brief lifetime.
+func TestBlockReleaseComposition_AuditLogWriteFails_RollsBackDecision(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	session := rig.createSession(ctx, t)
+	check := createReviewedReleaseManifestCheck(ctx, t, rig, session)
+
+	admin, adminToken := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleAdmin)
+
+	// NOT VALID: enforced on every NEW row (INSERT/UPDATE) from this
+	// point on, never validated against audit_log's own pre-existing
+	// rows (every other test's already-committed audit trail), which
+	// could not possibly satisfy CHECK(false) and would otherwise make
+	// this ALTER TABLE itself fail outright.
+	if _, err := rig.pool.Exec(ctx, `ALTER TABLE audit_log ADD CONSTRAINT probe_no_insert CHECK (false) NOT VALID`); err != nil {
+		t.Fatalf("add probe constraint: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := rig.pool.Exec(context.Background(), `ALTER TABLE audit_log DROP CONSTRAINT IF EXISTS probe_no_insert`); err != nil {
+			t.Errorf("drop probe constraint (cleanup): %v", err)
+		}
+	})
+
+	status := blockReleaseComposition(t, rig, session.ID.String(), adminToken, nil)
+	if status != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d (the audit_log INSERT must fail with the probe constraint active)", status, http.StatusInternalServerError)
+	}
+
+	row, err := rig.releaseManifestChecks.GetBySessionID(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("GetBySessionID: %v", err)
+	}
+	if row.ID != check.ID {
+		t.Fatalf("row id changed unexpectedly")
+	}
+	if row.CompositionDecision != "pending" {
+		t.Fatalf("composition_decision = %q, want %q -- the guarded UPDATE must have rolled back when the audit-log half of the SAME transaction failed (decideReleaseCompositionOnTx)", row.CompositionDecision, "pending")
+	}
+	if row.CompositionDecisionBy.Valid {
+		t.Errorf("composition_decision_by = %v, want invalid/unset -- never partially applied", row.CompositionDecisionBy)
+	}
+
+	// Drop the constraint EARLY (not just via t.Cleanup, which only runs
+	// at the very end) so the positive half below runs against a healthy
+	// table, and so this shared table is degraded for the shortest
+	// possible window.
+	if _, err := rig.pool.Exec(ctx, `ALTER TABLE audit_log DROP CONSTRAINT IF EXISTS probe_no_insert`); err != nil {
+		t.Fatalf("drop probe constraint: %v", err)
+	}
+
+	status = blockReleaseComposition(t, rig, session.ID.String(), adminToken, nil)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want %d (once the fault is cleared, the identical call must now succeed)", status, http.StatusOK)
+	}
+	row, err = rig.releaseManifestChecks.GetBySessionID(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("GetBySessionID: %v", err)
+	}
+	if row.CompositionDecision != "blocked" {
+		t.Errorf("composition_decision = %q, want %q", row.CompositionDecision, "blocked")
+	}
+	if row.CompositionDecisionBy != admin.ID {
+		t.Errorf("composition_decision_by = %v, want %v", row.CompositionDecisionBy, admin.ID)
+	}
+}

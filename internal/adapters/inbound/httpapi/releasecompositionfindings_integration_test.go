@@ -11,10 +11,12 @@ package httpapi_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
@@ -295,5 +297,48 @@ func TestPostReleaseCompositionFindings_NullFindings_NormalizesToEmptyArray(t *t
 	}
 	if string(updated.CompositionFindings) != "[]" {
 		t.Errorf("persisted composition_findings = %s, want the literal JSON array \"[]\", never a JSON null", updated.CompositionFindings)
+	}
+}
+
+// TestUpdateCompositionAnchor_GuardedCAS_SecondWriteConflicts is a minor
+// fix's own regression test: UpdateReleaseManifestCompositionAnchor's own
+// guarded UPDATE ("AND composition_head_sha IS NULL", queries/
+// releasemanifestchecks.sql) had no test at all -- mirrors
+// TestUpdateCompositionDecision_GuardedCAS_ConcurrentDecisionsRace's own
+// identical shape (releasecompositiondecision_integration_test.go) one
+// column over: the FIRST UpdateCompositionAnchor call for a given row
+// must win, and a SECOND call against the SAME already-anchored row
+// (dispatchCompositionReview's own guarded, best-effort write -- a
+// retried/duplicate dispatch attempt is the realistic trigger) must lose
+// with pgx.ErrNoRows, never silently overwrite the first-recorded anchor
+// with a different (potentially wrong) commit/truncated pair.
+func TestUpdateCompositionAnchor_GuardedCAS_SecondWriteConflicts(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	session := bareSessionWithSandbox(ctx, t, rig, "composition-anchor-cas")
+	check := createReleaseManifestCheck(ctx, t, rig, session.ID)
+
+	first, err := rig.releaseManifestChecks.UpdateCompositionAnchor(ctx, check.ID, "deadbeef1111", false)
+	if err != nil {
+		t.Fatalf("first UpdateCompositionAnchor: %v", err)
+	}
+	if first.CompositionHeadSha == nil || *first.CompositionHeadSha != "deadbeef1111" {
+		t.Fatalf("first winner's own head sha = %v, want %q", first.CompositionHeadSha, "deadbeef1111")
+	}
+
+	_, err = rig.releaseManifestChecks.UpdateCompositionAnchor(ctx, check.ID, "cafecafe2222", true)
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("second (losing) UpdateCompositionAnchor error = %v, want pgx.ErrNoRows (the guarded UPDATE should have matched zero rows)", err)
+	}
+
+	final, err := rig.releaseManifestChecks.GetBySessionID(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("GetBySessionID: %v", err)
+	}
+	if final.CompositionHeadSha == nil || *final.CompositionHeadSha != "deadbeef1111" {
+		t.Errorf("final persisted composition_head_sha = %v, want %q (the second call must never have won)", final.CompositionHeadSha, "deadbeef1111")
+	}
+	if final.CompositionDiffTruncated == nil || *final.CompositionDiffTruncated != false {
+		t.Errorf("final persisted composition_diff_truncated = %v, want false (the first call's own value, never the second's)", final.CompositionDiffTruncated)
 	}
 }

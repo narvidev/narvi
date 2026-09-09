@@ -264,8 +264,18 @@ func TestRun_TruncatedCoverageAloneTriggersCompositionDispatch(t *testing.T) {
 	diffFetcher := &fakeCompositionDiffFetcher{pr: githubapi.PullRequest{HeadSHA: "deadbeef", BaseRef: "main"}, diff: "diff"}
 	turns := &fakeCompositionTurnInserter{}
 	dispatch := &fakeCompositionDispatcher{}
+	checks := &fakeReleaseManifestCheckStore{}
 
-	releasereview.Run(context.Background(), discardLogger(), fullCompositionDeps(lister, outbox, templates, diffFetcher, turns, dispatch), releasereview.Input{
+	releasereview.Run(context.Background(), discardLogger(), releasereview.Deps{
+		SourceControl:          lister,
+		Outbox:                 outbox,
+		ReleaseManifestChecks:  checks,
+		CompositionTemplates:   templates,
+		CompositionDiffFetcher: diffFetcher,
+		CompositionTurns:       turns,
+		CompositionDispatch:    dispatch,
+		Timeouts:               platform.DefaultTimeouts(),
+	}, releasereview.Input{
 		SessionID: testSessionID(t),
 		Owner:     "acme", Repo: "widgets", PRNumber: 1, BaseRef: "main", HeadRef: "release/1.0", Token: "t",
 	})
@@ -277,15 +287,39 @@ func TestRun_TruncatedCoverageAloneTriggersCompositionDispatch(t *testing.T) {
 		t.Errorf("CompositionDispatch.EnsureDispatched calls = %d, want 1", dispatch.calls)
 	}
 
-	// The rendered outbox comment's own trigger reasons must name the
-	// truncation as a reason, not just silently dispatch with no
-	// human-readable explanation.
-	var payload githubapi.ReleaseManifestPayload
-	if err := json.Unmarshal(outbox.lastParams.Payload, &payload); err != nil {
-		t.Fatalf("decode outbox payload: %v", err)
+	// Test-integrity fix: a prior version of this assertion checked the
+	// rendered OUTBOX COMMENT body for the substring "coverage of the
+	// release was partial" -- text RenderManifestComment (reviewpost/
+	// rendermanifestcomment.go) ALREADY prints unconditionally whenever
+	// coveragePartial is true, entirely independent of why (or whether)
+	// the composition pass was dispatched at all (its own "Composition
+	// check" section only ever prints one of two FIXED strings, keyed on
+	// the bare aggregateReviewTriggered bool -- it never even receives
+	// the trigger REASONS list as a parameter). That assertion matched
+	// static boilerplate: it would have passed identically even if
+	// run.go's own `|| truncated` fold were deleted outright, as long as
+	// truncated was merely true. The actual claim this test is named for
+	// -- that a truncated listing is itself recorded as ITS OWN trigger
+	// REASON -- lives only in the PERSISTED row (release_manifest_checks.
+	// aggregate_review_trigger_reasons, written by persistReleaseManifestCheck),
+	// never in the posted comment -- so this now inspects the fake
+	// ReleaseManifestChecks store's own captured Insert params instead.
+	if !checks.lastInsertParams.AggregateReviewTriggered {
+		t.Fatalf("persisted AggregateReviewTriggered = false, want true")
 	}
-	if !strings.Contains(payload.Body, "coverage of the release was partial") {
-		t.Errorf("rendered comment does not explain the truncation-driven trigger -- body:\n%s", payload.Body)
+	var reasons []string
+	if err := json.Unmarshal(checks.lastInsertParams.AggregateReviewTriggerReasons, &reasons); err != nil {
+		t.Fatalf("decode persisted aggregate_review_trigger_reasons: %v", err)
+	}
+	found := false
+	for _, r := range reasons {
+		if strings.Contains(r, "constituent pull request listing was incomplete") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("persisted trigger reasons = %v, want one naming the truncated constituent-PR listing", reasons)
 	}
 }
 
@@ -318,6 +352,53 @@ func TestRun_AggregateReviewNotTriggered_NeverDispatchesCompositionReview(t *tes
 	}
 	if dispatch.calls != 0 {
 		t.Errorf("CompositionDispatch.EnsureDispatched calls = %d, want 0 (aggregate review never triggered)", dispatch.calls)
+	}
+}
+
+// TestRun_NonTriggeringRelease_PersistsEmptyArrayNeverJSONNull is a
+// minor fix's own regression test: persist.go's own marshalJSONArray had
+// a doc comment promising "a nil slice degrades to []byte(\"[]\"), never
+// a JSON null" that its own implementation never actually delivered
+// (only a json.Marshal ERROR triggered the fallback -- json.Marshal(nil
+// []string) legitimately succeeds and produces the literal bytes
+// `null`). review.AggregateReviewTriggerReasons returns exactly that nil
+// slice whenever none of §15.3's three criteria fired -- i.e. on every
+// NON-triggering release, the common case -- so
+// release_manifest_checks.aggregate_review_trigger_reasons persisted as
+// a literal SQL/JSON null, and releasemanifestreadout.go's own read side
+// then round-tripped that null straight back out onto the wire,
+// violating aggregateReviewTriggerReasons' own required-array contract
+// (contracts/rest/v1/dtos.schema.json) -- the SAME defect class as the
+// compositionFindings:null blocking finding, one field over. This proves
+// the persisted bytes are the literal, non-null "[]" for a genuinely
+// non-triggering, non-truncated release.
+func TestRun_NonTriggeringRelease_PersistsEmptyArrayNeverJSONNull(t *testing.T) {
+	t.Parallel()
+
+	lister := &fakeMergedPRLister{merged: []ports.MergedPR{
+		{Number: 1, Title: "an ordinary PR", HasApprovingReview: true},
+	}}
+	outbox := &fakeOutboxEnqueuer{}
+	checks := &fakeReleaseManifestCheckStore{}
+
+	releasereview.Run(context.Background(), discardLogger(), releasereview.Deps{
+		SourceControl:         lister,
+		Outbox:                outbox,
+		ReleaseManifestChecks: checks,
+		Timeouts:              platform.DefaultTimeouts(),
+	}, releasereview.Input{
+		SessionID: testSessionID(t),
+		Owner:     "acme", Repo: "widgets", PRNumber: 1, BaseRef: "main", HeadRef: "release/1.0", Token: "t",
+	})
+
+	if checks.insertCalls != 1 {
+		t.Fatalf("ReleaseManifestChecks.Insert calls = %d, want 1", checks.insertCalls)
+	}
+	if checks.lastInsertParams.AggregateReviewTriggered {
+		t.Fatalf("AggregateReviewTriggered = true, want false (this fixture matches none of §15.3's three criteria and is not truncated)")
+	}
+	if got := string(checks.lastInsertParams.AggregateReviewTriggerReasons); got != "[]" {
+		t.Errorf("persisted aggregate_review_trigger_reasons = %q, want the literal JSON array \"[]\", never a JSON null", got)
 	}
 }
 
@@ -559,8 +640,9 @@ func TestRun_CompositionTurnInsertFails_NeverDispatches(t *testing.T) {
 // write (migrations/000128_release_manifest_checks_composition_anchor.
 // up.sql) end to end, with no real DB.
 type fakeReleaseManifestCheckStore struct {
-	insertCalls int
-	insertedID  pgtype.UUID
+	insertCalls      int
+	insertedID       pgtype.UUID
+	lastInsertParams sqlcgen.InsertReleaseManifestCheckParams
 
 	anchorCalls         int
 	lastAnchorID        pgtype.UUID
@@ -569,8 +651,9 @@ type fakeReleaseManifestCheckStore struct {
 	anchorErr           error
 }
 
-func (f *fakeReleaseManifestCheckStore) Insert(_ context.Context, _ sqlcgen.InsertReleaseManifestCheckParams) (sqlcgen.ReleaseManifestCheck, error) {
+func (f *fakeReleaseManifestCheckStore) Insert(_ context.Context, arg sqlcgen.InsertReleaseManifestCheckParams) (sqlcgen.ReleaseManifestCheck, error) {
 	f.insertCalls++
+	f.lastInsertParams = arg
 	f.insertedID = pgtype.UUID{Bytes: [16]byte{1, 2, 3, 4}, Valid: true}
 	return sqlcgen.ReleaseManifestCheck{ID: f.insertedID}, nil
 }

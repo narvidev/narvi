@@ -7599,7 +7599,10 @@ type ReleaseManifestReadout struct {
 	// itself truncated at its own size cap -- distinct from coveragePartial above
 	// (that flag describes the CONSTITUENT-PR LISTING §15.2's manifest check ran
 	// over; this one describes the single aggregate baseRef..headRef diff §15.3's
-	// composition pass reviewed). Null exactly when compositionHeadSha is null.
+	// composition pass reviewed). Null exactly when compositionHeadSha is null (the
+	// pass was never dispatched) -- set at the SAME dispatch-time write as
+	// compositionHeadSha, so the two share an identical null/non-null pattern even
+	// though compositionHeadSha alone is what a client should branch render state on.
 	CompositionDiffTruncated ReleaseManifestReadoutCompositionDiffTruncated `json:"compositionDiffTruncated,omitempty,omitzero" yaml:"compositionDiffTruncated,omitempty" mapstructure:"compositionDiffTruncated,omitempty"`
 
 	// §15.3's own composition findings -- empty either because compositionReviewedAt
@@ -7607,13 +7610,25 @@ type ReleaseManifestReadout struct {
 	// pass genuinely found nothing to report.
 	CompositionFindings []ReleaseCompositionFinding `json:"compositionFindings" yaml:"compositionFindings" mapstructure:"compositionFindings"`
 
-	// The commit sha compositionFindings was actually reviewed against -- recorded
-	// once, at composition-review DISPATCH time
-	// (internal/app/releasereview.dispatchCompositionReview), never at findings-post
-	// time. Null exactly when compositionReviewedAt is null (the pass was never
-	// dispatched, or dispatch itself declined for want of a live head sha/diff) -- a
+	// The commit sha compositionFindings was actually (or will be) reviewed against
+	// -- recorded once, at composition-review DISPATCH time
+	// (internal/app/releasereview.dispatchCompositionReview's own
+	// UpdateCompositionAnchor call, immediately after the composition-review turn is
+	// created), strictly BEFORE that turn ever completes and posts findings. Null
+	// means the pass was NEVER actually dispatched at all (its own prompt-template
+	// fetch, diff fetch, or turn insert declined/failed) -- a HONEST TERMINAL state
+	// this system does not retry, never merely 'not yet available'. Non-null does NOT
+	// imply compositionReviewedAt is also set: a real, live dispatch sets this field
+	// FIRST and compositionReviewedAt only later, once the turn actually completes --
+	// so 'non-null head sha, still-null compositionReviewedAt' is the ordinary,
+	// expected shape of a genuinely in-flight pass, not a contradiction. A
 	// confirmed-major auditability fix: a verdict attributed to a diff nobody can
-	// identify afterward is not auditable.
+	// identify afterward is not auditable, and (a related, confirmed-major fix) a
+	// caller that conflates 'never dispatched' with 'dispatched, still pending'
+	// renders a false promise of eventual completion for a pass that will never run.
+	// See web/src/session/ReleaseReviewView.tsx's own compositionPassState for the
+	// one place in this codebase that actually reads this field to distinguish
+	// 'declined' from 'pending'.
 	CompositionHeadSha ReleaseManifestReadoutCompositionHeadSha `json:"compositionHeadSha,omitempty,omitzero" yaml:"compositionHeadSha,omitempty" mapstructure:"compositionHeadSha,omitempty"`
 
 	// §15.3's own aggregate-diff composition review pass: when it actually POSTED its
@@ -7713,16 +7728,31 @@ func (j *ReleaseManifestReadoutCompositionDecision) UnmarshalJSON(value []byte) 
 // truncated at its own size cap -- distinct from coveragePartial above (that flag
 // describes the CONSTITUENT-PR LISTING §15.2's manifest check ran over; this one
 // describes the single aggregate baseRef..headRef diff §15.3's composition pass
-// reviewed). Null exactly when compositionHeadSha is null.
+// reviewed). Null exactly when compositionHeadSha is null (the pass was never
+// dispatched) -- set at the SAME dispatch-time write as compositionHeadSha, so the
+// two share an identical null/non-null pattern even though compositionHeadSha
+// alone is what a client should branch render state on.
 type ReleaseManifestReadoutCompositionDiffTruncated *bool
 
-// The commit sha compositionFindings was actually reviewed against -- recorded
-// once, at composition-review DISPATCH time
-// (internal/app/releasereview.dispatchCompositionReview), never at findings-post
-// time. Null exactly when compositionReviewedAt is null (the pass was never
-// dispatched, or dispatch itself declined for want of a live head sha/diff) -- a
+// The commit sha compositionFindings was actually (or will be) reviewed against --
+// recorded once, at composition-review DISPATCH time
+// (internal/app/releasereview.dispatchCompositionReview's own
+// UpdateCompositionAnchor call, immediately after the composition-review turn is
+// created), strictly BEFORE that turn ever completes and posts findings. Null
+// means the pass was NEVER actually dispatched at all (its own prompt-template
+// fetch, diff fetch, or turn insert declined/failed) -- a HONEST TERMINAL state
+// this system does not retry, never merely 'not yet available'. Non-null does NOT
+// imply compositionReviewedAt is also set: a real, live dispatch sets this field
+// FIRST and compositionReviewedAt only later, once the turn actually completes --
+// so 'non-null head sha, still-null compositionReviewedAt' is the ordinary,
+// expected shape of a genuinely in-flight pass, not a contradiction. A
 // confirmed-major auditability fix: a verdict attributed to a diff nobody can
-// identify afterward is not auditable.
+// identify afterward is not auditable, and (a related, confirmed-major fix) a
+// caller that conflates 'never dispatched' with 'dispatched, still pending'
+// renders a false promise of eventual completion for a pass that will never run.
+// See web/src/session/ReleaseReviewView.tsx's own compositionPassState for the one
+// place in this codebase that actually reads this field to distinguish 'declined'
+// from 'pending'.
 type ReleaseManifestReadoutCompositionHeadSha *string
 
 // §15.3's own aggregate-diff composition review pass: when it actually POSTED its

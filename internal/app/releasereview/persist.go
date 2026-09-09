@@ -59,15 +59,42 @@ type manifestFindingJSON struct {
 // slice to "[]" rather than a JSON null -- mirrors marshalTags/
 // marshalArchDecisions' own identical "a present, empty array, never
 // null" guarantee (internal/app/reviewverdict/convert.go).
+//
+// Minor fix (the same defect class the composition-findings blocking fix
+// closed, one level over): this function's own doc comment already
+// promised the "nil degrades to []" guarantee above, but the
+// implementation never actually delivered it -- json.Marshal(nil
+// []string) legitimately SUCCEEDS (no error at all) and produces the
+// literal 4 bytes `null`, so the previous `if err != nil` guard alone
+// never caught it. findingsWire/mergedWire (this file's own two other
+// callers) happened to never trigger this in practice, because both are
+// always built via `make([]T, len(x))`, which is never nil even for a
+// zero-length x -- but triggerReasons (review.AggregateReviewTriggerReasons,
+// aggregatereview.go) starts as a bare `var reasons []string` and returns
+// it un-touched whenever none of §15.3's three criteria fired, which is
+// nil. The result: every NON-triggering manifest check (the common case)
+// persisted aggregate_review_trigger_reasons as a literal SQL/JSON null,
+// which releasemanifestreadout.go's own json.Unmarshal into `var reasons
+// []string` decodes with NO error (unmarshaling JSON null into a slice
+// pointer succeeds, leaving it nil) -- so that handler's own initial,
+// correct `[]string{}` default got silently overwritten right back to
+// nil, and the wire response violated aggregateReviewTriggerReasons' own
+// contracts/rest/v1/dtos.schema.json required-array shape on every
+// non-triggering release. Checking the marshaled BYTES themselves (never
+// trust the absence of an error alone) closes this for every current and
+// future caller of this shared helper, not just the one that happened to
+// surface it.
 func marshalJSONArray(v any) []byte {
 	b, err := json.Marshal(v)
-	if err != nil {
+	if err != nil || string(b) == "null" {
 		// Every element type here is a plain struct/string/bool/int --
 		// json.Marshal cannot fail on these, mirroring marshalTags' own
 		// "cannot happen for this package's own types" precedent. Fail
 		// conservative anyway: an empty array persists rather than a
 		// panic taking down persistReleaseManifestCheck's own best-effort
-		// caller.
+		// caller. The string(b) == "null" arm is the ACTUAL common path
+		// this function exists to cover -- see this function's own doc
+		// comment above for the real, previously-unfixed bug it closes.
 		return []byte("[]")
 	}
 	return b

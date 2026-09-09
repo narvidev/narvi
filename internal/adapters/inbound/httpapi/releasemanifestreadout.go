@@ -235,11 +235,24 @@ func GetReleaseManifestReadout(
 			resp.CompositionDecisionAt = &decisionAt
 		}
 
+		// Minor fix: guard against BOTH a decode failure (the existing
+		// `err == nil` check) AND a successfully-decoded-but-nil result
+		// (a literal persisted JSON `null` -- json.Unmarshal("null", &x)
+		// succeeds with x left nil, no error at all) -- either one must
+		// leave resp.AggregateReviewTriggerReasons at its own already-set,
+		// non-nil `[]string{}` default (this function's own top struct
+		// literal) rather than overwrite it with a nil slice, which
+		// marshals as a JSON null and violates this field's own required-
+		// array contract (contracts/rest/v1/dtos.schema.json). Deliberately
+		// defensive on the READ side too, independent of persist.go's own
+		// marshalJSONArray fix: a row already persisted with a literal
+		// null (written before that fix ever ran) must still render
+		// honestly here, not just rows inserted after it.
 		var reasons []string
-		if err := json.Unmarshal(row.AggregateReviewTriggerReasons, &reasons); err == nil {
-			resp.AggregateReviewTriggerReasons = reasons
-		} else {
+		if err := json.Unmarshal(row.AggregateReviewTriggerReasons, &reasons); err != nil {
 			logger.Warn("httpapi: unmarshal aggregate_review_trigger_reasons failed, rendering as empty", "error", err)
+		} else if reasons != nil {
+			resp.AggregateReviewTriggerReasons = reasons
 		}
 
 		var findings []releaseManifestFindingJSON
