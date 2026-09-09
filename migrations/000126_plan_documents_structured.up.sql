@@ -1,0 +1,29 @@
+-- §12.2 item 3's own missing structured-plan schema: plan_documents
+-- (migrations/000112_plan_documents.up.sql, "§31.3's durability fix")
+-- already snapshots an approved plan's own PROSE durably, independent of
+-- the events log it was recovered from; this adds the SAME durability for
+-- the structured document (internal/domain/plan.ExtractStructured)
+-- recovered from that exact same prose, as a second, independently
+-- nullable column -- never folded into `content` itself, and never a
+-- second table: mirrors `content`'s own established "isolable, nullable
+-- sidecar" precedent, for the identical reason (a future retention policy
+-- can null out either column alone with a single-column UPDATE, without
+-- rewriting this row's own metadata or the other column).
+--
+-- Nullable at the schema level, not merely in application code: NULL is
+-- the ONLY representation of "no structure could be recovered" -- every
+-- plan that predates this column's own existence, and any future plan
+-- whose producing turn never emitted (or emitted and failed to validate)
+-- a ```plan-steps block. ExtractStructured's own doc comment is explicit
+-- that a genuinely empty steps array is folded into this SAME "no
+-- structure" case rather than kept distinct -- so there is no "valid but
+-- empty" JSON value this column is ever asked to hold; it is a document
+-- with at least one step, or it is NULL, never an empty array/object
+-- standing in for either.
+--
+-- This table's only writer (httpapi.DecidePlanOnTx's own
+-- snapshotApprovedPlanContent) is unaffected in shape: the new column is
+-- populated in the SAME insert as `content`, from the SAME already-
+-- recovered prose, so no new write path or transaction boundary is
+-- introduced.
+ALTER TABLE plan_documents ADD COLUMN structured_steps JSONB;

@@ -27,6 +27,7 @@ import (
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -553,8 +554,14 @@ func TestCreateTurnCore_AwaitingPlan_PlanModeTrue_Allowed(t *testing.T) {
 	if !wasCreated {
 		t.Fatal("wasCreated = false, want true (a plan_mode=true turn must never be gated)")
 	}
-	if created.Prompt == nil || *created.Prompt != "drop the retry" {
-		t.Errorf("created.Prompt = %v, want %q", created.Prompt, "drop the retry")
+	// §12.2 item 3's own structured-plan-document instruction is
+	// unconditionally prepended onto every plan_mode=true turn's prompt
+	// (plandomain.MaybeInjectStructureInstruction) -- this turn is exactly
+	// such a turn, so its own stored prompt carries that prefix, never the
+	// bare input string.
+	wantPrompt := plandomain.MaybeInjectStructureInstruction(true, "drop the retry")
+	if created.Prompt == nil || *created.Prompt != wantPrompt {
+		t.Errorf("created.Prompt = %v, want %q", created.Prompt, wantPrompt)
 	}
 	if !created.PlanMode {
 		t.Error("created.PlanMode = false, want true")

@@ -4,19 +4,24 @@
 // assistant text laid out) for use in the Slack/Linear plan-approval-
 // request notifications (outboxenqueue.go).
 //
-// There is no structured plan schema anywhere in this codebase (§12.2 item
-// 3's own "numbered steps with file refs, scope estimate" is rendered from
-// a plan turn's freeform assistant text, never parsed into a structured
-// shape -- see internal/domain/plan/content.go's own top doc comment, which
-// this function now delegates its actual scan to). So this does not
-// attempt to parse steps out of the model's own prose into any structured
-// shape -- it extracts the producing turn's own final streamed assistant
-// text VERBATIM (the plan document's own actual content, whatever shape
-// the model rendered it in, almost always already a numbered list given
-// how plan-mode turns are prompted) and lets the caller (Slack Block Kit /
-// Linear activity text, or -- the web UI's own GET .../plans,
-// internal/adapters/inbound/httpapi/plans.go) truncate/render it as plain
-// text.
+// This function itself does not attempt to parse steps out of the model's
+// own prose into any structured shape -- it extracts the producing turn's
+// own final streamed assistant text VERBATIM (the plan document's own
+// actual content, whatever shape the model rendered it in, almost always
+// already a numbered list given how plan-mode turns are prompted) and lets
+// the caller (Slack Block Kit / Linear activity text) truncate/render it
+// as plain text. §12.2 item 3's own "numbered steps with file refs, scope
+// estimate" structured shape now DOES exist (internal/domain/plan.
+// ExtractStructured, plandomain/structured.go) -- recovered from this SAME
+// verbatim text, by a strict, model-asked-for-it-explicitly machine-
+// readable block, never by inferring structure from freeform prose layout.
+// This function's own two callers (outboxenqueue.go's Slack/Linear
+// notifications) render the verbatim text either way and have no present
+// need for the structured form; the web UI's own GET .../plans
+// (internal/adapters/inbound/httpapi/plans.go) is the one caller that
+// additionally runs ExtractStructured over the SAME content this function
+// (or, for its own multi-version needs, plandomain.ExtractContent
+// directly) recovers.
 //
 // The plan-mode UI (§12.2 item 3) generalized the actual scan below
 // into plandomain.ExtractContent, reusable by a SECOND caller that needs it

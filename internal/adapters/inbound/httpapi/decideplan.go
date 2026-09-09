@@ -470,7 +470,17 @@ func snapshotApprovedPlanContent(ctx context.Context, tx pgx.Tx, turns *postgres
 		content = plandomain.ExtractContent(sessionactor.ToContentEvents(recentEvents), lower, upper)
 	}
 
-	if _, err := planDocuments.WithTx(tx).Create(ctx, planRow.ID, content); err != nil {
+	// §12.2 item 3's own structured-plan-document schema: the SAME
+	// best-effort discipline as content above -- computed from the SAME
+	// already-recovered prose, never a second, independent recovery
+	// attempt -- and nil (never a partial/best-guess value) whenever
+	// ExtractStructured itself found nothing valid to extract. See
+	// migrations/000126_plan_documents_structured.up.sql's own comment for
+	// why NULL, not an empty object, is this column's only "no structure"
+	// representation.
+	structured := plandomain.ExtractStructured(content)
+
+	if _, err := planDocuments.WithTx(tx).Create(ctx, planRow.ID, content, structured); err != nil {
 		return fmt.Errorf("httpapi: create plan document snapshot: %w", err)
 	}
 	return nil

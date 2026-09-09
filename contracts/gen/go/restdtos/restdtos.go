@@ -5029,12 +5029,24 @@ func (j *PendingLinkPrompt) UnmarshalJSON(value []byte) error {
 // windowed per plan VERSION here (bounded above by the NEXT turn dispatched in
 // this session, if any, so an already-decided plan's content is never contaminated
 // by a later turn's own streamed text) rather than only ever the just-completed
-// turn. There is deliberately no structured steps/fileRefs/scopeEstimate shape:
-// internal/app/sessionactor/planapprovalcontent.go's own doc comment is explicit
-// that no such schema exists anywhere in this codebase -- content is the model's
-// own freeform prose, verbatim, rendered as plain text by the client (never
-// markdown-parsed), exactly like every other model-authored field this schema
-// already carries (finding.description, digest.summary).
+// turn. content is ALWAYS present and is always the model's own freeform prose,
+// verbatim, rendered as plain text by the client (never markdown-parsed) --
+// exactly like every other model-authored string this schema carries -- and never
+// stops being computed once structured (below) exists: structured is additive,
+// never a replacement. structured (§12.2 item 3's own 'numbered steps with file
+// refs, scope estimate' shape, internal/domain/plan.ExtractStructured) is the SAME
+// content string's own machine-recovered structure, present only when the
+// producing turn emitted a valid ```plan-steps block and null otherwise --
+// covering, identically and deliberately, every plan that predates this field, any
+// plan whose model never attempted one, and one that attempted and failed
+// validation: none of these is a distinguishable 'real zero', because there is no
+// honest partial rendering for any of them beyond content's own prose (see
+// ExtractStructured's own doc comment for the full reasoning, including why a
+// genuinely empty steps array is folded into this SAME null case rather than kept
+// as a distinct empty-but-real structured value). A client renders structured as a
+// numbered list when present, and content as plain prose otherwise -- both fields
+// are model-authored and attacker-influenceable, so title/description/fileRefs
+// entries get the SAME plain-text-only treatment content itself always has.
 type Plan struct {
 	// Best-effort, server-extracted plan text (see this DTO's own top doc comment) --
 	// never empty: falls back to a fixed, honest placeholder
@@ -5081,6 +5093,15 @@ type Plan struct {
 
 	// Matches Postgres plan_status exactly (migrations/000034_plan_mode.up.sql).
 	Status PlanStatus `json:"status" yaml:"status" mapstructure:"status"`
+
+	// §12.2 item 3's own structured plan document -- content's own machine-recovered
+	// structure (internal/domain/plan.ExtractStructured), present only when the
+	// producing turn emitted a valid ```plan-steps block; null covers every other
+	// case identically (see this DTO's own top doc comment for the full enumeration
+	// and why they are deliberately not distinguished). A client that gets null
+	// renders content in prose instead -- structured never replaces content, which is
+	// always present regardless.
+	Structured *PlanStructured `json:"structured" yaml:"structured" mapstructure:"structured"`
 
 	// 1-based, monotonically increasing per session
 	// (internal/domain/plan.NextVersion) -- v1 is the first plan proposed, v2 a
@@ -5217,6 +5238,102 @@ func (j *PlanStatus) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// One numbered step of a Plan's own structured document (§12.2 item 3: 'numbered
+// steps with file refs') -- internal/domain/plan.Step's wire shape. Every field is
+// model-authored, attacker-influenceable prose or a repository-relative path
+// string; a client renders all three as plain text only (title/description) or
+// inert text (fileRefs, never a clickable/navigable link built from an unvalidated
+// path), never markup, matching content's own established discipline.
+type PlanStep struct {
+	// Description corresponds to the JSON schema field "description".
+	Description string `json:"description" yaml:"description" mapstructure:"description"`
+
+	// Repository-relative file paths this step touches, as reported by the model --
+	// possibly empty (a step that has not yet named specific files), never null. Not
+	// validated against the repository's real tree or resolved to a link server-side:
+	// display-only, like FilesChanged elsewhere in this schema.
+	FileRefs []string `json:"fileRefs" yaml:"fileRefs" mapstructure:"fileRefs"`
+
+	// Title corresponds to the JSON schema field "title".
+	Title string `json:"title" yaml:"title" mapstructure:"title"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *PlanStep) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["description"]; raw != nil && !ok {
+		return fmt.Errorf("field description in PlanStep: required")
+	}
+	if _, ok := raw["fileRefs"]; raw != nil && !ok {
+		return fmt.Errorf("field fileRefs in PlanStep: required")
+	}
+	if _, ok := raw["title"]; raw != nil && !ok {
+		return fmt.Errorf("field title in PlanStep: required")
+	}
+	type Plain PlanStep
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if utf8.RuneCountInString(string(plain.Description)) < 1 {
+		return fmt.Errorf("field %s length: must be >= %d", "description", 1)
+	}
+	if utf8.RuneCountInString(string(plain.Title)) < 1 {
+		return fmt.Errorf("field %s length: must be >= %d", "title", 1)
+	}
+	*j = PlanStep(plain)
+	return nil
+}
+
+// §12.2 item 3's own structured plan document -- content's own machine-recovered
+// structure (internal/domain/plan.ExtractStructured), present only when the
+// producing turn emitted a valid ```plan-steps block; null covers every other case
+// identically (see this DTO's own top doc comment for the full enumeration and why
+// they are deliberately not distinguished). A client that gets null renders
+// content in prose instead -- structured never replaces content, which is always
+// present regardless.
+type PlanStructured struct {
+	// A short, non-empty, model-authored free-text summary of the plan's overall size
+	// (the mockup's own '6 files · 2 migrations' line, docs/design/mockups.html) --
+	// plain text only, like every other model-authored string here.
+	ScopeEstimate string `json:"scopeEstimate" yaml:"scopeEstimate" mapstructure:"scopeEstimate"`
+
+	// Always at least one step in a non-null structured value -- ExtractStructured
+	// folds a genuinely empty steps array into the SAME null case as no structure at
+	// all, so this array is never empty here.
+	Steps []PlanStep `json:"steps" yaml:"steps" mapstructure:"steps"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *PlanStructured) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["scopeEstimate"]; raw != nil && !ok {
+		return fmt.Errorf("field scopeEstimate in PlanStructured: required")
+	}
+	if _, ok := raw["steps"]; raw != nil && !ok {
+		return fmt.Errorf("field steps in PlanStructured: required")
+	}
+	type Plain PlanStructured
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if utf8.RuneCountInString(string(plain.ScopeEstimate)) < 1 {
+		return fmt.Errorf("field %s length: must be >= %d", "scopeEstimate", 1)
+	}
+	if plain.Steps != nil && len(plain.Steps) < 1 {
+		return fmt.Errorf("field %s length: must be >= %d", "steps", 1)
+	}
+	*j = PlanStructured(plain)
+	return nil
+}
+
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *Plan) UnmarshalJSON(value []byte) error {
 	var raw map[string]interface{}
@@ -5246,6 +5363,9 @@ func (j *Plan) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["status"]; raw != nil && !ok {
 		return fmt.Errorf("field status in Plan: required")
+	}
+	if _, ok := raw["structured"]; raw != nil && !ok {
+		return fmt.Errorf("field structured in Plan: required")
 	}
 	if _, ok := raw["version"]; raw != nil && !ok {
 		return fmt.Errorf("field version in Plan: required")
@@ -12457,6 +12577,8 @@ func (j *WorkflowStepRunOutcomeStatus) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
+
 // The posted outcome's advisory free-text summary -- never re-parsed as structured
 // data once posted (§25.6), same discipline as PostReviewVerdictRequest.summary.
 type WorkflowStepRunOutcomeSummary *string
@@ -12466,6 +12588,7 @@ type WorkflowStepRunStatus string
 const WorkflowStepRunStatusAwaitingDecision WorkflowStepRunStatus = "awaiting_decision"
 const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
 const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
+const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
 const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
 
 var enumValues_WorkflowStepRunStatus = []interface{}{
@@ -12495,10 +12618,6 @@ func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 	*j = WorkflowStepRunStatus(v)
 	return nil
 }
-
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
-
-const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
 
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
 // sequential turn'). Null while an awaiting_decision (hitlBefore-gated) attempt

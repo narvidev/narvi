@@ -1167,19 +1167,83 @@
 
 /* ---- plan mode (§12.2 item 3, Step 85) ---- */
 
-/* plan-content: NOT the mockup's own .planlist (a numbered <ol>/<li>
-   structure) -- the real plan document is freeform, model-authored prose
-   with no structured steps schema anywhere in this codebase (Plan.content's
-   own schema doc comment, PlanModeView.tsx's own top comment), so it is
-   never parsed into semantic list markup. This mirrors .stream p's own
-   "must not break the layout" treatment (a very long line, or one very
-   long unbroken word/token, must still wrap inside the card) rather than
-   inventing a second convention for the same underlying risk. */
+/* plan-content: plan.content's own prose rendering, used whenever
+   plan.structured is null (see PlanModeView.tsx's own top comment for the
+   three cases that collapse to null -- an unstructured plan is never a
+   confident empty state). Mirrors .stream p's own "must not break the
+   layout" treatment (a very long line, or one very long unbroken
+   word/token, must still wrap inside the card). */
 .plan-content {
   margin: var(--space-3) 0 0;
   font-size: var(--text-md);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
+}
+/* .planlist: the mockup's own numbered-step list (docs/design/mockups.html,
+   decision 15), used whenever plan.structured is present -- values
+   converted from the mockup's raw px to this app's own token scale, same
+   conversion this whole file already applies everywhere else. code spans
+   render a step's own fileRefs entries -- inert text only, never a link
+   (PlanModeView.tsx's own top comment). */
+.planlist {
+  list-style: none;
+  margin: var(--space-5) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  counter-reset: step;
+}
+.planlist li {
+  display: flex;
+  gap: var(--space-6);
+  counter-increment: step;
+}
+.planlist li::before {
+  content: counter(step);
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  flex: none;
+  border: 1.5px solid var(--line-strong);
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--mono);
+  font-size: var(--text-sm);
+  font-weight: 700;
+  margin-top: 1px;
+}
+.planlist b {
+  font-size: var(--text-base);
+  /* A step's own title is model-authored, attacker-reachable free text,
+     exactly like its description just below (.planlist p already has
+     this) -- an unbroken title with no natural break point would
+     otherwise push this card wider than its own container. */
+  overflow-wrap: anywhere;
+}
+.planlist p {
+  margin: var(--space-1) 0 0;
+  color: var(--muted);
+  font-size: var(--text-base-sm);
+  overflow-wrap: anywhere;
+}
+.planlist code {
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  background: var(--surface-2);
+  padding: 1px var(--space-5);
+  border-radius: var(--radius-xs);
+  margin-right: var(--space-3);
+  display: inline-block;
+  /* A fileRefs entry is model-authored free text with no length bound this
+     file's own layer enforces (internal/domain/plan.MaxFieldChars bounds
+     it server-side, not the render width) -- the SAME overflow discipline
+     .rtable td and .finding .loc already apply to every OTHER file-path
+     rendering this app has; a structured step's own file chips must not
+     be the one place that discipline was dropped. */
+  overflow-wrap: anywhere;
 }
 .approvalbar {
   position: sticky;

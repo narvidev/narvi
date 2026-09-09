@@ -13,10 +13,15 @@
 --
 -- GetPlanDocumentByPlanID backs this Step's own coverage measurement:
 -- confirming every approved plan has exactly one row here.
+--
+-- structured_steps (migrations/000126_plan_documents_structured.up.sql,
+-- §12.2 item 3) rides the SAME insert as content, from the SAME
+-- already-recovered prose -- see that migration's own comment for why NULL
+-- is the only representation of "no structure recovered".
 
 -- name: CreatePlanDocument :one
-INSERT INTO plan_documents (plan_id, content)
-VALUES ($1, $2)
+INSERT INTO plan_documents (plan_id, content, structured_steps)
+VALUES ($1, $2, $3)
 RETURNING *;
 
 -- name: GetPlanDocumentByPlanID :one
