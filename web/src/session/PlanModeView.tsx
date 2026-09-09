@@ -62,6 +62,35 @@
 // replacement path that could silently swallow a plan that has real
 // content but no recoverable structure.
 //
+// # plan.content is the authoritative document -- every channel shows it
+//
+// PlanCard renders plan.content's own prose UNCONDITIONALLY, whether or not
+// plan.structured is present. This was not always true: an earlier version
+// rendered EITHER the structured list OR the prose, never both, which meant
+// a web approver reading only the structured summary could be deciding on a
+// materially different document than the SAME plan's Slack/Linear approver
+// -- who only ever receives plan.content, stripped of its machine block
+// (internal/app/sessionactor/outboxenqueue.go's own two call sites; neither
+// Slack nor Linear has ever rendered plan.structured, and nothing here adds
+// that). Two people approving the "same" plan through different channels
+// seeing different text is exactly the failure mode a cross-channel
+// approval system (§13.3, "first verdict wins") cannot tolerate: a plan is
+// approved or it isn't, regardless of which surface approved it, so every
+// surface must be deciding on the same words.
+//
+// content is what was made authoritative, deliberately, not structured:
+// content is the model's own reply, unedited, and structured is a STRICT
+// SUBSET of what it can express (a title, a description, fileRefs, one
+// scope-estimate string -- no room for caveats, alternatives considered, or
+// open questions the model's prose might raise). structured can never carry
+// MORE information than content; it can only carry less. Picking content as
+// the thing every channel shows is therefore the choice that can never
+// hide something a human needed to see. StructuredPlanSteps above the prose
+// is a readability affordance on top of that authoritative text, not a
+// replacement for it -- exactly the same "additive, never a replacement"
+// rule this file's own preceding section already establishes for WHETHER
+// structure exists at all, now applied to whether it's shown.
+//
 // # Every third-party-authored string here is plain text
 //
 // plan.content, plan.structured's own step title/description/fileRefs
@@ -129,7 +158,7 @@ export function StructuredPlanSteps({ structured }: { structured: NonNullable<Pl
   )
 }
 
-/** PlanCard renders one plan version -- as a structured numbered list when plan.structured is present, or plan.content's own prose otherwise (see this file's own top comment for why those are the ONLY two cases and why null is never mistaken for "zero steps"). Exported for direct render-safety testing (mirrors CodeReviewView.tsx's own DigestSections/FindingCard precedent): a hostile plan.content or a hostile structured field (markup, a `javascript:` URL as plain text, an XSS payload) must render as plain text only, never as markup or a link -- see this file's own top doc comment. */
+/** PlanCard renders one plan version: plan.content's own prose ALWAYS (stripped of its machine block), preceded by a structured numbered-list summary when plan.structured is present (see this file's own top comment, "plan.content is the authoritative document", for why prose is never hidden just because a summary exists). Exported for direct render-safety testing (mirrors CodeReviewView.tsx's own DigestSections/FindingCard precedent): a hostile plan.content or a hostile structured field (markup, a `javascript:` URL as plain text, an XSS payload) must render as plain text only, never as markup or a link -- see this file's own top doc comment. */
 export function PlanCard({ plan }: { plan: Plan }) {
   return (
     <div className="card">
@@ -138,7 +167,8 @@ export function PlanCard({ plan }: { plan: Plan }) {
         <b>Plan</b>
         <time>{new Date(plan.createdAt).toLocaleString()}</time>
       </div>
-      {plan.structured ? <StructuredPlanSteps structured={plan.structured} /> : <p className="plan-content"><T text={stripStructureBlock(plan.content)} /></p>}
+      {plan.structured && <StructuredPlanSteps structured={plan.structured} />}
+      <p className="plan-content"><T text={stripStructureBlock(plan.content)} /></p>
       <div className="verdict-foot">
         {plan.structured && (
           <span>

@@ -91,19 +91,104 @@ func TestStructureInstruction_OwnExampleNeverParsesAsAPlan(t *testing.T) {
 	}
 }
 
-// TestStructureInstruction_ExampleRejectionIsExact keeps the guard above
-// from quietly widening into a placeholder-shaped heuristic that would turn
-// away real plans: a document that differs from the example in ONE field is
-// a plan, and must extract.
+// TestStructureInstruction_ExampleRejectionIsExact keeps isInstructionExample
+// (structured.go) from quietly widening into a placeholder-shaped heuristic
+// that would turn away real plans, and from quietly narrowing back into the
+// defect fixed alongside this test: comparing against a field a model varies
+// freely even while echoing the placeholder text (fileRefs) let the
+// fabricated example plan through under a one-character fileRefs drift, an
+// empty array, or an omitted key.
+//
+// isInstructionExample now keeps exactly four conjuncts: exactly one step,
+// and that step's title/description plus the document's scopeEstimate all
+// equal to the instruction's own placeholder text. Every subtest below
+// mutation-verifies ONE of those four: it changes exactly that one thing
+// away from the placeholder (or, for fileRefs, changes ONLY fileRefs, which
+// is deliberately not a conjunct at all) and asserts the resulting effect --
+// dropping any of the four kept conjuncts from the real implementation would
+// flip at least one of these subtests from its asserted outcome, which is
+// what "every conjunct it keeps must have a case that fails when dropped"
+// (this Step's own review) requires:
+//
+//   - dropping the "== exampleStepTitle" conjunct would wrongly reject
+//     "title differs" (case 2) as the example;
+//   - dropping "== exampleStepDescription" would wrongly reject
+//     "description differs" (case 3);
+//   - dropping "== exampleScopeEstimate" would wrongly reject
+//     "scopeEstimate differs" (case 4);
+//   - dropping "len(steps) == 1" would wrongly reject "a second, real step
+//     alongside a first step that echoes the placeholder" (case 5) -- steps[0]
+//     still matches the placeholder verbatim, so only the step-count check
+//     tells this apart from the true one-step example;
+//   - the three "exact echo, only fileRefs differs" cases (1a/1b/1c) prove
+//     the fix itself: fileRefs is NOT a conjunct, so no fileRefs variation
+//     can rescue the placeholder plan the way the old six-conjunct guard let
+//     it through.
 func TestStructureInstruction_ExampleRejectionIsExact(t *testing.T) {
-	content := "```plan-steps\n" +
-		`{"steps":[{"title":"short step title","description":"what this step does and why","fileRefs":["internal/app/real.go"]}],"scopeEstimate":"e.g. 6 files, 2 migrations"}` +
-		"\n```"
-	got := ExtractStructured(content)
-	if got == nil {
-		t.Fatal("a document differing from the example only in fileRefs was rejected -- the guard must be exact, not a placeholder heuristic")
+	block := func(title, description, scopeEstimate, fileRefsJSON string) string {
+		return "```plan-steps\n" +
+			`{"steps":[{"title":"` + title + `","description":"` + description + `","fileRefs":` + fileRefsJSON + `}],"scopeEstimate":"` + scopeEstimate + `"}` +
+			"\n```"
 	}
-	if len(got.Steps) != 1 || got.Steps[0].FileRefs[0] != "internal/app/real.go" {
-		t.Errorf("extracted = %+v, want the real fileRef preserved", got.Steps)
+
+	tests := []struct {
+		name    string
+		content string
+		wantNil bool
+	}{
+		{
+			name:    "exact echo with a REAL fileRef is still the placeholder -- fileRefs varying does not rescue it (the defect this fix closes)",
+			content: block(exampleStepTitle, exampleStepDescription, exampleScopeEstimate, `["internal/app/real.go"]`),
+			wantNil: true,
+		},
+		{
+			name:    "exact echo with an EMPTY fileRefs array is still the placeholder",
+			content: block(exampleStepTitle, exampleStepDescription, exampleScopeEstimate, `[]`),
+			wantNil: true,
+		},
+		{
+			name: "exact echo with fileRefs OMITTED entirely is still the placeholder",
+			content: "```plan-steps\n" +
+				`{"steps":[{"title":"` + exampleStepTitle + `","description":"` + exampleStepDescription + `"}],"scopeEstimate":"` + exampleScopeEstimate + `"}` +
+				"\n```",
+			wantNil: true,
+		},
+		{
+			name:    "title differs from the placeholder -- a real plan, must extract (mutation target: the title conjunct)",
+			content: block("Add the retry queue", exampleStepDescription, exampleScopeEstimate, `["internal/app/real.go"]`),
+			wantNil: false,
+		},
+		{
+			name:    "description differs from the placeholder -- a real plan, must extract (mutation target: the description conjunct)",
+			content: block(exampleStepTitle, "Add exponential backoff around the outbox delivery loop.", exampleScopeEstimate, `["internal/app/real.go"]`),
+			wantNil: false,
+		},
+		{
+			name:    "scopeEstimate differs from the placeholder -- a real plan, must extract (mutation target: the scopeEstimate conjunct)",
+			content: block(exampleStepTitle, exampleStepDescription, "3 files, 1 migration", `["internal/app/real.go"]`),
+			wantNil: false,
+		},
+		{
+			name: "a real SECOND step alongside a first step that echoes the placeholder -- a real (two-step) plan, must extract (mutation target: the step-count conjunct)",
+			content: "```plan-steps\n" +
+				`{"steps":[` +
+				`{"title":"` + exampleStepTitle + `","description":"` + exampleStepDescription + `","fileRefs":["` + exampleFileRef + `"]},` +
+				`{"title":"Wire it up.","description":"Connect the new queue to the outbox worker.","fileRefs":[]}` +
+				`],"scopeEstimate":"` + exampleScopeEstimate + `"}` +
+				"\n```",
+			wantNil: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractStructured(tt.content)
+			if tt.wantNil && got != nil {
+				t.Errorf("ExtractStructured() = %+v, want nil (still the instruction's own placeholder)", got)
+			}
+			if !tt.wantNil && got == nil {
+				t.Errorf("ExtractStructured() = nil, want a real extracted plan")
+			}
+		})
 	}
 }

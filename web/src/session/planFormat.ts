@@ -71,11 +71,38 @@ export function canActOnPlan(role: string | undefined, meId: string | undefined,
   return false
 }
 
+const FENCE_OPEN = '```plan-steps'
+const FENCE_CLOSE = '```'
+
+/**
+ * closingFenceIndex returns the index, within afterOpen, of the first
+ * FENCE_CLOSE ("```") that actually CLOSES a markdown fence -- one that
+ * starts a line, i.e. sits at the very start of afterOpen or immediately
+ * follows a '\n'. Returns -1 when no such occurrence exists. Mirrors
+ * internal/domain/plan.closingFenceIndex (structured.go) exactly -- see
+ * that function's own doc comment for why a plain indexOf is wrong: JSON
+ * does not require backticks to be escaped inside a string, so a step's own
+ * title or description can legitimately contain a "```" sequence BEFORE the
+ * block's real close, and a naive first-match search stops there instead,
+ * splicing the back half of the fenced JSON into the prose a human reads.
+ */
+function closingFenceIndex(afterOpen: string): number {
+  let offset = 0
+  for (;;) {
+    const rel = afterOpen.indexOf(FENCE_CLOSE, offset)
+    if (rel === -1) return -1
+    if (rel === 0 || afterOpen[rel - 1] === '\n') return rel
+    offset = rel + FENCE_CLOSE.length
+  }
+}
+
 /**
  * stripStructureBlock removes the one fenced `plan-steps` block from a plan's
  * prose before a human reads it, mirroring plandomain.StripStructureBlock on
  * the server (which does the same for the Slack and Linear approval
- * messages).
+ * messages) -- see that function's own doc comment for the full rationale;
+ * this is a byte-for-byte behavioural port, kept in sync deliberately rather
+ * than shared code, since the two run in different languages.
  *
  * The wire's `content` deliberately still carries the model's whole reply --
  * it is the record of what the model said. What must not happen is a human
@@ -87,17 +114,27 @@ export function canActOnPlan(role: string | undefined, meId: string | undefined,
  * it, the same shape the server's extractor reads. Two open fences means
  * neither side can tell which block was meant, so nothing is removed and the
  * reader sees exactly what the model wrote.
+ *
+ * Also refuses to remove the block when doing so would leave nothing at all
+ * -- a reply that is ONLY the fenced block (the model skipped the "propose
+ * your plan in prose first" half of the instruction) would otherwise strip
+ * down to the empty string, handing the caller a blank message: on the web,
+ * an empty plan card with the approval bar still live, asking a human to
+ * approve nothing. An empty result is never more honest than the raw block
+ * it came from, so this falls back to returning content unchanged -- the
+ * SAME "can't confidently improve on this, show exactly what the model
+ * wrote" outcome the two-open-fence case above already returns.
  */
 export function stripStructureBlock(content: string): string {
-  const FENCE_OPEN = '```plan-steps'
-  const FENCE_CLOSE = '```'
   const openIdx = content.indexOf(FENCE_OPEN)
   if (openIdx === -1) return content
   const afterOpen = content.slice(openIdx + FENCE_OPEN.length)
   if (afterOpen.includes(FENCE_OPEN)) return content
-  const closeIdx = afterOpen.indexOf(FENCE_CLOSE)
+  const closeIdx = closingFenceIndex(afterOpen)
   if (closeIdx === -1) return content
   const before = content.slice(0, openIdx)
   const after = afterOpen.slice(closeIdx + FENCE_CLOSE.length)
-  return before.replace(/[ \t\n]+$/, '') + after.replace(/[ \t\n]+$/, '')
+  const stripped = before.replace(/[ \t\n]+$/, '') + after.replace(/[ \t\n]+$/, '')
+  if (stripped.trim() === '' && content.trim() !== '') return content
+  return stripped
 }

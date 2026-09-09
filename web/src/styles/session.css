@@ -1217,6 +1217,11 @@
 }
 .planlist b {
   font-size: var(--text-base);
+  /* A step's own title is model-authored, attacker-reachable free text,
+     exactly like its description just below (.planlist p already has
+     this) -- an unbroken title with no natural break point would
+     otherwise push this card wider than its own container. */
+  overflow-wrap: anywhere;
 }
 .planlist p {
   margin: var(--space-1) 0 0;
@@ -1232,6 +1237,13 @@
   border-radius: var(--radius-xs);
   margin-right: var(--space-3);
   display: inline-block;
+  /* A fileRefs entry is model-authored free text with no length bound this
+     file's own layer enforces (internal/domain/plan.MaxFieldChars bounds
+     it server-side, not the render width) -- the SAME overflow discipline
+     .rtable td and .finding .loc already apply to every OTHER file-path
+     rendering this app has; a structured step's own file chips must not
+     be the one place that discipline was dropped. */
+  overflow-wrap: anywhere;
 }
 .approvalbar {
   position: sticky;

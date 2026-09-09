@@ -1,6 +1,7 @@
 package plan
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -212,6 +213,26 @@ func TestExtractStructured(t *testing.T) {
 			content: "",
 			want:    nil,
 		},
+		{
+			// JSON does not require backticks to be escaped inside a string,
+			// so a model describing something like wrapping output in code
+			// fences can legitimately put a "```" sequence INSIDE a title or
+			// description, strictly before the block's own real close. A
+			// naive strings.Index(afterOpen, "```") stops at THAT occurrence
+			// (mid-line, inside the still-open JSON string) rather than the
+			// real close two lines later -- truncating raw mid-string, which
+			// is invalid JSON, so this self-corrects to nil today. The fix
+			// (closingFenceIndex requiring the close to start a line) makes
+			// it extract correctly instead of merely failing safe.
+			name: "an embedded ``` sequence inside a field's own value does not end the block early",
+			content: "```plan-steps\n" +
+				"{\"steps\":[{\"title\":\"Wrap it in ```code``` blocks\",\"description\":\"D\",\"fileRefs\":[]}],\"scopeEstimate\":\"1 file\"}" +
+				"\n```",
+			want: &Structured{
+				Steps:         []Step{{Title: "Wrap it in ```code``` blocks", Description: "D", FileRefs: []string{}}},
+				ScopeEstimate: "1 file",
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -261,6 +282,48 @@ func TestStripStructureBlock(t *testing.T) {
 			name:    "an unterminated fence removes nothing",
 			content: "Plan.\n\n```plan-steps\n{\"steps\":[]",
 			want:    "Plan.\n\n```plan-steps\n{\"steps\":[]",
+		},
+		{
+			// The core reproduction for finding 1: a naive
+			// strings.Index(afterOpen, "```") stops at the mid-line "```"
+			// inside the title's own value, splicing the back half of the
+			// fenced JSON ("code```blocks\",\"description\":...}\n```\n\nDone.")
+			// straight into the prose a human reads. The fix requires the
+			// close to start a line, so the whole block -- ALL of it, past
+			// every embedded backtick sequence -- is removed, and nothing
+			// but the real prose on either side survives.
+			name: "an embedded ``` sequence inside the fenced JSON does not end the block early -- the whole block is removed, none of it leaks into the prose",
+			content: "Plan.\n\n```plan-steps\n" +
+				"{\"steps\":[{\"title\":\"Wrap it in ```code``` blocks\",\"description\":\"D\",\"fileRefs\":[]}],\"scopeEstimate\":\"1 file\"}" +
+				"\n```\n\nDone.",
+			want: "Plan.\n\nDone.",
+		},
+		{
+			// Finding 2: a reply that is ONLY the block (the model skipped
+			// the "propose your plan in prose first" half of the
+			// instruction) must not strip down to the empty string -- an
+			// empty result is never more honest than the raw block it came
+			// from, so the whole content comes back unchanged.
+			name: "a reply that is ONLY the block is returned UNCHANGED, never stripped to empty",
+			content: "```plan-steps\n" +
+				`{"steps":[{"title":"T","description":"D","fileRefs":[]}],"scopeEstimate":"1 file"}` +
+				"\n```",
+			want: "```plan-steps\n" +
+				`{"steps":[{"title":"T","description":"D","fileRefs":[]}],"scopeEstimate":"1 file"}` +
+				"\n```",
+		},
+		{
+			// Same case, with only whitespace padding the block on both
+			// sides -- still nothing for a human to read once trimmed, so
+			// still falls back to the unchanged original (whitespace and
+			// all), not an empty string.
+			name: "a reply that is the block plus only surrounding whitespace is also returned unchanged",
+			content: "   \n```plan-steps\n" +
+				`{"steps":[{"title":"T","description":"D","fileRefs":[]}],"scopeEstimate":"1 file"}` +
+				"\n```\n   ",
+			want: "   \n```plan-steps\n" +
+				`{"steps":[{"title":"T","description":"D","fileRefs":[]}],"scopeEstimate":"1 file"}` +
+				"\n```\n   ",
 		},
 	}
 
@@ -312,5 +375,85 @@ func TestExtractStructured_StepCountBound(t *testing.T) {
 	}
 	if got := ExtractStructured(build(MaxSteps + 1)); got != nil {
 		t.Errorf("MaxSteps+1 (%d) steps extracted %d steps, want nil -- past the bound a plan renders as prose, where the render cap does hold", MaxSteps+1, len(got.Steps))
+	}
+}
+
+// TestExtractStructured_FileRefsCountBound pins both sides of
+// MaxFileRefsPerStep -- MaxSteps' own missing companion (finding 5): a
+// document at the step-count ceiling with an unbounded fileRefs array per
+// step would still render an unbounded number of file chips for that ONE
+// step, so the step-count cap alone bounds nothing about a single step's
+// own render size.
+func TestExtractStructured_FileRefsCountBound(t *testing.T) {
+	build := func(n int) string {
+		var b strings.Builder
+		b.WriteString(`{"title":"T","description":"D","fileRefs":[`)
+		for i := 0; i < n; i++ {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString(`"a.go"`)
+		}
+		b.WriteString("]}")
+		return "```plan-steps\n" + `{"steps":[` + b.String() + `],"scopeEstimate":"s"}` + "\n```"
+	}
+
+	if got := ExtractStructured(build(MaxFileRefsPerStep)); got == nil || len(got.Steps[0].FileRefs) != MaxFileRefsPerStep {
+		t.Errorf("exactly MaxFileRefsPerStep (%d) fileRefs must extract, got %v", MaxFileRefsPerStep, got)
+	}
+	if got := ExtractStructured(build(MaxFileRefsPerStep + 1)); got != nil {
+		t.Errorf("MaxFileRefsPerStep+1 (%d) fileRefs extracted %d, want nil -- past the bound the step folds to prose", MaxFileRefsPerStep+1, len(got.Steps[0].FileRefs))
+	}
+}
+
+// TestExtractStructured_FieldCharBound pins both sides of MaxFieldChars for
+// every model-authored string field a structured document carries: a
+// step's title and description, one of its fileRefs entries, and the
+// document's own scopeEstimate. Without this, MaxSteps and
+// MaxFileRefsPerStep together still bound only COUNTS (how many steps, how
+// many fileRefs) -- a single field of unbounded length would still make
+// the aggregate render unbounded, which is exactly the property this
+// Step's own MaxSteps doc comment claims and, before this bound existed,
+// did not actually have.
+func TestExtractStructured_FieldCharBound(t *testing.T) {
+	tests := []struct {
+		name  string
+		build func(n int) string
+	}{
+		{
+			name: "title",
+			build: func(n int) string {
+				return "```plan-steps\n" + fmt.Sprintf(`{"steps":[{"title":%q,"description":"D","fileRefs":[]}],"scopeEstimate":"s"}`, strings.Repeat("a", n)) + "\n```"
+			},
+		},
+		{
+			name: "description",
+			build: func(n int) string {
+				return "```plan-steps\n" + fmt.Sprintf(`{"steps":[{"title":"T","description":%q,"fileRefs":[]}],"scopeEstimate":"s"}`, strings.Repeat("a", n)) + "\n```"
+			},
+		},
+		{
+			name: "a fileRefs entry",
+			build: func(n int) string {
+				return "```plan-steps\n" + fmt.Sprintf(`{"steps":[{"title":"T","description":"D","fileRefs":[%q]}],"scopeEstimate":"s"}`, strings.Repeat("a", n)) + "\n```"
+			},
+		},
+		{
+			name: "scopeEstimate",
+			build: func(n int) string {
+				return "```plan-steps\n" + fmt.Sprintf(`{"steps":[{"title":"T","description":"D","fileRefs":[]}],"scopeEstimate":%q}`, strings.Repeat("a", n)) + "\n```"
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ExtractStructured(tt.build(MaxFieldChars)); got == nil {
+				t.Errorf("a %s of exactly MaxFieldChars (%d) must extract, got nil", tt.name, MaxFieldChars)
+			}
+			if got := ExtractStructured(tt.build(MaxFieldChars + 1)); got != nil {
+				t.Errorf("a %s of MaxFieldChars+1 (%d) extracted, want nil -- past the bound the document folds to prose", tt.name, MaxFieldChars+1)
+			}
+		})
 	}
 }

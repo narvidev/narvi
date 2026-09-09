@@ -30,11 +30,31 @@ const wellFormedPlanStepsContent = "Here is my plan.\n\n1. Add a table.\n\n" +
 	`{"steps":[{"title":"Add table","description":"New migration.","fileRefs":["migrations/000200.up.sql"]}],"scopeEstimate":"1 file"}` +
 	"\n```\n"
 
+// wellFormedTwoStepPlanStepsContent is wellFormedPlanStepsContent's own
+// two-step twin, used only by the happy-path test below -- this Step's own
+// review found that EVERY structured-plan wire fixture in this file (and in
+// internal/domain/plan/structured_test.go's own multiple-steps case, which
+// only proves the DOMAIN layer preserves order) carried exactly one step, so
+// nothing at the WIRE level (planWireMap/planStructuredWireMap's own JSON
+// marshaling of the []Step slice) ever proved step ORDER survives the trip
+// through restdtos.PlanStep and back. Two distinctly-named, ORDER-SENSITIVE
+// steps close that gap: a mutation that reordered (e.g. sorted by title) or
+// mismatched fields across steps would flip which title/fileRef lands at
+// index 0 vs 1 below.
+const wellFormedTwoStepPlanStepsContent = "Here is my plan.\n\n1. Add a table.\n2. Wire it up.\n\n" +
+	"```plan-steps\n" +
+	`{"steps":[{"title":"Add table","description":"New migration.","fileRefs":["migrations/000200.up.sql"]},{"title":"Wire it up","description":"Consume the new table.","fileRefs":["internal/app/wireup.go","internal/app/wireup_test.go"]}],"scopeEstimate":"2 files"}` +
+	"\n```\n"
+
 // TestListPlans_StructuredField_PresentWhenContentCarriesAValidBlock proves
 // the happy path end to end: a producing turn's own event-log text that
 // contains a well-formed ```plan-steps block surfaces on the wire as a
 // non-nil Plan.structured, AND Plan.content still carries the full,
-// unmodified prose -- structured is additive, never a replacement.
+// unmodified prose -- structured is additive, never a replacement. Also
+// pins step ORDER at the wire level (see wellFormedTwoStepPlanStepsContent's
+// own doc comment): step 0 and step 1 must land in the SAME order they were
+// authored in, all the way through planWireMap/planStructuredWireMap's own
+// JSON marshaling.
 func TestListPlans_StructuredField_PresentWhenContentCarriesAValidBlock(t *testing.T) {
 	rig := newTestRig(t)
 	ctx := context.Background()
@@ -46,7 +66,7 @@ func TestListPlans_StructuredField_PresentWhenContentCarriesAValidBlock(t *testi
 		t.Fatalf("create turn: %v", err)
 	}
 	dispatchTurn(ctx, t, rig, session.ID, turn.ID)
-	seedTokenEvent(ctx, t, rig, session.ID, "structured-msg", wellFormedPlanStepsContent)
+	seedTokenEvent(ctx, t, rig, session.ID, "structured-msg", wellFormedTwoStepPlanStepsContent)
 	plan, err := rig.plans.Create(ctx, sqlcgen.CreatePlanParams{SessionID: session.ID, TurnID: turn.ID, Version: 1, Status: sqlcgen.PlanStatusAwaitingApproval})
 	if err != nil {
 		t.Fatalf("create plan: %v", err)
@@ -64,17 +84,17 @@ func TestListPlans_StructuredField_PresentWhenContentCarriesAValidBlock(t *testi
 	if got.Id != plan.ID.String() {
 		t.Fatalf("Plans[0].Id = %q, want %q", got.Id, plan.ID.String())
 	}
-	if got.Content != wellFormedPlanStepsContent {
-		t.Errorf("Content = %q, want the full unmodified prose %q -- structured must never replace it", got.Content, wellFormedPlanStepsContent)
+	if got.Content != wellFormedTwoStepPlanStepsContent {
+		t.Errorf("Content = %q, want the full unmodified prose %q -- structured must never replace it", got.Content, wellFormedTwoStepPlanStepsContent)
 	}
 	if got.Structured == nil {
 		t.Fatalf("Structured = nil, want a non-nil structured document")
 	}
-	if len(got.Structured.Steps) != 1 {
-		t.Fatalf("len(Structured.Steps) = %d, want 1", len(got.Structured.Steps))
+	if len(got.Structured.Steps) != 2 {
+		t.Fatalf("len(Structured.Steps) = %d, want 2", len(got.Structured.Steps))
 	}
 	if want := "Add table"; got.Structured.Steps[0].Title != want {
-		t.Errorf("Steps[0].Title = %q, want %q", got.Structured.Steps[0].Title, want)
+		t.Errorf("Steps[0].Title = %q, want %q -- step order must survive the wire round-trip", got.Structured.Steps[0].Title, want)
 	}
 	if want := "New migration."; got.Structured.Steps[0].Description != want {
 		t.Errorf("Steps[0].Description = %q, want %q", got.Structured.Steps[0].Description, want)
@@ -82,7 +102,16 @@ func TestListPlans_StructuredField_PresentWhenContentCarriesAValidBlock(t *testi
 	if want := []string{"migrations/000200.up.sql"}; len(got.Structured.Steps[0].FileRefs) != 1 || got.Structured.Steps[0].FileRefs[0] != want[0] {
 		t.Errorf("Steps[0].FileRefs = %v, want %v", got.Structured.Steps[0].FileRefs, want)
 	}
-	if want := "1 file"; got.Structured.ScopeEstimate != want {
+	if want := "Wire it up"; got.Structured.Steps[1].Title != want {
+		t.Errorf("Steps[1].Title = %q, want %q -- step order must survive the wire round-trip", got.Structured.Steps[1].Title, want)
+	}
+	if want := "Consume the new table."; got.Structured.Steps[1].Description != want {
+		t.Errorf("Steps[1].Description = %q, want %q", got.Structured.Steps[1].Description, want)
+	}
+	if want := []string{"internal/app/wireup.go", "internal/app/wireup_test.go"}; len(got.Structured.Steps[1].FileRefs) != 2 || got.Structured.Steps[1].FileRefs[0] != want[0] || got.Structured.Steps[1].FileRefs[1] != want[1] {
+		t.Errorf("Steps[1].FileRefs = %v, want %v", got.Structured.Steps[1].FileRefs, want)
+	}
+	if want := "2 files"; got.Structured.ScopeEstimate != want {
 		t.Errorf("Structured.ScopeEstimate = %q, want %q", got.Structured.ScopeEstimate, want)
 	}
 }
@@ -209,6 +238,82 @@ func TestApprovePlan_SnapshotsStructuredStepsIntoPlanDocuments(t *testing.T) {
 	}
 	if got.ScopeEstimate != "1 file" {
 		t.Errorf("structured_steps.ScopeEstimate = %q, want %q", got.ScopeEstimate, "1 file")
+	}
+}
+
+// TestApprovePlan_SnapshotsStructuredStepsIntoPlanDocuments_UsesTheApprovedPlansOwnTurn
+// closes a real fixture gap this Step's own review found: every OTHER test
+// in this file has exactly one session, one plan, one turn -- so
+// planRow.TurnID (decideplan.go's own snapshotApprovedPlanContent) is
+// trivially the only candidate turnContentBounds could ever resolve to, and
+// a mutation that snapshots some OTHER turn instead (e.g. always the
+// session's first-dispatched one) would leave every one of those tests
+// green. This seeds TWO plan versions, each with its own producing turn and
+// its own DISTINCT structured content, approves the SECOND, and asserts the
+// snapshot carries v2's own steps -- never v1's.
+func TestApprovePlan_SnapshotsStructuredStepsIntoPlanDocuments_UsesTheApprovedPlansOwnTurn(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	owner, token := rig.createAuthenticatedUser(ctx, t)
+	session := createSessionForUser(ctx, t, rig, owner.ID, nil)
+
+	turn1, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusCompleted, PlanMode: true})
+	if err != nil {
+		t.Fatalf("create turn1: %v", err)
+	}
+	dispatchTurn(ctx, t, rig, session.ID, turn1.ID)
+	content1 := "v1's own plan.\n\n```plan-steps\n" +
+		`{"steps":[{"title":"V1 STEP -- must never appear on plan v2's own snapshot","description":"D1","fileRefs":["v1.go"]}],"scopeEstimate":"v1 scope"}` +
+		"\n```\n"
+	seedTokenEvent(ctx, t, rig, session.ID, "turn1-structured-msg", content1)
+	plan1, err := rig.plans.Create(ctx, sqlcgen.CreatePlanParams{SessionID: session.ID, TurnID: turn1.ID, Version: 1, Status: sqlcgen.PlanStatusSuperseded})
+	if err != nil {
+		t.Fatalf("create plan1: %v", err)
+	}
+
+	turn2, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusCompleted, PlanMode: true})
+	if err != nil {
+		t.Fatalf("create turn2: %v", err)
+	}
+	dispatchTurn(ctx, t, rig, session.ID, turn2.ID)
+	content2 := "v2's own revised plan.\n\n```plan-steps\n" +
+		`{"steps":[{"title":"V2 STEP -- the one that must be snapshotted","description":"D2","fileRefs":["v2.go"]}],"scopeEstimate":"v2 scope"}` +
+		"\n```\n"
+	seedTokenEvent(ctx, t, rig, session.ID, "turn2-structured-msg", content2)
+	plan2, err := rig.plans.Create(ctx, sqlcgen.CreatePlanParams{SessionID: session.ID, TurnID: turn2.ID, Version: 2, Status: sqlcgen.PlanStatusAwaitingApproval})
+	if err != nil {
+		t.Fatalf("create plan2: %v", err)
+	}
+
+	status := rig.doJSON(t, http.MethodPost,
+		"/api/sessions/"+session.ID.String()+"/plans/"+plan2.ID.String()+"/approve", []byte{}, nil, token)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", status, http.StatusOK)
+	}
+
+	// plan1 was never approved -- it must have no snapshot of its own at all,
+	// which also rules out a mutation that snapshots EVERY plan in the
+	// session rather than only the one actually being approved.
+	if _, err := rig.planDocuments.GetByPlanID(ctx, plan1.ID); err == nil {
+		t.Errorf("plan1 (never approved) has a plan_documents row -- want none")
+	}
+
+	doc, err := rig.planDocuments.GetByPlanID(ctx, plan2.ID)
+	if err != nil {
+		t.Fatalf("GetByPlanID(%s): %v", plan2.ID.String(), err)
+	}
+	if doc.StructuredSteps == nil {
+		t.Fatalf("plan_documents.structured_steps = nil, want a non-nil JSON payload")
+	}
+	var got plandomain.Structured
+	if err := json.Unmarshal(doc.StructuredSteps, &got); err != nil {
+		t.Fatalf("unmarshal structured_steps: %v", err)
+	}
+	if len(got.Steps) != 1 || got.Steps[0].Title != "V2 STEP -- the one that must be snapshotted" {
+		t.Errorf("structured_steps = %+v, want v2's own single step, never v1's", got)
+	}
+	if got.ScopeEstimate != "v2 scope" {
+		t.Errorf("structured_steps.ScopeEstimate = %q, want %q (v1's own scope leaking here means the wrong turn was snapshotted)", got.ScopeEstimate, "v2 scope")
 	}
 }
 

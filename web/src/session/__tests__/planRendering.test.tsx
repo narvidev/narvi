@@ -92,10 +92,34 @@ describe('PlanCard/StructuredPlanSteps rendering -- the structured path, and its
     expect(html).toContain('<li')
   })
 
-  it('renders plan.content\'s own prose ONLY when structured is null -- a structured plan does not ALSO render its raw content underneath', () => {
-    const structured = structuredPlan({ content: 'THE RAW PROSE MUST NOT APPEAR TWICE' })
+  // Finding 7: plan.content is the authoritative document -- the SAME text
+  // every channel (web, Slack, Linear) shows, since neither Slack nor
+  // Linear has ever rendered plan.structured (outboxenqueue.go's own two
+  // call sites only ever strip and send plan.content). An earlier version
+  // of this test asserted the OPPOSITE ("prose does not ALSO render
+  // underneath") -- that was the bug: hiding the prose whenever a
+  // structured summary existed meant a web approver could be deciding on
+  // different text than the SAME plan's Slack/Linear approver. This test
+  // now pins the fix: the structured list is an ADDITIVE readability
+  // affordance on top of the prose, never a replacement for it.
+  it('renders plan.content\'s own prose ALONGSIDE the structured list, never hidden by it -- every channel decides on the same document', () => {
+    const structured = structuredPlan({ content: 'This prose is the authoritative document -- it must still be visible.' })
     const html = renderToStaticMarkup(<PlanCard plan={structured} />)
-    expect(html).not.toContain('THE RAW PROSE MUST NOT APPEAR TWICE')
+    expect(html).toContain('planlist')
+    expect(html).toContain('This prose is the authoritative document -- it must still be visible.')
+  })
+
+  it('still strips the machine block from the prose even when structured is present -- the human never sees the raw JSON twice over', () => {
+    const structured = structuredPlan({
+      content:
+        'Here is my plan.\n\n```plan-steps\n' +
+        '{"steps":[{"title":"Add table","description":"New migration.","fileRefs":["migrations/000200.up.sql"]}],"scopeEstimate":"1 file"}' +
+        '\n```\n',
+    })
+    const html = renderToStaticMarkup(<PlanCard plan={structured} />)
+    expect(html).toContain('Here is my plan.')
+    expect(html).not.toContain('plan-steps')
+    expect(html).not.toContain('scopeEstimate')
   })
 
   it('renders the scopeEstimate in the verdict-foot', () => {
@@ -194,6 +218,43 @@ describe('stripStructureBlock -- a human never reads the machine block', () => {
     expect(stripStructureBlock(content)).toBe(content)
   })
 
+  // Pins the Go twin's own coverage (plandomain.StripStructureBlock,
+  // structured_test.go's "an unterminated fence removes nothing") on this
+  // side too -- a truncated/cut-off stream must not have its trailing,
+  // incomplete block guessed at and removed.
+  it('an unterminated fence removes nothing', () => {
+    const content = 'Plan.\n\n```plan-steps\n{"steps":[]'
+    expect(stripStructureBlock(content)).toBe(content)
+  })
+
+  // The core reproduction for finding 1: JSON does not require backticks to
+  // be escaped inside a string, so a step's own title/description can
+  // legitimately contain a "```" sequence strictly before the block's real
+  // close. A naive first-match search stops there, splicing the back half
+  // of the fenced JSON into the prose. The fix (closingFenceIndex requiring
+  // the close to start a line) removes the WHOLE block instead.
+  it('an embedded ``` sequence inside the fenced JSON does not end the block early -- the whole block is removed, none of it leaks into the prose', () => {
+    const content =
+      'Plan.\n\n```plan-steps\n' +
+      '{"title":"Wrap it in ```code``` blocks"}' +
+      '\n```\n\nDone.'
+    expect(stripStructureBlock(content)).toBe('Plan.\n\nDone.')
+  })
+
+  // Finding 2: a reply that is ONLY the block (the model skipped the
+  // "propose your plan in prose first" half of the instruction) must not
+  // strip down to the empty string -- an empty result is never more honest
+  // than the raw block it came from.
+  it('a reply that is ONLY the block is returned UNCHANGED, never stripped to empty', () => {
+    const content = '```plan-steps\n{"steps":[{"title":"T","description":"D","fileRefs":[]}],"scopeEstimate":"1 file"}\n```'
+    expect(stripStructureBlock(content)).toBe(content)
+  })
+
+  it('a reply that is the block plus only surrounding whitespace is also returned unchanged', () => {
+    const content = '   \n```plan-steps\n{"steps":[{"title":"T","description":"D","fileRefs":[]}],"scopeEstimate":"1 file"}\n```\n   '
+    expect(stripStructureBlock(content)).toBe(content)
+  })
+
   it('the prose fallback -- the path taken when the block did NOT parse -- never shows the raw JSON', () => {
     // A block that fails validation (zero steps) so structured is null and
     // the fallback renders. Without the strip the reader would be handed the
@@ -211,5 +272,28 @@ describe('stripStructureBlock -- a human never reads the machine block', () => {
     expect(html).toContain('My plan in prose.')
     expect(html).not.toContain('scopeEstimate')
     expect(html).not.toContain('plan-steps')
+  })
+
+  // Finding 2: a reply that is ONLY the machine block (the model skipped
+  // the "propose your plan in prose first" half of the instruction) and
+  // fails validation must not render an EMPTY plan card -- before this fix,
+  // stripStructureBlock stripped the whole content down to '', so
+  // plan.structured was null (the block failed validation), the <p> was
+  // empty, and the approval bar was still live: a human was asked to
+  // approve nothing, with no way to tell why. It must show SOMETHING real.
+  it('a block-only reply that fails validation renders the raw content, never an empty card', () => {
+    const plan = {
+      id: 'p1',
+      version: 1,
+      status: 'awaiting_approval',
+      createdAt: new Date().toISOString(),
+      content: '```plan-steps\n{"steps":[],"scopeEstimate":"1 file"}\n```',
+      structured: null,
+    } as unknown as Plan
+    const html = renderToStaticMarkup(<PlanCard plan={plan} />)
+    expect(html).toContain('class="plan-content"')
+    // The <p class="plan-content"> must carry SOME text -- the raw,
+    // unstripped reply -- rather than an empty element.
+    expect(html).toMatch(/<p class="plan-content">[^<].*plan-steps/s)
   })
 })

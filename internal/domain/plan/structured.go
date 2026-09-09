@@ -95,16 +95,45 @@ const (
 	// Not an arbitrary ceiling: the web caps each rendered string at 8000
 	// characters, which bounded the prose path because that path renders ONE
 	// string. The structured path renders a title, a description and a file
-	// chip PER STEP, so an unbounded step count makes that cap bound nothing
-	// in aggregate, on a synchronous read path, from model-authored text.
+	// chip PER STEP, so an unbounded step count alone makes that cap bound
+	// nothing in aggregate, on a synchronous read path, from model-authored
+	// text -- MaxSteps only bounds the STEP COUNT; MaxFieldChars and
+	// MaxFileRefsPerStep below are what actually restore the aggregate
+	// bound, by also capping the two things a step count limit alone does
+	// not touch: how long any ONE field is, and how many file chips ONE
+	// step can render. All three together are what make "a structured
+	// plan's total rendered size is bounded" true; MaxSteps by itself only
+	// bounds how many titles/descriptions/scope-estimate lines exist, not
+	// their combined size.
 	//
-	// Exceeding it folds to prose like every other deviation -- which is the
-	// property that makes this number safe to pick: the fallback is the path
-	// whose cap does hold, so a plan too large to render as structure is
-	// still rendered, just bounded. 100 is well past any plan a human reads
-	// before clicking Approve, and far short of anything that would make a
-	// page unusable.
+	// Exceeding any of the three folds to prose like every other deviation
+	// -- which is the property that makes these numbers safe to pick: the
+	// fallback is the path whose cap does hold, so a plan too large to
+	// render as structure is still rendered, just bounded. 100 is well past
+	// any plan a human reads before clicking Approve, and far short of
+	// anything that would make a page unusable.
 	MaxSteps = 100
+
+	// MaxFieldChars bounds the length of every individual model-authored
+	// string field in a structured document -- a step's title, its
+	// description, each of its fileRefs entries, and the document's own
+	// scopeEstimate. The SAME 8000 the web's own per-string render cap
+	// already uses (PlanModeView.tsx's MAX_CONTENT_CHARS) -- picking the
+	// same number means a field that passes this check never needed the
+	// web's own truncateForDisplay to begin with, rather than validating
+	// against one number here and silently truncating against a different
+	// one at render time.
+	MaxFieldChars = 8000
+
+	// MaxFileRefsPerStep bounds how many fileRefs entries one step may
+	// carry -- MaxSteps' own missing companion: a document at the step-count
+	// ceiling with an unbounded fileRefs array per step would still render
+	// an unbounded number of file chips, so the step-count cap alone bounds
+	// nothing about a single step's own render size. 50 is generous for any
+	// step a human reads before clicking Approve (mirrors MaxSteps' own
+	// "well past any plan a human reads" reasoning) and far short of
+	// anything that would make one step's own file-chip list unusable.
+	MaxFileRefsPerStep = 50
 
 	StructureFenceOpen  = "```plan-steps"
 	structureFenceClose = "```"
@@ -186,8 +215,11 @@ type wireStructured struct {
 //     inventing its own extra keys is treated as "did not follow the
 //     schema", never "followed it loosely"), or carries trailing content
 //     after the one JSON value;
-//   - zero steps, or any step whose title or description is empty after
-//     trimming whitespace;
+//   - zero steps, more than MaxSteps steps, or any step whose title or
+//     description is empty after trimming whitespace;
+//   - a step with more than MaxFileRefsPerStep fileRefs entries;
+//   - any title, description, fileRefs entry or scopeEstimate longer than
+//     MaxFieldChars after trimming;
 //   - an empty (after trimming) scopeEstimate.
 //
 // Never fails the caller with an error: an extraction attempt that finds
@@ -207,7 +239,7 @@ func ExtractStructured(content string) *Structured {
 		return nil
 	}
 
-	closeIdx := strings.Index(afterOpen, structureFenceClose)
+	closeIdx := closingFenceIndex(afterOpen)
 	if closeIdx == -1 {
 		return nil
 	}
@@ -237,7 +269,7 @@ func ExtractStructured(content string) *Structured {
 		return nil
 	}
 	scopeEstimate := strings.TrimSpace(wire.ScopeEstimate)
-	if scopeEstimate == "" || containsNUL(scopeEstimate) {
+	if scopeEstimate == "" || containsNUL(scopeEstimate) || len(scopeEstimate) > MaxFieldChars {
 		return nil
 	}
 
@@ -251,9 +283,15 @@ func ExtractStructured(content string) *Structured {
 		if containsNUL(title) || containsNUL(description) {
 			return nil
 		}
+		if len(title) > MaxFieldChars || len(description) > MaxFieldChars {
+			return nil
+		}
 		fileRefs := s.FileRefs
 		if fileRefs == nil {
 			fileRefs = []string{}
+		}
+		if len(fileRefs) > MaxFileRefsPerStep {
+			return nil
 		}
 		for _, ref := range fileRefs {
 			// An empty path is not a path. The web renders each entry as its
@@ -261,6 +299,9 @@ func ExtractStructured(content string) *Structured {
 			// affordance pointing at nothing, which is the same fabrication
 			// this extractor refuses everywhere else.
 			if strings.TrimSpace(ref) == "" || containsNUL(ref) {
+				return nil
+			}
+			if len(ref) > MaxFieldChars {
 				return nil
 			}
 		}
@@ -274,8 +315,11 @@ func ExtractStructured(content string) *Structured {
 	return &Structured{Steps: steps, ScopeEstimate: scopeEstimate}
 }
 
-// isInstructionExample reports whether the extracted document is verbatim
-// the example block RenderStructureInstruction shows the model.
+// isInstructionExample reports whether the extracted document is the
+// instruction's own example block RenderStructureInstruction shows the
+// model, identified by the THREE fields that are actually placeholder text
+// with no plausible real-plan meaning: the step's title, its description,
+// and the document's own scopeEstimate.
 //
 // The content this extractor reads is the model's own reply, and the example
 // it was shown is a fully schema-valid document -- so a model that answers by
@@ -286,18 +330,26 @@ func ExtractStructured(content string) *Structured {
 // this extractor's own doc comment already claims: never a fabricated plan
 // invented just to satisfy the shape.
 //
-// Deliberately exact rather than heuristic. Refusing anything that merely
-// LOOKS like placeholder text would start turning away real plans, and the
-// failure actually worth closing is the verbatim echo.
+// Deliberately checks ONLY the conjuncts that actually identify "this is the
+// placeholder, verbatim" -- title, description and scopeEstimate, plus the
+// step count (a real multi-step plan is never mistaken for the single-step
+// example just because ONE of its steps happens to echo the placeholder
+// text). fileRefs is deliberately NOT checked: it is the one field a model
+// varies freely even while echoing the rest of the example verbatim (a real
+// path in fileRefs, or an empty array, or two entries), and the earlier
+// version of this guard required fileRefs to equal exampleFileRef exactly --
+// so any of those three ordinary variations defeated the guard entirely and
+// let the fabricated placeholder plan through. A document that differs from
+// the example ONLY in fileRefs is still exactly the placeholder in every
+// field a human actually reads, so it must still be refused; a document that
+// differs in title, description, scopeEstimate, or carries more than one
+// step, is a real plan and must extract.
 func isInstructionExample(steps []Step, scopeEstimate string) bool {
 	if len(steps) != 1 || scopeEstimate != exampleScopeEstimate {
 		return false
 	}
 	s := steps[0]
-	if s.Title != exampleStepTitle || s.Description != exampleStepDescription {
-		return false
-	}
-	return len(s.FileRefs) == 1 && s.FileRefs[0] == exampleFileRef
+	return s.Title == exampleStepTitle && s.Description == exampleStepDescription
 }
 
 // containsNUL reports whether s carries a U+0000, which is valid in a Go
@@ -350,6 +402,17 @@ func containsNUL(s string) bool { return strings.ContainsRune(s, 0) }
 // the model meant, so nothing is removed and the human sees exactly what
 // the model wrote, which is the honest outcome when the format was not
 // followed.
+//
+// Also refuses to remove the block when doing so would leave nothing at
+// all: a reply that is ONLY the fenced block (no prose before or after it --
+// the model skipped the "propose your plan in prose first" half of the
+// instruction) would otherwise strip down to the empty string, handing
+// every caller a blank message with nothing for a human to read -- on the
+// web, an empty plan card with the approval bar still live, asking someone
+// to approve nothing. An empty result is never more honest than the raw
+// block it came from, so this falls back to returning content unchanged --
+// the SAME "can't confidently improve on this, show exactly what the model
+// wrote" outcome the two-open-fence case above already returns.
 func StripStructureBlock(content string) string {
 	openIdx := strings.Index(content, StructureFenceOpen)
 	if openIdx == -1 {
@@ -359,7 +422,7 @@ func StripStructureBlock(content string) string {
 	if strings.Contains(afterOpen, StructureFenceOpen) {
 		return content
 	}
-	closeIdx := strings.Index(afterOpen, structureFenceClose)
+	closeIdx := closingFenceIndex(afterOpen)
 	if closeIdx == -1 {
 		return content
 	}
@@ -368,5 +431,46 @@ func StripStructureBlock(content string) string {
 	after := afterOpen[closeIdx+len(structureFenceClose):]
 	// Collapse the seam so removing a trailing block does not leave the
 	// message ending in the blank lines that separated it from the prose.
-	return strings.TrimRight(before, " \t\n") + strings.TrimRight(after, " \t\n")
+	stripped := strings.TrimRight(before, " \t\n") + strings.TrimRight(after, " \t\n")
+	if strings.TrimSpace(stripped) == "" && strings.TrimSpace(content) != "" {
+		return content
+	}
+	return stripped
+}
+
+// closingFenceIndex returns the index, within afterOpen, of the first
+// StructureFenceClose ("```") that actually CLOSES a markdown fence -- one
+// that starts a line, i.e. sits at the very beginning of afterOpen or
+// immediately follows a '\n'. Returns -1 when no such occurrence exists.
+//
+// Markdown fences only ever close this way (CommonMark's own fenced-code-
+// block rule): the closing sequence is a line of its own. A plain
+// strings.Index(afterOpen, structureFenceClose) -- what both ExtractStructured
+// and StripStructureBlock used before this function existed -- does not
+// know that, and a "```" appearing MID-LINE matches it just as readily as a
+// real closing fence does. That mid-line case is not hypothetical: JSON
+// does not require backticks to be escaped inside a string, so a step's own
+// title or description containing literal backtick text (e.g. a step that
+// says to wrap something in triple-backtick code blocks) puts a "```"
+// sequence INSIDE the fenced JSON, before the block's real close. Against
+// ExtractStructured this self-corrects almost always -- truncating mid-JSON-
+// string leaves unterminated JSON, which the decoder already rejects -- but
+// StripStructureBlock has no decoder to catch it: the naive search truncated
+// the "removed" span at that same premature "```", splicing the back half of
+// the fenced JSON into the prose a human then reads. Requiring the close to
+// start a line is what both functions need to agree on the same span, and
+// what stops that leak.
+func closingFenceIndex(afterOpen string) int {
+	offset := 0
+	for {
+		rel := strings.Index(afterOpen[offset:], structureFenceClose)
+		if rel == -1 {
+			return -1
+		}
+		abs := offset + rel
+		if abs == 0 || afterOpen[abs-1] == '\n' {
+			return abs
+		}
+		offset = abs + len(structureFenceClose)
+	}
 }
