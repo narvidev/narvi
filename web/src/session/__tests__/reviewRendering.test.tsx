@@ -17,7 +17,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ReleaseManifestPR, ReleaseManifestReadout, ReviewReadoutFinding, ReviewReadoutVerdict } from '@narvi/contracts/rest-dtos'
 
 import { DigestSections, FindingCard, FindingsAppendix, HandoffReadinessCard, PrGitHubLink, ReviewSessionPanel, SentinelAutoFixPanel, SentinelsPanel } from '../CodeReviewView'
-import { ReleaseManifestBody } from '../ReleaseReviewView'
+import { ReleaseManifestBody, isAdmin, isMaintainerPlus } from '../ReleaseReviewView'
 import { isSafeHref } from '../urlSafety'
 
 const XSS_IMG = '<img src=x onerror=alert(1)>'
@@ -319,28 +319,45 @@ describe('ReleaseReviewView rendering -- adversarial manifest content stays text
     expect(html).toContain('PR #1 and #2 both add the same migration')
   })
 
-  it('never renders Block/Acknowledge actions for a viewer/member (canBlock/canAcknowledge both false)', () => {
+  // Test-integrity fix: the two tests below now DERIVE canBlock/
+  // canAcknowledge from a REAL role string via the exported isMaintainerPlus/
+  // isAdmin -- the SAME functions ReleaseReviewView itself calls on the
+  // authenticated caller's own role -- rather than hand-passing booleans
+  // directly. A prior version of this suite hand-passed
+  // canBlock={true}/canAcknowledge={false} etc. straight into
+  // ReleaseManifestBody, which proved the RENDER gate works but never
+  // actually exercised isMaintainerPlus/isAdmin at all: an inverted
+  // `role === 'viewer'` typo in either function would have passed every
+  // test in this file unnoticed.
+  it.each(['viewer', 'member'] as const)('never renders Block/Acknowledge actions for a %s (isMaintainerPlus/isAdmin both false for this role)', (role) => {
     const readout = baseManifestReadout({
       aggregateReviewTriggered: true,
       compositionReviewedAt: '2026-08-20T11:00:00Z',
       compositionFindings: [{ kind: 'other', detail: 'something worth a human look' }],
     })
-    const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} sessionId="s1" />)
+    expect(isMaintainerPlus(role)).toBe(false)
+    expect(isAdmin(role)).toBe(false)
+    const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} sessionId="s1" canBlock={isMaintainerPlus(role)} canAcknowledge={isAdmin(role)} />)
     expect(html).not.toContain('Block release')
     expect(html).not.toContain('Acknowledge & ship')
   })
 
-  it('renders only Block for a maintainer, and both for an admin -- role-gated client-side, mirroring server RBAC', () => {
+  it('renders only Block for a "maintainer" role, and both for an "admin" role -- derived from the real role string, mirroring server RBAC', () => {
     const readout = baseManifestReadout({
       aggregateReviewTriggered: true,
       compositionReviewedAt: '2026-08-20T11:00:00Z',
       compositionFindings: [{ kind: 'other', detail: 'something worth a human look' }],
     })
-    const maintainerHtml = withQueryClient(<ReleaseManifestBody readout={readout} sessionId="s1" canBlock={true} canAcknowledge={false} />)
+
+    expect(isMaintainerPlus('maintainer')).toBe(true)
+    expect(isAdmin('maintainer')).toBe(false)
+    const maintainerHtml = withQueryClient(<ReleaseManifestBody readout={readout} sessionId="s1" canBlock={isMaintainerPlus('maintainer')} canAcknowledge={isAdmin('maintainer')} />)
     expect(maintainerHtml).toContain('Block release')
     expect(maintainerHtml).not.toContain('Acknowledge &amp; ship')
 
-    const adminHtml = withQueryClient(<ReleaseManifestBody readout={readout} sessionId="s1" canBlock={true} canAcknowledge={true} />)
+    expect(isMaintainerPlus('admin')).toBe(true)
+    expect(isAdmin('admin')).toBe(true)
+    const adminHtml = withQueryClient(<ReleaseManifestBody readout={readout} sessionId="s1" canBlock={isMaintainerPlus('admin')} canAcknowledge={isAdmin('admin')} />)
     expect(adminHtml).toContain('Block release')
     expect(adminHtml).toContain('Acknowledge &amp; ship')
   })
@@ -356,6 +373,30 @@ describe('ReleaseReviewView rendering -- adversarial manifest content stays text
     const html = withQueryClient(<ReleaseManifestBody readout={readout} sessionId="s1" canBlock={true} canAcknowledge={true} />)
     expect(html).not.toContain('<button')
     expect(html).toContain('Blocked')
+  })
+
+  // Blocking-finding fix: compositionDecision is a CLOSED, three-value
+  // server enum ('pending' | 'blocked' | 'acknowledged') -- a prior
+  // version of this component matched with `!== 'pending'` and then
+  // picked 'blocked' vs. an "acknowledged & shipped" FALLBACK for
+  // anything else, which is fail-OPEN in exactly the wrong direction: an
+  // out-of-enum value (this exact regression happening again, a
+  // transport bug, or -- before the readout-population fix this Step
+  // also lands -- the server's own unpopulated zero value "") rendered a
+  // green "acknowledged & shipped" chip. Reproduced here with the
+  // byte-for-byte "" value the unfixed server used to actually send, to
+  // prove the CLIENT half of the fix independently of the server half.
+  it('an out-of-enum compositionDecision (e.g. "", the server\'s own former unpopulated zero value) never renders as acknowledged & shipped', () => {
+    const readout = baseManifestReadout({
+      aggregateReviewTriggered: true,
+      compositionReviewedAt: '2026-08-20T11:00:00Z',
+      compositionFindings: [],
+      // @ts-expect-error -- deliberately out-of-enum, proving the runtime default branch (a real ApiError-shaped server response would fail contract validation before this component ever saw it; this test proves the component's own defense-in-depth independent of that).
+      compositionDecision: '',
+    })
+    const html = renderToStaticMarkup(<ReleaseManifestBody readout={readout} sessionId="s1" />)
+    expect(html).not.toContain('acknowledged &amp; shipped')
+    expect(html).not.toContain('acknowledged & shipped')
   })
 })
 

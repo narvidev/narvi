@@ -625,10 +625,22 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		// -- see reviewfindings.go's own doc comment.
 		r.Post("/{sessionID}/review/findings/{identityHash}/rebut", httpapi.RebutReviewFinding(rig.sessions, rig.prSessions, rig.reviewFindings, rig.auditLog))
 		r.Post("/{sessionID}/review/findings/{identityHash}/apply-suggestion", httpapi.ApplySuggestion(rig.sessions, rig.prSessions, rig.reviewFindings, rig.identities, rig.sourceControl, rig.tokenEncryptionKey, platform.DefaultTimeouts()))
-		// release-manifest/{block,acknowledge} (§12.2 item 9)
+		// release-manifest (§15.2/§15.3, §12.2 item 9) -- the dedicated
+		// release-review screen's own read model, see httpapi/
+		// releasemanifestreadout.go's own doc comment. Test-integrity fix:
+		// this GET route was never mounted in this rig at all before
+		// releasemanifestreadout_integration_test.go existed -- confirmed
+		// by grep before adding it -- so GetReleaseManifestReadout had
+		// literally zero integration coverage; every request this rig's
+		// own tests could send to "/{sessionID}/release-manifest" 404'd on
+		// chi's own unmatched-route fallback, never reaching the handler
+		// at all, regardless of what that handler did or didn't populate.
+		r.Get("/{sessionID}/release-manifest", httpapi.GetReleaseManifestReadout(rig.sessions, rig.prSessions, rig.releaseManifestChecks))
+		// release-manifest/{block,acknowledge,unblock} (§12.2 item 9)
 		// -- see releasecompositiondecision.go's own doc comment.
-		r.Post("/{sessionID}/release-manifest/block", httpapi.BlockReleaseComposition(rig.sessions, rig.releaseManifestChecks, rig.auditLog))
-		r.Post("/{sessionID}/release-manifest/acknowledge", httpapi.AcknowledgeReleaseComposition(rig.sessions, rig.releaseManifestChecks, rig.auditLog))
+		r.Post("/{sessionID}/release-manifest/block", httpapi.BlockReleaseComposition(rig.pool, rig.sessions, rig.releaseManifestChecks, rig.auditLog))
+		r.Post("/{sessionID}/release-manifest/acknowledge", httpapi.AcknowledgeReleaseComposition(rig.pool, rig.sessions, rig.releaseManifestChecks, rig.auditLog))
+		r.Post("/{sessionID}/release-manifest/unblock", httpapi.UnblockReleaseComposition(rig.pool, rig.sessions, rig.releaseManifestChecks, rig.auditLog))
 		// workflow-runs (§25.10's own two run-read routes) -- see
 		// httpapi/workflowruns.go's own doc comment.
 		r.Get("/{sessionID}/workflow-runs", httpapi.ListSessionWorkflowRuns(rig.sessions, rig.workflows))

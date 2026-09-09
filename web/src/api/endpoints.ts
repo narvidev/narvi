@@ -241,6 +241,11 @@ export function acknowledgeReleaseComposition(sessionId: string, signal?: AbortS
   return request<PostReleaseCompositionDecisionResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/release-manifest/acknowledge`, { method: 'POST', signal })
 }
 
+/** unblockReleaseComposition calls POST /api/sessions/:id/release-manifest/unblock (§12.2 item 9, confirmed-major "unblock path" fix) -- admin only server-side (authz.ActionUnblockReleaseComposition), reopening an already-blocked release back to "pending" so the SAME admin-only Acknowledge & ship action above remains reachable afterward. */
+export function unblockReleaseComposition(sessionId: string, signal?: AbortSignal): Promise<PostReleaseCompositionDecisionResponse> {
+  return request<PostReleaseCompositionDecisionResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/release-manifest/unblock`, { method: 'POST', signal })
+}
+
 /** retriggerReview calls POST /api/sessions/:id/review/retrigger (§12.2 item 2's "re-run action") -- admin/maintainer only server-side (authz.ActionRetriggerReview); the button itself is rendered role-aware but the server is the real gate. */
 export function retriggerReview(sessionId: string, signal?: AbortSignal): Promise<CreateTurnResponse> {
   return request<CreateTurnResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/review/retrigger`, { method: 'POST', signal })

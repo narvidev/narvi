@@ -513,6 +513,30 @@ const (
 	// anything. Only the risk-accepting direction (ship anyway) gets the
 	// stricter, admin-only row.
 	ActionAcknowledgeReleaseComposition Action = "acknowledge_release_composition"
+	// ActionUnblockReleaseComposition covers the "Unblock" action that
+	// reopens a maintainer's own "Block release" decision back to pending
+	// (§12.2 item 9, §15.3 -- POST /api/sessions/{sessionID}/
+	// release-manifest/unblock, internal/adapters/inbound/httpapi/
+	// releasecompositiondecision.go). Admin only, this SAME row as
+	// ActionAcknowledgeReleaseComposition immediately above -- a confirmed-
+	// major fix: without this action a maintainer's Block was terminal
+	// (internal/domain/review.compositionDecisionTransitions carried no
+	// outgoing edge for CompositionDecisionBlocked at all), which
+	// permanently voided ActionAcknowledgeReleaseComposition's own
+	// admin-only override for that release -- a LOWER-privileged action
+	// (row 5, maintainer+) a HIGHER-privileged one (row 6, admin only)
+	// could never undo, inverting this matrix's own "admin can always do
+	// at least what a maintainer can" property everywhere else. Placed at
+	// row 6 rather than row 5 (unlike the companion "Block release"
+	// action's own ActionEditReviewVerdict reuse): undoing a
+	// safety-additive maintainer action is itself the SAME class of
+	// risk-accepting override ActionAcknowledgeReleaseComposition's own
+	// doc comment already reasons about, not an ordinary review-adjacent
+	// write -- only the tier that may ship DESPITE a composition finding
+	// may also remove the safety block a maintainer placed on one, even
+	// though removing it alone does not yet ship anything (that still
+	// requires the separate, still admin-only Acknowledge & ship call).
+	ActionUnblockReleaseComposition Action = "unblock_release_composition"
 
 	// ActionViewShadowLedger backs, alongside ActionActivateShadowLedger
 	// immediately below, the shadow-operator surface (§30.6/§30.9): the
@@ -599,6 +623,7 @@ var AllActions = []Action{
 	ActionConfigureReviewCostBudget,
 	ActionConfigurePreviewLinks,
 	ActionAcknowledgeReleaseComposition,
+	ActionUnblockReleaseComposition,
 	ActionViewShadowLedger,
 	ActionActivateShadowLedger,
 }

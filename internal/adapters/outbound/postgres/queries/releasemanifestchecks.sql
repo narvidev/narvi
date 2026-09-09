@@ -65,6 +65,26 @@ SET composition_reviewed_at = now(),
 WHERE id = $1 AND composition_reviewed_at IS NULL
 RETURNING *;
 
+-- name: UpdateReleaseManifestCompositionAnchor :one
+-- Confirmed-major fix (migrations/000128_release_manifest_checks_
+-- composition_anchor.up.sql): internal/app/releasereview.
+-- dispatchCompositionReview's own write, immediately after it creates
+-- this release's own composition review turn -- records WHICH commit
+-- (headSHA, the SAME value just persisted as that turn's own
+-- turns.review_head_sha) and whether that turn's own diff fetch was
+-- itself truncated, so a later-posted composition finding is anchored to
+-- an identifiable diff rather than an untraceable one. Guarded
+-- ("AND composition_head_sha IS NULL") so a duplicate/retried dispatch for
+-- the SAME row can never silently overwrite an already-recorded anchor
+-- with a different one; pgx.ErrNoRows means an anchor was already
+-- recorded, harmless and expected for that case (best-effort, logged, not
+-- propagated -- see the Go call site's own doc comment).
+UPDATE release_manifest_checks
+SET composition_head_sha = $2,
+    composition_diff_truncated = $3
+WHERE id = $1 AND composition_head_sha IS NULL
+RETURNING *;
+
 -- name: UpdateReleaseManifestCompositionDecision :one
 -- The Block release / Acknowledge & ship action write
 -- (BlockReleaseComposition/AcknowledgeReleaseComposition, httpapi/

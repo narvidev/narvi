@@ -1944,6 +1944,8 @@ type ReleaseManifestCheck struct {
 	CompositionDecision           string             `json:"composition_decision"`
 	CompositionDecisionBy         pgtype.UUID        `json:"composition_decision_by"`
 	CompositionDecisionAt         pgtype.Timestamptz `json:"composition_decision_at"`
+	CompositionHeadSha            *string            `json:"composition_head_sha"`
+	CompositionDiffTruncated      *bool              `json:"composition_diff_truncated"`
 }
 
 type ReleaseManifestPending struct {

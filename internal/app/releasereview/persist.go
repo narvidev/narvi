@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"log/slog"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/domain/review"
 )
@@ -77,9 +79,18 @@ func marshalJSONArray(v any) []byte {
 // "every internal failure is logged and this function simply continues"
 // posture: a failure here must never prevent Run's own pre-existing
 // outbox-delivered comment from still being enqueued.
-func persistReleaseManifestCheck(ctx context.Context, logger *slog.Logger, store ReleaseManifestCheckInserter, in Input, merged []review.MergedPR, findings []review.ManifestFinding, aggregateReviewTriggered bool, triggerReasons []string, coveragePartial bool) {
+//
+// Returns the inserted row's own id and ok=true on success -- ok=false
+// (a zero-value pgtype.UUID) whenever store is nil or the insert itself
+// failed, so this function's own caller (Run) can pass a real id on to
+// dispatchCompositionReview (compositiondispatch.go) ONLY when a row
+// genuinely exists for it to anchor composition_head_sha/
+// composition_diff_truncated against -- never a guessed/zero id that
+// would make that later, best-effort UPDATE a silent no-op against the
+// wrong (or no) row.
+func persistReleaseManifestCheck(ctx context.Context, logger *slog.Logger, store ReleaseManifestCheckInserter, in Input, merged []review.MergedPR, findings []review.ManifestFinding, aggregateReviewTriggered bool, triggerReasons []string, coveragePartial bool) (checkID pgtype.UUID, ok bool) {
 	if store == nil {
-		return
+		return pgtype.UUID{}, false
 	}
 
 	mergedWire := make([]mergedPRJSON, len(merged))
@@ -109,7 +120,7 @@ func persistReleaseManifestCheck(ctx context.Context, logger *slog.Logger, store
 		}
 	}
 
-	if _, err := store.Insert(ctx, sqlcgen.InsertReleaseManifestCheckParams{
+	created, err := store.Insert(ctx, sqlcgen.InsertReleaseManifestCheckParams{
 		SessionID:                     in.SessionID,
 		RepoFullName:                  in.Owner + "/" + in.Repo,
 		PrNumber:                      in.PRNumber,
@@ -121,8 +132,11 @@ func persistReleaseManifestCheck(ctx context.Context, logger *slog.Logger, store
 		AggregateReviewTriggerReasons: marshalJSONArray(triggerReasons),
 		Findings:                      marshalJSONArray(findingsWire),
 		MergedPrs:                     marshalJSONArray(mergedWire),
-	}); err != nil {
+	})
+	if err != nil {
 		logger.Error("releasereview: persist release manifest check failed (the outbox-delivered comment is unaffected)",
 			"error", err, "owner", in.Owner, "repo", in.Repo, "pr_number", in.PRNumber)
+		return pgtype.UUID{}, false
 	}
+	return created.ID, true
 }

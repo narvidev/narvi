@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -22,6 +23,20 @@ type ReleaseManifestCheckStore struct {
 // by pool.
 func NewReleaseManifestCheckStore(pool *pgxpool.Pool) *ReleaseManifestCheckStore {
 	return &ReleaseManifestCheckStore{q: sqlcgen.New(pool)}
+}
+
+// WithTx returns a ReleaseManifestCheckStore whose queries run on tx
+// instead of the pool this store was built with -- mirrors AuditLogStore's
+// own identical WithTx convention (audit_log_store.go). Confirmed-major
+// fix: the Block/Acknowledge/Unblock decision write and its own audit_log
+// row (releasecompositiondecision.go) now share ONE transaction, exactly
+// like every other Authorize-gated state change in this codebase already
+// does (audit.go's own top doc comment: "written in the same tx as the
+// change") -- before this fix, a failure recording the audit row left the
+// guarded decision UPDATE already durably committed on its own, an
+// irreversible, unattributed override with no audit trail.
+func (s *ReleaseManifestCheckStore) WithTx(tx pgx.Tx) *ReleaseManifestCheckStore {
+	return &ReleaseManifestCheckStore{q: s.q.WithTx(tx)}
 }
 
 // Insert appends one release_manifest_checks row -- internal/app/
@@ -60,6 +75,24 @@ func (s *ReleaseManifestCheckStore) UpdateCompositionFindings(ctx context.Contex
 	return s.q.UpdateReleaseManifestCompositionFindings(ctx, sqlcgen.UpdateReleaseManifestCompositionFindingsParams{
 		ID:                  id,
 		CompositionFindings: findingsJSON,
+	})
+}
+
+// UpdateCompositionAnchor persists composition_head_sha/
+// composition_diff_truncated against the release manifest check row named
+// by id -- a guarded UPDATE ("AND composition_head_sha IS NULL", see the
+// underlying query's own doc comment); pgx.ErrNoRows means an anchor was
+// already recorded for this row (a retried/duplicate dispatch), never a
+// silent overwrite. diffTruncated is a plain bool, never *bool: the ONE
+// caller (dispatchCompositionReview) only ever calls this once it has
+// already confirmed a live diff was fetched (compositiondispatch.go's own
+// "declines to dispatch... diff fetch failed" branch), so there is no
+// third "unknown" state to represent here.
+func (s *ReleaseManifestCheckStore) UpdateCompositionAnchor(ctx context.Context, id pgtype.UUID, headSHA string, diffTruncated bool) (sqlcgen.ReleaseManifestCheck, error) {
+	return s.q.UpdateReleaseManifestCompositionAnchor(ctx, sqlcgen.UpdateReleaseManifestCompositionAnchorParams{
+		ID:                       id,
+		CompositionHeadSha:       &headSHA,
+		CompositionDiffTruncated: &diffTruncated,
 	})
 }
 

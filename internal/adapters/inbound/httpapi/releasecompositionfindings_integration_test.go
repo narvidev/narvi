@@ -259,3 +259,41 @@ func TestPostReleaseCompositionFindings_SecondCall_Conflict(t *testing.T) {
 		t.Errorf("second call status = %d, want %d (findings already posted)", status, http.StatusConflict)
 	}
 }
+
+// TestPostReleaseCompositionFindings_NullFindings_NormalizesToEmptyArray
+// is the test-integrity fix for this handler's own "a present, empty
+// array persists, never a JSON null" normalization (releasecompositionfindings.
+// go's own `if req.Findings == nil { findingsJSON = []byte("[]") }`
+// branch) -- previously untested. A literal JSON `null` for "findings"
+// (distinct from an OMITTED key, which restdtos' own generated
+// UnmarshalJSON already rejects 400 as a required field, and distinct
+// from an explicit `[]`, which decodes to a non-nil empty slice and never
+// even reaches this branch) decodes to a nil Go slice with no decode
+// error -- json.Marshal(nil slice) would otherwise persist a JSON `null`
+// into a JSONB column release_manifest_checks.composition_findings'
+// own NOT NULL constraint (migrations/000127_release_manifest_checks_
+// composition.up.sql) never allows, and every OTHER reader of this same
+// column (GetReleaseManifestReadout, decisioninbox's own resolveReleaseCut)
+// unmarshals it expecting a real (possibly empty) JSON array.
+func TestPostReleaseCompositionFindings_NullFindings_NormalizesToEmptyArray(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	session := bareSessionWithSandbox(ctx, t, rig, "composition-nullfindings")
+	createReleaseManifestCheck(ctx, t, rig, session.ID)
+
+	status, resp := postReleaseCompositionFindings(t, rig, session.ID.String(), "composition-nullfindings", "1", `{"findings":null}`)
+	if status != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
+	}
+	if resp.FindingsCount != 0 {
+		t.Errorf("FindingsCount = %d, want 0", resp.FindingsCount)
+	}
+
+	updated, err := rig.releaseManifestChecks.GetBySessionID(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("GetBySessionID: %v", err)
+	}
+	if string(updated.CompositionFindings) != "[]" {
+		t.Errorf("persisted composition_findings = %s, want the literal JSON array \"[]\", never a JSON null", updated.CompositionFindings)
+	}
+}

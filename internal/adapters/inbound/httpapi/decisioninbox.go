@@ -166,6 +166,19 @@ func decisionInboxItemToDTO(it decisioninbox.Item) restdtos.DecisionInboxItem {
 			dto.AggregateReviewTriggered = &aggregateReviewTriggered
 			manifestCoveragePartial := it.ManifestCoveragePartial
 			dto.ManifestCoveragePartial = &manifestCoveragePartial
+
+			// compositionReviewed/compositionDecision (confirmed-major
+			// fix): rendered ONLY when isRelease is true, mirroring
+			// manifestFindingsCount immediately above -- compositionDecision
+			// stays entirely absent from the wire (never a fabricated
+			// "pending") unless the composition pass has actually
+			// completed (it.CompositionReviewed), so a client can never
+			// mistake "not yet reviewed" for a real, still-open decision.
+			compositionReviewed := it.CompositionReviewed
+			dto.CompositionReviewed = &compositionReviewed
+			if it.CompositionReviewed {
+				dto.CompositionDecision = &restdtos.DecisionInboxItemCompositionDecision{Value: it.CompositionDecision}
+			}
 		}
 	}
 	if it.RiskLabel != "" {

@@ -2567,11 +2567,12 @@ type DecisionInboxItem struct {
 	AgeSeconds int `json:"ageSeconds" yaml:"ageSeconds" mapstructure:"ageSeconds"`
 
 	// §15.3's own already-computed trigger decision (whether the constituent PRs' own
-	// shape met the criteria for an aggregate diff review) -- set iff isRelease is
-	// true, null otherwise. This is NOT a composition-findings count: the aggregate
-	// diff review pass itself is not dispatched anywhere in this system, so this
-	// field says only that its trigger criteria were met, never that the pass
-	// produced a finding.
+	// shape met the criteria for an aggregate diff review, OR the constituent-PR
+	// listing was itself truncated -- a truncated scan is treated as its own trigger,
+	// never a silent skip) -- set iff isRelease is true, null otherwise. This says
+	// only that the composition pass was dispatched (or should have been); see
+	// compositionReviewed/compositionDecision below for whether it has actually
+	// completed and been decided.
 	AggregateReviewTriggered DecisionInboxItemAggregateReviewTriggered `json:"aggregateReviewTriggered" yaml:"aggregateReviewTriggered" mapstructure:"aggregateReviewTriggered"`
 
 	// The automation's own last deterministic run summary (§8.4).
@@ -2584,6 +2585,28 @@ type DecisionInboxItem struct {
 	// findings, and isHandoff used to be nulled out for the handoff sub-case of
 	// kind=awaiting_approval, the one row isHandoff exists to identify).
 	CiGreen DecisionInboxItemCiGreen `json:"ciGreen" yaml:"ciGreen" mapstructure:"ciGreen"`
+
+	// The SAME three-value enum GetReleaseManifestReadout's own compositionDecision
+	// renders ('pending' until a maintainer+ blocks or an admin acknowledges, and
+	// 'pending' again after an admin unblocks) -- meaningless (null) whenever
+	// compositionReviewed is false or isRelease is false. A client rendering this
+	// row's own chip should treat 'pending' identically whether compositionReviewed
+	// is true (a real decision is genuinely still outstanding) or
+	// aggregateReviewTriggered is true but compositionReviewed is false (the pass has
+	// not completed) -- decisionInboxFormat.ts's own releaseChipData is this
+	// contract's one intended reader, and it already distinguishes the two via
+	// compositionReviewed.
+	CompositionDecision *DecisionInboxItemCompositionDecision `json:"compositionDecision,omitempty,omitzero" yaml:"compositionDecision,omitempty" mapstructure:"compositionDecision,omitempty"`
+
+	// §15.3's own composition-review COMPLETION state -- the SAME fact
+	// GetReleaseManifestReadout exposes as compositionReviewedAt (non-null), rendered
+	// here as a plain boolean since this row has no use for the exact timestamp. Set
+	// iff isRelease is true, null otherwise. Confirmed-major fix: before this field
+	// existed, a client had no way to tell 'the composition pass has not run yet'
+	// apart from 'it ran, found nothing, and was decided' -- both rendered as the
+	// identical, permanent 'aggregate review needed' chip (aggregateReviewTriggered
+	// alone cannot express this: it only ever says the pass SHOULD run).
+	CompositionReviewed DecisionInboxItemCompositionReviewed `json:"compositionReviewed,omitempty,omitzero" yaml:"compositionReviewed,omitempty" mapstructure:"compositionReviewed,omitempty"`
 
 	// When this row first became a pending decision -- the ranking (§16.1: 'by
 	// decision cost then age') and staleness reference point. For a PR row this is an
@@ -2731,11 +2754,12 @@ type DecisionInboxItem struct {
 }
 
 // §15.3's own already-computed trigger decision (whether the constituent PRs' own
-// shape met the criteria for an aggregate diff review) -- set iff isRelease is
-// true, null otherwise. This is NOT a composition-findings count: the aggregate
-// diff review pass itself is not dispatched anywhere in this system, so this field
-// says only that its trigger criteria were met, never that the pass produced a
-// finding.
+// shape met the criteria for an aggregate diff review, OR the constituent-PR
+// listing was itself truncated -- a truncated scan is treated as its own trigger,
+// never a silent skip) -- set iff isRelease is true, null otherwise. This says
+// only that the composition pass was dispatched (or should have been); see
+// compositionReviewed/compositionDecision below for whether it has actually
+// completed and been decided.
 type DecisionInboxItemAggregateReviewTriggered *bool
 
 // The automation's own last deterministic run summary (§8.4).
@@ -2748,6 +2772,54 @@ type DecisionInboxItemAutomationId *string
 // findings, and isHandoff used to be nulled out for the handoff sub-case of
 // kind=awaiting_approval, the one row isHandoff exists to identify).
 type DecisionInboxItemCiGreen *bool
+
+type DecisionInboxItemCompositionDecision struct {
+	Value interface{}
+}
+
+// MarshalJSON implements json.Marshaler.
+func (j *DecisionInboxItemCompositionDecision) MarshalJSON() ([]byte, error) {
+	return json.Marshal(j.Value)
+}
+
+var enumValues_DecisionInboxItemCompositionDecision = []interface{}{
+	"pending",
+	"blocked",
+	"acknowledged",
+	nil,
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *DecisionInboxItemCompositionDecision) UnmarshalJSON(value []byte) error {
+	var v struct {
+		Value interface{}
+	}
+	if err := json.Unmarshal(value, &v.Value); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_DecisionInboxItemCompositionDecision {
+		if reflect.DeepEqual(v.Value, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_DecisionInboxItemCompositionDecision, v.Value)
+	}
+	*j = DecisionInboxItemCompositionDecision(v)
+	return nil
+}
+
+// §15.3's own composition-review COMPLETION state -- the SAME fact
+// GetReleaseManifestReadout exposes as compositionReviewedAt (non-null), rendered
+// here as a plain boolean since this row has no use for the exact timestamp. Set
+// iff isRelease is true, null otherwise. Confirmed-major fix: before this field
+// existed, a client had no way to tell 'the composition pass has not run yet'
+// apart from 'it ran, found nothing, and was decided' -- both rendered as the
+// identical, permanent 'aggregate review needed' chip (aggregateReviewTriggered
+// alone cannot express this: it only ever says the pass SHOULD run).
+type DecisionInboxItemCompositionReviewed *bool
 
 // Matches Postgres session_failure_reason -- kind=needs_attention, a failed
 // session, only.
@@ -5705,8 +5777,12 @@ func (j *PostEpistemicOutcomeResponse) UnmarshalJSON(value []byte) error {
 }
 
 // 200 response body for POST
-// /api/sessions/:id/release-manifest/{block,acknowledge} (§12.2 item 9) -- the
-// same shape for either action, distinguished by compositionDecision's own value.
+// /api/sessions/:id/release-manifest/{block,acknowledge,unblock} (§12.2 item 9) --
+// the same shape for all three actions, distinguished by compositionDecision's own
+// value. "pending" is Unblock's own result (the confirmed-major "unblock path"
+// fix): it reopens an already-blocked release back to pending, never straight to
+// acknowledged -- see internal/domain/review.CompositionDecisionActionUnblock's
+// own doc comment.
 type PostReleaseCompositionDecisionResponse struct {
 	// CompositionDecision corresponds to the JSON schema field "compositionDecision".
 	CompositionDecision PostReleaseCompositionDecisionResponseCompositionDecision `json:"compositionDecision" yaml:"compositionDecision" mapstructure:"compositionDecision"`
@@ -5727,8 +5803,10 @@ type PostReleaseCompositionDecisionResponseCompositionDecision string
 
 const PostReleaseCompositionDecisionResponseCompositionDecisionAcknowledged PostReleaseCompositionDecisionResponseCompositionDecision = "acknowledged"
 const PostReleaseCompositionDecisionResponseCompositionDecisionBlocked PostReleaseCompositionDecisionResponseCompositionDecision = "blocked"
+const PostReleaseCompositionDecisionResponseCompositionDecisionPending PostReleaseCompositionDecisionResponseCompositionDecision = "pending"
 
 var enumValues_PostReleaseCompositionDecisionResponseCompositionDecision = []interface{}{
+	"pending",
 	"blocked",
 	"acknowledged",
 }
@@ -7495,22 +7573,48 @@ type ReleaseManifestReadout struct {
 	// BaseRef corresponds to the JSON schema field "baseRef".
 	BaseRef ReleaseManifestReadoutBaseRef `json:"baseRef,omitempty,omitzero" yaml:"baseRef,omitempty" mapstructure:"baseRef,omitempty"`
 
-	// §12.2 item 9's own 'Block release / Acknowledge & ship' human decision on
-	// compositionFindings -- 'pending' until a maintainer+ (block) or admin
-	// (acknowledge, an explicit override) acts.
+	// §12.2 item 9's own 'Block release / Acknowledge & ship [/ Unblock]' human
+	// decision on compositionFindings -- 'pending' until a maintainer+ (block) or
+	// admin (acknowledge, an explicit override) acts, and 'pending' AGAIN after an
+	// admin unblocks an already-blocked release
+	// (internal/domain/review.CompositionDecisionActionUnblock) -- Unblock never
+	// jumps straight to 'acknowledged'.
 	CompositionDecision ReleaseManifestReadoutCompositionDecision `json:"compositionDecision" yaml:"compositionDecision" mapstructure:"compositionDecision"`
 
-	// When compositionDecision was rendered -- null while it is still 'pending'.
+	// When the MOST RECENT block/acknowledge/unblock action was rendered -- see
+	// compositionDecisionBy's own description for why this can be non-null even while
+	// compositionDecision itself reads 'pending' again.
 	CompositionDecisionAt ReleaseManifestReadoutCompositionDecisionAt `json:"compositionDecisionAt,omitempty,omitzero" yaml:"compositionDecisionAt,omitempty" mapstructure:"compositionDecisionAt,omitempty"`
 
-	// The user id who rendered compositionDecision -- null while it is still
-	// 'pending'.
+	// The user id who rendered the MOST RECENT block/acknowledge/unblock action
+	// against this release -- null only when no such action has ever been taken. NOT
+	// necessarily null when compositionDecision reads 'pending' again: an Unblock
+	// action also sets this (to the unblocking admin), which is why
+	// compositionDecision alone is not enough to tell 'never decided' apart from
+	// 'decided, then reopened' -- a client checking that distinction should treat
+	// this field as the tell, not compositionDecision.
 	CompositionDecisionBy ReleaseManifestReadoutCompositionDecisionBy `json:"compositionDecisionBy,omitempty,omitzero" yaml:"compositionDecisionBy,omitempty" mapstructure:"compositionDecisionBy,omitempty"`
+
+	// Whether the diff fetch this composition review pass actually ran over was
+	// itself truncated at its own size cap -- distinct from coveragePartial above
+	// (that flag describes the CONSTITUENT-PR LISTING §15.2's manifest check ran
+	// over; this one describes the single aggregate baseRef..headRef diff §15.3's
+	// composition pass reviewed). Null exactly when compositionHeadSha is null.
+	CompositionDiffTruncated ReleaseManifestReadoutCompositionDiffTruncated `json:"compositionDiffTruncated,omitempty,omitzero" yaml:"compositionDiffTruncated,omitempty" mapstructure:"compositionDiffTruncated,omitempty"`
 
 	// §15.3's own composition findings -- empty either because compositionReviewedAt
 	// is null (not yet available, see that field's own description) or because the
 	// pass genuinely found nothing to report.
 	CompositionFindings []ReleaseCompositionFinding `json:"compositionFindings" yaml:"compositionFindings" mapstructure:"compositionFindings"`
+
+	// The commit sha compositionFindings was actually reviewed against -- recorded
+	// once, at composition-review DISPATCH time
+	// (internal/app/releasereview.dispatchCompositionReview), never at findings-post
+	// time. Null exactly when compositionReviewedAt is null (the pass was never
+	// dispatched, or dispatch itself declined for want of a live head sha/diff) -- a
+	// confirmed-major auditability fix: a verdict attributed to a diff nobody can
+	// identify afterward is not auditable.
+	CompositionHeadSha ReleaseManifestReadoutCompositionHeadSha `json:"compositionHeadSha,omitempty,omitzero" yaml:"compositionHeadSha,omitempty" mapstructure:"compositionHeadSha,omitempty"`
 
 	// §15.3's own aggregate-diff composition review pass: when it actually POSTED its
 	// findings via the composition-findings tool. Null means 'not yet available' --
@@ -7561,13 +7665,20 @@ type ReleaseManifestReadoutCompositionDecision string
 
 const ReleaseManifestReadoutCompositionDecisionAcknowledged ReleaseManifestReadoutCompositionDecision = "acknowledged"
 
-// When compositionDecision was rendered -- null while it is still 'pending'.
+// When the MOST RECENT block/acknowledge/unblock action was rendered -- see
+// compositionDecisionBy's own description for why this can be non-null even while
+// compositionDecision itself reads 'pending' again.
 type ReleaseManifestReadoutCompositionDecisionAt = *time.Time
 
 const ReleaseManifestReadoutCompositionDecisionBlocked ReleaseManifestReadoutCompositionDecision = "blocked"
 
-// The user id who rendered compositionDecision -- null while it is still
-// 'pending'.
+// The user id who rendered the MOST RECENT block/acknowledge/unblock action
+// against this release -- null only when no such action has ever been taken. NOT
+// necessarily null when compositionDecision reads 'pending' again: an Unblock
+// action also sets this (to the unblocking admin), which is why
+// compositionDecision alone is not enough to tell 'never decided' apart from
+// 'decided, then reopened' -- a client checking that distinction should treat this
+// field as the tell, not compositionDecision.
 type ReleaseManifestReadoutCompositionDecisionBy *string
 
 const ReleaseManifestReadoutCompositionDecisionPending ReleaseManifestReadoutCompositionDecision = "pending"
@@ -7597,6 +7708,22 @@ func (j *ReleaseManifestReadoutCompositionDecision) UnmarshalJSON(value []byte) 
 	*j = ReleaseManifestReadoutCompositionDecision(v)
 	return nil
 }
+
+// Whether the diff fetch this composition review pass actually ran over was itself
+// truncated at its own size cap -- distinct from coveragePartial above (that flag
+// describes the CONSTITUENT-PR LISTING §15.2's manifest check ran over; this one
+// describes the single aggregate baseRef..headRef diff §15.3's composition pass
+// reviewed). Null exactly when compositionHeadSha is null.
+type ReleaseManifestReadoutCompositionDiffTruncated *bool
+
+// The commit sha compositionFindings was actually reviewed against -- recorded
+// once, at composition-review DISPATCH time
+// (internal/app/releasereview.dispatchCompositionReview), never at findings-post
+// time. Null exactly when compositionReviewedAt is null (the pass was never
+// dispatched, or dispatch itself declined for want of a live head sha/diff) -- a
+// confirmed-major auditability fix: a verdict attributed to a diff nobody can
+// identify afterward is not auditable.
+type ReleaseManifestReadoutCompositionHeadSha *string
 
 // §15.3's own aggregate-diff composition review pass: when it actually POSTED its
 // findings via the composition-findings tool. Null means 'not yet available' --

@@ -94,6 +94,7 @@ POST /api/sessions/{sessionID}/plans/{planId}/approve
 POST /api/sessions/{sessionID}/plans/{planId}/reject
 POST /api/sessions/{sessionID}/release-manifest/acknowledge
 POST /api/sessions/{sessionID}/release-manifest/block
+POST /api/sessions/{sessionID}/release-manifest/unblock
 POST /api/sessions/{sessionID}/review/findings/{identityHash}/apply-suggestion
 POST /api/sessions/{sessionID}/review/findings/{identityHash}/rebut
 POST /api/sessions/{sessionID}/review/retrigger

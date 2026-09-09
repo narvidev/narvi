@@ -53,7 +53,7 @@ import (
 // composition_reviewed_at simply stays NULL, which httpapi/
 // releasemanifestreadout.go already renders as an honest "not yet
 // available" state (this file's own top doc comment).
-func dispatchCompositionReview(ctx context.Context, logger *slog.Logger, deps Deps, in Input) {
+func dispatchCompositionReview(ctx context.Context, logger *slog.Logger, deps Deps, in Input, checkID pgtype.UUID) {
 	if deps.CompositionTemplates == nil || deps.CompositionDiffFetcher == nil || deps.CompositionTurns == nil || deps.CompositionDispatch == nil {
 		logger.Warn("releasereview: aggregate review triggered but composition-dispatch dependencies are not configured, the composition pass will not run for this release",
 			"owner", in.Owner, "repo", in.Repo, "pr_number", in.PRNumber)
@@ -79,6 +79,29 @@ func dispatchCompositionReview(ctx context.Context, logger *slog.Logger, deps De
 			"owner", in.Owner, "repo", in.Repo, "pr_number", in.PRNumber)
 		return
 	}
+	if reviewCtx.Diff == "" {
+		// Confirmed-major fix: reviewcontext.Fetch degrades HeadSHA and
+		// Diff INDEPENDENTLY (that function's own doc comment) -- a
+		// GetPullRequest success followed by a GetCompareDiff FAILURE
+		// leaves HeadSHA populated (the check immediately above passes)
+		// while Diff stays "". Dispatching anyway used to send
+		// RenderCompositionReviewPrompt a prompt with NO diff block at
+		// all (that function's own "ctx.Diff empty... renders no diff
+		// block at all" branch) -- the reviewing agent would then have
+		// nothing to review but the tool instructions, and would very
+		// plausibly still call the composition-findings tool with an
+		// empty findings array, which release_manifest_checks.
+		// composition_reviewed_at/composition_findings would then
+		// persist as an INDISTINGUISHABLE-from-genuine "reviewed, found
+		// nothing" result. A pass that reviewed nothing must never be
+		// recorded as a pass that found nothing -- decline this cycle
+		// exactly like the missing-head-sha branch immediately above,
+		// leaving composition_reviewed_at NULL (this Step's own
+		// "not yet available" sentinel, never a fabricated clean result).
+		logger.Warn("releasereview: could not fetch this release PR's own diff, declining to dispatch the composition pass rather than review nothing and record it as a clean result",
+			"owner", in.Owner, "repo", in.Repo, "pr_number", in.PRNumber, "head_sha", reviewCtx.HeadSHA)
+		return
+	}
 
 	prompt := review.RenderCompositionReviewPrompt(template, reviewCtx)
 
@@ -97,6 +120,26 @@ func dispatchCompositionReview(ctx context.Context, logger *slog.Logger, deps De
 
 	logger.Info("releasereview: composition review turn dispatched",
 		"owner", in.Owner, "repo", in.Repo, "pr_number", in.PRNumber, "turn_id", created.ID.String())
+
+	// Confirmed-major fix (auditability): anchor this composition review to
+	// the EXACT commit/diff-completeness it actually ran against, on the
+	// SAME release_manifest_checks row its own findings will later land on
+	// -- see UpdateCompositionAnchor's own doc comment (postgres store) for
+	// the full "why at dispatch time, never at findings-post time"
+	// reasoning. checkID.Valid is false whenever persistReleaseManifestCheck
+	// itself never produced a row (store unset, or the insert failed) --
+	// there is nothing to anchor in that case, and deps.CompositionAnchor
+	// nil is this dependency's own established "caller never wired this
+	// deliverable" degrade (mirrors every other Composition* dep on this
+	// same Deps struct). Best-effort, exactly like every other step in this
+	// function: a failure (or a declined write) here never unwinds the
+	// turn dispatch that already happened above.
+	if deps.CompositionAnchor != nil && checkID.Valid {
+		if _, err := deps.CompositionAnchor.UpdateCompositionAnchor(ctx, checkID, reviewCtx.HeadSHA, reviewCtx.DiffTruncated); err != nil {
+			logger.Warn("releasereview: record composition review anchor (head sha/diff-truncated) failed",
+				"error", err, "owner", in.Owner, "repo", in.Repo, "pr_number", in.PRNumber)
+		}
+	}
 
 	if err := deps.CompositionDispatch.EnsureDispatched(ctx, in.SessionID); err != nil {
 		logger.Warn("releasereview: ensure-dispatched after composition review turn insert failed",
@@ -131,6 +174,19 @@ type CompositionTemplateFetcher interface {
 // interface so a unit test can inject a fake with no real DB round trip.
 type CompositionTurnInserter interface {
 	Create(ctx context.Context, arg sqlcgen.CreateTurnParams) (sqlcgen.Turn, error)
+}
+
+// CompositionAnchorUpdater is the narrow slice of
+// *postgres.ReleaseManifestCheckStore this package needs to record
+// composition_head_sha/composition_diff_truncated (migrations/
+// 000128_release_manifest_checks_composition_anchor.up.sql) -- mirrors
+// CompositionTurnInserter's own identical "small, locally-defined
+// interface so a unit test can inject a fake" precedent immediately
+// below. *postgres.ReleaseManifestCheckStore satisfies this directly
+// (UpdateCompositionAnchor already exists on it, alongside
+// UpdateCompositionFindings/UpdateCompositionDecision).
+type CompositionAnchorUpdater interface {
+	UpdateCompositionAnchor(ctx context.Context, id pgtype.UUID, headSHA string, diffTruncated bool) (sqlcgen.ReleaseManifestCheck, error)
 }
 
 // CompositionDispatcher is this package's own narrow "please dispatch

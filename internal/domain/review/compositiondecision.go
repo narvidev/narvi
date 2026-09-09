@@ -49,7 +49,7 @@ const (
 	CompositionDecisionAcknowledged CompositionDecision = "acknowledged"
 )
 
-// CompositionDecisionAction is one of the two §12.2 item 9 actions a
+// CompositionDecisionAction is one of the three §12.2 item 9 actions a
 // human may take against a release's own composition findings.
 type CompositionDecisionAction string
 
@@ -63,6 +63,24 @@ const (
 	// comment for the RBAC placement this decision's caller enforces --
 	// this package itself carries no RBAC concept at all, §11).
 	CompositionDecisionActionAcknowledge CompositionDecisionAction = "acknowledge"
+	// CompositionDecisionActionUnblock is the "Unblock" action -- a
+	// confirmed-major fix: a maintainer's Block used to be TERMINAL in
+	// this table (no entry existed for CompositionDecisionBlocked as a
+	// starting state at all), which meant the strictly MORE privileged
+	// admin-only Acknowledge & ship (CompositionDecisionActionAcknowledge)
+	// could never run once a maintainer had blocked -- a
+	// lower-privileged action a higher-privileged one could not undo,
+	// inverting this system's own privilege gate everywhere else (an
+	// admin can always do at least what a maintainer can). Unblock
+	// reopens a Blocked decision back to Pending -- never straight to
+	// Acknowledged, so the SAME admin-only Acknowledge & ship action still
+	// has to be exercised explicitly afterward, keeping the "acknowledging
+	// a real finding is its own deliberate act" property this decision's
+	// own doc comment already establishes for the forward direction. See
+	// internal/domain/authz.ActionUnblockReleaseComposition's own doc
+	// comment for why this is gated admin-only, not maintainer+ -- undoing
+	// a safety-additive action is itself a risk-accepting one.
+	CompositionDecisionActionUnblock CompositionDecisionAction = "unblock"
 )
 
 // ErrIllegalCompositionDecisionTransition is TransitionCompositionDecision's
@@ -77,18 +95,25 @@ var ErrIllegalCompositionDecisionTransition = errors.New("review: illegal compos
 
 // compositionDecisionTransitions is this decision's own explicit
 // transition table -- see this file's own top doc comment for why an
-// explicit map, not inferred logic, and why sized to exactly one
-// non-terminal state. Deliberately has NO entries for
-// CompositionDecisionBlocked/CompositionDecisionAcknowledged as a
-// starting state: once decided, a composition decision never transitions
-// again through this table -- a later composition review pass (a fresh
-// release_manifest_checks row, a possible later extension) would carry
-// its own fresh CompositionDecisionPending, never flip an existing
-// terminal decision back.
+// explicit map, not inferred logic. CompositionDecisionAcknowledged
+// still has NO entries as a starting state (unchanged): acknowledging is
+// this table's own genuinely terminal state -- an admin has already
+// exercised the strictest override this decision offers, and there is no
+// further action left for ANY role to take against it. CompositionDecisionBlocked,
+// by contrast, is NOT fully terminal (confirmed-major fix, this file's
+// own top doc comment): CompositionDecisionActionUnblock reopens it back
+// to Pending, so the admin-only Acknowledge & ship path remains reachable
+// even after a maintainer's Block -- a later composition review pass (a
+// fresh release_manifest_checks row) is unaffected either way, since that
+// always starts its own fresh row at CompositionDecisionPending
+// regardless of what this table does with an EXISTING row's decision.
 var compositionDecisionTransitions = map[CompositionDecision]map[CompositionDecisionAction]CompositionDecision{
 	CompositionDecisionPending: {
 		CompositionDecisionActionBlock:       CompositionDecisionBlocked,
 		CompositionDecisionActionAcknowledge: CompositionDecisionAcknowledged,
+	},
+	CompositionDecisionBlocked: {
+		CompositionDecisionActionUnblock: CompositionDecisionPending,
 	},
 }
 

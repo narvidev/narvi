@@ -12,7 +12,7 @@ import (
 )
 
 const getLatestReleaseManifestCheck = `-- name: GetLatestReleaseManifestCheck :one
-SELECT id, session_id, repo_full_name, pr_number, base_ref, head_ref, constituent_pr_count, coverage_partial, aggregate_review_triggered, aggregate_review_trigger_reasons, findings, merged_prs, created_at, composition_reviewed_at, composition_findings, composition_decision, composition_decision_by, composition_decision_at FROM release_manifest_checks
+SELECT id, session_id, repo_full_name, pr_number, base_ref, head_ref, constituent_pr_count, coverage_partial, aggregate_review_triggered, aggregate_review_trigger_reasons, findings, merged_prs, created_at, composition_reviewed_at, composition_findings, composition_decision, composition_decision_by, composition_decision_at, composition_head_sha, composition_diff_truncated FROM release_manifest_checks
 WHERE repo_full_name = $1 AND pr_number = $2
 ORDER BY created_at DESC
 LIMIT 1
@@ -51,12 +51,14 @@ func (q *Queries) GetLatestReleaseManifestCheck(ctx context.Context, arg GetLate
 		&i.CompositionDecision,
 		&i.CompositionDecisionBy,
 		&i.CompositionDecisionAt,
+		&i.CompositionHeadSha,
+		&i.CompositionDiffTruncated,
 	)
 	return i, err
 }
 
 const getLatestReleaseManifestCheckBySessionID = `-- name: GetLatestReleaseManifestCheckBySessionID :one
-SELECT id, session_id, repo_full_name, pr_number, base_ref, head_ref, constituent_pr_count, coverage_partial, aggregate_review_triggered, aggregate_review_trigger_reasons, findings, merged_prs, created_at, composition_reviewed_at, composition_findings, composition_decision, composition_decision_by, composition_decision_at FROM release_manifest_checks
+SELECT id, session_id, repo_full_name, pr_number, base_ref, head_ref, constituent_pr_count, coverage_partial, aggregate_review_triggered, aggregate_review_trigger_reasons, findings, merged_prs, created_at, composition_reviewed_at, composition_findings, composition_decision, composition_decision_by, composition_decision_at, composition_head_sha, composition_diff_truncated FROM release_manifest_checks
 WHERE session_id = $1
 ORDER BY created_at DESC
 LIMIT 1
@@ -93,6 +95,8 @@ func (q *Queries) GetLatestReleaseManifestCheckBySessionID(ctx context.Context, 
 		&i.CompositionDecision,
 		&i.CompositionDecisionBy,
 		&i.CompositionDecisionAt,
+		&i.CompositionHeadSha,
+		&i.CompositionDiffTruncated,
 	)
 	return i, err
 }
@@ -106,7 +110,7 @@ INSERT INTO release_manifest_checks (
     findings, merged_prs
 )
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-RETURNING id, session_id, repo_full_name, pr_number, base_ref, head_ref, constituent_pr_count, coverage_partial, aggregate_review_triggered, aggregate_review_trigger_reasons, findings, merged_prs, created_at, composition_reviewed_at, composition_findings, composition_decision, composition_decision_by, composition_decision_at
+RETURNING id, session_id, repo_full_name, pr_number, base_ref, head_ref, constituent_pr_count, coverage_partial, aggregate_review_triggered, aggregate_review_trigger_reasons, findings, merged_prs, created_at, composition_reviewed_at, composition_findings, composition_decision, composition_decision_by, composition_decision_at, composition_head_sha, composition_diff_truncated
 `
 
 type InsertReleaseManifestCheckParams struct {
@@ -167,6 +171,63 @@ func (q *Queries) InsertReleaseManifestCheck(ctx context.Context, arg InsertRele
 		&i.CompositionDecision,
 		&i.CompositionDecisionBy,
 		&i.CompositionDecisionAt,
+		&i.CompositionHeadSha,
+		&i.CompositionDiffTruncated,
+	)
+	return i, err
+}
+
+const updateReleaseManifestCompositionAnchor = `-- name: UpdateReleaseManifestCompositionAnchor :one
+UPDATE release_manifest_checks
+SET composition_head_sha = $2,
+    composition_diff_truncated = $3
+WHERE id = $1 AND composition_head_sha IS NULL
+RETURNING id, session_id, repo_full_name, pr_number, base_ref, head_ref, constituent_pr_count, coverage_partial, aggregate_review_triggered, aggregate_review_trigger_reasons, findings, merged_prs, created_at, composition_reviewed_at, composition_findings, composition_decision, composition_decision_by, composition_decision_at, composition_head_sha, composition_diff_truncated
+`
+
+type UpdateReleaseManifestCompositionAnchorParams struct {
+	ID                       pgtype.UUID `json:"id"`
+	CompositionHeadSha       *string     `json:"composition_head_sha"`
+	CompositionDiffTruncated *bool       `json:"composition_diff_truncated"`
+}
+
+// Confirmed-major fix (migrations/000128_release_manifest_checks_
+// composition_anchor.up.sql): internal/app/releasereview.
+// dispatchCompositionReview's own write, immediately after it creates
+// this release's own composition review turn -- records WHICH commit
+// (headSHA, the SAME value just persisted as that turn's own
+// turns.review_head_sha) and whether that turn's own diff fetch was
+// itself truncated, so a later-posted composition finding is anchored to
+// an identifiable diff rather than an untraceable one. Guarded
+// ("AND composition_head_sha IS NULL") so a duplicate/retried dispatch for
+// the SAME row can never silently overwrite an already-recorded anchor
+// with a different one; pgx.ErrNoRows means an anchor was already
+// recorded, harmless and expected for that case (best-effort, logged, not
+// propagated -- see the Go call site's own doc comment).
+func (q *Queries) UpdateReleaseManifestCompositionAnchor(ctx context.Context, arg UpdateReleaseManifestCompositionAnchorParams) (ReleaseManifestCheck, error) {
+	row := q.db.QueryRow(ctx, updateReleaseManifestCompositionAnchor, arg.ID, arg.CompositionHeadSha, arg.CompositionDiffTruncated)
+	var i ReleaseManifestCheck
+	err := row.Scan(
+		&i.ID,
+		&i.SessionID,
+		&i.RepoFullName,
+		&i.PrNumber,
+		&i.BaseRef,
+		&i.HeadRef,
+		&i.ConstituentPrCount,
+		&i.CoveragePartial,
+		&i.AggregateReviewTriggered,
+		&i.AggregateReviewTriggerReasons,
+		&i.Findings,
+		&i.MergedPrs,
+		&i.CreatedAt,
+		&i.CompositionReviewedAt,
+		&i.CompositionFindings,
+		&i.CompositionDecision,
+		&i.CompositionDecisionBy,
+		&i.CompositionDecisionAt,
+		&i.CompositionHeadSha,
+		&i.CompositionDiffTruncated,
 	)
 	return i, err
 }
@@ -177,7 +238,7 @@ SET composition_decision = $2,
     composition_decision_by = $3,
     composition_decision_at = now()
 WHERE id = $1 AND composition_decision = $4
-RETURNING id, session_id, repo_full_name, pr_number, base_ref, head_ref, constituent_pr_count, coverage_partial, aggregate_review_triggered, aggregate_review_trigger_reasons, findings, merged_prs, created_at, composition_reviewed_at, composition_findings, composition_decision, composition_decision_by, composition_decision_at
+RETURNING id, session_id, repo_full_name, pr_number, base_ref, head_ref, constituent_pr_count, coverage_partial, aggregate_review_triggered, aggregate_review_trigger_reasons, findings, merged_prs, created_at, composition_reviewed_at, composition_findings, composition_decision, composition_decision_by, composition_decision_at, composition_head_sha, composition_diff_truncated
 `
 
 type UpdateReleaseManifestCompositionDecisionParams struct {
@@ -222,6 +283,8 @@ func (q *Queries) UpdateReleaseManifestCompositionDecision(ctx context.Context, 
 		&i.CompositionDecision,
 		&i.CompositionDecisionBy,
 		&i.CompositionDecisionAt,
+		&i.CompositionHeadSha,
+		&i.CompositionDiffTruncated,
 	)
 	return i, err
 }
@@ -231,7 +294,7 @@ UPDATE release_manifest_checks
 SET composition_reviewed_at = now(),
     composition_findings = $2
 WHERE id = $1 AND composition_reviewed_at IS NULL
-RETURNING id, session_id, repo_full_name, pr_number, base_ref, head_ref, constituent_pr_count, coverage_partial, aggregate_review_triggered, aggregate_review_trigger_reasons, findings, merged_prs, created_at, composition_reviewed_at, composition_findings, composition_decision, composition_decision_by, composition_decision_at
+RETURNING id, session_id, repo_full_name, pr_number, base_ref, head_ref, constituent_pr_count, coverage_partial, aggregate_review_triggered, aggregate_review_trigger_reasons, findings, merged_prs, created_at, composition_reviewed_at, composition_findings, composition_decision, composition_decision_by, composition_decision_at, composition_head_sha, composition_diff_truncated
 `
 
 type UpdateReleaseManifestCompositionFindingsParams struct {
@@ -273,6 +336,8 @@ func (q *Queries) UpdateReleaseManifestCompositionFindings(ctx context.Context, 
 		&i.CompositionDecision,
 		&i.CompositionDecisionBy,
 		&i.CompositionDecisionAt,
+		&i.CompositionHeadSha,
+		&i.CompositionDiffTruncated,
 	)
 	return i, err
 }

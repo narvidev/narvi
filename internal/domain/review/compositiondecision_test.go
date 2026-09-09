@@ -8,10 +8,14 @@ import (
 )
 
 // TestTransitionCompositionDecision covers §12.2 item 9's own "Block
-// release / Acknowledge & ship" transition table (compositiondecision.go):
-// exactly two legal transitions, both out of Pending, both terminal, and
-// every other (current, action) pair -- including an already-decided
-// current and an unrecognized/zero-value current -- is illegal.
+// release / Acknowledge & ship [/ Unblock]" transition table
+// (compositiondecision.go): two legal transitions out of Pending (both
+// ending in a decided state), one further legal transition out of Blocked
+// back to Pending (the confirmed-major "unblock path" fix -- Blocked is
+// no longer fully terminal), Acknowledged remains genuinely terminal with
+// no outgoing edge at all, and every other (current, action) pair --
+// including an already-decided current, an unrecognized/zero-value
+// current, and unblock attempted from anywhere but Blocked -- is illegal.
 func TestTransitionCompositionDecision(t *testing.T) {
 	t.Parallel()
 
@@ -35,27 +39,45 @@ func TestTransitionCompositionDecision(t *testing.T) {
 			want:    review.CompositionDecisionAcknowledged,
 		},
 		{
-			name:    "blocked + block -> illegal (terminal)",
+			name:    "blocked + block -> illegal (no re-block)",
 			current: review.CompositionDecisionBlocked,
 			action:  review.CompositionDecisionActionBlock,
 			wantErr: true,
 		},
 		{
-			name:    "blocked + acknowledge -> illegal (terminal)",
+			name:    "blocked + acknowledge -> illegal (must unblock first)",
 			current: review.CompositionDecisionBlocked,
 			action:  review.CompositionDecisionActionAcknowledge,
 			wantErr: true,
 		},
 		{
-			name:    "acknowledged + block -> illegal (terminal)",
+			name:    "blocked + unblock -> pending (the confirmed-major fix)",
+			current: review.CompositionDecisionBlocked,
+			action:  review.CompositionDecisionActionUnblock,
+			want:    review.CompositionDecisionPending,
+		},
+		{
+			name:    "pending + unblock -> illegal (nothing to unblock)",
+			current: review.CompositionDecisionPending,
+			action:  review.CompositionDecisionActionUnblock,
+			wantErr: true,
+		},
+		{
+			name:    "acknowledged + block -> illegal (fully terminal)",
 			current: review.CompositionDecisionAcknowledged,
 			action:  review.CompositionDecisionActionBlock,
 			wantErr: true,
 		},
 		{
-			name:    "acknowledged + acknowledge -> illegal (terminal)",
+			name:    "acknowledged + acknowledge -> illegal (fully terminal)",
 			current: review.CompositionDecisionAcknowledged,
 			action:  review.CompositionDecisionActionAcknowledge,
+			wantErr: true,
+		},
+		{
+			name:    "acknowledged + unblock -> illegal (fully terminal)",
+			current: review.CompositionDecisionAcknowledged,
+			action:  review.CompositionDecisionActionUnblock,
 			wantErr: true,
 		},
 		{

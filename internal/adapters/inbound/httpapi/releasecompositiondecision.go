@@ -1,14 +1,16 @@
 // This file (releasecompositiondecision.go) implements §12.2 item 9's own
-// two composition-finding actions ("Block release / Acknowledge & ship"):
+// composition-finding actions ("Block release / Acknowledge & ship /
+// Unblock"):
 //
 //   - POST /api/sessions/{sessionID}/release-manifest/block
 //   - POST /api/sessions/{sessionID}/release-manifest/acknowledge
+//   - POST /api/sessions/{sessionID}/release-manifest/unblock
 //
-// Both resolve their target release_manifest_checks row from sessionID
-// alone (ReleaseManifestCheckStore.GetBySessionID, the
+// All three resolve their target release_manifest_checks row from
+// sessionID alone (ReleaseManifestCheckStore.GetBySessionID, the
 // addition), validate the requested transition via internal/domain/review.
 // TransitionCompositionDecision (an already-decided composition, or one
-// whose own composition review has not completed yet, rejects both
+// whose own composition review has not completed yet, rejects all three
 // actions), then persist it via a guarded compare-and-swap
 // (ReleaseManifestCheckStore.UpdateCompositionDecision) keyed on the SAME
 // current value just validated -- a concurrent decision loses the race
@@ -16,7 +18,7 @@
 // own established guarded-write discipline, e.g. reviewfindings.go's own
 // finding-status transitions).
 //
-// # RBAC: two different rows for two different risk shapes
+// # RBAC: three different rows for three different risk shapes
 //
 // Block reuses authz.ActionEditReviewVerdict (§13.3 row 5, admin/
 // maintainer) -- blocking is the SAFETY-additive response to a
@@ -30,15 +32,26 @@
 // reasoning: this is a human electing to ship AS IS, specifically DESPITE
 // an already-computed cross-PR risk signal, an override in the same
 // admin-gated class as every other row-6 action.
+//
+// Unblock (confirmed-major fix: Block used to be terminal, permanently
+// voiding Acknowledge & ship once a maintainer had blocked) gates on the
+// NEW authz.ActionUnblockReleaseComposition, the SAME admin-only row as
+// Acknowledge -- see that action's own doc comment for the full "why
+// admin-only" reasoning: only the tier that may ship despite a
+// composition finding may also remove the safety block a maintainer
+// placed on one.
 
 package httpapi
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
@@ -49,8 +62,8 @@ import (
 )
 
 // releaseCompositionDecisionRouteContext resolves {sessionID} into the
-// values BlockReleaseComposition/AcknowledgeReleaseComposition both need:
-// the session must exist (404), the caller must pass action (403), this
+// values every decision action (Block/Acknowledge/Unblock) needs: the
+// session must exist (404), the caller must pass action (403), this
 // session must have a release manifest check on record at all (400), and
 // that check's own composition review must have actually completed (400
 // -- §15.3's own "not yet available" sentinel: composition_reviewed_at
@@ -110,9 +123,22 @@ func releaseCompositionDecisionRouteContext(w http.ResponseWriter, r *http.Reque
 }
 
 // decideReleaseComposition is the shared core BlockReleaseComposition/
-// AcknowledgeReleaseComposition both call: validate the transition,
-// persist it via a guarded compare-and-swap, audit-log it, and respond.
-func decideReleaseComposition(w http.ResponseWriter, r *http.Request, sessions *postgres.SessionStore, releaseManifestChecks *postgres.ReleaseManifestCheckStore, auditLog *postgres.AuditLogStore, action authz.Action, decisionAction review.CompositionDecisionAction, auditAction string) {
+// AcknowledgeReleaseComposition/UnblockReleaseComposition all call:
+// validate the transition, persist it via a guarded compare-and-swap and
+// audit-log it IN ONE TRANSACTION, and respond.
+//
+// Confirmed-major fix (transactional audit): the guarded UPDATE and its
+// own audit_log row now run on one pool.Begin transaction, committed only
+// once BOTH have succeeded -- mirrors decideplan.go's own DecidePlan/
+// DecidePlanOnTx split and audit.go's own top doc comment ("written in
+// the same transaction as the change"). BEFORE this fix, these were two
+// independent pool-scoped calls: a failure recording the audit row (a
+// transient DB error, a connection drop) left the decision UPDATE already
+// durably committed on its own -- an irreversible override (Block/
+// Acknowledge/Unblock all change what a human can act on next) with NO
+// audit trail, exactly the kind of unattributed state change §13.3's own
+// audit requirement exists to make impossible.
+func decideReleaseComposition(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, sessions *postgres.SessionStore, releaseManifestChecks *postgres.ReleaseManifestCheckStore, auditLog *postgres.AuditLogStore, action authz.Action, decisionAction review.CompositionDecisionAction, auditAction string) {
 	sessionID, check, actorUserID, ok := releaseCompositionDecisionRouteContext(w, r, sessions, releaseManifestChecks, action)
 	if !ok {
 		return
@@ -127,25 +153,27 @@ func decideReleaseComposition(w http.ResponseWriter, r *http.Request, sessions *
 		return
 	}
 
-	updated, err := releaseManifestChecks.UpdateCompositionDecision(ctx, check.ID, string(current), string(next), actorUserID)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		logger.Error("httpapi: begin release composition decision tx failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	updated, err := decideReleaseCompositionOnTx(ctx, tx, releaseManifestChecks, auditLog, sessionID, check.ID, actorUserID, current, next, auditAction)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			writeError(w, http.StatusConflict, "this release's composition decision was changed concurrently")
 			return
 		}
-		logger.Error("httpapi: update release composition decision failed", "error", err)
+		logger.Error("httpapi: decide release composition failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
-	if err := recordAuditLog(ctx, auditLog, actorUserID, auditAction, "release_manifest_check", updated.ID.String(), map[string]any{
-		"session_id":     sessionID.String(),
-		"repo_full_name": updated.RepoFullName,
-		"pr_number":      updated.PrNumber,
-		"prior_decision": string(current),
-		"new_decision":   string(next),
-	}); err != nil {
-		logger.Error("httpapi: record "+auditAction+" audit log failed", "error", err)
+	if err := tx.Commit(ctx); err != nil {
+		logger.Error("httpapi: commit release composition decision tx failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
@@ -158,12 +186,38 @@ func decideReleaseComposition(w http.ResponseWriter, r *http.Request, sessions *
 	})
 }
 
+// decideReleaseCompositionOnTx performs the guarded compare-and-swap
+// UPDATE and its own audit_log row on tx, an already-open transaction --
+// see decideReleaseComposition's own doc comment for why these two writes
+// must never commit independently of each other. pgx.ErrNoRows
+// (unwrapped) means the guarded UPDATE's own CAS predicate lost a
+// concurrent race -- see UpdateReleaseManifestCompositionDecision's own
+// doc comment (queries/releasemanifestchecks.sql).
+func decideReleaseCompositionOnTx(ctx context.Context, tx pgx.Tx, releaseManifestChecks *postgres.ReleaseManifestCheckStore, auditLog *postgres.AuditLogStore, sessionID, checkID, actorUserID pgtype.UUID, current, next review.CompositionDecision, auditAction string) (sqlcgen.ReleaseManifestCheck, error) {
+	updated, err := releaseManifestChecks.WithTx(tx).UpdateCompositionDecision(ctx, checkID, string(current), string(next), actorUserID)
+	if err != nil {
+		return sqlcgen.ReleaseManifestCheck{}, err
+	}
+
+	if err := recordAuditLog(ctx, auditLog.WithTx(tx), actorUserID, auditAction, "release_manifest_check", updated.ID.String(), map[string]any{
+		"session_id":     sessionID.String(),
+		"repo_full_name": updated.RepoFullName,
+		"pr_number":      updated.PrNumber,
+		"prior_decision": string(current),
+		"new_decision":   string(next),
+	}); err != nil {
+		return sqlcgen.ReleaseManifestCheck{}, fmt.Errorf("httpapi: record %s audit log: %w", auditAction, err)
+	}
+
+	return updated, nil
+}
+
 // BlockReleaseComposition backs POST /api/sessions/{sessionID}/
 // release-manifest/block -- admin/maintainer (authz.ActionEditReviewVerdict,
 // see this file's own top doc comment for why this row).
-func BlockReleaseComposition(sessions *postgres.SessionStore, releaseManifestChecks *postgres.ReleaseManifestCheckStore, auditLog *postgres.AuditLogStore) http.HandlerFunc {
+func BlockReleaseComposition(pool *pgxpool.Pool, sessions *postgres.SessionStore, releaseManifestChecks *postgres.ReleaseManifestCheckStore, auditLog *postgres.AuditLogStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		decideReleaseComposition(w, r, sessions, releaseManifestChecks, auditLog, authz.ActionEditReviewVerdict, review.CompositionDecisionActionBlock, "release_manifest_check.block")
+		decideReleaseComposition(w, r, pool, sessions, releaseManifestChecks, auditLog, authz.ActionEditReviewVerdict, review.CompositionDecisionActionBlock, "release_manifest_check.block")
 	}
 }
 
@@ -171,8 +225,22 @@ func BlockReleaseComposition(sessions *postgres.SessionStore, releaseManifestChe
 // release-manifest/acknowledge -- admin only
 // (authz.ActionAcknowledgeReleaseComposition, see this file's own top doc
 // comment for why this stricter row).
-func AcknowledgeReleaseComposition(sessions *postgres.SessionStore, releaseManifestChecks *postgres.ReleaseManifestCheckStore, auditLog *postgres.AuditLogStore) http.HandlerFunc {
+func AcknowledgeReleaseComposition(pool *pgxpool.Pool, sessions *postgres.SessionStore, releaseManifestChecks *postgres.ReleaseManifestCheckStore, auditLog *postgres.AuditLogStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		decideReleaseComposition(w, r, sessions, releaseManifestChecks, auditLog, authz.ActionAcknowledgeReleaseComposition, review.CompositionDecisionActionAcknowledge, "release_manifest_check.acknowledge")
+		decideReleaseComposition(w, r, pool, sessions, releaseManifestChecks, auditLog, authz.ActionAcknowledgeReleaseComposition, review.CompositionDecisionActionAcknowledge, "release_manifest_check.acknowledge")
+	}
+}
+
+// UnblockReleaseComposition backs POST /api/sessions/{sessionID}/
+// release-manifest/unblock -- admin only
+// (authz.ActionUnblockReleaseComposition, see this file's own top doc
+// comment for why this stricter row). Confirmed-major fix: closes the
+// "Block is terminal, permanently voiding the admin-only Acknowledge &
+// ship" gap -- see internal/domain/review.CompositionDecisionActionUnblock's
+// own doc comment for why this reopens back to pending rather than
+// straight to acknowledged.
+func UnblockReleaseComposition(pool *pgxpool.Pool, sessions *postgres.SessionStore, releaseManifestChecks *postgres.ReleaseManifestCheckStore, auditLog *postgres.AuditLogStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		decideReleaseComposition(w, r, pool, sessions, releaseManifestChecks, auditLog, authz.ActionUnblockReleaseComposition, review.CompositionDecisionActionUnblock, "release_manifest_check.unblock")
 	}
 }

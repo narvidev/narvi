@@ -105,7 +105,13 @@ type Deps struct {
 	CompositionDiffFetcher reviewcontext.Fetcher
 	CompositionTurns       CompositionTurnInserter
 	CompositionDispatch    CompositionDispatcher
-	Timeouts               platform.Timeouts
+	// CompositionAnchor (§15.3, confirmed-major auditability fix) records
+	// composition_head_sha/composition_diff_truncated at dispatch time --
+	// nil-safe, mirroring every other Composition* dep immediately above:
+	// unset simply means a dispatched composition review's own findings
+	// carry no recorded anchor, never a panic or a degraded manifest check.
+	CompositionAnchor CompositionAnchorUpdater
+	Timeouts          platform.Timeouts
 }
 
 // Input is what Run needs to know about the just-detected release PR.
@@ -172,8 +178,30 @@ func Run(ctx context.Context, logger *slog.Logger, deps Deps, in Input) {
 	}
 
 	findings := review.ComputeReleaseManifestFindings(domainMerged)
-	aggregateReview := review.ShouldRunAggregateReview(domainMerged)
+	// Confirmed-major fix: truncated (below) is now ALSO its own trigger
+	// for the aggregate/composition pass, folded in at this app-layer
+	// orchestration point rather than inside review.ShouldRunAggregateReview
+	// itself -- that function stays pure and scoped to exactly §15.3's
+	// three named OR-conditions over the (possibly incomplete) []MergedPR
+	// it was actually given (internal/domain/review/aggregatereview.go's
+	// own doc comment, and its own tests, are both unchanged by this fix).
+	// A truncated constituent-PR listing means those three conditions were
+	// evaluated over an INCOMPLETE set -- a real trigger could easily have
+	// been missed entirely (e.g. the ≥3-overlapping-PRs condition, undercounted
+	// because some constituent PRs were never even listed). Silently
+	// skipping the composition pass in exactly the case where this check's
+	// own input is known-incomplete would be the same "absence of a
+	// finding is not a completeness guarantee" trap §15.2's own
+	// coveragePartial discipline already refuses everywhere else on this
+	// same row (RenderManifestComment/GetReleaseManifestReadout/
+	// decisioninbox's own resolveReleaseCut) -- so this run treats a
+	// truncated scan as itself sufficient reason to run the aggregate
+	// diff review conservatively, never a silent no-op.
+	aggregateReview := review.ShouldRunAggregateReview(domainMerged) || truncated
 	triggerReasons := review.AggregateReviewTriggerReasons(domainMerged)
+	if truncated {
+		triggerReasons = append(triggerReasons, "this release's own constituent pull request listing was incomplete, so the composition criteria above could not be fully evaluated over the complete set")
+	}
 	// Blocking-finding fix #5: truncated (ListMergedBetween's own second
 	// return -- see MergedPRLister's own doc comment) is threaded through
 	// so the rendered comment never claims a completeness guarantee this
@@ -190,7 +218,13 @@ func Run(ctx context.Context, logger *slog.Logger, deps Deps, in Input) {
 	// data above, alongside (never instead of) the outbox-delivered
 	// comment below -- see persist.go's own doc comment for why this
 	// exists and why it is best-effort.
-	persistReleaseManifestCheck(ctx, logger, deps.ReleaseManifestChecks, in, domainMerged, findings, aggregateReview, triggerReasons, truncated)
+	// checkID is the zero-value, Valid==false pgtype.UUID whenever
+	// persistReleaseManifestCheck's own store was unset or its insert
+	// failed (that function's own second, ok bool return -- deliberately
+	// unread here: checkID.Valid alone already tells
+	// dispatchCompositionReview everything it needs, this file's own
+	// comment on that call below).
+	checkID, _ := persistReleaseManifestCheck(ctx, logger, deps.ReleaseManifestChecks, in, domainMerged, findings, aggregateReview, triggerReasons, truncated)
 
 	// §15.3: dispatch the actual composition review pass, once
 	// its own trigger decision (aggregateReview, above) fires -- see
@@ -199,9 +233,14 @@ func Run(ctx context.Context, logger *slog.Logger, deps Deps, in Input) {
 	// Called AFTER persistReleaseManifestCheck above so the
 	// release_manifest_checks row this dispatches against already exists
 	// by the time the composition-findings-posting tool's own later call
-	// looks it up by session id.
+	// looks it up by session id. checkID lets dispatchCompositionReview
+	// anchor composition_head_sha/composition_diff_truncated against the
+	// SAME row -- checkID.Valid == false (store unset, or the insert
+	// itself failed) simply means that anchor write is skipped
+	// (dispatchCompositionReview's own nil/Valid-gated posture), never a
+	// reason to skip dispatching the pass itself.
 	if aggregateReview {
-		dispatchCompositionReview(ctx, logger, deps, in)
+		dispatchCompositionReview(ctx, logger, deps, in, checkID)
 	}
 
 	payload, err := json.Marshal(githubapi.ReleaseManifestPayload{

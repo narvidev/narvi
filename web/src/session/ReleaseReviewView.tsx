@@ -29,7 +29,7 @@ import { Link } from '@tanstack/react-router'
 
 import type { ReleaseManifestReadout } from '@narvi/contracts/rest-dtos'
 
-import { acknowledgeReleaseComposition, blockReleaseComposition, getReleaseManifestReadout } from '../api/endpoints'
+import { acknowledgeReleaseComposition, blockReleaseComposition, getReleaseManifestReadout, unblockReleaseComposition } from '../api/endpoints'
 import { reviewQueryKeys } from '../api/queryKeys'
 import { meQueryOptions } from '../auth/session'
 import { formatRelativeTime } from './relativeTime'
@@ -42,11 +42,22 @@ function T({ text }: { text: string }) {
   return <>{truncateForDisplay(text, MAX_FIELD_CHARS)}</>
 }
 
-function isMaintainerPlus(role: string | undefined): boolean {
+// isMaintainerPlus/isAdmin are exported (test-integrity fix): the ONLY
+// caller inside this file passes their own boolean RESULT into
+// ReleaseManifestBody as canBlock/canAcknowledge/canUnblock, so a
+// rendering test that hand-passes those booleans directly (as this
+// file's own render-safety tests used to) never actually exercises
+// either function -- an inverted `role === 'viewer'` typo here, or a
+// role string drifting from what GET /api/me actually returns, would
+// pass every existing test unnoticed. Exporting lets
+// __tests__/reviewRendering.test.tsx derive its own canBlock/
+// canAcknowledge/canUnblock from a REAL role string, the same way the
+// one production call site (ReleaseReviewView, below) does.
+export function isMaintainerPlus(role: string | undefined): boolean {
   return role === 'admin' || role === 'maintainer'
 }
 
-function isAdmin(role: string | undefined): boolean {
+export function isAdmin(role: string | undefined): boolean {
   return role === 'admin'
 }
 
@@ -92,6 +103,59 @@ function compositionFindingKindLabel(kind: string): string {
       return 'invalidated assumption'
     default:
       return 'other'
+  }
+}
+
+/**
+ * compositionDecisionChip/compositionDecisionSummaryText both render
+ * readout.compositionDecision -- a CLOSED, three-value server enum
+ * ('pending' | 'blocked' | 'acknowledged', contracts/rest/v1/dtos.schema.
+ * json). A prior version of this file matched with `!== 'pending'` and
+ * then picked between 'blocked' and an "acknowledged & shipped" FALLBACK
+ * for anything else -- which is fail-OPEN in exactly the wrong direction:
+ * the server's own generated restdtos.
+ * ReleaseManifestReadoutCompositionDecision zero value is the empty
+ * string (never a valid enum member, doc.go's own "an unset field is
+ * never confused with a real value" discipline), so a readout this view
+ * had not yet populated -- BEFORE the composition-fields-population fix
+ * this Step also lands -- rendered a green "acknowledged & shipped" chip
+ * immediately above the prose saying the pass had not even completed. An
+ * out-of-enum value (an unrecognized future member, a transport bug, this
+ * exact regression happening again) must fall to the SAME neutral "no
+ * decision rendered" branch 'pending' itself takes, never the
+ * risk-accepting affirmative one -- these two functions therefore each
+ * switch on the two REAL terminal values only, with every other input
+ * (including 'pending') falling through to a shared, neutral default.
+ */
+function compositionDecisionChip(decision: string) {
+  switch (decision) {
+    case 'blocked':
+      return (
+        <span className="chip crit" style={{ marginLeft: 8 }}>
+          <span className="dot" />
+          blocked
+        </span>
+      )
+    case 'acknowledged':
+      return (
+        <span className="chip ok" style={{ marginLeft: 8 }}>
+          <span className="dot" />
+          acknowledged & shipped
+        </span>
+      )
+    default:
+      return null
+  }
+}
+
+function compositionDecisionSummaryText(decision: string): string | null {
+  switch (decision) {
+    case 'blocked':
+      return 'Blocked'
+    case 'acknowledged':
+      return 'Acknowledged & shipped'
+    default:
+      return null
   }
 }
 
@@ -144,8 +208,39 @@ function CompositionDecisionActions({ sessionId, canBlock, canAcknowledge }: { s
   )
 }
 
+/**
+ * UnblockAction is the confirmed-major "unblock path" fix's own leaf:
+ * mirrors CompositionDecisionActions' own "QueryClientProvider only
+ * needed here" isolation exactly, mounted ONLY when compositionDecision
+ * reads 'blocked' AND the caller passes authz.ActionUnblockReleaseComposition
+ * (admin only, the SAME row as Acknowledge & ship -- see that action's own
+ * doc comment). Reopens back to 'pending', never straight to
+ * 'acknowledged' -- the SAME admin-only Acknowledge & ship button above
+ * still has to be clicked separately afterward.
+ */
+function UnblockAction({ sessionId }: { sessionId: string }) {
+  const queryClient = useQueryClient()
+  const unblockMutation = useMutation({
+    mutationFn: () => unblockReleaseComposition(sessionId),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: reviewQueryKeys.releaseManifest(sessionId) }),
+  })
+
+  return (
+    <div style={{ display: 'flex', gap: 8, marginTop: 10, alignItems: 'center' }}>
+      <button type="button" className="btn" disabled={unblockMutation.isPending} onClick={() => unblockMutation.mutate()}>
+        {unblockMutation.isPending ? 'Unblocking…' : 'Unblock'}
+      </button>
+      {unblockMutation.isError && (
+        <span role="alert" style={{ color: 'var(--crit)', fontSize: 'var(--text-base)' }}>
+          Couldn't unblock. Try again.
+        </span>
+      )}
+    </div>
+  )
+}
+
 /** ReleaseManifestBody: the readout-to-markup half, taking already-fetched data as a plain prop -- exported for direct render-safety testing (mirrors SessionRail.tsx's own ArtifactRow precedent). No hook of its own besides plain prop threading -- CompositionDecisionActions is the one leaf that needs a QueryClientProvider ancestor, and it is only ever reached once a composition review has actually completed with a still-pending decision. */
-export function ReleaseManifestBody({ readout, sessionId, canBlock = false, canAcknowledge = false }: { readout: ReleaseManifestReadout; sessionId: string; canBlock?: boolean; canAcknowledge?: boolean }) {
+export function ReleaseManifestBody({ readout, sessionId, canBlock = false, canAcknowledge = false, canUnblock = false }: { readout: ReleaseManifestReadout; sessionId: string; canBlock?: boolean; canAcknowledge?: boolean; canUnblock?: boolean }) {
   const flaggedCount = readout.mergedPrs.filter((pr) => manifestNote(pr) !== null).length
 
   return (
@@ -233,13 +328,14 @@ export function ReleaseManifestBody({ readout, sessionId, canBlock = false, canA
                 {readout.compositionFindings.length > 0 ? `${readout.compositionFindings.length} finding${readout.compositionFindings.length === 1 ? '' : 's'}` : 'clean'}
               </span>
             )}
-            {readout.compositionDecision !== 'pending' && (
-              <span className={`chip ${readout.compositionDecision === 'blocked' ? 'crit' : 'ok'}`} style={{ marginLeft: 8 }}>
-                <span className="dot" />
-                {readout.compositionDecision === 'blocked' ? 'blocked' : 'acknowledged & shipped'}
-              </span>
-            )}
+            {compositionDecisionChip(readout.compositionDecision)}
           </div>
+
+          {readout.coveragePartial && (
+            <p style={{ margin: '6px 0 0', color: 'var(--warn)', fontSize: 'var(--text-base)' }}>
+              This release's own constituent PR listing was incomplete when this check ran -- treat the composition result below as run over a possibly-incomplete diff, never a complete audit.
+            </p>
+          )}
 
           {!readout.compositionReviewedAt && (
             <p style={{ color: 'var(--faint)', fontSize: 'var(--text-base)' }}>
@@ -250,6 +346,13 @@ export function ReleaseManifestBody({ readout, sessionId, canBlock = false, canA
           {readout.compositionReviewedAt && readout.compositionFindings.length === 0 && (
             <p style={{ color: 'var(--faint)', fontSize: 'var(--text-base)' }}>
               No composition findings — this release's already-individually-reviewed changes compose cleanly (reviewed {formatRelativeTime(readout.compositionReviewedAt)}).
+            </p>
+          )}
+
+          {readout.compositionReviewedAt && readout.compositionHeadSha && (
+            <p style={{ margin: '2px 0 0', color: 'var(--faint)', fontSize: 'var(--text-base)' }}>
+              Reviewed against <span className="num">{readout.compositionHeadSha.slice(0, 12)}</span>
+              {readout.compositionDiffTruncated ? ' — this diff was truncated at its own fetch size cap, so this result may not reflect the release in full.' : '.'}
             </p>
           )}
 
@@ -275,9 +378,11 @@ export function ReleaseManifestBody({ readout, sessionId, canBlock = false, canA
             <CompositionDecisionActions sessionId={sessionId} canBlock={canBlock} canAcknowledge={canAcknowledge} />
           )}
 
-          {readout.compositionDecision !== 'pending' && readout.compositionDecisionAt && (
+          {readout.compositionDecision === 'blocked' && canUnblock && <UnblockAction sessionId={sessionId} />}
+
+          {compositionDecisionSummaryText(readout.compositionDecision) && readout.compositionDecisionAt && (
             <p style={{ color: 'var(--faint)', fontSize: 'var(--text-base)', marginTop: 8 }}>
-              {readout.compositionDecision === 'blocked' ? 'Blocked' : 'Acknowledged & shipped'} {formatRelativeTime(readout.compositionDecisionAt)}.
+              {compositionDecisionSummaryText(readout.compositionDecision)} {formatRelativeTime(readout.compositionDecisionAt)}.
             </p>
           )}
         </div>
@@ -311,6 +416,13 @@ export function ReleaseReviewView({ sessionId }: { sessionId: string }) {
   const readout = readoutQuery.data
   const canBlock = isMaintainerPlus(meQuery.data?.role)
   const canAcknowledge = isAdmin(meQuery.data?.role)
+  // canUnblock: admin only, the SAME row as canAcknowledge -- see
+  // authz.ActionUnblockReleaseComposition's own doc comment. Computed as
+  // its own named value (never just `canAcknowledge` reused under a
+  // second name) so a render-safety test can exercise it independently
+  // of Acknowledge & ship's own gate, and so this call site reads as an
+  // explicit RBAC decision rather than an accidental alias.
+  const canUnblock = isAdmin(meQuery.data?.role)
 
   return (
     <div className="app one">
@@ -333,7 +445,7 @@ export function ReleaseReviewView({ sessionId }: { sessionId: string }) {
           <span className="spacer" />
         </header>
 
-        <ReleaseManifestBody readout={readout} sessionId={sessionId} canBlock={canBlock} canAcknowledge={canAcknowledge} />
+        <ReleaseManifestBody readout={readout} sessionId={sessionId} canBlock={canBlock} canAcknowledge={canAcknowledge} canUnblock={canUnblock} />
       </section>
     </div>
   )
