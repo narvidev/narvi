@@ -191,13 +191,7 @@ export function prChipData(item: Pick<DecisionInboxItem, 'riskLabel' | 'findings
  * cut row ("manifest: 3 flags") -- deliberately NOT prChipData's own
  * riskLabel/findings chips, which describe an ordinary code-review
  * verdict a release cut never carries. manifestFindingsCount is §15.2's
- * own mechanical findings only; this NEVER fabricates an "aggregate: N
- * findings" chip the mockup also shows, because the aggregate diff
- * review's own composition findings are not computed anywhere in this
- * system (DecisionInboxItem.aggregateReviewTriggered's own doc comment)
- * -- aggregateReviewTriggered renders as its own, honestly-worded chip
- * instead, saying only that the trigger criteria were met, never
- * implying a finding count that does not exist.
+ * own mechanical findings only.
  *
  * manifestCoveragePartial is what stops the count from over-claiming.
  * When it is true the manifest scan ran over a TRUNCATED list of
@@ -209,8 +203,33 @@ export function prChipData(item: Pick<DecisionInboxItem, 'riskLabel' | 'findings
  * when it did find something. This mirrors what the release-review
  * readout (`coveragePartial`) and the posted manifest comment already do
  * with the identical fact.
+ *
+ * The second chip (confirmed-major fix) used to be a single, PERMANENT
+ * "aggregate review needed" the instant aggregateReviewTriggered was
+ * true -- true forever once §15.3's composition pass had a reason to
+ * run, even long after it had actually run, found (or not found)
+ * something, and been decided (Block/Acknowledge/Unblock). compositionReviewed/
+ * compositionDecision (DecisionInboxItem's own doc comments) now let this
+ * function tell those apart:
+ *
+ *   - aggregateReviewTriggered && !compositionReviewed: the pass has not
+ *     completed yet -- 'aggregate review needed' stands, unchanged text.
+ *   - compositionReviewed && compositionDecision === 'pending': the pass
+ *     ran, but nobody has acted on it yet -- a decision is what's
+ *     actually needed now, not the review itself.
+ *   - compositionReviewed && compositionDecision === 'blocked': the
+ *     release was blocked -- `crit`, never rendered as merely "needed".
+ *   - compositionReviewed && compositionDecision === 'acknowledged': a
+ *     human already accepted the composition finding (or its absence) --
+ *     `ok`, no longer anything outstanding for this row to demand.
+ *   - any other compositionDecision value (an out-of-enum future member,
+ *     a transport bug): falls to the SAME neutral "needs review" branch
+ *     'pending' takes, never the risk-accepting 'acknowledged' one --
+ *     mirrors ReleaseReviewView.tsx's own identical closed-enum-match
+ *     discipline (that file's own compositionDecisionChip/
+ *     compositionDecisionSummaryText doc comment).
  */
-export function releaseChipData(item: Pick<DecisionInboxItem, 'manifestFindingsCount' | 'manifestCoveragePartial' | 'aggregateReviewTriggered'>): DecisionInboxChip[] {
+export function releaseChipData(item: Pick<DecisionInboxItem, 'manifestFindingsCount' | 'manifestCoveragePartial' | 'aggregateReviewTriggered' | 'compositionReviewed' | 'compositionDecision'>): DecisionInboxChip[] {
   const chips: DecisionInboxChip[] = []
 
   if (item.manifestFindingsCount !== null) {
@@ -222,7 +241,22 @@ export function releaseChipData(item: Pick<DecisionInboxItem, 'manifestFindingsC
   }
 
   if (item.aggregateReviewTriggered === true) {
-    chips.push({ tone: 'warn', text: 'aggregate review needed' })
+    if (item.compositionReviewed !== true) {
+      chips.push({ tone: 'warn', text: 'aggregate review needed' })
+    } else {
+      switch (item.compositionDecision) {
+        case 'blocked':
+          chips.push({ tone: 'crit', text: 'composition: blocked' })
+          break
+        case 'acknowledged':
+          chips.push({ tone: 'ok', text: 'composition: acknowledged' })
+          break
+        default:
+          // 'pending', or an out-of-enum/unset value -- reviewed, but a
+          // human decision is what this row is actually waiting on now.
+          chips.push({ tone: 'warn', text: 'composition: decision needed' })
+      }
+    }
   }
 
   return chips

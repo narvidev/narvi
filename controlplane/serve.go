@@ -158,6 +158,29 @@ type App struct {
 	moduleWorkers []extension.Worker
 }
 
+// releaseCompositionDispatcher implements releasereview.CompositionDispatcher
+// (§15.3) -- a thin adapter around registry.GetOrSpawn +
+// (*sessionactor.Actor).Send(sessionactor.EnsureDispatched{}), the SAME
+// fire-and-forget sequencing httpapi.createTurnLocked already uses after
+// every OTHER turn-creation path (internal/adapters/inbound/httpapi/
+// turn.go). Kept here, in the wiring layer, rather than inside
+// internal/app/releasereview itself, so that package never needs to
+// import internal/app/sessionactor's own Command type system directly --
+// its own CompositionDispatcher interface stays a single narrow method,
+// satisfiable by a no-op fake in a unit test with no real Actor/mailbox
+// involved at all.
+type releaseCompositionDispatcher struct {
+	registry *sessionactor.Registry
+}
+
+func (d releaseCompositionDispatcher) EnsureDispatched(ctx context.Context, sessionID pgtype.UUID) error {
+	actor, err := d.registry.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		return fmt.Errorf("controlplane: get-or-spawn actor for composition review dispatch: %w", err)
+	}
+	return actor.Send(ctx, sessionactor.EnsureDispatched{})
+}
+
 // Main is intentionally a bare-bones dispatch, not a flag-parsing
 // library: two subcommands, "serve" and "seed" ("config/data
 // seeding", §10-P6/§13.4 -- see seed.go). "seed" lives here, as a
@@ -1235,6 +1258,14 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	router.Post("/sessions/{sessionID}/turn/epistemic-outcome",
 		httpapi.PostEpistemicOutcome(sandboxStore, turnStore))
 
+	// release-manifest/composition-findings (§15.3): the
+	// composition-findings-posting TOOL -- deliberately mounted OUTSIDE
+	// /api/sessions and outside auth.Middleware entirely, mirroring
+	// review/verdict and turn/epistemic-outcome immediately above exactly
+	// (see httpapi/releasecompositionfindings.go's own doc comment).
+	router.Post("/sessions/{sessionID}/release-manifest/composition-findings",
+		httpapi.PostReleaseCompositionFindings(sandboxStore, releaseManifestCheckStore))
+
 	// uploads mint/confirm/content ("uploads, blob storage & the
 	// in-sandbox download_file tool", §28.4/§28.5): deliberately mounted
 	// OUTSIDE /api/sessions and outside auth.Middleware entirely, mirroring
@@ -1853,6 +1884,17 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// release-review screen's own read model, see httpapi/
 		// releasemanifestreadout.go's own doc comment.
 		r.Get("/{sessionID}/release-manifest", httpapi.GetReleaseManifestReadout(sessionStore, githubPRSessionStore, releaseManifestCheckStore))
+		// release-manifest/{block,acknowledge,unblock} (§12.2 item 9) --
+		// the three composition-finding actions, see
+		// releasecompositiondecision.go's own doc comment for the RBAC
+		// split between them. pool backs the guarded-UPDATE-plus-audit-log
+		// transaction all three now share (confirmed-major fix,
+		// releasecompositiondecision.go's own doc comment on
+		// decideReleaseComposition) -- the SAME pool every other
+		// pool-taking route in this file already uses.
+		r.Post("/{sessionID}/release-manifest/block", httpapi.BlockReleaseComposition(pool, sessionStore, releaseManifestCheckStore, auditLogStore))
+		r.Post("/{sessionID}/release-manifest/acknowledge", httpapi.AcknowledgeReleaseComposition(pool, sessionStore, releaseManifestCheckStore, auditLogStore))
+		r.Post("/{sessionID}/release-manifest/unblock", httpapi.UnblockReleaseComposition(pool, sessionStore, releaseManifestCheckStore, auditLogStore))
 		// workflow-runs ("workflow definition & run API", §25.10): a
 		// session's own runs, newest first -- the SAME session-read
 		// gate every other route in this group uses (see httpapi/
@@ -2633,11 +2675,33 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// pre-fix inline call authenticated ListMergedBetween with -- never
 	// persisted onto a release_manifest_pending row itself (see
 	// releasereview.Enqueue's own doc comment).
+	//
+	// Composition-review (§15.3) additions: promptTemplateStore/sourceControl/
+	// turnStore are the SAME instances every other caller above already
+	// uses (promptTemplateStore already satisfies releasereview.
+	// CompositionTemplateFetcher directly, GetTemplate; sourceControl
+	// already satisfies reviewcontext.Fetcher, the SAME decorator passed
+	// as ReviewDiffFetcher to sessionactor.NewRegistry above; turnStore
+	// already satisfies releasereview.CompositionTurnInserter directly,
+	// Create) -- releaseCompositionDispatcher is the one genuinely new
+	// piece of glue, a thin adapter around registry.GetOrSpawn +
+	// (*sessionactor.Actor).Send(sessionactor.EnsureDispatched{}), the SAME
+	// fire-and-forget sequencing httpapi.createTurnLocked already uses
+	// after every OTHER turn-creation path (turn.go).
 	releaseManifestWorker := releasereview.NewWorker(releaseManifestPendingStore, releasereview.Deps{
-		SourceControl:         sourceControl,
-		Outbox:                outboxStore,
-		ReleaseManifestChecks: releaseManifestCheckStore,
-		Timeouts:              cfg.Timeouts,
+		SourceControl:          sourceControl,
+		Outbox:                 outboxStore,
+		ReleaseManifestChecks:  releaseManifestCheckStore,
+		CompositionTemplates:   promptTemplateStore,
+		CompositionDiffFetcher: sourceControl,
+		CompositionTurns:       turnStore,
+		CompositionDispatch:    releaseCompositionDispatcher{registry: registry},
+		// CompositionAnchor (confirmed-major auditability fix): the SAME
+		// releaseManifestCheckStore instance ReleaseManifestChecks above
+		// already uses -- it satisfies releasereview.CompositionAnchorUpdater
+		// directly (UpdateCompositionAnchor), no new store instance needed.
+		CompositionAnchor: releaseManifestCheckStore,
+		Timeouts:          cfg.Timeouts,
 	}, cfg.GitHubBotToken, cfg.Timeouts)
 
 	return &App{

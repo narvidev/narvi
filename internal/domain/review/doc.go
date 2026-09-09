@@ -63,7 +63,11 @@
 // added on top of these eight by a later Step — see design call #8 below
 // for why it does not reopen this section's own count or its "no second
 // path" discipline: it computes none of the eight RESULTS this section
-// enumerates.)
+// enumerates. A tenth and eleventh, RenderCompositionReviewPrompt
+// (compositionreview.go) and TransitionCompositionDecision
+// (compositiondecision.go), were added by §15.3/§12.2 item 9's own Step —
+// see design call #9 below for the identical reasoning: neither computes
+// one of the eight RESULTS above either.)
 //
 // # Ranking is an explicit table, never iota order
 // Shippable's total order (auto < needs_human < block, most to least
@@ -262,4 +266,32 @@
 //     automatically, exactly like this package's read path already does,
 //     with no second scan-test to maintain. See StripPlaceholderTokens'
 //     own doc comment (sanitize.go) for the full reasoning.
+//
+//  9. (§15.3/§12.2 item 9) Two further exported functions, neither
+//     reopening the "exactly eight" count above for the identical reason
+//     design call #8 already establishes for StripPlaceholderTokens (both
+//     compute none of the eight VERDICT-COMPUTATION results that count
+//     enumerates):
+//
+//     - RenderCompositionReviewPrompt (compositionreview.go) is the
+//     aggregate-diff composition review turn's own prompt renderer --
+//     deliberately a SEPARATE function from RenderTurnPrompt, never a
+//     parameterized variant of it, because §15.3 requires "a prompt
+//     distinct from the standard risk-map verdict": this pass must
+//     never compute or consume Shippable/PremiseState/the digest/
+//     BlastRadius vocabulary at all (§15.4). Its own tool-instructions
+//     block names a SEPARATE endpoint/JSON shape
+//     (compositionFindingsToolInstructions) from verdictToolInstructions
+//     — see that file's own top doc comment for the full "why a second
+//     tool, not a second call to the existing verdict tool" reasoning.
+//     - TransitionCompositionDecision (compositiondecision.go) is §12.2
+//     item 9's own "Block release / Acknowledge & ship" transition —
+//     an explicit, table-driven decision (CLAUDE.md/§11's own "every
+//     state transition goes through the machine's transition table"
+//     rule) sized to exactly what it needs: one non-terminal state,
+//     two legal, both-terminal actions. CompositionDecision is never
+//     computed by this package (unlike Shippable, this package's OTHER
+//     classification) — it is a human's own decision, recorded
+//     verbatim; this function only validates which decision may
+//     legally follow which.
 package review

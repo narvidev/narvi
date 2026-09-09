@@ -2567,11 +2567,12 @@ type DecisionInboxItem struct {
 	AgeSeconds int `json:"ageSeconds" yaml:"ageSeconds" mapstructure:"ageSeconds"`
 
 	// §15.3's own already-computed trigger decision (whether the constituent PRs' own
-	// shape met the criteria for an aggregate diff review) -- set iff isRelease is
-	// true, null otherwise. This is NOT a composition-findings count: the aggregate
-	// diff review pass itself is not dispatched anywhere in this system, so this
-	// field says only that its trigger criteria were met, never that the pass
-	// produced a finding.
+	// shape met the criteria for an aggregate diff review, OR the constituent-PR
+	// listing was itself truncated -- a truncated scan is treated as its own trigger,
+	// never a silent skip) -- set iff isRelease is true, null otherwise. This says
+	// only that the composition pass was dispatched (or should have been); see
+	// compositionReviewed/compositionDecision below for whether it has actually
+	// completed and been decided.
 	AggregateReviewTriggered DecisionInboxItemAggregateReviewTriggered `json:"aggregateReviewTriggered" yaml:"aggregateReviewTriggered" mapstructure:"aggregateReviewTriggered"`
 
 	// The automation's own last deterministic run summary (§8.4).
@@ -2584,6 +2585,28 @@ type DecisionInboxItem struct {
 	// findings, and isHandoff used to be nulled out for the handoff sub-case of
 	// kind=awaiting_approval, the one row isHandoff exists to identify).
 	CiGreen DecisionInboxItemCiGreen `json:"ciGreen" yaml:"ciGreen" mapstructure:"ciGreen"`
+
+	// The SAME three-value enum GetReleaseManifestReadout's own compositionDecision
+	// renders ('pending' until a maintainer+ blocks or an admin acknowledges, and
+	// 'pending' again after an admin unblocks) -- meaningless (null) whenever
+	// compositionReviewed is false or isRelease is false. A client rendering this
+	// row's own chip should treat 'pending' identically whether compositionReviewed
+	// is true (a real decision is genuinely still outstanding) or
+	// aggregateReviewTriggered is true but compositionReviewed is false (the pass has
+	// not completed) -- decisionInboxFormat.ts's own releaseChipData is this
+	// contract's one intended reader, and it already distinguishes the two via
+	// compositionReviewed.
+	CompositionDecision *DecisionInboxItemCompositionDecision `json:"compositionDecision,omitempty,omitzero" yaml:"compositionDecision,omitempty" mapstructure:"compositionDecision,omitempty"`
+
+	// §15.3's own composition-review COMPLETION state -- the SAME fact
+	// GetReleaseManifestReadout exposes as compositionReviewedAt (non-null), rendered
+	// here as a plain boolean since this row has no use for the exact timestamp. Set
+	// iff isRelease is true, null otherwise. Confirmed-major fix: before this field
+	// existed, a client had no way to tell 'the composition pass has not run yet'
+	// apart from 'it ran, found nothing, and was decided' -- both rendered as the
+	// identical, permanent 'aggregate review needed' chip (aggregateReviewTriggered
+	// alone cannot express this: it only ever says the pass SHOULD run).
+	CompositionReviewed DecisionInboxItemCompositionReviewed `json:"compositionReviewed,omitempty,omitzero" yaml:"compositionReviewed,omitempty" mapstructure:"compositionReviewed,omitempty"`
 
 	// When this row first became a pending decision -- the ranking (§16.1: 'by
 	// decision cost then age') and staleness reference point. For a PR row this is an
@@ -2731,11 +2754,12 @@ type DecisionInboxItem struct {
 }
 
 // §15.3's own already-computed trigger decision (whether the constituent PRs' own
-// shape met the criteria for an aggregate diff review) -- set iff isRelease is
-// true, null otherwise. This is NOT a composition-findings count: the aggregate
-// diff review pass itself is not dispatched anywhere in this system, so this field
-// says only that its trigger criteria were met, never that the pass produced a
-// finding.
+// shape met the criteria for an aggregate diff review, OR the constituent-PR
+// listing was itself truncated -- a truncated scan is treated as its own trigger,
+// never a silent skip) -- set iff isRelease is true, null otherwise. This says
+// only that the composition pass was dispatched (or should have been); see
+// compositionReviewed/compositionDecision below for whether it has actually
+// completed and been decided.
 type DecisionInboxItemAggregateReviewTriggered *bool
 
 // The automation's own last deterministic run summary (§8.4).
@@ -2748,6 +2772,54 @@ type DecisionInboxItemAutomationId *string
 // findings, and isHandoff used to be nulled out for the handoff sub-case of
 // kind=awaiting_approval, the one row isHandoff exists to identify).
 type DecisionInboxItemCiGreen *bool
+
+type DecisionInboxItemCompositionDecision struct {
+	Value interface{}
+}
+
+// MarshalJSON implements json.Marshaler.
+func (j *DecisionInboxItemCompositionDecision) MarshalJSON() ([]byte, error) {
+	return json.Marshal(j.Value)
+}
+
+var enumValues_DecisionInboxItemCompositionDecision = []interface{}{
+	"pending",
+	"blocked",
+	"acknowledged",
+	nil,
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *DecisionInboxItemCompositionDecision) UnmarshalJSON(value []byte) error {
+	var v struct {
+		Value interface{}
+	}
+	if err := json.Unmarshal(value, &v.Value); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_DecisionInboxItemCompositionDecision {
+		if reflect.DeepEqual(v.Value, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_DecisionInboxItemCompositionDecision, v.Value)
+	}
+	*j = DecisionInboxItemCompositionDecision(v)
+	return nil
+}
+
+// §15.3's own composition-review COMPLETION state -- the SAME fact
+// GetReleaseManifestReadout exposes as compositionReviewedAt (non-null), rendered
+// here as a plain boolean since this row has no use for the exact timestamp. Set
+// iff isRelease is true, null otherwise. Confirmed-major fix: before this field
+// existed, a client had no way to tell 'the composition pass has not run yet'
+// apart from 'it ran, found nothing, and was decided' -- both rendered as the
+// identical, permanent 'aggregate review needed' chip (aggregateReviewTriggered
+// alone cannot express this: it only ever says the pass SHOULD run).
+type DecisionInboxItemCompositionReviewed *bool
 
 // Matches Postgres session_failure_reason -- kind=needs_attention, a failed
 // session, only.
@@ -5704,6 +5776,152 @@ func (j *PostEpistemicOutcomeResponse) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// 200 response body for POST
+// /api/sessions/:id/release-manifest/{block,acknowledge,unblock} (§12.2 item 9) --
+// the same shape for all three actions, distinguished by compositionDecision's own
+// value. "pending" is Unblock's own result (the confirmed-major "unblock path"
+// fix): it reopens an already-blocked release back to pending, never straight to
+// acknowledged -- see internal/domain/review.CompositionDecisionActionUnblock's
+// own doc comment.
+type PostReleaseCompositionDecisionResponse struct {
+	// CompositionDecision corresponds to the JSON schema field "compositionDecision".
+	CompositionDecision PostReleaseCompositionDecisionResponseCompositionDecision `json:"compositionDecision" yaml:"compositionDecision" mapstructure:"compositionDecision"`
+
+	// CompositionDecisionAt corresponds to the JSON schema field
+	// "compositionDecisionAt".
+	CompositionDecisionAt time.Time `json:"compositionDecisionAt" yaml:"compositionDecisionAt" mapstructure:"compositionDecisionAt"`
+
+	// CompositionDecisionBy corresponds to the JSON schema field
+	// "compositionDecisionBy".
+	CompositionDecisionBy string `json:"compositionDecisionBy" yaml:"compositionDecisionBy" mapstructure:"compositionDecisionBy"`
+
+	// SessionId corresponds to the JSON schema field "sessionId".
+	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+}
+
+type PostReleaseCompositionDecisionResponseCompositionDecision string
+
+const PostReleaseCompositionDecisionResponseCompositionDecisionAcknowledged PostReleaseCompositionDecisionResponseCompositionDecision = "acknowledged"
+const PostReleaseCompositionDecisionResponseCompositionDecisionBlocked PostReleaseCompositionDecisionResponseCompositionDecision = "blocked"
+const PostReleaseCompositionDecisionResponseCompositionDecisionPending PostReleaseCompositionDecisionResponseCompositionDecision = "pending"
+
+var enumValues_PostReleaseCompositionDecisionResponseCompositionDecision = []interface{}{
+	"pending",
+	"blocked",
+	"acknowledged",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *PostReleaseCompositionDecisionResponseCompositionDecision) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_PostReleaseCompositionDecisionResponseCompositionDecision {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_PostReleaseCompositionDecisionResponseCompositionDecision, v)
+	}
+	*j = PostReleaseCompositionDecisionResponseCompositionDecision(v)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *PostReleaseCompositionDecisionResponse) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["compositionDecision"]; raw != nil && !ok {
+		return fmt.Errorf("field compositionDecision in PostReleaseCompositionDecisionResponse: required")
+	}
+	if _, ok := raw["compositionDecisionAt"]; raw != nil && !ok {
+		return fmt.Errorf("field compositionDecisionAt in PostReleaseCompositionDecisionResponse: required")
+	}
+	if _, ok := raw["compositionDecisionBy"]; raw != nil && !ok {
+		return fmt.Errorf("field compositionDecisionBy in PostReleaseCompositionDecisionResponse: required")
+	}
+	if _, ok := raw["sessionId"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionId in PostReleaseCompositionDecisionResponse: required")
+	}
+	type Plain PostReleaseCompositionDecisionResponse
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = PostReleaseCompositionDecisionResponse(plain)
+	return nil
+}
+
+// Request body for POST /sessions/:id/release-manifest/composition-findings
+// (§15.3) -- the composition-findings-posting tool's own
+// sandbox-bearer-authenticated call, mirroring PostReviewVerdictRequest's own
+// 'typed fields, never markers' discipline one level down.
+type PostReleaseCompositionFindingsRequest struct {
+	// Zero or more composition findings -- an empty array is a legitimate, positive
+	// result (this release composes cleanly).
+	Findings []ReleaseCompositionFinding `json:"findings" yaml:"findings" mapstructure:"findings"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *PostReleaseCompositionFindingsRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["findings"]; raw != nil && !ok {
+		return fmt.Errorf("field findings in PostReleaseCompositionFindingsRequest: required")
+	}
+	type Plain PostReleaseCompositionFindingsRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = PostReleaseCompositionFindingsRequest(plain)
+	return nil
+}
+
+// 201 response body for POST /sessions/:id/release-manifest/composition-findings.
+type PostReleaseCompositionFindingsResponse struct {
+	// FindingsCount corresponds to the JSON schema field "findingsCount".
+	FindingsCount int `json:"findingsCount" yaml:"findingsCount" mapstructure:"findingsCount"`
+
+	// ReviewedAt corresponds to the JSON schema field "reviewedAt".
+	ReviewedAt time.Time `json:"reviewedAt" yaml:"reviewedAt" mapstructure:"reviewedAt"`
+
+	// SessionId corresponds to the JSON schema field "sessionId".
+	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *PostReleaseCompositionFindingsResponse) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["findingsCount"]; raw != nil && !ok {
+		return fmt.Errorf("field findingsCount in PostReleaseCompositionFindingsResponse: required")
+	}
+	if _, ok := raw["reviewedAt"]; raw != nil && !ok {
+		return fmt.Errorf("field reviewedAt in PostReleaseCompositionFindingsResponse: required")
+	}
+	if _, ok := raw["sessionId"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionId in PostReleaseCompositionFindingsResponse: required")
+	}
+	type Plain PostReleaseCompositionFindingsResponse
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = PostReleaseCompositionFindingsResponse(plain)
+	return nil
+}
+
 // Request body for POST /sessions/:id/review/verdict ('server-side verdict',
 // §8.2/§5.2) -- the verdict-posting tool's own typed-fields call, validated
 // server-side (internal/domain/reviewpost.ValidateVerdictInput). Mirrors
@@ -7042,6 +7260,77 @@ func (j *RebutFindingRequest) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// One composition finding from §15.3's own aggregate-diff review pass -- reported
+// by the reviewing agent via the composition-findings-posting tool (POST
+// /sessions/:id/release-manifest/composition-findings), never re-parsed from
+// posted comment text. Distinct from ReleaseManifestFinding (§15.2's mechanical
+// manifest audit) and from a per-PR review verdict's own findings -- this pass
+// never computes or consumes riskLevel/premise/shippable/digest (§15.4).
+type ReleaseCompositionFinding struct {
+	// Free-text explanation of the composition issue, naming the constituent pull
+	// requests involved.
+	Detail string `json:"detail" yaml:"detail" mapstructure:"detail"`
+
+	// §15.3's own composition framing: do these already-individually-correct changes
+	// conflict, duplicate, or invalidate each other's assumptions.
+	Kind ReleaseCompositionFindingKind `json:"kind" yaml:"kind" mapstructure:"kind"`
+}
+
+type ReleaseCompositionFindingKind string
+
+const ReleaseCompositionFindingKindConflict ReleaseCompositionFindingKind = "conflict"
+const ReleaseCompositionFindingKindDuplication ReleaseCompositionFindingKind = "duplication"
+const ReleaseCompositionFindingKindInvalidatedAssumption ReleaseCompositionFindingKind = "invalidated_assumption"
+const ReleaseCompositionFindingKindOther ReleaseCompositionFindingKind = "other"
+
+var enumValues_ReleaseCompositionFindingKind = []interface{}{
+	"conflict",
+	"duplication",
+	"invalidated_assumption",
+	"other",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *ReleaseCompositionFindingKind) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_ReleaseCompositionFindingKind {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_ReleaseCompositionFindingKind, v)
+	}
+	*j = ReleaseCompositionFindingKind(v)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *ReleaseCompositionFinding) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["detail"]; raw != nil && !ok {
+		return fmt.Errorf("field detail in ReleaseCompositionFinding: required")
+	}
+	if _, ok := raw["kind"]; raw != nil && !ok {
+		return fmt.Errorf("field kind in ReleaseCompositionFinding: required")
+	}
+	type Plain ReleaseCompositionFinding
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = ReleaseCompositionFinding(plain)
+	return nil
+}
+
 // One review.ManifestFinding's own REST wire shape (§15.2).
 type ReleaseManifestFinding struct {
 	// Short, optional elaboration specific to kind -- empty string when this finding
@@ -7284,6 +7573,73 @@ type ReleaseManifestReadout struct {
 	// BaseRef corresponds to the JSON schema field "baseRef".
 	BaseRef ReleaseManifestReadoutBaseRef `json:"baseRef,omitempty,omitzero" yaml:"baseRef,omitempty" mapstructure:"baseRef,omitempty"`
 
+	// §12.2 item 9's own 'Block release / Acknowledge & ship [/ Unblock]' human
+	// decision on compositionFindings -- 'pending' until a maintainer+ (block) or
+	// admin (acknowledge, an explicit override) acts, and 'pending' AGAIN after an
+	// admin unblocks an already-blocked release
+	// (internal/domain/review.CompositionDecisionActionUnblock) -- Unblock never
+	// jumps straight to 'acknowledged'.
+	CompositionDecision ReleaseManifestReadoutCompositionDecision `json:"compositionDecision" yaml:"compositionDecision" mapstructure:"compositionDecision"`
+
+	// When the MOST RECENT block/acknowledge/unblock action was rendered -- see
+	// compositionDecisionBy's own description for why this can be non-null even while
+	// compositionDecision itself reads 'pending' again.
+	CompositionDecisionAt ReleaseManifestReadoutCompositionDecisionAt `json:"compositionDecisionAt,omitempty,omitzero" yaml:"compositionDecisionAt,omitempty" mapstructure:"compositionDecisionAt,omitempty"`
+
+	// The user id who rendered the MOST RECENT block/acknowledge/unblock action
+	// against this release -- null only when no such action has ever been taken. NOT
+	// necessarily null when compositionDecision reads 'pending' again: an Unblock
+	// action also sets this (to the unblocking admin), which is why
+	// compositionDecision alone is not enough to tell 'never decided' apart from
+	// 'decided, then reopened' -- a client checking that distinction should treat
+	// this field as the tell, not compositionDecision.
+	CompositionDecisionBy ReleaseManifestReadoutCompositionDecisionBy `json:"compositionDecisionBy,omitempty,omitzero" yaml:"compositionDecisionBy,omitempty" mapstructure:"compositionDecisionBy,omitempty"`
+
+	// Whether the diff fetch this composition review pass actually ran over was
+	// itself truncated at its own size cap -- distinct from coveragePartial above
+	// (that flag describes the CONSTITUENT-PR LISTING §15.2's manifest check ran
+	// over; this one describes the single aggregate baseRef..headRef diff §15.3's
+	// composition pass reviewed). Null exactly when compositionHeadSha is null (the
+	// pass was never dispatched) -- set at the SAME dispatch-time write as
+	// compositionHeadSha, so the two share an identical null/non-null pattern even
+	// though compositionHeadSha alone is what a client should branch render state on.
+	CompositionDiffTruncated ReleaseManifestReadoutCompositionDiffTruncated `json:"compositionDiffTruncated,omitempty,omitzero" yaml:"compositionDiffTruncated,omitempty" mapstructure:"compositionDiffTruncated,omitempty"`
+
+	// §15.3's own composition findings -- empty either because compositionReviewedAt
+	// is null (not yet available, see that field's own description) or because the
+	// pass genuinely found nothing to report.
+	CompositionFindings []ReleaseCompositionFinding `json:"compositionFindings" yaml:"compositionFindings" mapstructure:"compositionFindings"`
+
+	// The commit sha compositionFindings was actually (or will be) reviewed against
+	// -- recorded once, at composition-review DISPATCH time
+	// (internal/app/releasereview.dispatchCompositionReview's own
+	// UpdateCompositionAnchor call, immediately after the composition-review turn is
+	// created), strictly BEFORE that turn ever completes and posts findings. Null
+	// means the pass was NEVER actually dispatched at all (its own prompt-template
+	// fetch, diff fetch, or turn insert declined/failed) -- a HONEST TERMINAL state
+	// this system does not retry, never merely 'not yet available'. Non-null does NOT
+	// imply compositionReviewedAt is also set: a real, live dispatch sets this field
+	// FIRST and compositionReviewedAt only later, once the turn actually completes --
+	// so 'non-null head sha, still-null compositionReviewedAt' is the ordinary,
+	// expected shape of a genuinely in-flight pass, not a contradiction. A
+	// confirmed-major auditability fix: a verdict attributed to a diff nobody can
+	// identify afterward is not auditable, and (a related, confirmed-major fix) a
+	// caller that conflates 'never dispatched' with 'dispatched, still pending'
+	// renders a false promise of eventual completion for a pass that will never run.
+	// See web/src/session/ReleaseReviewView.tsx's own compositionPassState for the
+	// one place in this codebase that actually reads this field to distinguish
+	// 'declined' from 'pending'.
+	CompositionHeadSha ReleaseManifestReadoutCompositionHeadSha `json:"compositionHeadSha,omitempty,omitzero" yaml:"compositionHeadSha,omitempty" mapstructure:"compositionHeadSha,omitempty"`
+
+	// §15.3's own aggregate-diff composition review pass: when it actually POSTED its
+	// findings via the composition-findings tool. Null means 'not yet available' --
+	// either the pass was never triggered (aggregateReviewTriggered is false), or it
+	// was triggered but has not completed (or its dispatch failed) -- distinct, by
+	// construction, from a real, empty compositionFindings array (the pass ran and
+	// found nothing to report). Never render an empty compositionFindings array as a
+	// confident 'no composition findings' while this is null.
+	CompositionReviewedAt ReleaseManifestReadoutCompositionReviewedAt `json:"compositionReviewedAt,omitempty,omitzero" yaml:"compositionReviewedAt,omitempty" mapstructure:"compositionReviewedAt,omitempty"`
+
 	// False when no release_manifest_checks row has ever been persisted for this PR
 	// -- see this object's own top-level description.
 	Computed bool `json:"computed" yaml:"computed" mapstructure:"computed"`
@@ -7320,6 +7676,94 @@ type ReleaseManifestReadout struct {
 
 type ReleaseManifestReadoutBaseRef *string
 
+type ReleaseManifestReadoutCompositionDecision string
+
+const ReleaseManifestReadoutCompositionDecisionAcknowledged ReleaseManifestReadoutCompositionDecision = "acknowledged"
+
+// When the MOST RECENT block/acknowledge/unblock action was rendered -- see
+// compositionDecisionBy's own description for why this can be non-null even while
+// compositionDecision itself reads 'pending' again.
+type ReleaseManifestReadoutCompositionDecisionAt = *time.Time
+
+const ReleaseManifestReadoutCompositionDecisionBlocked ReleaseManifestReadoutCompositionDecision = "blocked"
+
+// The user id who rendered the MOST RECENT block/acknowledge/unblock action
+// against this release -- null only when no such action has ever been taken. NOT
+// necessarily null when compositionDecision reads 'pending' again: an Unblock
+// action also sets this (to the unblocking admin), which is why
+// compositionDecision alone is not enough to tell 'never decided' apart from
+// 'decided, then reopened' -- a client checking that distinction should treat this
+// field as the tell, not compositionDecision.
+type ReleaseManifestReadoutCompositionDecisionBy *string
+
+const ReleaseManifestReadoutCompositionDecisionPending ReleaseManifestReadoutCompositionDecision = "pending"
+
+var enumValues_ReleaseManifestReadoutCompositionDecision = []interface{}{
+	"pending",
+	"blocked",
+	"acknowledged",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *ReleaseManifestReadoutCompositionDecision) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_ReleaseManifestReadoutCompositionDecision {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_ReleaseManifestReadoutCompositionDecision, v)
+	}
+	*j = ReleaseManifestReadoutCompositionDecision(v)
+	return nil
+}
+
+// Whether the diff fetch this composition review pass actually ran over was itself
+// truncated at its own size cap -- distinct from coveragePartial above (that flag
+// describes the CONSTITUENT-PR LISTING §15.2's manifest check ran over; this one
+// describes the single aggregate baseRef..headRef diff §15.3's composition pass
+// reviewed). Null exactly when compositionHeadSha is null (the pass was never
+// dispatched) -- set at the SAME dispatch-time write as compositionHeadSha, so the
+// two share an identical null/non-null pattern even though compositionHeadSha
+// alone is what a client should branch render state on.
+type ReleaseManifestReadoutCompositionDiffTruncated *bool
+
+// The commit sha compositionFindings was actually (or will be) reviewed against --
+// recorded once, at composition-review DISPATCH time
+// (internal/app/releasereview.dispatchCompositionReview's own
+// UpdateCompositionAnchor call, immediately after the composition-review turn is
+// created), strictly BEFORE that turn ever completes and posts findings. Null
+// means the pass was NEVER actually dispatched at all (its own prompt-template
+// fetch, diff fetch, or turn insert declined/failed) -- a HONEST TERMINAL state
+// this system does not retry, never merely 'not yet available'. Non-null does NOT
+// imply compositionReviewedAt is also set: a real, live dispatch sets this field
+// FIRST and compositionReviewedAt only later, once the turn actually completes --
+// so 'non-null head sha, still-null compositionReviewedAt' is the ordinary,
+// expected shape of a genuinely in-flight pass, not a contradiction. A
+// confirmed-major auditability fix: a verdict attributed to a diff nobody can
+// identify afterward is not auditable, and (a related, confirmed-major fix) a
+// caller that conflates 'never dispatched' with 'dispatched, still pending'
+// renders a false promise of eventual completion for a pass that will never run.
+// See web/src/session/ReleaseReviewView.tsx's own compositionPassState for the one
+// place in this codebase that actually reads this field to distinguish 'declined'
+// from 'pending'.
+type ReleaseManifestReadoutCompositionHeadSha *string
+
+// §15.3's own aggregate-diff composition review pass: when it actually POSTED its
+// findings via the composition-findings tool. Null means 'not yet available' --
+// either the pass was never triggered (aggregateReviewTriggered is false), or it
+// was triggered but has not completed (or its dispatch failed) -- distinct, by
+// construction, from a real, empty compositionFindings array (the pass ran and
+// found nothing to report). Never render an empty compositionFindings array as a
+// confident 'no composition findings' while this is null.
+type ReleaseManifestReadoutCompositionReviewedAt = *time.Time
+
 // When this check ran -- null when computed is false.
 type ReleaseManifestReadoutComputedAt = *time.Time
 
@@ -7336,6 +7780,12 @@ func (j *ReleaseManifestReadout) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["aggregateReviewTriggered"]; raw != nil && !ok {
 		return fmt.Errorf("field aggregateReviewTriggered in ReleaseManifestReadout: required")
+	}
+	if _, ok := raw["compositionDecision"]; raw != nil && !ok {
+		return fmt.Errorf("field compositionDecision in ReleaseManifestReadout: required")
+	}
+	if _, ok := raw["compositionFindings"]; raw != nil && !ok {
+		return fmt.Errorf("field compositionFindings in ReleaseManifestReadout: required")
 	}
 	if _, ok := raw["computed"]; raw != nil && !ok {
 		return fmt.Errorf("field computed in ReleaseManifestReadout: required")
@@ -12016,7 +12466,6 @@ type WorkflowStepRunStatus string
 const WorkflowStepRunStatusAwaitingDecision WorkflowStepRunStatus = "awaiting_decision"
 const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
 const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
-const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
 const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
 
 var enumValues_WorkflowStepRunStatus = []interface{}{
@@ -12048,6 +12497,8 @@ func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 }
 
 type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
+
+const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
 
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
 // sequential turn'). Null while an awaiting_decision (hitlBefore-gated) attempt

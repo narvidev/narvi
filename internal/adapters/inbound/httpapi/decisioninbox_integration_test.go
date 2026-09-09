@@ -824,6 +824,22 @@ func (rig *decisionInboxTestRig) claimReviewSession(ctx context.Context, t *test
 // manifestFindingsCount/aggregateReviewTriggered -- all three null for an
 // ordinary PR row, never a fabricated zero/false standing in for "not a
 // release cut at all".
+//
+// Coverage fix: PR #1402/#1403 now ALSO assert compositionReviewed/
+// compositionDecision -- before this fix, this test file (and every
+// other test in this codebase, unit or integration) never once asserted
+// on those two fields at all. A verifier confirmed the gap three
+// independent ways: hardwiring decisioninbox/aggregate.go's own
+// resolveReleaseCut to always return compositionReviewed=false,
+// compositionDecision="" (reverting the exact server-side fix this
+// field pair exists for); severing Item's own CompositionReviewed/
+// CompositionDecision wiring in buildPROpenItem; and skipping the
+// decisioninbox.go DTO-mapping `if it.CompositionReviewed {
+// dto.CompositionDecision = ... }` block entirely -- ALL THREE left
+// this package's unit, integration, and this file's own httpapi suites
+// green. PR #1402 (triggered but never actually composition-reviewed)
+// and the NEW PR #1403 (composition-reviewed AND decided) together pin
+// every state resolveReleaseCut's own two new return values can be in.
 func TestListDecisionInbox_SessionIdAndReleaseCut_FieldsPopulated(t *testing.T) {
 	const repo = "acme/rockets"
 	fakeSCM := &fakeMergeSourceControl{
@@ -834,6 +850,8 @@ func TestListDecisionInbox_SessionIdAndReleaseCut_FieldsPopulated(t *testing.T) 
 				HeadSHA: "sha1401", Assignees: []ports.PRPerson{{ExternalID: "9100", Login: "octocat"}}, CIConclusion: ports.CIConclusionSuccess},
 			{Owner: "acme", Repo: "rockets", Number: 1402, Title: "release/2026.09.01 -- 1 PR", HTMLURL: "https://github.com/acme/rockets/pull/1402",
 				HeadSHA: "sha1402", Assignees: []ports.PRPerson{{ExternalID: "9100", Login: "octocat"}}, CIConclusion: ports.CIConclusionSuccess},
+			{Owner: "acme", Repo: "rockets", Number: 1403, Title: "release/2026.09.02 -- composition reviewed and blocked", HTMLURL: "https://github.com/acme/rockets/pull/1403",
+				HeadSHA: "sha1403", Assignees: []ports.PRPerson{{ExternalID: "9100", Login: "octocat"}}, CIConclusion: ports.CIConclusionSuccess},
 		},
 	}
 	rig := newDecisionInboxTestRig(t, fakeSCM)
@@ -853,6 +871,25 @@ func TestListDecisionInbox_SessionIdAndReleaseCut_FieldsPopulated(t *testing.T) 
 		MergedPrs:                     []byte(`[]`),
 	}); err != nil {
 		t.Fatalf("insert release manifest check: %v", err)
+	}
+
+	session1403 := rig.claimReviewSession(ctx, t, repo, 1403)
+	check1403, err := rig.releaseManifestChecks.Insert(ctx, sqlcgen.InsertReleaseManifestCheckParams{
+		SessionID: session1403, RepoFullName: repo, PrNumber: 1403, BaseRef: "main", HeadRef: "release/2026.09.02",
+		ConstituentPrCount: 2, CoveragePartial: false, AggregateReviewTriggered: true,
+		AggregateReviewTriggerReasons: []byte(`["a high-risk pull request is included in this release"]`),
+		Findings:                      []byte(`[]`),
+		MergedPrs:                     []byte(`[]`),
+	})
+	if err != nil {
+		t.Fatalf("insert release manifest check (1403): %v", err)
+	}
+	if _, err := rig.releaseManifestChecks.UpdateCompositionFindings(ctx, check1403.ID,
+		[]byte(`[{"kind":"conflict","detail":"PR #1 and #2 both add migration 42"}]`)); err != nil {
+		t.Fatalf("UpdateCompositionFindings (1403): %v", err)
+	}
+	if _, err := rig.releaseManifestChecks.UpdateCompositionDecision(ctx, check1403.ID, "pending", "blocked", user.ID); err != nil {
+		t.Fatalf("UpdateCompositionDecision (1403): %v", err)
 	}
 
 	var got restdtos.ListDecisionInboxResponse
@@ -922,6 +959,42 @@ func TestListDecisionInbox_SessionIdAndReleaseCut_FieldsPopulated(t *testing.T) 
 	// isRelease's own gate rather than being omitted when convenient.
 	if pr1402.ManifestCoveragePartial == nil || *pr1402.ManifestCoveragePartial {
 		t.Errorf("PR #1402 ManifestCoveragePartial = %v, want a non-nil pointer to false", pr1402.ManifestCoveragePartial)
+	}
+	// PR #1402's own composition pass was never actually reviewed (its
+	// check row was inserted with AggregateReviewTriggered=false and no
+	// UpdateCompositionFindings call) -- compositionReviewed must be a
+	// non-nil pointer to FALSE (present and false, mirroring
+	// ManifestCoveragePartial's own "present, never omitted" discipline
+	// immediately above), and compositionDecision must be entirely absent
+	// (nil), never a fabricated "pending".
+	if pr1402.CompositionReviewed == nil || *pr1402.CompositionReviewed {
+		t.Errorf("PR #1402 CompositionReviewed = %v, want a non-nil pointer to false", pr1402.CompositionReviewed)
+	}
+	if pr1402.CompositionDecision != nil {
+		t.Errorf("PR #1402 CompositionDecision = %v, want nil (composition pass never reviewed)", pr1402.CompositionDecision)
+	}
+
+	pr1403 := byPR[1403]
+	if pr1403 == nil {
+		t.Fatalf("PR #1403 missing from the response entirely: %+v", got.Items)
+	}
+	if pr1403.IsRelease == nil || !*pr1403.IsRelease {
+		t.Errorf("PR #1403 IsRelease = %v, want a non-nil pointer to true", pr1403.IsRelease)
+	}
+	if pr1403.AggregateReviewTriggered == nil || !*pr1403.AggregateReviewTriggered {
+		t.Errorf("PR #1403 AggregateReviewTriggered = %v, want a non-nil pointer to true", pr1403.AggregateReviewTriggered)
+	}
+	// The whole point of this row: composition_reviewed_at IS set (a real
+	// finding was posted) AND a human decision (Block) has been rendered
+	// -- both must actually reach the wire.
+	if pr1403.CompositionReviewed == nil || !*pr1403.CompositionReviewed {
+		t.Errorf("PR #1403 CompositionReviewed = %v, want a non-nil pointer to true", pr1403.CompositionReviewed)
+	}
+	if pr1403.CompositionDecision == nil {
+		t.Fatalf("PR #1403 CompositionDecision is nil, want %q", "blocked")
+	}
+	if pr1403.CompositionDecision.Value != "blocked" {
+		t.Errorf("PR #1403 CompositionDecision = %v, want %q", pr1403.CompositionDecision.Value, "blocked")
 	}
 }
 

@@ -233,6 +233,19 @@ var matrix = map[Action]actionRule{
 	// ActionToggleAutoMerge/ActionToggleSentinelAutoFix immediately above
 	// (action.go's own doc comment).
 	ActionConfigurePreviewLinks: {allow: roles(RoleAdmin)},
+	// (§12.2 item 9/§15.3): "Acknowledge & ship" despite a
+	// release's own composition finding -- admin only, this SAME row, per
+	// action.go's own doc comment (an override of an already-computed
+	// risk signal, not a per-PR judgment call the way the companion
+	// "Block release" action's own ActionEditReviewVerdict row-5 reuse
+	// is).
+	ActionAcknowledgeReleaseComposition: {allow: roles(RoleAdmin)},
+	// (§12.2 item 9/§15.3): "Unblock" -- reopening a maintainer's
+	// own Block back to pending -- admin only, this SAME row, per
+	// action.go's own doc comment (the confirmed-major "unblock path" fix:
+	// only the tier that may Acknowledge & ship despite a composition
+	// finding may also undo the safety block a maintainer placed on one).
+	ActionUnblockReleaseComposition: {allow: roles(RoleAdmin)},
 	// (§30.6/§30.9): the shadow-operator ledger view and its
 	// Activate promotion -- admin only, this SAME row, though no §13.3
 	// table row names either explicitly (action.go's own doc comment on

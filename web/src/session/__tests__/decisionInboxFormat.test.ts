@@ -191,6 +191,46 @@ describe('releaseChipData -- a release-cut row never fabricates an aggregate-fin
     const chips = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: false, aggregateReviewTriggered: false })
     expect(chips.some((c) => c.text.includes('aggregate'))).toBe(false)
   })
+
+  // Confirmed-major fix: "aggregate review needed" used to render
+  // PERMANENTLY once aggregateReviewTriggered was true, even long after
+  // the composition pass had actually run and been decided --
+  // compositionReviewed/compositionDecision are what let this row's own
+  // chip move past that stale, unconditional text.
+  it('triggered but not yet reviewed still renders the pending "needed" chip', () => {
+    const chips = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: false, aggregateReviewTriggered: true, compositionReviewed: false, compositionDecision: null })
+    expect(chips).toContainEqual({ tone: 'warn', text: 'aggregate review needed' })
+  })
+
+  it('reviewed but still pending a human decision renders "decision needed", not the stale "aggregate review needed" text', () => {
+    const chips = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: false, aggregateReviewTriggered: true, compositionReviewed: true, compositionDecision: 'pending' })
+    expect(chips).toContainEqual({ tone: 'warn', text: 'composition: decision needed' })
+    expect(chips.some((c) => c.text === 'aggregate review needed')).toBe(false)
+  })
+
+  it('reviewed and blocked renders a crit "blocked" chip', () => {
+    const chips = releaseChipData({ manifestFindingsCount: 1, manifestCoveragePartial: false, aggregateReviewTriggered: true, compositionReviewed: true, compositionDecision: 'blocked' })
+    expect(chips).toContainEqual({ tone: 'crit', text: 'composition: blocked' })
+  })
+
+  it('reviewed and acknowledged renders an ok "acknowledged" chip -- nothing left outstanding', () => {
+    const chips = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: false, aggregateReviewTriggered: true, compositionReviewed: true, compositionDecision: 'acknowledged' })
+    expect(chips).toContainEqual({ tone: 'ok', text: 'composition: acknowledged' })
+    expect(chips.some((c) => c.text === 'aggregate review needed')).toBe(false)
+  })
+
+  it('an out-of-enum compositionDecision falls to the neutral "decision needed" branch, never the affirmative acknowledged one', () => {
+    const chips = releaseChipData({
+      manifestFindingsCount: 0,
+      manifestCoveragePartial: false,
+      aggregateReviewTriggered: true,
+      compositionReviewed: true,
+      // @ts-expect-error -- deliberately an out-of-enum value, proving the runtime default branch, not just the type system
+      compositionDecision: 'garbled',
+    })
+    expect(chips).toContainEqual({ tone: 'warn', text: 'composition: decision needed' })
+    expect(chips.some((c) => c.text.includes('acknowledged'))).toBe(false)
+  })
 })
 
 describe('formatAgeSeconds', () => {
