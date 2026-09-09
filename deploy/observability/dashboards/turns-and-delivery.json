@@ -33,6 +33,14 @@
       "type": "counter_rate",
       "metrics": ["outbox_dead_letter_total"],
       "unit": "{entry}/min"
+    },
+    {
+      "id": "automerge-auth-dead-letter-rate",
+      "title": "Auto-merge auth/permission dead-letters (rate)",
+      "description": "Rate of automerge_auth_dead_lettered_total — internal/app/automerge.Worker's own authGuard giving up on a scope (the shared worker-wide bot credential, or one repository) after exhausting domain/automerge.MaxAuthFailures consecutive authentication/permission-classified GitHub failures (docs/TECHNICAL_PLAN.md §17). A worker-wide dead-letter stops EVERY armed repository's own auto-merge until an operator rotates the credential and redeploys; a per-repository one stops only that repository.",
+      "type": "counter_rate",
+      "metrics": ["automerge_auth_dead_lettered_total"],
+      "unit": "{scope}/min"
     }
   ]
 }

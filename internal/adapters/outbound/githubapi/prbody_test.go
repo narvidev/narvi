@@ -3,6 +3,7 @@ package githubapi_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -191,5 +192,44 @@ func TestUpdatePRBody_4xxSurfacesAsError(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("UpdatePRBody() error = nil, want a genuine error on a 422")
+	}
+}
+
+// TestUpdatePRBody_403RateLimited_APIErrorCarriesRateLimited is doPatch's
+// own regression test for docs/TECHNICAL_PLAN.md §17's own adversarial
+// review: "doPost/doPatch never compute RateLimited, so a textbook
+// primary-rate-limited 403 through either unwraps to
+// ErrPermissionDenied." doPatch previously never computed
+// APIError.RateLimited at all, so this 403 -- flagged by GitHub's own
+// X-RateLimit-Remaining header -- would have unwrapped straight to
+// ports.ErrPermissionDenied via APIError.Unwrap's own Status==403 branch.
+func TestUpdatePRBody_403RateLimited_APIErrorCarriesRateLimited(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-RateLimit-Remaining", "0")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]any{"message": "API rate limit exceeded for xxx.xxx.xxx.xxx."})
+	}))
+	defer server.Close()
+
+	adapter := githubapi.New(server.Client(), server.URL)
+	err := adapter.UpdatePRBody(context.Background(), ports.UpdatePRBodySpec{
+		Owner: "acme", Repo: "widgets", Number: 42, Body: "x", Token: "tok",
+	})
+	if err == nil {
+		t.Fatal("UpdatePRBody() error = nil, want a genuine error on a rate-limited 403")
+	}
+	if errors.Is(err, ports.ErrPermissionDenied) {
+		t.Error("errors.Is(err, ports.ErrPermissionDenied) = true, want false -- a rate-limited 403 must never classify as a permanent denial")
+	}
+
+	var apiErr *githubapi.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("UpdatePRBody() error = %v (%T), want an error wrapping *githubapi.APIError", err, err)
+	}
+	if !apiErr.RateLimited {
+		t.Error("APIError.RateLimited = false, want true -- doPatch must compute it exactly like doGet/doPut do")
 	}
 }

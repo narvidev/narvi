@@ -318,6 +318,30 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("githubapi: http %d: %s", e.Status, e.Message)
 }
 
+// Unwrap lets errors.Is(err, ports.ErrAuthenticationFailed)/errors.Is(err,
+// ports.ErrPermissionDenied) see through this adapter-internal type to
+// the port-level, adapter-agnostic classification a caller like
+// internal/app/automerge needs (docs/TECHNICAL_PLAN.md §17's own
+// automerge dead-letter fix) -- reusing the SAME Status/RateLimited
+// fields every other classification on this type already relies on
+// (isRateLimitedResponse below), never a second, parallel
+// classification. A 401 is unambiguous (ports.ErrAuthenticationFailed's
+// own doc comment: GitHub never uses 401 for rate limiting). A 403
+// unwraps to ports.ErrPermissionDenied ONLY when RateLimited is false --
+// mirrors ports.MergePRError.Unwrap's own identical logic for MergePR's
+// own separately-typed error exactly, so a caller never has to know
+// which of this port's two error shapes it is holding to classify it.
+func (e *APIError) Unwrap() error {
+	switch {
+	case e.Status == http.StatusUnauthorized:
+		return ports.ErrAuthenticationFailed
+	case e.Status == http.StatusForbidden && !e.RateLimited:
+		return ports.ErrPermissionDenied
+	default:
+		return nil
+	}
+}
+
 // isRateLimitedResponse reports whether a 403 response resp actually
 // signals GitHub's own real primary or secondary rate-limit/abuse-detection
 // mechanism, rather than a genuine "this token cannot read this resource"
@@ -401,7 +425,23 @@ func (a *Adapter) doGet(ctx context.Context, path, token string) ([]byte, error)
 			// computed for a 403 -- see isRateLimitedResponse's own doc
 			// comment for why a 403 specifically (never a 404 or a 5xx)
 			// needs this extra classification.
-			apiErr.RateLimited = isRateLimitedResponse(resp, message)
+			//
+			// string(body) -- the RAW response body -- not `message` above:
+			// message is OVERWRITTEN with the fixed placeholder string
+			// "error body did not match GitHub's expected error envelope"
+			// whenever body does not parse as GitHub's own JSON error
+			// envelope, which is EXACTLY the case isRateLimitedResponse's
+			// own message-text fallback exists to catch (its own doc
+			// comment: "in case a header got stripped somewhere between
+			// GitHub and this adapter (a proxy, a test double)") -- an
+			// edge/WAF HTML page (e.g. "error code: 1015 (you are being
+			// rate limited)") is never valid JSON, so passing the
+			// overwritten placeholder here made that fallback permanently
+			// unreachable for the one case its own doc comment names it
+			// for. Passing message here would misclassify that response as
+			// a genuine, permanent per-repo denial -- the exact direction
+			// ports.ErrPermissionDenied's own doc comment forbids.
+			apiErr.RateLimited = isRateLimitedResponse(resp, string(body))
 		}
 		return nil, apiErr
 	}
@@ -575,7 +615,17 @@ func (a *Adapter) doPost(ctx context.Context, path, token string, reqBody []byte
 		} else if len(body) > 0 {
 			message = "error body did not match GitHub's expected error envelope"
 		}
-		return nil, &APIError{Status: resp.StatusCode, Message: message}
+		apiErr := &APIError{Status: resp.StatusCode, Message: message}
+		if resp.StatusCode == http.StatusForbidden {
+			// Audit fix: doPost previously never computed RateLimited at
+			// all, so a textbook primary-rate-limited 403 through this
+			// method unwrapped straight to ports.ErrPermissionDenied --
+			// see doGet's own identical isRateLimitedResponse call/doc
+			// comment above for why string(body) (the raw body), not
+			// message, is what the fallback text check needs.
+			apiErr.RateLimited = isRateLimitedResponse(resp, string(body))
+		}
+		return nil, apiErr
 	}
 
 	return body, nil
@@ -917,7 +967,15 @@ func (a *Adapter) GetPullRequestDiff(ctx context.Context, owner, repo string, nu
 		} else if len(body) > 0 {
 			message = "error body did not match GitHub's expected error envelope"
 		}
-		return "", false, &APIError{Status: resp.StatusCode, Message: message}
+		apiErr := &APIError{Status: resp.StatusCode, Message: message}
+		if resp.StatusCode == http.StatusForbidden {
+			// Audit fix: this method previously never computed RateLimited
+			// at all -- see doGet's own identical isRateLimitedResponse
+			// call/doc comment above for why string(body) (the raw body),
+			// not message, is what the fallback text check needs.
+			apiErr.RateLimited = isRateLimitedResponse(resp, string(body))
+		}
+		return "", false, apiErr
 	}
 
 	if len(body) > maxPRDiffResponseBytes {
@@ -995,7 +1053,15 @@ func (a *Adapter) GetCompareDiff(ctx context.Context, owner, repo, base, head, t
 		} else if len(body) > 0 {
 			message = "error body did not match GitHub's expected error envelope"
 		}
-		return "", false, &APIError{Status: resp.StatusCode, Message: message}
+		apiErr := &APIError{Status: resp.StatusCode, Message: message}
+		if resp.StatusCode == http.StatusForbidden {
+			// Audit fix: this method previously never computed RateLimited
+			// at all -- see doGet's own identical isRateLimitedResponse
+			// call/doc comment above for why string(body) (the raw body),
+			// not message, is what the fallback text check needs.
+			apiErr.RateLimited = isRateLimitedResponse(resp, string(body))
+		}
+		return "", false, apiErr
 	}
 
 	if len(body) > maxPRDiffResponseBytes {
@@ -1324,9 +1390,17 @@ func (a *Adapter) CreateBranch(ctx context.Context, spec ports.CreateBranchSpec)
 // doPut performs one authenticated PUT against a.apiBaseURL+path with
 // reqBody as the JSON request body -- the doPost-analog this package's
 // own doc.go promises, needed because GitHub's Contents API create-or-
-// update-file-contents endpoint is specifically a PUT, never a POST.
-// Otherwise byte-for-byte the same bounded-read/error-envelope-parsing
-// shape as doGet/doPost.
+// update-file-contents endpoint (and MergePR's own merge endpoint,
+// mergepr.go) is specifically a PUT, never a POST. Otherwise byte-for-
+// byte the same bounded-read/error-envelope-parsing shape as doGet/
+// doPost, INCLUDING doGet's own isRateLimitedResponse classification on
+// a 403 (docs/TECHNICAL_PLAN.md §17's own automerge dead-letter fix):
+// MergePR is this package's one caller that converts this method's
+// *APIError into a SEPARATE typed error of its own (ports.MergePRError),
+// so RateLimited must be computed HERE, before that conversion, or it
+// would silently read as false for every 403 MergePR ever returns --
+// indistinguishable from a genuine permission denial to any caller
+// classifying via ports.ErrPermissionDenied.
 func (a *Adapter) doPut(ctx context.Context, path, token string, reqBody []byte) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, path, bytes.NewReader(reqBody))
 	if err != nil {
@@ -1355,7 +1429,17 @@ func (a *Adapter) doPut(ctx context.Context, path, token string, reqBody []byte)
 		} else if len(body) > 0 {
 			message = "error body did not match GitHub's expected error envelope"
 		}
-		return nil, &APIError{Status: resp.StatusCode, Message: message}
+		apiErr := &APIError{Status: resp.StatusCode, Message: message}
+		if resp.StatusCode == http.StatusForbidden {
+			// See this method's own doc comment above for why this must
+			// be computed here rather than left to a caller further up.
+			// string(body), not message -- see doGet's own identical fix
+			// above for why the RAW body, not the placeholder message can
+			// get overwritten to, is what isRateLimitedResponse's own
+			// message-text fallback needs.
+			apiErr.RateLimited = isRateLimitedResponse(resp, string(body))
+		}
+		return nil, apiErr
 	}
 
 	return body, nil
@@ -1395,7 +1479,15 @@ func (a *Adapter) doPatch(ctx context.Context, path, token string, reqBody []byt
 		} else if len(body) > 0 {
 			message = "error body did not match GitHub's expected error envelope"
 		}
-		return nil, &APIError{Status: resp.StatusCode, Message: message}
+		apiErr := &APIError{Status: resp.StatusCode, Message: message}
+		if resp.StatusCode == http.StatusForbidden {
+			// Audit fix: doPatch previously never computed RateLimited at
+			// all -- see doGet's own identical isRateLimitedResponse call/
+			// doc comment above for why string(body) (the raw body), not
+			// message, is what the fallback text check needs.
+			apiErr.RateLimited = isRateLimitedResponse(resp, string(body))
+		}
+		return nil, apiErr
 	}
 
 	return body, nil
