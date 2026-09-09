@@ -44,20 +44,88 @@ type fakeAutoMergeSourceControl struct {
 	mergeErr       error
 	mergeErrByRepo map[string]error // "owner/repo" -> error, takes priority over mergeErr (see MergePR's own doc comment)
 
-	// mergeDelay, when non-zero, is slept INSIDE MergePR, AFTER releasing
-	// f.mu -- models "blocks on a real GitHub round trip" (docs/
-	// TECHNICAL_PLAN.md §17's own adversarial review, blocker #1) so a
-	// test driving several armed repos through ONE PumpOnce tick can
-	// force their own concurrent goroutines (worker.go's own errgroup fan-
-	// out) to all clear their own authGuard.allow() check BEFORE any one
-	// of them reports its own outcome -- exactly the interleaving the
+	// mergeRendezvous, when non-nil, is waited on INSIDE MergePR, AFTER
+	// releasing f.mu -- models "blocks on a real GitHub round trip"
+	// (docs/TECHNICAL_PLAN.md §17's own adversarial review, blocker #1)
+	// so a test driving several armed repos through ONE PumpOnce tick can
+	// force their own concurrent goroutines (worker.go's own errgroup
+	// fan-out) to all clear their own authGuard.allow() check BEFORE any
+	// one of them reports its own outcome -- exactly the interleaving the
 	// review's own diagnosis names, and the ONE thing a zero-latency fake
 	// can never reproduce (the review's own counterfactual: "with latency
 	// removed from the fake... only one failure is recorded").
-	mergeDelay time.Duration
+	//
+	// A DETERMINISTIC rendezvous (below), not a sleep long enough to
+	// "usually" win the race: this Step's own first version used a plain
+	// time.Sleep, which was long enough locally but not on a loaded CI
+	// runner, where one goroutine legitimately started late enough to
+	// miss the window -- correct behavior (the guard blocking a late
+	// arrival), misread by the test's own then-assertion as a bug. A
+	// barrier that blocks every caller until ALL of them have arrived
+	// removes that scheduling dependency entirely: either every
+	// concurrent call is genuinely in flight together by construction, or
+	// the barrier's own timeout fails the test loudly instead of hanging.
+	mergeRendezvous *rendezvousBarrier
 }
 
 var _ ports.SourceControl = (*fakeAutoMergeSourceControl)(nil)
+
+// rendezvousBarrier blocks every Wait call until n callers have all
+// arrived, then releases them all together -- so a test can force N
+// goroutines to be genuinely concurrent at one specific point, rather
+// than hoping a sleep duration happens to outlast whatever scheduling
+// noise a real CI runner introduces. timeout is a safety valve: if fewer
+// than n callers ever arrive (e.g. a regression elsewhere makes one of
+// them return early, before ever reaching Wait), every already-arrived
+// caller is released once timeout elapses rather than hanging forever --
+// the caller of Wait is expected to fail the test if that happens
+// (mergeRendezvousTimedOut below).
+type rendezvousBarrier struct {
+	mu         sync.Mutex
+	n          int
+	arrived    int
+	timeout    time.Duration
+	release    chan struct{}
+	hitTimeout bool
+}
+
+func newRendezvousBarrier(n int, timeout time.Duration) *rendezvousBarrier {
+	return &rendezvousBarrier{n: n, timeout: timeout, release: make(chan struct{})}
+}
+
+// Wait blocks the calling goroutine until every one of b.n expected
+// callers has itself called Wait, then returns for all of them at once.
+func (b *rendezvousBarrier) Wait() {
+	b.mu.Lock()
+	b.arrived++
+	release := b.release
+	last := b.arrived >= b.n
+	b.mu.Unlock()
+
+	if last {
+		close(release)
+		return
+	}
+
+	select {
+	case <-release:
+	case <-time.After(b.timeout):
+		b.mu.Lock()
+		b.hitTimeout = true
+		b.mu.Unlock()
+	}
+}
+
+// timedOut reports whether ANY Wait call on this barrier ever hit its
+// own timeout instead of a genuine rendezvous -- a test calling this
+// after driving a tick to completion can fail loudly on it, rather than
+// silently accepting a degraded (non-concurrent) run as if it had
+// exercised the same thing a real rendezvous would have.
+func (b *rendezvousBarrier) timedOut() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.hitTimeout
+}
 
 func (f *fakeAutoMergeSourceControl) GetOpenPR(_ context.Context, owner, repo string, number int, _ string) (ports.OpenPR, bool, error) {
 	f.mu.Lock()
@@ -101,15 +169,15 @@ func (f *fakeAutoMergeSourceControl) MergePR(_ context.Context, spec ports.Merge
 		err = f.mergeErr
 	}
 	sha := f.mergeSHA
-	delay := f.mergeDelay
+	rendezvous := f.mergeRendezvous
 	f.mu.Unlock()
 
-	if delay > 0 {
-		// Deliberately OUTSIDE f.mu -- every concurrent goroutine sleeps
-		// here at once, mirroring N real, independent outbound GitHub
-		// calls in flight together, never serialized by this fake's own
+	if rendezvous != nil {
+		// Deliberately OUTSIDE f.mu -- every concurrent goroutine waits
+		// here together, mirroring N real, independent outbound GitHub
+		// calls in flight at once, never serialized by this fake's own
 		// bookkeeping lock.
-		time.Sleep(delay)
+		rendezvous.Wait()
 	}
 	if err != nil {
 		return "", err
@@ -883,34 +951,70 @@ func TestPumpOnce_GetOpenPRAuthFailure_DeadLettersWorkerWide(t *testing.T) {
 // calling allow(repo, now) with the SAME now. Every goroutine clears
 // allow() in microseconds and then blocks on a real GitHub round trip, so
 // with >= MaxAuthFailures armed repos they all record a worker-scope
-// failure at the same instant." fakeAutoMergeSourceControl.mergeDelay
-// (above) models that real round trip -- a real time.Sleep, INSIDE a
-// real goroutine PumpOnce's own errgroup spawns, is the ONE thing needed
-// to force the exact interleaving the review's own diagnosis names (its
-// own counterfactual: "with latency removed from the fake... only one
-// failure is recorded", implying the opposite happens WITH it).
+// failure at the same instant." fakeAutoMergeSourceControl.mergeRendezvous
+// (above) models that real round trip -- a DETERMINISTIC barrier, not a
+// sleep, so every one of armedRepos' own goroutines is GUARANTEED to be
+// inside MergePR together before any of them reports its own outcome,
+// rather than merely likely to be.
+//
+// What this test asserts, and why it does NOT assert mergeCallCount() ==
+// armedRepos:
+//
+// How many of the armedRepos goroutines get their own real MergePR
+// attempt in the racing tick is NOT the invariant this fix establishes
+// -- it is a scheduling-dependent property of exactly how many
+// goroutines clear their own allow() check before the FIRST coalesced
+// failure lands and sets nextAttemptAt (EvaluateBackoff(1) =
+// AutoMergeAuthBackoffBase, 2min, platform/timeouts.go). A goroutine
+// scheduled late enough to call allow() AFTER that first failure already
+// landed is CORRECTLY blocked by the very backoff window this fix
+// installs -- that is the guard working, not a premature dead-letter. An
+// earlier version of this test asserted mergeCallCount() == armedRepos
+// (with a plain time.Sleep standing in for mergeRendezvous) and failed
+// intermittently on a loaded CI runner (7 of 8, not 8) for exactly this
+// reason: it pinned an incidental scheduling outcome, not the invariant
+// it was named for -- the "a check that fails for a reason it does not
+// describe" failure mode this codebase's own audits keep finding, here
+// in the OTHER direction (a check that can also spuriously PASS if
+// nothing raced at all, which is why mergeRendezvous replaces the sleep
+// rather than merely loosening the assertion to >= 1).
+//
+// The actual invariant -- EXACTLY one consecutive failure recorded per
+// concurrent wave, regardless of how many of the armedRepos goroutines
+// overlapped -- is bracketed below via the backoff RUNG it produces
+// (assertExactlyOneNewWorkerFailure), fully deterministic and observable
+// without touching authGuard's own unexported state:
+//
+//  1. A probe tick 1 minute after the wave -- before the 2m rung
+//     EvaluateBackoff(1) sets elapses -- must produce ZERO merge
+//     attempts, proving the worker-wide scope IS backing off, i.e. AT
+//     LEAST one failure was just recorded (zero failures would leave
+//     nextAttemptAt at its zero value, which never blocks allow() at
+//     all).
+//  2. A probe tick 3 minutes after the wave -- past the 2m rung, but
+//     before a SECOND failure's own 4m rung (EvaluateBackoff(2)) would
+//     have elapsed -- must produce NON-ZERO merge attempts, proving the
+//     rung actually reached was the FIRST one (2m), i.e. EXACTLY one
+//     failure, not two or more (whose own rung, 4m, would still be
+//     blocking at +3m).
 //
 // WITHOUT the authguard.go fix (a plain g.mu-protected increment with no
-// generation coalescing), this test's own N=8 armed repos -- each
-// failing with the SAME worker-wide 401 -- would drive
-// consecutiveFailures from 0 to 8 inside this ONE tick, dead-lettering
-// the worker mid-tick (>= domainautomerge.MaxAuthFailures=5): the
-// audit_log row would already exist after just one PumpOnce call, and
-// whichever repos' own goroutines lost the race to cross
-// MaxAuthFailures first would never even get their own MergePR attempt.
-// WITH the fix, a single tick's worth of concurrent, contemporaneous
-// failures coalesces to exactly ONE consecutive failure -- EVERY armed
-// repo gets its own real attempt this tick (mergeCallCount == N), and
-// the worker is NOT YET dead-lettered.
+// generation coalescing), this test's own N=8 armed repos -- all
+// GUARANTEED concurrent via mergeRendezvous, each failing with the SAME
+// worker-wide 401 -- independently record 8 separate consecutive
+// failures inside this ONE tick, which (>= domainautomerge.MaxAuthFailures,
+// 5) dead-letters the worker mid-tick: the no-dead-letter assertion below
+// fails immediately, well before the backoff-rung probes ever run.
 func TestPumpOnce_ConcurrentArmedRepos_OneTickAuthFailure_CoalescesNotDeadLetters(t *testing.T) {
 	rig := newAutomergeTestRig(t)
 	ctx := context.Background()
 
-	const armedRepos = 8 // > domainautomerge.MaxAuthFailures (5)
+	const armedRepos = 8                       // > domainautomerge.MaxAuthFailures (5)
+	const rendezvousTimeout = 10 * time.Second // generous CI-runner safety valve, never expected to fire
 	sc := &fakeAutoMergeSourceControl{
-		prsByKey:   map[string]ports.OpenPR{},
-		mergeErr:   &ports.MergePRError{Status: http.StatusUnauthorized, Message: "Bad credentials"},
-		mergeDelay: 20 * time.Millisecond,
+		prsByKey:        map[string]ports.OpenPR{},
+		mergeErr:        &ports.MergePRError{Status: http.StatusUnauthorized, Message: "Bad credentials"},
+		mergeRendezvous: newRendezvousBarrier(armedRepos, rendezvousTimeout),
 	}
 	for i := 0; i < armedRepos; i++ {
 		repo := fmt.Sprintf("automerge-concurrent-%d", i)
@@ -929,32 +1033,99 @@ func TestPumpOnce_ConcurrentArmedRepos_OneTickAuthFailure_CoalescesNotDeadLetter
 	}
 	worker := rig.newWorker(t, sc)
 
-	if err := worker.PumpOnce(ctx, time.Now()); err != nil {
+	now0 := time.Now()
+	if err := worker.PumpOnce(ctx, now0); err != nil {
 		t.Fatalf("PumpOnce() error = %v, want nil", err)
 	}
-
-	if got := sc.mergeCallCount(); got != armedRepos {
-		t.Fatalf("MergePR call count after one tick = %d, want %d -- every armed repo's own candidate must get a real attempt THIS tick, none skipped mid-tick by a premature dead-letter", got, armedRepos)
+	if sc.mergeRendezvous.timedOut() {
+		t.Fatal("mergeRendezvous timed out waiting for all armedRepos callers to arrive -- fewer than armedRepos candidates reached MergePR concurrently, so this run never actually exercised the race this test is named for")
 	}
 
+	// The real subject of this test: a single tick's worth of
+	// GUARANTEED-concurrent contemporaneous failures must never walk the
+	// whole backoff ladder in one shot.
 	if entry := findAuditLogEntry(t, rig.pool, "automerge.auth_dead_lettered"); entry != nil {
 		t.Fatalf("audit_log row with action=automerge.auth_dead_lettered already exists after ONE tick's worth of %d concurrent contemporaneous failures (detail=%s) -- want none yet: a single tick must never walk the whole backoff ladder in one shot", armedRepos, string(entry.DetailJson))
 	}
 
-	// A SECOND tick's worth of the SAME concurrent failure must still
-	// coalesce to a SECOND consecutive failure, not immediately
-	// dead-letter either -- proving the coalescing holds across waves,
-	// not merely on the very first one.
+	// Bracket that tick's own worth of failures at EXACTLY one,
+	// deterministically -- see this test's own doc comment for why NOT
+	// mergeCallCount() == armedRepos. The probe's own second tick is
+	// itself a second real, mergeRendezvous-guaranteed concurrent wave;
+	// its return value is unused here (nothing further to chain from),
+	// but is available to a future caller wanting to bracket a THIRD
+	// wave the same way.
+	_ = assertExactlyOneNewWorkerFailure(t, ctx, worker, sc, now0, armedRepos, rendezvousTimeout)
+
+	if entry := findAuditLogEntry(t, rig.pool, "automerge.auth_dead_lettered"); entry != nil {
+		t.Fatalf("audit_log row with action=automerge.auth_dead_lettered already exists after a SECOND concurrent wave's own single coalesced failure (detail=%s) -- want none yet (domainautomerge.MaxAuthFailures=5 requires several more waves)", string(entry.DetailJson))
+	}
+}
+
+// assertExactlyOneNewWorkerFailure asserts that, starting from a
+// concurrent wave already driven at waveNow, the worker-wide scope just
+// recorded EXACTLY one NEW consecutive classified failure -- bracketed
+// via the backoff rung it produces (EvaluateBackoff, internal/domain/
+// automerge/backoff.go), rather than by counting how many of armedRepos'
+// own goroutines happened to overlap in wall-clock time (a scheduling-
+// dependent property CI's own loaded runners do not guarantee, and not
+// the invariant this test is named for -- see
+// TestPumpOnce_ConcurrentArmedRepos_OneTickAuthFailure_CoalescesNotDeadLetters's
+// own doc comment for the full "why").
+//
+// Issues two further ticks:
+//
+//  1. waveNow+1m (before the 2m rung elapses): must produce ZERO merge
+//     attempts, proving the scope IS backing off (>= 1 failure was
+//     recorded by waveNow's own wave).
+//  2. waveNow+3m (past the 2m rung, before a second failure's own 4m
+//     rung): must produce NON-ZERO merge attempts, proving the rung
+//     reached was the FIRST one -- i.e. EXACTLY one failure, not two or
+//     more. This second probe is itself a real, mergeRendezvous-
+//     guaranteed concurrent wave across every one of armedRepos (the
+//     worker-wide backoff clears for all of them at once, since they
+//     share the one scope), so it doubles as this test's own proof that
+//     coalescing holds on a SECOND wave, not merely the very first.
+//
+// Resets sc's own recorded merge calls, and its rendezvous barrier,
+// before each probe. Returns the second probe's own tick time
+// (waveNow+3m) so a caller can chain further assertions from it.
+func assertExactlyOneNewWorkerFailure(t *testing.T, ctx context.Context, worker *automerge.Worker, sc *fakeAutoMergeSourceControl, waveNow time.Time, armedRepos int, rendezvousTimeout time.Duration) time.Time {
+	t.Helper()
+
 	sc.mu.Lock()
 	sc.mergeCalls = nil
 	sc.mu.Unlock()
-	if err := worker.PumpOnce(ctx, time.Now().Add(30*time.Minute)); err != nil {
-		t.Fatalf("PumpOnce() second tick error = %v, want nil", err)
+	probeA := waveNow.Add(time.Minute)
+	if err := worker.PumpOnce(ctx, probeA); err != nil {
+		t.Fatalf("PumpOnce() probe tick (+1m from %v) error = %v, want nil", waveNow, err)
 	}
-	if got := sc.mergeCallCount(); got != armedRepos {
-		t.Fatalf("MergePR call count after second tick = %d, want %d", got, armedRepos)
+	if got := sc.mergeCallCount(); got != 0 {
+		t.Fatalf("MergePR call count at +1m from %v = %d, want 0 -- the worker-wide scope must still be backing off on the 2m rung EvaluateBackoff(1) sets, proving at least one failure was recorded (zero would mean allow() never blocked at all)", waveNow, got)
 	}
-	if entry := findAuditLogEntry(t, rig.pool, "automerge.auth_dead_lettered"); entry != nil {
-		t.Fatalf("audit_log row with action=automerge.auth_dead_lettered already exists after TWO ticks' worth of %d concurrent contemporaneous failures each (detail=%s) -- want none yet (domainautomerge.MaxAuthFailures=5 requires several more waves)", armedRepos, string(entry.DetailJson))
+
+	sc.mu.Lock()
+	sc.mergeCalls = nil
+	// A fresh barrier: this probe is itself a real concurrent wave (every
+	// one of armedRepos unblocks together once the 2m rung clears), and
+	// the ORIGINAL barrier is already spent (every Wait call beyond its
+	// own n-th would either double-count an arrival past n or, if replayed
+	// after a close, panic on a second close of the same channel).
+	sc.mergeRendezvous = newRendezvousBarrier(armedRepos, rendezvousTimeout)
+	sc.mu.Unlock()
+	probeB := waveNow.Add(3 * time.Minute)
+	if err := worker.PumpOnce(ctx, probeB); err != nil {
+		t.Fatalf("PumpOnce() probe tick (+3m from %v) error = %v, want nil", waveNow, err)
 	}
+	if got := sc.mergeCallCount(); got == 0 {
+		t.Fatalf("MergePR call count at +3m from %v = 0, want > 0 -- the 2m rung must have already elapsed by +3m; zero attempts here would mean the SECOND rung (4m, i.e. consecutiveFailures==2) was reached instead, proving MORE than one failure was recorded", waveNow)
+	}
+	sc.mu.Lock()
+	timedOut := sc.mergeRendezvous.timedOut()
+	sc.mu.Unlock()
+	if timedOut {
+		t.Fatalf("mergeRendezvous timed out waiting for all armedRepos callers to arrive during the +3m probe wave from %v", waveNow)
+	}
+
+	return probeB
 }
