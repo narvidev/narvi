@@ -62,14 +62,14 @@ ORDER BY created_at DESC
 LIMIT 1
 `
 
-// Step 125's own session-scoped lookup: the composition-findings-posting
+// The session-scoped lookup: the composition-findings-posting
 // tool and the Block/Acknowledge actions all resolve their target row
 // from a sessionID alone (a sandbox-bearer-authenticated tool call, or an
 // authenticated browser request against /api/sessions/:id/release-manifest/*),
 // never from (repo_full_name, pr_number) -- mirrors GetLatestReleaseManifestCheck's
 // own identical "ORDER BY created_at DESC LIMIT 1" shape, backed by
 // release_manifest_checks_session_id_created_at_idx (migrations/
-// 000126_release_manifest_checks_composition.up.sql). pgx.ErrNoRows means
+// 000127_release_manifest_checks_composition.up.sql). pgx.ErrNoRows means
 // this session has no release manifest check on record at all.
 func (q *Queries) GetLatestReleaseManifestCheckBySessionID(ctx context.Context, sessionID pgtype.UUID) (ReleaseManifestCheck, error) {
 	row := q.db.QueryRow(ctx, getLatestReleaseManifestCheckBySessionID, sessionID)
@@ -187,7 +187,7 @@ type UpdateReleaseManifestCompositionDecisionParams struct {
 	ExpectedDecision      string      `json:"expected_decision"`
 }
 
-// Step 125's own Block release / Acknowledge & ship action write
+// The Block release / Acknowledge & ship action write
 // (BlockReleaseComposition/AcknowledgeReleaseComposition, httpapi/
 // releasecompositiondecision.go): a guarded UPDATE comparing against
 // expectedCurrentDecision (the SAME current value the caller already
@@ -239,7 +239,7 @@ type UpdateReleaseManifestCompositionFindingsParams struct {
 	CompositionFindings []byte      `json:"composition_findings"`
 }
 
-// Step 125's own composition-findings-posting tool write
+// The composition-findings-posting tool write
 // (PostReleaseCompositionFindings, httpapi/releasecompositionfindings.go):
 // a guarded UPDATE ("AND composition_reviewed_at IS NULL") so this can
 // only ever succeed ONCE per row -- a retried/duplicate tool call for the

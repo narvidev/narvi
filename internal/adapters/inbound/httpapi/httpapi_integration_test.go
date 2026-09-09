@@ -248,7 +248,7 @@ type testRig struct {
 	// own review_verdicts insert (reviewverdict.go).
 	reviewVerdicts *narvipg.ReviewVerdictStore
 
-	// releaseManifestChecks (Step 125, §15.3/§12.2 item 9) backs this
+	// releaseManifestChecks (§15.3/§12.2 item 9) backs this
 	// rig's own composition-findings-posting tool route and Block/
 	// Acknowledge routes (releasecompositionfindings_integration_test.go/
 	// releasecompositiondecision_integration_test.go).
@@ -625,7 +625,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		// -- see reviewfindings.go's own doc comment.
 		r.Post("/{sessionID}/review/findings/{identityHash}/rebut", httpapi.RebutReviewFinding(rig.sessions, rig.prSessions, rig.reviewFindings, rig.auditLog))
 		r.Post("/{sessionID}/review/findings/{identityHash}/apply-suggestion", httpapi.ApplySuggestion(rig.sessions, rig.prSessions, rig.reviewFindings, rig.identities, rig.sourceControl, rig.tokenEncryptionKey, platform.DefaultTimeouts()))
-		// release-manifest/{block,acknowledge} (Step 125, §12.2 item 9)
+		// release-manifest/{block,acknowledge} (§12.2 item 9)
 		// -- see releasecompositiondecision.go's own doc comment.
 		r.Post("/{sessionID}/release-manifest/block", httpapi.BlockReleaseComposition(rig.sessions, rig.releaseManifestChecks, rig.auditLog))
 		r.Post("/{sessionID}/release-manifest/acknowledge", httpapi.AcknowledgeReleaseComposition(rig.sessions, rig.releaseManifestChecks, rig.auditLog))
@@ -725,7 +725,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 	// own doc comment.
 	router.Post("/sessions/{sessionID}/turn/epistemic-outcome",
 		httpapi.PostEpistemicOutcome(rig.sandboxes, rig.turns))
-	// release-manifest/composition-findings (Step 125, §15.3) is mounted
+	// release-manifest/composition-findings (§15.3) is mounted
 	// the SAME way -- see releasecompositionfindings.go's own doc comment.
 	router.Post("/sessions/{sessionID}/release-manifest/composition-findings",
 		httpapi.PostReleaseCompositionFindings(rig.sandboxes, rig.releaseManifestChecks))

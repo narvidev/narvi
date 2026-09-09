@@ -1,5 +1,5 @@
 // This file (compositionfindingstoolprompt.go) closes the other half of
-// Step 125's own ("release composition findings", §15.3/§12.2 item 9)
+// The release composition review's own (§15.3/§12.2 item 9)
 // composition-findings-posting tool: internal/domain/review.
 // RenderCompositionReviewPrompt renders the aggregate-diff composition
 // review turn's own prompt with a FIXED, deterministic block instructing

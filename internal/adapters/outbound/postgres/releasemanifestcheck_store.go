@@ -43,7 +43,7 @@ func (s *ReleaseManifestCheckStore) GetLatest(ctx context.Context, repoFullName 
 }
 
 // GetBySessionID fetches sessionID's own most-recently-computed check --
-// Step 125's own session-scoped lookup, used by the composition-findings-
+// The session-scoped lookup, used by the composition-findings-
 // posting tool and the Block/Acknowledge actions, none of which know
 // (repoFullName, prNumber) up front. pgx.ErrNoRows means this session has
 // no release manifest check on record at all.

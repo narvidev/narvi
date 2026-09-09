@@ -2,7 +2,7 @@
 // item 9): manifest table + aggregate-diff trigger banner + composition
 // findings with Block release / Acknowledge & ship actions.
 //
-// Step 125 closes this screen's own named gap: the composition-focused
+// This closes the screen's own named gap: the composition-focused
 // aggregate diff review pass (§15.3) is now actually dispatched, and this
 // view renders its real result -- but the result has THREE genuinely
 // distinct states, never collapsed into one:

@@ -159,7 +159,7 @@ type App struct {
 }
 
 // releaseCompositionDispatcher implements releasereview.CompositionDispatcher
-// (Step 125, §15.3) -- a thin adapter around registry.GetOrSpawn +
+// (§15.3) -- a thin adapter around registry.GetOrSpawn +
 // (*sessionactor.Actor).Send(sessionactor.EnsureDispatched{}), the SAME
 // fire-and-forget sequencing httpapi.createTurnLocked already uses after
 // every OTHER turn-creation path (internal/adapters/inbound/httpapi/
@@ -1258,7 +1258,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	router.Post("/sessions/{sessionID}/turn/epistemic-outcome",
 		httpapi.PostEpistemicOutcome(sandboxStore, turnStore))
 
-	// release-manifest/composition-findings (Step 125, §15.3): the
+	// release-manifest/composition-findings (§15.3): the
 	// composition-findings-posting TOOL -- deliberately mounted OUTSIDE
 	// /api/sessions and outside auth.Middleware entirely, mirroring
 	// review/verdict and turn/epistemic-outcome immediately above exactly
@@ -1881,7 +1881,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// release-review screen's own read model, see httpapi/
 		// releasemanifestreadout.go's own doc comment.
 		r.Get("/{sessionID}/release-manifest", httpapi.GetReleaseManifestReadout(sessionStore, githubPRSessionStore, releaseManifestCheckStore))
-		// release-manifest/{block,acknowledge} (Step 125, §12.2 item 9) --
+		// release-manifest/{block,acknowledge} (§12.2 item 9) --
 		// the two composition-finding actions, see
 		// releasecompositiondecision.go's own doc comment for the RBAC
 		// split between them.
@@ -2668,7 +2668,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// persisted onto a release_manifest_pending row itself (see
 	// releasereview.Enqueue's own doc comment).
 	//
-	// Step 125 (§15.3) additions: promptTemplateStore/sourceControl/
+	// Composition-review (§15.3) additions: promptTemplateStore/sourceControl/
 	// turnStore are the SAME instances every other caller above already
 	// uses (promptTemplateStore already satisfies releasereview.
 	// CompositionTemplateFetcher directly, GetTemplate; sourceControl

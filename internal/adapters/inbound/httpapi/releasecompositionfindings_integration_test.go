@@ -1,6 +1,6 @@
 //go:build integration
 
-// Integration tests for Step 125's own ("release composition findings",
+// Integration tests for the release composition findings
 // §15.3/§12.2 item 9) composition-findings-posting tool
 // (releasecompositionfindings.go), against a real Postgres instance --
 // sharing this package's own testRig (httpapi_integration_test.go),
@@ -169,7 +169,7 @@ func TestPostReleaseCompositionFindings_NoReleaseManifestCheck_BadRequest(t *tes
 }
 
 // TestPostReleaseCompositionFindings_HappyPath_PersistsFindings proves
-// the core Step 125 mechanism end to end: a real finding posted through
+// the core composition-findings mechanism end to end: a real finding posted through
 // this endpoint lands in release_manifest_checks.composition_findings,
 // and composition_reviewed_at is set -- the sentinel the release-review
 // screen's readout depends on to stop rendering "not yet available".

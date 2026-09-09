@@ -231,12 +231,12 @@ export function getReleaseManifestReadout(sessionId: string, signal?: AbortSigna
   return request<ReleaseManifestReadout>(`/api/sessions/${encodeURIComponent(sessionId)}/release-manifest`, { signal })
 }
 
-/** blockReleaseComposition calls POST /api/sessions/:id/release-manifest/block (Step 125, §12.2 item 9) -- admin/maintainer only server-side (authz.ActionEditReviewVerdict). */
+/** blockReleaseComposition calls POST /api/sessions/:id/release-manifest/block (§12.2 item 9) -- admin/maintainer only server-side (authz.ActionEditReviewVerdict). */
 export function blockReleaseComposition(sessionId: string, signal?: AbortSignal): Promise<PostReleaseCompositionDecisionResponse> {
   return request<PostReleaseCompositionDecisionResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/release-manifest/block`, { method: 'POST', signal })
 }
 
-/** acknowledgeReleaseComposition calls POST /api/sessions/:id/release-manifest/acknowledge (Step 125, §12.2 item 9) -- admin only server-side (authz.ActionAcknowledgeReleaseComposition), an explicit override of an already-computed composition finding. */
+/** acknowledgeReleaseComposition calls POST /api/sessions/:id/release-manifest/acknowledge (§12.2 item 9) -- admin only server-side (authz.ActionAcknowledgeReleaseComposition), an explicit override of an already-computed composition finding. */
 export function acknowledgeReleaseComposition(sessionId: string, signal?: AbortSignal): Promise<PostReleaseCompositionDecisionResponse> {
   return request<PostReleaseCompositionDecisionResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/release-manifest/acknowledge`, { method: 'POST', signal })
 }

@@ -15,7 +15,7 @@ import (
 
 // TestRenderCompositionFindingsToolPromptText mirrors
 // TestRenderEpistemicOutcomeToolPromptText's own table shape exactly
-// (Step 125, §15.3): the SAME mechanism, a fourth placeholder set,
+// (§15.3): the SAME mechanism, a fourth placeholder set,
 // resolved against the SAME controlPlaneHTTPBase derivation
 // reviewVerdictToolURL/epistemicOutcomeToolURL both share.
 func TestRenderCompositionFindingsToolPromptText(t *testing.T) {

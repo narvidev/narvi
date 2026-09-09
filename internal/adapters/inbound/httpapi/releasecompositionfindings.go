@@ -1,5 +1,5 @@
-// This file (releasecompositionfindings.go) implements Step 125's own
-// ("release composition findings", §15.3/§12.2 item 9) composition-
+// This file (releasecompositionfindings.go) implements the release
+// composition review's (§15.3/§12.2 item 9) own composition-
 // findings-posting TOOL: POST /sessions/{sessionID}/release-manifest/
 // composition-findings. This is the ONLY way the aggregate-diff
 // composition review turn's own findings ever reach release_manifest_checks
@@ -32,6 +32,7 @@
 // second path to any of these eight results" discipline exists to avoid.
 // A second, much smaller tool, naming a much smaller JSON shape, is the
 // honest fit.
+
 package httpapi
 
 import (

@@ -11,7 +11,7 @@ import (
 	"github.com/narvidev/narvi/internal/domain/review"
 )
 
-// This file (compositiondispatch.go) closes Step 125's own named gap:
+// This file (compositiondispatch.go) closes a named gap:
 // §15.3's own aggregate-diff composition review pass was, before this
 // Step, never dispatched anywhere in this codebase -- only its own
 // TRIGGER decision (review.ShouldRunAggregateReview) was computed and
@@ -106,7 +106,7 @@ func dispatchCompositionReview(ctx context.Context, logger *slog.Logger, deps De
 
 // compositionReviewPromptTemplateName is §15.3's own versioned prompt
 // template's name in prompt_templates (migrations/
-// 000126_release_manifest_checks_composition.up.sql's own seed row) --
+// 000127_release_manifest_checks_composition.up.sql's own seed row) --
 // the SAME DB-backed storage/versioning mechanism §18.6/§12.2 item 5
 // already built for the intent classifier's own templates (§15.3's own
 // explicit "same mechanism as §8.3/§12.2 item 5" instruction).

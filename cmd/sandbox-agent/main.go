@@ -386,7 +386,7 @@ func (h *commandHandler) HandlePrompt(_ context.Context, cmd sandboxws.Prompt) {
 	// that placeholder present (every non-review turn, and a review turn
 	// whose ceiling was never configured, review/context.go's own gating).
 	cmd.Text = renderReviewCostBudgetToolPromptText(cmd.Text, h.reviewCostBudgetURL)
-	// (Step 125, §15.3): the SAME mechanism once more, for the
+	// (§15.3): the SAME mechanism once more, for the
 	// aggregate-diff composition review turn's own composition-findings-
 	// posting tool (internal/domain/review.RenderCompositionReviewPrompt,
 	// dispatched by internal/app/releasereview's own dispatchCompositionReview)

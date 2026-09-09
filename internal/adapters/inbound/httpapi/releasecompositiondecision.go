@@ -5,7 +5,7 @@
 //   - POST /api/sessions/{sessionID}/release-manifest/acknowledge
 //
 // Both resolve their target release_manifest_checks row from sessionID
-// alone (ReleaseManifestCheckStore.GetBySessionID, Step 125's own
+// alone (ReleaseManifestCheckStore.GetBySessionID, the
 // addition), validate the requested transition via internal/domain/review.
 // TransitionCompositionDecision (an already-decided composition, or one
 // whose own composition review has not completed yet, rejects both
@@ -30,6 +30,7 @@
 // reasoning: this is a human electing to ship AS IS, specifically DESPITE
 // an already-computed cross-PR risk signal, an override in the same
 // admin-gated class as every other row-6 action.
+
 package httpapi
 
 import (

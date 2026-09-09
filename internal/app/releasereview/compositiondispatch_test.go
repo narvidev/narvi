@@ -100,7 +100,7 @@ func fullCompositionDeps(lister *fakeMergedPRLister, outbox *fakeOutboxEnqueuer,
 }
 
 // TestRun_AggregateReviewTriggered_DispatchesCompositionReviewTurn proves
-// the core Step 125 mechanism: when ShouldRunAggregateReview fires (here,
+// the core dispatch mechanism: when ShouldRunAggregateReview fires (here,
 // via a high-risk-flagged constituent PR), Run fetches the composition
 // prompt template, re-fetches the release PR's own diff, inserts a
 // pending turn on the SAME session carrying a rendered composition
@@ -192,7 +192,7 @@ func TestRun_AggregateReviewNotTriggered_NeverDispatchesCompositionReview(t *tes
 
 // TestRun_CompositionDepsNotConfigured_DegradesGracefully proves every one
 // of the four composition-dispatch dependencies is independently nil-safe
-// -- a caller that doesn't wire Step 125's own deliverable (e.g. every
+// -- a caller that doesn't wire the composition dispatcher (e.g. every
 // EXISTING test in run_test.go, predating this Step) must keep behaving
 // exactly as before: the manifest check itself is unaffected, and nothing
 // panics.

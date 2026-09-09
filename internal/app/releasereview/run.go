@@ -95,7 +95,7 @@ type Deps struct {
 	// degrades, never blocks" posture for a caller that doesn't wire one.
 	ReleaseManifestChecks ReleaseManifestCheckInserter
 	// CompositionTemplates/CompositionDiffFetcher/CompositionTurns/
-	// CompositionDispatch (Step 125, §15.3) back dispatchCompositionReview
+	// CompositionDispatch (§15.3) back dispatchCompositionReview
 	// (compositiondispatch.go) -- ALL nil-safe, mirroring
 	// ReleaseManifestChecks immediately above: any one of them left unset
 	// simply declines to dispatch the composition pass for a caller that
@@ -192,7 +192,7 @@ func Run(ctx context.Context, logger *slog.Logger, deps Deps, in Input) {
 	// exists and why it is best-effort.
 	persistReleaseManifestCheck(ctx, logger, deps.ReleaseManifestChecks, in, domainMerged, findings, aggregateReview, triggerReasons, truncated)
 
-	// Step 125 (§15.3): dispatch the actual composition review pass, once
+	// §15.3: dispatch the actual composition review pass, once
 	// its own trigger decision (aggregateReview, above) fires -- see
 	// dispatchCompositionReview's own doc comment (compositiondispatch.go)
 	// for the full "why a second turn on this same session" design.
