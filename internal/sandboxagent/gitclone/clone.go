@@ -166,7 +166,7 @@ func CloneAll(
 // real, not merely theoretical, defense-in-depth gap were "--" omitted.
 func applySparseCheckout(ctx context.Context, sup *supervisor.Supervisor, dir string, patterns []string, timeout, stopGrace time.Duration) error {
 	// See internal/sandboxagent/gitclone's runGit (sync.go) and
-	// githarden.NeutralizeFilters' own doc comments for the full
+	// githarden.NeutralizeFiltersBestEffort's own doc comments for the full
 	// reasoning: `sparse-checkout set` materializes newly-in-scope paths
 	// into the working tree, which is exactly the class of operation that
 	// can run a content filter -- and unlike cloneOne's own fresh-clone
@@ -179,7 +179,7 @@ func applySparseCheckout(ctx context.Context, sup *supervisor.Supervisor, dir st
 	// gives for covering a shared runner instead of each caller: a path
 	// this function reaches unprotected is a hole regardless of how safe
 	// its OTHER caller is.
-	if err := githarden.NeutralizeFilters(dir); err != nil {
+	if err := githarden.NeutralizeFiltersBestEffort(dir); err != nil {
 		return fmt.Errorf("neutralize content filters for %s: %w", dir, err)
 	}
 
@@ -318,9 +318,10 @@ func disableSparseCheckoutIfEnabled(ctx context.Context, sup *supervisor.Supervi
 	// path into the working tree -- the same class of operation as
 	// applySparseCheckout's own identical call just above in this file,
 	// and reached the same way, from syncOne against an already-existing
-	// repo. See that call's own comment and githarden.NeutralizeFilters'
-	// doc comment for the full reasoning.
-	if err := githarden.NeutralizeFilters(dir); err != nil {
+	// repo. See that call's own comment and
+	// githarden.NeutralizeFiltersBestEffort's own doc comment for the full
+	// reasoning.
+	if err := githarden.NeutralizeFiltersBestEffort(dir); err != nil {
 		return fmt.Errorf("neutralize content filters for %s: %w", dir, err)
 	}
 
@@ -378,7 +379,7 @@ func validateRepoSpec(repo sessionconfig.SessionConfigReposElem) error {
 // context) and reported as a timeout failure; a non-zero exit or a wait
 // failure is likewise a real, returned error.
 //
-// Deliberately NOT preceded by githarden.NeutralizeFilters, unlike
+// Deliberately NOT preceded by githarden.NeutralizeFiltersBestEffort, unlike
 // applySparseCheckout/disableSparseCheckoutIfEnabled below and runGit
 // (sync.go): dir does not exist yet when this runs (CloneAll's own doc
 // comment: workspaceDir's PARENT is created via MkdirAll, but `git

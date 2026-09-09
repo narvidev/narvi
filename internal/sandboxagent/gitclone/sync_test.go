@@ -2055,7 +2055,7 @@ func writeMarkerScript(t *testing.T, path, marker string) {
 
 // TestSyncAll_ArmedContentFilterInExistingWorkspace_DoesNotExecute is the
 // end-to-end proof that the REAL production wiring -- gitclone.SyncAll,
-// not just githarden.NeutralizeFilters in isolation -- blocks the class
+// not just githarden.NeutralizeFiltersBestEffort in isolation -- blocks the class
 // githarden's own doc comment names: a content filter
 // armed directly in .git/config, exactly as the agent runtime could have
 // left it in an ALREADY-EXISTING workspace (this file's own package
@@ -2117,7 +2117,7 @@ func TestSyncAll_ArmedContentFilterInExistingWorkspace_DoesNotExecute(t *testing
 	}
 
 	if _, statErr := os.Stat(marker); statErr == nil {
-		t.Error("armed filter.evil.smudge RAN during SyncAll's own checkout -- NeutralizeFilters was not applied where it needed to be")
+		t.Error("armed filter.evil.smudge RAN during SyncAll's own checkout -- NeutralizeFiltersBestEffort was not applied where it needed to be")
 	}
 
 	data, err := os.ReadFile(filepath.Join(repoDir, "secret.bin"))
@@ -2171,7 +2171,7 @@ func TestCleanForImageBuild_ArmedContentFilter_DoesNotExecute(t *testing.T) {
 	}
 
 	if _, statErr := os.Stat(marker); statErr == nil {
-		t.Error("armed filter.evil.smudge RAN during CleanForImageBuild's own checkout -- NeutralizeFilters was not applied where it needed to be")
+		t.Error("armed filter.evil.smudge RAN during CleanForImageBuild's own checkout -- NeutralizeFiltersBestEffort was not applied where it needed to be")
 	}
 
 	data, err := os.ReadFile(filepath.Join(repoDir, "secret.bin"))

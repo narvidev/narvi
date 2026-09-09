@@ -509,7 +509,7 @@ func runGit(ctx context.Context, sup *supervisor.Supervisor, args []string, step
 	// happens without them. Callers still pass their own "-C <dir>";
 	// githarden.Harden rewrites the invocation around it.
 	//
-	// githarden.NeutralizeFilters is the one piece Harden's own -c flags
+	// githarden.NeutralizeFiltersBestEffort is the one piece Harden's own -c flags
 	// cannot cover (see its own doc comment): a content filter's driver
 	// name is chosen by the repository, not fixed, so it is asserted here
 	// as a file write instead, before every spawn -- this function is
@@ -522,7 +522,7 @@ func runGit(ctx context.Context, sup *supervisor.Supervisor, args []string, step
 	// swallowed: proceeding with the git call anyway would be running it
 	// un-neutralized, silently.
 	if dir, ok := dashCDir(args); ok {
-		if err := githarden.NeutralizeFilters(dir); err != nil {
+		if err := githarden.NeutralizeFiltersBestEffort(dir); err != nil {
 			return "", fmt.Errorf("neutralize content filters for %s: %w", dir, err)
 		}
 	}
