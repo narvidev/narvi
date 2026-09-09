@@ -214,7 +214,7 @@ func ExtractStructured(content string) *Structured {
 		return nil
 	}
 	scopeEstimate := strings.TrimSpace(wire.ScopeEstimate)
-	if scopeEstimate == "" {
+	if scopeEstimate == "" || containsNUL(scopeEstimate) {
 		return nil
 	}
 
@@ -225,12 +225,47 @@ func ExtractStructured(content string) *Structured {
 		if title == "" || description == "" {
 			return nil
 		}
+		if containsNUL(title) || containsNUL(description) {
+			return nil
+		}
 		fileRefs := s.FileRefs
 		if fileRefs == nil {
 			fileRefs = []string{}
+		}
+		for _, ref := range fileRefs {
+			if containsNUL(ref) {
+				return nil
+			}
 		}
 		steps[i] = Step{Title: title, Description: description, FileRefs: fileRefs}
 	}
 
 	return &Structured{Steps: steps, ScopeEstimate: scopeEstimate}
 }
+
+// containsNUL reports whether s carries a U+0000, which is valid in a Go
+// string and valid in JSON (as the escape \u0000) but which Postgres cannot
+// store in a jsonb column: it raises 22P05, "unsupported Unicode escape
+// sequence".
+//
+// That refusal is why this is a rejection and not a cosmetic check. The
+// structured value is persisted to plan_documents.structured_steps inside
+// the SAME transaction that approves the plan, so one NUL anywhere in a
+// model-emitted title, description, fileRef or scope estimate rolls that
+// transaction back -- and because the content is re-derived deterministically
+// from the immutable event log on every attempt, the plan is not merely
+// failing once, it is unapprovable forever, on the web button, the Slack
+// button and the Linear reply alike. The prose in that same content reaches
+// a TEXT column and is harmless there, which is exactly why this was not a
+// problem before the structured column existed.
+//
+// U+0000 is the only character with this effect: U+0001 through U+001F
+// marshal to the same escape shape and jsonb accepts them, so this checks
+// for the one byte that actually bricks the write rather than sweeping a
+// whole control-character range it has no reason to refuse.
+//
+// Folding to nil rather than stripping the byte keeps the one rule this
+// extractor has: every deviation renders as the prose it always was. Editing
+// model-authored text on its way through would be a silent rewrite of the
+// document a human is about to approve.
+func containsNUL(s string) bool { return strings.ContainsRune(s, 0) }

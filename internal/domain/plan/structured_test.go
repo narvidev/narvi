@@ -17,6 +17,51 @@ func TestExtractStructured(t *testing.T) {
 			want:    nil,
 		},
 		{
+			// A NUL is valid JSON and a valid Go string, but Postgres jsonb
+			// raises 22P05 on it -- and the structured value is persisted in
+			// the SAME transaction that approves the plan, so letting one
+			// through makes that plan unapprovable forever, on every channel.
+			name: "a NUL escape in a title folds to prose rather than bricking approval",
+			content: "```plan-steps\n" +
+				`{"steps":[{"title":"Add\u0000table","description":"New migration.","fileRefs":["a.sql"]}],"scopeEstimate":"1 file"}` +
+				"\n```",
+			want: nil,
+		},
+		{
+			name: "a NUL escape in a description folds to prose",
+			content: "```plan-steps\n" +
+				`{"steps":[{"title":"Add table","description":"New\u0000migration.","fileRefs":["a.sql"]}],"scopeEstimate":"1 file"}` +
+				"\n```",
+			want: nil,
+		},
+		{
+			name: "a NUL escape in a fileRef folds to prose",
+			content: "```plan-steps\n" +
+				`{"steps":[{"title":"Add table","description":"New migration.","fileRefs":["a\u0000.sql"]}],"scopeEstimate":"1 file"}` +
+				"\n```",
+			want: nil,
+		},
+		{
+			name: "a NUL escape in the scope estimate folds to prose",
+			content: "```plan-steps\n" +
+				`{"steps":[{"title":"Add table","description":"New migration.","fileRefs":["a.sql"]}],"scopeEstimate":"1\u0000file"}` +
+				"\n```",
+			want: nil,
+		},
+		{
+			// The control that keeps the guard honest: U+0001..U+001F share the
+			// escape SHAPE but jsonb stores them fine, so rejecting them too
+			// would refuse a plan Postgres would have accepted.
+			name: "a non-NUL control escape is NOT rejected -- jsonb accepts those",
+			content: "```plan-steps\n" +
+				`{"steps":[{"title":"Add\u0001table","description":"New migration.","fileRefs":["a.sql"]}],"scopeEstimate":"1 file"}` +
+				"\n```",
+			want: &Structured{
+				Steps:         []Step{{Title: "Add\u0001table", Description: "New migration.", FileRefs: []string{"a.sql"}}},
+				ScopeEstimate: "1 file",
+			},
+		},
+		{
 			name: "well-formed block embedded in surrounding prose, before and after",
 			content: "Here is my plan.\n\n1. Add a table.\n2. Wire it up.\n\n" +
 				"```plan-steps\n" +

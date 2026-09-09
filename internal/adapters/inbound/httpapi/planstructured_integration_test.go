@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -246,6 +247,75 @@ func TestApprovePlan_StructuredStepsNullWhenContentUnstructured(t *testing.T) {
 	}
 	if doc.StructuredSteps != nil {
 		t.Errorf("plan_documents.structured_steps = %s, want NULL for unstructured content", doc.StructuredSteps)
+	}
+}
+
+// TestApprovePlan_NulInStructuredField_StillApproves is the end-to-end
+// proof for the one failure that made a plan UNAPPROVABLE rather than
+// merely rendered badly.
+//
+// U+0000 is valid JSON and a valid Go string, but Postgres jsonb refuses it
+// with 22P05. structured_steps is written inside the SAME transaction that
+// approves the plan, so a single NUL escape anywhere in a model-emitted
+// title, description, fileRef or scope estimate rolled that transaction
+// back -- and because the content is re-derived deterministically from the
+// immutable event log on every attempt, retrying could never help: the plan
+// stayed awaiting_approval forever, on the web button, the Slack button and
+// the Linear reply alike, with no plan_documents row and no implementation
+// turn. The content is model-authored text about a repository the model
+// reads, so the byte is attacker-influenceable.
+//
+// ExtractStructured now folds a NUL-carrying block to nil, which is the same
+// thing it does with every other deviation: the plan renders as the prose it
+// always was, and it approves.
+func TestApprovePlan_NulInStructuredField_StillApproves(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	owner, token := rig.createAuthenticatedUser(ctx, t)
+	session := createSessionForUser(ctx, t, rig, owner.ID, nil)
+
+	turn, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusCompleted, PlanMode: true})
+	if err != nil {
+		t.Fatalf("create producing turn: %v", err)
+	}
+	dispatchTurn(ctx, t, rig, session.ID, turn.ID)
+
+	// A fully compliant block whose title carries the (valid JSON) escape
+	// for U+0000. Note the content itself holds no NUL byte -- only the
+	// six-character escape text -- which is why it reached the TEXT content
+	// column harmlessly before the jsonb column existed.
+	content := "Here is my plan.\n\n```plan-steps\n" +
+		`{"steps":[{"title":"Add` + `\u0000` + `table","description":"New migration.","fileRefs":["a.sql"]}],"scopeEstimate":"1 file"}` +
+		"\n```\n"
+	if strings.ContainsRune(content, 0) {
+		t.Fatalf("fixture bug: the content must carry the ESCAPE, not a literal NUL byte")
+	}
+	seedTokenEvent(ctx, t, rig, session.ID, "approve-nul-msg", content)
+	plan, err := rig.plans.Create(ctx, sqlcgen.CreatePlanParams{SessionID: session.ID, TurnID: turn.ID, Version: 1, Status: sqlcgen.PlanStatusAwaitingApproval})
+	if err != nil {
+		t.Fatalf("create awaiting_approval plan: %v", err)
+	}
+
+	status := rig.doJSON(t, http.MethodPost,
+		"/api/sessions/"+session.ID.String()+"/plans/"+plan.ID.String()+"/approve", []byte{}, nil, token)
+	if status != http.StatusOK {
+		t.Fatalf("approve status = %d, want %d -- a NUL in a structured field must never make a plan unapprovable", status, http.StatusOK)
+	}
+
+	got, err := rig.plans.Get(ctx, plan.ID)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", plan.ID.String(), err)
+	}
+	if got.Status != sqlcgen.PlanStatusApproved {
+		t.Errorf("plan status = %q, want %q", got.Status, sqlcgen.PlanStatusApproved)
+	}
+
+	doc, err := rig.planDocuments.GetByPlanID(ctx, plan.ID)
+	if err != nil {
+		t.Fatalf("GetByPlanID(%s): %v", plan.ID.String(), err)
+	}
+	if doc.StructuredSteps != nil {
+		t.Errorf("plan_documents.structured_steps = %s, want NULL -- the block was rejected, so there is no structure to snapshot", doc.StructuredSteps)
 	}
 }
 
