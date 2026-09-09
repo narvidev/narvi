@@ -91,7 +91,7 @@ import { approvePlan, createTurn, getSession, listPlans, rejectPlan } from '../a
 import { ApiError } from '../api/http'
 import { planQueryKeys, sessionListQueryKeys, sessionQueryKeys } from '../api/queryKeys'
 import { meQueryOptions } from '../auth/session'
-import { canActOnPlan, latestPlan, modelLabel, planStatusLabel, planStatusTone } from './planFormat'
+import { canActOnPlan, latestPlan, modelLabel, planStatusLabel, planStatusTone, stripStructureBlock } from './planFormat'
 import { truncateForDisplay } from './textSafety'
 
 const MAX_CONTENT_CHARS = 8000
@@ -138,7 +138,7 @@ export function PlanCard({ plan }: { plan: Plan }) {
         <b>Plan</b>
         <time>{new Date(plan.createdAt).toLocaleString()}</time>
       </div>
-      {plan.structured ? <StructuredPlanSteps structured={plan.structured} /> : <p className="plan-content"><T text={plan.content} /></p>}
+      {plan.structured ? <StructuredPlanSteps structured={plan.structured} /> : <p className="plan-content"><T text={stripStructureBlock(plan.content)} /></p>}
       <div className="verdict-foot">
         {plan.structured && (
           <span>

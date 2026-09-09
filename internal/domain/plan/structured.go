@@ -240,7 +240,37 @@ func ExtractStructured(content string) *Structured {
 		steps[i] = Step{Title: title, Description: description, FileRefs: fileRefs}
 	}
 
+	if isInstructionExample(steps, scopeEstimate) {
+		return nil
+	}
+
 	return &Structured{Steps: steps, ScopeEstimate: scopeEstimate}
+}
+
+// isInstructionExample reports whether the extracted document is verbatim
+// the example block RenderStructureInstruction shows the model.
+//
+// The content this extractor reads is the model's own reply, and the example
+// it was shown is a fully schema-valid document -- so a model that answers by
+// echoing the requested format produces a plan reading "short step title /
+// what this step does and why", rendered on the screen where a human clicks
+// Approve & build and attributed to the model as its own plan. Folding that
+// to prose is the same rule every other deviation follows, and it is the rule
+// this extractor's own doc comment already claims: never a fabricated plan
+// invented just to satisfy the shape.
+//
+// Deliberately exact rather than heuristic. Refusing anything that merely
+// LOOKS like placeholder text would start turning away real plans, and the
+// failure actually worth closing is the verbatim echo.
+func isInstructionExample(steps []Step, scopeEstimate string) bool {
+	if len(steps) != 1 || scopeEstimate != exampleScopeEstimate {
+		return false
+	}
+	s := steps[0]
+	if s.Title != exampleStepTitle || s.Description != exampleStepDescription {
+		return false
+	}
+	return len(s.FileRefs) == 1 && s.FileRefs[0] == exampleFileRef
 }
 
 // containsNUL reports whether s carries a U+0000, which is valid in a Go
@@ -269,3 +299,47 @@ func ExtractStructured(content string) *Structured {
 // model-authored text on its way through would be a silent rewrite of the
 // document a human is about to approve.
 func containsNUL(s string) bool { return strings.ContainsRune(s, 0) }
+
+// StripStructureBlock returns content with the one fenced plan-steps block
+// removed, for rendering to a HUMAN. Everything else is preserved byte for
+// byte, and content that carries no complete block comes back unchanged.
+//
+// Why this exists. The instruction asks the model to append a machine-
+// readable block to its prose, and that prose is what Slack's and Linear's
+// approval messages carry and what the web renders whenever no structure
+// could be extracted. Without this, every one of those surfaces shows a
+// human a wall of JSON after the plan -- and the fallback path shows it
+// precisely when something went wrong with the block, which is the worst
+// moment to hand someone the raw thing that failed.
+//
+// It strips PRESENTATION only. plan_documents' own content column and the
+// wire's own content field keep the model's reply whole: that is the record
+// of what the model actually said, and editing it on the way into storage
+// would make the record disagree with the event log it was recovered from.
+//
+// The block is only removed when it is unambiguous -- one open fence and a
+// close after it, the same shape ExtractStructured reads. A second open
+// fence means neither this function nor the extractor can tell which block
+// the model meant, so nothing is removed and the human sees exactly what
+// the model wrote, which is the honest outcome when the format was not
+// followed.
+func StripStructureBlock(content string) string {
+	openIdx := strings.Index(content, StructureFenceOpen)
+	if openIdx == -1 {
+		return content
+	}
+	afterOpen := content[openIdx+len(StructureFenceOpen):]
+	if strings.Contains(afterOpen, StructureFenceOpen) {
+		return content
+	}
+	closeIdx := strings.Index(afterOpen, structureFenceClose)
+	if closeIdx == -1 {
+		return content
+	}
+
+	before := content[:openIdx]
+	after := afterOpen[closeIdx+len(structureFenceClose):]
+	// Collapse the seam so removing a trailing block does not leave the
+	// message ending in the blank lines that separated it from the prose.
+	return strings.TrimRight(before, " \t\n") + strings.TrimRight(after, " \t\n")
+}

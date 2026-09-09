@@ -25,14 +25,36 @@ package plan
 // omit the block entirely rather than guess, which is what lets a
 // genuinely under-specified plan still render honestly as prose (never a
 // fabricated one-step "plan" invented just to satisfy the shape).
+// The example block's own field values, named rather than inlined so
+// ExtractStructured can refuse a document that is exactly this example.
+//
+// It has to refuse one: the example above is a fully schema-valid document,
+// and the content ExtractStructured reads is the MODEL'S REPLY. A model that
+// answers by echoing the format it was just shown -- a thing models do --
+// would otherwise put a plan reading "short step title / what this step does
+// and why / e.g. 6 files, 2 migrations" on the screen where a human clicks
+// Approve & build, presented as its own. That is precisely the fabricated
+// plan this whole extractor's fold-to-prose rule exists to prevent.
+//
+// The refusal is deliberately narrow -- this exact document, not anything
+// that merely looks like a placeholder. A broader heuristic would start
+// turning away real plans, and the failure worth closing is the verbatim
+// echo, not a model that wrote something slightly different.
+const (
+	exampleStepTitle       = "short step title"
+	exampleStepDescription = "what this step does and why"
+	exampleFileRef         = "path/to/file.go"
+	exampleScopeEstimate   = "e.g. 6 files, 2 migrations"
+)
+
 const structureInstruction = "" +
 	"This is a plan-mode turn. Propose your plan as you normally would, in prose, for a human to read " +
 	"first -- that text is what gets shown and decided on. Then, as the LAST thing in your reply, " +
 	"include exactly one fenced code block labeled `plan-steps` containing a single JSON object with " +
 	"this exact shape, so this system can also render your plan as a structured document:\n\n" +
 	StructureFenceOpen + "\n" +
-	"{\"steps\": [{\"title\": \"short step title\", \"description\": \"what this step does and why\", " +
-	"\"fileRefs\": [\"path/to/file.go\"]}], \"scopeEstimate\": \"e.g. 6 files, 2 migrations\"}\n" +
+	"{\"steps\": [{\"title\": \"" + exampleStepTitle + "\", \"description\": \"" + exampleStepDescription + "\", " +
+	"\"fileRefs\": [\"" + exampleFileRef + "\"]}], \"scopeEstimate\": \"" + exampleScopeEstimate + "\"}\n" +
 	"```\n\n" +
 	"Requirements: at least one step; every step needs a non-empty title and description; fileRefs is a " +
 	"(possibly empty) array of real repository paths the step touches; scopeEstimate is a short, " +

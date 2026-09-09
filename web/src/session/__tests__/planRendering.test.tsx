@@ -13,7 +13,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import type { Plan } from '@narvi/contracts/rest-dtos'
 
 import { PlanCard, StructuredPlanSteps } from '../PlanModeView'
-import { latestPlan } from '../planFormat'
+import { latestPlan, stripStructureBlock } from '../planFormat'
 
 const XSS_IMG = '<img src=x onerror=alert(1)>'
 const XSS_SCRIPT = '<script>alert(document.cookie)</script>'
@@ -173,5 +173,43 @@ describe('latestPlan -- pure selection logic', () => {
   })
   it('returns null for an empty list', () => {
     expect(latestPlan([])).toBeNull()
+  })
+})
+
+describe('stripStructureBlock -- a human never reads the machine block', () => {
+  it('removes a trailing plan-steps block and the blank seam it left', () => {
+    const content =
+      'Here is my plan.\n\n1. Add a table.\n\n```plan-steps\n' +
+      '{"steps":[{"title":"T","description":"D","fileRefs":[]}],"scopeEstimate":"1 file"}' +
+      '\n```\n'
+    expect(stripStructureBlock(content)).toBe('Here is my plan.\n\n1. Add a table.')
+  })
+
+  it('leaves content with no block untouched', () => {
+    expect(stripStructureBlock('1. Add a table.')).toBe('1. Add a table.')
+  })
+
+  it('removes nothing when two open fences make the block ambiguous', () => {
+    const content = 'A\n```plan-steps\n{}\n```\nB\n```plan-steps\n{}\n```\n'
+    expect(stripStructureBlock(content)).toBe(content)
+  })
+
+  it('the prose fallback -- the path taken when the block did NOT parse -- never shows the raw JSON', () => {
+    // A block that fails validation (zero steps) so structured is null and
+    // the fallback renders. Without the strip the reader would be handed the
+    // very JSON that just failed.
+    const plan = {
+      id: 'p1',
+      version: 1,
+      status: 'awaiting_approval',
+      createdAt: new Date().toISOString(),
+      content:
+        'My plan in prose.\n\n```plan-steps\n{"steps":[],"scopeEstimate":"1 file"}\n```\n',
+      structured: null,
+    } as unknown as Plan
+    const html = renderToStaticMarkup(<PlanCard plan={plan} />)
+    expect(html).toContain('My plan in prose.')
+    expect(html).not.toContain('scopeEstimate')
+    expect(html).not.toContain('plan-steps')
   })
 })

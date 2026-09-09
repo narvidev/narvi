@@ -2,6 +2,7 @@ package plan
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -189,5 +190,70 @@ func TestExtractStructured(t *testing.T) {
 				t.Errorf("ExtractStructured() = %+v, want %+v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestStripStructureBlock(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{
+			name:    "content with no block is returned unchanged",
+			content: "1. Add a table.\n2. Wire it up.",
+			want:    "1. Add a table.\n2. Wire it up.",
+		},
+		{
+			name: "a trailing block is removed, and so is the blank seam it left",
+			content: "Here is my plan.\n\n1. Add a table.\n\n```plan-steps\n" +
+				`{"steps":[{"title":"Add table","description":"New migration.","fileRefs":[]}],"scopeEstimate":"1 file"}` +
+				"\n```\n",
+			want: "Here is my plan.\n\n1. Add a table.",
+		},
+		{
+			name: "prose after the block survives",
+			content: "Plan.\n\n```plan-steps\n" +
+				`{"steps":[{"title":"T","description":"D","fileRefs":[]}],"scopeEstimate":"1 file"}` +
+				"\n```\n\nLet me know.",
+			want: "Plan.\n\nLet me know.",
+		},
+		{
+			// The same ambiguity ExtractStructured refuses: with two open
+			// fences neither can tell which block was meant, so the human
+			// sees exactly what the model wrote rather than a guess.
+			name:    "two open fences: nothing is removed",
+			content: "A\n```plan-steps\n{}\n```\nB\n```plan-steps\n{}\n```\n",
+			want:    "A\n```plan-steps\n{}\n```\nB\n```plan-steps\n{}\n```\n",
+		},
+		{
+			name:    "an unterminated fence removes nothing",
+			content: "Plan.\n\n```plan-steps\n{\"steps\":[]",
+			want:    "Plan.\n\n```plan-steps\n{\"steps\":[]",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := StripStructureBlock(tc.content); got != tc.want {
+				t.Errorf("StripStructureBlock() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStripStructureBlock_NeverStripsWhatExtractStructuredWouldRead is the
+// pair invariant: whenever a block IS extractable, stripping must actually
+// remove it -- otherwise a human reads the JSON on exactly the plans that
+// worked, which is the leak this function exists to close.
+func TestStripStructureBlock_NeverStripsWhatExtractStructuredWouldRead(t *testing.T) {
+	content := "Prose first.\n\n```plan-steps\n" +
+		`{"steps":[{"title":"T","description":"D","fileRefs":["a.go"]}],"scopeEstimate":"1 file"}` +
+		"\n```\n"
+	if ExtractStructured(content) == nil {
+		t.Fatal("fixture bug: this content must extract, or the invariant below is vacuous")
+	}
+	if got := StripStructureBlock(content); strings.Contains(got, "plan-steps") || strings.Contains(got, "scopeEstimate") {
+		t.Errorf("StripStructureBlock() = %q, want the machine block gone", got)
 	}
 }

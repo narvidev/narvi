@@ -70,3 +70,34 @@ export function canActOnPlan(role: string | undefined, meId: string | undefined,
   if (role === 'member' && meId !== undefined && sessionCreatedBy !== null && meId === sessionCreatedBy) return true
   return false
 }
+
+/**
+ * stripStructureBlock removes the one fenced `plan-steps` block from a plan's
+ * prose before a human reads it, mirroring plandomain.StripStructureBlock on
+ * the server (which does the same for the Slack and Linear approval
+ * messages).
+ *
+ * The wire's `content` deliberately still carries the model's whole reply --
+ * it is the record of what the model said. What must not happen is a human
+ * being shown the machine-readable block, and the prose fallback is exactly
+ * where that would bite hardest: it renders precisely when the block did NOT
+ * parse, so without this the reader gets the raw JSON that just failed.
+ *
+ * Only an unambiguous block is removed -- one open fence with a close after
+ * it, the same shape the server's extractor reads. Two open fences means
+ * neither side can tell which block was meant, so nothing is removed and the
+ * reader sees exactly what the model wrote.
+ */
+export function stripStructureBlock(content: string): string {
+  const FENCE_OPEN = '```plan-steps'
+  const FENCE_CLOSE = '```'
+  const openIdx = content.indexOf(FENCE_OPEN)
+  if (openIdx === -1) return content
+  const afterOpen = content.slice(openIdx + FENCE_OPEN.length)
+  if (afterOpen.includes(FENCE_OPEN)) return content
+  const closeIdx = afterOpen.indexOf(FENCE_CLOSE)
+  if (closeIdx === -1) return content
+  const before = content.slice(0, openIdx)
+  const after = afterOpen.slice(closeIdx + FENCE_CLOSE.length)
+  return before.replace(/[ \t\n]+$/, '') + after.replace(/[ \t\n]+$/, '')
+}

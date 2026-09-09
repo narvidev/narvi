@@ -72,3 +72,38 @@ func TestRenderStructureInstruction_MentionsTheExactFenceTagExtractStructuredLoo
 		t.Errorf("a minimal well-formed reply following this instruction's own documented shape failed to extract: %q", simulatedReply)
 	}
 }
+
+// TestStructureInstruction_OwnExampleNeverParsesAsAPlan is the invariant
+// that ties the prompt and the extractor together.
+//
+// The example the instruction shows is a fully schema-valid document, and
+// the content ExtractStructured reads is the model's REPLY -- so a model
+// that answers by echoing the format it was shown would produce a plan
+// reading "short step title / what this step does and why", presented as
+// its own on the screen where a human clicks Approve & build. Feeding the
+// whole instruction back through the extractor is the cheapest statement of
+// the rule, and it keeps failing if anyone later edits the example, adds a
+// second one, or relaxes the extractor.
+func TestStructureInstruction_OwnExampleNeverParsesAsAPlan(t *testing.T) {
+	if got := ExtractStructured(RenderStructureInstruction()); got != nil {
+		t.Errorf("the instruction's own example parses as a plan (steps=%d, scope=%q) -- a model echoing the requested format would render a fabricated plan for a human to approve",
+			len(got.Steps), got.ScopeEstimate)
+	}
+}
+
+// TestStructureInstruction_ExampleRejectionIsExact keeps the guard above
+// from quietly widening into a placeholder-shaped heuristic that would turn
+// away real plans: a document that differs from the example in ONE field is
+// a plan, and must extract.
+func TestStructureInstruction_ExampleRejectionIsExact(t *testing.T) {
+	content := "```plan-steps\n" +
+		`{"steps":[{"title":"short step title","description":"what this step does and why","fileRefs":["internal/app/real.go"]}],"scopeEstimate":"e.g. 6 files, 2 migrations"}` +
+		"\n```"
+	got := ExtractStructured(content)
+	if got == nil {
+		t.Fatal("a document differing from the example only in fileRefs was rejected -- the guard must be exact, not a placeholder heuristic")
+	}
+	if len(got.Steps) != 1 || got.Steps[0].FileRefs[0] != "internal/app/real.go" {
+		t.Errorf("extracted = %+v, want the real fileRef preserved", got.Steps)
+	}
+}

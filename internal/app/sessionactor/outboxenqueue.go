@@ -178,7 +178,9 @@ func (a *Actor) enqueueOutboxNotification(ctx context.Context, tx pgx.Tx, sessio
 				ChannelID: row.ChannelID,
 				ThreadTS:  row.ThreadTs,
 				Version:   int(plan.Version),
-				Text:      a.planContentText(ctx, processing),
+				// Stripped for the human reading it -- the machine block is
+				// noise in a Slack message (plandomain.StripStructureBlock).
+				Text: plandomain.StripStructureBlock(a.planContentText(ctx, processing)),
 			}
 		} else {
 			kind = ports.NotificationKindSlack
@@ -222,7 +224,7 @@ func (a *Actor) enqueueOutboxNotification(ctx context.Context, tx pgx.Tx, sessio
 			payload = linearapi.Payload{
 				AgentSessionID: row.AgentSessionID,
 				OrganizationID: row.OrganizationID,
-				Text:           planApprovalLinearText(plan.Version, a.planContentText(ctx, processing)),
+				Text:           planApprovalLinearText(plan.Version, plandomain.StripStructureBlock(a.planContentText(ctx, processing))),
 				Success:        true,
 			}
 		} else {
