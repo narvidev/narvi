@@ -477,6 +477,53 @@ func TestRun_CompositionDiffFetchFails_NeverInsertsTurn(t *testing.T) {
 	}
 }
 
+// TestRun_CompareDiffFetchFails_HeadSHAStillResolved_NeverInsertsTurn is
+// the confirmed-major fix's own regression test -- DISTINCT from
+// TestRun_CompositionDiffFetchFails_NeverInsertsTurn immediately above,
+// which covers GetPullRequest itself failing (no head sha at all).
+// reviewcontext.Fetch degrades HeadSHA and Diff INDEPENDENTLY: a
+// GetPullRequest SUCCESS followed by a GetCompareDiff FAILURE leaves
+// HeadSHA populated (the existing "reviewCtx.HeadSHA == \"\"" guard would
+// NOT have caught this) while Diff stays "". Before this fix, dispatch
+// proceeded anyway, sending RenderCompositionReviewPrompt a prompt with
+// NO diff block at all -- the reviewing agent had nothing to review but
+// the tool instructions, and could very plausibly still call the
+// composition-findings tool with an empty findings array, which would
+// have persisted as an INDISTINGUISHABLE-from-genuine "reviewed, found
+// nothing" result. This proves the dispatch now declines instead.
+func TestRun_CompareDiffFetchFails_HeadSHAStillResolved_NeverInsertsTurn(t *testing.T) {
+	t.Parallel()
+
+	lister := &fakeMergedPRLister{merged: []ports.MergedPR{
+		{Number: 1, Title: "a", HasApprovingReview: true, Labels: []string{reviewpost.LabelHighRisk}},
+	}}
+	outbox := &fakeOutboxEnqueuer{}
+	templates := &fakeCompositionTemplateFetcher{template: "t"}
+	// pr resolves successfully (a real, non-empty HeadSHA) -- ONLY the
+	// compare-diff call fails.
+	diffFetcher := &fakeCompositionDiffFetcher{
+		pr:      githubapi.PullRequest{HeadSHA: "deadbeef", BaseRef: "main"},
+		diffErr: errors.New("compare api exploded"),
+	}
+	turns := &fakeCompositionTurnInserter{}
+	dispatch := &fakeCompositionDispatcher{}
+
+	releasereview.Run(context.Background(), discardLogger(), fullCompositionDeps(lister, outbox, templates, diffFetcher, turns, dispatch), releasereview.Input{
+		SessionID: testSessionID(t),
+		Owner:     "acme", Repo: "widgets", PRNumber: 1, BaseRef: "main", HeadRef: "release/1.0", Token: "t",
+	})
+
+	if diffFetcher.prCalls != 1 {
+		t.Fatalf("GetPullRequest calls = %d, want 1 (head sha resolution must still be attempted)", diffFetcher.prCalls)
+	}
+	if turns.calls != 0 {
+		t.Errorf("CompositionTurns.Create calls = %d, want 0 -- a pass that never reviewed a diff must never dispatch a turn that could get recorded as a clean result", turns.calls)
+	}
+	if dispatch.calls != 0 {
+		t.Errorf("CompositionDispatch.EnsureDispatched calls = %d, want 0", dispatch.calls)
+	}
+}
+
 // TestRun_CompositionTurnInsertFails_NeverDispatches proves a failed turn
 // insert never still nudges the session actor to dispatch -- there would
 // be nothing pending to dispatch.
