@@ -4,13 +4,13 @@
 
 Narvi's technical specification (autonomous coding agents in sandboxes) is in
 [docs/TECHNICAL_PLAN.md](TECHNICAL_PLAN.md) (§0–§40), and the nine-view UI design spec is in
-[docs/design/mockups.html](design/mockups.html). This plan breaks 17 phases (0–16) into **159 Steps**.
+[docs/design/mockups.html](design/mockups.html). This plan breaks 17 phases (0–16) into **161 Steps**.
 132 of them are scheduled work in this repository (Steps 108-110 were routed out to a separate
 repository when the extension boundary was drawn, and keep their numbers as pointers so every
 citation of them stays valid; Phase 16's 3 are gated on a product decision nobody has taken) — including Phase 4's own 5 additive Steps, 40-44, Phase 8's 9
 shadow-mode Steps, 96-104, Phase 9's 6 knowledge Steps, 105-110, and Phase 12's 4 boundary Steps,
 132-135, Phase 13's 7 silent-failure Steps, 136-142, Phase 14's 5 composition Steps, 143-147,
-and Phase 15's 4 guardrail Steps, 148-151. The other 24 are Phase 11 (Steps 113-131, plus 152-156 appended after the phase was scheduled): named
+and Phase 15's 4 guardrail Steps, 148-151. The other 26 are Phase 11 (Steps 113-131, plus 152-156 and 160-161 appended after the phase was scheduled): named
 gaps, each filed as the shipping Step
 that found it declared it, and since scheduled in full with an execution order and a milestone of
 its own. They gate nothing else, which is why Phase 12 follows them numerically without waiting
@@ -419,8 +419,10 @@ the fail direction this repository refuses everywhere else. An explicit declarat
 its secrets is a loud boot failure. In every outcome, `configured` on the §12.5 read model must
 become honest or be removed — a field that cannot be false informs nobody.
 
-**Phase 11 milestone**: every row — including the five appended after the phase was scheduled
-(152-156, filed once a sweep of this session's own audits found real absences nothing recorded) —
+**Phase 11 milestone**: every row — including the seven appended after the phase was scheduled
+(152-156, filed once a sweep of this session's own audits found real absences nothing recorded,
+and 160-161, filed when the adversarial reviews of Steps 130 and 126 each turned up a real gap
+belonging to neither Step) —
 either shipped, or closed by a recorded decision that says why
 it will not be — the second being a legitimate outcome for 129 and 119's residue, never a silent
 omission. `configured` no longer reports a value it cannot fail to report. And the sweep in 128 is
@@ -453,6 +455,8 @@ rot again.
 | 154 | automerge polls on indefinitely through an auth failure | The automerge worker has no dead-letter and no backoff for an authentication failure: with a bad or empty bot token it keeps polling GitHub, forever, at full rate. Surfaced by Step 119's audit and correctly refuted as a defect of that Step — it is `main`'s behaviour verbatim, predating it. Every other outbound path in this repository either dead-letters or backs off; this one does neither, and an operator sees only rate-limit noise | §17 |
 | 155 | a repository rename splits its own corpus | `repo_full_name` is the scope key for per-repository knowledge, and that corpus outlives any PR session — so a rename or transfer silently leaves the old prose unreachable under a name nothing will ever query again, with no error and no migration. Named as an accepted residual limit in the spec rather than hidden, and filed here so it is not rediscovered as a bug. Consistency with `repo_settings` and `github_pr_sessions` argues for inheriting whatever rename fix those tables get, which is the cheapest correct answer and does not exist yet | §31.9 |
 | 156 | the embeddings provider is an un-closed egress channel | If mode B is ever built, a hosted embeddings provider receives customer-derived prose — a new egress channel, surfaced in the spec and left open. The named path to closing it for a self-hoster is a wire-compatible adapter, so the same corpus can be served by something the operator runs. Deferred, not dropped. **Moot under a kill decision on mode B**, and filed with that condition attached rather than as unconditional work | §31.5, §31.9 |
+| 160 | git transport helpers are the same unclosed class as content filters | `githarden`'s `hardeningFlags` sets no `protocol.allow`, no `protocol.ext.allow` and no `core.gitProxy` restriction. `remote.origin.url` lives in the same runtime-owned `.git/config` as a filter driver (§30.5 grants the agent runtime that ownership), so a rewrite to `ext::<command>`, or a planted `core.gitProxy`, runs as sandbox-agent on the next fetch or default-branch resolution. Surfaced while auditing Step 130 and deliberately left unfixed there — it is a different class, and Step 130's own conclusion (a file inside a directory the adversary owns cannot be a trustworthy guard) may or may not apply here, since these keys DO have `-c` overrides that a filter driver's unbounded namespace does not. That difference is what makes this worth its own row rather than a footnote on a closed one | §30.5 |
+| 161 | `plan_documents` is written by one place and read by none | The approval snapshot is created inside the approving transaction and consulted by nothing in production — not `content`, and since Step 126 not `structured_steps` either. The read path instead recomputes from the event log over a bounded window (2000 events), which is strictly weaker: past that window `ExtractContent` returns its honest `(plan content unavailable)` placeholder while the snapshot two tables over holds the text. Found auditing Step 126, which extended the table rather than created the shape. Needs a decision before code — whether the snapshot becomes the read path's first choice, or the table is dropped as the dead weight it currently is — because either answer changes what the API returns for every approved plan, and §5.1's single-source-of-truth reasoning is what has to settle it | §12.2, §5.1 |
 
 ## Phase 16 — External-client prerequisites (3 Steps, additive, gated)
 
