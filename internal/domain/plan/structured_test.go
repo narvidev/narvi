@@ -18,6 +18,37 @@ func TestExtractStructured(t *testing.T) {
 			want:    nil,
 		},
 		{
+			// dec.More() reported false for these, because it answers "is
+			// there another element in the CURRENT array/object" rather than
+			// "is there anything after the value". Both were accepted.
+			name: "a trailing closing brace is rejected",
+			content: "```plan-steps\n" +
+				`{"steps":[{"title":"T","description":"D","fileRefs":["a.go"]}],"scopeEstimate":"1 file"}}` +
+				"\n```",
+			want: nil,
+		},
+		{
+			name: "a trailing closing bracket is rejected",
+			content: "```plan-steps\n" +
+				`{"steps":[{"title":"T","description":"D","fileRefs":["a.go"]}],"scopeEstimate":"1 file"}]` +
+				"\n```",
+			want: nil,
+		},
+		{
+			name: "an empty fileRef is rejected -- an empty path renders an empty chip pointing at nothing",
+			content: "```plan-steps\n" +
+				`{"steps":[{"title":"T","description":"D","fileRefs":[""]}],"scopeEstimate":"1 file"}` +
+				"\n```",
+			want: nil,
+		},
+		{
+			name: "a whitespace-only fileRef is rejected too",
+			content: "```plan-steps\n" +
+				`{"steps":[{"title":"T","description":"D","fileRefs":["   "]}],"scopeEstimate":"1 file"}` +
+				"\n```",
+			want: nil,
+		},
+		{
 			// A NUL is valid JSON and a valid Go string, but Postgres jsonb
 			// raises 22P05 on it -- and the structured value is persisted in
 			// the SAME transaction that approves the plan, so letting one
@@ -255,5 +286,31 @@ func TestStripStructureBlock_NeverStripsWhatExtractStructuredWouldRead(t *testin
 	}
 	if got := StripStructureBlock(content); strings.Contains(got, "plan-steps") || strings.Contains(got, "scopeEstimate") {
 		t.Errorf("StripStructureBlock() = %q, want the machine block gone", got)
+	}
+}
+
+// TestExtractStructured_StepCountBound pins both sides of MaxSteps: at the
+// bound a plan still extracts, past it the document folds to prose -- which
+// is what keeps the web's own per-string 8000-character cap meaningful,
+// since the prose path renders one string rather than three per step.
+func TestExtractStructured_StepCountBound(t *testing.T) {
+	build := func(n int) string {
+		var b strings.Builder
+		b.WriteString("```plan-steps\n{\"steps\":[")
+		for i := 0; i < n; i++ {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString(`{"title":"T","description":"D","fileRefs":["a.go"]}`)
+		}
+		b.WriteString(`],"scopeEstimate":"s"}` + "\n```")
+		return b.String()
+	}
+
+	if got := ExtractStructured(build(MaxSteps)); got == nil || len(got.Steps) != MaxSteps {
+		t.Errorf("exactly MaxSteps (%d) steps must extract, got %v", MaxSteps, got)
+	}
+	if got := ExtractStructured(build(MaxSteps + 1)); got != nil {
+		t.Errorf("MaxSteps+1 (%d) steps extracted %d steps, want nil -- past the bound a plan renders as prose, where the render cap does hold", MaxSteps+1, len(got.Steps))
 	}
 }

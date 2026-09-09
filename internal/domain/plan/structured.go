@@ -90,6 +90,22 @@ import (
 // SPECIFIC close tag would only need a wider set of models to get the
 // close annotation right too, buying no additional safety.
 const (
+	// MaxSteps bounds how many steps one plan document may carry.
+	//
+	// Not an arbitrary ceiling: the web caps each rendered string at 8000
+	// characters, which bounded the prose path because that path renders ONE
+	// string. The structured path renders a title, a description and a file
+	// chip PER STEP, so an unbounded step count makes that cap bound nothing
+	// in aggregate, on a synchronous read path, from model-authored text.
+	//
+	// Exceeding it folds to prose like every other deviation -- which is the
+	// property that makes this number safe to pick: the fallback is the path
+	// whose cap does hold, so a plan too large to render as structure is
+	// still rendered, just bounded. 100 is well past any plan a human reads
+	// before clicking Approve, and far short of anything that would make a
+	// page unusable.
+	MaxSteps = 100
+
 	StructureFenceOpen  = "```plan-steps"
 	structureFenceClose = "```"
 )
@@ -204,13 +220,20 @@ func ExtractStructured(content string) *Structured {
 	if err := dec.Decode(&wire); err != nil {
 		return nil
 	}
-	if dec.More() {
-		// Trailing content after the one JSON value the fence is supposed
-		// to contain -- reject rather than silently ignore it.
+	// Trailing content after the one JSON value the fence is supposed to
+	// contain -- reject rather than silently ignore it.
+	//
+	// dec.More() is NOT sufficient here and using it was a real defect: it
+	// answers "is there another element in the CURRENT array or object",
+	// so it reports false for a trailing `}` or `]`, and a block ending
+	// `...}}` or `...}]` was accepted. InputOffset gives the byte just past
+	// the value actually decoded, so whatever follows is checked directly,
+	// whatever shape it takes.
+	if strings.TrimSpace(raw[dec.InputOffset():]) != "" {
 		return nil
 	}
 
-	if len(wire.Steps) == 0 {
+	if len(wire.Steps) == 0 || len(wire.Steps) > MaxSteps {
 		return nil
 	}
 	scopeEstimate := strings.TrimSpace(wire.ScopeEstimate)
@@ -233,7 +256,11 @@ func ExtractStructured(content string) *Structured {
 			fileRefs = []string{}
 		}
 		for _, ref := range fileRefs {
-			if containsNUL(ref) {
+			// An empty path is not a path. The web renders each entry as its
+			// own `<code>` chip, so an empty one draws an empty chip -- an
+			// affordance pointing at nothing, which is the same fabrication
+			// this extractor refuses everywhere else.
+			if strings.TrimSpace(ref) == "" || containsNUL(ref) {
 				return nil
 			}
 		}
