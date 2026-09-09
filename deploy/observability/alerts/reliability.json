@@ -55,6 +55,14 @@
       "runbook": "docs/runbooks/watchdog-false-alarms.md"
     },
     {
+      "name": "AutoMergeAuthDeadLetterAny",
+      "description": "internal/app/automerge.Worker's own authGuard dead-lettered a scope (the shared worker-wide bot credential, or one repository) after exhausting domain/automerge.MaxAuthFailures consecutive authentication/permission-classified GitHub failures — auto-merge has stopped for the affected scope until an operator rotates the credential/redeploys (worker-wide) or investigates the repository's own access (per-repository), docs/TECHNICAL_PLAN.md §17.",
+      "metrics": ["automerge_auth_dead_lettered_total"],
+      "condition": "increase(automerge_auth_dead_lettered_total[5m]) > 0",
+      "severity": "warning",
+      "thresholdDerivation": "Presence, not a rate, mirroring OutboxDeadLetterAny's own identical reasoning immediately below: dead-lettering only happens once per scope, ever, after domain/automerge.MaxAuthFailures (5) consecutive classified failures are exhausted (internal/app/automerge/authguard.go) — there is no 'normal' rate of a credential or a repository's own access permanently failing, so any occurrence at all is worth a look. No runbook yet (this alert's own introduction, alongside the metric instrument it references) -- Runbook is left empty rather than pointed at an unrelated existing page."
+    },
+    {
       "name": "TurnFalseFailureAny",
       "description": "A turn the control plane terminalized Failed on its own turn_deadline inference was, in fact, still genuinely working and finished successfully.",
       "metrics": ["turn_false_failure_total"],

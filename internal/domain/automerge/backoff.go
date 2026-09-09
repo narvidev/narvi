@@ -48,11 +48,15 @@ import "time"
 // a much smaller figure than domain/outbox.MaxAttempts (10) is the
 // correct choice here, not an oversight: with the shipped defaults
 // (platform.Timeouts.AutoMergeAuthBackoffBase 2min,
-// AutoMergeAuthBackoffMax 30min), the schedule this produces is 2m, 4m,
-// 8m, 16m, dead-letter -- roughly half an hour of tolerating what might
-// still be a transient blip before this package's own caller commits to
-// treating it as the durable, operator-actionable condition it almost
-// certainly is by then.
+// AutoMergeAuthBackoffMax 12min -- deliberately BELOW the 16min the 4th
+// consecutive failure would otherwise double to unclamped, see that
+// field's own doc comment for why, chosen precisely so the ceiling has a
+// real, demonstrable effect rather than sitting above every value this
+// schedule could ever produce and never binding at all), the schedule
+// this produces is 2m, 4m, 8m, 12m, dead-letter -- a little over 25
+// minutes of tolerating what might still be a transient blip before this
+// package's own caller commits to treating it as the durable,
+// operator-actionable condition it almost certainly is by then.
 const MaxAuthFailures = 5
 
 // BackoffConfig configures EvaluateBackoff's exponential schedule. Both
@@ -98,14 +102,28 @@ type BackoffDecision struct {
 // that just happened (the caller increments it before calling this
 // function) -- mirrors domain/outbox.EvaluateBackoff's own identical
 // attemptCount convention exactly. consecutiveFailures < 1 is treated as
-// 1 (defensive: there is no such thing as a "0th" failure).
+// 1 (defensive: there is no such thing as a "0th" failure) -- and, unlike
+// an earlier loop-based version of this function where that clamp was
+// pure dead code (a loop bounded by "i < consecutiveFailures" behaves
+// identically for any consecutiveFailures <= 1, so no input could ever
+// make the clamp's own effect observable), the shift below makes it
+// load-bearing: consecutiveFailures-1 is a shift COUNT, and Go's runtime
+// panics on a negative shift count. TestEvaluateBackoff_NegativeOrZero
+// (backoff_test.go) is this clamp's own mutation-test witness -- delete
+// the clamp and that test panics, rather than merely computing a
+// different number.
 //
 // Doubling per additional failure (BaseDelay, 2×BaseDelay, 4×BaseDelay,
 // ...), capped at MaxDelay, is the SAME schedule domain/outbox.
 // EvaluateBackoff/domain/imagebuild.EvaluateBackoff already establish
 // for the identical §5.1 requirement ("retry with exponential backoff,
 // not fixed") -- reused here rather than inventing a third shape for
-// what is, at this level, the same problem.
+// what is, at this level, the same problem. consecutiveFailures is
+// already bounded to [1, MaxAuthFailures) by the dead-letter check above
+// by the time the shift runs, so BaseDelay<<(consecutiveFailures-1) only
+// ever needs the delay<=0 guard below for defensive overflow protection
+// (a pathological BaseDelay/MaxAuthFailures combination), not for any
+// value this package's own callers actually produce.
 func EvaluateBackoff(consecutiveFailures int, cfg BackoffConfig, now time.Time) BackoffDecision {
 	if consecutiveFailures < 1 {
 		consecutiveFailures = 1
@@ -115,15 +133,12 @@ func EvaluateBackoff(consecutiveFailures int, cfg BackoffConfig, now time.Time) 
 		return BackoffDecision{DeadLetter: true}
 	}
 
-	delay := cfg.BaseDelay
-	for i := 1; i < consecutiveFailures; i++ {
-		if delay >= cfg.MaxDelay {
-			delay = cfg.MaxDelay
-			break
-		}
-		delay *= 2
-	}
-	if delay > cfg.MaxDelay {
+	delay := cfg.BaseDelay << (consecutiveFailures - 1)
+	if delay <= 0 || delay > cfg.MaxDelay {
+		// delay <= 0 catches signed overflow from the shift above wrapping
+		// an int64 duration negative -- treated exactly like "exceeded
+		// MaxDelay", the same plateau every other case at or above
+		// MaxDelay already gets.
 		delay = cfg.MaxDelay
 	}
 

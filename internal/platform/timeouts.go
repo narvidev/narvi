@@ -2131,16 +2131,25 @@ type Timeouts struct {
 
 	// AutoMergeAuthBackoffMax is domain/automerge.BackoffConfig.MaxDelay:
 	// the ceiling the exponential schedule above plateaus at. Not
-	// specified in the plan; chosen as 30min -- LONGER than OutboxBackoffMax's
-	// own 5min, in the same ~60x-the-pump-interval proportion
-	// OutboxBackoffMax already keeps relative to OutboxPumpInterval (5min
-	// is 60x OutboxPumpInterval's 5s; 30min is 30x AutoMergePumpInterval's
-	// 60s -- the same order of magnitude, not identical, since
-	// AutoMergePumpInterval's own cadence is already coarser to begin
-	// with), so a scope deep in backoff skips several ticks at a time
-	// rather than merely one, right up until domain/automerge.
-	// MaxAuthFailures is reached and this scope dead-letters for the rest
-	// of this process's own lifetime.
+	// specified in the plan; chosen as 12min. A materially SMALLER value
+	// than an earlier version of this field (30min) shipped with:
+	// AutoMergeAuthBackoffBase (2min) doubles four times before
+	// domain/automerge.MaxAuthFailures (5) dead-letters -- 2m, 4m, 8m,
+	// 16m -- so ANY ceiling at or above 16min has no effect whatsoever on
+	// the schedule this produces; the 30min figure this field previously
+	// held was exactly that (docs/TECHNICAL_PLAN.md §17's own
+	// reachability finding: a configured value nothing can ever reach is
+	// indistinguishable, in its actual runtime effect, from no cap at
+	// all). 12min sits strictly below the 4th consecutive failure's own
+	// natural 16min, so it demonstrably caps that step down to 12min
+	// rather than merely equaling a value the schedule was already going
+	// to produce on its own -- domain/automerge.
+	// TestEvaluateBackoff_ShippedDefaultsMaxDelayBinds mirrors this exact
+	// pair of numbers to prove it. The schedule this produces end to end
+	// is 2m, 4m, 8m, 12m, dead-letter -- domain/automerge.MaxAuthFailures'
+	// own doc comment has the full accounting for why a little over 25
+	// minutes, not outbox's own much longer 10-attempt tolerance, is the
+	// correct total window here.
 	AutoMergeAuthBackoffMax time.Duration
 
 	// DigestPumpInterval is how often internal/app/digest.Pump's own
@@ -2795,7 +2804,7 @@ func DefaultTimeouts() Timeouts {
 		AutoMergePumpInterval:          60 * time.Second,    // §21.2; not specified, mirrors AutomationEnginePumpInterval's own identical periodic-background-policy-engine reasoning
 		AutoMergeCandidateLookback:     7 * 24 * time.Hour,  // §21.2; not specified, chosen generously -- every candidate is re-confirmed live regardless
 		AutoMergeAuthBackoffBase:       2 * time.Minute,     // §17; not specified, chosen -- see domain/automerge.EvaluateBackoff's own doc comment for the schedule this produces
-		AutoMergeAuthBackoffMax:        30 * time.Minute,    // §17; not specified, chosen -- deliberately proportional to AutoMergePumpInterval, see field doc comment
+		AutoMergeAuthBackoffMax:        12 * time.Minute,    // §17; not specified, chosen -- strictly below the naturally-doubled 4th-failure delay so this ceiling actually binds, see field doc comment
 		DigestPumpInterval:             5 * time.Minute,     // §21.3; not specified, chosen -- a digest fires at most once per channel per day, so coarse polling is ample
 		DigestChannelDiscoveryLookback: 30 * 24 * time.Hour, // §21.3; not specified, mirrors ReviewVerdictAnalyticsWindow's own identical "a month, bounded" reasoning
 		DigestContentWindow:            24 * time.Hour,      // §21.3, explicit ("a daily digest") -- one calendar day of rollup content, distinct from the channel-discovery lookback above

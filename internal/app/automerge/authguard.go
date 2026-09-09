@@ -53,6 +53,16 @@ type authFailureState struct {
 	consecutiveFailures int
 	deadLettered        bool
 	nextAttemptAt       time.Time
+
+	// generation is bumped every time recordFailure actually increments
+	// consecutiveFailures for THIS scope, and every time recordSuccess
+	// resets the worker-wide scope -- NEVER reused/rewound, so it is safe
+	// as a version stamp across this scope's entire process lifetime, not
+	// merely between one reset and the next (no ABA hazard: a stale
+	// caller's own observed generation can never coincidentally match a
+	// LATER generation the same numeric value once already passed
+	// through). See authReservation's own doc comment for what reads it.
+	generation uint64
 }
 
 // authScope names which of authGuard's two independent failure states a
@@ -97,6 +107,50 @@ func newAuthGuard(cfg domainautomerge.BackoffConfig) *authGuard {
 	return &authGuard{perRepo: make(map[string]*authFailureState), cfg: cfg}
 }
 
+// authReservation is what allow returns alongside its bool verdict when a
+// real outbound GitHub call is permitted: the exact generation this
+// caller OBSERVED for the worker-wide scope (and, when repoFullName
+// already had per-repo state at check time, that scope's own generation
+// too) -- carried back into recordFailure so a caller reporting an
+// outcome can tell whether ANOTHER concurrent caller has ALREADY
+// recorded a newer outcome for the SAME scope since this reservation was
+// taken.
+//
+// This -- not merely holding g.mu across the whole outbound call, which
+// recordFailure already serializes internally -- is what actually closes
+// docs/TECHNICAL_PLAN.md §17's own concurrency finding. PumpOnce's own
+// errgroup (worker.go) fans every armed repo out concurrently, one
+// goroutine per repo, each calling allow() with the SAME now. Every
+// goroutine's own allow() call clears in microseconds and then blocks on
+// a REAL GitHub round trip -- so with >= domainautomerge.MaxAuthFailures
+// armed repos sharing one worker-wide scope, ALL of them observe the
+// SAME pre-failure generation before any single one has reported back.
+// Serializing the outbound calls themselves behind a single lock would
+// fix the counting but silently undo PumpOnce's own documented "fans
+// them out" concurrent design for EVERY tick, healthy or not -- not just
+// during an actual incident. Coalescing at report time, via this
+// generation stamp, fixes the ACTUAL bug (N concurrent reports of the
+// SAME underlying event -- one broken/rotated credential, one instant --
+// must collapse into ONE consecutive failure, not N) without touching
+// the happy path's own concurrency at all: the first concurrent caller
+// to reach recordFailure for a given generation is the one whose report
+// counts; every other caller reporting against that SAME
+// now-superseded generation is stale evidence about a state that has
+// already moved on, and is discarded rather than double-counted.
+//
+// Deliberately NOT threaded through recordSuccess: a genuinely
+// successful call is this package's OWN strongest possible evidence
+// (recordSuccess's doc comment) and must reset state regardless of
+// whether some OTHER concurrent caller's report landed first -- gating
+// success on a stale reservation would risk discarding fresh, current
+// proof the credential works. recordSuccess still cannot un-latch an
+// ALREADY-dead-lettered scope (its own doc comment covers that
+// separately).
+type authReservation struct {
+	workerGeneration uint64
+	repoGeneration   uint64
+}
+
 // allow reports whether repoFullName may attempt a real outbound GitHub
 // call right now -- false when EITHER the worker-wide state OR this
 // repository's own state is dead-lettered, or either is still cooling
@@ -104,18 +158,24 @@ func newAuthGuard(cfg domainautomerge.BackoffConfig) *authGuard {
 // (mergeCandidate, worker.go), immediately before RevalidateForAutoMerge
 // -- the one call this fix must stop from firing at "full rate" once a
 // failure has been classified (worker.go's own top-of-file doc comment
-// citing docs/TECHNICAL_PLAN.md §17).
-func (g *authGuard) allow(repoFullName string, now time.Time) bool {
+// citing docs/TECHNICAL_PLAN.md §17). The returned authReservation must
+// be threaded back into recordFailure by the SAME caller reporting this
+// SAME attempt's own outcome -- see that type's own doc comment for why.
+func (g *authGuard) allow(repoFullName string, now time.Time) (bool, authReservation) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	if !stateReady(&g.worker, now) {
-		return false
+		return false, authReservation{}
 	}
-	if repo, ok := g.perRepo[repoFullName]; ok && !stateReady(repo, now) {
-		return false
+	res := authReservation{workerGeneration: g.worker.generation}
+	if repo, ok := g.perRepo[repoFullName]; ok {
+		if !stateReady(repo, now) {
+			return false, authReservation{}
+		}
+		res.repoGeneration = repo.generation
 	}
-	return true
+	return true, res
 }
 
 func stateReady(s *authFailureState, now time.Time) bool {
@@ -148,11 +208,44 @@ func stateReady(s *authFailureState, now time.Time) bool {
 // worker_integration_test.go's own two auth-dead-letter tests are what
 // caught it). Only the strongest available evidence -- a merge that
 // actually went through -- resets either streak.
+//
+// A scope that is ALREADY dead-lettered is left completely untouched --
+// authFailureState.deadLettered's own doc intent ("a scope stays
+// dead-lettered for the rest of this process's own lifetime", this
+// file's own top comment) means recordSuccess must never be the thing
+// that un-latches it. Concretely reachable even though allow() already
+// gates every call BEFORE it goes out: PumpOnce's own errgroup can have
+// several goroutines mid-flight, past allow(), from BEFORE a dead-letter
+// transition landed; if one of those in-flight calls happens to succeed
+// (a flapping/rotating credential, this file's own top comment) AFTER
+// another one's failure already dead-lettered the scope, that late
+// success must not resurrect a scope this package has already committed
+// to treating as terminal -- resurrecting it would resume "full-rate"
+// outbound calls against a scope an operator has just been told, via the
+// one-time audit_log row, is permanently dead, reproducing the exact
+// noise (a fresh audit row/Error log on every subsequent failure) that
+// row exists to be the ONE time it happens.
 func (g *authGuard) recordSuccess(repoFullName string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.worker = authFailureState{}
-	delete(g.perRepo, repoFullName)
+	if !g.worker.deadLettered {
+		// generation is preserved (bumped, not zeroed) across this reset
+		// -- see authFailureState.generation's own doc comment for why a
+		// PLAIN zero-value reset here would reopen an ABA hazard for any
+		// recordFailure call still holding a reservation from before this
+		// success landed.
+		g.worker = authFailureState{generation: g.worker.generation + 1}
+	}
+	if repo, ok := g.perRepo[repoFullName]; ok && !repo.deadLettered {
+		// Per-repository state is deleted outright, not reset in place --
+		// safe against the SAME ABA hazard only because pumpRepo (worker.go)
+		// processes one repo's own candidates strictly sequentially, so no
+		// OTHER goroutine can be holding a stale reservation for this SAME
+		// repoFullName at the moment this delete happens (unlike the
+		// worker-wide scope above, which every armed repo's own goroutine
+		// can reach concurrently).
+		delete(g.perRepo, repoFullName)
+	}
 }
 
 // recordFailure classifies err against ports.ErrAuthenticationFailed/
@@ -166,12 +259,12 @@ func (g *authGuard) recordSuccess(repoFullName string) {
 // handler.
 //
 // Returns the scope a NEW transition into a dead-lettered state just
-// happened for (authScopeNone if err did not classify, or if it
-// classified but this scope was already dead-lettered/not yet at
-// MaxAuthFailures), the target this failure applies to (repoFullName for
-// authScopeRepo, "" for authScopeWorker -- worker.go's own audit-log
-// call uses this as detail_json's own repo_full_name), and the
-// consecutive-failure count at the moment of transition. The caller
+// happened for (authScopeNone if err did not classify, if it classified
+// but this scope was already dead-lettered/not yet at MaxAuthFailures,
+// or if res is STALE -- see below), the target this failure applies to
+// (repoFullName for authScopeRepo, "" for authScopeWorker -- worker.go's
+// own audit-log call uses this as detail_json's own repo_full_name), and
+// the consecutive-failure count at the moment of transition. The caller
 // (worker.go) uses a true transition to fire the one-time, durable
 // audit_log row (docs/TECHNICAL_PLAN.md §17.5's own "no actor" audit
 // precedent) that is this package's own answer to "how does an operator
@@ -181,7 +274,18 @@ func (g *authGuard) recordSuccess(repoFullName string) {
 // dashboard can alert on it without the 'why does this keep paging me'
 // confusion a repeating trip for the same, un-clearable condition would
 // cause").
-func (g *authGuard) recordFailure(repoFullName string, err error, now time.Time) (scope authScope, target string, consecutiveFailures int) {
+//
+// res is the EXACT authReservation the caller's own earlier allow() call
+// returned for this SAME attempt. If the relevant scope's own current
+// generation no longer matches what res observed, this failure is stale:
+// another concurrent caller has ALREADY recorded an outcome (failure or
+// success) for this SAME scope since this reservation was taken, so this
+// report is discarded rather than incremented -- see authReservation's
+// own doc comment (allow, above) for why this, not a coarser lock, is
+// what keeps N concurrent contemporaneous failures against the SAME
+// pre-failure state from being counted as N separate consecutive
+// failures.
+func (g *authGuard) recordFailure(repoFullName string, err error, now time.Time, res authReservation) (scope authScope, target string, consecutiveFailures int) {
 	scope = classify(err)
 	if scope == authScopeNone {
 		return authScopeNone, "", 0
@@ -191,9 +295,11 @@ func (g *authGuard) recordFailure(repoFullName string, err error, now time.Time)
 	defer g.mu.Unlock()
 
 	var state *authFailureState
+	var observedGeneration uint64
 	switch scope {
 	case authScopeWorker:
 		state = &g.worker
+		observedGeneration = res.workerGeneration
 	case authScopeRepo:
 		repo, ok := g.perRepo[repoFullName]
 		if !ok {
@@ -202,6 +308,7 @@ func (g *authGuard) recordFailure(repoFullName string, err error, now time.Time)
 		}
 		state = repo
 		target = repoFullName
+		observedGeneration = res.repoGeneration
 	}
 
 	if state.deadLettered {
@@ -211,7 +318,17 @@ func (g *authGuard) recordFailure(repoFullName string, err error, now time.Time)
 		return authScopeNone, "", 0
 	}
 
+	if state.generation != observedGeneration {
+		// Stale: this report reflects a pre-failure (or pre-success)
+		// state ANOTHER concurrent caller has already superseded --
+		// discarding it here, rather than incrementing anyway, is the
+		// actual fix for docs/TECHNICAL_PLAN.md §17's own concurrency
+		// finding (authReservation's own doc comment, allow above).
+		return authScopeNone, "", 0
+	}
+
 	state.consecutiveFailures++
+	state.generation++
 	decision := domainautomerge.EvaluateBackoff(state.consecutiveFailures, g.cfg, now)
 	state.nextAttemptAt = decision.NextRetryAt
 	consecutiveFailures = state.consecutiveFailures

@@ -1501,6 +1501,53 @@ func TestCheckRepoAccess_403RateLimited_IsErrorNeverADefinitiveDenial(t *testing
 	}
 }
 
+// TestCheckRepoAccess_403EdgePageBody_MessageFallbackStillDetectsRateLimit
+// is doGet's own regression test for the classifier's "wrong direction"
+// bug (docs/TECHNICAL_PLAN.md §17's own adversarial review): a 403 whose
+// body is NOT GitHub's JSON error envelope at all -- an edge/WAF HTML
+// page ("error code: 1015 (you are being rate limited)"), carrying
+// NEITHER GitHub's own X-RateLimit-Remaining NOR Retry-After header
+// (plausibly stripped by whatever intercepted the response before this
+// adapter ever saw it) -- must still classify as RateLimited via
+// isRateLimitedResponse's own documented message-text fallback. Before
+// this fix, doGet overwrote the body text with a fixed placeholder
+// string BEFORE handing it to isRateLimitedResponse, so that fallback --
+// documented as existing "in case a header got stripped somewhere
+// between GitHub and this adapter (a proxy, a test double)" -- could
+// never fire for exactly the case it names.
+func TestCheckRepoAccess_403EdgePageBody_MessageFallbackStillDetectsRateLimit(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("<html><body>error code: 1015 (you are being rate limited)</body></html>"))
+	}))
+	defer server.Close()
+
+	adapter := githubapi.New(server.Client(), server.URL)
+
+	allowed, err := adapter.CheckRepoAccess(context.Background(), ports.CheckRepoAccessSpec{
+		Owner: "acme",
+		Repo:  "widgets",
+		Token: "gho_edgepage",
+	})
+	if err == nil {
+		t.Fatal("CheckRepoAccess() error = nil, want a real error -- a WAF/edge rate-limit page must never be treated as a definitive permission denial")
+	}
+	if allowed {
+		t.Error("CheckRepoAccess() allowed = true, want false alongside the error")
+	}
+
+	var apiErr *githubapi.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("CheckRepoAccess() error = %v (%T), want *githubapi.APIError", err, err)
+	}
+	if !apiErr.RateLimited {
+		t.Error("APIError.RateLimited = false, want true -- the message-text fallback must see the RAW body, not a placeholder string overwriting it")
+	}
+}
+
 // TestCheckRepoAccess_403WithoutRateLimitSignal_StillDeniedNoError proves a
 // plain 403 carrying NEITHER a rate-limit header NOR a rate-limit-shaped
 // message (an ordinary "you cannot read this" denial) still reports the
@@ -1662,5 +1709,44 @@ func TestCreateCommitStatus_EscapesOwnerRepoSHA(t *testing.T) {
 	want := "/repos/acme%2Fevil/widgets/statuses/sha%23v1"
 	if gotEscapedPath != want {
 		t.Errorf("request EscapedPath = %q, want %q", gotEscapedPath, want)
+	}
+}
+
+// TestCreateBranch_403RateLimited_APIErrorCarriesRateLimited is doPost's
+// own regression test for docs/TECHNICAL_PLAN.md §17's own adversarial
+// review: "doPost/doPatch never compute RateLimited, so a textbook
+// primary-rate-limited 403 through either unwraps to
+// ErrPermissionDenied." doPost previously never computed
+// APIError.RateLimited at all, so this 403 -- flagged by GitHub's own
+// X-RateLimit-Remaining header -- would have unwrapped straight to
+// ports.ErrPermissionDenied via APIError.Unwrap's own Status==403 branch.
+func TestCreateBranch_403RateLimited_APIErrorCarriesRateLimited(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-RateLimit-Remaining", "0")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]any{"message": "API rate limit exceeded for xxx.xxx.xxx.xxx."})
+	}))
+	defer server.Close()
+
+	adapter := githubapi.New(server.Client(), server.URL)
+	err := adapter.CreateBranch(context.Background(), ports.CreateBranchSpec{
+		Owner: "acme", Repo: "widgets", Branch: "feature/x", SHA: "abc123", Token: "tok",
+	})
+	if err == nil {
+		t.Fatal("CreateBranch() error = nil, want a genuine error on a rate-limited 403")
+	}
+	if errors.Is(err, ports.ErrPermissionDenied) {
+		t.Error("errors.Is(err, ports.ErrPermissionDenied) = true, want false -- a rate-limited 403 must never classify as a permanent denial")
+	}
+
+	var apiErr *githubapi.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("CreateBranch() error = %v (%T), want an error wrapping *githubapi.APIError", err, err)
+	}
+	if !apiErr.RateLimited {
+		t.Error("APIError.RateLimited = false, want true -- doPost must compute it exactly like doGet/doPut do")
 	}
 }

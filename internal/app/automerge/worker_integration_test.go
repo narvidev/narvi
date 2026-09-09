@@ -7,6 +7,7 @@ package automerge_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"testing"
@@ -42,6 +43,18 @@ type fakeAutoMergeSourceControl struct {
 	mergeSHA       string
 	mergeErr       error
 	mergeErrByRepo map[string]error // "owner/repo" -> error, takes priority over mergeErr (see MergePR's own doc comment)
+
+	// mergeDelay, when non-zero, is slept INSIDE MergePR, AFTER releasing
+	// f.mu -- models "blocks on a real GitHub round trip" (docs/
+	// TECHNICAL_PLAN.md §17's own adversarial review, blocker #1) so a
+	// test driving several armed repos through ONE PumpOnce tick can
+	// force their own concurrent goroutines (worker.go's own errgroup fan-
+	// out) to all clear their own authGuard.allow() check BEFORE any one
+	// of them reports its own outcome -- exactly the interleaving the
+	// review's own diagnosis names, and the ONE thing a zero-latency fake
+	// can never reproduce (the review's own counterfactual: "with latency
+	// removed from the fake... only one failure is recorded").
+	mergeDelay time.Duration
 }
 
 var _ ports.SourceControl = (*fakeAutoMergeSourceControl)(nil)
@@ -72,22 +85,36 @@ func (f *fakeAutoMergeSourceControl) UpdatePRBody(context.Context, ports.UpdateP
 
 func (f *fakeAutoMergeSourceControl) MergePR(_ context.Context, spec ports.MergePRSpec) (string, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.mergeCalls = append(f.mergeCalls, spec)
 	// mergeErrByRepo (keyed "owner/repo") takes priority over the plain,
 	// every-call mergeErr below -- needed by the two per-repository-scope
 	// auth-dead-letter tests, which must fail ONE repo's own calls while
 	// a genuinely unrelated, healthy repo's calls keep succeeding through
 	// the SAME shared fake instance.
+	var err error
 	if f.mergeErrByRepo != nil {
-		if err, ok := f.mergeErrByRepo[spec.Owner+"/"+spec.Repo]; ok {
-			return "", err
+		if e, ok := f.mergeErrByRepo[spec.Owner+"/"+spec.Repo]; ok {
+			err = e
 		}
 	}
-	if f.mergeErr != nil {
-		return "", f.mergeErr
+	if err == nil {
+		err = f.mergeErr
 	}
-	return f.mergeSHA, nil
+	sha := f.mergeSHA
+	delay := f.mergeDelay
+	f.mu.Unlock()
+
+	if delay > 0 {
+		// Deliberately OUTSIDE f.mu -- every concurrent goroutine sleeps
+		// here at once, mirroring N real, independent outbound GitHub
+		// calls in flight together, never serialized by this fake's own
+		// bookkeeping lock.
+		time.Sleep(delay)
+	}
+	if err != nil {
+		return "", err
+	}
+	return sha, nil
 }
 
 func (f *fakeAutoMergeSourceControl) mergeCallCount() int {
@@ -197,6 +224,23 @@ func (rs *automergeTestRig) deps(sourceControl ports.SourceControl) automerge.De
 	}
 }
 
+// newWorker builds a Worker from rig.deps(sourceControl), failing the
+// test immediately on error -- automerge.New now constructs a real OTel
+// counter (automerge_auth_dead_lettered_total, worker.go) at
+// construction time and can fail, mirroring outboxworker.NewBuilder/
+// imagebuild.NewBuilder's own identical "construction can fail" shape.
+// Small helper so each of the tests below (which all previously called
+// automerge.New directly, back when it could not fail) stays a one-line
+// call.
+func (rs *automergeTestRig) newWorker(t *testing.T, sourceControl ports.SourceControl) *automerge.Worker {
+	t.Helper()
+	worker, err := automerge.New(rs.deps(sourceControl))
+	if err != nil {
+		t.Fatalf("automerge.New: %v", err)
+	}
+	return worker
+}
+
 // seedEligiblePR seeds a fully platform-authored, eligible (Shippable=auto)
 // PR at repoFullName#prNumber -- the fixture every test below starts
 // from, mirroring internal/app/decisioninbox's own seedAutoApprovedVerdict
@@ -265,7 +309,7 @@ func TestPumpOnce_OffByDefault_NoMerge(t *testing.T) {
 		},
 		mergeSHA: "should-never-be-used",
 	}
-	worker := automerge.New(rig.deps(sc))
+	worker := rig.newWorker(t, sc)
 
 	if err := worker.PumpOnce(ctx, time.Now()); err != nil {
 		t.Fatalf("PumpOnce() error = %v, want nil", err)
@@ -298,7 +342,7 @@ func TestPumpOnce_ExplicitlyDisabled_NoMerge(t *testing.T) {
 			},
 		},
 	}
-	worker := automerge.New(rig.deps(sc))
+	worker := rig.newWorker(t, sc)
 
 	if err := worker.PumpOnce(ctx, time.Now()); err != nil {
 		t.Fatalf("PumpOnce() error = %v, want nil", err)
@@ -331,7 +375,7 @@ func TestPumpOnce_Armed_MergesEligibleCandidate(t *testing.T) {
 		},
 		mergeSHA: "merged-commit-sha",
 	}
-	worker := automerge.New(rig.deps(sc))
+	worker := rig.newWorker(t, sc)
 
 	if err := worker.PumpOnce(ctx, time.Now()); err != nil {
 		t.Fatalf("PumpOnce() error = %v, want nil", err)
@@ -378,7 +422,7 @@ func TestPumpOnce_Armed_StaleVerdictNeverMerges(t *testing.T) {
 			},
 		},
 	}
-	worker := automerge.New(rig.deps(sc))
+	worker := rig.newWorker(t, sc)
 
 	if err := worker.PumpOnce(ctx, time.Now()); err != nil {
 		t.Fatalf("PumpOnce() error = %v, want nil", err)
@@ -403,7 +447,7 @@ func TestPumpOnce_CandidateNoLongerOpen_NeverErrors(t *testing.T) {
 	}
 
 	sc := &fakeAutoMergeSourceControl{prsByKey: map[string]ports.OpenPR{}} // no PR found at all
-	worker := automerge.New(rig.deps(sc))
+	worker := rig.newWorker(t, sc)
 
 	if err := worker.PumpOnce(ctx, time.Now()); err != nil {
 		t.Fatalf("PumpOnce() error = %v, want nil (a closed/merged-elsewhere race is not a pump-level error)", err)
@@ -434,7 +478,7 @@ func TestPumpOnce_Armed_GetOpenPRErrors_NeverMergesNeverPanics(t *testing.T) {
 	}
 
 	sc := &fakeAutoMergeSourceControl{getErr: errors.New("github: rate limited")}
-	worker := automerge.New(rig.deps(sc))
+	worker := rig.newWorker(t, sc)
 
 	if err := worker.PumpOnce(ctx, time.Now()); err != nil {
 		t.Fatalf("PumpOnce() error = %v, want nil (a per-candidate GetOpenPR error must degrade, never fail, the whole tick)", err)
@@ -484,7 +528,7 @@ func TestPumpOnce_Armed_MergeFails_NeverPanics_NoConfirmedOutcomeRecorded(t *tes
 		},
 		mergeErr: &ports.MergePRError{Status: http.StatusMethodNotAllowed, Message: "not mergeable"},
 	}
-	worker := automerge.New(rig.deps(sc))
+	worker := rig.newWorker(t, sc)
 
 	if err := worker.PumpOnce(ctx, time.Now()); err != nil {
 		t.Fatalf("PumpOnce() error = %v, want nil (a per-candidate MergePR error must degrade, never fail, the whole tick)", err)
@@ -504,7 +548,7 @@ func TestPumpOnce_Armed_MergeFails_NeverPanics_NoConfirmedOutcomeRecorded(t *tes
 
 // findAuditLogEntry returns the most recent audit_log row carrying the
 // given action, or nil if none exists yet -- a small local helper for the
-// two auth-dead-letter tests below, which need to confirm docs/
+// auth-dead-letter tests below, which need to confirm docs/
 // TECHNICAL_PLAN.md §17's own "how does an operator learn" answer
 // (worker.go's own recordAuthOutcome) actually wrote a durable, queryable
 // row, not merely a log line.
@@ -522,6 +566,31 @@ func findAuditLogEntry(t *testing.T, pool *pgxpool.Pool, action string) *sqlcgen
 	return nil
 }
 
+// countAuditLogEntries is findAuditLogEntry's own counting sibling --
+// docs/TECHNICAL_PLAN.md §17's own adversarial review, test-integrity
+// finding: "the audit-log assertions cannot detect the operator noise the
+// fix exists to remove: writing a bogus dead-letter row on every failed
+// call still passes them." A mere findAuditLogEntry != nil check is
+// satisfied by ONE row just as much as by a fresh row on every single
+// tick -- exactly the "only rate-limit noise" regression §17 exists to
+// close. Every test below that asserts on automerge.auth_dead_lettered
+// now also asserts the COUNT stays exactly 1 across every tick AFTER the
+// dead-lettering one.
+func countAuditLogEntries(t *testing.T, pool *pgxpool.Pool, action string) int {
+	t.Helper()
+	entries, err := narvipg.NewAuditLogStore(pool).List(context.Background(), 100, 0)
+	if err != nil {
+		t.Fatalf("list audit log entries: %v", err)
+	}
+	count := 0
+	for i := range entries {
+		if entries[i].Action == action {
+			count++
+		}
+	}
+	return count
+}
+
 // TestPumpOnce_MergePR401_DeadLettersWorkerWide_StopsHammeringAllRepos is
 // this Step's own end-to-end proof of docs/TECHNICAL_PLAN.md §17: a
 // bad/empty bot token (modeled here as MergePR always returning a 401
@@ -535,7 +604,7 @@ func findAuditLogEntry(t *testing.T, pool *pgxpool.Pool, action string) *sqlcgen
 // own name for the gap this closes).
 //
 // now is advanced by a full hour between ticks -- comfortably past
-// platform.DefaultTimeouts().AutoMergeAuthBackoffMax (30min), so every
+// platform.DefaultTimeouts().AutoMergeAuthBackoffMax (12min), so every
 // tick after the first is guaranteed to be outside its own scope's
 // backoff window without this test needing to know the exact schedule
 // domain/automerge.EvaluateBackoff computes.
@@ -558,7 +627,7 @@ func TestPumpOnce_MergePR401_DeadLettersWorkerWide_StopsHammeringAllRepos(t *tes
 		},
 		mergeErr: &ports.MergePRError{Status: http.StatusUnauthorized, Message: "Bad credentials"},
 	}
-	worker := automerge.New(rig.deps(sc))
+	worker := rig.newWorker(t, sc)
 
 	now := time.Now()
 	const maxAuthFailures = 5 // domainautomerge.MaxAuthFailures, kept as a literal to avoid this test depending on an internal/domain import for a single constant
@@ -615,6 +684,16 @@ func TestPumpOnce_MergePR401_DeadLettersWorkerWide_StopsHammeringAllRepos(t *tes
 	if got := sc.getOpenPRCallCount(); got != 0 {
 		t.Errorf("GetOpenPR call count after dead-letter = %d, want 0 (repo-a) -- this is the literal 'keeps polling GitHub, forever, at full rate' bug docs/TECHNICAL_PLAN.md §17 describes", got)
 	}
+
+	// The operator-noise regression test: a bogus dead-letter row on
+	// every subsequent failed call would still pass a mere
+	// findAuditLogEntry != nil check above -- this is the assertion that
+	// actually distinguishes "fired exactly once" from "fires on every
+	// tick" (docs/TECHNICAL_PLAN.md §17's own adversarial review, test-
+	// integrity finding).
+	if got := countAuditLogEntries(t, rig.pool, "automerge.auth_dead_lettered"); got != 1 {
+		t.Errorf("audit_log rows with action=automerge.auth_dead_lettered = %d after %d further ticks, want exactly 1 -- a fresh row on every subsequent failed call is the operator noise this fix exists to remove", got, 3)
+	}
 }
 
 // TestPumpOnce_MergePR403NonRateLimited_DeadLettersOnlyThatRepo is
@@ -660,7 +739,7 @@ func TestPumpOnce_MergePR403NonRateLimited_DeadLettersOnlyThatRepo(t *testing.T)
 		},
 		mergeSHA: "healthy-repo-merge-sha",
 	}
-	worker := automerge.New(rig.deps(sc))
+	worker := rig.newWorker(t, sc)
 
 	now := time.Now()
 	const maxAuthFailures = 5 // domainautomerge.MaxAuthFailures, see the sibling test's own identical comment
@@ -693,9 +772,11 @@ func TestPumpOnce_MergePR403NonRateLimited_DeadLettersOnlyThatRepo(t *testing.T)
 	sc.mergeCalls = nil
 	sc.mu.Unlock()
 
-	now = now.Add(time.Hour)
-	if err := worker.PumpOnce(ctx, now); err != nil {
-		t.Fatalf("PumpOnce() post-dead-letter tick error = %v, want nil", err)
+	for i := 0; i < 3; i++ {
+		now = now.Add(time.Hour)
+		if err := worker.PumpOnce(ctx, now); err != nil {
+			t.Fatalf("PumpOnce() post-dead-letter tick %d error = %v, want nil", i, err)
+		}
 	}
 
 	sc.mu.Lock()
@@ -715,5 +796,165 @@ func TestPumpOnce_MergePR403NonRateLimited_DeadLettersOnlyThatRepo(t *testing.T)
 	}
 	if !healthyMerged {
 		t.Error("MergePR was never called for the healthy, unrelated repo -- a per-repository dead-letter must never leak and block an unrelated repo's own merges")
+	}
+
+	// The operator-noise regression test, mirroring the worker-wide
+	// sibling test's own identical assertion: a bogus dead-letter row on
+	// every subsequent failed call would still pass a mere
+	// findAuditLogEntry != nil check above.
+	if got := countAuditLogEntries(t, rig.pool, "automerge.auth_dead_lettered"); got != 1 {
+		t.Errorf("audit_log rows with action=automerge.auth_dead_lettered = %d after 3 further ticks, want exactly 1", got)
+	}
+}
+
+// TestPumpOnce_GetOpenPRAuthFailure_DeadLettersWorkerWide is
+// TestPumpOnce_MergePR401_DeadLettersWorkerWide_StopsHammeringAllRepos'
+// own sibling for mergeCandidate's OTHER recordAuthOutcome call site --
+// docs/TECHNICAL_PLAN.md §17's own adversarial review, test-integrity
+// finding: "the revalidate/GetOpenPR guard -- the actual 'polls GitHub
+// forever' path this commit exists to fix -- is untested; removing it
+// leaves unit and integration tests green." Every OTHER dead-letter test
+// in this file drives a failure through MergePR (the SECOND
+// recordAuthOutcome call site, worker.go's own mergeCandidate); this one
+// drives it through RevalidateForAutoMerge's own GetOpenPR call (the
+// FIRST), fed by fakeAutoMergeSourceControl.getErr -- proving worker.go's
+// own `if err != nil { w.recordAuthOutcome(...) }` branch immediately
+// after RevalidateForAutoMerge is real, wired code, not dead: deleting it
+// would leave every OTHER test in this file green, since none of them
+// ever cause GetOpenPR itself to return a classified error.
+func TestPumpOnce_GetOpenPRAuthFailure_DeadLettersWorkerWide(t *testing.T) {
+	rig := newAutomergeTestRig(t)
+	ctx := context.Background()
+	const repoFullName = "acme/automerge-getopenpr-401"
+
+	rig.seedEligiblePR(ctx, t, repoFullName, 30, "sha-30")
+	if _, err := rig.repoSettings.UpsertAutoMergeToggle(ctx, repoFullName, true); err != nil {
+		t.Fatalf("upsert auto-approval settings: %v", err)
+	}
+
+	sc := &fakeAutoMergeSourceControl{
+		// getErr, not mergeErr: GetOpenPR itself fails, so
+		// RevalidateForAutoMerge never even reaches revalidateCore, and
+		// MergePR must never be attempted at all.
+		getErr: &ports.MergePRError{Status: http.StatusUnauthorized, Message: "Bad credentials"},
+	}
+	worker := rig.newWorker(t, sc)
+
+	now := time.Now()
+	const maxAuthFailures = 5 // domainautomerge.MaxAuthFailures, see the sibling tests' own identical comment
+	for i := 0; i < maxAuthFailures; i++ {
+		if err := worker.PumpOnce(ctx, now); err != nil {
+			t.Fatalf("PumpOnce() tick %d error = %v, want nil", i, err)
+		}
+		now = now.Add(time.Hour)
+	}
+
+	if got := sc.mergeCallCount(); got != 0 {
+		t.Fatalf("MergePR call count = %d, want 0 -- RevalidateForAutoMerge itself never succeeded, MergePR must never even be attempted", got)
+	}
+
+	entry := findAuditLogEntry(t, rig.pool, "automerge.auth_dead_lettered")
+	if entry == nil {
+		t.Fatal("no audit_log row with action=automerge.auth_dead_lettered found -- the revalidate/GetOpenPR failure path must dead-letter exactly like the MergePR path does")
+	}
+	if entry.ResourceType != "automerge_worker" {
+		t.Errorf("audit_log entry ResourceType = %q, want %q (worker-wide scope)", entry.ResourceType, "automerge_worker")
+	}
+
+	// "stops hammering" proof, mirroring the MergePR-path sibling test:
+	// zero further GetOpenPR calls once worker-wide dead-lettered.
+	sc.mu.Lock()
+	sc.getOpenPRHits = 0
+	sc.mu.Unlock()
+
+	now = now.Add(24 * time.Hour)
+	if err := worker.PumpOnce(ctx, now); err != nil {
+		t.Fatalf("PumpOnce() post-dead-letter tick error = %v, want nil", err)
+	}
+	if got := sc.getOpenPRCallCount(); got != 0 {
+		t.Errorf("GetOpenPR call count after dead-letter = %d, want 0 -- the worker must never call GetOpenPR again once worker-wide dead-lettered", got)
+	}
+}
+
+// TestPumpOnce_ConcurrentArmedRepos_OneTickAuthFailure_CoalescesNotDeadLetters
+// is this Step's own worker-level, end-to-end reproduction of blocker #1
+// (docs/TECHNICAL_PLAN.md §17's own adversarial review): "PumpOnce fans
+// repos out concurrently, one errgroup goroutine per armed repo, each
+// calling allow(repo, now) with the SAME now. Every goroutine clears
+// allow() in microseconds and then blocks on a real GitHub round trip, so
+// with >= MaxAuthFailures armed repos they all record a worker-scope
+// failure at the same instant." fakeAutoMergeSourceControl.mergeDelay
+// (above) models that real round trip -- a real time.Sleep, INSIDE a
+// real goroutine PumpOnce's own errgroup spawns, is the ONE thing needed
+// to force the exact interleaving the review's own diagnosis names (its
+// own counterfactual: "with latency removed from the fake... only one
+// failure is recorded", implying the opposite happens WITH it).
+//
+// WITHOUT the authguard.go fix (a plain g.mu-protected increment with no
+// generation coalescing), this test's own N=8 armed repos -- each
+// failing with the SAME worker-wide 401 -- would drive
+// consecutiveFailures from 0 to 8 inside this ONE tick, dead-lettering
+// the worker mid-tick (>= domainautomerge.MaxAuthFailures=5): the
+// audit_log row would already exist after just one PumpOnce call, and
+// whichever repos' own goroutines lost the race to cross
+// MaxAuthFailures first would never even get their own MergePR attempt.
+// WITH the fix, a single tick's worth of concurrent, contemporaneous
+// failures coalesces to exactly ONE consecutive failure -- EVERY armed
+// repo gets its own real attempt this tick (mergeCallCount == N), and
+// the worker is NOT YET dead-lettered.
+func TestPumpOnce_ConcurrentArmedRepos_OneTickAuthFailure_CoalescesNotDeadLetters(t *testing.T) {
+	rig := newAutomergeTestRig(t)
+	ctx := context.Background()
+
+	const armedRepos = 8 // > domainautomerge.MaxAuthFailures (5)
+	sc := &fakeAutoMergeSourceControl{
+		prsByKey:   map[string]ports.OpenPR{},
+		mergeErr:   &ports.MergePRError{Status: http.StatusUnauthorized, Message: "Bad credentials"},
+		mergeDelay: 20 * time.Millisecond,
+	}
+	for i := 0; i < armedRepos; i++ {
+		repo := fmt.Sprintf("automerge-concurrent-%d", i)
+		repoFullName := "acme/" + repo
+		prNumber := int32(100 + i)
+		headSHA := fmt.Sprintf("sha-concurrent-%d", i)
+
+		htmlURL := rig.seedEligiblePR(ctx, t, repoFullName, prNumber, headSHA)
+		if _, err := rig.repoSettings.UpsertAutoMergeToggle(ctx, repoFullName, true); err != nil {
+			t.Fatalf("upsert auto-approval settings (%s): %v", repoFullName, err)
+		}
+		sc.prsByKey[fmt.Sprintf("%s#%d", repoFullName, prNumber)] = ports.OpenPR{
+			Owner: "acme", Repo: repo, Number: int(prNumber), HTMLURL: htmlURL,
+			HeadSHA: headSHA, CIConclusion: ports.CIConclusionSuccess,
+		}
+	}
+	worker := rig.newWorker(t, sc)
+
+	if err := worker.PumpOnce(ctx, time.Now()); err != nil {
+		t.Fatalf("PumpOnce() error = %v, want nil", err)
+	}
+
+	if got := sc.mergeCallCount(); got != armedRepos {
+		t.Fatalf("MergePR call count after one tick = %d, want %d -- every armed repo's own candidate must get a real attempt THIS tick, none skipped mid-tick by a premature dead-letter", got, armedRepos)
+	}
+
+	if entry := findAuditLogEntry(t, rig.pool, "automerge.auth_dead_lettered"); entry != nil {
+		t.Fatalf("audit_log row with action=automerge.auth_dead_lettered already exists after ONE tick's worth of %d concurrent contemporaneous failures (detail=%s) -- want none yet: a single tick must never walk the whole backoff ladder in one shot", armedRepos, string(entry.DetailJson))
+	}
+
+	// A SECOND tick's worth of the SAME concurrent failure must still
+	// coalesce to a SECOND consecutive failure, not immediately
+	// dead-letter either -- proving the coalescing holds across waves,
+	// not merely on the very first one.
+	sc.mu.Lock()
+	sc.mergeCalls = nil
+	sc.mu.Unlock()
+	if err := worker.PumpOnce(ctx, time.Now().Add(30*time.Minute)); err != nil {
+		t.Fatalf("PumpOnce() second tick error = %v, want nil", err)
+	}
+	if got := sc.mergeCallCount(); got != armedRepos {
+		t.Fatalf("MergePR call count after second tick = %d, want %d", got, armedRepos)
+	}
+	if entry := findAuditLogEntry(t, rig.pool, "automerge.auth_dead_lettered"); entry != nil {
+		t.Fatalf("audit_log row with action=automerge.auth_dead_lettered already exists after TWO ticks' worth of %d concurrent contemporaneous failures each (detail=%s) -- want none yet (domainautomerge.MaxAuthFailures=5 requires several more waves)", armedRepos, string(entry.DetailJson))
 	}
 }

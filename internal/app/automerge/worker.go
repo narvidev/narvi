@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
@@ -30,6 +32,11 @@ import (
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/platform"
 )
+
+// meterName is this package's own OTel meter name -- mirrors app/
+// imagebuild's/app/outboxworker's own "narvi/<package>" convention
+// exactly.
+const meterName = "narvi/automerge"
 
 // maxCandidatesPerRepoPerTick bounds how many auto-approved candidate PRs
 // ONE repo contributes to ONE tick -- §21.1's own "bounded from day one"
@@ -54,6 +61,19 @@ type Deps struct {
 type Worker struct {
 	deps      Deps
 	authGuard *authGuard
+
+	// authDeadLetterCount counts every NEW transition into a dead-lettered
+	// scope (worker-wide or per-repository) -- constructed exactly once,
+	// here, at construction time, mirroring internal/app/outboxworker.
+	// Builder's own outbox_dead_letter_total precedent and internal/app/
+	// imagebuild.Builder's own image_build_permanently_failed precedent
+	// (both cited by authguard.go's own recordFailure doc comment) --
+	// audit fix: this Step originally shipped the audit_log row and Error
+	// log recordAuthOutcome (below) already fires on a transition, but
+	// registered NO metric instrument alongside them, so unlike both of
+	// those precedents, no dashboard/alert could ever fire on this
+	// condition at all.
+	authDeadLetterCount metric.Int64Counter
 }
 
 // New builds a Worker. authGuard (authguard.go, docs/TECHNICAL_PLAN.md
@@ -61,15 +81,30 @@ type Worker struct {
 // Worker, from deps.Timeouts.AutoMergeAuthBackoffBase/
 // AutoMergeAuthBackoffMax -- mirroring every other backoff-config-holding
 // construction in this codebase (e.g. internal/app/outboxworker.Builder,
-// which reads OutboxBackoffBase/OutboxBackoffMax the same way).
-func New(deps Deps) *Worker {
+// which reads OutboxBackoffBase/OutboxBackoffMax the same way). Returns
+// an error only if constructing authDeadLetterCount fails -- mirroring
+// outboxworker.NewBuilder/imagebuild.NewBuilder's own identical
+// "a metric instrument that failed to construct is a construction-time
+// error, not a per-call one" precedent.
+func New(deps Deps) (*Worker, error) {
+	meter := otel.Meter(meterName)
+	authDeadLetterCount, err := meter.Int64Counter(
+		"automerge_auth_dead_lettered_total",
+		metric.WithDescription("Number of times internal/app/automerge.Worker's own authGuard dead-lettered a scope (worker-wide bot credential, or one repository) after exhausting domain/automerge.MaxAuthFailures consecutive authentication/permission-classified failures (docs/TECHNICAL_PLAN.md §17)."),
+		metric.WithUnit("{scope}"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("automerge: construct automerge_auth_dead_lettered_total counter: %w", err)
+	}
+
 	return &Worker{
 		deps: deps,
 		authGuard: newAuthGuard(domainautomerge.BackoffConfig{
 			BaseDelay: deps.Timeouts.AutoMergeAuthBackoffBase,
 			MaxDelay:  deps.Timeouts.AutoMergeAuthBackoffMax,
 		}),
-	}
+		authDeadLetterCount: authDeadLetterCount,
+	}, nil
 }
 
 // Run ticks every deps.Timeouts.AutoMergePumpInterval until ctx is
@@ -149,7 +184,8 @@ func (w *Worker) pumpRepo(ctx context.Context, repoFullName string, now time.Tim
 func (w *Worker) mergeCandidate(ctx context.Context, repoFullName string, prNumber int, now time.Time) {
 	logger := platform.Logger(ctx)
 
-	if !w.authGuard.allow(repoFullName, now) {
+	allowed, reservation := w.authGuard.allow(repoFullName, now)
+	if !allowed {
 		// Already classified, backed off, and (past MaxAuthFailures)
 		// dead-lettered by an EARLIER call -- the one-time transition log
 		// + audit_log row already fired (recordAuthOutcome below); a
@@ -158,6 +194,11 @@ func (w *Worker) mergeCandidate(ctx context.Context, repoFullName string, prNumb
 		// remove, so this path is silent by design.
 		return
 	}
+	// reservation is threaded through to BOTH of this call's own
+	// recordAuthOutcome sites below -- it is the SAME single allow()
+	// check/attempt, so both failure points report against the SAME
+	// observed generation (authguard.go's own authReservation doc
+	// comment).
 
 	// NOTE: no w.authGuard.recordSuccess call on RevalidateForAutoMerge's
 	// own success below -- deliberately. A read-only GetOpenPR call
@@ -174,7 +215,7 @@ func (w *Worker) mergeCandidate(ctx context.Context, repoFullName string, prNumb
 	// Only a genuinely successful MergePR (below) resets either streak.
 	ok, headSHA, reason, err := decisioninbox.RevalidateForAutoMerge(ctx, w.deps.DecisionInbox, w.deps.SourceControl, repoFullName, prNumber, w.deps.BotToken)
 	if err != nil {
-		w.recordAuthOutcome(ctx, repoFullName, err, now)
+		w.recordAuthOutcome(ctx, repoFullName, err, now, reservation)
 		logger.Error("automerge: revalidate for auto-merge failed", "error", err, "repo_full_name", repoFullName, "pr_number", prNumber)
 		return
 	}
@@ -224,7 +265,7 @@ func (w *Worker) mergeCandidate(ctx context.Context, repoFullName string, prNumb
 		return
 	}
 	if err != nil {
-		w.recordAuthOutcome(ctx, repoFullName, err, now)
+		w.recordAuthOutcome(ctx, repoFullName, err, now, reservation)
 		logger.Error("automerge: merge pr failed", "error", err, "repo_full_name", repoFullName, "pr_number", prNumber)
 		return
 	}
@@ -261,11 +302,11 @@ func (w *Worker) mergeCandidate(ctx context.Context, repoFullName string, prNumb
 // A no-op for any error that does not classify as either
 // ports.ErrAuthenticationFailed/ports.ErrPermissionDenied (rate limits,
 // 5xxs, "not mergeable", a stale head SHA, etc.), and equally a no-op on
-// every call AFTER the one that actually tripped the transition --
-// authGuard.recordFailure's own doc comment covers both cases (see
-// authguard.go).
-func (w *Worker) recordAuthOutcome(ctx context.Context, repoFullName string, err error, now time.Time) {
-	scope, target, consecutiveFailures := w.authGuard.recordFailure(repoFullName, err, now)
+// every call AFTER the one that actually tripped the transition, OR
+// whose reservation is stale (authGuard.recordFailure's own doc comment
+// covers all three cases, see authguard.go).
+func (w *Worker) recordAuthOutcome(ctx context.Context, repoFullName string, err error, now time.Time, reservation authReservation) {
+	scope, target, consecutiveFailures := w.authGuard.recordFailure(repoFullName, err, now, reservation)
 	if scope == authScopeNone {
 		return
 	}
@@ -273,6 +314,8 @@ func (w *Worker) recordAuthOutcome(ctx context.Context, repoFullName string, err
 	logger := platform.Logger(ctx)
 	logger.Error("automerge: giving up -- authentication/permission failure exhausted retries, dead-lettering",
 		"scope", scope.String(), "repo_full_name", target, "consecutive_failures", consecutiveFailures, "last_error", err)
+
+	w.authDeadLetterCount.Add(ctx, 1)
 
 	// resourceType/resourceID vary by scope: authScopeRepo names the one
 	// repository this token was denied for (a real "repository" resource,
