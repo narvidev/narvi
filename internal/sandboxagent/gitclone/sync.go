@@ -508,6 +508,24 @@ func runGit(ctx context.Context, sup *supervisor.Supervisor, args []string, step
 	// See internal/sandboxagent/githarden for what they are and what
 	// happens without them. Callers still pass their own "-C <dir>";
 	// githarden.Harden rewrites the invocation around it.
+	//
+	// githarden.NeutralizeFiltersBestEffort is the one piece Harden's own -c flags
+	// cannot cover (see its own doc comment): a content filter's driver
+	// name is chosen by the repository, not fixed, so it is asserted here
+	// as a file write instead, before every spawn -- this function is
+	// EVERY git invocation this package makes against an already-existing
+	// workspace (SyncAll's checkout/stash-pop, CleanForImageBuild's own
+	// `checkout -- .` at image-bake time), which is exactly the set that
+	// can populate a working tree from a .git/config the agent runtime
+	// (or a services.yml command running under its identity) had a full
+	// turn to write into first. A failure here is returned rather than
+	// swallowed: proceeding with the git call anyway would be running it
+	// un-neutralized, silently.
+	if dir, ok := dashCDir(args); ok {
+		if err := githarden.NeutralizeFiltersBestEffort(dir); err != nil {
+			return "", fmt.Errorf("neutralize content filters for %s: %w", dir, err)
+		}
+	}
 	proc, err := sup.Spawn(supervisor.Spec{
 		Path:   "git",
 		Args:   githarden.Harden(args),
@@ -532,6 +550,21 @@ func runGit(ctx context.Context, sup *supervisor.Supervisor, args []string, step
 		return "", fmt.Errorf("git %s: exited %d", strings.Join(args, " "), result.ExitCode)
 	}
 	return strings.TrimSpace(stdout.String()), nil
+}
+
+// dashCDir extracts the directory named by a "-C <dir>" pair in args,
+// mirroring githarden.Harden's own identical scan exactly -- runGit's
+// every caller in this package builds args as []string{"-C", dir, ...},
+// so this always finds one in practice, but the bool return (rather than
+// a panic or a swallowed empty string) keeps that an observed fact about
+// today's call sites, not an assumption baked into this function itself.
+func dashCDir(args []string) (string, bool) {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-C" {
+			return args[i+1], true
+		}
+	}
+	return "", false
 }
 
 // gitStatusDirty runs `git -C <dir> status --porcelain` and reports

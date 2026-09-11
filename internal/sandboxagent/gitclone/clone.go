@@ -165,6 +165,24 @@ func CloneAll(
 // (path.Match's own grammar does not forbid a leading "-"), so this is a
 // real, not merely theoretical, defense-in-depth gap were "--" omitted.
 func applySparseCheckout(ctx context.Context, sup *supervisor.Supervisor, dir string, patterns []string, timeout, stopGrace time.Duration) error {
+	// See internal/sandboxagent/gitclone's runGit (sync.go) and
+	// githarden.NeutralizeFiltersBestEffort's own doc comments for the full
+	// reasoning: `sparse-checkout set` materializes newly-in-scope paths
+	// into the working tree, which is exactly the class of operation that
+	// can run a content filter -- and unlike cloneOne's own fresh-clone
+	// call just above in this file, this function is ALSO reached from
+	// syncOne (sync.go) against an ALREADY-EXISTING repo (SyncAll's own
+	// deferred pathScope re-narrowing, this function's own doc comment
+	// above), where the agent runtime has already had a full turn to
+	// write .git/config. Required here, not just at CloneAll's own call
+	// site, for exactly the reason githarden.Harden's own doc comment
+	// gives for covering a shared runner instead of each caller: a path
+	// this function reaches unprotected is a hole regardless of how safe
+	// its OTHER caller is.
+	if err := githarden.NeutralizeFiltersBestEffort(dir); err != nil {
+		return fmt.Errorf("neutralize content filters for %s: %w", dir, err)
+	}
+
 	args := append([]string{"-C", dir, "sparse-checkout", "set", "--no-cone", "--"}, patterns...)
 
 	var stderr bytes.Buffer
@@ -296,6 +314,17 @@ func disableSparseCheckoutIfEnabled(ctx context.Context, sup *supervisor.Supervi
 		return nil
 	}
 
+	// `sparse-checkout disable` re-materializes every previously-excluded
+	// path into the working tree -- the same class of operation as
+	// applySparseCheckout's own identical call just above in this file,
+	// and reached the same way, from syncOne against an already-existing
+	// repo. See that call's own comment and
+	// githarden.NeutralizeFiltersBestEffort's own doc comment for the full
+	// reasoning.
+	if err := githarden.NeutralizeFiltersBestEffort(dir); err != nil {
+		return fmt.Errorf("neutralize content filters for %s: %w", dir, err)
+	}
+
 	proc, err := sup.Spawn(supervisor.Spec{
 		Path: "git",
 		Args: githarden.Args(dir, "sparse-checkout", "disable"),
@@ -349,6 +378,18 @@ func validateRepoSpec(repo sessionconfig.SessionConfigReposElem) error {
 // OUTER ctx for the Stop call, not the already-expired clone-scoped
 // context) and reported as a timeout failure; a non-zero exit or a wait
 // failure is likewise a real, returned error.
+//
+// Deliberately NOT preceded by githarden.NeutralizeFiltersBestEffort, unlike
+// applySparseCheckout/disableSparseCheckoutIfEnabled below and runGit
+// (sync.go): dir does not exist yet when this runs (CloneAll's own doc
+// comment: workspaceDir's PARENT is created via MkdirAll, but `git
+// clone` itself requires its OWN target to be empty or absent), so
+// .git/config is created by THIS clone, empty, with nothing having had
+// any chance to write a filter driver into it yet. The internal checkout
+// `git clone` performs as its own last step is safe for the same reason
+// a missing filter driver is a no-op passthrough (gitattributes(5)):
+// there is no config yet for .gitattributes' filter= attribute to
+// resolve against.
 func cloneOne(
 	ctx context.Context,
 	sup *supervisor.Supervisor,

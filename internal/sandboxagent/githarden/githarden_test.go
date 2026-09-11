@@ -1,8 +1,12 @@
 package githarden
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -161,5 +165,291 @@ func TestArgs_CredentialHelperResetPrecedesTheCallersOwn(t *testing.T) {
 	}
 	if resetAt > oursAt {
 		t.Errorf("the reset is at %d and the caller's helper at %d: the reset must come FIRST, or it discards Narvi's own helper and leaves the repository's", resetAt, oursAt)
+	}
+}
+
+// runGitCmd runs a real git subprocess in dir, failing the test
+// immediately on any error -- these tests spawn real git, never a mock of
+// one, matching internal/sandboxagent/gitclone's own house style
+// (clone_test.go's identically-named helper) for exactly the same reason:
+// a hardening claim about real git behavior is only checkable against
+// real git.
+func runGitCmd(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s (dir=%s) failed: %v\n%s", strings.Join(args, " "), dir, err, out)
+	}
+}
+
+// writeScript writes an executable shell script at path -- mirroring
+// internal/sandboxagent/boot's own hooks_test.go helper of the same
+// shape, reused here rather than an inline "sh -c '...'" config value so
+// the armed filter command never has to worry about shell-quoting a
+// temp-dir path.
+func writeScript(t *testing.T, path, body string) {
+	t.Helper()
+	content := "#!/bin/sh\n" + body + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		t.Fatalf("write script %s: %v", path, err)
+	}
+}
+
+// armRepoWithFilter builds a real git repo at a fresh t.TempDir with a
+// committed file named fileName, filtered under driverName, whose content
+// differs between the "main" (checked-out) and "other" (target) branches
+// -- so a checkout from main to other MUST rewrite fileName from its
+// blob, never a same-content no-op real git could satisfy without ever
+// invoking smudge at all. filter.<driverName>.smudge is armed directly in
+// .git/config, exactly what the agent runtime (owning this repository
+// under §30.5, with no elevated access of its own) can do. Returns the
+// repo dir and the marker path smudge touches if it runs.
+func armRepoWithFilter(t *testing.T, fileName, driverName string) (repoDir, marker string) {
+	t.Helper()
+	repoDir = t.TempDir()
+	marker = filepath.Join(t.TempDir(), "smudge-ran")
+
+	runGitCmd(t, repoDir, "init", "-b", "main")
+	runGitCmd(t, repoDir, "config", "user.email", "test@example.com")
+	runGitCmd(t, repoDir, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(repoDir, ".gitattributes"), []byte(fileName+" filter="+driverName+"\n"), 0o644); err != nil {
+		t.Fatalf("write .gitattributes: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, fileName), []byte("v1\n"), 0o644); err != nil {
+		t.Fatalf("write %s: %v", fileName, err)
+	}
+	runGitCmd(t, repoDir, "add", ".")
+	runGitCmd(t, repoDir, "commit", "-m", "v1")
+	runGitCmd(t, repoDir, "checkout", "-b", "other")
+	if err := os.WriteFile(filepath.Join(repoDir, fileName), []byte("v2\n"), 0o644); err != nil {
+		t.Fatalf("write %s v2: %v", fileName, err)
+	}
+	runGitCmd(t, repoDir, "commit", "-am", "v2")
+	runGitCmd(t, repoDir, "checkout", "main")
+
+	smudgeScript := filepath.Join(t.TempDir(), "smudge.sh")
+	writeScript(t, smudgeScript, "touch '"+marker+"'\ncat")
+	runGitCmd(t, repoDir, "config", "filter."+driverName+".smudge", smudgeScript)
+
+	return repoDir, marker
+}
+
+// TestNeutralizeFiltersBestEffort_ArmedSmudgeFilter is a mutation-verify
+// demonstration, run against a REAL git binary, not asserted from
+// documentation: it arms a filter.<driver>.smudge exactly the way an
+// attacker with write access to .git/config would, then runs the real,
+// hardened `git checkout` this package exists to produce, and shows the
+// armed command did NOT run once NeutralizeFiltersBestEffort had been
+// called for the same repoDir (with no concurrent tampering -- see this
+// package's own doc comment on NeutralizeFiltersBestEffort for the
+// racing case this does NOT cover), and DID run when it had not. Both
+// directions are pinned permanently, in the same table.
+//
+// Run against TWO different (path, driver-name) pairs, not one: a
+// "* -filter" override narrowed to a single hardcoded filename (e.g. the
+// first fixture's own "secret.bin") would still pass the first case and
+// only fail the second -- this is what makes that mutation visible
+// rather than leaving the suite green on a coincidental match between the
+// override and the one fixture name a narrower test happened to use.
+func TestNeutralizeFiltersBestEffort_ArmedSmudgeFilter(t *testing.T) {
+	for _, filterCase := range []struct {
+		fileName, driverName string
+	}{
+		{"secret.bin", "evil"},
+		{"totally-unrelated-name.xyz", "a-different-driver-entirely"},
+	} {
+		for _, tc := range []struct {
+			name       string
+			neutralize bool
+			wantRan    bool
+		}{
+			{name: "not neutralized: the armed filter runs", neutralize: false, wantRan: true},
+			{name: "neutralized: the armed filter does not run", neutralize: true, wantRan: false},
+		} {
+			t.Run(filterCase.fileName+"/"+tc.name, func(t *testing.T) {
+				repoDir, marker := armRepoWithFilter(t, filterCase.fileName, filterCase.driverName)
+
+				if tc.neutralize {
+					if err := NeutralizeFiltersBestEffort(repoDir); err != nil {
+						t.Fatalf("NeutralizeFiltersBestEffort(%s) = %v, want nil", repoDir, err)
+					}
+				}
+
+				// The real, hardened invocation this whole package exists
+				// to produce -- exactly the shape internal/sandboxagent/
+				// gitclone's runGit spawns.
+				args := Args(repoDir, "checkout", "other", "--")
+				cmd := exec.Command("git", args...)
+				cmd.Dir = repoDir
+				if out, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+				}
+
+				_, statErr := os.Stat(marker)
+				gotRan := statErr == nil
+				if gotRan != tc.wantRan {
+					t.Errorf("armed filter.%s.smudge ran = %v, want %v", filterCase.driverName, gotRan, tc.wantRan)
+				}
+
+				data, err := os.ReadFile(filepath.Join(repoDir, filterCase.fileName))
+				if err != nil {
+					t.Fatalf("read %s after checkout: %v", filterCase.fileName, err)
+				}
+				if string(data) != "v2\n" {
+					t.Errorf("%s content = %q, want %q -- checkout must still produce the real blob content whether or not the filter ran", filterCase.fileName, data, "v2\n")
+				}
+			})
+		}
+	}
+}
+
+// TestNeutralizeFiltersBestEffort_CreatesInfoDirectoryIfAbsent covers the
+// one filesystem precondition NeutralizeFiltersBestEffort's own doc
+// comment asserts without a test otherwise pinning it: a freshly-
+// initialized repository has $GIT_DIR/info at all (git itself creates
+// it), but this must not assume that -- a repoDir handed to it by a
+// caller that never ran a real `git init`/`clone` (a hand-built test
+// fixture, for instance) should still succeed.
+func TestNeutralizeFiltersBestEffort_CreatesInfoDirectoryIfAbsent(t *testing.T) {
+	repoDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repoDir, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll .git: %v", err)
+	}
+
+	if err := NeutralizeFiltersBestEffort(repoDir); err != nil {
+		t.Fatalf("NeutralizeFiltersBestEffort(%s) = %v, want nil", repoDir, err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(repoDir, ".git", "info", "attributes"))
+	if err != nil {
+		t.Fatalf("read .git/info/attributes: %v", err)
+	}
+	if string(got) != filterAttributesOverride {
+		t.Errorf(".git/info/attributes = %q, want %q", got, filterAttributesOverride)
+	}
+}
+
+// TestNeutralizeFiltersBestEffort_RefusesToFollowASymlink is the
+// regression test for the vulnerability this function's own doc comment
+// now records in its own history: the first version wrote via
+// os.WriteFile, which follows a symlink at the target path, so
+// `ln -sfn /dev/null .git/info/attributes` (one unprivileged command, in
+// a directory the agent runtime owns per §30.5) made the "neutralizing"
+// write land on /dev/null while the function still returned nil --
+// silent, false success. Confirmed independently against real git before
+// this fix: with that pre-planted symlink in place, NeutralizeFilters
+// returned nil AND a real, hardened `git checkout` still ran the armed
+// filter.
+//
+// This pins the fix in ISOLATION from any checkout at all: the function
+// itself must now return a real, non-nil error the moment it finds a
+// symlink already sitting at the exact path it is about to write,
+// without ever touching the file the symlink points to.
+func TestNeutralizeFiltersBestEffort_RefusesToFollowASymlink(t *testing.T) {
+	repoDir := t.TempDir()
+	infoDir := filepath.Join(repoDir, ".git", "info")
+	if err := os.MkdirAll(infoDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll %s: %v", infoDir, err)
+	}
+	target := filepath.Join(t.TempDir(), "would-be-clobbered")
+	if err := os.WriteFile(target, []byte("untouched\n"), 0o644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	attrPath := filepath.Join(infoDir, "attributes")
+	if err := os.Symlink(target, attrPath); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	err := NeutralizeFiltersBestEffort(repoDir)
+	if err == nil {
+		t.Fatal("NeutralizeFiltersBestEffort returned nil with a symlink pre-planted at .git/info/attributes -- this is the exact silent-bypass vulnerability, reopened")
+	}
+	t.Logf("got the expected fail-closed error: %v", err)
+
+	got, readErr := os.ReadFile(target)
+	if readErr != nil {
+		t.Fatalf("read target: %v", readErr)
+	}
+	if string(got) != "untouched\n" {
+		t.Errorf("target content = %q, want %q -- the symlink target must never be written through", got, "untouched\n")
+	}
+
+	// The symlink itself must survive too -- confirms the failure came
+	// from refusing to follow it, not from some other path that happened
+	// to also leave the target alone (e.g. an unrelated permission error
+	// before ever reaching the symlink).
+	fi, lstatErr := os.Lstat(attrPath)
+	if lstatErr != nil {
+		t.Fatalf("lstat %s: %v", attrPath, lstatErr)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("attrPath mode = %v, want a symlink still in place", fi.Mode())
+	}
+}
+
+// TestNeutralizeFiltersBestEffort_RefusesANonRegularFile extends the
+// symlink check to the OTHER thing O_NOFOLLOW does not catch on its own:
+// a non-regular node created directly at the path (no symlink involved),
+// which O_NOFOLLOW's own "refuse to follow" semantics do not apply to --
+// this is what the fstat-and-check-IsRegular step catches instead.
+func TestNeutralizeFiltersBestEffort_RefusesANonRegularFile(t *testing.T) {
+	repoDir := t.TempDir()
+	infoDir := filepath.Join(repoDir, ".git", "info")
+	if err := os.MkdirAll(infoDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll %s: %v", infoDir, err)
+	}
+	attrPath := filepath.Join(infoDir, "attributes")
+	if err := syscall.Mkfifo(attrPath, 0o644); err != nil {
+		t.Skipf("mkfifo not available in this environment: %v", err)
+	}
+
+	err := NeutralizeFiltersBestEffort(repoDir)
+	if err == nil {
+		t.Fatal("NeutralizeFiltersBestEffort returned nil with a FIFO at .git/info/attributes -- refusing non-regular files is not actually wired up")
+	}
+	t.Logf("got the expected fail-closed error: %v", err)
+}
+
+// TestNeutralizeFiltersBestEffort_ReassertsEveryCall is the regression
+// test for the OTHER mutation a passive test suite does not catch:
+// memoizing this function per repoDir (a package-level "already ran for
+// this path, skip" cache) would make every test above pass on the FIRST
+// call and say nothing about the second. That matters because production
+// calls this before EVERY spawn specifically because the agent runtime
+// can undo it between calls (this function's own doc comment) -- a
+// cached implementation would silently stop re-asserting after the
+// first call ever succeeds for a given repoDir, which is invisible
+// unless something calls it twice with real tampering in between, which
+// this test does.
+func TestNeutralizeFiltersBestEffort_ReassertsEveryCall(t *testing.T) {
+	repoDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repoDir, ".git"), 0o755); err != nil {
+		t.Fatalf("MkdirAll .git: %v", err)
+	}
+
+	if err := NeutralizeFiltersBestEffort(repoDir); err != nil {
+		t.Fatalf("first call: NeutralizeFiltersBestEffort(%s) = %v, want nil", repoDir, err)
+	}
+
+	attrPath := filepath.Join(repoDir, ".git", "info", "attributes")
+	// Simulate the agent runtime getting a full turn between two separate
+	// sandbox-agent invocations (never a race -- purely sequential) and
+	// overwriting what this function wrote.
+	if err := os.WriteFile(attrPath, []byte("tampered by the runtime\n"), 0o644); err != nil {
+		t.Fatalf("tamper: %v", err)
+	}
+
+	if err := NeutralizeFiltersBestEffort(repoDir); err != nil {
+		t.Fatalf("second call: NeutralizeFiltersBestEffort(%s) = %v, want nil", repoDir, err)
+	}
+
+	got, err := os.ReadFile(attrPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", attrPath, err)
+	}
+	if string(got) != filterAttributesOverride {
+		t.Errorf("after the second call, .git/info/attributes = %q, want %q -- a memoized guard would have left the tampered content in place", got, filterAttributesOverride)
 	}
 }
