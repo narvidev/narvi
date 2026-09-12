@@ -24,7 +24,7 @@ Narvi — this repository — is the engine and team web UI, complete on its own
 | Path | What it is |
 |---|---|
 | [`docs/TECHNICAL_PLAN.md`](docs/TECHNICAL_PLAN.md) | The full technical specification: architecture, domain model, ports, cross-cutting invariants, wire contracts, feature set, identity/RBAC, the product-prototyping workflow, release review, and the decision inbox. Self-contained. |
-| [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) | The work broken into 161 Steps across 17 phases (0–16) — 132 of scheduled work (3 of them gated on a product decision), 3 routed out to a separate repository, plus 26 named gaps (Phase 11) that gate nothing — each Step shippable as one pull request and referencing the technical-plan section that specifies it. |
+| [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) | The work broken into 170 Steps across 19 phases (0–18) — 141 of scheduled work (3 of them gated on a product decision), 3 routed out to a separate repository, plus 26 named gaps (Phase 11) that gate nothing — each Step shippable as one pull request and referencing the technical-plan section that specifies it. |
 | [`docs/design/mockups.html`](docs/design/mockups.html) | Visual specification — nine UI views with numbered design decisions. Open in a browser. |
 | [`docs/environments.md`](docs/environments.md) | Requirements for an Environment's own `setup.sh`/`start.sh` — notably the `setup.sh` idempotency contract every repo must satisfy under warm-boot shared images. |
 

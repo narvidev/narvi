@@ -3,14 +3,15 @@
 ## Context
 
 Narvi's technical specification (autonomous coding agents in sandboxes) is in
-[docs/TECHNICAL_PLAN.md](TECHNICAL_PLAN.md) (§0–§40), and the nine-view UI design spec is in
-[docs/design/mockups.html](design/mockups.html). This plan breaks 17 phases (0–16) into **161 Steps**.
-132 of them are scheduled work in this repository (Steps 108-110 were routed out to a separate
+[docs/TECHNICAL_PLAN.md](TECHNICAL_PLAN.md) (§0–§42), and the nine-view UI design spec is in
+[docs/design/mockups.html](design/mockups.html). This plan breaks 19 phases (0–18) into **170 Steps**.
+141 of them are scheduled work in this repository (Steps 108-110 were routed out to a separate
 repository when the extension boundary was drawn, and keep their numbers as pointers so every
 citation of them stays valid; Phase 16's 3 are gated on a product decision nobody has taken) — including Phase 4's own 5 additive Steps, 40-44, Phase 8's 9
 shadow-mode Steps, 96-104, Phase 9's 6 knowledge Steps, 105-110, and Phase 12's 4 boundary Steps,
 132-135, Phase 13's 7 silent-failure Steps, 136-142, Phase 14's 5 composition Steps, 143-147,
-and Phase 15's 4 guardrail Steps, 148-151. The other 26 are Phase 11 (Steps 113-131, plus 152-156 and 160-161 appended after the phase was scheduled): named
+Phase 15's 4 guardrail Steps, 148-151, Phase 17's 4 parity Steps, 162-165, and Phase 18's 5
+Kubernetes-provider Steps, 166-170. The other 26 are Phase 11 (Steps 113-131, plus 152-156 and 160-161 appended after the phase was scheduled): named
 gaps, each filed as the shipping Step
 that found it declared it, and since scheduled in full with an execution order and a milestone of
 its own. They gate nothing else, which is why Phase 12 follows them numerically without waiting
@@ -690,6 +691,77 @@ human command still works while it holds; a repository's level answers what it m
 refuses a toggle above it at the write, and leaves one audit record per consequence when lowered.
 §9.3 scenario 15 green — gating this phase, on the Phase 4 precedent. Phase KPI: verdict precision
 (§21.1) reported per level from the first repository moved.
+
+## Phase 17 — Claims parity (4 Steps, additive)
+
+What `docs/FOUNDATIONS.md` says in the present tense, made true, and then kept true. Technical plan
+§41 is the normative specification. Read against the code on 2026-09-12, three of the document's
+sentences were true of the plan and false of the binary: the control plane is "packaged as standard
+containers" (no Dockerfile, chart or manifest exists for it), the platform "natively supports Modal
+and RWX" (`rwx.Provider` implements the port; `controlplane/serve.go` constructs `modal.New`
+unconditionally), and sign-in offers "pluggable OIDC SSO" (`inbound/auth` is GitHub OAuth only, and
+says so). The sign-in view was honest — its SSO button is rendered "disabled today". The document
+was not, and could not have been caught, because it lived outside the repository.
+
+Not Phase 11, under that phase's own rule: Step 57 never declared RWX unwired, and no Step ever owned
+control-plane packaging. Only the OIDC gap qualifies, and one document's corrections belong in one
+phase with one exit.
+
+Execution order: **{162, 163, 164} → 165**. The first three are independent; 165 is last because it
+cites them. Step 163 is a prerequisite of Phase 18's Step 166 — the Kubernetes provider is a third
+value of the switch 163 builds, never a second selection mechanism. Independent of Phase 16 in both
+directions.
+
+| Step | Title | Content | Ref. |
+|---|---|---|---|
+| 162 ∥ | control-plane packaging | Multi-stage `Dockerfile` at the root running the exact `make dist` recipe (`web-build` + `go build -tags web_assets`), distroless final stage, non-root; CI publishes to the GitHub container registry on every tag with tag and SHA as labels — the two values the boot fingerprint already logs; `deploy/control-plane/` with `Deployment`, `Service` and a `Secret` template naming every required `platform.Config` variable, and nothing else — no Helm, because `platform.Config`'s boot validation is the one configuration surface (§37's principle). Exit: the image, against the compose Postgres, serves the Phase 12 golden route table; `docker run` unconfigured fails with `platform.Config`'s own message, not a stack trace | §41.1 |
+| 163 ∥ | sandbox provider selection | `NARVI_SANDBOX_PROVIDER` ∈ {`modal`, `rwx`}, required, validated at boot together with the chosen provider's own variables (missing names in the refusal); `serve.go`'s one construction site becomes a switch, no other file learns the name; value in the boot fingerprint and every spawn log; `kubernetes` reserved for §42 and not constructed here. The RWX real-binary test leaves `t.Skip` behind a CI job carrying the pinned binary and `RWX_ACCESS_TOKEN`, settling `Resume` empirically — Step 57's first exit criterion, never run. One external dependency, named: an RWX account; without it the switch ships, the test stays skipped, and the document says "selectable", not "supported". Exit: one end-to-end session per configured provider through the same binary; `rwx` without a token refuses to boot naming the variable | §41.2 |
+| 164 ∥ | OIDC sign-in | `GET /auth/oidc/login` + `/callback` beside the GitHub pair; discovery via `.well-known/openid-configuration`, code flow with PKCE, `nonce`/`state` on the existing pre-auth cookie; `NARVI_OIDC_ISSUER`/`CLIENT_ID`/`CLIENT_SECRET` all-or-none at boot, unset = today's disabled button; `email_verified` required true or refused; same allowlist, same default role, same `users` row; `identities` gains provider `oidc` with issuer-qualified `external_id` by migration; PR creation for a GitHub-less user takes §8.11's bot fallback, GitHub linkable later through the ordinary flow; §13.1's "configuration, not code" amended in place. Exit: a user with no GitHub account signs in through a real IdP, lands on the inbox with the allowlist's role, appears once in Members, and a second sign-in creates no second user; a token without `email_verified` is refused with the audited reason | §41.3, §13.1 |
+| 165 | the document and its drift test | `docs/FOUNDATIONS.md` joins the repository; every bullet ends in exactly one of a citation `(path/file.go:Symbol)` or `[planned §N]`; `internal/ops` gains `TestFoundationsClaims` on the `sectionref.go`/`guidedrift.go` model — neither marker fails, both fail, a dangling citation fails, an unknown section fails. Ships the two wording corrections (transitions through the actor, creation under the same row lock; the fence rejects inside the transaction under a row lock) and the mode B rewrite ("specified behind a ranking port, deliberately not built until mode A's measurement says so" — §31.9's decision, never overturned to make a sentence true). Exit: the test fails on a synthetic dangling bullet and passes on the shipped document | §41.4 |
+
+**Phase 17 milestone**: the published image serves the golden route table; one binary runs a session
+on either configured provider, selected by one variable; a user with no GitHub account signs in
+through a real IdP; and `go test ./internal/ops/` fails on a dangling citation in
+`docs/FOUNDATIONS.md` and passes on the shipped one — every present-tense sentence in it resolves to
+a file that exists.
+
+## Phase 18 — Kubernetes-native sandbox provider (5 Steps, additive, gated on Step 163)
+
+The third `SandboxProvider`, and the last component of this system that still leaves the operator's
+cluster. Technical plan §42 is the normative specification. The adapter is the small part: the port
+has held for two implementations, `Capabilities()` already lets a third declare what it lacks, and
+`sandbox-agent` dials out, so no pod ever needs an inbound route. The substance is the three
+decisions a pod needs before it may be called a sandbox — what runs it (§42.3: the RuntimeClass is
+the boundary; Kata by default, gVisor where the pool cannot run a hypervisor, `runc` never,
+fail-closed on an absent class), what it may reach (§42.4: FQDN-capable egress policy, or
+`EgressPolicy: false` and §27.6's fail-closed refusal), and how long it lives (§42.2: Narvi sets
+`activeDeadlineSeconds` itself — the first provider whose hard cap is Narvi's own value).
+
+One thing this phase says about itself that a green badge would otherwise imply falsely (§42.6): CI
+runs `kind`, `kind` cannot run Kata, so CI proves the lifecycle and not the boundary. Step 167's exit
+is an acceptance run on the target cluster, recorded with the RuntimeClass handler, node type and
+date. The first fact that run establishes is whether the node pool can run a hypervisor at all —
+bare metal or nested virtualization — which is a fact about the cluster, and the one that decides
+between Kata and gVisor.
+
+Execution order: **166 → 167 → 168 → {169, 170}**. 166 is gated on Step 163. 167 and 168 cannot be
+skipped by declaring capabilities false: without 167 the provider is a shared kernel; without 168,
+§27.6 leaves every `allowlist` Environment unspawnable here. 169 and 170 gate nothing.
+
+| Step | Title | Content | Ref. |
+|---|---|---|---|
+| 166 | the adapter, on `kind` | `internal/adapters/outbound/kubernetes` implementing the nine methods: one pod per `(session, gen)`, `sbx-{session-short}-{gen}`, labels `narvi.dev/session`/`narvi.dev/gen`, dedicated namespace and a ServiceAccount scoped to pods and secrets there; `SESSION_CONFIG` as one owner-referenced `Secret` surfaced as the single env var; `activeDeadlineSeconds` from the new `KubernetesPodActiveDeadline` in `platform/timeouts.go`, asserted in §5.4's chain as the provider hard cap and stamping §35's `lifetime_deadline_at` exactly; mandatory requests/limits; the full security context (`automountServiceAccountToken: false`, non-root, no privilege escalation, all capabilities dropped, `RuntimeDefault` seccomp, no host namespaces, read-only root except sized `emptyDir`s) in a namespace labelled PSS `restricted`; `Capabilities{Snapshots: false, Resume: false, ImageBuilds: false, ExplicitStop: true}`, Docker unsupported; errors classified by `StatusReason`, unknown → transient; `List` by label, orphan GC unchanged, a test that no `Secret` outlives its pod; `NARVI_SANDBOX_PROVIDER=kubernetes` as the switch's third value. Exit: §9.3 scenario 16's lifecycle half green on `kind` in CI | §42.1, §42.2, §42.5 |
+| 167 | the boundary: RuntimeClass, fail-closed | `NARVI_K8S_RUNTIME_CLASS` required, no default; the adapter reads the `RuntimeClass` at boot and refuses to start if absent — never a fall-through to `runc`; handler → `Capabilities.IsolationClass` ∈ {`vm`, `user-kernel`, `shared-kernel`}; `shared-kernel` refused unless `NARVI_K8S_ALLOW_SHARED_KERNEL=1`, an escape hatch for `kind` and laptops that stamps the boot fingerprint and is listed in `PRODUCTION_CHECKLIST.md` as must-be-unset; §27.5's dispatch check reads the typed value. **First exit criterion, empirical, on the RWX precedent**: an acceptance run on the target cluster — the node pool's hypervisor capability established, a Kata pod boots the sandbox image and passes the boot contract, or the run records why the pool cannot and gVisor is the class. Recorded with handler, node type and date | §42.3, §42.6 |
+| 168 | egress: FQDN policy | `NARVI_K8S_EGRESS_POLICY` ∈ {`cilium-fqdn`, `none`}; with `cilium-fqdn`, one `CiliumNetworkPolicy` per pod — default-deny egress, DNS to the cluster resolver, the server-appended floor (control-plane Service, git hosts by FQDN), the Environment's allowlist by FQDN, all ingress denied — and `EgressPolicy: true`; with `none`, `false`, and §27.6's fail-closed rule refuses an `allowlist` Environment on this provider. The adapter does not claim to verify the CNI enforces the policy — it cannot — so the value is an operator assertion in the production checklist beside the RuntimeClass; §27.6 amended to say "FQDN-capable" and why. Exit: from inside a spawned sandbox on the acceptance cluster, the control plane and the git host are reachable and a host outside the allowlist is not; scenario 16's egress half green | §42.4 |
+| 169 ∥ | in-cluster image builds | `BuildImage` as a BuildKit `Job` in the provider's namespace pushing to an in-cluster registry, `DeleteImage` through the registry API, `ImageBuilds: true`; §19's fingerprint, freshness pump and fall-back-to-base unchanged — they never knew which provider built an image. Gates nothing; until it lands, this provider runs the configured base image with `setup.sh` on every fresh spawn, §4.1.1's RWX posture. Exit: a warm boot from a prebuilt image on this provider, measured against §19.2's staleness window | §42.5, §19 |
+| 170 ∥ | previews | Per-session `Service` + `Ingress` rule on `{session}.{NARVI_K8S_PREVIEW_DOMAIN}`, created on `push_complete` through §4.1.2's outbox kind and deleted with the pod; per-repo opt-in, off by default (§24.5); UI copy stating an in-cluster preview is reachable only where the operator exposes the wildcard. Gates nothing. Exit: a `preview` artifact on a Kubernetes-provider session resolves to the pushed commit's app | §42.5, §4.1.2 |
+
+**Phase 18 milestone**: §9.3 scenario 16 green on `kind` — a pod deleted mid-turn respawns under a
+new gen with the old gen's `Secret` gone and the same turn resumed; an absent RuntimeClass refuses
+boot naming the class; an `allowlist` Environment on `EgressPolicy: false` refuses dispatch with the
+typed reason — and one acceptance run on the target cluster, recorded with the RuntimeClass handler,
+node type and date, in which a sandbox reaches the control plane and its git host and nothing else.
+The boundary is proven there and nowhere else, and the phase says so.
 
 ## Sequencing & parallelism
 
