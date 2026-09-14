@@ -92,6 +92,9 @@ POST /api/sandbox-secrets
 POST /api/sessions
 POST /api/sessions/{sessionID}/plans/{planId}/approve
 POST /api/sessions/{sessionID}/plans/{planId}/reject
+POST /api/sessions/{sessionID}/release-manifest/acknowledge
+POST /api/sessions/{sessionID}/release-manifest/block
+POST /api/sessions/{sessionID}/release-manifest/unblock
 POST /api/sessions/{sessionID}/review/findings/{identityHash}/apply-suggestion
 POST /api/sessions/{sessionID}/review/findings/{identityHash}/rebut
 POST /api/sessions/{sessionID}/review/retrigger
@@ -106,6 +109,7 @@ POST /sessions/{sessionID}/cloud-identity-config
 POST /sessions/{sessionID}/cloud-identity-token
 POST /sessions/{sessionID}/opencode-config
 POST /sessions/{sessionID}/provider-credentials
+POST /sessions/{sessionID}/release-manifest/composition-findings
 POST /sessions/{sessionID}/review/verdict
 POST /sessions/{sessionID}/sandbox-secrets
 POST /sessions/{sessionID}/scm-credentials

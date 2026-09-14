@@ -47,15 +47,17 @@ var decisionInboxTokenKey = []byte("01234567890123456789012345678901")
 // decisionInboxTestRig is this file's own small, self-contained fixture --
 // see this file's own top doc comment for why it does not reuse testRig.
 type decisionInboxTestRig struct {
-	pool           *pgxpool.Pool
-	users          *narvipg.UserStore
-	userSessions   *narvipg.UserSessionStore
-	identities     *narvipg.IdentityStore
-	sessions       *narvipg.SessionStore
-	artifacts      *narvipg.ArtifactStore
-	auditLog       *narvipg.AuditLogStore
-	reviewVerdicts *narvipg.ReviewVerdictStore
-	server         *httptest.Server
+	pool                  *pgxpool.Pool
+	users                 *narvipg.UserStore
+	userSessions          *narvipg.UserSessionStore
+	identities            *narvipg.IdentityStore
+	sessions              *narvipg.SessionStore
+	artifacts             *narvipg.ArtifactStore
+	auditLog              *narvipg.AuditLogStore
+	reviewVerdicts        *narvipg.ReviewVerdictStore
+	githubPRSessions      *narvipg.GitHubPRSessionStore
+	releaseManifestChecks *narvipg.ReleaseManifestCheckStore
+	server                *httptest.Server
 }
 
 // seedAutoApprovedVerdict inserts a Shippable=auto review_verdicts row at
@@ -183,20 +185,24 @@ func newDecisionInboxTestRig(t *testing.T, sourceControl ports.SourceControl) *d
 	artifacts := narvipg.NewArtifactStore(pool)
 	reviewFindings := narvipg.NewReviewFindingStore(pool)
 	reviewVerdicts := narvipg.NewReviewVerdictStore(pool)
+	githubPRSessions := narvipg.NewGitHubPRSessionStore(pool)
+	releaseManifestChecks := narvipg.NewReleaseManifestCheckStore(pool)
 
 	deps := decisioninbox.Deps{
-		Plans:              narvipg.NewPlanStore(pool),
-		Sessions:           sessions,
-		Participants:       narvipg.NewParticipantStore(pool),
-		Automations:        narvipg.NewAutomationStore(pool),
-		Outbox:             narvipg.NewOutboxStore(pool, false),
-		ReviewFindings:     reviewFindings,
-		SentinelFixes:      narvipg.NewSentinelFixStore(pool),
-		Artifacts:          artifacts,
-		Identities:         identities,
-		SCMCache:           decisioninbox.NewSCMCache(sourceControl, platform.DefaultTimeouts()),
-		TokenEncryptionKey: decisionInboxTokenKey,
-		Timeouts:           platform.DefaultTimeouts(),
+		Plans:                 narvipg.NewPlanStore(pool),
+		Sessions:              sessions,
+		Participants:          narvipg.NewParticipantStore(pool),
+		Automations:           narvipg.NewAutomationStore(pool),
+		Outbox:                narvipg.NewOutboxStore(pool, false),
+		ReviewFindings:        reviewFindings,
+		SentinelFixes:         narvipg.NewSentinelFixStore(pool),
+		Artifacts:             artifacts,
+		Identities:            identities,
+		GitHubPRSessions:      githubPRSessions,
+		ReleaseManifestChecks: releaseManifestChecks,
+		SCMCache:              decisioninbox.NewSCMCache(sourceControl, platform.DefaultTimeouts()),
+		TokenEncryptionKey:    decisionInboxTokenKey,
+		Timeouts:              platform.DefaultTimeouts(),
 		// (§21.1/§21.2): the REAL auto-approval eligibility
 		// engine's own store dependencies.
 		ReviewVerdict: appreviewverdict.Deps{
@@ -221,7 +227,8 @@ func newDecisionInboxTestRig(t *testing.T, sourceControl ports.SourceControl) *d
 
 	return &decisionInboxTestRig{
 		pool: pool, users: users, userSessions: userSessions, identities: identities,
-		sessions: sessions, artifacts: artifacts, auditLog: auditLog, reviewVerdicts: reviewVerdicts, server: server,
+		sessions: sessions, artifacts: artifacts, auditLog: auditLog, reviewVerdicts: reviewVerdicts,
+		githubPRSessions: githubPRSessions, releaseManifestChecks: releaseManifestChecks, server: server,
 	}
 }
 
@@ -773,6 +780,221 @@ func TestListDecisionInbox_HandoffPR_FieldsPopulated(t *testing.T) {
 	}
 	if row.HasChangesRequested == nil || !*row.HasChangesRequested {
 		t.Errorf("HasChangesRequested = %v, want a non-nil pointer to TRUE (this DTO field previously did not exist on the wire at all)", row.HasChangesRequested)
+	}
+}
+
+// claimReviewSession mirrors coalesce.go's own atomic
+// EnsureRow+LockForUpdate+SetSessionID claim sequence -- the one
+// legitimate way a github_pr_sessions row is ever produced, reused here
+// so this file's fixtures stay faithful to the real write path rather
+// than a raw INSERT.
+func (rig *decisionInboxTestRig) claimReviewSession(ctx context.Context, t *testing.T, repoFullName string, prNumber int32) pgtype.UUID {
+	t.Helper()
+	tx, err := rig.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin claim tx: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	txStore := rig.githubPRSessions.WithTx(tx)
+	if err := txStore.EnsureRow(ctx, repoFullName, prNumber); err != nil {
+		t.Fatalf("EnsureRow: %v", err)
+	}
+	if _, err := txStore.LockForUpdate(ctx, repoFullName, prNumber); err != nil {
+		t.Fatalf("LockForUpdate: %v", err)
+	}
+	created, err := rig.sessions.WithTx(tx).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub})
+	if err != nil {
+		t.Fatalf("create review session: %v", err)
+	}
+	if err := txStore.SetSessionID(ctx, repoFullName, prNumber, created.ID); err != nil {
+		t.Fatalf("SetSessionID: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit claim tx: %v", err)
+	}
+	return created.ID
+}
+
+// TestListDecisionInbox_SessionIdAndReleaseCut_FieldsPopulated is the
+// wire-level proof for the two gaps closed on top of
+// TestListDecisionInbox_HandoffPR_FieldsPopulated's own baseline: a PR
+// Narvi has actually reviewed carries its own real sessionId on the wire
+// (never a stale/absent one), a PR Narvi has never been mentioned on
+// renders sessionId null, and a release cut renders isRelease/
+// manifestFindingsCount/aggregateReviewTriggered -- all three null for an
+// ordinary PR row, never a fabricated zero/false standing in for "not a
+// release cut at all".
+//
+// Coverage fix: PR #1402/#1403 now ALSO assert compositionReviewed/
+// compositionDecision -- before this fix, this test file (and every
+// other test in this codebase, unit or integration) never once asserted
+// on those two fields at all. A verifier confirmed the gap three
+// independent ways: hardwiring decisioninbox/aggregate.go's own
+// resolveReleaseCut to always return compositionReviewed=false,
+// compositionDecision="" (reverting the exact server-side fix this
+// field pair exists for); severing Item's own CompositionReviewed/
+// CompositionDecision wiring in buildPROpenItem; and skipping the
+// decisioninbox.go DTO-mapping `if it.CompositionReviewed {
+// dto.CompositionDecision = ... }` block entirely -- ALL THREE left
+// this package's unit, integration, and this file's own httpapi suites
+// green. PR #1402 (triggered but never actually composition-reviewed)
+// and the NEW PR #1403 (composition-reviewed AND decided) together pin
+// every state resolveReleaseCut's own two new return values can be in.
+func TestListDecisionInbox_SessionIdAndReleaseCut_FieldsPopulated(t *testing.T) {
+	const repo = "acme/rockets"
+	fakeSCM := &fakeMergeSourceControl{
+		openPRs: []ports.OpenPR{
+			{Owner: "acme", Repo: "rockets", Number: 1400, Title: "mentioned PR", HTMLURL: "https://github.com/acme/rockets/pull/1400",
+				HeadSHA: "sha1400", Assignees: []ports.PRPerson{{ExternalID: "9100", Login: "octocat"}}, CIConclusion: ports.CIConclusionSuccess},
+			{Owner: "acme", Repo: "rockets", Number: 1401, Title: "never mentioned PR", HTMLURL: "https://github.com/acme/rockets/pull/1401",
+				HeadSHA: "sha1401", Assignees: []ports.PRPerson{{ExternalID: "9100", Login: "octocat"}}, CIConclusion: ports.CIConclusionSuccess},
+			{Owner: "acme", Repo: "rockets", Number: 1402, Title: "release/2026.09.01 -- 1 PR", HTMLURL: "https://github.com/acme/rockets/pull/1402",
+				HeadSHA: "sha1402", Assignees: []ports.PRPerson{{ExternalID: "9100", Login: "octocat"}}, CIConclusion: ports.CIConclusionSuccess},
+			{Owner: "acme", Repo: "rockets", Number: 1403, Title: "release/2026.09.02 -- composition reviewed and blocked", HTMLURL: "https://github.com/acme/rockets/pull/1403",
+				HeadSHA: "sha1403", Assignees: []ports.PRPerson{{ExternalID: "9100", Login: "octocat"}}, CIConclusion: ports.CIConclusionSuccess},
+		},
+	}
+	rig := newDecisionInboxTestRig(t, fakeSCM)
+	ctx := context.Background()
+
+	user, token := rig.createAuthenticatedUser(ctx, t, sqlcgen.UserRoleMember)
+	rig.linkGitHub(ctx, t, user.ID, "9100")
+
+	session1400 := rig.claimReviewSession(ctx, t, repo, 1400)
+	// PR #1401 is deliberately left unclaimed.
+	session1402 := rig.claimReviewSession(ctx, t, repo, 1402)
+	if _, err := rig.releaseManifestChecks.Insert(ctx, sqlcgen.InsertReleaseManifestCheckParams{
+		SessionID: session1402, RepoFullName: repo, PrNumber: 1402, BaseRef: "main", HeadRef: "release/2026.09.01",
+		ConstituentPrCount: 1, CoveragePartial: false, AggregateReviewTriggered: false,
+		AggregateReviewTriggerReasons: []byte(`[]`),
+		Findings:                      []byte(`[{"kind":"admin_override","prNumber":50,"prTitle":"hotfix","detail":"merged via admin override"}]`),
+		MergedPrs:                     []byte(`[]`),
+	}); err != nil {
+		t.Fatalf("insert release manifest check: %v", err)
+	}
+
+	session1403 := rig.claimReviewSession(ctx, t, repo, 1403)
+	check1403, err := rig.releaseManifestChecks.Insert(ctx, sqlcgen.InsertReleaseManifestCheckParams{
+		SessionID: session1403, RepoFullName: repo, PrNumber: 1403, BaseRef: "main", HeadRef: "release/2026.09.02",
+		ConstituentPrCount: 2, CoveragePartial: false, AggregateReviewTriggered: true,
+		AggregateReviewTriggerReasons: []byte(`["a high-risk pull request is included in this release"]`),
+		Findings:                      []byte(`[]`),
+		MergedPrs:                     []byte(`[]`),
+	})
+	if err != nil {
+		t.Fatalf("insert release manifest check (1403): %v", err)
+	}
+	if _, err := rig.releaseManifestChecks.UpdateCompositionFindings(ctx, check1403.ID,
+		[]byte(`[{"kind":"conflict","detail":"PR #1 and #2 both add migration 42"}]`)); err != nil {
+		t.Fatalf("UpdateCompositionFindings (1403): %v", err)
+	}
+	if _, err := rig.releaseManifestChecks.UpdateCompositionDecision(ctx, check1403.ID, "pending", "blocked", user.ID); err != nil {
+		t.Fatalf("UpdateCompositionDecision (1403): %v", err)
+	}
+
+	var got restdtos.ListDecisionInboxResponse
+	status := rig.doJSON(t, http.MethodGet, "/api/decision-inbox", nil, &got, token)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", status, http.StatusOK)
+	}
+
+	byPR := map[int]*restdtos.DecisionInboxItem{}
+	for i := range got.Items {
+		if got.Items[i].PrNumber != nil {
+			byPR[*got.Items[i].PrNumber] = &got.Items[i]
+		}
+	}
+
+	pr1400 := byPR[1400]
+	if pr1400 == nil {
+		t.Fatalf("PR #1400 missing from the response entirely: %+v", got.Items)
+	}
+	if pr1400.SessionId == nil || *pr1400.SessionId != session1400.String() {
+		t.Errorf("PR #1400 SessionId = %v, want a non-nil pointer to %q (its own claimed review session)", pr1400.SessionId, session1400.String())
+	}
+	if pr1400.IsRelease == nil || *pr1400.IsRelease {
+		t.Errorf("PR #1400 IsRelease = %v, want a non-nil pointer to false", pr1400.IsRelease)
+	}
+	if pr1400.ManifestFindingsCount != nil {
+		t.Errorf("PR #1400 ManifestFindingsCount = %v, want nil (not a release cut)", pr1400.ManifestFindingsCount)
+	}
+	if pr1400.AggregateReviewTriggered != nil {
+		t.Errorf("PR #1400 AggregateReviewTriggered = %v, want nil (not a release cut)", pr1400.AggregateReviewTriggered)
+	}
+	if pr1400.ManifestCoveragePartial != nil {
+		t.Errorf("PR #1400 ManifestCoveragePartial = %v, want nil (not a release cut -- the flag qualifies a count that is itself absent)", pr1400.ManifestCoveragePartial)
+	}
+
+	pr1401 := byPR[1401]
+	if pr1401 == nil {
+		t.Fatalf("PR #1401 missing from the response entirely: %+v", got.Items)
+	}
+	if pr1401.SessionId != nil {
+		t.Errorf("PR #1401 (never mentioned) SessionId = %v, want nil -- never presenting an 'Open review' action this backend cannot serve", *pr1401.SessionId)
+	}
+
+	pr1402 := byPR[1402]
+	if pr1402 == nil {
+		t.Fatalf("PR #1402 missing from the response entirely: %+v", got.Items)
+	}
+	if pr1402.Kind != restdtos.DecisionInboxItemKindNeedsReview {
+		t.Errorf("PR #1402 Kind = %q, want needs_review", pr1402.Kind)
+	}
+	if pr1402.IsRelease == nil || !*pr1402.IsRelease {
+		t.Errorf("PR #1402 IsRelease = %v, want a non-nil pointer to true", pr1402.IsRelease)
+	}
+	if pr1402.ManifestFindingsCount == nil || *pr1402.ManifestFindingsCount != 1 {
+		t.Errorf("PR #1402 ManifestFindingsCount = %v, want a non-nil pointer to 1", pr1402.ManifestFindingsCount)
+	}
+	if pr1402.AggregateReviewTriggered == nil || *pr1402.AggregateReviewTriggered {
+		t.Errorf("PR #1402 AggregateReviewTriggered = %v, want a non-nil pointer to false", pr1402.AggregateReviewTriggered)
+	}
+	if pr1402.SessionId == nil || *pr1402.SessionId != session1402.String() {
+		t.Errorf("PR #1402 SessionId = %v, want a non-nil pointer to %q (the review session that produced its own manifest check)", pr1402.SessionId, session1402.String())
+	}
+	// Its persisted check recorded coverage_partial=false, so the wire
+	// must say false -- present and false, never absent. A client cannot
+	// tell "complete scan" from "this server does not report coverage" if
+	// the field is simply missing, which is the whole reason it rides
+	// isRelease's own gate rather than being omitted when convenient.
+	if pr1402.ManifestCoveragePartial == nil || *pr1402.ManifestCoveragePartial {
+		t.Errorf("PR #1402 ManifestCoveragePartial = %v, want a non-nil pointer to false", pr1402.ManifestCoveragePartial)
+	}
+	// PR #1402's own composition pass was never actually reviewed (its
+	// check row was inserted with AggregateReviewTriggered=false and no
+	// UpdateCompositionFindings call) -- compositionReviewed must be a
+	// non-nil pointer to FALSE (present and false, mirroring
+	// ManifestCoveragePartial's own "present, never omitted" discipline
+	// immediately above), and compositionDecision must be entirely absent
+	// (nil), never a fabricated "pending".
+	if pr1402.CompositionReviewed == nil || *pr1402.CompositionReviewed {
+		t.Errorf("PR #1402 CompositionReviewed = %v, want a non-nil pointer to false", pr1402.CompositionReviewed)
+	}
+	if pr1402.CompositionDecision != nil {
+		t.Errorf("PR #1402 CompositionDecision = %v, want nil (composition pass never reviewed)", pr1402.CompositionDecision)
+	}
+
+	pr1403 := byPR[1403]
+	if pr1403 == nil {
+		t.Fatalf("PR #1403 missing from the response entirely: %+v", got.Items)
+	}
+	if pr1403.IsRelease == nil || !*pr1403.IsRelease {
+		t.Errorf("PR #1403 IsRelease = %v, want a non-nil pointer to true", pr1403.IsRelease)
+	}
+	if pr1403.AggregateReviewTriggered == nil || !*pr1403.AggregateReviewTriggered {
+		t.Errorf("PR #1403 AggregateReviewTriggered = %v, want a non-nil pointer to true", pr1403.AggregateReviewTriggered)
+	}
+	// The whole point of this row: composition_reviewed_at IS set (a real
+	// finding was posted) AND a human decision (Block) has been rendered
+	// -- both must actually reach the wire.
+	if pr1403.CompositionReviewed == nil || !*pr1403.CompositionReviewed {
+		t.Errorf("PR #1403 CompositionReviewed = %v, want a non-nil pointer to true", pr1403.CompositionReviewed)
+	}
+	if pr1403.CompositionDecision == nil {
+		t.Fatalf("PR #1403 CompositionDecision is nil, want %q", "blocked")
+	}
+	if pr1403.CompositionDecision.Value != "blocked" {
+		t.Errorf("PR #1403 CompositionDecision = %v, want %q", pr1403.CompositionDecision.Value, "blocked")
 	}
 }
 

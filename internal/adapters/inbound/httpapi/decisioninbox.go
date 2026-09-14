@@ -147,6 +147,39 @@ func decisionInboxItemToDTO(it decisioninbox.Item) restdtos.DecisionInboxItem {
 		dto.HasApprovingReview = &hasApprovingReview
 		hasChangesRequested := it.HasChangesRequested
 		dto.HasChangesRequested = &hasChangesRequested
+
+		// isRelease is set unconditionally, exactly like isHandoff above --
+		// the field a client checks to render this row's own distinct
+		// "release" shape. manifestFindingsCount/aggregateReviewTriggered
+		// render ONLY when isRelease is true: an ordinary PR row has no
+		// manifest check at all, and rendering a fabricated 0 there would
+		// be indistinguishable from a genuine, computed "zero findings"
+		// release-cut result. manifestCoveragePartial rides the same gate:
+		// it qualifies manifestFindingsCount, so it is meaningless
+		// wherever that count is absent.
+		isRelease := it.IsRelease
+		dto.IsRelease = &isRelease
+		if it.IsRelease {
+			manifestFindingsCount := it.ManifestFindingsCount
+			dto.ManifestFindingsCount = &manifestFindingsCount
+			aggregateReviewTriggered := it.AggregateReviewTriggered
+			dto.AggregateReviewTriggered = &aggregateReviewTriggered
+			manifestCoveragePartial := it.ManifestCoveragePartial
+			dto.ManifestCoveragePartial = &manifestCoveragePartial
+
+			// compositionReviewed/compositionDecision (confirmed-major
+			// fix): rendered ONLY when isRelease is true, mirroring
+			// manifestFindingsCount immediately above -- compositionDecision
+			// stays entirely absent from the wire (never a fabricated
+			// "pending") unless the composition pass has actually
+			// completed (it.CompositionReviewed), so a client can never
+			// mistake "not yet reviewed" for a real, still-open decision.
+			compositionReviewed := it.CompositionReviewed
+			dto.CompositionReviewed = &compositionReviewed
+			if it.CompositionReviewed {
+				dto.CompositionDecision = &restdtos.DecisionInboxItemCompositionDecision{Value: it.CompositionDecision}
+			}
+		}
 	}
 	if it.RiskLabel != "" {
 		dto.RiskLabel = &it.RiskLabel

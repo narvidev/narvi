@@ -68,18 +68,19 @@ func TestPlaceholderTokensMatchTurnPackage(t *testing.T) {
 // it never imports the upload PACKAGE.
 
 // TestPlaceholderTokensExactCount pins placeholderTokens' own total size --
-// this package's own four (VerdictToolURLPlaceholder/BearerPlaceholder/
-// GenPlaceholder plus ReviewCostBudgetToolURLPlaceholder), plus turn's own
-// three, plus upload's own three, no more no less. A future family that
-// grows this list without a corresponding drift-matcher test above (or
-// without the general cross-domain-package scan,
-// placeholderdrift_internal_test.go) fails here first, forcing a
-// deliberate update to this exact number rather than an unnoticed size
-// change.
+// this package's own seven (VerdictToolURLPlaceholder/BearerPlaceholder/
+// GenPlaceholder, ReviewCostBudgetToolURLPlaceholder, plus §15.3/§12.2
+// item 9's own CompositionFindingsToolURLPlaceholder/BearerPlaceholder/
+// GenPlaceholder, compositionreview.go), plus turn's own three, plus
+// upload's own three, no more no less. A future family that grows this
+// list without a corresponding drift-matcher test above (or without the
+// general cross-domain-package scan, placeholderdrift_internal_test.go)
+// fails here first, forcing a deliberate update to this exact number
+// rather than an unnoticed size change.
 func TestPlaceholderTokensExactCount(t *testing.T) {
 	t.Parallel()
 
-	// This package's own four, for completeness -- trivially true by
+	// This package's own seven, for completeness -- trivially true by
 	// construction today, but guards against a future refactor of
 	// placeholderTokens' own literal accidentally dropping one.
 	for _, tok := range []string{
@@ -87,14 +88,17 @@ func TestPlaceholderTokensExactCount(t *testing.T) {
 		VerdictToolBearerPlaceholder,
 		VerdictToolGenPlaceholder,
 		ReviewCostBudgetToolURLPlaceholder,
+		CompositionFindingsToolURLPlaceholder,
+		CompositionFindingsToolBearerPlaceholder,
+		CompositionFindingsToolGenPlaceholder,
 	} {
 		if !containsToken(placeholderTokens, tok) {
 			t.Errorf("placeholderTokens = %v, want it to contain this package's own %q", placeholderTokens, tok)
 		}
 	}
 
-	if len(placeholderTokens) != 10 {
-		t.Errorf("len(placeholderTokens) = %d, want exactly 10 (this package's own 4, plus turn's own 3, plus upload's own 3, no more no less)", len(placeholderTokens))
+	if len(placeholderTokens) != 13 {
+		t.Errorf("len(placeholderTokens) = %d, want exactly 13 (this package's own 7, plus turn's own 3, plus upload's own 3, no more no less)", len(placeholderTokens))
 	}
 }
 

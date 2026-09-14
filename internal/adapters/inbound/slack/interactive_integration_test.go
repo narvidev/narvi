@@ -30,8 +30,22 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 	"github.com/narvidev/narvi/internal/app/identitylink"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 	"github.com/narvidev/narvi/internal/platform"
 )
+
+// promptOrNilText renders a *string turn prompt for a test failure message
+// as either its dereferenced text or the literal "<nil>" -- %v on a
+// *string prints a raw pointer address (e.g. "0xc0001a3710"), which tells
+// nobody debugging a failed assertion anything about the actual value.
+// Shared across this package's own plan-mode-turn assertions
+// (planapprovalgate_integration_test.go, same package).
+func promptOrNilText(p *string) string {
+	if p == nil {
+		return "<nil>"
+	}
+	return *p
+}
 
 // recordedSlackRequest captures one request the fake Slack API server
 // observed -- enough for this file's own assertions (which endpoint, what
@@ -409,8 +423,18 @@ func TestInteractivityHandler_ViewSubmission_CreatesRequestChangesTurn(t *testin
 	if !newTurn.PlanMode {
 		t.Error("new turn PlanMode = false, want true (a request-changes turn)")
 	}
-	if newTurn.Prompt == nil || *newTurn.Prompt != "please keep the fallback path" {
-		t.Errorf("new turn Prompt = %v, want %q", newTurn.Prompt, "please keep the fallback path")
+	// §12.2 item 3's own structured-plan-document instruction
+	// (plandomain.MaybeInjectStructureInstruction) is unconditionally
+	// prepended onto every plan_mode=true turn's prompt, at the SAME
+	// CreateTurnCore this modal submission dispatches through -- so the
+	// persisted prompt is the modal's own submitted text with that fixed
+	// instruction prepended, never the bare submitted text. Named via the
+	// transformation itself (never loosened to a substring/prefix check)
+	// so this still fails if either the modal text stops reaching the
+	// prompt, or the instruction text changes unexpectedly.
+	wantPrompt := plandomain.MaybeInjectStructureInstruction(true, "please keep the fallback path")
+	if newTurn.Prompt == nil || *newTurn.Prompt != wantPrompt {
+		t.Errorf("new turn Prompt = %q, want %q", promptOrNilText(newTurn.Prompt), wantPrompt)
 	}
 	if newTurn.Status != sqlcgen.TurnStatusPending {
 		t.Errorf("new turn Status = %q, want %q", newTurn.Status, sqlcgen.TurnStatusPending)

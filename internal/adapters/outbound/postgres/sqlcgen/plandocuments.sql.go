@@ -13,14 +13,15 @@ import (
 
 const createPlanDocument = `-- name: CreatePlanDocument :one
 
-INSERT INTO plan_documents (plan_id, content)
-VALUES ($1, $2)
-RETURNING id, plan_id, content, created_at
+INSERT INTO plan_documents (plan_id, content, structured_steps)
+VALUES ($1, $2, $3)
+RETURNING id, plan_id, content, created_at, structured_steps
 `
 
 type CreatePlanDocumentParams struct {
-	PlanID  pgtype.UUID `json:"plan_id"`
-	Content *string     `json:"content"`
+	PlanID          pgtype.UUID `json:"plan_id"`
+	Content         *string     `json:"content"`
+	StructuredSteps []byte      `json:"structured_steps"`
 }
 
 // Queries backing PlanDocumentStore (§31.3's durability fix for an
@@ -38,20 +39,26 @@ type CreatePlanDocumentParams struct {
 //
 // GetPlanDocumentByPlanID backs this Step's own coverage measurement:
 // confirming every approved plan has exactly one row here.
+//
+// structured_steps (migrations/000126_plan_documents_structured.up.sql,
+// §12.2 item 3) rides the SAME insert as content, from the SAME
+// already-recovered prose -- see that migration's own comment for why NULL
+// is the only representation of "no structure recovered".
 func (q *Queries) CreatePlanDocument(ctx context.Context, arg CreatePlanDocumentParams) (PlanDocument, error) {
-	row := q.db.QueryRow(ctx, createPlanDocument, arg.PlanID, arg.Content)
+	row := q.db.QueryRow(ctx, createPlanDocument, arg.PlanID, arg.Content, arg.StructuredSteps)
 	var i PlanDocument
 	err := row.Scan(
 		&i.ID,
 		&i.PlanID,
 		&i.Content,
 		&i.CreatedAt,
+		&i.StructuredSteps,
 	)
 	return i, err
 }
 
 const getPlanDocumentByPlanID = `-- name: GetPlanDocumentByPlanID :one
-SELECT id, plan_id, content, created_at FROM plan_documents WHERE plan_id = $1
+SELECT id, plan_id, content, created_at, structured_steps FROM plan_documents WHERE plan_id = $1
 `
 
 func (q *Queries) GetPlanDocumentByPlanID(ctx context.Context, planID pgtype.UUID) (PlanDocument, error) {
@@ -62,6 +69,7 @@ func (q *Queries) GetPlanDocumentByPlanID(ctx context.Context, planID pgtype.UUI
 		&i.PlanID,
 		&i.Content,
 		&i.CreatedAt,
+		&i.StructuredSteps,
 	)
 	return i, err
 }

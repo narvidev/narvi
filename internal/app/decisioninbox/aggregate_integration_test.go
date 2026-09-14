@@ -12,6 +12,7 @@ package decisioninbox_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -544,6 +545,331 @@ func findItemByPR(items []decisioninbox.Item, number int) *decisioninbox.Item {
 		}
 	}
 	return nil
+}
+
+// TestBuild_ReviewSessionIDAndReleaseCut proves the two gaps closed on top
+// of TestBuild_FullScenario's own baseline: a PR-shaped row now carries a
+// real review-session id when (and ONLY when) Narvi has actually been
+// mentioned on that exact PR, never a session id belonging to a
+// DIFFERENT PR (github_pr_sessions_integration coverage already pins
+// this at the store layer; this proves the SAME property survives
+// Build's own wiring); and a release cut (a persisted §15.2 manifest
+// check) now renders as its own distinct row, classified needs_review
+// EVEN when every ordinary ready_to_merge criterion is also met.
+func TestBuild_ReviewSessionIDAndReleaseCut(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+
+	users := narvipg.NewUserStore(pool)
+	sessions := narvipg.NewSessionStore(pool)
+	identities := narvipg.NewIdentityStore(pool)
+	artifacts := narvipg.NewArtifactStore(pool)
+	githubPRSessions := narvipg.NewGitHubPRSessionStore(pool)
+	releaseManifestChecks := narvipg.NewReleaseManifestCheckStore(pool)
+
+	actor, err := users.Create(ctx, sqlcgen.CreateUserParams{PrimaryEmail: "review-session-actor@example.com", DisplayName: "Actor", Role: sqlcgen.UserRoleMember})
+	if err != nil {
+		t.Fatalf("create actor: %v", err)
+	}
+	const actorGitHubExternalID = "2001"
+	tokenKey := []byte("01234567890123456789012345678901") // exactly 32 bytes
+	encryptedToken, err := platform.EncryptToken(tokenKey, []byte("fake-gh-token"))
+	if err != nil {
+		t.Fatalf("encrypt token: %v", err)
+	}
+	if _, err := identities.Create(ctx, sqlcgen.CreateIdentityParams{
+		UserID: actor.ID, Provider: sqlcgen.IdentityProviderGithub, ExternalID: actorGitHubExternalID,
+		EmailVerified: true, LinkedVia: sqlcgen.IdentityLinkedViaAutoEmail, AccessTokenEncrypted: encryptedToken,
+	}); err != nil {
+		t.Fatalf("create identity: %v", err)
+	}
+
+	// claimReviewSession mirrors coalesce.go's own atomic
+	// EnsureRow+LockForUpdate+SetSessionID claim sequence -- the ONLY
+	// legitimate way a github_pr_sessions row is ever created in this
+	// codebase, reused here rather than a raw INSERT so this fixture
+	// stays faithful to the real write path.
+	claimReviewSession := func(t *testing.T, repoFullName string, prNumber int32) pgtype.UUID {
+		t.Helper()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin claim tx: %v", err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		txStore := githubPRSessions.WithTx(tx)
+		if err := txStore.EnsureRow(ctx, repoFullName, prNumber); err != nil {
+			t.Fatalf("EnsureRow: %v", err)
+		}
+		if _, err := txStore.LockForUpdate(ctx, repoFullName, prNumber); err != nil {
+			t.Fatalf("LockForUpdate: %v", err)
+		}
+		created, err := sessions.WithTx(tx).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub})
+		if err != nil {
+			t.Fatalf("create review session: %v", err)
+		}
+		if err := txStore.SetSessionID(ctx, repoFullName, prNumber, created.ID); err != nil {
+			t.Fatalf("SetSessionID: %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit claim tx: %v", err)
+		}
+		return created.ID
+	}
+
+	const repo = "acme/rockets"
+
+	// PR #30: mentioned (a real github_pr_sessions claim), NOT platform-
+	// authored, NOT a release cut -- the ordinary "open review" case.
+	session30 := claimReviewSession(t, repo, 30)
+
+	// PR #31: mentioned by a DIFFERENT claim than #30's -- exists purely
+	// to prove #30 and #31 never cross-resolve each other's session id.
+	session31 := claimReviewSession(t, repo, 31)
+	if session30 == session31 {
+		t.Fatalf("fixture bug: session30 and session31 are the same session (%+v)", session30)
+	}
+
+	// PR #32: never mentioned at all -- "open review" must stay external.
+
+	// PR #33: a release cut (§15) that ALSO meets every ordinary
+	// ready_to_merge criterion (platform-authored, low-risk, CI green,
+	// an auto-approved verdict on record) -- proves release-cut
+	// classification wins regardless.
+	platformSession33, err := sessions.Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub, CreatedBy: actor.ID})
+	if err != nil {
+		t.Fatalf("create platform session for PR #33: %v", err)
+	}
+	if _, err := artifacts.Create(ctx, sqlcgen.CreateArtifactParams{
+		SessionID: platformSession33.ID, Type: sqlcgen.ArtifactTypePr, Url: "https://github.com/acme/rockets/pull/33", Metadata: []byte("{}"),
+	}); err != nil {
+		t.Fatalf("create pr artifact for PR #33: %v", err)
+	}
+	seedAutoApprovedVerdict(ctx, t, pool, repo, 33, "sha33")
+	session33 := claimReviewSession(t, repo, 33)
+	findingsJSON33, err := json.Marshal([]map[string]any{
+		{"kind": "admin_override", "prNumber": 100, "prTitle": "hotfix", "detail": "merged via admin override"},
+		{"kind": "red_at_merge", "prNumber": 101, "prTitle": "flaky", "detail": "CI was red at merge sha"},
+	})
+	if err != nil {
+		t.Fatalf("marshal findings fixture: %v", err)
+	}
+	if _, err := releaseManifestChecks.Insert(ctx, sqlcgen.InsertReleaseManifestCheckParams{
+		SessionID: session33, RepoFullName: repo, PrNumber: 33, BaseRef: "main", HeadRef: "release/2026.09.01",
+		ConstituentPrCount: 2, CoveragePartial: false, AggregateReviewTriggered: true,
+		AggregateReviewTriggerReasons: []byte(`["3+ constituent PRs touch overlapping paths"]`),
+		Findings:                      findingsJSON33,
+		MergedPrs:                     []byte(`[]`),
+	}); err != nil {
+		t.Fatalf("insert release manifest check for PR #33: %v", err)
+	}
+
+	// PR #34: the SAME ready-to-merge-eligible shape as #33, but NEVER
+	// checked as a release cut -- the contrasting control: proves this
+	// fixture's own #33 result is due to the release-cut signal
+	// specifically, not some other unaccounted-for difference.
+	platformSession34, err := sessions.Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub, CreatedBy: actor.ID})
+	if err != nil {
+		t.Fatalf("create platform session for PR #34: %v", err)
+	}
+	if _, err := artifacts.Create(ctx, sqlcgen.CreateArtifactParams{
+		SessionID: platformSession34.ID, Type: sqlcgen.ArtifactTypePr, Url: "https://github.com/acme/rockets/pull/34", Metadata: []byte("{}"),
+	}); err != nil {
+		t.Fatalf("create pr artifact for PR #34: %v", err)
+	}
+	seedAutoApprovedVerdict(ctx, t, pool, repo, 34, "sha34")
+
+	// PR #35: a release cut whose constituent-PR listing was TRUNCATED
+	// (coverage_partial), with ZERO mechanical findings -- the confident-
+	// zero case. Its findings count is honestly 0, but 0 over an
+	// incomplete set is not the same claim as 0 over a complete one, and
+	// nothing downstream may render the two identically.
+	platformSession35, err := sessions.Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub, CreatedBy: actor.ID})
+	if err != nil {
+		t.Fatalf("create platform session for PR #35: %v", err)
+	}
+	if _, err := artifacts.Create(ctx, sqlcgen.CreateArtifactParams{
+		SessionID: platformSession35.ID, Type: sqlcgen.ArtifactTypePr, Url: "https://github.com/acme/rockets/pull/35", Metadata: []byte("{}"),
+	}); err != nil {
+		t.Fatalf("create pr artifact for PR #35: %v", err)
+	}
+	session35 := claimReviewSession(t, repo, 35)
+	if _, err := releaseManifestChecks.Insert(ctx, sqlcgen.InsertReleaseManifestCheckParams{
+		SessionID: session35, RepoFullName: repo, PrNumber: 35, BaseRef: "main", HeadRef: "release/2026.09.02",
+		ConstituentPrCount: 250, CoveragePartial: true, AggregateReviewTriggered: false,
+		AggregateReviewTriggerReasons: []byte(`[]`),
+		Findings:                      []byte(`[]`),
+		MergedPrs:                     []byte(`[]`),
+	}); err != nil {
+		t.Fatalf("insert release manifest check for PR #35: %v", err)
+	}
+
+	// PR #36: a release cut whose persisted findings blob is CORRUPT --
+	// valid jsonb, but an object where the reader expects an array, so
+	// json.Unmarshal into []json.RawMessage fails. coverage_partial is
+	// deliberately false on this row: the truncation flag is NOT what
+	// makes this one partial. A count that could not be decoded is not a
+	// count of zero, and the row must not read as a clean release just
+	// because the decode failure happened to be logged rather than
+	// surfaced.
+	platformSession36, err := sessions.Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub, CreatedBy: actor.ID})
+	if err != nil {
+		t.Fatalf("create platform session for PR #36: %v", err)
+	}
+	if _, err := artifacts.Create(ctx, sqlcgen.CreateArtifactParams{
+		SessionID: platformSession36.ID, Type: sqlcgen.ArtifactTypePr, Url: "https://github.com/acme/rockets/pull/36", Metadata: []byte("{}"),
+	}); err != nil {
+		t.Fatalf("create pr artifact for PR #36: %v", err)
+	}
+	session36 := claimReviewSession(t, repo, 36)
+	if _, err := releaseManifestChecks.Insert(ctx, sqlcgen.InsertReleaseManifestCheckParams{
+		SessionID: session36, RepoFullName: repo, PrNumber: 36, BaseRef: "main", HeadRef: "release/2026.09.03",
+		ConstituentPrCount: 4, CoveragePartial: false, AggregateReviewTriggered: false,
+		AggregateReviewTriggerReasons: []byte(`[]`),
+		Findings:                      []byte(`{"not":"an array"}`),
+		MergedPrs:                     []byte(`[]`),
+	}); err != nil {
+		t.Fatalf("insert release manifest check for PR #36: %v", err)
+	}
+
+	fakeSCM := &fakeDecisionInboxSourceControl{
+		openPRsByExternalID: map[string][]ports.OpenPR{
+			actorGitHubExternalID: {
+				{Owner: "acme", Repo: "rockets", Number: 30, Title: "PR 30", HTMLURL: "https://github.com/acme/rockets/pull/30", HeadSHA: "sha30",
+					Assignees: []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}}, CIConclusion: ports.CIConclusionSuccess, CreatedAt: time.Now()},
+				{Owner: "acme", Repo: "rockets", Number: 31, Title: "PR 31", HTMLURL: "https://github.com/acme/rockets/pull/31", HeadSHA: "sha31",
+					Assignees: []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}}, CIConclusion: ports.CIConclusionSuccess, CreatedAt: time.Now()},
+				{Owner: "acme", Repo: "rockets", Number: 32, Title: "PR 32", HTMLURL: "https://github.com/acme/rockets/pull/32", HeadSHA: "sha32",
+					Assignees: []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}}, CIConclusion: ports.CIConclusionSuccess, CreatedAt: time.Now()},
+				{Owner: "acme", Repo: "rockets", Number: 33, Title: "release/2026.09.01 -- 2 PRs", HTMLURL: "https://github.com/acme/rockets/pull/33", HeadSHA: "sha33",
+					Assignees: []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}}, CIConclusion: ports.CIConclusionSuccess, Labels: []string{"review:low-risk"}, CreatedAt: time.Now()},
+				{Owner: "acme", Repo: "rockets", Number: 34, Title: "PR 34", HTMLURL: "https://github.com/acme/rockets/pull/34", HeadSHA: "sha34",
+					Assignees: []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}}, CIConclusion: ports.CIConclusionSuccess, Labels: []string{"review:low-risk"}, CreatedAt: time.Now()},
+				{Owner: "acme", Repo: "rockets", Number: 35, Title: "release/2026.09.02 -- truncated scan", HTMLURL: "https://github.com/acme/rockets/pull/35", HeadSHA: "sha35",
+					Assignees: []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}}, CIConclusion: ports.CIConclusionSuccess, Labels: []string{"review:low-risk"}, CreatedAt: time.Now()},
+				{Owner: "acme", Repo: "rockets", Number: 36, Title: "release/2026.09.03 -- corrupt findings blob", HTMLURL: "https://github.com/acme/rockets/pull/36", HeadSHA: "sha36",
+					Assignees: []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}}, CIConclusion: ports.CIConclusionSuccess, Labels: []string{"review:low-risk"}, CreatedAt: time.Now()},
+			},
+		},
+	}
+	scmCache := decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts())
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: sessions, Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: artifacts, Identities: identities, GitHubPRSessions: githubPRSessions, ReleaseManifestChecks: releaseManifestChecks,
+		SCMCache: scmCache, TokenEncryptionKey: tokenKey, Timeouts: platform.DefaultTimeouts(),
+		ReviewVerdict: appreviewverdict.Deps{ReviewVerdicts: narvipg.NewReviewVerdictStore(pool), RepoSettings: narvipg.NewRepoSettingsStore(pool), ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool), Timeouts: platform.DefaultTimeouts()},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+
+	pr30 := findItemByPR(result.Items, 30)
+	if pr30 == nil {
+		t.Fatal("PR #30 missing from the inbox entirely")
+	}
+	if pr30.SessionID != session30.String() {
+		t.Errorf("PR #30 SessionID = %q, want %q (its own claimed session)", pr30.SessionID, session30.String())
+	}
+	if pr30.SessionID == session31.String() {
+		t.Fatalf("PR #30 SessionID equals PR #31's own session -- cross-contamination")
+	}
+
+	pr31 := findItemByPR(result.Items, 31)
+	if pr31 == nil {
+		t.Fatal("PR #31 missing from the inbox entirely")
+	}
+	if pr31.SessionID != session31.String() {
+		t.Errorf("PR #31 SessionID = %q, want %q (its own claimed session)", pr31.SessionID, session31.String())
+	}
+	if pr31.SessionID == session30.String() {
+		t.Fatalf("PR #31 SessionID equals PR #30's own session -- cross-contamination")
+	}
+
+	pr32 := findItemByPR(result.Items, 32)
+	if pr32 == nil {
+		t.Fatal("PR #32 missing from the inbox entirely")
+	}
+	if pr32.SessionID != "" {
+		t.Errorf("PR #32 (never mentioned) SessionID = %q, want empty", pr32.SessionID)
+	}
+
+	pr33 := findItemByPR(result.Items, 33)
+	if pr33 == nil {
+		t.Fatal("PR #33 missing from the inbox entirely")
+	}
+	if !pr33.IsRelease {
+		t.Error("PR #33 IsRelease = false, want true (a persisted release manifest check exists)")
+	}
+	if pr33.Kind != decisioninboxdomain.KindNeedsReview {
+		t.Errorf("PR #33 Kind = %s, want needs_review -- a release cut must never classify ready_to_merge even though every ordinary criterion (platform-authored/low-risk/CI-green/auto-approved-verdict) is met", pr33.Kind)
+	}
+	if pr33.ManifestFindingsCount != 2 {
+		t.Errorf("PR #33 ManifestFindingsCount = %d, want 2", pr33.ManifestFindingsCount)
+	}
+	if !pr33.AggregateReviewTriggered {
+		t.Error("PR #33 AggregateReviewTriggered = false, want true")
+	}
+	if pr33.SessionID != session33.String() {
+		t.Errorf("PR #33 SessionID = %q, want %q (the review session that produced its own manifest check)", pr33.SessionID, session33.String())
+	}
+	if pr33.ManifestCoveragePartial {
+		t.Error("PR #33 ManifestCoveragePartial = true, want false -- its persisted check recorded coverage_partial=false, and a complete scan must not be flagged as partial or the flag means nothing")
+	}
+
+	pr34 := findItemByPR(result.Items, 34)
+	if pr34 == nil {
+		t.Fatal("PR #34 missing from the inbox entirely")
+	}
+	if pr34.IsRelease {
+		t.Error("PR #34 IsRelease = true, want false -- no release manifest check was ever persisted for it")
+	}
+	if pr34.Kind != decisioninboxdomain.KindReadyToMerge {
+		t.Errorf("PR #34 Kind = %s, want ready_to_merge -- the SAME ready-to-merge-eligible shape as PR #33, minus the release-cut signal, must still classify normally", pr34.Kind)
+	}
+
+	pr35 := findItemByPR(result.Items, 35)
+	if pr35 == nil {
+		t.Fatal("PR #35 missing from the inbox entirely")
+	}
+	if !pr35.IsRelease {
+		t.Error("PR #35 IsRelease = false, want true (a persisted release manifest check exists)")
+	}
+	if pr35.ManifestFindingsCount != 0 {
+		t.Errorf("PR #35 ManifestFindingsCount = %d, want 0 -- its persisted findings blob is empty", pr35.ManifestFindingsCount)
+	}
+	// The point of this row: a zero findings count over a TRUNCATED
+	// constituent listing must arrive carrying the truncation, or the
+	// inbox becomes the one consumer of this persisted row that reads a
+	// partial scan as a clean audit -- the posted manifest comment
+	// (reviewpost.RenderManifestComment) and the release-review readout
+	// (httpapi's `coveragePartial`) both already refuse to.
+	if !pr35.ManifestCoveragePartial {
+		t.Error("PR #35 ManifestCoveragePartial = false, want true -- its persisted check recorded coverage_partial=true, so its zero findings count is a lower bound over an incomplete set, not a clean release")
+	}
+
+	pr36 := findItemByPR(result.Items, 36)
+	if pr36 == nil {
+		t.Fatal("PR #36 missing from the inbox entirely")
+	}
+	if !pr36.IsRelease {
+		t.Error("PR #36 IsRelease = false, want true -- the check row exists, so this PR unambiguously IS a release cut however corrupt its findings blob is")
+	}
+	if pr36.ManifestFindingsCount != 0 {
+		t.Errorf("PR #36 ManifestFindingsCount = %d, want 0 -- an undecodable blob yields no countable findings", pr36.ManifestFindingsCount)
+	}
+	// The distinct point of this row, and the reason it carries
+	// coverage_partial=false: the forced flag must come from the DECODE
+	// FAILURE itself, not from the truncation column. Without this, a
+	// corrupt row renders exactly like a clean release cut with zero
+	// findings, and the only trace is a log line nobody reading the inbox
+	// will ever see.
+	if !pr36.ManifestCoveragePartial {
+		t.Error("PR #36 ManifestCoveragePartial = false, want true -- its findings blob could not be decoded at all, and a count that could not be read is not a count of zero (its coverage_partial column is false, so this must come from the decode failure)")
+	}
 }
 
 // TestBuild_NoLinkedGitHubIdentity proves an actor with no linked GitHub

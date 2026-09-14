@@ -173,7 +173,13 @@ func TestHandlePrompt_RunsFullSubstitutionChainInOrder(t *testing.T) {
 		"POST " + review.VerdictToolURLPlaceholder + "\nAuthorization: Bearer " + review.VerdictToolBearerPlaceholder + "\nX-Sandbox-Gen: " + review.VerdictToolGenPlaceholder + "\n\n" +
 		"curl -H \"Authorization: Bearer " + domainupload.BearerPlaceholder + "\" -H \"X-Sandbox-Gen: " + domainupload.GenPlaceholder + "\" " + domainupload.BaseURLPlaceholder + "/sessions/test-session/uploads/u1/content\n\n" +
 		"POST " + turn.EpistemicOutcomeToolURLPlaceholder + "\nAuthorization: Bearer " + turn.EpistemicOutcomeToolBearerPlaceholder + "\nX-Sandbox-Gen: " + turn.EpistemicOutcomeToolGenPlaceholder + "\n\n" +
-		"GET " + review.ReviewCostBudgetToolURLPlaceholder + "?ceilingUsd=5.00"
+		"GET " + review.ReviewCostBudgetToolURLPlaceholder + "?ceilingUsd=5.00\n\n" +
+		// Test-integrity fix: the composition-findings-posting tool
+		// (§15.3) is HandlePrompt's own FIFTH placeholder-substitution
+		// call (renderCompositionFindingsToolPromptText, main.go) -- this
+		// exact family was entirely absent from this flagship test, so
+		// deleting that fifth call from HandlePrompt left this test green.
+		"POST " + review.CompositionFindingsToolURLPlaceholder + "\nAuthorization: Bearer " + review.CompositionFindingsToolBearerPlaceholder + "\nX-Sandbox-Gen: " + review.CompositionFindingsToolGenPlaceholder
 
 	cmd := sandboxws.Prompt{Type: "prompt", MessageId: "m1", SessionId: "test-session", Gen: liveGen, Text: hostileText}
 
@@ -187,23 +193,33 @@ func TestHandlePrompt_RunsFullSubstitutionChainInOrder(t *testing.T) {
 		t.Fatal("fakeOpenCodeServer captured no prompt_async request at all -- HandlePrompt never reached StartTurn")
 	}
 
-	// Every placeholder token, from all four families, must be gone --
-	// proving all four render*ToolPromptText calls genuinely ran.
+	// Every placeholder token, from all five families, must be gone --
+	// proving all five render*ToolPromptText calls genuinely ran.
 	for _, tok := range []string{
 		review.VerdictToolURLPlaceholder, review.VerdictToolBearerPlaceholder, review.VerdictToolGenPlaceholder,
 		domainupload.BaseURLPlaceholder, domainupload.BearerPlaceholder, domainupload.GenPlaceholder,
 		turn.EpistemicOutcomeToolURLPlaceholder, turn.EpistemicOutcomeToolBearerPlaceholder, turn.EpistemicOutcomeToolGenPlaceholder,
 		review.ReviewCostBudgetToolURLPlaceholder,
+		review.CompositionFindingsToolURLPlaceholder, review.CompositionFindingsToolBearerPlaceholder, review.CompositionFindingsToolGenPlaceholder,
 	} {
 		if strings.Contains(got, tok) {
 			t.Errorf("captured prompt_async text still contains unresolved placeholder %q\ngot: %q", tok, got)
 		}
 	}
-	// The live bearer/gen must appear -- once per family (3 occurrences of
-	// the bearer, one per Authorization header above) -- proving
-	// resolution used the REAL h.cfg.SessionConfig, not a stub.
-	if n := strings.Count(got, liveBearer); n != 3 {
-		t.Errorf("captured prompt_async text contains the live bearer %d times, want 3 (one per placeholder family)\ngot: %q", n, got)
+	// The live bearer/gen must appear -- once per family that carries an
+	// Authorization header (4 of the 5: verdict, upload, epistemic,
+	// composition-findings -- review-cost-budget carries no bearer of its
+	// own, a plain unauthenticated loopback GET) -- proving resolution
+	// used the REAL h.cfg.SessionConfig, not a stub.
+	if n := strings.Count(got, liveBearer); n != 4 {
+		t.Errorf("captured prompt_async text contains the live bearer %d times, want 4 (one per bearer-carrying placeholder family)\ngot: %q", n, got)
+	}
+	// The composition-findings tool's own POST line must resolve to a
+	// real, derived URL naming this session's own release-manifest/
+	// composition-findings path -- proving compositionFindingsToolURL
+	// actually ran, not merely that the bearer/gen tokens vanished.
+	if !strings.Contains(got, "POST http://127.0.0.1:9/sessions/test-session/release-manifest/composition-findings") {
+		t.Errorf("captured prompt_async text does not contain the resolved composition-findings-tool POST line\ngot: %q", got)
 	}
 	// (§26.7/§26.9): the review-cost-budget URL must resolve to
 	// h.reviewCostBudgetURL specifically -- proving HandlePrompt threads

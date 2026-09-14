@@ -44,21 +44,72 @@
 // reached through the composer's own structured request instead of a
 // parsed chat reply.
 //
+// # Structured plans, and the honest fallback for one that isn't (§12.2
+// item 3's own missing piece, closed here)
+//
+// plan.content is ALWAYS present -- the producing turn's own rendered
+// prose, exactly as before this Step. plan.structured is the SAME content
+// string's own machine-recovered structure (internal/domain/plan.
+// ExtractStructured), present only when the model emitted a valid
+// ```plan-steps block; null otherwise. Null covers three cases
+// identically and deliberately (Plan's own schema doc comment,
+// contracts/rest/v1/dtos.schema.json): every plan that predates this
+// field, a plan-mode turn whose model never attempted the block, and one
+// that attempted and failed validation -- none of these is a "confident
+// empty plan", so PlanCard below never renders an empty numbered list for
+// any of them. It renders EXACTLY plan.content, in prose, precisely as
+// this view always has -- structured rendering is additive, never a
+// replacement path that could silently swallow a plan that has real
+// content but no recoverable structure.
+//
+// # plan.content is the authoritative document -- every channel shows it
+//
+// PlanCard renders plan.content's own prose UNCONDITIONALLY, whether or not
+// plan.structured is present. This was not always true: an earlier version
+// rendered EITHER the structured list OR the prose, never both, which meant
+// a web approver reading only the structured summary could be deciding on a
+// materially different document than the SAME plan's Slack/Linear approver
+// -- who only ever receives plan.content, stripped of its machine block
+// (internal/app/sessionactor/outboxenqueue.go's own two call sites; neither
+// Slack nor Linear has ever rendered plan.structured, and nothing here adds
+// that). Two people approving the "same" plan through different channels
+// seeing different text is exactly the failure mode a cross-channel
+// approval system (§13.3, "first verdict wins") cannot tolerate: a plan is
+// approved or it isn't, regardless of which surface approved it, so every
+// surface must be deciding on the same words.
+//
+// content is what was made authoritative, deliberately, not structured:
+// content is the model's own reply, unedited, and structured is a STRICT
+// SUBSET of what it can express (a title, a description, fileRefs, one
+// scope-estimate string -- no room for caveats, alternatives considered, or
+// open questions the model's prose might raise). structured can never carry
+// MORE information than content; it can only carry less. Picking content as
+// the thing every channel shows is therefore the choice that can never
+// hide something a human needed to see. StructuredPlanSteps above the prose
+// is a readability affordance on top of that authoritative text, not a
+// replacement for it -- exactly the same "additive, never a replacement"
+// rule this file's own preceding section already establishes for WHETHER
+// structure exists at all, now applied to whether it's shown.
+//
 // # Every third-party-authored string here is plain text
 //
-// plan.content (the plan document's own text -- model-authored, verbatim,
-// per Plan's own schema doc comment: "no structured plan schema anywhere
-// in this codebase... render as plain text only, never markdown-parsed")
-// and the revise feedback textarea's own value (human-authored, echoed
-// back nowhere in THIS view but sent to the server as a turn prompt, the
-// exact same trust level as anything else typed into the composer) are
-// the two attacker-reachable field families. Both render as plain React
-// text content only -- see the local T component below (identical
-// truncateForDisplay + JSX-text-interpolation shape CodeReviewView.tsx/
-// ReleaseReviewView.tsx already establish) -- never dangerouslySetInnerHTML,
-// never markdown/ANSI-parsed. This view constructs no href from plan
-// content at all, so urlSafety.ts has nothing to guard here (unlike
-// SessionRail.tsx's artifact links or CodeReviewView's PR link).
+// plan.content, plan.structured's own step title/description/fileRefs
+// entries and scopeEstimate (all model-authored, verbatim -- see Plan's
+// own schema doc comment), and the revise feedback textarea's own value
+// (human-authored, echoed back nowhere in THIS view but sent to the server
+// as a turn prompt, the exact same trust level as anything else typed into
+// the composer) are the attacker-reachable field families. All render as
+// plain React text content only -- see the local T component below
+// (identical truncateForDisplay + JSX-text-interpolation shape
+// CodeReviewView.tsx/ReleaseReviewView.tsx already establish) -- never
+// dangerouslySetInnerHTML, never markdown/ANSI-parsed. A step's own
+// fileRefs are rendered as inert `<code>` text only, NEVER as a clickable
+// or navigable link: this view constructs no href from any plan-authored
+// string at all (content, a step's title/description, or a file path), so
+// urlSafety.ts has nothing to guard here (unlike SessionRail.tsx's
+// artifact links or CodeReviewView's PR link) and a hostile fileRefs entry
+// (e.g. a path crafted to look like it escapes the repository, or one
+// containing a `javascript:`-scheme string) can never become navigation.
 import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
@@ -69,7 +120,7 @@ import { approvePlan, createTurn, getSession, listPlans, rejectPlan } from '../a
 import { ApiError } from '../api/http'
 import { planQueryKeys, sessionListQueryKeys, sessionQueryKeys } from '../api/queryKeys'
 import { meQueryOptions } from '../auth/session'
-import { canActOnPlan, latestPlan, modelLabel, planStatusLabel, planStatusTone } from './planFormat'
+import { canActOnPlan, latestPlan, modelLabel, planStatusLabel, planStatusTone, stripStructureBlock } from './planFormat'
 import { truncateForDisplay } from './textSafety'
 
 const MAX_CONTENT_CHARS = 8000
@@ -78,7 +129,36 @@ function T({ text }: { text: string }) {
   return <>{truncateForDisplay(text, MAX_CONTENT_CHARS)}</>
 }
 
-/** PlanCard renders one plan version's own content -- exported for direct render-safety testing (mirrors CodeReviewView.tsx's own DigestSections/FindingCard precedent): a hostile plan.content (markup, a `javascript:` URL as plain text, an XSS payload) must render as plain text only, never as markup or a link -- see this file's own top doc comment. */
+/** StructuredPlanSteps renders plan.structured's own numbered steps (docs/design/mockups.html's own `.planlist` shape, decision 15) -- exported alongside PlanCard for the identical render-safety testing this file's own top comment describes: every string here (title, description, each fileRefs entry) is model-authored and renders as plain text only, and no fileRefs entry is ever turned into an href. */
+export function StructuredPlanSteps({ structured }: { structured: NonNullable<Plan['structured']> }) {
+  return (
+    <ol className="planlist">
+      {structured.steps.map((step, i) => (
+        <li key={i}>
+          <div>
+            <b>
+              <T text={step.title} />
+            </b>
+            <p>
+              <T text={step.description} />
+            </p>
+            {step.fileRefs.length > 0 && (
+              <p>
+                {step.fileRefs.map((ref, j) => (
+                  <code key={j}>
+                    <T text={ref} />
+                  </code>
+                ))}
+              </p>
+            )}
+          </div>
+        </li>
+      ))}
+    </ol>
+  )
+}
+
+/** PlanCard renders one plan version: plan.content's own prose ALWAYS (stripped of its machine block), preceded by a structured numbered-list summary when plan.structured is present (see this file's own top comment, "plan.content is the authoritative document", for why prose is never hidden just because a summary exists). Exported for direct render-safety testing (mirrors CodeReviewView.tsx's own DigestSections/FindingCard precedent): a hostile plan.content or a hostile structured field (markup, a `javascript:` URL as plain text, an XSS payload) must render as plain text only, never as markup or a link -- see this file's own top doc comment. */
 export function PlanCard({ plan }: { plan: Plan }) {
   return (
     <div className="card">
@@ -87,11 +167,15 @@ export function PlanCard({ plan }: { plan: Plan }) {
         <b>Plan</b>
         <time>{new Date(plan.createdAt).toLocaleString()}</time>
       </div>
-      <p className="plan-content">
-        <T text={plan.content} />
-      </p>
+      {plan.structured && <StructuredPlanSteps structured={plan.structured} />}
+      <p className="plan-content"><T text={stripStructureBlock(plan.content)} /></p>
       <div className="verdict-foot">
-        <span>
+        {plan.structured && (
+          <span>
+            estimated scope: <T text={plan.structured.scopeEstimate} />
+          </span>
+        )}
+        <span style={plan.structured ? { marginLeft: 'auto' } : undefined}>
           plan persisted · v{plan.version}
           {plan.decidedAt ? ` · decided ${new Date(plan.decidedAt).toLocaleString()}` : ''}
         </span>

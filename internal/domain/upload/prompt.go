@@ -80,6 +80,10 @@ const (
 	epistemicOutcomeToolGenPlaceholderLiteral    = "{{EPISTEMIC_OUTCOME_TOOL_GEN}}"
 
 	reviewCostBudgetToolURLPlaceholderLiteral = "{{REVIEW_COST_BUDGET_TOOL_URL}}"
+
+	releaseCompositionFindingsToolURLPlaceholderLiteral    = "{{RELEASE_COMPOSITION_FINDINGS_TOOL_URL}}"
+	releaseCompositionFindingsToolBearerPlaceholderLiteral = "{{RELEASE_COMPOSITION_FINDINGS_TOOL_BEARER}}"
+	releaseCompositionFindingsToolGenPlaceholderLiteral    = "{{RELEASE_COMPOSITION_FINDINGS_TOOL_GEN}}"
 )
 
 // placeholderTokens lists every literal placeholder token this whole
@@ -90,9 +94,10 @@ const (
 // epistemicoutcometoolprompt.go/reviewcostbudgetprompt.go): this package's
 // own three (BaseURLPlaceholder/BearerPlaceholder/GenPlaceholder), review's
 // own four (VerdictToolURLPlaceholder/BearerPlaceholder/GenPlaceholder,
-// plus ReviewCostBudgetToolURLPlaceholder), plus turn's own three (all
-// immediately above). sanitizeUntrustedField (below) destroys every exact
-// occurrence of all ten before any untrusted value is interpolated into
+// plus ReviewCostBudgetToolURLPlaceholder), review's own three more for
+// the release composition-findings tool (§15.3), plus turn's own three
+// (all immediately above). sanitizeUntrustedField (below) destroys every
+// exact occurrence of all thirteen before any untrusted value is interpolated into
 // rendered output, so a poisoned Filename/ContentType can never survive to
 // that later substitution step -- see that function's own doc comment for
 // the full attack this closes.
@@ -107,6 +112,9 @@ var placeholderTokens = []string{
 	epistemicOutcomeToolBearerPlaceholderLiteral,
 	epistemicOutcomeToolGenPlaceholderLiteral,
 	reviewCostBudgetToolURLPlaceholderLiteral,
+	releaseCompositionFindingsToolURLPlaceholderLiteral,
+	releaseCompositionFindingsToolBearerPlaceholderLiteral,
+	releaseCompositionFindingsToolGenPlaceholderLiteral,
 }
 
 // BaseURLPlaceholder, BearerPlaceholder, and GenPlaceholder are the fixed

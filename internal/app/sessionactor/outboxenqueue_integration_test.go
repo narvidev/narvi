@@ -5,6 +5,7 @@ package sessionactor
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -494,5 +495,163 @@ func TestCompleteProcessingTurn_WebOrigin_EnqueuesNoOutboxRow(t *testing.T) {
 
 	if n := countOutboxRowsForSession(ctx, t, pool, sessionID); n != 0 {
 		t.Errorf("outbox row count for web-origin session = %d, want 0", n)
+	}
+}
+
+// planStepsBlockContent is a well-formed plan-mode turn's own streamed text:
+// real prose, followed by exactly one valid ```plan-steps fenced block --
+// the SAME shape RenderStructureInstruction (internal/domain/plan) asks a
+// plan-mode model to emit. Shared by the two tests below, which exist to
+// close a real fixture gap (this Step's own review): both
+// enqueueOutboxNotification call sites that invoke plandomain.
+// StripStructureBlock -- the Slack branch (this file's own PlanApprovalPayload
+// construction) and the Linear branch (planApprovalLinearText) -- were,
+// before these two tests, never exercised by ANY fixture anywhere in
+// sessionactor, outboxworker, slack or linear that actually contained a
+// ```plan-steps block. Deleting either StripStructureBlock call left every
+// existing test green; these two are what would catch that deletion.
+const planStepsBlockContent = "Here is my plan.\n\n1. Add a table.\n2. Wire it up.\n\n```plan-steps\n" +
+	`{"steps":[{"title":"Add table","description":"New migration.","fileRefs":["a.sql"]}],"scopeEstimate":"1 file"}` +
+	"\n```\n"
+
+// seedPlanStepsTokenEvent seeds one "token" event carrying
+// planStepsBlockContent as messageID's own cumulative text -- the exact
+// shape ToContentEvents (planapprovalcontent.go) decodes, mirroring this
+// file's own TestPlanContentText_LongEventHistory... precedent
+// (planapprovalcontent_integration_test.go) for building a token payload.
+func seedPlanStepsTokenEvent(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID, messageID string) {
+	t.Helper()
+	tokenPayload, err := json.Marshal(struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}{Type: "token", Text: planStepsBlockContent})
+	if err != nil {
+		t.Fatalf("marshal token payload: %v", err)
+	}
+	if _, err := narvipg.NewEventStore(pool).Create(ctx, sqlcgen.CreateEventParams{
+		SessionID: sessionID,
+		Type:      "token",
+		MessageID: messageID,
+		Payload:   tokenPayload,
+	}); err != nil {
+		t.Fatalf("seed plan-steps token event: %v", err)
+	}
+}
+
+// TestCompleteProcessingTurn_SlackOrigin_PlanApproval_StripsStructureBlockFromText
+// closes the fixture gap this Step's own review found: a plan-mode turn's
+// own content that genuinely carries a ```plan-steps block, run through the
+// REAL completion pipeline, must reach the Slack plan-approval payload's own
+// Text field with that block already removed -- never the raw JSON a human
+// reading the Slack message was never supposed to see (structured.go's own
+// StripStructureBlock doc comment).
+func TestCompleteProcessingTurn_SlackOrigin_PlanApproval_StripsStructureBlockFromText(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+
+	sessionID := createTestSessionWithSpawnSource(ctx, t, pool, sqlcgen.SessionSpawnSourceSlack)
+	if _, err := narvipg.NewSandboxStore(pool).Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+	if _, ok, err := narvipg.NewSlackThreadSessionStore(pool).Claim(ctx, "C123", "1700000000.000100", sessionID); err != nil || !ok {
+		t.Fatalf("claim slack thread session: ok=%v err=%v", ok, err)
+	}
+
+	turnStore := narvipg.NewTurnStore(pool)
+	createProcessingTurnWithPlanMode(ctx, t, turnStore, sessionID, true, nil)
+	seedPlanStepsTokenEvent(ctx, t, pool, sessionID, "slack-plan-steps-msg")
+
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "execution_complete",
+		Gen:  1,
+		Raw:  executionCompleteRaw(t, sessionID.String(), 1, sandboxws.ExecutionCompleteOutcomeCompleted),
+	})
+
+	row := getSoleOutboxRowForSession(ctx, t, pool, sessionID)
+	if row.Kind != "slack_plan_approval" {
+		t.Fatalf("Kind = %q, want %q", row.Kind, "slack_plan_approval")
+	}
+
+	var payload slackapi.PlanApprovalPayload
+	if err := json.Unmarshal(row.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload as slackapi.PlanApprovalPayload: %v", err)
+	}
+	if strings.Contains(payload.Text, "plan-steps") || strings.Contains(payload.Text, "scopeEstimate") {
+		t.Errorf("Text = %q, want the ```plan-steps block stripped -- a human reading Slack must never see the raw machine block", payload.Text)
+	}
+	if !strings.Contains(payload.Text, "Here is my plan.") {
+		t.Errorf("Text = %q, want the surrounding prose preserved", payload.Text)
+	}
+}
+
+// TestCompleteProcessingTurn_LinearOrigin_PlanApproval_StripsStructureBlockFromText
+// is the Linear twin of the Slack test above -- the SAME fixture gap, closed
+// for outboxenqueue.go's OTHER StripStructureBlock call site
+// (planApprovalLinearText).
+func TestCompleteProcessingTurn_LinearOrigin_PlanApproval_StripsStructureBlockFromText(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+
+	sessionID := createTestSessionWithSpawnSource(ctx, t, pool, sqlcgen.SessionSpawnSourceLinear)
+	if _, err := narvipg.NewSandboxStore(pool).Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+	agentSessions := narvipg.NewLinearAgentSessionStore(pool)
+	if _, err := agentSessions.Claim(ctx, "agent-session-plan", "org-plan"); err != nil {
+		t.Fatalf("claim linear agent session: %v", err)
+	}
+	if err := agentSessions.SetSessionID(ctx, "agent-session-plan", sessionID); err != nil {
+		t.Fatalf("set linear agent session id: %v", err)
+	}
+
+	turnStore := narvipg.NewTurnStore(pool)
+	createProcessingTurnWithPlanMode(ctx, t, turnStore, sessionID, true, nil)
+	seedPlanStepsTokenEvent(ctx, t, pool, sessionID, "linear-plan-steps-msg")
+
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "execution_complete",
+		Gen:  1,
+		Raw:  executionCompleteRaw(t, sessionID.String(), 1, sandboxws.ExecutionCompleteOutcomeCompleted),
+	})
+
+	row := getSoleOutboxRowForSession(ctx, t, pool, sessionID)
+	if row.Kind != string(ports.NotificationKindLinear) {
+		t.Fatalf("Kind = %q, want %q", row.Kind, ports.NotificationKindLinear)
+	}
+
+	var payload linearapi.Payload
+	if err := json.Unmarshal(row.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload as linearapi.Payload: %v", err)
+	}
+	if strings.Contains(payload.Text, "plan-steps") || strings.Contains(payload.Text, "scopeEstimate") {
+		t.Errorf("Text = %q, want the ```plan-steps block stripped -- a human reading Linear must never see the raw machine block", payload.Text)
+	}
+	if !strings.Contains(payload.Text, "Here is my plan.") {
+		t.Errorf("Text = %q, want the surrounding prose preserved", payload.Text)
+	}
+	if !strings.Contains(payload.Text, "Plan v1 is ready for review") {
+		t.Errorf("Text = %q, want the planApprovalLinearText wrapper", payload.Text)
 	}
 }

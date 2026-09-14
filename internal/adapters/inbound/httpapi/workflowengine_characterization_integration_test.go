@@ -52,6 +52,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 )
 
 // referenceSandboxRow is the SAME fixed, fake sandbox row every comparison
@@ -294,8 +295,17 @@ func TestCharacterization_PlanLane_FirstTurn_ZeroConfig_IdenticalPromptJSON(t *t
 		t.Fatal("created.PlanMode = false, want true")
 	}
 
-	if created.Prompt == nil || *created.Prompt != inputPrompt {
-		t.Errorf("created.Prompt = %v, want %q (byte-for-byte unchanged)", created.Prompt, inputPrompt)
+	// §12.2 item 3's own structured-plan-document instruction is
+	// unconditionally prepended onto every plan_mode=true turn's prompt
+	// (plandomain.MaybeInjectStructureInstruction), regardless of workflow
+	// engine wiring -- this is that same, unrelated concern, not something
+	// the engine's own zero-config resolution added, so it belongs in BOTH
+	// wantPrompt here and oldTurn's own reference Prompt below, keeping
+	// this test's real subject (the engine's OWN identity-transform
+	// property) isolated from it.
+	wantPrompt := plandomain.MaybeInjectStructureInstruction(true, inputPrompt)
+	if created.Prompt == nil || *created.Prompt != wantPrompt {
+		t.Errorf("created.Prompt = %v, want %q (byte-for-byte unchanged but for the unrelated structured-plan instruction)", created.Prompt, wantPrompt)
 	}
 	if created.ModelID != nil {
 		t.Errorf("created.ModelID = %v, want nil (built-in plan step 1's own ModelID is nil -- inherit, no override)", created.ModelID)
@@ -308,7 +318,7 @@ func TestCharacterization_PlanLane_FirstTurn_ZeroConfig_IdenticalPromptJSON(t *t
 		t.Fatalf("get session: %v", err)
 	}
 
-	oldTurn := narvipg.Turn{Prompt: &inputPrompt, ModelID: nil, PlanMode: true}
+	oldTurn := narvipg.Turn{Prompt: &wantPrompt, ModelID: nil, PlanMode: true}
 	oldRaw, err := sessionactor.BuildPromptPayload(session.ID.String(), sessionRow, referenceSandboxRow, oldTurn)
 	if err != nil {
 		t.Fatalf("BuildPromptPayload (old/reference): %v", err)

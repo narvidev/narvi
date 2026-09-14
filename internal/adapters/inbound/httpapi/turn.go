@@ -18,6 +18,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/workflowengine"
 	"github.com/narvidev/narvi/internal/domain/authz"
 	intentdomain "github.com/narvidev/narvi/internal/domain/intent"
+	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	domainupload "github.com/narvidev/narvi/internal/domain/upload"
 	"github.com/narvidev/narvi/internal/platform"
@@ -938,6 +939,20 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 	if epistemicCheckSessionKnown {
 		effectivePrompt = turn.MaybeInjectEpistemicPreamble(epistemicCheckDefault, epistemicCheckOverride, planMode, effectivePrompt)
 	}
+
+	// §12.2 item 3's own structured-plan-document instruction
+	// (internal/domain/plan.MaybeInjectStructureInstruction): the exact
+	// mirror-image condition of the epistemic preamble immediately above --
+	// a no-op for every ordinary (planMode == false) turn, and unconditional
+	// (no session/platform override, unlike epistemicCheckSessionKnown's own
+	// gating above) for a plan-mode one, since every plan-mode turn is asked
+	// for structure the same way regardless of config. Runs AFTER the
+	// epistemic-preamble call above rather than before: the two conditions
+	// are mutually exclusive (ShouldInjectEpistemicPreamble already refuses
+	// planMode==true turns), so this ordering has no observable effect on
+	// prompt bytes -- it is placed here purely to read as "one paragraph of
+	// prompt-shaping calls", not scattered across the function.
+	effectivePrompt = plandomain.MaybeInjectStructureInstruction(planMode, effectivePrompt)
 
 	// correlationID (§12.2 item 1's own session-rail gap, migrations/
 	// 000121_turns_correlation_id.up.sql): this request's own id, when the

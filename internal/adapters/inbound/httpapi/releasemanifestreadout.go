@@ -67,6 +67,20 @@ type releaseManifestFindingJSON struct {
 	Detail   string `json:"detail"`
 }
 
+// releaseCompositionFindingJSON mirrors restdtos.ReleaseCompositionFinding's
+// own wire shape byte-for-byte -- the SAME shape
+// releasecompositionfindings.go's own PostReleaseCompositionFindings
+// marshals verbatim (json.Marshal(req.Findings)) into
+// release_manifest_checks.composition_findings; this read side re-declares
+// it rather than importing restdtos' own struct directly, mirroring
+// releaseManifestFindingJSON/releaseManifestMergedPRJSON's own identical
+// "re-declare the wire shape, don't reach into an internal package" choice
+// immediately above.
+type releaseCompositionFindingJSON struct {
+	Kind   string `json:"kind"`
+	Detail string `json:"detail"`
+}
+
 // GetReleaseManifestReadout backs GET
 // /api/sessions/{sessionID}/release-manifest. 404 if sessionID doesn't
 // exist; 400 if it exists but was never created via a GitHub PR mention;
@@ -122,6 +136,22 @@ func GetReleaseManifestReadout(
 			AggregateReviewTriggerReasons: []string{},
 			Findings:                      []restdtos.ReleaseManifestFinding{},
 			MergedPrs:                     []restdtos.ReleaseManifestPR{},
+			// CompositionFindings/CompositionDecision are BOTH required,
+			// closed-shape fields on the wire (contracts/rest/v1/dtos.schema.
+			// json) -- never the Go zero value of either (nil, which
+			// marshals to JSON null for the array; "", which is not a
+			// legal enum member for the string). "pending" plus an empty
+			// (never nil) array is the honest default even in the
+			// computed=false branch immediately below: release_manifest_
+			// checks.composition_decision/composition_findings themselves
+			// default to exactly these same two values at the schema level
+			// (migrations/000127_release_manifest_checks_composition.up.
+			// sql), so a session with no persisted check at all is reporting
+			// precisely what a freshly-inserted row would also report --
+			// "nothing decided yet" -- never an out-of-enum sentinel a
+			// strict client would reject.
+			CompositionFindings: []restdtos.ReleaseCompositionFinding{},
+			CompositionDecision: restdtos.ReleaseManifestReadoutCompositionDecisionPending,
 		}
 
 		row, err := releaseManifestChecks.GetLatest(ctx, repoFullName, prNumber)
@@ -149,11 +179,80 @@ func GetReleaseManifestReadout(
 		resp.CoveragePartial = row.CoveragePartial
 		resp.AggregateReviewTriggered = row.AggregateReviewTriggered
 
-		var reasons []string
-		if err := json.Unmarshal(row.AggregateReviewTriggerReasons, &reasons); err == nil {
-			resp.AggregateReviewTriggerReasons = reasons
+		// §15.3/§12.2 item 9's own composition-review fields -- the ONE
+		// omission a real adversarial review of this branch caught: this
+		// handler used to stop at AggregateReviewTriggered above and never
+		// read composition_reviewed_at/composition_findings/
+		// composition_decision/composition_decision_by/
+		// composition_decision_at back out of row at all, which meant the
+		// composition pass could run, post real findings, and have a real
+		// human decision recorded against it, and this endpoint would still
+		// render the "pending: has been dispatched but has not completed
+		// yet" sentinel forever. CompositionReviewedAt is left nil (its own
+		// "not yet available" sentinel, restdtos.
+		// ReleaseManifestReadoutCompositionReviewedAt's own doc comment)
+		// exactly when row.CompositionReviewedAt itself is not Valid --
+		// never fabricated -- mirroring ComputedAt/BaseRef/HeadRef's own
+		// identical pgtype-Valid-gated pattern immediately above.
+		if row.CompositionReviewedAt.Valid {
+			compositionReviewedAt := row.CompositionReviewedAt.Time
+			resp.CompositionReviewedAt = &compositionReviewedAt
+		}
+		// CompositionHeadSha/CompositionDiffTruncated (migrations/
+		// 000128_release_manifest_checks_composition_anchor.up.sql,
+		// confirmed-major auditability fix): row.CompositionHeadSha is
+		// already nil exactly when dispatchCompositionReview never recorded
+		// an anchor for this row (never dispatched, or declined to dispatch)
+		// -- forwarded verbatim, no extra Valid-gate needed the way a
+		// pgtype column would require.
+		resp.CompositionHeadSha = row.CompositionHeadSha
+		resp.CompositionDiffTruncated = row.CompositionDiffTruncated
+		var compositionFindings []releaseCompositionFindingJSON
+		if err := json.Unmarshal(row.CompositionFindings, &compositionFindings); err == nil {
+			// A present, empty array on the wire, never JSON null -- mirrors
+			// resp's own top-of-function default (this function's own doc
+			// comment on that struct literal): compositionFindings is a
+			// required array field, so it must never regress to nil (which
+			// encoding/json marshals as `null`) merely because this release
+			// has zero composition findings to report.
+			resp.CompositionFindings = make([]restdtos.ReleaseCompositionFinding, 0, len(compositionFindings))
+			for _, f := range compositionFindings {
+				resp.CompositionFindings = append(resp.CompositionFindings, restdtos.ReleaseCompositionFinding{
+					Kind:   restdtos.ReleaseCompositionFindingKind(f.Kind),
+					Detail: f.Detail,
+				})
+			}
 		} else {
+			logger.Warn("httpapi: unmarshal composition findings failed, rendering as empty", "error", err)
+		}
+		resp.CompositionDecision = restdtos.ReleaseManifestReadoutCompositionDecision(row.CompositionDecision)
+		if row.CompositionDecisionBy.Valid {
+			decisionBy := row.CompositionDecisionBy.String()
+			resp.CompositionDecisionBy = &decisionBy
+		}
+		if row.CompositionDecisionAt.Valid {
+			decisionAt := row.CompositionDecisionAt.Time
+			resp.CompositionDecisionAt = &decisionAt
+		}
+
+		// Minor fix: guard against BOTH a decode failure (the existing
+		// `err == nil` check) AND a successfully-decoded-but-nil result
+		// (a literal persisted JSON `null` -- json.Unmarshal("null", &x)
+		// succeeds with x left nil, no error at all) -- either one must
+		// leave resp.AggregateReviewTriggerReasons at its own already-set,
+		// non-nil `[]string{}` default (this function's own top struct
+		// literal) rather than overwrite it with a nil slice, which
+		// marshals as a JSON null and violates this field's own required-
+		// array contract (contracts/rest/v1/dtos.schema.json). Deliberately
+		// defensive on the READ side too, independent of persist.go's own
+		// marshalJSONArray fix: a row already persisted with a literal
+		// null (written before that fix ever ran) must still render
+		// honestly here, not just rows inserted after it.
+		var reasons []string
+		if err := json.Unmarshal(row.AggregateReviewTriggerReasons, &reasons); err != nil {
 			logger.Warn("httpapi: unmarshal aggregate_review_trigger_reasons failed, rendering as empty", "error", err)
+		} else if reasons != nil {
+			resp.AggregateReviewTriggerReasons = reasons
 		}
 
 		var findings []releaseManifestFindingJSON

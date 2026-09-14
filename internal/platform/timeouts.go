@@ -2113,6 +2113,45 @@ type Timeouts struct {
 	// never eligibility itself.
 	AutoMergeCandidateLookback time.Duration
 
+	// AutoMergeAuthBackoffBase is domain/automerge.BackoffConfig.BaseDelay
+	// (docs/TECHNICAL_PLAN.md §17's own automerge dead-letter fix): the
+	// delay scheduled after internal/app/automerge.Worker's own authGuard
+	// observes the FIRST consecutive authentication/permission-classified
+	// failure (ports.ErrAuthenticationFailed/ports.ErrPermissionDenied)
+	// for a given scope (worker-wide, or one repository). Not specified in
+	// the plan; chosen as 2min -- see domain/automerge.EvaluateBackoff's
+	// own doc comment for the full schedule this produces alongside
+	// AutoMergeAuthBackoffMax below, and domain/automerge.MaxAuthFailures'
+	// own doc comment for why a materially SHORTER total tolerance window
+	// than OutboxBackoffBase/OutboxBackoffMax's own 10-attempt schedule is
+	// the correct choice here: an authentication failure, unlike a
+	// transient outbox delivery failure, has no realistic self-healing
+	// story to wait out.
+	AutoMergeAuthBackoffBase time.Duration
+
+	// AutoMergeAuthBackoffMax is domain/automerge.BackoffConfig.MaxDelay:
+	// the ceiling the exponential schedule above plateaus at. Not
+	// specified in the plan; chosen as 12min. A materially SMALLER value
+	// than an earlier version of this field (30min) shipped with:
+	// AutoMergeAuthBackoffBase (2min) doubles four times before
+	// domain/automerge.MaxAuthFailures (5) dead-letters -- 2m, 4m, 8m,
+	// 16m -- so ANY ceiling at or above 16min has no effect whatsoever on
+	// the schedule this produces; the 30min figure this field previously
+	// held was exactly that (docs/TECHNICAL_PLAN.md §17's own
+	// reachability finding: a configured value nothing can ever reach is
+	// indistinguishable, in its actual runtime effect, from no cap at
+	// all). 12min sits strictly below the 4th consecutive failure's own
+	// natural 16min, so it demonstrably caps that step down to 12min
+	// rather than merely equaling a value the schedule was already going
+	// to produce on its own -- domain/automerge.
+	// TestEvaluateBackoff_ShippedDefaultsMaxDelayBinds mirrors this exact
+	// pair of numbers to prove it. The schedule this produces end to end
+	// is 2m, 4m, 8m, 12m, dead-letter -- domain/automerge.MaxAuthFailures'
+	// own doc comment has the full accounting for why a little over 25
+	// minutes, not outbox's own much longer 10-attempt tolerance, is the
+	// correct total window here.
+	AutoMergeAuthBackoffMax time.Duration
+
 	// DigestPumpInterval is how often internal/app/digest.Pump's own
 	// background tick checks whether today's digest is due (§21.3) --
 	// deliberately much coarser than AutoMergePumpInterval/
@@ -2764,6 +2803,8 @@ func DefaultTimeouts() Timeouts {
 		ReviewVerdictAnalyticsWindow:   30 * 24 * time.Hour, // §21.1, explicit ("bounded from day one ... default 30 days, mirroring the decision inbox's own DecisionInboxLatencyWindow, §16.2 -- never DecisionInboxStaleAfter's own much narrower 48h item-staleness flag, §16.1, a different concept entirely") -- mirrors DecisionInboxLatencyWindow's own identical "a month, bounded" reasoning
 		AutoMergePumpInterval:          60 * time.Second,    // §21.2; not specified, mirrors AutomationEnginePumpInterval's own identical periodic-background-policy-engine reasoning
 		AutoMergeCandidateLookback:     7 * 24 * time.Hour,  // §21.2; not specified, chosen generously -- every candidate is re-confirmed live regardless
+		AutoMergeAuthBackoffBase:       2 * time.Minute,     // §17; not specified, chosen -- see domain/automerge.EvaluateBackoff's own doc comment for the schedule this produces
+		AutoMergeAuthBackoffMax:        12 * time.Minute,    // §17; not specified, chosen -- strictly below the naturally-doubled 4th-failure delay so this ceiling actually binds, see field doc comment
 		DigestPumpInterval:             5 * time.Minute,     // §21.3; not specified, chosen -- a digest fires at most once per channel per day, so coarse polling is ample
 		DigestChannelDiscoveryLookback: 30 * 24 * time.Hour, // §21.3; not specified, mirrors ReviewVerdictAnalyticsWindow's own identical "a month, bounded" reasoning
 		DigestContentWindow:            24 * time.Hour,      // §21.3, explicit ("a daily digest") -- one calendar day of rollup content, distinct from the channel-discovery lookback above

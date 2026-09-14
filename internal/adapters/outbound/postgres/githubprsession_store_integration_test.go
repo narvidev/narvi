@@ -8,8 +8,10 @@ package postgres_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/sync/errgroup"
 
@@ -187,4 +189,92 @@ func TestGitHubPRSessionStore_ConcurrentClaim_ExactlyOneWinnerSeesNoSession(t *t
 	if claimRowCount != 1 {
 		t.Errorf("claim row count = %d, want exactly 1", claimRowCount)
 	}
+}
+
+// TestGitHubPRSessionStore_GetByRepoAndPRNumber proves the FORWARD,
+// non-claiming read the decision inbox's own "open review" action needs:
+// a claimed (repo, pr) resolves its real session id, an unclaimed one
+// reports pgx.ErrNoRows, and -- the property that actually matters for
+// this read (a row must never carry a session id belonging to a
+// different PR) -- two DIFFERENT PRs, each claimed by its OWN session,
+// never cross-resolve to each other's session id.
+func TestGitHubPRSessionStore_GetByRepoAndPRNumber(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessions := narvipg.NewSessionStore(pool)
+	store := narvipg.NewGitHubPRSessionStore(pool)
+
+	t.Run("no claim at all -- pgx.ErrNoRows, never a fabricated row", func(t *testing.T) {
+		_, err := store.GetByRepoAndPRNumber(ctx, "acme/widgets", 9999)
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("GetByRepoAndPRNumber(unclaimed) error = %v, want pgx.ErrNoRows", err)
+		}
+	})
+
+	// Two distinct PRs, each claimed by its own distinct session -- the
+	// fixture this property actually needs: a single-PR fixture could
+	// pass this test for the wrong reason (e.g. a query that ignores
+	// pr_number and returns ANY row for the repo).
+	claim := func(t *testing.T, repoFullName string, prNumber int32) pgtype.UUID {
+		t.Helper()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("Begin: %v", err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		txStore := store.WithTx(tx)
+		if err := txStore.EnsureRow(ctx, repoFullName, prNumber); err != nil {
+			t.Fatalf("EnsureRow: %v", err)
+		}
+		if _, err := txStore.LockForUpdate(ctx, repoFullName, prNumber); err != nil {
+			t.Fatalf("LockForUpdate: %v", err)
+		}
+		created, err := sessions.WithTx(tx).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub})
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		if err := txStore.SetSessionID(ctx, repoFullName, prNumber, created.ID); err != nil {
+			t.Fatalf("SetSessionID: %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("Commit: %v", err)
+		}
+		return created.ID
+	}
+
+	sessionA := claim(t, "acme/widgets", 501)
+	sessionB := claim(t, "acme/widgets", 502)
+	if sessionA == sessionB {
+		t.Fatalf("fixture bug: sessionA and sessionB are the same session (%+v) -- this test needs two distinct sessions to prove no cross-contamination", sessionA)
+	}
+
+	t.Run("PR #501 resolves session A, never session B", func(t *testing.T) {
+		row, err := store.GetByRepoAndPRNumber(ctx, "acme/widgets", 501)
+		if err != nil {
+			t.Fatalf("GetByRepoAndPRNumber(501): %v", err)
+		}
+		if row.SessionID != sessionA {
+			t.Errorf("GetByRepoAndPRNumber(501).SessionID = %+v, want %+v (sessionA) -- got %+v (sessionB) instead if this fails on cross-contamination", row.SessionID, sessionA, sessionB)
+		}
+	})
+
+	t.Run("PR #502 resolves session B, never session A", func(t *testing.T) {
+		row, err := store.GetByRepoAndPRNumber(ctx, "acme/widgets", 502)
+		if err != nil {
+			t.Fatalf("GetByRepoAndPRNumber(502): %v", err)
+		}
+		if row.SessionID != sessionB {
+			t.Errorf("GetByRepoAndPRNumber(502).SessionID = %+v, want %+v (sessionB) -- got %+v (sessionA) instead if this fails on cross-contamination", row.SessionID, sessionB, sessionA)
+		}
+	})
+
+	t.Run("a different repo with the SAME pr_number never cross-resolves", func(t *testing.T) {
+		// github_pr_sessions' own primary key is (repo_full_name,
+		// pr_number) TOGETHER -- a query that filtered on pr_number alone
+		// would incorrectly match PR #501 in a completely different repo.
+		_, err := store.GetByRepoAndPRNumber(ctx, "acme/other-repo", 501)
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("GetByRepoAndPRNumber(acme/other-repo#501) error = %v, want pgx.ErrNoRows (no claim exists for this repo)", err)
+		}
+	})
 }

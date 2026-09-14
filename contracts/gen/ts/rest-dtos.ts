@@ -414,7 +414,7 @@ export interface LinkMemberIdentityRequest {
   externalId: string;
 }
 /**
- * One plan-mode VERSION's own REST wire shape (migrations/000034_plan_mode.up.sql), returned by GET /api/sessions/:id/plans (audit finding M3, completeness: §8.1 shipped approve/reject with no way for a web client to ever discover a planId to approve). Deliberately omits turnId and slack_channel_id/slack_message_ts, both present on the underlying plans row: turnId is an internal linkage to the producing turn's own event stream, never itself surfaced (the plan-mode UI needs what that stream CONTAINS -- content below -- never the linkage id itself); slack_channel_id/slack_message_ts (migrations/000035_plan_mode_cross_channel.up.sql) are Slack cross-channel-notify plumbing that should never leak into a REST response, mirroring PlanActionResponse's own equally minimal shape below. content (the plan-mode UI, §12.2 item 3) closes the gap this description used to name as out of scope ("not needed for a client whose job here is discovering/approving a planId") now that a client's job here also includes RENDERING the plan: the producing turn's own final streamed assistant text, best-effort recovered server-side by the SAME bounded event-log scan internal/domain/plan.ExtractContent already provides for the Slack/Linear cross-channel notifiers (internal/app/sessionactor/planapprovalcontent.go), just windowed per plan VERSION here (bounded above by the NEXT turn dispatched in this session, if any, so an already-decided plan's content is never contaminated by a later turn's own streamed text) rather than only ever the just-completed turn. There is deliberately no structured steps/fileRefs/scopeEstimate shape: internal/app/sessionactor/planapprovalcontent.go's own doc comment is explicit that no such schema exists anywhere in this codebase -- content is the model's own freeform prose, verbatim, rendered as plain text by the client (never markdown-parsed), exactly like every other model-authored field this schema already carries (finding.description, digest.summary).
+ * One plan-mode VERSION's own REST wire shape (migrations/000034_plan_mode.up.sql), returned by GET /api/sessions/:id/plans (audit finding M3, completeness: §8.1 shipped approve/reject with no way for a web client to ever discover a planId to approve). Deliberately omits turnId and slack_channel_id/slack_message_ts, both present on the underlying plans row: turnId is an internal linkage to the producing turn's own event stream, never itself surfaced (the plan-mode UI needs what that stream CONTAINS -- content below -- never the linkage id itself); slack_channel_id/slack_message_ts (migrations/000035_plan_mode_cross_channel.up.sql) are Slack cross-channel-notify plumbing that should never leak into a REST response, mirroring PlanActionResponse's own equally minimal shape below. content (the plan-mode UI, §12.2 item 3) closes the gap this description used to name as out of scope ("not needed for a client whose job here is discovering/approving a planId") now that a client's job here also includes RENDERING the plan: the producing turn's own final streamed assistant text, best-effort recovered server-side by the SAME bounded event-log scan internal/domain/plan.ExtractContent already provides for the Slack/Linear cross-channel notifiers (internal/app/sessionactor/planapprovalcontent.go), just windowed per plan VERSION here (bounded above by the NEXT turn dispatched in this session, if any, so an already-decided plan's content is never contaminated by a later turn's own streamed text) rather than only ever the just-completed turn. content is ALWAYS present and is always the model's own freeform prose, verbatim, rendered as plain text by the client (never markdown-parsed) -- exactly like every other model-authored string this schema carries -- and never stops being computed once structured (below) exists: structured is additive, never a replacement. structured (§12.2 item 3's own 'numbered steps with file refs, scope estimate' shape, internal/domain/plan.ExtractStructured) is the SAME content string's own machine-recovered structure, present only when the producing turn emitted a valid ```plan-steps block and null otherwise -- covering, identically and deliberately, every plan that predates this field, any plan whose model never attempted one, and one that attempted and failed validation: none of these is a distinguishable 'real zero', because there is no honest partial rendering for any of them beyond content's own prose (see ExtractStructured's own doc comment for the full reasoning, including why a genuinely empty steps array is folded into this SAME null case rather than kept as a distinct empty-but-real structured value). A client renders structured as a numbered list when present, and content as plain prose otherwise -- both fields are model-authored and attacker-influenceable, so title/description/fileRefs entries get the SAME plain-text-only treatment content itself always has.
  *
  * This interface was referenced by `RestDtos`'s JSON-Schema
  * via the `definition` "Plan".
@@ -447,6 +447,35 @@ export interface Plan {
    * Best-effort, server-extracted plan text (see this DTO's own top doc comment) -- never empty: falls back to a fixed, honest placeholder (internal/domain/plan.ContentFallbackText) when no token event could be recovered for this version's own window, mirroring planContentFallbackText's pre-existing identical fallback for the Slack/Linear notifiers. Model-authored freeform prose -- render as plain text only, never markdown-parsed, matching every other model-authored string this schema carries.
    */
   content: string;
+  /**
+   * §12.2 item 3's own structured plan document -- content's own machine-recovered structure (internal/domain/plan.ExtractStructured), present only when the producing turn emitted a valid ```plan-steps block; null covers every other case identically (see this DTO's own top doc comment for the full enumeration and why they are deliberately not distinguished). A client that gets null renders content in prose instead -- structured never replaces content, which is always present regardless.
+   */
+  structured: {
+    /**
+     * Always at least one step in a non-null structured value -- ExtractStructured folds a genuinely empty steps array into the SAME null case as no structure at all, so this array is never empty here.
+     *
+     * @minItems 1
+     */
+    steps: [PlanStep, ...PlanStep[]];
+    /**
+     * A short, non-empty, model-authored free-text summary of the plan's overall size (the mockup's own '6 files · 2 migrations' line, docs/design/mockups.html) -- plain text only, like every other model-authored string here.
+     */
+    scopeEstimate: string;
+  } | null;
+}
+/**
+ * One numbered step of a Plan's own structured document (§12.2 item 3: 'numbered steps with file refs') -- internal/domain/plan.Step's wire shape. Every field is model-authored, attacker-influenceable prose or a repository-relative path string; a client renders all three as plain text only (title/description) or inert text (fileRefs, never a clickable/navigable link built from an unvalidated path), never markup, matching content's own established discipline.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "PlanStep".
+ */
+export interface PlanStep {
+  title: string;
+  description: string;
+  /**
+   * Repository-relative file paths this step touches, as reported by the model -- possibly empty (a step that has not yet named specific files), never null. Not validated against the repository's real tree or resolved to a link server-side: display-only, like FilesChanged elsewhere in this schema.
+   */
+  fileRefs: string[];
 }
 /**
  * GET /api/sessions/:id/plans's own response body (audit finding M3, completeness) -- every plan VERSION for the session, ordered by version, so a web client can render v1->v2 history and find the currently awaiting_approval version's own id to approve/reject. Deliberately minimal: no pagination (a session's own plan history is expected to stay small, matching ArtifactsResponse's own identical 'unbounded' precedent above) and no new WS/event notification on plan creation -- later Steps (decision inbox, plan-mode UI) are already planned to build richer surfaces; this endpoint only closes the discoverability gap.
@@ -981,6 +1010,34 @@ export interface ReleaseManifestReadout {
    * Every constituent pull request this check examined -- the manifest table's own row source.
    */
   mergedPrs: ReleaseManifestPR[];
+  /**
+   * §15.3's own aggregate-diff composition review pass: when it actually POSTED its findings via the composition-findings tool. Null means 'not yet available' -- either the pass was never triggered (aggregateReviewTriggered is false), or it was triggered but has not completed (or its dispatch failed) -- distinct, by construction, from a real, empty compositionFindings array (the pass ran and found nothing to report). Never render an empty compositionFindings array as a confident 'no composition findings' while this is null.
+   */
+  compositionReviewedAt?: string | null;
+  /**
+   * §15.3's own composition findings -- empty either because compositionReviewedAt is null (not yet available, see that field's own description) or because the pass genuinely found nothing to report.
+   */
+  compositionFindings: ReleaseCompositionFinding[];
+  /**
+   * The commit sha compositionFindings was actually (or will be) reviewed against -- recorded once, at composition-review DISPATCH time (internal/app/releasereview.dispatchCompositionReview's own UpdateCompositionAnchor call, immediately after the composition-review turn is created), strictly BEFORE that turn ever completes and posts findings. Null means the pass was NEVER actually dispatched at all (its own prompt-template fetch, diff fetch, or turn insert declined/failed) -- a HONEST TERMINAL state this system does not retry, never merely 'not yet available'. Non-null does NOT imply compositionReviewedAt is also set: a real, live dispatch sets this field FIRST and compositionReviewedAt only later, once the turn actually completes -- so 'non-null head sha, still-null compositionReviewedAt' is the ordinary, expected shape of a genuinely in-flight pass, not a contradiction. A confirmed-major auditability fix: a verdict attributed to a diff nobody can identify afterward is not auditable, and (a related, confirmed-major fix) a caller that conflates 'never dispatched' with 'dispatched, still pending' renders a false promise of eventual completion for a pass that will never run. See web/src/session/ReleaseReviewView.tsx's own compositionPassState for the one place in this codebase that actually reads this field to distinguish 'declined' from 'pending'.
+   */
+  compositionHeadSha?: string | null;
+  /**
+   * Whether the diff fetch this composition review pass actually ran over was itself truncated at its own size cap -- distinct from coveragePartial above (that flag describes the CONSTITUENT-PR LISTING §15.2's manifest check ran over; this one describes the single aggregate baseRef..headRef diff §15.3's composition pass reviewed). Null exactly when compositionHeadSha is null (the pass was never dispatched) -- set at the SAME dispatch-time write as compositionHeadSha, so the two share an identical null/non-null pattern even though compositionHeadSha alone is what a client should branch render state on.
+   */
+  compositionDiffTruncated?: boolean | null;
+  /**
+   * §12.2 item 9's own 'Block release / Acknowledge & ship [/ Unblock]' human decision on compositionFindings -- 'pending' until a maintainer+ (block) or admin (acknowledge, an explicit override) acts, and 'pending' AGAIN after an admin unblocks an already-blocked release (internal/domain/review.CompositionDecisionActionUnblock) -- Unblock never jumps straight to 'acknowledged'.
+   */
+  compositionDecision: 'pending' | 'blocked' | 'acknowledged';
+  /**
+   * The user id who rendered the MOST RECENT block/acknowledge/unblock action against this release -- null only when no such action has ever been taken. NOT necessarily null when compositionDecision reads 'pending' again: an Unblock action also sets this (to the unblocking admin), which is why compositionDecision alone is not enough to tell 'never decided' apart from 'decided, then reopened' -- a client checking that distinction should treat this field as the tell, not compositionDecision.
+   */
+  compositionDecisionBy?: string | null;
+  /**
+   * When the MOST RECENT block/acknowledge/unblock action was rendered -- see compositionDecisionBy's own description for why this can be non-null even while compositionDecision itself reads 'pending' again.
+   */
+  compositionDecisionAt?: string | null;
 }
 /**
  * One review.ManifestFinding's own REST wire shape (§15.2).
@@ -1023,6 +1080,57 @@ export interface ReleaseManifestPR {
   revertedAfterMergeSeconds: number | null;
   hadManualConflictResolution: boolean;
   highRiskFlagged: boolean;
+}
+/**
+ * One composition finding from §15.3's own aggregate-diff review pass -- reported by the reviewing agent via the composition-findings-posting tool (POST /sessions/:id/release-manifest/composition-findings), never re-parsed from posted comment text. Distinct from ReleaseManifestFinding (§15.2's mechanical manifest audit) and from a per-PR review verdict's own findings -- this pass never computes or consumes riskLevel/premise/shippable/digest (§15.4).
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "ReleaseCompositionFinding".
+ */
+export interface ReleaseCompositionFinding {
+  /**
+   * §15.3's own composition framing: do these already-individually-correct changes conflict, duplicate, or invalidate each other's assumptions.
+   */
+  kind: 'conflict' | 'duplication' | 'invalidated_assumption' | 'other';
+  /**
+   * Free-text explanation of the composition issue, naming the constituent pull requests involved.
+   */
+  detail: string;
+}
+/**
+ * Request body for POST /sessions/:id/release-manifest/composition-findings (§15.3) -- the composition-findings-posting tool's own sandbox-bearer-authenticated call, mirroring PostReviewVerdictRequest's own 'typed fields, never markers' discipline one level down.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "PostReleaseCompositionFindingsRequest".
+ */
+export interface PostReleaseCompositionFindingsRequest {
+  /**
+   * Zero or more composition findings -- an empty array is a legitimate, positive result (this release composes cleanly).
+   */
+  findings: ReleaseCompositionFinding[];
+}
+/**
+ * 201 response body for POST /sessions/:id/release-manifest/composition-findings.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "PostReleaseCompositionFindingsResponse".
+ */
+export interface PostReleaseCompositionFindingsResponse {
+  sessionId: string;
+  reviewedAt: string;
+  findingsCount: number;
+}
+/**
+ * 200 response body for POST /api/sessions/:id/release-manifest/{block,acknowledge,unblock} (§12.2 item 9) -- the same shape for all three actions, distinguished by compositionDecision's own value. "pending" is Unblock's own result (the confirmed-major "unblock path" fix): it reopens an already-blocked release back to pending, never straight to acknowledged -- see internal/domain/review.CompositionDecisionActionUnblock's own doc comment.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "PostReleaseCompositionDecisionResponse".
+ */
+export interface PostReleaseCompositionDecisionResponse {
+  sessionId: string;
+  compositionDecision: 'pending' | 'blocked' | 'acknowledged';
+  compositionDecisionBy: string;
+  compositionDecisionAt: string;
 }
 /**
  * GET/PUT /api/repos/{owner}/{repo}/settings response body (§8.2/§21.2) -- an admin, per-repo policy-flag row (migrations/000044_repo_settings.up.sql). Deliberately a small, extensible shape: §21's auto-merge toggle, §24's automatic-re-review opt-in (§24.5), and §26.2's description-autofix toggle (§26.2) each added a further boolean property here, never a bespoke DTO of their own -- future toggles are expected to follow the same pattern.
@@ -2308,11 +2416,35 @@ export interface DecisionInboxItem {
    */
   hasChangesRequested: boolean | null;
   /**
+   * True iff this PR is a release cut (§15) whose manifest check has already been computed and persisted. Set (to true or false) for any PR-shaped row, exactly like isHandoff above -- the field a client checks to render this row's own distinct release shape (a link to the release-review screen, never a Merge button: a release cut always renders under kind=needs_review) instead of the ordinary PR shape. A PR that a release-branch-pattern/label WOULD classify as a release cut but that Narvi has not yet reviewed (or reviewed too recently for the background check to have finished) renders false here -- an honest, temporary gap, never a fabricated one.
+   */
+  isRelease: boolean | null;
+  /**
+   * §15.2's own mechanical manifest-findings count (admin overrides, red-at-merge, unreviewed reverts) -- set iff isRelease is true, null otherwise. NEVER the aggregate diff review's own composition findings (§15.3/§15.4), which nothing in this system computes yet -- this count can be zero on a clean release cut, which is why it is a separate nullable field rather than folded into a chip that would render '0' identically to 'unknown'.
+   */
+  manifestFindingsCount: number | null;
+  /**
+   * True iff the constituent-PR listing that §15.2's manifest check ran over was TRUNCATED, so manifestFindingsCount above is a lower bound over an incomplete set rather than a complete audit -- the SAME fact GetReleaseManifestReadout exposes as `coveragePartial` and the posted manifest comment states in prose, for the same persisted row. Also true when the persisted findings blob could not be decoded at all, because a count that could not be read is not a count of zero. Set iff isRelease is true, null otherwise. A client must NEVER render manifestFindingsCount as a clean result while this is true: a truncated scan that found nothing and a complete scan that found nothing are different claims.
+   */
+  manifestCoveragePartial: boolean | null;
+  /**
+   * §15.3's own already-computed trigger decision (whether the constituent PRs' own shape met the criteria for an aggregate diff review, OR the constituent-PR listing was itself truncated -- a truncated scan is treated as its own trigger, never a silent skip) -- set iff isRelease is true, null otherwise. This says only that the composition pass was dispatched (or should have been); see compositionReviewed/compositionDecision below for whether it has actually completed and been decided.
+   */
+  aggregateReviewTriggered: boolean | null;
+  /**
+   * §15.3's own composition-review COMPLETION state -- the SAME fact GetReleaseManifestReadout exposes as compositionReviewedAt (non-null), rendered here as a plain boolean since this row has no use for the exact timestamp. Set iff isRelease is true, null otherwise. Confirmed-major fix: before this field existed, a client had no way to tell 'the composition pass has not run yet' apart from 'it ran, found nothing, and was decided' -- both rendered as the identical, permanent 'aggregate review needed' chip (aggregateReviewTriggered alone cannot express this: it only ever says the pass SHOULD run).
+   */
+  compositionReviewed?: boolean | null;
+  /**
+   * The SAME three-value enum GetReleaseManifestReadout's own compositionDecision renders ('pending' until a maintainer+ blocks or an admin acknowledges, and 'pending' again after an admin unblocks) -- meaningless (null) whenever compositionReviewed is false or isRelease is false. A client rendering this row's own chip should treat 'pending' identically whether compositionReviewed is true (a real decision is genuinely still outstanding) or aggregateReviewTriggered is true but compositionReviewed is false (the pass has not completed) -- decisionInboxFormat.ts's own releaseChipData is this contract's one intended reader, and it already distinguishes the two via compositionReviewed.
+   */
+  compositionDecision?: 'pending' | 'blocked' | 'acknowledged' | null;
+  /**
    * kind=awaiting_approval, a plan (not a handoff PR) only.
    */
   planId: string | null;
   /**
-   * Set for a plan (kind=awaiting_approval) or a failed session (kind=needs_attention).
+   * Set for a plan (kind=awaiting_approval), a failed session (kind=needs_attention), or a PR-shaped row (ready_to_merge/needs_review, including a release cut) for which Narvi has actually run a review session against this exact pull request -- a client uses this to link into that review (or release-review) screen instead of an external GitHub link. Left null for a PR-shaped row Narvi has never been mentioned on, which is common and not an error.
    */
   sessionId: string | null;
   /**

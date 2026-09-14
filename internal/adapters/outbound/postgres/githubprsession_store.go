@@ -79,6 +79,23 @@ func (s *GitHubPRSessionStore) GetBySessionID(ctx context.Context, sessionID pgt
 	return s.q.GetGitHubPRSessionBySessionID(ctx, sessionID)
 }
 
+// GetByRepoAndPRNumber is the FORWARD, non-locking, non-claiming read the
+// decision inbox's own "open review" action needs: given (repoFullName,
+// prNumber), does a review session already exist for this exact PR, and
+// if so which one? Deliberately never EnsureRow/LockForUpdate -- this is
+// a read-only display lookup with no claim to make, and must never
+// contend with (or block behind) a real concurrent @mention claim for the
+// same PR the way holding LockForUpdate's own row lock would. Returns
+// pgx.ErrNoRows (unwrapped) when Narvi has never been mentioned on this
+// PR -- a common, legitimate negative, mirroring GetBySessionID's own
+// identical contract.
+func (s *GitHubPRSessionStore) GetByRepoAndPRNumber(ctx context.Context, repoFullName string, prNumber int32) (sqlcgen.GithubPrSession, error) {
+	return s.q.GetGitHubPRSessionByRepoAndPRNumber(ctx, sqlcgen.GetGitHubPRSessionByRepoAndPRNumberParams{
+		RepoFullName: repoFullName,
+		PrNumber:     prNumber,
+	})
+}
+
 // SetHeadSHA is REMOVED as of migrations/000072_turns_review_head_sha.up.sql
 // -- github_pr_sessions.
 // pending_head_sha (and this method) is superseded by turns.

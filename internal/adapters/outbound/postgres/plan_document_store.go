@@ -2,12 +2,15 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 )
 
 // PlanDocumentStore is a thin, pass-through wrapper around the
@@ -35,14 +38,35 @@ func (s *PlanDocumentStore) WithTx(tx pgx.Tx) *PlanDocumentStore {
 	return &PlanDocumentStore{q: s.q.WithTx(tx)}
 }
 
-// Create snapshots content as planID's own durable plan document. planID
-// must name a real plans row (the FK) not already snapshotted (the
+// Create snapshots content -- and, when structured is non-nil,
+// migrations/000126_plan_documents_structured.up.sql's own
+// structured_steps column -- as planID's own durable plan document.
+// planID must name a real plans row (the FK) not already snapshotted (the
 // UNIQUE constraint) -- a violation of either surfaces here as a plain
 // Postgres error, never swallowed.
-func (s *PlanDocumentStore) Create(ctx context.Context, planID pgtype.UUID, content string) (sqlcgen.PlanDocument, error) {
+//
+// structured is marshaled to JSON here (the one place a plandomain.
+// Structured value crosses into a raw column write) via Step/Structured's
+// own json tags -- the SAME field names (title/description/fileRefs/
+// steps/scopeEstimate) ExtractStructured's own wireStep/wireStructured
+// decode from, so a future reader of this column sees the identical shape
+// the model was asked to emit, not a second, independently-cased mapping.
+// A nil structured writes SQL NULL (pgx encodes a nil []byte as NULL for a
+// jsonb column) -- the only representation of "no structure recovered",
+// matching that migration's own doc comment.
+func (s *PlanDocumentStore) Create(ctx context.Context, planID pgtype.UUID, content string, structured *plandomain.Structured) (sqlcgen.PlanDocument, error) {
+	var structuredJSON []byte
+	if structured != nil {
+		var err error
+		structuredJSON, err = json.Marshal(structured)
+		if err != nil {
+			return sqlcgen.PlanDocument{}, fmt.Errorf("postgres: marshal structured plan document: %w", err)
+		}
+	}
 	return s.q.CreatePlanDocument(ctx, sqlcgen.CreatePlanDocumentParams{
-		PlanID:  planID,
-		Content: &content,
+		PlanID:          planID,
+		Content:         &content,
+		StructuredSteps: structuredJSON,
 	})
 }
 

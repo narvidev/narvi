@@ -19,6 +19,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/domain/authz"
 	"github.com/narvidev/narvi/internal/domain/environment"
+	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 	"github.com/narvidev/narvi/internal/domain/provenance"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/turn"
@@ -969,6 +970,14 @@ func CreateSessionOnTx(ctx context.Context, tx pgx.Tx, sessions *postgres.Sessio
 		// request sees it take effect on this exact first turn. req.PlanMode
 		// excludes per §20.3 exactly like every other caller.
 		firstTurnPrompt := turn.MaybeInjectEpistemicPreamble(epistemicCheckDefault, created.EpistemicCheckEnabled, req.PlanMode, *req.Prompt)
+		// §12.2 item 3's own structured-plan-document instruction -- see
+		// turn.go's own identical call site (CreateTurnCore) for the full
+		// "mirrors the epistemic preamble, opposite condition, unconditional
+		// on config" rationale; this is the OTHER of the two real places a
+		// plan_mode=true turn's prompt is assembled (a brand-new session's
+		// own first turn, here, vs. every subsequent turn including a
+		// revise, there).
+		firstTurnPrompt = plandomain.MaybeInjectStructureInstruction(req.PlanMode, firstTurnPrompt)
 		// correlationID (§12.2 item 1's own session-rail gap, migrations/
 		// 000121_turns_correlation_id.up.sql): this request's own id, when
 		// the ingress that created it minted one.

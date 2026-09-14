@@ -72,7 +72,13 @@ func (a *Adapter) MergePR(ctx context.Context, spec ports.MergePRSpec) (string, 
 	if err != nil {
 		var apiErr *APIError
 		if errors.As(err, &apiErr) {
-			return "", &ports.MergePRError{Status: apiErr.Status, Message: apiErr.Message}
+			// RateLimited carried through verbatim (doPut's own updated
+			// doc comment, adapter.go) -- without it, ports.MergePRError.
+			// Unwrap would read every 403 this method returns as
+			// RateLimited=false, misclassifying a live rate limit as a
+			// permanent ports.ErrPermissionDenied (docs/TECHNICAL_PLAN.md
+			// §17's own automerge dead-letter fix).
+			return "", &ports.MergePRError{Status: apiErr.Status, Message: apiErr.Message, RateLimited: apiErr.RateLimited}
 		}
 		return "", fmt.Errorf("githubapi: merge pr: %w", err)
 	}

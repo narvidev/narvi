@@ -31,6 +31,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -286,8 +287,18 @@ func TestHandler_ReplyOnMappedThread_AwaitingPlan_RevisePrefix_CreatesPlanModeTu
 	if !newTurn.PlanMode {
 		t.Error("new turn PlanMode = false, want true")
 	}
-	if newTurn.Prompt == nil || *newTurn.Prompt != "drop the retry logic" {
-		t.Errorf("new turn prompt = %v, want %q (the revise: prefix must be stripped)", newTurn.Prompt, "drop the retry logic")
+	// §12.2 item 3's own structured-plan-document instruction
+	// (plandomain.MaybeInjectStructureInstruction) is unconditionally
+	// prepended onto every plan_mode=true turn's prompt, at the SAME
+	// CreateTurnCore this revise reply dispatches through -- so the
+	// persisted prompt is the STRIPPED feedback with that fixed
+	// instruction prepended. Named via the transformation itself (never
+	// loosened to a substring/prefix check): this still fails if the
+	// revise: prefix stripping breaks, and still fails if the instruction
+	// text changes unexpectedly.
+	wantPrompt := plandomain.MaybeInjectStructureInstruction(true, "drop the retry logic")
+	if newTurn.Prompt == nil || *newTurn.Prompt != wantPrompt {
+		t.Errorf("new turn prompt = %q, want %q (the revise: prefix must be stripped, then the structured-plan instruction prepended)", promptOrNilText(newTurn.Prompt), wantPrompt)
 	}
 
 	var dbStatus sqlcgen.PlanStatus

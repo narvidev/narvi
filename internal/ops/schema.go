@@ -148,9 +148,14 @@ type Alert struct {
 	// platform.Timeouts constant grounds the number, this names it.
 	ThresholdDerivation string `json:"thresholdDerivation"`
 	// Runbook is a repo-relative path to the runbook this alert should
-	// send an operator to (e.g. "docs/runbooks/outbox-lag.md") — optional
-	// only for an alert this Step deliberately did not write a runbook
-	// for (none, as shipped; every alert below names one).
+	// send an operator to (e.g. "docs/runbooks/outbox-lag.md") — optional:
+	// most alerts as shipped name one, but AutoMergeAuthDeadLetterAny
+	// (deploy/observability/alerts/reliability.json, docs/
+	// TECHNICAL_PLAN.md §17's own automerge dead-letter fix) deliberately
+	// leaves this empty rather than pointing at an unrelated existing
+	// runbook page — TestAlertRunbooksExist (drift_test.go) only checks a
+	// NON-empty Runbook actually resolves to a real file, never requires
+	// one.
 	Runbook string `json:"runbook,omitempty"`
 
 	sourcePath string

@@ -3,6 +3,7 @@ package ports
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 )
 
@@ -699,10 +700,44 @@ type ResolveCodeOwnersSpec struct {
 type MergePRError struct {
 	Status  int
 	Message string
+
+	// RateLimited mirrors githubapi.APIError.RateLimited exactly (same
+	// field name, same meaning, same "only ever set on a 403" scope):
+	// true when Status==403 was GitHub's own real primary/secondary
+	// rate-limit or abuse-detection mechanism answering, rather than a
+	// genuine "this credential cannot merge this PR" denial. Populated by
+	// the adapter (githubapi.MergePR) from the SAME classification
+	// CheckRepoAccess already relies on for an identical reason -- see
+	// Unwrap below, this field's own reason for existing on THIS type.
+	RateLimited bool
 }
 
 func (e *MergePRError) Error() string {
 	return fmt.Sprintf("sourcecontrol: merge pr: http %d: %s", e.Status, e.Message)
+}
+
+// Unwrap lets errors.Is(err, ErrAuthenticationFailed)/errors.Is(err,
+// ErrPermissionDenied) see through a *MergePRError to GitHub's own real
+// HTTP status underneath (docs/TECHNICAL_PLAN.md §17's own automerge
+// dead-letter fix) -- reusing this type's own EXISTING Status/RateLimited
+// fields rather than inventing a second, parallel classification. A 401
+// is unambiguous (see ErrAuthenticationFailed's own doc comment: GitHub
+// never uses 401 for rate limiting). A 403 unwraps to ErrPermissionDenied
+// ONLY when RateLimited is false -- a rate-limited 403 must never unwrap
+// to either sentinel, since that would make a live, self-resolving rate
+// limit indistinguishable from a permanently revoked credential to any
+// caller that only checks errors.Is (ErrPermissionDenied's own doc
+// comment spells out both misclassification directions this guards
+// against).
+func (e *MergePRError) Unwrap() error {
+	switch {
+	case e.Status == http.StatusUnauthorized:
+		return ErrAuthenticationFailed
+	case e.Status == http.StatusForbidden && !e.RateLimited:
+		return ErrPermissionDenied
+	default:
+		return nil
+	}
 }
 
 // MergePRSpec is what SourceControl.MergePR (§16.2's own Merge

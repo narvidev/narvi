@@ -192,6 +192,7 @@ var stepRefPins = []stepRefPin{
 	{"migrations/000101_repo_settings_live_egress_enabled.up.sql", "104", "shadow operator surface"},
 	{"migrations/000103_outbox_shadow_epoch.up.sql", "104", "shadow operator surface"},
 	{"migrations/000125_platform_analytics_indexes.up.sql", "120", "analytics: platform-wide rollup"},
+	{"migrations/000127_release_manifest_checks_composition.up.sql", "125", "release composition findings"},
 }
 
 // stepRefPinKey is the map key TestStepRefsPinnedToPlanRows and the

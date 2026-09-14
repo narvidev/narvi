@@ -83,7 +83,7 @@ func TestApprovePlan_SnapshotConflict_AbortsWholeApproval(t *testing.T) {
 	session := createSessionForUser(ctx, t, rig, owner.ID, nil)
 	plan := seedAwaitingApprovalPlan(ctx, t, rig, session.ID, 1)
 
-	if _, err := rig.planDocuments.Create(ctx, plan.ID, "a pre-existing row already occupying this plan's own unique slot"); err != nil {
+	if _, err := rig.planDocuments.Create(ctx, plan.ID, "a pre-existing row already occupying this plan's own unique slot", nil); err != nil {
 		t.Fatalf("pre-seed conflicting plan_documents row: %v", err)
 	}
 
