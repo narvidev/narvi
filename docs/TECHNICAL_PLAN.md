@@ -283,6 +283,48 @@ The adapter already has a *partial* answer for the auto-compaction case: an `Ove
 
 **Phasing:** Step 44 — one PR: the classifier + `forceCompaction` + retry loop + `OpenCodeSummarizeTimeout` + table-driven unit tests on the retry decision + a fake-server test (mirroring `fake_server_test.go`'s existing precedent) + the one real-binary contract case above. Independent of every warm-boot Step (§19) — it touches only the OpenCode adapter, and can land whenever Step 17 (OpenCode adapter) is already merged, in parallel with anything else.
 
+### 7.3 A retry decision is not a diagnosis
+
+The adapter already classifies an engine error well enough to **act** on it: `openCodeTaggedError`
+carries the tagged-union member name, and `openCodeErrorData` is modelled — deliberately, and its own
+doc comment says so — for exactly the fields §7.2's transient-retry decision consumes. That is the
+right scope for a decision. It is the wrong scope for the question asked afterwards, which is never
+"should this have been retried" but "why did it fail, and is it failing for everyone".
+
+What reaches a human today, once the retries are exhausted, is `opencode: APIError` and a failure
+reason. That names the union member and nothing that locates the cause: not the model that was
+running, not the runtime version that produced it, not the provider's own request identifier — the
+one token that makes a support conversation with that provider possible at all. The sandbox provider
+side is already better off: §4.1's `ProviderError` carries an `Op` from a fixed vocabulary and the
+provider's own code. The agent runtime has no equivalent.
+
+**Keep what is available, by allowlist, never by taking the error object whole.** The fields worth
+retaining when the engine supplies them: the human-readable message, the union member name and HTTP
+status already decoded, the provider's request identifier, the model that ran, the pinned runtime
+version §7 already records in the boot fingerprint, and the sandbox the turn ran on. The allowlist is
+the design here, not an implementation detail — `APIError`'s own payload also carries
+`responseHeaders` and `responseBody`, which is where credentials and the prompt itself live. A
+blocklist over those two is a redaction rule that the next schema addition silently defeats; an
+allowlist degrades to *less diagnostic information*, which is the direction this must fail in. A size
+cap applies on top, because a provider is free to return a message of any length and a diagnostic
+that fills the session journal is its own outage.
+
+**Where it surfaces**: the session's own event journal, so the person looking at the session sees it,
+and the operator diagnostic path §5.3 already scopes by correlation id. One record read from two
+places — never a detail written in one surface and absent from the other, which is the same rule
+§36.2 states for turn outcomes and for the same reason.
+
+**The retry decision does not move.** It stays on the typed discriminator — `Name == "APIError"`
+together with `isRetryable` — exactly as §7.2 specifies, and as §4.1 and §18.1 each require within
+their own domain. Enrichment is additive and strictly downstream of that decision. The moment a
+diagnostic field becomes an *input* to whether something is retried, this has become classification
+by error text, which is the failure all three of those sections exist to forbid.
+
+The exit criterion is the one that would actually catch a regression: a provider failure can be
+traced from the diagnostic to its cause, **and** the same diagnostic is asserted to contain neither
+credentials nor request content. A test that checks only the first half is a check that passes while
+verifying nothing about the half that carries the risk.
+
 ## 8. Feature set (exit criteria, not options)
 
 1. **Plan mode**: persistent plans, HITL approve/reject on web/Slack/Linear/GitHub, server-side implementation dispatch on approval, plan/build model split, cross-channel verdict + archive notifications.
@@ -5800,6 +5842,30 @@ same submission, no cycles, at most one successor per predecessor — but as a w
 on a trusted agent's output, not as a security boundary, and a hallucinated identifier degrades to
 a link that cannot resolve its own ticket rather than to anything worse.
 
+**The graph is of leaves, and it is reconciled rather than merely well-formed (amendment).** Two
+things the paragraphs above leave open, and both decide whether a train runs at all against a real
+ticket hierarchy.
+
+*Decomposition goes to the leaves and keeps the ancestry.* A sub-issue that itself has sub-issues is
+a container: it describes work, it does not contain any. Spawning a session for it produces either a
+duplicate of its children's diffs or an empty pull request, and both consume a whole link's review
+budget to say nothing. The train's members are the **leaves**; each keeps a reference to the ancestor
+chain it came from, because that chain is what §39.4's escalation is surfaced on and what a human
+reads to place one small PR among fifteen others. A container therefore contributes structure and
+never a code session. A blocking relation declared **on** a container is inherited by the leaves
+beneath it and resolved against them — a dependency on something nothing will ever execute is a
+dependency that never clears, and the link waiting on it waits forever.
+
+*Reconciliation is a separate step from validation.* The self-consistency check above is
+well-formedness on a trusted agent's output: identifiers unique, no cycles, every dependency naming
+another member. It compares the submission only against **itself**, which is why it cannot catch a
+submission that is internally perfect and describes a graph the tracker no longer has. Before any
+session is spawned, the submission is reconciled against the tracker's own relations as they stand
+at that moment — the authority §39.2 already names. The dangerous direction is a relation the
+tracker declares and the submission omits: that produces a train running two dependent pieces of
+work concurrently, with nothing anywhere reporting an inconsistency, which is precisely the failure
+this feature exists to avoid rather than to cause.
+
 ### 39.3 The gate is the recomputed verdict, never a self-reported risk level
 A successor does not start because its predecessor opened a pull request. It starts because that
 PR's review came back clean — and *clean* here means §21.2's **server-recomputed** `Shippable` and
@@ -5849,6 +5915,40 @@ above:
   construction, which is precisely the shape §24.8 defers. §24.8's verdict-waiter exemption is not
   optional here: without it, a successor waits forever on a verdict a deferred review never posts,
   and a gate built to avoid pointless work would have produced a deadlock instead.
+
+### 39.5b A link is a durable identity, not a step counter (amendment)
+§39.1 gives each sub-issue a row with a short-lived claim state. That row outlives the moment it was
+created, and four questions follow from it being long-lived. Each has a wrong answer that is only
+visible in production.
+
+- **The association is persisted once, in one place.** Leaf ticket → link → session, written when
+  the session is spawned and read by everything afterwards: the progress surfaced on the ticket, the
+  routing of a follow-up message, the escalation of §39.4, the operator view. Recomputing that
+  association from the tracker at each use is how two callers come to disagree about which session a
+  ticket is on, and the disagreement surfaces as a reply delivered to the wrong agent.
+- **A link resolves its predecessor and its effective base when it starts**, not when the train was
+  submitted. The graph moves underneath a waiting link — a ticket reparented, a predecessor's PR
+  retargeted, a branch deleted — and a base captured at submission time would stack the work on a
+  branch chosen against a world that no longer exists. This is §17.6's stacking question asked once
+  per link, and §21.1's amended staleness rule is the same observation about verdicts. An
+  unresolvable predecessor makes the link fail visibly; what it must never do is fall through to the
+  default branch, which produces a PR that merges cleanly and contains the wrong diff.
+- **A child can finish without producing a pull request**, and this is the state most likely to be
+  missing, because it is the only one that is not a failure anybody notices. The work may have
+  turned out unnecessary; the session may have failed outright. Either way there is no PR, therefore
+  no review, therefore no verdict — and §39.3's gate fires on a verdict. Every successor then waits
+  forever on a signal that will not come, and a train stalled this way looks, from the ticket, like a
+  train still working. A link therefore carries a terminal outcome of its own, distinct from
+  *blocked*: visible on the parent ticket, notified **once and idempotently** — a train that
+  re-notifies on every poll is a train nobody stays subscribed to — and its successors are disposed
+  of deliberately, released to run or terminated with the reason, never left waiting.
+- **Stop is a train-level operation.** §39.3 already stops a running link whose verdict turned
+  blocking, which is a different thing. An explicit human Stop has to reach the links that are merely
+  **waiting** and own no session to interrupt, as well as the children currently running; stopping
+  only what is running leaves a train that resumes itself the moment the next verdict lands. And once
+  a link is stopped or its ticket closed, its message routing is retired: a follow-up arriving
+  afterwards has no session to reach, and delivering it to the last session known is worse than
+  reporting that there is none.
 
 ### 39.6 What this changes in §17.6, stated rather than left to be noticed
 §17.6 declines to build an N-deep stack producer, on the ground that "nothing else in this plan
