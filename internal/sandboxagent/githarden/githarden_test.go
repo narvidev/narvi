@@ -190,15 +190,25 @@ func TestArgs_CredentialHelperResetPrecedesTheCallersOwn(t *testing.T) {
 // §30.5 hands it, plus (for the first two) a committed .gitattributes,
 // which any repository ships.
 
+// gitEnv is os.Environ plus a fixed identity. EVERY git command this file
+// spawns needs it, not only the committing ones: a merge writes a commit
+// too, and a developer machine's own global identity would silently supply
+// it while a CI container has none -- so a command that omits this passes
+// locally and fails remotely for a reason that has nothing to do with what
+// the test is about.
+func gitEnv() []string {
+	return append(os.Environ(),
+		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.invalid",
+		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.invalid",
+	)
+}
+
 // gitInRepo runs git in dir with a fixed identity, failing the test on error.
 func gitInRepo(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(),
-		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.invalid",
-		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.invalid",
-	)
+	cmd.Env = gitEnv()
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
@@ -281,14 +291,26 @@ func TestOpenClass_MergeDriverExecutes(t *testing.T) {
 	}
 	gitInRepo(t, repoDir, "commit", "-qam", "ours")
 
-	// The merge itself is allowed to report a conflict; only the driver
-	// having RUN is what this test observes.
+	// The merge is allowed to report a conflict -- only the driver having
+	// RUN is what this test observes. But its output is captured and
+	// reported on failure: a merge that never happened (a git that refused
+	// the repository, a branch name this fixture guessed wrong) would
+	// otherwise look identical to a driver that did not fire, and this test
+	// would blame the wrong thing.
 	merge := exec.Command("git", append(Args(repoDir), "merge", "theirs")...)
 	merge.Dir = repoDir
-	_ = merge.Run()
+	merge.Env = gitEnv()
+	mergeOut, mergeErr := merge.CombinedOutput()
+
+	// Precondition: git must actually have attempted a three-way merge of
+	// the armed path. If it fast-forwarded or refused outright, the driver
+	// was never reachable and the run proves nothing either way.
+	if !strings.Contains(string(mergeOut), "f.txt") {
+		t.Fatalf("precondition failed: git never attempted a three-way merge of the armed path.\ngit merge said: %v\n%s", mergeErr, mergeOut)
+	}
 
 	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("the armed merge driver did NOT run (marker %s absent: %v) -- if this now passes because the class was closed, delete this test rather than repairing it", marker, err)
+		t.Fatalf("the armed merge driver did NOT run (marker %s absent: %v)\ngit merge said: %v\n%s\n-- if this now passes because the class was closed, delete this test rather than repairing it", marker, err, mergeErr, mergeOut)
 	}
 }
 
@@ -318,9 +340,10 @@ func TestOpenClass_UploadPackExecutes(t *testing.T) {
 
 	fetch := exec.Command("git", append(Args(repoDir), "fetch", "origin")...)
 	fetch.Dir = repoDir
-	_ = fetch.Run()
+	fetch.Env = gitEnv()
+	fetchOut, fetchErr := fetch.CombinedOutput()
 
 	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("the armed uploadpack command did NOT run (marker %s absent: %v) -- if this now passes because the class was closed, delete this test rather than repairing it", marker, err)
+		t.Fatalf("the armed uploadpack command did NOT run (marker %s absent: %v)\ngit fetch said: %v\n%s\n-- if this now passes because the class was closed, delete this test rather than repairing it", marker, err, fetchErr, fetchOut)
 	}
 }
