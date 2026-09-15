@@ -34,13 +34,22 @@ import (
 	"github.com/narvidev/narvi/internal/platform"
 )
 
-// minioImage is pinned to a real, currently-published tag (verified
-// directly against the Docker Hub registry API and pulled successfully
-// while writing this test) -- the SAME tag docker-compose.dev.yml's own
-// minio service uses, for the same consistency reason
-// docker-compose.dev.yml's own postgres service comment already gives
-// ("same image the §2 testcontainers integration test uses").
-const minioImage = "minio/minio:RELEASE.2025-09-07T16-13-09Z"
+// minioImage names quay.io, MinIO's own registry, NOT Docker Hub.
+//
+// The tag is unchanged and was always correct; what moved is where it can
+// be fetched from. `minio/minio` on Docker Hub now answers every anonymous
+// pull with "pull access denied ... repository does not exist or may
+// require 'docker login'" -- not a rate limit, which would say so, and not
+// transient: it reproduces from a developer machine as readily as from CI.
+// This service's own compose comment had already recorded that Docker Hub
+// publishing "appears to have gone quiet after this exact release"; the
+// repository has since stopped answering altogether.
+//
+// quay.io/minio/minio serves the SAME pinned tag (verified by pulling it),
+// so nothing about what this test runs against changes. Still deliberately
+// not ":latest" -- see docker-compose.dev.yml's own minio comment, which
+// names the same registry for the same reason.
+const minioImage = "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
 
 // minioTestBucket is created fresh inside TestStore_MinIORoundTrip via a
 // raw admin *s3.Client (see that test) -- ports.BlobStore itself
