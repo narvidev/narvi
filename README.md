@@ -27,6 +27,7 @@ Narvi — this repository — is the engine and team web UI, complete on its own
 | [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) | The work broken into 176 Steps across 19 phases (0–18) — 141 of scheduled work (3 of them gated on a product decision), 3 routed out to a separate repository, plus 32 named gaps (Phase 11) that gate nothing — each Step shippable as one pull request and referencing the technical-plan section that specifies it. |
 | [`docs/design/mockups.html`](docs/design/mockups.html) | Visual specification — nine UI views with numbered design decisions. Open in a browser. |
 | [`docs/environments.md`](docs/environments.md) | Requirements for an Environment's own `setup.sh`/`start.sh` — notably the `setup.sh` idempotency contract every repo must satisfy under warm-boot shared images. |
+| [`docs/analyses/`](docs/analyses/) | Dated, point-in-time studies that informed a plan change, each pinning the commit it was checked against. **Not normative** — where one disagrees with the plans, the plans win and the analysis is stale by definition. |
 
 ## Building it
 
