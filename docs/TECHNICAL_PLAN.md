@@ -1152,6 +1152,42 @@ written down now, while it costs nothing, rather than discovered by the first me
 Phasing: with §35 and §36, in the appended phase. It extends Step 65's own ingress lane and needs
 nothing that Step did not already build.
 
+
+**Membership is an event, not a property read once (amendment).** Everything above decides from a
+PR's base at the moment a trigger fires. A stack is not that stable: a PR joins one, leaves one, is
+retargeted, or the stack dissolves entirely — and GitHub emits events for exactly those transitions,
+which this ingress does not route today. Three consequences follow, and they are not
+interchangeable.
+
+**Invalidation is immediate; only the launch waits.** When membership changes, any decision that
+rested on the old shape stops being applicable at once — an approval that is now contrary to policy
+must be revoked in the same breath as the event, never after a quiet period. What waits is the
+*launch* of a replacement review, debounced so a burst of restructuring does not spend a review per
+event. Deferring both together would leave the stale approval usable for the whole delay, which is
+the failure the debounce was supposed to make cheaper, not the failure it is allowed to create.
+
+**The debounce is per PR and does not pretend otherwise.** Ten PRs restructured together still
+launch ten reviews once their windows close. Nothing here serialises a stack's members or schedules
+them as a unit, and a reader who assumes otherwise will size the budget wrong. Stating the limit is
+the point; §24.6's per-PR budget is what actually bounds the spend.
+
+**Work is persisted before the webhook is acknowledged, and an obsolete attempt is abandoned.** A
+membership read against GitHub takes time, and a newer event can land during it; the older attempt
+must be dropped rather than allowed to publish a decision about a shape that no longer exists. A
+read or handling failure is retried through §2's existing persistent timers, not a new mechanism.
+
+**An unknown base is unknown, never fresh.** The native stack context can report a base this system
+cannot resolve — absent, null, or naming something it cannot see. That is a third state beside
+"matches" and "differs", and it must never satisfy a freshness check: an absent value is not evidence
+that a review still covers the code. §21.1's amended context rule is what this feeds.
+
+One question this section does **not** settle, deliberately: whether a trigger policy should look at
+a PR's direct parent or at the stack's ultimate target. The review's diff is the increment against
+the direct parent and stays that way — §21.1 is explicit that a verdict pinned to one head cannot
+honestly cover a cumulative multi-PR diff. Whether the *gate* consults the ultimate target is a
+separate decision, and silently substituting one base for the other everywhere would change what
+§24.3 gates on without saying so. Step 142 carries the lifecycle; that choice is named there as a
+decision, not assumed.
 ## 25. Configurable workflow engine per lane + visual canvas editor (new capability)
 
 Problem this solves: today each of Narvi's three lanes (review, request/build, plan) is one fixed
@@ -5544,6 +5580,28 @@ Coverage is deliberately narrow: only a fresh lineage ships a recap. A restore w
 not carry a usable runtime session loses context too and ships none yet — that case is instrumented
 first, so the decision to widen rests on how often it actually happens.
 
+### 35.5b The snapshot carries the runtime it was minted under (amendment)
+
+A rotation restores a snapshot into a fresh sandbox with a fresh deadline. That new deadline says
+nothing about the binaries inside it: a snapshot minted under an older agent runtime restores with
+that older runtime, and the only thing the restart made younger is the clock. **A fresh start date
+does not make a snapshot's contents current**, and without a recorded provenance an incompatible
+snapshot is indistinguishable from a current one at the moment it matters.
+
+So the runtime version is captured **at mint** and travels with the snapshot across every restore.
+The source of truth is what the snapshot actually contains, never a desired version injected at boot
+— reading the intended version and stamping it onto an old snapshot would relabel the problem rather
+than detect it, and that mislabel is worse than no label, because it reads as a check that passed.
+
+Three states, treated differently and never collapsed: **compatible**, restored normally;
+**incompatible**, refused with a reason the operator can see, falling back to a fresh lineage under
+§35.5's own rules, with §35.4's continuity note explaining what happened rather than presenting the
+restart as routine; and **provenance unknown**, which is its own state and not a synonym for
+compatible — treating an unrecorded version as "probably fine" is how the first two states stop
+being distinguishable. Whether historic unversioned snapshots exist at all is an empirical question,
+and a staged migration for them is worth building only if the answer is yes. Steps 136 and 139 carry
+this.
+
 ### 35.6 One stored row per text part
 §6.1 pins the `token` event as cumulative text, upsert-by-`messageId`. Under that contract a
 sandbox lost mid-turn keeps only the **last text fragment** of a multi-part answer, and §35.5's
@@ -5922,6 +5980,30 @@ turn ends under its own `turn_deadline`, a `warning` is persisted and one notice
 derives its terminal status through §3.1's transition table with a new named reason — never `failed`,
 because nothing failed. A human may extend a bound on one session (audited); the extension is the
 remedy, exactly as raising the cap is.
+
+**A bound on elapsed work is not a bound on wasted work (amendment).** Everything above measures
+how much a session has DONE — turns taken, wall-clock burnt, money spent. None of it asks whether
+any of that produced anything. A session that retries the same failing build for six hours stays
+inside every bound here and inside 40.1's cap, because each attempt is a well-formed turn that cost
+what turns cost. `loopguard` does not close this either: it bounds the iterations of ONE workflow
+step, not a session's whole run without result.
+
+So a fourth quantity is measured, and its novelty is the clock it runs on: **time, cost and attempts
+since the last OBSERVABLE progress**, not since the session began. Observable is the load-bearing
+word, and it means server-verifiable: a pull request created or merged as the source-control provider
+itself reports it, or an explicit human resumption. **An agent's own claim of progress is not
+progress** — the whole failure being bounded is an agent that believes it is advancing, so a
+self-report is the one signal that cannot be trusted here, and a tool call announcing success must
+not reset this window. The check is therefore server-side and fires whether or not the agent
+cooperates, which distinguishes it from any budget the agent is asked to respect.
+
+The window resets on observed progress and on nothing else. Its expiry is not a failure and not a
+`failed` status: same shape as a bound above, a named reason, a persisted `warning`, one notice, and
+a human resumption as the remedy. **Resetting it resets nothing else** — not 40.1's spend cap, not
+40.3's turn and wall-clock bounds. A session that has made progress every hour for two days has an
+empty no-progress window and may still be out of money, and conflating the two would let steady
+visible progress spend without limit. Step 148 carries this; Step 150's absolute bounds stay
+separate on purpose.
 
 ### 40.4 The autonomy level: one column that constrains the toggles
 
