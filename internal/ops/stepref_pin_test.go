@@ -22,7 +22,7 @@ type stepRefPin struct {
 }
 
 // stepRefPins is the golden table. Adding a NEW citation under
-// stepRefPinScanDirs means adding its (file, number) pair here too, after
+// stepRefPinScanRoots means adding its (file, number) pair here too, after
 // verifying it the way the sweep did: find the row whose TITLE AND CONTENT
 // match what the citing text claims, never by arithmetic. That is what
 // keeps this table honest rather than a rubber stamp -- an entry asserts "a
@@ -35,9 +35,22 @@ var stepRefPins = []stepRefPin{
 	{"deploy/sandbox-image/Dockerfile", "13", "sandbox-agent: supervisor"},
 	{"deploy/sandbox-image/Dockerfile", "74", "sandbox substrate: docker, egress policy, toolchain"},
 	{"deploy/seed/example.yaml", "75", "config/data seeding"},
+	{"docs/DECISIONS.md", "107", "mode A: arch-decisions block, mode buffer, write hygiene"},
+	{"docs/DECISIONS.md", "108", "mode B: index & retrieval — **routed out**"},
+	{"docs/DECISIONS.md", "142", "base-branch gate, retarget lane, write-time refusals"},
+	{"docs/DECISIONS.md", "152", "no un-entitlement, ever"},
+	{"docs/DECISIONS.md", "153", "the bot token is an egress credential in the ingress bundle"},
+	{"docs/DECISIONS.md", "156", "the embeddings provider is an un-closed egress channel"},
+	{"docs/DECISIONS.md", "158", "native-client authentication"},
+	{"docs/DECISIONS.md", "161", "`plan_documents` is written by one place and read by none"},
+	{"docs/DECISIONS.md", "163", "sandbox provider selection"},
+	{"docs/DECISIONS.md", "167", "the boundary: RuntimeClass, fail-closed"},
+	{"docs/DECISIONS.md", "171", "sandbox-agent must not run git against a runtime-owned `.git`"},
 	{"docs/guides/README.md", "64", "plan mode: follow-up intent classification (amend vs answer)"},
 	{"docs/guides/README.md", "77", "ops"},
 	{"docs/guides/README.md", "78", "launch readiness"},
+	{"docs/guides/README.md", "165", "the document and its drift test"},
+	{"docs/guides/README.md", "178", "the guide drift check only runs in the direction that does not fail"},
 	{"docs/guides/github.md", "48", "sentinels + suggestions"},
 	{"docs/guides/github.md", "63", "review: learned false-positive patterns"},
 	{"docs/guides/github.md", "65", "review: automatic re-review on new commits"},
@@ -232,7 +245,7 @@ func TestStepRefsPinnedToPlanRows(t *testing.T) {
 		t.Fatal("LoadPlanStepTitles returned no rows at all -- the plan's table format probably changed under planStepRowPattern")
 	}
 
-	citations, err := ScanStepCitationsForPinning(root, stepRefPinScanDirs)
+	citations, err := ScanStepCitationsForPinning(root, stepRefPinScanRoots)
 	if err != nil {
 		t.Fatalf("ScanStepCitationsForPinning: %v", err)
 	}
@@ -275,7 +288,7 @@ func TestStepRefsPinnedToPlanRows(t *testing.T) {
 	for _, pin := range stepRefPins {
 		if _, ok := cited[stepRefPinKey(pin.File, pin.Num)]; !ok {
 			t.Errorf("stepRefPins has %s pinned to Step %s (%q) but no citation of it remains in that file under any of %v -- "+
-				"remove the stale pin.", pin.File, pin.Num, pin.Title, stepRefPinScanDirs)
+				"remove the stale pin.", pin.File, pin.Num, pin.Title, stepRefPinScanRoots)
 		}
 	}
 }
