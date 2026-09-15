@@ -184,6 +184,7 @@ func (f *autoRetriggerFixture) insertVerdict(ctx context.Context, t *testing.T, 
 		SessionID:         f.sessionID,
 		ArchDecisionTags:  []byte(`[]`),
 		ArchDecisionRoots: []byte(`[]`),
+		AncestorChain:     []byte(`[]`),
 	}); err != nil {
 		t.Fatalf("insert review verdict: %v", err)
 	}
@@ -211,6 +212,7 @@ func (f *autoRetriggerFixture) insertVerdictWithReviewPath(ctx context.Context, 
 		ReviewPath:        &reviewPath,
 		ArchDecisionTags:  []byte(`[]`),
 		ArchDecisionRoots: []byte(`[]`),
+		AncestorChain:     []byte(`[]`),
 	}); err != nil {
 		t.Fatalf("insert review verdict with review_path: %v", err)
 	}

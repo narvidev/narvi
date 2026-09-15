@@ -122,7 +122,22 @@ import (
 // review_verdicts.knowledge_influenced (migrations/000117) is NOT NULL
 // DEFAULT false, so a caller that has no turn to read (this function's
 // own zero value) safely persists false, never an ambiguous NULL.
-func Insert(ctx context.Context, store *postgres.ReviewVerdictStore, repoSettings *postgres.RepoSettingsStore, platformShadow bool, repoFullName string, prNumber int32, headSHA string, sessionID pgtype.UUID, verdict review.Verdict, digest reviewpost.Digest, reviewPath reviewtriage.ReviewDepth, counterReview review.CounterReviewStatus, factCheck reviewpost.FactCheckStatus, factCheckKilled int, archDecisionTags, archDecisionRoots []string, knowledgeMode string, knowledgeInfluenced bool) (reviewverdict.Record, error) {
+// verdictContext/attemptID (§21.1's amendment) forward the rest of what
+// this verdict examined, beyond headSHA above -- verdictContext is the
+// posting turn's own turns.review_verdict_context, already unmarshaled
+// by the caller (httpapi.PostReviewVerdict) into reviewverdict.Context;
+// attemptID is that SAME turn's own id. Both forward verbatim onto this
+// row's own base_ref/base_sha/ancestor_chain/policy_version/attempt_id
+// columns (migrations/000130_review_verdicts_context.up.sql) -- this
+// function does no resolution of its own, mirroring reviewPath/
+// counterReview/factCheck's own identical "caller already resolved it,
+// this function only persists" contract. verdictContext.BaseRef == ""
+// (the zero value, or a caller whose own turn predates the amendment)
+// persists base_ref/base_sha as genuine SQL NULL via nonEmptyStringPtr
+// below -- never the empty string -- so internal/domain/autoapproval.
+// ComputeEligible reads it back as UNKNOWN, exactly like a pre-migration
+// row.
+func Insert(ctx context.Context, store *postgres.ReviewVerdictStore, repoSettings *postgres.RepoSettingsStore, platformShadow bool, repoFullName string, prNumber int32, headSHA string, sessionID pgtype.UUID, verdict review.Verdict, digest reviewpost.Digest, reviewPath reviewtriage.ReviewDepth, counterReview review.CounterReviewStatus, factCheck reviewpost.FactCheckStatus, factCheckKilled int, archDecisionTags, archDecisionRoots []string, knowledgeMode string, knowledgeInfluenced bool, verdictContext reviewverdict.Context, attemptID pgtype.UUID) (reviewverdict.Record, error) {
 	if headSHA == "" {
 		return reviewverdict.Record{}, fmt.Errorf("reviewverdict: insert: refusing to persist a verdict with no known head sha for %s#%d", repoFullName, prNumber)
 	}
@@ -165,6 +180,11 @@ func Insert(ctx context.Context, store *postgres.ReviewVerdictStore, repoSetting
 		return reviewverdict.Record{}, fmt.Errorf("reviewverdict: marshal arch decision roots: %w", err)
 	}
 
+	ancestorChainJSON, err := marshalAncestorChain(verdictContext.AncestorChain)
+	if err != nil {
+		return reviewverdict.Record{}, fmt.Errorf("reviewverdict: marshal ancestor chain: %w", err)
+	}
+
 	row, err := store.Insert(ctx, sqlcgen.InsertReviewVerdictParams{
 		RepoFullName:              repoFullName,
 		PrNumber:                  prNumber,
@@ -195,6 +215,11 @@ func Insert(ctx context.Context, store *postgres.ReviewVerdictStore, repoSetting
 		ArchDecisionRoots:         archDecisionRootsJSON,
 		KnowledgeMode:             nonEmptyStringPtr(knowledgeMode),
 		KnowledgeInfluenced:       knowledgeInfluenced,
+		BaseRef:                   nonEmptyStringPtr(verdictContext.BaseRef),
+		BaseSha:                   nonEmptyStringPtr(verdictContext.BaseSHA),
+		AncestorChain:             ancestorChainJSON,
+		PolicyVersion:             int32(verdictContext.PolicyVersion),
+		AttemptID:                 attemptID,
 	})
 	if err != nil {
 		return reviewverdict.Record{}, err

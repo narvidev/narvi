@@ -44,6 +44,7 @@ func insertAutoApprovedVerdict(ctx context.Context, t *testing.T, store *narvipg
 		SuppressedInShadow: suppressedInShadow,
 		ArchDecisionTags:   []byte(`[]`),
 		ArchDecisionRoots:  []byte(`[]`),
+		AncestorChain:      []byte(`[]`),
 	}); err != nil {
 		t.Fatalf("insert review_verdicts row: %v", err)
 	}

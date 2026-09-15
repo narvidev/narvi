@@ -682,8 +682,16 @@ type pullRequestResponse struct {
 	// reason (H5's head-branch resolution). Never nullable on a real
 	// GitHub PR resource (unlike Head.Repo, a base branch/repo can never
 	// be deleted while the PR referencing it is open/merged).
+	// SHA (§21.1's amendment) is this PR's own CURRENT base commit --
+	// PREVIOUSLY never decoded at all, which is the exact gap that
+	// amendment names: "the GitHub decoder reads base.ref while never
+	// reading base.sha at all." Reading it alone does not fix the hazard
+	// (a decoded value nothing yet compares is inert) -- see
+	// PullRequest.BaseSHA's own doc comment below for what actually
+	// consumes it.
 	Base struct {
 		Ref string `json:"ref"`
+		SHA string `json:"sha"`
 	} `json:"base"`
 
 	// Labels (§15.1) is this PR's own CURRENT label set --
@@ -781,6 +789,15 @@ type PullRequest struct {
 	HeadRepoCloneURL string
 	// BaseRef (§15.1) is this PR's own real base branch name.
 	BaseRef string
+	// BaseSHA (§21.1's amendment) is the commit BaseRef resolved to at
+	// the moment this response was fetched -- internal/app/reviewcontext.
+	// Fetch's own source for review.PreFetchedContext.BaseSHA, persisted
+	// turn-scoped and compared, at verdict-eligibility time, against the
+	// PR's own CURRENT base commit: "a PR evaluated while based on
+	// another PR's branch, then retargeted -- or whose parent moved
+	// beneath it -- keeps an unchanged head" is exactly the hazard this
+	// field, previously never decoded at all, closes.
+	BaseSHA string
 	// Labels (§15.1) is this PR's own current label names.
 	Labels []string
 	// Stack is non-nil exactly when this PR belongs to a GitHub-native
@@ -847,6 +864,7 @@ func (a *Adapter) GetPullRequest(ctx context.Context, owner, repo string, number
 		HeadRef:      parsed.Head.Ref,
 		HeadSHA:      parsed.Head.SHA,
 		BaseRef:      parsed.Base.Ref,
+		BaseSHA:      parsed.Base.SHA,
 		Additions:    parsed.Additions,
 		Deletions:    parsed.Deletions,
 		ChangedFiles: parsed.ChangedFiles,

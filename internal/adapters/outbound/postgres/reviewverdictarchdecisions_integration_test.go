@@ -59,6 +59,7 @@ func insertArchDecisionVerdict(ctx context.Context, t *testing.T, store *narvipg
 		SuppressedInShadow:  suppressedInShadow,
 		ArchDecisionTags:    tags,
 		ArchDecisionRoots:   roots,
+		AncestorChain:       []byte(`[]`),
 	})
 	if err != nil {
 		t.Fatalf("insert review_verdicts row: %v", err)

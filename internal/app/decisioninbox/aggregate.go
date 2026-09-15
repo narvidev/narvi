@@ -636,10 +636,25 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// eligibleIgnoringHumanSignals, which is exactly "would the engine
 	// have approved this on its own criteria", independent of which
 	// human-disagreement signal (if any) is ALSO present.
+	// VerdictAssessed/VerdictBaseRef/VerdictBaseSHA/VerdictAncestorChain/
+	// VerdictPolicyVersion and CurrentBaseRef/CurrentBaseSHA/
+	// CurrentAncestorChain (§21.1's amendment) mirror revalidateCore's
+	// own identical wiring (revalidate.go) -- record.Context is the SAME
+	// review_verdicts row record.HeadSHA already came from, and pr is
+	// this function's own already-fetched, live ports.OpenPR (no new
+	// I/O), exactly like pr.HeadSHA itself.
 	eligibleIgnoringHumanSignals, _ := autoapproval.ComputeEligible(autoapproval.EligibilityInput{
 		Verdict:                 record.Verdict,
+		VerdictAssessed:         true,
 		VerdictHeadSHA:          record.HeadSHA,
+		VerdictBaseRef:          record.Context.BaseRef,
+		VerdictBaseSHA:          record.Context.BaseSHA,
+		VerdictAncestorChain:    record.Context.AncestorChain,
+		VerdictPolicyVersion:    record.Context.PolicyVersion,
 		CurrentHeadSHA:          pr.HeadSHA,
+		CurrentBaseRef:          pr.BaseRef,
+		CurrentBaseSHA:          pr.BaseSHA,
+		CurrentAncestorChain:    convertAncestorChain(pr.AncestorChain),
 		CIGreen:                 ciGreen,
 		HasNeedsHumanLabel:      false,
 		ChangedFileCount:        changedFileCount,

@@ -438,6 +438,17 @@ type PRPerson struct {
 	Login      string
 }
 
+// PRAncestorLink is one link of a PR's own base-branch ancestry beyond its
+// immediate base -- ref+sha, mirrors internal/domain/review.AncestorLink's
+// identical shape one layer down (this port stays adapter-agnostic and
+// domain-free, §4.3, so it defines its own copy rather than importing a
+// domain type; the app layer converts between the two at the one call
+// site that needs both, internal/app/decisioninbox).
+type PRAncestorLink struct {
+	Ref string
+	SHA string
+}
+
 // OpenPR is one open pull request ListOpenPRsForUser reports (
 // §16.2: "ListOpenPRsForUser(ctx, user) ([]OpenPR, error) (review state,
 // CI at head SHA, labels, assignees/reviewers)"). Every field is this
@@ -464,7 +475,21 @@ type OpenPR struct {
 
 	HeadSHA string
 	BaseRef string
-	Draft   bool
+	// BaseSHA (§21.1's amendment) is the commit BaseRef resolved to at
+	// the moment this PR was fetched -- decisioninbox's own live
+	// eligibility re-check (internal/domain/autoapproval.ComputeEligible)
+	// compares this against a verdict's own recorded base commit, closing
+	// the gap named by that amendment: "the GitHub decoder reads
+	// base.ref while never reading base.sha at all."
+	BaseSHA string
+	// AncestorChain (§21.1's amendment) is this PR's own ordered
+	// ancestor chain beyond its immediate base -- PRAncestorLink's own
+	// doc comment; mirrors internal/domain/review.AncestorChainFromStack's
+	// identical derivation over this PR's own GitHub-native stack fields
+	// (empty unless this PR belongs to a stack AND is not its own
+	// bottom member).
+	AncestorChain []PRAncestorLink
+	Draft         bool
 
 	Author             PRPerson
 	Assignees          []PRPerson

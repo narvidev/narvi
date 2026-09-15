@@ -22,9 +22,23 @@ import (
 	"github.com/narvidev/narvi/internal/app/decisioninbox"
 	"github.com/narvidev/narvi/internal/app/ports"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
+	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
+	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 	"github.com/narvidev/narvi/internal/platform"
+)
+
+// testEligibleBaseRef/testEligibleBaseSHA (§21.1's amendment) mirror
+// internal/app/decisioninbox's own identical shared fixture pair
+// (aggregate_integration_test.go) -- every "eligible" ports.OpenPR
+// fixture in this file sets BOTH on the live PR AND seedEligiblePR below
+// stamps them onto the seeded verdict's own recorded context, so
+// internal/domain/autoapproval.ComputeEligible's new context-freshness
+// check passes for the same reason head_sha already has to match.
+const (
+	testEligibleBaseRef = "main"
+	testEligibleBaseSHA = "sha-eligible-base"
 )
 
 // fakeAutoMergeSourceControl is a minimal, test-only ports.SourceControl
@@ -347,7 +361,8 @@ func (rs *automergeTestRig) seedEligiblePR(ctx context.Context, t *testing.T, re
 	if _, err := repoSettings.UpsertLiveEgressEnabled(ctx, repoFullName, true); err != nil {
 		t.Fatalf("promote repo to live egress: %v", err)
 	}
-	if _, err := appreviewverdict.Insert(ctx, rs.reviewVerdict.ReviewVerdicts, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false); err != nil {
+	verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
+	if _, err := appreviewverdict.Insert(ctx, rs.reviewVerdict.ReviewVerdicts, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
 		t.Fatalf("seed review_verdicts row: %v", err)
 	}
 	return htmlURL
@@ -372,7 +387,7 @@ func TestPumpOnce_OffByDefault_NoMerge(t *testing.T) {
 		prsByKey: map[string]ports.OpenPR{
 			"acme/automerge-off-by-default#1": {
 				Owner: "acme", Repo: "automerge-off-by-default", Number: 1, HTMLURL: htmlURL,
-				HeadSHA: "sha-1", CIConclusion: ports.CIConclusionSuccess,
+				HeadSHA: "sha-1", BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, CIConclusion: ports.CIConclusionSuccess,
 			},
 		},
 		mergeSHA: "should-never-be-used",
@@ -406,7 +421,7 @@ func TestPumpOnce_ExplicitlyDisabled_NoMerge(t *testing.T) {
 		prsByKey: map[string]ports.OpenPR{
 			"acme/automerge-explicitly-off#2": {
 				Owner: "acme", Repo: "automerge-explicitly-off", Number: 2, HTMLURL: htmlURL,
-				HeadSHA: "sha-2", CIConclusion: ports.CIConclusionSuccess,
+				HeadSHA: "sha-2", BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, CIConclusion: ports.CIConclusionSuccess,
 			},
 		},
 	}
@@ -438,7 +453,7 @@ func TestPumpOnce_Armed_MergesEligibleCandidate(t *testing.T) {
 		prsByKey: map[string]ports.OpenPR{
 			"acme/automerge-armed#3": {
 				Owner: "acme", Repo: "automerge-armed", Number: 3, HTMLURL: htmlURL,
-				HeadSHA: "sha-3", CIConclusion: ports.CIConclusionSuccess,
+				HeadSHA: "sha-3", BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, CIConclusion: ports.CIConclusionSuccess,
 			},
 		},
 		mergeSHA: "merged-commit-sha",
@@ -486,7 +501,7 @@ func TestPumpOnce_Armed_StaleVerdictNeverMerges(t *testing.T) {
 		prsByKey: map[string]ports.OpenPR{
 			"acme/automerge-stale#4": {
 				Owner: "acme", Repo: "automerge-stale", Number: 4, HTMLURL: htmlURL,
-				HeadSHA: "sha-4-new-commit-landed", CIConclusion: ports.CIConclusionSuccess,
+				HeadSHA: "sha-4-new-commit-landed", BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, CIConclusion: ports.CIConclusionSuccess,
 			},
 		},
 	}
@@ -591,7 +606,7 @@ func TestPumpOnce_Armed_MergeFails_NeverPanics_NoConfirmedOutcomeRecorded(t *tes
 		prsByKey: map[string]ports.OpenPR{
 			"acme/automerge-merge-fails#7": {
 				Owner: "acme", Repo: "automerge-merge-fails", Number: 7, HTMLURL: htmlURL,
-				HeadSHA: "sha-7", CIConclusion: ports.CIConclusionSuccess,
+				HeadSHA: "sha-7", BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, CIConclusion: ports.CIConclusionSuccess,
 			},
 		},
 		mergeErr: &ports.MergePRError{Status: http.StatusMethodNotAllowed, Message: "not mergeable"},
@@ -690,7 +705,7 @@ func TestPumpOnce_MergePR401_DeadLettersWorkerWide_StopsHammeringAllRepos(t *tes
 		prsByKey: map[string]ports.OpenPR{
 			"acme/automerge-401-repo-a#10": {
 				Owner: "acme", Repo: "automerge-401-repo-a", Number: 10, HTMLURL: htmlURLA,
-				HeadSHA: "sha-10", CIConclusion: ports.CIConclusionSuccess,
+				HeadSHA: "sha-10", BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, CIConclusion: ports.CIConclusionSuccess,
 			},
 		},
 		mergeErr: &ports.MergePRError{Status: http.StatusUnauthorized, Message: "Bad credentials"},
@@ -735,7 +750,7 @@ func TestPumpOnce_MergePR401_DeadLettersWorkerWide_StopsHammeringAllRepos(t *tes
 	sc.mu.Lock()
 	sc.prsByKey["acme/automerge-401-repo-b-never-failed#11"] = ports.OpenPR{
 		Owner: "acme", Repo: "automerge-401-repo-b-never-failed", Number: 11, HTMLURL: htmlURLB,
-		HeadSHA: "sha-11", CIConclusion: ports.CIConclusionSuccess,
+		HeadSHA: "sha-11", BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, CIConclusion: ports.CIConclusionSuccess,
 	}
 	sc.mu.Unlock()
 
@@ -790,11 +805,11 @@ func TestPumpOnce_MergePR403NonRateLimited_DeadLettersOnlyThatRepo(t *testing.T)
 		prsByKey: map[string]ports.OpenPR{
 			"acme/automerge-403-denied#20": {
 				Owner: "acme", Repo: "automerge-403-denied", Number: 20, HTMLURL: htmlURLDenied,
-				HeadSHA: "sha-20", CIConclusion: ports.CIConclusionSuccess,
+				HeadSHA: "sha-20", BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, CIConclusion: ports.CIConclusionSuccess,
 			},
 			"acme/automerge-403-healthy#21": {
 				Owner: "acme", Repo: "automerge-403-healthy", Number: 21, HTMLURL: htmlURLHealthy,
-				HeadSHA: "sha-21", CIConclusion: ports.CIConclusionSuccess,
+				HeadSHA: "sha-21", BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, CIConclusion: ports.CIConclusionSuccess,
 			},
 		},
 		// mergeErrByRepo, not the plain every-call mergeErr: this test's
@@ -1028,7 +1043,7 @@ func TestPumpOnce_ConcurrentArmedRepos_OneTickAuthFailure_CoalescesNotDeadLetter
 		}
 		sc.prsByKey[fmt.Sprintf("%s#%d", repoFullName, prNumber)] = ports.OpenPR{
 			Owner: "acme", Repo: repo, Number: int(prNumber), HTMLURL: htmlURL,
-			HeadSHA: headSHA, CIConclusion: ports.CIConclusionSuccess,
+			HeadSHA: headSHA, BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, CIConclusion: ports.CIConclusionSuccess,
 		}
 	}
 	worker := rig.newWorker(t, sc)

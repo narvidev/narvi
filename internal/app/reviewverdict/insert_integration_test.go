@@ -14,6 +14,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -29,10 +30,13 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
+	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
 	"github.com/narvidev/narvi/internal/domain/reviewtriage"
+	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 	"github.com/narvidev/narvi/migrations"
 )
 
@@ -179,7 +183,7 @@ func TestInsert_AllTenPlaceholderTokensStrippedFromStoredDigest(t *testing.T) {
 		},
 	}
 
-	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, digest, reviewtriage.DepthDeep, review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false); err != nil {
+	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, digest, reviewtriage.DepthDeep, review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, reviewverdict.Context{}, pgtype.UUID{}); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
 
@@ -217,4 +221,121 @@ func TestInsert_AllTenPlaceholderTokensStrippedFromStoredDigest(t *testing.T) {
 			t.Errorf("read-back record.%s is empty -- want it non-empty (the sanitized-but-still-present remainder of the poisoned fixture), which would mean this test is vacuously passing", fieldName)
 		}
 	}
+}
+
+// TestInsert_ContextAndAttemptIDRoundTrip (§21.1's amendment) proves the
+// new base_ref/base_sha/ancestor_chain/policy_version/attempt_id columns
+// persist and read back verbatim against a REAL Postgres instance -- the
+// exact round trip internal/domain/autoapproval.ComputeEligible's own
+// context-freshness comparison depends on. Two rows: one with a REAL,
+// fully-populated Context (an ordinary stacked-PR review) and one with
+// the ZERO-VALUE Context (mirroring a pre-amendment row, or a review
+// turn whose own context-fetch never resolved a base ref) -- proving
+// both directions read back exactly as this Step's own backfill decision
+// requires: a real context round-trips exactly, and an absent one reads
+// back as BaseRef == "" (autoapproval's own "unknown, never a match"
+// signal), never silently coerced into looking like either.
+func TestInsert_ContextAndAttemptIDRoundTrip(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	reviewVerdicts := narvipg.NewReviewVerdictStore(pool)
+	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	sessions := narvipg.NewSessionStore(pool)
+	turns := narvipg.NewTurnStore(pool)
+
+	// A real turn row -- attempt_id's own FK (migrations/
+	// 000130_review_verdicts_context.up.sql: "ON DELETE SET NULL") means a
+	// caller cannot honestly stamp a made-up UUID here; this is the
+	// minimal real (session, turn) pair the FK requires.
+	session, err := sessions.Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceWeb})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	turn, err := turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusCompleted})
+	if err != nil {
+		t.Fatalf("create turn: %v", err)
+	}
+
+	baseVerdict := func() review.Verdict {
+		v := review.Verdict{
+			RiskLevel:         review.RiskLevelLow,
+			Premise:           review.PremiseStateOK,
+			TestsCoverage:     review.TestsCoverageStateAdequate,
+			DocsDrift:         review.DocsDriftStateNone,
+			ProposedShippable: review.ProposedShippableAuto,
+		}
+		v.Shippable = review.ComputeShippable(v.RiskLevel, v.TestsCoverage, v.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+		return v
+	}
+	digest := reviewpost.Digest{Summary: "Context round-trip test-seeded verdict.", DescriptionAdequacy: review.DescriptionAdequacyOK, AdequacyExplanation: "n/a"}
+
+	t.Run("a real context and attempt id round-trip exactly", func(t *testing.T) {
+		const repoFullName = "acme/context-roundtrip-repo"
+		const prNumber = int32(1)
+		const headSHA = "sha-context-roundtrip-1"
+
+		wantContext := reviewverdict.Context{
+			BaseRef:       "feature/parent-pr-branch",
+			BaseSHA:       "sha-parent-head",
+			AncestorChain: []review.AncestorLink{{Ref: "main", SHA: "sha-main-tip"}},
+			PolicyVersion: autoapproval.CurrentPolicyVersion,
+		}
+
+		if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, baseVerdict(), digest, reviewtriage.DepthLight, "", reviewpost.FactCheckSkipped, 0, nil, nil, "", false, wantContext, turn.ID); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+
+		record, ok, err := appreviewverdict.GetLatest(ctx, appreviewverdict.Deps{ReviewVerdicts: reviewVerdicts}, repoFullName, prNumber)
+		if err != nil {
+			t.Fatalf("GetLatest: %v", err)
+		}
+		if !ok {
+			t.Fatalf("GetLatest: ok = false, want true")
+		}
+		if record.Context.BaseRef != wantContext.BaseRef {
+			t.Errorf("record.Context.BaseRef = %q, want %q", record.Context.BaseRef, wantContext.BaseRef)
+		}
+		if record.Context.BaseSHA != wantContext.BaseSHA {
+			t.Errorf("record.Context.BaseSHA = %q, want %q", record.Context.BaseSHA, wantContext.BaseSHA)
+		}
+		if record.Context.PolicyVersion != wantContext.PolicyVersion {
+			t.Errorf("record.Context.PolicyVersion = %d, want %d", record.Context.PolicyVersion, wantContext.PolicyVersion)
+		}
+		if !slices.Equal(record.Context.AncestorChain, wantContext.AncestorChain) {
+			t.Errorf("record.Context.AncestorChain = %+v, want %+v", record.Context.AncestorChain, wantContext.AncestorChain)
+		}
+		if !record.AttemptID.Valid || record.AttemptID.Bytes != turn.ID.Bytes {
+			t.Errorf("record.AttemptID = %+v, want a valid id matching the seeded turn %+v", record.AttemptID, turn.ID)
+		}
+	})
+
+	t.Run("a zero-value context (a pre-amendment row) reads back with an empty base ref, never a fabricated match", func(t *testing.T) {
+		const repoFullName = "acme/context-roundtrip-repo"
+		const prNumber = int32(2)
+		const headSHA = "sha-context-roundtrip-2"
+
+		if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, baseVerdict(), digest, reviewtriage.DepthLight, "", reviewpost.FactCheckSkipped, 0, nil, nil, "", false, reviewverdict.Context{}, pgtype.UUID{}); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+
+		record, ok, err := appreviewverdict.GetLatest(ctx, appreviewverdict.Deps{ReviewVerdicts: reviewVerdicts}, repoFullName, prNumber)
+		if err != nil {
+			t.Fatalf("GetLatest: %v", err)
+		}
+		if !ok {
+			t.Fatalf("GetLatest: ok = false, want true")
+		}
+		if record.Context.BaseRef != "" {
+			t.Errorf("record.Context.BaseRef = %q, want empty (an absent/never-recorded context)", record.Context.BaseRef)
+		}
+		if record.Context.PolicyVersion != 0 {
+			t.Errorf("record.Context.PolicyVersion = %d, want 0 (never equal to autoapproval.CurrentPolicyVersion=%d by coincidence)", record.Context.PolicyVersion, autoapproval.CurrentPolicyVersion)
+		}
+		if len(record.Context.AncestorChain) != 0 {
+			t.Errorf("record.Context.AncestorChain = %+v, want empty", record.Context.AncestorChain)
+		}
+		if record.AttemptID.Valid {
+			t.Errorf("record.AttemptID = %+v, want an invalid/NULL id (no attempt was ever recorded)", record.AttemptID)
+		}
+	})
 }

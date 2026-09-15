@@ -85,6 +85,7 @@ import (
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
 	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
+	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -606,7 +607,24 @@ func (a *Actor) finishReviewRetrigger(ctx context.Context, decision *reviewRetri
 				a.logger.Info("sessionactor: review_retrigger_debounce: declining to enqueue an automatic re-review turn -- a plan is awaiting approval on this session",
 					"repo_full_name", decision.repoFullName, "pr_number", decision.prNumber)
 			} else {
-				if err := a.insertAutoRetriggerTurn(ctx, tx, decision, prompt, reviewCtx.HeadSHA); err != nil {
+				// reviewVerdictContextJSON (§21.1's amendment) mirrors
+				// reviewCtx.HeadSHA's own identical "already resolved by
+				// fetchAutoRetriggerReviewContext above, just marshaled
+				// and persisted here" shape -- see internal/adapters/
+				// inbound/github/handler.go's own identical addition for
+				// the full "why".
+				reviewVerdictContextJSON, verdictContextErr := json.Marshal(reviewverdict.Context{
+					BaseRef:       reviewCtx.BaseRef,
+					BaseSHA:       reviewCtx.BaseSHA,
+					AncestorChain: reviewCtx.AncestorChain,
+					PolicyVersion: reviewCtx.PolicyVersion,
+				})
+				if verdictContextErr != nil {
+					a.logger.Warn("sessionactor: review_retrigger_debounce: marshal review verdict context failed, turn will carry review_head_sha but no review_verdict_context",
+						"error", verdictContextErr, "repo_full_name", decision.repoFullName, "pr_number", decision.prNumber)
+					reviewVerdictContextJSON = nil
+				}
+				if err := a.insertAutoRetriggerTurn(ctx, tx, decision, prompt, reviewCtx.HeadSHA, reviewVerdictContextJSON); err != nil {
 					return err
 				}
 				if _, err := a.stores.githubPRSession.WithTx(tx).IncrementAutoRetriggerCount(ctx, decision.repoFullName, decision.prNumber); err != nil {
@@ -835,7 +853,11 @@ func (a *Actor) composeAutoRetriggerPrompt(ctx context.Context, repoFullName str
 // triage computation of its own, it only persists what was already
 // decided, mirroring headSHA's own identical "already resolved
 // upstream, just persisted here" shape.
-func (a *Actor) insertAutoRetriggerTurn(ctx context.Context, tx pgx.Tx, decision *reviewRetriggerDecision, prompt string, headSHA string) error {
+// reviewVerdictContextJSON (§21.1's amendment) mirrors headSHA's own
+// identical "already resolved by this function's one caller,
+// finishReviewRetrigger, just persisted here" shape -- see that call
+// site's own doc comment for the full "why".
+func (a *Actor) insertAutoRetriggerTurn(ctx context.Context, tx pgx.Tx, decision *reviewRetriggerDecision, prompt string, headSHA string, reviewVerdictContextJSON []byte) error {
 	var reviewDepth *string
 	if decision.finalReviewDepth != "" {
 		reviewDepth = &decision.finalReviewDepth
@@ -865,6 +887,7 @@ func (a *Actor) insertAutoRetriggerTurn(ctx context.Context, tx pgx.Tx, decision
 		ReviewDepthDecision:     decision.reviewDepthDecisionJSON,
 		ReviewKnowledgeMode:     &knowledgeMode,
 		ReviewKnowledgeDecision: decision.knowledgeDecisionJSON,
+		ReviewVerdictContext:    reviewVerdictContextJSON,
 		CorrelationID:           correlationID,
 	})
 	if err != nil {

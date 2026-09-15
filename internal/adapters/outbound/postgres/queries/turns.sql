@@ -63,8 +63,15 @@
 -- whatever internal/platform.CorrelationIDFromContext(ctx) returns at
 -- EVERY call site that creates a turn, never re-derived or backfilled
 -- later.
-INSERT INTO turns (session_id, status, prompt, model_id, plan_mode, effort, review_head_sha, answer_only, review_depth, review_depth_decision, review_knowledge_mode, review_knowledge_decision, correlation_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+--
+-- review_verdict_context (migrations/000129_turns_review_verdict_context.up.sql,
+-- §21.1's amendment) mirrors review_depth_decision's own identical shape
+-- one column further: nil/absent for every non-review turn, set exactly
+-- once, at creation, by the SAME review-turn-creation paths, pre-
+-- marshaled JSON (internal/domain/reviewverdict.Context) -- this query
+-- does no encoding of its own.
+INSERT INTO turns (session_id, status, prompt, model_id, plan_mode, effort, review_head_sha, answer_only, review_depth, review_depth_decision, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 RETURNING *;
 
 -- name: GetTurn :one

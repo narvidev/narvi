@@ -25,9 +25,11 @@ import (
 	"github.com/narvidev/narvi/internal/app/decisioninbox"
 	"github.com/narvidev/narvi/internal/app/ports"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
+	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
+	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -88,6 +90,7 @@ func (rs *revalidateStores) eligiblePR(ctx context.Context, t *testing.T, pool *
 	pr := ports.OpenPR{
 		Owner: owner, Repo: repo, Number: prNumber,
 		Title: "eligible pr", HTMLURL: htmlURL, HeadSHA: "sha-" + strconv.Itoa(prNumber),
+		BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
 		Assignees:    []ports.PRPerson{{ExternalID: actorGitHubID, Login: "actor"}},
 		CIConclusion: ports.CIConclusionSuccess,
 		Labels:       []string{"review:low-risk"},
@@ -479,6 +482,39 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		}
 	})
 
+	// (§21.1's amendment): the decisive case head-SHA equality alone
+	// cannot catch -- the PR's own head has NOT moved (unlike
+	// StaleVerdictHeadSHA_Refused immediately above), but its BASE has:
+	// "a PR evaluated while based on another PR's branch, then
+	// retargeted -- or whose parent moved beneath it -- keeps an
+	// unchanged head, so the equality holds and the stale verdict reads
+	// as fresh." This test would pass with no code change at all if it
+	// only checked HeadSHA equality (it still equals headSHA) -- it is
+	// the live BaseRef perturbation below, and ComputeEligible's own new
+	// context comparison, that must be what actually refuses it.
+	t.Run("RetargetedBase_Refused", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-retargeted-base"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 32)
+		// The PR's own head is UNCHANGED -- only its base moved (a
+		// GitHub retarget onto a different branch, or its stacked
+		// parent's own branch moving beneath it). review_verdicts'
+		// own recorded base (seeded by eligiblePR against
+		// testEligibleBaseRef) no longer matches.
+		pr.BaseRef = "release/2026.09"
+		rs.replaceTargetPR(actorGitHubID, pr)
+
+		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+		}
+		if ok {
+			t.Fatal("RevalidateForMerge() ok = true, want false -- THE HAZARD THIS AMENDMENT CLOSES: the head sha is unchanged, but the base has moved, and the stale verdict must not read as fresh")
+		}
+		if reason == "" {
+			t.Error("reason is empty, want a human-readable explanation")
+		}
+	})
+
 	// RevalidateForMerge's own
 	// truncated->500 branch was never executed by any existing test --
 	// when the target PR is not found in a TRUNCATED (partial/degraded)
@@ -613,7 +649,13 @@ func TestRevalidateForMerge_LyingVerdictAgainstReal300FileSensitivePR(t *testing
 	if lyingVerdict.Shippable != review.ShippableAuto {
 		t.Fatalf("test setup: lyingVerdict.Shippable = %v, want auto", lyingVerdict.Shippable)
 	}
-	if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, lyingVerdict, reviewpost.Digest{Summary: "Test-seeded lying verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false); err != nil {
+	// verdictContext (§21.1's amendment) matches the live PR's own
+	// BaseRef/BaseSHA below exactly -- this test's whole point is
+	// proving the diff-size/sensitive-path criteria refuse regardless of
+	// the model's own lie, which requires the NEWER context-freshness
+	// check to pass first so THOSE two criteria are what actually fire.
+	verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
+	if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, lyingVerdict, reviewpost.Digest{Summary: "Test-seeded lying verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
 		t.Fatalf("seed lying review_verdicts row: %v", err)
 	}
 
@@ -631,6 +673,7 @@ func TestRevalidateForMerge_LyingVerdictAgainstReal300FileSensitivePR(t *testing
 	pr := ports.OpenPR{
 		Owner: "acme", Repo: "revalidate-c1-attack", Number: prNumber,
 		Title: "innocuous-looking title", HTMLURL: htmlURL, HeadSHA: headSHA,
+		BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
 		Assignees:    []ports.PRPerson{{ExternalID: actorGitHubID, Login: "actor"}},
 		CIConclusion: ports.CIConclusionSuccess,
 		Labels:       []string{"review:low-risk"},

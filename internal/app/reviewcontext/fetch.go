@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
+	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewtriage"
 	"github.com/narvidev/narvi/internal/platform"
@@ -147,10 +148,25 @@ func Fetch(ctx context.Context, logger *slog.Logger, fetcher Fetcher, timeouts p
 	// light posture makes that degradation safe (this file's own doc
 	// comment on review.PreFetchedContext.Additions).
 	return review.PreFetchedContext{
-		Diff:              diff,
-		DiffTruncated:     truncated,
-		Stack:             stack,
-		HeadSHA:           pr.HeadSHA,
+		Diff:          diff,
+		DiffTruncated: truncated,
+		Stack:         stack,
+		HeadSHA:       pr.HeadSHA,
+		// BaseRef/BaseSHA/AncestorChain/PolicyVersion (§21.1's amendment)
+		// are resolved from the SAME GetPullRequest call HeadSHA/Stack
+		// themselves already come from -- no separate fetch. AncestorChain
+		// is derived from `stack` (already resolved above, preferring
+		// knownStack exactly like Stack itself), never re-derived from
+		// pr.Stack directly, mirroring `stack`'s own "knownStack takes
+		// precedence" convention. PolicyVersion is stamped from this
+		// package's own imported autoapproval.CurrentPolicyVersion --
+		// internal/domain/review cannot import that package itself
+		// (§11: "zero external imports"), so a caller that already can
+		// sets it here.
+		BaseRef:           pr.BaseRef,
+		BaseSHA:           pr.BaseSHA,
+		AncestorChain:     review.AncestorChainFromStack(stack),
+		PolicyVersion:     autoapproval.CurrentPolicyVersion,
 		Title:             pr.Title,
 		Body:              pr.Body,
 		Additions:         pr.Additions,

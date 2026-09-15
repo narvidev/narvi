@@ -8,7 +8,30 @@ import (
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/reposource"
+	"github.com/narvidev/narvi/internal/domain/review"
 )
+
+// convertAncestorChain converts links (ports.PRAncestorLink, this port's
+// own domain-free copy of the identical shape, ports.PRAncestorLink's own
+// doc comment) into review.AncestorLink -- the one place this codebase
+// converts between the two, mirroring how every other ports<->domain
+// boundary in this file already converts (e.g. autoapproval.
+// ClassifyChangedPaths over target.ChangedFiles, immediately below this
+// function's own two real call sites). A nil links converts to a nil
+// result, never an empty-but-non-nil slice -- both compare equal under
+// autoapproval.ComputeEligible's own ancestorChainEqual (that function's
+// own doc comment), so this is a preference for the common case, not a
+// correctness requirement.
+func convertAncestorChain(links []ports.PRAncestorLink) []review.AncestorLink {
+	if links == nil {
+		return nil
+	}
+	out := make([]review.AncestorLink, len(links))
+	for i, l := range links {
+		out[i] = review.AncestorLink{Ref: l.Ref, SHA: l.SHA}
+	}
+	return out
+}
 
 // RevalidateForMerge re-checks, LIVE and never cached (§16.2, §5.2's own
 // "the rendered queue is never trusted as authority" invariant), whether
@@ -217,10 +240,35 @@ func revalidateCore(ctx context.Context, deps Deps, repoFullName string, prNumbe
 	// truncated at GitHub's own one-page cap): either way,
 	// ComputeEligible now refuses this PR rather than silently trusting
 	// an incomplete-or-absent classification of target.ChangedFiles.
+	// VerdictAssessed is unconditionally true here -- hasVerdict was
+	// already confirmed true above (the !hasVerdict branch returns
+	// earlier) -- but is still passed through explicitly, never left at
+	// its own zero value, mirroring TouchedBlastRadiusKnown's own
+	// identical "never rely on a caller forgetting" discipline: a future
+	// edit to this function that moves or removes the early !hasVerdict
+	// return must not silently reintroduce ReasonNotAssessed's own fail-
+	// closed guard as the ONLY thing standing between a not-assessed PR
+	// and a merge -- ComputeEligible checks it again regardless.
+	//
+	// VerdictBaseRef/VerdictBaseSHA/VerdictAncestorChain/
+	// VerdictPolicyVersion (§21.1's amendment) come from record.Context
+	// -- the SAME review_verdicts row record.HeadSHA itself came from,
+	// resolved by appreviewverdict.GetLatest above. CurrentBaseRef/
+	// CurrentBaseSHA/CurrentAncestorChain mirror CurrentHeadSHA's own
+	// identical "target is this function's own already-fetched, LIVE
+	// ports.OpenPR" sourcing -- no new I/O.
 	eligible, eligReason := autoapproval.ComputeEligible(autoapproval.EligibilityInput{
 		Verdict:                 record.Verdict,
+		VerdictAssessed:         true,
 		VerdictHeadSHA:          record.HeadSHA,
+		VerdictBaseRef:          record.Context.BaseRef,
+		VerdictBaseSHA:          record.Context.BaseSHA,
+		VerdictAncestorChain:    record.Context.AncestorChain,
+		VerdictPolicyVersion:    record.Context.PolicyVersion,
 		CurrentHeadSHA:          target.HeadSHA,
+		CurrentBaseRef:          target.BaseRef,
+		CurrentBaseSHA:          target.BaseSHA,
+		CurrentAncestorChain:    convertAncestorChain(target.AncestorChain),
 		CIGreen:                 ciGreen,
 		HasNeedsHumanLabel:      hasNeedsHuman,
 		ChangedFileCount:        target.ChangedFilesCount,

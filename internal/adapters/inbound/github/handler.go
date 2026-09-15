@@ -21,6 +21,7 @@ import (
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/review"
 	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
+	domainreviewverdict "github.com/narvidev/narvi/internal/domain/reviewverdict"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -843,6 +844,26 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 			triageRecordJSON = nil
 		}
 
+		// reviewVerdictContextJSON (§21.1's amendment) is this turn's own
+		// review-context snapshot beyond fetchedHeadSHA above -- prCtx.
+		// BaseRef/BaseSHA/AncestorChain/PolicyVersion, resolved by the
+		// SAME reviewcontext.Fetch call fetchedHeadSHA itself came from,
+		// mirrors triageRecordJSON's own identical "marshal once here,
+		// forward verbatim" shape immediately above. Marshal failure
+		// degrades exactly like triageRecordJSON's own: the turn simply
+		// carries no recorded context, which internal/domain/autoapproval.
+		// ComputeEligible reads as unknown, never as a match.
+		reviewVerdictContextJSON, verdictContextErr := json.Marshal(domainreviewverdict.Context{
+			BaseRef:       prCtx.BaseRef,
+			BaseSHA:       prCtx.BaseSHA,
+			AncestorChain: prCtx.AncestorChain,
+			PolicyVersion: prCtx.PolicyVersion,
+		})
+		if verdictContextErr != nil {
+			logger.Warn("github: marshal review verdict context failed, turn will carry review_head_sha but no review_verdict_context", "error", verdictContextErr, "repo", m.RepoFullName, "pr_number", m.PRNumber)
+			reviewVerdictContextJSON = nil
+		}
+
 		req := restdtos.CreateSessionRequest{
 			SpawnSource: restdtos.CreateSessionRequestSpawnSourceGithub,
 			Prompt:      restdtos.CreateSessionRequestPrompt(&m.CommentBody),
@@ -891,7 +912,7 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 			return
 		}
 
-		session, turn, isNew, err := coalescer.CreateOrJoin(ctx, m.RepoFullName, m.PRNumber, req, actor, m.IsLabelRetrigger, mentionText, fetchedHeadSHA, &reviewDepthStr, triageModelID, triageEffort, triageRecordJSON, &knowledgeMode, knowledgeDecisionJSON)
+		session, turn, isNew, err := coalescer.CreateOrJoin(ctx, m.RepoFullName, m.PRNumber, req, actor, m.IsLabelRetrigger, mentionText, fetchedHeadSHA, &reviewDepthStr, triageModelID, triageEffort, triageRecordJSON, &knowledgeMode, knowledgeDecisionJSON, reviewVerdictContextJSON)
 		if err != nil {
 			if errors.Is(err, ErrActorNotAuthorized) {
 				// ErrActorNotAuthorized fires for TWO distinct reasons

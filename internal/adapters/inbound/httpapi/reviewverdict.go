@@ -358,6 +358,21 @@ func PostReviewVerdict(
 		// gap -- and why it is an events.id and not a timestamp.
 		var dispatchedSandboxGen *int32
 		var dispatchedEventID *int64
+		// verdictContext/attemptID (§21.1's amendment) mirror
+		// verdictHeadSHA/reviewDepth's own identical "resolved once here,
+		// from THIS session's own currently-processing turn, never
+		// re-derived" shape, one field further. verdictContext stays at
+		// its own zero value (Context{}, BaseRef == "") for every case
+		// that skips or fails the turn lookup/unmarshal below -- the
+		// SAME safe degradation review_depth_decision's own unmarshal
+		// failure already gets, and exactly what internal/domain/
+		// autoapproval.ComputeEligible reads as "context unknown",
+		// mirroring a pre-amendment row. attemptID stays an invalid
+		// pgtype.UUID{} in the identical cases -- a verdict this
+		// endpoint cannot attribute to a real turn id is never stamped
+		// with an invented one.
+		var verdictContext reviewverdict.Context
+		var attemptID pgtype.UUID
 		if processingTurn, turnErr := turns.GetProcessingTurnForSession(ctx, sessionID); turnErr != nil {
 			if errors.Is(turnErr, pgx.ErrNoRows) {
 				logger.Warn("httpapi: review-verdict: no processing turn found for session, skipping review_verdicts insert", "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
@@ -373,6 +388,14 @@ func PostReviewVerdict(
 			}
 			dispatchedSandboxGen = processingTurn.DispatchedSandboxGen
 			dispatchedEventID = processingTurn.DispatchedEventID
+			attemptID = processingTurn.ID
+			if len(processingTurn.ReviewVerdictContext) > 0 {
+				if unmarshalErr := json.Unmarshal(processingTurn.ReviewVerdictContext, &verdictContext); unmarshalErr != nil {
+					logger.Warn("httpapi: review-verdict: unmarshal review_verdict_context failed, verdict will carry no recorded base/ancestor/policy context",
+						"error", unmarshalErr, "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
+					verdictContext = reviewverdict.Context{}
+				}
+			}
 			if processingTurn.ReviewKnowledgeMode != nil {
 				knowledgeMode = *processingTurn.ReviewKnowledgeMode
 			}
@@ -675,7 +698,7 @@ func PostReviewVerdict(
 		// an unpersisted verdict.
 		if verdictHeadSHA == "" {
 			logger.Warn("httpapi: review-verdict: no review head sha on record, skipping review_verdicts insert", "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
-		} else if _, insertErr := appreviewverdict.Insert(ctx, reviewVerdicts.WithTx(tx), repoSettings.WithTx(tx), platformShadow, prSession.RepoFullName, prSession.PrNumber, verdictHeadSHA, sessionID, verdict, input.Digest, reviewDepth, input.CounterReview, input.FactCheck, input.FactCheckKilled, archDecisionTags, archDecisionRoots, knowledgeMode, knowledgeInfluenced); insertErr != nil {
+		} else if _, insertErr := appreviewverdict.Insert(ctx, reviewVerdicts.WithTx(tx), repoSettings.WithTx(tx), platformShadow, prSession.RepoFullName, prSession.PrNumber, verdictHeadSHA, sessionID, verdict, input.Digest, reviewDepth, input.CounterReview, input.FactCheck, input.FactCheckKilled, archDecisionTags, archDecisionRoots, knowledgeMode, knowledgeInfluenced, verdictContext, attemptID); insertErr != nil {
 			logger.Error("httpapi: review-verdict: insert review_verdicts row failed", "error", insertErr)
 			writeError(w, http.StatusInternalServerError, "internal error")
 			return

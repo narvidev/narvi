@@ -37,6 +37,42 @@ type StackContext struct {
 	UltimateBaseSHA string
 }
 
+// AncestorLink is one link of a PR's own base-branch ancestry, beyond its
+// own immediate base -- ref+sha, ordered nearest-first (§21.1's amendment:
+// "the ordered ancestor chain"). This is bookkeeping data, exactly like
+// HeadSHA/BaseRef/BaseSHA below -- never rendered into a review turn's
+// prompt, never additional diff to verdict over (StackContext's own doc
+// comment states why a stack's own further context stays out of the
+// diff; the same reasoning applies here).
+type AncestorLink struct {
+	Ref string `json:"ref"`
+	SHA string `json:"sha"`
+}
+
+// AncestorChainFromStack derives the ordered ancestor chain (§21.1's
+// amendment) from a GitHub-native stack's own reported fields alone --
+// the only additional ancestry this codebase can derive today, since
+// §17.6 states nothing besides the origin+sentinel-fix pair produces a
+// chain deeper than two, and a GitHub-native stack object reports only
+// position/size/ultimate-base, never each intermediate link.
+//
+// A PR at the BOTTOM of its own stack (position <= 1) or with no stack at
+// all (stack == nil) has no ancestor beyond its own immediate base --
+// which PreFetchedContext's own BaseRef/BaseSHA (below) already carry --
+// so the chain is empty. A PR further up reports exactly one link: the
+// stack's own ultimate base, the one further-back fact a GitHub-native
+// stack actually exposes. A genuine N-deep producer (§39, unshipped) gets
+// a longer chain the day it exists to supply one: this function returns
+// an ordered SLICE, not a fixed 0-or-1 shape, so the comparison this
+// feeds (autoapproval.ComputeEligible) does not need to widen when trains
+// ship.
+func AncestorChainFromStack(stack *StackContext) []AncestorLink {
+	if stack == nil || stack.Position <= 1 || stack.UltimateBaseRef == "" {
+		return nil
+	}
+	return []AncestorLink{{Ref: stack.UltimateBaseRef, SHA: stack.UltimateBaseSHA}}
+}
+
 // PreFetchedContext is a review turn's own inline pre-fetched context
 // (§8.2: "inline diff pre-fetched into context (agent must not need
 // to run `gh pr diff` repeatedly)") -- built once, outside any domain
@@ -80,6 +116,30 @@ type PreFetchedContext struct {
 	// could not determine a head SHA (a degraded, best-effort outcome,
 	// exactly like Diff itself being empty on a failed fetch).
 	HeadSHA string
+	// BaseRef/BaseSHA/AncestorChain/PolicyVersion (§21.1's amendment) are
+	// this PR's own review CONTEXT beyond HeadSHA -- server-side
+	// bookkeeping ONLY, exactly like HeadSHA's own doc comment immediately
+	// above (never rendered into the prompt, never additional diff to
+	// verdict over). BaseRef/BaseSHA are this PR's own immediate base at
+	// context-fetch time (the SAME GetPullRequest call HeadSHA itself
+	// comes from); AncestorChain is AncestorChainFromStack's own result
+	// over Stack above. PolicyVersion is the eligibility-policy revision
+	// in effect when this context was fetched (autoapproval.
+	// CurrentPolicyVersion at fetch time) -- a caller outside this
+	// package sets it, since this package (§11: zero external imports)
+	// cannot import internal/domain/autoapproval to read that constant
+	// itself.
+	//
+	// Persisted turn-scoped, exactly like HeadSHA (§21.1's own amendment:
+	// "the context must be scoped to the turn that examined it, never a
+	// per-(repo, PR) column, for exactly the reason that paragraph gives
+	// about head_sha") -- read back at verdict-post time to become
+	// review_verdicts' own base_ref/base_sha/ancestor_chain/policy_version
+	// columns (internal/domain/reviewverdict.Context).
+	BaseRef       string
+	BaseSHA       string
+	AncestorChain []AncestorLink
+	PolicyVersion int
 	// Title/Body (adversarial-review fix, §26.2's own follow-up)
 	// are the PR's own CURRENT title/body, fetched server-side by the SAME
 	// GetPullRequest call this struct's one real producer

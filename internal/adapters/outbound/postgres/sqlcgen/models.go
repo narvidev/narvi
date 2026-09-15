@@ -2065,6 +2065,11 @@ type ReviewVerdict struct {
 	ArchDecisionRoots         []byte             `json:"arch_decision_roots"`
 	KnowledgeMode             *string            `json:"knowledge_mode"`
 	KnowledgeInfluenced       bool               `json:"knowledge_influenced"`
+	BaseRef                   *string            `json:"base_ref"`
+	BaseSha                   *string            `json:"base_sha"`
+	AncestorChain             []byte             `json:"ancestor_chain"`
+	PolicyVersion             int32              `json:"policy_version"`
+	AttemptID                 pgtype.UUID        `json:"attempt_id"`
 }
 
 type Sandbox struct {
@@ -2200,6 +2205,7 @@ type Turn struct {
 	ReviewKnowledgeMode     *string               `json:"review_knowledge_mode"`
 	ReviewKnowledgeDecision []byte                `json:"review_knowledge_decision"`
 	CorrelationID           *string               `json:"correlation_id"`
+	ReviewVerdictContext    []byte                `json:"review_verdict_context"`
 }
 
 type TurnStepCost struct {

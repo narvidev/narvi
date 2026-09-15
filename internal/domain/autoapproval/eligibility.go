@@ -16,6 +16,27 @@ import "github.com/narvidev/narvi/internal/domain/review"
 // a claimed-correct number.
 const defaultMaxFilesChanged = 20
 
+// CurrentPolicyVersion (§21.1's amendment) is this engine's own
+// eligibility-policy revision -- stamped onto a review's own context at
+// fetch time (review.PreFetchedContext.PolicyVersion, since
+// internal/domain/review cannot import this package -- §11's "zero
+// external imports" convention for that package) and compared, at
+// eligibility time, against a verdict's own recorded
+// EligibilityInput.VerdictPolicyVersion: "a verdict produced under one
+// set of rules is not evidence under another, and nothing else records
+// which rules applied." A verdict recorded under an EARLIER policy
+// version fails ComputeEligible's own policy-version check below,
+// forcing a fresh review under the current rules -- never silently
+// grandfathered in. Bump this whenever a change to this package's own
+// criteria (a new check, a changed threshold's MEANING rather than its
+// configured VALUE, a reordered precedence) would make an
+// already-eligible verdict's own eligibility answer no longer honest
+// under the new rules. The starting value is 1, deliberately never 0:
+// every review_verdicts row that predates this column reads back
+// policy_version = 0 (migrations' own NOT NULL DEFAULT 0), which must
+// never equal a real, current policy version by coincidence.
+const CurrentPolicyVersion = 1
+
 // DefaultSensitiveTags is DefaultEligibilityConfig's own sensitive-path
 // tag list -- §21.2's own named defaults, verbatim: "migrations, auth
 // code, /contracts by default". Returned as a fresh slice on every call
@@ -79,9 +100,40 @@ type EligibilityInput struct {
 	// DISPLAY/audit data for a caller that wants to show what the model
 	// itself claimed -- ComputeEligible never reads either.
 	Verdict review.Verdict
+	// VerdictAssessed reports whether Verdict above is a REAL, posted
+	// verdict at all -- §21.1's amendment: "not_assessed as a first-class
+	// outcome... a review that did not complete has no risk level, and
+	// inventing one (or letting its absence read as low) is the same
+	// defect as a truncated scan rendering as a clean one." Deliberately
+	// the BOOLEAN ZERO VALUE for "not assessed", mirroring
+	// TouchedBlastRadiusKnown's own identical fail-conservative
+	// convention immediately below: a caller that constructs an
+	// EligibilityInput and simply forgets to set this field gets false
+	// ("not assessed, fail closed"), never true ("a real verdict exists")
+	// by accident. Every real caller (internal/app/decisioninbox's
+	// revalidateCore/computeRealEligibility) already refuses to reach
+	// this function at all when reviewverdict.GetLatest reports no
+	// verdict on record -- this field is the SAME fact, made checkable
+	// inside the one function §21.2 calls the actual gate, so a future
+	// caller cannot silently reintroduce the hole by forgetting that
+	// upstream guard.
+	VerdictAssessed bool
 	// VerdictHeadSHA is review_verdicts.head_sha for Verdict above --
 	// the commit Verdict was actually produced against.
 	VerdictHeadSHA string
+	// VerdictBaseRef/VerdictBaseSHA/VerdictAncestorChain/
+	// VerdictPolicyVersion (§21.1's amendment) are the rest of what
+	// Verdict's own review_verdicts row recorded about what it examined
+	// -- review_verdicts.base_ref/base_sha/ancestor_chain/policy_version
+	// (internal/domain/reviewverdict.Context). VerdictBaseRef == ""
+	// means this row predates the amendment (no context was ever
+	// recorded) -- see ComputeEligible's own doc comment for why that is
+	// treated as UNKNOWN, never as a match: "treating unknown context as
+	// matching would reopen the hole for every verdict already stored."
+	VerdictBaseRef       string
+	VerdictBaseSHA       string
+	VerdictAncestorChain []review.AncestorLink
+	VerdictPolicyVersion int
 	// ChangedFileCount is this PR's own CURRENT, server-fetched
 	// changed-file count -- ports.OpenPR.
 	// ChangedFilesCount, GitHub's own authoritative "changed_files"
@@ -165,6 +217,17 @@ type EligibilityInput struct {
 	// comment, which this engine's own stale-verdict guard depends on
 	// exactly as much as the rest of that function does).
 	CurrentHeadSHA string
+	// CurrentBaseRef/CurrentBaseSHA/CurrentAncestorChain (§21.1's
+	// amendment) are the PR's LIVE current review context, fetched fresh
+	// exactly like CurrentHeadSHA immediately above (ports.OpenPR.
+	// BaseRef/BaseSHA/AncestorChain) -- compared against
+	// VerdictBaseRef/VerdictBaseSHA/VerdictAncestorChain above to catch
+	// the hazard CurrentHeadSHA alone cannot: "a PR evaluated while based
+	// on another PR's branch, then retargeted -- or whose parent moved
+	// beneath it -- keeps an unchanged head."
+	CurrentBaseRef       string
+	CurrentBaseSHA       string
+	CurrentAncestorChain []review.AncestorLink
 	// CIGreen is the PR's CI conclusion at CurrentHeadSHA specifically
 	// (never at VerdictHeadSHA, which may already be stale) -- re-
 	// derived live via the STRICT ports.CIConclusion check
@@ -189,14 +252,48 @@ type Reason string
 // eligible=true; every other value accompanies eligible=false and names
 // exactly which criterion failed.
 const (
-	ReasonNone                 Reason = ""
-	ReasonNeedsHumanLabel      Reason = "review:needs-human label is present"
-	ReasonStaleVerdict         Reason = "the verdict relied on was produced against an earlier commit"
-	ReasonCINotGreen           Reason = "CI is not green at the current head"
-	ReasonNotShippableAuto     Reason = "the verdict's shippable classification is not auto"
-	ReasonDiffTooLarge         Reason = "the diff exceeds this repo's auto-approval file-count threshold"
-	ReasonBlastRadiusUnknown   Reason = "the diff's sensitive-path facts could not be established from GitHub"
-	ReasonSensitivePathTouched Reason = "the diff touches a sensitive path"
+	ReasonNone Reason = ""
+	// ReasonNotAssessed (§21.1's amendment) accompanies a PR with no
+	// posted verdict at all -- EligibilityInput.VerdictAssessed's own doc
+	// comment. Distinct from ReasonStaleVerdict below: this PR has never
+	// been reviewed, not "reviewed against a commit that has since
+	// moved."
+	ReasonNotAssessed     Reason = "no review verdict has been posted for this pull request"
+	ReasonNeedsHumanLabel Reason = "review:needs-human label is present"
+	ReasonStaleVerdict    Reason = "the verdict relied on was produced against an earlier commit"
+	// ReasonContextUnknown (§21.1's amendment) accompanies a verdict that
+	// predates this check -- VerdictBaseRef's own doc comment: an old row
+	// recorded no base/ancestor/policy context at all, and treating that
+	// absence as a match would reopen the exact hole this amendment
+	// closes. Distinct from ReasonBaseMoved/ReasonAncestorChainChanged/
+	// ReasonPolicyVersionMismatch below, which all mean "a context WAS
+	// recorded, and it no longer matches" -- this one means "no context
+	// was ever recorded to compare".
+	ReasonContextUnknown Reason = "this verdict predates review-context tracking and cannot be confirmed fresh"
+	// ReasonBaseMoved (§21.1's amendment) accompanies a verdict whose
+	// recorded base ref or base commit no longer matches the PR's own
+	// CURRENT base -- the retargeted-PR / parent-moved-beneath-it hazard
+	// this amendment exists to close: "a PR evaluated while based on
+	// another PR's branch, then retargeted -- or whose parent moved
+	// beneath it -- keeps an unchanged head."
+	ReasonBaseMoved Reason = "the pull request's base has changed since this verdict was produced"
+	// ReasonAncestorChainChanged (§21.1's amendment) accompanies a
+	// verdict whose recorded ancestor chain (review.AncestorLink, ordered
+	// nearest-first) no longer matches the PR's own current chain --
+	// catches the shape ReasonBaseMoved alone cannot: this PR's own
+	// immediate base is unchanged, but something further back in its
+	// stacked ancestry moved.
+	ReasonAncestorChainChanged Reason = "the pull request's ancestor chain has changed since this verdict was produced"
+	// ReasonPolicyVersionMismatch (§21.1's amendment) accompanies a
+	// verdict recorded under an earlier eligibility policy
+	// (CurrentPolicyVersion's own doc comment): "a verdict produced under
+	// one set of rules is not evidence under another."
+	ReasonPolicyVersionMismatch Reason = "this verdict was produced under an earlier eligibility policy"
+	ReasonCINotGreen            Reason = "CI is not green at the current head"
+	ReasonNotShippableAuto      Reason = "the verdict's shippable classification is not auto"
+	ReasonDiffTooLarge          Reason = "the diff exceeds this repo's auto-approval file-count threshold"
+	ReasonBlastRadiusUnknown    Reason = "the diff's sensitive-path facts could not be established from GitHub"
+	ReasonSensitivePathTouched  Reason = "the diff touches a sensitive path"
 )
 
 // ComputeEligible is this package's single exported pure function
@@ -209,8 +306,38 @@ func ComputeEligible(in EligibilityInput, cfg EligibilityConfig) (eligible bool,
 	if in.HasNeedsHumanLabel {
 		return false, ReasonNeedsHumanLabel
 	}
+	// §21.1's amendment: "a review that did not complete has no risk
+	// level, and inventing one ... is the same defect as a truncated scan
+	// rendering as a clean one." Checked before anything else looks at
+	// in.Verdict at all -- a not-assessed PR has no Verdict worth
+	// reasoning about.
+	if !in.VerdictAssessed {
+		return false, ReasonNotAssessed
+	}
 	if in.VerdictHeadSHA == "" || in.VerdictHeadSHA != in.CurrentHeadSHA {
 		return false, ReasonStaleVerdict
+	}
+	// §21.1's amendment: "head equality is necessary and not
+	// sufficient... the gate is the verdict's whole persisted context --
+	// head, base, ancestor chain and policy version -- matching the PR as
+	// it stands now." VerdictBaseRef == "" means this row predates the
+	// amendment: no context was ever recorded, so there is nothing to
+	// confirm fresh -- treated as UNKNOWN, never as a match, exactly
+	// because "treating unknown context as matching would reopen the
+	// hole for every verdict already stored" (backfill: an old verdict
+	// means exactly this, and forces a fresh review, never a silent
+	// grandfather-in).
+	if in.VerdictBaseRef == "" {
+		return false, ReasonContextUnknown
+	}
+	if in.VerdictBaseRef != in.CurrentBaseRef || in.VerdictBaseSHA != in.CurrentBaseSHA {
+		return false, ReasonBaseMoved
+	}
+	if !ancestorChainEqual(in.VerdictAncestorChain, in.CurrentAncestorChain) {
+		return false, ReasonAncestorChainChanged
+	}
+	if in.VerdictPolicyVersion != CurrentPolicyVersion {
+		return false, ReasonPolicyVersionMismatch
 	}
 	if !in.CIGreen {
 		return false, ReasonCINotGreen
@@ -278,4 +405,28 @@ func touchesSensitivePath(blastRadius, sensitiveTags []review.Tag) bool {
 		}
 	}
 	return false
+}
+
+// ancestorChainEqual reports whether a and b name the identical ordered
+// ancestor chain (§21.1's amendment) -- ORDER-SENSITIVE (a chain is
+// nearest-first, review.AncestorLink's own doc comment, so two chains
+// that name the same links in a different order are NOT the same
+// ancestry) and length-sensitive (a chain that gained or lost a link
+// changed, regardless of what the surviving links say). A nil and an
+// empty-but-non-nil slice compare equal -- both mean "no ancestor beyond
+// the immediate base", the ordinary non-stacked case, and the
+// distinction between "never computed" and "computed as empty" is not
+// one this comparison needs to preserve (unlike VerdictBaseRef == "",
+// which IS load-bearing precisely because a real base ref is never
+// legitimately empty).
+func ancestorChainEqual(a, b []review.AncestorLink) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

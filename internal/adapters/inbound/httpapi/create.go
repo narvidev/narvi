@@ -119,6 +119,12 @@ type ChildSessionOptions struct {
 	// "why".
 	ReviewKnowledgeMode     *string
 	ReviewKnowledgeDecision []byte
+
+	// ReviewVerdictContext (§21.1's amendment) mirrors ReviewDepth/
+	// ReviewDepthDecision's own identical shape one field further -- see
+	// CreateTurnOptions.ReviewVerdictContext's own doc comment (turn.go)
+	// for the full "why".
+	ReviewVerdictContext []byte
 }
 
 // childSessionOptionsFrom returns opts[0] if the caller supplied one, or
@@ -997,6 +1003,7 @@ func CreateSessionOnTx(ctx context.Context, tx pgx.Tx, sessions *postgres.Sessio
 			ReviewDepthDecision:     opts.ReviewDepthDecision,
 			ReviewKnowledgeMode:     opts.ReviewKnowledgeMode,
 			ReviewKnowledgeDecision: opts.ReviewKnowledgeDecision,
+			ReviewVerdictContext:    opts.ReviewVerdictContext,
 			CorrelationID:           correlationID,
 		}); err != nil {
 			logger.Error("httpapi: create turn failed", "error", err)

@@ -34,12 +34,34 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
 	"github.com/narvidev/narvi/internal/domain/authz"
+	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	decisioninboxdomain "github.com/narvidev/narvi/internal/domain/decisioninbox"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
+	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/migrations"
+)
+
+// testEligibleBaseRef/testEligibleBaseSHA (§21.1's amendment) are this
+// package's own shared "this PR's base has not moved" fixture pair --
+// every ports.OpenPR fixture in this file and revalidate_integration_
+// test.go that claims to be "otherwise fully eligible" sets BOTH of
+// these on the LIVE PR AND passes them to seedAutoApprovedVerdict below,
+// so the verdict's own recorded context matches the PR's current one
+// exactly, the precondition internal/domain/autoapproval.ComputeEligible
+// now requires before CI/Shippable/diff-size/sensitive-path are ever
+// even reached. A test that means to exercise base drift specifically
+// (TestComputeEligible's own "a PR whose base changed while its head did
+// not must lose eligibility" case lives in eligibility_test.go, a pure
+// unit test -- this package's own integration tests are not where that
+// guard is pinned) sets a DIFFERENT base on the live PR after seeding,
+// exactly like every other negative subtest here perturbs one fact off
+// of the eligible baseline.
+const (
+	testEligibleBaseRef = "main"
+	testEligibleBaseSHA = "sha-eligible-base"
 )
 
 // newTestPool spins up a throwaway Postgres container, runs every embedded
@@ -255,7 +277,20 @@ func seedAutoApprovedVerdict(ctx context.Context, t *testing.T, pool *pgxpool.Po
 	// caller uses (migrations/000105's own doc comment) -- this fixture
 	// does not need to promote repoFullName to live for that read to see
 	// it, unlike internal/app/automerge's own seedEligiblePR.
-	if _, err := appreviewverdict.Insert(ctx, store, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false); err != nil {
+	// (§21.1's amendment): base_ref/base_sha/policy_version are
+	// stamped to this package's own shared testEligibleBaseRef/
+	// testEligibleBaseSHA/autoapproval.CurrentPolicyVersion -- matching
+	// every "otherwise fully eligible" ports.OpenPR fixture in this file
+	// and revalidate_integration_test.go, so ComputeEligible's own new
+	// context-freshness check passes for the SAME reason head_sha above
+	// already has to match. AncestorChain stays nil: none of this
+	// package's fixtures are GitHub-native-stack PRs.
+	verdictContext := reviewverdict.Context{
+		BaseRef:       testEligibleBaseRef,
+		BaseSHA:       testEligibleBaseSHA,
+		PolicyVersion: autoapproval.CurrentPolicyVersion,
+	}
+	if _, err := appreviewverdict.Insert(ctx, store, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
 		t.Fatalf("seed auto-approved review_verdicts row for %s#%d: %v", repoFullName, prNumber, err)
 	}
 }
@@ -351,6 +386,7 @@ func TestBuild_FullScenario(t *testing.T) {
 				{
 					Owner: "acme", Repo: "widgets", Number: 10, Title: "scheduler: exponential backoff",
 					HTMLURL: "https://github.com/acme/widgets/pull/10", HeadSHA: "sha10",
+					BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
 					Assignees:    []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}},
 					CIConclusion: ports.CIConclusionSuccess,
 					Labels:       []string{"review:low-risk"},
@@ -741,8 +777,10 @@ func TestBuild_ReviewSessionIDAndReleaseCut(t *testing.T) {
 				{Owner: "acme", Repo: "rockets", Number: 32, Title: "PR 32", HTMLURL: "https://github.com/acme/rockets/pull/32", HeadSHA: "sha32",
 					Assignees: []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}}, CIConclusion: ports.CIConclusionSuccess, CreatedAt: time.Now()},
 				{Owner: "acme", Repo: "rockets", Number: 33, Title: "release/2026.09.01 -- 2 PRs", HTMLURL: "https://github.com/acme/rockets/pull/33", HeadSHA: "sha33",
+					BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
 					Assignees: []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}}, CIConclusion: ports.CIConclusionSuccess, Labels: []string{"review:low-risk"}, CreatedAt: time.Now()},
 				{Owner: "acme", Repo: "rockets", Number: 34, Title: "PR 34", HTMLURL: "https://github.com/acme/rockets/pull/34", HeadSHA: "sha34",
+					BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
 					Assignees: []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}}, CIConclusion: ports.CIConclusionSuccess, Labels: []string{"review:low-risk"}, CreatedAt: time.Now()},
 				{Owner: "acme", Repo: "rockets", Number: 35, Title: "release/2026.09.02 -- truncated scan", HTMLURL: "https://github.com/acme/rockets/pull/35", HeadSHA: "sha35",
 					Assignees: []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}}, CIConclusion: ports.CIConclusionSuccess, Labels: []string{"review:low-risk"}, CreatedAt: time.Now()},
@@ -1222,6 +1260,7 @@ func TestBuild_HasChangesRequestedDemotesFromReadyToMerge(t *testing.T) {
 				{
 					Owner: "acme", Repo: "widgets", Number: 40, Title: "otherwise fully eligible, but changes requested",
 					HTMLURL: htmlURL, HeadSHA: "sha40",
+					BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
 					Assignees:           []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}},
 					CIConclusion:        ports.CIConclusionSuccess,
 					Labels:              []string{"review:low-risk"},
@@ -1299,6 +1338,7 @@ func TestBuild_ChangedFilesListDegraded_NeverReadyToMerge(t *testing.T) {
 				{
 					Owner: "acme", Repo: "widgets", Number: 50, Title: "otherwise fully eligible, but the changed-files read was degraded",
 					HTMLURL: htmlURL, HeadSHA: "sha50",
+					BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
 					Assignees:    []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}},
 					CIConclusion: ports.CIConclusionSuccess,
 					Labels:       []string{"review:low-risk"},
@@ -1635,6 +1675,7 @@ func buildEligibleReadyToMergeFixture(ctx context.Context, t *testing.T, pool *p
 				{
 					Owner: owner, Repo: repo, Number: prNumber, Title: "eligible pr",
 					HTMLURL: htmlURL, HeadSHA: headSHA,
+					BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
 					Assignees:    []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}},
 					CIConclusion: ports.CIConclusionSuccess,
 					Labels:       []string{"review:low-risk"},

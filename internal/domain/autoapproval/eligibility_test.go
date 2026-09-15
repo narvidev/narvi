@@ -38,11 +38,28 @@ func cleanVerdict() review.Verdict {
 // "unknown" (fail closed), so a clean baseline must set it explicitly,
 // exactly like every OTHER field here is explicitly set rather than
 // relying on a Go zero value to mean "clean".
+//
+// VerdictAssessed is explicitly true, and VerdictBaseRef/VerdictBaseSHA/
+// VerdictPolicyVersion explicitly match CurrentBaseRef/CurrentBaseSHA/
+// autoapproval.CurrentPolicyVersion (§21.1's amendment) -- mirrors
+// TouchedBlastRadiusKnown's own "explicit, never a relied-upon zero
+// value" discipline immediately above, extended to every new field this
+// amendment adds: a clean baseline states its own freshness explicitly
+// rather than accidentally passing because both sides happen to share a
+// zero value.
 func cleanInput() autoapproval.EligibilityInput {
 	return autoapproval.EligibilityInput{
 		Verdict:                 cleanVerdict(),
+		VerdictAssessed:         true,
 		VerdictHeadSHA:          "abc123",
+		VerdictBaseRef:          "main",
+		VerdictBaseSHA:          "base-abc123",
+		VerdictAncestorChain:    nil,
+		VerdictPolicyVersion:    autoapproval.CurrentPolicyVersion,
 		CurrentHeadSHA:          "abc123",
+		CurrentBaseRef:          "main",
+		CurrentBaseSHA:          "base-abc123",
+		CurrentAncestorChain:    nil,
 		CIGreen:                 true,
 		HasNeedsHumanLabel:      false,
 		ChangedFileCount:        5,
@@ -81,7 +98,18 @@ func TestComputeEligible(t *testing.T) {
 			wantReason:   autoapproval.ReasonNeedsHumanLabel,
 		},
 
-		// --- criterion 2: the stale-head-SHA guard ---
+		// --- criterion 2 (§21.1's amendment): a verdict must actually
+		// have been posted at all -- "not_assessed as a first-class
+		// outcome ... a review that did not complete has no risk level" ---
+		{
+			name:         "a PR with no posted verdict at all is not_assessed, never silently eligible",
+			in:           withVerdictAssessed(cleanInput(), false),
+			cfg:          cfg,
+			wantEligible: false,
+			wantReason:   autoapproval.ReasonNotAssessed,
+		},
+
+		// --- criterion 3: the stale-head-SHA guard ---
 		{
 			name:         "a verdict head sha that differs from the current head sha is stale",
 			in:           withCurrentHeadSHA(cleanInput(), "def456"),
@@ -118,7 +146,72 @@ func TestComputeEligible(t *testing.T) {
 			wantReason:   autoapproval.ReasonStaleVerdict,
 		},
 
-		// --- criterion 3: CI green at the CURRENT head ---
+		// --- criterion 4 (§21.1's amendment): the verdict's whole
+		// recorded context -- base ref/sha, ancestor chain, policy
+		// version -- must match the PR as it stands now. Head equality
+		// alone (criterion 3, above) is NOT sufficient: this is the
+		// exact hazard the amendment names -- "a PR evaluated while
+		// based on another PR's branch, then retargeted -- or whose
+		// parent moved beneath it -- keeps an unchanged head." ---
+		{
+			// THE DECISIVE CASE: this is the test that would pass
+			// without §21.1's amendment -- VerdictHeadSHA ==
+			// CurrentHeadSHA holds (cleanInput's own baseline), so
+			// criterion 3 alone is satisfied, and only the NEW base
+			// comparison below can catch it.
+			name:         "a PR whose base changed while its head did not must lose eligibility",
+			in:           withCurrentBaseRef(cleanInput(), "release/2026.09"),
+			cfg:          cfg,
+			wantEligible: false,
+			wantReason:   autoapproval.ReasonBaseMoved,
+		},
+		{
+			name:         "a PR whose base SHA moved (parent pushed a new commit) while the base ref name stayed the same must lose eligibility",
+			in:           withCurrentBaseSHA(cleanInput(), "base-def456"),
+			cfg:          cfg,
+			wantEligible: false,
+			wantReason:   autoapproval.ReasonBaseMoved,
+		},
+		{
+			name:         "a verdict recorded with no base ref at all (predates this amendment) is UNKNOWN context, never a match",
+			in:           withVerdictBaseRef(cleanInput(), ""),
+			cfg:          cfg,
+			wantEligible: false,
+			wantReason:   autoapproval.ReasonContextUnknown,
+		},
+		{
+			name:         "an ancestor chain that no longer matches the PR's current stacked ancestry loses eligibility",
+			in:           withCurrentAncestorChain(cleanInput(), []review.AncestorLink{{Ref: "main", SHA: "sha-main-new"}}),
+			cfg:          cfg,
+			wantEligible: false,
+			wantReason:   autoapproval.ReasonAncestorChainChanged,
+		},
+		{
+			name: "an ancestor chain that matches in content but not ORDER is still a change (order-sensitive)",
+			in: withCurrentAncestorChain(
+				withVerdictAncestorChain(cleanInput(), []review.AncestorLink{{Ref: "a", SHA: "1"}, {Ref: "b", SHA: "2"}}),
+				[]review.AncestorLink{{Ref: "b", SHA: "2"}, {Ref: "a", SHA: "1"}},
+			),
+			cfg:          cfg,
+			wantEligible: false,
+			wantReason:   autoapproval.ReasonAncestorChainChanged,
+		},
+		{
+			name:         "a verdict recorded under an earlier eligibility policy version loses eligibility",
+			in:           withVerdictPolicyVersion(cleanInput(), autoapproval.CurrentPolicyVersion-1),
+			cfg:          cfg,
+			wantEligible: false,
+			wantReason:   autoapproval.ReasonPolicyVersionMismatch,
+		},
+		{
+			name:         "a fully matching context (base, empty ancestor chain, current policy version) stays eligible",
+			in:           cleanInput(),
+			cfg:          cfg,
+			wantEligible: true,
+			wantReason:   autoapproval.ReasonNone,
+		},
+
+		// --- criterion 5: CI green at the CURRENT head ---
 		{
 			name:         "CI not green at head is never eligible",
 			in:           withCIGreen(cleanInput(), false),
@@ -127,7 +220,7 @@ func TestComputeEligible(t *testing.T) {
 			wantReason:   autoapproval.ReasonCINotGreen,
 		},
 
-		// --- criterion 4: Shippable == auto, exercised via three
+		// --- criterion 6: Shippable == auto, exercised via three
 		// DISTINCT, independently-meaningful ways Shippable can fail to
 		// be auto (risk baseline, coverage floor, premise floor) -- see
 		// doc.go for why this ONE check is "no floor raised" in full,
@@ -166,7 +259,7 @@ func TestComputeEligible(t *testing.T) {
 			wantReason:   autoapproval.ReasonNotShippableAuto,
 		},
 
-		// --- criterion 5: diff size under the configured threshold --
+		// --- criterion 7: diff size under the configured threshold --
 		// now gated on ChangedFileCount (the
 		// server-fetched fact), never Verdict.FilesChanged. ---
 		{
@@ -184,11 +277,11 @@ func TestComputeEligible(t *testing.T) {
 			wantReason:   autoapproval.ReasonNone,
 		},
 
-		// --- criterion 6: the changed-file facts must actually be
+		// --- criterion 8: the changed-file facts must actually be
 		// KNOWN before TouchedBlastRadius is trusted at all -- Phase 5
 		// audit findings 1+2 (both fixed): a failed or page-truncated
 		// GitHub changed-files fetch must refuse here, distinctly from
-		// "we checked and it IS sensitive" (criterion 7 immediately
+		// "we checked and it IS sensitive" (criterion 9 immediately
 		// below). Mutation-test target: reverting this check (deleting
 		// the `if !in.TouchedBlastRadiusKnown` branch in eligibility.go)
 		// must turn the FIRST case below from refused back into eligible
@@ -234,7 +327,7 @@ func TestComputeEligible(t *testing.T) {
 			wantReason:   autoapproval.ReasonNone,
 		},
 
-		// --- criterion 7: no sensitive path touched -- gated on
+		// --- criterion 9: no sensitive path touched -- gated on
 		// TouchedBlastRadius (the server-DERIVED fact,
 		// autoapproval.ClassifyChangedPaths over the PR's real changed
 		// files), never Verdict.BlastRadius. ---
@@ -309,8 +402,14 @@ func TestComputeEligible_IgnoresModelSelfReportedFilesChangedAndBlastRadius(t *t
 		t.Parallel()
 		in := autoapproval.EligibilityInput{
 			Verdict:                 lyingVerdict,
+			VerdictAssessed:         true,
 			VerdictHeadSHA:          "sha-under-attack",
+			VerdictBaseRef:          "main",
+			VerdictBaseSHA:          "base-under-attack",
+			VerdictPolicyVersion:    autoapproval.CurrentPolicyVersion,
 			CurrentHeadSHA:          "sha-under-attack",
+			CurrentBaseRef:          "main",
+			CurrentBaseSHA:          "base-under-attack",
 			CIGreen:                 true,
 			HasNeedsHumanLabel:      false,
 			ChangedFileCount:        300, // TRUTH: GitHub itself reports 300 changed files.
@@ -329,12 +428,18 @@ func TestComputeEligible_IgnoresModelSelfReportedFilesChangedAndBlastRadius(t *t
 	t.Run("sensitive path: real migrations+authz paths refuse despite a lying empty BlastRadius", func(t *testing.T) {
 		t.Parallel()
 		in := autoapproval.EligibilityInput{
-			Verdict:            lyingVerdict,
-			VerdictHeadSHA:     "sha-under-attack",
-			CurrentHeadSHA:     "sha-under-attack",
-			CIGreen:            true,
-			HasNeedsHumanLabel: false,
-			ChangedFileCount:   1, // small, so this subtest isolates the sensitive-path criterion specifically
+			Verdict:              lyingVerdict,
+			VerdictAssessed:      true,
+			VerdictHeadSHA:       "sha-under-attack",
+			VerdictBaseRef:       "main",
+			VerdictBaseSHA:       "base-under-attack",
+			VerdictPolicyVersion: autoapproval.CurrentPolicyVersion,
+			CurrentHeadSHA:       "sha-under-attack",
+			CurrentBaseRef:       "main",
+			CurrentBaseSHA:       "base-under-attack",
+			CIGreen:              true,
+			HasNeedsHumanLabel:   false,
+			ChangedFileCount:     1, // small, so this subtest isolates the sensitive-path criterion specifically
 			// TRUTH: autoapproval.ClassifyChangedPaths, applied to the PR's
 			// real changed files, found migrations + authz touched -- see
 			// TestRevalidateForMerge_LyingVerdictAgainstReal300FileSensitivePR
@@ -368,8 +473,14 @@ func TestComputeEligible_IgnoresModelSelfReportedFilesChangedAndBlastRadius(t *t
 
 		in := autoapproval.EligibilityInput{
 			Verdict:                 overReportingVerdict,
+			VerdictAssessed:         true,
 			VerdictHeadSHA:          "sha-clean",
+			VerdictBaseRef:          "main",
+			VerdictBaseSHA:          "base-clean",
+			VerdictPolicyVersion:    autoapproval.CurrentPolicyVersion,
 			CurrentHeadSHA:          "sha-clean",
+			CurrentBaseRef:          "main",
+			CurrentBaseSHA:          "base-clean",
 			CIGreen:                 true,
 			HasNeedsHumanLabel:      false,
 			ChangedFileCount:        1,
@@ -430,5 +541,33 @@ func withTouchedBlastRadius(in autoapproval.EligibilityInput, tags []review.Tag)
 }
 func withTouchedBlastRadiusKnown(in autoapproval.EligibilityInput, known bool) autoapproval.EligibilityInput {
 	in.TouchedBlastRadiusKnown = known
+	return in
+}
+func withVerdictAssessed(in autoapproval.EligibilityInput, v bool) autoapproval.EligibilityInput {
+	in.VerdictAssessed = v
+	return in
+}
+func withVerdictBaseRef(in autoapproval.EligibilityInput, ref string) autoapproval.EligibilityInput {
+	in.VerdictBaseRef = ref
+	return in
+}
+func withCurrentBaseRef(in autoapproval.EligibilityInput, ref string) autoapproval.EligibilityInput {
+	in.CurrentBaseRef = ref
+	return in
+}
+func withCurrentBaseSHA(in autoapproval.EligibilityInput, sha string) autoapproval.EligibilityInput {
+	in.CurrentBaseSHA = sha
+	return in
+}
+func withVerdictAncestorChain(in autoapproval.EligibilityInput, chain []review.AncestorLink) autoapproval.EligibilityInput {
+	in.VerdictAncestorChain = chain
+	return in
+}
+func withCurrentAncestorChain(in autoapproval.EligibilityInput, chain []review.AncestorLink) autoapproval.EligibilityInput {
+	in.CurrentAncestorChain = chain
+	return in
+}
+func withVerdictPolicyVersion(in autoapproval.EligibilityInput, v int) autoapproval.EligibilityInput {
+	in.VerdictPolicyVersion = v
 	return in
 }
