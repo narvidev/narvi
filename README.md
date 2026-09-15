@@ -24,9 +24,10 @@ Narvi — this repository — is the engine and team web UI, complete on its own
 | Path | What it is |
 |---|---|
 | [`docs/TECHNICAL_PLAN.md`](docs/TECHNICAL_PLAN.md) | The full technical specification: architecture, domain model, ports, cross-cutting invariants, wire contracts, feature set, identity/RBAC, the product-prototyping workflow, release review, and the decision inbox. Self-contained. |
-| [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) | The work broken into 176 Steps across 19 phases (0–18) — 141 of scheduled work (3 of them gated on a product decision), 3 routed out to a separate repository, plus 32 named gaps (Phase 11) that gate nothing — each Step shippable as one pull request and referencing the technical-plan section that specifies it. |
+| [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) | The work broken into 177 Steps across 19 phases (0–18) — 141 of scheduled work (3 of them gated on a product decision), 3 routed out to a separate repository, plus 33 named gaps (Phase 11) that gate nothing — each Step shippable as one pull request and referencing the technical-plan section that specifies it. |
 | [`docs/design/mockups.html`](docs/design/mockups.html) | Visual specification — nine UI views with numbered design decisions. Open in a browser. |
 | [`docs/environments.md`](docs/environments.md) | Requirements for an Environment's own `setup.sh`/`start.sh` — notably the `setup.sh` idempotency contract every repo must satisfy under warm-boot shared images. |
+| [`docs/DECISIONS.md`](docs/DECISIONS.md) | Decisions this design cannot take for itself, and where each one is recorded. An **index**: where a decision belongs to a Step row, that row stays authoritative and this file holds a pointer. It carries in full only the decisions that have no row yet — because taking them is what would create one. |
 | [`docs/analyses/`](docs/analyses/) | Dated, point-in-time studies that informed a plan change, each pinning the commit it was checked against. **Not normative** — where one disagrees with the plans, the plans win and the analysis is stale by definition. |
 
 ## Building it
