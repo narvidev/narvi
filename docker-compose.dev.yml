@@ -27,19 +27,22 @@ services:
   # S3-compatible backend internal/adapters/outbound/objstore talks to in
   # development, mirroring the postgres service above exactly (same
   # override-via-.env port convention, same CMD-SHELL healthcheck shape).
-  # Pinned to a real, currently-published release tag (verified directly
-  # against the Docker Hub registry API and pulled successfully while this
-  # service was written -- minio/minio's own Docker Hub publishing appears
-  # to have gone quiet after this exact release, which is also why it is
-  # the newest tag available at all, not merely the one picked) -- the
-  # SAME tag internal/adapters/outbound/objstore/
+  # Pulled from quay.io, MinIO's own registry, NOT Docker Hub. The comment
+  # here used to note that minio/minio's Docker Hub publishing "appears to
+  # have gone quiet after this exact release" -- it has since stopped
+  # answering anonymous pulls entirely ("repository does not exist or may
+  # require 'docker login'"), which broke CI and every local
+  # `docker compose up` alike. quay.io serves the SAME pinned tag, so the
+  # only thing that changed is where it comes from.
+  #
+  # Same tag internal/adapters/outbound/objstore/
   # objstore_integration_test.go's own testcontainer uses, for the same
   # consistency reason the postgres service's own image comment above
   # already gives. Deliberately not ":latest", so a local
   # `docker compose pull` can't silently change dev's behavior out from
   # under anyone.
   minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: narvi
