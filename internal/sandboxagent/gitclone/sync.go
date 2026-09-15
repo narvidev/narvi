@@ -508,6 +508,18 @@ func runGit(ctx context.Context, sup *supervisor.Supervisor, args []string, step
 	// See internal/sandboxagent/githarden for what they are and what
 	// happens without them. Callers still pass their own "-C <dir>";
 	// githarden.Harden rewrites the invocation around it.
+	//
+	// githarden's own doc comment records, and does not paper over, the
+	// gap Harden's -c flags cannot reach: filter.<driver>,
+	// merge.<driver>.driver, and remote.<name>.uploadpack/receivepack are
+	// each a command chosen by this same repository's own .git/config,
+	// which the agent runtime owns (§30.5), and every one of them is
+	// reachable by git invocations this package makes against an
+	// already-existing workspace (SyncAll's checkout/stash-pop,
+	// CleanForImageBuild's own `checkout -- .`). No flag or attributes
+	// override closes that for a process that still runs git against a
+	// runtime-owned .git; see githarden's doc comment and
+	// githarden_test.go for the recorded, executable proof.
 	proc, err := sup.Spawn(supervisor.Spec{
 		Path:   "git",
 		Args:   githarden.Harden(args),
