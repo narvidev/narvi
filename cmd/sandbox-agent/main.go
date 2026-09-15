@@ -501,14 +501,14 @@ func (h *commandHandler) HandlePush(_ context.Context, cmd sandboxws.Push) {
 // fields (remote, in addition to name/branch). See reposource's own
 // package doc comment for the full reasoning.
 //
-// Neither this function's own `git push` nor headSHA's `git rev-parse
-// HEAD` below is preceded by githarden.NeutralizeFilters, unlike
-// internal/sandboxagent/gitclone's runGit/applySparseCheckout/
-// disableSparseCheckoutIfEnabled: neither populates a working tree from a
-// blob (push transfers already-committed objects verbatim; rev-parse
-// only reads a ref), so neither can ever invoke a clean/smudge filter
-// regardless of what .git/config says. See githarden.NeutralizeFilters'
-// own doc comment for what DOES need it.
+// Both this function's own `git push` and headSHA's `git rev-parse HEAD`
+// below go through githarden.Args like every other git invocation here,
+// and that is the whole of the hardening either gets. No attributes
+// override precedes them: one was tried for the content-filter class,
+// measured, and withdrawn as net-negative -- see githarden's own doc
+// comment for why, and for the two further command classes (merge
+// drivers, the uploadpack/receivepack transport pair) that no flag in
+// this package reaches either.
 func (h *commandHandler) pushOneRepo(repoSpec sandboxws.PushReposElem) (string, error) {
 	if err := reposource.ValidateRepoName(repoSpec.Name); err != nil {
 		return "", fmt.Errorf("invalid repo name: %w", err)
