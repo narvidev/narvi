@@ -28,7 +28,9 @@
 // in their own checkouts.
 package githarden
 
-import "github.com/narvidev/narvi/internal/sandboxagent/supervisor"
+import (
+	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
+)
 
 // noHooksPath points git at a location that holds no hooks and cannot be
 // made to hold any. /dev/null is not a directory, so every hook lookup
@@ -99,14 +101,89 @@ func hardeningFlags(repoDir string) []string {
 	}
 }
 
-// NOT covered, stated rather than left for the next audit to rediscover:
-// content filters (filter.<name>.clean / .smudge). They are named by the
-// repository's own .gitattributes, so there is no fixed key to neutralise
-// and git offers no flag that disables filters wholesale. A repository
-// that authors both .gitattributes and .git/config can still run a
-// command on checkout. The control for that is the UID boundary (§30.5)
-// and, for the credential specifically, the read-only token (§30.4) --
-// not this file. Do not read the list above as a complete perimeter.
+// Three command classes are deliberately left off the list above, and NOT
+// because they are safe. Two adversarial audit rounds, both reproduced
+// against real git, established that none of the three can be closed by
+// anything this package does, and record why here so the gap cannot rot
+// into a comment nobody rechecks; see githarden_test.go for the
+// executable proof each class actually runs.
+//
+//  1. filter.<driver>.clean/.smudge. A filter's driver name is chosen by
+//     the repository's own .gitattributes ("<path> filter=<anything>"),
+//     so there is no fixed "filter.X.clean" key a -c entry could reset
+//     once and cover every case: "-c filter.*.clean=" is not a wildcard
+//     to git, it names a literal, useless config section called "*".
+//     git documents no flag that disables the filter mechanism wholesale
+//     (gitattributes(5)).
+//
+//  2. merge.<driver>.driver. Same shape as (1) -- the driver name is
+//     chosen by the repository's own .gitattributes ("<path>
+//     merge=<anything>") -- and reachable through a command this
+//     codebase actually runs: internal/sandboxagent/gitclone's syncOne
+//     runs `git stash pop --index` to restore a stashed working tree,
+//     which invokes the configured merge driver on conflict. Root in
+//     production (workspaceowner.go).
+//
+//  3. remote.<name>.uploadpack / remote.<name>.receivepack. Unlike (1)
+//     and (2), this key has no attributes half at all to reason about --
+//     it lives only in .git/config, names a command git runs as the
+//     LOCAL side of the pack protocol, and fires deterministically, with
+//     no race, on a plain `git fetch` or `git push` against a remote
+//     configured with that key. Nothing in gitattributes(5) or a -c
+//     override touches it.
+//
+// A tempting answer for all three -- "the UID boundary (§30.5) already
+// covers this, since a repository-authored command either runs as the
+// runtime already, or never runs at all" -- does not survive contact
+// with what §30.5 actually grants. The runtime owns .git BECAUSE of that
+// boundary, which makes writing any of the three keys above into
+// .git/config (and, for (1)/(2), a matching attribute into
+// .gitattributes) an ORDINARY, unprivileged act for it -- not a
+// violation of the boundary. The violation is what happens next:
+// sandbox-agent's OWN later git invocations against that SAME repository
+// -- gitclone's SyncAll reconciling an already-existing workspace exactly
+// like a repo_image/snapshot_restore boot presents one, its
+// CleanForImageBuild running `checkout -- .` at image-bake time, or any
+// plain fetch/push -- read that config back and run the planted command
+// AS SANDBOX-AGENT. Same shape as the pre-push-hook exploit this file's
+// own top comment documents, one call removed.
+//
+// A first attempt at a mitigation for (1) alone -- writing "* -filter"
+// into $GIT_DIR/info/attributes, gitattributes(5)'s own highest-
+// precedence attributes source -- was tried, measured against real git,
+// and WITHDRAWN. It failed on every axis that matters: the attributes
+// file it wrote into lives inside the same runtime-owned directory the
+// attack starts from, so the runtime can delete or replace it between
+// the write and git's read (0 of 60 racing trials blocked in
+// measurement); it addressed only (1), leaving (2) and (3) untouched;
+// and reaching it required a root-privileged os.WriteFile into a
+// directory an attacker controls, which is itself a primitive an
+// attacker could redirect (via a symlink planted at the parent
+// directory) into truncating an arbitrary file on the host. A mitigation
+// that adds a root-privileged write into an attacker-owned directory,
+// for a race it cannot win, is net-negative -- worse than doing nothing.
+//
+// CONCLUSION: none of these three classes is closed by anything in this
+// package, or closable by any flag, attributes override, or file written
+// into .git from a process that does not itself own .git. The only real
+// remedy is structural: sandbox-agent must stop running git against a
+// .git directory the sandbox runtime owns (filed as a follow-up plan
+// row; find it by its own citation, never by a Step number -- Step
+// numbers do not belong in this source per this codebase's own
+// convention). Until that lands, this is a recorded, accepted gap, not a
+// fixed one.
+//
+// The trade-off a real fix would still need, decided here rather than
+// left to be discovered by a user with a checkout full of pointer files:
+// git-lfs is itself implemented as exactly this kind of content filter.
+// Today that trade is free regardless of any of the above --
+// deploy/sandbox-image/Dockerfile installs `git`, never `git-lfs`, so no
+// repository's LFS content is materialized by sandbox-agent's own
+// clone/sync either way; a repository using LFS already gets pointer
+// files, not real blobs. If git-lfs is ever added to the image AND a
+// real, race-free fix is ever built, that fix will need a deliberate,
+// named exception for the literal driver name "lfs" -- not a silent
+// regression discovered later.
 
 // Args returns git's own arguments for a command operating on repoDir,
 // with the hardening ahead of whatever the caller wants to run.
