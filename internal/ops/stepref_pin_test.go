@@ -38,6 +38,8 @@ var stepRefPins = []stepRefPin{
 	{"docs/guides/README.md", "64", "plan mode: follow-up intent classification (amend vs answer)"},
 	{"docs/guides/README.md", "77", "ops"},
 	{"docs/guides/README.md", "78", "launch readiness"},
+	{"docs/guides/README.md", "165", "the document and its drift test"},
+	{"docs/guides/README.md", "178", "the guide drift check only runs in the direction that does not fail"},
 	{"docs/guides/github.md", "48", "sentinels + suggestions"},
 	{"docs/guides/github.md", "63", "review: learned false-positive patterns"},
 	{"docs/guides/github.md", "65", "review: automatic re-review on new commits"},

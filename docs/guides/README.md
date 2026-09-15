@@ -282,3 +282,53 @@ exact mutations and test names:
 3. Malforming a guide file (breaking its embedded JSON, or removing a
    closing fence) makes `internal/ops.LoadGuides` itself fail — the test
    errors out rather than silently treating that file as empty.
+
+## Two rules, one of which nothing currently enforces
+
+**Shipped behavior only, and this stays.** A proposal from a documentation-gap
+review was to let a guide describe planned behavior behind a marker — the
+`[planned §N]` model Step 165 uses for `docs/FOUNDATIONS.md`. That model is
+right there and wrong here, and the difference is who is reading. FOUNDATIONS
+exists to state what this system *is*, where a planned item is information.
+These guides are read by someone trying to do something **now**: a
+planned-behavior entry is an instruction that fails, and the reader has no way
+to tell which half of the page applies to them. A Step existing does not make
+a feature available, and a guide is the last place a reader should have to
+draw that distinction for themselves. So: no markers, no aspirational section,
+no "coming soon". A capability appears here when it ships and not before —
+which is also why the rule above is stated as an invariant and not a
+preference. Adding the marker would weaken a property that currently holds.
+
+**The drift check only runs one way, and the other way is the one that
+happens.** `TestNoGuideDrift` fails a guide documenting a command the code does
+not implement. It cannot fail a guide that **omits** a command the code does
+implement. Omission is the realistic failure: shipping a capability and
+updating its guide are two acts, usually by two people, at two different
+times, and only one of them is enforced. A check that catches aspirational
+text, living in a directory whose stated risk is aspirational text, reads as
+covering the subject; it covers half of it, and the visible half.
+
+Step 178 is where the missing direction is filed, including the reason it is
+harder than its sibling: nothing in the router knows which routes are meant
+for a person. A webhook receiver, a health endpoint and a BFF route the web
+app calls are all real routes that belong in no user guide, so the check needs
+an explicit list of what is deliberately undocumented — and that list is a
+claim someone makes, never a default.
+
+## Which lot owes which guide
+
+A capability that ships without its guide entry is the omission above, made
+concrete. Each of these names the guide it must update as part of its own
+work, not afterwards:
+
+| Lot | Guide |
+|---|---|
+| Ticket decomposition into a PR train, and `Stop` across it | `linear.md` — it is the surface the train is driven from |
+| Automations dispatching on real webhook events, including check and status events | `github.md`, and `web.md` for where an automation is configured |
+| The review's own result surface and human acceptance of a verdict | `github.md` for the check and the review, `web.md` for acceptance |
+| Snapshot restore and what a restored sandbox carries | `web.md` |
+| Upload and capture limits, and anything reclaiming quota | `web.md` |
+| An external client connection, if one is ever adopted | a new guide file — this one is a connection procedure, not a surface's command set |
+
+The last row is deliberately conditional: `docs/DECISIONS.md` holds that
+decision, and naming the guide here does not take it.
