@@ -128,10 +128,25 @@ import (
 //  10. Otherwise -> 201 with restdtos.PostReviewVerdictResponse, having
 //     enqueued exactly one ports.NotificationKindGitHubVerdict outbox row
 //     (internal/adapters/outbound/githubapi.VerdictNotifier delivers it:
-//     the formal review, then the label sync) AND appended exactly one
-//     review_verdicts row -- outcome 8's own refuse-outright fix means a
-//     201 now ALWAYS has a verdict of record; there is no longer a path
-//     where this handler succeeds with the insert silently skipped.
+//     the formal review, then the label sync). Outcome 8's own
+//     refuse-outright fix closes the ATTRIBUTION gap only -- an
+//     un-attributable REQUEST can no longer reach 201 at all -- and this
+//     does NOT mean the review_verdicts insert is now unconditional (an
+//     earlier version of this comment claimed exactly that, and it was
+//     false, E1, third adversarial-review round): a correctly-attributed
+//     turn whose own review_head_sha is nil (dispatchedTurn.
+//     ReviewHeadSha == nil -- e.g. that turn's own context fetch degraded
+//     to no head sha at all, reviewcontext.Fetch's own doc comment) still
+//     reaches 201 with the review_verdicts insert SKIPPED, logged, never
+//     failing the call (see the skip's own comment at the insert site,
+//     below, for why that is the safe direction). This is a distinct,
+//     still-live case outcome 8 was never meant to close: verdictHeadSHA
+//     == "" reflects a real upstream fetch failure at turn-creation time,
+//     not a caller-controllable input the way the missing/placeholder/
+//     unresolvable dispatch header was, so refusing the whole tool call
+//     here would punish the agent for a fetch that failed before it ever
+//     ran. TestPostReviewVerdict_SkipsReviewVerdictInsert_WhenNoReviewHeadSHA
+//     pins exactly this: 201, and zero review_verdicts rows.
 //
 // §8.2 ("sentinels + suggestions", §17/§22.1) extends this handler,
 // never replaces it: after building the verdict, it ALSO builds

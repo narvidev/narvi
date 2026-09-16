@@ -12,7 +12,11 @@
 package decisioninbox_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
 	"strconv"
 	"strings"
 	"testing"
@@ -56,6 +60,22 @@ func newRevalidateStores(pool *pgxpool.Pool) *revalidateStores {
 			SentinelFixes:  narvipg.NewSentinelFixStore(pool),
 			Artifacts:      narvipg.NewArtifactStore(pool),
 			Identities:     narvipg.NewIdentityStore(pool),
+			// Timeouts (E4/E7, third adversarial-review round): this rig's
+			// own top-level decisioninbox.Deps.Timeouts was never set at
+			// all before this fix -- revalidateCore had no reason to read
+			// it until E4 wired DecisionInboxIsAncestorTimeout into its own
+			// IsAncestor call, at which point this rig's own zero-valued
+			// Timeouts silently supplied a 0s timeout to every subtest in
+			// this file, making the fast-forward-tolerance subtest below
+			// (BaseBranchAdvanced_ConfirmedFastForward_NotRefused) fail --
+			// exactly the "zero/missing timeout observable" property E7
+			// added the fake's own ctx-honoring for, just caught in this
+			// fixture rather than in production. Mirrors ReviewVerdict.
+			// Timeouts immediately below (already set, for a different
+			// reason) and aggregate_integration_test.go's own rig, which
+			// already sets this top-level field for its own pre-existing
+			// deps.Timeouts.DecisionInboxStaleAfter consumer.
+			Timeouts: platform.DefaultTimeouts(),
 			// (§21.1/§21.2): the REAL auto-approval eligibility
 			// engine's own store dependencies -- revalidateCore now reads
 			// review_verdicts/repo_settings through this bundle.
@@ -604,6 +624,55 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		}
 	})
 
+	// E6 (third adversarial-review round): the SAME precondition as
+	// BaseBranchAdvanced_ConfirmedFastForward_NotRefused immediately
+	// above -- base ref unchanged, base sha genuinely differs on both
+	// sides -- but this time the fake's own IsAncestor call itself FAILS,
+	// rather than confirming or refuting the movement. Before this fix,
+	// revalidateCore (the merge-gate path) swallowed that error with no
+	// log at all -- unlike its read-model sibling in aggregate.go, which
+	// already logs -- and fell through to autoapproval.ComputeEligible's
+	// generic ReasonBaseMoved ("the pull request's base has changed since
+	// this verdict was produced"): true, but not the whole truth. The
+	// base SHA genuinely did change (that part IS confirmed, or this
+	// branch is never reached at all), but whether that change was a
+	// safe fast-forward or a genuine rewrite is exactly what the failed
+	// IsAncestor call could not determine -- "the base changed" and "we
+	// could not check whether tolerating that change was safe" are
+	// different facts, and conflating them tells an operator retrying is
+	// pointless when it may well not be.
+	t.Run("BaseBranchAdvanced_AncestorCheckFails_LogsAndReturnsHonestReason", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-ancestor-check-fails"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 35)
+		rs.sourceControl.resolveBranchSHA = "sha-main-has-actually-advanced"
+		rs.sourceControl.isAncestorErr = errors.New("boom: github is down")
+		// Mirrors the preceding subtest's own "reset at the START" note --
+		// the SAME shared fake carries isAncestorCalls across subtests.
+		rs.sourceControl.isAncestorCalls = nil
+		defer func() {
+			rs.sourceControl.resolveBranchSHA = ""
+			rs.sourceControl.isAncestorErr = nil
+			rs.sourceControl.isAncestorCalls = nil
+		}()
+
+		buf := captureDefaultLoggerJSON(t)
+
+		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil -- an unconfirmable ancestry check is a domain refusal, never a Go error", err)
+		}
+		if ok {
+			t.Fatal("RevalidateForMerge() ok = true, want false -- a base movement that could not be confirmed safe must still refuse the merge")
+		}
+		const wantReason = "this pull request's base has changed since this verdict was produced, and whether that change was safe to tolerate could not be confirmed (a live check failed) -- try again shortly"
+		if reason != wantReason {
+			t.Errorf("reason = %q, want %q -- E6: a FAILED ancestry check must read differently from autoapproval.ReasonBaseMoved's own generic \"the base has changed\" text, which this code path must never fall through to", reason, wantReason)
+		}
+		if !hasLogEntry(t, buf, "decisioninbox: resolve base-advanced-without-rewrite ancestry failed, refusing merge -- could not confirm whether the base's forward movement was safe to tolerate") {
+			t.Errorf("did not find the dedicated ancestor-check-failure log line -- E6: this call previously swallowed the error with no log at all; full log:\n%s", buf.String())
+		}
+	})
+
 	// RevalidateForMerge's own
 	// truncated->500 branch was never executed by any existing test --
 	// when the target PR is not found in a TRUNCATED (partial/degraded)
@@ -682,6 +751,39 @@ func TestRevalidateForMerge_EligibilityConfigStoreError_FailsClosed(t *testing.T
 	if reason != "" {
 		t.Errorf("reason = %q, want empty (this is an error return, not a domain refusal reason)", reason)
 	}
+}
+
+// captureDefaultLoggerJSON/hasLogEntry mirror internal/adapters/inbound/
+// httpapi's own identical precedent (planapprove_integration_test.go's
+// captureDefaultLoggerJSON/findLogEntry) -- platform.Logger(ctx), what
+// revalidateCore actually calls, is itself built on top of
+// slog.Default(), so redirecting THAT is how a test observes what got
+// logged. Copied locally rather than shared cross-package (both are
+// small, unexported test helpers with no natural shared home).
+func captureDefaultLoggerJSON(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+	return &buf
+}
+
+func hasLogEntry(t *testing.T, buf *bytes.Buffer, wantMsg string) bool {
+	t.Helper()
+	for _, line := range bytes.Split(buf.Bytes(), []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal(line, &entry); err != nil {
+			t.Fatalf("unmarshal log line %q: %v", line, err)
+		}
+		if entry["msg"] == wantMsg {
+			return true
+		}
+	}
+	return false
 }
 
 // TestRevalidateForMerge_LyingVerdictAgainstReal300FileSensitivePR is the

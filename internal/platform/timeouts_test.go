@@ -1396,6 +1396,20 @@ func TestDefaultTimeouts_Step173StandaloneField(t *testing.T) {
 		t.Errorf("DecisionInboxResolveBranchSHATimeout = %v, want %v", to.DecisionInboxResolveBranchSHATimeout, 10*time.Second)
 	}
 
+	// DecisionInboxIsAncestorTimeout (D3, second adversarial-review round)
+	// had NO assertion anywhere in this file until E7, third
+	// adversarial-review round: a zero value here would have made
+	// revalidateCore's own IsAncestor call fail on every single
+	// invocation (context.WithTimeout with a non-positive duration
+	// expires immediately) with no test anywhere noticing, silently
+	// disabling the whole D3 fast-forward-tolerance mechanism.
+	if to.DecisionInboxIsAncestorTimeout <= 0 {
+		t.Errorf("DecisionInboxIsAncestorTimeout = %v, want > 0", to.DecisionInboxIsAncestorTimeout)
+	}
+	if to.DecisionInboxIsAncestorTimeout != 10*time.Second {
+		t.Errorf("DecisionInboxIsAncestorTimeout = %v, want %v", to.DecisionInboxIsAncestorTimeout, 10*time.Second)
+	}
+
 	if err := to.Validate(); err != nil {
 		t.Fatalf("Validate() = %v, want nil (this field must not disturb either invariant chain)", err)
 	}

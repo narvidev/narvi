@@ -183,6 +183,17 @@ type Result struct {
 	//     renders it, demoted out of ready_to_merge (that field's own doc
 	//     comment) -- but the overall read is, again, no longer a complete
 	//     picture. SCMAsOf is set here too, same as (3)/(4).
+	//  6. computeRealEligibility's own live SCM lookups for that ONE PR --
+	//     the base-branch tip resolution (SCMCache.ResolveBranchSHA) or the
+	//     fast-forward-ancestry confirmation (SCMCache.IsAncestor), either
+	//     one failing (E5, third adversarial-review round). Before this
+	//     producer existed, a row demoted out of ready_to_merge by either
+	//     failure's own fail-closed reason (ReasonBaseSHAUnknown/
+	//     ReasonBaseMoved) rendered identically to a row the engine
+	//     genuinely judged ineligible -- exactly the "failure rendering as
+	//     a confident normal state" shape this codebase has repeatedly had
+	//     to fix elsewhere. Same shape as (5): the row is NOT dropped, only
+	//     demoted, and SCMAsOf is set here too.
 	//
 	// UNLIKE this field's own previous doc comment claimed, SCMAsOf
 	// non-nil and SCMFetchFailed true are NOT mutually exclusive as of
@@ -397,7 +408,16 @@ func buildPRItems(ctx context.Context, deps Deps, actorGitHubID, token string, n
 			// doc comment (a per-row degrade still marks the whole batch).
 			degraded = true
 		}
-		item := buildPROpenItem(ctx, deps, pr, repoFullName, actorGitHubID, token, now, budget)
+		item, itemDegraded := buildPROpenItem(ctx, deps, pr, repoFullName, actorGitHubID, token, now, budget)
+		if itemDegraded {
+			// E5, third adversarial-review round: buildPROpenItem's own
+			// computeRealEligibility call hit a live SCM lookup failure for
+			// THIS one row -- see Result.SCMFetchFailed's own producer list
+			// (6) and buildPROpenItem's own doc comment. Mirrors
+			// pr.ReviewDecisionDegraded immediately above: a per-row
+			// degrade still marks the whole batch.
+			degraded = true
+		}
 		items = append(items, item)
 	}
 
@@ -414,8 +434,18 @@ func buildPRItems(ctx context.Context, deps Deps, actorGitHubID, token string, n
 const openFindingsUnknownFailClosed = 1
 
 // buildPROpenItem assembles one Item for an already-filtered, non-draft,
-// non-§17-excluded OpenPR.
-func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullName, actorGitHubID, token string, now time.Time, budget *codeOwnersBudget) Item {
+// non-§17-excluded OpenPR. degraded (E5, third adversarial-review round)
+// is true iff computeRealEligibility's own live SCM lookups (base-branch
+// tip resolution, fast-forward-ancestry confirmation) failed for this
+// ONE row -- see that function's own doc comment and Result.
+// SCMFetchFailed's own producer list (6) for the full "why": without
+// this, a row demoted out of ready_to_merge purely because a live GitHub
+// call failed rendered identically to one demoted on a genuine,
+// considered ineligibility judgement, exactly the "failure rendering as
+// a confident normal state" shape this codebase has already fixed
+// elsewhere for this same Result field (producers 1-5).
+func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullName, actorGitHubID, token string, now time.Time, budget *codeOwnersBudget) (Item, bool) {
+	var degraded bool
 	provenance := resolvePRProvenance(ctx, deps, pr, repoFullName, actorGitHubID, token, now, budget)
 
 	hasNeedsHuman, riskLabel, isHandoffPR := classifyPRLabels(pr.Labels)
@@ -493,7 +523,8 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 		item.Kind = decisioninbox.KindNeedsReview
 	default:
 		platformAuthored := isPlatformAuthored(ctx, deps, pr.HTMLURL)
-		eligible := computeRealEligibility(ctx, deps, repoFullName, pr, ciGreen, hasNeedsHuman, token, now)
+		eligible, eligibilityDegraded := computeRealEligibility(ctx, deps, repoFullName, pr, ciGreen, hasNeedsHuman, token, now)
+		degraded = eligibilityDegraded
 		// HasChangesRequested is a HARD merge blocker at RevalidateForMerge
 		// (revalidate.go) but was previously never consulted HERE -- so such a PR sat
 		// in the TOP ready_to_merge section with a Merge button that
@@ -533,7 +564,7 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 		}
 	}
 
-	return item
+	return item, degraded
 }
 
 // computeRealEligibility runs §21.2 stage 1's real auto-approval
@@ -564,14 +595,30 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 // live-resolved context: two values of a DIFFERENT kind that compared
 // unequal by construction, the exact same class of hazard finding F1
 // closed for revalidateCore one file over).
-func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string, pr ports.OpenPR, ciGreen, hasNeedsHuman bool, token string, now time.Time) bool {
+// degraded (E5, third adversarial-review round) is a SECOND, distinct
+// return value from eligible/eligible-ness itself: true iff a live SCM
+// lookup this function makes (base-branch tip resolution, or the
+// fast-forward-ancestry confirmation, both below) failed. Unset (false)
+// for the GetLatest/!hasVerdict/LoadEligibilityConfig early returns
+// immediately below -- those are pre-existing, differently-shaped
+// degradations (a Postgres store read, never a live GitHub SCM call) and
+// were never part of what this finding names; only the two live SCM
+// lookups this function's own D2/D3 (second round) fixes added are in
+// scope. Before this fix, a live SCM failure here demoted a row out of
+// ready_to_merge (via ReasonBaseSHAUnknown/ReasonBaseMoved, both
+// fail-closed) with NO way for the caller to tell that apart from a
+// considered "this PR really is not eligible" judgement -- see
+// buildPROpenItem's own doc comment and Result.SCMFetchFailed's own
+// producer list (6) for the full wiring this return value feeds.
+func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string, pr ports.OpenPR, ciGreen, hasNeedsHuman bool, token string, now time.Time) (bool, bool) {
+	var degraded bool
 	record, hasVerdict, err := appreviewverdict.GetLatest(ctx, deps.ReviewVerdict, repoFullName, int32(pr.Number))
 	if err != nil {
 		platform.Logger(ctx).Error("decisioninbox: get latest review verdict failed -- failing closed (not eligible)", "error", err, "repo", repoFullName, "pr_number", pr.Number)
-		return false
+		return false, false
 	}
 	if !hasVerdict {
-		return false
+		return false, false
 	}
 
 	// a genuine repo_settings read error means this
@@ -584,7 +631,7 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	cfg, cfgErr := appreviewverdict.LoadEligibilityConfig(ctx, deps.ReviewVerdict, repoFullName)
 	if cfgErr != nil {
 		platform.Logger(ctx).Error("decisioninbox: load eligibility config failed -- failing closed (not eligible)", "error", cfgErr, "repo", repoFullName, "pr_number", pr.Number)
-		return false
+		return false, false
 	}
 
 	// ChangedFileCount/TouchedBlastRadius are BOTH
@@ -669,7 +716,11 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// revalidateCore's own identical "fails CLOSED... autoapproval.
 	// ComputeEligible's own empty-base-sha guard (finding F2) then refuses
 	// on its own distinct reason" precedent -- never a second,
-	// independently-invented fail-closed path.
+	// independently-invented fail-closed path. ALSO marks this function's
+	// own degraded return true (E5, third round): the row this produces
+	// is about to fail closed on ReasonBaseSHAUnknown for a reason that
+	// has nothing to do with the PR's own merits -- a live GitHub call
+	// failed -- and the caller must be able to tell the two apart.
 	currentBaseSHA, _, baseSHAErr := deps.SCMCache.ResolveBranchSHA(ctx, ports.ResolveBranchSHASpec{
 		Owner:  pr.Owner,
 		Repo:   pr.Repo,
@@ -679,6 +730,7 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	if baseSHAErr != nil {
 		platform.Logger(ctx).Warn("decisioninbox: resolve live base branch sha failed, base-freshness check will fail closed via ReasonBaseSHAUnknown", "error", baseSHAErr, "repo", repoFullName, "pr_number", pr.Number)
 		currentBaseSHA = ""
+		degraded = true
 	}
 
 	// baseAdvancedWithoutRewrite (D3, second adversarial-review round)
@@ -698,6 +750,10 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 		}, now)
 		if ancestorErr != nil {
 			platform.Logger(ctx).Warn("decisioninbox: resolve base-advanced-without-rewrite ancestry failed, base-freshness check will fail closed via ReasonBaseMoved", "error", ancestorErr, "repo", repoFullName, "pr_number", pr.Number)
+			// E5, third round: same reasoning as baseSHAErr above -- this
+			// row is about to fail closed on ReasonBaseMoved for a reason
+			// that is not a judgement about the PR at all.
+			degraded = true
 		} else {
 			baseAdvancedWithoutRewrite = confirmed
 		}
@@ -744,7 +800,7 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 		appreviewverdict.RecordOverridden(ctx, deps.ReviewVerdict, repoFullName, int32(pr.Number), record.HeadSHA)
 	}
 
-	return eligible
+	return eligible, degraded
 }
 
 // resolvePRProvenance determines WHY pr is assigned to actorGitHubID --

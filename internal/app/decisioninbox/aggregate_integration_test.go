@@ -214,8 +214,23 @@ var _ ports.SourceControl = (*fakeDecisionInboxSourceControl)(nil)
 // isAncestorResult/isAncestorErr, recording every call it receives so a
 // test can assert WHICH (ancestor, descendant) pair was actually
 // compared -- mirrors this fake's own codeOwnersCalls precedent.
-func (f *fakeDecisionInboxSourceControl) IsAncestor(_ context.Context, spec ports.IsAncestorSpec) (bool, error) {
+//
+// Honors ctx (E7, third adversarial-review round): this previously
+// ignored ctx entirely (the blank identifier in its own signature), so
+// platform.Timeouts.DecisionInboxIsAncestorTimeout being zero, unset, or
+// never wired into the real call at all could not make ANY test in this
+// package fail -- the exact "the timeout is asserted by nothing" gap.
+// ctx.Err() is checked FIRST, before either configured return: a caller
+// context.WithTimeout'd with a non-positive duration is already expired
+// the instant it is constructed (context's own documented behavior, no
+// sleep/wall-clock dependency needed to observe it), so this makes a
+// zero/missing timeout on the real call site fail deterministically and
+// visibly here, precisely where the previous version could not.
+func (f *fakeDecisionInboxSourceControl) IsAncestor(ctx context.Context, spec ports.IsAncestorSpec) (bool, error) {
 	f.isAncestorCalls = append(f.isAncestorCalls, spec)
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if f.isAncestorErr != nil {
 		return false, f.isAncestorErr
 	}
@@ -1817,6 +1832,62 @@ func TestBuild_EligibilityConfigStoreError_DemotesFromReadyToMerge(t *testing.T)
 	}
 	if item.Kind == decisioninboxdomain.KindReadyToMerge {
 		t.Error("Kind = ready_to_merge, want needs_review -- an eligibility-config store error must fail CLOSED (never substitute the engine's own wider defaults for this repo's own configured policy)")
+	}
+}
+
+// TestBuild_LiveSCMLookupFails_MarksSCMFetchFailed is E5's own regression
+// test (third adversarial-review round): before this fix, a per-PR live
+// SCM lookup failure inside computeRealEligibility (here,
+// SCMCache.ResolveBranchSHA's own base-branch-tip resolution) demoted the
+// row out of ready_to_merge via ReasonBaseSHAUnknown's own fail-closed
+// path with NO way for the caller to tell that apart from a genuine,
+// considered "not eligible" judgement -- Result.SCMFetchFailed stayed
+// false throughout, so the row rendered as a confident normal state when
+// the truth was a failed GitHub call, exactly the "failure rendering as
+// a confident normal state" shape this codebase has repeatedly had to
+// fix elsewhere (Result.SCMFetchFailed's own producer list, producers
+// 1-5, aggregate.go). Uses the SAME fault-injection shape as
+// TestBuild_EligibilityConfigStoreError_DemotesFromReadyToMerge above,
+// applied to the fake SourceControl's own ResolveBranchSHA instead of a
+// broken Postgres store.
+func TestBuild_LiveSCMLookupFails_MarksSCMFetchFailed(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "5009"
+	const repoFullName = "acme/build-live-scm-lookup-fails"
+
+	actor, fakeSCM := buildEligibleReadyToMergeFixture(ctx, t, pool, tokenKey, "e5-actor@example.com", actorGitHubExternalID, repoFullName, 73)
+	fakeSCM.resolveBranchSHAErr = errors.New("boom: github is down")
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict: appreviewverdict.Deps{
+			ReviewVerdicts: narvipg.NewReviewVerdictStore(pool), RepoSettings: narvipg.NewRepoSettingsStore(pool),
+			ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool),
+			Timeouts: platform.DefaultTimeouts(),
+		},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil (a live SCM lookup failure must degrade ONE row, never fail the whole Build call)", err)
+	}
+	item := findItemByPR(result.Items, 73)
+	if item == nil {
+		t.Fatal("PR #73 missing from the inbox entirely, want present as needs_review")
+	}
+	if item.Kind == decisioninboxdomain.KindReadyToMerge {
+		t.Error("Kind = ready_to_merge, want needs_review -- a failed live base-branch-tip resolution must fail CLOSED via ReasonBaseSHAUnknown")
+	}
+	if !result.SCMFetchFailed {
+		t.Error("SCMFetchFailed = false, want true -- E5: a live SCM lookup failure inside computeRealEligibility must mark the whole read degraded, or this row renders as a considered ineligibility judgement rather than the truth (a lookup failed)")
 	}
 }
 

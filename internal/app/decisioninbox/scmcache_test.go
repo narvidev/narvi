@@ -506,7 +506,20 @@ func TestSCMCache_ResolveBranchSHA_ExpiredEntryRefetches(t *testing.T) {
 	cache := decisioninbox.NewSCMCache(fake, timeouts)
 	spec := ports.ResolveBranchSHASpec{Owner: "acme", Repo: "widgets", Branch: "main", Token: "tok"}
 
-	now := time.Now()
+	// A fixed, injected clock -- deliberately NEVER time.Now() -- so this
+	// test is provable against the cache's own logical clock alone (E9,
+	// third adversarial-review round). This previously seeded `now` from
+	// a REAL time.Now() and re-checked at now+TTL+1ms: a 1ms margin
+	// against a SEPARATE, real time.Now() call inside ResolveBranchSHA
+	// itself (scmcache.go's own fetchedAt, at the time) that any
+	// scheduling delay between capturing `now` here and that internal
+	// call actually running could exceed -- silently keeping the
+	// "expired" entry alive and failing this test on a loaded machine.
+	// Now that ResolveBranchSHA stores against the SAME `now` it is
+	// handed, never a second, independent clock read, expiry is a pure
+	// function of the two `now` values THIS TEST controls -- no
+	// wall-clock proximity involved anywhere.
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
 	if _, _, err := cache.ResolveBranchSHA(context.Background(), spec, now); err != nil {
 		t.Fatalf("first call error = %v", err)
 	}
@@ -515,12 +528,26 @@ func TestSCMCache_ResolveBranchSHA_ExpiredEntryRefetches(t *testing.T) {
 	fake.resolveBranchSHA = "sha-def456"
 	fake.mu.Unlock()
 
-	sha2, _, err := cache.ResolveBranchSHA(context.Background(), spec, now.Add(timeouts.DecisionInboxSCMCacheTTL+time.Millisecond))
+	// Exactly at the TTL boundary, no margin past it needed:
+	// ttlCache.get's own `!now.Before(entry.expiresAt)` check treats
+	// now == expiresAt as already expired.
+	now2 := now.Add(timeouts.DecisionInboxSCMCacheTTL)
+	sha2, asOf2, err := cache.ResolveBranchSHA(context.Background(), spec, now2)
 	if err != nil {
 		t.Fatalf("second call error = %v", err)
 	}
 	if sha2 != "sha-def456" {
 		t.Errorf("second call (past TTL) sha = %q, want %q (a fresh live fetch, not the expired cached value)", sha2, "sha-def456")
+	}
+	// E9's own decisive assertion: a fresh fetch's own asOf must be
+	// EXACTLY the injected clock this call was handed. Reverting
+	// scmcache.go's own fetchedAt to a real time.Now() call fails this
+	// deterministically (a real wall-clock reading almost never equals
+	// this test's own fixed, arbitrary 2026-09-16 instant), never
+	// flakily -- the exact property a mutation of that fix must be
+	// caught by.
+	if !asOf2.Equal(now2) {
+		t.Errorf("second call asOf = %v, want exactly %v (E9: a fresh fetch's own fetchedAt must be the injected clock this call was handed, never a second, real time.Now() read)", asOf2, now2)
 	}
 	if got := fake.resolveBranchSHACalls(); got != 2 {
 		t.Errorf("fetch called %d times, want 2 (the second call must genuinely re-fetch)", got)

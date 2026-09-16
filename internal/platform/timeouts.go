@@ -2081,14 +2081,19 @@ type Timeouts struct {
 	// underlying endpoint, just a different call site.
 	DecisionInboxResolveBranchSHATimeout time.Duration
 
-	// DecisionInboxIsAncestorTimeout (D3, second adversarial-review round)
-	// bounds ONE SourceControl.IsAncestor call made from internal/app/
-	// decisioninbox -- both revalidateCore (revalidate.go, uncached, an
-	// action endpoint) and SCMCache.IsAncestor (aggregate.go's own
-	// read-model path, cached) share this one field, mirroring
-	// DecisionInboxSCMCacheTTL's own identical "one field, two cached
-	// methods" precedent in this same package. Chosen as 10s, matching
-	// every other single-lightweight-GitHub-REST-GET timeout in this file
+	// DecisionInboxIsAncestorTimeout (D3, second adversarial-review round;
+	// actually wired into revalidateCore, E4, third round) bounds ONE
+	// SourceControl.IsAncestor call made from internal/app/decisioninbox
+	// -- both revalidateCore (revalidate.go, uncached, an action
+	// endpoint) and SCMCache.IsAncestor (aggregate.go's own read-model
+	// path, cached) share this one field, mirroring DecisionInboxSCMCacheTTL's
+	// own identical "one field, two cached methods" precedent in this
+	// same package. This doc comment previously claimed revalidateCore's
+	// own call was already bound by this field when it was not -- an
+	// unbounded live GitHub call on the one action path in this package
+	// that is not allowed to serve a cached/stale answer; both call sites
+	// now genuinely share it. Chosen as 10s, matching every other
+	// single-lightweight-GitHub-REST-GET timeout in this file
 	// (GitHubGetPRTimeout/GitHubResolveBaseBranchSHATimeout/
 	// DecisionInboxResolveBranchSHATimeout) -- IsAncestor is the SAME
 	// class of call (one GET to the compare-two-commits endpoint), just a
