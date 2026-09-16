@@ -53,6 +53,19 @@ type fakeAutoMergeSourceControl struct {
 	getErr        error
 	getOpenPRHits int
 
+	// getOpenPRBlockUntilCtxDone (H3, fifth adversarial-review round),
+	// when true, makes GetOpenPR wait for ITS OWN ctx to report Done
+	// before returning a perfectly ordinary (pr, ok, nil) -- modeling
+	// githubapi.Adapter.GetOpenPR's own real shape: a deadline firing
+	// PARTWAY through its five-call composite is swallowed by each
+	// individual sub-call's own degraded-field fallback
+	// (buildOpenPRFromDetail's own doc comment, listopenprs.go), never
+	// surfaced as an error from GetOpenPR itself. This is deliberately a
+	// SEPARATE field from getErr above and from ctx.Err() being already
+	// expired at entry (below): those two model "the call itself failed",
+	// this one models "the call technically succeeded, but too late".
+	getOpenPRBlockUntilCtxDone bool
+
 	// resolveBranchSHA/resolveBranchSHAErr (finding F1 (§21.1's amendment)) back
 	// ResolveBranchSHA below -- revalidateCore (shared by
 	// RevalidateForAutoMerge, this package's own real caller) now
@@ -156,15 +169,57 @@ func (b *rendezvousBarrier) timedOut() bool {
 	return b.hitTimeout
 }
 
-func (f *fakeAutoMergeSourceControl) GetOpenPR(_ context.Context, owner, repo string, number int, _ string) (ports.OpenPR, bool, error) {
+// GetOpenPR honors ctx (H5, fifth adversarial-review round -- a verifier
+// deleted revalidate.go's own context.WithTimeout wrap around this call
+// and ran the whole automerge integration suite green, since nothing here
+// could observe the missing wrap; this previously ignored ctx entirely,
+// the blank identifier in its own prior signature). ctx.Err() is checked
+// FIRST, before either configured return -- mirrors internal/app/
+// decisioninbox's own fakeDecisionInboxSourceControl.IsAncestor/
+// ResolveBranchSHA precedent (aggregate_integration_test.go): a caller
+// context.WithTimeout'd with a non-positive duration is already expired
+// the instant it is constructed, so THIS MECHANISM makes a zero/missing
+// timeout on the real call site detectable, no sleep/wall-clock
+// dependency needed.
+func (f *fakeAutoMergeSourceControl) GetOpenPR(ctx context.Context, owner, repo string, number int, _ string) (ports.OpenPR, bool, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.getOpenPRHits++
-	if f.getErr != nil {
-		return ports.OpenPR{}, false, f.getErr
-	}
+	getErr := f.getErr
+	blockUntilCtxDone := f.getOpenPRBlockUntilCtxDone
 	key := owner + "/" + repo + "#" + itoa(number)
 	pr, ok := f.prsByKey[key]
+	f.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return ports.OpenPR{}, false, err
+	}
+	if blockUntilCtxDone {
+		// H3: waits for ctx's own deadline to fire and THEN returns a
+		// perfectly ordinary result -- reproducing "the call technically
+		// succeeded, but too late", the exact shape a deadline firing
+		// partway through GetOpenPR's real five-call composite produces
+		// (see this field's own doc comment above) -- distinct from the
+		// ctx.Err() branch immediately above, which models a caller-side
+		// ctx already expired before GetOpenPR was ever entered.
+		//
+		// The time.After safety valve is deliberately NOT ctx-derived: if
+		// a future regression ever deletes the real call site's own
+		// context.WithTimeout wrap entirely (rather than merely mishandling
+		// it), ctx here degrades to the test's own never-expiring
+		// context.Background(), and <-ctx.Done() alone would hang this
+		// goroutine forever -- turning a real regression into a wedged
+		// test run instead of a clean, fast failure. Mirrors
+		// rendezvousBarrier's own identical "a safety valve so a broken
+		// wait fails loudly instead of hanging forever" reasoning (this
+		// file's own doc comment, above).
+		select {
+		case <-ctx.Done():
+		case <-time.After(5 * time.Second):
+		}
+	}
+	if getErr != nil {
+		return ports.OpenPR{}, false, getErr
+	}
 	return pr, ok, nil
 }
 
@@ -612,6 +667,113 @@ func TestPumpOnce_Armed_GetOpenPRErrors_NeverMergesNeverPanics(t *testing.T) {
 	}
 	if total != 0 || contested != 0 {
 		t.Errorf("outcome counts = (total=%d, contested=%d), want (0, 0) -- RecordConfirmed must never fire for a candidate that was never actually merged", total, contested)
+	}
+}
+
+// TestPumpOnce_Armed_ZeroGetOpenPRTimeout_RefusesRatherThanMerging is H5's
+// own regression test (fifth adversarial-review round): a verifier
+// deleted revalidate.go's own context.WithTimeout wrap around
+// RevalidateForAutoMerge's GetOpenPR call and ran this entire package's
+// integration suite green, because fakeAutoMergeSourceControl.GetOpenPR
+// ignored ctx entirely -- the bind was pinned by nothing. A ZERO
+// GitHubGetOpenPRTimeout makes context.WithTimeout construct an
+// ALREADY-EXPIRED context deterministically (no sleep/wall-clock
+// dependency needed); the fake's own ctx.Err()-checked-first mechanism
+// (this fix) then fails the call before ever reaching its seeded
+// prsByKey lookup, which would otherwise happily return this fully
+// eligible candidate and merge it -- so only the context.WithTimeout
+// wrap genuinely being applied, AND the fake genuinely honoring it,
+// stand between this test's expected refusal and a false merge.
+func TestPumpOnce_Armed_ZeroGetOpenPRTimeout_RefusesRatherThanMerging(t *testing.T) {
+	rig := newAutomergeTestRig(t)
+	ctx := context.Background()
+	const repoFullName = "acme/automerge-zero-getopenpr-timeout"
+
+	htmlURL := rig.seedEligiblePR(ctx, t, repoFullName, 7, "sha-7")
+	if _, err := rig.repoSettings.UpsertAutoMergeToggle(ctx, repoFullName, true); err != nil {
+		t.Fatalf("upsert auto-approval settings: %v", err)
+	}
+
+	sc := &fakeAutoMergeSourceControl{
+		prsByKey: map[string]ports.OpenPR{
+			"acme/automerge-zero-getopenpr-timeout#7": {
+				Owner: "acme", Repo: "automerge-zero-getopenpr-timeout", Number: 7, HTMLURL: htmlURL,
+				HeadSHA: "sha-7", BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, CIConclusion: ports.CIConclusionSuccess,
+			},
+		},
+	}
+	deps := rig.deps(sc)
+	deps.DecisionInbox.Timeouts.GitHubGetOpenPRTimeout = 0
+	worker, err := automerge.New(deps)
+	if err != nil {
+		t.Fatalf("automerge.New: %v", err)
+	}
+
+	if err := worker.PumpOnce(ctx, time.Now()); err != nil {
+		t.Fatalf("PumpOnce() error = %v, want nil (a per-candidate revalidate failure must degrade, never fail, the whole tick)", err)
+	}
+	if got := sc.mergeCallCount(); got != 0 {
+		t.Fatalf("MergePR call count = %d, want 0 -- a zero timeout must make GetOpenPR fail closed, never silently succeed as though the context.WithTimeout wrap (or the fake's own ctx-honoring) were never applied", got)
+	}
+}
+
+// TestPumpOnce_Armed_GetOpenPRTimesOutPartwayThroughComposite_NeverMerges
+// is H3's own regression test (fifth adversarial-review round): unlike
+// the zero-timeout test immediately above (ctx already expired before
+// GetOpenPR is ever entered) or GetOpenPRErrors above that (GetOpenPR
+// itself returns an error), this models the shape H3 actually names --
+// GetOpenPR's own ctx has a real, not-yet-elapsed budget when the call
+// starts, the deadline fires WHILE it is still "in flight" (fakeAutoMergeSourceControl.
+// getOpenPRBlockUntilCtxDone waits for ctx.Done()), and it THEN returns
+// a perfectly ordinary, non-erroring result anyway -- exactly what
+// githubapi.Adapter.GetOpenPR's own real five-call composite does when a
+// deadline cuts one of its later sub-calls short (each one swallows its
+// own failure into a degraded field rather than an error). Before H3's
+// fix, RevalidateForAutoMerge would have accepted that result at face
+// value and evaluated eligibility against a silently-incomplete target,
+// with no honest signal that anything had gone wrong -- this test proves
+// it instead refuses, via the OWN dedicated getPRCtx-DeadlineExceeded
+// check, before ever reaching that evaluation.
+func TestPumpOnce_Armed_GetOpenPRTimesOutPartwayThroughComposite_NeverMerges(t *testing.T) {
+	rig := newAutomergeTestRig(t)
+	ctx := context.Background()
+	const repoFullName = "acme/automerge-getopenpr-mid-composite-timeout"
+
+	htmlURL := rig.seedEligiblePR(ctx, t, repoFullName, 8, "sha-8")
+	if _, err := rig.repoSettings.UpsertAutoMergeToggle(ctx, repoFullName, true); err != nil {
+		t.Fatalf("upsert auto-approval settings: %v", err)
+	}
+
+	sc := &fakeAutoMergeSourceControl{
+		prsByKey: map[string]ports.OpenPR{
+			"acme/automerge-getopenpr-mid-composite-timeout#8": {
+				Owner: "acme", Repo: "automerge-getopenpr-mid-composite-timeout", Number: 8, HTMLURL: htmlURL,
+				HeadSHA: "sha-8", BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, CIConclusion: ports.CIConclusionSuccess,
+			},
+		},
+		getOpenPRBlockUntilCtxDone: true,
+	}
+	deps := rig.deps(sc)
+	// A short but genuinely POSITIVE timeout -- unlike the zero-timeout
+	// test above, ctx must NOT already be expired when GetOpenPR is
+	// entered, or this would exercise that test's own ctx.Err()-at-entry
+	// branch instead of the mid-flight DeadlineExceeded this test exists
+	// to pin. _test.go files are exempt from the notimeliteral lint rule
+	// (platform/timeouts.go's own top comment), so a literal here is fine.
+	deps.DecisionInbox.Timeouts.GitHubGetOpenPRTimeout = 20 * time.Millisecond
+	worker, err := automerge.New(deps)
+	if err != nil {
+		t.Fatalf("automerge.New: %v", err)
+	}
+
+	if err := worker.PumpOnce(ctx, time.Now()); err != nil {
+		t.Fatalf("PumpOnce() error = %v, want nil (a per-candidate revalidate failure must degrade, never fail, the whole tick)", err)
+	}
+	if got := sc.mergeCallCount(); got != 0 {
+		t.Fatalf("MergePR call count = %d, want 0 -- a deadline firing partway through GetOpenPR's own composite must refuse rather than trust a silently-incomplete result", got)
+	}
+	if got := sc.getOpenPRCallCount(); got != 1 {
+		t.Fatalf("GetOpenPR call count = %d, want 1 -- this candidate must actually have been reached for this test to exercise anything", got)
 	}
 }
 

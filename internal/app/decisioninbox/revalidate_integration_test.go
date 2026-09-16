@@ -786,7 +786,13 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 	// which would otherwise happily return testEligibleBaseSHA (a MATCH,
 	// letting this fully-eligible PR through) -- so only the
 	// context.WithTimeout wrap genuinely being applied stands between
-	// this test's expected refusal and a false "eligible".
+	// this test's expected refusal and a false "eligible". The expected
+	// reason/log below were updated for H2 (fifth adversarial-review
+	// round): this resolution failure now returns EARLY with its own
+	// honest, logged reason (mirroring the ancestor-check failure's own
+	// E6/G3 precedent) rather than falling through to ComputeEligible's
+	// generic ReasonBaseSHAUnknown, which this test previously (and
+	// wrongly) pinned as the expected outcome.
 	t.Run("ZeroResolveBranchSHATimeout_TreatedAsAlreadyExpired_RefusesRatherThanSucceeding", func(t *testing.T) {
 		const repoFullName = "acme/revalidate-zero-resolve-branch-sha-timeout"
 		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 38)
@@ -796,6 +802,8 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 			rs.deps.Timeouts.DecisionInboxResolveBranchSHATimeout = savedTimeout
 		}()
 
+		buf := captureDefaultLoggerJSON(t)
+
 		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
@@ -803,9 +811,47 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		if ok {
 			t.Fatal("RevalidateForMerge() ok = true, want false -- a zero timeout must make this call fail closed, never silently succeed as though the context.WithTimeout wrap were never applied")
 		}
-		const wantReason = "this pull request no longer meets the auto-approval eligibility criteria: this pull request's base commit could not be established"
+		const wantReason = "this pull request's base commit could not be confirmed (a live check failed) -- try again shortly"
+		if reason != wantReason {
+			t.Errorf("reason = %q, want %q -- H2: a FAILED base-SHA resolution must read differently from autoapproval.ReasonBaseSHAUnknown's own generic \"could not be established\" text, which this code path must never fall through to", reason, wantReason)
+		}
+		if !hasLogEntry(t, buf, "decisioninbox: resolve base branch's live tip failed, refusing merge -- could not confirm the pull request's current base commit") {
+			t.Errorf("did not find the dedicated resolve-branch-sha-failure log line -- H2: this call previously swallowed the error with no log at all; full log:\n%s", buf.String())
+		}
+	})
+
+	// TestRevalidateForMerge_NegativeCases/ResolveBranchSHAFails_LogsAndReturnsHonestReason
+	// is H2's own direct-error regression test (fifth adversarial-review
+	// round), mirroring BaseBranchAdvanced_AncestorCheckFails_LogsAndReturnsHonestReason
+	// above one live call earlier: drives fakeDecisionInboxSourceControl's
+	// own resolveBranchSHAErr directly (rather than via a zero timeout,
+	// the preceding subtest's own mechanism) so this failure path is
+	// pinned independently of that one, exactly as the ancestor-check
+	// failure and its own zero-timeout sibling are pinned independently
+	// of each other above.
+	t.Run("ResolveBranchSHAFails_LogsAndReturnsHonestReason", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-resolve-branch-sha-fails"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 39)
+		rs.sourceControl.resolveBranchSHAErr = errors.New("boom: github is down")
+		defer func() {
+			rs.sourceControl.resolveBranchSHAErr = nil
+		}()
+
+		buf := captureDefaultLoggerJSON(t)
+
+		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil -- an unconfirmable base-sha resolution is a domain refusal, never a Go error", err)
+		}
+		if ok {
+			t.Fatal("RevalidateForMerge() ok = true, want false -- a base-sha resolution that could not be confirmed must still refuse the merge")
+		}
+		const wantReason = "this pull request's base commit could not be confirmed (a live check failed) -- try again shortly"
 		if reason != wantReason {
 			t.Errorf("reason = %q, want %q", reason, wantReason)
+		}
+		if !hasLogEntry(t, buf, "decisioninbox: resolve base branch's live tip failed, refusing merge -- could not confirm the pull request's current base commit") {
+			t.Errorf("did not find the dedicated resolve-branch-sha-failure log line -- H2: this call previously swallowed the error with no log at all; full log:\n%s", buf.String())
 		}
 	})
 

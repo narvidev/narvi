@@ -2,6 +2,7 @@ package decisioninbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/narvidev/narvi/internal/app/ports"
@@ -123,21 +124,42 @@ func RevalidateForAutoMerge(ctx context.Context, deps Deps, sourceControl ports.
 		return false, "", "", fmt.Errorf("decisioninbox: revalidate for auto-merge: repoFullName %q is not shaped owner/repo", repoFullName)
 	}
 
-	// Bounded by platform.Timeouts.GitHubGetPRTimeout (G4, fourth
-	// adversarial-review round): this call previously ran on the bare,
-	// unbounded ctx this function was handed -- ctx's own only bound is
-	// whatever the automerge worker's own tick context happens to carry
+	// Bounded by platform.Timeouts.GitHubGetOpenPRTimeout (G4, fourth
+	// adversarial-review round; moved to its own dedicated field, H3,
+	// fifth round): this call previously ran on the bare, unbounded ctx
+	// this function was handed -- ctx's own only bound is whatever the
+	// automerge worker's own tick context happens to carry
 	// (internal/app/automerge/worker.go's own PumpOnce/mergeCandidate,
 	// which sets none), so a hung GitHub call here could stall a merge
-	// tick indefinitely. GetOpenPR resolves one owner/repo#number by a
-	// single GET, the SAME class of call GitHubGetPRTimeout already
-	// bounds elsewhere in this codebase (platform/timeouts.go's own doc
-	// comment), never a new timeout invented for this one call site.
-	getPRCtx, cancel := context.WithTimeout(ctx, deps.Timeouts.GitHubGetPRTimeout)
+	// tick indefinitely. See GitHubGetOpenPRTimeout's own doc comment
+	// (platform/timeouts.go) for what GetOpenPR actually does and why it
+	// no longer reuses GitHubGetPRTimeout.
+	getPRCtx, cancel := context.WithTimeout(ctx, deps.Timeouts.GitHubGetOpenPRTimeout)
 	target, found, err := sourceControl.GetOpenPR(getPRCtx, owner, repo, prNumber, botToken)
 	cancel()
 	if err != nil {
 		return false, "", "", err
+	}
+	// H3 (fifth adversarial-review round): GetOpenPR's own five sub-calls
+	// each swallow their OWN individual failure into a degraded field
+	// instead of an error (buildOpenPRFromDetail's own doc comment,
+	// listopenprs.go), so a deadline firing partway through this
+	// composite -- getPRCtx running out after the first sub-call already
+	// succeeded -- returns here with err == nil and a target silently
+	// missing whatever the cut-short sub-call would have reported. Left
+	// unchecked, that renders downstream as an ordinary, permanent-
+	// looking eligibility refusal rather than the transient, retry-worthy
+	// timeout it actually was. Detected via getPRCtx's OWN error, checked
+	// for DeadlineExceeded specifically -- never a bare non-nil check,
+	// which the cancel() call two lines above would ALSO satisfy on the
+	// ordinary, well-within-budget success path (a context's recorded
+	// error is set by whichever of "its own deadline fired" or "someone
+	// called its cancel func" happens FIRST, and never overwritten after
+	// -- so DeadlineExceeded surviving past this function's own cancel()
+	// call means the deadline is what actually fired here, not this
+	// function's own routine cleanup).
+	if errors.Is(getPRCtx.Err(), context.DeadlineExceeded) {
+		return false, "", "", fmt.Errorf("decisioninbox: revalidate for auto-merge: get open pr timed out partway through its own five-call fetch (GitHubGetOpenPRTimeout) -- refusing rather than trusting whichever sub-call was cut short: %w", context.DeadlineExceeded)
 	}
 	if !found {
 		return false, "", "this pull request is no longer open", nil
@@ -197,8 +219,15 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	// human-clicked Merge endpoint AND (via RevalidateForAutoMerge, which
 	// shares this exact core) the UNATTENDED auto-merge worker -- "we
 	// could not tell" must block exactly like a confirmed changes-request
-	// would, never silently pass through as "no".
+	// would, never silently pass through as "no". Logged (H2, fifth
+	// adversarial-review round: made consistent with its two live-check
+	// siblings below, ResolveBranchSHA's own failure and IsAncestor's own
+	// failure, both of which log) even though the underlying fetch
+	// happened earlier, outside this function -- this is still the one
+	// place that decides to refuse ON it, so it is the right place to
+	// record that decision.
 	if target.ReviewDecisionDegraded {
+		platform.Logger(ctx).Warn("decisioninbox: review-decision read was degraded, refusing merge -- could not confirm whether a reviewer requested changes", "repo_full_name", repoFullName, "pr_number", prNumber)
 		return false, "", "this pull request's review decision could not be confirmed (a degraded GitHub read) -- failing closed rather than trusting an unconfirmed read", nil
 	}
 	if target.HasChangesRequested {
@@ -277,23 +306,33 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	// mirroring CurrentHeadSHA's own identical sourcing), CI, Shippable,
 	// diff size, and blast radius. CurrentBaseSHA is deliberately
 	// ASSUMED equal to the verdict's own recorded VerdictBaseSHA -- the
-	// most lenient possible stand-in, since equality trivially satisfies
-	// BOTH of ComputeEligible's base-SHA-comparison checks
-	// (ReasonBaseSHAUnknown/ReasonBaseMoved) regardless of what
-	// BaseAdvancedWithoutRewrite is, and affects nothing else the probe
-	// checks. Any REAL currentBaseSHA can only be equally-or-LESS
-	// lenient than this assumption on those two checks, and every other
-	// criterion is unaffected by which base-SHA scenario is used -- so
-	// if the probe already refuses, the real computation below refuses
-	// too (on this exact reason, or an earlier-ordered one still, if the
-	// real base SHA also happens to differ), and neither the live
-	// ResolveBranchSHA call nor the live IsAncestor call below could ever
-	// have changed that outcome. Skipping both in that case is what G3
-	// ("order the checks so the honest reason wins" -- a permanently
-	// ineligible PR must never be told a live check's own transient
-	// failure is the reason it was refused) and G4 (fewer live calls on
-	// the merge path than strictly needed) both ask for, from the same
-	// restructuring.
+	// most lenient possible stand-in, for two DIFFERENT reasons on
+	// ComputeEligible's two base-SHA-comparison checks (corrected, H4,
+	// fifth adversarial-review round: a prior version of this comment
+	// claimed equality "trivially satisfies BOTH", which is false for the
+	// first one). On ReasonBaseMoved, equality genuinely IS trivially
+	// satisfying: an assumed-unchanged value can never register as
+	// changed, regardless of what BaseAdvancedWithoutRewrite is. On
+	// ReasonBaseSHAUnknown, the assumption satisfies nothing and is
+	// beside the point -- that check (VerdictBaseSHA == "" ||
+	// CurrentBaseSHA == "") fires on VerdictBaseSHA alone whenever IT is
+	// empty, and assuming CurrentBaseSHA equal to an empty VerdictBaseSHA
+	// does not change that: the probe still correctly refuses here, just
+	// not because the two sides were made to agree. Either way, this
+	// assumption cannot make either check MORE lenient than any real
+	// currentBaseSHA would -- and affects nothing else the probe checks.
+	// Any REAL currentBaseSHA can only be equally-or-LESS lenient than
+	// this assumption on those two checks, and every other criterion is
+	// unaffected by which base-SHA scenario is used -- so if the probe
+	// already refuses, the real computation below refuses too (on this
+	// exact reason, or an earlier-ordered one still, if the real base SHA
+	// also happens to differ), and neither the live ResolveBranchSHA call
+	// nor the live IsAncestor call below could ever have changed that
+	// outcome. Skipping both in that case is what G3 ("order the checks
+	// so the honest reason wins" -- a permanently ineligible PR must
+	// never be told a live check's own transient failure is the reason it
+	// was refused) and G4 (fewer live calls on the merge path than
+	// strictly needed) both ask for, from the same restructuring.
 	//
 	// VerdictAssessed is unconditionally true in both the probe and the
 	// final call below -- hasVerdict was already confirmed true above
@@ -349,23 +388,21 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	// closing the exact hazard base_ref alone could never see: "whose
 	// parent moved beneath it."
 	//
-	// A resolution failure fails CLOSED to an empty CurrentBaseSHA,
-	// mirroring every other genuinely-unknown-fact convention this
-	// function already applies (ReviewDecisionDegraded, ChangedFilesListDegraded)
-	// -- autoapproval.ComputeEligible's own empty-base-sha guard (finding
-	// F2) then refuses on its own distinct reason, rather than this
-	// function inventing a SECOND fail-closed path that could drift from
-	// the engine's own.
+	// A resolution failure fails CLOSED, but (H2, fifth adversarial-review
+	// round) with its own dedicated, logged, early return immediately
+	// below -- never by silently blanking CurrentBaseSHA and letting
+	// execution fall through to autoapproval.ComputeEligible's own
+	// empty-base-sha guard (finding F2, ReasonBaseSHAUnknown), which is
+	// worded for a fact that was never recorded at all, not for a live
+	// lookup that failed just now.
 	//
 	// Bounded by platform.Timeouts.DecisionInboxResolveBranchSHATimeout
 	// (G4, fourth adversarial-review round): this call previously ran on
 	// the bare, unbounded ctx this function was handed -- the SAME
 	// unbounded-live-GitHub-call-on-the-merge-gate-action-path shape E4
 	// (third round) had already fixed for the IsAncestor call below, one
-	// call site over. That timeout field's own doc comment already named
-	// this exact call as one of the two call sites it bounds
-	// (SCMCache.ResolveBranchSHA, scmcache.go); it now genuinely bounds
-	// this uncached one too.
+	// call site over. See that field's own doc comment
+	// (platform/timeouts.go) for which call site(s) it bounds.
 	resolveCtx, cancel := context.WithTimeout(ctx, deps.Timeouts.DecisionInboxResolveBranchSHATimeout)
 	currentBaseSHA, _, resolveErr := sourceControl.ResolveBranchSHA(resolveCtx, ports.ResolveBranchSHASpec{
 		Owner:  target.Owner,
@@ -375,7 +412,25 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	})
 	cancel()
 	if resolveErr != nil {
-		currentBaseSHA = ""
+		// H2 (fifth adversarial-review round): previously swallowed with
+		// no log, and currentBaseSHA fell through blank to
+		// ComputeEligible's own ReasonBaseSHAUnknown ("this pull request's
+		// base commit could not be established") -- a message written for
+		// a fact that was NEVER recorded (VerdictBaseSHA/CurrentBaseSHA
+		// never populated at all), not for a live lookup that simply
+		// failed just now, and therefore indistinguishable to whoever
+		// read it from a permanent refusal. Mirrors the IsAncestor
+		// failure a few lines below (E6, third round; ordering fixed G3,
+		// fourth round): logged, and returned EARLY with its own honest,
+		// distinctly-worded reason, never falling through to a reason
+		// that never mentions a live check failed at all. The probe above
+		// already confirmed every OTHER criterion passes, so a failure
+		// here really is the one and only thing standing between this PR
+		// and eligibility -- the same "try again shortly" honesty
+		// guarantee G3 established for the ancestor check below applies
+		// here too.
+		platform.Logger(ctx).Warn("decisioninbox: resolve base branch's live tip failed, refusing merge -- could not confirm the pull request's current base commit", "error", resolveErr, "repo_full_name", repoFullName, "pr_number", prNumber)
+		return false, "", "this pull request's base commit could not be confirmed (a live check failed) -- try again shortly", nil
 	}
 
 	// baseAdvancedWithoutRewrite (D3, second adversarial-review round;

@@ -947,6 +947,27 @@ func TestDefaultTimeouts_GitHubPRPayloadCorrectnessStandaloneField(t *testing.T)
 	}
 }
 
+// TestDefaultTimeouts_GitHubGetOpenPRTimeoutStandaloneField proves the H3
+// (fifth adversarial-review round) standalone addition -- GitHubGetOpenPRTimeout,
+// split out from GitHubGetPRTimeout's own prior misuse at
+// internal/app/decisioninbox.RevalidateForAutoMerge's own GetOpenPR call
+// site -- ships with a sane, non-zero default, and that adding it did not
+// disturb either pre-existing invariant chain, matching every other
+// standalone addition's own test precedent above.
+func TestDefaultTimeouts_GitHubGetOpenPRTimeoutStandaloneField(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+
+	if to.GitHubGetOpenPRTimeout <= 0 {
+		t.Errorf("GitHubGetOpenPRTimeout = %v, want > 0", to.GitHubGetOpenPRTimeout)
+	}
+
+	if err := to.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil (GitHubGetOpenPRTimeout must not disturb either invariant chain)", err)
+	}
+}
+
 // TestDefaultTimeouts_Step40StandaloneField proves §19.3's ("warm boot:
 // fetch-aware git sync", §19.3) own addition -- GitFetchStepTimeout -- ships
 // with a sane, non-zero default matching its own documented value (§19.3's
