@@ -55,16 +55,24 @@ type fakeAutoMergeSourceControl struct {
 
 	// getOpenPRBlockUntilCtxDone (H3, fifth adversarial-review round),
 	// when true, makes GetOpenPR wait for ITS OWN ctx to report Done
-	// before returning a perfectly ordinary (pr, ok, nil) -- modeling
-	// githubapi.Adapter.GetOpenPR's own real shape: a deadline firing
-	// PARTWAY through its five-call composite is swallowed by each
-	// individual sub-call's own degraded-field fallback
-	// (buildOpenPRFromDetail's own doc comment, listopenprs.go), never
-	// surfaced as an error from GetOpenPR itself. This is deliberately a
-	// SEPARATE field from getErr above and from ctx.Err() being already
-	// expired at entry (below): those two model "the call itself failed",
-	// this one models "the call technically succeeded, but too late".
+	// before returning a perfectly ordinary (pr, ok, nil) -- modeling one
+	// specific way githubapi.Adapter.GetOpenPR's own real composite can
+	// return a deadline-cut-short-but-nil-error result: fetchCIConclusionLive's
+	// own two GETs carry no degraded field at all (see
+	// internal/app/decisioninbox/revalidate.go's own corrected doc
+	// comment on this, not a restatement of it here). This is
+	// deliberately a SEPARATE field from getErr above and from ctx.Err()
+	// being already expired at entry (below): those two model "the call
+	// itself failed", this one models "the call technically succeeded,
+	// but too late".
 	getOpenPRBlockUntilCtxDone bool
+
+	// getOpenPRBranch (I2, sixth adversarial-review round), guarded by
+	// f.mu like every other field above, records which of GetOpenPR's own
+	// return paths actually executed on its one real call -- see that
+	// method's own doc comment for why a test cannot safely infer this
+	// from mergeCallCount/getOpenPRCallCount alone.
+	getOpenPRBranch string
 
 	// resolveBranchSHA/resolveBranchSHAErr (finding F1 (§21.1's amendment)) back
 	// ResolveBranchSHA below -- revalidateCore (shared by
@@ -181,6 +189,10 @@ func (b *rendezvousBarrier) timedOut() bool {
 // the instant it is constructed, so THIS MECHANISM makes a zero/missing
 // timeout on the real call site detectable, no sleep/wall-clock
 // dependency needed.
+// GetOpenPR's own return paths are recorded onto f.getOpenPRBranch as it
+// takes them (I2, sixth adversarial-review round) -- see
+// getOpenPRBranchTaken's own doc comment for why a test needs this rather
+// than inferring which path ran from the outcome alone.
 func (f *fakeAutoMergeSourceControl) GetOpenPR(ctx context.Context, owner, repo string, number int, _ string) (ports.OpenPR, bool, error) {
 	f.mu.Lock()
 	f.getOpenPRHits++
@@ -191,8 +203,10 @@ func (f *fakeAutoMergeSourceControl) GetOpenPR(ctx context.Context, owner, repo 
 	f.mu.Unlock()
 
 	if err := ctx.Err(); err != nil {
+		f.setGetOpenPRBranch("ctx_err_at_entry")
 		return ports.OpenPR{}, false, err
 	}
+	branch := "immediate"
 	if blockUntilCtxDone {
 		// H3: waits for ctx's own deadline to fire and THEN returns a
 		// perfectly ordinary result -- reproducing "the call technically
@@ -211,15 +225,22 @@ func (f *fakeAutoMergeSourceControl) GetOpenPR(ctx context.Context, owner, repo 
 		// test run instead of a clean, fast failure. Mirrors
 		// rendezvousBarrier's own identical "a safety valve so a broken
 		// wait fails loudly instead of hanging forever" reasoning (this
-		// file's own doc comment, above).
+		// file's own doc comment, above). Which of the two fired is itself
+		// part of the recorded branch below -- a test pinning the H3
+		// scenario must see ctx_done, never safety_valve (that would mean
+		// ctx never actually expired here at all).
 		select {
 		case <-ctx.Done():
+			branch = "blocked_ctx_done"
 		case <-time.After(5 * time.Second):
+			branch = "blocked_safety_valve"
 		}
 	}
 	if getErr != nil {
+		f.setGetOpenPRBranch(branch + "_then_err")
 		return ports.OpenPR{}, false, getErr
 	}
+	f.setGetOpenPRBranch(branch + "_then_ok")
 	return pr, ok, nil
 }
 
@@ -227,6 +248,37 @@ func (f *fakeAutoMergeSourceControl) getOpenPRCallCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.getOpenPRHits
+}
+
+func (f *fakeAutoMergeSourceControl) setGetOpenPRBranch(branch string) {
+	f.mu.Lock()
+	f.getOpenPRBranch = branch
+	f.mu.Unlock()
+}
+
+// getOpenPRBranchTaken reports which of GetOpenPR's own return paths ran on
+// its most recent call: "ctx_err_at_entry" (ctx already Done before
+// GetOpenPR was ever entered -- H5/the zero-timeout test's own scenario),
+// "immediate_then_ok"/"immediate_then_err" (blockUntilCtxDone unset,
+// returned without waiting), or "blocked_ctx_done_then_ok"/
+// "blocked_ctx_done_then_err"/"blocked_safety_valve_then_ok"/
+// "blocked_safety_valve_then_err" (blockUntilCtxDone set -- see that
+// field's own doc comment). A test asserting only mergeCallCount/
+// getOpenPRCallCount cannot tell "ctx_err_at_entry" apart from
+// "blocked_ctx_done_then_ok" -- both make a fully-eligible candidate fail
+// to merge, but the FIRST exercises revalidateCore's ordinary,
+// already-covered `err != nil` propagation, while the SECOND is the one
+// path H3's own dedicated DeadlineExceeded check
+// (internal/app/decisioninbox/revalidate.go) exists to catch: GetOpenPR
+// returning err == nil after its deadline already fired. A test meant to
+// pin the second must assert on this recording, not just the outcome,
+// or a timing budget change (e.g. the 20ms this package's own mid-composite
+// test configures) can silently swap it for the first while the test keeps
+// passing.
+func (f *fakeAutoMergeSourceControl) getOpenPRBranchTaken() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.getOpenPRBranch
 }
 func (f *fakeAutoMergeSourceControl) GetPRBody(context.Context, string, string, int, string) (string, bool, error) {
 	return "", false, errors.New("fakeAutoMergeSourceControl: GetPRBody not implemented")
@@ -724,16 +776,27 @@ func TestPumpOnce_Armed_ZeroGetOpenPRTimeout_RefusesRatherThanMerging(t *testing
 // itself returns an error), this models the shape H3 actually names --
 // GetOpenPR's own ctx has a real, not-yet-elapsed budget when the call
 // starts, the deadline fires WHILE it is still "in flight" (fakeAutoMergeSourceControl.
-// getOpenPRBlockUntilCtxDone waits for ctx.Done()), and it THEN returns
-// a perfectly ordinary, non-erroring result anyway -- exactly what
-// githubapi.Adapter.GetOpenPR's own real five-call composite does when a
-// deadline cuts one of its later sub-calls short (each one swallows its
-// own failure into a degraded field rather than an error). Before H3's
-// fix, RevalidateForAutoMerge would have accepted that result at face
+// getOpenPRBlockUntilCtxDone waits for ctx.Done()), and it THEN returns a
+// perfectly ordinary, non-erroring result anyway -- one concrete way
+// githubapi.Adapter.GetOpenPR's own real composite can do the identical
+// thing (internal/app/decisioninbox/revalidate.go's own corrected doc
+// comment on GetOpenPR's actual failure model, not restated here). Before
+// H3's fix, RevalidateForAutoMerge would have accepted that result at face
 // value and evaluated eligibility against a silently-incomplete target,
 // with no honest signal that anything had gone wrong -- this test proves
 // it instead refuses, via the OWN dedicated getPRCtx-DeadlineExceeded
 // check, before ever reaching that evaluation.
+//
+// I2 (sixth adversarial-review round): mergeCallCount()==0 alone does not
+// prove the DeadlineExceeded check ran -- ctx_err_at_entry (the
+// zero-timeout test's OWN scenario) produces the identical outcome via
+// revalidateCore's ordinary, already-covered err != nil propagation, and a
+// slow CI runner eating the 20ms budget before GetOpenPR is even entered
+// can silently substitute that branch for this one with no test failure
+// to show it. sc.getOpenPRBranchTaken() below asserts the fake actually
+// took the "blocked, ctx genuinely went Done while in flight, then
+// returned ok" path this test exists to pin -- see that method's own doc
+// comment for the full branch vocabulary.
 func TestPumpOnce_Armed_GetOpenPRTimesOutPartwayThroughComposite_NeverMerges(t *testing.T) {
 	rig := newAutomergeTestRig(t)
 	ctx := context.Background()
@@ -774,6 +837,16 @@ func TestPumpOnce_Armed_GetOpenPRTimesOutPartwayThroughComposite_NeverMerges(t *
 	}
 	if got := sc.getOpenPRCallCount(); got != 1 {
 		t.Fatalf("GetOpenPR call count = %d, want 1 -- this candidate must actually have been reached for this test to exercise anything", got)
+	}
+	// I2: the decisive assertion. Without this, the two checks above
+	// cannot distinguish this test's own intended scenario from
+	// ctx_err_at_entry -- the SAME outcome, reached through
+	// revalidateCore's ordinary err != nil branch instead of the
+	// getPRCtx-DeadlineExceeded check this test exists to pin. A budget
+	// change that let that substitution happen silently would otherwise
+	// pass this test while testing nothing new.
+	if got := sc.getOpenPRBranchTaken(); got != "blocked_ctx_done_then_ok" {
+		t.Fatalf("GetOpenPR branch = %q, want %q -- this test must exercise the deadline firing WHILE GetOpenPR is in flight (H3's own scenario), not ctx already being done at entry (the zero-timeout test's own scenario) or the 5s safety valve (which would mean the 20ms deadline never actually fired at all)", got, "blocked_ctx_done_then_ok")
 	}
 }
 

@@ -166,26 +166,18 @@ type fakeDecisionInboxSourceControl struct {
 	// previously inspected what spec this fake was actually called with.
 	codeOwnersCalls []ports.ResolveCodeOwnersSpec
 
-	// getOpenPRByKey/getOpenPRErr (§21.2 stage 2) back GetOpenPR
-	// below -- keyed by "owner/repo#number", the direct single-PR lookup
-	// internal/app/decisioninbox.RevalidateForAutoMerge uses instead of a
-	// user-scoped ListOpenPRsForUser search (revalidate_integration_test.go's
-	// own TestRevalidateForAutoMerge is this field's one real user).
-	getOpenPRByKey map[string]ports.OpenPR
-	getOpenPRErr   error
-
 	// resolveBranchSHA/resolveBranchSHAErr (finding F1 (§21.1's amendment)) back
 	// ResolveBranchSHA below -- revalidateCore now resolves the base
 	// branch's LIVE tip independently, rather than trusting
 	// ports.OpenPR.BaseSHA (GitHub's own possibly-stale
 	// `pull_request.base.sha` snapshot, that field's own doc comment).
 	// Both zero (every caller that never sets them) falls back to
-	// scanning this fake's own already-seeded PRs (openPRsByExternalID/
-	// getOpenPRByKey) for one reporting spec.Branch as its BaseRef,
-	// returning THAT PR's own BaseSHA -- so every EXISTING fixture in
-	// this file, which already sets BaseRef/BaseSHA consistently, gets a
-	// live resolution "for free" with no per-test literal changes
-	// needed. A test proving the F1 hazard
+	// scanning this fake's own already-seeded PRs (openPRsByExternalID)
+	// for one reporting spec.Branch as its BaseRef, returning THAT PR's
+	// own BaseSHA -- so every EXISTING fixture in this file, which
+	// already sets BaseRef/BaseSHA consistently, gets a live resolution
+	// "for free" with no per-test literal changes needed. A test proving
+	// the F1 hazard
 	// (revalidate_integration_test.go) overrides resolveBranchSHA
 	// explicitly to simulate the base branch's real tip moving while
 	// GitHub's own cached base.sha field (and the base ref name) both
@@ -290,11 +282,6 @@ func (f *fakeDecisionInboxSourceControl) ResolveBranchSHA(ctx context.Context, s
 			}
 		}
 	}
-	for _, pr := range f.getOpenPRByKey {
-		if pr.BaseRef == spec.Branch {
-			return pr.BaseSHA, spec.Branch, nil
-		}
-	}
 	return "", "", fmt.Errorf("fakeDecisionInboxSourceControl: ResolveBranchSHA: no seeded PR reports base ref %q", spec.Branch)
 }
 func (f *fakeDecisionInboxSourceControl) ResolveContractsFingerprint(context.Context, ports.ResolveContractsFingerprintSpec) (string, bool, error) {
@@ -322,19 +309,17 @@ func (f *fakeDecisionInboxSourceControl) MergePR(context.Context, ports.MergePRS
 	return "", errors.New("fakeDecisionInboxSourceControl: MergePR not implemented")
 }
 
-// GetOpenPR (§21.2 stage 2) looks up f.getOpenPRByKey by
-// "owner/repo#number" -- a miss (the ordinary case for every test that
-// never populates this field) reports found=false, err=nil, mirroring a
-// confirmed GitHub 404 (ports.SourceControl.GetOpenPR's own doc comment)
-// rather than an error, since most callers of this fake never exercise
-// this method at all.
-func (f *fakeDecisionInboxSourceControl) GetOpenPR(_ context.Context, owner, repo string, number int, _ string) (ports.OpenPR, bool, error) {
-	if f.getOpenPRErr != nil {
-		return ports.OpenPR{}, false, f.getOpenPRErr
-	}
-	key := fmt.Sprintf("%s/%s#%d", owner, repo, number)
-	pr, ok := f.getOpenPRByKey[key]
-	return pr, ok, nil
+// GetOpenPR (§21.2 stage 2) backs RevalidateForAutoMerge, which no test in
+// this package (decisioninbox) exercises -- that function's own coverage
+// lives in internal/app/automerge's worker_integration_test.go, against
+// ITS OWN fakeAutoMergeSourceControl, this fake's sibling. A prior version
+// of this method carried a seedable getOpenPRByKey map whose doc named a
+// TestRevalidateForAutoMerge this package has never had; removed rather
+// than given a real user, mirroring the plain "not implemented" every
+// other method on this fake already uses for a method Build's own
+// SCMCache never calls (this type's own doc comment, above).
+func (f *fakeDecisionInboxSourceControl) GetOpenPR(context.Context, string, string, int, string) (ports.OpenPR, bool, error) {
+	return ports.OpenPR{}, false, errors.New("fakeDecisionInboxSourceControl: GetOpenPR not implemented")
 }
 func (f *fakeDecisionInboxSourceControl) GetPRBody(context.Context, string, string, int, string) (string, bool, error) {
 	return "", false, errors.New("fakeDecisionInboxSourceControl: GetPRBody not implemented")

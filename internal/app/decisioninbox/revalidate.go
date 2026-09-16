@@ -140,24 +140,41 @@ func RevalidateForAutoMerge(ctx context.Context, deps Deps, sourceControl ports.
 	if err != nil {
 		return false, "", "", err
 	}
-	// H3 (fifth adversarial-review round): GetOpenPR's own five sub-calls
-	// each swallow their OWN individual failure into a degraded field
-	// instead of an error (buildOpenPRFromDetail's own doc comment,
-	// listopenprs.go), so a deadline firing partway through this
-	// composite -- getPRCtx running out after the first sub-call already
-	// succeeded -- returns here with err == nil and a target silently
-	// missing whatever the cut-short sub-call would have reported. Left
-	// unchecked, that renders downstream as an ordinary, permanent-
-	// looking eligibility refusal rather than the transient, retry-worthy
-	// timeout it actually was. Detected via getPRCtx's OWN error, checked
-	// for DeadlineExceeded specifically -- never a bare non-nil check,
-	// which the cancel() call two lines above would ALSO satisfy on the
-	// ordinary, well-within-budget success path (a context's recorded
-	// error is set by whichever of "its own deadline fired" or "someone
-	// called its cancel func" happens FIRST, and never overwritten after
-	// -- so DeadlineExceeded surviving past this function's own cancel()
-	// call means the deadline is what actually fired here, not this
-	// function's own routine cleanup).
+	// H3 (fifth adversarial-review round; corrected, sixth round -- the
+	// previous version of this paragraph asserted a uniform failure model
+	// for all five of GetOpenPR's sub-calls, sourced to
+	// buildOpenPRFromDetail's own doc comment, which makes no such claim
+	// and is wrong for two of the five). fetchOpenPRDetail's own failure
+	// is a real Go error, already caught by this function's err != nil
+	// check two lines above -- a deadline firing during THAT call cannot
+	// reach the branch below at all. fetchReviewDecision and
+	// fetchChangedFilePaths each swallow their own failure into a
+	// degraded field instead, per their own doc comments (listopenprs.go,
+	// ports.OpenPR.ReviewDecisionDegraded/ChangedFilesListDegraded).
+	// fetchCIConclusionLive carries no degraded field for either of its
+	// two GETs at all -- see that function's own doc comment and
+	// terminal switch (listopenprs.go) for what it actually reports on a
+	// half-read composite: not "silently missing whatever it would have
+	// reported", but a confident CIConclusionSuccess whenever the GET
+	// that failed was the only one that could have contradicted the GET
+	// that didn't. That hazard predates this PR, is unchanged by it, and
+	// is not fixed here -- it is out of scope for this change and tracked
+	// as its own defect. What THIS guard closes is narrower: a deadline
+	// firing partway through GetOpenPR's own five-call composite still
+	// returns here with err == nil and a target reflecting whichever
+	// later sub-call the deadline cut short. Left unchecked, that renders
+	// downstream as an ordinary, permanent-looking eligibility refusal --
+	// or, via the CI hazard described above, a false approval -- rather
+	// than the transient, retry-worthy timeout it actually was. Detected
+	// via getPRCtx's OWN error, checked for DeadlineExceeded specifically
+	// -- never a bare non-nil check, which the cancel() call two lines
+	// above would ALSO satisfy on the ordinary, well-within-budget
+	// success path (a context's recorded error is set by whichever of
+	// "its own deadline fired" or "someone called its cancel func"
+	// happens FIRST, and never overwritten after -- so DeadlineExceeded
+	// surviving past this function's own cancel() call means the
+	// deadline is what actually fired here, not this function's own
+	// routine cleanup).
 	if errors.Is(getPRCtx.Err(), context.DeadlineExceeded) {
 		return false, "", "", fmt.Errorf("decisioninbox: revalidate for auto-merge: get open pr timed out partway through its own five-call fetch (GitHubGetOpenPRTimeout) -- refusing rather than trusting whichever sub-call was cut short: %w", context.DeadlineExceeded)
 	}
