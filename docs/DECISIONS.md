@@ -30,6 +30,9 @@ to adopt, and an entry that leaves with `reject` and a reason has done its job.
 | How a compromised sandbox token is revoked | Explicit operator revocation, the only form that is true without network reachability | Step 152 |
 | How the bot token's egress is scoped | Its own independent required-set entry, never folded into another | Step 153 |
 | What a plan document reads from | The `plan_documents` snapshot is the read; recomputation is the fallback, not the reverse | Step 161 |
+| Whether this project takes an RWX account | **Yes** (2026-09-17). The real-binary test loses its skip, so `Resume` is settled empirically — Step 57's first exit criterion, never once run. Unblocks Phases 17 and 18 | Step 163 |
+| Mode B: kill, defer or build | **Build** (2026-09-17), in the separate repository, where it is already specified as Steps E5-E7. Building it in this repository was never one of the three. Step 107's baseline readout stays the reference input and its window keeps accruing; the decision was taken without waiting for it, deliberately rather than by oversight | Step 108 |
+| Whether to expose this system to existing MCP clients | **Adopt** (2026-09-17). Independent of any native-client decision, and the bulk of the cost is an authentication surface Step 158's device flow does not provide | Step 180 onward |
 
 ## Open, owned by a row that already names them
 
@@ -38,11 +41,16 @@ it gates. They are listed here so the set is visible in one place, not so it is 
 
 | Decision | What it gates | Stated in |
 |---|---|---|
-| Whether this project takes an RWX account | Phase 17's claims-parity work | Step 163 |
 | Which cluster, and whether its node pool has the hypervisor capability — that acceptance run is what decides Kata against gVisor, not a preference | Phase 18 entirely | Step 167 |
-| Mode B: kill, defer or build — taking Step 107's baseline readout as input, and recorded rather than defaulted. Building it in this repository is explicitly not one of the three | Step 156, which only matters if the answer is *build* | Step 108 |
 | Whether a trigger consults a stack's direct parent or its ultimate target | The stack policy's incremental diff, implemented by Step 142 | §24.8 — the row itself does not raise it |
 | Whether an external client is built at all | Phase 16, which is gated rather than scheduled | Phase 16 preamble |
+
+**What the build decision on mode B turns on.** Step 156 stops being conditional: a hosted
+embeddings provider receiving customer-derived prose is a real egress channel, and the wire-compatible
+adapter that lets a self-hoster serve the same corpus is now required work rather than deferred work.
+Steps 109 and 110 also come back into play — both need Step 108's corpus tables, and both were dead
+under a kill. Phase 9's exit is written as a disjunction precisely so neither branch reads as the
+only outcome; the build branch is the one that carries more work, not less.
 
 ## Open, with no home until they are taken
 
@@ -52,7 +60,14 @@ not an argument for adopting it** — these are listed as questions, with what e
 because the alternative is that they disappear from tracking and get rediscovered in a year as
 though they were new.
 
-### D-01 — Expose this system to existing MCP clients
+### D-01 — Expose this system to existing MCP clients — **ADOPTED 2026-09-17**
+
+Recorded here until its Step rows exist; once they do, they become authoritative and this entry
+keeps only the pointer. The reasoning below is what the decision was taken against, and the
+rejected alternatives are kept so they are not re-proposed as improvements: deferring (cheap only
+if Phase 16's three prerequisites are built client-agnostically, and the real risk of deferral was
+never the delay but building them FOR one client and encoding its assumptions), and rejecting
+(which would have left Phase 16 as Step 157 alone).
 
 **The question.** Whether an external MCP client may drive sessions here: discover repositories and
 models, read session state, delegate work, send a prompt, approve or reject a plan, stop a run.
