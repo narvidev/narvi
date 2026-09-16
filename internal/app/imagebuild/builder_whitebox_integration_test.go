@@ -67,6 +67,13 @@ func (f *whiteboxFakeSourceControl) ResolveBranchSHA(_ context.Context, spec por
 	return sha, "main", nil
 }
 
+// IsAncestor (D3, second adversarial-review round) is never exercised by
+// this file's own tests -- stubbed only for ports.SourceControl interface
+// satisfaction.
+func (f *whiteboxFakeSourceControl) IsAncestor(context.Context, ports.IsAncestorSpec) (bool, error) {
+	return false, errors.New("whiteboxFakeSourceControl: IsAncestor not implemented")
+}
+
 func (f *whiteboxFakeSourceControl) ResolveContractsFingerprint(context.Context, ports.ResolveContractsFingerprintSpec) (string, bool, error) {
 	return "", false, errors.New("whiteboxFakeSourceControl: ResolveContractsFingerprint not implemented")
 }

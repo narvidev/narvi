@@ -135,6 +135,33 @@ func setupReviewSessionWithSandbox(ctx context.Context, t *testing.T, r testRig,
 	return session
 }
 
+// seedDispatchedTurn creates a processing turn for sessionID and stamps
+// its dispatched_message_id to testDispatchMessageID -- D1/D4/D6's own
+// fix (second adversarial-review round) means PostReviewVerdict now
+// REFUSES (403) any call it cannot attribute to a specific, real turn, so
+// every test below that used to pass an empty dispatch-message-id header
+// and expect a 201 now needs a real turn to resolve. Mirrors
+// TestPostReviewVerdict_PersistsReviewVerdictRow_WhenReviewHeadSHAKnown's
+// own pre-existing two-step Create-then-UpdateStatus dance verbatim
+// (turns.Create itself has no DispatchedMessageID param) -- reused here
+// rather than duplicated once more for every caller that does not
+// otherwise need a bespoke turn shape (a specific review_head_sha or
+// review_depth_decision payload; those keep seeding their own turn
+// directly, exactly as before this fix).
+func seedDispatchedTurn(ctx context.Context, t *testing.T, r testRig, sessionID pgtype.UUID) sqlcgen.Turn {
+	t.Helper()
+	created, err := r.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: sessionID, Status: sqlcgen.TurnStatusProcessing})
+	if err != nil {
+		t.Fatalf("seed processing turn: %v", err)
+	}
+	messageID := testDispatchMessageID
+	updated, err := r.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: created.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedMessageID: &messageID})
+	if err != nil {
+		t.Fatalf("stamp dispatched_message_id on seeded turn: %v", err)
+	}
+	return updated
+}
+
 func TestPostReviewVerdict_NotFound(t *testing.T) {
 	rig := newTestRig(t)
 
@@ -292,8 +319,9 @@ func TestPostReviewVerdict_Success_EnqueuesGitHubVerdictOutboxRow(t *testing.T) 
 	rig := newTestRig(t)
 	ctx := context.Background()
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-success", 42)
+	seedDispatchedTurn(ctx, t, rig, session.ID)
 
-	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", validVerdictRequestJSON())
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, validVerdictRequestJSON())
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -574,32 +602,157 @@ func TestPostReviewVerdict_SkipsReviewVerdictInsert_WhenNoReviewHeadSHA(t *testi
 	}
 }
 
-// TestPostReviewVerdict_SkipsReviewVerdictInsert_WhenNoProcessingTurnAtAll
-// is TestPostReviewVerdict_SkipsReviewVerdictInsert_WhenNoReviewHeadSHA's
-// own sibling for the OTHER degraded case this handler must also handle
-// gracefully: no processing turn can be resolved for
-// this session AT ALL (a genuine race -- the turn already completed/
-// failed/was cancelled between the agent's own HTTP call landing and
-// this handler's own GetProcessingTurnForSession read) -- still posts
-// successfully, review_verdicts insert skipped, exactly like the
-// no-head-sha case.
-func TestPostReviewVerdict_SkipsReviewVerdictInsert_WhenNoProcessingTurnAtAll(t *testing.T) {
-	rig := newTestRig(t)
-	ctx := context.Background()
-	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-no-processing-turn", 57)
-	// Deliberately no turn created at all.
+// dispatchMissingHeaderRejectedLogMsg/dispatchPlaceholderRejectedLogMsg/
+// dispatchNoTurnRejectedLogMsg are reviewverdict.go's own exact log
+// messages for D1/D4/D10's three distinct "cannot attribute" branches --
+// named here as literals (this is package httpapi_test, a black-box test
+// package) rather than re-deriving them, mirroring
+// filesChangedDriftCanaryLogMsg's own identical "named literal for an
+// unexported production string" precedent below. Distinct log lines for
+// distinct causes are the whole point of D4's own fix: a mutation that
+// deletes one dedicated branch and lets it fall through to another still
+// returns the identical 403 (status/persistence alone cannot catch it),
+// but logs the WRONG line -- which the tests below assert on directly.
+const (
+	dispatchMissingHeaderRejectedLogMsg = "httpapi: review-verdict: rejecting: no X-Sandbox-Dispatch-Message-Id header presented, cannot attribute this verdict to a specific turn"
+	dispatchPlaceholderRejectedLogMsg   = "httpapi: review-verdict: rejecting: presented X-Sandbox-Dispatch-Message-Id is the literal unsubstituted placeholder -- sandbox image predates this substitution, cannot attribute this verdict to a specific turn"
+	dispatchNoTurnRejectedLogMsg        = "httpapi: review-verdict: rejecting: no turn found for this session's own presented dispatch message id"
+)
 
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", validVerdictRequestJSON())
-	if status != http.StatusCreated {
-		t.Fatalf("status = %d, want %d (no resolvable processing turn must never fail the verdict post itself)", status, http.StatusCreated)
+// assertRejectedNoVerdictOfRecord is the shared assertion every D1/D4/D6
+// "cannot be attributed to a turn" test below needs: 403, and NEITHER an
+// outbox row NOR a review_verdicts row was ever created -- the whole tool
+// call was refused, never a degraded-but-successful post (D6's own
+// "confident normal state" failure mode this fix removes).
+func assertRejectedNoVerdictOfRecord(t *testing.T, rig testRig, ctx context.Context, sessionID, repoFullName string, prNumber int32, gotStatus int) {
+	t.Helper()
+	if gotStatus != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d (a verdict this endpoint cannot attribute to a real turn must be refused outright, never degraded to a successful post)", gotStatus, http.StatusForbidden)
 	}
 
-	var count int
-	if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM review_verdicts WHERE repo_full_name = $1 AND pr_number = $2`, "acme/verdict-no-processing-turn", 57).Scan(&count); err != nil {
+	var verdictCount int
+	if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM review_verdicts WHERE repo_full_name = $1 AND pr_number = $2`, repoFullName, prNumber).Scan(&verdictCount); err != nil {
 		t.Fatalf("count review_verdicts rows: %v", err)
 	}
-	if count != 0 {
-		t.Errorf("review_verdicts row count = %d, want 0", count)
+	if verdictCount != 0 {
+		t.Errorf("review_verdicts row count = %d, want 0 (a refused request must never persist a verdict)", verdictCount)
+	}
+
+	var outboxCount int
+	if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE session_id = $1`, sessionID).Scan(&outboxCount); err != nil {
+		t.Fatalf("count outbox rows: %v", err)
+	}
+	if outboxCount != 0 {
+		t.Errorf("outbox row count = %d, want 0 (a refused request must never post a comment)", outboxCount)
+	}
+}
+
+// TestPostReviewVerdict_RejectsWhenDispatchMessageIDHeaderMissing is D1's
+// own regression test (second adversarial-review round, HIGH,
+// prompt-injectable): before this fix, an omitted
+// X-Sandbox-Dispatch-Message-Id header degraded IDENTICALLY to a
+// not-found lookup -- logged, reviewDepth left at its own zero value
+// (satisfying neither light- nor deep-path enforcement), verdict posted
+// anyway, review_verdicts insert skipped, 201 returned. Since a review
+// turn's own prompt is the ONLY place this header's value lives before
+// the agent composes its own HTTP call (§30.5: the agent runtime is not a
+// trusted process boundary), an attacker's injected PR-body instruction
+// to "omit that header" used to be a strictly BETTER outcome for evading
+// deep-path enforcement than sending it correctly. This proves the
+// server-side posture instead: a caller-suppressible header can no
+// longer buy a degraded-but-successful outcome -- omitting it now fails
+// the WHOLE call, exactly like an omitted Authorization header does.
+func TestPostReviewVerdict_RejectsWhenDispatchMessageIDHeaderMissing(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	repoFullName := "acme/verdict-dispatch-header-missing"
+	session := setupReviewSessionWithSandbox(ctx, t, rig, repoFullName, 57)
+	seedDispatchedTurn(ctx, t, rig, session.ID)
+
+	buf := captureDefaultLoggerJSON(t)
+
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", validVerdictRequestJSON())
+	assertRejectedNoVerdictOfRecord(t, rig, ctx, session.ID.String(), repoFullName, 57, status)
+
+	if !hasLogEntry(t, buf, dispatchMissingHeaderRejectedLogMsg) {
+		t.Errorf("did not find the dedicated missing-header rejection log line; full log:\n%s", buf.String())
+	}
+}
+
+// TestPostReviewVerdict_RejectsWhenDispatchMessageIDIsUnsubstitutedPlaceholder
+// is D4's own regression test (second adversarial-review round, HIGH): an
+// older sandbox image, mid rolling-upgrade (§35.2: "this system runs
+// mixed image versions for weeks"), predates renderVerdictToolPromptText's
+// own dispatch-message-id substitution, so the agent's prompt still
+// carried the RAW, unsubstituted placeholder text and it echoed that back
+// verbatim as the header value rather than a real id.
+// review.VerdictToolDispatchMessageIDPlaceholder is a real, well-formed
+// string -- distinct from a bare-empty header -- so it must be
+// recognized explicitly (never merely fall through to a generic
+// not-found lookup, where it would be indistinguishable from a genuine
+// race or a forged value in every log line). The response is identical
+// to the missing-header case (403, nothing persisted): an old image gets
+// an honest, visible refusal instead of a false 201 with no verdict of
+// record.
+func TestPostReviewVerdict_RejectsWhenDispatchMessageIDIsUnsubstitutedPlaceholder(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	repoFullName := "acme/verdict-dispatch-header-placeholder"
+	session := setupReviewSessionWithSandbox(ctx, t, rig, repoFullName, 58)
+	seedDispatchedTurn(ctx, t, rig, session.ID)
+
+	buf := captureDefaultLoggerJSON(t)
+
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", review.VerdictToolDispatchMessageIDPlaceholder, validVerdictRequestJSON())
+	assertRejectedNoVerdictOfRecord(t, rig, ctx, session.ID.String(), repoFullName, 58, status)
+
+	// The distinguishing half of D4: this must reach the DEDICATED
+	// placeholder branch, never merely fall through to the generic
+	// not-found lookup's own log line -- an operator watching for a
+	// rolling-upgrade artifact must be able to tell "an old image sent
+	// the raw placeholder" apart from "a genuine race or a forged value"
+	// (TestPostReviewVerdict_RejectsWhenDispatchMessageIDNamesNoTurn,
+	// below). A regression that deleted the dedicated placeholder case
+	// (letting it fall through to the ordinary GetByDispatchedMessageID
+	// lookup) would still return the identical 403 -- this assertion is
+	// what actually catches that regression, since status/persistence
+	// alone cannot.
+	if !hasLogEntry(t, buf, dispatchPlaceholderRejectedLogMsg) {
+		t.Errorf("did not find the dedicated placeholder-rejection log line -- the placeholder must be recognized explicitly, never merely fall through to the generic not-found lookup; full log:\n%s", buf.String())
+	}
+	if hasLogEntry(t, buf, dispatchMissingHeaderRejectedLogMsg) {
+		t.Errorf("found the MISSING-header log line for a PRESENT (if unsubstituted) header -- these two cases must log distinguishably")
+	}
+}
+
+// TestPostReviewVerdict_RejectsWhenDispatchMessageIDNamesNoTurn restores
+// coverage of the pgx.ErrNoRows branch this test was originally named
+// for (D10, LOW: a prior round repurposed
+// TestPostReviewVerdict_SkipsReviewVerdictInsert_WhenNoProcessingTurnAtAll
+// to exercise the missing-header case instead, leaving the real
+// GetByDispatchedMessageID-returns-ErrNoRows path -- a real, well-formed
+// header naming a turn this session never dispatched, e.g. a genuine
+// race where the turn already completed/failed/was cancelled between the
+// agent's own HTTP call landing and this read, or a forged value -- with
+// no test of its own). Distinct from BOTH of the two tests immediately
+// above: this header is neither empty nor the known placeholder, so it
+// must reach the real store lookup and be refused there.
+func TestPostReviewVerdict_RejectsWhenDispatchMessageIDNamesNoTurn(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	repoFullName := "acme/verdict-no-processing-turn"
+	session := setupReviewSessionWithSandbox(ctx, t, rig, repoFullName, 59)
+	// Deliberately no turn created at all -- "some-other-message-id" names
+	// no row in turns.dispatched_message_id for this (or any) session, so
+	// turns.GetByDispatchedMessageID returns pgx.ErrNoRows.
+
+	buf := captureDefaultLoggerJSON(t)
+
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "some-other-message-id", validVerdictRequestJSON())
+	assertRejectedNoVerdictOfRecord(t, rig, ctx, session.ID.String(), repoFullName, 59, status)
+
+	if !hasLogEntry(t, buf, dispatchNoTurnRejectedLogMsg) {
+		t.Errorf("did not find the dedicated no-turn-found rejection log line; full log:\n%s", buf.String())
 	}
 }
 
@@ -612,6 +765,7 @@ func TestPostReviewVerdict_ShippableNeverTrustsProposedShippable(t *testing.T) {
 	rig := newTestRig(t)
 	ctx := context.Background()
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-not-a-pr", 9)
+	seedDispatchedTurn(ctx, t, rig, session.ID)
 
 	body := `{
 		"riskLevel": "low",
@@ -631,7 +785,7 @@ func TestPostReviewVerdict_ShippableNeverTrustsProposedShippable(t *testing.T) {
 		"factCheckKilled": 0
 	}`
 
-	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", body)
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, body)
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -677,8 +831,9 @@ func TestPostReviewVerdict_BlockOnHighRisk(t *testing.T) {
 		rig := newTestRig(t)
 		ctx := context.Background()
 		session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-blockonhighrisk-off", 10)
+		seedDispatchedTurn(ctx, t, rig, session.ID)
 
-		status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", highRiskBody)
+		status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, highRiskBody)
 		if status != http.StatusCreated {
 			t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 		}
@@ -699,8 +854,9 @@ func TestPostReviewVerdict_BlockOnHighRisk(t *testing.T) {
 		if _, err := rig.repoSettings.Upsert(ctx, repoFullName, true, false); err != nil {
 			t.Fatalf("upsert repo settings: %v", err)
 		}
+		seedDispatchedTurn(ctx, t, rig, session.ID)
 
-		status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", highRiskBody)
+		status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, highRiskBody)
 		if status != http.StatusCreated {
 			t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 		}
@@ -722,6 +878,7 @@ func TestPostReviewVerdict_ConcurrentCalls_AllSucceedNoDeadlock(t *testing.T) {
 	rig := newTestRig(t)
 	ctx := context.Background()
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-concurrent", 77)
+	seedDispatchedTurn(ctx, t, rig, session.ID)
 
 	const n = 6
 	start := make(chan struct{})
@@ -732,7 +889,7 @@ func TestPostReviewVerdict_ConcurrentCalls_AllSucceedNoDeadlock(t *testing.T) {
 		idx := i
 		go func() {
 			<-start
-			status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", validVerdictRequestJSON())
+			status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, validVerdictRequestJSON())
 			statuses[idx] = status
 			done <- idx
 		}()
@@ -767,6 +924,7 @@ func TestPostReviewVerdict_MisleadingAdequacyRaisesShippable(t *testing.T) {
 	rig := newTestRig(t)
 	ctx := context.Background()
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-misleading-adequacy", 12)
+	seedDispatchedTurn(ctx, t, rig, session.ID)
 
 	body := `{
 		"riskLevel": "low",
@@ -786,7 +944,7 @@ func TestPostReviewVerdict_MisleadingAdequacyRaisesShippable(t *testing.T) {
 		"factCheckKilled": 0
 	}`
 
-	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", body)
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, body)
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -884,6 +1042,7 @@ func TestPostReviewVerdict_ProposedBodyPresent_EnqueuesDescriptionAutofixOutboxR
 	rig := newTestRig(t)
 	ctx := context.Background()
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-autofix-candidate", 14)
+	seedDispatchedTurn(ctx, t, rig, session.ID)
 
 	proposedBody := "This PR rewrites the auth token refresh path to retry on transient network failures."
 	body := `{
@@ -905,7 +1064,7 @@ func TestPostReviewVerdict_ProposedBodyPresent_EnqueuesDescriptionAutofixOutboxR
 		"factCheckKilled": 0
 	}`
 
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", body)
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, body)
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -965,6 +1124,7 @@ func TestPostReviewVerdict_AdequacyOKWithProposedBody_NeverEnqueuesDescriptionAu
 	rig := newTestRig(t)
 	ctx := context.Background()
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-adequacy-ok-candidate", 16)
+	seedDispatchedTurn(ctx, t, rig, session.ID)
 
 	body := `{
 		"riskLevel": "low",
@@ -985,7 +1145,7 @@ func TestPostReviewVerdict_AdequacyOKWithProposedBody_NeverEnqueuesDescriptionAu
 		"factCheckKilled": 0
 	}`
 
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", body)
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, body)
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -1018,8 +1178,9 @@ func TestPostReviewVerdict_ProposedBodyAbsent_NeverEnqueuesDescriptionAutofixOut
 	rig := newTestRig(t)
 	ctx := context.Background()
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-no-autofix-candidate", 15)
+	seedDispatchedTurn(ctx, t, rig, session.ID)
 
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", validVerdictRequestJSON())
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, validVerdictRequestJSON())
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}

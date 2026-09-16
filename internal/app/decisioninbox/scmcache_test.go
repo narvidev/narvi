@@ -21,9 +21,10 @@ import (
 )
 
 // fakeSCMCacheSourceControl is a minimal, call-counting, concurrency-safe
-// test-only ports.SourceControl -- narrowed to exactly the two methods
-// SCMCache itself calls (ListOpenPRsForUser, ResolveCodeOwners); every
-// other method returns a plain "not implemented" error.
+// test-only ports.SourceControl -- narrowed to exactly the three methods
+// SCMCache itself calls (ListOpenPRsForUser, ResolveCodeOwners,
+// ResolveBranchSHA -- D2's own addition, second adversarial-review
+// round); every other method returns a plain "not implemented" error.
 type fakeSCMCacheSourceControl struct {
 	mu sync.Mutex
 
@@ -49,6 +50,22 @@ type fakeSCMCacheSourceControl struct {
 	// TestSCMCache_ListOpenPRsForUser_SlowFetchDoesNotBornExpire below).
 	codeOwnersDelay     time.Duration
 	codeOwnersCallCount int
+
+	// resolveBranchSHA/resolveBranchSHAErr/resolveBranchSHADelay/
+	// resolveBranchSHACallCount (D2, second adversarial-review round)
+	// mirror the openPRs fields' own identical shape, one method further,
+	// backing SCMCache.ResolveBranchSHA's own tests below.
+	resolveBranchSHA          string
+	resolveBranchSHAErr       error
+	resolveBranchSHADelay     time.Duration
+	resolveBranchSHACallCount int
+
+	// isAncestorResult/isAncestorErr/isAncestorCallCount (D3, second
+	// adversarial-review round) back SCMCache.IsAncestor's own tests
+	// below, mirroring resolveBranchSHA's own identical shape.
+	isAncestorResult    bool
+	isAncestorErr       error
+	isAncestorCallCount int
 }
 
 var _ ports.SourceControl = (*fakeSCMCacheSourceControl)(nil)
@@ -109,8 +126,53 @@ func (f *fakeSCMCacheSourceControl) codeOwnersCalls() int {
 func (f *fakeSCMCacheSourceControl) CreatePR(context.Context, ports.CreatePRSpec) (ports.PRRef, error) {
 	return ports.PRRef{}, errors.New("fakeSCMCacheSourceControl: CreatePR not implemented")
 }
-func (f *fakeSCMCacheSourceControl) ResolveBranchSHA(context.Context, ports.ResolveBranchSHASpec) (string, string, error) {
-	return "", "", errors.New("fakeSCMCacheSourceControl: ResolveBranchSHA not implemented")
+func (f *fakeSCMCacheSourceControl) ResolveBranchSHA(ctx context.Context, spec ports.ResolveBranchSHASpec) (string, string, error) {
+	f.mu.Lock()
+	f.resolveBranchSHACallCount++
+	delay := f.resolveBranchSHADelay
+	sha := f.resolveBranchSHA
+	err := f.resolveBranchSHAErr
+	f.mu.Unlock()
+
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return "", "", ctx.Err()
+		}
+	}
+	if err != nil {
+		return "", "", err
+	}
+	return sha, spec.Branch, nil
+}
+
+func (f *fakeSCMCacheSourceControl) resolveBranchSHACalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.resolveBranchSHACallCount
+}
+
+// IsAncestor (D3, second adversarial-review round) backs
+// SCMCache.IsAncestor's own tests below -- mirrors ResolveBranchSHA's own
+// identical shape immediately above, one comparison further.
+func (f *fakeSCMCacheSourceControl) IsAncestor(context.Context, ports.IsAncestorSpec) (bool, error) {
+	f.mu.Lock()
+	f.isAncestorCallCount++
+	err := f.isAncestorErr
+	result := f.isAncestorResult
+	f.mu.Unlock()
+
+	if err != nil {
+		return false, err
+	}
+	return result, nil
+}
+
+func (f *fakeSCMCacheSourceControl) isAncestorCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.isAncestorCallCount
 }
 func (f *fakeSCMCacheSourceControl) ResolveContractsFingerprint(context.Context, ports.ResolveContractsFingerprintSpec) (string, bool, error) {
 	return "", false, errors.New("fakeSCMCacheSourceControl: ResolveContractsFingerprint not implemented")
@@ -392,5 +454,148 @@ func TestSCMCache_ResolveCodeOwners_SlowFetchDoesNotBornExpire(t *testing.T) {
 	}
 	if got := fake.codeOwnersCalls(); got != 1 {
 		t.Errorf("fetch called %d times after second call, want 1 (still a cache hit -- expiresAt must be anchored on fetch COMPLETION, not the pre-fetch `now`)", got)
+	}
+}
+
+// TestSCMCache_ResolveBranchSHA_CacheHitWithinTTL is D2's own regression
+// test (second adversarial-review round): a second call for the SAME
+// (owner, repo, branch) within DecisionInboxSCMCacheTTL must be served
+// from cache -- exactly one live fetch, mirroring TestSCMCache_
+// ListOpenPRsForUser_CacheHitReturnsOriginalFetchInstant's own identical
+// shape one method further.
+func TestSCMCache_ResolveBranchSHA_CacheHitWithinTTL(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeSCMCacheSourceControl{resolveBranchSHA: "sha-abc123"}
+	cache := decisioninbox.NewSCMCache(fake, platform.DefaultTimeouts())
+	spec := ports.ResolveBranchSHASpec{Owner: "acme", Repo: "widgets", Branch: "main", Token: "tok"}
+
+	now := time.Now()
+	sha1, _, err := cache.ResolveBranchSHA(context.Background(), spec, now)
+	if err != nil {
+		t.Fatalf("first call error = %v", err)
+	}
+	if sha1 != "sha-abc123" {
+		t.Errorf("first call sha = %q, want %q", sha1, "sha-abc123")
+	}
+	if got := fake.resolveBranchSHACalls(); got != 1 {
+		t.Fatalf("fetch called %d times after first call, want 1", got)
+	}
+
+	sha2, _, err := cache.ResolveBranchSHA(context.Background(), spec, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("second call error = %v", err)
+	}
+	if sha2 != "sha-abc123" {
+		t.Errorf("second call sha = %q, want %q (cached)", sha2, "sha-abc123")
+	}
+	if got := fake.resolveBranchSHACalls(); got != 1 {
+		t.Errorf("fetch called %d times after second call, want 1 (still a cache hit)", got)
+	}
+}
+
+// TestSCMCache_ResolveBranchSHA_ExpiredEntryRefetches proves the OTHER
+// half: a call past DecisionInboxSCMCacheTTL genuinely re-fetches, rather
+// than serving a stale, expired entry forever.
+func TestSCMCache_ResolveBranchSHA_ExpiredEntryRefetches(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeSCMCacheSourceControl{resolveBranchSHA: "sha-abc123"}
+	timeouts := platform.DefaultTimeouts()
+	timeouts.DecisionInboxSCMCacheTTL = 50 * time.Millisecond
+	cache := decisioninbox.NewSCMCache(fake, timeouts)
+	spec := ports.ResolveBranchSHASpec{Owner: "acme", Repo: "widgets", Branch: "main", Token: "tok"}
+
+	now := time.Now()
+	if _, _, err := cache.ResolveBranchSHA(context.Background(), spec, now); err != nil {
+		t.Fatalf("first call error = %v", err)
+	}
+
+	fake.mu.Lock()
+	fake.resolveBranchSHA = "sha-def456"
+	fake.mu.Unlock()
+
+	sha2, _, err := cache.ResolveBranchSHA(context.Background(), spec, now.Add(timeouts.DecisionInboxSCMCacheTTL+time.Millisecond))
+	if err != nil {
+		t.Fatalf("second call error = %v", err)
+	}
+	if sha2 != "sha-def456" {
+		t.Errorf("second call (past TTL) sha = %q, want %q (a fresh live fetch, not the expired cached value)", sha2, "sha-def456")
+	}
+	if got := fake.resolveBranchSHACalls(); got != 2 {
+		t.Errorf("fetch called %d times, want 2 (the second call must genuinely re-fetch)", got)
+	}
+}
+
+// TestSCMCache_ResolveBranchSHA_PropagatesUnderlyingError mirrors
+// TestSCMCache_ListOpenPRsForUser_PropagatesUnderlyingError one method
+// further.
+func TestSCMCache_ResolveBranchSHA_PropagatesUnderlyingError(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("boom: github is down")
+	fake := &fakeSCMCacheSourceControl{resolveBranchSHAErr: wantErr}
+	cache := decisioninbox.NewSCMCache(fake, platform.DefaultTimeouts())
+
+	_, _, err := cache.ResolveBranchSHA(context.Background(), ports.ResolveBranchSHASpec{Owner: "acme", Repo: "widgets", Branch: "main"}, time.Now())
+	if err == nil {
+		t.Fatal("ResolveBranchSHA() error = nil, want the underlying SourceControl error wrapped")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Errorf("ResolveBranchSHA() error = %v, want it to wrap %v", err, wantErr)
+	}
+}
+
+// TestSCMCache_IsAncestor_CacheHitWithinTTL is D3's own regression test
+// (second adversarial-review round): a second call for the SAME (owner,
+// repo, ancestor, descendant) tuple within DecisionInboxSCMCacheTTL must
+// be served from cache -- exactly one live call.
+func TestSCMCache_IsAncestor_CacheHitWithinTTL(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeSCMCacheSourceControl{isAncestorResult: true}
+	cache := decisioninbox.NewSCMCache(fake, platform.DefaultTimeouts())
+	spec := ports.IsAncestorSpec{Owner: "acme", Repo: "widgets", Ancestor: "sha-old", Descendant: "sha-new", Token: "tok"}
+
+	now := time.Now()
+	got1, err := cache.IsAncestor(context.Background(), spec, now)
+	if err != nil {
+		t.Fatalf("first call error = %v", err)
+	}
+	if !got1 {
+		t.Error("first call = false, want true")
+	}
+	if got := fake.isAncestorCalls(); got != 1 {
+		t.Fatalf("fetch called %d times after first call, want 1", got)
+	}
+
+	got2, err := cache.IsAncestor(context.Background(), spec, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("second call error = %v", err)
+	}
+	if !got2 {
+		t.Error("second call = false, want true (cached)")
+	}
+	if got := fake.isAncestorCalls(); got != 1 {
+		t.Errorf("fetch called %d times after second call, want 1 (still a cache hit)", got)
+	}
+}
+
+// TestSCMCache_IsAncestor_PropagatesUnderlyingError mirrors
+// TestSCMCache_ResolveBranchSHA_PropagatesUnderlyingError one method
+// further.
+func TestSCMCache_IsAncestor_PropagatesUnderlyingError(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("boom: github is down")
+	fake := &fakeSCMCacheSourceControl{isAncestorErr: wantErr}
+	cache := decisioninbox.NewSCMCache(fake, platform.DefaultTimeouts())
+
+	_, err := cache.IsAncestor(context.Background(), ports.IsAncestorSpec{Owner: "acme", Repo: "widgets", Ancestor: "a", Descendant: "b"}, time.Now())
+	if err == nil {
+		t.Fatal("IsAncestor() error = nil, want the underlying SourceControl error wrapped")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Errorf("IsAncestor() error = %v, want it to wrap %v", err, wantErr)
 	}
 }

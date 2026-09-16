@@ -107,6 +107,13 @@ func codeOwnersKey(owner, repo, ref string, paths []string) codeOwnersCacheKey {
 	return codeOwnersCacheKey{owner: owner, repo: repo, ref: ref, pathsKey: strings.Join(sorted, "\x00")}
 }
 
+// branchSHACacheKey identifies one ResolveBranchSHA lookup -- (owner,
+// repo, branch), mirroring codeOwnersCacheKey's own identical per-repo/
+// per-ref keying immediately above.
+type branchSHACacheKey struct {
+	owner, repo, branch string
+}
+
 // SCMCache is the §16.2 short-TTL cache wrapping every live SourceControl
 // read the decision-inbox aggregator makes -- constructed once and
 // threaded through Deps, exactly like repoAccessCache is constructed once
@@ -118,18 +125,110 @@ type SCMCache struct {
 	sourceControl ports.SourceControl
 	timeouts      platform.Timeouts
 
-	openPRs    *ttlCache[string, []ports.OpenPR]
-	codeOwners *ttlCache[codeOwnersCacheKey, []ports.Owner]
+	openPRs           *ttlCache[string, []ports.OpenPR]
+	codeOwners        *ttlCache[codeOwnersCacheKey, []ports.Owner]
+	branchSHAs        *ttlCache[branchSHACacheKey, string]
+	isAncestorResults *ttlCache[isAncestorCacheKey, bool]
 }
 
 // NewSCMCache builds an SCMCache wrapping sourceControl.
 func NewSCMCache(sourceControl ports.SourceControl, timeouts platform.Timeouts) *SCMCache {
 	return &SCMCache{
-		sourceControl: sourceControl,
-		timeouts:      timeouts,
-		openPRs:       newTTLCache[string, []ports.OpenPR](),
-		codeOwners:    newTTLCache[codeOwnersCacheKey, []ports.Owner](),
+		sourceControl:     sourceControl,
+		timeouts:          timeouts,
+		openPRs:           newTTLCache[string, []ports.OpenPR](),
+		codeOwners:        newTTLCache[codeOwnersCacheKey, []ports.Owner](),
+		branchSHAs:        newTTLCache[branchSHACacheKey, string](),
+		isAncestorResults: newTTLCache[isAncestorCacheKey, bool](),
 	}
+}
+
+// ResolveBranchSHA returns spec's own branch's CURRENT commit SHA,
+// live-fetching on a cache miss/expiry and caching the result for
+// platform.Timeouts.DecisionInboxSCMCacheTTL -- mirrors
+// ListOpenPRsForUser/ResolveCodeOwners above exactly.
+//
+// D2 (second adversarial-review round): this method is what
+// computeRealEligibility (aggregate.go) now calls to supply
+// autoapproval.EligibilityInput.CurrentBaseSHA, replacing a direct read
+// of ports.OpenPR.BaseSHA -- GitHub's own per-PR CACHED "base.sha"
+// snapshot, verified to lag the base branch's real tip by an unknown,
+// sometimes month-scale margin (see that field's own doc comment,
+// ports/sourcecontrol.go). revalidateCore (revalidate.go) already
+// resolves this SAME kind of value -- a LIVE branch-tip read -- but
+// deliberately bypasses every cache (that function's own doc comment:
+// "the whole point of this function is a fresh read"), since it backs an
+// ACTION endpoint (merge). computeRealEligibility backs a READ MODEL
+// instead (§16.2: "SCM data is cached with a short TTL... never presented
+// as live truth" -- explicitly the posture this whole cache exists for),
+// so caching this call here, exactly like every other SCM read this
+// aggregator makes, is correct: both callers now supply the SAME KIND of
+// value (a live-resolved tip, never the stale per-PR snapshot) to
+// autoapproval.ComputeEligible, differing only in how fresh "live" is
+// allowed to be for their own, differently-scoped purposes.
+//
+// A resolution failure is propagated as err, exactly like
+// ListOpenPRsForUser/ResolveCodeOwners above -- computeRealEligibility's
+// own caller degrades that to an empty CurrentBaseSHA, which
+// autoapproval.ComputeEligible's own ReasonBaseSHAUnknown guard then
+// fails closed on, mirroring revalidateCore's own identical degradation.
+func (c *SCMCache) ResolveBranchSHA(ctx context.Context, spec ports.ResolveBranchSHASpec, now time.Time) (sha string, asOf time.Time, err error) {
+	key := branchSHACacheKey{owner: spec.Owner, repo: spec.Repo, branch: spec.Branch}
+	if cached, fetchedAt, ok := c.branchSHAs.get(key, now); ok {
+		return cached, fetchedAt, nil
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, c.timeouts.DecisionInboxResolveBranchSHATimeout)
+	defer cancel()
+	sha, _, err = c.sourceControl.ResolveBranchSHA(callCtx, spec)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("decisioninbox: resolve branch sha: %w", err)
+	}
+
+	fetchedAt := time.Now()
+	c.branchSHAs.set(key, sha, fetchedAt, c.timeouts.DecisionInboxSCMCacheTTL)
+	return sha, fetchedAt, nil
+}
+
+// isAncestorCacheKey identifies one IsAncestor lookup -- (owner, repo,
+// ancestor sha, descendant sha), mirroring branchSHACacheKey's own
+// identical per-repo keying immediately above, one comparison further.
+type isAncestorCacheKey struct {
+	owner, repo, ancestor, descendant string
+}
+
+// IsAncestor (D3, second adversarial-review round) reports whether
+// spec.Ancestor is an ancestor of (or identical to) spec.Descendant,
+// live-fetching on a cache miss/expiry and caching the result for
+// platform.Timeouts.DecisionInboxSCMCacheTTL -- mirrors ResolveBranchSHA
+// immediately above exactly, and for the identical reason: this backs
+// computeRealEligibility's own READ MODEL (aggregate.go), which §16.2
+// already licenses to serve a short-TTL-cached view rather than an
+// instantaneous-fresh one.
+//
+// See ports.SourceControl.IsAncestor's own doc comment for what this
+// answers and why: computeRealEligibility (and revalidateCore, which
+// bypasses this cache exactly like it bypasses ResolveBranchSHA's own
+// cache, for the identical "action endpoint needs a fresh read" reason)
+// consult this only when a verdict's own recorded base sha differs from
+// the base branch's current live tip but the base REF is unchanged --
+// tolerating an ORDINARY, unrelated merge to the base branch between
+// review and merge/revalidation, while still refusing a genuine rewrite.
+func (c *SCMCache) IsAncestor(ctx context.Context, spec ports.IsAncestorSpec, now time.Time) (isAncestor bool, err error) {
+	key := isAncestorCacheKey{owner: spec.Owner, repo: spec.Repo, ancestor: spec.Ancestor, descendant: spec.Descendant}
+	if cached, _, ok := c.isAncestorResults.get(key, now); ok {
+		return cached, nil
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, c.timeouts.DecisionInboxIsAncestorTimeout)
+	defer cancel()
+	isAncestor, err = c.sourceControl.IsAncestor(callCtx, spec)
+	if err != nil {
+		return false, fmt.Errorf("decisioninbox: is ancestor: %w", err)
+	}
+
+	c.isAncestorResults.set(key, isAncestor, time.Now(), c.timeouts.DecisionInboxSCMCacheTTL)
+	return isAncestor, nil
 }
 
 // ListOpenPRsForUser returns spec's own open-PR list, live-fetching on a

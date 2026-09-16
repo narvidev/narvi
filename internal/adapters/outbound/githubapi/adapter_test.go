@@ -1134,6 +1134,145 @@ func TestResolveBranchSHA_4xxMapsToRealError(t *testing.T) {
 	}
 }
 
+// TestIsAncestor_IdenticalOrAhead_ReportsTrue is D3's own (second
+// adversarial-review round) adapter-level proof: GitHub's own "identical"
+// and "ahead" compare statuses (base is behind, or equal to, head -- in
+// git-ancestry terms, base IS an ancestor of head) both report true.
+func TestIsAncestor_IdenticalOrAhead_ReportsTrue(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []string{"identical", "ahead"} {
+		t.Run(status, func(t *testing.T) {
+			t.Parallel()
+
+			var gotPath, gotAuth, gotAccept string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				gotAuth = r.Header.Get("Authorization")
+				gotAccept = r.Header.Get("Accept")
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": status})
+			}))
+			defer server.Close()
+
+			adapter := githubapi.New(server.Client(), server.URL)
+
+			isAncestor, err := adapter.IsAncestor(context.Background(), ports.IsAncestorSpec{
+				Owner: "acme", Repo: "widgets", Ancestor: "sha-old", Descendant: "sha-new", Token: "gho_realtoken",
+			})
+			if err != nil {
+				t.Fatalf("IsAncestor() error = %v, want nil", err)
+			}
+			if !isAncestor {
+				t.Errorf("IsAncestor() = false, want true (GitHub status %q)", status)
+			}
+			if gotPath != "/repos/acme/widgets/compare/sha-old...sha-new" {
+				t.Errorf("request path = %q, want %q", gotPath, "/repos/acme/widgets/compare/sha-old...sha-new")
+			}
+			if gotAuth != "Bearer gho_realtoken" {
+				t.Errorf("Authorization header = %q, want %q", gotAuth, "Bearer gho_realtoken")
+			}
+			if gotAccept != "application/vnd.github+json" {
+				t.Errorf("Accept header = %q, want %q (GitHub's own default JSON shape, never the diff media type)", gotAccept, "application/vnd.github+json")
+			}
+		})
+	}
+}
+
+// TestIsAncestor_BehindOrDiverged_ReportsFalse is
+// TestIsAncestor_IdenticalOrAhead_ReportsTrue's own negative-space
+// sibling: "behind" (the reverse relationship) and "diverged" (neither
+// contains the other) both report false.
+func TestIsAncestor_BehindOrDiverged_ReportsFalse(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []string{"behind", "diverged"} {
+		t.Run(status, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": status})
+			}))
+			defer server.Close()
+
+			adapter := githubapi.New(server.Client(), server.URL)
+
+			isAncestor, err := adapter.IsAncestor(context.Background(), ports.IsAncestorSpec{
+				Owner: "acme", Repo: "widgets", Ancestor: "sha-old", Descendant: "sha-new", Token: "gho_realtoken",
+			})
+			if err != nil {
+				t.Fatalf("IsAncestor() error = %v, want nil", err)
+			}
+			if isAncestor {
+				t.Errorf("IsAncestor() = true, want false (GitHub status %q)", status)
+			}
+		})
+	}
+}
+
+// TestIsAncestor_EscapesOwnerRepoAndCommits mirrors this file's own
+// established escaping-discipline precedent (e.g.
+// TestResolveBranchSHA_EscapesOwnerRepoAndBranch) for the compare
+// endpoint's own three path segments.
+func TestIsAncestor_EscapesOwnerRepoAndCommits(t *testing.T) {
+	t.Parallel()
+
+	var gotEscapedPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotEscapedPath = r.URL.EscapedPath()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ahead"})
+	}))
+	defer server.Close()
+
+	adapter := githubapi.New(server.Client(), server.URL)
+
+	_, err := adapter.IsAncestor(context.Background(), ports.IsAncestorSpec{
+		Owner: "acme/evil", Repo: "widgets#v1", Ancestor: "sha-old", Descendant: "sha-new", Token: "gho_realtoken",
+	})
+	if err != nil {
+		t.Fatalf("IsAncestor() error = %v, want nil", err)
+	}
+
+	want := "/repos/acme%2Fevil/widgets%23v1/compare/sha-old...sha-new"
+	if gotEscapedPath != want {
+		t.Errorf("request EscapedPath = %q, want %q (owner/repo must be escaped, not interpolated raw)", gotEscapedPath, want)
+	}
+}
+
+// TestIsAncestor_4xxMapsToRealError mirrors TestResolveBranchSHA_
+// 4xxMapsToRealError one method further.
+func TestIsAncestor_4xxMapsToRealError(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]any{"message": "Not Found"})
+	}))
+	defer server.Close()
+
+	adapter := githubapi.New(server.Client(), server.URL)
+
+	_, err := adapter.IsAncestor(context.Background(), ports.IsAncestorSpec{
+		Owner: "acme", Repo: "widgets", Ancestor: "sha-old", Descendant: "sha-new", Token: "gho_realtoken",
+	})
+	if err == nil {
+		t.Fatal("IsAncestor() error = nil, want a *githubapi.APIError")
+	}
+	var apiErr *githubapi.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("IsAncestor() error = %v (%T), want *githubapi.APIError", err, err)
+	}
+	if apiErr.Status != http.StatusNotFound {
+		t.Errorf("APIError.Status = %d, want %d", apiErr.Status, http.StatusNotFound)
+	}
+}
+
 // TestResolveContractsFingerprint_DirectoryExists proves a real contents
 // listing (several files) fingerprints to EXACTLY contractdrift.
 // Fingerprint's own output over the identical path->sha map -- proving

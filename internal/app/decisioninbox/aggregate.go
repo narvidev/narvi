@@ -493,7 +493,7 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 		item.Kind = decisioninbox.KindNeedsReview
 	default:
 		platformAuthored := isPlatformAuthored(ctx, deps, pr.HTMLURL)
-		eligible := computeRealEligibility(ctx, deps, repoFullName, pr, ciGreen, hasNeedsHuman)
+		eligible := computeRealEligibility(ctx, deps, repoFullName, pr, ciGreen, hasNeedsHuman, token, now)
 		// HasChangesRequested is a HARD merge blocker at RevalidateForMerge
 		// (revalidate.go) but was previously never consulted HERE -- so such a PR sat
 		// in the TOP ready_to_merge section with a Merge button that
@@ -556,7 +556,15 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 // disagreed (HasChangesRequested, or a needs-human label), computed here
 // because this call site already has every fact needed at zero extra
 // cost.
-func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string, pr ports.OpenPR, ciGreen, hasNeedsHuman bool) bool {
+//
+// token/now (D2, second adversarial-review round) back this function's
+// OWN live base-branch-tip resolution, below -- see that call site's own
+// doc comment for the full "why" (this used to compare pr.BaseSHA,
+// GitHub's own per-PR CACHED snapshot, against a verdict's own
+// live-resolved context: two values of a DIFFERENT kind that compared
+// unequal by construction, the exact same class of hazard finding F1
+// closed for revalidateCore one file over).
+func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string, pr ports.OpenPR, ciGreen, hasNeedsHuman bool, token string, now time.Time) bool {
 	record, hasVerdict, err := appreviewverdict.GetLatest(ctx, deps.ReviewVerdict, repoFullName, int32(pr.Number))
 	if err != nil {
 		platform.Logger(ctx).Error("decisioninbox: get latest review verdict failed -- failing closed (not eligible)", "error", err, "repo", repoFullName, "pr_number", pr.Number)
@@ -636,30 +644,92 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// eligibleIgnoringHumanSignals, which is exactly "would the engine
 	// have approved this on its own criteria", independent of which
 	// human-disagreement signal (if any) is ALSO present.
+	// currentBaseSHA (D2, second adversarial-review round) is the base
+	// branch's LIVE tip, resolved fresh through deps.SCMCache -- NEVER
+	// pr.BaseSHA (ports.OpenPR.BaseSHA's own doc comment: GitHub's own
+	// per-PR CACHED "base.sha" snapshot, refreshed on GitHub's own
+	// schedule rather than on every push to the base branch, verified to
+	// lag the branch's real tip by an unknown, sometimes month-scale
+	// margin). Before this fix, this call site was the LAST remaining
+	// consumer of pr.BaseSHA for an eligibility comparison: revalidateCore
+	// (revalidate.go, finding F1) already resolves this SAME kind of
+	// value for the identical reason, one file over -- comparing this
+	// function's own cached snapshot against a verdict's own live-resolved
+	// context compared two values of a DIFFERENT KIND, unequal by
+	// construction, exactly the hazard F1 closed for the OTHER
+	// ComputeEligible call site. SCMCache.ResolveBranchSHA (unlike
+	// revalidateCore's own direct, uncached sourceControl.ResolveBranchSHA
+	// call) caches this read for DecisionInboxSCMCacheTTL -- correct here,
+	// never there, because this function backs a READ MODEL (§16.2: "SCM
+	// data is cached with a short TTL... never presented as live truth"),
+	// while revalidateCore backs an ACTION endpoint (merge) that needs an
+	// instantaneous-fresh read regardless of any cache's own TTL.
+	//
+	// A resolution failure degrades to an empty currentBaseSHA, mirroring
+	// revalidateCore's own identical "fails CLOSED... autoapproval.
+	// ComputeEligible's own empty-base-sha guard (finding F2) then refuses
+	// on its own distinct reason" precedent -- never a second,
+	// independently-invented fail-closed path.
+	currentBaseSHA, _, baseSHAErr := deps.SCMCache.ResolveBranchSHA(ctx, ports.ResolveBranchSHASpec{
+		Owner:  pr.Owner,
+		Repo:   pr.Repo,
+		Branch: pr.BaseRef,
+		Token:  token,
+	}, now)
+	if baseSHAErr != nil {
+		platform.Logger(ctx).Warn("decisioninbox: resolve live base branch sha failed, base-freshness check will fail closed via ReasonBaseSHAUnknown", "error", baseSHAErr, "repo", repoFullName, "pr_number", pr.Number)
+		currentBaseSHA = ""
+	}
+
+	// baseAdvancedWithoutRewrite (D3, second adversarial-review round)
+	// mirrors revalidateCore's own identical wiring (revalidate.go) -- see
+	// that call site's own doc comment for the full "why" and the
+	// preconditions gating this call. Cached via deps.SCMCache.IsAncestor,
+	// exactly like currentBaseSHA immediately above, for the identical
+	// read-model-vs-action-endpoint reason.
+	var baseAdvancedWithoutRewrite bool
+	if record.Context.BaseRef == pr.BaseRef && record.Context.BaseSHA != "" && currentBaseSHA != "" && record.Context.BaseSHA != currentBaseSHA {
+		confirmed, ancestorErr := deps.SCMCache.IsAncestor(ctx, ports.IsAncestorSpec{
+			Owner:      pr.Owner,
+			Repo:       pr.Repo,
+			Ancestor:   record.Context.BaseSHA,
+			Descendant: currentBaseSHA,
+			Token:      token,
+		}, now)
+		if ancestorErr != nil {
+			platform.Logger(ctx).Warn("decisioninbox: resolve base-advanced-without-rewrite ancestry failed, base-freshness check will fail closed via ReasonBaseMoved", "error", ancestorErr, "repo", repoFullName, "pr_number", pr.Number)
+		} else {
+			baseAdvancedWithoutRewrite = confirmed
+		}
+	}
+
 	// VerdictAssessed/VerdictBaseRef/VerdictBaseSHA/VerdictAncestorChain/
-	// VerdictPolicyVersion and CurrentBaseRef/CurrentBaseSHA/
-	// CurrentAncestorChain (§21.1's amendment) mirror revalidateCore's
-	// own identical wiring (revalidate.go) -- record.Context is the SAME
-	// review_verdicts row record.HeadSHA already came from, and pr is
-	// this function's own already-fetched, live ports.OpenPR (no new
-	// I/O), exactly like pr.HeadSHA itself.
+	// VerdictPolicyVersion and CurrentBaseRef/CurrentAncestorChain
+	// (§21.1's amendment) mirror revalidateCore's own identical wiring
+	// (revalidate.go) -- record.Context is the SAME review_verdicts row
+	// record.HeadSHA already came from, and pr is this function's own
+	// already-fetched, live ports.OpenPR (no new I/O), exactly like
+	// pr.HeadSHA itself. CurrentBaseSHA is the one exception -- see that
+	// variable's own doc comment immediately above for why it is NOT
+	// pr.BaseSHA.
 	eligibleIgnoringHumanSignals, _ := autoapproval.ComputeEligible(autoapproval.EligibilityInput{
-		Verdict:                 record.Verdict,
-		VerdictAssessed:         true,
-		VerdictHeadSHA:          record.HeadSHA,
-		VerdictBaseRef:          record.Context.BaseRef,
-		VerdictBaseSHA:          record.Context.BaseSHA,
-		VerdictAncestorChain:    record.Context.AncestorChain,
-		VerdictPolicyVersion:    record.Context.PolicyVersion,
-		CurrentHeadSHA:          pr.HeadSHA,
-		CurrentBaseRef:          pr.BaseRef,
-		CurrentBaseSHA:          pr.BaseSHA,
-		CurrentAncestorChain:    convertAncestorChain(pr.AncestorChain),
-		CIGreen:                 ciGreen,
-		HasNeedsHumanLabel:      false,
-		ChangedFileCount:        changedFileCount,
-		TouchedBlastRadius:      touchedBlastRadius,
-		TouchedBlastRadiusKnown: touchedBlastRadiusKnown,
+		Verdict:                    record.Verdict,
+		VerdictAssessed:            true,
+		VerdictHeadSHA:             record.HeadSHA,
+		VerdictBaseRef:             record.Context.BaseRef,
+		VerdictBaseSHA:             record.Context.BaseSHA,
+		VerdictAncestorChain:       record.Context.AncestorChain,
+		VerdictPolicyVersion:       record.Context.PolicyVersion,
+		CurrentHeadSHA:             pr.HeadSHA,
+		CurrentBaseRef:             pr.BaseRef,
+		CurrentBaseSHA:             currentBaseSHA,
+		CurrentAncestorChain:       convertAncestorChain(pr.AncestorChain),
+		BaseAdvancedWithoutRewrite: baseAdvancedWithoutRewrite,
+		CIGreen:                    ciGreen,
+		HasNeedsHumanLabel:         false,
+		ChangedFileCount:           changedFileCount,
+		TouchedBlastRadius:         touchedBlastRadius,
+		TouchedBlastRadiusKnown:    touchedBlastRadiusKnown,
 	}, cfg)
 	eligible := eligibleIgnoringHumanSignals && !hasNeedsHuman
 

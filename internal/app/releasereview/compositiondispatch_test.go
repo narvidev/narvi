@@ -13,9 +13,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/releasereview"
-	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
-	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -260,30 +258,23 @@ func TestRun_AggregateReviewTriggered_DispatchesCompositionReviewTurn(t *testing
 	if turns.lastParams.ReviewHeadSha == nil || *turns.lastParams.ReviewHeadSha != "deadbeef" {
 		t.Errorf("inserted turn ReviewHeadSha = %v, want \"deadbeef\"", turns.lastParams.ReviewHeadSha)
 	}
-	// finding F7 (§21.1's amendment): this turn must ALSO carry review_verdict_context
-	// -- the SAME asymmetry fix as review_head_sha above, one column
-	// further. Before this fix, this turn was inserted with ReviewHeadSha
-	// set and ReviewVerdictContext left nil -- a verdict posted while this
-	// exact turn is processing would get a real head sha and a NULL base/
-	// ancestor/policy context, so autoapproval.ComputeEligible would answer
-	// ReasonContextUnknown for it forever, permanently blocking
-	// auto-approval/auto-merge for this release PR no matter how clean its
-	// own verdict looked.
-	if len(turns.lastParams.ReviewVerdictContext) == 0 {
-		t.Fatal("inserted turn ReviewVerdictContext is nil/empty, want the real fetched base ref/sha/policy version -- this turn can never be auto-approved/auto-merged without it (finding F7)")
-	}
-	var gotContext reviewverdict.Context
-	if err := json.Unmarshal(turns.lastParams.ReviewVerdictContext, &gotContext); err != nil {
-		t.Fatalf("unmarshal inserted turn ReviewVerdictContext: %v", err)
-	}
-	if gotContext.BaseRef != "main" {
-		t.Errorf("inserted turn ReviewVerdictContext.BaseRef = %q, want %q", gotContext.BaseRef, "main")
-	}
-	if gotContext.BaseSHA != "main-tip-sha" {
-		t.Errorf("inserted turn ReviewVerdictContext.BaseSHA = %q, want %q", gotContext.BaseSHA, "main-tip-sha")
-	}
-	if gotContext.PolicyVersion != autoapproval.CurrentPolicyVersion {
-		t.Errorf("inserted turn ReviewVerdictContext.PolicyVersion = %d, want %d", gotContext.PolicyVersion, autoapproval.CurrentPolicyVersion)
+	// D5 (second adversarial-review round): this turn must carry NO
+	// review_verdict_context -- reverting F7's own addition from the
+	// first round (F7's premise was that leaving it NULL "permanently
+	// blocks auto-approval/auto-merge for release composition-review
+	// turns", but this turn's own prompt, asserted above, instructs the
+	// agent to post to the SEPARATE composition-findings tool, never
+	// httpapi.PostReviewVerdict -- the ONE reader of
+	// turns.review_verdict_context anywhere in this codebase -- so no
+	// request for this turn could ever present the dispatch-message-id
+	// PostReviewVerdict would need to read it back by, and §15.4/
+	// decisioninbox.buildPROpenItem's own isReleaseCut branch mean no
+	// release-cut PR ever reaches autoapproval.ComputeEligible at all
+	// regardless). A column written here and read by nothing is exactly
+	// the defect D5 names -- this asserts the write was removed, not
+	// merely that it once existed.
+	if len(turns.lastParams.ReviewVerdictContext) != 0 {
+		t.Errorf("inserted turn ReviewVerdictContext = %q, want nil/empty (D5: no request for this turn can ever present a dispatch-message-id PostReviewVerdict -- the one reader of this column -- could resolve it by, and no release-cut PR ever reaches the eligibility engine this column would feed)", turns.lastParams.ReviewVerdictContext)
 	}
 	if dispatch.calls != 1 {
 		t.Fatalf("CompositionDispatch.EnsureDispatched calls = %d, want 1", dispatch.calls)

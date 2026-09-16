@@ -558,6 +558,52 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		}
 	})
 
+	// D3 (second adversarial-review round): "any unrelated merge to trunk
+	// permanently disqualifies a verdict" -- the EXACT SAME base-tip
+	// movement as BaseBranchAdvanced_LiveTipMovedWhileGitHubsCachedBaseSHAFieldDidNot_Refused
+	// immediately above, but this time the fake's own IsAncestor call
+	// CONFIRMS the movement was a pure fast-forward (an ordinary,
+	// unrelated merge landing on the base branch, never a rewrite) --
+	// RevalidateForMerge must NOT refuse it. This is what makes auto-merge
+	// able to regain eligibility through an ordinary sequence of events
+	// rather than being stuck the moment any base movement is observed at
+	// all.
+	t.Run("BaseBranchAdvanced_ConfirmedFastForward_NotRefused", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-base-branch-advanced-confirmed"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 34)
+		rs.sourceControl.resolveBranchSHA = "sha-main-has-actually-advanced"
+		rs.sourceControl.isAncestorResult = true
+		// The PRECEDING subtest (BaseBranchAdvanced_LiveTipMovedWhile...)
+		// ALSO triggers an IsAncestor call against the SAME shared fake --
+		// reset here, at the START, rather than relying solely on that
+		// subtest's own defer/ordering to have cleared it first.
+		rs.sourceControl.isAncestorCalls = nil
+		defer func() {
+			rs.sourceControl.resolveBranchSHA = ""
+			rs.sourceControl.isAncestorResult = false
+			rs.sourceControl.isAncestorCalls = nil
+		}()
+
+		ok, headSHA, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+		}
+		if !ok {
+			t.Fatalf("RevalidateForMerge() ok = false, reason = %q, want true -- D3: a base movement CONFIRMED as a pure fast-forward must not refuse an otherwise-eligible PR", reason)
+		}
+		if headSHA != pr.HeadSHA {
+			t.Errorf("headSHA = %q, want %q", headSHA, pr.HeadSHA)
+		}
+		if len(rs.sourceControl.isAncestorCalls) != 1 {
+			t.Fatalf("IsAncestor called %d times, want 1", len(rs.sourceControl.isAncestorCalls))
+		}
+		gotCall := rs.sourceControl.isAncestorCalls[0]
+		if gotCall.Ancestor != testEligibleBaseSHA || gotCall.Descendant != "sha-main-has-actually-advanced" {
+			t.Errorf("IsAncestor(Ancestor, Descendant) = (%q, %q), want (%q, %q) -- the verdict's OWN recorded base sha as the candidate ancestor, the LIVE resolved tip as the descendant",
+				gotCall.Ancestor, gotCall.Descendant, testEligibleBaseSHA, "sha-main-has-actually-advanced")
+		}
+	})
+
 	// RevalidateForMerge's own
 	// truncated->500 branch was never executed by any existing test --
 	// when the target PR is not found in a TRUNCATED (partial/degraded)

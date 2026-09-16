@@ -509,6 +509,45 @@ func (a *Adapter) ResolveBranchSHA(ctx context.Context, spec ports.ResolveBranch
 	return commit.SHA, branch, nil
 }
 
+// isAncestorCompareResponse is the ONE field this method needs out of
+// GitHub's real GET /repos/{owner}/{repo}/compare/{base}...{head}
+// response, requested in GitHub's own DEFAULT JSON shape (doGet's own
+// Accept header) -- the SAME endpoint GetCompareDiff above targets, just
+// content-negotiated differently (that method requests raw diff text via
+// diffAcceptHeader; this one wants the ordinary JSON envelope, exactly
+// like mergedbetween.go's own compareResponse does one struct up).
+// GitHub's documented values: "identical" (same commit), "ahead" (head
+// contains every commit base does, plus more -- i.e. base IS an ancestor
+// of head), "behind" (the reverse), "diverged" (neither contains the
+// other).
+type isAncestorCompareResponse struct {
+	Status string `json:"status"`
+}
+
+// IsAncestor implements ports.SourceControl (D3, second adversarial-
+// review round) -- see that port method's own doc comment for the full
+// "why" (the base-freshness gate's own fast-forward tolerance). Reuses
+// the SAME compare-two-commits endpoint GetCompareDiff/ListMergedBetween
+// already call, in GitHub's own default JSON shape, reading only
+// "status": spec.Ancestor is an ancestor of (or identical to)
+// spec.Descendant exactly when GitHub reports "identical" or "ahead" for
+// compare(base=Ancestor, head=Descendant) -- "behind"/"diverged" both
+// mean it is not.
+func (a *Adapter) IsAncestor(ctx context.Context, spec ports.IsAncestorSpec) (bool, error) {
+	path := fmt.Sprintf("%s/repos/%s/%s/compare/%s...%s", a.apiBaseURL, url.PathEscape(spec.Owner), url.PathEscape(spec.Repo), url.PathEscape(spec.Ancestor), url.PathEscape(spec.Descendant))
+	body, err := a.doGet(ctx, path, spec.Token)
+	if err != nil {
+		return false, fmt.Errorf("githubapi: is ancestor: compare %s...%s: %w", spec.Ancestor, spec.Descendant, err)
+	}
+
+	var parsed isAncestorCompareResponse
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return false, fmt.Errorf("githubapi: is ancestor: decode compare response: %w", err)
+	}
+
+	return parsed.Status == "identical" || parsed.Status == "ahead", nil
+}
+
 // CheckRepoAccess implements ports.SourceControl (audit fix, "warm-boot
 // image access control"): answers "can spec.Token read this repo at all"
 // via the SAME GET https://api.github.com/repos/{owner}/{repo} call
@@ -682,16 +721,25 @@ type pullRequestResponse struct {
 	// reason (H5's head-branch resolution). Never nullable on a real
 	// GitHub PR resource (unlike Head.Repo, a base branch/repo can never
 	// be deleted while the PR referencing it is open/merged).
-	// SHA (§21.1's amendment) is this PR's own CURRENT base commit --
-	// PREVIOUSLY never decoded at all, which is the exact gap that
-	// amendment names: "the GitHub decoder reads base.ref while never
-	// reading base.sha at all." Reading it alone does not fix the hazard
-	// (a decoded value nothing yet compares is inert) -- see
-	// PullRequest.BaseSHA's own doc comment below for what actually
-	// consumes it.
+	//
+	// D11 (second adversarial-review round): this struct deliberately
+	// decodes ONLY "ref", never GitHub's own "base.sha" -- §21.1's
+	// amendment originally added a SHA field here (and on the exported
+	// PullRequest.BaseSHA below) to close "the GitHub decoder reads
+	// base.ref while never reading base.sha at all", but the ONE call
+	// site that would have consumed it (internal/app/reviewcontext.Fetch)
+	// was built, from the start, to deliberately NEVER read it -- that
+	// package's own doc comment names this exact field and explains why
+	// it always resolves the base branch's LIVE tip via ResolveBranchSHA
+	// instead (a per-PR GetPullRequest response caches base.sha on
+	// GitHub's own schedule, verified to lag the branch's real tip). A
+	// decoded-but-unread field is worse than no field at all -- a second
+	// adapter author implementing this same port could reasonably assume
+	// it feeds the freshness gate, when nothing here ever has. Removed
+	// rather than merely documented: there is no other legitimate
+	// consumer to preserve it for.
 	Base struct {
 		Ref string `json:"ref"`
-		SHA string `json:"sha"`
 	} `json:"base"`
 
 	// Labels (§15.1) is this PR's own CURRENT label set --
@@ -788,16 +836,21 @@ type PullRequest struct {
 	HeadRepoName     string
 	HeadRepoCloneURL string
 	// BaseRef (§15.1) is this PR's own real base branch name.
+	//
+	// D11 (second adversarial-review round): this struct previously also
+	// carried a BaseSHA field (GitHub's own per-PR-cached "base.sha")
+	// alongside this one -- removed, never renamed/repurposed, because it
+	// was decoded and populated but read by nothing: internal/app/
+	// reviewcontext.Fetch, the one call site review.PreFetchedContext.
+	// BaseSHA's own doc comment named as its consumer, was built from the
+	// start to deliberately NEVER read it, always resolving the base
+	// branch's LIVE tip via ResolveBranchSHA instead (this exact cached
+	// field is verified to lag a branch's real tip by an unknown,
+	// sometimes month-scale margin -- see reviewcontext.Fetch's own doc
+	// comment for the full "why"). See pullRequestResponse.Base's own doc
+	// comment, above GetPullRequest, for the parallel removal at the wire-
+	// decode layer.
 	BaseRef string
-	// BaseSHA (§21.1's amendment) is the commit BaseRef resolved to at
-	// the moment this response was fetched -- internal/app/reviewcontext.
-	// Fetch's own source for review.PreFetchedContext.BaseSHA, persisted
-	// turn-scoped and compared, at verdict-eligibility time, against the
-	// PR's own CURRENT base commit: "a PR evaluated while based on
-	// another PR's branch, then retargeted -- or whose parent moved
-	// beneath it -- keeps an unchanged head" is exactly the hazard this
-	// field, previously never decoded at all, closes.
-	BaseSHA string
 	// Labels (§15.1) is this PR's own current label names.
 	Labels []string
 	// Stack is non-nil exactly when this PR belongs to a GitHub-native
@@ -864,7 +917,6 @@ func (a *Adapter) GetPullRequest(ctx context.Context, owner, repo string, number
 		HeadRef:      parsed.Head.Ref,
 		HeadSHA:      parsed.Head.SHA,
 		BaseRef:      parsed.Base.Ref,
-		BaseSHA:      parsed.Base.SHA,
 		Additions:    parsed.Additions,
 		Deletions:    parsed.Deletions,
 		ChangedFiles: parsed.ChangedFiles,

@@ -2,7 +2,6 @@ package releasereview
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -10,7 +9,6 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
 	"github.com/narvidev/narvi/internal/domain/review"
-	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 )
 
 // This file (compositiondispatch.go) closes a named gap:
@@ -107,40 +105,34 @@ func dispatchCompositionReview(ctx context.Context, logger *slog.Logger, deps De
 
 	prompt := review.RenderCompositionReviewPrompt(template, reviewCtx)
 
-	// reviewVerdictContextJSON (finding F7 (§21.1's amendment)) mirrors
-	// reviewCtx.HeadSHA's own identical "already resolved by the SAME
-	// reviewcontext.Fetch call above, just marshaled and persisted here"
-	// shape -- see internal/app/sessionactor/reviewretrigger.go's own
-	// insertAutoRetriggerTurn call site (and internal/adapters/inbound/
-	// github/handler.go before it) for the identical pattern this mirrors.
-	// Before this fix, this turn carried review_head_sha but no
-	// review_verdict_context at all: a verdict posted while THIS turn is
-	// processing would get a real head sha and a NULL base/ancestor/
-	// policy context, so autoapproval.ComputeEligible answers
-	// ReasonContextUnknown for it forever -- this composition-review PR
-	// could never be auto-approved/auto-merged, no matter how clean its
-	// own verdict looked, and the operator-facing reason would misleadingly
-	// read "this verdict predates review-context tracking" for a turn
-	// created moments ago.
-	reviewVerdictContextJSON, verdictContextErr := json.Marshal(reviewverdict.Context{
-		BaseRef:       reviewCtx.BaseRef,
-		BaseSHA:       reviewCtx.BaseSHA,
-		AncestorChain: reviewCtx.AncestorChain,
-		PolicyVersion: reviewCtx.PolicyVersion,
-	})
-	if verdictContextErr != nil {
-		logger.Warn("releasereview: marshal review verdict context failed, composition review turn will carry review_head_sha but no review_verdict_context",
-			"error", verdictContextErr, "owner", in.Owner, "repo", in.Repo, "pr_number", in.PRNumber)
-		reviewVerdictContextJSON = nil
-	}
-
+	// review_verdict_context is deliberately NOT set on this turn (D5,
+	// second adversarial-review round -- reverting F7's own addition from
+	// the first round). F7's premise was that leaving it NULL "permanently
+	// blocks auto-approval/auto-merge for release composition-review
+	// turns" -- but a composition-review turn never reaches that gate at
+	// all: this prompt (RenderCompositionReviewPrompt/
+	// compositionFindingsToolInstructions, above) instructs the agent to
+	// post to the SEPARATE composition-findings tool, never
+	// httpapi.PostReviewVerdict -- no request for this turn ever carries
+	// an X-Sandbox-Dispatch-Message-Id header PostReviewVerdict could
+	// resolve it by, so review_verdict_context could never be read back
+	// regardless of what it held. More fundamentally, §15.4 gives a
+	// composition pass no Shippable/premise/risk score to feed
+	// autoapproval.ComputeEligible in the first place, and
+	// decisioninbox.buildPROpenItem's own isReleaseCut branch (aggregate.go)
+	// routes every release-cut PR straight to KindNeedsReview WITHOUT ever
+	// calling computeRealEligibility -- "a release cut is ALWAYS a
+	// human-judgment row, never auto-merge-eligible". A column written
+	// here and read by nothing is exactly the defect this repository keeps
+	// finding (D5's own framing) -- the fix is to stop writing it, not to
+	// invent a read path for a value no eligibility check will ever
+	// consult.
 	created, err := deps.CompositionTurns.Create(ctx, sqlcgen.CreateTurnParams{
-		SessionID:            in.SessionID,
-		Status:               sqlcgen.TurnStatusPending,
-		Prompt:               &prompt,
-		ReviewHeadSha:        &reviewCtx.HeadSHA,
-		ReviewVerdictContext: reviewVerdictContextJSON,
-		CorrelationID:        in.CorrelationID,
+		SessionID:     in.SessionID,
+		Status:        sqlcgen.TurnStatusPending,
+		Prompt:        &prompt,
+		ReviewHeadSha: &reviewCtx.HeadSHA,
+		CorrelationID: in.CorrelationID,
 	})
 	if err != nil {
 		logger.Error("releasereview: insert composition review turn failed",

@@ -192,9 +192,35 @@ type fakeDecisionInboxSourceControl struct {
 	// stay exactly as they were.
 	resolveBranchSHA    string
 	resolveBranchSHAErr error
+
+	// isAncestorResult/isAncestorErr/isAncestorCalls (D3, second
+	// adversarial-review round) back IsAncestor below -- the fast-forward
+	// tolerance the base-freshness gate now applies when a verdict's own
+	// recorded base sha differs from the live tip but the base REF is
+	// unchanged. Zero value (false, nil) reproduces this codebase's own
+	// PRE-D3 behavior exactly (any base sha mismatch refuses, regardless
+	// of ancestry) -- every EXISTING test in this file that never sets
+	// this field is therefore unaffected by D3's own addition. A test
+	// proving the D3 fix sets isAncestorResult = true to simulate an
+	// unrelated, purely-forward merge to the base branch.
+	isAncestorResult bool
+	isAncestorErr    error
+	isAncestorCalls  []ports.IsAncestorSpec
 }
 
 var _ ports.SourceControl = (*fakeDecisionInboxSourceControl)(nil)
+
+// IsAncestor (D3, second adversarial-review round) reports
+// isAncestorResult/isAncestorErr, recording every call it receives so a
+// test can assert WHICH (ancestor, descendant) pair was actually
+// compared -- mirrors this fake's own codeOwnersCalls precedent.
+func (f *fakeDecisionInboxSourceControl) IsAncestor(_ context.Context, spec ports.IsAncestorSpec) (bool, error) {
+	f.isAncestorCalls = append(f.isAncestorCalls, spec)
+	if f.isAncestorErr != nil {
+		return false, f.isAncestorErr
+	}
+	return f.isAncestorResult, nil
+}
 
 func (f *fakeDecisionInboxSourceControl) ListOpenPRsForUser(_ context.Context, spec ports.ListOpenPRsForUserSpec) ([]ports.OpenPR, bool, error) {
 	if f.openPRsErr != nil {
@@ -1791,6 +1817,156 @@ func TestBuild_EligibilityConfigStoreError_DemotesFromReadyToMerge(t *testing.T)
 	}
 	if item.Kind == decisioninboxdomain.KindReadyToMerge {
 		t.Error("Kind = ready_to_merge, want needs_review -- an eligibility-config store error must fail CLOSED (never substitute the engine's own wider defaults for this repo's own configured policy)")
+	}
+}
+
+// TestBuild_BaseBranchAdvanced_LiveTipMoved_DemotesFromReadyToMerge is D2's
+// own regression test (second adversarial-review round) at the
+// READ-MODEL level -- computeRealEligibility's (aggregate.go) own sibling
+// of revalidate_integration_test.go's identical
+// "BaseBranchAdvanced_LiveTipMovedWhileGitHubsCachedBaseSHAFieldDidNot_Refused"
+// case for RevalidateForMerge. Before this fix, computeRealEligibility
+// was the LAST remaining ComputeEligible call site still comparing
+// pr.BaseSHA (GitHub's own per-PR CACHED snapshot, frozen here at
+// testEligibleBaseSHA, matching the verdict's own recorded context
+// EXACTLY) against itself -- detecting nothing, no matter how far the
+// base branch's real tip had actually moved, so a PR reviewed while based
+// on another PR's branch (then retargeted) or whose parent moved beneath
+// it could render ready_to_merge in the inbox from a stale verdict. The
+// base ref and GitHub's own cached base.sha field are BOTH left exactly
+// as buildEligibleReadyToMergeFixture seeds them -- only the fake's own
+// live ResolveBranchSHA response (what SCMCache.ResolveBranchSHA now
+// calls through to) reports a different commit, simulating the real
+// branch tip having advanced.
+func TestBuild_BaseBranchAdvanced_LiveTipMoved_DemotesFromReadyToMerge(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "5005"
+	const repoFullName = "acme/build-base-branch-advanced"
+
+	actor, fakeSCM := buildEligibleReadyToMergeFixture(ctx, t, pool, tokenKey, "d2-actor@example.com", actorGitHubExternalID, repoFullName, 62)
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict: appreviewverdict.Deps{
+			ReviewVerdicts: narvipg.NewReviewVerdictStore(pool), RepoSettings: narvipg.NewRepoSettingsStore(pool),
+			ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool),
+			Timeouts: platform.DefaultTimeouts(),
+		},
+	}
+
+	// Positive control, proving the fixture itself is genuinely
+	// ready_to_merge-eligible before this test's own perturbation --
+	// otherwise a broken fixture demoting it for some UNRELATED reason
+	// would pass this test for the wrong one.
+	t0 := time.Now()
+	before, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, t0)
+	if err != nil {
+		t.Fatalf("Build() (control) error = %v, want nil", err)
+	}
+	itemBefore := findItemByPR(before.Items, 62)
+	if itemBefore == nil || itemBefore.Kind != decisioninboxdomain.KindReadyToMerge {
+		t.Fatalf("precondition: PR #62 Kind = %v, want ready_to_merge before the base branch perturbation below", itemBefore)
+	}
+
+	fakeSCM.resolveBranchSHA = "sha-main-has-actually-advanced"
+	// t1 is deliberately past DecisionInboxSCMCacheTTL from t0: deps.
+	// SCMCache is the SAME instance across both Build calls (exactly like
+	// production, where one long-lived cache serves many requests), so a
+	// second call within the TTL would silently serve the FIRST call's
+	// own already-cached ResolveBranchSHA result regardless of what the
+	// fake now reports -- this advances the clock far enough that the
+	// cached entry has genuinely expired, forcing a fresh live read.
+	t1 := t0.Add(platform.DefaultTimeouts().DecisionInboxSCMCacheTTL + time.Minute)
+
+	after, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, t1)
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil", err)
+	}
+	itemAfter := findItemByPR(after.Items, 62)
+	if itemAfter == nil {
+		t.Fatal("PR #62 missing from the inbox entirely, want present as needs_review")
+	}
+	if itemAfter.Kind == decisioninboxdomain.KindReadyToMerge {
+		t.Error("Kind = ready_to_merge, want needs_review -- D2: the base branch's real live tip advanced while GitHub's own cached base.sha field and the base ref both stayed frozen; comparing the cached field against itself detects nothing, so this read model must resolve the LIVE tip exactly like RevalidateForMerge already does")
+	}
+}
+
+// TestBuild_BaseBranchAdvanced_ConfirmedFastForward_StaysReadyToMerge is
+// D3's own regression test (second adversarial-review round) at the
+// READ-MODEL level -- computeRealEligibility's (aggregate.go) own sibling
+// of revalidate_integration_test.go's identical
+// "BaseBranchAdvanced_ConfirmedFastForward_NotRefused" case. The EXACT
+// SAME base-tip movement as TestBuild_BaseBranchAdvanced_LiveTipMoved_
+// DemotesFromReadyToMerge above, but this time the fake's own IsAncestor
+// call CONFIRMS the movement was a pure fast-forward (an ordinary,
+// unrelated merge landing on the base branch) -- the PR must NOT be
+// demoted. Without this, "any unrelated merge to trunk permanently
+// disqualifies a verdict" (D3's own named failure) would make auto-merge
+// effectively never fire in an active repository, since the inbox would
+// never even OFFER the row as ready_to_merge for a human to confirm.
+func TestBuild_BaseBranchAdvanced_ConfirmedFastForward_StaysReadyToMerge(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "5006"
+	const repoFullName = "acme/build-base-branch-advanced-confirmed"
+
+	actor, fakeSCM := buildEligibleReadyToMergeFixture(ctx, t, pool, tokenKey, "d3-actor@example.com", actorGitHubExternalID, repoFullName, 63)
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict: appreviewverdict.Deps{
+			ReviewVerdicts: narvipg.NewReviewVerdictStore(pool), RepoSettings: narvipg.NewRepoSettingsStore(pool),
+			ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool),
+			Timeouts: platform.DefaultTimeouts(),
+		},
+	}
+
+	t0 := time.Now()
+	before, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, t0)
+	if err != nil {
+		t.Fatalf("Build() (control) error = %v, want nil", err)
+	}
+	itemBefore := findItemByPR(before.Items, 63)
+	if itemBefore == nil || itemBefore.Kind != decisioninboxdomain.KindReadyToMerge {
+		t.Fatalf("precondition: PR #63 Kind = %v, want ready_to_merge before the base branch perturbation below", itemBefore)
+	}
+
+	fakeSCM.resolveBranchSHA = "sha-main-has-actually-advanced"
+	fakeSCM.isAncestorResult = true
+	// t1 past DecisionInboxSCMCacheTTL, exactly like the sibling test
+	// above -- deps.SCMCache is the SAME instance across both Build
+	// calls, so both the ResolveBranchSHA AND IsAncestor caches need this
+	// to genuinely re-fetch.
+	t1 := t0.Add(platform.DefaultTimeouts().DecisionInboxSCMCacheTTL + time.Minute)
+
+	after, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, t1)
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil", err)
+	}
+	itemAfter := findItemByPR(after.Items, 63)
+	if itemAfter == nil {
+		t.Fatal("PR #63 missing from the inbox entirely, want present")
+	}
+	if itemAfter.Kind != decisioninboxdomain.KindReadyToMerge {
+		t.Errorf("Kind = %v, want ready_to_merge -- D3: a base movement CONFIRMED as a pure fast-forward (an unrelated merge to trunk) must not demote an otherwise-eligible PR out of ready_to_merge", itemAfter.Kind)
+	}
+	if len(fakeSCM.isAncestorCalls) == 0 {
+		t.Error("IsAncestor was never called -- the ancestry-tolerance check must actually run when the base sha differs under an unchanged ref")
 	}
 }
 

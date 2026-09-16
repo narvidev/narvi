@@ -35,12 +35,19 @@
 //     (§21.1's amendment, stated because head equality alone is NOT
 //     sufficient): VerdictBaseRef == "" means no context was ever
 //     recorded (a pre-amendment row) and fails as UNKNOWN; otherwise
-//     VerdictBaseRef/VerdictBaseSHA must equal CurrentBaseRef/
-//     CurrentBaseSHA, VerdictAncestorChain must equal
-//     CurrentAncestorChain (order-sensitive), and VerdictPolicyVersion
-//     must equal CurrentPolicyVersion. Any mismatch refuses -- this is
-//     what catches a PR retargeted onto a different base, or whose
-//     parent moved beneath it, that CurrentHeadSHA alone cannot see.
+//     VerdictBaseRef must equal CurrentBaseRef, VerdictAncestorChain must
+//     equal CurrentAncestorChain (order-sensitive), and
+//     VerdictPolicyVersion must equal CurrentPolicyVersion. VerdictBaseSHA/
+//     CurrentBaseSHA are the ONE exception, refined by D3 (second
+//     adversarial-review round): they must be EQUAL, UNLESS
+//     BaseAdvancedWithoutRewrite confirms the difference is a pure
+//     fast-forward (an ordinary, unrelated commit landing on the base
+//     branch, never a rewrite) -- see that field's own doc comment
+//     (eligibility.go) for why tolerating this is sound and why a base
+//     REF change still refuses unconditionally regardless. Any OTHER
+//     mismatch refuses -- this is what catches a PR retargeted onto a
+//     different base, or whose parent moved beneath it via an actual
+//     rewrite, that CurrentHeadSHA alone cannot see.
 //  5. CIGreen -- must be true.
 //  6. Verdict.Shippable == review.ShippableAuto.
 //  7. EligibilityInput.ChangedFileCount <= cfg.MaxFilesChanged (diff

@@ -180,6 +180,14 @@ func (f *fakeMergeSourceControl) ResolveBranchSHA(_ context.Context, spec ports.
 	}
 	return "", "", fmt.Errorf("fakeMergeSourceControl: ResolveBranchSHA: no seeded PR reports base ref %q", spec.Branch)
 }
+
+// IsAncestor (D3, second adversarial-review round) is never exercised by
+// this file's own tests (no test here perturbs resolveBranchSHA away
+// from a seeded PR's own matching BaseSHA) -- stubbed only for
+// ports.SourceControl interface satisfaction.
+func (f *fakeMergeSourceControl) IsAncestor(context.Context, ports.IsAncestorSpec) (bool, error) {
+	return false, nil
+}
 func (f *fakeMergeSourceControl) ResolveContractsFingerprint(context.Context, ports.ResolveContractsFingerprintSpec) (string, bool, error) {
 	return "", false, errors.New("not implemented")
 }

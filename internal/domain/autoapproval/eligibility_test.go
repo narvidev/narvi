@@ -172,6 +172,36 @@ func TestComputeEligible(t *testing.T) {
 			wantEligible: false,
 			wantReason:   autoapproval.ReasonBaseMoved,
 		},
+		// --- D3 (second adversarial-review round): "any unrelated merge
+		// to trunk permanently disqualifies a verdict" -- the SAME base
+		// SHA movement immediately above, but now with the caller
+		// POSITIVELY CONFIRMING (BaseAdvancedWithoutRewrite) it was an
+		// ordinary, unrelated fast-forward, must NOT lose eligibility.
+		// This is what makes auto-merge able to regain eligibility
+		// through an ordinary sequence of events (an unrelated PR merging
+		// to the same trunk) rather than being permanently stuck the
+		// moment any base movement is observed. ---
+		{
+			name:         "a PR whose base SHA moved but is CONFIRMED a pure fast-forward (an unrelated merge to trunk) keeps eligibility",
+			in:           withBaseAdvancedWithoutRewrite(withCurrentBaseSHA(cleanInput(), "base-def456"), true),
+			cfg:          cfg,
+			wantEligible: true,
+			wantReason:   autoapproval.ReasonNone,
+		},
+		{
+			// A base REF change (a genuine retarget, or a stacked PR's
+			// own parent merging and GitHub re-targeting onto the
+			// grandparent) must refuse UNCONDITIONALLY -- confirming the
+			// SHA relationship says nothing about a DIFFERENT branch.
+			// BaseAdvancedWithoutRewrite must never be read as a
+			// blanket "trust this base", only as a narrow confirmation
+			// about the base SHA comparison specifically.
+			name:         "a PR whose base REF changed loses eligibility even when BaseAdvancedWithoutRewrite is (incorrectly, or irrelevantly) set",
+			in:           withBaseAdvancedWithoutRewrite(withCurrentBaseRef(cleanInput(), "release/2026.09"), true),
+			cfg:          cfg,
+			wantEligible: false,
+			wantReason:   autoapproval.ReasonBaseMoved,
+		},
 		{
 			name:         "a verdict recorded with no base ref at all (predates this amendment) is UNKNOWN context, never a match",
 			in:           withVerdictBaseRef(cleanInput(), ""),
@@ -599,6 +629,15 @@ func withCurrentBaseSHA(in autoapproval.EligibilityInput, sha string) autoapprov
 }
 func withVerdictBaseSHA(in autoapproval.EligibilityInput, sha string) autoapproval.EligibilityInput {
 	in.VerdictBaseSHA = sha
+	return in
+}
+
+// withBaseAdvancedWithoutRewrite (D3, second adversarial-review round)
+// sets EligibilityInput.BaseAdvancedWithoutRewrite -- see that field's
+// own doc comment for what it confirms and why the zero value (false)
+// must remain the fail-conservative default.
+func withBaseAdvancedWithoutRewrite(in autoapproval.EligibilityInput, confirmed bool) autoapproval.EligibilityInput {
+	in.BaseAdvancedWithoutRewrite = confirmed
 	return in
 }
 func withVerdictAncestorChain(in autoapproval.EligibilityInput, chain []review.AncestorLink) autoapproval.EligibilityInput {

@@ -302,23 +302,58 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		currentBaseSHA = ""
 	}
 
+	// baseAdvancedWithoutRewrite (D3, second adversarial-review round)
+	// tolerates an ORDINARY, unrelated merge landing on the base branch
+	// between review and merge -- "any unrelated merge to trunk
+	// permanently disqualifies a verdict" is the exact failure this
+	// closes. Only even attempted when it could possibly matter: the base
+	// ref is unchanged (a real retarget still refuses unconditionally,
+	// autoapproval.ComputeEligible's own doc comment) and the base sha
+	// genuinely differs on both sides (both non-empty, since an empty
+	// side already fails its own ReasonBaseSHAUnknown check regardless of
+	// this field). See ports.SourceControl.IsAncestor's own doc comment
+	// for what this call answers and why it is sound: a three-dot diff is
+	// defined against the merge-base of (base, head), which does not move
+	// merely because the base branch's tip advances, as long as its OLD
+	// tip remains an ancestor of the new one.
+	//
+	// A resolution failure fails CLOSED to false (never confirmed),
+	// mirroring currentBaseSHA's own identical "a resolution failure
+	// fails CLOSED" convention immediately above -- ComputeEligible then
+	// refuses on ReasonBaseMoved exactly as it did before this field
+	// existed, never a new, silently-permissive default.
+	var baseAdvancedWithoutRewrite bool
+	if record.Context.BaseRef == target.BaseRef && record.Context.BaseSHA != "" && currentBaseSHA != "" && record.Context.BaseSHA != currentBaseSHA {
+		confirmed, ancestorErr := sourceControl.IsAncestor(ctx, ports.IsAncestorSpec{
+			Owner:      target.Owner,
+			Repo:       target.Repo,
+			Ancestor:   record.Context.BaseSHA,
+			Descendant: currentBaseSHA,
+			Token:      token,
+		})
+		if ancestorErr == nil {
+			baseAdvancedWithoutRewrite = confirmed
+		}
+	}
+
 	eligible, eligReason := autoapproval.ComputeEligible(autoapproval.EligibilityInput{
-		Verdict:                 record.Verdict,
-		VerdictAssessed:         true,
-		VerdictHeadSHA:          record.HeadSHA,
-		VerdictBaseRef:          record.Context.BaseRef,
-		VerdictBaseSHA:          record.Context.BaseSHA,
-		VerdictAncestorChain:    record.Context.AncestorChain,
-		VerdictPolicyVersion:    record.Context.PolicyVersion,
-		CurrentHeadSHA:          target.HeadSHA,
-		CurrentBaseRef:          target.BaseRef,
-		CurrentBaseSHA:          currentBaseSHA,
-		CurrentAncestorChain:    convertAncestorChain(target.AncestorChain),
-		CIGreen:                 ciGreen,
-		HasNeedsHumanLabel:      hasNeedsHuman,
-		ChangedFileCount:        target.ChangedFilesCount,
-		TouchedBlastRadius:      autoapproval.ClassifyChangedPaths(target.ChangedFiles),
-		TouchedBlastRadiusKnown: !target.ChangedFilesListDegraded,
+		Verdict:                    record.Verdict,
+		VerdictAssessed:            true,
+		VerdictHeadSHA:             record.HeadSHA,
+		VerdictBaseRef:             record.Context.BaseRef,
+		VerdictBaseSHA:             record.Context.BaseSHA,
+		VerdictAncestorChain:       record.Context.AncestorChain,
+		VerdictPolicyVersion:       record.Context.PolicyVersion,
+		CurrentHeadSHA:             target.HeadSHA,
+		CurrentBaseRef:             target.BaseRef,
+		CurrentBaseSHA:             currentBaseSHA,
+		CurrentAncestorChain:       convertAncestorChain(target.AncestorChain),
+		BaseAdvancedWithoutRewrite: baseAdvancedWithoutRewrite,
+		CIGreen:                    ciGreen,
+		HasNeedsHumanLabel:         hasNeedsHuman,
+		ChangedFileCount:           target.ChangedFilesCount,
+		TouchedBlastRadius:         autoapproval.ClassifyChangedPaths(target.ChangedFiles),
+		TouchedBlastRadiusKnown:    !target.ChangedFilesListDegraded,
 	}, cfg)
 	if !eligible {
 		return false, "", fmt.Sprintf("this pull request no longer meets the auto-approval eligibility criteria: %s", eligReason), nil

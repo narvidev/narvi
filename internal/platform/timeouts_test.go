@@ -1371,7 +1371,12 @@ func TestDefaultTimeouts_Step120StandaloneField(t *testing.T) {
 // TestDefaultTimeouts_Step173StandaloneField proves §21.1's amendment's own finding
 // F1 addition -- GitHubResolveBaseBranchSHATimeout -- ships with a
 // sensible, non-zero default and does not disturb either invariant chain
-// (it is a standalone field, wired into neither).
+// (it is a standalone field, wired into neither). Also covers D2's own
+// addition (second adversarial-review round) -- DecisionInboxResolveBranchSHATimeout,
+// a DISTINCT field for a distinct call site/package (decisioninbox's own
+// SCMCache) even though it shares GitHubResolveBaseBranchSHATimeout's own
+// chosen value, matching this codebase's own "one named timeout per
+// distinct network-call type" convention.
 func TestDefaultTimeouts_Step173StandaloneField(t *testing.T) {
 	t.Parallel()
 
@@ -1382,6 +1387,13 @@ func TestDefaultTimeouts_Step173StandaloneField(t *testing.T) {
 	}
 	if to.GitHubResolveBaseBranchSHATimeout != 10*time.Second {
 		t.Errorf("GitHubResolveBaseBranchSHATimeout = %v, want %v", to.GitHubResolveBaseBranchSHATimeout, 10*time.Second)
+	}
+
+	if to.DecisionInboxResolveBranchSHATimeout <= 0 {
+		t.Errorf("DecisionInboxResolveBranchSHATimeout = %v, want > 0", to.DecisionInboxResolveBranchSHATimeout)
+	}
+	if to.DecisionInboxResolveBranchSHATimeout != 10*time.Second {
+		t.Errorf("DecisionInboxResolveBranchSHATimeout = %v, want %v", to.DecisionInboxResolveBranchSHATimeout, 10*time.Second)
 	}
 
 	if err := to.Validate(); err != nil {

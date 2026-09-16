@@ -71,9 +71,10 @@ func TestPostReviewVerdict_UpsertsFindingsWithServerComputedIdentity(t *testing.
 	ctx := context.Background()
 	repoFullName := "acme/findings-upsert-repo"
 	session := setupReviewSessionWithSandbox(ctx, t, rig, repoFullName, 21)
+	seedDispatchedTurn(ctx, t, rig, session.ID)
 
 	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1",
-		"", findingsVerdictRequestJSON("coverage", "Missing test for the timeout path."))
+		testDispatchMessageID, findingsVerdictRequestJSON("coverage", "Missing test for the timeout path."))
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -111,9 +112,10 @@ func TestPostReviewVerdict_FindingReReportedAtShiftedLine_SameIdentity(t *testin
 	ctx := context.Background()
 	repoFullName := "acme/findings-line-shift-repo"
 	session := setupReviewSessionWithSandbox(ctx, t, rig, repoFullName, 22)
+	seedDispatchedTurn(ctx, t, rig, session.ID)
 
 	body1 := `{"riskLevel":"low","premise":"ok","blastRadius":[],"filesChanged":1,"testsCoverage":"insufficient","docsDrift":"none","proposedShippable":"auto","summary":"s","findings":[{"sentinelKind":"coverage","severity":"medium","filePath":"a.go","line":10,"description":"Missing coverage for X."}],"digest":{"summary":"Adds a helper; one coverage gap found.","descriptionAdequacy":"ok","adequacyExplanation":"Accurate."},"factCheck":"done","factCheckKilled":0}`
-	status, resp1 := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", body1)
+	status, resp1 := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, body1)
 	if status != http.StatusCreated {
 		t.Fatalf("first post status = %d, want %d", status, http.StatusCreated)
 	}
@@ -129,7 +131,7 @@ func TestPostReviewVerdict_FindingReReportedAtShiftedLine_SameIdentity(t *testin
 
 	// Re-report the SAME finding at a SHIFTED line (10 -> 25).
 	body2 := `{"riskLevel":"low","premise":"ok","blastRadius":[],"filesChanged":1,"testsCoverage":"insufficient","docsDrift":"none","proposedShippable":"auto","summary":"s","findings":[{"sentinelKind":"coverage","severity":"medium","filePath":"a.go","line":25,"description":"Missing coverage for X."}],"digest":{"summary":"Adds a helper; one coverage gap found.","descriptionAdequacy":"ok","adequacyExplanation":"Accurate."},"factCheck":"done","factCheckKilled":0}`
-	status2, resp2 := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", body2)
+	status2, resp2 := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, body2)
 	if status2 != http.StatusCreated {
 		t.Fatalf("second post status = %d, want %d", status2, http.StatusCreated)
 	}
@@ -160,7 +162,10 @@ func TestRebutReviewFinding_MemberDenied(t *testing.T) {
 	ctx := context.Background()
 	repoFullName := "acme/rebut-denied-repo"
 	session := setupReviewSessionWithSandbox(ctx, t, rig, repoFullName, 30)
-	postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", findingsVerdictRequestJSON("coverage", "x"))
+	seedDispatchedTurn(ctx, t, rig, session.ID)
+	if status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, findingsVerdictRequestJSON("coverage", "x")); status != http.StatusCreated {
+		t.Fatalf("seed post verdict status = %d, want %d", status, http.StatusCreated)
+	}
 
 	_, memberToken := rig.createAuthenticatedUser(ctx, t)
 	kind := reviewpost.SentinelKindCoverage
@@ -223,13 +228,14 @@ func TestPostReviewVerdict_SentinelAutoFix_TriggersWhenToggleOn(t *testing.T) {
 	owner, _ := rig.createAuthenticatedUser(ctx, t)
 	session := createOwnedGitHubReviewSessionWithBranch(ctx, t, rig, owner.ID, repoFullName, 40, "widgets", "https://github.com/acme/widgets.git", "feature-branch")
 	createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
+	seedDispatchedTurn(ctx, t, rig, session.ID)
 
 	if _, err := rig.repoSettings.Upsert(ctx, repoFullName, false, true); err != nil {
 		t.Fatalf("upsert repo settings: %v", err)
 	}
 
 	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1",
-		"", findingsVerdictRequestJSON("coverage", "Missing test for the retry path."))
+		testDispatchMessageID, findingsVerdictRequestJSON("coverage", "Missing test for the retry path."))
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -257,11 +263,12 @@ func TestPostReviewVerdict_SentinelAutoFix_NeverTriggersWhenToggleOff(t *testing
 	ctx := context.Background()
 	repoFullName := "acme/sentinel-trigger-off-repo"
 	session := setupReviewSessionWithSandbox(ctx, t, rig, repoFullName, 41)
+	seedDispatchedTurn(ctx, t, rig, session.ID)
 	// Deliberately never calling rig.repoSettings.Upsert -- proving the
 	// DEFAULT (no repo_settings row at all) is off.
 
 	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1",
-		"", findingsVerdictRequestJSON("coverage", "Missing test for the retry path."))
+		testDispatchMessageID, findingsVerdictRequestJSON("coverage", "Missing test for the retry path."))
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -309,9 +316,10 @@ func TestPostReviewVerdict_SentinelAutoFix_NoRecursion(t *testing.T) {
 		t.Fatalf("set github_pr_sessions session id: %v", err)
 	}
 	createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
+	seedDispatchedTurn(ctx, t, rig, session.ID)
 
 	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1",
-		"", findingsVerdictRequestJSON("coverage", "Missing test for the retry path."))
+		testDispatchMessageID, findingsVerdictRequestJSON("coverage", "Missing test for the retry path."))
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -340,6 +348,9 @@ func (f *applySuggestionFakeSourceControl) CreatePR(context.Context, ports.Creat
 }
 func (f *applySuggestionFakeSourceControl) ResolveBranchSHA(context.Context, ports.ResolveBranchSHASpec) (string, string, error) {
 	return "", "", errors.New("not implemented")
+}
+func (f *applySuggestionFakeSourceControl) IsAncestor(context.Context, ports.IsAncestorSpec) (bool, error) {
+	return false, errors.New("not implemented")
 }
 func (f *applySuggestionFakeSourceControl) ResolveContractsFingerprint(context.Context, ports.ResolveContractsFingerprintSpec) (string, bool, error) {
 	return "", false, errors.New("not implemented")
@@ -397,9 +408,10 @@ func setupFindingWithSuggestedFix(ctx context.Context, t *testing.T, rig testRig
 	owner, _ := rig.createAuthenticatedUser(ctx, t)
 	session := createOwnedGitHubReviewSessionWithBranch(ctx, t, rig, owner.ID, repoFullName, prNumber, "widgets", "https://github.com/acme/widgets.git", "pr-head-branch")
 	createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
+	seedDispatchedTurn(ctx, t, rig, session.ID)
 
 	body := `{"riskLevel":"low","premise":"ok","blastRadius":[],"filesChanged":1,"testsCoverage":"insufficient","docsDrift":"none","proposedShippable":"auto","summary":"s","findings":[{"severity":"low","filePath":"internal/foo/bar.go","description":"Stale comment.","suggestedFix":"--- a/internal/foo/bar.go\n+++ b/internal/foo/bar.go\n@@ -1,2 +1,2 @@\n package foo\n-// old comment\n+// new comment\n"}],"digest":{"summary":"Fixes a stale comment.","descriptionAdequacy":"ok","adequacyExplanation":"Accurate."},"factCheck":"done","factCheckKilled":0}`
-	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", body)
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, body)
 	if status != http.StatusCreated {
 		t.Fatalf("post verdict status = %d, want %d", status, http.StatusCreated)
 	}
@@ -591,7 +603,8 @@ func TestApplySuggestion_NoSuggestedFix_BadRequest(t *testing.T) {
 	ctx := context.Background()
 	repoFullName := "acme/apply-suggestion-none-repo"
 	session := setupReviewSessionWithSandbox(ctx, t, rig, repoFullName, 62)
-	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", findingsVerdictRequestJSON("", "No fix available."))
+	seedDispatchedTurn(ctx, t, rig, session.ID)
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, findingsVerdictRequestJSON("", "No fix available."))
 	if status != http.StatusCreated {
 		t.Fatalf("post verdict status = %d, want %d", status, http.StatusCreated)
 	}

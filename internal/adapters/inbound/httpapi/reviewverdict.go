@@ -108,16 +108,30 @@ import (
 //     PostReviewVerdictRequest -- the generated type's own UnmarshalJSON
 //     already rejects a missing required field, an out-of-enum value, a
 //     negative filesChanged, or an empty summary) -> 400.
-//  8. The decoded, syntactically-valid body still fails
+//  8. The presented X-Sandbox-Dispatch-Message-Id header is missing, is
+//     the literal unsubstituted placeholder (an old sandbox image that
+//     predates this substitution, §35.2's own "mixed image versions for
+//     weeks" -- distinguished from a genuine caller error only in its own
+//     log line, never in the response), or names no turn this session
+//     ever dispatched (pgx.ErrNoRows -- a genuine race, or a forged/stale
+//     value) -> 403 (D1/D4/D6, second adversarial-review round: "no
+//     usable verdict-posting credential for this turn", mirroring the
+//     X-Sandbox-Gen check's own identical posture immediately above --
+//     see this handler's own dispatch-resolution block, below, for the
+//     full "why refuse rather than degrade" reasoning).
+//  9. The decoded, syntactically-valid body still fails
 //     reviewpost.ValidateVerdictInput (today: only a whitespace-only
 //     summary reaches this far -- every other check above already caught
 //     it at JSON-decode time; kept as real defense in depth, not dead
 //     code -- one of several application-layer checks the schema alone
 //     cannot close) -> 400.
-//  9. Otherwise -> 201 with restdtos.PostReviewVerdictResponse, having
+//  10. Otherwise -> 201 with restdtos.PostReviewVerdictResponse, having
 //     enqueued exactly one ports.NotificationKindGitHubVerdict outbox row
 //     (internal/adapters/outbound/githubapi.VerdictNotifier delivers it:
-//     the formal review, then the label sync).
+//     the formal review, then the label sync) AND appended exactly one
+//     review_verdicts row -- outcome 8's own refuse-outright fix means a
+//     201 now ALWAYS has a verdict of record; there is no longer a path
+//     where this handler succeeds with the insert silently skipped.
 //
 // §8.2 ("sentinels + suggestions", §17/§22.1) extends this handler,
 // never replaces it: after building the verdict, it ALSO builds
@@ -291,14 +305,92 @@ func PostReviewVerdict(
 		// request now presents as a header -- never by session-wide
 		// "current" status. turns.GetByDispatchedMessageID takes no status
 		// filter at all, so a turn already marked 'failed' (exactly the
-		// case above) is still found correctly. A missing/empty header
-		// (a caller that predates this fix, or an otherwise-malformed
-		// request) degrades IDENTICALLY to a not-found lookup below --
-		// logged, no context recorded -- deliberately NOT a fallback to
-		// the old session-wide lookup: a fallback that could still
-		// resolve the wrong turn would just be a second lookup racing the
-		// same way.
+		// case above) is still found correctly.
+		//
+		// # D1/D4/D6 (second adversarial-review round): refuse, never degrade
+		//
+		// The FIRST round made this header the ONLY source of reviewDepth
+		// (immediately below) -- and therefore the only thing three
+		// server-side enforcement points keyed on DepthDeep depend on
+		// (validate.go's deep-path required-field block, this handler's
+		// own counter-review corroboration call, and validate.go's
+		// counterReviewForFloor substitution). A caller-side OMISSION of
+		// this header used to degrade IDENTICALLY to a not-found lookup:
+		// logged, reviewDepth left at its own zero value (neither light
+		// nor deep), verdict posted anyway, review_verdicts insert
+		// skipped, 201 returned. §5.2: "PR diffs and external content are
+		// untrusted input" -- the PR body reaching this review turn's own
+		// prompt can instruct the agent to omit a header ITS OWN prompt
+		// told it to send (§30.5: the agent runtime is not a trusted
+		// process boundary; nothing stops it composing whatever HTTP
+		// request it likes), and omitting it used to be a strictly BETTER
+		// outcome for whoever wanted a light-shaped payload waved through
+		// deep-path enforcement -- a caller-suppressible header must never
+		// be a server-side enforcement input.
+		//
+		// The fix mirrors how Authorization/X-Sandbox-Gen are already
+		// handled above: a credential this handler cannot verify is
+		// refused outright (401/403), never silently treated as "absent,
+		// proceed anyway". Every shape of "this verdict cannot be
+		// attributed to a real, specific turn" -- header empty, header is
+		// the literal unsubstituted placeholder (D4: an OLD sandbox image
+		// that predates this substitution and could never have populated
+		// it correctly, §35.2's "mixed image versions for weeks" --
+		// distinguished from a bare omission only in ITS OWN log line,
+		// never in the response or in any relaxed handling, since an
+		// attacker who has read this very file could otherwise embed the
+		// literal placeholder string itself to reach for the same
+		// degraded-enforcement path D1 closes), or a real, well-formed
+		// value that names no turn this session ever dispatched
+		// (pgx.ErrNoRows) -- now returns 403 before anything is built,
+		// posted, or persisted. This also closes D6 as a direct
+		// consequence: there is no longer any path where this endpoint
+		// returns 201 with review_verdicts silently missing its row --
+		// every 201 from this point on has one. Rejected alternative:
+		// falling back to turns.GetProcessingTurnForSession (this
+		// endpoint's OWN pre-F3 behavior) for the header-absent case only.
+		// Rejected because that reintroduces exactly the race F3 was
+		// fixed to close (a timed-out turn's own agent posting after a
+		// SECOND turn has become "processing" for the same session), and
+		// because it gives an attacker who can suppress the header a
+		// deterministic route back to session-wide resolution -- the
+		// exact lenient path D1 exists to remove, not preserve for one
+		// case.
 		dispatchMessageID := r.Header.Get("X-Sandbox-Dispatch-Message-Id")
+		switch dispatchMessageID {
+		case "":
+			logger.Warn("httpapi: review-verdict: rejecting: no X-Sandbox-Dispatch-Message-Id header presented, cannot attribute this verdict to a specific turn",
+				"repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
+			writeError(w, http.StatusForbidden, "no usable verdict-posting credential for this turn")
+			return
+		case review.VerdictToolDispatchMessageIDPlaceholder:
+			// D4: the literal, unsubstituted placeholder -- this sandbox
+			// image's own renderVerdictToolPromptText predates this
+			// substitution (or failed to run it), so the agent's prompt
+			// carried the raw placeholder text verbatim and it echoed
+			// that back rather than a real id. A distinct log line from
+			// the empty-header case above (an operator watching for a
+			// rolling-upgrade artifact must be able to tell it apart from
+			// a bare omission) -- but the SAME refusal: an old image gets
+			// an honest, visible 403 instead of a false 201 with no
+			// verdict of record.
+			logger.Warn("httpapi: review-verdict: rejecting: presented X-Sandbox-Dispatch-Message-Id is the literal unsubstituted placeholder -- sandbox image predates this substitution, cannot attribute this verdict to a specific turn",
+				"repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
+			writeError(w, http.StatusForbidden, "no usable verdict-posting credential for this turn")
+			return
+		}
+		dispatchedTurn, turnErr := turns.GetByDispatchedMessageID(ctx, sessionID, dispatchMessageID)
+		if turnErr != nil {
+			if errors.Is(turnErr, pgx.ErrNoRows) {
+				logger.Warn("httpapi: review-verdict: rejecting: no turn found for this session's own presented dispatch message id",
+					"repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
+				writeError(w, http.StatusForbidden, "no usable verdict-posting credential for this turn")
+				return
+			}
+			logger.Error("httpapi: review-verdict: get turn by dispatched message id failed", "error", turnErr, "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
 		//
 		// Moved here (§26.3 -- one step EARLIER than the
 		// previous "before §22.1.1's own position-resolution step"
@@ -310,14 +402,6 @@ func PostReviewVerdict(
 		// unaffected -- it is computed once, here, and simply read
 		// later, exactly as before.
 		//
-		// Both a genuine store error AND a not-found (ErrNoRows -- a
-		// genuine race: the turn already completed/failed/was cancelled
-		// between this agent's own HTTP call landing and this read)
-		// degrade IDENTICALLY: logged, verdictHeadSHA/reviewDepth both
-		// stay at their own zero value, and (per the existing skip branch
-		// further down, unchanged by this fix) the review_verdicts
-		// insert is skipped -- never a reason to fail this whole tool
-		// call.
 		// serverComputedChangedFiles (§21.1's own filesChanged drift
 		// canary) is this SAME dispatched-message-id-resolved turn's own reviewtriage.
 		// DecisionRecord.ChangedFilesCount, unmarshaled from
@@ -350,144 +434,104 @@ func PostReviewVerdict(
 		// principle forbids elsewhere in this same PR. Set true ONLY
 		// inside the successful-unmarshal branch below, from the real
 		// decisionRecord.
+		// verdictHeadSHA/reviewDepth/serverComputedChangedFiles/
+		// diffDelivered/archDecisionTags/archDecisionRoots/knowledgeMode/
+		// knowledgeInfluenced/dispatchedSandboxGen/dispatchedEventID/
+		// verdictContext/attemptID are all resolved, below, from
+		// dispatchedTurn -- the ONE turn this request has now been
+		// refused unless it could be attributed to, above (D1/D4/D6).
+		// Each still defaults to its own honest zero value (nil header
+		// field on the turn row itself, a legitimate, unrelated
+		// degradation this fix does not touch -- e.g. a review turn whose
+		// own context fetch degraded to no head sha at all) and each
+		// zero value is the SAME fail-conservative default this handler
+		// already relied on before this fix (ComputeEligible reads an
+		// empty verdictContext as "context unknown", an empty reviewDepth
+		// never satisfies DepthDeep, etc.) -- only the PATH that used to
+		// reach those defaults via an un-attributable REQUEST is gone,
+		// never the defaults themselves.
 		var verdictHeadSHA string
 		var reviewDepth reviewtriage.ReviewDepth
 		var serverComputedChangedFiles int
 		var diffDelivered bool
 		var archDecisionTags, archDecisionRoots []string
-		// knowledgeMode/knowledgeInfluenced (§31.2/§31.7's own mode
-		// buffer and G5) mirror archDecisionTags/archDecisionRoots' own
-		// identical "read back from where the dispatching path stamped
-		// it" shape, immediately above: knowledgeMode is this SAME
-		// dispatched-message-id-resolved turn's own turns.review_knowledge_mode, forwarded
-		// verbatim; knowledgeInfluenced is derived, not forwarded --
-		// "this turn's prompt actually carried a prior-decisions block"
-		// iff its own turns.review_knowledge_decision record is
-		// non-empty. Both stay at their zero value (empty mode, not
-		// influenced) for every case that skips or fails the turn lookup
-		// below -- the safe direction: an un-attributable verdict is
-		// never wrongly stamped as knowledge-influenced.
 		var knowledgeMode string
 		var knowledgeInfluenced bool
-		// dispatchedSandboxGen/dispatchedEventID (§26.4/§7.1) are
-		// this SAME dispatched-message-id-resolved turn's own turns.dispatched_sandbox_gen/
-		// dispatched_event_id -- the sandbox gen this turn's prompt was
-		// actually dispatched to (migrations/000026_turn_dispatch_gen.up.sql)
-		// and the events-log high-water mark at the instant it was
-		// dispatched (migrations/000089_turns_dispatched_event_id.up.sql).
-		// Both stay nil for every case that skips or fails the turn lookup
-		// below, exactly like verdictHeadSHA/reviewDepth's own identical
-		// degradation -- corroborateCounterReview's own call site, further
-		// down, treats either one being unset as NOT corroborated rather
-		// than erroring or skipping the check (fail-conservative, see that
-		// call site's own doc comment). BOTH are required together, not
-		// merely gen alone: see events.sql's own doc comment on
-		// ListSubTaskStart/FinishEventsForTurn for why gen-scoping alone was
-		// found to be insufficient (an adversarial review finding on this
-		// same PR) and why the id lower bound is what actually closes that
-		// gap -- and why it is an events.id and not a timestamp.
 		var dispatchedSandboxGen *int32
 		var dispatchedEventID *int64
-		// verdictContext/attemptID (§21.1's amendment) mirror
-		// verdictHeadSHA/reviewDepth's own identical "resolved once here,
-		// from THIS request's own dispatched-message-id-resolved turn, never
-		// re-derived" shape, one field further. verdictContext stays at
-		// its own zero value (Context{}, BaseRef == "") for every case
-		// that skips or fails the turn lookup/unmarshal below -- the
-		// SAME safe degradation review_depth_decision's own unmarshal
-		// failure already gets, and exactly what internal/domain/
-		// autoapproval.ComputeEligible reads as "context unknown",
-		// mirroring a pre-amendment row. attemptID stays an invalid
-		// pgtype.UUID{} in the identical cases -- a verdict this
-		// endpoint cannot attribute to a real turn id is never stamped
-		// with an invented one.
 		var verdictContext reviewverdict.Context
 		var attemptID pgtype.UUID
-		if dispatchMessageID == "" {
-			// A caller-side omission (a request that predates this fix,
-			// or an otherwise-malformed one) -- degrades identically to
-			// the not-found branch below: logged, no context recorded,
-			// never a reason to fail this whole tool call.
-			logger.Warn("httpapi: review-verdict: no X-Sandbox-Dispatch-Message-Id header presented, cannot attribute this verdict to a specific turn, skipping review_verdicts insert", "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
-		} else if dispatchedTurn, turnErr := turns.GetByDispatchedMessageID(ctx, sessionID, dispatchMessageID); turnErr != nil {
-			if errors.Is(turnErr, pgx.ErrNoRows) {
-				logger.Warn("httpapi: review-verdict: no turn found for this session's own dispatched message id, skipping review_verdicts insert", "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
+		if dispatchedTurn.ReviewHeadSha != nil {
+			verdictHeadSHA = *dispatchedTurn.ReviewHeadSha
+		}
+		if dispatchedTurn.ReviewDepth != nil {
+			reviewDepth = reviewtriage.ReviewDepth(*dispatchedTurn.ReviewDepth)
+		}
+		dispatchedSandboxGen = dispatchedTurn.DispatchedSandboxGen
+		dispatchedEventID = dispatchedTurn.DispatchedEventID
+		attemptID = dispatchedTurn.ID
+		if len(dispatchedTurn.ReviewVerdictContext) > 0 {
+			if unmarshalErr := json.Unmarshal(dispatchedTurn.ReviewVerdictContext, &verdictContext); unmarshalErr != nil {
+				// Findings F4/F6: this branch means a review_verdict_context
+				// value WAS recorded (len > 0) but could not be decoded --
+				// a genuine bug (a corrupted column, a schema drift between
+				// the writer and this reader), never the legitimate
+				// "context tracking predates this row" case (which never
+				// reaches this branch at all: that case is an empty/NULL
+				// column, len == 0). Degrading BOTH cases to the identical
+				// verdictContext = Context{} makes ComputeEligible answer
+				// the SAME ReasonContextUnknown for either -- silently
+				// turning auto-approval/auto-merge off for every PR this
+				// repo ever reviews, with an operator-facing reason
+				// ("this verdict predates review-context tracking") that
+				// is simply FALSE for this branch. Logged at Error,
+				// deliberately louder than every other best-effort
+				// unmarshal degradation in this function (review_knowledge_
+				// decision/review_depth_decision below stay Warn: an
+				// unrecognized/corrupted one only ever affects a single
+				// verdict's own display/routing data, never every
+				// subsequent eligibility decision the way an unrecorded
+				// base/ancestor/policy context does) -- an operator or
+				// alerting pipeline watching Error-level logs must be able
+				// to tell "review context tracking is silently broken for
+				// this repo" apart from "an old verdict, nothing to fix".
+				logger.Error("httpapi: review-verdict: unmarshal review_verdict_context failed -- a context WAS recorded but could not be decoded (a bug, never the legitimate 'predates tracking' case); this verdict will read as ReasonContextUnknown and lose auto-approval/auto-merge eligibility exactly like a genuinely untracked verdict, which is misleading -- investigate this repo/PR directly",
+					"error", unmarshalErr, "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
+				verdictContext = reviewverdict.Context{}
+			}
+		}
+		if dispatchedTurn.ReviewKnowledgeMode != nil {
+			knowledgeMode = *dispatchedTurn.ReviewKnowledgeMode
+		}
+		if len(dispatchedTurn.ReviewKnowledgeDecision) > 0 {
+			var injected knowledge.InjectedRecord
+			if unmarshalErr := json.Unmarshal(dispatchedTurn.ReviewKnowledgeDecision, &injected); unmarshalErr != nil {
+				logger.Warn("httpapi: review-verdict: unmarshal review_knowledge_decision failed, verdict will be stamped as not knowledge-influenced",
+					"error", unmarshalErr, "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
 			} else {
-				logger.Error("httpapi: review-verdict: get turn by dispatched message id failed, skipping review_verdicts insert", "error", turnErr, "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
+				knowledgeInfluenced = !injected.Empty()
 			}
-		} else {
-			if dispatchedTurn.ReviewHeadSha != nil {
-				verdictHeadSHA = *dispatchedTurn.ReviewHeadSha
-			}
-			if dispatchedTurn.ReviewDepth != nil {
-				reviewDepth = reviewtriage.ReviewDepth(*dispatchedTurn.ReviewDepth)
-			}
-			dispatchedSandboxGen = dispatchedTurn.DispatchedSandboxGen
-			dispatchedEventID = dispatchedTurn.DispatchedEventID
-			attemptID = dispatchedTurn.ID
-			if len(dispatchedTurn.ReviewVerdictContext) > 0 {
-				if unmarshalErr := json.Unmarshal(dispatchedTurn.ReviewVerdictContext, &verdictContext); unmarshalErr != nil {
-					// Findings F4/F6: this branch means a review_verdict_context
-					// value WAS recorded (len > 0) but could not be decoded --
-					// a genuine bug (a corrupted column, a schema drift between
-					// the writer and this reader), never the legitimate
-					// "context tracking predates this row" case (which never
-					// reaches this branch at all: that case is an empty/NULL
-					// column, len == 0). Degrading BOTH cases to the identical
-					// verdictContext = Context{} makes ComputeEligible answer
-					// the SAME ReasonContextUnknown for either -- silently
-					// turning auto-approval/auto-merge off for every PR this
-					// repo ever reviews, with an operator-facing reason
-					// ("this verdict predates review-context tracking") that
-					// is simply FALSE for this branch. Logged at Error,
-					// deliberately louder than every other best-effort
-					// unmarshal degradation in this function (review_knowledge_
-					// decision/review_depth_decision below stay Warn: an
-					// unrecognized/corrupted one only ever affects a single
-					// verdict's own display/routing data, never every
-					// subsequent eligibility decision the way an unrecorded
-					// base/ancestor/policy context does) -- an operator or
-					// alerting pipeline watching Error-level logs must be able
-					// to tell "review context tracking is silently broken for
-					// this repo" apart from "an old verdict, nothing to fix".
-					logger.Error("httpapi: review-verdict: unmarshal review_verdict_context failed -- a context WAS recorded but could not be decoded (a bug, never the legitimate 'predates tracking' case); this verdict will read as ReasonContextUnknown and lose auto-approval/auto-merge eligibility exactly like a genuinely untracked verdict, which is misleading -- investigate this repo/PR directly",
-						"error", unmarshalErr, "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
-					verdictContext = reviewverdict.Context{}
-				}
-			}
-			if dispatchedTurn.ReviewKnowledgeMode != nil {
-				knowledgeMode = *dispatchedTurn.ReviewKnowledgeMode
-			}
-			if len(dispatchedTurn.ReviewKnowledgeDecision) > 0 {
-				var injected knowledge.InjectedRecord
-				if unmarshalErr := json.Unmarshal(dispatchedTurn.ReviewKnowledgeDecision, &injected); unmarshalErr != nil {
-					logger.Warn("httpapi: review-verdict: unmarshal review_knowledge_decision failed, verdict will be stamped as not knowledge-influenced",
-						"error", unmarshalErr, "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
-				} else {
-					knowledgeInfluenced = !injected.Empty()
-				}
-			}
-			if len(dispatchedTurn.ReviewDepthDecision) > 0 {
-				var decisionRecord reviewtriage.DecisionRecord
-				if unmarshalErr := json.Unmarshal(dispatchedTurn.ReviewDepthDecision, &decisionRecord); unmarshalErr != nil {
-					logger.Warn("httpapi: review-verdict: unmarshal review_depth_decision failed, filesChanged drift canary has no server-computed count to compare against",
-						"error", unmarshalErr, "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
-				} else {
-					serverComputedChangedFiles = decisionRecord.ChangedFilesCount
-					diffDelivered = !decisionRecord.DiffEmpty && !decisionRecord.DiffTruncated
-					// The gate's own key, read back from where the
-					// dispatching path stamped it rather than recomputed
-					// here: this endpoint never sees the PR's changed
-					// paths, only what the sandbox posts, and the one
-					// thing the gate must never key on is anything the
-					// model authored. An unmarshal failure above leaves
-					// both nil, so the verdict is stamped with no tags
-					// and no roots -- it becomes reachable only through
-					// the selector's recency fallback, never wrongly
-					// matched, which is the safe direction.
-					archDecisionTags = decisionRecord.ArchDecisionTags
-					archDecisionRoots = decisionRecord.ArchDecisionRoots
-				}
+		}
+		if len(dispatchedTurn.ReviewDepthDecision) > 0 {
+			var decisionRecord reviewtriage.DecisionRecord
+			if unmarshalErr := json.Unmarshal(dispatchedTurn.ReviewDepthDecision, &decisionRecord); unmarshalErr != nil {
+				logger.Warn("httpapi: review-verdict: unmarshal review_depth_decision failed, filesChanged drift canary has no server-computed count to compare against",
+					"error", unmarshalErr, "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
+			} else {
+				serverComputedChangedFiles = decisionRecord.ChangedFilesCount
+				diffDelivered = !decisionRecord.DiffEmpty && !decisionRecord.DiffTruncated
+				// The gate's own key, read back from where the
+				// dispatching path stamped it rather than recomputed
+				// here: this endpoint never sees the PR's changed
+				// paths, only what the sandbox posts, and the one
+				// thing the gate must never key on is anything the
+				// model authored. An unmarshal failure above leaves
+				// both nil, so the verdict is stamped with no tags
+				// and no roots -- it becomes reachable only through
+				// the selector's recency fallback, never wrongly
+				// matched, which is the safe direction.
+				archDecisionTags = decisionRecord.ArchDecisionTags
+				archDecisionRoots = decisionRecord.ArchDecisionRoots
 			}
 		}
 

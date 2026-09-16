@@ -228,6 +228,33 @@ type EligibilityInput struct {
 	CurrentBaseRef       string
 	CurrentBaseSHA       string
 	CurrentAncestorChain []review.AncestorLink
+	// BaseAdvancedWithoutRewrite (D3, second adversarial-review round) is
+	// the fast-forward-tolerance fact this engine consults ONLY when
+	// VerdictBaseSHA != CurrentBaseSHA under an UNCHANGED VerdictBaseRef/
+	// CurrentBaseRef (a retargeted base still refuses unconditionally,
+	// below, regardless of this field). true means the caller has
+	// POSITIVELY CONFIRMED, via a live SourceControl.IsAncestor check,
+	// that VerdictBaseSHA is an ancestor of (or identical to)
+	// CurrentBaseSHA -- i.e. the base branch only ever gained NEW,
+	// unrelated commits since the verdict was produced, never rewound or
+	// rewritten. Under that confirmation, a three-dot diff (base...head,
+	// what GitHub itself shows on a PR and what the verdict was actually
+	// produced against) is unaffected by the base's own forward movement:
+	// its own merge-base with head has not moved, so what the verdict
+	// examined provably still matches what the PR would merge today.
+	//
+	// Deliberately the BOOLEAN ZERO VALUE for "not confirmed", mirroring
+	// this package's own established fail-conservative convention
+	// (TouchedBlastRadiusKnown/VerdictAssessed's own identical doc
+	// comments): a caller that never populates this field, or whose own
+	// IsAncestor call failed, gets false -- "the base moved and this was
+	// never independently confirmed to be safe" -- which this function
+	// then refuses on ReasonBaseMoved, EXACTLY the behavior this codebase
+	// had before this field existed. This is what makes the failure D3
+	// closes a strict widening of eligibility (an unrelated, confirmed-
+	// forward-only base movement no longer refuses) rather than a
+	// loosening of anything ELSE this engine already checks.
+	BaseAdvancedWithoutRewrite bool
 	// CIGreen is the PR's CI conclusion at CurrentHeadSHA specifically
 	// (never at VerdictHeadSHA, which may already be stale) -- re-
 	// derived live via the STRICT ports.CIConclusion check
@@ -270,12 +297,19 @@ const (
 	// recorded, and it no longer matches" -- this one means "no context
 	// was ever recorded to compare".
 	ReasonContextUnknown Reason = "this verdict predates review-context tracking and cannot be confirmed fresh"
-	// ReasonBaseMoved (§21.1's amendment) accompanies a verdict whose
-	// recorded base ref or base commit no longer matches the PR's own
-	// CURRENT base -- the retargeted-PR / parent-moved-beneath-it hazard
-	// this amendment exists to close: "a PR evaluated while based on
-	// another PR's branch, then retargeted -- or whose parent moved
-	// beneath it -- keeps an unchanged head."
+	// ReasonBaseMoved (§21.1's amendment; refined by D3, second
+	// adversarial-review round) accompanies a verdict whose recorded base
+	// ref, or whose recorded base commit in a way NOT confirmed to be a
+	// pure forward advance, no longer matches the PR's own CURRENT base --
+	// the retargeted-PR / parent-moved-beneath-it hazard this amendment
+	// exists to close: "a PR evaluated while based on another PR's
+	// branch, then retargeted -- or whose parent moved beneath it --
+	// keeps an unchanged head." A base REF change always fires this,
+	// unconditionally. A base SHA change fires this UNLESS
+	// BaseAdvancedWithoutRewrite confirms the movement was an ordinary,
+	// unrelated fast-forward (D3's own fix for "any unrelated merge to
+	// trunk permanently disqualifies a verdict" -- see that field's own
+	// doc comment for the full reasoning).
 	ReasonBaseMoved Reason = "the pull request's base has changed since this verdict was produced"
 	// ReasonAncestorChainChanged (§21.1's amendment) accompanies a
 	// verdict whose recorded ancestor chain (review.AncestorLink, ordered
@@ -359,7 +393,25 @@ func ComputeEligible(in EligibilityInput, cfg EligibilityConfig) (eligible bool,
 	if in.VerdictBaseSHA == "" || in.CurrentBaseSHA == "" {
 		return false, ReasonBaseSHAUnknown
 	}
-	if in.VerdictBaseRef != in.CurrentBaseRef || in.VerdictBaseSHA != in.CurrentBaseSHA {
+	// D3 (second adversarial-review round): a base REF change (a retarget,
+	// or a stacked PR's own parent merging and GitHub re-targeting onto
+	// the grandparent) always refuses -- unconditionally, regardless of
+	// BaseAdvancedWithoutRewrite, which says nothing about a DIFFERENT
+	// branch. Split from the base-SHA comparison immediately below
+	// (previously one combined condition) specifically so the ref check
+	// can stay unconditional while the sha check alone gains the
+	// fast-forward tolerance.
+	if in.VerdictBaseRef != in.CurrentBaseRef {
+		return false, ReasonBaseMoved
+	}
+	// The base SHA changed under an UNCHANGED ref -- refuse UNLESS the
+	// caller has positively confirmed (BaseAdvancedWithoutRewrite) this
+	// was an ordinary, unrelated fast-forward: "any unrelated merge to
+	// trunk permanently disqualifies a verdict" is exactly the failure D3
+	// exists to close, and BaseAdvancedWithoutRewrite's own doc comment
+	// covers why this is a strict widening, never a loosening, of what
+	// this engine already refuses.
+	if in.VerdictBaseSHA != in.CurrentBaseSHA && !in.BaseAdvancedWithoutRewrite {
 		return false, ReasonBaseMoved
 	}
 	if !ancestorChainEqual(in.VerdictAncestorChain, in.CurrentAncestorChain) {

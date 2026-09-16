@@ -206,6 +206,13 @@ func (d *Decorator) ResolveBranchSHA(ctx context.Context, spec ports.ResolveBran
 	return d.live.ResolveBranchSHA(ctx, spec)
 }
 
+// IsAncestor (D3, second adversarial-review round) is a read and is
+// forwarded unchanged, mirroring ResolveBranchSHA's own identical
+// precedent immediately above.
+func (d *Decorator) IsAncestor(ctx context.Context, spec ports.IsAncestorSpec) (bool, error) {
+	return d.live.IsAncestor(ctx, spec)
+}
+
 // ResolveContractsFingerprint is a read and is forwarded unchanged.
 func (d *Decorator) ResolveContractsFingerprint(ctx context.Context, spec ports.ResolveContractsFingerprintSpec) (string, bool, error) {
 	return d.live.ResolveContractsFingerprint(ctx, spec)

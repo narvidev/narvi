@@ -69,8 +69,10 @@ type DecisionRecord struct {
 	// NO triage purpose of its own -- Decide never reads it -- it exists
 	// solely as this record's own already-established "turn-scoped
 	// carrier" mechanism (turns.review_depth_decision, read back via
-	// httpapi.PostReviewVerdict's own turns.GetProcessingTurnForSession
-	// call) for a value that would otherwise have no way to reach
+	// httpapi.PostReviewVerdict's own turns.GetByDispatchedMessageID
+	// call -- finding F3's own replacement for the session-wide
+	// GetProcessingTurnForSession lookup this comment previously named)
+	// for a value that would otherwise have no way to reach
 	// verdict-post time at all, short of a new turns column mirroring
 	// review_head_sha/review_depth's own dedicated-column treatment --
 	// deliberately not done here (this Step's own scope: a diagnostic-only

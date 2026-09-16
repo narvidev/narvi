@@ -116,6 +116,30 @@ type ResolveBranchSHASpec struct {
 	Token string
 }
 
+// IsAncestorSpec is what SourceControl.IsAncestor (D3, second
+// adversarial-review round) needs -- Owner/Repo/Token are the same
+// generic source-control concepts CreatePRSpec/ResolveBranchSHASpec
+// already use.
+type IsAncestorSpec struct {
+	// Owner is the repo owner/organization.
+	Owner string
+	// Repo is the repo name (without owner prefix).
+	Repo string
+	// Ancestor is the candidate ancestor commit SHA -- the OLDER of the
+	// two commits being compared (e.g. a verdict's own recorded base
+	// commit).
+	Ancestor string
+	// Descendant is the commit SHA that must contain Ancestor somewhere
+	// in its own history for IsAncestor to report true -- the NEWER of
+	// the two commits being compared (e.g. the base branch's current
+	// live tip).
+	Descendant string
+	// Token is the same plaintext, decrypted OAuth access token shape
+	// CreatePRSpec.Token/ResolveBranchSHASpec.Token already use. Never
+	// logged by any caller or implementation of this port.
+	Token string
+}
+
 // ResolveContractsFingerprintSpec is what SourceControl.
 // ResolveContractsFingerprint ("mocking + contract drift", §14.3)
 // needs to fingerprint a repo's configured contracts directory at one ref.
@@ -475,12 +499,32 @@ type OpenPR struct {
 
 	HeadSHA string
 	BaseRef string
-	// BaseSHA (§21.1's amendment) is the commit BaseRef resolved to at
-	// the moment this PR was fetched -- decisioninbox's own live
-	// eligibility re-check (internal/domain/autoapproval.ComputeEligible)
-	// compares this against a verdict's own recorded base commit, closing
-	// the gap named by that amendment: "the GitHub decoder reads
-	// base.ref while never reading base.sha at all."
+	// BaseSHA (§21.1's amendment) is GitHub's own per-PR CACHED snapshot
+	// of the commit BaseRef resolved to as of whichever earlier moment
+	// GitHub itself last refreshed this field -- NOT necessarily "at the
+	// moment this PR was fetched" despite this field living on a
+	// just-fetched OpenPR, and verified against real GitHub PRs to lag
+	// the base branch's own real, current tip by an unknown, sometimes
+	// month-scale margin.
+	//
+	// D8 (second adversarial-review round): this doc comment previously
+	// claimed decisioninbox's own live eligibility re-check
+	// (internal/domain/autoapproval.ComputeEligible) compares THIS field
+	// against a verdict's own recorded base commit -- true of
+	// revalidateCore (revalidate.go) only until finding F1, and never
+	// true of computeRealEligibility (aggregate.go), which read this
+	// exact field for its own ComputeEligible call until D2 fixed it (a
+	// PR evaluated while based on another PR's branch, then retargeted,
+	// or whose parent moved beneath it, kept an unchanged head, so
+	// comparing this CACHED value against itself detected nothing). Both
+	// call sites now resolve the base branch's LIVE tip instead --
+	// decisioninbox.SCMCache.ResolveBranchSHA (cached, §16.2's own "SCM
+	// data is cached with a short TTL" posture, for the read-model path)
+	// or a direct, uncached ports.SourceControl.ResolveBranchSHA call
+	// (for the action-endpoint path) -- never this field. Retained here
+	// as GitHub's own honestly-cached fact, exposed for any future
+	// display/audit purpose that can tolerate its own staleness; not
+	// itself wired into any eligibility comparison.
 	BaseSHA string
 	// AncestorChain (§21.1's amendment) is this PR's own ordered
 	// ancestor chain beyond its immediate base -- PRAncestorLink's own
@@ -851,6 +895,33 @@ type SourceControl interface {
 	// to the exact same ref -- splitting what should be one branch's
 	// tracked state into two.
 	ResolveBranchSHA(ctx context.Context, spec ResolveBranchSHASpec) (sha string, resolvedBranch string, err error)
+
+	// IsAncestor (D3, second adversarial-review round) reports whether
+	// spec.Ancestor is an ancestor of, or identical to, spec.Descendant --
+	// a pure git-ancestry fact, portable across any git-backed host
+	// (CLAUDE.md: "don't couple a port to a single adapter" -- this is a
+	// generic git concept, not a GitHub-specific one).
+	//
+	// This is what makes the base-freshness gate (autoapproval.
+	// ComputeEligible) tolerate an ORDINARY, unrelated merge landing on a
+	// PR's base branch between review and merge, while still refusing a
+	// genuine rewrite: a three-dot diff (base...head, what GitHub itself
+	// shows on a PR, and what reviewcontext.Fetch pins a review to) is
+	// defined against the MERGE BASE of (base, head), never against the
+	// base branch's raw tip -- so as long as the base's OLD tip (what a
+	// verdict examined) remains an ancestor of its NEW tip (what is live
+	// now), the merge-base or diff-relevant commit relationship, and the
+	// diff itself, provably have not moved, regardless of how many
+	// unrelated commits landed on the base branch in between; only a
+	// disagreement here (a force-push/history rewrite on the base branch,
+	// or the base being reset to something that does not descend from
+	// what was reviewed) means the review might no longer cover what
+	// merging would actually integrate.
+	//
+	// Errors are plain, exactly like ResolveBranchSHA/CreatePR above --
+	// see IsAncestorSpec's own doc comment for the fail-closed convention
+	// every caller of this method applies to a non-nil error.
+	IsAncestor(ctx context.Context, spec IsAncestorSpec) (isAncestor bool, err error)
 
 	// ResolveContractsFingerprint fingerprints spec.Path's directory
 	// listing at spec.Ref ("mocking + contract drift", §14.3).

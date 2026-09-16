@@ -93,6 +93,13 @@ func (f *fakeSourceControl) ResolveBranchSHA(_ context.Context, spec ports.Resol
 	return f.nextSHA, resolvedBranch, nil
 }
 
+// IsAncestor (D3, second adversarial-review round) is never exercised by
+// this file's own tests -- stubbed only for ports.SourceControl interface
+// satisfaction.
+func (f *fakeSourceControl) IsAncestor(context.Context, ports.IsAncestorSpec) (bool, error) {
+	return false, errors.New("fakeSourceControl: IsAncestor not implemented")
+}
+
 func (f *fakeSourceControl) ResolveContractsFingerprint(context.Context, ports.ResolveContractsFingerprintSpec) (string, bool, error) {
 	return "", false, errors.New("fakeSourceControl: ResolveContractsFingerprint not implemented")
 }

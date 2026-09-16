@@ -40,10 +40,18 @@
 -- exactly like a not-found processing turn already does (logged, no
 -- context recorded), never a reason to fail the request.
 --
--- No index: PostReviewVerdict's own lookup is always scoped to (session_id,
--- dispatched_message_id) together, and turns.session_id already has one
--- (migrations/000005_turns.up.sql, turns_one_processing_per_session) -- a
--- session's own turn count is small (this codebase's own turn-history
--- scale, ListTurnsForSession's own doc comment), so a sequential scan
--- within one session's own rows is not a concern worth a second index for.
+-- No index (rationale corrected, second adversarial-review round, D9):
+-- turns_one_processing_per_session (migrations/000005_turns.up.sql) is a
+-- PARTIAL unique index, WHERE status = 'processing' -- Postgres can only
+-- use a partial index for a query whose WHERE clause implies that same
+-- predicate, and GetTurnByDispatchedMessageID's own query deliberately
+-- carries no status filter at all (that query's own doc comment: a turn
+-- already marked 'failed' while its own agent is still posting must
+-- still be found), so this lookup can never use it. There is, in fact,
+-- no existing index this query benefits from. The real reason a
+-- dedicated index is skipped anyway: a session's own turn count is small
+-- (this codebase's own turn-history scale, ListTurnsForSession's own doc
+-- comment), so a sequential scan within one session's own rows -- found
+-- via turns_one_processing_per_session's own underlying table access
+-- pattern, not the index itself -- is cheap regardless.
 ALTER TABLE turns ADD COLUMN dispatched_message_id TEXT;
