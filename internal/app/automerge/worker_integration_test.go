@@ -793,7 +793,9 @@ func TestPumpOnce_Armed_ZeroGetOpenPRTimeout_RefusesRatherThanMerging(t *testing
 // I2 (sixth adversarial-review round): mergeCallCount()==0 alone does not
 // prove the DeadlineExceeded check ran -- ctx_err_at_entry (the
 // zero-timeout test's OWN scenario) produces the identical outcome via
-// revalidateCore's ordinary, already-covered err != nil propagation, and a
+// RevalidateForAutoMerge's own ordinary, already-covered err != nil
+// propagation -- that check sits before revalidateCore is ever reached --
+// and a
 // slow CI runner eating the 20ms budget before GetOpenPR is even entered
 // can silently substitute that branch for this one with no test failure
 // to show it. sc.getOpenPRBranchTaken() below asserts the fake actually
@@ -844,7 +846,8 @@ func TestPumpOnce_Armed_GetOpenPRTimesOutPartwayThroughComposite_NeverMerges(t *
 	// I2: the decisive assertion. Without this, the two checks above
 	// cannot distinguish this test's own intended scenario from
 	// ctx_err_at_entry -- the SAME outcome, reached through
-	// revalidateCore's ordinary err != nil branch instead of the
+	// RevalidateForAutoMerge's own ordinary err != nil branch, which fires
+	// before revalidateCore is reached at all, instead of the
 	// getPRCtx-DeadlineExceeded check this test exists to pin. A budget
 	// change that let that substitution happen silently would otherwise
 	// pass this test while testing nothing new.
