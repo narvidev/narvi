@@ -73,11 +73,21 @@ import (
 // CheckStepRefs's own regexes already teach about the citation shapes this
 // repo uses, is the honest boundary.
 
-// stepRefPinScanDirs are Step 128's own swept roots: schema migrations
+// stepRefPinScanRoots are Step 128's own swept roots: schema migrations
 // recording which Step introduced a change, and the ops surfaces (guides,
 // runbooks, deploy manifests, CI workflow comments) that describe shipped
 // behavior by the Step that built it.
-var stepRefPinScanDirs = []string{"migrations", "docs/guides", "docs/runbooks", "deploy", ".github"}
+//
+// A root may be a single FILE, not only a directory -- docs/DECISIONS.md is
+// one. The decision register points at the Step row that owns each decision
+// and cites it by number, which is exactly the citation this check exists to
+// keep honest; it was unscanned when it landed, and this plan has been
+// renumbered before. It has to be named file-by-file rather than by adding
+// "docs": that root would sweep TECHNICAL_PLAN.md and IMPLEMENTATION_PLAN.md,
+// which cite Steps constantly and legitimately, and pinning every one of
+// those would turn the golden table into the rubber stamp its own doc
+// comment warns against.
+var stepRefPinScanRoots = []string{"migrations", "docs/guides", "docs/runbooks", "deploy", ".github", "docs/DECISIONS.md"}
 
 // stepRefPinScanExtensions is deliberately wider than stepRefScanExtensions
 // (stepref.go's own Go/TypeScript pair): the pin roots are SQL comments,
@@ -132,7 +142,7 @@ var (
 var planStepRowPattern = regexp.MustCompile(`(?m)^\|\s*(\d+)\s*∥?\s*\|\s*([^|]+?)\s*\|`)
 
 // StepCitation is one "Step N" (or one member of a joined "Steps N/M/O")
-// citation found under stepRefPinScanDirs, already reduced to the base plan
+// citation found under stepRefPinScanRoots, already reduced to the base plan
 // row it names.
 type StepCitation struct {
 	File string
@@ -187,9 +197,9 @@ func LoadPlanStepTitles(root string) (map[string]string, error) {
 // TestStepRefsPinnedToPlanRows) decides that by comparing against the
 // pinned set -- so this only excludes local narrative ("Step 1: ...")
 // scenario lines, never a real plan citation.
-func ScanStepCitationsForPinning(root string, scanDirs []string) ([]StepCitation, error) {
+func ScanStepCitationsForPinning(root string, scanRoots []string) ([]StepCitation, error) {
 	var out []StepCitation
-	for _, dir := range scanDirs {
+	for _, dir := range scanRoots {
 		base := filepath.Join(root, dir)
 		if _, err := os.Stat(base); os.IsNotExist(err) {
 			continue
