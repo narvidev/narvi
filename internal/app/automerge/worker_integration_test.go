@@ -266,8 +266,11 @@ func (f *fakeAutoMergeSourceControl) setGetOpenPRBranch(branch string) {
 // field's own doc comment). A test asserting only mergeCallCount/
 // getOpenPRCallCount cannot tell "ctx_err_at_entry" apart from
 // "blocked_ctx_done_then_ok" -- both make a fully-eligible candidate fail
-// to merge, but the FIRST exercises revalidateCore's ordinary,
-// already-covered `err != nil` propagation, while the SECOND is the one
+// to merge, but the FIRST exercises RevalidateForAutoMerge's own
+// ordinary, already-covered `err != nil` propagation -- that check sits
+// in RevalidateForAutoMerge, before revalidateCore is reached at all,
+// since revalidateCore is handed an already-fetched target -- while the
+// SECOND is the one
 // path H3's own dedicated DeadlineExceeded check
 // (internal/app/decisioninbox/revalidate.go) exists to catch: GetOpenPR
 // returning err == nil after its deadline already fired. A test meant to

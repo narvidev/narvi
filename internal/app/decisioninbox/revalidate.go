@@ -163,9 +163,21 @@ func RevalidateForAutoMerge(ctx context.Context, deps Deps, sourceControl ports.
 	// firing partway through GetOpenPR's own five-call composite still
 	// returns here with err == nil and a target reflecting whichever
 	// later sub-call the deadline cut short. Left unchecked, that renders
-	// downstream as an ordinary, permanent-looking eligibility refusal --
-	// or, via the CI hazard described above, a false approval -- rather
-	// than the transient, retry-worthy timeout it actually was. Detected
+	// downstream as an ordinary, permanent-looking eligibility refusal
+	// rather than the transient, retry-worthy timeout it actually was.
+	//
+	// It does NOT render as a false approval, and the previous version of
+	// this paragraph claimed it could. A deadline that cuts the CI read
+	// short leaves the LATER changed-files GET failing on that same
+	// expired ctx, so ChangedFilesListDegraded is set, and
+	// ComputeEligible refuses on ReasonBlastRadiusUnknown before any
+	// approval is reachable. Established with an httptest harness against
+	// the real adapter rather than reasoned about: the false CI green
+	// does occur, and it arrives inseparably bundled with the degraded
+	// changed-files signal that refuses it. Reaching a false approval
+	// needs an INDEPENDENT non-deadline failure on one CI GET with the
+	// changed-files GET still succeeding -- the separately-tracked
+	// hazard, in which a deadline plays no part. Detected
 	// via getPRCtx's OWN error, checked for DeadlineExceeded specifically
 	// -- never a bare non-nil check, which the cancel() call two lines
 	// above would ALSO satisfy on the ordinary, well-within-budget
