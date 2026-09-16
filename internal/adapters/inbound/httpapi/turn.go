@@ -374,6 +374,16 @@ type CreateTurnOptions struct {
 	ReviewDepth         *string
 	ReviewDepthDecision []byte
 
+	// ReviewVerdictContext (§21.1's amendment) mirrors ReviewDepthDecision's
+	// own identical shape one field further: non-nil ONLY for a review-
+	// session turn, the SAME callers that set ReviewHeadSHA/ReviewDepth.
+	// Stored verbatim onto turns.review_verdict_context (migrations/
+	// 000129_turns_review_verdict_context.up.sql) at INSERT time below --
+	// pre-marshaled JSON (internal/domain/reviewverdict.Context), this
+	// core does no encoding of its own, mirroring ReviewDepthDecision's
+	// own identical convention.
+	ReviewVerdictContext []byte
+
 	// ReviewKnowledgeMode/ReviewKnowledgeDecision (§31.2/§31.6's own mode
 	// buffer) mirror ReviewDepth/ReviewDepthDecision's own identical
 	// shape two fields further: non-nil ONLY for a review-session turn,
@@ -581,6 +591,7 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 	var reviewDepthDecision []byte
 	var reviewKnowledgeMode *string
 	var reviewKnowledgeDecision []byte
+	var reviewVerdictContext []byte
 	if len(opts) > 0 {
 		attachmentIDs = opts[0].AttachmentIDs
 		storageConfigured = opts[0].StorageConfigured
@@ -591,6 +602,7 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 		reviewDepthDecision = opts[0].ReviewDepthDecision
 		reviewKnowledgeMode = opts[0].ReviewKnowledgeMode
 		reviewKnowledgeDecision = opts[0].ReviewKnowledgeDecision
+		reviewVerdictContext = opts[0].ReviewVerdictContext
 	}
 
 	// §23 ("plan mode: follow-up intent classification", §23.1/§23.2):
@@ -973,6 +985,7 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 		ReviewDepthDecision:     reviewDepthDecision,
 		ReviewKnowledgeMode:     reviewKnowledgeMode,
 		ReviewKnowledgeDecision: reviewKnowledgeDecision,
+		ReviewVerdictContext:    reviewVerdictContext,
 		// answerOnly (§23.2) is nil ("classification did not
 		// apply") for every turn that predates this Step, or that never hit
 		// the plan_followup block above -- see that block's own doc

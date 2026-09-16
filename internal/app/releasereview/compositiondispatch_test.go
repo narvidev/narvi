@@ -66,6 +66,16 @@ type fakeCompositionDiffFetcher struct {
 	lastGetCompareDiffBase  string
 	lastGetCompareDiffHead  string
 	lastGetCompareDiffToken string
+
+	// resolveBranchSHA/resolveBranchSHAErr (finding F1 (§21.1's amendment)) back
+	// ResolveBranchSHA below -- the default (both zero values) reports
+	// ("", "", nil), which reviewcontext.Fetch treats as "no live
+	// resolution available" and falls back to pinning the diff fetch on
+	// pr.BaseRef (this fake's own pre-existing behavior), so every
+	// EXISTING test in this file that never configures this field keeps
+	// asserting lastGetCompareDiffBase == pr.BaseRef exactly as before.
+	resolveBranchSHA    string
+	resolveBranchSHAErr error
 }
 
 func (f *fakeCompositionDiffFetcher) GetPullRequest(_ context.Context, owner, repo string, number int32, token string) (githubapi.PullRequest, error) {
@@ -75,6 +85,13 @@ func (f *fakeCompositionDiffFetcher) GetPullRequest(_ context.Context, owner, re
 	f.lastGetPullRequestNumber = number
 	f.lastGetPullRequestToken = token
 	return f.pr, f.prErr
+}
+
+func (f *fakeCompositionDiffFetcher) ResolveBranchSHA(_ context.Context, spec ports.ResolveBranchSHASpec) (string, string, error) {
+	if f.resolveBranchSHAErr != nil {
+		return "", "", f.resolveBranchSHAErr
+	}
+	return f.resolveBranchSHA, spec.Branch, nil
 }
 
 func (f *fakeCompositionDiffFetcher) GetCompareDiff(_ context.Context, owner, repo, base, head, token string) (string, bool, error) {
@@ -151,7 +168,13 @@ func TestRun_AggregateReviewTriggered_DispatchesCompositionReviewTurn(t *testing
 	diffFetcher := &fakeCompositionDiffFetcher{pr: githubapi.PullRequest{
 		HeadSHA: "deadbeef",
 		BaseRef: "main",
-	}, diff: "diff --git a/x b/x\n+hello\n"}
+	},
+		// resolveBranchSHA (finding F1/F7 (§21.1's amendment)): a real, non-empty
+		// live base resolution, so this test's own F7 assertion (below)
+		// proves review_verdict_context.baseSha is genuinely populated,
+		// never left at the fake's own zero-value default.
+		resolveBranchSHA: "main-tip-sha",
+		diff:             "diff --git a/x b/x\n+hello\n"}
 	turns := &fakeCompositionTurnInserter{}
 	dispatch := &fakeCompositionDispatcher{}
 
@@ -190,13 +213,15 @@ func TestRun_AggregateReviewTriggered_DispatchesCompositionReviewTurn(t *testing
 	if diffFetcher.lastGetCompareDiffOwner != "acme" || diffFetcher.lastGetCompareDiffRepo != "widgets" {
 		t.Errorf("GetCompareDiff(owner, repo) = (%q, %q), want (%q, %q)", diffFetcher.lastGetCompareDiffOwner, diffFetcher.lastGetCompareDiffRepo, "acme", "widgets")
 	}
-	// base/head are PINNED to the pr's own resolved BaseRef/HeadSHA
-	// (reviewcontext.Fetch's own "pin the compare call" fix), never
+	// base/head are PINNED to the LIVE-resolved base sha/pr's own resolved
+	// HeadSHA (finding F1's own fix to reviewcontext.Fetch: the diff is
+	// pinned to the base branch's own resolved commit, never the base REF
+	// name alone, which GitHub would otherwise re-resolve itself), never
 	// in.BaseRef/in.HeadRef (the release PR's own BRANCH names) -- proving
 	// this call site actually goes through Fetch rather than some other,
 	// unpinned path.
-	if diffFetcher.lastGetCompareDiffBase != "main" || diffFetcher.lastGetCompareDiffHead != "deadbeef" {
-		t.Errorf("GetCompareDiff(base, head) = (%q, %q), want (%q, %q) (pr.BaseRef, pr.HeadSHA)", diffFetcher.lastGetCompareDiffBase, diffFetcher.lastGetCompareDiffHead, "main", "deadbeef")
+	if diffFetcher.lastGetCompareDiffBase != "main-tip-sha" || diffFetcher.lastGetCompareDiffHead != "deadbeef" {
+		t.Errorf("GetCompareDiff(base, head) = (%q, %q), want (%q, %q) (resolved base sha, pr.HeadSHA)", diffFetcher.lastGetCompareDiffBase, diffFetcher.lastGetCompareDiffHead, "main-tip-sha", "deadbeef")
 	}
 	if diffFetcher.lastGetCompareDiffToken != "gho_bottoken" {
 		t.Errorf("GetCompareDiff token = %q, want %q", diffFetcher.lastGetCompareDiffToken, "gho_bottoken")
@@ -232,6 +257,24 @@ func TestRun_AggregateReviewTriggered_DispatchesCompositionReviewTurn(t *testing
 	}
 	if turns.lastParams.ReviewHeadSha == nil || *turns.lastParams.ReviewHeadSha != "deadbeef" {
 		t.Errorf("inserted turn ReviewHeadSha = %v, want \"deadbeef\"", turns.lastParams.ReviewHeadSha)
+	}
+	// D5 (second adversarial-review round): this turn must carry NO
+	// review_verdict_context -- reverting F7's own addition from the
+	// first round (F7's premise was that leaving it NULL "permanently
+	// blocks auto-approval/auto-merge for release composition-review
+	// turns", but this turn's own prompt, asserted above, instructs the
+	// agent to post to the SEPARATE composition-findings tool, never
+	// httpapi.PostReviewVerdict -- the ONE reader of
+	// turns.review_verdict_context anywhere in this codebase -- so no
+	// request for this turn could ever present the dispatch-message-id
+	// PostReviewVerdict would need to read it back by, and §15.4/
+	// decisioninbox.buildPROpenItem's own isReleaseCut branch mean no
+	// release-cut PR ever reaches autoapproval.ComputeEligible at all
+	// regardless). A column written here and read by nothing is exactly
+	// the defect D5 names -- this asserts the write was removed, not
+	// merely that it once existed.
+	if len(turns.lastParams.ReviewVerdictContext) != 0 {
+		t.Errorf("inserted turn ReviewVerdictContext = %q, want nil/empty (D5: no request for this turn can ever present a dispatch-message-id PostReviewVerdict -- the one reader of this column -- could resolve it by, and no release-cut PR ever reaches the eligibility engine this column would feed)", turns.lastParams.ReviewVerdictContext)
 	}
 	if dispatch.calls != 1 {
 		t.Fatalf("CompositionDispatch.EnsureDispatched calls = %d, want 1", dispatch.calls)

@@ -22,6 +22,7 @@ import (
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
+	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 )
 
 // archRecapCommentBody mirrors falsePositiveCommentBody exactly (same
@@ -89,7 +90,7 @@ func seedDeepVerdictWithArchDecisions(ctx context.Context, t *testing.T, reviewV
 		AdequacyExplanation: "matches the diff",
 		ArchDecisions:       decisions,
 	}
-	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, digest, "deep", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false); err != nil {
+	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, digest, "deep", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, reviewverdict.Context{}, pgtype.UUID{}); err != nil {
 		t.Fatalf("seed deep review_verdicts row: %v", err)
 	}
 }

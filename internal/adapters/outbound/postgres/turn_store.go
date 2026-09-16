@@ -80,6 +80,25 @@ func (s *TurnStore) GetProcessingTurnForSession(ctx context.Context, sessionID p
 	return s.q.GetProcessingTurnForSession(ctx, sessionID)
 }
 
+// GetByDispatchedMessageID (finding F3 (§21.1's amendment)) resolves the SPECIFIC
+// turn a verdict-posting request actually originated from, by the
+// sandboxws.Prompt MessageId that request's own header presents --
+// mirrors GetProcessingTurnForSession's own "no turn id named at all"
+// shape one field further: still resolved from the sandbox-authenticated
+// session id alone, but now scoped to the ONE dispatch this specific
+// request is provably a reply to, never to session-wide "current" status.
+// A turn already marked terminal (e.g. 'failed' via timeout) is still
+// found here -- deliberately: that is the exact case this method exists
+// to still resolve correctly (GetTurnByDispatchedMessageID's own doc
+// comment, sqlcgen/turns.sql.go). No matching row is pgx.ErrNoRows,
+// exactly like GetProcessingTurnForSession's own not-found case.
+func (s *TurnStore) GetByDispatchedMessageID(ctx context.Context, sessionID pgtype.UUID, dispatchedMessageID string) (sqlcgen.Turn, error) {
+	return s.q.GetTurnByDispatchedMessageID(ctx, sqlcgen.GetTurnByDispatchedMessageIDParams{
+		SessionID:           sessionID,
+		DispatchedMessageID: &dispatchedMessageID,
+	})
+}
+
 // SetEpistemicOutcome is the guarded write backing the epistemic-outcome-
 // posting endpoint (§20.2) -- mirrors WorkflowStore.
 // SetStepRunOutcome's own "guarded UPDATE, observed via :execrows" idiom

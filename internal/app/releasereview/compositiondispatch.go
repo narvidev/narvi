@@ -105,6 +105,28 @@ func dispatchCompositionReview(ctx context.Context, logger *slog.Logger, deps De
 
 	prompt := review.RenderCompositionReviewPrompt(template, reviewCtx)
 
+	// review_verdict_context is deliberately NOT set on this turn (D5,
+	// second adversarial-review round -- reverting F7's own addition from
+	// the first round). F7's premise was that leaving it NULL "permanently
+	// blocks auto-approval/auto-merge for release composition-review
+	// turns" -- but a composition-review turn never reaches that gate at
+	// all: this prompt (RenderCompositionReviewPrompt/
+	// compositionFindingsToolInstructions, above) instructs the agent to
+	// post to the SEPARATE composition-findings tool, never
+	// httpapi.PostReviewVerdict -- no request for this turn ever carries
+	// an X-Sandbox-Dispatch-Message-Id header PostReviewVerdict could
+	// resolve it by, so review_verdict_context could never be read back
+	// regardless of what it held. More fundamentally, §15.4 gives a
+	// composition pass no Shippable/premise/risk score to feed
+	// autoapproval.ComputeEligible in the first place, and
+	// decisioninbox.buildPROpenItem's own isReleaseCut branch (aggregate.go)
+	// routes every release-cut PR straight to KindNeedsReview WITHOUT ever
+	// calling computeRealEligibility -- "a release cut is ALWAYS a
+	// human-judgment row, never auto-merge-eligible". A column written
+	// here and read by nothing is exactly the defect this repository keeps
+	// finding (D5's own framing) -- the fix is to stop writing it, not to
+	// invent a read path for a value no eligibility check will ever
+	// consult.
 	created, err := deps.CompositionTurns.Create(ctx, sqlcgen.CreateTurnParams{
 		SessionID:     in.SessionID,
 		Status:        sqlcgen.TurnStatusPending,

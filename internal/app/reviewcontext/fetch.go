@@ -5,6 +5,8 @@ import (
 	"log/slog"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
+	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewtriage"
 	"github.com/narvidev/narvi/internal/platform"
@@ -26,9 +28,27 @@ import (
 // either one actually reflected. GetPullRequestDiff itself is UNCHANGED
 // and still exists on *githubapi.Adapter -- it simply has no caller
 // through this narrower interface anymore.
+// ResolveBranchSHA replays ports.SourceControl.ResolveBranchSHA's own
+// exact signature (finding F1 (§21.1's amendment)) -- *githubapi.Adapter already
+// implements this method (adapter.go, built for §8.5's image builds), so
+// this interface reuses it as-is rather than inventing a second "resolve
+// a branch ref to a commit" mechanism. See Fetch's own doc comment for
+// why this call exists: GitHub's own `pull_request.base.sha` field is a
+// per-PR CACHED snapshot of the base branch's tip -- verified against
+// real GitHub PRs to lag the branch's actual current commit by an
+// unknown, sometimes month-scale margin, refreshed on GitHub's own
+// schedule, never on push. GetPullRequest's own response (adapter.go's
+// pullRequestResponse) deliberately never decodes it at all (D11,
+// internal/adapters/outbound/githubapi/adapter.go's own
+// pullRequestResponse.Base doc comment has the full "why removed, not
+// merely undecoded"). ResolveBranchSHA instead issues a real,
+// synchronous GET .../commits/{branch}, so its result is the base
+// branch's LIVE tip at the moment this review turn's context is
+// assembled -- the one value BaseSHA below is pinned to.
 type Fetcher interface {
 	GetPullRequest(ctx context.Context, owner, repo string, number int32, token string) (githubapi.PullRequest, error)
 	GetCompareDiff(ctx context.Context, owner, repo, base, head, token string) (diff string, truncated bool, err error)
+	ResolveBranchSHA(ctx context.Context, spec ports.ResolveBranchSHASpec) (sha string, resolvedBranch string, err error)
 }
 
 // Fetch builds review.PreFetchedContext for owner/repo#number -- the ONE
@@ -113,8 +133,54 @@ func Fetch(ctx context.Context, logger *slog.Logger, fetcher Fetcher, timeouts p
 	// pr.Stack == nil, knownStack == nil: an ordinary, non-stacked PR --
 	// stack stays nil.
 
+	// Finding F1: GitHub's own per-PR "base.sha" field is a CACHED
+	// snapshot of the base branch's tip -- verified against real GitHub
+	// PRs to lag the branch's actual current commit by an unknown,
+	// sometimes month-scale margin, refreshed on GitHub's own schedule
+	// rather than on every push to the base branch. pr (githubapi.
+	// PullRequest, above) never carries it at all (D11: removed, not
+	// merely undecoded -- see Fetcher's own doc comment above for the
+	// full "why"). Comparing a cached snapshot against itself later would
+	// detect nothing: the SHA half of the freshness gate would pass
+	// whether or not the base branch had actually moved -- exactly the
+	// "or whose parent moved beneath it" hazard §21.1 names as the whole
+	// reason this field was added, and the one half base_ref alone can
+	// never see.
+	//
+	// The fix mirrors HeadSHA's own discipline one section up: resolve the
+	// base branch's LIVE tip via ONE real call (ResolveBranchSHA, already
+	// shipped for §8.5's image builds -- reused as-is, never a second
+	// "resolve a ref" mechanism), then pin the diff fetch to THAT exact
+	// commit, never to the branch name alone (which GitHub would otherwise
+	// re-resolve to whatever is current at request time, one more
+	// independently-raceable read). baseSHA is therefore the ONE value
+	// both the diff and the persisted base_sha are anchored to -- an
+	// anchor by construction, not two reads that merely tend to agree.
+	//
+	// A resolution failure degrades exactly like a GetPullRequest/
+	// GetCompareDiff failure elsewhere in this function: logged, baseSHA
+	// stays "", and the diff fetch below falls back to pinning on
+	// pr.BaseRef (GitHub re-resolves the ref itself) rather than failing
+	// the whole turn -- never a reason to refuse creating the review turn.
+	// An empty persisted BaseSHA is not silently read as a match later:
+	// autoapproval.ComputeEligible's own empty-base-sha guard (finding F2)
+	// fails closed on either side being unresolved, rather than treating
+	// "" == "" as fresh.
+	baseCtx, cancel := context.WithTimeout(ctx, timeouts.GitHubResolveBaseBranchSHATimeout)
+	baseSHA, _, baseErr := fetcher.ResolveBranchSHA(baseCtx, ports.ResolveBranchSHASpec{Owner: owner, Repo: repo, Branch: pr.BaseRef, Token: token})
+	cancel()
+	if baseErr != nil {
+		logger.Warn("reviewcontext: resolve base branch's live tip failed, review turn's persisted base sha will be empty (context reads as unknown, never a stale match) and the diff fetch will pin to the base ref name instead of a resolved commit",
+			"error", baseErr, "owner", owner, "repo", repo, "pr_number", number, "base_ref", pr.BaseRef)
+		baseSHA = ""
+	}
+
+	diffBase := pr.BaseRef
+	if baseSHA != "" {
+		diffBase = baseSHA
+	}
 	diffCtx, cancel := context.WithTimeout(ctx, timeouts.GitHubPRDiffTimeout)
-	diff, truncated, err := fetcher.GetCompareDiff(diffCtx, owner, repo, pr.BaseRef, pr.HeadSHA, token)
+	diff, truncated, err := fetcher.GetCompareDiff(diffCtx, owner, repo, diffBase, pr.HeadSHA, token)
 	cancel()
 	if err != nil {
 		logger.Warn("reviewcontext: fetch compare diff failed, review turn will carry no pre-fetched diff",
@@ -147,10 +213,31 @@ func Fetch(ctx context.Context, logger *slog.Logger, fetcher Fetcher, timeouts p
 	// light posture makes that degradation safe (this file's own doc
 	// comment on review.PreFetchedContext.Additions).
 	return review.PreFetchedContext{
-		Diff:              diff,
-		DiffTruncated:     truncated,
-		Stack:             stack,
-		HeadSHA:           pr.HeadSHA,
+		Diff:          diff,
+		DiffTruncated: truncated,
+		Stack:         stack,
+		HeadSHA:       pr.HeadSHA,
+		// BaseRef/AncestorChain/PolicyVersion (§21.1's amendment) are
+		// resolved from the SAME GetPullRequest call HeadSHA/Stack
+		// themselves already come from -- no separate fetch. AncestorChain
+		// is derived from `stack` (already resolved above, preferring
+		// knownStack exactly like Stack itself), never re-derived from
+		// pr.Stack directly, mirroring `stack`'s own "knownStack takes
+		// precedence" convention. PolicyVersion is stamped from this
+		// package's own imported autoapproval.CurrentPolicyVersion --
+		// internal/domain/review cannot import that package itself
+		// (§11: "zero external imports"), so a caller that already can
+		// sets it here.
+		//
+		// BaseSHA (finding F1) is deliberately baseSHA -- the LIVE
+		// resolution above -- never GitHub's own possibly-stale
+		// `base.sha` snapshot: githubapi.PullRequest carries no such
+		// field to read here at all (D11; see the doc comment on the
+		// ResolveBranchSHA call above for the full "why").
+		BaseRef:           pr.BaseRef,
+		BaseSHA:           baseSHA,
+		AncestorChain:     review.AncestorChainFromStack(stack),
+		PolicyVersion:     autoapproval.CurrentPolicyVersion,
 		Title:             pr.Title,
 		Body:              pr.Body,
 		Additions:         pr.Additions,

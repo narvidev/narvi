@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
+	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/platform"
@@ -46,10 +47,33 @@ type fakeFetcher struct {
 	diffHead      string
 	diffToken     string
 
-	// callOrder records each method invoked, in order ("pr", "diff") --
-	// asserted directly by TestFetch_Success_CallOrderIsPRThenDiff to pin
-	// that GetPullRequest always resolves BEFORE the diff fetch is even
-	// attempted (never the reverse, and never interleaved/concurrent).
+	// resolveBranchSHA/resolveBranchSHAResolved/resolveBranchSHAErr
+	// (finding F1) back ResolveBranchSHA below -- the default (all zero
+	// values) mirrors this fake's own pre-existing "unset means a plain,
+	// harmless zero result" convention (see prErr/diffErr's own defaults):
+	// an unset resolveBranchSHA reports ("", "", nil), which Fetch treats
+	// identically to "resolution unavailable" (baseSHA stays "", the diff
+	// fetch falls back to pinning on the base REF), so every EXISTING test
+	// in this file that never configures this field keeps its own
+	// pre-fix behavior for every OTHER assertion it makes.
+	resolveBranchSHA         string
+	resolveBranchSHAResolved string
+	resolveBranchSHAErr      error
+	resolveBranchSHACalls    int
+	resolveBranchSHAOwner    string
+	resolveBranchSHARepo     string
+	resolveBranchSHABranch   string
+	resolveBranchSHAToken    string
+
+	// callOrder records each method invoked, in order ("pr",
+	// "resolvebranchsha", "diff") -- asserted directly by
+	// TestFetch_Success_CallOrderIsPRThenResolveBranchSHAThenDiff to pin
+	// that GetPullRequest always resolves BEFORE the base-branch
+	// resolution, which itself always resolves BEFORE the diff fetch is
+	// even attempted (never the reverse, and never interleaved/
+	// concurrent) -- the ordering the whole F1 fix depends on: the diff
+	// fetch must be pinned to the SAME resolved base sha this call
+	// reports, never a value obtained after it.
 	callOrder []string
 }
 
@@ -58,6 +82,13 @@ func (f *fakeFetcher) GetPullRequest(_ context.Context, owner, repo string, numb
 	f.prOwner, f.prRepo, f.prNumber, f.prToken = owner, repo, number, token
 	f.callOrder = append(f.callOrder, "pr")
 	return f.pr, f.prErr
+}
+
+func (f *fakeFetcher) ResolveBranchSHA(_ context.Context, spec ports.ResolveBranchSHASpec) (string, string, error) {
+	f.resolveBranchSHACalls++
+	f.resolveBranchSHAOwner, f.resolveBranchSHARepo, f.resolveBranchSHABranch, f.resolveBranchSHAToken = spec.Owner, spec.Repo, spec.Branch, spec.Token
+	f.callOrder = append(f.callOrder, "resolvebranchsha")
+	return f.resolveBranchSHA, f.resolveBranchSHAResolved, f.resolveBranchSHAErr
 }
 
 func (f *fakeFetcher) GetCompareDiff(_ context.Context, owner, repo, base, head, token string) (string, bool, error) {
@@ -88,18 +119,21 @@ func assertDiffArgs(t *testing.T, f *fakeFetcher, wantOwner, wantRepo, wantBase,
 	}
 }
 
-// TestFetch_Success_DiffPinnedToExactlyWhatGetPullRequestReported is the
-// C2 regression test at the unit level: the
-// core atomicity property this whole fix exists to provide -- the diff
-// fetch (GetCompareDiff) is parametrized by EXACTLY pr.BaseRef/pr.HeadSHA,
-// the SAME values this call returns as HeadSHA, never a second,
-// independently-suppliable value that could disagree.
-func TestFetch_Success_DiffPinnedToExactlyWhatGetPullRequestReported(t *testing.T) {
+// TestFetch_Success_DiffPinnedToExactlyWhatWasResolved is the C2/F1
+// regression test at the unit level: the core atomicity property this
+// whole fix exists to provide -- the diff fetch (GetCompareDiff) is
+// parametrized by EXACTLY pr.HeadSHA and the LIVE-resolved base sha
+// (finding F1: never pr.BaseRef alone, and never GetPullRequest's own
+// possibly-stale base.sha field), the SAME values this call returns as
+// HeadSHA/BaseSHA, never a second, independently-suppliable value that
+// could disagree.
+func TestFetch_Success_DiffPinnedToExactlyWhatWasResolved(t *testing.T) {
 	t.Parallel()
 
 	fetcher := &fakeFetcher{
-		pr:   githubapi.PullRequest{HeadRef: "feature-x", HeadSHA: "resolved-head-sha", BaseRef: "main", Title: "Fix the retry loop", Body: "Retries now back off exponentially."},
-		diff: "diff --git a/x b/x\n",
+		pr:               githubapi.PullRequest{HeadRef: "feature-x", HeadSHA: "resolved-head-sha", BaseRef: "main", Title: "Fix the retry loop", Body: "Retries now back off exponentially."},
+		diff:             "diff --git a/x b/x\n",
+		resolveBranchSHA: "resolved-base-sha",
 	}
 
 	got := reviewcontext.Fetch(context.Background(), discardLogger(), fetcher, platform.DefaultTimeouts(), "acme", "widgets", 42, "gho_bottoken", nil)
@@ -116,6 +150,15 @@ func TestFetch_Success_DiffPinnedToExactlyWhatGetPullRequestReported(t *testing.
 	if got.HeadSHA != "resolved-head-sha" {
 		t.Errorf("HeadSHA = %q, want %q", got.HeadSHA, "resolved-head-sha")
 	}
+	// THE decisive F1 assertion: BaseSHA comes from the LIVE
+	// ResolveBranchSHA call, never from GitHub's own possibly-stale
+	// `base.sha` -- githubapi.PullRequest carries no such field at all
+	// (D11), so there is no fixture value a regression could fall back to
+	// reading; this assertion would simply fail against a real, non-empty
+	// resolveBranchSHA fixture value if it ever stopped being used.
+	if got.BaseSHA != "resolved-base-sha" {
+		t.Errorf("BaseSHA = %q, want %q (the LIVE-resolved value)", got.BaseSHA, "resolved-base-sha")
+	}
 	if got.Title != "Fix the retry loop" {
 		t.Errorf("Title = %q, want %q", got.Title, "Fix the retry loop")
 	}
@@ -125,28 +168,72 @@ func TestFetch_Success_DiffPinnedToExactlyWhatGetPullRequestReported(t *testing.
 	if fetcher.prCalls != 1 {
 		t.Errorf("prCalls = %d, want 1", fetcher.prCalls)
 	}
+	if fetcher.resolveBranchSHACalls != 1 {
+		t.Errorf("resolveBranchSHACalls = %d, want 1", fetcher.resolveBranchSHACalls)
+	}
 	if fetcher.diffCalls != 1 {
 		t.Errorf("diffCalls = %d, want 1", fetcher.diffCalls)
 	}
 	assertPRArgs(t, fetcher, "acme", "widgets", 42, "gho_bottoken")
-	// THE core assertion: GetCompareDiff's own base/head args are EXACTLY
-	// pr.BaseRef/pr.HeadSHA -- proving the diff is pinned to what
-	// GetPullRequest reported, never an independent value.
+	if fetcher.resolveBranchSHAOwner != "acme" || fetcher.resolveBranchSHARepo != "widgets" || fetcher.resolveBranchSHABranch != "main" || fetcher.resolveBranchSHAToken != "gho_bottoken" {
+		t.Errorf("ResolveBranchSHA args = (%q, %q, branch=%q, %q), want (\"acme\", \"widgets\", branch=\"main\", \"gho_bottoken\")",
+			fetcher.resolveBranchSHAOwner, fetcher.resolveBranchSHARepo, fetcher.resolveBranchSHABranch, fetcher.resolveBranchSHAToken)
+	}
+	// THE core atomicity assertion: GetCompareDiff's own base arg is
+	// EXACTLY the resolved base sha, never pr.BaseRef (the branch name
+	// GitHub would otherwise re-resolve itself, one more independently-
+	// raceable read) -- githubapi.PullRequest has no BaseSHA field to
+	// confuse this with (D11).
+	assertDiffArgs(t, fetcher, "acme", "widgets", "resolved-base-sha", "resolved-head-sha", "gho_bottoken")
+}
+
+// TestFetch_BaseResolutionFails_DiffFallsBackToBaseRef_BaseSHAEmpty proves
+// finding F1's own degradation path: a ResolveBranchSHA failure never
+// fails the whole review turn's own creation (mirroring every other
+// degrade-gracefully precedent in this function) -- BaseSHA stays "" (an
+// honest "could not be established", never a stale or guessed value), and
+// the diff fetch falls back to pinning on the base REF name, exactly the
+// pre-fix behavior for that ONE call, so a transient GitHub failure here
+// costs nothing beyond an empty BaseSHA (which autoapproval.ComputeEligible's
+// own empty-base-sha guard, finding F2, then fails closed on -- never
+// silently reads as a match).
+func TestFetch_BaseResolutionFails_DiffFallsBackToBaseRef_BaseSHAEmpty(t *testing.T) {
+	t.Parallel()
+
+	fetcher := &fakeFetcher{
+		pr:                  githubapi.PullRequest{HeadSHA: "resolved-head-sha", BaseRef: "main"},
+		diff:                "d",
+		resolveBranchSHAErr: errors.New("network exploded"),
+	}
+
+	got := reviewcontext.Fetch(context.Background(), discardLogger(), fetcher, platform.DefaultTimeouts(), "acme", "widgets", 42, "gho_bottoken", nil)
+
+	if got.BaseSHA != "" {
+		t.Errorf("BaseSHA = %q, want empty on a ResolveBranchSHA failure", got.BaseSHA)
+	}
+	if got.HeadSHA != "resolved-head-sha" {
+		t.Errorf("HeadSHA = %q, want %q -- a base-resolution failure must not erase an already-confirmed head sha", got.HeadSHA, "resolved-head-sha")
+	}
+	if got.Diff != "d" {
+		t.Errorf("Diff = %q, want %q -- a base-resolution failure must not prevent the diff fetch, only its pinning precision", got.Diff, "d")
+	}
 	assertDiffArgs(t, fetcher, "acme", "widgets", "main", "resolved-head-sha", "gho_bottoken")
 }
 
-// TestFetch_Success_CallOrderIsPRThenDiff pins that GetPullRequest always
-// resolves BEFORE GetCompareDiff is even attempted -- the ordering the
-// whole atomicity fix depends on (fetch.go's own doc comment: "resolve
+// TestFetch_Success_CallOrderIsPRThenResolveBranchSHAThenDiff pins that
+// GetPullRequest always resolves BEFORE ResolveBranchSHA, which itself
+// always resolves BEFORE GetCompareDiff is even attempted -- the ordering
+// the whole atomicity fix depends on (fetch.go's own doc comment: "resolve
 // pr.HeadSHA ... FIRST, then fetch the diff ... PINNED to that exact
-// pair").
-func TestFetch_Success_CallOrderIsPRThenDiff(t *testing.T) {
+// pair", and finding F1's amendment: the base sha must be resolved before
+// the diff fetch it pins).
+func TestFetch_Success_CallOrderIsPRThenResolveBranchSHAThenDiff(t *testing.T) {
 	t.Parallel()
 
 	fetcher := &fakeFetcher{pr: githubapi.PullRequest{HeadSHA: "sha", BaseRef: "main"}, diff: "d"}
 	reviewcontext.Fetch(context.Background(), discardLogger(), fetcher, platform.DefaultTimeouts(), "acme", "widgets", 42, "gho_bottoken", nil)
 
-	want := []string{"pr", "diff"}
+	want := []string{"pr", "resolvebranchsha", "diff"}
 	if len(fetcher.callOrder) != len(want) {
 		t.Fatalf("callOrder = %v, want %v", fetcher.callOrder, want)
 	}

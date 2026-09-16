@@ -40,8 +40,9 @@ const (
 // placeholderTokens lists every literal placeholder token this whole
 // system ever substitutes for a live secret (or, for
 // ReviewCostBudgetToolURLPlaceholder, a live but non-secret local URL) at
-// prompt-substitution time -- this package's own four (VerdictToolURLPlaceholder/
+// prompt-substitution time -- this package's own five (VerdictToolURLPlaceholder/
 // VerdictToolBearerPlaceholder/VerdictToolGenPlaceholder/
+// VerdictToolDispatchMessageIDPlaceholder (finding F3 (§21.1's amendment))/
 // ReviewCostBudgetToolURLPlaceholder, referenced directly, not duplicated:
 // this file is IN internal/domain/review), plus turn's own three and
 // upload's own three (both duplicated as raw literals immediately above,
@@ -101,6 +102,7 @@ var placeholderTokens = []string{
 	VerdictToolURLPlaceholder,
 	VerdictToolBearerPlaceholder,
 	VerdictToolGenPlaceholder,
+	VerdictToolDispatchMessageIDPlaceholder,
 	ReviewCostBudgetToolURLPlaceholder,
 	CompositionFindingsToolURLPlaceholder,
 	CompositionFindingsToolBearerPlaceholder,

@@ -1,0 +1,101 @@
+-- turns.dispatched_message_id (Step 173, finding F3): the sandboxws.Prompt
+-- MessageId (contracts/gen/go/sandboxws) this turn's own dispatch actually
+-- sent to the sandbox -- the wire identifier the review agent's own
+-- prompt-substitution step (cmd/sandbox-agent's renderVerdictToolPromptText)
+-- embeds into the verdict-posting tool's own instructions as a header, and
+-- the ONE fact httpapi.PostReviewVerdict now resolves the posting turn BY,
+-- instead of "whichever turn happens to be status='processing' for this
+-- session right now" (GetProcessingTurnForSession).
+--
+-- The defect this closes: turns_one_processing_per_session (migrations/
+-- 000005_turns.up.sql) guarantees at most one turn is EVER 'processing' at
+-- once, but says nothing about which turn a specific, already-in-flight
+-- HTTP call actually originated from. A turn that exceeds TurnDeadline is
+-- marked 'failed' while its own agent process can still be alive in the
+-- same sandbox (this codebase's own documented sandbox-lifetime gap: a
+-- turn timeout does not forcibly kill the underlying sandbox process); a
+-- queued retrigger then dispatches a SECOND turn to that SAME sandbox
+-- incarnation (no respawn, same X-Sandbox-Gen), which becomes the new
+-- 'processing' row. When the FIRST turn's agent finally posts its verdict,
+-- GetProcessingTurnForSession resolves the SECOND turn's context/head/base
+-- -- a verdict genuinely produced against the first turn's own commit is
+-- silently stamped with a different turn's review context. §21.1's own
+-- head_sha paragraph already names this exact class of hazard one level
+-- down: "the SHA must be scoped to the turn that examined it, never to a
+-- per-(repo, PR) column ... a verdict can be recorded against a commit it
+-- never read." This is the same hazard one level UP: scoping head_sha/
+-- context to "the turn" is not enough when "the turn" itself is resolved
+-- by session-wide, time-varying state rather than by an identifier the
+-- posting request itself carries.
+--
+-- Stamped by the SAME two call sites (internal/app/sessionactor's
+-- tryPlanDispatch/tryPlanReenqueue, dispatch.go) that already stamp
+-- dispatched_sandbox_gen/dispatched_event_id via UpdateTurnStatus, in the
+-- SAME write, from the SAME messageID BuildPromptPayload embeds into the
+-- wire Prompt itself -- never a second, independently-generated value that
+-- could drift from what the sandbox actually received. Nullable: NULL for
+-- every turn created before this migration, and for any turn that has
+-- never been dispatched at all.
+--
+-- Degrade description corrected (E3, third adversarial-review round): an
+-- earlier version of this comment said a verdict-posting request
+-- presenting a missing or unmatched dispatched_message_id "finds no
+-- turn, degrading exactly like a not-found processing turn already does
+-- ... never a reason to fail the request." That described this column's
+-- own ORIGINAL degrade-and-proceed behavior, which the second
+-- adversarial-review round (D1/D4/D6) replaced with an outright refusal:
+-- httpapi.PostReviewVerdict now returns 403 for a missing header, the
+-- literal unsubstituted placeholder, or a well-formed header naming no
+-- turn in this session (pgx.ErrNoRows from GetTurnByDispatchedMessageID,
+-- below) -- never a 201 with the lookup silently skipped. NULL on this
+-- column is still a legitimate, unrelated case (a turn that predates
+-- this migration, or was never dispatched at all); it is the REQUEST's
+-- own failure to attribute a verdict to a turn that no longer degrades.
+-- See reviewverdict.go's own outcome table for the current, authoritative
+-- behavior.
+--
+-- Index rationale corrected a third time (E3/E8, third adversarial-review
+-- round; G6, fourth round): the second round (D9) correctly showed
+-- turns_one_processing_per_session (migrations/000005_turns.up.sql)
+-- cannot back this query -- it is a PARTIAL unique index,
+-- WHERE status = 'processing', and GetTurnByDispatchedMessageID
+-- (queries/turns.sql) carries no status filter at all, so Postgres can
+-- never choose it for THIS query -- but the third round's own
+-- conclusion, that there is "no session_id index of ANY kind on this
+-- table, partial or otherwise", contradicted the sentence immediately
+-- above it: turns_one_processing_per_session IS a session_id index,
+-- partial, exactly as just described. Verified directly against the
+-- live schema (`\d turns` against every migration through 000130
+-- applied): the one and only session_id-touching index before this
+-- migration is that same partial one, scoped to status = 'processing'.
+-- What is true, and is the actual reason this migration's own index is
+-- needed, is narrower: no index on this table can serve a session_id
+-- lookup that carries NO status filter -- the partial index's own WHERE
+-- clause is exactly what disqualifies it here, already established two
+-- sentences above -- so what GetTurnByDispatchedMessageID's query plans
+-- to today is a SEQUENTIAL SCAN OF THE WHOLE turns TABLE, across every
+-- session this deployment has ever run -- never "within one session's
+-- own rows", which is not a thing an unindexed-for-this-predicate scan
+-- can be scoped to. The cited justification for that ("this codebase's
+-- own turn-history scale, ListTurnsForSession's own doc comment") does
+-- not exist either: ListTurnsForSession's own doc comment says nothing
+-- about scale, and carries the identical status-unfiltered
+-- session_id = $1 predicate itself -- which the partial index cannot
+-- serve for the SAME reason.
+--
+-- This is, in addition, this deployment's highest-frequency turns lookup
+-- with no status-unfiltered session_id index to answer it: GetTurnByDispatchedMessageID
+-- runs on every verdict-posting request (httpapi.PostReviewVerdict), a
+-- request volume that scales with total review-turn count across every
+-- session ever run, never with any one session's own small turn history.
+-- A composite index on (session_id, dispatched_message_id) answers this
+-- query directly -- both predicates are equality, fully covered by the
+-- index, and carrying no WHERE clause of its own -- and its leading
+-- column also serves ListTurnsForSession's own identical session_id = $1
+-- filter, though that query's own ORDER BY created_at still needs its
+-- own sort step this index does not cover -- a genuine, if partial,
+-- second benefit, not the reason this index exists.
+ALTER TABLE turns ADD COLUMN dispatched_message_id TEXT;
+
+CREATE INDEX turns_session_id_dispatched_message_id_idx
+    ON turns (session_id, dispatched_message_id);

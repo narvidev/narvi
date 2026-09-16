@@ -313,7 +313,7 @@ func TestRenderEpistemicOutcomeToolPromptText_HostileFilenameCannotExfiltrateSec
 
 			// The REAL production substitution sequence, in the REAL
 			// order main.go's own HandlePrompt runs it.
-			got := renderVerdictToolPromptText(promptText, cfg)
+			got := renderVerdictToolPromptText(promptText, cfg, "msg-epistemic-hostile")
 			got = renderUploadToolPromptText(got, cfg)
 			got = renderEpistemicOutcomeToolPromptText(got, cfg)
 
@@ -378,7 +378,7 @@ func TestRenderEpistemicOutcomeAndVerdictPlaceholders_Independent(t *testing.T) 
 		Gen:               4,
 	}
 
-	got := renderVerdictToolPromptText(text, cfg)
+	got := renderVerdictToolPromptText(text, cfg, "msg-epistemic-independent")
 	got = renderUploadToolPromptText(got, cfg)
 	got = renderEpistemicOutcomeToolPromptText(got, cfg)
 

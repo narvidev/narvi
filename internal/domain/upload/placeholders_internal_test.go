@@ -35,7 +35,11 @@ func TestPlaceholderTokensMatchReviewPackage(t *testing.T) {
 		review.VerdictToolURLPlaceholder,
 		review.VerdictToolBearerPlaceholder,
 		review.VerdictToolGenPlaceholder,
-		// (§26.7/§26.9): review's FOURTH placeholder, a single
+		// (finding F3, §21.1's amendment): review's FIFTH placeholder --
+		// see reviewVerdictToolDispatchMessageIDPlaceholderLiteral's own
+		// doc comment (prompt.go).
+		review.VerdictToolDispatchMessageIDPlaceholder,
+		// (§26.7/§26.9): review's own single
 		// literal with no bearer/gen counterpart (the endpoint it points at
 		// needs no authentication, reviewcostbudgetserver.go's own doc
 		// comment).
@@ -74,12 +78,14 @@ func TestPlaceholderTokensMatchTurnPackage(t *testing.T) {
 }
 
 // TestPlaceholderTokensExactCount pins placeholderTokens' own total size --
-// this package's own three, plus review's own four, plus turn's own three,
+// this package's own three, plus review's own five, plus turn's own three,
 // no more no less (F1, adversarial review: bumped 6 -> 9 when turn's three
 // EPISTEMIC_OUTCOME_TOOL_* literals were registered; §26.7/§26.9:
 // bumped 9 -> 10 when review's own fourth, ReviewCostBudgetToolURLPlaceholder,
 // was registered; 10 -> 13 when the release composition-findings tool
-// registered a URL/bearer/gen triple, §15.3). A future family that grows this list without a
+// registered a URL/bearer/gen triple, §15.3; 13 -> 14 when review's own
+// fifth, VerdictToolDispatchMessageIDPlaceholder, was registered (finding
+// F3, §21.1's amendment)). A future family that grows this list without a
 // corresponding drift-matcher test above (or without the general
 // cross-domain-package scan, placeholderdrift_internal_test.go) fails here
 // first, forcing a deliberate update to this exact number rather than an
@@ -96,8 +102,8 @@ func TestPlaceholderTokensExactCount(t *testing.T) {
 		}
 	}
 
-	if len(placeholderTokens) != 13 {
-		t.Errorf("len(placeholderTokens) = %d, want exactly 13 (this package's own 3, plus review's own 4, plus its 3 for the release composition-findings tool, plus turn's own 3, no more no less)", len(placeholderTokens))
+	if len(placeholderTokens) != 14 {
+		t.Errorf("len(placeholderTokens) = %d, want exactly 14 (this package's own 3, plus review's own 5, plus its 3 for the release composition-findings tool, plus turn's own 3, no more no less)", len(placeholderTokens))
 	}
 }
 

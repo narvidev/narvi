@@ -115,18 +115,27 @@ func TestPostReviewVerdict_PersistsKnowledgeAndArchDecisionStamps(t *testing.T) 
 			}
 			knowledgeMode := tc.knowledgeMode
 
-			if _, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{
+			createdTurn, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{
 				SessionID:               session.ID,
 				Status:                  sqlcgen.TurnStatusProcessing,
 				ReviewHeadSha:           &reviewHeadSHA,
 				ReviewDepthDecision:     triageRecordJSON,
 				ReviewKnowledgeMode:     &knowledgeMode,
 				ReviewKnowledgeDecision: knowledgeDecisionJSON,
-			}); err != nil {
+			})
+			if err != nil {
 				t.Fatalf("seed processing turn with knowledge/arch-decision stamps: %v", err)
 			}
+			// dispatched_message_id (finding F3 (§21.1's amendment)): stamped here
+			// so postReviewVerdict's own testDispatchMessageID header
+			// resolves THIS turn via the real
+			// turns.GetByDispatchedMessageID lookup.
+			turnMessageID := testDispatchMessageID
+			if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: createdTurn.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedMessageID: &turnMessageID}); err != nil {
+				t.Fatalf("stamp dispatched_message_id on seeded turn: %v", err)
+			}
 
-			status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", validVerdictRequestJSON())
+			status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, validVerdictRequestJSON())
 			if status != http.StatusCreated {
 				t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 			}

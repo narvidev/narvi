@@ -496,6 +496,18 @@ func TestHandleEnsureDispatched_SandboxReady_DispatchesTurn(t *testing.T) {
 	if !got.DispatchedAt.Valid {
 		t.Error("turn dispatched_at not set")
 	}
+	// D7 (second adversarial-review round, restoring F3's own write-half
+	// coverage): turns.dispatched_message_id must be stamped on real
+	// dispatch -- httpapi.PostReviewVerdict resolves a posting turn BY
+	// this exact identifier (turns.GetByDispatchedMessageID), so a turn
+	// dispatched with it left NULL can never be attributed to a verdict
+	// at all. Before this test, deleting `DispatchedMessageID: &messageID`
+	// from tryPlanDispatch's own UpdateStatus call (dispatch.go) kept this
+	// whole suite green -- UpdateTurnStatus's own COALESCE semantics make
+	// a nil param a silent no-op, so nothing here or elsewhere noticed.
+	if got.DispatchedMessageID == nil || *got.DispatchedMessageID == "" {
+		t.Fatal("turn dispatched_message_id not set -- httpapi.PostReviewVerdict can never attribute a verdict to this turn without it")
+	}
 
 	var n int
 	if err := pool.QueryRow(ctx,
@@ -523,6 +535,20 @@ func TestHandleEnsureDispatched_SandboxReady_DispatchesTurn(t *testing.T) {
 	}
 	if prompt.ScmName == "" || prompt.ScmEmail == "" {
 		t.Error("Prompt.ScmName/ScmEmail must be non-empty")
+	}
+	// D7's own second guard: the message id STAMPED into
+	// turns.dispatched_message_id must be the EXACT SAME value embedded
+	// into the wire Prompt's own MessageId -- never a second,
+	// independently-generated id. tryPlanDispatch (dispatch.go) generates
+	// messageID exactly ONCE and threads it into both the UpdateStatus
+	// write and BuildPromptPayload -- a regression that generated a
+	// SECOND uuid for either one (e.g. two separate uuid.NewString()
+	// calls) would leave the sandbox-agent substituting a
+	// X-Sandbox-Dispatch-Message-Id the DATABASE row does not recognize,
+	// so a real, honest verdict-posting call would be refused (D1/D4/D6)
+	// as if it were unattributable.
+	if prompt.MessageId != *got.DispatchedMessageID {
+		t.Errorf("Prompt.MessageId = %q, turns.dispatched_message_id = %q, want the IDENTICAL value (one messageID threaded into both, never two independently generated ids)", prompt.MessageId, *got.DispatchedMessageID)
 	}
 	if commander.sessions[0] != sessionID.String() {
 		t.Errorf("SendCommand sessionID = %q, want %q", commander.sessions[0], sessionID.String())
@@ -2559,6 +2585,21 @@ func TestHandleEnsureDispatched_ProcessingOnStaleGenReadySandbox_Reenqueues(t *t
 	}
 	if prompt.Text != "finish the job" {
 		t.Errorf("dispatched Prompt.Text = %q, want %q", prompt.Text, "finish the job")
+	}
+	// D7 (second adversarial-review round): tryPlanReenqueue's own sibling
+	// write, mirroring tryPlanDispatch's own identical two guards
+	// (TestHandleEnsureDispatched_SandboxReady_DispatchesTurn) -- a fresh
+	// messageID is generated on EVERY re-enqueue (this function's own doc
+	// comment: "a fresh value on EVERY re-enqueue is correct, not merely
+	// tolerated"), so it must be BOTH stamped onto turns.
+	// dispatched_message_id AND identical to the wire Prompt's own
+	// MessageId, never left NULL and never a second, independently
+	// generated id.
+	if gotTurn.DispatchedMessageID == nil || *gotTurn.DispatchedMessageID == "" {
+		t.Fatal("turn dispatched_message_id not set on re-enqueue -- httpapi.PostReviewVerdict can never attribute a verdict to this turn without it")
+	}
+	if prompt.MessageId != *gotTurn.DispatchedMessageID {
+		t.Errorf("dispatched Prompt.MessageId = %q, turns.dispatched_message_id = %q, want the IDENTICAL value", prompt.MessageId, *gotTurn.DispatchedMessageID)
 	}
 }
 

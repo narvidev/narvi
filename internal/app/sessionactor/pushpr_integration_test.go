@@ -167,6 +167,14 @@ func (f *fakeSourceControl) ResolveBranchSHA(_ context.Context, spec ports.Resol
 	return f.nextSHA, resolvedBranch, nil
 }
 
+// IsAncestor (D3, second adversarial-review round) is never exercised by
+// this file's own tests -- stubbed only for ports.SourceControl interface
+// satisfaction, mirroring this fake's own precedent for methods no test
+// here calls.
+func (f *fakeSourceControl) IsAncestor(context.Context, ports.IsAncestorSpec) (bool, error) {
+	return false, nil
+}
+
 func (f *fakeSourceControl) shaCallCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

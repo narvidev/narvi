@@ -947,6 +947,27 @@ func TestDefaultTimeouts_GitHubPRPayloadCorrectnessStandaloneField(t *testing.T)
 	}
 }
 
+// TestDefaultTimeouts_GitHubGetOpenPRTimeoutStandaloneField proves the H3
+// (fifth adversarial-review round) standalone addition -- GitHubGetOpenPRTimeout,
+// split out from GitHubGetPRTimeout's own prior misuse at
+// internal/app/decisioninbox.RevalidateForAutoMerge's own GetOpenPR call
+// site -- ships with a sane, non-zero default, and that adding it did not
+// disturb either pre-existing invariant chain, matching every other
+// standalone addition's own test precedent above.
+func TestDefaultTimeouts_GitHubGetOpenPRTimeoutStandaloneField(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+
+	if to.GitHubGetOpenPRTimeout <= 0 {
+		t.Errorf("GitHubGetOpenPRTimeout = %v, want > 0", to.GitHubGetOpenPRTimeout)
+	}
+
+	if err := to.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil (GitHubGetOpenPRTimeout must not disturb either invariant chain)", err)
+	}
+}
+
 // TestDefaultTimeouts_Step40StandaloneField proves §19.3's ("warm boot:
 // fetch-aware git sync", §19.3) own addition -- GitFetchStepTimeout -- ships
 // with a sane, non-zero default matching its own documented value (§19.3's
@@ -1361,6 +1382,53 @@ func TestDefaultTimeouts_Step120StandaloneField(t *testing.T) {
 	}
 	if to.PlatformAnalyticsWindow != 30*24*time.Hour {
 		t.Errorf("PlatformAnalyticsWindow = %v, want %v", to.PlatformAnalyticsWindow, 30*24*time.Hour)
+	}
+
+	if err := to.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil (this field must not disturb either invariant chain)", err)
+	}
+}
+
+// TestDefaultTimeouts_Step173StandaloneField proves §21.1's amendment's own finding
+// F1 addition -- GitHubResolveBaseBranchSHATimeout -- ships with a
+// sensible, non-zero default and does not disturb either invariant chain
+// (it is a standalone field, wired into neither). Also covers D2's own
+// addition (second adversarial-review round) -- DecisionInboxResolveBranchSHATimeout,
+// a DISTINCT field for a distinct call site/package (decisioninbox's own
+// SCMCache) even though it shares GitHubResolveBaseBranchSHATimeout's own
+// chosen value, matching this codebase's own "one named timeout per
+// distinct network-call type" convention.
+func TestDefaultTimeouts_Step173StandaloneField(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+
+	if to.GitHubResolveBaseBranchSHATimeout <= 0 {
+		t.Errorf("GitHubResolveBaseBranchSHATimeout = %v, want > 0", to.GitHubResolveBaseBranchSHATimeout)
+	}
+	if to.GitHubResolveBaseBranchSHATimeout != 10*time.Second {
+		t.Errorf("GitHubResolveBaseBranchSHATimeout = %v, want %v", to.GitHubResolveBaseBranchSHATimeout, 10*time.Second)
+	}
+
+	if to.DecisionInboxResolveBranchSHATimeout <= 0 {
+		t.Errorf("DecisionInboxResolveBranchSHATimeout = %v, want > 0", to.DecisionInboxResolveBranchSHATimeout)
+	}
+	if to.DecisionInboxResolveBranchSHATimeout != 10*time.Second {
+		t.Errorf("DecisionInboxResolveBranchSHATimeout = %v, want %v", to.DecisionInboxResolveBranchSHATimeout, 10*time.Second)
+	}
+
+	// DecisionInboxIsAncestorTimeout (D3, second adversarial-review round)
+	// had NO assertion anywhere in this file until E7, third
+	// adversarial-review round: a zero value here would have made
+	// revalidateCore's own IsAncestor call fail on every single
+	// invocation (context.WithTimeout with a non-positive duration
+	// expires immediately) with no test anywhere noticing, silently
+	// disabling the whole D3 fast-forward-tolerance mechanism.
+	if to.DecisionInboxIsAncestorTimeout <= 0 {
+		t.Errorf("DecisionInboxIsAncestorTimeout = %v, want > 0", to.DecisionInboxIsAncestorTimeout)
+	}
+	if to.DecisionInboxIsAncestorTimeout != 10*time.Second {
+		t.Errorf("DecisionInboxIsAncestorTimeout = %v, want %v", to.DecisionInboxIsAncestorTimeout, 10*time.Second)
 	}
 
 	if err := to.Validate(); err != nil {

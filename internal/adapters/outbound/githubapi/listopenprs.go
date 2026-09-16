@@ -149,9 +149,27 @@ type openPRDetailResponse struct {
 	Head struct {
 		SHA string `json:"sha"`
 	} `json:"head"`
+	// Base.SHA (§21.1's amendment) is this response shape's own decode of
+	// GitHub's per-PR CACHED base commit -- ports.OpenPR.BaseSHA below is
+	// this response's one consumer, and that field's own doc comment
+	// (ports/sourcecontrol.go) is normative for why it is retained for
+	// display/audit only, never wired into an eligibility comparison.
+	// adapter.go's own pullRequestResponse -- a DIFFERENT response shape,
+	// GetPullRequest's, not this one -- no longer decodes the equivalent
+	// field at all (D11): the two shapes are not mirrors of each other on
+	// this point, unlike before D11.
 	Base struct {
 		Ref string `json:"ref"`
+		SHA string `json:"sha"`
 	} `json:"base"`
+
+	// Stack (§21.1's amendment) mirrors pullRequestResponse.Stack's own
+	// identical GitHub-native-stack object (adapter.go, §17.6) -- reuses
+	// that file's own stackResponse shape verbatim, this package's one
+	// other decode target for it, so ports.OpenPR.AncestorChain below can
+	// be derived the SAME way review.PreFetchedContext.AncestorChain
+	// already is at review-context-fetch time.
+	Stack *stackResponse `json:"stack"`
 
 	Labels []struct {
 		Name string `json:"name"`
@@ -419,9 +437,11 @@ func (a *Adapter) buildOpenPRFromDetail(ctx context.Context, owner, repo string,
 		Title:   detail.Title,
 		HTMLURL: detail.HTMLURL,
 
-		HeadSHA: detail.Head.SHA,
-		BaseRef: detail.Base.Ref,
-		Draft:   detail.Draft,
+		HeadSHA:       detail.Head.SHA,
+		BaseRef:       detail.Base.Ref,
+		BaseSHA:       detail.Base.SHA,
+		AncestorChain: ancestorChainFromDetailStack(detail.Stack),
+		Draft:         detail.Draft,
 
 		Author:             author,
 		Assignees:          assignees,
@@ -455,6 +475,21 @@ func (a *Adapter) buildOpenPRFromDetail(ctx context.Context, owner, repo string,
 	}
 
 	return pr
+}
+
+// ancestorChainFromDetailStack mirrors internal/domain/review.
+// AncestorChainFromStack's own identical derivation, one layer down --
+// this port (§4.3) stays domain-free, so it builds its own
+// ports.PRAncestorLink slice directly from stack rather than importing
+// that domain function. See AncestorChainFromStack's own doc comment for
+// the full "why one link, nearest-first" reasoning; kept in exact sync
+// with it deliberately (there is exactly one other real caller of the
+// identical logic, internal/app/reviewcontext.Fetch).
+func ancestorChainFromDetailStack(stack *stackResponse) []ports.PRAncestorLink {
+	if stack == nil || stack.Position <= 1 || stack.Base.Ref == "" {
+		return nil
+	}
+	return []ports.PRAncestorLink{{Ref: stack.Base.Ref, SHA: stack.Base.SHA}}
 }
 
 // fetchCIConclusionLive determines an OPEN PR's own CI conclusion AT ITS

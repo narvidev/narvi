@@ -13,9 +13,9 @@ import (
 
 const createTurn = `-- name: CreateTurn :one
 
-INSERT INTO turns (session_id, status, prompt, model_id, plan_mode, effort, review_head_sha, answer_only, review_depth, review_depth_decision, review_knowledge_mode, review_knowledge_decision, correlation_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id
+INSERT INTO turns (session_id, status, prompt, model_id, plan_mode, effort, review_head_sha, answer_only, review_depth, review_depth_decision, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id
 `
 
 type CreateTurnParams struct {
@@ -32,6 +32,7 @@ type CreateTurnParams struct {
 	ReviewKnowledgeMode     *string     `json:"review_knowledge_mode"`
 	ReviewKnowledgeDecision []byte      `json:"review_knowledge_decision"`
 	CorrelationID           *string     `json:"correlation_id"`
+	ReviewVerdictContext    []byte      `json:"review_verdict_context"`
 }
 
 // Queries backing TurnStore (§4.3). Just enough to prove the pipeline end
@@ -97,6 +98,13 @@ type CreateTurnParams struct {
 // whatever internal/platform.CorrelationIDFromContext(ctx) returns at
 // EVERY call site that creates a turn, never re-derived or backfilled
 // later.
+//
+// review_verdict_context (migrations/000129_turns_review_verdict_context.up.sql,
+// §21.1's amendment) mirrors review_depth_decision's own identical shape
+// one column further: nil/absent for every non-review turn, set exactly
+// once, at creation, by the SAME review-turn-creation paths, pre-
+// marshaled JSON (internal/domain/reviewverdict.Context) -- this query
+// does no encoding of its own.
 func (q *Queries) CreateTurn(ctx context.Context, arg CreateTurnParams) (Turn, error) {
 	row := q.db.QueryRow(ctx, createTurn,
 		arg.SessionID,
@@ -112,6 +120,7 @@ func (q *Queries) CreateTurn(ctx context.Context, arg CreateTurnParams) (Turn, e
 		arg.ReviewKnowledgeMode,
 		arg.ReviewKnowledgeDecision,
 		arg.CorrelationID,
+		arg.ReviewVerdictContext,
 	)
 	var i Turn
 	err := row.Scan(
@@ -138,6 +147,8 @@ func (q *Queries) CreateTurn(ctx context.Context, arg CreateTurnParams) (Turn, e
 		&i.ReviewKnowledgeMode,
 		&i.ReviewKnowledgeDecision,
 		&i.CorrelationID,
+		&i.ReviewVerdictContext,
+		&i.DispatchedMessageID,
 	)
 	return i, err
 }
@@ -202,7 +213,7 @@ func (q *Queries) GetPlatformCostSummaryInWindow(ctx context.Context, createdAt 
 }
 
 const getProcessingTurnForSession = `-- name: GetProcessingTurnForSession :one
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id FROM turns
 WHERE session_id = $1 AND status = 'processing'
 `
 
@@ -242,12 +253,14 @@ func (q *Queries) GetProcessingTurnForSession(ctx context.Context, sessionID pgt
 		&i.ReviewKnowledgeMode,
 		&i.ReviewKnowledgeDecision,
 		&i.CorrelationID,
+		&i.ReviewVerdictContext,
+		&i.DispatchedMessageID,
 	)
 	return i, err
 }
 
 const getTurn = `-- name: GetTurn :one
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id FROM turns
 WHERE id = $1
 `
 
@@ -278,6 +291,81 @@ func (q *Queries) GetTurn(ctx context.Context, id pgtype.UUID) (Turn, error) {
 		&i.ReviewKnowledgeMode,
 		&i.ReviewKnowledgeDecision,
 		&i.CorrelationID,
+		&i.ReviewVerdictContext,
+		&i.DispatchedMessageID,
+	)
+	return i, err
+}
+
+const getTurnByDispatchedMessageID = `-- name: GetTurnByDispatchedMessageID :one
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id FROM turns
+WHERE session_id = $1 AND dispatched_message_id = $2
+`
+
+type GetTurnByDispatchedMessageIDParams struct {
+	SessionID           pgtype.UUID `json:"session_id"`
+	DispatchedMessageID *string     `json:"dispatched_message_id"`
+}
+
+// finding F3 (§21.1's amendment): resolves the SPECIFIC turn a verdict-posting
+// request actually originated from, by the sandboxws.Prompt MessageId that
+// request's own header presents (see the review-verdict handler,
+// httpapi.PostReviewVerdict) -- NEVER by session-wide "current" status,
+// which GetProcessingTurnForSession above answers and which this query
+// deliberately does NOT ask: a turn that timed out and was marked 'failed'
+// while its own agent was still posting is exactly the case this query
+// must still find, so there is no "AND status = ..." filter here at all.
+// turns.dispatched_message_id is unique in PRACTICE (a UUID minted fresh
+// per dispatch, scoped further by session_id in this WHERE clause) though
+// not DB-enforced unique (corrected, G7, fourth adversarial-review round:
+// migration 000131 DOES add an index over (session_id,
+// dispatched_message_id) -- for this query's own performance, never a
+// constraint -- so pointing here at "why no index... was added" was
+// stale the moment that migration shipped; no migration's own doc
+// comment actually explains why a UNIQUE constraint specifically was
+// never added, so none is cited); a caller-observed multiple-row result
+// would be a genuine anomaly, not a normal outcome this query's own :one
+// cardinality anticipates. No matching row (dispatched_message_id absent,
+// or naming a turn from a different session entirely) is pgx.ErrNoRows,
+// mirroring GetTurn's own identical not-found convention -- the caller
+// REFUSES the request (403), never degrades and proceeds (corrected, G7,
+// fourth round: the sentence this replaced -- "the caller degrades
+// exactly like a not-found processing turn already does" -- described
+// this column's own ORIGINAL, pre-403 behavior, which migration 000131's
+// own doc comment already documents as corrected, E3, third round, for
+// the identical reason; this copy of the same stale sentence was never
+// updated along with it). See reviewverdict.go's own outcome table
+// (internal/adapters/inbound/httpapi) for the current, authoritative
+// behavior.
+func (q *Queries) GetTurnByDispatchedMessageID(ctx context.Context, arg GetTurnByDispatchedMessageIDParams) (Turn, error) {
+	row := q.db.QueryRow(ctx, getTurnByDispatchedMessageID, arg.SessionID, arg.DispatchedMessageID)
+	var i Turn
+	err := row.Scan(
+		&i.ID,
+		&i.SessionID,
+		&i.Status,
+		&i.ConversationID,
+		&i.CreatedAt,
+		&i.DispatchedAt,
+		&i.CompletedAt,
+		&i.Prompt,
+		&i.ModelID,
+		&i.PlanMode,
+		&i.DispatchedSandboxGen,
+		&i.ProgressNotifiedAt,
+		&i.Effort,
+		&i.EpistemicOutcome,
+		&i.ReviewHeadSha,
+		&i.AnswerOnly,
+		&i.ReviewDepth,
+		&i.ReviewDepthDecision,
+		&i.DispatchedEventID,
+		&i.CostUsd,
+		&i.ReviewKnowledgeMode,
+		&i.ReviewKnowledgeDecision,
+		&i.CorrelationID,
+		&i.ReviewVerdictContext,
+		&i.DispatchedMessageID,
 	)
 	return i, err
 }
@@ -394,7 +482,7 @@ func (q *Queries) ListSessionCostTotalsWithRepos(ctx context.Context) ([]ListSes
 }
 
 const listTurnsForSession = `-- name: ListTurnsForSession :many
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id FROM turns
 WHERE session_id = $1
 ORDER BY created_at ASC
 `
@@ -435,6 +523,8 @@ func (q *Queries) ListTurnsForSession(ctx context.Context, sessionID pgtype.UUID
 			&i.ReviewKnowledgeMode,
 			&i.ReviewKnowledgeDecision,
 			&i.CorrelationID,
+			&i.ReviewVerdictContext,
+			&i.DispatchedMessageID,
 		); err != nil {
 			return nil, err
 		}
@@ -594,9 +684,10 @@ SET status = $2,
     dispatched_at = COALESCE($3, dispatched_at),
     completed_at = COALESCE($4, completed_at),
     dispatched_sandbox_gen = COALESCE($5, dispatched_sandbox_gen),
-    dispatched_event_id = COALESCE($6, dispatched_event_id)
+    dispatched_event_id = COALESCE($6, dispatched_event_id),
+    dispatched_message_id = COALESCE($7, dispatched_message_id)
 WHERE id = $1
-RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id
+RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id
 `
 
 type UpdateTurnStatusParams struct {
@@ -606,6 +697,7 @@ type UpdateTurnStatusParams struct {
 	CompletedAt          pgtype.Timestamptz `json:"completed_at"`
 	DispatchedSandboxGen *int32             `json:"dispatched_sandbox_gen"`
 	DispatchedEventID    *int64             `json:"dispatched_event_id"`
+	DispatchedMessageID  *string            `json:"dispatched_message_id"`
 }
 
 // Sets a turn's status, plus dispatched_at/completed_at/
@@ -634,6 +726,14 @@ type UpdateTurnStatusParams struct {
 // queries use as their lower bound instead of a timestamp. It follows the
 // identical sqlc.narg + COALESCE "absent argument leaves the column
 // untouched" convention as the three columns above it.
+//
+// dispatched_message_id (migrations/000131_turns_dispatched_message_id.up.sql,
+// finding F3, §21.1's amendment) is stamped by the SAME two call sites, in the SAME
+// write, from the sandboxws.Prompt MessageId BuildPromptPayload embeds
+// into the wire payload itself -- GetTurnByDispatchedMessageID (below) is
+// what a verdict-posting request resolves ITS OWN turn by, instead of
+// "whichever turn is processing for this session right now". Follows the
+// identical sqlc.narg + COALESCE convention.
 func (q *Queries) UpdateTurnStatus(ctx context.Context, arg UpdateTurnStatusParams) (Turn, error) {
 	row := q.db.QueryRow(ctx, updateTurnStatus,
 		arg.ID,
@@ -642,6 +742,7 @@ func (q *Queries) UpdateTurnStatus(ctx context.Context, arg UpdateTurnStatusPara
 		arg.CompletedAt,
 		arg.DispatchedSandboxGen,
 		arg.DispatchedEventID,
+		arg.DispatchedMessageID,
 	)
 	var i Turn
 	err := row.Scan(
@@ -668,6 +769,8 @@ func (q *Queries) UpdateTurnStatus(ctx context.Context, arg UpdateTurnStatusPara
 		&i.ReviewKnowledgeMode,
 		&i.ReviewKnowledgeDecision,
 		&i.CorrelationID,
+		&i.ReviewVerdictContext,
+		&i.DispatchedMessageID,
 	)
 	return i, err
 }

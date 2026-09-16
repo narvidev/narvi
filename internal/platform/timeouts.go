@@ -1408,6 +1408,31 @@ type Timeouts struct {
 	// webhook response prompt.
 	GitHubGetPRTimeout time.Duration
 
+	// GitHubResolveBaseBranchSHATimeout bounds a single
+	// internal/app/ports.SourceControl.ResolveBranchSHA call made from
+	// inside internal/app/reviewcontext.Fetch (finding F1 (§21.1's amendment)) --
+	// a real outbound GET https://api.github.com/repos/{owner}/{repo}/
+	// commits/{branch}, resolving the PR's own base branch to its LIVE
+	// current tip, rather than trusting `pull_request.base.sha`
+	// (verified against real GitHub PRs to be a per-PR cached snapshot
+	// that lags the base branch's real tip by an unknown, sometimes
+	// month-scale margin -- githubapi.PullRequest no longer even decodes
+	// this field, D11; see ports.OpenPR.BaseSHA's own doc comment,
+	// ports/sourcecontrol.go, for that same lag on the field that IS
+	// still decoded, for a read-model-only purpose). A DISTINCT field
+	// from RepoSHAResolutionTimeout (this
+	// codebase's own convention: one named timeout per distinct
+	// network-call type, even when two share the chosen value --
+	// RepoSHAResolutionTimeout's own doc comment states this precedent
+	// explicitly) -- that field bounds app/imagebuild's own pump-driven
+	// resolution loop, a fundamentally different caller/context than
+	// this one, made synchronously inline while a review turn's context
+	// is being assembled. Not specified in the plan (this fix postdates
+	// it); chosen as 10s, matching GitHubGetPRTimeout/
+	// RepoSHAResolutionTimeout's own "lightweight GET, not a large data
+	// transfer" reasoning exactly.
+	GitHubResolveBaseBranchSHATimeout time.Duration
+
 	// --- §19.3 standalone addition ("warm boot: fetch-aware git sync",
 	// §19.3): no ordering relationship with either invariant chain above
 	// (or with any prior Step's standalone additions), so -- per those
@@ -2037,6 +2062,82 @@ type Timeouts struct {
 	// reasoning for an outbound sequence a bit heavier than a single GET
 	// but nowhere near ListOpenPRsForUser's own worst case.
 	GitHubResolveCodeOwnersTimeout time.Duration
+
+	// GitHubGetOpenPRTimeout (§21.2 stage 2; split out from
+	// GitHubGetPRTimeout's own misuse, H3, fifth adversarial-review round)
+	// bounds ONE SourceControl.GetOpenPR call -- internal/app/decisioninbox.
+	// RevalidateForAutoMerge's own one real call site (revalidate.go),
+	// wrapping the whole method in one outer context.WithTimeout, the SAME
+	// "wrap the whole multi-call port method in one outer
+	// context.WithTimeout at its one real call site" shape
+	// GitHubListOpenPRsForUserTimeout/GitHubResolveCodeOwnersTimeout
+	// already establish just above, not a new pattern. GetOpenPR (getopenpr.go)
+	// is FIVE sequential GETs against the SAME single target PR, never
+	// one: fetchOpenPRDetail, fetchReviewDecision, fetchCIConclusionLive's
+	// own two calls (combined-status, check-runs), and
+	// fetchChangedFilePaths (all buildOpenPRFromDetail's own construction,
+	// listopenprs.go) -- a previous revision of the call site reused
+	// GitHubGetPRTimeout here, whose OWN doc comment names a genuinely
+	// different, single-GET method (GetPullRequest, called from the
+	// GitHub webhook handler) that this field must never be confused
+	// with again. Chosen as 30s, matching GitHubResolveCodeOwnersTimeout's
+	// own bound immediately above for a comparable few-sequential-GET
+	// composite against one PR -- nowhere near GitHubListOpenPRsForUserTimeout's
+	// own 3-minute figure, which additionally multiplies this SAME
+	// five-call cost across up to maxOpenPRsForUser distinct candidate
+	// PRs (that field's own doc comment), not just the one target this
+	// call resolves.
+	GitHubGetOpenPRTimeout time.Duration
+
+	// DecisionInboxResolveBranchSHATimeout (D2, second adversarial-review
+	// round; the second of its two call sites documented here, H1, fifth
+	// adversarial-review round) bounds ONE SourceControl.ResolveBranchSHA
+	// call made from internal/app/decisioninbox -- both SCMCache.
+	// ResolveBranchSHA (scmcache.go, cached, computeRealEligibility's own
+	// read-model path, aggregate.go) and revalidateCore (revalidate.go,
+	// UNCACHED, the one action endpoint in this package that must never
+	// serve a stale answer) share this one field, mirroring
+	// DecisionInboxIsAncestorTimeout's own identical "one field, two call
+	// sites" shape immediately below. This doc comment previously
+	// described only the SCMCache call, naming revalidateCore's own call
+	// solely as a CONTRAST (the read-model's live resolution "rather than
+	// comparing ports.OpenPR.BaseSHA... against a verdict's own
+	// live-resolved context") -- revalidateCore's own call was wired to
+	// this same field separately (G4, fourth adversarial-review round)
+	// but this doc comment was never updated to say so, the identical gap
+	// DecisionInboxIsAncestorTimeout's own doc comment already had
+	// corrected for its sibling call. Both call sites now genuinely share
+	// it. A DISTINCT field from GitHubResolveBaseBranchSHATimeout (this
+	// codebase's own established convention: one named timeout per
+	// distinct network-call type/caller, even when two share the chosen
+	// value -- that field's own doc comment states this precedent
+	// explicitly), since THIS field bounds calls made from an entirely
+	// different package (decisioninbox, both its cached read-model path
+	// and its uncached action path) vs. reviewcontext.Fetch's own inline,
+	// uncached call at review-turn-creation time. Chosen as 10s, matching
+	// GitHubResolveBaseBranchSHATimeout/GitHubGetPRTimeout's own identical
+	// "a single lightweight GitHub REST GET" reasoning -- this is the SAME
+	// underlying endpoint, just two different call sites.
+	DecisionInboxResolveBranchSHATimeout time.Duration
+
+	// DecisionInboxIsAncestorTimeout (D3, second adversarial-review round;
+	// actually wired into revalidateCore, E4, third round) bounds ONE
+	// SourceControl.IsAncestor call made from internal/app/decisioninbox
+	// -- both revalidateCore (revalidate.go, uncached, an action
+	// endpoint) and SCMCache.IsAncestor (aggregate.go's own read-model
+	// path, cached) share this one field, mirroring DecisionInboxSCMCacheTTL's
+	// own identical "one field, two cached methods" precedent in this
+	// same package. This doc comment previously claimed revalidateCore's
+	// own call was already bound by this field when it was not -- an
+	// unbounded live GitHub call on the one action path in this package
+	// that is not allowed to serve a cached/stale answer; both call sites
+	// now genuinely share it. Chosen as 10s, matching every other
+	// single-lightweight-GitHub-REST-GET timeout in this file
+	// (GitHubGetPRTimeout/GitHubResolveBaseBranchSHATimeout/
+	// DecisionInboxResolveBranchSHATimeout) -- IsAncestor is the SAME
+	// class of call (one GET to the compare-two-commits endpoint), just a
+	// different comparison.
+	DecisionInboxIsAncestorTimeout time.Duration
 
 	// GitHubMergePRTimeout bounds ONE MergePR call -- a single PUT, but to
 	// an endpoint GitHub's own docs note can itself take a moment to
@@ -2752,6 +2853,8 @@ func DefaultTimeouts() Timeouts {
 
 		GitHubGetPRTimeout: 10 * time.Second, // not specified (fix postdates the plan); chosen, generous for a single GitHub REST GET, mirrors PRCreateTimeout/SlackAckTimeout's own reasoning
 
+		GitHubResolveBaseBranchSHATimeout: 10 * time.Second, // finding F1 (§21.1's amendment), not specified; chosen, matches GitHubGetPRTimeout/RepoSHAResolutionTimeout's own "lightweight GET" reasoning
+
 		GitFetchStepTimeout: 90 * time.Second, // §19.3, explicit ("propose 90s, distinct from the existing local-only 30s GitSyncStepTimeout")
 
 		ImageRefreshCheckInterval: 10 * time.Minute, // §19.2, explicit ("propose 10 min")
@@ -2793,12 +2896,15 @@ func DefaultTimeouts() Timeouts {
 		ChatGPTLinkAttemptTTL:           15 * time.Minute, // §8.8; not specified, chosen generously (human device-switch time)
 		ChatGPTOAuthHTTPClientTimeout:   15 * time.Second, // §8.8; not specified, chosen generously (a real third-party OAuth endpoint over the public internet)
 
-		GitHubListOpenPRsForUserTimeout: 3 * time.Minute,     // §16; not specified, matches ReleaseManifestCheckTimeout's own figure for a comparable bounded-but-many-call operation
-		GitHubResolveCodeOwnersTimeout:  30 * time.Second,    // §16; not specified, chosen generously (a handful of file/user/team fetches)
-		GitHubMergePRTimeout:            15 * time.Second,    // §16; not specified, half again GitHubGetPRTimeout's baseline (interactive, human-facing write)
-		DecisionInboxSCMCacheTTL:        2 * time.Minute,     // §16.2's own worked example ("as of 2 min ago")
-		DecisionInboxStaleAfter:         48 * time.Hour,      // §16.1, explicit ("stale items (>48h, configurable)")
-		DecisionInboxLatencyWindow:      30 * 24 * time.Hour, // §16.2; not specified, chosen as a month of decision history -- long enough for a stable median, bounded per §21.1
+		GitHubListOpenPRsForUserTimeout:      3 * time.Minute,     // §16; not specified, matches ReleaseManifestCheckTimeout's own figure for a comparable bounded-but-many-call operation
+		GitHubResolveCodeOwnersTimeout:       30 * time.Second,    // §16; not specified, chosen generously (a handful of file/user/team fetches)
+		GitHubGetOpenPRTimeout:               30 * time.Second,    // §21.2 stage 2, H3 (fifth adversarial-review round); not specified, matches GitHubResolveCodeOwnersTimeout's own figure for a comparable few-sequential-GET composite against one PR
+		DecisionInboxResolveBranchSHATimeout: 10 * time.Second,    // D2, second adversarial-review round; not specified, matches GitHubResolveBaseBranchSHATimeout/GitHubGetPRTimeout's own "lightweight GET" reasoning
+		DecisionInboxIsAncestorTimeout:       10 * time.Second,    // D3, second adversarial-review round; not specified, matches this file's own "lightweight GitHub REST GET" precedent
+		GitHubMergePRTimeout:                 15 * time.Second,    // §16; not specified, half again GitHubGetPRTimeout's baseline (interactive, human-facing write)
+		DecisionInboxSCMCacheTTL:             2 * time.Minute,     // §16.2's own worked example ("as of 2 min ago")
+		DecisionInboxStaleAfter:              48 * time.Hour,      // §16.1, explicit ("stale items (>48h, configurable)")
+		DecisionInboxLatencyWindow:           30 * 24 * time.Hour, // §16.2; not specified, chosen as a month of decision history -- long enough for a stable median, bounded per §21.1
 
 		ReviewVerdictAnalyticsWindow:   30 * 24 * time.Hour, // §21.1, explicit ("bounded from day one ... default 30 days, mirroring the decision inbox's own DecisionInboxLatencyWindow, §16.2 -- never DecisionInboxStaleAfter's own much narrower 48h item-staleness flag, §16.1, a different concept entirely") -- mirrors DecisionInboxLatencyWindow's own identical "a month, bounded" reasoning
 		AutoMergePumpInterval:          60 * time.Second,    // §21.2; not specified, mirrors AutomationEnginePumpInterval's own identical periodic-background-policy-engine reasoning

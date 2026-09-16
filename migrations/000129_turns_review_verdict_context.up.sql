@@ -1,0 +1,44 @@
+-- turns.review_verdict_context (§21.1's amendment): the rest of a review
+-- turn's own pre-fetched context, beyond review_head_sha (migrations/
+-- 000072_turns_review_head_sha.up.sql) -- base ref/sha, ordered ancestor
+-- chain, and the eligibility-policy version in effect when this context
+-- was fetched (internal/domain/reviewverdict.Context, internal/domain/
+-- review.PreFetchedContext's own BaseRef/BaseSHA/AncestorChain/
+-- PolicyVersion fields).
+--
+-- §21.1's amendment states the defect this closes precisely: "review_
+-- verdicts persists head_sha and nothing else about the context... A PR
+-- evaluated while based on another PR's branch, then retargeted -- or
+-- whose parent moved beneath it -- keeps an unchanged head, so the
+-- equality holds and the stale verdict reads as fresh." What the verdict
+-- must therefore carry, beside head_sha, is the rest of what it
+-- reviewed: base_ref, base_sha, the ordered ancestor chain, and a policy
+-- version.
+--
+-- Scoped to the TURN, never to github_pr_sessions (a per-(repo, PR)
+-- column), for the EXACT reason review_head_sha itself is turn-scoped
+-- (migrations/000072's own doc comment, "why pending_head_sha was
+-- wrong: a shared, mutable column has no turn"): a review session is
+-- reused across a PR's whole life (§8.2), so any shared mutable
+-- column is overwritten by the next context fetch, and a verdict could
+-- be recorded against a context it never actually examined. §21.1's own
+-- words: "the SHA must be scoped to the turn that examined it, never to
+-- a per-(repo, PR) column... That defeats the stale-verdict guard
+-- precisely -- the guard compares the right two fields and still
+-- passes, because the stored SHA was never the examined one." The same
+-- argument applies verbatim to base ref/sha/ancestor chain/policy
+-- version, which is why they ride the identical turn-scoped carrier
+-- rather than a new github_pr_sessions column.
+--
+-- One JSONB blob, not four separate columns: mirrors review_depth_
+-- decision's own identical shape (migrations/000083_turns_review_depth_
+-- decision.up.sql) -- a structured record captured once, at turn-
+-- creation time, and read back verbatim at verdict-post time
+-- (httpapi.PostReviewVerdict). Nullable: NULL for every non-review turn,
+-- and for a review turn whose own context-fetch could not resolve a
+-- base ref at all (the SAME "safe, not dangerous, degradation" posture
+-- review_head_sha itself already has -- a verdict with no known context
+-- simply carries no review_verdicts.base_ref/base_sha/ancestor_chain/
+-- policy_version, which internal/domain/autoapproval.ComputeEligible
+-- then treats as UNKNOWN, never as a match).
+ALTER TABLE turns ADD COLUMN review_verdict_context JSONB;

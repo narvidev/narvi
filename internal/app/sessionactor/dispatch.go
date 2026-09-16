@@ -626,6 +626,21 @@ func (a *Actor) tryPlanReenqueue(
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: read events high-water mark for reenqueue: %w", err)
 	}
+	// messageID (finding F3 (§21.1's amendment)) is generated ONCE, here, then
+	// threaded into BOTH the wire payload below AND this SAME
+	// UpdateStatus write (turns.dispatched_message_id) -- the one
+	// identifier httpapi.PostReviewVerdict later resolves a verdict-
+	// posting turn BY, instead of "whichever turn is processing for this
+	// session right now" (BuildPromptPayload's own doc comment). A fresh
+	// value on EVERY re-enqueue is correct, not merely tolerated: this is
+	// a genuinely new dispatch to a different sandbox incarnation, so an
+	// old, now-stale MessageId a still-alive PREVIOUS incarnation might
+	// still present later finds no matching row here -- httpapi.
+	// PostReviewVerdict refuses the call outright (403) rather than
+	// resolving the wrong turn or degrading to session-wide resolution
+	// (D1/D4/D6, second adversarial-review round: see that handler's own
+	// doc comment for the full "why refuse rather than degrade").
+	messageID := uuid.NewString()
 	if _, err := a.stores.turn.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
 		ID: target.ID,
 		// The turn's own CURRENT status, passed back unchanged -- this is
@@ -635,11 +650,12 @@ func (a *Actor) tryPlanReenqueue(
 		Status:               target.Status,
 		DispatchedSandboxGen: &dispatchedGen,
 		DispatchedEventID:    &dispatchedEventID,
+		DispatchedMessageID:  &messageID,
 	}); err != nil {
 		return nil, fmt.Errorf("sessionactor: stamp dispatched_sandbox_gen for reenqueue: %w", err)
 	}
 
-	payload, err := BuildPromptPayload(a.sessionID.String(), sessionRow, sandboxRow, target)
+	payload, err := BuildPromptPayload(a.sessionID.String(), sessionRow, sandboxRow, target, messageID)
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: build prompt payload (reenqueue): %w", err)
 	}
@@ -1756,12 +1772,21 @@ func (a *Actor) tryPlanDispatch(
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: read events high-water mark for dispatch: %w", err)
 	}
+	// messageID (finding F3 (§21.1's amendment)) is generated ONCE, here, then
+	// threaded into BOTH the wire payload below AND this SAME
+	// UpdateStatus write (turns.dispatched_message_id) -- see
+	// BuildPromptPayload's own doc comment for the full "why": this is
+	// the ONE identifier httpapi.PostReviewVerdict later resolves a
+	// verdict-posting turn BY, instead of "whichever turn is processing
+	// for this session right now".
+	messageID := uuid.NewString()
 	if _, err := a.stores.turn.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
 		ID:                   turnID,
 		Status:               sqlcgen.TurnStatus(toDispatched),
 		DispatchedAt:         pgtype.Timestamptz{Time: now, Valid: true},
 		DispatchedSandboxGen: &dispatchedGen,
 		DispatchedEventID:    &dispatchedEventID,
+		DispatchedMessageID:  &messageID,
 	}); err != nil {
 		return nil, fmt.Errorf("sessionactor: update turn status to dispatched: %w", err)
 	}
@@ -1789,7 +1814,7 @@ func (a *Actor) tryPlanDispatch(
 		return nil, err
 	}
 
-	payload, err := BuildPromptPayload(a.sessionID.String(), sessionRow, sandboxRow, target)
+	payload, err := BuildPromptPayload(a.sessionID.String(), sessionRow, sandboxRow, target, messageID)
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: build prompt payload: %w", err)
 	}
@@ -2032,6 +2057,22 @@ func (a *Actor) failDispatchedTurn(ctx context.Context, turnID pgtype.UUID, reas
 // start... so follow-up prompts on a fresh sandbox resume the same
 // conversation").
 //
+// messageID (finding F3 (§21.1's amendment)) is the wire Prompt's own MessageId --
+// deliberately a CALLER-SUPPLIED parameter, never generated inside this
+// function (as it was before this fix): both real call sites (below)
+// generate it ONCE, then thread the SAME value into both this payload and
+// the SAME UpdateTurnStatus write that already stamps
+// dispatched_sandbox_gen/dispatched_event_id (turns.dispatched_message_id,
+// migrations/000131), so the wire value the sandbox actually receives and
+// the value httpapi.PostReviewVerdict later resolves a verdict-posting
+// turn BY are provably the SAME identifier, never two independently-
+// generated ones that could drift. assertIdenticalPrompts (workflowengine_
+// characterization_integration_test.go) strips this field before
+// comparing, exactly as it already did when this function generated it
+// internally -- a caller-supplied value changes nothing about that test's
+// own byte-identity claim, which was never about MessageId in the first
+// place.
+//
 // Exported ("workflow execution engine", §25.6) specifically so
 // internal/adapters/inbound/httpapi's own characterization test
 // (workflowengine_characterization_integration_test.go) can call the EXACT
@@ -2045,10 +2086,10 @@ func (a *Actor) failDispatchedTurn(ctx context.Context, turnID pgtype.UUID, reas
 // package boundary reach the real, single implementation (see turn.go's
 // own doc comments) -- a pure rename, no behavior change: both call sites
 // below are unaffected other than the name.
-func BuildPromptPayload(sessionID string, sessionRow sqlcgen.Session, sandboxRow sqlcgen.Sandbox, target sqlcgen.Turn) (json.RawMessage, error) {
+func BuildPromptPayload(sessionID string, sessionRow sqlcgen.Session, sandboxRow sqlcgen.Sandbox, target sqlcgen.Turn, messageID string) (json.RawMessage, error) {
 	prompt := sandboxws.Prompt{
 		Type:      "prompt",
-		MessageId: uuid.NewString(),
+		MessageId: messageID,
 		SessionId: sessionID,
 		Gen:       int(sandboxRow.Gen),
 		// nil (first turn) or the session's own previously-recorded

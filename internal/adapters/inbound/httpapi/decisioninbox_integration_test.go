@@ -34,8 +34,10 @@ import (
 	"github.com/narvidev/narvi/internal/app/decisioninbox"
 	"github.com/narvidev/narvi/internal/app/ports"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
+	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
+	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -79,10 +81,26 @@ func (rig *decisionInboxTestRig) seedAutoApprovedVerdict(ctx context.Context, t 
 		FilesChanged:      3,
 	}
 	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
-	if _, err := appreviewverdict.Insert(ctx, rig.reviewVerdicts, narvipg.NewRepoSettingsStore(rig.pool), false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false); err != nil {
+	// verdictContext (§21.1's amendment) mirrors internal/app/
+	// decisioninbox's own identical seedAutoApprovedVerdict fixture
+	// (aggregate_integration_test.go): testEligibleBaseRef/
+	// testEligibleBaseSHA, matching every "otherwise fully eligible"
+	// ports.OpenPR fixture in this file.
+	verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
+	if _, err := appreviewverdict.Insert(ctx, rig.reviewVerdicts, narvipg.NewRepoSettingsStore(rig.pool), false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
 		t.Fatalf("seed auto-approved review_verdicts row for %s#%d: %v", repoFullName, prNumber, err)
 	}
 }
+
+// testEligibleBaseRef/testEligibleBaseSHA (§21.1's amendment) mirror
+// internal/app/decisioninbox's own identical shared fixture pair
+// (aggregate_integration_test.go) -- every "eligible" ports.OpenPR
+// fixture in this file sets both on the live PR, matching
+// seedAutoApprovedVerdict's own recorded context above.
+const (
+	testEligibleBaseRef = "main"
+	testEligibleBaseSHA = "sha-eligible-base"
+)
 
 // fakeMergeSourceControl is a minimal test-only ports.SourceControl,
 // configurable per test -- mirrors reviewfindings_integration_test.go's
@@ -114,6 +132,19 @@ type fakeMergeSourceControl struct {
 	// drive a genuine partial-fetch read through the real SCMCache/Build
 	// pipeline, never a hand-built response.
 	truncated bool
+
+	// resolveBranchSHA/resolveBranchSHAErr (finding F1, §21.1's amendment)
+	// back ResolveBranchSHA below -- revalidateCore now resolves the base
+	// branch's LIVE tip independently, rather than trusting
+	// ports.OpenPR.BaseSHA (GitHub's own possibly-stale
+	// `pull_request.base.sha` snapshot). Both zero (every EXISTING test
+	// in this file) falls back to scanning f.openPRs for one reporting
+	// spec.Branch as its own BaseRef, returning THAT PR's own BaseSHA --
+	// so every existing fixture here, which already sets BaseRef/BaseSHA
+	// consistently, gets a live resolution "for free" with no per-test
+	// literal changes needed.
+	resolveBranchSHA    string
+	resolveBranchSHAErr error
 }
 
 var _ ports.SourceControl = (*fakeMergeSourceControl)(nil)
@@ -135,8 +166,27 @@ func (f *fakeMergeSourceControl) MergePR(_ context.Context, spec ports.MergePRSp
 func (f *fakeMergeSourceControl) CreatePR(context.Context, ports.CreatePRSpec) (ports.PRRef, error) {
 	return ports.PRRef{}, errors.New("not implemented")
 }
-func (f *fakeMergeSourceControl) ResolveBranchSHA(context.Context, ports.ResolveBranchSHASpec) (string, string, error) {
-	return "", "", errors.New("not implemented")
+func (f *fakeMergeSourceControl) ResolveBranchSHA(_ context.Context, spec ports.ResolveBranchSHASpec) (string, string, error) {
+	if f.resolveBranchSHAErr != nil {
+		return "", "", f.resolveBranchSHAErr
+	}
+	if f.resolveBranchSHA != "" {
+		return f.resolveBranchSHA, spec.Branch, nil
+	}
+	for _, pr := range f.openPRs {
+		if pr.BaseRef == spec.Branch {
+			return pr.BaseSHA, spec.Branch, nil
+		}
+	}
+	return "", "", fmt.Errorf("fakeMergeSourceControl: ResolveBranchSHA: no seeded PR reports base ref %q", spec.Branch)
+}
+
+// IsAncestor (D3, second adversarial-review round) is never exercised by
+// this file's own tests (no test here perturbs resolveBranchSHA away
+// from a seeded PR's own matching BaseSHA) -- stubbed only for
+// ports.SourceControl interface satisfaction.
+func (f *fakeMergeSourceControl) IsAncestor(context.Context, ports.IsAncestorSpec) (bool, error) {
+	return false, nil
 }
 func (f *fakeMergeSourceControl) ResolveContractsFingerprint(context.Context, ports.ResolveContractsFingerprintSpec) (string, bool, error) {
 	return "", false, errors.New("not implemented")
@@ -419,7 +469,7 @@ func TestMergePullRequest_HappyPath(t *testing.T) {
 		openPRs: []ports.OpenPR{
 			{
 				Owner: "acme", Repo: "widgets", Number: 1204, Title: "low risk", HTMLURL: htmlURL,
-				HeadSHA: "headsha1204", Assignees: []ports.PRPerson{{ExternalID: "9001", Login: "octocat"}},
+				HeadSHA: "headsha1204", BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, Assignees: []ports.PRPerson{{ExternalID: "9001", Login: "octocat"}},
 				CIConclusion: ports.CIConclusionSuccess, Labels: []string{"review:low-risk"},
 			},
 		},
@@ -490,7 +540,7 @@ func TestMergePullRequest_ShadowSuppressed_RecordedNotMerged(t *testing.T) {
 		openPRs: []ports.OpenPR{
 			{
 				Owner: "acme", Repo: "widgets", Number: 1204, Title: "low risk", HTMLURL: htmlURL,
-				HeadSHA: "headsha1204", Assignees: []ports.PRPerson{{ExternalID: "9001", Login: "octocat"}},
+				HeadSHA: "headsha1204", BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, Assignees: []ports.PRPerson{{ExternalID: "9001", Login: "octocat"}},
 				CIConclusion: ports.CIConclusionSuccess, Labels: []string{"review:low-risk"},
 			},
 		},
@@ -658,7 +708,7 @@ func TestMergePullRequest_MergePRErrorStatusMapping(t *testing.T) {
 		openPRs: []ports.OpenPR{
 			{
 				Owner: "acme", Repo: "widgets", Number: prNumber, Title: "status mapping", HTMLURL: htmlURL,
-				HeadSHA: "headsha5001", Assignees: []ports.PRPerson{{ExternalID: "9004", Login: "octocat"}},
+				HeadSHA: "headsha5001", BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, Assignees: []ports.PRPerson{{ExternalID: "9004", Login: "octocat"}},
 				CIConclusion: ports.CIConclusionSuccess, Labels: []string{"review:low-risk"},
 			},
 		},

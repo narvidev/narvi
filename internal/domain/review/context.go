@@ -37,6 +37,42 @@ type StackContext struct {
 	UltimateBaseSHA string
 }
 
+// AncestorLink is one link of a PR's own base-branch ancestry, beyond its
+// own immediate base -- ref+sha, ordered nearest-first (§21.1's amendment:
+// "the ordered ancestor chain"). This is bookkeeping data, exactly like
+// HeadSHA/BaseRef/BaseSHA below -- never rendered into a review turn's
+// prompt, never additional diff to verdict over (StackContext's own doc
+// comment states why a stack's own further context stays out of the
+// diff; the same reasoning applies here).
+type AncestorLink struct {
+	Ref string `json:"ref"`
+	SHA string `json:"sha"`
+}
+
+// AncestorChainFromStack derives the ordered ancestor chain (§21.1's
+// amendment) from a GitHub-native stack's own reported fields alone --
+// the only additional ancestry this codebase can derive today, since
+// §17.6 states nothing besides the origin+sentinel-fix pair produces a
+// chain deeper than two, and a GitHub-native stack object reports only
+// position/size/ultimate-base, never each intermediate link.
+//
+// A PR at the BOTTOM of its own stack (position <= 1) or with no stack at
+// all (stack == nil) has no ancestor beyond its own immediate base --
+// which PreFetchedContext's own BaseRef/BaseSHA (below) already carry --
+// so the chain is empty. A PR further up reports exactly one link: the
+// stack's own ultimate base, the one further-back fact a GitHub-native
+// stack actually exposes. A genuine N-deep producer (§39, unshipped) gets
+// a longer chain the day it exists to supply one: this function returns
+// an ordered SLICE, not a fixed 0-or-1 shape, so the comparison this
+// feeds (autoapproval.ComputeEligible) does not need to widen when trains
+// ship.
+func AncestorChainFromStack(stack *StackContext) []AncestorLink {
+	if stack == nil || stack.Position <= 1 || stack.UltimateBaseRef == "" {
+		return nil
+	}
+	return []AncestorLink{{Ref: stack.UltimateBaseRef, SHA: stack.UltimateBaseSHA}}
+}
+
 // PreFetchedContext is a review turn's own inline pre-fetched context
 // (§8.2: "inline diff pre-fetched into context (agent must not need
 // to run `gh pr diff` repeatedly)") -- built once, outside any domain
@@ -80,6 +116,35 @@ type PreFetchedContext struct {
 	// could not determine a head SHA (a degraded, best-effort outcome,
 	// exactly like Diff itself being empty on a failed fetch).
 	HeadSHA string
+	// BaseRef/BaseSHA/AncestorChain/PolicyVersion (§21.1's amendment) are
+	// this PR's own review CONTEXT beyond HeadSHA -- server-side
+	// bookkeeping ONLY, exactly like HeadSHA's own doc comment immediately
+	// above (never rendered into the prompt, never additional diff to
+	// verdict over). BaseRef/BaseSHA are this PR's own immediate base at
+	// context-fetch time, but from two DIFFERENT calls: BaseRef is the
+	// SAME GetPullRequest call HeadSHA itself comes from, while BaseSHA is
+	// a SEPARATE, live SourceControl.ResolveBranchSHA call pinned to that
+	// BaseRef -- never GetPullRequest's own response, which no longer
+	// decodes a base SHA at all (internal/app/reviewcontext.Fetch's own
+	// doc comment has the full "why"). AncestorChain is
+	// AncestorChainFromStack's own result
+	// over Stack above. PolicyVersion is the eligibility-policy revision
+	// in effect when this context was fetched (autoapproval.
+	// CurrentPolicyVersion at fetch time) -- a caller outside this
+	// package sets it, since this package (§11: zero external imports)
+	// cannot import internal/domain/autoapproval to read that constant
+	// itself.
+	//
+	// Persisted turn-scoped, exactly like HeadSHA (§21.1's own amendment:
+	// "the context must be scoped to the turn that examined it, never a
+	// per-(repo, PR) column, for exactly the reason that paragraph gives
+	// about head_sha") -- read back at verdict-post time to become
+	// review_verdicts' own base_ref/base_sha/ancestor_chain/policy_version
+	// columns (internal/domain/reviewverdict.Context).
+	BaseRef       string
+	BaseSHA       string
+	AncestorChain []AncestorLink
+	PolicyVersion int
 	// Title/Body (adversarial-review fix, §26.2's own follow-up)
 	// are the PR's own CURRENT title/body, fetched server-side by the SAME
 	// GetPullRequest call this struct's one real producer
@@ -281,10 +346,30 @@ const (
 // substitution, so no wire-contract change (a new sandboxws.Prompt field,
 // §6.1) is needed to tell sandbox-agent "this is a review turn": the
 // placeholders' own presence already is that signal.
+//
+// VerdictToolDispatchMessageIDPlaceholder (finding F3 (§21.1's amendment)) is a
+// FOURTH placeholder, one level more precise than Gen: Gen identifies
+// which SANDBOX INCARNATION a turn was dispatched to, but multiple turns
+// can share one incarnation (no respawn in between) -- exactly the gap
+// that let a verdict posted by a timed-out turn's own still-alive agent
+// be silently attributed to whatever OTHER turn happened to be
+// 'processing' when it finally posted (§21.1's own head_sha paragraph
+// names the identical class of hazard one level down: "a verdict can be
+// recorded against a commit it never read"). This placeholder is
+// substituted from the WIRE Prompt's own MessageId -- NOT from
+// cfg.SessionConfig like the three above (that value is fixed at sandbox
+// BOOT time; MessageId is fresh PER DISPATCH) -- at the SAME
+// substitution site, but sourced from the specific "prompt" command
+// currently being handled (cmd/sandbox-agent's HandlePrompt already has
+// it in scope as cmd.MessageId). httpapi.PostReviewVerdict reads it back
+// off a request header and resolves the posting turn by an EXACT match
+// on turns.dispatched_message_id (migrations/000131), never by session-
+// wide "current" status.
 const (
-	VerdictToolURLPlaceholder    = "{{REVIEW_VERDICT_TOOL_URL}}"
-	VerdictToolBearerPlaceholder = "{{REVIEW_VERDICT_TOOL_BEARER}}"
-	VerdictToolGenPlaceholder    = "{{REVIEW_VERDICT_TOOL_GEN}}"
+	VerdictToolURLPlaceholder               = "{{REVIEW_VERDICT_TOOL_URL}}"
+	VerdictToolBearerPlaceholder            = "{{REVIEW_VERDICT_TOOL_BEARER}}"
+	VerdictToolGenPlaceholder               = "{{REVIEW_VERDICT_TOOL_GEN}}"
+	VerdictToolDispatchMessageIDPlaceholder = "{{REVIEW_VERDICT_TOOL_DISPATCH_MESSAGE_ID}}"
 )
 
 // ReviewCostBudgetToolURLPlaceholder (§26.7/§26.9) is the fixed
@@ -516,6 +601,7 @@ func verdictToolInstructions(deep bool, costBudgetUSD float64, costBudgetSafetyM
 		"POST " + VerdictToolURLPlaceholder + "\n" +
 		"Authorization: Bearer " + VerdictToolBearerPlaceholder + "\n" +
 		"X-Sandbox-Gen: " + VerdictToolGenPlaceholder + "\n" +
+		"X-Sandbox-Dispatch-Message-Id: " + VerdictToolDispatchMessageIDPlaceholder + "\n" +
 		"Content-Type: application/json\n\n" +
 		"JSON body (every field below the top level is required except \"findings\" and \"counterReview\", which are optional -- see \"counterReview\"'s own entry below for exactly when to include it; within \"digest\", \"summary\"/\"descriptionAdequacy\"/\"adequacyExplanation\" are required -- " + digestRequiredFieldsClause + "):\n" +
 		"{\n" +

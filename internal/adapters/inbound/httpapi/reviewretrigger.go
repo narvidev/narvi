@@ -44,6 +44,7 @@ import (
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/review"
 	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
+	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -381,6 +382,21 @@ func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns 
 			triageRecordJSON = nil
 		}
 
+		// reviewVerdictContextJSON (§21.1's amendment) mirrors
+		// triageRecordJSON's own identical "marshal once here, forward
+		// verbatim" shape -- see internal/adapters/inbound/github/
+		// handler.go's own identical addition for the full "why".
+		reviewVerdictContextJSON, verdictContextErr := json.Marshal(reviewverdict.Context{
+			BaseRef:       prCtx.BaseRef,
+			BaseSHA:       prCtx.BaseSHA,
+			AncestorChain: prCtx.AncestorChain,
+			PolicyVersion: prCtx.PolicyVersion,
+		})
+		if verdictContextErr != nil {
+			logger.Warn("httpapi: marshal review verdict context failed, turn will carry review_head_sha but no review_verdict_context", "error", verdictContextErr, "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
+			reviewVerdictContextJSON = nil
+		}
+
 		// AlwaysQueue, NOT CreateTurn's own RejectIfOpen -- see this file's
 		// own top doc comment for why a manual re-review click is treated
 		// exactly like another @mention on the same PR (coalesce.go's own
@@ -409,7 +425,7 @@ func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns 
 		// to the safe, deterministic pre-existing "decline while a plan is
 		// awaiting approval" behavior instead of guessing from
 		// manualRetriggerPromptText/the pre-fetched diff.
-		created, _, cerr := CreateTurnCore(ctx, pool, sessions, turns, plans, nil, auditLog, registry, sessionID, prompt, triageModelID, false, false, actorUserID, AlwaysQueue, CreateTurnOptions{ReviewHeadSHA: reviewHeadSHA, Effort: triageEffort, ReviewDepth: &reviewDepthStr, ReviewDepthDecision: triageRecordJSON, ReviewKnowledgeMode: &knowledgeMode, ReviewKnowledgeDecision: knowledgeDecisionJSON})
+		created, _, cerr := CreateTurnCore(ctx, pool, sessions, turns, plans, nil, auditLog, registry, sessionID, prompt, triageModelID, false, false, actorUserID, AlwaysQueue, CreateTurnOptions{ReviewHeadSHA: reviewHeadSHA, Effort: triageEffort, ReviewDepth: &reviewDepthStr, ReviewDepthDecision: triageRecordJSON, ReviewKnowledgeMode: &knowledgeMode, ReviewKnowledgeDecision: knowledgeDecisionJSON, ReviewVerdictContext: reviewVerdictContextJSON})
 		if cerr != nil {
 			logger.Error("httpapi: retrigger review (create turn) failed", "status", cerr.Status, "message", cerr.Message)
 			writeError(w, cerr.Status, cerr.Message)

@@ -258,17 +258,22 @@ func createSandboxWithToken(ctx context.Context, t *testing.T, rig testRig, sess
 	}
 }
 
-// markTurnProcessing flips a turn to 'processing' directly via SQL --
-// standing in for the real dispatch machinery (a different package's own
-// concern, internal/app/sessionactor), the SAME shortcut internal/
-// adapters/inbound/httpapi's own reviewverdict_integration_test.go takes
-// (creating turns directly at sqlcgen.TurnStatusProcessing) so this test
-// can call the real POST /sessions/{id}/review/verdict handler against a
-// turn PostReviewVerdict's own GetProcessingTurnForSession will actually
-// find.
-func markTurnProcessing(ctx context.Context, t *testing.T, rig testRig, turnID pgtype.UUID) {
+// markTurnProcessing flips a turn to 'processing' AND stamps its own
+// dispatched_message_id, directly via SQL -- standing in for the real
+// dispatch machinery (a different package's own concern, internal/app/
+// sessionactor), the SAME shortcut internal/adapters/inbound/httpapi's own
+// reviewverdict_integration_test.go takes (creating turns directly at
+// sqlcgen.TurnStatusProcessing) so this test can call the real POST
+// /sessions/{id}/review/verdict handler against a turn
+// PostReviewVerdict's own turns.GetByDispatchedMessageID will actually
+// find (finding F3, §21.1's amendment: that lookup is now keyed by
+// dispatched_message_id, never by session-wide "current" status alone --
+// see reviewverdict.go's own doc comment). dispatchMessageID is the SAME
+// value the caller must then present as this turn's own
+// X-Sandbox-Dispatch-Message-Id header.
+func markTurnProcessing(ctx context.Context, t *testing.T, rig testRig, turnID pgtype.UUID, dispatchMessageID string) {
 	t.Helper()
-	if _, err := rig.pool.Exec(ctx, `UPDATE turns SET status = 'processing' WHERE id = $1`, turnID); err != nil {
+	if _, err := rig.pool.Exec(ctx, `UPDATE turns SET status = 'processing', dispatched_message_id = $2 WHERE id = $1`, turnID, dispatchMessageID); err != nil {
 		t.Fatalf("mark turn processing: %v", err)
 	}
 }
@@ -380,7 +385,8 @@ func TestGitHubIntegration_SensitiveGlobDiff_RoutesDeep_PersistsThroughVerdict(t
 	// chain: the depth persisted above is read back and forwarded onto
 	// review_verdicts.review_path, never silently dropped or recomputed.
 	createSandboxWithToken(ctx, t, rig, sessionID, "sandbox-bearer-token")
-	markTurnProcessing(ctx, t, rig, turnID)
+	const dispatchMessageID = "sensitive-migration-dispatch-message-id"
+	markTurnProcessing(ctx, t, rig, turnID, dispatchMessageID)
 
 	verdictMux := chi.NewRouter()
 	verdictMux.Post("/sessions/{sessionID}/review/verdict", httpapi.PostReviewVerdict(
@@ -412,6 +418,7 @@ func TestGitHubIntegration_SensitiveGlobDiff_RoutesDeep_PersistsThroughVerdict(t
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer sandbox-bearer-token")
 	req.Header.Set("X-Sandbox-Gen", "1")
+	req.Header.Set("X-Sandbox-Dispatch-Message-Id", dispatchMessageID)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

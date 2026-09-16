@@ -108,6 +108,9 @@ func (f *fakeDescriptionAutofixSourceControl) CreatePR(context.Context, ports.Cr
 func (f *fakeDescriptionAutofixSourceControl) ResolveBranchSHA(context.Context, ports.ResolveBranchSHASpec) (string, string, error) {
 	return "", "", errors.New("fakeDescriptionAutofixSourceControl: ResolveBranchSHA not implemented")
 }
+func (f *fakeDescriptionAutofixSourceControl) IsAncestor(context.Context, ports.IsAncestorSpec) (bool, error) {
+	return false, errors.New("fakeDescriptionAutofixSourceControl: IsAncestor not implemented")
+}
 func (f *fakeDescriptionAutofixSourceControl) ResolveContractsFingerprint(context.Context, ports.ResolveContractsFingerprintSpec) (string, bool, error) {
 	return "", false, errors.New("fakeDescriptionAutofixSourceControl: ResolveContractsFingerprint not implemented")
 }

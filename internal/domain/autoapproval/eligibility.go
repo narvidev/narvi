@@ -16,6 +16,27 @@ import "github.com/narvidev/narvi/internal/domain/review"
 // a claimed-correct number.
 const defaultMaxFilesChanged = 20
 
+// CurrentPolicyVersion (§21.1's amendment) is this engine's own
+// eligibility-policy revision -- stamped onto a review's own context at
+// fetch time (review.PreFetchedContext.PolicyVersion, since
+// internal/domain/review cannot import this package -- §11's "zero
+// external imports" convention for that package) and compared, at
+// eligibility time, against a verdict's own recorded
+// EligibilityInput.VerdictPolicyVersion: "a verdict produced under one
+// set of rules is not evidence under another, and nothing else records
+// which rules applied." A verdict recorded under an EARLIER policy
+// version fails ComputeEligible's own policy-version check below,
+// forcing a fresh review under the current rules -- never silently
+// grandfathered in. Bump this whenever a change to this package's own
+// criteria (a new check, a changed threshold's MEANING rather than its
+// configured VALUE, a reordered precedence) would make an
+// already-eligible verdict's own eligibility answer no longer honest
+// under the new rules. The starting value is 1, deliberately never 0:
+// every review_verdicts row that predates this column reads back
+// policy_version = 0 (migrations' own NOT NULL DEFAULT 0), which must
+// never equal a real, current policy version by coincidence.
+const CurrentPolicyVersion = 1
+
 // DefaultSensitiveTags is DefaultEligibilityConfig's own sensitive-path
 // tag list -- §21.2's own named defaults, verbatim: "migrations, auth
 // code, /contracts by default". Returned as a fresh slice on every call
@@ -79,9 +100,40 @@ type EligibilityInput struct {
 	// DISPLAY/audit data for a caller that wants to show what the model
 	// itself claimed -- ComputeEligible never reads either.
 	Verdict review.Verdict
+	// VerdictAssessed reports whether Verdict above is a REAL, posted
+	// verdict at all -- §21.1's amendment: "not_assessed as a first-class
+	// outcome... a review that did not complete has no risk level, and
+	// inventing one (or letting its absence read as low) is the same
+	// defect as a truncated scan rendering as a clean one." Deliberately
+	// the BOOLEAN ZERO VALUE for "not assessed", mirroring
+	// TouchedBlastRadiusKnown's own identical fail-conservative
+	// convention immediately below: a caller that constructs an
+	// EligibilityInput and simply forgets to set this field gets false
+	// ("not assessed, fail closed"), never true ("a real verdict exists")
+	// by accident. Every real caller (internal/app/decisioninbox's
+	// revalidateCore/computeRealEligibility) already refuses to reach
+	// this function at all when reviewverdict.GetLatest reports no
+	// verdict on record -- this field is the SAME fact, made checkable
+	// inside the one function §21.2 calls the actual gate, so a future
+	// caller cannot silently reintroduce the hole by forgetting that
+	// upstream guard.
+	VerdictAssessed bool
 	// VerdictHeadSHA is review_verdicts.head_sha for Verdict above --
 	// the commit Verdict was actually produced against.
 	VerdictHeadSHA string
+	// VerdictBaseRef/VerdictBaseSHA/VerdictAncestorChain/
+	// VerdictPolicyVersion (§21.1's amendment) are the rest of what
+	// Verdict's own review_verdicts row recorded about what it examined
+	// -- review_verdicts.base_ref/base_sha/ancestor_chain/policy_version
+	// (internal/domain/reviewverdict.Context). VerdictBaseRef == ""
+	// means this row predates the amendment (no context was ever
+	// recorded) -- see ComputeEligible's own doc comment for why that is
+	// treated as UNKNOWN, never as a match: "treating unknown context as
+	// matching would reopen the hole for every verdict already stored."
+	VerdictBaseRef       string
+	VerdictBaseSHA       string
+	VerdictAncestorChain []review.AncestorLink
+	VerdictPolicyVersion int
 	// ChangedFileCount is this PR's own CURRENT, server-fetched
 	// changed-file count -- ports.OpenPR.
 	// ChangedFilesCount, GitHub's own authoritative "changed_files"
@@ -165,6 +217,108 @@ type EligibilityInput struct {
 	// comment, which this engine's own stale-verdict guard depends on
 	// exactly as much as the rest of that function does).
 	CurrentHeadSHA string
+	// CurrentBaseRef/CurrentBaseSHA/CurrentAncestorChain (§21.1's
+	// amendment) are the PR's LIVE current review context -- compared
+	// against VerdictBaseRef/VerdictBaseSHA/VerdictAncestorChain above to
+	// catch the hazard CurrentHeadSHA alone cannot: "a PR evaluated while
+	// based on another PR's branch, then retargeted -- or whose parent
+	// moved beneath it -- keeps an unchanged head." CurrentBaseRef/
+	// CurrentAncestorChain come straight from ports.OpenPR (BaseRef/
+	// AncestorChain), fetched fresh exactly like CurrentHeadSHA
+	// immediately above. CurrentBaseSHA is DIFFERENT: never ports.OpenPR.
+	// BaseSHA -- that field is GitHub's own per-PR CACHED snapshot
+	// (ports.OpenPR.BaseSHA's own doc comment), exactly the value both of
+	// this engine's real callers (internal/app/decisioninbox's
+	// revalidateCore and computeRealEligibility) deliberately bypass in
+	// favor of a live SourceControl.ResolveBranchSHA call -- see either
+	// call site's own doc comment for the full "why".
+	CurrentBaseRef       string
+	CurrentBaseSHA       string
+	CurrentAncestorChain []review.AncestorLink
+	// BaseAdvancedWithoutRewrite (D3, second adversarial-review round;
+	// doc comment corrected twice over -- E2, third round, then G1,
+	// fourth round, because E2's OWN replacement was a second false proof
+	// -- see below) is the fast-forward-tolerance
+	// fact this engine consults ONLY when VerdictBaseSHA != CurrentBaseSHA
+	// under an UNCHANGED VerdictBaseRef/CurrentBaseRef (a retargeted base
+	// still refuses unconditionally, below, regardless of this field).
+	// true means the caller has POSITIVELY CONFIRMED, via a live
+	// SourceControl.IsAncestor check, that VerdictBaseSHA is an ancestor
+	// of (or identical to) CurrentBaseSHA -- i.e. the base branch only
+	// ever gained NEW commits since the verdict was produced, never
+	// rewound or rewritten.
+	//
+	// This is a TOLERATED RESIDUAL, not a proof that nothing relevant
+	// changed. The previous (E2, third round) version of this comment
+	// claimed that, under this confirmation, "its own merge-base with
+	// head has not moved, so what the verdict examined provably still
+	// matches what the PR would merge today" -- both halves are wrong.
+	// E2's OWN replacement then claimed a second, narrower-sounding proof
+	// -- that a moved merge-base can only shrink the diff to a SUBSET of
+	// what the verdict already examined -- and that is false too,
+	// reproduced against real git rather than reasoned from first
+	// principles (G1, fourth round): seed a file with content A on main.
+	// Branch feat-a flips it to B (one commit, C1). Branch feat-b is cut
+	// from feat-a and flips it BACK to A (a second commit, C2 == head);
+	// feat-b is the open PR, base main, main still at its own pre-feat-a
+	// commit. main...head is computed at verdict time: the two flips
+	// cancel across the merge-base, so the file is ABSENT from the diff
+	// -- the verdict never saw it at all. feat-a then merges to main (an
+	// ordinary, unrelated merge -- IsAncestor(old main, new main) is
+	// true, so this tolerance applies: base ref unchanged, base sha
+	// advanced, confirmed forward-only). The merge-base of (main, head)
+	// moves from main's old tip to C1 -- still on head's own history,
+	// exactly as the premise says -- and the FRESH main...head diff now
+	// CONTAINS the file, a real hunk (-B +A) the verdict never examined.
+	// That is not a subset of what the verdict saw (the verdict saw
+	// nothing for this file); it is a hunk manufactured by the merge-base
+	// advancing past C1. Advancing the merge-base along head's own
+	// history does not monotonically shrink the diff -- it can just as
+	// easily UNMASK whatever an earlier commit on head changed and a
+	// later commit on head undid, because that intervening commit is
+	// exactly what falls out of scope once the merge-base moves past it.
+	//
+	// What actually bounds the damage is narrower, and structural rather
+	// than a property of the diff: both callers of ComputeEligible
+	// (revalidateCore and computeRealEligibility) re-derive
+	// ChangedFileCount and TouchedBlastRadius LIVE, from GitHub's current
+	// changed-files listing, on every call -- never from anything the
+	// verdict itself recorded. A base movement that unmasks a change to a
+	// SENSITIVE path, or that pushes the file count over threshold, is
+	// still caught, because the checks that would catch it read the PR's
+	// live state, not the stale verdict's.
+	//
+	// The residual this tolerance genuinely accepts is narrower, and
+	// real: a base movement that unmasks a NON-sensitive file's silent
+	// revert of a teammate's just-landed change, while the total file
+	// count stays under threshold, is invisible to every check this
+	// engine runs -- Shippable == auto stands, from a verdict that never
+	// saw the revert. The verdict's Shippable/blast-radius judgement was
+	// formed by reading the diff against the base's OLD content, and
+	// EligibilityInput.CIGreen is checked at CurrentHeadSHA alone, a
+	// feature-branch build that does not re-run against the base's new
+	// tip. Nothing in this engine re-examines head's reviewed diff merged
+	// into what the base has since become. Refusing here instead would
+	// disqualify every verdict on an active trunk the moment anyone else
+	// merges, with no mechanism in this codebase to re-trigger review on
+	// the base moving alone (§24's automatic re-review watches the PR's
+	// own head, never its base) -- judged the worse failure, so the
+	// residual is accepted rather than closed. §21.1 (docs/
+	// TECHNICAL_PLAN.md) records this amendment alongside its own,
+	// differently-shaped stacked-PR residual.
+	//
+	// Deliberately the BOOLEAN ZERO VALUE for "not confirmed", mirroring
+	// this package's own established fail-conservative convention
+	// (TouchedBlastRadiusKnown/VerdictAssessed's own identical doc
+	// comments): a caller that never populates this field, or whose own
+	// IsAncestor call failed, gets false -- "the base moved and this was
+	// never independently confirmed to be safe" -- which this function
+	// then refuses on ReasonBaseMoved, EXACTLY the behavior this codebase
+	// had before this field existed. This is what makes the failure D3
+	// closes a strict widening of eligibility (an unrelated, confirmed-
+	// forward-only base movement no longer refuses) rather than a
+	// loosening of anything ELSE this engine already checks.
+	BaseAdvancedWithoutRewrite bool
 	// CIGreen is the PR's CI conclusion at CurrentHeadSHA specifically
 	// (never at VerdictHeadSHA, which may already be stale) -- re-
 	// derived live via the STRICT ports.CIConclusion check
@@ -189,9 +343,66 @@ type Reason string
 // eligible=true; every other value accompanies eligible=false and names
 // exactly which criterion failed.
 const (
-	ReasonNone                 Reason = ""
-	ReasonNeedsHumanLabel      Reason = "review:needs-human label is present"
-	ReasonStaleVerdict         Reason = "the verdict relied on was produced against an earlier commit"
+	ReasonNone Reason = ""
+	// ReasonNotAssessed (§21.1's amendment) accompanies a PR with no
+	// posted verdict at all -- EligibilityInput.VerdictAssessed's own doc
+	// comment. Distinct from ReasonStaleVerdict below: this PR has never
+	// been reviewed, not "reviewed against a commit that has since
+	// moved."
+	ReasonNotAssessed     Reason = "no review verdict has been posted for this pull request"
+	ReasonNeedsHumanLabel Reason = "review:needs-human label is present"
+	ReasonStaleVerdict    Reason = "the verdict relied on was produced against an earlier commit"
+	// ReasonContextUnknown (§21.1's amendment) accompanies a verdict that
+	// predates this check -- VerdictBaseRef's own doc comment: an old row
+	// recorded no base/ancestor/policy context at all, and treating that
+	// absence as a match would reopen the exact hole this amendment
+	// closes. Distinct from ReasonBaseMoved/ReasonAncestorChainChanged/
+	// ReasonPolicyVersionMismatch below, which all mean "a context WAS
+	// recorded, and it no longer matches" -- this one means "no context
+	// was ever recorded to compare".
+	ReasonContextUnknown Reason = "this verdict predates review-context tracking and cannot be confirmed fresh"
+	// ReasonBaseMoved (§21.1's amendment; refined by D3, second
+	// adversarial-review round) accompanies a verdict whose recorded base
+	// ref, or whose recorded base commit in a way NOT confirmed to be a
+	// pure forward advance, no longer matches the PR's own CURRENT base --
+	// the retargeted-PR / parent-moved-beneath-it hazard this amendment
+	// exists to close: "a PR evaluated while based on another PR's
+	// branch, then retargeted -- or whose parent moved beneath it --
+	// keeps an unchanged head." A base REF change always fires this,
+	// unconditionally. A base SHA change fires this UNLESS
+	// BaseAdvancedWithoutRewrite confirms the movement was an ordinary,
+	// unrelated fast-forward (D3's own fix for "any unrelated merge to
+	// trunk permanently disqualifies a verdict" -- see that field's own
+	// doc comment for the full reasoning).
+	ReasonBaseMoved Reason = "the pull request's base has changed since this verdict was produced"
+	// ReasonAncestorChainChanged (§21.1's amendment) accompanies a
+	// verdict whose recorded ancestor chain (review.AncestorLink, ordered
+	// nearest-first) no longer matches the PR's own current chain --
+	// catches the shape ReasonBaseMoved alone cannot: this PR's own
+	// immediate base is unchanged, but something further back in its
+	// stacked ancestry moved.
+	ReasonAncestorChainChanged Reason = "the pull request's ancestor chain has changed since this verdict was produced"
+	// ReasonPolicyVersionMismatch (§21.1's amendment) accompanies a
+	// verdict recorded under an earlier eligibility policy
+	// (CurrentPolicyVersion's own doc comment): "a verdict produced under
+	// one set of rules is not evidence under another."
+	ReasonPolicyVersionMismatch Reason = "this verdict was produced under an earlier eligibility policy"
+	// ReasonBaseSHAUnknown (finding F2 (§21.1's amendment)) accompanies a verdict
+	// whose recorded OR current base commit could not be established at
+	// all -- VerdictBaseSHA/CurrentBaseSHA being empty is not the same
+	// fact as ReasonContextUnknown (VerdictBaseRef == "", meaning no
+	// context was ever recorded) or ReasonBaseMoved (a real recorded
+	// commit that no longer matches a real current one): this is "a
+	// commit SHA was supposed to be here and is not", on EITHER side --
+	// a live resolution that failed (internal/app/reviewcontext.Fetch's
+	// or internal/app/decisioninbox.revalidateCore's own
+	// ResolveBranchSHA call erroring), or a decoder that stopped
+	// emitting the field. Checked BEFORE the equality comparison
+	// immediately below specifically so "" == "" (both sides genuinely
+	// empty) can never read as a match: an empty base SHA on either
+	// side must fail closed with THIS distinct reason, never silently
+	// pass as fresh because two unknowns happen to be equal.
+	ReasonBaseSHAUnknown       Reason = "this pull request's base commit could not be established"
 	ReasonCINotGreen           Reason = "CI is not green at the current head"
 	ReasonNotShippableAuto     Reason = "the verdict's shippable classification is not auto"
 	ReasonDiffTooLarge         Reason = "the diff exceeds this repo's auto-approval file-count threshold"
@@ -209,8 +420,69 @@ func ComputeEligible(in EligibilityInput, cfg EligibilityConfig) (eligible bool,
 	if in.HasNeedsHumanLabel {
 		return false, ReasonNeedsHumanLabel
 	}
+	// §21.1's amendment: "a review that did not complete has no risk
+	// level, and inventing one ... is the same defect as a truncated scan
+	// rendering as a clean one." Checked before anything else looks at
+	// in.Verdict at all -- a not-assessed PR has no Verdict worth
+	// reasoning about.
+	if !in.VerdictAssessed {
+		return false, ReasonNotAssessed
+	}
 	if in.VerdictHeadSHA == "" || in.VerdictHeadSHA != in.CurrentHeadSHA {
 		return false, ReasonStaleVerdict
+	}
+	// §21.1's amendment: "head equality is necessary and not
+	// sufficient... the gate is the verdict's whole persisted context --
+	// head, base, ancestor chain and policy version -- matching the PR as
+	// it stands now." VerdictBaseRef == "" means this row predates the
+	// amendment: no context was ever recorded, so there is nothing to
+	// confirm fresh -- treated as UNKNOWN, never as a match, exactly
+	// because "treating unknown context as matching would reopen the
+	// hole for every verdict already stored" (backfill: an old verdict
+	// means exactly this, and forces a fresh review, never a silent
+	// grandfather-in).
+	if in.VerdictBaseRef == "" {
+		return false, ReasonContextUnknown
+	}
+	// Finding F2: an empty base SHA on EITHER side is refused here, on its
+	// own dedicated reason, BEFORE the equality comparison below ever runs
+	// -- "" == "" would otherwise read as a trivially-matching pair,
+	// exactly the same hole VerdictHeadSHA's own dedicated empty-string
+	// check (above) already closes for the head sha. This also fails
+	// closed the day a decoder regression, or a second SourceControl
+	// adapter (CLAUDE.md: "don't couple a port to a single adapter" --
+	// this port is EXPECTED to gain one), stops emitting either field:
+	// both sides reading "" must never be indistinguishable from both
+	// sides genuinely, confirmedly agreeing.
+	if in.VerdictBaseSHA == "" || in.CurrentBaseSHA == "" {
+		return false, ReasonBaseSHAUnknown
+	}
+	// D3 (second adversarial-review round): a base REF change (a retarget,
+	// or a stacked PR's own parent merging and GitHub re-targeting onto
+	// the grandparent) always refuses -- unconditionally, regardless of
+	// BaseAdvancedWithoutRewrite, which says nothing about a DIFFERENT
+	// branch. Split from the base-SHA comparison immediately below
+	// (previously one combined condition) specifically so the ref check
+	// can stay unconditional while the sha check alone gains the
+	// fast-forward tolerance.
+	if in.VerdictBaseRef != in.CurrentBaseRef {
+		return false, ReasonBaseMoved
+	}
+	// The base SHA changed under an UNCHANGED ref -- refuse UNLESS the
+	// caller has positively confirmed (BaseAdvancedWithoutRewrite) this
+	// was an ordinary, unrelated fast-forward: "any unrelated merge to
+	// trunk permanently disqualifies a verdict" is exactly the failure D3
+	// exists to close, and BaseAdvancedWithoutRewrite's own doc comment
+	// covers why this is a strict widening, never a loosening, of what
+	// this engine already refuses.
+	if in.VerdictBaseSHA != in.CurrentBaseSHA && !in.BaseAdvancedWithoutRewrite {
+		return false, ReasonBaseMoved
+	}
+	if !ancestorChainEqual(in.VerdictAncestorChain, in.CurrentAncestorChain) {
+		return false, ReasonAncestorChainChanged
+	}
+	if in.VerdictPolicyVersion != CurrentPolicyVersion {
+		return false, ReasonPolicyVersionMismatch
 	}
 	if !in.CIGreen {
 		return false, ReasonCINotGreen
@@ -278,4 +550,28 @@ func touchesSensitivePath(blastRadius, sensitiveTags []review.Tag) bool {
 		}
 	}
 	return false
+}
+
+// ancestorChainEqual reports whether a and b name the identical ordered
+// ancestor chain (§21.1's amendment) -- ORDER-SENSITIVE (a chain is
+// nearest-first, review.AncestorLink's own doc comment, so two chains
+// that name the same links in a different order are NOT the same
+// ancestry) and length-sensitive (a chain that gained or lost a link
+// changed, regardless of what the surviving links say). A nil and an
+// empty-but-non-nil slice compare equal -- both mean "no ancestor beyond
+// the immediate base", the ordinary non-stacked case, and the
+// distinction between "never computed" and "computed as empty" is not
+// one this comparison needs to preserve (unlike VerdictBaseRef == "",
+// which IS load-bearing precisely because a real base ref is never
+// legitimately empty).
+func ancestorChainEqual(a, b []review.AncestorLink) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

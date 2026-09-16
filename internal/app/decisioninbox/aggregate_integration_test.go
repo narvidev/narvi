@@ -34,12 +34,34 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
 	"github.com/narvidev/narvi/internal/domain/authz"
+	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	decisioninboxdomain "github.com/narvidev/narvi/internal/domain/decisioninbox"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
+	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/migrations"
+)
+
+// testEligibleBaseRef/testEligibleBaseSHA (§21.1's amendment) are this
+// package's own shared "this PR's base has not moved" fixture pair --
+// every ports.OpenPR fixture in this file and revalidate_integration_
+// test.go that claims to be "otherwise fully eligible" sets BOTH of
+// these on the LIVE PR AND passes them to seedAutoApprovedVerdict below,
+// so the verdict's own recorded context matches the PR's current one
+// exactly, the precondition internal/domain/autoapproval.ComputeEligible
+// now requires before CI/Shippable/diff-size/sensitive-path are ever
+// even reached. A test that means to exercise base drift specifically
+// (TestComputeEligible's own "a PR whose base changed while its head did
+// not must lose eligibility" case lives in eligibility_test.go, a pure
+// unit test -- this package's own integration tests are not where that
+// guard is pinned) sets a DIFFERENT base on the live PR after seeding,
+// exactly like every other negative subtest here perturbs one fact off
+// of the eligible baseline.
+const (
+	testEligibleBaseRef = "main"
+	testEligibleBaseSHA = "sha-eligible-base"
 )
 
 // newTestPool spins up a throwaway Postgres container, runs every embedded
@@ -144,16 +166,76 @@ type fakeDecisionInboxSourceControl struct {
 	// previously inspected what spec this fake was actually called with.
 	codeOwnersCalls []ports.ResolveCodeOwnersSpec
 
-	// getOpenPRByKey/getOpenPRErr (§21.2 stage 2) back GetOpenPR
-	// below -- keyed by "owner/repo#number", the direct single-PR lookup
-	// internal/app/decisioninbox.RevalidateForAutoMerge uses instead of a
-	// user-scoped ListOpenPRsForUser search (revalidate_integration_test.go's
-	// own TestRevalidateForAutoMerge is this field's one real user).
-	getOpenPRByKey map[string]ports.OpenPR
-	getOpenPRErr   error
+	// resolveBranchSHA/resolveBranchSHAErr (finding F1 (§21.1's amendment)) back
+	// ResolveBranchSHA below -- revalidateCore now resolves the base
+	// branch's LIVE tip independently, rather than trusting
+	// ports.OpenPR.BaseSHA (GitHub's own possibly-stale
+	// `pull_request.base.sha` snapshot, that field's own doc comment).
+	// Both zero (every caller that never sets them) falls back to
+	// scanning this fake's own already-seeded PRs (openPRsByExternalID)
+	// for one reporting spec.Branch as its BaseRef, returning THAT PR's
+	// own BaseSHA -- so every EXISTING fixture in this file, which
+	// already sets BaseRef/BaseSHA consistently, gets a live resolution
+	// "for free" with no per-test literal changes needed. A test proving
+	// the F1 hazard
+	// (revalidate_integration_test.go) overrides resolveBranchSHA
+	// explicitly to simulate the base branch's real tip moving while
+	// GitHub's own cached base.sha field (and the base ref name) both
+	// stay exactly as they were.
+	resolveBranchSHA    string
+	resolveBranchSHAErr error
+
+	// isAncestorResult/isAncestorErr/isAncestorCalls (D3, second
+	// adversarial-review round) back IsAncestor below -- the fast-forward
+	// tolerance the base-freshness gate now applies when a verdict's own
+	// recorded base sha differs from the live tip but the base REF is
+	// unchanged. Zero value (false, nil) reproduces this codebase's own
+	// PRE-D3 behavior exactly (any base sha mismatch refuses, regardless
+	// of ancestry) -- every EXISTING test in this file that never sets
+	// this field is therefore unaffected by D3's own addition. A test
+	// proving the D3 fix sets isAncestorResult = true to simulate an
+	// unrelated, purely-forward merge to the base branch.
+	isAncestorResult bool
+	isAncestorErr    error
+	isAncestorCalls  []ports.IsAncestorSpec
 }
 
 var _ ports.SourceControl = (*fakeDecisionInboxSourceControl)(nil)
+
+// IsAncestor (D3, second adversarial-review round) reports
+// isAncestorResult/isAncestorErr, recording every call it receives so a
+// test can assert WHICH (ancestor, descendant) pair was actually
+// compared -- mirrors this fake's own codeOwnersCalls precedent.
+//
+// Honors ctx (E7, third adversarial-review round): this previously
+// ignored ctx entirely (the blank identifier in its own signature).
+// ctx.Err() is checked FIRST, before either configured return: a caller
+// context.WithTimeout'd with a non-positive duration is already expired
+// the instant it is constructed (context's own documented behavior, no
+// sleep/wall-clock dependency needed to observe it), so THIS MECHANISM
+// makes a zero/missing timeout on the real call site detectable --
+// something no version of this fake could do before E7.
+//
+// That capability sat unused (G5, fourth adversarial-review round): E7's
+// own comment here previously claimed a zero/unset/never-wired timeout
+// "could not make ANY test in this package fail", stated as though this
+// fake already delivered that guarantee -- but no test anywhere in this
+// package ever set platform.Timeouts.DecisionInboxIsAncestorTimeout to a
+// non-positive value and asserted the resulting failure, so nothing
+// actually exercised the branch this doc comment described. A mechanism
+// nothing calls pins nothing.
+// TestRevalidateForMerge_ZeroIsAncestorTimeout_TreatedAsAlreadyExpired
+// (revalidate_integration_test.go) is the first test that does.
+func (f *fakeDecisionInboxSourceControl) IsAncestor(ctx context.Context, spec ports.IsAncestorSpec) (bool, error) {
+	f.isAncestorCalls = append(f.isAncestorCalls, spec)
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if f.isAncestorErr != nil {
+		return false, f.isAncestorErr
+	}
+	return f.isAncestorResult, nil
+}
 
 func (f *fakeDecisionInboxSourceControl) ListOpenPRsForUser(_ context.Context, spec ports.ListOpenPRsForUserSpec) ([]ports.OpenPR, bool, error) {
 	if f.openPRsErr != nil {
@@ -175,8 +257,32 @@ func (f *fakeDecisionInboxSourceControl) ResolveCodeOwners(_ context.Context, sp
 func (f *fakeDecisionInboxSourceControl) CreatePR(context.Context, ports.CreatePRSpec) (ports.PRRef, error) {
 	return ports.PRRef{}, errors.New("fakeDecisionInboxSourceControl: CreatePR not implemented")
 }
-func (f *fakeDecisionInboxSourceControl) ResolveBranchSHA(context.Context, ports.ResolveBranchSHASpec) (string, string, error) {
-	return "", "", errors.New("fakeDecisionInboxSourceControl: ResolveBranchSHA not implemented")
+// Honors ctx (G4, fourth adversarial-review round -- mirroring
+// IsAncestor's own identical E7 fix above, for the identical reason):
+// this previously ignored ctx entirely, so a caller that failed to wrap
+// this call in a timeout (revalidateCore's own ResolveBranchSHA call was
+// exactly this, before G4) could not be caught by any test in this
+// package. ctx.Err() is checked FIRST, before any configured/seeded
+// return, for the identical "already-expired context is deterministic,
+// no sleep needed" reason IsAncestor's own doc comment gives.
+func (f *fakeDecisionInboxSourceControl) ResolveBranchSHA(ctx context.Context, spec ports.ResolveBranchSHASpec) (string, string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", "", err
+	}
+	if f.resolveBranchSHAErr != nil {
+		return "", "", f.resolveBranchSHAErr
+	}
+	if f.resolveBranchSHA != "" {
+		return f.resolveBranchSHA, spec.Branch, nil
+	}
+	for _, prs := range f.openPRsByExternalID {
+		for _, pr := range prs {
+			if pr.BaseRef == spec.Branch {
+				return pr.BaseSHA, spec.Branch, nil
+			}
+		}
+	}
+	return "", "", fmt.Errorf("fakeDecisionInboxSourceControl: ResolveBranchSHA: no seeded PR reports base ref %q", spec.Branch)
 }
 func (f *fakeDecisionInboxSourceControl) ResolveContractsFingerprint(context.Context, ports.ResolveContractsFingerprintSpec) (string, bool, error) {
 	return "", false, errors.New("fakeDecisionInboxSourceControl: ResolveContractsFingerprint not implemented")
@@ -203,19 +309,17 @@ func (f *fakeDecisionInboxSourceControl) MergePR(context.Context, ports.MergePRS
 	return "", errors.New("fakeDecisionInboxSourceControl: MergePR not implemented")
 }
 
-// GetOpenPR (§21.2 stage 2) looks up f.getOpenPRByKey by
-// "owner/repo#number" -- a miss (the ordinary case for every test that
-// never populates this field) reports found=false, err=nil, mirroring a
-// confirmed GitHub 404 (ports.SourceControl.GetOpenPR's own doc comment)
-// rather than an error, since most callers of this fake never exercise
-// this method at all.
-func (f *fakeDecisionInboxSourceControl) GetOpenPR(_ context.Context, owner, repo string, number int, _ string) (ports.OpenPR, bool, error) {
-	if f.getOpenPRErr != nil {
-		return ports.OpenPR{}, false, f.getOpenPRErr
-	}
-	key := fmt.Sprintf("%s/%s#%d", owner, repo, number)
-	pr, ok := f.getOpenPRByKey[key]
-	return pr, ok, nil
+// GetOpenPR (§21.2 stage 2) backs RevalidateForAutoMerge, which no test in
+// this package (decisioninbox) exercises -- that function's own coverage
+// lives in internal/app/automerge's worker_integration_test.go, against
+// ITS OWN fakeAutoMergeSourceControl, this fake's sibling. A prior version
+// of this method carried a seedable getOpenPRByKey map whose doc named a
+// TestRevalidateForAutoMerge this package has never had; removed rather
+// than given a real user, mirroring the plain "not implemented" every
+// other method on this fake already uses for a method Build's own
+// SCMCache never calls (this type's own doc comment, above).
+func (f *fakeDecisionInboxSourceControl) GetOpenPR(context.Context, string, string, int, string) (ports.OpenPR, bool, error) {
+	return ports.OpenPR{}, false, errors.New("fakeDecisionInboxSourceControl: GetOpenPR not implemented")
 }
 func (f *fakeDecisionInboxSourceControl) GetPRBody(context.Context, string, string, int, string) (string, bool, error) {
 	return "", false, errors.New("fakeDecisionInboxSourceControl: GetPRBody not implemented")
@@ -255,7 +359,20 @@ func seedAutoApprovedVerdict(ctx context.Context, t *testing.T, pool *pgxpool.Po
 	// caller uses (migrations/000105's own doc comment) -- this fixture
 	// does not need to promote repoFullName to live for that read to see
 	// it, unlike internal/app/automerge's own seedEligiblePR.
-	if _, err := appreviewverdict.Insert(ctx, store, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false); err != nil {
+	// (§21.1's amendment): base_ref/base_sha/policy_version are
+	// stamped to this package's own shared testEligibleBaseRef/
+	// testEligibleBaseSHA/autoapproval.CurrentPolicyVersion -- matching
+	// every "otherwise fully eligible" ports.OpenPR fixture in this file
+	// and revalidate_integration_test.go, so ComputeEligible's own new
+	// context-freshness check passes for the SAME reason head_sha above
+	// already has to match. AncestorChain stays nil: none of this
+	// package's fixtures are GitHub-native-stack PRs.
+	verdictContext := reviewverdict.Context{
+		BaseRef:       testEligibleBaseRef,
+		BaseSHA:       testEligibleBaseSHA,
+		PolicyVersion: autoapproval.CurrentPolicyVersion,
+	}
+	if _, err := appreviewverdict.Insert(ctx, store, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
 		t.Fatalf("seed auto-approved review_verdicts row for %s#%d: %v", repoFullName, prNumber, err)
 	}
 }
@@ -351,6 +468,7 @@ func TestBuild_FullScenario(t *testing.T) {
 				{
 					Owner: "acme", Repo: "widgets", Number: 10, Title: "scheduler: exponential backoff",
 					HTMLURL: "https://github.com/acme/widgets/pull/10", HeadSHA: "sha10",
+					BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
 					Assignees:    []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}},
 					CIConclusion: ports.CIConclusionSuccess,
 					Labels:       []string{"review:low-risk"},
@@ -741,8 +859,10 @@ func TestBuild_ReviewSessionIDAndReleaseCut(t *testing.T) {
 				{Owner: "acme", Repo: "rockets", Number: 32, Title: "PR 32", HTMLURL: "https://github.com/acme/rockets/pull/32", HeadSHA: "sha32",
 					Assignees: []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}}, CIConclusion: ports.CIConclusionSuccess, CreatedAt: time.Now()},
 				{Owner: "acme", Repo: "rockets", Number: 33, Title: "release/2026.09.01 -- 2 PRs", HTMLURL: "https://github.com/acme/rockets/pull/33", HeadSHA: "sha33",
+					BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
 					Assignees: []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}}, CIConclusion: ports.CIConclusionSuccess, Labels: []string{"review:low-risk"}, CreatedAt: time.Now()},
 				{Owner: "acme", Repo: "rockets", Number: 34, Title: "PR 34", HTMLURL: "https://github.com/acme/rockets/pull/34", HeadSHA: "sha34",
+					BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
 					Assignees: []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}}, CIConclusion: ports.CIConclusionSuccess, Labels: []string{"review:low-risk"}, CreatedAt: time.Now()},
 				{Owner: "acme", Repo: "rockets", Number: 35, Title: "release/2026.09.02 -- truncated scan", HTMLURL: "https://github.com/acme/rockets/pull/35", HeadSHA: "sha35",
 					Assignees: []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}}, CIConclusion: ports.CIConclusionSuccess, Labels: []string{"review:low-risk"}, CreatedAt: time.Now()},
@@ -1222,6 +1342,7 @@ func TestBuild_HasChangesRequestedDemotesFromReadyToMerge(t *testing.T) {
 				{
 					Owner: "acme", Repo: "widgets", Number: 40, Title: "otherwise fully eligible, but changes requested",
 					HTMLURL: htmlURL, HeadSHA: "sha40",
+					BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
 					Assignees:           []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}},
 					CIConclusion:        ports.CIConclusionSuccess,
 					Labels:              []string{"review:low-risk"},
@@ -1299,6 +1420,7 @@ func TestBuild_ChangedFilesListDegraded_NeverReadyToMerge(t *testing.T) {
 				{
 					Owner: "acme", Repo: "widgets", Number: 50, Title: "otherwise fully eligible, but the changed-files read was degraded",
 					HTMLURL: htmlURL, HeadSHA: "sha50",
+					BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
 					Assignees:    []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}},
 					CIConclusion: ports.CIConclusionSuccess,
 					Labels:       []string{"review:low-risk"},
@@ -1635,6 +1757,7 @@ func buildEligibleReadyToMergeFixture(ctx context.Context, t *testing.T, pool *p
 				{
 					Owner: owner, Repo: repo, Number: prNumber, Title: "eligible pr",
 					HTMLURL: htmlURL, HeadSHA: headSHA,
+					BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
 					Assignees:    []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}},
 					CIConclusion: ports.CIConclusionSuccess,
 					Labels:       []string{"review:low-risk"},
@@ -1713,6 +1836,333 @@ func TestBuild_EligibilityConfigStoreError_DemotesFromReadyToMerge(t *testing.T)
 	}
 	if item.Kind == decisioninboxdomain.KindReadyToMerge {
 		t.Error("Kind = ready_to_merge, want needs_review -- an eligibility-config store error must fail CLOSED (never substitute the engine's own wider defaults for this repo's own configured policy)")
+	}
+}
+
+// TestBuild_LiveSCMLookupFails_MarksSCMFetchFailed is E5's own regression
+// test (third adversarial-review round): before this fix, a per-PR live
+// SCM lookup failure inside computeRealEligibility (here,
+// SCMCache.ResolveBranchSHA's own base-branch-tip resolution) demoted the
+// row out of ready_to_merge via ReasonBaseSHAUnknown's own fail-closed
+// path with NO way for the caller to tell that apart from a genuine,
+// considered "not eligible" judgement -- Result.SCMFetchFailed stayed
+// false throughout, so the row rendered as a confident normal state when
+// the truth was a failed GitHub call, exactly the "failure rendering as
+// a confident normal state" shape this codebase has repeatedly had to
+// fix elsewhere (Result.SCMFetchFailed's own producer list, producers
+// 1-5, aggregate.go). Uses the SAME fault-injection shape as
+// TestBuild_EligibilityConfigStoreError_DemotesFromReadyToMerge above,
+// applied to the fake SourceControl's own ResolveBranchSHA instead of a
+// broken Postgres store.
+func TestBuild_LiveSCMLookupFails_MarksSCMFetchFailed(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "5009"
+	const repoFullName = "acme/build-live-scm-lookup-fails"
+
+	actor, fakeSCM := buildEligibleReadyToMergeFixture(ctx, t, pool, tokenKey, "e5-actor@example.com", actorGitHubExternalID, repoFullName, 73)
+	fakeSCM.resolveBranchSHAErr = errors.New("boom: github is down")
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict: appreviewverdict.Deps{
+			ReviewVerdicts: narvipg.NewReviewVerdictStore(pool), RepoSettings: narvipg.NewRepoSettingsStore(pool),
+			ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool),
+			Timeouts: platform.DefaultTimeouts(),
+		},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil (a live SCM lookup failure must degrade ONE row, never fail the whole Build call)", err)
+	}
+	item := findItemByPR(result.Items, 73)
+	if item == nil {
+		t.Fatal("PR #73 missing from the inbox entirely, want present as needs_review")
+	}
+	if item.Kind == decisioninboxdomain.KindReadyToMerge {
+		t.Error("Kind = ready_to_merge, want needs_review -- a failed live base-branch-tip resolution must fail CLOSED via ReasonBaseSHAUnknown")
+	}
+	if !result.SCMFetchFailed {
+		t.Error("SCMFetchFailed = false, want true -- E5: a live SCM lookup failure inside computeRealEligibility must mark the whole read degraded, or this row renders as a considered ineligibility judgement rather than the truth (a lookup failed)")
+	}
+}
+
+// TestBuild_IsAncestorLookupFails_MarksSCMFetchFailed is G9's own
+// regression test (fourth adversarial-review round): the IDENTICAL E5
+// degraded signal as TestBuild_LiveSCMLookupFails_MarksSCMFetchFailed
+// immediately above, but for computeRealEligibility's OTHER live SCM
+// lookup -- the fast-forward-ancestry confirmation (deps.SCMCache.
+// IsAncestor), which producer (6)'s own doc comment (Result.
+// SCMFetchFailed) has always named alongside ResolveBranchSHA but which,
+// before this test, had no regression coverage of its own at all. The
+// base branch's live tip is made to genuinely differ from the verdict's
+// own recorded base sha (resolveBranchSHA overridden, mirroring
+// TestBuild_BaseBranchAdvanced_LiveTipMoved_DemotesFromReadyToMerge
+// below) so the ancestor-check branch is actually entered, and the
+// ancestor check itself then fails (isAncestorErr set) rather than
+// confirming or refuting the movement.
+func TestBuild_IsAncestorLookupFails_MarksSCMFetchFailed(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "5010"
+	const repoFullName = "acme/build-is-ancestor-lookup-fails"
+
+	actor, fakeSCM := buildEligibleReadyToMergeFixture(ctx, t, pool, tokenKey, "g9-actor@example.com", actorGitHubExternalID, repoFullName, 74)
+	fakeSCM.resolveBranchSHA = "sha-main-has-actually-advanced"
+	fakeSCM.isAncestorErr = errors.New("boom: github is down")
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict: appreviewverdict.Deps{
+			ReviewVerdicts: narvipg.NewReviewVerdictStore(pool), RepoSettings: narvipg.NewRepoSettingsStore(pool),
+			ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool),
+			Timeouts: platform.DefaultTimeouts(),
+		},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil (a live SCM lookup failure must degrade ONE row, never fail the whole Build call)", err)
+	}
+	item := findItemByPR(result.Items, 74)
+	if item == nil {
+		t.Fatal("PR #74 missing from the inbox entirely, want present as needs_review")
+	}
+	if item.Kind == decisioninboxdomain.KindReadyToMerge {
+		t.Error("Kind = ready_to_merge, want needs_review -- a failed live fast-forward-ancestry confirmation must fail CLOSED via ReasonBaseMoved")
+	}
+	if !result.SCMFetchFailed {
+		t.Error("SCMFetchFailed = false, want true -- G9/E5: a failed IsAncestor call inside computeRealEligibility must mark the whole read degraded, exactly like a failed ResolveBranchSHA call already does, or this row renders as a considered ineligibility judgement rather than the truth (a lookup failed)")
+	}
+	if len(fakeSCM.isAncestorCalls) != 1 {
+		t.Fatalf("IsAncestor called %d times, want 1 -- the ancestor-check branch must actually have been entered for this test to exercise anything", len(fakeSCM.isAncestorCalls))
+	}
+}
+
+// TestBuild_BaseBranchAdvanced_ButAlreadyIneligibleForAnotherReason is
+// G10's own regression test (fourth adversarial-review round): this PR's
+// CI is red (a criterion computeRealEligibility's own probe checks
+// WITHOUT any live SCM call) AND its base SHA has moved in a way whose
+// live ancestor confirmation would fail if it were ever attempted.
+// Before this fix, computeRealEligibility called ResolveBranchSHA/
+// IsAncestor unconditionally, so a live-call failure marked
+// Result.SCMFetchFailed degraded even though CI-red alone already
+// guaranteed this row could never render ready_to_merge -- exactly the
+// "base-SHA lookups that could not have affected the row" producer (6)'s
+// own doc comment now says must not raise this signal. isAncestorErr is
+// set specifically so that if the probe is ever bypassed or removed, the
+// live call would fail and mark SCMFetchFailed=true instead of this
+// test's own expected false, making a regression to the pre-G10
+// behavior visible as a wrong degraded signal, not merely a silent
+// behavior change.
+func TestBuild_BaseBranchAdvanced_ButAlreadyIneligibleForAnotherReason(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "5011"
+	const repoFullName = "acme/build-base-advanced-and-ci-red"
+
+	actor, fakeSCM := buildEligibleReadyToMergeFixture(ctx, t, pool, tokenKey, "g10-actor@example.com", actorGitHubExternalID, repoFullName, 76)
+	fakeSCM.openPRsByExternalID[actorGitHubExternalID][0].CIConclusion = ports.CIConclusionFailure
+	fakeSCM.resolveBranchSHA = "sha-main-has-actually-advanced"
+	fakeSCM.isAncestorErr = errors.New("boom: github is down")
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict: appreviewverdict.Deps{
+			ReviewVerdicts: narvipg.NewReviewVerdictStore(pool), RepoSettings: narvipg.NewRepoSettingsStore(pool),
+			ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool),
+			Timeouts: platform.DefaultTimeouts(),
+		},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil", err)
+	}
+	item := findItemByPR(result.Items, 76)
+	if item == nil {
+		t.Fatal("PR #76 missing from the inbox entirely, want present as needs_review")
+	}
+	if item.Kind == decisioninboxdomain.KindReadyToMerge {
+		t.Error("Kind = ready_to_merge, want needs_review -- CI is red")
+	}
+	if result.SCMFetchFailed {
+		t.Error("SCMFetchFailed = true, want false -- G10: CI-red alone already refuses this PR, independent of the base-SHA question, so the live ResolveBranchSHA/IsAncestor calls could never have changed this row's own fate; their failure must not raise the inbox-wide degraded signal")
+	}
+	if len(fakeSCM.isAncestorCalls) != 0 {
+		t.Errorf("IsAncestor called %d times, want 0 -- G10: a PR already ineligible on an independent, fully-known criterion must never spend a live ancestor-confirmation call that could not have changed the outcome", len(fakeSCM.isAncestorCalls))
+	}
+}
+
+// TestBuild_BaseBranchAdvanced_LiveTipMoved_DemotesFromReadyToMerge is D2's
+// own regression test (second adversarial-review round) at the
+// READ-MODEL level -- computeRealEligibility's (aggregate.go) own sibling
+// of revalidate_integration_test.go's identical
+// "BaseBranchAdvanced_LiveTipMovedWhileGitHubsCachedBaseSHAFieldDidNot_Refused"
+// case for RevalidateForMerge. Before this fix, computeRealEligibility
+// was the LAST remaining ComputeEligible call site still comparing
+// pr.BaseSHA (GitHub's own per-PR CACHED snapshot, frozen here at
+// testEligibleBaseSHA, matching the verdict's own recorded context
+// EXACTLY) against itself -- detecting nothing, no matter how far the
+// base branch's real tip had actually moved, so a PR reviewed while based
+// on another PR's branch (then retargeted) or whose parent moved beneath
+// it could render ready_to_merge in the inbox from a stale verdict. The
+// base ref and GitHub's own cached base.sha field are BOTH left exactly
+// as buildEligibleReadyToMergeFixture seeds them -- only the fake's own
+// live ResolveBranchSHA response (what SCMCache.ResolveBranchSHA now
+// calls through to) reports a different commit, simulating the real
+// branch tip having advanced.
+func TestBuild_BaseBranchAdvanced_LiveTipMoved_DemotesFromReadyToMerge(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "5005"
+	const repoFullName = "acme/build-base-branch-advanced"
+
+	actor, fakeSCM := buildEligibleReadyToMergeFixture(ctx, t, pool, tokenKey, "d2-actor@example.com", actorGitHubExternalID, repoFullName, 62)
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict: appreviewverdict.Deps{
+			ReviewVerdicts: narvipg.NewReviewVerdictStore(pool), RepoSettings: narvipg.NewRepoSettingsStore(pool),
+			ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool),
+			Timeouts: platform.DefaultTimeouts(),
+		},
+	}
+
+	// Positive control, proving the fixture itself is genuinely
+	// ready_to_merge-eligible before this test's own perturbation --
+	// otherwise a broken fixture demoting it for some UNRELATED reason
+	// would pass this test for the wrong one.
+	t0 := time.Now()
+	before, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, t0)
+	if err != nil {
+		t.Fatalf("Build() (control) error = %v, want nil", err)
+	}
+	itemBefore := findItemByPR(before.Items, 62)
+	if itemBefore == nil || itemBefore.Kind != decisioninboxdomain.KindReadyToMerge {
+		t.Fatalf("precondition: PR #62 Kind = %v, want ready_to_merge before the base branch perturbation below", itemBefore)
+	}
+
+	fakeSCM.resolveBranchSHA = "sha-main-has-actually-advanced"
+	// t1 is deliberately past DecisionInboxSCMCacheTTL from t0: deps.
+	// SCMCache is the SAME instance across both Build calls (exactly like
+	// production, where one long-lived cache serves many requests), so a
+	// second call within the TTL would silently serve the FIRST call's
+	// own already-cached ResolveBranchSHA result regardless of what the
+	// fake now reports -- this advances the clock far enough that the
+	// cached entry has genuinely expired, forcing a fresh live read.
+	t1 := t0.Add(platform.DefaultTimeouts().DecisionInboxSCMCacheTTL + time.Minute)
+
+	after, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, t1)
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil", err)
+	}
+	itemAfter := findItemByPR(after.Items, 62)
+	if itemAfter == nil {
+		t.Fatal("PR #62 missing from the inbox entirely, want present as needs_review")
+	}
+	if itemAfter.Kind == decisioninboxdomain.KindReadyToMerge {
+		t.Error("Kind = ready_to_merge, want needs_review -- D2: the base branch's real live tip advanced while GitHub's own cached base.sha field and the base ref both stayed frozen; comparing the cached field against itself detects nothing, so this read model must resolve the LIVE tip exactly like RevalidateForMerge already does")
+	}
+}
+
+// TestBuild_BaseBranchAdvanced_ConfirmedFastForward_StaysReadyToMerge is
+// D3's own regression test (second adversarial-review round) at the
+// READ-MODEL level -- computeRealEligibility's (aggregate.go) own sibling
+// of revalidate_integration_test.go's identical
+// "BaseBranchAdvanced_ConfirmedFastForward_NotRefused" case. The EXACT
+// SAME base-tip movement as TestBuild_BaseBranchAdvanced_LiveTipMoved_
+// DemotesFromReadyToMerge above, but this time the fake's own IsAncestor
+// call CONFIRMS the movement was a pure fast-forward (an ordinary,
+// unrelated merge landing on the base branch) -- the PR must NOT be
+// demoted. Without this, "any unrelated merge to trunk permanently
+// disqualifies a verdict" (D3's own named failure) would make auto-merge
+// effectively never fire in an active repository, since the inbox would
+// never even OFFER the row as ready_to_merge for a human to confirm.
+func TestBuild_BaseBranchAdvanced_ConfirmedFastForward_StaysReadyToMerge(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "5006"
+	const repoFullName = "acme/build-base-branch-advanced-confirmed"
+
+	actor, fakeSCM := buildEligibleReadyToMergeFixture(ctx, t, pool, tokenKey, "d3-actor@example.com", actorGitHubExternalID, repoFullName, 63)
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict: appreviewverdict.Deps{
+			ReviewVerdicts: narvipg.NewReviewVerdictStore(pool), RepoSettings: narvipg.NewRepoSettingsStore(pool),
+			ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool),
+			Timeouts: platform.DefaultTimeouts(),
+		},
+	}
+
+	t0 := time.Now()
+	before, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, t0)
+	if err != nil {
+		t.Fatalf("Build() (control) error = %v, want nil", err)
+	}
+	itemBefore := findItemByPR(before.Items, 63)
+	if itemBefore == nil || itemBefore.Kind != decisioninboxdomain.KindReadyToMerge {
+		t.Fatalf("precondition: PR #63 Kind = %v, want ready_to_merge before the base branch perturbation below", itemBefore)
+	}
+
+	fakeSCM.resolveBranchSHA = "sha-main-has-actually-advanced"
+	fakeSCM.isAncestorResult = true
+	// t1 past DecisionInboxSCMCacheTTL, exactly like the sibling test
+	// above -- deps.SCMCache is the SAME instance across both Build
+	// calls, so both the ResolveBranchSHA AND IsAncestor caches need this
+	// to genuinely re-fetch.
+	t1 := t0.Add(platform.DefaultTimeouts().DecisionInboxSCMCacheTTL + time.Minute)
+
+	after, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, t1)
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil", err)
+	}
+	itemAfter := findItemByPR(after.Items, 63)
+	if itemAfter == nil {
+		t.Fatal("PR #63 missing from the inbox entirely, want present")
+	}
+	if itemAfter.Kind != decisioninboxdomain.KindReadyToMerge {
+		t.Errorf("Kind = %v, want ready_to_merge -- D3: a base movement CONFIRMED as a pure fast-forward (an unrelated merge to trunk) must not demote an otherwise-eligible PR out of ready_to_merge", itemAfter.Kind)
+	}
+	if len(fakeSCM.isAncestorCalls) == 0 {
+		t.Error("IsAncestor was never called -- the ancestry-tolerance check must actually run when the base sha differs under an unchanged ref")
 	}
 }
 

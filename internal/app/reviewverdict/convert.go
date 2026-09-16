@@ -77,6 +77,63 @@ func marshalStrings(ss []string) ([]byte, error) {
 	return json.Marshal(out)
 }
 
+// marshalAncestorChain converts chain into ancestor_chain's own JSONB
+// bytes (§21.1's amendment) -- review.AncestorLink's own json tags
+// already give the wire shape ({"ref":...,"sha":...}), so this is a
+// direct json.Marshal; a nil/empty chain always marshals to "[]", never
+// a JSON null, mirroring marshalTags/marshalStrings' own identical
+// "always a present, empty array" guarantee (this file, above/below):
+// ancestor_chain is NOT NULL DEFAULT '[]'::jsonb (migrations/
+// 000130_review_verdicts_context.up.sql).
+func marshalAncestorChain(chain []review.AncestorLink) ([]byte, error) {
+	out := make([]review.AncestorLink, len(chain))
+	copy(out, chain)
+	return json.Marshal(out)
+}
+
+// unmarshalAncestorChain is marshalAncestorChain's own inverse -- a NULL
+// column or genuinely invalid JSON (should never happen for a column
+// only ever written by marshalAncestorChain above, defended against
+// anyway) both degrade to nil, mirroring unmarshalArchDecisions' own
+// identical fail-conservative posture below: ComputeEligible's own
+// ancestor-chain comparison treats nil and an empty-but-present chain as
+// equivalent (autoapproval.ancestorChainEqual's own doc comment), so
+// this degradation is safe either way.
+func unmarshalAncestorChain(raw []byte) []review.AncestorLink {
+	if len(raw) == 0 {
+		return nil
+	}
+	var chain []review.AncestorLink
+	if err := json.Unmarshal(raw, &chain); err != nil {
+		return nil
+	}
+	if len(chain) == 0 {
+		return nil
+	}
+	return chain
+}
+
+// contextFromRow builds reviewverdict.Context from row's own base_ref/
+// base_sha/ancestor_chain/policy_version columns (§21.1's amendment) --
+// row.BaseRef == nil (a pre-amendment row, or a review turn whose own
+// context-fetch never resolved a base ref) degrades to the zero-value
+// Context{} -- BaseRef == "" -- which internal/domain/autoapproval.
+// ComputeEligible reads as UNKNOWN, never as a match, mirroring every
+// other "absent column -> zero value, never a fabricated fact" precedent
+// in this file.
+func contextFromRow(row sqlcgen.ReviewVerdict) reviewverdict.Context {
+	var c reviewverdict.Context
+	if row.BaseRef != nil {
+		c.BaseRef = *row.BaseRef
+	}
+	if row.BaseSha != nil {
+		c.BaseSHA = *row.BaseSha
+	}
+	c.AncestorChain = unmarshalAncestorChain(row.AncestorChain)
+	c.PolicyVersion = int(row.PolicyVersion)
+	return c
+}
+
 // recordFromRow converts a freshly-inserted-or-read sqlcgen.ReviewVerdict
 // into the pure reviewverdict.Record shape -- the one seam every domain-
 // layer analytics/eligibility caller in this package goes through, never
@@ -102,6 +159,8 @@ func recordFromRow(row sqlcgen.ReviewVerdict) reviewverdict.Record {
 		CounterReview:   counterReviewFromRow(row),
 		FactCheck:       factCheckFromRow(row),
 		FactCheckKilled: factCheckKilledFromRow(row),
+		Context:         contextFromRow(row),
+		AttemptID:       row.AttemptID,
 	}
 }
 

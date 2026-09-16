@@ -185,11 +185,11 @@ func TestCharacterization_RequestLane_ZeroConfig_IdenticalPromptJSON(t *testing.
 	}
 
 	oldTurn := narvipg.Turn{Prompt: &inputPrompt, ModelID: &inputModelID, PlanMode: false}
-	oldRaw, err := sessionactor.BuildPromptPayload(session.ID.String(), sessionRow, referenceSandboxRow, oldTurn)
+	oldRaw, err := sessionactor.BuildPromptPayload(session.ID.String(), sessionRow, referenceSandboxRow, oldTurn, "msg-old")
 	if err != nil {
 		t.Fatalf("BuildPromptPayload (old/reference): %v", err)
 	}
-	newRaw, err := sessionactor.BuildPromptPayload(session.ID.String(), sessionRow, referenceSandboxRow, created)
+	newRaw, err := sessionactor.BuildPromptPayload(session.ID.String(), sessionRow, referenceSandboxRow, created, "msg-new")
 	if err != nil {
 		t.Fatalf("BuildPromptPayload (new/actual): %v", err)
 	}
@@ -244,11 +244,11 @@ func TestCharacterization_ReviewLane_ZeroConfig_IdenticalPromptJSON(t *testing.T
 	}
 
 	oldTurn := narvipg.Turn{Prompt: &inputPrompt, ModelID: nil, PlanMode: false}
-	oldRaw, err := sessionactor.BuildPromptPayload(session.ID.String(), sessionRow, referenceSandboxRow, oldTurn)
+	oldRaw, err := sessionactor.BuildPromptPayload(session.ID.String(), sessionRow, referenceSandboxRow, oldTurn, "msg-old")
 	if err != nil {
 		t.Fatalf("BuildPromptPayload (old/reference): %v", err)
 	}
-	newRaw, err := sessionactor.BuildPromptPayload(session.ID.String(), sessionRow, referenceSandboxRow, created)
+	newRaw, err := sessionactor.BuildPromptPayload(session.ID.String(), sessionRow, referenceSandboxRow, created, "msg-new")
 	if err != nil {
 		t.Fatalf("BuildPromptPayload (new/actual): %v", err)
 	}
@@ -319,11 +319,11 @@ func TestCharacterization_PlanLane_FirstTurn_ZeroConfig_IdenticalPromptJSON(t *t
 	}
 
 	oldTurn := narvipg.Turn{Prompt: &wantPrompt, ModelID: nil, PlanMode: true}
-	oldRaw, err := sessionactor.BuildPromptPayload(session.ID.String(), sessionRow, referenceSandboxRow, oldTurn)
+	oldRaw, err := sessionactor.BuildPromptPayload(session.ID.String(), sessionRow, referenceSandboxRow, oldTurn, "msg-old")
 	if err != nil {
 		t.Fatalf("BuildPromptPayload (old/reference): %v", err)
 	}
-	newRaw, err := sessionactor.BuildPromptPayload(session.ID.String(), sessionRow, referenceSandboxRow, created)
+	newRaw, err := sessionactor.BuildPromptPayload(session.ID.String(), sessionRow, referenceSandboxRow, created, "msg-new")
 	if err != nil {
 		t.Fatalf("BuildPromptPayload (new/actual): %v", err)
 	}

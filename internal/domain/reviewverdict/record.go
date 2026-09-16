@@ -3,6 +3,8 @@ package reviewverdict
 import (
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
 	"github.com/narvidev/narvi/internal/domain/reviewtriage"
@@ -62,4 +64,46 @@ type Record struct {
 	// tracking existed", never "this path never runs fact-check".
 	FactCheck       reviewpost.FactCheckStatus
 	FactCheckKilled int
+	// Context (§21.1's amendment) is the rest of what this verdict
+	// examined, beyond HeadSHA above -- base ref/sha, ordered ancestor
+	// chain, and the eligibility-policy version in effect at fetch time.
+	// Context.BaseRef == "" means this row predates the amendment (no
+	// context was ever recorded) -- see internal/domain/autoapproval.
+	// ComputeEligible's own doc comment for why that reads as UNKNOWN,
+	// never as a match.
+	Context Context
+	// AttemptID (§21.1's amendment) is an identifier distinct from
+	// Context above -- the turn that produced this verdict (turns.id),
+	// forwarded verbatim from the SAME turns.GetByDispatchedMessageID
+	// call HeadSHA itself already depends on (httpapi.PostReviewVerdict --
+	// finding F3's own replacement for the session-wide
+	// GetProcessingTurnForSession lookup this comment previously named).
+	// "Two
+	// attempts over identical code share a context; exactly one may
+	// publish the current result, which a context alone cannot express."
+	// The zero value (an invalid pgtype.UUID) is what a pre-existing row,
+	// or any caller that predates this Step, reads back as -- this Step
+	// does not itself build the "which attempt publishes" mechanism
+	// (§39.3's own atomic-claim idiom is the first real consumer); it
+	// only makes the fact recordable.
+	AttemptID pgtype.UUID
+}
+
+// Context is the review-context snapshot (§21.1's amendment) a review
+// verdict was actually produced against, beyond HeadSHA -- BaseRef/BaseSHA
+// (this PR's own immediate base at context-fetch time, review.
+// PreFetchedContext's own identical fields), AncestorChain (review.
+// AncestorChainFromStack's own ordered result, forwarded verbatim -- never
+// recomputed here), and PolicyVersion (autoapproval.CurrentPolicyVersion
+// at fetch time). Marshaled verbatim onto turns.review_verdict_context
+// (turn-scoped, exactly like HeadSHA/turns.review_head_sha -- see that
+// column's own migration doc comment for the "why" this is scoped to the
+// turn and never a per-(repo,PR) column) and forwarded, at verdict-post
+// time, onto review_verdicts' own base_ref/base_sha/ancestor_chain/
+// policy_version columns.
+type Context struct {
+	BaseRef       string                `json:"baseRef"`
+	BaseSHA       string                `json:"baseSha"`
+	AncestorChain []review.AncestorLink `json:"ancestorChain,omitempty"`
+	PolicyVersion int                   `json:"policyVersion"`
 }

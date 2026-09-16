@@ -12,7 +12,11 @@
 package decisioninbox_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
 	"strconv"
 	"strings"
 	"testing"
@@ -25,9 +29,11 @@ import (
 	"github.com/narvidev/narvi/internal/app/decisioninbox"
 	"github.com/narvidev/narvi/internal/app/ports"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
+	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
+	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -54,6 +60,22 @@ func newRevalidateStores(pool *pgxpool.Pool) *revalidateStores {
 			SentinelFixes:  narvipg.NewSentinelFixStore(pool),
 			Artifacts:      narvipg.NewArtifactStore(pool),
 			Identities:     narvipg.NewIdentityStore(pool),
+			// Timeouts (E4/E7, third adversarial-review round): this rig's
+			// own top-level decisioninbox.Deps.Timeouts was never set at
+			// all before this fix -- revalidateCore had no reason to read
+			// it until E4 wired DecisionInboxIsAncestorTimeout into its own
+			// IsAncestor call, at which point this rig's own zero-valued
+			// Timeouts silently supplied a 0s timeout to every subtest in
+			// this file, making the fast-forward-tolerance subtest below
+			// (BaseBranchAdvanced_ConfirmedFastForward_NotRefused) fail --
+			// exactly the "zero/missing timeout observable" property E7
+			// added the fake's own ctx-honoring for, just caught in this
+			// fixture rather than in production. Mirrors ReviewVerdict.
+			// Timeouts immediately below (already set, for a different
+			// reason) and aggregate_integration_test.go's own rig, which
+			// already sets this top-level field for its own pre-existing
+			// deps.Timeouts.DecisionInboxStaleAfter consumer.
+			Timeouts: platform.DefaultTimeouts(),
 			// (§21.1/§21.2): the REAL auto-approval eligibility
 			// engine's own store dependencies -- revalidateCore now reads
 			// review_verdicts/repo_settings through this bundle.
@@ -88,6 +110,7 @@ func (rs *revalidateStores) eligiblePR(ctx context.Context, t *testing.T, pool *
 	pr := ports.OpenPR{
 		Owner: owner, Repo: repo, Number: prNumber,
 		Title: "eligible pr", HTMLURL: htmlURL, HeadSHA: "sha-" + strconv.Itoa(prNumber),
+		BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
 		Assignees:    []ports.PRPerson{{ExternalID: actorGitHubID, Login: "actor"}},
 		CIConclusion: ports.CIConclusionSuccess,
 		Labels:       []string{"review:low-risk"},
@@ -479,6 +502,359 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		}
 	})
 
+	// (§21.1's amendment): the decisive case head-SHA equality alone
+	// cannot catch -- the PR's own head has NOT moved (unlike
+	// StaleVerdictHeadSHA_Refused immediately above), but its BASE has:
+	// "a PR evaluated while based on another PR's branch, then
+	// retargeted -- or whose parent moved beneath it -- keeps an
+	// unchanged head, so the equality holds and the stale verdict reads
+	// as fresh." This test would pass with no code change at all if it
+	// only checked HeadSHA equality (it still equals headSHA) -- it is
+	// the live BaseRef perturbation below, and ComputeEligible's own new
+	// context comparison, that must be what actually refuses it.
+	t.Run("RetargetedBase_Refused", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-retargeted-base"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 32)
+		// The PR's own head is UNCHANGED -- only its base moved (a
+		// GitHub retarget onto a different branch, or its stacked
+		// parent's own branch moving beneath it). review_verdicts'
+		// own recorded base (seeded by eligiblePR against
+		// testEligibleBaseRef) no longer matches.
+		pr.BaseRef = "release/2026.09"
+		rs.replaceTargetPR(actorGitHubID, pr)
+
+		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+		}
+		if ok {
+			t.Fatal("RevalidateForMerge() ok = true, want false -- THE HAZARD THIS AMENDMENT CLOSES: the head sha is unchanged, but the base has moved, and the stale verdict must not read as fresh")
+		}
+		if reason == "" {
+			t.Error("reason is empty, want a human-readable explanation")
+		}
+	})
+
+	// (finding F1): THE DECISIVE CASE this finding is named
+	// for -- base ref unchanged, PR head unchanged, and even GitHub's own
+	// `pull_request.base.sha` field (ports.OpenPR.BaseSHA, what this
+	// fixture's own BaseSHA models) unchanged -- yet the base BRANCH's
+	// REAL, live tip has advanced. Verified against real GitHub PRs
+	// (golang/go PR #27813, ten open kubernetes/kubernetes PRs): that
+	// field is a per-PR cached snapshot GitHub refreshes on its own
+	// schedule, not on every push to the base branch, so it can -- and in
+	// practice does -- stay frozen for months while the branch moves on.
+	// Comparing it against itself detects NOTHING.
+	//
+	// This test fails against the PRE-FIX code: revalidateCore used to
+	// read target.BaseSHA (this fixture's own frozen BaseSHA field)
+	// directly as CurrentBaseSHA, which trivially equals the verdict's
+	// own recorded BaseSHA (both testEligibleBaseSHA) -- eligible=true,
+	// the bug. The fix instead resolves CurrentBaseSHA via a fresh
+	// sourceControl.ResolveBranchSHA call, modeled here by the fake's own
+	// resolveBranchSHA override reporting a DIFFERENT commit -- proving
+	// the base branch's own live tip, not GitHub's cached field, is what
+	// this gate actually compares now.
+	t.Run("BaseBranchAdvanced_LiveTipMovedWhileGitHubsCachedBaseSHAFieldDidNot_Refused", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-base-branch-advanced"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 33)
+		// pr.BaseRef/pr.BaseSHA (GitHub's own possibly-stale
+		// pull_request.base.sha snapshot) are BOTH left exactly as
+		// eligiblePR seeded them (testEligibleBaseRef/testEligibleBaseSHA,
+		// the SAME values review_verdicts' own recorded context carries)
+		// -- neither the ref nor GitHub's cached field moved at all.
+		rs.sourceControl.resolveBranchSHA = "sha-main-has-actually-advanced"
+		defer func() { rs.sourceControl.resolveBranchSHA = "" }()
+
+		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+		}
+		if ok {
+			t.Fatal("RevalidateForMerge() ok = true, want false -- THE DECISIVE F1 HAZARD: base ref, head sha, AND GitHub's own cached base.sha field are all unchanged, but the base branch's REAL live tip advanced -- the stale verdict must not read as fresh")
+		}
+		if reason == "" {
+			t.Error("reason is empty, want a human-readable explanation")
+		}
+	})
+
+	// D3 (second adversarial-review round): "any unrelated merge to trunk
+	// permanently disqualifies a verdict" -- the EXACT SAME base-tip
+	// movement as BaseBranchAdvanced_LiveTipMovedWhileGitHubsCachedBaseSHAFieldDidNot_Refused
+	// immediately above, but this time the fake's own IsAncestor call
+	// CONFIRMS the movement was a pure fast-forward (an ordinary,
+	// unrelated merge landing on the base branch, never a rewrite) --
+	// RevalidateForMerge must NOT refuse it. This is what makes auto-merge
+	// able to regain eligibility through an ordinary sequence of events
+	// rather than being stuck the moment any base movement is observed at
+	// all.
+	t.Run("BaseBranchAdvanced_ConfirmedFastForward_NotRefused", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-base-branch-advanced-confirmed"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 34)
+		rs.sourceControl.resolveBranchSHA = "sha-main-has-actually-advanced"
+		rs.sourceControl.isAncestorResult = true
+		// The PRECEDING subtest (BaseBranchAdvanced_LiveTipMovedWhile...)
+		// ALSO triggers an IsAncestor call against the SAME shared fake --
+		// reset here, at the START, rather than relying solely on that
+		// subtest's own defer/ordering to have cleared it first.
+		rs.sourceControl.isAncestorCalls = nil
+		defer func() {
+			rs.sourceControl.resolveBranchSHA = ""
+			rs.sourceControl.isAncestorResult = false
+			rs.sourceControl.isAncestorCalls = nil
+		}()
+
+		ok, headSHA, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+		}
+		if !ok {
+			t.Fatalf("RevalidateForMerge() ok = false, reason = %q, want true -- D3: a base movement CONFIRMED as a pure fast-forward must not refuse an otherwise-eligible PR", reason)
+		}
+		if headSHA != pr.HeadSHA {
+			t.Errorf("headSHA = %q, want %q", headSHA, pr.HeadSHA)
+		}
+		if len(rs.sourceControl.isAncestorCalls) != 1 {
+			t.Fatalf("IsAncestor called %d times, want 1", len(rs.sourceControl.isAncestorCalls))
+		}
+		gotCall := rs.sourceControl.isAncestorCalls[0]
+		if gotCall.Ancestor != testEligibleBaseSHA || gotCall.Descendant != "sha-main-has-actually-advanced" {
+			t.Errorf("IsAncestor(Ancestor, Descendant) = (%q, %q), want (%q, %q) -- the verdict's OWN recorded base sha as the candidate ancestor, the LIVE resolved tip as the descendant",
+				gotCall.Ancestor, gotCall.Descendant, testEligibleBaseSHA, "sha-main-has-actually-advanced")
+		}
+	})
+
+	// TestRevalidateForMerge_NegativeCases/BaseBranchAdvanced_ButAlreadyIneligibleForAnotherReason
+	// is G3's own regression test (fourth adversarial-review round): this
+	// PR carries review:needs-human (a PERMANENT refusal, until a
+	// maintainer removes it) AND a base-SHA movement whose own live
+	// ancestor confirmation would fail if it were ever attempted. Before
+	// this fix, the ancestor-check branch ran unconditionally and its own
+	// failure preempted ComputeEligible entirely, so this PR would have
+	// been told the TRANSIENT "try again shortly" -- exactly wrong for a
+	// PR that is not going to become eligible no matter how many times the
+	// caller retries. isAncestorErr is set specifically so that if the
+	// probe (this fix) is ever bypassed or removed, the live call would
+	// fail and produce the OLD, wrong "try again shortly" message instead
+	// of this test's own expected reason -- making a regression to the
+	// pre-G3 behavior visible as a WRONG reason string, not merely a
+	// silent behavior change.
+	t.Run("BaseBranchAdvanced_ButAlreadyIneligibleForAnotherReason", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-base-advanced-and-needs-human"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 37)
+		pr.Labels = []string{"review:low-risk", "review:needs-human"}
+		rs.replaceTargetPR(actorGitHubID, pr)
+		rs.sourceControl.resolveBranchSHA = "sha-main-has-actually-advanced"
+		rs.sourceControl.isAncestorErr = errors.New("boom: github is down")
+		rs.sourceControl.isAncestorCalls = nil
+		defer func() {
+			rs.sourceControl.resolveBranchSHA = ""
+			rs.sourceControl.isAncestorErr = nil
+			rs.sourceControl.isAncestorCalls = nil
+		}()
+
+		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+		}
+		if ok {
+			t.Fatal("RevalidateForMerge() ok = true, want false (review:needs-human label applied)")
+		}
+		const wantReason = "this pull request no longer meets the auto-approval eligibility criteria: review:needs-human label is present"
+		if reason != wantReason {
+			t.Errorf("reason = %q, want %q -- G3: the permanent, already-known needs-human refusal must win over the base movement's own unconfirmed, transient state", reason, wantReason)
+		}
+		if len(rs.sourceControl.isAncestorCalls) != 0 {
+			t.Errorf("IsAncestor called %d times, want 0 -- G3/G4: a PR already ineligible on an independent, fully-known criterion must never spend a live ancestor-confirmation call that could not have changed the outcome", len(rs.sourceControl.isAncestorCalls))
+		}
+	})
+
+	// E6 (third adversarial-review round): the SAME precondition as
+	// BaseBranchAdvanced_ConfirmedFastForward_NotRefused immediately
+	// above -- base ref unchanged, base sha genuinely differs on both
+	// sides -- but this time the fake's own IsAncestor call itself FAILS,
+	// rather than confirming or refuting the movement. Before this fix,
+	// revalidateCore (the merge-gate path) swallowed that error with no
+	// log at all -- unlike its read-model sibling in aggregate.go, which
+	// already logs -- and fell through to autoapproval.ComputeEligible's
+	// generic ReasonBaseMoved ("the pull request's base has changed since
+	// this verdict was produced"): true, but not the whole truth. The
+	// base SHA genuinely did change (that part IS confirmed, or this
+	// branch is never reached at all), but whether that change was a
+	// safe fast-forward or a genuine rewrite is exactly what the failed
+	// IsAncestor call could not determine -- "the base changed" and "we
+	// could not check whether tolerating that change was safe" are
+	// different facts, and conflating them tells an operator retrying is
+	// pointless when it may well not be.
+	t.Run("BaseBranchAdvanced_AncestorCheckFails_LogsAndReturnsHonestReason", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-ancestor-check-fails"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 35)
+		rs.sourceControl.resolveBranchSHA = "sha-main-has-actually-advanced"
+		rs.sourceControl.isAncestorErr = errors.New("boom: github is down")
+		// Mirrors the preceding subtest's own "reset at the START" note --
+		// the SAME shared fake carries isAncestorCalls across subtests.
+		rs.sourceControl.isAncestorCalls = nil
+		defer func() {
+			rs.sourceControl.resolveBranchSHA = ""
+			rs.sourceControl.isAncestorErr = nil
+			rs.sourceControl.isAncestorCalls = nil
+		}()
+
+		buf := captureDefaultLoggerJSON(t)
+
+		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil -- an unconfirmable ancestry check is a domain refusal, never a Go error", err)
+		}
+		if ok {
+			t.Fatal("RevalidateForMerge() ok = true, want false -- a base movement that could not be confirmed safe must still refuse the merge")
+		}
+		const wantReason = "this pull request's base has changed since this verdict was produced, and whether that change was safe to tolerate could not be confirmed (a live check failed) -- try again shortly"
+		if reason != wantReason {
+			t.Errorf("reason = %q, want %q -- E6: a FAILED ancestry check must read differently from autoapproval.ReasonBaseMoved's own generic \"the base has changed\" text, which this code path must never fall through to", reason, wantReason)
+		}
+		if !hasLogEntry(t, buf, "decisioninbox: resolve base-advanced-without-rewrite ancestry failed, refusing merge -- could not confirm whether the base's forward movement was safe to tolerate") {
+			t.Errorf("did not find the dedicated ancestor-check-failure log line -- E6: this call previously swallowed the error with no log at all; full log:\n%s", buf.String())
+		}
+	})
+
+	// TestRevalidateForMerge_ZeroIsAncestorTimeout_TreatedAsAlreadyExpired
+	// is G5's own regression test (fourth adversarial-review round) --
+	// the actual proof that E4's fix (bounding revalidateCore's own
+	// IsAncestor call with platform.Timeouts.DecisionInboxIsAncestorTimeout,
+	// third round) is wired into the real call site, which nothing in
+	// this file previously asserted: the subtest immediately above drives
+	// isAncestorErr directly, which proves the FAILURE PATH is handled,
+	// never that a timeout genuinely bounds the call. fakeDecisionInboxSourceControl.
+	// IsAncestor's own ctx.Err()-checked-first mechanism (E7, third round)
+	// exists to make exactly this provable, but its own doc comment
+	// overclaimed that this already held (G5) -- no test anywhere set
+	// DecisionInboxIsAncestorTimeout to a non-positive value. A ZERO
+	// timeout makes context.WithTimeout construct an ALREADY-EXPIRED
+	// context deterministically (context's own documented behavior for a
+	// non-positive duration -- no sleep/wall-clock dependency needed);
+	// isAncestorResult is deliberately set to TRUE (a value that would
+	// otherwise confirm the base movement and let this PR through) so
+	// that only the ctx.Err() check standing between it and a false
+	// "eligible" answer is what this test actually exercises: strip the
+	// context.WithTimeout wrap off the real call site (reverting it to
+	// the bare ctx this test hands RevalidateForMerge) and the fake sees
+	// a live, un-expired context, skips the ctx.Err() branch entirely,
+	// and returns isAncestorResult=true -- eligible, not refused -- which
+	// is exactly the mutation this test exists to catch.
+	t.Run("ZeroIsAncestorTimeout_TreatedAsAlreadyExpired_RefusesRatherThanSucceeding", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-zero-ancestor-timeout"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 36)
+		rs.sourceControl.resolveBranchSHA = "sha-main-has-actually-advanced"
+		rs.sourceControl.isAncestorResult = true
+		rs.sourceControl.isAncestorCalls = nil
+		savedTimeout := rs.deps.Timeouts.DecisionInboxIsAncestorTimeout
+		rs.deps.Timeouts.DecisionInboxIsAncestorTimeout = 0
+		defer func() {
+			rs.sourceControl.resolveBranchSHA = ""
+			rs.sourceControl.isAncestorResult = false
+			rs.sourceControl.isAncestorCalls = nil
+			rs.deps.Timeouts.DecisionInboxIsAncestorTimeout = savedTimeout
+		}()
+
+		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil -- an unconfirmable ancestry check is a domain refusal, never a Go error", err)
+		}
+		if ok {
+			t.Fatal("RevalidateForMerge() ok = true, want false -- a zero timeout must make this call fail closed, never silently succeed as though the context.WithTimeout wrap were never applied")
+		}
+		const wantReason = "this pull request's base has changed since this verdict was produced, and whether that change was safe to tolerate could not be confirmed (a live check failed) -- try again shortly"
+		if reason != wantReason {
+			t.Errorf("reason = %q, want %q", reason, wantReason)
+		}
+		if len(rs.sourceControl.isAncestorCalls) != 1 {
+			t.Fatalf("IsAncestor called %d times, want 1 -- the ancestor-check branch must actually have been entered for this test to exercise anything", len(rs.sourceControl.isAncestorCalls))
+		}
+	})
+
+	// TestRevalidateForMerge_NegativeCases/ZeroResolveBranchSHATimeout is
+	// G4's own regression test (fourth adversarial-review round),
+	// mirroring ZeroIsAncestorTimeout immediately above one live call
+	// earlier: proves platform.Timeouts.DecisionInboxResolveBranchSHATimeout
+	// genuinely bounds revalidateCore's own ResolveBranchSHA call, which
+	// previously ran on the bare, unbounded ctx this function was handed.
+	// A ZERO timeout makes context.WithTimeout construct an
+	// ALREADY-EXPIRED context deterministically; fakeDecisionInboxSourceControl.
+	// ResolveBranchSHA's own ctx.Err()-checked-first mechanism (this fix)
+	// then fails the call before ever falling back to its seeded PR scan,
+	// which would otherwise happily return testEligibleBaseSHA (a MATCH,
+	// letting this fully-eligible PR through) -- so only the
+	// context.WithTimeout wrap genuinely being applied stands between
+	// this test's expected refusal and a false "eligible". The expected
+	// reason/log below were updated for H2 (fifth adversarial-review
+	// round): this resolution failure now returns EARLY with its own
+	// honest, logged reason (mirroring the ancestor-check failure's own
+	// E6/G3 precedent) rather than falling through to ComputeEligible's
+	// generic ReasonBaseSHAUnknown, which this test previously (and
+	// wrongly) pinned as the expected outcome.
+	t.Run("ZeroResolveBranchSHATimeout_TreatedAsAlreadyExpired_RefusesRatherThanSucceeding", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-zero-resolve-branch-sha-timeout"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 38)
+		savedTimeout := rs.deps.Timeouts.DecisionInboxResolveBranchSHATimeout
+		rs.deps.Timeouts.DecisionInboxResolveBranchSHATimeout = 0
+		defer func() {
+			rs.deps.Timeouts.DecisionInboxResolveBranchSHATimeout = savedTimeout
+		}()
+
+		buf := captureDefaultLoggerJSON(t)
+
+		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+		}
+		if ok {
+			t.Fatal("RevalidateForMerge() ok = true, want false -- a zero timeout must make this call fail closed, never silently succeed as though the context.WithTimeout wrap were never applied")
+		}
+		const wantReason = "this pull request's base commit could not be confirmed (a live check failed) -- try again shortly"
+		if reason != wantReason {
+			t.Errorf("reason = %q, want %q -- H2: a FAILED base-SHA resolution must read differently from autoapproval.ReasonBaseSHAUnknown's own generic \"could not be established\" text, which this code path must never fall through to", reason, wantReason)
+		}
+		if !hasLogEntry(t, buf, "decisioninbox: resolve base branch's live tip failed, refusing merge -- could not confirm the pull request's current base commit") {
+			t.Errorf("did not find the dedicated resolve-branch-sha-failure log line -- H2: this call previously swallowed the error with no log at all; full log:\n%s", buf.String())
+		}
+	})
+
+	// TestRevalidateForMerge_NegativeCases/ResolveBranchSHAFails_LogsAndReturnsHonestReason
+	// is H2's own direct-error regression test (fifth adversarial-review
+	// round), mirroring BaseBranchAdvanced_AncestorCheckFails_LogsAndReturnsHonestReason
+	// above one live call earlier: drives fakeDecisionInboxSourceControl's
+	// own resolveBranchSHAErr directly (rather than via a zero timeout,
+	// the preceding subtest's own mechanism) so this failure path is
+	// pinned independently of that one, exactly as the ancestor-check
+	// failure and its own zero-timeout sibling are pinned independently
+	// of each other above.
+	t.Run("ResolveBranchSHAFails_LogsAndReturnsHonestReason", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-resolve-branch-sha-fails"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 39)
+		rs.sourceControl.resolveBranchSHAErr = errors.New("boom: github is down")
+		defer func() {
+			rs.sourceControl.resolveBranchSHAErr = nil
+		}()
+
+		buf := captureDefaultLoggerJSON(t)
+
+		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil -- an unconfirmable base-sha resolution is a domain refusal, never a Go error", err)
+		}
+		if ok {
+			t.Fatal("RevalidateForMerge() ok = true, want false -- a base-sha resolution that could not be confirmed must still refuse the merge")
+		}
+		const wantReason = "this pull request's base commit could not be confirmed (a live check failed) -- try again shortly"
+		if reason != wantReason {
+			t.Errorf("reason = %q, want %q", reason, wantReason)
+		}
+		if !hasLogEntry(t, buf, "decisioninbox: resolve base branch's live tip failed, refusing merge -- could not confirm the pull request's current base commit") {
+			t.Errorf("did not find the dedicated resolve-branch-sha-failure log line -- H2: this call previously swallowed the error with no log at all; full log:\n%s", buf.String())
+		}
+	})
+
 	// RevalidateForMerge's own
 	// truncated->500 branch was never executed by any existing test --
 	// when the target PR is not found in a TRUNCATED (partial/degraded)
@@ -559,6 +935,39 @@ func TestRevalidateForMerge_EligibilityConfigStoreError_FailsClosed(t *testing.T
 	}
 }
 
+// captureDefaultLoggerJSON/hasLogEntry mirror internal/adapters/inbound/
+// httpapi's own identical precedent (planapprove_integration_test.go's
+// captureDefaultLoggerJSON/findLogEntry) -- platform.Logger(ctx), what
+// revalidateCore actually calls, is itself built on top of
+// slog.Default(), so redirecting THAT is how a test observes what got
+// logged. Copied locally rather than shared cross-package (both are
+// small, unexported test helpers with no natural shared home).
+func captureDefaultLoggerJSON(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+	return &buf
+}
+
+func hasLogEntry(t *testing.T, buf *bytes.Buffer, wantMsg string) bool {
+	t.Helper()
+	for _, line := range bytes.Split(buf.Bytes(), []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal(line, &entry); err != nil {
+			t.Fatalf("unmarshal log line %q: %v", line, err)
+		}
+		if entry["msg"] == wantMsg {
+			return true
+		}
+	}
+	return false
+}
+
 // TestRevalidateForMerge_LyingVerdictAgainstReal300FileSensitivePR is the
 // C1 regression test at the FULL
 // system level -- the exact attack the reviewers verified reproducible
@@ -613,7 +1022,13 @@ func TestRevalidateForMerge_LyingVerdictAgainstReal300FileSensitivePR(t *testing
 	if lyingVerdict.Shippable != review.ShippableAuto {
 		t.Fatalf("test setup: lyingVerdict.Shippable = %v, want auto", lyingVerdict.Shippable)
 	}
-	if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, lyingVerdict, reviewpost.Digest{Summary: "Test-seeded lying verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false); err != nil {
+	// verdictContext (§21.1's amendment) matches the live PR's own
+	// BaseRef/BaseSHA below exactly -- this test's whole point is
+	// proving the diff-size/sensitive-path criteria refuse regardless of
+	// the model's own lie, which requires the NEWER context-freshness
+	// check to pass first so THOSE two criteria are what actually fire.
+	verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
+	if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, lyingVerdict, reviewpost.Digest{Summary: "Test-seeded lying verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
 		t.Fatalf("seed lying review_verdicts row: %v", err)
 	}
 
@@ -631,6 +1046,7 @@ func TestRevalidateForMerge_LyingVerdictAgainstReal300FileSensitivePR(t *testing
 	pr := ports.OpenPR{
 		Owner: "acme", Repo: "revalidate-c1-attack", Number: prNumber,
 		Title: "innocuous-looking title", HTMLURL: htmlURL, HeadSHA: headSHA,
+		BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
 		Assignees:    []ports.PRPerson{{ExternalID: actorGitHubID, Login: "actor"}},
 		CIConclusion: ports.CIConclusionSuccess,
 		Labels:       []string{"review:low-risk"},

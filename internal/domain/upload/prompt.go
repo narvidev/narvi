@@ -74,6 +74,13 @@ const (
 	reviewVerdictToolURLPlaceholderLiteral    = "{{REVIEW_VERDICT_TOOL_URL}}"
 	reviewVerdictToolBearerPlaceholderLiteral = "{{REVIEW_VERDICT_TOOL_BEARER}}"
 	reviewVerdictToolGenPlaceholderLiteral    = "{{REVIEW_VERDICT_TOOL_GEN}}"
+	// reviewVerdictToolDispatchMessageIDPlaceholderLiteral (finding F3,
+	// §21.1's amendment) mirrors reviewVerdictToolGenPlaceholderLiteral's
+	// own identical byte-for-byte-copy treatment, one placeholder further:
+	// internal/domain/review's own VerdictToolDispatchMessageIDPlaceholder
+	// (review/context.go), duplicated as a raw literal here for the SAME
+	// layering reason the three above already are.
+	reviewVerdictToolDispatchMessageIDPlaceholderLiteral = "{{REVIEW_VERDICT_TOOL_DISPATCH_MESSAGE_ID}}"
 
 	epistemicOutcomeToolURLPlaceholderLiteral    = "{{EPISTEMIC_OUTCOME_TOOL_URL}}"
 	epistemicOutcomeToolBearerPlaceholderLiteral = "{{EPISTEMIC_OUTCOME_TOOL_BEARER}}"
@@ -93,11 +100,12 @@ const (
 // strings.ReplaceAll calls, cmd/sandbox-agent/reviewverdicttoolprompt.go/
 // epistemicoutcometoolprompt.go/reviewcostbudgetprompt.go): this package's
 // own three (BaseURLPlaceholder/BearerPlaceholder/GenPlaceholder), review's
-// own four (VerdictToolURLPlaceholder/BearerPlaceholder/GenPlaceholder,
-// plus ReviewCostBudgetToolURLPlaceholder), review's own three more for
+// own five (VerdictToolURLPlaceholder/BearerPlaceholder/GenPlaceholder/
+// DispatchMessageIDPlaceholder (finding F3, §21.1's amendment), plus
+// ReviewCostBudgetToolURLPlaceholder), review's own three more for
 // the release composition-findings tool (§15.3), plus turn's own three
 // (all immediately above). sanitizeUntrustedField (below) destroys every
-// exact occurrence of all thirteen before any untrusted value is interpolated into
+// exact occurrence of all fourteen before any untrusted value is interpolated into
 // rendered output, so a poisoned Filename/ContentType can never survive to
 // that later substitution step -- see that function's own doc comment for
 // the full attack this closes.
@@ -108,6 +116,7 @@ var placeholderTokens = []string{
 	reviewVerdictToolURLPlaceholderLiteral,
 	reviewVerdictToolBearerPlaceholderLiteral,
 	reviewVerdictToolGenPlaceholderLiteral,
+	reviewVerdictToolDispatchMessageIDPlaceholderLiteral,
 	epistemicOutcomeToolURLPlaceholderLiteral,
 	epistemicOutcomeToolBearerPlaceholderLiteral,
 	epistemicOutcomeToolGenPlaceholderLiteral,
