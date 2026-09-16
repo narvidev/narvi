@@ -1026,6 +1026,78 @@ Analytics rollups (timeseries, top-risk-driver breakdown, the "Review finding ou
 
 Three constraints are load-bearing on the comparison this wires (`reviewverdict.FilesChangedDrifted`) — the third added by adversarial-review hardening after this Step first shipped — and none is self-evident. It stays **diagnostic only** — never rewriting the verdict, never moving a risk level, never failing a request — because the self-reported number is what a human reads, and silently correcting it would destroy the very evidence the signal exists to surface; the function itself returns a plain boolean, with no verdict or `Shippable` parameter anywhere in its signature, so its one real caller has nothing to feed a fired result back into even by mistake — it only ever logs. And it tolerates `ChangedFilesCount == 0`, which §26.3 documents as **indistinguishable from a genuinely empty diff** whenever `GetPullRequest` fails: a non-positive server-computed count returns `false` unconditionally, before either threshold below is even evaluated, so a canary that read zero as truth would fire on every transient GitHub fault — and a canary that cries wolf is one its readers learn to ignore, strictly worse than not having built it. The canary additionally requires BOTH a ratio (`FilesChangedDriftRatioThreshold`, 50%) and an absolute-count (`FilesChangedDriftAbsoluteThreshold`, 5 files) divergence at once — named, documented constants, never a literal buried at the comparison site — because neither threshold alone is trustworthy: a ratio alone is noisy on a small PR (a one-file difference already reads as 100% off), and an absolute count alone is noisy on a large one (a handful of files out of several hundred is ordinary counting slop, not a signal worth a human's attention). And it tolerates the diff itself never having been fully delivered to the reviewing agent — the exact symmetric case of the `serverComputed <= 0` guard above: `GetPullRequest` (which resolves `ChangedFilesCount`) and `GetCompareDiff` (which resolves the diff the agent is actually shown) are independent calls, so the first can succeed while the second fails or truncates, and an agent handed no diff, or only a partial one with an explicit truncation notice, can only ever report what it saw. `reviewtriage.DecisionRecord` carries `DiffEmpty`/`DiffTruncated` alongside `ChangedFilesCount` for exactly this reason, and the canary is suppressed, never fired, whenever either is true (or unknown) — a divergence caused by the server's own delivery failure must never read as evidence the reviewer skipped something.
 
+### 21.1b One verdict identity, and everyone who reads it (amendment)
+§21.1 above says what a verdict records. It does not say who reads it, what happens when two
+writers race, or what a result means on GitHub — three gaps the parity analysis under
+`docs/analyses/` left open, and each of them is a place where two components can disagree about the
+same pull request.
+
+**Every consumer reads the same context and the same current attempt, or it is a second authority.**
+The decision inbox, the eligibility engine, the auto-merge worker, a train's gate (§39.3) and the
+GitHub result publisher all decide about one pull request, and they must decide from one record:
+the verdict's persisted `Context` — base ref, base SHA, ordered ancestor chain, policy version — and
+the attempt that produced it. **No consumer re-derives a context of its own.** A consumer that
+recomputes is not sharing a source of truth with the others, it is a second one, and the two drift
+without anything reporting it — the failure §5.1 exists to prevent for session state, asked here of
+review state. Where a consumer needs live facts the verdict cannot carry (the PR's current head, its
+current CI conclusion), it reads them live and compares them against the recorded context; it never
+folds them back into the record.
+
+**Publication is concurrent, and the losing writer must know it lost.** Two attempts can be in
+flight for one pull request, and a base can move under an unchanged head, so the record a publisher
+is about to emit may already be superseded by the time it emits. Two rules, both cheap now and
+expensive to retrofit:
+
+- **An emission carries the attempt and context it was produced for, and is refused if either has
+  been superseded.** Head equality is not sufficient to identify a result — §21.1's own amendment
+  above is the same observation about freshness — so an older emission with a matching head must
+  still lose to a newer attempt or a newer base. A publisher that writes on head alone will
+  overwrite a current result with a stale one, and the overwrite is invisible.
+- **A creation race produces one identity, never two active ones.** Two concurrent attempts to open
+  the same external result must resolve to a single one, by the atomic-claim idiom §5.1 already
+  establishes. Two active identities for one pull request is worse than none: each is individually
+  plausible, and which one a reader sees depends on timing.
+
+**`not_assessed` is a state, and GitHub's own vocabulary does not have one for it.** Step 174
+already forbids an unassessed verdict from satisfying Narvi's own auto-merge. That does not settle
+what a published check should say, and the question cannot be avoided by choosing a value that
+happens to be quiet: **GitHub counts a `neutral` conclusion as satisfying a required check**, so
+publishing `not_assessed` as `neutral` makes an unevaluated pull request mergeable by rule. That is
+a failure rendering as a confident normal state, which this design has now corrected in three other
+places, and it must not be inherited along with the mechanism.
+
+Three things follow, and each is a decision to record rather than a default to discover:
+
+- What a check reports for a review that did not complete, given that the honest answer — "this was
+  not assessed" — has no conclusion value meaning it. Whatever is chosen, an unassessed review must
+  not read to GitHub as a satisfied requirement.
+- Whether a repository may make the check required at all, and what happens to an in-flight review
+  when it does.
+- What happens when enforcement is off. A check that nothing requires is still a statement to every
+  human reading the pull request, and it must be as true when it gates nothing as when it gates a
+  merge.
+
+**Acceptance is an authorisation, not an override.** A human may accept a verdict the engine
+refuses. That path needs the same four answers every other privileged action in §13 needs — who may
+do it, through which surface and API, under which role, and how it is audited — and two more that
+are specific to it:
+
+- **Acceptance binds to one verdict, one attempt and one context.** A new attempt, a moved base or a
+  changed ancestor chain makes it inapplicable, exactly as it makes the verdict stale; an acceptance
+  that survives the thing it accepted is an approval of code nobody looked at.
+- **Acceptance does not rewrite the assessment.** It records that a human chose to proceed despite
+  it. The risk level stays what it was, the eligibility conditions that are not about human judgment
+  — CI green at the current head, blast radius known, sensitive paths — stay mandatory, and
+  revocation is available with its own audit trail. An acceptance that silently reclassifies a
+  verdict as low-risk destroys the analytics §21.1 collects and the contradiction-rate signal §21.2
+  is calibrated on.
+
+**Both the publisher and acceptance are downstream of Step 173's semantics, and that is a
+realisation order, not a preference.** They identify a result by attempt and context; those did not
+exist before Step 173 and could not be retrofitted onto a head-only identity without the same
+overwrite hazard described above. Step 174 therefore starts after Step 173 ships, and a plan that
+schedules them in parallel is scheduling the publisher against an identity it cannot express.
+
 ### 21.2 Automated approval: eligibility engine + calibrated auto-merge
 This section **supersedes** the label-driven auto-approval mechanism §8.2 and §16.1 originally specified (`review: low risk` as the trigger a human posts to approve a PR for auto-merge). That design was a per-PR human bottleneck — it still required a person to read the PR and apply the label before anything automated could happen, exactly the serial-human chokepoint the decision inbox (§16) exists to relieve elsewhere. The replacement is fully automated from day one, in two decoupled stages:
 
