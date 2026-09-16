@@ -1367,3 +1367,24 @@ func TestDefaultTimeouts_Step120StandaloneField(t *testing.T) {
 		t.Fatalf("Validate() = %v, want nil (this field must not disturb either invariant chain)", err)
 	}
 }
+
+// TestDefaultTimeouts_Step173StandaloneField proves §21.1's amendment's own finding
+// F1 addition -- GitHubResolveBaseBranchSHATimeout -- ships with a
+// sensible, non-zero default and does not disturb either invariant chain
+// (it is a standalone field, wired into neither).
+func TestDefaultTimeouts_Step173StandaloneField(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+
+	if to.GitHubResolveBaseBranchSHATimeout <= 0 {
+		t.Errorf("GitHubResolveBaseBranchSHATimeout = %v, want > 0", to.GitHubResolveBaseBranchSHATimeout)
+	}
+	if to.GitHubResolveBaseBranchSHATimeout != 10*time.Second {
+		t.Errorf("GitHubResolveBaseBranchSHATimeout = %v, want %v", to.GitHubResolveBaseBranchSHATimeout, 10*time.Second)
+	}
+
+	if err := to.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil (this field must not disturb either invariant chain)", err)
+	}
+}

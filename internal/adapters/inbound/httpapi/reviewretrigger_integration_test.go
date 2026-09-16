@@ -19,6 +19,9 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/domain/autoapproval"
+	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 )
 
 // fakeReviewContextFetcher is a test-only reviewcontext.Fetcher -- no real
@@ -44,10 +47,31 @@ type fakeReviewContextFetcher struct {
 	diffBase  string
 	diffHead  string
 	diffToken string
+
+	// resolveBranchSHA (finding F1/F4/F6 (§21.1's amendment)) is the value
+	// ResolveBranchSHA below reports -- "" (the zero value, every
+	// EXISTING test in this file) mirrors reviewcontext.Fetch's own
+	// "resolution unavailable, fall back to pinning the diff fetch on
+	// pr.BaseRef" degradation. A test proving the full review-context
+	// handoff end to end (TestRetriggerReview_PersistsFullReviewVerdictContext_
+	// ReadBackByPostReviewVerdict) sets this explicitly so
+	// review.PreFetchedContext.BaseSHA -- and therefore the persisted
+	// review_verdict_context.baseSha -- is genuinely non-empty.
+	resolveBranchSHA string
 }
 
 func (f *fakeReviewContextFetcher) GetPullRequest(_ context.Context, _, _ string, _ int32, _ string) (githubapi.PullRequest, error) {
 	return f.pr, nil
+}
+
+// ResolveBranchSHA (finding F1 (§21.1's amendment)) reports resolveBranchSHA --
+// "" (every EXISTING test in this file, none of which sets it) mirrors
+// reviewcontext.Fetch's own "resolution unavailable" degradation, falling
+// back to pinning the diff fetch on pr.BaseRef, exactly this fake's own
+// pre-existing behavior, so every EXISTING assertion against diffBase in
+// this file keeps passing unchanged.
+func (f *fakeReviewContextFetcher) ResolveBranchSHA(_ context.Context, spec ports.ResolveBranchSHASpec) (string, string, error) {
+	return f.resolveBranchSHA, spec.Branch, nil
 }
 
 func (f *fakeReviewContextFetcher) GetCompareDiff(_ context.Context, owner, repo, base, head, token string) (string, bool, error) {
@@ -263,6 +287,119 @@ func TestRetriggerReview_PreFetchesReviewContext_CorrectOwnerRepoArgs(t *testing
 	}
 	if !strings.Contains(prompt, "diff --git a/x b/x") {
 		t.Errorf("prompt = %q, want it to contain the pre-fetched diff", prompt)
+	}
+}
+
+// TestRetriggerReview_PersistsFullReviewVerdictContext_ReadBackByPostReviewVerdict
+// is §21.1's amendment's own findings F4/F6 regression test: "the turn->verdict
+// context handoff has no test at all... every existing test injects the
+// Context directly into Insert, so the handoff itself is executed by no
+// assertion." This test exercises BOTH real production halves of that
+// handoff, never a hand-built fixture standing in for either: the WRITE
+// half is this endpoint's own real RetriggerReview handler (reviewretrigger.go),
+// which calls the REAL reviewcontext.Fetch (through fakeReviewContextFetcher,
+// this file's own narrow test double for the outbound GitHub call only) and
+// persists its result onto turns.review_verdict_context via the REAL
+// createTurnLocked insert (turn.go's own "ReviewVerdictContext:
+// reviewVerdictContext" write); the READ half is PostReviewVerdict's own
+// real unmarshal (reviewverdict.go). A regression that dropped the field at
+// either end (turn.go's own write, or reviewverdict.go's own read) would
+// pass every EXISTING test in this repository -- none of them drives both
+// halves through their real production code paths at once -- and would
+// silently turn ComputeEligible's answer into ReasonContextUnknown for
+// EVERY future PR this repo reviews, permanently and silently disabling
+// auto-approval/auto-merge (see reviewverdict.go's own doc comment on the
+// unmarshal-failure branch, immediately below this test).
+func TestRetriggerReview_PersistsFullReviewVerdictContext_ReadBackByPostReviewVerdict(t *testing.T) {
+	fetcher := &fakeReviewContextFetcher{
+		diff: "diff --git a/x b/x\n+hello\n",
+		pr:   githubapi.PullRequest{HeadSHA: "handoff-head-sha", BaseRef: "main"},
+		// resolveBranchSHA (finding F1) is the base branch's own LIVE tip
+		// -- deliberately set here (unlike every other test in this file)
+		// so review.PreFetchedContext.BaseSHA, and therefore the
+		// persisted review_verdict_context.baseSha, is genuinely
+		// non-empty: this test's own point is proving the FULL context
+		// round-trips, not merely the fields that already had coverage.
+		resolveBranchSHA: "handoff-base-sha",
+	}
+	rig := newTestRig(t, func(r *testRig) {
+		r.diffFetcher = fetcher
+		r.botToken = "test-bot-token"
+	})
+	ctx := context.Background()
+	owner, _ := rig.createAuthenticatedUser(ctx, t)
+	_, token := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMaintainer)
+
+	repoFullName := "acme/verdict-context-handoff"
+	session := rig.createOwnedGitHubReviewSession(ctx, t, owner.ID, repoFullName, 91)
+	// The READ half below (postReviewVerdict) needs a real sandbox row to
+	// authenticate against -- RetriggerReview itself needs none.
+	createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
+
+	// THE WRITE HALF: the real RetriggerReview handler.
+	status := rig.doJSON(t, http.MethodPost, "/api/sessions/"+session.ID.String()+"/review/retrigger", nil, nil, token)
+	if status != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
+	}
+
+	var turnID pgtype.UUID
+	var contextJSON []byte
+	if err := rig.pool.QueryRow(ctx, `SELECT id, review_verdict_context FROM turns WHERE session_id = $1 ORDER BY created_at DESC LIMIT 1`, session.ID).Scan(&turnID, &contextJSON); err != nil {
+		t.Fatalf("query turn review_verdict_context: %v", err)
+	}
+	if len(contextJSON) == 0 {
+		t.Fatal("turns.review_verdict_context is NULL/empty -- the real write half (turn.go's own createTurnLocked insert) did not persist it")
+	}
+	var writtenContext reviewverdict.Context
+	if err := json.Unmarshal(contextJSON, &writtenContext); err != nil {
+		t.Fatalf("unmarshal turns.review_verdict_context: %v", err)
+	}
+	if writtenContext.BaseRef != "main" {
+		t.Errorf("written context BaseRef = %q, want %q", writtenContext.BaseRef, "main")
+	}
+	if writtenContext.BaseSHA != "handoff-base-sha" {
+		t.Errorf("written context BaseSHA = %q, want %q", writtenContext.BaseSHA, "handoff-base-sha")
+	}
+	if writtenContext.PolicyVersion != autoapproval.CurrentPolicyVersion {
+		t.Errorf("written context PolicyVersion = %d, want %d", writtenContext.PolicyVersion, autoapproval.CurrentPolicyVersion)
+	}
+
+	// Simulates the (separately fixed and tested, finding F3) real
+	// dispatch stamp -- the ONE piece of the real production path this
+	// test does not drive live, since doing so would require a live
+	// sessionactor.Actor/SandboxCommander; dispatch.go's own real
+	// UpdateStatus write is covered directly by dispatch_test.go and by
+	// reviewverdict_integration_test.go's own F3 regression test.
+	dispatchMessageID := "handoff-dispatch-message-id"
+	if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: turnID, Status: sqlcgen.TurnStatusProcessing, DispatchedMessageID: &dispatchMessageID}); err != nil {
+		t.Fatalf("stamp dispatched_message_id on the real created turn: %v", err)
+	}
+
+	// THE READ HALF: the real PostReviewVerdict handler.
+	verdictStatus, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", dispatchMessageID, validVerdictRequestJSON())
+	if verdictStatus != http.StatusCreated {
+		t.Fatalf("verdict status = %d, want %d", verdictStatus, http.StatusCreated)
+	}
+
+	var gotBaseRef, gotBaseSHA string
+	var gotPolicyVersion int
+	if err := rig.pool.QueryRow(ctx, `SELECT base_ref, base_sha, policy_version FROM review_verdicts WHERE repo_full_name = $1 AND pr_number = $2`, repoFullName, 91).
+		Scan(&gotBaseRef, &gotBaseSHA, &gotPolicyVersion); err != nil {
+		t.Fatalf("query review_verdicts row: %v", err)
+	}
+
+	// THE DECISIVE HANDOFF ASSERTION: the verdict's own persisted context
+	// matches EXACTLY what the real write half recorded -- proving the
+	// full round trip, through two real production functions, never a
+	// hand-injected Context.
+	if gotBaseRef != writtenContext.BaseRef {
+		t.Errorf("review_verdicts.base_ref = %q, want %q (the turn's own written context)", gotBaseRef, writtenContext.BaseRef)
+	}
+	if gotBaseSHA != writtenContext.BaseSHA {
+		t.Errorf("review_verdicts.base_sha = %q, want %q (the turn's own written context)", gotBaseSHA, writtenContext.BaseSHA)
+	}
+	if gotPolicyVersion != writtenContext.PolicyVersion {
+		t.Errorf("review_verdicts.policy_version = %d, want %d (the turn's own written context)", gotPolicyVersion, writtenContext.PolicyVersion)
 	}
 }
 

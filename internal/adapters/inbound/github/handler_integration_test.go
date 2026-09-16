@@ -31,6 +31,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
@@ -348,6 +349,16 @@ type fakeReviewContextFetcher struct {
 
 func (f *fakeReviewContextFetcher) GetPullRequest(_ context.Context, _, _ string, _ int32, _ string) (githubapi.PullRequest, error) {
 	return f.pr, f.prErr
+}
+
+// ResolveBranchSHA (finding F1 (§21.1's amendment)) reports no live resolution by
+// default (the zero value "" -- no field here configures a different
+// result) -- reviewcontext.Fetch treats that identically to "resolution
+// unavailable" and falls back to pinning the diff fetch on pr.BaseRef,
+// exactly this fake's own pre-existing behavior, so every EXISTING
+// assertion against diffBase in this file keeps passing unchanged.
+func (f *fakeReviewContextFetcher) ResolveBranchSHA(_ context.Context, spec ports.ResolveBranchSHASpec) (string, string, error) {
+	return "", spec.Branch, nil
 }
 
 func (f *fakeReviewContextFetcher) GetCompareDiff(_ context.Context, owner, repo, base, head, token string) (string, bool, error) {

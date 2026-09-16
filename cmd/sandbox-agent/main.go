@@ -364,7 +364,7 @@ func (h *commandHandler) HandlePrompt(_ context.Context, cmd sandboxws.Prompt) {
 	// gen -- see reviewverdicttoolprompt.go's own top doc comment for why
 	// this is the one place those placeholders can actually be resolved. A
 	// no-op for every non-review turn (no placeholders present).
-	cmd.Text = renderVerdictToolPromptText(cmd.Text, h.cfg.SessionConfig)
+	cmd.Text = renderVerdictToolPromptText(cmd.Text, h.cfg.SessionConfig, cmd.MessageId)
 	// (§28.5): the SAME mechanism, extended for the
 	// download_file/upload tools' own placeholders (internal/domain/
 	// upload's attachment block + upload-tool note, rendered at

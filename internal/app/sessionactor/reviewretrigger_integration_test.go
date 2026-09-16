@@ -52,6 +52,15 @@ func (f *fakeReviewDiffFetcher) GetPullRequest(_ context.Context, _, _ string, _
 	return githubapi.PullRequest{HeadSHA: f.nextHeadSHA, BaseRef: f.nextBaseRef}, nil
 }
 
+// ResolveBranchSHA (finding F1 (§21.1's amendment)) reports no live resolution --
+// reviewcontext.Fetch falls back to pinning the diff fetch on the PR's
+// own base ref, exactly this fake's own pre-existing behavior (no test
+// in this file asserts on GetCompareDiff's own base/head args at all, so
+// this degrades identically either way).
+func (f *fakeReviewDiffFetcher) ResolveBranchSHA(_ context.Context, spec ports.ResolveBranchSHASpec) (string, string, error) {
+	return "", spec.Branch, nil
+}
+
 func (f *fakeReviewDiffFetcher) GetCompareDiff(_ context.Context, _, _, _, _, _ string) (string, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

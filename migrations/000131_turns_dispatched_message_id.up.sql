@@ -1,0 +1,49 @@
+-- turns.dispatched_message_id (Step 173, finding F3): the sandboxws.Prompt
+-- MessageId (contracts/gen/go/sandboxws) this turn's own dispatch actually
+-- sent to the sandbox -- the wire identifier the review agent's own
+-- prompt-substitution step (cmd/sandbox-agent's renderVerdictToolPromptText)
+-- embeds into the verdict-posting tool's own instructions as a header, and
+-- the ONE fact httpapi.PostReviewVerdict now resolves the posting turn BY,
+-- instead of "whichever turn happens to be status='processing' for this
+-- session right now" (GetProcessingTurnForSession).
+--
+-- The defect this closes: turns_one_processing_per_session (migrations/
+-- 000005_turns.up.sql) guarantees at most one turn is EVER 'processing' at
+-- once, but says nothing about which turn a specific, already-in-flight
+-- HTTP call actually originated from. A turn that exceeds TurnDeadline is
+-- marked 'failed' while its own agent process can still be alive in the
+-- same sandbox (this codebase's own documented sandbox-lifetime gap: a
+-- turn timeout does not forcibly kill the underlying sandbox process); a
+-- queued retrigger then dispatches a SECOND turn to that SAME sandbox
+-- incarnation (no respawn, same X-Sandbox-Gen), which becomes the new
+-- 'processing' row. When the FIRST turn's agent finally posts its verdict,
+-- GetProcessingTurnForSession resolves the SECOND turn's context/head/base
+-- -- a verdict genuinely produced against the first turn's own commit is
+-- silently stamped with a different turn's review context. §21.1's own
+-- head_sha paragraph already names this exact class of hazard one level
+-- down: "the SHA must be scoped to the turn that examined it, never to a
+-- per-(repo, PR) column ... a verdict can be recorded against a commit it
+-- never read." This is the same hazard one level UP: scoping head_sha/
+-- context to "the turn" is not enough when "the turn" itself is resolved
+-- by session-wide, time-varying state rather than by an identifier the
+-- posting request itself carries.
+--
+-- Stamped by the SAME two call sites (internal/app/sessionactor's
+-- tryPlanDispatch/tryPlanReenqueue, dispatch.go) that already stamp
+-- dispatched_sandbox_gen/dispatched_event_id via UpdateTurnStatus, in the
+-- SAME write, from the SAME messageID BuildPromptPayload embeds into the
+-- wire Prompt itself -- never a second, independently-generated value that
+-- could drift from what the sandbox actually received. Nullable: NULL for
+-- every turn created before this migration, and for any turn that has
+-- never been dispatched at all -- a verdict-posting request presenting no
+-- matching dispatched_message_id (or none at all) finds no turn, degrading
+-- exactly like a not-found processing turn already does (logged, no
+-- context recorded), never a reason to fail the request.
+--
+-- No index: PostReviewVerdict's own lookup is always scoped to (session_id,
+-- dispatched_message_id) together, and turns.session_id already has one
+-- (migrations/000005_turns.up.sql, turns_one_processing_per_session) -- a
+-- session's own turn count is small (this codebase's own turn-history
+-- scale, ListTurnsForSession's own doc comment), so a sequential scan
+-- within one session's own rows is not a concern worth a second index for.
+ALTER TABLE turns ADD COLUMN dispatched_message_id TEXT;

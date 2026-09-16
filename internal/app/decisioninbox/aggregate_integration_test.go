@@ -173,6 +173,25 @@ type fakeDecisionInboxSourceControl struct {
 	// own TestRevalidateForAutoMerge is this field's one real user).
 	getOpenPRByKey map[string]ports.OpenPR
 	getOpenPRErr   error
+
+	// resolveBranchSHA/resolveBranchSHAErr (finding F1 (§21.1's amendment)) back
+	// ResolveBranchSHA below -- revalidateCore now resolves the base
+	// branch's LIVE tip independently, rather than trusting
+	// ports.OpenPR.BaseSHA (GitHub's own possibly-stale
+	// `pull_request.base.sha` snapshot, that field's own doc comment).
+	// Both zero (every caller that never sets them) falls back to
+	// scanning this fake's own already-seeded PRs (openPRsByExternalID/
+	// getOpenPRByKey) for one reporting spec.Branch as its BaseRef,
+	// returning THAT PR's own BaseSHA -- so every EXISTING fixture in
+	// this file, which already sets BaseRef/BaseSHA consistently, gets a
+	// live resolution "for free" with no per-test literal changes
+	// needed. A test proving the F1 hazard
+	// (revalidate_integration_test.go) overrides resolveBranchSHA
+	// explicitly to simulate the base branch's real tip moving while
+	// GitHub's own cached base.sha field (and the base ref name) both
+	// stay exactly as they were.
+	resolveBranchSHA    string
+	resolveBranchSHAErr error
 }
 
 var _ ports.SourceControl = (*fakeDecisionInboxSourceControl)(nil)
@@ -197,8 +216,26 @@ func (f *fakeDecisionInboxSourceControl) ResolveCodeOwners(_ context.Context, sp
 func (f *fakeDecisionInboxSourceControl) CreatePR(context.Context, ports.CreatePRSpec) (ports.PRRef, error) {
 	return ports.PRRef{}, errors.New("fakeDecisionInboxSourceControl: CreatePR not implemented")
 }
-func (f *fakeDecisionInboxSourceControl) ResolveBranchSHA(context.Context, ports.ResolveBranchSHASpec) (string, string, error) {
-	return "", "", errors.New("fakeDecisionInboxSourceControl: ResolveBranchSHA not implemented")
+func (f *fakeDecisionInboxSourceControl) ResolveBranchSHA(_ context.Context, spec ports.ResolveBranchSHASpec) (string, string, error) {
+	if f.resolveBranchSHAErr != nil {
+		return "", "", f.resolveBranchSHAErr
+	}
+	if f.resolveBranchSHA != "" {
+		return f.resolveBranchSHA, spec.Branch, nil
+	}
+	for _, prs := range f.openPRsByExternalID {
+		for _, pr := range prs {
+			if pr.BaseRef == spec.Branch {
+				return pr.BaseSHA, spec.Branch, nil
+			}
+		}
+	}
+	for _, pr := range f.getOpenPRByKey {
+		if pr.BaseRef == spec.Branch {
+			return pr.BaseSHA, spec.Branch, nil
+		}
+	}
+	return "", "", fmt.Errorf("fakeDecisionInboxSourceControl: ResolveBranchSHA: no seeded PR reports base ref %q", spec.Branch)
 }
 func (f *fakeDecisionInboxSourceControl) ResolveContractsFingerprint(context.Context, ports.ResolveContractsFingerprintSpec) (string, bool, error) {
 	return "", false, errors.New("fakeDecisionInboxSourceControl: ResolveContractsFingerprint not implemented")

@@ -25,6 +25,7 @@ import (
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
 	"github.com/narvidev/narvi/internal/domain/reviewtriage"
+	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 )
 
 // validVerdictRequestJSON is the happy-path request body every test in
@@ -71,12 +72,27 @@ func driftFiringVerdictRequestJSON() string {
 	return strings.Replace(validVerdictRequestJSON(), `"filesChanged": 3`, `"filesChanged": 25`, 1)
 }
 
+// testDispatchMessageID (finding F3 (§21.1's amendment)) is the shared, fixed
+// sandboxws.Prompt MessageId value every turn-seeding fixture in this file
+// stamps onto turns.dispatched_message_id, and postReviewVerdict presents
+// back as the X-Sandbox-Dispatch-Message-Id header -- so a test asserting
+// on the resulting review_verdicts row's own head_sha/context genuinely
+// exercises the real dispatched-message-id lookup (turns.
+// GetByDispatchedMessageID), never a coincidental degrade-to-empty path
+// that happens to produce the same outward assertion for the wrong
+// reason.
+const testDispatchMessageID = "test-dispatch-message-id"
+
 // postReviewVerdict posts body to sessionID's own review/verdict endpoint,
 // with bearer/gen as the SAME sandbox-bearer-auth headers scmcredentials_
 // integration_test.go's own postScmCredentialsFull establishes -- gen ==
 // "" omits the X-Sandbox-Gen header entirely (matching a real caller that
 // never sends it), mirroring that helper's own identical convention.
-func postReviewVerdict(t *testing.T, r testRig, sessionID, bearer, gen, body string) (int, restdtos.PostReviewVerdictResponse) {
+// dispatchMessageID (finding F3 (§21.1's amendment)) mirrors that SAME convention
+// one header further: "" omits X-Sandbox-Dispatch-Message-Id entirely
+// (matching a caller/turn that predates this fix, or a test that
+// deliberately exercises the no-context-resolvable degradation).
+func postReviewVerdict(t *testing.T, r testRig, sessionID, bearer, gen, dispatchMessageID, body string) (int, restdtos.PostReviewVerdictResponse) {
 	t.Helper()
 
 	req, err := http.NewRequest(http.MethodPost, r.server.URL+"/sessions/"+sessionID+"/review/verdict", strings.NewReader(body))
@@ -89,6 +105,9 @@ func postReviewVerdict(t *testing.T, r testRig, sessionID, bearer, gen, body str
 	}
 	if gen != "" {
 		req.Header.Set("X-Sandbox-Gen", gen)
+	}
+	if dispatchMessageID != "" {
+		req.Header.Set("X-Sandbox-Dispatch-Message-Id", dispatchMessageID)
 	}
 
 	resp, err := http.DefaultClient.Do(req)
@@ -119,7 +138,7 @@ func setupReviewSessionWithSandbox(ctx context.Context, t *testing.T, r testRig,
 func TestPostReviewVerdict_NotFound(t *testing.T) {
 	rig := newTestRig(t)
 
-	status, _ := postReviewVerdict(t, rig, "00000000-0000-0000-0000-000000000000", "any-token", "1", validVerdictRequestJSON())
+	status, _ := postReviewVerdict(t, rig, "00000000-0000-0000-0000-000000000000", "any-token", "1", "", validVerdictRequestJSON())
 	if status != http.StatusNotFound {
 		t.Errorf("status = %d, want %d", status, http.StatusNotFound)
 	}
@@ -130,7 +149,7 @@ func TestPostReviewVerdict_MissingBearer_Unauthorized(t *testing.T) {
 	ctx := context.Background()
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-nobearer", 1)
 
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "", "1", validVerdictRequestJSON())
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "", "1", "", validVerdictRequestJSON())
 	if status != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d", status, http.StatusUnauthorized)
 	}
@@ -141,7 +160,7 @@ func TestPostReviewVerdict_WrongToken_Unauthorized(t *testing.T) {
 	ctx := context.Background()
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-wrongtoken", 2)
 
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "not-the-real-token", "1", validVerdictRequestJSON())
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "not-the-real-token", "1", "", validVerdictRequestJSON())
 	if status != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d", status, http.StatusUnauthorized)
 	}
@@ -152,7 +171,7 @@ func TestPostReviewVerdict_GenMismatch_Forbidden(t *testing.T) {
 	ctx := context.Background()
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-genmismatch", 3)
 
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "999", validVerdictRequestJSON())
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "999", "", validVerdictRequestJSON())
 	if status != http.StatusForbidden {
 		t.Errorf("status = %d, want %d", status, http.StatusForbidden)
 	}
@@ -163,7 +182,7 @@ func TestPostReviewVerdict_MissingGen_Forbidden(t *testing.T) {
 	ctx := context.Background()
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-missinggen", 4)
 
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "", validVerdictRequestJSON())
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "", "", validVerdictRequestJSON())
 	if status != http.StatusForbidden {
 		t.Errorf("status = %d, want %d (a well-formed caller always sends X-Sandbox-Gen)", status, http.StatusForbidden)
 	}
@@ -181,7 +200,7 @@ func TestPostReviewVerdict_DeadSandbox_Gone(t *testing.T) {
 		t.Fatalf("mark sandbox stopped: %v", err)
 	}
 
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", validVerdictRequestJSON())
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", validVerdictRequestJSON())
 	if status != http.StatusGone {
 		t.Errorf("status = %d, want %d", status, http.StatusGone)
 	}
@@ -200,7 +219,7 @@ func TestPostReviewVerdict_NoGitHubPRMapping_BadRequest(t *testing.T) {
 	}
 	createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
 
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", validVerdictRequestJSON())
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", validVerdictRequestJSON())
 	if status != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d (no github_pr_sessions row for this session)", status, http.StatusBadRequest)
 	}
@@ -247,7 +266,7 @@ func TestPostReviewVerdict_MalformedPartialPayload(t *testing.T) {
 			ctx := context.Background()
 			session := setupReviewSessionWithSandbox(ctx, t, rig, fmt.Sprintf("acme/verdict-malformed-%d", i), int32(i+1))
 
-			status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", tc.body)
+			status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", tc.body)
 			if status != http.StatusBadRequest {
 				t.Errorf("status = %d, want %d", status, http.StatusBadRequest)
 			}
@@ -274,7 +293,7 @@ func TestPostReviewVerdict_Success_EnqueuesGitHubVerdictOutboxRow(t *testing.T) 
 	ctx := context.Background()
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-success", 42)
 
-	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", validVerdictRequestJSON())
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", validVerdictRequestJSON())
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -343,11 +362,19 @@ func TestPostReviewVerdict_PersistsReviewVerdictRow_WhenReviewHeadSHAKnown(t *te
 	// turn is dispatched (status='processing') by the time its own agent
 	// calls this endpoint.
 	reviewHeadSHA := "sha-persist-abc123"
-	if _, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &reviewHeadSHA}); err != nil {
+	createdTurn, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &reviewHeadSHA})
+	if err != nil {
 		t.Fatalf("seed processing turn with review head sha: %v", err)
 	}
+	// dispatched_message_id (finding F3 (§21.1's amendment)): stamped here so
+	// postReviewVerdict's own testDispatchMessageID header resolves THIS
+	// turn via the real turns.GetByDispatchedMessageID lookup.
+	turnMessageID := testDispatchMessageID
+	if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: createdTurn.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedMessageID: &turnMessageID}); err != nil {
+		t.Fatalf("stamp dispatched_message_id on seeded turn: %v", err)
+	}
 
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", validVerdictRequestJSON())
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, validVerdictRequestJSON())
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -403,8 +430,13 @@ func TestPostReviewVerdict_PersistsDigestColumns(t *testing.T) {
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-digest-persist", 66)
 
 	reviewHeadSHA := "sha-digest-persist-abc123"
-	if _, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &reviewHeadSHA}); err != nil {
+	createdTurn, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &reviewHeadSHA})
+	if err != nil {
 		t.Fatalf("seed processing turn with review head sha: %v", err)
+	}
+	turnMessageID := testDispatchMessageID
+	if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: createdTurn.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedMessageID: &turnMessageID}); err != nil {
+		t.Fatalf("stamp dispatched_message_id on seeded turn: %v", err)
 	}
 
 	body := `{
@@ -430,7 +462,7 @@ func TestPostReviewVerdict_PersistsDigestColumns(t *testing.T) {
 		"factCheckKilled": 0
 	}`
 
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", body)
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, body)
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -519,11 +551,16 @@ func TestPostReviewVerdict_SkipsReviewVerdictInsert_WhenNoReviewHeadSHA(t *testi
 	ctx := context.Background()
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-no-head-sha", 56)
 	// Deliberately no ReviewHeadSha -- this is the fact under test.
-	if _, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing}); err != nil {
+	createdTurn, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing})
+	if err != nil {
 		t.Fatalf("seed processing turn with no review head sha: %v", err)
 	}
+	turnMessageID := testDispatchMessageID
+	if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: createdTurn.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedMessageID: &turnMessageID}); err != nil {
+		t.Fatalf("stamp dispatched_message_id on seeded turn: %v", err)
+	}
 
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", validVerdictRequestJSON())
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, validVerdictRequestJSON())
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d (a missing head sha must never fail the verdict post itself)", status, http.StatusCreated)
 	}
@@ -552,7 +589,7 @@ func TestPostReviewVerdict_SkipsReviewVerdictInsert_WhenNoProcessingTurnAtAll(t 
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-no-processing-turn", 57)
 	// Deliberately no turn created at all.
 
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", validVerdictRequestJSON())
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", validVerdictRequestJSON())
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d (no resolvable processing turn must never fail the verdict post itself)", status, http.StatusCreated)
 	}
@@ -594,7 +631,7 @@ func TestPostReviewVerdict_ShippableNeverTrustsProposedShippable(t *testing.T) {
 		"factCheckKilled": 0
 	}`
 
-	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", body)
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", body)
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -641,7 +678,7 @@ func TestPostReviewVerdict_BlockOnHighRisk(t *testing.T) {
 		ctx := context.Background()
 		session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-blockonhighrisk-off", 10)
 
-		status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", highRiskBody)
+		status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", highRiskBody)
 		if status != http.StatusCreated {
 			t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 		}
@@ -663,7 +700,7 @@ func TestPostReviewVerdict_BlockOnHighRisk(t *testing.T) {
 			t.Fatalf("upsert repo settings: %v", err)
 		}
 
-		status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", highRiskBody)
+		status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", highRiskBody)
 		if status != http.StatusCreated {
 			t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 		}
@@ -695,7 +732,7 @@ func TestPostReviewVerdict_ConcurrentCalls_AllSucceedNoDeadlock(t *testing.T) {
 		idx := i
 		go func() {
 			<-start
-			status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", validVerdictRequestJSON())
+			status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", validVerdictRequestJSON())
 			statuses[idx] = status
 			done <- idx
 		}()
@@ -749,7 +786,7 @@ func TestPostReviewVerdict_MisleadingAdequacyRaisesShippable(t *testing.T) {
 		"factCheckKilled": 0
 	}`
 
-	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", body)
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", body)
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -788,8 +825,13 @@ func TestPostReviewVerdict_AdequacyNeverAffectsRiskLevel(t *testing.T) {
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-adequacy-risklevel", 13)
 
 	reviewHeadSHA := "sha-adequacy-risklevel-abc123"
-	if _, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &reviewHeadSHA}); err != nil {
+	createdTurn, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &reviewHeadSHA})
+	if err != nil {
 		t.Fatalf("seed processing turn with review head sha: %v", err)
+	}
+	turnMessageID := testDispatchMessageID
+	if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: createdTurn.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedMessageID: &turnMessageID}); err != nil {
+		t.Fatalf("stamp dispatched_message_id on seeded turn: %v", err)
 	}
 
 	body := `{
@@ -810,7 +852,7 @@ func TestPostReviewVerdict_AdequacyNeverAffectsRiskLevel(t *testing.T) {
 		"factCheckKilled": 0
 	}`
 
-	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", body)
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, body)
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -863,7 +905,7 @@ func TestPostReviewVerdict_ProposedBodyPresent_EnqueuesDescriptionAutofixOutboxR
 		"factCheckKilled": 0
 	}`
 
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", body)
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", body)
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -943,7 +985,7 @@ func TestPostReviewVerdict_AdequacyOKWithProposedBody_NeverEnqueuesDescriptionAu
 		"factCheckKilled": 0
 	}`
 
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", body)
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", body)
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -977,7 +1019,7 @@ func TestPostReviewVerdict_ProposedBodyAbsent_NeverEnqueuesDescriptionAutofixOut
 	ctx := context.Background()
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-no-autofix-candidate", 15)
 
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", validVerdictRequestJSON())
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", validVerdictRequestJSON())
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -1006,13 +1048,26 @@ func seedProcessingTurnWithChangedFilesCount(ctx context.Context, t *testing.T, 
 	if err != nil {
 		t.Fatalf("marshal review depth decision record: %v", err)
 	}
-	if _, err := r.turns.Create(ctx, sqlcgen.CreateTurnParams{
+	created, err := r.turns.Create(ctx, sqlcgen.CreateTurnParams{
 		SessionID:           sessionID,
 		Status:              sqlcgen.TurnStatusProcessing,
 		ReviewHeadSha:       &reviewHeadSHA,
 		ReviewDepthDecision: recordJSON,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("seed processing turn with review_depth_decision: %v", err)
+	}
+	// dispatched_message_id (finding F3 (§21.1's amendment)): stamped here, exactly
+	// like seedProcessingDeepPathTurn's own identical re-stamp, so
+	// postReviewVerdict's own testDispatchMessageID header resolves THIS
+	// turn via the real turns.GetByDispatchedMessageID lookup.
+	messageID := testDispatchMessageID
+	if _, err := r.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+		ID:                  created.ID,
+		Status:              sqlcgen.TurnStatusProcessing,
+		DispatchedMessageID: &messageID,
+	}); err != nil {
+		t.Fatalf("stamp dispatched_message_id on seeded turn: %v", err)
 	}
 }
 
@@ -1066,7 +1121,7 @@ func TestPostReviewVerdict_FilesChangedDriftCanary_FiresOnDivergence_NeverAffect
 
 	buf := captureDefaultLoggerJSON(t)
 
-	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", driftFiringVerdictRequestJSON())
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, driftFiringVerdictRequestJSON())
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d (a fired canary must never fail the request)", status, http.StatusCreated)
 	}
@@ -1104,7 +1159,7 @@ func TestPostReviewVerdict_FilesChangedDriftCanary_NoDivergence_NeverFires(t *te
 
 	buf := captureDefaultLoggerJSON(t)
 
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", validVerdictRequestJSON())
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, validVerdictRequestJSON())
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -1137,13 +1192,18 @@ func TestPostReviewVerdict_FilesChangedDriftCanary_ServerComputedZero_NeverFires
 	reviewHeadSHA := "sha-drift-zero-guard"
 	// Deliberately no ReviewDepthDecision -- review_depth_decision stays
 	// SQL NULL, exactly like a turn that predates this field.
-	if _, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &reviewHeadSHA}); err != nil {
+	createdTurn, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &reviewHeadSHA})
+	if err != nil {
 		t.Fatalf("seed processing turn with no review_depth_decision: %v", err)
+	}
+	turnMessageID := testDispatchMessageID
+	if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: createdTurn.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedMessageID: &turnMessageID}); err != nil {
+		t.Fatalf("stamp dispatched_message_id on seeded turn: %v", err)
 	}
 
 	buf := captureDefaultLoggerJSON(t)
 
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", validVerdictRequestJSON())
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, validVerdictRequestJSON())
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -1169,13 +1229,24 @@ func seedProcessingTurnWithUndeliveredDiff(ctx context.Context, t *testing.T, r 
 	if err != nil {
 		t.Fatalf("marshal review depth decision record: %v", err)
 	}
-	if _, err := r.turns.Create(ctx, sqlcgen.CreateTurnParams{
+	created, err := r.turns.Create(ctx, sqlcgen.CreateTurnParams{
 		SessionID:           sessionID,
 		Status:              sqlcgen.TurnStatusProcessing,
 		ReviewHeadSha:       &reviewHeadSHA,
 		ReviewDepthDecision: recordJSON,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("seed processing turn with undelivered-diff review_depth_decision: %v", err)
+	}
+	// dispatched_message_id (finding F3 (§21.1's amendment)): see
+	// seedProcessingTurnWithChangedFilesCount's own identical re-stamp.
+	messageID := testDispatchMessageID
+	if _, err := r.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+		ID:                  created.ID,
+		Status:              sqlcgen.TurnStatusProcessing,
+		DispatchedMessageID: &messageID,
+	}); err != nil {
+		t.Fatalf("stamp dispatched_message_id on seeded turn: %v", err)
 	}
 }
 
@@ -1199,7 +1270,7 @@ func TestPostReviewVerdict_FilesChangedDriftCanary_DiffTruncated_NeverFires(t *t
 
 	buf := captureDefaultLoggerJSON(t)
 
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", driftFiringVerdictRequestJSON())
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, driftFiringVerdictRequestJSON())
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -1225,7 +1296,7 @@ func TestPostReviewVerdict_FilesChangedDriftCanary_DiffEmpty_NeverFires(t *testi
 
 	buf := captureDefaultLoggerJSON(t)
 
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", driftFiringVerdictRequestJSON())
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, driftFiringVerdictRequestJSON())
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -1334,12 +1405,21 @@ func seedProcessingDeepPathTurn(ctx context.Context, t *testing.T, r testRig, se
 	if err != nil {
 		t.Fatalf("read events high-water mark for seeded deep-path turn: %v", err)
 	}
+	messageID := testDispatchMessageID
 	updated, err := r.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
 		ID:                   created.ID,
 		Status:               sqlcgen.TurnStatusProcessing,
 		DispatchedAt:         pgtype.Timestamptz{Time: dbDispatchedAt(ctx, t, r), Valid: true},
 		DispatchedSandboxGen: &gen,
 		DispatchedEventID:    &watermark,
+		// dispatched_message_id (finding F3 (§21.1's amendment)) mirrors gen/
+		// event-id's own identical "stamped at the moment the prompt was
+		// (would be) dispatched" convention -- postReviewVerdict's own
+		// callers present testDispatchMessageID back as a request header,
+		// so PostReviewVerdict's real turns.GetByDispatchedMessageID
+		// lookup resolves THIS exact turn, never session-wide "current"
+		// status.
+		DispatchedMessageID: &messageID,
 	})
 	if err != nil {
 		t.Fatalf("stamp dispatch columns on seeded deep-path turn: %v", err)
@@ -1438,7 +1518,7 @@ func TestPostReviewVerdict_CounterReviewCorroborated_NotFloored(t *testing.T) {
 	seedSubTaskStart(ctx, t, rig, session.ID, "msg-start-1", "subtask-1", review.CounterReviewerAgentName, 1)
 	seedSubTaskFinish(ctx, t, rig, session.ID, "msg-finish-1", "subtask-1", "completed", 1)
 
-	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", deepPathVerdictRequestJSON("done"))
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, deepPathVerdictRequestJSON("done"))
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -1462,7 +1542,7 @@ func TestPostReviewVerdict_CounterReviewUncorroborated_NoFinishEvent_FloorsToNee
 	seedSubTaskStart(ctx, t, rig, session.ID, "msg-start-2", "subtask-2", review.CounterReviewerAgentName, 1)
 	// Deliberately no matching sub_task_finish event at all.
 
-	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", deepPathVerdictRequestJSON("done"))
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, deepPathVerdictRequestJSON("done"))
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -1487,7 +1567,7 @@ func TestPostReviewVerdict_CounterReviewUncorroborated_OnlyDifferentSubAgentType
 	seedSubTaskStart(ctx, t, rig, session.ID, "msg-start-3", "subtask-3", "fact-check", 1)
 	seedSubTaskFinish(ctx, t, rig, session.ID, "msg-finish-3", "subtask-3", "completed", 1)
 
-	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", deepPathVerdictRequestJSON("done"))
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, deepPathVerdictRequestJSON("done"))
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -1520,7 +1600,7 @@ func TestPostReviewVerdict_CounterReviewCorroborated_MultipleSubAgentTypes_NotFl
 	seedSubTaskStart(ctx, t, rig, session.ID, "msg-start-counter", "subtask-counter", review.CounterReviewerAgentName, 1)
 	seedSubTaskFinish(ctx, t, rig, session.ID, "msg-finish-counter", "subtask-counter", "completed", 1)
 
-	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", deepPathVerdictRequestJSON("done"))
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, deepPathVerdictRequestJSON("done"))
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -1664,12 +1744,21 @@ func TestPostReviewVerdict_CounterReviewCorroborated_EarlierTurnSameGenDoesNotCo
 	if err != nil {
 		t.Fatalf("read turn 1 watermark: %v", err)
 	}
+	// turn1MessageID (finding F3 (§21.1's amendment)) is deliberately DISTINCT from
+	// turn2's own (below) -- this is the EXACT hazard this test's own
+	// name describes, one layer up: two turns sharing the same session AND
+	// gen must still be individually addressable, now by
+	// dispatched_message_id rather than by "whichever is processing" --
+	// see this test's own top doc comment for the identical gen-scoping
+	// gap this closes for counter-review corroboration.
+	turn1MessageID := "test-dispatch-message-id-turn-1"
 	if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
 		ID:                   turn1.ID,
 		Status:               sqlcgen.TurnStatusProcessing,
 		DispatchedAt:         pgtype.Timestamptz{Time: turn1DispatchedAt, Valid: true},
 		DispatchedSandboxGen: &sameGen,
 		DispatchedEventID:    &turn1Watermark,
+		DispatchedMessageID:  &turn1MessageID,
 	}); err != nil {
 		t.Fatalf("stamp turn 1 dispatch columns: %v", err)
 	}
@@ -1724,21 +1813,220 @@ func TestPostReviewVerdict_CounterReviewCorroborated_EarlierTurnSameGenDoesNotCo
 	if turn2Watermark <= turn1Watermark {
 		t.Fatalf("turn 2 watermark %d must be strictly above turn 1's %d, otherwise this test cannot distinguish the two turns' traces at all", turn2Watermark, turn1Watermark)
 	}
+	// turn2MessageID is deliberately testDispatchMessageID -- the SAME
+	// value the postReviewVerdict call below presents as its own header,
+	// so the real turns.GetByDispatchedMessageID lookup resolves TURN 2
+	// specifically (never turn 1, even though both share session_id AND
+	// gen) -- proving this test's own real point end to end: which turn's
+	// context/corroboration-scope applies is now decided by this
+	// identifier, not by which turn happens to be 'processing'.
+	turn2MessageID := testDispatchMessageID
 	if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
 		ID:                   turn2.ID,
 		Status:               sqlcgen.TurnStatusProcessing,
 		DispatchedAt:         pgtype.Timestamptz{Time: turn2DispatchedAt, Valid: true},
 		DispatchedSandboxGen: &sameGen,
 		DispatchedEventID:    &turn2Watermark,
+		DispatchedMessageID:  &turn2MessageID,
 	}); err != nil {
 		t.Fatalf("stamp turn 2 dispatch columns: %v", err)
 	}
 
-	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", deepPathVerdictRequestJSON("done"))
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, deepPathVerdictRequestJSON("done"))
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
 	if resp.Shippable != restdtos.PostReviewVerdictResponseShippableNeedsHuman {
 		t.Errorf("Shippable = %q, want %q (turn 2's fabricated counterReview:done self-report must NOT be corroborated by turn 1's own OLD trace, even though both turns share the identical dispatched_sandbox_gen)", resp.Shippable, restdtos.PostReviewVerdictResponseShippableNeedsHuman)
+	}
+}
+
+// TestPostReviewVerdict_TimedOutTurnStillPostsAgainstOwnContext_NotTheNewerTurn
+// is §21.1's amendment's own DECISIVE finding F3 regression test, reproducing the
+// EXACT scenario finding F3 names: turn A is dispatched (and its own
+// review context, including a distinct base ref and head sha, is
+// recorded), then exceeds TurnDeadline and is marked 'failed' -- but its
+// own agent process is still alive in the same sandbox (this codebase's
+// own documented sandbox-lifetime gap: a timeout does not forcibly kill
+// the sandbox). A queued retrigger then dispatches turn B on the SAME
+// session, to the SAME sandbox incarnation (no respawn, same
+// X-Sandbox-Gen), which becomes the new 'processing' row. Turn A's own
+// agent -- having rendered its OWN prompt, carrying its OWN dispatch
+// message id, before it ever knew it would time out -- finally posts.
+//
+// This test FAILS against the pre-fix code: GetProcessingTurnForSession
+// resolves "whichever turn is processing right now" -- turn B -- so the
+// posted verdict would be silently stamped with turn B's own head_sha/
+// base_ref/base_sha, even though the verdict was genuinely produced
+// against turn A's own commit. The fix resolves the turn by the SAME
+// dispatch message id turn A's own prompt carried
+// (turns.GetByDispatchedMessageID), regardless of turn A's own CURRENT
+// status -- so this verdict is correctly attributed to turn A, never to
+// the newer, unrelated turn B.
+func TestPostReviewVerdict_TimedOutTurnStillPostsAgainstOwnContext_NotTheNewerTurn(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	repoFullName := "acme/verdict-timedout-turn-a"
+	session := setupReviewSessionWithSandbox(ctx, t, rig, repoFullName, 90)
+
+	sameGen := int32(1)
+	const turnAMessageID = "turn-a-own-dispatch-message-id"
+	const turnBMessageID = "turn-b-own-dispatch-message-id"
+
+	turnAHeadSHA := "sha-turn-a-examined-this-commit"
+	turnAContext, err := json.Marshal(reviewverdict.Context{BaseRef: "main", BaseSHA: "base-sha-turn-a", PolicyVersion: 1})
+	if err != nil {
+		t.Fatalf("marshal turn A context: %v", err)
+	}
+
+	// Turn A: dispatched, given its own real review context, then
+	// TIMES OUT (marked 'failed') -- exactly like turn.DeriveFailureReason
+	// forwards TriggerTimeout in production -- while its own agent is
+	// still alive and has not yet posted.
+	turnA, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{
+		SessionID:            session.ID,
+		Status:               sqlcgen.TurnStatusProcessing,
+		ReviewHeadSha:        &turnAHeadSHA,
+		ReviewVerdictContext: turnAContext,
+	})
+	if err != nil {
+		t.Fatalf("create turn A: %v", err)
+	}
+	turnAMsgID := turnAMessageID
+	if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+		ID:                   turnA.ID,
+		Status:               sqlcgen.TurnStatusProcessing,
+		DispatchedSandboxGen: &sameGen,
+		DispatchedMessageID:  &turnAMsgID,
+	}); err != nil {
+		t.Fatalf("stamp turn A dispatch columns: %v", err)
+	}
+	if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+		ID:          turnA.ID,
+		Status:      sqlcgen.TurnStatusFailed,
+		CompletedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+	}); err != nil {
+		t.Fatalf("mark turn A failed (timeout): %v", err)
+	}
+
+	// Turn B: a queued retrigger, dispatched to the SAME sandbox
+	// incarnation (no respawn -- same gen), carrying a COMPLETELY
+	// DIFFERENT head sha/context. This is now the session's own
+	// 'processing' turn.
+	turnBHeadSHA := "sha-turn-b-a-newer-unrelated-commit"
+	turnBContext, err := json.Marshal(reviewverdict.Context{BaseRef: "release/2026.09", BaseSHA: "base-sha-turn-b", PolicyVersion: 1})
+	if err != nil {
+		t.Fatalf("marshal turn B context: %v", err)
+	}
+	turnB, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{
+		SessionID:            session.ID,
+		Status:               sqlcgen.TurnStatusProcessing,
+		ReviewHeadSha:        &turnBHeadSHA,
+		ReviewVerdictContext: turnBContext,
+	})
+	if err != nil {
+		t.Fatalf("create turn B: %v", err)
+	}
+	turnBMsgID := turnBMessageID
+	if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+		ID:                   turnB.ID,
+		Status:               sqlcgen.TurnStatusProcessing,
+		DispatchedSandboxGen: &sameGen,
+		DispatchedMessageID:  &turnBMsgID,
+	}); err != nil {
+		t.Fatalf("stamp turn B dispatch columns: %v", err)
+	}
+
+	// Turn A's own agent, unaware it has already been marked failed,
+	// finally posts -- presenting turn A's OWN dispatch message id, never
+	// turn B's.
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", turnAMessageID, validVerdictRequestJSON())
+	if status != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
+	}
+
+	var gotHeadSHA, gotBaseRef, gotBaseSHA string
+	if err := rig.pool.QueryRow(ctx,
+		`SELECT head_sha, base_ref, base_sha FROM review_verdicts WHERE repo_full_name = $1 AND pr_number = $2`,
+		repoFullName, 90,
+	).Scan(&gotHeadSHA, &gotBaseRef, &gotBaseSHA); err != nil {
+		t.Fatalf("query review_verdicts row: %v", err)
+	}
+
+	// THE DECISIVE F3 ASSERTION: the persisted verdict must carry turn
+	// A's own context -- the turn that actually produced it -- never turn
+	// B's, even though turn B is the session's own CURRENTLY-PROCESSING
+	// turn at the moment this request lands.
+	if gotHeadSHA != turnAHeadSHA {
+		t.Errorf("head_sha = %q, want %q (turn A's own examined commit -- got turn B's context instead, the exact F3 misattribution)", gotHeadSHA, turnAHeadSHA)
+	}
+	if gotBaseRef != "main" {
+		t.Errorf("base_ref = %q, want %q (turn A's own recorded base ref)", gotBaseRef, "main")
+	}
+	if gotBaseSHA != "base-sha-turn-a" {
+		t.Errorf("base_sha = %q, want %q (turn A's own recorded base sha)", gotBaseSHA, "base-sha-turn-a")
+	}
+}
+
+// TestPostReviewVerdict_CorruptedReviewVerdictContext_LogsLoudErrorNeverSilentlyReadsAsUntracked
+// is §21.1's amendment's own findings F4/F6 regression test for the "a silently-
+// failing unmarshal must be a loud error, not a NULL" requirement: a turn
+// whose own turns.review_verdict_context WAS recorded (len > 0) but is not
+// valid JSON (a genuine bug -- a corrupted column, a schema drift between
+// writer and reader -- never the legitimate "context tracking predates
+// this row" case, which is an EMPTY/NULL column instead) must log at
+// Error, not Warn, and with wording that does not read as the ordinary,
+// expected backfill case -- an operator/alerting pipeline watching for
+// Error-level lines must be able to tell "review context tracking is
+// broken for this repo" apart from "an old verdict, nothing to fix".
+func TestPostReviewVerdict_CorruptedReviewVerdictContext_LogsLoudErrorNeverSilentlyReadsAsUntracked(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	repoFullName := "acme/verdict-corrupted-context"
+	session := setupReviewSessionWithSandbox(ctx, t, rig, repoFullName, 92)
+
+	reviewHeadSHA := "sha-corrupted-context"
+	// Syntactically VALID JSON (Postgres' own JSONB column type validates
+	// syntax at INSERT time, so genuinely malformed JSON like "{not valid"
+	// can never even reach this far) but the WRONG shape for
+	// reviewverdict.Context (a JSON array, not an object) -- exactly the
+	// class of corruption Postgres itself cannot catch but Go's own
+	// json.Unmarshal into a typed struct does.
+	createdTurn, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{
+		SessionID:            session.ID,
+		Status:               sqlcgen.TurnStatusProcessing,
+		ReviewHeadSha:        &reviewHeadSHA,
+		ReviewVerdictContext: []byte("[1,2,3]"),
+	})
+	if err != nil {
+		t.Fatalf("seed processing turn with corrupted review_verdict_context: %v", err)
+	}
+	turnMessageID := testDispatchMessageID
+	if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: createdTurn.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedMessageID: &turnMessageID}); err != nil {
+		t.Fatalf("stamp dispatched_message_id on seeded turn: %v", err)
+	}
+
+	buf := captureDefaultLoggerJSON(t)
+
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, validVerdictRequestJSON())
+	if status != http.StatusCreated {
+		t.Fatalf("status = %d, want %d (a corrupted context must never fail the verdict post itself)", status, http.StatusCreated)
+	}
+
+	entry := findLogEntry(t, buf, "httpapi: review-verdict: unmarshal review_verdict_context failed -- a context WAS recorded but could not be decoded (a bug, never the legitimate 'predates tracking' case); this verdict will read as ReasonContextUnknown and lose auto-approval/auto-merge eligibility exactly like a genuinely untracked verdict, which is misleading -- investigate this repo/PR directly")
+	if level, _ := entry["level"].(string); level != "ERROR" {
+		t.Errorf("log level = %q, want %q (a silently-failing unmarshal must be a LOUD error, not a Warn indistinguishable from the ordinary degraded-but-expected cases elsewhere in this handler)", level, "ERROR")
+	}
+
+	// The verdict itself must still degrade safely (never fabricate a base
+	// ref) -- confirming this fix is about the LOG's own loudness, never
+	// about changing the fail-safe outcome ComputeEligible already
+	// enforces for an unknown context.
+	var gotBaseRef *string
+	if err := rig.pool.QueryRow(ctx, `SELECT base_ref FROM review_verdicts WHERE repo_full_name = $1 AND pr_number = $2`, repoFullName, 92).Scan(&gotBaseRef); err != nil {
+		t.Fatalf("query review_verdicts row: %v", err)
+	}
+	if gotBaseRef != nil {
+		t.Errorf("base_ref = %v, want NULL (a corrupted context must degrade to no recorded context, never a fabricated one)", *gotBaseRef)
 	}
 }

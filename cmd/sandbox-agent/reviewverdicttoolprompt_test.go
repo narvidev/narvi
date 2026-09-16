@@ -29,15 +29,17 @@ func TestRenderVerdictToolPromptText(t *testing.T) {
 	reviewPromptText := "please review this PR.\n\n" +
 		"POST " + review.VerdictToolURLPlaceholder + "\n" +
 		"Authorization: Bearer " + review.VerdictToolBearerPlaceholder + "\n" +
-		"X-Sandbox-Gen: " + review.VerdictToolGenPlaceholder + "\n"
+		"X-Sandbox-Gen: " + review.VerdictToolGenPlaceholder + "\n" +
+		"X-Sandbox-Dispatch-Message-Id: " + review.VerdictToolDispatchMessageIDPlaceholder + "\n"
 
 	tests := []struct {
-		name            string
-		text            string
-		cfg             *sessionconfig.SessionConfig
-		wantExact       string // when non-empty, exact expected output
-		wantContains    []string
-		wantNotContains []string
+		name              string
+		text              string
+		cfg               *sessionconfig.SessionConfig
+		dispatchMessageID string
+		wantExact         string // when non-empty, exact expected output
+		wantContains      []string
+		wantNotContains   []string
 	}{
 		{
 			name:      "no placeholders present: byte-for-byte no-op regardless of cfg",
@@ -52,7 +54,7 @@ func TestRenderVerdictToolPromptText(t *testing.T) {
 			wantExact: reviewPromptText,
 		},
 		{
-			name: "review turn, production wss:// control plane: all three placeholders resolved",
+			name: "review turn, production wss:// control plane: all four placeholders resolved",
 			text: reviewPromptText,
 			cfg: &sessionconfig.SessionConfig{
 				ControlPlaneWsUrl: "wss://cp.example.com/sessions/session-123/ws?type=sandbox",
@@ -60,13 +62,15 @@ func TestRenderVerdictToolPromptText(t *testing.T) {
 				SandboxToken:      "s3cr3t-token",
 				Gen:               7,
 			},
+			dispatchMessageID: "msg-abc-123",
 			wantContains: []string{
 				"POST https://cp.example.com/sessions/session-123/review/verdict",
 				"Authorization: Bearer s3cr3t-token",
 				"X-Sandbox-Gen: 7",
+				"X-Sandbox-Dispatch-Message-Id: msg-abc-123",
 			},
 			wantNotContains: []string{
-				review.VerdictToolURLPlaceholder, review.VerdictToolBearerPlaceholder, review.VerdictToolGenPlaceholder,
+				review.VerdictToolURLPlaceholder, review.VerdictToolBearerPlaceholder, review.VerdictToolGenPlaceholder, review.VerdictToolDispatchMessageIDPlaceholder,
 			},
 		},
 		{
@@ -78,10 +82,12 @@ func TestRenderVerdictToolPromptText(t *testing.T) {
 				SandboxToken:      "dev-token",
 				Gen:               1,
 			},
+			dispatchMessageID: "msg-dev-9",
 			wantContains: []string{
 				"POST http://127.0.0.1:8080/sessions/session-9/review/verdict",
 				"Authorization: Bearer dev-token",
 				"X-Sandbox-Gen: 1",
+				"X-Sandbox-Dispatch-Message-Id: msg-dev-9",
 			},
 		},
 		{
@@ -93,7 +99,8 @@ func TestRenderVerdictToolPromptText(t *testing.T) {
 				SandboxToken:      "should-never-appear",
 				Gen:               2,
 			},
-			wantExact: reviewPromptText,
+			dispatchMessageID: "msg-refused-5",
+			wantExact:         reviewPromptText,
 		},
 		{
 			name: "review turn, malformed control plane url: refused, placeholders left unresolved",
@@ -104,14 +111,15 @@ func TestRenderVerdictToolPromptText(t *testing.T) {
 				SandboxToken:      "should-never-appear",
 				Gen:               1,
 			},
-			wantExact: reviewPromptText,
+			dispatchMessageID: "msg-malformed-1",
+			wantExact:         reviewPromptText,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := renderVerdictToolPromptText(tc.text, tc.cfg)
+			got := renderVerdictToolPromptText(tc.text, tc.cfg, tc.dispatchMessageID)
 
 			if tc.wantExact != "" && got != tc.wantExact {
 				t.Fatalf("renderVerdictToolPromptText() = %q, want exactly %q", got, tc.wantExact)
@@ -145,7 +153,7 @@ func TestRenderVerdictToolPromptText_NeverLeaksTokenWhenNothingToSubstitute(t *t
 		SessionId:         "abc",
 		SandboxToken:      liveToken,
 		Gen:               1,
-	})
+	}, "msg-irrelevant")
 
 	if strings.Contains(got, liveToken) {
 		t.Errorf("renderVerdictToolPromptText() = %q, want it to NEVER contain the live sandbox token for a prompt with no placeholders", got)
@@ -458,7 +466,7 @@ func TestRenderUploadToolPromptText_HostileFilenameCannotExfiltrateSecrets(t *te
 
 			// The REAL production substitution sequence, in the REAL
 			// order main.go's own HandlePrompt runs it.
-			got := renderVerdictToolPromptText(promptText, cfg)
+			got := renderVerdictToolPromptText(promptText, cfg, "msg-hostile-test")
 			got = renderUploadToolPromptText(got, cfg)
 
 			// The legitimate substitution must still have happened
@@ -516,7 +524,7 @@ func TestRenderUploadAndVerdictPlaceholders_Independent(t *testing.T) {
 		Gen:               1,
 	}
 
-	got := renderVerdictToolPromptText(text, cfg)
+	got := renderVerdictToolPromptText(text, cfg, "msg-independent-1")
 	got = renderUploadToolPromptText(got, cfg)
 
 	if strings.Contains(got, review.VerdictToolURLPlaceholder) || strings.Contains(got, domainupload.BaseURLPlaceholder) {

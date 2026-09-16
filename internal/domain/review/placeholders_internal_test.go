@@ -68,8 +68,9 @@ func TestPlaceholderTokensMatchTurnPackage(t *testing.T) {
 // it never imports the upload PACKAGE.
 
 // TestPlaceholderTokensExactCount pins placeholderTokens' own total size --
-// this package's own seven (VerdictToolURLPlaceholder/BearerPlaceholder/
-// GenPlaceholder, ReviewCostBudgetToolURLPlaceholder, plus §15.3/§12.2
+// this package's own eight (VerdictToolURLPlaceholder/BearerPlaceholder/
+// GenPlaceholder/DispatchMessageIDPlaceholder (finding F3 (§21.1's amendment)),
+// ReviewCostBudgetToolURLPlaceholder, plus §15.3/§12.2
 // item 9's own CompositionFindingsToolURLPlaceholder/BearerPlaceholder/
 // GenPlaceholder, compositionreview.go), plus turn's own three, plus
 // upload's own three, no more no less. A future family that grows this
@@ -80,13 +81,14 @@ func TestPlaceholderTokensMatchTurnPackage(t *testing.T) {
 func TestPlaceholderTokensExactCount(t *testing.T) {
 	t.Parallel()
 
-	// This package's own seven, for completeness -- trivially true by
+	// This package's own eight, for completeness -- trivially true by
 	// construction today, but guards against a future refactor of
 	// placeholderTokens' own literal accidentally dropping one.
 	for _, tok := range []string{
 		VerdictToolURLPlaceholder,
 		VerdictToolBearerPlaceholder,
 		VerdictToolGenPlaceholder,
+		VerdictToolDispatchMessageIDPlaceholder,
 		ReviewCostBudgetToolURLPlaceholder,
 		CompositionFindingsToolURLPlaceholder,
 		CompositionFindingsToolBearerPlaceholder,
@@ -97,8 +99,8 @@ func TestPlaceholderTokensExactCount(t *testing.T) {
 		}
 	}
 
-	if len(placeholderTokens) != 13 {
-		t.Errorf("len(placeholderTokens) = %d, want exactly 13 (this package's own 7, plus turn's own 3, plus upload's own 3, no more no less)", len(placeholderTokens))
+	if len(placeholderTokens) != 14 {
+		t.Errorf("len(placeholderTokens) = %d, want exactly 14 (this package's own 8, plus turn's own 3, plus upload's own 3, no more no less)", len(placeholderTokens))
 	}
 }
 

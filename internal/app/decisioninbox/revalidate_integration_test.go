@@ -515,6 +515,49 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		}
 	})
 
+	// (finding F1): THE DECISIVE CASE this finding is named
+	// for -- base ref unchanged, PR head unchanged, and even GitHub's own
+	// `pull_request.base.sha` field (ports.OpenPR.BaseSHA, what this
+	// fixture's own BaseSHA models) unchanged -- yet the base BRANCH's
+	// REAL, live tip has advanced. Verified against real GitHub PRs
+	// (golang/go PR #27813, ten open kubernetes/kubernetes PRs): that
+	// field is a per-PR cached snapshot GitHub refreshes on its own
+	// schedule, not on every push to the base branch, so it can -- and in
+	// practice does -- stay frozen for months while the branch moves on.
+	// Comparing it against itself detects NOTHING.
+	//
+	// This test fails against the PRE-FIX code: revalidateCore used to
+	// read target.BaseSHA (this fixture's own frozen BaseSHA field)
+	// directly as CurrentBaseSHA, which trivially equals the verdict's
+	// own recorded BaseSHA (both testEligibleBaseSHA) -- eligible=true,
+	// the bug. The fix instead resolves CurrentBaseSHA via a fresh
+	// sourceControl.ResolveBranchSHA call, modeled here by the fake's own
+	// resolveBranchSHA override reporting a DIFFERENT commit -- proving
+	// the base branch's own live tip, not GitHub's cached field, is what
+	// this gate actually compares now.
+	t.Run("BaseBranchAdvanced_LiveTipMovedWhileGitHubsCachedBaseSHAFieldDidNot_Refused", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-base-branch-advanced"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 33)
+		// pr.BaseRef/pr.BaseSHA (GitHub's own possibly-stale
+		// pull_request.base.sha snapshot) are BOTH left exactly as
+		// eligiblePR seeded them (testEligibleBaseRef/testEligibleBaseSHA,
+		// the SAME values review_verdicts' own recorded context carries)
+		// -- neither the ref nor GitHub's cached field moved at all.
+		rs.sourceControl.resolveBranchSHA = "sha-main-has-actually-advanced"
+		defer func() { rs.sourceControl.resolveBranchSHA = "" }()
+
+		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+		}
+		if ok {
+			t.Fatal("RevalidateForMerge() ok = true, want false -- THE DECISIVE F1 HAZARD: base ref, head sha, AND GitHub's own cached base.sha field are all unchanged, but the base branch's REAL live tip advanced -- the stale verdict must not read as fresh")
+		}
+		if reason == "" {
+			t.Error("reason is empty, want a human-readable explanation")
+		}
+	})
+
 	// RevalidateForMerge's own
 	// truncated->500 branch was never executed by any existing test --
 	// when the target PR is not found in a TRUNCATED (partial/degraded)

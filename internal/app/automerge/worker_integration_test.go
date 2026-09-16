@@ -53,6 +53,21 @@ type fakeAutoMergeSourceControl struct {
 	getErr        error
 	getOpenPRHits int
 
+	// resolveBranchSHA/resolveBranchSHAErr (finding F1 (§21.1's amendment)) back
+	// ResolveBranchSHA below -- revalidateCore (shared by
+	// RevalidateForAutoMerge, this package's own real caller) now
+	// resolves the base branch's LIVE tip independently, rather than
+	// trusting ports.OpenPR.BaseSHA (GitHub's own possibly-stale
+	// `pull_request.base.sha` snapshot). Both zero (every EXISTING test
+	// in this file, none of which sets them) falls back to scanning
+	// prsByKey for one seeded PR reporting spec.Branch as its own
+	// BaseRef, returning THAT PR's own BaseSHA -- so every fixture here,
+	// which already seeds BaseRef/BaseSHA consistently (testEligibleBaseRef/
+	// testEligibleBaseSHA), gets a live resolution "for free" with no
+	// per-test literal changes needed.
+	resolveBranchSHA    string
+	resolveBranchSHAErr error
+
 	mergeCalls     []ports.MergePRSpec
 	mergeSHA       string
 	mergeErr       error
@@ -227,8 +242,21 @@ func itoa(n int) string {
 func (f *fakeAutoMergeSourceControl) CreatePR(context.Context, ports.CreatePRSpec) (ports.PRRef, error) {
 	return ports.PRRef{}, errors.New("not implemented")
 }
-func (f *fakeAutoMergeSourceControl) ResolveBranchSHA(context.Context, ports.ResolveBranchSHASpec) (string, string, error) {
-	return "", "", errors.New("not implemented")
+func (f *fakeAutoMergeSourceControl) ResolveBranchSHA(_ context.Context, spec ports.ResolveBranchSHASpec) (string, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.resolveBranchSHAErr != nil {
+		return "", "", f.resolveBranchSHAErr
+	}
+	if f.resolveBranchSHA != "" {
+		return f.resolveBranchSHA, spec.Branch, nil
+	}
+	for _, pr := range f.prsByKey {
+		if pr.BaseRef == spec.Branch {
+			return pr.BaseSHA, spec.Branch, nil
+		}
+	}
+	return "", "", fmt.Errorf("fakeAutoMergeSourceControl: ResolveBranchSHA: no seeded PR reports base ref %q", spec.Branch)
 }
 func (f *fakeAutoMergeSourceControl) ResolveContractsFingerprint(context.Context, ports.ResolveContractsFingerprintSpec) (string, bool, error) {
 	return "", false, errors.New("not implemented")

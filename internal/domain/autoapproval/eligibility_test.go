@@ -179,6 +179,44 @@ func TestComputeEligible(t *testing.T) {
 			wantEligible: false,
 			wantReason:   autoapproval.ReasonContextUnknown,
 		},
+		// --- finding F2: an empty base SHA on either side must fail
+		// closed on its OWN reason, never silently compare equal to an
+		// equally-empty other side. VerdictBaseRef is left non-empty in
+		// every case below (cleanInput's own baseline) so
+		// ReasonContextUnknown's own, earlier, unrelated check cannot be
+		// what actually fires -- isolating this criterion exactly like
+		// "both head shas empty" isolates its own analogous check above. ---
+		{
+			// THE DECISIVE F2 CASE: both sides genuinely empty must never
+			// read as a trivially-matching pair -- mutation-test target:
+			// deleting the `in.VerdictBaseSHA == "" || in.CurrentBaseSHA
+			// == ""` guard in eligibility.go turns this case's own
+			// outcome from refused back into eligible (VerdictBaseSHA ==
+			// CurrentBaseSHA == "" would then satisfy the equality check
+			// immediately below it).
+			name: "both base shas empty is refused on its own reason, never read as a trivially-matching pair",
+			in: func() autoapproval.EligibilityInput {
+				in := withVerdictBaseSHA(cleanInput(), "")
+				return withCurrentBaseSHA(in, "")
+			}(),
+			cfg:          cfg,
+			wantEligible: false,
+			wantReason:   autoapproval.ReasonBaseSHAUnknown,
+		},
+		{
+			name:         "an empty verdict base sha alone (a decoder/resolution regression) is refused, distinct from a real base-moved mismatch",
+			in:           withVerdictBaseSHA(cleanInput(), ""),
+			cfg:          cfg,
+			wantEligible: false,
+			wantReason:   autoapproval.ReasonBaseSHAUnknown,
+		},
+		{
+			name:         "an empty current base sha alone (a failed live resolution) is refused, never silently treated as a confirmed match",
+			in:           withCurrentBaseSHA(cleanInput(), ""),
+			cfg:          cfg,
+			wantEligible: false,
+			wantReason:   autoapproval.ReasonBaseSHAUnknown,
+		},
 		{
 			name:         "an ancestor chain that no longer matches the PR's current stacked ancestry loses eligibility",
 			in:           withCurrentAncestorChain(cleanInput(), []review.AncestorLink{{Ref: "main", SHA: "sha-main-new"}}),
@@ -557,6 +595,10 @@ func withCurrentBaseRef(in autoapproval.EligibilityInput, ref string) autoapprov
 }
 func withCurrentBaseSHA(in autoapproval.EligibilityInput, sha string) autoapproval.EligibilityInput {
 	in.CurrentBaseSHA = sha
+	return in
+}
+func withVerdictBaseSHA(in autoapproval.EligibilityInput, sha string) autoapproval.EligibilityInput {
+	in.VerdictBaseSHA = sha
 	return in
 }
 func withVerdictAncestorChain(in autoapproval.EligibilityInput, chain []review.AncestorLink) autoapproval.EligibilityInput {

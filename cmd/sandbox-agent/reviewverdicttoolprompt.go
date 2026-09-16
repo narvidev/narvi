@@ -61,15 +61,26 @@ import (
 )
 
 // renderVerdictToolPromptText substitutes review.VerdictToolURLPlaceholder/
-// VerdictToolBearerPlaceholder/VerdictToolGenPlaceholder in text with this
-// sandbox's OWN, live, current-gen values, derived from cfg -- see this
-// file's own top doc comment for the full rationale. cfg == nil (should be
-// unreachable -- commandHandler.HandlePrompt only ever calls this when
+// VerdictToolBearerPlaceholder/VerdictToolGenPlaceholder/
+// VerdictToolDispatchMessageIDPlaceholder in text with this sandbox's OWN,
+// live, current-gen values, derived from cfg -- see this file's own top
+// doc comment for the full rationale. cfg == nil (should be unreachable --
+// commandHandler.HandlePrompt only ever calls this when
 // h.cfg.SessionConfig is already known non-nil, see run()'s own
 // "commandHandler only ever constructed within that same cfg.SessionConfig
 // != nil branch" precedent) returns text unchanged, matching this
 // package's existing "no live session, nothing to do" discipline
 // elsewhere (e.g. HandlePrompt/HandleStop's own h.adapter == nil guards).
+//
+// dispatchMessageID (finding F3 (§21.1's amendment)) is DIFFERENT in kind from
+// cfg's own three fields: it is not fixed at sandbox BOOT time (cfg is),
+// it is the WIRE Prompt's own MessageId for THIS SPECIFIC "prompt"
+// command -- the caller (HandlePrompt) already has it in scope as
+// cmd.MessageId, and passes it straight through. This is the one
+// identifier httpapi.PostReviewVerdict later resolves the posting turn
+// BY, instead of "whichever turn is processing for this session right
+// now" -- see review.VerdictToolDispatchMessageIDPlaceholder's own doc
+// comment for the hazard this closes.
 //
 // A malformed cfg.ControlPlaneWsUrl (reviewVerdictToolURL's own error
 // path) is logged and otherwise treated as "nothing to substitute" --
@@ -78,13 +89,14 @@ import (
 // turn-fatal: a review agent that cannot resolve the placeholders simply
 // cannot call the tool this turn, exactly as if this substitution had
 // never run at all (it never has, before this Step).
-func renderVerdictToolPromptText(text string, cfg *sessionconfig.SessionConfig) string {
+func renderVerdictToolPromptText(text string, cfg *sessionconfig.SessionConfig, dispatchMessageID string) string {
 	if cfg == nil {
 		return text
 	}
 	if !strings.Contains(text, review.VerdictToolURLPlaceholder) &&
 		!strings.Contains(text, review.VerdictToolBearerPlaceholder) &&
-		!strings.Contains(text, review.VerdictToolGenPlaceholder) {
+		!strings.Contains(text, review.VerdictToolGenPlaceholder) &&
+		!strings.Contains(text, review.VerdictToolDispatchMessageIDPlaceholder) {
 		// The overwhelming common case (every non-review turn): nothing to
 		// substitute, skip deriving a URL at all.
 		return text
@@ -99,6 +111,7 @@ func renderVerdictToolPromptText(text string, cfg *sessionconfig.SessionConfig) 
 	text = strings.ReplaceAll(text, review.VerdictToolURLPlaceholder, verdictURL)
 	text = strings.ReplaceAll(text, review.VerdictToolBearerPlaceholder, cfg.SandboxToken)
 	text = strings.ReplaceAll(text, review.VerdictToolGenPlaceholder, strconv.Itoa(cfg.Gen))
+	text = strings.ReplaceAll(text, review.VerdictToolDispatchMessageIDPlaceholder, dispatchMessageID)
 	return text
 }
 

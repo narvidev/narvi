@@ -132,6 +132,19 @@ type fakeMergeSourceControl struct {
 	// drive a genuine partial-fetch read through the real SCMCache/Build
 	// pipeline, never a hand-built response.
 	truncated bool
+
+	// resolveBranchSHA/resolveBranchSHAErr (finding F1, §21.1's amendment)
+	// back ResolveBranchSHA below -- revalidateCore now resolves the base
+	// branch's LIVE tip independently, rather than trusting
+	// ports.OpenPR.BaseSHA (GitHub's own possibly-stale
+	// `pull_request.base.sha` snapshot). Both zero (every EXISTING test
+	// in this file) falls back to scanning f.openPRs for one reporting
+	// spec.Branch as its own BaseRef, returning THAT PR's own BaseSHA --
+	// so every existing fixture here, which already sets BaseRef/BaseSHA
+	// consistently, gets a live resolution "for free" with no per-test
+	// literal changes needed.
+	resolveBranchSHA    string
+	resolveBranchSHAErr error
 }
 
 var _ ports.SourceControl = (*fakeMergeSourceControl)(nil)
@@ -153,8 +166,19 @@ func (f *fakeMergeSourceControl) MergePR(_ context.Context, spec ports.MergePRSp
 func (f *fakeMergeSourceControl) CreatePR(context.Context, ports.CreatePRSpec) (ports.PRRef, error) {
 	return ports.PRRef{}, errors.New("not implemented")
 }
-func (f *fakeMergeSourceControl) ResolveBranchSHA(context.Context, ports.ResolveBranchSHASpec) (string, string, error) {
-	return "", "", errors.New("not implemented")
+func (f *fakeMergeSourceControl) ResolveBranchSHA(_ context.Context, spec ports.ResolveBranchSHASpec) (string, string, error) {
+	if f.resolveBranchSHAErr != nil {
+		return "", "", f.resolveBranchSHAErr
+	}
+	if f.resolveBranchSHA != "" {
+		return f.resolveBranchSHA, spec.Branch, nil
+	}
+	for _, pr := range f.openPRs {
+		if pr.BaseRef == spec.Branch {
+			return pr.BaseSHA, spec.Branch, nil
+		}
+	}
+	return "", "", fmt.Errorf("fakeMergeSourceControl: ResolveBranchSHA: no seeded PR reports base ref %q", spec.Branch)
 }
 func (f *fakeMergeSourceControl) ResolveContractsFingerprint(context.Context, ports.ResolveContractsFingerprintSpec) (string, bool, error) {
 	return "", false, errors.New("not implemented")

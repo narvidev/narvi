@@ -2,6 +2,7 @@ package releasereview
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -9,6 +10,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
 	"github.com/narvidev/narvi/internal/domain/review"
+	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 )
 
 // This file (compositiondispatch.go) closes a named gap:
@@ -105,12 +107,40 @@ func dispatchCompositionReview(ctx context.Context, logger *slog.Logger, deps De
 
 	prompt := review.RenderCompositionReviewPrompt(template, reviewCtx)
 
+	// reviewVerdictContextJSON (finding F7 (§21.1's amendment)) mirrors
+	// reviewCtx.HeadSHA's own identical "already resolved by the SAME
+	// reviewcontext.Fetch call above, just marshaled and persisted here"
+	// shape -- see internal/app/sessionactor/reviewretrigger.go's own
+	// insertAutoRetriggerTurn call site (and internal/adapters/inbound/
+	// github/handler.go before it) for the identical pattern this mirrors.
+	// Before this fix, this turn carried review_head_sha but no
+	// review_verdict_context at all: a verdict posted while THIS turn is
+	// processing would get a real head sha and a NULL base/ancestor/
+	// policy context, so autoapproval.ComputeEligible answers
+	// ReasonContextUnknown for it forever -- this composition-review PR
+	// could never be auto-approved/auto-merged, no matter how clean its
+	// own verdict looked, and the operator-facing reason would misleadingly
+	// read "this verdict predates review-context tracking" for a turn
+	// created moments ago.
+	reviewVerdictContextJSON, verdictContextErr := json.Marshal(reviewverdict.Context{
+		BaseRef:       reviewCtx.BaseRef,
+		BaseSHA:       reviewCtx.BaseSHA,
+		AncestorChain: reviewCtx.AncestorChain,
+		PolicyVersion: reviewCtx.PolicyVersion,
+	})
+	if verdictContextErr != nil {
+		logger.Warn("releasereview: marshal review verdict context failed, composition review turn will carry review_head_sha but no review_verdict_context",
+			"error", verdictContextErr, "owner", in.Owner, "repo", in.Repo, "pr_number", in.PRNumber)
+		reviewVerdictContextJSON = nil
+	}
+
 	created, err := deps.CompositionTurns.Create(ctx, sqlcgen.CreateTurnParams{
-		SessionID:     in.SessionID,
-		Status:        sqlcgen.TurnStatusPending,
-		Prompt:        &prompt,
-		ReviewHeadSha: &reviewCtx.HeadSHA,
-		CorrelationID: in.CorrelationID,
+		SessionID:            in.SessionID,
+		Status:               sqlcgen.TurnStatusPending,
+		Prompt:               &prompt,
+		ReviewHeadSha:        &reviewCtx.HeadSHA,
+		ReviewVerdictContext: reviewVerdictContextJSON,
+		CorrelationID:        in.CorrelationID,
 	})
 	if err != nil {
 		logger.Error("releasereview: insert composition review turn failed",

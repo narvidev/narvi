@@ -341,10 +341,30 @@ const (
 // substitution, so no wire-contract change (a new sandboxws.Prompt field,
 // §6.1) is needed to tell sandbox-agent "this is a review turn": the
 // placeholders' own presence already is that signal.
+//
+// VerdictToolDispatchMessageIDPlaceholder (finding F3 (§21.1's amendment)) is a
+// FOURTH placeholder, one level more precise than Gen: Gen identifies
+// which SANDBOX INCARNATION a turn was dispatched to, but multiple turns
+// can share one incarnation (no respawn in between) -- exactly the gap
+// that let a verdict posted by a timed-out turn's own still-alive agent
+// be silently attributed to whatever OTHER turn happened to be
+// 'processing' when it finally posted (§21.1's own head_sha paragraph
+// names the identical class of hazard one level down: "a verdict can be
+// recorded against a commit it never read"). This placeholder is
+// substituted from the WIRE Prompt's own MessageId -- NOT from
+// cfg.SessionConfig like the three above (that value is fixed at sandbox
+// BOOT time; MessageId is fresh PER DISPATCH) -- at the SAME
+// substitution site, but sourced from the specific "prompt" command
+// currently being handled (cmd/sandbox-agent's HandlePrompt already has
+// it in scope as cmd.MessageId). httpapi.PostReviewVerdict reads it back
+// off a request header and resolves the posting turn by an EXACT match
+// on turns.dispatched_message_id (migrations/000131), never by session-
+// wide "current" status.
 const (
-	VerdictToolURLPlaceholder    = "{{REVIEW_VERDICT_TOOL_URL}}"
-	VerdictToolBearerPlaceholder = "{{REVIEW_VERDICT_TOOL_BEARER}}"
-	VerdictToolGenPlaceholder    = "{{REVIEW_VERDICT_TOOL_GEN}}"
+	VerdictToolURLPlaceholder               = "{{REVIEW_VERDICT_TOOL_URL}}"
+	VerdictToolBearerPlaceholder            = "{{REVIEW_VERDICT_TOOL_BEARER}}"
+	VerdictToolGenPlaceholder               = "{{REVIEW_VERDICT_TOOL_GEN}}"
+	VerdictToolDispatchMessageIDPlaceholder = "{{REVIEW_VERDICT_TOOL_DISPATCH_MESSAGE_ID}}"
 )
 
 // ReviewCostBudgetToolURLPlaceholder (§26.7/§26.9) is the fixed
@@ -576,6 +596,7 @@ func verdictToolInstructions(deep bool, costBudgetUSD float64, costBudgetSafetyM
 		"POST " + VerdictToolURLPlaceholder + "\n" +
 		"Authorization: Bearer " + VerdictToolBearerPlaceholder + "\n" +
 		"X-Sandbox-Gen: " + VerdictToolGenPlaceholder + "\n" +
+		"X-Sandbox-Dispatch-Message-Id: " + VerdictToolDispatchMessageIDPlaceholder + "\n" +
 		"Content-Type: application/json\n\n" +
 		"JSON body (every field below the top level is required except \"findings\" and \"counterReview\", which are optional -- see \"counterReview\"'s own entry below for exactly when to include it; within \"digest\", \"summary\"/\"descriptionAdequacy\"/\"adequacyExplanation\" are required -- " + digestRequiredFieldsClause + "):\n" +
 		"{\n" +

@@ -56,7 +56,7 @@ func TestBuildPromptPayload(t *testing.T) {
 		sessionRow := sqlcgen.Session{OpencodeConversationID: nil}
 		turn := sqlcgen.Turn{ID: turnID, Prompt: &prompt, ModelID: &model, Effort: &effort, PlanMode: true}
 
-		raw, err := BuildPromptPayload("session-1", sessionRow, sandboxRow, turn)
+		raw, err := BuildPromptPayload("session-1", sessionRow, sandboxRow, turn, "msg-1")
 		if err != nil {
 			t.Fatalf("BuildPromptPayload() error = %v, want nil", err)
 		}
@@ -96,8 +96,12 @@ func TestBuildPromptPayload(t *testing.T) {
 		if got.Effort == nil || *got.Effort != effort {
 			t.Errorf("Effort = %v, want %q", got.Effort, effort)
 		}
-		if got.MessageId == "" {
-			t.Error("MessageId is empty, want a freshly minted uuid")
+		// MessageId (finding F3 (§21.1's amendment)) is now a caller-supplied
+		// parameter, never generated inside BuildPromptPayload itself --
+		// asserting the EXACT value proves it is threaded through
+		// verbatim, never silently regenerated or dropped.
+		if got.MessageId != "msg-1" {
+			t.Errorf("MessageId = %q, want %q (the caller-supplied value, threaded through verbatim)", got.MessageId, "msg-1")
 		}
 	})
 
@@ -108,7 +112,7 @@ func TestBuildPromptPayload(t *testing.T) {
 		sessionRow := sqlcgen.Session{OpencodeConversationID: &conversationID}
 		turn := sqlcgen.Turn{ID: turnID, Prompt: &prompt}
 
-		raw, err := BuildPromptPayload("session-2", sessionRow, sandboxRow, turn)
+		raw, err := BuildPromptPayload("session-2", sessionRow, sandboxRow, turn, "msg-2")
 		if err != nil {
 			t.Fatalf("BuildPromptPayload() error = %v, want nil", err)
 		}
@@ -128,7 +132,7 @@ func TestBuildPromptPayload(t *testing.T) {
 		sessionRow := sqlcgen.Session{}
 		turn := sqlcgen.Turn{ID: turnID}
 
-		raw, err := BuildPromptPayload("session-3", sessionRow, sandboxRow, turn)
+		raw, err := BuildPromptPayload("session-3", sessionRow, sandboxRow, turn, "msg-3")
 		if err != nil {
 			t.Fatalf("BuildPromptPayload() error = %v, want nil", err)
 		}

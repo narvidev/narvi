@@ -105,12 +105,21 @@ WHERE id = $1;
 -- queries use as their lower bound instead of a timestamp. It follows the
 -- identical sqlc.narg + COALESCE "absent argument leaves the column
 -- untouched" convention as the three columns above it.
+--
+-- dispatched_message_id (migrations/000131_turns_dispatched_message_id.up.sql,
+-- finding F3, §21.1's amendment) is stamped by the SAME two call sites, in the SAME
+-- write, from the sandboxws.Prompt MessageId BuildPromptPayload embeds
+-- into the wire payload itself -- GetTurnByDispatchedMessageID (below) is
+-- what a verdict-posting request resolves ITS OWN turn by, instead of
+-- "whichever turn is processing for this session right now". Follows the
+-- identical sqlc.narg + COALESCE convention.
 UPDATE turns
 SET status = $2,
     dispatched_at = COALESCE(sqlc.narg('dispatched_at'), dispatched_at),
     completed_at = COALESCE(sqlc.narg('completed_at'), completed_at),
     dispatched_sandbox_gen = COALESCE(sqlc.narg('dispatched_sandbox_gen'), dispatched_sandbox_gen),
-    dispatched_event_id = COALESCE(sqlc.narg('dispatched_event_id'), dispatched_event_id)
+    dispatched_event_id = COALESCE(sqlc.narg('dispatched_event_id'), dispatched_event_id),
+    dispatched_message_id = COALESCE(sqlc.narg('dispatched_message_id'), dispatched_message_id)
 WHERE id = $1
 RETURNING *;
 
@@ -150,6 +159,27 @@ WHERE id = $1 AND progress_notified_at IS NULL;
 -- match.
 SELECT * FROM turns
 WHERE session_id = $1 AND status = 'processing';
+
+-- name: GetTurnByDispatchedMessageID :one
+-- finding F3 (§21.1's amendment): resolves the SPECIFIC turn a verdict-posting
+-- request actually originated from, by the sandboxws.Prompt MessageId that
+-- request's own header presents (see the review-verdict handler,
+-- httpapi.PostReviewVerdict) -- NEVER by session-wide "current" status,
+-- which GetProcessingTurnForSession above answers and which this query
+-- deliberately does NOT ask: a turn that timed out and was marked 'failed'
+-- while its own agent was still posting is exactly the case this query
+-- must still find, so there is no "AND status = ..." filter here at all.
+-- turns.dispatched_message_id is unique in PRACTICE (a UUID minted fresh
+-- per dispatch, scoped further by session_id in this WHERE clause) though
+-- not DB-enforced unique (see migration 000131's own doc comment for why
+-- no index/constraint was added); a caller-observed multiple-row result
+-- would be a genuine anomaly, not a normal outcome this query's own :one
+-- cardinality anticipates. No matching row (dispatched_message_id absent,
+-- or naming a turn from a different session entirely) is pgx.ErrNoRows,
+-- mirroring GetTurn's own identical not-found convention -- the caller
+-- degrades exactly like a not-found processing turn already does.
+SELECT * FROM turns
+WHERE session_id = $1 AND dispatched_message_id = $2;
 
 -- name: SetTurnEpistemicOutcome :execrows
 -- The guarded UPDATE backing that same endpoint (§20.2) -- mirrors

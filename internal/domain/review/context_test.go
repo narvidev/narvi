@@ -1032,3 +1032,73 @@ func TestRenderTurnPrompt_TitleAndBodyAngleBracketsEscaped(t *testing.T) {
 		t.Errorf("RenderTurnPrompt() output contains %d occurrences of \"</pr_description>\", want exactly %d (the real closing tag only -- the forged one from Body must be escaped):\n%s", n, want, got)
 	}
 }
+
+// finding F5 (§21.1's amendment): "both ancestor-chain producers are mutation-proven
+// dead -- gutting either producer to `return nil` breaks no test, and no
+// fixture anywhere produces a non-empty chain." Before this test, nothing
+// in this repository called AncestorChainFromStack (this file) or its
+// sibling one layer down (internal/adapters/outbound/githubapi's
+// ancestorChainFromDetailStack, TestAncestorChainFromDetailStack_*,
+// listopenprs_test.go) and inspected the return value at all.
+//
+// AncestorChainFromStack itself can only ever report a chain of AT MOST
+// ONE link -- this function's own doc comment states why: a GitHub-native
+// stack object reports only ITS OWN size/position/ultimate-base, never
+// each intermediate link, so "a genuine N-deep producer" (§39, explicitly
+// unshipped) is what a longer chain would require. The ORDER/LENGTH-
+// sensitivity of the COMPARISON this chain feeds (autoapproval.
+// ComputeEligible's own ancestorChainEqual) is proven independently, with
+// literal multi-link fixtures, by internal/domain/autoapproval/
+// eligibility_test.go -- this test's own job is narrower and different:
+// proving the PRODUCER itself, not merely the comparison it feeds, is
+// live wiring that actually reports a real link when a real stacked PR
+// exists, not dead code a `return nil` mutation could gut unnoticed.
+func TestAncestorChainFromStack(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		stack *review.StackContext
+		want  []review.AncestorLink
+	}{
+		{
+			name:  "nil stack (the ordinary, non-stacked PR) has no ancestor beyond its own immediate base",
+			stack: nil,
+			want:  nil,
+		},
+		{
+			name:  "a stack's own bottom member (position 1) has no ancestor beyond its own immediate base",
+			stack: &review.StackContext{Position: 1, Size: 2, UltimateBaseRef: "main", UltimateBaseSHA: "sha-main"},
+			want:  nil,
+		},
+		{
+			// Mutation-test target: gutting AncestorChainFromStack to
+			// `return nil` unconditionally turns THIS case's own
+			// assertion from a pass into a failure -- the ONE case in
+			// this table that must observe a real, non-nil link.
+			name:  "a PR further up its own stack (position > 1) reports its stack's own ultimate base as its one ancestor link",
+			stack: &review.StackContext{Position: 2, Size: 2, UltimateBaseRef: "main", UltimateBaseSHA: "sha-main"},
+			want:  []review.AncestorLink{{Ref: "main", SHA: "sha-main"}},
+		},
+		{
+			name:  "a stack reporting an empty ultimate base ref is treated identically to no ancestor (nothing real to name)",
+			stack: &review.StackContext{Position: 2, Size: 2, UltimateBaseRef: "", UltimateBaseSHA: "sha-main"},
+			want:  nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := review.AncestorChainFromStack(tc.stack)
+			if len(got) != len(tc.want) {
+				t.Fatalf("AncestorChainFromStack(%+v) = %+v, want %+v", tc.stack, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("AncestorChainFromStack(%+v)[%d] = %+v, want %+v", tc.stack, i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}

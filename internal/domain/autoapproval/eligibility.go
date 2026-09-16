@@ -289,11 +289,27 @@ const (
 	// (CurrentPolicyVersion's own doc comment): "a verdict produced under
 	// one set of rules is not evidence under another."
 	ReasonPolicyVersionMismatch Reason = "this verdict was produced under an earlier eligibility policy"
-	ReasonCINotGreen            Reason = "CI is not green at the current head"
-	ReasonNotShippableAuto      Reason = "the verdict's shippable classification is not auto"
-	ReasonDiffTooLarge          Reason = "the diff exceeds this repo's auto-approval file-count threshold"
-	ReasonBlastRadiusUnknown    Reason = "the diff's sensitive-path facts could not be established from GitHub"
-	ReasonSensitivePathTouched  Reason = "the diff touches a sensitive path"
+	// ReasonBaseSHAUnknown (finding F2 (§21.1's amendment)) accompanies a verdict
+	// whose recorded OR current base commit could not be established at
+	// all -- VerdictBaseSHA/CurrentBaseSHA being empty is not the same
+	// fact as ReasonContextUnknown (VerdictBaseRef == "", meaning no
+	// context was ever recorded) or ReasonBaseMoved (a real recorded
+	// commit that no longer matches a real current one): this is "a
+	// commit SHA was supposed to be here and is not", on EITHER side --
+	// a live resolution that failed (internal/app/reviewcontext.Fetch's
+	// or internal/app/decisioninbox.revalidateCore's own
+	// ResolveBranchSHA call erroring), or a decoder that stopped
+	// emitting the field. Checked BEFORE the equality comparison
+	// immediately below specifically so "" == "" (both sides genuinely
+	// empty) can never read as a match: an empty base SHA on either
+	// side must fail closed with THIS distinct reason, never silently
+	// pass as fresh because two unknowns happen to be equal.
+	ReasonBaseSHAUnknown       Reason = "this pull request's base commit could not be established"
+	ReasonCINotGreen           Reason = "CI is not green at the current head"
+	ReasonNotShippableAuto     Reason = "the verdict's shippable classification is not auto"
+	ReasonDiffTooLarge         Reason = "the diff exceeds this repo's auto-approval file-count threshold"
+	ReasonBlastRadiusUnknown   Reason = "the diff's sensitive-path facts could not be established from GitHub"
+	ReasonSensitivePathTouched Reason = "the diff touches a sensitive path"
 )
 
 // ComputeEligible is this package's single exported pure function
@@ -329,6 +345,19 @@ func ComputeEligible(in EligibilityInput, cfg EligibilityConfig) (eligible bool,
 	// grandfather-in).
 	if in.VerdictBaseRef == "" {
 		return false, ReasonContextUnknown
+	}
+	// Finding F2: an empty base SHA on EITHER side is refused here, on its
+	// own dedicated reason, BEFORE the equality comparison below ever runs
+	// -- "" == "" would otherwise read as a trivially-matching pair,
+	// exactly the same hole VerdictHeadSHA's own dedicated empty-string
+	// check (above) already closes for the head sha. This also fails
+	// closed the day a decoder regression, or a second SourceControl
+	// adapter (CLAUDE.md: "don't couple a port to a single adapter" --
+	// this port is EXPECTED to gain one), stops emitting either field:
+	// both sides reading "" must never be indistinguishable from both
+	// sides genuinely, confirmedly agreeing.
+	if in.VerdictBaseSHA == "" || in.CurrentBaseSHA == "" {
+		return false, ReasonBaseSHAUnknown
 	}
 	if in.VerdictBaseRef != in.CurrentBaseRef || in.VerdictBaseSHA != in.CurrentBaseSHA {
 		return false, ReasonBaseMoved

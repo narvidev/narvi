@@ -73,7 +73,7 @@ func TestPostReviewVerdict_UpsertsFindingsWithServerComputedIdentity(t *testing.
 	session := setupReviewSessionWithSandbox(ctx, t, rig, repoFullName, 21)
 
 	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1",
-		findingsVerdictRequestJSON("coverage", "Missing test for the timeout path."))
+		"", findingsVerdictRequestJSON("coverage", "Missing test for the timeout path."))
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -113,7 +113,7 @@ func TestPostReviewVerdict_FindingReReportedAtShiftedLine_SameIdentity(t *testin
 	session := setupReviewSessionWithSandbox(ctx, t, rig, repoFullName, 22)
 
 	body1 := `{"riskLevel":"low","premise":"ok","blastRadius":[],"filesChanged":1,"testsCoverage":"insufficient","docsDrift":"none","proposedShippable":"auto","summary":"s","findings":[{"sentinelKind":"coverage","severity":"medium","filePath":"a.go","line":10,"description":"Missing coverage for X."}],"digest":{"summary":"Adds a helper; one coverage gap found.","descriptionAdequacy":"ok","adequacyExplanation":"Accurate."},"factCheck":"done","factCheckKilled":0}`
-	status, resp1 := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", body1)
+	status, resp1 := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", body1)
 	if status != http.StatusCreated {
 		t.Fatalf("first post status = %d, want %d", status, http.StatusCreated)
 	}
@@ -129,7 +129,7 @@ func TestPostReviewVerdict_FindingReReportedAtShiftedLine_SameIdentity(t *testin
 
 	// Re-report the SAME finding at a SHIFTED line (10 -> 25).
 	body2 := `{"riskLevel":"low","premise":"ok","blastRadius":[],"filesChanged":1,"testsCoverage":"insufficient","docsDrift":"none","proposedShippable":"auto","summary":"s","findings":[{"sentinelKind":"coverage","severity":"medium","filePath":"a.go","line":25,"description":"Missing coverage for X."}],"digest":{"summary":"Adds a helper; one coverage gap found.","descriptionAdequacy":"ok","adequacyExplanation":"Accurate."},"factCheck":"done","factCheckKilled":0}`
-	status2, resp2 := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", body2)
+	status2, resp2 := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", body2)
 	if status2 != http.StatusCreated {
 		t.Fatalf("second post status = %d, want %d", status2, http.StatusCreated)
 	}
@@ -160,7 +160,7 @@ func TestRebutReviewFinding_MemberDenied(t *testing.T) {
 	ctx := context.Background()
 	repoFullName := "acme/rebut-denied-repo"
 	session := setupReviewSessionWithSandbox(ctx, t, rig, repoFullName, 30)
-	postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", findingsVerdictRequestJSON("coverage", "x"))
+	postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", findingsVerdictRequestJSON("coverage", "x"))
 
 	_, memberToken := rig.createAuthenticatedUser(ctx, t)
 	kind := reviewpost.SentinelKindCoverage
@@ -229,7 +229,7 @@ func TestPostReviewVerdict_SentinelAutoFix_TriggersWhenToggleOn(t *testing.T) {
 	}
 
 	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1",
-		findingsVerdictRequestJSON("coverage", "Missing test for the retry path."))
+		"", findingsVerdictRequestJSON("coverage", "Missing test for the retry path."))
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -261,7 +261,7 @@ func TestPostReviewVerdict_SentinelAutoFix_NeverTriggersWhenToggleOff(t *testing
 	// DEFAULT (no repo_settings row at all) is off.
 
 	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1",
-		findingsVerdictRequestJSON("coverage", "Missing test for the retry path."))
+		"", findingsVerdictRequestJSON("coverage", "Missing test for the retry path."))
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -311,7 +311,7 @@ func TestPostReviewVerdict_SentinelAutoFix_NoRecursion(t *testing.T) {
 	createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
 
 	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1",
-		findingsVerdictRequestJSON("coverage", "Missing test for the retry path."))
+		"", findingsVerdictRequestJSON("coverage", "Missing test for the retry path."))
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -399,7 +399,7 @@ func setupFindingWithSuggestedFix(ctx context.Context, t *testing.T, rig testRig
 	createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
 
 	body := `{"riskLevel":"low","premise":"ok","blastRadius":[],"filesChanged":1,"testsCoverage":"insufficient","docsDrift":"none","proposedShippable":"auto","summary":"s","findings":[{"severity":"low","filePath":"internal/foo/bar.go","description":"Stale comment.","suggestedFix":"--- a/internal/foo/bar.go\n+++ b/internal/foo/bar.go\n@@ -1,2 +1,2 @@\n package foo\n-// old comment\n+// new comment\n"}],"digest":{"summary":"Fixes a stale comment.","descriptionAdequacy":"ok","adequacyExplanation":"Accurate."},"factCheck":"done","factCheckKilled":0}`
-	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", body)
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", body)
 	if status != http.StatusCreated {
 		t.Fatalf("post verdict status = %d, want %d", status, http.StatusCreated)
 	}
@@ -591,7 +591,7 @@ func TestApplySuggestion_NoSuggestedFix_BadRequest(t *testing.T) {
 	ctx := context.Background()
 	repoFullName := "acme/apply-suggestion-none-repo"
 	session := setupReviewSessionWithSandbox(ctx, t, rig, repoFullName, 62)
-	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", findingsVerdictRequestJSON("", "No fix available."))
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "", findingsVerdictRequestJSON("", "No fix available."))
 	if status != http.StatusCreated {
 		t.Fatalf("post verdict status = %d, want %d", status, http.StatusCreated)
 	}

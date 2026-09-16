@@ -98,7 +98,7 @@ func RevalidateForMerge(ctx context.Context, deps Deps, sourceControl ports.Sour
 		return false, "", "this pull request is no longer open, or no longer assigned to you", nil
 	}
 
-	return revalidateCore(ctx, deps, repoFullName, prNumber, *target)
+	return revalidateCore(ctx, deps, sourceControl, token, repoFullName, prNumber, *target)
 }
 
 // RevalidateForAutoMerge is RevalidateForMerge's own machine-initiated
@@ -130,7 +130,7 @@ func RevalidateForAutoMerge(ctx context.Context, deps Deps, sourceControl ports.
 		return false, "", "this pull request is no longer open", nil
 	}
 
-	return revalidateCore(ctx, deps, repoFullName, prNumber, target)
+	return revalidateCore(ctx, deps, sourceControl, botToken, repoFullName, prNumber, target)
 }
 
 // revalidateCore is the SHARED body of RevalidateForMerge/
@@ -146,7 +146,18 @@ func RevalidateForAutoMerge(ctx context.Context, deps Deps, sourceControl ports.
 // facts (a new commit landed dropping CI red, a reviewer requested
 // changes, a needs-human label applied...) could have changed since the
 // cached queue was last rendered.
-func revalidateCore(ctx context.Context, deps Deps, repoFullName string, prNumber int, target ports.OpenPR) (ok bool, headSHA string, reason string, err error) {
+//
+// sourceControl/token (finding F1 (§21.1's amendment)) are threaded through from
+// whichever caller already resolved target, so this function can make
+// its OWN fresh ResolveBranchSHA call for the base-freshness check below
+// -- deliberately never target.BaseSHA (ports.OpenPR.BaseSHA's own doc
+// comment: GitHub's per-PR CACHED `base.sha` snapshot, verified to lag
+// the base branch's real tip by an unknown, sometimes month-scale
+// margin). token mirrors CurrentHeadSHA's own already-live sourcing
+// exactly: RevalidateForMerge passes the acting human's own OAuth token,
+// RevalidateForAutoMerge passes the deployment's bot token -- the SAME
+// credential each caller already used to resolve target itself.
+func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceControl, token string, repoFullName string, prNumber int, target ports.OpenPR) (ok bool, headSHA string, reason string, err error) {
 	if target.Draft {
 		return false, "", "this pull request is a draft", nil
 	}
@@ -254,9 +265,43 @@ func revalidateCore(ctx context.Context, deps Deps, repoFullName string, prNumbe
 	// VerdictPolicyVersion (§21.1's amendment) come from record.Context
 	// -- the SAME review_verdicts row record.HeadSHA itself came from,
 	// resolved by appreviewverdict.GetLatest above. CurrentBaseRef/
-	// CurrentBaseSHA/CurrentAncestorChain mirror CurrentHeadSHA's own
-	// identical "target is this function's own already-fetched, LIVE
-	// ports.OpenPR" sourcing -- no new I/O.
+	// CurrentAncestorChain mirror CurrentHeadSHA's own identical "target
+	// is this function's own already-fetched, LIVE ports.OpenPR"
+	// sourcing -- no new I/O.
+	//
+	// CurrentBaseSHA (finding F1 (§21.1's amendment)) is deliberately NOT
+	// target.BaseSHA -- that field is GitHub's own per-PR CACHED
+	// `base.sha` snapshot (ports.OpenPR.BaseSHA's own doc comment),
+	// refreshed on GitHub's own schedule rather than on every push to the
+	// base branch, and verified against real GitHub PRs to lag by an
+	// unknown, sometimes month-scale margin. Comparing that cached field
+	// against ITSELF (the verdict side reads the identical field, via
+	// reviewcontext.Fetch's own pre-fix sourcing) detects nothing: the
+	// SHA half of the freshness gate would pass whether or not the base
+	// branch had actually moved. This calls the SAME ResolveBranchSHA a
+	// verdict's own context was anchored to (internal/app/reviewcontext.
+	// Fetch), so a genuine advance of the base branch's real tip between
+	// verdict-time and merge-time now surfaces as a real SHA mismatch --
+	// closing the exact hazard base_ref alone could never see: "whose
+	// parent moved beneath it."
+	//
+	// A resolution failure fails CLOSED to an empty CurrentBaseSHA,
+	// mirroring every other genuinely-unknown-fact convention this
+	// function already applies (ReviewDecisionDegraded, ChangedFilesListDegraded)
+	// -- autoapproval.ComputeEligible's own empty-base-sha guard (finding
+	// F2) then refuses on its own distinct reason, rather than this
+	// function inventing a SECOND fail-closed path that could drift from
+	// the engine's own.
+	currentBaseSHA, _, resolveErr := sourceControl.ResolveBranchSHA(ctx, ports.ResolveBranchSHASpec{
+		Owner:  target.Owner,
+		Repo:   target.Repo,
+		Branch: target.BaseRef,
+		Token:  token,
+	})
+	if resolveErr != nil {
+		currentBaseSHA = ""
+	}
+
 	eligible, eligReason := autoapproval.ComputeEligible(autoapproval.EligibilityInput{
 		Verdict:                 record.Verdict,
 		VerdictAssessed:         true,
@@ -267,7 +312,7 @@ func revalidateCore(ctx context.Context, deps Deps, repoFullName string, prNumbe
 		VerdictPolicyVersion:    record.Context.PolicyVersion,
 		CurrentHeadSHA:          target.HeadSHA,
 		CurrentBaseRef:          target.BaseRef,
-		CurrentBaseSHA:          target.BaseSHA,
+		CurrentBaseSHA:          currentBaseSHA,
 		CurrentAncestorChain:    convertAncestorChain(target.AncestorChain),
 		CIGreen:                 ciGreen,
 		HasNeedsHumanLabel:      hasNeedsHuman,

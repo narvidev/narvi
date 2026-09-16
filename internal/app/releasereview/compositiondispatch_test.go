@@ -13,7 +13,9 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/releasereview"
+	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
+	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -66,6 +68,16 @@ type fakeCompositionDiffFetcher struct {
 	lastGetCompareDiffBase  string
 	lastGetCompareDiffHead  string
 	lastGetCompareDiffToken string
+
+	// resolveBranchSHA/resolveBranchSHAErr (finding F1 (§21.1's amendment)) back
+	// ResolveBranchSHA below -- the default (both zero values) reports
+	// ("", "", nil), which reviewcontext.Fetch treats as "no live
+	// resolution available" and falls back to pinning the diff fetch on
+	// pr.BaseRef (this fake's own pre-existing behavior), so every
+	// EXISTING test in this file that never configures this field keeps
+	// asserting lastGetCompareDiffBase == pr.BaseRef exactly as before.
+	resolveBranchSHA    string
+	resolveBranchSHAErr error
 }
 
 func (f *fakeCompositionDiffFetcher) GetPullRequest(_ context.Context, owner, repo string, number int32, token string) (githubapi.PullRequest, error) {
@@ -75,6 +87,13 @@ func (f *fakeCompositionDiffFetcher) GetPullRequest(_ context.Context, owner, re
 	f.lastGetPullRequestNumber = number
 	f.lastGetPullRequestToken = token
 	return f.pr, f.prErr
+}
+
+func (f *fakeCompositionDiffFetcher) ResolveBranchSHA(_ context.Context, spec ports.ResolveBranchSHASpec) (string, string, error) {
+	if f.resolveBranchSHAErr != nil {
+		return "", "", f.resolveBranchSHAErr
+	}
+	return f.resolveBranchSHA, spec.Branch, nil
 }
 
 func (f *fakeCompositionDiffFetcher) GetCompareDiff(_ context.Context, owner, repo, base, head, token string) (string, bool, error) {
@@ -151,7 +170,13 @@ func TestRun_AggregateReviewTriggered_DispatchesCompositionReviewTurn(t *testing
 	diffFetcher := &fakeCompositionDiffFetcher{pr: githubapi.PullRequest{
 		HeadSHA: "deadbeef",
 		BaseRef: "main",
-	}, diff: "diff --git a/x b/x\n+hello\n"}
+	},
+		// resolveBranchSHA (finding F1/F7 (§21.1's amendment)): a real, non-empty
+		// live base resolution, so this test's own F7 assertion (below)
+		// proves review_verdict_context.baseSha is genuinely populated,
+		// never left at the fake's own zero-value default.
+		resolveBranchSHA: "main-tip-sha",
+		diff:             "diff --git a/x b/x\n+hello\n"}
 	turns := &fakeCompositionTurnInserter{}
 	dispatch := &fakeCompositionDispatcher{}
 
@@ -190,13 +215,15 @@ func TestRun_AggregateReviewTriggered_DispatchesCompositionReviewTurn(t *testing
 	if diffFetcher.lastGetCompareDiffOwner != "acme" || diffFetcher.lastGetCompareDiffRepo != "widgets" {
 		t.Errorf("GetCompareDiff(owner, repo) = (%q, %q), want (%q, %q)", diffFetcher.lastGetCompareDiffOwner, diffFetcher.lastGetCompareDiffRepo, "acme", "widgets")
 	}
-	// base/head are PINNED to the pr's own resolved BaseRef/HeadSHA
-	// (reviewcontext.Fetch's own "pin the compare call" fix), never
+	// base/head are PINNED to the LIVE-resolved base sha/pr's own resolved
+	// HeadSHA (finding F1's own fix to reviewcontext.Fetch: the diff is
+	// pinned to the base branch's own resolved commit, never the base REF
+	// name alone, which GitHub would otherwise re-resolve itself), never
 	// in.BaseRef/in.HeadRef (the release PR's own BRANCH names) -- proving
 	// this call site actually goes through Fetch rather than some other,
 	// unpinned path.
-	if diffFetcher.lastGetCompareDiffBase != "main" || diffFetcher.lastGetCompareDiffHead != "deadbeef" {
-		t.Errorf("GetCompareDiff(base, head) = (%q, %q), want (%q, %q) (pr.BaseRef, pr.HeadSHA)", diffFetcher.lastGetCompareDiffBase, diffFetcher.lastGetCompareDiffHead, "main", "deadbeef")
+	if diffFetcher.lastGetCompareDiffBase != "main-tip-sha" || diffFetcher.lastGetCompareDiffHead != "deadbeef" {
+		t.Errorf("GetCompareDiff(base, head) = (%q, %q), want (%q, %q) (resolved base sha, pr.HeadSHA)", diffFetcher.lastGetCompareDiffBase, diffFetcher.lastGetCompareDiffHead, "main-tip-sha", "deadbeef")
 	}
 	if diffFetcher.lastGetCompareDiffToken != "gho_bottoken" {
 		t.Errorf("GetCompareDiff token = %q, want %q", diffFetcher.lastGetCompareDiffToken, "gho_bottoken")
@@ -232,6 +259,31 @@ func TestRun_AggregateReviewTriggered_DispatchesCompositionReviewTurn(t *testing
 	}
 	if turns.lastParams.ReviewHeadSha == nil || *turns.lastParams.ReviewHeadSha != "deadbeef" {
 		t.Errorf("inserted turn ReviewHeadSha = %v, want \"deadbeef\"", turns.lastParams.ReviewHeadSha)
+	}
+	// finding F7 (§21.1's amendment): this turn must ALSO carry review_verdict_context
+	// -- the SAME asymmetry fix as review_head_sha above, one column
+	// further. Before this fix, this turn was inserted with ReviewHeadSha
+	// set and ReviewVerdictContext left nil -- a verdict posted while this
+	// exact turn is processing would get a real head sha and a NULL base/
+	// ancestor/policy context, so autoapproval.ComputeEligible would answer
+	// ReasonContextUnknown for it forever, permanently blocking
+	// auto-approval/auto-merge for this release PR no matter how clean its
+	// own verdict looked.
+	if len(turns.lastParams.ReviewVerdictContext) == 0 {
+		t.Fatal("inserted turn ReviewVerdictContext is nil/empty, want the real fetched base ref/sha/policy version -- this turn can never be auto-approved/auto-merged without it (finding F7)")
+	}
+	var gotContext reviewverdict.Context
+	if err := json.Unmarshal(turns.lastParams.ReviewVerdictContext, &gotContext); err != nil {
+		t.Fatalf("unmarshal inserted turn ReviewVerdictContext: %v", err)
+	}
+	if gotContext.BaseRef != "main" {
+		t.Errorf("inserted turn ReviewVerdictContext.BaseRef = %q, want %q", gotContext.BaseRef, "main")
+	}
+	if gotContext.BaseSHA != "main-tip-sha" {
+		t.Errorf("inserted turn ReviewVerdictContext.BaseSHA = %q, want %q", gotContext.BaseSHA, "main-tip-sha")
+	}
+	if gotContext.PolicyVersion != autoapproval.CurrentPolicyVersion {
+		t.Errorf("inserted turn ReviewVerdictContext.PolicyVersion = %d, want %d", gotContext.PolicyVersion, autoapproval.CurrentPolicyVersion)
 	}
 	if dispatch.calls != 1 {
 		t.Fatalf("CompositionDispatch.EnsureDispatched calls = %d, want 1", dispatch.calls)

@@ -95,12 +95,17 @@ func TestPostReviewVerdict_PositionAnchoring_MatchableFindingRendersAnchoredLine
 
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-anchor-match", 60)
 	headSHA := "anchoring-head-sha"
-	if _, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &headSHA}); err != nil {
+	createdTurn, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &headSHA})
+	if err != nil {
 		t.Fatalf("seed processing turn with review head sha: %v", err)
+	}
+	turnMessageID := testDispatchMessageID
+	if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: createdTurn.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedMessageID: &turnMessageID}); err != nil {
+		t.Fatalf("stamp dispatched_message_id on seeded turn: %v", err)
 	}
 
 	body := verdictRequestWithFinding("main.go", "for i := 0; i < len(items); i++ looks risky")
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", body)
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, body)
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
@@ -142,12 +147,17 @@ func TestPostReviewVerdict_PositionAnchoring_UnmatchableFindingRendersNoLine(t *
 
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-anchor-nomatch", 61)
 	headSHA := "anchoring-head-sha-2"
-	if _, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &headSHA}); err != nil {
+	createdTurn, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &headSHA})
+	if err != nil {
 		t.Fatalf("seed processing turn with review head sha: %v", err)
+	}
+	turnMessageID := testDispatchMessageID
+	if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: createdTurn.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedMessageID: &turnMessageID}); err != nil {
+		t.Fatalf("stamp dispatched_message_id on seeded turn: %v", err)
 	}
 
 	body := verdictRequestWithFinding("main.go", "completely unrelated prose about quarterly revenue projections")
-	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", body)
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, body)
 	if status != http.StatusCreated {
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
