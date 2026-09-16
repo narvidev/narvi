@@ -151,14 +151,13 @@ func TestFetch_Success_DiffPinnedToExactlyWhatWasResolved(t *testing.T) {
 		t.Errorf("HeadSHA = %q, want %q", got.HeadSHA, "resolved-head-sha")
 	}
 	// THE decisive F1 assertion: BaseSHA comes from the LIVE
-	// ResolveBranchSHA call, never from pr.BaseSHA (which this fixture
-	// deliberately leaves unset/empty -- a real GetPullRequest response
-	// would report SOME base.sha here, and a regression that reverted to
-	// reading it would still produce a non-empty BaseSHA, silently
-	// passing this assertion for the wrong reason, so leaving pr.BaseSHA
-	// empty makes any such regression fail loudly instead).
+	// ResolveBranchSHA call, never from GitHub's own possibly-stale
+	// `base.sha` -- githubapi.PullRequest carries no such field at all
+	// (D11), so there is no fixture value a regression could fall back to
+	// reading; this assertion would simply fail against a real, non-empty
+	// resolveBranchSHA fixture value if it ever stopped being used.
 	if got.BaseSHA != "resolved-base-sha" {
-		t.Errorf("BaseSHA = %q, want %q (the LIVE-resolved value, never pr.BaseSHA)", got.BaseSHA, "resolved-base-sha")
+		t.Errorf("BaseSHA = %q, want %q (the LIVE-resolved value)", got.BaseSHA, "resolved-base-sha")
 	}
 	if got.Title != "Fix the retry loop" {
 		t.Errorf("Title = %q, want %q", got.Title, "Fix the retry loop")
@@ -183,7 +182,8 @@ func TestFetch_Success_DiffPinnedToExactlyWhatWasResolved(t *testing.T) {
 	// THE core atomicity assertion: GetCompareDiff's own base arg is
 	// EXACTLY the resolved base sha, never pr.BaseRef (the branch name
 	// GitHub would otherwise re-resolve itself, one more independently-
-	// raceable read) and never pr.BaseSHA.
+	// raceable read) -- githubapi.PullRequest has no BaseSHA field to
+	// confuse this with (D11).
 	assertDiffArgs(t, fetcher, "acme", "widgets", "resolved-base-sha", "resolved-head-sha", "gho_bottoken")
 }
 

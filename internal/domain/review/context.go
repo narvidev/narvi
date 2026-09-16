@@ -121,8 +121,13 @@ type PreFetchedContext struct {
 	// bookkeeping ONLY, exactly like HeadSHA's own doc comment immediately
 	// above (never rendered into the prompt, never additional diff to
 	// verdict over). BaseRef/BaseSHA are this PR's own immediate base at
-	// context-fetch time (the SAME GetPullRequest call HeadSHA itself
-	// comes from); AncestorChain is AncestorChainFromStack's own result
+	// context-fetch time, but from two DIFFERENT calls: BaseRef is the
+	// SAME GetPullRequest call HeadSHA itself comes from, while BaseSHA is
+	// a SEPARATE, live SourceControl.ResolveBranchSHA call pinned to that
+	// BaseRef -- never GetPullRequest's own response, which no longer
+	// decodes a base SHA at all (internal/app/reviewcontext.Fetch's own
+	// doc comment has the full "why"). AncestorChain is
+	// AncestorChainFromStack's own result
 	// over Stack above. PolicyVersion is the eligibility-policy revision
 	// in effect when this context was fetched (autoapproval.
 	// CurrentPolicyVersion at fetch time) -- a caller outside this

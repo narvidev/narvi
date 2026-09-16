@@ -661,10 +661,13 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// chain/policy-version equality, CI, Shippable, diff size, blast
 	// radius). CurrentBaseSHA is deliberately ASSUMED equal to the
 	// verdict's own recorded VerdictBaseSHA -- the most lenient possible
-	// stand-in: it trivially satisfies BOTH of ComputeEligible's
-	// base-SHA-comparison checks (ReasonBaseSHAUnknown/ReasonBaseMoved)
-	// regardless of BaseAdvancedWithoutRewrite, and affects nothing else
-	// the probe checks. Any REAL currentBaseSHA can only be
+	// stand-in. This assumption cannot make either of ComputeEligible's
+	// two base-SHA-comparison checks (ReasonBaseSHAUnknown/ReasonBaseMoved)
+	// MORE lenient than any real currentBaseSHA would -- but NOT for the
+	// same reason on both checks; see revalidateCore's own corrected doc
+	// comment (revalidate.go, H4, fifth adversarial-review round) for why
+	// equality is trivially satisfying for one and merely beside-the-point
+	// for the other. Any REAL currentBaseSHA can only be
 	// equally-or-LESS lenient than this assumption on those two checks,
 	// and every other criterion is unaffected by which base-SHA scenario
 	// is used -- so if the probe already refuses, eligibleIgnoringHuman
@@ -764,11 +767,16 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// while revalidateCore backs an ACTION endpoint (merge) that needs an
 	// instantaneous-fresh read regardless of any cache's own TTL.
 	//
-	// A resolution failure degrades to an empty currentBaseSHA, mirroring
-	// revalidateCore's own identical "fails CLOSED... autoapproval.
-	// ComputeEligible's own empty-base-sha guard (finding F2) then refuses
-	// on its own distinct reason" precedent -- never a second,
-	// independently-invented fail-closed path. ALSO marks this function's
+	// A resolution failure degrades to an empty currentBaseSHA, which
+	// autoapproval.ComputeEligible's own empty-base-sha guard (finding F2)
+	// then fails closed on -- this function's OWN fail-closed path, never
+	// a second, independently-invented one. This is NOT what revalidateCore
+	// (revalidate.go) does for the identical live-lookup failure: since H2
+	// (fifth adversarial-review round), that function returns early with
+	// its own distinct, honest reason instead of falling through to this
+	// same guard -- see revalidateCore's own doc comment for why the two
+	// call sites diverge (a cached read model here, an action endpoint
+	// there). ALSO marks this function's
 	// own degraded return true (E5, third round; correctly SCOPED by the
 	// probe above, G10, fourth round): the probe already confirmed this
 	// row would otherwise be eligible, so a live GitHub call failing here

@@ -74,8 +74,11 @@ type Record struct {
 	Context Context
 	// AttemptID (§21.1's amendment) is an identifier distinct from
 	// Context above -- the turn that produced this verdict (turns.id),
-	// forwarded verbatim from the SAME processing-turn lookup HeadSHA
-	// itself already depends on (httpapi.PostReviewVerdict). "Two
+	// forwarded verbatim from the SAME turns.GetByDispatchedMessageID
+	// call HeadSHA itself already depends on (httpapi.PostReviewVerdict --
+	// finding F3's own replacement for the session-wide
+	// GetProcessingTurnForSession lookup this comment previously named).
+	// "Two
 	// attempts over identical code share a context; exactly one may
 	// publish the current result, which a context alone cannot express."
 	// The zero value (an invalid pgtype.UUID) is what a pre-existing row,

@@ -33,12 +33,15 @@ import (
 // implements this method (adapter.go, built for §8.5's image builds), so
 // this interface reuses it as-is rather than inventing a second "resolve
 // a branch ref to a commit" mechanism. See Fetch's own doc comment for
-// why this call exists: `pull_request.base.sha` (the field
-// GetPullRequest/pullRequestResponse.Base.SHA decode) is GitHub's own
+// why this call exists: GitHub's own `pull_request.base.sha` field is a
 // per-PR CACHED snapshot of the base branch's tip -- verified against
 // real GitHub PRs to lag the branch's actual current commit by an
 // unknown, sometimes month-scale margin, refreshed on GitHub's own
-// schedule, never on push. ResolveBranchSHA instead issues a real,
+// schedule, never on push. GetPullRequest's own response (adapter.go's
+// pullRequestResponse) deliberately never decodes it at all (D11,
+// internal/adapters/outbound/githubapi/adapter.go's own
+// pullRequestResponse.Base doc comment has the full "why removed, not
+// merely undecoded"). ResolveBranchSHA instead issues a real,
 // synchronous GET .../commits/{branch}, so its result is the base
 // branch's LIVE tip at the moment this review turn's context is
 // assembled -- the one value BaseSHA below is pinned to.
@@ -130,13 +133,15 @@ func Fetch(ctx context.Context, logger *slog.Logger, fetcher Fetcher, timeouts p
 	// pr.Stack == nil, knownStack == nil: an ordinary, non-stacked PR --
 	// stack stays nil.
 
-	// Finding F1: pr.BaseSHA (GetPullRequest's own `base.sha` field) is
-	// GitHub's per-PR CACHED snapshot of the base branch's tip -- verified
-	// against real GitHub PRs to lag the branch's actual current commit by
-	// an unknown, sometimes month-scale margin, refreshed on GitHub's own
-	// schedule rather than on every push to the base branch. Comparing it
-	// against itself later (the live side reads the SAME cached field)
-	// detects nothing: the SHA half of the freshness gate would pass
+	// Finding F1: GitHub's own per-PR "base.sha" field is a CACHED
+	// snapshot of the base branch's tip -- verified against real GitHub
+	// PRs to lag the branch's actual current commit by an unknown,
+	// sometimes month-scale margin, refreshed on GitHub's own schedule
+	// rather than on every push to the base branch. pr (githubapi.
+	// PullRequest, above) never carries it at all (D11: removed, not
+	// merely undecoded -- see Fetcher's own doc comment above for the
+	// full "why"). Comparing a cached snapshot against itself later would
+	// detect nothing: the SHA half of the freshness gate would pass
 	// whether or not the base branch had actually moved -- exactly the
 	// "or whose parent moved beneath it" hazard §21.1 names as the whole
 	// reason this field was added, and the one half base_ref alone can
@@ -225,8 +230,9 @@ func Fetch(ctx context.Context, logger *slog.Logger, fetcher Fetcher, timeouts p
 		// sets it here.
 		//
 		// BaseSHA (finding F1) is deliberately baseSHA -- the LIVE
-		// resolution above -- never pr.BaseSHA (GetPullRequest's own
-		// possibly-stale `base.sha` snapshot, see the doc comment on the
+		// resolution above -- never GitHub's own possibly-stale
+		// `base.sha` snapshot: githubapi.PullRequest carries no such
+		// field to read here at all (D11; see the doc comment on the
 		// ResolveBranchSHA call above for the full "why").
 		BaseRef:           pr.BaseRef,
 		BaseSHA:           baseSHA,

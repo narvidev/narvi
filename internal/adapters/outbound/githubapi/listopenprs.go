@@ -149,10 +149,15 @@ type openPRDetailResponse struct {
 	Head struct {
 		SHA string `json:"sha"`
 	} `json:"head"`
-	// Base.SHA (§21.1's amendment) mirrors pullRequestResponse.Base.SHA's
-	// own identical fix (adapter.go) on THIS response shape -- previously
-	// never decoded here either. ports.OpenPR.BaseSHA below is this
-	// response's one consumer.
+	// Base.SHA (§21.1's amendment) is this response shape's own decode of
+	// GitHub's per-PR CACHED base commit -- ports.OpenPR.BaseSHA below is
+	// this response's one consumer, and that field's own doc comment
+	// (ports/sourcecontrol.go) is normative for why it is retained for
+	// display/audit only, never wired into an eligibility comparison.
+	// adapter.go's own pullRequestResponse -- a DIFFERENT response shape,
+	// GetPullRequest's, not this one -- no longer decodes the equivalent
+	// field at all (D11): the two shapes are not mirrors of each other on
+	// this point, unlike before D11.
 	Base struct {
 		Ref string `json:"ref"`
 		SHA string `json:"sha"`

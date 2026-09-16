@@ -171,7 +171,12 @@ func NewSCMCache(sourceControl ports.SourceControl, timeouts platform.Timeouts) 
 // ListOpenPRsForUser/ResolveCodeOwners above -- computeRealEligibility's
 // own caller degrades that to an empty CurrentBaseSHA, which
 // autoapproval.ComputeEligible's own ReasonBaseSHAUnknown guard then
-// fails closed on, mirroring revalidateCore's own identical degradation.
+// fails closed on. This is NOT what revalidateCore (revalidate.go) does
+// for the identical live-lookup failure: since H2 (fifth adversarial-
+// review round), that function returns early with its own distinct,
+// honest reason instead of falling through to this same guard -- see
+// revalidateCore's own doc comment for why the two call sites diverge
+// (a cached read model here, an action endpoint there).
 func (c *SCMCache) ResolveBranchSHA(ctx context.Context, spec ports.ResolveBranchSHASpec, now time.Time) (sha string, asOf time.Time, err error) {
 	key := branchSHACacheKey{owner: spec.Owner, repo: spec.Repo, branch: spec.Branch}
 	if cached, fetchedAt, ok := c.branchSHAs.get(key, now); ok {

@@ -635,8 +635,11 @@ func (a *Actor) tryPlanReenqueue(
 	// value on EVERY re-enqueue is correct, not merely tolerated: this is
 	// a genuinely new dispatch to a different sandbox incarnation, so an
 	// old, now-stale MessageId a still-alive PREVIOUS incarnation might
-	// still present later finds no matching row here, degrading safely
-	// (unknown context) rather than resolving the wrong turn.
+	// still present later finds no matching row here -- httpapi.
+	// PostReviewVerdict refuses the call outright (403) rather than
+	// resolving the wrong turn or degrading to session-wide resolution
+	// (D1/D4/D6, second adversarial-review round: see that handler's own
+	// doc comment for the full "why refuse rather than degrade").
 	messageID := uuid.NewString()
 	if _, err := a.stores.turn.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
 		ID: target.ID,

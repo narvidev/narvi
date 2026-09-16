@@ -359,9 +359,11 @@ func PostReviewVerdict(
 		// value that names no turn this session ever dispatched
 		// (pgx.ErrNoRows) -- now returns 403 before anything is built,
 		// posted, or persisted. This also closes D6 as a direct
-		// consequence: there is no longer any path where this endpoint
-		// returns 201 with review_verdicts silently missing its row --
-		// every 201 from this point on has one. Rejected alternative:
+		// consequence, for the un-attributable-REQUEST case only: such a
+		// request can no longer reach 201 at all. This does NOT mean
+		// every 201 now has a review_verdicts row -- see this file's own
+		// outcome table (Outcome 10, above) for the separate, still-live
+		// case this fix does not touch. Rejected alternative:
 		// falling back to turns.GetProcessingTurnForSession (this
 		// endpoint's OWN pre-F3 behavior) for the header-absent case only.
 		// Rejected because that reintroduces exactly the race F3 was

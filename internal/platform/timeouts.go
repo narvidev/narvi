@@ -1416,8 +1416,11 @@ type Timeouts struct {
 	// current tip, rather than trusting `pull_request.base.sha`
 	// (verified against real GitHub PRs to be a per-PR cached snapshot
 	// that lags the base branch's real tip by an unknown, sometimes
-	// month-scale margin -- see githubapi.PullRequest.BaseSHA's own doc
-	// comment). A DISTINCT field from RepoSHAResolutionTimeout (this
+	// month-scale margin -- githubapi.PullRequest no longer even decodes
+	// this field, D11; see ports.OpenPR.BaseSHA's own doc comment,
+	// ports/sourcecontrol.go, for that same lag on the field that IS
+	// still decoded, for a read-model-only purpose). A DISTINCT field
+	// from RepoSHAResolutionTimeout (this
 	// codebase's own convention: one named timeout per distinct
 	// network-call type, even when two share the chosen value --
 	// RepoSHAResolutionTimeout's own doc comment states this precedent

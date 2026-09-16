@@ -34,7 +34,13 @@
 //  4. The verdict's own recorded CONTEXT matches the PR's current one
 //     (§21.1's amendment, stated because head equality alone is NOT
 //     sufficient): VerdictBaseRef == "" means no context was ever
-//     recorded (a pre-amendment row) and fails as UNKNOWN; otherwise
+//     recorded (a pre-amendment row) and fails as UNKNOWN; an empty
+//     VerdictBaseSHA or CurrentBaseSHA likewise fails as UNKNOWN, on its
+//     own dedicated reason (Finding F2), checked BEFORE the equality
+//     comparison below ever runs -- "" == "" must never read as a
+//     trivially-matching pair, exactly the same hole VerdictHeadSHA's own
+//     dedicated empty-string check (item 3 above) already closes for the
+//     head sha; otherwise
 //     VerdictBaseRef must equal CurrentBaseRef, VerdictAncestorChain must
 //     equal CurrentAncestorChain (order-sensitive), and
 //     VerdictPolicyVersion must equal CurrentPolicyVersion. VerdictBaseSHA/

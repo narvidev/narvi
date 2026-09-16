@@ -218,13 +218,20 @@ type EligibilityInput struct {
 	// exactly as much as the rest of that function does).
 	CurrentHeadSHA string
 	// CurrentBaseRef/CurrentBaseSHA/CurrentAncestorChain (§21.1's
-	// amendment) are the PR's LIVE current review context, fetched fresh
-	// exactly like CurrentHeadSHA immediately above (ports.OpenPR.
-	// BaseRef/BaseSHA/AncestorChain) -- compared against
-	// VerdictBaseRef/VerdictBaseSHA/VerdictAncestorChain above to catch
-	// the hazard CurrentHeadSHA alone cannot: "a PR evaluated while based
-	// on another PR's branch, then retargeted -- or whose parent moved
-	// beneath it -- keeps an unchanged head."
+	// amendment) are the PR's LIVE current review context -- compared
+	// against VerdictBaseRef/VerdictBaseSHA/VerdictAncestorChain above to
+	// catch the hazard CurrentHeadSHA alone cannot: "a PR evaluated while
+	// based on another PR's branch, then retargeted -- or whose parent
+	// moved beneath it -- keeps an unchanged head." CurrentBaseRef/
+	// CurrentAncestorChain come straight from ports.OpenPR (BaseRef/
+	// AncestorChain), fetched fresh exactly like CurrentHeadSHA
+	// immediately above. CurrentBaseSHA is DIFFERENT: never ports.OpenPR.
+	// BaseSHA -- that field is GitHub's own per-PR CACHED snapshot
+	// (ports.OpenPR.BaseSHA's own doc comment), exactly the value both of
+	// this engine's real callers (internal/app/decisioninbox's
+	// revalidateCore and computeRealEligibility) deliberately bypass in
+	// favor of a live SourceControl.ResolveBranchSHA call -- see either
+	// call site's own doc comment for the full "why".
 	CurrentBaseRef       string
 	CurrentBaseSHA       string
 	CurrentAncestorChain []review.AncestorLink

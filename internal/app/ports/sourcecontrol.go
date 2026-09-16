@@ -927,9 +927,17 @@ type SourceControl interface {
 	// what does and does not follow from that, and why the residual it
 	// leaves open is accepted rather than closed.
 	//
-	// Errors are plain, exactly like ResolveBranchSHA/CreatePR above --
-	// see IsAncestorSpec's own doc comment for the fail-closed convention
-	// every caller of this method applies to a non-nil error.
+	// Errors are plain, exactly like ResolveBranchSHA/CreatePR above -- a
+	// mechanical fact about the return type only, not a shared posture:
+	// ResolveBranchSHA's own doc comment describes a DIFFERENT, never-
+	// fail-closed caller (§8.5's image builds, "never a fatal condition").
+	// IsAncestorSpec's own doc comment carries no error-handling
+	// convention at all (it documents fields only) -- the fail-closed
+	// convention every caller of THIS method applies to a non-nil error
+	// lives at the call sites, not on this port: internal/app/
+	// decisioninbox's revalidateCore (revalidate.go) and
+	// computeRealEligibility (aggregate.go) each document their own
+	// logged, early-return/degraded fail-closed handling.
 	IsAncestor(ctx context.Context, spec IsAncestorSpec) (isAncestor bool, err error)
 
 	// ResolveContractsFingerprint fingerprints spec.Path's directory
