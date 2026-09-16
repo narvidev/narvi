@@ -185,20 +185,20 @@ func (c *SCMCache) ResolveBranchSHA(ctx context.Context, spec ports.ResolveBranc
 		return "", time.Time{}, fmt.Errorf("decisioninbox: resolve branch sha: %w", err)
 	}
 
-	// fetchedAt is `now` -- the SAME clock reading this call was already
-	// handed, never a second, independent time.Now() call (E9, third
-	// adversarial-review round: this previously called time.Now() here,
-	// a real wall-clock read racing against every caller's own injected
-	// `now`, which made a test asserting expiry at exactly
-	// now+TTL+epsilon flaky under any scheduling delay between capturing
-	// its own `now` and this line actually running -- a margin of
-	// wall-clock proximity no test should need to depend on). A fresh
-	// fetch's own "instant it was fetched" IS the logical now this whole
-	// call is happening at; get's own "never now on a cache HIT" contract
-	// (this cache's own top doc comment) is unaffected, since that
-	// concerns the STORED value a later, later-now hit returns, never
-	// how a fresh miss captures it in the first place.
-	fetchedAt := now
+	// fetchedAt ("born-expired entries", G2, fourth adversarial-review
+	// round): anchored on FETCH COMPLETION, a fresh time.Now() taken
+	// AFTER the (potentially slow, up to
+	// DecisionInboxResolveBranchSHATimeout) call above returns --
+	// mirrors ListOpenPRsForUser/ResolveCodeOwners' own identical fix
+	// below, and for the identical reason: a round-3 (E9) change made
+	// this store against the caller's own PRE-fetch `now` parameter
+	// instead, which reintroduced the exact bug this file documents as
+	// fixed for those two sibling methods -- a slow fetch against a
+	// short DecisionInboxSCMCacheTTL could write an entry get() would
+	// immediately reject as already expired, so the cache would never
+	// amortize for exactly the caller it exists to help.
+	// TestSCMCache_ResolveBranchSHA_SlowFetchDoesNotBornExpire pins this.
+	fetchedAt := time.Now()
 	c.branchSHAs.set(key, sha, fetchedAt, c.timeouts.DecisionInboxSCMCacheTTL)
 	return sha, fetchedAt, nil
 }
@@ -240,11 +240,16 @@ func (c *SCMCache) IsAncestor(ctx context.Context, spec ports.IsAncestorSpec, no
 		return false, fmt.Errorf("decisioninbox: is ancestor: %w", err)
 	}
 
-	// Stores against `now`, never a fresh time.Now() -- mirrors
-	// ResolveBranchSHA's own identical E9 fix immediately above, for the
-	// identical reason (the same wall-clock-proximity flake, one cached
-	// method over).
-	c.isAncestorResults.set(key, isAncestor, now, c.timeouts.DecisionInboxSCMCacheTTL)
+	// Stores against a fresh time.Now(), taken AFTER the call above
+	// returns -- mirrors ResolveBranchSHA's own identical "born-expired
+	// entries" fix immediately above (G2, fourth adversarial-review
+	// round), for the identical reason, one cached method over: this
+	// result carries no asOf back to its own caller (IsAncestor's return
+	// signature has none), but a slow fetch storing against the
+	// pre-fetch `now` could still write an entry get() would immediately
+	// reject as already expired, defeating the cache's own TTL for
+	// exactly the slow calls it exists to amortize.
+	c.isAncestorResults.set(key, isAncestor, time.Now(), c.timeouts.DecisionInboxSCMCacheTTL)
 	return isAncestor, nil
 }
 

@@ -54,34 +54,47 @@
 -- See reviewverdict.go's own outcome table for the current, authoritative
 -- behavior.
 --
--- Index rationale corrected again (E3/E8, third adversarial-review
--- round): the second round (D9) correctly showed turns_one_processing_
--- per_session (migrations/000005_turns.up.sql) cannot back this query --
--- it is a PARTIAL unique index, WHERE status = 'processing', and
--- GetTurnByDispatchedMessageID (queries/turns.sql) carries no status
--- filter at all, so Postgres can never choose it -- but its own
--- conclusion was still wrong. There is no session_id index of ANY kind
--- on this table, partial or otherwise, so what this query actually plans
+-- Index rationale corrected a third time (E3/E8, third adversarial-review
+-- round; G6, fourth round): the second round (D9) correctly showed
+-- turns_one_processing_per_session (migrations/000005_turns.up.sql)
+-- cannot back this query -- it is a PARTIAL unique index,
+-- WHERE status = 'processing', and GetTurnByDispatchedMessageID
+-- (queries/turns.sql) carries no status filter at all, so Postgres can
+-- never choose it for THIS query -- but the third round's own
+-- conclusion, that there is "no session_id index of ANY kind on this
+-- table, partial or otherwise", contradicted the sentence immediately
+-- above it: turns_one_processing_per_session IS a session_id index,
+-- partial, exactly as just described. Verified directly against the
+-- live schema (`\d turns` against every migration through 000130
+-- applied): the one and only session_id-touching index before this
+-- migration is that same partial one, scoped to status = 'processing'.
+-- What is true, and is the actual reason this migration's own index is
+-- needed, is narrower: no index on this table can serve a session_id
+-- lookup that carries NO status filter -- the partial index's own WHERE
+-- clause is exactly what disqualifies it here, already established two
+-- sentences above -- so what GetTurnByDispatchedMessageID's query plans
 -- to today is a SEQUENTIAL SCAN OF THE WHOLE turns TABLE, across every
 -- session this deployment has ever run -- never "within one session's
--- own rows", which is not a thing an unindexed scan can be scoped to.
--- The cited justification for that ("this codebase's own turn-history
--- scale, ListTurnsForSession's own doc comment") does not exist either:
--- ListTurnsForSession's own doc comment says nothing about scale, and
--- carries the identical unindexed session_id = $1 predicate itself.
+-- own rows", which is not a thing an unindexed-for-this-predicate scan
+-- can be scoped to. The cited justification for that ("this codebase's
+-- own turn-history scale, ListTurnsForSession's own doc comment") does
+-- not exist either: ListTurnsForSession's own doc comment says nothing
+-- about scale, and carries the identical status-unfiltered
+-- session_id = $1 predicate itself -- which the partial index cannot
+-- serve for the SAME reason.
 --
 -- This is, in addition, this deployment's highest-frequency turns lookup
--- with no session_id index at all: GetTurnByDispatchedMessageID runs on
--- every verdict-posting request (httpapi.PostReviewVerdict), a request
--- volume that scales with total review-turn count across every session
--- ever run, never with any one session's own small turn history. A
--- composite index on (session_id, dispatched_message_id) answers this
+-- with no status-unfiltered session_id index to answer it: GetTurnByDispatchedMessageID
+-- runs on every verdict-posting request (httpapi.PostReviewVerdict), a
+-- request volume that scales with total review-turn count across every
+-- session ever run, never with any one session's own small turn history.
+-- A composite index on (session_id, dispatched_message_id) answers this
 -- query directly -- both predicates are equality, fully covered by the
--- index -- and its leading column also serves ListTurnsForSession's own
--- identical session_id = $1 filter, though that query's own ORDER BY
--- created_at still needs its own sort step this index does not cover --
--- a genuine, if partial, second benefit, not the reason this index
--- exists.
+-- index, and carrying no WHERE clause of its own -- and its leading
+-- column also serves ListTurnsForSession's own identical session_id = $1
+-- filter, though that query's own ORDER BY created_at still needs its
+-- own sort step this index does not cover -- a genuine, if partial,
+-- second benefit, not the reason this index exists.
 ALTER TABLE turns ADD COLUMN dispatched_message_id TEXT;
 
 CREATE INDEX turns_session_id_dispatched_message_id_idx

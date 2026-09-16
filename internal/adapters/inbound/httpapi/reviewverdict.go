@@ -803,13 +803,19 @@ func PostReviewVerdict(
 		// resolved above from this request's own dispatched-message-id-resolved turn, never
 		// re-derived or asked of the agent). A missing head SHA (empty --
 		// e.g. a review turn whose own context fetch degraded to no diff
-		// at all, or no turn could be resolved) is logged and
-		// SKIPPED, never a reason to fail this tool call: review_verdicts
-		// existing reliably matters for the auto-approval engine, but
-		// that engine's own fail-CLOSED posture (internal/domain/
-		// autoapproval) already treats "no verdict on record" as
-		// ineligible, so a missing row here is a SAFE, not a dangerous,
-		// degradation. A genuine store error on the INSERT itself, by
+		// at all) is logged and SKIPPED, never a reason to fail this tool
+		// call: review_verdicts existing reliably matters for the
+		// auto-approval engine, but that engine's own fail-CLOSED posture
+		// (internal/domain/autoapproval) already treats "no verdict on
+		// record" as ineligible, so a missing row here is a SAFE, not a
+		// dangerous, degradation. Corrected (G8, fourth adversarial-review
+		// round): "or no turn could be resolved" previously named a
+		// SECOND cause here, but that path is unreachable at this point in
+		// the handler -- outcome 8's own refuse-outright fix (this file's
+		// own outcome table, above) already returns 403 before this line
+		// is ever reached whenever no turn resolves; every verdictHeadSHA
+		// this line sees comes from a dispatchedTurn that is guaranteed
+		// already resolved. A genuine store error on the INSERT itself, by
 		// contrast, is treated exactly like a findings-upsert or
 		// outbox-create failure immediately above/below: it fails this
 		// whole request (500, rolled back), never silently proceeds with

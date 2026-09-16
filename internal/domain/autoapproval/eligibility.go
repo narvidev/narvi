@@ -229,8 +229,9 @@ type EligibilityInput struct {
 	CurrentBaseSHA       string
 	CurrentAncestorChain []review.AncestorLink
 	// BaseAdvancedWithoutRewrite (D3, second adversarial-review round;
-	// doc comment corrected, E2, third round -- the previous text stated
-	// a proof that did not hold, see below) is the fast-forward-tolerance
+	// doc comment corrected twice over -- E2, third round, then G1,
+	// fourth round, because E2's OWN replacement was a second false proof
+	// -- see below) is the fast-forward-tolerance
 	// fact this engine consults ONLY when VerdictBaseSHA != CurrentBaseSHA
 	// under an UNCHANGED VerdictBaseRef/CurrentBaseRef (a retargeted base
 	// still refuses unconditionally, below, regardless of this field).
@@ -241,39 +242,63 @@ type EligibilityInput struct {
 	// rewound or rewritten.
 	//
 	// This is a TOLERATED RESIDUAL, not a proof that nothing relevant
-	// changed. The previous version of this comment claimed that, under
-	// this confirmation, "its own merge-base with head has not moved, so
-	// what the verdict examined provably still matches what the PR would
-	// merge today" -- both halves are wrong, and neither is what actually
-	// makes the tolerance safe.
+	// changed. The previous (E2, third round) version of this comment
+	// claimed that, under this confirmation, "its own merge-base with
+	// head has not moved, so what the verdict examined provably still
+	// matches what the PR would merge today" -- both halves are wrong.
+	// E2's OWN replacement then claimed a second, narrower-sounding proof
+	// -- that a moved merge-base can only shrink the diff to a SUBSET of
+	// what the verdict already examined -- and that is false too,
+	// reproduced against real git rather than reasoned from first
+	// principles (G1, fourth round): seed a file with content A on main.
+	// Branch feat-a flips it to B (one commit, C1). Branch feat-b is cut
+	// from feat-a and flips it BACK to A (a second commit, C2 == head);
+	// feat-b is the open PR, base main, main still at its own pre-feat-a
+	// commit. main...head is computed at verdict time: the two flips
+	// cancel across the merge-base, so the file is ABSENT from the diff
+	// -- the verdict never saw it at all. feat-a then merges to main (an
+	// ordinary, unrelated merge -- IsAncestor(old main, new main) is
+	// true, so this tolerance applies: base ref unchanged, base sha
+	// advanced, confirmed forward-only). The merge-base of (main, head)
+	// moves from main's old tip to C1 -- still on head's own history,
+	// exactly as the premise says -- and the FRESH main...head diff now
+	// CONTAINS the file, a real hunk (-B +A) the verdict never examined.
+	// That is not a subset of what the verdict saw (the verdict saw
+	// nothing for this file); it is a hunk manufactured by the merge-base
+	// advancing past C1. Advancing the merge-base along head's own
+	// history does not monotonically shrink the diff -- it can just as
+	// easily UNMASK whatever an earlier commit on head changed and a
+	// later commit on head undid, because that intervening commit is
+	// exactly what falls out of scope once the merge-base moves past it.
 	//
-	// The merge-base is not pinned: if the base gained a commit that is
-	// itself already an ancestor of head (the ordinary stacked case --
-	// head cut from some branch, the base later merges that same branch),
-	// IsAncestor still confirms true, yet the three-dot merge-base of
-	// (base, head) moves FORWARD, toward head. That is not a hazard for
-	// the diff, but it does mean "the merge-base has not moved" is simply
-	// false as a general claim -- the real reason the diff stays safe is
-	// narrower: head is unchanged and the base only ever advanced, so any
-	// new merge-base lies on head's own history between the old merge-base
-	// and head, which means a fresh three-dot diff can only be a SUBSET
-	// of what the verdict already examined, never introduce a change the
-	// verdict never saw.
+	// What actually bounds the damage is narrower, and structural rather
+	// than a property of the diff: both callers of ComputeEligible
+	// (revalidateCore and computeRealEligibility) re-derive
+	// ChangedFileCount and TouchedBlastRadius LIVE, from GitHub's current
+	// changed-files listing, on every call -- never from anything the
+	// verdict itself recorded. A base movement that unmasks a change to a
+	// SENSITIVE path, or that pushes the file count over threshold, is
+	// still caught, because the checks that would catch it read the PR's
+	// live state, not the stale verdict's.
 	//
-	// What is NOT re-examined -- the actual residual this tolerance
-	// accepts -- is the combination: the verdict's Shippable/blast-radius
-	// judgement was formed by reading the diff against the base's OLD
-	// content, and EligibilityInput.CIGreen is checked at CurrentHeadSHA
-	// alone, a feature-branch build that does not re-run against the
-	// base's new tip. Nothing in this engine re-examines head's reviewed
-	// diff merged into what the base has since become. Refusing here
-	// instead would disqualify every verdict on an active trunk the
-	// moment anyone else merges, with no mechanism in this codebase to
-	// re-trigger review on the base moving alone (§24's automatic
-	// re-review watches the PR's own head, never its base) -- judged the
-	// worse failure, so the residual is accepted rather than closed.
-	// §21.1 (docs/TECHNICAL_PLAN.md) records this amendment alongside its
-	// own, differently-shaped stacked-PR residual.
+	// The residual this tolerance genuinely accepts is narrower, and
+	// real: a base movement that unmasks a NON-sensitive file's silent
+	// revert of a teammate's just-landed change, while the total file
+	// count stays under threshold, is invisible to every check this
+	// engine runs -- Shippable == auto stands, from a verdict that never
+	// saw the revert. The verdict's Shippable/blast-radius judgement was
+	// formed by reading the diff against the base's OLD content, and
+	// EligibilityInput.CIGreen is checked at CurrentHeadSHA alone, a
+	// feature-branch build that does not re-run against the base's new
+	// tip. Nothing in this engine re-examines head's reviewed diff merged
+	// into what the base has since become. Refusing here instead would
+	// disqualify every verdict on an active trunk the moment anyone else
+	// merges, with no mechanism in this codebase to re-trigger review on
+	// the base moving alone (§24's automatic re-review watches the PR's
+	// own head, never its base) -- judged the worse failure, so the
+	// residual is accepted rather than closed. §21.1 (docs/
+	// TECHNICAL_PLAN.md) records this amendment alongside its own,
+	// differently-shaped stacked-PR residual.
 	//
 	// Deliberately the BOOLEAN ZERO VALUE for "not confirmed", mirroring
 	// this package's own established fail-conservative convention

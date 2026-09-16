@@ -624,6 +624,51 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		}
 	})
 
+	// TestRevalidateForMerge_NegativeCases/BaseBranchAdvanced_ButAlreadyIneligibleForAnotherReason
+	// is G3's own regression test (fourth adversarial-review round): this
+	// PR carries review:needs-human (a PERMANENT refusal, until a
+	// maintainer removes it) AND a base-SHA movement whose own live
+	// ancestor confirmation would fail if it were ever attempted. Before
+	// this fix, the ancestor-check branch ran unconditionally and its own
+	// failure preempted ComputeEligible entirely, so this PR would have
+	// been told the TRANSIENT "try again shortly" -- exactly wrong for a
+	// PR that is not going to become eligible no matter how many times the
+	// caller retries. isAncestorErr is set specifically so that if the
+	// probe (this fix) is ever bypassed or removed, the live call would
+	// fail and produce the OLD, wrong "try again shortly" message instead
+	// of this test's own expected reason -- making a regression to the
+	// pre-G3 behavior visible as a WRONG reason string, not merely a
+	// silent behavior change.
+	t.Run("BaseBranchAdvanced_ButAlreadyIneligibleForAnotherReason", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-base-advanced-and-needs-human"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 37)
+		pr.Labels = []string{"review:low-risk", "review:needs-human"}
+		rs.replaceTargetPR(actorGitHubID, pr)
+		rs.sourceControl.resolveBranchSHA = "sha-main-has-actually-advanced"
+		rs.sourceControl.isAncestorErr = errors.New("boom: github is down")
+		rs.sourceControl.isAncestorCalls = nil
+		defer func() {
+			rs.sourceControl.resolveBranchSHA = ""
+			rs.sourceControl.isAncestorErr = nil
+			rs.sourceControl.isAncestorCalls = nil
+		}()
+
+		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+		}
+		if ok {
+			t.Fatal("RevalidateForMerge() ok = true, want false (review:needs-human label applied)")
+		}
+		const wantReason = "this pull request no longer meets the auto-approval eligibility criteria: review:needs-human label is present"
+		if reason != wantReason {
+			t.Errorf("reason = %q, want %q -- G3: the permanent, already-known needs-human refusal must win over the base movement's own unconfirmed, transient state", reason, wantReason)
+		}
+		if len(rs.sourceControl.isAncestorCalls) != 0 {
+			t.Errorf("IsAncestor called %d times, want 0 -- G3/G4: a PR already ineligible on an independent, fully-known criterion must never spend a live ancestor-confirmation call that could not have changed the outcome", len(rs.sourceControl.isAncestorCalls))
+		}
+	})
+
 	// E6 (third adversarial-review round): the SAME precondition as
 	// BaseBranchAdvanced_ConfirmedFastForward_NotRefused immediately
 	// above -- base ref unchanged, base sha genuinely differs on both
@@ -670,6 +715,97 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		}
 		if !hasLogEntry(t, buf, "decisioninbox: resolve base-advanced-without-rewrite ancestry failed, refusing merge -- could not confirm whether the base's forward movement was safe to tolerate") {
 			t.Errorf("did not find the dedicated ancestor-check-failure log line -- E6: this call previously swallowed the error with no log at all; full log:\n%s", buf.String())
+		}
+	})
+
+	// TestRevalidateForMerge_ZeroIsAncestorTimeout_TreatedAsAlreadyExpired
+	// is G5's own regression test (fourth adversarial-review round) --
+	// the actual proof that E4's fix (bounding revalidateCore's own
+	// IsAncestor call with platform.Timeouts.DecisionInboxIsAncestorTimeout,
+	// third round) is wired into the real call site, which nothing in
+	// this file previously asserted: the subtest immediately above drives
+	// isAncestorErr directly, which proves the FAILURE PATH is handled,
+	// never that a timeout genuinely bounds the call. fakeDecisionInboxSourceControl.
+	// IsAncestor's own ctx.Err()-checked-first mechanism (E7, third round)
+	// exists to make exactly this provable, but its own doc comment
+	// overclaimed that this already held (G5) -- no test anywhere set
+	// DecisionInboxIsAncestorTimeout to a non-positive value. A ZERO
+	// timeout makes context.WithTimeout construct an ALREADY-EXPIRED
+	// context deterministically (context's own documented behavior for a
+	// non-positive duration -- no sleep/wall-clock dependency needed);
+	// isAncestorResult is deliberately set to TRUE (a value that would
+	// otherwise confirm the base movement and let this PR through) so
+	// that only the ctx.Err() check standing between it and a false
+	// "eligible" answer is what this test actually exercises: strip the
+	// context.WithTimeout wrap off the real call site (reverting it to
+	// the bare ctx this test hands RevalidateForMerge) and the fake sees
+	// a live, un-expired context, skips the ctx.Err() branch entirely,
+	// and returns isAncestorResult=true -- eligible, not refused -- which
+	// is exactly the mutation this test exists to catch.
+	t.Run("ZeroIsAncestorTimeout_TreatedAsAlreadyExpired_RefusesRatherThanSucceeding", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-zero-ancestor-timeout"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 36)
+		rs.sourceControl.resolveBranchSHA = "sha-main-has-actually-advanced"
+		rs.sourceControl.isAncestorResult = true
+		rs.sourceControl.isAncestorCalls = nil
+		savedTimeout := rs.deps.Timeouts.DecisionInboxIsAncestorTimeout
+		rs.deps.Timeouts.DecisionInboxIsAncestorTimeout = 0
+		defer func() {
+			rs.sourceControl.resolveBranchSHA = ""
+			rs.sourceControl.isAncestorResult = false
+			rs.sourceControl.isAncestorCalls = nil
+			rs.deps.Timeouts.DecisionInboxIsAncestorTimeout = savedTimeout
+		}()
+
+		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil -- an unconfirmable ancestry check is a domain refusal, never a Go error", err)
+		}
+		if ok {
+			t.Fatal("RevalidateForMerge() ok = true, want false -- a zero timeout must make this call fail closed, never silently succeed as though the context.WithTimeout wrap were never applied")
+		}
+		const wantReason = "this pull request's base has changed since this verdict was produced, and whether that change was safe to tolerate could not be confirmed (a live check failed) -- try again shortly"
+		if reason != wantReason {
+			t.Errorf("reason = %q, want %q", reason, wantReason)
+		}
+		if len(rs.sourceControl.isAncestorCalls) != 1 {
+			t.Fatalf("IsAncestor called %d times, want 1 -- the ancestor-check branch must actually have been entered for this test to exercise anything", len(rs.sourceControl.isAncestorCalls))
+		}
+	})
+
+	// TestRevalidateForMerge_NegativeCases/ZeroResolveBranchSHATimeout is
+	// G4's own regression test (fourth adversarial-review round),
+	// mirroring ZeroIsAncestorTimeout immediately above one live call
+	// earlier: proves platform.Timeouts.DecisionInboxResolveBranchSHATimeout
+	// genuinely bounds revalidateCore's own ResolveBranchSHA call, which
+	// previously ran on the bare, unbounded ctx this function was handed.
+	// A ZERO timeout makes context.WithTimeout construct an
+	// ALREADY-EXPIRED context deterministically; fakeDecisionInboxSourceControl.
+	// ResolveBranchSHA's own ctx.Err()-checked-first mechanism (this fix)
+	// then fails the call before ever falling back to its seeded PR scan,
+	// which would otherwise happily return testEligibleBaseSHA (a MATCH,
+	// letting this fully-eligible PR through) -- so only the
+	// context.WithTimeout wrap genuinely being applied stands between
+	// this test's expected refusal and a false "eligible".
+	t.Run("ZeroResolveBranchSHATimeout_TreatedAsAlreadyExpired_RefusesRatherThanSucceeding", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-zero-resolve-branch-sha-timeout"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 38)
+		savedTimeout := rs.deps.Timeouts.DecisionInboxResolveBranchSHATimeout
+		rs.deps.Timeouts.DecisionInboxResolveBranchSHATimeout = 0
+		defer func() {
+			rs.deps.Timeouts.DecisionInboxResolveBranchSHATimeout = savedTimeout
+		}()
+
+		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+		}
+		if ok {
+			t.Fatal("RevalidateForMerge() ok = true, want false -- a zero timeout must make this call fail closed, never silently succeed as though the context.WithTimeout wrap were never applied")
+		}
+		const wantReason = "this pull request no longer meets the auto-approval eligibility criteria: this pull request's base commit could not be established"
+		if reason != wantReason {
+			t.Errorf("reason = %q, want %q", reason, wantReason)
 		}
 	})
 

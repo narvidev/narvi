@@ -654,6 +654,58 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	touchedBlastRadius := autoapproval.ClassifyChangedPaths(pr.ChangedFiles)
 	touchedBlastRadiusKnown := !pr.ChangedFilesListDegraded
 
+	// probe (G10, fourth adversarial-review round) asks "setting the
+	// base-freshness question aside entirely, would this PR already be
+	// ineligible" -- every criterion below is fully known WITHOUT a live
+	// SCM call (head-SHA equality, the verdict's own base-ref/ancestor-
+	// chain/policy-version equality, CI, Shippable, diff size, blast
+	// radius). CurrentBaseSHA is deliberately ASSUMED equal to the
+	// verdict's own recorded VerdictBaseSHA -- the most lenient possible
+	// stand-in: it trivially satisfies BOTH of ComputeEligible's
+	// base-SHA-comparison checks (ReasonBaseSHAUnknown/ReasonBaseMoved)
+	// regardless of BaseAdvancedWithoutRewrite, and affects nothing else
+	// the probe checks. Any REAL currentBaseSHA can only be
+	// equally-or-LESS lenient than this assumption on those two checks,
+	// and every other criterion is unaffected by which base-SHA scenario
+	// is used -- so if the probe already refuses, eligibleIgnoringHuman
+	// Signals below is false regardless of what the live base-branch-tip
+	// resolution (or the fast-forward-ancestry confirmation) turns out
+	// to answer, and neither call could have changed that outcome. A
+	// live SCM failure that could not have changed the row's own fate
+	// must not raise Result.SCMFetchFailed's producer (6) signal, which
+	// that field's own doc comment scopes to a lookup that COULD have
+	// affected the row ("the row is NOT dropped, only demoted") --
+	// before this fix, both live calls ran unconditionally, and a
+	// failure was reported as degraded even for a PR this engine was
+	// always going to refuse on an unrelated, already-known criterion.
+	// HasNeedsHumanLabel is left false here, mirroring the FINAL
+	// ComputeEligible call below (hasNeedsHuman is applied externally,
+	// see eligible's own definition) -- the probe answers exactly the
+	// same eligibleIgnoringHumanSignals question the final call answers,
+	// just with the base-SHA question deferred.
+	probe := autoapproval.EligibilityInput{
+		Verdict:                    record.Verdict,
+		VerdictAssessed:            true,
+		VerdictHeadSHA:             record.HeadSHA,
+		VerdictBaseRef:             record.Context.BaseRef,
+		VerdictBaseSHA:             record.Context.BaseSHA,
+		VerdictAncestorChain:       record.Context.AncestorChain,
+		VerdictPolicyVersion:       record.Context.PolicyVersion,
+		CurrentHeadSHA:             pr.HeadSHA,
+		CurrentBaseRef:             pr.BaseRef,
+		CurrentBaseSHA:             record.Context.BaseSHA, // assumed equal -- see doc comment above
+		CurrentAncestorChain:       convertAncestorChain(pr.AncestorChain),
+		BaseAdvancedWithoutRewrite: true, // moot: the assumed SHA equality above already bypasses this check
+		CIGreen:                    ciGreen,
+		HasNeedsHumanLabel:         false,
+		ChangedFileCount:           changedFileCount,
+		TouchedBlastRadius:         touchedBlastRadius,
+		TouchedBlastRadiusKnown:    touchedBlastRadiusKnown,
+	}
+	if probeEligible, _ := autoapproval.ComputeEligible(probe, cfg); !probeEligible {
+		return false, false
+	}
+
 	// A genuine correctness bug: computed ONCE, ignoring BOTH human-disagreement signals --
 	// HasNeedsHumanLabel here, and pr.HasChangesRequested, which is not
 	// even a ComputeEligible INPUT at all (it is enforced entirely
@@ -717,10 +769,18 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// ComputeEligible's own empty-base-sha guard (finding F2) then refuses
 	// on its own distinct reason" precedent -- never a second,
 	// independently-invented fail-closed path. ALSO marks this function's
-	// own degraded return true (E5, third round): the row this produces
-	// is about to fail closed on ReasonBaseSHAUnknown for a reason that
-	// has nothing to do with the PR's own merits -- a live GitHub call
-	// failed -- and the caller must be able to tell the two apart.
+	// own degraded return true (E5, third round; correctly SCOPED by the
+	// probe above, G10, fourth round): the probe already confirmed this
+	// row would otherwise be eligible, so a live GitHub call failing here
+	// really is about to fail this row closed on ReasonBaseSHAUnknown for
+	// a reason that has nothing to do with the PR's own merits -- and the
+	// caller must be able to tell the two apart. Before the probe existed,
+	// this same degraded=true fired even when the row was ALREADY, and
+	// independently, going to be ineligible (a needs-human label aside,
+	// which the probe deliberately still ignores -- see the probe's own
+	// doc comment above), which is producer (6)'s own doc comment's "row
+	// is NOT dropped, only demoted" scoped more widely than it should
+	// have been.
 	currentBaseSHA, _, baseSHAErr := deps.SCMCache.ResolveBranchSHA(ctx, ports.ResolveBranchSHASpec{
 		Owner:  pr.Owner,
 		Repo:   pr.Repo,
@@ -736,9 +796,15 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// baseAdvancedWithoutRewrite (D3, second adversarial-review round)
 	// mirrors revalidateCore's own identical wiring (revalidate.go) -- see
 	// that call site's own doc comment for the full "why" and the
-	// preconditions gating this call. Cached via deps.SCMCache.IsAncestor,
-	// exactly like currentBaseSHA immediately above, for the identical
-	// read-model-vs-action-endpoint reason.
+	// preconditions gating this call, and autoapproval.
+	// BaseAdvancedWithoutRewrite's own doc comment (eligibility.go) for
+	// what a confirmed "yes" here actually establishes and what it does
+	// not. Cached via deps.SCMCache.IsAncestor, exactly like
+	// currentBaseSHA immediately above, for the identical
+	// read-model-vs-action-endpoint reason. A failure here ALSO marks
+	// degraded true (E5, third round), pinned by its own regression test
+	// (G9, fourth round -- previously untested: only the ResolveBranchSHA
+	// half of this same signal had one).
 	var baseAdvancedWithoutRewrite bool
 	if record.Context.BaseRef == pr.BaseRef && record.Context.BaseSHA != "" && currentBaseSHA != "" && record.Context.BaseSHA != currentBaseSHA {
 		confirmed, ancestorErr := deps.SCMCache.IsAncestor(ctx, ports.IsAncestorSpec{

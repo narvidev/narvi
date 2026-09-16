@@ -317,13 +317,26 @@ type GetTurnByDispatchedMessageIDParams struct {
 // must still find, so there is no "AND status = ..." filter here at all.
 // turns.dispatched_message_id is unique in PRACTICE (a UUID minted fresh
 // per dispatch, scoped further by session_id in this WHERE clause) though
-// not DB-enforced unique (see migration 000131's own doc comment for why
-// no index/constraint was added); a caller-observed multiple-row result
+// not DB-enforced unique (corrected, G7, fourth adversarial-review round:
+// migration 000131 DOES add an index over (session_id,
+// dispatched_message_id) -- for this query's own performance, never a
+// constraint -- so pointing here at "why no index... was added" was
+// stale the moment that migration shipped; no migration's own doc
+// comment actually explains why a UNIQUE constraint specifically was
+// never added, so none is cited); a caller-observed multiple-row result
 // would be a genuine anomaly, not a normal outcome this query's own :one
 // cardinality anticipates. No matching row (dispatched_message_id absent,
 // or naming a turn from a different session entirely) is pgx.ErrNoRows,
 // mirroring GetTurn's own identical not-found convention -- the caller
-// degrades exactly like a not-found processing turn already does.
+// REFUSES the request (403), never degrades and proceeds (corrected, G7,
+// fourth round: the sentence this replaced -- "the caller degrades
+// exactly like a not-found processing turn already does" -- described
+// this column's own ORIGINAL, pre-403 behavior, which migration 000131's
+// own doc comment already documents as corrected, E3, third round, for
+// the identical reason; this copy of the same stale sentence was never
+// updated along with it). See reviewverdict.go's own outcome table
+// (internal/adapters/inbound/httpapi) for the current, authoritative
+// behavior.
 func (q *Queries) GetTurnByDispatchedMessageID(ctx context.Context, arg GetTurnByDispatchedMessageIDParams) (Turn, error) {
 	row := q.db.QueryRow(ctx, getTurnByDispatchedMessageID, arg.SessionID, arg.DispatchedMessageID)
 	var i Turn

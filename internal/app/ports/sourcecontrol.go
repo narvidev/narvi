@@ -903,20 +903,29 @@ type SourceControl interface {
 	// generic git concept, not a GitHub-specific one).
 	//
 	// This is what makes the base-freshness gate (autoapproval.
-	// ComputeEligible) tolerate an ORDINARY, unrelated merge landing on a
-	// PR's base branch between review and merge, while still refusing a
-	// genuine rewrite: a three-dot diff (base...head, what GitHub itself
-	// shows on a PR, and what reviewcontext.Fetch pins a review to) is
-	// defined against the MERGE BASE of (base, head), never against the
-	// base branch's raw tip -- so as long as the base's OLD tip (what a
-	// verdict examined) remains an ancestor of its NEW tip (what is live
-	// now), the merge-base or diff-relevant commit relationship, and the
-	// diff itself, provably have not moved, regardless of how many
-	// unrelated commits landed on the base branch in between; only a
-	// disagreement here (a force-push/history rewrite on the base branch,
-	// or the base being reset to something that does not descend from
-	// what was reviewed) means the review might no longer cover what
-	// merging would actually integrate.
+	// ComputeEligible) TOLERATE an ORDINARY, unrelated merge landing on a
+	// PR's base branch between review and merge, rather than refusing on
+	// any base movement at all -- while still refusing a genuine rewrite:
+	// a disagreement here (a force-push/history rewrite on the base
+	// branch, or the base being reset to something that does not descend
+	// from what was reviewed) means the review might no longer cover what
+	// merging would actually integrate, and the gate refuses outright.
+	//
+	// A confirmed "yes" here (autoapproval.BaseAdvancedWithoutRewrite's
+	// own doc comment carries the full reasoning, corrected there twice
+	// over -- E2, third adversarial-review round, then G1, fourth, after
+	// E2's own replacement proof was ALSO shown false against real git)
+	// is NOT a proof that the diff a fresh three-dot comparison produces
+	// is unchanged, or bounded to a subset of what the verdict already
+	// examined -- it is neither: the three-dot merge-base of (base, head)
+	// can move FORWARD along head's own history as the base advances, and
+	// moving it forward can UNMASK a change one of head's own earlier
+	// commits made and a later one undid, producing a hunk the verdict
+	// never saw. What this confirmation actually establishes is narrower:
+	// the base only ever gained commits reachable from its own new tip,
+	// never rewound or rewritten -- autoapproval's own doc comment names
+	// what does and does not follow from that, and why the residual it
+	// leaves open is accepted rather than closed.
 	//
 	// Errors are plain, exactly like ResolveBranchSHA/CreatePR above --
 	// see IsAncestorSpec's own doc comment for the fail-closed convention

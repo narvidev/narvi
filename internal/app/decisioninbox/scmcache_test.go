@@ -60,11 +60,14 @@ type fakeSCMCacheSourceControl struct {
 	resolveBranchSHADelay     time.Duration
 	resolveBranchSHACallCount int
 
-	// isAncestorResult/isAncestorErr/isAncestorCallCount (D3, second
-	// adversarial-review round) back SCMCache.IsAncestor's own tests
-	// below, mirroring resolveBranchSHA's own identical shape.
+	// isAncestorResult/isAncestorErr/isAncestorDelay/isAncestorCallCount
+	// (D3, second adversarial-review round; isAncestorDelay added G2,
+	// fourth round, mirroring resolveBranchSHADelay's own identical
+	// purpose) back SCMCache.IsAncestor's own tests below, mirroring
+	// resolveBranchSHA's own identical shape.
 	isAncestorResult    bool
 	isAncestorErr       error
+	isAncestorDelay     time.Duration
 	isAncestorCallCount int
 }
 
@@ -156,13 +159,21 @@ func (f *fakeSCMCacheSourceControl) resolveBranchSHACalls() int {
 // IsAncestor (D3, second adversarial-review round) backs
 // SCMCache.IsAncestor's own tests below -- mirrors ResolveBranchSHA's own
 // identical shape immediately above, one comparison further.
-func (f *fakeSCMCacheSourceControl) IsAncestor(context.Context, ports.IsAncestorSpec) (bool, error) {
+func (f *fakeSCMCacheSourceControl) IsAncestor(ctx context.Context, _ ports.IsAncestorSpec) (bool, error) {
 	f.mu.Lock()
 	f.isAncestorCallCount++
+	delay := f.isAncestorDelay
 	err := f.isAncestorErr
 	result := f.isAncestorResult
 	f.mu.Unlock()
 
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
 	if err != nil {
 		return false, err
 	}
@@ -497,30 +508,29 @@ func TestSCMCache_ResolveBranchSHA_CacheHitWithinTTL(t *testing.T) {
 // TestSCMCache_ResolveBranchSHA_ExpiredEntryRefetches proves the OTHER
 // half: a call past DecisionInboxSCMCacheTTL genuinely re-fetches, rather
 // than serving a stale, expired entry forever.
+//
+// Uses a REAL clock throughout (G2, fourth adversarial-review round --
+// the previous version of this test used a fully injected, arbitrary
+// 2026 date instead, on the theory that ResolveBranchSHA's own
+// fetchedAt was anchored on that SAME injected `now` parameter; E9's
+// clock change did anchor it there, which is exactly the "born-expired
+// entries" bug this same file documents as fixed for ResolveBranchSHA's
+// two sibling cache methods -- fetchedAt is now, correctly, a real
+// fetch-completion instant, mirroring TestSCMCache_
+// ListOpenPRsForUser_CacheHitReturnsOriginalFetchInstant's own identical
+// "a real time.Sleep between the two calls" precedent immediately above
+// in this file, rather than a second, decoupled logical clock this
+// method no longer has).
 func TestSCMCache_ResolveBranchSHA_ExpiredEntryRefetches(t *testing.T) {
 	t.Parallel()
 
 	fake := &fakeSCMCacheSourceControl{resolveBranchSHA: "sha-abc123"}
 	timeouts := platform.DefaultTimeouts()
-	timeouts.DecisionInboxSCMCacheTTL = 50 * time.Millisecond
+	timeouts.DecisionInboxSCMCacheTTL = 20 * time.Millisecond
 	cache := decisioninbox.NewSCMCache(fake, timeouts)
 	spec := ports.ResolveBranchSHASpec{Owner: "acme", Repo: "widgets", Branch: "main", Token: "tok"}
 
-	// A fixed, injected clock -- deliberately NEVER time.Now() -- so this
-	// test is provable against the cache's own logical clock alone (E9,
-	// third adversarial-review round). This previously seeded `now` from
-	// a REAL time.Now() and re-checked at now+TTL+1ms: a 1ms margin
-	// against a SEPARATE, real time.Now() call inside ResolveBranchSHA
-	// itself (scmcache.go's own fetchedAt, at the time) that any
-	// scheduling delay between capturing `now` here and that internal
-	// call actually running could exceed -- silently keeping the
-	// "expired" entry alive and failing this test on a loaded machine.
-	// Now that ResolveBranchSHA stores against the SAME `now` it is
-	// handed, never a second, independent clock read, expiry is a pure
-	// function of the two `now` values THIS TEST controls -- no
-	// wall-clock proximity involved anywhere.
-	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
-	if _, _, err := cache.ResolveBranchSHA(context.Background(), spec, now); err != nil {
+	if _, _, err := cache.ResolveBranchSHA(context.Background(), spec, time.Now()); err != nil {
 		t.Fatalf("first call error = %v", err)
 	}
 
@@ -528,29 +538,66 @@ func TestSCMCache_ResolveBranchSHA_ExpiredEntryRefetches(t *testing.T) {
 	fake.resolveBranchSHA = "sha-def456"
 	fake.mu.Unlock()
 
-	// Exactly at the TTL boundary, no margin past it needed:
-	// ttlCache.get's own `!now.Before(entry.expiresAt)` check treats
-	// now == expiresAt as already expired.
-	now2 := now.Add(timeouts.DecisionInboxSCMCacheTTL)
-	sha2, asOf2, err := cache.ResolveBranchSHA(context.Background(), spec, now2)
+	time.Sleep(40 * time.Millisecond) // safely past DecisionInboxSCMCacheTTL above
+	sha2, asOf2, err := cache.ResolveBranchSHA(context.Background(), spec, time.Now())
 	if err != nil {
 		t.Fatalf("second call error = %v", err)
 	}
 	if sha2 != "sha-def456" {
 		t.Errorf("second call (past TTL) sha = %q, want %q (a fresh live fetch, not the expired cached value)", sha2, "sha-def456")
 	}
-	// E9's own decisive assertion: a fresh fetch's own asOf must be
-	// EXACTLY the injected clock this call was handed. Reverting
-	// scmcache.go's own fetchedAt to a real time.Now() call fails this
-	// deterministically (a real wall-clock reading almost never equals
-	// this test's own fixed, arbitrary 2026-09-16 instant), never
-	// flakily -- the exact property a mutation of that fix must be
-	// caught by.
-	if !asOf2.Equal(now2) {
-		t.Errorf("second call asOf = %v, want exactly %v (E9: a fresh fetch's own fetchedAt must be the injected clock this call was handed, never a second, real time.Now() read)", asOf2, now2)
+	if asOf2.IsZero() {
+		t.Error("second call asOf is zero, want a real fetch-completion instant")
 	}
 	if got := fake.resolveBranchSHACalls(); got != 2 {
 		t.Errorf("fetch called %d times, want 2 (the second call must genuinely re-fetch)", got)
+	}
+}
+
+// TestSCMCache_ResolveBranchSHA_SlowFetchDoesNotBornExpire is G2's own
+// regression test (fourth adversarial-review round): the IDENTICAL
+// "born-expired entries" fix already proven for ListOpenPRsForUser/
+// ResolveCodeOwners above, for ResolveBranchSHA instead -- a round-3
+// (E9) clock change anchored this method's own fetchedAt on the
+// caller's PRE-fetch `now` parameter rather than fetch completion,
+// reintroducing the bug this file otherwise documents as fixed. Mirrors
+// TestSCMCache_ListOpenPRsForUser_SlowFetchDoesNotBornExpire exactly, at
+// the same test-friendly durations, for ResolveBranchSHA.
+func TestSCMCache_ResolveBranchSHA_SlowFetchDoesNotBornExpire(t *testing.T) {
+	t.Parallel()
+
+	const ttl = 50 * time.Millisecond
+	const fetchDelay = 200 * time.Millisecond
+
+	fake := &fakeSCMCacheSourceControl{resolveBranchSHA: "sha-abc123", resolveBranchSHADelay: fetchDelay}
+	timeouts := platform.DefaultTimeouts()
+	timeouts.DecisionInboxSCMCacheTTL = ttl
+	timeouts.DecisionInboxResolveBranchSHATimeout = 10 * time.Second // plenty of headroom over fetchDelay
+	cache := decisioninbox.NewSCMCache(fake, timeouts)
+	spec := ports.ResolveBranchSHASpec{Owner: "acme", Repo: "widgets", Branch: "main", Token: "tok"}
+
+	preFetchNow := time.Now()
+	_, _, err := cache.ResolveBranchSHA(context.Background(), spec, preFetchNow)
+	if err != nil {
+		t.Fatalf("first call error = %v", err)
+	}
+	if got := fake.resolveBranchSHACalls(); got != 1 {
+		t.Fatalf("fetch called %d times after first call, want 1", got)
+	}
+
+	// A realistic, immediate follow-up request: `now` captured fresh,
+	// right after the first call returns.
+	secondNow := time.Now()
+	if !secondNow.After(preFetchNow.Add(ttl)) {
+		t.Fatalf("test setup invariant violated: the fetch (%s) must outlast the TTL (%s) for this test to actually exercise the bug -- preFetchNow=%v secondNow=%v", fetchDelay, ttl, preFetchNow, secondNow)
+	}
+
+	_, _, err = cache.ResolveBranchSHA(context.Background(), spec, secondNow)
+	if err != nil {
+		t.Fatalf("second call error = %v", err)
+	}
+	if got := fake.resolveBranchSHACalls(); got != 1 {
+		t.Errorf("fetch called %d times after second call, want 1 (still a cache hit -- expiresAt must be anchored on fetch COMPLETION, not the pre-fetch `now`)", got)
 	}
 }
 
@@ -605,6 +652,52 @@ func TestSCMCache_IsAncestor_CacheHitWithinTTL(t *testing.T) {
 	}
 	if got := fake.isAncestorCalls(); got != 1 {
 		t.Errorf("fetch called %d times after second call, want 1 (still a cache hit)", got)
+	}
+}
+
+// TestSCMCache_IsAncestor_SlowFetchDoesNotBornExpire is G2's own
+// regression test (fourth adversarial-review round), mirroring
+// TestSCMCache_ResolveBranchSHA_SlowFetchDoesNotBornExpire one cached
+// method further -- IsAncestor's own fetchedAt had the identical E9
+// clock-anchoring bug (its own doc comment explicitly claimed to mirror
+// ResolveBranchSHA's fix, which made the claim false the moment E9
+// changed ResolveBranchSHA's own anchor without this method following).
+// IsAncestor returns no asOf to its own caller, so this test can only
+// observe the bug through the cache's own call count, exactly like
+// ListOpenPRsForUser/ResolveCodeOwners' own identical tests above.
+func TestSCMCache_IsAncestor_SlowFetchDoesNotBornExpire(t *testing.T) {
+	t.Parallel()
+
+	const ttl = 50 * time.Millisecond
+	const fetchDelay = 200 * time.Millisecond
+
+	fake := &fakeSCMCacheSourceControl{isAncestorResult: true, isAncestorDelay: fetchDelay}
+	timeouts := platform.DefaultTimeouts()
+	timeouts.DecisionInboxSCMCacheTTL = ttl
+	timeouts.DecisionInboxIsAncestorTimeout = 10 * time.Second // plenty of headroom over fetchDelay
+	cache := decisioninbox.NewSCMCache(fake, timeouts)
+	spec := ports.IsAncestorSpec{Owner: "acme", Repo: "widgets", Ancestor: "sha-old", Descendant: "sha-new", Token: "tok"}
+
+	preFetchNow := time.Now()
+	if _, err := cache.IsAncestor(context.Background(), spec, preFetchNow); err != nil {
+		t.Fatalf("first call error = %v", err)
+	}
+	if got := fake.isAncestorCalls(); got != 1 {
+		t.Fatalf("fetch called %d times after first call, want 1", got)
+	}
+
+	// A realistic, immediate follow-up request: `now` captured fresh,
+	// right after the first call returns.
+	secondNow := time.Now()
+	if !secondNow.After(preFetchNow.Add(ttl)) {
+		t.Fatalf("test setup invariant violated: the fetch (%s) must outlast the TTL (%s) for this test to actually exercise the bug -- preFetchNow=%v secondNow=%v", fetchDelay, ttl, preFetchNow, secondNow)
+	}
+
+	if _, err := cache.IsAncestor(context.Background(), spec, secondNow); err != nil {
+		t.Fatalf("second call error = %v", err)
+	}
+	if got := fake.isAncestorCalls(); got != 1 {
+		t.Errorf("fetch called %d times after second call, want 1 (still a cache hit -- expiresAt must be anchored on fetch COMPLETION, not the pre-fetch `now`)", got)
 	}
 }
 

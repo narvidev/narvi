@@ -216,16 +216,24 @@ var _ ports.SourceControl = (*fakeDecisionInboxSourceControl)(nil)
 // compared -- mirrors this fake's own codeOwnersCalls precedent.
 //
 // Honors ctx (E7, third adversarial-review round): this previously
-// ignored ctx entirely (the blank identifier in its own signature), so
-// platform.Timeouts.DecisionInboxIsAncestorTimeout being zero, unset, or
-// never wired into the real call at all could not make ANY test in this
-// package fail -- the exact "the timeout is asserted by nothing" gap.
+// ignored ctx entirely (the blank identifier in its own signature).
 // ctx.Err() is checked FIRST, before either configured return: a caller
 // context.WithTimeout'd with a non-positive duration is already expired
 // the instant it is constructed (context's own documented behavior, no
-// sleep/wall-clock dependency needed to observe it), so this makes a
-// zero/missing timeout on the real call site fail deterministically and
-// visibly here, precisely where the previous version could not.
+// sleep/wall-clock dependency needed to observe it), so THIS MECHANISM
+// makes a zero/missing timeout on the real call site detectable --
+// something no version of this fake could do before E7.
+//
+// That capability sat unused (G5, fourth adversarial-review round): E7's
+// own comment here previously claimed a zero/unset/never-wired timeout
+// "could not make ANY test in this package fail", stated as though this
+// fake already delivered that guarantee -- but no test anywhere in this
+// package ever set platform.Timeouts.DecisionInboxIsAncestorTimeout to a
+// non-positive value and asserted the resulting failure, so nothing
+// actually exercised the branch this doc comment described. A mechanism
+// nothing calls pins nothing.
+// TestRevalidateForMerge_ZeroIsAncestorTimeout_TreatedAsAlreadyExpired
+// (revalidate_integration_test.go) is the first test that does.
 func (f *fakeDecisionInboxSourceControl) IsAncestor(ctx context.Context, spec ports.IsAncestorSpec) (bool, error) {
 	f.isAncestorCalls = append(f.isAncestorCalls, spec)
 	if err := ctx.Err(); err != nil {
@@ -257,7 +265,18 @@ func (f *fakeDecisionInboxSourceControl) ResolveCodeOwners(_ context.Context, sp
 func (f *fakeDecisionInboxSourceControl) CreatePR(context.Context, ports.CreatePRSpec) (ports.PRRef, error) {
 	return ports.PRRef{}, errors.New("fakeDecisionInboxSourceControl: CreatePR not implemented")
 }
-func (f *fakeDecisionInboxSourceControl) ResolveBranchSHA(_ context.Context, spec ports.ResolveBranchSHASpec) (string, string, error) {
+// Honors ctx (G4, fourth adversarial-review round -- mirroring
+// IsAncestor's own identical E7 fix above, for the identical reason):
+// this previously ignored ctx entirely, so a caller that failed to wrap
+// this call in a timeout (revalidateCore's own ResolveBranchSHA call was
+// exactly this, before G4) could not be caught by any test in this
+// package. ctx.Err() is checked FIRST, before any configured/seeded
+// return, for the identical "already-expired context is deterministic,
+// no sleep needed" reason IsAncestor's own doc comment gives.
+func (f *fakeDecisionInboxSourceControl) ResolveBranchSHA(ctx context.Context, spec ports.ResolveBranchSHASpec) (string, string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", "", err
+	}
 	if f.resolveBranchSHAErr != nil {
 		return "", "", f.resolveBranchSHAErr
 	}
@@ -1888,6 +1907,127 @@ func TestBuild_LiveSCMLookupFails_MarksSCMFetchFailed(t *testing.T) {
 	}
 	if !result.SCMFetchFailed {
 		t.Error("SCMFetchFailed = false, want true -- E5: a live SCM lookup failure inside computeRealEligibility must mark the whole read degraded, or this row renders as a considered ineligibility judgement rather than the truth (a lookup failed)")
+	}
+}
+
+// TestBuild_IsAncestorLookupFails_MarksSCMFetchFailed is G9's own
+// regression test (fourth adversarial-review round): the IDENTICAL E5
+// degraded signal as TestBuild_LiveSCMLookupFails_MarksSCMFetchFailed
+// immediately above, but for computeRealEligibility's OTHER live SCM
+// lookup -- the fast-forward-ancestry confirmation (deps.SCMCache.
+// IsAncestor), which producer (6)'s own doc comment (Result.
+// SCMFetchFailed) has always named alongside ResolveBranchSHA but which,
+// before this test, had no regression coverage of its own at all. The
+// base branch's live tip is made to genuinely differ from the verdict's
+// own recorded base sha (resolveBranchSHA overridden, mirroring
+// TestBuild_BaseBranchAdvanced_LiveTipMoved_DemotesFromReadyToMerge
+// below) so the ancestor-check branch is actually entered, and the
+// ancestor check itself then fails (isAncestorErr set) rather than
+// confirming or refuting the movement.
+func TestBuild_IsAncestorLookupFails_MarksSCMFetchFailed(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "5010"
+	const repoFullName = "acme/build-is-ancestor-lookup-fails"
+
+	actor, fakeSCM := buildEligibleReadyToMergeFixture(ctx, t, pool, tokenKey, "g9-actor@example.com", actorGitHubExternalID, repoFullName, 74)
+	fakeSCM.resolveBranchSHA = "sha-main-has-actually-advanced"
+	fakeSCM.isAncestorErr = errors.New("boom: github is down")
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict: appreviewverdict.Deps{
+			ReviewVerdicts: narvipg.NewReviewVerdictStore(pool), RepoSettings: narvipg.NewRepoSettingsStore(pool),
+			ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool),
+			Timeouts: platform.DefaultTimeouts(),
+		},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil (a live SCM lookup failure must degrade ONE row, never fail the whole Build call)", err)
+	}
+	item := findItemByPR(result.Items, 74)
+	if item == nil {
+		t.Fatal("PR #74 missing from the inbox entirely, want present as needs_review")
+	}
+	if item.Kind == decisioninboxdomain.KindReadyToMerge {
+		t.Error("Kind = ready_to_merge, want needs_review -- a failed live fast-forward-ancestry confirmation must fail CLOSED via ReasonBaseMoved")
+	}
+	if !result.SCMFetchFailed {
+		t.Error("SCMFetchFailed = false, want true -- G9/E5: a failed IsAncestor call inside computeRealEligibility must mark the whole read degraded, exactly like a failed ResolveBranchSHA call already does, or this row renders as a considered ineligibility judgement rather than the truth (a lookup failed)")
+	}
+	if len(fakeSCM.isAncestorCalls) != 1 {
+		t.Fatalf("IsAncestor called %d times, want 1 -- the ancestor-check branch must actually have been entered for this test to exercise anything", len(fakeSCM.isAncestorCalls))
+	}
+}
+
+// TestBuild_BaseBranchAdvanced_ButAlreadyIneligibleForAnotherReason is
+// G10's own regression test (fourth adversarial-review round): this PR's
+// CI is red (a criterion computeRealEligibility's own probe checks
+// WITHOUT any live SCM call) AND its base SHA has moved in a way whose
+// live ancestor confirmation would fail if it were ever attempted.
+// Before this fix, computeRealEligibility called ResolveBranchSHA/
+// IsAncestor unconditionally, so a live-call failure marked
+// Result.SCMFetchFailed degraded even though CI-red alone already
+// guaranteed this row could never render ready_to_merge -- exactly the
+// "base-SHA lookups that could not have affected the row" producer (6)'s
+// own doc comment now says must not raise this signal. isAncestorErr is
+// set specifically so that if the probe is ever bypassed or removed, the
+// live call would fail and mark SCMFetchFailed=true instead of this
+// test's own expected false, making a regression to the pre-G10
+// behavior visible as a wrong degraded signal, not merely a silent
+// behavior change.
+func TestBuild_BaseBranchAdvanced_ButAlreadyIneligibleForAnotherReason(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "5011"
+	const repoFullName = "acme/build-base-advanced-and-ci-red"
+
+	actor, fakeSCM := buildEligibleReadyToMergeFixture(ctx, t, pool, tokenKey, "g10-actor@example.com", actorGitHubExternalID, repoFullName, 76)
+	fakeSCM.openPRsByExternalID[actorGitHubExternalID][0].CIConclusion = ports.CIConclusionFailure
+	fakeSCM.resolveBranchSHA = "sha-main-has-actually-advanced"
+	fakeSCM.isAncestorErr = errors.New("boom: github is down")
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict: appreviewverdict.Deps{
+			ReviewVerdicts: narvipg.NewReviewVerdictStore(pool), RepoSettings: narvipg.NewRepoSettingsStore(pool),
+			ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool),
+			Timeouts: platform.DefaultTimeouts(),
+		},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil", err)
+	}
+	item := findItemByPR(result.Items, 76)
+	if item == nil {
+		t.Fatal("PR #76 missing from the inbox entirely, want present as needs_review")
+	}
+	if item.Kind == decisioninboxdomain.KindReadyToMerge {
+		t.Error("Kind = ready_to_merge, want needs_review -- CI is red")
+	}
+	if result.SCMFetchFailed {
+		t.Error("SCMFetchFailed = true, want false -- G10: CI-red alone already refuses this PR, independent of the base-SHA question, so the live ResolveBranchSHA/IsAncestor calls could never have changed this row's own fate; their failure must not raise the inbox-wide degraded signal")
+	}
+	if len(fakeSCM.isAncestorCalls) != 0 {
+		t.Errorf("IsAncestor called %d times, want 0 -- G10: a PR already ineligible on an independent, fully-known criterion must never spend a live ancestor-confirmation call that could not have changed the outcome", len(fakeSCM.isAncestorCalls))
 	}
 }
 

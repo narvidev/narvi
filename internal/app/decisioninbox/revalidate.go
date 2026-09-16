@@ -123,7 +123,19 @@ func RevalidateForAutoMerge(ctx context.Context, deps Deps, sourceControl ports.
 		return false, "", "", fmt.Errorf("decisioninbox: revalidate for auto-merge: repoFullName %q is not shaped owner/repo", repoFullName)
 	}
 
-	target, found, err := sourceControl.GetOpenPR(ctx, owner, repo, prNumber, botToken)
+	// Bounded by platform.Timeouts.GitHubGetPRTimeout (G4, fourth
+	// adversarial-review round): this call previously ran on the bare,
+	// unbounded ctx this function was handed -- ctx's own only bound is
+	// whatever the automerge worker's own tick context happens to carry
+	// (internal/app/automerge/worker.go's own PumpOnce/mergeCandidate,
+	// which sets none), so a hung GitHub call here could stall a merge
+	// tick indefinitely. GetOpenPR resolves one owner/repo#number by a
+	// single GET, the SAME class of call GitHubGetPRTimeout already
+	// bounds elsewhere in this codebase (platform/timeouts.go's own doc
+	// comment), never a new timeout invented for this one call site.
+	getPRCtx, cancel := context.WithTimeout(ctx, deps.Timeouts.GitHubGetPRTimeout)
+	target, found, err := sourceControl.GetOpenPR(getPRCtx, owner, repo, prNumber, botToken)
+	cancel()
 	if err != nil {
 		return false, "", "", err
 	}
@@ -231,7 +243,7 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	if cfgErr != nil {
 		return false, "", "", fmt.Errorf("decisioninbox: revalidate for merge: load eligibility config: %w", cfgErr)
 	}
-	// ChangedFileCount/TouchedBlastRadius are BOTH
+	// changedFileCount/touchedBlastRadius/touchedBlastRadiusKnown are ALL
 	// derived here from target -- target is revalidateCore's own
 	// already-fetched, server-side ports.OpenPR (RevalidateForMerge's
 	// live ListOpenPRsForUser search, or RevalidateForAutoMerge's live
@@ -241,34 +253,85 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	//
 	// Phase 5 audit findings 1+2 (both fixed, the SAME root cause C1
 	// fixed for the verdict's own self-report, now closed for THIS
-	// adapter-fetched data too): ChangedFileCount is target.
+	// adapter-fetched data too): changedFileCount is target.
 	// ChangedFilesCount, GitHub's own authoritative scalar -- never
 	// len(target.ChangedFiles), which githubapi caps at one page and
 	// which used to also silently read as 0 whenever the underlying
-	// GitHub fetch failed outright. TouchedBlastRadiusKnown is
+	// GitHub fetch failed outright. touchedBlastRadiusKnown is
 	// !target.ChangedFilesListDegraded -- see that field's own doc
 	// comment (ports.OpenPR) for the two independent ways it can go
 	// true (a failed fetch, or a genuinely large diff whose listing was
 	// truncated at GitHub's own one-page cap): either way,
 	// ComputeEligible now refuses this PR rather than silently trusting
 	// an incomplete-or-absent classification of target.ChangedFiles.
-	// VerdictAssessed is unconditionally true here -- hasVerdict was
-	// already confirmed true above (the !hasVerdict branch returns
-	// earlier) -- but is still passed through explicitly, never left at
-	// its own zero value, mirroring TouchedBlastRadiusKnown's own
-	// identical "never rely on a caller forgetting" discipline: a future
-	// edit to this function that moves or removes the early !hasVerdict
-	// return must not silently reintroduce ReasonNotAssessed's own fail-
-	// closed guard as the ONLY thing standing between a not-assessed PR
-	// and a merge -- ComputeEligible checks it again regardless.
+	changedFileCount := target.ChangedFilesCount
+	touchedBlastRadius := autoapproval.ClassifyChangedPaths(target.ChangedFiles)
+	touchedBlastRadiusKnown := !target.ChangedFilesListDegraded
+
+	// probe (G3/G4, fourth adversarial-review round) asks "setting the
+	// base-freshness question aside entirely, is this PR already
+	// ineligible" -- every criterion below is fully known WITHOUT any
+	// live SCM call: head-SHA equality (VerdictHeadSHA/CurrentHeadSHA,
+	// both already in hand), the verdict's own base-ref/ancestor-chain/
+	// policy-version equality (record.Context vs. target, no new I/O,
+	// mirroring CurrentHeadSHA's own identical sourcing), CI, Shippable,
+	// diff size, and blast radius. CurrentBaseSHA is deliberately
+	// ASSUMED equal to the verdict's own recorded VerdictBaseSHA -- the
+	// most lenient possible stand-in, since equality trivially satisfies
+	// BOTH of ComputeEligible's base-SHA-comparison checks
+	// (ReasonBaseSHAUnknown/ReasonBaseMoved) regardless of what
+	// BaseAdvancedWithoutRewrite is, and affects nothing else the probe
+	// checks. Any REAL currentBaseSHA can only be equally-or-LESS
+	// lenient than this assumption on those two checks, and every other
+	// criterion is unaffected by which base-SHA scenario is used -- so
+	// if the probe already refuses, the real computation below refuses
+	// too (on this exact reason, or an earlier-ordered one still, if the
+	// real base SHA also happens to differ), and neither the live
+	// ResolveBranchSHA call nor the live IsAncestor call below could ever
+	// have changed that outcome. Skipping both in that case is what G3
+	// ("order the checks so the honest reason wins" -- a permanently
+	// ineligible PR must never be told a live check's own transient
+	// failure is the reason it was refused) and G4 (fewer live calls on
+	// the merge path than strictly needed) both ask for, from the same
+	// restructuring.
 	//
-	// VerdictBaseRef/VerdictBaseSHA/VerdictAncestorChain/
-	// VerdictPolicyVersion (§21.1's amendment) come from record.Context
-	// -- the SAME review_verdicts row record.HeadSHA itself came from,
-	// resolved by appreviewverdict.GetLatest above. CurrentBaseRef/
-	// CurrentAncestorChain mirror CurrentHeadSHA's own identical "target
-	// is this function's own already-fetched, LIVE ports.OpenPR"
-	// sourcing -- no new I/O.
+	// VerdictAssessed is unconditionally true in both the probe and the
+	// final call below -- hasVerdict was already confirmed true above
+	// (the !hasVerdict branch returns earlier) -- but is still passed
+	// through explicitly, never left at its own zero value, mirroring
+	// touchedBlastRadiusKnown's own identical "never rely on a caller
+	// forgetting" discipline: a future edit to this function that moves
+	// or removes the early !hasVerdict return must not silently
+	// reintroduce ReasonNotAssessed's own fail-closed guard as the ONLY
+	// thing standing between a not-assessed PR and a merge --
+	// ComputeEligible checks it again regardless.
+	probeInput := autoapproval.EligibilityInput{
+		Verdict:                    record.Verdict,
+		VerdictAssessed:            true,
+		VerdictHeadSHA:             record.HeadSHA,
+		VerdictBaseRef:             record.Context.BaseRef,
+		VerdictBaseSHA:             record.Context.BaseSHA,
+		VerdictAncestorChain:       record.Context.AncestorChain,
+		VerdictPolicyVersion:       record.Context.PolicyVersion,
+		CurrentHeadSHA:             target.HeadSHA,
+		CurrentBaseRef:             target.BaseRef,
+		CurrentBaseSHA:             record.Context.BaseSHA, // assumed equal -- see doc comment above
+		CurrentAncestorChain:       convertAncestorChain(target.AncestorChain),
+		BaseAdvancedWithoutRewrite: true, // moot: the assumed SHA equality above already bypasses this check
+		CIGreen:                    ciGreen,
+		HasNeedsHumanLabel:         hasNeedsHuman,
+		ChangedFileCount:           changedFileCount,
+		TouchedBlastRadius:         touchedBlastRadius,
+		TouchedBlastRadiusKnown:    touchedBlastRadiusKnown,
+	}
+	if _, probeReason := autoapproval.ComputeEligible(probeInput, cfg); probeReason != autoapproval.ReasonNone {
+		return false, "", fmt.Sprintf("this pull request no longer meets the auto-approval eligibility criteria: %s", probeReason), nil
+	}
+
+	// The probe passed: on every criterion except base freshness, this PR
+	// clears the bar, so the live base-branch-tip resolution (and, if
+	// needed, the fast-forward-ancestry confirmation) now genuinely
+	// decides whether it stays eligible.
 	//
 	// CurrentBaseSHA (finding F1 (§21.1's amendment)) is deliberately NOT
 	// target.BaseSHA -- that field is GitHub's own per-PR CACHED
@@ -293,12 +356,24 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	// F2) then refuses on its own distinct reason, rather than this
 	// function inventing a SECOND fail-closed path that could drift from
 	// the engine's own.
-	currentBaseSHA, _, resolveErr := sourceControl.ResolveBranchSHA(ctx, ports.ResolveBranchSHASpec{
+	//
+	// Bounded by platform.Timeouts.DecisionInboxResolveBranchSHATimeout
+	// (G4, fourth adversarial-review round): this call previously ran on
+	// the bare, unbounded ctx this function was handed -- the SAME
+	// unbounded-live-GitHub-call-on-the-merge-gate-action-path shape E4
+	// (third round) had already fixed for the IsAncestor call below, one
+	// call site over. That timeout field's own doc comment already named
+	// this exact call as one of the two call sites it bounds
+	// (SCMCache.ResolveBranchSHA, scmcache.go); it now genuinely bounds
+	// this uncached one too.
+	resolveCtx, cancel := context.WithTimeout(ctx, deps.Timeouts.DecisionInboxResolveBranchSHATimeout)
+	currentBaseSHA, _, resolveErr := sourceControl.ResolveBranchSHA(resolveCtx, ports.ResolveBranchSHASpec{
 		Owner:  target.Owner,
 		Repo:   target.Repo,
 		Branch: target.BaseRef,
 		Token:  token,
 	})
+	cancel()
 	if resolveErr != nil {
 		currentBaseSHA = ""
 	}
@@ -313,13 +388,13 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	// ComputeEligible's own doc comment) and the base sha genuinely
 	// differs on both sides (both non-empty, since an empty side already
 	// fails its own ReasonBaseSHAUnknown check regardless of this field).
-	// See ports.SourceControl.IsAncestor's own doc comment for what this
-	// call answers and why it is sound: a three-dot diff is defined
-	// against the merge-base of (base, head), which does not move merely
-	// because the base branch's tip advances, as long as its OLD tip
-	// remains an ancestor of the new one -- eligibility.go's own
-	// BaseAdvancedWithoutRewrite doc comment covers the residual this
-	// tolerance still accepts.
+	// See autoapproval.BaseAdvancedWithoutRewrite's own doc comment
+	// (eligibility.go) for what a confirmed "yes" here actually
+	// establishes and what it does not -- corrected twice over (E2, then
+	// G1, fourth round) after two successive claims that this call's own
+	// "yes" provably bounds the fresh diff were shown false against real
+	// git; this call site deliberately never repeats either claim
+	// itself, so there is exactly one place left to keep correct.
 	//
 	// Bounded by platform.Timeouts.DecisionInboxIsAncestorTimeout (E4,
 	// third round): this call previously ran on the bare, unbounded ctx
@@ -348,6 +423,15 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	// ReviewDecisionDegraded's own identical "a degraded read fails
 	// closed with a reason naming the degradation, not a fabricated
 	// verdict" precedent a few lines above in this same function.
+	//
+	// G3 (fourth adversarial-review round): unlike before this fix, the
+	// "try again shortly" reason returned below is now ALWAYS the honest
+	// one -- the probe above already confirmed every OTHER criterion
+	// passes, so a failure here really is the one and only thing
+	// standing between this PR and eligibility, never a transient
+	// message papering over some unrelated, permanent refusal (a
+	// needs-human label, a stale verdict, an already-red build, ...) the
+	// caller was never told about.
 	var baseAdvancedWithoutRewrite bool
 	if record.Context.BaseRef == target.BaseRef && record.Context.BaseSHA != "" && currentBaseSHA != "" && record.Context.BaseSHA != currentBaseSHA {
 		ancestorCtx, cancel := context.WithTimeout(ctx, deps.Timeouts.DecisionInboxIsAncestorTimeout)
@@ -381,9 +465,9 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		BaseAdvancedWithoutRewrite: baseAdvancedWithoutRewrite,
 		CIGreen:                    ciGreen,
 		HasNeedsHumanLabel:         hasNeedsHuman,
-		ChangedFileCount:           target.ChangedFilesCount,
-		TouchedBlastRadius:         autoapproval.ClassifyChangedPaths(target.ChangedFiles),
-		TouchedBlastRadiusKnown:    !target.ChangedFilesListDegraded,
+		ChangedFileCount:           changedFileCount,
+		TouchedBlastRadius:         touchedBlastRadius,
+		TouchedBlastRadiusKnown:    touchedBlastRadiusKnown,
 	}, cfg)
 	if !eligible {
 		return false, "", fmt.Sprintf("this pull request no longer meets the auto-approval eligibility criteria: %s", eligReason), nil
