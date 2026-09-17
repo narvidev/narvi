@@ -605,6 +605,45 @@ type OpenPR struct {
 	// positively-confirmed-vs-genuinely-unknown discipline verbatim (see
 	// that type's own doc comment).
 	CIConclusion CIConclusion
+	// CIConclusionDegraded is true iff the fetch that produced CIConclusion
+	// above could not be fully read -- githubapi.fetchCIConclusionLive
+	// makes TWO independent GETs (the legacy combined-status endpoint and
+	// check-runs), and each contributes to CIConclusion only when it
+	// itself succeeds and decodes. BEFORE this field existed, a failed
+	// GET contributed NOTHING at all -- silently missing whatever it
+	// would have reported -- so a status GET confirming "success" beside
+	// a check-runs GET that itself failed (a transient 5xx, a secondary
+	// rate limit, an undecodable body) produced CIConclusionSuccess, not
+	// CIConclusionUnknown: a half-read composite reporting a CONFIDENT
+	// green, indistinguishable from a genuine, fully-confirmed one. This
+	// is the SAME "we could not tell" vs. "we confirmed a clean read"
+	// distinction ReviewDecisionDegraded/ChangedFilesListDegraded already
+	// draw one field over -- applied here to the one sibling in this same
+	// composite that, until now, carried no degraded signal at all.
+	//
+	// FAIL CLOSED: every caller that gates on CIConclusion ==
+	// CIConclusionSuccess MUST also check this field and refuse
+	// identically to a confirmed non-success read when it is true --
+	// "half-read" must never be read as "green". CIConclusion itself is
+	// NEVER CIConclusionSuccess when this is true (fetchCIConclusionLive's
+	// own terminal switch: a degraded GET can still contribute a genuine
+	// CONFIRMED failure from whichever GET did succeed -- that real
+	// signal is not suppressed -- but a would-be success is always
+	// downgraded to CIConclusionUnknown whenever either GET could not be
+	// read), so a caller that reads CIConclusion alone already fails
+	// closed in the success case; this field exists so a caller can tell
+	// "genuinely unknown/still running" apart from "could not be fully
+	// read" for its own logging/reason-string purposes, mirroring the
+	// identical distinction autoapproval.ReasonCIConclusionDegraded draws
+	// from autoapproval.ReasonCINotGreen (eligibility.go).
+	//
+	// Narrower than it looks: a repository whose checks are Actions-only
+	// reports total_count==0 on the legacy combined-status endpoint (a
+	// successful, fully-decoded GET contributing no signal at all, never
+	// a degraded one) -- so this field stays false, and CIConclusion
+	// stays reachable as Success from check-runs alone, on such a
+	// repository exactly as it always has been.
+	CIConclusionDegraded bool
 
 	// Labels is this PR's own current GitHub labels -- a caller checks
 	// this against reviewpost.LabelLowRisk/.../LabelNeedsHuman to derive

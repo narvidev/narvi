@@ -399,11 +399,16 @@ func (a *Adapter) buildOpenPRFromDetail(ctx context.Context, owner, repo string,
 	hasApproving, hasChangesRequested, reviewDecisionDegraded := a.fetchReviewDecision(ctx, owner, repo, number, token)
 
 	ci := ports.CIConclusionUnknown
+	var ciConclusionDegraded bool
 	if detail.Head.SHA != "" {
 		// fetchCIConclusionLive, deliberately NOT fetchCIConclusion -- see that function's own doc comment for
 		// why a LIVE, pre-merge gate needs a STRICT conclusion, distinct
 		// from mergedbetween.go's retrospective-audit-only lenient one.
-		ci = a.fetchCIConclusionLive(ctx, owner, repo, detail.Head.SHA, token)
+		// ciConclusionDegraded is true iff either of that function's two
+		// GETs itself failed -- see ports.OpenPR.CIConclusionDegraded's
+		// own doc comment for the fail-closed contract this signals to
+		// every caller gating on ci == CIConclusionSuccess.
+		ci, ciConclusionDegraded = a.fetchCIConclusionLive(ctx, owner, repo, detail.Head.SHA, token)
 	}
 
 	// Phase 5 audit findings 1+2 (both fixed). Two INDEPENDENT ways this
@@ -497,7 +502,12 @@ func (a *Adapter) buildOpenPRFromDetail(ctx context.Context, owner, repo string,
 		ReviewDecisionDegraded: reviewDecisionDegraded,
 
 		CIConclusion: ci,
-		Labels:       labels,
+		// fetchCIConclusionLive's own second return -- see that field's
+		// own doc comment (ports.OpenPR) for the fail-closed contract
+		// every caller gating on CIConclusion == CIConclusionSuccess must
+		// also honor.
+		CIConclusionDegraded: ciConclusionDegraded,
+		Labels:               labels,
 
 		ChangedFiles: files,
 		// Phase 5 audit findings 1+2: ChangedFilesCount is GitHub's own
@@ -618,15 +628,56 @@ func ancestorChainFromDetailStack(stack *stackResponse) []ports.PRAncestorLink {
 // the full "why": GitHub reports state=="pending" both for a genuinely
 // in-flight legacy status AND for a repo with no legacy statuses at all,
 // and only TotalCount can tell the two apart.
-func (a *Adapter) fetchCIConclusionLive(ctx context.Context, owner, repo, headSHA, token string) ports.CIConclusion {
+//
+// The second return value is "degraded": true iff EITHER of the two GETs
+// below itself failed to produce a trustworthy read (a transport error,
+// or a response that did not decode -- exactly fetchReviewDecision's own
+// "degraded" convention, immediately below in this file), OR the
+// check-runs GET decoded fine but reported a TotalCount exceeding what it
+// actually served (F1, below) -- a truncated PREFIX is the
+// identical "not fully read" fact as an outright failure, just discovered
+// after a successful decode instead of before one. Before this return
+// value existed, each GET was gated by a bare `if err == nil`, so a
+// failed call contributed NOTHING at all -- not "silently missing
+// whatever it would have reported", but silently agreeing with whatever
+// the OTHER, surviving GET happened to say. A status GET confirming
+// "success" beside a check-runs GET that itself failed then fell all the
+// way through the switch below to sawSuccess with neither sawFailure nor
+// sawIncomplete set, reporting CIConclusionSuccess: a confident green
+// from a composite that was only ever half read. Only a failure of BOTH
+// GETs fell back to the honest CIConclusionUnknown default -- exactly
+// backwards from ReviewDecisionDegraded/ChangedFilesListDegraded's own
+// established fail-closed contract one field over. F1 closed a NARROWER
+// but still live variant of the same defect: even a check-runs GET that
+// succeeds outright can still under-report if the ref carries more check
+// runs than one page holds -- before this GET sent per_page=100 and
+// compared against TotalCount, no error or decode failure existed to
+// catch a ref with, say, 40 check runs served only its first 30 (GitHub's
+// undocumented-per_page default) at all; the switch below reported
+// whatever the visible prefix said, confidently.
+//
+// Fixed by gating each GET's contribution on ITS OWN success (unchanged)
+// while additionally tracking whether it failed at all, and refusing to
+// report Success -- ever -- while either GET is unread: a genuine,
+// CONFIRMED failure from the GET that DID succeed is still real signal
+// and still wins (mirrors the terminal switch's own pre-existing "a
+// genuine, confirmed failure signal still wins over an incomplete one"
+// precedent), but sawSuccess alone, with the other GET's own health
+// unknown, is no longer sufficient to report green.
+func (a *Adapter) fetchCIConclusionLive(ctx context.Context, owner, repo, headSHA, token string) (ports.CIConclusion, bool) {
 	sawFailure := false
 	sawSuccess := false
 	sawIncomplete := false
+	degraded := false
 
 	statusPath := fmt.Sprintf("%s/repos/%s/%s/commits/%s/status", a.apiBaseURL, url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(headSHA))
-	if body, err := a.doGet(ctx, statusPath, token); err == nil {
+	if body, err := a.doGet(ctx, statusPath, token); err != nil {
+		degraded = true
+	} else {
 		var status combinedStatusResponse
-		if json.Unmarshal(body, &status) == nil {
+		if json.Unmarshal(body, &status) != nil {
+			degraded = true
+		} else {
 			switch status.State {
 			case "failure", "error":
 				sawFailure = true
@@ -659,6 +710,8 @@ func (a *Adapter) fetchCIConclusionLive(ctx context.Context, owner, repo, headSH
 				// when TotalCount confirms at least one status actually
 				// exists here; a statusless "pending" carries no signal at
 				// all and is left for the check-runs loop below to decide.
+				// This is a SUCCESSFUL, fully-decoded read reporting
+				// "nothing to see here" -- never degraded.
 				if status.TotalCount > 0 {
 					sawIncomplete = true
 				}
@@ -666,10 +719,37 @@ func (a *Adapter) fetchCIConclusionLive(ctx context.Context, owner, repo, headSH
 		}
 	}
 
-	checksPath := fmt.Sprintf("%s/repos/%s/%s/commits/%s/check-runs", a.apiBaseURL, url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(headSHA))
-	if body, err := a.doGet(ctx, checksPath, token); err == nil {
+	// per_page=100, mirroring every other list GET in this adapter
+	// (fetchHasApprovingReview, fetchChangedFilePaths, fetchReverts,
+	// fetchHadManualConflictResolution) -- F1: this GET
+	// previously sent no per_page at all, so GitHub's documented default
+	// page size (30) served only a first-page PREFIX on any ref carrying
+	// more than 30 check runs, with no error and no decode failure to
+	// signal it. total_count is checked below regardless of this bump,
+	// since a ref can still carry more than even 100 check runs -- the
+	// same "known total vs. what was actually served" comparison
+	// buildOpenPRFromDetail's own ChangedFilesListDegraded already applies
+	// to files (detail.ChangedFiles > len(files)).
+	checksPath := fmt.Sprintf("%s/repos/%s/%s/commits/%s/check-runs?per_page=100", a.apiBaseURL, url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(headSHA))
+	if body, err := a.doGet(ctx, checksPath, token); err != nil {
+		degraded = true
+	} else {
 		var runs checkRunsResponse
-		if json.Unmarshal(body, &runs) == nil {
+		if json.Unmarshal(body, &runs) != nil {
+			degraded = true
+		} else {
+			if runs.TotalCount > len(runs.CheckRuns) {
+				// F1: a genuine, successfully-decoded response that is
+				// still only a PREFIX of the real total -- the same fact
+				// pattern as a failed GET (some check runs were never
+				// read at all), so this reports degraded exactly like
+				// one, never a confident conclusion computed from a
+				// partial set. Attacker-influenceable: a PR author fully
+				// controls how many check runs a workflow config
+				// produces, so padding past 100 pushes a genuinely
+				// failing run past the page boundary.
+				degraded = true
+			}
 			for _, r := range runs.CheckRuns {
 				if r.Conclusion == nil {
 					// Still queued/in_progress -- UNLIKE fetchCIConclusion's
@@ -701,13 +781,23 @@ func (a *Adapter) fetchCIConclusionLive(ctx context.Context, owner, repo, headSH
 
 	switch {
 	case sawFailure:
-		return ports.CIConclusionFailure
+		// A genuine, confirmed failure from whichever GET succeeded is
+		// real signal regardless of the other GET's own health -- never
+		// suppressed by degraded, exactly like the pre-existing "failure
+		// wins over incomplete" precedent immediately below.
+		return ports.CIConclusionFailure, degraded
 	case sawIncomplete:
-		return ports.CIConclusionUnknown
+		return ports.CIConclusionUnknown, degraded
+	case degraded:
+		// The fix this function exists for: sawSuccess may well be true
+		// here (the surviving GET reported green), but with the OTHER GET
+		// unread, that green is unconfirmed -- report Unknown, never
+		// Success, and say so via the second return value.
+		return ports.CIConclusionUnknown, true
 	case sawSuccess:
-		return ports.CIConclusionSuccess
+		return ports.CIConclusionSuccess, false
 	default:
-		return ports.CIConclusionUnknown
+		return ports.CIConclusionUnknown, false
 	}
 }
 

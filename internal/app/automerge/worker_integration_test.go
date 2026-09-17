@@ -57,14 +57,12 @@ type fakeAutoMergeSourceControl struct {
 	// when true, makes GetOpenPR wait for ITS OWN ctx to report Done
 	// before returning a perfectly ordinary (pr, ok, nil) -- modeling one
 	// specific way githubapi.Adapter.GetOpenPR's own real composite can
-	// return a deadline-cut-short-but-nil-error result: fetchCIConclusionLive's
-	// own two GETs carry no degraded field at all (see
-	// internal/app/decisioninbox/revalidate.go's own corrected doc
-	// comment on this, not a restatement of it here). This is
-	// deliberately a SEPARATE field from getErr above and from ctx.Err()
-	// being already expired at entry (below): those two model "the call
-	// itself failed", this one models "the call technically succeeded,
-	// but too late".
+	// return a deadline-cut-short-but-nil-error result (see
+	// internal/app/decisioninbox/revalidate.go's own doc comment on this,
+	// not a restatement of it here). This is deliberately a SEPARATE
+	// field from getErr above and from ctx.Err() being already expired at
+	// entry (below): those two model "the call itself failed", this one
+	// models "the call technically succeeded, but too late".
 	getOpenPRBlockUntilCtxDone bool
 
 	// getOpenPRBranch (I2, sixth adversarial-review round), guarded by
@@ -626,6 +624,60 @@ func TestPumpOnce_Armed_MergesEligibleCandidate(t *testing.T) {
 	}
 	if total != 1 || contested != 0 {
 		t.Errorf("outcome counts = (total=%d, contested=%d), want (1, 0) -- the merge must record a 'confirmed' outcome", total, contested)
+	}
+}
+
+// TestPumpOnce_Armed_CIConclusionDegraded_NeverMerges is the fail-closed
+// CI read's own end-to-end proof, at the ONE place this whole gap
+// matters most: the UNATTENDED auto-merge worker, with no human in the
+// loop and no second CI read. CIConclusion itself is left at its own
+// confirmed CIConclusionSuccess (mirroring
+// TestPumpOnce_Armed_MergesEligibleCandidate's identical fixture in every
+// other respect) -- only CIConclusionDegraded is set, isolating that this
+// PR refuses on the degraded read ALONE, never on a coincidentally
+// non-success CIConclusion. Before ports.OpenPR.CIConclusionDegraded
+// existed, githubapi.Adapter.GetOpenPR's real composite could produce
+// exactly this shape (CIConclusion==Success, half the underlying GitHub
+// read having actually failed) with nothing on ports.OpenPR to say so --
+// this test proves the worker now refuses it instead of merging
+// unattended on a half-read green.
+func TestPumpOnce_Armed_CIConclusionDegraded_NeverMerges(t *testing.T) {
+	rig := newAutomergeTestRig(t)
+	ctx := context.Background()
+	const repoFullName = "acme/automerge-ci-conclusion-degraded"
+
+	htmlURL := rig.seedEligiblePR(ctx, t, repoFullName, 12, "sha-12")
+	if _, err := rig.repoSettings.UpsertAutoMergeToggle(ctx, repoFullName, true); err != nil {
+		t.Fatalf("upsert auto-approval settings: %v", err)
+	}
+
+	sc := &fakeAutoMergeSourceControl{
+		prsByKey: map[string]ports.OpenPR{
+			"acme/automerge-ci-conclusion-degraded#12": {
+				Owner: "acme", Repo: "automerge-ci-conclusion-degraded", Number: 12, HTMLURL: htmlURL,
+				HeadSHA: "sha-12", BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
+				CIConclusion:         ports.CIConclusionSuccess,
+				CIConclusionDegraded: true,
+			},
+		},
+		mergeSHA: "merged-commit-sha",
+	}
+	worker := rig.newWorker(t, sc)
+
+	if err := worker.PumpOnce(ctx, time.Now()); err != nil {
+		t.Fatalf("PumpOnce() error = %v, want nil", err)
+	}
+
+	if got := sc.mergeCallCount(); got != 0 {
+		t.Fatalf("MergePR call count = %d, want 0 -- a degraded/half-read CI status must never merge unattended, even though CIConclusion itself still reads Success", got)
+	}
+
+	total, contested, err := narvipg.NewAutoApprovalOutcomeStore(rig.pool).CountInWindow(ctx, repoFullName, pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true})
+	if err != nil {
+		t.Fatalf("count auto-approval outcomes: %v", err)
+	}
+	if total != 0 {
+		t.Errorf("outcome counts = (total=%d, contested=%d), want (0, %d) -- a refused, never-attempted merge must not record a 'confirmed' outcome", total, contested, contested)
 	}
 }
 

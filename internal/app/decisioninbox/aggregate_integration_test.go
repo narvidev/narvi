@@ -184,6 +184,17 @@ type fakeDecisionInboxSourceControl struct {
 	// stay exactly as they were.
 	resolveBranchSHA    string
 	resolveBranchSHAErr error
+	// resolveBranchSHACalls (F2/F4) records every
+	// ResolveBranchSHA call this fake receives, in order -- mirrors
+	// isAncestorCalls' own identical "record what was actually called"
+	// convention immediately below. Needed once Result.SCMFetchFailed
+	// could ALSO turn true directly off ports.OpenPR.CIConclusionDegraded
+	// (independent of whether this live call ever ran): a test proving
+	// the probe still short-circuits BEFORE this call, for a PR the probe
+	// already refuses on CIConclusionDegraded alone, can no longer rely on
+	// SCMFetchFailed's own value to prove that (it is now true either
+	// way) and needs this call count instead.
+	resolveBranchSHACalls []ports.ResolveBranchSHASpec
 	// resolveBranchSHAByBranch (round-11 finding A3) lets a test configure
 	// a DISTINCT resolved sha per queried branch -- checked BEFORE both
 	// the plain resolveBranchSHA override and the scan-fallback above,
@@ -278,6 +289,7 @@ func (f *fakeDecisionInboxSourceControl) CreatePR(context.Context, ports.CreateP
 // return, for the identical "already-expired context is deterministic,
 // no sleep needed" reason IsAncestor's own doc comment gives.
 func (f *fakeDecisionInboxSourceControl) ResolveBranchSHA(ctx context.Context, spec ports.ResolveBranchSHASpec) (string, string, error) {
+	f.resolveBranchSHACalls = append(f.resolveBranchSHACalls, spec)
 	if err := ctx.Err(); err != nil {
 		return "", "", err
 	}
@@ -2494,6 +2506,183 @@ func TestBuild_BaseBranchAdvanced_ButAlreadyIneligibleForAnotherReason(t *testin
 	}
 	if len(fakeSCM.isAncestorCalls) != 0 {
 		t.Errorf("IsAncestor called %d times, want 0 -- G10: a PR already ineligible on an independent, fully-known criterion must never spend a live ancestor-confirmation call that could not have changed the outcome", len(fakeSCM.isAncestorCalls))
+	}
+}
+
+// TestBuild_CIConclusionDegraded_ProbeCatchesItBeforeAnyLiveCall is
+// G10's own regression shape (immediately above), applied to
+// ports.OpenPR.CIConclusionDegraded specifically: computeRealEligibility
+// builds TWO EligibilityInput literals from the identical pr (the probe,
+// checked before any live SCM call, and the final literal, checked
+// after) -- both must carry CIConclusionDegraded, mirroring
+// revalidateCore's own identical two-literal shape
+// (revalidate_integration_test.go's own
+// TestRevalidateForMerge_CIConclusionDegraded_ProbeCatchesItBeforeAnyLiveCall).
+// CIConclusion is left at its own confirmed CIConclusionSuccess (the
+// fixture's baseline) so this test isolates CIConclusionDegraded alone,
+// exactly like that sibling test does. resolveBranchSHAErr forces the
+// LIVE base-branch-tip resolution to fail -- if the probe does not ALSO
+// carry CIConclusionDegraded, that live call actually runs.
+//
+// F2/F4 changed what this test can observe: buildPRItems
+// now ALSO raises Result.SCMFetchFailed directly off pr.CIConclusionDegraded
+// (producer (7) on that field's own doc comment), independent of whether
+// computeRealEligibility's probe/final calls ever run at all -- so
+// SCMFetchFailed reads true in this test regardless of the mutation below,
+// and can no longer be the signal that proves the probe's own
+// short-circuit. Mutation-test target, EXECUTION-VERIFIED (dropping
+// CIConclusionDegraded from the probe literal specifically, aggregate.go,
+// leaving the final literal and buildPRItems' own producer-(7) check
+// untouched): item.Kind stays needs_review (the FINAL literal still
+// carries pr.CIConclusionDegraded=true and refuses on its own) and
+// SCMFetchFailed stays true (producer (7) fires independently of either
+// EligibilityInput literal) -- neither flips. Only the ResolveBranchSHA
+// call-count assertion below turns from a pass into a failure: the probe
+// no longer refuses on CIConclusionDegraded, so its own early return
+// (autoapproval.ComputeEligible(probe, cfg) with CIConclusionDegraded
+// unset) no longer fires, and the LIVE base-branch-tip resolution
+// actually runs.
+func TestBuild_CIConclusionDegraded_ProbeCatchesItBeforeAnyLiveCall(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "5012"
+	const repoFullName = "acme/build-ci-conclusion-degraded-probe"
+
+	actor, fakeSCM := buildEligibleReadyToMergeFixture(ctx, t, pool, tokenKey, "ci-degraded-probe-actor@example.com", actorGitHubExternalID, repoFullName, 77)
+	fakeSCM.openPRsByExternalID[actorGitHubExternalID][0].CIConclusionDegraded = true
+	fakeSCM.resolveBranchSHAErr = errors.New("boom: github is down")
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict: appreviewverdict.Deps{
+			ReviewVerdicts: narvipg.NewReviewVerdictStore(pool), RepoSettings: narvipg.NewRepoSettingsStore(pool),
+			ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool),
+			Timeouts: platform.DefaultTimeouts(),
+		},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil", err)
+	}
+	item := findItemByPR(result.Items, 77)
+	if item == nil {
+		t.Fatal("PR #77 missing from the inbox entirely, want present as needs_review")
+	}
+	if item.Kind == decisioninboxdomain.KindReadyToMerge {
+		t.Error("Kind = ready_to_merge, want needs_review -- CIConclusionDegraded is true")
+	}
+	// F2/F4: SCMFetchFailed must now read true -- pr.
+	// CIConclusionDegraded IS itself an incomplete-SCM-read fact
+	// (buildPRItems' own producer (7), aggregate.go), independent of
+	// whatever computeRealEligibility's own live calls do or don't do.
+	// Before F2/F4, this assertion read the OPPOSITE way ("want false"),
+	// on the reasoning that the live ResolveBranchSHA call never ran so
+	// nothing degraded the read -- true as far as it went, but conflated
+	// "the live call never ran" with "the read was complete", which it
+	// was not: the CI composite itself was only ever half read. That
+	// reasoning is exactly what F2/F4 found wrong.
+	if !result.SCMFetchFailed {
+		t.Error("SCMFetchFailed = false, want true -- pr.CIConclusionDegraded is itself an incomplete-SCM-read fact and must raise this field regardless of what the live base-branch lookup below does")
+	}
+	// The ORIGINAL property this test exists for -- the probe refuses
+	// BEFORE ever attempting the live ResolveBranchSHA call -- is now
+	// proven by the call count directly, since SCMFetchFailed's own value
+	// can no longer distinguish it (it is true either way after the fix
+	// above). resolveBranchSHAErr is still armed: if the probe did NOT
+	// carry CIConclusionDegraded, this call would still run and its
+	// failure would set currentBaseSHA = "" but would NOT be observable
+	// via SCMFetchFailed anymore either (masked by producer (7)) -- this
+	// call count is now the ONLY way to prove the probe's own
+	// short-circuit still holds.
+	if len(fakeSCM.resolveBranchSHACalls) != 0 {
+		t.Errorf("ResolveBranchSHA called %d times, want 0 -- the probe's own CIConclusionDegraded refusal already refuses this PR, independent of the base-SHA question, so the live ResolveBranchSHA call could never have changed this row's own fate", len(fakeSCM.resolveBranchSHACalls))
+	}
+}
+
+// TestBuild_CIConclusionDegraded_FinalLiteralWiredFromRealValue is F3/F9's
+// own regression test: of computeRealEligibility's two
+// EligibilityInput literals (the probe, above, and the FINAL one, checked
+// after the live base-branch lookup succeeds), only the probe's own
+// CIConclusionDegraded wiring had a dedicated test before this one -- the
+// final literal's identical field (aggregate.go) was covered by no test at
+// all.
+//
+// EXECUTION-VERIFIED, not assumed (this project's own standing rule):
+// hardcoding the probe's CIConclusionDegraded to a REAL PR's own true
+// value while the fixture's underlying pr.CIConclusionDegraded is false
+// cannot be tested from outside this package by dropping the field (Go's
+// own zero value for a bool IS false, so "dropped" and "false" are the
+// same bit pattern) -- and dropping it from the FINAL literal specifically
+// is, ITSELF, unobservable by any test: whenever the real value is true,
+// the probe (built from the SAME pr.CIConclusionDegraded, checked first)
+// already refuses via ComputeEligible's own CIConclusionDegraded check,
+// and computeRealEligibility returns before ever constructing the final
+// literal -- confirmed by running the full package suite (`go test
+// -tags=integration`) against that exact mutation: zero tests failed. Only
+// the OPPOSITE-directioned mistake -- the final literal wired to the
+// WRONG value (a hardcoded/miswired constant instead of pr.
+// CIConclusionDegraded) -- is reachable, and only when the real value is
+// false, which is this test's own scenario. Confirmed the same way:
+// hardcoding the final literal's CIConclusionDegraded to `true`
+// unconditionally breaks this test (and, incidentally,
+// TestBuild_FullScenario and several other existing happy-path tests that
+// were never written with this field in mind) -- proving the final
+// literal really is read from pr.CIConclusionDegraded and not some other
+// source. Mutation-test target: hardcoding the final literal
+// (aggregate.go) to `true` must turn this test from a pass into a
+// failure; hardcoding it (or dropping the field) to `false` must not,
+// since that is this test's own already-true baseline.
+func TestBuild_CIConclusionDegraded_FinalLiteralWiredFromRealValue(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "5013"
+	const repoFullName = "acme/build-ci-conclusion-degraded-final-literal"
+
+	actor, fakeSCM := buildEligibleReadyToMergeFixture(ctx, t, pool, tokenKey, "ci-degraded-final-literal-actor@example.com", actorGitHubExternalID, repoFullName, 78)
+	// CIConclusionDegraded is left at its own zero value (false) --
+	// buildEligibleReadyToMergeFixture's own otherwise-fully-eligible
+	// baseline, unperturbed. If the FINAL literal read anything other
+	// than this real, false value, ComputeEligible would refuse via
+	// ReasonCIConclusionDegraded and this PR would never reach
+	// ready_to_merge.
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict: appreviewverdict.Deps{
+			ReviewVerdicts: narvipg.NewReviewVerdictStore(pool), RepoSettings: narvipg.NewRepoSettingsStore(pool),
+			ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool),
+			Timeouts: platform.DefaultTimeouts(),
+		},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil", err)
+	}
+	item := findItemByPR(result.Items, 78)
+	if item == nil {
+		t.Fatal("PR #78 missing from the inbox entirely, want present as ready_to_merge")
+	}
+	if item.Kind != decisioninboxdomain.KindReadyToMerge {
+		t.Errorf("Kind = %v, want ready_to_merge -- the FINAL EligibilityInput literal's own CIConclusionDegraded must read this PR's real (false) value, never a hardcoded/miswired constant", item.Kind)
+	}
+	if result.SCMFetchFailed {
+		t.Error("SCMFetchFailed = true, want false -- nothing about this fixture is degraded")
 	}
 }
 

@@ -375,6 +375,32 @@ type EligibilityInput struct {
 	// (githubapi.fetchCIConclusionLive: an incomplete or cancelled
 	// check is never green).
 	CIGreen bool
+	// CIConclusionDegraded is ports.OpenPR.CIConclusionDegraded, verbatim
+	// -- true iff the live CI read behind CIGreen above could not be
+	// fully performed (githubapi.fetchCIConclusionLive makes two
+	// independent GETs, the legacy combined-status endpoint and
+	// check-runs, and either one can fail independently of the other).
+	// CIGreen is ALREADY false whenever this is true -- ports.OpenPR.
+	// CIConclusionDegraded's own doc comment: a half-read composite can
+	// never resolve to CIConclusionSuccess -- so ComputeEligible below
+	// would refuse via ReasonCINotGreen even without this field. This
+	// field exists for the SAME reason TouchedBlastRadiusKnown exists
+	// alongside TouchedBlastRadius (both refuse either way; the
+	// dedicated reason is what lets a 409/log line tell "we could not
+	// read this" apart from "we read it and it genuinely is not green" --
+	// an operator-legibility distinction, not a second eligibility
+	// outcome). Checked BEFORE CIGreen for the identical reason
+	// TouchedBlastRadiusKnown is checked before TouchedBlastRadius: "is
+	// the fact even knowable" precedes "what does it say".
+	//
+	// Deliberately the BOOLEAN ZERO VALUE for "not degraded", mirroring
+	// this package's own established fail-conservative convention -- a
+	// caller that forgets to populate this field gets false ("confirmed,
+	// not degraded"), which is only ever safe because CIGreen itself
+	// already carries the fail-closed half of this contract on its own;
+	// a caller populating this field wrong can misreport WHICH reason a
+	// refusal carries, never turn a genuine refusal into an approval.
+	CIConclusionDegraded bool
 	// HasNeedsHumanLabel is reviewpost.LabelNeedsHuman's own current
 	// presence on the PR -- §21.2's escape hatch, unconditional and
 	// checked first, regardless of every other field's value.
@@ -481,7 +507,17 @@ const (
 	// empty) can never read as a match: an empty base SHA on either
 	// side must fail closed with THIS distinct reason, never silently
 	// pass as fresh because two unknowns happen to be equal.
-	ReasonBaseSHAUnknown       Reason = "this pull request's base commit could not be established"
+	ReasonBaseSHAUnknown Reason = "this pull request's base commit could not be established"
+	// ReasonCIConclusionDegraded accompanies a PR whose live CI read
+	// (EligibilityInput.CIGreen) could not be fully performed --
+	// EligibilityInput.CIConclusionDegraded's own doc comment: one of the
+	// two independent GitHub GETs behind that read itself failed. Checked
+	// BEFORE ReasonCINotGreen below, on its own dedicated reason, so a
+	// 409/log line can tell "CI could not be fully read" apart from both
+	// "CI is confirmed red" and "CI is still running" -- the same
+	// "is the fact even knowable" distinction ReasonBlastRadiusUnknown
+	// already draws for the sensitive-path check.
+	ReasonCIConclusionDegraded Reason = "this pull request's CI status could not be fully read from GitHub"
 	ReasonCINotGreen           Reason = "CI is not green at the current head"
 	ReasonNotShippableAuto     Reason = "the verdict's shippable classification is not auto"
 	ReasonDiffTooLarge         Reason = "the diff exceeds this repo's auto-approval file-count threshold"
@@ -573,6 +609,16 @@ func ComputeEligible(in EligibilityInput, cfg EligibilityConfig) (eligible bool,
 	}
 	if in.VerdictPolicyVersion != CurrentPolicyVersion {
 		return false, ReasonPolicyVersionMismatch
+	}
+	// EligibilityInput.CIConclusionDegraded's own doc comment: CIGreen is
+	// already false whenever this is true, so this check changes no
+	// OUTCOME by itself -- it exists so the reason a half-read CI
+	// composite refuses is distinguishable from a confirmed-red or
+	// still-running one, mirroring ReasonBlastRadiusUnknown's identical
+	// "is the fact even knowable" precedence over the sensitive-path
+	// comparison it gates, below.
+	if in.CIConclusionDegraded {
+		return false, ReasonCIConclusionDegraded
 	}
 	if !in.CIGreen {
 		return false, ReasonCINotGreen

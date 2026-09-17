@@ -223,6 +223,58 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		}
 	})
 
+	// a half-read CI composite (githubapi.
+	// fetchCIConclusionLive making two independent GETs, one of them
+	// itself failing) must refuse the merge exactly like ReviewDecision
+	// Degraded above -- "we could not fully read this" must never
+	// silently satisfy this gate. CIConclusion is deliberately left at
+	// its own confirmed CIConclusionSuccess (the fixture's own eligible
+	// baseline) so this subtest proves the refusal fires on
+	// CIConclusionDegraded ALONE, not on a coincidentally-non-success
+	// CIConclusion -- the exact shape the row's own reproduction produces
+	// (a status GET confirming success beside a failing check-runs GET).
+	// Mutation-test target, EXECUTION-VERIFIED (F6/F7, this review round --
+	// the PREVIOUS version of this comment claimed dropping the field
+	// from EITHER single literal alone makes this subtest fail; false in
+	// BOTH halves, confirmed by actually running each): dropping
+	// CIConclusionDegraded from the PROBE literal alone (revalidate.go)
+	// leaves this subtest GREEN -- the live ResolveBranchSHA call between
+	// the two literals succeeds against this fixture's own already-
+	// eligible baseline, so execution reaches the FINAL literal, which
+	// still carries the real value and refuses there instead. Dropping it
+	// from the FINAL literal alone ALSO leaves this subtest green -- the
+	// PROBE, unmutated, still carries the real true value and refuses
+	// FIRST, before the final literal is ever built (mirrors
+	// TestRevalidateForMerge_CIConclusionDegraded_ProbeCatchesItBeforeAnyLiveCall's
+	// own proof of that same short-circuit). Only dropping it from BOTH
+	// literals simultaneously turns this subtest from a pass into a
+	// failure (RevalidateForMerge() ok = true, confirmed). This subtest's
+	// real coverage is therefore or-of-two, not either-alone -- it still
+	// proves CIConclusionDegraded is wired somewhere in this function, but
+	// cannot by itself distinguish "wired into the probe" from "wired
+	// into the final call" the way
+	// TestRevalidateForMerge_CIConclusionDegraded_ProbeCatchesItBeforeAnyLiveCall
+	// and
+	// TestRevalidateForMerge_CIConclusionDegraded_FinalLiteralWiredFromRealValue
+	// each do independently for their own one literal.
+	t.Run("CIConclusionDegraded_Refused", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-ci-conclusion-degraded"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 107)
+		pr.CIConclusionDegraded = true
+		rs.replaceTargetPR(actorGitHubID, pr)
+
+		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+		}
+		if ok {
+			t.Fatal("RevalidateForMerge() ok = true, want false -- a degraded/half-read CI status (one of fetchCIConclusionLive's two GETs failed) must never silently pass as 'confirmed green'")
+		}
+		if reason == "" {
+			t.Error("reason is empty, want a human-readable explanation")
+		}
+	})
+
 	// Phase 5 audit finding 1 (fixed) at the real revalidateCore wiring,
 	// the audit's own named scenario: "GET /pulls/{n}/files returns 502
 	// during aggregation or auto-merge revalidation". ChangedFiles stays
@@ -1181,6 +1233,108 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 			t.Errorf("reason = %q, want empty (this is an error return, not a domain refusal reason)", reason)
 		}
 	})
+}
+
+// TestRevalidateForMerge_CIConclusionDegraded_ProbeCatchesItBeforeAnyLiveCall
+// is revalidateCore's own "one of two call sites" trap, made observable:
+// this function builds TWO EligibilityInput literals from the identical
+// target -- probeInput (checked before any live SCM call) and the final
+// literal (checked after). CIConclusionDegraded_Refused above (in
+// TestRevalidateForMerge_NegativeCases) proves the OUTCOME refuses either
+// way, but on this fixture's own otherwise-fully-eligible baseline the
+// live ResolveBranchSHA call between the two literals ALWAYS succeeds, so
+// that test alone cannot tell "the probe caught it" apart from "only the
+// final call caught it, after an live call the probe should have made
+// unnecessary". This test forces sourceControl.ResolveBranchSHA to FAIL,
+// and asserts the reason string is STILL the CI-degraded one, never the
+// distinct "base commit could not be confirmed (a live check failed)"
+// message revalidateCore returns when that live call itself errors --
+// proving the probe refuses BEFORE ever attempting it, exactly like G3/
+// G4's own established "order the checks so the honest reason wins" and
+// "fewer live calls than strictly needed" discipline this same function's
+// doc comment already establishes for every OTHER criterion the probe
+// checks. Mutation-test target: dropping CIConclusionDegraded from
+// probeInput specifically (revalidate.go) while leaving it in the final
+// literal must turn this test's own reason assertion from a pass into a
+// failure (the reason would then read the base-commit message instead).
+func TestRevalidateForMerge_CIConclusionDegraded_ProbeCatchesItBeforeAnyLiveCall(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	rs := newRevalidateStores(pool)
+	const actorGitHubID = "revalidate-actor-ci-degraded-probe"
+	const repoFullName = "acme/revalidate-ci-conclusion-degraded-probe"
+
+	pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 108)
+	pr.CIConclusionDegraded = true
+	rs.replaceTargetPR(actorGitHubID, pr)
+
+	// Forces the LIVE base-branch-tip resolution (revalidateCore, between
+	// the probe and the final ComputeEligible call) to fail -- if the
+	// probe does not ALSO carry CIConclusionDegraded, execution reaches
+	// this call and returns ITS OWN distinct, honest reason instead of
+	// ever reaching the final ComputeEligible call at all.
+	rs.sourceControl.resolveBranchSHAErr = errors.New("simulated: base branch tip unavailable")
+	defer func() { rs.sourceControl.resolveBranchSHAErr = nil }()
+
+	ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+	if err != nil {
+		t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+	}
+	if ok {
+		t.Fatal("RevalidateForMerge() ok = true, want false")
+	}
+	if strings.Contains(reason, "base commit could not be confirmed") {
+		t.Errorf("reason = %q, contains the LIVE-base-check failure message -- the probe should have refused on the degraded CI read BEFORE ever attempting that live call", reason)
+	}
+	if !strings.Contains(reason, string(autoapproval.ReasonCIConclusionDegraded)) {
+		t.Errorf("reason = %q, want it to contain %q (the probe's own CIConclusionDegraded refusal)", reason, autoapproval.ReasonCIConclusionDegraded)
+	}
+}
+
+// TestRevalidateForMerge_CIConclusionDegraded_FinalLiteralWiredFromRealValue
+// is F3/F9's own regression test, revalidateCore's sibling
+// of aggregate_integration_test.go's identical
+// TestBuild_CIConclusionDegraded_FinalLiteralWiredFromRealValue -- see that
+// test's own doc comment for the full execution-verified reasoning this
+// one shares: of revalidateCore's two EligibilityInput literals (probeInput,
+// above, and the FINAL one built after the live base-branch lookup
+// succeeds), only the probe's own CIConclusionDegraded wiring had a
+// dedicated test before this one.
+//
+// Mutation-test target, EXECUTION-VERIFIED: dropping CIConclusionDegraded
+// from the FINAL literal specifically (revalidate.go) is unobservable by
+// any test -- whenever the real value is true, probeInput (built from the
+// SAME target.CIConclusionDegraded, checked first) already refuses and
+// revalidateCore returns before ever constructing the final literal.
+// Hardcoding the final literal to `true` unconditionally, by contrast,
+// breaks THIS test (confirmed by running it) -- proving the final literal
+// really is sourced from ciConclusionDegraded/target.CIConclusionDegraded,
+// not a hardcoded/miswired constant. Left at CIConclusionDegraded's own
+// zero value (false) here, mirroring eligiblePR's own already-fully-
+// eligible baseline.
+func TestRevalidateForMerge_CIConclusionDegraded_FinalLiteralWiredFromRealValue(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	rs := newRevalidateStores(pool)
+	const actorGitHubID = "revalidate-actor-ci-degraded-final-literal"
+	const repoFullName = "acme/revalidate-ci-conclusion-degraded-final-literal"
+
+	pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 109)
+	// pr.CIConclusionDegraded is left at its own zero value (false) --
+	// if the FINAL literal read anything other than this real, false
+	// value, ComputeEligible would refuse via ReasonCIConclusionDegraded
+	// and this merge would never succeed.
+
+	ok, headSHA, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+	if err != nil {
+		t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatalf("RevalidateForMerge() ok = false, reason = %q, want true -- the FINAL EligibilityInput literal's own CIConclusionDegraded must read this PR's real (false) value, never a hardcoded/miswired constant", reason)
+	}
+	if headSHA != pr.HeadSHA {
+		t.Errorf("headSHA = %q, want %q", headSHA, pr.HeadSHA)
+	}
 }
 
 // TestRevalidateForMerge_EligibilityConfigStoreError_FailsClosed is the C3

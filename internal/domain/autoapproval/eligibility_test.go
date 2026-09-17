@@ -373,7 +373,48 @@ func TestComputeEligible(t *testing.T) {
 			wantReason:   autoapproval.ReasonNone,
 		},
 
-		// --- criterion 5: CI green at the CURRENT head ---
+		// --- criterion 5: the live CI read must have been FULLY
+		// performed -- ports.OpenPR.CIConclusionDegraded's own doc
+		// comment (githubapi.fetchCIConclusionLive makes two independent
+		// GETs, and either can fail without the other). Set here with
+		// CIGreen ALSO left true, deliberately -- proving this refusal
+		// fires on CIConclusionDegraded alone, on its own dedicated
+		// reason, never merely riding CIGreen's own already-false
+		// fail-closed path (which a real half-read composite also takes,
+		// per fetchCIConclusionLive's own terminal switch, but which this
+		// test isolates from). Mutation-test target: deleting the
+		// `if in.CIConclusionDegraded` branch in eligibility.go must turn
+		// this case from refused back into eligible. ---
+		{
+			name: "a degraded CI read is never eligible, even when CIGreen itself still reads true",
+			in: func() autoapproval.EligibilityInput {
+				in := cleanInput()
+				in.CIConclusionDegraded = true
+				return in
+			}(),
+			cfg:          cfg,
+			wantEligible: false,
+			wantReason:   autoapproval.ReasonCIConclusionDegraded,
+		},
+		{
+			// Isolates the check-ORDER, mirroring the diff-size-vs-
+			// blast-radius-unknown isolation further below: a half-read
+			// CI composite -- CIGreen==false AND CIConclusionDegraded==
+			// true at once, exactly what fetchCIConclusionLive's own
+			// terminal switch actually produces for the row's own
+			// reproduction scenario (a status GET confirming success
+			// beside a failing check-runs GET) -- refuses on
+			// ReasonCIConclusionDegraded, not on the later-checked
+			// ReasonCINotGreen, so an operator reading the reason can
+			// tell "could not be fully read" apart from "confirmed red".
+			name:         "a half-read CI composite refuses on CIConclusionDegraded, not merely on CI-not-green",
+			in:           withCIGreen(withCIConclusionDegraded(cleanInput(), true), false),
+			cfg:          cfg,
+			wantEligible: false,
+			wantReason:   autoapproval.ReasonCIConclusionDegraded,
+		},
+
+		// --- criterion 6: CI green at the CURRENT head ---
 		{
 			name:         "CI not green at head is never eligible",
 			in:           withCIGreen(cleanInput(), false),
@@ -382,7 +423,7 @@ func TestComputeEligible(t *testing.T) {
 			wantReason:   autoapproval.ReasonCINotGreen,
 		},
 
-		// --- criterion 6: Shippable == auto, exercised via three
+		// --- criterion 7: Shippable == auto, exercised via three
 		// DISTINCT, independently-meaningful ways Shippable can fail to
 		// be auto (risk baseline, coverage floor, premise floor) -- see
 		// doc.go for why this ONE check is "no floor raised" in full,
@@ -421,7 +462,7 @@ func TestComputeEligible(t *testing.T) {
 			wantReason:   autoapproval.ReasonNotShippableAuto,
 		},
 
-		// --- criterion 7: diff size under the configured threshold --
+		// --- criterion 8: diff size under the configured threshold --
 		// now gated on ChangedFileCount (the
 		// server-fetched fact), never Verdict.FilesChanged. ---
 		{
@@ -439,11 +480,11 @@ func TestComputeEligible(t *testing.T) {
 			wantReason:   autoapproval.ReasonNone,
 		},
 
-		// --- criterion 8: the changed-file facts must actually be
+		// --- criterion 9: the changed-file facts must actually be
 		// KNOWN before TouchedBlastRadius is trusted at all -- Phase 5
 		// audit findings 1+2 (both fixed): a failed or page-truncated
 		// GitHub changed-files fetch must refuse here, distinctly from
-		// "we checked and it IS sensitive" (criterion 9 immediately
+		// "we checked and it IS sensitive" (criterion 10 immediately
 		// below). Mutation-test target: reverting this check (deleting
 		// the `if !in.TouchedBlastRadiusKnown` branch in eligibility.go)
 		// must turn the FIRST case below from refused back into eligible
@@ -489,7 +530,7 @@ func TestComputeEligible(t *testing.T) {
 			wantReason:   autoapproval.ReasonNone,
 		},
 
-		// --- criterion 9: no sensitive path touched -- gated on
+		// --- criterion 10: no sensitive path touched -- gated on
 		// TouchedBlastRadius (the server-DERIVED fact,
 		// autoapproval.ClassifyChangedPaths over the PR's real changed
 		// files), never Verdict.BlastRadius. ---
@@ -679,6 +720,10 @@ func withNeedsHuman(in autoapproval.EligibilityInput, v bool) autoapproval.Eligi
 }
 func withCIGreen(in autoapproval.EligibilityInput, v bool) autoapproval.EligibilityInput {
 	in.CIGreen = v
+	return in
+}
+func withCIConclusionDegraded(in autoapproval.EligibilityInput, v bool) autoapproval.EligibilityInput {
+	in.CIConclusionDegraded = v
 	return in
 }
 func withCurrentHeadSHA(in autoapproval.EligibilityInput, sha string) autoapproval.EligibilityInput {

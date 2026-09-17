@@ -494,3 +494,222 @@ func TestListMergedBetween_RevertReviewFetchFails_ReportsUnknownNeverNotReviewed
 		t.Errorf("PR #70: RevertReviewState = %s, want %s (a failed sub-fetch must never manufacture NotReviewed)", merged[0].RevertReviewState, ports.RevertReviewStateUnknown)
 	}
 }
+
+// TestListMergedBetween_HalfReadCIFailsClosed is F5's own regression test
+// fetchCIConclusion (mergedbetween.go), the RETROSPECTIVE
+// sibling of fetchCIConclusionLive's own F1 fix (listopenprs.go), used to
+// report a confident CIConclusionSuccess whenever ONE of its two GETs
+// (combined-status, check-runs) succeeded reporting green while the OTHER
+// itself failed or decoded a confirmed-truncated page -- exactly the same
+// half-read-reports-green defect F1 closed for the live gate, left open
+// here across an earlier round of this same review series. Fixed to
+// report CIConclusionUnknown instead -- this package's own pre-existing,
+// already-non-accusatory "could not be determined" value (see
+// ComputeReleaseManifestFindings' own doc comment, manifestcheck.go, for
+// why Unknown is safe here and Success is not) -- whenever either GET
+// could not be fully read, mirroring fetchCIConclusionLive's own identical
+// fail-closed shape one file over. A genuine, CONFIRMED failure from
+// whichever GET DID succeed still wins regardless of the other GET's own
+// health, exactly like that sibling.
+func TestListMergedBetween_HalfReadCIFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		statusHandler func(w http.ResponseWriter)
+		checksHandler func(w http.ResponseWriter)
+		want          ports.CIConclusion
+	}{
+		{
+			name: "both GETs succeed, both report success",
+			statusHandler: func(w http.ResponseWriter) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"state": "success"})
+			},
+			checksHandler: func(w http.ResponseWriter) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": []map[string]any{{"conclusion": "success"}}})
+			},
+			want: ports.CIConclusionSuccess,
+		},
+		{
+			// F5's own reproduction: a status GET succeeding beside a
+			// failing check-runs GET must not report a confident Success
+			// -- that Success could be masking a real, unread failure
+			// that ComputeReleaseManifestFindings would otherwise have
+			// flagged as ManifestFindingRedAtMerge.
+			name: "status succeeds (success), check-runs GET fails (500)",
+			statusHandler: func(w http.ResponseWriter) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"state": "success"})
+			},
+			checksHandler: func(w http.ResponseWriter) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			want: ports.CIConclusionUnknown,
+		},
+		{
+			// The mirror image -- the OTHER of the two GETs failing.
+			name: "check-runs succeeds (success), status GET fails (500)",
+			statusHandler: func(w http.ResponseWriter) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			checksHandler: func(w http.ResponseWriter) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": []map[string]any{{"conclusion": "success"}}})
+			},
+			want: ports.CIConclusionUnknown,
+		},
+		{
+			name: "both GETs fail (500)",
+			statusHandler: func(w http.ResponseWriter) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			checksHandler: func(w http.ResponseWriter) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			want: ports.CIConclusionUnknown,
+		},
+		{
+			// A genuine, CONFIRMED failure from the GET that DID succeed
+			// is still real signal and still wins over the other GET's
+			// own degraded read -- mirrors fetchCIConclusionLive's own
+			// identical precedent.
+			name: "check-runs reports a confirmed failure, status GET fails (500)",
+			statusHandler: func(w http.ResponseWriter) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			checksHandler: func(w http.ResponseWriter) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": []map[string]any{{"conclusion": "failure"}}})
+			},
+			want: ports.CIConclusionFailure,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/compare/main...release-1.0":
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"commits": []map[string]any{
+							{"commit": map[string]any{"message": "Merge pull request #50 from acme/widgets/x"}},
+						},
+					})
+				case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/pulls/50":
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"number": 50, "title": "x", "merged": true,
+						"merged_at": "2024-06-01T00:00:00Z", "merge_commit_sha": "sha50",
+						"base":   map[string]any{"ref": "main"},
+						"labels": []map[string]any{},
+					})
+				case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/pulls/50/reviews":
+					_ = json.NewEncoder(w).Encode([]map[string]any{{"state": "APPROVED"}})
+				case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/commits/sha50/status":
+					tc.statusHandler(w)
+				case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/commits/sha50/check-runs":
+					tc.checksHandler(w)
+				case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/pulls/50/files":
+					_ = json.NewEncoder(w).Encode([]map[string]any{})
+				case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/pulls/50/commits":
+					_ = json.NewEncoder(w).Encode([]map[string]any{{"parents": []map[string]any{{"sha": "p1"}}}})
+				case r.Method == http.MethodGet && r.URL.Path == "/search/issues":
+					_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{}})
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+
+			adapter := githubapi.New(server.Client(), server.URL)
+			merged, _, err := adapter.ListMergedBetween(context.Background(), ports.ListMergedBetweenSpec{
+				Owner: "acme", Repo: "widgets", BaseRef: "main", HeadRef: "release-1.0", Token: "tok",
+			})
+			if err != nil {
+				t.Fatalf("ListMergedBetween() error = %v", err)
+			}
+			if len(merged) != 1 {
+				t.Fatalf("got %d merged PRs, want 1: %+v", len(merged), merged)
+			}
+			if merged[0].CIConclusionAtMergeSHA != tc.want {
+				t.Errorf("CIConclusionAtMergeSHA = %v, want %v", merged[0].CIConclusionAtMergeSHA, tc.want)
+			}
+		})
+	}
+}
+
+// TestListMergedBetween_CheckRunsTruncatedFirstPageFailsClosed is F5's own
+// sibling of F1's identical fix (listopenprs.go, F1's own reproduction
+// test) applied to fetchCIConclusion: a merge SHA carrying more check
+// runs than GitHub's documented default page size (30, when no per_page is
+// sent) must never report CIConclusionSuccess off a truncated first page
+// -- reproduced exactly like F1's own listopenprs.go test, 40 check runs,
+// run #35 (index 34) concluding "failure".
+func TestListMergedBetween_CheckRunsTruncatedFirstPageFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	const total = 40
+	const failingIndex = 34 // run #35, 0-indexed
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/compare/main...release-1.0":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"commits": []map[string]any{
+					{"commit": map[string]any{"message": "Merge pull request #51 from acme/widgets/x"}},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/pulls/51":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 51, "title": "x", "merged": true,
+				"merged_at": "2024-06-01T00:00:00Z", "merge_commit_sha": "sha51",
+				"base":   map[string]any{"ref": "main"},
+				"labels": []map[string]any{},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/pulls/51/reviews":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"state": "APPROVED"}})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/commits/sha51/status":
+			_ = json.NewEncoder(w).Encode(map[string]any{"state": "pending", "total_count": 0})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/commits/sha51/check-runs":
+			perPage := r.URL.Query().Get("per_page")
+			served := total
+			if perPage != "100" {
+				served = 30
+			}
+			runs := make([]map[string]any, 0, served)
+			for i := 0; i < served; i++ {
+				concl := "success"
+				if i == failingIndex {
+					concl = "failure"
+				}
+				runs = append(runs, map[string]any{"conclusion": concl})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": total, "check_runs": runs})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/pulls/51/files":
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/pulls/51/commits":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"parents": []map[string]any{{"sha": "p1"}}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/search/issues":
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{}})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	adapter := githubapi.New(server.Client(), server.URL)
+	merged, _, err := adapter.ListMergedBetween(context.Background(), ports.ListMergedBetweenSpec{
+		Owner: "acme", Repo: "widgets", BaseRef: "main", HeadRef: "release-1.0", Token: "tok",
+	})
+	if err != nil {
+		t.Fatalf("ListMergedBetween() error = %v", err)
+	}
+	if len(merged) != 1 {
+		t.Fatalf("got %d merged PRs, want 1: %+v", len(merged), merged)
+	}
+	if merged[0].CIConclusionAtMergeSHA != ports.CIConclusionFailure {
+		t.Errorf("CIConclusionAtMergeSHA = %v, want failure -- per_page=100 must surface run #51's own confirmed failure, never a stale prefix's all-green view", merged[0].CIConclusionAtMergeSHA)
+	}
+}
