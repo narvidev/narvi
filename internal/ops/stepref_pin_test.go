@@ -47,6 +47,7 @@ var stepRefPins = []stepRefPin{
 	{"docs/DECISIONS.md", "185", "browser-side error capture and user feedback"},
 	{"docs/DECISIONS.md", "186", "session replay"},
 	{"docs/DECISIONS.md", "187", "automation env vars reach the process, not just the prompt"},
+	{"docs/DECISIONS.md", "174", "the review has no GitHub-native result surface"},
 	{"docs/DECISIONS.md", "157", "`/contracts` as a stable external API"},
 	{"docs/DECISIONS.md", "109", "kb_search — **routed out**"},
 	{"docs/DECISIONS.md", "180", "the MCP surface: entry point, transport, and the tools it exposes"},
