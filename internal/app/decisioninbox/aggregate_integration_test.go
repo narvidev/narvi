@@ -2497,6 +2497,68 @@ func TestBuild_BaseBranchAdvanced_ButAlreadyIneligibleForAnotherReason(t *testin
 	}
 }
 
+// TestBuild_CIConclusionDegraded_ProbeCatchesItBeforeAnyLiveCall is
+// G10's own regression shape (immediately above), applied to
+// ports.OpenPR.CIConclusionDegraded specifically: computeRealEligibility
+// builds TWO EligibilityInput literals from the identical pr (the probe,
+// checked before any live SCM call, and the final literal, checked
+// after) -- both must carry CIConclusionDegraded, mirroring
+// revalidateCore's own identical two-literal shape
+// (revalidate_integration_test.go's own
+// TestRevalidateForMerge_CIConclusionDegraded_ProbeCatchesItBeforeAnyLiveCall).
+// CIConclusion is left at its own confirmed CIConclusionSuccess (the
+// fixture's baseline) so this test isolates CIConclusionDegraded alone,
+// exactly like that sibling test does. resolveBranchSHAErr forces the
+// LIVE base-branch-tip resolution to fail -- if the probe does not ALSO
+// carry CIConclusionDegraded, that live call actually runs and its
+// failure marks Result.SCMFetchFailed degraded for a reason that has
+// nothing to do with this PR's own merits, exactly the producer-(6)
+// scoping mistake G10 fixed for the base-SHA/ancestor-chain criteria.
+// Mutation-test target: dropping CIConclusionDegraded from the probe
+// literal specifically (aggregate.go) must turn BOTH assertions below
+// from a pass into a failure.
+func TestBuild_CIConclusionDegraded_ProbeCatchesItBeforeAnyLiveCall(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "5012"
+	const repoFullName = "acme/build-ci-conclusion-degraded-probe"
+
+	actor, fakeSCM := buildEligibleReadyToMergeFixture(ctx, t, pool, tokenKey, "ci-degraded-probe-actor@example.com", actorGitHubExternalID, repoFullName, 77)
+	fakeSCM.openPRsByExternalID[actorGitHubExternalID][0].CIConclusionDegraded = true
+	fakeSCM.resolveBranchSHAErr = errors.New("boom: github is down")
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict: appreviewverdict.Deps{
+			ReviewVerdicts: narvipg.NewReviewVerdictStore(pool), RepoSettings: narvipg.NewRepoSettingsStore(pool),
+			ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool),
+			Timeouts: platform.DefaultTimeouts(),
+		},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil", err)
+	}
+	item := findItemByPR(result.Items, 77)
+	if item == nil {
+		t.Fatal("PR #77 missing from the inbox entirely, want present as needs_review")
+	}
+	if item.Kind == decisioninboxdomain.KindReadyToMerge {
+		t.Error("Kind = ready_to_merge, want needs_review -- CIConclusionDegraded is true")
+	}
+	if result.SCMFetchFailed {
+		t.Error("SCMFetchFailed = true, want false -- the probe's own CIConclusionDegraded refusal already refuses this PR, independent of the base-SHA question, so the live ResolveBranchSHA call could never have changed this row's own fate; its failure must not raise the inbox-wide degraded signal")
+	}
+}
+
 // TestBuild_BaseBranchAdvanced_LiveTipMoved_DemotesFromReadyToMerge is D2's
 // own regression test (second adversarial-review round) at the
 // READ-MODEL level -- computeRealEligibility's (aggregate.go) own sibling

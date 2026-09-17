@@ -125,37 +125,29 @@ func RevalidateForAutoMerge(ctx context.Context, deps Deps, sourceControl ports.
 	// and is wrong for two of the five). fetchOpenPRDetail's own failure
 	// is a real Go error, already caught by this function's err != nil
 	// check two lines above -- a deadline firing during THAT call cannot
-	// reach the branch below at all. fetchReviewDecision and
-	// fetchChangedFilePaths each swallow their own failure into a
-	// degraded field instead, per their own doc comments (listopenprs.go,
-	// ports.OpenPR.ReviewDecisionDegraded/ChangedFilesListDegraded).
-	// fetchCIConclusionLive carries no degraded field for either of its
-	// two GETs at all -- see that function's own doc comment and
-	// terminal switch (listopenprs.go) for what it actually reports on a
-	// half-read composite: not "silently missing whatever it would have
-	// reported", but a confident CIConclusionSuccess whenever the GET
-	// that failed was the only one that could have contradicted the GET
-	// that didn't. That hazard predates this PR, is unchanged by it, and
-	// is not fixed here -- it is out of scope for this change and tracked
-	// as its own defect. What THIS guard closes is narrower: a deadline
-	// firing partway through GetOpenPR's own five-call composite still
-	// returns here with err == nil and a target reflecting whichever
-	// later sub-call the deadline cut short. Left unchecked, that renders
-	// downstream as an ordinary, permanent-looking eligibility refusal
-	// rather than the transient, retry-worthy timeout it actually was.
-	//
-	// It does NOT render as a false approval, and the previous version of
-	// this paragraph claimed it could. A deadline that cuts the CI read
-	// short leaves the LATER changed-files GET failing on that same
-	// expired ctx, so ChangedFilesListDegraded is set, and
-	// ComputeEligible refuses on ReasonBlastRadiusUnknown before any
-	// approval is reachable. Established with an httptest harness against
-	// the real adapter rather than reasoned about: the false CI green
-	// does occur, and it arrives inseparably bundled with the degraded
-	// changed-files signal that refuses it. Reaching a false approval
-	// needs an INDEPENDENT non-deadline failure on one CI GET with the
-	// changed-files GET still succeeding -- the separately-tracked
-	// hazard, in which a deadline plays no part. Detected
+	// reach the branch below at all. fetchReviewDecision,
+	// fetchChangedFilePaths and (since fixed) fetchCIConclusionLive each
+	// swallow their own failure into a degraded field instead, per their
+	// own doc comments (listopenprs.go, ports.OpenPR.
+	// ReviewDecisionDegraded/ChangedFilesListDegraded/
+	// CIConclusionDegraded) -- fetchCIConclusionLive USED TO carry no
+	// degraded field for either of its two GETs at all, so a failed call
+	// contributed nothing and a status GET confirming "success" beside a
+	// failed check-runs GET produced a confident CIConclusionSuccess:
+	// only a failure of BOTH GETs fell back to the honest
+	// CIConclusionUnknown default. Fixed: CIConclusionDegraded is now
+	// this composite's own third degraded signal, and ComputeEligible
+	// refuses on it (ReasonCIConclusionDegraded) exactly like it already
+	// refused on ReviewDecisionDegraded/ChangedFilesListDegraded's own
+	// callers refusing via revalidateCore's hard block and
+	// ReasonBlastRadiusUnknown respectively -- a half-read CI composite
+	// can no longer produce an eligible PR. What THIS guard (below) closes
+	// is a DIFFERENT, narrower hazard: a deadline firing partway through
+	// GetOpenPR's own five-call composite still returns here with
+	// err == nil and a target reflecting whichever later sub-call the
+	// deadline cut short. Left unchecked, that renders downstream as an
+	// ordinary, permanent-looking eligibility refusal rather than the
+	// transient, retry-worthy timeout it actually was. Detected
 	// via getPRCtx's OWN error, checked for DeadlineExceeded specifically
 	// -- never a bare non-nil check, which the cancel() call two lines
 	// above would ALSO satisfy on the ordinary, well-within-budget
@@ -256,6 +248,11 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		return false, "", "this pull request has an open, unresolved review finding", nil
 	}
 	ciGreen := target.CIConclusion == ports.CIConclusionSuccess
+	// ciConclusionDegraded is target.CIConclusionDegraded, verbatim --
+	// wired into BOTH EligibilityInput literals below (the probe and the
+	// final call), exactly like ciGreen itself, so a half-read CI
+	// composite refuses at whichever of the two actually runs first.
+	ciConclusionDegraded := target.CIConclusionDegraded
 
 	record, hasVerdict, verdictErr := appreviewverdict.GetLatest(ctx, deps.ReviewVerdict, repoFullName, int32(prNumber))
 	if verdictErr != nil {
@@ -406,6 +403,7 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		// mismatch to tolerate when both sides are the identical slice.
 		AncestorChainAdvancedWithoutRewrite: true,
 		CIGreen:                             ciGreen,
+		CIConclusionDegraded:                ciConclusionDegraded,
 		HasNeedsHumanLabel:                  hasNeedsHuman,
 		ChangedFileCount:                    changedFileCount,
 		TouchedBlastRadius:                  touchedBlastRadius,
@@ -671,6 +669,7 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		BaseAdvancedWithoutRewrite:          baseAdvancedWithoutRewrite,
 		AncestorChainAdvancedWithoutRewrite: ancestorChainAdvancedWithoutRewrite,
 		CIGreen:                             ciGreen,
+		CIConclusionDegraded:                ciConclusionDegraded,
 		HasNeedsHumanLabel:                  hasNeedsHuman,
 		ChangedFileCount:                    changedFileCount,
 		TouchedBlastRadius:                  touchedBlastRadius,

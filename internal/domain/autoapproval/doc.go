@@ -75,30 +75,43 @@
 //     onto a different base, or whose parent moved beneath it via an
 //     actual rewrite, that CurrentHeadSHA alone cannot see.
 //
-//  5. CIGreen -- must be true.
+//  5. EligibilityInput.CIConclusionDegraded must be false -- the live CI
+//     read (check 6 below) must have actually been FULLY performed
+//     before its own answer is trusted for anything: ports.OpenPR.
+//     CIConclusionDegraded's own doc comment (githubapi.
+//     fetchCIConclusionLive makes two independent GETs, and either can
+//     fail without the other). CIGreen below is already false whenever
+//     this is true -- this check changes no OUTCOME by itself -- but it
+//     is checked FIRST, on its own dedicated reason
+//     (ReasonCIConclusionDegraded), the same "is the fact even knowable"
+//     precedence check 9 below already establishes for check 10, so a
+//     half-read CI composite refuses distinguishably from a confirmed-red
+//     one (CIGreen == false, this field == false) or a still-running one.
 //
-//  6. Verdict.Shippable == review.ShippableAuto.
+//  6. CIGreen -- must be true.
 //
-//  7. EligibilityInput.ChangedFileCount <= cfg.MaxFilesChanged (diff
+//  7. Verdict.Shippable == review.ShippableAuto.
+//
+//  8. EligibilityInput.ChangedFileCount <= cfg.MaxFilesChanged (diff
 //     size) -- GitHub's own authoritative changed-file scalar, never
 //     Verdict.FilesChanged, and (Phase 5 audit finding 2, fixed) never
 //     a possibly page-truncated len() of the fetched path listing
 //     either.
 //
-//  8. EligibilityInput.TouchedBlastRadiusKnown is true (Phase 5 audit
-//     findings 1+2, fixed) -- the sensitive-path facts check 9 below
+//  9. EligibilityInput.TouchedBlastRadiusKnown is true (Phase 5 audit
+//     findings 1+2, fixed) -- the sensitive-path facts check 10 below
 //     relies on must have actually been established from GitHub; a
 //     failed or page-truncated changed-files fetch refuses here rather
 //     than silently reading as "nothing sensitive touched".
 //
-//  9. No cfg.SensitiveTags member appears in EligibilityInput.
+//  10. No cfg.SensitiveTags member appears in EligibilityInput.
 //     TouchedBlastRadius (no sensitive path touched) -- never
 //     Verdict.BlastRadius.
 //
 // "No floor raised: neither the coverage floor nor the premise floor
 // ... is above its baseline" is DELIBERATELY not a separate check of its
 // own anywhere in the numbered list above (never conflate this with
-// check 8, Phase 5 audit findings 1+2's own "is the fact even knowable"
+// check 9, Phase 5 audit findings 1+2's own "is the fact even knowable"
 // gate above, which exists for an entirely different reason: whether
 // GitHub's changed-files data could be fetched at all, nothing to do
 // with floors). internal/domain/review's own ComputeShippable composes
@@ -114,16 +127,16 @@
 // contribute a HIGHER rank into a max() and still have the max() come
 // out at the LOWEST rank. Re-deriving "no floor raised" as a second,
 // independent check over the verdict's own raw RiskLevel/TestsCoverage/
-// Premise fields would therefore either (a) always agree with check 6
+// Premise fields would therefore either (a) always agree with check 7
 // above, making it dead weight, or (b) disagree with it, which would
 // mean domain/review's own raise-only property had a bug -- a bug this
-// package has no business re-litigating a second time. Check 6 alone
+// package has no business re-litigating a second time. Check 7 alone
 // already IS "no floor raised", exactly as rigorously as a bespoke
 // second check would be. This package's own test suite (eligibility_test.go)
 // still exercises "a floor raised" as its own, independently named
 // scenario -- via three DISTINCT Verdict fixtures (coverage floor
 // raised, premise floor raised, risk baseline alone raised), each
-// proving check 6 catches that specific case -- rather than by adding a
+// proving check 7 catches that specific case -- rather than by adding a
 // redundant branch that could never independently fail.
 //
 // # IsDraft / HasChangesRequested are deliberately NOT inputs here

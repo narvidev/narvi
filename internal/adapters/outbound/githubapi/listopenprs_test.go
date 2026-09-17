@@ -279,8 +279,16 @@ func TestListOpenPRsForUser_QueuedOrCancelledCheckIsNotGreen(t *testing.T) {
 					_ = json.NewEncoder(w).Encode([]map[string]any{})
 				case r.URL.Path == "/repos/acme/widgets/commits/s/status":
 					// No legacy combined-status signal at all -- this test
-					// isolates the Checks API surface.
-					w.WriteHeader(http.StatusNotFound)
+					// isolates the Checks API surface. Deliberately the
+					// SAME realistic 200/pending/total_count==0 shape
+					// TestListOpenPRsForUser_PendingCombinedStatusRequiresARealStatus's
+					// own doc comment establishes ("a VALID commit always
+					// returns 200, never 404") -- a bare 404 here would
+					// itself now count as a failed GET
+					// (ports.OpenPR.CIConclusionDegraded's own fix), which
+					// is not what "no legacy signal" means and would
+					// wrongly degrade every case in this table.
+					_ = json.NewEncoder(w).Encode(map[string]any{"state": "pending", "statuses": []map[string]any{}, "total_count": 0})
 				case r.URL.Path == "/repos/acme/widgets/commits/s/check-runs":
 					_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": tc.checkRuns})
 				case r.URL.Path == "/repos/acme/widgets/pulls/5/files":
@@ -303,6 +311,9 @@ func TestListOpenPRsForUser_QueuedOrCancelledCheckIsNotGreen(t *testing.T) {
 			}
 			if prs[0].CIConclusion != tc.want {
 				t.Errorf("CIConclusion = %v, want %v", prs[0].CIConclusion, tc.want)
+			}
+			if prs[0].CIConclusionDegraded {
+				t.Errorf("CIConclusionDegraded = true, want false -- both GETs succeeded and decoded in this fixture")
 			}
 		})
 	}
@@ -403,6 +414,198 @@ func TestListOpenPRsForUser_PendingCombinedStatusRequiresARealStatus(t *testing.
 			}
 			if prs[0].CIConclusion != tc.want {
 				t.Errorf("CIConclusion = %v, want %v", prs[0].CIConclusion, tc.want)
+			}
+			// this repo's own regression proof for the
+			// fail-closed CI read's explicit preservation clause: an
+			// Actions-only repository (the "statusless pending" case
+			// above) with green check-runs must still report Success,
+			// UNDEGRADED -- both GETs here succeeded and fully decoded,
+			// one of them simply reporting no legacy signal at all, which
+			// is not the same thing as either GET having failed.
+			if prs[0].CIConclusionDegraded {
+				t.Errorf("CIConclusionDegraded = true, want false -- both GETs succeeded and decoded in this fixture (%s)", tc.name)
+			}
+		})
+	}
+}
+
+// TestListOpenPRsForUser_HalfReadCIFailsClosed is the regression test for a
+// half-read CI composite reporting green: fetchCIConclusionLive makes TWO
+// independent GETs (the legacy combined-status endpoint and check-runs),
+// and BEFORE this fix each was gated by a bare `if err == nil` -- a failed
+// call contributed NOTHING at all, so a status GET confirming "success"
+// beside a check-runs GET that itself failed (a transient 5xx, exactly
+// like GitHub's own documented secondary-rate-limit/abuse-detection
+// responses) fell through the terminal switch to CIConclusionSuccess: a
+// confident green from a composite only half read. Only a failure of BOTH
+// GETs fell back to CIConclusionUnknown. Reproduced against the real
+// adapter with this exact httptest harness during a review round: before
+// the fix, this test's own "status succeeds, check-runs fails" case
+// observed CIConclusion=="success", CIConclusionDegraded field not yet
+// existing at all.
+//
+// Covers all four combinations the row's own exit criterion warns must
+// not be shortchanged down to "only the both-failed case": that alone is
+// a check that passes while verifying nothing about the half this fix
+// exists for.
+func TestListOpenPRsForUser_HalfReadCIFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		statusHandler func(w http.ResponseWriter)
+		checksHandler func(w http.ResponseWriter)
+		want          ports.CIConclusion
+		wantDegraded  bool
+	}{
+		{
+			name: "both GETs succeed, both report success",
+			statusHandler: func(w http.ResponseWriter) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"state": "success", "total_count": 1})
+			},
+			checksHandler: func(w http.ResponseWriter) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": []map[string]any{{"conclusion": "success"}}})
+			},
+			want:         ports.CIConclusionSuccess,
+			wantDegraded: false,
+		},
+		{
+			// The row's own reproduction scenario, verbatim: a status GET
+			// succeeding beside a failing check-runs GET must not produce
+			// an eligible PR -- CIConclusion must read Unknown, never
+			// Success, and CIConclusionDegraded must say why.
+			name: "status succeeds (success), check-runs GET fails (500)",
+			statusHandler: func(w http.ResponseWriter) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"state": "success", "total_count": 1})
+			},
+			checksHandler: func(w http.ResponseWriter) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			want:         ports.CIConclusionUnknown,
+			wantDegraded: true,
+		},
+		{
+			// The mirror image -- the OTHER of the two GETs failing. The
+			// row warns this is a distinct call site from its own sibling
+			// above and must be independently proven, not inferred.
+			name: "check-runs succeeds (success), status GET fails (500)",
+			statusHandler: func(w http.ResponseWriter) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			checksHandler: func(w http.ResponseWriter) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": []map[string]any{{"conclusion": "success"}}})
+			},
+			want:         ports.CIConclusionUnknown,
+			wantDegraded: true,
+		},
+		{
+			// The row's own warning, verbatim: "an assertion that only
+			// checks the both-failed case is a check that passes while
+			// verifying nothing about the half this Step exists for" --
+			// kept here anyway, alongside its three siblings above, so
+			// this composite's own pre-existing "both failed -> Unknown"
+			// behavior is still proven, not merely assumed unchanged.
+			name: "both GETs fail (500)",
+			statusHandler: func(w http.ResponseWriter) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			checksHandler: func(w http.ResponseWriter) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			want:         ports.CIConclusionUnknown,
+			wantDegraded: true,
+		},
+		{
+			// A GET that returns 200 but an undecodable body is the SAME
+			// "could not be read" fact as a transport error -- mirrors
+			// fetchReviewDecision/fetchChangedFilePaths' own identical
+			// "err != nil OR decode failed" degraded convention one field
+			// over (listopenprs.go).
+			name: "status succeeds but returns an undecodable body, check-runs succeeds",
+			statusHandler: func(w http.ResponseWriter) {
+				_, _ = w.Write([]byte("not json"))
+			},
+			checksHandler: func(w http.ResponseWriter) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": []map[string]any{{"conclusion": "success"}}})
+			},
+			want:         ports.CIConclusionUnknown,
+			wantDegraded: true,
+		},
+		{
+			// A genuine, CONFIRMED failure from the GET that DID succeed
+			// is still real signal and still wins over the other GET's
+			// own degraded read -- mirrors the terminal switch's own
+			// pre-existing "failure wins over incomplete" precedent.
+			// Degraded is still true (the composite was still only half
+			// read), but the conclusion itself is the more specific,
+			// already-confirmed Failure, never merely Unknown.
+			name: "check-runs reports a confirmed failure, status GET fails (500)",
+			statusHandler: func(w http.ResponseWriter) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+			checksHandler: func(w http.ResponseWriter) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": []map[string]any{{"conclusion": "failure"}}})
+			},
+			want:         ports.CIConclusionFailure,
+			wantDegraded: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.URL.Path == "/user/1":
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{"id": 1, "login": "octocat"})
+				case r.URL.Path == "/search/issues" && strings.Contains(r.URL.Query().Get("q"), "assignee:octocat"):
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"items": []map[string]any{{"number": 5, "repository_url": "https://api.github.com/repos/acme/widgets"}},
+					})
+				case r.URL.Path == "/search/issues" && strings.Contains(r.URL.Query().Get("q"), "review-requested:octocat"):
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{}})
+				case r.URL.Path == "/repos/acme/widgets/pulls/5":
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"number": 5, "title": "x", "html_url": "u", "state": "open", "head": map[string]any{"sha": "s"}, "base": map[string]any{"ref": "main"},
+					})
+				case r.URL.Path == "/repos/acme/widgets/pulls/5/reviews":
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode([]map[string]any{})
+				case r.URL.Path == "/repos/acme/widgets/commits/s/status":
+					w.Header().Set("Content-Type", "application/json")
+					tc.statusHandler(w)
+				case r.URL.Path == "/repos/acme/widgets/commits/s/check-runs":
+					w.Header().Set("Content-Type", "application/json")
+					tc.checksHandler(w)
+				case r.URL.Path == "/repos/acme/widgets/pulls/5/files":
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode([]map[string]any{})
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+
+			adapter := githubapi.New(server.Client(), server.URL)
+
+			prs, _, err := adapter.ListOpenPRsForUser(context.Background(), ports.ListOpenPRsForUserSpec{GitHubExternalID: "1", Token: "tok"})
+			if err != nil {
+				t.Fatalf("ListOpenPRsForUser() error = %v, want nil", err)
+			}
+			if len(prs) != 1 {
+				t.Fatalf("ListOpenPRsForUser() returned %d PRs, want 1", len(prs))
+			}
+			if prs[0].CIConclusion != tc.want {
+				t.Errorf("CIConclusion = %v, want %v", prs[0].CIConclusion, tc.want)
+			}
+			if prs[0].CIConclusionDegraded != tc.wantDegraded {
+				t.Errorf("CIConclusionDegraded = %v, want %v", prs[0].CIConclusionDegraded, tc.wantDegraded)
 			}
 		})
 	}

@@ -223,6 +223,38 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		}
 	})
 
+	// a half-read CI composite (githubapi.
+	// fetchCIConclusionLive making two independent GETs, one of them
+	// itself failing) must refuse the merge exactly like ReviewDecision
+	// Degraded above -- "we could not fully read this" must never
+	// silently satisfy this gate. CIConclusion is deliberately left at
+	// its own confirmed CIConclusionSuccess (the fixture's own eligible
+	// baseline) so this subtest proves the refusal fires on
+	// CIConclusionDegraded ALONE, not on a coincidentally-non-success
+	// CIConclusion -- the exact shape the row's own reproduction produces
+	// (a status GET confirming success beside a failing check-runs GET).
+	// Mutation-test target: dropping CIConclusionDegraded from either of
+	// revalidateCore's two EligibilityInput literals (the probe or the
+	// final call) must turn this subtest's own "ok = true" assertion from
+	// a failure back into a pass.
+	t.Run("CIConclusionDegraded_Refused", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-ci-conclusion-degraded"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 107)
+		pr.CIConclusionDegraded = true
+		rs.replaceTargetPR(actorGitHubID, pr)
+
+		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+		}
+		if ok {
+			t.Fatal("RevalidateForMerge() ok = true, want false -- a degraded/half-read CI status (one of fetchCIConclusionLive's two GETs failed) must never silently pass as 'confirmed green'")
+		}
+		if reason == "" {
+			t.Error("reason is empty, want a human-readable explanation")
+		}
+	})
+
 	// Phase 5 audit finding 1 (fixed) at the real revalidateCore wiring,
 	// the audit's own named scenario: "GET /pulls/{n}/files returns 502
 	// during aggregation or auto-merge revalidation". ChangedFiles stays
@@ -1181,6 +1213,62 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 			t.Errorf("reason = %q, want empty (this is an error return, not a domain refusal reason)", reason)
 		}
 	})
+}
+
+// TestRevalidateForMerge_CIConclusionDegraded_ProbeCatchesItBeforeAnyLiveCall
+// is revalidateCore's own "one of two call sites" trap, made observable:
+// this function builds TWO EligibilityInput literals from the identical
+// target -- probeInput (checked before any live SCM call) and the final
+// literal (checked after). CIConclusionDegraded_Refused above (in
+// TestRevalidateForMerge_NegativeCases) proves the OUTCOME refuses either
+// way, but on this fixture's own otherwise-fully-eligible baseline the
+// live ResolveBranchSHA call between the two literals ALWAYS succeeds, so
+// that test alone cannot tell "the probe caught it" apart from "only the
+// final call caught it, after an live call the probe should have made
+// unnecessary". This test forces sourceControl.ResolveBranchSHA to FAIL,
+// and asserts the reason string is STILL the CI-degraded one, never the
+// distinct "base commit could not be confirmed (a live check failed)"
+// message revalidateCore returns when that live call itself errors --
+// proving the probe refuses BEFORE ever attempting it, exactly like G3/
+// G4's own established "order the checks so the honest reason wins" and
+// "fewer live calls than strictly needed" discipline this same function's
+// doc comment already establishes for every OTHER criterion the probe
+// checks. Mutation-test target: dropping CIConclusionDegraded from
+// probeInput specifically (revalidate.go) while leaving it in the final
+// literal must turn this test's own reason assertion from a pass into a
+// failure (the reason would then read the base-commit message instead).
+func TestRevalidateForMerge_CIConclusionDegraded_ProbeCatchesItBeforeAnyLiveCall(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	rs := newRevalidateStores(pool)
+	const actorGitHubID = "revalidate-actor-ci-degraded-probe"
+	const repoFullName = "acme/revalidate-ci-conclusion-degraded-probe"
+
+	pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 108)
+	pr.CIConclusionDegraded = true
+	rs.replaceTargetPR(actorGitHubID, pr)
+
+	// Forces the LIVE base-branch-tip resolution (revalidateCore, between
+	// the probe and the final ComputeEligible call) to fail -- if the
+	// probe does not ALSO carry CIConclusionDegraded, execution reaches
+	// this call and returns ITS OWN distinct, honest reason instead of
+	// ever reaching the final ComputeEligible call at all.
+	rs.sourceControl.resolveBranchSHAErr = errors.New("simulated: base branch tip unavailable")
+	defer func() { rs.sourceControl.resolveBranchSHAErr = nil }()
+
+	ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+	if err != nil {
+		t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+	}
+	if ok {
+		t.Fatal("RevalidateForMerge() ok = true, want false")
+	}
+	if strings.Contains(reason, "base commit could not be confirmed") {
+		t.Errorf("reason = %q, contains the LIVE-base-check failure message -- the probe should have refused on the degraded CI read BEFORE ever attempting that live call", reason)
+	}
+	if !strings.Contains(reason, string(autoapproval.ReasonCIConclusionDegraded)) {
+		t.Errorf("reason = %q, want it to contain %q (the probe's own CIConclusionDegraded refusal)", reason, autoapproval.ReasonCIConclusionDegraded)
+	}
 }
 
 // TestRevalidateForMerge_EligibilityConfigStoreError_FailsClosed is the C3
