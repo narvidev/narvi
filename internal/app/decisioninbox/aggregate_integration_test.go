@@ -184,6 +184,17 @@ type fakeDecisionInboxSourceControl struct {
 	// stay exactly as they were.
 	resolveBranchSHA    string
 	resolveBranchSHAErr error
+	// resolveBranchSHAByBranch (round-11 finding A3) lets a test configure
+	// a DISTINCT resolved sha per queried branch -- checked BEFORE both
+	// the plain resolveBranchSHA override and the scan-fallback above,
+	// specifically for a test that needs the IMMEDIATE base and a
+	// GitHub-native stack's own ancestor ref to resolve to two
+	// INDEPENDENTLY-controlled values in the same call (a fast-forward on
+	// the ancestor chain alone, the base left genuinely unchanged) --
+	// resolveBranchSHA's own single shared value cannot express that,
+	// since it answers every branch identically. Every EXISTING test that
+	// never populates this map is unaffected.
+	resolveBranchSHAByBranch map[string]string
 
 	// isAncestorResult/isAncestorErr/isAncestorCalls (D3, second
 	// adversarial-review round) back IsAncestor below -- the fast-forward
@@ -272,6 +283,9 @@ func (f *fakeDecisionInboxSourceControl) ResolveBranchSHA(ctx context.Context, s
 	}
 	if f.resolveBranchSHAErr != nil {
 		return "", "", f.resolveBranchSHAErr
+	}
+	if sha, ok := f.resolveBranchSHAByBranch[spec.Branch]; ok {
+		return sha, spec.Branch, nil
 	}
 	if f.resolveBranchSHA != "" {
 		return f.resolveBranchSHA, spec.Branch, nil
@@ -1483,6 +1497,164 @@ func TestBuild_AncestorChainMatches_LiveResolved_StaysReadyToMerge(t *testing.T)
 	}
 }
 
+// TestBuild_AncestorChainUnknown_LiveResolveFails_DemotesAndMarksDegraded is
+// round-11 finding A1's own regression test for computeRealEligibility's
+// (aggregate.go) currentAncestorChain block, one specific hole finding E
+// separately named: the block's own two-case switch (err != nil /
+// liveAncestorSHA != "") had NO default arm at all, so a live resolve
+// failure fell through to currentAncestorChain's own zero value, nil --
+// INDISTINGUISHABLE, once compared, from "this PR was never in a stack at
+// all". This fixture's own verdict was recorded against a PR that WAS
+// stacked (a real, non-nil ancestor chain), so a live resolve failure here
+// must fail closed (demoted, SCMFetchFailed) rather than silently reading
+// as a clean, confirmed-empty match. Mutation-test target: reverting the
+// currentAncestorChain block's own `case liveAncestorErr != nil: ...
+// degraded = true` arm back to leaving currentAncestorChain at nil with
+// no degraded flag (this fix's own inverse) must turn this test's own
+// KindNeedsReview/SCMFetchFailed assertions back into
+// KindReadyToMerge/false.
+func TestBuild_AncestorChainUnknown_LiveResolveFails_DemotesAndMarksDegraded(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "5012"
+	const repoFullName = "acme/build-ancestor-chain-unknown"
+
+	actor, fakeSCM := buildEligibleReadyToMergeFixture(ctx, t, pool, tokenKey, "a1-actor@example.com", actorGitHubExternalID, repoFullName, 80)
+
+	// The live PR reports a real ancestor link on a branch
+	// ("release-parent") NO seeded PR's own BaseRef names -- the fake's
+	// own scan-fallback (ResolveBranchSHA's doc comment) then naturally
+	// returns an error for this SPECIFIC branch while the immediate base
+	// ("main", testEligibleBaseRef, matched by the seeded PR itself)
+	// still resolves cleanly -- isolating this test to the ANCESTOR
+	// resolve's own failure alone.
+	fakeSCM.openPRsByExternalID[actorGitHubExternalID][0].AncestorChain = []ports.PRAncestorLink{{Ref: "release-parent", SHA: "cached-irrelevant-snapshot"}}
+
+	// A verdict recorded while this PR WAS genuinely stacked -- a real,
+	// non-nil ancestor chain, never seedAutoApprovedVerdict's own nil.
+	verdict := review.Verdict{
+		RiskLevel:         review.RiskLevelLow,
+		Premise:           review.PremiseStateOK,
+		TestsCoverage:     review.TestsCoverageStateAdequate,
+		DocsDrift:         review.DocsDriftStateNone,
+		ProposedShippable: review.ProposedShippableAuto,
+		FilesChanged:      3,
+	}
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdictContext := reviewverdict.Context{
+		BaseRef:       testEligibleBaseRef,
+		BaseSHA:       testEligibleBaseSHA,
+		AncestorChain: []review.AncestorLink{{Ref: "release-parent", SHA: "release-parent-old-sha"}},
+		PolicyVersion: autoapproval.CurrentPolicyVersion,
+	}
+	reviewVerdicts := narvipg.NewReviewVerdictStore(pool)
+	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, 80, "sha-80", pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "verdict recorded while genuinely stacked, ancestor resolve now fails"}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
+		t.Fatalf("seed verdict with a real ancestor chain: %v", err)
+	}
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict:      appreviewverdict.Deps{ReviewVerdicts: reviewVerdicts, RepoSettings: repoSettings, ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool), Timeouts: platform.DefaultTimeouts()},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil (a live SCM lookup failure must degrade ONE row, never fail the whole Build call)", err)
+	}
+	item := findItemByPR(result.Items, 80)
+	if item == nil {
+		t.Fatal("PR #80 missing from the inbox entirely, want present as needs_review")
+	}
+	if item.Kind == decisioninboxdomain.KindReadyToMerge {
+		t.Error("Kind = ready_to_merge, want needs_review -- an unresolvable ancestor-chain link must fail closed via ReasonAncestorChainUnknown, never silently read as no ancestor chain at all")
+	}
+	if !result.SCMFetchFailed {
+		t.Error("SCMFetchFailed = false, want true -- a failed ancestor-chain live resolve must mark the whole read degraded, exactly like a failed base ResolveBranchSHA call already does")
+	}
+}
+
+// TestBuild_AncestorChainAdvanced_ConfirmedFastForward_StaysReadyToMerge is
+// round-11 finding A3's own regression test for computeRealEligibility --
+// the SAME fast-forward tolerance BaseBranchAdvanced_ConfirmedFastForward
+// (revalidate_integration_test.go) pins for the immediate base, one link
+// further out, exercised through the read-model path (aggregate.go) this
+// time. Before this fix, ANY ancestor-chain sha movement refused
+// unconditionally (autoapproval.ancestorChainEqual had no tolerance
+// parameter at all).
+func TestBuild_AncestorChainAdvanced_ConfirmedFastForward_StaysReadyToMerge(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "5013"
+	const repoFullName = "acme/build-ancestor-chain-advanced-confirmed"
+
+	actor, fakeSCM := buildEligibleReadyToMergeFixture(ctx, t, pool, tokenKey, "a3-actor@example.com", actorGitHubExternalID, repoFullName, 81)
+
+	fakeSCM.openPRsByExternalID[actorGitHubExternalID][0].AncestorChain = []ports.PRAncestorLink{{Ref: "release-parent", SHA: "cached-irrelevant-snapshot"}}
+	fakeSCM.resolveBranchSHAByBranch = map[string]string{"release-parent": "release-parent-new-sha"}
+	fakeSCM.isAncestorResult = true
+
+	verdict := review.Verdict{
+		RiskLevel:         review.RiskLevelLow,
+		Premise:           review.PremiseStateOK,
+		TestsCoverage:     review.TestsCoverageStateAdequate,
+		DocsDrift:         review.DocsDriftStateNone,
+		ProposedShippable: review.ProposedShippableAuto,
+		FilesChanged:      3,
+	}
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdictContext := reviewverdict.Context{
+		BaseRef:       testEligibleBaseRef,
+		BaseSHA:       testEligibleBaseSHA,
+		AncestorChain: []review.AncestorLink{{Ref: "release-parent", SHA: "release-parent-old-sha"}},
+		PolicyVersion: autoapproval.CurrentPolicyVersion,
+	}
+	reviewVerdicts := narvipg.NewReviewVerdictStore(pool)
+	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, 81, "sha-81", pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "verdict recorded before the ancestor chain's own confirmed fast-forward"}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
+		t.Fatalf("seed verdict with an advanced-but-confirmed ancestor chain: %v", err)
+	}
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict:      appreviewverdict.Deps{ReviewVerdicts: reviewVerdicts, RepoSettings: repoSettings, ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool), Timeouts: platform.DefaultTimeouts()},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil", err)
+	}
+	item := findItemByPR(result.Items, 81)
+	if item == nil {
+		t.Fatal("PR #81 missing from the inbox entirely")
+	}
+	if item.Kind != decisioninboxdomain.KindReadyToMerge {
+		t.Errorf("Kind = %s, want ready_to_merge -- A3: an ancestor-chain movement CONFIRMED as a pure fast-forward must not refuse an otherwise-eligible PR", item.Kind)
+	}
+	if len(fakeSCM.isAncestorCalls) != 1 {
+		t.Fatalf("IsAncestor called %d times, want 1", len(fakeSCM.isAncestorCalls))
+	}
+	gotCall := fakeSCM.isAncestorCalls[0]
+	if gotCall.Ancestor != "release-parent-old-sha" || gotCall.Descendant != "release-parent-new-sha" {
+		t.Errorf("IsAncestor(Ancestor, Descendant) = (%q, %q), want (%q, %q)",
+			gotCall.Ancestor, gotCall.Descendant, "release-parent-old-sha", "release-parent-new-sha")
+	}
+}
+
 // TestBuild_AncestorChainChanged_DemotesFromReadyToMerge is round-10
 // finding A2's own regression test for computeRealEligibility's (aggregate.go)
 // VerdictAncestorChain/CurrentAncestorChain wiring -- the SAME "otherwise
@@ -1494,20 +1666,41 @@ func TestBuild_AncestorChainMatches_LiveResolved_StaysReadyToMerge(t *testing.T)
 // are GitHub-native-stack PRs"), so a LIVE PR that now reports one (this
 // PR's parent moved beneath it in a GitHub-native stack, §21.1's
 // amendment) must demote out of ready_to_merge -- the verdict never
-// examined the code as it stands now. Before this test existed, both of
-// computeRealEligibility's own VerdictAncestorChain/CurrentAncestorChain
-// wiring lines (each of the two autoapproval.EligibilityInput literals in
-// aggregate.go) were independently deletable: every OTHER fixture in this
-// file leaves the live PR's own AncestorChain nil too, so
-// autoapproval.ancestorChainEqual(nil, nil) trivially passed regardless
-// of whether either wiring line even existed. Mutation-test target:
-// deleting `VerdictAncestorChain: record.Context.AncestorChain,` from
-// EITHER EligibilityInput literal in aggregate.go must turn this test's
-// own KindNeedsReview assertion back into KindReadyToMerge -- paired with
+// examined the code as it stands now.
+//
+// Round-11 finding E (corrected): the PREVIOUS version of this comment
+// named its own mutation target as deleting
+// `VerdictAncestorChain: record.Context.AncestorChain,` from EITHER of
+// computeRealEligibility's two autoapproval.EligibilityInput literals --
+// then, in its very next parenthetical, correctly explained why that
+// mutation is a NO-OP for this specific fixture ("this fixture's own
+// VerdictAncestorChain is already nil by construction, so it alone cannot
+// distinguish 'wired to nil' from 'never wired at all'") -- a
+// self-contradiction inside the same doc comment: record.Context.
+// AncestorChain IS nil here (seedAutoApprovedVerdict's own doc comment
+// above), so that wiring line's assigned value is indistinguishable from
+// its own Go zero value, and deleting it changes nothing this test can
+// observe.
+//
+// The mutation this test ACTUALLY pins is CurrentAncestorChain's own
+// wiring (both the probe's and the final call's, in EITHER
+// EligibilityInput literal in aggregate.go): this fixture's live PR
+// reports a REAL ancestor chain (Position-2, a genuine
+// `AncestorChain: []ports.PRAncestorLink{{Ref: "main", ...}}` below)
+// against a verdict recorded with none -- the two only disagree at all
+// because CurrentAncestorChain carries the live chain in. Every OTHER
+// fixture in this file leaves the live PR's own AncestorChain nil too, so
+// autoapproval.ancestorChainEqual(nil, nil) trivially passes regardless
+// of whether CurrentAncestorChain's own wiring line even exists --
+// exactly what made it independently deletable before this test existed.
+// Mutation-test target: deleting `CurrentAncestorChain: currentAncestorChain,`
+// from the FINAL EligibilityInput literal in aggregate.go must turn this
+// test's own KindNeedsReview assertion back into KindReadyToMerge (its own
+// zero value, nil, would then trivially match VerdictAncestorChain's
+// identical nil) -- paired with
 // TestBuild_AncestorChainMatches_LiveResolved_StaysReadyToMerge above,
-// which independently pins CurrentAncestorChain's own wiring (this
-// fixture's own VerdictAncestorChain is already nil by construction, so
-// it alone cannot distinguish "wired to nil" from "never wired at all").
+// which independently pins the SAME wiring line's positive direction (a
+// live chain that DOES match a real recorded one must stay eligible).
 func TestBuild_AncestorChainChanged_DemotesFromReadyToMerge(t *testing.T) {
 	pool := newTestPool(t)
 	ctx := context.Background()

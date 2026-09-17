@@ -130,19 +130,27 @@ type openPRDetailResponse struct {
 	Number  int    `json:"number"`
 	Title   string `json:"title"`
 	HTMLURL string `json:"html_url"`
-	// State (round-10 finding E) is GitHub's own documented "open"/
-	// "closed" scalar on this SAME "Get a pull request" response --
-	// GetOpenPR's own doc comment (ports/sourcecontrol.go) promises
-	// "found=false, err=nil means the PR does not exist, or is no
-	// longer open (closed/merged)", but until this fix nothing on this
-	// response shape was ever decoded to actually tell the two apart: a
-	// confirmed-absent PR (404) and a confirmed-PRESENT-but-closed-or-
-	// merged PR (200, this field reading "closed") both reached
-	// GetOpenPR's own caller identically as found=true. A merged PR
-	// ALSO reports state=="closed" here (GitHub never uses a separate
-	// "merged" state value), so checking this one field alone catches
-	// both closed and merged, matching that doc comment's own "closed/
-	// merged" wording exactly.
+	// State (round-10 finding E; doc comment corrected, round-11 finding
+	// E) is GitHub's own documented "open"/"closed" scalar on this SAME
+	// "Get a pull request" response -- GetOpenPR's own doc comment
+	// (ports/sourcecontrol.go) promises "found=false, err=nil means the
+	// PR does not exist, or is no longer open (closed/merged)", a
+	// two-halved contract only HALF of which was ever true before this
+	// fix. The confirmed-ABSENT half (a 404 from GitHub) was ALREADY
+	// correctly handled from GetOpenPR's own first version -- that
+	// function's own fetchOpenPRDetail error path checks
+	// apiErr.Status == http.StatusNotFound and returns found=false
+	// unconditionally, entirely independent of this field, which a 404
+	// response never even carries (there is no response body to decode
+	// State out of at all). The gap this fix closes is narrower, and
+	// different in kind: a confirmed-PRESENT-but-closed-or-merged PR (a
+	// real 200 response, this field reading "closed") reached GetOpenPR's
+	// own caller as found=true, identically to a genuinely open PR --
+	// until this field was decoded at all, nothing on this response shape
+	// could tell the two apart. A merged PR ALSO reports state=="closed"
+	// here (GitHub never uses a separate "merged" state value), so
+	// checking this one field alone catches both closed and merged,
+	// matching that doc comment's own "closed/merged" wording exactly.
 	State     string `json:"state"`
 	Draft     bool   `json:"draft"`
 	Additions int    `json:"additions"`
@@ -358,6 +366,25 @@ func (a *Adapter) buildOpenPR(ctx context.Context, owner, repo string, number in
 	if err != nil {
 		return ports.OpenPR{}, false
 	}
+	// Round-11 finding C: GetOpenPR (getopenpr.go, round-10 finding E)
+	// checks detail.State to exclude a closed-or-merged PR that a
+	// confirmed-present 200 response can still report -- that fix landed
+	// on GetOpenPR alone, leaving THIS caller's identical hazard open:
+	// searchOpenPRs' own "is:pr is:open" qualifier (this file's own top
+	// doc comment) queries GitHub's Search API index, which is
+	// eventually consistent and can still surface a candidate that has
+	// since closed or merged in the gap between the search and this
+	// detail fetch. This caller's own established "ok=false, drop this
+	// one row" semantics (this function's own doc comment above) is
+	// exactly the right shape for that race -- mirrors GetOpenPR's
+	// identical check, never a second, independently-decided threshold,
+	// so the human merge-click path (ListOpenPRsForUser, via
+	// decisioninbox.RevalidateForMerge) no longer treats a closed/merged
+	// PR as open while the machine-initiated path (GetOpenPR, via
+	// RevalidateForAutoMerge) already refuses it.
+	if detail.State != "open" {
+		return ports.OpenPR{}, false
+	}
 	return a.buildOpenPRFromDetail(ctx, owner, repo, detail, token), true
 }
 
@@ -491,14 +518,34 @@ func (a *Adapter) buildOpenPRFromDetail(ctx context.Context, owner, repo string,
 	return pr
 }
 
-// ancestorChainFromDetailStack mirrors internal/domain/review.
-// AncestorChainFromStack's own identical derivation, one layer down --
-// this port (§4.3) stays domain-free, so it builds its own
-// ports.PRAncestorLink slice directly from stack rather than importing
-// that domain function. See AncestorChainFromStack's own doc comment for
-// the full "why one link, nearest-first" reasoning; kept in exact sync
-// with it deliberately (there is exactly one other real caller of the
-// identical logic, internal/app/reviewcontext.Fetch).
+// ancestorChainFromDetailStack derives the SAME "position <= 1 or no
+// stack -> no link, otherwise exactly one link" SHAPE internal/domain/
+// review.AncestorChainFromStack derives, one layer down -- this port
+// (§4.3) stays domain-free, so it builds its own ports.PRAncestorLink
+// slice directly from stack rather than importing that domain function.
+//
+// Round-11 finding E (corrected): the PREVIOUS version of this comment
+// claimed this function is "kept in exact sync" with AncestorChainFromStack
+// -- true when it was written, no longer true since round-10 finding B
+// changed that domain function's own signature to take a SEPARATE,
+// caller-supplied, LIVE-resolved SHA parameter rather than reading a
+// stack's own embedded SHA field directly. This function has no
+// equivalent live-resolution capability at all -- it is a pure decode of
+// one already-fetched GitHub response, with no SourceControl port in
+// scope to call -- so stack.Base.SHA below is, and can only ever be,
+// GitHub's own PER-PR CACHED stack field (the same shape ports.OpenPR.
+// BaseSHA's own doc comment already documents as stale-by-design for the
+// immediate base, finding F1). ports.PRAncestorLink.SHA is therefore a
+// CACHED value here, never a live one -- this function's own two real
+// callers (buildOpenPRFromDetail, above, feeding ports.OpenPR.AncestorChain;
+// and GetOpenPR, getopenpr.go) both document that their own SHA is
+// display/audit data only, and BOTH of ComputeEligible's real call sites
+// (internal/app/decisioninbox's revalidateCore/computeRealEligibility)
+// deliberately read ONLY this result's Ref field, re-resolving the SHA
+// live themselves via SourceControl.ResolveBranchSHA -- exactly the
+// "never the cached field" discipline BaseSHA already established one
+// layer up, applied here by the CALLER rather than by this function
+// itself.
 func ancestorChainFromDetailStack(stack *stackResponse) []ports.PRAncestorLink {
 	if stack == nil || stack.Position <= 1 || stack.Base.Ref == "" {
 		return nil

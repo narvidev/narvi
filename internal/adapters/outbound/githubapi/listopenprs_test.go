@@ -52,7 +52,7 @@ func TestListOpenPRsForUser_FullScenario(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/pulls/1204":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"number": 1204, "title": "scheduler: exponential backoff", "html_url": "https://github.com/acme/widgets/pull/1204",
-				"draft": false, "additions": 40, "deletions": 5,
+				"state": "open", "draft": false, "additions": 40, "deletions": 5,
 				"created_at": "2026-08-05T10:00:00Z", "updated_at": "2026-08-05T11:00:00Z",
 				"user":                map[string]any{"id": 500, "login": "narvi-bot"},
 				"head":                map[string]any{"sha": "headsha1204"},
@@ -74,7 +74,7 @@ func TestListOpenPRsForUser_FullScenario(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/payroll-api/pulls/1187":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"number": 1187, "title": "harden webhook signature validation", "html_url": "https://github.com/acme/payroll-api/pull/1187",
-				"draft": false, "additions": 120, "deletions": 30,
+				"state": "open", "draft": false, "additions": 120, "deletions": 30,
 				"created_at": "2026-08-06T08:00:00Z", "updated_at": "2026-08-06T09:00:00Z",
 				"user":                map[string]any{"id": 600, "login": "narvi-bot"},
 				"head":                map[string]any{"sha": "headsha1187"},
@@ -171,7 +171,7 @@ func TestListOpenPRsForUser_OneQueryFailingDoesNotBlankTheOther(t *testing.T) {
 			})
 		case r.URL.Path == "/repos/acme/widgets/pulls/5":
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"number": 5, "title": "x", "html_url": "u", "head": map[string]any{"sha": "s"}, "base": map[string]any{"ref": "main"},
+				"number": 5, "title": "x", "html_url": "u", "state": "open", "head": map[string]any{"sha": "s"}, "base": map[string]any{"ref": "main"},
 			})
 		case r.URL.Path == "/repos/acme/widgets/pulls/5/reviews":
 			_ = json.NewEncoder(w).Encode([]map[string]any{})
@@ -273,7 +273,7 @@ func TestListOpenPRsForUser_QueuedOrCancelledCheckIsNotGreen(t *testing.T) {
 					_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{}})
 				case r.URL.Path == "/repos/acme/widgets/pulls/5":
 					_ = json.NewEncoder(w).Encode(map[string]any{
-						"number": 5, "title": "x", "html_url": "u", "head": map[string]any{"sha": "s"}, "base": map[string]any{"ref": "main"},
+						"number": 5, "title": "x", "html_url": "u", "state": "open", "head": map[string]any{"sha": "s"}, "base": map[string]any{"ref": "main"},
 					})
 				case r.URL.Path == "/repos/acme/widgets/pulls/5/reviews":
 					_ = json.NewEncoder(w).Encode([]map[string]any{})
@@ -371,7 +371,7 @@ func TestListOpenPRsForUser_PendingCombinedStatusRequiresARealStatus(t *testing.
 					_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{}})
 				case r.URL.Path == "/repos/acme/widgets/pulls/5":
 					_ = json.NewEncoder(w).Encode(map[string]any{
-						"number": 5, "title": "x", "html_url": "u", "head": map[string]any{"sha": "s"}, "base": map[string]any{"ref": "main"},
+						"number": 5, "title": "x", "html_url": "u", "state": "open", "head": map[string]any{"sha": "s"}, "base": map[string]any{"ref": "main"},
 					})
 				case r.URL.Path == "/repos/acme/widgets/pulls/5/reviews":
 					_ = json.NewEncoder(w).Encode([]map[string]any{})
@@ -474,7 +474,7 @@ func TestListOpenPRsForUser_ReviewDecisionReducesToLatestPerReviewer(t *testing.
 					_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{}})
 				case r.URL.Path == "/repos/acme/widgets/pulls/5":
 					_ = json.NewEncoder(w).Encode(map[string]any{
-						"number": 5, "title": "x", "html_url": "u", "head": map[string]any{"sha": "s"}, "base": map[string]any{"ref": "main"},
+						"number": 5, "title": "x", "html_url": "u", "state": "open", "head": map[string]any{"sha": "s"}, "base": map[string]any{"ref": "main"},
 					})
 				case r.URL.Path == "/repos/acme/widgets/pulls/5/reviews":
 					_ = json.NewEncoder(w).Encode(tc.reviews)
@@ -591,7 +591,7 @@ func TestListOpenPRsForUser_ChangedFilesCountAndDegraded(t *testing.T) {
 					_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{}})
 				case r.URL.Path == "/repos/acme/widgets/pulls/5":
 					_ = json.NewEncoder(w).Encode(map[string]any{
-						"number": 5, "title": "x", "html_url": "u", "head": map[string]any{"sha": "s"}, "base": map[string]any{"ref": "main"},
+						"number": 5, "title": "x", "html_url": "u", "state": "open", "head": map[string]any{"sha": "s"}, "base": map[string]any{"ref": "main"},
 						"changed_files": tc.changedFilesScalar,
 					})
 				case r.URL.Path == "/repos/acme/widgets/pulls/5/reviews":
@@ -637,5 +637,81 @@ func TestListOpenPRsForUser_ChangedFilesCountAndDegraded(t *testing.T) {
 				t.Errorf("len(ChangedFiles) = %d, want %d", len(pr.ChangedFiles), tc.wantChangedFilesLen)
 			}
 		})
+	}
+}
+
+// TestListOpenPRsForUser_ClosedCandidate_DroppedFromResults is round-11
+// finding C's own regression test: round-10 finding E added a
+// detail.State check to GetOpenPR (getopenpr.go, the MACHINE-initiated
+// discovery primitive RevalidateForAutoMerge uses) but never to
+// buildOpenPR here -- the HUMAN merge-click path's own discovery
+// primitive, reached via ListOpenPRsForUser and
+// decisioninbox.RevalidateForMerge. searchOpenPRs' own "is:pr is:open"
+// qualifier queries GitHub's Search API index, which is eventually
+// consistent and can surface a candidate that has since closed (or
+// merged -- GitHub reports both as state == "closed", never a distinct
+// "merged" value, openPRDetailResponse.State's own doc comment) in the
+// gap between the search and this detail fetch -- before this fix, a
+// confirmed-present 200 response reporting state == "closed" still built
+// a full ports.OpenPR and returned ok=true here, identically to a
+// genuinely open PR.
+func TestListOpenPRsForUser_ClosedCandidate_DroppedFromResults(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/user/9002":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 9002, "login": "octocat2"})
+
+		case r.Method == http.MethodGet && r.URL.Path == "/search/issues":
+			// Both qualifiers report the SAME stale search hit -- GitHub's
+			// search index has not yet caught up with this PR's own real,
+			// closed state.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"items": []map[string]any{
+					{"number": 2001, "repository_url": "https://api.github.com/repos/acme/widgets"},
+				},
+			})
+
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/pulls/2001":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 2001, "title": "stale search hit, actually closed", "html_url": "https://github.com/acme/widgets/pull/2001",
+				"state": "closed", "draft": false, "additions": 10, "deletions": 2,
+				"created_at": "2026-08-05T10:00:00Z", "updated_at": "2026-08-05T11:00:00Z",
+				"user":                map[string]any{"id": 500, "login": "narvi-bot"},
+				"head":                map[string]any{"sha": "headsha2001"},
+				"base":                map[string]any{"ref": "main"},
+				"labels":              []map[string]any{},
+				"assignees":           []map[string]any{{"id": 9002, "login": "octocat2"}},
+				"requested_reviewers": []map[string]any{},
+				"requested_teams":     []map[string]any{},
+			})
+			// No further GET should be attempted for this PR (reviews, CI,
+			// changed files) -- buildOpenPR must drop it on the state check
+			// alone, before any of buildOpenPRFromDetail's own further
+			// fetches. Any request to those paths is caught by the default
+			// case below and fails the test.
+
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	adapter := githubapi.New(server.Client(), server.URL)
+
+	prs, truncated, err := adapter.ListOpenPRsForUser(context.Background(), ports.ListOpenPRsForUserSpec{
+		GitHubExternalID: "9002", Token: "tok",
+	})
+	if err != nil {
+		t.Fatalf("ListOpenPRsForUser() error = %v, want nil", err)
+	}
+	if truncated {
+		t.Error("truncated = true, want false -- a per-PR drop (this PR's own detail confirms it is closed) is never a discovery-QUERY failure, mirrors buildOpenPR's own established per-PR-failure discipline")
+	}
+	if len(prs) != 0 {
+		t.Fatalf("ListOpenPRsForUser() returned %d PRs, want 0 -- a closed pull request must never render as an open one, exactly like GetOpenPR (getopenpr.go, round-10 finding E) already refuses it on the machine-initiated path: %+v", len(prs), prs)
 	}
 }

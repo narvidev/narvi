@@ -308,10 +308,20 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	// base-freshness question aside entirely, is this PR already
 	// ineligible" -- every criterion below is fully known WITHOUT any
 	// live SCM call: head-SHA equality (VerdictHeadSHA/CurrentHeadSHA,
-	// both already in hand), the verdict's own base-ref/ancestor-chain/
-	// policy-version equality (record.Context vs. target, no new I/O,
-	// mirroring CurrentHeadSHA's own identical sourcing), CI, Shippable,
-	// diff size, and blast radius. CurrentBaseSHA is deliberately
+	// both already in hand), the verdict's own base-REF/policy-version
+	// equality (record.Context vs. target, no new I/O, mirroring
+	// CurrentHeadSHA's own identical sourcing), CI, Shippable, diff size,
+	// and blast radius. The ANCESTOR CHAIN is NOT among these (round-11
+	// finding E, corrected: a previous version of this paragraph listed
+	// it alongside base-ref/policy-version as though the probe genuinely
+	// compares it against target's own live value) -- CurrentAncestorChain
+	// below is assigned record.Context.AncestorChain itself, the identical
+	// value VerdictAncestorChain also is, so this probe's own
+	// ancestor-chain comparison is ALWAYS trivially equal and can never by
+	// itself refuse on ReasonAncestorChainChanged/ReasonAncestorChainUnknown
+	// -- see CurrentAncestorChain's own doc comment a few lines down for
+	// the full "why", the same deferred-to-the-final-call treatment
+	// CurrentBaseSHA gets, immediately below. CurrentBaseSHA is deliberately
 	// ASSUMED equal to the verdict's own recorded VerdictBaseSHA -- the
 	// most lenient possible stand-in, for two DIFFERENT reasons on
 	// ComputeEligible's two base-SHA-comparison checks (corrected, H4,
@@ -377,11 +387,18 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		// what made this whole comparison verify nothing before this fix.
 		CurrentAncestorChain:       record.Context.AncestorChain,
 		BaseAdvancedWithoutRewrite: true, // moot: the assumed SHA equality above already bypasses this check
-		CIGreen:                    ciGreen,
-		HasNeedsHumanLabel:         hasNeedsHuman,
-		ChangedFileCount:           changedFileCount,
-		TouchedBlastRadius:         touchedBlastRadius,
-		TouchedBlastRadiusKnown:    touchedBlastRadiusKnown,
+		// AncestorChainAdvancedWithoutRewrite (round-11 finding A3) is
+		// likewise moot here, for the identical reason: CurrentAncestorChain
+		// is assigned the SAME value as VerdictAncestorChain immediately
+		// above, so ancestorChainEqual's own per-link sha comparison this
+		// flag would otherwise gate never even runs -- there is no sha
+		// mismatch to tolerate when both sides are the identical slice.
+		AncestorChainAdvancedWithoutRewrite: true,
+		CIGreen:                             ciGreen,
+		HasNeedsHumanLabel:                  hasNeedsHuman,
+		ChangedFileCount:                    changedFileCount,
+		TouchedBlastRadius:                  touchedBlastRadius,
+		TouchedBlastRadiusKnown:             touchedBlastRadiusKnown,
 	}
 	if _, probeReason := autoapproval.ComputeEligible(probeInput, cfg); probeReason != autoapproval.ReasonNone {
 		return false, "", fmt.Sprintf("this pull request no longer meets the auto-approval eligibility criteria: %s", probeReason), nil
@@ -538,12 +555,29 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	// ONE link today, so this is at most one further live call -- the
 	// ref itself (a branch name) is trusted from the cached read, exactly
 	// like BaseRef is; only the SHA is re-resolved live.
+	//
 	// currentAncestorChain's own zero value (nil) is the correct answer
-	// whenever target.AncestorChain reports no link at all, or the live
-	// resolution below comes back empty -- never a link with a stale or
-	// empty SHA, mirroring AncestorChainFromStack's own identical
-	// empty-liveSHA-degrades-to-no-link discipline
-	// (internal/domain/review/context.go).
+	// ONLY when target.AncestorChain reports no link at all -- a
+	// CONFIRMED fact (this PR is not currently stacked, or sits at its
+	// own bottom). A live resolution that fails, OR one that succeeds
+	// with an empty sha (this production adapter's own ResolveBranchSHA
+	// never returns that combination, ports.SourceControl's own doc
+	// comment, but a defensive symmetric check costs nothing), is NEITHER
+	// of those things -- round-11 finding A1's own fix applies here
+	// exactly as it does at review-context-fetch time
+	// (internal/app/reviewcontext.Fetch): both now return EARLY with
+	// their own honest, distinctly-worded reason (mirroring the resolveErr
+	// early-return a few lines above this one, H2, fifth adversarial-
+	// review round) rather than letting currentAncestorChain fall through
+	// to nil, which the PREVIOUS version of this comment claimed was
+	// "never a link with a stale or empty SHA" as though that were a safe
+	// degradation -- it is not: a nil currentAncestorChain here is
+	// INDISTINGUISHABLE, once compared, from "this PR was never in a
+	// stack at all", so a genuinely-stacked PR whose live ancestor
+	// resolve merely failed just now could otherwise read as a clean,
+	// confirmed-empty match against a verdict recorded before it was ever
+	// stacked -- exactly the silent-match hole finding A1 closed one
+	// layer down.
 	var currentAncestorChain []review.AncestorLink
 	if len(target.AncestorChain) > 0 && target.AncestorChain[0].Ref != "" {
 		ancestorSHACtx, cancel := context.WithTimeout(ctx, deps.Timeouts.DecisionInboxResolveBranchSHATimeout)
@@ -554,33 +588,65 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 			Token:  token,
 		})
 		cancel()
-		if liveAncestorErr != nil {
+		if liveAncestorErr != nil || liveAncestorSHA == "" {
 			platform.Logger(ctx).Warn("decisioninbox: resolve ancestor chain's own live tip failed, refusing merge -- could not confirm the pull request's current ancestor chain", "error", liveAncestorErr, "repo_full_name", repoFullName, "pr_number", prNumber)
 			return false, "", "this pull request's ancestor chain could not be confirmed (a live check failed) -- try again shortly", nil
 		}
-		if liveAncestorSHA != "" {
-			currentAncestorChain = []review.AncestorLink{{Ref: target.AncestorChain[0].Ref, SHA: liveAncestorSHA}}
+		currentAncestorChain = []review.AncestorLink{{Ref: target.AncestorChain[0].Ref, SHA: liveAncestorSHA}}
+	}
+
+	// ancestorChainAdvancedWithoutRewrite (round-11 finding A3) mirrors
+	// baseAdvancedWithoutRewrite's own identical fast-forward tolerance,
+	// one link further out -- see autoapproval.
+	// EligibilityInput.AncestorChainAdvancedWithoutRewrite's own doc
+	// comment (eligibility.go) for what a confirmed "yes" here actually
+	// establishes and what residual it carries. Only even attempted when
+	// it could possibly matter: both sides report a link, that link's REF
+	// is unchanged (a real restructure still refuses unconditionally,
+	// ancestorChainEqual's own doc comment), and the sha genuinely
+	// differs on both sides (both non-empty, since an empty side already
+	// fails its own ReasonAncestorChainUnknown check regardless of this
+	// field).
+	var ancestorChainAdvancedWithoutRewrite bool
+	if len(record.Context.AncestorChain) > 0 && len(currentAncestorChain) > 0 &&
+		record.Context.AncestorChain[0].Ref == currentAncestorChain[0].Ref &&
+		record.Context.AncestorChain[0].SHA != "" && currentAncestorChain[0].SHA != "" &&
+		record.Context.AncestorChain[0].SHA != currentAncestorChain[0].SHA {
+		ancestorChainAncestorCtx, cancel := context.WithTimeout(ctx, deps.Timeouts.DecisionInboxIsAncestorTimeout)
+		confirmed, ancestorErr := sourceControl.IsAncestor(ancestorChainAncestorCtx, ports.IsAncestorSpec{
+			Owner:      target.Owner,
+			Repo:       target.Repo,
+			Ancestor:   record.Context.AncestorChain[0].SHA,
+			Descendant: currentAncestorChain[0].SHA,
+			Token:      token,
+		})
+		cancel()
+		if ancestorErr != nil {
+			platform.Logger(ctx).Warn("decisioninbox: resolve ancestor-chain-advanced-without-rewrite ancestry failed, refusing merge -- could not confirm whether the ancestor chain's forward movement was safe to tolerate", "error", ancestorErr, "repo_full_name", repoFullName, "pr_number", prNumber)
+			return false, "", "this pull request's ancestor chain has changed since this verdict was produced, and whether that change was safe to tolerate could not be confirmed (a live check failed) -- try again shortly", nil
 		}
+		ancestorChainAdvancedWithoutRewrite = confirmed
 	}
 
 	eligible, eligReason := autoapproval.ComputeEligible(autoapproval.EligibilityInput{
-		Verdict:                    record.Verdict,
-		VerdictAssessed:            true,
-		VerdictHeadSHA:             record.HeadSHA,
-		VerdictBaseRef:             record.Context.BaseRef,
-		VerdictBaseSHA:             record.Context.BaseSHA,
-		VerdictAncestorChain:       record.Context.AncestorChain,
-		VerdictPolicyVersion:       record.Context.PolicyVersion,
-		CurrentHeadSHA:             target.HeadSHA,
-		CurrentBaseRef:             target.BaseRef,
-		CurrentBaseSHA:             currentBaseSHA,
-		CurrentAncestorChain:       currentAncestorChain,
-		BaseAdvancedWithoutRewrite: baseAdvancedWithoutRewrite,
-		CIGreen:                    ciGreen,
-		HasNeedsHumanLabel:         hasNeedsHuman,
-		ChangedFileCount:           changedFileCount,
-		TouchedBlastRadius:         touchedBlastRadius,
-		TouchedBlastRadiusKnown:    touchedBlastRadiusKnown,
+		Verdict:                             record.Verdict,
+		VerdictAssessed:                     true,
+		VerdictHeadSHA:                      record.HeadSHA,
+		VerdictBaseRef:                      record.Context.BaseRef,
+		VerdictBaseSHA:                      record.Context.BaseSHA,
+		VerdictAncestorChain:                record.Context.AncestorChain,
+		VerdictPolicyVersion:                record.Context.PolicyVersion,
+		CurrentHeadSHA:                      target.HeadSHA,
+		CurrentBaseRef:                      target.BaseRef,
+		CurrentBaseSHA:                      currentBaseSHA,
+		CurrentAncestorChain:                currentAncestorChain,
+		BaseAdvancedWithoutRewrite:          baseAdvancedWithoutRewrite,
+		AncestorChainAdvancedWithoutRewrite: ancestorChainAdvancedWithoutRewrite,
+		CIGreen:                             ciGreen,
+		HasNeedsHumanLabel:                  hasNeedsHuman,
+		ChangedFileCount:                    changedFileCount,
+		TouchedBlastRadius:                  touchedBlastRadius,
+		TouchedBlastRadiusKnown:             touchedBlastRadiusKnown,
 	}, cfg)
 	if !eligible {
 		return false, "", fmt.Sprintf("this pull request no longer meets the auto-approval eligibility criteria: %s", eligReason), nil

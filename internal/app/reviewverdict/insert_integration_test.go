@@ -440,3 +440,133 @@ func TestGetLatest_OrdersByProducingAttemptRecency_NeverPostTime(t *testing.T) {
 		t.Errorf("GetLatest() returned attempt_id = %q, want %q (the newer attempt's own turn id)", record.AttemptID, wantAttemptID)
 	}
 }
+
+// TestGetLatestAndListLatestAutoApproved_AgreeOnAttemptRecency is round-11
+// finding B's own regression test: ListLatestAutoApprovedInRepo (the
+// automerge worker's own discovery query, internal/app/automerge) used to
+// reduce "latest per PR" by review_verdicts.created_at (post time) ALONE
+// -- a DIFFERENT reduction than GetLatestReviewVerdict/GetLatest above,
+// which order by the PRODUCING ATTEMPT's own creation time (round-10
+// finding D). Two components deciding about the SAME pull request from
+// two DIFFERENT "latest" verdicts is exactly the failure this closes: the
+// decision inbox and the eligibility engine's own callers read via
+// GetLatest, but the worker that actually ARMS auto-merge discovers
+// candidates via ListLatestAutoApproved -- if the two ever disagreed
+// about which verdict is "latest" for the same PR, one component could
+// treat a PR as freshly reviewed while the other treats an entirely
+// different verdict as the one of record. This reproduces the EXACT
+// SAME race TestGetLatest_OrdersByProducingAttemptRecency_NeverPostTime
+// does (an older attempt's own post landing at the database AFTER a
+// newer attempt's), then proves BOTH GetLatest AND ListLatestAutoApproved
+// agree on which verdict is authoritative.
+//
+// Mutation-test target: reverting queries/reviewverdicts.sql's own
+// ListLatestAutoApprovedInRepo inner DISTINCT ON from `ORDER BY
+// rv.repo_full_name, rv.pr_number, COALESCE(t.created_at, rv.created_at)
+// DESC, rv.created_at DESC, rv.id DESC` back to `ORDER BY
+// rv.repo_full_name, rv.pr_number, rv.created_at DESC` (and regenerating
+// sqlcgen) must turn this test's own "candidate.HeadSha ==
+// newer-attempt-sha" assertion into "candidate.HeadSha ==
+// older-attempt-sha", disagreeing with GetLatest's own unchanged answer.
+func TestGetLatestAndListLatestAutoApproved_AgreeOnAttemptRecency(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	reviewVerdicts := narvipg.NewReviewVerdictStore(pool)
+	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	sessions := narvipg.NewSessionStore(pool)
+	turns := narvipg.NewTurnStore(pool)
+
+	const repoFullName = "acme/attempt-recency-auto-merge-repo"
+	const prNumber = int32(2)
+
+	// ListLatestAutoApproved (unlike GetLatest) filters out any verdict
+	// stamped suppressed_in_shadow -- egressmode.Resolve's own default for
+	// a repo with NO repo_settings row at all is shadowCapability()
+	// (resolve.go), so this repo must be explicitly promoted to live
+	// egress first, or appreviewverdict.Insert below would stamp both
+	// seeded verdicts shadow and ListLatestAutoApproved would legitimately
+	// (and uninterestingly) return zero candidates for an unrelated
+	// reason.
+	if _, err := repoSettings.UpsertLiveEgressEnabled(ctx, repoFullName, true); err != nil {
+		t.Fatalf("promote repo to live egress: %v", err)
+	}
+
+	newSession := func() sqlcgen.Session {
+		s, err := sessions.Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceWeb})
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		return s
+	}
+
+	olderSession := newSession()
+	olderTurn, err := turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: olderSession.ID, Status: sqlcgen.TurnStatusCompleted})
+	if err != nil {
+		t.Fatalf("create older turn: %v", err)
+	}
+	newerSession := newSession()
+	newerTurn, err := turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: newerSession.ID, Status: sqlcgen.TurnStatusCompleted})
+	if err != nil {
+		t.Fatalf("create newer turn: %v", err)
+	}
+	if !newerTurn.CreatedAt.Time.After(olderTurn.CreatedAt.Time) {
+		t.Fatalf("newerTurn.CreatedAt = %v, want it strictly after olderTurn.CreatedAt = %v -- test setup assumption broken", newerTurn.CreatedAt.Time, olderTurn.CreatedAt.Time)
+	}
+
+	verdict := func() review.Verdict {
+		v := review.Verdict{
+			RiskLevel:         review.RiskLevelLow,
+			Premise:           review.PremiseStateOK,
+			TestsCoverage:     review.TestsCoverageStateAdequate,
+			DocsDrift:         review.DocsDriftStateNone,
+			ProposedShippable: review.ProposedShippableAuto,
+		}
+		v.Shippable = review.ComputeShippable(v.RiskLevel, v.TestsCoverage, v.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+		return v
+	}
+	digest := reviewpost.Digest{Summary: "Attempt-recency auto-merge-agreement test-seeded verdict.", DescriptionAdequacy: review.DescriptionAdequacyOK, AdequacyExplanation: "n/a"}
+
+	// The NEWER attempt's own verdict is INSERTED FIRST -- an earlier
+	// review_verdicts.created_at than what follows.
+	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, "sha-newer-attempt-auto", pgtype.UUID{}, verdict(), digest, reviewtriage.DepthLight, "", reviewpost.FactCheckSkipped, 0, nil, nil, "", false, reviewverdict.Context{}, newerTurn.ID); err != nil {
+		t.Fatalf("insert newer attempt's verdict: %v", err)
+	}
+	// The OLDER attempt's own verdict is INSERTED SECOND -- reaching the
+	// database AFTER the newer attempt's own.
+	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, "sha-older-attempt-auto", pgtype.UUID{}, verdict(), digest, reviewtriage.DepthLight, "", reviewpost.FactCheckSkipped, 0, nil, nil, "", false, reviewverdict.Context{}, olderTurn.ID); err != nil {
+		t.Fatalf("insert older attempt's verdict (landing at the DB second): %v", err)
+	}
+
+	record, ok, err := appreviewverdict.GetLatest(ctx, appreviewverdict.Deps{ReviewVerdicts: reviewVerdicts}, repoFullName, prNumber)
+	if err != nil {
+		t.Fatalf("GetLatest: %v", err)
+	}
+	if !ok {
+		t.Fatalf("GetLatest: ok = false, want true")
+	}
+	if record.HeadSHA != "sha-newer-attempt-auto" {
+		t.Fatalf("GetLatest() returned head_sha = %q, want %q", record.HeadSHA, "sha-newer-attempt-auto")
+	}
+
+	// ListLatestAutoApproved is internal/app/automerge's own discovery
+	// query -- must agree with GetLatest above about which verdict is
+	// "latest" for this exact PR, never reduce by post time alone.
+	since := time.Now().Add(-24 * time.Hour)
+	candidates, err := reviewVerdicts.ListLatestAutoApproved(ctx, repoFullName, pgtype.Timestamptz{Time: since, Valid: true}, 20)
+	if err != nil {
+		t.Fatalf("ListLatestAutoApproved: %v", err)
+	}
+	var candidate *sqlcgen.ReviewVerdict
+	for i := range candidates {
+		if candidates[i].PrNumber == prNumber {
+			candidate = &candidates[i]
+			break
+		}
+	}
+	if candidate == nil {
+		t.Fatalf("ListLatestAutoApproved returned no candidate for pr_number=%d, want exactly one (both seeded verdicts are Shippable=auto)", prNumber)
+	}
+	if candidate.HeadSha != "sha-newer-attempt-auto" {
+		t.Errorf("ListLatestAutoApproved() returned head_sha = %q, want %q -- it must agree with GetLatest on which verdict is authoritative for this PR (the NEWER attempt's, never the OLDER attempt's own row that merely committed last)", candidate.HeadSha, "sha-newer-attempt-auto")
+	}
+}
