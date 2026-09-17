@@ -524,6 +524,38 @@ func (a *Adapter) buildOpenPRFromDetail(ctx context.Context, owner, repo string,
 // (§4.3) stays domain-free, so it builds its own ports.PRAncestorLink
 // slice directly from stack rather than importing that domain function.
 //
+// D1 (round-12 sweep, execution-verified -- this is the fix, not merely a
+// restated intent): round-11 changed AncestorChainFromStack so that
+// "stack.Position > 1" ALONE proves a link exists, dropping that
+// function's own PREVIOUS UltimateBaseRef-must-be-non-empty clause -- a
+// degraded stack read (position > 1 but no base ref decoded) now
+// collapses into the SAME explicit unknown-marker link every OTHER
+// resolution failure in this codebase already uses, never into the nil
+// that means "genuinely no ancestor" (see that function's own doc
+// comment, internal/domain/review/context.go). ROUND-11 CHANGED ONE SIDE
+// OF THIS PORT AND NOT THE OTHER: this function, the SOLE producer of
+// ports.OpenPR.AncestorChain (the live side every real ComputeEligible
+// caller actually reads), still carried its OWN stack.Base.Ref-is-empty
+// clause and still returned nil for the identical degraded input --
+// executed side by side on stackResponse{Position: 2, Base.Ref: ""}
+// (githubapi, this function) versus StackContext{Position: 2,
+// UltimateBaseRef: ""} (review.AncestorChainFromStack): nil here, a
+// real one-link unknown marker there. Fixed by dropping the SAME clause
+// this function's own sibling dropped -- position > 1 now reports a
+// link UNCONDITIONALLY, exactly like that sibling, so a degraded read
+// (an empty stack.Base.Ref, stack.Base.SHA, or both) still reports a
+// non-nil, single-element chain a caller can tell apart from "not
+// stacked at all" by its own empty Ref -- ports.PRAncestorLink.Ref == ""
+// in a NON-NIL chain is this port's own dedicated "could not be
+// established" marker (internal/app/decisioninbox's aggregate.go/
+// revalidate.go both handle it as such, round-12 sweep), mirroring
+// review.AncestorLink.SHA == ""'s identical role one layer down --
+// distinct fields carry the marker on each side only because this
+// function has no live SHA-resolution capability at all (this comment's
+// own next paragraph) and so can never itself produce a link with a
+// known ref but an unknown sha the way the domain function's
+// caller-supplied liveUltimateBaseSHA can.
+//
 // Round-11 finding E (corrected): the PREVIOUS version of this comment
 // claimed this function is "kept in exact sync" with AncestorChainFromStack
 // -- true when it was written, no longer true since round-10 finding B
@@ -547,7 +579,7 @@ func (a *Adapter) buildOpenPRFromDetail(ctx context.Context, owner, repo string,
 // layer up, applied here by the CALLER rather than by this function
 // itself.
 func ancestorChainFromDetailStack(stack *stackResponse) []ports.PRAncestorLink {
-	if stack == nil || stack.Position <= 1 || stack.Base.Ref == "" {
+	if stack == nil || stack.Position <= 1 {
 		return nil
 	}
 	return []ports.PRAncestorLink{{Ref: stack.Base.Ref, SHA: stack.Base.SHA}}

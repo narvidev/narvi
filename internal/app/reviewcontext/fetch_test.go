@@ -1,10 +1,12 @@
 package reviewcontext_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -397,6 +399,71 @@ func TestFetch_AncestorResolveBranchSHA_BoundedByGitHubResolveBaseBranchSHATimeo
 	if ancestorDeadline.Before(wantMin) || ancestorDeadline.After(wantMax) {
 		t.Errorf("ancestor resolve's own ctx deadline = %v, want it within [%v, %v] (bounded by GitHubResolveBaseBranchSHATimeout = %v)",
 			ancestorDeadline, wantMin, wantMax, timeouts.GitHubResolveBaseBranchSHATimeout)
+	}
+}
+
+// TestFetch_DegradedStackRef_NoLiveResolveAttempted_AndLogged is D4's own
+// regression test (round-12 sweep): a stack reporting position > 1
+// (proving a link exists, AncestorChainFromStack's own doc comment) but
+// an EMPTY UltimateBaseRef -- a degraded read AT THE SOURCE, GitHub's own
+// stack object, never a transient live-resolution failure a retry could
+// fix -- must (a) never attempt a live ResolveBranchSHA call against an
+// empty branch name, and (b) log something, unlike the PREVIOUS version
+// of this guard (`stack.Position > 1 && stack.UltimateBaseRef != ""`),
+// which silently skipped this exact case with NO log at all -- the one
+// degraded path in this function that gave an operator nothing to find
+// when a verdict's own ReasonAncestorChainUnknown never clears.
+//
+// Mutation-test target: reinstating the switch's own `case stack.
+// UltimateBaseRef == "":` arm as a no-op (deleting its logger.Warn call)
+// turns this test's own "want at least one WARN-level log record"
+// assertion from a pass into a failure.
+func TestFetch_DegradedStackRef_NoLiveResolveAttempted_AndLogged(t *testing.T) {
+	t.Parallel()
+
+	fetcher := &fakeFetcher{
+		pr: githubapi.PullRequest{
+			HeadSHA: "sha", BaseRef: "develop",
+			// A degraded stack read: position 2 of 3 (proving a link
+			// exists) but no base ref decoded at all.
+			Stack: &githubapi.StackInfo{Position: 2, Size: 3, BaseRef: "", BaseSHA: ""},
+		},
+		diff: "d",
+		resolveBranchSHAByBranch: map[string]string{
+			"develop": "sha-develop-live",
+		},
+	}
+	timeouts := platform.DefaultTimeouts()
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+
+	ctx := reviewcontext.Fetch(context.Background(), logger, fetcher, timeouts, "acme", "widgets", 42, "gho_bottoken", nil)
+
+	// (a) no live resolve attempted against the empty ultimate base ref
+	// -- only "develop" (the immediate base) was ever queried.
+	want := []string{"develop"}
+	if len(fetcher.resolveBranchSHABranchesQueried) != len(want) {
+		t.Fatalf("ResolveBranchSHA queried branches = %v, want %v (no live call for a degraded/empty ultimate base ref)", fetcher.resolveBranchSHABranchesQueried, want)
+	}
+	for i := range want {
+		if fetcher.resolveBranchSHABranchesQueried[i] != want[i] {
+			t.Errorf("ResolveBranchSHA queried branches[%d] = %q, want %q", i, fetcher.resolveBranchSHABranchesQueried[i], want[i])
+		}
+	}
+
+	// The persisted ancestor chain still carries the unknown-marker link
+	// AncestorChainFromStack's own contract promises for position > 1 --
+	// never nil, even though no live resolution was even attempted.
+	wantChain := []review.AncestorLink{{Ref: "", SHA: ""}}
+	if len(ctx.AncestorChain) != len(wantChain) || ctx.AncestorChain[0] != wantChain[0] {
+		t.Errorf("AncestorChain = %+v, want %+v (an unknown-marker link, never nil)", ctx.AncestorChain, wantChain)
+	}
+
+	// (b) D4's own fix: this degraded case must log SOMETHING -- before
+	// this fix, logBuf would be entirely empty here.
+	if !strings.Contains(logBuf.String(), "WARN") {
+		t.Errorf("log output = %q, want at least one WARN-level log record for the degraded stack read", logBuf.String())
 	}
 }
 

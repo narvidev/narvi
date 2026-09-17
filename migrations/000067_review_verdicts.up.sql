@@ -89,13 +89,39 @@ CREATE TABLE review_verdicts (
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Backs BOTH the DISTINCT ON latest-per-PR reduction (§21.1) and every
--- bounded active/recent-window scan this Step's own analytics rollups and
--- the auto-approval eligibility engine run -- (repo_full_name, pr_number,
--- created_at DESC) serves a per-PR DISTINCT ON directly, and its own
--- leading repo_full_name column ALSO serves a per-repo, created_at-bounded
--- scan (the analytics/digest read models' own shape) without a second,
--- differently-ordered index.
+-- D5 (round-12 sweep): this comment previously claimed the (repo_full_name,
+-- pr_number, created_at DESC) shape below "serves a per-PR DISTINCT ON
+-- directly", for BOTH queries/reviewverdicts.sql's GetLatestReviewVerdict
+-- (a single-PR lookup, not actually a DISTINCT ON at all -- that query's
+-- own doc comment already says so) and ListLatestAutoApprovedInRepo (the
+-- real multi-PR DISTINCT ON). Round-11 finding B changed what "latest"
+-- means for both queries, from a plain rv.created_at ORDER BY to
+-- COALESCE(t.created_at, rv.created_at) -- a value that reaches through a
+-- LEFT JOIN to turns -- and this comment was never revisited to check
+-- whether the claim still held. It does not. Verified by running EXPLAIN
+-- (ANALYZE, BUFFERS) against a real Postgres 17 instance (round-12 sweep),
+-- at both a small seed and a stress-tested 2,000-PR/6,000-row single repo:
+--   - GetLatestReviewVerdict DOES use this index, but ONLY for the
+--     equality filter (repo_full_name = $1 AND pr_number = $2) -- the
+--     handful of matching rows are then joined to turns and explicitly
+--     re-sorted in memory on the COALESCE expression; this index's own
+--     trailing created_at DESC column plays no role in that sort.
+--   - ListLatestAutoApprovedInRepo never touches this index at all. The
+--     planner instead uses the SIBLING review_verdicts_repo_created_idx
+--     below for its WHERE filter, then an explicit Sort + Unique, entirely
+--     in memory, for the DISTINCT ON itself.
+-- No plain btree index on review_verdicts alone can back an ORDER BY that
+-- reaches through a join to turns -- that would need either a denormalized
+-- "effective latest timestamp" column kept in sync at write time, or a
+-- materialized view, neither of which is justified by what EXPLAIN
+-- actually measured: both queries planned and executed in well under a
+-- millisecond at 2,000 PRs in one repo (Sort cost ~628, actual ~0.1ms).
+-- Not added -- no measured cost justifies the added write-path complexity
+-- yet; revisit if a real repo's own bounded-window verdict volume is ever
+-- shown, by EXPLAIN, to make that Sort a measurable cost. This index is
+-- kept regardless: it genuinely backs the equality half of both queries'
+-- own per-PR/per-repo filters, which is what the paragraph below actually
+-- describes.
 CREATE INDEX review_verdicts_repo_pr_created_idx ON review_verdicts (repo_full_name, pr_number, created_at DESC);
 
 -- A second, repo-only-leading index for a pure "every verdict for this

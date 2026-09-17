@@ -665,11 +665,22 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// policy-version as though the probe genuinely compares it against
 	// pr's own live value) -- CurrentAncestorChain below is assigned
 	// record.Context.AncestorChain itself, the identical value
-	// VerdictAncestorChain also is, so this probe's own ancestor-chain
-	// comparison is ALWAYS trivially equal and can never by itself refuse
-	// on ReasonAncestorChainChanged/ReasonAncestorChainUnknown -- see
-	// CurrentAncestorChain's own doc comment a few lines down for the
-	// full "why", the same deferred-to-the-final-call treatment
+	// VerdictAncestorChain also is, so this probe's own
+	// ancestorChainEqual comparison is ALWAYS trivially equal and can
+	// never by itself refuse on ReasonAncestorChainChanged. D2 (round-12
+	// sweep, execution-verified): the PREVIOUS version of this comment
+	// extended that same "can never" claim to ReasonAncestorChainUnknown
+	// too -- false, and executing ComputeEligible with both sides set to
+	// the identical unknown-SHA marker (VerdictAncestorChain ==
+	// CurrentAncestorChain == a single link with an empty SHA) refuses
+	// with ReasonAncestorChainUnknown every time. That check
+	// (ancestorChainHasUnknownLink) runs BEFORE the equality comparison
+	// and inspects EACH side on its own terms, so an unknown marker
+	// baked into the recorded verdict itself -- e.g. one posted while
+	// the review-context fetch's own live ancestor resolution was
+	// failing -- refuses here regardless of how trivially the two sides
+	// agree. See CurrentAncestorChain's own doc comment a few lines down
+	// for the full "why", the same deferred-to-the-final-call treatment
 	// CurrentBaseSHA gets, immediately below. CurrentBaseSHA is
 	// deliberately ASSUMED equal to the verdict's own recorded
 	// VerdictBaseSHA -- the most lenient possible
@@ -902,8 +913,37 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// than silently approved, mirroring baseSHAErr/ancestorErr's own
 	// identical "fail closed AND flag it visibly" discipline immediately
 	// above.
+	//
+	// D1 (round-12 sweep): pr.AncestorChain[0].Ref can ITSELF be empty --
+	// the adapter's own degraded-stack-read case, where GitHub reported
+	// position > 1 (proving a link exists) but the stack's own base ref
+	// could not be decoded (ancestorChainFromDetailStack's own doc
+	// comment, listopenprs.go). That is not "no link" (nil) and it is not
+	// a link this code can live-resolve (there is no ref to resolve
+	// against) -- it is the SAME unknown-marker state a failed live
+	// resolution reports below for a KNOWN ref, and is handled as its own
+	// first branch, before any live call is attempted.
 	var currentAncestorChain []review.AncestorLink
-	if len(pr.AncestorChain) > 0 && pr.AncestorChain[0].Ref != "" {
+	if len(pr.AncestorChain) > 0 && pr.AncestorChain[0].Ref == "" {
+		// D1 (round-12 sweep): the adapter's own degraded-stack-read case
+		// -- position > 1 PROVES a link exists (ancestorChainFromDetailStack's
+		// own doc comment, listopenprs.go, now mirrors review.
+		// AncestorChainFromStack exactly) but the ref itself could not be
+		// read off GitHub's stack object. There is no ref here to even
+		// ATTEMPT a live resolution against, so this reports the SAME
+		// explicit unknown marker directly, fail-closed -- exactly like a
+		// live resolution failure below does for a KNOWN ref. The
+		// PREVIOUS version of this guard required Ref != "" to enter this
+		// block at all, so this exact case fell through to
+		// currentAncestorChain's own nil zero value -- INDISTINGUISHABLE,
+		// once compared, from "this PR was never in a stack at all",
+		// silently passing this row as ready_to_merge on exactly the
+		// criterion this check exists to catch (the same collapse finding
+		// A1 closed one layer down for a live-resolution failure).
+		currentAncestorChain = []review.AncestorLink{{Ref: "", SHA: ""}}
+		platform.Logger(ctx).Warn("decisioninbox: ancestor chain link reported with no ref at all (a degraded stack read), base-freshness check will fail closed via ReasonAncestorChainUnknown", "repo", repoFullName, "pr_number", pr.Number)
+		degraded = true
+	} else if len(pr.AncestorChain) > 0 {
 		// unknownMarker is the fail-closed default for this iteration --
 		// overwritten below only on a genuine, non-empty live resolution.
 		unknownMarker := []review.AncestorLink{{Ref: pr.AncestorChain[0].Ref, SHA: ""}}

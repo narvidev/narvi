@@ -478,6 +478,20 @@ type PRPerson struct {
 // (internal/app/decisioninbox's revalidateCore/computeRealEligibility)
 // reads ONLY Ref off this struct and re-resolves the SHA LIVE itself via
 // SourceControl.ResolveBranchSHA -- never this field.
+//
+// Ref == "" on a link INSIDE A NON-NIL chain (as opposed to a nil chain
+// entirely) is this port's own dedicated "could not be established"
+// marker (D1, round-12 sweep) -- ancestorChainFromDetailStack's own doc
+// comment: GitHub reported a stack position that PROVES a link exists
+// (position > 1) but the stack's own base ref itself could not be
+// decoded off a degraded response. This is deliberately NOT the same nil
+// this type's own producer returns for "genuinely no ancestor" (position
+// <= 1, or no stack at all) -- a caller must test len(chain) > 0 alone to
+// learn "a link exists", and inspect Ref == "" separately as its own
+// unknown case, never gate entry to that branch on Ref != "" (doing so
+// silently re-collapses the unknown case back into "no link", exactly
+// the hole D1 found and closed in both real callers,
+// internal/app/decisioninbox's aggregate.go/revalidate.go).
 type PRAncestorLink struct {
 	Ref string
 	SHA string

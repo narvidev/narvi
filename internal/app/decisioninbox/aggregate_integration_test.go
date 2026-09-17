@@ -1504,15 +1504,56 @@ func TestBuild_AncestorChainMatches_LiveResolved_StaysReadyToMerge(t *testing.T)
 // liveAncestorSHA != "") had NO default arm at all, so a live resolve
 // failure fell through to currentAncestorChain's own zero value, nil --
 // INDISTINGUISHABLE, once compared, from "this PR was never in a stack at
-// all". This fixture's own verdict was recorded against a PR that WAS
-// stacked (a real, non-nil ancestor chain), so a live resolve failure here
-// must fail closed (demoted, SCMFetchFailed) rather than silently reading
-// as a clean, confirmed-empty match. Mutation-test target: reverting the
-// currentAncestorChain block's own `case liveAncestorErr != nil: ...
-// degraded = true` arm back to leaving currentAncestorChain at nil with
-// no degraded flag (this fix's own inverse) must turn this test's own
-// KindNeedsReview/SCMFetchFailed assertions back into
-// KindReadyToMerge/false.
+// all".
+//
+// D3 (round-12 sweep, execution-verified): the PREVIOUS version of this
+// fixture recorded the verdict's OWN ancestor chain as ALSO non-nil
+// ({Ref: "release-parent", ...}) -- deliberately, per that version's own
+// comment ("never seedAutoApprovedVerdict's own nil"). Executed with the
+// EXACT mutation this comment used to name (only the switch's error-case
+// `degraded = true` line deleted): the Kind assertion below still
+// passed, unchanged -- only SCMFetchFailed caught it, and re-executing
+// with the verdict's own ancestor chain changed to nil (below) did NOT
+// change that: this specific mutation can never move Kind, for a
+// reason worth being explicit about, because the FIRST version of this
+// comment's own claim ("mutation-verified... the mutation flips Kind")
+// was itself wrong and had to be corrected after actually running it.
+// currentAncestorChain is preset to its own fail-closed unknownMarker
+// (SHA == "", a non-nil link) BEFORE the switch below ever runs, so
+// deleting ONLY the error case's `degraded = true` leaves
+// currentAncestorChain exactly as unknown as it already was -- Kind was
+// always going to refuse via ReasonAncestorChainUnknown regardless,
+// which is a GOOD belt-and-suspenders property of the fix, not a gap,
+// but it does mean this ONE mutation only ever pins SCMFetchFailed.
+//
+// A SECOND, sharper mutation -- deleting the preset assignment itself
+// (`currentAncestorChain = unknownMarker` immediately before the
+// switch, leaving currentAncestorChain at its bare nil zero value unless
+// the success case fires) -- reproduces the ORIGINAL pre-A1-fix shape
+// exactly ("a two-case switch with no default arm at all"). Executed
+// with the verdict's own ancestor chain nil (below, this fixture's own
+// fix): that mutation DOES flip the Kind assertion, from needs_review to
+// ready_to_merge -- ancestorChainEqual(nil, nil) trivially matches once
+// currentAncestorChain has nothing pinning it to an unknown marker, the
+// exact silent-approval hazard A1 exists to close. With VerdictAncestorChain
+// non-nil (the PREVIOUS version of this fixture), that same mutation
+// instead refuses via ReasonAncestorChainChanged (a length mismatch,
+// 0 vs 1) -- still fail-closed, but for the wrong reason, and Kind would
+// never have caught the RIGHT one. Fixed by dropping this fixture's own
+// second verdict insert -- buildEligibleReadyToMergeFixture's own
+// seedAutoApprovedVerdict already seeds AncestorChain nil, exactly the
+// "recorded before it was ever stacked" precondition this scenario
+// needs.
+//
+// Mutation-test targets, each pinned by its OWN assertion below (not
+// both by either, per the execution above):
+//   - Deleting the currentAncestorChain block's own preset
+//     `currentAncestorChain = unknownMarker` default (leaving it at nil
+//     unless the success case fires) flips Kind from needs_review to
+//     ready_to_merge.
+//   - Deleting the switch's own `case liveAncestorErr != nil: ...
+//     degraded = true` arm (leaving the marker in place but the row
+//     un-flagged) flips SCMFetchFailed from true to false.
 func TestBuild_AncestorChainUnknown_LiveResolveFails_DemotesAndMarksDegraded(t *testing.T) {
 	pool := newTestPool(t)
 	ctx := context.Background()
@@ -1531,28 +1572,16 @@ func TestBuild_AncestorChainUnknown_LiveResolveFails_DemotesAndMarksDegraded(t *
 	// resolve's own failure alone.
 	fakeSCM.openPRsByExternalID[actorGitHubExternalID][0].AncestorChain = []ports.PRAncestorLink{{Ref: "release-parent", SHA: "cached-irrelevant-snapshot"}}
 
-	// A verdict recorded while this PR WAS genuinely stacked -- a real,
-	// non-nil ancestor chain, never seedAutoApprovedVerdict's own nil.
-	verdict := review.Verdict{
-		RiskLevel:         review.RiskLevelLow,
-		Premise:           review.PremiseStateOK,
-		TestsCoverage:     review.TestsCoverageStateAdequate,
-		DocsDrift:         review.DocsDriftStateNone,
-		ProposedShippable: review.ProposedShippableAuto,
-		FilesChanged:      3,
-	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
-	verdictContext := reviewverdict.Context{
-		BaseRef:       testEligibleBaseRef,
-		BaseSHA:       testEligibleBaseSHA,
-		AncestorChain: []review.AncestorLink{{Ref: "release-parent", SHA: "release-parent-old-sha"}},
-		PolicyVersion: autoapproval.CurrentPolicyVersion,
-	}
+	// D3 fix: the verdict's OWN ancestor chain stays NIL --
+	// buildEligibleReadyToMergeFixture's own seedAutoApprovedVerdict
+	// already seeds exactly that ("recorded before it was ever stacked",
+	// that helper's own doc comment) -- no second verdict insert needed,
+	// and none is made here. This is the precondition the scenario above
+	// actually requires: a buggy nil CurrentAncestorChain must be able to
+	// trivially equal VerdictAncestorChain for the hazard to manifest at
+	// all (see this test's own top doc comment).
 	reviewVerdicts := narvipg.NewReviewVerdictStore(pool)
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
-	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, 80, "sha-80", pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "verdict recorded while genuinely stacked, ancestor resolve now fails"}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
-		t.Fatalf("seed verdict with a real ancestor chain: %v", err)
-	}
 
 	deps := decisioninbox.Deps{
 		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
@@ -1578,6 +1607,72 @@ func TestBuild_AncestorChainUnknown_LiveResolveFails_DemotesAndMarksDegraded(t *
 	}
 	if !result.SCMFetchFailed {
 		t.Error("SCMFetchFailed = false, want true -- a failed ancestor-chain live resolve must mark the whole read degraded, exactly like a failed base ResolveBranchSHA call already does")
+	}
+}
+
+// TestBuild_AncestorChainDegradedRef_DemotesAndMarksDegraded is D1's own
+// regression test (round-12 sweep) for computeRealEligibility's
+// (aggregate.go) currentAncestorChain block, exercised through the
+// read-model path this time (revalidate_integration_test.go's own
+// AncestorChainDegradedRef_Refused pins the identical scenario through
+// the action-endpoint path). The live PR reports a stack position that
+// PROVES a link exists but a degraded read left the ref itself empty --
+// ports.PRAncestorLink{Ref: "", SHA: ""}, this port's own dedicated
+// "could not be established" marker -- never the SAME nil this package's
+// every OTHER fixture reports for "genuinely no ancestor at all". The
+// verdict's own recorded ancestor chain stays nil
+// (buildEligibleReadyToMergeFixture's own seedAutoApprovedVerdict,
+// unchanged): "recorded before it was ever stacked", the precondition
+// that makes this scenario dangerous -- before D1, this block's own
+// guard required pr.AncestorChain[0].Ref != "" to even enter its
+// comparison at all, so this exact degraded-ref case fell through to
+// currentAncestorChain's own nil zero value, trivially matching the
+// verdict's own nil, and this row would have rendered ready_to_merge
+// despite GitHub itself reporting an ancestor link this code never even
+// looked at.
+//
+// Mutation-test target: reinstating `&& pr.AncestorChain[0].Ref != ""`
+// on this block's own guard (this fix's own inverse) turns this test's
+// own KindNeedsReview/SCMFetchFailed assertions back into
+// KindReadyToMerge/false.
+func TestBuild_AncestorChainDegradedRef_DemotesAndMarksDegraded(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "5014"
+	const repoFullName = "acme/build-ancestor-chain-degraded-ref"
+
+	actor, fakeSCM := buildEligibleReadyToMergeFixture(ctx, t, pool, tokenKey, "d1-actor@example.com", actorGitHubExternalID, repoFullName, 82)
+
+	fakeSCM.openPRsByExternalID[actorGitHubExternalID][0].AncestorChain = []ports.PRAncestorLink{{Ref: "", SHA: ""}}
+
+	reviewVerdicts := narvipg.NewReviewVerdictStore(pool)
+	repoSettings := narvipg.NewRepoSettingsStore(pool)
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict:      appreviewverdict.Deps{ReviewVerdicts: reviewVerdicts, RepoSettings: repoSettings, ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool), Timeouts: platform.DefaultTimeouts()},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil (a degraded ancestor-chain link must degrade ONE row, never fail the whole Build call)", err)
+	}
+	item := findItemByPR(result.Items, 82)
+	if item == nil {
+		t.Fatal("PR #82 missing from the inbox entirely, want present as needs_review")
+	}
+	if item.Kind == decisioninboxdomain.KindReadyToMerge {
+		t.Error("Kind = ready_to_merge, want needs_review -- a degraded stack read (position > 1, no ref decoded) must fail closed via ReasonAncestorChainUnknown, never silently read as no ancestor chain at all")
+	}
+	if !result.SCMFetchFailed {
+		t.Error("SCMFetchFailed = false, want true -- a degraded ancestor-chain link must mark the whole read degraded, exactly like a failed live resolve already does")
 	}
 }
 

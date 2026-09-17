@@ -192,11 +192,22 @@ LIMIT 1;
 -- internal/app/automerge's own discovery query (§21.2 stage 2): every
 -- open-as-of-last-review-candidate PR in repoFullName whose LATEST
 -- verdict, within the bounded window, is Shippable == 'auto' -- the real
--- multi-row DISTINCT ON (repo, pr_number) ... ORDER BY created_at DESC
--- reduction §21.1 names, THEN filtered to shippable = 'auto' in an outer
--- query (DISTINCT ON's own "first row per group" pick must be decided by
--- created_at alone, before shippable can be tested, so the filter cannot
--- fold into the same SELECT's own WHERE clause). This is a DISCOVERY
+-- multi-row DISTINCT ON (repo, pr_number) ... ORDER BY reduction §21.1
+-- names, THEN filtered to shippable = 'auto' in an outer query (DISTINCT
+-- ON's own "first row per group" pick must be decided by its own
+-- ordering column, before shippable can be tested, so the filter cannot
+-- fold into the same SELECT's own WHERE clause).
+--
+-- D6 (round-12 sweep): this paragraph previously named that ordering
+-- column "created_at alone" -- true before Round-11 finding B, below,
+-- and contradicted by that SAME finding's own fix ever since: the inner
+-- DISTINCT ON's actual ORDER BY key is COALESCE(t.created_at,
+-- rv.created_at), never rv.created_at by itself. See that finding's own
+-- paragraph for why (the producing attempt's own creation time, when
+-- one exists, must decide the pick, exactly like GetLatestReviewVerdict/
+-- GetLatestNonShadowReviewVerdict above already do).
+--
+-- This is a DISCOVERY
 -- aid only, bounded and cheap (no GitHub call) -- internal/app/
 -- decisioninbox.RevalidateForAutoMerge is what actually re-confirms each
 -- candidate live before anything merges (§21.2: "reuses the decision

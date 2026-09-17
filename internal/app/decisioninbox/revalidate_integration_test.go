@@ -420,6 +420,48 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		}
 	})
 
+	// AncestorChainDegradedRef_Refused is D1's own regression test
+	// (round-12 sweep): the live PR reports a stack position that PROVES
+	// a link exists (ancestorChainFromDetailStack's own doc comment,
+	// listopenprs.go) but a degraded read left the ref itself empty --
+	// ports.PRAncestorLink{Ref: "", SHA: ""}, this port's own dedicated
+	// "could not be established" marker (ports.PRAncestorLink's own doc
+	// comment), never the SAME nil this package's every other fixture
+	// reports for "genuinely no ancestor at all". The verdict's own
+	// recorded ancestor chain stays nil (rs.eligiblePR's own
+	// seedAutoApprovedVerdict, unchanged) -- exactly the "recorded before
+	// it was ever stacked" precondition that makes this scenario
+	// dangerous: before D1, revalidateCore's own guard required
+	// target.AncestorChain[0].Ref != "" to even enter its comparison
+	// block at all, so this exact degraded-ref case fell through to
+	// currentAncestorChain's own nil zero value -- trivially matching the
+	// verdict's own nil via ancestorChainEqual(nil, nil) -- and this PR
+	// would have revalidated as ELIGIBLE despite GitHub itself reporting
+	// an ancestor link this code never even looked at.
+	//
+	// Mutation-test target: reinstating `&& target.AncestorChain[0].Ref
+	// != ""` on revalidateCore's own currentAncestorChain guard (this
+	// fix's own inverse) turns this test's own "ok = false" assertion
+	// into "ok = true".
+	t.Run("AncestorChainDegradedRef_Refused", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-ancestor-chain-degraded-ref"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 105)
+
+		pr.AncestorChain = []ports.PRAncestorLink{{Ref: "", SHA: ""}}
+		rs.replaceTargetPR(actorGitHubID, pr)
+
+		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+		}
+		if ok {
+			t.Fatal("RevalidateForMerge() ok = true, want false -- a degraded stack read (position > 1, no ref decoded) must refuse, never silently read as no ancestor chain at all")
+		}
+		if reason == "" {
+			t.Error("reason is empty, want a human-readable explanation")
+		}
+	})
+
 	// AncestorChainAdvanced_ConfirmedFastForward_NotRefused is round-11
 	// finding A3's own regression test -- the SAME fast-forward tolerance
 	// BaseBranchAdvanced_ConfirmedFastForward_NotRefused above already
