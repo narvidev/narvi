@@ -324,8 +324,24 @@ type combinedStatusResponse struct {
 // -- GitHub's own NEWER Checks API surface (what GitHub Actions and most
 // modern CI integrations report through); conclusion is nil while a
 // check is still in progress.
+//
+// TotalCount is GitHub's own documented count of ALL check runs for this
+// ref, independent of pagination -- CheckRuns carries only whatever page
+// was actually served. Modeled (F1) because, before this field
+// existed, a truncated first page was structurally indistinguishable from
+// a complete one: with no per_page sent, GitHub's documented default page
+// size is 30, so a ref carrying more than 30 check runs served only the
+// first 30, silently, with no error and no decode failure -- exactly the
+// "confident green from a composite that was only ever half read" defect
+// fetchCIConclusionLive (listopenprs.go) already closed for a failed GET,
+// but had not yet closed for a truncated-but-successful one. See that
+// function's own use of this field for the live, fail-closed consumer;
+// fetchCIConclusion below is the retrospective sibling and its own
+// deliberate non-use of this field is addressed at that function's own
+// doc comment.
 type checkRunsResponse struct {
-	CheckRuns []struct {
+	TotalCount int `json:"total_count"`
+	CheckRuns  []struct {
 		Conclusion *string `json:"conclusion"`
 	} `json:"check_runs"`
 }
@@ -380,14 +396,60 @@ var ciFailureConclusions = map[string]bool{
 // implementation can serve both callers. Do not reuse this function for
 // any live/pre-merge purpose; do not loosen fetchCIConclusionLive to
 // match this one's own leniency.
+//
+// F5: this function used to gate each GET's
+// contribution on a bare `if err == nil`, mirroring fetchCIConclusionLive's
+// own PRE-fix shape one file over -- a failed call contributed NOTHING,
+// so a status GET confirming "success" beside a check-runs GET that
+// itself failed (or a decoded check-runs page that was a confirmed
+// truncated prefix, F1) fell through to CIConclusionSuccess: a confident
+// green from a composite that was only ever half read, reported both to
+// ComputeReleaseManifestFindings (which could then silently MISS a real
+// ManifestFindingRedAtMerge the unread half would have produced -- a
+// consequence this package's own doc comment on that function never
+// weighed, since its "Unknown is not an accusation" reasoning is about
+// Unknown-vs-Failure, not about Success masking a read that never
+// happened) AND rendered directly to a human as this PR's own
+// "ciConclusionAtMergeSha" in the release manifest readout
+// (releasemanifestreadout.go) -- a specific, confident, false factual
+// claim about a PR's own CI history, the exact "failure rendering as a
+// confident normal state" shape this codebase has fixed everywhere else
+// it was found.
+//
+// UNLIKE fetchCIConclusionLive, this function needs no second "degraded"
+// return value to express the fix: ports.MergedPR.CIConclusionAtMergeSHA
+// already has a value this exact situation should report --
+// CIConclusionUnknown, this package's own pre-existing "no signal could
+// be determined" state, already treated as non-accusatory by every
+// consumer (ComputeReleaseManifestFindings' own doc comment, immediately
+// above this function's own callers). No new field, no new port surface:
+// a genuine, CONFIRMED failure from the GET that DID succeed still wins
+// (mirrors fetchCIConclusionLive's own identical "failure wins over
+// incomplete/degraded" precedent), but sawSuccess alone, with the other
+// GET's own health unknown, is no longer sufficient to report Success --
+// it now reports the SAME Unknown a fully-successful read reports when
+// neither GET found any signal at all, which is exactly the honest
+// answer: "could not be determined", never "confirmed green".
+//
+// per_page=100 (F1's own fix, applied here too -- the identical
+// undocumented-default-page-size gap existed on this GET as much as on
+// fetchCIConclusionLive's) and the TotalCount truncation guard mirror
+// that function's own identical fix one file over -- see checkRunsResponse's
+// own doc comment for what TotalCount answers and why it is checked
+// regardless of the per_page bump.
 func (a *Adapter) fetchCIConclusion(ctx context.Context, owner, repo, mergeSHA, token string) ports.CIConclusion {
 	sawFailure := false
 	sawSuccess := false
+	degraded := false
 
 	statusPath := fmt.Sprintf("%s/repos/%s/%s/commits/%s/status", a.apiBaseURL, url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(mergeSHA))
-	if body, err := a.doGet(ctx, statusPath, token); err == nil {
+	if body, err := a.doGet(ctx, statusPath, token); err != nil {
+		degraded = true
+	} else {
 		var status combinedStatusResponse
-		if json.Unmarshal(body, &status) == nil {
+		if json.Unmarshal(body, &status) != nil {
+			degraded = true
+		} else {
 			switch status.State {
 			case "failure", "error":
 				sawFailure = true
@@ -397,10 +459,21 @@ func (a *Adapter) fetchCIConclusion(ctx context.Context, owner, repo, mergeSHA, 
 		}
 	}
 
-	checksPath := fmt.Sprintf("%s/repos/%s/%s/commits/%s/check-runs", a.apiBaseURL, url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(mergeSHA))
-	if body, err := a.doGet(ctx, checksPath, token); err == nil {
+	checksPath := fmt.Sprintf("%s/repos/%s/%s/commits/%s/check-runs?per_page=100", a.apiBaseURL, url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(mergeSHA))
+	if body, err := a.doGet(ctx, checksPath, token); err != nil {
+		degraded = true
+	} else {
 		var runs checkRunsResponse
-		if json.Unmarshal(body, &runs) == nil {
+		if json.Unmarshal(body, &runs) != nil {
+			degraded = true
+		} else {
+			if runs.TotalCount > len(runs.CheckRuns) {
+				// F1: a genuine, successfully-decoded response that is
+				// still only a PREFIX of the real total -- see
+				// fetchCIConclusionLive's own identical guard
+				// (listopenprs.go) for the full "why".
+				degraded = true
+			}
 			for _, r := range runs.CheckRuns {
 				if r.Conclusion == nil {
 					continue
@@ -416,7 +489,17 @@ func (a *Adapter) fetchCIConclusion(ctx context.Context, owner, repo, mergeSHA, 
 
 	switch {
 	case sawFailure:
+		// A genuine, confirmed failure from whichever GET succeeded is
+		// real signal regardless of the other GET's own health --
+		// mirrors fetchCIConclusionLive's own identical precedent.
 		return ports.CIConclusionFailure
+	case degraded:
+		// F5: sawSuccess may well be true here (the surviving GET
+		// reported green), but with the other GET unread (or a decoded
+		// check-runs page confirmed truncated), that green is
+		// unconfirmed -- report Unknown, this package's own pre-existing
+		// "could not be determined" value, never a confident Success.
+		return ports.CIConclusionUnknown
 	case sawSuccess:
 		return ports.CIConclusionSuccess
 	default:

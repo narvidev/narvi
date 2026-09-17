@@ -611,6 +611,167 @@ func TestListOpenPRsForUser_HalfReadCIFailsClosed(t *testing.T) {
 	}
 }
 
+// TestListOpenPRsForUser_CheckRunsTruncatedFirstPageFailsClosed is F1's own
+// reproduction: a check-runs GET can succeed and decode
+// perfectly well and STILL be a truncated PREFIX of the real total -- a
+// fact TestListOpenPRsForUser_HalfReadCIFailsClosed above cannot exercise,
+// since every one of its cases is a transport/decode failure. Before the
+// fix, fetchCIConclusionLive's check-runs GET sent no per_page at all;
+// GitHub's documented default page size (30) then served only the first 30
+// of a ref carrying more. Reproduced here exactly as filed: 40 check runs,
+// run #35 (index 34) concludes "failure", the rest "success" -- the first
+// 30 (all green) are what a per_page-less request would receive. Verified
+// BEFORE this fix: found=true err=<nil> CI="success" CIConclusionDegraded=false
+// -- the unattended merge worker would act on a PR whose CI is red.
+func TestListOpenPRsForUser_CheckRunsTruncatedFirstPageFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	const total = 40
+	const failingIndex = 34 // run #35, 0-indexed
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/user/1":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 1, "login": "octocat"})
+		case r.URL.Path == "/search/issues" && strings.Contains(r.URL.Query().Get("q"), "assignee:octocat"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"items": []map[string]any{{"number": 5, "repository_url": "https://api.github.com/repos/acme/widgets"}},
+			})
+		case r.URL.Path == "/search/issues" && strings.Contains(r.URL.Query().Get("q"), "review-requested:octocat"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{}})
+		case r.URL.Path == "/repos/acme/widgets/pulls/5":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 5, "title": "x", "html_url": "u", "state": "open", "head": map[string]any{"sha": "s"}, "base": map[string]any{"ref": "main"},
+			})
+		case r.URL.Path == "/repos/acme/widgets/pulls/5/reviews":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		case r.URL.Path == "/repos/acme/widgets/commits/s/status":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"state": "pending", "total_count": 0})
+		case r.URL.Path == "/repos/acme/widgets/commits/s/check-runs":
+			w.Header().Set("Content-Type", "application/json")
+			// per_page=100 (the fix) must be what this adapter sends; a
+			// request without it, or with a smaller value, gets GitHub's
+			// real documented default page size (30) here, reproducing
+			// the original bug against an unfixed caller.
+			served := 30
+			if r.URL.Query().Get("per_page") == "100" {
+				served = total
+			}
+			runs := make([]map[string]any, 0, served)
+			for i := 0; i < served; i++ {
+				concl := "success"
+				if i == failingIndex {
+					concl = "failure"
+				}
+				runs = append(runs, map[string]any{"conclusion": concl})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": total, "check_runs": runs})
+		case r.URL.Path == "/repos/acme/widgets/pulls/5/files":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	adapter := githubapi.New(server.Client(), server.URL)
+
+	prs, _, err := adapter.ListOpenPRsForUser(context.Background(), ports.ListOpenPRsForUserSpec{GitHubExternalID: "1", Token: "tok"})
+	if err != nil {
+		t.Fatalf("ListOpenPRsForUser() error = %v, want nil", err)
+	}
+	if len(prs) != 1 {
+		t.Fatalf("ListOpenPRsForUser() returned %d PRs, want 1", len(prs))
+	}
+	if prs[0].CIConclusion != ports.CIConclusionFailure {
+		t.Errorf("CIConclusion = %v, want failure -- per_page=100 must surface run #35's own confirmed failure, never a stale prefix's all-green view", prs[0].CIConclusion)
+	}
+}
+
+// TestListOpenPRsForUser_CheckRunsTotalCountBeyondOnePageFailsClosed proves
+// the TotalCount guard (F1) covers a ref carrying MORE check runs than even
+// per_page=100 serves in one page: 150 total, run #135 (index 134) fails,
+// only the first 100 (all success) are ever served -- there is no Link
+// header or further pagination in this adapter, only the truncation
+// detection itself. Must never report Success from a page that is,
+// server-confirmed via TotalCount, still only a partial read.
+func TestListOpenPRsForUser_CheckRunsTotalCountBeyondOnePageFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	const total = 150
+	const servedCount = 100
+	const failingIndex = 134
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/user/1":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 1, "login": "octocat"})
+		case r.URL.Path == "/search/issues" && strings.Contains(r.URL.Query().Get("q"), "assignee:octocat"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"items": []map[string]any{{"number": 5, "repository_url": "https://api.github.com/repos/acme/widgets"}},
+			})
+		case r.URL.Path == "/search/issues" && strings.Contains(r.URL.Query().Get("q"), "review-requested:octocat"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{}})
+		case r.URL.Path == "/repos/acme/widgets/pulls/5":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 5, "title": "x", "html_url": "u", "state": "open", "head": map[string]any{"sha": "s"}, "base": map[string]any{"ref": "main"},
+			})
+		case r.URL.Path == "/repos/acme/widgets/pulls/5/reviews":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		case r.URL.Path == "/repos/acme/widgets/commits/s/status":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"state": "pending", "total_count": 0})
+		case r.URL.Path == "/repos/acme/widgets/commits/s/check-runs":
+			w.Header().Set("Content-Type", "application/json")
+			runs := make([]map[string]any, 0, servedCount)
+			for i := 0; i < servedCount; i++ {
+				concl := "success"
+				if i == failingIndex {
+					concl = "failure"
+				}
+				runs = append(runs, map[string]any{"conclusion": concl})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"total_count": total, "check_runs": runs})
+		case r.URL.Path == "/repos/acme/widgets/pulls/5/files":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	adapter := githubapi.New(server.Client(), server.URL)
+
+	prs, _, err := adapter.ListOpenPRsForUser(context.Background(), ports.ListOpenPRsForUserSpec{GitHubExternalID: "1", Token: "tok"})
+	if err != nil {
+		t.Fatalf("ListOpenPRsForUser() error = %v, want nil", err)
+	}
+	if len(prs) != 1 {
+		t.Fatalf("ListOpenPRsForUser() returned %d PRs, want 1", len(prs))
+	}
+	if prs[0].CIConclusion == ports.CIConclusionSuccess {
+		t.Errorf("CIConclusion = success, must never report Success from a page TotalCount confirms is truncated")
+	}
+	if !prs[0].CIConclusionDegraded {
+		t.Errorf("CIConclusionDegraded = false, want true (total_count=%d > len(check_runs)=%d)", total, servedCount)
+	}
+}
+
 // TestListOpenPRsForUser_ReviewDecisionReducesToLatestPerReviewer is the
 // P1-1 regression test: fetchReviewDecision
 // must reduce GitHub's own append-only review list to each reviewer's

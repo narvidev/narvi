@@ -195,6 +195,20 @@ type Result struct {
 	//     a confident normal state" shape this codebase has repeatedly had
 	//     to fix elsewhere. Same shape as (5): the row is NOT dropped, only
 	//     demoted, and SCMAsOf is set here too.
+	//  7. A per-PR ports.OpenPR.CIConclusionDegraded (F2/F4): githubapi.fetchCIConclusionLive itself could not fully
+	//     read that ONE PR's CI composite (either GET failed, or a
+	//     decoded check-runs page was a confirmed truncated prefix, F1).
+	//     Exactly the same shape as (5): the row is NOT dropped --
+	//     buildPROpenItem/computeRealEligibility still demote it out of
+	//     ready_to_merge (ReasonCIConclusionDegraded) -- but the overall
+	//     read is, again, no longer a complete picture. Before this
+	//     producer existed, this was the ONE per-PR degraded signal that
+	//     never raised this field at all: a half-read CI composite
+	//     demoted its own row correctly while the inbox as a whole kept
+	//     reporting a confident, complete picture -- the "failure
+	//     rendering as a confident normal state" shape (6) already
+	//     describes, left open for this one field alone. SCMAsOf is set
+	//     here too, same as (3)/(4)/(5).
 	//
 	// UNLIKE this field's own previous doc comment claimed, SCMAsOf
 	// non-nil and SCMFetchFailed true are NOT mutually exclusive as of
@@ -407,6 +421,26 @@ func buildPRItems(ctx context.Context, deps Deps, actorGitHubID, token string, n
 			// the OVERALL read is no longer a complete picture either,
 			// mirroring producers (3)/(4) on Result.SCMFetchFailed's own
 			// doc comment (a per-row degrade still marks the whole batch).
+			degraded = true
+		}
+		if pr.CIConclusionDegraded {
+			// F2/F4: CIConclusionDegraded's own sibling
+			// fix above (ReviewDecisionDegraded) already marks the WHOLE
+			// batch degraded when a per-PR review-decision read could not
+			// be fully confirmed -- CIConclusionDegraded carries the
+			// IDENTICAL "this row's own SCM read was incomplete" fact
+			// (githubapi.fetchCIConclusionLive's own doc comment: either
+			// GET failed, or a decoded check-runs page was a confirmed
+			// truncated prefix, F1) and, before this fix, raised NO
+			// signal here at all: computeRealEligibility/ComputeEligible
+			// already demote this ONE row out of ready_to_merge
+			// (ReasonCIConclusionDegraded), but the inbox as a WHOLE kept
+			// reporting Result.SCMFetchFailed=false -- a half-read CI
+			// composite rendering as a confident, complete picture, the
+			// exact "failure rendering as a confident normal state" shape
+			// this repository has already fixed for every OTHER SCM-read
+			// degradation. Mirrors pr.ReviewDecisionDegraded immediately
+			// above -- a per-row degrade still marks the whole batch.
 			degraded = true
 		}
 		item, itemDegraded := buildPROpenItem(ctx, deps, pr, repoFullName, actorGitHubID, token, now, budget)
