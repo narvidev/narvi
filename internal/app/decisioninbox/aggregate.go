@@ -658,10 +658,21 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// probe (G10, fourth adversarial-review round) asks "setting the
 	// base-freshness question aside entirely, would this PR already be
 	// ineligible" -- every criterion below is fully known WITHOUT a live
-	// SCM call (head-SHA equality, the verdict's own base-ref/ancestor-
-	// chain/policy-version equality, CI, Shippable, diff size, blast
-	// radius). CurrentBaseSHA is deliberately ASSUMED equal to the
-	// verdict's own recorded VerdictBaseSHA -- the most lenient possible
+	// SCM call (head-SHA equality, the verdict's own base-REF/policy-
+	// version equality, CI, Shippable, diff size, blast radius). The
+	// ANCESTOR CHAIN is NOT among these (round-11 finding E, corrected: a
+	// previous version of this paragraph listed it alongside base-ref/
+	// policy-version as though the probe genuinely compares it against
+	// pr's own live value) -- CurrentAncestorChain below is assigned
+	// record.Context.AncestorChain itself, the identical value
+	// VerdictAncestorChain also is, so this probe's own ancestor-chain
+	// comparison is ALWAYS trivially equal and can never by itself refuse
+	// on ReasonAncestorChainChanged/ReasonAncestorChainUnknown -- see
+	// CurrentAncestorChain's own doc comment a few lines down for the
+	// full "why", the same deferred-to-the-final-call treatment
+	// CurrentBaseSHA gets, immediately below. CurrentBaseSHA is
+	// deliberately ASSUMED equal to the verdict's own recorded
+	// VerdictBaseSHA -- the most lenient possible
 	// stand-in. This assumption cannot make either of ComputeEligible's
 	// two base-SHA-comparison checks (ReasonBaseSHAUnknown/ReasonBaseMoved)
 	// MORE lenient than any real currentBaseSHA would -- but NOT for the
@@ -710,11 +721,17 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 		// what made this comparison verify nothing before this fix.
 		CurrentAncestorChain:       record.Context.AncestorChain,
 		BaseAdvancedWithoutRewrite: true, // moot: the assumed SHA equality above already bypasses this check
-		CIGreen:                    ciGreen,
-		HasNeedsHumanLabel:         false,
-		ChangedFileCount:           changedFileCount,
-		TouchedBlastRadius:         touchedBlastRadius,
-		TouchedBlastRadiusKnown:    touchedBlastRadiusKnown,
+		// AncestorChainAdvancedWithoutRewrite (round-11 finding A3) is
+		// likewise moot here, mirroring BaseAdvancedWithoutRewrite
+		// immediately above for the identical reason: CurrentAncestorChain
+		// is assigned the SAME value as VerdictAncestorChain immediately
+		// above, so there is no sha mismatch for this flag to tolerate.
+		AncestorChainAdvancedWithoutRewrite: true,
+		CIGreen:                             ciGreen,
+		HasNeedsHumanLabel:                  false,
+		ChangedFileCount:                    changedFileCount,
+		TouchedBlastRadius:                  touchedBlastRadius,
+		TouchedBlastRadiusKnown:             touchedBlastRadiusKnown,
 	}
 	if probeEligible, _ := autoapproval.ComputeEligible(probe, cfg); !probeEligible {
 		return false, false
@@ -858,20 +875,39 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// currentBaseSHA immediately above, for the identical read-model-vs-
 	// action-endpoint reason. The ref itself (a branch name) is trusted
 	// from the cached read, exactly like BaseRef is; only the SHA is
-	// re-resolved live. A resolution failure degrades to no chain at all
-	// (never a link with a stale or empty SHA) and marks this row
-	// degraded, mirroring currentBaseSHA's own identical fail-closed-via-
-	// ComputeEligible discipline rather than baseSHAErr's own early
-	// return (revalidateCore, an action endpoint, can afford to fail
-	// outright; this read model cannot).
+	// re-resolved live.
+	//
 	// currentAncestorChain's own zero value (nil) is the correct answer
-	// whenever pr.AncestorChain reports no link at all, or the live
-	// resolution below comes back empty/failed -- never a link with a
-	// stale or empty SHA, mirroring AncestorChainFromStack's own
-	// identical empty-liveSHA-degrades-to-no-link discipline
-	// (internal/domain/review/context.go).
+	// ONLY when pr.AncestorChain reports no link at all -- a CONFIRMED
+	// fact (this PR is not currently stacked, or sits at its own bottom).
+	// A live resolution that fails, OR one that succeeds with an empty
+	// sha (this production adapter's own ResolveBranchSHA never returns
+	// that combination, but a defensive symmetric check costs nothing),
+	// is NEITHER of those things -- round-11 finding A1's own fix applies
+	// here exactly as it does in revalidateCore (revalidate.go) and at
+	// review-context-fetch time (internal/app/reviewcontext.Fetch):
+	// currentAncestorChain is set to an EXPLICIT unknown-marker link (an
+	// empty sha, this package's own dedicated "could not be established"
+	// value) rather than falling through to nil, which the PREVIOUS
+	// version of this comment (and this function's own two-case switch,
+	// which had NO default arm at all) claimed was safe -- it is not: a
+	// nil currentAncestorChain here is INDISTINGUISHABLE, once compared,
+	// from "this PR was never in a stack at all", so a genuinely-stacked
+	// PR whose live ancestor resolve merely failed just now could
+	// otherwise read as a clean, confirmed-empty match against a verdict
+	// recorded before it was ever stacked -- silently passing this row as
+	// ready_to_merge on exactly the criterion this check exists to catch.
+	// Marking degraded true on both new branches (the switch's own
+	// missing default, now added) keeps this row visibly DEMOTED rather
+	// than silently approved, mirroring baseSHAErr/ancestorErr's own
+	// identical "fail closed AND flag it visibly" discipline immediately
+	// above.
 	var currentAncestorChain []review.AncestorLink
 	if len(pr.AncestorChain) > 0 && pr.AncestorChain[0].Ref != "" {
+		// unknownMarker is the fail-closed default for this iteration --
+		// overwritten below only on a genuine, non-empty live resolution.
+		unknownMarker := []review.AncestorLink{{Ref: pr.AncestorChain[0].Ref, SHA: ""}}
+		currentAncestorChain = unknownMarker
 		liveAncestorSHA, _, liveAncestorErr := deps.SCMCache.ResolveBranchSHA(ctx, ports.ResolveBranchSHASpec{
 			Owner:  pr.Owner,
 			Repo:   pr.Repo,
@@ -880,10 +916,46 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 		}, now)
 		switch {
 		case liveAncestorErr != nil:
-			platform.Logger(ctx).Warn("decisioninbox: resolve live ancestor chain sha failed, base-freshness check will fail closed via ReasonAncestorChainChanged", "error", liveAncestorErr, "repo", repoFullName, "pr_number", pr.Number)
+			platform.Logger(ctx).Warn("decisioninbox: resolve live ancestor chain sha failed, base-freshness check will fail closed via ReasonAncestorChainUnknown", "error", liveAncestorErr, "repo", repoFullName, "pr_number", pr.Number)
 			degraded = true
 		case liveAncestorSHA != "":
 			currentAncestorChain = []review.AncestorLink{{Ref: pr.AncestorChain[0].Ref, SHA: liveAncestorSHA}}
+		default:
+			platform.Logger(ctx).Warn("decisioninbox: resolve live ancestor chain sha returned an empty sha with no error, base-freshness check will fail closed via ReasonAncestorChainUnknown", "repo", repoFullName, "pr_number", pr.Number)
+			degraded = true
+		}
+	}
+
+	// ancestorChainAdvancedWithoutRewrite (round-11 finding A3) mirrors
+	// baseAdvancedWithoutRewrite's own identical fast-forward tolerance,
+	// one link further out -- see autoapproval.
+	// EligibilityInput.AncestorChainAdvancedWithoutRewrite's own doc
+	// comment (eligibility.go) for what a confirmed "yes" here actually
+	// establishes and what residual it carries. Only even attempted when
+	// both sides report a real (non-unknown) link, that link's REF is
+	// unchanged (a real restructure still refuses unconditionally), and
+	// the sha genuinely differs. Cached via deps.SCMCache.IsAncestor,
+	// exactly like baseAdvancedWithoutRewrite immediately above, for the
+	// identical read-model-vs-action-endpoint reason. A failure here ALSO
+	// marks degraded true, mirroring baseAdvancedWithoutRewrite's own
+	// identical E5 discipline.
+	var ancestorChainAdvancedWithoutRewrite bool
+	if len(record.Context.AncestorChain) > 0 && len(currentAncestorChain) > 0 &&
+		record.Context.AncestorChain[0].Ref == currentAncestorChain[0].Ref &&
+		record.Context.AncestorChain[0].SHA != "" && currentAncestorChain[0].SHA != "" &&
+		record.Context.AncestorChain[0].SHA != currentAncestorChain[0].SHA {
+		confirmed, ancestorChainErr := deps.SCMCache.IsAncestor(ctx, ports.IsAncestorSpec{
+			Owner:      pr.Owner,
+			Repo:       pr.Repo,
+			Ancestor:   record.Context.AncestorChain[0].SHA,
+			Descendant: currentAncestorChain[0].SHA,
+			Token:      token,
+		}, now)
+		if ancestorChainErr != nil {
+			platform.Logger(ctx).Warn("decisioninbox: resolve ancestor-chain-advanced-without-rewrite ancestry failed, base-freshness check will fail closed via ReasonAncestorChainChanged", "error", ancestorChainErr, "repo", repoFullName, "pr_number", pr.Number)
+			degraded = true
+		} else {
+			ancestorChainAdvancedWithoutRewrite = confirmed
 		}
 	}
 
@@ -898,23 +970,24 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// comments immediately above for why they are NOT pr.BaseSHA/
 	// pr.AncestorChain.
 	eligibleIgnoringHumanSignals, _ := autoapproval.ComputeEligible(autoapproval.EligibilityInput{
-		Verdict:                    record.Verdict,
-		VerdictAssessed:            true,
-		VerdictHeadSHA:             record.HeadSHA,
-		VerdictBaseRef:             record.Context.BaseRef,
-		VerdictBaseSHA:             record.Context.BaseSHA,
-		VerdictAncestorChain:       record.Context.AncestorChain,
-		VerdictPolicyVersion:       record.Context.PolicyVersion,
-		CurrentHeadSHA:             pr.HeadSHA,
-		CurrentBaseRef:             pr.BaseRef,
-		CurrentBaseSHA:             currentBaseSHA,
-		CurrentAncestorChain:       currentAncestorChain,
-		BaseAdvancedWithoutRewrite: baseAdvancedWithoutRewrite,
-		CIGreen:                    ciGreen,
-		HasNeedsHumanLabel:         false,
-		ChangedFileCount:           changedFileCount,
-		TouchedBlastRadius:         touchedBlastRadius,
-		TouchedBlastRadiusKnown:    touchedBlastRadiusKnown,
+		Verdict:                             record.Verdict,
+		VerdictAssessed:                     true,
+		VerdictHeadSHA:                      record.HeadSHA,
+		VerdictBaseRef:                      record.Context.BaseRef,
+		VerdictBaseSHA:                      record.Context.BaseSHA,
+		VerdictAncestorChain:                record.Context.AncestorChain,
+		VerdictPolicyVersion:                record.Context.PolicyVersion,
+		CurrentHeadSHA:                      pr.HeadSHA,
+		CurrentBaseRef:                      pr.BaseRef,
+		CurrentBaseSHA:                      currentBaseSHA,
+		CurrentAncestorChain:                currentAncestorChain,
+		BaseAdvancedWithoutRewrite:          baseAdvancedWithoutRewrite,
+		AncestorChainAdvancedWithoutRewrite: ancestorChainAdvancedWithoutRewrite,
+		CIGreen:                             ciGreen,
+		HasNeedsHumanLabel:                  false,
+		ChangedFileCount:                    changedFileCount,
+		TouchedBlastRadius:                  touchedBlastRadius,
+		TouchedBlastRadiusKnown:             touchedBlastRadiusKnown,
 	}, cfg)
 	eligible := eligibleIgnoringHumanSignals && !hasNeedsHuman
 

@@ -1097,22 +1097,37 @@ func TestAncestorChainFromStack(t *testing.T) {
 			want:    []review.AncestorLink{{Ref: "main", SHA: "sha-main-live-and-different"}},
 		},
 		{
-			name:    "a stack reporting an empty ultimate base ref is treated identically to no ancestor (nothing real to name)",
+			// Round-11 finding A1 (was: "treated identically to no
+			// ancestor" -- an INVERSION this test used to assert as
+			// correct, proven wrong by executing ComputeEligible in a
+			// scratch copy). Position > 1 PROVES an ancestor link exists;
+			// a degraded stack read that lost the ref name does not make
+			// that fact go away -- it must still report a link (an
+			// explicit unknown-SHA-marker one, since there is no ref to
+			// pair a resolution attempt with either), never collapse into
+			// the SAME nil this function returns for "there is genuinely
+			// nothing here" (the position<=1/no-stack cases above).
+			name:    "a stack reporting an empty ultimate base ref (a degraded read) at position > 1 still reports a link -- an unknown-marker one, never collapsed into 'no ancestor at all'",
 			stack:   &review.StackContext{Position: 2, Size: 2, UltimateBaseRef: "", UltimateBaseSHA: "sha-main-cached"},
 			liveSHA: "sha-main-live",
-			want:    nil,
+			want:    []review.AncestorLink{{Ref: "", SHA: "sha-main-live"}},
 		},
 		{
-			// Round-10 finding B: a live resolution that failed (empty
-			// liveSHA) must degrade to NO chain at all, never a link
-			// carrying an empty SHA -- autoapproval.ancestorChainEqual
-			// would otherwise treat that empty string as a real,
-			// comparable value rather than "could not be established"
-			// (mirroring finding F2's identical BaseSHA discipline).
-			name:    "an empty live SHA (the caller's own resolution failed) degrades to no ancestor at all, never a link with an empty SHA",
+			// Round-11 finding A1 (was: "degrades to no ancestor at all,
+			// never a link with an empty SHA" -- the EXACT INVERSE of the
+			// correct behavior, per the same scratch-copy execution named
+			// above). A live resolution that failed must now report an
+			// EXPLICIT unknown-SHA-marker link (this package's own
+			// dedicated "could not be established" signal,
+			// autoapproval.ReasonAncestorChainUnknown), never collapse
+			// into the confirmed-empty nil the position<=1/no-stack cases
+			// return -- collapsing the two made a verdict recorded during
+			// an unresolvable live read silently indistinguishable from
+			// one recorded against a genuinely non-stacked PR.
+			name:    "an empty live SHA (the caller's own resolution failed) reports an unknown-marker link (empty sha), never collapsed into 'no ancestor at all'",
 			stack:   &review.StackContext{Position: 2, Size: 2, UltimateBaseRef: "main", UltimateBaseSHA: "sha-main-cached"},
 			liveSHA: "",
-			want:    nil,
+			want:    []review.AncestorLink{{Ref: "main", SHA: ""}},
 		},
 	}
 

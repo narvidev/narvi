@@ -396,10 +396,151 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		if ok {
 			t.Fatal("RevalidateForMerge() ok = true, want false -- the latest verdict's own recorded ancestor chain no longer matches the PR's live one")
 		}
-		// This fires on the PROBE (the SHA is assumed equal, so nothing
-		// live is checked before ComputeEligible refuses), which wraps
-		// the raw Reason string -- see revalidateCore's own probeReason
-		// handling -- so this checks containment, not equality.
+		// Round-11 finding E: this does NOT fire on the probe -- a
+		// previous version of this comment claimed it did, which this
+		// SAME delta (revalidateCore's own CurrentAncestorChain wiring)
+		// made impossible: the probe's own CurrentAncestorChain is
+		// deliberately ASSIGNED record.Context.AncestorChain itself (the
+		// identical value VerdictAncestorChain also is), so the probe's
+		// ancestor-chain comparison is ALWAYS trivially equal and can
+		// never itself observe a mismatch, regardless of what the live PR
+		// reports (revalidateCore's own probeInput doc comment). This
+		// refusal instead fires on the FINAL ComputeEligible call, after
+		// revalidateCore's own currentAncestorChain block runs: the live
+		// PR here reports NO ancestor chain at all (target.AncestorChain
+		// is empty), so that block never even attempts a live
+		// ResolveBranchSHA call -- currentAncestorChain simply stays nil,
+		// and the final call compares that honest, confirmed-empty nil
+		// against the verdict's own real, non-nil recorded chain. The
+		// result still wraps the raw Reason string -- see revalidateCore's
+		// own eligReason handling -- so this checks containment, not
+		// equality.
+		if !strings.Contains(reason, string(autoapproval.ReasonAncestorChainChanged)) {
+			t.Errorf("reason = %q, want it to contain %q", reason, autoapproval.ReasonAncestorChainChanged)
+		}
+	})
+
+	// AncestorChainAdvanced_ConfirmedFastForward_NotRefused is round-11
+	// finding A3's own regression test -- the SAME fast-forward tolerance
+	// BaseBranchAdvanced_ConfirmedFastForward_NotRefused above already
+	// pins for the immediate base, one link further out: the verdict's
+	// own recorded ancestor-chain link has since advanced (an ordinary,
+	// unrelated merge to the stack's own ultimate base, confirmed via
+	// IsAncestor), while the immediate base itself is untouched. Before
+	// this fix, ANY ancestor-chain sha movement refused unconditionally
+	// (autoapproval.ancestorChainEqual had no tolerance parameter at
+	// all) -- reintroducing, one link further back, the exact "any
+	// unrelated merge permanently disqualifies a verdict" failure D3
+	// already closed for the immediate base.
+	t.Run("AncestorChainAdvanced_ConfirmedFastForward_NotRefused", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-ancestor-chain-advanced-confirmed"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 105)
+
+		// The live PR now reports a GitHub-native-stack ancestor link on
+		// a DIFFERENT branch ("release-parent") than its own immediate
+		// base ("main", testEligibleBaseRef) -- deliberately distinct
+		// names, so the fake's own per-branch resolveBranchSHAByBranch
+		// (below) can answer the two ResolveBranchSHA calls this
+		// triggers independently, and so this test proves the ANCESTOR
+		// link's own tolerance specifically, with the immediate base
+		// left genuinely untouched (never moved at all).
+		pr.AncestorChain = []ports.PRAncestorLink{{Ref: "release-parent", SHA: "cached-irrelevant-snapshot"}}
+		rs.replaceTargetPR(actorGitHubID, pr)
+
+		verdictContext := reviewverdict.Context{
+			BaseRef:       testEligibleBaseRef,
+			BaseSHA:       testEligibleBaseSHA,
+			AncestorChain: []review.AncestorLink{{Ref: "release-parent", SHA: "release-parent-old-sha"}},
+			PolicyVersion: autoapproval.CurrentPolicyVersion,
+		}
+		verdict := review.Verdict{
+			RiskLevel:         review.RiskLevelLow,
+			Premise:           review.PremiseStateOK,
+			TestsCoverage:     review.TestsCoverageStateAdequate,
+			DocsDrift:         review.DocsDriftStateNone,
+			ProposedShippable: review.ProposedShippableAuto,
+			FilesChanged:      3,
+		}
+		verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+		if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, int32(pr.Number), pr.HeadSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "second, newer verdict whose ancestor chain has since advanced"}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
+			t.Fatalf("insert second verdict with an advanced ancestor chain: %v", err)
+		}
+
+		rs.sourceControl.resolveBranchSHAByBranch = map[string]string{"release-parent": "release-parent-new-sha"}
+		rs.sourceControl.isAncestorResult = true
+		rs.sourceControl.isAncestorCalls = nil
+		defer func() {
+			rs.sourceControl.resolveBranchSHAByBranch = nil
+			rs.sourceControl.isAncestorResult = false
+			rs.sourceControl.isAncestorCalls = nil
+		}()
+
+		ok, headSHA, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+		}
+		if !ok {
+			t.Fatalf("RevalidateForMerge() ok = false, reason = %q, want true -- A3: an ancestor-chain movement CONFIRMED as a pure fast-forward must not refuse an otherwise-eligible PR", reason)
+		}
+		if headSHA != pr.HeadSHA {
+			t.Errorf("headSHA = %q, want %q", headSHA, pr.HeadSHA)
+		}
+		if len(rs.sourceControl.isAncestorCalls) != 1 {
+			t.Fatalf("IsAncestor called %d times, want 1", len(rs.sourceControl.isAncestorCalls))
+		}
+		gotCall := rs.sourceControl.isAncestorCalls[0]
+		if gotCall.Ancestor != "release-parent-old-sha" || gotCall.Descendant != "release-parent-new-sha" {
+			t.Errorf("IsAncestor(Ancestor, Descendant) = (%q, %q), want (%q, %q) -- the verdict's OWN recorded ancestor-link sha as the candidate ancestor, the LIVE resolved tip as the descendant",
+				gotCall.Ancestor, gotCall.Descendant, "release-parent-old-sha", "release-parent-new-sha")
+		}
+	})
+
+	// AncestorChainAdvanced_WithoutConfirmation_Refused is the negative
+	// counterpart immediately above: the IDENTICAL ancestor-chain
+	// movement, but this time NOT confirmed a fast-forward (isAncestorResult
+	// left false) -- must still refuse. Proves the tolerance is genuinely
+	// gated on the live confirmation, never unconditional once a chain
+	// link's ref merely matches.
+	t.Run("AncestorChainAdvanced_WithoutConfirmation_Refused", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-ancestor-chain-advanced-unconfirmed"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 106)
+		pr.AncestorChain = []ports.PRAncestorLink{{Ref: "release-parent", SHA: "cached-irrelevant-snapshot"}}
+		rs.replaceTargetPR(actorGitHubID, pr)
+
+		verdictContext := reviewverdict.Context{
+			BaseRef:       testEligibleBaseRef,
+			BaseSHA:       testEligibleBaseSHA,
+			AncestorChain: []review.AncestorLink{{Ref: "release-parent", SHA: "release-parent-old-sha"}},
+			PolicyVersion: autoapproval.CurrentPolicyVersion,
+		}
+		verdict := review.Verdict{
+			RiskLevel:         review.RiskLevelLow,
+			Premise:           review.PremiseStateOK,
+			TestsCoverage:     review.TestsCoverageStateAdequate,
+			DocsDrift:         review.DocsDriftStateNone,
+			ProposedShippable: review.ProposedShippableAuto,
+			FilesChanged:      3,
+		}
+		verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+		if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, int32(pr.Number), pr.HeadSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "second, newer verdict whose ancestor chain advanced, unconfirmed"}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
+			t.Fatalf("insert second verdict with an advanced-but-unconfirmed ancestor chain: %v", err)
+		}
+
+		rs.sourceControl.resolveBranchSHAByBranch = map[string]string{"release-parent": "release-parent-new-sha"}
+		rs.sourceControl.isAncestorResult = false
+		rs.sourceControl.isAncestorCalls = nil
+		defer func() {
+			rs.sourceControl.resolveBranchSHAByBranch = nil
+			rs.sourceControl.isAncestorCalls = nil
+		}()
+
+		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+		}
+		if ok {
+			t.Fatal("RevalidateForMerge() ok = true, want false -- the ancestor-chain movement was never confirmed a fast-forward")
+		}
 		if !strings.Contains(reason, string(autoapproval.ReasonAncestorChainChanged)) {
 			t.Errorf("reason = %q, want it to contain %q", reason, autoapproval.ReasonAncestorChainChanged)
 		}

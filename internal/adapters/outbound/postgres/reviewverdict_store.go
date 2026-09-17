@@ -41,11 +41,15 @@ func (s *ReviewVerdictStore) Insert(ctx context.Context, arg sqlcgen.InsertRevie
 	return s.q.InsertReviewVerdict(ctx, arg)
 }
 
-// GetLatest fetches (repoFullName, prNumber)'s own most-recently-posted
-// verdict. pgx.ErrNoRows (unwrapped) means no verdict has ever been
-// posted for this PR -- callers (the auto-approval eligibility engine,
-// the decision inbox's own classification) treat that identically to an
-// ineligible/needs-review PR, never as an error.
+// GetLatest fetches (repoFullName, prNumber)'s own LATEST verdict --
+// round-11 finding E: never "most-recently-posted" (the previous wording
+// here); see GetLatestReviewVerdict's own generated doc comment for the
+// actual ordering -- the PRODUCING ATTEMPT's own creation time, tie-
+// broken deterministically (round-10 finding D, round-11 finding B),
+// never post time alone. pgx.ErrNoRows (unwrapped) means no verdict has
+// ever been posted for this PR -- callers (the auto-approval eligibility
+// engine, the decision inbox's own classification) treat that
+// identically to an ineligible/needs-review PR, never as an error.
 func (s *ReviewVerdictStore) GetLatest(ctx context.Context, repoFullName string, prNumber int32) (sqlcgen.ReviewVerdict, error) {
 	return s.q.GetLatestReviewVerdict(ctx, sqlcgen.GetLatestReviewVerdictParams{
 		RepoFullName: repoFullName,
@@ -53,14 +57,16 @@ func (s *ReviewVerdictStore) GetLatest(ctx context.Context, repoFullName string,
 	})
 }
 
-// GetLatestNonShadow fetches (repoFullName, prNumber)'s own most-
-// recently-posted verdict, excluding any verdict §30.8 says must never
-// arm a real, customer-visible effect (its own suppressed_in_shadow
-// stamp, or one that predates repoFullName's own live_egress_promoted_at
-// fence) -- see GetLatestNonShadowReviewVerdict's own generated doc
-// comment. pgx.ErrNoRows (unwrapped) means no NON-SHADOW verdict has
-// ever been posted for this PR -- callers must treat this identically to
-// GetLatest's own "no verdict at all" outcome, never distinguish the two.
+// GetLatestNonShadow fetches (repoFullName, prNumber)'s own LATEST
+// verdict (GetLatest's own doc comment immediately above -- the identical
+// "never post time alone" correction applies here too), excluding any
+// verdict §30.8 says must never arm a real, customer-visible effect (its
+// own suppressed_in_shadow stamp, or one that predates repoFullName's own
+// live_egress_promoted_at fence) -- see GetLatestNonShadowReviewVerdict's
+// own generated doc comment. pgx.ErrNoRows (unwrapped) means no
+// NON-SHADOW verdict has ever been posted for this PR -- callers must
+// treat this identically to GetLatest's own "no verdict at all" outcome,
+// never distinguish the two.
 func (s *ReviewVerdictStore) GetLatestNonShadow(ctx context.Context, repoFullName string, prNumber int32) (sqlcgen.ReviewVerdict, error) {
 	return s.q.GetLatestNonShadowReviewVerdict(ctx, sqlcgen.GetLatestNonShadowReviewVerdictParams{
 		RepoFullName: repoFullName,

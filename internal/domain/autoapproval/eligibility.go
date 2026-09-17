@@ -319,6 +319,56 @@ type EligibilityInput struct {
 	// forward-only base movement no longer refuses) rather than a
 	// loosening of anything ELSE this engine already checks.
 	BaseAdvancedWithoutRewrite bool
+	// AncestorChainAdvancedWithoutRewrite (round-11 finding A3) is
+	// BaseAdvancedWithoutRewrite's own identical fast-forward tolerance,
+	// one level further out: the immediate base has carried this
+	// tolerance since round 4's D3 ("any unrelated merge to trunk
+	// permanently disqualifies a verdict" is exactly the failure D3
+	// closes), but the ancestor chain's own SHA comparison, until this
+	// fix, was STRICT equality with no tolerance at all -- reintroducing,
+	// one link further back in a GitHub-native stack, precisely the same
+	// failure D3 already closed for the immediate base: a PR stacked atop
+	// another loses eligibility the moment ANY ordinary, unrelated commit
+	// lands on the stack's own ultimate base, with no mechanism here to
+	// win eligibility back (§24's automatic re-review watches the PR's
+	// own head, never a stack's ultimate base).
+	//
+	// true means the caller has POSITIVELY CONFIRMED, via a live
+	// SourceControl.IsAncestor check between the verdict's own recorded
+	// ancestor-link SHA and the current live-resolved one (for whichever
+	// link's ref matched but whose sha differed), that the recorded SHA
+	// is an ancestor of (or identical to) the current one. Consulted by
+	// ancestorChainEqual (below) ONLY for a link whose REF is unchanged
+	// but whose SHA differs -- a changed REF (a genuine stack restructure)
+	// always refuses unconditionally, exactly like BaseAdvancedWithoutRewrite
+	// never overrides a base REF change.
+	//
+	// This carries the IDENTICAL residual BaseAdvancedWithoutRewrite's own
+	// doc comment already proves against real git: confirming the
+	// movement forward-only does NOT bound the fresh diff to a subset of
+	// what the verdict examined (a cancelling-pair unmasking is exactly as
+	// possible one link further back as it is at the immediate base) --
+	// what actually bounds the exposure is the SAME structural fact:
+	// ChangedFileCount/TouchedBlastRadius are always recomputed LIVE by
+	// both of ComputeEligible's real callers, never read off the stored
+	// verdict.
+	//
+	// Deliberately the BOOLEAN ZERO VALUE for "not confirmed" (mirrors
+	// BaseAdvancedWithoutRewrite/TouchedBlastRadiusKnown/VerdictAssessed's
+	// own identical fail-conservative convention): a caller that never
+	// populates this field, or whose own IsAncestor call failed, gets
+	// false -- "the ancestor chain moved and this was never independently
+	// confirmed safe" -- which this function then refuses on
+	// ReasonAncestorChainChanged, exactly the behavior this codebase had
+	// before this field existed.
+	//
+	// A single flag, not one per link: §17.6 bounds the ancestor chain to
+	// AT MOST ONE link today (the origin+sentinel-fix pair), so this is
+	// not yet a generalization gap -- but a genuine N-deep chain (§39,
+	// unshipped) would need this to become per-link before this tolerance
+	// could honestly extend past the first link. Filed here as the
+	// residual this shape leaves, not silently assumed away.
+	AncestorChainAdvancedWithoutRewrite bool
 	// CIGreen is the PR's CI conclusion at CurrentHeadSHA specifically
 	// (never at VerdictHeadSHA, which may already be stale) -- re-
 	// derived live via the STRICT ports.CIConclusion check
@@ -375,13 +425,42 @@ const (
 	// trunk permanently disqualifies a verdict" -- see that field's own
 	// doc comment for the full reasoning).
 	ReasonBaseMoved Reason = "the pull request's base has changed since this verdict was produced"
-	// ReasonAncestorChainChanged (§21.1's amendment) accompanies a
+	// ReasonAncestorChainChanged (§21.1's amendment; refined by round-11
+	// finding A3 to tolerate a confirmed fast-forward, mirroring
+	// ReasonBaseMoved's own identical D3 refinement) accompanies a
 	// verdict whose recorded ancestor chain (review.AncestorLink, ordered
 	// nearest-first) no longer matches the PR's own current chain --
 	// catches the shape ReasonBaseMoved alone cannot: this PR's own
 	// immediate base is unchanged, but something further back in its
-	// stacked ancestry moved.
+	// stacked ancestry moved. A link whose REF changed always fires this,
+	// unconditionally (a genuine stack restructure). A link whose SHA
+	// alone changed under an unchanged ref fires this UNLESS
+	// AncestorChainAdvancedWithoutRewrite confirms the movement was an
+	// ordinary, unrelated fast-forward. Distinct from
+	// ReasonAncestorChainUnknown below, which means a link on either side
+	// could not be established AT ALL -- never that a real, resolved
+	// chain simply changed.
 	ReasonAncestorChainChanged Reason = "the pull request's ancestor chain has changed since this verdict was produced"
+	// ReasonAncestorChainUnknown (round-11 finding A1) accompanies a
+	// verdict or a live read whose ancestor chain carries a link that
+	// could not be established at all -- review.AncestorChainFromStack's
+	// own doc comment: a PR at a stack position that PROVES an ancestor
+	// link exists (position > 1) but whose live SHA resolution failed (or
+	// whose ref itself could not be read) reports that link with an
+	// EXPLICIT EMPTY SHA, this package's own dedicated "could not be
+	// established" marker -- mirroring VerdictBaseSHA/CurrentBaseSHA's
+	// own identical empty-string contract (finding F2) one level further
+	// out. Checked BEFORE the equality comparison (ancestorChainEqual)
+	// specifically so an unknown link on either side can never silently
+	// read as "no ancestor chain at all" (which would trivially match a
+	// genuinely-empty chain on the other side, verifying nothing -- the
+	// exact hole this finding closed: the previous version of this
+	// package collapsed "resolution failed" into the SAME nil value used
+	// for "there is genuinely no ancestor here", and a verdict produced
+	// while position > 1's own live resolve was failing could then read
+	// as fresh against a PR that had since gained a real, different
+	// ancestor chain).
+	ReasonAncestorChainUnknown Reason = "the pull request's ancestor chain could not be established"
 	// ReasonPolicyVersionMismatch (§21.1's amendment) accompanies a
 	// verdict recorded under an earlier eligibility policy
 	// (CurrentPolicyVersion's own doc comment): "a verdict produced under
@@ -478,7 +557,18 @@ func ComputeEligible(in EligibilityInput, cfg EligibilityConfig) (eligible bool,
 	if in.VerdictBaseSHA != in.CurrentBaseSHA && !in.BaseAdvancedWithoutRewrite {
 		return false, ReasonBaseMoved
 	}
-	if !ancestorChainEqual(in.VerdictAncestorChain, in.CurrentAncestorChain) {
+	// Round-11 finding A1: an unknown link (SHA == "") on EITHER side is
+	// refused here, on its own dedicated reason, BEFORE the equality
+	// comparison below ever runs -- exactly the same discipline the
+	// VerdictBaseSHA/CurrentBaseSHA empty-string guard above already
+	// applies one level up (finding F2): an unresolved link must never
+	// silently degrade to "no ancestor chain to compare", which the
+	// equality check below would otherwise treat as trivially matching a
+	// genuinely-empty chain on the other side.
+	if ancestorChainHasUnknownLink(in.VerdictAncestorChain) || ancestorChainHasUnknownLink(in.CurrentAncestorChain) {
+		return false, ReasonAncestorChainUnknown
+	}
+	if !ancestorChainEqual(in.VerdictAncestorChain, in.CurrentAncestorChain, in.AncestorChainAdvancedWithoutRewrite) {
 		return false, ReasonAncestorChainChanged
 	}
 	if in.VerdictPolicyVersion != CurrentPolicyVersion {
@@ -552,6 +642,24 @@ func touchesSensitivePath(blastRadius, sensitiveTags []review.Tag) bool {
 	return false
 }
 
+// ancestorChainHasUnknownLink reports whether chain carries a link whose
+// SHA could not be established (round-11 finding A1) -- review.
+// AncestorChainFromStack's own doc comment: an explicit empty-SHA link,
+// never a bare nil chain, is this package's dedicated "could not be
+// established" marker, exactly mirroring VerdictBaseSHA/CurrentBaseSHA's
+// own identical empty-string contract (finding F2) one level further out.
+// A nil or empty chain (no link at all) reports false here -- that is the
+// CONFIRMED-empty case (no ancestor beyond the immediate base), a
+// different fact entirely from a link that exists but is unresolved.
+func ancestorChainHasUnknownLink(chain []review.AncestorLink) bool {
+	for _, link := range chain {
+		if link.SHA == "" {
+			return true
+		}
+	}
+	return false
+}
+
 // ancestorChainEqual reports whether a and b name the identical ordered
 // ancestor chain (§21.1's amendment) -- ORDER-SENSITIVE (a chain is
 // nearest-first, review.AncestorLink's own doc comment, so two chains
@@ -563,13 +671,33 @@ func touchesSensitivePath(blastRadius, sensitiveTags []review.Tag) bool {
 // distinction between "never computed" and "computed as empty" is not
 // one this comparison needs to preserve (unlike VerdictBaseRef == "",
 // which IS load-bearing precisely because a real base ref is never
-// legitimately empty).
-func ancestorChainEqual(a, b []review.AncestorLink) bool {
+// legitimately empty) -- and unlike a link's own SHA being empty, which
+// IS load-bearing (an unknown link, ancestorChainHasUnknownLink above,
+// ComputeEligible's own caller checks and refuses on BEFORE this function
+// is ever reached, so this function itself never has to reason about
+// that case).
+//
+// advancedWithoutRewrite (round-11 finding A3) is
+// EligibilityInput.AncestorChainAdvancedWithoutRewrite, mirroring
+// BaseAdvancedWithoutRewrite's own identical fast-forward tolerance one
+// level further out: a per-link REF mismatch always refuses
+// unconditionally (a genuine stack restructure -- exactly like a base
+// REF change never tolerates this flag), but a per-link SHA mismatch
+// under a matching ref is tolerated when advancedWithoutRewrite is true.
+// A single flag applied uniformly across every link (never a per-link
+// flag) -- §17.6 bounds the real chain to at most one link today, so this
+// is not yet a generalization gap; see that field's own doc comment
+// (eligibility.go) for the residual a genuine N-deep chain would need to
+// close.
+func ancestorChainEqual(a, b []review.AncestorLink, advancedWithoutRewrite bool) bool {
 	if len(a) != len(b) {
 		return false
 	}
 	for i := range a {
-		if a[i] != b[i] {
+		if a[i].Ref != b[i].Ref {
+			return false
+		}
+		if a[i].SHA != b[i].SHA && !advancedWithoutRewrite {
 			return false
 		}
 	}

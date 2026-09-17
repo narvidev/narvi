@@ -197,18 +197,35 @@ func Fetch(ctx context.Context, logger *slog.Logger, fetcher Fetcher, timeouts p
 	// exists and AncestorChainFromStack would otherwise report a real
 	// link (stack.Position > 1, stack.UltimateBaseRef != "") -- an
 	// ordinary, non-stacked PR (the overwhelming common case) costs
-	// nothing extra. A resolution failure degrades exactly like baseSHA's
-	// own: logged, liveAncestorBaseSHA stays "", and
-	// AncestorChainFromStack's own empty-liveSHA guard then reports NO
-	// chain at all rather than a link carrying a stale or empty SHA --
-	// never a reason to refuse creating the review turn.
+	// nothing extra.
+	//
+	// A resolution failure degrades DIFFERENTLY than baseSHA's own
+	// (round-11 finding A1, corrected): liveAncestorBaseSHA stays "", and
+	// AncestorChainFromStack (review/context.go) then reports a chain
+	// carrying ONE LINK with that empty SHA -- this package's own
+	// dedicated "could not be established" marker -- never NO chain at
+	// all. The PREVIOUS version of this comment claimed the latter
+	// ("empty ... context reads as unknown, never a stale match") without
+	// that being true: a chain degraded to nil here is INDISTINGUISHABLE,
+	// once persisted, from a PR that was never in a stack at all (or sat
+	// at its own bottom), and autoapproval.ComputeEligible's own
+	// ancestor-chain comparison would then either compare it against an
+	// equally-nil live value (a silent, unverified match) or, at best,
+	// refuse on the generic ReasonAncestorChainChanged rather than the
+	// honest ReasonAncestorChainUnknown -- exactly the failure a verifier
+	// proved by running ComputeEligible in a scratch copy. Persisting the
+	// unknown-marker link instead means a verdict recorded during this
+	// exact failure genuinely CANNOT satisfy the auto-approval eligibility
+	// engine until a fresh review resolves this call successfully -- never
+	// a reason to refuse creating the review turn itself, only to keep the
+	// resulting verdict's own eligibility honestly unresolved.
 	var liveAncestorBaseSHA string
 	if stack != nil && stack.Position > 1 && stack.UltimateBaseRef != "" {
 		ancestorCtx, ancestorCancel := context.WithTimeout(ctx, timeouts.GitHubResolveBaseBranchSHATimeout)
 		resolvedSHA, _, ancestorErr := fetcher.ResolveBranchSHA(ancestorCtx, ports.ResolveBranchSHASpec{Owner: owner, Repo: repo, Branch: stack.UltimateBaseRef, Token: token})
 		ancestorCancel()
 		if ancestorErr != nil {
-			logger.Warn("reviewcontext: resolve stack's own ultimate base branch live tip failed, review turn's persisted ancestor chain will be empty (context reads as unknown, never a stale match)",
+			logger.Warn("reviewcontext: resolve stack's own ultimate base branch live tip failed, review turn's persisted ancestor chain will carry an unresolved (empty-sha) link, failing closed via autoapproval.ReasonAncestorChainUnknown rather than reading as no chain at all",
 				"error", ancestorErr, "owner", owner, "repo", repo, "pr_number", number, "ultimate_base_ref", stack.UltimateBaseRef)
 		} else {
 			liveAncestorBaseSHA = resolvedSHA

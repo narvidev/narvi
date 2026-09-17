@@ -21,9 +21,11 @@
 //     (§21.2: "review: needs-human ... forces a specific PR out of
 //     auto-approval regardless of what the criteria say"), never merely
 //     one AND-condition among equals.
+//
 //  2. VerdictAssessed (§21.1's amendment) -- must be true. A PR with no
 //     posted verdict at all has no risk level to reason about; checked
 //     before this function ever reads in.Verdict for anything.
+//
 //  3. VerdictHeadSHA != CurrentHeadSHA (the stale-verdict guard) -- "a
 //     verdict computed against an earlier commit is stale by definition
 //     and must never itself satisfy eligibility, no matter how low-risk
@@ -31,6 +33,7 @@
 //     Shippable check below: a stale verdict's own Shippable value is
 //     never even a fact worth reasoning about, since it was never
 //     computed against the code actually under consideration.
+//
 //  4. The verdict's own recorded CONTEXT matches the PR's current one
 //     (§21.1's amendment, stated because head equality alone is NOT
 //     sufficient): VerdictBaseRef == "" means no context was ever
@@ -43,29 +46,51 @@
 //     head sha; otherwise
 //     VerdictBaseRef must equal CurrentBaseRef, VerdictAncestorChain must
 //     equal CurrentAncestorChain (order-sensitive), and
-//     VerdictPolicyVersion must equal CurrentPolicyVersion. VerdictBaseSHA/
-//     CurrentBaseSHA are the ONE exception, refined by D3 (second
-//     adversarial-review round): they must be EQUAL, UNLESS
-//     BaseAdvancedWithoutRewrite confirms the difference is a pure
-//     fast-forward (an ordinary, unrelated commit landing on the base
-//     branch, never a rewrite) -- see that field's own doc comment
-//     (eligibility.go) for why tolerating this is sound and why a base
-//     REF change still refuses unconditionally regardless. Any OTHER
-//     mismatch refuses -- this is what catches a PR retargeted onto a
-//     different base, or whose parent moved beneath it via an actual
-//     rewrite, that CurrentHeadSHA alone cannot see.
+//     VerdictPolicyVersion must equal CurrentPolicyVersion.
+//
+//     VerdictBaseSHA/CurrentBaseSHA and the ancestor chain's own per-link
+//     SHA are the exceptions, mirroring one another (D3, second
+//     adversarial-review round, for the base; round-11 finding A3 for the
+//     chain): they must be EQUAL, UNLESS BaseAdvancedWithoutRewrite (base)
+//     or AncestorChainAdvancedWithoutRewrite (chain) confirms the
+//     difference is a pure fast-forward (an ordinary, unrelated commit,
+//     never a rewrite) -- see either field's own doc comment
+//     (eligibility.go) for why tolerating this is sound and why a REF
+//     change (base or per-link) still refuses unconditionally regardless.
+//
+//     An ancestor-chain link whose SHA is empty, on EITHER side, is a
+//     THIRD, distinct outcome (round-11 finding A1): review.
+//     AncestorChainFromStack's own dedicated "could not be established"
+//     marker for a PR whose own stack position proves a link exists but
+//     whose live SHA resolution failed. Checked (via
+//     ancestorChainHasUnknownLink) BEFORE the equality comparison, on its
+//     own ReasonAncestorChainUnknown, distinct from BOTH "no context
+//     recorded" (VerdictBaseRef == "") and "recorded and it no longer
+//     matches" (ReasonAncestorChainChanged) -- exactly the same
+//     three-way distinction VerdictBaseSHA/CurrentBaseSHA's own empty-
+//     string check already draws for the immediate base, one link
+//     further out.
+//
+//     Any OTHER mismatch refuses -- this is what catches a PR retargeted
+//     onto a different base, or whose parent moved beneath it via an
+//     actual rewrite, that CurrentHeadSHA alone cannot see.
+//
 //  5. CIGreen -- must be true.
+//
 //  6. Verdict.Shippable == review.ShippableAuto.
+//
 //  7. EligibilityInput.ChangedFileCount <= cfg.MaxFilesChanged (diff
 //     size) -- GitHub's own authoritative changed-file scalar, never
 //     Verdict.FilesChanged, and (Phase 5 audit finding 2, fixed) never
 //     a possibly page-truncated len() of the fetched path listing
 //     either.
+//
 //  8. EligibilityInput.TouchedBlastRadiusKnown is true (Phase 5 audit
 //     findings 1+2, fixed) -- the sensitive-path facts check 9 below
 //     relies on must have actually been established from GitHub; a
 //     failed or page-truncated changed-files fetch refuses here rather
 //     than silently reading as "nothing sensitive touched".
+//
 //  9. No cfg.SensitiveTags member appears in EligibilityInput.
 //     TouchedBlastRadius (no sensitive path touched) -- never
 //     Verdict.BlastRadius.

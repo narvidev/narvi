@@ -468,6 +468,16 @@ type PRPerson struct {
 // domain-free, §4.3, so it defines its own copy rather than importing a
 // domain type; the app layer converts between the two at the one call
 // site that needs both, internal/app/decisioninbox).
+//
+// SHA is a CACHED value (round-11 finding E) -- githubapi's own
+// ancestorChainFromDetailStack (its one real producer, listopenprs.go)
+// decodes it straight off GitHub's per-PR stack object, with no live
+// resolution capability of its own, the SAME "cached, display/audit only"
+// shape ports.OpenPR.BaseSHA's own doc comment already documents one
+// layer up (finding F1). Every real ComputeEligible call site
+// (internal/app/decisioninbox's revalidateCore/computeRealEligibility)
+// reads ONLY Ref off this struct and re-resolves the SHA LIVE itself via
+// SourceControl.ResolveBranchSHA -- never this field.
 type PRAncestorLink struct {
 	Ref string
 	SHA string

@@ -19,7 +19,7 @@ WHERE rv.repo_full_name = $1 AND rv.pr_number = $2
     AND rv.created_at > COALESCE(
         (SELECT rs.live_egress_promoted_at FROM repo_settings rs WHERE rs.repo_full_name = $1),
         'infinity'::timestamptz)
-ORDER BY COALESCE(t.created_at, rv.created_at) DESC
+ORDER BY COALESCE(t.created_at, rv.created_at) DESC, rv.created_at DESC, rv.id DESC
 LIMIT 1
 `
 
@@ -31,8 +31,10 @@ type GetLatestNonShadowReviewVerdictParams struct {
 // §30.8's own customer-consequential sibling of GetLatestReviewVerdict
 // above: the SAME per-PR latest-verdict reduction -- including the
 // IDENTICAL attempt-ordering fix immediately above this query's own doc
-// comment (round-10 finding D), for the same reason: this query is
-// exactly as reachable by two in-flight attempts as its sibling is --
+// comment (round-10 finding D) and the IDENTICAL deterministic
+// tie-breaker (round-11 finding B) -- for the same reason: this query is
+// exactly as reachable by two in-flight attempts, and by two rows tied
+// on COALESCE(t.created_at, rv.created_at), as its sibling is --
 // excluding any verdict whose own suppressed_in_shadow stamp is true OR
 // that predates this repo's own live_egress_promoted_at fence (belt and
 // suspenders -- see migrations/000104_repo_settings_live_egress_promoted_at.up.sql's
@@ -94,7 +96,7 @@ const getLatestReviewVerdict = `-- name: GetLatestReviewVerdict :one
 SELECT rv.id, rv.repo_full_name, rv.pr_number, rv.head_sha, rv.risk_level, rv.premise, rv.blast_radius, rv.files_changed, rv.tests_coverage, rv.docs_drift, rv.proposed_shippable, rv.shippable, rv.session_id, rv.created_at, rv.digest_summary, rv.digest_arch_decisions, rv.digest_stack_risks, rv.digest_unverified_limits, rv.digest_description_adequacy, rv.digest_adequacy_explanation, rv.digest_proposed_body, rv.review_path, rv.counter_review, rv.fact_check, rv.fact_check_killed, rv.digest_contested_points, rv.suppressed_in_shadow, rv.arch_decision_tags, rv.arch_decision_roots, rv.knowledge_mode, rv.knowledge_influenced, rv.base_ref, rv.base_sha, rv.ancestor_chain, rv.policy_version, rv.attempt_id FROM review_verdicts rv
 LEFT JOIN turns t ON t.id = rv.attempt_id
 WHERE rv.repo_full_name = $1 AND rv.pr_number = $2
-ORDER BY COALESCE(t.created_at, rv.created_at) DESC
+ORDER BY COALESCE(t.created_at, rv.created_at) DESC, rv.created_at DESC, rv.id DESC
 LIMIT 1
 `
 
@@ -140,6 +142,34 @@ type GetLatestReviewVerdictParams struct {
 // below is the customer-consequential sibling this query is NOT: use
 // that one instead for anything that could arm a real, customer-visible
 // effect (§30.8: "never call-site checks").
+//
+// Round-11 finding B: the ORDER BY above had no tie-breaker at all --
+// two verdicts sharing the identical COALESCE(t.created_at,
+// rv.created_at) value (the common case being two attempts sharing ONE
+// producing turn, so t.created_at is literally the SAME value for both
+// rows) resolved arbitrarily, by whatever physical row order Postgres
+// happened to return them in -- not merely non-deterministic across
+// runs, but potentially DIFFERENT from what ListLatestAutoApprovedInRepo
+// below picks for the identical pair, since that query (before this fix)
+// ran a DIFFERENT reduction entirely. Two further keys make this fully
+// deterministic and, just as importantly, IDENTICAL to every other
+// per-PR "latest" reduction this table has (this file's own three:
+// GetLatestNonShadowReviewVerdict immediately below, and
+// ListLatestAutoApprovedInRepo's own inner DISTINCT ON, further down --
+// searched for; there is no fourth): rv.created_at DESC breaks a tie on
+// the coarser attempt-time key using the finer, always-populated
+// row-level post time (meaningful for two attempts that DO share a
+// producing turn, or for the pre-amendment rows where attempt_id is
+// NULL and COALESCE already fell through to rv.created_at, in which case
+// this second key is now redundant with the first but harmless); rv.id
+// DESC is the final, purely-mechanical tie-break for the residual case
+// of two rows sharing BOTH timestamps exactly (same producing turn,
+// same wall-clock instant) -- id is a random UUID
+// (migrations/000067_review_verdicts.up.sql), so this key carries no
+// temporal meaning of its own; it exists solely to make the pick
+// REPRODUCIBLE (the same query against the same data always resolves
+// the SAME winning row) rather than to express which row actually is
+// newer.
 func (q *Queries) GetLatestReviewVerdict(ctx context.Context, arg GetLatestReviewVerdictParams) (ReviewVerdict, error) {
 	row := q.db.QueryRow(ctx, getLatestReviewVerdict, arg.RepoFullName, arg.PrNumber)
 	var i ReviewVerdict
@@ -541,15 +571,16 @@ const listLatestAutoApprovedInRepo = `-- name: ListLatestAutoApprovedInRepo :man
 SELECT id, repo_full_name, pr_number, head_sha, risk_level, premise, blast_radius, files_changed, tests_coverage, docs_drift, proposed_shippable, shippable, session_id, created_at, digest_summary, digest_arch_decisions, digest_stack_risks, digest_unverified_limits, digest_description_adequacy, digest_adequacy_explanation, digest_proposed_body, review_path, counter_review, fact_check, fact_check_killed, digest_contested_points, suppressed_in_shadow, arch_decision_tags, arch_decision_roots, knowledge_mode, knowledge_influenced, base_ref, base_sha, ancestor_chain, policy_version, attempt_id FROM (
     SELECT DISTINCT ON (rv.repo_full_name, rv.pr_number) rv.id, rv.repo_full_name, rv.pr_number, rv.head_sha, rv.risk_level, rv.premise, rv.blast_radius, rv.files_changed, rv.tests_coverage, rv.docs_drift, rv.proposed_shippable, rv.shippable, rv.session_id, rv.created_at, rv.digest_summary, rv.digest_arch_decisions, rv.digest_stack_risks, rv.digest_unverified_limits, rv.digest_description_adequacy, rv.digest_adequacy_explanation, rv.digest_proposed_body, rv.review_path, rv.counter_review, rv.fact_check, rv.fact_check_killed, rv.digest_contested_points, rv.suppressed_in_shadow, rv.arch_decision_tags, rv.arch_decision_roots, rv.knowledge_mode, rv.knowledge_influenced, rv.base_ref, rv.base_sha, rv.ancestor_chain, rv.policy_version, rv.attempt_id
     FROM review_verdicts rv
+    LEFT JOIN turns t ON t.id = rv.attempt_id
     WHERE rv.repo_full_name = $1 AND rv.created_at > $2
         AND NOT rv.suppressed_in_shadow
         AND rv.created_at > COALESCE(
             (SELECT rs.live_egress_promoted_at FROM repo_settings rs WHERE rs.repo_full_name = $1),
             'infinity'::timestamptz)
-    ORDER BY rv.repo_full_name, rv.pr_number, rv.created_at DESC
+    ORDER BY rv.repo_full_name, rv.pr_number, COALESCE(t.created_at, rv.created_at) DESC, rv.created_at DESC, rv.id DESC
 ) latest
 WHERE shippable = 'auto'
-ORDER BY created_at ASC
+ORDER BY created_at ASC, id ASC
 LIMIT $3
 `
 
@@ -586,6 +617,25 @@ type ListLatestAutoApprovedInRepoParams struct {
 // join is scoped to the SAME repo_full_name this whole query is already
 // scoped to ($1), so it costs one extra indexed lookup, not a
 // correlated subquery per candidate row.
+//
+// Round-11 finding B: the inner DISTINCT ON below used to reduce
+// "latest" by rv.created_at (post time) ALONE -- a DIFFERENT reduction
+// than GetLatestReviewVerdict/GetLatestNonShadowReviewVerdict above,
+// which order by the PRODUCING ATTEMPT's own creation time (round-10
+// finding D). Two components deciding about the SAME pull request from
+// two DIFFERENT "latest" verdicts is exactly the failure this closes:
+// this query is what actually ARMS auto-merge (internal/app/automerge's
+// own discovery query), and it must agree, row for row, with whichever
+// verdict the decision inbox and the eligibility engine's own callers
+// (GetLatestReviewVerdict) would call "latest" for the identical PR, or
+// the two can disagree about which verdict is authoritative for the same
+// code. The fix: the IDENTICAL LEFT JOIN turns / COALESCE(t.created_at,
+// rv.created_at) ordering, with the IDENTICAL deterministic tie-breakers
+// (rv.created_at DESC, then rv.id DESC) -- see
+// GetLatestReviewVerdict's own doc comment for the full "why" of each.
+// DISTINCT ON's own requirement that its ORDER BY start with the
+// DISTINCT ON columns is unchanged: rv.repo_full_name, rv.pr_number
+// still lead.
 func (q *Queries) ListLatestAutoApprovedInRepo(ctx context.Context, arg ListLatestAutoApprovedInRepoParams) ([]ReviewVerdict, error) {
 	rows, err := q.db.Query(ctx, listLatestAutoApprovedInRepo, arg.RepoFullName, arg.CreatedAt, arg.Limit)
 	if err != nil {

@@ -68,11 +68,13 @@ func ListNonShadowRecordsSince(ctx context.Context, deps Deps, repoFullName stri
 // day one" discipline (§21.1) at a per-PR rather than per-repo scale.
 const maxHistoryRows = 200
 
-// GetLatestRecord fetches (repoFullName, prNumber)'s own most-recently-
-// posted verdict, converted to the pure domain shape -- ok=false (never an
-// error) when no verdict has ever been posted for this PR, mirroring
-// ReviewVerdictStore.GetLatest's own "pgx.ErrNoRows means no verdict yet,
-// never an error condition" contract.
+// GetLatestRecord fetches (repoFullName, prNumber)'s own LATEST verdict
+// (round-11 finding E: never "most-recently-posted" -- see GetLatest's
+// own doc comment, latest.go, for the actual ordering), converted to the
+// pure domain shape -- ok=false (never an error) when no verdict has ever
+// been posted for this PR, mirroring ReviewVerdictStore.GetLatest's own
+// "pgx.ErrNoRows means no verdict yet, never an error condition"
+// contract.
 func GetLatestRecord(ctx context.Context, deps Deps, repoFullName string, prNumber int32) (reviewverdict.Record, bool, error) {
 	row, err := deps.ReviewVerdicts.GetLatest(ctx, repoFullName, prNumber)
 	if err != nil {

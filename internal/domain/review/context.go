@@ -84,23 +84,51 @@ type AncestorLink struct {
 // A PR at the BOTTOM of its own stack (position <= 1) or with no stack at
 // all (stack == nil) has no ancestor beyond its own immediate base --
 // which PreFetchedContext's own BaseRef/BaseSHA (below) already carry --
-// so the chain is empty. A PR further up reports exactly one link: the
-// stack's own ultimate base, the one further-back fact a GitHub-native
-// stack actually exposes. liveUltimateBaseSHA == "" (the caller's own
-// live resolution failed, or was never attempted) degrades to NO chain
-// at all -- never a link with an empty SHA, which autoapproval.
-// ancestorChainEqual would otherwise treat as a REAL, comparable value
-// rather than the "could not be established" signal it actually is;
-// mirroring EligibilityInput.VerdictBaseSHA/CurrentBaseSHA's own
-// identical "an empty value must fail closed on its own dedicated
-// reason, never silently match another empty value" contract (finding
-// F2). A genuine N-deep producer (§39, unshipped) gets a longer chain
-// the day it exists to supply one: this function returns an ordered
-// SLICE, not a fixed 0-or-1 shape, so the comparison this feeds
-// (autoapproval.ComputeEligible) does not need to widen when trains
-// ship.
+// so the chain is empty (nil), a CONFIRMED fact: there is genuinely
+// nothing further back to record.
+//
+// A PR further up (stack.Position > 1) ALWAYS reports exactly one link --
+// the stack's own ultimate base, the one further-back fact a GitHub-
+// native stack actually exposes -- even when liveUltimateBaseSHA could
+// not be resolved (the caller's own live resolution failed, or was never
+// attempted) or stack.UltimateBaseRef itself is empty (a degraded stack
+// read). This is round-11 finding A1's own fix, and it inverts the
+// PREVIOUS version of this function's behavior on exactly this path: that
+// version degraded an unresolved SHA to NO chain at all -- the identical
+// nil this function returns for "there is genuinely nothing here" -- and
+// its own doc comment asserted this was done specifically so
+// autoapproval.ancestorChainEqual would not treat an empty SHA as "a
+// REAL, comparable value", mirroring finding F2's contract. A verifier
+// proved that assertion backwards by actually running ComputeEligible in
+// a scratch copy: nil-vs-nil (two confirmed-empty chains) correctly read
+// as eligible, but a verdict recorded with an UNRESOLVED chain (this
+// function's old nil) against a PR that had since gained a REAL,
+// different one read as ReasonAncestorChainChanged -- an ordinary "your
+// ancestry changed" reason, not "this could never be confirmed" -- and,
+// worse, a verdict recorded with an unresolved chain against a PR whose
+// own live read ALSO failed to resolve (both nil, for entirely unrelated
+// reasons) read as eligible=true, a silent match between two different
+// unknowns. F2's own contract -- "an empty value must fail closed on its
+// own dedicated reason, never silently match another empty value" -- is
+// exactly what this OLD behavior violated, not what it honored.
+//
+// The fix: report the fact this PR's own stack position already proves
+// (an ancestor link exists) with whatever is actually known about it,
+// including an HONEST EMPTY SHA when resolution failed -- a link with an
+// empty SHA is now this package's own dedicated "could not be
+// established" marker, checked by autoapproval.ComputeEligible (via its
+// own ancestorChainHasUnknownLink helper) BEFORE the equality comparison
+// ever runs, refusing on the DISTINCT ReasonAncestorChainUnknown rather
+// than the generic ReasonAncestorChainChanged or a silent pass -- the
+// SAME two-step discipline (empty-check first, dedicated reason, THEN
+// equality) VerdictBaseSHA/CurrentBaseSHA already established at the
+// immediate-base layer (finding F2). A genuine N-deep producer (§39,
+// unshipped) gets a longer chain the day it exists to supply one: this
+// function returns an ordered SLICE, not a fixed 0-or-1 shape, so the
+// comparison this feeds (autoapproval.ComputeEligible) does not need to
+// widen when trains ship.
 func AncestorChainFromStack(stack *StackContext, liveUltimateBaseSHA string) []AncestorLink {
-	if stack == nil || stack.Position <= 1 || stack.UltimateBaseRef == "" || liveUltimateBaseSHA == "" {
+	if stack == nil || stack.Position <= 1 {
 		return nil
 	}
 	return []AncestorLink{{Ref: stack.UltimateBaseRef, SHA: liveUltimateBaseSHA}}

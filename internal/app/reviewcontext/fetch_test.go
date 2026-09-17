@@ -37,6 +37,14 @@ type fakeFetcher struct {
 	prRepo   string
 	prNumber int32
 	prToken  string
+	// prDeadline/prDeadlineOK (finding D, round 11) capture ctx.Deadline()
+	// on the GetPullRequest call -- before these fields existed, this
+	// method took a bare `_ context.Context`, so no test in this file
+	// could observe whether Fetch actually bounds this call by
+	// GitHubGetPRTimeout at all, mirroring resolveBranchSHADeadline's own
+	// identical, pre-existing precedent below.
+	prDeadline   time.Time
+	prDeadlineOK bool
 
 	diff          string
 	diffTruncated bool
@@ -47,6 +55,11 @@ type fakeFetcher struct {
 	diffBase      string
 	diffHead      string
 	diffToken     string
+	// diffDeadline/diffDeadlineOK (finding D, round 11) mirror
+	// prDeadline/prDeadlineOK immediately above, for GetCompareDiff and
+	// GitHubPRDiffTimeout.
+	diffDeadline   time.Time
+	diffDeadlineOK bool
 
 	// resolveBranchSHA/resolveBranchSHAResolved/resolveBranchSHAErr
 	// (finding F1) back ResolveBranchSHA below -- the default (all zero
@@ -77,6 +90,21 @@ type fakeFetcher struct {
 	resolveBranchSHADeadline   time.Time
 	resolveBranchSHADeadlineOK bool
 
+	// resolveBranchSHAByBranch/resolveBranchSHABranchesQueried/
+	// resolveBranchSHADeadlinesByBranch (round-11 finding A2/finding D)
+	// let a test distinguish MULTIPLE ResolveBranchSHA calls this
+	// function can make in one Fetch (the immediate base, and -- for a
+	// stacked PR -- the stack's own ultimate base) from one another, by
+	// which BRANCH each call named -- resolveBranchSHA/
+	// resolveBranchSHADeadline above only ever capture the LAST call,
+	// which cannot tell two calls apart at all. A test that never
+	// populates resolveBranchSHAByBranch keeps every EXISTING assertion's
+	// own pre-fix behavior (the plain resolveBranchSHA field remains the
+	// fallback, ResolveBranchSHA's own doc comment below).
+	resolveBranchSHAByBranch          map[string]string
+	resolveBranchSHABranchesQueried   []string
+	resolveBranchSHADeadlinesByBranch map[string]time.Time
+
 	// callOrder records each method invoked, in order ("pr",
 	// "resolvebranchsha", "diff") -- asserted directly by
 	// TestFetch_Success_CallOrderIsPRThenResolveBranchSHAThenDiff to pin
@@ -89,24 +117,51 @@ type fakeFetcher struct {
 	callOrder []string
 }
 
-func (f *fakeFetcher) GetPullRequest(_ context.Context, owner, repo string, number int32, token string) (githubapi.PullRequest, error) {
+func (f *fakeFetcher) GetPullRequest(ctx context.Context, owner, repo string, number int32, token string) (githubapi.PullRequest, error) {
 	f.prCalls++
 	f.prOwner, f.prRepo, f.prNumber, f.prToken = owner, repo, number, token
+	f.prDeadline, f.prDeadlineOK = ctx.Deadline()
 	f.callOrder = append(f.callOrder, "pr")
 	return f.pr, f.prErr
 }
 
+// ResolveBranchSHA (finding D, round 11: honors ctx, mirroring
+// IsAncestor/ResolveBranchSHA's own established "capture the deadline
+// this fake actually received" convention in other packages' own fakes,
+// e.g. internal/app/decisioninbox's fakeDecisionInboxSourceControl) --
+// resolveBranchSHAByBranch (round-11 finding A2) additionally lets a test
+// configure a DISTINCT return value per queried branch, so a test can
+// pin not merely "some chain was reported" but "the reported value came
+// from resolving THIS SPECIFIC branch, not some other one this function
+// also happens to call" -- see TestFetch_NoKnownStack_DerivesFromPRStack
+// below for why a single, shared resolveBranchSHA value (this fake's
+// pre-existing, simpler field, still honored as the fallback whenever a
+// test never populates the map) could not distinguish that.
 func (f *fakeFetcher) ResolveBranchSHA(ctx context.Context, spec ports.ResolveBranchSHASpec) (string, string, error) {
 	f.resolveBranchSHACalls++
 	f.resolveBranchSHADeadline, f.resolveBranchSHADeadlineOK = ctx.Deadline()
 	f.resolveBranchSHAOwner, f.resolveBranchSHARepo, f.resolveBranchSHABranch, f.resolveBranchSHAToken = spec.Owner, spec.Repo, spec.Branch, spec.Token
+	f.resolveBranchSHABranchesQueried = append(f.resolveBranchSHABranchesQueried, spec.Branch)
+	if f.resolveBranchSHADeadlinesByBranch == nil {
+		f.resolveBranchSHADeadlinesByBranch = make(map[string]time.Time)
+	}
+	if d, ok := ctx.Deadline(); ok {
+		f.resolveBranchSHADeadlinesByBranch[spec.Branch] = d
+	}
 	f.callOrder = append(f.callOrder, "resolvebranchsha")
-	return f.resolveBranchSHA, f.resolveBranchSHAResolved, f.resolveBranchSHAErr
+	if f.resolveBranchSHAErr != nil {
+		return "", "", f.resolveBranchSHAErr
+	}
+	if sha, ok := f.resolveBranchSHAByBranch[spec.Branch]; ok {
+		return sha, spec.Branch, nil
+	}
+	return f.resolveBranchSHA, f.resolveBranchSHAResolved, nil
 }
 
-func (f *fakeFetcher) GetCompareDiff(_ context.Context, owner, repo, base, head, token string) (string, bool, error) {
+func (f *fakeFetcher) GetCompareDiff(ctx context.Context, owner, repo, base, head, token string) (string, bool, error) {
 	f.diffCalls++
 	f.diffOwner, f.diffRepo, f.diffBase, f.diffHead, f.diffToken = owner, repo, base, head, token
+	f.diffDeadline, f.diffDeadlineOK = ctx.Deadline()
 	f.callOrder = append(f.callOrder, "diff")
 	return f.diff, f.diffTruncated, f.diffErr
 }
@@ -294,6 +349,114 @@ func TestFetch_ResolveBranchSHA_BoundedByGitHubResolveBaseBranchSHATimeout(t *te
 	}
 }
 
+// TestFetch_AncestorResolveBranchSHA_BoundedByGitHubResolveBaseBranchSHATimeout
+// (finding D, round 11) is the ANCESTOR-resolve call's own regression
+// test, distinct from TestFetch_ResolveBranchSHA_BoundedByGitHubResolveBaseBranchSHATimeout
+// immediately above (which pins the IMMEDIATE base's own resolve call):
+// before resolveBranchSHADeadlinesByBranch existed, this fake only ever
+// captured the deadline of the LAST ResolveBranchSHA call it received --
+// with a stacked PR (this test's own Position-2 fixture), that is the
+// ANCESTOR call, so the immediate-base test above already incidentally
+// exercised this timeout bind for a non-stacked PR only. This test pins
+// it directly, keyed by the SPECIFIC branch the ancestor resolve queries
+// (the stack's own ultimate base ref, "main" -- deliberately a different
+// branch than the immediate base, "develop", mirroring
+// TestFetch_NoKnownStack_DerivesFromPRStack's own identical
+// distinguishing fixture, round-11 finding A2) so a mutation that dropped
+// JUST the ancestor call's own context.WithTimeout wrap (fetch.go's own
+// `ancestorCtx, ancestorCancel := context.WithTimeout(ctx,
+// timeouts.GitHubResolveBaseBranchSHATimeout)` line) in favor of the bare
+// ctx cannot hide behind the immediate base's own, separately-bound call
+// still succeeding.
+func TestFetch_AncestorResolveBranchSHA_BoundedByGitHubResolveBaseBranchSHATimeout(t *testing.T) {
+	t.Parallel()
+
+	fetcher := &fakeFetcher{
+		pr: githubapi.PullRequest{
+			HeadSHA: "sha", BaseRef: "develop",
+			Stack: &githubapi.StackInfo{Position: 2, Size: 3, BaseRef: "main", BaseSHA: "deadbeef"},
+		},
+		diff: "d",
+		resolveBranchSHAByBranch: map[string]string{
+			"develop": "sha-develop-live",
+			"main":    "sha-main-live",
+		},
+	}
+	timeouts := platform.DefaultTimeouts()
+
+	before := time.Now()
+	reviewcontext.Fetch(context.Background(), discardLogger(), fetcher, timeouts, "acme", "widgets", 42, "gho_bottoken", nil)
+	after := time.Now()
+
+	ancestorDeadline, ancestorDeadlineOK := fetcher.resolveBranchSHADeadlinesByBranch["main"]
+	if !ancestorDeadlineOK {
+		t.Fatal("the ancestor resolve's own ctx (branch \"main\") carried no deadline at all, want one bounded by GitHubResolveBaseBranchSHATimeout")
+	}
+	wantMin := before.Add(timeouts.GitHubResolveBaseBranchSHATimeout)
+	wantMax := after.Add(timeouts.GitHubResolveBaseBranchSHATimeout)
+	if ancestorDeadline.Before(wantMin) || ancestorDeadline.After(wantMax) {
+		t.Errorf("ancestor resolve's own ctx deadline = %v, want it within [%v, %v] (bounded by GitHubResolveBaseBranchSHATimeout = %v)",
+			ancestorDeadline, wantMin, wantMax, timeouts.GitHubResolveBaseBranchSHATimeout)
+	}
+}
+
+// TestFetch_GetPullRequest_BoundedByGitHubGetPRTimeout (finding D, round
+// 11) pins fetch.go's own `prCtx, cancel := context.WithTimeout(ctx,
+// timeouts.GitHubGetPRTimeout)` bind -- before fakeFetcher.GetPullRequest
+// captured ctx.Deadline() at all (it previously took a bare `_
+// context.Context`), no test in this file could observe whether this
+// bind exists, mirroring the identical hole finding A5 (round 10) closed
+// for the base-branch resolve two rounds ago -- the same shape that
+// already hid a deletable bind before. Mutation-test target: replacing
+// this bind with the bare, unbounded ctx Fetch was itself handed must
+// turn this test's own deadline-bounds assertion from a pass into a
+// failure.
+func TestFetch_GetPullRequest_BoundedByGitHubGetPRTimeout(t *testing.T) {
+	t.Parallel()
+
+	fetcher := &fakeFetcher{pr: githubapi.PullRequest{HeadSHA: "sha", BaseRef: "main"}, diff: "d"}
+	timeouts := platform.DefaultTimeouts()
+
+	before := time.Now()
+	reviewcontext.Fetch(context.Background(), discardLogger(), fetcher, timeouts, "acme", "widgets", 42, "gho_bottoken", nil)
+	after := time.Now()
+
+	if !fetcher.prDeadlineOK {
+		t.Fatal("GetPullRequest's own ctx carried no deadline at all, want one bounded by GitHubGetPRTimeout")
+	}
+	wantMin := before.Add(timeouts.GitHubGetPRTimeout)
+	wantMax := after.Add(timeouts.GitHubGetPRTimeout)
+	if fetcher.prDeadline.Before(wantMin) || fetcher.prDeadline.After(wantMax) {
+		t.Errorf("GetPullRequest's own ctx deadline = %v, want it within [%v, %v] (bounded by GitHubGetPRTimeout = %v)",
+			fetcher.prDeadline, wantMin, wantMax, timeouts.GitHubGetPRTimeout)
+	}
+}
+
+// TestFetch_GetCompareDiff_BoundedByGitHubPRDiffTimeout (finding D, round
+// 11) mirrors TestFetch_GetPullRequest_BoundedByGitHubGetPRTimeout
+// immediately above, for fetch.go's own `diffCtx, cancel :=
+// context.WithTimeout(ctx, timeouts.GitHubPRDiffTimeout)` bind.
+func TestFetch_GetCompareDiff_BoundedByGitHubPRDiffTimeout(t *testing.T) {
+	t.Parallel()
+
+	fetcher := &fakeFetcher{pr: githubapi.PullRequest{HeadSHA: "sha", BaseRef: "main"}, diff: "d"}
+	timeouts := platform.DefaultTimeouts()
+
+	before := time.Now()
+	reviewcontext.Fetch(context.Background(), discardLogger(), fetcher, timeouts, "acme", "widgets", 42, "gho_bottoken", nil)
+	after := time.Now()
+
+	if !fetcher.diffDeadlineOK {
+		t.Fatal("GetCompareDiff's own ctx carried no deadline at all, want one bounded by GitHubPRDiffTimeout")
+	}
+	wantMin := before.Add(timeouts.GitHubPRDiffTimeout)
+	wantMax := after.Add(timeouts.GitHubPRDiffTimeout)
+	if fetcher.diffDeadline.Before(wantMin) || fetcher.diffDeadline.After(wantMax) {
+		t.Errorf("GetCompareDiff's own ctx deadline = %v, want it within [%v, %v] (bounded by GitHubPRDiffTimeout = %v)",
+			fetcher.diffDeadline, wantMin, wantMax, timeouts.GitHubPRDiffTimeout)
+	}
+}
+
 // TestFetch_GetPullRequestAlwaysCalled_EvenWithKnownStack is the
 // deliberate-tradeoff regression test named in fetch.go's own doc
 // comment: UNLIKE the previous version of this function, a caller-
@@ -342,24 +505,35 @@ func TestFetch_KnownStackPreferredOverPRStack(t *testing.T) {
 func TestFetch_NoKnownStack_DerivesFromPRStack(t *testing.T) {
 	t.Parallel()
 
+	// The immediate base ("develop") and the stack's own ultimate base
+	// ("main") are DELIBERATELY different branches here (round-11 finding
+	// A2 -- the previous version of this fixture used "main" for BOTH,
+	// so a single shared resolveBranchSHA fake value answered both calls
+	// identically and could never distinguish "the ancestor chain's SHA
+	// came from resolving the ultimate base ref" from "it came from
+	// resolving the immediate base ref instead" -- a mutation swapping
+	// fetch.go's own `liveAncestorBaseSHA` argument for `baseSHA` in the
+	// `AncestorChain: review.AncestorChainFromStack(stack,
+	// liveAncestorBaseSHA)` line left this test passing. Mutation-test
+	// target: making that exact swap in fetch.go must now turn
+	// got.AncestorChain's own assertion below from a pass into a failure,
+	// since baseSHA ("sha-develop-live") and liveAncestorBaseSHA
+	// ("sha-main-live") are now provably different values.
 	fetcher := &fakeFetcher{
 		pr: githubapi.PullRequest{
-			HeadSHA: "sha", BaseRef: "main",
+			HeadSHA: "sha", BaseRef: "develop",
 			Stack: &githubapi.StackInfo{Position: 2, Size: 3, BaseRef: "main", BaseSHA: "deadbeef"},
 		},
 		diff: "d",
-		// resolveBranchSHA (round-10 finding B): fetch.go now live-
-		// resolves the stack's own ultimate base ref via the SAME
-		// ResolveBranchSHA call already used for the immediate base --
-		// never stack.BaseSHA ("deadbeef" above, GitHub's own CACHED
-		// per-PR field, the same shape finding F1 already proved
-		// stale-by-design for the immediate base). This fake returns the
-		// SAME configured value for every branch queried, so this also
-		// becomes got.BaseSHA -- irrelevant to this test, which asserts
-		// neither BaseSHA nor the resolved branch argument, only that
-		// AncestorChain's own reported SHA is THIS value, never
-		// "deadbeef".
-		resolveBranchSHA: "sha-main-live",
+		// resolveBranchSHAByBranch (round-11 finding A2): a DISTINCT
+		// resolved sha per queried branch -- never stack.BaseSHA
+		// ("deadbeef" above, GitHub's own CACHED per-PR field, the same
+		// shape finding F1 already proved stale-by-design for the
+		// immediate base).
+		resolveBranchSHAByBranch: map[string]string{
+			"develop": "sha-develop-live",
+			"main":    "sha-main-live",
+		},
 	}
 
 	got := reviewcontext.Fetch(context.Background(), discardLogger(), fetcher, platform.DefaultTimeouts(), "acme", "widgets", 42, "gho_bottoken", nil)
@@ -372,6 +546,13 @@ func TestFetch_NoKnownStack_DerivesFromPRStack(t *testing.T) {
 		t.Errorf("Stack = %+v, want %+v", *got.Stack, want)
 	}
 
+	// THE decisive A2 assertion, now provably distinguishable from
+	// got.BaseSHA below: got.AncestorChain's own SHA must be
+	// "sha-main-live" -- the resolution of the STACK's own ultimate base
+	// ref ("main") -- never "sha-develop-live" (the immediate base's own
+	// resolution) and never "deadbeef" (stack.BaseSHA, GitHub's own
+	// cached snapshot).
+	//
 	// Round-10 finding A2: fetch.go's own `AncestorChain:
 	// review.AncestorChainFromStack(stack, liveAncestorBaseSHA)` line
 	// (§21.1's amendment) was independently deletable -- nothing in this
@@ -381,15 +562,22 @@ func TestFetch_NoKnownStack_DerivesFromPRStack(t *testing.T) {
 	// Mutation-test target: replacing that line with `AncestorChain:
 	// nil,` in fetch.go must turn this assertion from a pass into a
 	// failure.
-	//
-	// Round-10 finding B: the reported SHA is "sha-main-live" (this
-	// fixture's own resolveBranchSHA, above), never "deadbeef"
-	// (stack.BaseSHA, GitHub's own cached snapshot) -- proving fetch.go
-	// actually live-resolves the ancestor's own SHA rather than
-	// forwarding the cached one verbatim.
 	wantChain := []review.AncestorLink{{Ref: "main", SHA: "sha-main-live"}}
 	if len(got.AncestorChain) != len(wantChain) || (len(wantChain) > 0 && got.AncestorChain[0] != wantChain[0]) {
 		t.Errorf("AncestorChain = %+v, want %+v", got.AncestorChain, wantChain)
+	}
+
+	// THE decisive "which branch" assertion (round-11 finding A2, LOW
+	// half): got.BaseSHA -- the immediate base's own resolution -- must be
+	// "sha-develop-live", proving the base resolve queried "develop", not
+	// "main". Together with the assertion immediately above, this pins
+	// BOTH which branch each of the two ResolveBranchSHA calls named AND
+	// which resolved value each fed into which output field -- a
+	// mutation that swapped the two calls' own branch arguments (asking
+	// "main" for the base and "develop" for the ancestor) would flip
+	// BOTH assertions simultaneously and be caught by either one alone.
+	if got.BaseSHA != "sha-develop-live" {
+		t.Errorf("BaseSHA = %q, want %q (the immediate base's own resolution of branch %q)", got.BaseSHA, "sha-develop-live", "develop")
 	}
 }
 

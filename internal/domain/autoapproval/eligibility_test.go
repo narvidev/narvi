@@ -264,6 +264,100 @@ func TestComputeEligible(t *testing.T) {
 			wantEligible: false,
 			wantReason:   autoapproval.ReasonAncestorChainChanged,
 		},
+		// --- round-11 finding A1: an unknown link (empty SHA) on either
+		// side must be refused on its OWN reason (ReasonAncestorChainUnknown),
+		// never read as "no ancestor chain to compare" -- which would
+		// otherwise trivially match a genuinely-empty chain on the other
+		// side. This is the exact scenario a verifier settled by running
+		// ComputeEligible in a scratch copy: {main,""} (an unresolved
+		// link, this package's own "could not be established" marker) vs
+		// nil (a confirmed-empty current chain) used to read as
+		// ReasonAncestorChainChanged -- an ordinary "your ancestry
+		// changed" answer -- when the honest answer is "this was never
+		// confirmed at all". ---
+		{
+			// THE DECISIVE A1 CASE. Mutation-test target: deleting the
+			// `ancestorChainHasUnknownLink(in.VerdictAncestorChain) ||
+			// ancestorChainHasUnknownLink(in.CurrentAncestorChain)` guard
+			// in eligibility.go turns this case's own outcome from
+			// refused-as-unknown into refused-as-changed (still
+			// ineligible, since the chain LENGTHS still differ -- 1 vs 0
+			// -- but on the wrong, less honest reason, silently losing the
+			// distinction this finding exists to preserve).
+			name:         "a verdict recorded with an unresolved ancestor link (empty sha) against a PR reporting no ancestor at all is UNKNOWN, never a length-mismatch 'changed'",
+			in:           withVerdictAncestorChain(cleanInput(), []review.AncestorLink{{Ref: "main", SHA: ""}}),
+			cfg:          cfg,
+			wantEligible: false,
+			wantReason:   autoapproval.ReasonAncestorChainUnknown,
+		},
+		{
+			name:         "a live ancestor-chain read that could not be resolved (empty sha) against a verdict recording no ancestor at all is UNKNOWN, never a length-mismatch 'changed'",
+			in:           withCurrentAncestorChain(cleanInput(), []review.AncestorLink{{Ref: "main", SHA: ""}}),
+			cfg:          cfg,
+			wantEligible: false,
+			wantReason:   autoapproval.ReasonAncestorChainUnknown,
+		},
+		{
+			// Two different unknowns must never silently match each
+			// other -- the identical "two unknowns are not the same
+			// known fact" discipline finding F2 already established for
+			// VerdictBaseSHA/CurrentBaseSHA, one level further out.
+			name: "an unresolved ancestor link on BOTH sides never silently matches -- two unknowns are not the same known fact",
+			in: withCurrentAncestorChain(
+				withVerdictAncestorChain(cleanInput(), []review.AncestorLink{{Ref: "main", SHA: ""}}),
+				[]review.AncestorLink{{Ref: "main", SHA: ""}},
+			),
+			cfg:          cfg,
+			wantEligible: false,
+			wantReason:   autoapproval.ReasonAncestorChainUnknown,
+		},
+		// --- round-11 finding A3: the SAME fast-forward tolerance the
+		// immediate base has had since round 4's D3, one level further
+		// out -- an ancestor link whose ref is unchanged but whose sha
+		// advanced must NOT permanently disqualify a verdict when the
+		// caller has POSITIVELY CONFIRMED (AncestorChainAdvancedWithoutRewrite)
+		// it was an ordinary, unrelated fast-forward. ---
+		{
+			name: "an ancestor link whose sha moved but is CONFIRMED a pure fast-forward keeps eligibility",
+			in: withAncestorChainAdvancedWithoutRewrite(
+				withCurrentAncestorChain(
+					withVerdictAncestorChain(cleanInput(), []review.AncestorLink{{Ref: "main", SHA: "stack-base-old"}}),
+					[]review.AncestorLink{{Ref: "main", SHA: "stack-base-new"}},
+				),
+				true,
+			),
+			cfg:          cfg,
+			wantEligible: true,
+			wantReason:   autoapproval.ReasonNone,
+		},
+		{
+			name: "an ancestor link whose sha moved WITHOUT confirmation still loses eligibility",
+			in: withCurrentAncestorChain(
+				withVerdictAncestorChain(cleanInput(), []review.AncestorLink{{Ref: "main", SHA: "stack-base-old"}}),
+				[]review.AncestorLink{{Ref: "main", SHA: "stack-base-new"}},
+			),
+			cfg:          cfg,
+			wantEligible: false,
+			wantReason:   autoapproval.ReasonAncestorChainChanged,
+		},
+		{
+			// A REF change (a genuine stack restructure) must refuse
+			// UNCONDITIONALLY -- confirming the SHA relationship says
+			// nothing about a DIFFERENT branch, mirroring
+			// BaseAdvancedWithoutRewrite's own identical "never a blanket
+			// trust" contract.
+			name: "an ancestor link whose REF changed loses eligibility even when AncestorChainAdvancedWithoutRewrite is (incorrectly, or irrelevantly) set",
+			in: withAncestorChainAdvancedWithoutRewrite(
+				withCurrentAncestorChain(
+					withVerdictAncestorChain(cleanInput(), []review.AncestorLink{{Ref: "main", SHA: "stack-base-old"}}),
+					[]review.AncestorLink{{Ref: "other", SHA: "stack-base-new"}},
+				),
+				true,
+			),
+			cfg:          cfg,
+			wantEligible: false,
+			wantReason:   autoapproval.ReasonAncestorChainChanged,
+		},
 		{
 			name:         "a verdict recorded under an earlier eligibility policy version loses eligibility",
 			in:           withVerdictPolicyVersion(cleanInput(), autoapproval.CurrentPolicyVersion-1),
@@ -650,5 +744,16 @@ func withCurrentAncestorChain(in autoapproval.EligibilityInput, chain []review.A
 }
 func withVerdictPolicyVersion(in autoapproval.EligibilityInput, v int) autoapproval.EligibilityInput {
 	in.VerdictPolicyVersion = v
+	return in
+}
+
+// withAncestorChainAdvancedWithoutRewrite (round-11 finding A3) sets
+// EligibilityInput.AncestorChainAdvancedWithoutRewrite -- mirrors
+// withBaseAdvancedWithoutRewrite's own identical shape one level further
+// out; see that field's own doc comment (eligibility.go) for what it
+// confirms and why the zero value (false) must remain the
+// fail-conservative default.
+func withAncestorChainAdvancedWithoutRewrite(in autoapproval.EligibilityInput, confirmed bool) autoapproval.EligibilityInput {
+	in.AncestorChainAdvancedWithoutRewrite = confirmed
 	return in
 }
