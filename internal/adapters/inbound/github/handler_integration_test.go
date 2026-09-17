@@ -33,6 +33,8 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/domain/autoapproval"
+	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -345,20 +347,40 @@ type fakeReviewContextFetcher struct {
 	diffBase  string
 	diffHead  string
 	diffToken string
+
+	// resolveBranchSHA (round-10 finding A1) is this fake's own
+	// configurable live-base-resolution result -- see ResolveBranchSHA's
+	// own doc comment immediately below for why this field existing (and
+	// tests actually setting it to a non-empty value) matters: before
+	// this field existed, ResolveBranchSHA returned "" UNCONDITIONALLY,
+	// so review.PreFetchedContext.BaseSHA (and, downstream,
+	// turns.review_verdict_context.baseSha) was ALWAYS empty in every
+	// test in this file, regardless of what the real fix does -- an
+	// assertion against that column would have been checking a constant,
+	// never proving the wiring the way diffBase/diffHead already do for
+	// HeadSHA. Mirrors internal/app/reviewcontext/fetch_test.go's own
+	// fakeFetcher.resolveBranchSHA field precedent exactly.
+	resolveBranchSHA string
 }
 
 func (f *fakeReviewContextFetcher) GetPullRequest(_ context.Context, _, _ string, _ int32, _ string) (githubapi.PullRequest, error) {
 	return f.pr, f.prErr
 }
 
-// ResolveBranchSHA (finding F1 (§21.1's amendment)) reports no live resolution by
-// default (the zero value "" -- no field here configures a different
-// result) -- reviewcontext.Fetch treats that identically to "resolution
-// unavailable" and falls back to pinning the diff fetch on pr.BaseRef,
-// exactly this fake's own pre-existing behavior, so every EXISTING
-// assertion against diffBase in this file keeps passing unchanged.
+// ResolveBranchSHA (finding F1 (§21.1's amendment)) reports resolveBranchSHA
+// above -- the zero value "" (no test configures a different result) is
+// STILL a legitimate, distinct scenario (reviewcontext.Fetch treats it
+// identically to "resolution unavailable" and falls back to pinning the
+// diff fetch on pr.BaseRef), so every EXISTING assertion against diffBase
+// in this file that never sets this field keeps passing unchanged. A test
+// that DOES set it (round-10 finding A1's own fix) gets a genuine,
+// non-empty live-resolved base sha threaded all the way through to
+// turns.review_verdict_context -- see
+// TestGitHubIntegration_InlineDiffAndStackPreFetched_FoldedIntoTurnPrompt's
+// own new assertion below, which would previously have passed against an
+// always-empty baseSha no matter what CreateOrJoin actually forwarded.
 func (f *fakeReviewContextFetcher) ResolveBranchSHA(_ context.Context, spec ports.ResolveBranchSHASpec) (string, string, error) {
-	return "", spec.Branch, nil
+	return f.resolveBranchSHA, spec.Branch, nil
 }
 
 func (f *fakeReviewContextFetcher) GetCompareDiff(_ context.Context, owner, repo, base, head, token string) (string, bool, error) {
@@ -708,6 +730,14 @@ func TestGitHubIntegration_InlineDiffAndStackPreFetched_FoldedIntoTurnPrompt(t *
 			Stack:   &githubapi.StackInfo{Position: 1, Size: 2, BaseRef: "main", BaseSHA: "cafebabe"},
 		},
 		diff: "diff --git a/x b/x\n+hello\n",
+		// resolveBranchSHA (round-10 finding A1): a real, non-empty live
+		// base resolution, so review_verdict_context's own baseSha
+		// column (asserted below, on BOTH the WINNER and REUSE turns)
+		// proves something -- fakeReviewContextFetcher's own zero value
+		// would otherwise make that assertion pass against an
+		// unconditionally empty string regardless of what CreateOrJoin
+		// actually forwards.
+		resolveBranchSHA: "resolved-base-sha",
 	}
 	rig := newTestRig(t, func(cfg *githubingress.Config) {
 		cfg.PullRequests = fetcher
@@ -742,15 +772,17 @@ func TestGitHubIntegration_InlineDiffAndStackPreFetched_FoldedIntoTurnPrompt(t *
 	// Audit fix (test-coverage finding): prove reviewcontext.Fetch's own
 	// GetCompareDiff call was actually made with THIS mention's own
 	// owner/repo/token AND -- the fix's own core property -- pinned to
-	// EXACTLY pr.BaseRef/
+	// EXACTLY the LIVE-resolved base sha (finding F1: fetcher.
+	// resolveBranchSHA, "resolved-base-sha", above -- never pr.BaseRef,
+	// "main", the branch name GitHub would otherwise re-resolve itself)/
 	// pr.HeadSHA (never some other, independently-suppliable value).
 	// owner ("acme") and repo ("prefetch-repo") are deliberately
 	// distinguishable strings, so a swapped-argument regression at either
 	// of fetch.go's own call sites, or at this handler's own
 	// reposource.SplitFullName + Fetch call, would fail this assertion.
-	if fetcher.diffOwner != "acme" || fetcher.diffRepo != "prefetch-repo" || fetcher.diffBase != "main" || fetcher.diffHead != "resolved-head-sha" || fetcher.diffToken != "test-bot-token" {
+	if fetcher.diffOwner != "acme" || fetcher.diffRepo != "prefetch-repo" || fetcher.diffBase != "resolved-base-sha" || fetcher.diffHead != "resolved-head-sha" || fetcher.diffToken != "test-bot-token" {
 		t.Errorf("GetCompareDiff args = (%q, %q, base=%q, head=%q, %q), want (%q, %q, base=%q, head=%q, %q)",
-			fetcher.diffOwner, fetcher.diffRepo, fetcher.diffBase, fetcher.diffHead, fetcher.diffToken, "acme", "prefetch-repo", "main", "resolved-head-sha", "test-bot-token")
+			fetcher.diffOwner, fetcher.diffRepo, fetcher.diffBase, fetcher.diffHead, fetcher.diffToken, "acme", "prefetch-repo", "resolved-base-sha", "resolved-head-sha", "test-bot-token")
 	}
 
 	// the turn's own persisted review_head_sha
@@ -768,6 +800,65 @@ func TestGitHubIntegration_InlineDiffAndStackPreFetched_FoldedIntoTurnPrompt(t *
 		}
 		t.Errorf("turns.review_head_sha = %s, want %q", got, "resolved-head-sha")
 	}
+
+	// Round-10 finding A1: handler.go marshals reviewVerdictContextJSON
+	// once and forwards it through coalescer.CreateOrJoin into BOTH the
+	// WINNER branch (coalesce.go's own CreateSessionOnTx call, exercised
+	// by the mention above -- this is this PR's first-ever mention, so it
+	// takes the WINNER path) and the REUSE branch (coalesce.go's own
+	// CreateTurnForBot call) -- proven below by a SECOND mention on the
+	// SAME PR. Before this fix, a mutation zeroing
+	// reviewVerdictContextJSON at the top of CreateOrJoin killed BOTH
+	// branches at once with the rest of this package's own suite still
+	// green (round-10 finding A1) -- review_head_sha's own sibling
+	// assertion immediately above did not catch it because head_sha
+	// travels through a SEPARATE parameter, reviewHeadSHA, never through
+	// reviewVerdictContextJSON.
+	assertTurnReviewVerdictContext := func(t *testing.T, label, turnID string) {
+		t.Helper()
+		var raw []byte
+		if err := rig.pool.QueryRow(ctx, `SELECT review_verdict_context FROM turns WHERE id = $1`, turnID).Scan(&raw); err != nil {
+			t.Fatalf("%s: query turn review_verdict_context: %v", label, err)
+		}
+		if len(raw) == 0 {
+			t.Fatalf("%s: turns.review_verdict_context is NULL/empty, want a real, forwarded context", label)
+		}
+		var got reviewverdict.Context
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatalf("%s: unmarshal turns.review_verdict_context: %v (raw = %s)", label, err, raw)
+		}
+		if got.BaseRef != "main" {
+			t.Errorf("%s: review_verdict_context.baseRef = %q, want %q", label, got.BaseRef, "main")
+		}
+		if got.BaseSHA != "resolved-base-sha" {
+			t.Errorf("%s: review_verdict_context.baseSha = %q, want %q", label, got.BaseSHA, "resolved-base-sha")
+		}
+		if got.PolicyVersion != autoapproval.CurrentPolicyVersion {
+			t.Errorf("%s: review_verdict_context.policyVersion = %d, want %d", label, got.PolicyVersion, autoapproval.CurrentPolicyVersion)
+		}
+	}
+
+	var winnerTurnID string
+	if err := rig.pool.QueryRow(ctx, `SELECT id::text FROM turns WHERE session_id = (SELECT id FROM sessions WHERE spawn_source = 'github' ORDER BY created_at DESC LIMIT 1) ORDER BY created_at ASC LIMIT 1`).Scan(&winnerTurnID); err != nil {
+		t.Fatalf("query winner turn id: %v", err)
+	}
+	assertTurnReviewVerdictContext(t, "winner branch (coalesce.go's own CreateSessionOnTx)", winnerTurnID)
+
+	// A second, ordinary @mention on the SAME PR -- coalesce.go's own
+	// REUSE branch (CreateTurnForBot), never a second session.
+	secondBody := issueCommentBodyWithCommenter("acme/prefetch-repo", "prefetch-repo", "https://github.com/acme/prefetch-repo.git", 909, "prefetch-check-again", commenterID, "prefetch-user")
+	secondStatus := postWebhook(t, rig, secondBody, "delivery-prefetch-2")
+	if secondStatus != http.StatusOK {
+		t.Fatalf("second delivery status = %d, want %d", secondStatus, http.StatusOK)
+	}
+	var reuseTurnID string
+	if err := rig.pool.QueryRow(ctx, `SELECT id::text FROM turns WHERE session_id = (SELECT id FROM sessions WHERE spawn_source = 'github' ORDER BY created_at DESC LIMIT 1) ORDER BY created_at DESC LIMIT 1`).Scan(&reuseTurnID); err != nil {
+		t.Fatalf("query reuse turn id: %v", err)
+	}
+	if reuseTurnID == winnerTurnID {
+		t.Fatal("second mention did not create a new turn -- test setup is broken, this assertion would vacuously pass")
+	}
+	assertTurnReviewVerdictContext(t, "reuse branch (coalesce.go's own CreateTurnForBot)", reuseTurnID)
 }
 
 // TestGitHubIntegration_FullHTTPFlow_CreatesSessionAndTurn proves the

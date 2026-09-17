@@ -86,15 +86,32 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $
 RETURNING *;
 
 -- name: GetLatestReviewVerdict :one
--- The DISTINCT ON (repo, pr_number) ... ORDER BY created_at DESC
--- reduction §21.1 specifies -- scoped here to ONE (repo_full_name,
--- pr_number) pair (the one shape every real caller -- the auto-approval
--- eligibility engine, the decision inbox's own classification, the
--- revalidate-at-click/at-merge paths -- actually needs), so this is a
--- plain indexed lookup ORDER BY created_at DESC LIMIT 1, not a
--- multi-row DISTINCT ON scan -- see ListLatestAutoApprovedInRepo below
--- for the multi-PR, per-repo shape that DOES need real DISTINCT ON.
--- pgx.ErrNoRows means no verdict has ever been posted for this PR.
+-- The DISTINCT ON (repo, pr_number) ... reduction §21.1 specifies --
+-- scoped here to ONE (repo_full_name, pr_number) pair (the one shape
+-- every real caller -- the auto-approval eligibility engine, the
+-- decision inbox's own classification, the revalidate-at-click/at-merge
+-- paths -- actually needs), so this is a plain indexed lookup LIMIT 1,
+-- not a multi-row DISTINCT ON scan -- see ListLatestAutoApprovedInRepo
+-- below for the multi-PR, per-repo shape that DOES need real DISTINCT
+-- ON. pgx.ErrNoRows means no verdict has ever been posted for this PR.
+--
+-- Ordered by the PRODUCING ATTEMPT's own creation time (turns.created_at,
+-- joined via attempt_id) -- NEVER by review_verdicts.created_at alone
+-- (round-10 finding D: "the authoritative verdict is whichever request
+-- landed last, not the one for the current attempt", violating §21.1b's
+-- "an emission carries the attempt and context it was produced for").
+-- Two attempts can be in flight for one PR (§21.1b: "the record a
+-- publisher is about to emit may already be superseded by the time it
+-- emits"), and an OLDER attempt's own POST reaching this table AFTER a
+-- NEWER attempt's must not win this read merely because its own INSERT
+-- happened to commit later in wall-clock time -- this is a read-side
+-- fix only, distinct from (and no substitute for) the write-side
+-- refusal-on-supersession §21.1b describes and a later, unshipped GitHub
+-- result publisher (§8.2, §21.1) implements against a real external
+-- result. attempt_id is nullable (a
+-- pre-amendment row recorded none): the LEFT JOIN's own unmatched NULL
+-- falls through COALESCE to rv.created_at, preserving today's exact
+-- ordering for any row that predates this column existing at all.
 --
 -- Deliberately UNFILTERED by suppressed_in_shadow: §30.6 is explicit
 -- that review_verdicts "render in Narvi's own UI with zero new work",
@@ -106,17 +123,21 @@ RETURNING *;
 -- below is the customer-consequential sibling this query is NOT: use
 -- that one instead for anything that could arm a real, customer-visible
 -- effect (§30.8: "never call-site checks").
-SELECT * FROM review_verdicts
-WHERE repo_full_name = $1 AND pr_number = $2
-ORDER BY created_at DESC
+SELECT rv.* FROM review_verdicts rv
+LEFT JOIN turns t ON t.id = rv.attempt_id
+WHERE rv.repo_full_name = $1 AND rv.pr_number = $2
+ORDER BY COALESCE(t.created_at, rv.created_at) DESC
 LIMIT 1;
 
 -- name: GetLatestNonShadowReviewVerdict :one
 -- §30.8's own customer-consequential sibling of GetLatestReviewVerdict
--- above: the SAME per-PR latest-verdict reduction, but excluding any
--- verdict whose own suppressed_in_shadow stamp is true OR that predates
--- this repo's own live_egress_promoted_at fence (belt and suspenders --
--- see migrations/000104_repo_settings_live_egress_promoted_at.up.sql's
+-- above: the SAME per-PR latest-verdict reduction -- including the
+-- IDENTICAL attempt-ordering fix immediately above this query's own doc
+-- comment (round-10 finding D), for the same reason: this query is
+-- exactly as reachable by two in-flight attempts as its sibling is --
+-- excluding any verdict whose own suppressed_in_shadow stamp is true OR
+-- that predates this repo's own live_egress_promoted_at fence (belt and
+-- suspenders -- see migrations/000104_repo_settings_live_egress_promoted_at.up.sql's
 -- own doc comment for why both checks are independent, not redundant).
 -- internal/app/sessionactor/reviewretrigger.go's own auto-retrigger
 -- decision is this query's one caller: a shadow-era "already reviewed"
@@ -127,13 +148,14 @@ LIMIT 1;
 -- posted for this PR -- indistinguishable, by design, from "no verdict
 -- at all" to this query's one caller, which already treats that outcome
 -- as "nothing to compare against yet".
-SELECT * FROM review_verdicts rv
+SELECT rv.* FROM review_verdicts rv
+LEFT JOIN turns t ON t.id = rv.attempt_id
 WHERE rv.repo_full_name = $1 AND rv.pr_number = $2
     AND NOT rv.suppressed_in_shadow
     AND rv.created_at > COALESCE(
         (SELECT rs.live_egress_promoted_at FROM repo_settings rs WHERE rs.repo_full_name = $1),
         'infinity'::timestamptz)
-ORDER BY rv.created_at DESC
+ORDER BY COALESCE(t.created_at, rv.created_at) DESC
 LIMIT 1;
 
 -- name: ListLatestAutoApprovedInRepo :many

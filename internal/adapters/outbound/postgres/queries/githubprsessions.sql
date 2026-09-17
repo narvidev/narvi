@@ -76,9 +76,11 @@ WHERE repo_full_name = $1 AND pr_number = $2;
 -- REMOVED as of migrations/000072_turns_review_head_sha.up.sql (§21
 -- review finding C2, CRITICAL, fixed) -- superseded by turns.
 -- review_head_sha, set once at turn-creation time and read back via
--- TurnStore.GetProcessingTurnForSession, never a shared per-(repo,PR)
--- column any later, unrelated turn's own context-fetch could overwrite.
--- See that migration's own doc comment for the full "why".
+-- turns.GetByDispatchedMessageID (finding F3, §21.1's amendment,
+-- migrations/000131_turns_dispatched_message_id.up.sql), never a shared
+-- per-(repo,PR) column any later, unrelated turn's own context-fetch
+-- could overwrite. See migration 000072's own doc comment for the full
+-- "why".
 
 -- Queries backing §24's ("review: automatic re-review on new
 -- commits", §24) trailing-edge debounce + per-PR budget -- see

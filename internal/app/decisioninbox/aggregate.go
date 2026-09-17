@@ -82,6 +82,7 @@ import (
 	"github.com/narvidev/narvi/internal/domain/automation"
 	"github.com/narvidev/narvi/internal/domain/decisioninbox"
 	"github.com/narvidev/narvi/internal/domain/handoff"
+	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -687,17 +688,27 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// same eligibleIgnoringHumanSignals question the final call answers,
 	// just with the base-SHA question deferred.
 	probe := autoapproval.EligibilityInput{
-		Verdict:                    record.Verdict,
-		VerdictAssessed:            true,
-		VerdictHeadSHA:             record.HeadSHA,
-		VerdictBaseRef:             record.Context.BaseRef,
-		VerdictBaseSHA:             record.Context.BaseSHA,
-		VerdictAncestorChain:       record.Context.AncestorChain,
-		VerdictPolicyVersion:       record.Context.PolicyVersion,
-		CurrentHeadSHA:             pr.HeadSHA,
-		CurrentBaseRef:             pr.BaseRef,
-		CurrentBaseSHA:             record.Context.BaseSHA, // assumed equal -- see doc comment above
-		CurrentAncestorChain:       convertAncestorChain(pr.AncestorChain),
+		Verdict:              record.Verdict,
+		VerdictAssessed:      true,
+		VerdictHeadSHA:       record.HeadSHA,
+		VerdictBaseRef:       record.Context.BaseRef,
+		VerdictBaseSHA:       record.Context.BaseSHA,
+		VerdictAncestorChain: record.Context.AncestorChain,
+		VerdictPolicyVersion: record.Context.PolicyVersion,
+		CurrentHeadSHA:       pr.HeadSHA,
+		CurrentBaseRef:       pr.BaseRef,
+		CurrentBaseSHA:       record.Context.BaseSHA, // assumed equal -- see doc comment above
+		// CurrentAncestorChain (round-10 finding B) mirrors CurrentBaseSHA's
+		// own identical "assumed equal to the verdict's own recorded
+		// value" leniency immediately above -- the REAL, live-resolved
+		// chain (currentAncestorChain, computed further down this
+		// function, right before the final ComputeEligible call) is
+		// deferred past this probe exactly like the real currentBaseSHA
+		// is. Never pr.AncestorChain's own raw ref+sha pairs here -- that
+		// reads GitHub's own CACHED per-PR stack field (the same shape
+		// finding F1 already proved stale-by-design), which is exactly
+		// what made this comparison verify nothing before this fix.
+		CurrentAncestorChain:       record.Context.AncestorChain,
 		BaseAdvancedWithoutRewrite: true, // moot: the assumed SHA equality above already bypasses this check
 		CIGreen:                    ciGreen,
 		HasNeedsHumanLabel:         false,
@@ -833,15 +844,59 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 		}
 	}
 
+	// currentAncestorChain (round-10 finding B) mirrors currentBaseSHA's
+	// own identical "never the cached field, always a live resolution"
+	// discipline immediately above, one link further: pr.AncestorChain
+	// (ports.OpenPR's own field) is GitHub's per-PR CACHED stack object,
+	// the exact shape finding F1 already proved stale-by-design for the
+	// immediate base -- comparing it against record.Context.AncestorChain
+	// (itself now ALSO live-resolved at review-context-fetch time,
+	// internal/app/reviewcontext.Fetch) would otherwise compare a live
+	// fact against a cached one, unequal by construction. §17.6 bounds
+	// this to AT MOST ONE link today, so this is at most one further live
+	// call, cached via deps.SCMCache.ResolveBranchSHA exactly like
+	// currentBaseSHA immediately above, for the identical read-model-vs-
+	// action-endpoint reason. The ref itself (a branch name) is trusted
+	// from the cached read, exactly like BaseRef is; only the SHA is
+	// re-resolved live. A resolution failure degrades to no chain at all
+	// (never a link with a stale or empty SHA) and marks this row
+	// degraded, mirroring currentBaseSHA's own identical fail-closed-via-
+	// ComputeEligible discipline rather than baseSHAErr's own early
+	// return (revalidateCore, an action endpoint, can afford to fail
+	// outright; this read model cannot).
+	// currentAncestorChain's own zero value (nil) is the correct answer
+	// whenever pr.AncestorChain reports no link at all, or the live
+	// resolution below comes back empty/failed -- never a link with a
+	// stale or empty SHA, mirroring AncestorChainFromStack's own
+	// identical empty-liveSHA-degrades-to-no-link discipline
+	// (internal/domain/review/context.go).
+	var currentAncestorChain []review.AncestorLink
+	if len(pr.AncestorChain) > 0 && pr.AncestorChain[0].Ref != "" {
+		liveAncestorSHA, _, liveAncestorErr := deps.SCMCache.ResolveBranchSHA(ctx, ports.ResolveBranchSHASpec{
+			Owner:  pr.Owner,
+			Repo:   pr.Repo,
+			Branch: pr.AncestorChain[0].Ref,
+			Token:  token,
+		}, now)
+		switch {
+		case liveAncestorErr != nil:
+			platform.Logger(ctx).Warn("decisioninbox: resolve live ancestor chain sha failed, base-freshness check will fail closed via ReasonAncestorChainChanged", "error", liveAncestorErr, "repo", repoFullName, "pr_number", pr.Number)
+			degraded = true
+		case liveAncestorSHA != "":
+			currentAncestorChain = []review.AncestorLink{{Ref: pr.AncestorChain[0].Ref, SHA: liveAncestorSHA}}
+		}
+	}
+
 	// VerdictAssessed/VerdictBaseRef/VerdictBaseSHA/VerdictAncestorChain/
 	// VerdictPolicyVersion and CurrentBaseRef/CurrentAncestorChain
 	// (§21.1's amendment) mirror revalidateCore's own identical wiring
 	// (revalidate.go) -- record.Context is the SAME review_verdicts row
 	// record.HeadSHA already came from, and pr is this function's own
 	// already-fetched, live ports.OpenPR (no new I/O), exactly like
-	// pr.HeadSHA itself. CurrentBaseSHA is the one exception -- see that
-	// variable's own doc comment immediately above for why it is NOT
-	// pr.BaseSHA.
+	// pr.HeadSHA itself. CurrentBaseSHA/CurrentAncestorChain are the
+	// exceptions -- see currentBaseSHA/currentAncestorChain's own doc
+	// comments immediately above for why they are NOT pr.BaseSHA/
+	// pr.AncestorChain.
 	eligibleIgnoringHumanSignals, _ := autoapproval.ComputeEligible(autoapproval.EligibilityInput{
 		Verdict:                    record.Verdict,
 		VerdictAssessed:            true,
@@ -853,7 +908,7 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 		CurrentHeadSHA:             pr.HeadSHA,
 		CurrentBaseRef:             pr.BaseRef,
 		CurrentBaseSHA:             currentBaseSHA,
-		CurrentAncestorChain:       convertAncestorChain(pr.AncestorChain),
+		CurrentAncestorChain:       currentAncestorChain,
 		BaseAdvancedWithoutRewrite: baseAdvancedWithoutRewrite,
 		CIGreen:                    ciGreen,
 		HasNeedsHumanLabel:         false,

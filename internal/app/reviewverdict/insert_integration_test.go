@@ -22,6 +22,7 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	migratepg "github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
@@ -304,8 +305,9 @@ func TestInsert_ContextAndAttemptIDRoundTrip(t *testing.T) {
 		if !slices.Equal(record.Context.AncestorChain, wantContext.AncestorChain) {
 			t.Errorf("record.Context.AncestorChain = %+v, want %+v", record.Context.AncestorChain, wantContext.AncestorChain)
 		}
-		if !record.AttemptID.Valid || record.AttemptID.Bytes != turn.ID.Bytes {
-			t.Errorf("record.AttemptID = %+v, want a valid id matching the seeded turn %+v", record.AttemptID, turn.ID)
+		wantAttemptID := uuid.UUID(turn.ID.Bytes).String()
+		if record.AttemptID != wantAttemptID {
+			t.Errorf("record.AttemptID = %q, want %q (the seeded turn's own id)", record.AttemptID, wantAttemptID)
 		}
 	})
 
@@ -334,8 +336,107 @@ func TestInsert_ContextAndAttemptIDRoundTrip(t *testing.T) {
 		if len(record.Context.AncestorChain) != 0 {
 			t.Errorf("record.Context.AncestorChain = %+v, want empty", record.Context.AncestorChain)
 		}
-		if record.AttemptID.Valid {
-			t.Errorf("record.AttemptID = %+v, want an invalid/NULL id (no attempt was ever recorded)", record.AttemptID)
+		if record.AttemptID != "" {
+			t.Errorf("record.AttemptID = %q, want empty (no attempt was ever recorded)", record.AttemptID)
 		}
 	})
+}
+
+// TestGetLatest_OrdersByProducingAttemptRecency_NeverPostTime is round-10
+// finding D's own regression test: GetLatest used to order strictly by
+// review_verdicts.created_at DESC -- "whichever request landed last" --
+// so two attempts in flight for one PR made the AUTHORITATIVE verdict
+// whichever one's own INSERT happened to commit last, never necessarily
+// the one belonging to the more recent attempt. This reproduces the exact
+// race: an OLDER attempt (turn created first) whose own HTTP POST reaches
+// review_verdicts AFTER a NEWER attempt's (turn created second, but posts
+// FIRST) -- proving GetLatest still returns the newer attempt's own
+// verdict, never the one that merely committed last.
+//
+// Mutation-test target: reverting queries/reviewverdicts.sql's own
+// GetLatestReviewVerdict query from `ORDER BY COALESCE(t.created_at,
+// rv.created_at) DESC` back to `ORDER BY created_at DESC` (and
+// regenerating sqlcgen) must turn this test's own "record.HeadSHA ==
+// newer-attempt-sha" assertion into "record.HeadSHA ==
+// older-attempt-sha".
+func TestGetLatest_OrdersByProducingAttemptRecency_NeverPostTime(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	reviewVerdicts := narvipg.NewReviewVerdictStore(pool)
+	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	sessions := narvipg.NewSessionStore(pool)
+	turns := narvipg.NewTurnStore(pool)
+
+	const repoFullName = "acme/attempt-recency-repo"
+	const prNumber = int32(1)
+
+	newSession := func() sqlcgen.Session {
+		s, err := sessions.Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceWeb})
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		return s
+	}
+
+	// olderTurn is created FIRST -- an EARLIER attempt.
+	olderSession := newSession()
+	olderTurn, err := turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: olderSession.ID, Status: sqlcgen.TurnStatusCompleted})
+	if err != nil {
+		t.Fatalf("create older turn: %v", err)
+	}
+	// newerTurn is created SECOND -- Postgres now() has real sub-millisecond
+	// resolution and these are two sequential, real INSERTs, so
+	// newerTurn.CreatedAt > olderTurn.CreatedAt holds reliably in
+	// practice (no sleep needed, no test-controlled Clock exists at this
+	// layer to fake it more directly).
+	newerSession := newSession()
+	newerTurn, err := turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: newerSession.ID, Status: sqlcgen.TurnStatusCompleted})
+	if err != nil {
+		t.Fatalf("create newer turn: %v", err)
+	}
+	if !newerTurn.CreatedAt.Time.After(olderTurn.CreatedAt.Time) {
+		t.Fatalf("newerTurn.CreatedAt = %v, want it strictly after olderTurn.CreatedAt = %v -- test setup assumption broken", newerTurn.CreatedAt.Time, olderTurn.CreatedAt.Time)
+	}
+
+	verdict := func() review.Verdict {
+		v := review.Verdict{
+			RiskLevel:         review.RiskLevelLow,
+			Premise:           review.PremiseStateOK,
+			TestsCoverage:     review.TestsCoverageStateAdequate,
+			DocsDrift:         review.DocsDriftStateNone,
+			ProposedShippable: review.ProposedShippableAuto,
+		}
+		v.Shippable = review.ComputeShippable(v.RiskLevel, v.TestsCoverage, v.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+		return v
+	}
+	digest := reviewpost.Digest{Summary: "Attempt-recency test-seeded verdict.", DescriptionAdequacy: review.DescriptionAdequacyOK, AdequacyExplanation: "n/a"}
+
+	// The NEWER attempt's own verdict is INSERTED FIRST -- an earlier
+	// review_verdicts.created_at than what follows.
+	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, "sha-newer-attempt", pgtype.UUID{}, verdict(), digest, reviewtriage.DepthLight, "", reviewpost.FactCheckSkipped, 0, nil, nil, "", false, reviewverdict.Context{}, newerTurn.ID); err != nil {
+		t.Fatalf("insert newer attempt's verdict: %v", err)
+	}
+	// The OLDER attempt's own verdict is INSERTED SECOND -- reaching the
+	// database AFTER the newer attempt's own, exactly the race finding D
+	// names: "an older attempt's own POST landing at the database AFTER a
+	// newer attempt's must not win this read". Its review_verdicts.created_at
+	// is therefore the LATER of the two.
+	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, "sha-older-attempt", pgtype.UUID{}, verdict(), digest, reviewtriage.DepthLight, "", reviewpost.FactCheckSkipped, 0, nil, nil, "", false, reviewverdict.Context{}, olderTurn.ID); err != nil {
+		t.Fatalf("insert older attempt's verdict (landing at the DB second): %v", err)
+	}
+
+	record, ok, err := appreviewverdict.GetLatest(ctx, appreviewverdict.Deps{ReviewVerdicts: reviewVerdicts}, repoFullName, prNumber)
+	if err != nil {
+		t.Fatalf("GetLatest: %v", err)
+	}
+	if !ok {
+		t.Fatalf("GetLatest: ok = false, want true")
+	}
+	if record.HeadSHA != "sha-newer-attempt" {
+		t.Errorf("GetLatest() returned head_sha = %q, want %q -- the NEWER attempt's own verdict must win even though the OLDER attempt's own row was inserted (committed) last", record.HeadSHA, "sha-newer-attempt")
+	}
+	wantAttemptID := uuid.UUID(newerTurn.ID.Bytes).String()
+	if record.AttemptID != wantAttemptID {
+		t.Errorf("GetLatest() returned attempt_id = %q, want %q (the newer attempt's own turn id)", record.AttemptID, wantAttemptID)
+	}
 }

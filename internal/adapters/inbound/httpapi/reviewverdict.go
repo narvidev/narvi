@@ -426,12 +426,15 @@ func PostReviewVerdict(
 		// THIS turn's own context fetch, never re-derived here. Stays 0
 		// (that field's own zero value, and DecisionRecord's own doc
 		// comment: "indistinguishable from... genuinely empty diff") for
-		// every case that skips or fails the unmarshal below -- no
-		// turn resolved, a turn that predates this field, or a
-		// turn whose own review_depth_decision marshal failed at
-		// creation time -- reviewverdict.FilesChangedDrifted's own doc
-		// comment covers why treating that identically to "no reliable
-		// signal, never fire" is required, not merely convenient.
+		// every case that skips or fails the unmarshal below -- a turn
+		// that predates this field, or a turn whose own
+		// review_depth_decision marshal failed at creation time (never
+		// "no turn resolved": D1/D4/D6's own fix above already refuses
+		// the request outright before this point is ever reached, so
+		// dispatchedTurn is always a real, resolved turn here) --
+		// reviewverdict.FilesChangedDrifted's own doc comment covers why
+		// treating that identically to "no reliable signal, never fire"
+		// is required, not merely convenient.
 		//
 		// diffDelivered (D4, adversarial review of PR #182, MEDIUM) is
 		// this SAME dispatched-message-id-resolved turn's own reviewtriage.DecisionRecord.
@@ -443,12 +446,12 @@ func PostReviewVerdict(
 		// !decisionRecord.DiffTruncated" against a decisionRecord that
 		// might itself be an unpopulated zero value: DiffEmpty/
 		// DiffTruncated both false is ALSO decisionRecord's own zero
-		// value (no turn resolved, a turn that predates this
-		// field, or a failed unmarshal, exactly the same three cases
-		// serverComputedChangedFiles' own comment names), and reading
-		// that as "confirmed delivered" would be exactly the unsafe
-		// misreading D1's own "authoritative-or-absent, never partial"
-		// principle forbids elsewhere in this same PR. Set true ONLY
+		// value (a turn that predates this field, or a failed unmarshal
+		// -- the same two live cases serverComputedChangedFiles' own
+		// comment names), and reading that as "confirmed delivered"
+		// would be exactly the unsafe misreading D1's own
+		// "authoritative-or-absent, never partial" principle forbids
+		// elsewhere in this same PR. Set true ONLY
 		// inside the successful-unmarshal branch below, from the real
 		// decisionRecord.
 		// verdictHeadSHA/reviewDepth/serverComputedChangedFiles/

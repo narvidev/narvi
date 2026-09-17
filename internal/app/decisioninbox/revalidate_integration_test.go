@@ -289,6 +289,122 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		}
 	})
 
+	// Round-10 finding A2/B: revalidateCore's own VerdictAncestorChain/
+	// CurrentAncestorChain wiring (this file) used to be independently
+	// deletable with this package's OWN suite green, because every OTHER
+	// fixture in this file and in aggregate_integration_test.go leaves
+	// BOTH sides nil (seedAutoApprovedVerdict's own doc comment:
+	// "AncestorChain stays nil: none of this package's fixtures are
+	// GitHub-native-stack PRs") -- autoapproval.ancestorChainEqual(nil,
+	// nil) trivially passes regardless of whether either wiring line even
+	// exists. Round-10 finding B additionally found the COMPARISON itself
+	// verified nothing even when both sides WERE wired: both used to read
+	// GitHub's own per-PR CACHED stack field (the same shape finding F1
+	// already proved stale-by-design for the immediate base), so the
+	// comparison could pass or fail identically whether or not the branch
+	// it named had actually moved. The two subtests below now pin BOTH
+	// properties: a real, LIVE-resolved match must stay eligible (proving
+	// CurrentAncestorChain's own wiring -- deleting it defaults to nil,
+	// which would wrongly mismatch this otherwise-matching fixture), and
+	// a real mismatch must refuse (proving VerdictAncestorChain's own
+	// wiring -- deleting it defaults to nil, which would wrongly match
+	// this otherwise-mismatching fixture).
+	t.Run("AncestorChainMatches_LiveResolved_StaysEligible", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-ancestor-chain-match"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 103)
+
+		// pr.AncestorChain reports "main" (the SAME branch
+		// rs.eligiblePR's own fixture already resolves live to
+		// testEligibleBaseSHA, via fakeDecisionInboxSourceControl's own
+		// ResolveBranchSHA fallback matching a seeded PR's BaseRef) --
+		// but with a DELIBERATELY WRONG cached SHA, proving the live
+		// resolution below, never this cached value, is what the
+		// comparison actually uses.
+		pr.AncestorChain = []ports.PRAncestorLink{{Ref: "main", SHA: "stale-cached-sha-must-be-ignored"}}
+		rs.replaceTargetPR(actorGitHubID, pr)
+
+		// review_verdicts is append-only (§21.1) -- a SECOND, newer
+		// verdict row on the SAME PR/head, this time with a real,
+		// non-nil recorded ancestor chain (eligiblePR's own
+		// seedAutoApprovedVerdict helper always leaves it nil) that
+		// matches EXACTLY what a live resolution of "main" reports
+		// (testEligibleBaseSHA), becomes GetLatest's own returned row.
+		verdictContext := reviewverdict.Context{
+			BaseRef:       testEligibleBaseRef,
+			BaseSHA:       testEligibleBaseSHA,
+			AncestorChain: []review.AncestorLink{{Ref: "main", SHA: testEligibleBaseSHA}},
+			PolicyVersion: autoapproval.CurrentPolicyVersion,
+		}
+		verdict := review.Verdict{
+			RiskLevel:         review.RiskLevelLow,
+			Premise:           review.PremiseStateOK,
+			TestsCoverage:     review.TestsCoverageStateAdequate,
+			DocsDrift:         review.DocsDriftStateNone,
+			ProposedShippable: review.ProposedShippableAuto,
+			FilesChanged:      3,
+		}
+		verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+		if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, int32(pr.Number), pr.HeadSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "second, newer verdict whose recorded ancestor chain matches the live resolution"}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
+			t.Fatalf("insert second verdict with a matching ancestor chain: %v", err)
+		}
+
+		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+		}
+		if !ok {
+			t.Fatalf("RevalidateForMerge() ok = false, reason = %q, want true -- the verdict's own recorded ancestor chain matches a LIVE resolution of the PR's current one (the cached, deliberately-wrong pr.AncestorChain SHA must never be consulted)", reason)
+		}
+	})
+
+	t.Run("AncestorChainChanged_Refused", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-ancestor-chain-changed"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 104)
+
+		// review_verdicts is append-only (§21.1) -- a SECOND, newer
+		// verdict row on the SAME PR/head, this time with a real,
+		// non-nil recorded ancestor chain (eligiblePR's own
+		// seedAutoApprovedVerdict helper always leaves it nil), becomes
+		// GetLatest's own returned row.
+		verdictContext := reviewverdict.Context{
+			BaseRef:       testEligibleBaseRef,
+			BaseSHA:       testEligibleBaseSHA,
+			AncestorChain: []review.AncestorLink{{Ref: "main", SHA: "stack-ultimate-base-sha"}},
+			PolicyVersion: autoapproval.CurrentPolicyVersion,
+		}
+		verdict := review.Verdict{
+			RiskLevel:         review.RiskLevelLow,
+			Premise:           review.PremiseStateOK,
+			TestsCoverage:     review.TestsCoverageStateAdequate,
+			DocsDrift:         review.DocsDriftStateNone,
+			ProposedShippable: review.ProposedShippableAuto,
+			FilesChanged:      3,
+		}
+		verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+		if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, int32(pr.Number), pr.HeadSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "second, newer verdict with a real ancestor chain"}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
+			t.Fatalf("insert second verdict with a real ancestor chain: %v", err)
+		}
+
+		// pr.AncestorChain stays nil below (replaceTargetPR not even
+		// called): the LIVE PR reports no ancestor chain at all -- an
+		// ordinary, non-stacked PR today -- which no longer matches the
+		// verdict just inserted above.
+		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+		}
+		if ok {
+			t.Fatal("RevalidateForMerge() ok = true, want false -- the latest verdict's own recorded ancestor chain no longer matches the PR's live one")
+		}
+		// This fires on the PROBE (the SHA is assumed equal, so nothing
+		// live is checked before ComputeEligible refuses), which wraps
+		// the raw Reason string -- see revalidateCore's own probeReason
+		// handling -- so this checks containment, not equality.
+		if !strings.Contains(reason, string(autoapproval.ReasonAncestorChainChanged)) {
+			t.Errorf("reason = %q, want it to contain %q", reason, autoapproval.ReasonAncestorChainChanged)
+		}
+	})
+
 	// Paired with review:low-risk deliberately -- an otherwise-fully-
 	// eligible risk label -- so needs-human is provably the ONE thing
 	// keeping this refused, not a coincidental "no/unrecognized risk

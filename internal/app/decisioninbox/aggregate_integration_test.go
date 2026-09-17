@@ -257,6 +257,7 @@ func (f *fakeDecisionInboxSourceControl) ResolveCodeOwners(_ context.Context, sp
 func (f *fakeDecisionInboxSourceControl) CreatePR(context.Context, ports.CreatePRSpec) (ports.PRRef, error) {
 	return ports.PRRef{}, errors.New("fakeDecisionInboxSourceControl: CreatePR not implemented")
 }
+
 // Honors ctx (G4, fourth adversarial-review round -- mirroring
 // IsAncestor's own identical E7 fix above, for the identical reason):
 // this previously ignored ctx entirely, so a caller that failed to wrap
@@ -1378,6 +1379,198 @@ func TestBuild_HasChangesRequestedDemotesFromReadyToMerge(t *testing.T) {
 	}
 	if !pr40.HasChangesRequested {
 		t.Error("PR #40 HasChangesRequested = false, want true -- the domain Item field itself must also surface this fact")
+	}
+}
+
+// TestBuild_AncestorChainMatches_LiveResolved_StaysReadyToMerge is
+// round-10 finding B's own regression test for computeRealEligibility's
+// (aggregate.go) CurrentAncestorChain wiring: pr.AncestorChain reports
+// "main" with a DELIBERATELY WRONG cached SHA (GitHub's own per-PR cached
+// stack field, the same shape finding F1 already proved stale-by-design
+// for the immediate base), while the verdict's own recorded ancestor
+// chain carries "main" paired with testEligibleBaseRef's own LIVE tip
+// (testEligibleBaseSHA, the SAME value fakeDecisionInboxSourceControl's
+// own ResolveBranchSHA fallback already resolves "main" to elsewhere in
+// this file) -- proving the comparison uses the LIVE resolution, never
+// the cached SHA, and stays ready_to_merge when they genuinely agree.
+// Mutation-test target: deleting `CurrentAncestorChain: currentAncestorChain,`
+// from either EligibilityInput literal in aggregate.go (defaulting it to
+// nil) would wrongly mismatch this otherwise-agreeing fixture, turning
+// this test's own KindReadyToMerge assertion into KindNeedsReview.
+func TestBuild_AncestorChainMatches_LiveResolved_StaysReadyToMerge(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+
+	const actorGitHubExternalID = "4003"
+	tokenKey := []byte("01234567890123456789012345678901")
+	actor := decisionInboxActorFixture(ctx, t, pool, "p14c-actor@example.com", actorGitHubExternalID, tokenKey)
+
+	artifacts := narvipg.NewArtifactStore(pool)
+	const htmlURL = "https://github.com/acme/widgets/pull/42"
+	platformSession, err := narvipg.NewSessionStore(pool).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub, CreatedBy: actor.ID})
+	if err != nil {
+		t.Fatalf("create platform session: %v", err)
+	}
+	if _, err := artifacts.Create(ctx, sqlcgen.CreateArtifactParams{
+		SessionID: platformSession.ID, Type: sqlcgen.ArtifactTypePr, Url: htmlURL, Metadata: []byte("{}"),
+	}); err != nil {
+		t.Fatalf("mark PR #42 platform-authored: %v", err)
+	}
+
+	// A real verdict whose own recorded ancestor chain matches EXACTLY
+	// what a live resolution of "main" reports (testEligibleBaseSHA) --
+	// never seedAutoApprovedVerdict, which always leaves this nil.
+	verdict := review.Verdict{
+		RiskLevel:         review.RiskLevelLow,
+		Premise:           review.PremiseStateOK,
+		TestsCoverage:     review.TestsCoverageStateAdequate,
+		DocsDrift:         review.DocsDriftStateNone,
+		ProposedShippable: review.ProposedShippableAuto,
+		FilesChanged:      3,
+	}
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdictContext := reviewverdict.Context{
+		BaseRef:       testEligibleBaseRef,
+		BaseSHA:       testEligibleBaseSHA,
+		AncestorChain: []review.AncestorLink{{Ref: "main", SHA: testEligibleBaseSHA}},
+		PolicyVersion: autoapproval.CurrentPolicyVersion,
+	}
+	reviewVerdicts := narvipg.NewReviewVerdictStore(pool)
+	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, "acme/widgets", 42, "sha42", pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded verdict whose recorded ancestor chain matches the live resolution."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
+		t.Fatalf("seed verdict with a matching ancestor chain: %v", err)
+	}
+
+	fakeSCM := &fakeDecisionInboxSourceControl{
+		openPRsByExternalID: map[string][]ports.OpenPR{
+			actorGitHubExternalID: {
+				{
+					Owner: "acme", Repo: "widgets", Number: 42, Title: "otherwise fully eligible, ancestor chain genuinely matches",
+					HTMLURL: htmlURL, HeadSHA: "sha42",
+					BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
+					AncestorChain: []ports.PRAncestorLink{{Ref: "main", SHA: "stale-cached-sha-must-be-ignored"}},
+					Assignees:     []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}},
+					CIConclusion:  ports.CIConclusionSuccess,
+					Labels:        []string{"review:low-risk"},
+					CreatedAt:     time.Now(),
+				},
+			},
+		},
+	}
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict:      appreviewverdict.Deps{ReviewVerdicts: reviewVerdicts, RepoSettings: repoSettings, ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool), Timeouts: platform.DefaultTimeouts()},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil", err)
+	}
+
+	pr42 := findItemByPR(result.Items, 42)
+	if pr42 == nil {
+		t.Fatal("PR #42 missing from the inbox entirely")
+	}
+	if pr42.Kind != decisioninboxdomain.KindReadyToMerge {
+		t.Errorf("PR #42 (ancestor chain genuinely matches, live-resolved) Kind = %s, want ready_to_merge -- the cached, deliberately-wrong pr.AncestorChain SHA must never be consulted", pr42.Kind)
+	}
+}
+
+// TestBuild_AncestorChainChanged_DemotesFromReadyToMerge is round-10
+// finding A2's own regression test for computeRealEligibility's (aggregate.go)
+// VerdictAncestorChain/CurrentAncestorChain wiring -- the SAME "otherwise
+// fully eligible" fixture shape as
+// TestBuild_HasChangesRequestedDemotesFromReadyToMerge above, but
+// perturbing ports.OpenPR.AncestorChain instead of HasChangesRequested:
+// seedAutoApprovedVerdict's own recorded verdict always carries a nil
+// ancestor chain (its own doc comment: "none of this package's fixtures
+// are GitHub-native-stack PRs"), so a LIVE PR that now reports one (this
+// PR's parent moved beneath it in a GitHub-native stack, §21.1's
+// amendment) must demote out of ready_to_merge -- the verdict never
+// examined the code as it stands now. Before this test existed, both of
+// computeRealEligibility's own VerdictAncestorChain/CurrentAncestorChain
+// wiring lines (each of the two autoapproval.EligibilityInput literals in
+// aggregate.go) were independently deletable: every OTHER fixture in this
+// file leaves the live PR's own AncestorChain nil too, so
+// autoapproval.ancestorChainEqual(nil, nil) trivially passed regardless
+// of whether either wiring line even existed. Mutation-test target:
+// deleting `VerdictAncestorChain: record.Context.AncestorChain,` from
+// EITHER EligibilityInput literal in aggregate.go must turn this test's
+// own KindNeedsReview assertion back into KindReadyToMerge -- paired with
+// TestBuild_AncestorChainMatches_LiveResolved_StaysReadyToMerge above,
+// which independently pins CurrentAncestorChain's own wiring (this
+// fixture's own VerdictAncestorChain is already nil by construction, so
+// it alone cannot distinguish "wired to nil" from "never wired at all").
+func TestBuild_AncestorChainChanged_DemotesFromReadyToMerge(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+
+	const actorGitHubExternalID = "4002"
+	tokenKey := []byte("01234567890123456789012345678901")
+	actor := decisionInboxActorFixture(ctx, t, pool, "p14b-actor@example.com", actorGitHubExternalID, tokenKey)
+
+	artifacts := narvipg.NewArtifactStore(pool)
+	const htmlURL = "https://github.com/acme/widgets/pull/41"
+	platformSession, err := narvipg.NewSessionStore(pool).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub, CreatedBy: actor.ID})
+	if err != nil {
+		t.Fatalf("create platform session: %v", err)
+	}
+	if _, err := artifacts.Create(ctx, sqlcgen.CreateArtifactParams{
+		SessionID: platformSession.ID, Type: sqlcgen.ArtifactTypePr, Url: htmlURL, Metadata: []byte("{}"),
+	}); err != nil {
+		t.Fatalf("mark PR #41 platform-authored: %v", err)
+	}
+	// seedAutoApprovedVerdict's own recorded ancestor chain stays nil --
+	// this fixture's whole point is that the LIVE chain below no longer
+	// agrees with it.
+	seedAutoApprovedVerdict(ctx, t, pool, "acme/widgets", 41, "sha41")
+
+	fakeSCM := &fakeDecisionInboxSourceControl{
+		openPRsByExternalID: map[string][]ports.OpenPR{
+			actorGitHubExternalID: {
+				{
+					Owner: "acme", Repo: "widgets", Number: 41, Title: "otherwise fully eligible, but the ancestor chain moved",
+					HTMLURL: htmlURL, HeadSHA: "sha41",
+					BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
+					AncestorChain: []ports.PRAncestorLink{{Ref: "main", SHA: "a-parent-moved-beneath-this-pr"}},
+					Assignees:     []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}},
+					CIConclusion:  ports.CIConclusionSuccess,
+					Labels:        []string{"review:low-risk"},
+					CreatedAt:     time.Now(),
+				},
+			},
+		},
+	}
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict:      appreviewverdict.Deps{ReviewVerdicts: narvipg.NewReviewVerdictStore(pool), RepoSettings: narvipg.NewRepoSettingsStore(pool), ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool), Timeouts: platform.DefaultTimeouts()},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil", err)
+	}
+
+	pr41 := findItemByPR(result.Items, 41)
+	if pr41 == nil {
+		t.Fatal("PR #41 missing from the inbox entirely")
+	}
+	if pr41.Kind != decisioninboxdomain.KindNeedsReview {
+		t.Errorf("PR #41 (ancestor chain changed) Kind = %s, want needs_review -- the verdict's own recorded ancestor chain (nil) no longer matches the PR's live one, and must force it out of ready_to_merge even though it is otherwise fully eligible", pr41.Kind)
 	}
 }
 

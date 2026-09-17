@@ -127,9 +127,23 @@ type openPRSearchResponse struct {
 // reviewers/requested_teams/assignees/draft are real, documented fields
 // on this exact response.
 type openPRDetailResponse struct {
-	Number    int    `json:"number"`
-	Title     string `json:"title"`
-	HTMLURL   string `json:"html_url"`
+	Number  int    `json:"number"`
+	Title   string `json:"title"`
+	HTMLURL string `json:"html_url"`
+	// State (round-10 finding E) is GitHub's own documented "open"/
+	// "closed" scalar on this SAME "Get a pull request" response --
+	// GetOpenPR's own doc comment (ports/sourcecontrol.go) promises
+	// "found=false, err=nil means the PR does not exist, or is no
+	// longer open (closed/merged)", but until this fix nothing on this
+	// response shape was ever decoded to actually tell the two apart: a
+	// confirmed-absent PR (404) and a confirmed-PRESENT-but-closed-or-
+	// merged PR (200, this field reading "closed") both reached
+	// GetOpenPR's own caller identically as found=true. A merged PR
+	// ALSO reports state=="closed" here (GitHub never uses a separate
+	// "merged" state value), so checking this one field alone catches
+	// both closed and merged, matching that doc comment's own "closed/
+	// merged" wording exactly.
+	State     string `json:"state"`
 	Draft     bool   `json:"draft"`
 	Additions int    `json:"additions"`
 	Deletions int    `json:"deletions"`

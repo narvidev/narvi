@@ -44,18 +44,25 @@
 -- lifetime of the row, unlike pending_head_sha's own "overwritten on
 -- every fresh context fetch" design.
 --
--- httpapi.PostReviewVerdict (Step 47) now resolves "which turn is
+-- httpapi.PostReviewVerdict (Step 47) originally resolved "which turn is
 -- POSTing this verdict" via turns_one_processing_per_session (migrations/
 -- 000005_turns.up.sql) -- the SAME "resolve the session's own CURRENTLY
 -- live turn from a sandbox-authenticated session id alone" primitive
--- Step 61's own epistemic-outcome-posting endpoint already established
+-- Step 61's own epistemic-outcome-posting endpoint uses
 -- (TurnStore.GetProcessingTurnForSession, queries/turns.sql): a review
--- agent calls the verdict-posting endpoint WHILE its own turn is
+-- agent called the verdict-posting endpoint WHILE its own turn was
 -- actively processing, and the partial unique index guarantees at most
--- one turn can be 'processing' for a given session at any instant -- so
--- this lookup is unambiguous by construction, no new turn-id threading
--- through the sandbox WS protocol or the verdict-posting tool's own URL/
--- headers required.
+-- one turn can be 'processing' for a given session at any instant, so
+-- that lookup was unambiguous by construction. **Superseded by finding
+-- F3 (§21.1's amendment, migrations/000131_turns_dispatched_message_id.up.sql)**:
+-- a turn that exceeded its own deadline and was marked 'failed' could
+-- still have a live agent posting late, by which time a SECOND,
+-- unrelated turn had become the session's own new 'processing' row --
+-- session-wide "current" status named the wrong turn. PostReviewVerdict
+-- now resolves the posting turn via turns.GetByDispatchedMessageID
+-- instead, scoped to the specific dispatch the request is provably a
+-- reply to, never to session-wide status -- see that migration's own
+-- doc comment for the full "why".
 --
 -- Nullable: only ever set for a REVIEW turn (a build turn, a plan-mode
 -- turn, etc. never has one) -- NULL here means exactly what a NULL

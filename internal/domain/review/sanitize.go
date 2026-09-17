@@ -40,14 +40,22 @@ const (
 // placeholderTokens lists every literal placeholder token this whole
 // system ever substitutes for a live secret (or, for
 // ReviewCostBudgetToolURLPlaceholder, a live but non-secret local URL) at
-// prompt-substitution time -- this package's own five (VerdictToolURLPlaceholder/
-// VerdictToolBearerPlaceholder/VerdictToolGenPlaceholder/
-// VerdictToolDispatchMessageIDPlaceholder (finding F3 (§21.1's amendment))/
-// ReviewCostBudgetToolURLPlaceholder, referenced directly, not duplicated:
-// this file is IN internal/domain/review), plus turn's own three and
-// upload's own three (both duplicated as raw literals immediately above,
-// for the identical "zero external imports" reason internal/domain/upload's
-// own placeholderTokens duplicates review's/turn's literals).
+// prompt-substitution time -- this package's own eight
+// (VerdictToolURLPlaceholder/VerdictToolBearerPlaceholder/
+// VerdictToolGenPlaceholder/VerdictToolDispatchMessageIDPlaceholder
+// (finding F3 (§21.1's amendment))/ReviewCostBudgetToolURLPlaceholder/
+// CompositionFindingsToolURLPlaceholder/
+// CompositionFindingsToolBearerPlaceholder/
+// CompositionFindingsToolGenPlaceholder (§31.6/§15.3's own composition
+// review, compositionreview.go -- round-10 finding F5: this triple was
+// omitted from an earlier version of this enumeration, even though it
+// was already present in the slice below), referenced directly, not
+// duplicated: this file is IN internal/domain/review), plus turn's own
+// three and upload's own three (both duplicated as raw literals
+// immediately above, for the identical "zero external imports" reason
+// internal/domain/upload's own placeholderTokens duplicates review's/
+// turn's literals) -- fourteen tokens in total, matching the slice
+// literal immediately below element for element.
 //
 // # The vulnerability this closes (Phase 5 audit, CRITICAL)
 //
@@ -75,9 +83,10 @@ const (
 // three: cmd/sandbox-agent runs several independent, blind, whole-prompt
 // ReplaceAll passes (reviewverdicttoolprompt.go for the review-verdict and
 // upload sets, epistemicoutcometoolprompt.go for the epistemic set,
-// reviewcostbudgetprompt.go for the cost-budget URL) -- a token from ANY
-// of those families, planted in the diff/title/body, is expanded by
-// whichever pass owns it, exactly as readily as this package's own three.
+// reviewcostbudgetprompt.go for the cost-budget URL, compositionfindingstoolprompt.go
+// for the composition-findings triple) -- a token from ANY of those
+// families, planted in the diff/title/body, is expanded by whichever
+// pass owns it, exactly as readily as this package's own three.
 //
 // internal/domain/upload already solved this EXACT problem for its own
 // untrusted Filename/ContentType fields (sanitizeUntrustedField,

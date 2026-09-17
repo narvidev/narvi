@@ -1057,46 +1057,75 @@ func TestAncestorChainFromStack(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name  string
-		stack *review.StackContext
-		want  []review.AncestorLink
+		name    string
+		stack   *review.StackContext
+		liveSHA string
+		want    []review.AncestorLink
 	}{
 		{
-			name:  "nil stack (the ordinary, non-stacked PR) has no ancestor beyond its own immediate base",
-			stack: nil,
-			want:  nil,
+			name:    "nil stack (the ordinary, non-stacked PR) has no ancestor beyond its own immediate base",
+			stack:   nil,
+			liveSHA: "sha-main-live",
+			want:    nil,
 		},
 		{
-			name:  "a stack's own bottom member (position 1) has no ancestor beyond its own immediate base",
-			stack: &review.StackContext{Position: 1, Size: 2, UltimateBaseRef: "main", UltimateBaseSHA: "sha-main"},
-			want:  nil,
+			name:    "a stack's own bottom member (position 1) has no ancestor beyond its own immediate base",
+			stack:   &review.StackContext{Position: 1, Size: 2, UltimateBaseRef: "main", UltimateBaseSHA: "sha-main-cached"},
+			liveSHA: "sha-main-live",
+			want:    nil,
 		},
 		{
 			// Mutation-test target: gutting AncestorChainFromStack to
 			// `return nil` unconditionally turns THIS case's own
 			// assertion from a pass into a failure -- the ONE case in
 			// this table that must observe a real, non-nil link.
-			name:  "a PR further up its own stack (position > 1) reports its stack's own ultimate base as its one ancestor link",
-			stack: &review.StackContext{Position: 2, Size: 2, UltimateBaseRef: "main", UltimateBaseSHA: "sha-main"},
-			want:  []review.AncestorLink{{Ref: "main", SHA: "sha-main"}},
+			name:    "a PR further up its own stack (position > 1) reports its stack's own ultimate base ref, paired with the CALLER-supplied live SHA, as its one ancestor link",
+			stack:   &review.StackContext{Position: 2, Size: 2, UltimateBaseRef: "main", UltimateBaseSHA: "sha-main-cached"},
+			liveSHA: "sha-main-live",
+			want:    []review.AncestorLink{{Ref: "main", SHA: "sha-main-live"}},
 		},
 		{
-			name:  "a stack reporting an empty ultimate base ref is treated identically to no ancestor (nothing real to name)",
-			stack: &review.StackContext{Position: 2, Size: 2, UltimateBaseRef: "", UltimateBaseSHA: "sha-main"},
-			want:  nil,
+			// Round-10 finding B: the reported link's SHA is the LIVE
+			// one, never stack.UltimateBaseSHA (GitHub's own cached
+			// per-PR field, the same shape finding F1 already proved
+			// stale-by-design for the immediate base) -- this case would
+			// fail if AncestorChainFromStack ever reverted to reading
+			// stack.UltimateBaseSHA again.
+			name:    "reported SHA is the live-resolved value, never the stack's own cached snapshot",
+			stack:   &review.StackContext{Position: 2, Size: 2, UltimateBaseRef: "main", UltimateBaseSHA: "sha-main-cached"},
+			liveSHA: "sha-main-live-and-different",
+			want:    []review.AncestorLink{{Ref: "main", SHA: "sha-main-live-and-different"}},
+		},
+		{
+			name:    "a stack reporting an empty ultimate base ref is treated identically to no ancestor (nothing real to name)",
+			stack:   &review.StackContext{Position: 2, Size: 2, UltimateBaseRef: "", UltimateBaseSHA: "sha-main-cached"},
+			liveSHA: "sha-main-live",
+			want:    nil,
+		},
+		{
+			// Round-10 finding B: a live resolution that failed (empty
+			// liveSHA) must degrade to NO chain at all, never a link
+			// carrying an empty SHA -- autoapproval.ancestorChainEqual
+			// would otherwise treat that empty string as a real,
+			// comparable value rather than "could not be established"
+			// (mirroring finding F2's identical BaseSHA discipline).
+			name:    "an empty live SHA (the caller's own resolution failed) degrades to no ancestor at all, never a link with an empty SHA",
+			stack:   &review.StackContext{Position: 2, Size: 2, UltimateBaseRef: "main", UltimateBaseSHA: "sha-main-cached"},
+			liveSHA: "",
+			want:    nil,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := review.AncestorChainFromStack(tc.stack)
+			got := review.AncestorChainFromStack(tc.stack, tc.liveSHA)
 			if len(got) != len(tc.want) {
-				t.Fatalf("AncestorChainFromStack(%+v) = %+v, want %+v", tc.stack, got, tc.want)
+				t.Fatalf("AncestorChainFromStack(%+v, %q) = %+v, want %+v", tc.stack, tc.liveSHA, got, tc.want)
 			}
 			for i := range got {
 				if got[i] != tc.want[i] {
-					t.Errorf("AncestorChainFromStack(%+v)[%d] = %+v, want %+v", tc.stack, i, got[i], tc.want[i])
+					t.Errorf("AncestorChainFromStack(%+v, %q)[%d] = %+v, want %+v", tc.stack, tc.liveSHA, i, got[i], tc.want[i])
 				}
 			}
 		})

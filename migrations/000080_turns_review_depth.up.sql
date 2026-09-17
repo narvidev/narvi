@@ -9,8 +9,9 @@
 -- automatic re-review turn insert).
 --
 -- Read back at verdict-post time (internal/adapters/inbound/httpapi/
--- reviewverdict.go's own turns.GetProcessingTurnForSession call, the SAME
--- read review_head_sha already needs) so the depth THIS turn actually ran
+-- reviewverdict.go's own turns.GetByDispatchedMessageID call, finding F3
+-- (§21.1's amendment, migrations/000131_turns_dispatched_message_id.up.sql)
+-- -- the SAME read review_head_sha already needs) so the depth THIS turn actually ran
 -- at can be (a) enforced (the deep-path digest-completeness requirement,
 -- internal/domain/reviewpost.ValidateVerdictInput) and (b) persisted onto
 -- review_verdicts.review_path (migrations/000081) for per-path cost/

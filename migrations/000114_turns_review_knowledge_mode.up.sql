@@ -24,8 +24,10 @@
 -- the switch, so mode B's own work extends an already-proven buffer
 -- rather than retrofitting one onto live traffic.
 --
--- Read back at verdict-post time (the SAME turns.GetProcessingTurnForSession
--- read review_depth/review_depth_decision already use) so the mode THIS
+-- Read back at verdict-post time (the SAME turns.GetByDispatchedMessageID
+-- read review_depth/review_depth_decision already use, finding F3 --
+-- §21.1's amendment, migrations/000131_turns_dispatched_message_id.up.sql)
+-- so the mode THIS
 -- turn's prompt actually carried is what review_verdicts.knowledge_mode
 -- (migrations/000115) stamps, never the CURRENT repo_settings value --
 -- §31.2 item 2's own "in-query attribution, never the current flag"
