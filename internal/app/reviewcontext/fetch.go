@@ -194,10 +194,19 @@ func Fetch(ctx context.Context, logger *slog.Logger, fetcher Fetcher, timeouts p
 	// ultimately sourced from the identical rarely-refreshed GitHub
 	// field) verifies nothing. Mirrors baseSHA's own resolution
 	// immediately above, one link further: only attempted when a stack
-	// exists and AncestorChainFromStack would otherwise report a real
-	// link (stack.Position > 1, stack.UltimateBaseRef != "") -- an
-	// ordinary, non-stacked PR (the overwhelming common case) costs
-	// nothing extra.
+	// exists and stack.Position > 1 -- an ordinary, non-stacked PR (the
+	// overwhelming common case) costs nothing extra.
+	//
+	// D7 (round-12 sweep): the PREVIOUS version of this paragraph read
+	// "only attempted when a stack exists and AncestorChainFromStack
+	// would otherwise report a real link (stack.Position > 1,
+	// stack.UltimateBaseRef != '')" -- the PRE-round-12 contract.
+	// AncestorChainFromStack (review/context.go) no longer has an
+	// UltimateBaseRef clause at all: round-12 dropped it precisely
+	// because "position > 1" ALONE already proves a link exists, ref or
+	// no ref (D1's own fix, and this function's own switch below now
+	// mirrors that same reasoning by handling stack.UltimateBaseRef == ""
+	// as its own explicit case rather than silently skipping it).
 	//
 	// A resolution failure degrades DIFFERENTLY than baseSHA's own
 	// (round-11 finding A1, corrected): liveAncestorBaseSHA stays "", and
@@ -219,8 +228,31 @@ func Fetch(ctx context.Context, logger *slog.Logger, fetcher Fetcher, timeouts p
 	// engine until a fresh review resolves this call successfully -- never
 	// a reason to refuse creating the review turn itself, only to keep the
 	// resulting verdict's own eligibility honestly unresolved.
+	//
+	// D4 (round-12 sweep): "until a fresh review resolves this call
+	// successfully", immediately above, is a promise that only holds when
+	// the degradation is TRANSIENT (a live ResolveBranchSHA call that
+	// merely failed just now, and might succeed on retry -- the
+	// ancestorErr branch below, which DOES log). stack.UltimateBaseRef ==
+	// "" is a DIFFERENT failure mode: GitHub's own stack object itself
+	// reported no ultimate base ref at all, a degradation AT THE SOURCE
+	// this call cannot resolve past by retrying, since there is no ref
+	// here to even attempt a resolution against. Before this fix, that
+	// case fell through this guard silently -- no log at all, unlike
+	// every OTHER degraded path in this function -- so a PR whose verdict
+	// never clears ReasonAncestorChainUnknown gave an operator nothing to
+	// find: nothing here ever said WHY.
 	var liveAncestorBaseSHA string
-	if stack != nil && stack.Position > 1 && stack.UltimateBaseRef != "" {
+	switch {
+	case stack == nil || stack.Position <= 1:
+		// Ordinary, non-stacked PR (or sits at its own stack's own
+		// bottom) -- AncestorChainFromStack reports no link at all
+		// regardless of what this function does, so there is nothing to
+		// resolve.
+	case stack.UltimateBaseRef == "":
+		logger.Warn("reviewcontext: stack reports position > 1 with no ultimate base ref at all (a degraded stack read AT THE SOURCE, not a transient failure a retry would fix), review turn's persisted ancestor chain will carry an unresolved (empty-ref, empty-sha) link, failing closed via autoapproval.ReasonAncestorChainUnknown rather than reading as no chain at all",
+			"owner", owner, "repo", repo, "pr_number", number, "stack_position", stack.Position)
+	default:
 		ancestorCtx, ancestorCancel := context.WithTimeout(ctx, timeouts.GitHubResolveBaseBranchSHATimeout)
 		resolvedSHA, _, ancestorErr := fetcher.ResolveBranchSHA(ancestorCtx, ports.ResolveBranchSHASpec{Owner: owner, Repo: repo, Branch: stack.UltimateBaseRef, Token: token})
 		ancestorCancel()

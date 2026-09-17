@@ -317,10 +317,21 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	// compares it against target's own live value) -- CurrentAncestorChain
 	// below is assigned record.Context.AncestorChain itself, the identical
 	// value VerdictAncestorChain also is, so this probe's own
-	// ancestor-chain comparison is ALWAYS trivially equal and can never by
-	// itself refuse on ReasonAncestorChainChanged/ReasonAncestorChainUnknown
-	// -- see CurrentAncestorChain's own doc comment a few lines down for
-	// the full "why", the same deferred-to-the-final-call treatment
+	// ancestorChainEqual comparison is ALWAYS trivially equal and can
+	// never by itself refuse on ReasonAncestorChainChanged. D2 (round-12
+	// sweep, execution-verified): the PREVIOUS version of this comment
+	// extended that same "can never" claim to ReasonAncestorChainUnknown
+	// too -- false, and executing ComputeEligible with both sides set to
+	// the identical unknown-SHA marker (VerdictAncestorChain ==
+	// CurrentAncestorChain == a single link with an empty SHA) refuses
+	// with ReasonAncestorChainUnknown every time. That check
+	// (ancestorChainHasUnknownLink) runs BEFORE the equality comparison
+	// and inspects EACH side on its own terms, so an unknown marker baked
+	// into the recorded verdict itself -- e.g. one posted while the
+	// review-context fetch's own live ancestor resolution was failing --
+	// refuses here regardless of how trivially the two sides agree. See
+	// CurrentAncestorChain's own doc comment a few lines down for the
+	// full "why", the same deferred-to-the-final-call treatment
 	// CurrentBaseSHA gets, immediately below. CurrentBaseSHA is deliberately
 	// ASSUMED equal to the verdict's own recorded VerdictBaseSHA -- the
 	// most lenient possible stand-in, for two DIFFERENT reasons on
@@ -578,8 +589,25 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	// confirmed-empty match against a verdict recorded before it was ever
 	// stacked -- exactly the silent-match hole finding A1 closed one
 	// layer down.
+	//
+	// D1 (round-12 sweep): target.AncestorChain[0].Ref can ITSELF be
+	// empty -- the adapter's own degraded-stack-read case, where GitHub
+	// reported position > 1 (proving a link exists) but the stack's own
+	// base ref could not be decoded (ancestorChainFromDetailStack's own
+	// doc comment, listopenprs.go, now mirrors review.
+	// AncestorChainFromStack exactly). That is not "no link" (nil) and it
+	// is not a link this code can live-resolve (there is no ref to
+	// resolve against) -- refuse immediately, on the SAME honest reason
+	// the live-resolution-failed branch below gives for a KNOWN ref,
+	// rather than falling through to nil (the PREVIOUS version of this
+	// guard's Ref != "" clause did exactly that, collapsing this case
+	// into "this PR was never in a stack at all").
 	var currentAncestorChain []review.AncestorLink
-	if len(target.AncestorChain) > 0 && target.AncestorChain[0].Ref != "" {
+	if len(target.AncestorChain) > 0 && target.AncestorChain[0].Ref == "" {
+		platform.Logger(ctx).Warn("decisioninbox: ancestor chain link reported with no ref at all (a degraded stack read), refusing merge -- could not confirm the pull request's current ancestor chain", "repo_full_name", repoFullName, "pr_number", prNumber)
+		return false, "", "this pull request's ancestor chain could not be confirmed (a live check failed) -- try again shortly", nil
+	}
+	if len(target.AncestorChain) > 0 {
 		ancestorSHACtx, cancel := context.WithTimeout(ctx, deps.Timeouts.DecisionInboxResolveBranchSHATimeout)
 		liveAncestorSHA, _, liveAncestorErr := sourceControl.ResolveBranchSHA(ancestorSHACtx, ports.ResolveBranchSHASpec{
 			Owner:  target.Owner,
