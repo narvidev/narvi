@@ -1471,6 +1471,13 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 				// this package creates or joins is a PR review session, never a
 				// build turn, so the platform's real epistemic-check default
 				// must never reach it).
+				// Outbox (the review's own GitHub-native result
+				// surface, §8.2/§21.1/§21.1b): the SAME
+				// outboxStore instance every other enqueue site in this
+				// file already uses -- the WINNER path enqueues a
+				// PhaseQueued review-check emission in the SAME
+				// transaction as the claim row's own SetSessionID write.
+				Outbox: outboxStore,
 			},
 			webhookDeliveryStore,
 			githubingress.Config{
@@ -2496,6 +2503,16 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// SAME repoSettingsStore/artifactStore/sourceControl/cfg.GitHubBotToken
 	// every other caller above already uses.
 	descriptionAutofixNotifier := outboxworker.NewDescriptionAutofixNotifier(repoSettingsStore, artifactStore, sourceControl, cfg.GitHubBotToken, cfg.Timeouts)
+	// reviewCheckNotifier (the review's own GitHub-native result
+	// surface, §8.2/§21.1/§21.1b) publishes/updates the
+	// narvi/review check run -- the SAME liveSourceControl/
+	// cfg.GitHubBotToken every other GitHub-flavored notifier above
+	// already uses, plus its own claim-table store (reviewCheckRunStore)
+	// and cfg.GitHubAppID (the "select by SHA and GitHub App" identity
+	// filter, this deployment's own configured App id -- §30.4's own
+	// plumbing, required in every stage regardless of GitHub ingress).
+	reviewCheckRunStore := postgres.NewReviewCheckRunStore(pool)
+	reviewCheckNotifier := outboxworker.NewReviewCheckNotifier(pool, reviewCheckRunStore, liveSourceControl, cfg.GitHubBotToken, cfg.GitHubAppID)
 
 	// outboxStore is constructed earlier, alongside linearAgentSessionStore
 	// -- see that construction site's own doc comment for why.
@@ -2591,6 +2608,10 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// registering it under a second key needs no new githubapi code
 		// whatsoever.
 		outboxNotifiers[ports.NotificationKindGitHubWorkflowDecision] = githubNotifier
+		// reviewCheckNotifier (the review's own GitHub-native result
+		// surface, §8.2/§21.1/§21.1b) publishes/updates the
+		// narvi/review check run for a pull request.
+		outboxNotifiers[ports.NotificationKindGitHubReviewCheck] = reviewCheckNotifier
 	}
 
 	// rwxPreviewNotifier/githubPreviewLinkNotifier ("RWX provider

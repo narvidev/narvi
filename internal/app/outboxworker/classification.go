@@ -45,7 +45,7 @@ const (
 )
 
 // notificationKindClassification is §30.2's own exhaustive External/
-// Internal classification of all 19 ports.NotificationKind constants (see
+// Internal classification of all 20 ports.NotificationKind constants (see
 // internal/app/ports/notifier.go -- every const in that file's own block
 // has an entry here). NewBuilder below checks every kind actually
 // registered in its own notifiers map against this table and refuses to
@@ -100,6 +100,16 @@ var notificationKindClassification = map[ports.NotificationKind]EgressClass{
 	ports.NotificationKindSlackDigest:              ClassSuppress,
 	ports.NotificationKindGitHubDescriptionAutofix: ClassSuppress,
 	ports.NotificationKindLinearDigest:             ClassPassThrough,
+	// NotificationKindGitHubReviewCheck (the review's own GitHub-native
+	// result surface, §8.2/§21.1/§21.1b): its own Deliver performs zero
+	// internal state mutation independent of the external write -- the
+	// claim-table row it updates exists ONLY to make that external write
+	// correct (identity/supersession), mirroring
+	// github_description_autofix's own identical "not a hybrid" reasoning
+	// immediately above. SUPPRESS, never PASS-THROUGH: a shadow-mode
+	// repository must never have a real check run created or updated on
+	// its customer-visible pull request.
+	ports.NotificationKindGitHubReviewCheck: ClassSuppress,
 }
 
 // classifyNotifiers checks every kind actually registered in notifiers

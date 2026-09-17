@@ -17,6 +17,7 @@ import (
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/ports"
 )
 
 // positionAnchoringDiff carries a hunk whose "for i := 0; i < len(items);
@@ -110,8 +111,16 @@ func TestPostReviewVerdict_PositionAnchoring_MatchableFindingRendersAnchoredLine
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
 
+	// Scoped to kind = github_verdict, not merely session_id: a
+	// verdict-posting call now ALSO enqueues a github_review_check row
+	// for the SAME session (the review's own GitHub-native result
+	// surface, §8.2/§21.1/§21.1b) -- an unscoped query here would read
+	// whichever of the two rows Postgres happens to return first, which
+	// is exactly the wrong-payload-shape failure this fix closes (a
+	// ReviewCheckPayload unmarshaled into VerdictPayload leaves Body
+	// empty).
 	var raw []byte
-	if err := rig.pool.QueryRow(ctx, `SELECT payload FROM outbox WHERE session_id = $1`, session.ID).Scan(&raw); err != nil {
+	if err := rig.pool.QueryRow(ctx, `SELECT payload FROM outbox WHERE session_id = $1 AND kind = $2`, session.ID, string(ports.NotificationKindGitHubVerdict)).Scan(&raw); err != nil {
 		t.Fatalf("query outbox payload: %v", err)
 	}
 	var payload githubapi.VerdictPayload
@@ -162,8 +171,16 @@ func TestPostReviewVerdict_PositionAnchoring_UnmatchableFindingRendersNoLine(t *
 		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
 	}
 
+	// Scoped to kind = github_verdict, not merely session_id: a
+	// verdict-posting call now ALSO enqueues a github_review_check row
+	// for the SAME session (the review's own GitHub-native result
+	// surface, §8.2/§21.1/§21.1b) -- an unscoped query here would read
+	// whichever of the two rows Postgres happens to return first, which
+	// is exactly the wrong-payload-shape failure this fix closes (a
+	// ReviewCheckPayload unmarshaled into VerdictPayload leaves Body
+	// empty).
 	var raw []byte
-	if err := rig.pool.QueryRow(ctx, `SELECT payload FROM outbox WHERE session_id = $1`, session.ID).Scan(&raw); err != nil {
+	if err := rig.pool.QueryRow(ctx, `SELECT payload FROM outbox WHERE session_id = $1 AND kind = $2`, session.ID, string(ports.NotificationKindGitHubVerdict)).Scan(&raw); err != nil {
 		t.Fatalf("query outbox payload: %v", err)
 	}
 	var payload githubapi.VerdictPayload

@@ -1819,6 +1819,23 @@ func (a *Actor) tryPlanDispatch(
 		return nil, fmt.Errorf("sessionactor: build prompt payload: %w", err)
 	}
 
+	// The review's own GitHub-native result surface (§8.2/§21.1/§21.1b):
+	// a github-origin session is, by construction, a
+	// review session (internal/adapters/inbound/github's own doc.go --
+	// github_pr_sessions is the only mechanism that ever creates one).
+	// This turn just transitioned Pending -> Dispatched -> Processing
+	// (above, this SAME transaction) -- exactly the moment a review
+	// attempt genuinely begins, so this is the ONE call site for
+	// reviewcheck.PhaseRunning. Enqueued in the SAME transaction as the
+	// turn's own status write (§5.1). Every non-github session (the
+	// overwhelming majority of dispatches) pays nothing beyond this one
+	// SpawnSource comparison.
+	if sessionRow.SpawnSource == sqlcgen.SessionSpawnSourceGithub {
+		if err := a.enqueueReviewCheckRunning(ctx, tx, target); err != nil {
+			return nil, err
+		}
+	}
+
 	return &dispatchPlan{turnID: turnID, payload: payload, sessionRow: sessionRow}, nil
 }
 

@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -19,6 +20,8 @@ import (
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/domain/authz"
 	intentdomain "github.com/narvidev/narvi/internal/domain/intent"
+	"github.com/narvidev/narvi/internal/domain/reposource"
+	"github.com/narvidev/narvi/internal/domain/reviewcheck"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -208,6 +211,17 @@ type SessionCoalescer struct {
 	// silently broke along with it.
 	RolloutMode  platform.RolloutMode
 	RepoSettings *postgres.RepoSettingsStore
+
+	// Outbox is this repository's own addition for the review's
+	// GitHub-native result surface (§8.2/§21.1/§21.1b): the WINNER path below enqueues
+	// exactly one ports.NotificationKindGitHubReviewCheck row, in the
+	// SAME transaction as the claim row's own SetSessionID write --
+	// "a check is published in queued as soon as a pull request enters
+	// scope, before any review starts" (decision 2). The REUSE path
+	// never enqueues one: an ordinary second @mention or a label
+	// re-trigger reuses an ALREADY-tracked PR, which already has its own
+	// check run from whichever WINNER call first claimed it.
+	Outbox *postgres.OutboxStore
 }
 
 // CreateOrJoin is §8.2's own per-PR coalescing entry point -- see
@@ -767,6 +781,43 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 			return sqlcgen.Session{}, sqlcgen.Turn{}, false, fmt.Errorf("github: expected exactly one turn for new session, got %d", len(turnRows))
 		}
 		createdTurn = turnRows[0]
+	}
+
+	// The review's own GitHub-native result surface (§8.2/§21.1/§21.1b):
+	// decision 2, "a check is published in queued as
+	// soon as a pull request enters scope, before any review starts" --
+	// this WINNER branch is precisely that moment for a GitHub-origin
+	// review session (this function's own doc comment: every session it
+	// ever creates IS one). Enqueued in the SAME transaction as the claim
+	// row's own SetSessionID write below (§5.1: "written in the same tx
+	// as the state change"). Skipped when reviewHeadSHA is unknown (the
+	// context-fetch that would have resolved it failed) -- mirrors
+	// httpapi.PostReviewVerdict's own identical "no head sha, no
+	// row" degradation: a queued check with no commit to anchor it to
+	// cannot be created at all, and this is a safe, not a dangerous,
+	// omission (no check published is the SAME state a repo with the
+	// publisher not yet built would be in, not a regression this Step
+	// introduces).
+	if reviewHeadSHA != "" && c.Outbox != nil {
+		owner, repo, ok := reposource.SplitFullName(repoFullName)
+		if !ok {
+			logger.Warn("github: winner path: repo_full_name not in owner/repo shape, skipping queued review-check emission", "repo_full_name", repoFullName)
+		} else {
+			queuedPayload, marshalErr := json.Marshal(ports.ReviewCheckPayload{
+				Owner: owner, Repo: repo, PRNumber: int(prNumber), HeadSHA: reviewHeadSHA,
+				Phase: string(reviewcheck.PhaseQueued),
+			})
+			if marshalErr != nil {
+				return sqlcgen.Session{}, sqlcgen.Turn{}, false, fmt.Errorf("github: marshal queued review-check payload: %w", marshalErr)
+			}
+			if _, err := c.Outbox.WithTx(tx).Create(ctx, sqlcgen.CreateOutboxEntryParams{
+				SessionID: created.ID,
+				Kind:      string(ports.NotificationKindGitHubReviewCheck),
+				Payload:   queuedPayload,
+			}); err != nil {
+				return sqlcgen.Session{}, sqlcgen.Turn{}, false, fmt.Errorf("github: enqueue queued review-check outbox entry: %w", err)
+			}
+		}
 	}
 
 	if err := txPRSessions.SetSessionID(ctx, repoFullName, prNumber, created.ID); err != nil {

@@ -11,6 +11,32 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const existsReviewVerdictForAttempt = `-- name: ExistsReviewVerdictForAttempt :one
+SELECT EXISTS(
+    SELECT 1 FROM review_verdicts WHERE attempt_id = $1
+) AS verdict_exists
+`
+
+// The review's own GitHub-native result surface (§8.2/§21.1/§21.1b)
+// read: has ANY review_verdicts row ever been posted
+// for attemptID (turns.id)? sessionactor's own outboxenqueue.go calls
+// this at turn-completion time to decide whether the review-check
+// publisher's PhaseTerminalNotAssessed emission is warranted -- "a
+// review that did not complete" (decision 1) means exactly this: the
+// ONE attempt that just reached a terminal turn state never posted a
+// verdict through the verdict-posting tool (httpapi.PostReviewVerdict,
+// the ONLY sanctioned path, §8.2's own RAW-COMMENT BLOCKING). Scoped to
+// attempt_id specifically, never repo_full_name/pr_number alone: a PRIOR
+// attempt's own verdict must never be read as evidence THIS attempt
+// completed (the identical "an emission carries the attempt... it was
+// produced for" discipline §21.1b states for the publisher itself).
+func (q *Queries) ExistsReviewVerdictForAttempt(ctx context.Context, attemptID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, existsReviewVerdictForAttempt, attemptID)
+	var verdict_exists bool
+	err := row.Scan(&verdict_exists)
+	return verdict_exists, err
+}
+
 const getLatestNonShadowReviewVerdict = `-- name: GetLatestNonShadowReviewVerdict :one
 SELECT rv.id, rv.repo_full_name, rv.pr_number, rv.head_sha, rv.risk_level, rv.premise, rv.blast_radius, rv.files_changed, rv.tests_coverage, rv.docs_drift, rv.proposed_shippable, rv.shippable, rv.session_id, rv.created_at, rv.digest_summary, rv.digest_arch_decisions, rv.digest_stack_risks, rv.digest_unverified_limits, rv.digest_description_adequacy, rv.digest_adequacy_explanation, rv.digest_proposed_body, rv.review_path, rv.counter_review, rv.fact_check, rv.fact_check_killed, rv.digest_contested_points, rv.suppressed_in_shadow, rv.arch_decision_tags, rv.arch_decision_roots, rv.knowledge_mode, rv.knowledge_influenced, rv.base_ref, rv.base_sha, rv.ancestor_chain, rv.policy_version, rv.attempt_id FROM review_verdicts rv
 LEFT JOIN turns t ON t.id = rv.attempt_id
