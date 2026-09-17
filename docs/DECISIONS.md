@@ -33,7 +33,9 @@ to adopt, and an entry that leaves with `reject` and a reason has done its job.
 | Whether this project takes an RWX account | **Yes** (2026-09-17). The real-binary test loses its skip, so `Resume` is settled empirically — Step 57's first exit criterion, never once run. Unblocks Phases 17 and 18 | Step 163 |
 | Mode B: kill, defer or build | **Build** (2026-09-17), in the separate repository, where it is already specified as Steps E5-E7. Building it in this repository was never one of the three. Step 107's baseline readout stays the reference input and its window keeps accruing; the decision was taken without waiting for it, deliberately rather than by oversight | Step 108 |
 | Whether to expose this system to existing MCP clients | **Adopt** (2026-09-17). Independent of any native-client decision, and the bulk of the cost is an authentication surface Step 158's device flow does not provide | Step 180 onward |
-| Whether a newly created automation can reach its secrets | **Adopt** (2026-09-17), reusing the existing secret scopes. A scope meaning "secret belonging to one automation" stays a separate decision | Step 184 |
+| Whether a newly created automation can reach its secrets | **Adopt** (2026-09-17). Taken together with the line below rather than left separate | Step 184 |
+| Whether the `automation` secret scope is completed | **Adopt** (2026-09-17). It has been schema-only since migration 000090 -- the column shipped so the follow-up would need no second migration, and this is that follow-up: CRUD at the scope, and candidate resolution in the sandbox delivery path. The register had named this a separate decision; it was taken with D-02 instead, and the row says so | Step 184 |
+| How automation env vars reach a session | **Real process environment** (2026-09-17), not only the prompt preamble they are today. The generic `cmd.Env` mechanism already exists and carries two sources; this is a third contributor on a built path, and the append order it joins has to be decided rather than inherited. The preamble stays -- knowing a value and resolving it in a shell are different needs | Step 187 |
 | Whether browser-side errors and user feedback are captured | **Adopt** (2026-09-17). Server traces do not cover browser failures; reading them as coverage would be a capability claimed by adjacency | Step 185 |
 | Whether session replay is adopted | **Adopt** (2026-09-17), decided separately from the line above because it is a choice about other people's data. Masking, activation and per-deployment data destination are all open inside the Step | Step 186 |
 
@@ -73,6 +75,7 @@ goes looking for. Read the row for the reasoning and the condition.
 | Sandbox secrets and OpenCode config | Step 72 |
 | Shadow operator surface | Step 104 |
 | The embeddings provider as an un-closed egress channel — **no longer deferred**, see the mode B decision above | Step 156 |
+| The `automation` secret scope, schema-only since migration 000090 — **no longer deferred**, taken with D-02 above. It was recorded only in that migration's comment and in `internal/domain/automation/doc.go`, findable from neither | Step 184 |
 
 §31.9 carries its own block of deliberate deferrals for the knowledge capability, each surfacing at
 its own Step rather than silently defaulting. That block is the authority for those; it is named
