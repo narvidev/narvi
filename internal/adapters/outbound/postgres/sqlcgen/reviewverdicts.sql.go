@@ -12,13 +12,14 @@ import (
 )
 
 const getLatestNonShadowReviewVerdict = `-- name: GetLatestNonShadowReviewVerdict :one
-SELECT id, repo_full_name, pr_number, head_sha, risk_level, premise, blast_radius, files_changed, tests_coverage, docs_drift, proposed_shippable, shippable, session_id, created_at, digest_summary, digest_arch_decisions, digest_stack_risks, digest_unverified_limits, digest_description_adequacy, digest_adequacy_explanation, digest_proposed_body, review_path, counter_review, fact_check, fact_check_killed, digest_contested_points, suppressed_in_shadow, arch_decision_tags, arch_decision_roots, knowledge_mode, knowledge_influenced, base_ref, base_sha, ancestor_chain, policy_version, attempt_id FROM review_verdicts rv
+SELECT rv.id, rv.repo_full_name, rv.pr_number, rv.head_sha, rv.risk_level, rv.premise, rv.blast_radius, rv.files_changed, rv.tests_coverage, rv.docs_drift, rv.proposed_shippable, rv.shippable, rv.session_id, rv.created_at, rv.digest_summary, rv.digest_arch_decisions, rv.digest_stack_risks, rv.digest_unverified_limits, rv.digest_description_adequacy, rv.digest_adequacy_explanation, rv.digest_proposed_body, rv.review_path, rv.counter_review, rv.fact_check, rv.fact_check_killed, rv.digest_contested_points, rv.suppressed_in_shadow, rv.arch_decision_tags, rv.arch_decision_roots, rv.knowledge_mode, rv.knowledge_influenced, rv.base_ref, rv.base_sha, rv.ancestor_chain, rv.policy_version, rv.attempt_id FROM review_verdicts rv
+LEFT JOIN turns t ON t.id = rv.attempt_id
 WHERE rv.repo_full_name = $1 AND rv.pr_number = $2
     AND NOT rv.suppressed_in_shadow
     AND rv.created_at > COALESCE(
         (SELECT rs.live_egress_promoted_at FROM repo_settings rs WHERE rs.repo_full_name = $1),
         'infinity'::timestamptz)
-ORDER BY rv.created_at DESC
+ORDER BY COALESCE(t.created_at, rv.created_at) DESC
 LIMIT 1
 `
 
@@ -28,10 +29,13 @@ type GetLatestNonShadowReviewVerdictParams struct {
 }
 
 // §30.8's own customer-consequential sibling of GetLatestReviewVerdict
-// above: the SAME per-PR latest-verdict reduction, but excluding any
-// verdict whose own suppressed_in_shadow stamp is true OR that predates
-// this repo's own live_egress_promoted_at fence (belt and suspenders --
-// see migrations/000104_repo_settings_live_egress_promoted_at.up.sql's
+// above: the SAME per-PR latest-verdict reduction -- including the
+// IDENTICAL attempt-ordering fix immediately above this query's own doc
+// comment (round-10 finding D), for the same reason: this query is
+// exactly as reachable by two in-flight attempts as its sibling is --
+// excluding any verdict whose own suppressed_in_shadow stamp is true OR
+// that predates this repo's own live_egress_promoted_at fence (belt and
+// suspenders -- see migrations/000104_repo_settings_live_egress_promoted_at.up.sql's
 // own doc comment for why both checks are independent, not redundant).
 // internal/app/sessionactor/reviewretrigger.go's own auto-retrigger
 // decision is this query's one caller: a shadow-era "already reviewed"
@@ -87,9 +91,10 @@ func (q *Queries) GetLatestNonShadowReviewVerdict(ctx context.Context, arg GetLa
 }
 
 const getLatestReviewVerdict = `-- name: GetLatestReviewVerdict :one
-SELECT id, repo_full_name, pr_number, head_sha, risk_level, premise, blast_radius, files_changed, tests_coverage, docs_drift, proposed_shippable, shippable, session_id, created_at, digest_summary, digest_arch_decisions, digest_stack_risks, digest_unverified_limits, digest_description_adequacy, digest_adequacy_explanation, digest_proposed_body, review_path, counter_review, fact_check, fact_check_killed, digest_contested_points, suppressed_in_shadow, arch_decision_tags, arch_decision_roots, knowledge_mode, knowledge_influenced, base_ref, base_sha, ancestor_chain, policy_version, attempt_id FROM review_verdicts
-WHERE repo_full_name = $1 AND pr_number = $2
-ORDER BY created_at DESC
+SELECT rv.id, rv.repo_full_name, rv.pr_number, rv.head_sha, rv.risk_level, rv.premise, rv.blast_radius, rv.files_changed, rv.tests_coverage, rv.docs_drift, rv.proposed_shippable, rv.shippable, rv.session_id, rv.created_at, rv.digest_summary, rv.digest_arch_decisions, rv.digest_stack_risks, rv.digest_unverified_limits, rv.digest_description_adequacy, rv.digest_adequacy_explanation, rv.digest_proposed_body, rv.review_path, rv.counter_review, rv.fact_check, rv.fact_check_killed, rv.digest_contested_points, rv.suppressed_in_shadow, rv.arch_decision_tags, rv.arch_decision_roots, rv.knowledge_mode, rv.knowledge_influenced, rv.base_ref, rv.base_sha, rv.ancestor_chain, rv.policy_version, rv.attempt_id FROM review_verdicts rv
+LEFT JOIN turns t ON t.id = rv.attempt_id
+WHERE rv.repo_full_name = $1 AND rv.pr_number = $2
+ORDER BY COALESCE(t.created_at, rv.created_at) DESC
 LIMIT 1
 `
 
@@ -98,15 +103,32 @@ type GetLatestReviewVerdictParams struct {
 	PrNumber     int32  `json:"pr_number"`
 }
 
-// The DISTINCT ON (repo, pr_number) ... ORDER BY created_at DESC
-// reduction §21.1 specifies -- scoped here to ONE (repo_full_name,
-// pr_number) pair (the one shape every real caller -- the auto-approval
-// eligibility engine, the decision inbox's own classification, the
-// revalidate-at-click/at-merge paths -- actually needs), so this is a
-// plain indexed lookup ORDER BY created_at DESC LIMIT 1, not a
-// multi-row DISTINCT ON scan -- see ListLatestAutoApprovedInRepo below
-// for the multi-PR, per-repo shape that DOES need real DISTINCT ON.
-// pgx.ErrNoRows means no verdict has ever been posted for this PR.
+// The DISTINCT ON (repo, pr_number) ... reduction §21.1 specifies --
+// scoped here to ONE (repo_full_name, pr_number) pair (the one shape
+// every real caller -- the auto-approval eligibility engine, the
+// decision inbox's own classification, the revalidate-at-click/at-merge
+// paths -- actually needs), so this is a plain indexed lookup LIMIT 1,
+// not a multi-row DISTINCT ON scan -- see ListLatestAutoApprovedInRepo
+// below for the multi-PR, per-repo shape that DOES need real DISTINCT
+// ON. pgx.ErrNoRows means no verdict has ever been posted for this PR.
+//
+// Ordered by the PRODUCING ATTEMPT's own creation time (turns.created_at,
+// joined via attempt_id) -- NEVER by review_verdicts.created_at alone
+// (round-10 finding D: "the authoritative verdict is whichever request
+// landed last, not the one for the current attempt", violating §21.1b's
+// "an emission carries the attempt and context it was produced for").
+// Two attempts can be in flight for one PR (§21.1b: "the record a
+// publisher is about to emit may already be superseded by the time it
+// emits"), and an OLDER attempt's own POST reaching this table AFTER a
+// NEWER attempt's must not win this read merely because its own INSERT
+// happened to commit later in wall-clock time -- this is a read-side
+// fix only, distinct from (and no substitute for) the write-side
+// refusal-on-supersession §21.1b describes and a later, unshipped GitHub
+// result publisher (§8.2, §21.1) implements against a real external
+// result. attempt_id is nullable (a
+// pre-amendment row recorded none): the LEFT JOIN's own unmatched NULL
+// falls through COALESCE to rv.created_at, preserving today's exact
+// ordering for any row that predates this column existing at all.
 //
 // Deliberately UNFILTERED by suppressed_in_shadow: §30.6 is explicit
 // that review_verdicts "render in Narvi's own UI with zero new work",

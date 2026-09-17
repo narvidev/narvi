@@ -101,8 +101,9 @@ func (s *GitHubPRSessionStore) GetByRepoAndPRNumber(ctx context.Context, repoFul
 // pending_head_sha (and this method) is superseded by turns.
 // review_head_sha, set once at turn-creation time
 // (internal/adapters/inbound/httpapi's createTurnLocked/CreateSessionOnTx)
-// and read back via TurnStore.GetProcessingTurnForSession -- see that
-// migration's own doc comment for the full "why a shared, mutable
+// and read back via turns.GetByDispatchedMessageID (finding F3, §21.1's
+// amendment, migrations/000131_turns_dispatched_message_id.up.sql) -- see
+// migration 000072's own doc comment for the full "why a shared, mutable
 // per-(repo,PR) column was the wrong place for this fact".
 
 // UpsertPendingRetriggerHeadSHA is §24's own actor-bypassing write

@@ -3,8 +3,6 @@ package reviewverdict
 import (
 	"time"
 
-	"github.com/jackc/pgx/v5/pgtype"
-
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
 	"github.com/narvidev/narvi/internal/domain/reviewtriage"
@@ -81,12 +79,18 @@ type Record struct {
 	// "Two
 	// attempts over identical code share a context; exactly one may
 	// publish the current result, which a context alone cannot express."
-	// The zero value (an invalid pgtype.UUID) is what a pre-existing row,
-	// or any caller that predates this Step, reads back as -- this Step
-	// does not itself build the "which attempt publishes" mechanism
-	// (§39.3's own atomic-claim idiom is the first real consumer); it
-	// only makes the fact recordable.
-	AttemptID pgtype.UUID
+	// Kept a plain string (never pgtype.UUID/uuid.UUID), mirroring
+	// internal/domain/plan.ID/internal/domain/authz.Actor.UserID's own
+	// identical "adapter-independent, caller converts at the boundary"
+	// precedent (§11: domain has zero external dependencies) -- this
+	// field used to be pgtype.UUID directly, which made this package
+	// import the Postgres driver (round-10 finding C). The zero value
+	// (an empty string) is what a pre-existing row, or any caller that
+	// predates this Step, reads back as -- this Step does not itself
+	// build the "which attempt publishes" mechanism (§39.3's own
+	// atomic-claim idiom is the first real consumer); it only makes the
+	// fact recordable.
+	AttemptID string
 }
 
 // Context is the review-context snapshot (§21.1's amendment) a review

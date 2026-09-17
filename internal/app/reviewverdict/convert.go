@@ -3,12 +3,32 @@ package reviewverdict
 import (
 	"encoding/json"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
 	"github.com/narvidev/narvi/internal/domain/reviewtriage"
 	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 )
+
+// attemptIDFromRow converts row.AttemptID (pgtype.UUID, this package's
+// own driver-facing type) into reviewverdict.Record.AttemptID's plain
+// string (round-10 finding C: the domain package must not know the
+// driver) -- row.AttemptID.Valid == false (a pre-amendment row, or any
+// verdict whose posting turn could not be resolved) degrades to "",
+// mirroring every other "absent column -> zero value, never a fabricated
+// fact" precedent in this file. uuid.UUID(...).String() mirrors this
+// codebase's own established pgtype.UUID-to-string conversion at an app-
+// layer boundary (internal/app/shadowledger/writer.go's identical
+// uuid.UUID(ledgerID.Bytes).String()).
+func attemptIDFromRow(id pgtype.UUID) string {
+	if !id.Valid {
+		return ""
+	}
+	return uuid.UUID(id.Bytes).String()
+}
 
 // marshalTags converts tags into JSONB bytes -- review_verdicts.
 // blast_radius/repo_settings.sensitive_blast_radius_tags' own shared
@@ -160,7 +180,7 @@ func recordFromRow(row sqlcgen.ReviewVerdict) reviewverdict.Record {
 		FactCheck:       factCheckFromRow(row),
 		FactCheckKilled: factCheckKilledFromRow(row),
 		Context:         contextFromRow(row),
-		AttemptID:       row.AttemptID,
+		AttemptID:       attemptIDFromRow(row.AttemptID),
 	}
 }
 

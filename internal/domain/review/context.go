@@ -50,27 +50,60 @@ type AncestorLink struct {
 }
 
 // AncestorChainFromStack derives the ordered ancestor chain (§21.1's
-// amendment) from a GitHub-native stack's own reported fields alone --
-// the only additional ancestry this codebase can derive today, since
-// §17.6 states nothing besides the origin+sentinel-fix pair produces a
-// chain deeper than two, and a GitHub-native stack object reports only
-// position/size/ultimate-base, never each intermediate link.
+// amendment) from a GitHub-native stack's own reported ref(s) plus a
+// caller-supplied, LIVE-resolved SHA for the one link this codebase can
+// derive today -- since §17.6 states nothing besides the origin+
+// sentinel-fix pair produces a chain deeper than two, and a GitHub-native
+// stack object reports only position/size/ultimate-base, never each
+// intermediate link.
+//
+// liveUltimateBaseSHA is deliberately a SEPARATE parameter, never
+// stack.UltimateBaseSHA (round-10 finding B): stack.UltimateBaseSHA is
+// GitHub's own per-PR field embedded directly in the pull request
+// resource ("stack":{"base":{"sha":...}}), exactly the same SHAPE of
+// value finding F1 already proved is a CACHED snapshot for the immediate
+// base (pull_request.base.sha) -- refreshed on GitHub's own schedule, not
+// on every push to the branch it names. Nothing in this codebase's own
+// GitHub REST schema documents a live-recompute trigger for the stack
+// object distinct from the one already used for an ordinary branch tip
+// (GET .../commits/{branch}, ports.SourceControl.ResolveBranchSHA). Before
+// this fix, BOTH the verdict's own recorded chain (built here, from
+// stack.UltimateBaseSHA) and the eligibility engine's live comparison
+// side (built from ports.OpenPR.AncestorChain, ALSO sourced straight from
+// GitHub's identical cached per-PR field, githubapi's own
+// ancestorChainFromDetailStack) read the SAME rarely-refreshed cached
+// value -- so the freshness check this chain exists to feed
+// (autoapproval.ancestorChainEqual) could pass identically whether or not
+// the branch stack.UltimateBaseRef actually names had moved at all,
+// verifying nothing. The caller (internal/app/reviewcontext.Fetch) now
+// resolves stack.UltimateBaseRef's own LIVE tip via the SAME
+// ResolveBranchSHA call already used for the immediate base, and passes
+// THAT value here -- mirroring BaseSHA's own identical "never the
+// cached field, always a live resolution" discipline one level up.
 //
 // A PR at the BOTTOM of its own stack (position <= 1) or with no stack at
 // all (stack == nil) has no ancestor beyond its own immediate base --
 // which PreFetchedContext's own BaseRef/BaseSHA (below) already carry --
 // so the chain is empty. A PR further up reports exactly one link: the
 // stack's own ultimate base, the one further-back fact a GitHub-native
-// stack actually exposes. A genuine N-deep producer (§39, unshipped) gets
-// a longer chain the day it exists to supply one: this function returns
-// an ordered SLICE, not a fixed 0-or-1 shape, so the comparison this
-// feeds (autoapproval.ComputeEligible) does not need to widen when trains
+// stack actually exposes. liveUltimateBaseSHA == "" (the caller's own
+// live resolution failed, or was never attempted) degrades to NO chain
+// at all -- never a link with an empty SHA, which autoapproval.
+// ancestorChainEqual would otherwise treat as a REAL, comparable value
+// rather than the "could not be established" signal it actually is;
+// mirroring EligibilityInput.VerdictBaseSHA/CurrentBaseSHA's own
+// identical "an empty value must fail closed on its own dedicated
+// reason, never silently match another empty value" contract (finding
+// F2). A genuine N-deep producer (§39, unshipped) gets a longer chain
+// the day it exists to supply one: this function returns an ordered
+// SLICE, not a fixed 0-or-1 shape, so the comparison this feeds
+// (autoapproval.ComputeEligible) does not need to widen when trains
 // ship.
-func AncestorChainFromStack(stack *StackContext) []AncestorLink {
-	if stack == nil || stack.Position <= 1 || stack.UltimateBaseRef == "" {
+func AncestorChainFromStack(stack *StackContext, liveUltimateBaseSHA string) []AncestorLink {
+	if stack == nil || stack.Position <= 1 || stack.UltimateBaseRef == "" || liveUltimateBaseSHA == "" {
 		return nil
 	}
-	return []AncestorLink{{Ref: stack.UltimateBaseRef, SHA: stack.UltimateBaseSHA}}
+	return []AncestorLink{{Ref: stack.UltimateBaseRef, SHA: liveUltimateBaseSHA}}
 }
 
 // PreFetchedContext is a review turn's own inline pre-fetched context
@@ -109,9 +142,10 @@ type PreFetchedContext struct {
 	// could see or influence, mirroring Shippable's own "never the
 	// model's self-report" discipline, domain/review's own top-level doc
 	// comment). The caller (internal/app/reviewcontext.Fetch, this
-	// struct's one real producer) persists this to github_pr_sessions.
-	// pending_head_sha, read back at verdict-post time
-	// (httpapi.PostReviewVerdict) -- never threaded through the turn/
+	// struct's one real producer) persists this to turns.review_head_sha
+	// (migrations/000072_turns_review_head_sha.up.sql), read back at
+	// verdict-post time via turns.GetByDispatchedMessageID (finding F3,
+	// §21.1's amendment) -- never threaded through the turn/
 	// tool-call machinery at all. Empty when the fetch that produced Diff
 	// could not determine a head SHA (a degraded, best-effort outcome,
 	// exactly like Diff itself being empty on a failed fetch).

@@ -30,7 +30,7 @@ func TestGetOpenPR_StackPresent_AncestorChainPopulated(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/pulls/42":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"number": 42, "title": "fix: retry loop", "html_url": "https://github.com/acme/widgets/pull/42",
-				"draft": false, "additions": 10, "deletions": 2, "changed_files": 1,
+				"state": "open", "draft": false, "additions": 10, "deletions": 2, "changed_files": 1,
 				"created_at": "2026-08-05T10:00:00Z", "updated_at": "2026-08-05T11:00:00Z",
 				"user":                map[string]any{"id": 500, "login": "narvi-bot"},
 				"head":                map[string]any{"sha": "headsha42"},
@@ -101,7 +101,7 @@ func TestGetOpenPR_NoStack_AncestorChainNil(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/pulls/43":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"number": 43, "title": "fix: retry loop take 2", "html_url": "https://github.com/acme/widgets/pull/43",
-				"draft": false, "additions": 10, "deletions": 2, "changed_files": 1,
+				"state": "open", "draft": false, "additions": 10, "deletions": 2, "changed_files": 1,
 				"created_at": "2026-08-05T10:00:00Z", "updated_at": "2026-08-05T11:00:00Z",
 				"user":                map[string]any{"id": 500, "login": "narvi-bot"},
 				"head":                map[string]any{"sha": "headsha43"},
@@ -137,5 +137,108 @@ func TestGetOpenPR_NoStack_AncestorChainNil(t *testing.T) {
 	}
 	if pr.AncestorChain != nil {
 		t.Errorf("GetOpenPR() AncestorChain = %+v, want nil (no stack object reported)", pr.AncestorChain)
+	}
+}
+
+// TestGetOpenPR_ClosedPR_FoundFalse is round-10 finding E's own regression
+// test: GetOpenPR's own doc comment (ports/sourcecontrol.go) promises
+// "found=false, err=nil means the PR does not exist, or is no longer open
+// (closed/merged)", but before this fix a real, decodable 200 response
+// for a CLOSED pull request reached found=TRUE identically to a
+// genuinely open one -- nothing on openPRDetailResponse's own decode
+// target was ever consulted to tell the two apart. This is the exact gap
+// that made internal/app/decisioninbox.RevalidateForAutoMerge's own "this
+// pull request is no longer open" refusal permanently unreachable for a
+// PR that closed or merged between discovery and revalidation.
+//
+// This fixture registers NO handler for /reviews, /commits/.../status,
+// /commits/.../check-runs, or /files -- GetOpenPR must return before ANY
+// of buildOpenPRFromDetail's own sub-fetches run at all for a
+// confirmed-closed PR, mirroring the confirmed-404 case's own identical
+// "return before building anything" shape immediately above in this
+// file. A regression that moved the state check to fire AFTER those
+// sub-fetches, or dropped it entirely, would either fail this test's own
+// "unexpected request" default case or (if dropped entirely) return
+// found=true.
+//
+// Mutation-test target: deleting `if detail.State != "open" { return
+// ports.OpenPR{}, false, nil }` from GetOpenPR (getopenpr.go) must turn
+// this test's own "found = false" assertion into "found = true".
+func TestGetOpenPR_ClosedPR_FoundFalse(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/pulls/44":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 44, "title": "fix: already closed", "html_url": "https://github.com/acme/widgets/pull/44",
+				"state": "closed", "draft": false, "additions": 10, "deletions": 2, "changed_files": 1,
+				"created_at": "2026-08-05T10:00:00Z", "updated_at": "2026-08-05T11:00:00Z",
+				"user":                map[string]any{"id": 500, "login": "narvi-bot"},
+				"head":                map[string]any{"sha": "headsha44"},
+				"base":                map[string]any{"ref": "main", "sha": "basesha-stale"},
+				"labels":              []map[string]any{},
+				"assignees":           []map[string]any{},
+				"requested_reviewers": []map[string]any{},
+				"requested_teams":     []map[string]any{},
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	adapter := githubapi.New(server.Client(), server.URL)
+
+	pr, found, err := adapter.GetOpenPR(context.Background(), "acme", "widgets", 44, "tok")
+	if err != nil {
+		t.Fatalf("GetOpenPR() error = %v, want nil", err)
+	}
+	if found {
+		t.Fatalf("GetOpenPR() found = true, want false (state == \"closed\") -- pr = %+v", pr)
+	}
+}
+
+// TestGetOpenPR_MergedPR_FoundFalse mirrors TestGetOpenPR_ClosedPR_FoundFalse
+// for a MERGED pull request specifically -- GitHub reports a merged PR
+// with state == "closed" too (never a distinct "merged" state value), so
+// this proves the SAME single-field check catches both, exactly as
+// openPRDetailResponse.State's own doc comment claims.
+func TestGetOpenPR_MergedPR_FoundFalse(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/pulls/45":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"number": 45, "title": "fix: already merged", "html_url": "https://github.com/acme/widgets/pull/45",
+				"state": "closed", "merged": true, "draft": false, "additions": 10, "deletions": 2, "changed_files": 1,
+				"created_at": "2026-08-05T10:00:00Z", "updated_at": "2026-08-05T11:00:00Z",
+				"user":                map[string]any{"id": 500, "login": "narvi-bot"},
+				"head":                map[string]any{"sha": "headsha45"},
+				"base":                map[string]any{"ref": "main", "sha": "basesha-stale"},
+				"labels":              []map[string]any{},
+				"assignees":           []map[string]any{},
+				"requested_reviewers": []map[string]any{},
+				"requested_teams":     []map[string]any{},
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	adapter := githubapi.New(server.Client(), server.URL)
+
+	pr, found, err := adapter.GetOpenPR(context.Background(), "acme", "widgets", 45, "tok")
+	if err != nil {
+		t.Fatalf("GetOpenPR() error = %v, want nil", err)
+	}
+	if found {
+		t.Fatalf("GetOpenPR() found = true, want false (state == \"closed\", merged == true) -- pr = %+v", pr)
 	}
 }

@@ -13,28 +13,6 @@ import (
 	"github.com/narvidev/narvi/internal/platform"
 )
 
-// convertAncestorChain converts links (ports.PRAncestorLink, this port's
-// own domain-free copy of the identical shape, ports.PRAncestorLink's own
-// doc comment) into review.AncestorLink -- the one place this codebase
-// converts between the two, mirroring how every other ports<->domain
-// boundary in this file already converts (e.g. autoapproval.
-// ClassifyChangedPaths over target.ChangedFiles, immediately below this
-// function's own two real call sites). A nil links converts to a nil
-// result, never an empty-but-non-nil slice -- both compare equal under
-// autoapproval.ComputeEligible's own ancestorChainEqual (that function's
-// own doc comment), so this is a preference for the common case, not a
-// correctness requirement.
-func convertAncestorChain(links []ports.PRAncestorLink) []review.AncestorLink {
-	if links == nil {
-		return nil
-	}
-	out := make([]review.AncestorLink, len(links))
-	for i, l := range links {
-		out[i] = review.AncestorLink{Ref: l.Ref, SHA: l.SHA}
-	}
-	return out
-}
-
 // RevalidateForMerge re-checks, LIVE and never cached (§16.2, §5.2's own
 // "the rendered queue is never trusted as authority" invariant), whether
 // (repoFullName, prNumber) is currently eligible for actorGitHubID to
@@ -374,17 +352,30 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	// thing standing between a not-assessed PR and a merge --
 	// ComputeEligible checks it again regardless.
 	probeInput := autoapproval.EligibilityInput{
-		Verdict:                    record.Verdict,
-		VerdictAssessed:            true,
-		VerdictHeadSHA:             record.HeadSHA,
-		VerdictBaseRef:             record.Context.BaseRef,
-		VerdictBaseSHA:             record.Context.BaseSHA,
-		VerdictAncestorChain:       record.Context.AncestorChain,
-		VerdictPolicyVersion:       record.Context.PolicyVersion,
-		CurrentHeadSHA:             target.HeadSHA,
-		CurrentBaseRef:             target.BaseRef,
-		CurrentBaseSHA:             record.Context.BaseSHA, // assumed equal -- see doc comment above
-		CurrentAncestorChain:       convertAncestorChain(target.AncestorChain),
+		Verdict:              record.Verdict,
+		VerdictAssessed:      true,
+		VerdictHeadSHA:       record.HeadSHA,
+		VerdictBaseRef:       record.Context.BaseRef,
+		VerdictBaseSHA:       record.Context.BaseSHA,
+		VerdictAncestorChain: record.Context.AncestorChain,
+		VerdictPolicyVersion: record.Context.PolicyVersion,
+		CurrentHeadSHA:       target.HeadSHA,
+		CurrentBaseRef:       target.BaseRef,
+		CurrentBaseSHA:       record.Context.BaseSHA, // assumed equal -- see doc comment above
+		// CurrentAncestorChain (round-10 finding B) mirrors CurrentBaseSHA's
+		// own identical "assumed equal to the verdict's own recorded
+		// value" leniency immediately above, for the identical reason:
+		// the REAL, live-resolved chain (currentAncestorChain, computed
+		// further down this function, right before the final
+		// ComputeEligible call) is deferred past this probe exactly like
+		// the real currentBaseSHA is, so a PR already ineligible on some
+		// OTHER, cheaper-to-check criterion never pays for a live GitHub
+		// call this probe's own early-refusal makes moot. Never
+		// target.AncestorChain's own raw ref+sha pairs here -- that
+		// reads GitHub's own CACHED per-PR stack field, the same shape
+		// finding F1 already proved stale-by-design, which is exactly
+		// what made this whole comparison verify nothing before this fix.
+		CurrentAncestorChain:       record.Context.AncestorChain,
 		BaseAdvancedWithoutRewrite: true, // moot: the assumed SHA equality above already bypasses this check
 		CIGreen:                    ciGreen,
 		HasNeedsHumanLabel:         hasNeedsHuman,
@@ -534,6 +525,44 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		baseAdvancedWithoutRewrite = confirmed
 	}
 
+	// currentAncestorChain (round-10 finding B) mirrors currentBaseSHA's
+	// own identical "never the cached field, always a live resolution"
+	// discipline immediately above, one link further: target.AncestorChain
+	// (ports.OpenPR's own field) is GitHub's per-PR CACHED stack object,
+	// the exact shape finding F1 already proved stale-by-design for the
+	// immediate base -- comparing it against record.Context.AncestorChain
+	// (itself now ALSO live-resolved at review-context-fetch time,
+	// internal/app/reviewcontext.Fetch) would otherwise compare a live
+	// fact against a cached one, unequal by construction, exactly the
+	// hazard F1 closed for CurrentBaseSHA. §17.6 bounds this to AT MOST
+	// ONE link today, so this is at most one further live call -- the
+	// ref itself (a branch name) is trusted from the cached read, exactly
+	// like BaseRef is; only the SHA is re-resolved live.
+	// currentAncestorChain's own zero value (nil) is the correct answer
+	// whenever target.AncestorChain reports no link at all, or the live
+	// resolution below comes back empty -- never a link with a stale or
+	// empty SHA, mirroring AncestorChainFromStack's own identical
+	// empty-liveSHA-degrades-to-no-link discipline
+	// (internal/domain/review/context.go).
+	var currentAncestorChain []review.AncestorLink
+	if len(target.AncestorChain) > 0 && target.AncestorChain[0].Ref != "" {
+		ancestorSHACtx, cancel := context.WithTimeout(ctx, deps.Timeouts.DecisionInboxResolveBranchSHATimeout)
+		liveAncestorSHA, _, liveAncestorErr := sourceControl.ResolveBranchSHA(ancestorSHACtx, ports.ResolveBranchSHASpec{
+			Owner:  target.Owner,
+			Repo:   target.Repo,
+			Branch: target.AncestorChain[0].Ref,
+			Token:  token,
+		})
+		cancel()
+		if liveAncestorErr != nil {
+			platform.Logger(ctx).Warn("decisioninbox: resolve ancestor chain's own live tip failed, refusing merge -- could not confirm the pull request's current ancestor chain", "error", liveAncestorErr, "repo_full_name", repoFullName, "pr_number", prNumber)
+			return false, "", "this pull request's ancestor chain could not be confirmed (a live check failed) -- try again shortly", nil
+		}
+		if liveAncestorSHA != "" {
+			currentAncestorChain = []review.AncestorLink{{Ref: target.AncestorChain[0].Ref, SHA: liveAncestorSHA}}
+		}
+	}
+
 	eligible, eligReason := autoapproval.ComputeEligible(autoapproval.EligibilityInput{
 		Verdict:                    record.Verdict,
 		VerdictAssessed:            true,
@@ -545,7 +574,7 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		CurrentHeadSHA:             target.HeadSHA,
 		CurrentBaseRef:             target.BaseRef,
 		CurrentBaseSHA:             currentBaseSHA,
-		CurrentAncestorChain:       convertAncestorChain(target.AncestorChain),
+		CurrentAncestorChain:       currentAncestorChain,
 		BaseAdvancedWithoutRewrite: baseAdvancedWithoutRewrite,
 		CIGreen:                    ciGreen,
 		HasNeedsHumanLabel:         hasNeedsHuman,

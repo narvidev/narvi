@@ -15,18 +15,24 @@
 -- table would destroy the very history §21.1's analytics rollups
 -- (timeseries, top-risk-driver breakdown) read from. The LATEST verdict
 -- per PR is instead a read-time reduction (queries/reviewverdicts.sql's
--- own GetLatestReviewVerdict, a DISTINCT ON (repo_full_name, pr_number)
--- ... ORDER BY created_at DESC query) -- no second table, no triggers, no
--- convention a future writer could forget to honor.
+-- own GetLatestReviewVerdict, scoped to one (repo_full_name, pr_number)
+-- pair; ListLatestAutoApprovedInRepo, same file, is the real multi-PR
+-- DISTINCT ON (repo_full_name, pr_number) reduction) -- no second table,
+-- no triggers, no convention a future writer could forget to honor.
 --
 -- head_sha (§21.1's own emphatic requirement) is the commit this verdict
 -- was actually produced against -- the SAME SHA the review session's own
 -- pre-fetched diff (internal/app/reviewcontext.Fetch, Step 46) was already
--- anchored to. This is forwarded from github_pr_sessions.pending_head_sha
--- (migrations/000068), itself populated at context-fetch time by every
--- review-trigger ingress path -- never re-derived here, and never asked of
--- the reviewing agent (which has no reliable way to self-report it; see
--- that migration's own doc comment for the full "why"). NOT NULL: a
+-- anchored to. This was originally forwarded from github_pr_sessions.
+-- pending_head_sha (migrations/000068), itself populated at context-fetch
+-- time by every review-trigger ingress path; migration
+-- 000072_turns_review_head_sha.up.sql later dropped that column outright
+-- and moved this same fact onto turns.review_head_sha instead (see that
+-- migration's own doc comment for the full "why a shared, mutable
+-- per-(repo,PR) column was the wrong place for this fact") -- head_sha on
+-- THIS table is unaffected either way: never re-derived here, and never
+-- asked of the reviewing agent (which has no reliable way to self-report
+-- it). NOT NULL: a
 -- verdict with no known head SHA cannot honestly participate in the
 -- auto-approval eligibility engine's own stale-verdict guard (§21.2) at
 -- all, so this table refuses to record one rather than silently treating

@@ -384,11 +384,12 @@ func TestPostReviewVerdict_PersistsReviewVerdictRow_WhenReviewHeadSHAKnown(t *te
 	ctx := context.Background()
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-persist", 55)
 
-	// the head sha now lives on the session's own
-	// CURRENTLY-PROCESSING turn (turns.review_head_sha), resolved via
-	// TurnStore.GetProcessingTurnForSession -- mirrors how a real review
-	// turn is dispatched (status='processing') by the time its own agent
-	// calls this endpoint.
+	// the head sha lives on this specific turn
+	// (turns.review_head_sha) -- mirrors how a real review turn is
+	// dispatched (status='processing') by the time its own agent calls
+	// this endpoint. Resolved via turns.GetByDispatchedMessageID below
+	// (finding F3), never TurnStore.GetProcessingTurnForSession -- see
+	// that lookup's own doc comment two lines down.
 	reviewHeadSHA := "sha-persist-abc123"
 	createdTurn, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &reviewHeadSHA})
 	if err != nil {
@@ -413,7 +414,7 @@ func TestPostReviewVerdict_PersistsReviewVerdictRow_WhenReviewHeadSHAKnown(t *te
 		t.Fatalf("query review_verdicts row: %v", err)
 	}
 	if row.HeadSha != "sha-persist-abc123" {
-		t.Errorf("head_sha = %q, want %q (forwarded verbatim from pending_head_sha)", row.HeadSha, "sha-persist-abc123")
+		t.Errorf("head_sha = %q, want %q (forwarded verbatim from this turn's own turns.review_head_sha)", row.HeadSha, "sha-persist-abc123")
 	}
 	if row.RiskLevel != string(review.RiskLevelLow) {
 		t.Errorf("risk_level = %q, want %q", row.RiskLevel, review.RiskLevelLow)
@@ -432,6 +433,106 @@ func TestPostReviewVerdict_PersistsReviewVerdictRow_WhenReviewHeadSHAKnown(t *te
 	}
 	if row.Shippable != string(review.ShippableAuto) {
 		t.Errorf("shippable = %q, want %q (server-computed from risk=low/premise=ok/coverage=adequate)", row.Shippable, review.ShippableAuto)
+	}
+}
+
+// TestPostReviewVerdict_DispatchedMessageIDScopedToSession_NeverResolvesAnotherSessionsTurn
+// is round-10 finding A3's own regression test: turns.
+// GetTurnByDispatchedMessageID (queries/turns.sql) is scoped by BOTH
+// session_id AND dispatched_message_id -- session_id is the ONLY thing
+// stopping a request authenticated for one sandbox/session from
+// addressing a DIFFERENT session's own turn, since dispatched_message_id
+// alone is unique only in PRACTICE (a UUID minted fresh per real
+// dispatch, never DB-enforced -- GetTurnByDispatchedMessageID's own doc
+// comment, queries/turns.sql), not by construction. Two real sessions,
+// each with their own real sandbox and their own real dispatched turn,
+// both deliberately stamped with the SAME dispatched_message_id
+// (testDispatchMessageID, seedDispatchedTurn's own shared fixed
+// constant -- an artificial collision no two real dispatches would ever
+// produce on their own, but exactly what a DB-level uniqueness gap
+// permits) -- proving a verdict POSTed against session A, authenticated
+// with session A's own bearer, is attributed to session A's OWN turn
+// (via review_verdicts.attempt_id, finding A4) and never session B's,
+// even though both turns match on dispatched_message_id alone.
+//
+// Mutation-test target: deleting "AND dispatched_message_id = $2"'s own
+// sibling "session_id = $1" predicate from GetTurnByDispatchedMessageID
+// (queries/turns.sql) leaves this package's OWN suite green apart from
+// THIS test -- see this Step's own PR body for the exact mutation run
+// and the observed failure.
+func TestPostReviewVerdict_DispatchedMessageIDScopedToSession_NeverResolvesAnotherSessionsTurn(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+
+	sessionA := setupReviewSessionWithSandbox(ctx, t, rig, "acme/scoped-session-a", 501)
+	sessionB := setupReviewSessionWithSandbox(ctx, t, rig, "acme/scoped-session-b", 502)
+
+	// A real, dispatched, PROCESSING turn per session, each carrying its
+	// own distinguishable review_head_sha (never seedDispatchedTurn,
+	// which leaves review_head_sha NULL -- PostReviewVerdict skips the
+	// review_verdicts insert entirely for a NULL head sha, which would
+	// make this test's own attempt_id query find nothing to assert on)
+	// -- mirrors TestPostReviewVerdict_PersistsReviewVerdictRow_
+	// WhenReviewHeadSHAKnown's own Create-then-UpdateStatus dance.
+	//
+	// Deliberate ORDER (both turns created first, then session B's own
+	// turn stamped with the shared dispatch id BEFORE session A's own):
+	// Postgres MVCC gives an UPDATE's new row version a fresh physical
+	// tuple, appended after every tuple that already exists -- a plain
+	// sequential scan with no ORDER BY (this query's own shape) walks
+	// tuples in that physical order, so stamping B's turn first makes
+	// B's live tuple sort BEFORE A's. Without this ordering, an
+	// unscoped query would still happen to return A's own turn FIRST
+	// (created and stamped earliest) even with the session_id predicate
+	// removed, and this test would pass for the wrong reason regardless
+	// of whether the scoping the mutation below removes is present at
+	// all.
+	headSHAA := "sha-session-a"
+	turnA, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: sessionA.ID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &headSHAA})
+	if err != nil {
+		t.Fatalf("seed session A's own turn: %v", err)
+	}
+	headSHAB := "sha-session-b"
+	turnB, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: sessionB.ID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &headSHAB})
+	if err != nil {
+		t.Fatalf("seed session B's own turn: %v", err)
+	}
+	// Round-10 finding A3's own artificial collision: session B's turn
+	// deliberately shares session A's own dispatched_message_id --
+	// dispatched_message_id is unique only in PRACTICE (a UUID minted
+	// fresh per real dispatch, never DB-enforced), so this is exactly the
+	// shape a DB-level uniqueness gap permits, never something two real
+	// dispatches would produce on their own. Stamped BEFORE session A's
+	// own turn -- see the ordering note above.
+	turnBMessageID := testDispatchMessageID
+	if turnB, err = rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: turnB.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedMessageID: &turnBMessageID}); err != nil {
+		t.Fatalf("stamp dispatched_message_id on session B's own turn: %v", err)
+	}
+	turnAMessageID := testDispatchMessageID
+	if turnA, err = rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: turnA.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedMessageID: &turnAMessageID}); err != nil {
+		t.Fatalf("stamp dispatched_message_id on session A's own turn: %v", err)
+	}
+	if turnA.ID == turnB.ID {
+		t.Fatal("turnA.ID == turnB.ID -- test setup is broken, this assertion would be vacuous")
+	}
+
+	status, resp := postReviewVerdict(t, rig, sessionA.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, validVerdictRequestJSON())
+	if status != http.StatusCreated {
+		t.Fatalf("status = %d, body = %+v, want %d", status, resp, http.StatusCreated)
+	}
+
+	var attemptID pgtype.UUID
+	if err := rig.pool.QueryRow(ctx, `SELECT attempt_id FROM review_verdicts WHERE repo_full_name = $1 AND pr_number = $2`, "acme/scoped-session-a", 501).Scan(&attemptID); err != nil {
+		t.Fatalf("query review_verdicts attempt_id: %v", err)
+	}
+	if !attemptID.Valid {
+		t.Fatal("review_verdicts.attempt_id is NULL, want a valid id -- this assertion needs a real value to compare")
+	}
+	if attemptID.Bytes == turnB.ID.Bytes {
+		t.Fatalf("review_verdicts.attempt_id = session B's own turn id (%s) -- posting against session A resolved a DIFFERENT session's turn, proving turns.GetTurnByDispatchedMessageID's own session_id scoping is not being applied", turnB.ID)
+	}
+	if attemptID.Bytes != turnA.ID.Bytes {
+		t.Errorf("review_verdicts.attempt_id = %s, want session A's own turn id %s", attemptID, turnA.ID)
 	}
 }
 

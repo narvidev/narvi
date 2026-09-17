@@ -83,6 +83,17 @@ type Fetcher interface {
 // caller goes on to persist. There is no longer a "two independent
 // sources" question to ask.
 //
+// **This paragraph describes this function's ORIGINAL fix, since
+// amended.** Finding F1, below, found that pinning the BASE half of the
+// pair to pr.BaseRef (a branch NAME, not a commit) reintroduces the
+// identical class of race one level down -- GitHub re-resolves a branch
+// name to whatever is current at request time, exactly like the
+// PR-resource diff endpoint this paragraph's own fix was written to
+// avoid. The diff is therefore actually pinned to (baseSHA, pr.HeadSHA)
+// -- baseSHA being finding F1's own LIVE ResolveBranchSHA result, below
+// -- falling back to pr.BaseRef only when that live resolution fails,
+// never as the first choice this paragraph's own wording still implies.
+//
 // This deliberately gives up the PREVIOUS optimization of skipping the
 // GetPullRequest call entirely when a caller's own webhook payload
 // already supplied stack/head-sha inline (the label-retrigger path,
@@ -175,6 +186,35 @@ func Fetch(ctx context.Context, logger *slog.Logger, fetcher Fetcher, timeouts p
 		baseSHA = ""
 	}
 
+	// Round-10 finding B: stack.UltimateBaseSHA (whether derived from
+	// pr.Stack just above, or carried in verbatim via knownStack) is
+	// GitHub's own per-PR CACHED field, exactly the same shape finding F1
+	// already proved stale-by-design for the immediate base -- comparing
+	// that cached value against itself at eligibility time (both sides
+	// ultimately sourced from the identical rarely-refreshed GitHub
+	// field) verifies nothing. Mirrors baseSHA's own resolution
+	// immediately above, one link further: only attempted when a stack
+	// exists and AncestorChainFromStack would otherwise report a real
+	// link (stack.Position > 1, stack.UltimateBaseRef != "") -- an
+	// ordinary, non-stacked PR (the overwhelming common case) costs
+	// nothing extra. A resolution failure degrades exactly like baseSHA's
+	// own: logged, liveAncestorBaseSHA stays "", and
+	// AncestorChainFromStack's own empty-liveSHA guard then reports NO
+	// chain at all rather than a link carrying a stale or empty SHA --
+	// never a reason to refuse creating the review turn.
+	var liveAncestorBaseSHA string
+	if stack != nil && stack.Position > 1 && stack.UltimateBaseRef != "" {
+		ancestorCtx, ancestorCancel := context.WithTimeout(ctx, timeouts.GitHubResolveBaseBranchSHATimeout)
+		resolvedSHA, _, ancestorErr := fetcher.ResolveBranchSHA(ancestorCtx, ports.ResolveBranchSHASpec{Owner: owner, Repo: repo, Branch: stack.UltimateBaseRef, Token: token})
+		ancestorCancel()
+		if ancestorErr != nil {
+			logger.Warn("reviewcontext: resolve stack's own ultimate base branch live tip failed, review turn's persisted ancestor chain will be empty (context reads as unknown, never a stale match)",
+				"error", ancestorErr, "owner", owner, "repo", repo, "pr_number", number, "ultimate_base_ref", stack.UltimateBaseRef)
+		} else {
+			liveAncestorBaseSHA = resolvedSHA
+		}
+	}
+
 	diffBase := pr.BaseRef
 	if baseSHA != "" {
 		diffBase = baseSHA
@@ -223,7 +263,10 @@ func Fetch(ctx context.Context, logger *slog.Logger, fetcher Fetcher, timeouts p
 		// is derived from `stack` (already resolved above, preferring
 		// knownStack exactly like Stack itself), never re-derived from
 		// pr.Stack directly, mirroring `stack`'s own "knownStack takes
-		// precedence" convention. PolicyVersion is stamped from this
+		// precedence" convention -- but its SHA is liveAncestorBaseSHA
+		// (round-10 finding B), never stack.UltimateBaseSHA, mirroring
+		// BaseSHA's own identical "never the cached field" discipline
+		// immediately below. PolicyVersion is stamped from this
 		// package's own imported autoapproval.CurrentPolicyVersion --
 		// internal/domain/review cannot import that package itself
 		// (§11: "zero external imports"), so a caller that already can
@@ -236,7 +279,7 @@ func Fetch(ctx context.Context, logger *slog.Logger, fetcher Fetcher, timeouts p
 		// ResolveBranchSHA call above for the full "why").
 		BaseRef:           pr.BaseRef,
 		BaseSHA:           baseSHA,
-		AncestorChain:     review.AncestorChainFromStack(stack),
+		AncestorChain:     review.AncestorChainFromStack(stack, liveAncestorBaseSHA),
 		PolicyVersion:     autoapproval.CurrentPolicyVersion,
 		Title:             pr.Title,
 		Body:              pr.Body,
