@@ -277,6 +277,33 @@ const (
 	// gap; see internal/app/outboxworker/digestlinearnotifier.go's own
 	// doc comment for the full "why".
 	NotificationKindLinearDigest NotificationKind = "linear_digest"
+
+	// NotificationKindGitHubReviewCheck is this codebase's own addition
+	// for the review's GitHub-native result surface (§8.2/§21.1/§21.1b): routes
+	// to internal/app/outboxworker's own review-check notifier, which
+	// publishes/updates the narvi/review check run for a pull request --
+	// see ReviewCheckPayload's own doc comment for the wire shape, and
+	// internal/domain/reviewcheck for the pure state mapping and
+	// supersession rule that notifier's own Deliver applies. Enqueued
+	// from three places, one per internal/domain/reviewcheck.Phase this
+	// Step actually wires a trigger for: internal/adapters/inbound/
+	// github's own coalesce.go (PhaseQueued -- decision 2 asks for this
+	// as soon as a pull request enters scope, but coalesce.go's own
+	// CreateOrJoin (its own Deps.Outbox doc comment has the full
+	// correction) is only ever reached from a resolved @mention or a
+	// label re-trigger, never a bare "PR opened" webhook, so what
+	// actually fires here is "a review was TRIGGERED", a narrower event
+	// than decision 2 names -- a PR nobody has mentioned the bot on yet
+	// still carries no check at all, a deferred gap, not a closed one),
+	// internal/app/sessionactor's own dispatch.go (PhaseRunning, a review
+	// turn dispatched) and reviewverdict.go/outboxenqueue.go
+	// (PhaseTerminalAssessed/PhaseTerminalNotAssessed, a review turn
+	// concluding with or without a posted verdict).
+	// PhaseStale is a real, mapped, tested state (internal/domain/
+	// reviewcheck's own doc comment on PhaseStale) with no live trigger
+	// wired by this Step -- named as an explicit follow-up, never
+	// silently assumed built.
+	NotificationKindGitHubReviewCheck NotificationKind = "github_review_check"
 )
 
 // Notification is what Notifier.Deliver needs to deliver ONE outbox entry

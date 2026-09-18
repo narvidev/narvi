@@ -83,6 +83,7 @@ import (
 	"time"
 
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/domain/reviewcheck"
 )
 
 // maxOpenPRsForUser bounds how many discovered candidate PRs
@@ -664,6 +665,22 @@ func ancestorChainFromDetailStack(stack *stackResponse) []ports.PRAncestorLink {
 // genuine, confirmed failure signal still wins over an incomplete one"
 // precedent), but sawSuccess alone, with the other GET's own health
 // unknown, is no longer sufficient to report green.
+//
+// Narvi's own narvi/review check run (reviewcheck.CheckName) is excluded
+// from the check-runs loop below by NAME, regardless of its own status/
+// conclusion -- fourth review round, HIGH, reproduced in both directions
+// against the real code: with no exclusion, this publisher's own
+// action_required (a review timed out with no verdict) read as a
+// confirmed CI FAILURE here, this publisher's own success read as a
+// confirmed CI SUCCESS on a repository with no real CI at all (ciGreen
+// satisfied purely by Narvi grading its own homework), and this
+// publisher's own queued/running (Conclusion == nil) tripped
+// sawIncomplete, making every in-flight review read its own PR as
+// CI-not-green. See mergedbetween.go's own fetchCIConclusion doc comment
+// (the §15.2 retrospective sibling reading the identical unfiltered set
+// before this fix) for the full "why NAME, not App id or external_id"
+// reasoning -- both functions apply the identical exclusion, for the
+// identical reason.
 func (a *Adapter) fetchCIConclusionLive(ctx context.Context, owner, repo, headSHA, token string) (ports.CIConclusion, bool) {
 	sawFailure := false
 	sawSuccess := false
@@ -751,6 +768,14 @@ func (a *Adapter) fetchCIConclusionLive(ctx context.Context, owner, repo, headSH
 				degraded = true
 			}
 			for _, r := range runs.CheckRuns {
+				if r.Name == reviewcheck.CheckName {
+					// Narvi's own check run -- see this function's own
+					// doc comment for the full "why". Skipped BEFORE the
+					// nil-conclusion check below, deliberately: a
+					// queued/running narvi/review run must not trip
+					// sawIncomplete either.
+					continue
+				}
 				if r.Conclusion == nil {
 					// Still queued/in_progress -- UNLIKE fetchCIConclusion's
 					// own identical loop, this is never simply skipped: a

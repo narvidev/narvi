@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -19,6 +20,8 @@ import (
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/domain/authz"
 	intentdomain "github.com/narvidev/narvi/internal/domain/intent"
+	"github.com/narvidev/narvi/internal/domain/reposource"
+	"github.com/narvidev/narvi/internal/domain/reviewcheck"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -208,6 +211,28 @@ type SessionCoalescer struct {
 	// silently broke along with it.
 	RolloutMode  platform.RolloutMode
 	RepoSettings *postgres.RepoSettingsStore
+
+	// Outbox is this repository's own addition for the review's
+	// GitHub-native result surface (§8.2/§21.1/§21.1b): the WINNER path
+	// below enqueues exactly one ports.NotificationKindGitHubReviewCheck
+	// row, in the SAME transaction as the claim row's own SetSessionID
+	// write. Decision 2 (§21.1b) asks for a check published in
+	// queued "as soon as a pull request enters scope, before any review
+	// starts" -- what this WINNER path actually publishes queued for is
+	// narrower than that: CreateOrJoin (below) is only ever reached from
+	// a resolved @mention or a label re-trigger (handler.go's own
+	// parseMention gate before it), never from a bare pull_request
+	// "opened" webhook (this package has no such lane -- see
+	// pullrequestevent.go's own top doc comment), so this fires when a
+	// review is TRIGGERED, not when the PR itself enters scope. A PR
+	// nobody has ever mentioned the bot on still carries no check at all
+	// -- decision 2's own full gap, named rather than silently assumed
+	// closed; see ports.NotificationKindGitHubReviewCheck's own doc
+	// comment (notifier.go) for the identical correction. The REUSE path
+	// never enqueues one: an ordinary second @mention or a label
+	// re-trigger reuses an ALREADY-tracked PR, which already has its own
+	// check run from whichever WINNER call first claimed it.
+	Outbox *postgres.OutboxStore
 }
 
 // CreateOrJoin is §8.2's own per-PR coalescing entry point -- see
@@ -602,7 +627,17 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 		// REUSE-path turn ever gets -- light leaves both nil (today's
 		// unchanged behavior), deep forces high effort (and, when
 		// c.ReviewModelDeep is configured, a specific frontier model).
-		createdTurn, err := httpapi.CreateTurnForBot(ctx, c.Pool, c.Sessions, c.Turns, c.Plans, c.IntentClassifier, c.AuditLog, c.Registry, existing, prompt, triageModelID, req.PlanMode, false, actor, reviewHeadSHAPtr, &classifyText, triageEffort, reviewDepthPtr, triageRecordJSON, knowledgeMode, knowledgeDecisionJSON, reviewVerdictContextJSON)
+		//
+		// isLabelRetrigger, passed straight through as
+		// CreateTurnForBot's own new isReviewAttempt parameter (finding
+		// A4): this REUSE branch is reached by BOTH an ordinary follow-up
+		// @mention and a "review:*" label re-trigger (reuseAction's own
+		// branch above already distinguishes the two for authorization);
+		// only the label re-trigger is a genuine review attempt that
+		// should ever move the narvi/review check -- see turns.
+		// is_review_attempt's own migration doc comment for the full
+		// "why" an ordinary follow-up must NOT set this.
+		createdTurn, err := httpapi.CreateTurnForBot(ctx, c.Pool, c.Sessions, c.Turns, c.Plans, c.IntentClassifier, c.AuditLog, c.Registry, existing, prompt, triageModelID, req.PlanMode, false, actor, reviewHeadSHAPtr, &classifyText, triageEffort, reviewDepthPtr, triageRecordJSON, knowledgeMode, knowledgeDecisionJSON, reviewVerdictContextJSON, isLabelRetrigger)
 		if err != nil {
 			// mention_count untouched here too (audit fix): this is the
 			// OTHER denial route the increment used to run ahead of --
@@ -767,6 +802,47 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 			return sqlcgen.Session{}, sqlcgen.Turn{}, false, fmt.Errorf("github: expected exactly one turn for new session, got %d", len(turnRows))
 		}
 		createdTurn = turnRows[0]
+	}
+
+	// The review's own GitHub-native result surface (§8.2/§21.1/§21.1b):
+	// decision 2 asks for a check published in queued as soon as a pull
+	// request enters scope, before any review starts -- what this WINNER
+	// branch actually publishes queued for is narrower (Deps.Outbox's own
+	// doc comment, above, has the full correction): this function is only
+	// ever reached from a resolved @mention or a label re-trigger, so
+	// this fires when a review is TRIGGERED, a pull request that nobody
+	// has mentioned the bot on yet still carries no check at all -- named
+	// as a deferred gap, not silently assumed closed. Enqueued in the
+	// SAME transaction as the claim row's own SetSessionID write below
+	// (§5.1: "written in the same tx as the state change"). Skipped when
+	// reviewHeadSHA is unknown (the
+	// context-fetch that would have resolved it failed) -- mirrors
+	// httpapi.PostReviewVerdict's own identical "no head sha, no
+	// row" degradation: a queued check with no commit to anchor it to
+	// cannot be created at all, and this is a safe, not a dangerous,
+	// omission (no check published is the SAME state a repo with the
+	// publisher not yet built would be in, not a regression this Step
+	// introduces).
+	if reviewHeadSHA != "" && c.Outbox != nil {
+		owner, repo, ok := reposource.SplitFullName(repoFullName)
+		if !ok {
+			logger.Warn("github: winner path: repo_full_name not in owner/repo shape, skipping queued review-check emission", "repo_full_name", repoFullName)
+		} else {
+			queuedPayload, marshalErr := json.Marshal(ports.ReviewCheckPayload{
+				Owner: owner, Repo: repo, PRNumber: int(prNumber), HeadSHA: reviewHeadSHA,
+				Phase: string(reviewcheck.PhaseQueued),
+			})
+			if marshalErr != nil {
+				return sqlcgen.Session{}, sqlcgen.Turn{}, false, fmt.Errorf("github: marshal queued review-check payload: %w", marshalErr)
+			}
+			if _, err := c.Outbox.WithTx(tx).Create(ctx, sqlcgen.CreateOutboxEntryParams{
+				SessionID: created.ID,
+				Kind:      string(ports.NotificationKindGitHubReviewCheck),
+				Payload:   queuedPayload,
+			}); err != nil {
+				return sqlcgen.Session{}, sqlcgen.Turn{}, false, fmt.Errorf("github: enqueue queued review-check outbox entry: %w", err)
+			}
+		}
 	}
 
 	if err := txPRSessions.SetSessionID(ctx, repoFullName, prNumber, created.ID); err != nil {

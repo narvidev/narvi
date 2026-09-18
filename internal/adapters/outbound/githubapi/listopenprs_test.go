@@ -429,6 +429,138 @@ func TestListOpenPRsForUser_PendingCombinedStatusRequiresARealStatus(t *testing.
 	}
 }
 
+// TestListOpenPRsForUser_NarviOwnCheckExcludedFromCIConclusion is the
+// fourth review round's own HIGH finding (3/3, attacker-influenceable),
+// reproduced in both directions against the real adapter with this exact
+// httptest harness: fetchCIConclusionLive used to list EVERY check run at
+// the PR's head SHA with NO exclusion for reviewcheck.CheckName, so this
+// publisher's own narvi/review check run -- written at exactly the SHA
+// this function reads -- fed straight back into the CI conclusion it is
+// itself computed alongside.
+//
+// Direction A: a review that times out with no verdict publishes
+// action_required (ComputeOutput's fail-closed default, also PhaseStale/
+// PhaseTerminalNotAssessed) -- a value ciFailureConclusions
+// (mergedbetween.go) treats as a genuine CI failure. Before the fix, that
+// made Narvi's own merge gate report a CI failure that exists nowhere in
+// real CI, beside a genuinely green build.
+//
+// Direction B: a completed review publishes ConclusionSuccess. Before the
+// fix, that alone satisfied CI green (ciGreen, decisioninbox/aggregate.go
+// -- a direct AND-condition of merge eligibility) on a repository with NO
+// real CI configured at all: the merge gate satisfied by Narvi grading
+// its own homework.
+//
+// A third case covers the symptom named alongside both: PhaseQueued/
+// PhaseRunning publish with Conclusion == nil (still queued/in_progress),
+// which fetchCIConclusionLive's own STRICT rule treats as an incomplete
+// required check for every OTHER check run -- before the fix, every
+// in-flight review made its own PR read as CI-not-green for that reason
+// alone.
+func TestListOpenPRsForUser_NarviOwnCheckExcludedFromCIConclusion(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		statusState string
+		statusTotal int
+		checkRuns   []map[string]any
+		want        ports.CIConclusion
+	}{
+		{
+			name:        "direction A baseline: combined status success + a real check run build=success",
+			statusState: "success",
+			checkRuns: []map[string]any{
+				{"name": "build", "conclusion": "success"},
+			},
+			want: ports.CIConclusionSuccess,
+		},
+		{
+			name:        "direction A: adding narvi/review=action_required beside the identical green build must NOT flip CI to failure",
+			statusState: "success",
+			checkRuns: []map[string]any{
+				{"name": "build", "conclusion": "success"},
+				{"name": "narvi/review", "conclusion": "action_required"},
+			},
+			want: ports.CIConclusionSuccess,
+		},
+		{
+			name:        "direction B baseline: no legacy statuses, zero check runs at all",
+			statusState: "pending",
+			statusTotal: 0,
+			checkRuns:   []map[string]any{},
+			want:        ports.CIConclusionUnknown,
+		},
+		{
+			name:        "direction B: a single narvi/review=success must NOT manufacture a CI green from nothing",
+			statusState: "pending",
+			statusTotal: 0,
+			checkRuns: []map[string]any{
+				{"name": "narvi/review", "conclusion": "success"},
+			},
+			want: ports.CIConclusionUnknown,
+		},
+		{
+			name:        "an in-flight narvi/review (PhaseQueued/PhaseRunning, conclusion nil) beside a green build must not read as an incomplete required check",
+			statusState: "success",
+			checkRuns: []map[string]any{
+				{"name": "build", "conclusion": "success"},
+				{"name": "narvi/review", "conclusion": nil},
+			},
+			want: ports.CIConclusionSuccess,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.URL.Path == "/user/1":
+					_ = json.NewEncoder(w).Encode(map[string]any{"id": 1, "login": "octocat"})
+				case r.URL.Path == "/search/issues" && strings.Contains(r.URL.Query().Get("q"), "assignee:octocat"):
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"items": []map[string]any{{"number": 5, "repository_url": "https://api.github.com/repos/acme/widgets"}},
+					})
+				case r.URL.Path == "/search/issues" && strings.Contains(r.URL.Query().Get("q"), "review-requested:octocat"):
+					_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{}})
+				case r.URL.Path == "/repos/acme/widgets/pulls/5":
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"number": 5, "title": "x", "html_url": "u", "state": "open", "head": map[string]any{"sha": "s"}, "base": map[string]any{"ref": "main"},
+					})
+				case r.URL.Path == "/repos/acme/widgets/pulls/5/reviews":
+					_ = json.NewEncoder(w).Encode([]map[string]any{})
+				case r.URL.Path == "/repos/acme/widgets/commits/s/status":
+					_ = json.NewEncoder(w).Encode(map[string]any{"state": tc.statusState, "statuses": []map[string]any{}, "total_count": tc.statusTotal})
+				case r.URL.Path == "/repos/acme/widgets/commits/s/check-runs":
+					_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": tc.checkRuns})
+				case r.URL.Path == "/repos/acme/widgets/pulls/5/files":
+					_ = json.NewEncoder(w).Encode([]map[string]any{})
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+
+			adapter := githubapi.New(server.Client(), server.URL)
+
+			prs, _, err := adapter.ListOpenPRsForUser(context.Background(), ports.ListOpenPRsForUserSpec{GitHubExternalID: "1", Token: "tok"})
+			if err != nil {
+				t.Fatalf("ListOpenPRsForUser() error = %v, want nil", err)
+			}
+			if len(prs) != 1 {
+				t.Fatalf("ListOpenPRsForUser() returned %d PRs, want 1", len(prs))
+			}
+			if prs[0].CIConclusion != tc.want {
+				t.Errorf("CIConclusion = %v, want %v (%s)", prs[0].CIConclusion, tc.want, tc.name)
+			}
+		})
+	}
+}
+
 // TestListOpenPRsForUser_HalfReadCIFailsClosed is the regression test for a
 // half-read CI composite reporting green: fetchCIConclusionLive makes TWO
 // independent GETs (the legacy combined-status endpoint and check-runs),

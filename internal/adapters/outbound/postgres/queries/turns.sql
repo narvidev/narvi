@@ -70,8 +70,20 @@
 -- once, at creation, by the SAME review-turn-creation paths, pre-
 -- marshaled JSON (internal/domain/reviewverdict.Context) -- this query
 -- does no encoding of its own.
-INSERT INTO turns (session_id, status, prompt, model_id, plan_mode, effort, review_head_sha, answer_only, review_depth, review_depth_decision, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+--
+-- is_review_attempt (migrations/000133_turns_is_review_attempt.up.sql,
+-- finding A4) mirrors review_head_sha's own identical shape one column
+-- further, EXCEPT its zero value is a real, meaningful `false` rather
+-- than NULL/absent (this is a plain boolean, not a nullable pointer
+-- field) -- every call site that never sets it (every non-review-turn
+-- creation, and even a REUSE-path GitHub turn that is an ordinary
+-- follow-up rather than a genuine review attempt) gets `false`, the
+-- safe default: dispatch.go/outboxenqueue.go both gate the review-check
+-- outbox enqueue on this column being true, never merely on
+-- review_head_sha being set. See that migration's own doc comment for
+-- the full "why".
+INSERT INTO turns (session_id, status, prompt, model_id, plan_mode, effort, review_head_sha, answer_only, review_depth, review_depth_decision, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, is_review_attempt)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 RETURNING *;
 
 -- name: GetTurn :one

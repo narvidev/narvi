@@ -78,6 +78,7 @@ import (
 	"github.com/narvidev/narvi/internal/domain/provenance"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/review"
+	"github.com/narvidev/narvi/internal/domain/reviewcheck"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
 	"github.com/narvidev/narvi/internal/domain/reviewtriage"
 	"github.com/narvidev/narvi/internal/domain/reviewverdict"
@@ -831,6 +832,42 @@ func PostReviewVerdict(
 			logger.Error("httpapi: review-verdict: insert review_verdicts row failed", "error", insertErr)
 			writeError(w, http.StatusInternalServerError, "internal error")
 			return
+		}
+
+		// The review's own GitHub-native result surface (§8.2/§21.1/
+		// §21.1b): a real review.Verdict was just posted for
+		// attemptID -- reviewcheck.PhaseTerminalAssessed. Enqueued in the
+		// SAME transaction as the review_verdicts insert above (§5.1),
+		// gated on the identical verdictHeadSHA != "" precondition that
+		// insert already requires: with no head sha there is nothing to
+		// anchor a check run to (this handler's own established
+		// "safe, not dangerous, degradation" posture for that case,
+		// stated immediately above).
+		if verdictHeadSHA != "" {
+			reviewCheckPayload, marshalErr := json.Marshal(ports.ReviewCheckPayload{
+				Owner: owner, Repo: repo, PRNumber: int(prSession.PrNumber), HeadSHA: verdictHeadSHA,
+				AttemptID:        attemptID.String(),
+				AttemptCreatedAt: dispatchedTurn.CreatedAt.Time,
+				Phase:            string(reviewcheck.PhaseTerminalAssessed),
+				BaseRef:          verdictContext.BaseRef,
+				BaseSHA:          verdictContext.BaseSHA,
+				PolicyVersion:    verdictContext.PolicyVersion,
+			})
+			if marshalErr != nil {
+				logger.Error("httpapi: review-verdict: marshal review-check payload failed", "error", marshalErr)
+				writeError(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+			if _, err := outbox.WithTx(tx).Create(ctx, sqlcgen.CreateOutboxEntryParams{
+				SessionID:     sessionID,
+				Kind:          string(ports.NotificationKindGitHubReviewCheck),
+				Payload:       reviewCheckPayload,
+				CorrelationID: correlationID,
+			}); err != nil {
+				logger.Error("httpapi: review-verdict: enqueue review-check outbox entry failed", "error", err)
+				writeError(w, http.StatusInternalServerError, "internal error")
+				return
+			}
 		}
 
 		if _, err := outbox.WithTx(tx).Create(ctx, sqlcgen.CreateOutboxEntryParams{

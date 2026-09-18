@@ -888,7 +888,11 @@ func (a *Actor) insertAutoRetriggerTurn(ctx context.Context, tx pgx.Tx, decision
 		ReviewKnowledgeMode:     &knowledgeMode,
 		ReviewKnowledgeDecision: decision.knowledgeDecisionJSON,
 		ReviewVerdictContext:    reviewVerdictContextJSON,
-		CorrelationID:           correlationID,
+		// IsReviewAttempt: true (finding A4) -- §24's own automatic
+		// push-triggered retrigger is, by construction, always a genuine
+		// review attempt.
+		IsReviewAttempt: true,
+		CorrelationID:   correlationID,
 	})
 	if err != nil {
 		return fmt.Errorf("sessionactor: insert automatic re-review turn: %w", err)

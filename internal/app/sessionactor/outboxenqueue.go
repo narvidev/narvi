@@ -203,11 +203,54 @@ func (a *Actor) enqueueOutboxNotification(ctx context.Context, tx pgx.Tx, sessio
 		// posting tool (internal/adapters/inbound/httpapi/
 		// reviewverdict.go) is now the ONLY sanctioned way a review
 		// session's output reaches the pull request as a comment or
-		// formal review. This branch therefore enqueues NOTHING any more
-		// -- a github-origin turn's completion is silent from THIS path's
-		// own perspective; whatever needs to reach the PR does so only
+		// formal review. This branch therefore enqueues NOTHING further
+		// on THIS path's own generic outcome-text mechanism -- whatever
+		// needs to reach the PR as a comment/formal review does so only
 		// via a real verdict-posting-tool call, scoped and validated
 		// there, never here.
+		//
+		// The review's own GitHub-native result surface (§8.2/§21.1/
+		// §21.1b): this turn just reached a terminal state
+		// (complete/fail/cancel/timeout, trig above) -- decision 1, "a
+		// review that did not complete publishes action_required",
+		// applies UNCONDITIONALLY of trig: even a turn that completed
+		// SUCCESSFULLY (TriggerComplete) but never called the
+		// verdict-posting tool is, from the check's own point of view, a
+		// review that did not complete. reviewcheck.PhaseTerminalAssessed
+		// is enqueued separately, at the ONE place a real verdict is
+		// actually posted (httpapi.PostReviewVerdict, in the SAME
+		// transaction as that verdict's own review_verdicts insert) --
+		// never here, since this function runs whether or not that
+		// happened. So the ONLY decision left here is: did THIS attempt
+		// already get its Terminal-Assessed emission from that other
+		// path? ExistsForAttempt answers exactly that, scoped to
+		// processing.ID (this turn), never to the PR as a whole -- a
+		// PRIOR attempt's own verdict must never suppress THIS attempt's
+		// own not-assessed emission (the identical per-attempt scoping
+		// §21.1b requires of the publisher itself).
+		//
+		// processing.IsReviewAttempt (finding A4, migrations/
+		// 000133_turns_is_review_attempt.up.sql) gates this UNCONDITIONALLY
+		// of trig -- "a review that did not complete" only means something
+		// for a turn that was actually attempting a review in the first
+		// place. Before this gate, an ORDINARY follow-up @mention on an
+		// already-reviewed PR ("what does finding 3 mean?") reached this
+		// exact branch, never called the verdict-posting tool (it was
+		// never asked to), and so unconditionally published
+		// PhaseTerminalNotAssessed for its own (newer) attempt --
+		// §21.1b's "a newer attempt always wins" rule then let that
+		// emission overwrite the real review turn's already-published
+		// PhaseTerminalAssessed/success, flipping a successfully reviewed
+		// PR's check back to "Review not completed" for no reason visible
+		// on the PR itself. See that migration's own doc comment for the
+		// full enumeration of which turn-creation paths set
+		// IsReviewAttempt true.
+		if !processing.IsReviewAttempt {
+			return nil
+		}
+		if err := a.enqueueReviewCheckNotAssessed(ctx, tx, processing); err != nil {
+			return err
+		}
 		return nil
 
 	case sqlcgen.SessionSpawnSourceLinear:

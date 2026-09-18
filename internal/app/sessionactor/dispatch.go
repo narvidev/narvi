@@ -1819,6 +1819,34 @@ func (a *Actor) tryPlanDispatch(
 		return nil, fmt.Errorf("sessionactor: build prompt payload: %w", err)
 	}
 
+	// The review's own GitHub-native result surface (§8.2/§21.1/§21.1b):
+	// a github-origin session is, by construction, a
+	// review session (internal/adapters/inbound/github's own doc.go --
+	// github_pr_sessions is the only mechanism that ever creates one).
+	// This turn just transitioned Pending -> Dispatched -> Processing
+	// (above, this SAME transaction) -- exactly the moment a review
+	// attempt genuinely begins, so this is the ONE call site for
+	// reviewcheck.PhaseRunning. Enqueued in the SAME transaction as the
+	// turn's own status write (§5.1). Every non-github session (the
+	// overwhelming majority of dispatches) pays nothing beyond this one
+	// SpawnSource comparison.
+	//
+	// target.IsReviewAttempt (finding A4, migrations/
+	// 000133_turns_is_review_attempt.up.sql) is a SECOND, REQUIRED gate,
+	// added alongside SpawnSource -- not every turn on a github-origin
+	// session is a genuine review attempt (an ordinary follow-up
+	// @mention on an already-reviewed PR is not). Publishing
+	// PhaseRunning for one of those would flip an already-terminal
+	// check back to "in progress" for a turn that was never going to
+	// call the verdict-posting tool at all -- see that migration's own
+	// doc comment for the full "why", and outboxenqueue.go's own
+	// identical gate on the terminal side.
+	if sessionRow.SpawnSource == sqlcgen.SessionSpawnSourceGithub && target.IsReviewAttempt {
+		if err := a.enqueueReviewCheckRunning(ctx, tx, target); err != nil {
+			return nil, err
+		}
+	}
+
 	return &dispatchPlan{turnID: turnID, payload: payload, sessionRow: sessionRow}, nil
 }
 

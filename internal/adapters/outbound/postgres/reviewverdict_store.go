@@ -41,6 +41,17 @@ func (s *ReviewVerdictStore) Insert(ctx context.Context, arg sqlcgen.InsertRevie
 	return s.q.InsertReviewVerdict(ctx, arg)
 }
 
+// ExistsForAttempt reports whether ANY review_verdicts row has ever been
+// posted for attemptID -- see ExistsReviewVerdictForAttempt's own
+// generated doc comment. The review's own GitHub-native result surface's
+// (§8.2/§21.1/§21.1b) one caller, sessionactor.outboxenqueue.go, uses
+// this to decide whether a
+// completing github-origin turn warrants a
+// reviewcheck.PhaseTerminalNotAssessed emission.
+func (s *ReviewVerdictStore) ExistsForAttempt(ctx context.Context, attemptID pgtype.UUID) (bool, error) {
+	return s.q.ExistsReviewVerdictForAttempt(ctx, attemptID)
+}
+
 // GetLatest fetches (repoFullName, prNumber)'s own LATEST verdict --
 // round-11 finding E: never "most-recently-posted" (the previous wording
 // here); see GetLatestReviewVerdict's own generated doc comment for the

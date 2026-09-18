@@ -1985,6 +1985,27 @@ type RepoSetting struct {
 	DemotionSweepPendingAt     pgtype.Timestamptz `json:"demotion_sweep_pending_at"`
 }
 
+type ReviewCheckRun struct {
+	RepoFullName     string             `json:"repo_full_name"`
+	PrNumber         int32              `json:"pr_number"`
+	HeadSha          string             `json:"head_sha"`
+	ExternalID       *int64             `json:"external_id"`
+	AttemptID        pgtype.UUID        `json:"attempt_id"`
+	AttemptCreatedAt pgtype.Timestamptz `json:"attempt_created_at"`
+	Phase            string             `json:"phase"`
+	BaseRef          *string            `json:"base_ref"`
+	BaseSha          *string            `json:"base_sha"`
+	PolicyVersion    int32              `json:"policy_version"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+}
+
+type ReviewCheckWriterAppID struct {
+	ID        int16              `json:"id"`
+	AppID     int64              `json:"app_id"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
 type ReviewDigestSectionFeedback struct {
 	ID           pgtype.UUID        `json:"id"`
 	RepoFullName string             `json:"repo_full_name"`
@@ -2207,6 +2228,7 @@ type Turn struct {
 	CorrelationID           *string               `json:"correlation_id"`
 	ReviewVerdictContext    []byte                `json:"review_verdict_context"`
 	DispatchedMessageID     *string               `json:"dispatched_message_id"`
+	IsReviewAttempt         bool                  `json:"is_review_attempt"`
 }
 
 type TurnStepCost struct {

@@ -424,3 +424,21 @@ WHERE rv.repo_full_name = $1
     )
 ORDER BY rv.created_at DESC
 LIMIT sqlc.arg(result_limit);
+
+-- name: ExistsReviewVerdictForAttempt :one
+-- The review's own GitHub-native result surface (§8.2/§21.1/§21.1b)
+-- read: has ANY review_verdicts row ever been posted
+-- for attemptID (turns.id)? sessionactor's own outboxenqueue.go calls
+-- this at turn-completion time to decide whether the review-check
+-- publisher's PhaseTerminalNotAssessed emission is warranted -- "a
+-- review that did not complete" (decision 1) means exactly this: the
+-- ONE attempt that just reached a terminal turn state never posted a
+-- verdict through the verdict-posting tool (httpapi.PostReviewVerdict,
+-- the ONLY sanctioned path, §8.2's own RAW-COMMENT BLOCKING). Scoped to
+-- attempt_id specifically, never repo_full_name/pr_number alone: a PRIOR
+-- attempt's own verdict must never be read as evidence THIS attempt
+-- completed (the identical "an emission carries the attempt... it was
+-- produced for" discipline §21.1b states for the publisher itself).
+SELECT EXISTS(
+    SELECT 1 FROM review_verdicts WHERE attempt_id = $1
+) AS verdict_exists;
