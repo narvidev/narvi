@@ -6,6 +6,7 @@ import {
   canMergeDecisionInboxItem,
   formatAgeSeconds,
   formatDecisionLatencySeconds,
+  hasAcceptedOverride,
   prChipData,
   provenanceText,
   releaseChipData,
@@ -39,6 +40,7 @@ function baseItem(overrides: Partial<DecisionInboxItem> = {}): DecisionInboxItem
     acceptanceId: null,
     acceptanceJustification: null,
     acceptedAt: null,
+    acceptedBy: null,
     isRelease: null,
     manifestFindingsCount: null,
     manifestCoveragePartial: null,
@@ -114,29 +116,45 @@ describe('provenanceText -- decision 34: every row says why it is yours', () => 
 
 describe('riskLabel chips via prChipData -- the wire value is "review:high-risk" etc, not "high"', () => {
   it('a high-risk label with open findings combines into one chip', () => {
-    const chips = prChipData({ riskLabel: 'review:high-risk', findings: 2, ciGreen: true, hasChangesRequested: false })
+    const chips = prChipData({ riskLabel: 'review:high-risk', findings: 2, ciGreen: true, hasChangesRequested: false, acceptanceId: null })
     expect(chips[0]).toEqual({ tone: 'crit', text: 'review: high risk · 2 findings' })
     expect(chips).toContainEqual({ tone: 'ok', text: 'CI green' })
   })
 
   it('a low-risk label with zero findings omits the findings suffix', () => {
-    const chips = prChipData({ riskLabel: 'review:low-risk', findings: 0, ciGreen: true, hasChangesRequested: false })
+    const chips = prChipData({ riskLabel: 'review:low-risk', findings: 0, ciGreen: true, hasChangesRequested: false, acceptanceId: null })
     expect(chips[0]).toEqual({ tone: 'ok', text: 'review: low risk' })
   })
 
   it('null findings (could not be determined) never renders as a fabricated "0 findings"', () => {
-    const chips = prChipData({ riskLabel: 'review:medium-risk', findings: null, ciGreen: true, hasChangesRequested: false })
+    const chips = prChipData({ riskLabel: 'review:medium-risk', findings: null, ciGreen: true, hasChangesRequested: false, acceptanceId: null })
     expect(chips[0]).toEqual({ tone: 'warn', text: 'review: medium risk' })
   })
 
   it('null ciGreen (not a PR-shaped fact yet known) renders no CI chip at all', () => {
-    const chips = prChipData({ riskLabel: null, findings: null, ciGreen: null, hasChangesRequested: false })
+    const chips = prChipData({ riskLabel: null, findings: null, ciGreen: null, hasChangesRequested: false, acceptanceId: null })
     expect(chips.some((c) => c.text.includes('CI'))).toBe(false)
   })
 
   it('hasChangesRequested=true adds its own explicit chip', () => {
-    const chips = prChipData({ riskLabel: null, findings: null, ciGreen: true, hasChangesRequested: true })
+    const chips = prChipData({ riskLabel: null, findings: null, ciGreen: true, hasChangesRequested: true, acceptanceId: null })
     expect(chips).toContainEqual({ tone: 'crit', text: 'changes requested' })
+  })
+
+  // finding F5 (adversarial review): an accepted-but-engine-refused PR
+  // (§21.1b) used to render on this queue INDISTINGUISHABLY from an
+  // ordinary needs_review row -- these two cases pin the chip that now
+  // makes it visible, and hasAcceptedOverride's own existence signal.
+  it('a non-null acceptanceId adds an "accepted override" chip', () => {
+    const chips = prChipData({ riskLabel: null, findings: null, ciGreen: true, hasChangesRequested: false, acceptanceId: 'acceptance-1' })
+    expect(chips).toContainEqual({ tone: 'warn', text: 'accepted override' })
+    expect(hasAcceptedOverride({ acceptanceId: 'acceptance-1' })).toBe(true)
+  })
+
+  it('a null acceptanceId (never accepted) renders no acceptance chip at all', () => {
+    const chips = prChipData({ riskLabel: null, findings: null, ciGreen: true, hasChangesRequested: false, acceptanceId: null })
+    expect(chips.some((c) => c.text.includes('accepted'))).toBe(false)
+    expect(hasAcceptedOverride({ acceptanceId: null })).toBe(false)
   })
 })
 

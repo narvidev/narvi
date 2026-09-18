@@ -97,34 +97,43 @@ type Item struct {
 	// latest when the accept request arrives).
 	VerdictID string
 
-	// AcceptanceID/AcceptanceJustification/AcceptedAt (§21.1b: "human
-	// acceptance of a verdict the engine refuses") are set iff an ACTIVE,
-	// APPLICABLE acceptance exists for this PR's own current verdict
-	// (internal/domain/reviewverdict.Acceptance.Applicable) AND its own
-	// recorded base ref/ancestor chain still match this PR's own current,
-	// already-fetched base ref/ancestor chain (finding F6, adversarial
-	// review: Applicable alone cannot see a moved base or a changed
-	// ancestor chain -- see acceptanceContextStillFresh's own doc comment,
-	// aggregate.go). A revoked acceptance, one that no longer binds to the
-	// current verdict, or one a moved base/changed ancestor chain has
-	// invalidated, renders identically to no acceptance at all: all three
+	// AcceptanceID/AcceptanceJustification/AcceptedAt/AcceptedByUserID
+	// (§21.1b: "human acceptance of a verdict the engine refuses") are set
+	// iff an ACTIVE, APPLICABLE acceptance exists for this PR's own
+	// current verdict AND current attempt (internal/domain/reviewverdict.
+	// Acceptance.Applicable, given internal/app/reviewverdict.
+	// HasNewerReviewAttempt's own resolved fact -- finding F1, adversarial
+	// review: a not_assessed attempt posts no verdict, so verdict-id
+	// equality alone cannot see it) AND its own recorded base ref/ancestor
+	// chain still match this PR's own current, already-fetched base ref/
+	// ancestor chain (finding F6 of an earlier round, adversarial review:
+	// Applicable alone cannot see a moved base or a changed ancestor chain
+	// -- see acceptanceContextStillFresh's own doc comment, aggregate.go).
+	// A revoked acceptance, one that no longer binds to the current
+	// verdict/attempt, or one a moved base/changed ancestor chain has
+	// invalidated, renders identically to no acceptance at all: all four
 	// fields are the empty string / zero time, mirroring this package's
 	// own "absent fact -> zero value" convention elsewhere on this same
 	// struct (e.g. Findings/FindingsUnknown). Display only -- none of the
-	// three ever gates Kind (buildPROpenItem's own classification below is
+	// four ever gates Kind (buildPROpenItem's own classification below is
 	// unaffected: an accepted PR still classifies needs_review, never
 	// ready_to_merge, because §21.1b's own acceptance is an authorisation
 	// for a human's OWN Merge click, never a reclassification of the
 	// engine's judgment) -- they exist so a maintainer scanning
 	// needs_review can SEE that this row's own eligibility refusal has
-	// already been authorised, by whom, and can name AcceptanceID back on
-	// RevokeReviewVerdictAcceptanceRequest.Id (finding F11, adversarial
-	// review: before this field existed, no read surface ever returned an
-	// acceptance's own id, so revocation was reachable only by a client
-	// that had kept the original 201 response body).
+	// already been authorised, by whom (AcceptedByUserID -- finding F6,
+	// adversarial review: this field did not exist before this fix, even
+	// though this doc comment already claimed a maintainer could see "by
+	// whom" it was authorised), and can name AcceptanceID back on
+	// RevokeReviewVerdictAcceptanceRequest.Id (finding F11 of an earlier
+	// round, adversarial review: before that field existed, no read
+	// surface ever returned an acceptance's own id, so revocation was
+	// reachable only by a client that had kept the original 201 response
+	// body).
 	AcceptanceID            string
 	AcceptanceJustification string
 	AcceptedAt              time.Time
+	AcceptedByUserID        string
 
 	// IsRelease is true iff this PR-shaped row is a release cut (§15)
 	// whose §15.2 manifest check has already been computed and persisted

@@ -44,30 +44,61 @@ func (s *ReviewVerdictAcceptanceStore) WithTx(tx pgx.Tx) *ReviewVerdictAcceptanc
 //
 // FIRST supersedes (revokes) any existing active row for the SAME
 // (repo_full_name, pr_number) -- SupersedeActiveReviewVerdictAcceptances's
-// own generated doc comment (finding F2, adversarial review) explains why
-// this is two SEQUENTIAL statements, never one combined WITH-clause
-// statement: verified against real Postgres, a single `WITH superseded AS
-// (UPDATE ...) INSERT ...` statement's own primary INSERT does not see
-// the CTE's UPDATE for unique-constraint-checking purposes (both execute
-// against the SAME start-of-query snapshot), so it fails with a spurious
-// duplicate-key error on the routine case this exists to allow. Not
-// wrapped in an explicit transaction spanning both calls (unlike
-// OIDCSigningKeyStore.Rotate's own retire-then-create pair, which needs
-// one to observe the other's committed row for its own audit contract) --
-// review_verdict_acceptances_one_active_idx is what actually enforces "at
-// most one active row" regardless of whether these two statements commit
-// together; a concurrent accept racing between them can still make the
-// INSERT below fail on that constraint, an ordinary retryable error, but
-// can never produce two live rows.
-func (s *ReviewVerdictAcceptanceStore) Insert(ctx context.Context, arg sqlcgen.InsertReviewVerdictAcceptanceParams) (sqlcgen.ReviewVerdictAcceptance, error) {
-	if err := s.q.SupersedeActiveReviewVerdictAcceptances(ctx, sqlcgen.SupersedeActiveReviewVerdictAcceptancesParams{
+// own generated doc comment explains why this is two SEQUENTIAL
+// statements, never one combined WITH-clause statement: verified against
+// real Postgres, a single `WITH superseded AS (UPDATE ...) INSERT ...`
+// statement's own primary INSERT does not see the CTE's UPDATE for
+// unique-constraint-checking purposes (both execute against the SAME
+// start-of-query snapshot), so it fails with a spurious duplicate-key
+// error on the routine case this exists to allow.
+//
+// CORRECTED (finding F2, adversarial review): a previous version of this
+// method ran both statements against s.q UNWRAPPED -- autocommit, no
+// transaction spanning them at all, on the theory that
+// review_verdict_acceptances_one_active_idx alone made ordering
+// irrelevant. That theory covers a CONCURRENT accept racing this one
+// (still true, see below), but not this call's OWN two statements failing
+// PARTWAY: a context cancellation, a statement timeout, or a connection
+// reset between the Supersede and the Insert left the prior acceptance
+// already revoked, committed, with NO new row ever created -- a routine
+// re-accept (e.g. correcting the justification text) that hits exactly
+// this window silently zeroes out the PR's own acceptance instead of
+// replacing it, attributed to the person who was trying to ACCEPT, never
+// revoke. The caller now MUST supply a store already WithTx-scoped to a
+// transaction it began itself and commits after this call returns --
+// mirroring OIDCSigningKeyStore.Rotate's own identical "the caller owns
+// the transaction boundary, this method does not" convention (that
+// store's own doc comment) -- so both statements now commit or roll back
+// together. The one caller, internal/app/reviewverdict.Accept (via
+// httpapi.AcceptReviewVerdict), does exactly this.
+//
+// review_verdict_acceptances_one_active_idx is STILL what enforces "at
+// most one active row" against a DIFFERENT, concurrently-racing
+// transaction -- this fix closes the partial-failure hazard within ONE
+// call, not the ordinary cross-transaction race, which remains an
+// accepted, retryable 500 exactly as before.
+//
+// superseded is EVERY row this call's own Supersede statement revoked
+// (in practice at most one, per the unique index above) -- returned so
+// the caller can record an audited fact naming what, if anything, got
+// superseded (finding F4, adversarial review: before this fix, a
+// supersession was invisible in the audit log, and the ONLY row revoked_
+// by/revoked_at named made it look like an explicit revocation the
+// accepting user never performed).
+func (s *ReviewVerdictAcceptanceStore) Insert(ctx context.Context, arg sqlcgen.InsertReviewVerdictAcceptanceParams) (created sqlcgen.ReviewVerdictAcceptance, superseded []sqlcgen.ReviewVerdictAcceptance, err error) {
+	superseded, err = s.q.SupersedeActiveReviewVerdictAcceptances(ctx, sqlcgen.SupersedeActiveReviewVerdictAcceptancesParams{
 		RepoFullName: arg.RepoFullName,
 		PrNumber:     arg.PrNumber,
 		RevokedBy:    arg.AcceptedBy,
-	}); err != nil {
-		return sqlcgen.ReviewVerdictAcceptance{}, err
+	})
+	if err != nil {
+		return sqlcgen.ReviewVerdictAcceptance{}, nil, err
 	}
-	return s.q.InsertReviewVerdictAcceptance(ctx, arg)
+	created, err = s.q.InsertReviewVerdictAcceptance(ctx, arg)
+	if err != nil {
+		return sqlcgen.ReviewVerdictAcceptance{}, nil, err
+	}
+	return created, superseded, nil
 }
 
 // GetActive fetches the LATEST non-revoked acceptance for

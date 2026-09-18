@@ -4298,6 +4298,7 @@
         "acceptanceId",
         "acceptanceJustification",
         "acceptedAt",
+        "acceptedBy",
         "isRelease",
         "manifestFindingsCount",
         "manifestCoveragePartial",
@@ -4463,6 +4464,14 @@
           ],
           "format": "date-time",
           "description": "When the acceptance named by acceptanceJustification was granted -- null under the exact same conditions acceptanceJustification is null."
+        },
+        "acceptedBy": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid",
+          "description": "The accepting maintainer+'s own user id -- null under the exact same conditions acceptanceJustification is null (finding F6, adversarial review: this row's own acceptanceJustification/acceptedAt already told a maintainer THAT a verdict was authorised and WHEN; this field is the missing 'by whom')."
         },
         "isRelease": {
           "type": [
@@ -4727,7 +4736,8 @@
         "acceptedBy",
         "acceptedAt",
         "revokedAt",
-        "revokedBy"
+        "revokedBy",
+        "revocationReason"
       ],
       "properties": {
         "id": {
@@ -4793,6 +4803,13 @@
           ],
           "format": "uuid",
           "description": "Null under the exact same condition revokedAt is null."
+        },
+        "revocationReason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "'explicit' (a maintainer+'s own revoke-verdict-acceptance click) or 'superseded' (a fresh accept-verdict for the SAME pull request revoked this row automatically) -- null under the exact same condition revokedAt is null (finding F4, adversarial review: before this field existed, both cases wrote the IDENTICAL revokedAt/revokedBy shape, so a superseded acceptance was indistinguishable, on this row alone, from an explicit revocation the accepting user never performed)."
         }
       }
     },

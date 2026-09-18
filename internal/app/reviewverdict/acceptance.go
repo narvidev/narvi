@@ -61,8 +61,7 @@ type AcceptInput struct {
 // Accept records one review_verdict_acceptances row ("human acceptance
 // of a verdict the engine refuses", §21.1b) -- APPEND-ONLY (this table's
 // own migration doc comment): a repeat accept inserts a NEW row, never an
-// UPDATE. Unlike an earlier version of this table (finding F2, adversarial
-// review), a repeat accept for the SAME pull request now SUPERSEDES
+// UPDATE. A repeat accept for the SAME pull request now SUPERSEDES
 // (revokes) any existing active row for that pull request FIRST --
 // postgres.ReviewVerdictAcceptanceStore.Insert's own doc comment for why
 // this is two sequential statements, not one combined atomic statement --
@@ -70,16 +69,29 @@ type AcceptInput struct {
 // (review_verdict_acceptances_one_active_idx), and revoking "the" active
 // acceptance can never silently re-activate an earlier one left lying
 // around.
-func Accept(ctx context.Context, store *postgres.ReviewVerdictAcceptanceStore, in AcceptInput) (reviewverdict.Acceptance, error) {
+//
+// store MUST already be WithTx-scoped to a transaction the CALLER began
+// and will commit after this function returns (finding F2, adversarial
+// review -- store.Insert's own doc comment for the full "why": the
+// supersede-then-insert pair must commit or roll back together, never two
+// independent autocommit statements). The one caller,
+// httpapi.AcceptReviewVerdict, does exactly this.
+//
+// superseded is every acceptance THIS call's own supersede step revoked
+// (in practice at most one) -- returned so the caller can record a
+// DISTINCT audited fact naming it (finding F4, adversarial review: a
+// supersession used to be invisible in the audit log, indistinguishable
+// from the superseded acceptance simply vanishing).
+func Accept(ctx context.Context, store *postgres.ReviewVerdictAcceptanceStore, in AcceptInput) (accepted reviewverdict.Acceptance, superseded []reviewverdict.Acceptance, err error) {
 	if store == nil {
-		return reviewverdict.Acceptance{}, ErrAcceptanceStoreNotConfigured
+		return reviewverdict.Acceptance{}, nil, ErrAcceptanceStoreNotConfigured
 	}
 	ancestorChainJSON, err := marshalAncestorChain(in.Context.AncestorChain)
 	if err != nil {
-		return reviewverdict.Acceptance{}, fmt.Errorf("reviewverdict: accept: marshal ancestor chain: %w", err)
+		return reviewverdict.Acceptance{}, nil, fmt.Errorf("reviewverdict: accept: marshal ancestor chain: %w", err)
 	}
 
-	row, err := store.Insert(ctx, sqlcgen.InsertReviewVerdictAcceptanceParams{
+	row, supersededRows, err := store.Insert(ctx, sqlcgen.InsertReviewVerdictAcceptanceParams{
 		RepoFullName:  in.RepoFullName,
 		PrNumber:      in.PRNumber,
 		VerdictID:     in.VerdictID,
@@ -94,9 +106,13 @@ func Accept(ctx context.Context, store *postgres.ReviewVerdictAcceptanceStore, i
 		AcceptedBy:    in.AcceptedBy,
 	})
 	if err != nil {
-		return reviewverdict.Acceptance{}, err
+		return reviewverdict.Acceptance{}, nil, err
 	}
-	return acceptanceFromRow(row), nil
+	superseded = make([]reviewverdict.Acceptance, len(supersededRows))
+	for i, supersededRow := range supersededRows {
+		superseded[i] = acceptanceFromRow(supersededRow)
+	}
+	return acceptanceFromRow(row), superseded, nil
 }
 
 // GetActiveAcceptance fetches (repoFullName, prNumber)'s own LATEST
@@ -221,6 +237,9 @@ func acceptanceFromRow(row sqlcgen.ReviewVerdictAcceptance) reviewverdict.Accept
 	}
 	if row.RevokedBy.Valid {
 		a.RevokedByUserID = pgUUIDToString(row.RevokedBy)
+	}
+	if row.RevocationReason != nil {
+		a.RevocationReason = *row.RevocationReason
 	}
 	return a
 }

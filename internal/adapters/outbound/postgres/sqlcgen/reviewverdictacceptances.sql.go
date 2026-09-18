@@ -12,7 +12,7 @@ import (
 )
 
 const getActiveReviewVerdictAcceptance = `-- name: GetActiveReviewVerdictAcceptance :one
-SELECT id, repo_full_name, pr_number, verdict_id, attempt_id, head_sha, base_ref, base_sha, ancestor_chain, policy_version, reason, justification, accepted_by, accepted_at, revoked_at, revoked_by FROM review_verdict_acceptances
+SELECT id, repo_full_name, pr_number, verdict_id, attempt_id, head_sha, base_ref, base_sha, ancestor_chain, policy_version, reason, justification, accepted_by, accepted_at, revoked_at, revoked_by, revocation_reason FROM review_verdict_acceptances
 WHERE repo_full_name = $1 AND pr_number = $2 AND revoked_at IS NULL
 ORDER BY accepted_at DESC
 LIMIT 1
@@ -51,12 +51,13 @@ func (q *Queries) GetActiveReviewVerdictAcceptance(ctx context.Context, arg GetA
 		&i.AcceptedAt,
 		&i.RevokedAt,
 		&i.RevokedBy,
+		&i.RevocationReason,
 	)
 	return i, err
 }
 
 const getReviewVerdictAcceptance = `-- name: GetReviewVerdictAcceptance :one
-SELECT id, repo_full_name, pr_number, verdict_id, attempt_id, head_sha, base_ref, base_sha, ancestor_chain, policy_version, reason, justification, accepted_by, accepted_at, revoked_at, revoked_by FROM review_verdict_acceptances WHERE id = $1 AND repo_full_name = $2
+SELECT id, repo_full_name, pr_number, verdict_id, attempt_id, head_sha, base_ref, base_sha, ancestor_chain, policy_version, reason, justification, accepted_by, accepted_at, revoked_at, revoked_by, revocation_reason FROM review_verdict_acceptances WHERE id = $1 AND repo_full_name = $2
 `
 
 type GetReviewVerdictAcceptanceParams struct {
@@ -97,6 +98,7 @@ func (q *Queries) GetReviewVerdictAcceptance(ctx context.Context, arg GetReviewV
 		&i.AcceptedAt,
 		&i.RevokedAt,
 		&i.RevokedBy,
+		&i.RevocationReason,
 	)
 	return i, err
 }
@@ -109,7 +111,7 @@ INSERT INTO review_verdict_acceptances (
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
 )
-RETURNING id, repo_full_name, pr_number, verdict_id, attempt_id, head_sha, base_ref, base_sha, ancestor_chain, policy_version, reason, justification, accepted_by, accepted_at, revoked_at, revoked_by
+RETURNING id, repo_full_name, pr_number, verdict_id, attempt_id, head_sha, base_ref, base_sha, ancestor_chain, policy_version, reason, justification, accepted_by, accepted_at, revoked_at, revoked_by, revocation_reason
 `
 
 type InsertReviewVerdictAcceptanceParams struct {
@@ -170,12 +172,13 @@ func (q *Queries) InsertReviewVerdictAcceptance(ctx context.Context, arg InsertR
 		&i.AcceptedAt,
 		&i.RevokedAt,
 		&i.RevokedBy,
+		&i.RevocationReason,
 	)
 	return i, err
 }
 
 const listReviewVerdictAcceptances = `-- name: ListReviewVerdictAcceptances :many
-SELECT id, repo_full_name, pr_number, verdict_id, attempt_id, head_sha, base_ref, base_sha, ancestor_chain, policy_version, reason, justification, accepted_by, accepted_at, revoked_at, revoked_by FROM review_verdict_acceptances
+SELECT id, repo_full_name, pr_number, verdict_id, attempt_id, head_sha, base_ref, base_sha, ancestor_chain, policy_version, reason, justification, accepted_by, accepted_at, revoked_at, revoked_by, revocation_reason FROM review_verdict_acceptances
 WHERE repo_full_name = $1 AND pr_number = $2
 ORDER BY accepted_at DESC
 LIMIT $3
@@ -217,6 +220,7 @@ func (q *Queries) ListReviewVerdictAcceptances(ctx context.Context, arg ListRevi
 			&i.AcceptedAt,
 			&i.RevokedAt,
 			&i.RevokedBy,
+			&i.RevocationReason,
 		); err != nil {
 			return nil, err
 		}
@@ -230,9 +234,9 @@ func (q *Queries) ListReviewVerdictAcceptances(ctx context.Context, arg ListRevi
 
 const revokeReviewVerdictAcceptance = `-- name: RevokeReviewVerdictAcceptance :one
 UPDATE review_verdict_acceptances
-SET revoked_at = now(), revoked_by = $2
+SET revoked_at = now(), revoked_by = $2, revocation_reason = 'explicit'
 WHERE id = $1 AND repo_full_name = $3 AND revoked_at IS NULL
-RETURNING id, repo_full_name, pr_number, verdict_id, attempt_id, head_sha, base_ref, base_sha, ancestor_chain, policy_version, reason, justification, accepted_by, accepted_at, revoked_at, revoked_by
+RETURNING id, repo_full_name, pr_number, verdict_id, attempt_id, head_sha, base_ref, base_sha, ancestor_chain, policy_version, reason, justification, accepted_by, accepted_at, revoked_at, revoked_by, revocation_reason
 `
 
 type RevokeReviewVerdictAcceptanceParams struct {
@@ -243,11 +247,15 @@ type RevokeReviewVerdictAcceptanceParams struct {
 
 // The revoke write: a maintainer+ (the SAME role that may accept --
 // see internal/domain/authz's own ActionAcceptReviewVerdict, row 5)
-// explicitly withdraws an active acceptance. SCOPED to repo_full_name
-// (mirrors RetireFalsePositivePattern's own identical audit-fix
-// precedent) AND guarded (WHERE revoked_at IS NULL, CLAUDE.md/§11's own
-// "guarded UPDATE ... WHERE for cross-writer transitions" rule) so
-// revoking an ALREADY-revoked acceptance is a no-op that returns
+// explicitly withdraws an active acceptance -- revocation_reason =
+// 'explicit' (finding F4, adversarial review), distinct from
+// SupersedeActiveReviewVerdictAcceptances' own 'superseded' above: THIS
+// is the one write that is a genuine, deliberate human revocation click,
+// never an automatic side effect of a fresh accept. SCOPED to
+// repo_full_name (mirrors RetireFalsePositivePattern's own identical
+// audit-fix precedent) AND guarded (WHERE revoked_at IS NULL, CLAUDE.md/
+// §11's own "guarded UPDATE ... WHERE for cross-writer transitions" rule)
+// so revoking an ALREADY-revoked acceptance is a no-op that returns
 // pgx.ErrNoRows (never a second, silently overwriting revoked_at/
 // revoked_by) -- the caller (httpapi) tells "never existed in this
 // repo" apart from "exists in this repo but already revoked" via a
@@ -274,15 +282,17 @@ func (q *Queries) RevokeReviewVerdictAcceptance(ctx context.Context, arg RevokeR
 		&i.AcceptedAt,
 		&i.RevokedAt,
 		&i.RevokedBy,
+		&i.RevocationReason,
 	)
 	return i, err
 }
 
-const supersedeActiveReviewVerdictAcceptances = `-- name: SupersedeActiveReviewVerdictAcceptances :exec
+const supersedeActiveReviewVerdictAcceptances = `-- name: SupersedeActiveReviewVerdictAcceptances :many
 
 UPDATE review_verdict_acceptances
-SET revoked_at = now(), revoked_by = $3
+SET revoked_at = now(), revoked_by = $3, revocation_reason = 'superseded'
 WHERE repo_full_name = $1 AND pr_number = $2 AND revoked_at IS NULL
+RETURNING id, repo_full_name, pr_number, verdict_id, attempt_id, head_sha, base_ref, base_sha, ancestor_chain, policy_version, reason, justification, accepted_by, accepted_at, revoked_at, revoked_by, revocation_reason
 `
 
 type SupersedeActiveReviewVerdictAcceptancesParams struct {
@@ -299,7 +309,12 @@ type SupersedeActiveReviewVerdictAcceptancesParams struct {
 // revoked_by the SAME accepting user (this is an automatic supersession
 // by a fresh accept, not a maintainer's own explicit revoke click, so
 // there is no separate revoker to name -- the accepting user is the only
-// actor this statement genuinely knows about). Called by
+// actor this statement genuinely knows about) and revocation_reason =
+// 'superseded' (finding F4, adversarial review -- distinct from
+// RevokeReviewVerdictAcceptance's own 'explicit', below: this column is
+// what lets a reader tell "this row was auto-superseded by a fresh
+// accept" apart from "a maintainer explicitly clicked revoke", which
+// revoked_at/revoked_by alone cannot). Called by
 // ReviewVerdictAcceptanceStore.Insert (postgres package) IMMEDIATELY
 // before InsertReviewVerdictAcceptance below, as two separate statements
 // -- NEVER as one WITH-clause statement (finding F2's own first attempt,
@@ -312,13 +327,56 @@ type SupersedeActiveReviewVerdictAcceptancesParams struct {
 // and the whole statement fails with a spurious duplicate-key error on
 // the routine, common case this exists to allow -- a plain re-accept of
 // the SAME verdict). Two ordinary sequential statements (this one, then
-// the INSERT) do not share this hazard. review_verdict_acceptances_one_
-// active_idx is the actual invariant enforcer either way: a concurrent
-// accept racing between this statement and the INSERT below can still
-// make the INSERT fail on that constraint (a genuine, rare double-accept
-// race) -- an ordinary, retryable 500, never a silent violation of "at
-// most one active row".
-func (q *Queries) SupersedeActiveReviewVerdictAcceptances(ctx context.Context, arg SupersedeActiveReviewVerdictAcceptancesParams) error {
-	_, err := q.db.Exec(ctx, supersedeActiveReviewVerdictAcceptances, arg.RepoFullName, arg.PrNumber, arg.RevokedBy)
-	return err
+// the INSERT) do not share this hazard -- PROVIDED they run inside the
+// SAME transaction (finding F2, adversarial review, corrected: this used
+// to be true only in the CTE sense, never in the commit sense -- see
+// ReviewVerdictAcceptanceStore.Insert's own doc comment, postgres
+// package, for the fix: the caller now supplies a WithTx-scoped store).
+// review_verdict_acceptances_one_active_idx is the actual invariant
+// enforcer either way: a concurrent accept racing between this statement
+// and the INSERT below (from a DIFFERENT transaction) can still make the
+// INSERT fail on that constraint (a genuine, rare double-accept race) --
+// an ordinary, retryable 500, never a silent violation of "at most one
+// active row". RETURNING * (finding F4: this used to be :exec, silently
+// discarding which row, if any, was superseded) is what lets the caller
+// record a DISTINCT, properly-attributed audit fact for the supersession
+// itself, naming the superseded row's own id -- see
+// httpapi.AcceptReviewVerdict's own review_verdict.accept_supersedes_prior
+// audit action.
+func (q *Queries) SupersedeActiveReviewVerdictAcceptances(ctx context.Context, arg SupersedeActiveReviewVerdictAcceptancesParams) ([]ReviewVerdictAcceptance, error) {
+	rows, err := q.db.Query(ctx, supersedeActiveReviewVerdictAcceptances, arg.RepoFullName, arg.PrNumber, arg.RevokedBy)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ReviewVerdictAcceptance
+	for rows.Next() {
+		var i ReviewVerdictAcceptance
+		if err := rows.Scan(
+			&i.ID,
+			&i.RepoFullName,
+			&i.PrNumber,
+			&i.VerdictID,
+			&i.AttemptID,
+			&i.HeadSha,
+			&i.BaseRef,
+			&i.BaseSha,
+			&i.AncestorChain,
+			&i.PolicyVersion,
+			&i.Reason,
+			&i.Justification,
+			&i.AcceptedBy,
+			&i.AcceptedAt,
+			&i.RevokedAt,
+			&i.RevokedBy,
+			&i.RevocationReason,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

@@ -168,6 +168,42 @@ func (q *Queries) CreateTurn(ctx context.Context, arg CreateTurnParams) (Turn, e
 	return i, err
 }
 
+const existsNewerReviewAttempt = `-- name: ExistsNewerReviewAttempt :one
+SELECT EXISTS(
+    SELECT 1 FROM turns
+    WHERE session_id = $1 AND is_review_attempt = true AND created_at > $2
+) AS has_newer_review_attempt
+`
+
+type ExistsNewerReviewAttemptParams struct {
+	SessionID pgtype.UUID        `json:"session_id"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+// finding F1 (adversarial review, §21.1b): reviewverdict.Acceptance.
+// Applicable's own "new attempt" half cannot be reduced to verdict-id
+// equality alone -- a review attempt that ends not_assessed posts NO
+// review_verdicts row at all (sessionactor.enqueueReviewCheckNotAssessed
+// fires exactly because ExistsReviewVerdictForAttempt is false), so
+// GetLatestReviewVerdict still returns the OLD, accepted verdict even
+// though a NEWER attempt has since run. This answers that question
+// directly against turns itself: has any genuine review attempt
+// (is_review_attempt = true, mirroring dispatch.go/outboxenqueue.go's own
+// identical gate on this same column) in the SAME session, STRICTLY
+// newer than afterCreatedAt, run since -- regardless of whether it ever
+// posted a review_verdicts row. The caller (internal/app/reviewverdict.
+// HasNewerReviewAttempt) supplies afterCreatedAt from the ACCEPTED
+// attempt's own turns.created_at (TurnStore.Get, above), so this query
+// never needs to name that attempt a second time: session_id scoped to
+// rows strictly after ITS OWN timestamp already answers "is the accepted
+// attempt still the latest review attempt in this session".
+func (q *Queries) ExistsNewerReviewAttempt(ctx context.Context, arg ExistsNewerReviewAttemptParams) (bool, error) {
+	row := q.db.QueryRow(ctx, existsNewerReviewAttempt, arg.SessionID, arg.CreatedAt)
+	var has_newer_review_attempt bool
+	err := row.Scan(&has_newer_review_attempt)
+	return has_newer_review_attempt, err
+}
+
 const getPlatformCostSummaryInWindow = `-- name: GetPlatformCostSummaryInWindow :one
 WITH per_session AS (
     SELECT session_id, SUM(cost_usd) AS total

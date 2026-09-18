@@ -591,6 +591,7 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 	var acceptanceID string
 	var acceptanceJustification string
 	var acceptedAt time.Time
+	var acceptedByUserID string
 	if record, hasVerdict, verdictErr := appreviewverdict.GetLatest(ctx, deps.ReviewVerdict, repoFullName, int32(pr.Number)); verdictErr != nil {
 		platform.Logger(ctx).Warn("decisioninbox: get latest review verdict failed -- omitting verdict/acceptance display data for this row", "error", verdictErr, "repo", repoFullName, "pr_number", pr.Number)
 	} else if hasVerdict {
@@ -599,10 +600,26 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 		// common case: most PRs are never accepted).
 		if acceptance, acceptanceOK, acceptanceErr := appreviewverdict.GetActiveAcceptance(ctx, deps.ReviewVerdict.Acceptances, repoFullName, int32(pr.Number)); acceptanceErr != nil {
 			platform.Logger(ctx).Warn("decisioninbox: get active review verdict acceptance failed -- omitting acceptance display data for this row", "error", acceptanceErr, "repo", repoFullName, "pr_number", pr.Number)
-		} else if acceptanceOK && acceptance.Applicable(record.ID) && acceptanceContextStillFresh(record.Context, pr) {
-			acceptanceID = acceptance.ID
-			acceptanceJustification = acceptance.Justification
-			acceptedAt = acceptance.AcceptedAt
+		} else if acceptanceOK {
+			// hasNewerAttempt (finding F1, adversarial review): a
+			// best-effort, DISPLAY-only read (unlike revalidateCore's own
+			// fail-CLOSED-with-a-hard-error twin, revalidate.go) -- a
+			// lookup error here degrades to hasNewerAttempt=true
+			// (HasNewerReviewAttempt's own doc comment: its error default
+			// IS the safe "deny" answer), which simply omits this row's
+			// acceptance display data exactly like every other
+			// best-effort failure in this function, never a failed Build
+			// call.
+			hasNewerAttempt, newerErr := appreviewverdict.HasNewerReviewAttempt(ctx, deps.ReviewVerdict.Turns, acceptance)
+			if newerErr != nil {
+				platform.Logger(ctx).Warn("decisioninbox: check newer review attempt failed -- omitting acceptance display data for this row", "error", newerErr, "repo", repoFullName, "pr_number", pr.Number)
+			}
+			if acceptance.Applicable(record.ID, hasNewerAttempt) && acceptanceContextStillFresh(record.Context, pr) {
+				acceptanceID = acceptance.ID
+				acceptanceJustification = acceptance.Justification
+				acceptedAt = acceptance.AcceptedAt
+				acceptedByUserID = acceptance.AcceptedByUserID
+			}
 		}
 	}
 
@@ -632,6 +649,7 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 		AcceptanceID:             acceptanceID,
 		AcceptanceJustification:  acceptanceJustification,
 		AcceptedAt:               acceptedAt,
+		AcceptedByUserID:         acceptedByUserID,
 	}
 	item.AgeSeconds = int64(decisioninbox.Age(item.EnteredQueueAt, now).Seconds())
 	item.Stale = decisioninbox.IsStale(item.EnteredQueueAt, now, deps.Timeouts.DecisionInboxStaleAfter)

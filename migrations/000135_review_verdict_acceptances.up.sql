@@ -11,23 +11,34 @@
 -- Binds to ONE verdict via verdict_id (review_verdicts.id) -- an
 -- immutable, append-only row that ALREADY pins ONE attempt (its own
 -- attempt_id column) and ONE context (its own base_ref/base_sha/
--- ancestor_chain/policy_version columns), so verdict_id alone is what an
--- acceptance's own applicability actually keys on -- see internal/domain/
--- reviewverdict.Acceptance.Applicable's own doc comment for the full
--- "why" and for the one freshness trigger (a moved base, or a changed
--- ancestor chain, under an UNCHANGED verdict) that check deliberately
--- does NOT try to catch itself, because autoapproval.
--- ComputeEligibleWithAcceptance's own unconditional base/ancestor-chain
--- checks already catch it independently, whether or not an acceptance
--- applies.
+-- ancestor_chain/policy_version columns). verdict_id equality is
+-- necessary but NOT sufficient for "one attempt" to still hold (finding
+-- F1, adversarial review, corrected -- a previous version of this
+-- comment claimed verdict_id alone was sufficient): an attempt that ends
+-- not_assessed posts no review_verdicts row at all, so a NEWER attempt
+-- can exist while the latest verdict_id for this pull request stays
+-- unchanged. internal/domain/reviewverdict.Acceptance.Applicable
+-- therefore also takes a caller-resolved hasNewerAttempt fact
+-- (internal/app/reviewverdict.HasNewerReviewAttempt, which queries
+-- turns.is_review_attempt directly via attempt_id below) -- see that
+-- method's own doc comment for the full "why" and for the one freshness
+-- trigger (a moved base, or a changed ancestor chain, under an UNCHANGED
+-- verdict AND no new attempt) that neither check tries to catch, because
+-- autoapproval.ComputeEligibleWithAcceptance's own unconditional
+-- base/ancestor-chain checks already catch it independently, whether or
+-- not an acceptance applies.
 --
 -- attempt_id/head_sha/base_ref/base_sha/ancestor_chain/policy_version
 -- are ALSO stored here, verbatim, redundant with the referenced verdict
--- row -- never consulted by Applicable, which needs only verdict_id --
--- kept for the SAME reason review_check_runs carries this identical
+-- row, for the SAME reason review_check_runs carries this identical
 -- shape (migrations/000132's own doc comment): a human or an operator
 -- reading THIS row for audit purposes should never need a join back to
--- review_verdicts to see what, exactly, was accepted.
+-- review_verdicts to see what, exactly, was accepted. attempt_id is now
+-- ALSO load-bearing, not merely display data (finding F1's own fix):
+-- internal/app/reviewverdict.HasNewerReviewAttempt reads it back, via
+-- turns.id, to resolve the accepted attempt's own turns.created_at,
+-- which is what "is a NEWER review attempt on record" is actually
+-- checked against.
 --
 -- reason is a best-effort, no-I/O classification (httpapi.
 -- AcceptReviewVerdict's own accept-time guess) of which waivable
@@ -85,7 +96,20 @@
 -- review_verdict_acceptances_one_active_idx itself is what guarantees it,
 -- regardless of the two statements' own relative timing; the supersede
 -- step is what makes the ORDINARY case (an uncontested re-accept) succeed
--- cleanly rather than colliding with its own predecessor.
+-- cleanly rather than colliding with its own predecessor. Two SEQUENTIAL
+-- statements is NOT the same claim as "two independently-committed
+-- statements", though (finding F2, adversarial review, corrected -- a
+-- previous version of this table shipped exactly that mistake: Insert
+-- ran both statements against the bare, pool-bound store, so a context
+-- cancellation/timeout/reset between them left the prior acceptance
+-- revoked with NO new row created at all). The caller now MUST supply a
+-- store already scoped via WithTx to an open transaction it began itself
+-- and commits after Insert returns -- mirroring OIDCSigningKeyStore.
+-- Rotate's own identical "the caller owns the transaction boundary, this
+-- method does not" precedent one file over -- so the supersede and the
+-- insert now commit or roll back together. See
+-- ReviewVerdictAcceptanceStore.Insert's own doc comment (postgres
+-- package) for the concrete caller (httpapi.AcceptReviewVerdict).
 CREATE TABLE review_verdict_acceptances (
     id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     repo_full_name TEXT NOT NULL,
@@ -102,17 +126,30 @@ CREATE TABLE review_verdict_acceptances (
     accepted_by    UUID REFERENCES users(id) ON DELETE SET NULL,
     accepted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     revoked_at     TIMESTAMPTZ,
-    revoked_by     UUID REFERENCES users(id) ON DELETE SET NULL
+    revoked_by     UUID REFERENCES users(id) ON DELETE SET NULL,
+    -- revocation_reason (finding F4, adversarial review) distinguishes an
+    -- EXPLICIT revocation (a maintainer+'s own POST
+    -- /revoke-verdict-acceptance click, RevokeReviewVerdictAcceptance)
+    -- from an AUTOMATIC supersession (a fresh Accept on the SAME pull
+    -- request revoking the prior active row FIRST,
+    -- SupersedeActiveReviewVerdictAcceptances) -- both used to write the
+    -- IDENTICAL revoked_at/revoked_by shape otherwise (revoked_by is the
+    -- SAME accepting user in the supersede case, since there is no
+    -- separate revoker to name), which made a superseded row
+    -- indistinguishable, on this row alone, from an explicit revocation
+    -- that same person chose to make -- the audit log told the same lie:
+    -- the ONLY row it wrote was review_verdict.accept by the new
+    -- accepter, whose detail never named the superseded row at all, so
+    -- the prior acceptance simply vanished from the trail. NULL while
+    -- active (revoked_at IS NULL); one of the two literal values below,
+    -- always set ALONGSIDE revoked_at, never independently -- see
+    -- ReviewVerdictAcceptanceStore.Insert's own doc comment
+    -- (postgres package) for how a caller tells the two apart, and
+    -- httpapi.AcceptReviewVerdict for the now-distinct
+    -- review_verdict.accept_supersedes_prior audit action this column's
+    -- own 'superseded' value pairs with.
+    revocation_reason TEXT CHECK (revocation_reason IN ('explicit', 'superseded'))
 );
-
--- The one read query the merge/decision-inbox path needs: the LATEST
--- non-revoked acceptance for one pull request, if any -- mirrors
--- review_false_positive_patterns_repo_active_idx's own identical
--- "index the exact WHERE clause the one real read query uses" precedent
--- (migrations/000073).
-CREATE INDEX review_verdict_acceptances_active_idx
-    ON review_verdict_acceptances (repo_full_name, pr_number, accepted_at DESC)
-    WHERE revoked_at IS NULL;
 
 -- Enforces "at most one active acceptance per pull request" (finding F2,
 -- adversarial review) as a database-level invariant, never merely an
@@ -121,7 +158,34 @@ CREATE INDEX review_verdict_acceptances_active_idx
 -- Accept racing InsertReviewVerdictAcceptance's own supersede-then-insert
 -- (queries/reviewverdictacceptances.sql) fails this constraint rather
 -- than silently creating the second live row the rest of this table's
--- own doc comment above exists to rule out.
+-- own doc comment above exists to rule out. ALSO serves
+-- GetActiveReviewVerdictAcceptance's own WHERE repo_full_name = $1 AND
+-- pr_number = $2 AND revoked_at IS NULL ORDER BY accepted_at DESC LIMIT 1
+-- directly -- a SEPARATE, narrower review_verdict_acceptances_active_idx
+-- (same leading columns, same partial WHERE) used to exist alongside this
+-- one; removed (finding F7, adversarial review): this unique index alone
+-- already guarantees at most one matching row, so that other index's own
+-- trailing accepted_at DESC could never order anything, and a scratch
+-- benchmark over 80k rows confirmed dropping it left
+-- GetActiveReviewVerdictAcceptance on the identical plan with the
+-- identical 3 shared buffers.
 CREATE UNIQUE INDEX review_verdict_acceptances_one_active_idx
     ON review_verdict_acceptances (repo_full_name, pr_number)
     WHERE revoked_at IS NULL;
+
+-- Serves ListReviewVerdictAcceptances -- the audit view, EVERY acceptance
+-- (active or revoked) for one pull request, newest-first (finding F7,
+-- adversarial review: that query has no caller anywhere yet, but a
+-- future audit-view caller is the reason this table, and
+-- RevokeReviewVerdictAcceptance/revocation_reason immediately above,
+-- keep every row rather than deleting a superseded/revoked one). That
+-- query's own WHERE repo_full_name = $1 AND pr_number = $2 carries no
+-- revoked_at predicate, so it matches NEITHER partial index above --
+-- measured on 80k rows before this index existed: a bare Seq Scan, 1124
+-- shared buffers, Rows Removed by Filter: 79996. A full (non-partial)
+-- index, covering every row regardless of revoked_at, is what this
+-- query's own unfiltered WHERE clause actually needs -- an unindexed
+-- query with a seq-scan plan is a trap set for whoever wires this view up
+-- first.
+CREATE INDEX review_verdict_acceptances_pr_idx
+    ON review_verdict_acceptances (repo_full_name, pr_number, accepted_at DESC);

@@ -22,7 +22,7 @@ func TestAcceptance_NilStore(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("Accept", func(t *testing.T) {
-		_, err := Accept(ctx, nil, AcceptInput{RepoFullName: "acme/widgets", PRNumber: 1})
+		_, _, err := Accept(ctx, nil, AcceptInput{RepoFullName: "acme/widgets", PRNumber: 1})
 		if !errors.Is(err, ErrAcceptanceStoreNotConfigured) {
 			t.Fatalf("Accept(nil store) error = %v, want ErrAcceptanceStoreNotConfigured (never a panic)", err)
 		}

@@ -91,7 +91,11 @@ func newRevalidateStores(pool *pgxpool.Pool) *revalidateStores {
 				// test.go, exactly like every other ReviewVerdict.Deps
 				// field on this SAME literal.
 				Acceptances: narvipg.NewReviewVerdictAcceptanceStore(pool),
-				Timeouts:    platform.DefaultTimeouts(),
+				// Turns (finding F1, adversarial review, §21.1b) backs
+				// HasNewerReviewAttempt -- mirrors production wiring
+				// (controlplane/serve.go's own reviewVerdictDeps).
+				Turns:    narvipg.NewTurnStore(pool),
+				Timeouts: platform.DefaultTimeouts(),
 			},
 		},
 	}

@@ -334,14 +334,21 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	// never silently degrade to "an acceptance applies" either; erroring
 	// out is the only honest answer. acceptanceOK=false (no active row,
 	// or a row exists but Applicable reports it no longer binds to
-	// record.ID -- a new attempt posted a different verdict since it was
-	// granted) means accepted=false, exactly like a PR that was never
-	// accepted at all -- Acceptance.Applicable's own doc comment is what
-	// makes this the SAME code path that also closes "a moved base
-	// makes it inapplicable": ComputeEligibleWithAcceptance's own
-	// unconditional base/ancestor-chain checks refuse regardless of
-	// accepted, so this line alone need only answer "same verdict,
-	// still not revoked".
+	// record.ID, OR a NEWER review attempt has since run whether or not
+	// it posted a verdict -- finding F1, adversarial review: verdict-id
+	// equality alone cannot see a not_assessed attempt, since that
+	// attempt posts no review_verdicts row at all) means accepted=false,
+	// exactly like a PR that was never accepted at all -- Acceptance.
+	// Applicable's own doc comment is what makes this the SAME code path
+	// that also closes "a moved base makes it inapplicable":
+	// ComputeEligibleWithAcceptance's own unconditional base/
+	// ancestor-chain checks refuse regardless of accepted, so this line
+	// alone need only answer "same verdict, no newer attempt, still not
+	// revoked". hasNewerAttempt's own lookup error is ALSO fail-CLOSED,
+	// propagated exactly like acceptanceErr immediately below -- an
+	// action endpoint (this function, unlike buildPROpenItem's own
+	// best-effort display read) must never proceed on an unconfirmed
+	// attempt-freshness fact either direction.
 	//
 	// Gated on honorAcceptance (finding F4, adversarial review): when
 	// false (the unattended auto-merge worker), this store is never even
@@ -355,9 +362,15 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		if acceptanceErr != nil {
 			return false, "", "", false, "", fmt.Errorf("decisioninbox: revalidate for merge: get active review verdict acceptance: %w", acceptanceErr)
 		}
-		if acceptanceOK && acceptance.Applicable(record.ID) {
-			accepted = true
-			acceptanceID = acceptance.ID
+		if acceptanceOK {
+			hasNewerAttempt, newerErr := appreviewverdict.HasNewerReviewAttempt(ctx, deps.ReviewVerdict.Turns, acceptance)
+			if newerErr != nil {
+				return false, "", "", false, "", fmt.Errorf("decisioninbox: revalidate for merge: check newer review attempt: %w", newerErr)
+			}
+			if acceptance.Applicable(record.ID, hasNewerAttempt) {
+				accepted = true
+				acceptanceID = acceptance.ID
+			}
 		}
 	}
 

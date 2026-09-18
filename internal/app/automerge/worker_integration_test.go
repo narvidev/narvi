@@ -672,7 +672,7 @@ func TestPumpOnce_Armed_AcceptanceNeverHonored_DiffTooLarge_NeverMerges(t *testi
 	if err != nil {
 		t.Fatalf("create admin user: %v", err)
 	}
-	if _, err := appreviewverdict.Accept(ctx, rig.reviewVerdict.Acceptances, appreviewverdict.AcceptInput{
+	if _, _, err := appreviewverdict.Accept(ctx, rig.reviewVerdict.Acceptances, appreviewverdict.AcceptInput{
 		RepoFullName:  repoFullName,
 		PRNumber:      4,
 		VerdictID:     verdictID,

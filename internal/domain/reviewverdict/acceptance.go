@@ -22,17 +22,26 @@ type Acceptance struct {
 	// binds to. A review_verdicts row is immutable and append-only
 	// (§21.1: "never an update-in-place") and already carries its OWN
 	// attempt (Record.AttemptID) and its OWN context (Record.Context) on
-	// that SAME row -- so VerdictID alone is what "one verdict, one
-	// attempt and one context" (§21.1b) reduces to for THIS check:
-	// Applicable below needs no separate attempt/context comparison of
-	// its own -- see that method's own doc comment for the full
-	// reasoning, including the one thing VerdictID equality does NOT by
-	// itself catch (a moved base under an unchanged verdict).
+	// that SAME row. VerdictID equality alone is NOT sufficient to prove
+	// "one attempt" still holds, though (finding F1, adversarial review,
+	// corrected -- a previous version of this comment claimed it was): an
+	// attempt that ends not_assessed posts no review_verdicts row at all,
+	// so a NEWER attempt can exist with currentVerdictID still unchanged.
+	// Applicable below therefore ALSO takes hasNewerAttempt, a
+	// caller-supplied fact (internal/app/reviewverdict.
+	// HasNewerReviewAttempt) -- see that method's own doc comment for the
+	// full reasoning, including the one thing neither check by itself
+	// catches (a moved base under an unchanged verdict and no new
+	// attempt).
 	VerdictID string
 	// AttemptID/HeadSHA/Context are carried here VERBATIM from the
 	// accepted verdict, for display/audit only (this table's own
-	// migration doc comment) -- Applicable below never reads them, since
-	// VerdictID equality already implies them.
+	// migration doc comment) AND as the key Applicable's caller uses to
+	// resolve hasNewerAttempt (internal/app/reviewverdict.
+	// HasNewerReviewAttempt reads THIS field, via TurnStore.Get, to find
+	// the accepted attempt's own turns.created_at) -- Applicable itself
+	// never reads this field directly, since hasNewerAttempt is already
+	// resolved by the time Applicable is called.
 	AttemptID string
 	HeadSHA   string
 	Context   Context
@@ -58,11 +67,22 @@ type Acceptance struct {
 	AcceptedByUserID string
 	AcceptedAt       time.Time
 	// RevokedAt/RevokedByUserID: RevokedAt == nil means this acceptance
-	// is still active. Non-nil means a maintainer+ explicitly revoked it
-	// -- kept, never deleted, for the audit trail (§21.1b: "auditable
-	// revocation").
+	// is still active. Non-nil means either a maintainer+ explicitly
+	// revoked it, or a fresh Accept for the same pull request superseded
+	// it -- RevocationReason (below) is what tells the two apart; kept,
+	// never deleted, for the audit trail (§21.1b: "auditable revocation").
 	RevokedAt       *time.Time
 	RevokedByUserID string
+	// RevocationReason is "explicit" (a maintainer+'s own
+	// /revoke-verdict-acceptance click, RevokeReviewVerdictAcceptance) or
+	// "superseded" (a fresh Accept for the SAME pull request revoked this
+	// row automatically, SupersedeActiveReviewVerdictAcceptances) --
+	// display/audit only, empty while RevokedAt is nil (finding F4,
+	// adversarial review: before this column existed, both cases wrote the
+	// IDENTICAL revoked_at/revoked_by shape, so a superseded acceptance
+	// was indistinguishable, on this row alone, from an explicit
+	// revocation the accepting user never performed).
+	RevocationReason string
 }
 
 // Revoked reports whether a has been explicitly revoked.
@@ -76,22 +96,42 @@ func (a Acceptance) Revoked() bool {
 // moved base or a changed ancestor chain makes it inapplicable, exactly
 // as it makes the verdict stale."
 //
-// Because a review_verdicts row is immutable and append-only, and a's
-// own VerdictID already names the ONE verdict (and, transitively, the
-// ONE attempt and ONE context that SAME immutable row carries --
-// VerdictID's own doc comment above), the "new attempt" half of that
-// contract reduces entirely to: is currentVerdictID -- the id of the
-// LATEST verdict internal/app/reviewverdict.GetLatest would return for
-// this pull request RIGHT NOW -- still the SAME id this acceptance was
-// granted against? A new attempt (a re-triggered review, or a fresh
-// review after a new commit landed) always posts a NEW review_verdicts
-// row with a NEW id, so currentVerdictID changes the instant that
-// happens, with no separate attempt-id comparison needed here.
+// CORRECTED (finding F1, adversarial review, reproduced end to end
+// against real Postgres): a previous version of this doc comment claimed
+// the "new attempt" half of that contract "reduces entirely to"
+// currentVerdictID equality, reasoning that a new attempt always posts a
+// NEW review_verdicts row. That is false for the one attempt outcome
+// this package's own sibling, review's "not_assessed" state, exists to
+// name: a review attempt that ends without ever calling the
+// verdict-posting tool posts NO review_verdicts row at all
+// (sessionactor.enqueueReviewCheckNotAssessed fires PRECISELY because
+// reviewverdict.ExistsForAttempt is false for that attempt) -- so
+// internal/app/reviewverdict.GetLatest still returns the OLD, accepted
+// verdict, currentVerdictID still equals a.VerdictID, and the acceptance
+// stayed applicable through an attempt it was never granted against.
+// Proven: after a second attempt at the same head ended
+// terminal_not_assessed, RevalidateForMerge still returned ok=true,
+// viaAcceptance=true, with the PR's own narvi/review check reading
+// action_required -- nothing else catches this (githubapi.
+// fetchCIConclusionLive deliberately never folds Narvi's own check into
+// CIConclusion, so this is not a CI-green failure either).
+//
+// hasNewerAttempt is therefore now a CALLER-SUPPLIED fact, never
+// re-derived here (this package is I/O-free, §11) -- internal/app/
+// reviewverdict.HasNewerReviewAttempt is the one function that computes
+// it honestly, by querying turns directly for any is_review_attempt row
+// in the SAME session strictly newer than the accepted attempt's own
+// turns.created_at, regardless of whether that newer attempt ever posted
+// a verdict. A caller that cannot resolve this (no store wired, a
+// genuine lookup error) must pass true -- HasNewerReviewAttempt's own
+// doc comment: the safe default denies the waiver, never grants one this
+// deployment cannot actually confirm.
 //
 // A moved base or a changed ancestor chain, by themselves, do NOT change
-// which verdict row is latest (nobody re-reviewed) -- so this function
-// alone cannot detect those two triggers, and deliberately does not try:
-// they are instead caught downstream, by autoapproval.
+// which verdict row is latest and do NOT by themselves make a newer
+// attempt exist -- so hasNewerAttempt alone cannot detect those two
+// triggers, and this function deliberately does not ask it to: they are
+// instead caught downstream, by autoapproval.
 // ComputeEligibleWithAcceptance's OWN unconditional (never waived)
 // base-moved/ancestor-chain-changed checks, which run whether or not
 // accepted is true (that function's own doc comment). This function and
@@ -102,10 +142,13 @@ func (a Acceptance) Revoked() bool {
 // this code good enough" (CI, Shippable, diff size, sensitive path).
 //
 // A revoked acceptance is never applicable, regardless of
-// currentVerdictID.
-func (a Acceptance) Applicable(currentVerdictID string) bool {
+// currentVerdictID or hasNewerAttempt.
+func (a Acceptance) Applicable(currentVerdictID string, hasNewerAttempt bool) bool {
 	if a.Revoked() {
 		return false
 	}
-	return a.VerdictID != "" && a.VerdictID == currentVerdictID
+	if a.VerdictID == "" || a.VerdictID != currentVerdictID {
+		return false
+	}
+	return !hasNewerAttempt
 }

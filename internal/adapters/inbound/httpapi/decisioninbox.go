@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
@@ -163,20 +164,37 @@ func decisionInboxItemToDTO(it decisioninbox.Item) restdtos.DecisionInboxItem {
 			dto.VerdictId = &it.VerdictID
 		}
 
-		// acceptanceId/acceptanceJustification/acceptedAt (§21.1b) render
-		// only when an active, applicable acceptance actually exists for
-		// this row (Item.AcceptanceJustification's own doc comment: the
-		// empty string/zero time IS "no acceptance", mirroring
-		// lastHitAt's own "null iff hitCount is 0" precedent,
-		// FalsePositivePattern's wire shape) -- never a fabricated
-		// null-vs-empty-string distinction. acceptanceId (finding F11,
+		// acceptanceId/acceptanceJustification/acceptedAt/acceptedBy
+		// (§21.1b) render only when an active, applicable acceptance
+		// actually exists for this row -- gated on it.AcceptanceID being
+		// non-empty (finding F3b, adversarial review, corrected: a
+		// previous version of this gate was `it.AcceptanceJustification !=
+		// ""`, which only happened to be equivalent to "an acceptance
+		// exists" because AcceptReviewVerdict's own justification is
+		// REQUIRED, non-empty input -- a fact this rendering gate had no
+		// business depending on, and that nothing here pinned: a required
+		// check living entirely in a DIFFERENT file, decisioninbox.go's
+		// own AcceptReviewVerdict handler, could be relaxed or deleted
+		// without this gate ever failing to compile or obviously breaking
+		// -- see that check's own doc comment for the mutation-tested
+		// proof). AcceptanceID is the field aggregate.go's own
+		// buildPROpenItem sets UNCONDITIONALLY alongside the other three
+		// under the identical Applicable/acceptanceContextStillFresh
+		// gate (Item.AcceptanceID's own doc comment), so it is the
+		// existence signal that is actually true by CONSTRUCTION, not by
+		// coincidence. acceptanceId (finding F11 of an earlier round,
 		// adversarial review) is the id a client names back on
-		// RevokeReviewVerdictAcceptanceRequest.Id.
-		if it.AcceptanceJustification != "" {
+		// RevokeReviewVerdictAcceptanceRequest.Id. acceptedBy (finding F6,
+		// adversarial review) is the missing "by whom" this row's own
+		// justification/acceptedAt never named.
+		if it.AcceptanceID != "" {
 			dto.AcceptanceId = &it.AcceptanceID
 			dto.AcceptanceJustification = &it.AcceptanceJustification
 			acceptedAt := it.AcceptedAt
 			dto.AcceptedAt = &acceptedAt
+			if it.AcceptedByUserID != "" {
+				dto.AcceptedBy = &it.AcceptedByUserID
+			}
 		}
 
 		// isRelease is set unconditionally, exactly like isHandoff above --
@@ -561,7 +579,23 @@ func MergePullRequest(deps decisioninbox.Deps, sourceControl ports.SourceControl
 // attempted (RevalidateForMerge/RevalidateForAutoMerge, revalidate.go)
 // -- this handler never re-implements that decision, "never a second
 // authority" (CLAUDE.md).
-func AcceptReviewVerdict(deps decisioninbox.Deps, auditLog *postgres.AuditLogStore) http.HandlerFunc {
+//
+// pool (finding F2, adversarial review) is this handler's own new
+// dependency: the supersede-then-insert pair appreviewverdict.Accept
+// performs must commit or roll back TOGETHER, so this handler now owns
+// the transaction boundary itself -- mirrors UpdateMemberRole's own
+// identical "handler takes pool directly, begins/defer-rollback/commits"
+// shape (members.go) -- and passes deps.ReviewVerdict.Acceptances.
+// WithTx(tx) down to Accept, never the bare pool-scoped store. The audit
+// log write(s) below now ALSO run inside this SAME transaction
+// (auditLog.WithTx(tx), never the bare pool-scoped auditLog this handler
+// used to call straight through) -- mirrors auditlog.Record's own
+// doc comment ("written in the same transaction as the change") and
+// corrects this handler's own previous violation of it: a failure
+// writing the audit row now aborts the whole accept (rollback), never a
+// logged-and-ignored best-effort write that could leave the acceptance
+// committed with no audit trail at all.
+func AcceptReviewVerdict(pool *pgxpool.Pool, deps decisioninbox.Deps, auditLog *postgres.AuditLogStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		logger := platform.Logger(ctx)
@@ -665,7 +699,15 @@ func AcceptReviewVerdict(deps decisioninbox.Deps, auditLog *postgres.AuditLogSto
 			}
 		}
 
-		acceptance, err := appreviewverdict.Accept(ctx, deps.ReviewVerdict.Acceptances, appreviewverdict.AcceptInput{
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			logger.Error("httpapi: accept review verdict: begin tx failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+
+		acceptance, superseded, err := appreviewverdict.Accept(ctx, deps.ReviewVerdict.Acceptances.WithTx(tx), appreviewverdict.AcceptInput{
 			RepoFullName:  req.RepoFullName,
 			PRNumber:      int32(req.PrNumber),
 			VerdictID:     verdictID,
@@ -682,7 +724,31 @@ func AcceptReviewVerdict(deps decisioninbox.Deps, auditLog *postgres.AuditLogSto
 			return
 		}
 
-		if err := auditlog.Record(ctx, auditLog, actorUserID, "review_verdict.accept", "review_verdict_acceptance", acceptance.ID, map[string]any{
+		// review_verdict.accept_supersedes_prior (finding F4, adversarial
+		// review): a DISTINCT audit row per superseded acceptance, naming
+		// its own id, recorded BEFORE review_verdict.accept below and in
+		// the SAME transaction -- so the audit log itself, not just this
+		// row's own revocation_reason column, records "this specific prior
+		// acceptance was superseded by this specific new one", never
+		// leaving it to simply vanish from the trail the way a bare
+		// review_verdict.accept entry (naming only the NEW acceptance)
+		// used to.
+		for _, prior := range superseded {
+			if err := auditlog.Record(ctx, auditLog.WithTx(tx), actorUserID, "review_verdict.accept_supersedes_prior", "review_verdict_acceptance", acceptance.ID, map[string]any{
+				"repo_full_name":           req.RepoFullName,
+				"pr_number":                req.PrNumber,
+				"superseded_acceptance_id": prior.ID,
+				"superseded_verdict_id":    prior.VerdictID,
+				"superseded_justification": prior.Justification,
+				"superseded_accepted_by":   prior.AcceptedByUserID,
+			}); err != nil {
+				logger.Error("httpapi: record review_verdict.accept_supersedes_prior audit log failed", "error", err)
+				writeError(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+		}
+
+		if err := auditlog.Record(ctx, auditLog.WithTx(tx), actorUserID, "review_verdict.accept", "review_verdict_acceptance", acceptance.ID, map[string]any{
 			"repo_full_name": req.RepoFullName,
 			"pr_number":      req.PrNumber,
 			"verdict_id":     acceptance.VerdictID,
@@ -690,6 +756,14 @@ func AcceptReviewVerdict(deps decisioninbox.Deps, auditLog *postgres.AuditLogSto
 			"justification":  acceptance.Justification,
 		}); err != nil {
 			logger.Error("httpapi: record review_verdict.accept audit log failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			logger.Error("httpapi: accept review verdict: commit tx failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
 		}
 
 		writeJSON(w, http.StatusCreated, reviewVerdictAcceptanceToDTO(acceptance))
@@ -803,6 +877,15 @@ func reviewVerdictAcceptanceToDTO(a reviewverdict.Acceptance) restdtos.ReviewVer
 		if a.RevokedByUserID != "" {
 			revokedBy := a.RevokedByUserID
 			dto.RevokedBy = &revokedBy
+		}
+		// revocationReason (finding F4, adversarial review): "explicit" vs
+		// "superseded" -- the fact that distinguishes a maintainer+'s own
+		// deliberate revoke click from a fresh accept's own automatic
+		// supersession, which used to write the IDENTICAL revokedAt/
+		// revokedBy shape either way.
+		if a.RevocationReason != "" {
+			revocationReason := a.RevocationReason
+			dto.RevocationReason = &revocationReason
 		}
 	}
 	return dto

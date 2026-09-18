@@ -47,6 +47,20 @@ func (s *TurnStore) ListForSession(ctx context.Context, sessionID pgtype.UUID) (
 	return s.q.ListTurnsForSession(ctx, sessionID)
 }
 
+// ExistsNewerReviewAttempt reports whether ANY genuine review attempt
+// (is_review_attempt = true) in sessionID's own turn history is strictly
+// newer than afterCreatedAt — see ExistsNewerReviewAttempt's own
+// generated doc comment (queries/turns.sql) for the full "why". The one
+// caller, internal/app/reviewverdict.HasNewerReviewAttempt (finding F1,
+// adversarial review, §21.1b), supplies afterCreatedAt from the ACCEPTED
+// attempt's own turns.created_at (this store's own Get, above).
+func (s *TurnStore) ExistsNewerReviewAttempt(ctx context.Context, sessionID pgtype.UUID, afterCreatedAt pgtype.Timestamptz) (bool, error) {
+	return s.q.ExistsNewerReviewAttempt(ctx, sqlcgen.ExistsNewerReviewAttemptParams{
+		SessionID: sessionID,
+		CreatedAt: afterCreatedAt,
+	})
+}
+
 // UpdateStatus sets a turn's status, plus dispatched_at/completed_at when
 // the caller supplies one (see UpdateTurnStatusParams' generated doc for
 // the COALESCE semantics).

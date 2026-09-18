@@ -2094,22 +2094,23 @@ type ReviewVerdict struct {
 }
 
 type ReviewVerdictAcceptance struct {
-	ID            pgtype.UUID        `json:"id"`
-	RepoFullName  string             `json:"repo_full_name"`
-	PrNumber      int32              `json:"pr_number"`
-	VerdictID     pgtype.UUID        `json:"verdict_id"`
-	AttemptID     pgtype.UUID        `json:"attempt_id"`
-	HeadSha       string             `json:"head_sha"`
-	BaseRef       *string            `json:"base_ref"`
-	BaseSha       *string            `json:"base_sha"`
-	AncestorChain []byte             `json:"ancestor_chain"`
-	PolicyVersion int32              `json:"policy_version"`
-	Reason        string             `json:"reason"`
-	Justification string             `json:"justification"`
-	AcceptedBy    pgtype.UUID        `json:"accepted_by"`
-	AcceptedAt    pgtype.Timestamptz `json:"accepted_at"`
-	RevokedAt     pgtype.Timestamptz `json:"revoked_at"`
-	RevokedBy     pgtype.UUID        `json:"revoked_by"`
+	ID               pgtype.UUID        `json:"id"`
+	RepoFullName     string             `json:"repo_full_name"`
+	PrNumber         int32              `json:"pr_number"`
+	VerdictID        pgtype.UUID        `json:"verdict_id"`
+	AttemptID        pgtype.UUID        `json:"attempt_id"`
+	HeadSha          string             `json:"head_sha"`
+	BaseRef          *string            `json:"base_ref"`
+	BaseSha          *string            `json:"base_sha"`
+	AncestorChain    []byte             `json:"ancestor_chain"`
+	PolicyVersion    int32              `json:"policy_version"`
+	Reason           string             `json:"reason"`
+	Justification    string             `json:"justification"`
+	AcceptedBy       pgtype.UUID        `json:"accepted_by"`
+	AcceptedAt       pgtype.Timestamptz `json:"accepted_at"`
+	RevokedAt        pgtype.Timestamptz `json:"revoked_at"`
+	RevokedBy        pgtype.UUID        `json:"revoked_by"`
+	RevocationReason *string            `json:"revocation_reason"`
 }
 
 type Sandbox struct {

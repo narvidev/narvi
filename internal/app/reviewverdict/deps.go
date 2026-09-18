@@ -41,6 +41,16 @@ type Deps struct {
 	// exists".
 	Acceptances *postgres.ReviewVerdictAcceptanceStore
 
+	// Turns backs HasNewerReviewAttempt (finding F1, adversarial review,
+	// §21.1b) -- the ONE store an acceptance's own applicability check
+	// needs to tell "a new attempt posted a fresh verdict" apart from "a
+	// new attempt ran and posted NOTHING" (not_assessed). Nil-safe on the
+	// SAME convention as Acceptances immediately above: a nil store
+	// degrades HasNewerReviewAttempt to (true, nil) -- fail CLOSED, never
+	// a panic and never a silent grant of a waiver this deployment cannot
+	// confirm.
+	Turns *postgres.TurnStore
+
 	// PlatformShadow is the deployment-wide egress switch (§30.8), needed
 	// alongside RepoSettings to stamp an outcome's own epoch -- see
 	// recordOutcome. False on a wiring that never records outcomes.

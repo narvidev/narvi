@@ -165,7 +165,9 @@ export interface DecisionInboxChip {
  * comment) and are skipped here rather than rendered as a false "0"/
  * "not green" when genuinely unknown.
  */
-export function prChipData(item: Pick<DecisionInboxItem, 'riskLabel' | 'findings' | 'ciGreen' | 'hasChangesRequested'>): DecisionInboxChip[] {
+export function prChipData(
+  item: Pick<DecisionInboxItem, 'riskLabel' | 'findings' | 'ciGreen' | 'hasChangesRequested' | 'acceptanceId'>,
+): DecisionInboxChip[] {
   const chips: DecisionInboxChip[] = []
 
   if (item.riskLabel) {
@@ -183,7 +185,37 @@ export function prChipData(item: Pick<DecisionInboxItem, 'riskLabel' | 'findings
     chips.push({ tone: 'crit', text: 'changes requested' })
   }
 
+  // finding F5 (adversarial review): before this chip existed, an
+  // accepted-but-engine-refused PR (§21.1b) rendered on this queue
+  // INDISTINGUISHABLY from an ordinary, never-looked-at needs_review row
+  // -- the ONLY signal a maintainer had that a human already authorised
+  // proceeding was the raw JSON API response, never anything this view
+  // rendered. acceptanceId, never acceptanceJustification's own
+  // emptiness, is the existence signal (mirrors decisionInboxItemToDTO's
+  // own identical correction, server-side, finding F3b).
+  if (hasAcceptedOverride(item)) {
+    chips.push({ tone: 'warn', text: 'accepted override' })
+  }
+
   return chips
+}
+
+/**
+ * hasAcceptedOverride reports whether a PR-shaped row carries an active,
+ * applicable acceptance (§21.1b) -- the aggregate's own Kind
+ * classification stays DELIBERATELY acceptance-blind (an accepted PR
+ * still classifies needs_review, never ready_to_merge, because §21.1b's
+ * acceptance authorises a human's OWN next Merge click rather than
+ * reclassifying the engine's judgment -- decisioninbox.Item.AcceptanceID's
+ * own doc comment, server-side), so this is the flag THIS view uses to
+ * still offer that Merge click on a needs_review row (DecisionInboxView.
+ * tsx), and to render the "accepted override" chip above -- rather than
+ * leaving a maintainer who already sees the acceptance's own
+ * justification with nothing but an "Open review" link and no way to act
+ * on it (finding F5, adversarial review).
+ */
+export function hasAcceptedOverride(item: Pick<DecisionInboxItem, 'acceptanceId'>): boolean {
+  return item.acceptanceId !== null
 }
 
 /**

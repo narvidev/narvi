@@ -1939,7 +1939,7 @@ func TestBuild_AcceptedVerdict_BaseMoved_HidesStaleAcceptance(t *testing.T) {
 	if err := verdictID.Scan(record.ID); err != nil {
 		t.Fatalf("scan verdict id: %v", err)
 	}
-	if _, err := appreviewverdict.Accept(ctx, acceptances, appreviewverdict.AcceptInput{
+	if _, _, err := appreviewverdict.Accept(ctx, acceptances, appreviewverdict.AcceptInput{
 		RepoFullName:  repoFullName,
 		PRNumber:      42,
 		VerdictID:     verdictID,

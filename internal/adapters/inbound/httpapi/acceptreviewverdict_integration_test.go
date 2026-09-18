@@ -200,6 +200,106 @@ func TestAcceptReviewVerdict_MissingVerdictID_Returns400(t *testing.T) {
 	}
 }
 
+// TestAcceptReviewVerdict_MissingJustification_Returns400 pins finding
+// F3b (adversarial review): justification is a required field -- the
+// `if justification == "" { 400 }` check (decisioninbox.go) had NO test
+// of its own before this fix, and could be deleted with the whole suite
+// still green. An omitted justification must never silently record an
+// acceptance with an empty explanation (§21.1b: "carries author,
+// justification").
+func TestAcceptReviewVerdict_MissingJustification_Returns400(t *testing.T) {
+	rig := newDecisionInboxTestRig(t, &fakeMergeSourceControl{})
+	ctx := context.Background()
+
+	_, token := rig.createAuthenticatedUser(ctx, t, sqlcgen.UserRoleMaintainer)
+	const repoFullName = "acme/accept-verdict-missing-justification"
+	rig.seedAutoApprovedVerdict(ctx, t, repoFullName, 506, "headsha506")
+
+	record, hasVerdict, err := appreviewverdict.GetLatest(ctx, appreviewverdict.Deps{ReviewVerdicts: rig.reviewVerdicts}, repoFullName, 506)
+	if err != nil || !hasVerdict {
+		t.Fatalf("GetLatest: hasVerdict=%v err=%v", hasVerdict, err)
+	}
+
+	body, err := json.Marshal(restdtos.AcceptReviewVerdictRequest{
+		RepoFullName: repoFullName, PrNumber: 506, VerdictId: record.ID,
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	status := rig.doJSON(t, http.MethodPost, "/api/decision-inbox/accept-verdict", body, nil, token)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", status, http.StatusBadRequest)
+	}
+
+	// No acceptance must have been recorded.
+	_, ok, err := appreviewverdict.GetActiveAcceptance(ctx, narvipg.NewReviewVerdictAcceptanceStore(rig.pool), repoFullName, 506)
+	if err != nil {
+		t.Fatalf("GetActiveAcceptance: error = %v, want nil", err)
+	}
+	if ok {
+		t.Error("GetActiveAcceptance: ok = true, want false -- a request with no justification must never record an acceptance")
+	}
+}
+
+// TestRevokeReviewVerdictAcceptance_Member_Returns403 pins finding F3a
+// (adversarial review): AcceptReviewVerdict's own sibling authz gate
+// (TestAcceptReviewVerdict_Member_Returns403, above) had no equivalent
+// test for RevokeReviewVerdictAcceptance -- the authorize(...,
+// authz.ActionAcceptReviewVerdict, ...) block in that handler
+// (decisioninbox.go) could be deleted with the whole suite still green.
+// A member (or viewer) may never revoke an acceptance, mirroring
+// action.go's own "revocation is deliberately never a stricter role than
+// acceptance" doc comment -- same role floor, same denial for anything
+// below it.
+func TestRevokeReviewVerdictAcceptance_Member_Returns403(t *testing.T) {
+	rig := newDecisionInboxTestRig(t, &fakeMergeSourceControl{})
+	ctx := context.Background()
+
+	_, maintainerToken := rig.createAuthenticatedUser(ctx, t, sqlcgen.UserRoleMaintainer)
+	_, memberToken := rig.createAuthenticatedUser(ctx, t, sqlcgen.UserRoleMember)
+	const repoFullName = "acme/revoke-verdict-member"
+	rig.seedAutoApprovedVerdict(ctx, t, repoFullName, 507, "headsha507")
+
+	record, hasVerdict, err := appreviewverdict.GetLatest(ctx, appreviewverdict.Deps{ReviewVerdicts: rig.reviewVerdicts}, repoFullName, 507)
+	if err != nil || !hasVerdict {
+		t.Fatalf("GetLatest: hasVerdict=%v err=%v", hasVerdict, err)
+	}
+
+	acceptBody, err := json.Marshal(restdtos.AcceptReviewVerdictRequest{
+		RepoFullName: repoFullName, PrNumber: 507, VerdictId: record.ID, Justification: "Accepted by a maintainer, then a member tries (and must fail) to revoke it.",
+	})
+	if err != nil {
+		t.Fatalf("marshal accept request: %v", err)
+	}
+	var accepted restdtos.ReviewVerdictAcceptance
+	if status := rig.doJSON(t, http.MethodPost, "/api/decision-inbox/accept-verdict", acceptBody, &accepted, maintainerToken); status != http.StatusCreated {
+		t.Fatalf("accept status = %d, want %d", status, http.StatusCreated)
+	}
+
+	revokeBody, err := json.Marshal(restdtos.RevokeReviewVerdictAcceptanceRequest{
+		RepoFullName: repoFullName, Id: accepted.Id,
+	})
+	if err != nil {
+		t.Fatalf("marshal revoke request: %v", err)
+	}
+
+	status := rig.doJSON(t, http.MethodPost, "/api/decision-inbox/revoke-verdict-acceptance", revokeBody, nil, memberToken)
+	if status != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d (member role must be denied)", status, http.StatusForbidden)
+	}
+
+	// The acceptance must still be active -- a denied request must never
+	// have any side effect.
+	_, ok, err := appreviewverdict.GetActiveAcceptance(ctx, narvipg.NewReviewVerdictAcceptanceStore(rig.pool), repoFullName, 507)
+	if err != nil {
+		t.Fatalf("GetActiveAcceptance: error = %v, want nil", err)
+	}
+	if !ok {
+		t.Error("GetActiveAcceptance: ok = false, want true -- a forbidden revoke attempt must never actually revoke anything")
+	}
+}
+
 // TestRevokeReviewVerdictAcceptance_HappyPathThenAlreadyRevoked proves
 // revocation end to end, and its own guarded-UPDATE idempotency: a
 // second revoke of the SAME acceptance is a 409, never a silent
@@ -246,6 +346,12 @@ func TestRevokeReviewVerdictAcceptance_HappyPathThenAlreadyRevoked(t *testing.T)
 	}
 	if revoked.RevokedBy == nil || *revoked.RevokedBy != revoker.ID.String() {
 		t.Errorf("RevokedBy = %v, want the revoking admin's own id %q", revoked.RevokedBy, revoker.ID.String())
+	}
+	// finding F4 (adversarial review): a genuine, explicit revoke click
+	// must read back as "explicit", never "superseded" -- the fact that
+	// tells the two apart on the wire.
+	if revoked.RevocationReason == nil || *revoked.RevocationReason != "explicit" {
+		t.Errorf("RevocationReason = %v, want %q", revoked.RevocationReason, "explicit")
 	}
 
 	// GetActiveAcceptance must no longer report this row as active.

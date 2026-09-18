@@ -293,7 +293,11 @@ func newDecisionInboxTestRig(t *testing.T, sourceControl ports.SourceControl) *d
 			// RevokeReviewVerdictAcceptance below, and revalidateCore's
 			// own GetActiveAcceptance/Applicable check.
 			Acceptances: narvipg.NewReviewVerdictAcceptanceStore(pool),
-			Timeouts:    platform.DefaultTimeouts(),
+			// Turns (finding F1, adversarial review, §21.1b) backs
+			// HasNewerReviewAttempt -- mirrors production wiring
+			// (controlplane/serve.go's own reviewVerdictDeps).
+			Turns:    narvipg.NewTurnStore(pool),
+			Timeouts: platform.DefaultTimeouts(),
 		},
 	}
 	auditLog := narvipg.NewAuditLogStore(pool)
@@ -303,7 +307,7 @@ func newDecisionInboxTestRig(t *testing.T, sourceControl ports.SourceControl) *d
 		r.Use(auth.Middleware(userSessions, users))
 		r.Get("/", httpapi.ListDecisionInbox(deps))
 		r.Post("/merge", httpapi.MergePullRequest(deps, sourceControl, auditLog))
-		r.Post("/accept-verdict", httpapi.AcceptReviewVerdict(deps, auditLog))
+		r.Post("/accept-verdict", httpapi.AcceptReviewVerdict(pool, deps, auditLog))
 		r.Post("/revoke-verdict-acceptance", httpapi.RevokeReviewVerdictAcceptance(deps, auditLog))
 	})
 

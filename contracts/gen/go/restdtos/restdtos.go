@@ -2642,6 +2642,12 @@ type DecisionInboxItem struct {
 	// the exact same conditions acceptanceJustification is null.
 	AcceptedAt DecisionInboxItemAcceptedAt `json:"acceptedAt" yaml:"acceptedAt" mapstructure:"acceptedAt"`
 
+	// The accepting maintainer+'s own user id -- null under the exact same conditions
+	// acceptanceJustification is null (finding F6, adversarial review: this row's own
+	// acceptanceJustification/acceptedAt already told a maintainer THAT a verdict was
+	// authorised and WHEN; this field is the missing 'by whom').
+	AcceptedBy DecisionInboxItemAcceptedBy `json:"acceptedBy" yaml:"acceptedBy" mapstructure:"acceptedBy"`
+
 	// The response's own generation instant minus enteredQueueAt, in seconds.
 	AgeSeconds int `json:"ageSeconds" yaml:"ageSeconds" mapstructure:"ageSeconds"`
 
@@ -2863,6 +2869,12 @@ type DecisionInboxItemAcceptanceJustification *string
 // When the acceptance named by acceptanceJustification was granted -- null under
 // the exact same conditions acceptanceJustification is null.
 type DecisionInboxItemAcceptedAt = *time.Time
+
+// The accepting maintainer+'s own user id -- null under the exact same conditions
+// acceptanceJustification is null (finding F6, adversarial review: this row's own
+// acceptanceJustification/acceptedAt already told a maintainer THAT a verdict was
+// authorised and WHEN; this field is the missing 'by whom').
+type DecisionInboxItemAcceptedBy *string
 
 // §15.3's own already-computed trigger decision (whether the constituent PRs' own
 // shape met the criteria for an aggregate diff review, OR the constituent-PR
@@ -3137,6 +3149,9 @@ func (j *DecisionInboxItem) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["acceptedAt"]; raw != nil && !ok {
 		return fmt.Errorf("field acceptedAt in DecisionInboxItem: required")
+	}
+	if _, ok := raw["acceptedBy"]; raw != nil && !ok {
+		return fmt.Errorf("field acceptedBy in DecisionInboxItem: required")
 	}
 	if _, ok := raw["ageSeconds"]; raw != nil && !ok {
 		return fmt.Errorf("field ageSeconds in DecisionInboxItem: required")
@@ -9867,6 +9882,15 @@ type ReviewVerdictAcceptance struct {
 	// RepoFullName corresponds to the JSON schema field "repoFullName".
 	RepoFullName string `json:"repoFullName" yaml:"repoFullName" mapstructure:"repoFullName"`
 
+	// 'explicit' (a maintainer+'s own revoke-verdict-acceptance click) or
+	// 'superseded' (a fresh accept-verdict for the SAME pull request revoked this row
+	// automatically) -- null under the exact same condition revokedAt is null
+	// (finding F4, adversarial review: before this field existed, both cases wrote
+	// the IDENTICAL revokedAt/revokedBy shape, so a superseded acceptance was
+	// indistinguishable, on this row alone, from an explicit revocation the accepting
+	// user never performed).
+	RevocationReason ReviewVerdictAcceptanceRevocationReason `json:"revocationReason" yaml:"revocationReason" mapstructure:"revocationReason"`
+
 	// Null means this acceptance is still active. Non-null means a maintainer+ has
 	// explicitly revoked it -- kept, never deleted, for the audit trail.
 	RevokedAt *time.Time `json:"revokedAt" yaml:"revokedAt" mapstructure:"revokedAt"`
@@ -9882,6 +9906,15 @@ type ReviewVerdictAcceptance struct {
 // The accepted verdict's own turns.id, carried verbatim for display/audit -- null
 // for a pre-§21.1-amendment verdict.
 type ReviewVerdictAcceptanceAttemptId *string
+
+// 'explicit' (a maintainer+'s own revoke-verdict-acceptance click) or 'superseded'
+// (a fresh accept-verdict for the SAME pull request revoked this row
+// automatically) -- null under the exact same condition revokedAt is null (finding
+// F4, adversarial review: before this field existed, both cases wrote the
+// IDENTICAL revokedAt/revokedBy shape, so a superseded acceptance was
+// indistinguishable, on this row alone, from an explicit revocation the accepting
+// user never performed).
+type ReviewVerdictAcceptanceRevocationReason *string
 
 // Null under the exact same condition revokedAt is null.
 type ReviewVerdictAcceptanceRevokedBy *string
@@ -9918,6 +9951,9 @@ func (j *ReviewVerdictAcceptance) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["repoFullName"]; raw != nil && !ok {
 		return fmt.Errorf("field repoFullName in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["revocationReason"]; raw != nil && !ok {
+		return fmt.Errorf("field revocationReason in ReviewVerdictAcceptance: required")
 	}
 	if _, ok := raw["revokedAt"]; raw != nil && !ok {
 		return fmt.Errorf("field revokedAt in ReviewVerdictAcceptance: required")

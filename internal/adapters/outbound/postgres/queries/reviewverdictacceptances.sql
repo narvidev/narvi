@@ -3,12 +3,17 @@
 -- 000135_review_verdict_acceptances.up.sql's own doc comment for the
 -- table's full design.
 
--- name: SupersedeActiveReviewVerdictAcceptances :exec
+-- name: SupersedeActiveReviewVerdictAcceptances :many
 -- Revokes every currently-active row for (repo_full_name, pr_number),
 -- revoked_by the SAME accepting user (this is an automatic supersession
 -- by a fresh accept, not a maintainer's own explicit revoke click, so
 -- there is no separate revoker to name -- the accepting user is the only
--- actor this statement genuinely knows about). Called by
+-- actor this statement genuinely knows about) and revocation_reason =
+-- 'superseded' (finding F4, adversarial review -- distinct from
+-- RevokeReviewVerdictAcceptance's own 'explicit', below: this column is
+-- what lets a reader tell "this row was auto-superseded by a fresh
+-- accept" apart from "a maintainer explicitly clicked revoke", which
+-- revoked_at/revoked_by alone cannot). Called by
 -- ReviewVerdictAcceptanceStore.Insert (postgres package) IMMEDIATELY
 -- before InsertReviewVerdictAcceptance below, as two separate statements
 -- -- NEVER as one WITH-clause statement (finding F2's own first attempt,
@@ -21,15 +26,26 @@
 -- and the whole statement fails with a spurious duplicate-key error on
 -- the routine, common case this exists to allow -- a plain re-accept of
 -- the SAME verdict). Two ordinary sequential statements (this one, then
--- the INSERT) do not share this hazard. review_verdict_acceptances_one_
--- active_idx is the actual invariant enforcer either way: a concurrent
--- accept racing between this statement and the INSERT below can still
--- make the INSERT fail on that constraint (a genuine, rare double-accept
--- race) -- an ordinary, retryable 500, never a silent violation of "at
--- most one active row".
+-- the INSERT) do not share this hazard -- PROVIDED they run inside the
+-- SAME transaction (finding F2, adversarial review, corrected: this used
+-- to be true only in the CTE sense, never in the commit sense -- see
+-- ReviewVerdictAcceptanceStore.Insert's own doc comment, postgres
+-- package, for the fix: the caller now supplies a WithTx-scoped store).
+-- review_verdict_acceptances_one_active_idx is the actual invariant
+-- enforcer either way: a concurrent accept racing between this statement
+-- and the INSERT below (from a DIFFERENT transaction) can still make the
+-- INSERT fail on that constraint (a genuine, rare double-accept race) --
+-- an ordinary, retryable 500, never a silent violation of "at most one
+-- active row". RETURNING * (finding F4: this used to be :exec, silently
+-- discarding which row, if any, was superseded) is what lets the caller
+-- record a DISTINCT, properly-attributed audit fact for the supersession
+-- itself, naming the superseded row's own id -- see
+-- httpapi.AcceptReviewVerdict's own review_verdict.accept_supersedes_prior
+-- audit action.
 UPDATE review_verdict_acceptances
-SET revoked_at = now(), revoked_by = $3
-WHERE repo_full_name = $1 AND pr_number = $2 AND revoked_at IS NULL;
+SET revoked_at = now(), revoked_by = $3, revocation_reason = 'superseded'
+WHERE repo_full_name = $1 AND pr_number = $2 AND revoked_at IS NULL
+RETURNING *;
 
 -- name: InsertReviewVerdictAcceptance :one
 -- APPEND-ONLY create (this table's own migration doc comment: "never
@@ -84,11 +100,15 @@ SELECT * FROM review_verdict_acceptances WHERE id = $1 AND repo_full_name = $2;
 -- name: RevokeReviewVerdictAcceptance :one
 -- The revoke write: a maintainer+ (the SAME role that may accept --
 -- see internal/domain/authz's own ActionAcceptReviewVerdict, row 5)
--- explicitly withdraws an active acceptance. SCOPED to repo_full_name
--- (mirrors RetireFalsePositivePattern's own identical audit-fix
--- precedent) AND guarded (WHERE revoked_at IS NULL, CLAUDE.md/§11's own
--- "guarded UPDATE ... WHERE for cross-writer transitions" rule) so
--- revoking an ALREADY-revoked acceptance is a no-op that returns
+-- explicitly withdraws an active acceptance -- revocation_reason =
+-- 'explicit' (finding F4, adversarial review), distinct from
+-- SupersedeActiveReviewVerdictAcceptances' own 'superseded' above: THIS
+-- is the one write that is a genuine, deliberate human revocation click,
+-- never an automatic side effect of a fresh accept. SCOPED to
+-- repo_full_name (mirrors RetireFalsePositivePattern's own identical
+-- audit-fix precedent) AND guarded (WHERE revoked_at IS NULL, CLAUDE.md/
+-- §11's own "guarded UPDATE ... WHERE for cross-writer transitions" rule)
+-- so revoking an ALREADY-revoked acceptance is a no-op that returns
 -- pgx.ErrNoRows (never a second, silently overwriting revoked_at/
 -- revoked_by) -- the caller (httpapi) tells "never existed in this
 -- repo" apart from "exists in this repo but already revoked" via a
@@ -96,7 +116,7 @@ SELECT * FROM review_verdict_acceptances WHERE id = $1 AND repo_full_name = $2;
 -- same error path, mirroring RetireFalsePositivePattern's own identical
 -- caller-side discipline.
 UPDATE review_verdict_acceptances
-SET revoked_at = now(), revoked_by = $2
+SET revoked_at = now(), revoked_by = $2, revocation_reason = 'explicit'
 WHERE id = $1 AND repo_full_name = $3 AND revoked_at IS NULL
 RETURNING *;
 

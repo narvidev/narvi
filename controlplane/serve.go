@@ -879,6 +879,11 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// instance the GitHub capture command above already uses.
 		DigestSectionFeedback: reviewDigestSectionFeedbackStore,
 		Acceptances:           reviewVerdictAcceptanceStore,
+		// Turns (finding F1, adversarial review, §21.1b) backs
+		// HasNewerReviewAttempt -- the SAME turnStore instance every other
+		// httpapi handler in this file already shares (platformAnalyticsDeps
+		// immediately below, for one).
+		Turns: turnStore,
 		// §30.7: stamps each recorded auto-approval outcome with the
 		// epoch it was observed in, so a shadow-era contradiction never
 		// moves the rate that justifies arming auto-merge.
@@ -1796,7 +1801,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// route shape. Both gated on authz.ActionAcceptReviewVerdict
 		// (maintainer+, §13.3 row 5) inside the handler itself, exactly
 		// like /merge's own authz.ActionMergePR gate.
-		r.Post("/accept-verdict", httpapi.AcceptReviewVerdict(decisionInboxDeps, auditLogStore))
+		r.Post("/accept-verdict", httpapi.AcceptReviewVerdict(pool, decisionInboxDeps, auditLogStore))
 		r.Post("/revoke-verdict-acceptance", httpapi.RevokeReviewVerdictAcceptance(decisionInboxDeps, auditLogStore))
 	})
 

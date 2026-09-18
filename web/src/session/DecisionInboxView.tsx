@@ -59,6 +59,7 @@ import {
   canMergeDecisionInboxItem,
   formatAgeSeconds,
   formatDecisionLatencySeconds,
+  hasAcceptedOverride,
   prChipData,
   provenanceText,
   releaseChipData,
@@ -355,7 +356,22 @@ export function DecisionInboxRow({ item, canMerge }: { item: DecisionInboxItem; 
         {item.stale ? ' — stale' : ''}
       </span>
 
-      {item.kind === 'ready_to_merge' && <MergeButton item={item} canMerge={canMerge} />}
+      {/*
+        finding F5 (adversarial review): an accepted-but-engine-refused PR
+        (§21.1b) still classifies needs_review, DELIBERATELY (see
+        hasAcceptedOverride's own doc comment, decisionInboxFormat.ts, for
+        why the aggregate stays acceptance-blind) -- but that must never
+        mean the ONLY way to act on it is the raw API a maintainer cannot
+        reach from this screen. The Merge endpoint's own server-side gate
+        (RevalidateForMerge) already honors an applicable acceptance
+        regardless of which row kind this client thinks it is looking at
+        (MergeButton's own doc comment: "the real gate is server-side...
+        re-checked unconditionally at click time"), so offering it here is
+        never unsafe -- it was simply never OFFERED before this fix.
+      */}
+      {(item.kind === 'ready_to_merge' || (kind === 'pr' && item.kind === 'needs_review' && hasAcceptedOverride(item))) && (
+        <MergeButton item={item} canMerge={canMerge} />
+      )}
       {/*
         Open review links into Narvi's own code-review screen, but ONLY
         when the server has already resolved a real review session for
@@ -389,6 +405,22 @@ export function DecisionInboxRow({ item, canMerge }: { item: DecisionInboxItem; 
       {why !== null && (
         <span className="qwhy">
           <T text={why} />
+        </span>
+      )}
+      {/*
+        finding F5 (adversarial review): the accepting maintainer+'s own
+        free-text justification (§21.1b: "carries author, justification")
+        is untrusted, human-authored content -- through T like every other
+        such string on this row (`why` immediately above, item.title),
+        never a bare interpolation. Rendered only alongside the "accepted
+        override" chip (prChipData), i.e. exactly when acceptanceId is
+        set -- acceptanceJustification's own nullability already mirrors
+        that same gate server-side (DecisionInboxItem.acceptanceJustification's
+        own doc comment).
+      */}
+      {kind === 'pr' && hasAcceptedOverride(item) && item.acceptanceJustification !== null && (
+        <span className="qwhy">
+          <T text={`Accepted despite refusal: ${item.acceptanceJustification}`} />
         </span>
       )}
       {kind === 'session' && (

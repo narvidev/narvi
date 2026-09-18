@@ -2432,6 +2432,10 @@ export interface DecisionInboxItem {
    */
   acceptedAt: string | null;
   /**
+   * The accepting maintainer+'s own user id -- null under the exact same conditions acceptanceJustification is null (finding F6, adversarial review: this row's own acceptanceJustification/acceptedAt already told a maintainer THAT a verdict was authorised and WHEN; this field is the missing 'by whom').
+   */
+  acceptedBy: string | null;
+  /**
    * True iff this PR is a release cut (§15) whose manifest check has already been computed and persisted. Set (to true or false) for any PR-shaped row, exactly like isHandoff above -- the field a client checks to render this row's own distinct release shape (a link to the release-review screen, never a Merge button: a release cut always renders under kind=needs_review) instead of the ordinary PR shape. A PR that a release-branch-pattern/label WOULD classify as a release cut but that Narvi has not yet reviewed (or reviewed too recently for the background check to have finished) renders false here -- an honest, temporary gap, never a fabricated one.
    */
   isRelease: boolean | null;
@@ -2600,6 +2604,10 @@ export interface ReviewVerdictAcceptance {
    * Null under the exact same condition revokedAt is null.
    */
   revokedBy: string | null;
+  /**
+   * 'explicit' (a maintainer+'s own revoke-verdict-acceptance click) or 'superseded' (a fresh accept-verdict for the SAME pull request revoked this row automatically) -- null under the exact same condition revokedAt is null (finding F4, adversarial review: before this field existed, both cases wrote the IDENTICAL revokedAt/revokedBy shape, so a superseded acceptance was indistinguishable, on this row alone, from an explicit revocation the accepting user never performed).
+   */
+  revocationReason: string | null;
 }
 /**
  * One review_false_positive_patterns row's own REST wire shape ('review: learned false-positive patterns', §22.2/§22.4, migrations/000073_review_false_positive_patterns.up.sql) -- returned by the audit-view GET and the retire POST so a caller can confirm the resulting state. Capture itself has no REST shape at all: it happens exclusively via the `false positive: <reason>` PR-thread command (§22.2, internal/adapters/inbound/github's own dispatch-before-router capture handler), never through this API.

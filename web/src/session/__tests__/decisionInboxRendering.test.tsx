@@ -50,6 +50,7 @@ function baseItem(overrides: Partial<DecisionInboxItem> = {}): DecisionInboxItem
     acceptanceId: null,
     acceptanceJustification: null,
     acceptedAt: null,
+    acceptedBy: null,
     isRelease: null,
     manifestFindingsCount: null,
     manifestCoveragePartial: null,
@@ -262,6 +263,43 @@ describe('DecisionInboxRow -- hasChangesRequested, not hasApprovingReview, gates
     const blocked = prItem({ kind: 'ready_to_merge', hasChangesRequested: true, hasApprovingReview: true })
     const blockedHtml = withQueryClient(<DecisionInboxRow item={blocked} canMerge={true} />)
     expect(blockedHtml).toMatch(/<button[^>]*disabled/)
+  })
+})
+
+// finding F5 (adversarial review): the aggregate stays DELIBERATELY
+// acceptance-blind (an accepted PR still classifies needs_review, never
+// ready_to_merge -- decisioninbox.Item.AcceptanceID's own doc comment,
+// server-side), which used to mean this row rendered NO way to act on it
+// beyond "Open review" -- even though the acceptance's own justification
+// was already sitting in the API response. These cases pin that the
+// Merge button and the justification text now BOTH render for exactly
+// that row shape, and NEITHER renders for an ordinary, never-accepted
+// needs_review row.
+describe('DecisionInboxRow -- an accepted-but-refused PR (§21.1b) gets a real surface, not just "Open review"', () => {
+  it('a needs_review row with an active acceptance renders the Merge button', () => {
+    const item = prItem({ kind: 'needs_review', acceptanceId: 'acceptance-1', acceptanceJustification: 'Reviewed offline; risk accepted.' })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).toContain('>Merge<')
+  })
+
+  it("a needs_review row with an active acceptance renders the maintainer's own justification as text", () => {
+    const item = prItem({ kind: 'needs_review', acceptanceId: 'acceptance-1', acceptanceJustification: 'Reviewed offline; risk accepted.' })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).toContain('Reviewed offline; risk accepted.')
+    expect(html).toContain('accepted override')
+  })
+
+  it('a hostile justification renders as text, never markup', () => {
+    const item = prItem({ kind: 'needs_review', acceptanceId: 'acceptance-1', acceptanceJustification: XSS_IMG })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).not.toContain('<img')
+  })
+
+  it('an ordinary needs_review row (never accepted) renders NEITHER the Merge button NOR any acceptance text', () => {
+    const item = prItem({ kind: 'needs_review', acceptanceId: null, acceptanceJustification: null })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).not.toContain('>Merge<')
+    expect(html).not.toContain('accepted override')
   })
 })
 
