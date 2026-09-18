@@ -35,11 +35,23 @@
 -- CreateSessionOnTx) and its REUSE branch's own label-retrigger case
 -- (httpapi.CreateTurnForBot, gated on isLabelRetrigger -- an ORDINARY
 -- REUSE @mention passes false), the manual REST re-trigger button
--- (httpapi.CreateTurnCore via reviewretrigger.go), §24's own automatic
--- push-triggered retrigger (internal/app/sessionactor/reviewretrigger.go),
--- and the release composition-review pass (internal/app/releasereview/
--- compositiondispatch.go). Every OTHER turn-creation call site (Slack,
+-- (httpapi.CreateTurnCore via reviewretrigger.go), and §24's own
+-- automatic push-triggered retrigger (internal/app/sessionactor/
+-- reviewretrigger.go). Every OTHER turn-creation call site (Slack,
 -- Linear, the plain REST CreateTurn endpoint, workflowengine) never sets
 -- review_head_sha either, so this column is simply always false there
 -- too -- consistent, never consulted outside a github-origin session.
+--
+-- Finding B5: the release composition-review pass (internal/app/
+-- releasereview/compositiondispatch.go) sets review_head_sha but
+-- deliberately does NOT set this column -- it is not a genuine review
+-- attempt in this column's own sense (compositiondispatch.go's own doc
+-- comment: this turn never calls httpapi.PostReviewVerdict, has no
+-- Shippable/premise/risk score, and never reaches the eligibility gate
+-- this column exists to protect), so a REAL github-origin turn's own
+-- dispatch/terminal transition must not treat it as one either
+-- (sessionactor/dispatch.go's own IsReviewAttempt gate,
+-- outboxenqueue.go's own identical gate on the terminal side) -- an
+-- earlier version of this comment named it as a call site that sets
+-- this column to true; it never did.
 ALTER TABLE turns ADD COLUMN is_review_attempt BOOLEAN NOT NULL DEFAULT false;

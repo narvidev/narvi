@@ -157,11 +157,16 @@ type listCheckRunsForRefResponse struct {
 // serve only a PREFIX of a ref carrying many check runs. A prefix that
 // happens to omit narvi/review's own entry reads identically to "no
 // existing check run" and this adapter's own caller falls back to
-// CREATING one -- a harmless, bounded consequence (a second check run
-// object on a ref that already carried more than 100 others), not a
-// silent wrong answer the way a missed CI failure signal would be, so
-// this method does not itself refuse on a partial page the way
-// fetchCIConclusionLive's own live CI gate does.
+// CREATING one -- a BOUNDED consequence (only reachable on a ref already
+// carrying more than 100 other check runs), but not a harmless one: the
+// missed entry is the SAME shape of orphan finding A7 reassesses
+// (internal/app/outboxworker's own reviewCheckNotifier.Deliver, its doc
+// comment above the resolveOrCreateCheckRun call, is this claim's own
+// source of truth) -- it sits on the ref's own Checks tab exactly as it
+// was, nothing in this system ever writing to it again. Not a silent
+// WRONG answer the way a missed CI failure signal would be (this method
+// does not itself refuse on a partial page the way fetchCIConclusionLive's
+// own live CI gate does), but not nothing either.
 func (a *Adapter) ListCheckRunsForRef(ctx context.Context, owner, repo, ref, token string) ([]CheckRunSummary, error) {
 	path := fmt.Sprintf("%s/repos/%s/%s/commits/%s/check-runs?per_page=100", a.apiBaseURL, url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(ref))
 	body, err := a.doGet(ctx, path, token)

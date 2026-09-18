@@ -74,16 +74,29 @@ type reviewCheckNotifier struct {
 	// CreateCheckRun response -- the only way to know for certain what
 	// identity a given credential's write is attributed to is to make
 	// that credential perform a write and read back what GitHub says
-	// about it. 0 means "not yet observed" (a fresh process, or one that
-	// has never yet successfully created a check run) -- see
-	// resolveOrCreateCheckRun's own doc comment for how that state
-	// degrades (never adopts, always creates -- safe, never a
-	// false-positive match). Cached for this PROCESS's own lifetime
-	// only (an atomic.Int64, not a Postgres column) -- a known,
-	// documented limitation: a fresh process (a restart, a new pod in a
-	// multi-pod fleet) starts back at "not yet observed" and only
-	// recovers its own recognition ability after its own first
-	// successful create in that process's lifetime.
+	// about it. 0 means "not yet observed" -- see resolveOrCreateCheckRun's
+	// own doc comment for how that state degrades (never adopts, always
+	// creates -- safe, never a false-positive match).
+	//
+	// An atomic.Int64, but NOT the sole record any more (finding B2): a
+	// bare in-process cache with no durable backing IS "a cache with
+	// authority" (§5.1 forbids exactly this) the moment it alone decides
+	// whether a crash-recovery adoption can succeed -- and a fresh
+	// process (a restart, a new pod in a multi-pod fleet) is EXACTLY the
+	// case adoption exists for, yet used to start back at "not yet
+	// observed" every single time, unable to adopt its own in-flight run
+	// until its own first successful create in that process's lifetime.
+	// recordWriterAppID/observedWriterAppID (below) now also read/write
+	// ReviewCheckRunStore's own durable row (migrations/
+	// 000134_review_check_writer_app_id.up.sql) -- this field remains a
+	// genuine, authority-free memoization on top of that (avoiding a DB
+	// round trip on every call once a value is known), never the only
+	// place the fact lives. Residual this does NOT close, stated
+	// precisely rather than left implied: the very FIRST check-run
+	// creation this deployment EVER makes, deployment-wide, still races
+	// unrecovered (nothing has been persisted yet to fall back to) --
+	// every subsequent crash, for any PR, recovers correctly once that
+	// row exists.
 	writerAppID atomic.Int64
 }
 
@@ -101,16 +114,50 @@ var _ ports.Notifier = (*reviewCheckNotifier)(nil)
 // value with 0 (id == 0 means the create response carried no app object
 // at all -- should not happen for a genuine GitHub App installation
 // token, but defended rather than trusted).
-func (n *reviewCheckNotifier) recordWriterAppID(id int64) {
-	if id != 0 {
-		n.writerAppID.Store(id)
+//
+// Finding B2: also persists id durably via ReviewCheckRunStore.
+// SetWriterAppID, so a FUTURE process (a restart, a new pod) can recover
+// it without first re-observing it -- best-effort: a failure to persist
+// is logged, never propagated as this call's own error, since the
+// ORIGINAL CreateCheckRun already succeeded and this process's own
+// in-process cache is already correct regardless of whether the durable
+// write lands.
+func (n *reviewCheckNotifier) recordWriterAppID(ctx context.Context, id int64) {
+	if id == 0 {
+		return
+	}
+	n.writerAppID.Store(id)
+	if err := n.store.SetWriterAppID(ctx, id); err != nil {
+		platform.Logger(ctx).Warn("outboxworker: reviewCheckNotifier: could not durably persist this deployment's own observed writer app id; a future fresh process will not recover it until its own next successful create",
+			"app_id", id, "error", err)
 	}
 }
 
 // observedWriterAppID returns this notifier's own self-observed writer
 // App id, or 0 ("not yet observed" -- see writerAppID's own doc comment).
-func (n *reviewCheckNotifier) observedWriterAppID() int64 {
-	return n.writerAppID.Load()
+//
+// Finding B2: checks the in-process cache FIRST (avoiding a DB round
+// trip once a value is known), and only when THIS process has never
+// observed one itself, falls back to ReviewCheckRunStore.GetWriterAppID
+// -- the durable record ANY process, including an earlier incarnation of
+// this same one before a restart, may have already written. A read
+// failure degrades to 0 (never adopt, always create -- the same safe
+// direction every other "not yet observed" path already degrades to),
+// logged rather than propagated: this is a recovery optimization, never
+// a correctness requirement of Deliver's own claim/publish sequence.
+func (n *reviewCheckNotifier) observedWriterAppID(ctx context.Context) int64 {
+	if id := n.writerAppID.Load(); id != 0 {
+		return id
+	}
+	id, err := n.store.GetWriterAppID(ctx)
+	if err != nil {
+		platform.Logger(ctx).Warn("outboxworker: reviewCheckNotifier: could not read this deployment's own durably-observed writer app id; degrading to never-adopt for this call", "error", err)
+		return 0
+	}
+	if id != 0 {
+		n.writerAppID.Store(id)
+	}
+	return id
 }
 
 // toEmission converts a (possibly placeholder, possibly real)
@@ -416,7 +463,7 @@ func (n *reviewCheckNotifier) resolveOrCreateCheckRun(ctx context.Context, owner
 	// degradation is to never adopt (fall through to CreateCheckRun
 	// below, which itself teaches this notifier its own app id for
 	// every LATER call in this process's lifetime), never to guess.
-	observedAppID := n.observedWriterAppID()
+	observedAppID := n.observedWriterAppID(ctx)
 	if observedAppID != 0 {
 		for _, run := range existing {
 			if run.Name == reviewcheck.CheckName && run.AppID == observedAppID && run.HeadSHA == headSHA && run.Status != string(reviewcheck.StatusCompleted) {
@@ -431,27 +478,40 @@ func (n *reviewCheckNotifier) resolveOrCreateCheckRun(ctx context.Context, owner
 	if err != nil {
 		return 0, fmt.Errorf("create check run: %w", err)
 	}
-	n.recordWriterAppID(appID)
+	n.recordWriterAppID(ctx, appID)
 	return id, nil
 }
 
-// guardAgainstSupersessionDuringCall (finding A3) re-checks, with NO
-// Postgres transaction/lock held (a plain read, mirroring
-// GetByRepoAndPRNumber's own "forward, non-locking read" shape), whether
-// candidate is STILL this row's current emission now that the GitHub
-// call that just published externalID's own output has returned. If it
-// is, this was not a race -- nothing to do. If the row has moved on to a
-// DIFFERENT attempt or phase for the SAME head sha, the call this
-// function follows was stale by the time it landed on GitHub (a
-// concurrently-racing, genuinely newer Deliver call finished ITS OWN
-// GitHub write first) -- this self-heals by immediately re-publishing
-// the row's own CURRENT truth to the SAME external check run, so GitHub
-// converges to what Postgres already knows rather than being left
+// guardAgainstSupersessionDuringCall (finding A3, corrected by finding
+// B1) re-checks, with NO Postgres transaction/lock held (a plain read,
+// mirroring GetByRepoAndPRNumber's own "forward, non-locking read"
+// shape), whether candidate is STILL this row's current emission now
+// that the GitHub call that just published externalID's own output has
+// returned. If it is, this was not a race -- nothing to do. If the row
+// has moved on to a DIFFERENT attempt or phase for the SAME head sha
+// AND row.ExternalID still names externalID -- the identity THIS call
+// itself just published to -- the call this function follows was stale
+// by the time it landed on GitHub (a concurrently-racing, genuinely
+// newer Deliver call finished ITS OWN GitHub write first, to the SAME
+// external check run) -- this self-heals by immediately re-publishing
+// the row's own CURRENT truth to that SAME external check run, so
+// GitHub converges to what Postgres already knows rather than being left
 // showing this call's now-superseded output indefinitely. If the row has
 // moved on to a DIFFERENT head sha, nothing here can correct that (a
 // different head sha means a different external identity entirely,
 // which the emission that changed it owns and publishes for itself) --
-// logged, left alone.
+// logged, left alone. And if row.ExternalID no longer names externalID
+// at all (finding B1) -- newIdentityNeeded (Deliver, above) already
+// cleared it and a newer attempt opened a FRESH check run for this SAME
+// head sha, entirely within this call's own network-call window -- the
+// self-heal above is not merely stale, it is aimed at the WRONG run: the
+// row has genuinely moved on to a different external identity, exactly
+// like the different-head-sha case, and PATCHing externalID would
+// reopen an already-concluded check run this row no longer claims
+// (A1's own forbidden shape, reached through a path resolveOrCreateCheckRun's
+// status predicate does not cover, since it never runs for an
+// in-place update). Logged, left alone, same as the different-head-sha
+// case.
 //
 // Best-effort throughout: a failure reading the row, or a failure
 // PATCHing the correction, is logged and swallowed, never propagated as
@@ -481,6 +541,37 @@ func (n *reviewCheckNotifier) guardAgainstSupersessionDuringCall(ctx context.Con
 	if current.HeadSHA != candidate.HeadSHA {
 		logger.Warn("outboxworker: reviewCheckNotifier: row moved to a different head sha during this call's own GitHub round trip; a fresh emission for the new head owns its own identity, nothing to correct here",
 			"repo", repoFullName, "pr_number", prNumber, "candidate_head_sha", candidate.HeadSHA, "current_head_sha", current.HeadSHA)
+		return
+	}
+	// finding B1: same head sha is NOT sufficient to conclude externalID
+	// (the identity THIS call just published to) is still the row's own
+	// current identity. newIdentityNeeded (Deliver, above) clears
+	// external_id and opens a FRESH check run whenever the row was
+	// already terminal-shaped and a genuinely newer attempt claims it --
+	// reachable from inside this exact race window, since that claim
+	// commits (and may even create its own new check run) entirely
+	// between this call's own GitHub write returning and this read. When
+	// that happens, row.ExternalID now names the NEW run the newer
+	// attempt opened -- a DIFFERENT external id from externalID, even
+	// though head sha is unchanged -- and self-correcting onto externalID
+	// would PATCH the OLD, already-concluded run this row no longer
+	// claims, reopening it (completed/success back to in_progress, with
+	// conclusion dropped entirely -- checkRunRequest's own omitempty
+	// behavior) while the row's own current truth lives on a run this
+	// call never touches. Reproduced against real Postgres: without this
+	// check, exactly that reopening happens. Skip the self-heal (best
+	// effort, same as every other outcome this function reaches) rather
+	// than write onto an identity this row has already moved off of --
+	// the newer attempt's own Deliver call already published, or will
+	// publish, its own correct output to its own run.
+	if row.ExternalID == nil || *row.ExternalID != externalID {
+		var rowExternalID any = "none"
+		if row.ExternalID != nil {
+			rowExternalID = *row.ExternalID
+		}
+		logger.Warn("outboxworker: reviewCheckNotifier: row's own external id no longer names the run this call published to; a newer emission already opened a fresh identity for this head sha -- nothing to self-heal on the run this call wrote to",
+			"repo", repoFullName, "pr_number", prNumber, "external_id", externalID, "row_external_id", rowExternalID,
+			"candidate_attempt", candidate.AttemptID, "current_attempt", current.AttemptID)
 		return
 	}
 	logger.Warn("outboxworker: reviewCheckNotifier: superseded during this call's own GitHub round trip; self-correcting the check run to the row's current truth",

@@ -49,9 +49,17 @@ const (
 // (emission.go): Queued(0) < Running(1) < every terminal-shaped phase
 // (2). Stale/TerminalAssessed/TerminalNotAssessed share rank 2
 // deliberately -- they are mutually-exclusive ALTERNATE outcomes for the
-// SAME attempt, not a further ordering among themselves (a later
-// emission for the same attempt reporting a DIFFERENT one of the three is
-// a correction, always applied, never a regression to guard against).
+// SAME attempt, not a further ordering among themselves. Sharing a rank
+// is NOT the same claim as "always applied" -- rank only says neither is
+// a REGRESSION by rank; Supersedes' own
+// supersedesSameAttemptTerminalAssessed additionally refuses the one
+// same-attempt transition that shares this rank but is never a
+// legitimate correction (PhaseTerminalAssessed -> PhaseTerminalNotAssessed,
+// "no verdict was posted" arriving after one demonstrably was) while
+// still allowing PhaseTerminalAssessed -> PhaseStale (the base moving out
+// from under an already-posted verdict, same attempt) -- see that
+// function's own doc comment for the full rule this rank alone does not
+// express.
 // An unrecognized Phase ranks -1, which Valid reports as false --
 // Supersedes' own caller (internal/app/outboxworker's review-check
 // notifier) must never publish an unrecognized phase to GitHub, and this

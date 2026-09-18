@@ -86,10 +86,12 @@ func TestSupersedes_SameAttemptPhaseRegressionRefused(t *testing.T) {
 // -- never refused merely for matching rank. (Before finding A8's own
 // fix, this same test used TerminalAssessed -> TerminalNotAssessed as
 // its own example of an allowed "correction" -- that was the defect
-// itself: see TestSupersedes_SameAttemptTerminalAssessedNeverDisplacedByADifferentPhase
+// itself: see TestSupersedes_SameAttemptTerminalAssessedNeverDisplacedByTerminalNotAssessed
 // below for why a REAL, already-posted success is not a "correction"
 // candidate in the same sense Stale/TerminalNotAssessed are for each
-// other.)
+// other -- though, per finding B3, PhaseStale itself IS still allowed to
+// displace a real, already-posted success: see
+// TestSupersedes_SameAttemptStaleDisplacesTerminalAssessed.)
 func TestSupersedes_SameAttemptSameRankAllowsIdempotentOverwrite(t *testing.T) {
 	current := Emission{AttemptID: "attempt-a", AttemptCreatedAt: t1, Phase: PhaseTerminalNotAssessed}
 	candidate := Emission{AttemptID: "attempt-a", AttemptCreatedAt: t1, Phase: PhaseStale}
@@ -112,24 +114,39 @@ func TestSupersedes_SameAttemptTerminalAssessedRedeliveryAllowed(t *testing.T) {
 	}
 }
 
-// TestSupersedes_SameAttemptTerminalAssessedNeverDisplacedByADifferentPhase
-// is finding A8's own fix: once PhaseTerminalAssessed is current for an
-// attempt (a real review.Verdict was posted), no same-attempt candidate
-// other than ANOTHER PhaseTerminalAssessed may ever displace it -- not
-// Stale, not TerminalNotAssessed, even though both share
-// PhaseTerminalAssessed's own rank and would otherwise pass the
-// same-rank-is-allowed rule. Before this fix, a same-attempt
-// TerminalNotAssessed (or Stale) emission -- reachable via a redelivery
-// race, never through the normal enqueue paths this codebase ships
-// today, but not excluded by Supersedes itself -- could silently replace
-// a real, already-posted success with "Review not completed".
-func TestSupersedes_SameAttemptTerminalAssessedNeverDisplacedByADifferentPhase(t *testing.T) {
+// TestSupersedes_SameAttemptTerminalAssessedNeverDisplacedByTerminalNotAssessed
+// is finding A8's own fix, narrowed by finding B3: once
+// PhaseTerminalAssessed is current for an attempt (a real review.Verdict
+// was posted), a same-attempt PhaseTerminalNotAssessed candidate may
+// never displace it, even though it shares PhaseTerminalAssessed's own
+// rank and would otherwise pass the same-rank-is-allowed rule. Before
+// this fix, a same-attempt TerminalNotAssessed emission -- reachable via
+// a redelivery race, never through the normal enqueue paths this
+// codebase ships today, but not excluded by Supersedes itself -- could
+// silently replace a real, already-posted success with "Review not
+// completed".
+func TestSupersedes_SameAttemptTerminalAssessedNeverDisplacedByTerminalNotAssessed(t *testing.T) {
 	current := Emission{AttemptID: "attempt-a", AttemptCreatedAt: t1, Phase: PhaseTerminalAssessed}
-	for _, p := range []Phase{PhaseTerminalNotAssessed, PhaseStale} {
-		candidate := Emission{AttemptID: "attempt-a", AttemptCreatedAt: t1, Phase: p}
-		if Supersedes(current, candidate) {
-			t.Errorf("a same-attempt %s candidate must never displace an already-posted PhaseTerminalAssessed/success", p)
-		}
+	candidate := Emission{AttemptID: "attempt-a", AttemptCreatedAt: t1, Phase: PhaseTerminalNotAssessed}
+	if Supersedes(current, candidate) {
+		t.Fatal("a same-attempt TerminalNotAssessed candidate must never displace an already-posted PhaseTerminalAssessed/success")
+	}
+}
+
+// TestSupersedes_SameAttemptStaleDisplacesTerminalAssessed is finding
+// B3's own fix: PhaseStale is the ONE same-attempt candidate, besides
+// another PhaseTerminalAssessed itself, that MUST be allowed to displace
+// an already-posted PhaseTerminalAssessed -- marking an already-posted
+// verdict stale because the base moved out from under it, same attempt,
+// no newer attempt involved (PhaseStale's own doc comment, phase.go).
+// Before this fix, supersedesSameAttemptTerminalAssessed refused every
+// same-attempt candidate other than PhaseTerminalAssessed itself, which
+// made PhaseStale unreachable in the one case it exists to mark.
+func TestSupersedes_SameAttemptStaleDisplacesTerminalAssessed(t *testing.T) {
+	current := Emission{AttemptID: "attempt-a", AttemptCreatedAt: t1, Phase: PhaseTerminalAssessed}
+	candidate := Emission{AttemptID: "attempt-a", AttemptCreatedAt: t1, Phase: PhaseStale}
+	if !Supersedes(current, candidate) {
+		t.Fatal("a same-attempt Stale candidate must be allowed to displace an already-posted PhaseTerminalAssessed/success -- otherwise PhaseStale can never mark this exact case")
 	}
 }
 

@@ -213,11 +213,22 @@ type SessionCoalescer struct {
 	RepoSettings *postgres.RepoSettingsStore
 
 	// Outbox is this repository's own addition for the review's
-	// GitHub-native result surface (§8.2/§21.1/§21.1b): the WINNER path below enqueues
-	// exactly one ports.NotificationKindGitHubReviewCheck row, in the
-	// SAME transaction as the claim row's own SetSessionID write --
-	// "a check is published in queued as soon as a pull request enters
-	// scope, before any review starts" (decision 2). The REUSE path
+	// GitHub-native result surface (§8.2/§21.1/§21.1b): the WINNER path
+	// below enqueues exactly one ports.NotificationKindGitHubReviewCheck
+	// row, in the SAME transaction as the claim row's own SetSessionID
+	// write. Decision 2 (§21.1b) asks for a check published in
+	// queued "as soon as a pull request enters scope, before any review
+	// starts" -- what this WINNER path actually publishes queued for is
+	// narrower than that: CreateOrJoin (below) is only ever reached from
+	// a resolved @mention or a label re-trigger (handler.go's own
+	// parseMention gate before it), never from a bare pull_request
+	// "opened" webhook (this package has no such lane -- see
+	// pullrequestevent.go's own top doc comment), so this fires when a
+	// review is TRIGGERED, not when the PR itself enters scope. A PR
+	// nobody has ever mentioned the bot on still carries no check at all
+	// -- decision 2's own full gap, named rather than silently assumed
+	// closed; see ports.NotificationKindGitHubReviewCheck's own doc
+	// comment (notifier.go) for the identical correction. The REUSE path
 	// never enqueues one: an ordinary second @mention or a label
 	// re-trigger reuses an ALREADY-tracked PR, which already has its own
 	// check run from whichever WINNER call first claimed it.
@@ -794,13 +805,17 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 	}
 
 	// The review's own GitHub-native result surface (§8.2/§21.1/§21.1b):
-	// decision 2, "a check is published in queued as
-	// soon as a pull request enters scope, before any review starts" --
-	// this WINNER branch is precisely that moment for a GitHub-origin
-	// review session (this function's own doc comment: every session it
-	// ever creates IS one). Enqueued in the SAME transaction as the claim
-	// row's own SetSessionID write below (§5.1: "written in the same tx
-	// as the state change"). Skipped when reviewHeadSHA is unknown (the
+	// decision 2 asks for a check published in queued as soon as a pull
+	// request enters scope, before any review starts -- what this WINNER
+	// branch actually publishes queued for is narrower (Deps.Outbox's own
+	// doc comment, above, has the full correction): this function is only
+	// ever reached from a resolved @mention or a label re-trigger, so
+	// this fires when a review is TRIGGERED, a pull request that nobody
+	// has mentioned the bot on yet still carries no check at all -- named
+	// as a deferred gap, not silently assumed closed. Enqueued in the
+	// SAME transaction as the claim row's own SetSessionID write below
+	// (§5.1: "written in the same tx as the state change"). Skipped when
+	// reviewHeadSHA is unknown (the
 	// context-fetch that would have resolved it failed) -- mirrors
 	// httpapi.PostReviewVerdict's own identical "no head sha, no
 	// row" degradation: a queued check with no commit to anchor it to

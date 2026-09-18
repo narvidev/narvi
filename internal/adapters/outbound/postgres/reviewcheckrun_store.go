@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -128,4 +129,27 @@ func (s *ReviewCheckRunStore) GetByRepoAndPRNumber(ctx context.Context, repoFull
 		RepoFullName: repoFullName,
 		PrNumber:     prNumber,
 	})
+}
+
+// GetWriterAppID returns this deployment's own durably-observed writer
+// App id (finding B2 -- migrations/000134_review_check_writer_app_id.up.sql's
+// own doc comment), or (0, nil) when no row has ever been written --
+// "never observed", the SAME degradation observedWriterAppID's own
+// in-process cache already returns for a fresh process, now also true
+// when NOTHING has ever observed one, not merely this one process.
+func (s *ReviewCheckRunStore) GetWriterAppID(ctx context.Context) (int64, error) {
+	id, err := s.q.GetReviewCheckWriterAppID(ctx)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil
+	}
+	return id, err
+}
+
+// SetWriterAppID durably records appID as this deployment's own observed
+// writer App id -- an upsert, called immediately after every successful
+// CreateCheckRun response (mirroring recordWriterAppID's own in-process
+// write), so a FUTURE process -- a restart, a new pod -- can recover this
+// fact without first creating an orphan of its own.
+func (s *ReviewCheckRunStore) SetWriterAppID(ctx context.Context, appID int64) error {
+	return s.q.UpsertReviewCheckWriterAppID(ctx, appID)
 }

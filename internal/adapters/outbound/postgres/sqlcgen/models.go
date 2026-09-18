@@ -2000,6 +2000,12 @@ type ReviewCheckRun struct {
 	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
 }
 
+type ReviewCheckWriterAppID struct {
+	ID        int16              `json:"id"`
+	AppID     int64              `json:"app_id"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
 type ReviewDigestSectionFeedback struct {
 	ID           pgtype.UUID        `json:"id"`
 	RepoFullName string             `json:"repo_full_name"`

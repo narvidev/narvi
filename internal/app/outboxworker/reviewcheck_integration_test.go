@@ -99,6 +99,19 @@ type fakeCheckRunGitHub struct {
 	// committed a newer row to Postgres" at the exact moment this call's
 	// own network round trip is in flight.
 	onPatch func(id int64)
+	// onCreate, when set, is invoked (with the fake's own lock NOT held,
+	// before this fake assigns an id or responds) on every POST -- finding
+	// B1's own reproduction: it lets a test run an ENTIRELY SEPARATE,
+	// genuinely newer Deliver call to completion (claim, clear, create its
+	// OWN check run, record its OWN external id) nested inside the exact
+	// window a slower, older call's own CreateCheckRun is still in flight
+	// -- no goroutines or real concurrency needed, since Postgres's own
+	// claim-row transaction for the older call already committed and
+	// released its lock BEFORE this HTTP call was ever made (Deliver's own
+	// "claim, then release, then call GitHub" sequencing), so a nested,
+	// synchronous call from inside this hook reaches Postgres exactly as
+	// a genuinely concurrent second process would.
+	onCreate func()
 }
 
 func newFakeCheckRunGitHub() *fakeCheckRunGitHub {
@@ -127,6 +140,9 @@ func (f *fakeCheckRunGitHub) server() *httptest.Server {
 
 		switch {
 		case r.Method == http.MethodPost:
+			if f.onCreate != nil {
+				f.onCreate()
+			}
 			f.mu.Lock()
 			f.nextID++
 			id := f.nextID
@@ -540,13 +556,23 @@ func TestReviewCheckNotifier_TerminalRestart_NeverReopensConcludedRun(t *testing
 }
 
 // TestReviewCheckNotifier_Recovery_AdoptsOwnInFlightRun is finding A5's
-// own missing coverage for the adoption/recovery branch's HAPPY path:
-// a crash between a successful CreateCheckRun and this system's own
-// local record of external_id (SetReviewCheckRunExternalID's own doc
-// comment) must recover the REAL check run rather than creating a
-// duplicate, when it genuinely belongs to this same process (this
-// notifier has already self-learned its own writer App id from an
-// earlier, real create -- writerAppID's own doc comment, reviewcheck.go).
+// own missing coverage for the adoption/recovery branch's HAPPY path,
+// through a COLD second notifier (finding B2's own fix, and the gap the
+// prior version of this test could not see): a crash between a
+// successful CreateCheckRun and this system's own local record of
+// external_id (SetReviewCheckRunExternalID's own doc comment) must
+// recover the REAL check run rather than creating a duplicate -- and the
+// realistic shape of that crash is a PROCESS RESTART, which is exactly
+// what a second, brand-new *reviewCheckNotifier -- sharing nothing but
+// the same pool/store/adapter/bot token, never the first notifier's own
+// in-process writerAppID cache -- reproduces. Before finding B2's fix,
+// this test used the SAME warm notifier instance for both deliveries:
+// the second call's own observedWriterAppID() read straight from the
+// FIRST call's already-learned in-process cache, so it could never
+// distinguish "this process learned its own app id" from "some process,
+// at some point, did" -- the exact distinction finding B2 is about. A
+// genuinely cold notifier can only recover via
+// ReviewCheckRunStore.GetWriterAppID's own durable row.
 func TestReviewCheckNotifier_Recovery_AdoptsOwnInFlightRun(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
@@ -557,7 +583,7 @@ func TestReviewCheckNotifier_Recovery_AdoptsOwnInFlightRun(t *testing.T) {
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	notifier := outboxworker.NewReviewCheckNotifier(pool, store, adapter, "tok")
+	warmNotifier := outboxworker.NewReviewCheckNotifier(pool, store, adapter, "tok")
 
 	owner, repoName := "acme", fmt.Sprintf("recovery-repo-%d", time.Now().UnixNano())
 	const prNumber = 55
@@ -574,9 +600,10 @@ func TestReviewCheckNotifier_Recovery_AdoptsOwnInFlightRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal running payload: %v", err)
 	}
-	// First delivery: a genuine create, and how this notifier learns its
-	// own writer App id (writerAppID's own doc comment).
-	if err := notifier.Deliver(ctx, ports.Notification{Kind: ports.NotificationKindGitHubReviewCheck, Payload: runningPayload}); err != nil {
+	// First delivery, on the WARM notifier: a genuine create, and how
+	// this notifier learns its own writer App id (writerAppID's own doc
+	// comment) -- ALSO how it durably persists that id (finding B2).
+	if err := warmNotifier.Deliver(ctx, ports.Notification{Kind: ports.NotificationKindGitHubReviewCheck, Payload: runningPayload}); err != nil {
 		t.Fatalf("Deliver(running) error = %v", err)
 	}
 	creates1, _ := fake.counts()
@@ -610,16 +637,20 @@ func TestReviewCheckNotifier_Recovery_AdoptsOwnInFlightRun(t *testing.T) {
 	}
 
 	// A second delivery for the SAME attempt/head sha, same phase
-	// (mirrors an outbox redelivery after the "lost" write above) --
-	// resolveOrCreateCheckRun must ADOPT the existing, still-in-progress
-	// run rather than create a second one.
-	if err := notifier.Deliver(ctx, ports.Notification{Kind: ports.NotificationKindGitHubReviewCheck, Payload: runningPayload}); err != nil {
-		t.Fatalf("Deliver(running, redelivery) error = %v", err)
+	// (mirrors an outbox redelivery after a PROCESS RESTART, following
+	// the "lost" write above) -- on a BRAND-NEW notifier that has never
+	// itself observed a writer app id: resolveOrCreateCheckRun must
+	// still ADOPT the existing, still-in-progress run rather than create
+	// a second one, recovering the durably-persisted app id finding B2
+	// gives it, never guessing and never falling back to "create".
+	coldNotifier := outboxworker.NewReviewCheckNotifier(pool, store, adapter, "tok")
+	if err := coldNotifier.Deliver(ctx, ports.Notification{Kind: ports.NotificationKindGitHubReviewCheck, Payload: runningPayload}); err != nil {
+		t.Fatalf("Deliver(running, redelivery on a COLD notifier) error = %v", err)
 	}
 
 	creates2, updates2 := fake.counts()
 	if creates2 != 1 {
-		t.Fatalf("creates after recovery = %d, want STILL 1 -- the existing in-flight run must be adopted, never duplicated", creates2)
+		t.Fatalf("creates after recovery = %d, want STILL 1 -- the existing in-flight run must be adopted, never duplicated, even by a notifier that never itself created it", creates2)
 	}
 	if updates2 < 1 {
 		t.Fatalf("updates after recovery = %d, want at least 1 (the adoption PATCH)", updates2)
@@ -835,5 +866,154 @@ func TestReviewCheckNotifier_SelfHealsWhenSupersededDuringGitHubCall(t *testing.
 	}
 	if rowAfter.Phase != "terminal_assessed" || !rowAfter.AttemptID.Valid || rowAfter.AttemptID.String() != attemptB {
 		t.Errorf("row after = phase %q attempt %v, want terminal_assessed/%s", rowAfter.Phase, rowAfter.AttemptID, attemptB)
+	}
+}
+
+// TestReviewCheckNotifier_SelfHealNeverReopensARunANewerIdentityAbandoned
+// is finding B1's own reproduction: guardAgainstSupersessionDuringCall's
+// self-heal (finding A3, above) used to PATCH externalID -- the run THIS
+// call published to -- onto the row's current truth whenever attempt or
+// phase had moved on for the SAME head sha, without ever checking that
+// row.ExternalID still NAMED externalID. When the row moved on because
+// newIdentityNeeded (Deliver) opened a FRESH check run for a genuinely
+// newer attempt at the SAME head sha -- exactly the shape finding A1's
+// own fix (resolveOrCreateCheckRun) already refuses to ADOPT -- the old
+// external id belongs to an already-concluded run this row no longer
+// claims, and the self-heal reopened it anyway: completed/success back
+// to in_progress, conclusion dropped entirely (checkRunRequest's own
+// omitempty behavior clearing it when the correction carries none).
+//
+// Reproduced deterministically, no goroutines: attempt A's own terminal,
+// FIRST-EVER create for this PR is slow (its own POST is still being
+// handled by the fake); attempt B -- a genuinely NEWER attempt, same head
+// sha -- races entirely INSIDE that window via the fake's own onCreate
+// hook, nested and synchronous (Deliver's own claim-then-release-then-
+// call sequencing means Postgres's row lock for attempt A's claim is
+// already released by the time its own HTTP POST is in flight, so a
+// nested call reaches Postgres exactly as a genuinely concurrent second
+// process would): attempt B claims the row (already terminal-shaped,
+// genuinely newer attempt -- newIdentityNeeded fires), creates its OWN
+// check run, and records its OWN external id -- all before attempt A's
+// own POST response is even returned to it.
+func TestReviewCheckNotifier_SelfHealNeverReopensARunANewerIdentityAbandoned(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	store := narvipg.NewReviewCheckRunStore(pool)
+
+	fake := newFakeCheckRunGitHub()
+	server := fake.server()
+	defer server.Close()
+
+	adapter := githubapi.New(server.Client(), server.URL)
+	notifier := outboxworker.NewReviewCheckNotifier(pool, store, adapter, "tok")
+
+	owner, repoName := "acme", fmt.Sprintf("b1-repo-%d", time.Now().UnixNano())
+	const prNumber = 21
+	const headSHA = "cafef00d"
+
+	attemptA := newTestAttempt(ctx, t, pool)
+	attemptB := newTestAttempt(ctx, t, pool)
+	older := time.Date(2026, 9, 18, 9, 0, 0, 0, time.UTC)
+	newer := older.Add(time.Hour)
+
+	// A plain bool guard, NOT sync.Once: attempt B's own nested Deliver
+	// call (below) reaches this SAME onCreate hook again for its OWN
+	// CreateCheckRun POST -- sync.Once.Do is not reentrant, and calling it
+	// again from inside its own function on the same Once deadlocks. A
+	// CompareAndSwap makes the re-entrant call a harmless no-op instead.
+	var fired atomic.Bool
+	var runBID int64
+	fake.onCreate = func() {
+		if !fired.CompareAndSwap(false, true) {
+			return
+		}
+		runningPayload, marshalErr := json.Marshal(ports.ReviewCheckPayload{
+			Owner: owner, Repo: repoName, PRNumber: prNumber, HeadSHA: headSHA,
+			AttemptID: attemptB, AttemptCreatedAt: newer,
+			Phase: "running",
+		})
+		if marshalErr != nil {
+			t.Errorf("marshal attempt B payload: %v", marshalErr)
+			return
+		}
+		if delivErr := notifier.Deliver(ctx, ports.Notification{Kind: ports.NotificationKindGitHubReviewCheck, Payload: runningPayload}); delivErr != nil {
+			t.Errorf("Deliver(B running, nested inside A's own create) error = %v", delivErr)
+			return
+		}
+		row, getErr := store.GetByRepoAndPRNumber(ctx, owner+"/"+repoName, prNumber)
+		if getErr != nil {
+			t.Errorf("get row after nested B delivery: %v", getErr)
+			return
+		}
+		if row.ExternalID == nil {
+			t.Error("row.ExternalID is nil after nested B delivery, want attempt B's own real external id")
+			return
+		}
+		runBID = *row.ExternalID
+	}
+
+	// attempt A: the FIRST-EVER emission for this PR, straight to
+	// terminal_assessed -- its own CreateCheckRun call is where attempt
+	// B's own full Deliver race (above) is nested.
+	terminalPayload, err := json.Marshal(ports.ReviewCheckPayload{
+		Owner: owner, Repo: repoName, PRNumber: prNumber, HeadSHA: headSHA,
+		AttemptID: attemptA, AttemptCreatedAt: older,
+		Phase: "terminal_assessed",
+	})
+	if err != nil {
+		t.Fatalf("marshal attempt A payload: %v", err)
+	}
+	if err := notifier.Deliver(ctx, ports.Notification{Kind: ports.NotificationKindGitHubReviewCheck, Payload: terminalPayload}); err != nil {
+		t.Fatalf("Deliver(A terminal_assessed) error = %v", err)
+	}
+
+	creates, _ := fake.counts()
+	if creates != 2 {
+		t.Fatalf("creates = %d, want 2 (attempt A's own run, and attempt B's own run created inside the race)", creates)
+	}
+	if runBID == 0 {
+		t.Fatal("runBID was never recorded -- the nested race inside onCreate did not run")
+	}
+
+	// The row (Postgres's own truth) must reflect attempt B -- the
+	// genuinely newer attempt -- never attempt A, which lost the claim
+	// race entirely (Supersedes: B's own AttemptCreatedAt is newer).
+	rowAfter, err := store.GetByRepoAndPRNumber(ctx, owner+"/"+repoName, prNumber)
+	if err != nil {
+		t.Fatalf("get row after: %v", err)
+	}
+	if rowAfter.Phase != "running" || !rowAfter.AttemptID.Valid || rowAfter.AttemptID.String() != attemptB {
+		t.Fatalf("row after = phase %q attempt %v, want running/%s (attempt B)", rowAfter.Phase, rowAfter.AttemptID, attemptB)
+	}
+	if rowAfter.ExternalID == nil || *rowAfter.ExternalID != runBID {
+		t.Fatalf("row.ExternalID after = %v, want %d (attempt B's own run)", rowAfter.ExternalID, runBID)
+	}
+
+	// attempt A's own run -- abandoned when B's genuinely newer attempt
+	// claimed the row -- must be left exactly as attempt A's own create
+	// call originally published it: completed/success. The self-heal
+	// (guardAgainstSupersessionDuringCall, triggered by attempt A's own
+	// create returning into a row that has since moved to B) must NEVER
+	// reopen it -- that is finding B1's own defect, fixed.
+	//
+	// Exactly two ids were ever assigned (creates == 2, asserted above),
+	// starting from 1 -- attempt A's own is simply "the other one" of
+	// {1, 2}, whichever B's own row didn't claim.
+	var runAID int64
+	for id := int64(1); id <= int64(creates); id++ {
+		if id != runBID {
+			runAID = id
+			break
+		}
+	}
+	if runAID == 0 {
+		t.Fatal("could not determine attempt A's own run id")
+	}
+	stateA := fake.stateFor(runAID)
+	if stateA == nil {
+		t.Fatalf("attempt A's own run (id %d) not found in the fake's own state", runAID)
+	}
+	if stateA["status"] != "completed" || stateA["conclusion"] != "success" {
+		t.Fatalf("attempt A's own run (id %d) = %+v, want UNCHANGED completed/success -- the self-heal must never reopen a run a newer identity has already abandoned this row for", runAID, stateA)
 	}
 }

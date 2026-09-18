@@ -181,13 +181,17 @@ type SetReviewCheckRunExternalIDParams struct {
 // runs with no Postgres transaction held open across it -- migrations/
 // 000132's own doc comment). A guard miss (0 rows, pgx.ErrNoRows) means
 // exactly that race happened: this caller's own GitHub check run may now
-// be an orphan nothing else in this system ever points to again (an
-// accepted, bounded residual -- mirrors githubapi.VerdictNotifier's own
-// documented "CreateReview is not itself idempotent... a known, accepted
-// limitation shared with every other Notifier in this codebase" residual)
-// -- the caller logs it and returns nil (this delivery attempt is done;
-// whichever newer candidate won the row already has, or will soon get,
-// its OWN correct external_id recorded by its own Deliver call).
+// be an orphan nothing else in this system ever points to again --
+// reassessed, NOT harmless (finding A7 -- internal/app/outboxworker's
+// own reviewCheckNotifier.Deliver, its doc comment immediately above the
+// resolveOrCreateCheckRun call, is this claim's own source of truth: the
+// orphan sits on the pull request's own Checks tab PERMANENTLY queued or
+// in_progress, a second, real, human-visible entry beside the one this
+// system keeps correctly updating, with no reconciliation sweep built
+// yet to clean it up) -- the caller logs it and returns nil (this
+// delivery attempt is done; whichever newer candidate won the row
+// already has, or will soon get, its OWN correct external_id recorded by
+// its own Deliver call).
 func (q *Queries) SetReviewCheckRunExternalID(ctx context.Context, arg SetReviewCheckRunExternalIDParams) (ReviewCheckRun, error) {
 	row := q.db.QueryRow(ctx, setReviewCheckRunExternalID,
 		arg.RepoFullName,

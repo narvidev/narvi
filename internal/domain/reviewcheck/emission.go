@@ -102,12 +102,17 @@ type Emission struct {
 //     ORDINARILY allowed -- idempotent, never refused. finding A8's own
 //     fix narrows this ONE further: when current is ALREADY
 //     PhaseTerminalAssessed (a real review.Verdict was posted for this
-//     exact attempt), a same-attempt candidate may only be ANOTHER
-//     PhaseTerminalAssessed (the idempotent-redelivery/corrected-text
-//     case above) -- never a same-rank Stale/TerminalNotAssessed
-//     "correction", which is never a legitimate same-attempt transition
-//     out of a real, already-posted success (supersedesSameAttemptTerminalAssessed,
-//     below).
+//     exact attempt), a same-attempt candidate may never be
+//     PhaseTerminalNotAssessed -- that would mean "no verdict was posted
+//     for this attempt" arriving after this package already recorded
+//     that one was, which is never a legitimate same-attempt transition
+//     out of a real, already-posted success. PhaseStale is deliberately
+//     NOT excluded here: it is the one same-attempt transition
+//     PhaseTerminalAssessed legitimately makes on its own -- the base
+//     moving out from under an already-posted verdict, with no newer
+//     attempt involved (PhaseStale's own doc comment, phase.go) -- and
+//     refusing it would make PhaseStale unreachable in exactly the case
+//     it exists to mark (supersedesSameAttemptTerminalAssessed, below).
 //
 // An invalid candidate.Phase (Valid() == false) is refused unconditionally,
 // regardless of attempt recency -- this package's own caller must never
@@ -127,21 +132,26 @@ func Supersedes(current, candidate Emission) bool {
 	return candidate.Phase.rank() >= current.Phase.rank()
 }
 
-// supersedesSameAttemptTerminalAssessed (finding A8) reports whether
-// current/candidate fall into the ONE same-rank, same-attempt shape
-// Supersedes above refuses rather than allows: rank 2 is shared by three
-// MUTUALLY EXCLUSIVE alternate outcomes (Stale/TerminalAssessed/
-// TerminalNotAssessed, Phase.rank's own doc comment), and Supersedes'
-// general same-attempt rule otherwise allows any one of them to replace
-// any other for the identical attempt -- a legitimate "correction" for
-// the Stale/TerminalNotAssessed pair (redisplaying with corrected text,
-// or a re-evaluation flipping stale status), but never safe for
-// PhaseTerminalAssessed: that phase means "a real review.Verdict was
-// posted for this attempt", a fact that does not become UN-true. The
-// ONLY same-attempt candidate ever allowed to replace an already-
-// terminal-assessed current is another PhaseTerminalAssessed itself (an
-// idempotent redelivery, or republished display text) -- never a
-// same-attempt Stale/TerminalNotAssessed masquerading as a "correction".
+// supersedesSameAttemptTerminalAssessed (finding A8, narrowed by finding
+// B3) reports whether current/candidate fall into the ONE same-rank,
+// same-attempt shape Supersedes above refuses rather than allows: a
+// same-attempt PhaseTerminalNotAssessed arriving after PhaseTerminalAssessed
+// is already current. PhaseTerminalAssessed means "a real review.Verdict
+// was posted for this attempt", a fact that does not become UN-true, so
+// a same-attempt candidate asserting "no verdict was ever posted" is
+// never a legitimate correction -- refused unconditionally.
+//
+// PhaseStale is deliberately NOT refused here (finding B3's own fix):
+// before it, this function refused EVERY same-attempt candidate other
+// than another PhaseTerminalAssessed, which made PhaseStale itself
+// unreachable in the one case its own doc comment (phase.go) names --
+// "an EXISTING, previously-terminal check run... its recorded
+// attempt/context has been superseded... the base moved out from under
+// it" for the SAME attempt, no newer attempt involved. That is a
+// legitimate same-attempt transition OUT of a real, already-posted
+// success, unlike PhaseTerminalNotAssessed above -- Stale does not claim
+// the verdict never happened, only that it no longer speaks for the
+// PR's current base.
 func supersedesSameAttemptTerminalAssessed(current, candidate Emission) bool {
-	return current.Phase == PhaseTerminalAssessed && candidate.Phase != PhaseTerminalAssessed
+	return current.Phase == PhaseTerminalAssessed && candidate.Phase == PhaseTerminalNotAssessed
 }
