@@ -228,6 +228,26 @@ func (a *Actor) enqueueOutboxNotification(ctx context.Context, tx pgx.Tx, sessio
 		// PRIOR attempt's own verdict must never suppress THIS attempt's
 		// own not-assessed emission (the identical per-attempt scoping
 		// §21.1b requires of the publisher itself).
+		//
+		// processing.IsReviewAttempt (finding A4, migrations/
+		// 000133_turns_is_review_attempt.up.sql) gates this UNCONDITIONALLY
+		// of trig -- "a review that did not complete" only means something
+		// for a turn that was actually attempting a review in the first
+		// place. Before this gate, an ORDINARY follow-up @mention on an
+		// already-reviewed PR ("what does finding 3 mean?") reached this
+		// exact branch, never called the verdict-posting tool (it was
+		// never asked to), and so unconditionally published
+		// PhaseTerminalNotAssessed for its own (newer) attempt --
+		// §21.1b's "a newer attempt always wins" rule then let that
+		// emission overwrite the real review turn's already-published
+		// PhaseTerminalAssessed/success, flipping a successfully reviewed
+		// PR's check back to "Review not completed" for no reason visible
+		// on the PR itself. See that migration's own doc comment for the
+		// full enumeration of which turn-creation paths set
+		// IsReviewAttempt true.
+		if !processing.IsReviewAttempt {
+			return nil
+		}
 		if err := a.enqueueReviewCheckNotAssessed(ctx, tx, processing); err != nil {
 			return err
 		}

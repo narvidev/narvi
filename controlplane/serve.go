@@ -2507,12 +2507,19 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// surface, §8.2/§21.1/§21.1b) publishes/updates the
 	// narvi/review check run -- the SAME liveSourceControl/
 	// cfg.GitHubBotToken every other GitHub-flavored notifier above
-	// already uses, plus its own claim-table store (reviewCheckRunStore)
-	// and cfg.GitHubAppID (the "select by SHA and GitHub App" identity
-	// filter, this deployment's own configured App id -- §30.4's own
-	// plumbing, required in every stage regardless of GitHub ingress).
+	// already uses, plus its own claim-table store (reviewCheckRunStore).
+	// Finding A2: this used to also take cfg.GitHubAppID, asserting it as
+	// "this deployment's own configured GitHub App id" for the "select by
+	// SHA and GitHub App" identity filter -- but cfg.GitHubAppID is §30.4's
+	// OWN, separate, read-only shadow-mode credential (internal/adapters/
+	// outbound/githubapp.Client), never the credential cfg.GitHubBotToken
+	// actually carries and writes check runs with. The notifier now
+	// self-learns its own writer App id from its own CreateCheckRun
+	// responses instead (reviewCheckNotifier.writerAppID's own doc
+	// comment, reviewcheck.go) -- no config value for it exists, or is
+	// needed, here.
 	reviewCheckRunStore := postgres.NewReviewCheckRunStore(pool)
-	reviewCheckNotifier := outboxworker.NewReviewCheckNotifier(pool, reviewCheckRunStore, liveSourceControl, cfg.GitHubBotToken, cfg.GitHubAppID)
+	reviewCheckNotifier := outboxworker.NewReviewCheckNotifier(pool, reviewCheckRunStore, liveSourceControl, cfg.GitHubBotToken)
 
 	// outboxStore is constructed earlier, alongside linearAgentSessionStore
 	// -- see that construction site's own doc comment for why.

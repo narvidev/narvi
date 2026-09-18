@@ -53,11 +53,19 @@ RETURNING *;
 
 -- name: ClearReviewCheckRunExternalID :exec
 -- Companion to UpdateReviewCheckRunPublished above -- called in the SAME
--- transaction, under the SAME lock, exactly when the caller has just
--- observed the row's head_sha is about to change: the existing
--- external_id (if any) belongs to the OLD sha and must never be carried
--- forward onto the new one (a GitHub check run cannot be moved to a
--- different commit; a new one must be created against the new head).
+-- transaction, under the SAME lock, whenever the caller (outboxworker's
+-- own reviewCheckNotifier, newIdentityNeeded) has decided the existing
+-- external_id must not carry forward. Finding A10: this doc used to name
+-- a head_sha change as the ONLY such condition -- the caller ALSO clears
+-- it when the row is already terminal-shaped (Stale/TerminalAssessed/
+-- TerminalNotAssessed) and candidate belongs to a genuinely newer
+-- attempt on the SAME head sha ("open a NEW check when a review
+-- restarts after a terminal result... never reopen a concluded one",
+-- finding A1) -- a case this doc omitted even though the caller has
+-- always implemented it. Both share the same reason: the existing
+-- external_id belongs to an identity this row's own next write must not
+-- reuse (a different SHA in the first case; an already-concluded run in
+-- the second).
 UPDATE review_check_runs
 SET external_id = NULL
 WHERE repo_full_name = $1 AND pr_number = $2;
@@ -85,16 +93,24 @@ WHERE repo_full_name = $1 AND pr_number = $2 AND attempt_id IS NOT DISTINCT FROM
 RETURNING *;
 
 -- name: GetReviewCheckRunByRepoAndPRNumber :one
--- The plain, non-locking read a Notifier.Deliver call opens with (no
--- claim to make yet -- mirrors GetGitHubPRSessionByRepoAndPRNumber's own
--- identical "forward, non-locking read" precedent, githubprsessions.sql):
--- resolves reviewcheck.Supersedes' own "current" argument before this
--- caller decides whether to proceed to the real claim (Ensure+Lock+
--- Update) sequence at all. pgx.ErrNoRows means no row exists yet for
--- this PR -- a genuine, reachable state only if this emission's own
--- enqueue site ran before this PR's very first PhaseQueued emission was
--- ever enqueued, which should not happen in practice (every enqueue path
--- runs after github_pr_sessions' own claim already exists) but is
--- defended here rather than assumed unreachable.
+-- A plain, non-locking read -- mirrors GetGitHubPRSessionByRepoAndPRNumber's
+-- own identical "forward, non-locking read" precedent
+-- (githubprsessions.sql). pgx.ErrNoRows means no row exists yet for this
+-- PR.
+--
+-- Finding A10: this used to be documented as "the read a Notifier.Deliver
+-- call opens with... resolves reviewcheck.Supersedes' own current
+-- argument" -- describing a pre-read Deliver never actually performed
+-- (Deliver's own claim sequence resolves "current" from
+-- LockReviewCheckRunForUpdate, inside its transaction, never from this
+-- query) -- and, before finding A3's own fix, had no production caller
+-- at all. It now has one: reviewCheckNotifier.
+-- guardAgainstSupersessionDuringCall (reviewcheck.go) calls this, with
+-- no transaction open, AFTER a GitHub write completes, to detect whether
+-- a concurrently-racing, newer Deliver call already committed a
+-- different row while that write was in flight -- a genuinely reachable
+-- pgx.ErrNoRows there would mean this row was deleted between this
+-- notifier's own earlier claim and this later read (not a real
+-- production path today, but handled rather than assumed unreachable).
 SELECT * FROM review_check_runs
 WHERE repo_full_name = $1 AND pr_number = $2;

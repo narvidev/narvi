@@ -1004,7 +1004,20 @@ func CreateSessionOnTx(ctx context.Context, tx pgx.Tx, sessions *postgres.Sessio
 			ReviewKnowledgeMode:     opts.ReviewKnowledgeMode,
 			ReviewKnowledgeDecision: opts.ReviewKnowledgeDecision,
 			ReviewVerdictContext:    opts.ReviewVerdictContext,
-			CorrelationID:           correlationID,
+			// IsReviewAttempt (finding A4): opts.ReviewHeadSHA != nil is a
+			// safe stand-in for "genuine review attempt" ONLY here --
+			// unlike CreateTurnOptions.IsReviewAttempt's own doc comment
+			// (turn.go), which warns against exactly this inference for
+			// CreateTurnCore's general case, ChildSessionOptions.
+			// ReviewHeadSHA's own doc comment (above) states it is
+			// non-nil for EXACTLY ONE caller: github/coalesce.go's WINNER
+			// branch, a brand-new review session's own FIRST turn --
+			// always a genuine attempt, never an ordinary follow-up (a
+			// follow-up cannot reach the WINNER branch at all; it always
+			// finds an existing github_pr_sessions claim row and takes the
+			// REUSE branch instead).
+			IsReviewAttempt: opts.ReviewHeadSHA != nil,
+			CorrelationID:   correlationID,
 		}); err != nil {
 			logger.Error("httpapi: create turn failed", "error", err)
 			return sqlcgen.Session{}, false, &CreateSessionError{Status: http.StatusInternalServerError, Message: "internal error"}

@@ -555,6 +555,77 @@ func TestHandleEnsureDispatched_SandboxReady_DispatchesTurn(t *testing.T) {
 	}
 }
 
+// TestHandleEnsureDispatched_GitHubOrigin_OrdinaryFollowUp_NeverEnqueuesReviewCheckRunning
+// is finding A4's own dispatch-side reproduction, fixed: dispatch.go's
+// own enqueueReviewCheckRunning call site (the PhaseRunning half,
+// alongside outboxenqueue.go's own PhaseTerminalNotAssessed half already
+// covered in outboxenqueue_integration_test.go) must not fire for a
+// github-origin turn that is not a genuine review attempt, even though
+// it carries a real review_head_sha and dispatches normally.
+func TestHandleEnsureDispatched_GitHubOrigin_OrdinaryFollowUp_NeverEnqueuesReviewCheckRunning(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessionID := createTestSessionWithSpawnSource(ctx, t, pool, sqlcgen.SessionSpawnSourceGithub)
+
+	turnStore := narvipg.NewTurnStore(pool)
+	headSHA := "0ddba11"
+	// IsReviewAttempt deliberately omitted (false) -- an ordinary
+	// follow-up @mention's own turn shape.
+	created, err := turnStore.Create(ctx, sqlcgen.CreateTurnParams{
+		SessionID:     sessionID,
+		Status:        sqlcgen.TurnStatusPending,
+		Prompt:        strPtr("what does finding 3 mean?"),
+		ReviewHeadSha: &headSHA,
+	})
+	if err != nil {
+		t.Fatalf("create pending turn: %v", err)
+	}
+
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
+	if err := prSessions.EnsureRow(ctx, "acme/widgets", 45); err != nil {
+		t.Fatalf("ensure github pr session row: %v", err)
+	}
+	if err := prSessions.SetSessionID(ctx, "acme/widgets", 45, sessionID); err != nil {
+		t.Fatalf("set github pr session id: %v", err)
+	}
+
+	sandboxStore := narvipg.NewSandboxStore(pool)
+	if _, err := sandboxStore.Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+	if _, err := sandboxStore.UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
+		SessionID: sessionID, Status: sqlcgen.SandboxStatusReady,
+	}); err != nil {
+		t.Fatalf("move sandbox to ready: %v", err)
+	}
+
+	commander := &fakeSendCommander{}
+	r := newDispatchTestRegistry(t, ctx, pool, nil, commander)
+	t.Cleanup(func() { _ = r.Shutdown() })
+
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+	sendEnsureDispatched(ctx, t, a)
+
+	waitUntil(t, 5*time.Second, func() bool {
+		return commander.callCount() == 1
+	})
+
+	got, err := turnStore.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("get turn: %v", err)
+	}
+	if got.Status != sqlcgen.TurnStatusProcessing {
+		t.Fatalf("turn status = %s, want %s (dispatch itself must proceed normally)", got.Status, sqlcgen.TurnStatusProcessing)
+	}
+
+	if n := countOutboxRowsForSession(ctx, t, pool, sessionID); n != 0 {
+		t.Errorf("outbox row count = %d, want 0 -- an ordinary follow-up (is_review_attempt=false) must never enqueue reviewcheck.PhaseRunning either", n)
+	}
+}
+
 // TestHandleEnsureDispatched_SendCommandNoLiveConnection_FailsTurnForward
 // proves the restructured dispatchTurn (design decision 3b's own fix: a
 // real network call must never run while the transact's own FOR UPDATE

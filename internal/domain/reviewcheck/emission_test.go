@@ -81,14 +81,55 @@ func TestSupersedes_SameAttemptPhaseRegressionRefused(t *testing.T) {
 }
 
 // TestSupersedes_SameAttemptSameRankAllowsIdempotentOverwrite: an exact
-// redelivery, or a same-rank correction (e.g. TerminalAssessed ->
-// TerminalNotAssessed for the identical attempt, or a plain retry),
-// must still be allowed -- never refused merely for matching rank.
+// redelivery, or a same-rank correction between Stale and
+// TerminalNotAssessed for the identical attempt, must still be allowed
+// -- never refused merely for matching rank. (Before finding A8's own
+// fix, this same test used TerminalAssessed -> TerminalNotAssessed as
+// its own example of an allowed "correction" -- that was the defect
+// itself: see TestSupersedes_SameAttemptTerminalAssessedNeverDisplacedByADifferentPhase
+// below for why a REAL, already-posted success is not a "correction"
+// candidate in the same sense Stale/TerminalNotAssessed are for each
+// other.)
 func TestSupersedes_SameAttemptSameRankAllowsIdempotentOverwrite(t *testing.T) {
-	current := Emission{AttemptID: "attempt-a", AttemptCreatedAt: t1, Phase: PhaseTerminalAssessed}
-	candidate := Emission{AttemptID: "attempt-a", AttemptCreatedAt: t1, Phase: PhaseTerminalNotAssessed}
+	current := Emission{AttemptID: "attempt-a", AttemptCreatedAt: t1, Phase: PhaseTerminalNotAssessed}
+	candidate := Emission{AttemptID: "attempt-a", AttemptCreatedAt: t1, Phase: PhaseStale}
 	if !Supersedes(current, candidate) {
 		t.Fatal("a same-rank, same-attempt candidate must be allowed to apply (idempotent redelivery / correction)")
+	}
+}
+
+// TestSupersedes_SameAttemptTerminalAssessedRedeliveryAllowed: an exact
+// redelivery of PhaseTerminalAssessed for the identical attempt (e.g.
+// republished display text, or a plain outbox retry) is still allowed --
+// finding A8's fix narrows same-rank overwrites OUT of an
+// already-assessed current, never idempotent redelivery of the SAME
+// phase.
+func TestSupersedes_SameAttemptTerminalAssessedRedeliveryAllowed(t *testing.T) {
+	current := Emission{AttemptID: "attempt-a", AttemptCreatedAt: t1, Phase: PhaseTerminalAssessed}
+	candidate := Emission{AttemptID: "attempt-a", AttemptCreatedAt: t1, Phase: PhaseTerminalAssessed}
+	if !Supersedes(current, candidate) {
+		t.Fatal("an idempotent redelivery of PhaseTerminalAssessed for the same attempt must still be allowed")
+	}
+}
+
+// TestSupersedes_SameAttemptTerminalAssessedNeverDisplacedByADifferentPhase
+// is finding A8's own fix: once PhaseTerminalAssessed is current for an
+// attempt (a real review.Verdict was posted), no same-attempt candidate
+// other than ANOTHER PhaseTerminalAssessed may ever displace it -- not
+// Stale, not TerminalNotAssessed, even though both share
+// PhaseTerminalAssessed's own rank and would otherwise pass the
+// same-rank-is-allowed rule. Before this fix, a same-attempt
+// TerminalNotAssessed (or Stale) emission -- reachable via a redelivery
+// race, never through the normal enqueue paths this codebase ships
+// today, but not excluded by Supersedes itself -- could silently replace
+// a real, already-posted success with "Review not completed".
+func TestSupersedes_SameAttemptTerminalAssessedNeverDisplacedByADifferentPhase(t *testing.T) {
+	current := Emission{AttemptID: "attempt-a", AttemptCreatedAt: t1, Phase: PhaseTerminalAssessed}
+	for _, p := range []Phase{PhaseTerminalNotAssessed, PhaseStale} {
+		candidate := Emission{AttemptID: "attempt-a", AttemptCreatedAt: t1, Phase: p}
+		if Supersedes(current, candidate) {
+			t.Errorf("a same-attempt %s candidate must never displace an already-posted PhaseTerminalAssessed/success", p)
+		}
 	}
 }
 

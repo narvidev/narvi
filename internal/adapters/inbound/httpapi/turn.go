@@ -384,6 +384,22 @@ type CreateTurnOptions struct {
 	// own identical convention.
 	ReviewVerdictContext []byte
 
+	// IsReviewAttempt (migrations/000133_turns_is_review_attempt.up.sql,
+	// finding A4) is DELIBERATELY narrower than "ReviewHeadSHA != nil":
+	// every GitHub-origin turn this core ever creates carries a
+	// ReviewHeadSHA (the commit its own pre-fetched diff was anchored
+	// to), but NOT every one of them is a genuine review attempt --
+	// github/coalesce.go's own REUSE branch creates a turn for BOTH an
+	// ordinary follow-up @mention AND a "review:*" label re-trigger,
+	// and only the second is one. False (the Go zero value) for every
+	// caller that never sets it -- the same safe-default reasoning
+	// ReviewHeadSHA's own doc comment states, just for a real bool
+	// rather than a nil pointer. Stored verbatim onto turns.
+	// is_review_attempt at INSERT time below; dispatch.go/
+	// outboxenqueue.go gate the review-check outbox enqueue on THIS
+	// column, never on ReviewHeadSHA's mere presence.
+	IsReviewAttempt bool
+
 	// ReviewKnowledgeMode/ReviewKnowledgeDecision (§31.2/§31.6's own mode
 	// buffer) mirror ReviewDepth/ReviewDepthDecision's own identical
 	// shape two fields further: non-nil ONLY for a review-session turn,
@@ -592,6 +608,7 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 	var reviewKnowledgeMode *string
 	var reviewKnowledgeDecision []byte
 	var reviewVerdictContext []byte
+	var isReviewAttempt bool
 	if len(opts) > 0 {
 		attachmentIDs = opts[0].AttachmentIDs
 		storageConfigured = opts[0].StorageConfigured
@@ -603,6 +620,7 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 		reviewKnowledgeMode = opts[0].ReviewKnowledgeMode
 		reviewKnowledgeDecision = opts[0].ReviewKnowledgeDecision
 		reviewVerdictContext = opts[0].ReviewVerdictContext
+		isReviewAttempt = opts[0].IsReviewAttempt
 	}
 
 	// §23 ("plan mode: follow-up intent classification", §23.1/§23.2):
@@ -986,6 +1004,7 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 		ReviewKnowledgeMode:     reviewKnowledgeMode,
 		ReviewKnowledgeDecision: reviewKnowledgeDecision,
 		ReviewVerdictContext:    reviewVerdictContext,
+		IsReviewAttempt:         isReviewAttempt,
 		// answerOnly (§23.2) is nil ("classification did not
 		// apply") for every turn that predates this Step, or that never hit
 		// the plan_followup block above -- see that block's own doc

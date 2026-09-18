@@ -1,0 +1,45 @@
+-- turns.is_review_attempt (finding A4 -- "an ordinary follow-up flips a
+-- reviewed PR to not completed"): whether THIS turn was created as a
+-- genuine review-performing attempt, as opposed to an ordinary reply on
+-- an already-tracked GitHub review session.
+--
+-- Before this column, internal/adapters/inbound/github's own doc.go
+-- reasoned "every github-origin session is a review session" and
+-- generalized that to "every TURN on one is a review attempt" --
+-- dispatch.go's own enqueueReviewCheckRunning and outboxenqueue.go's own
+-- enqueueReviewCheckNotAssessed both fired unconditionally for every
+-- github-origin turn's own dispatch/terminal transition. That is true
+-- for a session's FIRST turn (github/coalesce.go's own WINNER path) and
+-- for an explicit re-trigger (a "re-review" label, the REST re-trigger
+-- button, or §24's automatic push-triggered retrigger) -- it is false
+-- for an ORDINARY follow-up @mention on an already-reviewed PR ("what
+-- does finding 3 mean?", "thanks"), which creates its own turn (a fresh
+-- turns.id, i.e. a fresh reviewcheck.Emission.AttemptID) that reaches a
+-- terminal state having never called the verdict-posting tool -- exactly
+-- like a genuinely failed review attempt reads to reviewcheck.Supersedes,
+-- which has no way to tell the two apart from Phase/AttemptID/
+-- AttemptCreatedAt alone. Since a NEWER attempt always wins over an
+-- older one (§21.1b), that ordinary follow-up's own
+-- PhaseTerminalNotAssessed emission overwrote the real, already-posted
+-- PhaseTerminalAssessed/success the actual review turn published --
+-- flipping a successfully reviewed PR's check back to "Review not
+-- completed" for no reason a human reading the PR could see.
+--
+-- NOT NULL DEFAULT false: the safe default. A turn nobody explicitly
+-- marks as a review attempt never touches the check -- silence is the
+-- safe failure mode here (§21.1b's own "two active identities... worse
+-- than none" reasoning extends naturally to "an extra, wrong write is
+-- worse than no write"), never the reverse. Every genuine review-turn-
+-- creation path sets this to true explicitly, at INSERT time, alongside
+-- review_head_sha: github/coalesce.go's WINNER branch (httpapi.
+-- CreateSessionOnTx) and its REUSE branch's own label-retrigger case
+-- (httpapi.CreateTurnForBot, gated on isLabelRetrigger -- an ORDINARY
+-- REUSE @mention passes false), the manual REST re-trigger button
+-- (httpapi.CreateTurnCore via reviewretrigger.go), §24's own automatic
+-- push-triggered retrigger (internal/app/sessionactor/reviewretrigger.go),
+-- and the release composition-review pass (internal/app/releasereview/
+-- compositiondispatch.go). Every OTHER turn-creation call site (Slack,
+-- Linear, the plain REST CreateTurn endpoint, workflowengine) never sets
+-- review_head_sha either, so this column is simply always false there
+-- too -- consistent, never consulted outside a github-origin session.
+ALTER TABLE turns ADD COLUMN is_review_attempt BOOLEAN NOT NULL DEFAULT false;

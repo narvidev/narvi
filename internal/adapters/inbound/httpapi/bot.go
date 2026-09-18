@@ -151,8 +151,21 @@ func CreateSessionForBot(ctx context.Context, pool *pgxpool.Pool, sessions *post
 // reviewDepthDecision's own identical "non-nil ONLY for github/
 // coalesce.go's own REUSE-path caller" shape, one field further -- see
 // CreateTurnOptions.ReviewVerdictContext's own doc comment (turn.go).
-func CreateTurnForBot(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, intentSvc *intentclassifier.Service, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, sessionID pgtype.UUID, prompt string, modelID *string, planMode bool, epistemicCheckDefault bool, actorUserID pgtype.UUID, reviewHeadSHA *string, classifyText *string, effort *string, reviewDepth *string, reviewDepthDecision []byte, reviewKnowledgeMode *string, reviewKnowledgeDecision []byte, reviewVerdictContextJSON []byte) (sqlcgen.Turn, error) {
-	created, _, cerr := createTurnLocked(ctx, pool, sessions, turns, plans, intentSvc, auditLog, registry, sessionID, prompt, modelID, planMode, epistemicCheckDefault, actorUserID, AlwaysQueue, CreateTurnOptions{ReviewHeadSHA: reviewHeadSHA, ClassifyText: classifyText, Effort: effort, ReviewDepth: reviewDepth, ReviewDepthDecision: reviewDepthDecision, ReviewKnowledgeMode: reviewKnowledgeMode, ReviewKnowledgeDecision: reviewKnowledgeDecision, ReviewVerdictContext: reviewVerdictContextJSON})
+//
+// isReviewAttempt (migrations/000133_turns_is_review_attempt.up.sql,
+// finding A4) is REQUIRED, not bundled into reviewHeadSHA's own
+// "non-nil only for a review turn" shape -- unlike every other
+// review-*-flavored parameter above, this function's ONE caller
+// (github/coalesce.go's REUSE branch) does NOT always mean "yes" when it
+// has a real value to supply: an ordinary follow-up @mention and a
+// "review:*" label re-trigger both reach this exact call site, and only
+// the label re-trigger is a genuine review attempt (that caller's own
+// isLabelRetrigger, already computed to pick between ActionPromptSession
+// and ActionRetriggerReview). See CreateTurnOptions.IsReviewAttempt's own
+// doc comment (turn.go) for why this must never be inferred from
+// reviewHeadSHA's own presence.
+func CreateTurnForBot(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, intentSvc *intentclassifier.Service, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, sessionID pgtype.UUID, prompt string, modelID *string, planMode bool, epistemicCheckDefault bool, actorUserID pgtype.UUID, reviewHeadSHA *string, classifyText *string, effort *string, reviewDepth *string, reviewDepthDecision []byte, reviewKnowledgeMode *string, reviewKnowledgeDecision []byte, reviewVerdictContextJSON []byte, isReviewAttempt bool) (sqlcgen.Turn, error) {
+	created, _, cerr := createTurnLocked(ctx, pool, sessions, turns, plans, intentSvc, auditLog, registry, sessionID, prompt, modelID, planMode, epistemicCheckDefault, actorUserID, AlwaysQueue, CreateTurnOptions{ReviewHeadSHA: reviewHeadSHA, ClassifyText: classifyText, Effort: effort, ReviewDepth: reviewDepth, ReviewDepthDecision: reviewDepthDecision, ReviewKnowledgeMode: reviewKnowledgeMode, ReviewKnowledgeDecision: reviewKnowledgeDecision, ReviewVerdictContext: reviewVerdictContextJSON, IsReviewAttempt: isReviewAttempt})
 	if cerr != nil {
 		// %w, NOT %s (a follow-up fix, Finding 1): cerr's own
 		// Error() method returns exactly cerr.Message, so this produces the

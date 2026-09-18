@@ -2222,6 +2222,7 @@ type Turn struct {
 	CorrelationID           *string               `json:"correlation_id"`
 	ReviewVerdictContext    []byte                `json:"review_verdict_context"`
 	DispatchedMessageID     *string               `json:"dispatched_message_id"`
+	IsReviewAttempt         bool                  `json:"is_review_attempt"`
 }
 
 type TurnStepCost struct {

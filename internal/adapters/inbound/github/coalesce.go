@@ -616,7 +616,17 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 		// REUSE-path turn ever gets -- light leaves both nil (today's
 		// unchanged behavior), deep forces high effort (and, when
 		// c.ReviewModelDeep is configured, a specific frontier model).
-		createdTurn, err := httpapi.CreateTurnForBot(ctx, c.Pool, c.Sessions, c.Turns, c.Plans, c.IntentClassifier, c.AuditLog, c.Registry, existing, prompt, triageModelID, req.PlanMode, false, actor, reviewHeadSHAPtr, &classifyText, triageEffort, reviewDepthPtr, triageRecordJSON, knowledgeMode, knowledgeDecisionJSON, reviewVerdictContextJSON)
+		//
+		// isLabelRetrigger, passed straight through as
+		// CreateTurnForBot's own new isReviewAttempt parameter (finding
+		// A4): this REUSE branch is reached by BOTH an ordinary follow-up
+		// @mention and a "review:*" label re-trigger (reuseAction's own
+		// branch above already distinguishes the two for authorization);
+		// only the label re-trigger is a genuine review attempt that
+		// should ever move the narvi/review check -- see turns.
+		// is_review_attempt's own migration doc comment for the full
+		// "why" an ordinary follow-up must NOT set this.
+		createdTurn, err := httpapi.CreateTurnForBot(ctx, c.Pool, c.Sessions, c.Turns, c.Plans, c.IntentClassifier, c.AuditLog, c.Registry, existing, prompt, triageModelID, req.PlanMode, false, actor, reviewHeadSHAPtr, &classifyText, triageEffort, reviewDepthPtr, triageRecordJSON, knowledgeMode, knowledgeDecisionJSON, reviewVerdictContextJSON, isLabelRetrigger)
 		if err != nil {
 			// mention_count untouched here too (audit fix): this is the
 			// OTHER denial route the increment used to run ahead of --

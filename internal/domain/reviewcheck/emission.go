@@ -98,8 +98,16 @@ type Emission struct {
 //     emission already published must not resurrect
 //     "in progress" over a concluded result), while a same-rank update
 //     (e.g. PhaseTerminalAssessed republished with corrected display
-//     text, or a plain redelivery of the identical emission) is always
-//     allowed -- idempotent, never refused.
+//     text, or a plain redelivery of the identical emission) is
+//     ORDINARILY allowed -- idempotent, never refused. finding A8's own
+//     fix narrows this ONE further: when current is ALREADY
+//     PhaseTerminalAssessed (a real review.Verdict was posted for this
+//     exact attempt), a same-attempt candidate may only be ANOTHER
+//     PhaseTerminalAssessed (the idempotent-redelivery/corrected-text
+//     case above) -- never a same-rank Stale/TerminalNotAssessed
+//     "correction", which is never a legitimate same-attempt transition
+//     out of a real, already-posted success (supersedesSameAttemptTerminalAssessed,
+//     below).
 //
 // An invalid candidate.Phase (Valid() == false) is refused unconditionally,
 // regardless of attempt recency -- this package's own caller must never
@@ -113,5 +121,27 @@ func Supersedes(current, candidate Emission) bool {
 	if candidate.AttemptID != current.AttemptID {
 		return candidate.AttemptCreatedAt.After(current.AttemptCreatedAt)
 	}
+	if supersedesSameAttemptTerminalAssessed(current, candidate) {
+		return false
+	}
 	return candidate.Phase.rank() >= current.Phase.rank()
+}
+
+// supersedesSameAttemptTerminalAssessed (finding A8) reports whether
+// current/candidate fall into the ONE same-rank, same-attempt shape
+// Supersedes above refuses rather than allows: rank 2 is shared by three
+// MUTUALLY EXCLUSIVE alternate outcomes (Stale/TerminalAssessed/
+// TerminalNotAssessed, Phase.rank's own doc comment), and Supersedes'
+// general same-attempt rule otherwise allows any one of them to replace
+// any other for the identical attempt -- a legitimate "correction" for
+// the Stale/TerminalNotAssessed pair (redisplaying with corrected text,
+// or a re-evaluation flipping stale status), but never safe for
+// PhaseTerminalAssessed: that phase means "a real review.Verdict was
+// posted for this attempt", a fact that does not become UN-true. The
+// ONLY same-attempt candidate ever allowed to replace an already-
+// terminal-assessed current is another PhaseTerminalAssessed itself (an
+// idempotent redelivery, or republished display text) -- never a
+// same-attempt Stale/TerminalNotAssessed masquerading as a "correction".
+func supersedesSameAttemptTerminalAssessed(current, candidate Emission) bool {
+	return current.Phase == PhaseTerminalAssessed && candidate.Phase != PhaseTerminalAssessed
 }

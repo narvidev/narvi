@@ -110,9 +110,19 @@ func (s *ReviewCheckRunStore) SetExternalID(ctx context.Context, repoFullName st
 	})
 }
 
-// GetByRepoAndPRNumber is the plain, non-locking read a Deliver call
-// opens with -- see GetReviewCheckRunByRepoAndPRNumber's own generated
-// doc comment. pgx.ErrNoRows means no row exists yet for this PR.
+// GetByRepoAndPRNumber is a plain, non-locking read -- see
+// GetReviewCheckRunByRepoAndPRNumber's own generated doc comment.
+// pgx.ErrNoRows means no row exists yet for this PR.
+//
+// Finding A10: this used to be documented as "the read a Deliver call
+// opens with", describing a pre-read Deliver never actually performed
+// (Deliver opens its own claim sequence with EnsureRow+LockForUpdate,
+// both inside a transaction -- never a bare unlocked Get) -- and, before
+// finding A3's own fix, had no production caller at all. It now has one:
+// reviewCheckNotifier.guardAgainstSupersessionDuringCall (reviewcheck.go)
+// calls this, with no transaction open, AFTER a GitHub write completes,
+// to detect whether a concurrently-racing, newer Deliver call already
+// committed a different row while that write was in flight.
 func (s *ReviewCheckRunStore) GetByRepoAndPRNumber(ctx context.Context, repoFullName string, prNumber int32) (sqlcgen.ReviewCheckRun, error) {
 	return s.q.GetReviewCheckRunByRepoAndPRNumber(ctx, sqlcgen.GetReviewCheckRunByRepoAndPRNumberParams{
 		RepoFullName: repoFullName,

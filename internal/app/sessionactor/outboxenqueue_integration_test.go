@@ -195,6 +195,141 @@ func TestCompleteProcessingTurn_GitHubOrigin_EnqueuesNoRawCommentOutboxRow(t *te
 	}
 }
 
+// TestCompleteProcessingTurn_GitHubOrigin_OrdinaryFollowUp_NeverTouchesReviewCheck
+// is finding A4's own reproduction, fixed: a turn that carries a real
+// review_head_sha (so it WOULD have passed enqueueReviewCheck's own
+// "no head sha, skip" gate) but is NOT a genuine review attempt
+// (turns.is_review_attempt == false, its Go zero value -- an ordinary
+// follow-up @mention on an already-reviewed PR, github/coalesce.go's own
+// REUSE branch when isLabelRetrigger is false) must enqueue NOTHING on
+// the review-check surface when it reaches a terminal state, regardless
+// of trig. Before this fix, outboxenqueue.go's own github branch fired
+// unconditionally for every github-origin turn, so this exact turn shape
+// published reviewcheck.PhaseTerminalNotAssessed ("Review not
+// completed") and, via §21.1b's own "a newer attempt always wins" rule,
+// silently overwrote a real, already-posted PhaseTerminalAssessed/
+// success for the SAME pull request.
+func TestCompleteProcessingTurn_GitHubOrigin_OrdinaryFollowUp_NeverTouchesReviewCheck(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+
+	sessionID := createTestSessionWithSpawnSource(ctx, t, pool, sqlcgen.SessionSpawnSourceGithub)
+
+	if _, err := narvipg.NewSandboxStore(pool).Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+	turnStore := narvipg.NewTurnStore(pool)
+	headSHA := "deadbeef"
+	// IsReviewAttempt deliberately omitted (Go zero value: false) -- this
+	// is the exact shape an ordinary REUSE-path follow-up @mention turn
+	// carries: a real review_head_sha (its own pre-fetched diff WAS
+	// anchored to a commit), but not a genuine review attempt.
+	if _, err := turnStore.Create(ctx, sqlcgen.CreateTurnParams{
+		SessionID:     sessionID,
+		Status:        sqlcgen.TurnStatusProcessing,
+		ReviewHeadSha: &headSHA,
+	}); err != nil {
+		t.Fatalf("create processing turn: %v", err)
+	}
+
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
+	if err := prSessions.EnsureRow(ctx, "acme/widgets", 43); err != nil {
+		t.Fatalf("ensure github pr session row: %v", err)
+	}
+	if err := prSessions.SetSessionID(ctx, "acme/widgets", 43, sessionID); err != nil {
+		t.Fatalf("set github pr session id: %v", err)
+	}
+
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	// TriggerComplete deliberately -- decision 1 applies UNCONDITIONALLY
+	// of trig (outboxenqueue.go's own doc comment), so even a turn that
+	// completed SUCCESSFULLY must not touch the check when it is not a
+	// review attempt at all.
+	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "execution_complete",
+		Gen:  1,
+		Raw:  executionCompleteRaw(t, sessionID.String(), 1, sandboxws.ExecutionCompleteOutcomeCompleted),
+	})
+
+	if n := countOutboxRowsForSession(ctx, t, pool, sessionID); n != 0 {
+		t.Errorf("outbox row count = %d, want 0 -- an ordinary follow-up (is_review_attempt=false) must never enqueue a review-check emission", n)
+	}
+}
+
+// TestCompleteProcessingTurn_GitHubOrigin_ReviewAttempt_EnqueuesNotAssessed
+// is this same gate's positive case: a turn that IS a genuine review
+// attempt (is_review_attempt=true) still correctly publishes
+// PhaseTerminalNotAssessed when it reaches a terminal state without ever
+// posting a verdict -- the gate added for finding A4 narrows WHO can
+// move the check, it does not silence the check for a genuine attempt.
+func TestCompleteProcessingTurn_GitHubOrigin_ReviewAttempt_EnqueuesNotAssessed(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+
+	sessionID := createTestSessionWithSpawnSource(ctx, t, pool, sqlcgen.SessionSpawnSourceGithub)
+
+	if _, err := narvipg.NewSandboxStore(pool).Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+	turnStore := narvipg.NewTurnStore(pool)
+	headSHA := "cafef00d"
+	if _, err := turnStore.Create(ctx, sqlcgen.CreateTurnParams{
+		SessionID:       sessionID,
+		Status:          sqlcgen.TurnStatusProcessing,
+		ReviewHeadSha:   &headSHA,
+		IsReviewAttempt: true,
+	}); err != nil {
+		t.Fatalf("create processing turn: %v", err)
+	}
+
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
+	if err := prSessions.EnsureRow(ctx, "acme/widgets", 44); err != nil {
+		t.Fatalf("ensure github pr session row: %v", err)
+	}
+	if err := prSessions.SetSessionID(ctx, "acme/widgets", 44, sessionID); err != nil {
+		t.Fatalf("set github pr session id: %v", err)
+	}
+
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "execution_complete",
+		Gen:  1,
+		Raw:  executionCompleteRaw(t, sessionID.String(), 1, sandboxws.ExecutionCompleteOutcomeCompleted),
+	})
+
+	row := getSoleOutboxRowForSession(ctx, t, pool, sessionID)
+	if row.Kind != string(ports.NotificationKindGitHubReviewCheck) {
+		t.Fatalf("Kind = %q, want %q", row.Kind, ports.NotificationKindGitHubReviewCheck)
+	}
+	var payload ports.ReviewCheckPayload
+	if err := json.Unmarshal(row.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload.Phase != "terminal_not_assessed" {
+		t.Errorf("Phase = %q, want terminal_not_assessed", payload.Phase)
+	}
+}
+
 // TestCompleteProcessingTurn_LinearOrigin_EnqueuesExactlyOneLinearOutboxRow
 // proves a linear-origin session's SUCCESSFUL turn completion enqueues
 // exactly one 'linear'-kind outbox row, shaped as linearapi.Payload, with

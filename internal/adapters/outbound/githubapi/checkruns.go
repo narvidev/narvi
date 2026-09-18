@@ -44,22 +44,36 @@ type checkRunOutput struct {
 // checkRunResponse is the subset of GitHub's real check-run object this
 // adapter reads back -- ID is what SetExternalID persists; the rest
 // (HeadSHA, App.ID, Name) are what ListCheckRunsForRef's own callers
-// filter recovery candidates by.
+// filter recovery candidates by. Status/Conclusion (finding A1) let a
+// recovery caller exclude an already-CONCLUDED run from adoption --
+// CheckRunSummary carried neither before this fix, so the adoption
+// predicate had no way to tell a genuinely-recoverable in-flight/orphaned
+// run apart from a PREVIOUS attempt's own already-terminal one.
 type checkRunResponse struct {
-	ID      int64  `json:"id"`
-	Name    string `json:"name"`
-	HeadSHA string `json:"head_sha"`
-	App     struct {
+	ID         int64  `json:"id"`
+	Name       string `json:"name"`
+	HeadSHA    string `json:"head_sha"`
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
+	App        struct {
 		ID int64 `json:"id"`
 	} `json:"app"`
 }
 
 // CreateCheckRun creates a NEW check run named name against headSHA,
-// returning GitHub's own assigned check-run id. conclusion == "" (
+// returning GitHub's own assigned check-run id, PLUS the id of the App
+// GitHub attributed this write to (finding A2) -- read back from the
+// SAME create response, never asserted from local config. A writing
+// credential's own identity is only known for certain by observing what
+// GitHub itself reports for a write THAT credential actually made; see
+// internal/app/outboxworker's own review-check notifier for the caller
+// that records this as "this deployment's own observed writer App id"
+// and uses it, instead of a separately-configured value that may name an
+// entirely different credential's App. conclusion == "" (
 // reviewcheck.ConclusionNone) omits the field entirely -- required for
 // status == "queued"/"in_progress" (GitHub rejects a conclusion on an
 // incomplete run).
-func (a *Adapter) CreateCheckRun(ctx context.Context, owner, repo, token, headSHA, name, status, conclusion, title, summary string) (int64, error) {
+func (a *Adapter) CreateCheckRun(ctx context.Context, owner, repo, token, headSHA, name, status, conclusion, title, summary string) (id int64, appID int64, err error) {
 	reqBody, err := json.Marshal(checkRunRequest{
 		Name:       name,
 		HeadSHA:    headSHA,
@@ -68,22 +82,22 @@ func (a *Adapter) CreateCheckRun(ctx context.Context, owner, repo, token, headSH
 		Output:     &checkRunOutput{Title: title, Summary: summary},
 	})
 	if err != nil {
-		return 0, fmt.Errorf("githubapi: encode create-check-run request: %w", err)
+		return 0, 0, fmt.Errorf("githubapi: encode create-check-run request: %w", err)
 	}
 
 	path := fmt.Sprintf("%s/repos/%s/%s/check-runs", a.apiBaseURL, url.PathEscape(owner), url.PathEscape(repo))
 	body, err := a.doPost(ctx, path, token, reqBody)
 	if err != nil {
-		return 0, fmt.Errorf("githubapi: create check run: %w", err)
+		return 0, 0, fmt.Errorf("githubapi: create check run: %w", err)
 	}
 	var parsed checkRunResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return 0, fmt.Errorf("githubapi: decode create-check-run response: %w", err)
+		return 0, 0, fmt.Errorf("githubapi: decode create-check-run response: %w", err)
 	}
 	if parsed.ID == 0 {
-		return 0, fmt.Errorf("githubapi: create check run: empty id in response")
+		return 0, 0, fmt.Errorf("githubapi: create check run: empty id in response")
 	}
-	return parsed.ID, nil
+	return parsed.ID, parsed.App.ID, nil
 }
 
 // UpdateCheckRun PATCHes an EXISTING check run (checkRunID, GitHub's own
@@ -126,11 +140,16 @@ type listCheckRunsForRefResponse struct {
 // ListCheckRunsForRef lists every check run GitHub has recorded for ref
 // (a commit SHA) -- the "select by SHA and GitHub App" recovery read
 // (the brief's own identity rule): a caller filters the result to
-// entries whose App.ID matches this deployment's OWN configured GitHub
-// App id AND whose Name equals reviewcheck.CheckName, so another app's
-// same-named check run is never adopted, and so a crash between a
-// successful create and this system's own record of its id can recover
-// the real one rather than creating a duplicate.
+// entries whose App.ID matches this deployment's own OBSERVED writer App
+// id (finding A2 -- never a separately-configured value that may name a
+// different credential's App entirely) AND whose Name equals
+// reviewcheck.CheckName, so another app's same-named check run is never
+// adopted, AND whose Status is not yet "completed" (finding A1 -- a
+// concluded check run is never a recovery candidate: "open a NEW check
+// when a review restarts after a terminal result... never reopen a
+// concluded one"), so a crash between a successful create and this
+// system's own record of its id can recover the real one rather than
+// creating a duplicate.
 //
 // per_page=100, mirroring every other list GET in this adapter
 // (fetchCIConclusionLive's own identical fix, listopenprs.go) --
@@ -155,20 +174,29 @@ func (a *Adapter) ListCheckRunsForRef(ctx context.Context, owner, repo, ref, tok
 	}
 	out := make([]CheckRunSummary, 0, len(parsed.CheckRuns))
 	for _, r := range parsed.CheckRuns {
-		out = append(out, CheckRunSummary{ID: r.ID, Name: r.Name, HeadSHA: r.HeadSHA, AppID: r.App.ID})
+		out = append(out, CheckRunSummary{ID: r.ID, Name: r.Name, HeadSHA: r.HeadSHA, AppID: r.App.ID, Status: r.Status, Conclusion: r.Conclusion})
 	}
 	return out, nil
 }
 
 // CheckRunSummary is ListCheckRunsForRef's own return shape -- the
 // fields a recovery caller needs to decide "is this MY app's
-// narvi/review check run for this exact SHA", never GitHub's full
-// check-run object.
+// narvi/review check run for this exact SHA, and is it still safe to
+// adopt", never GitHub's full check-run object. Status/Conclusion
+// (finding A1) are GitHub's own raw strings, deliberately NOT this
+// codebase's own reviewcheck.Status/reviewcheck.Conclusion types --
+// this adapter package has no dependency on internal/domain/reviewcheck
+// (mirrors this file's own top doc comment: "the wire protocol only",
+// every decision lives with the caller), so a caller compares Status
+// against reviewcheck.StatusCompleted's own string value, never a type
+// this package would need to import reviewcheck to produce.
 type CheckRunSummary struct {
-	ID      int64
-	Name    string
-	HeadSHA string
-	AppID   int64
+	ID         int64
+	Name       string
+	HeadSHA    string
+	AppID      int64
+	Status     string
+	Conclusion string
 }
 
 // nonEmptyStringPtr returns nil for an empty string, &s otherwise --

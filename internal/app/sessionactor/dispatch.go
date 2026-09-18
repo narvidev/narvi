@@ -1830,7 +1830,18 @@ func (a *Actor) tryPlanDispatch(
 	// turn's own status write (§5.1). Every non-github session (the
 	// overwhelming majority of dispatches) pays nothing beyond this one
 	// SpawnSource comparison.
-	if sessionRow.SpawnSource == sqlcgen.SessionSpawnSourceGithub {
+	//
+	// target.IsReviewAttempt (finding A4, migrations/
+	// 000133_turns_is_review_attempt.up.sql) is a SECOND, REQUIRED gate,
+	// added alongside SpawnSource -- not every turn on a github-origin
+	// session is a genuine review attempt (an ordinary follow-up
+	// @mention on an already-reviewed PR is not). Publishing
+	// PhaseRunning for one of those would flip an already-terminal
+	// check back to "in progress" for a turn that was never going to
+	// call the verdict-posting tool at all -- see that migration's own
+	// doc comment for the full "why", and outboxenqueue.go's own
+	// identical gate on the terminal side.
+	if sessionRow.SpawnSource == sqlcgen.SessionSpawnSourceGithub && target.IsReviewAttempt {
 		if err := a.enqueueReviewCheckRunning(ctx, tx, target); err != nil {
 			return nil, err
 		}

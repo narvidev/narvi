@@ -30,17 +30,24 @@ func TestCreateCheckRun_Queued(t *testing.T) {
 		gotAuth = r.Header.Get("Authorization")
 		_ = json.NewDecoder(r.Body).Decode(&gotBody)
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 42})
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 42, "app": map[string]any{"id": 777}})
 	}))
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	id, err := adapter.CreateCheckRun(context.Background(), "acme", "widgets", "tok", "deadbeef", "narvi/review", "queued", "", "Review queued", "Narvi has not yet started reviewing this pull request.")
+	id, appID, err := adapter.CreateCheckRun(context.Background(), "acme", "widgets", "tok", "deadbeef", "narvi/review", "queued", "", "Review queued", "Narvi has not yet started reviewing this pull request.")
 	if err != nil {
 		t.Fatalf("CreateCheckRun() error = %v", err)
 	}
 	if id != 42 {
 		t.Errorf("CreateCheckRun() id = %d, want 42", id)
+	}
+	// finding A2: the create response's own app.id must be surfaced back
+	// to the caller -- this is what lets a caller self-learn the writing
+	// credential's REAL identity, rather than asserting it from separate,
+	// possibly-unrelated config.
+	if appID != 777 {
+		t.Errorf("CreateCheckRun() appID = %d, want 777 (read back from the create response's own app.id)", appID)
 	}
 	if gotMethod != http.MethodPost {
 		t.Errorf("method = %s, want POST", gotMethod)
@@ -79,7 +86,7 @@ func TestCreateCheckRun_TerminalCarriesConclusion(t *testing.T) {
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	if _, err := adapter.CreateCheckRun(context.Background(), "acme", "widgets", "tok", "sha1", "narvi/review", "completed", "action_required", "Review not completed", "..."); err != nil {
+	if _, _, err := adapter.CreateCheckRun(context.Background(), "acme", "widgets", "tok", "sha1", "narvi/review", "completed", "action_required", "Review not completed", "..."); err != nil {
 		t.Fatalf("CreateCheckRun() error = %v", err)
 	}
 	if gotBody["conclusion"] != "action_required" {
@@ -213,7 +220,7 @@ func TestCreateCheckRun_PermissionDeniedIsDistinguishable(t *testing.T) {
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	_, err := adapter.CreateCheckRun(context.Background(), "acme", "widgets", "tok", "sha1", "narvi/review", "queued", "", "t", "s")
+	_, _, err := adapter.CreateCheckRun(context.Background(), "acme", "widgets", "tok", "sha1", "narvi/review", "queued", "", "t", "s")
 	if err == nil {
 		t.Fatal("CreateCheckRun() error = nil, want a permission-denied error")
 	}
@@ -243,7 +250,7 @@ func TestCreateCheckRun_RateLimitedIsDistinguishable(t *testing.T) {
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	_, err := adapter.CreateCheckRun(context.Background(), "acme", "widgets", "tok", "sha1", "narvi/review", "queued", "", "t", "s")
+	_, _, err := adapter.CreateCheckRun(context.Background(), "acme", "widgets", "tok", "sha1", "narvi/review", "queued", "", "t", "s")
 	if err == nil {
 		t.Fatal("CreateCheckRun() error = nil, want a rate-limit error")
 	}
