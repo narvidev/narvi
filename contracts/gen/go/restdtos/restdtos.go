@@ -2638,6 +2638,28 @@ type DecisionInboxItem struct {
 	// than reclassifying the engine's judgment.
 	AcceptanceJustification DecisionInboxItemAcceptanceJustification `json:"acceptanceJustification" yaml:"acceptanceJustification" mapstructure:"acceptanceJustification"`
 
+	// A short, human-readable explanation of why acceptanceMergeable is false -- null
+	// whenever acceptanceMergeable is null or true. Never itself an instruction;
+	// display only, mirroring failureReason/lastError's own identical 'echo a short
+	// reason string, never markup' discipline.
+	AcceptanceMergeBlockedReason DecisionInboxItemAcceptanceMergeBlockedReason `json:"acceptanceMergeBlockedReason,omitempty,omitzero" yaml:"acceptanceMergeBlockedReason,omitempty" mapstructure:"acceptanceMergeBlockedReason,omitempty"`
+
+	// Round 3, finding R1 (adversarial review): whether THIS row's own acceptance
+	// actually unblocks a Merge click right now -- null whenever acceptanceId is null
+	// (the question does not apply); set (true or false) iff acceptanceId is
+	// non-null. Computed by re-running the SAME real eligibility engine that
+	// classifies Kind (internal/app/decisioninbox.computeRealEligibility), a second
+	// time, WITH the acceptance applied -- never derived from acceptanceId's own
+	// presence alone, which is exactly the defect this field exists to close: a
+	// maintainer+'s own acceptance row can exist and still leave this PR blocked on a
+	// mandatory, never-waived criterion (CI green, an open review finding, changes
+	// requested, blast radius known, a moved base...), and this field is what tells a
+	// client that BEFORE it renders a Merge button that would 409. Still
+	// best-effort/non-authoritative, exactly like Kind itself (§16.2: 'the rendered
+	// queue is never trusted as authority') -- RevalidateForMerge is re-run,
+	// unconditionally, at click time regardless of what this says.
+	AcceptanceMergeable DecisionInboxItemAcceptanceMergeable `json:"acceptanceMergeable,omitempty,omitzero" yaml:"acceptanceMergeable,omitempty" mapstructure:"acceptanceMergeable,omitempty"`
+
 	// When the acceptance named by acceptanceJustification was granted -- null under
 	// the exact same conditions acceptanceJustification is null.
 	AcceptedAt DecisionInboxItemAcceptedAt `json:"acceptedAt" yaml:"acceptedAt" mapstructure:"acceptedAt"`
@@ -2865,6 +2887,28 @@ type DecisionInboxItemAcceptanceId *string
 // ready_to_merge, because acceptance authorises a human's own Merge click rather
 // than reclassifying the engine's judgment.
 type DecisionInboxItemAcceptanceJustification *string
+
+// A short, human-readable explanation of why acceptanceMergeable is false -- null
+// whenever acceptanceMergeable is null or true. Never itself an instruction;
+// display only, mirroring failureReason/lastError's own identical 'echo a short
+// reason string, never markup' discipline.
+type DecisionInboxItemAcceptanceMergeBlockedReason *string
+
+// Round 3, finding R1 (adversarial review): whether THIS row's own acceptance
+// actually unblocks a Merge click right now -- null whenever acceptanceId is null
+// (the question does not apply); set (true or false) iff acceptanceId is non-null.
+// Computed by re-running the SAME real eligibility engine that classifies Kind
+// (internal/app/decisioninbox.computeRealEligibility), a second time, WITH the
+// acceptance applied -- never derived from acceptanceId's own presence alone,
+// which is exactly the defect this field exists to close: a maintainer+'s own
+// acceptance row can exist and still leave this PR blocked on a mandatory,
+// never-waived criterion (CI green, an open review finding, changes requested,
+// blast radius known, a moved base...), and this field is what tells a client that
+// BEFORE it renders a Merge button that would 409. Still
+// best-effort/non-authoritative, exactly like Kind itself (§16.2: 'the rendered
+// queue is never trusted as authority') -- RevalidateForMerge is re-run,
+// unconditionally, at click time regardless of what this says.
+type DecisionInboxItemAcceptanceMergeable *bool
 
 // When the acceptance named by acceptanceJustification was granted -- null under
 // the exact same conditions acceptanceJustification is null.
@@ -12909,28 +12953,6 @@ var enumValues_WorkflowStepRunStatus = []interface{}{
 	"cancelled",
 }
 
-// UnmarshalJSON implements json.Unmarshaler.
-func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
-	var v string
-	if err := json.Unmarshal(value, &v); err != nil {
-		return err
-	}
-	var ok bool
-	for _, expected := range enumValues_WorkflowStepRunStatus {
-		if reflect.DeepEqual(v, expected) {
-			ok = true
-			break
-		}
-	}
-	if !ok {
-		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_WorkflowStepRunStatus, v)
-	}
-	*j = WorkflowStepRunStatus(v)
-	return nil
-}
-
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
-
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
 // sequential turn'). Null while an awaiting_decision (hitlBefore-gated) attempt
 // exists before any turn does.
@@ -12990,5 +13012,27 @@ func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
 		return err
 	}
 	*j = WorkflowStepRun(plain)
+	return nil
+}
+
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_WorkflowStepRunStatus {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_WorkflowStepRunStatus, v)
+	}
+	*j = WorkflowStepRunStatus(v)
 	return nil
 }

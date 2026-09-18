@@ -92,6 +92,30 @@ func (rig *decisionInboxTestRig) seedAutoApprovedVerdict(ctx context.Context, t 
 	}
 }
 
+// seedReviewAttemptTurn (round 3, finding R10, adversarial review) seeds
+// a real, minimal is_review_attempt=true turn (on a throwaway session)
+// and returns its id -- HasNewerReviewAttempt now fails CLOSED
+// (hasNewer=true, "deny the waiver") whenever an acceptance's own
+// AttemptID is empty, so any fixture that seeds a verdict meaning to be
+// ACCEPTED, and later read back as currently APPLICABLE, must record a
+// real attempt id here rather than the zero pgtype.UUID{} this file used
+// before this fix -- otherwise the resulting acceptance can never
+// actually apply, exactly the residual R10's own fix accepts for a
+// verdict that genuinely carries no attempt id (a pre-migration-000130
+// row, never backfilled).
+func seedReviewAttemptTurn(ctx context.Context, t *testing.T, pool *pgxpool.Pool) pgtype.UUID {
+	t.Helper()
+	session, err := narvipg.NewSessionStore(pool).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub})
+	if err != nil {
+		t.Fatalf("seedReviewAttemptTurn: create session: %v", err)
+	}
+	turn, err := narvipg.NewTurnStore(pool).Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusCompleted, IsReviewAttempt: true})
+	if err != nil {
+		t.Fatalf("seedReviewAttemptTurn: create turn: %v", err)
+	}
+	return turn.ID
+}
+
 // seedNotShippableAutoVerdict is seedAutoApprovedVerdict's own sibling --
 // the SAME "otherwise fully eligible" shape (adequate coverage, ok
 // premise, matching base/policy context) except RiskLevel is HIGH, which
@@ -100,6 +124,14 @@ func (rig *decisionInboxTestRig) seedAutoApprovedVerdict(ctx context.Context, t 
 // fail, mirroring internal/app/decisioninbox's own identical fixture
 // (acceptance_integration_test.go). Used by F1's own reproduction test
 // below to seed a verdict an acceptance is needed to merge past.
+//
+// Records a REAL attempt id (seedReviewAttemptTurn, round 3, finding R10)
+// on the seeded review_verdicts row -- httpapi.AcceptReviewVerdict
+// forwards record.AttemptID straight onto the resulting acceptance, so
+// this is what lets that acceptance actually read as applicable
+// afterward (HasNewerReviewAttempt's own fail-closed default on an EMPTY
+// attempt id would otherwise make every acceptance created against this
+// fixture permanently inapplicable).
 func (rig *decisionInboxTestRig) seedNotShippableAutoVerdict(ctx context.Context, t *testing.T, repoFullName string, prNumber int32, headSHA string) {
 	t.Helper()
 	verdict := review.Verdict{
@@ -115,7 +147,8 @@ func (rig *decisionInboxTestRig) seedNotShippableAutoVerdict(ctx context.Context
 		t.Fatalf("seedNotShippableAutoVerdict: fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
 	}
 	verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
-	if _, err := appreviewverdict.Insert(ctx, rig.reviewVerdicts, narvipg.NewRepoSettingsStore(rig.pool), false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
+	attemptID := seedReviewAttemptTurn(ctx, t, rig.pool)
+	if _, err := appreviewverdict.Insert(ctx, rig.reviewVerdicts, narvipg.NewRepoSettingsStore(rig.pool), false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, attemptID); err != nil {
 		t.Fatalf("seed not-shippable-auto review_verdicts row for %s#%d: %v", repoFullName, prNumber, err)
 	}
 }
@@ -308,7 +341,7 @@ func newDecisionInboxTestRig(t *testing.T, sourceControl ports.SourceControl) *d
 		r.Get("/", httpapi.ListDecisionInbox(deps))
 		r.Post("/merge", httpapi.MergePullRequest(deps, sourceControl, auditLog))
 		r.Post("/accept-verdict", httpapi.AcceptReviewVerdict(pool, deps, auditLog))
-		r.Post("/revoke-verdict-acceptance", httpapi.RevokeReviewVerdictAcceptance(deps, auditLog))
+		r.Post("/revoke-verdict-acceptance", httpapi.RevokeReviewVerdictAcceptance(pool, deps, auditLog))
 	})
 
 	server := httptest.NewServer(router)

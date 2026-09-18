@@ -1802,7 +1802,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// (maintainer+, §13.3 row 5) inside the handler itself, exactly
 		// like /merge's own authz.ActionMergePR gate.
 		r.Post("/accept-verdict", httpapi.AcceptReviewVerdict(pool, decisionInboxDeps, auditLogStore))
-		r.Post("/revoke-verdict-acceptance", httpapi.RevokeReviewVerdictAcceptance(decisionInboxDeps, auditLogStore))
+		r.Post("/revoke-verdict-acceptance", httpapi.RevokeReviewVerdictAcceptance(pool, decisionInboxDeps, auditLogStore))
 	})
 
 	// /api/intent-templates, /api/intent-templates/preview (audit finding

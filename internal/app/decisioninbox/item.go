@@ -135,6 +135,37 @@ type Item struct {
 	AcceptedAt              time.Time
 	AcceptedByUserID        string
 
+	// AcceptanceMergeable/AcceptanceMergeBlockedReason (round 3, finding
+	// R1, adversarial review) answer the question a maintainer+ actually
+	// needs once they can SEE the acceptance above: does it unblock a
+	// Merge click RIGHT NOW. Set (AcceptanceMergeable to true or false)
+	// ONLY when AcceptanceID is non-empty -- both stay at their Go zero
+	// value (false, "") otherwise, mirroring FindingsUnknown's own
+	// "absent fact -> zero value" convention on this same struct. Before
+	// this fix, the client's own hasAcceptedOverride was nothing but
+	// "does an acceptance row exist", so a needs_review row with an open
+	// review finding, or one with changes requested, rendered an enabled
+	// Merge button that RevalidateForMerge would unconditionally refuse
+	// (409) -- indistinguishable, on this row, from a row an acceptance
+	// genuinely unblocks.
+	//
+	// buildPROpenItem computes this by calling computeRealEligibility a
+	// SECOND time, WITH accepted=true, reusing the identical mandatory-
+	// criteria set RevalidateForMerge itself enforces at click time (CI
+	// green, blast radius known, sensitive path, every freshness check)
+	// -- never a client-side or server-side heuristic re-deriving those
+	// criteria independently, which is exactly how this drifted from the
+	// real gate before. Still best-effort/non-authoritative, exactly
+	// like Kind itself (§16.2: "the rendered queue is never trusted as
+	// authority") -- RevalidateForMerge is re-run, unconditionally, at
+	// click time regardless of what this says; a false AcceptanceMergeable
+	// therefore only ever hides a button that might, rarely, still have
+	// worked (a live check settled favorably between this read and a
+	// hypothetical click) -- never the reverse (a shown button that
+	// 409s), which is the direction this fix exists to close.
+	AcceptanceMergeable          bool
+	AcceptanceMergeBlockedReason string
+
 	// IsRelease is true iff this PR-shaped row is a release cut (§15)
 	// whose §15.2 manifest check has already been computed and persisted
 	// -- see resolveReleaseCut's own doc comment (aggregate.go) for the

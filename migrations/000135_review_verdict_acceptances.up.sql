@@ -147,8 +147,22 @@ CREATE TABLE review_verdict_acceptances (
     -- (postgres package) for how a caller tells the two apart, and
     -- httpapi.AcceptReviewVerdict for the now-distinct
     -- review_verdict.accept_supersedes_prior audit action this column's
-    -- own 'superseded' value pairs with.
-    revocation_reason TEXT CHECK (revocation_reason IN ('explicit', 'superseded'))
+    -- own 'superseded' value pairs with. The "always set ALONGSIDE
+    -- revoked_at, never independently" pairing is enforced BELOW
+    -- (review_verdict_acceptances_revocation_reason_pairing), not merely
+    -- asserted in this comment (round 3, finding R5, adversarial review,
+    -- corrected: a previous version of this table shipped exactly the
+    -- shape round 2's own finding about the unique index warned against
+    -- -- a structural guarantee asserted in prose only, which the very
+    -- next change could have silently broken: the CHECK immediately
+    -- below this column constrained only revocation_reason's own two
+    -- literal values, never the pairing against revoked_at, so a row
+    -- with revocation_reason = 'explicit' and revoked_at IS NULL -- or
+    -- the reverse -- was always a legal insert as far as the schema was
+    -- concerned).
+    revocation_reason TEXT CHECK (revocation_reason IN ('explicit', 'superseded')),
+    CONSTRAINT review_verdict_acceptances_revocation_reason_pairing
+        CHECK ((revoked_at IS NULL) = (revocation_reason IS NULL))
 );
 
 -- Enforces "at most one active acceptance per pull request" (finding F2,

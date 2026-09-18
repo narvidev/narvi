@@ -195,6 +195,22 @@ func decisionInboxItemToDTO(it decisioninbox.Item) restdtos.DecisionInboxItem {
 			if it.AcceptedByUserID != "" {
 				dto.AcceptedBy = &it.AcceptedByUserID
 			}
+
+			// acceptanceMergeable/acceptanceMergeBlockedReason (round 3,
+			// finding R1, adversarial review): rendered under the SAME gate
+			// as the rest of this acceptance's own display data --
+			// Item.AcceptanceMergeable's own doc comment. The client used to
+			// gate its Merge button on acceptanceId's own presence alone
+			// (hasAcceptedOverride), which says nothing about whether this
+			// acceptance actually unblocks a Merge click right now -- this
+			// is the server's own answer to that question, computed by the
+			// SAME real eligibility engine RevalidateForMerge re-checks at
+			// click time.
+			acceptanceMergeable := it.AcceptanceMergeable
+			dto.AcceptanceMergeable = &acceptanceMergeable
+			if !it.AcceptanceMergeable && it.AcceptanceMergeBlockedReason != "" {
+				dto.AcceptanceMergeBlockedReason = &it.AcceptanceMergeBlockedReason
+			}
 		}
 
 		// isRelease is set unconditionally, exactly like isHandoff above --
@@ -733,14 +749,30 @@ func AcceptReviewVerdict(pool *pgxpool.Pool, deps decisioninbox.Deps, auditLog *
 		// leaving it to simply vanish from the trail the way a bare
 		// review_verdict.accept entry (naming only the NEW acceptance)
 		// used to.
+		//
+		// resourceId is prior.ID (round 3, finding R6, adversarial review,
+		// corrected: the previous version of this call filed this row
+		// under the NEW acceptance's own id, with the superseded id only
+		// inside detail_json) -- asymmetric with an explicit revoke
+		// (RevokeReviewVerdictAcceptance, above), which files ITS OWN audit
+		// row under the id of the acceptance it revoked. An audit lookup
+		// keyed on the SUPERSEDED acceptance's own id therefore showed no
+		// trace it had ever been revoked -- this row is the ONE record
+		// that a superseded acceptance was revoked at all, so it must be
+		// findable from that acceptance's own id, exactly like an explicit
+		// revoke already is. superseding_acceptance_id (renamed from the
+		// prior superseded_* detail shape, now redundant with resourceId)
+		// is what still lets a reader starting from the NEW acceptance's
+		// own id find what it superseded.
 		for _, prior := range superseded {
-			if err := auditlog.Record(ctx, auditLog.WithTx(tx), actorUserID, "review_verdict.accept_supersedes_prior", "review_verdict_acceptance", acceptance.ID, map[string]any{
-				"repo_full_name":           req.RepoFullName,
-				"pr_number":                req.PrNumber,
-				"superseded_acceptance_id": prior.ID,
-				"superseded_verdict_id":    prior.VerdictID,
-				"superseded_justification": prior.Justification,
-				"superseded_accepted_by":   prior.AcceptedByUserID,
+			if err := auditlog.Record(ctx, auditLog.WithTx(tx), actorUserID, "review_verdict.accept_supersedes_prior", "review_verdict_acceptance", prior.ID, map[string]any{
+				"repo_full_name":            req.RepoFullName,
+				"pr_number":                 req.PrNumber,
+				"verdict_id":                prior.VerdictID,
+				"justification":             prior.Justification,
+				"accepted_by":               prior.AcceptedByUserID,
+				"superseding_acceptance_id": acceptance.ID,
+				"superseding_verdict_id":    acceptance.VerdictID,
 			}); err != nil {
 				logger.Error("httpapi: record review_verdict.accept_supersedes_prior audit log failed", "error", err)
 				writeError(w, http.StatusInternalServerError, "internal error")
@@ -776,7 +808,25 @@ func AcceptReviewVerdict(pool *pgxpool.Pool, deps decisioninbox.Deps, auditLog *
 // action as AcceptReviewVerdict above -- action.go's own doc comment
 // explains why revocation is deliberately never a stricter role than
 // acceptance.
-func RevokeReviewVerdictAcceptance(deps decisioninbox.Deps, auditLog *postgres.AuditLogStore) http.HandlerFunc {
+//
+// pool (round 3, finding R3, adversarial review) is this handler's own
+// new dependency, mirroring AcceptReviewVerdict's own identical fix one
+// function up: the revoke write and its own audit log entry now commit or
+// roll back TOGETHER, inside a transaction this handler owns. Before this
+// fix, the revoke UPDATE committed on the bare pool FIRST, and the audit
+// write ran afterward, best-effort, on the bare auditLog -- a failure
+// there was logged and swallowed, and the handler still returned 200: a
+// revocation could succeed with literally no record of it ever happening.
+// §21.1b requires auditable revocation, and auditlog.Record's own doc
+// comment is explicit the audit row is "transactionally bound to the
+// change it describes... not best-effort" -- the previous version of
+// this handler was the one remaining violation of that contract in this
+// file (AcceptReviewVerdict's own supersede/accept audit writes were
+// already fixed to the identical shape). The hazard here was never a
+// torn write (a single UPDATE has no partial-failure mode of its own) --
+// it is that "revoked, but unrecorded" is indistinguishable from "never
+// revoked" to anyone auditing this table later.
+func RevokeReviewVerdictAcceptance(pool *pgxpool.Pool, deps decisioninbox.Deps, auditLog *postgres.AuditLogStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		logger := platform.Logger(ctx)
@@ -812,7 +862,15 @@ func RevokeReviewVerdictAcceptance(deps decisioninbox.Deps, auditLog *postgres.A
 			return
 		}
 
-		acceptance, ok, err := appreviewverdict.RevokeAcceptance(ctx, deps.ReviewVerdict.Acceptances, id, actorUserID, req.RepoFullName)
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			logger.Error("httpapi: revoke review verdict acceptance: begin tx failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+
+		acceptance, ok, err := appreviewverdict.RevokeAcceptance(ctx, deps.ReviewVerdict.Acceptances.WithTx(tx), id, actorUserID, req.RepoFullName)
 		if err != nil {
 			logger.Error("httpapi: revoke review verdict acceptance failed", "error", err)
 			writeError(w, http.StatusInternalServerError, "internal error")
@@ -824,8 +882,12 @@ func RevokeReviewVerdictAcceptance(deps decisioninbox.Deps, auditLog *postgres.A
 			// repo" (404) from "exists in this repo but already revoked"
 			// (409) with a follow-up read, mirroring
 			// RetireFalsePositivePattern's own identical discipline
-			// (falsepositivepatterns.go).
-			_, getOK, getErr := appreviewverdict.GetAcceptance(ctx, deps.ReviewVerdict.Acceptances, id, req.RepoFullName)
+			// (falsepositivepatterns.go). Read inside the SAME transaction
+			// (WithTx(tx)) -- no state changed on this path, so the deferred
+			// Rollback above simply discards an empty transaction either
+			// way, but reading through a different connection than the
+			// failed UPDATE just used would be an unforced inconsistency.
+			_, getOK, getErr := appreviewverdict.GetAcceptance(ctx, deps.ReviewVerdict.Acceptances.WithTx(tx), id, req.RepoFullName)
 			if getErr != nil {
 				logger.Error("httpapi: get review verdict acceptance after failed revoke failed", "error", getErr)
 				writeError(w, http.StatusInternalServerError, "internal error")
@@ -839,12 +901,25 @@ func RevokeReviewVerdictAcceptance(deps decisioninbox.Deps, auditLog *postgres.A
 			return
 		}
 
-		if err := auditlog.Record(ctx, auditLog, actorUserID, "review_verdict.revoke_acceptance", "review_verdict_acceptance", acceptance.ID, map[string]any{
+		// The audit write now runs INSIDE the same transaction as the
+		// revoke UPDATE above, and its failure aborts the whole revocation
+		// (rollback, 500) rather than being logged and ignored -- see this
+		// function's own doc comment for the full "why" (finding R3,
+		// adversarial review).
+		if err := auditlog.Record(ctx, auditLog.WithTx(tx), actorUserID, "review_verdict.revoke_acceptance", "review_verdict_acceptance", acceptance.ID, map[string]any{
 			"repo_full_name": acceptance.RepoFullName,
 			"pr_number":      acceptance.PRNumber,
 			"verdict_id":     acceptance.VerdictID,
 		}); err != nil {
 			logger.Error("httpapi: record review_verdict.revoke_acceptance audit log failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			logger.Error("httpapi: revoke review verdict acceptance: commit tx failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
 		}
 
 		writeJSON(w, http.StatusOK, reviewVerdictAcceptanceToDTO(acceptance))

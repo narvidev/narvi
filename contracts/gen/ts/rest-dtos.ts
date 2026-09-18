@@ -2436,6 +2436,14 @@ export interface DecisionInboxItem {
    */
   acceptedBy: string | null;
   /**
+   * Round 3, finding R1 (adversarial review): whether THIS row's own acceptance actually unblocks a Merge click right now -- null whenever acceptanceId is null (the question does not apply); set (true or false) iff acceptanceId is non-null. Computed by re-running the SAME real eligibility engine that classifies Kind (internal/app/decisioninbox.computeRealEligibility), a second time, WITH the acceptance applied -- never derived from acceptanceId's own presence alone, which is exactly the defect this field exists to close: a maintainer+'s own acceptance row can exist and still leave this PR blocked on a mandatory, never-waived criterion (CI green, an open review finding, changes requested, blast radius known, a moved base...), and this field is what tells a client that BEFORE it renders a Merge button that would 409. Still best-effort/non-authoritative, exactly like Kind itself (§16.2: 'the rendered queue is never trusted as authority') -- RevalidateForMerge is re-run, unconditionally, at click time regardless of what this says.
+   */
+  acceptanceMergeable?: boolean | null;
+  /**
+   * A short, human-readable explanation of why acceptanceMergeable is false -- null whenever acceptanceMergeable is null or true. Never itself an instruction; display only, mirroring failureReason/lastError's own identical 'echo a short reason string, never markup' discipline.
+   */
+  acceptanceMergeBlockedReason?: string | null;
+  /**
    * True iff this PR is a release cut (§15) whose manifest check has already been computed and persisted. Set (to true or false) for any PR-shaped row, exactly like isHandoff above -- the field a client checks to render this row's own distinct release shape (a link to the release-review screen, never a Merge button: a release cut always renders under kind=needs_review) instead of the ordinary PR shape. A PR that a release-branch-pattern/label WOULD classify as a release cut but that Narvi has not yet reviewed (or reviewed too recently for the background check to have finished) renders false here -- an honest, temporary gap, never a fabricated one.
    */
   isRelease: boolean | null;

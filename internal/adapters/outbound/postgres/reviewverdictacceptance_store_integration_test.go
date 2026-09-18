@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -310,4 +311,167 @@ func TestReviewVerdictAcceptanceStore_Insert_ConcurrentAccept_ExactlyOneActive(t
 	if activeCount != 1 {
 		t.Errorf("active row count = %d, want exactly 1 -- review_verdict_acceptances_one_active_idx must guarantee at most one active row even under concurrent accepts racing the SAME pull request", activeCount)
 	}
+}
+
+// TestReviewVerdictAcceptanceStore_Revoke_ScopedToRepo pins finding R9
+// (round 3, adversarial review): RevokeReviewVerdictAcceptance's own
+// repo_full_name predicate (queries/reviewverdictacceptances.sql) is the
+// ONE thing stopping a revoke request that names the WRONG repository
+// from revoking an acceptance that actually belongs to a DIFFERENT one --
+// naming the right id but the wrong repo must behave exactly like the id
+// does not exist at all (pgx.ErrNoRows), never revoke the row anyway.
+// Before this test, neutralising that predicate in the generated SQL
+// (dropping the "AND repo_full_name = $3" clause) left this table's
+// entire acceptance suite green across httpapi/decisioninbox/postgres --
+// mutation-verified directly against real Postgres (see this test's own
+// commit message / PR body for the exact break-test-restore log).
+func TestReviewVerdictAcceptanceStore_Revoke_ScopedToRepo(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	verdicts := narvipg.NewReviewVerdictStore(pool)
+	acceptances := narvipg.NewReviewVerdictAcceptanceStore(pool)
+	users := narvipg.NewUserStore(pool)
+	const ownedRepo = "acme/revoke-scope-owner"
+	const attackerRepo = "acme/revoke-scope-attacker"
+	const prNumber = int32(1)
+
+	maintainer, err := users.Create(ctx, sqlcgen.CreateUserParams{PrimaryEmail: "revoke-scope@example.com", DisplayName: "Maintainer", Role: sqlcgen.UserRoleMaintainer})
+	if err != nil {
+		t.Fatalf("create maintainer: %v", err)
+	}
+	verdict := insertReviewVerdictAcceptanceStoreVerdict(ctx, t, verdicts, ownedRepo, prNumber, "sha-revoke-scope")
+	created, _, err := acceptances.Insert(ctx, reviewVerdictAcceptanceParams(ownedRepo, prNumber, verdict, "accepted in the owning repo", maintainer.ID))
+	if err != nil {
+		t.Fatalf("insert acceptance: %v", err)
+	}
+
+	// THE DECISIVE CALL: the SAME id, but a repoFullName naming a
+	// DIFFERENT repository -- this must behave exactly like the id does
+	// not exist at all.
+	if _, err := acceptances.Revoke(ctx, created.ID, maintainer.ID, attackerRepo); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("Revoke() scoped to a DIFFERENT repo: error = %v, want pgx.ErrNoRows -- the repo_full_name predicate must refuse this exactly like an unknown id", err)
+	}
+
+	// The acceptance must still be untouched -- a cross-repo revoke
+	// attempt must never have any side effect on the row it named.
+	active, err := acceptances.GetActive(ctx, ownedRepo, prNumber)
+	if err != nil {
+		t.Fatalf("GetActive after cross-repo revoke attempt: error = %v, want nil (still active)", err)
+	}
+	if active.ID != created.ID || active.RevokedAt.Valid {
+		t.Errorf("acceptance after cross-repo revoke attempt: id=%v revokedAt.Valid=%v, want the SAME row, still non-revoked", active.ID, active.RevokedAt.Valid)
+	}
+}
+
+// TestReviewVerdictAcceptanceStore_Get_ScopedToRepo is Revoke's own
+// identical R9 sibling for GetReviewVerdictAcceptance -- the read
+// RevokeReviewVerdictAcceptance's own failed-revoke diagnosis path
+// (httpapi.RevokeReviewVerdictAcceptance) uses to tell "never existed in
+// this repo" (404) apart from "exists in this repo but already revoked"
+// (409). Without this query's own repo_full_name scoping, a request
+// naming the WRONG repository but a REAL acceptance id from a different
+// one would read that acceptance back (404 would silently become 409, an
+// accurate-sounding but wrong diagnosis for a request that named a
+// nonexistent row IN ITS OWN REPO), rather than reporting "no such
+// acceptance in this repo" -- mirrors GetFalsePositivePattern's own
+// identical audit-fix precedent this query's own doc comment cites.
+func TestReviewVerdictAcceptanceStore_Get_ScopedToRepo(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	verdicts := narvipg.NewReviewVerdictStore(pool)
+	acceptances := narvipg.NewReviewVerdictAcceptanceStore(pool)
+	users := narvipg.NewUserStore(pool)
+	const ownedRepo = "acme/get-scope-owner"
+	const attackerRepo = "acme/get-scope-attacker"
+	const prNumber = int32(1)
+
+	maintainer, err := users.Create(ctx, sqlcgen.CreateUserParams{PrimaryEmail: "get-scope@example.com", DisplayName: "Maintainer", Role: sqlcgen.UserRoleMaintainer})
+	if err != nil {
+		t.Fatalf("create maintainer: %v", err)
+	}
+	verdict := insertReviewVerdictAcceptanceStoreVerdict(ctx, t, verdicts, ownedRepo, prNumber, "sha-get-scope")
+	created, _, err := acceptances.Insert(ctx, reviewVerdictAcceptanceParams(ownedRepo, prNumber, verdict, "accepted in the owning repo", maintainer.ID))
+	if err != nil {
+		t.Fatalf("insert acceptance: %v", err)
+	}
+
+	if _, err := acceptances.Get(ctx, created.ID, attackerRepo); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("Get() scoped to a DIFFERENT repo: error = %v, want pgx.ErrNoRows -- the repo_full_name predicate must refuse this exactly like an unknown id", err)
+	}
+
+	// Confirmed reachable via its own actual repo, ruling out a typo in
+	// this test's own fixture as the reason the cross-repo read above
+	// found nothing.
+	if _, err := acceptances.Get(ctx, created.ID, ownedRepo); err != nil {
+		t.Fatalf("Get() scoped to the OWNING repo: error = %v, want nil", err)
+	}
+}
+
+// TestReviewVerdictAcceptances_RevocationReasonPairingEnforced pins
+// finding R5 (round 3, adversarial review): revocation_reason's own CHECK
+// constrains only its two literal values ('explicit'/'superseded') --
+// this table's own migration doc comment separately claims "NULL while
+// active (revoked_at IS NULL); always set ALONGSIDE revoked_at, never
+// independently", but nothing enforced THAT pairing until
+// review_verdict_acceptances_revocation_reason_pairing was added
+// (migrations/000135_review_verdict_acceptances.up.sql) -- the identical
+// shape round 2's own finding flagged for the unique index: "a structural
+// guarantee that is asserted in prose and not enforced is a guarantee the
+// next change removes silently." Both mismatched directions are proven
+// directly against real Postgres, bypassing every Go-side write path
+// (InsertReviewVerdictAcceptance/SupersedeActiveReviewVerdictAcceptances/
+// RevokeReviewVerdictAcceptance) entirely, since the whole point is a
+// SCHEMA-level guarantee that must hold regardless of which write path
+// (current or future) produces the row.
+func TestReviewVerdictAcceptances_RevocationReasonPairingEnforced(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	verdicts := narvipg.NewReviewVerdictStore(pool)
+	const repoFullName = "acme/revocation-reason-pairing"
+	const prNumber = int32(1)
+
+	verdict := insertReviewVerdictAcceptanceStoreVerdict(ctx, t, verdicts, repoFullName, prNumber, "sha-pairing")
+
+	insertRaw := func(revokedAtExpr, revocationReasonExpr string) error {
+		_, err := pool.Exec(ctx, `
+			INSERT INTO review_verdict_acceptances (
+				repo_full_name, pr_number, verdict_id, head_sha, ancestor_chain,
+				reason, justification, revoked_at, revocation_reason
+			) VALUES ($1, $2, $3, $4, '[]'::jsonb, $5, $6, `+revokedAtExpr+`, `+revocationReasonExpr+`)`,
+			repoFullName, prNumber, verdict.ID, verdict.HeadSha, "the verdict's shippable classification is not auto", "raw-sql pairing test",
+		)
+		return err
+	}
+
+	t.Run("revoked_at set, revocation_reason NULL -- must be rejected", func(t *testing.T) {
+		err := insertRaw("now()", "NULL")
+		if err == nil {
+			t.Fatal("INSERT with revoked_at set and revocation_reason NULL succeeded, want a CHECK-constraint violation")
+		}
+		if !strings.Contains(err.Error(), "review_verdict_acceptances_revocation_reason_pairing") {
+			t.Errorf("error = %v, want it to name review_verdict_acceptances_revocation_reason_pairing", err)
+		}
+	})
+
+	t.Run("revoked_at NULL, revocation_reason set -- must be rejected", func(t *testing.T) {
+		err := insertRaw("NULL", "'explicit'")
+		if err == nil {
+			t.Fatal("INSERT with revoked_at NULL and revocation_reason set succeeded, want a CHECK-constraint violation")
+		}
+		if !strings.Contains(err.Error(), "review_verdict_acceptances_revocation_reason_pairing") {
+			t.Errorf("error = %v, want it to name review_verdict_acceptances_revocation_reason_pairing", err)
+		}
+	})
+
+	t.Run("both NULL (active, never revoked) -- allowed", func(t *testing.T) {
+		if err := insertRaw("NULL", "NULL"); err != nil {
+			t.Fatalf("INSERT with both NULL: error = %v, want nil (this is the ordinary active-acceptance shape)", err)
+		}
+	})
+
+	t.Run("both set (revoked, with a reason) -- allowed", func(t *testing.T) {
+		if err := insertRaw("now()", "'superseded'"); err != nil {
+			t.Fatalf("INSERT with both set: error = %v, want nil (this is the ordinary revoked-acceptance shape)", err)
+		}
+	})
 }

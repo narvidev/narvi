@@ -19,17 +19,30 @@ import (
 // granted against run since", directly against turns, regardless of
 // whether that newer attempt ever posted a verdict.
 //
-// acceptance.AttemptID == "" (a pre-attempt-tracking acceptance/verdict --
-// review_verdicts.attempt_id is nullable, migrations/000130) degrades to
-// (false, nil): there is nothing to compare against, so this reduces to
-// the SAME verdict-id-only check Applicable performed before this fix --
-// an accepted, documented residual for data that predates attempt
-// tracking, never a hole this fix reopens for current data (every
-// CURRENT accept path, httpapi.AcceptReviewVerdict, always supplies a
-// real attempt id when the accepted verdict's own Record.AttemptID is
-// non-empty).
+// acceptance.AttemptID == "" (round 3, finding R10, adversarial review,
+// CORRECTED: a previous version of this function returned (false, nil)
+// here -- "no newer attempt", the exact opposite of every OTHER path
+// below, which all fail CLOSED) now degrades to (true, err=nil) instead,
+// mirroring turns == nil/a parse failure/a store error immediately below.
+// Two verifiers confirmed this degenerate input is unreachable through
+// any CURRENT writer: the sole production writer of review_verdicts
+// always supplies the dispatched turn's own id, the sole creator of
+// acceptances (httpapi.AcceptReviewVerdict) copies it straight through,
+// and turns/sessions are never deleted anywhere in this codebase, so the
+// attempt_id column's own ON DELETE SET NULL route is dead. But their own
+// analysis conceded the one population that DOES reach this branch: a
+// review_verdicts row written before the migration that added attempt_id
+// (migrations/000130), which was never backfilled -- an acceptance bound
+// to such a verdict carries AttemptID == "" and, under the PREVIOUS
+// fail-OPEN default here, became permanently immune to attempt-based
+// invalidation (the exact defect this whole mechanism exists to close,
+// §21.1b: "a new attempt... makes it inapplicable"). The residual this
+// fix accepts instead: such an acceptance can never actually apply
+// (Applicable's own final `!hasNewerAttempt` always false) -- a verdict
+// with no attempt id on record must be re-reviewed before its refusal can
+// be accepted at all, never silently waived forever.
 //
-// turns == nil, or a genuine store error, degrades to (true, err) --
+// turns == nil, or a genuine store error, ALSO degrades to (true, err) --
 // deliberately fail CLOSED: the safe default here is the one that DENIES
 // the waiver, never one that silently grants an acceptance this
 // deployment cannot actually confirm is still fresh. A caller that
@@ -43,7 +56,7 @@ import (
 // answer either way.
 func HasNewerReviewAttempt(ctx context.Context, turns *postgres.TurnStore, acceptance reviewverdict.Acceptance) (bool, error) {
 	if acceptance.AttemptID == "" {
-		return false, nil
+		return true, nil
 	}
 	if turns == nil {
 		return true, nil

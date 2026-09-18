@@ -219,6 +219,30 @@ export function hasAcceptedOverride(item: Pick<DecisionInboxItem, 'acceptanceId'
 }
 
 /**
+ * canMergeViaAcceptance answers a DIFFERENT question than hasAcceptedOverride
+ * above (round 3, finding R1, adversarial review, corrected: a previous
+ * version of DecisionInboxView.tsx's own Merge-button gate used
+ * hasAcceptedOverride for this too, which is nothing but "does an
+ * acceptance row exist" -- true the instant a maintainer+ accepts a
+ * verdict, regardless of whether that acceptance can actually unblock a
+ * merge). This client never infers mergeability itself: acceptanceMergeable
+ * is the SERVER's own answer (decisioninbox.Item.AcceptanceMergeable,
+ * computed by re-running the real eligibility engine WITH the acceptance
+ * applied, aggregate.go), null whenever acceptanceId is null (the
+ * question does not apply) and otherwise true only when every mandatory,
+ * never-waived criterion (CI green, no open finding, no changes
+ * requested, blast radius known, every freshness check...) ALSO holds --
+ * an acceptance row existing says nothing about that on its own. Before
+ * this fix, a needs_review row with an open review finding, or one with
+ * changes requested (prChipData's own adjacent, mandatory-blocker chips),
+ * rendered an enabled Merge button purely because acceptanceId was set --
+ * a button RevalidateForMerge would unconditionally 409 on click.
+ */
+export function canMergeViaAcceptance(item: Pick<DecisionInboxItem, 'acceptanceId' | 'acceptanceMergeable'>): boolean {
+  return item.acceptanceId !== null && item.acceptanceMergeable === true
+}
+
+/**
  * releaseChipData builds the mockup's own `.chip` sequence for a release-
  * cut row ("manifest: 3 flags") -- deliberately NOT prChipData's own
  * riskLabel/findings chips, which describe an ordinary code-review

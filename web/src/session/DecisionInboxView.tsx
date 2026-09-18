@@ -33,13 +33,26 @@
 //
 // item.title (a PR/plan/session/automation title), repoFullName,
 // provenanceRepoFullName/provenancePattern (a CODEOWNERS pattern),
-// failureReason, artifactSummary, and lastError are ALL third-party or
-// model-influenced free text (a PR title is GitHub-author-controlled; a
-// CODEOWNERS pattern is a repo-author-controlled string; failureReason/
-// lastError can echo arbitrary upstream error text) -- every one of them
-// renders through the plain-text T component below (truncateForDisplay,
-// mirroring AutomationsView.tsx's own AutomationRow / MembersPanel.tsx's
-// own MemberRow precedent exactly), never dangerouslySetInnerHTML.
+// failureReason, artifactSummary, lastError, acceptanceJustification (the
+// accepting maintainer+'s own free-text justification, §21.1b -- round 3,
+// finding R8, adversarial review: added when this field started being
+// rendered, round 2, but this accounting was never updated to name it),
+// and acceptanceMergeBlockedReason (a short, SERVER-composed reason
+// string, round 3, finding R1 -- never itself free text a THIRD party
+// authors, but rendered through the identical T path anyway, since
+// nothing here distinguishes "server-composed" from "third-party" at the
+// render call site) are ALL third-party or model-influenced free text (a
+// PR title is GitHub-author-controlled; a CODEOWNERS pattern is a
+// repo-author-controlled string; failureReason/lastError can echo
+// arbitrary upstream error text) -- every one of them renders through the
+// plain-text T component below (truncateForDisplay, mirroring
+// AutomationsView.tsx's own AutomationRow / MembersPanel.tsx's own
+// MemberRow precedent exactly), never dangerouslySetInnerHTML.
+// acceptedBy is a raw user id (a UUID string), never resolved to a
+// display name -- mirrors restdtos.Plan.decidedBy/PlanModeView.tsx's own
+// identical precedent, rendered through T anyway for consistency with
+// every other field on this row, though it carries no injection risk of
+// its own.
 // htmlUrl is the ONLY field that ever becomes an href, and only after
 // isSafeHref (urlSafety.ts) accepts it -- mirrors SessionRail.tsx's own
 // ArtifactRow precedent, including its identical "link unavailable"
@@ -57,6 +70,7 @@ import { meQueryOptions } from '../auth/session'
 import { AUTO_PAUSE_THRESHOLD } from './automationFormat'
 import {
   canMergeDecisionInboxItem,
+  canMergeViaAcceptance,
   formatAgeSeconds,
   formatDecisionLatencySeconds,
   hasAcceptedOverride,
@@ -368,9 +382,38 @@ export function DecisionInboxRow({ item, canMerge }: { item: DecisionInboxItem; 
         (MergeButton's own doc comment: "the real gate is server-side...
         re-checked unconditionally at click time"), so offering it here is
         never unsafe -- it was simply never OFFERED before this fix.
+
+        Round 3, finding R1 (adversarial review, corrected): this used to
+        gate on hasAcceptedOverride(item) alone -- "an acceptance row
+        exists" -- which rendered an enabled Merge button on a PR the
+        server refuses UNCONDITIONALLY (an open review finding, changes
+        requested...), since an acceptance row existing says nothing about
+        whether it actually unblocks anything. canMergeViaAcceptance
+        (decisionInboxFormat.ts) is the fix: this client never infers
+        mergeability itself, it reads the SERVER's own answer
+        (acceptanceMergeable, computed by re-running the real eligibility
+        engine WITH the acceptance applied). See the "why not" text a few
+        lines down for what a maintainer sees INSTEAD of the button on a
+        row this still refuses.
       */}
-      {(item.kind === 'ready_to_merge' || (kind === 'pr' && item.kind === 'needs_review' && hasAcceptedOverride(item))) && (
+      {(item.kind === 'ready_to_merge' || (kind === 'pr' && item.kind === 'needs_review' && canMergeViaAcceptance(item))) && (
         <MergeButton item={item} canMerge={canMerge} />
+      )}
+      {/*
+        The "if not, why" half of finding R1: a row WITH an acceptance
+        that still does not unblock Merge (canMergeViaAcceptance false)
+        must not simply render nothing where the button would have been
+        -- that reads as "no acceptance was ever granted", the exact
+        confusion the "accepted override" chip above already exists to
+        dispel. acceptanceMergeBlockedReason is the server's own honest
+        reason (Item.AcceptanceMergeBlockedReason's own doc comment,
+        server-side); through T like every other untrusted string on this
+        row.
+      */}
+      {kind === 'pr' && item.kind === 'needs_review' && hasAcceptedOverride(item) && !canMergeViaAcceptance(item) && item.acceptanceMergeBlockedReason !== null && (
+        <span className="qwhy" title="This acceptance does not currently unblock a merge">
+          <T text={`Still blocked: ${item.acceptanceMergeBlockedReason}`} />
+        </span>
       )}
       {/*
         Open review links into Narvi's own code-review screen, but ONLY
@@ -417,10 +460,38 @@ export function DecisionInboxRow({ item, canMerge }: { item: DecisionInboxItem; 
         set -- acceptanceJustification's own nullability already mirrors
         that same gate server-side (DecisionInboxItem.acceptanceJustification's
         own doc comment).
+
+        Round 3, finding R7 (adversarial review): round 2 added
+        acceptedBy/acceptedAt to the wire (Item.AcceptedByUserID's own doc
+        comment: "the missing 'by whom'") but nothing here ever rendered
+        either -- this line still read as anonymous and undated, the
+        exact gap that addition claimed to close. acceptedBy renders
+        through T like every other string on this row, never resolved to
+        a display name: mirrors this codebase's own established
+        precedent for a raw user-id wire field on a sibling DTO
+        (restdtos.Plan.decidedBy/PlanModeView.tsx, restdtos.
+        WorkflowStepRun.decidedBy/WorkflowRunsView.tsx's own StepRunCard)
+        -- neither resolves the id to a name either; a future surface
+        that DOES resolve user ids to display names should update all
+        three together, never just this one. acceptedAt mirrors
+        WorkflowRunsView.tsx's own identical
+        `new Date(stepRun.decidedAt).toLocaleString()` formatting.
+        acceptedBy is independently nullable from acceptanceJustification
+        (Item.AcceptedByUserID's own doc comment: the accepting user's
+        row can be deleted after the fact, ON DELETE SET NULL) so it gets
+        its own null check, never assumed present just because
+        acceptanceJustification is.
       */}
       {kind === 'pr' && hasAcceptedOverride(item) && item.acceptanceJustification !== null && (
         <span className="qwhy">
           <T text={`Accepted despite refusal: ${item.acceptanceJustification}`} />
+          {item.acceptedBy !== null && (
+            <>
+              {' — by '}
+              <T text={item.acceptedBy} />
+            </>
+          )}
+          {item.acceptedAt !== null && ` · ${new Date(item.acceptedAt).toLocaleString()}`}
         </span>
       )}
       {kind === 'session' && (

@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -1326,6 +1327,32 @@ func decisionInboxActorFixture(ctx context.Context, t *testing.T, pool *pgxpool.
 	return actor
 }
 
+// seedReviewAttemptTurn (round 3, finding R10, adversarial review) seeds
+// a real, minimal is_review_attempt=true turn (on a throwaway session)
+// and returns its id -- HasNewerReviewAttempt now fails CLOSED
+// (hasNewer=true, "deny the waiver") whenever an acceptance's own
+// AttemptID is empty, so any fixture that means to create a CURRENTLY
+// APPLICABLE acceptance (this package's own tests that assert
+// Applicable()==true, ok=true via acceptance, or AcceptanceID/
+// AcceptanceMergeable being set on a Build() Item) must record a real
+// attempt id here rather than the zero pgtype.UUID{} many of these
+// fixtures used before this fix -- otherwise Applicable's own final
+// `!hasNewerAttempt` is unconditionally false, and the acceptance can
+// never actually apply, regardless of what else this test means to
+// isolate.
+func seedReviewAttemptTurn(ctx context.Context, t *testing.T, pool *pgxpool.Pool) pgtype.UUID {
+	t.Helper()
+	session, err := narvipg.NewSessionStore(pool).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub})
+	if err != nil {
+		t.Fatalf("seedReviewAttemptTurn: create session: %v", err)
+	}
+	turn, err := narvipg.NewTurnStore(pool).Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusCompleted, IsReviewAttempt: true})
+	if err != nil {
+		t.Fatalf("seedReviewAttemptTurn: create turn: %v", err)
+	}
+	return turn.ID
+}
+
 // TestBuild_HasChangesRequestedDemotesFromReadyToMerge is the read-path
 // regression test proving that buildPROpenItem consults
 // HasChangesRequested when classifying Kind, since it is a HARD merge
@@ -1943,6 +1970,7 @@ func TestBuild_AcceptedVerdict_BaseMoved_HidesStaleAcceptance(t *testing.T) {
 		RepoFullName:  repoFullName,
 		PRNumber:      42,
 		VerdictID:     verdictID,
+		AttemptID:     seedReviewAttemptTurn(ctx, t, pool),
 		HeadSHA:       "sha42",
 		Context:       verdictContext,
 		Reason:        string(autoapproval.ReasonNotShippableAuto),
@@ -1978,7 +2006,7 @@ func TestBuild_AcceptedVerdict_BaseMoved_HidesStaleAcceptance(t *testing.T) {
 		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
 		TokenEncryptionKey: tokenKey,
 		Timeouts:           platform.DefaultTimeouts(),
-		ReviewVerdict:      appreviewverdict.Deps{ReviewVerdicts: reviewVerdicts, RepoSettings: repoSettingsStore, ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool), Acceptances: acceptances, Timeouts: platform.DefaultTimeouts()},
+		ReviewVerdict:      appreviewverdict.Deps{ReviewVerdicts: reviewVerdicts, RepoSettings: repoSettingsStore, ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool), Acceptances: acceptances, Turns: narvipg.NewTurnStore(pool), Timeouts: platform.DefaultTimeouts()},
 	}
 
 	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
@@ -2003,6 +2031,474 @@ func TestBuild_AcceptedVerdict_BaseMoved_HidesStaleAcceptance(t *testing.T) {
 	}
 	if !ok || stillActive.Revoked() {
 		t.Fatal("GetActiveAcceptance: ok = false or Revoked() = true, want an active, non-revoked row -- this test's own point is that the base move ALONE hides it from the read model, not revocation")
+	}
+}
+
+// TestBuild_AcceptedVerdict_HeadMoved_HidesStaleAcceptance pins finding R2
+// (round 3, adversarial review): a PUSH -- with no new review attempt yet
+// dispatched (the auto-retrigger is debounced and capped by
+// reviewAutoRetriggerBudget, so once that budget is spent no new attempt
+// EVER arrives to invalidate the acceptance) -- must ALSO hide a stale
+// acceptance, exactly like a moved base already does above. Before this
+// fix, buildPROpenItem's own acceptance-display condition compared only
+// acceptance.Applicable(record.ID, hasNewerAttempt) (unaffected by a
+// push with no new attempt: record.ID stays the SAME latest verdict, and
+// hasNewerAttempt stays false) and acceptanceContextStillFresh's own
+// base-ref/ancestor-chain check (ALSO unaffected here: both stay
+// unchanged from the accepted verdict) -- so BOTH passed, and the row
+// kept rendering this acceptance as active even though its own recorded
+// head_sha no longer matched the PR's live HeadSHA, which
+// autoapproval.ComputeEligible's own unconditional ReasonStaleVerdict
+// check (checked BEFORE, and never waived by, the acceptance-waivable
+// criteria) would refuse on at merge time.
+//
+// Mutation-test target: deleting the `record.HeadSHA == pr.HeadSHA`
+// conjunct from buildPROpenItem's own acceptance-display condition
+// (aggregate.go) must turn this test's own "acceptance hidden" assertion
+// from a pass back into a failure (the row would then render the stale
+// acceptance again) -- mirrors TestBuild_AcceptedVerdict_BaseMoved_
+// HidesStaleAcceptance's own identical mutation-test-target discipline,
+// immediately above, for the ref-level half of this same guard.
+func TestBuild_AcceptedVerdict_HeadMoved_HidesStaleAcceptance(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+
+	const actorGitHubExternalID = "4004"
+	tokenKey := []byte("01234567890123456789012345678901")
+	actor := decisionInboxActorFixture(ctx, t, pool, "r2-actor@example.com", actorGitHubExternalID, tokenKey)
+
+	artifacts := narvipg.NewArtifactStore(pool)
+	const htmlURL = "https://github.com/acme/widgets/pull/43"
+	const repoFullName = "acme/widgets"
+	platformSession, err := narvipg.NewSessionStore(pool).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub, CreatedBy: actor.ID})
+	if err != nil {
+		t.Fatalf("create platform session: %v", err)
+	}
+	if _, err := artifacts.Create(ctx, sqlcgen.CreateArtifactParams{
+		SessionID: platformSession.ID, Type: sqlcgen.ArtifactTypePr, Url: htmlURL, Metadata: []byte("{}"),
+	}); err != nil {
+		t.Fatalf("mark PR #43 platform-authored: %v", err)
+	}
+
+	// A high-risk (not Shippable=auto) verdict, otherwise fully eligible,
+	// recorded against testEligibleBaseRef/testEligibleBaseSHA and head
+	// sha43 -- mirrors TestBuild_AcceptedVerdict_BaseMoved_
+	// HidesStaleAcceptance's own identical fixture shape above, EXCEPT
+	// only the head sha differs below (base ref/sha and ancestor chain
+	// stay unchanged on both sides) -- isolating the head-SHA half of
+	// "a new attempt, a moved base, or a changed ancestor chain" from the
+	// ref-level half that test already pins.
+	reviewVerdicts := narvipg.NewReviewVerdictStore(pool)
+	repoSettingsStore := narvipg.NewRepoSettingsStore(pool)
+	acceptances := narvipg.NewReviewVerdictAcceptanceStore(pool)
+	verdict := review.Verdict{
+		RiskLevel:         review.RiskLevelHigh,
+		Premise:           review.PremiseStateOK,
+		TestsCoverage:     review.TestsCoverageStateAdequate,
+		DocsDrift:         review.DocsDriftStateNone,
+		ProposedShippable: review.ProposedShippableNeedsHuman,
+		FilesChanged:      3,
+	}
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	if verdict.Shippable == review.ShippableAuto {
+		t.Fatalf("fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
+	}
+	verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
+	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, 43, "sha43", pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{})
+	if err != nil {
+		t.Fatalf("seed not-shippable-auto review_verdicts row: %v", err)
+	}
+
+	var verdictID pgtype.UUID
+	if err := verdictID.Scan(record.ID); err != nil {
+		t.Fatalf("scan verdict id: %v", err)
+	}
+	if _, _, err := appreviewverdict.Accept(ctx, acceptances, appreviewverdict.AcceptInput{
+		RepoFullName:  repoFullName,
+		PRNumber:      43,
+		VerdictID:     verdictID,
+		AttemptID:     seedReviewAttemptTurn(ctx, t, pool),
+		HeadSHA:       "sha43",
+		Context:       verdictContext,
+		Reason:        string(autoapproval.ReasonNotShippableAuto),
+		Justification: "Accepted -- about to become stale via a push, no new attempt yet dispatched.",
+		AcceptedBy:    actor.ID,
+	}); err != nil {
+		t.Fatalf("Accept() error = %v, want nil", err)
+	}
+
+	// The live PR's own head sha has MOVED (a push) relative to what was
+	// accepted -- base ref/sha are UNCHANGED, and nobody revoked the
+	// acceptance, so acceptanceContextStillFresh's own ref-level check
+	// alone would still pass this row through.
+	fakeSCM := &fakeDecisionInboxSourceControl{
+		openPRsByExternalID: map[string][]ports.OpenPR{
+			actorGitHubExternalID: {
+				{
+					Owner: "acme", Repo: "widgets", Number: 43, Title: "accepted, then pushed",
+					HTMLURL: htmlURL, HeadSHA: "sha43-pushed",
+					BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
+					Assignees:    []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}},
+					CIConclusion: ports.CIConclusionSuccess,
+					CreatedAt:    time.Now(),
+				},
+			},
+		},
+	}
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict:      appreviewverdict.Deps{ReviewVerdicts: reviewVerdicts, RepoSettings: repoSettingsStore, ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool), Acceptances: acceptances, Turns: narvipg.NewTurnStore(pool), Timeouts: platform.DefaultTimeouts()},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil", err)
+	}
+
+	pr43 := findItemByPR(result.Items, 43)
+	if pr43 == nil {
+		t.Fatal("PR #43 missing from the inbox entirely")
+	}
+	if pr43.AcceptanceJustification != "" || pr43.AcceptanceID != "" || !pr43.AcceptedAt.IsZero() {
+		t.Errorf("PR #43 (head moved since acceptance, no new attempt) still renders an acceptance -- AcceptanceID=%q AcceptanceJustification=%q AcceptedAt=%v, want all absent: a moved head makes this acceptance inapplicable, and the row must not tell a human otherwise", pr43.AcceptanceID, pr43.AcceptanceJustification, pr43.AcceptedAt)
+	}
+
+	// Confirm this is genuinely the "moved head, no new attempt" case,
+	// not "nobody revoked it happened to also be gone" -- GetActiveAcceptance
+	// must still report the SAME row as active underneath.
+	stillActive, ok, err := appreviewverdict.GetActiveAcceptance(ctx, acceptances, repoFullName, 43)
+	if err != nil {
+		t.Fatalf("GetActiveAcceptance: error = %v, want nil", err)
+	}
+	if !ok || stillActive.Revoked() {
+		t.Fatal("GetActiveAcceptance: ok = false or Revoked() = true, want an active, non-revoked row -- this test's own point is that the head move ALONE hides it from the read model, not revocation")
+	}
+}
+
+// TestBuild_AcceptedVerdict_AncestorChainChanged_HidesStaleAcceptance
+// pins finding R4 (round 3, adversarial review): acceptanceContextStillFresh's
+// own ancestor-chain-length comparison (aggregate.go) had NO regression
+// test of its own -- it could be deleted outright with the whole suite
+// still green, even though the function's own doc comment and
+// TestBuild_AcceptedVerdict_BaseMoved_HidesStaleAcceptance's own doc
+// comment (immediately above) advertise it as a mutation-test target
+// alongside the base-ref half, which THAT test actually exercises. This
+// test isolates the ancestor-chain half specifically: base ref/sha and
+// head sha all stay UNCHANGED between the accepted verdict and the live
+// PR -- only the ancestor chain differs (the verdict was recorded while
+// this PR was stacked on a parent branch; the live PR now reports no
+// stack at all, a length mismatch acceptanceContextStillFresh's own
+// `len(recordContext.AncestorChain) != len(pr.AncestorChain)` check
+// exists to catch).
+//
+// Mutation-test target: deleting acceptanceContextStillFresh's own
+// ancestor-chain comparison (both the length check and the per-link Ref
+// loop, aggregate.go) must turn this test's own "acceptance hidden"
+// assertion from a pass back into a failure.
+func TestBuild_AcceptedVerdict_AncestorChainChanged_HidesStaleAcceptance(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+
+	const actorGitHubExternalID = "4005"
+	tokenKey := []byte("01234567890123456789012345678901")
+	actor := decisionInboxActorFixture(ctx, t, pool, "r4-actor@example.com", actorGitHubExternalID, tokenKey)
+
+	artifacts := narvipg.NewArtifactStore(pool)
+	const htmlURL = "https://github.com/acme/widgets/pull/44"
+	const repoFullName = "acme/widgets"
+	platformSession, err := narvipg.NewSessionStore(pool).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub, CreatedBy: actor.ID})
+	if err != nil {
+		t.Fatalf("create platform session: %v", err)
+	}
+	if _, err := artifacts.Create(ctx, sqlcgen.CreateArtifactParams{
+		SessionID: platformSession.ID, Type: sqlcgen.ArtifactTypePr, Url: htmlURL, Metadata: []byte("{}"),
+	}); err != nil {
+		t.Fatalf("mark PR #44 platform-authored: %v", err)
+	}
+
+	reviewVerdicts := narvipg.NewReviewVerdictStore(pool)
+	repoSettingsStore := narvipg.NewRepoSettingsStore(pool)
+	acceptances := narvipg.NewReviewVerdictAcceptanceStore(pool)
+	verdict := review.Verdict{
+		RiskLevel:         review.RiskLevelHigh,
+		Premise:           review.PremiseStateOK,
+		TestsCoverage:     review.TestsCoverageStateAdequate,
+		DocsDrift:         review.DocsDriftStateNone,
+		ProposedShippable: review.ProposedShippableNeedsHuman,
+		FilesChanged:      3,
+	}
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	if verdict.Shippable == review.ShippableAuto {
+		t.Fatalf("fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
+	}
+	// The verdict was recorded while this PR was STACKED on a parent
+	// branch -- verdictContext.AncestorChain carries ONE link.
+	verdictContext := reviewverdict.Context{
+		BaseRef:       testEligibleBaseRef,
+		BaseSHA:       testEligibleBaseSHA,
+		AncestorChain: []review.AncestorLink{{Ref: "feature/stack-parent", SHA: "sha-stack-parent"}},
+		PolicyVersion: autoapproval.CurrentPolicyVersion,
+	}
+	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, 44, "sha44", pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{})
+	if err != nil {
+		t.Fatalf("seed not-shippable-auto review_verdicts row: %v", err)
+	}
+
+	var verdictID pgtype.UUID
+	if err := verdictID.Scan(record.ID); err != nil {
+		t.Fatalf("scan verdict id: %v", err)
+	}
+	if _, _, err := appreviewverdict.Accept(ctx, acceptances, appreviewverdict.AcceptInput{
+		RepoFullName:  repoFullName,
+		PRNumber:      44,
+		VerdictID:     verdictID,
+		AttemptID:     seedReviewAttemptTurn(ctx, t, pool),
+		HeadSHA:       "sha44",
+		Context:       verdictContext,
+		Reason:        string(autoapproval.ReasonNotShippableAuto),
+		Justification: "Accepted while stacked -- about to become stale via a restructure.",
+		AcceptedBy:    actor.ID,
+	}); err != nil {
+		t.Fatalf("Accept() error = %v, want nil", err)
+	}
+
+	// The live PR reports NO ancestor chain at all -- base ref/sha and
+	// head sha are all UNCHANGED from what was accepted; only the stack
+	// itself changed (a restructure landed the stacked branch, so this PR
+	// now sits directly on testEligibleBaseRef).
+	fakeSCM := &fakeDecisionInboxSourceControl{
+		openPRsByExternalID: map[string][]ports.OpenPR{
+			actorGitHubExternalID: {
+				{
+					Owner: "acme", Repo: "widgets", Number: 44, Title: "accepted while stacked, then restructured",
+					HTMLURL: htmlURL, HeadSHA: "sha44",
+					BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
+					AncestorChain: nil,
+					Assignees:     []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}},
+					CIConclusion:  ports.CIConclusionSuccess,
+					CreatedAt:     time.Now(),
+				},
+			},
+		},
+	}
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict:      appreviewverdict.Deps{ReviewVerdicts: reviewVerdicts, RepoSettings: repoSettingsStore, ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool), Acceptances: acceptances, Turns: narvipg.NewTurnStore(pool), Timeouts: platform.DefaultTimeouts()},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil", err)
+	}
+
+	pr44 := findItemByPR(result.Items, 44)
+	if pr44 == nil {
+		t.Fatal("PR #44 missing from the inbox entirely")
+	}
+	if pr44.AcceptanceJustification != "" || pr44.AcceptanceID != "" || !pr44.AcceptedAt.IsZero() {
+		t.Errorf("PR #44 (ancestor chain changed since acceptance) still renders an acceptance -- AcceptanceID=%q AcceptanceJustification=%q AcceptedAt=%v, want all absent: a changed ancestor chain makes this acceptance inapplicable, and the row must not tell a human otherwise", pr44.AcceptanceID, pr44.AcceptanceJustification, pr44.AcceptedAt)
+	}
+
+	// Confirm this is genuinely the "ancestor chain changed" case, not
+	// "nobody revoked it happened to also be gone" -- GetActiveAcceptance
+	// must still report the SAME row as active underneath.
+	stillActive, ok, err := appreviewverdict.GetActiveAcceptance(ctx, acceptances, repoFullName, 44)
+	if err != nil {
+		t.Fatalf("GetActiveAcceptance: error = %v, want nil", err)
+	}
+	if !ok || stillActive.Revoked() {
+		t.Fatal("GetActiveAcceptance: ok = false or Revoked() = true, want an active, non-revoked row -- this test's own point is that the ancestor-chain change ALONE hides it from the read model, not revocation")
+	}
+}
+
+// TestBuild_AcceptanceMergeable pins finding R1 (round 3, adversarial
+// review): DecisionInboxItem.AcceptanceMergeable/
+// AcceptanceMergeBlockedReason (buildPROpenItem, aggregate.go) must
+// reflect the SAME mandatory, never-waived criteria RevalidateForMerge
+// enforces at click time -- never derived from AcceptanceID's own
+// presence alone (hasAcceptedOverride, decisionInboxFormat.ts's own
+// PRE-FIX heuristic, web/src/session). Table-driven over the two
+// illustrative failure modes the finding itself names ("the case with
+// open review findings and the case whose own chip is rendered one span
+// to the left" -- prChipData's own chip order, decisionInboxFormat.ts:
+// risk/findings, CI, changes requested, THEN accepted override, i.e.
+// hasChangesRequested is the chip immediately to its left) plus the
+// genuinely-mergeable-via-acceptance baseline every case perturbs FROM.
+//
+// Mutation-test target: replacing this test's own AcceptanceMergeable
+// assertions with a bare `acceptanceID != ""` check (the pre-fix
+// behavior) must turn the two blocked subtests' own "not mergeable"
+// assertion from a pass into a failure -- both would then read
+// AcceptanceMergeable = true purely because the acceptance row exists.
+func TestBuild_AcceptanceMergeable(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+
+	tests := []struct {
+		name                string
+		openFinding         bool
+		hasChangesRequested bool
+		wantMergeable       bool
+		wantReasonContains  string
+	}{
+		{
+			name:          "clean PR, blocked only by Shippable -- mergeable via acceptance",
+			wantMergeable: true,
+		},
+		{
+			name:               "open review finding -- never waived, blocks despite acceptance",
+			openFinding:        true,
+			wantMergeable:      false,
+			wantReasonContains: "review finding",
+		},
+		{
+			name:                "changes requested -- never waived, blocks despite acceptance",
+			hasChangesRequested: true,
+			wantMergeable:       false,
+			wantReasonContains:  "changes requested",
+		},
+	}
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			prNumber := int32(60 + i)
+			actorGitHubExternalID := fmt.Sprintf("60%d", i)
+			tokenKey := []byte("01234567890123456789012345678901")
+			actor := decisionInboxActorFixture(ctx, t, pool, fmt.Sprintf("r1-actor-%d@example.com", i), actorGitHubExternalID, tokenKey)
+
+			artifacts := narvipg.NewArtifactStore(pool)
+			htmlURL := fmt.Sprintf("https://github.com/acme/widgets/pull/%d", prNumber)
+			const repoFullName = "acme/widgets"
+			platformSession, err := narvipg.NewSessionStore(pool).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub, CreatedBy: actor.ID})
+			if err != nil {
+				t.Fatalf("create platform session: %v", err)
+			}
+			if _, err := artifacts.Create(ctx, sqlcgen.CreateArtifactParams{
+				SessionID: platformSession.ID, Type: sqlcgen.ArtifactTypePr, Url: htmlURL, Metadata: []byte("{}"),
+			}); err != nil {
+				t.Fatalf("mark PR #%d platform-authored: %v", prNumber, err)
+			}
+
+			reviewFindings := narvipg.NewReviewFindingStore(pool)
+			if tc.openFinding {
+				if _, err := reviewFindings.Upsert(ctx, sqlcgen.UpsertReviewFindingParams{
+					RepoFullName: repoFullName, PrNumber: prNumber, IdentityHash: "r1-open-finding",
+					Severity: "high", FilePath: "internal/foo.go", Description: "a real, still-open finding",
+				}); err != nil {
+					t.Fatalf("seed open finding: %v", err)
+				}
+			}
+
+			// A high-risk (not Shippable=auto) verdict, otherwise fully
+			// eligible -- mirrors this file's own TestBuild_
+			// AcceptedVerdict_BaseMoved_HidesStaleAcceptance fixture shape
+			// exactly.
+			reviewVerdicts := narvipg.NewReviewVerdictStore(pool)
+			repoSettingsStore := narvipg.NewRepoSettingsStore(pool)
+			acceptances := narvipg.NewReviewVerdictAcceptanceStore(pool)
+			verdict := review.Verdict{
+				RiskLevel:         review.RiskLevelHigh,
+				Premise:           review.PremiseStateOK,
+				TestsCoverage:     review.TestsCoverageStateAdequate,
+				DocsDrift:         review.DocsDriftStateNone,
+				ProposedShippable: review.ProposedShippableNeedsHuman,
+				FilesChanged:      3,
+			}
+			verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+			if verdict.Shippable == review.ShippableAuto {
+				t.Fatalf("fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
+			}
+			headSHA := fmt.Sprintf("sha-r1-%d", i)
+			verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
+			record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{})
+			if err != nil {
+				t.Fatalf("seed not-shippable-auto review_verdicts row: %v", err)
+			}
+
+			var verdictID pgtype.UUID
+			if err := verdictID.Scan(record.ID); err != nil {
+				t.Fatalf("scan verdict id: %v", err)
+			}
+			if _, _, err := appreviewverdict.Accept(ctx, acceptances, appreviewverdict.AcceptInput{
+				RepoFullName:  repoFullName,
+				PRNumber:      prNumber,
+				VerdictID:     verdictID,
+				AttemptID:     seedReviewAttemptTurn(ctx, t, pool),
+				HeadSHA:       headSHA,
+				Context:       verdictContext,
+				Reason:        string(autoapproval.ReasonNotShippableAuto),
+				Justification: "Accepted -- table-driven AcceptanceMergeable fixture.",
+				AcceptedBy:    actor.ID,
+			}); err != nil {
+				t.Fatalf("Accept() error = %v, want nil", err)
+			}
+
+			fakeSCM := &fakeDecisionInboxSourceControl{
+				openPRsByExternalID: map[string][]ports.OpenPR{
+					actorGitHubExternalID: {
+						{
+							Owner: "acme", Repo: "widgets", Number: int(prNumber), Title: tc.name,
+							HTMLURL: htmlURL, HeadSHA: headSHA,
+							BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
+							Assignees:           []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}},
+							CIConclusion:        ports.CIConclusionSuccess,
+							HasChangesRequested: tc.hasChangesRequested,
+							CreatedAt:           time.Now(),
+						},
+					},
+				},
+			}
+
+			deps := decisioninbox.Deps{
+				Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+				Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+				ReviewFindings: reviewFindings, SentinelFixes: narvipg.NewSentinelFixStore(pool),
+				Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
+				SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+				TokenEncryptionKey: tokenKey,
+				Timeouts:           platform.DefaultTimeouts(),
+				ReviewVerdict:      appreviewverdict.Deps{ReviewVerdicts: reviewVerdicts, RepoSettings: repoSettingsStore, ReviewFindings: reviewFindings, AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool), Acceptances: acceptances, Turns: narvipg.NewTurnStore(pool), Timeouts: platform.DefaultTimeouts()},
+			}
+
+			result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+			if err != nil {
+				t.Fatalf("Build() error = %v, want nil", err)
+			}
+
+			item := findItemByPR(result.Items, int(prNumber))
+			if item == nil {
+				t.Fatalf("PR #%d missing from the inbox entirely", prNumber)
+			}
+			if item.Kind != decisioninboxdomain.KindNeedsReview {
+				t.Fatalf("PR #%d Kind = %s, want needs_review (Kind stays acceptance-blind by design)", prNumber, item.Kind)
+			}
+			if item.AcceptanceID == "" {
+				t.Fatalf("PR #%d AcceptanceID is empty, want the active acceptance's own id -- fixture bug, not what this test means to check", prNumber)
+			}
+			if item.AcceptanceMergeable != tc.wantMergeable {
+				t.Errorf("PR #%d AcceptanceMergeable = %v, want %v (reason=%q)", prNumber, item.AcceptanceMergeable, tc.wantMergeable, item.AcceptanceMergeBlockedReason)
+			}
+			if tc.wantReasonContains != "" && !strings.Contains(item.AcceptanceMergeBlockedReason, tc.wantReasonContains) {
+				t.Errorf("PR #%d AcceptanceMergeBlockedReason = %q, want it to contain %q", prNumber, item.AcceptanceMergeBlockedReason, tc.wantReasonContains)
+			}
+			if tc.wantMergeable && item.AcceptanceMergeBlockedReason != "" {
+				t.Errorf("PR #%d AcceptanceMergeBlockedReason = %q, want empty when AcceptanceMergeable is true", prNumber, item.AcceptanceMergeBlockedReason)
+			}
+		})
 	}
 }
 

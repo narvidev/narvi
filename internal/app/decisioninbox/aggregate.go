@@ -521,6 +521,28 @@ const openFindingsUnknownFailClosed = 1
 // merge time: an ordinary, unrelated merge to trunk must not read as
 // "your acceptance is gone" any more than it reads as "your verdict is
 // stale" elsewhere in this design.
+//
+// CORRECTED (round 3, finding R2, adversarial review): this function
+// deliberately does NOT compare head SHA -- it structurally CANNOT from
+// recordContext alone, since reviewverdict.Context (record.go's own doc
+// comment) is defined as the review-context snapshot BEYOND HeadSHA,
+// which lives on the separate Record.HeadSHA field instead. The head-SHA
+// half of "a new attempt, a moved base, or a changed ancestor chain makes
+// it inapplicable" (§21.1b) is therefore the CALLER's job -- see
+// buildPROpenItem's own acceptance-display block, which holds both
+// record.HeadSHA and pr.HeadSHA already and compares them directly,
+// alongside this function's own ref-level check, before ever setting
+// AcceptanceID. Before that caller-side fix, a push that landed with no
+// new review attempt yet dispatched (the auto-retrigger is debounced and
+// budget-capped, reviewAutoRetriggerBudget -- once that budget is spent,
+// NO new attempt ever arrives to invalidate the acceptance) left this
+// function's own ref-level check trivially satisfied (base ref/ancestor
+// chain unchanged) while the PR's live head SHA had already moved past
+// what was accepted -- exactly the ReasonStaleVerdict gap
+// autoapproval.ComputeEligible's own unconditional head-SHA-equality
+// check (checked BEFORE, and never waived by, the acceptance-waivable
+// criteria) would refuse on at merge time, permanently misrepresented
+// here as "still active".
 func acceptanceContextStillFresh(recordContext reviewverdict.Context, pr ports.OpenPR) bool {
 	if recordContext.BaseRef != pr.BaseRef {
 		return false
@@ -614,7 +636,23 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 			if newerErr != nil {
 				platform.Logger(ctx).Warn("decisioninbox: check newer review attempt failed -- omitting acceptance display data for this row", "error", newerErr, "repo", repoFullName, "pr_number", pr.Number)
 			}
-			if acceptance.Applicable(record.ID, hasNewerAttempt) && acceptanceContextStillFresh(record.Context, pr) {
+			// record.HeadSHA == pr.HeadSHA (round 3, finding R2, adversarial
+			// review) closes the head-SHA half of "a new attempt, a moved
+			// base, or a changed ancestor chain makes it inapplicable"
+			// (§21.1b) -- see acceptanceContextStillFresh's own doc comment
+			// (immediately above) for why that function structurally cannot
+			// check this itself (reviewverdict.Context is the snapshot
+			// BEYOND HeadSHA; the head lives on Record.HeadSHA, which this
+			// call site already holds, alongside pr.HeadSHA -- no new I/O).
+			// Without this check, a push landing with no new review attempt
+			// yet dispatched (the auto-retrigger is debounced and capped by
+			// reviewAutoRetriggerBudget -- once that budget is spent, no new
+			// attempt ever arrives to invalidate the acceptance) left
+			// record.ID/hasNewerAttempt/acceptanceContextStillFresh all
+			// trivially satisfied while the live head SHA had already moved
+			// past what was accepted, permanently misrepresenting a stale
+			// acceptance as active.
+			if acceptance.Applicable(record.ID, hasNewerAttempt) && record.HeadSHA == pr.HeadSHA && acceptanceContextStillFresh(record.Context, pr) {
 				acceptanceID = acceptance.ID
 				acceptanceJustification = acceptance.Justification
 				acceptedAt = acceptance.AcceptedAt
@@ -672,7 +710,7 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 		item.Kind = decisioninbox.KindNeedsReview
 	default:
 		platformAuthored := isPlatformAuthored(ctx, deps, pr.HTMLURL)
-		eligible, eligibilityDegraded := computeRealEligibility(ctx, deps, repoFullName, pr, ciGreen, hasNeedsHuman, token, now)
+		eligible, eligibilityDegraded := computeRealEligibility(ctx, deps, repoFullName, pr, ciGreen, hasNeedsHuman, token, now, false)
 		degraded = eligibilityDegraded
 		// HasChangesRequested is a HARD merge blocker at RevalidateForMerge
 		// (revalidate.go) but was previously never consulted HERE -- so such a PR sat
@@ -710,6 +748,64 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 			item.Kind = decisioninbox.KindReadyToMerge
 		} else {
 			item.Kind = decisioninbox.KindNeedsReview
+
+			// AcceptanceMergeable/AcceptanceMergeBlockedReason (round 3,
+			// finding R1, adversarial review): computed ONLY when this row
+			// actually carries an active, applicable, fresh acceptance
+			// (acceptanceID is set exactly under that gate, above) --
+			// otherwise both stay at their Go zero value, mirroring
+			// Item.AcceptanceMergeable's own doc comment. The client used to
+			// infer "the Merge button is safe to offer" from acceptanceID
+			// alone (hasAcceptedOverride, decisionInboxFormat.ts), which is
+			// true only by coincidence: it says nothing about whether the
+			// SAME mandatory, never-waived criteria RevalidateForMerge
+			// enforces at click time (CI green, no open finding, no changes
+			// requested, a confirmed review-decision read, blast radius
+			// known, every freshness check) also hold. Every mandatory
+			// criterion this switch already evaluated (platformAuthored,
+			// !pr.HasChangesRequested, !pr.ReviewDecisionDegraded,
+			// openFindings == 0) is checked again here, FIRST and cheaply
+			// (no new I/O -- every fact is already in hand), before ever
+			// re-running the engine: reusing the same mandatory-criteria
+			// values just used for Kind, never a second, independently
+			// re-derived copy that could silently drift from it.
+			if acceptanceID != "" {
+				switch {
+				case !platformAuthored:
+					item.AcceptanceMergeBlockedReason = "this pull request was not authored by a platform session"
+				case pr.HasChangesRequested:
+					item.AcceptanceMergeBlockedReason = "this pull request has changes requested by a reviewer"
+				case pr.ReviewDecisionDegraded:
+					item.AcceptanceMergeBlockedReason = "this pull request's review decision could not be confirmed (a degraded GitHub read)"
+				case openFindings > 0:
+					item.AcceptanceMergeBlockedReason = "this pull request has an open, unresolved review finding"
+				default:
+					// The mandatory, never-waived criteria above all clear
+					// -- the ONE remaining question is whether the engine's
+					// own real eligibility criteria (CI, blast radius,
+					// sensitive path, every freshness check, Shippable/
+					// diff-size) ALSO clear, this time WITH the acceptance
+					// applied (accepted=true) -- the SAME real engine
+					// computeRealEligibility already ran above (accepted=
+					// false, for Kind classification), re-run a second time
+					// so this field can never diverge from what a real
+					// Merge click would actually decide. A degraded live
+					// read here (viaDegraded) is treated as "not confirmed
+					// mergeable" -- never a confident false, mirroring this
+					// same file's "never present a degraded read as a
+					// considered judgement" discipline elsewhere (findings,
+					// SCMFetchFailed) -- so a transient lookup failure only
+					// ever hides the button, never shows one that 409s.
+					eligibleViaAcceptance, viaDegraded := computeRealEligibility(ctx, deps, repoFullName, pr, ciGreen, hasNeedsHuman, token, now, true)
+					if viaDegraded {
+						degraded = true
+					}
+					item.AcceptanceMergeable = eligibleViaAcceptance && !viaDegraded
+					if !item.AcceptanceMergeable {
+						item.AcceptanceMergeBlockedReason = "this pull request no longer meets the auto-approval eligibility criteria, even with its accepted override applied"
+					}
+				}
+			}
 		}
 	}
 
@@ -759,7 +855,21 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 // considered "this PR really is not eligible" judgement -- see
 // buildPROpenItem's own doc comment and Result.SCMFetchFailed's own
 // producer list (6) for the full wiring this return value feeds.
-func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string, pr ports.OpenPR, ciGreen, hasNeedsHuman bool, token string, now time.Time) (bool, bool) {
+//
+// accepted (round 3, finding R1, adversarial review) threads through to
+// BOTH ComputeEligible calls below (the probe and the final call),
+// switching them to ComputeEligibleWithAcceptance -- accepted=false from
+// this function's ORIGINAL caller (Kind classification, which stays
+// DELIBERATELY acceptance-blind: Item.AcceptanceID's own doc comment) is
+// byte-for-byte identical to plain ComputeEligible, so that call site's
+// behavior is completely unchanged by this parameter's addition.
+// accepted=true is this function's NEW second caller (buildPROpenItem's
+// own AcceptanceMergeable computation): "would this PR's own real
+// eligibility criteria clear WITH its acceptance applied" -- the
+// question a maintainer+'s own Merge click actually depends on, computed
+// by the SAME engine RevalidateForMerge itself re-checks at click time,
+// never a second, independently-derived approximation.
+func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string, pr ports.OpenPR, ciGreen, hasNeedsHuman bool, token string, now time.Time, accepted bool) (bool, bool) {
 	var degraded bool
 	record, hasVerdict, err := appreviewverdict.GetLatest(ctx, deps.ReviewVerdict, repoFullName, int32(pr.Number))
 	if err != nil {
@@ -893,7 +1003,13 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 		TouchedBlastRadius:                  touchedBlastRadius,
 		TouchedBlastRadiusKnown:             touchedBlastRadiusKnown,
 	}
-	if probeEligible, _ := autoapproval.ComputeEligible(probe, cfg); !probeEligible {
+	// ComputeEligibleWithAcceptance, never a bare ComputeEligible (round 3,
+	// finding R1, adversarial review) -- accepted is false from this
+	// function's ORIGINAL caller (Kind classification), making this call
+	// byte-for-byte identical to the pre-existing ComputeEligible(probe,
+	// cfg); accepted is true from the NEW AcceptanceMergeable caller,
+	// which is the whole point of threading it through.
+	if probeEligible, _, _ := autoapproval.ComputeEligibleWithAcceptance(probe, cfg, accepted); !probeEligible {
 		return false, false
 	}
 
@@ -1158,7 +1274,12 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// exceptions -- see currentBaseSHA/currentAncestorChain's own doc
 	// comments immediately above for why they are NOT pr.BaseSHA/
 	// pr.AncestorChain.
-	eligibleIgnoringHumanSignals, _ := autoapproval.ComputeEligible(autoapproval.EligibilityInput{
+	// ComputeEligibleWithAcceptance, mirroring the probe call's own
+	// identical switch above (round 3, finding R1, adversarial review) --
+	// same accepted, same "false is byte-for-byte identical to the
+	// pre-existing ComputeEligible call" guarantee for this function's
+	// ORIGINAL (Kind-classification) caller.
+	eligibleIgnoringHumanSignals, _, _ := autoapproval.ComputeEligibleWithAcceptance(autoapproval.EligibilityInput{
 		Verdict:                             record.Verdict,
 		VerdictAssessed:                     true,
 		VerdictHeadSHA:                      record.HeadSHA,
@@ -1178,7 +1299,7 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 		ChangedFileCount:                    changedFileCount,
 		TouchedBlastRadius:                  touchedBlastRadius,
 		TouchedBlastRadiusKnown:             touchedBlastRadiusKnown,
-	}, cfg)
+	}, cfg, accepted)
 	eligible := eligibleIgnoringHumanSignals && !hasNeedsHuman
 
 	// "Contested": the engine would have approved this PR on every

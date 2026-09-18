@@ -4,6 +4,7 @@ import type { DecisionInboxItem } from '@narvi/contracts/rest-dtos'
 
 import {
   canMergeDecisionInboxItem,
+  canMergeViaAcceptance,
   formatAgeSeconds,
   formatDecisionLatencySeconds,
   hasAcceptedOverride,
@@ -39,6 +40,8 @@ function baseItem(overrides: Partial<DecisionInboxItem> = {}): DecisionInboxItem
     verdictId: null,
     acceptanceId: null,
     acceptanceJustification: null,
+    acceptanceMergeable: null,
+    acceptanceMergeBlockedReason: null,
     acceptedAt: null,
     acceptedBy: null,
     isRelease: null,
@@ -155,6 +158,31 @@ describe('riskLabel chips via prChipData -- the wire value is "review:high-risk"
     const chips = prChipData({ riskLabel: null, findings: null, ciGreen: true, hasChangesRequested: false, acceptanceId: null })
     expect(chips.some((c) => c.text.includes('accepted'))).toBe(false)
     expect(hasAcceptedOverride({ acceptanceId: null })).toBe(false)
+  })
+})
+
+// Round 3, finding R1 (adversarial review, corrected): canMergeViaAcceptance
+// answers a DIFFERENT question than hasAcceptedOverride above -- "does
+// this acceptance actually unblock a merge right now", never "does an
+// acceptance row exist". The pre-fix client used hasAcceptedOverride for
+// BOTH questions, which rendered an enabled Merge button on a row the
+// server refuses unconditionally (an open finding, changes requested...)
+// purely because an acceptance row existed.
+describe('canMergeViaAcceptance -- the server\'s own mergeability answer, never inferred from acceptanceId alone', () => {
+  it('acceptanceId set AND acceptanceMergeable true -- mergeable', () => {
+    expect(canMergeViaAcceptance({ acceptanceId: 'acceptance-1', acceptanceMergeable: true })).toBe(true)
+  })
+
+  it('acceptanceId set but acceptanceMergeable false -- NOT mergeable, even though an acceptance exists', () => {
+    expect(canMergeViaAcceptance({ acceptanceId: 'acceptance-1', acceptanceMergeable: false })).toBe(false)
+  })
+
+  it('acceptanceId set but acceptanceMergeable null (a degraded/unknown read) -- NOT mergeable, fails closed', () => {
+    expect(canMergeViaAcceptance({ acceptanceId: 'acceptance-1', acceptanceMergeable: null })).toBe(false)
+  })
+
+  it('acceptanceId null -- NOT mergeable regardless of acceptanceMergeable (the question does not apply)', () => {
+    expect(canMergeViaAcceptance({ acceptanceId: null, acceptanceMergeable: true })).toBe(false)
   })
 })
 

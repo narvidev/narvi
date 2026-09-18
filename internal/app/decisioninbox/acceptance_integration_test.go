@@ -122,9 +122,15 @@ func TestRevalidateForMerge_AcceptedVerdict(t *testing.T) {
 		t.Fatalf("scan verdict id: %v", err)
 	}
 	acceptance, _, err := appreviewverdict.Accept(ctx, rs.deps.ReviewVerdict.Acceptances, appreviewverdict.AcceptInput{
-		RepoFullName:  repoFullName,
-		PRNumber:      int32(pr.Number),
-		VerdictID:     verdictID,
+		RepoFullName: repoFullName,
+		PRNumber:     int32(pr.Number),
+		VerdictID:    verdictID,
+		// AttemptID (round 3, finding R10, adversarial review): a real
+		// turn id -- HasNewerReviewAttempt now fails CLOSED on an empty
+		// one, which would otherwise make this test's own "the acceptance
+		// genuinely authorises a merge" phase (below) refuse unconditionally,
+		// regardless of the base-move this test actually means to isolate.
+		AttemptID:     seedReviewAttemptTurn(ctx, t, pool),
 		HeadSHA:       recordBefore.HeadSHA,
 		Context:       recordBefore.Context,
 		Reason:        string(autoapproval.ReasonNotShippableAuto),
@@ -319,9 +325,16 @@ func TestRevalidateForMerge_AcceptedVerdict_NewAttemptInvalidatesAcceptance(t *t
 		t.Fatalf("scan first verdict id: %v", err)
 	}
 	acceptance, _, err := appreviewverdict.Accept(ctx, rs.deps.ReviewVerdict.Acceptances, appreviewverdict.AcceptInput{
-		RepoFullName:  repoFullName,
-		PRNumber:      int32(pr.Number),
-		VerdictID:     firstVerdictID,
+		RepoFullName: repoFullName,
+		PRNumber:     int32(pr.Number),
+		VerdictID:    firstVerdictID,
+		// AttemptID (round 3, finding R10, adversarial review): a real
+		// turn id, distinct from the FRESH attempt this test creates
+		// below -- HasNewerReviewAttempt now fails CLOSED on an empty one,
+		// which would otherwise refuse the "before" phase's own ok=true
+		// assertion unconditionally, never reaching the NEW-attempt
+		// invalidation this test actually means to isolate.
+		AttemptID:     seedReviewAttemptTurn(ctx, t, pool),
 		HeadSHA:       firstVerdict.HeadSHA,
 		Context:       firstVerdict.Context,
 		Reason:        string(autoapproval.ReasonNotShippableAuto),

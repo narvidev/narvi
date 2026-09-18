@@ -150,13 +150,21 @@ func TestAcceptReviewVerdict_Supersede_RecordsDistinctAuditRow(t *testing.T) {
 				acceptCount++
 			}
 		case "review_verdict.accept_supersedes_prior":
+			// round 3, finding R6 (adversarial review): this row is now
+			// filed under the SUPERSEDED acceptance's own id (first.Id),
+			// never the new one -- symmetric with an explicit revoke,
+			// which is filed under the id of the acceptance IT revoked.
+			// An audit lookup keyed on first.Id must find this row;
+			// detail.SupersedingAcceptanceID is what still lets a reader
+			// starting from the NEW acceptance's own id (second.Id) find
+			// what it superseded.
 			var detail struct {
-				SupersededAcceptanceID string `json:"superseded_acceptance_id"`
+				SupersedingAcceptanceID string `json:"superseding_acceptance_id"`
 			}
 			if err := json.Unmarshal(e.DetailJson, &detail); err != nil {
 				t.Fatalf("unmarshal accept_supersedes_prior detail: %v", err)
 			}
-			if e.ResourceID == second.Id && detail.SupersededAcceptanceID == first.Id {
+			if e.ResourceID == first.Id && detail.SupersedingAcceptanceID == second.Id {
 				foundSupersede = true
 			}
 		}
@@ -165,7 +173,7 @@ func TestAcceptReviewVerdict_Supersede_RecordsDistinctAuditRow(t *testing.T) {
 		t.Errorf("review_verdict.accept audit rows for this test's own two acceptances = %d, want 2", acceptCount)
 	}
 	if !foundSupersede {
-		t.Error("no review_verdict.accept_supersedes_prior audit row found naming the first acceptance as superseded by the second -- finding F4, adversarial review: a supersession must not vanish from the audit trail")
+		t.Error("no review_verdict.accept_supersedes_prior audit row found filed under the superseded (first) acceptance's own id and naming the superseding (second) one -- finding F4/R6, adversarial review: a supersession must not vanish from the audit trail, and must be findable from the row it revoked, exactly like an explicit revoke already is")
 	}
 }
 
@@ -451,6 +459,97 @@ func TestRevokeReviewVerdictAcceptance_HappyPathThenAlreadyRevoked(t *testing.T)
 	status = rig.doJSON(t, http.MethodPost, "/api/decision-inbox/revoke-verdict-acceptance", revokeBody, nil, revokeToken)
 	if status != http.StatusConflict {
 		t.Fatalf("second revoke status = %d, want %d (already revoked)", status, http.StatusConflict)
+	}
+}
+
+// TestRevokeReviewVerdictAcceptance_AuditFailureRollsBackRevoke pins
+// finding R3 (round 3, adversarial review) directly against real
+// Postgres: an audit-log write failure must abort the WHOLE revocation,
+// never leave the acceptance revoked with no record of it. Forces the
+// audit INSERT specifically (never review_verdict_acceptances) to fail
+// with a throwaway CHECK constraint naming this test's own action --
+// review_verdict_acceptances carries no such constraint, so a version of
+// this handler that still writes the revoke UPDATE on the bare pool,
+// then the audit row best-effort afterward (round 2's own shape, before
+// this fix), would commit the revoke regardless of this constraint and
+// only fail (silently, logged-and-swallowed, 200 OK) writing the audit
+// row -- this test's own decisive assertion is that the acceptance
+// itself is STILL ACTIVE afterward, which only holds once revoke and its
+// audit row run in the SAME transaction.
+func TestRevokeReviewVerdictAcceptance_AuditFailureRollsBackRevoke(t *testing.T) {
+	rig := newDecisionInboxTestRig(t, &fakeMergeSourceControl{})
+	ctx := context.Background()
+
+	_, token := rig.createAuthenticatedUser(ctx, t, sqlcgen.UserRoleMaintainer)
+	const repoFullName = "acme/revoke-verdict-audit-failure"
+	rig.seedAutoApprovedVerdict(ctx, t, repoFullName, 510, "headsha510")
+
+	record, hasVerdict, err := appreviewverdict.GetLatest(ctx, appreviewverdict.Deps{ReviewVerdicts: rig.reviewVerdicts}, repoFullName, 510)
+	if err != nil || !hasVerdict {
+		t.Fatalf("GetLatest: hasVerdict=%v err=%v", hasVerdict, err)
+	}
+
+	acceptBody, err := json.Marshal(restdtos.AcceptReviewVerdictRequest{
+		RepoFullName: repoFullName, PrNumber: 510, VerdictId: record.ID, Justification: "About to be revoked -- the revocation's own audit write will be forced to fail.",
+	})
+	if err != nil {
+		t.Fatalf("marshal accept request: %v", err)
+	}
+	var accepted restdtos.ReviewVerdictAcceptance
+	if status := rig.doJSON(t, http.MethodPost, "/api/decision-inbox/accept-verdict", acceptBody, &accepted, token); status != http.StatusCreated {
+		t.Fatalf("accept status = %d, want %d", status, http.StatusCreated)
+	}
+
+	// THE FAULT: a throwaway CHECK constraint that only ever rejects an
+	// audit_log row for THIS test's own action -- review_verdict.
+	// revoke_acceptance -- never anything on review_verdict_acceptances
+	// itself, so the revoke UPDATE this handler issues is, on its own,
+	// completely unaffected by this constraint.
+	const constraintName = "test_r3_block_revoke_audit"
+	if _, err := rig.pool.Exec(ctx, "ALTER TABLE audit_log ADD CONSTRAINT "+constraintName+" CHECK (action <> 'review_verdict.revoke_acceptance')"); err != nil {
+		t.Fatalf("add throwaway audit_log constraint: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := rig.pool.Exec(context.Background(), "ALTER TABLE audit_log DROP CONSTRAINT IF EXISTS "+constraintName); err != nil {
+			t.Errorf("drop throwaway audit_log constraint: %v", err)
+		}
+	})
+
+	revokeBody, err := json.Marshal(restdtos.RevokeReviewVerdictAcceptanceRequest{
+		RepoFullName: repoFullName, Id: accepted.Id,
+	})
+	if err != nil {
+		t.Fatalf("marshal revoke request: %v", err)
+	}
+
+	status := rig.doJSON(t, http.MethodPost, "/api/decision-inbox/revoke-verdict-acceptance", revokeBody, nil, token)
+	if status != http.StatusInternalServerError {
+		t.Fatalf("revoke status = %d, want %d (the audit write must fail, and the handler must surface that, never a silent 200)", status, http.StatusInternalServerError)
+	}
+
+	// THE DECISIVE ASSERTION: the acceptance must still be ACTIVE -- the
+	// revoke UPDATE rolled back together with its own failed audit write,
+	// never committed independently.
+	_, ok, err := appreviewverdict.GetActiveAcceptance(ctx, narvipg.NewReviewVerdictAcceptanceStore(rig.pool), repoFullName, 510)
+	if err != nil {
+		t.Fatalf("GetActiveAcceptance after failed revoke: error = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatal("GetActiveAcceptance after failed revoke: ok = false, want true -- a revocation whose own audit write failed must roll back entirely, never leave the acceptance revoked with no record of it")
+	}
+
+	// No audit row for this action must exist either -- the failed
+	// INSERT itself never committed (it could not have, given the
+	// constraint), but this also rules out some OTHER, unrelated
+	// audit row accidentally satisfying the test above.
+	entries, err := rig.auditLog.List(ctx, 100, 0)
+	if err != nil {
+		t.Fatalf("list audit log: %v", err)
+	}
+	for _, e := range entries {
+		if e.Action == "review_verdict.revoke_acceptance" && e.ResourceID == accepted.Id {
+			t.Errorf("found a review_verdict.revoke_acceptance audit row for %s despite the forced failure -- want none", accepted.Id)
+		}
 	}
 }
 

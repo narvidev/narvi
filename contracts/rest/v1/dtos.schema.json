@@ -4473,6 +4473,20 @@
           "format": "uuid",
           "description": "The accepting maintainer+'s own user id -- null under the exact same conditions acceptanceJustification is null (finding F6, adversarial review: this row's own acceptanceJustification/acceptedAt already told a maintainer THAT a verdict was authorised and WHEN; this field is the missing 'by whom')."
         },
+        "acceptanceMergeable": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Round 3, finding R1 (adversarial review): whether THIS row's own acceptance actually unblocks a Merge click right now -- null whenever acceptanceId is null (the question does not apply); set (true or false) iff acceptanceId is non-null. Computed by re-running the SAME real eligibility engine that classifies Kind (internal/app/decisioninbox.computeRealEligibility), a second time, WITH the acceptance applied -- never derived from acceptanceId's own presence alone, which is exactly the defect this field exists to close: a maintainer+'s own acceptance row can exist and still leave this PR blocked on a mandatory, never-waived criterion (CI green, an open review finding, changes requested, blast radius known, a moved base...), and this field is what tells a client that BEFORE it renders a Merge button that would 409. Still best-effort/non-authoritative, exactly like Kind itself (§16.2: 'the rendered queue is never trusted as authority') -- RevalidateForMerge is re-run, unconditionally, at click time regardless of what this says."
+        },
+        "acceptanceMergeBlockedReason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A short, human-readable explanation of why acceptanceMergeable is false -- null whenever acceptanceMergeable is null or true. Never itself an instruction; display only, mirroring failureReason/lastError's own identical 'echo a short reason string, never markup' discipline."
+        },
         "isRelease": {
           "type": [
             "boolean",

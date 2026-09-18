@@ -49,6 +49,8 @@ function baseItem(overrides: Partial<DecisionInboxItem> = {}): DecisionInboxItem
     verdictId: null,
     acceptanceId: null,
     acceptanceJustification: null,
+    acceptanceMergeable: null,
+    acceptanceMergeBlockedReason: null,
     acceptedAt: null,
     acceptedBy: null,
     isRelease: null,
@@ -275,31 +277,141 @@ describe('DecisionInboxRow -- hasChangesRequested, not hasApprovingReview, gates
 // Merge button and the justification text now BOTH render for exactly
 // that row shape, and NEITHER renders for an ordinary, never-accepted
 // needs_review row.
+//
+// Round 3, finding R1 (adversarial review, corrected): the Merge button
+// itself must ALSO gate on acceptanceMergeable, the server's own answer
+// to "does this acceptance actually unblock a merge right now" -- never
+// on acceptanceId's own presence alone, which is true the instant a
+// maintainer+ accepts a verdict regardless of whether some OTHER,
+// mandatory criterion (an open finding, changes requested...) still
+// blocks it. Both directions are pinned below: a mergeable acceptance
+// still shows the button (unchanged from before this fix), and a
+// non-mergeable one shows neither the button nor a false "still stuck"
+// silence -- an honest "Still blocked: <reason>" line instead.
 describe('DecisionInboxRow -- an accepted-but-refused PR (§21.1b) gets a real surface, not just "Open review"', () => {
-  it('a needs_review row with an active acceptance renders the Merge button', () => {
-    const item = prItem({ kind: 'needs_review', acceptanceId: 'acceptance-1', acceptanceJustification: 'Reviewed offline; risk accepted.' })
+  it('a needs_review row with a MERGEABLE active acceptance renders the Merge button', () => {
+    const item = prItem({ kind: 'needs_review', acceptanceId: 'acceptance-1', acceptanceJustification: 'Reviewed offline; risk accepted.', acceptanceMergeable: true })
     const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
     expect(html).toContain('>Merge<')
   })
 
   it("a needs_review row with an active acceptance renders the maintainer's own justification as text", () => {
-    const item = prItem({ kind: 'needs_review', acceptanceId: 'acceptance-1', acceptanceJustification: 'Reviewed offline; risk accepted.' })
+    const item = prItem({ kind: 'needs_review', acceptanceId: 'acceptance-1', acceptanceJustification: 'Reviewed offline; risk accepted.', acceptanceMergeable: true })
     const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
     expect(html).toContain('Reviewed offline; risk accepted.')
     expect(html).toContain('accepted override')
   })
 
+  // Round 3, finding R7 (adversarial review): round 2 added acceptedBy/
+  // acceptedAt to the wire (Item.AcceptedByUserID's own doc comment: "the
+  // missing 'by whom'") specifically so a maintainer scanning needs_review
+  // could see who authorised a refusal and when -- but nothing here ever
+  // rendered either field, so the row still read as anonymous and
+  // undated. Both must now actually appear.
+  it("a needs_review row with an active acceptance renders WHO accepted it and WHEN", () => {
+    const item = prItem({
+      kind: 'needs_review',
+      acceptanceId: 'acceptance-1',
+      acceptanceJustification: 'Reviewed offline; risk accepted.',
+      acceptanceMergeable: true,
+      acceptedBy: '11111111-1111-1111-1111-111111111111',
+      acceptedAt: '2026-08-20T10:00:00Z',
+    })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).toContain('11111111-1111-1111-1111-111111111111')
+    expect(html).toContain(new Date('2026-08-20T10:00:00Z').toLocaleString())
+  })
+
+  it('a hostile acceptedBy renders as text, never markup (defense in depth -- a raw user id, never actually attacker-authored)', () => {
+    const item = prItem({
+      kind: 'needs_review',
+      acceptanceId: 'acceptance-1',
+      acceptanceJustification: 'Reviewed offline; risk accepted.',
+      acceptanceMergeable: true,
+      acceptedBy: XSS_SCRIPT,
+      acceptedAt: null,
+    })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).not.toContain('<script>')
+    expect(html).toContain('&lt;script&gt;')
+  })
+
+  it('a null acceptedBy (the accepting user was since deleted) renders no "by" clause, never a broken/empty one', () => {
+    const item = prItem({
+      kind: 'needs_review',
+      acceptanceId: 'acceptance-1',
+      acceptanceJustification: 'Reviewed offline; risk accepted.',
+      acceptanceMergeable: true,
+      acceptedBy: null,
+      acceptedAt: '2026-08-20T10:00:00Z',
+    })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).not.toContain(' by ')
+    expect(html).toContain(new Date('2026-08-20T10:00:00Z').toLocaleString())
+  })
+
   it('a hostile justification renders as text, never markup', () => {
-    const item = prItem({ kind: 'needs_review', acceptanceId: 'acceptance-1', acceptanceJustification: XSS_IMG })
+    const item = prItem({ kind: 'needs_review', acceptanceId: 'acceptance-1', acceptanceJustification: XSS_IMG, acceptanceMergeable: true })
     const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
     expect(html).not.toContain('<img')
   })
 
   it('an ordinary needs_review row (never accepted) renders NEITHER the Merge button NOR any acceptance text', () => {
-    const item = prItem({ kind: 'needs_review', acceptanceId: null, acceptanceJustification: null })
+    const item = prItem({ kind: 'needs_review', acceptanceId: null, acceptanceJustification: null, acceptanceMergeable: null })
     const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
     expect(html).not.toContain('>Merge<')
     expect(html).not.toContain('accepted override')
+  })
+
+  // finding R1's own decisive case: an acceptance exists (the chip and
+  // justification still render -- a maintainer must still be able to SEE
+  // it was accepted), but the server reports it does NOT currently
+  // unblock a merge (an open finding, changes requested, or any other
+  // mandatory criterion). Before this fix, hasAcceptedOverride alone
+  // gated the button, so this exact row shape rendered an ENABLED Merge
+  // button that RevalidateForMerge would unconditionally 409 on click.
+  it('a needs_review row with an acceptance that is NOT currently mergeable renders NO Merge button, and explains why', () => {
+    const item = prItem({
+      kind: 'needs_review',
+      acceptanceId: 'acceptance-1',
+      acceptanceJustification: 'Reviewed offline; risk accepted.',
+      acceptanceMergeable: false,
+      acceptanceMergeBlockedReason: 'this pull request has an open, unresolved review finding',
+    })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).not.toContain('>Merge<')
+    // The acceptance itself must still be visible -- never silently
+    // indistinguishable from "never accepted at all".
+    expect(html).toContain('accepted override')
+    expect(html).toContain('Reviewed offline; risk accepted.')
+    expect(html).toContain('Still blocked')
+    expect(html).toContain('this pull request has an open, unresolved review finding')
+  })
+
+  it('a hostile acceptanceMergeBlockedReason renders as text, never markup', () => {
+    const item = prItem({
+      kind: 'needs_review',
+      acceptanceId: 'acceptance-1',
+      acceptanceJustification: 'Reviewed offline; risk accepted.',
+      acceptanceMergeable: false,
+      acceptanceMergeBlockedReason: XSS_SCRIPT,
+    })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).not.toContain('<script>')
+    expect(html).toContain('&lt;script&gt;')
+  })
+
+  // The OTHER direction, named explicitly by finding R1 itself: a client
+  // that hid the button whenever the server WOULD permit the merge is
+  // just as much a defect as one that shows a button that 409s. Ready_to_
+  // merge's own gate is unaffected by acceptanceMergeable (that field is
+  // only ever meaningful for the needs_review+acceptance combination),
+  // so a ready_to_merge row with acceptanceMergeable left null/false must
+  // still show the button, exactly as it always has.
+  it('a ready_to_merge row shows the Merge button regardless of acceptanceMergeable (a different row shape entirely)', () => {
+    const item = prItem({ kind: 'ready_to_merge', acceptanceId: null, acceptanceMergeable: null })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).toContain('>Merge<')
   })
 })
 
