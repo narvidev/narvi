@@ -97,6 +97,44 @@ type reviewCheckNotifier struct {
 	// unrecovered (nothing has been persisted yet to fall back to) --
 	// every subsequent crash, for any PR, recovers correctly once that
 	// row exists.
+	//
+	// C7: a SECOND residual this durability does not close, stated for
+	// the same reason -- a credential rotation that moves this
+	// deployment's own bot token to a DIFFERENT GitHub App's installation
+	// (not merely a new token for the SAME App) leaves this row naming
+	// the OLD App id: nothing here observes a rotation happening, only a
+	// SUCCESSFUL CreateCheckRun's own response, and a rotated credential
+	// keeps succeeding, just attributed to a different App. Between the
+	// rotation and this deployment's own next genuine CreateCheckRun (the
+	// only event that re-teaches this value, recordWriterAppID above),
+	// every cold process reads the STALE, pre-rotation App id back from
+	// this durable row and may adopt (PATCH, via the NEW credential) a
+	// check run GitHub attributes to the OLD App -- for the CORRECT pull
+	// request (finding C1's own per-PR discriminator still applies), so
+	// this is not the cross-PR collapse C1 fixes, but it is still
+	// publishing under an App id this deployment's own CURRENT credential
+	// does not actually own, and if GitHub's Checks API itself refuses a
+	// cross-App update, every retry re-selects the SAME stale candidate
+	// and fails the SAME way -- wedged, not merely delayed, until
+	// something clears this row.
+	//
+	// Deliberately NOT auto-invalidated here: telling "a rotation to a
+	// different App" apart from "a transient PATCH failure for any other
+	// reason" from the adopt error alone is not reliable enough to act on
+	// automatically without risking the opposite mistake (discarding a
+	// good, durably-learned App id on an ordinary transient failure,
+	// which would then race the deployment-wide unrecovered-first-create
+	// window above on every such hiccup). Stated as an operator residual
+	// instead: after rotating this deployment's own bot credential to a
+	// DIFFERENT GitHub App, an operator clears this row (`DELETE FROM
+	// review_check_writer_app_id;`) AND restarts every running process
+	// (a durable-row delete alone does not reach an already-running
+	// process's own in-process writerAppID atomic, checked first,
+	// observedWriterAppID's own doc comment) -- every process then starts
+	// back at "not yet observed" and self-relearns the new credential's
+	// real App id from its own next successful create, the same safe
+	// degradation the deployment-wide first-ever-create race above
+	// already relies on.
 	writerAppID atomic.Int64
 }
 
@@ -385,24 +423,49 @@ func (n *reviewCheckNotifier) Deliver(ctx context.Context, notification ports.No
 	// own required-check evaluation, once a repository opts in, decision
 	// 2) reading the PR sees a check that will never complete, with no
 	// way to tell, from the PR alone, that it is a discarded duplicate
-	// rather than a second, still-running assessment. Recover via
-	// "select by SHA and GitHub App" (the brief's own identity rule,
-	// finding A2's own self-learned writer App id) before creating a
-	// duplicate -- this narrows, but does not eliminate, the race: it
-	// only helps once this process has already learned its own writer
-	// App id from an earlier successful create (writerAppID's own doc
-	// comment), so the FIRST race for a brand-new process (both racers
-	// starting from "not yet observed") still produces this exact
-	// orphan. Closing it structurally would need either serializing the
+	// rather than a second, still-running assessment.
+	//
+	// C2 (corrected -- the prior text here misattributed this residual):
+	// recovering via "select by SHA and GitHub App" (the brief's own
+	// identity rule, finding A2's own self-learned writer App id, now
+	// ALSO the per-PR reviewcheck.PRExternalID, finding C1 below) does
+	// NOT narrow this specific orphan at all, whether or not this
+	// process has already learned its own writer App id: BOTH attempts
+	// reach this branch because NEITHER has recorded an external id
+	// locally yet, which also means neither has CREATED the check run on
+	// GitHub yet -- there is nothing yet on GitHub for either one's own
+	// list call to find and adopt, known writer App id or not. The
+	// known/not-yet-observed distinction changes the outcome of a
+	// SEQUENTIAL recovery (a crash, then a LATER redelivery reaching this
+	// branch after the original create has already landed on GitHub) --
+	// it does nothing for a genuine concurrent race between two attempts
+	// in flight at the same time, which is what this comment is actually
+	// about. Closing the race itself would need either serializing the
 	// two GitHub calls (which ports.Notifier.Deliver's own contract
 	// forbids: no Postgres transaction may span a network call) or a
 	// periodic reconciliation sweep that finds and completes/cleans up a
 	// tracked PR's own orphaned check runs -- neither is built here;
 	// named as a real, open follow-up rather than re-asserted as
 	// harmless.
-	externalID, err := n.resolveOrCreateCheckRun(ctx, payload.Owner, payload.Repo, candidate.HeadSHA, output)
+	//
+	// Finding C1: this orphan is entirely SAME-PR (both racers are
+	// delivering for the identical (repo, pr_number, head_sha)) and is
+	// unrelated to, and not fixed by, reviewcheck.PRExternalID's own
+	// per-PR scoping below -- that fixes a DIFFERENT collapse, two
+	// DIFFERENT pull requests sharing one head commit adopting the SAME
+	// run; this comment's own race is two deliveries for the SAME pull
+	// request, which the per-PR discriminator does not, and is not meant
+	// to, distinguish from each other.
+	externalID, err := n.resolveOrCreateCheckRun(ctx, logger, payload.Owner, payload.Repo, candidate.HeadSHA, candidate.PRNumber, output)
 	if err != nil {
-		return n.classifyAndWrap(logger, "create", err)
+		// C3 (fixed): resolveOrCreateCheckRun now classifies its own
+		// failure at the exact point it occurred (list/adopt/create), so
+		// the error returned here is already logged with the correct op
+		// -- never re-labeled "create" when the real failure was an
+		// adopt PATCH (or the preceding list read), which used to
+		// misdiagnose an adopt-time permission failure as evidence the
+		// CREATE endpoint itself lacks checks:write.
+		return err
 	}
 	// finding A3: same guard as the plain-update branch above, for the
 	// identical reason -- resolveOrCreateCheckRun's own network call(s)
@@ -426,14 +489,37 @@ func (n *reviewCheckNotifier) Deliver(ctx context.Context, notification ports.No
 	return nil
 }
 
-// resolveOrCreateCheckRun implements "select by SHA and GitHub App": it
-// first lists GitHub's own check runs for headSHA and adopts (PATCHes)
-// the one matching reviewcheck.CheckName, this deployment's own
-// SELF-OBSERVED writer App id (finding A2 -- writerAppID's own doc
-// comment; NEVER a merely-configured value that could name a different
-// credential's App entirely), and is NOT ALREADY CONCLUDED (finding A1),
-// if any such run exists -- never merely the first name match. Only when
-// no match is found does it create a brand-new check run.
+// resolveOrCreateCheckRun implements "select by SHA and GitHub App"
+// (finding A2), narrowed to one PULL REQUEST (finding C1): it first lists
+// GitHub's own check runs for headSHA and adopts (PATCHes) the one
+// matching reviewcheck.CheckName, this deployment's own SELF-OBSERVED
+// writer App id (finding A2 -- writerAppID's own doc comment; NEVER a
+// merely-configured value that could name a different credential's App
+// entirely), is NOT ALREADY CONCLUDED (finding A1), AND whose own
+// external_id names prNumber's own reviewcheck.PRExternalID (finding
+// C1), if any such run exists -- never merely the first name match. Only
+// when no match is found does it create a brand-new check run.
+//
+// Finding C1: a GitHub check run is scoped to a commit SHA, never to a
+// pull request -- ListCheckRunsForRef returns the IDENTICAL set of runs
+// for every pull request sharing headSHA (the same branch opened against
+// two bases; a fork PR beside a same-repo PR carrying the same commit).
+// Before this fix, the predicate above stopped at (name, App id, head
+// SHA, not-completed), none of which is scoped to a pull request at
+// all -- resolveOrCreateCheckRun itself was never even given a PR number
+// to scope by. Two such pull requests each emitting for the first time
+// would each independently see nothing to adopt and each create their
+// own run correctly, but the SECOND one to later reach a crash-recovery
+// or cold-adoption read (this function, again, with no external id
+// recorded locally) would find and adopt the FIRST pull request's own
+// run: both pull requests' own review_check_runs rows would then name
+// the SAME external_id, and every later emission from EITHER one
+// overwrites what the OTHER's Checks tab shows -- reproduced against
+// real Postgres (this Step's own report has the full before/after). The
+// prExternalID comparison closes it: reviewcheck.PRExternalID(prNumber)
+// is stamped onto every run this notifier creates (below) and is unique
+// per PR within the (owner, repo) scope every call here already runs
+// under, so a run created for a DIFFERENT pull request never matches.
 //
 // The status exclusion is the fix for a REAL, reproduced defect: the
 // caller (Deliver, above) reaches this function with existingExternalID
@@ -452,10 +538,23 @@ func (n *reviewCheckNotifier) Deliver(ctx context.Context, notification ports.No
 // NOT exclude a concluded run no matter how newIdentityNeeded's own
 // decision was written -- the fix had to reach the wire-level type, not
 // just this function's own logic.
-func (n *reviewCheckNotifier) resolveOrCreateCheckRun(ctx context.Context, owner, repo, headSHA string, output reviewcheck.Output) (int64, error) {
+//
+// C3 (fixed): every failure below is classified (n.classifyAndWrap) at
+// the exact point it occurred -- "list", "adopt", or "create" -- rather
+// than left for the caller to label uniformly as "create". An adopt-time
+// PATCH failure is the one shape that used to be misdiagnosed hardest: it
+// used to surface as "outboxworker: reviewCheckNotifier: create check
+// run: ... permission denied", which reads as "the create endpoint lacks
+// checks:write" even when a check run was already found (meaning the
+// preceding list read succeeded) and only the PATCH itself failed -- the
+// one diagnosis this feature most needs to be accurate about, since a
+// missing checks:write is this feature's own expected first production
+// state (classifyAndWrap's own doc comment).
+func (n *reviewCheckNotifier) resolveOrCreateCheckRun(ctx context.Context, logger *slog.Logger, owner, repo, headSHA string, prNumber int32, output reviewcheck.Output) (int64, error) {
+	prExternalID := reviewcheck.PRExternalID(prNumber)
 	existing, err := n.adapter.ListCheckRunsForRef(ctx, owner, repo, headSHA, n.botToken)
 	if err != nil {
-		return 0, fmt.Errorf("list check runs for ref: %w", err)
+		return 0, n.classifyAndWrap(logger, "list", err)
 	}
 	// observedAppID == 0 ("not yet observed", writerAppID's own doc
 	// comment) means this process cannot yet tell ITS OWN check runs
@@ -466,17 +565,17 @@ func (n *reviewCheckNotifier) resolveOrCreateCheckRun(ctx context.Context, owner
 	observedAppID := n.observedWriterAppID(ctx)
 	if observedAppID != 0 {
 		for _, run := range existing {
-			if run.Name == reviewcheck.CheckName && run.AppID == observedAppID && run.HeadSHA == headSHA && run.Status != string(reviewcheck.StatusCompleted) {
+			if run.Name == reviewcheck.CheckName && run.AppID == observedAppID && run.HeadSHA == headSHA && run.Status != string(reviewcheck.StatusCompleted) && run.ExternalID == prExternalID {
 				if err := n.adapter.UpdateCheckRun(ctx, owner, repo, n.botToken, run.ID, string(output.Status), string(output.Conclusion), output.Title, output.Summary); err != nil {
-					return 0, fmt.Errorf("adopt existing check run %d: %w", run.ID, err)
+					return 0, n.classifyAndWrap(logger, "adopt", err)
 				}
 				return run.ID, nil
 			}
 		}
 	}
-	id, appID, err := n.adapter.CreateCheckRun(ctx, owner, repo, n.botToken, headSHA, reviewcheck.CheckName, string(output.Status), string(output.Conclusion), output.Title, output.Summary)
+	id, appID, err := n.adapter.CreateCheckRun(ctx, owner, repo, n.botToken, headSHA, reviewcheck.CheckName, string(output.Status), string(output.Conclusion), output.Title, output.Summary, prExternalID)
 	if err != nil {
-		return 0, fmt.Errorf("create check run: %w", err)
+		return 0, n.classifyAndWrap(logger, "create", err)
 	}
 	n.recordWriterAppID(ctx, appID)
 	return id, nil
@@ -501,17 +600,23 @@ func (n *reviewCheckNotifier) resolveOrCreateCheckRun(ctx context.Context, owner
 // different head sha means a different external identity entirely,
 // which the emission that changed it owns and publishes for itself) --
 // logged, left alone. And if row.ExternalID no longer names externalID
-// at all (finding B1) -- newIdentityNeeded (Deliver, above) already
-// cleared it and a newer attempt opened a FRESH check run for this SAME
-// head sha, entirely within this call's own network-call window -- the
-// self-heal above is not merely stale, it is aimed at the WRONG run: the
-// row has genuinely moved on to a different external identity, exactly
-// like the different-head-sha case, and PATCHing externalID would
-// reopen an already-concluded check run this row no longer claims
-// (A1's own forbidden shape, reached through a path resolveOrCreateCheckRun's
-// status predicate does not cover, since it never runs for an
-// in-place update). Logged, left alone, same as the different-head-sha
-// case.
+// (finding B1) -- newIdentityNeeded (Deliver, above) already cleared it
+// for a newer attempt at this SAME head sha, entirely within this call's
+// own network-call window -- the self-heal above is not merely stale, it
+// would be aimed at the WRONG run: the row has genuinely moved off this
+// external identity, exactly like the different-head-sha case, and
+// PATCHing externalID would reopen an already-concluded check run this
+// row no longer claims (A1's own forbidden shape, reached through a path
+// resolveOrCreateCheckRun's status predicate does not cover, since it
+// never runs for an in-place update). Logged, left alone, same as the
+// different-head-sha case -- C6 (fixed): row.ExternalID is nil in the
+// MORE common of the two shapes here (the newer attempt's own create has
+// not yet landed, or its own SetExternalID itself lost a guard to a
+// still-newer write -- nothing has actually been recorded yet), and
+// non-nil-but-different in the less common one (a fresh identity has
+// already landed); the two are logged distinctly below rather than under
+// one "already opened a fresh identity" message that only the second
+// shape earns.
 //
 // Best-effort throughout: a failure reading the row, or a failure
 // PATCHing the correction, is logged and swallowed, never propagated as
@@ -564,13 +669,26 @@ func (n *reviewCheckNotifier) guardAgainstSupersessionDuringCall(ctx context.Con
 	// than write onto an identity this row has already moved off of --
 	// the newer attempt's own Deliver call already published, or will
 	// publish, its own correct output to its own run.
-	if row.ExternalID == nil || *row.ExternalID != externalID {
-		var rowExternalID any = "none"
-		if row.ExternalID != nil {
-			rowExternalID = *row.ExternalID
-		}
-		logger.Warn("outboxworker: reviewCheckNotifier: row's own external id no longer names the run this call published to; a newer emission already opened a fresh identity for this head sha -- nothing to self-heal on the run this call wrote to",
-			"repo", repoFullName, "pr_number", prNumber, "external_id", externalID, "row_external_id", rowExternalID,
+	// C6 (fixed): the two shapes below share a return, but not an actual
+	// cause -- the prior single log line asserted "a newer emission
+	// already opened a fresh identity" for BOTH, which is only true of
+	// the second. row.ExternalID == nil is, in practice, the MORE common
+	// of the two: newIdentityNeeded has cleared the column and the
+	// genuinely newer attempt's own GitHub call (create-and-record) is
+	// still in flight, or that attempt's own SetExternalID itself lost
+	// its guard to a STILL-newer write -- either way nothing has been
+	// durably recorded here yet, "already opened" overstates what is
+	// actually known. Only the non-nil-mismatch case below is a fresh
+	// identity that has genuinely already landed.
+	if row.ExternalID == nil {
+		logger.Warn("outboxworker: reviewCheckNotifier: row no longer records any external id for this head sha; a newer attempt's own identity claim is in flight (or itself lost its guard) -- nothing recorded yet to self-heal onto",
+			"repo", repoFullName, "pr_number", prNumber, "external_id", externalID,
+			"candidate_attempt", candidate.AttemptID, "current_attempt", current.AttemptID)
+		return
+	}
+	if *row.ExternalID != externalID {
+		logger.Warn("outboxworker: reviewCheckNotifier: row's own external id no longer names the run this call published to; a newer emission already opened and recorded a fresh identity for this head sha -- nothing to self-heal on the run this call wrote to",
+			"repo", repoFullName, "pr_number", prNumber, "external_id", externalID, "row_external_id", *row.ExternalID,
 			"candidate_attempt", candidate.AttemptID, "current_attempt", current.AttemptID)
 		return
 	}
@@ -592,7 +710,13 @@ func (n *reviewCheckNotifier) guardAgainstSupersessionDuringCall(ctx context.Con
 // reading logs (or a future dead-letter reason column) can already tell
 // a missing `checks:write` permission apart from a flaky network apart
 // from GitHub's own rate limiting, without this classification
-// collapsing all three into one indistinguishable "delivery failed".
+// collapsing all three into one indistinguishable "delivery failed". A
+// missing `checks:write` scope is this feature's own expected FIRST
+// production state (an installation this codebase does not itself grant
+// the scope to), which is exactly why op (below) must name the real
+// operation that failed -- C3's own fix, resolveOrCreateCheckRun's own
+// doc comment -- rather than a caller-asserted label that may not match
+// where the failure actually occurred.
 func (n *reviewCheckNotifier) classifyAndWrap(logger *slog.Logger, op string, err error) error {
 	var apiErr *githubapi.APIError
 	switch {

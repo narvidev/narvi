@@ -12,12 +12,26 @@ package reviewcheck
 type Phase string
 
 const (
-	// PhaseQueued is published as soon as a pull request enters scope,
-	// before any review has started (decision 2: "otherwise a PR nobody
-	// triggered a review on carries no check, and a required check that
-	// is never published makes the PR mergeable by absence"). No
-	// attempt exists yet -- an Emission in this phase always carries
-	// AttemptID == "".
+	// PhaseQueued is decision 2's own answer for what a check says before
+	// any review has started: "otherwise a PR nobody triggered a review
+	// on carries no check, and a required check that is never published
+	// makes the PR mergeable by absence". No attempt exists yet -- an
+	// Emission in this phase always carries AttemptID == "".
+	//
+	// C4 (correction, already made at the three sites that enqueue this
+	// Phase -- ports.NotificationKindGitHubReviewCheck's own doc comment,
+	// notifier.go; github.coalesce.go's own Deps.Outbox doc comment; and
+	// coalesce.go's own CreateOrJoin call-site comment -- and, until this
+	// fix, left unmade here): decision 2 itself says "as soon as a pull
+	// request enters scope" -- what THIS Step actually wires is narrower.
+	// The one WINNER path that enqueues a PhaseQueued emission
+	// (coalesce.go's own CreateOrJoin) is only ever reached from a
+	// resolved @mention or a label re-trigger, never from a bare
+	// pull_request "opened" webhook, so what actually fires is "a review
+	// was TRIGGERED", not "a pull request entered scope" -- a PR nobody
+	// has ever mentioned the bot on still carries no check at all. This
+	// is a deferred gap, named at every site that wires the trigger,
+	// never silently assumed closed.
 	PhaseQueued Phase = "queued"
 	// PhaseRunning is published once a review turn has been dispatched
 	// for the current attempt -- an assessment is in flight, but no

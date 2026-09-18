@@ -1,5 +1,7 @@
 package reviewcheck
 
+import "strconv"
+
 // CheckName is the fixed, single check name every narvi/review check run
 // this publisher ever creates or updates carries -- GitHub's own "select
 // by SHA and App" identity rule (§21.1b/the brief's own identity rules)
@@ -10,6 +12,42 @@ package reviewcheck
 // caller that could rename its own check would defeat the one piece of
 // this identity a human actually recognizes.
 const CheckName = "narvi/review"
+
+// PRExternalID is the value this publisher asks GitHub to store,
+// verbatim, in a check run's own "external_id" request/response field --
+// GitHub's own caller-supplied, caller-readable discriminator. This is
+// NOT the same concept as what this codebase's own existing vocabulary
+// elsewhere calls "external id" (ReviewCheckRunStore's own external_id
+// column, internal/app/outboxworker's own externalID variables) -- THAT
+// is GitHub's "id", the integer GitHub itself assigns on creation and
+// returns from every create/update call. GitHub's Checks API genuinely
+// has both, under those exact names; the collision is GitHub's own
+// vocabulary, not invented here, and is called out explicitly because it
+// is easy to conflate the two while reading the caller of this function.
+//
+// A check run is scoped to one commit SHA, never to one pull request --
+// GitHub's own "list check runs for a git reference" read (the
+// recovery/adoption path, internal/app/outboxworker's own
+// resolveOrCreateCheckRun) returns the IDENTICAL set of check runs for
+// every pull request that happens to share a head commit (the same
+// branch opened against two bases, or a fork PR beside a same-repo PR
+// carrying the same commit). Filtering that list by (name, App id, head
+// SHA, not-completed) alone -- this package's own prior identity rule --
+// does not distinguish one such pull request from another: the SECOND
+// pull request's own recovery read then adopts the FIRST one's check
+// run, and the two collapse onto one GitHub identity, with every later
+// emission from either one overwriting what the other's Checks tab
+// shows. This value closes that gap by giving the adoption filter a
+// discriminator that a shared commit does not share.
+//
+// The value is simply the PR number as a decimal string -- stable, and
+// already unique within the (owner, repo) scope every caller of this
+// function is already operating under (the REST path itself carries
+// owner/repo; ListCheckRunsForRef's own ref parameter already scopes by
+// commit) -- no further namespacing is needed.
+func PRExternalID(prNumber int32) string {
+	return strconv.Itoa(int(prNumber))
+}
 
 // Status is GitHub's own check-run "status" vocabulary (the Checks API's
 // documented enum: queued, in_progress, completed -- nothing else is a

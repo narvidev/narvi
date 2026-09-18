@@ -79,6 +79,27 @@ func TestComputeOutput_IncompleteNeverCarriesConclusion(t *testing.T) {
 	}
 }
 
+// TestPRExternalID_DistinctPerPRNumber pins the property the adoption
+// filter (internal/app/outboxworker's own resolveOrCreateCheckRun)
+// actually relies on: two different pull requests must never compute the
+// SAME discriminator, and the SAME pull request must always compute the
+// SAME one -- otherwise a per-PR adoption filter built on top of this
+// value would be no filter at all.
+func TestPRExternalID_DistinctPerPRNumber(t *testing.T) {
+	firstCallFor101 := PRExternalID(101)
+	secondCallFor101 := PRExternalID(101)
+	for102 := PRExternalID(102)
+	if firstCallFor101 == for102 {
+		t.Fatalf("PRExternalID(101) == PRExternalID(102) == %q, want distinct values for distinct PR numbers", firstCallFor101)
+	}
+	if firstCallFor101 != secondCallFor101 {
+		t.Fatalf("PRExternalID(101) is not stable across calls: %q != %q", firstCallFor101, secondCallFor101)
+	}
+	if got, want := firstCallFor101, "101"; got != want {
+		t.Errorf("PRExternalID(101) = %q, want %q", got, want)
+	}
+}
+
 // TestComputeOutput_UnrecognizedPhaseFailsClosed pins the fail-closed
 // default: a Phase this package does not recognize must never render as
 // a pass.

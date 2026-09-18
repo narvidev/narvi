@@ -28,12 +28,24 @@ import (
 // serialized at all: GitHub's own API rejects a conclusion field on an
 // incomplete check run, and an explicit empty string is not the same
 // wire shape as an absent field).
+// ExternalID (finding C1) is GitHub's own "external_id" request field --
+// a caller-supplied, caller-readable discriminator, entirely distinct
+// from the "id" GitHub itself assigns (what checkRunResponse.ID and this
+// codebase's own broader "external id" vocabulary elsewhere both name --
+// see reviewcheck.PRExternalID's own doc comment for the full "why two
+// things are both called this" disambiguation). Only ever populated on
+// CreateCheckRun -- UpdateCheckRun never sends it, mirroring
+// name/head_sha's own "not re-sent on update" precedent immediately
+// below: a caller updating an EXISTING check run already knows which one
+// it means (by GitHub's own numeric id), and this value never changes
+// for a check run's own lifetime once created.
 type checkRunRequest struct {
 	Name       string          `json:"name,omitempty"`
 	HeadSHA    string          `json:"head_sha,omitempty"`
 	Status     string          `json:"status,omitempty"`
 	Conclusion *string         `json:"conclusion,omitempty"`
 	Output     *checkRunOutput `json:"output,omitempty"`
+	ExternalID *string         `json:"external_id,omitempty"`
 }
 
 type checkRunOutput struct {
@@ -55,6 +67,11 @@ type checkRunResponse struct {
 	HeadSHA    string `json:"head_sha"`
 	Status     string `json:"status"`
 	Conclusion string `json:"conclusion"`
+	// ExternalID (finding C1) is GitHub's own "external_id" response
+	// field, read back so a recovery caller (ListCheckRunsForRef, below)
+	// can filter candidates by it -- see checkRunRequest.ExternalID's own
+	// doc comment for what this is and is not.
+	ExternalID string `json:"external_id"`
 	App        struct {
 		ID int64 `json:"id"`
 	} `json:"app"`
@@ -72,14 +89,19 @@ type checkRunResponse struct {
 // entirely different credential's App. conclusion == "" (
 // reviewcheck.ConclusionNone) omits the field entirely -- required for
 // status == "queued"/"in_progress" (GitHub rejects a conclusion on an
-// incomplete run).
-func (a *Adapter) CreateCheckRun(ctx context.Context, owner, repo, token, headSHA, name, status, conclusion, title, summary string) (id int64, appID int64, err error) {
+// incomplete run). prExternalID (finding C1) is stamped onto GitHub's own
+// "external_id" request field -- reviewcheck.PRExternalID's own doc
+// comment has the full "why": without it, two pull requests sharing one
+// head commit are indistinguishable to a later recovery/adoption read,
+// which sees only the commit, never the pull request.
+func (a *Adapter) CreateCheckRun(ctx context.Context, owner, repo, token, headSHA, name, status, conclusion, title, summary, prExternalID string) (id int64, appID int64, err error) {
 	reqBody, err := json.Marshal(checkRunRequest{
 		Name:       name,
 		HeadSHA:    headSHA,
 		Status:     status,
 		Conclusion: nonEmptyStringPtr(conclusion),
 		Output:     &checkRunOutput{Title: title, Summary: summary},
+		ExternalID: nonEmptyStringPtr(prExternalID),
 	})
 	if err != nil {
 		return 0, 0, fmt.Errorf("githubapi: encode create-check-run request: %w", err)
@@ -147,8 +169,13 @@ type listCheckRunsForRefResponse struct {
 // adopted, AND whose Status is not yet "completed" (finding A1 -- a
 // concluded check run is never a recovery candidate: "open a NEW check
 // when a review restarts after a terminal result... never reopen a
-// concluded one"), so a crash between a successful create and this
-// system's own record of its id can recover the real one rather than
+// concluded one"), AND whose ExternalID matches the requesting pull
+// request's own reviewcheck.PRExternalID (finding C1 -- a check run is
+// scoped to a commit, never to a pull request, so two open pull requests
+// sharing one head commit see the identical set of runs here; without
+// this last filter, the second such pull request's own recovery read
+// adopts the first one's run), so a crash between a successful create and
+// this system's own record of its id can recover the real one rather than
 // creating a duplicate.
 //
 // per_page=100, mirroring every other list GET in this adapter
@@ -179,7 +206,7 @@ func (a *Adapter) ListCheckRunsForRef(ctx context.Context, owner, repo, ref, tok
 	}
 	out := make([]CheckRunSummary, 0, len(parsed.CheckRuns))
 	for _, r := range parsed.CheckRuns {
-		out = append(out, CheckRunSummary{ID: r.ID, Name: r.Name, HeadSHA: r.HeadSHA, AppID: r.App.ID, Status: r.Status, Conclusion: r.Conclusion})
+		out = append(out, CheckRunSummary{ID: r.ID, Name: r.Name, HeadSHA: r.HeadSHA, AppID: r.App.ID, Status: r.Status, Conclusion: r.Conclusion, ExternalID: r.ExternalID})
 	}
 	return out, nil
 }
@@ -202,6 +229,17 @@ type CheckRunSummary struct {
 	AppID      int64
 	Status     string
 	Conclusion string
+	// ExternalID (finding C1) is GitHub's own "external_id" field, read
+	// back verbatim -- the per-pull-request discriminator
+	// reviewcheck.PRExternalID computes and CreateCheckRun stamps onto
+	// every run this publisher creates. Empty for any check run created
+	// before this fix shipped (GitHub never backfills a field an old
+	// create call never sent), so it never accidentally matches a
+	// caller's own non-empty expected value -- an old run degrades to
+	// "never adopted", the same safe direction every other unrecognized-
+	// candidate case in this file already degrades to, never a false
+	// match.
+	ExternalID string
 }
 
 // nonEmptyStringPtr returns nil for an empty string, &s otherwise --

@@ -69,6 +69,12 @@ type fakeCheckRun struct {
 	AppID      int64
 	Status     string
 	Conclusion string
+	// ExternalID (finding C1) mirrors real GitHub's own immutable
+	// "external_id" field: captured once, from CreateCheckRun's own
+	// request body, and echoed back on every later list/get -- never
+	// mutated by UpdateCheckRun (GitHub's own PATCH endpoint does not
+	// accept it either), exactly like Name/HeadSHA beside it.
+	ExternalID string
 }
 
 // fakeCheckRunGitHub is an in-memory stand-in for GitHub's real Checks
@@ -112,6 +118,15 @@ type fakeCheckRunGitHub struct {
 	// synchronous call from inside this hook reaches Postgres exactly as
 	// a genuinely concurrent second process would.
 	onCreate func()
+	// failPatchStatus (finding C3's own reproduction), when nonzero,
+	// makes every PATCH respond with this HTTP status and a permission-
+	// denied-shaped body instead of mutating state -- lets a test force
+	// an ADOPT-time failure specifically (a check run already exists and
+	// is found by the list read; only the PATCH that would adopt it
+	// fails), distinct from a CREATE-time failure, which every other test
+	// in this file already covers via the permission/rate-limit tests in
+	// githubapi's own checkruns_test.go.
+	failPatchStatus int
 }
 
 func newFakeCheckRunGitHub() *fakeCheckRunGitHub {
@@ -150,7 +165,8 @@ func (f *fakeCheckRunGitHub) server() *httptest.Server {
 			headSHA, _ := body["head_sha"].(string)
 			status, _ := body["status"].(string)
 			conclusion, _ := body["conclusion"].(string)
-			f.runs[id] = &fakeCheckRun{Name: name, HeadSHA: headSHA, AppID: f.appID, Status: status, Conclusion: conclusion}
+			externalID, _ := body["external_id"].(string)
+			f.runs[id] = &fakeCheckRun{Name: name, HeadSHA: headSHA, AppID: f.appID, Status: status, Conclusion: conclusion, ExternalID: externalID}
 			f.creates++
 			appID := f.appID
 			f.mu.Unlock()
@@ -160,6 +176,14 @@ func (f *fakeCheckRunGitHub) server() *httptest.Server {
 			id := parseTrailingID(r.URL.Path)
 			if f.onPatch != nil {
 				f.onPatch(id)
+			}
+			f.mu.Lock()
+			failStatus := f.failPatchStatus
+			f.mu.Unlock()
+			if failStatus != 0 {
+				w.WriteHeader(failStatus)
+				_ = json.NewEncoder(w).Encode(map[string]any{"message": "Resource not accessible by integration"})
+				return
 			}
 			f.mu.Lock()
 			if run, ok := f.runs[id]; ok {
@@ -201,6 +225,7 @@ func (f *fakeCheckRunGitHub) server() *httptest.Server {
 					"id": e.ID, "name": e.Run.Name, "head_sha": e.Run.HeadSHA,
 					"status": e.Run.Status, "conclusion": e.Run.Conclusion,
 					"app": map[string]any{"id": e.Run.AppID},
+					"external_id": e.Run.ExternalID,
 				})
 			}
 			w.WriteHeader(http.StatusOK)
@@ -249,7 +274,7 @@ func (f *fakeCheckRunGitHub) stateFor(id int64) map[string]any {
 	if !ok {
 		return nil
 	}
-	return map[string]any{"status": run.Status, "conclusion": run.Conclusion, "name": run.Name, "head_sha": run.HeadSHA, "app_id": run.AppID}
+	return map[string]any{"status": run.Status, "conclusion": run.Conclusion, "name": run.Name, "head_sha": run.HeadSHA, "app_id": run.AppID, "external_id": run.ExternalID}
 }
 
 func (f *fakeCheckRunGitHub) counts() (creates, updates int32) {
@@ -447,11 +472,16 @@ func TestReviewCheckNotifier_ConcurrentAttempts_ResolveToOneIdentity(t *testing.
 	// invariant this system actually promises (§21.1b: "Two active
 	// identities... worse than none" -- ACTIVE, i.e. ones this system
 	// still treats as current). A GitHub-side orphan from the losing
-	// attempt is the same accepted, bounded residual already documented
-	// on SetReviewCheckRunExternalID's own generated doc comment -- named
-	// here explicitly rather than asserted away, since asserting it away
-	// would require holding a Postgres transaction across the GitHub
-	// call, which this codebase's own Notifier.Deliver contract forbids.
+	// attempt is the same residual already documented on
+	// SetReviewCheckRunExternalID's own generated doc comment --
+	// reassessed there, NOT harmless (finding A7: it sits on the pull
+	// request's own Checks tab PERMANENTLY queued or in_progress, a
+	// second, real, human-visible entry beside the one this system keeps
+	// correctly updating) -- named here explicitly rather than asserted
+	// away or softened back into "accepted, bounded", since asserting it
+	// away would require holding a Postgres transaction across the
+	// GitHub call, which this codebase's own Notifier.Deliver contract
+	// forbids.
 }
 
 // TestReviewCheckNotifier_TerminalRestart_NeverReopensConcludedRun is
@@ -1015,5 +1045,78 @@ func TestReviewCheckNotifier_SelfHealNeverReopensARunANewerIdentityAbandoned(t *
 	}
 	if stateA["status"] != "completed" || stateA["conclusion"] != "success" {
 		t.Fatalf("attempt A's own run (id %d) = %+v, want UNCHANGED completed/success -- the self-heal must never reopen a run a newer identity has already abandoned this row for", runAID, stateA)
+	}
+}
+
+// TestReviewCheckNotifier_AdoptFailure_ClassifiedAsAdoptNotCreate is C3's
+// own reproduction: an adopt-time PATCH failure (a check run already
+// exists and is found by the recovery/adoption read; only the PATCH that
+// would adopt it fails) must be classified and logged as "adopt", never
+// mislabeled "create" -- the create endpoint is never even reached on
+// this path, so a log naming it as the failure point misdirects an
+// operator's very first diagnosis: "does the create endpoint have
+// checks:write" when the real, narrower question is "does the update
+// endpoint".
+func TestReviewCheckNotifier_AdoptFailure_ClassifiedAsAdoptNotCreate(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	store := narvipg.NewReviewCheckRunStore(pool)
+
+	fake := newFakeCheckRunGitHub()
+	server := fake.server()
+	defer server.Close()
+
+	adapter := githubapi.New(server.Client(), server.URL)
+	notifier := outboxworker.NewReviewCheckNotifier(pool, store, adapter, "tok")
+
+	owner, repoName := "acme", fmt.Sprintf("adoptfail-repo-%d", time.Now().UnixNano())
+	const prNumber = 303
+	const headSHA = "f00dbead"
+
+	attempt := newTestAttempt(ctx, t, pool)
+	created := time.Date(2026, 9, 18, 9, 0, 0, 0, time.UTC)
+
+	// First delivery: a genuine, successful create -- establishes a real
+	// check run AND teaches this notifier its own writer App id.
+	runningPayload, err := json.Marshal(ports.ReviewCheckPayload{
+		Owner: owner, Repo: repoName, PRNumber: prNumber, HeadSHA: headSHA,
+		AttemptID: attempt, AttemptCreatedAt: created, Phase: "running",
+	})
+	if err != nil {
+		t.Fatalf("marshal running: %v", err)
+	}
+	if err := notifier.Deliver(ctx, ports.Notification{Kind: ports.NotificationKindGitHubReviewCheck, Payload: runningPayload}); err != nil {
+		t.Fatalf("Deliver(running) error = %v", err)
+	}
+
+	// Simulate "the local record of external_id was lost" (the SAME
+	// setup TestReviewCheckNotifier_Recovery_AdoptsOwnInFlightRun already
+	// uses) -- the next delivery must reach resolveOrCreateCheckRun's
+	// adoption branch, not a plain update.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin clear-external-id tx: %v", err)
+	}
+	if err := store.WithTx(tx).ClearExternalID(ctx, owner+"/"+repoName, prNumber); err != nil {
+		t.Fatalf("clear external id: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit clear-external-id tx: %v", err)
+	}
+
+	// Arm the failure: every PATCH from here on fails with a permission-
+	// denied shape -- the adoption branch's own PATCH will hit this.
+	fake.failPatchStatus = http.StatusForbidden
+
+	err = notifier.Deliver(ctx, ports.Notification{Kind: ports.NotificationKindGitHubReviewCheck, Payload: runningPayload})
+	if err == nil {
+		t.Fatal("Deliver() error = nil, want the adopt-time PATCH failure to surface")
+	}
+	t.Logf("Deliver() error = %v", err)
+	if !strings.Contains(err.Error(), "adopt check run") {
+		t.Errorf("error = %q, want it to name the adopt op (\"adopt check run\") -- a caller reading this must not be told the CREATE endpoint failed when the failure was actually an ADOPT-time PATCH", err.Error())
+	}
+	if strings.Contains(err.Error(), "create check run") {
+		t.Errorf("error = %q, misclassified as a create failure -- the create endpoint was never even called on this path (a check run already existed to adopt)", err.Error())
 	}
 }

@@ -35,7 +35,7 @@ func TestCreateCheckRun_Queued(t *testing.T) {
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	id, appID, err := adapter.CreateCheckRun(context.Background(), "acme", "widgets", "tok", "deadbeef", "narvi/review", "queued", "", "Review queued", "Narvi has not yet started reviewing this pull request.")
+	id, appID, err := adapter.CreateCheckRun(context.Background(), "acme", "widgets", "tok", "deadbeef", "narvi/review", "queued", "", "Review queued", "Narvi has not yet started reviewing this pull request.", "101")
 	if err != nil {
 		t.Fatalf("CreateCheckRun() error = %v", err)
 	}
@@ -70,6 +70,11 @@ func TestCreateCheckRun_Queued(t *testing.T) {
 	if gotBody["name"] != "narvi/review" {
 		t.Errorf("posted name = %v, want narvi/review", gotBody["name"])
 	}
+	// finding C1: the per-PR discriminator must reach the wire, under
+	// GitHub's own "external_id" field name.
+	if gotBody["external_id"] != "101" {
+		t.Errorf("posted external_id = %v, want 101", gotBody["external_id"])
+	}
 }
 
 // TestCreateCheckRun_TerminalCarriesConclusion proves the opposite shape:
@@ -86,7 +91,7 @@ func TestCreateCheckRun_TerminalCarriesConclusion(t *testing.T) {
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	if _, _, err := adapter.CreateCheckRun(context.Background(), "acme", "widgets", "tok", "sha1", "narvi/review", "completed", "action_required", "Review not completed", "..."); err != nil {
+	if _, _, err := adapter.CreateCheckRun(context.Background(), "acme", "widgets", "tok", "sha1", "narvi/review", "completed", "action_required", "Review not completed", "...", "202"); err != nil {
 		t.Fatalf("CreateCheckRun() error = %v", err)
 	}
 	if gotBody["conclusion"] != "action_required" {
@@ -156,8 +161,8 @@ func TestListCheckRunsForRef_FiltersByAppAndName(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"total_count": 2,
 			"check_runs": []map[string]any{
-				{"id": 1, "name": "narvi/review", "head_sha": "deadbeef", "app": map[string]any{"id": 999}},
-				{"id": 2, "name": "narvi/review", "head_sha": "deadbeef", "app": map[string]any{"id": 111}},
+				{"id": 1, "name": "narvi/review", "head_sha": "deadbeef", "app": map[string]any{"id": 999}, "external_id": "101"},
+				{"id": 2, "name": "narvi/review", "head_sha": "deadbeef", "app": map[string]any{"id": 111}, "external_id": "102"},
 			},
 		})
 	}))
@@ -172,12 +177,15 @@ func TestListCheckRunsForRef_FiltersByAppAndName(t *testing.T) {
 		t.Fatalf("got %d check runs, want 2", len(runs))
 	}
 	var ourAppID, otherAppID int64
+	var ourExternalID, otherExternalID string
 	for _, r := range runs {
 		if r.AppID == 999 {
 			ourAppID = r.ID
+			ourExternalID = r.ExternalID
 		}
 		if r.AppID == 111 {
 			otherAppID = r.ID
+			otherExternalID = r.ExternalID
 		}
 	}
 	if ourAppID != 1 {
@@ -185,6 +193,16 @@ func TestListCheckRunsForRef_FiltersByAppAndName(t *testing.T) {
 	}
 	if otherAppID != 2 {
 		t.Errorf("other app's (111) check run id = %d, want 2 -- must be distinguishable, never adopted", otherAppID)
+	}
+	// finding C1: ExternalID (GitHub's own per-PR discriminator field)
+	// must round-trip through this read, distinctly per run -- this is
+	// what lets a caller scope adoption to one pull request even when two
+	// runs share both name and head SHA.
+	if ourExternalID != "101" {
+		t.Errorf("our app's (999) check run ExternalID = %q, want 101", ourExternalID)
+	}
+	if otherExternalID != "102" {
+		t.Errorf("other app's (111) check run ExternalID = %q, want 102", otherExternalID)
 	}
 }
 
@@ -220,7 +238,7 @@ func TestCreateCheckRun_PermissionDeniedIsDistinguishable(t *testing.T) {
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	_, _, err := adapter.CreateCheckRun(context.Background(), "acme", "widgets", "tok", "sha1", "narvi/review", "queued", "", "t", "s")
+	_, _, err := adapter.CreateCheckRun(context.Background(), "acme", "widgets", "tok", "sha1", "narvi/review", "queued", "", "t", "s", "303")
 	if err == nil {
 		t.Fatal("CreateCheckRun() error = nil, want a permission-denied error")
 	}
@@ -250,7 +268,7 @@ func TestCreateCheckRun_RateLimitedIsDistinguishable(t *testing.T) {
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	_, _, err := adapter.CreateCheckRun(context.Background(), "acme", "widgets", "tok", "sha1", "narvi/review", "queued", "", "t", "s")
+	_, _, err := adapter.CreateCheckRun(context.Background(), "acme", "widgets", "tok", "sha1", "narvi/review", "queued", "", "t", "s", "303")
 	if err == nil {
 		t.Fatal("CreateCheckRun() error = nil, want a rate-limit error")
 	}
