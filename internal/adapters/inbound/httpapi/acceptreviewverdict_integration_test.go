@@ -9,15 +9,19 @@
 package httpapi_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // TestAcceptReviewVerdict_HappyPath proves a maintainer+ can accept a
@@ -388,5 +392,117 @@ func TestRevokeReviewVerdictAcceptance_UnknownID_Returns404(t *testing.T) {
 	status := rig.doJSON(t, http.MethodPost, "/api/decision-inbox/revoke-verdict-acceptance", body, nil, token)
 	if status != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d", status, http.StatusNotFound)
+	}
+}
+
+// TestAcceptReviewVerdict_ConcurrentAccept_ExactlyOneActive exercises
+// AcceptReviewVerdict itself (not merely the store) under real HTTP
+// concurrency: N requests race to accept the SAME verdict, and the row
+// count must settle at EXACTLY one active acceptance regardless of how
+// many individual requests succeeded (201) versus lost to the
+// unique-constraint violation (500, an accepted, documented residual --
+// ReviewVerdictAcceptanceStore.Insert's own doc comment: "an ordinary,
+// retryable 500, never a silent violation of 'at most one active row'").
+//
+// HONEST LIMIT, stated rather than implied (execution-checked): this test
+// does NOT reliably distinguish AcceptReviewVerdict calling Acceptances.
+// WithTx(tx).Insert from a reverted version calling the bare,
+// pool-scoped Acceptances.Insert directly -- both configurations were
+// run against this exact test and both left activeCount == 1. The reason
+// is structural, not a weak assertion: the ONLY way Insert can fail
+// through this real endpoint is the unique-constraint race itself (the
+// handler's own req.VerdictId mismatch check refuses a bogus verdict id
+// with a 409 before Accept is ever called, so the foreign-key-violation
+// failure mode the store-level tests use to force a deterministic
+// partial failure is unreachable here) -- and an ordinary "loser
+// collides with an already-committed winner" race tends to self-heal via
+// later racers' own chained supersessions even without per-request
+// atomicity, in exactly the interleavings this test's own goroutines
+// produced when checked against the reverted handler. The DETERMINISTIC
+// proof that WithTx is what makes a genuine partial failure roll back
+// together -- rather than leaving zero active rows, per finding F2,
+// adversarial review -- is
+// reviewverdictacceptance_store_integration_test.go's own
+// TestReviewVerdictAcceptanceStore_Insert_PartialFailureRollsBackTogether/
+// _WithoutTxLeavesNoActiveAcceptanceOnPartialFailure pair, which forces
+// the second half to fail via a real foreign-key violation rather than a
+// race. This test still earns its place alongside them: it is the one
+// place the handler's OWN transaction/commit/rollback wiring runs
+// end-to-end under concurrency without throwing an unhandled panic or
+// leaving a stuck connection, which the store-level tests, calling the
+// store directly, cannot exercise.
+func TestAcceptReviewVerdict_ConcurrentAccept_ExactlyOneActive(t *testing.T) {
+	rig := newDecisionInboxTestRig(t, &fakeMergeSourceControl{})
+	ctx := context.Background()
+
+	_, token := rig.createAuthenticatedUser(ctx, t, sqlcgen.UserRoleMaintainer)
+	const repoFullName = "acme/accept-verdict-concurrent"
+	rig.seedAutoApprovedVerdict(ctx, t, repoFullName, 508, "headsha508")
+
+	record, hasVerdict, err := appreviewverdict.GetLatest(ctx, appreviewverdict.Deps{ReviewVerdicts: rig.reviewVerdicts}, repoFullName, 508)
+	if err != nil || !hasVerdict {
+		t.Fatalf("GetLatest: hasVerdict=%v err=%v", hasVerdict, err)
+	}
+
+	body, err := json.Marshal(restdtos.AcceptReviewVerdictRequest{
+		RepoFullName: repoFullName, PrNumber: 508, VerdictId: record.ID, Justification: "Concurrent accept race.",
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	const n = 10
+	var g errgroup.Group
+	statuses := make([]int, n)
+	for i := 0; i < n; i++ {
+		idx := i
+		g.Go(func() error {
+			req, err := http.NewRequest(http.MethodPost, rig.server.URL+"/api/decision-inbox/accept-verdict", bytes.NewReader(body))
+			if err != nil {
+				return err
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.AddCookie(&http.Cookie{Name: platform.AuthSessionCookieName, Value: token})
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = resp.Body.Close() }()
+			statuses[idx] = resp.StatusCode
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		t.Fatalf("errgroup: %v", err)
+	}
+
+	successCount := 0
+	for _, s := range statuses {
+		switch s {
+		case http.StatusCreated:
+			successCount++
+		case http.StatusInternalServerError:
+			// A genuine, accepted concurrent-accept race residual (this
+			// test's own doc comment) -- never a hard failure.
+		default:
+			t.Errorf("unexpected status %d, want %d or %d", s, http.StatusCreated, http.StatusInternalServerError)
+		}
+	}
+	if successCount < 1 {
+		t.Fatalf("successCount = 0 of %d, want at least 1 -- %d concurrent accepts racing the SAME verdict must yield at least one committed acceptance", n, n)
+	}
+
+	// THE DECISIVE ASSERTION: regardless of how many individual requests
+	// happened to succeed, exactly one row is active once every request
+	// has finished.
+	var activeCount int
+	if err := rig.pool.QueryRow(ctx,
+		`SELECT count(*) FROM review_verdict_acceptances WHERE repo_full_name = $1 AND pr_number = $2 AND revoked_at IS NULL`,
+		repoFullName, 508,
+	).Scan(&activeCount); err != nil {
+		t.Fatalf("count active rows: %v", err)
+	}
+	if activeCount != 1 {
+		t.Errorf("active row count = %d, want exactly 1 -- a losing request's own Supersede half must never commit alone (finding F2, adversarial review)", activeCount)
 	}
 }
