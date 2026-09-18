@@ -33,11 +33,14 @@
 //
 // item.title (a PR/plan/session/automation title), repoFullName,
 // provenanceRepoFullName/provenancePattern (a CODEOWNERS pattern),
-// failureReason, artifactSummary, lastError, acceptanceJustification (the
-// accepting maintainer+'s own free-text justification, §21.1b -- round 3,
-// finding R8, adversarial review: added when this field started being
-// rendered, round 2, but this accounting was never updated to name it),
-// and acceptanceMergeBlockedReason (a short, SERVER-composed reason
+// failureReason, artifactSummary, lastError, outboxKind (DecisionInboxRow,
+// the `dead-lettered · ${item.outboxKind}` text -- T7, round 4,
+// adversarial review: rendered since this view's own outbox section
+// existed, but never named here until this fix), acceptanceJustification
+// (the accepting maintainer+'s own free-text justification, §21.1b --
+// round 3, finding R8, adversarial review: added when this field started
+// being rendered, round 2, but this accounting was never updated to name
+// it), and acceptanceMergeBlockedReason (a short, SERVER-composed reason
 // string, round 3, finding R1 -- never itself free text a THIRD party
 // authors, but rendered through the identical T path anyway, since
 // nothing here distinguishes "server-composed" from "third-party" at the
@@ -53,10 +56,29 @@
 // identical precedent, rendered through T anyway for consistency with
 // every other field on this row, though it carries no injection risk of
 // its own.
+// mutation.error.message (T7, round 4, adversarial review: the four
+// `{mutation.error instanceof ApiError ? <T text={mutation.error.
+// message} /> : ...}` renders inside MergeButton/ApprovePlanButton/
+// ResumeSessionButton/ResumeAutomationButton below) is the ONE class of
+// string on this row that is not a wire field at all -- ApiError.message
+// (api/http.ts) is server-composed error text from a REST response body,
+// arbitrary in length and content the same way any of the fields above
+// are, and already went through T (mirrors every field above); this
+// accounting simply never named it, twice (round 3's own version of this
+// list already omitted it).
 // htmlUrl is the ONLY field that ever becomes an href, and only after
 // isSafeHref (urlSafety.ts) accepts it -- mirrors SessionRail.tsx's own
 // ArtifactRow precedent, including its identical "link unavailable"
 // fallback text for a rejected URL.
+//
+// This list is audited against the code, not the other way around: T7
+// (round 4, adversarial review) found it DRIFTED from DecisionInboxRow/
+// MergeButton/ApprovePlanButton/ResumeSessionButton/ResumeAutomationButton
+// TWICE already (outboxKind, mutation.error.message) -- an accounting
+// that is itself incomplete verifies nothing. Anyone adding a new
+// server-composed or third-party string render below must add it here IN
+// THE SAME CHANGE, named by symbol (never paraphrased), or this list
+// drifts a third time.
 import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
@@ -409,12 +431,40 @@ export function DecisionInboxRow({ item, canMerge }: { item: DecisionInboxItem; 
         reason (Item.AcceptanceMergeBlockedReason's own doc comment,
         server-side); through T like every other untrusted string on this
         row.
+
+        `kind === 'handoff'` (T6, round 4, adversarial review) joins the
+        `kind === 'pr' && item.kind === 'needs_review'` half above --
+        aggregate.go's own isHandoffPR branch now computes a real,
+        non-empty AcceptanceMergeBlockedReason whenever this row carries
+        an acceptance (mirroring RevalidateForMerge's own unconditional
+        handoff refusal), and a handoff row never offers a Merge button
+        at all (see the button's own condition a few lines up), so this
+        is the ONLY place a maintainer+ can see WHY an acceptance they
+        already granted still does nothing here.
+
+        `!= null` (T5, round 4, adversarial review, corrected: was
+        `!== null`) -- acceptanceMergeBlockedReason carries
+        `omitempty,omitzero` server-side (restdtos.DecisionInboxItem), so
+        an EMPTY reason (buildPROpenItem's own isReleaseCut branch, or any
+        future acceptanceMergeable=false path that leaves the reason
+        uncomputed) is OMITTED from the JSON entirely, arriving here as
+        `undefined`, never `null`. `!== null` alone does not exclude
+        `undefined` (`undefined !== null` is `true` in JS), so the OLD
+        guard let this block through with `item.
+        acceptanceMergeBlockedReason` itself `undefined`, rendering the
+        literal text "Still blocked: undefined" -- a real string, not a
+        crash, which is exactly why no test caught it. `!= null` (loose
+        equality, an established idiom in this codebase -- costRollup.ts)
+        excludes BOTH.
       */}
-      {kind === 'pr' && item.kind === 'needs_review' && hasAcceptedOverride(item) && !canMergeViaAcceptance(item) && item.acceptanceMergeBlockedReason !== null && (
-        <span className="qwhy" title="This acceptance does not currently unblock a merge">
-          <T text={`Still blocked: ${item.acceptanceMergeBlockedReason}`} />
-        </span>
-      )}
+      {((kind === 'pr' && item.kind === 'needs_review') || kind === 'handoff') &&
+        hasAcceptedOverride(item) &&
+        !canMergeViaAcceptance(item) &&
+        item.acceptanceMergeBlockedReason != null && (
+          <span className="qwhy" title="This acceptance does not currently unblock a merge">
+            <T text={`Still blocked: ${item.acceptanceMergeBlockedReason}`} />
+          </span>
+        )}
       {/*
         Open review links into Narvi's own code-review screen, but ONLY
         when the server has already resolved a real review session for
@@ -481,8 +531,19 @@ export function DecisionInboxRow({ item, canMerge }: { item: DecisionInboxItem; 
         row can be deleted after the fact, ON DELETE SET NULL) so it gets
         its own null check, never assumed present just because
         acceptanceJustification is.
+
+        `kind === 'handoff'` (T6, round 4, adversarial review) joins
+        `kind === 'pr'` -- acceptanceJustification/acceptedBy/acceptedAt
+        are populated server-side UNCONDITIONALLY for any row carrying an
+        acceptance (buildPROpenItem sets them ahead of, and independently
+        of, Kind classification, aggregate.go), so a handoff row already
+        carried this data on the wire -- this view simply never rendered
+        it. Before this fix, a handoff row's own "accepted override" chip
+        (prChipData, rendered for `kind === 'pr' || kind === 'handoff'`
+        already) had nothing beneath it explaining who accepted, why, or
+        when -- a bare chip a maintainer+ could not act on or understand.
       */}
-      {kind === 'pr' && hasAcceptedOverride(item) && item.acceptanceJustification !== null && (
+      {(kind === 'pr' || kind === 'handoff') && hasAcceptedOverride(item) && item.acceptanceJustification !== null && (
         <span className="qwhy">
           <T text={`Accepted despite refusal: ${item.acceptanceJustification}`} />
           {item.acceptedBy !== null && (

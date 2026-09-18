@@ -695,6 +695,26 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 	switch {
 	case isHandoffPR:
 		item.Kind = decisioninbox.KindAwaitingApproval
+
+		// AcceptanceMergeable/AcceptanceMergeBlockedReason (T6, round 4,
+		// adversarial review): a handoff item is refused by
+		// RevalidateForMerge UNCONDITIONALLY (revalidateCore's own
+		// isHandoffPR check, revalidate.go, runs BEFORE even
+		// isPlatformAuthored) -- no acceptance, however applicable, can
+		// ever unblock a merge here, so no engine call is needed to know
+		// that. Before this fix, this branch never computed either field
+		// at all, so a handoff row carrying an acceptance shipped
+		// acceptanceMergeable=false (its Go zero value) with an EMPTY,
+		// omitted reason (T5's own false+absent-reason combination) --
+		// indistinguishable, on the wire, from "no acceptance was ever
+		// granted", and rendered a bare "accepted override" chip
+		// client-side with nothing explaining it (DecisionInboxView.tsx).
+		// The reason string below is copied VERBATIM from revalidateCore's
+		// own identical refusal, never a second, independently-worded
+		// phrasing for the same fact.
+		if acceptanceID != "" {
+			item.AcceptanceMergeBlockedReason = "this pull request is a handoff item, not an ordinary code-review merge decision"
+		}
 	case isReleaseCut:
 		// §16.1: "needs_review... includes release cuts with manifest
 		// flags (§15)" -- a release cut is ALWAYS a human-judgment row,
@@ -707,11 +727,24 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 		// even if it somehow were, §15's own manifest-check machinery
 		// exists precisely because a release cut needs a human looking at
 		// the compliance findings, not a fast-path auto-merge.
+		//
+		// AcceptanceMergeable/AcceptanceMergeBlockedReason are left
+		// uncomputed here too (T6, round 4, adversarial review): an
+		// acceptance authorises past the CODE-REVIEW engine's own
+		// refusal, and says nothing about §15's SEPARATE manifest check --
+		// this branch's own comment above already establishes a release
+		// cut can never fast-path around that regardless.
 		item.Kind = decisioninbox.KindNeedsReview
 	default:
 		platformAuthored := isPlatformAuthored(ctx, deps, pr.HTMLURL)
-		eligible, eligibilityDegraded := computeRealEligibility(ctx, deps, repoFullName, pr, ciGreen, hasNeedsHuman, token, now, false)
-		degraded = eligibilityDegraded
+		eligibilityRes := computeRealEligibility(ctx, deps, repoFullName, pr, ciGreen, hasNeedsHuman, token, now, false)
+		// T1 (round 4, adversarial review): the ONLY call to
+		// recordContestedIfApplicable in this file -- see that function's
+		// own doc comment for why the SECOND, display-only
+		// computeRealEligibility call below (accepted=true) must never
+		// also reach it.
+		recordContestedIfApplicable(ctx, deps, repoFullName, pr.Number, hasNeedsHuman, pr.HasChangesRequested, eligibilityRes)
+		degraded = eligibilityRes.Degraded
 		// HasChangesRequested is a HARD merge blocker at RevalidateForMerge
 		// (revalidate.go) but was previously never consulted HERE -- so such a PR sat
 		// in the TOP ready_to_merge section with a Merge button that
@@ -744,66 +777,105 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 		// RevalidateForAutoMerge (revalidate.go) enforce the SAME fact as
 		// a hard block at click/auto-merge time regardless of what this
 		// read-model row shows.
-		if platformAuthored && eligible && !pr.HasChangesRequested && !pr.ReviewDecisionDegraded && openFindings == 0 {
+		// mandatoryCriteriaClear is reused VERBATIM by the
+		// AcceptanceMergeable computation below (T6, round 4, adversarial
+		// review) -- never a second, independently re-derived copy that
+		// could silently drift from what just decided Kind.
+		mandatoryCriteriaClear := platformAuthored && !pr.HasChangesRequested && !pr.ReviewDecisionDegraded && openFindings == 0
+		if mandatoryCriteriaClear && eligibilityRes.Eligible {
 			item.Kind = decisioninbox.KindReadyToMerge
 		} else {
 			item.Kind = decisioninbox.KindNeedsReview
+		}
 
-			// AcceptanceMergeable/AcceptanceMergeBlockedReason (round 3,
-			// finding R1, adversarial review): computed ONLY when this row
-			// actually carries an active, applicable, fresh acceptance
-			// (acceptanceID is set exactly under that gate, above) --
-			// otherwise both stay at their Go zero value, mirroring
-			// Item.AcceptanceMergeable's own doc comment. The client used to
-			// infer "the Merge button is safe to offer" from acceptanceID
-			// alone (hasAcceptedOverride, decisionInboxFormat.ts), which is
-			// true only by coincidence: it says nothing about whether the
-			// SAME mandatory, never-waived criteria RevalidateForMerge
-			// enforces at click time (CI green, no open finding, no changes
-			// requested, a confirmed review-decision read, blast radius
-			// known, every freshness check) also hold. Every mandatory
-			// criterion this switch already evaluated (platformAuthored,
-			// !pr.HasChangesRequested, !pr.ReviewDecisionDegraded,
-			// openFindings == 0) is checked again here, FIRST and cheaply
-			// (no new I/O -- every fact is already in hand), before ever
-			// re-running the engine: reusing the same mandatory-criteria
-			// values just used for Kind, never a second, independently
-			// re-derived copy that could silently drift from it.
-			if acceptanceID != "" {
+		// AcceptanceMergeable/AcceptanceMergeBlockedReason (round 3,
+		// finding R1, adversarial review; generalized to BOTH outcomes of
+		// the if/else immediately above by T6, round 4, adversarial
+		// review): computed ONLY when this row actually carries an
+		// active, applicable, fresh acceptance (acceptanceID is set
+		// exactly under that gate, above) -- otherwise both stay at their
+		// Go zero value, mirroring Item.AcceptanceMergeable's own doc
+		// comment. The client used to infer "the Merge button is safe to
+		// offer" from acceptanceID alone (hasAcceptedOverride,
+		// decisionInboxFormat.ts), which is true only by coincidence: it
+		// says nothing about whether the SAME mandatory, never-waived
+		// criteria RevalidateForMerge enforces at click time (CI green,
+		// no open finding, no changes requested, a confirmed
+		// review-decision read, blast radius known, every freshness
+		// check) also hold. Every mandatory criterion this switch already
+		// evaluated (platformAuthored, !pr.HasChangesRequested,
+		// !pr.ReviewDecisionDegraded, openFindings == 0) is checked again
+		// here, FIRST and cheaply (no new I/O -- every fact is already in
+		// hand), before ever re-running the engine.
+		//
+		// T6 (round 4, adversarial review): PREVIOUSLY this whole block
+		// lived INSIDE the `else` arm above, so a ready_to_merge row that
+		// ALSO happened to carry an acceptance (e.g. accepted while CI was
+		// still red, CI then turning green on a later run with no new
+		// verdict posted) shipped acceptanceMergeable=false/reason-omitted
+		// -- wrong on a row the engine had ALREADY approved unaided, and
+		// (T5) exactly the false+absent-reason combination the web's own
+		// null-check guard mishandled. Moved here, outside the if/else, so
+		// it runs identically regardless of which Kind this row just
+		// landed in.
+		if acceptanceID != "" {
+			switch {
+			case !platformAuthored:
+				item.AcceptanceMergeBlockedReason = "this pull request was not authored by a platform session"
+			case pr.HasChangesRequested:
+				item.AcceptanceMergeBlockedReason = "this pull request has changes requested by a reviewer"
+			case pr.ReviewDecisionDegraded:
+				item.AcceptanceMergeBlockedReason = "this pull request's review decision could not be confirmed (a degraded GitHub read)"
+			case openFindings > 0:
+				item.AcceptanceMergeBlockedReason = "this pull request has an open, unresolved review finding"
+			default:
+				// The mandatory, never-waived criteria above all clear
+				// -- the ONE remaining question is whether the engine's
+				// own real eligibility criteria (CI, blast radius,
+				// sensitive path, every freshness check, Shippable/
+				// diff-size) ALSO clear, this time WITH the acceptance
+				// applied (accepted=true) -- the SAME real engine
+				// computeRealEligibility already ran above (accepted=
+				// false, for Kind classification), re-run a second time
+				// (deps.SCMCache absorbs the repeat live lookups within
+				// its own TTL) so this field can never diverge from what
+				// a real Merge click would actually decide. This SECOND
+				// call is PURELY a display computation -- see
+				// computeRealEligibility's own top doc comment and
+				// recordContestedIfApplicable's own doc comment for why
+				// it must never, itself, record anything.
+				//
+				// T3 (round 4, adversarial review): a DEGRADED live read
+				// here (acceptanceEligibility.Degraded) is a DIFFERENT
+				// fact than a considered "does not qualify" -- the
+				// PREVIOUS version of this code unconditionally stamped
+				// the "no longer meets... criteria" reason whenever
+				// eligibleViaAcceptance was false-OR-degraded, so a
+				// transient live-check failure (e.g. a 502 resolving the
+				// base branch's own tip) rendered "Still blocked: this
+				// pull request no longer meets the auto-approval
+				// eligibility criteria..." on a PR a live Merge click
+				// would actually succeed on the instant the failure
+				// cleared -- a degraded read presented as a considered
+				// judgement, exactly the failure mode this file's
+				// SCMFetchFailed discipline exists elsewhere to prevent.
+				// Mirrors this same function's pr.ReviewDecisionDegraded
+				// arm a few lines up ("could not be confirmed (a
+				// degraded GitHub read)") and RevalidateForMerge's OWN
+				// identical live-check-failure wording (revalidate.go,
+				// "this pull request's base commit could not be
+				// confirmed (a live check failed) -- try again shortly")
+				// -- reused verbatim here, never a third phrasing for the
+				// same fact.
+				acceptanceEligibility := computeRealEligibility(ctx, deps, repoFullName, pr, ciGreen, hasNeedsHuman, token, now, true)
 				switch {
-				case !platformAuthored:
-					item.AcceptanceMergeBlockedReason = "this pull request was not authored by a platform session"
-				case pr.HasChangesRequested:
-					item.AcceptanceMergeBlockedReason = "this pull request has changes requested by a reviewer"
-				case pr.ReviewDecisionDegraded:
-					item.AcceptanceMergeBlockedReason = "this pull request's review decision could not be confirmed (a degraded GitHub read)"
-				case openFindings > 0:
-					item.AcceptanceMergeBlockedReason = "this pull request has an open, unresolved review finding"
+				case acceptanceEligibility.Degraded:
+					degraded = true
+					item.AcceptanceMergeBlockedReason = "this pull request's base commit could not be confirmed (a live check failed) -- try again shortly"
+				case !acceptanceEligibility.Eligible:
+					item.AcceptanceMergeBlockedReason = "this pull request no longer meets the auto-approval eligibility criteria, even with its accepted override applied"
 				default:
-					// The mandatory, never-waived criteria above all clear
-					// -- the ONE remaining question is whether the engine's
-					// own real eligibility criteria (CI, blast radius,
-					// sensitive path, every freshness check, Shippable/
-					// diff-size) ALSO clear, this time WITH the acceptance
-					// applied (accepted=true) -- the SAME real engine
-					// computeRealEligibility already ran above (accepted=
-					// false, for Kind classification), re-run a second time
-					// so this field can never diverge from what a real
-					// Merge click would actually decide. A degraded live
-					// read here (viaDegraded) is treated as "not confirmed
-					// mergeable" -- never a confident false, mirroring this
-					// same file's "never present a degraded read as a
-					// considered judgement" discipline elsewhere (findings,
-					// SCMFetchFailed) -- so a transient lookup failure only
-					// ever hides the button, never shows one that 409s.
-					eligibleViaAcceptance, viaDegraded := computeRealEligibility(ctx, deps, repoFullName, pr, ciGreen, hasNeedsHuman, token, now, true)
-					if viaDegraded {
-						degraded = true
-					}
-					item.AcceptanceMergeable = eligibleViaAcceptance && !viaDegraded
-					if !item.AcceptanceMergeable {
-						item.AcceptanceMergeBlockedReason = "this pull request no longer meets the auto-approval eligibility criteria, even with its accepted override applied"
-					}
+					item.AcceptanceMergeable = true
 				}
 			}
 		}
@@ -825,13 +897,20 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 // countOpenFindings' own identical fail-closed precedent in this same
 // file).
 //
-// ALSO records the §21.2 stage 2 "overridden" contradiction-rate signal
-// (best-effort, never blocking this read) -- see reviewverdict.
-// RecordOverridden's own doc comment: this fires when the verdict would
-// have been eligible on every OTHER criterion but a human already
-// disagreed (HasChangesRequested, or a needs-human label), computed here
-// because this call site already has every fact needed at zero extra
-// cost.
+// PURE with respect to Postgres writes (T1, round 4, adversarial review,
+// corrected: a previous version of this function ALSO recorded the
+// §21.2 stage 2 "overridden" contradiction-rate signal as a side effect
+// of every call -- including a purely-display call this same file makes
+// with accepted=true to compute AcceptanceMergeable, which could
+// therefore write reviewverdict.RecordOverridden's own ledger row for a
+// PR the engine never would have approved at all, e.g. one carrying the
+// review:needs-human label, once accepted=true's own Shippable/diff-size
+// waiver flipped eligibleIgnoringHumanSignals from false to true for
+// that call alone). This function now only ever COMPUTES; see
+// eligibilityResult.EligibleIgnoringHumanSignals/HeadSHA and
+// recordContestedIfApplicable's own doc comment, immediately below this
+// function, for the ONE caller now entitled to record anything from what
+// this function returns.
 //
 // token/now (D2, second adversarial-review round) back this function's
 // OWN live base-branch-tip resolution, below -- see that call site's own
@@ -869,15 +948,15 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 // question a maintainer+'s own Merge click actually depends on, computed
 // by the SAME engine RevalidateForMerge itself re-checks at click time,
 // never a second, independently-derived approximation.
-func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string, pr ports.OpenPR, ciGreen, hasNeedsHuman bool, token string, now time.Time, accepted bool) (bool, bool) {
+func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string, pr ports.OpenPR, ciGreen, hasNeedsHuman bool, token string, now time.Time, accepted bool) eligibilityResult {
 	var degraded bool
 	record, hasVerdict, err := appreviewverdict.GetLatest(ctx, deps.ReviewVerdict, repoFullName, int32(pr.Number))
 	if err != nil {
 		platform.Logger(ctx).Error("decisioninbox: get latest review verdict failed -- failing closed (not eligible)", "error", err, "repo", repoFullName, "pr_number", pr.Number)
-		return false, false
+		return eligibilityResult{}
 	}
 	if !hasVerdict {
-		return false, false
+		return eligibilityResult{}
 	}
 
 	// a genuine repo_settings read error means this
@@ -890,7 +969,7 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	cfg, cfgErr := appreviewverdict.LoadEligibilityConfig(ctx, deps.ReviewVerdict, repoFullName)
 	if cfgErr != nil {
 		platform.Logger(ctx).Error("decisioninbox: load eligibility config failed -- failing closed (not eligible)", "error", cfgErr, "repo", repoFullName, "pr_number", pr.Number)
-		return false, false
+		return eligibilityResult{}
 	}
 
 	// ChangedFileCount/TouchedBlastRadius are BOTH
@@ -1010,7 +1089,7 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// cfg); accepted is true from the NEW AcceptanceMergeable caller,
 	// which is the whole point of threading it through.
 	if probeEligible, _, _ := autoapproval.ComputeEligibleWithAcceptance(probe, cfg, accepted); !probeEligible {
-		return false, false
+		return eligibilityResult{}
 	}
 
 	// A genuine correctness bug: computed ONCE, ignoring BOTH human-disagreement signals --
@@ -1302,18 +1381,99 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	}, cfg, accepted)
 	eligible := eligibleIgnoringHumanSignals && !hasNeedsHuman
 
-	// "Contested": the engine would have approved this PR on every
-	// criterion it actually checks, but a human signal -- a needs-human
-	// label, OR a reviewer requesting changes -- means it was NOT
-	// actually auto-approved. reviewverdict.RecordOverridden's own doc
-	// comment: recorded the first time this is observed for this (repo,
-	// PR, head_sha), never re-recorded on every subsequent read (its own
-	// idempotent ON CONFLICT DO NOTHING write).
-	if eligibleIgnoringHumanSignals && (hasNeedsHuman || pr.HasChangesRequested) {
-		appreviewverdict.RecordOverridden(ctx, deps.ReviewVerdict, repoFullName, int32(pr.Number), record.HeadSHA)
+	// T1 (round 4, adversarial review): this function used to ALSO decide,
+	// right here, whether to call reviewverdict.RecordOverridden -- see
+	// this function's own top doc comment for the full "why" that was
+	// wrong. eligibleIgnoringHumanSignals/record.HeadSHA are returned
+	// below instead, for recordContestedIfApplicable (immediately below
+	// this function) to decide from -- called from EXACTLY ONE call site
+	// (buildPROpenItem's Kind-classification call, accepted=false), never
+	// from the AcceptanceMergeable display call (accepted=true).
+	return eligibilityResult{
+		Eligible:                     eligible,
+		Degraded:                     degraded,
+		EligibleIgnoringHumanSignals: eligibleIgnoringHumanSignals,
+		HeadSHA:                      record.HeadSHA,
 	}
+}
 
-	return eligible, degraded
+// eligibilityResult is computeRealEligibility's own return value -- a
+// plain, side-effect-free record of what the engine decided, never an
+// instruction to write anything (see that function's own top doc comment
+// for the T1 defect this separation closes).
+type eligibilityResult struct {
+	// Eligible is "would this PR merge right now, given accepted" --
+	// already gated on hasNeedsHuman (the needs-human escape hatch is
+	// never one of the two criteria accepted may waive,
+	// autoapproval.ComputeEligibleWithAcceptance's own doc comment, so
+	// this is false whenever hasNeedsHuman is true, REGARDLESS of
+	// accepted -- mirroring RevalidateForMerge's own identical, real
+	// merge-time gate, revalidate.go, which feeds hasNeedsHuman into the
+	// SAME EligibilityInput.HasNeedsHumanLabel field unconditionally).
+	Eligible bool
+	// Degraded is true iff a live SCM lookup this function makes failed --
+	// see computeRealEligibility's own doc comment for the full producer
+	// list and its "unset for the GetLatest/!hasVerdict/
+	// LoadEligibilityConfig early returns" scoping.
+	Degraded bool
+	// EligibleIgnoringHumanSignals/HeadSHA back
+	// recordContestedIfApplicable's own §21.2 stage 2 "contested" write,
+	// below -- no OTHER caller/field may ever consult them. Both are the
+	// Go zero value on every early-return path inside computeRealEligibility
+	// (no verdict, a store error, or the probe already refusing), which
+	// recordContestedIfApplicable's own condition and recordOutcome's own
+	// headSHA=="" guard both already treat as "never write" -- mirroring
+	// Eligible/Degraded's own identical zero-value "nothing to report"
+	// convention on those same paths.
+	EligibleIgnoringHumanSignals bool
+	HeadSHA                      string
+}
+
+// recordContestedIfApplicable performs reviewverdict.RecordOverridden's
+// own idempotent, best-effort §21.2 stage 2 "contested" write -- IF AND
+// ONLY IF result reports the engine would have approved this PR ignoring
+// human signals, AND a human-disagreement signal (hasNeedsHuman or
+// hasChangesRequested) is ALSO present. "Contested": the engine would
+// have approved this PR on every criterion it actually checks, but a
+// human signal -- a needs-human label, OR a reviewer requesting changes
+// -- means it was NOT actually auto-approved. reviewverdict.
+// RecordOverridden's own doc comment: recorded the first time this is
+// observed for this (repo, PR, head_sha), never re-recorded on every
+// subsequent read (its own idempotent ON CONFLICT DO NOTHING write).
+//
+// T1 (round 4, adversarial review): this is now the ONLY function in
+// this file entitled to call reviewverdict.RecordOverridden, and it has
+// EXACTLY ONE caller -- buildPROpenItem's Kind-classification call to
+// computeRealEligibility (accepted=false). Before this fix,
+// computeRealEligibility performed this same write ITSELF, unconditionally,
+// as a side effect of every call it received -- including buildPROpenItem's
+// OWN second, display-only call (accepted=true, backing
+// AcceptanceMergeable). Since accepted=true waives
+// ReasonNotShippableAuto/ReasonDiffTooLarge, EligibleIgnoringHumanSignals
+// can flip from false (the accepted=false call) to true (the accepted=true
+// call) for the EXACT SAME PR -- so a PR carrying BOTH the
+// review:needs-human label AND an accepted high-risk verdict wrote an
+// 'overridden' auto_approval_outcomes row from the display call alone,
+// asserting the engine "would otherwise have judged auto-approved" a PR
+// it never would have (the needs-human label refuses UNCONDITIONALLY,
+// acceptance or not) -- migrations/000070's own definition of
+// 'overridden', made false. That row's key is (repo_full_name, pr_number,
+// head_sha) with an idempotent ON CONFLICT DO NOTHING write, so the
+// spurious row was also PERMANENT for that head sha, silently dropping
+// the genuine RecordAcceptedOverride write a real merge would later make,
+// and entering both `total` and `contested` in
+// CountAutoApprovalOutcomesInWindow -- the number that gates arming
+// auto-merge.
+//
+// Separating "compute" (computeRealEligibility, now pure) from "maybe
+// record" (this function) makes a display path incapable of writing BY
+// CONSTRUCTION, rather than by a caller remembering to add hasNeedsHuman
+// to a re-check list -- the same "accident waiting for the next caller"
+// this fix exists to close for good.
+func recordContestedIfApplicable(ctx context.Context, deps Deps, repoFullName string, prNumber int, hasNeedsHuman, hasChangesRequested bool, result eligibilityResult) {
+	if result.EligibleIgnoringHumanSignals && (hasNeedsHuman || hasChangesRequested) {
+		appreviewverdict.RecordOverridden(ctx, deps.ReviewVerdict, repoFullName, int32(prNumber), result.HeadSHA)
+	}
 }
 
 // resolvePRProvenance determines WHY pr is assigned to actorGitHubID --

@@ -155,14 +155,31 @@ type Item struct {
 	// green, blast radius known, sensitive path, every freshness check)
 	// -- never a client-side or server-side heuristic re-deriving those
 	// criteria independently, which is exactly how this drifted from the
-	// real gate before. Still best-effort/non-authoritative, exactly
-	// like Kind itself (§16.2: "the rendered queue is never trusted as
-	// authority") -- RevalidateForMerge is re-run, unconditionally, at
-	// click time regardless of what this says; a false AcceptanceMergeable
-	// therefore only ever hides a button that might, rarely, still have
-	// worked (a live check settled favorably between this read and a
-	// hypothetical click) -- never the reverse (a shown button that
-	// 409s), which is the direction this fix exists to close.
+	// real gate before. This SECOND call is PURELY a display computation
+	// (T1, round 4, adversarial review: computeRealEligibility itself no
+	// longer records anything -- see that function's own doc comment,
+	// aggregate.go, and recordContestedIfApplicable's own doc comment for
+	// why this call site must never be the one that does). Still
+	// best-effort/non-authoritative, exactly like Kind itself (§16.2: "the
+	// rendered queue is never trusted as authority") -- RevalidateForMerge
+	// is re-run, unconditionally, at click time regardless of what this
+	// says; a false AcceptanceMergeable therefore only ever hides a
+	// button that might, rarely, still have worked (a live check settled
+	// favorably between this read and a hypothetical click) -- never the
+	// reverse (a shown button that 409s), which is the direction this fix
+	// exists to close.
+	//
+	// Computed for EVERY PR-shaped row carrying an acceptance (T6, round
+	// 4, adversarial review) -- ready_to_merge, needs_review, AND the
+	// handoff sub-case of awaiting_approval -- never only needs_review as
+	// a previous version of this comment implied: a handoff PR is refused
+	// UNCONDITIONALLY by RevalidateForMerge regardless of any acceptance
+	// (buildPROpenItem's own isHandoffPR branch says so with its own
+	// fixed reason, no engine call needed), and a ready_to_merge row's own
+	// acceptance is (trivially) mergeable, since accepted only ever
+	// RELAXES the criteria an already-passing row already cleared. A
+	// release cut is the one PR-shaped Kind that still leaves this pair
+	// uncomputed -- see buildPROpenItem's own isReleaseCut branch for why.
 	AcceptanceMergeable          bool
 	AcceptanceMergeBlockedReason string
 

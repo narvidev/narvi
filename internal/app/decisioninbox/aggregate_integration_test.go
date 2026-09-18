@@ -2349,11 +2349,13 @@ func TestBuild_AcceptanceMergeable(t *testing.T) {
 	ctx := context.Background()
 
 	tests := []struct {
-		name                string
-		openFinding         bool
-		hasChangesRequested bool
-		wantMergeable       bool
-		wantReasonContains  string
+		name                   string
+		openFinding            bool
+		hasChangesRequested    bool
+		notPlatformAuthored    bool
+		reviewDecisionDegraded bool
+		wantMergeable          bool
+		wantReasonContains     string
 	}{
 		{
 			name:          "clean PR, blocked only by Shippable -- mergeable via acceptance",
@@ -2371,6 +2373,28 @@ func TestBuild_AcceptanceMergeable(t *testing.T) {
 			wantMergeable:       false,
 			wantReasonContains:  "changes requested",
 		},
+		// T4 (round 4, adversarial review): the !platformAuthored and
+		// pr.ReviewDecisionDegraded arms of the mandatory-blocker re-check
+		// (buildPROpenItem, aggregate.go) previously had NO regression
+		// test of their own -- either arm could be deleted outright with
+		// this entire integration suite still green, and each deletion
+		// makes this row advertise a merge RevalidateForMerge refuses
+		// unconditionally (that function's own identical hard blocks,
+		// revalidate.go: "this pull request was not authored by a
+		// platform session" / the review-decision-degraded check a few
+		// lines above it).
+		{
+			name:                "not platform-authored -- never waived, blocks despite acceptance",
+			notPlatformAuthored: true,
+			wantMergeable:       false,
+			wantReasonContains:  "platform session",
+		},
+		{
+			name:                   "review decision degraded -- never waived, blocks despite acceptance",
+			reviewDecisionDegraded: true,
+			wantMergeable:          false,
+			wantReasonContains:     "review decision could not be confirmed",
+		},
 	}
 
 	for i, tc := range tests {
@@ -2387,10 +2411,17 @@ func TestBuild_AcceptanceMergeable(t *testing.T) {
 			if err != nil {
 				t.Fatalf("create platform session: %v", err)
 			}
-			if _, err := artifacts.Create(ctx, sqlcgen.CreateArtifactParams{
-				SessionID: platformSession.ID, Type: sqlcgen.ArtifactTypePr, Url: htmlURL, Metadata: []byte("{}"),
-			}); err != nil {
-				t.Fatalf("mark PR #%d platform-authored: %v", prNumber, err)
+			// notPlatformAuthored (T4): skip the artifact create below --
+			// isPlatformAuthored (aggregate.go) fails closed to false
+			// whenever artifacts.GetPRArtifactByURL finds no row, exactly
+			// the shape a genuinely non-platform PR (opened directly by a
+			// human) produces.
+			if !tc.notPlatformAuthored {
+				if _, err := artifacts.Create(ctx, sqlcgen.CreateArtifactParams{
+					SessionID: platformSession.ID, Type: sqlcgen.ArtifactTypePr, Url: htmlURL, Metadata: []byte("{}"),
+				}); err != nil {
+					t.Fatalf("mark PR #%d platform-authored: %v", prNumber, err)
+				}
 			}
 
 			reviewFindings := narvipg.NewReviewFindingStore(pool)
@@ -2454,10 +2485,11 @@ func TestBuild_AcceptanceMergeable(t *testing.T) {
 							Owner: "acme", Repo: "widgets", Number: int(prNumber), Title: tc.name,
 							HTMLURL: htmlURL, HeadSHA: headSHA,
 							BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
-							Assignees:           []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}},
-							CIConclusion:        ports.CIConclusionSuccess,
-							HasChangesRequested: tc.hasChangesRequested,
-							CreatedAt:           time.Now(),
+							Assignees:              []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}},
+							CIConclusion:           ports.CIConclusionSuccess,
+							HasChangesRequested:    tc.hasChangesRequested,
+							ReviewDecisionDegraded: tc.reviewDecisionDegraded,
+							CreatedAt:              time.Now(),
 						},
 					},
 				},
@@ -2499,6 +2531,559 @@ func TestBuild_AcceptanceMergeable(t *testing.T) {
 				t.Errorf("PR #%d AcceptanceMergeBlockedReason = %q, want empty when AcceptanceMergeable is true", prNumber, item.AcceptanceMergeBlockedReason)
 			}
 		})
+	}
+}
+
+// TestBuild_AcceptanceMergeable_NeedsHumanLabel_DoesNotRecordOverridden
+// pins T1 (round 4, adversarial review, two independent lenses): a PR
+// labelled review:needs-human, whose high-risk verdict was accepted, must
+// NEVER record an 'overridden' §21.2 stage 2 outcome merely because
+// buildPROpenItem's OWN display-only AcceptanceMergeable computation
+// (accepted=true) re-runs the eligibility engine a second time.
+//
+// Mechanism: computeRealEligibility's own probe/final ComputeEligible
+// calls waive ReasonNotShippableAuto/ReasonDiffTooLarge when accepted is
+// true -- so eligibleIgnoringHumanSignals can flip from false (the
+// accepted=false call, Kind classification, which refuses outright on
+// the high-risk verdict and returns early) to true (the accepted=true
+// display call, where the SAME verdict now clears every criterion
+// EXCEPT the needs-human label). Before this fix, computeRealEligibility
+// called reviewverdict.RecordOverridden itself, unconditionally, as soon
+// as `eligibleIgnoringHumanSignals && (hasNeedsHuman ||
+// pr.HasChangesRequested)` held for ANY call -- so THIS SECOND, display
+// -only call recorded 'overridden' for a PR the engine never would have
+// approved at all (the needs-human label refuses UNCONDITIONALLY,
+// acceptance or not -- AcceptanceMergeable itself correctly stays false
+// throughout; the bug was never in that field, only in the SIDE EFFECT
+// this display path was never entitled to trigger).
+//
+// Reproduced against this fix's own parent commit (cd7b679): this exact
+// fixture recorded (total=1, contested=1) there.
+//
+// Mutation-test target: reintroducing computeRealEligibility's own
+// pre-fix unconditional RecordOverridden call (i.e. moving
+// recordContestedIfApplicable's condition back INSIDE computeRealEligibility
+// itself, reached by every caller including the accepted=true one) must
+// turn this test's own (0, 0) assertion into (1, 1).
+func TestBuild_AcceptanceMergeable_NeedsHumanLabel_DoesNotRecordOverridden(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "5009"
+	const repoFullName = "acme/t1-needs-human-accepted"
+	const prNumber = int32(80)
+
+	actor := decisionInboxActorFixture(ctx, t, pool, "t1-needs-human-accepted@example.com", actorGitHubExternalID, tokenKey)
+
+	// §30.7 stamps each recorded outcome with the egress mode that held
+	// when it was OBSERVED, and the calibration query excludes shadow
+	// ones -- armed BEFORE Build runs, mirroring every other T1 test's
+	// own identical ordering requirement.
+	if _, err := narvipg.NewRepoSettingsStore(pool).UpsertLiveEgressEnabled(ctx, repoFullName, true); err != nil {
+		t.Fatalf("arm live egress: %v", err)
+	}
+
+	artifacts := narvipg.NewArtifactStore(pool)
+	htmlURL := fmt.Sprintf("https://github.com/%s/pull/%d", repoFullName, prNumber)
+	platformSession, err := narvipg.NewSessionStore(pool).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub, CreatedBy: actor.ID})
+	if err != nil {
+		t.Fatalf("create platform session: %v", err)
+	}
+	if _, err := artifacts.Create(ctx, sqlcgen.CreateArtifactParams{
+		SessionID: platformSession.ID, Type: sqlcgen.ArtifactTypePr, Url: htmlURL, Metadata: []byte("{}"),
+	}); err != nil {
+		t.Fatalf("mark PR #%d platform-authored: %v", prNumber, err)
+	}
+
+	// A high-risk (not Shippable=auto) verdict, otherwise fully eligible
+	// -- mirrors TestBuild_AcceptanceMergeable's own identical fixture
+	// shape.
+	reviewVerdicts := narvipg.NewReviewVerdictStore(pool)
+	repoSettingsStore := narvipg.NewRepoSettingsStore(pool)
+	reviewFindings := narvipg.NewReviewFindingStore(pool)
+	acceptances := narvipg.NewReviewVerdictAcceptanceStore(pool)
+	verdict := review.Verdict{
+		RiskLevel:         review.RiskLevelHigh,
+		Premise:           review.PremiseStateOK,
+		TestsCoverage:     review.TestsCoverageStateAdequate,
+		DocsDrift:         review.DocsDriftStateNone,
+		ProposedShippable: review.ProposedShippableNeedsHuman,
+		FilesChanged:      3,
+	}
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	if verdict.Shippable == review.ShippableAuto {
+		t.Fatalf("fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
+	}
+	const headSHA = "sha-t1-needs-human"
+	verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
+	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{})
+	if err != nil {
+		t.Fatalf("seed not-shippable-auto review_verdicts row: %v", err)
+	}
+	var verdictID pgtype.UUID
+	if err := verdictID.Scan(record.ID); err != nil {
+		t.Fatalf("scan verdict id: %v", err)
+	}
+	if _, _, err := appreviewverdict.Accept(ctx, acceptances, appreviewverdict.AcceptInput{
+		RepoFullName:  repoFullName,
+		PRNumber:      prNumber,
+		VerdictID:     verdictID,
+		AttemptID:     seedReviewAttemptTurn(ctx, t, pool),
+		HeadSHA:       headSHA,
+		Context:       verdictContext,
+		Reason:        string(autoapproval.ReasonNotShippableAuto),
+		Justification: "Accepted -- T1 needs-human fixture.",
+		AcceptedBy:    actor.ID,
+	}); err != nil {
+		t.Fatalf("Accept() error = %v, want nil", err)
+	}
+
+	fakeSCM := &fakeDecisionInboxSourceControl{
+		openPRsByExternalID: map[string][]ports.OpenPR{
+			actorGitHubExternalID: {
+				{
+					Owner: "acme", Repo: "t1-needs-human-accepted", Number: int(prNumber), Title: "needs-human, accepted anyway",
+					HTMLURL: htmlURL, HeadSHA: headSHA,
+					BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
+					Assignees:    []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}},
+					CIConclusion: ports.CIConclusionSuccess,
+					Labels:       []string{"review:needs-human"},
+					CreatedAt:    time.Now(),
+				},
+			},
+		},
+	}
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: reviewFindings, SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict:      appreviewverdict.Deps{ReviewVerdicts: reviewVerdicts, RepoSettings: repoSettingsStore, ReviewFindings: reviewFindings, AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool), Acceptances: acceptances, Turns: narvipg.NewTurnStore(pool), Timeouts: platform.DefaultTimeouts()},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil", err)
+	}
+	item := findItemByPR(result.Items, int(prNumber))
+	if item == nil {
+		t.Fatalf("PR #%d missing from the inbox entirely", prNumber)
+	}
+	if item.AcceptanceID == "" {
+		t.Fatalf("PR #%d AcceptanceID is empty, want the active acceptance's own id -- fixture bug, not what this test means to check", prNumber)
+	}
+	// AcceptanceMergeable correctly stays false throughout -- the
+	// needs-human label refuses UNCONDITIONALLY, acceptance or not
+	// (mirrors RevalidateForMerge's own identical HasNeedsHumanLabel
+	// gate) -- this test's OWN point is the outcome-recording side
+	// effect below, never this field.
+	if item.AcceptanceMergeable {
+		t.Errorf("AcceptanceMergeable = true, want false -- the needs-human label is never waived by an acceptance")
+	}
+
+	total, contested := countAutoApprovalOutcomes(ctx, t, pool, repoFullName)
+	if total != 0 || contested != 0 {
+		t.Errorf("outcome counts = (total=%d, contested=%d), want (0, 0) -- the engine never would have approved a needs-human PR at all, acceptance or not, so its OWN display-only re-check (accepted=true) must never record 'overridden'", total, contested)
+	}
+}
+
+// TestBuild_AcceptanceMergeable_DegradedLiveCheck_DistinctReason pins T3
+// (round 4, adversarial review): a transient failure resolving the base
+// branch's live tip during the AcceptanceMergeable display computation
+// must render as "could not be confirmed", never as the SAME confident
+// "no longer meets the auto-approval eligibility criteria" reason a
+// genuine engine refusal gets -- a degraded read is not a considered
+// judgement (this file's own established discipline for findings/
+// SCMFetchFailed elsewhere, applied here to this ONE remaining spot that
+// still conflated the two before this fix).
+//
+// Mutation-test target: reverting the AcceptanceMergeable switch
+// (buildPROpenItem, aggregate.go) to its pre-fix shape --
+// `item.AcceptanceMergeable = eligibleViaAcceptance && !viaDegraded;
+// if !item.AcceptanceMergeable { <single "no longer meets" reason> }` --
+// must turn this test's own wantReasonContains assertion into a failure
+// (the reason would read "no longer meets the auto-approval eligibility
+// criteria" instead).
+func TestBuild_AcceptanceMergeable_DegradedLiveCheck_DistinctReason(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "5010"
+	const repoFullName = "acme/t3-degraded-live-check"
+	const prNumber = int32(81)
+
+	actor := decisionInboxActorFixture(ctx, t, pool, "t3-degraded-live-check@example.com", actorGitHubExternalID, tokenKey)
+
+	artifacts := narvipg.NewArtifactStore(pool)
+	htmlURL := fmt.Sprintf("https://github.com/%s/pull/%d", repoFullName, prNumber)
+	platformSession, err := narvipg.NewSessionStore(pool).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub, CreatedBy: actor.ID})
+	if err != nil {
+		t.Fatalf("create platform session: %v", err)
+	}
+	if _, err := artifacts.Create(ctx, sqlcgen.CreateArtifactParams{
+		SessionID: platformSession.ID, Type: sqlcgen.ArtifactTypePr, Url: htmlURL, Metadata: []byte("{}"),
+	}); err != nil {
+		t.Fatalf("mark PR #%d platform-authored: %v", prNumber, err)
+	}
+
+	reviewVerdicts := narvipg.NewReviewVerdictStore(pool)
+	repoSettingsStore := narvipg.NewRepoSettingsStore(pool)
+	reviewFindings := narvipg.NewReviewFindingStore(pool)
+	acceptances := narvipg.NewReviewVerdictAcceptanceStore(pool)
+	verdict := review.Verdict{
+		RiskLevel:         review.RiskLevelHigh,
+		Premise:           review.PremiseStateOK,
+		TestsCoverage:     review.TestsCoverageStateAdequate,
+		DocsDrift:         review.DocsDriftStateNone,
+		ProposedShippable: review.ProposedShippableNeedsHuman,
+		FilesChanged:      3,
+	}
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	if verdict.Shippable == review.ShippableAuto {
+		t.Fatalf("fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
+	}
+	const headSHA = "sha-t3-degraded"
+	verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
+	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{})
+	if err != nil {
+		t.Fatalf("seed not-shippable-auto review_verdicts row: %v", err)
+	}
+	var verdictID pgtype.UUID
+	if err := verdictID.Scan(record.ID); err != nil {
+		t.Fatalf("scan verdict id: %v", err)
+	}
+	if _, _, err := appreviewverdict.Accept(ctx, acceptances, appreviewverdict.AcceptInput{
+		RepoFullName:  repoFullName,
+		PRNumber:      prNumber,
+		VerdictID:     verdictID,
+		AttemptID:     seedReviewAttemptTurn(ctx, t, pool),
+		HeadSHA:       headSHA,
+		Context:       verdictContext,
+		Reason:        string(autoapproval.ReasonNotShippableAuto),
+		Justification: "Accepted -- T3 degraded live check fixture.",
+		AcceptedBy:    actor.ID,
+	}); err != nil {
+		t.Fatalf("Accept() error = %v, want nil", err)
+	}
+
+	fakeSCM := &fakeDecisionInboxSourceControl{
+		openPRsByExternalID: map[string][]ports.OpenPR{
+			actorGitHubExternalID: {
+				{
+					Owner: "acme", Repo: "t3-degraded-live-check", Number: int(prNumber), Title: "otherwise mergeable via acceptance, but the live base-tip lookup is down",
+					HTMLURL: htmlURL, HeadSHA: headSHA,
+					BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
+					Assignees:    []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}},
+					CIConclusion: ports.CIConclusionSuccess,
+					CreatedAt:    time.Now(),
+				},
+			},
+		},
+		// resolveBranchSHAErr (T3): simulates a 502 on GitHub's own
+		// branch-tip lookup -- this fixture's own accepted=false Kind-
+		// classification call never reaches this live call at all (its
+		// own probe refuses outright on ReasonNotShippableAuto before any
+		// SCM call), so ONLY the accepted=true display call is affected.
+		resolveBranchSHAErr: errors.New("boom: github base-branch-tip lookup returned 502"),
+	}
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: reviewFindings, SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict:      appreviewverdict.Deps{ReviewVerdicts: reviewVerdicts, RepoSettings: repoSettingsStore, ReviewFindings: reviewFindings, AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool), Acceptances: acceptances, Turns: narvipg.NewTurnStore(pool), Timeouts: platform.DefaultTimeouts()},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil", err)
+	}
+	item := findItemByPR(result.Items, int(prNumber))
+	if item == nil {
+		t.Fatalf("PR #%d missing from the inbox entirely", prNumber)
+	}
+	if item.AcceptanceID == "" {
+		t.Fatalf("PR #%d AcceptanceID is empty -- fixture bug, not what this test means to check", prNumber)
+	}
+	if item.AcceptanceMergeable {
+		t.Errorf("AcceptanceMergeable = true, want false -- a degraded live read must never render as a confident mergeable either")
+	}
+	const wantReasonContains = "could not be confirmed"
+	if !strings.Contains(item.AcceptanceMergeBlockedReason, wantReasonContains) {
+		t.Errorf("AcceptanceMergeBlockedReason = %q, want it to contain %q (a DEGRADED read, distinct from a considered refusal)", item.AcceptanceMergeBlockedReason, wantReasonContains)
+	}
+	const dontWantReasonContains = "no longer meets"
+	if strings.Contains(item.AcceptanceMergeBlockedReason, dontWantReasonContains) {
+		t.Errorf("AcceptanceMergeBlockedReason = %q, must NOT contain %q -- that phrasing asserts a considered engine refusal, which this degraded read never established", item.AcceptanceMergeBlockedReason, dontWantReasonContains)
+	}
+	if !result.SCMFetchFailed {
+		t.Error("SCMFetchFailed = false, want true -- a degraded live lookup inside the acceptance-mergeable computation must mark the overall read incomplete")
+	}
+}
+
+// TestBuild_AcceptanceMergeable_ReadyToMergeRow pins T6 (round 4,
+// adversarial review): AcceptanceMergeable/AcceptanceMergeBlockedReason
+// must be computed for a ready_to_merge row too, not only needs_review --
+// before this fix, the whole computation lived INSIDE the needs_review
+// `else` arm, so a ready_to_merge row carrying an (otherwise moot)
+// acceptance shipped acceptanceMergeable=false with an EMPTY, omitted
+// reason (T5's own false+absent-reason combination), wrong on a row the
+// engine had ALREADY approved unaided.
+//
+// Mutation-test target: reverting the AcceptanceMergeable block
+// (buildPROpenItem, aggregate.go) to live back inside the needs_review
+// `else` arm must turn this test's own AcceptanceMergeable=true assertion
+// into a failure (it would read false, its Go zero value, on this
+// ready_to_merge row).
+func TestBuild_AcceptanceMergeable_ReadyToMergeRow(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "5011"
+	const repoFullName = "acme/t6-ready-to-merge-accepted"
+	const prNumber = int32(82)
+
+	actor := decisionInboxActorFixture(ctx, t, pool, "t6-ready-to-merge-accepted@example.com", actorGitHubExternalID, tokenKey)
+
+	artifacts := narvipg.NewArtifactStore(pool)
+	htmlURL := fmt.Sprintf("https://github.com/%s/pull/%d", repoFullName, prNumber)
+	platformSession, err := narvipg.NewSessionStore(pool).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub, CreatedBy: actor.ID})
+	if err != nil {
+		t.Fatalf("create platform session: %v", err)
+	}
+	if _, err := artifacts.Create(ctx, sqlcgen.CreateArtifactParams{
+		SessionID: platformSession.ID, Type: sqlcgen.ArtifactTypePr, Url: htmlURL, Metadata: []byte("{}"),
+	}); err != nil {
+		t.Fatalf("mark PR #%d platform-authored: %v", prNumber, err)
+	}
+
+	// A Shippable=auto verdict -- fully eligible ON ITS OWN, unlike every
+	// other AcceptanceMergeable fixture in this file, which deliberately
+	// uses a high-risk verdict. An acceptance can still legitimately exist
+	// against a Shippable=auto verdict blocked ONLY by the diff-size
+	// threshold (ReasonDiffTooLarge, autoapproval.
+	// ComputeEligibleWithAcceptance's own doc comment) -- AcceptReviewVerdict
+	// itself never requires the verdict to be currently ineligible before
+	// accepting it (httpapi.AcceptReviewVerdict, decisioninbox.go).
+	reviewVerdicts := narvipg.NewReviewVerdictStore(pool)
+	repoSettingsStore := narvipg.NewRepoSettingsStore(pool)
+	reviewFindings := narvipg.NewReviewFindingStore(pool)
+	acceptances := narvipg.NewReviewVerdictAcceptanceStore(pool)
+	verdict := review.Verdict{
+		RiskLevel:         review.RiskLevelLow,
+		Premise:           review.PremiseStateOK,
+		TestsCoverage:     review.TestsCoverageStateAdequate,
+		DocsDrift:         review.DocsDriftStateNone,
+		ProposedShippable: review.ProposedShippableAuto,
+		FilesChanged:      3,
+	}
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	if verdict.Shippable != review.ShippableAuto {
+		t.Fatalf("fixture bug -- RiskLevelLow computed Shippable=%v, want auto", verdict.Shippable)
+	}
+	const headSHA = "sha-t6-ready-to-merge"
+	verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
+	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded auto-approved verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{})
+	if err != nil {
+		t.Fatalf("seed shippable-auto review_verdicts row: %v", err)
+	}
+	var verdictID pgtype.UUID
+	if err := verdictID.Scan(record.ID); err != nil {
+		t.Fatalf("scan verdict id: %v", err)
+	}
+	if _, _, err := appreviewverdict.Accept(ctx, acceptances, appreviewverdict.AcceptInput{
+		RepoFullName:  repoFullName,
+		PRNumber:      prNumber,
+		VerdictID:     verdictID,
+		AttemptID:     seedReviewAttemptTurn(ctx, t, pool),
+		HeadSHA:       headSHA,
+		Context:       verdictContext,
+		Reason:        string(autoapproval.ReasonDiffTooLarge),
+		Justification: "Accepted -- T6 ready_to_merge fixture.",
+		AcceptedBy:    actor.ID,
+	}); err != nil {
+		t.Fatalf("Accept() error = %v, want nil", err)
+	}
+
+	fakeSCM := &fakeDecisionInboxSourceControl{
+		openPRsByExternalID: map[string][]ports.OpenPR{
+			actorGitHubExternalID: {
+				{
+					Owner: "acme", Repo: "t6-ready-to-merge-accepted", Number: int(prNumber), Title: "ready to merge on its own, also carries an acceptance",
+					HTMLURL: htmlURL, HeadSHA: headSHA,
+					BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
+					Assignees:    []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}},
+					CIConclusion: ports.CIConclusionSuccess,
+					Labels:       []string{"review:low-risk"},
+					CreatedAt:    time.Now(),
+				},
+			},
+		},
+	}
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: reviewFindings, SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict:      appreviewverdict.Deps{ReviewVerdicts: reviewVerdicts, RepoSettings: repoSettingsStore, ReviewFindings: reviewFindings, AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool), Acceptances: acceptances, Turns: narvipg.NewTurnStore(pool), Timeouts: platform.DefaultTimeouts()},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil", err)
+	}
+	item := findItemByPR(result.Items, int(prNumber))
+	if item == nil {
+		t.Fatalf("PR #%d missing from the inbox entirely", prNumber)
+	}
+	if item.Kind != decisioninboxdomain.KindReadyToMerge {
+		t.Fatalf("PR #%d Kind = %s, want ready_to_merge -- fixture bug, not what this test means to check", prNumber, item.Kind)
+	}
+	if item.AcceptanceID == "" {
+		t.Fatalf("PR #%d AcceptanceID is empty, want the active acceptance's own id -- fixture bug, not what this test means to check", prNumber)
+	}
+	if !item.AcceptanceMergeable {
+		t.Errorf("AcceptanceMergeable = false, want true -- a ready_to_merge row's own acceptance is (trivially) mergeable, since accepted only ever relaxes the criteria this row already cleared unaided")
+	}
+	if item.AcceptanceMergeBlockedReason != "" {
+		t.Errorf("AcceptanceMergeBlockedReason = %q, want empty when AcceptanceMergeable is true", item.AcceptanceMergeBlockedReason)
+	}
+}
+
+// TestBuild_AcceptanceMergeable_HandoffRow pins T6 (round 4, adversarial
+// review): a handoff row carrying an acceptance must report
+// AcceptanceMergeable=false with a NON-EMPTY reason mirroring
+// revalidateCore's own unconditional isHandoffPR refusal -- before this
+// fix, this branch never computed either field at all, shipping
+// acceptanceMergeable=false with an EMPTY, omitted reason (T5's own
+// false+absent-reason combination) -- indistinguishable, on the wire,
+// from "no acceptance was ever granted".
+//
+// Mutation-test target: deleting the `if acceptanceID != ""` block inside
+// buildPROpenItem's own isHandoffPR case must turn this test's own
+// non-empty AcceptanceMergeBlockedReason assertion into a failure (it
+// would read "", its Go zero value).
+func TestBuild_AcceptanceMergeable_HandoffRow(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "5012"
+	const repoFullName = "acme/t6-handoff-accepted"
+	const prNumber = int32(83)
+
+	actor := decisionInboxActorFixture(ctx, t, pool, "t6-handoff-accepted@example.com", actorGitHubExternalID, tokenKey)
+
+	artifacts := narvipg.NewArtifactStore(pool)
+	htmlURL := fmt.Sprintf("https://github.com/%s/pull/%d", repoFullName, prNumber)
+	platformSession, err := narvipg.NewSessionStore(pool).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub, CreatedBy: actor.ID})
+	if err != nil {
+		t.Fatalf("create platform session: %v", err)
+	}
+	if _, err := artifacts.Create(ctx, sqlcgen.CreateArtifactParams{
+		SessionID: platformSession.ID, Type: sqlcgen.ArtifactTypePr, Url: htmlURL, Metadata: []byte("{}"),
+	}); err != nil {
+		t.Fatalf("mark PR #%d platform-authored: %v", prNumber, err)
+	}
+
+	reviewVerdicts := narvipg.NewReviewVerdictStore(pool)
+	repoSettingsStore := narvipg.NewRepoSettingsStore(pool)
+	reviewFindings := narvipg.NewReviewFindingStore(pool)
+	acceptances := narvipg.NewReviewVerdictAcceptanceStore(pool)
+	verdict := review.Verdict{
+		RiskLevel:         review.RiskLevelHigh,
+		Premise:           review.PremiseStateOK,
+		TestsCoverage:     review.TestsCoverageStateAdequate,
+		DocsDrift:         review.DocsDriftStateNone,
+		ProposedShippable: review.ProposedShippableNeedsHuman,
+		FilesChanged:      3,
+	}
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	if verdict.Shippable == review.ShippableAuto {
+		t.Fatalf("fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
+	}
+	const headSHA = "sha-t6-handoff"
+	verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
+	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{})
+	if err != nil {
+		t.Fatalf("seed not-shippable-auto review_verdicts row: %v", err)
+	}
+	var verdictID pgtype.UUID
+	if err := verdictID.Scan(record.ID); err != nil {
+		t.Fatalf("scan verdict id: %v", err)
+	}
+	if _, _, err := appreviewverdict.Accept(ctx, acceptances, appreviewverdict.AcceptInput{
+		RepoFullName:  repoFullName,
+		PRNumber:      prNumber,
+		VerdictID:     verdictID,
+		AttemptID:     seedReviewAttemptTurn(ctx, t, pool),
+		HeadSHA:       headSHA,
+		Context:       verdictContext,
+		Reason:        string(autoapproval.ReasonNotShippableAuto),
+		Justification: "Accepted -- T6 handoff fixture.",
+		AcceptedBy:    actor.ID,
+	}); err != nil {
+		t.Fatalf("Accept() error = %v, want nil", err)
+	}
+
+	fakeSCM := &fakeDecisionInboxSourceControl{
+		openPRsByExternalID: map[string][]ports.OpenPR{
+			actorGitHubExternalID: {
+				{
+					Owner: "acme", Repo: "t6-handoff-accepted", Number: int(prNumber), Title: "handoff, also carries an acceptance",
+					HTMLURL: htmlURL, HeadSHA: headSHA,
+					BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
+					Assignees:    []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}},
+					CIConclusion: ports.CIConclusionSuccess,
+					Labels:       []string{"handoff"},
+					CreatedAt:    time.Now(),
+				},
+			},
+		},
+	}
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: reviewFindings, SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict:      appreviewverdict.Deps{ReviewVerdicts: reviewVerdicts, RepoSettings: repoSettingsStore, ReviewFindings: reviewFindings, AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool), Acceptances: acceptances, Turns: narvipg.NewTurnStore(pool), Timeouts: platform.DefaultTimeouts()},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil", err)
+	}
+	item := findItemByPR(result.Items, int(prNumber))
+	if item == nil {
+		t.Fatalf("PR #%d missing from the inbox entirely", prNumber)
+	}
+	if item.Kind != decisioninboxdomain.KindAwaitingApproval || !item.IsHandoff {
+		t.Fatalf("PR #%d Kind = %s, IsHandoff = %v, want awaiting_approval/true -- fixture bug, not what this test means to check", prNumber, item.Kind, item.IsHandoff)
+	}
+	if item.AcceptanceID == "" {
+		t.Fatalf("PR #%d AcceptanceID is empty, want the active acceptance's own id -- fixture bug, not what this test means to check", prNumber)
+	}
+	if item.AcceptanceMergeable {
+		t.Errorf("AcceptanceMergeable = true, want false -- a handoff item is refused by RevalidateForMerge unconditionally, acceptance or not")
+	}
+	const wantReason = "this pull request is a handoff item, not an ordinary code-review merge decision"
+	if item.AcceptanceMergeBlockedReason != wantReason {
+		t.Errorf("AcceptanceMergeBlockedReason = %q, want %q", item.AcceptanceMergeBlockedReason, wantReason)
 	}
 }
 

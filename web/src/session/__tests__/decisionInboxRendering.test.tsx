@@ -413,6 +413,136 @@ describe('DecisionInboxRow -- an accepted-but-refused PR (§21.1b) gets a real s
     const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
     expect(html).toContain('>Merge<')
   })
+
+  // T5 (round 4, adversarial review): acceptanceMergeBlockedReason carries
+  // `omitempty,omitzero` server-side (restdtos.DecisionInboxItem) -- an
+  // EMPTY reason is OMITTED from the JSON entirely, arriving here as
+  // `undefined`, never `null`. The OLD guard (`item.
+  // acceptanceMergeBlockedReason !== null`) does not exclude `undefined`
+  // (`undefined !== null` is `true` in JS), so that exact combination --
+  // acceptanceMergeable=false with the reason omitted, a combination the
+  // server DOES produce (see the handoff/ready_to_merge cases T6 fixed
+  // server-side) -- rendered the literal text "Still blocked: undefined".
+  it('acceptanceMergeBlockedReason=undefined (the server omitted it) renders NO "Still blocked" text -- never "Still blocked: undefined"', () => {
+    const item = prItem({
+      kind: 'needs_review',
+      acceptanceId: 'acceptance-1',
+      acceptanceJustification: 'Reviewed offline; risk accepted.',
+      acceptanceMergeable: false,
+      acceptanceMergeBlockedReason: undefined,
+    })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).not.toContain('undefined')
+    expect(html).not.toContain('Still blocked')
+    // The acceptance itself must still be visible -- an absent reason is
+    // not the same fact as "never accepted at all".
+    expect(html).toContain('accepted override')
+  })
+})
+
+// T6 (round 4, adversarial review): AcceptanceMergeable/
+// AcceptanceMergeBlockedReason are now computed server-side for a handoff
+// row too (aggregate.go's own isHandoffPR branch), so this view must
+// actually render what they carry -- before this fix, a handoff row's own
+// "accepted override" chip (prChipData, already rendered for
+// `kind === 'pr' || kind === 'handoff'`) had nothing beneath it: no
+// justification, no accepter, no reason. The Merge button itself is
+// deliberately NOT part of this pair -- a handoff row never offers one
+// (mockups.html's own distinct "Assign to engineering" action, not built
+// by this Step), and RevalidateForMerge refuses a handoff item
+// unconditionally regardless of any acceptance (revalidate.go).
+describe('DecisionInboxRow -- a handoff row (awaiting_approval) with an acceptance gets the same explanation a needs_review row does', () => {
+  function handoffItem(overrides: Partial<DecisionInboxItem> = {}): DecisionInboxItem {
+    return prItem({
+      kind: 'awaiting_approval',
+      isHandoff: true,
+      htmlUrl: 'https://github.com/acme/widgets/pull/101',
+      ...overrides,
+    })
+  }
+
+  it('renders the justification and accepter, exactly like a needs_review row does', () => {
+    const item = handoffItem({
+      acceptanceId: 'acceptance-1',
+      acceptanceJustification: 'Reviewed offline; risk accepted.',
+      acceptedBy: '11111111-1111-1111-1111-111111111111',
+      acceptedAt: '2026-08-20T10:00:00Z',
+      acceptanceMergeable: false,
+      acceptanceMergeBlockedReason: 'this pull request is a handoff item, not an ordinary code-review merge decision',
+    })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).toContain('accepted override')
+    expect(html).toContain('Reviewed offline; risk accepted.')
+    expect(html).toContain('11111111-1111-1111-1111-111111111111')
+  })
+
+  it('renders "Still blocked: <reason>", never a Merge button', () => {
+    const item = handoffItem({
+      acceptanceId: 'acceptance-1',
+      acceptanceJustification: 'Reviewed offline; risk accepted.',
+      acceptanceMergeable: false,
+      acceptanceMergeBlockedReason: 'this pull request is a handoff item, not an ordinary code-review merge decision',
+    })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).toContain('Still blocked')
+    expect(html).toContain('this pull request is a handoff item, not an ordinary code-review merge decision')
+    expect(html).not.toContain('>Merge<')
+  })
+
+  it('an ordinary handoff row (never accepted) renders neither the chip nor any acceptance text', () => {
+    const item = handoffItem({ acceptanceId: null, acceptanceJustification: null, acceptanceMergeBlockedReason: null })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).not.toContain('accepted override')
+    expect(html).not.toContain('Still blocked')
+  })
+})
+
+// T8 (round 4, adversarial review): replacing acceptanceJustification/
+// acceptedBy/acceptanceMergeBlockedReason's own `<T text=…>` renders with
+// bare interpolations passes every OTHER test in this file (React escapes
+// either way, which is all the hostile-content cases above actually
+// prove) -- nothing previously pinned that these three go through T's own
+// 500-character bound (MAX_FIELD_CHARS, DecisionInboxView.tsx) rather
+// than textSafety.ts's default 4000, or through T at all. A string well
+// over 500 characters but under React's own rendering limits is the
+// probe: it passes only if truncateForDisplay's own marker text appears
+// and the full string does not.
+describe('DecisionInboxRow -- acceptance justification/accepter/blocked-reason are bounded through T, not bare interpolations', () => {
+  const LONG = 'x'.repeat(600) // over MAX_FIELD_CHARS (500), under textSafety's own MAX_DISPLAY_CHARS (4000)
+
+  it('a long acceptanceJustification is truncated at 500 characters', () => {
+    const item = prItem({ kind: 'needs_review', acceptanceId: 'acceptance-1', acceptanceJustification: LONG, acceptanceMergeable: true })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).toContain('more characters truncated')
+    expect(html).not.toContain(LONG)
+  })
+
+  it('a long acceptedBy is truncated at 500 characters', () => {
+    const item = prItem({
+      kind: 'needs_review',
+      acceptanceId: 'acceptance-1',
+      acceptanceJustification: 'short',
+      acceptanceMergeable: true,
+      acceptedBy: LONG,
+      acceptedAt: '2026-08-20T10:00:00Z',
+    })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).toContain('more characters truncated')
+    expect(html).not.toContain(LONG)
+  })
+
+  it('a long acceptanceMergeBlockedReason is truncated at 500 characters', () => {
+    const item = prItem({
+      kind: 'needs_review',
+      acceptanceId: 'acceptance-1',
+      acceptanceJustification: 'short',
+      acceptanceMergeable: false,
+      acceptanceMergeBlockedReason: LONG,
+    })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).toContain('more characters truncated')
+    expect(html).not.toContain(LONG)
+  })
 })
 
 describe('DecisionInboxRow -- viewer role sees a read-only queue (§16.2)', () => {

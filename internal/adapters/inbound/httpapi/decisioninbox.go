@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -35,6 +36,21 @@ import (
 	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 	"github.com/narvidev/narvi/internal/platform"
 )
+
+// maxAcceptReviewVerdictJustificationChars bounds
+// AcceptReviewVerdictRequest.Justification's own free-text length (T8,
+// round 4, adversarial review). Measured in runes (utf8.RuneCountInString),
+// never bytes, so a multi-byte-character justification is not penalized
+// for its ENCODING rather than its actual length. Chosen well above
+// web/src/session/textSafety.ts's own MAX_FIELD_CHARS (500, the
+// DISPLAY-side truncation DecisionInboxView.tsx's own <T> component
+// applies) -- deliberately NOT the same number: storage validity and
+// render cost are two different concerns, and a legitimate justification
+// must never be silently clipped in Postgres just because the unrelated
+// display layer truncates longer. Still four orders of magnitude below
+// maxRequestBodyBytes' own 1 MiB whole-request cap (helpers.go), which
+// was, before this fix, the ONLY limit this field had.
+const maxAcceptReviewVerdictJustificationChars = 4000
 
 // ListDecisionInbox backs GET /api/decision-inbox (§16.2/§16.3 -- Phase 5
 // half: read model + endpoints). No authz.Authorize gate: this is a
@@ -655,6 +671,20 @@ func AcceptReviewVerdict(pool *pgxpool.Pool, deps decisioninbox.Deps, auditLog *
 		justification := strings.TrimSpace(req.Justification)
 		if justification == "" {
 			writeError(w, http.StatusBadRequest, "justification is required")
+			return
+		}
+		// T8 (round 4, adversarial review): before this bound existed, the
+		// ONLY limit on this human-authored, untrusted free-text field was
+		// maxRequestBodyBytes' own 1 MiB whole-request cap (helpers.go) --
+		// four orders of magnitude past anything a genuine justification
+		// needs, and unrelated to it (that cap bounds the WHOLE JSON body,
+		// not this one field). A typed 400, mirroring every other
+		// validation failure in this handler (verdictId/justification
+		// required, above), rather than silently accepting and storing an
+		// unbounded value the TEXT column and this endpoint's own
+		// TrimSpace call placed no ceiling on.
+		if n := utf8.RuneCountInString(justification); n > maxAcceptReviewVerdictJustificationChars {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("justification exceeds the maximum length of %d characters (got %d)", maxAcceptReviewVerdictJustificationChars, n))
 			return
 		}
 

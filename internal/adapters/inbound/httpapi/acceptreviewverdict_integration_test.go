@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"golang.org/x/sync/errgroup"
@@ -331,6 +332,56 @@ func TestAcceptReviewVerdict_MissingJustification_Returns400(t *testing.T) {
 	}
 	if ok {
 		t.Error("GetActiveAcceptance: ok = true, want false -- a request with no justification must never record an acceptance")
+	}
+}
+
+// TestAcceptReviewVerdict_JustificationTooLong_Returns400 pins T8 (round
+// 4, adversarial review): before this fix, the ONLY limit on
+// Justification's own length was maxRequestBodyBytes' own 1 MiB
+// whole-request cap (helpers.go) -- this test proves a justification well
+// under that cap, but over maxAcceptReviewVerdictJustificationChars, is
+// STILL refused with a typed 400, and that no acceptance is recorded.
+//
+// Mutation-test target: deleting the
+// `utf8.RuneCountInString(justification) >
+// maxAcceptReviewVerdictJustificationChars` check (decisioninbox.go) must
+// turn this test's own 400 assertion into a failure (the request would
+// succeed, status 201).
+func TestAcceptReviewVerdict_JustificationTooLong_Returns400(t *testing.T) {
+	rig := newDecisionInboxTestRig(t, &fakeMergeSourceControl{})
+	ctx := context.Background()
+
+	_, token := rig.createAuthenticatedUser(ctx, t, sqlcgen.UserRoleMaintainer)
+	const repoFullName = "acme/accept-verdict-justification-too-long"
+	rig.seedAutoApprovedVerdict(ctx, t, repoFullName, 507, "headsha507")
+
+	record, hasVerdict, err := appreviewverdict.GetLatest(ctx, appreviewverdict.Deps{ReviewVerdicts: rig.reviewVerdicts}, repoFullName, 507)
+	if err != nil || !hasVerdict {
+		t.Fatalf("GetLatest: hasVerdict=%v err=%v", hasVerdict, err)
+	}
+
+	// One rune over the bound -- the exact boundary this check must
+	// refuse on, not merely some arbitrarily larger value.
+	tooLong := strings.Repeat("a", 4001)
+	body, err := json.Marshal(restdtos.AcceptReviewVerdictRequest{
+		RepoFullName: repoFullName, PrNumber: 507, VerdictId: record.ID, Justification: tooLong,
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	status := rig.doJSON(t, http.MethodPost, "/api/decision-inbox/accept-verdict", body, nil, token)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", status, http.StatusBadRequest)
+	}
+
+	// No acceptance must have been recorded.
+	_, ok, err := appreviewverdict.GetActiveAcceptance(ctx, narvipg.NewReviewVerdictAcceptanceStore(rig.pool), repoFullName, 507)
+	if err != nil {
+		t.Fatalf("GetActiveAcceptance: error = %v, want nil", err)
+	}
+	if ok {
+		t.Error("GetActiveAcceptance: ok = true, want false -- an over-long justification must never record an acceptance")
 	}
 }
 
