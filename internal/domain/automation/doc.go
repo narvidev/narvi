@@ -140,10 +140,26 @@
 //     category already belongs to Linear's own existing agent-session
 //     pipeline). ClassifyGitHubDispatch/ClassifyLinearDispatch return a
 //     named GitHubDispatchSkipReason/LinearDispatchSkipReason for anything
-//     outside the register, logged at the call site rather than silently
-//     dropped -- expanding either allowlist is a deliberate, reviewed source
-//     edit, never an implicit consequence of a new webhook category this
-//     deployment happens to start receiving. Automation dispatch is an
+//     outside the register -- ALSO consulted at automation-CREATE time now
+//     (D10 audit fix): ValidateGitHubTriggerConfig/
+//     ValidateLinearTriggerConfig (trigger.go) call these SAME two
+//     Classify functions -- one register, consulted by both the create-time
+//     check and the dispatch-time check below, so the two can never drift
+//     apart -- so an automation naming an event outside either allowlist is
+//     rejected at creation now, instead of being silently accepted and dead
+//     forever with no feedback. A live webhook delivery that still names an
+//     event outside the register (e.g. a type introduced to GitHub/Linear
+//     after every EXISTING automation was already validated against
+//     yesterday's register) is logged at the call site -- Warn, not Debug
+//     (D11 audit fix: this sentence used to read "logged at the call site
+//     rather than silently dropped" while every one of those call-site
+//     log lines was logger.Debug and this codebase's own deployed default
+//     log level is info -- making the OLD sentence false: a log line no
+//     operator's own default configuration ever surfaces is, in every
+//     practical sense, silently dropped. Raised to Warn so this sentence is
+//     actually true) -- expanding either allowlist is a deliberate, reviewed
+//     source edit, never an implicit consequence of a new webhook category
+//     this deployment happens to start receiving. Automation dispatch is an
 //     ADDITIONAL, independent consumer of the same already-deduplicated
 //     delivery the @mention/AgentSessionEvent pipelines already process --
 //     never a replacement for either, and a panic or error inside dispatch
@@ -155,18 +171,61 @@
 //     configured target repos does a given event concern?
 //     TargetMatchesGitHubEvent scopes by repo (RepoFullNameFromCloneURL,
 //     comparing an automation's own Target.URL against the event's
-//     repository.full_name) and, when a target's own Branch is set, by
-//     branch -- and this is where the branch-CONTAINS-vs-branch-TIP trap is
+//     repository.full_name -- D7 audit fix: this comparison, and the host
+//     it is keyed against, are covered below) and by branch, REGARDLESS of
+//     whether a target's own Branch is configured (D4 audit fix, confirmed
+//     finding "a guard that is correct and out of the path": an
+//     UNCONFIGURED target used to match any branch unconditionally, before
+//     ever reaching the tip-check below, while the run it created still
+//     silently checked out the repo's actual default branch -- an
+//     unconfigured target now means EXACTLY "the repo's own default
+//     branch", resolved from the event's own "repository.default_branch",
+//     with the SAME tip-check applied to it; issues/issue_comment, which
+//     carry no branch identity at all, are the one explicit, closed-set
+//     carve-out where an unconfigured target still matches unconditionally
+//     -- see TargetMatchesGitHubEvent's own doc comment for the full
+//     reasoning). This is where the branch-CONTAINS-vs-branch-TIP trap is
 //     closed: a GitHub `status` event's own branches[] field lists every
 //     branch that CONTAINS the commit, never the branch whose CURRENT TIP
 //     it is, so membership is decided by TipBranchNames (branches[i].
 //     HeadSHA == the event's own SHA) and NEVER by scanning branches[] for a
 //     matching NAME alone -- a branch scoped target whose own branch merely
-//     contains an ancestor commit must not fire for it. Deduplication
-//     reuses the ALREADY-ESTABLISHED webhookDeliveryStore.Claim/Release
-//     mechanism the @mention/AgentSessionEvent pipelines already dedupe
-//     redeliveries with (§5.1) -- no second, independently-invented
-//     dedup mechanism exists for automation dispatch.
+//     contains an ancestor commit must not fire for it. A `pull_request`
+//     event's own branch identity (D3 audit fix) is its BASE branch (what
+//     it is being merged INTO, mirroring GitHub Actions' own
+//     `on.pull_request.branches` convention) -- never its head branch alone,
+//     which can belong to an entirely different (forked) repository whose
+//     author chooses its name freely; a same-repo head branch is ALSO
+//     accepted, but a fork's is rejected outright regardless of what name
+//     it carries (internal/adapters/inbound/github's own
+//     buildGitHubEventInput, automationdispatch.go).
+//
+//     RepoFullNameFromCloneURL (D7 audit fix, confirmed by a throwaway
+//     program run against it, see this batch's own PR body for the full
+//     input/output table) now ALSO checks the URL's own host against the
+//     one host this codebase's single real GitHub integration talks to --
+//     before this fix the host was parsed and silently discarded, so a
+//     target hosted on GitLab, Bitbucket, or a GitHub Enterprise instance
+//     matched a github.com event naming the identical owner/repo path.
+//
+//     Deduplication for the invocation dispatch itself creates is a
+//     SEPARATE, independently-invented mechanism from the
+//     webhookDeliveryStore.Claim/Release the @mention/AgentSessionEvent
+//     pipelines use for THEIR OWN dedup (§5.1) -- D1 audit fix (confirmed
+//     finding: "a redelivery re-fires the automation"). That claim's own
+//     lifetime is owned by those OTHER consumers of the same delivery, not
+//     automation dispatch's to rely on: they release it specifically so a
+//     genuine redelivery can retry THEIR OWN failed processing, which
+//     silently let automation dispatch fire a SECOND time for the identical
+//     delivery too. Each invocation created by live dispatch now carries
+//     its own durable (provider, delivery_id) identity
+//     (automation_invocations.source_provider/source_delivery_id,
+//     migrations/000135_automation_invocations_source_delivery.up.sql),
+//     made idempotent via the SAME "INSERT ... ON CONFLICT ... RETURNING
+//     (xmax = 0) AS inserted" idiom ClaimWebhookDelivery itself already
+//     establishes (app/automation's own CreateInvocationForDelivery,
+//     invocationenqueue.go) -- surviving a claim release entirely, by
+//     design.
 //
 //   - cron.go: a small, honest, fully-tested 5-field cron matcher
 //     (CronMatches/ValidateCronExpr) -- standard vixie-cron field
@@ -208,6 +267,18 @@
 //     counts/names honestly closes mockups.html's own named gap ("the
 //     column exists in the UI but the backend never fills it") without
 //     inventing that larger mechanism here.
+//
+// dispatch.go (the "later closing pass" mentioned in trigger.go's own
+// bullet above) and dispatchthrottle.go are two FURTHER files, added after
+// the original five above and after live dispatch first landed --
+// dispatchthrottle.go is D8's own audit fix (confirmed, SECURITY finding:
+// "unbounded invocations"): DispatchThrottleThreshold/
+// EvaluateDispatchThrottle, the SAME pure count-within-a-window-against-a-
+// threshold shape domain/sandbox.EvaluateCircuitBreaker/domain/imagebuild.
+// EvaluateBackoff already establish for this codebase's other two
+// "something keeps happening too often, stop" decisions, applied per
+// automation rather than per provider/fingerprint -- see that file's own
+// doc comment for the full "why this shape, not that one" reasoning.
 //
 // # Per-automation secrets: deferred to §25.1, deliberately not built here
 //

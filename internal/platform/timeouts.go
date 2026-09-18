@@ -1876,6 +1876,54 @@ type Timeouts struct {
 	// (ProviderHTTPClientTimeout, OutboxClaimDuration, etc.).
 	AutomationCronCatchUpWindow time.Duration
 
+	// AutomationDispatchMaxAttempts/AutomationDispatchRetryBaseDelay/
+	// AutomationDispatchRetryMaxDelay configure platform.Retry's own
+	// doubling-capped-at-max backoff around the live GitHub/Linear
+	// webhook-dispatch path's own two Postgres round trips (app/
+	// automation's own githubdispatch.go/lineardispatch.go: listing
+	// active automations, and creating an invocation) -- D6 audit fix
+	// (confirmed finding: "a transient error... is logged and swallowed
+	// while the handler keeps the claim and still answers 200... the
+	// automation permanently never fires, and even a manual redelivery is
+	// skipped as a duplicate"). Mirrors SandboxSecretFetchMaxAttempts/
+	// SandboxSecretFetchRetryBaseDelay/SandboxSecretFetchRetryMaxDelay's
+	// own identical shape (a foreground, in-process retry bounded by the
+	// caller's own request budget) -- deliberately NOT a fix that touches
+	// the shared webhook_deliveries claim (see D1's own doc comment,
+	// invocationenqueue.go: that claim's lifetime is owned by the
+	// @mention/AgentSessionEvent pipelines, not this consumer's to
+	// release or hold onto). A genuinely transient Postgres error now
+	// self-heals within the SAME request via this bounded inline retry,
+	// with no need to ever touch the claim in either direction. Chosen as
+	// 3 attempts / 250ms base / 1s max: this call sits inline on a real
+	// GitHub/Linear webhook's own request path (unlike sandbox boot's
+	// generous 240s FirstConnectBudget), so the worst case (3 attempts at
+	// whatever the per-call Postgres timeout already is, plus two backoff
+	// waits pessimistically at the 1s cap) must stay small relative to a
+	// webhook provider's own delivery timeout (GitHub warns above ~10s).
+	AutomationDispatchMaxAttempts    int
+	AutomationDispatchRetryBaseDelay time.Duration
+	AutomationDispatchRetryMaxDelay  time.Duration
+
+	// AutomationDispatchThrottleWindow is D8's own audit fix (confirmed,
+	// SECURITY finding: "unbounded invocations" -- every matching webhook
+	// delivery creates a brand-new invocation with no per-automation
+	// throttle, coalescing, or in-flight cap, so an attacker-controlled
+	// (or merely noisy, e.g. a CI system posting comments) event stream on
+	// a public repo creates unbounded invocations, each fanning out into
+	// up to MaxFanOutTargets sandboxed agent sessions). Bounds how far
+	// back app/automation's own dispatch path counts a single
+	// automation's own already-created invocations
+	// (CountRecentAutomationInvocations) before comparing against
+	// domainautomation.DispatchThrottleThreshold -- see that constant's
+	// own doc comment for why counting, not a circuit-breaker-style
+	// consecutive-FAILURE count, is the right shape reused here (this
+	// counts INVOCATIONS, regardless of outcome, not failures). Chosen as
+	// 5 minutes, mirroring CircuitBreakerWindow's own identical value and
+	// identical "a short, real-time window, not a long lookback" reasoning
+	// -- not specified by the plan.
+	AutomationDispatchThrottleWindow time.Duration
+
 	// --- §4.1 standalone additions ("RWX provider + previews", §4.1.1):
 	// RWXCLIExecTimeout has no ordering relationship with either invariant
 	// chain above (or with any prior standalone addition), so — per those
@@ -2881,6 +2929,12 @@ func DefaultTimeouts() Timeouts {
 		AutomationRunRunningOrphanThreshold:  90 * time.Minute, // §3.5, explicit ("running >90 min")
 		AutomationCronGranularity:            1 * time.Minute,  // §8.4; structural, not tunable -- see field doc comment
 		AutomationCronCatchUpWindow:          10 * time.Minute, // §8.4 fix (missed cron evaluations); not specified, chosen -- see field doc comment
+
+		AutomationDispatchMaxAttempts:    3,                      // D6 audit fix; not specified, chosen -- see field doc comment
+		AutomationDispatchRetryBaseDelay: 250 * time.Millisecond, // D6 audit fix; not specified, chosen
+		AutomationDispatchRetryMaxDelay:  1 * time.Second,        // D6 audit fix; not specified, chosen
+
+		AutomationDispatchThrottleWindow: 5 * time.Minute, // D8 audit fix; mirrors CircuitBreakerWindow's own identical value
 
 		RWXCLIExecTimeout:           2 * time.Minute,  // §4.1.1; not specified (RWX publishes no p99), chosen generously -- see field doc comment
 		RWXSandboxInactivityTimeout: 45 * time.Minute, // §4.1.1; not specified, chosen with margin above ActorIdleTTL (30min) -- see field doc comment

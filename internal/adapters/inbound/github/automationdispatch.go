@@ -6,7 +6,10 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/app/actorauthz"
 	"github.com/narvidev/narvi/internal/app/automation"
+	"github.com/narvidev/narvi/internal/domain/authz"
 	domainautomation "github.com/narvidev/narvi/internal/domain/automation"
 )
 
@@ -23,7 +26,28 @@ type githubAutomationEventEnvelope struct {
 	Action     string `json:"action"`
 	Repository struct {
 		FullName string `json:"full_name"`
+
+		// DefaultBranch is "repository.default_branch" -- D4 audit fix's
+		// own resolution for what an UNCONFIGURED (Target.Branch == "")
+		// automation target means (domainautomation.
+		// TargetMatchesGitHubEvent's own doc comment): the repo's own
+		// CURRENT default branch, exactly as GitHub itself reports it on
+		// every event's own embedded repository object -- never a static
+		// "main" guess. Present on every event type this file builds an
+		// input for (GitHub's own full repository object always carries
+		// it), so populating this costs no extra lookup.
+		DefaultBranch string `json:"default_branch"`
 	} `json:"repository"`
+
+	// Sender is GitHub's own "who performed this action" actor, present on
+	// EVERY event type in domainautomation.GitHubDispatchAllowlist -- D2
+	// audit fix's own actor-authorization input (dispatchAutomationsBestEffort
+	// below): the same (provider, external_id) identity resolveCommenterActor
+	// (identity.go) already resolves the @mention pipeline's own commenter
+	// against, reused here rather than a second lookup.
+	Sender struct {
+		ID int64 `json:"id"`
+	} `json:"sender"`
 
 	// Label is the top-level "label" object GitHub's own `pull_request`/
 	// `issues` "labeled"/"unlabeled" actions carry -- the ONE label that
@@ -39,9 +63,20 @@ type githubAutomationEventEnvelope struct {
 
 	PullRequest *struct {
 		Head struct {
-			Ref string `json:"ref"`
-			SHA string `json:"sha"`
+			Ref  string `json:"ref"`
+			SHA  string `json:"sha"`
+			Repo struct {
+				FullName string `json:"full_name"`
+			} `json:"repo"`
 		} `json:"head"`
+		// Base.Ref is the PR's own TARGET/integration branch ("what
+		// branch is this PR being merged INTO") -- D3 audit fix's own
+		// decision for what a branch-scoped target means for a
+		// `pull_request` event, see buildGitHubEventInput's own doc
+		// comment below for the full "why".
+		Base struct {
+			Ref string `json:"ref"`
+		} `json:"base"`
 		Labels []struct {
 			Name string `json:"name"`
 		} `json:"labels"`
@@ -84,6 +119,15 @@ type githubAutomationEventEnvelope struct {
 
 const pushRefBranchPrefix = "refs/heads/"
 
+// githubZeroSHA is GitHub's own well-known "this ref no longer exists"
+// sentinel: a `push` event's own "after" field is exactly 40 zero
+// characters when that push DELETED the branch named by "ref", never a
+// real commit SHA -- D5 audit fix (confirmed finding: a branch deletion
+// was previously classified as that branch's own new tip, since the old
+// check was a bare `env.After != ""`, and this sentinel string is very
+// much non-empty).
+const githubZeroSHA = "0000000000000000000000000000000000000000"
+
 // buildGitHubEventInput normalizes body (the raw webhook payload for
 // eventType) into domainautomation.GitHubEventInput -- ok is false only on
 // a JSON decode failure (a malformed body, which parseMention's own
@@ -100,11 +144,50 @@ const pushRefBranchPrefix = "refs/heads/"
 // first, regardless of event type, ahead of whichever per-event-type
 // labels[] array below also contributes to it.
 //
+// RepoFullName/DefaultBranch (env.Repository) are populated identically
+// for every event type below -- GitHub's own full repository object,
+// carrying both, is embedded on every event type in
+// domainautomation.GitHubDispatchAllowlist.
+//
 // Per event type:
-//   - pull_request: Labels also gets pull_request.labels[] (the full
-//     CURRENT label set); Branches carries ONE entry, the PR's own head
-//     ref/sha -- unambiguous, no tip-vs-containment question for this
-//     event type.
+//   - pull_request (D3 audit fix -- "what does a branch-scoped target
+//     mean for a pull_request event"): Labels also gets
+//     pull_request.labels[] (the full CURRENT label set). DECISION: a
+//     branch-scoped target means the PR's own BASE branch (what it is
+//     being merged INTO), never its head branch -- mirroring GitHub
+//     Actions' own `on.pull_request.branches` filter, which matches the
+//     base branch by the identical convention. This is not an arbitrary
+//     pick: the confirmed audit finding was TWO defects in the OLD
+//     head-branch-only behavior at once -- (1) a fork PR's own head
+//     branch is chosen freely by its author and belongs to a DIFFERENT
+//     repository entirely, so a fork opened with head.ref == "main"
+//     satisfied a target scoped to "main" on the BASE repo by naming
+//     coincidence alone (a false positive, attacker-controlled); (2) an
+//     ordinary, same-repo PR opened INTO main never fires a target
+//     scoped to "main" at all, since a PR's own head is by definition
+//     never its own base (a false negative). Base-branch scoping closes
+//     BOTH: base.ref is always a real branch of the base repo itself,
+//     never attacker-chosen, and "this PR targets main" is exactly what
+//     a "main"-scoped target should mean. Branches therefore carries
+//     base.ref FIRST (when present), paired with head.sha (the commit
+//     this event actually pertains to) as its own HeadSHA -- this
+//     pairing is a DELIBERATE simplification, not a claim that head.sha
+//     is literally the base branch's real, independent current-tip
+//     commit in git terms (a `pull_request` payload carries no such
+//     fact): it exists purely so TargetMatchesGitHubEvent's existing,
+//     shared TipBranchNames(in.SHA, in.Branches) machinery -- built for
+//     status/check_run's OWN genuine tip-vs-containment ambiguity --
+//     also serves this event type's unambiguous "which base branch does
+//     this ONE event concern" question, without forking that function's
+//     own logic per event type. head.ref is ALSO added, as a SECOND
+//     Branches entry, but ONLY when it is genuinely a branch of the SAME
+//     repository as env.Repository (sameRepoOrUnknown below) -- e.g. an
+//     automation deliberately scoped to a long-lived, same-repo branch
+//     that itself opens PRs. A head whose own repo is explicitly a
+//     DIFFERENT one (a real fork) is REJECTED outright: never added,
+//     regardless of what name it carries -- this is the literal "reject
+//     head refs that belong to a different repository than the event's
+//     own" half of the fix.
 //   - issues: Labels also gets issue.labels[]; no branch concept at all.
 //   - issue_comment: no labels beyond the top-level merge above (this
 //     event's own payload does not embed the parent issue's labels), no
@@ -112,7 +195,12 @@ const pushRefBranchPrefix = "refs/heads/"
 //   - push: Branches carries ONE entry, ref (stripped of "refs/heads/")
 //     and after -- the new tip BY DEFINITION (a push necessarily moves
 //     that branch's tip to after). Skipped (nil Branches, empty SHA) for
-//     a tag push (Ref does not start with "refs/heads/").
+//     a tag push (Ref does not start with "refs/heads/") OR (D5 audit
+//     fix) a branch DELETION (after == githubZeroSHA) -- a deleted
+//     branch has no "new tip" at all, and the old bare `after != ""`
+//     check let the zero-SHA sentinel itself be stored as both the event
+//     SHA and the branch's own HeadSHA, firing branch-scoped automations
+//     for a branch that no longer exists.
 //   - check_run: SHA/Branches come from check_run.head_sha/check_suite.
 //     head_branch -- GitHub itself names the one branch this run concerns,
 //     no containment ambiguity.
@@ -130,9 +218,10 @@ func buildGitHubEventInput(eventType string, body []byte) (domainautomation.GitH
 	}
 
 	in := domainautomation.GitHubEventInput{
-		EventType:    eventType,
-		Action:       env.Action,
-		RepoFullName: env.Repository.FullName,
+		EventType:     eventType,
+		Action:        env.Action,
+		RepoFullName:  env.Repository.FullName,
+		DefaultBranch: env.Repository.DefaultBranch,
 	}
 
 	if env.Label != nil && env.Label.Name != "" {
@@ -147,7 +236,12 @@ func buildGitHubEventInput(eventType string, body []byte) (domainautomation.GitH
 			}
 			if env.PullRequest.Head.SHA != "" {
 				in.SHA = env.PullRequest.Head.SHA
-				in.Branches = []domainautomation.GitHubEventBranch{{Name: env.PullRequest.Head.Ref, HeadSHA: env.PullRequest.Head.SHA}}
+				if env.PullRequest.Base.Ref != "" {
+					in.Branches = append(in.Branches, domainautomation.GitHubEventBranch{Name: env.PullRequest.Base.Ref, HeadSHA: env.PullRequest.Head.SHA})
+				}
+				if env.PullRequest.Head.Ref != "" && sameRepoOrUnknown(env.PullRequest.Head.Repo.FullName, env.Repository.FullName) {
+					in.Branches = append(in.Branches, domainautomation.GitHubEventBranch{Name: env.PullRequest.Head.Ref, HeadSHA: env.PullRequest.Head.SHA})
+				}
 			}
 		}
 
@@ -159,7 +253,7 @@ func buildGitHubEventInput(eventType string, body []byte) (domainautomation.GitH
 		}
 
 	case "push":
-		if strings.HasPrefix(env.Ref, pushRefBranchPrefix) && env.After != "" {
+		if strings.HasPrefix(env.Ref, pushRefBranchPrefix) && env.After != "" && env.After != githubZeroSHA {
 			branch := strings.TrimPrefix(env.Ref, pushRefBranchPrefix)
 			in.SHA = env.After
 			in.Branches = []domainautomation.GitHubEventBranch{{Name: branch, HeadSHA: env.After}}
@@ -187,6 +281,43 @@ func buildGitHubEventInput(eventType string, body []byte) (domainautomation.GitH
 	return in, true
 }
 
+// sameRepoOrUnknown reports whether headRepoFullName (a pull_request
+// event's own head.repo.full_name) may be trusted as naming a branch of
+// baseRepoFullName (the event's own top-level "repository") -- true when
+// headRepoFullName is empty (GitHub's own real payload never omits this
+// field; only a minimal/synthetic test payload does, so this fallback is
+// never exercised against a genuine webhook delivery) OR matches
+// case-insensitively (GitHub repo paths route case-insensitively,
+// mirroring TargetMatchesGitHubEvent's own identical reasoning,
+// dispatch.go). False means headRepoFullName names a DIFFERENT,
+// untrusted repository -- a real fork -- so the caller must never use its
+// own head.ref as if it were a branch of baseRepoFullName.
+func sameRepoOrUnknown(headRepoFullName, baseRepoFullName string) bool {
+	return headRepoFullName == "" || strings.EqualFold(headRepoFullName, baseRepoFullName)
+}
+
+// githubEventSenderID extracts the top-level "sender.id" GitHub attaches
+// to EVERY webhook event (the actor who performed the action this
+// delivery reports) -- a second, minimal, standalone decode rather than
+// widening buildGitHubEventInput's own return shape, so that function's
+// existing unit tests (this package's own automationdispatch_test.go, all
+// written against its current (GitHubEventInput, bool) signature) stay
+// untouched by an addition that is, structurally, an unrelated concern
+// (WHO sent this event, never WHAT it says). ok is false only on a JSON
+// decode failure -- the identical "nothing to do" contract
+// buildGitHubEventInput's own ok already establishes.
+func githubEventSenderID(body []byte) (id int64, ok bool) {
+	var env struct {
+		Sender struct {
+			ID int64 `json:"id"`
+		} `json:"sender"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return 0, false
+	}
+	return env.Sender.ID, true
+}
+
 // dispatchAutomationsBestEffort is §8.4's own live-dispatch call site:
 // an ADDITIONAL, independent consumer of this SAME already-claimed
 // delivery -- called from NewHandler's own returned func immediately after
@@ -198,6 +329,8 @@ func buildGitHubEventInput(eventType string, body []byte) (domainautomation.GitH
 // this package's own handler_test.go, or any other minimal wiring that
 // doesn't care about this Step): simply returns, mirroring every other
 // optional Config field's identical nil-safety convention in this file.
+// identities/users are ALSO required (nil fails closed exactly like the
+// two Config fields, logged once) -- see the D2 section below.
 //
 // Recovers from a panic internally and only logs it -- automation dispatch
 // evaluating a handful of trigger configs against a webhook payload is
@@ -208,7 +341,40 @@ func buildGitHubEventInput(eventType string, body []byte) (domainautomation.GitH
 // swallowed panics" convention elsewhere -- this is a documented, reviewed
 // exception for exactly this "additional, independent consumer" shape, not
 // a general panic-recovery precedent for the rest of this handler).
-func dispatchAutomationsBestEffort(ctx context.Context, logger *slog.Logger, cfg Config, eventType string, body []byte) {
+//
+// # D2 audit fix: actor authorization, fail closed
+//
+// Before this fix, ANY GitHub account that could open an issue, post a
+// comment, or open a fork PR on a watched public repository could create
+// an automation invocation -- and, downstream, sandboxed agent runs
+// holding this deployment's own repository credentials -- with NO
+// authorization check at all, even though the pre-existing @mention
+// pipeline (coalesce.go) already refuses the identical unlinked sender
+// via actorauthz.AuthorizeLinkedActor. This closes that gap by calling
+// the SAME primitive, never a second one: the event's own top-level
+// "sender.id" (githubEventSenderID above) is resolved to a Narvi actor via
+// resolveCommenterActor (identity.go -- the EXACT same direct (provider,
+// external_id) lookup the @mention pipeline's own commenter resolution
+// already uses, no separate/duplicated lookup), then authorized via
+// actorauthz.AuthorizeLinkedActor(..., authz.ActionCreateSession, ...) --
+// ActionCreateSession because an automation invocation is, structurally,
+// "start new agent work" (§13.3 row 2), the SAME row CreateOrJoin's own
+// WINNER path already authorizes a fresh @mention-triggered session
+// against, and that row has no per-resource ownership concept to carve
+// out (a brand-new invocation has no pre-existing session to own or not).
+// An unauthorized or unlinked sender (actor invalid, OR AuthorizeLinkedActor
+// denies a linked-but-insufficient-role actor) is skipped with a named,
+// logged reason -- exactly like an out-of-allowlist event
+// (ClassifyGitHubDispatch's own identical "named reason, no dispatch"
+// shape, app/automation's own githubdispatch.go) -- never silently or
+// implicitly. A genuine LOOKUP failure (resolveCommenterActor's own
+// distinct non-nil-error return -- a transient Postgres error, saying
+// NOTHING about link state) is treated the same way: fail closed, skip
+// dispatch, log at Error. See this batch's own PR body for the follow-on
+// product question this raises (docs/DECISIONS.md) and the traceability
+// finding (does untrusted payload text reach the agent's prompt on this
+// path).
+func dispatchAutomationsBestEffort(ctx context.Context, logger *slog.Logger, cfg Config, identities CommenterIdentityLookup, users *postgres.UserStore, eventType string, deliveryID string, body []byte) {
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("github: automation dispatch panicked, isolated from the rest of this delivery", "panic", r, "event_type", eventType)
@@ -218,6 +384,10 @@ func dispatchAutomationsBestEffort(ctx context.Context, logger *slog.Logger, cfg
 	if cfg.Automations == nil || cfg.AutomationInvocations == nil {
 		return
 	}
+	if identities == nil || users == nil {
+		logger.Error("github: automation dispatch: identities/users store not wired, skipping (fail closed)", "event_type", eventType)
+		return
+	}
 
 	in, ok := buildGitHubEventInput(eventType, body)
 	if !ok {
@@ -225,5 +395,21 @@ func dispatchAutomationsBestEffort(ctx context.Context, logger *slog.Logger, cfg
 		return
 	}
 
-	automation.DispatchGitHubWebhookEvent(ctx, logger, cfg.Automations, cfg.AutomationInvocations, eventType, in)
+	senderID, ok := githubEventSenderID(body)
+	if !ok {
+		logger.Warn("github: automation dispatch: malformed webhook body (sender), skipping", "event_type", eventType)
+		return
+	}
+
+	actor, err := resolveCommenterActor(ctx, identities, senderID)
+	if err != nil {
+		logger.Error("github: automation dispatch: resolve sender identity failed, skipping (fail closed)", "error", err, "event_type", eventType)
+		return
+	}
+	if !actorauthz.AuthorizeLinkedActor(ctx, logger, authzSurface, users, actor, authz.ActionCreateSession, authz.Resource{}) {
+		logger.Info("github: automation dispatch: sender not authorized, skipping", "event_type", eventType, "reason", "sender_unlinked_or_unauthorized", "sender_id", senderID)
+		return
+	}
+
+	automation.DispatchGitHubWebhookEvent(ctx, logger, cfg.Automations, cfg.AutomationInvocations, cfg.Timeouts, eventType, deliveryID, in)
 }

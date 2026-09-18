@@ -1650,6 +1650,8 @@ type AutomationInvocation struct {
 	FailureCountedAt pgtype.Timestamptz         `json:"failure_counted_at"`
 	ClosedAt         pgtype.Timestamptz         `json:"closed_at"`
 	CreatedAt        pgtype.Timestamptz         `json:"created_at"`
+	SourceProvider   *string                    `json:"source_provider"`
+	SourceDeliveryID *string                    `json:"source_delivery_id"`
 }
 
 type AutomationRun struct {

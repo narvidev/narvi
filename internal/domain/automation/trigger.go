@@ -134,12 +134,31 @@ type GitHubTriggerConfig struct {
 // ErrEmptyGitHubEvent is ValidateGitHubTriggerConfig's own sentinel.
 var ErrEmptyGitHubEvent = errors.New("automation: github trigger config: event must not be empty")
 
+// ErrGitHubEventNotDispatchable is ValidateGitHubTriggerConfig's own
+// second sentinel -- D10 audit fix (confirmed finding: "a trigger for a
+// non-allowlisted event is accepted and silently dead"). Before this
+// fix, GitHubDispatchAllowlist (dispatch.go) was consulted ONLY at live
+// dispatch time, never at automation-create time, so the API accepted a
+// GitHubTriggerConfig naming an event outside it (a typo, or a real
+// GitHub event this dispatch path simply does not subscribe to) and that
+// automation was dead forever, with no feedback to whoever created it.
+var ErrGitHubEventNotDispatchable = errors.New("automation: github trigger config: event is not in the dispatchable allowlist")
+
 // ValidateGitHubTriggerConfig validates cfg before it is accepted onto an
-// automation with TriggerTypeGitHub -- only Event is required; Action/Label
-// are optional filters (see their own doc comments above).
+// automation with TriggerTypeGitHub -- Event is required AND (D10 audit
+// fix) must be one ClassifyGitHubDispatch itself recognizes: the SAME
+// function dispatch.go's own live-dispatch path calls
+// (app/automation.DispatchGitHubWebhookEvent) -- one register, consulted
+// by both the create-time check here and the dispatch-time check there,
+// so the two can never drift apart the way two independently-maintained
+// copies of the same allowlist could. Action/Label are optional filters
+// (see their own doc comments above).
 func ValidateGitHubTriggerConfig(cfg GitHubTriggerConfig) error {
 	if cfg.Event == "" {
 		return ErrEmptyGitHubEvent
+	}
+	if ClassifyGitHubDispatch(cfg.Event) != GitHubDispatchNotSkipped {
+		return fmt.Errorf("%w: %q", ErrGitHubEventNotDispatchable, cfg.Event)
 	}
 	return nil
 }
@@ -180,6 +199,17 @@ type GitHubEventInput struct {
 	// (TargetMatchesGitHubEvent then never matches any target, fail
 	// closed).
 	RepoFullName string
+
+	// DefaultBranch is the event's own "repository.default_branch" --
+	// D4 audit fix's own resolution for what an UNCONFIGURED
+	// (Target.Branch == "") target means, see TargetMatchesGitHubEvent's
+	// own doc comment. Every GitHub webhook payload this dispatch path
+	// parses embeds the full repository object this field comes from, so
+	// populating it costs no extra lookup/I/O -- "" for a caller that
+	// never resolved it (TargetMatchesGitHubEvent then never matches an
+	// unconfigured target against this event, fail closed, exactly like
+	// an unresolved RepoFullName above).
+	DefaultBranch string
 
 	// SHA is the commit this event pertains to (status: top-level "sha";
 	// check_run: "check_run.head_sha"; pull_request: "pull_request.head.
@@ -291,11 +321,22 @@ type LinearTriggerConfig struct {
 // ErrEmptyLinearEventType is ValidateLinearTriggerConfig's own sentinel.
 var ErrEmptyLinearEventType = errors.New("automation: linear trigger config: event type must not be empty")
 
+// ErrLinearEventNotDispatchable mirrors ErrGitHubEventNotDispatchable's
+// own D10 audit fix, for Linear.
+var ErrLinearEventNotDispatchable = errors.New("automation: linear trigger config: event type is not in the dispatchable allowlist")
+
 // ValidateLinearTriggerConfig validates cfg before it is accepted onto an
-// automation with TriggerTypeLinear.
+// automation with TriggerTypeLinear -- mirrors
+// ValidateGitHubTriggerConfig's own D10 audit fix exactly: EventType must
+// also be one ClassifyLinearDispatch itself recognizes, the SAME register
+// app/automation.DispatchLinearWebhookEvent consults at live dispatch
+// time.
 func ValidateLinearTriggerConfig(cfg LinearTriggerConfig) error {
 	if cfg.EventType == "" {
 		return ErrEmptyLinearEventType
+	}
+	if ClassifyLinearDispatch(cfg.EventType) != LinearDispatchNotSkipped {
+		return fmt.Errorf("%w: %q", ErrLinearEventNotDispatchable, cfg.EventType)
 	}
 	return nil
 }

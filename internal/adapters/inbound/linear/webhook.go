@@ -234,8 +234,12 @@ type Deps struct {
 	// for the full design. Nil-safe: nil (this package's own webhook_test.
 	// go, or any other minimal wiring that doesn't care about this Step)
 	// simply skips automation dispatch entirely.
-	Automations           automation.LinearTriggerLister
-	AutomationInvocations automation.InvocationCreator
+	Automations automation.LinearTriggerLister
+	// AutomationInvocations mirrors internal/adapters/inbound/github's own
+	// Config.AutomationInvocations doc comment exactly (D1/D8 audit
+	// fixes): typed as automation.DeliveryInvocationCreator, not the
+	// narrower automation.InvocationCreator this field used to carry.
+	AutomationInvocations automation.DeliveryInvocationCreator
 }
 
 // NewWebhookHandler backs POST /webhooks/linear: verifies Linear's own
@@ -352,7 +356,7 @@ func NewWebhookHandler(deps Deps) http.HandlerFunc {
 		// itself -- see that allowlist's own doc comment for why). See
 		// dispatchAutomationsBestEffort's own doc comment
 		// (automationdispatch.go) for the full design and panic-isolation.
-		dispatchAutomationsBestEffort(ctx, logger, deps, eventType, rawBody)
+		dispatchAutomationsBestEffort(ctx, logger, deps, eventType, deliveryID, rawBody)
 
 		if eventType != agentSessionEventType && payload.Type != agentSessionEventType {
 			logger.Info("linear: ignoring non-AgentSessionEvent webhook category", "event_type", eventType)

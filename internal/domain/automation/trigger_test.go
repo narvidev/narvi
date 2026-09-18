@@ -75,6 +75,20 @@ func TestValidateGitHubTriggerConfig(t *testing.T) {
 	}
 }
 
+// TestValidateGitHubTriggerConfig_RejectsEventOutsideDispatchAllowlist is
+// D10's own audit fix, pinned: before this fix, an Event value outside
+// GitHubDispatchAllowlist (e.g. "release", a real GitHub event this
+// dispatch path simply never subscribes to) was accepted at
+// automation-create time and then NEVER matched anything at live dispatch
+// time (ClassifyGitHubDispatch skips it there) -- silently dead forever,
+// with no feedback to whoever configured it.
+func TestValidateGitHubTriggerConfig_RejectsEventOutsideDispatchAllowlist(t *testing.T) {
+	err := automation.ValidateGitHubTriggerConfig(automation.GitHubTriggerConfig{Event: "release"})
+	if !errors.Is(err, automation.ErrGitHubEventNotDispatchable) {
+		t.Fatalf("got %v, want ErrGitHubEventNotDispatchable", err)
+	}
+}
+
 func TestMatchesGitHubTrigger(t *testing.T) {
 	tests := []struct {
 		name string
@@ -137,6 +151,16 @@ func TestValidateLinearTriggerConfig(t *testing.T) {
 	err := automation.ValidateLinearTriggerConfig(automation.LinearTriggerConfig{})
 	if !errors.Is(err, automation.ErrEmptyLinearEventType) {
 		t.Fatalf("got %v, want ErrEmptyLinearEventType", err)
+	}
+}
+
+// TestValidateLinearTriggerConfig_RejectsEventTypeOutsideDispatchAllowlist
+// mirrors TestValidateGitHubTriggerConfig_RejectsEventOutsideDispatchAllowlist,
+// for Linear -- D10's own audit fix.
+func TestValidateLinearTriggerConfig_RejectsEventTypeOutsideDispatchAllowlist(t *testing.T) {
+	err := automation.ValidateLinearTriggerConfig(automation.LinearTriggerConfig{EventType: "AgentSessionEvent"})
+	if !errors.Is(err, automation.ErrLinearEventNotDispatchable) {
+		t.Fatalf("got %v, want ErrLinearEventNotDispatchable", err)
 	}
 }
 

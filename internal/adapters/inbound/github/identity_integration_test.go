@@ -152,10 +152,16 @@ func (rig identityTestRig) createLinkedUser(t *testing.T, commenterID int64, rol
 
 // issueCommentBodyWithCommenter mirrors issueCommentBody
 // (handler_integration_test.go) but also sets comment.user.{id,login} --
-// the field this batch's own payload.go parsing newly reads.
+// the field this batch's own payload.go parsing newly reads. ALSO sets the
+// top-level "sender" field to the SAME commenter (D2 audit fix's own
+// automation-dispatch actor-authorization input, githubEventSenderID,
+// automationdispatch.go) -- a real GitHub `issue_comment`/"created"
+// delivery's own top-level sender IS the comment's author, exactly like
+// this mirrors.
 func issueCommentBodyWithCommenter(repoFullName, repoName, cloneURL string, prNumber int, label string, commenterID int64, commenterLogin string) []byte {
 	body, err := json.Marshal(map[string]any{
 		"action": "created",
+		"sender": map[string]any{"id": commenterID, "login": commenterLogin},
 		"issue": map[string]any{
 			"number":       prNumber,
 			"pull_request": map[string]any{"url": fmt.Sprintf("https://api.github.com/repos/%s/pulls/%d", repoFullName, prNumber)},

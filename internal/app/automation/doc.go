@@ -137,7 +137,9 @@
 // ListActiveGitHubAutomations, DispatchLinearWebhookEvent's own
 // ListActiveLinearAutomations, and the generic webhook trigger's own
 // automationwebhook.NewHandler) is the FIRST layer: each already filters to
-// "status = 'active'" before ever calling CreateInvocation, so a paused
+// "status = 'active'" before ever calling CreateInvocation/
+// CreateInvocationForDelivery (D1 audit fix's own idempotent-on-delivery
+// variant, invocationenqueue.go -- see the section below), so a paused
 // automation is never a fresh call's own target in the first place. Because
 // claimBatch claims an
 // entire BATCH of due invocations inside one transaction, an automation can
@@ -158,21 +160,77 @@
 // as a failure strike against an automation no longer accepting new work)
 // would need its own small design decision, not addressed by this Step.
 //
-// # CreateInvocation -- the one entry point every trigger evaluator shares
+// # CreateInvocation/CreateInvocationForDelivery -- the two entry points every trigger evaluator shares
 //
 // §8.4 ("automations: triggers & extras", §8.4) owns WHAT causes an
 // invocation to be created -- GitHub/Linear/webhook/cron trigger condition
-// evaluation -- and every one of those four now calls this SAME entry
-// point unchanged: the cron trigger pump (triggerpump.go's own
-// EvaluateCronTriggersOnce), live GitHub/Linear webhook dispatch
-// (githubdispatch.go's own DispatchGitHubWebhookEvent, lineardispatch.go's
-// own DispatchLinearWebhookEvent), and the generic webhook trigger
-// (internal/adapters/inbound/automationwebhook's own handler.go).
-// invocationenqueue.go's CreateInvocation is the minimal, durable "an
-// invocation now exists, fan it out" hand-off every one of them shares
-// (mirrors internal/app/releasereview.Enqueue's own "one cheap INSERT, the
-// real work happens later on a dedicated background loop's own schedule"
-// shape). It does NOT itself decide whether an automation should fire; it
-// only validates targets (automation.ValidateTargets) and durably records
-// that a firing has already been decided.
+// evaluation. Until D1's audit fix, all four trigger evaluators called the
+// SAME single entry point (CreateInvocation) unchanged; that is no longer
+// true, and this section now describes the CURRENT split, not the
+// original one:
+//
+//   - The cron trigger pump (triggerpump.go's own
+//     EvaluateCronTriggersOnce) and the generic webhook trigger
+//     (internal/adapters/inbound/automationwebhook's own handler.go) still
+//     call invocationenqueue.go's own CreateInvocation -- neither has a
+//     genuine per-delivery identity to key idempotency on (a cron tick is
+//     already CAS-guarded per minute-bucket via ClaimCronFire; a generic
+//     webhook trigger's own "condition" IS its bearer-token
+//     authentication, with no separate redeliverable-provider-delivery
+//     concept at all).
+//   - Live GitHub/Linear webhook dispatch (githubdispatch.go's own
+//     DispatchGitHubWebhookEvent, lineardispatch.go's own
+//     DispatchLinearWebhookEvent) call CreateInvocationForDelivery instead
+//     -- D1 audit fix (confirmed finding: "a redelivery re-fires the
+//     automation"). A real GitHub/Linear webhook delivery IS
+//     redeliverable (a manual "Redeliver" action, or -- see D6's own fix,
+//     immediately below -- this package's own bounded inline retry), and
+//     the @mention/AgentSessionEvent pipelines sharing that SAME delivery
+//     may release their own webhook_deliveries claim for reasons entirely
+//     unrelated to whether automation dispatch itself already succeeded --
+//     so automation dispatch needs (and, since this fix, has) its OWN
+//     idempotency, keyed on (automation_id, provider, delivery_id)
+//     (migrations/000135_automation_invocations_source_delivery.up.sql),
+//     independent of that claim's own lifetime.
+//
+// Both entry points share the identical minimal, durable "an invocation
+// now exists, fan it out" shape (mirrors internal/app/releasereview.
+// Enqueue's own "one cheap INSERT, the real work happens later on a
+// dedicated background loop's own schedule" shape). Neither decides
+// whether an automation should fire; both only validate targets
+// (automation.ValidateTargets) and durably record that a firing has
+// already been decided.
+//
+// # D6 audit fix: transient Postgres failures retry inline, bounded
+//
+// Every Postgres round trip inside DispatchGitHubWebhookEvent/
+// DispatchLinearWebhookEvent (listing active automations, creating an
+// invocation, counting recent invocations for D8's own throttle below) is
+// wrapped in platform.Retry, bounded by platform.Timeouts.
+// AutomationDispatchMaxAttempts/AutomationDispatchRetryBaseDelay/
+// AutomationDispatchRetryMaxDelay -- confirmed finding: before this fix, a
+// transient error (or a panic, recovered and logged one layer up by the
+// adapter's own dispatchAutomationsBestEffort) was simply swallowed while
+// the handler kept the webhook-delivery claim and still answered 200, so
+// the automation permanently never fired and even a manual redelivery was
+// skipped as a duplicate (the claim was never released for THIS reason).
+// Deliberately NOT fixed by touching that claim in either direction (see
+// D1's own section above: its lifetime belongs to the OTHER consumers of
+// the same delivery) -- a bounded, in-process retry is the only retry path
+// available to a consumer that must not touch it.
+//
+// # D8 audit fix: a per-automation dispatch throttle
+//
+// checkDispatchThrottle (githubdispatch.go, shared verbatim by both
+// DispatchGitHubWebhookEvent and DispatchLinearWebhookEvent) counts an
+// automation's own invocations created within platform.Timeouts.
+// AutomationDispatchThrottleWindow and denies creating another once
+// internal/domain/automation.EvaluateDispatchThrottle says no -- confirmed,
+// SECURITY finding: before this fix, every matching webhook delivery
+// created a brand-new invocation with no per-automation throttle,
+// coalescing, or in-flight cap at all, so an attacker-controlled event
+// stream on a public repo (or simply a single authorized-but-noisy actor,
+// or a CI system posting comments) could create unbounded invocations,
+// each fanning out into up to internal/domain/automation.MaxFanOutTargets
+// (10) sandboxed agent sessions.
 package automation

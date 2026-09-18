@@ -8,6 +8,7 @@ import (
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	domainautomation "github.com/narvidev/narvi/internal/domain/automation"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // linearTriggerConfigJSON mirrors githubTriggerConfigJSON's own doc
@@ -34,6 +35,13 @@ type LinearTriggerLister interface {
 	ListActiveLinearAutomations(ctx context.Context) ([]sqlcgen.Automation, error)
 }
 
+// linearDeliveryProvider is the SAME literal
+// internal/adapters/inbound/linear's own webhook.go already uses for
+// WebhookDeliveryStore.Claim ("linear") -- this package's own copy,
+// mirroring githubDeliveryProvider's own identical reasoning
+// (githubdispatch.go).
+const linearDeliveryProvider = "linear"
+
 // DispatchLinearWebhookEvent is DispatchGitHubWebhookEvent's own Linear
 // twin -- called inline from internal/adapters/inbound/linear's own
 // webhook.go, for every already-claimed (deduplicated) Linear webhook
@@ -49,24 +57,38 @@ type LinearTriggerLister interface {
 // automation, EVERY one of its own configured target repos fires,
 // unnarrowed, exactly like the cron trigger pump's own evaluateCronAutomation
 // and the generic webhook trigger's own automationwebhook.NewHandler.
-func DispatchLinearWebhookEvent(ctx context.Context, logger *slog.Logger, automations LinearTriggerLister, invocations InvocationCreator, eventType string, in domainautomation.LinearEventInput) {
+//
+// D1/D6/D8 audit fixes: mirrors DispatchGitHubWebhookEvent's own identical
+// idempotent-on-delivery invocation creation (CreateInvocationForDelivery,
+// keyed on (row.ID, linearDeliveryProvider, deliveryID)), per-automation
+// dispatch throttle (checkDispatchThrottle), and bounded inline retry
+// around every Postgres call (platform.Retry, timeouts.
+// AutomationDispatchMaxAttempts et al.) -- see that function's own doc
+// comment for the full "why" behind each, shared verbatim rather than
+// re-implemented here.
+func DispatchLinearWebhookEvent(ctx context.Context, logger *slog.Logger, automations LinearTriggerLister, invocations DeliveryInvocationCreator, timeouts platform.Timeouts, eventType string, deliveryID string, in domainautomation.LinearEventInput) {
 	if reason := domainautomation.ClassifyLinearDispatch(eventType); reason != domainautomation.LinearDispatchNotSkipped {
-		logger.Debug("automation: linear event not evaluated against any trigger", "event_type", eventType, "reason", string(reason))
+		logger.Warn("automation: linear event not evaluated against any trigger", "event_type", eventType, "reason", string(reason))
 		return
 	}
 
-	rows, err := automations.ListActiveLinearAutomations(ctx)
-	if err != nil {
-		logger.Error("automation: list active linear automations failed", "error", err)
+	var rows []sqlcgen.Automation
+	retryErr := platform.Retry(ctx, timeouts.AutomationDispatchMaxAttempts, timeouts.AutomationDispatchRetryBaseDelay, timeouts.AutomationDispatchRetryMaxDelay, func() error {
+		var err error
+		rows, err = automations.ListActiveLinearAutomations(ctx)
+		return err
+	})
+	if retryErr != nil {
+		logger.Error("automation: list active linear automations failed", "error", retryErr)
 		return
 	}
 
 	for _, row := range rows {
-		dispatchOneLinearAutomation(ctx, logger, invocations, row, eventType, in)
+		dispatchOneLinearAutomation(ctx, logger, invocations, timeouts, row, eventType, deliveryID, in)
 	}
 }
 
-func dispatchOneLinearAutomation(ctx context.Context, logger *slog.Logger, invocations InvocationCreator, row sqlcgen.Automation, eventType string, in domainautomation.LinearEventInput) {
+func dispatchOneLinearAutomation(ctx context.Context, logger *slog.Logger, invocations DeliveryInvocationCreator, timeouts platform.Timeouts, row sqlcgen.Automation, eventType string, deliveryID string, in domainautomation.LinearEventInput) {
 	logger = logger.With("automation_id", row.ID.String())
 
 	cfg, err := unmarshalLinearTriggerConfig(row.TriggerConfig)
@@ -84,7 +106,16 @@ func dispatchOneLinearAutomation(ctx context.Context, logger *slog.Logger, invoc
 		return
 	}
 
-	if _, err := CreateInvocation(ctx, invocations, row.ID, targets); err != nil {
+	if !checkDispatchThrottle(ctx, logger, invocations, timeouts, row.ID) {
+		return
+	}
+
+	created, err := createInvocationForDeliveryWithRetry(ctx, invocations, timeouts, row.ID, targets, linearDeliveryProvider, deliveryID)
+	if err != nil {
 		logger.Error("automation: create invocation for linear dispatch failed", "error", err, "event_type", eventType)
+		return
+	}
+	if !created {
+		logger.Info("automation: linear dispatch already created an invocation for this exact delivery, skipping", "event_type", eventType, "delivery_id", deliveryID)
 	}
 }

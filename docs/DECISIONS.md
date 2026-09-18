@@ -62,6 +62,7 @@ whenever this file is opened to record a new decision.
 |---|---|---|
 | A platform-supplied plugin mode (D-03) | 2026-09-17 | A repository needs a platform-pinned tool that the sandbox's own runtime configuration cannot supply. The cost that made deferral easy is the half that gets forgotten: convergence after restore — installing what is expected **and removing** what survives inside a snapshot (§35.5b) |
 | Deleting a prepared medium against its quota (D-04) | 2026-09-17 | A slot quota is actually wanted. It is a different resource from a byte quota, and whoever reopens this must name bytes, slots, video duration and cancelled captures together — a design naming two of the four is wrong at the boundary |
+| Triaging events from an unlinked/unauthorized GitHub or Linear actor via automation dispatch (D-06) | 2026-09-18 | Someone explicitly asks for "triage every new issue, including from outsiders" as a product capability **and** a separate, reviewed containment design exists for untrusted webhook payload text reaching an agent's prompt while that agent holds this deployment's repository credentials. This is not a flag flip: fail-closed is the ONLY thing standing between an anonymous internet actor and a sandboxed agent run today, and the untrusted-text-reaches-the-prompt path this batch traced (see PR body) is a prompt-injection surface, not a UX preference — containing it is separate work from authorizing the sender |
 
 ### Deferrals that live in a plan row
 
@@ -183,7 +184,35 @@ must not be assimilated into the upload system without a decision.
 happens to each on a failed or cancelled capture — four quantities that interact, and a design that
 names only two of them will be wrong at the boundary.
 
-### D-05 — Browser-side error capture, user feedback, and session replay — **ADOPTED 2026-09-17, both halves** — errors and feedback at Step 185, replay at Step 186
+### D-06 — Triage events from unlinked/unauthorized GitHub or Linear actors — **DEFERRED 2026-09-18** — see the Deferred table above for what reopens it
+
+**The question.** An adversarial review of live automation dispatch (§8.4) found that ANY GitHub
+account that can open an issue, post a comment, or open a fork PR on a watched public repository —
+and, for Linear, any workspace whose deliveries are signed with this app's shared webhook secret —
+could create an automation invocation, and therefore a sandboxed agent run holding this deployment's
+own repository credentials, with no authorization check at all. The fix landed here is fail-closed:
+live dispatch now requires the GitHub sender (or the Linear workspace) to already be a known,
+linked, authorized identity, reusing the SAME `actorauthz.AuthorizeLinkedActor` gate the pre-existing
+@mention pipeline already enforces. That closes the hole, but it also forecloses a legitimate
+product shape — "triage every new issue, including one filed by someone who has never signed into
+Narvi" — that fail-closed cannot express. Whether to build an opt-in for that shape is the open
+question this entry defers.
+
+**Why it cannot be defaulted.** Fail-closed was the correct FIRST fix for a HIGH-severity,
+confirmed-exploitable gap — it is not the correct LAST word on what this deployment is allowed to
+do. But an opt-in cannot be added by flipping a flag on the authorization check alone: an unlinked,
+unauthorized actor's comment/issue body is untrusted text, and this same audit traced whether that
+text already reaches an agent's own prompt on this path (see the PR body's own traceability finding).
+Removing the authorization gate without ALSO containing that text is not "triage from outsiders" —
+it is prompt injection with this deployment's repository credentials sitting on the other side of it,
+which is a materially worse position than the one D2 fixed.
+
+**What adoption costs.** A real containment design for untrusted webhook payload text reaching an
+agent's prompt — sanitisation, a trust boundary the agent's own tool calls respect, or a narrower
+capability set for a run whose triggering actor is unauthenticated — reviewed and built as its own
+piece of work, not assumed as a side effect of relaxing D2's own gate. Until that exists, an opt-in
+here is a second copy of the exact vulnerability this batch just closed, wearing a configuration flag
+instead of a code path.
 
 **The question.** Whether front-end error capture and user feedback complement the existing
 OTel/OTLP foundation — and, **separately**, whether session replay is adopted.

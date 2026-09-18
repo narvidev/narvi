@@ -5,9 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	domainautomation "github.com/narvidev/narvi/internal/domain/automation"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // githubTriggerConfigJSON is this package's OWN small, private, decode-only
@@ -50,6 +54,14 @@ type GitHubTriggerLister interface {
 	ListActiveGitHubAutomations(ctx context.Context) ([]sqlcgen.Automation, error)
 }
 
+// githubDeliveryProvider is the SAME literal
+// internal/adapters/inbound/github's own handler.go already uses for
+// WebhookDeliveryStore.Claim -- this package's own copy (D1 audit fix,
+// automation_invocations.source_provider), never imported from there (that
+// package imports THIS one, for GitHubTriggerLister/InvocationCreator --
+// importing back would be a cycle).
+const githubDeliveryProvider = "github"
+
 // DispatchGitHubWebhookEvent is §8.4's own live-dispatch entry point
 // for a real, already-claimed (deduplicated -- see this package's own
 // doc.go) GitHub webhook delivery: called inline, synchronously, from
@@ -70,28 +82,63 @@ type GitHubTriggerLister interface {
 // domainautomation.TargetMatchesGitHubEvent accepts (repo scoping, and --
 // §8.4's own named trap -- branch-TIP scoping, never containment) and,
 // only when at least one target survives that narrowing, calls
-// CreateInvocation with that narrowed target list. One automation's own
-// failure (a malformed trigger_config, a Postgres error) is isolated:
-// logged, and does NOT abort evaluating the rest of the batch -- mirrors
-// evaluateCronAutomation's own identical per-row isolation (triggerpump.go).
-func DispatchGitHubWebhookEvent(ctx context.Context, logger *slog.Logger, automations GitHubTriggerLister, invocations InvocationCreator, eventType string, in domainautomation.GitHubEventInput) {
+// CreateInvocationForDelivery with that narrowed target list, keyed on
+// (row.ID, githubDeliveryProvider, deliveryID) -- D1 audit fix: idempotent
+// regardless of how many times this exact delivery is re-dispatched (a
+// real GitHub redelivery, or this package's OWN bounded retry below).
+// D8 audit fix: gated behind a per-automation throttle
+// (domainautomation.EvaluateDispatchThrottle) BEFORE that call, so one
+// automation's own noisy event stream cannot create unbounded invocations.
+// One automation's own failure (a malformed trigger_config, a Postgres
+// error) is isolated: logged, and does NOT abort evaluating the rest of
+// the batch -- mirrors evaluateCronAutomation's own identical per-row
+// isolation (triggerpump.go).
+//
+// # D6 audit fix: transient vs. permanent, and a bounded retry that never touches the shared claim
+//
+// The two genuine Postgres round trips below (ListActiveGitHubAutomations
+// here, CreateForDelivery/CountRecentInvocations in
+// dispatchOneGitHubAutomation) are each wrapped in platform.Retry, bounded
+// by timeouts.AutomationDispatchMaxAttempts/
+// AutomationDispatchRetryBaseDelay/AutomationDispatchRetryMaxDelay -- a
+// genuinely TRANSIENT failure (a dropped connection, a momentary Postgres
+// blip) now self-heals within THIS SAME request. This is the other half of
+// D1/D6's shared design: this package does not, and must not, touch the
+// webhook_deliveries claim in either direction (see CreateInvocationForDelivery's
+// own doc comment, invocationenqueue.go) -- so a transient failure's ONLY
+// possible retry path is an inline one, bounded by this handler's own
+// request budget, never a claim-release-triggered external redelivery. A
+// PERMANENT/business outcome (no matching automation, the trigger's own
+// filter/target narrowing rejects this event, a malformed per-row
+// trigger_config, the throttle denies) is NOT retried -- redelivering the
+// identical event would only ever reproduce the identical, deterministic
+// verdict. A PANIC (recovered one layer up, by the adapter's own
+// dispatchAutomationsBestEffort) is also not retried here -- a
+// programming bug reproduces itself identically on a retry; only this
+// package's OWN two Postgres calls are.
+func DispatchGitHubWebhookEvent(ctx context.Context, logger *slog.Logger, automations GitHubTriggerLister, invocations DeliveryInvocationCreator, timeouts platform.Timeouts, eventType string, deliveryID string, in domainautomation.GitHubEventInput) {
 	if reason := domainautomation.ClassifyGitHubDispatch(eventType); reason != domainautomation.GitHubDispatchNotSkipped {
-		logger.Debug("automation: github event not evaluated against any trigger", "event_type", eventType, "reason", string(reason))
+		logger.Warn("automation: github event not evaluated against any trigger", "event_type", eventType, "reason", string(reason))
 		return
 	}
 
-	rows, err := automations.ListActiveGitHubAutomations(ctx)
-	if err != nil {
-		logger.Error("automation: list active github automations failed", "error", err)
+	var rows []sqlcgen.Automation
+	retryErr := platform.Retry(ctx, timeouts.AutomationDispatchMaxAttempts, timeouts.AutomationDispatchRetryBaseDelay, timeouts.AutomationDispatchRetryMaxDelay, func() error {
+		var err error
+		rows, err = automations.ListActiveGitHubAutomations(ctx)
+		return err
+	})
+	if retryErr != nil {
+		logger.Error("automation: list active github automations failed", "error", retryErr)
 		return
 	}
 
 	for _, row := range rows {
-		dispatchOneGitHubAutomation(ctx, logger, invocations, row, eventType, in)
+		dispatchOneGitHubAutomation(ctx, logger, invocations, timeouts, row, eventType, deliveryID, in)
 	}
 }
 
-func dispatchOneGitHubAutomation(ctx context.Context, logger *slog.Logger, invocations InvocationCreator, row sqlcgen.Automation, eventType string, in domainautomation.GitHubEventInput) {
+func dispatchOneGitHubAutomation(ctx context.Context, logger *slog.Logger, invocations DeliveryInvocationCreator, timeouts platform.Timeouts, row sqlcgen.Automation, eventType string, deliveryID string, in domainautomation.GitHubEventInput) {
 	logger = logger.With("automation_id", row.ID.String())
 
 	cfg, err := unmarshalGitHubTriggerConfig(row.TriggerConfig)
@@ -126,7 +173,58 @@ func dispatchOneGitHubAutomation(ctx context.Context, logger *slog.Logger, invoc
 		return
 	}
 
-	if _, err := CreateInvocation(ctx, invocations, row.ID, matched); err != nil {
-		logger.Error("automation: create invocation for github dispatch failed", "error", err, "event_type", eventType)
+	if !checkDispatchThrottle(ctx, logger, invocations, timeouts, row.ID) {
+		return
 	}
+
+	created, err := createInvocationForDeliveryWithRetry(ctx, invocations, timeouts, row.ID, matched, githubDeliveryProvider, deliveryID)
+	if err != nil {
+		logger.Error("automation: create invocation for github dispatch failed", "error", err, "event_type", eventType)
+		return
+	}
+	if !created {
+		logger.Info("automation: github dispatch already created an invocation for this exact delivery, skipping", "event_type", eventType, "delivery_id", deliveryID)
+	}
+}
+
+// checkDispatchThrottle is D8's own gate, shared verbatim (via
+// createInvocationForDeliveryWithRetry's own sibling call in
+// lineardispatch.go) between the GitHub and Linear dispatch paths --
+// counts row's own invocations created within
+// timeouts.AutomationDispatchThrottleWindow (retried the SAME bounded way
+// as every other Postgres call in this file, D6) and reports whether
+// ANOTHER may be created.
+func checkDispatchThrottle(ctx context.Context, logger *slog.Logger, invocations DeliveryInvocationCreator, timeouts platform.Timeouts, automationID pgtype.UUID) bool {
+	since := time.Now().Add(-timeouts.AutomationDispatchThrottleWindow)
+	var count int64
+	retryErr := platform.Retry(ctx, timeouts.AutomationDispatchMaxAttempts, timeouts.AutomationDispatchRetryBaseDelay, timeouts.AutomationDispatchRetryMaxDelay, func() error {
+		var err error
+		count, err = invocations.CountRecentInvocations(ctx, automationID, pgtype.Timestamptz{Time: since, Valid: true})
+		return err
+	})
+	if retryErr != nil {
+		logger.Error("automation: count recent invocations for dispatch throttle failed, skipping (fail closed)", "error", retryErr)
+		return false
+	}
+	if !domainautomation.EvaluateDispatchThrottle(int(count)) {
+		logger.Warn("automation: dispatch throttled, this automation has created too many invocations recently", "reason", "dispatch_throttled", "count_in_window", count, "threshold", domainautomation.DispatchThrottleThreshold)
+		return false
+	}
+	return true
+}
+
+// createInvocationForDeliveryWithRetry wraps CreateInvocationForDelivery
+// (invocationenqueue.go) in the SAME bounded platform.Retry every other
+// Postgres call in this file uses (D6) -- shared between the GitHub and
+// Linear dispatch paths (lineardispatch.go's own identical call).
+func createInvocationForDeliveryWithRetry(ctx context.Context, invocations DeliveryInvocationCreator, timeouts platform.Timeouts, automationID pgtype.UUID, targets []domainautomation.Target, provider, deliveryID string) (created bool, err error) {
+	retryErr := platform.Retry(ctx, timeouts.AutomationDispatchMaxAttempts, timeouts.AutomationDispatchRetryBaseDelay, timeouts.AutomationDispatchRetryMaxDelay, func() error {
+		_, wasCreated, createErr := CreateInvocationForDelivery(ctx, invocations, automationID, targets, provider, deliveryID)
+		if createErr != nil {
+			return createErr
+		}
+		created = wasCreated
+		return nil
+	})
+	return created, retryErr
 }

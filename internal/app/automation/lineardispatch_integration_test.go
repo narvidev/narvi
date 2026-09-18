@@ -54,7 +54,7 @@ func TestDispatchLinearWebhookEvent_FiresMatchingAutomation(t *testing.T) {
 	auto := f.createLinearAutomation(t, "on issue create", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG"}, target)
 
 	in := domainautomation.LinearEventInput{EventType: "Issue", Action: "create", TeamKey: "ENG"}
-	automation.DispatchLinearWebhookEvent(ctx, logger, f.automations, f.invocations, "Issue", in)
+	automation.DispatchLinearWebhookEvent(ctx, logger, f.automations, f.invocations, platform.DefaultTimeouts(), "Issue", "delivery-linear-fires-1", in)
 
 	if got := f.countInvocationsForAutomation(t, auto.ID); got != 1 {
 		t.Fatalf("invocations for automation = %d, want 1", got)
@@ -74,7 +74,7 @@ func TestDispatchLinearWebhookEvent_EventTypeOutsideAllowlistNeverFires(t *testi
 	auto := f.createLinearAutomation(t, "on agent session", domainautomation.LinearTriggerConfig{EventType: "AgentSessionEvent"}, target)
 
 	in := domainautomation.LinearEventInput{EventType: "AgentSessionEvent"}
-	automation.DispatchLinearWebhookEvent(ctx, logger, f.automations, f.invocations, "AgentSessionEvent", in)
+	automation.DispatchLinearWebhookEvent(ctx, logger, f.automations, f.invocations, platform.DefaultTimeouts(), "AgentSessionEvent", "delivery-linear-agentsession-1", in)
 
 	if got := f.countInvocationsForAutomation(t, auto.ID); got != 0 {
 		t.Fatalf("invocations for automation = %d, want 0 (event type not in LinearDispatchAllowlist)", got)
@@ -90,7 +90,7 @@ func TestDispatchLinearWebhookEvent_TeamMismatchNeverFires(t *testing.T) {
 	auto := f.createLinearAutomation(t, "on ENG issue", domainautomation.LinearTriggerConfig{EventType: "Issue", TeamKey: "ENG"}, target)
 
 	in := domainautomation.LinearEventInput{EventType: "Issue", TeamKey: "OPS"}
-	automation.DispatchLinearWebhookEvent(ctx, logger, f.automations, f.invocations, "Issue", in)
+	automation.DispatchLinearWebhookEvent(ctx, logger, f.automations, f.invocations, platform.DefaultTimeouts(), "Issue", "delivery-linear-teammismatch-1", in)
 
 	if got := f.countInvocationsForAutomation(t, auto.ID); got != 0 {
 		t.Fatalf("invocations for automation = %d, want 0 (team key mismatch)", got)

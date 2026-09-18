@@ -10,6 +10,7 @@ package automation_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -70,8 +71,15 @@ func TestDispatchGitHubWebhookEvent_FiresMatchingAutomation(t *testing.T) {
 		Action:       "labeled",
 		Labels:       []string{"automation:run", "bug"},
 		RepoFullName: "acme/repo",
+		// D4 audit fix: the fixture's own target is unconfigured
+		// (Branch == "") -- matches only the repo's own default branch,
+		// resolved from DefaultBranch here (a real GitHub payload's own
+		// "repository.default_branch"), never any branch unconditionally.
+		DefaultBranch: "main",
+		SHA:           "shaHead",
+		Branches:      []domainautomation.GitHubEventBranch{{Name: "main", HeadSHA: "shaHead"}},
 	}
-	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, "pull_request", in)
+	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, platform.DefaultTimeouts(), "pull_request", "delivery-github-fires-1", in)
 
 	if got := f.countInvocationsForAutomation(t, auto.ID); got != 1 {
 		t.Fatalf("invocations for automation = %d, want 1", got)
@@ -89,7 +97,7 @@ func TestDispatchGitHubWebhookEvent_EventTypeOutsideAllowlistNeverFires(t *testi
 	auto := f.createGitHubAutomation(t, "on release", domainautomation.GitHubTriggerConfig{Event: "release"}, target)
 
 	in := domainautomation.GitHubEventInput{EventType: "release", RepoFullName: "acme/repo"}
-	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, "release", in)
+	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, platform.DefaultTimeouts(), "release", "delivery-github-notallowlisted-1", in)
 
 	if got := f.countInvocationsForAutomation(t, auto.ID); got != 0 {
 		t.Fatalf("invocations for automation = %d, want 0 (event type not in GitHubDispatchAllowlist)", got)
@@ -107,7 +115,7 @@ func TestDispatchGitHubWebhookEvent_WrongRepoNeverFires(t *testing.T) {
 	// Event/Action/Label filter matches, but the webhook's own repository
 	// is NOT one of this automation's configured targets.
 	in := domainautomation.GitHubEventInput{EventType: "pull_request", RepoFullName: "someoneelse/unrelated"}
-	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, "pull_request", in)
+	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, platform.DefaultTimeouts(), "pull_request", "delivery-github-wrongrepo-1", in)
 
 	if got := f.countInvocationsForAutomation(t, auto.ID); got != 0 {
 		t.Fatalf("invocations for automation = %d, want 0 (event's own repo is not a configured target)", got)
@@ -142,7 +150,7 @@ func TestDispatchGitHubWebhookEvent_BranchTipNotContainment(t *testing.T) {
 			{Name: "feature-x", HeadSHA: "shaFeatureTip"},
 		},
 	}
-	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, "status", in)
+	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, platform.DefaultTimeouts(), "status", "delivery-github-branchtip-1", in)
 
 	if got := f.countInvocationsForAutomation(t, mainAuto.ID); got != 1 {
 		t.Fatalf("invocations for main-scoped automation = %d, want 1 (main IS this commit's own tip)", got)
@@ -164,9 +172,39 @@ func TestDispatchGitHubWebhookEvent_PausedAutomationNeverFires(t *testing.T) {
 	}
 
 	in := domainautomation.GitHubEventInput{EventType: "pull_request", RepoFullName: "acme/repo"}
-	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, "pull_request", in)
+	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, platform.DefaultTimeouts(), "pull_request", "delivery-github-paused-1", in)
 
 	if got := f.countInvocationsForAutomation(t, auto.ID); got != 0 {
 		t.Fatalf("invocations for paused automation = %d, want 0", got)
+	}
+}
+
+// TestDispatchGitHubWebhookEvent_ThrottlesUnboundedInvocations is D8's own
+// required, missing security proof: a single automation's own dispatch
+// path must not create unbounded invocations no matter how many distinct,
+// genuinely-matching deliveries arrive -- each delivery here has a
+// DIFFERENT delivery id (D1's own idempotency, keyed per-delivery, would
+// otherwise mask this: reusing the SAME id would only ever prove
+// dedup, never the throttle). Fires domainautomation.
+// DispatchThrottleThreshold+5 distinct, matching deliveries and asserts
+// the invocation count stops growing at exactly the threshold.
+func TestDispatchGitHubWebhookEvent_ThrottlesUnboundedInvocations(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	logger := platform.Logger(ctx)
+
+	target := domainautomation.Target{Name: "repo", URL: "https://github.com/acme/repo"}
+	auto := f.createGitHubAutomation(t, "on issue_comment (throttle)", domainautomation.GitHubTriggerConfig{Event: "issue_comment"}, target)
+
+	in := domainautomation.GitHubEventInput{EventType: "issue_comment", RepoFullName: "acme/repo"}
+
+	const attempts = domainautomation.DispatchThrottleThreshold + 5
+	for i := 0; i < attempts; i++ {
+		deliveryID := fmt.Sprintf("delivery-github-throttle-%d", i)
+		automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, platform.DefaultTimeouts(), "issue_comment", deliveryID, in)
+	}
+
+	if got := f.countInvocationsForAutomation(t, auto.ID); got != domainautomation.DispatchThrottleThreshold {
+		t.Fatalf("invocations for automation after %d distinct matching deliveries = %d, want exactly %d (D8 audit fix: the per-automation dispatch throttle must cap it)", attempts, got, domainautomation.DispatchThrottleThreshold)
 	}
 }

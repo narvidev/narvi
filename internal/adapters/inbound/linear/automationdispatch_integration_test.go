@@ -106,6 +106,10 @@ func TestWebhookHandler_AutomationDispatchFiresOnRealWebhook(t *testing.T) {
 	deps := newHandlerDeps(t, pool)
 	deps.Automations = automations
 	deps.AutomationInvocations = invocations
+	// D9 audit fix: the dispatch path now fails closed unless the sending
+	// workspace ("org-automation-dispatch", issueEventPayload's own fixed
+	// organizationId) has a real installation row.
+	installLinearFixture(ctx, t, pool, "org-automation-dispatch", deps.TokenEncryptionKey)
 	handler := linear.NewWebhookHandler(deps)
 
 	rec := postWebhookEventType(t, handler, issueEventPayload("ENG"), "delivery-linear-automation-1", "Issue")
@@ -130,6 +134,9 @@ func TestWebhookHandler_AutomationDispatchDedupesRedeliveredDelivery(t *testing.
 	deps := newHandlerDeps(t, pool)
 	deps.Automations = automations
 	deps.AutomationInvocations = invocations
+	// D9 audit fix: see the identical comment in
+	// TestWebhookHandler_AutomationDispatchFiresOnRealWebhook above.
+	installLinearFixture(ctx, t, pool, "org-automation-dispatch", deps.TokenEncryptionKey)
 	handler := linear.NewWebhookHandler(deps)
 
 	body := issueEventPayload("ENG")
@@ -171,13 +178,52 @@ func (panicAutomationLister) ListActiveLinearAutomations(ctx context.Context) ([
 // crashed/500 response, when automation dispatch panics internally.
 func TestWebhookHandler_AutomationDispatchPanicDoesNotBreakTheRequest(t *testing.T) {
 	pool := newTestPool(t)
+	ctx := context.Background()
 	deps := newHandlerDeps(t, pool)
 	deps.Automations = panicAutomationLister{}
 	deps.AutomationInvocations = narvipg.NewAutomationInvocationStore(pool)
+	// D9 audit fix: without a real installation row for this org, dispatch
+	// would now skip BEFORE ever reaching panicAutomationLister -- install
+	// it so this test still genuinely exercises the panic-recovery path.
+	installLinearFixture(ctx, t, pool, "org-automation-dispatch", deps.TokenEncryptionKey)
 	handler := linear.NewWebhookHandler(deps)
 
 	rec := postWebhookEventType(t, handler, issueEventPayload("ENG"), "delivery-linear-automation-panic-1", "Issue")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d (a panic inside automation dispatch must not surface as a failed request); body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+}
+
+// TestWebhookHandler_AutomationDispatchDeniesUninstalledWorkspace is D9's
+// own required, missing security proof: a correctly-signed delivery from
+// a workspace this deployment has NO installation row for must NOT create
+// an invocation, even though the trigger's own filter genuinely matches --
+// Linear signs every webhook delivery from EVERY workspace that has this
+// app installed with the SAME shared secret (per-app, not per-workspace),
+// so a valid signature alone says nothing about whether the SENDING
+// workspace is one this deployment actually recognizes.
+func TestWebhookHandler_AutomationDispatchDeniesUninstalledWorkspace(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+
+	automations := narvipg.NewAutomationStore(pool)
+	invocations := narvipg.NewAutomationInvocationStore(pool)
+	target := domainautomation.Target{Name: "repo", URL: "https://github.com/narvidev/narvi"}
+	auto := createLinearAutomation(ctx, t, automations, "on ENG issue create (uninstalled workspace)", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG"}, target)
+
+	deps := newHandlerDeps(t, pool)
+	deps.Automations = automations
+	deps.AutomationInvocations = invocations
+	// Deliberately NO installLinearFixture call for this organization --
+	// this workspace has never installed this app.
+	handler := linear.NewWebhookHandler(deps)
+
+	rec := postWebhookEventType(t, handler, issueEventPayload("ENG"), "delivery-linear-uninstalled-1", "Issue")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	if got := countAutomationInvocations(t, pool, auto.ID); got != 0 {
+		t.Fatalf("automation_invocations for automation = %d, want 0 (D9 audit fix: an uninstalled workspace must never create an invocation)", got)
 	}
 }

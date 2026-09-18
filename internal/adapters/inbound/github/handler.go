@@ -318,8 +318,17 @@ type Config struct {
 	// failure isolation. *postgres.AutomationStore/*postgres.
 	// AutomationInvocationStore (cmd/control-plane/main.go, the SAME
 	// instances automationEngine already uses) satisfy these directly.
-	Automations           automation.GitHubTriggerLister
-	AutomationInvocations automation.InvocationCreator
+	Automations automation.GitHubTriggerLister
+	// AutomationInvocations is typed as automation.DeliveryInvocationCreator
+	// (D1/D8 audit fixes), not the narrower automation.InvocationCreator
+	// this field used to carry -- the live webhook dispatch path needs
+	// BOTH CreateForDelivery (idempotent-on-delivery invocation creation)
+	// and CountRecentInvocations (the per-automation dispatch throttle),
+	// neither of which InvocationCreator's own single Create method
+	// exposes. *postgres.AutomationInvocationStore (cmd/control-plane/
+	// main.go, the SAME instance automationEngine already uses) satisfies
+	// this directly.
+	AutomationInvocations automation.DeliveryInvocationCreator
 
 	// Timers ("review: automatic re-review on new commits",
 	// §24.1) backs the NEW `pull_request`/action=="synchronize" lane
@@ -412,7 +421,7 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 		// the closed, typed event-category allowlist
 		// (domainautomation.GitHubDispatchAllowlist) it enforces before
 		// ever evaluating a single trigger.
-		dispatchAutomationsBestEffort(ctx, logger, cfg, eventType, body)
+		dispatchAutomationsBestEffort(ctx, logger, cfg, coalescer.Identities, coalescer.Users, eventType, deliveryID, body)
 
 		// (§31.7's own G4 arming write): captured for EVERY `pull_request`
 		// "closed" event, unconditionally -- deliberately NOT gated behind
