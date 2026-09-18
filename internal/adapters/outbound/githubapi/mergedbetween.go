@@ -72,6 +72,7 @@ import (
 	"time"
 
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/domain/reviewcheck"
 )
 
 // maxConstituentPRs bounds how many discovered constituent PRs
@@ -339,9 +340,28 @@ type combinedStatusResponse struct {
 // fetchCIConclusion below is the retrospective sibling and its own
 // deliberate non-use of this field is addressed at that function's own
 // doc comment.
+//
+// Name is the check run's own "name" field, decoded (previously absent)
+// so both readers below can exclude reviewcheck.CheckName -- fourth
+// review round, HIGH, reproduced in both directions against the real
+// code: this publisher's own narvi/review check run sits at the exact
+// SHA either function reads, so with no exclusion its own
+// action_required (a review that timed out with no verdict) read as a
+// genuine CI failure, its own success read as a genuine CI success (a
+// repository with no CI at all became "green" purely on the strength of
+// Narvi's own check -- the merge gate satisfied by Narvi grading its own
+// homework), and its own queued/running (Conclusion == nil) read as an
+// incomplete required check, making every in-flight review make its own
+// PR read as CI-not-green. output.go's own doc comment states the
+// intent this defeated: this check "expresses PROCESS completion, never
+// risk" -- yet unfiltered, it fed straight into ciGreen's eligibility
+// computation. Filtered by NAME alone, not by writer App id or
+// external_id (both considered and rejected, this package's own two
+// callers' doc comments have the full "why" for each).
 type checkRunsResponse struct {
 	TotalCount int `json:"total_count"`
 	CheckRuns  []struct {
+		Name       string  `json:"name"`
 		Conclusion *string `json:"conclusion"`
 	} `json:"check_runs"`
 }
@@ -437,6 +457,59 @@ var ciFailureConclusions = map[string]bool{
 // that function's own identical fix one file over -- see checkRunsResponse's
 // own doc comment for what TotalCount answers and why it is checked
 // regardless of the per_page bump.
+//
+// # Narvi's own check run is excluded from this read, by NAME
+//
+// This §15.2 retrospective audit and fetchCIConclusionLive's own live
+// gate (listopenprs.go) are Narvi's only two readers of a ref's check
+// runs, and both used to read the ENTIRE set with no exclusion for
+// reviewcheck.CheckName -- so the publisher's own narvi/review check run,
+// sitting at the exact SHA either function reads, fed straight back into
+// the CI conclusion it is itself computed alongside. Three options were
+// weighed for how to exclude it:
+//
+//   - By NAME (chosen). reviewcheck.CheckName is a fixed constant this
+//     publisher alone writes (its own doc comment: "the one piece of this
+//     identity a human actually recognizes"), needs no per-call lookup,
+//     and is unconditionally correct for what this exclusion is FOR: any
+//     check run named narvi/review is Narvi's own process signal, never a
+//     CI result, regardless of which App wrote it or which pull request
+//     it was created for. A same-named run from a genuinely different
+//     App is not a real-world case this codebase has ever observed, and
+//     even if one existed, excluding it from CI-green computation is the
+//     SAFE direction (an extra Unknown, never a false Success/Failure) --
+//     the same posture every other ambiguous-signal case in this file
+//     already takes.
+//   - By writer App id (rejected). The "select by SHA and GitHub App"
+//     identity rule governs adoption on the WRITE side
+//     (resolveOrCreateCheckRun, internal/app/outboxworker/reviewcheck.go)
+//     specifically to avoid adopting a DIFFERENT app's same-named check
+//     run -- a concern that does not apply to excluding a run from THIS
+//     read, where the goal is "never let narvi/review count as CI",
+//     full stop, regardless of who wrote it. Threading this
+//     deployment's own observed writer App id in here would also add a
+//     dependency this file does not otherwise have (that value is
+//     process-local state owned by outboxworker's own notifier, not
+//     configuration or a value either read path already has to hand) to
+//     a GET called on every open-PR list and every release-PR audit --
+//     disproportionate cost for a filter NAME already settles correctly.
+//   - By external_id (rejected). reviewcheck.PRExternalID scopes a check
+//     run to ONE pull request -- correct for the write side's own
+//     adoption predicate (a check run is scoped to a commit, not a PR;
+//     external_id is what tells two PRs sharing one head SHA apart), but
+//     wrong for this exclusion: a narvi/review run created for a
+//     DIFFERENT pull request sharing this exact head SHA would carry a
+//     non-matching external_id and would NOT be excluded by that filter
+//     alone, leaving the exact hazard this fix exists to close open for
+//     that PR. The hazard here is head-SHA-scoped, not PR-scoped, and
+//     NAME is what covers it regardless of which PR's external_id the
+//     run carries.
+//
+// The Actions-only regression this project has fixed twice before (see
+// checkRunsResponse's own doc comment and TestListOpenPRsForUser_
+// PendingCombinedStatusRequiresARealStatus, listopenprs_test.go) is
+// unaffected: a real CI check run's own Name is never
+// reviewcheck.CheckName, so this exclusion never touches it.
 func (a *Adapter) fetchCIConclusion(ctx context.Context, owner, repo, mergeSHA, token string) ports.CIConclusion {
 	sawFailure := false
 	sawSuccess := false
@@ -475,6 +548,14 @@ func (a *Adapter) fetchCIConclusion(ctx context.Context, owner, repo, mergeSHA, 
 				degraded = true
 			}
 			for _, r := range runs.CheckRuns {
+				if r.Name == reviewcheck.CheckName {
+					// Narvi's own check run -- checkRunsResponse's own
+					// doc comment has the full "why": this publisher's
+					// own narvi/review run must never contribute to the
+					// CI conclusion it is itself read alongside, no
+					// matter what it concluded (or didn't).
+					continue
+				}
 				if r.Conclusion == nil {
 					continue
 				}

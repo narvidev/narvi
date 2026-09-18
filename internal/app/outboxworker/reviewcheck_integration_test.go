@@ -37,6 +37,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/outboxworker"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/domain/reviewcheck"
 )
 
 // newTestAttempt creates a real session + turn -- review_check_runs.
@@ -139,10 +140,22 @@ func newFakeCheckRunGitHub() *fakeCheckRunGitHub {
 // head sha" (finding A2's own adversarial case) without going through
 // this fake's own CreateCheckRun path (which would attribute it to
 // f.appID, defeating the point).
-func (f *fakeCheckRunGitHub) seedRun(id int64, name, headSHA string, appID int64, status, conclusion string) {
+//
+// externalID (fourth review round, E3) lets a caller seed a run whose
+// OTHER four fields -- Name, HeadSHA, Status-not-completed -- ALL match
+// resolveOrCreateCheckRun's own adoption predicate, isolating the App-id
+// comparison as the ONE remaining reason a candidate is excluded. Without
+// this, every existing caller of seedRun left ExternalID at its Go zero
+// value (""), which never equals a real reviewcheck.PRExternalID(n) --
+// so the App-id guard's own test could delete `run.AppID == observedAppID`
+// from that predicate and still pass, the ExternalID mismatch alone
+// already excluding the seeded run for an unrelated reason. See
+// TestReviewCheckNotifier_Recovery_NeverAdoptsAnotherAppsRun's own updated
+// doc comment for the full "why".
+func (f *fakeCheckRunGitHub) seedRun(id int64, name, headSHA string, appID int64, status, conclusion, externalID string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.runs[id] = &fakeCheckRun{Name: name, HeadSHA: headSHA, AppID: appID, Status: status, Conclusion: conclusion}
+	f.runs[id] = &fakeCheckRun{Name: name, HeadSHA: headSHA, AppID: appID, Status: status, Conclusion: conclusion, ExternalID: externalID}
 	if id > f.nextID {
 		f.nextID = id
 	}
@@ -700,6 +713,24 @@ func TestReviewCheckNotifier_Recovery_AdoptsOwnInFlightRun(t *testing.T) {
 // half: a DIFFERENT app's same-named, same-head-sha check run must never
 // be adopted, even though it shares reviewcheck.CheckName and the exact
 // head sha -- only a matching App id makes a candidate adoptable.
+//
+// Fourth review round, E3: this test used to pass with the App-id guard
+// (`run.AppID == observedAppID`) deleted from resolveOrCreateCheckRun's
+// own adoption predicate entirely, because the seeded run's own
+// ExternalID was left at seedRun's Go zero value ("") -- which never
+// equals prExternalID (reviewcheck.PRExternalID(88), a non-empty decimal
+// string), so the ExternalID comparison alone already excluded the
+// seeded run from adoption, for a reason that has nothing to do with App
+// id. The row's own identity rule is "select by SHA AND GitHub App" --
+// a test whose assertion holds regardless of whether the App-id half of
+// that rule exists is not testing that half at all. Fixed by seeding the
+// OTHER app's run with the CORRECT ExternalID (matching this exact PR),
+// so every other field in the adoption predicate (Name, HeadSHA,
+// Status-not-completed, ExternalID) matches and ONLY the App id differs
+// -- isolating that comparison as the one thing this test actually
+// verifies. Verified by deleting `run.AppID == observedAppID` from
+// resolveOrCreateCheckRun (reviewcheck.go) after this fix: this test then
+// fails (the other app's run gets adopted).
 func TestReviewCheckNotifier_Recovery_NeverAdoptsAnotherAppsRun(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
@@ -732,12 +763,15 @@ func TestReviewCheckNotifier_Recovery_NeverAdoptsAnotherAppsRun(t *testing.T) {
 		t.Fatalf("Deliver(warmup) error = %v", err)
 	}
 
-	// Seed a DIFFERENT app's own check run at the target head sha --
-	// same name, same head sha, DIFFERENT app id, deliberately
-	// non-concluded (in_progress) so a status-only guard could not, by
-	// itself, explain refusing to adopt it: only the App-id mismatch can.
+	// Seed a DIFFERENT app's own check run at the target head sha -- same
+	// name, same head sha, the SAME ExternalID this exact PR's own
+	// resolveOrCreateCheckRun call computes (so that guard cannot explain
+	// exclusion either), deliberately non-concluded (in_progress) so a
+	// status-only guard could not, by itself, explain refusing to adopt
+	// it -- every field but AppID matches; only the App-id mismatch can
+	// explain exclusion here.
 	const otherAppID = 999999
-	fake.seedRun(1000, "narvi/review", headSHA, otherAppID, "in_progress", "")
+	fake.seedRun(1000, "narvi/review", headSHA, otherAppID, "in_progress", "", reviewcheck.PRExternalID(prNumber))
 
 	attempt := newTestAttempt(ctx, t, pool)
 	payload, err := json.Marshal(ports.ReviewCheckPayload{

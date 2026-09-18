@@ -638,6 +638,122 @@ func TestListMergedBetween_HalfReadCIFailsClosed(t *testing.T) {
 	}
 }
 
+// TestListMergedBetween_NarviOwnCheckExcludedFromCIConclusion is the
+// §15.2 retrospective sibling of listopenprs_test.go's own
+// TestListOpenPRsForUser_NarviOwnCheckExcludedFromCIConclusion, proving
+// the fourth review round's own HIGH finding is closed on BOTH read
+// paths, not just the live one: mergedbetween.go's fetchCIConclusion used
+// to list the identical unfiltered check-run set fetchCIConclusionLive
+// did, with no exclusion for reviewcheck.CheckName, so a release-PR
+// retrospective audit (§15.2) could report a merged PR's own
+// CIConclusionAtMergeSHA as a confident success or failure that was
+// really just Narvi's own narvi/review check run reporting on itself.
+func TestListMergedBetween_NarviOwnCheckExcludedFromCIConclusion(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		statusHandler func(w http.ResponseWriter)
+		checkRuns     []map[string]any
+		want          ports.CIConclusion
+	}{
+		{
+			name: "direction A baseline: combined status success + a real check run build=success",
+			statusHandler: func(w http.ResponseWriter) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"state": "success"})
+			},
+			checkRuns: []map[string]any{
+				{"name": "build", "conclusion": "success"},
+			},
+			want: ports.CIConclusionSuccess,
+		},
+		{
+			name: "direction A: adding narvi/review=action_required beside the identical green build must NOT flip CI to failure",
+			statusHandler: func(w http.ResponseWriter) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"state": "success"})
+			},
+			checkRuns: []map[string]any{
+				{"name": "build", "conclusion": "success"},
+				{"name": "narvi/review", "conclusion": "action_required"},
+			},
+			want: ports.CIConclusionSuccess,
+		},
+		{
+			name: "direction B baseline: no legacy statuses, zero check runs at all",
+			statusHandler: func(w http.ResponseWriter) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"state": "pending", "statuses": []map[string]any{}, "total_count": 0})
+			},
+			checkRuns: []map[string]any{},
+			want:      ports.CIConclusionUnknown,
+		},
+		{
+			name: "direction B: a single narvi/review=success must NOT manufacture a CI green from nothing",
+			statusHandler: func(w http.ResponseWriter) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"state": "pending", "statuses": []map[string]any{}, "total_count": 0})
+			},
+			checkRuns: []map[string]any{
+				{"name": "narvi/review", "conclusion": "success"},
+			},
+			want: ports.CIConclusionUnknown,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/compare/main...release-1.0":
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"commits": []map[string]any{
+							{"commit": map[string]any{"message": "Merge pull request #50 from acme/widgets/x"}},
+						},
+					})
+				case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/pulls/50":
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"number": 50, "title": "x", "merged": true,
+						"merged_at": "2024-06-01T00:00:00Z", "merge_commit_sha": "sha50",
+						"base":   map[string]any{"ref": "main"},
+						"labels": []map[string]any{},
+					})
+				case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/pulls/50/reviews":
+					_ = json.NewEncoder(w).Encode([]map[string]any{{"state": "APPROVED"}})
+				case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/commits/sha50/status":
+					tc.statusHandler(w)
+				case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/commits/sha50/check-runs":
+					_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": tc.checkRuns})
+				case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/pulls/50/files":
+					_ = json.NewEncoder(w).Encode([]map[string]any{})
+				case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/pulls/50/commits":
+					_ = json.NewEncoder(w).Encode([]map[string]any{{"parents": []map[string]any{{"sha": "p1"}}}})
+				case r.Method == http.MethodGet && r.URL.Path == "/search/issues":
+					_ = json.NewEncoder(w).Encode(map[string]any{"items": []map[string]any{}})
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+
+			adapter := githubapi.New(server.Client(), server.URL)
+			merged, _, err := adapter.ListMergedBetween(context.Background(), ports.ListMergedBetweenSpec{
+				Owner: "acme", Repo: "widgets", BaseRef: "main", HeadRef: "release-1.0", Token: "tok",
+			})
+			if err != nil {
+				t.Fatalf("ListMergedBetween() error = %v", err)
+			}
+			if len(merged) != 1 {
+				t.Fatalf("got %d merged PRs, want 1: %+v", len(merged), merged)
+			}
+			if merged[0].CIConclusionAtMergeSHA != tc.want {
+				t.Errorf("CIConclusionAtMergeSHA = %v, want %v (%s)", merged[0].CIConclusionAtMergeSHA, tc.want, tc.name)
+			}
+		})
+	}
+}
+
 // TestListMergedBetween_CheckRunsTruncatedFirstPageFailsClosed is F5's own
 // sibling of F1's identical fix (listopenprs.go, F1's own reproduction
 // test) applied to fetchCIConclusion: a merge SHA carrying more check

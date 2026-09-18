@@ -19,6 +19,7 @@ import (
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/domain/reviewcheck"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -623,6 +624,98 @@ func TestHandleEnsureDispatched_GitHubOrigin_OrdinaryFollowUp_NeverEnqueuesRevie
 
 	if n := countOutboxRowsForSession(ctx, t, pool, sessionID); n != 0 {
 		t.Errorf("outbox row count = %d, want 0 -- an ordinary follow-up (is_review_attempt=false) must never enqueue reviewcheck.PhaseRunning either", n)
+	}
+}
+
+// TestHandleEnsureDispatched_GitHubOrigin_ReviewAttempt_EnqueuesRunning is
+// this same gate's positive case -- fourth review round, E2: dispatch.go's
+// own enqueueReviewCheckRunning call site had NO positive-path test
+// anywhere in this repository before this fix. The sibling test above
+// (OrdinaryFollowUp_NeverEnqueuesReviewCheckRunning) only ever proves
+// zero outbox rows for a NON-review-attempt turn -- a proof that holds
+// identically whether or not the PhaseRunning call site exists at all,
+// so it alone could not catch that call site being deleted wholesale.
+// This test proves the OTHER half: a turn that genuinely IS a review
+// attempt (is_review_attempt=true) dispatching Pending -> Processing
+// must enqueue exactly one ports.NotificationKindGitHubReviewCheck row
+// carrying reviewcheck.PhaseRunning, in the SAME transaction as the
+// dispatch itself -- mirrors outboxenqueue_integration_test.go's own
+// TestCompleteProcessingTurn_GitHubOrigin_ReviewAttempt_EnqueuesNotAssessed,
+// the terminal-side sibling this dispatch-side positive case was missing.
+func TestHandleEnsureDispatched_GitHubOrigin_ReviewAttempt_EnqueuesRunning(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessionID := createTestSessionWithSpawnSource(ctx, t, pool, sqlcgen.SessionSpawnSourceGithub)
+
+	turnStore := narvipg.NewTurnStore(pool)
+	headSHA := "cafef00d"
+	created, err := turnStore.Create(ctx, sqlcgen.CreateTurnParams{
+		SessionID:       sessionID,
+		Status:          sqlcgen.TurnStatusPending,
+		Prompt:          strPtr("please review"),
+		ReviewHeadSha:   &headSHA,
+		IsReviewAttempt: true,
+	})
+	if err != nil {
+		t.Fatalf("create pending turn: %v", err)
+	}
+
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
+	if err := prSessions.EnsureRow(ctx, "acme/widgets", 46); err != nil {
+		t.Fatalf("ensure github pr session row: %v", err)
+	}
+	if err := prSessions.SetSessionID(ctx, "acme/widgets", 46, sessionID); err != nil {
+		t.Fatalf("set github pr session id: %v", err)
+	}
+
+	sandboxStore := narvipg.NewSandboxStore(pool)
+	if _, err := sandboxStore.Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+	if _, err := sandboxStore.UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
+		SessionID: sessionID, Status: sqlcgen.SandboxStatusReady,
+	}); err != nil {
+		t.Fatalf("move sandbox to ready: %v", err)
+	}
+
+	commander := &fakeSendCommander{}
+	r := newDispatchTestRegistry(t, ctx, pool, nil, commander)
+	t.Cleanup(func() { _ = r.Shutdown() })
+
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+	sendEnsureDispatched(ctx, t, a)
+
+	waitUntil(t, 5*time.Second, func() bool {
+		return commander.callCount() == 1
+	})
+
+	got, err := turnStore.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("get turn: %v", err)
+	}
+	if got.Status != sqlcgen.TurnStatusProcessing {
+		t.Fatalf("turn status = %s, want %s (dispatch itself must proceed normally)", got.Status, sqlcgen.TurnStatusProcessing)
+	}
+
+	row := getSoleOutboxRowForSession(ctx, t, pool, sessionID)
+	if row.Kind != string(ports.NotificationKindGitHubReviewCheck) {
+		t.Fatalf("Kind = %q, want %q", row.Kind, ports.NotificationKindGitHubReviewCheck)
+	}
+	var payload ports.ReviewCheckPayload
+	if err := json.Unmarshal(row.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload.Phase != string(reviewcheck.PhaseRunning) {
+		t.Errorf("Phase = %q, want %q", payload.Phase, reviewcheck.PhaseRunning)
+	}
+	if payload.HeadSHA != headSHA {
+		t.Errorf("HeadSHA = %q, want %q", payload.HeadSHA, headSHA)
+	}
+	if payload.AttemptID != created.ID.String() {
+		t.Errorf("AttemptID = %q, want %q (this turn's own id)", payload.AttemptID, created.ID.String())
 	}
 }
 

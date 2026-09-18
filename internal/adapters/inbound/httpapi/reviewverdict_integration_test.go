@@ -23,6 +23,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/domain/review"
+	"github.com/narvidev/narvi/internal/domain/reviewcheck"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
 	"github.com/narvidev/narvi/internal/domain/reviewtriage"
 	"github.com/narvidev/narvi/internal/domain/reviewverdict"
@@ -433,6 +434,84 @@ func TestPostReviewVerdict_PersistsReviewVerdictRow_WhenReviewHeadSHAKnown(t *te
 	}
 	if row.Shippable != string(review.ShippableAuto) {
 		t.Errorf("shippable = %q, want %q (server-computed from risk=low/premise=ok/coverage=adequate)", row.Shippable, review.ShippableAuto)
+	}
+}
+
+// TestPostReviewVerdict_Success_EnqueuesGitHubReviewCheckOutboxRow is the
+// fourth review round's own E2 pinning test for this handler's own
+// reviewcheck.PhaseTerminalAssessed emission (reviewverdict.go, the
+// outbox.Create call gated on verdictHeadSHA != "", right after the
+// review_verdicts insert): before this fix, NO test anywhere in this
+// repository asserted that a real verdict POST ever enqueues a
+// ports.NotificationKindGitHubReviewCheck row at all --
+// TestPostReviewVerdict_Success_EnqueuesGitHubVerdictOutboxRow above
+// seeds its turn via seedDispatchedTurn, which leaves review_head_sha
+// nil, so THAT test's own single-row query never even exercises this
+// gated block (verdictHeadSHA == "" skips it by construction) -- it
+// could not have caught this emission being deleted. This test mirrors
+// TestPostReviewVerdict_PersistsReviewVerdictRow_WhenReviewHeadSHAKnown's
+// own turn-seeding shape (a REAL review_head_sha) specifically so the
+// emission's own precondition is genuinely met, then asserts on the
+// SECOND outbox row it must produce alongside the existing
+// NotificationKindGitHubVerdict one.
+func TestPostReviewVerdict_Success_EnqueuesGitHubReviewCheckOutboxRow(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-review-check", 77)
+
+	reviewHeadSHA := "sha-review-check-abc123"
+	createdTurn, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &reviewHeadSHA})
+	if err != nil {
+		t.Fatalf("seed processing turn with review head sha: %v", err)
+	}
+	turnMessageID := testDispatchMessageID
+	if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: createdTurn.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedMessageID: &turnMessageID}); err != nil {
+		t.Fatalf("stamp dispatched_message_id on seeded turn: %v", err)
+	}
+
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, validVerdictRequestJSON())
+	if status != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
+	}
+
+	var payloadText string
+	if err := rig.pool.QueryRow(ctx,
+		`SELECT payload::text FROM outbox WHERE session_id = $1 AND kind = $2`,
+		session.ID, string(ports.NotificationKindGitHubReviewCheck),
+	).Scan(&payloadText); err != nil {
+		t.Fatalf("query github_review_check outbox row: %v (no row was ever enqueued by a successful verdict POST)", err)
+	}
+
+	var payload ports.ReviewCheckPayload
+	if err := json.Unmarshal([]byte(payloadText), &payload); err != nil {
+		t.Fatalf("unmarshal outbox payload: %v", err)
+	}
+	if payload.Phase != string(reviewcheck.PhaseTerminalAssessed) {
+		t.Errorf("Phase = %q, want %q", payload.Phase, reviewcheck.PhaseTerminalAssessed)
+	}
+	if payload.Owner != "acme" || payload.Repo != "verdict-review-check" {
+		t.Errorf("Owner/Repo = %q/%q, want %q/%q", payload.Owner, payload.Repo, "acme", "verdict-review-check")
+	}
+	if payload.PRNumber != 77 {
+		t.Errorf("PRNumber = %d, want 77", payload.PRNumber)
+	}
+	if payload.HeadSHA != reviewHeadSHA {
+		t.Errorf("HeadSHA = %q, want %q", payload.HeadSHA, reviewHeadSHA)
+	}
+	if payload.AttemptID != createdTurn.ID.String() {
+		t.Errorf("AttemptID = %q, want %q (this turn's own id)", payload.AttemptID, createdTurn.ID.String())
+	}
+
+	// Both outbox rows this ONE successful verdict POST enqueues must
+	// coexist -- the pre-existing NotificationKindGitHubVerdict (the
+	// posted comment) AND this one (the check run), never one at the
+	// expense of the other.
+	var totalOutboxCount int
+	if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE session_id = $1`, session.ID).Scan(&totalOutboxCount); err != nil {
+		t.Fatalf("count outbox rows: %v", err)
+	}
+	if totalOutboxCount != 2 {
+		t.Errorf("total outbox row count for session = %d, want 2 (one github_verdict, one github_review_check)", totalOutboxCount)
 	}
 }
 
