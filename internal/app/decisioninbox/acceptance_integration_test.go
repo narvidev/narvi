@@ -91,7 +91,7 @@ func TestRevalidateForMerge_AcceptedVerdict(t *testing.T) {
 	// Phase 1: the engine refuses -- ReasonNotShippableAuto, and ONLY
 	// that reason (proven by asserting the reason text names it, never a
 	// blanket "not eligible").
-	ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+	ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 	if err != nil {
 		t.Fatalf("RevalidateForMerge() (phase 1, before acceptance) error = %v, want nil", err)
 	}
@@ -143,7 +143,7 @@ func TestRevalidateForMerge_AcceptedVerdict(t *testing.T) {
 	// every OTHER criterion (CI green, blast radius known and clean,
 	// head/base/ancestor-chain freshness) still holds because nothing
 	// about the PR's own live facts changed.
-	ok, headSHA, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+	ok, headSHA, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 	if err != nil {
 		t.Fatalf("RevalidateForMerge() (phase 3, after acceptance) error = %v, want nil", err)
 	}
@@ -178,7 +178,7 @@ func TestRevalidateForMerge_AcceptedVerdict(t *testing.T) {
 	retargeted.BaseSHA = "sha-retargeted-base"
 	rs.replaceTargetPR(actorGitHubID, retargeted)
 
-	ok, _, reason, err = decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+	ok, _, reason, _, _, err = decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 	if err != nil {
 		t.Fatalf("RevalidateForMerge() (phase 4, after base moved) error = %v, want nil", err)
 	}
@@ -265,7 +265,7 @@ func TestRevalidateForMerge_AcceptedVerdict_MandatoryConditionsStillRefuse(t *te
 	ciRed.CIConclusion = "failure"
 	rs.replaceTargetPR(actorGitHubID, ciRed)
 
-	ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+	ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 	if err != nil {
 		t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 	}
@@ -275,4 +275,229 @@ func TestRevalidateForMerge_AcceptedVerdict_MandatoryConditionsStillRefuse(t *te
 	if !strings.Contains(reason, string(autoapproval.ReasonCINotGreen)) {
 		t.Fatalf("reason = %q, want it to name %q", reason, autoapproval.ReasonCINotGreen)
 	}
+}
+
+// TestRevalidateForMerge_AcceptedVerdict_NewAttemptInvalidatesAcceptance
+// pins the OTHER half of §21.1b's own contract that
+// TestRevalidateForMerge_AcceptedVerdict above never actually exercises
+// (finding F7, adversarial review: that test's own verdict id never
+// changes across all four of its phases, so deleting
+// reviewverdict.Acceptance.Applicable's own verdict-id check from
+// revalidateCore -- e.g. replacing `accepted := acceptanceOK &&
+// acceptance.Applicable(record.ID)` with `accepted := acceptanceOK` --
+// leaves that test green). This test posts a SECOND verdict (a fresh
+// attempt, at the SAME head sha -- a re-triggered review with nothing
+// new to say) for the SAME pull request AFTER the first one was
+// accepted, and proves the acceptance no longer applies to the new
+// attempt -- "acceptance binds to ONE verdict, one attempt and one
+// context... a new attempt... makes it inapplicable" (§21.1b) -- even
+// though nobody ever revoked it.
+func TestRevalidateForMerge_AcceptedVerdict_NewAttemptInvalidatesAcceptance(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	rs := newRevalidateStores(pool)
+	const actorGitHubID = "revalidate-accept-new-attempt-actor"
+	const repoFullName = "acme/revalidate-accepted-verdict-new-attempt"
+
+	users := narvipg.NewUserStore(pool)
+	maintainer, err := users.Create(ctx, sqlcgen.CreateUserParams{PrimaryEmail: "accept-new-attempt@example.com", DisplayName: "Maintainer", Role: sqlcgen.UserRoleMaintainer})
+	if err != nil {
+		t.Fatalf("create maintainer: %v", err)
+	}
+
+	pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 1)
+	seedNotShippableAutoVerdict(ctx, t, pool, repoFullName, int32(pr.Number), pr.HeadSHA)
+
+	firstVerdict, hasVerdict, err := appreviewverdict.GetLatest(ctx, rs.deps.ReviewVerdict, repoFullName, int32(pr.Number))
+	if err != nil || !hasVerdict {
+		t.Fatalf("GetLatest (first verdict): hasVerdict=%v err=%v", hasVerdict, err)
+	}
+
+	// A maintainer+ accepts the FIRST verdict.
+	var firstVerdictID pgtype.UUID
+	if err := firstVerdictID.Scan(firstVerdict.ID); err != nil {
+		t.Fatalf("scan first verdict id: %v", err)
+	}
+	acceptance, err := appreviewverdict.Accept(ctx, rs.deps.ReviewVerdict.Acceptances, appreviewverdict.AcceptInput{
+		RepoFullName:  repoFullName,
+		PRNumber:      int32(pr.Number),
+		VerdictID:     firstVerdictID,
+		HeadSHA:       firstVerdict.HeadSHA,
+		Context:       firstVerdict.Context,
+		Reason:        string(autoapproval.ReasonNotShippableAuto),
+		Justification: "Accepted the FIRST attempt -- a fresh re-review must not inherit this.",
+		AcceptedBy:    maintainer.ID,
+	})
+	if err != nil {
+		t.Fatalf("Accept() error = %v, want nil", err)
+	}
+
+	// Confirm the acceptance genuinely authorises a merge of the first
+	// attempt, BEFORE the new attempt exists -- otherwise this test would
+	// prove nothing about which mechanism later refuses.
+	ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+	if err != nil {
+		t.Fatalf("RevalidateForMerge() (before new attempt) error = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatalf("RevalidateForMerge() (before new attempt) ok = false, reason = %q, want true", reason)
+	}
+
+	// A re-triggered review posts a SECOND, high-risk verdict for the SAME
+	// pull request at the SAME head sha (nothing new to say, still not
+	// Shippable=auto) -- an ordinary re-review, never a code change.
+	seedNotShippableAutoVerdict(ctx, t, pool, repoFullName, int32(pr.Number), pr.HeadSHA)
+
+	secondVerdict, hasVerdict, err := appreviewverdict.GetLatest(ctx, rs.deps.ReviewVerdict, repoFullName, int32(pr.Number))
+	if err != nil || !hasVerdict {
+		t.Fatalf("GetLatest (second verdict): hasVerdict=%v err=%v", hasVerdict, err)
+	}
+	if secondVerdict.ID == firstVerdict.ID {
+		t.Fatalf("fixture bug: second seedNotShippableAutoVerdict call did not produce a new verdict row (id unchanged: %s)", secondVerdict.ID)
+	}
+
+	// The acceptance itself is untouched -- nobody revoked it, and it is
+	// still the LATEST non-revoked row for this pull request.
+	stillActive, activeOK, err := appreviewverdict.GetActiveAcceptance(ctx, rs.deps.ReviewVerdict.Acceptances, repoFullName, int32(pr.Number))
+	if err != nil {
+		t.Fatalf("GetActiveAcceptance after new attempt: error = %v, want nil", err)
+	}
+	if !activeOK {
+		t.Fatal("GetActiveAcceptance after new attempt: ok = false, want true -- nobody revoked this acceptance")
+	}
+	if stillActive.ID != acceptance.ID {
+		t.Fatalf("GetActiveAcceptance after new attempt returned a DIFFERENT acceptance id (%s), want the SAME one this test created (%s)", stillActive.ID, acceptance.ID)
+	}
+	if stillActive.Revoked() {
+		t.Error("the acceptance's own Revoked() = true after the new attempt, want false -- this test's own point is that Applicable, not revocation, is what refuses here")
+	}
+
+	// The decisive assertion: RevalidateForMerge must now refuse, on
+	// ReasonNotShippableAuto again, because the OLD acceptance's own
+	// VerdictID no longer matches the NEW latest verdict -- if
+	// Acceptance.Applicable's own verdict-id check were deleted from
+	// revalidateCore (accepted := acceptanceOK, with no Applicable call
+	// at all), this would incorrectly stay eligible=true, since
+	// GetActiveAcceptance still reports the old row as active.
+	ok, _, reason, _, _, err = decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+	if err != nil {
+		t.Fatalf("RevalidateForMerge() (after new attempt) error = %v, want nil", err)
+	}
+	if ok {
+		t.Fatal("RevalidateForMerge() (after new attempt) ok = true, want false: an acceptance granted against a SUPERSEDED verdict must not authorise a merge of a fresh, never-accepted attempt")
+	}
+	if !strings.Contains(reason, string(autoapproval.ReasonNotShippableAuto)) {
+		t.Fatalf("RevalidateForMerge() (after new attempt) reason = %q, want it to name %q -- the new attempt was never accepted", reason, autoapproval.ReasonNotShippableAuto)
+	}
+}
+
+// TestAccept_SupersedesPriorActiveAcceptance pins finding F2 (adversarial
+// review) directly against real Postgres: nothing stops two live
+// acceptances for one pull request BEFORE this fix, so revoking the row
+// GetActiveAcceptance reports as active could silently re-activate an
+// earlier one that was never touched -- "a revocation that does not
+// revoke is worse than none." A second Accept for the SAME verdict now
+// atomically supersedes (revokes) the first, so at most one row is ever
+// active, and revoking "the" active acceptance afterwards finds nothing
+// left to silently re-activate.
+func TestAccept_SupersedesPriorActiveAcceptance(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	rs := newRevalidateStores(pool)
+	const actorGitHubID = "revalidate-supersede-actor"
+	const repoFullName = "acme/revalidate-accept-supersede"
+
+	users := narvipg.NewUserStore(pool)
+	maintainer, err := users.Create(ctx, sqlcgen.CreateUserParams{PrimaryEmail: "supersede-maintainer@example.com", DisplayName: "Maintainer", Role: sqlcgen.UserRoleMaintainer})
+	if err != nil {
+		t.Fatalf("create maintainer: %v", err)
+	}
+
+	pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 1)
+	seedNotShippableAutoVerdict(ctx, t, pool, repoFullName, int32(pr.Number), pr.HeadSHA)
+
+	record, hasVerdict, err := appreviewverdict.GetLatest(ctx, rs.deps.ReviewVerdict, repoFullName, int32(pr.Number))
+	if err != nil || !hasVerdict {
+		t.Fatalf("GetLatest: hasVerdict=%v err=%v", hasVerdict, err)
+	}
+	var verdictID pgtype.UUID
+	if err := verdictID.Scan(record.ID); err != nil {
+		t.Fatalf("scan verdict id: %v", err)
+	}
+
+	acceptInput := appreviewverdict.AcceptInput{
+		RepoFullName:  repoFullName,
+		PRNumber:      int32(pr.Number),
+		VerdictID:     verdictID,
+		HeadSHA:       record.HeadSHA,
+		Context:       record.Context,
+		Reason:        string(autoapproval.ReasonNotShippableAuto),
+		Justification: "First acceptance -- about to be superseded by a second accept.",
+		AcceptedBy:    maintainer.ID,
+	}
+	first, err := appreviewverdict.Accept(ctx, rs.deps.ReviewVerdict.Acceptances, acceptInput)
+	if err != nil {
+		t.Fatalf("Accept() (first) error = %v, want nil", err)
+	}
+
+	// A second accept for the SAME verdict (a double-click, a retried
+	// request) must SUPERSEDE the first, never coexist with it.
+	acceptInput.Justification = "Second acceptance -- supersedes the first."
+	second, err := appreviewverdict.Accept(ctx, rs.deps.ReviewVerdict.Acceptances, acceptInput)
+	if err != nil {
+		t.Fatalf("Accept() (second) error = %v, want nil", err)
+	}
+	if second.ID == first.ID {
+		t.Fatalf("second Accept() returned the SAME id as the first (%s) -- Accept must always insert a NEW row (append-only)", first.ID)
+	}
+
+	// Exactly one row reports active: the second.
+	active, ok, err := appreviewverdict.GetActiveAcceptance(ctx, rs.deps.ReviewVerdict.Acceptances, repoFullName, int32(pr.Number))
+	if err != nil {
+		t.Fatalf("GetActiveAcceptance: error = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatal("GetActiveAcceptance: ok = false, want true")
+	}
+	if active.ID != second.ID {
+		t.Fatalf("GetActiveAcceptance returned %s, want the SECOND acceptance %s", active.ID, second.ID)
+	}
+
+	// The FIRST row must now read back as revoked -- superseded, not left
+	// dangling as a second live row.
+	firstAfter, ok, err := appreviewverdict.GetAcceptance(ctx, rs.deps.ReviewVerdict.Acceptances, verdictIDFromString(t, first.ID), repoFullName)
+	if err != nil {
+		t.Fatalf("GetAcceptance (first, after supersede): error = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatal("GetAcceptance (first, after supersede): ok = false, want true (the row must still exist, only revoked)")
+	}
+	if !firstAfter.Revoked() {
+		t.Error("the FIRST acceptance's own Revoked() = false after a second accept superseded it, want true")
+	}
+
+	// THE DECISIVE ASSERTION: revoke "the" active acceptance (the
+	// second) -- this must NOT silently re-activate the first.
+	if _, ok, err := appreviewverdict.RevokeAcceptance(ctx, rs.deps.ReviewVerdict.Acceptances, verdictIDFromString(t, second.ID), maintainer.ID, repoFullName); err != nil || !ok {
+		t.Fatalf("RevokeAcceptance (second): ok=%v err=%v, want ok=true err=nil", ok, err)
+	}
+	_, ok, err = appreviewverdict.GetActiveAcceptance(ctx, rs.deps.ReviewVerdict.Acceptances, repoFullName, int32(pr.Number))
+	if err != nil {
+		t.Fatalf("GetActiveAcceptance after revoking the second: error = %v, want nil", err)
+	}
+	if ok {
+		t.Error("GetActiveAcceptance after revoking the second: ok = true, want false -- revoking the only active acceptance must never silently re-activate an earlier, already-superseded one (finding F2)")
+	}
+}
+
+// verdictIDFromString is a small local helper -- every call site above
+// already has a pgtype.UUID scan boilerplate; this collects it once for
+// this test's own repeated GetAcceptance/RevokeAcceptance calls.
+func verdictIDFromString(t *testing.T, id string) pgtype.UUID {
+	t.Helper()
+	var u pgtype.UUID
+	if err := u.Scan(id); err != nil {
+		t.Fatalf("scan id %q: %v", id, err)
+	}
+	return u
 }

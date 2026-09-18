@@ -2416,6 +2416,14 @@ export interface DecisionInboxItem {
    */
   hasChangesRequested: boolean | null;
   /**
+   * review_verdicts.id for this PR's own CURRENT latest verdict, whenever one has been posted -- null for a PR with no review verdict of record. This is the id a client names back on AcceptReviewVerdictRequest.verdictId (finding F3, adversarial review): accept-verdict binds to the ONE verdict a maintainer actually read here, never to whichever verdict happens to be latest when the request arrives, and refuses (409) on a mismatch.
+   */
+  verdictId: string | null;
+  /**
+   * The id of the acceptance named by acceptanceJustification below, set under the exact same conditions -- the id a client passes to RevokeReviewVerdictAcceptanceRequest.id (finding F11, adversarial review: before this field existed, no read surface ever returned an acceptance's own id, so revocation was reachable only by a client that had kept the 201 response body from the original accept-verdict call).
+   */
+  acceptanceId: string | null;
+  /**
    * §21.1b's own 'human acceptance of a verdict the engine refuses': the accepting maintainer+'s own free-text justification, set iff an ACTIVE, APPLICABLE acceptance exists for this PR's own CURRENT verdict (internal/domain/reviewverdict.Acceptance.Applicable) -- null for a PR that was never accepted, whose acceptance was since revoked, or whose acceptance no longer binds to the current verdict (a new attempt, a moved base, a changed ancestor chain -- §21.1b's own three invalidating triggers). Display only: this never changes kind -- an accepted PR still renders needs_review, never ready_to_merge, because acceptance authorises a human's own Merge click rather than reclassifying the engine's judgment.
    */
   acceptanceJustification: string | null;
@@ -2525,7 +2533,7 @@ export interface MergePullRequestResponse {
   message: string;
 }
 /**
- * POST /api/decision-inbox/accept-verdict's own request body ('human acceptance of a verdict the engine refuses', §21.1b) -- binds a new acceptance to (repoFullName, prNumber)'s own CURRENT latest review_verdicts row, server-side, at request time; the caller never supplies a verdict id.
+ * POST /api/decision-inbox/accept-verdict's own request body ('human acceptance of a verdict the engine refuses', §21.1b) -- binds a new acceptance to (repoFullName, prNumber)'s own review_verdicts row NAMED by verdictId below (finding F3, adversarial review: an earlier version of this endpoint bound to whichever verdict was latest AT REQUEST TIME, server-resolved, never named by the caller -- so a maintainer could authorise a verdict that had already replaced the one they actually read; §21.1b's own contract is 'binds to ONE verdict', and only the client that read that ONE verdict can name it).
  *
  * This interface was referenced by `RestDtos`'s JSON-Schema
  * via the `definition` "AcceptReviewVerdictRequest".
@@ -2533,6 +2541,10 @@ export interface MergePullRequestResponse {
 export interface AcceptReviewVerdictRequest {
   repoFullName: string;
   prNumber: number;
+  /**
+   * The id of the review_verdicts row the caller actually read and is accepting (DecisionInboxItem.verdictId, or ReviewReadoutLatestVerdict's own id) -- the server refuses (409) if this no longer matches (repoFullName, prNumber)'s own CURRENT latest verdict, rather than silently binding to whatever is latest now: a mismatch means a new attempt posted since the caller last read this PR, and the caller is about to authorise code it never saw.
+   */
+  verdictId: string;
   /**
    * The accepting maintainer+'s own required, free-text explanation (§21.1b: 'carries author, justification'). Untrusted, human-authored content.
    */
@@ -2571,7 +2583,7 @@ export interface ReviewVerdictAcceptance {
   attemptId: string | null;
   headSha: string;
   /**
-   * The autoapproval.Reason ComputeEligible returned for this verdict at accept time (e.g. 'the verdict's shippable classification is not auto') -- display/audit only, never re-checked.
+   * A best-effort, no-I/O classification of which waivable eligibility criterion this acceptance most likely addresses (e.g. 'the verdict's shippable classification is not auto') -- NOT itself computed by calling autoapproval.ComputeEligible (finding F8, adversarial review: this description, and three others, previously claimed it was); display/audit only, never re-checked. The authoritative eligibility decision is always re-derived live, at merge time, by autoapproval.ComputeEligibleWithAcceptance -- a wrong guess here changes no outcome, only what a human reading the audit trail sees.
    */
   reason: string;
   justification: string;

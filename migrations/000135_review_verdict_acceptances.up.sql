@@ -29,9 +29,13 @@
 -- reading THIS row for audit purposes should never need a join back to
 -- review_verdicts to see what, exactly, was accepted.
 --
--- reason is the autoapproval.Reason value ComputeEligible returned at
--- accept time (e.g. "the verdict's shippable classification is not
--- auto") -- display/audit only, never re-checked: a caller applying this
+-- reason is a best-effort, no-I/O classification (httpapi.
+-- AcceptReviewVerdict's own accept-time guess) of which waivable
+-- eligibility criterion this acceptance most likely addresses (e.g. "the
+-- verdict's shippable classification is not auto") -- NOT itself computed
+-- by calling autoapproval.ComputeEligible (finding F8, adversarial
+-- review: this comment, and three others, previously claimed it was) --
+-- display/audit only, never re-checked: a caller applying this
 -- acceptance always re-runs ComputeEligibleWithAcceptance against the
 -- pull request's CURRENT live facts, which independently re-derives
 -- whichever reason(s) still apply -- this column is never itself
@@ -53,12 +57,35 @@
 -- may exist for the SAME pull request over its lifetime (one per attempt
 -- that was ever accepted) -- internal/app/reviewverdict's own
 -- GetActiveAcceptance "latest non-revoked row" read decides which one,
--- if any, is currently in force. No uniqueness constraint on
--- (repo_full_name, pr_number) is needed or enforced here: that read,
--- combined with Applicable's own verdict_id check, already makes a
--- superseded row harmless even if nobody ever explicitly revokes it
--- (§21.1b: an acceptance "makes it inapplicable... without a human
--- touching it").
+-- if any, is currently in force.
+--
+-- AT MOST ONE non-revoked row per (repo_full_name, pr_number), enforced
+-- below by review_verdict_acceptances_one_active_idx (finding F2,
+-- adversarial review, corrected before this table's first release: an
+-- earlier version of this comment argued no uniqueness constraint was
+-- needed here, reasoning that GetActiveAcceptance's "latest non-revoked
+-- row" read, combined with Applicable's own verdict_id check, already
+-- made a superseded row harmless -- that reasoning covers a NEW verdict
+-- superseding an old acceptance, but not two acceptances coexisting for
+-- the SAME verdict: revoking the row GetActiveAcceptance currently
+-- reports as active would then silently re-activate the OTHER one,
+-- since it is still non-revoked and still Applicable to the same
+-- verdict_id -- a revocation that does not revoke is worse than none).
+-- postgres.ReviewVerdictAcceptanceStore.Insert now supersedes any
+-- existing active row for the SAME (repo_full_name, pr_number) via
+-- SupersedeActiveReviewVerdictAcceptances, immediately before the INSERT
+-- (queries/reviewverdictacceptances.sql) -- two SEQUENTIAL statements,
+-- deliberately never one combined WITH-clause statement (that query's own
+-- doc comment: verified against real Postgres, a single `WITH superseded
+-- AS (UPDATE ...) INSERT ...` statement's own INSERT does not see the
+-- CTE's UPDATE for unique-constraint purposes, since both share the SAME
+-- start-of-query snapshot, and fails with a spurious duplicate-key error
+-- on the routine re-accept case this exists to allow). This invariant is
+-- still enforced by construction, never merely by convention --
+-- review_verdict_acceptances_one_active_idx itself is what guarantees it,
+-- regardless of the two statements' own relative timing; the supersede
+-- step is what makes the ORDINARY case (an uncontested re-accept) succeed
+-- cleanly rather than colliding with its own predecessor.
 CREATE TABLE review_verdict_acceptances (
     id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     repo_full_name TEXT NOT NULL,
@@ -85,4 +112,16 @@ CREATE TABLE review_verdict_acceptances (
 -- (migrations/000073).
 CREATE INDEX review_verdict_acceptances_active_idx
     ON review_verdict_acceptances (repo_full_name, pr_number, accepted_at DESC)
+    WHERE revoked_at IS NULL;
+
+-- Enforces "at most one active acceptance per pull request" (finding F2,
+-- adversarial review) as a database-level invariant, never merely an
+-- application-level convention InsertReviewVerdictAcceptance could
+-- forget to uphold on some future code path -- a second concurrent
+-- Accept racing InsertReviewVerdictAcceptance's own supersede-then-insert
+-- (queries/reviewverdictacceptances.sql) fails this constraint rather
+-- than silently creating the second live row the rest of this table's
+-- own doc comment above exists to rule out.
+CREATE UNIQUE INDEX review_verdict_acceptances_one_active_idx
+    ON review_verdict_acceptances (repo_full_name, pr_number)
     WHERE revoked_at IS NULL;

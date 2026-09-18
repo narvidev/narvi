@@ -36,13 +36,18 @@ type Acceptance struct {
 	AttemptID string
 	HeadSHA   string
 	Context   Context
-	// Reason is the autoapproval.Reason string ComputeEligible returned
-	// at accept time (e.g. "the verdict's shippable classification is
-	// not auto") -- display/audit only: never itself consulted to decide
-	// whether this acceptance still applies. A caller applying this
-	// acceptance always re-runs autoapproval.ComputeEligibleWithAcceptance
-	// against the pull request's CURRENT live facts, which independently
-	// re-derives whichever reason(s) still apply.
+	// Reason is a best-effort, no-I/O classification (httpapi.
+	// AcceptReviewVerdict's own accept-time guess, autoapproval.Reason's
+	// own string vocabulary) of which waivable eligibility criterion this
+	// acceptance most likely addresses (e.g. "the verdict's shippable
+	// classification is not auto") -- NOT itself computed by calling
+	// autoapproval.ComputeEligible (finding F8, adversarial review: this
+	// comment previously claimed it was) -- display/audit only: never
+	// itself consulted to decide whether this acceptance still applies. A
+	// caller applying this acceptance always re-runs autoapproval.
+	// ComputeEligibleWithAcceptance against the pull request's CURRENT
+	// live facts, which independently re-derives whichever reason(s)
+	// still apply.
 	Reason string
 	// Justification is the accepting maintainer's own required free-text
 	// explanation (§21.1b: "carries author, justification"). Untrusted,

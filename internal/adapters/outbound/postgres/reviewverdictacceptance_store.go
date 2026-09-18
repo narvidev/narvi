@@ -41,7 +41,32 @@ func (s *ReviewVerdictAcceptanceStore) WithTx(tx pgx.Tx) *ReviewVerdictAcceptanc
 // Insert creates one review_verdict_acceptances row -- see
 // InsertReviewVerdictAcceptance's own generated doc comment for why this
 // is always a plain INSERT, never an upsert (this table is append-only).
+//
+// FIRST supersedes (revokes) any existing active row for the SAME
+// (repo_full_name, pr_number) -- SupersedeActiveReviewVerdictAcceptances's
+// own generated doc comment (finding F2, adversarial review) explains why
+// this is two SEQUENTIAL statements, never one combined WITH-clause
+// statement: verified against real Postgres, a single `WITH superseded AS
+// (UPDATE ...) INSERT ...` statement's own primary INSERT does not see
+// the CTE's UPDATE for unique-constraint-checking purposes (both execute
+// against the SAME start-of-query snapshot), so it fails with a spurious
+// duplicate-key error on the routine case this exists to allow. Not
+// wrapped in an explicit transaction spanning both calls (unlike
+// OIDCSigningKeyStore.Rotate's own retire-then-create pair, which needs
+// one to observe the other's committed row for its own audit contract) --
+// review_verdict_acceptances_one_active_idx is what actually enforces "at
+// most one active row" regardless of whether these two statements commit
+// together; a concurrent accept racing between them can still make the
+// INSERT below fail on that constraint, an ordinary retryable error, but
+// can never produce two live rows.
 func (s *ReviewVerdictAcceptanceStore) Insert(ctx context.Context, arg sqlcgen.InsertReviewVerdictAcceptanceParams) (sqlcgen.ReviewVerdictAcceptance, error) {
+	if err := s.q.SupersedeActiveReviewVerdictAcceptances(ctx, sqlcgen.SupersedeActiveReviewVerdictAcceptancesParams{
+		RepoFullName: arg.RepoFullName,
+		PrNumber:     arg.PrNumber,
+		RevokedBy:    arg.AcceptedBy,
+	}); err != nil {
+		return sqlcgen.ReviewVerdictAcceptance{}, err
+	}
 	return s.q.InsertReviewVerdictAcceptance(ctx, arg)
 }
 

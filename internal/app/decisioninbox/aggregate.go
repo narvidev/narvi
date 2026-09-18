@@ -84,6 +84,7 @@ import (
 	"github.com/narvidev/narvi/internal/domain/handoff"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
+	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -479,6 +480,62 @@ const openFindingsUnknownFailClosed = 1
 // considered ineligibility judgement, exactly the "failure rendering as
 // a confident normal state" shape this codebase has already fixed
 // elsewhere for this same Result field (producers 1-5).
+// acceptanceContextStillFresh reports whether recordContext (the accepted
+// verdict's own persisted base ref and ancestor chain, internal/domain/
+// reviewverdict.Context) still matches pr's CURRENT, already-fetched
+// (§16.2's own short-TTL-cached, "never presented as live truth") base
+// ref and ancestor chain (finding F6, adversarial review). Applicable
+// alone (reviewverdict.Acceptance.Applicable's own doc comment) can only
+// ever confirm "same verdict, still not revoked" -- by design, it
+// defers "a moved base or a changed ancestor chain" to autoapproval.
+// ComputeEligibleWithAcceptance's own LIVE, unconditional freshness
+// checks (revalidateCore, revalidate.go), which this read-model function
+// never runs: doing so here would mean a new, uncached GitHub call on
+// every decision-inbox render, exactly the "SCM data is cached... never
+// presented as live truth" posture §16.2 forbids trading away. So
+// before this fix, a row whose base had moved or whose ancestor chain
+// had changed still rendered its stale acceptance as active right up
+// until the human clicked Merge and got refused -- contradicting the
+// wire contract (DecisionInboxItem.acceptanceJustification's own
+// description: "null ... whose acceptance no longer binds to the
+// current verdict (a new attempt, a moved base, a changed ancestor
+// chain)") and telling a human the acceptance stands when it does not.
+//
+// This function closes the REF-level half of that gap with NO new I/O,
+// using data buildPROpenItem's own caller has already fetched: a base
+// REF change (a genuine retarget) or an ancestor-chain REF change (a
+// genuine stack restructure) makes ComputeEligibleWithAcceptance refuse
+// UNCONDITIONALLY, with no fast-forward tolerance possible (see
+// ComputeEligible's own ReasonBaseMoved/ReasonAncestorChainChanged doc
+// comments) -- so a ref-level mismatch here is a fact this function can
+// assert confidently, before any live SHA resolution: a merge attempt
+// against this exact acceptance is GUARANTEED to refuse. A ref-level
+// MATCH does NOT by itself prove the acceptance is still eligible (the
+// base's own SHA could still have moved in a way only a live
+// ResolveBranchSHA/IsAncestor call, revalidateCore's own, can confirm,
+// and that live call may yet tolerate a confirmed fast-forward) -- this
+// function only ever narrows "still shown" away from "definitely wrong",
+// never widens it to "definitely still applies". The residual (a base
+// SHA move this function cannot see) is accepted here for the SAME
+// reason revalidateCore's own BaseAdvancedWithoutRewrite tolerates it at
+// merge time: an ordinary, unrelated merge to trunk must not read as
+// "your acceptance is gone" any more than it reads as "your verdict is
+// stale" elsewhere in this design.
+func acceptanceContextStillFresh(recordContext reviewverdict.Context, pr ports.OpenPR) bool {
+	if recordContext.BaseRef != pr.BaseRef {
+		return false
+	}
+	if len(recordContext.AncestorChain) != len(pr.AncestorChain) {
+		return false
+	}
+	for i, link := range recordContext.AncestorChain {
+		if link.Ref != pr.AncestorChain[i].Ref {
+			return false
+		}
+	}
+	return true
+}
+
 func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullName, actorGitHubID, token string, now time.Time, budget *codeOwnersBudget) (Item, bool) {
 	var degraded bool
 	provenance := resolvePRProvenance(ctx, deps, pr, repoFullName, actorGitHubID, token, now, budget)
@@ -514,27 +571,36 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 	// release-cut status -- see resolveReleaseCut's own doc comment.
 	isReleaseCut, manifestFindingsCount, aggregateReviewTriggered, manifestCoveragePartial, compositionReviewed, compositionDecision := resolveReleaseCut(ctx, deps, repoFullName, pr.Number)
 
-	// acceptanceJustification/acceptedAt (§21.1b: "human acceptance of a
-	// verdict the engine refuses") -- display only, best-effort: a
-	// lookup failure here degrades to "no acceptance shown", never a
-	// failed row (mirrors resolveReviewSessionID/resolveReleaseCut's own
-	// identical "this is display data, not eligibility" posture in this
-	// same function -- unlike computeRealEligibility below, a failure
-	// here must never mark the read degraded, since nothing here gates
-	// Kind or ready_to_merge). Short-circuits on GetActiveAcceptance's
-	// own ok=false (the common case: most PRs are never accepted) before
-	// paying for a second GetLatest verdict read -- computeRealEligibility
-	// below already does its own, independent GetLatest call; this one
-	// is intentionally separate rather than threading record.ID out
-	// through that function's own (bool, bool) return shape.
+	// verdictID/acceptanceID/acceptanceJustification/acceptedAt (§21.1b:
+	// "human acceptance of a verdict the engine refuses") -- display
+	// only, best-effort: a lookup failure here degrades to "no
+	// verdict/acceptance shown", never a failed row (mirrors
+	// resolveReviewSessionID/resolveReleaseCut's own identical "this is
+	// display data, not eligibility" posture in this same function --
+	// unlike computeRealEligibility below, a failure here must never mark
+	// the read degraded, since nothing here gates Kind or
+	// ready_to_merge). verdictID is resolved unconditionally, ahead of
+	// the acceptance check, so a client always has (finding F3,
+	// adversarial review) the ONE verdict id it must name back on
+	// AcceptReviewVerdictRequest -- this is a SECOND, independent
+	// GetLatest call from computeRealEligibility's own below; kept
+	// separate rather than threading record.ID out through that
+	// function's own (bool, bool) return shape, mirroring this block's
+	// own pre-existing precedent.
+	var verdictID string
+	var acceptanceID string
 	var acceptanceJustification string
 	var acceptedAt time.Time
-	if acceptance, acceptanceOK, acceptanceErr := appreviewverdict.GetActiveAcceptance(ctx, deps.ReviewVerdict.Acceptances, repoFullName, int32(pr.Number)); acceptanceErr != nil {
-		platform.Logger(ctx).Warn("decisioninbox: get active review verdict acceptance failed -- omitting acceptance display data for this row", "error", acceptanceErr, "repo", repoFullName, "pr_number", pr.Number)
-	} else if acceptanceOK {
-		if record, hasVerdict, verdictErr := appreviewverdict.GetLatest(ctx, deps.ReviewVerdict, repoFullName, int32(pr.Number)); verdictErr != nil {
-			platform.Logger(ctx).Warn("decisioninbox: get latest review verdict failed -- omitting acceptance display data for this row", "error", verdictErr, "repo", repoFullName, "pr_number", pr.Number)
-		} else if hasVerdict && acceptance.Applicable(record.ID) {
+	if record, hasVerdict, verdictErr := appreviewverdict.GetLatest(ctx, deps.ReviewVerdict, repoFullName, int32(pr.Number)); verdictErr != nil {
+		platform.Logger(ctx).Warn("decisioninbox: get latest review verdict failed -- omitting verdict/acceptance display data for this row", "error", verdictErr, "repo", repoFullName, "pr_number", pr.Number)
+	} else if hasVerdict {
+		verdictID = record.ID
+		// Short-circuits on GetActiveAcceptance's own ok=false (the
+		// common case: most PRs are never accepted).
+		if acceptance, acceptanceOK, acceptanceErr := appreviewverdict.GetActiveAcceptance(ctx, deps.ReviewVerdict.Acceptances, repoFullName, int32(pr.Number)); acceptanceErr != nil {
+			platform.Logger(ctx).Warn("decisioninbox: get active review verdict acceptance failed -- omitting acceptance display data for this row", "error", acceptanceErr, "repo", repoFullName, "pr_number", pr.Number)
+		} else if acceptanceOK && acceptance.Applicable(record.ID) && acceptanceContextStillFresh(record.Context, pr) {
+			acceptanceID = acceptance.ID
 			acceptanceJustification = acceptance.Justification
 			acceptedAt = acceptance.AcceptedAt
 		}
@@ -562,6 +628,8 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 		ManifestCoveragePartial:  manifestCoveragePartial,
 		CompositionReviewed:      compositionReviewed,
 		CompositionDecision:      compositionDecision,
+		VerdictID:                verdictID,
+		AcceptanceID:             acceptanceID,
 		AcceptanceJustification:  acceptanceJustification,
 		AcceptedAt:               acceptedAt,
 	}

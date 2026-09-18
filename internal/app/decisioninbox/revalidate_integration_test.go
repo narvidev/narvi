@@ -169,7 +169,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		const repoFullName = "acme/revalidate-eligible"
 		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 1)
 
-		ok, headSHA, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, headSHA, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -190,7 +190,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		pr.CIConclusion = ports.CIConclusionFailure
 		rs.replaceTargetPR(actorGitHubID, pr)
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -218,7 +218,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		// on a coincidentally-true HasChangesRequested.
 		rs.replaceTargetPR(actorGitHubID, pr)
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -270,7 +270,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		pr.CIConclusionDegraded = true
 		rs.replaceTargetPR(actorGitHubID, pr)
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -299,7 +299,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		pr.ChangedFilesListDegraded = true
 		rs.replaceTargetPR(actorGitHubID, pr)
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -336,7 +336,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		pr.ChangedFilesListDegraded = false
 		rs.replaceTargetPR(actorGitHubID, pr)
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -407,7 +407,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 			t.Fatalf("insert second verdict with a matching ancestor chain: %v", err)
 		}
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -448,7 +448,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		// called): the LIVE PR reports no ancestor chain at all -- an
 		// ordinary, non-stacked PR today -- which no longer matches the
 		// verdict just inserted above.
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -509,7 +509,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		pr.AncestorChain = []ports.PRAncestorLink{{Ref: "", SHA: ""}}
 		rs.replaceTargetPR(actorGitHubID, pr)
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -576,7 +576,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 			rs.sourceControl.isAncestorCalls = nil
 		}()
 
-		ok, headSHA, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, headSHA, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -635,7 +635,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 			rs.sourceControl.isAncestorCalls = nil
 		}()
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -661,7 +661,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		pr.Labels = []string{"review:low-risk", "review:needs-human"}
 		rs.replaceTargetPR(actorGitHubID, pr)
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -699,7 +699,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 			t.Fatalf("update sentinel fix opened: %v", err)
 		}
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -717,7 +717,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		pr.Draft = true
 		rs.replaceTargetPR(actorGitHubID, pr)
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -748,7 +748,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		pr.Labels = []string{"review:low-risk", "handoff"}
 		rs.replaceTargetPR(actorGitHubID, pr)
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -770,7 +770,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		pr.HasChangesRequested = true
 		rs.replaceTargetPR(actorGitHubID, pr)
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -824,7 +824,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		// Deliberately NO seedAutoApprovedVerdict call -- this is the
 		// fact under test.
 
-		ok2, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok2, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -848,7 +848,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		pr.HeadSHA = "sha-31-newer-commit"
 		rs.replaceTargetPR(actorGitHubID, pr)
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -881,7 +881,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		pr.BaseRef = "release/2026.09"
 		rs.replaceTargetPR(actorGitHubID, pr)
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -924,7 +924,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		rs.sourceControl.resolveBranchSHA = "sha-main-has-actually-advanced"
 		defer func() { rs.sourceControl.resolveBranchSHA = "" }()
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -962,7 +962,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 			rs.sourceControl.isAncestorCalls = nil
 		}()
 
-		ok, headSHA, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, headSHA, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -1011,7 +1011,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 			rs.sourceControl.isAncestorCalls = nil
 		}()
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -1060,7 +1060,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 
 		buf := captureDefaultLoggerJSON(t)
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil -- an unconfirmable ancestry check is a domain refusal, never a Go error", err)
 		}
@@ -1115,7 +1115,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 			rs.deps.Timeouts.DecisionInboxIsAncestorTimeout = savedTimeout
 		}()
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil -- an unconfirmable ancestry check is a domain refusal, never a Go error", err)
 		}
@@ -1162,7 +1162,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 
 		buf := captureDefaultLoggerJSON(t)
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 		}
@@ -1197,7 +1197,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 
 		buf := captureDefaultLoggerJSON(t)
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 		if err != nil {
 			t.Fatalf("RevalidateForMerge() error = %v, want nil -- an unconfirmable base-sha resolution is a domain refusal, never a Go error", err)
 		}
@@ -1229,7 +1229,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		rs.sourceControl.openPRsTruncated = true
 		defer func() { rs.sourceControl.openPRsTruncated = false }()
 
-		ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, "acme/revalidate-truncated-not-found", 9999, "tok")
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, "acme/revalidate-truncated-not-found", 9999, "tok")
 		if err == nil {
 			t.Fatal("RevalidateForMerge() error = nil, want a non-nil error -- a truncated read must never confidently deny, it must fail loudly instead so the caller retries")
 		}
@@ -1283,7 +1283,7 @@ func TestRevalidateForMerge_CIConclusionDegraded_ProbeCatchesItBeforeAnyLiveCall
 	rs.sourceControl.resolveBranchSHAErr = errors.New("simulated: base branch tip unavailable")
 	defer func() { rs.sourceControl.resolveBranchSHAErr = nil }()
 
-	ok, _, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+	ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 	if err != nil {
 		t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 	}
@@ -1332,7 +1332,7 @@ func TestRevalidateForMerge_CIConclusionDegraded_FinalLiteralWiredFromRealValue(
 	// value, ComputeEligible would refuse via ReasonCIConclusionDegraded
 	// and this merge would never succeed.
 
-	ok, headSHA, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+	ok, headSHA, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 	if err != nil {
 		t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 	}
@@ -1380,7 +1380,7 @@ func TestRevalidateForMerge_EligibilityConfigStoreError_FailsClosed(t *testing.T
 	// with a real pgx error, never pgx.ErrNoRows.
 	rs.deps.ReviewVerdict.RepoSettings = narvipg.NewRepoSettingsStore(pool).WithTx(tx)
 
-	ok, headSHA, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+	ok, headSHA, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
 	if err == nil {
 		t.Fatal("RevalidateForMerge() error = nil, want a non-nil error -- a genuine eligibility-config store error must fail CLOSED (refuse), never silently fall back to the engine's own wider defaults")
 	}
@@ -1528,7 +1528,7 @@ func TestRevalidateForMerge_LyingVerdictAgainstReal300FileSensitivePR(t *testing
 	}
 	rs.sourceControl.openPRsByExternalID[actorGitHubID] = append(rs.sourceControl.openPRsByExternalID[actorGitHubID], pr)
 
-	ok, headSHAGot, reason, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, prNumber, "tok")
+	ok, headSHAGot, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, prNumber, "tok")
 	if err != nil {
 		t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
 	}

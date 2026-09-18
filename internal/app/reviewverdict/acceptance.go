@@ -13,6 +13,20 @@ import (
 	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 )
 
+// ErrAcceptanceStoreNotConfigured is returned by Accept/RevokeAcceptance/
+// GetAcceptance/ListAcceptances below when store is nil (finding F9,
+// adversarial review: Deps.Acceptances' own doc comment already promised
+// "Accept/Revoke [degrade] to a plain error, never a silent no-op" --
+// before this fix, only GetActiveAcceptance actually checked for nil;
+// every other function here called straight through to a nil *postgres.
+// ReviewVerdictAcceptanceStore and panicked on the nil-pointer field
+// access inside it). Mirrors GetActiveAcceptance's own "a deployment/test
+// wiring that never constructs this store" precedent, except a WRITE (or
+// a read a caller cannot silently treat as absence, e.g. GetAcceptance's
+// own use in RevokeAcceptance's failed-revoke diagnosis) has no honest
+// ok=false to degrade to -- an error is the only honest answer.
+var ErrAcceptanceStoreNotConfigured = errors.New("reviewverdict: review verdict acceptance store not configured")
+
 // AcceptInput is Accept's own caller-supplied shape -- every field the
 // accepting maintainer+ actually controls, or that the caller has
 // already resolved server-side. Accept never re-fetches or re-derives
@@ -33,8 +47,11 @@ type AcceptInput struct {
 	AttemptID pgtype.UUID
 	HeadSHA   string
 	Context   reviewverdict.Context
-	// Reason is the autoapproval.Reason ComputeEligible returned for
-	// this verdict at accept time -- display/audit only
+	// Reason is httpapi's own best-effort, no-I/O classification of which
+	// waivable eligibility criterion this acceptance most likely
+	// addresses -- NOT itself computed by calling autoapproval.
+	// ComputeEligible (finding F8, adversarial review: this comment
+	// previously claimed it was) -- display/audit only
 	// (reviewverdict.Acceptance.Reason's own doc comment).
 	Reason        string
 	Justification string
@@ -43,11 +60,20 @@ type AcceptInput struct {
 
 // Accept records one review_verdict_acceptances row ("human acceptance
 // of a verdict the engine refuses", §21.1b) -- APPEND-ONLY (this table's
-// own migration doc comment): a repeat accept for the SAME verdict
-// simply inserts a second row; GetActiveAcceptance's own "latest
-// non-revoked row" read decides which one, if any, is currently in
-// force.
+// own migration doc comment): a repeat accept inserts a NEW row, never an
+// UPDATE. Unlike an earlier version of this table (finding F2, adversarial
+// review), a repeat accept for the SAME pull request now SUPERSEDES
+// (revokes) any existing active row for that pull request FIRST --
+// postgres.ReviewVerdictAcceptanceStore.Insert's own doc comment for why
+// this is two sequential statements, not one combined atomic statement --
+// so at most one row is ever active at a time
+// (review_verdict_acceptances_one_active_idx), and revoking "the" active
+// acceptance can never silently re-activate an earlier one left lying
+// around.
 func Accept(ctx context.Context, store *postgres.ReviewVerdictAcceptanceStore, in AcceptInput) (reviewverdict.Acceptance, error) {
+	if store == nil {
+		return reviewverdict.Acceptance{}, ErrAcceptanceStoreNotConfigured
+	}
 	ancestorChainJSON, err := marshalAncestorChain(in.Context.AncestorChain)
 	if err != nil {
 		return reviewverdict.Acceptance{}, fmt.Errorf("reviewverdict: accept: marshal ancestor chain: %w", err)
@@ -115,6 +141,9 @@ func GetActiveAcceptance(ctx context.Context, store *postgres.ReviewVerdictAccep
 // same ok=false path, mirroring postgres.ReviewVerdictAcceptanceStore.
 // Revoke's own identical caller-side discipline.
 func RevokeAcceptance(ctx context.Context, store *postgres.ReviewVerdictAcceptanceStore, id, revokedBy pgtype.UUID, repoFullName string) (acceptance reviewverdict.Acceptance, ok bool, err error) {
+	if store == nil {
+		return reviewverdict.Acceptance{}, false, ErrAcceptanceStoreNotConfigured
+	}
 	row, err := store.Revoke(ctx, id, revokedBy, repoFullName)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -129,6 +158,9 @@ func RevokeAcceptance(ctx context.Context, store *postgres.ReviewVerdictAcceptan
 // ok=false (never an error) means no such acceptance exists in this
 // repo.
 func GetAcceptance(ctx context.Context, store *postgres.ReviewVerdictAcceptanceStore, id pgtype.UUID, repoFullName string) (acceptance reviewverdict.Acceptance, ok bool, err error) {
+	if store == nil {
+		return reviewverdict.Acceptance{}, false, ErrAcceptanceStoreNotConfigured
+	}
 	row, err := store.Get(ctx, id, repoFullName)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -143,6 +175,9 @@ func GetAcceptance(ctx context.Context, store *postgres.ReviewVerdictAcceptanceS
 // (repoFullName, prNumber), newest-first, bounded by limit -- the audit
 // view.
 func ListAcceptances(ctx context.Context, store *postgres.ReviewVerdictAcceptanceStore, repoFullName string, prNumber, limit int32) ([]reviewverdict.Acceptance, error) {
+	if store == nil {
+		return nil, ErrAcceptanceStoreNotConfigured
+	}
 	rows, err := store.List(ctx, repoFullName, prNumber, limit)
 	if err != nil {
 		return nil, err

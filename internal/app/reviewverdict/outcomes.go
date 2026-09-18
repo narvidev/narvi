@@ -33,8 +33,31 @@ import (
 // repo's own contradiction rate at 100% or "not yet computed". Both
 // claims are now accurate: httpapi.MergePullRequest (decisioninbox.go)
 // calls this immediately after a successful merge.
+//
+// MUST NEVER be called for a merge whose own RevalidateForMerge/
+// RevalidateForAutoMerge (internal/app/decisioninbox/revalidate.go)
+// reported viaAcceptance=true (finding F1, adversarial review) -- both
+// real callers gate on that flag and call RecordAcceptedOverride below
+// instead in that case. This function's own name and doc comment ARE the
+// contract "confirmed" analytics readers rely on: recording it for a
+// merge the engine itself refused, and only proceeded past because a
+// human's acceptance waived that refusal, would silently misrepresent an
+// override as the engine having been right -- exactly the harm §21.1b
+// names and the contradiction-rate signal §21.2 is calibrated on.
 func RecordConfirmed(ctx context.Context, deps Deps, repoFullName string, prNumber int32, headSHA string) {
 	recordOutcome(ctx, deps, repoFullName, prNumber, headSHA, reviewverdict.OutcomeConfirmed)
+}
+
+// RecordAcceptedOverride idempotently records that (repoFullName,
+// prNumber, headSHA) merged ONLY because an applicable
+// review_verdict_acceptances row waived the engine's own refusal
+// (finding F1, adversarial review) -- reviewverdict.
+// OutcomeAcceptedOverride's own doc comment. Called from the SAME two
+// merge-completion call sites as RecordConfirmed, in its place, whenever
+// RevalidateForMerge/RevalidateForAutoMerge reported viaAcceptance=true
+// for this merge. Best-effort, mirroring RecordConfirmed above.
+func RecordAcceptedOverride(ctx context.Context, deps Deps, repoFullName string, prNumber int32, headSHA string) {
+	recordOutcome(ctx, deps, repoFullName, prNumber, headSHA, reviewverdict.OutcomeAcceptedOverride)
 }
 
 // RecordOverridden idempotently records that (repoFullName, prNumber,

@@ -64,12 +64,19 @@ type GetReviewVerdictAcceptanceParams struct {
 	RepoFullName string      `json:"repo_full_name"`
 }
 
-// Looked up by the revoke endpoint (acceptance id comes straight off the
-// URL path, repoFullName off the route) -- SCOPED to repoFullName,
-// mirroring GetFalsePositivePattern's own identical "id alone is not
-// enough" audit-fix precedent (reviewfalsepositivepatterns.sql): a
+// Looked up by the revoke endpoint's own failed-revoke diagnosis path
+// (httpapi.RevokeReviewVerdictAcceptance) -- id and repoFullName both
+// arrive in that endpoint's JSON request body (POST
+// /api/decision-inbox/revoke-verdict-acceptance, restdtos.
+// RevokeReviewVerdictAcceptanceRequest), never off a URL path segment or
+// route (finding F10, adversarial review: this comment previously
+// described a route surface -- "acceptance id comes straight off the URL
+// path" -- this endpoint does not have; it is a flat POST with no path
+// parameters at all). SCOPED to repoFullName regardless, mirroring
+// GetFalsePositivePattern's own identical "id alone is not enough"
+// audit-fix precedent (reviewfalsepositivepatterns.sql): a
 // pattern/acceptance belonging to a DIFFERENT repo must never be
-// reachable through the wrong repo's own URL.
+// reachable through the wrong repo's own request.
 func (q *Queries) GetReviewVerdictAcceptance(ctx context.Context, arg GetReviewVerdictAcceptanceParams) (ReviewVerdictAcceptance, error) {
 	row := q.db.QueryRow(ctx, getReviewVerdictAcceptance, arg.ID, arg.RepoFullName)
 	var i ReviewVerdictAcceptance
@@ -95,7 +102,6 @@ func (q *Queries) GetReviewVerdictAcceptance(ctx context.Context, arg GetReviewV
 }
 
 const insertReviewVerdictAcceptance = `-- name: InsertReviewVerdictAcceptance :one
-
 INSERT INTO review_verdict_acceptances (
     repo_full_name, pr_number, verdict_id, attempt_id, head_sha,
     base_ref, base_sha, ancestor_chain, policy_version,
@@ -121,15 +127,16 @@ type InsertReviewVerdictAcceptanceParams struct {
 	AcceptedBy    pgtype.UUID `json:"accepted_by"`
 }
 
-// Queries backing ReviewVerdictAcceptanceStore ("human acceptance of a
-// verdict the engine refuses", §21.1b) -- see migrations/
-// 000135_review_verdict_acceptances.up.sql's own doc comment for the
-// table's full design.
 // APPEND-ONLY create (this table's own migration doc comment: "never
-// UPDATEd for a re-accept") -- a maintainer+ accepting the SAME verdict
-// twice (a double-click, a retried request) simply inserts a second row;
-// GetActiveReviewVerdictAcceptance's own "latest non-revoked row" read is
-// what a caller consults, never a uniqueness constraint here.
+// UPDATEd for a re-accept") -- but AT MOST ONE row may be ACTIVE
+// (non-revoked) for a given (repo_full_name, pr_number) at a time
+// (review_verdict_acceptances_one_active_idx, finding F2, adversarial
+// review: two live acceptances let a revocation of "the" active one
+// silently re-activate the other). ReviewVerdictAcceptanceStore.Insert
+// always calls SupersedeActiveReviewVerdictAcceptances above FIRST, as a
+// separate statement (see that query's own doc comment for why never a
+// single combined WITH-clause statement), so an ordinary re-accept never
+// collides with this INSERT's own unique-index check.
 func (q *Queries) InsertReviewVerdictAcceptance(ctx context.Context, arg InsertReviewVerdictAcceptanceParams) (ReviewVerdictAcceptance, error) {
 	row := q.db.QueryRow(ctx, insertReviewVerdictAcceptance,
 		arg.RepoFullName,
@@ -269,4 +276,49 @@ func (q *Queries) RevokeReviewVerdictAcceptance(ctx context.Context, arg RevokeR
 		&i.RevokedBy,
 	)
 	return i, err
+}
+
+const supersedeActiveReviewVerdictAcceptances = `-- name: SupersedeActiveReviewVerdictAcceptances :exec
+
+UPDATE review_verdict_acceptances
+SET revoked_at = now(), revoked_by = $3
+WHERE repo_full_name = $1 AND pr_number = $2 AND revoked_at IS NULL
+`
+
+type SupersedeActiveReviewVerdictAcceptancesParams struct {
+	RepoFullName string      `json:"repo_full_name"`
+	PrNumber     int32       `json:"pr_number"`
+	RevokedBy    pgtype.UUID `json:"revoked_by"`
+}
+
+// Queries backing ReviewVerdictAcceptanceStore ("human acceptance of a
+// verdict the engine refuses", §21.1b) -- see migrations/
+// 000135_review_verdict_acceptances.up.sql's own doc comment for the
+// table's full design.
+// Revokes every currently-active row for (repo_full_name, pr_number),
+// revoked_by the SAME accepting user (this is an automatic supersession
+// by a fresh accept, not a maintainer's own explicit revoke click, so
+// there is no separate revoker to name -- the accepting user is the only
+// actor this statement genuinely knows about). Called by
+// ReviewVerdictAcceptanceStore.Insert (postgres package) IMMEDIATELY
+// before InsertReviewVerdictAcceptance below, as two separate statements
+// -- NEVER as one WITH-clause statement (finding F2's own first attempt,
+// adversarial review: `WITH superseded AS (UPDATE ...) INSERT ...` reads
+// as atomic and is the obvious idiom, but PostgreSQL's WITH sub-statements
+// and the primary statement all execute against the SAME snapshot taken
+// at the START of the query -- verified against real Postgres in a
+// scratch database: the primary INSERT's own unique-constraint check does
+// NOT see the CTE's UPDATE having cleared the conflicting index entry,
+// and the whole statement fails with a spurious duplicate-key error on
+// the routine, common case this exists to allow -- a plain re-accept of
+// the SAME verdict). Two ordinary sequential statements (this one, then
+// the INSERT) do not share this hazard. review_verdict_acceptances_one_
+// active_idx is the actual invariant enforcer either way: a concurrent
+// accept racing between this statement and the INSERT below can still
+// make the INSERT fail on that constraint (a genuine, rare double-accept
+// race) -- an ordinary, retryable 500, never a silent violation of "at
+// most one active row".
+func (q *Queries) SupersedeActiveReviewVerdictAcceptances(ctx context.Context, arg SupersedeActiveReviewVerdictAcceptancesParams) error {
+	_, err := q.db.Exec(ctx, supersedeActiveReviewVerdictAcceptances, arg.RepoFullName, arg.PrNumber, arg.RevokedBy)
+	return err
 }

@@ -14,7 +14,7 @@ import (
 const countAutoApprovalOutcomesInWindow = `-- name: CountAutoApprovalOutcomesInWindow :one
 SELECT
     count(*) AS total,
-    count(*) FILTER (WHERE outcome = 'overridden') AS contested
+    count(*) FILTER (WHERE outcome IN ('overridden', 'accepted_override')) AS contested
 FROM auto_approval_outcomes
 WHERE repo_full_name = $1 AND decided_at > $2
   -- §30.7: a shadow-era outcome is recorded but never calibrates. See
@@ -33,12 +33,20 @@ type CountAutoApprovalOutcomesInWindowRow struct {
 }
 
 // The contradiction-rate rollup's own single bounded aggregate query --
-// total (every recorded outcome) and contested (outcome = 'overridden')
-// counts for repoFullName since sinceTime, in one round trip.
-// internal/domain/reviewverdict.ContradictionRate reduces these two plain
-// integers -- this query does no rate arithmetic itself (§11: no
-// floating-point policy math in a SQL query the domain layer should
-// instead own and unit-test).
+// total (every recorded outcome) and contested (outcome IN ('overridden',
+// 'accepted_override')) counts for repoFullName since sinceTime, in one
+// round trip. internal/domain/reviewverdict.ContradictionRate reduces
+// these two plain integers -- this query does no rate arithmetic itself
+// (§11: no floating-point policy math in a SQL query the domain layer
+// should instead own and unit-test).
+//
+// 'accepted_override' (finding F1, adversarial review) counts as
+// contested for the SAME reason 'overridden' does: a PR that merged only
+// because a human's acceptance waived the engine's own refusal
+// (internal/domain/reviewverdict.OutcomeAcceptedOverride's own doc
+// comment) is not evidence the engine's judgment stood, and excluding it
+// from this filter would mechanically drive the contradiction rate down
+// with every acceptance-driven merge -- exactly the failure §21.1b names.
 func (q *Queries) CountAutoApprovalOutcomesInWindow(ctx context.Context, arg CountAutoApprovalOutcomesInWindowParams) (CountAutoApprovalOutcomesInWindowRow, error) {
 	row := q.db.QueryRow(ctx, countAutoApprovalOutcomesInWindow, arg.RepoFullName, arg.DecidedAt)
 	var i CountAutoApprovalOutcomesInWindowRow

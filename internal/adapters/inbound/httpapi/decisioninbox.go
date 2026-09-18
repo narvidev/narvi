@@ -154,13 +154,26 @@ func decisionInboxItemToDTO(it decisioninbox.Item) restdtos.DecisionInboxItem {
 		hasChangesRequested := it.HasChangesRequested
 		dto.HasChangesRequested = &hasChangesRequested
 
-		// acceptanceJustification/acceptedAt (§21.1b) render only when an
-		// active, applicable acceptance actually exists for this row
-		// (Item.AcceptanceJustification's own doc comment: the empty
-		// string/zero time IS "no acceptance", mirroring lastHitAt's own
-		// "null iff hitCount is 0" precedent, FalsePositivePattern's wire
-		// shape) -- never a fabricated null-vs-empty-string distinction.
+		// verdictId (finding F3, adversarial review) renders whenever this
+		// PR has a posted review verdict of record -- the id a client
+		// names back on AcceptReviewVerdictRequest.VerdictId so
+		// accept-verdict can refuse a mismatch instead of silently binding
+		// to whatever verdict happens to be latest at request time.
+		if it.VerdictID != "" {
+			dto.VerdictId = &it.VerdictID
+		}
+
+		// acceptanceId/acceptanceJustification/acceptedAt (§21.1b) render
+		// only when an active, applicable acceptance actually exists for
+		// this row (Item.AcceptanceJustification's own doc comment: the
+		// empty string/zero time IS "no acceptance", mirroring
+		// lastHitAt's own "null iff hitCount is 0" precedent,
+		// FalsePositivePattern's wire shape) -- never a fabricated
+		// null-vs-empty-string distinction. acceptanceId (finding F11,
+		// adversarial review) is the id a client names back on
+		// RevokeReviewVerdictAcceptanceRequest.Id.
 		if it.AcceptanceJustification != "" {
+			dto.AcceptanceId = &it.AcceptanceID
 			dto.AcceptanceJustification = &it.AcceptanceJustification
 			acceptedAt := it.AcceptedAt
 			dto.AcceptedAt = &acceptedAt
@@ -349,7 +362,7 @@ func MergePullRequest(deps decisioninbox.Deps, sourceControl ports.SourceControl
 		token := string(plaintextToken)
 
 		revalidateCtx, cancel := context.WithTimeout(ctx, deps.Timeouts.GitHubListOpenPRsForUserTimeout)
-		eligible, headSHA, reason, err := decisioninbox.RevalidateForMerge(revalidateCtx, deps, sourceControl, identity.ExternalID, req.RepoFullName, req.PrNumber, token)
+		eligible, headSHA, reason, viaAcceptance, acceptanceID, err := decisioninbox.RevalidateForMerge(revalidateCtx, deps, sourceControl, identity.ExternalID, req.RepoFullName, req.PrNumber, token)
 		cancel()
 		if err != nil {
 			logger.Error("httpapi: revalidate pull request for merge failed", "error", err)
@@ -474,13 +487,40 @@ func MergePullRequest(deps decisioninbox.Deps, sourceControl ports.SourceControl
 		// (after the merge succeeds, before the audit-log write): a
 		// failure here must never claim the already-succeeded GitHub
 		// merge failed.
-		appreviewverdict.RecordConfirmed(ctx, deps.ReviewVerdict, req.RepoFullName, int32(req.PrNumber), headSHA)
+		//
+		// viaAcceptance (finding F1, adversarial review) is
+		// RevalidateForMerge's own report of whether THIS merge only
+		// happened because an applicable acceptance waived the engine's
+		// own refusal -- gates which outcome is recorded, never
+		// RecordConfirmed unconditionally: a merge the engine itself
+		// refused, and a human's acceptance let proceed, is not evidence
+		// the engine's judgment stood, and recording it as 'confirmed'
+		// would mechanically drive the contradiction rate down with
+		// every such merge -- the exact harm §21.1b names.
+		if viaAcceptance {
+			appreviewverdict.RecordAcceptedOverride(ctx, deps.ReviewVerdict, req.RepoFullName, int32(req.PrNumber), headSHA)
+		} else {
+			appreviewverdict.RecordConfirmed(ctx, deps.ReviewVerdict, req.RepoFullName, int32(req.PrNumber), headSHA)
+		}
 
-		if err := auditlog.Record(ctx, auditLog, actorUserID, "merge_pr", "pull_request", fmt.Sprintf("%s#%d", req.RepoFullName, req.PrNumber), map[string]any{
+		auditDetail := map[string]any{
 			"repo_full_name":   req.RepoFullName,
 			"pr_number":        req.PrNumber,
 			"merge_commit_sha": mergeSHA,
-		}); err != nil {
+		}
+		// acceptance_id/via_acceptance (finding F1, adversarial review):
+		// the merge_pr audit row carries the SAME acceptance fact just
+		// used to pick an outcome above, so an operator reading the audit
+		// log can see, without a join, that this merge proceeded only
+		// because a human waived the engine's own refusal -- absent
+		// entirely (never a fabricated false/"") when viaAcceptance is
+		// false, mirroring this codebase's own "omit, don't null-pad"
+		// convention for a fact that plainly does not apply.
+		if viaAcceptance {
+			auditDetail["via_acceptance"] = true
+			auditDetail["acceptance_id"] = acceptanceID
+		}
+		if err := auditlog.Record(ctx, auditLog, actorUserID, "merge_pr", "pull_request", fmt.Sprintf("%s#%d", req.RepoFullName, req.PrNumber), auditDetail); err != nil {
 			// The merge already succeeded on GitHub -- a logging failure
 			// here must never claim otherwise to the caller (mirrors
 			// §17.5's own "the merge already happened" posture for the
@@ -501,17 +541,23 @@ func MergePullRequest(deps decisioninbox.Deps, sourceControl ports.SourceControl
 // AUTHORISATION, never an override (that section's own words). Gated on
 // authz.ActionAcceptReviewVerdict (maintainer+, the SAME row as
 // ActionEditReviewVerdict/ActionConfigureAutoApprove -- action.go's own
-// doc comment). Binds a new review_verdict_acceptances row to
-// (repoFullName, prNumber)'s own CURRENT latest review_verdicts row,
-// resolved server-side at request time -- the caller never supplies a
-// verdict id, so a client holding a stale rendered queue can never
-// accept a verdict other than the one actually posted right now (the
-// SAME "never trust the client-rendered queue as authority" discipline
-// MergePullRequest's own re-validation-at-click already applies, §16.2/
-// §5.2). This endpoint does NOT itself re-run the live eligibility
-// engine (never a live SCM call): it only records the authorisation.
-// Whether it actually unblocks a merge is decided, fresh, by
-// autoapproval.ComputeEligibleWithAcceptance the next time a Merge is
+// doc comment). Binds a new review_verdict_acceptances row to the
+// review_verdicts row the caller NAMES via req.VerdictId (finding F3,
+// adversarial review -- CORRECTED: an earlier version of this endpoint
+// resolved (repoFullName, prNumber)'s own CURRENT latest verdict
+// server-side, with the caller never supplying a verdict id at all --
+// which let a maintainer authorise a DIFFERENT verdict than the one they
+// actually read, if a new attempt posted between their read and this
+// request. §21.1b's own contract is "binds to ONE verdict, one attempt
+// and one context" -- only the client that read that verdict can name
+// it, so this endpoint now requires VerdictId and refuses (409) on a
+// mismatch against (repoFullName, prNumber)'s own current latest
+// verdict, the SAME "never trust the client-rendered queue as authority"
+// discipline MergePullRequest's own re-validation-at-click already
+// applies, §16.2/§5.2). This endpoint does NOT itself re-run the live
+// eligibility engine (never a live SCM call): it only records the
+// authorisation. Whether it actually unblocks a merge is decided, fresh,
+// by autoapproval.ComputeEligibleWithAcceptance the next time a Merge is
 // attempted (RevalidateForMerge/RevalidateForAutoMerge, revalidate.go)
 // -- this handler never re-implements that decision, "never a second
 // authority" (CLAUDE.md).
@@ -545,6 +591,17 @@ func AcceptReviewVerdict(deps decisioninbox.Deps, auditLog *postgres.AuditLogSto
 			writeError(w, http.StatusBadRequest, "repoFullName and a positive prNumber are required")
 			return
 		}
+		// verdictId (finding F3, adversarial review) is REQUIRED: §21.1b's
+		// own contract is "binds to ONE verdict", and only the client that
+		// actually read that verdict can name it -- a server that
+		// resolves "current latest" on its own, with no verdict named by
+		// the caller, can silently accept a DIFFERENT verdict than the one
+		// a maintainer read, if a new attempt posted between their read
+		// and this request.
+		if strings.TrimSpace(req.VerdictId) == "" {
+			writeError(w, http.StatusBadRequest, "verdictId is required")
+			return
+		}
 		justification := strings.TrimSpace(req.Justification)
 		if justification == "" {
 			writeError(w, http.StatusBadRequest, "justification is required")
@@ -559,6 +616,17 @@ func AcceptReviewVerdict(deps decisioninbox.Deps, auditLog *postgres.AuditLogSto
 		}
 		if !hasVerdict {
 			writeError(w, http.StatusConflict, "this pull request has no review verdict of record")
+			return
+		}
+		// A mismatch (finding F3, adversarial review) means a new attempt
+		// posted a fresh verdict since the caller last read this PR --
+		// refuse rather than silently binding to whatever is latest now,
+		// the SAME "the rendered queue is never trusted as authority"
+		// discipline MergePullRequest's own re-validation-at-click already
+		// applies (§16.2/§5.2): the caller is about to authorise code it
+		// never actually saw.
+		if record.ID != req.VerdictId {
+			writeError(w, http.StatusConflict, "this pull request's review verdict has changed since it was read -- refresh and try again")
 			return
 		}
 

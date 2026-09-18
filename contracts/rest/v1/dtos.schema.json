@@ -4294,6 +4294,8 @@
         "isHandoff",
         "hasApprovingReview",
         "hasChangesRequested",
+        "verdictId",
+        "acceptanceId",
         "acceptanceJustification",
         "acceptedAt",
         "isRelease",
@@ -4430,6 +4432,22 @@
             "null"
           ],
           "description": "The PR's own current GitHub review-decision fact, reduced to each reviewer's LATEST review (so a reviewer who requested changes and has since re-reviewed and approved no longer counts here). UNLIKE hasApprovingReview above, this DOES gate an action: RevalidateForMerge treats a true value as a hard block on the Merge endpoint -- a client should use this field, not hasApprovingReview, to pre-disable/explain a disabled Merge action (this field previously did not exist on the wire at all, even though the fact it surfaces already hard-blocked the merge server-side). Set for any PR-shaped row, exactly like ciGreen above."
+        },
+        "verdictId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid",
+          "description": "review_verdicts.id for this PR's own CURRENT latest verdict, whenever one has been posted -- null for a PR with no review verdict of record. This is the id a client names back on AcceptReviewVerdictRequest.verdictId (finding F3, adversarial review): accept-verdict binds to the ONE verdict a maintainer actually read here, never to whichever verdict happens to be latest when the request arrives, and refuses (409) on a mismatch."
+        },
+        "acceptanceId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid",
+          "description": "The id of the acceptance named by acceptanceJustification below, set under the exact same conditions -- the id a client passes to RevokeReviewVerdictAcceptanceRequest.id (finding F11, adversarial review: before this field existed, no read surface ever returned an acceptance's own id, so revocation was reachable only by a client that had kept the 201 response body from the original accept-verdict call)."
         },
         "acceptanceJustification": {
           "type": [
@@ -4649,10 +4667,11 @@
     "AcceptReviewVerdictRequest": {
       "type": "object",
       "additionalProperties": false,
-      "description": "POST /api/decision-inbox/accept-verdict's own request body ('human acceptance of a verdict the engine refuses', §21.1b) -- binds a new acceptance to (repoFullName, prNumber)'s own CURRENT latest review_verdicts row, server-side, at request time; the caller never supplies a verdict id.",
+      "description": "POST /api/decision-inbox/accept-verdict's own request body ('human acceptance of a verdict the engine refuses', §21.1b) -- binds a new acceptance to (repoFullName, prNumber)'s own review_verdicts row NAMED by verdictId below (finding F3, adversarial review: an earlier version of this endpoint bound to whichever verdict was latest AT REQUEST TIME, server-resolved, never named by the caller -- so a maintainer could authorise a verdict that had already replaced the one they actually read; §21.1b's own contract is 'binds to ONE verdict', and only the client that read that ONE verdict can name it).",
       "required": [
         "repoFullName",
         "prNumber",
+        "verdictId",
         "justification"
       ],
       "properties": {
@@ -4661,6 +4680,11 @@
         },
         "prNumber": {
           "type": "integer"
+        },
+        "verdictId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "The id of the review_verdicts row the caller actually read and is accepting (DecisionInboxItem.verdictId, or ReviewReadoutLatestVerdict's own id) -- the server refuses (409) if this no longer matches (repoFullName, prNumber)'s own CURRENT latest verdict, rather than silently binding to whatever is latest now: a mismatch means a new attempt posted since the caller last read this PR, and the caller is about to authorise code it never saw."
         },
         "justification": {
           "type": "string",
@@ -4734,7 +4758,7 @@
         },
         "reason": {
           "type": "string",
-          "description": "The autoapproval.Reason ComputeEligible returned for this verdict at accept time (e.g. 'the verdict's shippable classification is not auto') -- display/audit only, never re-checked."
+          "description": "A best-effort, no-I/O classification of which waivable eligibility criterion this acceptance most likely addresses (e.g. 'the verdict's shippable classification is not auto') -- NOT itself computed by calling autoapproval.ComputeEligible (finding F8, adversarial review: this description, and three others, previously claimed it was); display/audit only, never re-checked. The authoritative eligibility decision is always re-derived live, at merge time, by autoapproval.ComputeEligibleWithAcceptance -- a wrong guess here changes no outcome, only what a human reading the audit trail sees."
         },
         "justification": {
           "type": "string"

@@ -87,23 +87,42 @@ type Item struct {
 	// HasApprovingReview.
 	HasChangesRequested bool
 
-	// AcceptanceJustification/AcceptedAt (§21.1b: "human acceptance of a
-	// verdict the engine refuses") are set iff an ACTIVE, APPLICABLE
-	// acceptance exists for this PR's own current verdict (internal/
-	// domain/reviewverdict.Acceptance.Applicable) -- a revoked
-	// acceptance, or one that no longer binds to the current verdict
-	// (a new attempt, a moved base, a changed ancestor chain), renders
-	// identically to no acceptance at all: both are the empty string /
-	// zero time, mirroring this package's own "absent fact -> zero
-	// value" convention elsewhere on this same struct (e.g. Findings/
-	// FindingsUnknown). Display only -- it never itself gates Kind
-	// (buildPROpenItem's own classification below is unaffected: an
-	// accepted PR still classifies needs_review, never ready_to_merge,
-	// because §21.1b's own acceptance is an authorisation for a human's
-	// OWN Merge click, never a reclassification of the engine's
-	// judgment) -- it exists so a maintainer scanning needs_review can
-	// SEE that this row's own eligibility refusal has already been
-	// authorised, and by whom, before clicking Merge.
+	// VerdictID is review_verdicts.id for this PR's own CURRENT latest
+	// verdict, whenever one has been posted (empty otherwise) -- set
+	// unconditionally alongside the acceptance-display fields below (the
+	// SAME GetLatest call already resolves it), so a client can name this
+	// exact verdict back on AcceptReviewVerdictRequest.VerdictId (finding
+	// F3, adversarial review: accept-verdict binds to the ONE verdict a
+	// caller actually read, never to whichever verdict happens to be
+	// latest when the accept request arrives).
+	VerdictID string
+
+	// AcceptanceID/AcceptanceJustification/AcceptedAt (§21.1b: "human
+	// acceptance of a verdict the engine refuses") are set iff an ACTIVE,
+	// APPLICABLE acceptance exists for this PR's own current verdict
+	// (internal/domain/reviewverdict.Acceptance.Applicable) AND its own
+	// recorded base ref/ancestor chain still match this PR's own current,
+	// already-fetched base ref/ancestor chain (finding F6, adversarial
+	// review: Applicable alone cannot see a moved base or a changed
+	// ancestor chain -- see acceptanceContextStillFresh's own doc comment,
+	// aggregate.go). A revoked acceptance, one that no longer binds to the
+	// current verdict, or one a moved base/changed ancestor chain has
+	// invalidated, renders identically to no acceptance at all: all three
+	// fields are the empty string / zero time, mirroring this package's
+	// own "absent fact -> zero value" convention elsewhere on this same
+	// struct (e.g. Findings/FindingsUnknown). Display only -- none of the
+	// three ever gates Kind (buildPROpenItem's own classification below is
+	// unaffected: an accepted PR still classifies needs_review, never
+	// ready_to_merge, because §21.1b's own acceptance is an authorisation
+	// for a human's OWN Merge click, never a reclassification of the
+	// engine's judgment) -- they exist so a maintainer scanning
+	// needs_review can SEE that this row's own eligibility refusal has
+	// already been authorised, by whom, and can name AcceptanceID back on
+	// RevokeReviewVerdictAcceptanceRequest.Id (finding F11, adversarial
+	// review: before this field existed, no read surface ever returned an
+	// acceptance's own id, so revocation was reachable only by a client
+	// that had kept the original 201 response body).
+	AcceptanceID            string
 	AcceptanceJustification string
 	AcceptedAt              time.Time
 

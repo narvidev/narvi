@@ -422,7 +422,13 @@ func newAutomergeTestRig(t *testing.T) *automergeTestRig {
 			RepoSettings:         narvipg.NewRepoSettingsStore(pool),
 			ReviewFindings:       narvipg.NewReviewFindingStore(pool),
 			AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool),
-			Timeouts:             platform.DefaultTimeouts(),
+			// Acceptances (finding F4's own test, adversarial review)
+			// backs the acceptance this rig's own worker-never-honors-it
+			// test seeds -- wired here rather than left nil so
+			// appreviewverdict.Accept has a real store to write to;
+			// every OTHER existing test in this file never touches it.
+			Acceptances: narvipg.NewReviewVerdictAcceptanceStore(pool),
+			Timeouts:    platform.DefaultTimeouts(),
 		},
 		auditLog: narvipg.NewAuditLogStore(pool),
 	}
@@ -624,6 +630,95 @@ func TestPumpOnce_Armed_MergesEligibleCandidate(t *testing.T) {
 	}
 	if total != 1 || contested != 0 {
 		t.Errorf("outcome counts = (total=%d, contested=%d), want (1, 0) -- the merge must record a 'confirmed' outcome", total, contested)
+	}
+}
+
+// TestPumpOnce_Armed_AcceptanceNeverHonored_DiffTooLarge_NeverMerges pins
+// finding F4 (adversarial review) directly: the unattended auto-merge
+// worker must NEVER consult review_verdict_acceptances at all, even for
+// an otherwise-eligible (Shippable==auto) candidate PR whose diff exceeds
+// this repo's own file-count threshold and whose OWN verdict has an
+// applicable acceptance on file waiving exactly that refusal
+// (autoapproval.ReasonDiffTooLarge -- the one waivable reason the
+// worker's own Shippable==auto candidate-list filter does NOT already
+// rule out, per ListLatestAutoApprovedInRepo's own doc comment: only
+// ReasonNotShippableAuto is unreachable there). §21.1b's own acceptance
+// is "a human chose to proceed despite it", authorising a human's NEXT
+// Merge click -- not arming a background worker to act on that judgment
+// indefinitely with nobody present. Deleting revalidateCore's own
+// honorAcceptance gate (i.e. making RevalidateForAutoMerge pass
+// honorAcceptance=true like RevalidateForMerge does) must make this test
+// fail: the PR would then merge unattended and record a outcome, where
+// this test asserts neither happens.
+func TestPumpOnce_Armed_AcceptanceNeverHonored_DiffTooLarge_NeverMerges(t *testing.T) {
+	rig := newAutomergeTestRig(t)
+	ctx := context.Background()
+	const repoFullName = "acme/automerge-armed-diff-too-large"
+
+	htmlURL := rig.seedEligiblePR(ctx, t, repoFullName, 4, "sha-4")
+	if _, err := rig.repoSettings.UpsertAutoMergeToggle(ctx, repoFullName, true); err != nil {
+		t.Fatalf("upsert auto-approval settings: %v", err)
+	}
+
+	record, hasVerdict, err := appreviewverdict.GetLatest(ctx, rig.reviewVerdict, repoFullName, 4)
+	if err != nil || !hasVerdict {
+		t.Fatalf("GetLatest: hasVerdict=%v err=%v", hasVerdict, err)
+	}
+	var verdictID pgtype.UUID
+	if err := verdictID.Scan(record.ID); err != nil {
+		t.Fatalf("scan verdict id: %v", err)
+	}
+	admin, err := narvipg.NewUserStore(rig.pool).Create(ctx, sqlcgen.CreateUserParams{PrimaryEmail: "diff-too-large-admin@example.com", DisplayName: "Admin", Role: sqlcgen.UserRoleAdmin})
+	if err != nil {
+		t.Fatalf("create admin user: %v", err)
+	}
+	if _, err := appreviewverdict.Accept(ctx, rig.reviewVerdict.Acceptances, appreviewverdict.AcceptInput{
+		RepoFullName:  repoFullName,
+		PRNumber:      4,
+		VerdictID:     verdictID,
+		HeadSHA:       record.HeadSHA,
+		Context:       record.Context,
+		Reason:        string(autoapproval.ReasonDiffTooLarge),
+		Justification: "Accepted despite the diff size -- a human's own next Merge click, never this worker.",
+		AcceptedBy:    admin.ID,
+	}); err != nil {
+		t.Fatalf("Accept() error = %v, want nil", err)
+	}
+
+	// changedFiles: one clean, non-sensitive path repeated past
+	// autoapproval's own default MaxFilesChanged (20) -- large enough to
+	// refuse on ReasonDiffTooLarge alone, isolated from every other
+	// criterion (no sensitive path touched).
+	changedFiles := make([]string, 50)
+	for i := range changedFiles {
+		changedFiles[i] = fmt.Sprintf("pkg/widgets/file_%d.go", i)
+	}
+	sc := &fakeAutoMergeSourceControl{
+		prsByKey: map[string]ports.OpenPR{
+			"acme/automerge-armed-diff-too-large#4": {
+				Owner: "acme", Repo: "automerge-armed-diff-too-large", Number: 4, HTMLURL: htmlURL,
+				HeadSHA: "sha-4", BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, CIConclusion: ports.CIConclusionSuccess,
+				ChangedFiles: changedFiles, ChangedFilesCount: len(changedFiles),
+			},
+		},
+		mergeSHA: "merged-commit-sha-should-never-be-used",
+	}
+	worker := rig.newWorker(t, sc)
+
+	if err := worker.PumpOnce(ctx, time.Now()); err != nil {
+		t.Fatalf("PumpOnce() error = %v, want nil", err)
+	}
+
+	if got := sc.mergeCallCount(); got != 0 {
+		t.Fatalf("MergePR call count = %d, want 0 -- an acceptance waiving ReasonDiffTooLarge must never authorise THIS unattended worker to merge", got)
+	}
+
+	total, contested, err := narvipg.NewAutoApprovalOutcomeStore(rig.pool).CountInWindow(ctx, repoFullName, pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true})
+	if err != nil {
+		t.Fatalf("count auto-approval outcomes: %v", err)
+	}
+	if total != 0 || contested != 0 {
+		t.Errorf("outcome counts = (total=%d, contested=%d), want (0, 0) -- no merge was attempted, so nothing should be recorded", total, contested)
 	}
 }
 

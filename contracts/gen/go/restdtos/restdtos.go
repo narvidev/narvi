@@ -12,8 +12,12 @@ import "unicode/utf8"
 
 // POST /api/decision-inbox/accept-verdict's own request body ('human acceptance of
 // a verdict the engine refuses', §21.1b) -- binds a new acceptance to
-// (repoFullName, prNumber)'s own CURRENT latest review_verdicts row, server-side,
-// at request time; the caller never supplies a verdict id.
+// (repoFullName, prNumber)'s own review_verdicts row NAMED by verdictId below
+// (finding F3, adversarial review: an earlier version of this endpoint bound to
+// whichever verdict was latest AT REQUEST TIME, server-resolved, never named by
+// the caller -- so a maintainer could authorise a verdict that had already
+// replaced the one they actually read; §21.1b's own contract is 'binds to ONE
+// verdict', and only the client that read that ONE verdict can name it).
 type AcceptReviewVerdictRequest struct {
 	// The accepting maintainer+'s own required, free-text explanation (§21.1b:
 	// 'carries author, justification'). Untrusted, human-authored content.
@@ -24,6 +28,14 @@ type AcceptReviewVerdictRequest struct {
 
 	// RepoFullName corresponds to the JSON schema field "repoFullName".
 	RepoFullName string `json:"repoFullName" yaml:"repoFullName" mapstructure:"repoFullName"`
+
+	// The id of the review_verdicts row the caller actually read and is accepting
+	// (DecisionInboxItem.verdictId, or ReviewReadoutLatestVerdict's own id) -- the
+	// server refuses (409) if this no longer matches (repoFullName, prNumber)'s own
+	// CURRENT latest verdict, rather than silently binding to whatever is latest now:
+	// a mismatch means a new attempt posted since the caller last read this PR, and
+	// the caller is about to authorise code it never saw.
+	VerdictId string `json:"verdictId" yaml:"verdictId" mapstructure:"verdictId"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -40,6 +52,9 @@ func (j *AcceptReviewVerdictRequest) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["repoFullName"]; raw != nil && !ok {
 		return fmt.Errorf("field repoFullName in AcceptReviewVerdictRequest: required")
+	}
+	if _, ok := raw["verdictId"]; raw != nil && !ok {
+		return fmt.Errorf("field verdictId in AcceptReviewVerdictRequest: required")
 	}
 	type Plain AcceptReviewVerdictRequest
 	var plain Plain
@@ -2603,6 +2618,14 @@ func (j *CreateWorkflowDefinitionRequest) UnmarshalJSON(value []byte) error {
 // -- flattening keeps every field here a plain, typed, nullable scalar, consistent
 // with every other kind-conditional field on this same object.
 type DecisionInboxItem struct {
+	// The id of the acceptance named by acceptanceJustification below, set under the
+	// exact same conditions -- the id a client passes to
+	// RevokeReviewVerdictAcceptanceRequest.id (finding F11, adversarial review:
+	// before this field existed, no read surface ever returned an acceptance's own
+	// id, so revocation was reachable only by a client that had kept the 201 response
+	// body from the original accept-verdict call).
+	AcceptanceId DecisionInboxItemAcceptanceId `json:"acceptanceId" yaml:"acceptanceId" mapstructure:"acceptanceId"`
+
 	// §21.1b's own 'human acceptance of a verdict the engine refuses': the accepting
 	// maintainer+'s own free-text justification, set iff an ACTIVE, APPLICABLE
 	// acceptance exists for this PR's own CURRENT verdict
@@ -2807,7 +2830,23 @@ type DecisionInboxItem struct {
 
 	// Title corresponds to the JSON schema field "title".
 	Title string `json:"title" yaml:"title" mapstructure:"title"`
+
+	// review_verdicts.id for this PR's own CURRENT latest verdict, whenever one has
+	// been posted -- null for a PR with no review verdict of record. This is the id a
+	// client names back on AcceptReviewVerdictRequest.verdictId (finding F3,
+	// adversarial review): accept-verdict binds to the ONE verdict a maintainer
+	// actually read here, never to whichever verdict happens to be latest when the
+	// request arrives, and refuses (409) on a mismatch.
+	VerdictId DecisionInboxItemVerdictId `json:"verdictId" yaml:"verdictId" mapstructure:"verdictId"`
 }
+
+// The id of the acceptance named by acceptanceJustification below, set under the
+// exact same conditions -- the id a client passes to
+// RevokeReviewVerdictAcceptanceRequest.id (finding F11, adversarial review: before
+// this field existed, no read surface ever returned an acceptance's own id, so
+// revocation was reachable only by a client that had kept the 201 response body
+// from the original accept-verdict call).
+type DecisionInboxItemAcceptanceId *string
 
 // §21.1b's own 'human acceptance of a verdict the engine refuses': the accepting
 // maintainer+'s own free-text justification, set iff an ACTIVE, APPLICABLE
@@ -3076,11 +3115,22 @@ type DecisionInboxItemRiskLabel *string
 // error.
 type DecisionInboxItemSessionId *string
 
+// review_verdicts.id for this PR's own CURRENT latest verdict, whenever one has
+// been posted -- null for a PR with no review verdict of record. This is the id a
+// client names back on AcceptReviewVerdictRequest.verdictId (finding F3,
+// adversarial review): accept-verdict binds to the ONE verdict a maintainer
+// actually read here, never to whichever verdict happens to be latest when the
+// request arrives, and refuses (409) on a mismatch.
+type DecisionInboxItemVerdictId *string
+
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *DecisionInboxItem) UnmarshalJSON(value []byte) error {
 	var raw map[string]interface{}
 	if err := json.Unmarshal(value, &raw); err != nil {
 		return err
+	}
+	if _, ok := raw["acceptanceId"]; raw != nil && !ok {
+		return fmt.Errorf("field acceptanceId in DecisionInboxItem: required")
 	}
 	if _, ok := raw["acceptanceJustification"]; raw != nil && !ok {
 		return fmt.Errorf("field acceptanceJustification in DecisionInboxItem: required")
@@ -3177,6 +3227,9 @@ func (j *DecisionInboxItem) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["title"]; raw != nil && !ok {
 		return fmt.Errorf("field title in DecisionInboxItem: required")
+	}
+	if _, ok := raw["verdictId"]; raw != nil && !ok {
+		return fmt.Errorf("field verdictId in DecisionInboxItem: required")
 	}
 	type Plain DecisionInboxItem
 	var plain Plain
@@ -9801,9 +9854,14 @@ type ReviewVerdictAcceptance struct {
 	// PrNumber corresponds to the JSON schema field "prNumber".
 	PrNumber int `json:"prNumber" yaml:"prNumber" mapstructure:"prNumber"`
 
-	// The autoapproval.Reason ComputeEligible returned for this verdict at accept
-	// time (e.g. 'the verdict's shippable classification is not auto') --
-	// display/audit only, never re-checked.
+	// A best-effort, no-I/O classification of which waivable eligibility criterion
+	// this acceptance most likely addresses (e.g. 'the verdict's shippable
+	// classification is not auto') -- NOT itself computed by calling
+	// autoapproval.ComputeEligible (finding F8, adversarial review: this description,
+	// and three others, previously claimed it was); display/audit only, never
+	// re-checked. The authoritative eligibility decision is always re-derived live,
+	// at merge time, by autoapproval.ComputeEligibleWithAcceptance -- a wrong guess
+	// here changes no outcome, only what a human reading the audit trail sees.
 	Reason string `json:"reason" yaml:"reason" mapstructure:"reason"`
 
 	// RepoFullName corresponds to the JSON schema field "repoFullName".
