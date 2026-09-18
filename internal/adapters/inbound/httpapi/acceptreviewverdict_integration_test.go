@@ -89,6 +89,86 @@ func TestAcceptReviewVerdict_HappyPath(t *testing.T) {
 	}
 }
 
+// TestAcceptReviewVerdict_Supersede_RecordsDistinctAuditRow pins finding
+// F4 (adversarial review) end to end over HTTP: a SECOND accept for the
+// SAME pull request supersedes the first (Accept's own doc comment), and
+// that supersession must leave its OWN audited fact --
+// review_verdict.accept_supersedes_prior, naming the superseded
+// acceptance's own id -- never just a second review_verdict.accept entry
+// that makes the first acceptance look like it simply vanished. Before
+// this fix, the ONLY audit row was review_verdict.accept by the second
+// accepter, whose detail never named the first acceptance at all.
+func TestAcceptReviewVerdict_Supersede_RecordsDistinctAuditRow(t *testing.T) {
+	rig := newDecisionInboxTestRig(t, &fakeMergeSourceControl{})
+	ctx := context.Background()
+
+	_, token := rig.createAuthenticatedUser(ctx, t, sqlcgen.UserRoleMaintainer)
+	const repoFullName = "acme/accept-verdict-supersede-audit"
+	rig.seedAutoApprovedVerdict(ctx, t, repoFullName, 509, "headsha509")
+
+	record, hasVerdict, err := appreviewverdict.GetLatest(ctx, appreviewverdict.Deps{ReviewVerdicts: rig.reviewVerdicts}, repoFullName, 509)
+	if err != nil || !hasVerdict {
+		t.Fatalf("GetLatest: hasVerdict=%v err=%v", hasVerdict, err)
+	}
+
+	firstBody, err := json.Marshal(restdtos.AcceptReviewVerdictRequest{
+		RepoFullName: repoFullName, PrNumber: 509, VerdictId: record.ID, Justification: "First acceptance -- about to be superseded.",
+	})
+	if err != nil {
+		t.Fatalf("marshal first request: %v", err)
+	}
+	var first restdtos.ReviewVerdictAcceptance
+	if status := rig.doJSON(t, http.MethodPost, "/api/decision-inbox/accept-verdict", firstBody, &first, token); status != http.StatusCreated {
+		t.Fatalf("first accept status = %d, want %d", status, http.StatusCreated)
+	}
+
+	secondBody, err := json.Marshal(restdtos.AcceptReviewVerdictRequest{
+		RepoFullName: repoFullName, PrNumber: 509, VerdictId: record.ID, Justification: "Second acceptance -- supersedes the first.",
+	})
+	if err != nil {
+		t.Fatalf("marshal second request: %v", err)
+	}
+	var second restdtos.ReviewVerdictAcceptance
+	if status := rig.doJSON(t, http.MethodPost, "/api/decision-inbox/accept-verdict", secondBody, &second, token); status != http.StatusCreated {
+		t.Fatalf("second accept status = %d, want %d", status, http.StatusCreated)
+	}
+	if second.Id == first.Id {
+		t.Fatalf("second accept returned the SAME id as the first (%s) -- Accept must always insert a NEW row", first.Id)
+	}
+
+	entries, err := narvipg.NewAuditLogStore(rig.pool).List(ctx, 20, 0)
+	if err != nil {
+		t.Fatalf("list audit log: %v", err)
+	}
+
+	acceptCount := 0
+	foundSupersede := false
+	for _, e := range entries {
+		switch e.Action {
+		case "review_verdict.accept":
+			if e.ResourceID == first.Id || e.ResourceID == second.Id {
+				acceptCount++
+			}
+		case "review_verdict.accept_supersedes_prior":
+			var detail struct {
+				SupersededAcceptanceID string `json:"superseded_acceptance_id"`
+			}
+			if err := json.Unmarshal(e.DetailJson, &detail); err != nil {
+				t.Fatalf("unmarshal accept_supersedes_prior detail: %v", err)
+			}
+			if e.ResourceID == second.Id && detail.SupersededAcceptanceID == first.Id {
+				foundSupersede = true
+			}
+		}
+	}
+	if acceptCount != 2 {
+		t.Errorf("review_verdict.accept audit rows for this test's own two acceptances = %d, want 2", acceptCount)
+	}
+	if !foundSupersede {
+		t.Error("no review_verdict.accept_supersedes_prior audit row found naming the first acceptance as superseded by the second -- finding F4, adversarial review: a supersession must not vanish from the audit trail")
+	}
+}
+
 // TestAcceptReviewVerdict_Member_Returns403 pins §13.3 row 5's own
 // admin/maintainer-only gate -- a member (or viewer) may never accept a
 // refused verdict.
