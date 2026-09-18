@@ -51,12 +51,14 @@ func unmarshalCronTriggerConfig(raw []byte) (domainautomation.CronTriggerConfig,
 // function's own "review fix" paragraph below), attempts to claim the
 // CURRENT minute bucket (ClaimCronFire's CAS) and, on winning it, calls
 // CreateInvocation with a fresh snapshot of the automation's own current
-// repos as targets -- mirrors invocationenqueue.go's own doc comment:
-// "§8.4's own future trigger evaluator is expected to check this same
-// status before ever calling CreateInvocation" -- ListActiveCronAutomations'
-// own "AND status = 'active'" filter is exactly that check, evaluated fresh
-// every tick (a paused automation simply stops appearing in this list, with
-// no separate gate needed).
+// repos as targets -- ListActiveCronAutomations' own "AND status = 'active'"
+// filter is the SAME "check this automation is still active before ever
+// calling CreateInvocation" convention every trigger evaluator in this
+// package now shares (DispatchGitHubWebhookEvent's own
+// ListActiveGitHubAutomations, DispatchLinearWebhookEvent's own
+// ListActiveLinearAutomations), evaluated fresh every tick (a paused
+// automation simply stops appearing in this list, with no separate gate
+// needed).
 //
 // # Review fix: catch-up window, not a point-in-time check
 //

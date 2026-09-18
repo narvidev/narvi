@@ -146,6 +146,20 @@ func (s *AutomationStore) ListActiveCronAutomations(ctx context.Context) ([]sqlc
 	return s.q.ListActiveCronAutomations(ctx)
 }
 
+// ListActiveGitHubAutomations returns every active, github-triggered
+// automation -- backs the live GitHub webhook dispatch path (§8.4,
+// app/automation's own githubdispatch.go).
+func (s *AutomationStore) ListActiveGitHubAutomations(ctx context.Context) ([]sqlcgen.Automation, error) {
+	return s.q.ListActiveGitHubAutomations(ctx)
+}
+
+// ListActiveLinearAutomations returns every active, linear-triggered
+// automation -- backs the live Linear webhook dispatch path (§8.4,
+// app/automation's own lineardispatch.go).
+func (s *AutomationStore) ListActiveLinearAutomations(ctx context.Context) ([]sqlcgen.Automation, error) {
+	return s.q.ListActiveLinearAutomations(ctx)
+}
+
 // ClaimCronFire is the cron trigger pump's own per-automation CAS guard --
 // see ClaimCronFire's own generated doc comment. pgx.ErrNoRows means this
 // automation already fired for the given minute bucket (a concurrent tick

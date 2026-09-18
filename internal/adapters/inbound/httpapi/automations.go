@@ -4,9 +4,11 @@
 // 000055_automations_triggers_and_extras.up.sql) -- §3.5 ("automations:
 // engine") shipped the fan-out/reconcile/sweep engine ENGINE-ONLY, with no
 // HTTP surface at all (verified directly: no automations.go existed in
-// this package before this Step) -- invocationenqueue.go's own doc comment
-// already anticipated this: "§8.4's own future trigger evaluator is
-// expected to call [CreateInvocation] unchanged once it exists."
+// this package before this Step) -- every trigger evaluator this codebase
+// now has (the cron pump, live GitHub/Linear webhook dispatch, and the
+// generic webhook trigger, internal/app/automation's own doc.go) calls
+// invocationenqueue.go's own CreateInvocation unchanged, exactly as that
+// function's own doc comment anticipated before any of them existed.
 //
 // Seven routes, all mounted behind auth.Middleware (cmd/control-plane/
 // main.go) like every other browser-facing REST route in this package:
@@ -419,6 +421,12 @@ type githubTriggerConfigWire struct {
 	Event  string `json:"event"`
 	Action string `json:"action,omitempty"`
 	Label  string `json:"label,omitempty"`
+	// Name/Conclusion (§8.4): the check_run/status condition-builder
+	// fields -- see domainautomation.GitHubTriggerConfig.Name/Conclusion's
+	// own doc comments for what each normalizes across the two providers'
+	// own differently-named equivalent fields.
+	Name       string `json:"name,omitempty"`
+	Conclusion string `json:"conclusion,omitempty"`
 }
 type linearTriggerConfigWire struct {
 	EventType string `json:"eventType"`
@@ -462,11 +470,11 @@ func buildTriggerConfig(triggerType domainautomation.TriggerType, raw *json.RawM
 				return nil, errors.New("malformed github trigger config")
 			}
 		}
-		cfg := domainautomation.GitHubTriggerConfig{Event: wire.Event, Action: wire.Action, Label: wire.Label}
+		cfg := domainautomation.GitHubTriggerConfig{Event: wire.Event, Action: wire.Action, Label: wire.Label, Name: wire.Name, Conclusion: wire.Conclusion}
 		if err := domainautomation.ValidateGitHubTriggerConfig(cfg); err != nil {
 			return nil, err
 		}
-		return json.Marshal(githubTriggerConfigWire{Event: cfg.Event, Action: cfg.Action, Label: cfg.Label})
+		return json.Marshal(githubTriggerConfigWire{Event: cfg.Event, Action: cfg.Action, Label: cfg.Label, Name: cfg.Name, Conclusion: cfg.Conclusion})
 
 	case domainautomation.TriggerTypeLinear:
 		var wire linearTriggerConfigWire

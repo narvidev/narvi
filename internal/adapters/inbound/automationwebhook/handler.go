@@ -17,10 +17,11 @@
 // fresh snapshot of the automation's own current repos -- this endpoint's
 // own "condition" IS successful authentication; there is no further
 // per-request filter to evaluate (unlike the GitHub/Linear trigger types,
-// whose own condition -- event/action/label or event/action/team -- IS
-// modeled and validated, internal/domain/automation's own trigger.go, but
-// not live-dispatched by this Step; see internal/domain/automation/doc.go
-// for the full reasoning).
+// whose own condition -- event/action/label/name/conclusion or
+// event/action/team -- IS modeled, validated, AND live-dispatched,
+// internal/domain/automation's own trigger.go/dispatch.go plus
+// internal/app/automation's own githubdispatch.go/lineardispatch.go; see
+// internal/domain/automation/doc.go for the full design).
 //
 // # Why this is its own package, not internal/adapters/inbound/httpapi
 //

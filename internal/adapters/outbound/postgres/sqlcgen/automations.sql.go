@@ -309,6 +309,110 @@ func (q *Queries) ListActiveCronAutomations(ctx context.Context) ([]Automation, 
 	return items, nil
 }
 
+const listActiveGitHubAutomations = `-- name: ListActiveGitHubAutomations :many
+SELECT id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary FROM automations
+WHERE trigger_type = 'github' AND status = 'active'
+ORDER BY id ASC
+`
+
+// Backs the live GitHub webhook dispatch path (§8.4, app/automation's
+// own githubdispatch.go, called inline from internal/adapters/inbound/
+// github's own handler.go) -- every active, github-triggered automation,
+// evaluated against each dispatchable webhook delivery. Mirrors
+// ListActiveCronAutomations' own shape exactly, one row over, ordered by
+// id only for deterministic test output (unlike the cron pump, there is no
+// "last fired" column this trigger type advances).
+func (q *Queries) ListActiveGitHubAutomations(ctx context.Context) ([]Automation, error) {
+	rows, err := q.db.Query(ctx, listActiveGitHubAutomations)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Automation
+	for rows.Next() {
+		var i Automation
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Prompt,
+			&i.Repos,
+			&i.Status,
+			&i.ConsecutiveFailures,
+			&i.CreatedBy,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.TriggerType,
+			&i.TriggerConfig,
+			&i.WebhookTokenHash,
+			&i.LastCronFiredAt,
+			&i.SandboxPathScope,
+			&i.SandboxMockConfigured,
+			&i.SandboxContractsPath,
+			&i.EnvVars,
+			&i.LastRunAt,
+			&i.LastRunStatus,
+			&i.ArtifactSummary,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listActiveLinearAutomations = `-- name: ListActiveLinearAutomations :many
+SELECT id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary FROM automations
+WHERE trigger_type = 'linear' AND status = 'active'
+ORDER BY id ASC
+`
+
+// The Linear twin of ListActiveGitHubAutomations immediately above --
+// backs app/automation's own lineardispatch.go, called inline from
+// internal/adapters/inbound/linear's own webhook.go.
+func (q *Queries) ListActiveLinearAutomations(ctx context.Context) ([]Automation, error) {
+	rows, err := q.db.Query(ctx, listActiveLinearAutomations)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Automation
+	for rows.Next() {
+		var i Automation
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Prompt,
+			&i.Repos,
+			&i.Status,
+			&i.ConsecutiveFailures,
+			&i.CreatedBy,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.TriggerType,
+			&i.TriggerConfig,
+			&i.WebhookTokenHash,
+			&i.LastCronFiredAt,
+			&i.SandboxPathScope,
+			&i.SandboxMockConfigured,
+			&i.SandboxContractsPath,
+			&i.EnvVars,
+			&i.LastRunAt,
+			&i.LastRunStatus,
+			&i.ArtifactSummary,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAutomations = `-- name: ListAutomations :many
 SELECT id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary FROM automations
 WHERE ($1::uuid IS NULL OR created_by = $1)

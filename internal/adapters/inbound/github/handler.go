@@ -11,6 +11,7 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/app/automation"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/releasereview"
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
@@ -298,6 +299,28 @@ type Config struct {
 	ReleaseLabel         string
 	ReleaseBranchPattern string
 
+	// Automations/AutomationInvocations (§8.4, "automations never
+	// dispatch on a real webhook"): the live-dispatch wiring
+	// internal/domain/automation/doc.go's own §8.4 section named as
+	// deliberately not done at first -- MatchesGitHubTrigger existed,
+	// fully modeled and tested, called by nothing outside that package.
+	// dispatchAutomationsBestEffort (automationdispatch.go) is the ONE
+	// call site that uses these; see that function's own doc comment for
+	// the full "additional, independent consumer of this same delivery"
+	// design and its panic-isolation. Nil-safe: nil (this package's own
+	// handler_test.go, or any other minimal wiring that doesn't care
+	// about this Step) simply skips automation dispatch entirely, exactly
+	// like every other optional Config field above. Typed as the narrow
+	// automation.GitHubTriggerLister/automation.InvocationCreator
+	// interfaces (never the concrete *postgres.AutomationStore/
+	// *postgres.AutomationInvocationStore types) so a test can inject a
+	// fake -- including one that deliberately panics, to prove dispatch
+	// failure isolation. *postgres.AutomationStore/*postgres.
+	// AutomationInvocationStore (cmd/control-plane/main.go, the SAME
+	// instances automationEngine already uses) satisfy these directly.
+	Automations           automation.GitHubTriggerLister
+	AutomationInvocations automation.InvocationCreator
+
 	// Timers ("review: automatic re-review on new commits",
 	// §24.1) backs the NEW `pull_request`/action=="synchronize" lane
 	// (pullrequestsynchronize.go): the exported postgres.TimerStore.Upsert
@@ -376,6 +399,20 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 		}
 
 		eventType := r.Header.Get("X-GitHub-Event")
+
+		// §8.4 ("automations never dispatch on a real webhook"): an
+		// ADDITIONAL, independent consumer of this SAME already-claimed
+		// delivery -- deliberately BEFORE every lane below (the merge-gate
+		// capture, the synchronize lane, the capture commands, and
+		// parseMention's own @mention pipeline), and unconditional: an
+		// event that both mentions the bot AND matches an automation must
+		// do both, and this call's own failure/panic must never suppress
+		// any lane below it. See dispatchAutomationsBestEffort's own doc
+		// comment (automationdispatch.go) for the full design, including
+		// the closed, typed event-category allowlist
+		// (domainautomation.GitHubDispatchAllowlist) it enforces before
+		// ever evaluating a single trigger.
+		dispatchAutomationsBestEffort(ctx, logger, cfg, eventType, body)
 
 		// (§31.7's own G4 arming write): captured for EVERY `pull_request`
 		// "closed" event, unconditionally -- deliberately NOT gated behind

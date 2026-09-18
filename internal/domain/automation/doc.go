@@ -118,24 +118,56 @@
 //     automation_triggers side table -- mockups.html's own Automations view
 //     shows exactly one trigger per automation row, confirming this shape
 //     rather than guessing it. GitHub/Linear's own condition (event/action/
-//     label or event/action/team filter) is fully modeled AND validated
-//     here (MatchesGitHubTrigger/MatchesLinearTrigger) -- but live dispatch,
-//     wiring a call to either matcher into the existing, already-merged
-//     GitHub/Linear webhook ingress handlers (internal/adapters/inbound/
-//     github/handler.go, internal/adapters/inbound/linear/webhook.go), is
-//     NOT done in this Step. Verified directly: GitHub's own handler is
-//     entirely tuned to @mention detection (parseMention) plus one
-//     PR-closed merge-gate special case, never a generic "any repo event"
-//     dispatch point; Linear's own handler explicitly ignores every webhook
-//     category other than AgentSessionEvent ("linear: ignoring non-
-//     AgentSessionEvent webhook category"). Deciding which event categories
-//     a generic automation trigger should even be subscribed to/dispatched
-//     through is a real, separate design question neither handler answers
-//     today -- a genuine architectural fork this Step resolves
-//     conservatively (model + validate the condition fully now; leave live
-//     ingress wiring, a small and clearly-scoped follow-up once that
-//     subscription question is answered, for later) rather than guessing at
-//     an answer and reshaping either large, sensitive, already-tested file.
+//     label/name/conclusion or event/action/team filter) is fully modeled,
+//     validated, AND (a later closing pass) LIVE-DISPATCHED: an inbound
+//     GitHub/Linear webhook now reaches MatchesGitHubTrigger/
+//     MatchesLinearTrigger for real, through internal/app/automation's own
+//     githubdispatch.go/lineardispatch.go, called inline from the existing,
+//     already-merged GitHub/Linear webhook ingress handlers
+//     (internal/adapters/inbound/github/handler.go's own
+//     dispatchAutomationsBestEffort call site, internal/adapters/inbound/
+//     linear/webhook.go's own identical one).
+//
+//     The architectural fork this package's own earlier writeup left open --
+//     WHICH event categories a generic automation trigger is even
+//     subscribed to, given GitHub's handler is entirely tuned to @mention
+//     detection plus one PR-closed merge-gate special case, and Linear's
+//     ignores every category but AgentSessionEvent -- is resolved here, in
+//     dispatch.go, as an explicit, closed, typed register rather than
+//     "whatever arrives": GitHubDispatchAllowlist (pull_request, issues,
+//     issue_comment, push, check_run, status) and LinearDispatchAllowlist
+//     (Issue, Comment -- AgentSessionEvent deliberately excluded, since that
+//     category already belongs to Linear's own existing agent-session
+//     pipeline). ClassifyGitHubDispatch/ClassifyLinearDispatch return a
+//     named GitHubDispatchSkipReason/LinearDispatchSkipReason for anything
+//     outside the register, logged at the call site rather than silently
+//     dropped -- expanding either allowlist is a deliberate, reviewed source
+//     edit, never an implicit consequence of a new webhook category this
+//     deployment happens to start receiving. Automation dispatch is an
+//     ADDITIONAL, independent consumer of the same already-deduplicated
+//     delivery the @mention/AgentSessionEvent pipelines already process --
+//     never a replacement for either, and a panic or error inside dispatch
+//     is recovered and logged rather than allowed to suppress them (see
+//     each adapter's own dispatchAutomationsBestEffort doc comment).
+//
+//     dispatch.go ALSO answers the second question live dispatch raises the
+//     moment a trigger's own filter matches: WHICH of an automation's own
+//     configured target repos does a given event concern?
+//     TargetMatchesGitHubEvent scopes by repo (RepoFullNameFromCloneURL,
+//     comparing an automation's own Target.URL against the event's
+//     repository.full_name) and, when a target's own Branch is set, by
+//     branch -- and this is where the branch-CONTAINS-vs-branch-TIP trap is
+//     closed: a GitHub `status` event's own branches[] field lists every
+//     branch that CONTAINS the commit, never the branch whose CURRENT TIP
+//     it is, so membership is decided by TipBranchNames (branches[i].
+//     HeadSHA == the event's own SHA) and NEVER by scanning branches[] for a
+//     matching NAME alone -- a branch scoped target whose own branch merely
+//     contains an ancestor commit must not fire for it. Deduplication
+//     reuses the ALREADY-ESTABLISHED webhookDeliveryStore.Claim/Release
+//     mechanism the @mention/AgentSessionEvent pipelines already dedupe
+//     redeliveries with (§5.1) -- no second, independently-invented
+//     dedup mechanism exists for automation dispatch.
+//
 //   - cron.go: a small, honest, fully-tested 5-field cron matcher
 //     (CronMatches/ValidateCronExpr) -- standard vixie-cron field
 //     vocabulary (minute hour day-of-month month day-of-week; *, N, A-B,
@@ -145,6 +177,7 @@
 //     special case). Pure: the caller (app/automation's own new trigger
 //     pump) supplies `now`, exactly like IsOrphaned already does for the
 //     recovery sweep.
+//
 //   - sandboxsettings.go: SandboxSettings, the exact same path_scope/
 //     mock_configured/contracts_path attributes environment.Environment
 //     already carries for an ordinary session, namespaced onto an
@@ -153,10 +186,12 @@
 //     ValidateSandboxSettings reuses environment.ValidatePathScope/
 //     ValidateContractsPath directly, never a second, independently-
 //     maintained copy of either check.
+//
 //   - envvar.go: EnvVar, §8.4's own "per-automation env vars" -- PLAIN,
 //     non-secret configuration only (see this section's own trailing
 //     paragraph below for why per-automation SECRETS are a different,
 //     deliberately unbuilt thing).
+//
 //   - summary.go: BuildArtifactSummary, a deterministic, MECHANICALLY
 //     generated one-line sentence over already-persisted, typed
 //     invocation-outcome data (target names, succeeded/failed counts) --

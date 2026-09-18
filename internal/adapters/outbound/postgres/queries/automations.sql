@@ -60,6 +60,26 @@ SELECT * FROM automations
 WHERE trigger_type = 'cron' AND status = 'active'
 ORDER BY last_cron_fired_at ASC NULLS FIRST;
 
+-- name: ListActiveGitHubAutomations :many
+-- Backs the live GitHub webhook dispatch path (§8.4, app/automation's
+-- own githubdispatch.go, called inline from internal/adapters/inbound/
+-- github's own handler.go) -- every active, github-triggered automation,
+-- evaluated against each dispatchable webhook delivery. Mirrors
+-- ListActiveCronAutomations' own shape exactly, one row over, ordered by
+-- id only for deterministic test output (unlike the cron pump, there is no
+-- "last fired" column this trigger type advances).
+SELECT * FROM automations
+WHERE trigger_type = 'github' AND status = 'active'
+ORDER BY id ASC;
+
+-- name: ListActiveLinearAutomations :many
+-- The Linear twin of ListActiveGitHubAutomations immediately above --
+-- backs app/automation's own lineardispatch.go, called inline from
+-- internal/adapters/inbound/linear's own webhook.go.
+SELECT * FROM automations
+WHERE trigger_type = 'linear' AND status = 'active'
+ORDER BY id ASC;
+
 -- name: ClaimCronFire :one
 -- The CAS half of the cron trigger pump's own per-automation fire guard:
 -- "UPDATE ... WHERE last_cron_fired_at IS NULL OR last_cron_fired_at <
