@@ -71,7 +71,7 @@ type DeliveryInvocationCreator interface {
 // target-validation/marshal steps exactly, but creates (or finds) the
 // invocation keyed on (automationID, provider, deliveryID) via
 // invocations.CreateForDelivery's own ON CONFLICT idiom (migrations/
-// 000135_automation_invocations_source_delivery.up.sql), so a redelivery
+// 000136_automation_invocations_source_delivery.up.sql), so a redelivery
 // of the SAME (provider, deliveryID) for the SAME automation can NEVER
 // create a second invocation.
 //

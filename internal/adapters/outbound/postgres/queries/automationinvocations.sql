@@ -25,7 +25,7 @@ WHERE id = $1;
 -- -- a deliberate, self-referential no-op update (automation_id is set
 -- back to its own current value) on conflict against
 -- automation_invocations_source_delivery_uniq (migrations/
--- 000135_automation_invocations_source_delivery.up.sql), so RETURNING
+-- 000136_automation_invocations_source_delivery.up.sql), so RETURNING
 -- always yields exactly one row whether this call just inserted a fresh
 -- invocation or found an already-created one from an earlier delivery of
 -- the SAME (automation_id, provider, delivery_id) -- a real webhook

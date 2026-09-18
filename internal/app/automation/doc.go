@@ -190,7 +190,7 @@
 //     unrelated to whether automation dispatch itself already succeeded --
 //     so automation dispatch needs (and, since this fix, has) its OWN
 //     idempotency, keyed on (automation_id, provider, delivery_id)
-//     (migrations/000135_automation_invocations_source_delivery.up.sql),
+//     (migrations/000136_automation_invocations_source_delivery.up.sql),
 //     independent of that claim's own lifetime.
 //
 // Both entry points share the identical minimal, durable "an invocation

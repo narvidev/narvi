@@ -220,7 +220,7 @@
 //     delivery too. Each invocation created by live dispatch now carries
 //     its own durable (provider, delivery_id) identity
 //     (automation_invocations.source_provider/source_delivery_id,
-//     migrations/000135_automation_invocations_source_delivery.up.sql),
+//     migrations/000136_automation_invocations_source_delivery.up.sql),
 //     made idempotent via the SAME "INSERT ... ON CONFLICT ... RETURNING
 //     (xmax = 0) AS inserted" idiom ClaimWebhookDelivery itself already
 //     establishes (app/automation's own CreateInvocationForDelivery,
