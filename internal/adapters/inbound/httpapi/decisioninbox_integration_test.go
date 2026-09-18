@@ -260,7 +260,12 @@ func newDecisionInboxTestRig(t *testing.T, sourceControl ports.SourceControl) *d
 			RepoSettings:         narvipg.NewRepoSettingsStore(pool),
 			ReviewFindings:       reviewFindings,
 			AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool),
-			Timeouts:             platform.DefaultTimeouts(),
+			// Acceptances ("human acceptance of a verdict the engine
+			// refuses", §21.1b) backs AcceptReviewVerdict/
+			// RevokeReviewVerdictAcceptance below, and revalidateCore's
+			// own GetActiveAcceptance/Applicable check.
+			Acceptances: narvipg.NewReviewVerdictAcceptanceStore(pool),
+			Timeouts:    platform.DefaultTimeouts(),
 		},
 	}
 	auditLog := narvipg.NewAuditLogStore(pool)
@@ -270,6 +275,8 @@ func newDecisionInboxTestRig(t *testing.T, sourceControl ports.SourceControl) *d
 		r.Use(auth.Middleware(userSessions, users))
 		r.Get("/", httpapi.ListDecisionInbox(deps))
 		r.Post("/merge", httpapi.MergePullRequest(deps, sourceControl, auditLog))
+		r.Post("/accept-verdict", httpapi.AcceptReviewVerdict(deps, auditLog))
+		r.Post("/revoke-verdict-acceptance", httpapi.RevokeReviewVerdictAcceptance(deps, auditLog))
 	})
 
 	server := httptest.NewServer(router)

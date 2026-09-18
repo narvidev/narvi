@@ -2416,6 +2416,14 @@ export interface DecisionInboxItem {
    */
   hasChangesRequested: boolean | null;
   /**
+   * §21.1b's own 'human acceptance of a verdict the engine refuses': the accepting maintainer+'s own free-text justification, set iff an ACTIVE, APPLICABLE acceptance exists for this PR's own CURRENT verdict (internal/domain/reviewverdict.Acceptance.Applicable) -- null for a PR that was never accepted, whose acceptance was since revoked, or whose acceptance no longer binds to the current verdict (a new attempt, a moved base, a changed ancestor chain -- §21.1b's own three invalidating triggers). Display only: this never changes kind -- an accepted PR still renders needs_review, never ready_to_merge, because acceptance authorises a human's own Merge click rather than reclassifying the engine's judgment.
+   */
+  acceptanceJustification: string | null;
+  /**
+   * When the acceptance named by acceptanceJustification was granted -- null under the exact same conditions acceptanceJustification is null.
+   */
+  acceptedAt: string | null;
+  /**
    * True iff this PR is a release cut (§15) whose manifest check has already been computed and persisted. Set (to true or false) for any PR-shaped row, exactly like isHandoff above -- the field a client checks to render this row's own distinct release shape (a link to the release-review screen, never a Merge button: a release cut always renders under kind=needs_review) instead of the ordinary PR shape. A PR that a release-branch-pattern/label WOULD classify as a release cut but that Narvi has not yet reviewed (or reviewed too recently for the background check to have finished) renders false here -- an honest, temporary gap, never a fabricated one.
    */
   isRelease: boolean | null;
@@ -2515,6 +2523,71 @@ export interface MergePullRequestResponse {
   merged: boolean;
   mergeCommitSha: string;
   message: string;
+}
+/**
+ * POST /api/decision-inbox/accept-verdict's own request body ('human acceptance of a verdict the engine refuses', §21.1b) -- binds a new acceptance to (repoFullName, prNumber)'s own CURRENT latest review_verdicts row, server-side, at request time; the caller never supplies a verdict id.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "AcceptReviewVerdictRequest".
+ */
+export interface AcceptReviewVerdictRequest {
+  repoFullName: string;
+  prNumber: number;
+  /**
+   * The accepting maintainer+'s own required, free-text explanation (§21.1b: 'carries author, justification'). Untrusted, human-authored content.
+   */
+  justification: string;
+}
+/**
+ * POST /api/decision-inbox/revoke-verdict-acceptance's own request body -- the SAME maintainer+ role as accept-verdict (§21.1b, never a stricter one), scoped to repoFullName exactly like RetireFalsePositivePattern's own identical audit-fix precedent.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "RevokeReviewVerdictAcceptanceRequest".
+ */
+export interface RevokeReviewVerdictAcceptanceRequest {
+  repoFullName: string;
+  /**
+   * The acceptance's own id (ReviewVerdictAcceptance.id) -- never the verdict id or the PR number.
+   */
+  id: string;
+}
+/**
+ * One review_verdict_acceptances row's own REST wire shape ('human acceptance of a verdict the engine refuses', §21.1b, migrations/000135_review_verdict_acceptances.up.sql) -- returned by accept-verdict and revoke-verdict-acceptance so a caller can confirm the resulting state.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "ReviewVerdictAcceptance".
+ */
+export interface ReviewVerdictAcceptance {
+  id: string;
+  repoFullName: string;
+  prNumber: number;
+  /**
+   * review_verdicts.id -- the ONE verdict this acceptance binds to (internal/domain/reviewverdict.Acceptance.Applicable's own doc comment).
+   */
+  verdictId: string;
+  /**
+   * The accepted verdict's own turns.id, carried verbatim for display/audit -- null for a pre-§21.1-amendment verdict.
+   */
+  attemptId: string | null;
+  headSha: string;
+  /**
+   * The autoapproval.Reason ComputeEligible returned for this verdict at accept time (e.g. 'the verdict's shippable classification is not auto') -- display/audit only, never re-checked.
+   */
+  reason: string;
+  justification: string;
+  /**
+   * The accepting maintainer+'s own user id.
+   */
+  acceptedBy: string;
+  acceptedAt: string;
+  /**
+   * Null means this acceptance is still active. Non-null means a maintainer+ has explicitly revoked it -- kept, never deleted, for the audit trail.
+   */
+  revokedAt: string | null;
+  /**
+   * Null under the exact same condition revokedAt is null.
+   */
+  revokedBy: string | null;
 }
 /**
  * One review_false_positive_patterns row's own REST wire shape ('review: learned false-positive patterns', §22.2/§22.4, migrations/000073_review_false_positive_patterns.up.sql) -- returned by the audit-view GET and the retire POST so a caller can confirm the resulting state. Capture itself has no REST shape at all: it happens exclusively via the `false positive: <reason>` PR-thread command (§22.2, internal/adapters/inbound/github's own dispatch-before-router capture handler), never through this API.

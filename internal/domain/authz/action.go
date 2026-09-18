@@ -286,6 +286,34 @@ const (
 	// never a session a member merely created or joined), the same
 	// reasoning those three already establish.
 	ActionContestArchRecap Action = "contest_arch_recap"
+	// ActionAcceptReviewVerdict covers "human acceptance of a verdict
+	// the engine refuses" (§21.1b, §21.2): a maintainer+ authorises
+	// proceeding past the eligibility engine's own refusal for a
+	// SPECIFIC review_verdicts row (autoapproval.ReasonNotShippableAuto
+	// or ReasonDiffTooLarge -- the two, and only two, human-judgment
+	// criteria autoapproval.ComputeEligibleWithAcceptance ever waives),
+	// AND its own auditable revocation -- ONE action gates both, on the
+	// SAME reasoning ActionManageFalsePositivePatterns' own doc comment
+	// already states for its own create/retire pair ("one action gates
+	// every read+write endpoint of this lifecycle-management surface"):
+	// accept and revoke are both REST endpoints on the SAME resource,
+	// reached by the SAME maintainer+ role, so a second action name here
+	// would only ever track this one's verdict exactly, never diverge
+	// from it. Placed in THIS row (maintainer+, no member own/joined
+	// carve-out): an acceptance is PR-scoped but the judgment "proceed
+	// despite this refusal" is the identical maintainer-level
+	// review-adjacent write ActionEditReviewVerdict/ActionRetriggerReview/
+	// ActionConfigureAutoApprove already are, and revocation is
+	// deliberately the SAME role as acceptance, never a stricter one:
+	// revocation only ever REMOVES an authorisation (returns a PR to the
+	// engine's own unmodified judgment), so requiring a higher bar to
+	// revoke than to grant would be a perverse asymmetry -- a maintainer
+	// trusted to authorise a refused merge is equally trusted to
+	// withdraw that authorisation, mirroring every other reversible
+	// privileged toggle in this row/row 6 (e.g. the per-repo auto-merge
+	// toggle), none of which splits its own grant/revoke into two
+	// different roles either.
+	ActionAcceptReviewVerdict Action = "accept_review_verdict"
 
 	// -- Row 6: "Integrations, global secrets, prompt-template
 	// activation, members & roles, sentinel auto-fix toggle, per-repo
@@ -608,6 +636,7 @@ var AllActions = []Action{
 	ActionTeachFalsePositivePattern,
 	ActionManageFalsePositivePatterns,
 	ActionContestArchRecap,
+	ActionAcceptReviewVerdict,
 	ActionManageIntegrations,
 	ActionManageGlobalSecrets,
 	ActionManageCloudIdentityKeys,

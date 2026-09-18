@@ -15,7 +15,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
@@ -25,7 +28,10 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
 	"github.com/narvidev/narvi/internal/domain/authz"
+	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/reposource"
+	"github.com/narvidev/narvi/internal/domain/review"
+	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -147,6 +153,18 @@ func decisionInboxItemToDTO(it decisioninbox.Item) restdtos.DecisionInboxItem {
 		dto.HasApprovingReview = &hasApprovingReview
 		hasChangesRequested := it.HasChangesRequested
 		dto.HasChangesRequested = &hasChangesRequested
+
+		// acceptanceJustification/acceptedAt (§21.1b) render only when an
+		// active, applicable acceptance actually exists for this row
+		// (Item.AcceptanceJustification's own doc comment: the empty
+		// string/zero time IS "no acceptance", mirroring lastHitAt's own
+		// "null iff hitCount is 0" precedent, FalsePositivePattern's wire
+		// shape) -- never a fabricated null-vs-empty-string distinction.
+		if it.AcceptanceJustification != "" {
+			dto.AcceptanceJustification = &it.AcceptanceJustification
+			acceptedAt := it.AcceptedAt
+			dto.AcceptedAt = &acceptedAt
+		}
 
 		// isRelease is set unconditionally, exactly like isHandoff above --
 		// the field a client checks to render this row's own distinct
@@ -476,4 +494,248 @@ func MergePullRequest(deps decisioninbox.Deps, sourceControl ports.SourceControl
 			Message:        "Pull request merged",
 		})
 	}
+}
+
+// AcceptReviewVerdict backs POST /api/decision-inbox/accept-verdict
+// ("human acceptance of a verdict the engine refuses", §21.1b) -- an
+// AUTHORISATION, never an override (that section's own words). Gated on
+// authz.ActionAcceptReviewVerdict (maintainer+, the SAME row as
+// ActionEditReviewVerdict/ActionConfigureAutoApprove -- action.go's own
+// doc comment). Binds a new review_verdict_acceptances row to
+// (repoFullName, prNumber)'s own CURRENT latest review_verdicts row,
+// resolved server-side at request time -- the caller never supplies a
+// verdict id, so a client holding a stale rendered queue can never
+// accept a verdict other than the one actually posted right now (the
+// SAME "never trust the client-rendered queue as authority" discipline
+// MergePullRequest's own re-validation-at-click already applies, §16.2/
+// §5.2). This endpoint does NOT itself re-run the live eligibility
+// engine (never a live SCM call): it only records the authorisation.
+// Whether it actually unblocks a merge is decided, fresh, by
+// autoapproval.ComputeEligibleWithAcceptance the next time a Merge is
+// attempted (RevalidateForMerge/RevalidateForAutoMerge, revalidate.go)
+// -- this handler never re-implements that decision, "never a second
+// authority" (CLAUDE.md).
+func AcceptReviewVerdict(deps decisioninbox.Deps, auditLog *postgres.AuditLogStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		logger := platform.Logger(ctx)
+
+		if deps.ReviewVerdict.Acceptances == nil {
+			logger.Error("httpapi: accept review verdict: no ReviewVerdictAcceptanceStore configured")
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+
+		if !authorize(w, r, authz.ActionAcceptReviewVerdict, authz.Resource{}) {
+			return
+		}
+
+		actorUserID, ok := authenticatedUserID(w, r)
+		if !ok {
+			return
+		}
+
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		var req restdtos.AcceptReviewVerdictRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "malformed request body")
+			return
+		}
+		if req.RepoFullName == "" || req.PrNumber <= 0 {
+			writeError(w, http.StatusBadRequest, "repoFullName and a positive prNumber are required")
+			return
+		}
+		justification := strings.TrimSpace(req.Justification)
+		if justification == "" {
+			writeError(w, http.StatusBadRequest, "justification is required")
+			return
+		}
+
+		record, hasVerdict, err := appreviewverdict.GetLatest(ctx, deps.ReviewVerdict, req.RepoFullName, int32(req.PrNumber))
+		if err != nil {
+			logger.Error("httpapi: accept review verdict: get latest review verdict failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if !hasVerdict {
+			writeError(w, http.StatusConflict, "this pull request has no review verdict of record")
+			return
+		}
+
+		// reason is a best-effort, NO-I/O classification of which of the
+		// two waivable eligibility criteria (autoapproval.
+		// ComputeEligibleWithAcceptance's own doc comment) this
+		// acceptance most likely addresses -- display/audit only, never
+		// itself re-checked (reviewverdict.Acceptance.Reason's own doc
+		// comment): ComputeEligibleWithAcceptance, at merge time,
+		// re-derives eligibility LIVE from the pull request's CURRENT
+		// facts and is the sole authority for whether this acceptance
+		// actually unblocks anything -- a wrong guess here changes no
+		// outcome, only what a human reading the audit trail sees. A
+		// verdict already Shippable==auto can only be refused, among the
+		// two WAIVABLE reasons, by the diff-size threshold (every other
+		// criterion this endpoint could name is mandatory and never
+		// waived at all) -- so ReasonDiffTooLarge is the honest best
+		// guess in that case; Shippable != auto is unambiguous.
+		reason := autoapproval.ReasonDiffTooLarge
+		if record.Verdict.Shippable != review.ShippableAuto {
+			reason = autoapproval.ReasonNotShippableAuto
+		}
+
+		var verdictID pgtype.UUID
+		if err := verdictID.Scan(record.ID); err != nil {
+			logger.Error("httpapi: accept review verdict: parse verdict id failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		var attemptID pgtype.UUID
+		if record.AttemptID != "" {
+			if err := attemptID.Scan(record.AttemptID); err != nil {
+				logger.Error("httpapi: accept review verdict: parse attempt id failed", "error", err)
+				writeError(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+		}
+
+		acceptance, err := appreviewverdict.Accept(ctx, deps.ReviewVerdict.Acceptances, appreviewverdict.AcceptInput{
+			RepoFullName:  req.RepoFullName,
+			PRNumber:      int32(req.PrNumber),
+			VerdictID:     verdictID,
+			AttemptID:     attemptID,
+			HeadSHA:       record.HeadSHA,
+			Context:       record.Context,
+			Reason:        string(reason),
+			Justification: justification,
+			AcceptedBy:    actorUserID,
+		})
+		if err != nil {
+			logger.Error("httpapi: accept review verdict failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+
+		if err := auditlog.Record(ctx, auditLog, actorUserID, "review_verdict.accept", "review_verdict_acceptance", acceptance.ID, map[string]any{
+			"repo_full_name": req.RepoFullName,
+			"pr_number":      req.PrNumber,
+			"verdict_id":     acceptance.VerdictID,
+			"reason":         acceptance.Reason,
+			"justification":  acceptance.Justification,
+		}); err != nil {
+			logger.Error("httpapi: record review_verdict.accept audit log failed", "error", err)
+		}
+
+		writeJSON(w, http.StatusCreated, reviewVerdictAcceptanceToDTO(acceptance))
+	}
+}
+
+// RevokeReviewVerdictAcceptance backs POST
+// /api/decision-inbox/revoke-verdict-acceptance -- §21.1b's own
+// "auditable revocation". Gated on the SAME authz.ActionAcceptReviewVerdict
+// action as AcceptReviewVerdict above -- action.go's own doc comment
+// explains why revocation is deliberately never a stricter role than
+// acceptance.
+func RevokeReviewVerdictAcceptance(deps decisioninbox.Deps, auditLog *postgres.AuditLogStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		logger := platform.Logger(ctx)
+
+		if deps.ReviewVerdict.Acceptances == nil {
+			logger.Error("httpapi: revoke review verdict acceptance: no ReviewVerdictAcceptanceStore configured")
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+
+		if !authorize(w, r, authz.ActionAcceptReviewVerdict, authz.Resource{}) {
+			return
+		}
+
+		actorUserID, ok := authenticatedUserID(w, r)
+		if !ok {
+			return
+		}
+
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		var req restdtos.RevokeReviewVerdictAcceptanceRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "malformed request body")
+			return
+		}
+		if req.RepoFullName == "" || req.Id == "" {
+			writeError(w, http.StatusBadRequest, "repoFullName and id are required")
+			return
+		}
+		var id pgtype.UUID
+		if err := id.Scan(req.Id); err != nil {
+			writeError(w, http.StatusBadRequest, "malformed acceptance id")
+			return
+		}
+
+		acceptance, ok, err := appreviewverdict.RevokeAcceptance(ctx, deps.ReviewVerdict.Acceptances, id, actorUserID, req.RepoFullName)
+		if err != nil {
+			logger.Error("httpapi: revoke review verdict acceptance failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if !ok {
+			// Guarded UPDATE's own WHERE revoked_at IS NULL clause
+			// rejected this write -- distinguish "never existed in this
+			// repo" (404) from "exists in this repo but already revoked"
+			// (409) with a follow-up read, mirroring
+			// RetireFalsePositivePattern's own identical discipline
+			// (falsepositivepatterns.go).
+			_, getOK, getErr := appreviewverdict.GetAcceptance(ctx, deps.ReviewVerdict.Acceptances, id, req.RepoFullName)
+			if getErr != nil {
+				logger.Error("httpapi: get review verdict acceptance after failed revoke failed", "error", getErr)
+				writeError(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+			if !getOK {
+				writeError(w, http.StatusNotFound, "no review verdict acceptance with this id")
+				return
+			}
+			writeError(w, http.StatusConflict, "this acceptance is already revoked")
+			return
+		}
+
+		if err := auditlog.Record(ctx, auditLog, actorUserID, "review_verdict.revoke_acceptance", "review_verdict_acceptance", acceptance.ID, map[string]any{
+			"repo_full_name": acceptance.RepoFullName,
+			"pr_number":      acceptance.PRNumber,
+			"verdict_id":     acceptance.VerdictID,
+		}); err != nil {
+			logger.Error("httpapi: record review_verdict.revoke_acceptance audit log failed", "error", err)
+		}
+
+		writeJSON(w, http.StatusOK, reviewVerdictAcceptanceToDTO(acceptance))
+	}
+}
+
+// reviewVerdictAcceptanceToDTO converts the pure reviewverdict.Acceptance
+// shape into its REST wire shape (contracts/rest/v1/dtos.schema.json's
+// own ReviewVerdictAcceptance) -- a pure, side-effect-free mapping,
+// mirroring decisionInboxItemToDTO's own identical role above.
+func reviewVerdictAcceptanceToDTO(a reviewverdict.Acceptance) restdtos.ReviewVerdictAcceptance {
+	dto := restdtos.ReviewVerdictAcceptance{
+		Id:            a.ID,
+		RepoFullName:  a.RepoFullName,
+		PrNumber:      int(a.PRNumber),
+		VerdictId:     a.VerdictID,
+		HeadSha:       a.HeadSHA,
+		Reason:        a.Reason,
+		Justification: a.Justification,
+		AcceptedBy:    a.AcceptedByUserID,
+		AcceptedAt:    a.AcceptedAt,
+	}
+	if a.AttemptID != "" {
+		attemptID := a.AttemptID
+		dto.AttemptId = &attemptID
+	}
+	if a.RevokedAt != nil {
+		revokedAt := *a.RevokedAt
+		dto.RevokedAt = &revokedAt
+		if a.RevokedByUserID != "" {
+			revokedBy := a.RevokedByUserID
+			dto.RevokedBy = &revokedBy
+		}
+	}
+	return dto
 }

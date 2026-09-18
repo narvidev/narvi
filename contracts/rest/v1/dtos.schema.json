@@ -4294,6 +4294,8 @@
         "isHandoff",
         "hasApprovingReview",
         "hasChangesRequested",
+        "acceptanceJustification",
+        "acceptedAt",
         "isRelease",
         "manifestFindingsCount",
         "manifestCoveragePartial",
@@ -4428,6 +4430,21 @@
             "null"
           ],
           "description": "The PR's own current GitHub review-decision fact, reduced to each reviewer's LATEST review (so a reviewer who requested changes and has since re-reviewed and approved no longer counts here). UNLIKE hasApprovingReview above, this DOES gate an action: RevalidateForMerge treats a true value as a hard block on the Merge endpoint -- a client should use this field, not hasApprovingReview, to pre-disable/explain a disabled Merge action (this field previously did not exist on the wire at all, even though the fact it surfaces already hard-blocked the merge server-side). Set for any PR-shaped row, exactly like ciGreen above."
+        },
+        "acceptanceJustification": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "§21.1b's own 'human acceptance of a verdict the engine refuses': the accepting maintainer+'s own free-text justification, set iff an ACTIVE, APPLICABLE acceptance exists for this PR's own CURRENT verdict (internal/domain/reviewverdict.Acceptance.Applicable) -- null for a PR that was never accepted, whose acceptance was since revoked, or whose acceptance no longer binds to the current verdict (a new attempt, a moved base, a changed ancestor chain -- §21.1b's own three invalidating triggers). Display only: this never changes kind -- an accepted PR still renders needs_review, never ready_to_merge, because acceptance authorises a human's own Merge click rather than reclassifying the engine's judgment."
+        },
+        "acceptedAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time",
+          "description": "When the acceptance named by acceptanceJustification was granted -- null under the exact same conditions acceptanceJustification is null."
         },
         "isRelease": {
           "type": [
@@ -4626,6 +4643,132 @@
         },
         "message": {
           "type": "string"
+        }
+      }
+    },
+    "AcceptReviewVerdictRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "POST /api/decision-inbox/accept-verdict's own request body ('human acceptance of a verdict the engine refuses', §21.1b) -- binds a new acceptance to (repoFullName, prNumber)'s own CURRENT latest review_verdicts row, server-side, at request time; the caller never supplies a verdict id.",
+      "required": [
+        "repoFullName",
+        "prNumber",
+        "justification"
+      ],
+      "properties": {
+        "repoFullName": {
+          "type": "string"
+        },
+        "prNumber": {
+          "type": "integer"
+        },
+        "justification": {
+          "type": "string",
+          "description": "The accepting maintainer+'s own required, free-text explanation (§21.1b: 'carries author, justification'). Untrusted, human-authored content."
+        }
+      }
+    },
+    "RevokeReviewVerdictAcceptanceRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "POST /api/decision-inbox/revoke-verdict-acceptance's own request body -- the SAME maintainer+ role as accept-verdict (§21.1b, never a stricter one), scoped to repoFullName exactly like RetireFalsePositivePattern's own identical audit-fix precedent.",
+      "required": [
+        "repoFullName",
+        "id"
+      ],
+      "properties": {
+        "repoFullName": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "The acceptance's own id (ReviewVerdictAcceptance.id) -- never the verdict id or the PR number."
+        }
+      }
+    },
+    "ReviewVerdictAcceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One review_verdict_acceptances row's own REST wire shape ('human acceptance of a verdict the engine refuses', §21.1b, migrations/000135_review_verdict_acceptances.up.sql) -- returned by accept-verdict and revoke-verdict-acceptance so a caller can confirm the resulting state.",
+      "required": [
+        "id",
+        "repoFullName",
+        "prNumber",
+        "verdictId",
+        "attemptId",
+        "headSha",
+        "reason",
+        "justification",
+        "acceptedBy",
+        "acceptedAt",
+        "revokedAt",
+        "revokedBy"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "repoFullName": {
+          "type": "string"
+        },
+        "prNumber": {
+          "type": "integer"
+        },
+        "verdictId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "review_verdicts.id -- the ONE verdict this acceptance binds to (internal/domain/reviewverdict.Acceptance.Applicable's own doc comment)."
+        },
+        "attemptId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid",
+          "description": "The accepted verdict's own turns.id, carried verbatim for display/audit -- null for a pre-§21.1-amendment verdict."
+        },
+        "headSha": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string",
+          "description": "The autoapproval.Reason ComputeEligible returned for this verdict at accept time (e.g. 'the verdict's shippable classification is not auto') -- display/audit only, never re-checked."
+        },
+        "justification": {
+          "type": "string"
+        },
+        "acceptedBy": {
+          "type": "string",
+          "format": "uuid",
+          "description": "The accepting maintainer+'s own user id."
+        },
+        "acceptedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "revokedAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time",
+          "description": "Null means this acceptance is still active. Non-null means a maintainer+ has explicitly revoked it -- kept, never deleted, for the audit trail.",
+          "goJSONSchema": {
+            "type": "*time.Time",
+            "imports": [
+              "time"
+            ]
+          }
+        },
+        "revokedBy": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uuid",
+          "description": "Null under the exact same condition revokedAt is null."
         }
       }
     },

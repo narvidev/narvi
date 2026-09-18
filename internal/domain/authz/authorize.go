@@ -182,6 +182,11 @@ var matrix = map[Action]actionRule{
 	// same reasoning as ActionTeachFalsePositivePattern immediately above
 	// (action.go's own doc comment).
 	ActionContestArchRecap: {allow: roles(RoleAdmin, RoleMaintainer)},
+	// ("human acceptance of a verdict the engine refuses", §21.1b): same
+	// row, same role, for BOTH acceptance and its own revocation --
+	// action.go's own doc comment on ActionAcceptReviewVerdict states why
+	// revocation is deliberately never a stricter role than acceptance.
+	ActionAcceptReviewVerdict: {allow: roles(RoleAdmin, RoleMaintainer)},
 
 	// Row 6: integrations/global secrets/template activation/members &
 	// roles/sentinel toggle/blockOnHighRisk -- admin only. §25.4

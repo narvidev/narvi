@@ -860,6 +860,15 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	reviewVerdictStore := postgres.NewReviewVerdictStore(pool)
 	autoApprovalOutcomeStore := postgres.NewAutoApprovalOutcomeStore(pool)
 	digestSendStateStore := postgres.NewDigestSendStateStore(pool)
+	// reviewVerdictAcceptanceStore ("human acceptance of a verdict the
+	// engine refuses", §21.1b) backs both the accept-verdict/revoke-
+	// verdict-acceptance REST endpoints (httpapi/decisioninbox.go) and
+	// the merge-time eligibility check itself
+	// (decisioninbox.RevalidateForMerge/RevalidateForAutoMerge,
+	// revalidate.go) -- one store, shared, never a second
+	// independently-constructed copy, mirroring reviewVerdictStore's own
+	// identical "one store, every caller" precedent immediately above.
+	reviewVerdictAcceptanceStore := postgres.NewReviewVerdictAcceptanceStore(pool)
 	reviewVerdictDeps := appreviewverdict.Deps{
 		ReviewVerdicts:       reviewVerdictStore,
 		RepoSettings:         repoSettingsStore,
@@ -869,6 +878,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// DigestContestationRate -- the SAME reviewDigestSectionFeedbackStore
 		// instance the GitHub capture command above already uses.
 		DigestSectionFeedback: reviewDigestSectionFeedbackStore,
+		Acceptances:           reviewVerdictAcceptanceStore,
 		// §30.7: stamps each recorded auto-approval outcome with the
 		// epoch it was observed in, so a shadow-era contradiction never
 		// moves the rate that justifies arming auto-merge.
@@ -1779,6 +1789,15 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		r.Use(auth.Middleware(userSessionStore, userStore))
 		r.Get("/", httpapi.ListDecisionInbox(decisionInboxDeps))
 		r.Post("/merge", httpapi.MergePullRequest(decisionInboxDeps, sourceControl, auditLogStore))
+		// accept-verdict/revoke-verdict-acceptance ("human acceptance of
+		// a verdict the engine refuses", §21.1b): mounted as siblings of
+		// /merge above, the SAME surface a maintainer already reaches a
+		// refused PR's Merge button from -- never a separate, invented
+		// route shape. Both gated on authz.ActionAcceptReviewVerdict
+		// (maintainer+, §13.3 row 5) inside the handler itself, exactly
+		// like /merge's own authz.ActionMergePR gate.
+		r.Post("/accept-verdict", httpapi.AcceptReviewVerdict(decisionInboxDeps, auditLogStore))
+		r.Post("/revoke-verdict-acceptance", httpapi.RevokeReviewVerdictAcceptance(decisionInboxDeps, auditLogStore))
 	})
 
 	// /api/intent-templates, /api/intent-templates/preview (audit finding

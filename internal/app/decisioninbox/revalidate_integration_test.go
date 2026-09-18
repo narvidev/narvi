@@ -84,7 +84,14 @@ func newRevalidateStores(pool *pgxpool.Pool) *revalidateStores {
 				RepoSettings:         narvipg.NewRepoSettingsStore(pool),
 				ReviewFindings:       narvipg.NewReviewFindingStore(pool),
 				AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool),
-				Timeouts:             platform.DefaultTimeouts(),
+				// Acceptances ("human acceptance of a verdict the engine
+				// refuses", §21.1b) backs revalidateCore's own
+				// GetActiveAcceptance/Applicable check -- wired here, for
+				// every subtest in this file and acceptance_integration_
+				// test.go, exactly like every other ReviewVerdict.Deps
+				// field on this SAME literal.
+				Acceptances: narvipg.NewReviewVerdictAcceptanceStore(pool),
+				Timeouts:    platform.DefaultTimeouts(),
 			},
 		},
 	}

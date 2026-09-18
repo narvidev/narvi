@@ -16,6 +16,20 @@ import (
 // constructed with a hand-computed Verdict.Shippable (review.Verdict's
 // own CONTRACT, unaffected by this wrapper).
 type Record struct {
+	// ID is review_verdicts.id -- this row's own immutable, database-
+	// assigned identity (migrations/000067_review_verdicts.up.sql: "id
+	// UUID PRIMARY KEY DEFAULT gen_random_uuid()"), forwarded verbatim.
+	// Added for Acceptance's own use (acceptance.go, "human acceptance
+	// of a verdict the engine refuses", §21.1b): Acceptance.VerdictID
+	// binds to exactly this value, mirroring AttemptID's own identical
+	// "adapter-independent, caller converts at the boundary" contract
+	// (§11) -- a plain string, never pgtype.UUID/uuid.UUID. The zero
+	// value (an empty string) is what a Record hand-built by a caller
+	// that never populated it reads back as -- every real reader
+	// (internal/app/reviewverdict.recordFromRow) always sets this from
+	// row.ID, which is NOT NULL, so an empty ID here can only mean "this
+	// Record did not come from a real review_verdicts row".
+	ID           string
 	RepoFullName string
 	PRNumber     int32
 	// HeadSHA is the commit this verdict was produced against -- see

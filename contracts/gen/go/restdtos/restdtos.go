@@ -10,6 +10,46 @@ import "regexp"
 import "time"
 import "unicode/utf8"
 
+// POST /api/decision-inbox/accept-verdict's own request body ('human acceptance of
+// a verdict the engine refuses', §21.1b) -- binds a new acceptance to
+// (repoFullName, prNumber)'s own CURRENT latest review_verdicts row, server-side,
+// at request time; the caller never supplies a verdict id.
+type AcceptReviewVerdictRequest struct {
+	// The accepting maintainer+'s own required, free-text explanation (§21.1b:
+	// 'carries author, justification'). Untrusted, human-authored content.
+	Justification string `json:"justification" yaml:"justification" mapstructure:"justification"`
+
+	// PrNumber corresponds to the JSON schema field "prNumber".
+	PrNumber int `json:"prNumber" yaml:"prNumber" mapstructure:"prNumber"`
+
+	// RepoFullName corresponds to the JSON schema field "repoFullName".
+	RepoFullName string `json:"repoFullName" yaml:"repoFullName" mapstructure:"repoFullName"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *AcceptReviewVerdictRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["justification"]; raw != nil && !ok {
+		return fmt.Errorf("field justification in AcceptReviewVerdictRequest: required")
+	}
+	if _, ok := raw["prNumber"]; raw != nil && !ok {
+		return fmt.Errorf("field prNumber in AcceptReviewVerdictRequest: required")
+	}
+	if _, ok := raw["repoFullName"]; raw != nil && !ok {
+		return fmt.Errorf("field repoFullName in AcceptReviewVerdictRequest: required")
+	}
+	type Plain AcceptReviewVerdictRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = AcceptReviewVerdictRequest(plain)
+	return nil
+}
+
 // 200 response body for POST
 // /api/sessions/:id/review/findings/:identityHash/apply-suggestion (§12.2 item 2).
 // On a repository whose outgoing changes are currently suppressed (platform shadow
@@ -2563,6 +2603,22 @@ func (j *CreateWorkflowDefinitionRequest) UnmarshalJSON(value []byte) error {
 // -- flattening keeps every field here a plain, typed, nullable scalar, consistent
 // with every other kind-conditional field on this same object.
 type DecisionInboxItem struct {
+	// §21.1b's own 'human acceptance of a verdict the engine refuses': the accepting
+	// maintainer+'s own free-text justification, set iff an ACTIVE, APPLICABLE
+	// acceptance exists for this PR's own CURRENT verdict
+	// (internal/domain/reviewverdict.Acceptance.Applicable) -- null for a PR that was
+	// never accepted, whose acceptance was since revoked, or whose acceptance no
+	// longer binds to the current verdict (a new attempt, a moved base, a changed
+	// ancestor chain -- §21.1b's own three invalidating triggers). Display only: this
+	// never changes kind -- an accepted PR still renders needs_review, never
+	// ready_to_merge, because acceptance authorises a human's own Merge click rather
+	// than reclassifying the engine's judgment.
+	AcceptanceJustification DecisionInboxItemAcceptanceJustification `json:"acceptanceJustification" yaml:"acceptanceJustification" mapstructure:"acceptanceJustification"`
+
+	// When the acceptance named by acceptanceJustification was granted -- null under
+	// the exact same conditions acceptanceJustification is null.
+	AcceptedAt DecisionInboxItemAcceptedAt `json:"acceptedAt" yaml:"acceptedAt" mapstructure:"acceptedAt"`
+
 	// The response's own generation instant minus enteredQueueAt, in seconds.
 	AgeSeconds int `json:"ageSeconds" yaml:"ageSeconds" mapstructure:"ageSeconds"`
 
@@ -2752,6 +2808,22 @@ type DecisionInboxItem struct {
 	// Title corresponds to the JSON schema field "title".
 	Title string `json:"title" yaml:"title" mapstructure:"title"`
 }
+
+// §21.1b's own 'human acceptance of a verdict the engine refuses': the accepting
+// maintainer+'s own free-text justification, set iff an ACTIVE, APPLICABLE
+// acceptance exists for this PR's own CURRENT verdict
+// (internal/domain/reviewverdict.Acceptance.Applicable) -- null for a PR that was
+// never accepted, whose acceptance was since revoked, or whose acceptance no
+// longer binds to the current verdict (a new attempt, a moved base, a changed
+// ancestor chain -- §21.1b's own three invalidating triggers). Display only: this
+// never changes kind -- an accepted PR still renders needs_review, never
+// ready_to_merge, because acceptance authorises a human's own Merge click rather
+// than reclassifying the engine's judgment.
+type DecisionInboxItemAcceptanceJustification *string
+
+// When the acceptance named by acceptanceJustification was granted -- null under
+// the exact same conditions acceptanceJustification is null.
+type DecisionInboxItemAcceptedAt = *time.Time
 
 // §15.3's own already-computed trigger decision (whether the constituent PRs' own
 // shape met the criteria for an aggregate diff review, OR the constituent-PR
@@ -3009,6 +3081,12 @@ func (j *DecisionInboxItem) UnmarshalJSON(value []byte) error {
 	var raw map[string]interface{}
 	if err := json.Unmarshal(value, &raw); err != nil {
 		return err
+	}
+	if _, ok := raw["acceptanceJustification"]; raw != nil && !ok {
+		return fmt.Errorf("field acceptanceJustification in DecisionInboxItem: required")
+	}
+	if _, ok := raw["acceptedAt"]; raw != nil && !ok {
+		return fmt.Errorf("field acceptedAt in DecisionInboxItem: required")
 	}
 	if _, ok := raw["ageSeconds"]; raw != nil && !ok {
 		return fmt.Errorf("field ageSeconds in DecisionInboxItem: required")
@@ -9695,6 +9773,112 @@ func (j *ReviewReadout) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// One review_verdict_acceptances row's own REST wire shape ('human acceptance of a
+// verdict the engine refuses', §21.1b,
+// migrations/000135_review_verdict_acceptances.up.sql) -- returned by
+// accept-verdict and revoke-verdict-acceptance so a caller can confirm the
+// resulting state.
+type ReviewVerdictAcceptance struct {
+	// AcceptedAt corresponds to the JSON schema field "acceptedAt".
+	AcceptedAt time.Time `json:"acceptedAt" yaml:"acceptedAt" mapstructure:"acceptedAt"`
+
+	// The accepting maintainer+'s own user id.
+	AcceptedBy string `json:"acceptedBy" yaml:"acceptedBy" mapstructure:"acceptedBy"`
+
+	// The accepted verdict's own turns.id, carried verbatim for display/audit -- null
+	// for a pre-§21.1-amendment verdict.
+	AttemptId ReviewVerdictAcceptanceAttemptId `json:"attemptId" yaml:"attemptId" mapstructure:"attemptId"`
+
+	// HeadSha corresponds to the JSON schema field "headSha".
+	HeadSha string `json:"headSha" yaml:"headSha" mapstructure:"headSha"`
+
+	// Id corresponds to the JSON schema field "id".
+	Id string `json:"id" yaml:"id" mapstructure:"id"`
+
+	// Justification corresponds to the JSON schema field "justification".
+	Justification string `json:"justification" yaml:"justification" mapstructure:"justification"`
+
+	// PrNumber corresponds to the JSON schema field "prNumber".
+	PrNumber int `json:"prNumber" yaml:"prNumber" mapstructure:"prNumber"`
+
+	// The autoapproval.Reason ComputeEligible returned for this verdict at accept
+	// time (e.g. 'the verdict's shippable classification is not auto') --
+	// display/audit only, never re-checked.
+	Reason string `json:"reason" yaml:"reason" mapstructure:"reason"`
+
+	// RepoFullName corresponds to the JSON schema field "repoFullName".
+	RepoFullName string `json:"repoFullName" yaml:"repoFullName" mapstructure:"repoFullName"`
+
+	// Null means this acceptance is still active. Non-null means a maintainer+ has
+	// explicitly revoked it -- kept, never deleted, for the audit trail.
+	RevokedAt *time.Time `json:"revokedAt" yaml:"revokedAt" mapstructure:"revokedAt"`
+
+	// Null under the exact same condition revokedAt is null.
+	RevokedBy ReviewVerdictAcceptanceRevokedBy `json:"revokedBy" yaml:"revokedBy" mapstructure:"revokedBy"`
+
+	// review_verdicts.id -- the ONE verdict this acceptance binds to
+	// (internal/domain/reviewverdict.Acceptance.Applicable's own doc comment).
+	VerdictId string `json:"verdictId" yaml:"verdictId" mapstructure:"verdictId"`
+}
+
+// The accepted verdict's own turns.id, carried verbatim for display/audit -- null
+// for a pre-§21.1-amendment verdict.
+type ReviewVerdictAcceptanceAttemptId *string
+
+// Null under the exact same condition revokedAt is null.
+type ReviewVerdictAcceptanceRevokedBy *string
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *ReviewVerdictAcceptance) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["acceptedAt"]; raw != nil && !ok {
+		return fmt.Errorf("field acceptedAt in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["acceptedBy"]; raw != nil && !ok {
+		return fmt.Errorf("field acceptedBy in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["attemptId"]; raw != nil && !ok {
+		return fmt.Errorf("field attemptId in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["headSha"]; raw != nil && !ok {
+		return fmt.Errorf("field headSha in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["id"]; raw != nil && !ok {
+		return fmt.Errorf("field id in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["justification"]; raw != nil && !ok {
+		return fmt.Errorf("field justification in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["prNumber"]; raw != nil && !ok {
+		return fmt.Errorf("field prNumber in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["reason"]; raw != nil && !ok {
+		return fmt.Errorf("field reason in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["repoFullName"]; raw != nil && !ok {
+		return fmt.Errorf("field repoFullName in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["revokedAt"]; raw != nil && !ok {
+		return fmt.Errorf("field revokedAt in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["revokedBy"]; raw != nil && !ok {
+		return fmt.Errorf("field revokedBy in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["verdictId"]; raw != nil && !ok {
+		return fmt.Errorf("field verdictId in ReviewVerdictAcceptance: required")
+	}
+	type Plain ReviewVerdictAcceptance
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = ReviewVerdictAcceptance(plain)
+	return nil
+}
+
 // One prior verdict on this PR, summarized for the merge readout's own 'History'
 // rail (§26.1 item 5) -- never the full ReviewReadoutVerdict shape, which only the
 // latest verdict needs in full.
@@ -9800,6 +9984,40 @@ func (j *ReviewVerdictHistoryEntry) UnmarshalJSON(value []byte) error {
 		return err
 	}
 	*j = ReviewVerdictHistoryEntry(plain)
+	return nil
+}
+
+// POST /api/decision-inbox/revoke-verdict-acceptance's own request body -- the
+// SAME maintainer+ role as accept-verdict (§21.1b, never a stricter one), scoped
+// to repoFullName exactly like RetireFalsePositivePattern's own identical
+// audit-fix precedent.
+type RevokeReviewVerdictAcceptanceRequest struct {
+	// The acceptance's own id (ReviewVerdictAcceptance.id) -- never the verdict id or
+	// the PR number.
+	Id string `json:"id" yaml:"id" mapstructure:"id"`
+
+	// RepoFullName corresponds to the JSON schema field "repoFullName".
+	RepoFullName string `json:"repoFullName" yaml:"repoFullName" mapstructure:"repoFullName"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *RevokeReviewVerdictAcceptanceRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["id"]; raw != nil && !ok {
+		return fmt.Errorf("field id in RevokeReviewVerdictAcceptanceRequest: required")
+	}
+	if _, ok := raw["repoFullName"]; raw != nil && !ok {
+		return fmt.Errorf("field repoFullName in RevokeReviewVerdictAcceptanceRequest: required")
+	}
+	type Plain RevokeReviewVerdictAcceptanceRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = RevokeReviewVerdictAcceptanceRequest(plain)
 	return nil
 }
 
@@ -12577,8 +12795,6 @@ func (j *WorkflowStepRunOutcomeStatus) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
-
 // The posted outcome's advisory free-text summary -- never re-parsed as structured
 // data once posted (§25.6), same discipline as PostReviewVerdictRequest.summary.
 type WorkflowStepRunOutcomeSummary *string
@@ -12618,6 +12834,8 @@ func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 	*j = WorkflowStepRunStatus(v)
 	return nil
 }
+
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
 
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
 // sequential turn'). Null while an awaiting_decision (hitlBefore-gated) attempt

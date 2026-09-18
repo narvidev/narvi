@@ -514,6 +514,32 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 	// release-cut status -- see resolveReleaseCut's own doc comment.
 	isReleaseCut, manifestFindingsCount, aggregateReviewTriggered, manifestCoveragePartial, compositionReviewed, compositionDecision := resolveReleaseCut(ctx, deps, repoFullName, pr.Number)
 
+	// acceptanceJustification/acceptedAt (§21.1b: "human acceptance of a
+	// verdict the engine refuses") -- display only, best-effort: a
+	// lookup failure here degrades to "no acceptance shown", never a
+	// failed row (mirrors resolveReviewSessionID/resolveReleaseCut's own
+	// identical "this is display data, not eligibility" posture in this
+	// same function -- unlike computeRealEligibility below, a failure
+	// here must never mark the read degraded, since nothing here gates
+	// Kind or ready_to_merge). Short-circuits on GetActiveAcceptance's
+	// own ok=false (the common case: most PRs are never accepted) before
+	// paying for a second GetLatest verdict read -- computeRealEligibility
+	// below already does its own, independent GetLatest call; this one
+	// is intentionally separate rather than threading record.ID out
+	// through that function's own (bool, bool) return shape.
+	var acceptanceJustification string
+	var acceptedAt time.Time
+	if acceptance, acceptanceOK, acceptanceErr := appreviewverdict.GetActiveAcceptance(ctx, deps.ReviewVerdict.Acceptances, repoFullName, int32(pr.Number)); acceptanceErr != nil {
+		platform.Logger(ctx).Warn("decisioninbox: get active review verdict acceptance failed -- omitting acceptance display data for this row", "error", acceptanceErr, "repo", repoFullName, "pr_number", pr.Number)
+	} else if acceptanceOK {
+		if record, hasVerdict, verdictErr := appreviewverdict.GetLatest(ctx, deps.ReviewVerdict, repoFullName, int32(pr.Number)); verdictErr != nil {
+			platform.Logger(ctx).Warn("decisioninbox: get latest review verdict failed -- omitting acceptance display data for this row", "error", verdictErr, "repo", repoFullName, "pr_number", pr.Number)
+		} else if hasVerdict && acceptance.Applicable(record.ID) {
+			acceptanceJustification = acceptance.Justification
+			acceptedAt = acceptance.AcceptedAt
+		}
+	}
+
 	item := Item{
 		RepoFullName:             repoFullName,
 		PRNumber:                 pr.Number,
@@ -536,6 +562,8 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 		ManifestCoveragePartial:  manifestCoveragePartial,
 		CompositionReviewed:      compositionReviewed,
 		CompositionDecision:      compositionDecision,
+		AcceptanceJustification:  acceptanceJustification,
+		AcceptedAt:               acceptedAt,
 	}
 	item.AgeSeconds = int64(decisioninbox.Age(item.EnteredQueueAt, now).Seconds())
 	item.Stale = decisioninbox.IsStale(item.EnteredQueueAt, now, deps.Timeouts.DecisionInboxStaleAfter)

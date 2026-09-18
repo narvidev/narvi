@@ -271,6 +271,13 @@ func TestAuthorize_ExhaustiveMatrix(t *testing.T) {
 		{"maintainer manages false-positive patterns", authz.RoleMaintainer, authz.ActionManageFalsePositivePatterns, false, true},
 		{"member cannot manage false-positive patterns", authz.RoleMember, authz.ActionManageFalsePositivePatterns, false, false},
 		{"viewer cannot manage false-positive patterns", authz.RoleViewer, authz.ActionManageFalsePositivePatterns, false, false},
+		// ("human acceptance of a verdict the engine refuses", §21.1b):
+		// same row, same role for BOTH accepting and revoking (ONE
+		// action gates both -- action.go's own doc comment).
+		{"admin accepts a refused review verdict", authz.RoleAdmin, authz.ActionAcceptReviewVerdict, false, true},
+		{"maintainer accepts a refused review verdict", authz.RoleMaintainer, authz.ActionAcceptReviewVerdict, false, true},
+		{"member cannot accept a refused review verdict", authz.RoleMember, authz.ActionAcceptReviewVerdict, false, false},
+		{"viewer cannot accept a refused review verdict", authz.RoleViewer, authz.ActionAcceptReviewVerdict, false, false},
 
 		// Row 6: integrations/global secrets/template activation/members
 		// & roles/sentinel toggle -- admin ONLY, not even maintainer.

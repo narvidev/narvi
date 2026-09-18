@@ -31,6 +31,16 @@ type Deps struct {
 	// by Timeseries/TopRiskDrivers/FindingOutcomes above).
 	DigestSectionFeedback *postgres.ReviewDigestSectionFeedbackStore
 
+	// Acceptances (§21.1b) backs Accept/Revoke/GetActiveAcceptance below
+	// -- "human acceptance of a verdict the engine refuses". Nil-safe on
+	// the SAME "a caller that doesn't need this rollup simply never
+	// wires its own store" convention DigestSectionFeedback immediately
+	// above already establishes: a nil store degrades GetActiveAcceptance
+	// to ok=false (never a panic) and Accept/Revoke to a plain error,
+	// never a silent no-op that could be mistaken for "no acceptance
+	// exists".
+	Acceptances *postgres.ReviewVerdictAcceptanceStore
+
 	// PlatformShadow is the deployment-wide egress switch (§30.8), needed
 	// alongside RepoSettings to stamp an outcome's own epoch -- see
 	// recordOutcome. False on a wiring that never records outcomes.

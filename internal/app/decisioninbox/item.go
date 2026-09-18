@@ -87,6 +87,26 @@ type Item struct {
 	// HasApprovingReview.
 	HasChangesRequested bool
 
+	// AcceptanceJustification/AcceptedAt (§21.1b: "human acceptance of a
+	// verdict the engine refuses") are set iff an ACTIVE, APPLICABLE
+	// acceptance exists for this PR's own current verdict (internal/
+	// domain/reviewverdict.Acceptance.Applicable) -- a revoked
+	// acceptance, or one that no longer binds to the current verdict
+	// (a new attempt, a moved base, a changed ancestor chain), renders
+	// identically to no acceptance at all: both are the empty string /
+	// zero time, mirroring this package's own "absent fact -> zero
+	// value" convention elsewhere on this same struct (e.g. Findings/
+	// FindingsUnknown). Display only -- it never itself gates Kind
+	// (buildPROpenItem's own classification below is unaffected: an
+	// accepted PR still classifies needs_review, never ready_to_merge,
+	// because §21.1b's own acceptance is an authorisation for a human's
+	// OWN Merge click, never a reclassification of the engine's
+	// judgment) -- it exists so a maintainer scanning needs_review can
+	// SEE that this row's own eligibility refusal has already been
+	// authorised, and by whom, before clicking Merge.
+	AcceptanceJustification string
+	AcceptedAt              time.Time
+
 	// IsRelease is true iff this PR-shaped row is a release cut (§15)
 	// whose §15.2 manifest check has already been computed and persisted
 	// -- see resolveReleaseCut's own doc comment (aggregate.go) for the

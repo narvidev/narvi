@@ -262,6 +262,32 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		return false, "", "this pull request has no review verdict of record", nil
 	}
 
+	// acceptance ("human acceptance of a verdict the engine refuses",
+	// §21.1b): a maintainer+ may have authorised proceeding past
+	// ReasonNotShippableAuto/ReasonDiffTooLarge for THIS exact verdict
+	// (record.ID) -- fetched once, here, so BOTH ComputeEligibleWithAcceptance
+	// calls below (the probe and the final call) see the identical
+	// answer. A genuine store error fails CLOSED (propagated as err,
+	// mirroring every other store-error branch in this function's own
+	// top doc comment) -- an acceptance lookup that cannot be confirmed
+	// must never silently degrade to "no acceptance applies" AND must
+	// never silently degrade to "an acceptance applies" either; erroring
+	// out is the only honest answer. acceptanceOK=false (no active row,
+	// or a row exists but Applicable reports it no longer binds to
+	// record.ID -- a new attempt posted a different verdict since it was
+	// granted) means accepted=false, exactly like a PR that was never
+	// accepted at all -- Acceptance.Applicable's own doc comment is what
+	// makes this the SAME code path that also closes "a moved base
+	// makes it inapplicable": ComputeEligibleWithAcceptance's own
+	// unconditional base/ancestor-chain checks refuse regardless of
+	// accepted, so this line alone need only answer "same verdict,
+	// still not revoked".
+	acceptance, acceptanceOK, acceptanceErr := appreviewverdict.GetActiveAcceptance(ctx, deps.ReviewVerdict.Acceptances, repoFullName, int32(prNumber))
+	if acceptanceErr != nil {
+		return false, "", "", fmt.Errorf("decisioninbox: revalidate for merge: get active review verdict acceptance: %w", acceptanceErr)
+	}
+	accepted := acceptanceOK && acceptance.Applicable(record.ID)
+
 	// a genuine repo_settings read error here means
 	// this repo's OWN configured policy (its diff-size threshold, its
 	// sensitive-tag list) cannot be established at all -- propagated
@@ -409,7 +435,13 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		TouchedBlastRadius:                  touchedBlastRadius,
 		TouchedBlastRadiusKnown:             touchedBlastRadiusKnown,
 	}
-	if _, probeReason := autoapproval.ComputeEligible(probeInput, cfg); probeReason != autoapproval.ReasonNone {
+	// ComputeEligibleWithAcceptance, never a bare probeReason != ReasonNone
+	// check: an applicable acceptance (accepted=true) can make eligible
+	// true while STILL reporting the waived Reason (ReasonNotShippableAuto/
+	// ReasonDiffTooLarge) for display -- see that function's own doc
+	// comment. Checking the reason string alone here would misread "eligible,
+	// via acceptance" as a refusal.
+	if probeEligible, probeReason, _ := autoapproval.ComputeEligibleWithAcceptance(probeInput, cfg, accepted); !probeEligible {
 		return false, "", fmt.Sprintf("this pull request no longer meets the auto-approval eligibility criteria: %s", probeReason), nil
 	}
 
@@ -654,7 +686,13 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		ancestorChainAdvancedWithoutRewrite = confirmed
 	}
 
-	eligible, eligReason := autoapproval.ComputeEligible(autoapproval.EligibilityInput{
+	// ComputeEligibleWithAcceptance, threading the SAME accepted this
+	// function's own probe call above already used -- accepted waives
+	// ONLY ReasonNotShippableAuto/ReasonDiffTooLarge; every OTHER
+	// criterion computed here (CI, blast radius, sensitive path, and
+	// every freshness check this function's own live SCM calls above
+	// just resolved) stays mandatory regardless (§21.1b).
+	eligible, eligReason, _ := autoapproval.ComputeEligibleWithAcceptance(autoapproval.EligibilityInput{
 		Verdict:                             record.Verdict,
 		VerdictAssessed:                     true,
 		VerdictHeadSHA:                      record.HeadSHA,
@@ -674,7 +712,7 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		ChangedFileCount:                    changedFileCount,
 		TouchedBlastRadius:                  touchedBlastRadius,
 		TouchedBlastRadiusKnown:             touchedBlastRadiusKnown,
-	}, cfg)
+	}, cfg, accepted)
 	if !eligible {
 		return false, "", fmt.Sprintf("this pull request no longer meets the auto-approval eligibility criteria: %s", eligReason), nil
 	}
