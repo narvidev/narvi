@@ -14,13 +14,20 @@ func TestBuildGitHubEventInput_MalformedBodyReturnsNotOK(t *testing.T) {
 }
 
 func TestBuildGitHubEventInput_PullRequestLabeled_MergesTopLevelAndArrayLabels(t *testing.T) {
+	// head.repo.full_name is REQUIRED here, matching the base repo -- D13
+	// audit fix: an absent head.repo (GitHub's own real payload never
+	// omits it) is no longer trusted as "same repo", so a minimal payload
+	// that leaves it out would no longer surface head.ref as a branch at
+	// all, which is not what THIS test exists to prove (see
+	// TestBuildGitHubEventInput_PullRequest_ForkHeadWithDeletedRepoRejected
+	// below for that exact fail-closed behavior, pinned on its own).
 	body := []byte(`{
 		"action": "labeled",
 		"label": {"name": "automation:run"},
 		"repository": {"full_name": "acme/repo"},
 		"pull_request": {
 			"labels": [{"name": "bug"}, {"name": "automation:run"}],
-			"head": {"ref": "feature-x", "sha": "shaHead"}
+			"head": {"ref": "feature-x", "sha": "shaHead", "repo": {"full_name": "acme/repo"}}
 		}
 	}`)
 	in, ok := buildGitHubEventInput("pull_request", body)
@@ -95,6 +102,30 @@ func TestBuildGitHubEventInput_Issues_LabelsFromIssueLabelsArray(t *testing.T) {
 	}
 	if len(in.Branches) != 0 {
 		t.Fatalf("Branches = %v, want none (issues has no branch concept)", in.Branches)
+	}
+}
+
+// TestBuildGitHubEventInput_IssueComment_LabelsFromIssueLabelsArray is
+// D16's own required, missing proof: GitHub embeds the FULL parent issue
+// resource, labels included, on an "issue_comment" delivery too -- not
+// just on "issues" itself, contrary to this file's own previous doc
+// comment claiming otherwise. Before this fix, an issue_comment Label
+// filter could never match anything, silently.
+func TestBuildGitHubEventInput_IssueComment_LabelsFromIssueLabelsArray(t *testing.T) {
+	body := []byte(`{
+		"action": "created",
+		"repository": {"full_name": "acme/repo"},
+		"issue": {"labels": [{"name": "triage"}]}
+	}`)
+	in, ok := buildGitHubEventInput("issue_comment", body)
+	if !ok {
+		t.Fatalf("ok = false, want true")
+	}
+	if len(in.Labels) != 1 || in.Labels[0] != "triage" {
+		t.Fatalf("Labels = %v, want [triage]", in.Labels)
+	}
+	if len(in.Branches) != 0 {
+		t.Fatalf("Branches = %v, want none (issue_comment has no branch concept)", in.Branches)
 	}
 }
 
@@ -205,6 +236,70 @@ func TestBuildGitHubEventInput_PullRequest_BaseAndHeadBranches(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestBuildGitHubEventInput_PullRequest_ForkHeadWithDeletedRepoRejected is
+// D13's own required, missing security proof: GitHub sends
+// "head.repo": null -- decoding to a zero-value Repo (empty
+// FullName) -- whenever the fork that opened this PR has SINCE BEEN
+// DELETED, which the fork's own author (an attacker, on a public
+// repository) controls unilaterally. sameRepo's own pre-fix behavior
+// treated this exact absence as "same repo, trust it", letting an
+// attacker-chosen head.ref through as if it were a branch of the base
+// repo. Unknown provenance must never be trusted: only base.ref may ever
+// appear here, exactly like a real, still-existing fork.
+func TestBuildGitHubEventInput_PullRequest_ForkHeadWithDeletedRepoRejected(t *testing.T) {
+	body := []byte(`{
+		"action": "opened",
+		"repository": {"full_name": "acme/repo"},
+		"pull_request": {
+			"head": {"ref": "main", "sha": "shaDeletedFork", "repo": null},
+			"base": {"ref": "develop"}
+		}
+	}`)
+	in, ok := buildGitHubEventInput("pull_request", body)
+	if !ok {
+		t.Fatalf("ok = false, want true")
+	}
+	want := []domainautomation.GitHubEventBranch{{Name: "develop", HeadSHA: "shaDeletedFork"}}
+	if len(in.Branches) != len(want) {
+		t.Fatalf("Branches = %v, want %v (a deleted fork's own head.ref %q must NOT appear)", in.Branches, want, "main")
+	}
+	if in.Branches[0] != want[0] {
+		t.Fatalf("Branches[0] = %v, want %v", in.Branches[0], want[0])
+	}
+	for _, b := range in.Branches {
+		if b.Name == "main" {
+			t.Fatalf("Branches = %v contains the deleted fork's own colliding head.ref %q, want it rejected (D13 audit fix: fail closed, unknown provenance is not \"same repo\")", in.Branches, "main")
+		}
+	}
+}
+
+// TestSameRepo pins sameRepo's own degenerate-input behavior directly --
+// D13 audit fix. Every input this table exercises is a real shape
+// buildGitHubEventInput's own callers can produce (an empty
+// headRepoFullName is GitHub's own documented "head.repo": null" shape,
+// never a caller bug).
+func TestSameRepo(t *testing.T) {
+	tests := []struct {
+		name             string
+		headRepoFullName string
+		baseRepoFullName string
+		want             bool
+	}{
+		{"identical", "acme/repo", "acme/repo", true},
+		{"case-insensitive match", "Acme/Repo", "acme/repo", true},
+		{"different repo (a real fork)", "attacker/fork", "acme/repo", false},
+		{"empty head repo (deleted fork) fails closed", "", "acme/repo", false},
+		{"both empty fails closed", "", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sameRepo(tt.headRepoFullName, tt.baseRepoFullName); got != tt.want {
+				t.Fatalf("sameRepo(%q, %q) = %v, want %v", tt.headRepoFullName, tt.baseRepoFullName, got, tt.want)
+			}
+		})
+	}
 }
 
 // TestBuildGitHubEventInput_DefaultBranchPopulatedFromRepository is D4's

@@ -66,11 +66,24 @@ const linearDeliveryProvider = "linear"
 // AutomationDispatchMaxAttempts et al.) -- see that function's own doc
 // comment for the full "why" behind each, shared verbatim rather than
 // re-implemented here.
+//
+// D18 audit fix: mirrors DispatchGitHubWebhookEvent's own identical fix
+// too -- ctx is wrapped in a single context.WithTimeout(ctx, timeouts.
+// AutomationDispatchTotalBudget) covering the list call AND the entire
+// per-automation loop below, so every platform.Retry call inside shares
+// ONE deadline instead of the single-call bound multiplying by however
+// many Linear-triggered automations this delivery evaluates.
 func DispatchLinearWebhookEvent(ctx context.Context, logger *slog.Logger, automations LinearTriggerLister, invocations DeliveryInvocationCreator, timeouts platform.Timeouts, eventType string, deliveryID string, in domainautomation.LinearEventInput) {
 	if reason := domainautomation.ClassifyLinearDispatch(eventType); reason != domainautomation.LinearDispatchNotSkipped {
 		logger.Warn("automation: linear event not evaluated against any trigger", "event_type", eventType, "reason", string(reason))
 		return
 	}
+
+	// See dispatchTotalBudgetContext's own doc comment (githubdispatch.go)
+	// for why an unconfigured (zero-value) budget must NOT be handed to
+	// context.WithTimeout directly.
+	ctx, cancel := dispatchTotalBudgetContext(ctx, timeouts.AutomationDispatchTotalBudget)
+	defer cancel()
 
 	var rows []sqlcgen.Automation
 	retryErr := platform.Retry(ctx, timeouts.AutomationDispatchMaxAttempts, timeouts.AutomationDispatchRetryBaseDelay, timeouts.AutomationDispatchRetryMaxDelay, func() error {

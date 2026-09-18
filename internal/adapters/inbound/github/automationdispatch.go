@@ -181,17 +181,19 @@ const githubZeroSHA = "0000000000000000000000000000000000000000"
 //     this ONE event concern" question, without forking that function's
 //     own logic per event type. head.ref is ALSO added, as a SECOND
 //     Branches entry, but ONLY when it is genuinely a branch of the SAME
-//     repository as env.Repository (sameRepoOrUnknown below) -- e.g. an
+//     repository as env.Repository (sameRepo below) -- e.g. an
 //     automation deliberately scoped to a long-lived, same-repo branch
 //     that itself opens PRs. A head whose own repo is explicitly a
 //     DIFFERENT one (a real fork) is REJECTED outright: never added,
 //     regardless of what name it carries -- this is the literal "reject
 //     head refs that belong to a different repository than the event's
 //     own" half of the fix.
-//   - issues: Labels also gets issue.labels[]; no branch concept at all.
-//   - issue_comment: no labels beyond the top-level merge above (this
-//     event's own payload does not embed the parent issue's labels), no
-//     branch concept.
+//   - issues/issue_comment: Labels also gets issue.labels[] -- D16 audit
+//     fix (confirmed finding: "an issue_comment Label filter can never
+//     match"): GitHub embeds the FULL parent issue resource, labels
+//     included, on an issue_comment delivery exactly like it does on
+//     issues itself, contrary to this comment's own previous claim that
+//     it does not. Neither event type has a branch concept at all.
 //   - push: Branches carries ONE entry, ref (stripped of "refs/heads/")
 //     and after -- the new tip BY DEFINITION (a push necessarily moves
 //     that branch's tip to after). Skipped (nil Branches, empty SHA) for
@@ -239,13 +241,18 @@ func buildGitHubEventInput(eventType string, body []byte) (domainautomation.GitH
 				if env.PullRequest.Base.Ref != "" {
 					in.Branches = append(in.Branches, domainautomation.GitHubEventBranch{Name: env.PullRequest.Base.Ref, HeadSHA: env.PullRequest.Head.SHA})
 				}
-				if env.PullRequest.Head.Ref != "" && sameRepoOrUnknown(env.PullRequest.Head.Repo.FullName, env.Repository.FullName) {
+				if env.PullRequest.Head.Ref != "" && sameRepo(env.PullRequest.Head.Repo.FullName, env.Repository.FullName) {
 					in.Branches = append(in.Branches, domainautomation.GitHubEventBranch{Name: env.PullRequest.Head.Ref, HeadSHA: env.PullRequest.Head.SHA})
 				}
 			}
 		}
 
-	case "issues":
+	case "issues", "issue_comment":
+		// D16 audit fix (confirmed finding: "an issue_comment Label filter
+		// can never match"): GitHub embeds the FULL parent issue resource
+		// on an issue_comment delivery too, labels included -- not just on
+		// "issues" itself -- so this reads env.Issue.Labels for both event
+		// types identically, never only the one this switch used to name.
 		if env.Issue != nil {
 			for _, l := range env.Issue.Labels {
 				in.Labels = append(in.Labels, l.Name)
@@ -281,19 +288,40 @@ func buildGitHubEventInput(eventType string, body []byte) (domainautomation.GitH
 	return in, true
 }
 
-// sameRepoOrUnknown reports whether headRepoFullName (a pull_request
-// event's own head.repo.full_name) may be trusted as naming a branch of
-// baseRepoFullName (the event's own top-level "repository") -- true when
-// headRepoFullName is empty (GitHub's own real payload never omits this
-// field; only a minimal/synthetic test payload does, so this fallback is
-// never exercised against a genuine webhook delivery) OR matches
-// case-insensitively (GitHub repo paths route case-insensitively,
-// mirroring TargetMatchesGitHubEvent's own identical reasoning,
-// dispatch.go). False means headRepoFullName names a DIFFERENT,
-// untrusted repository -- a real fork -- so the caller must never use its
-// own head.ref as if it were a branch of baseRepoFullName.
-func sameRepoOrUnknown(headRepoFullName, baseRepoFullName string) bool {
-	return headRepoFullName == "" || strings.EqualFold(headRepoFullName, baseRepoFullName)
+// sameRepo reports whether headRepoFullName (a pull_request event's own
+// head.repo.full_name) may be trusted as naming a branch of
+// baseRepoFullName (the event's own top-level "repository") -- true ONLY
+// on a non-empty, case-insensitive match (GitHub repo paths route
+// case-insensitively, mirroring TargetMatchesGitHubEvent's own identical
+// reasoning, dispatch.go).
+//
+// D13 audit fix, SECURITY (confirmed finding: "the fork-head rejection
+// fails open"): this function used to also return true for an EMPTY
+// headRepoFullName, reasoned (wrongly) as "GitHub's own real payload
+// never omits this field, so this fallback is never exercised against a
+// genuine webhook delivery". That reasoning does not survive contact with
+// GitHub's own documented behavior: GitHub sends "head.repo": null --
+// decoding to this exact zero value -- whenever the fork that opened this
+// PR has SINCE BEEN DELETED, and deleting your own fork is something the
+// PR's own author (an attacker, on a public repository) controls
+// unilaterally, at will, including in the same window as the webhook
+// delivery this function gates. So the previous fallback was reachable by
+// EXACTLY the input an attacker can produce on demand: open a fork PR
+// naming any head branch they like, delete the fork, and this function's
+// old "empty means same repo, trust it" branch let that attacker-chosen
+// head.ref through as if it were a branch of the base repo -- the precise
+// false positive TestBuildGitHubEventInput_PullRequest_BaseAndHeadBranches'
+// own "fork PR" case already proves this function must reject.
+//
+// Unknown provenance is not "same repo" -- fail closed, exactly like
+// every other guard in this file. The one legitimate case this used to
+// carve out (a long-lived, same-repo branch that itself opens PRs) is
+// unaffected: GitHub embeds a real, non-empty repository object on
+// head.repo for as long as the repo backing it still exists, fork or
+// not, so a genuine same-repo PR's own head.repo.full_name is never
+// empty in practice.
+func sameRepo(headRepoFullName, baseRepoFullName string) bool {
+	return headRepoFullName != "" && strings.EqualFold(headRepoFullName, baseRepoFullName)
 }
 
 // githubEventSenderID extracts the top-level "sender.id" GitHub attaches
@@ -370,10 +398,49 @@ func githubEventSenderID(body []byte) (id int64, ok bool) {
 // implicitly. A genuine LOOKUP failure (resolveCommenterActor's own
 // distinct non-nil-error return -- a transient Postgres error, saying
 // NOTHING about link state) is treated the same way: fail closed, skip
-// dispatch, log at Error. See this batch's own PR body for the follow-on
-// product question this raises (docs/DECISIONS.md) and the traceability
-// finding (does untrusted payload text reach the agent's prompt on this
-// path).
+// dispatch, log at Error.
+//
+// # D12 audit fix: this gate is HUMAN-origin only -- machine-originated
+// events are authorized per-automation, downstream
+//
+// The design above assumes the event's own top-level "sender.id" names a
+// real GitHub account capable of completing this deployment's own GitHub
+// OAuth login -- true for pull_request/issues/issue_comment/push, but
+// STRUCTURALLY IMPOSSIBLE for check_run/status: GitHub itself always
+// posts those (a CI integration, a bot, or GitHub's own "ghost"
+// placeholder), never a human account, on every real delivery of either
+// type, regardless of deployment or configuration. Gating them behind
+// "does sender.id resolve to a linked Narvi user" therefore rejected
+// EVERY delivery of check_run/status, forever -- the two event types this
+// package's own condition builder added Name/Conclusion for BY NAME
+// (§8.4) could never actually dispatch in production. A confirmed,
+// HIGH-severity finding, closed by classifying human-origin from
+// machine-origin EXPLICITLY (domainautomation.ClassifyGitHubEventOrigin
+// -- a closed, typed register, never a heuristic on the sender's own
+// login/type string) and authorizing each on its OWN terms:
+//
+//   - GitHubEventOriginHuman (unchanged by this fix): the sender-based
+//     gate immediately below, run ONCE per delivery -- the resolved
+//     sender is the SAME actor regardless of which automation's own
+//     trigger goes on to match, so there is nothing to gain by deferring
+//     this check per-automation-row.
+//   - GitHubEventOriginMachine: there is no sender identity to authorize
+//     at all, so this function does none of the above for it -- no
+//     sender resolution, no lookup, nothing. Authorization instead
+//     happens PER AUTOMATION, inside app/automation's own
+//     dispatchOneGitHubAutomation (githubdispatch.go), against THAT
+//     automation's own automations.created_by: the maintainer who
+//     created this automation and deliberately chose a check_run/status
+//     trigger is the human decision being honoured, standing in for a
+//     sender GitHub itself never sends as a completable Narvi identity.
+//
+// This split is deliberately NOT symmetric (human origin is gated here,
+// once; machine origin is gated one layer down, per row) -- see
+// GitHubEventOrigin's own doc comment (dispatch.go) for why forcing both
+// onto the identical call site would blur, rather than clarify, which
+// principal each origin is actually authorizing. Do NOT weaken the human
+// path to make the two symmetric: an arbitrary internet actor must still
+// never cause an agent run on pull_request/issues/issue_comment/push.
 func dispatchAutomationsBestEffort(ctx context.Context, logger *slog.Logger, cfg Config, identities CommenterIdentityLookup, users *postgres.UserStore, eventType string, deliveryID string, body []byte) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -395,6 +462,20 @@ func dispatchAutomationsBestEffort(ctx context.Context, logger *slog.Logger, cfg
 		return
 	}
 
+	// D12 audit fix: a machine-originated event type (check_run, status)
+	// has no sender identity to authorize at all -- GitHub itself is
+	// always the actor. Skip straight to dispatch; per-automation
+	// authorization against automations.created_by happens downstream,
+	// in app/automation's own dispatchOneGitHubAutomation. Anything NOT
+	// explicitly classified GitHubEventOriginMachine (including an event
+	// type outside GitHubDispatchAllowlist entirely, which dispatch below
+	// simply no-ops for) falls through to the human-origin sender check
+	// unchanged -- the safe, narrower default.
+	if origin, known := domainautomation.ClassifyGitHubEventOrigin(eventType); known && origin == domainautomation.GitHubEventOriginMachine {
+		automation.DispatchGitHubWebhookEvent(ctx, logger, cfg.Automations, cfg.AutomationInvocations, users, cfg.Timeouts, eventType, deliveryID, in)
+		return
+	}
+
 	senderID, ok := githubEventSenderID(body)
 	if !ok {
 		logger.Warn("github: automation dispatch: malformed webhook body (sender), skipping", "event_type", eventType)
@@ -411,5 +492,5 @@ func dispatchAutomationsBestEffort(ctx context.Context, logger *slog.Logger, cfg
 		return
 	}
 
-	automation.DispatchGitHubWebhookEvent(ctx, logger, cfg.Automations, cfg.AutomationInvocations, cfg.Timeouts, eventType, deliveryID, in)
+	automation.DispatchGitHubWebhookEvent(ctx, logger, cfg.Automations, cfg.AutomationInvocations, users, cfg.Timeouts, eventType, deliveryID, in)
 }

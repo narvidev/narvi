@@ -190,13 +190,21 @@ names only two of them will be wrong at the boundary.
 account that can open an issue, post a comment, or open a fork PR on a watched public repository —
 and, for Linear, any workspace whose deliveries are signed with this app's shared webhook secret —
 could create an automation invocation, and therefore a sandboxed agent run holding this deployment's
-own repository credentials, with no authorization check at all. The fix landed here is fail-closed:
-live dispatch now requires the GitHub sender (or the Linear workspace) to already be a known,
-linked, authorized identity, reusing the SAME `actorauthz.AuthorizeLinkedActor` gate the pre-existing
-@mention pipeline already enforces. That closes the hole, but it also forecloses a legitimate
-product shape — "triage every new issue, including one filed by someone who has never signed into
-Narvi" — that fail-closed cannot express. Whether to build an opt-in for that shape is the open
-question this entry defers.
+own repository credentials, with no authorization check at all. The fix landed here is fail-closed,
+on both paths, at the actor level: for GitHub, a HUMAN-originated event (pull_request, issues,
+issue_comment, push) requires the event's own sender to already be a known, linked, authorized
+identity; a MACHINE-originated event (check_run, status — GitHub itself is always the actor, never a
+human account, so a sender-based check is structurally unsatisfiable for these two) instead requires
+the automation's OWN creator to be that same known, linked, authorized identity — both reuse the SAME
+`actorauthz.AuthorizeLinkedActor` gate the pre-existing @mention pipeline already enforces, never a
+second, independently-invented check. For Linear, the event's own top-level `actor` (Linear's own
+"User, OAuth client, or Integration" field) is resolved via the SAME auto-linking algorithm the
+pre-existing AgentSessionEvent path already runs, then authorized through the identical
+`actorauthz.AuthorizeLinkedActor` gate — the sending workspace having an installation is tenant
+scoping, a separate, additional check, never a substitute for authorizing the actor who acted. That
+closes the hole, but it also forecloses a legitimate product shape — "triage every new issue,
+including one filed by someone who has never signed into Narvi" — that fail-closed cannot express.
+Whether to build an opt-in for that shape is the open question this entry defers.
 
 **Why it cannot be defaulted.** Fail-closed was the correct FIRST fix for a HIGH-severity,
 confirmed-exploitable gap — it is not the correct LAST word on what this deployment is allowed to

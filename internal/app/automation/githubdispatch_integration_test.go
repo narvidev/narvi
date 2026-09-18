@@ -25,7 +25,23 @@ import (
 // createGitHubAutomation inserts an automation with TriggerTypeGitHub, the
 // given event/action/label filter, and one target repo -- mirrors
 // createCronAutomation's own shape (triggerandextras_integration_test.go).
+// CreatedBy is deliberately left invalid (pgtype.UUID{}): every test using
+// this helper directly exercises a HUMAN-origin event type, which never
+// consults it (D12 audit fix) -- see createGitHubAutomationWithCreator
+// below for the "status"/"check_run" (GitHubEventOriginMachine) case.
 func (f *testFixture) createGitHubAutomation(t *testing.T, name string, cfg domainautomation.GitHubTriggerConfig, target domainautomation.Target) sqlcgen.Automation {
+	t.Helper()
+	return f.createGitHubAutomationWithCreator(t, name, cfg, target, pgtype.UUID{})
+}
+
+// createGitHubAutomationWithCreator is createGitHubAutomation's own
+// creator-supplying variant -- D12 audit fix's own required fixture: a
+// GitHubEventOriginMachine delivery (check_run, status) authorizes THIS
+// automation's own createdBy, so a test proving such a delivery actually
+// dispatches must wire a genuinely linked, authorized creator, not the
+// default invalid one every human-origin-event test in this file still
+// uses unchanged.
+func (f *testFixture) createGitHubAutomationWithCreator(t *testing.T, name string, cfg domainautomation.GitHubTriggerConfig, target domainautomation.Target, createdBy pgtype.UUID) sqlcgen.Automation {
 	t.Helper()
 	ctx := context.Background()
 
@@ -49,7 +65,7 @@ func (f *testFixture) createGitHubAutomation(t *testing.T, name string, cfg doma
 	}
 
 	row, err := f.automations.Create(ctx, sqlcgen.CreateAutomationParams{
-		Name: name, Repos: reposJSON, CreatedBy: pgtype.UUID{},
+		Name: name, Repos: reposJSON, CreatedBy: createdBy,
 		TriggerType: sqlcgen.AutomationTriggerTypeGithub, TriggerConfig: triggerConfigJSON, EnvVars: []byte("[]"),
 	})
 	if err != nil {
@@ -79,7 +95,7 @@ func TestDispatchGitHubWebhookEvent_FiresMatchingAutomation(t *testing.T) {
 		SHA:           "shaHead",
 		Branches:      []domainautomation.GitHubEventBranch{{Name: "main", HeadSHA: "shaHead"}},
 	}
-	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, platform.DefaultTimeouts(), "pull_request", "delivery-github-fires-1", in)
+	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, f.users, platform.DefaultTimeouts(), "pull_request", "delivery-github-fires-1", in)
 
 	if got := f.countInvocationsForAutomation(t, auto.ID); got != 1 {
 		t.Fatalf("invocations for automation = %d, want 1", got)
@@ -97,7 +113,7 @@ func TestDispatchGitHubWebhookEvent_EventTypeOutsideAllowlistNeverFires(t *testi
 	auto := f.createGitHubAutomation(t, "on release", domainautomation.GitHubTriggerConfig{Event: "release"}, target)
 
 	in := domainautomation.GitHubEventInput{EventType: "release", RepoFullName: "acme/repo"}
-	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, platform.DefaultTimeouts(), "release", "delivery-github-notallowlisted-1", in)
+	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, f.users, platform.DefaultTimeouts(), "release", "delivery-github-notallowlisted-1", in)
 
 	if got := f.countInvocationsForAutomation(t, auto.ID); got != 0 {
 		t.Fatalf("invocations for automation = %d, want 0 (event type not in GitHubDispatchAllowlist)", got)
@@ -115,7 +131,7 @@ func TestDispatchGitHubWebhookEvent_WrongRepoNeverFires(t *testing.T) {
 	// Event/Action/Label filter matches, but the webhook's own repository
 	// is NOT one of this automation's configured targets.
 	in := domainautomation.GitHubEventInput{EventType: "pull_request", RepoFullName: "someoneelse/unrelated"}
-	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, platform.DefaultTimeouts(), "pull_request", "delivery-github-wrongrepo-1", in)
+	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, f.users, platform.DefaultTimeouts(), "pull_request", "delivery-github-wrongrepo-1", in)
 
 	if got := f.countInvocationsForAutomation(t, auto.ID); got != 0 {
 		t.Fatalf("invocations for automation = %d, want 0 (event's own repo is not a configured target)", got)
@@ -129,15 +145,23 @@ func TestDispatchGitHubWebhookEvent_WrongRepoNeverFires(t *testing.T) {
 // commit is main's own current tip AND is merely CONTAINED by feature-x
 // (per GitHub's own branches[] containment semantics) must fire an
 // automation scoped to main and must NOT fire one scoped to feature-x.
+//
+// "status" is GitHubEventOriginMachine (D12 audit fix) -- both automations
+// below must carry a genuinely linked, authorized creator (createdBy)
+// via createGitHubAutomationWithCreator, or neither would ever dispatch
+// regardless of branch scoping, which is not what this test exists to
+// prove.
 func TestDispatchGitHubWebhookEvent_BranchTipNotContainment(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 	logger := platform.Logger(ctx)
 
+	creator := f.createAutomationCreator(t, "branchtip", sqlcgen.UserRoleMaintainer)
+
 	mainTarget := domainautomation.Target{Name: "repo", URL: "https://github.com/acme/repo", Branch: "main"}
 	featureTarget := domainautomation.Target{Name: "repo", URL: "https://github.com/acme/repo", Branch: "feature-x"}
-	mainAuto := f.createGitHubAutomation(t, "on main status success", domainautomation.GitHubTriggerConfig{Event: "status", Conclusion: "success"}, mainTarget)
-	featureAuto := f.createGitHubAutomation(t, "on feature-x status success", domainautomation.GitHubTriggerConfig{Event: "status", Conclusion: "success"}, featureTarget)
+	mainAuto := f.createGitHubAutomationWithCreator(t, "on main status success", domainautomation.GitHubTriggerConfig{Event: "status", Conclusion: "success"}, mainTarget, creator.ID)
+	featureAuto := f.createGitHubAutomationWithCreator(t, "on feature-x status success", domainautomation.GitHubTriggerConfig{Event: "status", Conclusion: "success"}, featureTarget, creator.ID)
 
 	in := domainautomation.GitHubEventInput{
 		EventType:    "status",
@@ -150,7 +174,7 @@ func TestDispatchGitHubWebhookEvent_BranchTipNotContainment(t *testing.T) {
 			{Name: "feature-x", HeadSHA: "shaFeatureTip"},
 		},
 	}
-	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, platform.DefaultTimeouts(), "status", "delivery-github-branchtip-1", in)
+	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, f.users, platform.DefaultTimeouts(), "status", "delivery-github-branchtip-1", in)
 
 	if got := f.countInvocationsForAutomation(t, mainAuto.ID); got != 1 {
 		t.Fatalf("invocations for main-scoped automation = %d, want 1 (main IS this commit's own tip)", got)
@@ -172,7 +196,7 @@ func TestDispatchGitHubWebhookEvent_PausedAutomationNeverFires(t *testing.T) {
 	}
 
 	in := domainautomation.GitHubEventInput{EventType: "pull_request", RepoFullName: "acme/repo"}
-	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, platform.DefaultTimeouts(), "pull_request", "delivery-github-paused-1", in)
+	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, f.users, platform.DefaultTimeouts(), "pull_request", "delivery-github-paused-1", in)
 
 	if got := f.countInvocationsForAutomation(t, auto.ID); got != 0 {
 		t.Fatalf("invocations for paused automation = %d, want 0", got)
@@ -201,7 +225,7 @@ func TestDispatchGitHubWebhookEvent_ThrottlesUnboundedInvocations(t *testing.T) 
 	const attempts = domainautomation.DispatchThrottleThreshold + 5
 	for i := 0; i < attempts; i++ {
 		deliveryID := fmt.Sprintf("delivery-github-throttle-%d", i)
-		automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, platform.DefaultTimeouts(), "issue_comment", deliveryID, in)
+		automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, f.users, platform.DefaultTimeouts(), "issue_comment", deliveryID, in)
 	}
 
 	if got := f.countInvocationsForAutomation(t, auto.ID); got != domainautomation.DispatchThrottleThreshold {

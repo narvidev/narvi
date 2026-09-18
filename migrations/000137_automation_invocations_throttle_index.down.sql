@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS automation_invocations_automation_id_created_at_idx;

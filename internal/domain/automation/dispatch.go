@@ -29,37 +29,123 @@ import (
 //     MatchesGitHubTrigger (which stays blind to repo/branch scoping
 //     entirely, see that function's own doc comment).
 
+// GitHubEventOrigin classifies, for ONE GitHubDispatchAllowlist event
+// type, WHO GitHub reports as having caused it -- D12 audit fix (a
+// confirmed, HIGH-severity finding: "the authorization gate kills two of
+// the six allowlisted event types"). Round 1's own actor-authorization
+// fix (D2, resolving and authorizing the event's own top-level
+// "sender.id") is right for a HUMAN-originated event -- a real GitHub
+// account can complete this deployment's own GitHub OAuth login, and its
+// resolved identity IS the human decision being honoured. It is
+// STRUCTURALLY IMPOSSIBLE to satisfy for a MACHINE-originated one:
+// check_run/status are ALWAYS posted by a CI integration, a bot, or
+// GitHub's own "ghost" placeholder, NEVER a human account -- so gating
+// either behind "does sender.id resolve to a linked Narvi user" rejects
+// every single delivery of either event type, forever, regardless of how
+// this deployment's automations are configured. See
+// ClassifyGitHubEventOrigin's own doc comment for how each origin is
+// actually authorized, and internal/adapters/inbound/github's own
+// dispatchAutomationsBestEffort / internal/app/automation's own
+// dispatchOneGitHubAutomation for where each check actually runs.
+type GitHubEventOrigin int
+
+const (
+	// GitHubEventOriginHuman means a real GitHub account -- capable of
+	// completing this deployment's own GitHub OAuth login -- performed
+	// this event. Authorized at the EVENT level (once per delivery,
+	// before any automation is even listed): the event's own top-level
+	// "sender.id" is resolved and must be a linked, non-disabled account
+	// holding authz.ActionCreateSession (internal/adapters/inbound/
+	// github's own dispatchAutomationsBestEffort, unchanged by D12 -- see
+	// that function's own doc comment).
+	GitHubEventOriginHuman GitHubEventOrigin = iota
+	// GitHubEventOriginMachine means GitHub itself (never a human
+	// account) is always the actor for every real delivery of this event
+	// type. There is no sender identity to authorize, so the
+	// authorizing PRINCIPAL is instead the automation's OWN
+	// configuration: a maintainer with authz.ActionCreateSession created
+	// this automation and deliberately chose a check_run/status trigger
+	// -- that is the human decision being honoured. Authorized PER
+	// AUTOMATION (never once per delivery, since it depends on which
+	// automation's own row is being evaluated): automations.created_by
+	// must name a linked, non-disabled account still holding
+	// authz.ActionCreateSession (internal/app/automation's own
+	// dispatchOneGitHubAutomation, githubdispatch.go). automations.
+	// created_by is nullable (ON DELETE SET NULL, migrations/
+	// 000051_automations.up.sql's own doc comment: "an automation, like a
+	// session, can outlive the user who created it") -- an automation
+	// whose creator has since been deleted has no authorizing principal
+	// left at all, and fails closed exactly like an unlinked GitHub
+	// sender does on the human path.
+	GitHubEventOriginMachine
+)
+
+// githubEventOrigins is the closed, typed, EXHAUSTIVE decision this
+// package makes for every GitHubDispatchAllowlist event type -- see
+// GitHubEventOrigin's own doc comment for the full "why" this type exists
+// at all. GitHubDispatchAllowlist itself (below) is DERIVED from this
+// map's own key set, rather than maintained as a second, independent
+// list: adding an event type to the allowlist and deciding which
+// authorization bucket it falls into are therefore the SAME source edit,
+// not two that could drift apart and silently leave a newly-allowlisted
+// event type with no origin decision at all (TestGitHubEventOriginCoversAllowlist,
+// dispatch_test.go, pins this derivation).
+var githubEventOrigins = map[string]GitHubEventOrigin{
+	// pull_request/issues/issue_comment/push: mockups.html's own worked
+	// example ("github · pull_request.labeled"), GitHubTriggerConfig.Label,
+	// and the ordinary "new commits landed on a branch" signal are all
+	// human actions -- a maintainer/contributor opening a PR, filing an
+	// issue, commenting, or pushing commits. A bot-driven push (e.g. a CI
+	// job or a dependency-update integration pushing via its own token)
+	// is possible but NOT the structural default the way check_run/status
+	// are -- an ordinary push is, overwhelmingly, a real person's `git
+	// push` -- so this stays on the human-authorization path: a bot
+	// sender simply has no linked Narvi identity and is denied exactly
+	// like any other unlinked sender, which is the correct, narrower
+	// default (fail closed on an unrecognized actor) rather than a
+	// heuristic guess at "is this sender secretly a bot" from its own
+	// login string.
+	"pull_request":  GitHubEventOriginHuman,
+	"issues":        GitHubEventOriginHuman,
+	"issue_comment": GitHubEventOriginHuman,
+	"push":          GitHubEventOriginHuman,
+	// check_run/status: §8.4's own named normalization targets --
+	// "normalise the check_run and status GitHub events with name and
+	// conclusion, plus deduplication". GitHub itself always posts these
+	// (a CI check completing, a commit status changing) -- never a human
+	// account directly, regardless of deployment or configuration.
+	"check_run": GitHubEventOriginMachine,
+	"status":    GitHubEventOriginMachine,
+}
+
+// ClassifyGitHubEventOrigin reports eventType's own GitHubEventOrigin --
+// ok is false for anything outside GitHubDispatchAllowlist (mirrors
+// ClassifyGitHubDispatch's own "outside the register" contract; a caller
+// that already checked ClassifyGitHubDispatch first can treat ok==false
+// here as unreachable in practice).
+func ClassifyGitHubEventOrigin(eventType string) (origin GitHubEventOrigin, ok bool) {
+	origin, ok = githubEventOrigins[eventType]
+	return origin, ok
+}
+
 // GitHubDispatchAllowlist is the closed, typed set of "X-GitHub-Event"
 // values a generic automation trigger is ever evaluated against --
-// ClassifyGitHubDispatch's own backing register. Deliberately NOT "every
-// event type this deployment's webhook happens to receive": a handler that
-// dispatched on any event it was handed would have its own behavior
-// defined by GitHub's future changes rather than by this repository
-// (§8.4's own explicit framing). Chosen to cover exactly what this
-// package's own condition builder can already express (Event/Action/Label
-// from the original trigger.go, Name/Conclusion added alongside this
-// allowlist) plus the two event types §8.4 names by name (check_run,
-// status):
-//
-//   - pull_request/issues/issue_comment: the three event types
-//     mockups.html's own worked example ("github · pull_request.labeled")
-//     and GitHubTriggerConfig.Label already assume carry a label-bearing
-//     payload.
-//   - push: the ordinary "new commits landed on a branch" signal, and the
-//     one event type besides pull_request whose own branch is completely
-//     unambiguous (ref/after), needed to exercise TargetMatchesGitHubEvent's
-//     own branch-scoping path without the status event's own tip-vs-
-//     containment ambiguity muddying a first, simple case.
-//   - check_run/status: §8.4's own named normalization targets --
-//     "normalise the check_run and status GitHub events with name and
-//     conclusion, plus deduplication".
-var GitHubDispatchAllowlist = map[string]bool{
-	"pull_request":  true,
-	"issues":        true,
-	"issue_comment": true,
-	"push":          true,
-	"check_run":     true,
-	"status":        true,
+// ClassifyGitHubDispatch's own backing register, DERIVED from
+// githubEventOrigins' own key set (immediately above) rather than
+// maintained as a second, independently-edited map -- see that map's own
+// doc comment for why. Deliberately NOT "every event type this
+// deployment's webhook happens to receive": a handler that dispatched on
+// any event it was handed would have its own behavior defined by GitHub's
+// future changes rather than by this repository (§8.4's own explicit
+// framing).
+var GitHubDispatchAllowlist = deriveGitHubDispatchAllowlist()
+
+func deriveGitHubDispatchAllowlist() map[string]bool {
+	m := make(map[string]bool, len(githubEventOrigins))
+	for eventType := range githubEventOrigins {
+		m[eventType] = true
+	}
+	return m
 }
 
 // GitHubDispatchSkipReason names why a live GitHub webhook delivery was
@@ -240,24 +326,34 @@ func RepoFullNameFromCloneURL(rawURL string) (fullName string, ok bool) {
 // GitHubDispatchAllowlist event type that carries NO branch identity at
 // all, by GitHub's own event shape -- not merely "a caller forgot to
 // populate Branches" the way a genuine bug would look. For these event
-// types ONLY, an UNCONFIGURED target keeps matching unconditionally
-// (target.Branch == "" -> true, exactly like the pre-D4 behavior for
-// every event type) -- there is no "which branch did this event actually
-// concern" fact to compare a run's own eventual default-branch checkout
-// against, so there is no mismatch for D4's fix to prevent: the run this
-// creates was ALWAYS going to check out the repo's default branch
-// regardless, since an issue/issue-comment event is never "about" any
-// branch in the first place. A CONFIGURED target on one of these event
-// types is UNCHANGED by this exception -- it still falls through to the
-// tip-check below, which still fails closed (in.Branches is always empty
-// for these two event types), exactly as it always has.
+// types, EVERY target matches on repo scoping alone, regardless of
+// whether Target.Branch is configured -- D14 audit fix (confirmed
+// finding: this carve-out used to key on "target.Branch == "" &&
+// eventTypesWithNoBranchConcept[...]", so an EXPLICITLY-configured branch
+// on one of these two event types fell through to the tip-check below
+// instead, which always fails closed for them, since in.Branches is
+// always empty here (issues/issue_comment carry no branch-tip evidence to
+// populate it with in the first place) -- silently making a configured
+// branch on an issues/issue_comment automation impossible to ever
+// satisfy, contradicting D4's own stated equivalence one section up that
+// an unconfigured target means "exactly the repo's own default branch".
+// The decision this fix makes: Target.Branch, for an event type with no
+// branch concept at all, names which branch a MATCHING run should check
+// out downstream (fanout.go) -- never a filter on whether this event
+// concerns that branch, because no such fact exists for these two event
+// types to compare it against (an issue/comment is never "about" a
+// branch). So the same repo-scoped target matches an issues/issue_comment
+// event whether Target.Branch is "" (checkout the repo's own default
+// branch) or "release/1.0" (checkout that branch instead) -- both are
+// ordinary, valid configurations of WHICH branch to run against, neither
+// is a claim about which branch this event concerns.
 func TargetMatchesGitHubEvent(target Target, in GitHubEventInput) bool {
 	repoFullName, ok := RepoFullNameFromCloneURL(target.URL)
 	if !ok || !strings.EqualFold(repoFullName, in.RepoFullName) {
 		return false
 	}
 
-	if target.Branch == "" && eventTypesWithNoBranchConcept[in.EventType] {
+	if eventTypesWithNoBranchConcept[in.EventType] {
 		return true
 	}
 

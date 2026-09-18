@@ -1905,6 +1905,51 @@ type Timeouts struct {
 	AutomationDispatchRetryBaseDelay time.Duration
 	AutomationDispatchRetryMaxDelay  time.Duration
 
+	// AutomationDispatchTotalBudget is D18 audit fix (confirmed, MEDIUM
+	// finding: "the retry budget multiplies inside a loop"). The three
+	// fields immediately above bound a SINGLE Postgres round trip's own
+	// worst case (750ms of sleep at today's defaults: 250ms then 500ms,
+	// per this file's own doc comment above) -- but
+	// DispatchGitHubWebhookEvent/DispatchLinearWebhookEvent (githubdispatch.go/
+	// lineardispatch.go) call platform.Retry TWICE PER MATCHING AUTOMATION
+	// (checkDispatchThrottle, then createInvocationForDeliveryWithRetry),
+	// inside a `for _, row := range rows` loop over every active
+	// automation of this trigger type -- so the inline webhook request's
+	// own worst-case backoff is that single-call bound multiplied by
+	// however many automations this delivery's trigger type happens to
+	// have configured, not the single-call bound itself. A webhook
+	// handler that sleeps for several seconds risks the provider's own
+	// delivery timeout (GitHub warns above ~10s, this file's own doc
+	// comment above) firing first, which redelivers the SAME event --
+	// interacting badly with the very redelivery-dedup D1 built this
+	// whole path around. This field bounds the TOTAL wall-clock time
+	// DispatchGitHubWebhookEvent/DispatchLinearWebhookEvent may spend
+	// (via a single context.WithTimeout wrapping the entire listing-plus-
+	// per-automation-loop body, not a per-call budget), regardless of how
+	// many automations match -- every platform.Retry call inside already
+	// shares that one ctx and returns ctx.Err() promptly once it expires
+	// (platform.Retry's own doc comment), so this is a genuine cap, not
+	// merely a suggestion an individual call could ignore. Chosen as 3
+	// seconds: comfortably wider than a handful of single-call worst
+	// cases (a real deployment's own automation count per trigger type is
+	// expected to stay small, mirroring this codebase's own "expected to
+	// stay small" precedent for an unbounded ListAutomations-shaped read),
+	// while staying a small fraction of GitHub's own ~10s delivery
+	// timeout -- not specified by the plan, chosen.
+	//
+	// Zero (the Go zero value -- an UNCONFIGURED Timeouts, e.g. a minimal
+	// test rig's own bare Config{} literal) is deliberately NOT treated as
+	// "expire immediately": DispatchGitHubWebhookEvent/
+	// DispatchLinearWebhookEvent's own dispatchTotalBudgetContext helper
+	// (githubdispatch.go) falls back to "no additional cap" (ctx passed
+	// through unchanged) for budget <= 0, never a bare
+	// context.WithTimeout(ctx, 0) -- which would create an
+	// already-expired context and fail EVERY dispatch closed, regardless
+	// of event type, the instant it is used. Caught by this batch's own
+	// new machine-origin dispatch test failing with "context deadline
+	// exceeded" against a test rig that never set this field.
+	AutomationDispatchTotalBudget time.Duration
+
 	// AutomationDispatchThrottleWindow is D8's own audit fix (confirmed,
 	// SECURITY finding: "unbounded invocations" -- every matching webhook
 	// delivery creates a brand-new invocation with no per-automation
@@ -2933,6 +2978,8 @@ func DefaultTimeouts() Timeouts {
 		AutomationDispatchMaxAttempts:    3,                      // D6 audit fix; not specified, chosen -- see field doc comment
 		AutomationDispatchRetryBaseDelay: 250 * time.Millisecond, // D6 audit fix; not specified, chosen
 		AutomationDispatchRetryMaxDelay:  1 * time.Second,        // D6 audit fix; not specified, chosen
+
+		AutomationDispatchTotalBudget: 3 * time.Second, // D18 audit fix; not specified, chosen -- see field doc comment
 
 		AutomationDispatchThrottleWindow: 5 * time.Minute, // D8 audit fix; mirrors CircuitBreakerWindow's own identical value
 

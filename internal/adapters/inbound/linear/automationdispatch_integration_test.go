@@ -49,15 +49,36 @@ func postWebhookEventType(t *testing.T, handler http.HandlerFunc, body []byte, d
 // issueEventPayload builds a synthetic, real-shaped "Issue" category
 // webhook body -- Linear's own generic action/type/data/organizationId/
 // webhookTimestamp envelope (this file's own top doc comment), with
-// data.team.key for LinearTriggerConfig.TeamKey's own filter.
+// data.team.key for LinearTriggerConfig.TeamKey's own filter. Carries NO
+// "actor" field at all -- D15 audit fix's own required negative fixture:
+// Linear's own docs describe actor as nullable ("since deleted"), and this
+// is also the shape a caller testing the D9 org-installation gate alone
+// (deliberately BEFORE ever reaching actor authorization) wants.
 func issueEventPayload(teamKey string) []byte {
+	return issueEventPayloadWithActor(teamKey, "")
+}
+
+// issueEventPayloadWithActor is issueEventPayload's own actor-carrying
+// variant -- D15 audit fix's own required positive fixture: every test
+// that expects dispatch to actually SUCCEED must now carry a resolvable
+// actor.id (Linear's own real payload shape, this package's own top doc
+// comment on linearAutomationEventEnvelope), never a bare, actor-less
+// event -- see automationdispatch.go's own D15 section for why an
+// actor-less (or unlinked) event must now be denied rather than
+// dispatched.
+func issueEventPayloadWithActor(teamKey, actorID string) []byte {
+	actorJSON := "null"
+	if actorID != "" {
+		actorJSON = fmt.Sprintf(`{"id": %q, "type": "user", "name": "Automation Actor"}`, actorID)
+	}
 	body := fmt.Sprintf(`{
 		"action": "create",
 		"type": "Issue",
 		"organizationId": "org-automation-dispatch",
+		"actor": %s,
 		"webhookTimestamp": %d,
 		"data": {"team": {"key": %q}}
-	}`, time.Now().UnixMilli(), teamKey)
+	}`, actorJSON, time.Now().UnixMilli(), teamKey)
 	return []byte(body)
 }
 
@@ -110,9 +131,17 @@ func TestWebhookHandler_AutomationDispatchFiresOnRealWebhook(t *testing.T) {
 	// workspace ("org-automation-dispatch", issueEventPayload's own fixed
 	// organizationId) has a real installation row.
 	installLinearFixture(ctx, t, pool, "org-automation-dispatch", deps.TokenEncryptionKey)
+	// D15 audit fix: deps.resolveActor/actorauthz.AuthorizeLinkedActor need
+	// deps.IdentityLink wired -- newHandlerDeps' own baseline deliberately
+	// leaves it zero-valued (every OTHER caller that needs it, e.g.
+	// identity_integration_test.go, wires its own copy in afterward too).
+	deps.IdentityLink = newIdentityLinkDepsForTest(pool, deps.AuditLog)
+	// D15 audit fix: the dispatch path ALSO now fails closed unless the
+	// event's own "actor.id" resolves to a linked, authorized Narvi user.
+	linkLinearIdentityForTest(ctx, t, pool, "linear-actor-fires-1", sqlcgen.UserRoleMaintainer)
 	handler := linear.NewWebhookHandler(deps)
 
-	rec := postWebhookEventType(t, handler, issueEventPayload("ENG"), "delivery-linear-automation-1", "Issue")
+	rec := postWebhookEventType(t, handler, issueEventPayloadWithActor("ENG", "linear-actor-fires-1"), "delivery-linear-automation-1", "Issue")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
@@ -137,9 +166,17 @@ func TestWebhookHandler_AutomationDispatchDedupesRedeliveredDelivery(t *testing.
 	// D9 audit fix: see the identical comment in
 	// TestWebhookHandler_AutomationDispatchFiresOnRealWebhook above.
 	installLinearFixture(ctx, t, pool, "org-automation-dispatch", deps.TokenEncryptionKey)
+	// D15 audit fix: deps.resolveActor/actorauthz.AuthorizeLinkedActor need
+	// deps.IdentityLink wired -- newHandlerDeps' own baseline deliberately
+	// leaves it zero-valued (every OTHER caller that needs it, e.g.
+	// identity_integration_test.go, wires its own copy in afterward too).
+	deps.IdentityLink = newIdentityLinkDepsForTest(pool, deps.AuditLog)
+	// D15 audit fix: see the identical comment in
+	// TestWebhookHandler_AutomationDispatchFiresOnRealWebhook above.
+	linkLinearIdentityForTest(ctx, t, pool, "linear-actor-dedup-1", sqlcgen.UserRoleMaintainer)
 	handler := linear.NewWebhookHandler(deps)
 
-	body := issueEventPayload("ENG")
+	body := issueEventPayloadWithActor("ENG", "linear-actor-dedup-1")
 	const deliveryID = "delivery-linear-automation-dedup-1"
 
 	first := postWebhookEventType(t, handler, body, deliveryID, "Issue")
@@ -186,11 +223,94 @@ func TestWebhookHandler_AutomationDispatchPanicDoesNotBreakTheRequest(t *testing
 	// would now skip BEFORE ever reaching panicAutomationLister -- install
 	// it so this test still genuinely exercises the panic-recovery path.
 	installLinearFixture(ctx, t, pool, "org-automation-dispatch", deps.TokenEncryptionKey)
+	// D15 audit fix: deps.resolveActor/actorauthz.AuthorizeLinkedActor need
+	// deps.IdentityLink wired -- newHandlerDeps' own baseline deliberately
+	// leaves it zero-valued (every OTHER caller that needs it, e.g.
+	// identity_integration_test.go, wires its own copy in afterward too).
+	deps.IdentityLink = newIdentityLinkDepsForTest(pool, deps.AuditLog)
+	// D15 audit fix: without a linked, authorized actor, dispatch would
+	// now ALSO skip before ever reaching panicAutomationLister -- link one
+	// for the identical reason.
+	linkLinearIdentityForTest(ctx, t, pool, "linear-actor-panic-1", sqlcgen.UserRoleMaintainer)
 	handler := linear.NewWebhookHandler(deps)
 
-	rec := postWebhookEventType(t, handler, issueEventPayload("ENG"), "delivery-linear-automation-panic-1", "Issue")
+	rec := postWebhookEventType(t, handler, issueEventPayloadWithActor("ENG", "linear-actor-panic-1"), "delivery-linear-automation-panic-1", "Issue")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d (a panic inside automation dispatch must not surface as a failed request); body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+}
+
+// TestWebhookHandler_AutomationDispatchDeniesUnauthorizedActor is D15's own
+// required, missing security proof: the only gate on this path used to be
+// "the sending workspace has an installation row" -- tenant scoping, never
+// authorization of the person who acted. A correctly-signed, correctly
+// tenant-scoped "Issue" delivery whose own actor has NO Narvi identity at
+// all must NOT create an invocation, even though the trigger's own filter
+// genuinely matches.
+func TestWebhookHandler_AutomationDispatchDeniesUnauthorizedActor(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+
+	automations := narvipg.NewAutomationStore(pool)
+	invocations := narvipg.NewAutomationInvocationStore(pool)
+	target := domainautomation.Target{Name: "repo", URL: "https://github.com/narvidev/narvi"}
+	auto := createLinearAutomation(ctx, t, automations, "on ENG issue create (unauthorized actor)", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG"}, target)
+
+	deps := newHandlerDeps(t, pool)
+	deps.Automations = automations
+	deps.AutomationInvocations = invocations
+	installLinearFixture(ctx, t, pool, "org-automation-dispatch", deps.TokenEncryptionKey)
+	// D15 audit fix: deps.resolveActor/actorauthz.AuthorizeLinkedActor need
+	// deps.IdentityLink wired -- newHandlerDeps' own baseline deliberately
+	// leaves it zero-valued (every OTHER caller that needs it, e.g.
+	// identity_integration_test.go, wires its own copy in afterward too).
+	deps.IdentityLink = newIdentityLinkDepsForTest(pool, deps.AuditLog)
+	handler := linear.NewWebhookHandler(deps)
+
+	// "linear-actor-unauthorized-1" is DELIBERATELY never linked via
+	// linkLinearIdentityForTest -- an actor with no Narvi identity at all.
+	rec := postWebhookEventType(t, handler, issueEventPayloadWithActor("ENG", "linear-actor-unauthorized-1"), "delivery-linear-unauthorized-1", "Issue")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (automation dispatch is best-effort -- an unauthorized actor is skipped, never a failed request); body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	if got := countAutomationInvocations(t, pool, auto.ID); got != 0 {
+		t.Fatalf("automation_invocations for automation = %d, want 0 (D15 audit fix: an unlinked/unauthorized actor must never create an invocation)", got)
+	}
+}
+
+// TestWebhookHandler_AutomationDispatchDeniesActorSinceDeleted covers
+// Linear's own documented "actor may be null if the user or integration
+// that triggered the action has since been deleted" case -- an event
+// carrying NO actor at all must be denied exactly like an unresolvable
+// one, never treated as trusted by absence.
+func TestWebhookHandler_AutomationDispatchDeniesActorSinceDeleted(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+
+	automations := narvipg.NewAutomationStore(pool)
+	invocations := narvipg.NewAutomationInvocationStore(pool)
+	target := domainautomation.Target{Name: "repo", URL: "https://github.com/narvidev/narvi"}
+	auto := createLinearAutomation(ctx, t, automations, "on ENG issue create (actor since deleted)", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG"}, target)
+
+	deps := newHandlerDeps(t, pool)
+	deps.Automations = automations
+	deps.AutomationInvocations = invocations
+	installLinearFixture(ctx, t, pool, "org-automation-dispatch", deps.TokenEncryptionKey)
+	// D15 audit fix: deps.resolveActor/actorauthz.AuthorizeLinkedActor need
+	// deps.IdentityLink wired -- newHandlerDeps' own baseline deliberately
+	// leaves it zero-valued (every OTHER caller that needs it, e.g.
+	// identity_integration_test.go, wires its own copy in afterward too).
+	deps.IdentityLink = newIdentityLinkDepsForTest(pool, deps.AuditLog)
+	handler := linear.NewWebhookHandler(deps)
+
+	rec := postWebhookEventType(t, handler, issueEventPayload("ENG"), "delivery-linear-actor-deleted-1", "Issue")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	if got := countAutomationInvocations(t, pool, auto.ID); got != 0 {
+		t.Fatalf("automation_invocations for automation = %d, want 0 (a null actor must never be treated as authorized)", got)
 	}
 }
 

@@ -33,6 +33,16 @@ type testFixture struct {
 	turns        *narvipg.TurnStore
 	environments *narvipg.EnvironmentStore
 	engine       *automation.Engine
+	// users (D12 audit fix) is DispatchGitHubWebhookEvent's own new
+	// actorauthz.AuthorizeLinkedActor dependency -- the per-automation,
+	// machine-origin (check_run/status) authorization gate looks up
+	// automations.created_by against this store. createGitHubAutomation's
+	// own default (CreatedBy: pgtype.UUID{}) is untouched by this addition
+	// for every human-origin-event test in this file; only
+	// TestDispatchGitHubWebhookEvent_BranchTipNotContainment (a "status"
+	// event) needs a genuinely linked creator, via createAutomationCreator
+	// below.
+	users *narvipg.UserStore
 }
 
 func newFixture(t *testing.T) *testFixture {
@@ -47,6 +57,7 @@ func newFixture(t *testing.T) *testFixture {
 	turns := narvipg.NewTurnStore(pool)
 	environments := narvipg.NewEnvironmentStore(pool)
 	auditLog := narvipg.NewAuditLogStore(pool)
+	users := narvipg.NewUserStore(pool)
 
 	// nil hub/commander/sandboxProvider/sourceControl -- mirrors
 	// internal/app/outboxworker's own sentinelautofix_integration_test.go
@@ -73,7 +84,27 @@ func newFixture(t *testing.T) *testFixture {
 	return &testFixture{
 		pool: pool, automations: automations, invocations: invocations, runs: runs,
 		sessions: sessions, turns: turns, environments: environments, engine: engine,
+		users: users,
 	}
+}
+
+// createAutomationCreator inserts a plain user row (no GitHub identity --
+// D12's own per-automation authorization gate reads automations.created_by
+// straight against users.id via actorauthz.AuthorizeLinkedActor, with no
+// provider-identity lookup involved at all) holding role, for a test to
+// wire onto an automation's own CreatedBy so a "status"/"check_run"
+// (GitHubEventOriginMachine) delivery can actually authorize it.
+func (f *testFixture) createAutomationCreator(t *testing.T, seed string, role sqlcgen.UserRole) sqlcgen.User {
+	t.Helper()
+	user, err := f.users.Create(context.Background(), sqlcgen.CreateUserParams{
+		PrimaryEmail: fmt.Sprintf("automation-creator-%s@example.com", seed),
+		DisplayName:  "Automation Creator",
+		Role:         role,
+	})
+	if err != nil {
+		t.Fatalf("create automation creator fixture user: %v", err)
+	}
+	return user
 }
 
 // createAutomation inserts a brand-new automations row with a real prompt

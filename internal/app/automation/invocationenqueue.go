@@ -88,12 +88,12 @@ type DeliveryInvocationCreator interface {
 // a second agent session, even though the automation dispatch itself had
 // already fully succeeded on the first delivery. The claim's lifetime is
 // owned by those other consumers and is not this package's to change --
-// see doc.go's own "Deduplication reuses the ALREADY-ESTABLISHED
-// webhookDeliveryStore.Claim/Release mechanism" section for what remains
-// true after this fix (the CLAIM still dedupes the delivery from ever
-// reaching this package twice while unclaimed; THIS function is what
-// makes reaching it MORE than once, after a claim release elsewhere,
-// harmless).
+// postgres.WebhookDeliveryStore.Claim (§5.1) still dedupes a delivery from
+// ever reaching this package's own callers (githubdispatch.go/
+// lineardispatch.go) twice WHILE UNCLAIMED; THIS function is what makes
+// reaching it MORE than once, after a claim release by one of those OTHER
+// consumers, harmless -- the two mechanisms are independent and BOTH
+// still hold, never one superseding the other.
 //
 // created reports whether THIS call is the one that actually created the
 // invocation (false means an earlier delivery of the identical

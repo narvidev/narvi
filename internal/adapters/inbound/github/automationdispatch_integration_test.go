@@ -38,8 +38,25 @@ import (
 // githubdispatch_integration_test.go createGitHubAutomation helper --
 // duplicated here (rather than exported/shared) because that package's
 // own testFixture is private to its _test package, exactly like every
-// other cross-package test-fixture boundary in this codebase.
+// other cross-package test-fixture boundary in this codebase. CreatedBy is
+// left invalid: every EXISTING test using this helper exercises a
+// HUMAN-origin event type, which never consults it (D12 audit fix) -- see
+// createGitHubAutomationWithCreator below for the "status"/"check_run"
+// (GitHubEventOriginMachine) case.
 func createGitHubAutomation(ctx context.Context, t *testing.T, automations *narvipg.AutomationStore, name string, cfg domainautomation.GitHubTriggerConfig, target domainautomation.Target) sqlcgen.Automation {
+	t.Helper()
+	return createGitHubAutomationWithCreator(ctx, t, automations, name, cfg, target, pgtype.UUID{})
+}
+
+// createGitHubAutomationWithCreator is createGitHubAutomation's own
+// creator-supplying, full-trigger-config variant -- D12 audit fix's own
+// required fixture: a GitHubEventOriginMachine delivery (check_run,
+// status) authorizes THIS automation's own createdBy, and its own
+// condition builder needs Name/Conclusion (§8.4's own "normalise
+// check_run and status with name and conclusion"), which
+// createGitHubAutomation's own trigger-config marshal never populated at
+// all (no existing test in this file needed them).
+func createGitHubAutomationWithCreator(ctx context.Context, t *testing.T, automations *narvipg.AutomationStore, name string, cfg domainautomation.GitHubTriggerConfig, target domainautomation.Target, createdBy pgtype.UUID) sqlcgen.Automation {
 	t.Helper()
 
 	reposJSON, err := json.Marshal([]domainautomation.Target{target})
@@ -48,19 +65,40 @@ func createGitHubAutomation(ctx context.Context, t *testing.T, automations *narv
 	}
 	triggerConfigJSON, err := json.Marshal(map[string]string{
 		"event": cfg.Event, "action": cfg.Action, "label": cfg.Label,
+		"name": cfg.Name, "conclusion": cfg.Conclusion,
 	})
 	if err != nil {
 		t.Fatalf("marshal trigger config: %v", err)
 	}
 
 	row, err := automations.Create(ctx, sqlcgen.CreateAutomationParams{
-		Name: name, Repos: reposJSON, CreatedBy: pgtype.UUID{},
+		Name: name, Repos: reposJSON, CreatedBy: createdBy,
 		TriggerType: sqlcgen.AutomationTriggerTypeGithub, TriggerConfig: triggerConfigJSON, EnvVars: []byte("[]"),
 	})
 	if err != nil {
 		t.Fatalf("create github automation: %v", err)
 	}
 	return row
+}
+
+// checkRunBody builds a real-shaped "check_run" webhook body -- GitHub
+// itself is always the actor for this event type (D12 audit fix,
+// domainautomation.GitHubEventOriginMachine), so this deliberately carries
+// NO "sender" field at all: proving dispatch succeeds without one is the
+// whole point of the tests using this helper.
+func checkRunBody(repoFullName, defaultBranch, name, conclusion, headSHA, headBranch string) []byte {
+	body, err := json.Marshal(map[string]any{
+		"action":     "completed",
+		"repository": map[string]any{"full_name": repoFullName, "default_branch": defaultBranch},
+		"check_run": map[string]any{
+			"name": name, "conclusion": conclusion, "head_sha": headSHA,
+			"check_suite": map[string]any{"head_branch": headBranch},
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return body
 }
 
 func countAutomationInvocations(t *testing.T, rig testRig, automationID pgtype.UUID) int {
@@ -353,5 +391,200 @@ func TestGitHubIntegration_AutomationDispatchDeniesUnauthorizedSender(t *testing
 
 	if got := countAutomationInvocations(t, rig, auto.ID); got != 0 {
 		t.Fatalf("automation_invocations for automation = %d, want 0 (D2 audit fix: an unlinked/unauthorized sender must never create an invocation)", got)
+	}
+}
+
+// TestGitHubIntegration_AutomationDispatchRoleMatrix is this batch's own
+// required proof (confirmed finding: "the permission choice is verified
+// by nothing" -- the only NEGATIVE test on this path used to be an
+// UNLINKED sender, so the gate would still pass every existing test if
+// authz.ActionCreateSession were swapped for an action every role holds,
+// viewer included). Exercises every role domain/authz's own matrix
+// distinguishes for ActionCreateSession (§13.3 row 2: Admin/Maintainer/
+// Member allow unconditionally, Viewer never does, no own/joined
+// carve-out to test since a brand-new invocation has no pre-existing
+// resource to own) -- a linked, non-disabled sender of EACH role,
+// asserting dispatch fires for the three allowed roles and is denied for
+// viewer.
+func TestGitHubIntegration_AutomationDispatchRoleMatrix(t *testing.T) {
+	tests := []struct {
+		role     sqlcgen.UserRole
+		wantFire bool
+	}{
+		{sqlcgen.UserRoleAdmin, true},
+		{sqlcgen.UserRoleMaintainer, true},
+		{sqlcgen.UserRoleMember, true},
+		{sqlcgen.UserRoleViewer, false},
+	}
+
+	for i, tt := range tests {
+		t.Run(string(tt.role), func(t *testing.T) {
+			repoFullName := fmt.Sprintf("acme/automation-role-matrix-%s", tt.role)
+			cloneURL := "https://github.com/acme/automation-role-matrix-" + string(tt.role)
+
+			pool := newTestPool(t)
+			automations := narvipg.NewAutomationStore(pool)
+			invocations := narvipg.NewAutomationInvocationStore(pool)
+			auto := createGitHubAutomation(context.Background(), t, automations,
+				"on labeled automation:run (role matrix "+string(tt.role)+")",
+				domainautomation.GitHubTriggerConfig{Event: "pull_request", Action: "labeled", Label: "automation:run"},
+				domainautomation.Target{Name: "repo", URL: cloneURL},
+			)
+
+			rig := newTestRig(t, func(cfg *githubingress.Config) {
+				cfg.Automations = automations
+				cfg.AutomationInvocations = invocations
+			})
+
+			senderID := int64(90000200 + i)
+			createLinkedGitHubUser(context.Background(), t, rig.users, rig.identities, senderID, tt.role)
+
+			body := pullRequestLabeledBody(repoFullName, "automation-role-matrix-"+string(tt.role), cloneURL, 46+i, "automation:run", senderID, "role-matrix-sender")
+			deliveryID := "delivery-automation-role-matrix-" + string(tt.role)
+			status := postWebhookEventType(t, rig, body, deliveryID, "pull_request")
+			if status != http.StatusOK {
+				t.Fatalf("status = %d, want %d", status, http.StatusOK)
+			}
+
+			want := 0
+			if tt.wantFire {
+				want = 1
+			}
+			if got := countAutomationInvocations(t, rig, auto.ID); got != want {
+				t.Fatalf("role %s: automation_invocations = %d, want %d", tt.role, got, want)
+			}
+		})
+	}
+}
+
+// TestGitHubIntegration_AutomationDispatchDeniesDisabledSender is this
+// batch's own required proof that Disabled is checked -- a linked sender
+// whose own role WOULD otherwise pass (Member) but whose account is
+// disabled must be denied exactly like auth.Middleware already denies
+// that same disabled user's web session (actorauthz.AuthorizeResolvedActor's
+// own doc comment, mirrored here for the automation-dispatch gate).
+func TestGitHubIntegration_AutomationDispatchDeniesDisabledSender(t *testing.T) {
+	ctx := context.Background()
+	repoFullName := "acme/automation-disabled-repo"
+	cloneURL := "https://github.com/acme/automation-disabled-repo"
+
+	pool := newTestPool(t)
+	automations := narvipg.NewAutomationStore(pool)
+	invocations := narvipg.NewAutomationInvocationStore(pool)
+	auto := createGitHubAutomation(ctx, t, automations,
+		"on labeled automation:run (disabled sender)",
+		domainautomation.GitHubTriggerConfig{Event: "pull_request", Action: "labeled", Label: "automation:run"},
+		domainautomation.Target{Name: "repo", URL: cloneURL},
+	)
+
+	rig := newTestRig(t, func(cfg *githubingress.Config) {
+		cfg.Automations = automations
+		cfg.AutomationInvocations = invocations
+	})
+
+	const senderID = 90000098
+	user := createLinkedGitHubUser(ctx, t, rig.users, rig.identities, senderID, sqlcgen.UserRoleMember)
+	if _, err := rig.pool.Exec(ctx, `UPDATE users SET disabled = true WHERE id = $1`, user.ID); err != nil {
+		t.Fatalf("disable fixture user: %v", err)
+	}
+
+	body := pullRequestLabeledBody(repoFullName, "automation-disabled-repo", cloneURL, 50, "automation:run", senderID, "disabled-sender")
+	status := postWebhookEventType(t, rig, body, "delivery-automation-disabled-1", "pull_request")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", status, http.StatusOK)
+	}
+
+	if got := countAutomationInvocations(t, rig, auto.ID); got != 0 {
+		t.Fatalf("automation_invocations for automation = %d, want 0 (a disabled sender's linked account must never create an invocation)", got)
+	}
+}
+
+// TestGitHubIntegration_AutomationDispatchFiresOnCheckRunWithAuthorizedCreator
+// is D12's own required, missing end-to-end proof: before this fix, EVERY
+// real "check_run" (and "status") delivery was rejected at this exact
+// adapter boundary, forever, because the gate demanded a resolvable
+// human sender.id -- GitHub itself is always the actor for these two
+// event types, never a human account, so that demand could never be
+// met. This posts a real, correctly-signed "check_run" delivery carrying
+// NO "sender" field at all (checkRunBody's own doc comment) against an
+// automation whose own creator IS linked and authorized, and asserts an
+// invocation is actually created -- the positive half nothing in this
+// repository proved before this batch.
+func TestGitHubIntegration_AutomationDispatchFiresOnCheckRunWithAuthorizedCreator(t *testing.T) {
+	ctx := context.Background()
+	repoFullName := "acme/automation-checkrun-repo"
+	cloneURL := "https://github.com/acme/automation-checkrun-repo"
+
+	pool := newTestPool(t)
+	automations := narvipg.NewAutomationStore(pool)
+	invocations := narvipg.NewAutomationInvocationStore(pool)
+	rig := newTestRig(t, func(cfg *githubingress.Config) {
+		cfg.Automations = automations
+		cfg.AutomationInvocations = invocations
+	})
+
+	creator, err := rig.users.Create(ctx, sqlcgen.CreateUserParams{
+		PrimaryEmail: "automation-checkrun-creator@example.com",
+		DisplayName:  "Automation Creator",
+		Role:         sqlcgen.UserRoleMaintainer,
+	})
+	if err != nil {
+		t.Fatalf("create automation creator fixture user: %v", err)
+	}
+
+	auto := createGitHubAutomationWithCreator(ctx, t, automations,
+		"on check_run ci/lint success",
+		domainautomation.GitHubTriggerConfig{Event: "check_run", Name: "ci/lint", Conclusion: "success"},
+		domainautomation.Target{Name: "repo", URL: cloneURL},
+		creator.ID,
+	)
+
+	body := checkRunBody(repoFullName, "main", "ci/lint", "success", "sha-checkrun-1", "main")
+	status := postWebhookEventType(t, rig, body, "delivery-automation-checkrun-1", "check_run")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", status, http.StatusOK)
+	}
+
+	if got := countAutomationInvocations(t, rig, auto.ID); got != 1 {
+		t.Fatalf("automation_invocations for automation = %d, want 1 (D12 audit fix: a machine-originated check_run delivery must dispatch when its automation's own creator is linked and authorized)", got)
+	}
+}
+
+// TestGitHubIntegration_AutomationDispatchDeniesCheckRunWithUnauthorizedCreator
+// is the negative half of the proof immediately above: a "check_run"
+// delivery whose matching automation's own creator is NOT linked/
+// authorized (the default -- an automation created before this fixture
+// wired any creator at all, or whose creator has since been deleted,
+// automations.created_by's own ON DELETE SET NULL) must never dispatch,
+// even though the trigger's own filter genuinely matches.
+func TestGitHubIntegration_AutomationDispatchDeniesCheckRunWithUnauthorizedCreator(t *testing.T) {
+	ctx := context.Background()
+	repoFullName := "acme/automation-checkrun-unauthorized-repo"
+	cloneURL := "https://github.com/acme/automation-checkrun-unauthorized-repo"
+
+	pool := newTestPool(t)
+	automations := narvipg.NewAutomationStore(pool)
+	invocations := narvipg.NewAutomationInvocationStore(pool)
+	rig := newTestRig(t, func(cfg *githubingress.Config) {
+		cfg.Automations = automations
+		cfg.AutomationInvocations = invocations
+	})
+
+	// CreatedBy is DELIBERATELY left invalid (createGitHubAutomation's own
+	// default) -- no linked creator at all.
+	auto := createGitHubAutomation(ctx, t, automations,
+		"on check_run ci/lint success (unauthorized creator)",
+		domainautomation.GitHubTriggerConfig{Event: "check_run", Name: "ci/lint", Conclusion: "success"},
+		domainautomation.Target{Name: "repo", URL: cloneURL},
+	)
+
+	body := checkRunBody(repoFullName, "main", "ci/lint", "success", "sha-checkrun-2", "main")
+	status := postWebhookEventType(t, rig, body, "delivery-automation-checkrun-unauthorized-1", "check_run")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want %d (automation dispatch is best-effort -- an unauthorized creator is skipped, never a failed request)", status, http.StatusOK)
+	}
+
+	if got := countAutomationInvocations(t, rig, auto.ID); got != 0 {
+		t.Fatalf("automation_invocations for automation = %d, want 0 (D12 audit fix: a machine-originated event must never dispatch for an automation with no linked, authorized creator)", got)
 	}
 }

@@ -182,8 +182,12 @@
 //     branch", resolved from the event's own "repository.default_branch",
 //     with the SAME tip-check applied to it; issues/issue_comment, which
 //     carry no branch identity at all, are the one explicit, closed-set
-//     carve-out where an unconfigured target still matches unconditionally
-//     -- see TargetMatchesGitHubEvent's own doc comment for the full
+//     carve-out where EVERY target matches unconditionally regardless of
+//     whether its own Branch is configured (D14 audit fix: a configured
+//     Branch on one of these two event types names which branch a
+//     matching run should check out, never a claim about which branch
+//     the event concerns, since neither event type has one) -- see
+//     TargetMatchesGitHubEvent's own doc comment for the full
 //     reasoning). This is where the branch-CONTAINS-vs-branch-TIP trap is
 //     closed: a GitHub `status` event's own branches[] field lists every
 //     branch that CONTAINS the commit, never the branch whose CURRENT TIP

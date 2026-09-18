@@ -6,9 +6,16 @@
 // HTTP surface at all (verified directly: no automations.go existed in
 // this package before this Step) -- every trigger evaluator this codebase
 // now has (the cron pump, live GitHub/Linear webhook dispatch, and the
-// generic webhook trigger, internal/app/automation's own doc.go) calls
-// invocationenqueue.go's own CreateInvocation unchanged, exactly as that
-// function's own doc comment anticipated before any of them existed.
+// generic webhook trigger, internal/app/automation's own doc.go) creates
+// its own invocations through ONE of TWO entry points in
+// invocationenqueue.go, not a single shared one: the cron pump and the
+// generic webhook trigger still call CreateInvocation unchanged, exactly
+// as that function's own doc comment anticipated before any of them
+// existed, while live GitHub/Linear webhook dispatch instead calls
+// CreateInvocationForDelivery (D1 audit fix -- a genuine, redeliverable
+// provider delivery needs its own idempotency the other two triggers have
+// no equivalent concept for) -- see CreateInvocationForDelivery's own doc
+// comment for the full "why" behind the split.
 //
 // Seven routes, all mounted behind auth.Middleware (cmd/control-plane/
 // main.go) like every other browser-facing REST route in this package:

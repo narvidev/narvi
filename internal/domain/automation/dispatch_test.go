@@ -30,6 +30,65 @@ func TestClassifyGitHubDispatch(t *testing.T) {
 	}
 }
 
+// TestClassifyGitHubEventOrigin is D12's own pinned proof: check_run/
+// status are the two event types this dispatch path exists to serve (§8.4
+// names them explicitly) that are ALWAYS machine-originated -- every
+// other allowlisted event type is human-originated. "release" (outside
+// the allowlist entirely) has no origin decision at all.
+func TestClassifyGitHubEventOrigin(t *testing.T) {
+	tests := []struct {
+		eventType  string
+		wantOrigin automation.GitHubEventOrigin
+		wantOK     bool
+	}{
+		{"pull_request", automation.GitHubEventOriginHuman, true},
+		{"issues", automation.GitHubEventOriginHuman, true},
+		{"issue_comment", automation.GitHubEventOriginHuman, true},
+		{"push", automation.GitHubEventOriginHuman, true},
+		{"check_run", automation.GitHubEventOriginMachine, true},
+		{"status", automation.GitHubEventOriginMachine, true},
+		{"release", automation.GitHubEventOriginHuman, false},
+		{"", automation.GitHubEventOriginHuman, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.eventType, func(t *testing.T) {
+			gotOrigin, gotOK := automation.ClassifyGitHubEventOrigin(tt.eventType)
+			if gotOK != tt.wantOK {
+				t.Fatalf("ClassifyGitHubEventOrigin(%q) ok = %v, want %v", tt.eventType, gotOK, tt.wantOK)
+			}
+			if gotOK && gotOrigin != tt.wantOrigin {
+				t.Fatalf("ClassifyGitHubEventOrigin(%q) origin = %v, want %v", tt.eventType, gotOrigin, tt.wantOrigin)
+			}
+		})
+	}
+}
+
+// TestGitHubEventOriginCoversExactlyTheAllowlist pins GitHubDispatchAllowlist's
+// own derivation (dispatch.go's own deriveGitHubDispatchAllowlist): every
+// allowlisted event type has a decided origin, and every event type with
+// a decided origin is allowlisted -- the two can never drift apart,
+// because they are now the SAME map. This is what makes "add an event
+// type to the allowlist without deciding its origin" impossible rather
+// than merely discouraged.
+func TestGitHubEventOriginCoversExactlyTheAllowlist(t *testing.T) {
+	for eventType := range automation.GitHubDispatchAllowlist {
+		if _, ok := automation.ClassifyGitHubEventOrigin(eventType); !ok {
+			t.Fatalf("allowlisted event type %q has no ClassifyGitHubEventOrigin verdict", eventType)
+		}
+	}
+	// The reverse direction: every event type ClassifyGitHubEventOrigin
+	// decides must also be allowlisted -- checked by re-deriving the
+	// allowlist would be circular (they share the same source map), so
+	// instead this walks the SAME fixed event-type list
+	// TestClassifyGitHubDispatch/TestClassifyGitHubEventOrigin both pin
+	// and asserts each is allowlisted.
+	for _, eventType := range []string{"pull_request", "issues", "issue_comment", "push", "check_run", "status"} {
+		if !automation.GitHubDispatchAllowlist[eventType] {
+			t.Fatalf("event type %q has a ClassifyGitHubEventOrigin verdict but is not in GitHubDispatchAllowlist", eventType)
+		}
+	}
+}
+
 func TestClassifyLinearDispatch(t *testing.T) {
 	tests := []struct {
 		eventType string
@@ -202,10 +261,13 @@ func TestTargetMatchesGitHubEvent_RepoScoping(t *testing.T) {
 }
 
 func TestTargetMatchesGitHubEvent_BranchScopedTargetRequiresTipEvidence(t *testing.T) {
-	// No Branches data at all (e.g. issues/issue_comment, or any event
-	// type a caller failed to populate Branches for) -- a branch-scoped
-	// target must fail closed, never assume a match.
-	in := automation.GitHubEventInput{EventType: "issues", RepoFullName: "acme/repo"}
+	// "push" DOES carry a genuine branch concept (unlike issues/
+	// issue_comment -- D14 audit fix, see
+	// TestTargetMatchesGitHubEvent_ConfiguredBranchAlwaysMatchesNoBranchConceptEvents
+	// below for THAT distinct case) -- a caller that simply never
+	// populated Branches for it must still fail closed, never assume a
+	// match.
+	in := automation.GitHubEventInput{EventType: "push", RepoFullName: "acme/repo"}
 	scoped := automation.Target{Name: "repo", URL: "https://github.com/acme/repo", Branch: "main"}
 
 	if automation.TargetMatchesGitHubEvent(scoped, in) {
@@ -272,6 +334,29 @@ func TestTargetMatchesGitHubEvent_UnconfiguredBranchAlwaysMatchesNoBranchConcept
 			unconfigured := automation.Target{Name: "repo", URL: "https://github.com/acme/repo"}
 			if !automation.TargetMatchesGitHubEvent(unconfigured, in) {
 				t.Fatalf("unconfigured target did not match a bare %s event (no branch concept, should always match), want true", eventType)
+			}
+		})
+	}
+}
+
+// TestTargetMatchesGitHubEvent_ConfiguredBranchAlwaysMatchesNoBranchConceptEvents
+// is D14's own required proof: an EXPLICITLY-configured Target.Branch on
+// an issues/issue_comment automation must match exactly like an
+// unconfigured one does (the sibling test immediately above) -- before
+// this fix, a configured branch fell through to the tip-check, which
+// always fails closed for these two event types (in.Branches is always
+// empty for them), so a configured branch could NEVER match, silently.
+// Target.Branch, for these two event types, names which branch a
+// matching run should check out downstream (fanout.go) -- never a claim
+// about which branch this event concerns, since neither event type has
+// one.
+func TestTargetMatchesGitHubEvent_ConfiguredBranchAlwaysMatchesNoBranchConceptEvents(t *testing.T) {
+	for _, eventType := range []string{"issues", "issue_comment"} {
+		t.Run(eventType, func(t *testing.T) {
+			in := automation.GitHubEventInput{EventType: eventType, RepoFullName: "acme/repo"}
+			configured := automation.Target{Name: "repo", URL: "https://github.com/acme/repo", Branch: "release/1.0"}
+			if !automation.TargetMatchesGitHubEvent(configured, in) {
+				t.Fatalf("configured-branch target did not match a bare %s event (no branch concept, should always match regardless of Target.Branch), want true", eventType)
 			}
 		})
 	}

@@ -59,7 +59,7 @@ func TestDispatchGitHubWebhookEvent_RetriesTransientListFailure(t *testing.T) {
 	// observes.
 	lister := &countingFailNTimesLister{failTimes: timeouts.AutomationDispatchMaxAttempts - 1}
 
-	automation.DispatchGitHubWebhookEvent(context.Background(), discardLogger(), lister, noopDeliveryInvocationCreator{}, timeouts, "pull_request", "delivery-retry-transient-1", domainautomation.GitHubEventInput{EventType: "pull_request", RepoFullName: "acme/repo"})
+	automation.DispatchGitHubWebhookEvent(context.Background(), discardLogger(), lister, noopDeliveryInvocationCreator{}, nil, timeouts, "pull_request", "delivery-retry-transient-1", domainautomation.GitHubEventInput{EventType: "pull_request", RepoFullName: "acme/repo"})
 
 	if lister.calls != timeouts.AutomationDispatchMaxAttempts {
 		t.Fatalf("ListActiveGitHubAutomations call count = %d, want exactly %d (retried up to the budget, succeeding on the last attempt)", lister.calls, timeouts.AutomationDispatchMaxAttempts)
@@ -73,9 +73,67 @@ func TestDispatchGitHubWebhookEvent_StopsRetryingAtMaxAttemptsOnPermanentTransie
 	// forever) and never fewer (a bug that never retried at all).
 	lister := &countingFailNTimesLister{failTimes: timeouts.AutomationDispatchMaxAttempts + 10}
 
-	automation.DispatchGitHubWebhookEvent(context.Background(), discardLogger(), lister, noopDeliveryInvocationCreator{}, timeouts, "pull_request", "delivery-retry-exhausted-1", domainautomation.GitHubEventInput{EventType: "pull_request", RepoFullName: "acme/repo"})
+	automation.DispatchGitHubWebhookEvent(context.Background(), discardLogger(), lister, noopDeliveryInvocationCreator{}, nil, timeouts, "pull_request", "delivery-retry-exhausted-1", domainautomation.GitHubEventInput{EventType: "pull_request", RepoFullName: "acme/repo"})
 
 	if lister.calls != timeouts.AutomationDispatchMaxAttempts {
 		t.Fatalf("ListActiveGitHubAutomations call count = %d, want exactly %d (bounded, not unbounded retry)", lister.calls, timeouts.AutomationDispatchMaxAttempts)
+	}
+}
+
+// ctxCapturingLister is a GitHubTriggerLister fake that records the ctx it
+// was actually called with -- D18's own required proof of
+// dispatchTotalBudgetContext's own degenerate-zero-value handling (this
+// package's own githubdispatch.go), since that helper is unexported and
+// this package cannot reach it directly from _test.
+type ctxCapturingLister struct {
+	gotCtx context.Context
+}
+
+func (f *ctxCapturingLister) ListActiveGitHubAutomations(ctx context.Context) ([]sqlcgen.Automation, error) {
+	f.gotCtx = ctx
+	return nil, nil
+}
+
+// TestDispatchGitHubWebhookEvent_ZeroTotalBudgetDoesNotExpireContextImmediately
+// is D18's own required, missing proof for the DEFAULT (unconfigured)
+// configuration: platform.Timeouts{} (the Go zero value -- every existing
+// test rig in the github/linear adapter packages that never explicitly
+// sets Config.Timeouts, this package's own githubdispatch_test.go included)
+// must NOT make dispatchTotalBudgetContext hand context.WithTimeout(ctx, 0)
+// to the caller -- that creates an ALREADY-EXPIRED context, silently
+// failing every dispatch closed the instant it is used. Caught for real
+// against a live Postgres by this batch's own
+// TestGitHubIntegration_AutomationDispatchFiresOnCheckRunWithAuthorizedCreator
+// (github/automationdispatch_integration_test.go) before this exact
+// zero-value handling was added -- pinned here at the unit level too, so
+// a future regression fails fast, with no container needed.
+func TestDispatchGitHubWebhookEvent_ZeroTotalBudgetDoesNotExpireContextImmediately(t *testing.T) {
+	lister := &ctxCapturingLister{}
+
+	automation.DispatchGitHubWebhookEvent(context.Background(), discardLogger(), lister, noopDeliveryInvocationCreator{}, nil, platform.Timeouts{}, "pull_request", "delivery-zero-budget-1", domainautomation.GitHubEventInput{EventType: "pull_request", RepoFullName: "acme/repo"})
+
+	if lister.gotCtx == nil {
+		t.Fatalf("ListActiveGitHubAutomations was never called")
+	}
+	if _, ok := lister.gotCtx.Deadline(); ok {
+		t.Fatalf("ctx passed to ListActiveGitHubAutomations carries a deadline, want none -- an unconfigured (zero-value) AutomationDispatchTotalBudget must fall back to \"no additional cap\", never context.WithTimeout(ctx, 0)")
+	}
+}
+
+// TestDispatchGitHubWebhookEvent_ConfiguredTotalBudgetSetsADeadline is the
+// positive half of the proof immediately above: a REAL, configured budget
+// (platform.DefaultTimeouts()) must still actually bound ctx -- proving
+// the zero-value fallback above did not also silently disable the cap for
+// the configured case.
+func TestDispatchGitHubWebhookEvent_ConfiguredTotalBudgetSetsADeadline(t *testing.T) {
+	lister := &ctxCapturingLister{}
+
+	automation.DispatchGitHubWebhookEvent(context.Background(), discardLogger(), lister, noopDeliveryInvocationCreator{}, nil, platform.DefaultTimeouts(), "pull_request", "delivery-configured-budget-1", domainautomation.GitHubEventInput{EventType: "pull_request", RepoFullName: "acme/repo"})
+
+	if lister.gotCtx == nil {
+		t.Fatalf("ListActiveGitHubAutomations was never called")
+	}
+	if _, ok := lister.gotCtx.Deadline(); !ok {
+		t.Fatalf("ctx passed to ListActiveGitHubAutomations carries no deadline, want one bounded by AutomationDispatchTotalBudget")
 	}
 }

@@ -9,10 +9,23 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/actorauthz"
+	"github.com/narvidev/narvi/internal/domain/authz"
 	domainautomation "github.com/narvidev/narvi/internal/domain/automation"
 	"github.com/narvidev/narvi/internal/platform"
 )
+
+// githubAutomationAuthzSurface is D12 audit fix's own "surface" label for
+// actorauthz.AuthorizeLinkedActor calls made from THIS package (the
+// per-automation, machine-origin gate below) -- kept distinct from
+// internal/adapters/inbound/github's own "github" constant (identity.go)
+// so a log reader can tell "the adapter denied the human sender, once per
+// delivery" apart from "the per-automation creator-authorization gate
+// denied a machine-originated event for THIS ONE automation", even though
+// both ultimately gate the identical authz.ActionCreateSession row.
+const githubAutomationAuthzSurface = "automation-github"
 
 // githubTriggerConfigJSON is this package's OWN small, private, decode-only
 // copy of the github trigger_config wire shape -- see
@@ -116,11 +129,55 @@ const githubDeliveryProvider = "github"
 // dispatchAutomationsBestEffort) is also not retried here -- a
 // programming bug reproduces itself identically on a retry; only this
 // package's OWN two Postgres calls are.
-func DispatchGitHubWebhookEvent(ctx context.Context, logger *slog.Logger, automations GitHubTriggerLister, invocations DeliveryInvocationCreator, timeouts platform.Timeouts, eventType string, deliveryID string, in domainautomation.GitHubEventInput) {
+//
+// # D18 audit fix: one shared total budget, not a per-automation multiple
+//
+// Both of those platform.Retry-wrapped round trips are bounded per CALL --
+// but dispatchOneGitHubAutomation runs once per row in the `for _, row :=
+// range rows` loop below, and checkDispatchThrottle/
+// createInvocationForDeliveryWithRetry (each itself another
+// platform.Retry call) run inside THAT function -- so, before this fix,
+// this function's own total worst-case sleep was the single-call bound
+// multiplied by however many automations this delivery's trigger type had
+// configured, not the single-call bound itself (confirmed, MEDIUM
+// finding). ctx is now wrapped in a single context.WithTimeout(ctx,
+// timeouts.AutomationDispatchTotalBudget) covering the list call AND the
+// entire per-automation loop -- every platform.Retry call below shares
+// this ONE deadline and returns ctx.Err() promptly once it expires
+// (platform.Retry's own doc comment), so the total time this function may
+// spend retrying is now bounded regardless of how many automations match.
+// See AutomationDispatchTotalBudget's own doc comment (platform/
+// timeouts.go) for the chosen value and the full "why".
+//
+// # D12 audit fix: a per-automation, machine-origin authorization lookup
+//
+// dispatchOneGitHubAutomation also calls actorauthz.AuthorizeLinkedActor
+// against row.CreatedBy for a GitHubEventOriginMachine event (check_run,
+// status) -- a THIRD genuine Postgres round trip this file makes, but
+// deliberately NOT wrapped in platform.Retry: it fails closed on any
+// error, exactly like every other actorauthz call site in this codebase
+// (github/linear/slack's own identity.go files), none of which retry
+// either -- this is a consistent, established choice, not a gap this fix
+// introduces.
+func DispatchGitHubWebhookEvent(ctx context.Context, logger *slog.Logger, automations GitHubTriggerLister, invocations DeliveryInvocationCreator, users *postgres.UserStore, timeouts platform.Timeouts, eventType string, deliveryID string, in domainautomation.GitHubEventInput) {
 	if reason := domainautomation.ClassifyGitHubDispatch(eventType); reason != domainautomation.GitHubDispatchNotSkipped {
 		logger.Warn("automation: github event not evaluated against any trigger", "event_type", eventType, "reason", string(reason))
 		return
 	}
+
+	// D18 audit fix (confirmed finding: "the retry budget multiplies
+	// inside a loop"): every platform.Retry call below -- the list call
+	// here, plus checkDispatchThrottle/createInvocationForDeliveryWithRetry
+	// called ONCE PER MATCHING AUTOMATION inside the loop below -- now
+	// shares this ONE deadline, so the total time this function may spend
+	// retrying is bounded regardless of how many automations match, not
+	// the single-call bound multiplied by that count. See
+	// platform.Timeouts.AutomationDispatchTotalBudget's own doc comment
+	// for the full "why", and dispatchTotalBudgetContext's own doc comment
+	// for why an UNCONFIGURED (zero-value) budget must NOT be handed to
+	// context.WithTimeout directly.
+	ctx, cancel := dispatchTotalBudgetContext(ctx, timeouts.AutomationDispatchTotalBudget)
+	defer cancel()
 
 	var rows []sqlcgen.Automation
 	retryErr := platform.Retry(ctx, timeouts.AutomationDispatchMaxAttempts, timeouts.AutomationDispatchRetryBaseDelay, timeouts.AutomationDispatchRetryMaxDelay, func() error {
@@ -134,11 +191,39 @@ func DispatchGitHubWebhookEvent(ctx context.Context, logger *slog.Logger, automa
 	}
 
 	for _, row := range rows {
-		dispatchOneGitHubAutomation(ctx, logger, invocations, timeouts, row, eventType, deliveryID, in)
+		dispatchOneGitHubAutomation(ctx, logger, invocations, users, timeouts, row, eventType, deliveryID, in)
 	}
 }
 
-func dispatchOneGitHubAutomation(ctx context.Context, logger *slog.Logger, invocations DeliveryInvocationCreator, timeouts platform.Timeouts, row sqlcgen.Automation, eventType string, deliveryID string, in domainautomation.GitHubEventInput) {
+// dispatchTotalBudgetContext wraps ctx in a context.WithTimeout bounded by
+// budget -- D18 audit fix's own total-budget cap, shared by
+// DispatchGitHubWebhookEvent/DispatchLinearWebhookEvent. budget <= 0 (the
+// Go zero value -- an UNCONFIGURED platform.Timeouts, which this exact
+// package's own test fixtures and this codebase's other minimal-wiring
+// test rigs deliberately leave zero for fields "nothing yet cares about")
+// is treated as "no additional cap": returns ctx completely UNCHANGED (a
+// no-op cancel), never context.WithTimeout(ctx, 0) -- which creates a
+// context whose deadline is effectively already past, silently failing
+// EVERY dispatch closed regardless of event type, human- or
+// machine-origin, the instant it is used. That degenerate input was
+// caught by this batch's own new machine-origin dispatch test
+// (TestGitHubIntegration_AutomationDispatchFiresOnCheckRunWithAuthorizedCreator,
+// github/automationdispatch_integration_test.go) failing with "list
+// active github automations failed: context deadline exceeded" against a
+// test rig that -- like every OTHER pre-existing test in that file --
+// never sets Config.Timeouts at all. Mirrors platform.Retry's own
+// identical "attempts < 1 is treated as 1, never zero calls" convention
+// for its own degenerate input: a zero/invalid budget falls back to a
+// safe default (here, "whatever deadline ctx already carries, unchanged")
+// rather than the literal, silently-catastrophic zero-value behavior.
+func dispatchTotalBudgetContext(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	if budget <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, budget)
+}
+
+func dispatchOneGitHubAutomation(ctx context.Context, logger *slog.Logger, invocations DeliveryInvocationCreator, users *postgres.UserStore, timeouts platform.Timeouts, row sqlcgen.Automation, eventType string, deliveryID string, in domainautomation.GitHubEventInput) {
 	logger = logger.With("automation_id", row.ID.String())
 
 	cfg, err := unmarshalGitHubTriggerConfig(row.TriggerConfig)
@@ -148,6 +233,36 @@ func dispatchOneGitHubAutomation(ctx context.Context, logger *slog.Logger, invoc
 	}
 	if !domainautomation.MatchesGitHubTrigger(cfg, in) {
 		return
+	}
+
+	// D12 audit fix: a machine-originated event type (check_run, status --
+	// GitHub itself is always the actor, never a human account) has no
+	// sender identity for the adapter to have authorized; instead, THIS
+	// automation's own creator must be a linked, non-disabled account
+	// still holding authz.ActionCreateSession -- the maintainer who
+	// created this automation and deliberately chose this trigger is the
+	// human decision being honoured. row.CreatedBy is nullable (ON DELETE
+	// SET NULL, migrations/000051_automations.up.sql: "an automation, like
+	// a session, can outlive the user who created it") --
+	// actorauthz.AuthorizeLinkedActor denies immediately when it is
+	// invalid, exactly like an unlinked GitHub sender is denied on the
+	// human-origin path (internal/adapters/inbound/github's own
+	// dispatchAutomationsBestEffort). Human-originated events are
+	// UNAFFECTED: their sender was already authorized once, upstream, by
+	// that SAME adapter function, before this automation was even listed
+	// -- see GitHubEventOrigin's own doc comment (domain/automation/
+	// dispatch.go) for why the two origins are deliberately gated at
+	// different layers rather than forced onto one shared call site. This
+	// lookup is NOT wrapped in platform.Retry (unlike this file's other
+	// Postgres round trips, D6) -- it fails closed on any error, exactly
+	// like every other actorauthz.AuthorizeLinkedActor/AuthorizeResolvedActor
+	// call site across this codebase (github/linear/slack's own identity.go
+	// files), none of which retry either.
+	if origin, known := domainautomation.ClassifyGitHubEventOrigin(eventType); known && origin == domainautomation.GitHubEventOriginMachine {
+		if !actorauthz.AuthorizeLinkedActor(ctx, logger, githubAutomationAuthzSurface, users, row.CreatedBy, authz.ActionCreateSession, authz.Resource{}) {
+			logger.Info("automation: github dispatch: automation creator not authorized for a machine-originated event, skipping", "event_type", eventType, "reason", "creator_unlinked_or_unauthorized")
+			return
+		}
 	}
 
 	targets, err := UnmarshalTargets(row.Repos)

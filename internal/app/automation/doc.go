@@ -204,20 +204,41 @@
 // # D6 audit fix: transient Postgres failures retry inline, bounded
 //
 // Every Postgres round trip inside DispatchGitHubWebhookEvent/
-// DispatchLinearWebhookEvent (listing active automations, creating an
-// invocation, counting recent invocations for D8's own throttle below) is
-// wrapped in platform.Retry, bounded by platform.Timeouts.
-// AutomationDispatchMaxAttempts/AutomationDispatchRetryBaseDelay/
-// AutomationDispatchRetryMaxDelay -- confirmed finding: before this fix, a
-// transient error (or a panic, recovered and logged one layer up by the
-// adapter's own dispatchAutomationsBestEffort) was simply swallowed while
-// the handler kept the webhook-delivery claim and still answered 200, so
-// the automation permanently never fired and even a manual redelivery was
+// DispatchLinearWebhookEvent that lists/creates/counts rows (listing
+// active automations, creating an invocation, counting recent invocations
+// for D8's own throttle below) is wrapped in platform.Retry, bounded by
+// platform.Timeouts.AutomationDispatchMaxAttempts/
+// AutomationDispatchRetryBaseDelay/AutomationDispatchRetryMaxDelay --
+// confirmed finding: before this fix, a transient error (or a panic,
+// recovered and logged one layer up by the adapter's own
+// dispatchAutomationsBestEffort) was simply swallowed while the handler
+// kept the webhook-delivery claim and still answered 200, so the
+// automation permanently never fired and even a manual redelivery was
 // skipped as a duplicate (the claim was never released for THIS reason).
 // Deliberately NOT fixed by touching that claim in either direction (see
 // D1's own section above: its lifetime belongs to the OTHER consumers of
 // the same delivery) -- a bounded, in-process retry is the only retry path
-// available to a consumer that must not touch it.
+// available to a consumer that must not touch it. The ONE exception is
+// D12's own per-automation, machine-origin actorauthz.AuthorizeLinkedActor
+// lookup (githubdispatch.go) -- deliberately NOT wrapped in platform.Retry,
+// consistent with every other actorauthz call site in this codebase
+// (github/linear/slack's own identity.go files), none of which retry
+// either.
+//
+// # D18 audit fix: one total budget, not a per-call one multiplied by every matching automation
+//
+// D6's own per-call retry bound above is necessary but not sufficient on
+// its own: DispatchGitHubWebhookEvent/DispatchLinearWebhookEvent call
+// checkDispatchThrottle/createInvocationForDeliveryWithRetry (each its own
+// platform.Retry call) ONCE PER MATCHING AUTOMATION, inside a loop -- so,
+// before this fix, the inline webhook request's own worst-case sleep was
+// the single-call bound MULTIPLIED by however many automations a
+// delivery's trigger type had configured, not the single-call bound
+// itself (confirmed, MEDIUM finding). Both dispatch entry points now wrap
+// their own ctx in a single context.WithTimeout(ctx,
+// platform.Timeouts.AutomationDispatchTotalBudget) covering the list call
+// AND the entire per-automation loop, so every platform.Retry call inside
+// shares ONE deadline instead.
 //
 // # D8 audit fix: a per-automation dispatch throttle
 //
