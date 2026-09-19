@@ -25,6 +25,11 @@ import (
 type githubAutomationEventEnvelope struct {
 	Action     string `json:"action"`
 	Repository struct {
+		// ID is U9 audit fix's own addition -- checkRunHeadBranchProvenanceOK's
+		// own cross-check input (below): GitHub's own numeric, stable
+		// repository id, never omitted from a real payload's full
+		// repository object.
+		ID       int64  `json:"id"`
 		FullName string `json:"full_name"`
 
 		// DefaultBranch is "repository.default_branch" -- D4 audit fix's
@@ -101,6 +106,18 @@ type githubAutomationEventEnvelope struct {
 		HeadSHA    string `json:"head_sha"`
 		CheckSuite struct {
 			HeadBranch string `json:"head_branch"`
+
+			// PullRequests is U9 audit fix's own addition -- see
+			// checkRunHeadBranchProvenanceOK's own doc comment (below) for
+			// the full "why": the ONE piece of repository-identity evidence
+			// check_suite carries at all, verified against GitHub's own
+			// canonical webhook JSON Schema (octokit/webhooks'
+			// payload-schemas/api.github.com/check_run/created.schema.json,
+			// $ref common/check-run-pull-request.schema.json ->
+			// common/repo-ref.schema.json), present only for a PR that
+			// happens to share this exact head_branch -- empty whenever no
+			// such PR exists, fork or not.
+			PullRequests []githubCheckRunPullRequest `json:"pull_requests"`
 		} `json:"check_suite"`
 	} `json:"check_run"`
 
@@ -115,6 +132,22 @@ type githubAutomationEventEnvelope struct {
 			SHA string `json:"sha"`
 		} `json:"commit"`
 	} `json:"branches"`
+}
+
+// githubCheckRunPullRequest mirrors octokit/webhooks' own
+// common/check-run-pull-request.schema.json exactly -- $ref'd from
+// check_run/created.schema.json's own check_suite.pull_requests[] (U9
+// audit fix). head.repo (common/repo-ref.schema.json) is a THREE-field
+// {id, url, name} object -- deliberately NOT the fuller repository object
+// pull_request.head.repo carries (sameRepo's own input): id is the only
+// field checkRunHeadBranchProvenanceOK needs, a stable numeric repository
+// id no rename/fork can change.
+type githubCheckRunPullRequest struct {
+	Head struct {
+		Repo struct {
+			ID int64 `json:"id"`
+		} `json:"repo"`
+	} `json:"head"`
 }
 
 const pushRefBranchPrefix = "refs/heads/"
@@ -271,7 +304,13 @@ func buildGitHubEventInput(eventType string, body []byte) (domainautomation.GitH
 			in.Name = env.CheckRun.Name
 			in.Conclusion = env.CheckRun.Conclusion
 			in.SHA = env.CheckRun.HeadSHA
-			if env.CheckRun.CheckSuite.HeadBranch != "" {
+			// U9 audit fix: checkRunHeadBranchProvenanceOK's own doc
+			// comment (below) explains why this is a defense-in-depth
+			// check, not the primary guarantee -- GitHub's own documented
+			// "head_branch is null for a forked repository" behavior
+			// remains the primary reason a fork's own branch never reaches
+			// here at all.
+			if env.CheckRun.CheckSuite.HeadBranch != "" && checkRunHeadBranchProvenanceOK(env.CheckRun.CheckSuite.PullRequests, env.Repository.ID) {
 				in.Branches = []domainautomation.GitHubEventBranch{{Name: env.CheckRun.CheckSuite.HeadBranch, HeadSHA: env.CheckRun.HeadSHA}}
 			}
 		}
@@ -322,6 +361,58 @@ func buildGitHubEventInput(eventType string, body []byte) (domainautomation.GitH
 // empty in practice.
 func sameRepo(headRepoFullName, baseRepoFullName string) bool {
 	return headRepoFullName != "" && strings.EqualFold(headRepoFullName, baseRepoFullName)
+}
+
+// checkRunHeadBranchProvenanceOK is U9 audit fix's own defense-in-depth
+// check for check_run's own head_branch (buildGitHubEventInput's own
+// "check_run" case, above) -- LOW confirmed finding: unlike pull_request's
+// own sameRepo check immediately above (head.repo.full_name against the
+// event's own top-level repository), check_suite carries NO repository
+// identity of its own at all -- verified directly against GitHub's own
+// canonical webhook JSON Schema (github.com/octokit/webhooks,
+// payload-schemas/api.github.com/check_run/created.schema.json): a
+// check_suite object's own properties are exactly id, node_id,
+// head_branch, head_sha, status, conclusion, url, before, after,
+// pull_requests, deployment, app, created_at, updated_at -- no
+// head_repository field, and no other field naming which repository
+// head_branch belongs to. This code's PRIMARY defense is instead GitHub's
+// own DOCUMENTED guarantee (that same schema's own pull_requests
+// description, quoted verbatim): "When the check suite's head_branch is in
+// a forked repository it will be null and the pull_requests array will be
+// empty" -- an EXTERNAL behaviour this repository does not control and
+// cannot directly assert against a live delivery; see
+// TestCheckRunHeadBranchForkGuaranteeIsDocumented (automationdispatch_test.go)
+// for that assumption pinned in a test a future reader must update if
+// GitHub's own docs ever change it.
+//
+// This function is the ONE additional check that same schema does make
+// possible: check_suite.pull_requests[] (populated whenever an open PR
+// happens to share this exact head_branch, regardless of fork status) DOES
+// carry each entry's own head.repo.id -- a stable, unique GitHub
+// repository id (common/repo-ref.schema.json) -- checked here against
+// repositoryID (the event's own top-level "repository.id"), mirroring
+// sameRepo's own "unknown provenance is not same repo, fail closed"
+// reasoning exactly. An EMPTY pull_requests array (the common case: no PR
+// happens to share this branch, fork or not) has no signal to check at
+// all and returns true unchanged -- this is a genuine, always-present-
+// when-available check, never a substitute for GitHub's own
+// null-head_branch guarantee, which remains this code's only defense for
+// the (more common) empty-pull_requests case. repositoryID == 0 (this
+// package's OWN pre-U9 test fixtures, none of which populate
+// "repository.id" -- a real GitHub payload's full repository object
+// always does) is treated the same way: nothing to compare against, so
+// this check passes through rather than fail closed on missing test data
+// it cannot distinguish from a genuinely absent id.
+func checkRunHeadBranchProvenanceOK(pullRequests []githubCheckRunPullRequest, repositoryID int64) bool {
+	if len(pullRequests) == 0 || repositoryID == 0 {
+		return true
+	}
+	for _, pr := range pullRequests {
+		if pr.Head.Repo.ID == repositoryID {
+			return true
+		}
+	}
+	return false
 }
 
 // githubEventSenderID extracts the top-level "sender.id" GitHub attaches
@@ -441,6 +532,21 @@ func githubEventSenderID(body []byte) (id int64, ok bool) {
 // principal each origin is actually authorizing. Do NOT weaken the human
 // path to make the two symmetric: an arbitrary internet actor must still
 // never cause an agent run on pull_request/issues/issue_comment/push.
+//
+// # U6/U10 audit fix: classify the event type FIRST, before any Postgres round trip
+//
+// Confirmed MEDIUM finding: domainautomation.ClassifyGitHubDispatch used to
+// run INSIDE automation.DispatchGitHubWebhookEvent, i.e. AFTER the
+// identity resolution (resolveCommenterActor) and authorization
+// (actorauthz.AuthorizeLinkedActor) below -- so every GitHub webhook
+// category this deployment's automation dispatch can never act on (any
+// event type outside domainautomation.GitHubDispatchAllowlist -- dozens of
+// real GitHub event types, against the six this allowlist actually covers)
+// still paid an identity-resolution round trip, and a user lookup whenever
+// the sender happened to be linked, for nothing. Classification needs only
+// eventType -- already this function's own parameter, available before ANY
+// of that work -- so it now runs immediately after the (equally cheap,
+// no-I/O) nil-dependency check, before body is even decoded.
 func dispatchAutomationsBestEffort(ctx context.Context, logger *slog.Logger, cfg Config, identities CommenterIdentityLookup, users *postgres.UserStore, eventType string, deliveryID string, body []byte) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -451,6 +557,16 @@ func dispatchAutomationsBestEffort(ctx context.Context, logger *slog.Logger, cfg
 	if cfg.Automations == nil || cfg.AutomationInvocations == nil {
 		return
 	}
+
+	// U6/U10 audit fix: see this function's own doc comment above.
+	// Deliberately NOT logged at Warn: this fires on every ordinary
+	// delivery of a category automation dispatch is simply not subscribed
+	// to, not a symptom of anything wrong.
+	if reason := domainautomation.ClassifyGitHubDispatch(eventType); reason != domainautomation.GitHubDispatchNotSkipped {
+		logger.Debug("github: automation dispatch: event type not evaluated against any trigger", "event_type", eventType, "reason", string(reason))
+		return
+	}
+
 	if identities == nil || users == nil {
 		logger.Error("github: automation dispatch: identities/users store not wired, skipping (fail closed)", "event_type", eventType)
 		return

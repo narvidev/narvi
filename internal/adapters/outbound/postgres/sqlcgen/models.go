@@ -1618,26 +1618,27 @@ type AutoApprovalOutcome struct {
 }
 
 type Automation struct {
-	ID                    pgtype.UUID                 `json:"id"`
-	Name                  string                      `json:"name"`
-	Prompt                *string                     `json:"prompt"`
-	Repos                 []byte                      `json:"repos"`
-	Status                AutomationStatus            `json:"status"`
-	ConsecutiveFailures   int32                       `json:"consecutive_failures"`
-	CreatedBy             pgtype.UUID                 `json:"created_by"`
-	CreatedAt             pgtype.Timestamptz          `json:"created_at"`
-	UpdatedAt             pgtype.Timestamptz          `json:"updated_at"`
-	TriggerType           AutomationTriggerType       `json:"trigger_type"`
-	TriggerConfig         []byte                      `json:"trigger_config"`
-	WebhookTokenHash      *string                     `json:"webhook_token_hash"`
-	LastCronFiredAt       pgtype.Timestamptz          `json:"last_cron_fired_at"`
-	SandboxPathScope      []byte                      `json:"sandbox_path_scope"`
-	SandboxMockConfigured bool                        `json:"sandbox_mock_configured"`
-	SandboxContractsPath  *string                     `json:"sandbox_contracts_path"`
-	EnvVars               []byte                      `json:"env_vars"`
-	LastRunAt             pgtype.Timestamptz          `json:"last_run_at"`
-	LastRunStatus         *AutomationInvocationStatus `json:"last_run_status"`
-	ArtifactSummary       *string                     `json:"artifact_summary"`
+	ID                       pgtype.UUID                 `json:"id"`
+	Name                     string                      `json:"name"`
+	Prompt                   *string                     `json:"prompt"`
+	Repos                    []byte                      `json:"repos"`
+	Status                   AutomationStatus            `json:"status"`
+	ConsecutiveFailures      int32                       `json:"consecutive_failures"`
+	CreatedBy                pgtype.UUID                 `json:"created_by"`
+	CreatedAt                pgtype.Timestamptz          `json:"created_at"`
+	UpdatedAt                pgtype.Timestamptz          `json:"updated_at"`
+	TriggerType              AutomationTriggerType       `json:"trigger_type"`
+	TriggerConfig            []byte                      `json:"trigger_config"`
+	WebhookTokenHash         *string                     `json:"webhook_token_hash"`
+	LastCronFiredAt          pgtype.Timestamptz          `json:"last_cron_fired_at"`
+	SandboxPathScope         []byte                      `json:"sandbox_path_scope"`
+	SandboxMockConfigured    bool                        `json:"sandbox_mock_configured"`
+	SandboxContractsPath     *string                     `json:"sandbox_contracts_path"`
+	EnvVars                  []byte                      `json:"env_vars"`
+	LastRunAt                pgtype.Timestamptz          `json:"last_run_at"`
+	LastRunStatus            *AutomationInvocationStatus `json:"last_run_status"`
+	ArtifactSummary          *string                     `json:"artifact_summary"`
+	CreatorUnauthorizedSince pgtype.Timestamptz          `json:"creator_unauthorized_since"`
 }
 
 type AutomationInvocation struct {

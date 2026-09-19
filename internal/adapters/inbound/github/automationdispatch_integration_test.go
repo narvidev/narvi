@@ -213,6 +213,14 @@ func (panicAutomationLister) ListActiveGitHubAutomations(ctx context.Context) ([
 	panic("forced panic: automation dispatch must not suppress the mention pipeline")
 }
 
+func (panicAutomationLister) MarkCreatorUnauthorized(ctx context.Context, id pgtype.UUID) (int64, error) {
+	return 0, nil
+}
+
+func (panicAutomationLister) ClearCreatorUnauthorized(ctx context.Context, id pgtype.UUID) (int64, error) {
+	return 0, nil
+}
+
 // TestGitHubIntegration_AutomationDispatchPanicDoesNotSuppressMention posts
 // a single `issue_comment` delivery that is BOTH a real @mention (should
 // create a session/turn) AND a delivery automation dispatch would

@@ -174,6 +174,78 @@ func ClassifyGitHubDispatch(eventType string) GitHubDispatchSkipReason {
 	return GitHubDispatchSkipEventNotAllowlisted
 }
 
+// LinearEventOrigin classifies, for one Linear "Issue"/"Comment" webhook
+// delivery, WHO Linear reports as having caused it -- U7 audit fix
+// (confirmed finding: "Linear has no machine-origin equivalent" -- the
+// exact functional hole D12 closed on the GitHub side, GitHubEventOrigin's
+// own doc comment above). Linear's own webhook docs describe the top-level
+// "actor" object's own "type" field as "user" for a real Linear account,
+// and something ELSE (an OAuth client or an Integration, per Linear's own
+// docs' wording -- "The actor who triggered the action. Could be a User,
+// OAuth client, or Integration") for a non-human actor. Unlike GitHub,
+// this is NOT determined by the event's own CATEGORY -- every Issue/
+// Comment delivery uses the identical wire shape regardless of who
+// triggered it -- so classification happens per-DELIVERY, from the
+// actor's own reported type, never from a closed, typed event-category
+// register the way GitHubEventOrigin is.
+type LinearEventOrigin int
+
+const (
+	// LinearEventOriginHuman means a real Linear account (actor.type ==
+	// "user") -- authorized at the EVENT level (once per delivery, before
+	// any automation is even listed), mirroring GitHubEventOriginHuman's
+	// own identical "resolve once, applies to every automation this
+	// delivery evaluates" reasoning: internal/adapters/inbound/linear's
+	// own dispatchAutomationsBestEffort.
+	LinearEventOriginHuman LinearEventOrigin = iota
+	// LinearEventOriginMachine means the reported actor is NOT a real
+	// Linear account (any non-empty, non-"user" actor.type) -- there is no
+	// human identity to authorize, so the authorizing PRINCIPAL is instead
+	// the automation's OWN configuration, mirroring
+	// GitHubEventOriginMachine's own identical reasoning exactly:
+	// automations.created_by must name a linked, non-disabled account
+	// still holding authz.ActionCreateSession (internal/app/automation's
+	// own dispatchOneLinearAutomation, lineardispatch.go).
+	LinearEventOriginMachine
+)
+
+// linearHumanActorType is the ONE actor.type value Linear's own docs and
+// live payloads confirm names a real Linear account ("user"). Every OTHER
+// non-empty type is classified machine-origin below -- deliberately the
+// NARROWER of the two possible defaults for a non-"user", non-empty
+// string: Linear's own docs name "OAuth client" and "Integration" as the
+// two non-human actor kinds but do not give this package a confirmed,
+// exhaustive register of their own wire "type" values (unlike
+// GitHubDispatchAllowlist/eventTypesWithNoBranchConcept's own closed,
+// verified registers elsewhere in this file) -- a closed allowlist for the
+// one CONFIRMED human value, rather than an open list of every possible
+// non-human one, so an actor type this package has never specifically seen
+// is classified machine-origin (gated behind the automation's own
+// creator) rather than silently falling through the human-path lookup
+// with a type string that was never actually a Narvi-linkable user id in
+// the first place.
+const linearHumanActorType = "user"
+
+// ClassifyLinearActorOrigin reports actorType's own LinearEventOrigin -- ok
+// is false for an EMPTY actorType (Linear's own "actor may be null if the
+// user or integration that triggered the action has since been deleted"
+// case): genuinely unknown whether the deleted actor was ever human, so
+// this stays on the existing, UNCHANGED human-path denial (ok == false,
+// origin defaults to Human but the caller must check ok before acting on
+// it, mirroring ClassifyGitHubEventOrigin's own identical ok-gated
+// contract) rather than being folded into either bucket -- deliberately
+// out of THIS fix's own scope (see U7's own doc comment,
+// internal/adapters/inbound/linear/automationdispatch.go, for the "why").
+func ClassifyLinearActorOrigin(actorType string) (origin LinearEventOrigin, ok bool) {
+	if actorType == "" {
+		return LinearEventOriginHuman, false
+	}
+	if actorType == linearHumanActorType {
+		return LinearEventOriginHuman, true
+	}
+	return LinearEventOriginMachine, true
+}
+
 // LinearDispatchAllowlist mirrors GitHubDispatchAllowlist's own reasoning
 // for Linear's own "Linear-Event" category header -- "Issue"/"Comment" are
 // LinearTriggerConfig.EventType's own worked examples (that struct's own

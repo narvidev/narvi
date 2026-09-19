@@ -202,6 +202,14 @@ func TestWebhookHandler_AutomationDispatchDedupesRedeliveredDelivery(t *testing.
 // request.
 type panicAutomationLister struct{}
 
+func (panicAutomationLister) MarkCreatorUnauthorized(ctx context.Context, id pgtype.UUID) (int64, error) {
+	return 0, nil
+}
+
+func (panicAutomationLister) ClearCreatorUnauthorized(ctx context.Context, id pgtype.UUID) (int64, error) {
+	return 0, nil
+}
+
 func (panicAutomationLister) ListActiveLinearAutomations(ctx context.Context) ([]sqlcgen.Automation, error) {
 	panic("forced panic: automation dispatch must not suppress the rest of this delivery's handling")
 }

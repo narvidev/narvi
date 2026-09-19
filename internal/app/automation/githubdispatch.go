@@ -3,6 +3,7 @@ package automation
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -63,8 +64,18 @@ func unmarshalGitHubTriggerConfig(raw []byte) (domainautomation.GitHubTriggerCon
 // "small, locally-defined interface so a unit/integration test can inject
 // a fake with no real DB round trip, or one that deliberately panics to
 // prove dispatch failure isolation" reasoning (invocationenqueue.go).
+//
+// MarkCreatorUnauthorized/ClearCreatorUnauthorized (U8 audit fix) widen
+// this beyond a pure "lister": dispatchOneGitHubAutomation's own
+// machine-origin gate (below) needs to WRITE this automation's own
+// creator_unauthorized_since the moment it denies or re-authorizes, and
+// *postgres.AutomationStore is already the SAME concrete type every real
+// caller passes as GitHubTriggerLister, so widening this interface costs
+// production wiring nothing.
 type GitHubTriggerLister interface {
 	ListActiveGitHubAutomations(ctx context.Context) ([]sqlcgen.Automation, error)
+	MarkCreatorUnauthorized(ctx context.Context, id pgtype.UUID) (int64, error)
+	ClearCreatorUnauthorized(ctx context.Context, id pgtype.UUID) (int64, error)
 }
 
 // githubDeliveryProvider is the SAME literal
@@ -161,7 +172,15 @@ const githubDeliveryProvider = "github"
 // introduces.
 func DispatchGitHubWebhookEvent(ctx context.Context, logger *slog.Logger, automations GitHubTriggerLister, invocations DeliveryInvocationCreator, users *postgres.UserStore, timeouts platform.Timeouts, eventType string, deliveryID string, in domainautomation.GitHubEventInput) {
 	if reason := domainautomation.ClassifyGitHubDispatch(eventType); reason != domainautomation.GitHubDispatchNotSkipped {
-		logger.Warn("automation: github event not evaluated against any trigger", "event_type", eventType, "reason", string(reason))
+		// U10 audit fix: downgraded from Warn -- after U6/U10's own
+		// adapter-side reordering (internal/adapters/inbound/github's own
+		// dispatchAutomationsBestEffort), this event type is now already
+		// filtered out BEFORE this function is ever called on the live
+		// path; this check stays only as a defensive, direct-call-safe
+		// backstop (this package's own unit tests call this function
+		// directly), and firing on ordinary, never-subscribed-to traffic
+		// was never actually a WARN-worthy symptom in the first place.
+		logger.Debug("automation: github event not evaluated against any trigger", "event_type", eventType, "reason", string(reason))
 		return
 	}
 
@@ -191,7 +210,7 @@ func DispatchGitHubWebhookEvent(ctx context.Context, logger *slog.Logger, automa
 	}
 
 	for _, row := range rows {
-		dispatchOneGitHubAutomation(ctx, logger, invocations, users, timeouts, row, eventType, deliveryID, in)
+		dispatchOneGitHubAutomation(ctx, logger, automations, invocations, users, timeouts, row, eventType, deliveryID, in)
 	}
 }
 
@@ -223,7 +242,7 @@ func dispatchTotalBudgetContext(ctx context.Context, budget time.Duration) (cont
 	return context.WithTimeout(ctx, budget)
 }
 
-func dispatchOneGitHubAutomation(ctx context.Context, logger *slog.Logger, invocations DeliveryInvocationCreator, users *postgres.UserStore, timeouts platform.Timeouts, row sqlcgen.Automation, eventType string, deliveryID string, in domainautomation.GitHubEventInput) {
+func dispatchOneGitHubAutomation(ctx context.Context, logger *slog.Logger, automations GitHubTriggerLister, invocations DeliveryInvocationCreator, users *postgres.UserStore, timeouts platform.Timeouts, row sqlcgen.Automation, eventType string, deliveryID string, in domainautomation.GitHubEventInput) {
 	logger = logger.With("automation_id", row.ID.String())
 
 	cfg, err := unmarshalGitHubTriggerConfig(row.TriggerConfig)
@@ -261,8 +280,14 @@ func dispatchOneGitHubAutomation(ctx context.Context, logger *slog.Logger, invoc
 	if origin, known := domainautomation.ClassifyGitHubEventOrigin(eventType); known && origin == domainautomation.GitHubEventOriginMachine {
 		if !actorauthz.AuthorizeLinkedActor(ctx, logger, githubAutomationAuthzSurface, users, row.CreatedBy, authz.ActionCreateSession, authz.Resource{}) {
 			logger.Info("automation: github dispatch: automation creator not authorized for a machine-originated event, skipping", "event_type", eventType, "reason", "creator_unlinked_or_unauthorized")
+			markCreatorUnauthorizedBestEffort(ctx, logger, automations, row.ID)
 			return
 		}
+		// U8 audit fix: a machine-origin dispatch that JUST authorized
+		// means this automation's own creator is linked/authorized again --
+		// clear any earlier denial's own mark (a no-op, one guarded UPDATE
+		// matching zero rows, when there was nothing to clear).
+		clearCreatorUnauthorizedBestEffort(ctx, logger, automations, row.ID)
 	}
 
 	targets, err := UnmarshalTargets(row.Repos)
@@ -288,17 +313,103 @@ func dispatchOneGitHubAutomation(ctx context.Context, logger *slog.Logger, invoc
 		return
 	}
 
-	if !checkDispatchThrottle(ctx, logger, invocations, timeouts, row.ID) {
+	if verdict := checkDispatchThrottle(ctx, logger, invocations, timeouts, row.ID); verdict != dispatchGateAllowed {
 		return
 	}
 
 	created, err := createInvocationForDeliveryWithRetry(ctx, invocations, timeouts, row.ID, matched, githubDeliveryProvider, deliveryID)
 	if err != nil {
-		logger.Error("automation: create invocation for github dispatch failed", "error", err, "event_type", eventType)
+		if dispatchBudgetExhausted(err) {
+			logger.Warn("automation: create invocation for github dispatch: total time budget exhausted before this call could complete, skipping (fail closed) -- NOT a throttle decision, see platform.Timeouts.AutomationDispatchTotalBudget", "reason", "dispatch_budget_exhausted", "error", err, "event_type", eventType)
+		} else {
+			logger.Error("automation: create invocation for github dispatch failed", "error", err, "event_type", eventType)
+		}
 		return
 	}
 	if !created {
 		logger.Info("automation: github dispatch already created an invocation for this exact delivery, skipping", "event_type", eventType, "delivery_id", deliveryID)
+	}
+}
+
+// dispatchGateVerdict is checkDispatchThrottle's own return type -- U1
+// audit fix (confirmed HIGH finding: "the total budget is smaller than the
+// retry chain it contains... [exhaustion] is logged as a throttle, which
+// is a different thing and sends whoever reads it looking in the wrong
+// place"). A plain bool could not tell a caller (or a log reader)
+// EvaluateDispatchThrottle's own genuine "this automation has created too
+// many invocations recently" verdict apart from "the shared
+// AutomationDispatchTotalBudget ran out before this automation's own
+// Postgres call could even complete" (an infrastructure/capacity
+// condition an operator should size the budget or automation count
+// against, not the anti-abuse control doing its job) apart from an
+// ordinary, non-time-budget Postgres failure. All three still deny (fail
+// closed -- no invocation is created in any case); this type exists
+// purely for OBSERVABILITY, so a log reader -- or a test asserting on this
+// return value -- is pointed at the right cause.
+type dispatchGateVerdict int
+
+const (
+	dispatchGateAllowed dispatchGateVerdict = iota
+	dispatchGateThrottled
+	dispatchGateBudgetExhausted
+	dispatchGateError
+)
+
+// dispatchBudgetExhausted reports whether err is ctx's OWN expiry -- either
+// DispatchGitHubWebhookEvent/DispatchLinearWebhookEvent's own
+// dispatchTotalBudgetContext deadline (D18/U1), or a deadline the caller's
+// own incoming ctx already carried -- as opposed to a genuine, repeated
+// Postgres error unrelated to time budget. Neither
+// ListActiveGitHubAutomations/ListActiveLinearAutomations nor
+// CountRecentInvocations/CreateForDelivery wraps its OWN call with any
+// separate context.WithTimeout (each runs directly against whatever ctx
+// this package's own callers already pass in) -- so a DeadlineExceeded/
+// Canceled surfacing from any of them can only ever be attributed to a
+// shared budget/caller ctx, never a private per-call timeout of their own.
+func dispatchBudgetExhausted(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+}
+
+// creatorUnauthorizedMarker is the narrow slice of GitHubTriggerLister/
+// LinearTriggerLister markCreatorUnauthorizedBestEffort/
+// clearCreatorUnauthorizedBestEffort (below) need -- shared VERBATIM
+// between both dispatch paths' own machine-origin gates
+// (dispatchOneGitHubAutomation here, dispatchOneLinearAutomation,
+// lineardispatch.go), U8 audit fix.
+type creatorUnauthorizedMarker interface {
+	MarkCreatorUnauthorized(ctx context.Context, id pgtype.UUID) (int64, error)
+	ClearCreatorUnauthorized(ctx context.Context, id pgtype.UUID) (int64, error)
+}
+
+// markCreatorUnauthorizedBestEffort/clearCreatorUnauthorizedBestEffort are
+// U8 audit fix's own required surface (confirmed LOW finding: "a
+// machine-origin automation can become permanently dead with no way to
+// revive it... An automation that is active and structurally incapable of
+// firing is a lie in the product's own state"). Called from each
+// provider's own per-automation machine-origin gate, immediately after
+// its own actorauthz.AuthorizeLinkedActor verdict -- see migrations/
+// 000138_automations_creator_unauthorized.up.sql's own doc comment for
+// the full "why" this specific state (rather than re-attribution
+// tooling) is this fix's chosen scope.
+//
+// Deliberately BEST EFFORT, never retried, never fail-closed: this is
+// OBSERVABILITY state, not an authorization decision -- the
+// AuthorizeLinkedActor verdict immediately above already decided whether
+// to dispatch; a failure writing creator_unauthorized_since must never
+// retroactively change that, and must never cost this delivery another
+// entry in the U1 retry-chain budget math (AutomationDispatchTotalBudget
+// is sized against list+throttle+create -- this is a FOURTH, genuinely
+// optional call, logged and dropped on error, not added to that budget's
+// own required floor).
+func markCreatorUnauthorizedBestEffort(ctx context.Context, logger *slog.Logger, automations creatorUnauthorizedMarker, id pgtype.UUID) {
+	if _, err := automations.MarkCreatorUnauthorized(ctx, id); err != nil {
+		logger.Error("automation: mark automation creator_unauthorized_since failed (best effort, not retried)", "error", err, "automation_id", id.String())
+	}
+}
+
+func clearCreatorUnauthorizedBestEffort(ctx context.Context, logger *slog.Logger, automations creatorUnauthorizedMarker, id pgtype.UUID) {
+	if _, err := automations.ClearCreatorUnauthorized(ctx, id); err != nil {
+		logger.Error("automation: clear automation creator_unauthorized_since failed (best effort, not retried)", "error", err, "automation_id", id.String())
 	}
 }
 
@@ -309,7 +420,7 @@ func dispatchOneGitHubAutomation(ctx context.Context, logger *slog.Logger, invoc
 // timeouts.AutomationDispatchThrottleWindow (retried the SAME bounded way
 // as every other Postgres call in this file, D6) and reports whether
 // ANOTHER may be created.
-func checkDispatchThrottle(ctx context.Context, logger *slog.Logger, invocations DeliveryInvocationCreator, timeouts platform.Timeouts, automationID pgtype.UUID) bool {
+func checkDispatchThrottle(ctx context.Context, logger *slog.Logger, invocations DeliveryInvocationCreator, timeouts platform.Timeouts, automationID pgtype.UUID) dispatchGateVerdict {
 	since := time.Now().Add(-timeouts.AutomationDispatchThrottleWindow)
 	var count int64
 	retryErr := platform.Retry(ctx, timeouts.AutomationDispatchMaxAttempts, timeouts.AutomationDispatchRetryBaseDelay, timeouts.AutomationDispatchRetryMaxDelay, func() error {
@@ -318,14 +429,18 @@ func checkDispatchThrottle(ctx context.Context, logger *slog.Logger, invocations
 		return err
 	})
 	if retryErr != nil {
+		if dispatchBudgetExhausted(retryErr) {
+			logger.Warn("automation: dispatch: total time budget exhausted before this automation's own recent-invocation count could complete, skipping (fail closed) -- NOT a throttle decision, see platform.Timeouts.AutomationDispatchTotalBudget", "reason", "dispatch_budget_exhausted", "error", retryErr)
+			return dispatchGateBudgetExhausted
+		}
 		logger.Error("automation: count recent invocations for dispatch throttle failed, skipping (fail closed)", "error", retryErr)
-		return false
+		return dispatchGateError
 	}
 	if !domainautomation.EvaluateDispatchThrottle(int(count)) {
 		logger.Warn("automation: dispatch throttled, this automation has created too many invocations recently", "reason", "dispatch_throttled", "count_in_window", count, "threshold", domainautomation.DispatchThrottleThreshold)
-		return false
+		return dispatchGateThrottled
 	}
-	return true
+	return dispatchGateAllowed
 }
 
 // createInvocationForDeliveryWithRetry wraps CreateInvocationForDelivery

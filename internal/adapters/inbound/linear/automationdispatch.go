@@ -8,8 +8,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/actorauthz"
 	"github.com/narvidev/narvi/internal/app/automation"
+	"github.com/narvidev/narvi/internal/app/identitylink"
 	"github.com/narvidev/narvi/internal/domain/authz"
 	domainautomation "github.com/narvidev/narvi/internal/domain/automation"
 )
@@ -43,20 +45,53 @@ import (
 // triggered the action has since been deleted" -- present on every
 // data-change category this deployment's own LinearDispatchAllowlist
 // covers ("Issue", "Comment"), the SAME actor/type/id shape Linear's own
-// webhook docs show for both. Actor.ID is resolved through the IDENTICAL
-// deps.resolveActor auto-linking algorithm the pre-existing AgentSessionEvent
-// path already uses for AgentSession.CreatorID/AgentActivity.UserID
-// (identity.go) -- never a second, independently-invented model: an actor
-// representing a non-user (an OAuth client, an Integration) simply never
-// has a matching identities row, and resolves to "not linked" exactly like
-// a genuine, never-signed-in human Linear user id would, with no separate
-// type-based branch needed to reach that same, correct, fail-closed
-// verdict.
+// webhook docs show for both.
+//
+// # U3 audit fix, SECURITY: Actor.ID is now resolved through a PURE lookup, never the auto-linking algorithm
+//
+// Confirmed HIGH finding ("the gate creates the identity it then checks"):
+// Actor.ID used to be resolved through deps.resolveActor -- the SAME
+// side-effecting auto-linking algorithm (identitylink.Resolve) the
+// pre-existing AgentSessionEvent path runs for AgentSession.CreatorID/
+// AgentActivity.UserID (identity.go) -- on THIS gate too. That call does
+// more than look up: for an actor with NO identities row at all, it
+// fetches a profile email from Linear's own API and, if that email
+// matches no known user either, MINTS a fresh identity_link_prompts row
+// (a live magic-link nonce, U4's own sibling finding) -- an authorization
+// gate that AUTO-LINKS the very actor it is supposed to be checking
+// authorizes everyone eventually: a never-before-seen Linear user simply
+// walks straight through the FIRST time they are ever observed, exactly
+// the gate this code exists to prevent. Actor.ID is now resolved through
+// identitylink.LookupLinkedUserID -- the SAME pure, side-effect-free
+// (provider, external_id) lookup github's own resolveCommenterActor uses
+// (internal/adapters/inbound/github/identity.go's own doc comment explains
+// why GitHub needs no auto-linking algorithm at all): either this exact
+// Linear actor id already has a linked Narvi account, or it does not --
+// nothing is minted, fetched, or auto-linked as a SIDE EFFECT of checking.
+// Auto-linking remains a legitimate operation with its own entry point
+// (the pre-existing AgentSessionEvent path, handleCreated/handlePrompted,
+// webhook.go) -- it is simply never something this authorization gate may
+// trigger itself. See U4's own sibling finding for the mint/discard half
+// this fix also closes as a direct consequence (an unlinked actor is no
+// longer given a magic-link prompt by THIS path at all, so there is
+// nothing left to mint and throw away here).
 type linearAutomationEventEnvelope struct {
 	Action         string `json:"action"`
 	OrganizationID string `json:"organizationId"`
 	Actor          *struct {
 		ID string `json:"id"`
+		// Type is U7 audit fix's own addition -- Linear's own docs
+		// (https://linear.app/developers/webhooks, live-fetched during
+		// this fix's own investigation): "user" for a real Linear
+		// account; a non-"user", non-empty value for a non-human actor
+		// (an OAuth client or an Integration, per that same doc's own
+		// "Could be a User, OAuth client, or Integration" wording).
+		// domainautomation.ClassifyLinearActorOrigin (dispatch.go) is
+		// this package's own single point of interpretation for this
+		// field's value -- see that function's own doc comment for why
+		// only "user" is a closed, confirmed allowlist entry rather than
+		// enumerating every possible non-human value.
+		Type string `json:"type"`
 	} `json:"actor"`
 	Data struct {
 		Team struct {
@@ -70,78 +105,56 @@ type linearAutomationEventEnvelope struct {
 // domainautomation.LinearEventInput -- ok is false only on a JSON decode
 // failure, mirroring github's own buildGitHubEventInput's identical "false
 // means nothing to dispatch, never a reason to fail this request" contract.
-// organizationID/actorExternalID are returned alongside (D9/D15 audit
-// fixes) rather than folded into LinearEventInput itself --
+// organizationID/actorExternalID/actorType are returned alongside (D9/D15/
+// U7 audit fixes) rather than folded into LinearEventInput itself --
 // installation/actor authorization is a SEPARATE concern from trigger
 // matching, exactly the same separation githubEventSenderID keeps from
 // buildGitHubEventInput (internal/adapters/inbound/github/
-// automationdispatch.go). actorExternalID is "" when Actor is nil (the
-// actor has since been deleted, per Linear's own docs) -- deps.resolveActor
-// already treats an empty externalID as "nothing to resolve, bot
-// attribution" (identity.go), so this needs no special-casing here.
-func buildLinearEventInput(eventType string, rawBody []byte) (in domainautomation.LinearEventInput, organizationID string, actorExternalID string, ok bool) {
+// automationdispatch.go). actorExternalID/actorType are both "" when Actor
+// is nil (the actor has since been deleted, per Linear's own docs) --
+// identitylink.LookupLinkedUserID already treats an empty externalID as
+// "nothing to resolve, not linked" (mirrors deps.resolveActor's own
+// identical "bot attribution" convention, identity.go), and
+// domainautomation.ClassifyLinearActorOrigin treats an empty actorType as
+// "origin unknown" (that function's own doc comment) -- neither needs any
+// special-casing here.
+func buildLinearEventInput(eventType string, rawBody []byte) (in domainautomation.LinearEventInput, organizationID string, actorExternalID string, actorType string, ok bool) {
 	var env linearAutomationEventEnvelope
 	if err := json.Unmarshal(rawBody, &env); err != nil {
-		return domainautomation.LinearEventInput{}, "", "", false
+		return domainautomation.LinearEventInput{}, "", "", "", false
 	}
 	if env.Actor != nil {
 		actorExternalID = env.Actor.ID
+		actorType = env.Actor.Type
 	}
 	return domainautomation.LinearEventInput{
 		EventType: eventType,
 		Action:    env.Action,
 		TeamKey:   env.Data.Team.Key,
-	}, env.OrganizationID, actorExternalID, true
+	}, env.OrganizationID, actorExternalID, actorType, true
 }
 
 // dispatchAutomationsBestEffort mirrors github's own identical function
 // (internal/adapters/inbound/github/automationdispatch.go) in shape --
 // same "additional, independent consumer of this already-claimed
 // delivery", same deliberately narrow, reviewed panic-recovery scope --
-// but is NOT identical in its authorization design: see the D15 section
-// below for the one place it genuinely differs, and why.
+// but is NOT identical in its authorization design: see the D15/U3
+// sections below for the places it genuinely differs, and why.
 //
-// # D9 audit fix: fail closed unless the sending workspace is installed
+// # U6/U10 audit fix: classify the event type FIRST, before any Postgres or Linear API call
 //
-// Before this fix, an event's own "organizationId" was parsed by nothing
-// on this path at all -- Linear signs every webhook delivery from EVERY
-// workspace that has this app installed with the SAME shared secret (it is
-// per-app, not per-workspace), so a correctly-signed delivery says nothing
-// on its own about whether the SENDING workspace is one this deployment
-// actually recognizes. This mirrors the pre-existing AgentSessionEvent
-// path's own check exactly (handleCreated/handlePrompted already fail
-// closed via deps.Installations.GetByOrganizationID, decryptLinearAccessToken.go
-// -- identity.go) -- the SAME store, the SAME lookup, never a second,
-// independently-maintained one.
-//
-// # D15 audit fix: the installation check above is tenant scoping, not actor authorization
-//
-// Confirmed, HIGH-severity finding: D9's installation check establishes
-// only that the SENDING WORKSPACE once completed OAuth -- it says nothing
-// about the PERSON who caused this specific event, and a signed, correctly-
-// tenant-scoped "Issue"/"Comment" delivery from a workspace with no
-// authorization check on its acting user could still create an automation
-// invocation (and, downstream, a sandboxed agent run holding this
-// deployment's own repository credentials) for an actor with no Narvi
-// identity at all -- reproduced directly against a real Postgres instance
-// (see this package's own automationdispatch_integration_test.go). This
-// closes that gap by reusing GitHub's own D2 design exactly, never a
-// second, independently-invented model: the event's own top-level "actor.id"
-// (buildLinearEventInput's own actorExternalID above) is resolved via
-// deps.resolveActor -- the SAME auto-linking algorithm the pre-existing
-// AgentSessionEvent path already runs for AgentSession.CreatorID/
-// AgentActivity.UserID (identity.go), no separate/duplicated lookup --
-// then authorized via actorauthz.AuthorizeLinkedActor(...,
-// authz.ActionCreateSession, ...), the IDENTICAL primitive/action/resource
-// GitHub's own dispatchAutomationsBestEffort authorizes its own sender
-// against. An unlinked/unauthorized actor (including Actor == nil, "since
-// deleted" per Linear's own docs, which resolves to an empty
-// actorExternalID) is skipped with a named, logged reason, never silently.
-// resolveActor's own notice (a magic-link prompt, when it minted one) is
-// deliberately NOT surfaced here -- unlike the AgentSessionEvent path,
-// automation dispatch posts no outbound activity of its own for this
-// delivery to append it to, and inventing a new one purely to carry this
-// notice is out of this fix's own scope.
+// Confirmed MEDIUM finding: domainautomation.ClassifyLinearDispatch used
+// to run INSIDE automation.DispatchLinearWebhookEvent, i.e. AFTER the
+// installation lookup, the actor lookup, AND authorization -- so every
+// Linear webhook category this deployment's automation dispatch can never
+// act on (anything outside LinearDispatchAllowlist) still paid an
+// installation-store round trip and an identity-resolution lookup, every
+// single delivery, for nothing: reproduced quantitatively (a delivery
+// against an unresponsive provider took 1.75s inside the HTTP handler; see
+// the PR body for the exact reproduction). Classification needs only
+// eventType -- already this function's own parameter, available before
+// ANY of that work -- so it now runs immediately after the (equally
+// cheap, no-I/O) nil-dependency checks, before rawBody is even decoded.
 func dispatchAutomationsBestEffort(ctx context.Context, logger *slog.Logger, deps Deps, eventType string, deliveryID string, rawBody []byte) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -152,12 +165,26 @@ func dispatchAutomationsBestEffort(ctx context.Context, logger *slog.Logger, dep
 	if deps.Automations == nil || deps.AutomationInvocations == nil {
 		return
 	}
+
+	// U6/U10 audit fix: see this function's own doc comment above. Cheapest
+	// check first is not an optimisation here -- it is what stops ordinary,
+	// never-actionable Linear traffic from costing an installation lookup
+	// and an identity-resolution call (in turn a Linear GraphQL round trip
+	// for any actor not already linked). Deliberately NOT logged at Warn:
+	// this fires on every ordinary delivery of a category automation
+	// dispatch is simply not subscribed to, not a symptom of anything
+	// wrong.
+	if reason := domainautomation.ClassifyLinearDispatch(eventType); reason != domainautomation.LinearDispatchNotSkipped {
+		logger.Debug("linear: automation dispatch: event type not evaluated against any trigger", "event_type", eventType, "reason", string(reason))
+		return
+	}
+
 	if deps.Installations == nil {
 		logger.Error("linear: automation dispatch: installations store not wired, skipping (fail closed)", "event_type", eventType)
 		return
 	}
 
-	in, organizationID, actorExternalID, ok := buildLinearEventInput(eventType, rawBody)
+	in, organizationID, actorExternalID, actorType, ok := buildLinearEventInput(eventType, rawBody)
 	if !ok {
 		logger.Warn("linear: automation dispatch: malformed webhook body, skipping (the AgentSessionEvent pipeline handles/logs this independently)", "event_type", eventType)
 		return
@@ -172,13 +199,12 @@ func dispatchAutomationsBestEffort(ctx context.Context, logger *slog.Logger, dep
 		return
 	}
 
-	// D15 audit fix: deps.resolveActor/actorauthz.AuthorizeLinkedActor
-	// below need deps.IdentityLink.Users/Identities -- both nil (a
-	// minimal test rig, or any other wiring that never populates
-	// IdentityLink at all) would otherwise reach a nil-pointer
-	// dereference deep inside identitylink/actorauthz rather than a
-	// named, logged, fail-closed skip, mirroring github's own identical
-	// "identities == nil || users == nil" nil-safety check
+	// D15/U3 audit fix: deps.IdentityLink.Users/Identities below need both
+	// wired -- either nil (a minimal test rig, or any other wiring that
+	// never populates IdentityLink at all) would otherwise reach a
+	// nil-pointer dereference deep inside identitylink/actorauthz rather
+	// than a named, logged, fail-closed skip, mirroring github's own
+	// identical "identities == nil || users == nil" nil-safety check
 	// (dispatchAutomationsBestEffort, automationdispatch.go). Deliberately
 	// checked AFTER the installation-row lookup above, not before: an
 	// uninstalled workspace must still be denied for THAT reason
@@ -189,11 +215,43 @@ func dispatchAutomationsBestEffort(ctx context.Context, logger *slog.Logger, dep
 		return
 	}
 
-	actorUserID, _ := deps.resolveActor(ctx, logger, organizationID, actorExternalID)
+	// # U7 audit fix: machine-origin events skip the human actor gate entirely
+	//
+	// Mirrors github's own D12 split exactly (dispatchAutomationsBestEffort,
+	// internal/adapters/inbound/github/automationdispatch.go): a
+	// machine-originated actor (domainautomation.ClassifyLinearActorOrigin
+	// == LinearEventOriginMachine) has no human identity for THIS gate to
+	// authorize at all -- that per-automation check instead happens one
+	// layer down, inside automation.DispatchLinearWebhookEvent
+	// (lineardispatch.go), against each matching automation's OWN creator.
+	// The ok==false "actor deleted, origin unknown" case (Actor == nil, or
+	// a present Actor with an empty Type) falls through to the human gate
+	// below UNCHANGED -- the safe, narrower default, exactly like GitHub's
+	// own "anything not explicitly classified Machine falls through to the
+	// human-origin sender check" precedent.
+	if origin, known := domainautomation.ClassifyLinearActorOrigin(actorType); known && origin == domainautomation.LinearEventOriginMachine {
+		automation.DispatchLinearWebhookEvent(ctx, logger, deps.Automations, deps.AutomationInvocations, deps.IdentityLink.Users, deps.Timeouts, eventType, deliveryID, in, actorType)
+		return
+	}
+
+	// U3 audit fix, SECURITY (confirmed HIGH finding: "the gate creates the
+	// identity it then checks"): identitylink.LookupLinkedUserID is a PURE
+	// lookup -- see this file's own linearAutomationEventEnvelope doc
+	// comment (above) for the full "why", mirroring github's own
+	// resolveCommenterActor exactly. A lookup FAILURE (as opposed to a
+	// genuine "not linked" verdict) fails closed here too, never silently
+	// treated as "not linked" -- mirroring github's own identical
+	// resolveCommenterActor error-handling split (identity.go's own doc
+	// comment there).
+	actorUserID, _, err := identitylink.LookupLinkedUserID(ctx, deps.IdentityLink, sqlcgen.IdentityProviderLinear, actorExternalID)
+	if err != nil {
+		logger.Error("linear: automation dispatch: look up actor identity failed, skipping (fail closed)", "error", err, "event_type", eventType)
+		return
+	}
 	if !actorauthz.AuthorizeLinkedActor(ctx, logger, authzSurface, deps.IdentityLink.Users, actorUserID, authz.ActionCreateSession, authz.Resource{}) {
 		logger.Info("linear: automation dispatch: actor not authorized, skipping", "event_type", eventType, "reason", "actor_unlinked_or_unauthorized")
 		return
 	}
 
-	automation.DispatchLinearWebhookEvent(ctx, logger, deps.Automations, deps.AutomationInvocations, deps.Timeouts, eventType, deliveryID, in)
+	automation.DispatchLinearWebhookEvent(ctx, logger, deps.Automations, deps.AutomationInvocations, deps.IdentityLink.Users, deps.Timeouts, eventType, deliveryID, in, actorType)
 }

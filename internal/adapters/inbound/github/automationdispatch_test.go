@@ -345,6 +345,114 @@ func TestBuildGitHubEventInput_CheckRun_NormalizesNameConclusionAndBranch(t *tes
 	}
 }
 
+// TestCheckRunHeadBranchForkGuaranteeIsDocumented is U9 audit fix's own
+// required pin (LOW finding: "a branch name from a machine event is
+// trusted without provenance... it fails closed today only because GitHub
+// documents head_branch as null for a push in a forked repository, an
+// external behaviour this repository does not control and does not
+// assert"). This is not a live check against GitHub -- there is no way to
+// do that from this repository -- it is the documented assumption itself,
+// quoted verbatim from GitHub's own canonical webhook JSON Schema
+// (github.com/octokit/webhooks,
+// payload-schemas/api.github.com/check_run/created.schema.json, the
+// check_suite.pull_requests property's own description, fetched live
+// during this fix's own investigation), so a future reader who discovers
+// GitHub has changed this behaviour has something concrete to update, not
+// a silent assumption baked into buildGitHubEventInput's own "check_run"
+// case with nothing pointing at it.
+func TestCheckRunHeadBranchForkGuaranteeIsDocumented(t *testing.T) {
+	const githubDocumentedGuarantee = "When the check suite's head_branch is in a forked repository it will be null and the pull_requests array will be empty."
+	if githubDocumentedGuarantee == "" {
+		t.Fatal("this string must never be emptied out -- it IS the assertion")
+	}
+	t.Log(githubDocumentedGuarantee)
+}
+
+// TestCheckRunHeadBranchProvenanceOK is a direct, table-driven pin of
+// checkRunHeadBranchProvenanceOK -- U9's own defense-in-depth check.
+func TestCheckRunHeadBranchProvenanceOK(t *testing.T) {
+	prWithRepoID := func(id int64) githubCheckRunPullRequest {
+		var pr githubCheckRunPullRequest
+		pr.Head.Repo.ID = id
+		return pr
+	}
+
+	tests := []struct {
+		name         string
+		pullRequests []githubCheckRunPullRequest
+		repositoryID int64
+		want         bool
+	}{
+		{"no pull requests, nothing to check", nil, 42, true},
+		{"repositoryID unknown (pre-U9 test fixture shape)", []githubCheckRunPullRequest{prWithRepoID(99)}, 0, true},
+		{"matching repo id", []githubCheckRunPullRequest{prWithRepoID(42)}, 42, true},
+		{"one of several matches", []githubCheckRunPullRequest{prWithRepoID(1), prWithRepoID(42)}, 42, true},
+		{"mismatched repo id (a fork's own PR, forged/stale head_branch)", []githubCheckRunPullRequest{prWithRepoID(99)}, 42, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := checkRunHeadBranchProvenanceOK(tc.pullRequests, tc.repositoryID); got != tc.want {
+				t.Errorf("checkRunHeadBranchProvenanceOK(%v, %d) = %v, want %v", tc.pullRequests, tc.repositoryID, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildGitHubEventInput_CheckRun_RejectsMismatchedPullRequestRepoID is
+// U9's own required, missing proof at buildGitHubEventInput's own level
+// (not just the pure helper above): when check_suite.pull_requests names a
+// DIFFERENT repository id than the event's own top-level "repository.id",
+// the branch is dropped entirely (Branches stays empty) rather than
+// trusted.
+func TestBuildGitHubEventInput_CheckRun_RejectsMismatchedPullRequestRepoID(t *testing.T) {
+	body := []byte(`{
+		"action": "completed",
+		"repository": {"id": 1000, "full_name": "acme/repo"},
+		"check_run": {
+			"name": "ci/lint",
+			"conclusion": "success",
+			"head_sha": "shaCheck",
+			"check_suite": {
+				"head_branch": "main",
+				"pull_requests": [{"head": {"repo": {"id": 9999}}}]
+			}
+		}
+	}`)
+	in, ok := buildGitHubEventInput("check_run", body)
+	if !ok {
+		t.Fatalf("ok = false, want true")
+	}
+	if len(in.Branches) != 0 {
+		t.Fatalf("Branches = %v, want empty (the only pull_requests entry names a different repository id than the event's own top-level repository)", in.Branches)
+	}
+}
+
+// TestBuildGitHubEventInput_CheckRun_AcceptsMatchingPullRequestRepoID is
+// the companion positive proof: a matching repository id must not
+// regress the ordinary case.
+func TestBuildGitHubEventInput_CheckRun_AcceptsMatchingPullRequestRepoID(t *testing.T) {
+	body := []byte(`{
+		"action": "completed",
+		"repository": {"id": 1000, "full_name": "acme/repo"},
+		"check_run": {
+			"name": "ci/lint",
+			"conclusion": "success",
+			"head_sha": "shaCheck",
+			"check_suite": {
+				"head_branch": "main",
+				"pull_requests": [{"head": {"repo": {"id": 1000}}}]
+			}
+		}
+	}`)
+	in, ok := buildGitHubEventInput("check_run", body)
+	if !ok {
+		t.Fatalf("ok = false, want true")
+	}
+	if len(in.Branches) != 1 || in.Branches[0].Name != "main" {
+		t.Fatalf("Branches = %v, want one {main}", in.Branches)
+	}
+}
+
 func TestBuildGitHubEventInput_Status_PreservesBranchesContainmentVerbatim(t *testing.T) {
 	body := []byte(`{
 		"repository": {"full_name": "acme/repo"},

@@ -232,3 +232,72 @@ func TestDispatchGitHubWebhookEvent_ThrottlesUnboundedInvocations(t *testing.T) 
 		t.Fatalf("invocations for automation after %d distinct matching deliveries = %d, want exactly %d (D8 audit fix: the per-automation dispatch throttle must cap it)", attempts, got, domainautomation.DispatchThrottleThreshold)
 	}
 }
+
+// TestDispatchGitHubWebhookEvent_MarksAndClearsCreatorUnauthorized is U8's
+// own required proof (confirmed LOW finding: "a machine-origin automation
+// can become permanently dead with no way to revive it"): a machine-origin
+// ("status") delivery denied because its automation's own creator has no
+// linked, authorized account must surface that on the automation's own
+// row (creator_unauthorized_since), not only a per-delivery Info log --
+// preserving the FIRST denial's own timestamp across repeated denials --
+// and must clear it again the moment a later delivery for the SAME
+// automation is authorized (an operator re-attributed it).
+func TestDispatchGitHubWebhookEvent_MarksAndClearsCreatorUnauthorized(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	logger := platform.Logger(ctx)
+
+	target := domainautomation.Target{Name: "repo", URL: "https://github.com/acme/repo"}
+	// createdBy left invalid (pgtype.UUID{}, createGitHubAutomation's own
+	// default) -- no authorizing principal at all.
+	auto := f.createGitHubAutomation(t, "on status success (unauthorized creator)", domainautomation.GitHubTriggerConfig{Event: "status", Conclusion: "success"}, target)
+
+	in := domainautomation.GitHubEventInput{
+		EventType: "status", RepoFullName: "acme/repo", DefaultBranch: "main", SHA: "shaMain", Conclusion: "success",
+		Branches: []domainautomation.GitHubEventBranch{{Name: "main", HeadSHA: "shaMain"}},
+	}
+	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, f.users, platform.DefaultTimeouts(), "status", "delivery-github-creator-unauthorized-1", in)
+
+	if got := f.countInvocationsForAutomation(t, auto.ID); got != 0 {
+		t.Fatalf("invocations = %d, want 0 (creator is not linked/authorized)", got)
+	}
+	row, err := f.automations.Get(ctx, auto.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !row.CreatorUnauthorizedSince.Valid {
+		t.Fatal("CreatorUnauthorizedSince.Valid = false, want true (a denied machine-origin dispatch must surface on the automation's own row)")
+	}
+	firstMark := row.CreatorUnauthorizedSince.Time
+
+	// A SECOND denial (a distinct delivery, still no authorizing creator)
+	// must NOT slide the timestamp forward -- the FIRST denial's own
+	// instant is what a maintainer needs to see.
+	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, f.users, platform.DefaultTimeouts(), "status", "delivery-github-creator-unauthorized-2", in)
+	row, err = f.automations.Get(ctx, auto.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !row.CreatorUnauthorizedSince.Time.Equal(firstMark) {
+		t.Fatalf("CreatorUnauthorizedSince changed on a second denial: got %v, want unchanged %v", row.CreatorUnauthorizedSince.Time, firstMark)
+	}
+
+	// Re-attribute the automation to a linked, authorized creator --
+	// mirrors an operator's own manual fix -- and fire again.
+	creator := f.createAutomationCreator(t, "revive", sqlcgen.UserRoleMaintainer)
+	if _, err := f.pool.Exec(ctx, "UPDATE automations SET created_by = $2 WHERE id = $1", auto.ID, creator.ID); err != nil {
+		t.Fatalf("re-attribute automation: %v", err)
+	}
+	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, f.users, platform.DefaultTimeouts(), "status", "delivery-github-creator-unauthorized-3", in)
+
+	if got := f.countInvocationsForAutomation(t, auto.ID); got != 1 {
+		t.Fatalf("invocations after re-attribution = %d, want 1", got)
+	}
+	row, err = f.automations.Get(ctx, auto.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if row.CreatorUnauthorizedSince.Valid {
+		t.Fatal("CreatorUnauthorizedSince.Valid = true, want false (a successful machine-origin dispatch must clear the earlier denial mark)")
+	}
+}

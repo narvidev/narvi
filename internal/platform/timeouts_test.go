@@ -121,6 +121,21 @@ func TestValidate_CatchesEachBrokenLink(t *testing.T) {
 			},
 			wantChain: "UploadPendingSweepAfter > UploadAbandonmentSweepInterval",
 		},
+		{
+			// U1 audit fix (confirmed HIGH finding: "the total budget is
+			// smaller than the retry chain it contains"): shrinking
+			// AutomationDispatchTotalBudget down to exactly 3x a single
+			// call's own worst case (list + throttle + create, un-margined)
+			// must be caught -- that leaves the FIRST matching automation
+			// in any delivery with no room at all for its own retry chain
+			// once the list call has already spent its share.
+			name: "AutomationDispatchTotalBudget not >= list + one matching automation's own full retry chain, with margin",
+			mutate: func(to *platform.Timeouts) {
+				perCall := platform.RetryWorstCaseSleep(to.AutomationDispatchMaxAttempts, to.AutomationDispatchRetryBaseDelay, to.AutomationDispatchRetryMaxDelay)
+				to.AutomationDispatchTotalBudget = 3 * perCall
+			},
+			wantChain: "AutomationDispatchTotalBudget > list call + one matching automation's own full retry chain (throttle + create), with margin",
+		},
 	}
 
 	for _, tc := range tests {
@@ -1433,5 +1448,94 @@ func TestDefaultTimeouts_Step173StandaloneField(t *testing.T) {
 
 	if err := to.Validate(); err != nil {
 		t.Fatalf("Validate() = %v, want nil (this field must not disturb either invariant chain)", err)
+	}
+}
+
+// TestValidate_RequiresPositiveFields is U2's own audit fix (confirmed
+// HIGH, SECURITY finding: "the anti-abuse throttle fails open on the zero
+// value of its window... Validate() accepts a zero
+// AutomationDispatchThrottleWindow -- it only checks pairwise ordering
+// between fields, never that a field is set at all"). Table-driven over
+// every field this audit traced to the shared "a count/elapsed-time-vs-
+// window comparison that is vacuously permissive at window == 0" shape
+// (see each field's own doc comment, timeouts.go, for the exact mechanism)
+// -- mirrors TestValidate_CatchesEachBrokenLink's own "start from
+// DefaultTimeouts (known-valid), mutate exactly one field, assert Validate
+// reports it BY NAME" discipline, so this test actually catches someone
+// re-introducing a silently-unbounded field later, not merely "some error
+// happened".
+func TestValidate_RequiresPositiveFields(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		mutate    func(*platform.Timeouts)
+		wantField string
+	}{
+		{
+			name:      "AutomationDispatchThrottleWindow == 0",
+			mutate:    func(to *platform.Timeouts) { to.AutomationDispatchThrottleWindow = 0 },
+			wantField: "AutomationDispatchThrottleWindow",
+		},
+		{
+			name:      "CircuitBreakerWindow == 0",
+			mutate:    func(to *platform.Timeouts) { to.CircuitBreakerWindow = 0 },
+			wantField: "CircuitBreakerWindow",
+		},
+		{
+			name:      "RepoAccessCheckBreakerWindow == 0",
+			mutate:    func(to *platform.Timeouts) { to.RepoAccessCheckBreakerWindow = 0 },
+			wantField: "RepoAccessCheckBreakerWindow",
+		},
+		{
+			// A negative value is exactly as permissive as zero for every
+			// one of these comparisons (elapsed time is never negative
+			// either) -- pinned so a future "only reject == 0, not < 0"
+			// regression is caught too.
+			name:      "AutomationDispatchThrottleWindow < 0",
+			mutate:    func(to *platform.Timeouts) { to.AutomationDispatchThrottleWindow = -1 },
+			wantField: "AutomationDispatchThrottleWindow",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			to := platform.DefaultTimeouts()
+			tc.mutate(&to)
+
+			err := to.Validate()
+			if err == nil {
+				t.Fatalf("Validate() = nil, want an error for zero/negative field %q", tc.wantField)
+			}
+
+			var posErr *platform.TimeoutMustBePositiveError
+			if !errors.As(err, &posErr) {
+				t.Fatalf("Validate() = %v, want a *TimeoutMustBePositiveError in the chain", err)
+			}
+			if posErr.Field != tc.wantField {
+				t.Fatalf("TimeoutMustBePositiveError.Field = %q, want %q", posErr.Field, tc.wantField)
+			}
+		})
+	}
+}
+
+// TestValidate_DefaultAutomationDispatchTotalBudgetCoversOneFullAutomation
+// pins the actual retry-chain math DefaultTimeouts derives
+// AutomationDispatchTotalBudget from (U1 audit fix): the list call plus
+// ONE matching automation's own two calls (throttle, create), each fully
+// retried, must fit inside the shipped default with room to spare -- the
+// SAME guarantee Validate()'s own new floor enforces for ANY configured
+// budget, proven here specifically against what actually ships.
+func TestValidate_DefaultAutomationDispatchTotalBudgetCoversOneFullAutomation(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+	perCall := platform.RetryWorstCaseSleep(to.AutomationDispatchMaxAttempts, to.AutomationDispatchRetryBaseDelay, to.AutomationDispatchRetryMaxDelay)
+	oneAutomationWorstCase := 3 * perCall // list + throttle + create
+
+	if to.AutomationDispatchTotalBudget <= oneAutomationWorstCase {
+		t.Fatalf("AutomationDispatchTotalBudget = %v, want > %v (list call + one matching automation's own full retry chain)", to.AutomationDispatchTotalBudget, oneAutomationWorstCase)
 	}
 }

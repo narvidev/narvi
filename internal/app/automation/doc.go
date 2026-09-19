@@ -254,4 +254,54 @@
 // or a CI system posting comments) could create unbounded invocations,
 // each fanning out into up to internal/domain/automation.MaxFanOutTargets
 // (10) sandboxed agent sessions.
+//
+// # U1 audit fix: the total budget is now sized against the retry chain it must contain
+//
+// Confirmed HIGH finding, round 3: D18's own AutomationDispatchTotalBudget
+// above used to be a flat literal picked independently of
+// AutomationDispatchMaxAttempts/RetryBaseDelay/RetryMaxDelay -- smaller
+// than the retry chain's own worst case for even TWO matching automations
+// (list + throttle + create = 3 calls per automation, each up to
+// platform.RetryWorstCaseSleep). DefaultTimeouts now DERIVES the budget
+// from those same three fields (platform/timeouts.go), and Validate()
+// requires it to cover at least the list call plus one matching
+// automation's own full retry chain, with margin -- see
+// AutomationDispatchTotalBudget's own doc comment for the exact floor and
+// why a delivery matching MORE automations than that degrades gracefully
+// instead of being silently truncated mid-backoff. checkDispatchThrottle's
+// own dispatchGateVerdict return type (githubdispatch.go) now also
+// distinguishes that graceful degradation (dispatchGateBudgetExhausted)
+// from EvaluateDispatchThrottle's own genuine throttle verdict
+// (dispatchGateThrottled) in both the return value and the log -- the two
+// used to be indistinguishable.
+//
+// # U7 audit fix: Linear gets the SAME machine-origin gate GitHub's D12 already has
+//
+// Confirmed HIGH finding: unlike GitHub (check_run/status, D12 above),
+// Linear's own dispatchOneLinearAutomation had NO machine-origin
+// equivalent at all -- an "Issue"/"Comment" event whose own top-level
+// "actor" is reported as something other than a real Linear account (an
+// OAuth client or an Integration, Linear's own docs) has no human identity
+// for the adapter's own gate to authorize, and was denied unconditionally,
+// forever, regardless of configuration. domainautomation.
+// ClassifyLinearActorOrigin (dispatch.go) mirrors ClassifyGitHubEventOrigin
+// exactly, one axis over (actor.type, not event category): a machine-
+// origin actor is now authorized against the matching automation's own
+// creator, exactly like check_run/status already are.
+//
+// # U8 audit fix: a permanently-dead machine-origin automation now surfaces on its own row
+//
+// Confirmed LOW finding: a machine-origin automation whose own created_by
+// is NULL (ON DELETE SET NULL), disabled, or reduced to viewer stops
+// dispatching with only a per-delivery Info log, while automations.status
+// stays 'active' forever -- structurally incapable of ever firing again,
+// with no UPDATE query anywhere to revive it, and no visible sign of the
+// problem on the automation's own state. markCreatorUnauthorizedBestEffort/
+// clearCreatorUnauthorizedBestEffort (githubdispatch.go, shared by both
+// providers' own machine-origin gates) now set/clear
+// automations.creator_unauthorized_since (migrations/
+// 000138_automations_creator_unauthorized.up.sql) the moment that
+// authorization denies or succeeds again -- best effort, never retried,
+// never fail-closed: this is observability state, never an authorization
+// decision.
 package automation

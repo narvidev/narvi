@@ -214,3 +214,31 @@ SET status = 'active',
     updated_at = now()
 WHERE id = $1 AND status = 'paused'
 RETURNING *;
+
+-- name: MarkAutomationCreatorUnauthorized :execrows
+-- U8 audit fix -- backs app/automation's own dispatchOneGitHubAutomation/
+-- dispatchOneLinearAutomation, called the moment a machine-origin
+-- dispatch is denied because this automation's own created_by is not a
+-- linked, non-disabled account holding authz.ActionCreateSession
+-- (migrations/000138_automations_creator_unauthorized.up.sql's own doc
+-- comment). "AND creator_unauthorized_since IS NULL" makes this
+-- idempotent AND preserves the FIRST denial's own timestamp -- a
+-- still-broken automation firing its trigger repeatedly must not keep
+-- sliding this forward, or a maintainer reading it would see only "just
+-- now", never how long this has actually been broken.
+UPDATE automations
+SET creator_unauthorized_since = now()
+WHERE id = $1 AND creator_unauthorized_since IS NULL;
+
+-- name: ClearAutomationCreatorUnauthorized :execrows
+-- The self-healing half of MarkAutomationCreatorUnauthorized immediately
+-- above: called the moment a machine-origin dispatch for this SAME
+-- automation is authorized again (a maintainer re-attributed it, or its
+-- existing creator's account was re-enabled/re-promoted) -- "AND
+-- creator_unauthorized_since IS NOT NULL" is the identical no-op-avoidance
+-- guard ResetConsecutiveFailures above already establishes for this
+-- table, never a correctness requirement (clearing an already-NULL column
+-- twice is harmless).
+UPDATE automations
+SET creator_unauthorized_since = NULL
+WHERE id = $1 AND creator_unauthorized_since IS NOT NULL;

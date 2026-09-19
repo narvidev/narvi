@@ -174,3 +174,22 @@ func (s *AutomationStore) ClaimCronFire(ctx context.Context, id pgtype.UUID, min
 func (s *AutomationStore) UpdateLastRun(ctx context.Context, arg sqlcgen.UpdateAutomationLastRunParams) (sqlcgen.Automation, error) {
 	return s.q.UpdateAutomationLastRun(ctx, arg)
 }
+
+// MarkCreatorUnauthorized records that id's own machine-origin dispatch
+// (check_run/status -- GitHub -- or a non-"user" actor -- Linear) was just
+// denied because created_by is not a linked, non-disabled account holding
+// authz.ActionCreateSession -- U8 audit fix, see migrations/
+// 000138_automations_creator_unauthorized.up.sql's own doc comment for the
+// full "why". Idempotent: a row already marked keeps its own FIRST denial
+// timestamp (MarkAutomationCreatorUnauthorized's own generated doc
+// comment) -- rows == 0 means "already marked", never an error.
+func (s *AutomationStore) MarkCreatorUnauthorized(ctx context.Context, id pgtype.UUID) (int64, error) {
+	return s.q.MarkAutomationCreatorUnauthorized(ctx, id)
+}
+
+// ClearCreatorUnauthorized is MarkCreatorUnauthorized's own self-healing
+// twin -- called the moment id's own machine-origin dispatch is
+// authorized again. rows == 0 means "was not marked", never an error.
+func (s *AutomationStore) ClearCreatorUnauthorized(ctx context.Context, id pgtype.UUID) (int64, error) {
+	return s.q.ClearAutomationCreatorUnauthorized(ctx, id)
+}

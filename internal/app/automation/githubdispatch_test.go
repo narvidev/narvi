@@ -37,6 +37,19 @@ func (f *countingFailNTimesLister) ListActiveGitHubAutomations(_ context.Context
 	return nil, nil
 }
 
+// MarkCreatorUnauthorized/ClearCreatorUnauthorized satisfy
+// automation.GitHubTriggerLister's own U8 audit fix addition -- never
+// called in this file's own tests (ListActiveGitHubAutomations always
+// returns zero rows, so no row-level machine-origin gate is ever
+// reached).
+func (f *countingFailNTimesLister) MarkCreatorUnauthorized(_ context.Context, _ pgtype.UUID) (int64, error) {
+	return 0, errors.New("unexpected call")
+}
+
+func (f *countingFailNTimesLister) ClearCreatorUnauthorized(_ context.Context, _ pgtype.UUID) (int64, error) {
+	return 0, errors.New("unexpected call")
+}
+
 // noopDeliveryInvocationCreator satisfies automation.DeliveryInvocationCreator
 // with no real Postgres round trip -- neither method is ever called in
 // these tests (ListActiveGitHubAutomations always returns zero rows), but
@@ -92,6 +105,14 @@ type ctxCapturingLister struct {
 func (f *ctxCapturingLister) ListActiveGitHubAutomations(ctx context.Context) ([]sqlcgen.Automation, error) {
 	f.gotCtx = ctx
 	return nil, nil
+}
+
+func (f *ctxCapturingLister) MarkCreatorUnauthorized(_ context.Context, _ pgtype.UUID) (int64, error) {
+	return 0, errors.New("unexpected call")
+}
+
+func (f *ctxCapturingLister) ClearCreatorUnauthorized(_ context.Context, _ pgtype.UUID) (int64, error) {
+	return 0, errors.New("unexpected call")
 }
 
 // TestDispatchGitHubWebhookEvent_ZeroTotalBudgetDoesNotExpireContextImmediately

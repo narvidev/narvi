@@ -1,0 +1,35 @@
+-- U8 audit fix (confirmed, LOW finding: "a machine-origin automation can
+-- become permanently dead with no way to revive it"): when a machine-
+-- origin automation's own trigger (check_run/status -- GitHub -- or a
+-- non-"user" actor -- Linear, U7) fires, dispatch authorizes it against
+-- automations.created_by (app/automation's own dispatchOneGitHubAutomation/
+-- dispatchOneLinearAutomation), never a sender identity -- see
+-- domain/automation's own GitHubEventOrigin/LinearEventOrigin doc
+-- comments for the full "why". created_by is nullable (ON DELETE SET
+-- NULL, migrations/000051_automations.up.sql: "an automation, like a
+-- session, can outlive the user who created it") and can also point at a
+-- linked-but-disabled or linked-but-viewer-role account -- any of which
+-- makes that authorization check permanently fail for THIS automation,
+-- with no UPDATE query anywhere that could ever give it a new authorizing
+-- principal. Before this fix, that dead state was invisible: the
+-- automation's own status stayed 'active' (an entirely separate concept
+-- -- consecutive_failures/auto-pause, migrations/000051), and only a
+-- per-delivery Info log recorded the denial. An automation that is
+-- 'active' and structurally incapable of ever firing is a lie in the
+-- product's own state.
+--
+-- creator_unauthorized_since surfaces that state directly on the
+-- automation's own row: set (to the FIRST denial's own timestamp, never
+-- overwritten by a later one -- see MarkAutomationCreatorUnauthorized,
+-- queries/automations.sql) the moment a machine-origin dispatch is denied
+-- for this reason, and cleared back to NULL (see
+-- ClearAutomationCreatorUnauthorized) the moment a machine-origin
+-- dispatch for this SAME automation succeeds again -- e.g. an operator
+-- re-attributes it (no dedicated endpoint exists yet; direct creator
+-- reassignment or re-enabling the linked account both clear this the same
+-- way, the next time this automation's own trigger fires). NULL means
+-- "never denied for this reason, or has since recovered" -- the
+-- CURRENTLY-broken default every pre-existing row and every non-machine-
+-- trigger automation keeps forever, never touched by either query.
+ALTER TABLE automations
+    ADD COLUMN creator_unauthorized_since TIMESTAMPTZ;
