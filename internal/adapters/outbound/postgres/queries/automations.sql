@@ -60,6 +60,55 @@ SELECT * FROM automations
 WHERE trigger_type = 'cron' AND status = 'active'
 ORDER BY last_cron_fired_at ASC NULLS FIRST;
 
+-- name: ListActiveGitHubAutomations :many
+-- Backs the live GitHub webhook dispatch path (§8.4, app/automation's
+-- own githubdispatch.go, called inline from internal/adapters/inbound/
+-- github's own handler.go) -- every active, github-triggered automation,
+-- evaluated against each dispatchable webhook delivery. Mirrors
+-- ListActiveCronAutomations' own shape exactly, one row over, ordered by
+-- id only for deterministic test output (unlike the cron pump, there is no
+-- "last fired" column this trigger type advances).
+SELECT * FROM automations
+WHERE trigger_type = 'github' AND status = 'active'
+ORDER BY id ASC;
+
+-- name: ListActiveLinearAutomations :many
+-- The Linear twin of ListActiveGitHubAutomations immediately above --
+-- backs app/automation's own lineardispatch.go, called inline from
+-- internal/adapters/inbound/linear's own webhook.go.
+--
+-- W3 audit fix (confirmed HIGH, TENANT ISOLATION finding): this query used
+-- to carry no tenant predicate at all -- the only workspace check
+-- anywhere on the Linear dispatch path was "some linear_installations row
+-- exists for this delivery's own organizationId" (D9), which establishes
+-- that SOME workspace installed this app, never that THIS automation
+-- belongs to the SAME workspace the live event came from. Unlike
+-- ListActiveGitHubAutomations (whose own repo/branch scoping happens
+-- entirely in-app, via TargetMatchesGitHubEvent comparing a target's own
+-- clone URL against the event's repository -- GitHub needs no separate
+-- tenant predicate here because a target's "owner/repo" path is already
+-- globally unique), a Linear-triggered automation's own configured target
+-- repos are ordinary git repositories with no relationship to which
+-- Linear WORKSPACE may trigger it -- so Linear's tenant boundary has to be
+-- the workspace itself, sqlc.arg('organization_id') compared directly
+-- against trigger_config's own "organizationId" field
+-- (LinearTriggerConfig.OrganizationID, required at creation time,
+-- internal/domain/automation/trigger.go). trigger_config->>'organizationId'
+-- mirrors this codebase's own existing JSONB-field-predicate precedent
+-- (queries/events.sql's own payload->>'gen'/payload->>'metric' filters)
+-- rather than a new dedicated column: automations is documented elsewhere
+-- (ListAutomations, above) as "expected to stay small", so this predicate
+-- needs no supporting index to stay a single, cheap index/seq scan over an
+-- already trigger_type/status-narrowed row set. A pre-existing row with no
+-- "organizationId" key at all (impossible going forward -- creation-time
+-- validation now requires it -- but defensively: trigger_config->>'x' on
+-- a missing key returns SQL NULL) can never equal a real, non-NULL
+-- organization_id argument, so it is excluded, never matched by accident.
+SELECT * FROM automations
+WHERE trigger_type = 'linear' AND status = 'active'
+  AND trigger_config->>'organizationId' = sqlc.arg('organization_id')::text
+ORDER BY id ASC;
+
 -- name: ClaimCronFire :one
 -- The CAS half of the cron trigger pump's own per-automation fire guard:
 -- "UPDATE ... WHERE last_cron_fired_at IS NULL OR last_cron_fired_at <
@@ -194,3 +243,34 @@ SET status = 'active',
     updated_at = now()
 WHERE id = $1 AND status = 'paused'
 RETURNING *;
+
+-- name: MarkAutomationCreatorUnauthorized :execrows
+-- U8 audit fix -- backs app/automation's own dispatchOneGitHubAutomation
+-- (githubdispatch.go) only, called the moment a machine-origin (check_run/
+-- status) dispatch is denied because this automation's own created_by is
+-- not a linked, non-disabled account holding authz.ActionCreateSession
+-- (migrations/000138_automations_creator_unauthorized.up.sql's own doc
+-- comment). dispatchOneLinearAutomation never calls this: a Linear
+-- machine-origin actor is denied outright, upstream, by
+-- ClassifyLinearActorOrigin (internal/domain/automation/dispatch.go) --
+-- see docs/DECISIONS.md's D-07 entry. "AND creator_unauthorized_since IS
+-- NULL" makes this idempotent AND preserves the FIRST denial's own
+-- timestamp -- a still-broken automation firing its trigger repeatedly
+-- must not keep sliding this forward, or a maintainer reading it would
+-- see only "just now", never how long this has actually been broken.
+UPDATE automations
+SET creator_unauthorized_since = now()
+WHERE id = $1 AND creator_unauthorized_since IS NULL;
+
+-- name: ClearAutomationCreatorUnauthorized :execrows
+-- The self-healing half of MarkAutomationCreatorUnauthorized immediately
+-- above: called the moment a machine-origin dispatch for this SAME
+-- automation is authorized again (a maintainer re-attributed it, or its
+-- existing creator's account was re-enabled/re-promoted) -- "AND
+-- creator_unauthorized_since IS NOT NULL" is the identical no-op-avoidance
+-- guard ResetConsecutiveFailures above already establishes for this
+-- table, never a correctness requirement (clearing an already-NULL column
+-- twice is harmless).
+UPDATE automations
+SET creator_unauthorized_since = NULL
+WHERE id = $1 AND creator_unauthorized_since IS NOT NULL;

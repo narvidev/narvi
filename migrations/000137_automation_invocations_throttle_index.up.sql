@@ -1,0 +1,26 @@
+-- D17 audit fix (confirmed, MEDIUM finding: "the throttle is a
+-- denial-of-service amplifier"): CountRecentAutomationInvocations
+-- (queries/automationinvocations.sql) filters "WHERE automation_id = $1
+-- AND created_at >= $2" -- D8's own per-automation dispatch throttle,
+-- checkDispatchThrottle (app/automation's own githubdispatch.go/
+-- lineardispatch.go), called inline, on EVERY matching webhook delivery,
+-- per matching automation. automation_invocations_automation_id_idx
+-- (migrations/000052_automation_invocations.up.sql) covers automation_id
+-- alone -- enough to jump to this automation's own rows, but NOT enough
+-- to prune by created_at, so this query still walks every invocation
+-- this automation has EVER created (its full lifetime count), not just
+-- the ones inside the throttle window: the anti-abuse check itself was
+-- O(that automation's lifetime invocation count), executed inline, per
+-- matching automation, per webhook delivery -- an attacker-controlled (or
+-- merely long-lived and heavily-used) automation makes the very check
+-- meant to bound its own cost scale with exactly the quantity it exists
+-- to bound.
+--
+-- This composite index lets that same query satisfy BOTH predicates via
+-- one index scan: automation_id equality narrows to this automation's own
+-- rows, then created_at >= $2 is satisfied directly from the index's own
+-- sort order, with no need to visit (or even skip past) a row created
+-- before the throttle window. See this batch's own PR body for the
+-- measured query plan before and after, against a populated table.
+CREATE INDEX automation_invocations_automation_id_created_at_idx
+    ON automation_invocations (automation_id, created_at);

@@ -79,6 +79,22 @@ export function runHealthLabel(runHealth: Automation['runHealth']): string | nul
   return `${runHealth.succeededRuns}/${runHealth.terminalRuns} ok`
 }
 
+/**
+ * creatorUnauthorizedLabel renders W7 audit fix's own required surfacing
+ * (confirmed MEDIUM finding: "the column added to end a silent failure is
+ * itself unread") of Automation.creatorUnauthorizedSince: null when this
+ * automation's own machine-origin creator authorization has never been
+ * denied, or has since recovered (the field itself is null/undefined on
+ * the wire) -- rendered by the caller as a distinct warning, never folded
+ * into the ordinary status/health chip, because an automation can be
+ * 'active' and structurally incapable of ever firing at the SAME time
+ * this field is set.
+ */
+export function creatorUnauthorizedLabel(creatorUnauthorizedSince: Automation['creatorUnauthorizedSince']): string | null {
+  if (creatorUnauthorizedSince == null) return null
+  return 'creator unauthorized'
+}
+
 export function nextRunSummary(automation: Automation): string {
   if (automation.status === 'paused') return '—'
   if (automation.triggerType === 'cron') {

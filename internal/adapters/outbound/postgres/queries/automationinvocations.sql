@@ -15,6 +15,38 @@ RETURNING *;
 SELECT * FROM automation_invocations
 WHERE id = $1;
 
+-- name: CreateAutomationInvocationForDelivery :one
+-- D1 audit fix's own idempotent-on-delivery variant of
+-- CreateAutomationInvocation above -- used ONLY by live GitHub/Linear
+-- webhook dispatch (app/automation's own githubdispatch.go/
+-- lineardispatch.go), which alone has a genuine (provider, delivery_id)
+-- identity to key on. The SAME "(xmax = 0) AS inserted" idiom
+-- ClaimWebhookDelivery already establishes (queries/webhookdeliveries.sql)
+-- -- a deliberate, self-referential no-op update (automation_id is set
+-- back to its own current value) on conflict against
+-- automation_invocations_source_delivery_uniq (migrations/
+-- 000136_automation_invocations_source_delivery.up.sql), so RETURNING
+-- always yields exactly one row whether this call just inserted a fresh
+-- invocation or found an already-created one from an earlier delivery of
+-- the SAME (automation_id, provider, delivery_id) -- a real webhook
+-- redelivery. Callers branch on Inserted: true means "a new invocation
+-- now exists, proceed exactly like CreateAutomationInvocation always has";
+-- false means "already dispatched for this exact delivery -- skip,
+-- never double-fire this automation for a resend".
+INSERT INTO automation_invocations (automation_id, targets, total_runs, source_provider, source_delivery_id)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (automation_id, source_provider, source_delivery_id) WHERE source_provider IS NOT NULL AND source_delivery_id IS NOT NULL
+DO UPDATE SET automation_id = automation_invocations.automation_id
+RETURNING *, (xmax = 0) AS inserted;
+
+-- name: CountRecentAutomationInvocations :one
+-- Backs D8's own per-automation dispatch throttle
+-- (domainautomation.EvaluateDispatchThrottle) -- every invocation this
+-- automation has created (any source, any outcome) since $2, regardless
+-- of whether it has fanned out or closed yet.
+SELECT count(*) FROM automation_invocations
+WHERE automation_id = $1 AND created_at >= $2;
+
 -- name: ListDueForFanOut :many
 -- Every invocation not yet claimed for fan-out, oldest first, locked FOR
 -- UPDATE SKIP LOCKED (of automation_invocations only -- "FOR UPDATE OF ai"

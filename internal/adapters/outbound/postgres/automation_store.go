@@ -146,6 +146,23 @@ func (s *AutomationStore) ListActiveCronAutomations(ctx context.Context) ([]sqlc
 	return s.q.ListActiveCronAutomations(ctx)
 }
 
+// ListActiveGitHubAutomations returns every active, github-triggered
+// automation -- backs the live GitHub webhook dispatch path (§8.4,
+// app/automation's own githubdispatch.go).
+func (s *AutomationStore) ListActiveGitHubAutomations(ctx context.Context) ([]sqlcgen.Automation, error) {
+	return s.q.ListActiveGitHubAutomations(ctx)
+}
+
+// ListActiveLinearAutomations returns every active, linear-triggered
+// automation SCOPED TO organizationID -- backs the live Linear webhook
+// dispatch path (§8.4, app/automation's own lineardispatch.go). W3 audit
+// fix: organizationID is now REQUIRED (never "" meaning "every
+// organization") -- see the generated query's own doc comment
+// (queries/automations.sql) for the tenant-isolation "why".
+func (s *AutomationStore) ListActiveLinearAutomations(ctx context.Context, organizationID string) ([]sqlcgen.Automation, error) {
+	return s.q.ListActiveLinearAutomations(ctx, organizationID)
+}
+
 // ClaimCronFire is the cron trigger pump's own per-automation CAS guard --
 // see ClaimCronFire's own generated doc comment. pgx.ErrNoRows means this
 // automation already fired for the given minute bucket (a concurrent tick
@@ -159,4 +176,28 @@ func (s *AutomationStore) ClaimCronFire(ctx context.Context, id pgtype.UUID, min
 // invocation's own outcome is decided.
 func (s *AutomationStore) UpdateLastRun(ctx context.Context, arg sqlcgen.UpdateAutomationLastRunParams) (sqlcgen.Automation, error) {
 	return s.q.UpdateAutomationLastRun(ctx, arg)
+}
+
+// MarkCreatorUnauthorized records that id's own machine-origin (check_run/
+// status) GitHub dispatch was just denied because created_by is not a
+// linked, non-disabled account holding authz.ActionCreateSession -- U8
+// audit fix, see migrations/000138_automations_creator_unauthorized.up.sql's
+// own doc comment for the full "why". GitHub only: a Linear machine-origin
+// actor is denied OUTRIGHT, upstream of any per-automation creator check,
+// by `ClassifyLinearActorOrigin` (internal/domain/automation/dispatch.go)
+// at `dispatchAutomationsBestEffort` (internal/adapters/inbound/linear/
+// automationdispatch.go) -- see docs/DECISIONS.md's D-07 entry -- so this
+// method is never called on that path. Idempotent: a row already marked
+// keeps its own FIRST denial timestamp (MarkAutomationCreatorUnauthorized's
+// own generated doc comment) -- rows == 0 means "already marked", never an
+// error.
+func (s *AutomationStore) MarkCreatorUnauthorized(ctx context.Context, id pgtype.UUID) (int64, error) {
+	return s.q.MarkAutomationCreatorUnauthorized(ctx, id)
+}
+
+// ClearCreatorUnauthorized is MarkCreatorUnauthorized's own self-healing
+// twin -- called the moment id's own machine-origin GitHub dispatch is
+// authorized again. rows == 0 means "was not marked", never an error.
+func (s *AutomationStore) ClearCreatorUnauthorized(ctx context.Context, id pgtype.UUID) (int64, error) {
+	return s.q.ClearAutomationCreatorUnauthorized(ctx, id)
 }

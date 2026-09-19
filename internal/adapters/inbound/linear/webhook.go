@@ -20,6 +20,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/actorauthz"
+	"github.com/narvidev/narvi/internal/app/automation"
 	"github.com/narvidev/narvi/internal/app/identitylink"
 	"github.com/narvidev/narvi/internal/app/intentclassifier"
 	"github.com/narvidev/narvi/internal/app/ports"
@@ -224,6 +225,21 @@ type Deps struct {
 	// GetByAgentSessionID (mirrors github's own PullRequestResolver
 	// nil-safe-fallback precedent, headresolve.go).
 	SessionIDSetter sessionIDSetter
+
+	// Automations/AutomationInvocations (§8.4, "automations never
+	// dispatch on a real webhook") mirror github.Config's own identical
+	// pair (internal/adapters/inbound/github/handler.go) exactly -- see
+	// that package's own automationdispatch.go doc comments, and this
+	// package's own dispatchAutomationsBestEffort (automationdispatch.go),
+	// for the full design. Nil-safe: nil (this package's own webhook_test.
+	// go, or any other minimal wiring that doesn't care about this Step)
+	// simply skips automation dispatch entirely.
+	Automations automation.LinearTriggerLister
+	// AutomationInvocations mirrors internal/adapters/inbound/github's own
+	// Config.AutomationInvocations doc comment exactly (D1/D8 audit
+	// fixes): typed as automation.DeliveryInvocationCreator, not the
+	// narrower automation.InvocationCreator this field used to carry.
+	AutomationInvocations automation.DeliveryInvocationCreator
 }
 
 // NewWebhookHandler backs POST /webhooks/linear: verifies Linear's own
@@ -328,6 +344,25 @@ func NewWebhookHandler(deps Deps) http.HandlerFunc {
 		// actually retry rather than being silently skipped forever as an
 		// already-claimed duplicate.
 		eventType := eventTypeFrom(r)
+
+		// §8.4 ("automations never dispatch on a real webhook"): an
+		// ADDITIONAL, independent consumer of this SAME already-claimed
+		// delivery, mirroring github's own identical call site (handler.go)
+		// exactly -- deliberately BEFORE the "ignoring non-AgentSessionEvent"
+		// check immediately below, and unconditional: this package's own
+		// AgentSessionEvent pipeline and a matching automation trigger are
+		// two fully independent consumers of the same delivery (though
+		// LinearDispatchAllowlist deliberately excludes AgentSessionEvent
+		// itself -- see that allowlist's own doc comment for why). See
+		// dispatchAutomationsBestEffort's own doc comment
+		// (automationdispatch.go) for the full design and panic-isolation --
+		// and github's own identical call site (handler.go)'s own "W5 audit
+		// fix" section for why that panic-isolation guarantee is about
+		// FAILURE, never about the WALL CLOCK this call spends ahead of the
+		// AgentSessionEvent pipeline below, on the same shared request-path
+		// budget. Applies here verbatim -- not re-explained a second time.
+		dispatchAutomationsBestEffort(ctx, logger, deps, eventType, deliveryID, rawBody)
+
 		if eventType != agentSessionEventType && payload.Type != agentSessionEventType {
 			logger.Info("linear: ignoring non-AgentSessionEvent webhook category", "event_type", eventType)
 			w.WriteHeader(http.StatusOK)

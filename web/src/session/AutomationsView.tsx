@@ -44,7 +44,7 @@ import { createAutomation, listAutomationInvocations, listAutomations, resumeAut
 import { ApiError } from '../api/http'
 import { automationQueryKeys } from '../api/queryKeys'
 import { meQueryOptions } from '../auth/session'
-import { AUTO_PAUSE_THRESHOLD, automationStatusTone, lastRunTone, nextRunSummary, runHealthLabel, runStatusTone, targetsSummary, triggerSummary } from './automationFormat'
+import { AUTO_PAUSE_THRESHOLD, automationStatusTone, creatorUnauthorizedLabel, lastRunTone, nextRunSummary, runHealthLabel, runStatusTone, targetsSummary, triggerSummary } from './automationFormat'
 import { formatRelativeTime } from './relativeTime'
 import { truncateForDisplay } from './textSafety'
 
@@ -148,7 +148,19 @@ export function AutomationRow({ automation, canManage }: { automation: Automatio
         </td>
         <td className="num">{nextRunSummary(automation)}</td>
         <td>
-          {automation.status === 'paused' ? (
+          {creatorUnauthorizedLabel(automation.creatorUnauthorizedSince) !== null ? (
+            // W7 audit fix: checked FIRST, ahead of auto-pause/strikes/health
+            // -- an automation whose own creator is no longer linked/
+            // authorized is structurally incapable of ever firing a
+            // machine-origin (check_run/status, or non-"user" Linear actor)
+            // trigger, regardless of what its own status/consecutiveFailures
+            // columns say. See automationFormat.ts's own creatorUnauthorizedLabel
+            // doc comment.
+            <span className="chip crit" title="This automation's own creator is not a linked, authorized account -- machine-origin triggers cannot fire until it is re-attributed.">
+              <span className="dot" />
+              {creatorUnauthorizedLabel(automation.creatorUnauthorizedSince)}
+            </span>
+          ) : automation.status === 'paused' ? (
             <>
               <span className="chip neutral">
                 <span className="dot" />

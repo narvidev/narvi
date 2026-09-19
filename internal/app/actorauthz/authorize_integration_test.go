@@ -211,6 +211,80 @@ func TestAuthorizeResolvedActor_UnknownUserFailsClosed(t *testing.T) {
 	}
 }
 
+// TestAuthorizeResolvedActorVerdict_UnknownUserReturnsError is W9's own
+// required proof (confirmed LOW finding: "an error is recorded as a
+// verdict"): the SAME "syntactically valid but nonexistent user id"
+// scenario TestAuthorizeResolvedActor_UnknownUserFailsClosed proves fails
+// closed at the bool call site must resolve to LinkedActorError specifically
+// -- NOT LinkedActorDenied -- through the verdict-returning form, because a
+// role-lookup failure says nothing about whether this actor is actually
+// authorized. A caller collapsing this into LinkedActorDenied (as the old
+// plain-bool callers had no choice but to) would persist a false "this
+// creator is unauthorized" verdict against an identity that was simply
+// never looked up successfully.
+func TestAuthorizeResolvedActorVerdict_UnknownUserReturnsError(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	users := narvipg.NewUserStore(pool)
+	logger := discardLogger()
+
+	var nonexistent pgtype.UUID
+	if err := nonexistent.Scan("00000000-0000-0000-0000-000000000000"); err != nil {
+		t.Fatalf("scan uuid: %v", err)
+	}
+
+	got := actorauthz.AuthorizeResolvedActorVerdict(ctx, logger, "test", users, nonexistent, authz.ActionCreateSession, authz.Resource{})
+	if got != actorauthz.LinkedActorError {
+		t.Errorf("AuthorizeResolvedActorVerdict() = %v, want LinkedActorError (a role-lookup failure is not a verdict) for a user id with no matching row", got)
+	}
+}
+
+// TestAuthorizeResolvedActorVerdict_DisabledUserReturnsDenied is the
+// verdict-returning sibling of TestAuthorizeResolvedActor_
+// DisabledUserDeniedEvenWithPermittingRole: a disabled account is a
+// GENUINE, completed verdict (LinkedActorDenied), not a lookup error --
+// this authorization ran to completion and correctly said no.
+func TestAuthorizeResolvedActorVerdict_DisabledUserReturnsDenied(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	users := narvipg.NewUserStore(pool)
+	logger := discardLogger()
+
+	user, err := users.Create(ctx, sqlcgen.CreateUserParams{
+		PrimaryEmail: "actorauthz-verdict-disabled@example.com",
+		DisplayName:  "Disabled Verdict Test User",
+		Role:         sqlcgen.UserRoleMember,
+	})
+	if err != nil {
+		t.Fatalf("create fixture user: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE users SET disabled = true WHERE id = $1`, user.ID); err != nil {
+		t.Fatalf("disable fixture user: %v", err)
+	}
+
+	got := actorauthz.AuthorizeResolvedActorVerdict(ctx, logger, "test", users, user.ID, authz.ActionCreateSession, authz.Resource{})
+	if got != actorauthz.LinkedActorDenied {
+		t.Errorf("AuthorizeResolvedActorVerdict() = %v, want LinkedActorDenied for a disabled user (a genuine, completed verdict)", got)
+	}
+}
+
+// TestAuthorizeLinkedActorVerdict_UnresolvedActorReturnsDenied mirrors
+// TestAuthorizeLinkedActor_UnresolvedActorDeniedWithNoLookup: an invalid
+// (not-yet-linked) actorUserID is LinkedActorDenied, never LinkedActorError
+// -- it is not a lookup failure, it is the exact, deliberate, structural
+// denial this function exists to return (see AuthorizeLinkedActorVerdict's
+// own doc comment). Proven with a nil *postgres.UserStore, which would
+// panic on any actual dereference -- pinning "no lookup happens at all".
+func TestAuthorizeLinkedActorVerdict_UnresolvedActorReturnsDenied(t *testing.T) {
+	ctx := context.Background()
+	logger := discardLogger()
+
+	got := actorauthz.AuthorizeLinkedActorVerdict(ctx, logger, "test", nil, pgtype.UUID{}, authz.ActionCreateSession, authz.Resource{})
+	if got != actorauthz.LinkedActorDenied {
+		t.Errorf("AuthorizeLinkedActorVerdict() = %v, want LinkedActorDenied for an unresolved (invalid) actor", got)
+	}
+}
+
 // TestAuthorizeResolvedActor_RoleMatrix is table-driven over the §13.3 role
 // matrix verdicts this function renders once an actor IS resolved --
 // mirrors slack/linear's own pre-extraction integration coverage (a

@@ -107,10 +107,27 @@ func parseMigrationName(name string) (MigrationFile, error) {
 // date. Requiring branches to be current before merge is what turns it
 // from a fast alarm into a gate.
 //
-// Sequential-with-no-gaps is deliberately NOT required. A gap is harmless
-// to golang-migrate and demanding contiguity would turn every abandoned
-// branch into a renumbering chore, which is how a check earns being
-// disabled.
+// Sequential-with-no-gaps is deliberately NOT required HERE. A gap that
+// stays a gap forever (an abandoned branch's own reserved-then-unused
+// number) is harmless to golang-migrate, and demanding contiguity would
+// turn every such branch into a renumbering chore, which is how a check
+// earns being disabled.
+//
+// U5 audit fix: that is a narrower claim than "gaps are always harmless",
+// and the distinction matters. golang-migrate's postgres driver tracks a
+// SINGLE applied version (schema_migrations' own one-row version+dirty
+// shape), not a per-migration applied set -- Up() walks forward from
+// whatever that stored version already is. A gap that gets FILLED IN
+// LATER, after a HIGHER-numbered migration has already run on a real
+// environment, is therefore silently and PERMANENTLY skipped: the
+// backfilled migration's own version is now behind the stored one, so
+// Up() never revisits it, on that environment, ever. This is real and not
+// hypothetical for the tree this batch lands in: this branch depends on
+// 000135 (owned by a sibling branch, not yet merged) existing before
+// 000136/000137 run anywhere for real. CheckMigrationGaps below is the
+// check for THAT hazard -- see its own doc comment for why it must never
+// run as an ordinary `go test` next to this one (a legitimately pending
+// branch would fail its own CI for a gap that is not yet a mistake).
 func CheckMigrationVersions(files []MigrationFile) []string {
 	var problems []string
 
@@ -162,6 +179,74 @@ func CheckMigrationVersions(files []MigrationFile) []string {
 					"version %06d pairs slug %q (up) with %q (down) -- a pair must share one slug",
 					v, upSlug.Slug, downSlug.Slug))
 			}
+		}
+	}
+	return problems
+}
+
+// CheckMigrationGaps returns one message per missing version number
+// strictly between the lowest and highest version present in files --
+// U5 audit fix (my own mistake, not a prior implementer's: I renumbered
+// this branch's own migration from 000135 to 000136 because a sibling
+// branch had also taken 000135, and described the resulting merge order
+// as a constraint someone would remember. The review established it is
+// worse than that -- see CheckMigrationVersions' own doc comment above for
+// the exact mechanism (golang-migrate's postgres driver tracks a single
+// applied version, not a per-migration set) that makes a backfilled gap a
+// PERMANENT skip on any environment that already migrated past the higher
+// number, not merely a confusing ordering rule.
+//
+// # Why this cannot run as an ordinary `go test`, next to CheckMigrationVersions
+//
+// This branch legitimately HAS a gap (000135) for as long as the sibling
+// that owns it has not yet merged -- that is not a mistake, it is the
+// expected, temporary state of two branches developed in parallel, each
+// individually green. Running this check inside `go test -race ./...`
+// (which this repo's own `make test` runs on EVERY push AND EVERY pull
+// request, per .github/workflows/ci.yml) would fail THIS branch's own CI
+// for exactly the reason U5 says is fine to have, defeating the entire
+// point: a check that blocks legitimate, temporary, in-flight work trains
+// people to work around it, which is how a check earns being disabled
+// (CheckMigrationVersions' own doc comment, same file, makes the identical
+// point about a DIFFERENT hazard).
+//
+// The property this check actually needs to enforce is "no gap survives a
+// MERGE to main" -- main is the one tree every real deployment's own
+// migration run actually walks, and once code lands there, every
+// migration that is part of main's own history must already be present:
+// a gap on main is never legitimately temporary the way one on a feature
+// branch is. TestNoMigrationGaps (migrationversions_test.go) is therefore
+// gated on running ONLY when this process is CI's own post-merge run
+// against main (GITHUB_EVENT_NAME == "push" && GITHUB_REF_NAME == "main"
+// -- GitHub Actions' own default env vars, requiring no workflow-file
+// change to populate) -- skipped everywhere else: a developer's own
+// machine, and every pull-request CI run, THIS branch's own included. See
+// that test's own doc comment for the full "why here, and why this is the
+// honest resolution rather than a workflow-level `if:` this package
+// cannot see or enforce on its own".
+func CheckMigrationGaps(files []MigrationFile) []string {
+	if len(files) == 0 {
+		return nil
+	}
+
+	present := map[int]bool{}
+	minVersion, maxVersion := files[0].Version, files[0].Version
+	for _, f := range files {
+		present[f.Version] = true
+		if f.Version < minVersion {
+			minVersion = f.Version
+		}
+		if f.Version > maxVersion {
+			maxVersion = f.Version
+		}
+	}
+
+	var problems []string
+	for v := minVersion; v <= maxVersion; v++ {
+		if !present[v] {
+			problems = append(problems, fmt.Sprintf(
+				"migrations/ is missing version %06d (present versions span %06d-%06d) -- golang-migrate's own postgres driver tracks a single applied version, not a per-migration set, so a lower-numbered migration that lands on main AFTER a higher one has already run on a real environment is skipped forever, never applied; this check only runs against main, where every merged migration must already be present",
+				v, minVersion, maxVersion))
 		}
 	}
 	return problems

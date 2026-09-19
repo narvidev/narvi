@@ -1555,7 +1555,7 @@ export interface Automation {
    */
   triggerType: 'manual' | 'cron' | 'github' | 'linear' | 'webhook';
   /**
-   * Opaque, type-specific trigger configuration -- see this schema's own top-level description for why this is not a discriminated union. {} for triggerType manual/webhook; {"schedule": "<5-field cron expr>"} for cron; {"event": ..., "action": ..., "label": ...} for github (action/label optional); {"eventType": ..., "action": ..., "teamKey": ...} for linear (action/teamKey optional).
+   * Opaque, type-specific trigger configuration -- see this schema's own top-level description for why this is not a discriminated union. {} for triggerType manual/webhook; {"schedule": "<5-field cron expr>"} for cron; {"event": ..., "action": ..., "label": ...} for github (action/label optional); {"eventType": ..., "action": ..., "teamKey": ..., "organizationId": ...} for linear (action/teamKey optional, organizationId REQUIRED -- the Linear workspace this automation is scoped to; W3 audit fix, tenant isolation).
    */
   triggerConfig: {
     [k: string]: unknown;
@@ -1582,6 +1582,10 @@ export interface Automation {
    * A short, one-sentence, mechanically generated description of the most recently closed invocation's own outcome (internal/domain/automation.BuildArtifactSummary). Null until lastRunAt is first set.
    */
   artifactSummary: string | null;
+  /**
+   * W7 audit fix (confirmed MEDIUM finding: "the column added to end a silent failure is itself unread"): set the moment a machine-originated GitHub (check_run/status) dispatch is denied because this automation's own creator is not a linked, non-disabled account holding authz.ActionCreateSession (migrations/000138_automations_creator_unauthorized.up.sql); cleared back to null the moment a machine-originated GitHub dispatch for this same automation is authorized again. A machine-originated Linear dispatch never sets or clears this field: that actor is denied outright, upstream of any per-automation creator check (see docs/DECISIONS.md's D-07 entry). Preserves the FIRST denial's own timestamp across repeated denials. Null means never denied for this reason, or has since recovered. An automation can be 'active' in the status column above and still be structurally incapable of ever firing because of this -- the product's own state was a lie about that until this field existed on the wire.
+   */
+  creatorUnauthorizedSince: string | null;
   /**
    * §12.2 item 4's own health-column success ratio ("12/12 ok", "47/48 ok") -- an ALL-TIME count over automation_runs (postgres.AutomationRunStore.ListRunHealth), computed fresh on every read, never a persisted counter. Null when this automation has never had a terminal (succeeded/failed) run -- an honest "no runs yet", never a fabricated 0/0.
    */

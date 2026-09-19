@@ -56,6 +56,21 @@ func (s *AutomationInvocationStore) Get(ctx context.Context, id pgtype.UUID) (sq
 	return s.q.GetAutomationInvocation(ctx, id)
 }
 
+// CreateForDelivery is D1 audit fix's own idempotent-on-delivery variant
+// of Create above -- see CreateAutomationInvocationForDelivery's own
+// generated doc comment for the full "why" and the Inserted-branching
+// contract every caller must honor.
+func (s *AutomationInvocationStore) CreateForDelivery(ctx context.Context, arg sqlcgen.CreateAutomationInvocationForDeliveryParams) (sqlcgen.CreateAutomationInvocationForDeliveryRow, error) {
+	return s.q.CreateAutomationInvocationForDelivery(ctx, arg)
+}
+
+// CountRecentInvocations backs D8's own per-automation dispatch throttle
+// (domainautomation.EvaluateDispatchThrottle) -- every invocation
+// automationID has created since since, any source, any outcome.
+func (s *AutomationInvocationStore) CountRecentInvocations(ctx context.Context, automationID pgtype.UUID, since pgtype.Timestamptz) (int64, error) {
+	return s.q.CountRecentAutomationInvocations(ctx, sqlcgen.CountRecentAutomationInvocationsParams{AutomationID: automationID, CreatedAt: since})
+}
+
 // ListDueForFanOut returns up to limit invocations not yet claimed for
 // fan-out, locked FOR UPDATE SKIP LOCKED -- callers MUST run this inside
 // the same transaction that subsequently calls ClaimForFanOut on each

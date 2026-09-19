@@ -1587,6 +1587,14 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 				// constructed above, backing this lane's own direct,
 				// actor-bypassing review_retrigger_debounce timer arm.
 				Timers: timerStore,
+				// Automations/AutomationInvocations (§8.4, "automations
+				// never dispatch on a real webhook"): the SAME
+				// automationStore/automationInvocationStore instances
+				// automationEngine (constructed below) already uses, never
+				// a second, independently-constructed copy -- see
+				// githubingress.Config.Automations' own doc comment.
+				Automations:           automationStore,
+				AutomationInvocations: automationInvocationStore,
 			},
 		))
 	}
@@ -2437,6 +2445,14 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 			// file also receives -- linear.Deps.PRSessions' own doc comment
 			// explains why Linear's own fixed default repo needs it too.
 			PRSessions: githubPRSessionStore,
+			// Automations/AutomationInvocations (§8.4, "automations
+			// never dispatch on a real webhook"): the SAME
+			// automationStore/automationInvocationStore instances
+			// automationEngine (constructed above) and the GitHub ingress
+			// route above already use, never a second, independently-
+			// constructed copy.
+			Automations:           automationStore,
+			AutomationInvocations: automationInvocationStore,
 		}))
 	}
 

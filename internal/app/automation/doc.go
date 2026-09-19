@@ -131,9 +131,17 @@
 // ListDueForFanOut's own "AND a.status = 'active'" join condition
 // (queries/automationinvocations.sql) is commit 431e4b3's own "SECOND,
 // independent layer" of defense-in-depth against fanning out a pending
-// invocation whose automation has since been auto-paused -- §8.4's own
-// future trigger evaluator is the FIRST layer (never calling CreateInvocation
-// for a paused automation in the first place). Because claimBatch claims an
+// invocation whose automation has since been auto-paused -- every trigger
+// evaluator this package now has (EvaluateCronTriggersOnce's own
+// ListActiveCronAutomations, DispatchGitHubWebhookEvent's own
+// ListActiveGitHubAutomations, DispatchLinearWebhookEvent's own
+// ListActiveLinearAutomations, and the generic webhook trigger's own
+// automationwebhook.NewHandler) is the FIRST layer: each already filters to
+// "status = 'active'" before ever calling CreateInvocation/
+// CreateInvocationForDelivery (D1 audit fix's own idempotent-on-delivery
+// variant, invocationenqueue.go -- see the section below), so a paused
+// automation is never a fresh call's own target in the first place. Because
+// claimBatch claims an
 // entire BATCH of due invocations inside one transaction, an automation can
 // still pause mid-batch: some of its own invocations, already claimed
 // (fanned_out_at stamped) and already fanned out into real sessions earlier
@@ -152,18 +160,161 @@
 // as a failure strike against an automation no longer accepting new work)
 // would need its own small design decision, not addressed by this Step.
 //
-// # CreateInvocation -- this Step's own minimal entry point
+// # CreateInvocation/CreateInvocationForDelivery -- the two entry points every trigger evaluator shares
 //
 // §8.4 ("automations: triggers & extras", §8.4) owns WHAT causes an
-// invocation to be created (GitHub/Linear/webhook/cron trigger condition
-// evaluation) -- out of this Step's own scope entirely. invocationenqueue.go's
-// CreateInvocation is this Step's own minimal, durable "an invocation now
-// exists, fan it out" hand-off (mirrors internal/app/releasereview.Enqueue's
-// own "one cheap INSERT, the real work happens later on a dedicated
-// background loop's own schedule" shape) -- callable directly by this
-// package's own tests today, and ready for §8.4's own trigger evaluator to
-// call unchanged once it exists. It does NOT itself decide whether an
-// automation should fire; it only validates targets (automation.
-// ValidateTargets) and durably records that a firing has already been
-// decided.
+// invocation to be created -- GitHub/Linear/webhook/cron trigger condition
+// evaluation. Until D1's audit fix, all four trigger evaluators called the
+// SAME single entry point (CreateInvocation) unchanged; that is no longer
+// true, and this section now describes the CURRENT split, not the
+// original one:
+//
+//   - The cron trigger pump (triggerpump.go's own
+//     EvaluateCronTriggersOnce) and the generic webhook trigger
+//     (internal/adapters/inbound/automationwebhook's own handler.go) still
+//     call invocationenqueue.go's own CreateInvocation -- neither has a
+//     genuine per-delivery identity to key idempotency on (a cron tick is
+//     already CAS-guarded per minute-bucket via ClaimCronFire; a generic
+//     webhook trigger's own "condition" IS its bearer-token
+//     authentication, with no separate redeliverable-provider-delivery
+//     concept at all).
+//   - Live GitHub/Linear webhook dispatch (githubdispatch.go's own
+//     DispatchGitHubWebhookEvent, lineardispatch.go's own
+//     DispatchLinearWebhookEvent) call CreateInvocationForDelivery instead
+//     -- D1 audit fix (confirmed finding: "a redelivery re-fires the
+//     automation"). A real GitHub/Linear webhook delivery IS
+//     redeliverable (a manual "Redeliver" action, or -- see D6's own fix,
+//     immediately below -- this package's own bounded inline retry), and
+//     the @mention/AgentSessionEvent pipelines sharing that SAME delivery
+//     may release their own webhook_deliveries claim for reasons entirely
+//     unrelated to whether automation dispatch itself already succeeded --
+//     so automation dispatch needs (and, since this fix, has) its OWN
+//     idempotency, keyed on (automation_id, provider, delivery_id)
+//     (migrations/000136_automation_invocations_source_delivery.up.sql),
+//     independent of that claim's own lifetime.
+//
+// Both entry points share the identical minimal, durable "an invocation
+// now exists, fan it out" shape (mirrors internal/app/releasereview.
+// Enqueue's own "one cheap INSERT, the real work happens later on a
+// dedicated background loop's own schedule" shape). Neither decides
+// whether an automation should fire; both only validate targets
+// (automation.ValidateTargets) and durably record that a firing has
+// already been decided.
+//
+// # D6 audit fix: transient Postgres failures retry inline, bounded
+//
+// Every Postgres round trip inside DispatchGitHubWebhookEvent/
+// DispatchLinearWebhookEvent that lists/creates/counts rows (listing
+// active automations, creating an invocation, counting recent invocations
+// for D8's own throttle below) is wrapped in platform.Retry, bounded by
+// platform.Timeouts.AutomationDispatchMaxAttempts/
+// AutomationDispatchRetryBaseDelay/AutomationDispatchRetryMaxDelay --
+// confirmed finding: before this fix, a transient error (or a panic,
+// recovered and logged one layer up by the adapter's own
+// dispatchAutomationsBestEffort) was simply swallowed while the handler
+// kept the webhook-delivery claim and still answered 200, so the
+// automation permanently never fired and even a manual redelivery was
+// skipped as a duplicate (the claim was never released for THIS reason).
+// Deliberately NOT fixed by touching that claim in either direction (see
+// D1's own section above: its lifetime belongs to the OTHER consumers of
+// the same delivery) -- a bounded, in-process retry is the only retry path
+// available to a consumer that must not touch it. The ONE exception is
+// D12's own per-automation, machine-origin actorauthz.AuthorizeLinkedActor
+// lookup (githubdispatch.go) -- deliberately NOT wrapped in platform.Retry,
+// consistent with every other actorauthz call site in this codebase
+// (github/linear/slack's own identity.go files), none of which retry
+// either.
+//
+// # D18 audit fix: one total budget, not a per-call one multiplied by every matching automation
+//
+// D6's own per-call retry bound above is necessary but not sufficient on
+// its own: DispatchGitHubWebhookEvent/DispatchLinearWebhookEvent call
+// checkDispatchThrottle/createInvocationForDeliveryWithRetry (each its own
+// platform.Retry call) ONCE PER MATCHING AUTOMATION, inside a loop -- so,
+// before this fix, the inline webhook request's own worst-case sleep was
+// the single-call bound MULTIPLIED by however many automations a
+// delivery's trigger type had configured, not the single-call bound
+// itself (confirmed, MEDIUM finding). Both dispatch entry points now wrap
+// their own ctx in a single context.WithTimeout(ctx,
+// platform.Timeouts.AutomationDispatchTotalBudget) covering the list call
+// AND the entire per-automation loop, so every platform.Retry call inside
+// shares ONE deadline instead.
+//
+// # D8 audit fix: a per-automation dispatch throttle
+//
+// checkDispatchThrottle (githubdispatch.go, shared verbatim by both
+// DispatchGitHubWebhookEvent and DispatchLinearWebhookEvent) counts an
+// automation's own invocations created within platform.Timeouts.
+// AutomationDispatchThrottleWindow and denies creating another once
+// internal/domain/automation.EvaluateDispatchThrottle says no -- confirmed,
+// SECURITY finding: before this fix, every matching webhook delivery
+// created a brand-new invocation with no per-automation throttle,
+// coalescing, or in-flight cap at all, so an attacker-controlled event
+// stream on a public repo (or simply a single authorized-but-noisy actor,
+// or a CI system posting comments) could create unbounded invocations,
+// each fanning out into up to internal/domain/automation.MaxFanOutTargets
+// (10) sandboxed agent sessions.
+//
+// # U1 audit fix: the total budget is now sized against the retry chain it must contain
+//
+// Confirmed HIGH finding, round 3: D18's own AutomationDispatchTotalBudget
+// above used to be a flat literal picked independently of
+// AutomationDispatchMaxAttempts/RetryBaseDelay/RetryMaxDelay -- smaller
+// than the retry chain's own worst case for even TWO matching automations
+// (list + throttle + create = 3 calls per automation, each up to
+// platform.RetryWorstCaseSleep). DefaultTimeouts now DERIVES the budget
+// from those same three fields (platform/timeouts.go), and Validate()
+// requires it to cover at least the list call plus one matching
+// automation's own full retry chain, with margin -- see
+// AutomationDispatchTotalBudget's own doc comment for the exact floor and
+// why a delivery matching MORE automations than that degrades gracefully
+// instead of being silently truncated mid-backoff. checkDispatchThrottle's
+// own dispatchGateVerdict return type (githubdispatch.go) now also
+// distinguishes that graceful degradation (dispatchGateBudgetExhausted)
+// from EvaluateDispatchThrottle's own genuine throttle verdict
+// (dispatchGateThrottled) in both the return value and the log -- the two
+// used to be indistinguishable.
+//
+// # U7 audit fix: Linear gets the SAME machine-origin gate GitHub's D12 already has -- since replaced by an outright denial
+//
+// Confirmed HIGH finding: unlike GitHub (check_run/status, D12 above),
+// Linear's own dispatchOneLinearAutomation had NO machine-origin
+// equivalent at all -- an "Issue"/"Comment" event whose own top-level
+// "actor" is reported as something other than a real Linear account (an
+// OAuth client or an Integration, Linear's own docs) has no human identity
+// for the adapter's own gate to authorize, and was denied unconditionally,
+// forever, regardless of configuration. U7's own fix authorized that
+// machine-origin actor against the matching automation's own creator,
+// exactly like check_run/status already is.
+//
+// That fix did not survive: W2 audit fix (SECURITY, confirmed HIGH) found
+// it an unsound mirror of D12 -- unlike GitHub's check_run/status (an
+// event TYPE only GitHub itself can ever emit), Linear's actor.type is a
+// per-payload field the sender influences, so routing it to the
+// creator-authorization path was a real bypass of the human-actor gate,
+// not a structural necessity. `ClassifyLinearActorOrigin`
+// (internal/domain/automation/dispatch.go) now denies a
+// LinearEventOriginMachine verdict OUTRIGHT, at
+// `dispatchAutomationsBestEffort` (internal/adapters/inbound/linear/
+// automationdispatch.go), before any automation is even listed --
+// dispatchOneLinearAutomation carries no per-automation, creator-
+// authorizing machine-origin gate any more. See docs/DECISIONS.md's D-07
+// entry for the resulting functional limitation and its reopen condition.
+//
+// # U8 audit fix: a permanently-dead machine-origin automation now surfaces on its own row
+//
+// Confirmed LOW finding: a machine-origin automation whose own created_by
+// is NULL (ON DELETE SET NULL), disabled, or reduced to viewer stops
+// dispatching with only a per-delivery Info log, while automations.status
+// stays 'active' forever -- structurally incapable of ever firing again,
+// with no UPDATE query anywhere to revive it, and no visible sign of the
+// problem on the automation's own state. markCreatorUnauthorizedBestEffort/
+// clearCreatorUnauthorizedBestEffort (githubdispatch.go) now set/clear
+// automations.creator_unauthorized_since (migrations/
+// 000138_automations_creator_unauthorized.up.sql) the moment that
+// authorization denies or succeeds again -- best effort, never retried,
+// never fail-closed: this is observability state, never an authorization
+// decision. GitHub's own machine-origin gate only: see the U7 section
+// above for why dispatchOneLinearAutomation calls neither function any
+// more.
 package automation

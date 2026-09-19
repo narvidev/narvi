@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -147,5 +148,144 @@ func TestCheckMigrationVersions(t *testing.T) {
 				t.Errorf("CheckMigrationVersions problems do not mention %q:\n%s", tc.wantSubstr, joined)
 			}
 		})
+	}
+}
+
+// TestCheckMigrationGaps is CheckMigrationGaps' own pure, unconditional
+// table test -- always runs, everywhere (unlike TestNoMigrationGaps
+// below, which only ever runs against the real tree on main) -- U5 audit
+// fix.
+func TestCheckMigrationGaps(t *testing.T) {
+	mf := func(names ...string) []MigrationFile {
+		t.Helper()
+		out := make([]MigrationFile, 0, len(names))
+		for _, n := range names {
+			parsed, err := parseMigrationName(n)
+			if err != nil {
+				t.Fatalf("fixture %q does not parse: %v", n, err)
+			}
+			out = append(out, parsed)
+		}
+		return out
+	}
+
+	tests := []struct {
+		name       string
+		files      []MigrationFile
+		wantSubstr string
+		wantOK     bool
+	}{
+		{
+			name:   "empty",
+			files:  nil,
+			wantOK: true,
+		},
+		{
+			name:   "one version, trivially no gap",
+			files:  mf("000001_a.up.sql", "000001_a.down.sql"),
+			wantOK: true,
+		},
+		{
+			name:   "contiguous versions",
+			files:  mf("000001_a.up.sql", "000002_b.up.sql", "000003_c.up.sql"),
+			wantOK: true,
+		},
+		{
+			name:       "a single missing version in the middle",
+			files:      mf("000134_a.up.sql", "000136_b.up.sql", "000137_c.up.sql"),
+			wantSubstr: "missing version 000135",
+		},
+		{
+			name: "multiple missing versions each reported",
+			files: mf(
+				"000001_a.up.sql",
+				"000005_b.up.sql",
+			),
+			wantSubstr: "missing version 000002",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			problems := CheckMigrationGaps(tc.files)
+			if tc.wantOK {
+				if len(problems) != 0 {
+					t.Fatalf("CheckMigrationGaps = %v, want no problems", problems)
+				}
+				return
+			}
+			if len(problems) == 0 {
+				t.Fatalf("CheckMigrationGaps found no problems, want one containing %q", tc.wantSubstr)
+			}
+			joined := strings.Join(problems, "\n")
+			if !strings.Contains(joined, tc.wantSubstr) {
+				t.Errorf("CheckMigrationGaps problems do not mention %q:\n%s", tc.wantSubstr, joined)
+			}
+		})
+	}
+}
+
+// TestCheckMigrationGaps_ReportsEveryMissingVersion pins the "multiple
+// missing versions each reported" case's own full count -- a check that
+// silently stopped after the first gap would still pass a substring-only
+// assertion.
+func TestCheckMigrationGaps_ReportsEveryMissingVersion(t *testing.T) {
+	files := []MigrationFile{
+		{Version: 1, Slug: "a", Direction: "up", Name: "000001_a.up.sql"},
+		{Version: 5, Slug: "b", Direction: "up", Name: "000005_b.up.sql"},
+	}
+	problems := CheckMigrationGaps(files)
+	if len(problems) != 3 {
+		t.Fatalf("CheckMigrationGaps returned %d problems, want 3 (versions 2, 3, 4 each missing):\n%s", len(problems), strings.Join(problems, "\n"))
+	}
+	for _, want := range []string{"000002", "000003", "000004"} {
+		found := false
+		for _, p := range problems {
+			if strings.Contains(p, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("no problem mentions missing version %s:\n%s", want, strings.Join(problems, "\n"))
+		}
+	}
+}
+
+// TestNoMigrationGaps is U5's own CI-enforcing structural guard: a gap in
+// this repo's REAL /migrations directory must fail the build -- but ONLY
+// once merged to main, never on a branch (see CheckMigrationGaps' own doc
+// comment for the full "why": a feature branch legitimately has a pending
+// gap until a sibling that owns the lower number merges first, and this
+// check must never fail a branch's own CI for that reason -- this exact
+// branch has one, 000135, as of this fix).
+//
+// Gated on GITHUB_EVENT_NAME == "push" && GITHUB_REF_NAME == "main" --
+// GitHub Actions' own default environment variables, populated for every
+// step without any workflow-file change: this repository's own
+// .github/workflows/ci.yml triggers on `push: branches: [main]` (a
+// post-merge run) and `pull_request:` (every PR, including this branch's
+// own) -- checking event_name/ref_name this way distinguishes the two
+// without a new job, a new `if:`, or any CI configuration this package
+// would otherwise have no way to see for itself. Locally (no CI env vars
+// set at all) this also skips, exactly like the "on a branch" case --
+// running this against a developer's own local tree, mid-work, would be
+// the identical false alarm.
+func TestNoMigrationGaps(t *testing.T) {
+	if os.Getenv("GITHUB_EVENT_NAME") != "push" || os.Getenv("GITHUB_REF_NAME") != "main" {
+		t.Skip("only meaningful once merged to main -- see this test's own doc comment: a feature branch legitimately has a pending gap until a sibling that owns the lower number merges first, and this check must never fail a branch's own CI (or a developer's own local run) for that reason")
+	}
+
+	dir := MigrationsDir(repoRoot(t))
+	files, err := LoadMigrationFiles(dir)
+	if err != nil {
+		t.Fatalf("load migrations from %s: %v", dir, err)
+	}
+	if len(files) == 0 {
+		t.Fatalf("loaded 0 migration files from %s -- this test would pass vacuously, which is worse than failing", dir)
+	}
+
+	if problems := CheckMigrationGaps(files); len(problems) > 0 {
+		t.Errorf("migrations/ has a gap on main, where every merged migration must already be present:\n  - %s", strings.Join(problems, "\n  - "))
 	}
 }

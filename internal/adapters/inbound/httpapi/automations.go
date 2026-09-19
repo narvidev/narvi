@@ -4,9 +4,18 @@
 // 000055_automations_triggers_and_extras.up.sql) -- §3.5 ("automations:
 // engine") shipped the fan-out/reconcile/sweep engine ENGINE-ONLY, with no
 // HTTP surface at all (verified directly: no automations.go existed in
-// this package before this Step) -- invocationenqueue.go's own doc comment
-// already anticipated this: "§8.4's own future trigger evaluator is
-// expected to call [CreateInvocation] unchanged once it exists."
+// this package before this Step) -- every trigger evaluator this codebase
+// now has (the cron pump, live GitHub/Linear webhook dispatch, and the
+// generic webhook trigger, internal/app/automation's own doc.go) creates
+// its own invocations through ONE of TWO entry points in
+// invocationenqueue.go, not a single shared one: the cron pump and the
+// generic webhook trigger still call CreateInvocation unchanged, exactly
+// as that function's own doc comment anticipated before any of them
+// existed, while live GitHub/Linear webhook dispatch instead calls
+// CreateInvocationForDelivery (D1 audit fix -- a genuine, redeliverable
+// provider delivery needs its own idempotency the other two triggers have
+// no equivalent concept for) -- see CreateInvocationForDelivery's own doc
+// comment for the full "why" behind the split.
 //
 // Seven routes, all mounted behind auth.Middleware (cmd/control-plane/
 // main.go) like every other browser-facing REST route in this package:
@@ -141,26 +150,41 @@ func automationToDTO(a sqlcgen.Automation, runHealth *restdtos.AutomationRunHeal
 		lastRunStatus = &restdtos.AutomationLastRunStatus{Value: string(*a.LastRunStatus)}
 	}
 
+	// AutomationCreatorUnauthorizedSince mirrors AutomationLastRunAt's own
+	// "ITSELF a named *time.Time" shape above -- W7 audit fix (confirmed
+	// MEDIUM finding: "the column added to end a silent failure is itself
+	// unread"): creator_unauthorized_since (migrations/
+	// 000138_automations_creator_unauthorized.up.sql) was written by
+	// dispatch and read by nothing outside two tests. Surfaced here so the
+	// product's own state stops lying about an automation that is 'active'
+	// and structurally incapable of ever firing.
+	var creatorUnauthorizedSince restdtos.AutomationCreatorUnauthorizedSince
+	if a.CreatorUnauthorizedSince.Valid {
+		t := a.CreatorUnauthorizedSince.Time
+		creatorUnauthorizedSince = restdtos.AutomationCreatorUnauthorizedSince(&t)
+	}
+
 	return restdtos.Automation{
-		Id:                    a.ID.String(),
-		Name:                  a.Name,
-		Prompt:                prompt,
-		Repos:                 repos,
-		Status:                restdtos.AutomationStatus(a.Status),
-		ConsecutiveFailures:   int(a.ConsecutiveFailures),
-		CreatedBy:             createdBy,
-		CreatedAt:             a.CreatedAt.Time,
-		UpdatedAt:             a.UpdatedAt.Time,
-		TriggerType:           restdtos.AutomationTriggerType(a.TriggerType),
-		TriggerConfig:         json.RawMessage(a.TriggerConfig),
-		SandboxPathScope:      pathScope,
-		SandboxMockConfigured: a.SandboxMockConfigured,
-		SandboxContractsPath:  a.SandboxContractsPath,
-		EnvVars:               envVars,
-		LastRunAt:             lastRunAt,
-		LastRunStatus:         lastRunStatus,
-		ArtifactSummary:       a.ArtifactSummary,
-		RunHealth:             runHealth,
+		Id:                       a.ID.String(),
+		Name:                     a.Name,
+		Prompt:                   prompt,
+		Repos:                    repos,
+		Status:                   restdtos.AutomationStatus(a.Status),
+		ConsecutiveFailures:      int(a.ConsecutiveFailures),
+		CreatedBy:                createdBy,
+		CreatedAt:                a.CreatedAt.Time,
+		UpdatedAt:                a.UpdatedAt.Time,
+		TriggerType:              restdtos.AutomationTriggerType(a.TriggerType),
+		TriggerConfig:            json.RawMessage(a.TriggerConfig),
+		SandboxPathScope:         pathScope,
+		SandboxMockConfigured:    a.SandboxMockConfigured,
+		SandboxContractsPath:     a.SandboxContractsPath,
+		EnvVars:                  envVars,
+		LastRunAt:                lastRunAt,
+		LastRunStatus:            lastRunStatus,
+		ArtifactSummary:          a.ArtifactSummary,
+		RunHealth:                runHealth,
+		CreatorUnauthorizedSince: creatorUnauthorizedSince,
 	}
 }
 
@@ -419,11 +443,22 @@ type githubTriggerConfigWire struct {
 	Event  string `json:"event"`
 	Action string `json:"action,omitempty"`
 	Label  string `json:"label,omitempty"`
+	// Name/Conclusion (§8.4): the check_run/status condition-builder
+	// fields -- see domainautomation.GitHubTriggerConfig.Name/Conclusion's
+	// own doc comments for what each normalizes across the two providers'
+	// own differently-named equivalent fields.
+	Name       string `json:"name,omitempty"`
+	Conclusion string `json:"conclusion,omitempty"`
 }
+
+// OrganizationID (W3 audit fix, confirmed HIGH, TENANT ISOLATION finding)
+// is REQUIRED, unlike Action/TeamKey -- see domainautomation.
+// LinearTriggerConfig.OrganizationID's own doc comment for the full "why".
 type linearTriggerConfigWire struct {
-	EventType string `json:"eventType"`
-	Action    string `json:"action,omitempty"`
-	TeamKey   string `json:"teamKey,omitempty"`
+	EventType      string `json:"eventType"`
+	Action         string `json:"action,omitempty"`
+	TeamKey        string `json:"teamKey,omitempty"`
+	OrganizationID string `json:"organizationId,omitempty"`
 }
 
 // buildTriggerConfig decodes raw (the request's own, possibly-absent,
@@ -462,11 +497,11 @@ func buildTriggerConfig(triggerType domainautomation.TriggerType, raw *json.RawM
 				return nil, errors.New("malformed github trigger config")
 			}
 		}
-		cfg := domainautomation.GitHubTriggerConfig{Event: wire.Event, Action: wire.Action, Label: wire.Label}
+		cfg := domainautomation.GitHubTriggerConfig{Event: wire.Event, Action: wire.Action, Label: wire.Label, Name: wire.Name, Conclusion: wire.Conclusion}
 		if err := domainautomation.ValidateGitHubTriggerConfig(cfg); err != nil {
 			return nil, err
 		}
-		return json.Marshal(githubTriggerConfigWire{Event: cfg.Event, Action: cfg.Action, Label: cfg.Label})
+		return json.Marshal(githubTriggerConfigWire{Event: cfg.Event, Action: cfg.Action, Label: cfg.Label, Name: cfg.Name, Conclusion: cfg.Conclusion})
 
 	case domainautomation.TriggerTypeLinear:
 		var wire linearTriggerConfigWire
@@ -475,11 +510,11 @@ func buildTriggerConfig(triggerType domainautomation.TriggerType, raw *json.RawM
 				return nil, errors.New("malformed linear trigger config")
 			}
 		}
-		cfg := domainautomation.LinearTriggerConfig{EventType: wire.EventType, Action: wire.Action, TeamKey: wire.TeamKey}
+		cfg := domainautomation.LinearTriggerConfig{EventType: wire.EventType, Action: wire.Action, TeamKey: wire.TeamKey, OrganizationID: wire.OrganizationID}
 		if err := domainautomation.ValidateLinearTriggerConfig(cfg); err != nil {
 			return nil, err
 		}
-		return json.Marshal(linearTriggerConfigWire{EventType: cfg.EventType, Action: cfg.Action, TeamKey: cfg.TeamKey})
+		return json.Marshal(linearTriggerConfigWire{EventType: cfg.EventType, Action: cfg.Action, TeamKey: cfg.TeamKey, OrganizationID: cfg.OrganizationID})
 
 	default:
 		// Unreachable: the caller already ran ValidateTriggerType before

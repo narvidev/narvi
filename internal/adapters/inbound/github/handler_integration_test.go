@@ -293,7 +293,13 @@ func postWebhookEventType(t *testing.T, rig testRig, body []byte, deliveryID, ev
 
 // pullRequestLabeledBody builds a synthetic, real-shaped "pull_request"
 // webhook payload with action="labeled" and the given label name --
-// §8.2's ("review sessions") own manual re-trigger-via-label lane.
+// §8.2's ("review sessions") own manual re-trigger-via-label lane. Also
+// carries head.sha/head.repo.full_name, base.ref, and
+// repository.default_branch -- real GitHub payload fields this package's
+// own automation-dispatch tests need (D3/D4 audit fixes: base-branch
+// scoping and the default-branch fallback for an unconfigured target, both
+// domain/automation.TargetMatchesGitHubEvent) that the mention pipeline
+// itself never reads.
 func pullRequestLabeledBody(repoFullName, cloneRepoName, cloneURL string, prNumber int, labelName string, senderID int64, senderLogin string) []byte {
 	body, err := json.Marshal(map[string]any{
 		"action": "labeled",
@@ -303,10 +309,12 @@ func pullRequestLabeledBody(repoFullName, cloneRepoName, cloneURL string, prNumb
 			"number": prNumber,
 			"head": map[string]any{
 				"ref":  "feature-x",
-				"repo": map[string]any{"name": cloneRepoName, "clone_url": cloneURL},
+				"sha":  "sha-pull-request-labeled-head",
+				"repo": map[string]any{"name": cloneRepoName, "clone_url": cloneURL, "full_name": repoFullName},
 			},
+			"base": map[string]any{"ref": "main"},
 		},
-		"repository": map[string]any{"full_name": repoFullName},
+		"repository": map[string]any{"full_name": repoFullName, "default_branch": "main"},
 	})
 	if err != nil {
 		panic(err)

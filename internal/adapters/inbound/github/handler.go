@@ -11,6 +11,7 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/app/automation"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/releasereview"
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
@@ -298,6 +299,37 @@ type Config struct {
 	ReleaseLabel         string
 	ReleaseBranchPattern string
 
+	// Automations/AutomationInvocations (§8.4, "automations never
+	// dispatch on a real webhook"): the live-dispatch wiring
+	// internal/domain/automation/doc.go's own §8.4 section named as
+	// deliberately not done at first -- MatchesGitHubTrigger existed,
+	// fully modeled and tested, called by nothing outside that package.
+	// dispatchAutomationsBestEffort (automationdispatch.go) is the ONE
+	// call site that uses these; see that function's own doc comment for
+	// the full "additional, independent consumer of this same delivery"
+	// design and its panic-isolation. Nil-safe: nil (this package's own
+	// handler_test.go, or any other minimal wiring that doesn't care
+	// about this Step) simply skips automation dispatch entirely, exactly
+	// like every other optional Config field above. Typed as the narrow
+	// automation.GitHubTriggerLister/automation.InvocationCreator
+	// interfaces (never the concrete *postgres.AutomationStore/
+	// *postgres.AutomationInvocationStore types) so a test can inject a
+	// fake -- including one that deliberately panics, to prove dispatch
+	// failure isolation. *postgres.AutomationStore/*postgres.
+	// AutomationInvocationStore (cmd/control-plane/main.go, the SAME
+	// instances automationEngine already uses) satisfy these directly.
+	Automations automation.GitHubTriggerLister
+	// AutomationInvocations is typed as automation.DeliveryInvocationCreator
+	// (D1/D8 audit fixes), not the narrower automation.InvocationCreator
+	// this field used to carry -- the live webhook dispatch path needs
+	// BOTH CreateForDelivery (idempotent-on-delivery invocation creation)
+	// and CountRecentInvocations (the per-automation dispatch throttle),
+	// neither of which InvocationCreator's own single Create method
+	// exposes. *postgres.AutomationInvocationStore (cmd/control-plane/
+	// main.go, the SAME instance automationEngine already uses) satisfies
+	// this directly.
+	AutomationInvocations automation.DeliveryInvocationCreator
+
 	// Timers ("review: automatic re-review on new commits",
 	// §24.1) backs the NEW `pull_request`/action=="synchronize" lane
 	// (pullrequestsynchronize.go): the exported postgres.TimerStore.Upsert
@@ -376,6 +408,53 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 		}
 
 		eventType := r.Header.Get("X-GitHub-Event")
+
+		// §8.4 ("automations never dispatch on a real webhook"): an
+		// ADDITIONAL, independent consumer of this SAME already-claimed
+		// delivery -- deliberately BEFORE every lane below (the merge-gate
+		// capture, the synchronize lane, the capture commands, and
+		// parseMention's own @mention pipeline), and unconditional: an
+		// event that both mentions the bot AND matches an automation must
+		// do both, and this call's own failure/panic must never suppress
+		// any lane below it. See dispatchAutomationsBestEffort's own doc
+		// comment (automationdispatch.go) for the full design, including
+		// the closed, typed event-category allowlist
+		// (domainautomation.GitHubDispatchAllowlist) it enforces before
+		// ever evaluating a single trigger.
+		//
+		// # W5 audit fix: that guarantee is about FAILURE, not TIME
+		//
+		// Confirmed MEDIUM finding: the paragraph above is true for a panic
+		// or an error return (dispatchAutomationsBestEffort's own recover,
+		// automationdispatch.go) -- it says nothing about WALL CLOCK, and
+		// this call sits on the request path, before every lane below it,
+		// bounded only by platform.Timeouts.AutomationDispatchTotalBudget
+		// (5.25s at the shipped default -- sized against ITS OWN retry
+		// chain, see that field's own doc comment, never against how much
+		// of THIS handler's shared time budget is fair to leave for the
+		// lanes below). Nothing here imposes an overall deadline across the
+		// whole handler, so a slow automation dispatch (many matching
+		// automations, or the per-call Postgres latency platform.Timeouts.
+		// AutomationDispatchTotalBudget's own "W1 audit fix" section
+		// documents as unbounded) can consume enough of GitHub's own shared
+		// webhook-delivery timeout that the lanes below, though they DO
+		// still run (no suppression IN THIS PROCESS), effectively never
+		// complete in time for GitHub to see this delivery as successful --
+		// and a human-triggered redelivery answers at the duplicate-claim
+		// check above before ANY lane, including this one, runs again. This
+		// is therefore a REAL, if indirect, way a lane below can go
+		// unserved, distinct from and not covered by the failure/panic
+		// guarantee this comment used to present as the whole story. Not
+		// fixed by bounding this call any further here: platform.Timeouts.
+		// AutomationDispatchTotalBudget is already this lane's OWN bound,
+		// sized against the retry chain it must contain (W1); shrinking it
+		// again purely to leave more room for the lanes below would
+		// reintroduce the exact "arbitrary literal, picked independently of
+		// what it actually needs to contain" shape W1 fixed once already.
+		// docs/DECISIONS.md's D-08 entry names the architectural fix (move
+		// dispatch off the request path) this residual risk shares with
+		// W4's own budget-exhaustion-drop finding.
+		dispatchAutomationsBestEffort(ctx, logger, cfg, coalescer.Identities, coalescer.Users, eventType, deliveryID, body)
 
 		// (§31.7's own G4 arming write): captured for EVERY `pull_request`
 		// "closed" event, unconditionally -- deliberately NOT gated behind

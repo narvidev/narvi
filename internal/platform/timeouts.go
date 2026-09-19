@@ -183,6 +183,17 @@ type Timeouts struct {
 	// "3 permanent spawn failures within 5 min blocks spawning". The
 	// companion threshold (3) is a plain int, not a duration, so it lives
 	// as a named constant in domain/sandbox instead of here.
+	//
+	// U2 audit fix, SECURITY: at the Go zero value,
+	// domain/sandbox.EvaluateCircuitBreaker's own `state.FailureCount > 0 &&
+	// timeSinceLastFailure >= cfg.Window` reset branch is vacuously true on
+	// every call (elapsed time is never negative), so the breaker resets
+	// and allows spawning unconditionally -- it can never actually open.
+	// Validate() below now requires this field to be > 0, the SAME "a
+	// count/elapsed-time-vs-window comparison that fails OPEN at window ==
+	// 0" shape AutomationDispatchThrottleWindow's own doc comment describes
+	// (app/automation's own dispatch throttle), found by the identical
+	// audit.
 	CircuitBreakerWindow time.Duration
 
 	// SpawnCooldown is the minimum interval between spawn attempts (bypassed
@@ -1570,6 +1581,21 @@ type Timeouts struct {
 	// minutes (this is damping repeated NETWORK CALLS during a transient
 	// failure, not caching an access verdict, so it does not need -- and
 	// should not have -- that same long a window).
+	//
+	// U2 audit fix: at the Go zero value, the SAME
+	// domain/sandbox.EvaluateCircuitBreaker vacuous-reset shape
+	// CircuitBreakerWindow's own doc comment describes means this breaker
+	// can never trip -- unlike that field, this one is not a security
+	// control (the underlying access decision stays fail-closed either
+	// way, per this doc comment's own "does not change the deny outcome"
+	// paragraph above), so a zero value here reintroduces a cost/
+	// availability regression (paying RepoAccessCheckTimeout again for
+	// every check during a sustained outage, the exact blowup this field
+	// exists to shed), not an authorization bypass. Still made
+	// Validate()-mandatory (> 0) below, alongside CircuitBreakerWindow/
+	// AutomationDispatchThrottleWindow: the audit finding this closes is
+	// about the FAMILY of zero-value-permissive window fields, not only
+	// the security-relevant members of it.
 	RepoAccessCheckBreakerWindow time.Duration
 	// --- Audit-remediation batch B2 addition: closes the imagebuild
 	// refresh-pump crash window (see internal/app/imagebuild/doc.go and
@@ -1875,6 +1901,205 @@ type Timeouts struct {
 	// "generous, round, clearly-justified default" precedent applies
 	// (ProviderHTTPClientTimeout, OutboxClaimDuration, etc.).
 	AutomationCronCatchUpWindow time.Duration
+
+	// AutomationDispatchMaxAttempts/AutomationDispatchRetryBaseDelay/
+	// AutomationDispatchRetryMaxDelay configure platform.Retry's own
+	// doubling-capped-at-max backoff around the live GitHub/Linear
+	// webhook-dispatch path's own two Postgres round trips (app/
+	// automation's own githubdispatch.go/lineardispatch.go: listing
+	// active automations, and creating an invocation) -- D6 audit fix
+	// (confirmed finding: "a transient error... is logged and swallowed
+	// while the handler keeps the claim and still answers 200... the
+	// automation permanently never fires, and even a manual redelivery is
+	// skipped as a duplicate"). Mirrors SandboxSecretFetchMaxAttempts/
+	// SandboxSecretFetchRetryBaseDelay/SandboxSecretFetchRetryMaxDelay's
+	// own identical shape (a foreground, in-process retry bounded by the
+	// caller's own request budget) -- deliberately NOT a fix that touches
+	// the shared webhook_deliveries claim (see D1's own doc comment,
+	// invocationenqueue.go: that claim's lifetime is owned by the
+	// @mention/AgentSessionEvent pipelines, not this consumer's to
+	// release or hold onto). A genuinely transient Postgres error now
+	// self-heals within the SAME request via this bounded inline retry,
+	// with no need to ever touch the claim in either direction. Chosen as
+	// 3 attempts / 250ms base / 1s max: this call sits inline on a real
+	// GitHub/Linear webhook's own request path (unlike sandbox boot's
+	// generous 240s FirstConnectBudget), so the worst case (3 attempts at
+	// whatever the per-call Postgres timeout already is, plus two backoff
+	// waits pessimistically at the 1s cap) must stay small relative to a
+	// webhook provider's own delivery timeout (GitHub warns above ~10s).
+	AutomationDispatchMaxAttempts    int
+	AutomationDispatchRetryBaseDelay time.Duration
+	AutomationDispatchRetryMaxDelay  time.Duration
+
+	// AutomationDispatchTotalBudget is D18 audit fix (confirmed, MEDIUM
+	// finding: "the retry budget multiplies inside a loop"). The three
+	// fields immediately above bound a SINGLE Postgres round trip's own
+	// worst case (750ms of sleep at today's defaults: 250ms then 500ms,
+	// per this file's own doc comment above) -- but
+	// DispatchGitHubWebhookEvent/DispatchLinearWebhookEvent (githubdispatch.go/
+	// lineardispatch.go) call platform.Retry TWICE PER MATCHING AUTOMATION
+	// (checkDispatchThrottle, then createInvocationForDeliveryWithRetry),
+	// inside a `for _, row := range rows` loop over every active
+	// automation of this trigger type -- so the inline webhook request's
+	// own worst-case backoff is that single-call bound multiplied by
+	// however many automations this delivery's trigger type happens to
+	// have configured, not the single-call bound itself. A webhook
+	// handler that sleeps for several seconds risks the provider's own
+	// delivery timeout (GitHub warns above ~10s, this file's own doc
+	// comment above) firing first, which redelivers the SAME event --
+	// interacting badly with the very redelivery-dedup D1 built this
+	// whole path around. This field bounds the TOTAL wall-clock time
+	// DispatchGitHubWebhookEvent/DispatchLinearWebhookEvent may spend
+	// (via a single context.WithTimeout wrapping the entire listing-plus-
+	// per-automation-loop body, not a per-call budget), regardless of how
+	// many automations match -- every platform.Retry call inside already
+	// shares that one ctx and returns ctx.Err() promptly once it expires
+	// (platform.Retry's own doc comment), so this is a genuine cap, not
+	// merely a suggestion an individual call could ignore.
+	//
+	// # U1 audit fix: sized against the retry chain it must contain, not a guess
+	//
+	// Confirmed HIGH finding: this field used to be a flat "3 seconds,
+	// chosen" literal, picked independently of
+	// AutomationDispatchMaxAttempts/RetryBaseDelay/RetryMaxDelay -- smaller
+	// than the retry chain's own worst case for even TWO matching
+	// automations (a single call's own worst case is
+	// platform.RetryWorstCaseSleep(MaxAttempts, RetryBaseDelay,
+	// RetryMaxDelay) = 750ms at today's retry defaults; ONE matching
+	// automation alone already spends 3 such calls -- list, throttle,
+	// create = 2.25s -- leaving only 750ms for a SECOND automation's own 2
+	// calls, which need 1.5s). Exhausting the shared budget mid-retry used
+	// to be indistinguishable from EvaluateDispatchThrottle's own genuine
+	// "too many invocations" verdict, in both the log line and
+	// checkDispatchThrottle's own return value -- see
+	// dispatchGateVerdict's own doc comment (githubdispatch.go) for the fix
+	// to THAT half. This field's own half: DefaultTimeouts() now computes
+	// it as platform.RetryWorstCaseSleep(MaxAttempts, RetryBaseDelay,
+	// RetryMaxDelay) * 7 -- the list call (1) plus 3 reference matching
+	// automations, each fully retried (2 calls each) -- rather than a bare
+	// literal, so raising the retry parameters can never silently shrink
+	// this budget's own real coverage relative to them again. Validate()
+	// below additionally REQUIRES this field to cover at least the list
+	// call plus ONE matching automation's own full retry chain, with one
+	// more single-call worst case of margin (4x a single call's own worst
+	// case) -- the smallest floor that still guarantees the AUTOMATION-COUNT
+	// dimension this budget is actually sized against: the first matching
+	// automation in any delivery is never starved of ITS OWN full attempt
+	// count by a SECOND, THIRD, ... matching automation ahead of it in the
+	// same loop (D18's own original defect -- the retry budget multiplying
+	// inside a loop). There is deliberately no value here that is "enough"
+	// for an unbounded number of matching automations: a delivery matching
+	// more than this default's own reference count (3) degrades gracefully
+	// instead (the 4th+ automation's own calls fall back to a distinctly
+	// logged, distinctly returned dispatchGateBudgetExhausted/
+	// dispatchBudgetExhausted verdict once the shared budget can no longer
+	// fit another full chain, rather than being silently truncated
+	// mid-backoff and misread as an ordinary throttle decision).
+	//
+	// # W1 audit fix: what this floor does NOT cover
+	//
+	// Confirmed HIGH finding: RetryWorstCaseSleep sums ONLY the SLEEP
+	// between failed attempts (its own doc comment, retry.go) -- it carries
+	// no term for a call's own EXECUTION time, yet this budget bounds a
+	// single wall-clock context.WithTimeout (dispatchTotalBudgetContext)
+	// that must ALSO cover however long ListActiveGitHubAutomations/
+	// ListActiveLinearAutomations/CountRecentInvocations/CreateForDelivery
+	// themselves take to run -- none of which carries a per-call timeout of
+	// its own (platform.Retry's own doc comment: "does not additionally
+	// wrap each fn() call with its own timeout"), and this repository has
+	// no Postgres statement_timeout anywhere either. So the guarantee above
+	// is honest only along the AUTOMATION-COUNT axis (how many matching
+	// automations get their full attempt count), never along a LATENCY
+	// axis this field was never sized against: reproduced directly against
+	// this exact function with the shipped defaults below -- at 0/0.5/1s of
+	// per-call latency the first (and only) matching automation's own
+	// create call still completes its full attempt count; at 2s of
+	// per-call latency it does not, and the shared budget expires mid-retry
+	// (surfacing as dispatchGateBudgetExhausted/dispatchBudgetExhausted,
+	// never silently). Two remedies were considered and rejected: inflating
+	// this floor collides with this field's own "small fraction of GitHub's
+	// ~10s delivery timeout" constraint two paragraphs below and
+	// reintroduces an arbitrary literal picked to make a specific latency
+	// pass, not a principled bound; adding a genuine per-call timeout to
+	// the three dispatch queries (and re-deriving this floor from
+	// attempts*perCallTimeout+sleep instead of sleep alone) is the more
+	// complete fix but a materially larger change than this batch's own
+	// scope -- filed, not attempted here (see the PR body for the full
+	// argument). What this fix DOES do: the claim above is now scoped to
+	// what the mechanism actually guarantees, and W4's own fix
+	// (githubdispatch.go) makes the resulting drop OBSERVABLE to an
+	// operator rather than only a log line, since a latency-driven
+	// exhaustion is exactly as real a drop as a count-driven one.
+	// A genuinely unbounded-N design would need dispatch to move off the
+	// request path entirely (e.g. an outbox-style deferred dispatch,
+	// mirroring how fan-out itself is already decoupled from invocation
+	// creation via Engine's own background pump, doc.go) -- a materially
+	// larger architectural change this fix does not attempt; see the PR
+	// body for the full argument.
+	//
+	// Zero (the Go zero value -- an UNCONFIGURED Timeouts, e.g. a minimal
+	// test rig's own bare Config{} literal) is deliberately NOT treated as
+	// "expire immediately": DispatchGitHubWebhookEvent/
+	// DispatchLinearWebhookEvent's own dispatchTotalBudgetContext helper
+	// (githubdispatch.go) falls back to "no additional cap" (ctx passed
+	// through unchanged) for budget <= 0, never a bare
+	// context.WithTimeout(ctx, 0) -- which would create an
+	// already-expired context and fail EVERY dispatch closed, regardless
+	// of event type, the instant it is used. Caught by this batch's own
+	// new machine-origin dispatch test failing with "context deadline
+	// exceeded" against a test rig that never set this field. This
+	// zero-value fallback is UNAFFECTED by Validate()'s own new floor
+	// above: Validate is never implicitly run by a minimal test rig that
+	// leaves Timeouts at its Go zero value, only by real configuration
+	// (platform.Load) -- a real, non-zero-but-too-small budget is what the
+	// new check rejects, not the deliberate "unconfigured" zero case.
+	AutomationDispatchTotalBudget time.Duration
+
+	// AutomationDispatchThrottleWindow is D8's own audit fix (confirmed,
+	// SECURITY finding: "unbounded invocations" -- every matching webhook
+	// delivery creates a brand-new invocation with no per-automation
+	// throttle, coalescing, or in-flight cap, so an attacker-controlled
+	// (or merely noisy, e.g. a CI system posting comments) event stream on
+	// a public repo creates unbounded invocations, each fanning out into
+	// up to MaxFanOutTargets sandboxed agent sessions). Bounds how far
+	// back app/automation's own dispatch path counts a single
+	// automation's own already-created invocations
+	// (CountRecentAutomationInvocations) before comparing against
+	// domainautomation.DispatchThrottleThreshold -- see that constant's
+	// own doc comment for why counting, not a circuit-breaker-style
+	// consecutive-FAILURE count, is the right shape reused here (this
+	// counts INVOCATIONS, regardless of outcome, not failures). Chosen as
+	// 5 minutes, mirroring CircuitBreakerWindow's own identical value and
+	// identical "a short, real-time window, not a long lookback" reasoning
+	// -- not specified by the plan.
+	//
+	// # U2 audit fix, SECURITY: zero fails OPEN, so Validate() now requires this field to be set
+	//
+	// Confirmed HIGH finding: checkDispatchThrottle (githubdispatch.go)
+	// computes `since := time.Now().Add(-AutomationDispatchThrottleWindow)`
+	// -- at the Go zero value, since == now(), CountRecentInvocations
+	// counts rows created at-or-after "now", which is always (approximately)
+	// zero, so domainautomation.EvaluateDispatchThrottle(0) is always true
+	// and this control never throttles anything, for any automation, ever.
+	// Validate() used to accept this silently (it only ever checked
+	// PAIRWISE ordering between two named fields, never that a field is set
+	// at all) -- this field participates in no pairwise chain, so nothing
+	// caught it. Validate() below now requires AutomationDispatchThrottleWindow
+	// > 0 directly, exactly like CircuitBreakerWindow/
+	// RepoAccessCheckBreakerWindow immediately below (both share the
+	// IDENTICAL fail-open shape: domain/sandbox.EvaluateCircuitBreaker's own
+	// "time since last failure >= window" check is vacuously true at
+	// window == 0, resetting/allowing on every call) -- the three fields
+	// this audit found in this exact "a count/elapsed-time-vs-window
+	// comparison that is vacuously permissive at window == 0" shape,
+	// out of every duration field this struct carries. See
+	// TestValidate_RequiresPositiveFields (timeouts_test.go) for the
+	// mutation-verified pin, and Load's own doc comment (config.go) for why
+	// this now becomes a startup failure rather than a silently-disabled
+	// control in production (DefaultTimeouts() is the ONLY source
+	// platform.Load wires Config.Timeouts from -- there is no separate
+	// per-field override to independently verify).
+	AutomationDispatchThrottleWindow time.Duration
 
 	// --- §4.1 standalone additions ("RWX provider + previews", §4.1.1):
 	// RWXCLIExecTimeout has no ordering relationship with either invariant
@@ -2730,6 +2955,17 @@ type Timeouts struct {
 // DefaultTimeouts returns the shipped defaults for every field, each
 // justified above on the struct field and (briefly) inline here.
 func DefaultTimeouts() Timeouts {
+	// U1 audit fix: AutomationDispatchTotalBudget (below) is DERIVED from
+	// these three retry parameters via RetryWorstCaseSleep, rather than a
+	// separate literal picked independently of them -- computed once, here,
+	// so the retry fields and the budget that must contain their own worst
+	// case can never silently drift apart into two independent numbers.
+	// See AutomationDispatchTotalBudget's own doc comment (the struct
+	// field, above) for the full "why".
+	automationDispatchMaxAttempts := 3                         // D6 audit fix; not specified, chosen -- see field doc comment
+	automationDispatchRetryBaseDelay := 250 * time.Millisecond // D6 audit fix; not specified, chosen
+	automationDispatchRetryMaxDelay := 1 * time.Second         // D6 audit fix; not specified, chosen
+
 	return Timeouts{
 		ProviderHardCap:           2 * time.Hour,     // §5.4, explicit
 		SupervisorTurnCap:         90 * time.Minute,  // not specified; chosen with margin below ProviderHardCap
@@ -2881,6 +3117,22 @@ func DefaultTimeouts() Timeouts {
 		AutomationRunRunningOrphanThreshold:  90 * time.Minute, // §3.5, explicit ("running >90 min")
 		AutomationCronGranularity:            1 * time.Minute,  // §8.4; structural, not tunable -- see field doc comment
 		AutomationCronCatchUpWindow:          10 * time.Minute, // §8.4 fix (missed cron evaluations); not specified, chosen -- see field doc comment
+
+		AutomationDispatchMaxAttempts:    automationDispatchMaxAttempts,
+		AutomationDispatchRetryBaseDelay: automationDispatchRetryBaseDelay,
+		AutomationDispatchRetryMaxDelay:  automationDispatchRetryMaxDelay,
+
+		// U1 audit fix (confirmed HIGH finding: "the total budget is
+		// smaller than the retry chain it contains"): list call (1) plus 3
+		// reference matching automations, each fully retried (throttle +
+		// create = 2 calls each) -- 7 single-call worst cases total. See
+		// this field's own doc comment (the struct field, above) for the
+		// full "why", including why only the FIRST matching automation's
+		// own full retry chain is an enforced Validate() floor, and what a
+		// 4th+ matching automation gets when this default is exceeded.
+		AutomationDispatchTotalBudget: RetryWorstCaseSleep(automationDispatchMaxAttempts, automationDispatchRetryBaseDelay, automationDispatchRetryMaxDelay) * 7,
+
+		AutomationDispatchThrottleWindow: 5 * time.Minute, // D8 audit fix; mirrors CircuitBreakerWindow's own identical value -- U2 audit fix: now Validate()-required to be > 0, see that field's own doc comment
 
 		RWXCLIExecTimeout:           2 * time.Minute,  // §4.1.1; not specified (RWX publishes no p99), chosen generously -- see field doc comment
 		RWXSandboxInactivityTimeout: 45 * time.Minute, // §4.1.1; not specified, chosen with margin above ActorIdleTTL (30min) -- see field doc comment
@@ -3110,7 +3362,89 @@ func (t Timeouts) Validate() error {
 	check("CloudIdentitySigningKeyOverlapWindow > CloudIdentityTokenLifetime",
 		"CloudIdentitySigningKeyOverlapWindow", t.CloudIdentitySigningKeyOverlapWindow, "CloudIdentityTokenLifetime", t.CloudIdentityTokenLifetime)
 
+	// U2 audit fix, SECURITY (confirmed HIGH finding: "the gate creates the
+	// identity it then checks" batch's own sibling finding -- "the
+	// anti-abuse throttle fails open on the zero value of its window").
+	// mustBePositive is a SEPARATE assertion shape from check() above: those
+	// all verify a PAIRWISE ordering between two configured fields; the
+	// three fields below have no natural partner to order against at
+	// all -- each is, on its own, a window a "count of recent events
+	// since now()-window" or "elapsed time since last failure >= window"
+	// comparison divides by, and every one of those comparisons is
+	// VACUOUSLY PERMISSIVE at window == 0 (see each field's own doc
+	// comment, above, for the exact shape). Requiring each to be > 0
+	// directly is therefore the correct check, not a degenerate one-sided
+	// pairwise link. This is deliberately NOT every zero-value-risky field
+	// this struct carries (~150 duration/int fields total) -- it is
+	// specifically the fields this audit traced to that one shared
+	// "count/elapsed-time-vs-window, vacuous at zero" mechanism, which is
+	// the mechanism the finding actually demonstrated (AutomationDispatchThrottleWindow),
+	// not every timeout whose zero value merely means "instant" (most of
+	// this struct's other fields fail CLOSED, not open, at zero -- e.g. a
+	// zero TTL makes whatever it bounds read as already-expired, and a zero
+	// webhook-timestamp freshness window makes platform.VerifyWebhookTimestamp
+	// reject every real delivery outright -- breaking loudly rather than
+	// silently permitting).
+	mustBePositive := func(field string, value time.Duration) {
+		if value <= 0 {
+			errs = append(errs, &TimeoutMustBePositiveError{Field: field, Value: value})
+		}
+	}
+	mustBePositive("AutomationDispatchThrottleWindow", t.AutomationDispatchThrottleWindow)
+	mustBePositive("CircuitBreakerWindow", t.CircuitBreakerWindow)
+	mustBePositive("RepoAccessCheckBreakerWindow", t.RepoAccessCheckBreakerWindow)
+
+	// U1 audit fix, HIGH (confirmed finding: "the total budget is smaller
+	// than the retry chain it contains"). Derived from the SAME three
+	// fields the retry chain it must contain is built from
+	// (RetryWorstCaseSleep(MaxAttempts, RetryBaseDelay, RetryMaxDelay)),
+	// never an independently-chosen literal -- see
+	// AutomationDispatchTotalBudget's own doc comment (above) for the full
+	// "why" this specific floor (list call + one matching automation's own
+	// full retry chain, with one more single-call worst case of margin) is
+	// the smallest one that still guarantees the FIRST matching automation
+	// in any delivery is never starved of its own full attempt count by
+	// ANOTHER matching automation ahead of it in the same delivery's loop
+	// -- see that same doc comment's own "W1 audit fix" section for what
+	// this floor deliberately does NOT cover (a call's own execution
+	// latency, as opposed to the sleep RetryWorstCaseSleep sums, is
+	// unbounded by anything this field or this Validate check enforces;
+	// confirmed HIGH finding, W1). Deliberately NOT run through the shared check() helper above: that helper's
+	// MinTimeoutMargin (30s) is calibrated for THIS file's slower
+	// "provider cap / cold start" scale and would require an
+	// AutomationDispatchTotalBudget upward of 30 SECONDS to pass --
+	// directly contradicting this field's own doc comment ("a small
+	// fraction of GitHub's ~10s delivery timeout").
+	if perCall := RetryWorstCaseSleep(t.AutomationDispatchMaxAttempts, t.AutomationDispatchRetryBaseDelay, t.AutomationDispatchRetryMaxDelay); t.AutomationDispatchTotalBudget < 4*perCall {
+		errs = append(errs, &TimeoutInvariantError{
+			Chain:          "AutomationDispatchTotalBudget > list call + one matching automation's own full retry chain (throttle + create), with margin",
+			LesserField:    "3×RetryWorstCaseSleep(AutomationDispatchMaxAttempts, AutomationDispatchRetryBaseDelay, AutomationDispatchRetryMaxDelay)",
+			LesserValue:    3 * perCall,
+			GreaterField:   "AutomationDispatchTotalBudget",
+			GreaterValue:   t.AutomationDispatchTotalBudget,
+			RequiredMargin: perCall,
+		})
+	}
+
 	return errors.Join(errs...)
+}
+
+// TimeoutMustBePositiveError reports a Timeouts field that Validate
+// requires to be strictly positive -- U2 audit fix's own distinct error
+// type from TimeoutInvariantError above: this is not a broken relationship
+// between two fields, it is one field whose OWN zero value silently
+// disables or unbounds whatever it governs (see the specific field's own
+// doc comment for which vacuous-at-zero comparison that is, in each case).
+type TimeoutMustBePositiveError struct {
+	Field string
+	Value time.Duration
+}
+
+func (e *TimeoutMustBePositiveError) Error() string {
+	return fmt.Sprintf(
+		"timeout invariant violated: %s=%s, want > 0 -- the zero value silently disables or unbounds the control this field governs, see that field's own doc comment",
+		e.Field, e.Value,
+	)
 }
 
 // SecondsToDuration converts a raw whole-seconds count -- e.g. an OAuth

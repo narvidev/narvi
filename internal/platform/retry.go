@@ -72,6 +72,37 @@ func IsPermanent(err error) bool {
 	return errors.As(err, &perm)
 }
 
+// RetryWorstCaseSleep returns the total time Retry blocks SLEEPING BETWEEN
+// FAILED ATTEMPTS in its own worst case -- attempts-1 waits, doubling from
+// baseDelay and capped at maxDelay, mirroring Retry's own loop below
+// exactly (never fn()'s own call latency, only the sleeps between calls).
+// attempts < 1 is treated as 1 (zero waits), the SAME normalization Retry
+// itself applies.
+//
+// U1 audit fix's own building block: a caller wrapping a fixed OVERALL time
+// budget (e.g. platform.Timeouts.AutomationDispatchTotalBudget) around one
+// or more Retry calls needs to size that budget against what the retry
+// chain it actually contains can cost, not against a figure picked
+// independently of these three fields -- see
+// Timeouts.AutomationDispatchTotalBudget's own doc comment for the concrete
+// case this was written for (a budget smaller than the retry chain it was
+// supposed to contain, confirmed HIGH-severity finding).
+func RetryWorstCaseSleep(attempts int, baseDelay, maxDelay time.Duration) time.Duration {
+	if attempts < 1 {
+		attempts = 1
+	}
+	var total time.Duration
+	delay := baseDelay
+	for i := 1; i < attempts; i++ {
+		total += delay
+		delay *= 2
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+	}
+	return total
+}
+
 // Retry calls fn up to attempts times (attempts < 1 is treated as 1 -- a
 // single, unretried call, never zero calls), sleeping between failed
 // attempts with a doubling delay starting at baseDelay and capped at

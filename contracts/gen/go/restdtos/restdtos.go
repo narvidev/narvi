@@ -284,6 +284,22 @@ type Automation struct {
 	// Null for a system-attributed automation with no direct human creator.
 	CreatedBy AutomationCreatedBy `json:"createdBy" yaml:"createdBy" mapstructure:"createdBy"`
 
+	// W7 audit fix (confirmed MEDIUM finding: "the column added to end a silent
+	// failure is itself unread"): set the moment a machine-originated GitHub
+	// (check_run/status) dispatch is denied because this automation's own creator is
+	// not a linked, non-disabled account holding authz.ActionCreateSession
+	// (migrations/000138_automations_creator_unauthorized.up.sql); cleared back to
+	// null the moment a machine-originated GitHub dispatch for this same automation
+	// is authorized again. A machine-originated Linear dispatch never sets or clears
+	// this field: that actor is denied outright, upstream of any per-automation
+	// creator check (see docs/DECISIONS.md's D-07 entry). Preserves the FIRST
+	// denial's own timestamp across repeated denials. Null means never denied for
+	// this reason, or has since recovered. An automation can be 'active' in the
+	// status column above and still be structurally incapable of ever firing because
+	// of this -- the product's own state was a lie about that until this field
+	// existed on the wire.
+	CreatorUnauthorizedSince AutomationCreatorUnauthorizedSince `json:"creatorUnauthorizedSince" yaml:"creatorUnauthorizedSince" mapstructure:"creatorUnauthorizedSince"`
+
 	// EnvVars corresponds to the JSON schema field "envVars".
 	EnvVars []AutomationEnvVarElem `json:"envVars" yaml:"envVars" mapstructure:"envVars"`
 
@@ -335,7 +351,9 @@ type Automation struct {
 	// description for why this is not a discriminated union. {} for triggerType
 	// manual/webhook; {"schedule": "<5-field cron expr>"} for cron; {"event": ...,
 	// "action": ..., "label": ...} for github (action/label optional); {"eventType":
-	// ..., "action": ..., "teamKey": ...} for linear (action/teamKey optional).
+	// ..., "action": ..., "teamKey": ..., "organizationId": ...} for linear
+	// (action/teamKey optional, organizationId REQUIRED -- the Linear workspace this
+	// automation is scoped to; W3 audit fix, tenant isolation).
 	TriggerConfig json.RawMessage `json:"triggerConfig" yaml:"triggerConfig" mapstructure:"triggerConfig"`
 
 	// Matches Postgres automation_trigger_type exactly. 'manual' means this
@@ -355,6 +373,21 @@ type AutomationArtifactSummary *string
 
 // Null for a system-attributed automation with no direct human creator.
 type AutomationCreatedBy *string
+
+// W7 audit fix (confirmed MEDIUM finding: "the column added to end a silent
+// failure is itself unread"): set the moment a machine-originated GitHub
+// (check_run/status) dispatch is denied because this automation's own creator is
+// not a linked, non-disabled account holding authz.ActionCreateSession
+// (migrations/000138_automations_creator_unauthorized.up.sql); cleared back to
+// null the moment a machine-originated GitHub dispatch for this same automation is
+// authorized again. A machine-originated Linear dispatch never sets or clears this
+// field: that actor is denied outright, upstream of any per-automation creator
+// check (see docs/DECISIONS.md's D-07 entry). Preserves the FIRST denial's own
+// timestamp across repeated denials. Null means never denied for this reason, or
+// has since recovered. An automation can be 'active' in the status column above
+// and still be structurally incapable of ever firing because of this -- the
+// product's own state was a lie about that until this field existed on the wire.
+type AutomationCreatorUnauthorizedSince = *time.Time
 
 // One entry of an automation's own env_vars (§8.4's own 'per-automation env vars')
 // -- plain, non-secret configuration only (internal/domain/automation.EnvVar). See
@@ -850,6 +883,9 @@ func (j *Automation) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["createdBy"]; raw != nil && !ok {
 		return fmt.Errorf("field createdBy in Automation: required")
+	}
+	if _, ok := raw["creatorUnauthorizedSince"]; raw != nil && !ok {
+		return fmt.Errorf("field creatorUnauthorizedSince in Automation: required")
 	}
 	if _, ok := raw["envVars"]; raw != nil && !ok {
 		return fmt.Errorf("field envVars in Automation: required")
@@ -12953,6 +12989,28 @@ var enumValues_WorkflowStepRunStatus = []interface{}{
 	"cancelled",
 }
 
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_WorkflowStepRunStatus {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_WorkflowStepRunStatus, v)
+	}
+	*j = WorkflowStepRunStatus(v)
+	return nil
+}
+
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
+
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
 // sequential turn'). Null while an awaiting_decision (hitlBefore-gated) attempt
 // exists before any turn does.
@@ -13012,27 +13070,5 @@ func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
 		return err
 	}
 	*j = WorkflowStepRun(plain)
-	return nil
-}
-
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
-
-// UnmarshalJSON implements json.Unmarshaler.
-func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
-	var v string
-	if err := json.Unmarshal(value, &v); err != nil {
-		return err
-	}
-	var ok bool
-	for _, expected := range enumValues_WorkflowStepRunStatus {
-		if reflect.DeepEqual(v, expected) {
-			ok = true
-			break
-		}
-	}
-	if !ok {
-		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_WorkflowStepRunStatus, v)
-	}
-	*j = WorkflowStepRunStatus(v)
 	return nil
 }

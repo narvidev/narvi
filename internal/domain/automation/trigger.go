@@ -34,14 +34,14 @@ const (
 	TriggerTypeCron TriggerType = "cron"
 	// TriggerTypeGitHub is a GitHub webhook-event-driven trigger --
 	// TriggerConfig.GitHub (GitHubTriggerConfig) names the event/action/
-	// label filter, evaluated via MatchesGitHubTrigger. See this package's
-	// own doc.go for why this Step models and validates this condition
-	// fully but does not yet wire live dispatch into the existing GitHub
-	// webhook ingress handler.
+	// label/name/conclusion filter, evaluated via MatchesGitHubTrigger and
+	// live-dispatched (§8.4) through GitHubDispatchAllowlist -- see
+	// this package's own doc.go for the full design.
 	TriggerTypeGitHub TriggerType = "github"
 	// TriggerTypeLinear is a Linear webhook-event-driven trigger --
 	// TriggerConfig.Linear (LinearTriggerConfig) names the event/action/
-	// team filter, evaluated via MatchesLinearTrigger. Same doc.go note as
+	// team filter, evaluated via MatchesLinearTrigger and live-dispatched
+	// (§8.4) through LinearDispatchAllowlist. Same doc.go note as
 	// TriggerTypeGitHub applies.
 	TriggerTypeLinear TriggerType = "linear"
 	// TriggerTypeWebhook is a generic inbound-HTTP-call trigger: any
@@ -94,10 +94,10 @@ func ValidateCronTriggerConfig(cfg CronTriggerConfig) error {
 
 // GitHubTriggerConfig is TriggerTypeGitHub's own trigger_config shape: an
 // automation fires when a GitHub webhook event arrives whose own
-// EventType/Action/label set matches this filter. Modeled (and validated)
-// in full here, as this Step's own §8.4 condition builder -- see this
-// package's own doc.go for why live dispatch into the existing GitHub
-// webhook ingress handler is deliberately deferred.
+// EventType/Action/label/name/conclusion set matches this filter. Modeled,
+// validated AND (§8.4) live-dispatched -- see this package's own doc.go
+// for the full design, including GitHubDispatchAllowlist (the closed set
+// of event types ever reaching MatchesGitHubTrigger at all).
 type GitHubTriggerConfig struct {
 	// Event is GitHub's own webhook event-type name verbatim (e.g.
 	// "pull_request", "issues", "issue_comment") -- required.
@@ -109,36 +109,143 @@ type GitHubTriggerConfig struct {
 	// Label, when non-empty, additionally requires GitHubEventInput.Labels
 	// to contain this exact label name -- "" means "no label filter".
 	Label string
+
+	// Name, when non-empty, additionally requires GitHubEventInput.Name to
+	// match exactly. §8.4's own "normalise check_run and status ...
+	// with name and conclusion": Name carries check_run's own `name` field
+	// (e.g. "ci/lint") or status's own `context` field (e.g.
+	// "continuous-integration/travis-ci") -- the two providers' own
+	// differently-named equivalents of "which check/context is this",
+	// normalized onto one filterable field rather than two, mirroring
+	// Label's own exact-match semantics. "" means "no name filter".
+	// Meaningless (always "" on the event side) for every event type that
+	// carries neither field (pull_request, issues, issue_comment, push).
+	Name string
+
+	// Conclusion, when non-empty, additionally requires
+	// GitHubEventInput.Conclusion to match exactly -- check_run's own
+	// `conclusion` field (e.g. "success", "failure") or status's own
+	// `state` field (e.g. "success", "pending"), normalized onto this one
+	// field for the identical reason Name is. "" means "no conclusion
+	// filter".
+	Conclusion string
 }
 
 // ErrEmptyGitHubEvent is ValidateGitHubTriggerConfig's own sentinel.
 var ErrEmptyGitHubEvent = errors.New("automation: github trigger config: event must not be empty")
 
+// ErrGitHubEventNotDispatchable is ValidateGitHubTriggerConfig's own
+// second sentinel -- D10 audit fix (confirmed finding: "a trigger for a
+// non-allowlisted event is accepted and silently dead"). Before this
+// fix, GitHubDispatchAllowlist (dispatch.go) was consulted ONLY at live
+// dispatch time, never at automation-create time, so the API accepted a
+// GitHubTriggerConfig naming an event outside it (a typo, or a real
+// GitHub event this dispatch path simply does not subscribe to) and that
+// automation was dead forever, with no feedback to whoever created it.
+var ErrGitHubEventNotDispatchable = errors.New("automation: github trigger config: event is not in the dispatchable allowlist")
+
 // ValidateGitHubTriggerConfig validates cfg before it is accepted onto an
-// automation with TriggerTypeGitHub -- only Event is required; Action/Label
-// are optional filters (see their own doc comments above).
+// automation with TriggerTypeGitHub -- Event is required AND (D10 audit
+// fix) must be one ClassifyGitHubDispatch itself recognizes: the SAME
+// function dispatch.go's own live-dispatch path calls
+// (app/automation.DispatchGitHubWebhookEvent) -- one register, consulted
+// by both the create-time check here and the dispatch-time check there,
+// so the two can never drift apart the way two independently-maintained
+// copies of the same allowlist could. Action/Label are optional filters
+// (see their own doc comments above).
 func ValidateGitHubTriggerConfig(cfg GitHubTriggerConfig) error {
 	if cfg.Event == "" {
 		return ErrEmptyGitHubEvent
 	}
+	if ClassifyGitHubDispatch(cfg.Event) != GitHubDispatchNotSkipped {
+		return fmt.Errorf("%w: %q", ErrGitHubEventNotDispatchable, cfg.Event)
+	}
 	return nil
 }
 
-// GitHubEventInput is the minimal shape MatchesGitHubTrigger needs from a
-// live GitHub webhook event -- a caller (a future dispatch wiring, per this
-// package's own doc.go) derives this from the real webhook payload; this
-// package never parses a raw GitHub payload itself (§11, adapter-
-// independence).
+// GitHubEventBranch is one entry from a GitHub `status` webhook event's own
+// branches[] array, or the single synthetic entry a dispatch-wiring caller
+// derives for an event type that names its own branch unambiguously
+// (pull_request's head.ref/head.sha, push's ref/after, check_run's
+// check_suite.head_branch/head_sha) -- see doc.go's own "branch tip, never
+// containment" section for the full "why" this shape exists at all.
+//
+// GitHub's own docs describe a status event's branches[] field as the list
+// of branches this commit is "part of" -- i.e. CONTAINS the commit, not
+// the branch whose CURRENT TIP it is. Name is the branch name; HeadSHA is
+// that branch's own current tip commit SHA (branches[].commit.sha in the
+// raw payload) -- deliberately NOT named "SHA" alone, so a reader cannot
+// mistake it for "the commit this event is about" (that is
+// GitHubEventInput.SHA, compared against HeadSHA by TipBranchNames below,
+// never assumed equal).
+type GitHubEventBranch struct {
+	Name    string
+	HeadSHA string
+}
+
+// GitHubEventInput is the minimal shape MatchesGitHubTrigger/
+// TargetMatchesGitHubEvent need from a live GitHub webhook event -- a
+// caller (internal/app/automation's own githubdispatch.go) derives this
+// from the real webhook payload; this package never parses a raw GitHub
+// payload itself (§11, adapter-independence).
 type GitHubEventInput struct {
 	EventType string
 	Action    string
 	Labels    []string
+
+	// RepoFullName is the event's own "repository.full_name" ("owner/
+	// repo") -- TargetMatchesGitHubEvent's own repo-scoping half (see that
+	// function's own doc comment); "" for a caller that never resolved it
+	// (TargetMatchesGitHubEvent then never matches any target, fail
+	// closed).
+	RepoFullName string
+
+	// DefaultBranch is the event's own "repository.default_branch" --
+	// D4 audit fix's own resolution for what an UNCONFIGURED
+	// (Target.Branch == "") target means, see TargetMatchesGitHubEvent's
+	// own doc comment. Every GitHub webhook payload this dispatch path
+	// parses embeds the full repository object this field comes from, so
+	// populating it costs no extra lookup/I/O -- "" for a caller that
+	// never resolved it (TargetMatchesGitHubEvent then never matches an
+	// unconfigured target against this event, fail closed, exactly like
+	// an unresolved RepoFullName above).
+	DefaultBranch string
+
+	// SHA is the commit this event pertains to (status: top-level "sha";
+	// check_run: "check_run.head_sha"; pull_request: "pull_request.head.
+	// sha"; push: "after") -- "" for an event type that carries no single
+	// commit (issues, issue_comment), which by construction can never
+	// satisfy TipBranchNames below (an empty SHA matches no branch's own
+	// non-empty HeadSHA).
+	SHA string
+
+	// Branches is this event's own branch-tip evidence -- see
+	// GitHubEventBranch's own doc comment for exactly what each entry
+	// means and why containment is the wrong read of it. Empty for an
+	// event type with no branch concept at all.
+	Branches []GitHubEventBranch
+
+	// Name is check_run's own `name` field or status's own `context`
+	// field, normalized -- see GitHubTriggerConfig.Name's own doc comment.
+	Name string
+	// Conclusion is check_run's own `conclusion` field or status's own
+	// `state` field, normalized -- see GitHubTriggerConfig.Conclusion's
+	// own doc comment.
+	Conclusion string
 }
 
 // MatchesGitHubTrigger reports whether in satisfies cfg's own filter: Event
 // must match exactly; Action, if cfg.Action is non-empty, must also match
 // exactly; Label, if cfg.Label is non-empty, must appear (exact string
-// match) somewhere in in.Labels.
+// match) somewhere in in.Labels; Name/Conclusion, if non-empty, must each
+// match in.Name/in.Conclusion exactly (§8.4's own check_run/status
+// normalization). This function is deliberately blind to repo/branch
+// scoping -- see TargetMatchesGitHubEvent below (and its own doc comment
+// on why containment vs. tip identity is decided there, not here): a
+// trigger's own Event/Action/Label/Name/Conclusion filter and an
+// automation's own configured target repos are two independent questions,
+// asked by two independent functions, exactly like app/automation's own
+// dispatch caller evaluates them independently.
 func MatchesGitHubTrigger(cfg GitHubTriggerConfig, in GitHubEventInput) bool {
 	if cfg.Event != in.EventType {
 		return false
@@ -158,15 +265,47 @@ func MatchesGitHubTrigger(cfg GitHubTriggerConfig, in GitHubEventInput) bool {
 			return false
 		}
 	}
+	if cfg.Name != "" && cfg.Name != in.Name {
+		return false
+	}
+	if cfg.Conclusion != "" && cfg.Conclusion != in.Conclusion {
+		return false
+	}
 	return true
+}
+
+// TipBranchNames returns every branches[i].Name whose own HeadSHA equals
+// sha exactly -- the ONE place this package turns a status/check_run
+// event's own branch-containment evidence (GitHubEventBranch's own doc
+// comment) into branch-TIP identity. A commit landed on a repo's default
+// branch is, by definition, contained by every feature branch ever cut at
+// or after it -- so a caller that instead scanned for a branch NAME
+// appearing anywhere in branches[] (ignoring HeadSHA entirely) would treat
+// every one of those feature branches as if this event were about their
+// own current work, when it is not. sha == "" always returns nil (an event
+// with no known commit can never be any branch's own current tip) --
+// deliberately checked explicitly rather than left to fall out of the
+// comparison loop below, so a zero-value GitHubEventInput reads as
+// "matches nothing" by construction, not by accident.
+func TipBranchNames(sha string, branches []GitHubEventBranch) []string {
+	if sha == "" {
+		return nil
+	}
+	var names []string
+	for _, b := range branches {
+		if b.HeadSHA == sha {
+			names = append(names, b.Name)
+		}
+	}
+	return names
 }
 
 // LinearTriggerConfig is TriggerTypeLinear's own trigger_config shape --
 // mirrors GitHubTriggerConfig's own shape, Linear's own vocabulary
 // (EventType/Action/TeamKey rather than Event/Action/Label): an automation
 // fires when a Linear webhook event arrives whose own EventType/Action/team
-// matches this filter. Same "modeled and validated, live dispatch
-// deferred" scope note as GitHubTriggerConfig applies -- see doc.go.
+// matches this filter. Modeled, validated, and live-dispatched exactly like
+// GitHubTriggerConfig -- see doc.go.
 type LinearTriggerConfig struct {
 	// EventType is Linear's own webhook event category verbatim (e.g.
 	// "Issue", "Comment") -- required.
@@ -175,18 +314,101 @@ type LinearTriggerConfig struct {
 	// means "any action for this EventType matches".
 	Action string
 	// TeamKey, when non-empty, additionally requires LinearEventInput.
-	// TeamKey to match exactly -- "" means "no team filter".
+	// TeamKey to match exactly -- "" means "no team filter". W6 audit fix:
+	// REJECTED outright at ValidateLinearTriggerConfig for an EventType in
+	// linearEventTypesWithNoTeamConcept (below) -- see that map's own doc
+	// comment for why a non-empty TeamKey paired with one of those event
+	// types can never be satisfied, ever, rather than silently dead.
 	TeamKey string
+	// OrganizationID is W3 audit fix's own required addition (confirmed
+	// HIGH-severity, TENANT ISOLATION finding: "the only workspace check is
+	// 'some linear_installations row exists for this organizationId' -- the
+	// sending workspace is never compared to anything the automation
+	// names"). Linear's own top-level "organizationId" (the SAME field
+	// D9's own installation lookup already authenticates, internal/
+	// adapters/inbound/linear/automationdispatch.go) -- required, and
+	// compared EXACTLY against the live event's own LinearEventInput.
+	// OrganizationID by MatchesLinearTrigger below, mirroring
+	// TargetMatchesGitHubEvent's own repo-scoping half on the GitHub side:
+	// GitHub has no separate "organization" concept here because a
+	// target's own clone URL (an "owner/repo" path) IS already globally
+	// unique and directly comparable against the event's own
+	// RepoFullName; Linear has no per-target equivalent (an automation's
+	// own configured target repos are git repositories, structurally
+	// unrelated to which Linear WORKSPACE may trigger it), so this field
+	// is the tenant boundary Linear needs that GitHub gets from Target.URL
+	// for free. Required (never "" means no filter, unlike TeamKey/Action)
+	// -- an automation with no recorded organization would otherwise fire
+	// for EVERY installed workspace's own matching event, which is
+	// precisely the vulnerability this fix closes.
+	OrganizationID string
 }
 
 // ErrEmptyLinearEventType is ValidateLinearTriggerConfig's own sentinel.
 var ErrEmptyLinearEventType = errors.New("automation: linear trigger config: event type must not be empty")
 
+// ErrLinearEventNotDispatchable mirrors ErrGitHubEventNotDispatchable's
+// own D10 audit fix, for Linear.
+var ErrLinearEventNotDispatchable = errors.New("automation: linear trigger config: event type is not in the dispatchable allowlist")
+
+// ErrEmptyLinearOrganizationID is ValidateLinearTriggerConfig's own W3
+// audit fix sentinel -- see LinearTriggerConfig.OrganizationID's own doc
+// comment for the full "why" this is required, never optional.
+var ErrEmptyLinearOrganizationID = errors.New("automation: linear trigger config: organization id must not be empty")
+
+// ErrLinearTeamFilterNotSupported is ValidateLinearTriggerConfig's own W6
+// audit fix sentinel (confirmed MEDIUM finding: "a Linear Comment trigger
+// with a team filter can never fire") -- see
+// linearEventTypesWithNoTeamConcept's own doc comment for the full "why".
+var ErrLinearTeamFilterNotSupported = errors.New("automation: linear trigger config: team filter is not supported for this event type")
+
+// linearEventTypesWithNoTeamConcept is ValidateLinearTriggerConfig's own
+// closed, typed carve-out -- W6 audit fix (confirmed MEDIUM finding).
+// Linear's "Comment" data-change webhook payload carries no team object at
+// all (confirmed directly against Linear's own published webhook payload
+// documentation during this fix's own investigation: the Comment payload's
+// "data" object carries id/createdAt/updatedAt/archivedAt/body/edited/
+// issueId/userId -- no team, and no nested issue object a team could be
+// read from either), unlike "Issue" (whose own "data.team.key" is exactly
+// LinearTriggerConfig.TeamKey's worked example). buildLinearEventInput
+// (internal/adapters/inbound/linear/automationdispatch.go) therefore
+// always yields LinearEventInput.TeamKey == "" for a Comment event, and
+// MatchesLinearTrigger's own exact-match TeamKey filter (below) then
+// always rejects a configured, non-empty TeamKey -- the same defect shape
+// D14 already fixed on the GitHub side for a configured branch on an
+// issues/issue_comment automation (eventTypesWithNoBranchConcept,
+// dispatch.go), except there is no equivalent "substitute meaning" to
+// carve out here the way D14 gave Target.Branch for GitHub (a Comment
+// event has no branch-shaped downstream use for TeamKey to mean something
+// else): a team filter genuinely CANNOT be satisfied for this event type,
+// full stop, so the correct fix is refusing the impossible combination at
+// creation time (ValidateLinearTriggerConfig), never accepting it and
+// leaving it silently dead forever the way an unvalidated combination did.
+var linearEventTypesWithNoTeamConcept = map[string]bool{
+	"Comment": true,
+}
+
 // ValidateLinearTriggerConfig validates cfg before it is accepted onto an
-// automation with TriggerTypeLinear.
+// automation with TriggerTypeLinear -- mirrors
+// ValidateGitHubTriggerConfig's own D10 audit fix exactly: EventType must
+// also be one ClassifyLinearDispatch itself recognizes, the SAME register
+// app/automation.DispatchLinearWebhookEvent consults at live dispatch
+// time. W3 audit fix: OrganizationID is now also required (see that
+// field's own doc comment). W6 audit fix: a non-empty TeamKey paired with
+// an EventType in linearEventTypesWithNoTeamConcept is refused outright,
+// rather than accepted and left silently, permanently dead.
 func ValidateLinearTriggerConfig(cfg LinearTriggerConfig) error {
 	if cfg.EventType == "" {
 		return ErrEmptyLinearEventType
+	}
+	if ClassifyLinearDispatch(cfg.EventType) != LinearDispatchNotSkipped {
+		return fmt.Errorf("%w: %q", ErrLinearEventNotDispatchable, cfg.EventType)
+	}
+	if cfg.OrganizationID == "" {
+		return ErrEmptyLinearOrganizationID
+	}
+	if cfg.TeamKey != "" && linearEventTypesWithNoTeamConcept[cfg.EventType] {
+		return fmt.Errorf("%w: %q", ErrLinearTeamFilterNotSupported, cfg.EventType)
 	}
 	return nil
 }
@@ -194,16 +416,39 @@ func ValidateLinearTriggerConfig(cfg LinearTriggerConfig) error {
 // LinearEventInput is the minimal shape MatchesLinearTrigger needs from a
 // live Linear webhook event -- see GitHubEventInput's own doc comment for
 // the identical "caller derives this, this package never parses a raw
-// payload" reasoning.
+// payload" reasoning. OrganizationID is W3 audit fix's own required
+// addition -- see LinearTriggerConfig.OrganizationID's own doc comment.
 type LinearEventInput struct {
-	EventType string
-	Action    string
-	TeamKey   string
+	EventType      string
+	Action         string
+	TeamKey        string
+	OrganizationID string
 }
 
 // MatchesLinearTrigger reports whether in satisfies cfg's own filter --
 // mirrors MatchesGitHubTrigger's own exact-match-per-populated-field logic.
+// W3 audit fix: OrganizationID is now an UNCONDITIONAL exact-match
+// requirement (never "no filter" the way TeamKey/Action's own "" means) --
+// see LinearTriggerConfig.OrganizationID's own doc comment for why this is
+// the tenant boundary Linear needs, mirroring TargetMatchesGitHubEvent's
+// own repo-scoping requirement on the GitHub side. Checked FIRST,
+// deliberately: every other field below is a business-logic filter this
+// automation's own configuration chose; this one is an authorization
+// boundary, and fails closed before any of those are even consulted, the
+// same "structural check first" ordering ClassifyGitHubDispatch/
+// ClassifyLinearDispatch already establish for event-type allowlisting.
 func MatchesLinearTrigger(cfg LinearTriggerConfig, in LinearEventInput) bool {
+	// Zero-value guard: cfg.OrganizationID == "" must NEVER match, even
+	// against an event whose own in.OrganizationID also happens to be ""
+	// (a malformed/never-resolved delivery) -- an unconditional "" == ""
+	// comparison would fail OPEN on exactly that degenerate pairing, the
+	// one shape ValidateLinearTriggerConfig's own requirement (this field's
+	// own doc comment) exists to make unreachable for cfg, but this
+	// function must not silently assume its own caller always validated
+	// first.
+	if cfg.OrganizationID == "" || cfg.OrganizationID != in.OrganizationID {
+		return false
+	}
 	if cfg.EventType != in.EventType {
 		return false
 	}

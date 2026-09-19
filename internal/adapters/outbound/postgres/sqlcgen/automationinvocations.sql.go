@@ -15,7 +15,7 @@ const claimAutomationInvocationForFanOut = `-- name: ClaimAutomationInvocationFo
 UPDATE automation_invocations
 SET fanned_out_at = now()
 WHERE id = $1 AND fanned_out_at IS NULL
-RETURNING id, automation_id, status, targets, total_runs, fanned_out_at, failure_counted_at, closed_at, created_at
+RETURNING id, automation_id, status, targets, total_runs, fanned_out_at, failure_counted_at, closed_at, created_at, source_provider, source_delivery_id
 `
 
 // The CAS half of the claim-batch pair immediately above -- "UPDATE ...
@@ -35,6 +35,8 @@ func (q *Queries) ClaimAutomationInvocationForFanOut(ctx context.Context, id pgt
 		&i.FailureCountedAt,
 		&i.ClosedAt,
 		&i.CreatedAt,
+		&i.SourceProvider,
+		&i.SourceDeliveryID,
 	)
 	return i, err
 }
@@ -44,7 +46,7 @@ UPDATE automation_invocations
 SET status = $2,
     closed_at = now()
 WHERE id = $1 AND status = 'pending'
-RETURNING id, automation_id, status, targets, total_runs, fanned_out_at, failure_counted_at, closed_at, created_at
+RETURNING id, automation_id, status, targets, total_runs, fanned_out_at, failure_counted_at, closed_at, created_at, source_provider, source_delivery_id
 `
 
 type CloseAutomationInvocationParams struct {
@@ -73,15 +75,38 @@ func (q *Queries) CloseAutomationInvocation(ctx context.Context, arg CloseAutoma
 		&i.FailureCountedAt,
 		&i.ClosedAt,
 		&i.CreatedAt,
+		&i.SourceProvider,
+		&i.SourceDeliveryID,
 	)
 	return i, err
+}
+
+const countRecentAutomationInvocations = `-- name: CountRecentAutomationInvocations :one
+SELECT count(*) FROM automation_invocations
+WHERE automation_id = $1 AND created_at >= $2
+`
+
+type CountRecentAutomationInvocationsParams struct {
+	AutomationID pgtype.UUID        `json:"automation_id"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
+// Backs D8's own per-automation dispatch throttle
+// (domainautomation.EvaluateDispatchThrottle) -- every invocation this
+// automation has created (any source, any outcome) since $2, regardless
+// of whether it has fanned out or closed yet.
+func (q *Queries) CountRecentAutomationInvocations(ctx context.Context, arg CountRecentAutomationInvocationsParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countRecentAutomationInvocations, arg.AutomationID, arg.CreatedAt)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
 }
 
 const createAutomationInvocation = `-- name: CreateAutomationInvocation :one
 
 INSERT INTO automation_invocations (automation_id, targets, total_runs)
 VALUES ($1, $2, $3)
-RETURNING id, automation_id, status, targets, total_runs, fanned_out_at, failure_counted_at, closed_at, created_at
+RETURNING id, automation_id, status, targets, total_runs, fanned_out_at, failure_counted_at, closed_at, created_at, source_provider, source_delivery_id
 `
 
 type CreateAutomationInvocationParams struct {
@@ -110,12 +135,88 @@ func (q *Queries) CreateAutomationInvocation(ctx context.Context, arg CreateAuto
 		&i.FailureCountedAt,
 		&i.ClosedAt,
 		&i.CreatedAt,
+		&i.SourceProvider,
+		&i.SourceDeliveryID,
+	)
+	return i, err
+}
+
+const createAutomationInvocationForDelivery = `-- name: CreateAutomationInvocationForDelivery :one
+INSERT INTO automation_invocations (automation_id, targets, total_runs, source_provider, source_delivery_id)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (automation_id, source_provider, source_delivery_id) WHERE source_provider IS NOT NULL AND source_delivery_id IS NOT NULL
+DO UPDATE SET automation_id = automation_invocations.automation_id
+RETURNING id, automation_id, status, targets, total_runs, fanned_out_at, failure_counted_at, closed_at, created_at, source_provider, source_delivery_id, (xmax = 0) AS inserted
+`
+
+type CreateAutomationInvocationForDeliveryParams struct {
+	AutomationID     pgtype.UUID `json:"automation_id"`
+	Targets          []byte      `json:"targets"`
+	TotalRuns        int32       `json:"total_runs"`
+	SourceProvider   *string     `json:"source_provider"`
+	SourceDeliveryID *string     `json:"source_delivery_id"`
+}
+
+type CreateAutomationInvocationForDeliveryRow struct {
+	ID               pgtype.UUID                `json:"id"`
+	AutomationID     pgtype.UUID                `json:"automation_id"`
+	Status           AutomationInvocationStatus `json:"status"`
+	Targets          []byte                     `json:"targets"`
+	TotalRuns        int32                      `json:"total_runs"`
+	FannedOutAt      pgtype.Timestamptz         `json:"fanned_out_at"`
+	FailureCountedAt pgtype.Timestamptz         `json:"failure_counted_at"`
+	ClosedAt         pgtype.Timestamptz         `json:"closed_at"`
+	CreatedAt        pgtype.Timestamptz         `json:"created_at"`
+	SourceProvider   *string                    `json:"source_provider"`
+	SourceDeliveryID *string                    `json:"source_delivery_id"`
+	Inserted         bool                       `json:"inserted"`
+}
+
+// D1 audit fix's own idempotent-on-delivery variant of
+// CreateAutomationInvocation above -- used ONLY by live GitHub/Linear
+// webhook dispatch (app/automation's own githubdispatch.go/
+// lineardispatch.go), which alone has a genuine (provider, delivery_id)
+// identity to key on. The SAME "(xmax = 0) AS inserted" idiom
+// ClaimWebhookDelivery already establishes (queries/webhookdeliveries.sql)
+// -- a deliberate, self-referential no-op update (automation_id is set
+// back to its own current value) on conflict against
+// automation_invocations_source_delivery_uniq (migrations/
+// 000136_automation_invocations_source_delivery.up.sql), so RETURNING
+// always yields exactly one row whether this call just inserted a fresh
+// invocation or found an already-created one from an earlier delivery of
+// the SAME (automation_id, provider, delivery_id) -- a real webhook
+// redelivery. Callers branch on Inserted: true means "a new invocation
+// now exists, proceed exactly like CreateAutomationInvocation always has";
+// false means "already dispatched for this exact delivery -- skip,
+// never double-fire this automation for a resend".
+func (q *Queries) CreateAutomationInvocationForDelivery(ctx context.Context, arg CreateAutomationInvocationForDeliveryParams) (CreateAutomationInvocationForDeliveryRow, error) {
+	row := q.db.QueryRow(ctx, createAutomationInvocationForDelivery,
+		arg.AutomationID,
+		arg.Targets,
+		arg.TotalRuns,
+		arg.SourceProvider,
+		arg.SourceDeliveryID,
+	)
+	var i CreateAutomationInvocationForDeliveryRow
+	err := row.Scan(
+		&i.ID,
+		&i.AutomationID,
+		&i.Status,
+		&i.Targets,
+		&i.TotalRuns,
+		&i.FannedOutAt,
+		&i.FailureCountedAt,
+		&i.ClosedAt,
+		&i.CreatedAt,
+		&i.SourceProvider,
+		&i.SourceDeliveryID,
+		&i.Inserted,
 	)
 	return i, err
 }
 
 const getAutomationInvocation = `-- name: GetAutomationInvocation :one
-SELECT id, automation_id, status, targets, total_runs, fanned_out_at, failure_counted_at, closed_at, created_at FROM automation_invocations
+SELECT id, automation_id, status, targets, total_runs, fanned_out_at, failure_counted_at, closed_at, created_at, source_provider, source_delivery_id FROM automation_invocations
 WHERE id = $1
 `
 
@@ -132,12 +233,14 @@ func (q *Queries) GetAutomationInvocation(ctx context.Context, id pgtype.UUID) (
 		&i.FailureCountedAt,
 		&i.ClosedAt,
 		&i.CreatedAt,
+		&i.SourceProvider,
+		&i.SourceDeliveryID,
 	)
 	return i, err
 }
 
 const listDueForFanOut = `-- name: ListDueForFanOut :many
-SELECT ai.id, ai.automation_id, ai.status, ai.targets, ai.total_runs, ai.fanned_out_at, ai.failure_counted_at, ai.closed_at, ai.created_at FROM automation_invocations ai
+SELECT ai.id, ai.automation_id, ai.status, ai.targets, ai.total_runs, ai.fanned_out_at, ai.failure_counted_at, ai.closed_at, ai.created_at, ai.source_provider, ai.source_delivery_id FROM automation_invocations ai
 JOIN automations a ON a.id = ai.automation_id
 WHERE ai.fanned_out_at IS NULL AND a.status = 'active'
 ORDER BY ai.created_at
@@ -184,6 +287,8 @@ func (q *Queries) ListDueForFanOut(ctx context.Context, limit int32) ([]Automati
 			&i.FailureCountedAt,
 			&i.ClosedAt,
 			&i.CreatedAt,
+			&i.SourceProvider,
+			&i.SourceDeliveryID,
 		); err != nil {
 			return nil, err
 		}
@@ -196,7 +301,7 @@ func (q *Queries) ListDueForFanOut(ctx context.Context, limit int32) ([]Automati
 }
 
 const listInvocationsForAutomation = `-- name: ListInvocationsForAutomation :many
-SELECT id, automation_id, status, targets, total_runs, fanned_out_at, failure_counted_at, closed_at, created_at FROM automation_invocations
+SELECT id, automation_id, status, targets, total_runs, fanned_out_at, failure_counted_at, closed_at, created_at, source_provider, source_delivery_id FROM automation_invocations
 WHERE automation_id = $1
 ORDER BY created_at DESC
 LIMIT $2
@@ -235,6 +340,8 @@ func (q *Queries) ListInvocationsForAutomation(ctx context.Context, arg ListInvo
 			&i.FailureCountedAt,
 			&i.ClosedAt,
 			&i.CreatedAt,
+			&i.SourceProvider,
+			&i.SourceDeliveryID,
 		); err != nil {
 			return nil, err
 		}
@@ -250,7 +357,7 @@ const markAutomationInvocationFailureCounted = `-- name: MarkAutomationInvocatio
 UPDATE automation_invocations
 SET failure_counted_at = now()
 WHERE id = $1 AND failure_counted_at IS NULL
-RETURNING id, automation_id, status, targets, total_runs, fanned_out_at, failure_counted_at, closed_at, created_at
+RETURNING id, automation_id, status, targets, total_runs, fanned_out_at, failure_counted_at, closed_at, created_at, source_provider, source_delivery_id
 `
 
 // §3.5's own literal CAS idiom: "UPDATE ... WHERE failure_counted_at IS
@@ -277,6 +384,8 @@ func (q *Queries) MarkAutomationInvocationFailureCounted(ctx context.Context, id
 		&i.FailureCountedAt,
 		&i.ClosedAt,
 		&i.CreatedAt,
+		&i.SourceProvider,
+		&i.SourceDeliveryID,
 	)
 	return i, err
 }
