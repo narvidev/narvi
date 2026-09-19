@@ -1,7 +1,7 @@
 // Command narvichecks runs Narvi's project-specific static-analysis checks
 // (nakedgoroutine, notimeliteral, demotionsweep, execimportban,
-// httpclientban, capabilityimportban) as a golang.org/x/tools/go/analysis
-// multichecker.
+// httpclientban, capabilityimportban, nilhttpclient, reasoncoverage) as a
+// golang.org/x/tools/go/analysis multichecker.
 // Usage: go run ./tools/lint/narvichecks ./...
 package main
 
@@ -15,6 +15,7 @@ import (
 	"github.com/narvidev/narvi/tools/lint/narvichecks/nakedgoroutine"
 	"github.com/narvidev/narvi/tools/lint/narvichecks/nilhttpclient"
 	"github.com/narvidev/narvi/tools/lint/narvichecks/notimeliteral"
+	"github.com/narvidev/narvi/tools/lint/narvichecks/reasoncoverage"
 )
 
 func main() {
@@ -26,5 +27,6 @@ func main() {
 		nakedgoroutine.Analyzer,
 		nilhttpclient.Analyzer,
 		notimeliteral.Analyzer,
+		reasoncoverage.Analyzer,
 	)
 }

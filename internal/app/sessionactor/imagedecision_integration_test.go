@@ -5,6 +5,7 @@ package sessionactor
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"testing"
 	"time"
@@ -174,7 +175,7 @@ func TestResolveAndSetImage_NoRepos_PersistsNoReposReason(t *testing.T) {
 		t.Errorf("sandboxes.image_decision_fingerprint = %q, want nil (nothing to fingerprint)", *sb.ImageDecisionFingerprint)
 	}
 
-	assertImageDecisionEvent(ctx, t, pool, sessionID, imagedecision.ReasonNoRepos, "")
+	assertImageDecisionEvent(ctx, t, pool, sessionID, imagedecision.ReasonNoRepos, "", sb.Gen)
 }
 
 // TestResolveAndSetImage_NoCreatedByUser_PersistsNoCreatorReason proves an
@@ -216,7 +217,7 @@ func TestResolveAndSetImage_NoCreatedByUser_PersistsNoCreatorReason(t *testing.T
 		t.Errorf("sandboxes.image_decision_fingerprint = %v, want %q", sb.ImageDecisionFingerprint, wantFingerprint)
 	}
 
-	assertImageDecisionEvent(ctx, t, pool, sessionID, imagedecision.ReasonRepoAccessNoCreator, wantFingerprint)
+	assertImageDecisionEvent(ctx, t, pool, sessionID, imagedecision.ReasonRepoAccessNoCreator, wantFingerprint, sb.Gen)
 }
 
 // TestResolveAndSetImage_RepoAccessDenied_PersistsDeniedReason proves the
@@ -253,7 +254,7 @@ func TestResolveAndSetImage_RepoAccessDenied_PersistsDeniedReason(t *testing.T) 
 	if got := imagedecision.Reason(*sb.ImageDecisionReason); got != imagedecision.ReasonRepoAccessDenied {
 		t.Errorf("sandboxes.image_decision_reason = %q, want %q", got, imagedecision.ReasonRepoAccessDenied)
 	}
-	assertImageDecisionEvent(ctx, t, pool, sessionID, imagedecision.ReasonRepoAccessDenied, wantFingerprint)
+	assertImageDecisionEvent(ctx, t, pool, sessionID, imagedecision.ReasonRepoAccessDenied, wantFingerprint, sb.Gen)
 }
 
 // TestResolveAndSetImage_Miss_PersistsPendingReason proves the ordinary,
@@ -290,7 +291,7 @@ func TestResolveAndSetImage_Miss_PersistsPendingReason(t *testing.T) {
 	if got := imagedecision.Reason(*sb.ImageDecisionReason); got != imagedecision.ReasonImageBuildPending {
 		t.Errorf("sandboxes.image_decision_reason = %q, want %q", got, imagedecision.ReasonImageBuildPending)
 	}
-	assertImageDecisionEvent(ctx, t, pool, sessionID, imagedecision.ReasonImageBuildPending, wantFingerprint)
+	assertImageDecisionEvent(ctx, t, pool, sessionID, imagedecision.ReasonImageBuildPending, wantFingerprint, sb.Gen)
 }
 
 // TestResolveAndSetImage_WarmHit_PersistsSelectedReasonWithBuiltRepoShas
@@ -336,7 +337,7 @@ func TestResolveAndSetImage_WarmHit_PersistsSelectedReasonWithBuiltRepoShas(t *t
 		t.Errorf("sandboxes.image_decision_fingerprint = %v, want %q", sb.ImageDecisionFingerprint, fingerprint)
 	}
 
-	payload := assertImageDecisionEvent(ctx, t, pool, sessionID, imagedecision.ReasonSelected, fingerprint)
+	payload := assertImageDecisionEvent(ctx, t, pool, sessionID, imagedecision.ReasonSelected, fingerprint, sb.Gen)
 	rawShas, ok := payload["built_repo_shas"]
 	if !ok {
 		t.Fatal(`image_decision event payload has no "built_repo_shas" key, want the warm-hit row's own repo-commit map`)
@@ -473,7 +474,115 @@ func TestResolveAndSetImage_ReadyRowMissingRef_PersistsAnomalyReason(t *testing.
 	if got := imagedecision.Reason(*sb.ImageDecisionReason); got != imagedecision.ReasonImageBuildReadyRowMissingRef {
 		t.Errorf("sandboxes.image_decision_reason = %q, want %q", got, imagedecision.ReasonImageBuildReadyRowMissingRef)
 	}
-	assertImageDecisionEvent(ctx, t, pool, sessionID, imagedecision.ReasonImageBuildReadyRowMissingRef, fingerprint)
+	assertImageDecisionEvent(ctx, t, pool, sessionID, imagedecision.ReasonImageBuildReadyRowMissingRef, fingerprint, sb.Gen)
+}
+
+// TestResolveAndSetImage_DisclosingReasons_EventCoarsensReasonButColumnStaysPrecise
+// is A2's own audit fix (disclosure, "warm-boot decision disclosure"),
+// proven end to end against a real Postgres instance: ReasonRepoAccess
+// CreatorDisabled/CreatorViewer/NoToken each name admin-only session-
+// creator account state (§13.3; Settings -> Members' own admin-only
+// ListMembers/UpdateMemberRole, members.go) -- but the "image_decision"
+// event is served, unconditionally, to any logged-in reader
+// (httpapi.ListEvents/client-WS replay check neither role nor session
+// membership). For each of the three, this proves the sandboxes COLUMN
+// keeps the exact, precise reason (an operator loses nothing), while the
+// SERVED EVENT's own "reason" field reads the coarser, already-non-
+// sensitive imagedecision.ReasonRepoAccessDenied instead -- never the
+// precise value, which would disclose the creator's account state to a
+// reader who cannot see it anywhere else in this product.
+func TestResolveAndSetImage_DisclosingReasons_EventCoarsensReasonButColumnStaysPrecise(t *testing.T) {
+	tests := []struct {
+		name       string
+		repoName   string
+		wantColumn imagedecision.Reason
+		setUser    func(t *testing.T, pool *pgxpool.Pool) pgtype.UUID
+	}{
+		{
+			name:       "disabled creator",
+			repoName:   "repo-decision-disabled",
+			wantColumn: imagedecision.ReasonRepoAccessCreatorDisabled,
+			setUser: func(t *testing.T, pool *pgxpool.Pool) pgtype.UUID {
+				creator := createTestUserWithGitHubToken(context.Background(), t, pool, "gh-fake-token-decision-disabled")
+				if _, err := pool.Exec(context.Background(), `UPDATE users SET disabled = true WHERE id = $1`, creator); err != nil {
+					t.Fatalf("disable fixture user: %v", err)
+				}
+				return creator
+			},
+		},
+		{
+			name:       "viewer creator",
+			repoName:   "repo-decision-viewer",
+			wantColumn: imagedecision.ReasonRepoAccessCreatorViewer,
+			setUser: func(t *testing.T, pool *pgxpool.Pool) pgtype.UUID {
+				creator := createTestUserWithGitHubToken(context.Background(), t, pool, "gh-fake-token-decision-viewer")
+				if _, err := narvipg.NewUserStore(pool).UpdateRole(context.Background(), creator, sqlcgen.UserRoleViewer); err != nil {
+					t.Fatalf("demote fixture user to viewer: %v", err)
+				}
+				return creator
+			},
+		},
+		{
+			name:       "creator with no linked github identity/token",
+			repoName:   "repo-decision-no-token",
+			wantColumn: imagedecision.ReasonRepoAccessNoToken,
+			setUser: func(t *testing.T, pool *pgxpool.Pool) pgtype.UUID {
+				user, err := narvipg.NewUserStore(pool).Create(context.Background(), sqlcgen.CreateUserParams{
+					PrimaryEmail: fmt.Sprintf("imagedecision-test-no-token-%d@example.com", time.Now().UnixNano()),
+					DisplayName:  "Image Decision No-Token Test User",
+					Role:         sqlcgen.UserRoleMember,
+				})
+				if err != nil {
+					t.Fatalf("create fixture user with no linked github identity: %v", err)
+				}
+				return user.ID
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			pool := newTestPool(t)
+
+			creator := tc.setUser(t, pool)
+			repoURL := "https://github.com/acme/" + tc.repoName + ".git"
+			sessionID := createTestSessionWithRepos(ctx, t, pool, creator, tc.repoName, repoURL, "main")
+
+			sourceControl := &fakeSourceControl{}
+			provider := &fakeSpawnProvider{nextRef: ports.SandboxRef{ProviderID: "provider-" + tc.repoName}}
+			r := newImageBuildTestRegistry(t, ctx, pool, provider, sourceControl)
+			t.Cleanup(func() { _ = r.Shutdown() })
+
+			turnStore := narvipg.NewTurnStore(pool)
+			createPendingTurn(ctx, t, turnStore, sessionID, "do the thing")
+
+			a, err := r.GetOrSpawn(ctx, sessionID)
+			if err != nil {
+				t.Fatalf("GetOrSpawn: %v", err)
+			}
+			sendEnsureDispatched(ctx, t, a)
+			waitUntil(t, 5*time.Second, func() bool { return provider.callCount() == 1 })
+
+			sb := waitForImageDecision(ctx, t, pool, sessionID)
+			if got := imagedecision.Reason(*sb.ImageDecisionReason); got != tc.wantColumn {
+				t.Errorf("sandboxes.image_decision_reason = %q, want the PRECISE %q -- the column must never be coarsened, only the served event", got, tc.wantColumn)
+			}
+
+			// The served event must read the COARSER, already-non-sensitive
+			// bucket. Asserting reason=ReasonRepoAccessDenied here (rather
+			// than tc.wantColumn) is the disclosure assertion itself: if
+			// participantVisibleReason ever regressed to passing the
+			// precise reason through unchanged, no event with
+			// reason="repo_access_denied" would ever appear and this call
+			// times out and fails, exactly as it should.
+			if got := sourceControl.accessCallCount(); got != 0 {
+				t.Errorf("CheckRepoAccess call count = %d, want 0 (CheckCreatorGuard/getToken must deny before SourceControl is ever reached)", got)
+			}
+			assertImageDecisionEvent(ctx, t, pool, sessionID, imagedecision.ReasonRepoAccessDenied, "", sb.Gen)
+		})
+	}
 }
 
 // waitForImageDecision polls sandboxStore.Get until image_decision_reason
@@ -497,10 +606,20 @@ func waitForImageDecision(ctx context.Context, t *testing.T, pool *pgxpool.Pool,
 
 // assertImageDecisionEvent polls the session's own event log for exactly
 // one "image_decision" event whose payload's own "reason" field matches
-// want, and -- when wantFingerprint is non-empty -- whose "fingerprint"
-// field matches it too. Returns the decoded payload so callers needing
-// more (built_repo_shas) can inspect it further.
-func assertImageDecisionEvent(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID, want imagedecision.Reason, wantFingerprint string) map[string]any {
+// want (the EVENT's own reason -- audit fix A2, "warm-boot decision
+// disclosure": this is participantVisibleReason's own coarsened form for
+// the three disclosing reasons, NOT necessarily the sandboxes column's
+// own precise value; callers testing one of those three pass
+// imagedecision.ReasonRepoAccessDenied here, not the precise reason), and
+// -- when wantFingerprint is non-empty -- whose "fingerprint" field
+// matches it too. Also asserts the payload's own "gen" field (audit fix
+// A4, "the append-only half cannot be attributed to a generation")
+// against wantGen -- every existing caller passes the SAME sandboxes row
+// (sqlcgen.Sandbox.Gen) waitForImageDecision already read back, rather
+// than a hardcoded literal, so this stays correct even if this package's
+// own gen-numbering ever changes. Returns the decoded payload so callers
+// needing more (built_repo_shas) can inspect it further.
+func assertImageDecisionEvent(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID, want imagedecision.Reason, wantFingerprint string, wantGen int32) map[string]any {
 	t.Helper()
 	eventStore := narvipg.NewEventStore(pool)
 
@@ -533,6 +652,13 @@ func assertImageDecisionEvent(ctx context.Context, t *testing.T, pool *pgxpool.P
 		if got, _ := matched["fingerprint"].(string); got != wantFingerprint {
 			t.Errorf(`image_decision event payload["fingerprint"] = %q, want %q`, got, wantFingerprint)
 		}
+	}
+	gotGen, ok := matched["gen"].(float64)
+	if !ok {
+		t.Fatalf(`image_decision event payload["gen"] = %v (%T), want a JSON number`, matched["gen"], matched["gen"])
+	}
+	if int32(gotGen) != wantGen {
+		t.Errorf(`image_decision event payload["gen"] = %v, want %d`, gotGen, wantGen)
 	}
 	return matched
 }

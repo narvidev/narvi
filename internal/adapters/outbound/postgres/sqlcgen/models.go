@@ -643,6 +643,7 @@ const (
 	ImageDecisionReasonImageBuildPending               ImageDecisionReason = "image_build_pending"
 	ImageDecisionReasonImageBuildNotReady              ImageDecisionReason = "image_build_not_ready"
 	ImageDecisionReasonImageBuildReadyRowMissingRef    ImageDecisionReason = "image_build_ready_row_missing_ref"
+	ImageDecisionReasonUnrecognized                    ImageDecisionReason = "unrecognized"
 )
 
 func (e *ImageDecisionReason) Scan(src interface{}) error {

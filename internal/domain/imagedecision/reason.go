@@ -16,25 +16,56 @@
 //
 // Reason is a defined string type, not a sealed sum type -- Go has no
 // exhaustiveness checking for that shape, so nothing stops a stray
-// imagedecision.Reason("typo") from compiling. Two independent backstops
-// close that gap, deliberately, rather than relying on convention alone:
+// imagedecision.Reason("typo") from compiling. Four mechanisms take
+// different, non-overlapping bites out of that gap -- each is pinned by
+// a specific test or analyzer named below, and NONE of them alone closes
+// it (an earlier version of this comment claimed "two independent
+// backstops" and overstated both of the two it named -- this is the
+// corrected, precise account, one symbol at a time):
 //
-//  1. migrations/000139_sandboxes_image_decision.up.sql persists this
+//  1. Every return path in decideImage/repoAccessAllowedForSpawn
+//     (imageresolve.go -- NOT resolveAndSetImage, which itself returns
+//     nothing at all) is typed to return a Reason as a POSITIONAL,
+//     unnamed return value -- Go refuses to compile a bare `return` in a
+//     function with unnamed return types, so a new early-return branch
+//     cannot be added without supplying SOME Reason value at that exact
+//     call site. This guarantees a Reason is SUPPLIED; it says nothing
+//     about whether the value supplied is one All() (below) actually
+//     lists -- that gap is left wide open by this mechanism alone, and
+//     is what points 2 and 3 below close.
+//  2. tools/lint/narvichecks/reasoncoverage's own Analyzer (run by `make
+//     lint`) walks every Reason-typed constant declared in this
+//     package's own const block and fails the build if one is absent
+//     from All(). This is what makes a ONE-SIDED EDIT -- a new Reason
+//     constant, returned from a real call site, but never added to
+//     All() -- a CI failure at the point the constant is declared,
+//     rather than a silent Postgres enum rejection discovered later. See
+//     that Analyzer's own doc comment for exactly what it does and does
+//     not catch: it is a BUILD-time check over this package's own
+//     source, so it cannot see a Reason value constructed any way other
+//     than a package-level constant declared here.
+//  3. persistImageDecisionBestEffort's own validatedPersistReason
+//     (imageresolve.go) is the RUNTIME backstop for whatever point 2's
+//     build-time check cannot see: any Reason not found in All(), for
+//     any reason, is substituted with ReasonUnrecognized -- itself
+//     always a member of All() -- before ever reaching the write, and
+//     logged at Error. Without this, a value outside All() reaching the
+//     ENUM-typed sandboxes.image_decision_reason column fails the whole
+//     persisting transact and silently drops both the column write and
+//     the bundled event-log entry -- the exact failure mode points 1 and
+//     2 above do not, by themselves, prevent.
+//  4. migrations/000139_sandboxes_image_decision.up.sql persists this
 //     exact vocabulary as a REAL Postgres ENUM
-//     (sandboxes.image_decision_reason) -- a value outside this closed set
-//     is rejected by the database itself, not merely by a Go switch
+//     (sandboxes.image_decision_reason) -- a value outside this closed
+//     set is rejected by the database itself, not merely by a Go switch
 //     someone could forget to update. All() (below) is the single source
 //     both that migration's own value list and
 //     imagedecision_integration_test.go's own drift check are written
 //     against, so the two can never silently diverge without a failing
-//     test.
-//  2. Every return path in resolveAndSetImage/repoAccessAllowedForSpawn
-//     (imageresolve.go) is typed to return a Reason as a POSITIONAL,
-//     unnamed return value -- Go refuses to compile a bare `return` in a
-//     function with unnamed return types, so a new early-return branch
-//     cannot be added without supplying some Reason value at that exact
-//     call site. See imageresolve.go's own top comment for why this,
-//     rather than a lint rule, is the enforcement mechanism.
+//     test. Point 3 above is meant to make this particular rejection
+//     unreachable in practice; the schema constraint stays regardless,
+//     as defense in depth, not as the only thing standing between an
+//     invalid value and a lost record.
 package imagedecision
 
 // Reason is the closed vocabulary itself. Every value is a real, persisted
@@ -142,6 +173,20 @@ const (
 	// returned ErrNoRows (no row yet for this fingerprint), and json.Marshal of the
 	// normalized repo-url map -- the best-effort pending-row tracking
 	// write's own input -- failed.
+	//
+	// UNREACHABLE today, on purpose, and this is not a merely-theoretical
+	// disclaimer: json.Marshal's only argument at this value's one
+	// producer (upsertPendingImageBuildBestEffort, imageresolve.go) is a
+	// map[string]string, and encoding/json cannot fail to marshal a
+	// map[string]string -- every key and value is already a valid JSON
+	// string, there is no cycle to detect, and no unsupported type to
+	// reject. Kept, rather than removed, as defensive handling for if
+	// that call site's own input type ever stops being a plain
+	// map[string]string (e.g. gains a value type json.Marshal genuinely
+	// can reject) -- at which point this branch becomes reachable without
+	// anyone having to notice and add a new Reason for it. Of All()'s 22
+	// persisted values, this is the one not reachable through any call
+	// site as the code stands today.
 	ReasonImageBuildTrackingMarshalFailed Reason = "image_build_tracking_marshal_failed"
 
 	// ReasonImageBuildTrackingUpsertFailed reports that image_builds.Get
@@ -171,11 +216,27 @@ const (
 	// glance instead of one silently masquerading as the other.
 	ReasonImageBuildReadyRowMissingRef Reason = "image_build_ready_row_missing_ref"
 
+	// ReasonUnrecognized is persistImageDecisionBestEffort's own (imageresolve.go)
+	// designated in-vocabulary fallback -- see this package's own top "# Why
+	// a closed Go vocabulary is not enough by itself" comment, point 3.
+	// validatedPersistReason substitutes it for any Reason value that is
+	// not one of All()'s own members before that value ever reaches the
+	// ENUM-typed sandboxes.image_decision_reason column, logging the
+	// original (invalid) value at Error. Reachable in production only if
+	// a future change adds a new Reason constant to this package without
+	// also adding it to All() -- tools/lint/narvichecks/reasoncoverage's
+	// own Analyzer exists specifically to catch that one-sided edit
+	// before it ships, so in a correctly-linted build this is expected to
+	// be as unreachable as ReasonRepoAccessCreatorGuardUnknown already is
+	// -- defensive, should-be-unreachable, denied/substituted regardless,
+	// never a silent fall-through.
+	ReasonUnrecognized Reason = "unrecognized"
+
 	// ReasonNone is NEVER persisted -- see this package's own top comment.
 	// repoAccessAllowedForSpawn returns it alongside allowed=true, the one
 	// case where its own Reason return value is meaningless and the
 	// caller must ignore it. Deliberately excluded from All(): the
-	// Postgres enum this package's other 21 values populate
+	// Postgres enum this package's other 22 values populate
 	// (migrations/000139_sandboxes_image_decision.up.sql) has NO
 	// 'none'/'not_applicable' member, on purpose -- if a future bug ever
 	// did try to persist ReasonNone, the enum-typed column write fails
@@ -215,5 +276,6 @@ func All() []Reason {
 		ReasonImageBuildPending,
 		ReasonImageBuildNotReady,
 		ReasonImageBuildReadyRowMissingRef,
+		ReasonUnrecognized,
 	}
 }

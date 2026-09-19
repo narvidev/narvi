@@ -22,12 +22,14 @@ func TestAll_NoDuplicatesAndExcludesNone(t *testing.T) {
 		}
 		seen[r] = true
 	}
-	// 21 persisted values, per this package's own const block: ReasonSelected
-	// plus 20 fallback reasons. Pinned as a literal count (not just
-	// len(All()) > 0) so an accidental removal is caught here, in a pure
-	// unit test, rather than only surfacing later as a Postgres enum/Go
-	// vocabulary drift.
-	const wantCount = 21
+	// 22 persisted values, per this package's own const block: ReasonSelected
+	// plus 21 fallback reasons (including ReasonUnrecognized, the
+	// designated fallback persistImageDecisionBestEffort substitutes for
+	// a Reason outside this vocabulary -- see that constant's own doc
+	// comment). Pinned as a literal count (not just len(All()) > 0) so an
+	// accidental removal is caught here, in a pure unit test, rather than
+	// only surfacing later as a Postgres enum/Go vocabulary drift.
+	const wantCount = 22
 	if got := len(All()); got != wantCount {
 		t.Fatalf("len(All()) = %d, want %d", got, wantCount)
 	}

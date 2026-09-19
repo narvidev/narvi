@@ -22,25 +22,51 @@
 -- schema-level enum constraint, not prose asserting a Go switch is
 -- exhaustive, is what keeps that count meaningful: a future write that
 -- passes anything outside this closed set is rejected by Postgres itself,
--- not merely by convention. internal/domain/imagedecision's own package
--- doc comment states the twin obligation this creates: the Go vocabulary
--- and this enum's value set must never drift apart, and an integration
--- test (imagedecision_integration_test.go) reads this enum's real,
--- live pg_enum labels back and diffs them against the Go constant list on
--- every run, so a one-sided edit fails CI rather than silently drifting.
+-- not merely by convention.
 --
--- Nullable, on BOTH new columns: NULL means "no decision has been
--- recorded for this sandbox row's CURRENT gen yet" -- distinct from every
--- real value, including image_decision_reason = 'selected'. This is the
--- ordinary state for every pre-existing sandboxes row (created before
--- this migration), for a sandbox that has never reached
--- resolveAndSetImage (e.g. a resume, which this function is never called
--- for -- dispatch.go's own doc comment), and for the brief window between
--- UpsertSandboxForSpawn's own gen bump and resolveAndSetImage's later
--- write for that same gen. NULL must never be read as "cold boot" or as
--- "warm boot" -- it is "unknown", the same non-committal zero value
--- agent_version/image_digest (migrations/000120_sandboxes_boot_
--- fingerprint.up.sql) already established for this exact table.
+-- Two DIFFERENT one-sided edits can drift this enum from
+-- internal/domain/imagedecision.All(), and two DIFFERENT guards, pinned
+-- by two different symbols, catch them -- see that package's own doc
+-- comment for the full four-mechanism account this is a part of:
+--   * This migration's own value list changes without All() following
+--     (or vice versa): imagedecision_integration_test.go's own
+--     TestImageDecisionReasonEnum_MatchesGoVocabulary reads this enum's
+--     real, live pg_enum labels back and diffs them against All() on
+--     every run against a real Postgres instance.
+--   * A new Reason constant is added to that package's own const block
+--     but never added to All() (so this migration's own value list has
+--     no way to know it should change at all): that is a Go-only, build-
+--     time problem this migration cannot see by construction -- closed
+--     instead by tools/lint/narvichecks/reasoncoverage's own Analyzer
+--     (run by `make lint`), which fails the build the moment such a
+--     constant is declared.
+--
+-- Nullable, on BOTH new columns, but NOT with identical meaning:
+--   * image_decision_reason: NULL means "no decision has been recorded
+--     for this sandbox row's CURRENT gen yet" -- distinct from every real
+--     value, including 'selected'.
+--   * image_decision_fingerprint: NULL means EITHER of two things --
+--     "no decision recorded for this gen yet" (the same case as above),
+--     OR "a decision WAS recorded, but there was nothing to fingerprint"
+--     (imagedecision.ReasonNoRepos, the one outcome with zero configured
+--     repos -- see resolveAndSetImage's own top-of-function bare return,
+--     imageresolve.go). A NULL fingerprint therefore does NOT by itself
+--     imply no decision was recorded; check image_decision_reason for
+--     that. queries/sandboxes.sql's own UpdateSandboxImageDecision
+--     comment and imagedecision_integration_test.go's own
+--     TestResolveAndSetImage_NoRepos_PersistsNoReposReason both already
+--     depend on exactly this narrower reading.
+--
+-- Both columns are the ordinary state for every pre-existing sandboxes
+-- row (created before this migration), for a sandbox that has never
+-- reached resolveAndSetImage (e.g. a resume, which this function is
+-- never called for -- dispatch.go's own doc comment), and for the brief
+-- window between UpsertSandboxForSpawn's own gen bump and
+-- resolveAndSetImage's later write for that same gen. NULL must never be
+-- read as "cold boot" or as "warm boot" on either column -- it is
+-- "unknown", the same non-committal zero value agent_version/image_digest
+-- (migrations/000120_sandboxes_boot_fingerprint.up.sql) already
+-- established for this exact table.
 --
 -- Reset to NULL on every respawn (queries/sandboxes.sql's own
 -- UpsertSandboxForSpawn, ON CONFLICT branch) for the identical reason
@@ -56,10 +82,16 @@
 -- §6.3's existing GET .../events REST route) with no schema or route
 -- change of its own, exactly the "reusing the existing collection and
 -- event log rather than adding a surface" instruction this migration
--- exists to satisfy. These two new sandboxes columns are the CURRENT-value
--- half of that pair (cheap to read without scanning the event log),
--- mirroring agent_version/image_digest's own identical role for the boot
--- fingerprint.
+-- exists to satisfy. These two new sandboxes columns mirror
+-- agent_version/image_digest's own "per-gen fact on the sandboxes row"
+-- STORAGE shape exactly (same table, same respawn-reset rule) -- but NOT
+-- their READABILITY: agent_version/image_digest are read back and
+-- rendered by a client today (internal/adapters/inbound/wshub's own
+-- dispatch/client wiring); nothing reads these two columns back through
+-- any REST/DTO/WS surface, so "cheap to read without scanning the event
+-- log" is true only for direct SQL/operator access, not for a client --
+-- a client wanting this decision has only the event log to read, exactly
+-- like every other reader of it.
 CREATE TYPE image_decision_reason AS ENUM (
     'selected',
     'no_repos',
@@ -81,7 +113,8 @@ CREATE TYPE image_decision_reason AS ENUM (
     'image_build_tracking_upsert_failed',
     'image_build_pending',
     'image_build_not_ready',
-    'image_build_ready_row_missing_ref'
+    'image_build_ready_row_missing_ref',
+    'unrecognized'
 );
 
 ALTER TABLE sandboxes ADD COLUMN image_decision_reason image_decision_reason;
