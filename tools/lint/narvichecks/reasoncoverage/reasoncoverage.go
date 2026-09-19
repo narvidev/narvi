@@ -15,9 +15,10 @@
 // length and contents, unchanged by the new constant), and passed the
 // drift test (which only compares All() against pg_enum, and All() was
 // not touched) -- reaching production having been checked by nothing,
-// and failing at runtime with a Postgres "invalid input value for enum"
-// error that rolled back the whole persisting transact, silently
-// dropping the record.
+// and mis-bucketing at runtime: validatedPersistReason substitutes
+// ReasonUnrecognized, so the record survives but attributes that whole
+// decision class to the wrong bucket, indistinguishable from any other
+// vocabulary bug.
 //
 // This Analyzer removes that possibility from the type of mistake it is:
 // every Reason-typed constant declared in the imagedecision package's own
@@ -41,10 +42,13 @@ sealed sum type: nothing in Go stops a new Reason constant from being
 declared, and returned from a real call site, without ever being added to
 All() -- the single source both the Postgres ENUM migration and the
 live-database drift test are written against. A one-sided edit like that
-compiles, vets, and lints clean today, and fails only at runtime, as a
-Postgres enum rejection that rolls back the whole persisting transact and
-silently drops the record. This check reports the missing constant at
-its own declaration, before any of that can happen.`
+compiles, vets, and lints clean today. At runtime
+persistImageDecisionBestEffort's own validatedPersistReason
+(internal/app/sessionactor/imageresolve.go) substitutes ReasonUnrecognized
+before the write reaches the Postgres enum, so the record survives -- but
+that whole decision class is then indistinguishable from any other
+vocabulary bug. This check reports the missing constant at its own
+declaration, before either can happen.`
 
 // Analyzer reports any exported-or-unexported constant of type Reason,
 // declared in a package named "imagedecision", that this package's own
