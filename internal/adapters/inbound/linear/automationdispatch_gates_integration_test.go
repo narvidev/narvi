@@ -326,3 +326,63 @@ func TestWebhookHandler_AutomationDispatchDeniesNonUserActorWithUnauthorizedCrea
 		t.Error("CreatorUnauthorizedSince.Valid = true, want false (W2 audit fix: this automation's own creator authorization is never evaluated for a non-\"user\" actor any more, so nothing should mark it)")
 	}
 }
+
+// TestWebhookHandler_AutomationDispatchDeniesNonUserActorEvenWhenActorIDIsLinkedAndAuthorized
+// is Y3 audit fix's own required, missing proof. Both
+// Test...NonUserActor... tests above use an actor id with NO identities
+// row at all, so they pass identically with the machine-origin denial
+// (automationdispatch.go's own `known && origin ==
+// domainautomation.LinearEventOriginMachine` branch) replaced by
+// `_ = actorType` -- the human-actor gate a few lines below (LookupLinkedUserID
+// + actorauthz.AuthorizeLinkedActor) denies the unlinked id anyway, for an
+// entirely different reason, so neither test can tell "denied because
+// non-user" apart from "denied because unlinked". A verifier proved this
+// directly against that exact mutant: both tests above, and the whole
+// package's own integration suite, still passed.
+//
+// This test supplies the one fixture that actually distinguishes the two
+// code paths: a non-"user" actor.type whose id IS linked to a genuinely
+// authorized Narvi user (linkLinearIdentityForTest, identity_integration_
+// test.go -- the SAME helper TestWebhookHandler_AutomationDispatchFiresOnRealWebhook
+// uses for its own positive case, just with actor.type set to something
+// other than "user"). With the machine-origin gate intact, this must still
+// deny (0 invocations): D-07 (docs/DECISIONS.md) is unconditional on
+// actor.type, never contingent on whether that id happens to resolve to an
+// authorized user. Delete the gate instead, and this exact fixture falls
+// through to the human-actor gate below, which WOULD find it linked and
+// authorized, and WOULD dispatch -- the reproduction that motivated this
+// test: HEAD gives 0 invocations, a `_ = actorType` mutant gives 1.
+func TestWebhookHandler_AutomationDispatchDeniesNonUserActorEvenWhenActorIDIsLinkedAndAuthorized(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+
+	automations := narvipg.NewAutomationStore(pool)
+	invocations := narvipg.NewAutomationInvocationStore(pool)
+	target := domainautomation.Target{Name: "repo", URL: "https://github.com/narvidev/narvi"}
+	auto := createLinearAutomation(ctx, t, automations, "on ENG issue create (non-user actor, linked and authorized)", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG", OrganizationID: "org-automation-dispatch"}, target)
+
+	deps := newHandlerDeps(t, pool)
+	deps.Automations = automations
+	deps.AutomationInvocations = invocations
+	installLinearFixture(ctx, t, pool, "org-automation-dispatch", deps.TokenEncryptionKey)
+	deps.IdentityLink = newIdentityLinkDepsForTest(pool, deps.AuditLog)
+
+	const linearActorID = "linear-integration-actor-linked-1"
+	// The distinguishing fixture: THIS actor id, unlike both tests above,
+	// IS linked to a genuinely authorized user -- the human-actor gate
+	// below would allow it through, if it were ever reached.
+	linkLinearIdentityForTest(ctx, t, pool, linearActorID, sqlcgen.UserRoleMaintainer)
+
+	handler := linear.NewWebhookHandler(deps)
+
+	// actor.type "application" -- NOT "user". Mirrors the two tests above's
+	// own reasoning for using an invented, non-"user" stand-in value.
+	rec := postWebhookEventType(t, handler, issueEventPayloadWithActorType("ENG", linearActorID, "application"), "delivery-linear-non-user-linked-1", "Issue")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	if got := countAutomationInvocations(t, pool, auto.ID); got != 0 {
+		t.Fatalf("automation_invocations = %d, want 0 (a non-\"user\" actor must be denied outright regardless of whether its id happens to be linked and authorized -- D-07, docs/DECISIONS.md, is unconditional on actor.type)", got)
+	}
+}

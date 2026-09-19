@@ -51,7 +51,7 @@ var automationDispatchDroppedTotalCounter = sync.OnceValue(newAutomationDispatch
 func newAutomationDispatchDroppedTotalCounter() metric.Int64Counter {
 	c, err := otel.Meter(automationDispatchMeterName).Int64Counter(
 		"automation_dispatch_dropped_total",
-		metric.WithDescription("Count of every automation dispatch attempt (a specific automation matched a live GitHub/Linear webhook delivery's trigger) abandoned because platform.Timeouts.AutomationDispatchTotalBudget ran out before its own throttle-check or create-invocation call could complete -- W4 audit fix. This drop is PERMANENT (the delivery's own claim is already taken; no redelivery or reconciler reaches it again), unlike an ordinary transient Postgres error, which platform.Retry already self-heals within the same request. Tagged by the \"stage\" attribute (\"throttle_check\" | \"create\") naming which of the two remaining Postgres calls the budget ran out on."),
+		metric.WithDescription("Count of every automation dispatch attempt (a specific automation matched, or -- for the \"list\" stage, WOULD have matched, a live GitHub/Linear webhook delivery's trigger) abandoned because platform.Timeouts.AutomationDispatchTotalBudget ran out before its own list, throttle-check, or create-invocation call could complete -- W4 audit fix, \"list\" stage added by Y2 audit fix. This drop is PERMANENT (the delivery's own claim is already taken; no redelivery or reconciler reaches it again), unlike an ordinary transient Postgres error, which platform.Retry already self-heals within the same request. Tagged by the \"stage\" attribute (\"list\" | \"throttle_check\" | \"create\") naming which Postgres call the budget ran out on -- \"list\" fires at most once per delivery and stands for every automation that delivery would have matched, since the list that would have named them never completed."),
 		metric.WithUnit("{automation}"),
 	)
 	if err != nil {
@@ -66,14 +66,19 @@ func newAutomationDispatchDroppedTotalCounter() metric.Int64Counter {
 }
 
 // recordAutomationDispatchDropped increments the drop counter by one --
-// called from checkDispatchThrottle's own dispatchGateBudgetExhausted
-// branch (stage "throttle_check") and from dispatchOneGitHubAutomation/
+// called from DispatchGitHubWebhookEvent/DispatchLinearWebhookEvent's own
+// list-call dispatchBudgetExhausted(err) branch (stage "list",
+// githubdispatch.go/lineardispatch.go -- Y2 audit fix: the shared budget
+// expiring HERE drops every automation that delivery would have matched,
+// not one, since the list that would have named them never completed),
+// from checkDispatchThrottle's own dispatchGateBudgetExhausted branch
+// (stage "throttle_check") and from dispatchOneGitHubAutomation/
 // dispatchOneLinearAutomation's own create-call dispatchBudgetExhausted(err)
-// branch (stage "create"), githubdispatch.go/lineardispatch.go -- the two,
-// and only two, places a dispatch attempt is abandoned specifically
-// because the shared budget expired, as opposed to a genuine business
-// verdict (no match, throttled, denied) or an ordinary Postgres error
-// platform.Retry already retried through.
+// branch (stage "create"), githubdispatch.go/lineardispatch.go -- the
+// three, and only three, places a dispatch attempt is abandoned
+// specifically because the shared budget expired, as opposed to a genuine
+// business verdict (no match, throttled, denied) or an ordinary Postgres
+// error platform.Retry already retried through.
 func recordAutomationDispatchDropped(ctx context.Context, stage string) {
 	automationDispatchDroppedTotalCounter().Add(ctx, 1, metric.WithAttributes(attribute.String("stage", stage)))
 }

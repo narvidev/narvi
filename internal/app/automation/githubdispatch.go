@@ -205,7 +205,19 @@ func DispatchGitHubWebhookEvent(ctx context.Context, logger *slog.Logger, automa
 		return err
 	})
 	if retryErr != nil {
-		logger.Error("automation: list active github automations failed", "error", retryErr)
+		if dispatchBudgetExhausted(retryErr) {
+			// Y2 audit fix (confirmed MEDIUM finding: "the drop counter
+			// misses the drop with the largest blast radius"): the shared
+			// budget expiring HERE, before the automation list is even
+			// read, drops EVERY automation that would have matched this
+			// delivery -- not one, like the throttle_check/create stages
+			// below. See recordAutomationDispatchDropped's own doc comment
+			// (dispatchmetrics.go) for why this is a third, distinct stage.
+			logger.Warn("automation: list active github automations: total time budget exhausted before this call could complete, skipping every matching automation for this delivery (fail closed) -- NOT a throttle decision, see platform.Timeouts.AutomationDispatchTotalBudget", "reason", "dispatch_budget_exhausted", "error", retryErr)
+			recordAutomationDispatchDropped(ctx, "list")
+		} else {
+			logger.Error("automation: list active github automations failed", "error", retryErr)
+		}
 		return
 	}
 

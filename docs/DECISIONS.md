@@ -187,6 +187,21 @@ must not be assimilated into the upload system without a decision.
 happens to each on a failed or cancelled capture — four quantities that interact, and a design that
 names only two of them will be wrong at the boundary.
 
+### D-05 — Browser-side error capture, user feedback, and session replay — **ADOPTED 2026-09-17, both halves** — errors and feedback at Step 185, replay at Step 186
+
+**The question.** Whether front-end error capture and user feedback complement the existing
+OTel/OTLP foundation — and, **separately**, whether session replay is adopted.
+
+**Why it cannot be defaulted.** Server traces and metrics do not cover browser-side failures; the
+existing instrumentation is not partial coverage of this, it is coverage of something else.
+
+**What adoption costs.** For errors and feedback: a configurable endpoint, source maps, and
+association with the correct release — a stack trace that cannot be symbolicated against the
+release it came from is a diagnostic that reads as present and is not. For replay: masking, an
+activation decision, and where the data goes per deployment. A shared collection project and
+unmasked replay are not defaults to inherit; they are choices, and the second one is a choice about
+other people's data.
+
 ### D-06 — Triage events from unlinked/unauthorized GitHub or Linear actors — **DEFERRED 2026-09-18** — see the Deferred table above for what reopens it
 
 **The question.** An adversarial review of live automation dispatch (§8.4) found that ANY GitHub
@@ -295,19 +310,6 @@ request path, against whatever delivery history this deployment retains. Until e
 `automation_dispatch_dropped_total` is the honest, shipped mitigation: a drop is now OBSERVABLE
 (alertable via `AutomationDispatchDroppedAny`, deploy/observability/alerts/reliability.json), never
 retried.
-
-**The question.** Whether front-end error capture and user feedback complement the existing
-OTel/OTLP foundation — and, **separately**, whether session replay is adopted.
-
-**Why it cannot be defaulted.** Server traces and metrics do not cover browser-side failures; the
-existing instrumentation is not partial coverage of this, it is coverage of something else.
-
-**What adoption costs.** For errors and feedback: a configurable endpoint, source maps, and
-association with the correct release — a stack trace that cannot be symbolicated against the
-release it came from is a diagnostic that reads as present and is not. For replay: masking, an
-activation decision, and where the data goes per deployment. A shared collection project and
-unmasked replay are not defaults to inherit; they are choices, and the second one is a choice about
-other people's data.
 
 ## Recording an outcome
 

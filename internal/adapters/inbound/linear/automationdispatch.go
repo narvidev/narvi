@@ -254,7 +254,7 @@ func dispatchAutomationsBestEffort(ctx context.Context, logger *slog.Logger, dep
 	// path. The functional cost -- a genuinely machine-originated Linear
 	// event (if Linear ever exposes one this deployment could distinguish
 	// STRUCTURALLY, the way check_run/status are) cannot fire an
-	// automation today -- is recorded in docs/DECISIONS.md's D-06 entry,
+	// automation today -- is recorded in docs/DECISIONS.md's D-07 entry,
 	// with an evaluable reopen condition, rather than silently accepted.
 	// dispatchOneLinearAutomation (lineardispatch.go) no longer carries
 	// any per-automation, creator-authorizing machine-origin gate at all
@@ -268,7 +268,7 @@ func dispatchAutomationsBestEffort(ctx context.Context, logger *slog.Logger, dep
 	// own "anything not explicitly classified Machine falls through to the
 	// human-origin sender check" precedent.
 	if origin, known := domainautomation.ClassifyLinearActorOrigin(actorType); known && origin == domainautomation.LinearEventOriginMachine {
-		logger.Info("linear: automation dispatch: actor reported as non-\"user\" origin, denied -- fail closed (no structural equivalent of GitHub's event-type split observed for Linear, see docs/DECISIONS.md D-06)", "event_type", eventType, "reason", "linear_machine_origin_not_authorized")
+		logger.Info("linear: automation dispatch: actor reported as non-\"user\" origin, denied -- fail closed (no structural equivalent of GitHub's event-type split observed for Linear, see docs/DECISIONS.md D-07)", "event_type", eventType, "reason", "linear_machine_origin_not_authorized")
 		return
 	}
 

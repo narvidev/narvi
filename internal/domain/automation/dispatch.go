@@ -222,7 +222,7 @@ func ClassifyGitHubDispatch(eventType string) GitHubDispatchSkipReason {
 // dispatchOneLinearAutomation (lineardispatch.go) carries no per-
 // automation, creator-authorizing machine-origin gate at all -- unlike
 // GitHub, which still legitimately needs and keeps one. See
-// docs/DECISIONS.md's D-06 entry for the resulting, accepted functional
+// docs/DECISIONS.md's D-07 entry for the resulting, accepted functional
 // limitation (a genuinely machine-originated Linear event, if Linear ever
 // gains one this deployment could distinguish structurally, cannot fire an
 // automation today) and its reopen condition.

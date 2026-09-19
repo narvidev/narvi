@@ -110,7 +110,7 @@ const linearDeliveryProvider = "linear"
 // actor (or the "actor deleted, origin unknown" case, which was always
 // routed through the ordinary human-actor gate). There is therefore
 // nothing left for a per-automation gate here to do: no actorType/users
-// parameter, no machine-origin branch. See docs/DECISIONS.md's D-06 entry
+// parameter, no machine-origin branch. See docs/DECISIONS.md's D-07 entry
 // for the resulting, accepted functional limitation and its reopen
 // condition, and domain/automation/dispatch.go's own LinearEventOrigin doc
 // comment for the full "why".
@@ -147,7 +147,19 @@ func DispatchLinearWebhookEvent(ctx context.Context, logger *slog.Logger, automa
 		return err
 	})
 	if retryErr != nil {
-		logger.Error("automation: list active linear automations failed", "error", retryErr)
+		if dispatchBudgetExhausted(retryErr) {
+			// Y2 audit fix, mirroring DispatchGitHubWebhookEvent's own
+			// identical fix (githubdispatch.go): the shared budget expiring
+			// HERE, before the automation list is even read, drops EVERY
+			// automation that would have matched this delivery -- not one,
+			// like the throttle_check/create stages below. See
+			// recordAutomationDispatchDropped's own doc comment
+			// (dispatchmetrics.go) for why this is a third, distinct stage.
+			logger.Warn("automation: list active linear automations: total time budget exhausted before this call could complete, skipping every matching automation for this delivery (fail closed) -- NOT a throttle decision, see platform.Timeouts.AutomationDispatchTotalBudget", "reason", "dispatch_budget_exhausted", "error", retryErr)
+			recordAutomationDispatchDropped(ctx, "list")
+		} else {
+			logger.Error("automation: list active linear automations failed", "error", retryErr)
+		}
 		return
 	}
 
