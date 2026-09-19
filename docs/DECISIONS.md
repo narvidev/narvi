@@ -63,6 +63,8 @@ whenever this file is opened to record a new decision.
 | A platform-supplied plugin mode (D-03) | 2026-09-17 | A repository needs a platform-pinned tool that the sandbox's own runtime configuration cannot supply. The cost that made deferral easy is the half that gets forgotten: convergence after restore — installing what is expected **and removing** what survives inside a snapshot (§35.5b) |
 | Deleting a prepared medium against its quota (D-04) | 2026-09-17 | A slot quota is actually wanted. It is a different resource from a byte quota, and whoever reopens this must name bytes, slots, video duration and cancelled captures together — a design naming two of the four is wrong at the boundary |
 | Triaging events from an unlinked/unauthorized GitHub or Linear actor via automation dispatch (D-06) | 2026-09-18 | Someone explicitly asks for "triage every new issue, including from outsiders" as a product capability **and** a separate, reviewed containment design exists for untrusted webhook payload text reaching an agent's prompt while that agent holds this deployment's repository credentials. This is not a flag flip: fail-closed is the ONLY thing standing between an anonymous internet actor and a sandboxed agent run today, and the untrusted-text-reaches-the-prompt path this batch traced (see PR body) is a prompt-injection surface, not a UX preference — containing it is separate work from authorizing the sender |
+| A Linear automation can never fire on a machine-reported (non-`"user"`) actor (D-07) | 2026-09-19 | Linear publishes, or this deployment otherwise directly observes against a real delivery, a confirmed, exhaustive register of `actor.type` wire values for non-human actors (today `ClassifyLinearActorOrigin` (internal/domain/automation/dispatch.go) only confirms `"user"`) **and** that register is structural rather than sender-chosen — e.g. tied to the event's own category the way GitHub's `check_run`/`status` are, not to which intake path (an Integration, Zapier, an email-to-issue form) happened to file the same "Issue"/"Comment" category. Absent both, denying is the only sound default: see D-06 above for why substituting a weaker authorization path here was the bug, not a feature |
+| A dispatch drop from a budget-exhausted delivery is visible, but not retried or reconciled (D-08) | 2026-09-19 | Inline webhook-request dispatch stops being this deployment's only live-dispatch path — e.g. an outbox-style deferred dispatch decoupling fan-out from the webhook request itself, mirroring how `Engine` (internal/app/automation/engine.go)'s own background pump already decouples invocation creation from fan-out. Until then, `recordAutomationDispatchDropped` (internal/app/automation/dispatchmetrics.go) is the mitigation, not the fix: it makes a permanent drop OBSERVABLE, it does not make dispatch retried, reconciled, or redelivered |
 
 ### Deferrals that live in a plan row
 
@@ -196,15 +198,22 @@ issue_comment, push) requires the event's own sender to already be a known, link
 identity; a MACHINE-originated event (check_run, status — GitHub itself is always the actor, never a
 human account, so a sender-based check is structurally unsatisfiable for these two) instead requires
 the automation's OWN creator to be that same known, linked, authorized identity — both reuse the SAME
-`actorauthz.AuthorizeLinkedActor` gate the pre-existing @mention pipeline already enforces, never a
-second, independently-invented check. For Linear, the event's own top-level `actor` (Linear's own
-"User, OAuth client, or Integration" field) is resolved via the SAME auto-linking algorithm the
-pre-existing AgentSessionEvent path already runs, then authorized through the identical
-`actorauthz.AuthorizeLinkedActor` gate — the sending workspace having an installation is tenant
-scoping, a separate, additional check, never a substitute for authorizing the actor who acted. That
-closes the hole, but it also forecloses a legitimate product shape — "triage every new issue,
-including one filed by someone who has never signed into Narvi" — that fail-closed cannot express.
-Whether to build an opt-in for that shape is the open question this entry defers.
+`AuthorizeLinkedActor` (internal/app/actorauthz/authorize.go) gate the pre-existing @mention pipeline
+already enforces, never a second, independently-invented check. For Linear, a human-origin actor (the
+event's own top-level `actor` field reporting `"user"`, Linear's own "User, OAuth client, or
+Integration" vocabulary) is resolved through `LookupLinkedUserID` (internal/app/identitylink/service.go)
+— a pure, side-effect-free lookup, never `Resolve` (internal/app/identitylink/service.go)'s own
+auto-linking algorithm the pre-existing AgentSessionEvent path still legitimately runs — then
+authorized through the identical `AuthorizeLinkedActor` (internal/app/actorauthz/authorize.go) gate;
+the sending workspace having an installation is tenant scoping, a separate, additional check, never a
+substitute for authorizing the actor who acted. A non-"user" (machine-reported) Linear actor is denied
+outright rather than authorized any other way — see D-07 below for that narrower, separate limitation
+and its own reopen condition (`ClassifyLinearActorOrigin` (internal/domain/automation/dispatch.go)
+names exactly what decides it). Fail-closed on an unauthorized/unlinked HUMAN actor, on both
+providers, closes the hole this entry is about, but it also forecloses a legitimate product shape —
+"triage every new issue, including one filed by someone who has never signed into Narvi" — that
+fail-closed cannot express. Whether to build an opt-in for that shape is the open question this entry
+defers.
 
 **Why it cannot be defaulted.** Fail-closed was the correct FIRST fix for a HIGH-severity,
 confirmed-exploitable gap — it is not the correct LAST word on what this deployment is allowed to
@@ -221,6 +230,70 @@ capability set for a run whose triggering actor is unauthenticated — reviewed 
 piece of work, not assumed as a side effect of relaxing D2's own gate. Until that exists, an opt-in
 here is a second copy of the exact vulnerability this batch just closed, wearing a configuration flag
 instead of a code path.
+
+### D-07 — Fire a Linear automation on a machine-reported (non-`"user"`) actor — **DEFERRED 2026-09-19** — see the Deferred table above for what reopens it
+
+**The question.** A second adversarial review of live automation dispatch (§8.4), this time of D-06's
+own fix, found that D-06's Linear half had reopened the exact class of gap it closed: it decided
+"human vs. machine origin" from `actor.type`, read by `buildLinearEventInput`
+(internal/adapters/inbound/linear/automationdispatch.go) — a per-payload field the SAME "Issue"/
+"Comment" event category carries either value for depending only on which intake path (a direct
+sign-in, an Integration, Zapier, a customer-facing form, email-to-issue) happened to file it — not a
+structural fact about the event the way GitHub's check_run/status are (`GitHubEventOrigin`
+(internal/domain/automation/dispatch.go) is keyed on the event TYPE, which the sender never
+supplies). The shipped fix, `ClassifyLinearActorOrigin` (internal/domain/automation/dispatch.go), now
+denies a `LinearEventOriginMachine` actor outright — `dispatchAutomationsBestEffort`
+(internal/adapters/inbound/linear/automationdispatch.go) returns without ever listing an automation —
+rather than authorizing it through the automation's own creator the way `GitHubEventOriginMachine`
+legitimately does. This entry defers the resulting functional gap: a genuinely machine-originated
+Linear event can never fire an automation today, even one whose creator is fully authorized.
+
+**Why it cannot be defaulted.** The creator-authorization substitute is sound for GitHub specifically
+because `check_run`/`status` are structurally impossible to originate from a human account — there is
+no sender identity that substitute could ever be bypassing. Linear has published no equivalent
+structural signal, and this deployment has never observed a real, confirmed wire value for a non-
+`"user"` `actor.type` (Linear's own docs name "OAuth client" and "Integration" as the two non-human
+kinds without giving their exact strings) — a security decision rebuilt on an unobserved external
+value would repeat the exact defect this entry exists to close. Denying is therefore the only sound
+default until BOTH conditions in the Deferred table row above are met.
+
+**What adoption costs.** A structural signal Linear actually publishes and this deployment can verify
+against a real delivery — not a fresh guess at another payload field to key on, which is what
+produced this defect the first time. Absent that, the honest, durable fix is the one already shipped:
+deny, and name the gap here rather than paper over it with a second unverified field.
+
+### D-08 — Retry or reconcile a budget-exhausted automation dispatch drop — **DEFERRED 2026-09-19** — see the Deferred table above for what reopens it
+
+**The question.** A live webhook delivery matching more automations than
+`AutomationDispatchTotalBudget` (internal/platform/timeouts.go) can fully retry, or hitting enough
+per-call Postgres latency, drops the remaining matching automations' own dispatch entirely — logged
+(`recordAutomationDispatchDropped` (internal/app/automation/dispatchmetrics.go), W4 audit fix's own
+visibility half) but never retried: the webhook delivery's own claim is already taken
+(`CreateInvocationForDelivery` (internal/app/automation/invocationenqueue.go)), so a provider
+redelivery returns at the duplicate check before dispatch ever runs again, and nothing reconciles
+`automation_invocations.source_delivery_id` against the set of automations that SHOULD have fired for
+it. Whether to build a retry/reconciliation mechanism for this specific gap is the open question this
+entry defers.
+
+**Why it cannot be defaulted.** Dispatch runs inline, on the webhook request path, specifically so a
+matching automation fires with the lowest possible latency and no separate worker to keep alive — see
+`DispatchGitHubWebhookEvent` (internal/app/automation/githubdispatch.go)'s and `DispatchLinearWebhookEvent`
+(internal/app/automation/lineardispatch.go)'s own doc comments. A design that must ALSO guarantee delivery for an unbounded number of matching
+automations per webhook needs dispatch off the request path entirely (an outbox-style deferred
+dispatch, mirroring how `Engine` (internal/app/automation/engine.go)'s own background pump already
+decouples invocation creation from fan-out) — a materially larger architectural change than adding a
+retry loop to the existing inline path, which could not by itself fix the ROOT cause (a request-path
+call is bounded by the provider's own webhook delivery timeout, full stop).
+
+**What adoption costs.** Either an outbox-style deferred-dispatch redesign (the honest fix, sized like
+a new Step, not a patch), or, as a narrower interim step, a periodic reconciler comparing each active
+automation's own trigger config against recent deliveries it should have matched — itself nontrivial,
+since "should have matched" requires re-deriving the SAME trigger-matching decision
+(`MatchesGitHubTrigger`/`MatchesLinearTrigger` (internal/domain/automation/trigger.go)) outside the
+request path, against whatever delivery history this deployment retains. Until either exists,
+`automation_dispatch_dropped_total` is the honest, shipped mitigation: a drop is now OBSERVABLE
+(alertable via `AutomationDispatchDroppedAny`, deploy/observability/alerts/reliability.json), never
+retried.
 
 **The question.** Whether front-end error capture and user feedback complement the existing
 OTel/OTLP foundation — and, **separately**, whether session replay is adopted.

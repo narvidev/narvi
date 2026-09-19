@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { Automation } from '@narvi/contracts/rest-dtos'
 
-import { AUTO_PAUSE_THRESHOLD, automationStatusTone, lastRunTone, nextRunSummary, runHealthLabel, runStatusTone, targetsSummary, triggerSummary } from '../automationFormat'
+import { AUTO_PAUSE_THRESHOLD, automationStatusTone, creatorUnauthorizedLabel, lastRunTone, nextRunSummary, runHealthLabel, runStatusTone, targetsSummary, triggerSummary } from '../automationFormat'
 
 function baseAutomation(overrides: Partial<Automation> = {}): Automation {
   return {
@@ -24,6 +24,7 @@ function baseAutomation(overrides: Partial<Automation> = {}): Automation {
     lastRunAt: null,
     lastRunStatus: null,
     artifactSummary: null,
+    creatorUnauthorizedSince: null,
     ...overrides,
   }
 }
@@ -107,6 +108,16 @@ describe('runHealthLabel', () => {
 
   it('returns null for undefined (the field absent on the wire entirely)', () => {
     expect(runHealthLabel(undefined)).toBeNull()
+  })
+})
+
+describe('creatorUnauthorizedLabel', () => {
+  it('returns null when creatorUnauthorizedSince is null (the healthy default -- this field is REQUIRED on the wire, unlike optional runHealth, so null is its only "absent" state)', () => {
+    expect(creatorUnauthorizedLabel(null)).toBeNull()
+  })
+
+  it('returns a non-null label once creatorUnauthorizedSince is set (W7 audit fix)', () => {
+    expect(creatorUnauthorizedLabel('2026-09-18T00:00:00Z')).not.toBeNull()
   })
 })
 

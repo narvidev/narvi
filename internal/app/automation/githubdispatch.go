@@ -263,7 +263,7 @@ func dispatchOneGitHubAutomation(ctx context.Context, logger *slog.Logger, autom
 	// human decision being honoured. row.CreatedBy is nullable (ON DELETE
 	// SET NULL, migrations/000051_automations.up.sql: "an automation, like
 	// a session, can outlive the user who created it") --
-	// actorauthz.AuthorizeLinkedActor denies immediately when it is
+	// actorauthz.AuthorizeLinkedActorVerdict denies immediately when it is
 	// invalid, exactly like an unlinked GitHub sender is denied on the
 	// human-origin path (internal/adapters/inbound/github's own
 	// dispatchAutomationsBestEffort). Human-originated events are
@@ -277,17 +277,43 @@ func dispatchOneGitHubAutomation(ctx context.Context, logger *slog.Logger, autom
 	// like every other actorauthz.AuthorizeLinkedActor/AuthorizeResolvedActor
 	// call site across this codebase (github/linear/slack's own identity.go
 	// files), none of which retry either.
+	//
+	// # W9 audit fix: an error is not a verdict
+	//
+	// Confirmed LOW finding: this call site used to test a plain bool
+	// (actorauthz.AuthorizeLinkedActor), so a genuine denial (the creator's
+	// account is disabled, or lacks authz.ActionCreateSession) and a
+	// TRANSIENT users.GetByID lookup failure both took the identical
+	// "mark creator_unauthorized_since" branch below -- a healthy,
+	// perfectly-authorized creator got PERMANENTLY recorded as unauthorized
+	// by one passing Postgres blip, logged with the same hardcoded
+	// reason="creator_unlinked_or_unauthorized" either way. Switching on
+	// actorauthz.LinkedActorVerdict (the SAME distinct-error-vs-verdict
+	// shape this file's own dispatchGateVerdict already applies to the
+	// throttle gate, U1) fixes it: only LinkedActorDenied -- authorization
+	// ran to completion and genuinely said no -- writes or clears the mark.
+	// LinkedActorError still fails this delivery CLOSED (no invocation is
+	// created either way, identical to before), it just does not touch
+	// creator_unauthorized_since at all: an unevaluated lookup says nothing
+	// about whether this creator is actually authorized, so neither
+	// marking NOR clearing it would be honest.
 	if origin, known := domainautomation.ClassifyGitHubEventOrigin(eventType); known && origin == domainautomation.GitHubEventOriginMachine {
-		if !actorauthz.AuthorizeLinkedActor(ctx, logger, githubAutomationAuthzSurface, users, row.CreatedBy, authz.ActionCreateSession, authz.Resource{}) {
+		switch verdict := actorauthz.AuthorizeLinkedActorVerdict(ctx, logger, githubAutomationAuthzSurface, users, row.CreatedBy, authz.ActionCreateSession, authz.Resource{}); verdict {
+		case actorauthz.LinkedActorAllowed:
+			// U8 audit fix: a machine-origin dispatch that JUST authorized
+			// means this automation's own creator is linked/authorized
+			// again -- clear any earlier denial's own mark (a no-op, one
+			// guarded UPDATE matching zero rows, when there was nothing to
+			// clear).
+			clearCreatorUnauthorizedBestEffort(ctx, logger, automations, row.ID)
+		case actorauthz.LinkedActorDenied:
 			logger.Info("automation: github dispatch: automation creator not authorized for a machine-originated event, skipping", "event_type", eventType, "reason", "creator_unlinked_or_unauthorized")
 			markCreatorUnauthorizedBestEffort(ctx, logger, automations, row.ID)
 			return
+		default: // actorauthz.LinkedActorError
+			logger.Error("automation: github dispatch: automation creator authorization lookup failed (transient), skipping this delivery without recording a verdict", "event_type", eventType, "reason", "creator_authz_lookup_error")
+			return
 		}
-		// U8 audit fix: a machine-origin dispatch that JUST authorized
-		// means this automation's own creator is linked/authorized again --
-		// clear any earlier denial's own mark (a no-op, one guarded UPDATE
-		// matching zero rows, when there was nothing to clear).
-		clearCreatorUnauthorizedBestEffort(ctx, logger, automations, row.ID)
 	}
 
 	targets, err := UnmarshalTargets(row.Repos)
@@ -321,6 +347,7 @@ func dispatchOneGitHubAutomation(ctx context.Context, logger *slog.Logger, autom
 	if err != nil {
 		if dispatchBudgetExhausted(err) {
 			logger.Warn("automation: create invocation for github dispatch: total time budget exhausted before this call could complete, skipping (fail closed) -- NOT a throttle decision, see platform.Timeouts.AutomationDispatchTotalBudget", "reason", "dispatch_budget_exhausted", "error", err, "event_type", eventType)
+			recordAutomationDispatchDropped(ctx, "create") // W4 audit fix, see dispatchmetrics.go
 		} else {
 			logger.Error("automation: create invocation for github dispatch failed", "error", err, "event_type", eventType)
 		}
@@ -370,12 +397,14 @@ func dispatchBudgetExhausted(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
 }
 
-// creatorUnauthorizedMarker is the narrow slice of GitHubTriggerLister/
-// LinearTriggerLister markCreatorUnauthorizedBestEffort/
-// clearCreatorUnauthorizedBestEffort (below) need -- shared VERBATIM
-// between both dispatch paths' own machine-origin gates
-// (dispatchOneGitHubAutomation here, dispatchOneLinearAutomation,
-// lineardispatch.go), U8 audit fix.
+// creatorUnauthorizedMarker is the narrow slice of GitHubTriggerLister
+// markCreatorUnauthorizedBestEffort/clearCreatorUnauthorizedBestEffort
+// (below) need -- U8 audit fix. Originally shared VERBATIM between both
+// dispatch paths' own machine-origin gates (dispatchOneGitHubAutomation
+// here, and dispatchOneLinearAutomation, lineardispatch.go); W2 audit fix
+// removed Linear's own per-automation machine-origin gate entirely (see
+// that function's own doc comment), so this is GitHub-only now -- the
+// interface itself is unchanged, only the set of real callers narrowed.
 type creatorUnauthorizedMarker interface {
 	MarkCreatorUnauthorized(ctx context.Context, id pgtype.UUID) (int64, error)
 	ClearCreatorUnauthorized(ctx context.Context, id pgtype.UUID) (int64, error)
@@ -385,9 +414,11 @@ type creatorUnauthorizedMarker interface {
 // U8 audit fix's own required surface (confirmed LOW finding: "a
 // machine-origin automation can become permanently dead with no way to
 // revive it... An automation that is active and structurally incapable of
-// firing is a lie in the product's own state"). Called from each
-// provider's own per-automation machine-origin gate, immediately after
-// its own actorauthz.AuthorizeLinkedActor verdict -- see migrations/
+// firing is a lie in the product's own state"). Called from GitHub's own
+// per-automation machine-origin gate (dispatchOneGitHubAutomation, the
+// only remaining caller after W2 -- see creatorUnauthorizedMarker's own
+// doc comment above), immediately after its own
+// actorauthz.AuthorizeLinkedActorVerdict result -- see migrations/
 // 000138_automations_creator_unauthorized.up.sql's own doc comment for
 // the full "why" this specific state (rather than re-attribution
 // tooling) is this fix's chosen scope.
@@ -431,6 +462,11 @@ func checkDispatchThrottle(ctx context.Context, logger *slog.Logger, invocations
 	if retryErr != nil {
 		if dispatchBudgetExhausted(retryErr) {
 			logger.Warn("automation: dispatch: total time budget exhausted before this automation's own recent-invocation count could complete, skipping (fail closed) -- NOT a throttle decision, see platform.Timeouts.AutomationDispatchTotalBudget", "reason", "dispatch_budget_exhausted", "error", retryErr)
+			// W4 audit fix: a budget-exhaustion drop is otherwise only this
+			// one Warn log line inside a best-effort dispatch lane, and the
+			// drop is PERMANENT (see dispatchmetrics.go's own doc comment)
+			// -- recorded so an operator has a real, alertable signal.
+			recordAutomationDispatchDropped(ctx, "throttle_check")
 			return dispatchGateBudgetExhausted
 		}
 		logger.Error("automation: count recent invocations for dispatch throttle failed, skipping (fail closed)", "error", retryErr)

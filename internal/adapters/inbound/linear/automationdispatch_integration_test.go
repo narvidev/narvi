@@ -90,7 +90,7 @@ func createLinearAutomation(ctx context.Context, t *testing.T, automations *narv
 		t.Fatalf("marshal repos: %v", err)
 	}
 	triggerConfigJSON, err := json.Marshal(map[string]string{
-		"eventType": cfg.EventType, "action": cfg.Action, "teamKey": cfg.TeamKey,
+		"eventType": cfg.EventType, "action": cfg.Action, "teamKey": cfg.TeamKey, "organizationId": cfg.OrganizationID,
 	})
 	if err != nil {
 		t.Fatalf("marshal trigger config: %v", err)
@@ -122,7 +122,7 @@ func TestWebhookHandler_AutomationDispatchFiresOnRealWebhook(t *testing.T) {
 	automations := narvipg.NewAutomationStore(pool)
 	invocations := narvipg.NewAutomationInvocationStore(pool)
 	target := domainautomation.Target{Name: "repo", URL: "https://github.com/narvidev/narvi"}
-	auto := createLinearAutomation(ctx, t, automations, "on ENG issue create", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG"}, target)
+	auto := createLinearAutomation(ctx, t, automations, "on ENG issue create", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG", OrganizationID: "org-automation-dispatch"}, target)
 
 	deps := newHandlerDeps(t, pool)
 	deps.Automations = automations
@@ -158,7 +158,7 @@ func TestWebhookHandler_AutomationDispatchDedupesRedeliveredDelivery(t *testing.
 	automations := narvipg.NewAutomationStore(pool)
 	invocations := narvipg.NewAutomationInvocationStore(pool)
 	target := domainautomation.Target{Name: "repo", URL: "https://github.com/narvidev/narvi"}
-	auto := createLinearAutomation(ctx, t, automations, "on ENG issue create (dedup)", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG"}, target)
+	auto := createLinearAutomation(ctx, t, automations, "on ENG issue create (dedup)", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG", OrganizationID: "org-automation-dispatch"}, target)
 
 	deps := newHandlerDeps(t, pool)
 	deps.Automations = automations
@@ -199,18 +199,12 @@ func TestWebhookHandler_AutomationDispatchDedupesRedeliveredDelivery(t *testing.
 // panicAutomationLister deliberately panics on ListActiveLinearAutomations
 // -- mirrors github's own identical fixture, proving Linear's own
 // dispatchAutomationsBestEffort recovers a panic without corrupting the
-// request.
+// request. No MarkCreatorUnauthorized/ClearCreatorUnauthorized (W2 audit
+// fix removed both from LinearTriggerLister -- see that interface's own
+// doc comment, internal/app/automation/lineardispatch.go).
 type panicAutomationLister struct{}
 
-func (panicAutomationLister) MarkCreatorUnauthorized(ctx context.Context, id pgtype.UUID) (int64, error) {
-	return 0, nil
-}
-
-func (panicAutomationLister) ClearCreatorUnauthorized(ctx context.Context, id pgtype.UUID) (int64, error) {
-	return 0, nil
-}
-
-func (panicAutomationLister) ListActiveLinearAutomations(ctx context.Context) ([]sqlcgen.Automation, error) {
+func (panicAutomationLister) ListActiveLinearAutomations(ctx context.Context, organizationID string) ([]sqlcgen.Automation, error) {
 	panic("forced panic: automation dispatch must not suppress the rest of this delivery's handling")
 }
 
@@ -262,7 +256,7 @@ func TestWebhookHandler_AutomationDispatchDeniesUnauthorizedActor(t *testing.T) 
 	automations := narvipg.NewAutomationStore(pool)
 	invocations := narvipg.NewAutomationInvocationStore(pool)
 	target := domainautomation.Target{Name: "repo", URL: "https://github.com/narvidev/narvi"}
-	auto := createLinearAutomation(ctx, t, automations, "on ENG issue create (unauthorized actor)", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG"}, target)
+	auto := createLinearAutomation(ctx, t, automations, "on ENG issue create (unauthorized actor)", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG", OrganizationID: "org-automation-dispatch"}, target)
 
 	deps := newHandlerDeps(t, pool)
 	deps.Automations = automations
@@ -299,7 +293,7 @@ func TestWebhookHandler_AutomationDispatchDeniesActorSinceDeleted(t *testing.T) 
 	automations := narvipg.NewAutomationStore(pool)
 	invocations := narvipg.NewAutomationInvocationStore(pool)
 	target := domainautomation.Target{Name: "repo", URL: "https://github.com/narvidev/narvi"}
-	auto := createLinearAutomation(ctx, t, automations, "on ENG issue create (actor since deleted)", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG"}, target)
+	auto := createLinearAutomation(ctx, t, automations, "on ENG issue create (actor since deleted)", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG", OrganizationID: "org-automation-dispatch"}, target)
 
 	deps := newHandlerDeps(t, pool)
 	deps.Automations = automations
@@ -337,7 +331,7 @@ func TestWebhookHandler_AutomationDispatchDeniesUninstalledWorkspace(t *testing.
 	automations := narvipg.NewAutomationStore(pool)
 	invocations := narvipg.NewAutomationInvocationStore(pool)
 	target := domainautomation.Target{Name: "repo", URL: "https://github.com/narvidev/narvi"}
-	auto := createLinearAutomation(ctx, t, automations, "on ENG issue create (uninstalled workspace)", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG"}, target)
+	auto := createLinearAutomation(ctx, t, automations, "on ENG issue create (uninstalled workspace)", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG", OrganizationID: "org-automation-dispatch"}, target)
 
 	deps := newHandlerDeps(t, pool)
 	deps.Automations = automations

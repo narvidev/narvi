@@ -6,28 +6,21 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/jackc/pgx/v5/pgtype"
-
-	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
-	"github.com/narvidev/narvi/internal/app/actorauthz"
-	"github.com/narvidev/narvi/internal/domain/authz"
 	domainautomation "github.com/narvidev/narvi/internal/domain/automation"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
-// linearAutomationAuthzSurface mirrors githubAutomationAuthzSurface's own
-// doc comment exactly (githubdispatch.go), for Linear's own per-automation,
-// machine-origin gate below (U7 audit fix).
-const linearAutomationAuthzSurface = "automation-linear"
-
 // linearTriggerConfigJSON mirrors githubTriggerConfigJSON's own doc
 // comment exactly, for Linear's own wire shape (internal/adapters/inbound/
-// httpapi's own linearTriggerConfigWire).
+// httpapi's own linearTriggerConfigWire). OrganizationID is W3 audit fix's
+// own required addition -- see domainautomation.LinearTriggerConfig.
+// OrganizationID's own doc comment.
 type linearTriggerConfigJSON struct {
-	EventType string `json:"eventType"`
-	Action    string `json:"action,omitempty"`
-	TeamKey   string `json:"teamKey,omitempty"`
+	EventType      string `json:"eventType"`
+	Action         string `json:"action,omitempty"`
+	TeamKey        string `json:"teamKey,omitempty"`
+	OrganizationID string `json:"organizationId,omitempty"`
 }
 
 func unmarshalLinearTriggerConfig(raw []byte) (domainautomation.LinearTriggerConfig, error) {
@@ -37,15 +30,22 @@ func unmarshalLinearTriggerConfig(raw []byte) (domainautomation.LinearTriggerCon
 			return domainautomation.LinearTriggerConfig{}, fmt.Errorf("automation: unmarshal linear trigger config: %w", err)
 		}
 	}
-	return domainautomation.LinearTriggerConfig{EventType: wire.EventType, Action: wire.Action, TeamKey: wire.TeamKey}, nil
+	return domainautomation.LinearTriggerConfig{EventType: wire.EventType, Action: wire.Action, TeamKey: wire.TeamKey, OrganizationID: wire.OrganizationID}, nil
 }
 
-// LinearTriggerLister mirrors GitHubTriggerLister, for Linear -- including
-// MarkCreatorUnauthorized/ClearCreatorUnauthorized (U8 audit fix).
+// LinearTriggerLister mirrors GitHubTriggerLister's own "narrow slice of
+// *postgres.AutomationStore" shape, for Linear. Unlike GitHubTriggerLister,
+// this carries no MarkCreatorUnauthorized/ClearCreatorUnauthorized: W2
+// audit fix removed dispatchOneLinearAutomation's own per-automation,
+// machine-origin gate entirely (see DispatchLinearWebhookEvent's own doc
+// comment) -- nothing in this file writes automations.
+// creator_unauthorized_since for the Linear path any more, so requiring
+// those two methods here would be dead surface, never called.
+// ListActiveLinearAutomations now takes organizationID (W3 audit fix,
+// confirmed HIGH, TENANT ISOLATION finding) -- see the generated query's
+// own doc comment (queries/automations.sql) for the full "why".
 type LinearTriggerLister interface {
-	ListActiveLinearAutomations(ctx context.Context) ([]sqlcgen.Automation, error)
-	MarkCreatorUnauthorized(ctx context.Context, id pgtype.UUID) (int64, error)
-	ClearCreatorUnauthorized(ctx context.Context, id pgtype.UUID) (int64, error)
+	ListActiveLinearAutomations(ctx context.Context, organizationID string) ([]sqlcgen.Automation, error)
 }
 
 // linearDeliveryProvider is the SAME literal
@@ -87,29 +87,50 @@ const linearDeliveryProvider = "linear"
 // ONE deadline instead of the single-call bound multiplying by however
 // many Linear-triggered automations this delivery evaluates.
 //
-// # U7 audit fix: a per-automation, machine-origin authorization lookup, mirroring GitHub's D12
+// # W2 audit fix: no per-automation, machine-origin authorization lookup -- unlike GitHub's D12
 //
-// actorType is the event's own top-level "actor.type" (buildLinearEventInput,
-// internal/adapters/inbound/linear/automationdispatch.go) -- users is the
-// SAME *postgres.UserStore the human-origin gate one layer up
-// (dispatchAutomationsBestEffort) already resolves its own actor against,
-// threaded down here specifically for domainautomation.
-// ClassifyLinearActorOrigin's own machine-origin bucket: an "Issue"/
-// "Comment" event actor reported as something other than a real Linear
-// account (Linear's own docs: "Could be a User, OAuth client, or
-// Integration") has no human identity for the adapter to have authorized;
-// instead, THIS automation's own creator must be a linked, non-disabled
-// account still holding authz.ActionCreateSession -- the maintainer who
-// created this automation is the human decision being honoured, exactly
-// like GitHubEventOriginMachine's own identical reasoning
-// (dispatchOneGitHubAutomation, githubdispatch.go). Human-origin events
-// (and the ok == false "actor deleted, origin unknown" case --
-// ClassifyLinearActorOrigin's own doc comment) are UNAFFECTED: their actor
-// was already authorized once, upstream, by dispatchAutomationsBestEffort,
-// before this automation was even listed.
-func DispatchLinearWebhookEvent(ctx context.Context, logger *slog.Logger, automations LinearTriggerLister, invocations DeliveryInvocationCreator, users *postgres.UserStore, timeouts platform.Timeouts, eventType string, deliveryID string, in domainautomation.LinearEventInput, actorType string) {
+// U7 originally threaded actorType (the event's own top-level "actor.type",
+// buildLinearEventInput, internal/adapters/inbound/linear/
+// automationdispatch.go) and a *postgres.UserStore down to THIS function
+// specifically to authorize domainautomation.ClassifyLinearActorOrigin's
+// own machine-origin bucket against each matching automation's OWN
+// creator, mirroring GitHubEventOriginMachine's structurally-justified
+// reasoning (dispatchOneGitHubAutomation, githubdispatch.go). W2 audit fix
+// (SECURITY, confirmed HIGH) found that mirror unsound for Linear: unlike
+// GitHub's check_run/status (an event TYPE only GitHub itself can ever
+// emit), Linear's actor.type is a per-payload field the SAME "Issue"/
+// "Comment" category carries either value for, depending only on how the
+// issue was filed -- not something the sender is structurally prevented
+// from influencing. Routing that field's value to a substitute
+// (automation-creator) authorization path was a real bypass of the
+// human-actor gate, not a legitimate structural necessity. That gate is
+// now denied entirely, one layer up, before any automation is even listed
+// (internal/adapters/inbound/linear's own dispatchAutomationsBestEffort) --
+// so this function is called ONLY for an already-authorized human-origin
+// actor (or the "actor deleted, origin unknown" case, which was always
+// routed through the ordinary human-actor gate). There is therefore
+// nothing left for a per-automation gate here to do: no actorType/users
+// parameter, no machine-origin branch. See docs/DECISIONS.md's D-06 entry
+// for the resulting, accepted functional limitation and its reopen
+// condition, and domain/automation/dispatch.go's own LinearEventOrigin doc
+// comment for the full "why".
+func DispatchLinearWebhookEvent(ctx context.Context, logger *slog.Logger, automations LinearTriggerLister, invocations DeliveryInvocationCreator, timeouts platform.Timeouts, eventType string, deliveryID string, in domainautomation.LinearEventInput) {
 	if reason := domainautomation.ClassifyLinearDispatch(eventType); reason != domainautomation.LinearDispatchNotSkipped {
 		logger.Debug("automation: linear event not evaluated against any trigger", "event_type", eventType, "reason", string(reason))
+		return
+	}
+
+	// W3 audit fix (confirmed HIGH, TENANT ISOLATION finding): an empty
+	// in.OrganizationID must never be treated as "list every organization's
+	// own automations" -- fails closed, loudly, before ever querying.
+	// Structurally unreachable on the real webhook path (D9's own
+	// installation lookup, internal/adapters/inbound/linear/
+	// automationdispatch.go, already requires a non-empty organizationId
+	// to resolve an installation before this function is ever called), but
+	// this function is also called directly by this package's own tests,
+	// and a defensive fail-closed default here costs nothing.
+	if in.OrganizationID == "" {
+		logger.Error("automation: linear dispatch: empty organization id, skipping (fail closed)", "event_type", eventType)
 		return
 	}
 
@@ -122,7 +143,7 @@ func DispatchLinearWebhookEvent(ctx context.Context, logger *slog.Logger, automa
 	var rows []sqlcgen.Automation
 	retryErr := platform.Retry(ctx, timeouts.AutomationDispatchMaxAttempts, timeouts.AutomationDispatchRetryBaseDelay, timeouts.AutomationDispatchRetryMaxDelay, func() error {
 		var err error
-		rows, err = automations.ListActiveLinearAutomations(ctx)
+		rows, err = automations.ListActiveLinearAutomations(ctx, in.OrganizationID)
 		return err
 	})
 	if retryErr != nil {
@@ -131,11 +152,11 @@ func DispatchLinearWebhookEvent(ctx context.Context, logger *slog.Logger, automa
 	}
 
 	for _, row := range rows {
-		dispatchOneLinearAutomation(ctx, logger, automations, invocations, users, timeouts, row, eventType, deliveryID, in, actorType)
+		dispatchOneLinearAutomation(ctx, logger, invocations, timeouts, row, eventType, deliveryID, in)
 	}
 }
 
-func dispatchOneLinearAutomation(ctx context.Context, logger *slog.Logger, automations LinearTriggerLister, invocations DeliveryInvocationCreator, users *postgres.UserStore, timeouts platform.Timeouts, row sqlcgen.Automation, eventType string, deliveryID string, in domainautomation.LinearEventInput, actorType string) {
+func dispatchOneLinearAutomation(ctx context.Context, logger *slog.Logger, invocations DeliveryInvocationCreator, timeouts platform.Timeouts, row sqlcgen.Automation, eventType string, deliveryID string, in domainautomation.LinearEventInput) {
 	logger = logger.With("automation_id", row.ID.String())
 
 	cfg, err := unmarshalLinearTriggerConfig(row.TriggerConfig)
@@ -145,23 +166,6 @@ func dispatchOneLinearAutomation(ctx context.Context, logger *slog.Logger, autom
 	}
 	if !domainautomation.MatchesLinearTrigger(cfg, in) {
 		return
-	}
-
-	// U7 audit fix: see this function's own caller's doc comment
-	// (DispatchLinearWebhookEvent, above) for the full "why". Not wrapped
-	// in platform.Retry (unlike this file's other Postgres round trips,
-	// D6) -- it fails closed on any error, exactly like every other
-	// actorauthz.AuthorizeLinkedActor call site across this codebase,
-	// mirroring dispatchOneGitHubAutomation's own identical choice.
-	if origin, known := domainautomation.ClassifyLinearActorOrigin(actorType); known && origin == domainautomation.LinearEventOriginMachine {
-		if !actorauthz.AuthorizeLinkedActor(ctx, logger, linearAutomationAuthzSurface, users, row.CreatedBy, authz.ActionCreateSession, authz.Resource{}) {
-			logger.Info("automation: linear dispatch: automation creator not authorized for a machine-originated actor, skipping", "event_type", eventType, "reason", "creator_unlinked_or_unauthorized")
-			markCreatorUnauthorizedBestEffort(ctx, logger, automations, row.ID)
-			return
-		}
-		// U8 audit fix: see githubdispatch.go's own identical call site
-		// doc comment (dispatchOneGitHubAutomation) for the full "why".
-		clearCreatorUnauthorizedBestEffort(ctx, logger, automations, row.ID)
 	}
 
 	targets, err := UnmarshalTargets(row.Repos)
@@ -178,6 +182,7 @@ func dispatchOneLinearAutomation(ctx context.Context, logger *slog.Logger, autom
 	if err != nil {
 		if dispatchBudgetExhausted(err) {
 			logger.Warn("automation: create invocation for linear dispatch: total time budget exhausted before this call could complete, skipping (fail closed) -- NOT a throttle decision, see platform.Timeouts.AutomationDispatchTotalBudget", "reason", "dispatch_budget_exhausted", "error", err, "event_type", eventType)
+			recordAutomationDispatchDropped(ctx, "create") // W4 audit fix, see dispatchmetrics.go
 		} else {
 			logger.Error("automation: create invocation for linear dispatch failed", "error", err, "event_type", eventType)
 		}

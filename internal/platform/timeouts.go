@@ -1982,22 +1982,55 @@ type Timeouts struct {
 	// below additionally REQUIRES this field to cover at least the list
 	// call plus ONE matching automation's own full retry chain, with one
 	// more single-call worst case of margin (4x a single call's own worst
-	// case) -- the smallest floor that still guarantees the FIRST matching
-	// automation in any delivery always gets its full D6 resilience,
-	// regardless of how many others follow it in the same delivery's loop.
-	// There is deliberately no value here that is "enough" for an
-	// unbounded number of matching automations: a delivery matching more
-	// than this default's own reference count (3) degrades gracefully
+	// case) -- the smallest floor that still guarantees the AUTOMATION-COUNT
+	// dimension this budget is actually sized against: the first matching
+	// automation in any delivery is never starved of ITS OWN full attempt
+	// count by a SECOND, THIRD, ... matching automation ahead of it in the
+	// same loop (D18's own original defect -- the retry budget multiplying
+	// inside a loop). There is deliberately no value here that is "enough"
+	// for an unbounded number of matching automations: a delivery matching
+	// more than this default's own reference count (3) degrades gracefully
 	// instead (the 4th+ automation's own calls fall back to a distinctly
 	// logged, distinctly returned dispatchGateBudgetExhausted/
 	// dispatchBudgetExhausted verdict once the shared budget can no longer
 	// fit another full chain, rather than being silently truncated
-	// mid-backoff and misread as an ordinary throttle decision) -- a
-	// webhook handler that must both retry AND stay inside a provider's own
-	// delivery timeout cannot promise unlimited retried automations on the
-	// request path; making the boundary OBSERVABLE, and guaranteeing it
-	// never bites the first automation, is this fix's own chosen scope. A
-	// genuinely unbounded-N design would need dispatch to move off the
+	// mid-backoff and misread as an ordinary throttle decision).
+	//
+	// # W1 audit fix: what this floor does NOT cover
+	//
+	// Confirmed HIGH finding: RetryWorstCaseSleep sums ONLY the SLEEP
+	// between failed attempts (its own doc comment, retry.go) -- it carries
+	// no term for a call's own EXECUTION time, yet this budget bounds a
+	// single wall-clock context.WithTimeout (dispatchTotalBudgetContext)
+	// that must ALSO cover however long ListActiveGitHubAutomations/
+	// ListActiveLinearAutomations/CountRecentInvocations/CreateForDelivery
+	// themselves take to run -- none of which carries a per-call timeout of
+	// its own (platform.Retry's own doc comment: "does not additionally
+	// wrap each fn() call with its own timeout"), and this repository has
+	// no Postgres statement_timeout anywhere either. So the guarantee above
+	// is honest only along the AUTOMATION-COUNT axis (how many matching
+	// automations get their full attempt count), never along a LATENCY
+	// axis this field was never sized against: reproduced directly against
+	// this exact function with the shipped defaults below -- at 0/0.5/1s of
+	// per-call latency the first (and only) matching automation's own
+	// create call still completes its full attempt count; at 2s of
+	// per-call latency it does not, and the shared budget expires mid-retry
+	// (surfacing as dispatchGateBudgetExhausted/dispatchBudgetExhausted,
+	// never silently). Two remedies were considered and rejected: inflating
+	// this floor collides with this field's own "small fraction of GitHub's
+	// ~10s delivery timeout" constraint two paragraphs below and
+	// reintroduces an arbitrary literal picked to make a specific latency
+	// pass, not a principled bound; adding a genuine per-call timeout to
+	// the three dispatch queries (and re-deriving this floor from
+	// attempts*perCallTimeout+sleep instead of sleep alone) is the more
+	// complete fix but a materially larger change than this batch's own
+	// scope -- filed, not attempted here (see the PR body for the full
+	// argument). What this fix DOES do: the claim above is now scoped to
+	// what the mechanism actually guarantees, and W4's own fix
+	// (githubdispatch.go) makes the resulting drop OBSERVABLE to an
+	// operator rather than only a log line, since a latency-driven
+	// exhaustion is exactly as real a drop as a count-driven one.
+	// A genuinely unbounded-N design would need dispatch to move off the
 	// request path entirely (e.g. an outbox-style deferred dispatch,
 	// mirroring how fan-out itself is already decoupled from invocation
 	// creation via Engine's own background pump, doc.go) -- a materially
@@ -3370,8 +3403,13 @@ func (t Timeouts) Validate() error {
 	// "why" this specific floor (list call + one matching automation's own
 	// full retry chain, with one more single-call worst case of margin) is
 	// the smallest one that still guarantees the FIRST matching automation
-	// in any delivery always completes its full D6 resilience. Deliberately
-	// NOT run through the shared check() helper above: that helper's
+	// in any delivery is never starved of its own full attempt count by
+	// ANOTHER matching automation ahead of it in the same delivery's loop
+	// -- see that same doc comment's own "W1 audit fix" section for what
+	// this floor deliberately does NOT cover (a call's own execution
+	// latency, as opposed to the sleep RetryWorstCaseSleep sums, is
+	// unbounded by anything this field or this Validate check enforces;
+	// confirmed HIGH finding, W1). Deliberately NOT run through the shared check() helper above: that helper's
 	// MinTimeoutMargin (30s) is calibrated for THIS file's slower
 	// "provider cap / cold start" scale and would require an
 	// AutomationDispatchTotalBudget upward of 30 SECONDS to pass --

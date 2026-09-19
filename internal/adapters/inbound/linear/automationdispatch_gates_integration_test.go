@@ -1,6 +1,9 @@
 //go:build integration
 
-// U3/U4/U6/U7 audit fixes' own required proofs -- mirrors
+// U3/U4/U6 audit fixes' own required proofs, plus W2's own fail-closed
+// proofs (which replaced U7's own positive/negative machine-origin-fires
+// pair -- see the two Test...NonUserActor... functions below's own doc
+// comments for why) -- mirrors
 // automationdispatch_integration_test.go's own conventions
 // (issueEventPayloadWithActor/createLinearAutomation/installLinearFixture/
 // countAutomationInvocations, this package's own shared helpers) plus
@@ -95,7 +98,7 @@ func TestWebhookHandler_AutomationDispatchDeniesUnlinkedActorWithoutAutoLinkingO
 	automations := narvipg.NewAutomationStore(pool)
 	invocations := narvipg.NewAutomationInvocationStore(pool)
 	target := domainautomation.Target{Name: "repo", URL: "https://github.com/narvidev/narvi"}
-	auto := createLinearAutomation(ctx, t, automations, "on ENG issue create (no auto-link)", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG"}, target)
+	auto := createLinearAutomation(ctx, t, automations, "on ENG issue create (no auto-link)", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG", OrganizationID: "org-automation-dispatch"}, target)
 
 	deps := newHandlerDeps(t, pool)
 	deps.Automations = automations
@@ -190,15 +193,19 @@ func TestWebhookHandler_AutomationDispatchSkipsInstallationLookupForUnclassified
 	}
 }
 
-// TestWebhookHandler_AutomationDispatchFiresForMachineOriginActor is U7's
-// own required, missing positive proof: an "Issue" event whose actor is
-// reported as something other than a real Linear account (actor.type !=
-// "user") has no human identity for the ordinary gate to authorize at
-// all -- BEFORE this fix, AuthorizeLinkedActor denied it unconditionally
-// (an invalid actorUserID), so the matching automation could never fire,
-// regardless of configuration. The automation's own creator, authorized
-// here instead, is what makes this event fire.
-func TestWebhookHandler_AutomationDispatchFiresForMachineOriginActor(t *testing.T) {
+// TestWebhookHandler_AutomationDispatchDeniesNonUserActorEvenWithAuthorizedCreator
+// is W2's own required proof (confirmed HIGH, SECURITY finding against
+// U7's own fix, which this test used to prove the OPPOSITE of -- see git
+// blame): an "Issue" event whose actor is reported as something other than
+// a real Linear account (actor.type != "user") must be denied outright,
+// EVEN WHEN the matching automation's own creator is genuinely linked and
+// authorized. Before W2, this exact fixture (a real, authorized creator)
+// fired the automation via the creator-authorization substitute path --
+// the bypass this fix closes: actor.type is a per-payload field the SAME
+// "Issue" category carries either value for depending only on how the
+// issue was filed, not something the sender is structurally prevented
+// from influencing, so it must never select a weaker authorization path.
+func TestWebhookHandler_AutomationDispatchDeniesNonUserActorEvenWithAuthorizedCreator(t *testing.T) {
 	pool := newTestPool(t)
 	ctx := context.Background()
 
@@ -207,7 +214,7 @@ func TestWebhookHandler_AutomationDispatchFiresForMachineOriginActor(t *testing.
 
 	users := narvipg.NewUserStore(pool)
 	creator, err := users.Create(ctx, sqlcgen.CreateUserParams{
-		PrimaryEmail: "machine-origin-creator@narvi-test.example.com", DisplayName: "Automation Creator", Role: sqlcgen.UserRoleMaintainer,
+		PrimaryEmail: "non-user-origin-creator@narvi-test.example.com", DisplayName: "Automation Creator", Role: sqlcgen.UserRoleMaintainer,
 	})
 	if err != nil {
 		t.Fatalf("create fixture creator: %v", err)
@@ -218,12 +225,12 @@ func TestWebhookHandler_AutomationDispatchFiresForMachineOriginActor(t *testing.
 	if err != nil {
 		t.Fatalf("marshal repos: %v", err)
 	}
-	triggerConfigJSON, err := json.Marshal(map[string]string{"eventType": "Issue", "action": "create", "teamKey": "ENG"})
+	triggerConfigJSON, err := json.Marshal(map[string]string{"eventType": "Issue", "action": "create", "teamKey": "ENG", "organizationId": "org-automation-dispatch"})
 	if err != nil {
 		t.Fatalf("marshal trigger config: %v", err)
 	}
 	auto, err := automations.Create(ctx, sqlcgen.CreateAutomationParams{
-		Name: "on ENG issue create (machine origin)", Repos: reposJSON, CreatedBy: creator.ID,
+		Name: "on ENG issue create (non-user actor, authorized creator)", Repos: reposJSON, CreatedBy: creator.ID,
 		TriggerType: sqlcgen.AutomationTriggerTypeLinear, TriggerConfig: triggerConfigJSON, EnvVars: []byte("[]"),
 	})
 	if err != nil {
@@ -241,24 +248,46 @@ func TestWebhookHandler_AutomationDispatchFiresForMachineOriginActor(t *testing.
 	}
 	handler := linear.NewWebhookHandler(deps)
 
-	// actor.type "application" -- NOT "user": no human identity at all,
-	// mirroring a real Linear Integration/OAuth-client-authored Issue.
-	rec := postWebhookEventType(t, handler, issueEventPayloadWithActorType("ENG", "linear-integration-actor-1", "application"), "delivery-linear-machine-origin-1", "Issue")
+	// actor.type "application" -- NOT "user". This deployment has never
+	// observed Linear's real wire value for a non-"user" actor (Linear's
+	// own docs name "OAuth client"/"Integration" as the two kinds but do
+	// not publish their exact strings) -- "application" is an invented
+	// test value standing in for "anything that is not literally 'user'",
+	// which is exactly the point: the fix must not depend on knowing the
+	// real value.
+	rec := postWebhookEventType(t, handler, issueEventPayloadWithActorType("ENG", "linear-integration-actor-1", "application"), "delivery-linear-non-user-origin-1", "Issue")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 
-	if got := countAutomationInvocations(t, pool, auto.ID); got != 1 {
-		t.Fatalf("automation_invocations = %d, want 1 (U7 audit fix: a machine-originated actor must fire via the automation's own authorized creator)", got)
+	if got := countAutomationInvocations(t, pool, auto.ID); got != 0 {
+		t.Fatalf("automation_invocations = %d, want 0 (W2 audit fix: a non-\"user\" actor must be denied outright, never routed through the automation-creator's own authorization even when that creator IS authorized)", got)
+	}
+
+	// The denial must NOT surface as a creator-unauthorized mark: this
+	// creator was never evaluated at all (the adapter denies before any
+	// automation is even listed), and marking a perfectly healthy creator
+	// "unauthorized" would itself be dishonest state.
+	row, err := automations.Get(ctx, auto.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if row.CreatorUnauthorizedSince.Valid {
+		t.Error("CreatorUnauthorizedSince.Valid = true, want false (this automation's own creator was never evaluated -- the non-\"user\" actor was denied one layer up, before any automation was listed)")
 	}
 }
 
-// TestWebhookHandler_AutomationDispatchDeniesMachineOriginWhenCreatorUnauthorized
-// is the companion negative proof: a machine-originated actor must still
-// NOT fire an automation whose own creator has no linked, authorized
-// account (CreatedBy left invalid -- mirrors an automation whose creator
-// was since deleted, ON DELETE SET NULL).
-func TestWebhookHandler_AutomationDispatchDeniesMachineOriginWhenCreatorUnauthorized(t *testing.T) {
+// TestWebhookHandler_AutomationDispatchDeniesNonUserActorWithUnauthorizedCreator
+// is the companion proof at the OTHER extreme of the same fixture space:
+// a non-"user" actor is denied identically even when the matching
+// automation's own creator has no linked, authorized account at all
+// (CreatedBy left invalid -- mirrors an automation whose creator was since
+// deleted, ON DELETE SET NULL). Read together with the "authorized
+// creator" test above, this pins that the creator's own authorization
+// state is now IRRELEVANT to a non-"user" actor's own denial -- proving
+// the fix is unconditional, not merely "still denies in the one case it
+// already denied before".
+func TestWebhookHandler_AutomationDispatchDeniesNonUserActorWithUnauthorizedCreator(t *testing.T) {
 	pool := newTestPool(t)
 	ctx := context.Background()
 
@@ -267,7 +296,7 @@ func TestWebhookHandler_AutomationDispatchDeniesMachineOriginWhenCreatorUnauthor
 	target := domainautomation.Target{Name: "repo", URL: "https://github.com/narvidev/narvi"}
 	// createLinearAutomation (automationdispatch_integration_test.go) seeds
 	// CreatedBy as an invalid pgtype.UUID -- no authorizing principal.
-	auto := createLinearAutomation(ctx, t, automations, "on ENG issue create (machine origin, unauthorized creator)", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG"}, target)
+	auto := createLinearAutomation(ctx, t, automations, "on ENG issue create (non-user actor, unauthorized creator)", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG", OrganizationID: "org-automation-dispatch"}, target)
 
 	deps := newHandlerDeps(t, pool)
 	deps.Automations = automations
@@ -280,24 +309,20 @@ func TestWebhookHandler_AutomationDispatchDeniesMachineOriginWhenCreatorUnauthor
 	}
 	handler := linear.NewWebhookHandler(deps)
 
-	rec := postWebhookEventType(t, handler, issueEventPayloadWithActorType("ENG", "linear-integration-actor-2", "application"), "delivery-linear-machine-origin-denied-1", "Issue")
+	rec := postWebhookEventType(t, handler, issueEventPayloadWithActorType("ENG", "linear-integration-actor-2", "application"), "delivery-linear-non-user-origin-denied-1", "Issue")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 
 	if got := countAutomationInvocations(t, pool, auto.ID); got != 0 {
-		t.Fatalf("automation_invocations = %d, want 0 (a machine-originated actor must not fire an automation whose own creator has no linked, authorized account)", got)
+		t.Fatalf("automation_invocations = %d, want 0 (a non-\"user\" actor must not fire an automation regardless of its own creator's authorization state)", got)
 	}
 
-	// U8 audit fix: the denial must also surface on the automation's own
-	// row, mirroring GitHub's own identical proof
-	// (TestDispatchGitHubWebhookEvent_MarksAndClearsCreatorUnauthorized,
-	// internal/app/automation/githubdispatch_integration_test.go).
 	row, err := automations.Get(ctx, auto.ID)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if !row.CreatorUnauthorizedSince.Valid {
-		t.Error("CreatorUnauthorizedSince.Valid = false, want true (a denied machine-origin Linear dispatch must surface on the automation's own row too)")
+	if row.CreatorUnauthorizedSince.Valid {
+		t.Error("CreatorUnauthorizedSince.Valid = true, want false (W2 audit fix: this automation's own creator authorization is never evaluated for a non-\"user\" actor any more, so nothing should mark it)")
 	}
 }

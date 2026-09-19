@@ -50,29 +50,79 @@ import (
 // check exactly -- denies immediately, never falls through to a role-based
 // verdict for a disabled user.
 func AuthorizeResolvedActor(ctx context.Context, logger *slog.Logger, surface string, users *postgres.UserStore, actorUserID pgtype.UUID, action authz.Action, resource authz.Resource) bool {
+	return AuthorizeResolvedActorVerdict(ctx, logger, surface, users, actorUserID, action, resource) == LinkedActorAllowed
+}
+
+// LinkedActorVerdict is AuthorizeResolvedActorVerdict/AuthorizeLinkedActorVerdict's
+// own richer return type -- W9 audit fix (confirmed LOW finding: "an error
+// is recorded as a verdict"). AuthorizeResolvedActor/AuthorizeLinkedActor's
+// plain bool return collapses two DIFFERENT conditions into the same
+// `false`: a genuine, deliberate denial (the linked account is disabled, or
+// domain/authz.Authorize returned ErrForbidden -- a real "no" this
+// deployment's own RBAC computed) and a TRANSIENT failure (users.GetByID's
+// own Postgres round trip erroring, or an authz.Authorize error that is
+// NOT ErrForbidden, i.e. a caller bug like ErrUnknownAction) that says
+// nothing at all about whether the actor is actually authorized. Both still
+// fail closed identically at the bool call sites (neither should proceed
+// the action either way) -- but a caller that PERSISTS this verdict as
+// product-visible state (dispatchOneGitHubAutomation's own
+// creator_unauthorized_since mark, githubdispatch.go) must not conflate
+// them: recording "unauthorized" against a creator whose account is
+// perfectly fine, merely because a Postgres blip made ONE lookup fail, is
+// exactly the D8/U1 "an infrastructure hiccup is misread as a genuine,
+// persisted verdict" shape this codebase has already fixed once for the
+// dispatch-throttle gate (dispatchGateVerdict, githubdispatch.go) -- this
+// type is the identical shape, reused rather than reinvented, for this
+// SECOND site that needed it.
+type LinkedActorVerdict int
+
+const (
+	// LinkedActorAllowed means the actor is a known, linked, non-disabled
+	// account holding the requested action.
+	LinkedActorAllowed LinkedActorVerdict = iota
+	// LinkedActorDenied means authorization was evaluated to completion and
+	// genuinely said no -- a disabled account, or domain/authz.Authorize's
+	// own ErrForbidden. A caller may safely treat this as a durable,
+	// product-visible verdict.
+	LinkedActorDenied
+	// LinkedActorError means authorization could NOT be evaluated at all --
+	// a Postgres lookup failed, or domain/authz.Authorize returned
+	// something other than ErrForbidden (a caller bug, never a legitimate
+	// "no"). Fails closed exactly like LinkedActorDenied at every existing
+	// bool call site, but a caller persisting this as state must not: an
+	// error is not a verdict.
+	LinkedActorError
+)
+
+// AuthorizeResolvedActorVerdict is AuthorizeResolvedActor's own verdict-
+// returning form -- see LinkedActorVerdict's own doc comment for why this
+// exists. AuthorizeResolvedActor itself is now a thin wrapper (immediately
+// above) so every existing bool call site is completely unchanged.
+func AuthorizeResolvedActorVerdict(ctx context.Context, logger *slog.Logger, surface string, users *postgres.UserStore, actorUserID pgtype.UUID, action authz.Action, resource authz.Resource) LinkedActorVerdict {
 	if !actorUserID.Valid {
-		return true
+		return LinkedActorAllowed
 	}
 
 	user, err := users.GetByID(ctx, actorUserID)
 	if err != nil {
 		logger.Error(surface+": authz: look up resolved actor's role failed", "error", err, "user_id", actorUserID.String(), "action", string(action))
-		return false
+		return LinkedActorError
 	}
 
 	if user.Disabled {
 		logger.Warn(surface+": authz: resolved actor's linked account is disabled, denying", "user_id", actorUserID.String(), "action", string(action))
-		return false
+		return LinkedActorDenied
 	}
 
 	actor := authz.Actor{UserID: actorUserID.String(), Role: authz.Role(user.Role)}
 	if err := authz.Authorize(actor, action, resource); err != nil {
 		if !errors.Is(err, authz.ErrForbidden) {
 			logger.Error(surface+": authz.Authorize failed", "error", err, "action", string(action))
+			return LinkedActorError
 		}
-		return false
+		return LinkedActorDenied
 	}
-	return true
+	return LinkedActorAllowed
 }
 
 // AuthorizeLinkedActor is the audit-hardening counterpart to
@@ -129,10 +179,24 @@ func AuthorizeResolvedActor(ctx context.Context, logger *slog.Logger, surface st
 // specific gap would risk regressing behavior this batch never touched or
 // re-verified.
 func AuthorizeLinkedActor(ctx context.Context, logger *slog.Logger, surface string, users *postgres.UserStore, actorUserID pgtype.UUID, action authz.Action, resource authz.Resource) bool {
+	return AuthorizeLinkedActorVerdict(ctx, logger, surface, users, actorUserID, action, resource) == LinkedActorAllowed
+}
+
+// AuthorizeLinkedActorVerdict is AuthorizeLinkedActor's own verdict-
+// returning form -- see LinkedActorVerdict's own doc comment for why this
+// exists. AuthorizeLinkedActor itself is now a thin wrapper (immediately
+// above) so every existing bool call site is completely unchanged. The
+// actorUserID.Valid == false case ("not yet linked at all") is
+// LinkedActorDenied, never LinkedActorError: it is not a lookup failure,
+// it is the exact, deliberate, structural denial this function exists to
+// return (see this function's own top-level doc comment) -- a caller
+// persisting THIS verdict is recording a true fact, not an infrastructure
+// hiccup.
+func AuthorizeLinkedActorVerdict(ctx context.Context, logger *slog.Logger, surface string, users *postgres.UserStore, actorUserID pgtype.UUID, action authz.Action, resource authz.Resource) LinkedActorVerdict {
 	if !actorUserID.Valid {
-		return false
+		return LinkedActorDenied
 	}
-	return AuthorizeResolvedActor(ctx, logger, surface, users, actorUserID, action, resource)
+	return AuthorizeResolvedActorVerdict(ctx, logger, surface, users, actorUserID, action, resource)
 }
 
 // OwnedOrJoined mirrors internal/adapters/inbound/httpapi's own

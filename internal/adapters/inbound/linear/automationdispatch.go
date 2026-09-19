@@ -105,13 +105,20 @@ type linearAutomationEventEnvelope struct {
 // domainautomation.LinearEventInput -- ok is false only on a JSON decode
 // failure, mirroring github's own buildGitHubEventInput's identical "false
 // means nothing to dispatch, never a reason to fail this request" contract.
-// organizationID/actorExternalID/actorType are returned alongside (D9/D15/
-// U7 audit fixes) rather than folded into LinearEventInput itself --
-// installation/actor authorization is a SEPARATE concern from trigger
-// matching, exactly the same separation githubEventSenderID keeps from
-// buildGitHubEventInput (internal/adapters/inbound/github/
-// automationdispatch.go). actorExternalID/actorType are both "" when Actor
-// is nil (the actor has since been deleted, per Linear's own docs) --
+// organizationID/actorExternalID/actorType are ALSO returned alongside
+// (D9/D15/U7 audit fixes), for the installation/actor authorization this
+// adapter runs BEFORE any automation is even listed -- a separate concern
+// from trigger matching, exactly the same separation githubEventSenderID
+// keeps from buildGitHubEventInput (internal/adapters/inbound/github/
+// automationdispatch.go). W3 audit fix: organizationID is now ALSO folded
+// into in.OrganizationID (domainautomation.LinearTriggerConfig.
+// OrganizationID's own doc comment) -- unlike actor/installation
+// authorization, tenant scoping IS part of trigger matching itself (the
+// tenant boundary GitHub gets for free from Target.URL, Linear does not),
+// so this one value legitimately serves both call sites from the SAME
+// parse, never a second, independently-extracted copy that could drift
+// from it. actorExternalID/actorType are both "" when Actor is nil (the
+// actor has since been deleted, per Linear's own docs) --
 // identitylink.LookupLinkedUserID already treats an empty externalID as
 // "nothing to resolve, not linked" (mirrors deps.resolveActor's own
 // identical "bot attribution" convention, identity.go), and
@@ -128,9 +135,10 @@ func buildLinearEventInput(eventType string, rawBody []byte) (in domainautomatio
 		actorType = env.Actor.Type
 	}
 	return domainautomation.LinearEventInput{
-		EventType: eventType,
-		Action:    env.Action,
-		TeamKey:   env.Data.Team.Key,
+		EventType:      eventType,
+		Action:         env.Action,
+		TeamKey:        env.Data.Team.Key,
+		OrganizationID: env.OrganizationID,
 	}, env.OrganizationID, actorExternalID, actorType, true
 }
 
@@ -215,22 +223,52 @@ func dispatchAutomationsBestEffort(ctx context.Context, logger *slog.Logger, dep
 		return
 	}
 
-	// # U7 audit fix: machine-origin events skip the human actor gate entirely
+	// # W2 audit fix, SECURITY: a non-"user" actor.type is denied, never routed to a substitute authorization path
 	//
-	// Mirrors github's own D12 split exactly (dispatchAutomationsBestEffort,
-	// internal/adapters/inbound/github/automationdispatch.go): a
-	// machine-originated actor (domainautomation.ClassifyLinearActorOrigin
-	// == LinearEventOriginMachine) has no human identity for THIS gate to
-	// authorize at all -- that per-automation check instead happens one
-	// layer down, inside automation.DispatchLinearWebhookEvent
-	// (lineardispatch.go), against each matching automation's OWN creator.
+	// U7 originally mirrored github's own D12 split here exactly: a
+	// non-"user" actor.type (domainautomation.ClassifyLinearActorOrigin ==
+	// LinearEventOriginMachine) skipped this human-actor gate entirely and
+	// dispatched under the automation's OWN creator's authorization
+	// instead (automation.DispatchLinearWebhookEvent, lineardispatch.go).
+	// Confirmed HIGH, SECURITY finding against that mirror: GitHub's split
+	// is keyed on the EVENT TYPE (check_run/status), a value the sender
+	// never supplies -- GitHub itself is structurally the only possible
+	// actor. Linear's split was keyed on a per-PAYLOAD field (actor.type)
+	// that the SAME "Issue"/"Comment" event category carries either value
+	// for, depending only on how the issue was filed: an Integration such
+	// as Slack, Zapier, a customer-facing intake form, or email-to-issue
+	// reports something other than "user" for the identical category a
+	// real person filing directly reports "user" for -- none of which
+	// require any special privilege in a workspace that already has this
+	// app installed. Routing THAT field's value to a DIFFERENT, weaker
+	// authorization path (the automation creator's, almost always
+	// satisfied) let any such actor bypass the human-actor gate entirely.
+	//
+	// This deployment has also never observed Linear's real wire value for
+	// a non-"user" actor.type (Linear's own docs name "OAuth client" and
+	// "Integration" as the two non-human kinds but do not publish their
+	// exact strings) -- a security decision resting on an unobserved
+	// external value is not a decision, it is a hope. So this now fails
+	// CLOSED for LinearEventOriginMachine: denied outright, exactly like
+	// an unlinked/unauthorized human actor below, never dispatched via any
+	// path. The functional cost -- a genuinely machine-originated Linear
+	// event (if Linear ever exposes one this deployment could distinguish
+	// STRUCTURALLY, the way check_run/status are) cannot fire an
+	// automation today -- is recorded in docs/DECISIONS.md's D-06 entry,
+	// with an evaluable reopen condition, rather than silently accepted.
+	// dispatchOneLinearAutomation (lineardispatch.go) no longer carries
+	// any per-automation, creator-authorizing machine-origin gate at all
+	// (that branch is now unreachable dead code with this adapter denying
+	// upstream, so it was removed rather than left as a footgun a future
+	// change could silently re-enable).
+	//
 	// The ok==false "actor deleted, origin unknown" case (Actor == nil, or
 	// a present Actor with an empty Type) falls through to the human gate
 	// below UNCHANGED -- the safe, narrower default, exactly like GitHub's
 	// own "anything not explicitly classified Machine falls through to the
 	// human-origin sender check" precedent.
 	if origin, known := domainautomation.ClassifyLinearActorOrigin(actorType); known && origin == domainautomation.LinearEventOriginMachine {
-		automation.DispatchLinearWebhookEvent(ctx, logger, deps.Automations, deps.AutomationInvocations, deps.IdentityLink.Users, deps.Timeouts, eventType, deliveryID, in, actorType)
+		logger.Info("linear: automation dispatch: actor reported as non-\"user\" origin, denied -- fail closed (no structural equivalent of GitHub's event-type split observed for Linear, see docs/DECISIONS.md D-06)", "event_type", eventType, "reason", "linear_machine_origin_not_authorized")
 		return
 	}
 
@@ -253,5 +291,5 @@ func dispatchAutomationsBestEffort(ctx context.Context, logger *slog.Logger, dep
 		return
 	}
 
-	automation.DispatchLinearWebhookEvent(ctx, logger, deps.Automations, deps.AutomationInvocations, deps.IdentityLink.Users, deps.Timeouts, eventType, deliveryID, in, actorType)
+	automation.DispatchLinearWebhookEvent(ctx, logger, deps.Automations, deps.AutomationInvocations, deps.Timeouts, eventType, deliveryID, in)
 }

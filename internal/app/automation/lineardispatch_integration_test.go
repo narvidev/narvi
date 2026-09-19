@@ -19,8 +19,17 @@ import (
 	"github.com/narvidev/narvi/internal/platform"
 )
 
+// testLinearOrganizationID is this file's own fixed, shared organization id
+// -- W3 audit fix (confirmed HIGH, TENANT ISOLATION finding) made
+// LinearTriggerConfig.OrganizationID/LinearEventInput.OrganizationID both
+// required, exact-match fields; every fixture in this file that expects a
+// MATCH uses this same constant on both the automation's own trigger
+// config and the live event's own input, exactly like a real delivery's
+// organizationId would agree with the automation that was created for it.
+const testLinearOrganizationID = "org-test-linear-dispatch"
+
 // createLinearAutomation inserts an automation with TriggerTypeLinear, the
-// given event/action/team filter, and one target repo.
+// given event/action/team/organization filter, and one target repo.
 func (f *testFixture) createLinearAutomation(t *testing.T, name string, cfg domainautomation.LinearTriggerConfig, target domainautomation.Target) sqlcgen.Automation {
 	t.Helper()
 	ctx := context.Background()
@@ -30,7 +39,7 @@ func (f *testFixture) createLinearAutomation(t *testing.T, name string, cfg doma
 		t.Fatalf("marshal repos: %v", err)
 	}
 	triggerConfigJSON, err := json.Marshal(map[string]string{
-		"eventType": cfg.EventType, "action": cfg.Action, "teamKey": cfg.TeamKey,
+		"eventType": cfg.EventType, "action": cfg.Action, "teamKey": cfg.TeamKey, "organizationId": cfg.OrganizationID,
 	})
 	if err != nil {
 		t.Fatalf("marshal trigger config: %v", err)
@@ -52,10 +61,10 @@ func TestDispatchLinearWebhookEvent_FiresMatchingAutomation(t *testing.T) {
 	logger := platform.Logger(ctx)
 
 	target := domainautomation.Target{Name: "repo", URL: "https://github.com/acme/repo"}
-	auto := f.createLinearAutomation(t, "on issue create", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG"}, target)
+	auto := f.createLinearAutomation(t, "on issue create", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG", OrganizationID: testLinearOrganizationID}, target)
 
-	in := domainautomation.LinearEventInput{EventType: "Issue", Action: "create", TeamKey: "ENG"}
-	automation.DispatchLinearWebhookEvent(ctx, logger, f.automations, f.invocations, f.users, platform.DefaultTimeouts(), "Issue", "delivery-linear-fires-1", in, "")
+	in := domainautomation.LinearEventInput{EventType: "Issue", Action: "create", TeamKey: "ENG", OrganizationID: testLinearOrganizationID}
+	automation.DispatchLinearWebhookEvent(ctx, logger, f.automations, f.invocations, platform.DefaultTimeouts(), "Issue", "delivery-linear-fires-1", in)
 
 	if got := f.countInvocationsForAutomation(t, auto.ID); got != 1 {
 		t.Fatalf("invocations for automation = %d, want 1", got)
@@ -72,10 +81,10 @@ func TestDispatchLinearWebhookEvent_EventTypeOutsideAllowlistNeverFires(t *testi
 	// (that category already belongs to the existing agent-session
 	// pipeline) -- even a trigger explicitly configured for it must not
 	// fire through this generic path.
-	auto := f.createLinearAutomation(t, "on agent session", domainautomation.LinearTriggerConfig{EventType: "AgentSessionEvent"}, target)
+	auto := f.createLinearAutomation(t, "on agent session", domainautomation.LinearTriggerConfig{EventType: "AgentSessionEvent", OrganizationID: testLinearOrganizationID}, target)
 
-	in := domainautomation.LinearEventInput{EventType: "AgentSessionEvent"}
-	automation.DispatchLinearWebhookEvent(ctx, logger, f.automations, f.invocations, f.users, platform.DefaultTimeouts(), "AgentSessionEvent", "delivery-linear-agentsession-1", in, "")
+	in := domainautomation.LinearEventInput{EventType: "AgentSessionEvent", OrganizationID: testLinearOrganizationID}
+	automation.DispatchLinearWebhookEvent(ctx, logger, f.automations, f.invocations, platform.DefaultTimeouts(), "AgentSessionEvent", "delivery-linear-agentsession-1", in)
 
 	if got := f.countInvocationsForAutomation(t, auto.ID); got != 0 {
 		t.Fatalf("invocations for automation = %d, want 0 (event type not in LinearDispatchAllowlist)", got)
@@ -88,13 +97,46 @@ func TestDispatchLinearWebhookEvent_TeamMismatchNeverFires(t *testing.T) {
 	logger := platform.Logger(ctx)
 
 	target := domainautomation.Target{Name: "repo", URL: "https://github.com/acme/repo"}
-	auto := f.createLinearAutomation(t, "on ENG issue", domainautomation.LinearTriggerConfig{EventType: "Issue", TeamKey: "ENG"}, target)
+	auto := f.createLinearAutomation(t, "on ENG issue", domainautomation.LinearTriggerConfig{EventType: "Issue", TeamKey: "ENG", OrganizationID: testLinearOrganizationID}, target)
 
-	in := domainautomation.LinearEventInput{EventType: "Issue", TeamKey: "OPS"}
-	automation.DispatchLinearWebhookEvent(ctx, logger, f.automations, f.invocations, f.users, platform.DefaultTimeouts(), "Issue", "delivery-linear-teammismatch-1", in, "")
+	in := domainautomation.LinearEventInput{EventType: "Issue", TeamKey: "OPS", OrganizationID: testLinearOrganizationID}
+	automation.DispatchLinearWebhookEvent(ctx, logger, f.automations, f.invocations, platform.DefaultTimeouts(), "Issue", "delivery-linear-teammismatch-1", in)
 
 	if got := f.countInvocationsForAutomation(t, auto.ID); got != 0 {
 		t.Fatalf("invocations for automation = %d, want 0 (team key mismatch)", got)
+	}
+}
+
+// TestDispatchLinearWebhookEvent_OrganizationMismatchNeverFires is W3's own
+// required proof (confirmed HIGH, TENANT ISOLATION finding): an otherwise
+// fully-matching event from a DIFFERENT organization must dispatch
+// NOTHING -- pinned at this integration level (real Postgres,
+// ListActiveLinearAutomations' own new tenant predicate included), not
+// only at the pure-function MatchesLinearTrigger level
+// (internal/domain/automation/trigger_test.go).
+func TestDispatchLinearWebhookEvent_OrganizationMismatchNeverFires(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	logger := platform.Logger(ctx)
+
+	target := domainautomation.Target{Name: "repo", URL: "https://github.com/acme/repo"}
+	auto := f.createLinearAutomation(t, "on ENG issue (org 1)", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG", OrganizationID: "org-1"}, target)
+
+	// A second organization's own automation, otherwise IDENTICAL, to prove
+	// this isn't merely "the query returned zero rows" but "the query
+	// returned THAT organization's own rows, and only those".
+	autoOrg2 := f.createLinearAutomation(t, "on ENG issue (org 2)", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG", OrganizationID: "org-2"}, target)
+
+	// The live event reports "org-2" -- must fire ONLY org-2's own
+	// automation, never org-1's.
+	in := domainautomation.LinearEventInput{EventType: "Issue", Action: "create", TeamKey: "ENG", OrganizationID: "org-2"}
+	automation.DispatchLinearWebhookEvent(ctx, logger, f.automations, f.invocations, platform.DefaultTimeouts(), "Issue", "delivery-linear-org-mismatch-1", in)
+
+	if got := f.countInvocationsForAutomation(t, auto.ID); got != 0 {
+		t.Fatalf("invocations for org-1's automation = %d, want 0 (a different organization's event must dispatch nothing for org-1)", got)
+	}
+	if got := f.countInvocationsForAutomation(t, autoOrg2.ID); got != 1 {
+		t.Fatalf("invocations for org-2's automation = %d, want 1 (the matching organization's own automation must still fire)", got)
 	}
 }
 
@@ -115,14 +157,14 @@ func TestDispatchLinearWebhookEvent_ThrottlesUnboundedInvocations(t *testing.T) 
 	logger := platform.Logger(ctx)
 
 	target := domainautomation.Target{Name: "repo", URL: "https://github.com/acme/repo"}
-	auto := f.createLinearAutomation(t, "on issue create (throttle)", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG"}, target)
+	auto := f.createLinearAutomation(t, "on issue create (throttle)", domainautomation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG", OrganizationID: testLinearOrganizationID}, target)
 
-	in := domainautomation.LinearEventInput{EventType: "Issue", Action: "create", TeamKey: "ENG"}
+	in := domainautomation.LinearEventInput{EventType: "Issue", Action: "create", TeamKey: "ENG", OrganizationID: testLinearOrganizationID}
 
 	const attempts = domainautomation.DispatchThrottleThreshold + 5
 	for i := 0; i < attempts; i++ {
 		deliveryID := fmt.Sprintf("delivery-linear-throttle-%d", i)
-		automation.DispatchLinearWebhookEvent(ctx, logger, f.automations, f.invocations, f.users, platform.DefaultTimeouts(), "Issue", deliveryID, in, "")
+		automation.DispatchLinearWebhookEvent(ctx, logger, f.automations, f.invocations, platform.DefaultTimeouts(), "Issue", deliveryID, in)
 	}
 
 	if got := f.countInvocationsForAutomation(t, auto.ID); got != domainautomation.DispatchThrottleThreshold {

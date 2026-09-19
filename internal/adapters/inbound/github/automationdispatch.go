@@ -442,7 +442,13 @@ func githubEventSenderID(body []byte) (id int64, ok bool) {
 // delivery -- called from NewHandler's own returned func immediately after
 // the delivery-dedup claim succeeds, BEFORE any of the @mention/merge-gate/
 // capture-command lanes below it, and unconditionally (regardless of which,
-// if any, of those lanes goes on to also handle this exact event).
+// if any, of those lanes goes on to also handle this exact event). "Best
+// effort" below is about FAILURE only (a panic/error here never takes down
+// a lane below it) -- it says nothing about the WALL CLOCK this call may
+// spend ahead of every one of those lanes, on their SAME shared request
+// budget; see NewHandler's own call site (handler.go) for the "W5 audit
+// fix" section naming that residual, real risk plainly rather than
+// implying this doc comment already covers it.
 //
 // Nil-safe (cfg.Automations == nil or cfg.AutomationInvocations == nil,
 // this package's own handler_test.go, or any other minimal wiring that

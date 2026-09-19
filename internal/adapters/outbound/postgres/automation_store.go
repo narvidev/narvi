@@ -154,10 +154,13 @@ func (s *AutomationStore) ListActiveGitHubAutomations(ctx context.Context) ([]sq
 }
 
 // ListActiveLinearAutomations returns every active, linear-triggered
-// automation -- backs the live Linear webhook dispatch path (§8.4,
-// app/automation's own lineardispatch.go).
-func (s *AutomationStore) ListActiveLinearAutomations(ctx context.Context) ([]sqlcgen.Automation, error) {
-	return s.q.ListActiveLinearAutomations(ctx)
+// automation SCOPED TO organizationID -- backs the live Linear webhook
+// dispatch path (§8.4, app/automation's own lineardispatch.go). W3 audit
+// fix: organizationID is now REQUIRED (never "" meaning "every
+// organization") -- see the generated query's own doc comment
+// (queries/automations.sql) for the tenant-isolation "why".
+func (s *AutomationStore) ListActiveLinearAutomations(ctx context.Context, organizationID string) ([]sqlcgen.Automation, error) {
+	return s.q.ListActiveLinearAutomations(ctx, organizationID)
 }
 
 // ClaimCronFire is the cron trigger pump's own per-automation CAS guard --

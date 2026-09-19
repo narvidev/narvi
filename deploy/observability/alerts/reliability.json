@@ -70,6 +70,14 @@
       "severity": "warning",
       "thresholdDerivation": "Any occurrence: unlike an orphan reap, a turn_false_failure_total increment has no documented benign single-race explanation — every one means platform.Timeouts.TurnDeadline (60m, internal/platform/timeouts.go — 'chosen with margin below SupervisorTurnCap') fired on a turn that was, in fact, still genuinely working. Worth a look every time, not just above some rate.",
       "runbook": "docs/runbooks/turn-false-failures.md"
+    },
+    {
+      "name": "AutomationDispatchDroppedAny",
+      "description": "A matching automation could not be dispatched off a live GitHub/Linear webhook delivery because platform.Timeouts.AutomationDispatchTotalBudget ran out before its own throttle-check or create-invocation call could complete (internal/app/automation, W4 audit fix). This drop is PERMANENT — the delivery's own claim is already taken, so a provider redelivery returns at the duplicate check before dispatch runs again, and no reconciler exists over automation_invocations.source_delivery_id to notice the gap — the sandboxed agent run this automation was supposed to create simply never happens, with nothing but this metric to say so.",
+      "metrics": ["automation_dispatch_dropped_total"],
+      "condition": "increase(automation_dispatch_dropped_total[10m]) > 0",
+      "severity": "warning",
+      "thresholdDerivation": "Presence, not a rate, mirroring OutboxDeadLetterAny/AutoMergeAuthDeadLetterAny's own identical reasoning: AutomationDispatchTotalBudget (5.25s at the shipped default, DefaultTimeouts, internal/platform/timeouts.go) is sized to comfortably cover the list call plus one matching automation's own full retry chain — see that field's own doc comment for the deliberate, documented limit this alert exists to make visible (more than a handful of matching automations on one delivery, or meaningful per-call execution latency, both of which this design accepts rather than solves inline; docs/DECISIONS.md D-08). There is no 'normal' rate of hitting either: any occurrence is worth a look, either at the delivery's own fan-out shape or at Postgres latency. No runbook yet (this alert's own introduction, alongside the metric instrument it references) -- Runbook is left empty rather than pointed at an unrelated existing page, mirroring AutoMergeAuthDeadLetterAny's own identical precedent."
     }
   ]
 }

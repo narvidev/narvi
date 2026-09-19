@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
@@ -299,5 +300,53 @@ func TestDispatchGitHubWebhookEvent_MarksAndClearsCreatorUnauthorized(t *testing
 	}
 	if row.CreatorUnauthorizedSince.Valid {
 		t.Fatal("CreatorUnauthorizedSince.Valid = true, want false (a successful machine-origin dispatch must clear the earlier denial mark)")
+	}
+}
+
+// TestDispatchGitHubWebhookEvent_TransientCreatorLookupFailureDoesNotMarkUnauthorized
+// is W9's own required proof (confirmed LOW finding: "an error is recorded
+// as a verdict"): a machine-origin ("status") delivery whose automation
+// creator IS genuinely linked and authorized must NOT have
+// creator_unauthorized_since written just because the ONE Postgres round
+// trip that would have proven that (actorauthz.AuthorizeLinkedActorVerdict's
+// own users.GetByID call) happened to fail transiently. users is backed by
+// its OWN, separate pool -- opened against the SAME database via
+// automation.IntegrationTestPoolAndConnStr's own shared connection string,
+// then immediately closed -- so only the creator-authorization lookup
+// fails; f.automations/f.invocations stay on the healthy shared pool, so
+// the list/throttle/create calls all succeed normally and this delivery's
+// only failure is the one this test targets.
+func TestDispatchGitHubWebhookEvent_TransientCreatorLookupFailureDoesNotMarkUnauthorized(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	logger := platform.Logger(ctx)
+
+	creator := f.createAutomationCreator(t, "transient-lookup", sqlcgen.UserRoleMaintainer)
+	target := domainautomation.Target{Name: "repo", URL: "https://github.com/acme/repo"}
+	auto := f.createGitHubAutomationWithCreator(t, "on status success (transient creator lookup failure)", domainautomation.GitHubTriggerConfig{Event: "status", Conclusion: "success"}, target, creator.ID)
+
+	_, connStr := automation.IntegrationTestPoolAndConnStr(t)
+	brokenPool, err := pgxpool.New(ctx, connStr)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	brokenPool.Close() // closed BEFORE any query -- every Acquire/Query on it now fails.
+	brokenUsers := narvipg.NewUserStore(brokenPool)
+
+	in := domainautomation.GitHubEventInput{
+		EventType: "status", RepoFullName: "acme/repo", DefaultBranch: "main", SHA: "shaMain", Conclusion: "success",
+		Branches: []domainautomation.GitHubEventBranch{{Name: "main", HeadSHA: "shaMain"}},
+	}
+	automation.DispatchGitHubWebhookEvent(ctx, logger, f.automations, f.invocations, brokenUsers, platform.DefaultTimeouts(), "status", "delivery-github-transient-creator-lookup-1", in)
+
+	if got := f.countInvocationsForAutomation(t, auto.ID); got != 0 {
+		t.Fatalf("invocations = %d, want 0 (fails closed identically to a genuine denial, even though this specific failure is transient)", got)
+	}
+	row, err := f.automations.Get(ctx, auto.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if row.CreatorUnauthorizedSince.Valid {
+		t.Fatal("CreatorUnauthorizedSince.Valid = true, want false (W9 audit fix: a transient lookup failure is not a verdict and must not be recorded as one -- this creator IS genuinely linked and authorized)")
 	}
 }

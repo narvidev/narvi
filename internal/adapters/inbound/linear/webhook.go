@@ -355,7 +355,12 @@ func NewWebhookHandler(deps Deps) http.HandlerFunc {
 		// LinearDispatchAllowlist deliberately excludes AgentSessionEvent
 		// itself -- see that allowlist's own doc comment for why). See
 		// dispatchAutomationsBestEffort's own doc comment
-		// (automationdispatch.go) for the full design and panic-isolation.
+		// (automationdispatch.go) for the full design and panic-isolation --
+		// and github's own identical call site (handler.go)'s own "W5 audit
+		// fix" section for why that panic-isolation guarantee is about
+		// FAILURE, never about the WALL CLOCK this call spends ahead of the
+		// AgentSessionEvent pipeline below, on the same shared request-path
+		// budget. Applies here verbatim -- not re-explained a second time.
 		dispatchAutomationsBestEffort(ctx, logger, deps, eventType, deliveryID, rawBody)
 
 		if eventType != agentSessionEventType && payload.Type != agentSessionEventType {

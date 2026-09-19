@@ -41,6 +41,7 @@ function baseAutomation(overrides: Partial<Automation> = {}): Automation {
     lastRunAt: null,
     lastRunStatus: null,
     artifactSummary: null,
+    creatorUnauthorizedSince: null,
     ...overrides,
   }
 }

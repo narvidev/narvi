@@ -314,8 +314,34 @@ type LinearTriggerConfig struct {
 	// means "any action for this EventType matches".
 	Action string
 	// TeamKey, when non-empty, additionally requires LinearEventInput.
-	// TeamKey to match exactly -- "" means "no team filter".
+	// TeamKey to match exactly -- "" means "no team filter". W6 audit fix:
+	// REJECTED outright at ValidateLinearTriggerConfig for an EventType in
+	// linearEventTypesWithNoTeamConcept (below) -- see that map's own doc
+	// comment for why a non-empty TeamKey paired with one of those event
+	// types can never be satisfied, ever, rather than silently dead.
 	TeamKey string
+	// OrganizationID is W3 audit fix's own required addition (confirmed
+	// HIGH-severity, TENANT ISOLATION finding: "the only workspace check is
+	// 'some linear_installations row exists for this organizationId' -- the
+	// sending workspace is never compared to anything the automation
+	// names"). Linear's own top-level "organizationId" (the SAME field
+	// D9's own installation lookup already authenticates, internal/
+	// adapters/inbound/linear/automationdispatch.go) -- required, and
+	// compared EXACTLY against the live event's own LinearEventInput.
+	// OrganizationID by MatchesLinearTrigger below, mirroring
+	// TargetMatchesGitHubEvent's own repo-scoping half on the GitHub side:
+	// GitHub has no separate "organization" concept here because a
+	// target's own clone URL (an "owner/repo" path) IS already globally
+	// unique and directly comparable against the event's own
+	// RepoFullName; Linear has no per-target equivalent (an automation's
+	// own configured target repos are git repositories, structurally
+	// unrelated to which Linear WORKSPACE may trigger it), so this field
+	// is the tenant boundary Linear needs that GitHub gets from Target.URL
+	// for free. Required (never "" means no filter, unlike TeamKey/Action)
+	// -- an automation with no recorded organization would otherwise fire
+	// for EVERY installed workspace's own matching event, which is
+	// precisely the vulnerability this fix closes.
+	OrganizationID string
 }
 
 // ErrEmptyLinearEventType is ValidateLinearTriggerConfig's own sentinel.
@@ -325,12 +351,52 @@ var ErrEmptyLinearEventType = errors.New("automation: linear trigger config: eve
 // own D10 audit fix, for Linear.
 var ErrLinearEventNotDispatchable = errors.New("automation: linear trigger config: event type is not in the dispatchable allowlist")
 
+// ErrEmptyLinearOrganizationID is ValidateLinearTriggerConfig's own W3
+// audit fix sentinel -- see LinearTriggerConfig.OrganizationID's own doc
+// comment for the full "why" this is required, never optional.
+var ErrEmptyLinearOrganizationID = errors.New("automation: linear trigger config: organization id must not be empty")
+
+// ErrLinearTeamFilterNotSupported is ValidateLinearTriggerConfig's own W6
+// audit fix sentinel (confirmed MEDIUM finding: "a Linear Comment trigger
+// with a team filter can never fire") -- see
+// linearEventTypesWithNoTeamConcept's own doc comment for the full "why".
+var ErrLinearTeamFilterNotSupported = errors.New("automation: linear trigger config: team filter is not supported for this event type")
+
+// linearEventTypesWithNoTeamConcept is ValidateLinearTriggerConfig's own
+// closed, typed carve-out -- W6 audit fix (confirmed MEDIUM finding).
+// Linear's "Comment" data-change webhook payload carries no team object at
+// all (confirmed directly against Linear's own published webhook payload
+// documentation during this fix's own investigation: the Comment payload's
+// "data" object carries id/createdAt/updatedAt/archivedAt/body/edited/
+// issueId/userId -- no team, and no nested issue object a team could be
+// read from either), unlike "Issue" (whose own "data.team.key" is exactly
+// LinearTriggerConfig.TeamKey's worked example). buildLinearEventInput
+// (internal/adapters/inbound/linear/automationdispatch.go) therefore
+// always yields LinearEventInput.TeamKey == "" for a Comment event, and
+// MatchesLinearTrigger's own exact-match TeamKey filter (below) then
+// always rejects a configured, non-empty TeamKey -- the same defect shape
+// D14 already fixed on the GitHub side for a configured branch on an
+// issues/issue_comment automation (eventTypesWithNoBranchConcept,
+// dispatch.go), except there is no equivalent "substitute meaning" to
+// carve out here the way D14 gave Target.Branch for GitHub (a Comment
+// event has no branch-shaped downstream use for TeamKey to mean something
+// else): a team filter genuinely CANNOT be satisfied for this event type,
+// full stop, so the correct fix is refusing the impossible combination at
+// creation time (ValidateLinearTriggerConfig), never accepting it and
+// leaving it silently dead forever the way an unvalidated combination did.
+var linearEventTypesWithNoTeamConcept = map[string]bool{
+	"Comment": true,
+}
+
 // ValidateLinearTriggerConfig validates cfg before it is accepted onto an
 // automation with TriggerTypeLinear -- mirrors
 // ValidateGitHubTriggerConfig's own D10 audit fix exactly: EventType must
 // also be one ClassifyLinearDispatch itself recognizes, the SAME register
 // app/automation.DispatchLinearWebhookEvent consults at live dispatch
-// time.
+// time. W3 audit fix: OrganizationID is now also required (see that
+// field's own doc comment). W6 audit fix: a non-empty TeamKey paired with
+// an EventType in linearEventTypesWithNoTeamConcept is refused outright,
+// rather than accepted and left silently, permanently dead.
 func ValidateLinearTriggerConfig(cfg LinearTriggerConfig) error {
 	if cfg.EventType == "" {
 		return ErrEmptyLinearEventType
@@ -338,22 +404,51 @@ func ValidateLinearTriggerConfig(cfg LinearTriggerConfig) error {
 	if ClassifyLinearDispatch(cfg.EventType) != LinearDispatchNotSkipped {
 		return fmt.Errorf("%w: %q", ErrLinearEventNotDispatchable, cfg.EventType)
 	}
+	if cfg.OrganizationID == "" {
+		return ErrEmptyLinearOrganizationID
+	}
+	if cfg.TeamKey != "" && linearEventTypesWithNoTeamConcept[cfg.EventType] {
+		return fmt.Errorf("%w: %q", ErrLinearTeamFilterNotSupported, cfg.EventType)
+	}
 	return nil
 }
 
 // LinearEventInput is the minimal shape MatchesLinearTrigger needs from a
 // live Linear webhook event -- see GitHubEventInput's own doc comment for
 // the identical "caller derives this, this package never parses a raw
-// payload" reasoning.
+// payload" reasoning. OrganizationID is W3 audit fix's own required
+// addition -- see LinearTriggerConfig.OrganizationID's own doc comment.
 type LinearEventInput struct {
-	EventType string
-	Action    string
-	TeamKey   string
+	EventType      string
+	Action         string
+	TeamKey        string
+	OrganizationID string
 }
 
 // MatchesLinearTrigger reports whether in satisfies cfg's own filter --
 // mirrors MatchesGitHubTrigger's own exact-match-per-populated-field logic.
+// W3 audit fix: OrganizationID is now an UNCONDITIONAL exact-match
+// requirement (never "no filter" the way TeamKey/Action's own "" means) --
+// see LinearTriggerConfig.OrganizationID's own doc comment for why this is
+// the tenant boundary Linear needs, mirroring TargetMatchesGitHubEvent's
+// own repo-scoping requirement on the GitHub side. Checked FIRST,
+// deliberately: every other field below is a business-logic filter this
+// automation's own configuration chose; this one is an authorization
+// boundary, and fails closed before any of those are even consulted, the
+// same "structural check first" ordering ClassifyGitHubDispatch/
+// ClassifyLinearDispatch already establish for event-type allowlisting.
 func MatchesLinearTrigger(cfg LinearTriggerConfig, in LinearEventInput) bool {
+	// Zero-value guard: cfg.OrganizationID == "" must NEVER match, even
+	// against an event whose own in.OrganizationID also happens to be ""
+	// (a malformed/never-resolved delivery) -- an unconditional "" == ""
+	// comparison would fail OPEN on exactly that degenerate pairing, the
+	// one shape ValidateLinearTriggerConfig's own requirement (this field's
+	// own doc comment) exists to make unreachable for cfg, but this
+	// function must not silently assume its own caller always validated
+	// first.
+	if cfg.OrganizationID == "" || cfg.OrganizationID != in.OrganizationID {
+		return false
+	}
 	if cfg.EventType != in.EventType {
 		return false
 	}

@@ -76,8 +76,37 @@ ORDER BY id ASC;
 -- The Linear twin of ListActiveGitHubAutomations immediately above --
 -- backs app/automation's own lineardispatch.go, called inline from
 -- internal/adapters/inbound/linear's own webhook.go.
+--
+-- W3 audit fix (confirmed HIGH, TENANT ISOLATION finding): this query used
+-- to carry no tenant predicate at all -- the only workspace check
+-- anywhere on the Linear dispatch path was "some linear_installations row
+-- exists for this delivery's own organizationId" (D9), which establishes
+-- that SOME workspace installed this app, never that THIS automation
+-- belongs to the SAME workspace the live event came from. Unlike
+-- ListActiveGitHubAutomations (whose own repo/branch scoping happens
+-- entirely in-app, via TargetMatchesGitHubEvent comparing a target's own
+-- clone URL against the event's repository -- GitHub needs no separate
+-- tenant predicate here because a target's "owner/repo" path is already
+-- globally unique), a Linear-triggered automation's own configured target
+-- repos are ordinary git repositories with no relationship to which
+-- Linear WORKSPACE may trigger it -- so Linear's tenant boundary has to be
+-- the workspace itself, sqlc.arg('organization_id') compared directly
+-- against trigger_config's own "organizationId" field
+-- (LinearTriggerConfig.OrganizationID, required at creation time,
+-- internal/domain/automation/trigger.go). trigger_config->>'organizationId'
+-- mirrors this codebase's own existing JSONB-field-predicate precedent
+-- (queries/events.sql's own payload->>'gen'/payload->>'metric' filters)
+-- rather than a new dedicated column: automations is documented elsewhere
+-- (ListAutomations, above) as "expected to stay small", so this predicate
+-- needs no supporting index to stay a single, cheap index/seq scan over an
+-- already trigger_type/status-narrowed row set. A pre-existing row with no
+-- "organizationId" key at all (impossible going forward -- creation-time
+-- validation now requires it -- but defensively: trigger_config->>'x' on
+-- a missing key returns SQL NULL) can never equal a real, non-NULL
+-- organization_id argument, so it is excluded, never matched by accident.
 SELECT * FROM automations
 WHERE trigger_type = 'linear' AND status = 'active'
+  AND trigger_config->>'organizationId' = sqlc.arg('organization_id')::text
 ORDER BY id ASC;
 
 -- name: ClaimCronFire :one

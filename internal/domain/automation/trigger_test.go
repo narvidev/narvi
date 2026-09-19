@@ -145,7 +145,7 @@ func TestMatchesGitHubTrigger(t *testing.T) {
 }
 
 func TestValidateLinearTriggerConfig(t *testing.T) {
-	if err := automation.ValidateLinearTriggerConfig(automation.LinearTriggerConfig{EventType: "Issue"}); err != nil {
+	if err := automation.ValidateLinearTriggerConfig(automation.LinearTriggerConfig{EventType: "Issue", OrganizationID: "org-1"}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	err := automation.ValidateLinearTriggerConfig(automation.LinearTriggerConfig{})
@@ -158,9 +158,37 @@ func TestValidateLinearTriggerConfig(t *testing.T) {
 // mirrors TestValidateGitHubTriggerConfig_RejectsEventOutsideDispatchAllowlist,
 // for Linear -- D10's own audit fix.
 func TestValidateLinearTriggerConfig_RejectsEventTypeOutsideDispatchAllowlist(t *testing.T) {
-	err := automation.ValidateLinearTriggerConfig(automation.LinearTriggerConfig{EventType: "AgentSessionEvent"})
+	err := automation.ValidateLinearTriggerConfig(automation.LinearTriggerConfig{EventType: "AgentSessionEvent", OrganizationID: "org-1"})
 	if !errors.Is(err, automation.ErrLinearEventNotDispatchable) {
 		t.Fatalf("got %v, want ErrLinearEventNotDispatchable", err)
+	}
+}
+
+// TestValidateLinearTriggerConfig_RequiresOrganizationID is W3's own
+// required proof (confirmed HIGH, TENANT ISOLATION finding): an empty
+// OrganizationID must be rejected at creation time, exactly like an empty
+// EventType -- never silently accepted and left to fire for every
+// installed workspace.
+func TestValidateLinearTriggerConfig_RequiresOrganizationID(t *testing.T) {
+	err := automation.ValidateLinearTriggerConfig(automation.LinearTriggerConfig{EventType: "Issue"})
+	if !errors.Is(err, automation.ErrEmptyLinearOrganizationID) {
+		t.Fatalf("got %v, want ErrEmptyLinearOrganizationID", err)
+	}
+}
+
+// TestValidateLinearTriggerConfig_RejectsTeamFilterOnCommentEvent is W6's
+// own required proof (confirmed MEDIUM finding: "a Linear Comment trigger
+// with a team filter can never fire"): the impossible combination must be
+// refused at creation time, not accepted and left silently dead.
+func TestValidateLinearTriggerConfig_RejectsTeamFilterOnCommentEvent(t *testing.T) {
+	err := automation.ValidateLinearTriggerConfig(automation.LinearTriggerConfig{EventType: "Comment", TeamKey: "ENG", OrganizationID: "org-1"})
+	if !errors.Is(err, automation.ErrLinearTeamFilterNotSupported) {
+		t.Fatalf("got %v, want ErrLinearTeamFilterNotSupported", err)
+	}
+	// An UNCONFIGURED team filter on the SAME event type is fine -- only a
+	// non-empty TeamKey is the impossible combination.
+	if err := automation.ValidateLinearTriggerConfig(automation.LinearTriggerConfig{EventType: "Comment", OrganizationID: "org-1"}); err != nil {
+		t.Fatalf("unexpected error for an unconfigured team filter on Comment: %v", err)
 	}
 }
 
@@ -173,26 +201,45 @@ func TestMatchesLinearTrigger(t *testing.T) {
 	}{
 		{
 			"event type only, matches",
-			automation.LinearTriggerConfig{EventType: "Issue"},
-			automation.LinearEventInput{EventType: "Issue", Action: "create"},
+			automation.LinearTriggerConfig{EventType: "Issue", OrganizationID: "org-1"},
+			automation.LinearEventInput{EventType: "Issue", Action: "create", OrganizationID: "org-1"},
 			true,
 		},
 		{
 			"event type mismatch",
-			automation.LinearTriggerConfig{EventType: "Issue"},
-			automation.LinearEventInput{EventType: "Comment"},
+			automation.LinearTriggerConfig{EventType: "Issue", OrganizationID: "org-1"},
+			automation.LinearEventInput{EventType: "Comment", OrganizationID: "org-1"},
 			false,
 		},
 		{
 			"team filter matches",
-			automation.LinearTriggerConfig{EventType: "Issue", TeamKey: "ENG"},
-			automation.LinearEventInput{EventType: "Issue", TeamKey: "ENG"},
+			automation.LinearTriggerConfig{EventType: "Issue", TeamKey: "ENG", OrganizationID: "org-1"},
+			automation.LinearEventInput{EventType: "Issue", TeamKey: "ENG", OrganizationID: "org-1"},
 			true,
 		},
 		{
 			"team filter mismatch",
-			automation.LinearTriggerConfig{EventType: "Issue", TeamKey: "ENG"},
-			automation.LinearEventInput{EventType: "Issue", TeamKey: "OPS"},
+			automation.LinearTriggerConfig{EventType: "Issue", TeamKey: "ENG", OrganizationID: "org-1"},
+			automation.LinearEventInput{EventType: "Issue", TeamKey: "OPS", OrganizationID: "org-1"},
+			false,
+		},
+		{
+			// W3 audit fix's own required proof at the matcher level: an
+			// otherwise fully-matching event from a DIFFERENT organization
+			// must never match -- this is the tenant boundary itself.
+			"organization mismatch, otherwise fully matching",
+			automation.LinearTriggerConfig{EventType: "Issue", Action: "create", TeamKey: "ENG", OrganizationID: "org-1"},
+			automation.LinearEventInput{EventType: "Issue", Action: "create", TeamKey: "ENG", OrganizationID: "org-2"},
+			false,
+		},
+		{
+			// Zero-value guard: an unconfigured (empty) cfg.OrganizationID
+			// must never match, even against an event whose own
+			// OrganizationID is ALSO empty -- an unconditional "" == ""
+			// comparison would fail OPEN here.
+			"both organization ids empty must not match",
+			automation.LinearTriggerConfig{EventType: "Issue", OrganizationID: ""},
+			automation.LinearEventInput{EventType: "Issue", OrganizationID: ""},
 			false,
 		},
 	}

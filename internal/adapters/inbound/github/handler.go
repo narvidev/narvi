@@ -421,6 +421,39 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 		// the closed, typed event-category allowlist
 		// (domainautomation.GitHubDispatchAllowlist) it enforces before
 		// ever evaluating a single trigger.
+		//
+		// # W5 audit fix: that guarantee is about FAILURE, not TIME
+		//
+		// Confirmed MEDIUM finding: the paragraph above is true for a panic
+		// or an error return (dispatchAutomationsBestEffort's own recover,
+		// automationdispatch.go) -- it says nothing about WALL CLOCK, and
+		// this call sits on the request path, before every lane below it,
+		// bounded only by platform.Timeouts.AutomationDispatchTotalBudget
+		// (5.25s at the shipped default -- sized against ITS OWN retry
+		// chain, see that field's own doc comment, never against how much
+		// of THIS handler's shared time budget is fair to leave for the
+		// lanes below). Nothing here imposes an overall deadline across the
+		// whole handler, so a slow automation dispatch (many matching
+		// automations, or the per-call Postgres latency platform.Timeouts.
+		// AutomationDispatchTotalBudget's own "W1 audit fix" section
+		// documents as unbounded) can consume enough of GitHub's own shared
+		// webhook-delivery timeout that the lanes below, though they DO
+		// still run (no suppression IN THIS PROCESS), effectively never
+		// complete in time for GitHub to see this delivery as successful --
+		// and a human-triggered redelivery answers at the duplicate-claim
+		// check above before ANY lane, including this one, runs again. This
+		// is therefore a REAL, if indirect, way a lane below can go
+		// unserved, distinct from and not covered by the failure/panic
+		// guarantee this comment used to present as the whole story. Not
+		// fixed by bounding this call any further here: platform.Timeouts.
+		// AutomationDispatchTotalBudget is already this lane's OWN bound,
+		// sized against the retry chain it must contain (W1); shrinking it
+		// again purely to leave more room for the lanes below would
+		// reintroduce the exact "arbitrary literal, picked independently of
+		// what it actually needs to contain" shape W1 fixed once already.
+		// docs/DECISIONS.md's D-08 entry names the architectural fix (move
+		// dispatch off the request path) this residual risk shares with
+		// W4's own budget-exhaustion-drop finding.
 		dispatchAutomationsBestEffort(ctx, logger, cfg, coalescer.Identities, coalescer.Users, eventType, deliveryID, body)
 
 		// (§31.7's own G4 arming write): captured for EVERY `pull_request`
