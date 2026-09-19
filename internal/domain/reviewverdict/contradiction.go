@@ -34,12 +34,16 @@ const (
 	// merge-completion call sites as OutcomeConfirmed (httpapi.
 	// MergePullRequest, internal/app/automerge's own worker), gated on
 	// RevalidateForMerge/RevalidateForAutoMerge's own viaAcceptance
-	// return value (internal/app/decisioninbox/revalidate.go) -- counted
-	// as CONTESTED by ContradictionRate below, exactly like
-	// OutcomeOverridden, because a merge that only happened via a human
-	// waiving the engine's own judgment is, by construction, not evidence
-	// that judgment was right: an acceptance must never mechanically
-	// drive the contradiction rate down.
+	// return value (internal/app/decisioninbox/revalidate.go) --
+	// EXCLUDED from both total and contested by ContradictionRate below
+	// (round-5 adversarial review, finding V1, correcting this comment's
+	// own prior claim that it counted as contested): this PR was never
+	// auto-approved at all -- the engine refused it -- so it does not
+	// belong in a metric §21.2 itself defines over auto-approved PRs. See
+	// internal/adapters/outbound/postgres/queries/autoapprovaloutcomes.sql's
+	// own CountAutoApprovalOutcomesInWindow comment for the worked
+	// arithmetic. It is still recorded, and still visible per-PR in the
+	// decision inbox -- only this aggregate's population excludes it.
 	OutcomeAcceptedOverride Outcome = "accepted_override"
 )
 
@@ -53,15 +57,15 @@ const (
 // brand-new repo must see "no data yet", never a falsely reassuring "0%
 // so far".
 //
-// contested is expected to be <= total (every OutcomeOverridden AND
-// OutcomeAcceptedOverride row is also counted in total, since all three
-// outcome values share the SAME underlying query -- internal/app/
-// reviewverdict's own CountAutoApprovalOutcomesInWindow); this function
-// does not itself validate that relationship (a pure arithmetic reduction
-// over values the caller's own query already guarantees are consistent,
-// mirroring MedianLatency's own "caller fetches, this package only
-// reduces" split), but the returned rate is naturally in [0, 1] whenever
-// the caller's own invariant holds.
+// contested is expected to be <= total (every OutcomeOverridden row is
+// also counted in total; OutcomeAcceptedOverride rows are excluded from
+// BOTH, since the underlying query -- internal/app/reviewverdict's own
+// CountAutoApprovalOutcomesInWindow -- filters them out entirely, round-5
+// finding V1); this function does not itself validate that relationship
+// (a pure arithmetic reduction over values the caller's own query already
+// guarantees are consistent, mirroring MedianLatency's own "caller
+// fetches, this package only reduces" split), but the returned rate is
+// naturally in [0, 1] whenever the caller's own invariant holds.
 func ContradictionRate(total, contested int) (rate float64, ok bool) {
 	if total == 0 {
 		return 0, false

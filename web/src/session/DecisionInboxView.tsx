@@ -442,22 +442,32 @@ export function DecisionInboxRow({ item, canMerge }: { item: DecisionInboxItem; 
         is the ONLY place a maintainer+ can see WHY an acceptance they
         already granted still does nothing here.
 
+        `kind === 'release'` (round-5 finding V4) joins the same two:
+        aggregate.go's own isReleaseCut branch now ALSO computes a real,
+        non-empty AcceptanceMergeBlockedReason whenever a release-cut row
+        carries an acceptance, explaining that §15's manifest check is a
+        separate gate an acceptance has no effect on. Before this fix
+        that field was left uncomputed for this row kind specifically, so
+        a release-cut row's own real, wire-carried acceptance rendered
+        NOTHING anywhere on this screen -- no chip (releaseChipData's own
+        matching fix), no justification, no accepter, no blocked reason
+        -- indistinguishable from "no acceptance was ever granted".
+
         `!= null` (T5, round 4, adversarial review, corrected: was
         `!== null`) -- acceptanceMergeBlockedReason carries
         `omitempty,omitzero` server-side (restdtos.DecisionInboxItem), so
-        an EMPTY reason (buildPROpenItem's own isReleaseCut branch, or any
-        future acceptanceMergeable=false path that leaves the reason
-        uncomputed) is OMITTED from the JSON entirely, arriving here as
-        `undefined`, never `null`. `!== null` alone does not exclude
-        `undefined` (`undefined !== null` is `true` in JS), so the OLD
-        guard let this block through with `item.
+        an EMPTY reason (any acceptanceMergeable=false path that leaves
+        the reason uncomputed) is OMITTED from the JSON entirely, arriving
+        here as `undefined`, never `null`. `!== null` alone does not
+        exclude `undefined` (`undefined !== null` is `true` in JS), so the
+        OLD guard let this block through with `item.
         acceptanceMergeBlockedReason` itself `undefined`, rendering the
         literal text "Still blocked: undefined" -- a real string, not a
         crash, which is exactly why no test caught it. `!= null` (loose
         equality, an established idiom in this codebase -- costRollup.ts)
         excludes BOTH.
       */}
-      {((kind === 'pr' && item.kind === 'needs_review') || kind === 'handoff') &&
+      {((kind === 'pr' && item.kind === 'needs_review') || kind === 'handoff' || kind === 'release') &&
         hasAcceptedOverride(item) &&
         !canMergeViaAcceptance(item) &&
         item.acceptanceMergeBlockedReason != null && (
@@ -542,8 +552,16 @@ export function DecisionInboxRow({ item, canMerge }: { item: DecisionInboxItem; 
         (prChipData, rendered for `kind === 'pr' || kind === 'handoff'`
         already) had nothing beneath it explaining who accepted, why, or
         when -- a bare chip a maintainer+ could not act on or understand.
+
+        `kind === 'release'` (round-5 finding V4) joins the same two, for
+        the identical reason: acceptanceJustification/acceptedBy/
+        acceptedAt were ALREADY on the wire, unconditionally, for a
+        release-cut row carrying an acceptance -- this view was simply
+        never told to look for `kind === 'release'` here, so that data
+        rendered nowhere at all (the "accepted override" chip above,
+        releaseChipData, closes the other half of this same gap).
       */}
-      {(kind === 'pr' || kind === 'handoff') && hasAcceptedOverride(item) && item.acceptanceJustification !== null && (
+      {(kind === 'pr' || kind === 'handoff' || kind === 'release') && hasAcceptedOverride(item) && item.acceptanceJustification !== null && (
         <span className="qwhy">
           <T text={`Accepted despite refusal: ${item.acceptanceJustification}`} />
           {item.acceptedBy !== null && (

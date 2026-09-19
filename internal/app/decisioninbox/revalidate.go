@@ -251,6 +251,40 @@ func RevalidateForAutoMerge(ctx context.Context, deps Deps, sourceControl ports.
 // SAME outcome the contradiction-rate read model was calibrated to
 // never blur (§21.2). Both are the zero value whenever ok=false or
 // honorAcceptance=false, since neither caller needs them in either case.
+// The refusal-reason strings below are each defined ONCE and shared by
+// every site that must describe the SAME underlying fact to a human --
+// revalidateCore's own return values immediately below, AND
+// buildPROpenItem's AcceptanceMergeBlockedReason assignments
+// (aggregate.go), which describe what these SAME mandatory criteria
+// found on a given row WITHOUT re-running revalidateCore itself (T6,
+// round 4, adversarial review). Round-5 finding V3: these used to be six
+// independent, hand-typed string literals in aggregate.go -- one
+// (reasonReviewDecisionDegraded) had ALREADY drifted from this file's
+// own copy, silently dropping its trailing clause, exactly the kind of
+// paraphrase a maintainer changing the wording here has no way to
+// notice. A single definition makes that drift structurally impossible
+// rather than merely commented against.
+const (
+	reasonHandoffItem            = "this pull request is a handoff item, not an ordinary code-review merge decision"
+	reasonReviewDecisionDegraded = "this pull request's review decision could not be confirmed (a degraded GitHub read) -- failing closed rather than trusting an unconfirmed read"
+	reasonChangesRequested       = "this pull request has changes requested by a reviewer"
+	reasonNotPlatformAuthored    = "this pull request was not authored by a platform session"
+	reasonOpenFinding            = "this pull request has an open, unresolved review finding"
+	reasonBaseCommitUnconfirmed  = "this pull request's base commit could not be confirmed (a live check failed) -- try again shortly"
+
+	// reasonNoLongerMeetsCriteriaFmt is this function's own probe-refusal
+	// AND final-refusal wording -- used at BOTH points below (the probe,
+	// before any live SCM call, and the final post-freshness-check
+	// re-evaluation) so the two never independently drift from each
+	// other either. NOT shared with aggregate.go's own
+	// AcceptanceMergeBlockedReason "...even with its accepted override
+	// applied" case: that field is a simpler, acceptance-specific
+	// summary that deliberately never interpolates the engine's own live
+	// Reason detail (%s here) -- a different fact, not a copy of this
+	// one.
+	reasonNoLongerMeetsCriteriaFmt = "this pull request no longer meets the auto-approval eligibility criteria: %s"
+)
+
 func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceControl, token string, repoFullName string, prNumber int, target ports.OpenPR, honorAcceptance bool) (ok bool, headSHA string, reason string, viaAcceptance bool, acceptanceID string, err error) {
 	if target.Draft {
 		return false, "", "this pull request is a draft", false, "", nil
@@ -266,7 +300,7 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 
 	hasNeedsHuman, _, isHandoffPR := classifyPRLabels(target.Labels)
 	if isHandoffPR {
-		return false, "", "this pull request is a handoff item, not an ordinary code-review merge decision", false, "", nil
+		return false, "", reasonHandoffItem, false, "", nil
 	}
 
 	// a degraded review-decision read (GitHub's
@@ -287,14 +321,14 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	// record that decision.
 	if target.ReviewDecisionDegraded {
 		platform.Logger(ctx).Warn("decisioninbox: review-decision read was degraded, refusing merge -- could not confirm whether a reviewer requested changes", "repo_full_name", repoFullName, "pr_number", prNumber)
-		return false, "", "this pull request's review decision could not be confirmed (a degraded GitHub read) -- failing closed rather than trusting an unconfirmed read", false, "", nil
+		return false, "", reasonReviewDecisionDegraded, false, "", nil
 	}
 	if target.HasChangesRequested {
-		return false, "", "this pull request has changes requested by a reviewer", false, "", nil
+		return false, "", reasonChangesRequested, false, "", nil
 	}
 
 	if !isPlatformAuthored(ctx, deps, target.HTMLURL) {
-		return false, "", "this pull request was not authored by a platform session", false, "", nil
+		return false, "", reasonNotPlatformAuthored, false, "", nil
 	}
 
 	openFindings, findingsErr := countOpenFindings(ctx, deps, repoFullName, prNumber)
@@ -305,7 +339,7 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		// Mirrors buildPROpenItem's own identical "kept as its own,
 		// separate AND-condition" reasoning (aggregate.go) -- never
 		// folded into the eligibility engine itself.
-		return false, "", "this pull request has an open, unresolved review finding", false, "", nil
+		return false, "", reasonOpenFinding, false, "", nil
 	}
 	ciGreen := target.CIConclusion == ports.CIConclusionSuccess
 	// ciConclusionDegraded is target.CIConclusionDegraded, verbatim --
@@ -528,7 +562,7 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	// comment. Checking the reason string alone here would misread "eligible,
 	// via acceptance" as a refusal.
 	if probeEligible, probeReason, _ := autoapproval.ComputeEligibleWithAcceptance(probeInput, cfg, accepted); !probeEligible {
-		return false, "", fmt.Sprintf("this pull request no longer meets the auto-approval eligibility criteria: %s", probeReason), false, "", nil
+		return false, "", fmt.Sprintf(reasonNoLongerMeetsCriteriaFmt, probeReason), false, "", nil
 	}
 
 	// The probe passed: on every criterion except base freshness, this PR
@@ -594,7 +628,7 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		// guarantee G3 established for the ancestor check below applies
 		// here too.
 		platform.Logger(ctx).Warn("decisioninbox: resolve base branch's live tip failed, refusing merge -- could not confirm the pull request's current base commit", "error", resolveErr, "repo_full_name", repoFullName, "pr_number", prNumber)
-		return false, "", "this pull request's base commit could not be confirmed (a live check failed) -- try again shortly", false, "", nil
+		return false, "", reasonBaseCommitUnconfirmed, false, "", nil
 	}
 
 	// baseAdvancedWithoutRewrite (D3, second adversarial-review round;
@@ -809,7 +843,7 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		TouchedBlastRadiusKnown:             touchedBlastRadiusKnown,
 	}, cfg, accepted)
 	if !eligible {
-		return false, "", fmt.Sprintf("this pull request no longer meets the auto-approval eligibility criteria: %s", eligReason), false, "", nil
+		return false, "", fmt.Sprintf(reasonNoLongerMeetsCriteriaFmt, eligReason), false, "", nil
 	}
 
 	// acceptanceID is only ever meaningful alongside viaAcceptance=true

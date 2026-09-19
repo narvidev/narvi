@@ -185,19 +185,35 @@ export function prChipData(
     chips.push({ tone: 'crit', text: 'changes requested' })
   }
 
-  // finding F5 (adversarial review): before this chip existed, an
-  // accepted-but-engine-refused PR (§21.1b) rendered on this queue
-  // INDISTINGUISHABLY from an ordinary, never-looked-at needs_review row
-  // -- the ONLY signal a maintainer had that a human already authorised
-  // proceeding was the raw JSON API response, never anything this view
-  // rendered. acceptanceId, never acceptanceJustification's own
-  // emptiness, is the existence signal (mirrors decisionInboxItemToDTO's
-  // own identical correction, server-side, finding F3b).
-  if (hasAcceptedOverride(item)) {
-    chips.push({ tone: 'warn', text: 'accepted override' })
-  }
+  chips.push(...acceptedOverrideChipData(item))
 
   return chips
+}
+
+/**
+ * acceptedOverrideChipData is the "accepted override" chip itself (finding
+ * F5, adversarial review): before this chip existed, an accepted-but-
+ * engine-refused PR (§21.1b) rendered on this queue INDISTINGUISHABLY from
+ * an ordinary, never-looked-at needs_review row -- the ONLY signal a
+ * maintainer had that a human already authorised proceeding was the raw
+ * JSON API response, never anything this view rendered. acceptanceId,
+ * never acceptanceJustification's own emptiness, is the existence signal
+ * (mirrors decisionInboxItemToDTO's own identical correction, server-side,
+ * finding F3b).
+ *
+ * Extracted to its OWN function (round-5 finding V4) so releaseChipData
+ * below can push the SAME chip a release-cut row carrying an acceptance
+ * now also earns -- before this fix, this logic lived only inside
+ * prChipData, which DecisionInboxView.tsx never calls for a release-cut
+ * row (rowKind returns 'release', not 'pr', for any row with
+ * isRelease=true), so such a row's own real, wire-carried acceptance
+ * rendered no trace of it at all: not this chip, not the justification/
+ * accepter/blocked-reason text below -- indistinguishable from "no
+ * acceptance was ever granted", the exact condition round 4's own T6 fix
+ * declared unacceptable for handoff rows.
+ */
+function acceptedOverrideChipData(item: Pick<DecisionInboxItem, 'acceptanceId'>): DecisionInboxChip[] {
+  return hasAcceptedOverride(item) ? [{ tone: 'warn', text: 'accepted override' }] : []
 }
 
 /**
@@ -285,7 +301,9 @@ export function canMergeViaAcceptance(item: Pick<DecisionInboxItem, 'acceptanceI
  *     discipline (that file's own compositionDecisionChip/
  *     compositionDecisionSummaryText doc comment).
  */
-export function releaseChipData(item: Pick<DecisionInboxItem, 'manifestFindingsCount' | 'manifestCoveragePartial' | 'aggregateReviewTriggered' | 'compositionReviewed' | 'compositionDecision'>): DecisionInboxChip[] {
+export function releaseChipData(
+  item: Pick<DecisionInboxItem, 'manifestFindingsCount' | 'manifestCoveragePartial' | 'aggregateReviewTriggered' | 'compositionReviewed' | 'compositionDecision' | 'acceptanceId'>,
+): DecisionInboxChip[] {
   const chips: DecisionInboxChip[] = []
 
   if (item.manifestFindingsCount !== null) {
@@ -314,6 +332,15 @@ export function releaseChipData(item: Pick<DecisionInboxItem, 'manifestFindingsC
       }
     }
   }
+
+  // Round-5 finding V4: a release cut carrying an active, applicable
+  // acceptance earns the SAME "accepted override" chip a PR-shaped row
+  // does (acceptedOverrideChipData's own doc comment, above) -- §15's
+  // manifest check is a separate gate an acceptance says nothing about,
+  // but whether one exists at all is a visibility question, not a
+  // mergeability one, and this row was previously indistinguishable from
+  // one that was never accepted at all.
+  chips.push(...acceptedOverrideChipData(item))
 
   return chips
 }

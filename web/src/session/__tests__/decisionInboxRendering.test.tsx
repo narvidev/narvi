@@ -497,6 +497,78 @@ describe('DecisionInboxRow -- a handoff row (awaiting_approval) with an acceptan
   })
 })
 
+// Round-5 finding V4: a release-cut row (isRelease=true, kind=needs_review)
+// carrying an active, applicable acceptance used to render NO trace of it
+// at all -- not the "accepted override" chip (releaseChipData never called
+// acceptedOverrideChipData), not the justification/accepter text (gated on
+// `kind === 'pr' || kind === 'handoff'`, and rowKind returns 'release', not
+// 'pr', whenever isRelease is true), not even a "Still blocked" reason
+// (aggregate.go's own isReleaseCut branch left AcceptanceMergeBlockedReason
+// uncomputed). Indistinguishable, on this screen, from "no acceptance was
+// ever granted" -- the exact condition round 4's own T6 fix (the handoff
+// describe block immediately above) declared unacceptable for a DIFFERENT
+// row kind. Mirrors that block's own cases, for 'release' instead of
+// 'handoff'.
+describe('DecisionInboxRow -- a release-cut row (needs_review, isRelease) with an acceptance is visible, never mergeable', () => {
+  function releaseItem(overrides: Partial<DecisionInboxItem> = {}): DecisionInboxItem {
+    return prItem({
+      kind: 'needs_review',
+      isRelease: true,
+      htmlUrl: 'https://github.com/acme/widgets/pull/201',
+      ...overrides,
+    })
+  }
+
+  it('renders the "accepted override" chip alongside its own manifest chip, never in place of it', () => {
+    const item = releaseItem({
+      manifestFindingsCount: 0,
+      acceptanceId: 'acceptance-1',
+      acceptanceJustification: 'Reviewed offline; risk accepted.',
+      acceptanceMergeable: false,
+      acceptanceMergeBlockedReason:
+        'this pull request is a release cut, subject to the separate release-manifest check (§15) -- an accepted override authorises past the code-review engine\'s own refusal only, and has no effect on that check',
+    })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).toContain('accepted override')
+    expect(html).toContain('manifest: 0 flags')
+  })
+
+  it('renders the justification and accepter, exactly like a needs_review or handoff row does', () => {
+    const item = releaseItem({
+      acceptanceId: 'acceptance-1',
+      acceptanceJustification: 'Reviewed offline; risk accepted.',
+      acceptedBy: '11111111-1111-1111-1111-111111111111',
+      acceptedAt: '2026-08-20T10:00:00Z',
+      acceptanceMergeable: false,
+      acceptanceMergeBlockedReason: 'this pull request is a release cut, subject to the separate release-manifest check (§15)',
+    })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).toContain('accepted override')
+    expect(html).toContain('Reviewed offline; risk accepted.')
+    expect(html).toContain('11111111-1111-1111-1111-111111111111')
+  })
+
+  it('renders "Still blocked: <reason>", never a Merge button -- an acceptance never bypasses §15\'s manifest check', () => {
+    const item = releaseItem({
+      acceptanceId: 'acceptance-1',
+      acceptanceJustification: 'Reviewed offline; risk accepted.',
+      acceptanceMergeable: false,
+      acceptanceMergeBlockedReason: 'this pull request is a release cut, subject to the separate release-manifest check (§15)',
+    })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).toContain('Still blocked')
+    expect(html).toContain('release-manifest check')
+    expect(html).not.toContain('>Merge<')
+  })
+
+  it('an ordinary release-cut row (never accepted) renders neither the chip nor any acceptance text', () => {
+    const item = releaseItem({ acceptanceId: null, acceptanceJustification: null, acceptanceMergeBlockedReason: null })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).not.toContain('accepted override')
+    expect(html).not.toContain('Still blocked')
+  })
+})
+
 // T8 (round 4, adversarial review): replacing acceptanceJustification/
 // acceptedBy/acceptanceMergeBlockedReason's own `<T text=…>` renders with
 // bare interpolations passes every OTHER test in this file (React escapes

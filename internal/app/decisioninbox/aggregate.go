@@ -709,11 +709,15 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 		// indistinguishable, on the wire, from "no acceptance was ever
 		// granted", and rendered a bare "accepted override" chip
 		// client-side with nothing explaining it (DecisionInboxView.tsx).
-		// The reason string below is copied VERBATIM from revalidateCore's
-		// own identical refusal, never a second, independently-worded
-		// phrasing for the same fact.
+		// The reason below is reasonHandoffItem, the SAME package-level
+		// constant revalidateCore itself returns (revalidate.go) -- a
+		// single definition, never a second, independently-typed copy
+		// that could silently drift from that refusal's own wording
+		// (round-5 finding V3: this used to be a hand-copied literal
+		// whose own comment merely CLAIMED verbatim equality with no way
+		// to verify or enforce it).
 		if acceptanceID != "" {
-			item.AcceptanceMergeBlockedReason = "this pull request is a handoff item, not an ordinary code-review merge decision"
+			item.AcceptanceMergeBlockedReason = reasonHandoffItem
 		}
 	case isReleaseCut:
 		// §16.1: "needs_review... includes release cuts with manifest
@@ -728,12 +732,25 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 		// exists precisely because a release cut needs a human looking at
 		// the compliance findings, not a fast-path auto-merge.
 		//
-		// AcceptanceMergeable/AcceptanceMergeBlockedReason are left
-		// uncomputed here too (T6, round 4, adversarial review): an
-		// acceptance authorises past the CODE-REVIEW engine's own
-		// refusal, and says nothing about §15's SEPARATE manifest check --
-		// this branch's own comment above already establishes a release
-		// cut can never fast-path around that regardless.
+		// AcceptanceMergeable stays at its own Go zero value, false, here
+		// UNCONDITIONALLY (T6, round 4, adversarial review): an acceptance
+		// authorises past the CODE-REVIEW engine's own refusal, and says
+		// nothing about §15's SEPARATE manifest check -- this branch's
+		// own comment above already establishes a release cut can never
+		// fast-path around that regardless. That reasoning is right about
+		// MERGEABILITY and was, before this fix, silently applied to
+		// VISIBILITY too: AcceptanceMergeBlockedReason was ALSO left
+		// uncomputed, so a release-cut row carrying an active, applicable
+		// acceptance rendered no trace of it anywhere (round-5 finding
+		// V4) -- indistinguishable from "no acceptance was ever granted",
+		// the exact condition round 4's own T6 fix declared unacceptable
+		// for handoff rows. Whether an acceptance can unblock THIS row's
+		// merge is a different question from whether a maintainer can SEE
+		// that one exists; this fix answers the second question honestly
+		// without changing the answer to the first.
+		if acceptanceID != "" {
+			item.AcceptanceMergeBlockedReason = "this pull request is a release cut, subject to the separate release-manifest check (§15) -- an accepted override authorises past the code-review engine's own refusal only, and has no effect on that check"
+		}
 		item.Kind = decisioninbox.KindNeedsReview
 	default:
 		platformAuthored := isPlatformAuthored(ctx, deps, pr.HTMLURL)
@@ -818,16 +835,25 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 		// null-check guard mishandled. Moved here, outside the if/else, so
 		// it runs identically regardless of which Kind this row just
 		// landed in.
+		// Each reason below is one of revalidate.go's own package-level
+		// refusal-reason constants -- the SAME definition revalidateCore
+		// itself returns for this exact fact, never a second,
+		// independently-typed copy (round-5 finding V3). Before this fix,
+		// reasonReviewDecisionDegraded's own text had ALREADY silently
+		// drifted from revalidateCore's copy (this switch's own version
+		// dropped its trailing "-- failing closed..." clause) -- proof
+		// that a hand-copied paraphrase here, not caught by any test, is
+		// exactly the failure this sharing closes.
 		if acceptanceID != "" {
 			switch {
 			case !platformAuthored:
-				item.AcceptanceMergeBlockedReason = "this pull request was not authored by a platform session"
+				item.AcceptanceMergeBlockedReason = reasonNotPlatformAuthored
 			case pr.HasChangesRequested:
-				item.AcceptanceMergeBlockedReason = "this pull request has changes requested by a reviewer"
+				item.AcceptanceMergeBlockedReason = reasonChangesRequested
 			case pr.ReviewDecisionDegraded:
-				item.AcceptanceMergeBlockedReason = "this pull request's review decision could not be confirmed (a degraded GitHub read)"
+				item.AcceptanceMergeBlockedReason = reasonReviewDecisionDegraded
 			case openFindings > 0:
-				item.AcceptanceMergeBlockedReason = "this pull request has an open, unresolved review finding"
+				item.AcceptanceMergeBlockedReason = reasonOpenFinding
 			default:
 				// The mandatory, never-waived criteria above all clear
 				// -- the ONE remaining question is whether the engine's
@@ -860,19 +886,27 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 				// judgement, exactly the failure mode this file's
 				// SCMFetchFailed discipline exists elsewhere to prevent.
 				// Mirrors this same function's pr.ReviewDecisionDegraded
-				// arm a few lines up ("could not be confirmed (a
-				// degraded GitHub read)") and RevalidateForMerge's OWN
-				// identical live-check-failure wording (revalidate.go,
-				// "this pull request's base commit could not be
-				// confirmed (a live check failed) -- try again shortly")
-				// -- reused verbatim here, never a third phrasing for the
-				// same fact.
+				// arm a few lines up (reasonReviewDecisionDegraded) and
+				// RevalidateForMerge's OWN identical live-check-failure
+				// wording (revalidate.go's own reasonBaseCommitUnconfirmed
+				// constant) -- the SAME shared definition, never a third,
+				// independently-typed phrasing for the same fact
+				// (round-5 finding V3).
 				acceptanceEligibility := computeRealEligibility(ctx, deps, repoFullName, pr, ciGreen, hasNeedsHuman, token, now, true)
 				switch {
 				case acceptanceEligibility.Degraded:
 					degraded = true
-					item.AcceptanceMergeBlockedReason = "this pull request's base commit could not be confirmed (a live check failed) -- try again shortly"
+					item.AcceptanceMergeBlockedReason = reasonBaseCommitUnconfirmed
 				case !acceptanceEligibility.Eligible:
+					// Deliberately NOT one of the shared reason constants:
+					// this fact ("still refused even WITH the acceptance
+					// applied") has no revalidateCore counterpart in this
+					// exact form -- revalidateCore's own equivalent
+					// (reasonNoLongerMeetsCriteriaFmt below) interpolates
+					// the engine's own live Reason detail into the string;
+					// this field is a simpler, acceptance-specific summary
+					// by design, so sharing would force one of the two
+					// call sites to say something it does not mean.
 					item.AcceptanceMergeBlockedReason = "this pull request no longer meets the auto-approval eligibility criteria, even with its accepted override applied"
 				default:
 					item.AcceptanceMergeable = true

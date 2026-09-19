@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"golang.org/x/sync/errgroup"
 
@@ -377,6 +378,162 @@ func TestAcceptReviewVerdict_JustificationTooLong_Returns400(t *testing.T) {
 
 	// No acceptance must have been recorded.
 	_, ok, err := appreviewverdict.GetActiveAcceptance(ctx, narvipg.NewReviewVerdictAcceptanceStore(rig.pool), repoFullName, 507)
+	if err != nil {
+		t.Fatalf("GetActiveAcceptance: error = %v, want nil", err)
+	}
+	if ok {
+		t.Error("GetActiveAcceptance: ok = true, want false -- an over-long justification must never record an acceptance")
+	}
+}
+
+// TestAcceptReviewVerdict_JustificationExactlyAtBound_Accepted pins
+// round-5 finding V5, the ACCEPTING side of the boundary
+// TestAcceptReviewVerdict_JustificationTooLong_Returns400 above only ever
+// proved the refusing side of: exactly
+// maxAcceptReviewVerdictJustificationChars (4000) runes must succeed
+// (201), never be refused. Before this test existed, nothing in this
+// tree distinguished "the cap is > 4000" (would also pass this case) from
+// "the cap is >= 4000" (the actual, correct condition, decisioninbox.go's
+// own `n > maxAcceptReviewVerdictJustificationChars` check) -- an off-by-
+// one on the wrong side of that comparison would have silently refused a
+// justification at EXACTLY the documented limit, and nothing would fail.
+//
+// Mutation-test target: changing decisioninbox.go's own `n >
+// maxAcceptReviewVerdictJustificationChars` to `n >=
+// maxAcceptReviewVerdictJustificationChars` must turn this test's own 201
+// assertion into a failure (400 instead).
+func TestAcceptReviewVerdict_JustificationExactlyAtBound_Accepted(t *testing.T) {
+	rig := newDecisionInboxTestRig(t, &fakeMergeSourceControl{})
+	ctx := context.Background()
+
+	_, token := rig.createAuthenticatedUser(ctx, t, sqlcgen.UserRoleMaintainer)
+	const repoFullName = "acme/accept-verdict-justification-exactly-at-bound"
+	rig.seedAutoApprovedVerdict(ctx, t, repoFullName, 508, "headsha508")
+
+	record, hasVerdict, err := appreviewverdict.GetLatest(ctx, appreviewverdict.Deps{ReviewVerdicts: rig.reviewVerdicts}, repoFullName, 508)
+	if err != nil || !hasVerdict {
+		t.Fatalf("GetLatest: hasVerdict=%v err=%v", hasVerdict, err)
+	}
+
+	atBound := strings.Repeat("a", 4000)
+	body, err := json.Marshal(restdtos.AcceptReviewVerdictRequest{
+		RepoFullName: repoFullName, PrNumber: 508, VerdictId: record.ID, Justification: atBound,
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	var got restdtos.ReviewVerdictAcceptance
+	status := rig.doJSON(t, http.MethodPost, "/api/decision-inbox/accept-verdict", body, &got, token)
+	if status != http.StatusCreated {
+		t.Fatalf("status = %d, want %d -- a justification of EXACTLY the documented 4000-character limit must be accepted, not refused", status, http.StatusCreated)
+	}
+	if got.Justification != atBound {
+		t.Errorf("Justification length = %d, want the full %d-rune string stored verbatim, never silently truncated", len(got.Justification), len(atBound))
+	}
+}
+
+// TestAcceptReviewVerdict_JustificationMultiByte_ExactlyAtBound_Accepted
+// pins round-5 finding V5: the comment on maxAcceptReviewVerdictJustificationChars
+// (decisioninbox.go) promises a multi-byte justification is "not
+// penalized for its ENCODING rather than its actual length" -- measured
+// in runes (utf8.RuneCountInString), never bytes. Nothing in this tree
+// actually exercised that promise with genuinely multi-byte content
+// before this test: every existing case here used plain ASCII, where rune
+// count and byte count are numerically identical and so cannot tell a
+// correct rune-counting implementation apart from an incorrect
+// byte-counting one. "日" is a 3-byte UTF-8 character (one rune) --
+// 4000 of them is exactly 4000 runes (at the documented bound, must be
+// ACCEPTED) but 12000 bytes (three times OVER the bound), so this case
+// fails under byte counting and passes only under rune counting.
+//
+// Mutation-test target: replacing decisioninbox.go's own
+// `utf8.RuneCountInString(justification)` with `len(justification)` must
+// turn this test's own 201 assertion into a failure (400 instead, since
+// the byte length -- 12000 -- exceeds the 4000-character bound).
+func TestAcceptReviewVerdict_JustificationMultiByte_ExactlyAtBound_Accepted(t *testing.T) {
+	rig := newDecisionInboxTestRig(t, &fakeMergeSourceControl{})
+	ctx := context.Background()
+
+	_, token := rig.createAuthenticatedUser(ctx, t, sqlcgen.UserRoleMaintainer)
+	const repoFullName = "acme/accept-verdict-justification-multibyte-at-bound"
+	rig.seedAutoApprovedVerdict(ctx, t, repoFullName, 509, "headsha509")
+
+	record, hasVerdict, err := appreviewverdict.GetLatest(ctx, appreviewverdict.Deps{ReviewVerdicts: rig.reviewVerdicts}, repoFullName, 509)
+	if err != nil || !hasVerdict {
+		t.Fatalf("GetLatest: hasVerdict=%v err=%v", hasVerdict, err)
+	}
+
+	multiByteAtBound := strings.Repeat("日", 4000)
+	if gotRunes := utf8.RuneCountInString(multiByteAtBound); gotRunes != 4000 {
+		t.Fatalf("fixture bug -- RuneCountInString(multiByteAtBound) = %d, want exactly 4000", gotRunes)
+	}
+	if gotBytes := len(multiByteAtBound); gotBytes <= 4000 {
+		t.Fatalf("fixture bug -- len(multiByteAtBound) = %d, want > 4000 (this case must ONLY pass under rune counting)", gotBytes)
+	}
+
+	body, err := json.Marshal(restdtos.AcceptReviewVerdictRequest{
+		RepoFullName: repoFullName, PrNumber: 509, VerdictId: record.ID, Justification: multiByteAtBound,
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	var got restdtos.ReviewVerdictAcceptance
+	status := rig.doJSON(t, http.MethodPost, "/api/decision-inbox/accept-verdict", body, &got, token)
+	if status != http.StatusCreated {
+		t.Fatalf("status = %d, want %d -- a 4000-RUNE justification must be accepted regardless of its byte length (12000 here); the bound is documented and measured in runes, never bytes", status, http.StatusCreated)
+	}
+	if got.Justification != multiByteAtBound {
+		t.Error("Justification stored does not match the submitted multi-byte text verbatim")
+	}
+}
+
+// TestAcceptReviewVerdict_JustificationMultiByte_OverBound_Returns400
+// pins round-5 finding V5's OTHER boundary side, with the SAME
+// genuinely-multi-byte content as the accepting-side case immediately
+// above: 4001 runes of "日" (12003 bytes) must be refused, exactly one
+// rune past the accepted case's own 4000. Pinning both sides with the
+// SAME character proves the boundary itself is a rune count, not merely
+// that byte counting happens to also refuse at some larger byte length.
+//
+// Mutation-test target: the SAME as
+// TestAcceptReviewVerdict_JustificationTooLong_Returns400 above -- deleting
+// the RuneCountInString check turns this test's own 400 assertion into a
+// failure too (a request this large would still be well under
+// maxRequestBodyBytes' own 1 MiB whole-request cap).
+func TestAcceptReviewVerdict_JustificationMultiByte_OverBound_Returns400(t *testing.T) {
+	rig := newDecisionInboxTestRig(t, &fakeMergeSourceControl{})
+	ctx := context.Background()
+
+	_, token := rig.createAuthenticatedUser(ctx, t, sqlcgen.UserRoleMaintainer)
+	const repoFullName = "acme/accept-verdict-justification-multibyte-over-bound"
+	rig.seedAutoApprovedVerdict(ctx, t, repoFullName, 510, "headsha510")
+
+	record, hasVerdict, err := appreviewverdict.GetLatest(ctx, appreviewverdict.Deps{ReviewVerdicts: rig.reviewVerdicts}, repoFullName, 510)
+	if err != nil || !hasVerdict {
+		t.Fatalf("GetLatest: hasVerdict=%v err=%v", hasVerdict, err)
+	}
+
+	multiByteOverBound := strings.Repeat("日", 4001)
+	if gotRunes := utf8.RuneCountInString(multiByteOverBound); gotRunes != 4001 {
+		t.Fatalf("fixture bug -- RuneCountInString(multiByteOverBound) = %d, want exactly 4001", gotRunes)
+	}
+
+	body, err := json.Marshal(restdtos.AcceptReviewVerdictRequest{
+		RepoFullName: repoFullName, PrNumber: 510, VerdictId: record.ID, Justification: multiByteOverBound,
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	status := rig.doJSON(t, http.MethodPost, "/api/decision-inbox/accept-verdict", body, nil, token)
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d -- one rune past the bound must be refused even though it is well under the whole-request byte cap", status, http.StatusBadRequest)
+	}
+
+	// No acceptance must have been recorded.
+	_, ok, err := appreviewverdict.GetActiveAcceptance(ctx, narvipg.NewReviewVerdictAcceptanceStore(rig.pool), repoFullName, 510)
 	if err != nil {
 		t.Fatalf("GetActiveAcceptance: error = %v, want nil", err)
 	}

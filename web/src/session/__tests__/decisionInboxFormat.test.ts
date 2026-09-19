@@ -188,57 +188,57 @@ describe('canMergeViaAcceptance -- the server\'s own mergeability answer, never 
 
 describe('releaseChipData -- a release-cut row never fabricates an aggregate-findings count', () => {
   it('zero manifest findings renders an "ok"-toned chip, not "crit"', () => {
-    const chips = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: false, aggregateReviewTriggered: false })
+    const chips = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: false, aggregateReviewTriggered: false, acceptanceId: null })
     expect(chips).toEqual([{ tone: 'ok', text: 'manifest: 0 flags' }])
   })
 
   it('one manifest finding uses the singular "flag", not "flags"', () => {
-    const chips = releaseChipData({ manifestFindingsCount: 1, manifestCoveragePartial: false, aggregateReviewTriggered: false })
+    const chips = releaseChipData({ manifestFindingsCount: 1, manifestCoveragePartial: false, aggregateReviewTriggered: false, acceptanceId: null })
     expect(chips[0]).toEqual({ tone: 'crit', text: 'manifest: 1 flag' })
   })
 
   it('multiple manifest findings render a "crit"-toned chip', () => {
-    const chips = releaseChipData({ manifestFindingsCount: 3, manifestCoveragePartial: false, aggregateReviewTriggered: false })
+    const chips = releaseChipData({ manifestFindingsCount: 3, manifestCoveragePartial: false, aggregateReviewTriggered: false, acceptanceId: null })
     expect(chips[0]).toEqual({ tone: 'crit', text: 'manifest: 3 flags' })
   })
 
   it('a null manifestFindingsCount (not actually a release cut) renders no manifest chip at all', () => {
-    const chips = releaseChipData({ manifestFindingsCount: null, manifestCoveragePartial: null, aggregateReviewTriggered: null })
+    const chips = releaseChipData({ manifestFindingsCount: null, manifestCoveragePartial: null, aggregateReviewTriggered: null, acceptanceId: null })
     expect(chips.some((c) => c.text.includes('manifest'))).toBe(false)
   })
 
   it('aggregateReviewTriggered=true adds an honest "needed" chip, never a fabricated finding count -- the aggregate diff review pass itself is not computed anywhere in this system', () => {
-    const chips = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: false, aggregateReviewTriggered: true })
+    const chips = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: false, aggregateReviewTriggered: true, acceptanceId: null })
     expect(chips).toContainEqual({ tone: 'warn', text: 'aggregate review needed' })
     expect(chips.some((c) => /aggregate:\s*\d/.test(c.text))).toBe(false)
   })
 
   it('a TRUNCATED scan finding nothing is never an "ok" chip -- 0 over an incomplete set is not a clean release', () => {
-    const chips = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: true, aggregateReviewTriggered: false })
+    const chips = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: true, aggregateReviewTriggered: false, acceptanceId: null })
     expect(chips[0].tone).not.toBe('ok')
     expect(chips[0]).toEqual({ tone: 'warn', text: 'manifest: 0 flags (partial scan)' })
   })
 
   it('a truncated scan and a complete scan with the same count never render identically', () => {
-    const complete = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: false, aggregateReviewTriggered: false })
-    const partial = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: true, aggregateReviewTriggered: false })
+    const complete = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: false, aggregateReviewTriggered: false, acceptanceId: null })
+    const partial = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: true, aggregateReviewTriggered: false, acceptanceId: null })
     expect(partial).not.toEqual(complete)
   })
 
   it('a truncated scan that DID find flags stays "crit" and still says the scan was partial', () => {
-    const chips = releaseChipData({ manifestFindingsCount: 2, manifestCoveragePartial: true, aggregateReviewTriggered: false })
+    const chips = releaseChipData({ manifestFindingsCount: 2, manifestCoveragePartial: true, aggregateReviewTriggered: false, acceptanceId: null })
     expect(chips[0]).toEqual({ tone: 'crit', text: 'manifest: 2 flags (partial scan)' })
   })
 
   it('a null manifestCoveragePartial (a server that did not report coverage) is not treated as a complete scan claim', () => {
     // null rides isRelease's own gate, so it only occurs on a non-release
     // row -- where there is no manifest chip to over-claim with at all.
-    const chips = releaseChipData({ manifestFindingsCount: null, manifestCoveragePartial: null, aggregateReviewTriggered: null })
+    const chips = releaseChipData({ manifestFindingsCount: null, manifestCoveragePartial: null, aggregateReviewTriggered: null, acceptanceId: null })
     expect(chips.some((c) => c.text.includes('manifest'))).toBe(false)
   })
 
   it('aggregateReviewTriggered=false renders no aggregate chip at all', () => {
-    const chips = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: false, aggregateReviewTriggered: false })
+    const chips = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: false, aggregateReviewTriggered: false, acceptanceId: null })
     expect(chips.some((c) => c.text.includes('aggregate'))).toBe(false)
   })
 
@@ -248,23 +248,23 @@ describe('releaseChipData -- a release-cut row never fabricates an aggregate-fin
   // compositionReviewed/compositionDecision are what let this row's own
   // chip move past that stale, unconditional text.
   it('triggered but not yet reviewed still renders the pending "needed" chip', () => {
-    const chips = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: false, aggregateReviewTriggered: true, compositionReviewed: false, compositionDecision: null })
+    const chips = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: false, aggregateReviewTriggered: true, compositionReviewed: false, compositionDecision: null, acceptanceId: null })
     expect(chips).toContainEqual({ tone: 'warn', text: 'aggregate review needed' })
   })
 
   it('reviewed but still pending a human decision renders "decision needed", not the stale "aggregate review needed" text', () => {
-    const chips = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: false, aggregateReviewTriggered: true, compositionReviewed: true, compositionDecision: 'pending' })
+    const chips = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: false, aggregateReviewTriggered: true, compositionReviewed: true, compositionDecision: 'pending', acceptanceId: null })
     expect(chips).toContainEqual({ tone: 'warn', text: 'composition: decision needed' })
     expect(chips.some((c) => c.text === 'aggregate review needed')).toBe(false)
   })
 
   it('reviewed and blocked renders a crit "blocked" chip', () => {
-    const chips = releaseChipData({ manifestFindingsCount: 1, manifestCoveragePartial: false, aggregateReviewTriggered: true, compositionReviewed: true, compositionDecision: 'blocked' })
+    const chips = releaseChipData({ manifestFindingsCount: 1, manifestCoveragePartial: false, aggregateReviewTriggered: true, compositionReviewed: true, compositionDecision: 'blocked', acceptanceId: null })
     expect(chips).toContainEqual({ tone: 'crit', text: 'composition: blocked' })
   })
 
   it('reviewed and acknowledged renders an ok "acknowledged" chip -- nothing left outstanding', () => {
-    const chips = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: false, aggregateReviewTriggered: true, compositionReviewed: true, compositionDecision: 'acknowledged' })
+    const chips = releaseChipData({ manifestFindingsCount: 0, manifestCoveragePartial: false, aggregateReviewTriggered: true, compositionReviewed: true, compositionDecision: 'acknowledged', acceptanceId: null })
     expect(chips).toContainEqual({ tone: 'ok', text: 'composition: acknowledged' })
     expect(chips.some((c) => c.text === 'aggregate review needed')).toBe(false)
   })
@@ -277,9 +277,36 @@ describe('releaseChipData -- a release-cut row never fabricates an aggregate-fin
       compositionReviewed: true,
       // @ts-expect-error -- deliberately an out-of-enum value, proving the runtime default branch, not just the type system
       compositionDecision: 'garbled',
+      acceptanceId: null,
     })
     expect(chips).toContainEqual({ tone: 'warn', text: 'composition: decision needed' })
     expect(chips.some((c) => c.text.includes('acknowledged'))).toBe(false)
+  })
+
+  // Round-5 finding V4: a release-cut row carrying an active, applicable
+  // acceptance used to render NO trace of it at all -- releaseChipData
+  // never called acceptedOverrideChipData, the same "accepted override"
+  // chip prChipData has carried since finding F5. These two cases mirror
+  // prChipData's own identical pair above (lines ~151-163).
+  it('a non-null acceptanceId adds an "accepted override" chip, alongside any manifest/composition chips', () => {
+    const chips = releaseChipData({
+      manifestFindingsCount: 0,
+      manifestCoveragePartial: false,
+      aggregateReviewTriggered: false,
+      acceptanceId: 'acceptance-1',
+    })
+    expect(chips).toContainEqual({ tone: 'warn', text: 'accepted override' })
+    expect(chips).toContainEqual({ tone: 'ok', text: 'manifest: 0 flags' })
+  })
+
+  it('a null acceptanceId (never accepted) renders no acceptance chip at all', () => {
+    const chips = releaseChipData({
+      manifestFindingsCount: 0,
+      manifestCoveragePartial: false,
+      aggregateReviewTriggered: false,
+      acceptanceId: null,
+    })
+    expect(chips.some((c) => c.text.includes('accepted'))).toBe(false)
   })
 })
 

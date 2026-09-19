@@ -3087,6 +3087,157 @@ func TestBuild_AcceptanceMergeable_HandoffRow(t *testing.T) {
 	}
 }
 
+// TestBuild_AcceptanceMergeable_ReleaseCutRow pins round-5 finding V4: a
+// release-cut row (isReleaseCut=true, a persisted §15.2 manifest check)
+// carrying an acceptance must ALSO report AcceptanceMergeable=false with a
+// NON-EMPTY reason -- mirroring TestBuild_AcceptanceMergeable_HandoffRow
+// immediately above, but for the isReleaseCut branch instead of
+// isHandoffPR. Before this fix, buildPROpenItem's own isReleaseCut case
+// never computed AcceptanceMergeBlockedReason at all (T6, round 4, left
+// this branch deliberately uncomputed, reasoning correctly about
+// MERGEABILITY -- §15's manifest check is a separate gate an acceptance
+// cannot waive -- but incoherently applying that same reasoning to
+// VISIBILITY too), shipping acceptanceMergeable=false with an EMPTY,
+// omitted reason -- indistinguishable, on the wire, from "no acceptance
+// was ever granted".
+//
+// Mutation-test target: deleting the `if acceptanceID != ""` block inside
+// buildPROpenItem's own isReleaseCut case must turn this test's own
+// non-empty AcceptanceMergeBlockedReason assertion into a failure (it
+// would read "", its Go zero value).
+func TestBuild_AcceptanceMergeable_ReleaseCutRow(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "5013"
+	const repoFullName = "acme/t7-release-accepted"
+	const prNumber = int32(84)
+
+	actor := decisionInboxActorFixture(ctx, t, pool, "t7-release-accepted@example.com", actorGitHubExternalID, tokenKey)
+
+	artifacts := narvipg.NewArtifactStore(pool)
+	sessions := narvipg.NewSessionStore(pool)
+	releaseManifestChecks := narvipg.NewReleaseManifestCheckStore(pool)
+	htmlURL := fmt.Sprintf("https://github.com/%s/pull/%d", repoFullName, prNumber)
+	platformSession, err := sessions.Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub, CreatedBy: actor.ID})
+	if err != nil {
+		t.Fatalf("create platform session: %v", err)
+	}
+	if _, err := artifacts.Create(ctx, sqlcgen.CreateArtifactParams{
+		SessionID: platformSession.ID, Type: sqlcgen.ArtifactTypePr, Url: htmlURL, Metadata: []byte("{}"),
+	}); err != nil {
+		t.Fatalf("mark PR #%d platform-authored: %v", prNumber, err)
+	}
+
+	// The release-manifest check itself -- what makes resolveReleaseCut
+	// report isReleaseCut=true for this exact (repoFullName, prNumber).
+	// The session id it's recorded against need not be the SAME session
+	// as the review verdict below (a real release cut's own manifest
+	// check and its constituent PRs' own review verdicts are recorded by
+	// different passes); reusing platformSession is just fixture economy.
+	if _, err := releaseManifestChecks.Insert(ctx, sqlcgen.InsertReleaseManifestCheckParams{
+		SessionID: platformSession.ID, RepoFullName: repoFullName, PrNumber: prNumber, BaseRef: "main", HeadRef: "release/2026.09.04",
+		ConstituentPrCount: 1, CoveragePartial: false, AggregateReviewTriggered: false,
+		AggregateReviewTriggerReasons: []byte(`[]`),
+		Findings:                      []byte(`[]`),
+		MergedPrs:                     []byte(`[]`),
+	}); err != nil {
+		t.Fatalf("insert release manifest check for PR #%d: %v", prNumber, err)
+	}
+
+	reviewVerdicts := narvipg.NewReviewVerdictStore(pool)
+	repoSettingsStore := narvipg.NewRepoSettingsStore(pool)
+	reviewFindings := narvipg.NewReviewFindingStore(pool)
+	acceptances := narvipg.NewReviewVerdictAcceptanceStore(pool)
+	verdict := review.Verdict{
+		RiskLevel:         review.RiskLevelHigh,
+		Premise:           review.PremiseStateOK,
+		TestsCoverage:     review.TestsCoverageStateAdequate,
+		DocsDrift:         review.DocsDriftStateNone,
+		ProposedShippable: review.ProposedShippableNeedsHuman,
+		FilesChanged:      3,
+	}
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	if verdict.Shippable == review.ShippableAuto {
+		t.Fatalf("fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
+	}
+	const headSHA = "sha-t7-release"
+	verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
+	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{})
+	if err != nil {
+		t.Fatalf("seed not-shippable-auto review_verdicts row: %v", err)
+	}
+	var verdictID pgtype.UUID
+	if err := verdictID.Scan(record.ID); err != nil {
+		t.Fatalf("scan verdict id: %v", err)
+	}
+	if _, _, err := appreviewverdict.Accept(ctx, acceptances, appreviewverdict.AcceptInput{
+		RepoFullName:  repoFullName,
+		PRNumber:      prNumber,
+		VerdictID:     verdictID,
+		AttemptID:     seedReviewAttemptTurn(ctx, t, pool),
+		HeadSHA:       headSHA,
+		Context:       verdictContext,
+		Reason:        string(autoapproval.ReasonNotShippableAuto),
+		Justification: "Accepted -- T7/V4 release-cut fixture.",
+		AcceptedBy:    actor.ID,
+	}); err != nil {
+		t.Fatalf("Accept() error = %v, want nil", err)
+	}
+
+	fakeSCM := &fakeDecisionInboxSourceControl{
+		openPRsByExternalID: map[string][]ports.OpenPR{
+			actorGitHubExternalID: {
+				{
+					// Deliberately NO "handoff" label -- this row's own
+					// isReleaseCut branch must be reached, never the
+					// isHandoffPR one immediately above it in the switch.
+					Owner: "acme", Repo: "t7-release-accepted", Number: int(prNumber), Title: "release cut, also carries an acceptance",
+					HTMLURL: htmlURL, HeadSHA: headSHA,
+					BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
+					Assignees:    []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}},
+					CIConclusion: ports.CIConclusionSuccess,
+					CreatedAt:    time.Now(),
+				},
+			},
+		},
+	}
+
+	deps := decisioninbox.Deps{
+		Plans: narvipg.NewPlanStore(pool), Sessions: sessions, Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: reviewFindings, SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
+		ReleaseManifestChecks: releaseManifestChecks,
+		SCMCache:              decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		TokenEncryptionKey:    tokenKey,
+		Timeouts:              platform.DefaultTimeouts(),
+		ReviewVerdict:         appreviewverdict.Deps{ReviewVerdicts: reviewVerdicts, RepoSettings: repoSettingsStore, ReviewFindings: reviewFindings, AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool), Acceptances: acceptances, Turns: narvipg.NewTurnStore(pool), Timeouts: platform.DefaultTimeouts()},
+	}
+
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil", err)
+	}
+	item := findItemByPR(result.Items, int(prNumber))
+	if item == nil {
+		t.Fatalf("PR #%d missing from the inbox entirely", prNumber)
+	}
+	if item.Kind != decisioninboxdomain.KindNeedsReview || !item.IsRelease {
+		t.Fatalf("PR #%d Kind = %s, IsRelease = %v, want needs_review/true -- fixture bug, not what this test means to check", prNumber, item.Kind, item.IsRelease)
+	}
+	if item.AcceptanceID == "" {
+		t.Fatalf("PR #%d AcceptanceID is empty, want the active acceptance's own id -- fixture bug, not what this test means to check", prNumber)
+	}
+	if item.AcceptanceMergeable {
+		t.Errorf("AcceptanceMergeable = true, want false -- an acceptance authorises past the code-review engine's own refusal only, and has no effect on §15's separate manifest check")
+	}
+	const wantReasonSubstring = "release cut"
+	if !strings.Contains(item.AcceptanceMergeBlockedReason, wantReasonSubstring) {
+		t.Errorf("AcceptanceMergeBlockedReason = %q, want it to contain %q -- a release-cut row's own acceptance must render a real, honest reason, never the empty Go zero value round 4 left every OTHER row-kind-specific reason exempt from", item.AcceptanceMergeBlockedReason, wantReasonSubstring)
+	}
+}
+
 // TestBuild_ChangedFilesListDegraded_NeverReadyToMerge is computeRealEligibility's
 // own (aggregate.go) Phase 5 audit finding 1 regression test -- the SAME
 // "otherwise fully eligible" fixture shape as

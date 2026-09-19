@@ -33,11 +33,18 @@
 --                          refusal -- NEITHER 'confirmed' (the engine did
 --                          not approve it) NOR 'overridden' (that value
 --                          means a pre-merge human disagreement, never an
---                          actual merge). Counted as CONTESTED by
---                          CountAutoApprovalOutcomesInWindow, exactly like
---                          'overridden' -- an acceptance-driven merge must
---                          never mechanically drive the contradiction rate
---                          down. See internal/domain/reviewverdict.
+--                          actual merge). EXCLUDED from both total and
+--                          contested by CountAutoApprovalOutcomesInWindow
+--                          (round-5 adversarial review, finding V1,
+--                          correcting this comment's own prior claim that
+--                          it counted as contested): this PR was never
+--                          auto-approved, so it is not part of the "auto-
+--                          approved PRs" population §21.2's own
+--                          contradiction rate measures. Still recorded,
+--                          still visible per-PR in the decision inbox --
+--                          only the aggregate excludes it. See that
+--                          query's own comment for the worked arithmetic
+--                          and internal/domain/reviewverdict.
 --                          OutcomeAcceptedOverride's own doc comment.
 -- Recorded from TWO existing call sites that already compute every fact
 -- needed at zero extra cost (internal/app/decisioninbox's own

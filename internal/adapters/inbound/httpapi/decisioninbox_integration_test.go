@@ -602,12 +602,18 @@ func TestMergePullRequest_HappyPath(t *testing.T) {
 // a high-risk/needs-human verdict refuses the merge (409), a maintainer+
 // accepts it (201), the merge then succeeds (200), and -- the decisive
 // assertion this test exists to pin -- auto_approval_outcomes records
-// 'accepted_override', NEVER 'confirmed', and CountInWindow counts it as
-// CONTESTED. Before this fix, MergePullRequest called RecordConfirmed
-// unconditionally after any successful merge, so this exact sequence
-// wrote outcome='confirmed', mechanically driving the contradiction rate
-// DOWN with every acceptance -- the harm §21.1b names by hand. Also pins
-// the merge_pr audit row's own new via_acceptance/acceptance_id fields.
+// 'accepted_override', NEVER 'confirmed' and NEVER plain 'overridden'
+// (asserted against the outcome COLUMN itself, round-5 finding V2, so
+// this test can actually tell those three values apart), and
+// CountInWindow EXCLUDES it from both total and contested (round-5
+// finding V1: it was never an auto-approved PR at all, so it does not
+// belong in either half of that population -- see
+// autoapprovaloutcomes.sql's own comment for the full "why"). Before the
+// F1 fix, MergePullRequest called RecordConfirmed unconditionally after
+// any successful merge, so this exact sequence wrote outcome='confirmed',
+// mechanically driving the contradiction rate DOWN with every acceptance
+// -- the harm §21.1b names by hand. Also pins the merge_pr audit row's
+// own new via_acceptance/acceptance_id fields.
 func TestMergePullRequest_AcceptedVerdict_RecordsAcceptedOverride(t *testing.T) {
 	const htmlURL = "https://github.com/acme/widgets/pull/1205"
 	const repoFullName = "acme/widgets"
@@ -673,15 +679,39 @@ func TestMergePullRequest_AcceptedVerdict_RecordsAcceptedOverride(t *testing.T) 
 		t.Errorf("response = %+v, want a successful merge with the fake's own sha", got)
 	}
 
-	// THE DECISIVE ASSERTION: this outcome must read as CONTESTED, never
-	// as a clean 'confirmed' auto-approval -- an acceptance-driven merge
-	// is not evidence the engine's own judgment stood.
+	// THE DECISIVE ASSERTION, part 1 (round-5 finding V2): assert the
+	// `outcome` COLUMN itself, not just the aggregate (total, contested)
+	// pair below -- the aggregate alone cannot distinguish
+	// 'accepted_override' from 'overridden' (both are, or were, counted
+	// identically by CountInWindow), so it cannot detect a regression of
+	// round 4's own defect: the wrong contested row winning the
+	// ON CONFLICT DO NOTHING race. Query the row directly.
+	var gotOutcome string
+	if err := rig.pool.QueryRow(ctx,
+		`SELECT outcome FROM auto_approval_outcomes WHERE repo_full_name = $1 AND pr_number = $2 AND head_sha = $3`,
+		repoFullName, 1205, "headsha1205",
+	).Scan(&gotOutcome); err != nil {
+		t.Fatalf("query auto_approval_outcomes.outcome: %v", err)
+	}
+	if want := string(reviewverdict.OutcomeAcceptedOverride); gotOutcome != want {
+		t.Fatalf("auto_approval_outcomes.outcome = %q, want %q -- an acceptance-driven merge must record 'accepted_override', never a clean 'confirmed' auto-approval or a plain pre-merge 'overridden' (finding F1)", gotOutcome, want)
+	}
+
+	// THE DECISIVE ASSERTION, part 2 (round-5 finding V1): 'accepted_override'
+	// is EXCLUDED from both total and contested by CountInWindow -- this
+	// PR was never auto-approved at all (the engine refused it), so it is
+	// not part of the "auto-approved PRs" population §21.2's own
+	// contradiction rate measures. See autoapprovaloutcomes.sql's own
+	// CountAutoApprovalOutcomesInWindow comment for the full "why" and
+	// the worked arithmetic. (Before that fix this asserted (1, 1) --
+	// counting the row as both auto-approved AND contested, which is
+	// exactly the mis-scoped population finding V1 corrects.)
 	total, contested, err := narvipg.NewAutoApprovalOutcomeStore(rig.pool).CountInWindow(ctx, repoFullName, pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true})
 	if err != nil {
 		t.Fatalf("count auto-approval outcomes: %v", err)
 	}
-	if total != 1 || contested != 1 {
-		t.Fatalf("outcome counts = (total=%d, contested=%d), want (1, 1) -- an acceptance-driven merge must record as CONTESTED, never as a clean 'confirmed' auto-approval (finding F1)", total, contested)
+	if total != 0 || contested != 0 {
+		t.Fatalf("outcome counts = (total=%d, contested=%d), want (0, 0) -- an 'accepted_override' row is excluded from both counts: it was never an auto-approved PR (finding V1)", total, contested)
 	}
 
 	// The merge_pr audit row carries the acceptance fact too.
