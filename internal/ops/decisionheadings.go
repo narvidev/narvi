@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 )
 
@@ -64,6 +65,20 @@ func ScanDecisionHeadings(root string) ([]int, error) {
 // duplicate, no entry out of order. Returns one human-readable message per
 // position that breaks that promise, sorted by the order the break was
 // found so the first divergence from the file's own top is always first.
+//
+// # Its own blind spot, and what closes it below
+//
+// This compares each heading's own POSITION against its number -- it has
+// no notion of how many entries SHOULD exist, only that whatever IS
+// present counts up from one with no gap. That is enough to catch a
+// heading lost from the middle (every heading after the gap now
+// mismatches its own position) but not the highest-numbered heading: lose
+// it, and 1..N-1 remains, by itself, a perfectly contiguous run starting
+// at 1 -- indistinguishable from "every heading intact" by a check that
+// only ever looks at relative position. CheckDecisionHeadingsCoverReferencedIDs
+// below closes exactly that gap, by cross-checking against a second place
+// the register already names each entry from, rather than hard-coding how
+// many headings there should be.
 func CheckDecisionHeadingsContiguous(headings []int) []string {
 	var bad []string
 	seen := make(map[int]int, len(headings)) // value -> first 1-based position it appeared at
@@ -83,5 +98,63 @@ func CheckDecisionHeadingsContiguous(headings []int) []string {
 			seen[n] = pos
 		}
 	}
+	return bad
+}
+
+// ReferencedDecisionIDs extracts every "D-NN" id cited inside the Deferred
+// table's own Subject cells (LoadDeferredDecisions, deferreddecisions.go)
+// -- e.g. the trailing "(D-08)" in "A dispatch drop from a budget-exhausted
+// delivery is visible, but not retried or reconciled (D-08)". Reuses
+// decisionIDRefPattern (decisionidref.go) rather than a second pattern, so
+// the two files agree on what a "D-NN" citation looks like. Not every
+// deferred row names one -- a row recorded before a decision was ever
+// numbered, or one that never gets one, cites nothing -- so callers must
+// not treat this as exhaustive over every "### D-NN" heading in the file,
+// only as a set that, whatever it contains, had better each still resolve
+// to a real heading.
+func ReferencedDecisionIDs(decisions []DeferredDecision) []int {
+	seen := make(map[int]bool)
+	var out []int
+	for _, d := range decisions {
+		for _, m := range decisionIDRefPattern.FindAllStringSubmatch(d.Subject, -1) {
+			n, convErr := strconv.Atoi(m[1])
+			if convErr != nil {
+				continue // not reachable given \d+, mirrors ScanDecisionIDRefs' own identical guard
+			}
+			if !seen[n] {
+				seen[n] = true
+				out = append(out, n)
+			}
+		}
+	}
+	return out
+}
+
+// CheckDecisionHeadingsCoverReferencedIDs is CheckDecisionHeadingsContiguous's
+// own closing half (see that function's own doc comment for the blind
+// spot this exists against): every id in referenced (ReferencedDecisionIDs,
+// ordinarily the Deferred table's own "(D-NN)" citations) must resolve to
+// a real "### D-NN" heading among headings. A referenced id with no
+// matching heading means the heading was lost -- or never written -- and
+// this reports it BY NUMBER, which is exactly what a purely
+// position-based comparison cannot do for the file's own highest-numbered
+// entry. Deliberately does not attempt the reverse (that every heading is
+// itself referenced back) -- most headings, adopted ones especially, are
+// never cited from the Deferred table at all, and requiring one would be
+// a fabricated obligation this file's own real content does not carry.
+func CheckDecisionHeadingsCoverReferencedIDs(headings []int, referenced []int) []string {
+	have := make(map[int]bool, len(headings))
+	for _, n := range headings {
+		have[n] = true
+	}
+	var bad []string
+	for _, n := range referenced {
+		if !have[n] {
+			bad = append(bad, fmt.Sprintf(
+				"the Deferred table cites \"(D-%02d)\" but docs/DECISIONS.md has no \"### D-%02d\" "+
+					"heading -- the heading was lost (or never written)", n, n))
+		}
+	}
+	sort.Strings(bad)
 	return bad
 }

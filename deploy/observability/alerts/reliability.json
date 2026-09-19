@@ -73,7 +73,7 @@
     },
     {
       "name": "AutomationDispatchDroppedAny",
-      "description": "A matching automation could not be dispatched off a live GitHub/Linear webhook delivery because platform.Timeouts.AutomationDispatchTotalBudget ran out before its own throttle-check or create-invocation call could complete (internal/app/automation, W4 audit fix). This drop is PERMANENT — the delivery's own claim is already taken, so a provider redelivery returns at the duplicate check before dispatch runs again, and no reconciler exists over automation_invocations.source_delivery_id to notice the gap — the sandboxed agent run this automation was supposed to create simply never happens, with nothing but this metric to say so.",
+      "description": "A matching automation could not be dispatched off a live GitHub/Linear webhook delivery because platform.Timeouts.AutomationDispatchTotalBudget ran out before its own list, throttle-check, or create-invocation call could complete (internal/app/automation, W4 audit fix, \"list\" stage added by Y2 audit fix). This drop is PERMANENT — the delivery's own claim is already taken, so a provider redelivery returns at the duplicate check before dispatch runs again, and no reconciler exists over automation_invocations.source_delivery_id to notice the gap — the sandboxed agent run this automation was supposed to create simply never happens, with nothing but this metric to say so.",
       "metrics": ["automation_dispatch_dropped_total"],
       "condition": "increase(automation_dispatch_dropped_total[10m]) > 0",
       "severity": "warning",

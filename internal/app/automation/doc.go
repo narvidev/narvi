@@ -275,7 +275,7 @@
 // (dispatchGateThrottled) in both the return value and the log -- the two
 // used to be indistinguishable.
 //
-// # U7 audit fix: Linear gets the SAME machine-origin gate GitHub's D12 already has
+// # U7 audit fix: Linear gets the SAME machine-origin gate GitHub's D12 already has -- since replaced by an outright denial
 //
 // Confirmed HIGH finding: unlike GitHub (check_run/status, D12 above),
 // Linear's own dispatchOneLinearAutomation had NO machine-origin
@@ -283,11 +283,23 @@
 // "actor" is reported as something other than a real Linear account (an
 // OAuth client or an Integration, Linear's own docs) has no human identity
 // for the adapter's own gate to authorize, and was denied unconditionally,
-// forever, regardless of configuration. domainautomation.
-// ClassifyLinearActorOrigin (dispatch.go) mirrors ClassifyGitHubEventOrigin
-// exactly, one axis over (actor.type, not event category): a machine-
-// origin actor is now authorized against the matching automation's own
-// creator, exactly like check_run/status already are.
+// forever, regardless of configuration. U7's own fix authorized that
+// machine-origin actor against the matching automation's own creator,
+// exactly like check_run/status already is.
+//
+// That fix did not survive: W2 audit fix (SECURITY, confirmed HIGH) found
+// it an unsound mirror of D12 -- unlike GitHub's check_run/status (an
+// event TYPE only GitHub itself can ever emit), Linear's actor.type is a
+// per-payload field the sender influences, so routing it to the
+// creator-authorization path was a real bypass of the human-actor gate,
+// not a structural necessity. `ClassifyLinearActorOrigin`
+// (internal/domain/automation/dispatch.go) now denies a
+// LinearEventOriginMachine verdict OUTRIGHT, at
+// `dispatchAutomationsBestEffort` (internal/adapters/inbound/linear/
+// automationdispatch.go), before any automation is even listed --
+// dispatchOneLinearAutomation carries no per-automation, creator-
+// authorizing machine-origin gate any more. See docs/DECISIONS.md's D-07
+// entry for the resulting functional limitation and its reopen condition.
 //
 // # U8 audit fix: a permanently-dead machine-origin automation now surfaces on its own row
 //
@@ -297,11 +309,12 @@
 // stays 'active' forever -- structurally incapable of ever firing again,
 // with no UPDATE query anywhere to revive it, and no visible sign of the
 // problem on the automation's own state. markCreatorUnauthorizedBestEffort/
-// clearCreatorUnauthorizedBestEffort (githubdispatch.go, shared by both
-// providers' own machine-origin gates) now set/clear
+// clearCreatorUnauthorizedBestEffort (githubdispatch.go) now set/clear
 // automations.creator_unauthorized_since (migrations/
 // 000138_automations_creator_unauthorized.up.sql) the moment that
 // authorization denies or succeeds again -- best effort, never retried,
 // never fail-closed: this is observability state, never an authorization
-// decision.
+// decision. GitHub's own machine-origin gate only: see the U7 section
+// above for why dispatchOneLinearAutomation calls neither function any
+// more.
 package automation

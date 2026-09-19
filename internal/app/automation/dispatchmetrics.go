@@ -74,11 +74,41 @@ func newAutomationDispatchDroppedTotalCounter() metric.Int64Counter {
 // from checkDispatchThrottle's own dispatchGateBudgetExhausted branch
 // (stage "throttle_check") and from dispatchOneGitHubAutomation/
 // dispatchOneLinearAutomation's own create-call dispatchBudgetExhausted(err)
-// branch (stage "create"), githubdispatch.go/lineardispatch.go -- the
-// three, and only three, places a dispatch attempt is abandoned
-// specifically because the shared budget expired, as opposed to a genuine
-// business verdict (no match, throttled, denied) or an ordinary Postgres
-// error platform.Retry already retried through.
+// branch (stage "create"), githubdispatch.go/lineardispatch.go -- these
+// are the three call sites that actually increment this counter, each
+// firing specifically because the shared budget expired, as opposed to a
+// genuine business verdict (no match, throttled, denied) or an ordinary
+// Postgres error platform.Retry already retried through.
+//
+// # A fourth site the shared budget can also abandon a dispatch at, left uncounted on purpose
+//
+// dispatchOneGitHubAutomation's own machine-origin authorization lookup
+// (githubdispatch.go, the `actorauthz.AuthorizeLinkedActorVerdict`
+// (internal/app/actorauthz/authorize.go) switch's `default:` branch --
+// verdict `LinkedActorError` (internal/app/actorauthz/authorize.go))
+// returns without ever calling this function when the shared budget
+// expiring mid-lookup turns users.GetByID into a lookup failure: that
+// automation is dropped for the identical underlying reason -- the budget
+// ran out -- but no stage records it. This is not an oversight:
+// `AuthorizeLinkedActorVerdict` collapses every lookup failure (a budget-
+// expired context, an ordinary transient Postgres error, anything else)
+// into the SAME `LinkedActorError` verdict, discarding the underlying
+// error -- so telling "budget expired" apart from "an ordinary transient
+// lookup failure" at that call site would need either an ad-hoc
+// context-deadline probe (which would mislabel a genuinely transient
+// lookup failure that merely races the budget's own expiry as a budget
+// drop) or widening `AuthorizeLinkedActorVerdict`'s own signature, shared
+// verbatim by the GitHub, Linear, and Slack identity call sites, to carry
+// a distinction none of ITS other callers need. Production behaviour at
+// this site is already correct regardless of the miscount: it fails
+// closed exactly like every other actorauthz call site in this codebase,
+// creates no invocation, and writes no creator_unauthorized_since mark
+// either way (W9 audit fix, see dispatchOneGitHubAutomation's own doc
+// comment) -- only this counter's own coverage stops short of it. Filed
+// as its own entry in docs/DECISIONS.md's Deferred table, with an
+// evaluable reopen condition, rather than left to be rediscovered as a
+// surprise the next time this counter is reconciled against a real
+// delivery.
 func recordAutomationDispatchDropped(ctx context.Context, stage string) {
 	automationDispatchDroppedTotalCounter().Add(ctx, 1, metric.WithAttributes(attribute.String("stage", stage)))
 }

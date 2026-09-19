@@ -150,16 +150,27 @@
 //     forever with no feedback. A live webhook delivery that still names an
 //     event outside the register (e.g. a type introduced to GitHub/Linear
 //     after every EXISTING automation was already validated against
-//     yesterday's register) is logged at the call site -- Warn, not Debug
-//     (D11 audit fix: this sentence used to read "logged at the call site
-//     rather than silently dropped" while every one of those call-site
-//     log lines was logger.Debug and this codebase's own deployed default
-//     log level is info -- making the OLD sentence false: a log line no
-//     operator's own default configuration ever surfaces is, in every
-//     practical sense, silently dropped. Raised to Warn so this sentence is
-//     actually true) -- expanding either allowlist is a deliberate, reviewed
-//     source edit, never an implicit consequence of a new webhook category
-//     this deployment happens to start receiving. Automation dispatch is an
+//     yesterday's register) is logged at the call site --
+//     `dispatchAutomationsBestEffort` (internal/adapters/inbound/github/
+//     automationdispatch.go and internal/adapters/inbound/linear/
+//     automationdispatch.go each own one) names the level it logs that at,
+//     and the reasoning behind it (U6/U10 audit fix), which this sentence
+//     deliberately does NOT restate. It restated one twice already and was
+//     wrong both times: D11 audit fix raised this sentence's own claimed
+//     level to Warn, correcting an earlier version that was false at the
+//     Debug those call sites actually used (a log line no operator's own
+//     default `info` configuration ever surfaces is, in every practical
+//     sense, silently dropped); a later reordering pass (U6/U10) then
+//     moved classification earlier in both adapters and picked Debug
+//     again, deliberately -- firing on ordinary, never-subscribed-to
+//     traffic is not itself a WARN-worthy symptom -- which left THIS
+//     sentence's own "Warn" claim stale a second time. The level is the
+//     call site's own decision, correct as of the audit fix that chose
+//     it; naming one here a third
+//     time would only start the same drift over again -- expanding either
+//     allowlist is a deliberate, reviewed source edit, never an implicit
+//     consequence of a new webhook category this deployment happens to
+//     start receiving. Automation dispatch is an
 //     ADDITIONAL, independent consumer of the same already-deduplicated
 //     delivery the @mention/AgentSessionEvent pipelines already process --
 //     never a replacement for either, and a panic or error inside dispatch

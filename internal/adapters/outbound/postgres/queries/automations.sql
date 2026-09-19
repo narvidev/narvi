@@ -245,16 +245,19 @@ WHERE id = $1 AND status = 'paused'
 RETURNING *;
 
 -- name: MarkAutomationCreatorUnauthorized :execrows
--- U8 audit fix -- backs app/automation's own dispatchOneGitHubAutomation/
--- dispatchOneLinearAutomation, called the moment a machine-origin
--- dispatch is denied because this automation's own created_by is not a
--- linked, non-disabled account holding authz.ActionCreateSession
+-- U8 audit fix -- backs app/automation's own dispatchOneGitHubAutomation
+-- (githubdispatch.go) only, called the moment a machine-origin (check_run/
+-- status) dispatch is denied because this automation's own created_by is
+-- not a linked, non-disabled account holding authz.ActionCreateSession
 -- (migrations/000138_automations_creator_unauthorized.up.sql's own doc
--- comment). "AND creator_unauthorized_since IS NULL" makes this
--- idempotent AND preserves the FIRST denial's own timestamp -- a
--- still-broken automation firing its trigger repeatedly must not keep
--- sliding this forward, or a maintainer reading it would see only "just
--- now", never how long this has actually been broken.
+-- comment). dispatchOneLinearAutomation never calls this: a Linear
+-- machine-origin actor is denied outright, upstream, by
+-- ClassifyLinearActorOrigin (internal/domain/automation/dispatch.go) --
+-- see docs/DECISIONS.md's D-07 entry. "AND creator_unauthorized_since IS
+-- NULL" makes this idempotent AND preserves the FIRST denial's own
+-- timestamp -- a still-broken automation firing its trigger repeatedly
+-- must not keep sliding this forward, or a maintainer reading it would
+-- see only "just now", never how long this has actually been broken.
 UPDATE automations
 SET creator_unauthorized_since = now()
 WHERE id = $1 AND creator_unauthorized_since IS NULL;

@@ -84,6 +84,73 @@ func TestCheckDecisionHeadingsContiguous_Table(t *testing.T) {
 	}
 }
 
+// TestDecisionHeadingsCoverDeferredTableReferences is Z3's own closing
+// half of TestDecisionHeadingsContiguous above: that check can only ever
+// compare a heading's own POSITION against its number, so losing the
+// file's own HIGHEST-numbered heading leaves every remaining heading in
+// perfect 1..N-1 position -- undetected, by design, the exact blind spot
+// CheckDecisionHeadingsContiguous's own doc comment names. This
+// cross-checks the real docs/DECISIONS.md against a second place the
+// register already names each entry from (the Deferred table's own
+// "(D-NN)" citations, ReferencedDecisionIDs) rather than hard-coding how
+// many headings should exist, which would itself need remembering.
+func TestDecisionHeadingsCoverDeferredTableReferences(t *testing.T) {
+	t.Parallel()
+
+	root := repoRoot(t)
+	headings, err := ScanDecisionHeadings(root)
+	if err != nil {
+		t.Fatalf("ScanDecisionHeadings: %v", err)
+	}
+	decisions, err := LoadDeferredDecisions(root)
+	if err != nil {
+		t.Fatalf("LoadDeferredDecisions: %v", err)
+	}
+	referenced := ReferencedDecisionIDs(decisions)
+	if len(referenced) == 0 {
+		t.Fatal("parsed zero \"(D-NN)\" citations from the Deferred table -- either the citation " +
+			"convention changed or every deferred row lost its id; either way this check is now " +
+			"verifying nothing")
+	}
+	if bad := CheckDecisionHeadingsCoverReferencedIDs(headings, referenced); len(bad) > 0 {
+		t.Errorf("docs/DECISIONS.md:\n%s\n\nA row in the Deferred table that cites \"(D-NN)\" is "+
+			"making a claim CI can check: that heading must still exist -- restore it, or drop the "+
+			"citation if the entry was genuinely renumbered away.", joinLines(bad))
+	}
+}
+
+// TestCheckDecisionHeadingsCoverReferencedIDs_Table is a synthetic,
+// table-driven unit test over CheckDecisionHeadingsCoverReferencedIDs
+// directly, isolated from the real docs/DECISIONS.md content
+// (TestDecisionHeadingsCoverDeferredTableReferences above already covers
+// that) -- including the exact shape this guard was written against: a
+// referenced id whose heading is the highest-numbered one, and is gone.
+func TestCheckDecisionHeadingsCoverReferencedIDs_Table(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		headings   []int
+		referenced []int
+		wantBad    bool
+	}{
+		{"no references at all", []int{1, 2, 3}, nil, false},
+		{"every reference resolves", []int{1, 2, 3}, []int{1, 3}, false},
+		{"referenced id is the missing HIGHEST heading -- CheckDecisionHeadingsContiguous's own blind spot",
+			[]int{1, 2, 3}, []int{1, 3, 4}, true},
+		{"referenced id missing from the middle", []int{1, 3}, []int{1, 2, 3}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bad := CheckDecisionHeadingsCoverReferencedIDs(tt.headings, tt.referenced)
+			if got := len(bad) > 0; got != tt.wantBad {
+				t.Errorf("CheckDecisionHeadingsCoverReferencedIDs(%v, %v) bad=%v (%v), want bad=%v",
+					tt.headings, tt.referenced, got, bad, tt.wantBad)
+			}
+		})
+	}
+}
+
 // TestScanDecisionHeadings_OrderAndParse proves ScanDecisionHeadings reads
 // numbers in file order (not sorted) and tolerates the real heading's own
 // trailing " -- **ADOPTED/DEFERRED ...** -- ..." suffix, so the contiguity
