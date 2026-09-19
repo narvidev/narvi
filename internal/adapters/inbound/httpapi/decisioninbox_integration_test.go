@@ -92,6 +92,67 @@ func (rig *decisionInboxTestRig) seedAutoApprovedVerdict(ctx context.Context, t 
 	}
 }
 
+// seedReviewAttemptTurn (round 3, finding R10, adversarial review) seeds
+// a real, minimal is_review_attempt=true turn (on a throwaway session)
+// and returns its id -- HasNewerReviewAttempt now fails CLOSED
+// (hasNewer=true, "deny the waiver") whenever an acceptance's own
+// AttemptID is empty, so any fixture that seeds a verdict meaning to be
+// ACCEPTED, and later read back as currently APPLICABLE, must record a
+// real attempt id here rather than the zero pgtype.UUID{} this file used
+// before this fix -- otherwise the resulting acceptance can never
+// actually apply, exactly the residual R10's own fix accepts for a
+// verdict that genuinely carries no attempt id (a pre-migration-000130
+// row, never backfilled).
+func seedReviewAttemptTurn(ctx context.Context, t *testing.T, pool *pgxpool.Pool) pgtype.UUID {
+	t.Helper()
+	session, err := narvipg.NewSessionStore(pool).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub})
+	if err != nil {
+		t.Fatalf("seedReviewAttemptTurn: create session: %v", err)
+	}
+	turn, err := narvipg.NewTurnStore(pool).Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusCompleted, IsReviewAttempt: true})
+	if err != nil {
+		t.Fatalf("seedReviewAttemptTurn: create turn: %v", err)
+	}
+	return turn.ID
+}
+
+// seedNotShippableAutoVerdict is seedAutoApprovedVerdict's own sibling --
+// the SAME "otherwise fully eligible" shape (adequate coverage, ok
+// premise, matching base/policy context) except RiskLevel is HIGH, which
+// baselineFromRisk (review/shippable.go) maps to ShippableNeedsHuman
+// regardless of every floor -- the ONE criterion this fixture means to
+// fail, mirroring internal/app/decisioninbox's own identical fixture
+// (acceptance_integration_test.go). Used by F1's own reproduction test
+// below to seed a verdict an acceptance is needed to merge past.
+//
+// Records a REAL attempt id (seedReviewAttemptTurn, round 3, finding R10)
+// on the seeded review_verdicts row -- httpapi.AcceptReviewVerdict
+// forwards record.AttemptID straight onto the resulting acceptance, so
+// this is what lets that acceptance actually read as applicable
+// afterward (HasNewerReviewAttempt's own fail-closed default on an EMPTY
+// attempt id would otherwise make every acceptance created against this
+// fixture permanently inapplicable).
+func (rig *decisionInboxTestRig) seedNotShippableAutoVerdict(ctx context.Context, t *testing.T, repoFullName string, prNumber int32, headSHA string) {
+	t.Helper()
+	verdict := review.Verdict{
+		RiskLevel:         review.RiskLevelHigh,
+		Premise:           review.PremiseStateOK,
+		TestsCoverage:     review.TestsCoverageStateAdequate,
+		DocsDrift:         review.DocsDriftStateNone,
+		ProposedShippable: review.ProposedShippableNeedsHuman,
+		FilesChanged:      3,
+	}
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	if verdict.Shippable == review.ShippableAuto {
+		t.Fatalf("seedNotShippableAutoVerdict: fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
+	}
+	verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
+	attemptID := seedReviewAttemptTurn(ctx, t, rig.pool)
+	if _, err := appreviewverdict.Insert(ctx, rig.reviewVerdicts, narvipg.NewRepoSettingsStore(rig.pool), false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, attemptID); err != nil {
+		t.Fatalf("seed not-shippable-auto review_verdicts row for %s#%d: %v", repoFullName, prNumber, err)
+	}
+}
+
 // testEligibleBaseRef/testEligibleBaseSHA (§21.1's amendment) mirror
 // internal/app/decisioninbox's own identical shared fixture pair
 // (aggregate_integration_test.go) -- every "eligible" ports.OpenPR
@@ -260,7 +321,16 @@ func newDecisionInboxTestRig(t *testing.T, sourceControl ports.SourceControl) *d
 			RepoSettings:         narvipg.NewRepoSettingsStore(pool),
 			ReviewFindings:       reviewFindings,
 			AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool),
-			Timeouts:             platform.DefaultTimeouts(),
+			// Acceptances ("human acceptance of a verdict the engine
+			// refuses", §21.1b) backs AcceptReviewVerdict/
+			// RevokeReviewVerdictAcceptance below, and revalidateCore's
+			// own GetActiveAcceptance/Applicable check.
+			Acceptances: narvipg.NewReviewVerdictAcceptanceStore(pool),
+			// Turns (finding F1, adversarial review, §21.1b) backs
+			// HasNewerReviewAttempt -- mirrors production wiring
+			// (controlplane/serve.go's own reviewVerdictDeps).
+			Turns:    narvipg.NewTurnStore(pool),
+			Timeouts: platform.DefaultTimeouts(),
 		},
 	}
 	auditLog := narvipg.NewAuditLogStore(pool)
@@ -270,6 +340,8 @@ func newDecisionInboxTestRig(t *testing.T, sourceControl ports.SourceControl) *d
 		r.Use(auth.Middleware(userSessions, users))
 		r.Get("/", httpapi.ListDecisionInbox(deps))
 		r.Post("/merge", httpapi.MergePullRequest(deps, sourceControl, auditLog))
+		r.Post("/accept-verdict", httpapi.AcceptReviewVerdict(pool, deps, auditLog))
+		r.Post("/revoke-verdict-acceptance", httpapi.RevokeReviewVerdictAcceptance(pool, deps, auditLog))
 	})
 
 	server := httptest.NewServer(router)
@@ -522,6 +594,227 @@ func TestMergePullRequest_HappyPath(t *testing.T) {
 	}
 	if total != 1 || contested != 0 {
 		t.Errorf("outcome counts = (total=%d, contested=%d), want (1, 0) -- the human 1-click merge must record a 'confirmed' outcome", total, contested)
+	}
+}
+
+// TestMergePullRequest_AcceptedVerdict_RecordsAcceptedOverride reproduces
+// finding F1 (adversarial review) end to end, exactly as it was found:
+// a high-risk/needs-human verdict refuses the merge (409), a maintainer+
+// accepts it (201), the merge then succeeds (200), and -- the decisive
+// assertion this test exists to pin -- auto_approval_outcomes records
+// 'accepted_override', NEVER 'confirmed' and NEVER plain 'overridden'
+// (asserted against the outcome COLUMN itself, round-5 finding V2, so
+// this test can actually tell those three values apart), and
+// CountInWindow EXCLUDES it from both total and contested (round-5
+// finding V1: it was never an auto-approved PR at all, so it does not
+// belong in either half of that population -- see
+// autoapprovaloutcomes.sql's own comment for the full "why"). Before the
+// F1 fix, MergePullRequest called RecordConfirmed unconditionally after
+// any successful merge, so this exact sequence wrote outcome='confirmed',
+// mechanically driving the contradiction rate DOWN with every acceptance
+// -- the harm §21.1b names by hand. Also pins the merge_pr audit row's
+// own new via_acceptance/acceptance_id fields.
+func TestMergePullRequest_AcceptedVerdict_RecordsAcceptedOverride(t *testing.T) {
+	const htmlURL = "https://github.com/acme/widgets/pull/1205"
+	const repoFullName = "acme/widgets"
+	fakeSCM := &fakeMergeSourceControl{
+		openPRs: []ports.OpenPR{
+			{
+				Owner: "acme", Repo: "widgets", Number: 1205, Title: "risky but accepted", HTMLURL: htmlURL,
+				HeadSHA: "headsha1205", BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, Assignees: []ports.PRPerson{{ExternalID: "9002", Login: "octocat"}},
+				CIConclusion: ports.CIConclusionSuccess,
+			},
+		},
+		mergeSHA: "merged-sha-accepted",
+	}
+	rig := newDecisionInboxTestRig(t, fakeSCM)
+	ctx := context.Background()
+
+	user, token := rig.createAuthenticatedUser(ctx, t, sqlcgen.UserRoleMaintainer)
+	rig.linkGitHub(ctx, t, user.ID, "9002")
+	rig.markPlatformAuthored(ctx, t, user.ID, htmlURL)
+	rig.seedNotShippableAutoVerdict(ctx, t, repoFullName, 1205, "headsha1205")
+
+	if _, err := narvipg.NewRepoSettingsStore(rig.pool).UpsertLiveEgressEnabled(ctx, repoFullName, true); err != nil {
+		t.Fatalf("arm live egress: %v", err)
+	}
+
+	mergeBody, err := json.Marshal(restdtos.MergePullRequestRequest{RepoFullName: repoFullName, PrNumber: 1205})
+	if err != nil {
+		t.Fatalf("marshal merge request: %v", err)
+	}
+
+	// Phase 1: the engine refuses -- 409, high-risk verdict, no
+	// acceptance yet.
+	status := rig.doJSON(t, http.MethodPost, "/api/decision-inbox/merge", mergeBody, nil, token)
+	if status != http.StatusConflict {
+		t.Fatalf("merge status (before acceptance) = %d, want %d", status, http.StatusConflict)
+	}
+
+	record, hasVerdict, err := appreviewverdict.GetLatest(ctx, appreviewverdict.Deps{ReviewVerdicts: rig.reviewVerdicts}, repoFullName, 1205)
+	if err != nil || !hasVerdict {
+		t.Fatalf("GetLatest: hasVerdict=%v err=%v", hasVerdict, err)
+	}
+
+	// Phase 2: a maintainer+ accepts it -- 201.
+	acceptBody, err := json.Marshal(restdtos.AcceptReviewVerdictRequest{
+		RepoFullName: repoFullName, PrNumber: 1205, VerdictId: record.ID,
+		Justification: "Reviewed offline with the team; the risk is understood and accepted for this one PR.",
+	})
+	if err != nil {
+		t.Fatalf("marshal accept request: %v", err)
+	}
+	var accepted restdtos.ReviewVerdictAcceptance
+	if status := rig.doJSON(t, http.MethodPost, "/api/decision-inbox/accept-verdict", acceptBody, &accepted, token); status != http.StatusCreated {
+		t.Fatalf("accept status = %d, want %d", status, http.StatusCreated)
+	}
+
+	// Phase 3: the merge now succeeds -- 200.
+	var got restdtos.MergePullRequestResponse
+	status = rig.doJSON(t, http.MethodPost, "/api/decision-inbox/merge", mergeBody, &got, token)
+	if status != http.StatusOK {
+		t.Fatalf("merge status (after acceptance) = %d, want %d", status, http.StatusOK)
+	}
+	if !got.Merged || got.MergeCommitSha != "merged-sha-accepted" {
+		t.Errorf("response = %+v, want a successful merge with the fake's own sha", got)
+	}
+
+	// THE DECISIVE ASSERTION, part 1 (round-5 finding V2): assert the
+	// `outcome` COLUMN itself, not just the aggregate (total, contested)
+	// pair below -- the aggregate alone cannot distinguish
+	// 'accepted_override' from 'overridden' (both are, or were, counted
+	// identically by CountInWindow), so it cannot detect a regression of
+	// round 4's own defect: the wrong contested row winning the
+	// ON CONFLICT DO NOTHING race. Query the row directly.
+	var gotOutcome string
+	if err := rig.pool.QueryRow(ctx,
+		`SELECT outcome FROM auto_approval_outcomes WHERE repo_full_name = $1 AND pr_number = $2 AND head_sha = $3`,
+		repoFullName, 1205, "headsha1205",
+	).Scan(&gotOutcome); err != nil {
+		t.Fatalf("query auto_approval_outcomes.outcome: %v", err)
+	}
+	if want := string(reviewverdict.OutcomeAcceptedOverride); gotOutcome != want {
+		t.Fatalf("auto_approval_outcomes.outcome = %q, want %q -- an acceptance-driven merge must record 'accepted_override', never a clean 'confirmed' auto-approval or a plain pre-merge 'overridden' (finding F1)", gotOutcome, want)
+	}
+
+	// THE DECISIVE ASSERTION, part 2 (round-5 finding V1): 'accepted_override'
+	// is EXCLUDED from both total and contested by CountInWindow -- this
+	// PR was never auto-approved at all (the engine refused it), so it is
+	// not part of the "auto-approved PRs" population §21.2's own
+	// contradiction rate measures. See autoapprovaloutcomes.sql's own
+	// CountAutoApprovalOutcomesInWindow comment for the full "why" and
+	// the worked arithmetic. (Before that fix this asserted (1, 1) --
+	// counting the row as both auto-approved AND contested, which is
+	// exactly the mis-scoped population finding V1 corrects.)
+	total, contested, err := narvipg.NewAutoApprovalOutcomeStore(rig.pool).CountInWindow(ctx, repoFullName, pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true})
+	if err != nil {
+		t.Fatalf("count auto-approval outcomes: %v", err)
+	}
+	if total != 0 || contested != 0 {
+		t.Fatalf("outcome counts = (total=%d, contested=%d), want (0, 0) -- an 'accepted_override' row is excluded from both counts: it was never an auto-approved PR (finding V1)", total, contested)
+	}
+
+	// The merge_pr audit row carries the acceptance fact too.
+	entries, err := narvipg.NewAuditLogStore(rig.pool).List(ctx, 20, 0)
+	if err != nil {
+		t.Fatalf("list audit log: %v", err)
+	}
+	found := false
+	for _, e := range entries {
+		if e.Action != "merge_pr" || e.ResourceID != fmt.Sprintf("%s#%d", repoFullName, 1205) {
+			continue
+		}
+		found = true
+		var detail map[string]any
+		if err := json.Unmarshal(e.DetailJson, &detail); err != nil {
+			t.Fatalf("unmarshal merge_pr audit detail: %v", err)
+		}
+		if viaAcceptance, _ := detail["via_acceptance"].(bool); !viaAcceptance {
+			t.Errorf("merge_pr audit detail via_acceptance = %v, want true", detail["via_acceptance"])
+		}
+		if acceptanceID, _ := detail["acceptance_id"].(string); acceptanceID != accepted.Id {
+			t.Errorf("merge_pr audit detail acceptance_id = %q, want %q", acceptanceID, accepted.Id)
+		}
+	}
+	if !found {
+		t.Error("no merge_pr audit_log entry found for this pull request")
+	}
+}
+
+// TestListDecisionInbox_AcceptedVerdict_ShowsVerdictAndAcceptanceIds
+// closes the reachability gap findings F3 and F11 (adversarial review)
+// name: F3 requires a client to NAME the verdict it is accepting
+// (AcceptReviewVerdictRequest.VerdictId), and F11 requires a client to be
+// able to name the acceptance it wants to revoke
+// (RevokeReviewVerdictAcceptanceRequest.Id) -- both ids must actually be
+// reachable from a real read surface, not merely accepted as input. This
+// test proves GET /api/decision-inbox is that surface: a PR with an
+// active, applicable acceptance renders verdictId (the id a client would
+// have named to create it) and acceptanceId (the id a client now needs to
+// revoke it) alongside the existing acceptanceJustification/acceptedAt.
+func TestListDecisionInbox_AcceptedVerdict_ShowsVerdictAndAcceptanceIds(t *testing.T) {
+	const htmlURL = "https://github.com/acme/widgets/pull/1206"
+	const repoFullName = "acme/widgets"
+	fakeSCM := &fakeMergeSourceControl{
+		openPRs: []ports.OpenPR{
+			{
+				Owner: "acme", Repo: "widgets", Number: 1206, Title: "risky but accepted", HTMLURL: htmlURL,
+				HeadSHA: "headsha1206", BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, Assignees: []ports.PRPerson{{ExternalID: "9003", Login: "octocat"}},
+				CIConclusion: ports.CIConclusionSuccess,
+			},
+		},
+	}
+	rig := newDecisionInboxTestRig(t, fakeSCM)
+	ctx := context.Background()
+
+	user, token := rig.createAuthenticatedUser(ctx, t, sqlcgen.UserRoleMaintainer)
+	rig.linkGitHub(ctx, t, user.ID, "9003")
+	rig.markPlatformAuthored(ctx, t, user.ID, htmlURL)
+	rig.seedNotShippableAutoVerdict(ctx, t, repoFullName, 1206, "headsha1206")
+
+	record, hasVerdict, err := appreviewverdict.GetLatest(ctx, appreviewverdict.Deps{ReviewVerdicts: rig.reviewVerdicts}, repoFullName, 1206)
+	if err != nil || !hasVerdict {
+		t.Fatalf("GetLatest: hasVerdict=%v err=%v", hasVerdict, err)
+	}
+
+	acceptBody, err := json.Marshal(restdtos.AcceptReviewVerdictRequest{
+		RepoFullName: repoFullName, PrNumber: 1206, VerdictId: record.ID,
+		Justification: "Accepted for the purposes of this test.",
+	})
+	if err != nil {
+		t.Fatalf("marshal accept request: %v", err)
+	}
+	var accepted restdtos.ReviewVerdictAcceptance
+	if status := rig.doJSON(t, http.MethodPost, "/api/decision-inbox/accept-verdict", acceptBody, &accepted, token); status != http.StatusCreated {
+		t.Fatalf("accept status = %d, want %d", status, http.StatusCreated)
+	}
+
+	var got restdtos.ListDecisionInboxResponse
+	status := rig.doJSON(t, http.MethodGet, "/api/decision-inbox", nil, &got, token)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", status, http.StatusOK)
+	}
+
+	var pr1206 *restdtos.DecisionInboxItem
+	for i := range got.Items {
+		if got.Items[i].PrNumber != nil && *got.Items[i].PrNumber == 1206 {
+			pr1206 = &got.Items[i]
+		}
+	}
+	if pr1206 == nil {
+		t.Fatal("PR #1206 missing from the inbox entirely")
+	}
+	if pr1206.VerdictId == nil || *pr1206.VerdictId != record.ID {
+		t.Errorf("VerdictId = %v, want %q -- a client must be able to name this verdict back on a future accept-verdict call (finding F3)", pr1206.VerdictId, record.ID)
+	}
+	if pr1206.AcceptanceId == nil || *pr1206.AcceptanceId != accepted.Id {
+		t.Errorf("AcceptanceId = %v, want %q -- a client must be able to name this acceptance back on revoke-verdict-acceptance (finding F11)", pr1206.AcceptanceId, accepted.Id)
+	}
+	if pr1206.AcceptanceJustification == nil || *pr1206.AcceptanceJustification != "Accepted for the purposes of this test." {
+		t.Errorf("AcceptanceJustification = %v, want the accepted justification", pr1206.AcceptanceJustification)
+	}
+	if pr1206.AcceptedAt == nil {
+		t.Error("AcceptedAt = nil, want non-nil")
 	}
 }
 

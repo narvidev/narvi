@@ -34,6 +34,15 @@ import (
 // stage 2) shares, so a human-clicked confirm and a machine-initiated
 // merge are NEVER independently-maintained checks that could silently
 // drift apart (§21.2: "a deliberate reuse, not a parallel merge path").
+// ONE deliberate exception (finding F4, adversarial review): this
+// function alone passes honorAcceptance=true to revalidateCore --
+// RevalidateForAutoMerge below always passes false. §21.1b's own
+// acceptance is "a human chose to proceed despite it", recorded at the
+// moment a maintainer+ clicks Accept; an unattended worker later
+// consuming that SAME authorisation, with no human present at merge
+// time, is a human-judgment waiver firing with nobody there to have
+// judged anything -- see revalidateCore's own doc comment for the full
+// reasoning.
 //
 // A store error from the §17 sentinel-fix exclusion or the open-findings
 // count (both inside revalidateCore) is propagated outright as err,
@@ -50,10 +59,22 @@ import (
 // merge call fails loudly (a 409 from GitHub itself) rather than silently
 // merging code nobody just re-checked. ok=false's own reason is a short,
 // human-readable explanation suitable for a 409 response body.
-func RevalidateForMerge(ctx context.Context, deps Deps, sourceControl ports.SourceControl, actorGitHubID, repoFullName string, prNumber int, token string) (ok bool, headSHA string, reason string, err error) {
+//
+// viaAcceptance/acceptanceID (finding F1, adversarial review) report
+// whether ok=true was reached ONLY because an applicable acceptance
+// waived a human-judgment criterion the engine itself would have
+// refused on -- see revalidateCore's own doc comment for the full "why"
+// this must never be discarded: a merge this is true for is not evidence
+// the engine's own judgment stood, and the caller (httpapi.
+// MergePullRequest) must record it as a DIFFERENT outcome than a clean
+// auto-approval, never fold it into RecordConfirmed's own "confirmed"
+// bucket. Both are the zero value (false, "") whenever ok=false, and
+// acceptanceID is "" whenever viaAcceptance is false -- a caller must
+// never read acceptanceID without first checking viaAcceptance.
+func RevalidateForMerge(ctx context.Context, deps Deps, sourceControl ports.SourceControl, actorGitHubID, repoFullName string, prNumber int, token string) (ok bool, headSHA string, reason string, viaAcceptance bool, acceptanceID string, err error) {
 	prs, truncated, err := sourceControl.ListOpenPRsForUser(ctx, ports.ListOpenPRsForUserSpec{GitHubExternalID: actorGitHubID, Token: token})
 	if err != nil {
-		return false, "", "", err
+		return false, "", "", false, "", err
 	}
 
 	var target *ports.OpenPR
@@ -73,12 +94,12 @@ func RevalidateForMerge(ctx context.Context, deps Deps, sourceControl ports.Sour
 			// false-confident 409 that could discourage a legitimate
 			// retry. Fails as an error (500, prompting a retry) instead
 			// of a confident domain "no".
-			return false, "", "", fmt.Errorf("decisioninbox: revalidate for merge: could not confirm this pull request's current state (a degraded/partial GitHub read) -- please retry")
+			return false, "", "", false, "", fmt.Errorf("decisioninbox: revalidate for merge: could not confirm this pull request's current state (a degraded/partial GitHub read) -- please retry")
 		}
-		return false, "", "this pull request is no longer open, or no longer assigned to you", nil
+		return false, "", "this pull request is no longer open, or no longer assigned to you", false, "", nil
 	}
 
-	return revalidateCore(ctx, deps, sourceControl, token, repoFullName, prNumber, *target)
+	return revalidateCore(ctx, deps, sourceControl, token, repoFullName, prNumber, *target, true)
 }
 
 // RevalidateForAutoMerge is RevalidateForMerge's own machine-initiated
@@ -90,16 +111,30 @@ func RevalidateForMerge(ctx context.Context, deps Deps, sourceControl ports.Sour
 // primitive" reasoning). Every check AFTER target resolution is the
 // IDENTICAL revalidateCore both functions share -- §21.2: "reuses the
 // decision inbox's existing server-side re-validation-at-click contract
-// unchanged... a deliberate reuse, not a parallel merge path."
+// unchanged... a deliberate reuse, not a parallel merge path." -- WITH
+// ONE deliberate exception (finding F4, adversarial review): this
+// function passes honorAcceptance=false, always -- an unattended
+// auto-merge tick never consults review_verdict_acceptances at all, so a
+// PR ineligible only because of a waived human-judgment criterion
+// (§21.1b) never merges through this path, no matter how applicable an
+// acceptance on file would otherwise be. §21.1b's own acceptance is "a
+// human chose to proceed despite it" -- authorising THIS human's own
+// next Merge click, not arming an unattended worker to act on that
+// judgment indefinitely with nobody present. See revalidateCore's own
+// doc comment for the full reasoning, and note the worker's own
+// candidate list (internal/app/automerge.Worker.pumpRepo) is additionally
+// pre-filtered to Shippable==auto verdicts -- so ReasonNotShippableAuto
+// was already unreachable here before this fix; ReasonDiffTooLarge was
+// not, and is what this fix actually closes.
 //
 // found=false (GetOpenPR's own confirmed-404 signal) is reported as a
 // plain ok=false/reason, mirroring RevalidateForMerge's own "no longer
 // open" case above -- a PR closed/merged through some other path between
 // discovery and this call is an ordinary, expected race, never an error.
-func RevalidateForAutoMerge(ctx context.Context, deps Deps, sourceControl ports.SourceControl, repoFullName string, prNumber int, botToken string) (ok bool, headSHA string, reason string, err error) {
+func RevalidateForAutoMerge(ctx context.Context, deps Deps, sourceControl ports.SourceControl, repoFullName string, prNumber int, botToken string) (ok bool, headSHA string, reason string, viaAcceptance bool, acceptanceID string, err error) {
 	owner, repo, splitOK := reposource.SplitFullName(repoFullName)
 	if !splitOK {
-		return false, "", "", fmt.Errorf("decisioninbox: revalidate for auto-merge: repoFullName %q is not shaped owner/repo", repoFullName)
+		return false, "", "", false, "", fmt.Errorf("decisioninbox: revalidate for auto-merge: repoFullName %q is not shaped owner/repo", repoFullName)
 	}
 
 	// Bounded by platform.Timeouts.GitHubGetOpenPRTimeout (G4, fourth
@@ -116,7 +151,7 @@ func RevalidateForAutoMerge(ctx context.Context, deps Deps, sourceControl ports.
 	target, found, err := sourceControl.GetOpenPR(getPRCtx, owner, repo, prNumber, botToken)
 	cancel()
 	if err != nil {
-		return false, "", "", err
+		return false, "", "", false, "", err
 	}
 	// H3 (fifth adversarial-review round; corrected, sixth round -- the
 	// previous version of this paragraph asserted a uniform failure model
@@ -158,13 +193,13 @@ func RevalidateForAutoMerge(ctx context.Context, deps Deps, sourceControl ports.
 	// deadline is what actually fired here, not this function's own
 	// routine cleanup).
 	if errors.Is(getPRCtx.Err(), context.DeadlineExceeded) {
-		return false, "", "", fmt.Errorf("decisioninbox: revalidate for auto-merge: get open pr timed out partway through its own five-call fetch (GitHubGetOpenPRTimeout) -- refusing rather than trusting whichever sub-call was cut short: %w", context.DeadlineExceeded)
+		return false, "", "", false, "", fmt.Errorf("decisioninbox: revalidate for auto-merge: get open pr timed out partway through its own five-call fetch (GitHubGetOpenPRTimeout) -- refusing rather than trusting whichever sub-call was cut short: %w", context.DeadlineExceeded)
 	}
 	if !found {
-		return false, "", "this pull request is no longer open", nil
+		return false, "", "this pull request is no longer open", false, "", nil
 	}
 
-	return revalidateCore(ctx, deps, sourceControl, botToken, repoFullName, prNumber, target)
+	return revalidateCore(ctx, deps, sourceControl, botToken, repoFullName, prNumber, target, false)
 }
 
 // revalidateCore is the SHARED body of RevalidateForMerge/
@@ -191,22 +226,81 @@ func RevalidateForAutoMerge(ctx context.Context, deps Deps, sourceControl ports.
 // exactly: RevalidateForMerge passes the acting human's own OAuth token,
 // RevalidateForAutoMerge passes the deployment's bot token -- the SAME
 // credential each caller already used to resolve target itself.
-func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceControl, token string, repoFullName string, prNumber int, target ports.OpenPR) (ok bool, headSHA string, reason string, err error) {
+//
+// honorAcceptance (finding F4, adversarial review) is the ONE thing that
+// deliberately differs between this core's two callers: true from
+// RevalidateForMerge (a human is, right now, clicking Merge), false from
+// RevalidateForAutoMerge (nobody is present). When false, this function
+// never looks up review_verdict_acceptances at all -- accepted stays
+// false unconditionally, so ComputeEligibleWithAcceptance below behaves
+// EXACTLY like plain ComputeEligible, and a PR ineligible only via a
+// waived human-judgment criterion (§21.1b: ReasonNotShippableAuto or
+// ReasonDiffTooLarge) never merges unattended on the strength of an
+// acceptance nobody re-confirmed at click time. Every OTHER check in
+// this function is unaffected by honorAcceptance and stays byte-for-byte
+// identical between the two callers, preserving this function's own
+// "never independently drift" property for everything acceptance does
+// NOT touch.
+//
+// viaAcceptance/acceptanceID (finding F1, adversarial review) are the
+// third and fourth return values ComputeEligibleWithAcceptance's own
+// doc comment names -- forwarded here, never discarded with `_`, so a
+// caller (httpapi.MergePullRequest, internal/app/automerge's own worker)
+// can tell "the engine's own judgment stood" apart from "this merged
+// only because a human's acceptance waived a refusal" and record the
+// SAME outcome the contradiction-rate read model was calibrated to
+// never blur (§21.2). Both are the zero value whenever ok=false or
+// honorAcceptance=false, since neither caller needs them in either case.
+// The refusal-reason strings below are each defined ONCE and shared by
+// every site that must describe the SAME underlying fact to a human --
+// revalidateCore's own return values immediately below, AND
+// buildPROpenItem's AcceptanceMergeBlockedReason assignments
+// (aggregate.go), which describe what these SAME mandatory criteria
+// found on a given row WITHOUT re-running revalidateCore itself (T6,
+// round 4, adversarial review). Round-5 finding V3: these used to be six
+// independent, hand-typed string literals in aggregate.go -- one
+// (reasonReviewDecisionDegraded) had ALREADY drifted from this file's
+// own copy, silently dropping its trailing clause, exactly the kind of
+// paraphrase a maintainer changing the wording here has no way to
+// notice. A single definition makes that drift structurally impossible
+// rather than merely commented against.
+const (
+	reasonHandoffItem            = "this pull request is a handoff item, not an ordinary code-review merge decision"
+	reasonReviewDecisionDegraded = "this pull request's review decision could not be confirmed (a degraded GitHub read) -- failing closed rather than trusting an unconfirmed read"
+	reasonChangesRequested       = "this pull request has changes requested by a reviewer"
+	reasonNotPlatformAuthored    = "this pull request was not authored by a platform session"
+	reasonOpenFinding            = "this pull request has an open, unresolved review finding"
+	reasonBaseCommitUnconfirmed  = "this pull request's base commit could not be confirmed (a live check failed) -- try again shortly"
+
+	// reasonNoLongerMeetsCriteriaFmt is this function's own probe-refusal
+	// AND final-refusal wording -- used at BOTH points below (the probe,
+	// before any live SCM call, and the final post-freshness-check
+	// re-evaluation) so the two never independently drift from each
+	// other either. NOT shared with aggregate.go's own
+	// AcceptanceMergeBlockedReason "...even with its accepted override
+	// applied" case: that field is a simpler, acceptance-specific
+	// summary that deliberately never interpolates the engine's own live
+	// Reason detail (%s here) -- a different fact, not a copy of this
+	// one.
+	reasonNoLongerMeetsCriteriaFmt = "this pull request no longer meets the auto-approval eligibility criteria: %s"
+)
+
+func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceControl, token string, repoFullName string, prNumber int, target ports.OpenPR, honorAcceptance bool) (ok bool, headSHA string, reason string, viaAcceptance bool, acceptanceID string, err error) {
 	if target.Draft {
-		return false, "", "this pull request is a draft", nil
+		return false, "", "this pull request is a draft", false, "", nil
 	}
 
 	excluded, exErr := deps.SentinelFixes.ExistsByFixPRNumber(ctx, repoFullName, int32(prNumber))
 	if exErr != nil {
-		return false, "", "", fmt.Errorf("decisioninbox: revalidate for merge: check sentinel-fix exclusion: %w", exErr)
+		return false, "", "", false, "", fmt.Errorf("decisioninbox: revalidate for merge: check sentinel-fix exclusion: %w", exErr)
 	}
 	if excluded {
-		return false, "", "this pull request is a sentinel-auto-fix follow-up -- it merges automatically once its own checks pass, never through this endpoint", nil
+		return false, "", "this pull request is a sentinel-auto-fix follow-up -- it merges automatically once its own checks pass, never through this endpoint", false, "", nil
 	}
 
 	hasNeedsHuman, _, isHandoffPR := classifyPRLabels(target.Labels)
 	if isHandoffPR {
-		return false, "", "this pull request is a handoff item, not an ordinary code-review merge decision", nil
+		return false, "", reasonHandoffItem, false, "", nil
 	}
 
 	// a degraded review-decision read (GitHub's
@@ -227,25 +321,25 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	// record that decision.
 	if target.ReviewDecisionDegraded {
 		platform.Logger(ctx).Warn("decisioninbox: review-decision read was degraded, refusing merge -- could not confirm whether a reviewer requested changes", "repo_full_name", repoFullName, "pr_number", prNumber)
-		return false, "", "this pull request's review decision could not be confirmed (a degraded GitHub read) -- failing closed rather than trusting an unconfirmed read", nil
+		return false, "", reasonReviewDecisionDegraded, false, "", nil
 	}
 	if target.HasChangesRequested {
-		return false, "", "this pull request has changes requested by a reviewer", nil
+		return false, "", reasonChangesRequested, false, "", nil
 	}
 
 	if !isPlatformAuthored(ctx, deps, target.HTMLURL) {
-		return false, "", "this pull request was not authored by a platform session", nil
+		return false, "", reasonNotPlatformAuthored, false, "", nil
 	}
 
 	openFindings, findingsErr := countOpenFindings(ctx, deps, repoFullName, prNumber)
 	if findingsErr != nil {
-		return false, "", "", fmt.Errorf("decisioninbox: revalidate for merge: count open findings: %w", findingsErr)
+		return false, "", "", false, "", fmt.Errorf("decisioninbox: revalidate for merge: count open findings: %w", findingsErr)
 	}
 	if openFindings > 0 {
 		// Mirrors buildPROpenItem's own identical "kept as its own,
 		// separate AND-condition" reasoning (aggregate.go) -- never
 		// folded into the eligibility engine itself.
-		return false, "", "this pull request has an open, unresolved review finding", nil
+		return false, "", reasonOpenFinding, false, "", nil
 	}
 	ciGreen := target.CIConclusion == ports.CIConclusionSuccess
 	// ciConclusionDegraded is target.CIConclusionDegraded, verbatim --
@@ -256,10 +350,62 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 
 	record, hasVerdict, verdictErr := appreviewverdict.GetLatest(ctx, deps.ReviewVerdict, repoFullName, int32(prNumber))
 	if verdictErr != nil {
-		return false, "", "", fmt.Errorf("decisioninbox: revalidate for merge: get latest review verdict: %w", verdictErr)
+		return false, "", "", false, "", fmt.Errorf("decisioninbox: revalidate for merge: get latest review verdict: %w", verdictErr)
 	}
 	if !hasVerdict {
-		return false, "", "this pull request has no review verdict of record", nil
+		return false, "", "this pull request has no review verdict of record", false, "", nil
+	}
+
+	// acceptance ("human acceptance of a verdict the engine refuses",
+	// §21.1b): a maintainer+ may have authorised proceeding past
+	// ReasonNotShippableAuto/ReasonDiffTooLarge for THIS exact verdict
+	// (record.ID) -- fetched once, here, so BOTH ComputeEligibleWithAcceptance
+	// calls below (the probe and the final call) see the identical
+	// answer. A genuine store error fails CLOSED (propagated as err,
+	// mirroring every other store-error branch in this function's own
+	// top doc comment) -- an acceptance lookup that cannot be confirmed
+	// must never silently degrade to "no acceptance applies" AND must
+	// never silently degrade to "an acceptance applies" either; erroring
+	// out is the only honest answer. acceptanceOK=false (no active row,
+	// or a row exists but Applicable reports it no longer binds to
+	// record.ID, OR a NEWER review attempt has since run whether or not
+	// it posted a verdict -- finding F1, adversarial review: verdict-id
+	// equality alone cannot see a not_assessed attempt, since that
+	// attempt posts no review_verdicts row at all) means accepted=false,
+	// exactly like a PR that was never accepted at all -- Acceptance.
+	// Applicable's own doc comment is what makes this the SAME code path
+	// that also closes "a moved base makes it inapplicable":
+	// ComputeEligibleWithAcceptance's own unconditional base/
+	// ancestor-chain checks refuse regardless of accepted, so this line
+	// alone need only answer "same verdict, no newer attempt, still not
+	// revoked". hasNewerAttempt's own lookup error is ALSO fail-CLOSED,
+	// propagated exactly like acceptanceErr immediately below -- an
+	// action endpoint (this function, unlike buildPROpenItem's own
+	// best-effort display read) must never proceed on an unconfirmed
+	// attempt-freshness fact either direction.
+	//
+	// Gated on honorAcceptance (finding F4, adversarial review): when
+	// false (the unattended auto-merge worker), this store is never even
+	// READ -- accepted/acceptanceID stay at their zero values
+	// unconditionally, so no acceptance on file, however applicable, can
+	// influence this call. See this function's own top doc comment for
+	// the full "why".
+	var accepted bool
+	if honorAcceptance {
+		acceptance, acceptanceOK, acceptanceErr := appreviewverdict.GetActiveAcceptance(ctx, deps.ReviewVerdict.Acceptances, repoFullName, int32(prNumber))
+		if acceptanceErr != nil {
+			return false, "", "", false, "", fmt.Errorf("decisioninbox: revalidate for merge: get active review verdict acceptance: %w", acceptanceErr)
+		}
+		if acceptanceOK {
+			hasNewerAttempt, newerErr := appreviewverdict.HasNewerReviewAttempt(ctx, deps.ReviewVerdict.Turns, acceptance)
+			if newerErr != nil {
+				return false, "", "", false, "", fmt.Errorf("decisioninbox: revalidate for merge: check newer review attempt: %w", newerErr)
+			}
+			if acceptance.Applicable(record.ID, hasNewerAttempt) {
+				accepted = true
+				acceptanceID = acceptance.ID
+			}
+		}
 	}
 
 	// a genuine repo_settings read error here means
@@ -274,7 +420,7 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	// instant.
 	cfg, cfgErr := appreviewverdict.LoadEligibilityConfig(ctx, deps.ReviewVerdict, repoFullName)
 	if cfgErr != nil {
-		return false, "", "", fmt.Errorf("decisioninbox: revalidate for merge: load eligibility config: %w", cfgErr)
+		return false, "", "", false, "", fmt.Errorf("decisioninbox: revalidate for merge: load eligibility config: %w", cfgErr)
 	}
 	// changedFileCount/touchedBlastRadius/touchedBlastRadiusKnown are ALL
 	// derived here from target -- target is revalidateCore's own
@@ -409,8 +555,14 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		TouchedBlastRadius:                  touchedBlastRadius,
 		TouchedBlastRadiusKnown:             touchedBlastRadiusKnown,
 	}
-	if _, probeReason := autoapproval.ComputeEligible(probeInput, cfg); probeReason != autoapproval.ReasonNone {
-		return false, "", fmt.Sprintf("this pull request no longer meets the auto-approval eligibility criteria: %s", probeReason), nil
+	// ComputeEligibleWithAcceptance, never a bare probeReason != ReasonNone
+	// check: an applicable acceptance (accepted=true) can make eligible
+	// true while STILL reporting the waived Reason (ReasonNotShippableAuto/
+	// ReasonDiffTooLarge) for display -- see that function's own doc
+	// comment. Checking the reason string alone here would misread "eligible,
+	// via acceptance" as a refusal.
+	if probeEligible, probeReason, _ := autoapproval.ComputeEligibleWithAcceptance(probeInput, cfg, accepted); !probeEligible {
+		return false, "", fmt.Sprintf(reasonNoLongerMeetsCriteriaFmt, probeReason), false, "", nil
 	}
 
 	// The probe passed: on every criterion except base freshness, this PR
@@ -476,7 +628,7 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		// guarantee G3 established for the ancestor check below applies
 		// here too.
 		platform.Logger(ctx).Warn("decisioninbox: resolve base branch's live tip failed, refusing merge -- could not confirm the pull request's current base commit", "error", resolveErr, "repo_full_name", repoFullName, "pr_number", prNumber)
-		return false, "", "this pull request's base commit could not be confirmed (a live check failed) -- try again shortly", nil
+		return false, "", reasonBaseCommitUnconfirmed, false, "", nil
 	}
 
 	// baseAdvancedWithoutRewrite (D3, second adversarial-review round;
@@ -546,7 +698,7 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		cancel()
 		if ancestorErr != nil {
 			platform.Logger(ctx).Warn("decisioninbox: resolve base-advanced-without-rewrite ancestry failed, refusing merge -- could not confirm whether the base's forward movement was safe to tolerate", "error", ancestorErr, "repo_full_name", repoFullName, "pr_number", prNumber)
-			return false, "", "this pull request's base has changed since this verdict was produced, and whether that change was safe to tolerate could not be confirmed (a live check failed) -- try again shortly", nil
+			return false, "", "this pull request's base has changed since this verdict was produced, and whether that change was safe to tolerate could not be confirmed (a live check failed) -- try again shortly", false, "", nil
 		}
 		baseAdvancedWithoutRewrite = confirmed
 	}
@@ -603,7 +755,7 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	var currentAncestorChain []review.AncestorLink
 	if len(target.AncestorChain) > 0 && target.AncestorChain[0].Ref == "" {
 		platform.Logger(ctx).Warn("decisioninbox: ancestor chain link reported with no ref at all (a degraded stack read), refusing merge -- could not confirm the pull request's current ancestor chain", "repo_full_name", repoFullName, "pr_number", prNumber)
-		return false, "", "this pull request's ancestor chain could not be confirmed (a live check failed) -- try again shortly", nil
+		return false, "", "this pull request's ancestor chain could not be confirmed (a live check failed) -- try again shortly", false, "", nil
 	}
 	if len(target.AncestorChain) > 0 {
 		ancestorSHACtx, cancel := context.WithTimeout(ctx, deps.Timeouts.DecisionInboxResolveBranchSHATimeout)
@@ -616,7 +768,7 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		cancel()
 		if liveAncestorErr != nil || liveAncestorSHA == "" {
 			platform.Logger(ctx).Warn("decisioninbox: resolve ancestor chain's own live tip failed, refusing merge -- could not confirm the pull request's current ancestor chain", "error", liveAncestorErr, "repo_full_name", repoFullName, "pr_number", prNumber)
-			return false, "", "this pull request's ancestor chain could not be confirmed (a live check failed) -- try again shortly", nil
+			return false, "", "this pull request's ancestor chain could not be confirmed (a live check failed) -- try again shortly", false, "", nil
 		}
 		currentAncestorChain = []review.AncestorLink{{Ref: target.AncestorChain[0].Ref, SHA: liveAncestorSHA}}
 	}
@@ -649,12 +801,27 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		cancel()
 		if ancestorErr != nil {
 			platform.Logger(ctx).Warn("decisioninbox: resolve ancestor-chain-advanced-without-rewrite ancestry failed, refusing merge -- could not confirm whether the ancestor chain's forward movement was safe to tolerate", "error", ancestorErr, "repo_full_name", repoFullName, "pr_number", prNumber)
-			return false, "", "this pull request's ancestor chain has changed since this verdict was produced, and whether that change was safe to tolerate could not be confirmed (a live check failed) -- try again shortly", nil
+			return false, "", "this pull request's ancestor chain has changed since this verdict was produced, and whether that change was safe to tolerate could not be confirmed (a live check failed) -- try again shortly", false, "", nil
 		}
 		ancestorChainAdvancedWithoutRewrite = confirmed
 	}
 
-	eligible, eligReason := autoapproval.ComputeEligible(autoapproval.EligibilityInput{
+	// ComputeEligibleWithAcceptance, threading the SAME accepted this
+	// function's own probe call above already used -- accepted waives
+	// ONLY ReasonNotShippableAuto/ReasonDiffTooLarge; every OTHER
+	// criterion computed here (CI, blast radius, sensitive path, and
+	// every freshness check this function's own live SCM calls above
+	// just resolved) stays mandatory regardless (§21.1b).
+	//
+	// viaAcceptance (finding F1, adversarial review), UNLIKE the probe
+	// call's own identical third return value above, is never discarded
+	// here: this is the call that actually decides whether this PR
+	// merges, so its own viaAcceptance is the one the caller must see --
+	// see this function's own top doc comment for why silently dropping
+	// it (as the code did before this fix) let an acceptance-driven
+	// merge read, downstream, as indistinguishable evidence the engine's
+	// own judgment was right.
+	eligible, eligReason, viaAcceptance := autoapproval.ComputeEligibleWithAcceptance(autoapproval.EligibilityInput{
 		Verdict:                             record.Verdict,
 		VerdictAssessed:                     true,
 		VerdictHeadSHA:                      record.HeadSHA,
@@ -674,10 +841,19 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		ChangedFileCount:                    changedFileCount,
 		TouchedBlastRadius:                  touchedBlastRadius,
 		TouchedBlastRadiusKnown:             touchedBlastRadiusKnown,
-	}, cfg)
+	}, cfg, accepted)
 	if !eligible {
-		return false, "", fmt.Sprintf("this pull request no longer meets the auto-approval eligibility criteria: %s", eligReason), nil
+		return false, "", fmt.Sprintf(reasonNoLongerMeetsCriteriaFmt, eligReason), false, "", nil
 	}
 
-	return true, target.HeadSHA, "", nil
+	// acceptanceID is only ever meaningful alongside viaAcceptance=true
+	// (accepted was computed above from THIS exact acceptance, if any) --
+	// reported here rather than unconditionally so a caller that (against
+	// this function's own contract) reads it without checking
+	// viaAcceptance first still gets the honest "" rather than a stale id
+	// left over from an acceptance that did not actually matter.
+	if !viaAcceptance {
+		acceptanceID = ""
+	}
+	return true, target.HeadSHA, "", viaAcceptance, acceptanceID, nil
 }

@@ -75,7 +75,9 @@ POST /api/automations/{automationID}/resume
 POST /api/automations/{automationID}/webhook-token
 POST /api/cloud-identity-bindings
 POST /api/cloud-identity/signing-keys/rotate
+POST /api/decision-inbox/accept-verdict
 POST /api/decision-inbox/merge
+POST /api/decision-inbox/revoke-verdict-acceptance
 POST /api/environments/{environmentID}/cloud-identity-bindings
 POST /api/environments/{environmentID}/provider-credentials
 POST /api/environments/{environmentID}/sandbox-secrets

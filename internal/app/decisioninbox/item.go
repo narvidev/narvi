@@ -87,6 +87,104 @@ type Item struct {
 	// HasApprovingReview.
 	HasChangesRequested bool
 
+	// VerdictID is review_verdicts.id for this PR's own CURRENT latest
+	// verdict, whenever one has been posted (empty otherwise) -- set
+	// unconditionally alongside the acceptance-display fields below (the
+	// SAME GetLatest call already resolves it), so a client can name this
+	// exact verdict back on AcceptReviewVerdictRequest.VerdictId (finding
+	// F3, adversarial review: accept-verdict binds to the ONE verdict a
+	// caller actually read, never to whichever verdict happens to be
+	// latest when the accept request arrives).
+	VerdictID string
+
+	// AcceptanceID/AcceptanceJustification/AcceptedAt/AcceptedByUserID
+	// (§21.1b: "human acceptance of a verdict the engine refuses") are set
+	// iff an ACTIVE, APPLICABLE acceptance exists for this PR's own
+	// current verdict AND current attempt (internal/domain/reviewverdict.
+	// Acceptance.Applicable, given internal/app/reviewverdict.
+	// HasNewerReviewAttempt's own resolved fact -- finding F1, adversarial
+	// review: a not_assessed attempt posts no verdict, so verdict-id
+	// equality alone cannot see it) AND its own recorded base ref/ancestor
+	// chain still match this PR's own current, already-fetched base ref/
+	// ancestor chain (finding F6 of an earlier round, adversarial review:
+	// Applicable alone cannot see a moved base or a changed ancestor chain
+	// -- see acceptanceContextStillFresh's own doc comment, aggregate.go).
+	// A revoked acceptance, one that no longer binds to the current
+	// verdict/attempt, or one a moved base/changed ancestor chain has
+	// invalidated, renders identically to no acceptance at all: all four
+	// fields are the empty string / zero time, mirroring this package's
+	// own "absent fact -> zero value" convention elsewhere on this same
+	// struct (e.g. Findings/FindingsUnknown). Display only -- none of the
+	// four ever gates Kind (buildPROpenItem's own classification below is
+	// unaffected: an accepted PR still classifies needs_review, never
+	// ready_to_merge, because §21.1b's own acceptance is an authorisation
+	// for a human's OWN Merge click, never a reclassification of the
+	// engine's judgment) -- they exist so a maintainer scanning
+	// needs_review can SEE that this row's own eligibility refusal has
+	// already been authorised, by whom (AcceptedByUserID -- finding F6,
+	// adversarial review: this field did not exist before this fix, even
+	// though this doc comment already claimed a maintainer could see "by
+	// whom" it was authorised), and can name AcceptanceID back on
+	// RevokeReviewVerdictAcceptanceRequest.Id (finding F11 of an earlier
+	// round, adversarial review: before that field existed, no read
+	// surface ever returned an acceptance's own id, so revocation was
+	// reachable only by a client that had kept the original 201 response
+	// body).
+	AcceptanceID            string
+	AcceptanceJustification string
+	AcceptedAt              time.Time
+	AcceptedByUserID        string
+
+	// AcceptanceMergeable/AcceptanceMergeBlockedReason (round 3, finding
+	// R1, adversarial review) answer the question a maintainer+ actually
+	// needs once they can SEE the acceptance above: does it unblock a
+	// Merge click RIGHT NOW. Set (AcceptanceMergeable to true or false)
+	// ONLY when AcceptanceID is non-empty -- both stay at their Go zero
+	// value (false, "") otherwise, mirroring FindingsUnknown's own
+	// "absent fact -> zero value" convention on this same struct. Before
+	// this fix, the client's own hasAcceptedOverride was nothing but
+	// "does an acceptance row exist", so a needs_review row with an open
+	// review finding, or one with changes requested, rendered an enabled
+	// Merge button that RevalidateForMerge would unconditionally refuse
+	// (409) -- indistinguishable, on this row, from a row an acceptance
+	// genuinely unblocks.
+	//
+	// buildPROpenItem computes this by calling computeRealEligibility a
+	// SECOND time, WITH accepted=true, reusing the identical mandatory-
+	// criteria set RevalidateForMerge itself enforces at click time (CI
+	// green, blast radius known, sensitive path, every freshness check)
+	// -- never a client-side or server-side heuristic re-deriving those
+	// criteria independently, which is exactly how this drifted from the
+	// real gate before. This SECOND call is PURELY a display computation
+	// (T1, round 4, adversarial review: computeRealEligibility itself no
+	// longer records anything -- see that function's own doc comment,
+	// aggregate.go, and recordContestedIfApplicable's own doc comment for
+	// why this call site must never be the one that does). Still
+	// best-effort/non-authoritative, exactly like Kind itself (§16.2: "the
+	// rendered queue is never trusted as authority") -- RevalidateForMerge
+	// is re-run, unconditionally, at click time regardless of what this
+	// says; a false AcceptanceMergeable therefore only ever hides a
+	// button that might, rarely, still have worked (a live check settled
+	// favorably between this read and a hypothetical click) -- never the
+	// reverse (a shown button that 409s), which is the direction this fix
+	// exists to close.
+	//
+	// Computed for EVERY PR-shaped row carrying an acceptance (T6, round
+	// 4, adversarial review) -- ready_to_merge, needs_review, AND the
+	// handoff sub-case of awaiting_approval -- never only needs_review as
+	// a previous version of this comment implied: a handoff PR is refused
+	// UNCONDITIONALLY by RevalidateForMerge regardless of any acceptance
+	// (buildPROpenItem's own isHandoffPR branch says so with its own
+	// fixed reason, no engine call needed), and a ready_to_merge row's own
+	// acceptance is (trivially) mergeable, since accepted only ever
+	// RELAXES the criteria an already-passing row already cleared. A
+	// release cut's own isReleaseCut branch (buildPROpenItem) computes
+	// AcceptanceMergeBlockedReason exactly like isHandoffPR does; only
+	// AcceptanceMergeable itself stays unconditionally false there -- see
+	// that branch's own comment for why.
+	AcceptanceMergeable          bool
+	AcceptanceMergeBlockedReason string
+
 	// IsRelease is true iff this PR-shaped row is a release cut (§15)
 	// whose §15.2 manifest check has already been computed and persisted
 	// -- see resolveReleaseCut's own doc comment (aggregate.go) for the

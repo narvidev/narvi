@@ -213,7 +213,7 @@ func (w *Worker) mergeCandidate(ctx context.Context, repoFullName string, prNumb
 	// MergePR-failure streak back to zero on every tick, so
 	// domainautomerge.MaxAuthFailures could never actually be reached.
 	// Only a genuinely successful MergePR (below) resets either streak.
-	ok, headSHA, reason, err := decisioninbox.RevalidateForAutoMerge(ctx, w.deps.DecisionInbox, w.deps.SourceControl, repoFullName, prNumber, w.deps.BotToken)
+	ok, headSHA, reason, viaAcceptance, acceptanceID, err := decisioninbox.RevalidateForAutoMerge(ctx, w.deps.DecisionInbox, w.deps.SourceControl, repoFullName, prNumber, w.deps.BotToken)
 	if err != nil {
 		w.recordAuthOutcome(ctx, repoFullName, err, now, reservation)
 		logger.Error("automerge: revalidate for auto-merge failed", "error", err, "repo_full_name", repoFullName, "pr_number", prNumber)
@@ -273,13 +273,35 @@ func (w *Worker) mergeCandidate(ctx context.Context, repoFullName string, prNumb
 
 	logger.Info("automerge: merged", "repo_full_name", repoFullName, "pr_number", prNumber, "merge_commit_sha", mergeSHA)
 
-	appreviewverdict.RecordConfirmed(ctx, w.deps.DecisionInbox.ReviewVerdict, repoFullName, int32(prNumber), headSHA)
+	// viaAcceptance (finding F1, adversarial review) mirrors httpapi.
+	// MergePullRequest's own identical gate -- RevalidateForAutoMerge
+	// passes honorAcceptance=false to revalidateCore (finding F4,
+	// revalidate.go's own doc comment: an unattended worker never
+	// consults review_verdict_acceptances at all), so viaAcceptance
+	// should always be false here in practice; this branch stays anyway,
+	// deliberately never a bare RecordConfirmed call, so a future change
+	// to that default cannot silently reintroduce F1's own defect on this
+	// path.
+	if viaAcceptance {
+		appreviewverdict.RecordAcceptedOverride(ctx, w.deps.DecisionInbox.ReviewVerdict, repoFullName, int32(prNumber), headSHA)
+	} else {
+		appreviewverdict.RecordConfirmed(ctx, w.deps.DecisionInbox.ReviewVerdict, repoFullName, int32(prNumber), headSHA)
+	}
 
-	if err := auditlog.Record(ctx, w.deps.AuditLog, pgtype.UUID{}, "auto_merge.merged", "pull_request", fmt.Sprintf("%s#%d", repoFullName, prNumber), map[string]any{
+	auditDetail := map[string]any{
 		"repo_full_name":   repoFullName,
 		"pr_number":        prNumber,
 		"merge_commit_sha": mergeSHA,
-	}); err != nil {
+	}
+	// via_acceptance/acceptance_id (finding F1, adversarial review):
+	// mirrors httpapi.MergePullRequest's own identical audit-row
+	// addition -- absent entirely (never a fabricated false/"") when
+	// viaAcceptance is false.
+	if viaAcceptance {
+		auditDetail["via_acceptance"] = true
+		auditDetail["acceptance_id"] = acceptanceID
+	}
+	if err := auditlog.Record(ctx, w.deps.AuditLog, pgtype.UUID{}, "auto_merge.merged", "pull_request", fmt.Sprintf("%s#%d", repoFullName, prNumber), auditDetail); err != nil {
 		// The merge already succeeded on GitHub -- a logging failure here
 		// must never claim otherwise, mirroring httpapi.MergePullRequest's
 		// own identical posture for the human-clicked path.

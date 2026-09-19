@@ -532,8 +532,61 @@ const (
 // full criteria list, their order, and why "no floor raised" is not a
 // separate check of its own.
 func ComputeEligible(in EligibilityInput, cfg EligibilityConfig) (eligible bool, reason Reason) {
+	eligible, reason, _ = computeEligibleCore(in, cfg, false)
+	return eligible, reason
+}
+
+// ComputeEligibleWithAcceptance is ComputeEligible's own sibling for a
+// pull request carrying an applicable human acceptance ("human
+// acceptance of a verdict the engine refuses", §21.1b) -- identical to
+// ComputeEligible in every respect except that, when accepted is true,
+// exactly TWO criteria stop refusing on their own: ReasonNotShippableAuto
+// ("the risk level stands... a human chose to proceed despite it",
+// §21.1b) and ReasonDiffTooLarge (grouped with Shippable in §21.2's own
+// stage-1 criteria list as the two judgment-shaped thresholds, never
+// alongside the structural/CI/sensitive-path checks below). Every OTHER
+// criterion -- every freshness check (head/base/ancestor-chain/policy-
+// version), CI green, blast-radius-known, sensitive-path-touched --
+// refuses exactly as ComputeEligible refuses it, UNCONDITIONALLY,
+// whether or not accepted is true: "the conditions that are not about
+// human judgment -- CI green at the current head, blast radius known,
+// sensitive paths -- stay mandatory" (§21.1b). accepted controls two
+// named checks and nothing else in this function's own control flow
+// changes shape.
+//
+// accepted is the caller's OWN already-computed answer to "does an
+// active review_verdict_acceptances row apply to the SAME verdict this
+// EligibilityInput was built from" (internal/domain/reviewverdict.
+// Acceptance.Applicable) -- this function never looks up an acceptance
+// itself (no I/O, CLAUDE.md/§11) and never re-derives applicability from
+// anything on in: a caller passing accepted=true for a verdict this
+// acceptance does not actually name would waive these two checks
+// wrongly -- that mistake belongs to the caller, never to this pure
+// function.
+//
+// viaAcceptance reports whether accepted actually changed the outcome --
+// true only when eligible is true AND at least one of the two waivable
+// checks would otherwise have refused. A caller with accepted=true whose
+// PR was going to be cleanly eligible anyway (or is still ineligible for
+// a DIFFERENT, non-waivable reason) gets viaAcceptance=false -- this is
+// what lets a caller (an audit-log write, §21.2's own contradiction-rate
+// outcome recording) tell "the engine's own judgment stood" apart from
+// "a human's acceptance is what actually let this merge happen".
+func ComputeEligibleWithAcceptance(in EligibilityInput, cfg EligibilityConfig, accepted bool) (eligible bool, reason Reason, viaAcceptance bool) {
+	return computeEligibleCore(in, cfg, accepted)
+}
+
+// computeEligibleCore is the shared body ComputeEligible/
+// ComputeEligibleWithAcceptance both call -- see doc.go for the full
+// criteria list, their order, and why "no floor raised" is not a
+// separate check of its own. waiveHumanJudgment is ALWAYS false from
+// ComputeEligible's own wrapper immediately above, which preserves that
+// function's exact, already-audited behavior byte-for-byte (every
+// existing call site/test keeps its original signature and outcome);
+// only ComputeEligibleWithAcceptance ever passes true.
+func computeEligibleCore(in EligibilityInput, cfg EligibilityConfig, waiveHumanJudgment bool) (eligible bool, reason Reason, viaAcceptance bool) {
 	if in.HasNeedsHumanLabel {
-		return false, ReasonNeedsHumanLabel
+		return false, ReasonNeedsHumanLabel, false
 	}
 	// §21.1's amendment: "a review that did not complete has no risk
 	// level, and inventing one ... is the same defect as a truncated scan
@@ -541,10 +594,10 @@ func ComputeEligible(in EligibilityInput, cfg EligibilityConfig) (eligible bool,
 	// in.Verdict at all -- a not-assessed PR has no Verdict worth
 	// reasoning about.
 	if !in.VerdictAssessed {
-		return false, ReasonNotAssessed
+		return false, ReasonNotAssessed, false
 	}
 	if in.VerdictHeadSHA == "" || in.VerdictHeadSHA != in.CurrentHeadSHA {
-		return false, ReasonStaleVerdict
+		return false, ReasonStaleVerdict, false
 	}
 	// §21.1's amendment: "head equality is necessary and not
 	// sufficient... the gate is the verdict's whole persisted context --
@@ -557,7 +610,7 @@ func ComputeEligible(in EligibilityInput, cfg EligibilityConfig) (eligible bool,
 	// means exactly this, and forces a fresh review, never a silent
 	// grandfather-in).
 	if in.VerdictBaseRef == "" {
-		return false, ReasonContextUnknown
+		return false, ReasonContextUnknown, false
 	}
 	// Finding F2: an empty base SHA on EITHER side is refused here, on its
 	// own dedicated reason, BEFORE the equality comparison below ever runs
@@ -570,7 +623,7 @@ func ComputeEligible(in EligibilityInput, cfg EligibilityConfig) (eligible bool,
 	// both sides reading "" must never be indistinguishable from both
 	// sides genuinely, confirmedly agreeing.
 	if in.VerdictBaseSHA == "" || in.CurrentBaseSHA == "" {
-		return false, ReasonBaseSHAUnknown
+		return false, ReasonBaseSHAUnknown, false
 	}
 	// D3 (second adversarial-review round): a base REF change (a retarget,
 	// or a stacked PR's own parent merging and GitHub re-targeting onto
@@ -581,7 +634,7 @@ func ComputeEligible(in EligibilityInput, cfg EligibilityConfig) (eligible bool,
 	// can stay unconditional while the sha check alone gains the
 	// fast-forward tolerance.
 	if in.VerdictBaseRef != in.CurrentBaseRef {
-		return false, ReasonBaseMoved
+		return false, ReasonBaseMoved, false
 	}
 	// The base SHA changed under an UNCHANGED ref -- refuse UNLESS the
 	// caller has positively confirmed (BaseAdvancedWithoutRewrite) this
@@ -591,7 +644,7 @@ func ComputeEligible(in EligibilityInput, cfg EligibilityConfig) (eligible bool,
 	// covers why this is a strict widening, never a loosening, of what
 	// this engine already refuses.
 	if in.VerdictBaseSHA != in.CurrentBaseSHA && !in.BaseAdvancedWithoutRewrite {
-		return false, ReasonBaseMoved
+		return false, ReasonBaseMoved, false
 	}
 	// Round-11 finding A1: an unknown link (SHA == "") on EITHER side is
 	// refused here, on its own dedicated reason, BEFORE the equality
@@ -602,13 +655,13 @@ func ComputeEligible(in EligibilityInput, cfg EligibilityConfig) (eligible bool,
 	// equality check below would otherwise treat as trivially matching a
 	// genuinely-empty chain on the other side.
 	if ancestorChainHasUnknownLink(in.VerdictAncestorChain) || ancestorChainHasUnknownLink(in.CurrentAncestorChain) {
-		return false, ReasonAncestorChainUnknown
+		return false, ReasonAncestorChainUnknown, false
 	}
 	if !ancestorChainEqual(in.VerdictAncestorChain, in.CurrentAncestorChain, in.AncestorChainAdvancedWithoutRewrite) {
-		return false, ReasonAncestorChainChanged
+		return false, ReasonAncestorChainChanged, false
 	}
 	if in.VerdictPolicyVersion != CurrentPolicyVersion {
-		return false, ReasonPolicyVersionMismatch
+		return false, ReasonPolicyVersionMismatch, false
 	}
 	// EligibilityInput.CIConclusionDegraded's own doc comment: CIGreen is
 	// already false whenever this is true, so this check changes no
@@ -618,13 +671,23 @@ func ComputeEligible(in EligibilityInput, cfg EligibilityConfig) (eligible bool,
 	// "is the fact even knowable" precedence over the sensitive-path
 	// comparison it gates, below.
 	if in.CIConclusionDegraded {
-		return false, ReasonCIConclusionDegraded
+		return false, ReasonCIConclusionDegraded, false
 	}
 	if !in.CIGreen {
-		return false, ReasonCINotGreen
+		return false, ReasonCINotGreen, false
 	}
-	if in.Verdict.Shippable != review.ShippableAuto {
-		return false, ReasonNotShippableAuto
+	// The two HUMAN-JUDGMENT criteria (§21.1b) -- the only two this
+	// function ever waives, and only when waiveHumanJudgment is true.
+	// Recorded as plain booleans, never an early return, so
+	// waiveHumanJudgment=true can never short-circuit past the MANDATORY
+	// checks below (blast-radius-known, sensitive-path) -- exactly the
+	// bug an early return here would reintroduce: a PR waived on
+	// Shippable/diff-size alone must still be refused if its (not yet
+	// evaluated at this point) blast radius turns out to be unknown or
+	// sensitive.
+	shippableFailed := in.Verdict.Shippable != review.ShippableAuto
+	if shippableFailed && !waiveHumanJudgment {
+		return false, ReasonNotShippableAuto, false
 	}
 	// both checks below now read
 	// server-derived facts (EligibilityInput's own doc comment) -- never
@@ -651,8 +714,9 @@ func ComputeEligible(in EligibilityInput, cfg EligibilityConfig) (eligible bool,
 	// the check below is an explicit, independently-enforced gate of its
 	// own, never something this function merely infers from reaching
 	// this point.
-	if in.ChangedFileCount > cfg.MaxFilesChanged {
-		return false, ReasonDiffTooLarge
+	diffTooLarge := in.ChangedFileCount > cfg.MaxFilesChanged
+	if diffTooLarge && !waiveHumanJudgment {
+		return false, ReasonDiffTooLarge, false
 	}
 	// Phase 5 audit findings 1+2 (both fixed): TouchedBlastRadiusKnown
 	// must be true before TouchedBlastRadius is trusted for anything --
@@ -661,14 +725,35 @@ func ComputeEligible(in EligibilityInput, cfg EligibilityConfig) (eligible bool,
 	// "confirmed nothing sensitive"). This is a DISTINCT criterion from
 	// the sensitive-path comparison immediately below it, with its own
 	// Reason, so a 409/log line can tell "we could not establish this"
-	// apart from "we established it and it IS sensitive".
+	// apart from "we established it and it IS sensitive". UNCONDITIONAL:
+	// waiveHumanJudgment never reaches this far without also having
+	// passed this check, exactly like ReasonSensitivePathTouched below --
+	// "blast radius known" is one of §21.1b's own three named-mandatory
+	// conditions.
 	if !in.TouchedBlastRadiusKnown {
-		return false, ReasonBlastRadiusUnknown
+		return false, ReasonBlastRadiusUnknown, false
 	}
+	// UNCONDITIONAL, exactly like TouchedBlastRadiusKnown immediately
+	// above -- "sensitive paths" is the third of §21.1b's own three
+	// named-mandatory conditions, and waiveHumanJudgment never touches
+	// this check.
 	if touchesSensitivePath(in.TouchedBlastRadius, cfg.SensitiveTags) {
-		return false, ReasonSensitivePathTouched
+		return false, ReasonSensitivePathTouched, false
 	}
-	return true, ReasonNone
+	switch {
+	case shippableFailed:
+		// Only reachable with waiveHumanJudgment true (the unwaived case
+		// already returned above) -- every check after Shippable, above,
+		// ran and passed, so this PR is eligible ONLY because an
+		// applicable acceptance waived ReasonNotShippableAuto.
+		return true, ReasonNotShippableAuto, true
+	case diffTooLarge:
+		// Symmetric to the shippableFailed case immediately above, for
+		// ReasonDiffTooLarge.
+		return true, ReasonDiffTooLarge, true
+	default:
+		return true, ReasonNone, false
+	}
 }
 
 // touchesSensitivePath reports whether ANY tag in blastRadius also
