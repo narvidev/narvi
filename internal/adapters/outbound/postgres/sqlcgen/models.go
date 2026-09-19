@@ -619,6 +619,68 @@ func (ns NullImageBuildStatus) Value() (driver.Value, error) {
 	return string(ns.ImageBuildStatus), nil
 }
 
+type ImageDecisionReason string
+
+const (
+	ImageDecisionReasonSelected                        ImageDecisionReason = "selected"
+	ImageDecisionReasonNoRepos                         ImageDecisionReason = "no_repos"
+	ImageDecisionReasonRepoAccessNoCreator             ImageDecisionReason = "repo_access_no_creator"
+	ImageDecisionReasonRepoAccessCreatorLookupFailed   ImageDecisionReason = "repo_access_creator_lookup_failed"
+	ImageDecisionReasonRepoAccessCreatorDisabled       ImageDecisionReason = "repo_access_creator_disabled"
+	ImageDecisionReasonRepoAccessCreatorViewer         ImageDecisionReason = "repo_access_creator_viewer"
+	ImageDecisionReasonRepoAccessCreatorGuardUnknown   ImageDecisionReason = "repo_access_creator_guard_unknown"
+	ImageDecisionReasonRepoAccessUnsupportedHost       ImageDecisionReason = "repo_access_unsupported_host"
+	ImageDecisionReasonRepoAccessUnparseableUrl        ImageDecisionReason = "repo_access_unparseable_url"
+	ImageDecisionReasonRepoAccessCachedDeny            ImageDecisionReason = "repo_access_cached_deny"
+	ImageDecisionReasonRepoAccessCircuitBreakerOpen    ImageDecisionReason = "repo_access_circuit_breaker_open"
+	ImageDecisionReasonRepoAccessNoToken               ImageDecisionReason = "repo_access_no_token"
+	ImageDecisionReasonRepoAccessNoSourceControl       ImageDecisionReason = "repo_access_no_source_control"
+	ImageDecisionReasonRepoAccessCheckIndeterminate    ImageDecisionReason = "repo_access_check_indeterminate"
+	ImageDecisionReasonRepoAccessDenied                ImageDecisionReason = "repo_access_denied"
+	ImageDecisionReasonImageBuildLookupFailed          ImageDecisionReason = "image_build_lookup_failed"
+	ImageDecisionReasonImageBuildTrackingMarshalFailed ImageDecisionReason = "image_build_tracking_marshal_failed"
+	ImageDecisionReasonImageBuildTrackingUpsertFailed  ImageDecisionReason = "image_build_tracking_upsert_failed"
+	ImageDecisionReasonImageBuildPending               ImageDecisionReason = "image_build_pending"
+	ImageDecisionReasonImageBuildNotReady              ImageDecisionReason = "image_build_not_ready"
+	ImageDecisionReasonImageBuildReadyRowMissingRef    ImageDecisionReason = "image_build_ready_row_missing_ref"
+	ImageDecisionReasonUnrecognized                    ImageDecisionReason = "unrecognized"
+)
+
+func (e *ImageDecisionReason) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = ImageDecisionReason(s)
+	case string:
+		*e = ImageDecisionReason(s)
+	default:
+		return fmt.Errorf("unsupported scan type for ImageDecisionReason: %T", src)
+	}
+	return nil
+}
+
+type NullImageDecisionReason struct {
+	ImageDecisionReason ImageDecisionReason `json:"image_decision_reason"`
+	Valid               bool                `json:"valid"` // Valid is true if ImageDecisionReason is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullImageDecisionReason) Scan(value interface{}) error {
+	if value == nil {
+		ns.ImageDecisionReason, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.ImageDecisionReason.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullImageDecisionReason) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.ImageDecisionReason), nil
+}
+
 type OpencodeConfigScope string
 
 const (
@@ -2117,26 +2179,28 @@ type ReviewVerdictAcceptance struct {
 }
 
 type Sandbox struct {
-	ID                            pgtype.UUID        `json:"id"`
-	SessionID                     pgtype.UUID        `json:"session_id"`
-	Gen                           int32              `json:"gen"`
-	Status                        SandboxStatus      `json:"status"`
-	LastSeenAt                    pgtype.Timestamptz `json:"last_seen_at"`
-	CreatedAt                     pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt                     pgtype.Timestamptz `json:"updated_at"`
-	TokenHash                     *string            `json:"token_hash"`
-	ProviderID                    *string            `json:"provider_id"`
-	SpawnFailureCount             int32              `json:"spawn_failure_count"`
-	LastSpawnFailureAt            pgtype.Timestamptz `json:"last_spawn_failure_at"`
-	SnapshotID                    *string            `json:"snapshot_id"`
-	PendingSnapshotMessageID      *string            `json:"pending_snapshot_message_id"`
-	PreSuspectStatus              *SandboxStatus     `json:"pre_suspect_status"`
-	SnapshotSuppressedInShadow    bool               `json:"snapshot_suppressed_in_shadow"`
-	PendingPushSuppressedInShadow *bool              `json:"pending_push_suppressed_in_shadow"`
-	PendingPushCancelled          bool               `json:"pending_push_cancelled"`
-	DemotionTerminateRequestedAt  pgtype.Timestamptz `json:"demotion_terminate_requested_at"`
-	AgentVersion                  *string            `json:"agent_version"`
-	ImageDigest                   *string            `json:"image_digest"`
+	ID                            pgtype.UUID          `json:"id"`
+	SessionID                     pgtype.UUID          `json:"session_id"`
+	Gen                           int32                `json:"gen"`
+	Status                        SandboxStatus        `json:"status"`
+	LastSeenAt                    pgtype.Timestamptz   `json:"last_seen_at"`
+	CreatedAt                     pgtype.Timestamptz   `json:"created_at"`
+	UpdatedAt                     pgtype.Timestamptz   `json:"updated_at"`
+	TokenHash                     *string              `json:"token_hash"`
+	ProviderID                    *string              `json:"provider_id"`
+	SpawnFailureCount             int32                `json:"spawn_failure_count"`
+	LastSpawnFailureAt            pgtype.Timestamptz   `json:"last_spawn_failure_at"`
+	SnapshotID                    *string              `json:"snapshot_id"`
+	PendingSnapshotMessageID      *string              `json:"pending_snapshot_message_id"`
+	PreSuspectStatus              *SandboxStatus       `json:"pre_suspect_status"`
+	SnapshotSuppressedInShadow    bool                 `json:"snapshot_suppressed_in_shadow"`
+	PendingPushSuppressedInShadow *bool                `json:"pending_push_suppressed_in_shadow"`
+	PendingPushCancelled          bool                 `json:"pending_push_cancelled"`
+	DemotionTerminateRequestedAt  pgtype.Timestamptz   `json:"demotion_terminate_requested_at"`
+	AgentVersion                  *string              `json:"agent_version"`
+	ImageDigest                   *string              `json:"image_digest"`
+	ImageDecisionReason           *ImageDecisionReason `json:"image_decision_reason"`
+	ImageDecisionFingerprint      *string              `json:"image_decision_fingerprint"`
 }
 
 type SandboxHistory struct {

@@ -84,6 +84,17 @@ RETURNING *;
 -- gen's own connecting/booting window would be actively misleading --
 -- "not reported yet" (NULL) is the honest state until THIS gen's own
 -- first "ready" event repopulates them.
+--
+-- image_decision_reason/image_decision_fingerprint (§19's own persisted-
+-- decision-provenance gap, migrations/000139_sandboxes_image_decision.
+-- up.sql) are cleared here for
+-- the IDENTICAL reason agent_version/image_digest already are: a stale
+-- previous-gen decision must never linger and be misread as THIS gen's
+-- own outcome. resolveAndSetImage (imageresolve.go) writes the real value
+-- for this gen immediately after this upsert runs (dispatch.go's own
+-- "outside any transaction, immediately before the provider is ever
+-- called" sequencing) -- NULL here is simply the honest gap between that
+-- gen bump and this gen's own first real decision.
 INSERT INTO sandboxes (session_id, gen, status, token_hash)
 VALUES ($1, 1, 'spawning', $2)
 ON CONFLICT (session_id) DO UPDATE
@@ -93,6 +104,8 @@ SET gen = sandboxes.gen + 1,
     last_seen_at = now(),
     agent_version = NULL,
     image_digest = NULL,
+    image_decision_reason = NULL,
+    image_decision_fingerprint = NULL,
     updated_at = now()
 RETURNING *;
 
@@ -332,5 +345,25 @@ SELECT * FROM sandboxes WHERE demotion_terminate_requested_at IS NOT NULL;
 -- precedent (ReconcileOnce's own doc comment).
 UPDATE sandboxes
 SET demotion_terminate_requested_at = NULL, updated_at = now()
+WHERE session_id = $1
+RETURNING *;
+
+-- name: UpdateSandboxImageDecision :one
+-- §19's own persisted-decision-provenance fix: records resolveAndSetImage's (imageresolve.go) own
+-- per-spawn/-restore image-resolution outcome for THIS gen -- a real
+-- warm-image selection (image_decision_reason = 'selected') or exactly
+-- one of the closed set of fallback reasons
+-- (internal/domain/imagedecision.Reason) that left plan.spec.Image at
+-- defaultBaseImage instead. Called from its own small transact, separate
+-- from planDispatch's (imageresolve.go's own "outside any transaction"
+-- sequencing) -- a plain, best-effort write: a failure here is logged and
+-- never blocks or fails the spawn (§10 Phase 2), mirroring
+-- UpdateSandboxProviderID's own single-column-write shape exactly.
+-- image_decision_fingerprint is nullable because ReasonNoRepos is the one
+-- outcome with no fingerprint to compute at all (decideImage's own first
+-- statement, imageresolve.go, an early return before any repos exist to
+-- fingerprint).
+UPDATE sandboxes
+SET image_decision_reason = $2, image_decision_fingerprint = $3, updated_at = now()
 WHERE session_id = $1
 RETURNING *;
