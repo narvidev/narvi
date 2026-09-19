@@ -178,8 +178,10 @@ type Item struct {
 	// fixed reason, no engine call needed), and a ready_to_merge row's own
 	// acceptance is (trivially) mergeable, since accepted only ever
 	// RELAXES the criteria an already-passing row already cleared. A
-	// release cut is the one PR-shaped Kind that still leaves this pair
-	// uncomputed -- see buildPROpenItem's own isReleaseCut branch for why.
+	// release cut's own isReleaseCut branch (buildPROpenItem) computes
+	// AcceptanceMergeBlockedReason exactly like isHandoffPR does; only
+	// AcceptanceMergeable itself stays unconditionally false there -- see
+	// that branch's own comment for why.
 	AcceptanceMergeable          bool
 	AcceptanceMergeBlockedReason string
 

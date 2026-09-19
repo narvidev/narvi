@@ -749,7 +749,7 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 		// that one exists; this fix answers the second question honestly
 		// without changing the answer to the first.
 		if acceptanceID != "" {
-			item.AcceptanceMergeBlockedReason = "this pull request is a release cut, subject to the separate release-manifest check (§15) -- an accepted override authorises past the code-review engine's own refusal only, and has no effect on that check"
+			item.AcceptanceMergeBlockedReason = "this pull request is a release cut, subject to the separate release-manifest check -- an accepted override authorises past the code-review engine's own refusal"
 		}
 		item.Kind = decisioninbox.KindNeedsReview
 	default:

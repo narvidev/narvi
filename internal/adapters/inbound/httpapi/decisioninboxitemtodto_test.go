@@ -214,8 +214,12 @@ func TestDecisionInboxItemToDTO_AcceptanceMergeableFalseRendersReason(t *testing
 // TestDecisionInboxItemToDTO_AcceptanceMergeableFalseEmptyReasonOmitsField
 // pins T5's own exact degenerate combination (round 4, adversarial
 // review): AcceptanceMergeable=false with an EMPTY
-// AcceptanceMergeBlockedReason (buildPROpenItem's own isHandoffPR/
-// isReleaseCut branches never populate the reason at all, aggregate.go)
+// AcceptanceMergeBlockedReason despite a non-empty AcceptanceID --
+// buildPROpenItem's own isHandoffPR/isReleaseCut branches (aggregate.go)
+// each guard their AcceptanceMergeBlockedReason assignment on
+// `acceptanceID != ""`, so neither can produce this exact combination as
+// written; forced directly below so this test's own DTO-mapping coverage
+// never depends on that guard actually firing.
 // must render acceptanceMergeable=false while leaving
 // acceptanceMergeBlockedReason ABSENT from the JSON entirely -- never a
 // pointer to "". This is the exact shape that arrives client-side as
