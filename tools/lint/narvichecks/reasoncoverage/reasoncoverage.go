@@ -29,6 +29,7 @@ package reasoncoverage
 import (
 	"go/ast"
 	"go/token"
+	"go/types"
 
 	"golang.org/x/tools/go/analysis"
 )
@@ -84,6 +85,16 @@ func run(pass *analysis.Pass) (any, error) {
 		return nil, nil
 	}
 
+	// reasonType is this package's own Reason named type, looked up by
+	// name rather than assumed -- every constant below is tested against
+	// it with types.AssignableTo, not against its own AST-level type
+	// syntax (see the loop below for why that distinction is load-bearing).
+	reasonObj := pass.Pkg.Scope().Lookup(reasonTypeName)
+	if reasonObj == nil {
+		return nil, nil
+	}
+	reasonType := reasonObj.Type()
+
 	declared := map[string]token.Pos{}
 	var order []string
 	listed := map[string]bool{}
@@ -97,15 +108,25 @@ func run(pass *analysis.Pass) (any, error) {
 				}
 				for _, spec := range d.Specs {
 					vs, ok := spec.(*ast.ValueSpec)
-					if !ok || vs.Type == nil {
-						continue
-					}
-					ident, ok := vs.Type.(*ast.Ident)
-					if !ok || ident.Name != reasonTypeName {
+					if !ok {
 						continue
 					}
 					for _, name := range vs.Names {
 						if name.Name == "_" {
+							continue
+						}
+						// types.AssignableTo, not an *ast.Ident match against
+						// vs.Type, on purpose: an UNTYPED constant (no "Reason"
+						// written at its own declaration, e.g. `ReasonFoo =
+						// "foo"`) reports vs.Type == nil and would be invisible
+						// to a syntactic check, yet is still implicitly
+						// assignable to Reason and returnable from a real call
+						// site. pass.TypesInfo.Defs[name].Type() is "untyped
+						// string" for that shape, NOT this package's own
+						// Reason -- AssignableTo is what recognizes it anyway,
+						// exactly as it does the explicitly-typed shape.
+						obj := pass.TypesInfo.Defs[name]
+						if obj == nil || !types.AssignableTo(obj.Type(), reasonType) {
 							continue
 						}
 						if _, exists := declared[name.Name]; !exists {
@@ -130,8 +151,8 @@ func run(pass *analysis.Pass) (any, error) {
 			continue
 		}
 		pass.Reportf(declared[name],
-			"%s is declared as a %s constant but is not listed in %s() -- a value the Postgres enum (migrations/000139_sandboxes_image_decision.up.sql) does not know about is rejected at write time, rolling back the whole persisting transact and silently dropping the record (see reason.go's own package doc comment); add it to %s(), and to that migration's CREATE TYPE list, or name it in reasoncoverage's own allowedMissing if it must never be persisted (see ReasonNone)",
-			name, reasonTypeName, allFuncName, allFuncName)
+			"%s is declared as a %s constant but is not listed in %s() -- persistImageDecisionBestEffort's own validatedPersistReason (internal/app/sessionactor/imageresolve.go) substitutes any Reason outside %s() with ReasonUnrecognized before the write ever reaches the Postgres enum (migrations/000139_sandboxes_image_decision.up.sql), so a real call site returning this constant silently mis-buckets into 'unrecognized' rather than being rejected at write time; add it to %s(), and to that migration's CREATE TYPE list, or name it in reasoncoverage's own allowedMissing if it must never be persisted (see ReasonNone)",
+			name, reasonTypeName, allFuncName, allFuncName, allFuncName)
 	}
 
 	return nil, nil

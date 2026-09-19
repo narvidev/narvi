@@ -49,8 +49,9 @@
 --     "no decision recorded for this gen yet" (the same case as above),
 --     OR "a decision WAS recorded, but there was nothing to fingerprint"
 --     (imagedecision.ReasonNoRepos, the one outcome with zero configured
---     repos -- see resolveAndSetImage's own top-of-function bare return,
---     imageresolve.go). A NULL fingerprint therefore does NOT by itself
+--     repos -- see decideImage's own first statement, an early return of
+--     three explicit values, imageresolve.go). A NULL fingerprint
+--     therefore does NOT by itself
 --     imply no decision was recorded; check image_decision_reason for
 --     that. queries/sandboxes.sql's own UpdateSandboxImageDecision
 --     comment and imagedecision_integration_test.go's own
@@ -76,9 +77,15 @@
 --
 -- Deliberately NOT re-exposed through any new REST/DTO surface here: the
 -- decision is ALSO appended, in the SAME transaction, to the existing
--- append-only events log (type = 'image_decision', payload carries the
--- identical reason plus fingerprint/context) -- and that log already
--- reaches every reader (§6.2's client-WS subscribe/fetch_history replay,
+-- append-only events log (type = 'image_decision', payload carries
+-- fingerprint/context plus internal/app/sessionactor's own
+-- participantVisibleReason(reason) -- NOT this column's raw value:
+-- participantVisibleReason coarsens three of the twenty-two reasons
+-- (ReasonRepoAccessCreatorDisabled, ReasonRepoAccessCreatorViewer,
+-- ReasonRepoAccessNoToken) to ReasonRepoAccessDenied before the event is
+-- served, while this column keeps the precise value regardless -- see
+-- that function's own doc comment, imageresolve.go, for why) -- and that
+-- log already reaches every reader (§6.2's client-WS subscribe/fetch_history replay,
 -- §6.3's existing GET .../events REST route) with no schema or route
 -- change of its own, exactly the "reusing the existing collection and
 -- event log rather than adding a surface" instruction this migration

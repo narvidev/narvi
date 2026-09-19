@@ -86,9 +86,10 @@ const (
 	ReasonSelected Reason = "selected"
 
 	// ReasonNoRepos reports that the session's own SessionConfig.Repos is empty --
-	// resolveAndSetImage's own top-of-function bare return ("nothing to
-	// fingerprint; stays on defaultBaseImage"), previously the only
-	// early-return path in this file with NO log line at all.
+	// decideImage's own first statement (imageresolve.go), an early return
+	// of three explicit values ("nothing to fingerprint; stays on
+	// defaultBaseImage"), previously the only early-return path in this
+	// file with NO log line at all.
 	ReasonNoRepos Reason = "no_repos"
 
 	// ReasonRepoAccessNoCreator reports that plan.createdBy is not a valid user id (an
@@ -185,8 +186,13 @@ const (
 	// map[string]string (e.g. gains a value type json.Marshal genuinely
 	// can reject) -- at which point this branch becomes reachable without
 	// anyone having to notice and add a new Reason for it. Of All()'s 22
-	// persisted values, this is the one not reachable through any call
-	// site as the code stands today.
+	// persisted values, this is not the only one whose own call site
+	// should never fire in a correctly-functioning build --
+	// ReasonRepoAccessCreatorGuardUnknown and ReasonUnrecognized's own
+	// doc comments make that same claim for themselves. What sets this
+	// one apart: its unreachability is provable from json.Marshal's own
+	// argument type, not merely assumed from another component's
+	// contract holding.
 	ReasonImageBuildTrackingMarshalFailed Reason = "image_build_tracking_marshal_failed"
 
 	// ReasonImageBuildTrackingUpsertFailed reports that image_builds.Get
@@ -239,10 +245,12 @@ const (
 	// Postgres enum this package's other 22 values populate
 	// (migrations/000139_sandboxes_image_decision.up.sql) has NO
 	// 'none'/'not_applicable' member, on purpose -- if a future bug ever
-	// did try to persist ReasonNone, the enum-typed column write fails
-	// loudly (a Postgres error, logged, the whole best-effort transact
-	// rolled back) rather than silently adding a meaningless bucket to a
-	// vocabulary whose entire purpose is being counted and compared.
+	// did try to persist ReasonNone, persistImageDecisionBestEffort's own
+	// validatedPersistReason (imageresolve.go) catches it before the
+	// transact even opens, substitutes ReasonUnrecognized, and logs at
+	// Error, so the record still survives rather than silently adding a
+	// meaningless bucket to a vocabulary whose entire purpose is being
+	// counted and compared.
 	ReasonNone Reason = "none"
 )
 

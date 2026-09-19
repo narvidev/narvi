@@ -593,8 +593,9 @@ type UpdateSandboxImageDecisionParams struct {
 // never blocks or fails the spawn (§10 Phase 2), mirroring
 // UpdateSandboxProviderID's own single-column-write shape exactly.
 // image_decision_fingerprint is nullable because ReasonNoRepos is the one
-// outcome with no fingerprint to compute at all (imageresolve.go's own
-// top-of-function bare return, before any repos exist to fingerprint).
+// outcome with no fingerprint to compute at all (decideImage's own first
+// statement, imageresolve.go, an early return before any repos exist to
+// fingerprint).
 func (q *Queries) UpdateSandboxImageDecision(ctx context.Context, arg UpdateSandboxImageDecisionParams) (Sandbox, error) {
 	row := q.db.QueryRow(ctx, updateSandboxImageDecision, arg.SessionID, arg.ImageDecisionReason, arg.ImageDecisionFingerprint)
 	var i Sandbox
