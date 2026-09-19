@@ -62,6 +62,7 @@ whenever this file is opened to record a new decision.
 |---|---|---|
 | A platform-supplied plugin mode (D-03) | 2026-09-17 | A repository needs a platform-pinned tool that the sandbox's own runtime configuration cannot supply. The cost that made deferral easy is the half that gets forgotten: convergence after restore — installing what is expected **and removing** what survives inside a snapshot (§35.5b) |
 | Deleting a prepared medium against its quota (D-04) | 2026-09-17 | A slot quota is actually wanted. It is a different resource from a byte quota, and whoever reopens this must name bytes, slots, video duration and cancelled captures together — a design naming two of the four is wrong at the boundary |
+| `revalidateCore` has no release-cut gate (revalidate.go) | 2026-09-19 | A release-cut PR — accepted override or not — reaches `ok=true` through `RevalidateForMerge`/`RevalidateForAutoMerge` while its own persisted §15.2 manifest check (`release_manifest_checks`) still carries a non-zero findings count. Evaluable directly from that merge's own audit row plus the PR's manifest-check row; no new instrumentation required |
 
 ### Deferrals that live in a plan row
 

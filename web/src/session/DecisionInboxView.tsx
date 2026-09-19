@@ -33,17 +33,52 @@
 //
 // item.title (a PR/plan/session/automation title), repoFullName,
 // provenanceRepoFullName/provenancePattern (a CODEOWNERS pattern),
-// failureReason, artifactSummary, and lastError are ALL third-party or
-// model-influenced free text (a PR title is GitHub-author-controlled; a
-// CODEOWNERS pattern is a repo-author-controlled string; failureReason/
-// lastError can echo arbitrary upstream error text) -- every one of them
-// renders through the plain-text T component below (truncateForDisplay,
-// mirroring AutomationsView.tsx's own AutomationRow / MembersPanel.tsx's
-// own MemberRow precedent exactly), never dangerouslySetInnerHTML.
+// failureReason, artifactSummary, lastError, outboxKind (DecisionInboxRow,
+// the `dead-lettered · ${item.outboxKind}` text -- T7, round 4,
+// adversarial review: rendered since this view's own outbox section
+// existed, but never named here until this fix), acceptanceJustification
+// (the accepting maintainer+'s own free-text justification, §21.1b --
+// round 3, finding R8, adversarial review: added when this field started
+// being rendered, round 2, but this accounting was never updated to name
+// it), and acceptanceMergeBlockedReason (a short, SERVER-composed reason
+// string, round 3, finding R1 -- never itself free text a THIRD party
+// authors, but rendered through the identical T path anyway, since
+// nothing here distinguishes "server-composed" from "third-party" at the
+// render call site) are ALL third-party or model-influenced free text (a
+// PR title is GitHub-author-controlled; a CODEOWNERS pattern is a
+// repo-author-controlled string; failureReason/lastError can echo
+// arbitrary upstream error text) -- every one of them renders through the
+// plain-text T component below (truncateForDisplay, mirroring
+// AutomationsView.tsx's own AutomationRow / MembersPanel.tsx's own
+// MemberRow precedent exactly), never dangerouslySetInnerHTML.
+// acceptedBy is a raw user id (a UUID string), never resolved to a
+// display name -- mirrors restdtos.Plan.decidedBy/PlanModeView.tsx's own
+// identical precedent, rendered through T anyway for consistency with
+// every other field on this row, though it carries no injection risk of
+// its own.
+// mutation.error.message (T7, round 4, adversarial review: the four
+// `{mutation.error instanceof ApiError ? <T text={mutation.error.
+// message} /> : ...}` renders inside MergeButton/ApprovePlanButton/
+// ResumeSessionButton/ResumeAutomationButton below) is the ONE class of
+// string on this row that is not a wire field at all -- ApiError.message
+// (api/http.ts) is server-composed error text from a REST response body,
+// arbitrary in length and content the same way any of the fields above
+// are, and already went through T (mirrors every field above); this
+// accounting simply never named it, twice (round 3's own version of this
+// list already omitted it).
 // htmlUrl is the ONLY field that ever becomes an href, and only after
 // isSafeHref (urlSafety.ts) accepts it -- mirrors SessionRail.tsx's own
 // ArtifactRow precedent, including its identical "link unavailable"
 // fallback text for a rejected URL.
+//
+// This list is audited against the code, not the other way around: T7
+// (round 4, adversarial review) found it DRIFTED from DecisionInboxRow/
+// MergeButton/ApprovePlanButton/ResumeSessionButton/ResumeAutomationButton
+// TWICE already (outboxKind, mutation.error.message) -- an accounting
+// that is itself incomplete verifies nothing. Anyone adding a new
+// server-composed or third-party string render below must add it here IN
+// THE SAME CHANGE, named by symbol (never paraphrased), or this list
+// drifts a third time.
 import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
@@ -57,8 +92,10 @@ import { meQueryOptions } from '../auth/session'
 import { AUTO_PAUSE_THRESHOLD } from './automationFormat'
 import {
   canMergeDecisionInboxItem,
+  canMergeViaAcceptance,
   formatAgeSeconds,
   formatDecisionLatencySeconds,
+  hasAcceptedOverride,
   prChipData,
   provenanceText,
   releaseChipData,
@@ -355,7 +392,89 @@ export function DecisionInboxRow({ item, canMerge }: { item: DecisionInboxItem; 
         {item.stale ? ' — stale' : ''}
       </span>
 
-      {item.kind === 'ready_to_merge' && <MergeButton item={item} canMerge={canMerge} />}
+      {/*
+        finding F5 (adversarial review): an accepted-but-engine-refused PR
+        (§21.1b) still classifies needs_review, DELIBERATELY (see
+        hasAcceptedOverride's own doc comment, decisionInboxFormat.ts, for
+        why the aggregate stays acceptance-blind) -- but that must never
+        mean the ONLY way to act on it is the raw API a maintainer cannot
+        reach from this screen. The Merge endpoint's own server-side gate
+        (RevalidateForMerge) already honors an applicable acceptance
+        regardless of which row kind this client thinks it is looking at
+        (MergeButton's own doc comment: "the real gate is server-side...
+        re-checked unconditionally at click time"), so offering it here is
+        never unsafe -- it was simply never OFFERED before this fix.
+
+        Round 3, finding R1 (adversarial review, corrected): this used to
+        gate on hasAcceptedOverride(item) alone -- "an acceptance row
+        exists" -- which rendered an enabled Merge button on a PR the
+        server refuses UNCONDITIONALLY (an open review finding, changes
+        requested...), since an acceptance row existing says nothing about
+        whether it actually unblocks anything. canMergeViaAcceptance
+        (decisionInboxFormat.ts) is the fix: this client never infers
+        mergeability itself, it reads the SERVER's own answer
+        (acceptanceMergeable, computed by re-running the real eligibility
+        engine WITH the acceptance applied). See the "why not" text a few
+        lines down for what a maintainer sees INSTEAD of the button on a
+        row this still refuses.
+      */}
+      {(item.kind === 'ready_to_merge' || (kind === 'pr' && item.kind === 'needs_review' && canMergeViaAcceptance(item))) && (
+        <MergeButton item={item} canMerge={canMerge} />
+      )}
+      {/*
+        The "if not, why" half of finding R1: a row WITH an acceptance
+        that still does not unblock Merge (canMergeViaAcceptance false)
+        must not simply render nothing where the button would have been
+        -- that reads as "no acceptance was ever granted", the exact
+        confusion the "accepted override" chip above already exists to
+        dispel. acceptanceMergeBlockedReason is the server's own honest
+        reason (Item.AcceptanceMergeBlockedReason's own doc comment,
+        server-side); through T like every other untrusted string on this
+        row.
+
+        `kind === 'handoff'` (T6, round 4, adversarial review) joins the
+        `kind === 'pr' && item.kind === 'needs_review'` half above --
+        aggregate.go's own isHandoffPR branch now computes a real,
+        non-empty AcceptanceMergeBlockedReason whenever this row carries
+        an acceptance (mirroring RevalidateForMerge's own unconditional
+        handoff refusal), and a handoff row never offers a Merge button
+        at all (see the button's own condition a few lines up), so this
+        is the ONLY place a maintainer+ can see WHY an acceptance they
+        already granted still does nothing here.
+
+        `kind === 'release'` (round-5 finding V4) joins the same two:
+        aggregate.go's own isReleaseCut branch now ALSO computes a real,
+        non-empty AcceptanceMergeBlockedReason whenever a release-cut row
+        carries an acceptance, explaining that §15's manifest check is a
+        separate gate an acceptance has no effect on. Before this fix
+        that field was left uncomputed for this row kind specifically, so
+        a release-cut row's own real, wire-carried acceptance rendered
+        NOTHING anywhere on this screen -- no chip (releaseChipData's own
+        matching fix), no justification, no accepter, no blocked reason
+        -- indistinguishable from "no acceptance was ever granted".
+
+        `!= null` (T5, round 4, adversarial review, corrected: was
+        `!== null`) -- acceptanceMergeBlockedReason carries
+        `omitempty,omitzero` server-side (restdtos.DecisionInboxItem), so
+        an EMPTY reason (any acceptanceMergeable=false path that leaves
+        the reason uncomputed) is OMITTED from the JSON entirely, arriving
+        here as `undefined`, never `null`. `!== null` alone does not
+        exclude `undefined` (`undefined !== null` is `true` in JS), so the
+        OLD guard let this block through with `item.
+        acceptanceMergeBlockedReason` itself `undefined`, rendering the
+        literal text "Still blocked: undefined" -- a real string, not a
+        crash, which is exactly why no test caught it. `!= null` (loose
+        equality, an established idiom in this codebase -- costRollup.ts)
+        excludes BOTH.
+      */}
+      {((kind === 'pr' && item.kind === 'needs_review') || kind === 'handoff' || kind === 'release') &&
+        hasAcceptedOverride(item) &&
+        !canMergeViaAcceptance(item) &&
+        item.acceptanceMergeBlockedReason != null && (
+          <span className="qwhy" title="This acceptance does not currently unblock a merge">
+            <T text={`Still blocked: ${item.acceptanceMergeBlockedReason}`} />
+          </span>
+        )}
       {/*
         Open review links into Narvi's own code-review screen, but ONLY
         when the server has already resolved a real review session for
@@ -389,6 +508,69 @@ export function DecisionInboxRow({ item, canMerge }: { item: DecisionInboxItem; 
       {why !== null && (
         <span className="qwhy">
           <T text={why} />
+        </span>
+      )}
+      {/*
+        finding F5 (adversarial review): the accepting maintainer+'s own
+        free-text justification (§21.1b: "carries author, justification")
+        is untrusted, human-authored content -- through T like every other
+        such string on this row (`why` immediately above, item.title),
+        never a bare interpolation. Rendered only alongside the "accepted
+        override" chip (prChipData), i.e. exactly when acceptanceId is
+        set -- acceptanceJustification's own nullability already mirrors
+        that same gate server-side (DecisionInboxItem.acceptanceJustification's
+        own doc comment).
+
+        Round 3, finding R7 (adversarial review): round 2 added
+        acceptedBy/acceptedAt to the wire (Item.AcceptedByUserID's own doc
+        comment: "the missing 'by whom'") but nothing here ever rendered
+        either -- this line still read as anonymous and undated, the
+        exact gap that addition claimed to close. acceptedBy renders
+        through T like every other string on this row, never resolved to
+        a display name: mirrors this codebase's own established
+        precedent for a raw user-id wire field on a sibling DTO
+        (restdtos.Plan.decidedBy/PlanModeView.tsx, restdtos.
+        WorkflowStepRun.decidedBy/WorkflowRunsView.tsx's own StepRunCard)
+        -- neither resolves the id to a name either; a future surface
+        that DOES resolve user ids to display names should update all
+        three together, never just this one. acceptedAt mirrors
+        WorkflowRunsView.tsx's own identical
+        `new Date(stepRun.decidedAt).toLocaleString()` formatting.
+        acceptedBy is independently nullable from acceptanceJustification
+        (Item.AcceptedByUserID's own doc comment: the accepting user's
+        row can be deleted after the fact, ON DELETE SET NULL) so it gets
+        its own null check, never assumed present just because
+        acceptanceJustification is.
+
+        `kind === 'handoff'` (T6, round 4, adversarial review) joins
+        `kind === 'pr'` -- acceptanceJustification/acceptedBy/acceptedAt
+        are populated server-side UNCONDITIONALLY for any row carrying an
+        acceptance (buildPROpenItem sets them ahead of, and independently
+        of, Kind classification, aggregate.go), so a handoff row already
+        carried this data on the wire -- this view simply never rendered
+        it. Before this fix, a handoff row's own "accepted override" chip
+        (prChipData, rendered for `kind === 'pr' || kind === 'handoff'`
+        already) had nothing beneath it explaining who accepted, why, or
+        when -- a bare chip a maintainer+ could not act on or understand.
+
+        `kind === 'release'` (round-5 finding V4) joins the same two, for
+        the identical reason: acceptanceJustification/acceptedBy/
+        acceptedAt were ALREADY on the wire, unconditionally, for a
+        release-cut row carrying an acceptance -- this view was simply
+        never told to look for `kind === 'release'` here, so that data
+        rendered nowhere at all (the "accepted override" chip above,
+        releaseChipData, closes the other half of this same gap).
+      */}
+      {(kind === 'pr' || kind === 'handoff' || kind === 'release') && hasAcceptedOverride(item) && item.acceptanceJustification !== null && (
+        <span className="qwhy">
+          <T text={`Accepted despite refusal: ${item.acceptanceJustification}`} />
+          {item.acceptedBy !== null && (
+            <>
+              {' — by '}
+              <T text={item.acceptedBy} />
+            </>
+          )}
+          {item.acceptedAt !== null && ` · ${new Date(item.acceptedAt).toLocaleString()}`}
         </span>
       )}
       {kind === 'session' && (

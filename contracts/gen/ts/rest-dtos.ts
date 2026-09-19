@@ -2416,6 +2416,34 @@ export interface DecisionInboxItem {
    */
   hasChangesRequested: boolean | null;
   /**
+   * review_verdicts.id for this PR's own CURRENT latest verdict, whenever one has been posted -- null for a PR with no review verdict of record. This is the id a client names back on AcceptReviewVerdictRequest.verdictId (finding F3, adversarial review): accept-verdict binds to the ONE verdict a maintainer actually read here, never to whichever verdict happens to be latest when the request arrives, and refuses (409) on a mismatch.
+   */
+  verdictId: string | null;
+  /**
+   * The id of the acceptance named by acceptanceJustification below, set under the exact same conditions -- the id a client passes to RevokeReviewVerdictAcceptanceRequest.id (finding F11, adversarial review: before this field existed, no read surface ever returned an acceptance's own id, so revocation was reachable only by a client that had kept the 201 response body from the original accept-verdict call).
+   */
+  acceptanceId: string | null;
+  /**
+   * §21.1b's own 'human acceptance of a verdict the engine refuses': the accepting maintainer+'s own free-text justification, set iff an ACTIVE, APPLICABLE acceptance exists for this PR's own CURRENT verdict (internal/domain/reviewverdict.Acceptance.Applicable) -- null for a PR that was never accepted, whose acceptance was since revoked, or whose acceptance no longer binds to the current verdict (a new attempt, a moved base, a changed ancestor chain -- §21.1b's own three invalidating triggers). Display only: this never changes kind -- an accepted PR still renders needs_review, never ready_to_merge, because acceptance authorises a human's own Merge click rather than reclassifying the engine's judgment.
+   */
+  acceptanceJustification: string | null;
+  /**
+   * When the acceptance named by acceptanceJustification was granted -- null under the exact same conditions acceptanceJustification is null.
+   */
+  acceptedAt: string | null;
+  /**
+   * The accepting maintainer+'s own user id -- null under the exact same conditions acceptanceJustification is null (finding F6, adversarial review: this row's own acceptanceJustification/acceptedAt already told a maintainer THAT a verdict was authorised and WHEN; this field is the missing 'by whom').
+   */
+  acceptedBy: string | null;
+  /**
+   * Round 3, finding R1 (adversarial review): whether THIS row's own acceptance actually unblocks a Merge click right now -- null whenever acceptanceId is null (the question does not apply); set (true or false) iff acceptanceId is non-null. Computed by re-running the SAME real eligibility engine that classifies Kind (internal/app/decisioninbox.computeRealEligibility), a second time, WITH the acceptance applied -- never derived from acceptanceId's own presence alone, which is exactly the defect this field exists to close: a maintainer+'s own acceptance row can exist and still leave this PR blocked on a mandatory, never-waived criterion (CI green, an open review finding, changes requested, blast radius known, a moved base...), and this field is what tells a client that BEFORE it renders a Merge button that would 409. Still best-effort/non-authoritative, exactly like Kind itself (§16.2: 'the rendered queue is never trusted as authority') -- RevalidateForMerge is re-run, unconditionally, at click time regardless of what this says.
+   */
+  acceptanceMergeable?: boolean | null;
+  /**
+   * A short, human-readable explanation of why acceptanceMergeable is false -- null whenever acceptanceMergeable is null or true. Never itself an instruction; display only, mirroring failureReason/lastError's own identical 'echo a short reason string, never markup' discipline.
+   */
+  acceptanceMergeBlockedReason?: string | null;
+  /**
    * True iff this PR is a release cut (§15) whose manifest check has already been computed and persisted. Set (to true or false) for any PR-shaped row, exactly like isHandoff above -- the field a client checks to render this row's own distinct release shape (a link to the release-review screen, never a Merge button: a release cut always renders under kind=needs_review) instead of the ordinary PR shape. A PR that a release-branch-pattern/label WOULD classify as a release cut but that Narvi has not yet reviewed (or reviewed too recently for the background check to have finished) renders false here -- an honest, temporary gap, never a fabricated one.
    */
   isRelease: boolean | null;
@@ -2515,6 +2543,79 @@ export interface MergePullRequestResponse {
   merged: boolean;
   mergeCommitSha: string;
   message: string;
+}
+/**
+ * POST /api/decision-inbox/accept-verdict's own request body ('human acceptance of a verdict the engine refuses', §21.1b) -- binds a new acceptance to (repoFullName, prNumber)'s own review_verdicts row NAMED by verdictId below (finding F3, adversarial review: an earlier version of this endpoint bound to whichever verdict was latest AT REQUEST TIME, server-resolved, never named by the caller -- so a maintainer could authorise a verdict that had already replaced the one they actually read; §21.1b's own contract is 'binds to ONE verdict', and only the client that read that ONE verdict can name it).
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "AcceptReviewVerdictRequest".
+ */
+export interface AcceptReviewVerdictRequest {
+  repoFullName: string;
+  prNumber: number;
+  /**
+   * The id of the review_verdicts row the caller actually read and is accepting (DecisionInboxItem.verdictId, or ReviewReadoutLatestVerdict's own id) -- the server refuses (409) if this no longer matches (repoFullName, prNumber)'s own CURRENT latest verdict, rather than silently binding to whatever is latest now: a mismatch means a new attempt posted since the caller last read this PR, and the caller is about to authorise code it never saw.
+   */
+  verdictId: string;
+  /**
+   * The accepting maintainer+'s own required, free-text explanation (§21.1b: 'carries author, justification'). Untrusted, human-authored content.
+   */
+  justification: string;
+}
+/**
+ * POST /api/decision-inbox/revoke-verdict-acceptance's own request body -- the SAME maintainer+ role as accept-verdict (§21.1b, never a stricter one), scoped to repoFullName exactly like RetireFalsePositivePattern's own identical audit-fix precedent.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "RevokeReviewVerdictAcceptanceRequest".
+ */
+export interface RevokeReviewVerdictAcceptanceRequest {
+  repoFullName: string;
+  /**
+   * The acceptance's own id (ReviewVerdictAcceptance.id) -- never the verdict id or the PR number.
+   */
+  id: string;
+}
+/**
+ * One review_verdict_acceptances row's own REST wire shape ('human acceptance of a verdict the engine refuses', §21.1b, migrations/000135_review_verdict_acceptances.up.sql) -- returned by accept-verdict and revoke-verdict-acceptance so a caller can confirm the resulting state.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "ReviewVerdictAcceptance".
+ */
+export interface ReviewVerdictAcceptance {
+  id: string;
+  repoFullName: string;
+  prNumber: number;
+  /**
+   * review_verdicts.id -- the ONE verdict this acceptance binds to (internal/domain/reviewverdict.Acceptance.Applicable's own doc comment).
+   */
+  verdictId: string;
+  /**
+   * The accepted verdict's own turns.id, carried verbatim for display/audit -- null for a pre-§21.1-amendment verdict.
+   */
+  attemptId: string | null;
+  headSha: string;
+  /**
+   * A best-effort, no-I/O classification of which waivable eligibility criterion this acceptance most likely addresses (e.g. 'the verdict's shippable classification is not auto') -- NOT itself computed by calling autoapproval.ComputeEligible (finding F8, adversarial review: this description, and three others, previously claimed it was); display/audit only, never re-checked. The authoritative eligibility decision is always re-derived live, at merge time, by autoapproval.ComputeEligibleWithAcceptance -- a wrong guess here changes no outcome, only what a human reading the audit trail sees.
+   */
+  reason: string;
+  justification: string;
+  /**
+   * The accepting maintainer+'s own user id.
+   */
+  acceptedBy: string;
+  acceptedAt: string;
+  /**
+   * Null means this acceptance is still active. Non-null means a maintainer+ has explicitly revoked it -- kept, never deleted, for the audit trail.
+   */
+  revokedAt: string | null;
+  /**
+   * Null under the exact same condition revokedAt is null.
+   */
+  revokedBy: string | null;
+  /**
+   * 'explicit' (a maintainer+'s own revoke-verdict-acceptance click) or 'superseded' (a fresh accept-verdict for the SAME pull request revoked this row automatically) -- null under the exact same condition revokedAt is null (finding F4, adversarial review: before this field existed, both cases wrote the IDENTICAL revokedAt/revokedBy shape, so a superseded acceptance was indistinguishable, on this row alone, from an explicit revocation the accepting user never performed).
+   */
+  revocationReason: string | null;
 }
 /**
  * One review_false_positive_patterns row's own REST wire shape ('review: learned false-positive patterns', §22.2/§22.4, migrations/000073_review_false_positive_patterns.up.sql) -- returned by the audit-view GET and the retire POST so a caller can confirm the resulting state. Capture itself has no REST shape at all: it happens exclusively via the `false positive: <reason>` PR-thread command (§22.2, internal/adapters/inbound/github's own dispatch-before-router capture handler), never through this API.

@@ -165,7 +165,9 @@ export interface DecisionInboxChip {
  * comment) and are skipped here rather than rendered as a false "0"/
  * "not green" when genuinely unknown.
  */
-export function prChipData(item: Pick<DecisionInboxItem, 'riskLabel' | 'findings' | 'ciGreen' | 'hasChangesRequested'>): DecisionInboxChip[] {
+export function prChipData(
+  item: Pick<DecisionInboxItem, 'riskLabel' | 'findings' | 'ciGreen' | 'hasChangesRequested' | 'acceptanceId'>,
+): DecisionInboxChip[] {
   const chips: DecisionInboxChip[] = []
 
   if (item.riskLabel) {
@@ -183,7 +185,77 @@ export function prChipData(item: Pick<DecisionInboxItem, 'riskLabel' | 'findings
     chips.push({ tone: 'crit', text: 'changes requested' })
   }
 
+  chips.push(...acceptedOverrideChipData(item))
+
   return chips
+}
+
+/**
+ * acceptedOverrideChipData is the "accepted override" chip itself (finding
+ * F5, adversarial review): before this chip existed, an accepted-but-
+ * engine-refused PR (§21.1b) rendered on this queue INDISTINGUISHABLY from
+ * an ordinary, never-looked-at needs_review row -- the ONLY signal a
+ * maintainer had that a human already authorised proceeding was the raw
+ * JSON API response, never anything this view rendered. acceptanceId,
+ * never acceptanceJustification's own emptiness, is the existence signal
+ * (mirrors decisionInboxItemToDTO's own identical correction, server-side,
+ * finding F3b).
+ *
+ * Extracted to its OWN function (round-5 finding V4) so releaseChipData
+ * below can push the SAME chip a release-cut row carrying an acceptance
+ * now also earns -- before this fix, this logic lived only inside
+ * prChipData, which DecisionInboxView.tsx never calls for a release-cut
+ * row (rowKind returns 'release', not 'pr', for any row with
+ * isRelease=true), so such a row's own real, wire-carried acceptance
+ * rendered no trace of it at all: not this chip, not the justification/
+ * accepter/blocked-reason text below -- indistinguishable from "no
+ * acceptance was ever granted", the exact condition round 4's own T6 fix
+ * declared unacceptable for handoff rows.
+ */
+function acceptedOverrideChipData(item: Pick<DecisionInboxItem, 'acceptanceId'>): DecisionInboxChip[] {
+  return hasAcceptedOverride(item) ? [{ tone: 'warn', text: 'accepted override' }] : []
+}
+
+/**
+ * hasAcceptedOverride reports whether a PR-shaped row carries an active,
+ * applicable acceptance (§21.1b) -- the aggregate's own Kind
+ * classification stays DELIBERATELY acceptance-blind (an accepted PR
+ * still classifies needs_review, never ready_to_merge, because §21.1b's
+ * acceptance authorises a human's OWN next Merge click rather than
+ * reclassifying the engine's judgment -- decisioninbox.Item.AcceptanceID's
+ * own doc comment, server-side), so this is the flag THIS view uses to
+ * still offer that Merge click on a needs_review row (DecisionInboxView.
+ * tsx), and to render the "accepted override" chip above -- rather than
+ * leaving a maintainer who already sees the acceptance's own
+ * justification with nothing but an "Open review" link and no way to act
+ * on it (finding F5, adversarial review).
+ */
+export function hasAcceptedOverride(item: Pick<DecisionInboxItem, 'acceptanceId'>): boolean {
+  return item.acceptanceId !== null
+}
+
+/**
+ * canMergeViaAcceptance answers a DIFFERENT question than hasAcceptedOverride
+ * above (round 3, finding R1, adversarial review, corrected: a previous
+ * version of DecisionInboxView.tsx's own Merge-button gate used
+ * hasAcceptedOverride for this too, which is nothing but "does an
+ * acceptance row exist" -- true the instant a maintainer+ accepts a
+ * verdict, regardless of whether that acceptance can actually unblock a
+ * merge). This client never infers mergeability itself: acceptanceMergeable
+ * is the SERVER's own answer (decisioninbox.Item.AcceptanceMergeable,
+ * computed by re-running the real eligibility engine WITH the acceptance
+ * applied, aggregate.go), null whenever acceptanceId is null (the
+ * question does not apply) and otherwise true only when every mandatory,
+ * never-waived criterion (CI green, no open finding, no changes
+ * requested, blast radius known, every freshness check...) ALSO holds --
+ * an acceptance row existing says nothing about that on its own. Before
+ * this fix, a needs_review row with an open review finding, or one with
+ * changes requested (prChipData's own adjacent, mandatory-blocker chips),
+ * rendered an enabled Merge button purely because acceptanceId was set --
+ * a button RevalidateForMerge would unconditionally 409 on click.
+ */
+export function canMergeViaAcceptance(item: Pick<DecisionInboxItem, 'acceptanceId' | 'acceptanceMergeable'>): boolean {
+  return item.acceptanceId !== null && item.acceptanceMergeable === true
 }
 
 /**
@@ -229,7 +301,9 @@ export function prChipData(item: Pick<DecisionInboxItem, 'riskLabel' | 'findings
  *     discipline (that file's own compositionDecisionChip/
  *     compositionDecisionSummaryText doc comment).
  */
-export function releaseChipData(item: Pick<DecisionInboxItem, 'manifestFindingsCount' | 'manifestCoveragePartial' | 'aggregateReviewTriggered' | 'compositionReviewed' | 'compositionDecision'>): DecisionInboxChip[] {
+export function releaseChipData(
+  item: Pick<DecisionInboxItem, 'manifestFindingsCount' | 'manifestCoveragePartial' | 'aggregateReviewTriggered' | 'compositionReviewed' | 'compositionDecision' | 'acceptanceId'>,
+): DecisionInboxChip[] {
   const chips: DecisionInboxChip[] = []
 
   if (item.manifestFindingsCount !== null) {
@@ -258,6 +332,15 @@ export function releaseChipData(item: Pick<DecisionInboxItem, 'manifestFindingsC
       }
     }
   }
+
+  // Round-5 finding V4: a release cut carrying an active, applicable
+  // acceptance earns the SAME "accepted override" chip a PR-shaped row
+  // does (acceptedOverrideChipData's own doc comment, above) -- §15's
+  // manifest check is a separate gate an acceptance says nothing about,
+  // but whether one exists at all is a visibility question, not a
+  // mergeability one, and this row was previously indistinguishable from
+  // one that was never accepted at all.
+  chips.push(...acceptedOverrideChipData(item))
 
   return chips
 }

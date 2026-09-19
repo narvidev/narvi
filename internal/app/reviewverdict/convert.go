@@ -24,6 +24,18 @@ import (
 // layer boundary (internal/app/shadowledger/writer.go's identical
 // uuid.UUID(ledgerID.Bytes).String()).
 func attemptIDFromRow(id pgtype.UUID) string {
+	return pgUUIDToString(id)
+}
+
+// pgUUIDToString is attemptIDFromRow's own general-purpose sibling --
+// the IDENTICAL conversion, under a name that does not imply "this is
+// specifically a turn/attempt id". acceptance.go's own acceptanceFromRow
+// uses this directly for review_verdict_acceptances' own verdict_id/
+// accepted_by/revoked_by columns, none of which are an attempt id, to
+// avoid the misleading name a call to attemptIDFromRow would read as
+// there. id.Valid == false degrades to "", the SAME "absent column ->
+// zero value" precedent attemptIDFromRow itself documents.
+func pgUUIDToString(id pgtype.UUID) string {
 	if !id.Valid {
 		return ""
 	}
@@ -160,6 +172,12 @@ func contextFromRow(row sqlcgen.ReviewVerdict) reviewverdict.Context {
 // hand-built ad hoc at each call site.
 func recordFromRow(row sqlcgen.ReviewVerdict) reviewverdict.Record {
 	return reviewverdict.Record{
+		// row.ID is NOT NULL (migrations/000067's own PRIMARY KEY DEFAULT
+		// gen_random_uuid()) -- always Valid, so this never degrades to
+		// "" for a real row, unlike attemptIDFromRow's own identical
+		// conversion immediately above, which DOES need the Valid guard
+		// because turns.id is nullable on this table.
+		ID:           uuid.UUID(row.ID.Bytes).String(),
 		RepoFullName: row.RepoFullName,
 		PRNumber:     row.PrNumber,
 		HeadSHA:      row.HeadSha,

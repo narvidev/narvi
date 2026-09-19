@@ -10,6 +10,61 @@ import "regexp"
 import "time"
 import "unicode/utf8"
 
+// POST /api/decision-inbox/accept-verdict's own request body ('human acceptance of
+// a verdict the engine refuses', §21.1b) -- binds a new acceptance to
+// (repoFullName, prNumber)'s own review_verdicts row NAMED by verdictId below
+// (finding F3, adversarial review: an earlier version of this endpoint bound to
+// whichever verdict was latest AT REQUEST TIME, server-resolved, never named by
+// the caller -- so a maintainer could authorise a verdict that had already
+// replaced the one they actually read; §21.1b's own contract is 'binds to ONE
+// verdict', and only the client that read that ONE verdict can name it).
+type AcceptReviewVerdictRequest struct {
+	// The accepting maintainer+'s own required, free-text explanation (§21.1b:
+	// 'carries author, justification'). Untrusted, human-authored content.
+	Justification string `json:"justification" yaml:"justification" mapstructure:"justification"`
+
+	// PrNumber corresponds to the JSON schema field "prNumber".
+	PrNumber int `json:"prNumber" yaml:"prNumber" mapstructure:"prNumber"`
+
+	// RepoFullName corresponds to the JSON schema field "repoFullName".
+	RepoFullName string `json:"repoFullName" yaml:"repoFullName" mapstructure:"repoFullName"`
+
+	// The id of the review_verdicts row the caller actually read and is accepting
+	// (DecisionInboxItem.verdictId, or ReviewReadoutLatestVerdict's own id) -- the
+	// server refuses (409) if this no longer matches (repoFullName, prNumber)'s own
+	// CURRENT latest verdict, rather than silently binding to whatever is latest now:
+	// a mismatch means a new attempt posted since the caller last read this PR, and
+	// the caller is about to authorise code it never saw.
+	VerdictId string `json:"verdictId" yaml:"verdictId" mapstructure:"verdictId"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *AcceptReviewVerdictRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["justification"]; raw != nil && !ok {
+		return fmt.Errorf("field justification in AcceptReviewVerdictRequest: required")
+	}
+	if _, ok := raw["prNumber"]; raw != nil && !ok {
+		return fmt.Errorf("field prNumber in AcceptReviewVerdictRequest: required")
+	}
+	if _, ok := raw["repoFullName"]; raw != nil && !ok {
+		return fmt.Errorf("field repoFullName in AcceptReviewVerdictRequest: required")
+	}
+	if _, ok := raw["verdictId"]; raw != nil && !ok {
+		return fmt.Errorf("field verdictId in AcceptReviewVerdictRequest: required")
+	}
+	type Plain AcceptReviewVerdictRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = AcceptReviewVerdictRequest(plain)
+	return nil
+}
+
 // 200 response body for POST
 // /api/sessions/:id/review/findings/:identityHash/apply-suggestion (§12.2 item 2).
 // On a repository whose outgoing changes are currently suppressed (platform shadow
@@ -2563,6 +2618,58 @@ func (j *CreateWorkflowDefinitionRequest) UnmarshalJSON(value []byte) error {
 // -- flattening keeps every field here a plain, typed, nullable scalar, consistent
 // with every other kind-conditional field on this same object.
 type DecisionInboxItem struct {
+	// The id of the acceptance named by acceptanceJustification below, set under the
+	// exact same conditions -- the id a client passes to
+	// RevokeReviewVerdictAcceptanceRequest.id (finding F11, adversarial review:
+	// before this field existed, no read surface ever returned an acceptance's own
+	// id, so revocation was reachable only by a client that had kept the 201 response
+	// body from the original accept-verdict call).
+	AcceptanceId DecisionInboxItemAcceptanceId `json:"acceptanceId" yaml:"acceptanceId" mapstructure:"acceptanceId"`
+
+	// §21.1b's own 'human acceptance of a verdict the engine refuses': the accepting
+	// maintainer+'s own free-text justification, set iff an ACTIVE, APPLICABLE
+	// acceptance exists for this PR's own CURRENT verdict
+	// (internal/domain/reviewverdict.Acceptance.Applicable) -- null for a PR that was
+	// never accepted, whose acceptance was since revoked, or whose acceptance no
+	// longer binds to the current verdict (a new attempt, a moved base, a changed
+	// ancestor chain -- §21.1b's own three invalidating triggers). Display only: this
+	// never changes kind -- an accepted PR still renders needs_review, never
+	// ready_to_merge, because acceptance authorises a human's own Merge click rather
+	// than reclassifying the engine's judgment.
+	AcceptanceJustification DecisionInboxItemAcceptanceJustification `json:"acceptanceJustification" yaml:"acceptanceJustification" mapstructure:"acceptanceJustification"`
+
+	// A short, human-readable explanation of why acceptanceMergeable is false -- null
+	// whenever acceptanceMergeable is null or true. Never itself an instruction;
+	// display only, mirroring failureReason/lastError's own identical 'echo a short
+	// reason string, never markup' discipline.
+	AcceptanceMergeBlockedReason DecisionInboxItemAcceptanceMergeBlockedReason `json:"acceptanceMergeBlockedReason,omitempty,omitzero" yaml:"acceptanceMergeBlockedReason,omitempty" mapstructure:"acceptanceMergeBlockedReason,omitempty"`
+
+	// Round 3, finding R1 (adversarial review): whether THIS row's own acceptance
+	// actually unblocks a Merge click right now -- null whenever acceptanceId is null
+	// (the question does not apply); set (true or false) iff acceptanceId is
+	// non-null. Computed by re-running the SAME real eligibility engine that
+	// classifies Kind (internal/app/decisioninbox.computeRealEligibility), a second
+	// time, WITH the acceptance applied -- never derived from acceptanceId's own
+	// presence alone, which is exactly the defect this field exists to close: a
+	// maintainer+'s own acceptance row can exist and still leave this PR blocked on a
+	// mandatory, never-waived criterion (CI green, an open review finding, changes
+	// requested, blast radius known, a moved base...), and this field is what tells a
+	// client that BEFORE it renders a Merge button that would 409. Still
+	// best-effort/non-authoritative, exactly like Kind itself (§16.2: 'the rendered
+	// queue is never trusted as authority') -- RevalidateForMerge is re-run,
+	// unconditionally, at click time regardless of what this says.
+	AcceptanceMergeable DecisionInboxItemAcceptanceMergeable `json:"acceptanceMergeable,omitempty,omitzero" yaml:"acceptanceMergeable,omitempty" mapstructure:"acceptanceMergeable,omitempty"`
+
+	// When the acceptance named by acceptanceJustification was granted -- null under
+	// the exact same conditions acceptanceJustification is null.
+	AcceptedAt DecisionInboxItemAcceptedAt `json:"acceptedAt" yaml:"acceptedAt" mapstructure:"acceptedAt"`
+
+	// The accepting maintainer+'s own user id -- null under the exact same conditions
+	// acceptanceJustification is null (finding F6, adversarial review: this row's own
+	// acceptanceJustification/acceptedAt already told a maintainer THAT a verdict was
+	// authorised and WHEN; this field is the missing 'by whom').
+	AcceptedBy DecisionInboxItemAcceptedBy `json:"acceptedBy" yaml:"acceptedBy" mapstructure:"acceptedBy"`
+
 	// The response's own generation instant minus enteredQueueAt, in seconds.
 	AgeSeconds int `json:"ageSeconds" yaml:"ageSeconds" mapstructure:"ageSeconds"`
 
@@ -2751,7 +2858,67 @@ type DecisionInboxItem struct {
 
 	// Title corresponds to the JSON schema field "title".
 	Title string `json:"title" yaml:"title" mapstructure:"title"`
+
+	// review_verdicts.id for this PR's own CURRENT latest verdict, whenever one has
+	// been posted -- null for a PR with no review verdict of record. This is the id a
+	// client names back on AcceptReviewVerdictRequest.verdictId (finding F3,
+	// adversarial review): accept-verdict binds to the ONE verdict a maintainer
+	// actually read here, never to whichever verdict happens to be latest when the
+	// request arrives, and refuses (409) on a mismatch.
+	VerdictId DecisionInboxItemVerdictId `json:"verdictId" yaml:"verdictId" mapstructure:"verdictId"`
 }
+
+// The id of the acceptance named by acceptanceJustification below, set under the
+// exact same conditions -- the id a client passes to
+// RevokeReviewVerdictAcceptanceRequest.id (finding F11, adversarial review: before
+// this field existed, no read surface ever returned an acceptance's own id, so
+// revocation was reachable only by a client that had kept the 201 response body
+// from the original accept-verdict call).
+type DecisionInboxItemAcceptanceId *string
+
+// §21.1b's own 'human acceptance of a verdict the engine refuses': the accepting
+// maintainer+'s own free-text justification, set iff an ACTIVE, APPLICABLE
+// acceptance exists for this PR's own CURRENT verdict
+// (internal/domain/reviewverdict.Acceptance.Applicable) -- null for a PR that was
+// never accepted, whose acceptance was since revoked, or whose acceptance no
+// longer binds to the current verdict (a new attempt, a moved base, a changed
+// ancestor chain -- §21.1b's own three invalidating triggers). Display only: this
+// never changes kind -- an accepted PR still renders needs_review, never
+// ready_to_merge, because acceptance authorises a human's own Merge click rather
+// than reclassifying the engine's judgment.
+type DecisionInboxItemAcceptanceJustification *string
+
+// A short, human-readable explanation of why acceptanceMergeable is false -- null
+// whenever acceptanceMergeable is null or true. Never itself an instruction;
+// display only, mirroring failureReason/lastError's own identical 'echo a short
+// reason string, never markup' discipline.
+type DecisionInboxItemAcceptanceMergeBlockedReason *string
+
+// Round 3, finding R1 (adversarial review): whether THIS row's own acceptance
+// actually unblocks a Merge click right now -- null whenever acceptanceId is null
+// (the question does not apply); set (true or false) iff acceptanceId is non-null.
+// Computed by re-running the SAME real eligibility engine that classifies Kind
+// (internal/app/decisioninbox.computeRealEligibility), a second time, WITH the
+// acceptance applied -- never derived from acceptanceId's own presence alone,
+// which is exactly the defect this field exists to close: a maintainer+'s own
+// acceptance row can exist and still leave this PR blocked on a mandatory,
+// never-waived criterion (CI green, an open review finding, changes requested,
+// blast radius known, a moved base...), and this field is what tells a client that
+// BEFORE it renders a Merge button that would 409. Still
+// best-effort/non-authoritative, exactly like Kind itself (§16.2: 'the rendered
+// queue is never trusted as authority') -- RevalidateForMerge is re-run,
+// unconditionally, at click time regardless of what this says.
+type DecisionInboxItemAcceptanceMergeable *bool
+
+// When the acceptance named by acceptanceJustification was granted -- null under
+// the exact same conditions acceptanceJustification is null.
+type DecisionInboxItemAcceptedAt = *time.Time
+
+// The accepting maintainer+'s own user id -- null under the exact same conditions
+// acceptanceJustification is null (finding F6, adversarial review: this row's own
+// acceptanceJustification/acceptedAt already told a maintainer THAT a verdict was
+// authorised and WHEN; this field is the missing 'by whom').
+type DecisionInboxItemAcceptedBy *string
 
 // §15.3's own already-computed trigger decision (whether the constituent PRs' own
 // shape met the criteria for an aggregate diff review, OR the constituent-PR
@@ -3004,11 +3171,31 @@ type DecisionInboxItemRiskLabel *string
 // error.
 type DecisionInboxItemSessionId *string
 
+// review_verdicts.id for this PR's own CURRENT latest verdict, whenever one has
+// been posted -- null for a PR with no review verdict of record. This is the id a
+// client names back on AcceptReviewVerdictRequest.verdictId (finding F3,
+// adversarial review): accept-verdict binds to the ONE verdict a maintainer
+// actually read here, never to whichever verdict happens to be latest when the
+// request arrives, and refuses (409) on a mismatch.
+type DecisionInboxItemVerdictId *string
+
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *DecisionInboxItem) UnmarshalJSON(value []byte) error {
 	var raw map[string]interface{}
 	if err := json.Unmarshal(value, &raw); err != nil {
 		return err
+	}
+	if _, ok := raw["acceptanceId"]; raw != nil && !ok {
+		return fmt.Errorf("field acceptanceId in DecisionInboxItem: required")
+	}
+	if _, ok := raw["acceptanceJustification"]; raw != nil && !ok {
+		return fmt.Errorf("field acceptanceJustification in DecisionInboxItem: required")
+	}
+	if _, ok := raw["acceptedAt"]; raw != nil && !ok {
+		return fmt.Errorf("field acceptedAt in DecisionInboxItem: required")
+	}
+	if _, ok := raw["acceptedBy"]; raw != nil && !ok {
+		return fmt.Errorf("field acceptedBy in DecisionInboxItem: required")
 	}
 	if _, ok := raw["ageSeconds"]; raw != nil && !ok {
 		return fmt.Errorf("field ageSeconds in DecisionInboxItem: required")
@@ -3099,6 +3286,9 @@ func (j *DecisionInboxItem) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["title"]; raw != nil && !ok {
 		return fmt.Errorf("field title in DecisionInboxItem: required")
+	}
+	if _, ok := raw["verdictId"]; raw != nil && !ok {
+		return fmt.Errorf("field verdictId in DecisionInboxItem: required")
 	}
 	type Plain DecisionInboxItem
 	var plain Plain
@@ -9695,6 +9885,138 @@ func (j *ReviewReadout) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// One review_verdict_acceptances row's own REST wire shape ('human acceptance of a
+// verdict the engine refuses', §21.1b,
+// migrations/000135_review_verdict_acceptances.up.sql) -- returned by
+// accept-verdict and revoke-verdict-acceptance so a caller can confirm the
+// resulting state.
+type ReviewVerdictAcceptance struct {
+	// AcceptedAt corresponds to the JSON schema field "acceptedAt".
+	AcceptedAt time.Time `json:"acceptedAt" yaml:"acceptedAt" mapstructure:"acceptedAt"`
+
+	// The accepting maintainer+'s own user id.
+	AcceptedBy string `json:"acceptedBy" yaml:"acceptedBy" mapstructure:"acceptedBy"`
+
+	// The accepted verdict's own turns.id, carried verbatim for display/audit -- null
+	// for a pre-§21.1-amendment verdict.
+	AttemptId ReviewVerdictAcceptanceAttemptId `json:"attemptId" yaml:"attemptId" mapstructure:"attemptId"`
+
+	// HeadSha corresponds to the JSON schema field "headSha".
+	HeadSha string `json:"headSha" yaml:"headSha" mapstructure:"headSha"`
+
+	// Id corresponds to the JSON schema field "id".
+	Id string `json:"id" yaml:"id" mapstructure:"id"`
+
+	// Justification corresponds to the JSON schema field "justification".
+	Justification string `json:"justification" yaml:"justification" mapstructure:"justification"`
+
+	// PrNumber corresponds to the JSON schema field "prNumber".
+	PrNumber int `json:"prNumber" yaml:"prNumber" mapstructure:"prNumber"`
+
+	// A best-effort, no-I/O classification of which waivable eligibility criterion
+	// this acceptance most likely addresses (e.g. 'the verdict's shippable
+	// classification is not auto') -- NOT itself computed by calling
+	// autoapproval.ComputeEligible (finding F8, adversarial review: this description,
+	// and three others, previously claimed it was); display/audit only, never
+	// re-checked. The authoritative eligibility decision is always re-derived live,
+	// at merge time, by autoapproval.ComputeEligibleWithAcceptance -- a wrong guess
+	// here changes no outcome, only what a human reading the audit trail sees.
+	Reason string `json:"reason" yaml:"reason" mapstructure:"reason"`
+
+	// RepoFullName corresponds to the JSON schema field "repoFullName".
+	RepoFullName string `json:"repoFullName" yaml:"repoFullName" mapstructure:"repoFullName"`
+
+	// 'explicit' (a maintainer+'s own revoke-verdict-acceptance click) or
+	// 'superseded' (a fresh accept-verdict for the SAME pull request revoked this row
+	// automatically) -- null under the exact same condition revokedAt is null
+	// (finding F4, adversarial review: before this field existed, both cases wrote
+	// the IDENTICAL revokedAt/revokedBy shape, so a superseded acceptance was
+	// indistinguishable, on this row alone, from an explicit revocation the accepting
+	// user never performed).
+	RevocationReason ReviewVerdictAcceptanceRevocationReason `json:"revocationReason" yaml:"revocationReason" mapstructure:"revocationReason"`
+
+	// Null means this acceptance is still active. Non-null means a maintainer+ has
+	// explicitly revoked it -- kept, never deleted, for the audit trail.
+	RevokedAt *time.Time `json:"revokedAt" yaml:"revokedAt" mapstructure:"revokedAt"`
+
+	// Null under the exact same condition revokedAt is null.
+	RevokedBy ReviewVerdictAcceptanceRevokedBy `json:"revokedBy" yaml:"revokedBy" mapstructure:"revokedBy"`
+
+	// review_verdicts.id -- the ONE verdict this acceptance binds to
+	// (internal/domain/reviewverdict.Acceptance.Applicable's own doc comment).
+	VerdictId string `json:"verdictId" yaml:"verdictId" mapstructure:"verdictId"`
+}
+
+// The accepted verdict's own turns.id, carried verbatim for display/audit -- null
+// for a pre-§21.1-amendment verdict.
+type ReviewVerdictAcceptanceAttemptId *string
+
+// 'explicit' (a maintainer+'s own revoke-verdict-acceptance click) or 'superseded'
+// (a fresh accept-verdict for the SAME pull request revoked this row
+// automatically) -- null under the exact same condition revokedAt is null (finding
+// F4, adversarial review: before this field existed, both cases wrote the
+// IDENTICAL revokedAt/revokedBy shape, so a superseded acceptance was
+// indistinguishable, on this row alone, from an explicit revocation the accepting
+// user never performed).
+type ReviewVerdictAcceptanceRevocationReason *string
+
+// Null under the exact same condition revokedAt is null.
+type ReviewVerdictAcceptanceRevokedBy *string
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *ReviewVerdictAcceptance) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["acceptedAt"]; raw != nil && !ok {
+		return fmt.Errorf("field acceptedAt in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["acceptedBy"]; raw != nil && !ok {
+		return fmt.Errorf("field acceptedBy in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["attemptId"]; raw != nil && !ok {
+		return fmt.Errorf("field attemptId in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["headSha"]; raw != nil && !ok {
+		return fmt.Errorf("field headSha in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["id"]; raw != nil && !ok {
+		return fmt.Errorf("field id in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["justification"]; raw != nil && !ok {
+		return fmt.Errorf("field justification in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["prNumber"]; raw != nil && !ok {
+		return fmt.Errorf("field prNumber in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["reason"]; raw != nil && !ok {
+		return fmt.Errorf("field reason in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["repoFullName"]; raw != nil && !ok {
+		return fmt.Errorf("field repoFullName in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["revocationReason"]; raw != nil && !ok {
+		return fmt.Errorf("field revocationReason in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["revokedAt"]; raw != nil && !ok {
+		return fmt.Errorf("field revokedAt in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["revokedBy"]; raw != nil && !ok {
+		return fmt.Errorf("field revokedBy in ReviewVerdictAcceptance: required")
+	}
+	if _, ok := raw["verdictId"]; raw != nil && !ok {
+		return fmt.Errorf("field verdictId in ReviewVerdictAcceptance: required")
+	}
+	type Plain ReviewVerdictAcceptance
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = ReviewVerdictAcceptance(plain)
+	return nil
+}
+
 // One prior verdict on this PR, summarized for the merge readout's own 'History'
 // rail (§26.1 item 5) -- never the full ReviewReadoutVerdict shape, which only the
 // latest verdict needs in full.
@@ -9800,6 +10122,40 @@ func (j *ReviewVerdictHistoryEntry) UnmarshalJSON(value []byte) error {
 		return err
 	}
 	*j = ReviewVerdictHistoryEntry(plain)
+	return nil
+}
+
+// POST /api/decision-inbox/revoke-verdict-acceptance's own request body -- the
+// SAME maintainer+ role as accept-verdict (§21.1b, never a stricter one), scoped
+// to repoFullName exactly like RetireFalsePositivePattern's own identical
+// audit-fix precedent.
+type RevokeReviewVerdictAcceptanceRequest struct {
+	// The acceptance's own id (ReviewVerdictAcceptance.id) -- never the verdict id or
+	// the PR number.
+	Id string `json:"id" yaml:"id" mapstructure:"id"`
+
+	// RepoFullName corresponds to the JSON schema field "repoFullName".
+	RepoFullName string `json:"repoFullName" yaml:"repoFullName" mapstructure:"repoFullName"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *RevokeReviewVerdictAcceptanceRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["id"]; raw != nil && !ok {
+		return fmt.Errorf("field id in RevokeReviewVerdictAcceptanceRequest: required")
+	}
+	if _, ok := raw["repoFullName"]; raw != nil && !ok {
+		return fmt.Errorf("field repoFullName in RevokeReviewVerdictAcceptanceRequest: required")
+	}
+	type Plain RevokeReviewVerdictAcceptanceRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = RevokeReviewVerdictAcceptanceRequest(plain)
 	return nil
 }
 
@@ -12577,8 +12933,6 @@ func (j *WorkflowStepRunOutcomeStatus) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
-
 // The posted outcome's advisory free-text summary -- never re-parsed as structured
 // data once posted (§25.6), same discipline as PostReviewVerdictRequest.summary.
 type WorkflowStepRunOutcomeSummary *string
@@ -12597,26 +12951,6 @@ var enumValues_WorkflowStepRunStatus = []interface{}{
 	"completed",
 	"failed",
 	"cancelled",
-}
-
-// UnmarshalJSON implements json.Unmarshaler.
-func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
-	var v string
-	if err := json.Unmarshal(value, &v); err != nil {
-		return err
-	}
-	var ok bool
-	for _, expected := range enumValues_WorkflowStepRunStatus {
-		if reflect.DeepEqual(v, expected) {
-			ok = true
-			break
-		}
-	}
-	if !ok {
-		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_WorkflowStepRunStatus, v)
-	}
-	*j = WorkflowStepRunStatus(v)
-	return nil
 }
 
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
@@ -12678,5 +13012,27 @@ func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
 		return err
 	}
 	*j = WorkflowStepRun(plain)
+	return nil
+}
+
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_WorkflowStepRunStatus {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_WorkflowStepRunStatus, v)
+	}
+	*j = WorkflowStepRunStatus(v)
 	return nil
 }
