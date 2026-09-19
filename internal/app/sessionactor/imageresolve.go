@@ -200,12 +200,87 @@
 // "zero network calls on the steady-state hot path" property for the
 // common case of a user who DOES have access.
 
+// # Persisted decision provenance
+//
+// Every return path below -- including the "never block a spawn" ones
+// this file's own comment above already describes -- reports exactly one
+// internal/domain/imagedecision.Reason value to
+// persistImageDecisionBestEffort (below): a real warm-image selection
+// (imagedecision.ReasonSelected) or the specific closed-vocabulary reason
+// it fell back to defaultBaseImage instead. This closes the gap a log
+// line alone cannot: once the pod that emitted it recycles, a log is
+// gone, and there was previously no way to tell a DELIBERATE cold boot
+// (no cached image yet) apart from a BROKEN warm path (repo access
+// denied, a lookup failure, a data-integrity anomaly) after the fact, or
+// to count either across sessions.
+//
+// The persisted record reuses two surfaces that already exist, rather
+// than adding one: sandboxes.image_decision_reason/
+// image_decision_fingerprint (migrations/000139_sandboxes_image_decision.
+// up.sql, mirroring agent_version/image_digest's own identical "per-gen
+// fact on the sandboxes row" precedent, migrations/000120_sandboxes_boot_
+// fingerprint.up.sql) for the CURRENT gen's own latest decision, and a new
+// "image_decision" event type appended to the session's own existing
+// append-only event log (a.appendEvent, exactly like timerfired.go's own
+// "warning"/reason:"inactivity_extended" precedent) for the full history
+// across every spawn/restore. The events copy needs no REST/DTO/route
+// change of its own to become readable: §6.2's client-WS subscribe/
+// fetch_history replay and §6.3's existing GET .../events REST route
+// (httpapi.ListEvents) already serve every row in that table,
+// unconditionally, to any authorized reader -- this is precisely what
+// "reusing the existing collection and event log rather than adding a
+// surface" means in practice.
+//
+// # Why this is mechanically hard to bypass, not merely a convention
+//
+// decideImage and repoAccessAllowedForSpawn (below) both return their
+// imagedecision.Reason as a plain, UNNAMED positional return value --
+// deliberately, not a named one. Go refuses to compile a bare `return`
+// inside a function with unnamed return types (every exit must spell out
+// every value explicitly), so a future early return added to either
+// function cannot compile without supplying SOME Reason at that exact
+// call site -- the compiler is the enforcement, not a review checklist.
+// A persisted value outside this package's closed vocabulary is
+// additionally rejected by Postgres itself
+// (sandboxes.image_decision_reason is a real ENUM column, not a
+// CHECK-constrained TEXT one) -- see imagedecision's own package doc
+// comment for the full two-part argument.
+//
+// # What this does NOT answer: which dependency manifest changed
+//
+// imagebuild.Fingerprint's own three inputs (base, each repo's
+// (name, normalized URL), runtimeVersion) are repo IDENTITY, never repo
+// CONTENT -- neither it nor the image_builds row it keys (which persists
+// exactly those same inputs plus built_repo_shas/built_at) has ever had
+// any dependency-manifest awareness. This spawn-path call site resolves
+// no per-repo SHA at all any more (see this file's own top comment), so
+// it cannot identify the CURRENT commit, let alone diff its dependency
+// manifests against whatever the image was built from. The only place in
+// this codebase that ever computes a manifest-level answer is
+// internal/sandboxagent/boot's own evaluateDependencySkip/
+// ComputeDependencyManifestDigest -- boot-TIME, inside the ephemeral
+// sandbox, comparing the checked-out tree against the image's baked
+// dependency_manifest_digests (§19.6) -- and even that is REPO
+// granularity only (one folded digest per repo across every recognized
+// lockfile), never per-file. That verdict is not sent over the sandbox-ws
+// wire today (boot.OnHookRerunTiming's own callback signature carries no
+// such field) and so never reaches Postgres from anywhere. Extending that
+// wire contract is a real, separate, larger change (contracts/sandbox-ws,
+// sandbox-agent's own hook-rerun-timing emission, and this package's own
+// wire-event handling) with its own blast radius -- not folded in here.
+// What this Step's own decision record CAN honestly carry, on
+// ReasonSelected only, is the warm-hit row's own built_repo_shas (repo
+// COMMIT identity, persisted already, zero extra I/O) -- see
+// persistImageDecisionBestEffort's own doc comment for why that is
+// explicitly NOT the same claim as "which manifest changed".
+
 package sessionactor
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -214,6 +289,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/domain/imagebuild"
+	"github.com/narvidev/narvi/internal/domain/imagedecision"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 )
 
@@ -236,9 +312,27 @@ import (
 // build -- does not change just because a matching built image also
 // happens to exist for the same fingerprint).
 func (a *Actor) resolveAndSetImage(ctx context.Context, plan *spawnPlan) {
+	reason, fingerprint, builtRepoShas := a.decideImage(ctx, plan)
+	a.persistImageDecisionBestEffort(ctx, reason, fingerprint, builtRepoShas)
+}
+
+// decideImage is resolveAndSetImage's own decision logic, split out so its
+// outcome -- not just its side effect on plan.spec.Image -- has somewhere
+// to go. plan.spec.Image is mutated in place to a real image_ref ONLY when
+// this exact spawn's own fingerprint already has a 'ready' image_builds
+// row; every other outcome (including any error) leaves it untouched,
+// exactly as resolveAndSetImage always has.
+//
+// Returns the imagedecision.Reason this decision landed on, the
+// fingerprint it was computed against ("" only for ReasonNoRepos, the one
+// outcome with nothing to fingerprint at all), and -- on ReasonSelected
+// only -- the warm-hit row's own raw built_repo_shas JSON (nil otherwise).
+// The three unnamed return types are load-bearing: see this file's own top
+// "# Why this is mechanically hard to bypass" comment.
+func (a *Actor) decideImage(ctx context.Context, plan *spawnPlan) (imagedecision.Reason, string, []byte) {
 	repos := plan.spec.SessionConfig.Repos
 	if len(repos) == 0 {
-		return // nothing to fingerprint; stays on defaultBaseImage
+		return imagedecision.ReasonNoRepos, "", nil // nothing to fingerprint; stays on defaultBaseImage
 	}
 
 	repoURLs := make(map[string]string, len(repos))
@@ -246,23 +340,30 @@ func (a *Actor) resolveAndSetImage(ctx context.Context, plan *spawnPlan) {
 		repoURLs[r.Name] = imagebuild.NormalizeRepoURL(r.Url)
 	}
 
+	// Computed BEFORE the repo-access gate below -- a harmless reordering
+	// relative to this function's pre-persistence shape: Fingerprint is a
+	// pure hash with no side effects and no I/O, so computing it slightly
+	// earlier changes nothing observable except letting a repo-access
+	// DENIAL's own persisted decision still carry a fingerprint an
+	// operator can cross-reference against image_builds, rather than
+	// leaving it blank for every denial.
+	fingerprint := imagebuild.Fingerprint(defaultBaseImage, repoURLs, a.openCodeRuntimeVersion)
+
 	// Audit fix ("warm-boot image access control", HIGH): gate BEFORE
 	// either branch below can run -- see this file's own top "# Repo-access
 	// gate" comment for the full design. Neither the miss/upsert branch
 	// nor the ready/warm-hit branch is reachable without a positive
 	// verdict here.
-	if !a.repoAccessAllowedForSpawn(ctx, plan, repoURLs) {
-		return
+	if allowed, reason := a.repoAccessAllowedForSpawn(ctx, plan, repoURLs); !allowed {
+		return reason, fingerprint, nil
 	}
-
-	fingerprint := imagebuild.Fingerprint(defaultBaseImage, repoURLs, a.openCodeRuntimeVersion)
 
 	row, err := a.stores.imageBuild.Get(ctx, fingerprint)
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			a.logger.Error("sessionactor: resolve image: look up image_builds failed; falling back to base image",
 				"fingerprint", fingerprint, "error", err)
-			return
+			return imagedecision.ReasonImageBuildLookupFailed, fingerprint, nil
 		}
 		// No row yet for this fingerprint: best-effort create a pending
 		// tracking row carrying the URL-keyed fingerprint inputs, so
@@ -273,16 +374,24 @@ func (a *Actor) resolveAndSetImage(ctx context.Context, plan *spawnPlan) {
 		// claim-time resolution, §19.2, is what later resolves and
 		// builds this row asynchronously). This spawn still uses the base
 		// image regardless of whether the upsert itself succeeds.
-		a.upsertPendingImageBuildBestEffort(ctx, fingerprint, repoURLs)
-		return
+		return a.upsertPendingImageBuildBestEffort(ctx, fingerprint, repoURLs), fingerprint, nil
 	}
 
-	if row.Status == sqlcgen.ImageBuildStatusReady && row.ImageRef != nil && *row.ImageRef != "" {
+	if row.Status == sqlcgen.ImageBuildStatusReady {
+		if row.ImageRef == nil || *row.ImageRef == "" {
+			// Data-integrity anomaly: a 'ready' row should always carry a
+			// real image_ref. Kept distinct from ReasonImageBuildNotReady
+			// below so this can never silently masquerade as an ordinary
+			// still-building state.
+			a.logger.Error("sessionactor: resolve image: image_builds row is ready but has no image_ref; falling back to base image",
+				"fingerprint", fingerprint)
+			return imagedecision.ReasonImageBuildReadyRowMissingRef, fingerprint, nil
+		}
 		plan.spec.Image = *row.ImageRef
 		if !plan.restore {
 			plan.spec.SessionConfig.BootMode = sessionconfig.SessionConfigBootModeRepoImage
 		}
-		return
+		return imagedecision.ReasonSelected, fingerprint, row.BuiltRepoShas
 	}
 
 	// status is pending/building/failed-but-not-yet-due: the background
@@ -294,6 +403,7 @@ func (a *Actor) resolveAndSetImage(ctx context.Context, plan *spawnPlan) {
 	// all. A row already existing means the earlier "no row" branch's own
 	// upsert (ON CONFLICT DO NOTHING) would be a pure no-op anyway, so it
 	// is not attempted again here.
+	return imagedecision.ReasonImageBuildNotReady, fingerprint, nil
 }
 
 // upsertPendingImageBuildBestEffort best-effort inserts a fresh 'pending'
@@ -302,14 +412,17 @@ func (a *Actor) resolveAndSetImage(ctx context.Context, plan *spawnPlan) {
 // (migrations/000039_image_builds_shared_fingerprint.up.sql's own doc
 // comment explains why those raw inputs are persisted, not just the
 // fingerprint hash). Any failure (marshal, DB error/timeout) is logged
-// only -- this is explicitly best-effort, never allowed to affect the
-// calling spawn.
-func (a *Actor) upsertPendingImageBuildBestEffort(ctx context.Context, fingerprint string, repoURLs map[string]string) {
+// and reported back via its own distinct Reason -- this remains explicitly
+// best-effort, never allowed to affect the calling spawn, but the CALLER
+// now needs to know which of the three outcomes (marshal failed, upsert
+// failed, or a real/no-op pending row) actually happened, to persist the
+// right one.
+func (a *Actor) upsertPendingImageBuildBestEffort(ctx context.Context, fingerprint string, repoURLs map[string]string) imagedecision.Reason {
 	raw, err := json.Marshal(repoURLs)
 	if err != nil {
 		a.logger.Error("sessionactor: resolve image: marshal repo urls for image_builds upsert failed",
 			"fingerprint", fingerprint, "error", err)
-		return
+		return imagedecision.ReasonImageBuildTrackingMarshalFailed
 	}
 
 	if err := a.stores.imageBuild.UpsertPending(ctx, sqlcgen.UpsertPendingImageBuildParams{
@@ -320,6 +433,75 @@ func (a *Actor) upsertPendingImageBuildBestEffort(ctx context.Context, fingerpri
 	}); err != nil {
 		a.logger.Error("sessionactor: resolve image: upsert pending image_builds row failed",
 			"fingerprint", fingerprint, "error", err)
+		return imagedecision.ReasonImageBuildTrackingUpsertFailed
+	}
+	return imagedecision.ReasonImageBuildPending
+}
+
+// persistImageDecisionBestEffort is decideImage's own caller-side
+// persistence step (see this file's own top "# Persisted decision
+// provenance" comment for the full design): writes reason/fingerprint
+// onto this session's CURRENT sandboxes row (the "collection" half --
+// cheap to read without scanning the event log, reset to NULL on every
+// respawn, queries/sandboxes.sql's own UpsertSandboxForSpawn) and appends
+// an "image_decision" event carrying the identical reason plus
+// fingerprint/built_repo_shas (the "event log" half -- full history
+// across every spawn/restore, already reachable via §6.2/§6.3's existing
+// replay/REST surface, no new route needed).
+//
+// built_repo_shas, when present, is the SAME image_builds.built_repo_shas
+// a warm hit just selected -- repo-COMMIT granularity, carried here so
+// consecutive decisions for this session can be diffed to see which
+// repo's built commit moved between one warm boot and the next. This is
+// NOT "which dependency manifest changed" -- see this file's own top
+// comment for why that question has no answer available at this call
+// site, and why extending the wire contract to carry the boot-time
+// answer is deliberately not folded into this fix.
+//
+// Both writes happen inside ONE a.transact call: "transact is the ONLY
+// way this package writes session/turn/sandbox state" (actor.go's own doc
+// comment) applies to sandboxes exactly as much as to sessions/turns, and
+// bundling both writes atomically means an invalid Reason can never reach
+// the events log either -- sandboxes.image_decision_reason's own Postgres
+// ENUM type rejects it outright, the whole transact rolls back, and
+// NOTHING is persisted, rather than the events copy alone silently
+// surviving with a value the enum-typed column would have refused.
+//
+// Best-effort, exactly like every other write in this file (§10 Phase 2,
+// "never block a spawn"): a transact failure here -- including
+// ErrStaleEpoch, a real possibility since this call runs strictly after
+// planDispatch's own transact has already committed and returned -- is
+// logged and never propagated; the spawn this decision was computed for
+// is already underway by the time this runs and must never be delayed or
+// failed by a provenance write.
+func (a *Actor) persistImageDecisionBestEffort(ctx context.Context, reason imagedecision.Reason, fingerprint string, builtRepoShas []byte) {
+	payload := map[string]any{"reason": string(reason)}
+	if fingerprint != "" {
+		payload["fingerprint"] = fingerprint
+	}
+	if len(builtRepoShas) > 0 {
+		payload["built_repo_shas"] = json.RawMessage(builtRepoShas)
+	}
+
+	reasonValue := sqlcgen.ImageDecisionReason(reason)
+	var fingerprintParam *string
+	if fingerprint != "" {
+		fingerprintParam = &fingerprint
+	}
+
+	err := a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if _, err := a.stores.sandbox.WithTx(tx).UpdateImageDecision(ctx, sqlcgen.UpdateSandboxImageDecisionParams{
+			SessionID:                a.sessionID,
+			ImageDecisionReason:      &reasonValue,
+			ImageDecisionFingerprint: fingerprintParam,
+		}); err != nil {
+			return fmt.Errorf("sessionactor: update sandbox image decision: %w", err)
+		}
+		return a.appendEvent(ctx, tx, "image_decision", payload)
+	})
+	if err != nil {
+		a.logger.Warn("sessionactor: resolve image: persist image decision failed (best-effort, spawn unaffected)",
+			"reason", string(reason), "fingerprint", fingerprint, "error", err)
 	}
 }
 
@@ -348,13 +530,20 @@ func (a *Actor) upsertPendingImageBuildBestEffort(ctx context.Context, fingerpri
 // failure -- returns false, per that same top comment's fail-closed
 // reasoning.
 //
+// The second return value is the exact imagedecision.Reason this verdict
+// landed on -- meaningful only when the first is false; callers must
+// ignore it (imagedecision.ReasonNone, never persisted) when allowed is
+// true. See this file's own top "# Why this is mechanically hard to
+// bypass" comment for why both are unnamed positional returns rather than
+// a struct or named returns.
+//
 // repoURLs is resolveAndSetImage's own already-normalized map (repo name
 // -> imagebuild.NormalizeRepoURL(r.Url)) -- reused here rather than
 // re-deriving it, and also what this function's own cache keys off of, so
 // a differently-spelled-but-equivalent URL shares one cache entry (and one
 // CheckRepoAccess call) with whatever spelling was checked first, exactly
 // like Fingerprint already treats them as the same repo.
-func (a *Actor) repoAccessAllowedForSpawn(ctx context.Context, plan *spawnPlan, repoURLs map[string]string) bool {
+func (a *Actor) repoAccessAllowedForSpawn(ctx context.Context, plan *spawnPlan, repoURLs map[string]string) (bool, imagedecision.Reason) {
 	// createdBy.Valid is checked HERE, before ever calling CheckCreatorGuard
 	// -- CheckCreatorGuard's own Allowed:true for an invalid createdBy means
 	// "nothing for THIS guard to check", not "access verified" (its own doc
@@ -364,7 +553,7 @@ func (a *Actor) repoAccessAllowedForSpawn(ctx context.Context, plan *spawnPlan, 
 	// regression, not a compensating control to lean on.
 	if !plan.createdBy.Valid {
 		a.logger.Warn("sessionactor: resolve image: repo-access gate: session has no created_by user; automation-created sessions never warm-boot (denying, not a bug -- see imageresolve.go's own top comment)")
-		return false
+		return false, imagedecision.ReasonRepoAccessNoCreator
 	}
 
 	// CheckCreatorGuard ALWAYS runs here, unconditionally, on EVERY spawn
@@ -383,14 +572,27 @@ func (a *Actor) repoAccessAllowedForSpawn(ctx context.Context, plan *spawnPlan, 
 		case v.Err != nil:
 			a.logger.Error("sessionactor: resolve image: repo-access gate: get session creator failed; denying (fail-closed)",
 				"user_id", plan.createdBy.String(), "error", v.Err)
+			return false, imagedecision.ReasonRepoAccessCreatorLookupFailed
 		case v.Disabled:
 			a.logger.Warn("sessionactor: resolve image: repo-access gate: session creator is now disabled; denying warm-boot (§13.3 viewer guard parity)",
 				"user_id", plan.createdBy.String())
+			return false, imagedecision.ReasonRepoAccessCreatorDisabled
 		case v.Viewer:
 			a.logger.Warn("sessionactor: resolve image: repo-access gate: session creator is now a viewer; denying warm-boot (§13.3 viewer guard parity)",
 				"user_id", plan.createdBy.String())
+			return false, imagedecision.ReasonRepoAccessCreatorViewer
 		}
-		return false
+		// Defensive, should be unreachable: CreatorGuardVerdict's own doc
+		// comment states exactly one of Allowed/Err/Disabled/Viewer is
+		// meaningful per verdict -- if none of the three cases above
+		// matched, something upstream returned a shape this switch does
+		// not recognize. Denied fail-closed regardless (never a silent
+		// fall-through as if this whole check had passed) -- mirrors
+		// EvaluateHook's own "unrecognized value is a programming error,
+		// not a data error" convention.
+		a.logger.Error("sessionactor: resolve image: repo-access gate: creator guard verdict has none of Err/Disabled/Viewer set; denying defensively (should be unreachable)",
+			"user_id", plan.createdBy.String())
+		return false, imagedecision.ReasonRepoAccessCreatorGuardUnknown
 	}
 
 	// Audit-remediation fix (correctness-availability, finding #7): unlike
@@ -430,14 +632,14 @@ func (a *Actor) repoAccessAllowedForSpawn(ctx context.Context, plan *spawnPlan, 
 		if err := reposource.CheckRepoHost(repoURL, ports.SupportedSourceControlHosts()...); err != nil {
 			a.logger.Warn("sessionactor: resolve image: repo-access gate: repo url does not name a supported source-control host; denying warm-boot",
 				"repo", name, "url", repoURL, "error", err)
-			return false
+			return false, imagedecision.ReasonRepoAccessUnsupportedHost
 		}
 
 		owner, repoName, err := reposource.ParseOwnerRepo(repoURL)
 		if err != nil {
 			a.logger.Warn("sessionactor: resolve image: repo-access gate: parse owner/repo from clone url failed; denying warm-boot",
 				"repo", name, "error", err)
-			return false
+			return false, imagedecision.ReasonRepoAccessUnparseableURL
 		}
 		repoLabel := owner + "/" + repoName
 
@@ -446,7 +648,7 @@ func (a *Actor) repoAccessAllowedForSpawn(ctx context.Context, plan *spawnPlan, 
 				if !allowed {
 					a.logger.Warn("sessionactor: resolve image: repo-access gate: cached verdict is deny; denying warm-boot",
 						"user_id", userID, "repo", repoLabel)
-					return false
+					return false, imagedecision.ReasonRepoAccessCachedDeny
 				}
 				continue
 			}
@@ -464,7 +666,7 @@ func (a *Actor) repoAccessAllowedForSpawn(ctx context.Context, plan *spawnPlan, 
 			if a.repoAccessCache.breakerOpen(now, a.timeouts.RepoAccessCheckBreakerWindow) {
 				a.logger.Warn("sessionactor: resolve image: repo-access gate: CheckRepoAccess circuit breaker open (repeated indeterminate SCM failures); denying warm-boot without a network call this spawn",
 					"user_id", userID, "repo", repoLabel)
-				return false
+				return false, imagedecision.ReasonRepoAccessCircuitBreakerOpen
 			}
 		}
 
@@ -472,7 +674,7 @@ func (a *Actor) repoAccessAllowedForSpawn(ctx context.Context, plan *spawnPlan, 
 		if !ok {
 			// Already logged (Warn or Error, as appropriate) by
 			// decryptCreatorGitHubToken itself.
-			return false
+			return false, imagedecision.ReasonRepoAccessNoToken
 		}
 
 		if a.sourceControl == nil {
@@ -480,7 +682,7 @@ func (a *Actor) repoAccessAllowedForSpawn(ctx context.Context, plan *spawnPlan, 
 			// own nil-provider guard exactly -- some tests, and any future
 			// caller genuinely without one, must not panic here.
 			a.logger.Warn("sessionactor: resolve image: repo-access gate: no SourceControl configured; denying warm-boot")
-			return false
+			return false, imagedecision.ReasonRepoAccessNoSourceControl
 		}
 
 		checkCtx, cancel := context.WithTimeout(ctx, a.timeouts.RepoAccessCheckTimeout)
@@ -504,7 +706,7 @@ func (a *Actor) repoAccessAllowedForSpawn(ctx context.Context, plan *spawnPlan, 
 			}
 			a.logger.Error("sessionactor: resolve image: repo-access gate: CheckRepoAccess call failed; SCM check indeterminate, denying only THIS spawn's warm-boot (not cached, not a permanent deny)",
 				"user_id", userID, "repo", repoLabel, "error", err)
-			return false
+			return false, imagedecision.ReasonRepoAccessCheckIndeterminate
 		}
 
 		if a.repoAccessCache != nil {
@@ -515,9 +717,9 @@ func (a *Actor) repoAccessAllowedForSpawn(ctx context.Context, plan *spawnPlan, 
 		if !allowed {
 			a.logger.Warn("sessionactor: resolve image: repo-access gate: session creator cannot read this repo; denying warm-boot (audit fix: warm-boot image access control)",
 				"user_id", userID, "repo", repoLabel)
-			return false
+			return false, imagedecision.ReasonRepoAccessDenied
 		}
 	}
 
-	return true
+	return true, imagedecision.ReasonNone
 }

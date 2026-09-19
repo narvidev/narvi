@@ -15,7 +15,7 @@ const cancelSandboxPendingPush = `-- name: CancelSandboxPendingPush :one
 UPDATE sandboxes
 SET pending_push_cancelled = true, updated_at = now()
 WHERE session_id = $1 AND pending_push_suppressed_in_shadow IS NOT NULL
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint
 `
 
 // §30.4's own "demotion ... must cancel in-flight push signals" -- sets
@@ -51,6 +51,8 @@ func (q *Queries) CancelSandboxPendingPush(ctx context.Context, sessionID pgtype
 		&i.DemotionTerminateRequestedAt,
 		&i.AgentVersion,
 		&i.ImageDigest,
+		&i.ImageDecisionReason,
+		&i.ImageDecisionFingerprint,
 	)
 	return i, err
 }
@@ -59,7 +61,7 @@ const clearSandboxDemotionTerminationRequested = `-- name: ClearSandboxDemotionT
 UPDATE sandboxes
 SET demotion_terminate_requested_at = NULL, updated_at = now()
 WHERE session_id = $1
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint
 `
 
 // Consumes a sandbox's own demotion-termination request once
@@ -91,6 +93,8 @@ func (q *Queries) ClearSandboxDemotionTerminationRequested(ctx context.Context, 
 		&i.DemotionTerminateRequestedAt,
 		&i.AgentVersion,
 		&i.ImageDigest,
+		&i.ImageDecisionReason,
+		&i.ImageDecisionFingerprint,
 	)
 	return i, err
 }
@@ -99,7 +103,7 @@ const clearSandboxPendingPush = `-- name: ClearSandboxPendingPush :one
 UPDATE sandboxes
 SET pending_push_suppressed_in_shadow = NULL, pending_push_cancelled = false, updated_at = now()
 WHERE session_id = $1
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint
 `
 
 // Consumes this sandbox's own persisted push/PR decision -- called by
@@ -133,6 +137,8 @@ func (q *Queries) ClearSandboxPendingPush(ctx context.Context, sessionID pgtype.
 		&i.DemotionTerminateRequestedAt,
 		&i.AgentVersion,
 		&i.ImageDigest,
+		&i.ImageDecisionReason,
+		&i.ImageDecisionFingerprint,
 	)
 	return i, err
 }
@@ -141,7 +147,7 @@ const createSandbox = `-- name: CreateSandbox :one
 
 INSERT INTO sandboxes (session_id)
 VALUES ($1)
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint
 `
 
 // Queries backing SandboxStore (§4.3). Just enough to prove the pipeline
@@ -171,12 +177,14 @@ func (q *Queries) CreateSandbox(ctx context.Context, sessionID pgtype.UUID) (San
 		&i.DemotionTerminateRequestedAt,
 		&i.AgentVersion,
 		&i.ImageDigest,
+		&i.ImageDecisionReason,
+		&i.ImageDecisionFingerprint,
 	)
 	return i, err
 }
 
 const getSandbox = `-- name: GetSandbox :one
-SELECT id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest FROM sandboxes
+SELECT id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint FROM sandboxes
 WHERE session_id = $1
 `
 
@@ -204,6 +212,8 @@ func (q *Queries) GetSandbox(ctx context.Context, sessionID pgtype.UUID) (Sandbo
 		&i.DemotionTerminateRequestedAt,
 		&i.AgentVersion,
 		&i.ImageDigest,
+		&i.ImageDecisionReason,
+		&i.ImageDecisionFingerprint,
 	)
 	return i, err
 }
@@ -298,7 +308,7 @@ func (q *Queries) ListLiveSandboxesWithSessionRepos(ctx context.Context) ([]List
 }
 
 const listSandboxesPendingDemotionTermination = `-- name: ListSandboxesPendingDemotionTermination :many
-SELECT id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest FROM sandboxes WHERE demotion_terminate_requested_at IS NOT NULL
+SELECT id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint FROM sandboxes WHERE demotion_terminate_requested_at IS NOT NULL
 `
 
 // app/reconciler.Reconciler's own new demotion-sweep tick reads every
@@ -337,6 +347,8 @@ func (q *Queries) ListSandboxesPendingDemotionTermination(ctx context.Context) (
 			&i.DemotionTerminateRequestedAt,
 			&i.AgentVersion,
 			&i.ImageDigest,
+			&i.ImageDecisionReason,
+			&i.ImageDecisionFingerprint,
 		); err != nil {
 			return nil, err
 		}
@@ -352,7 +364,7 @@ const markSandboxDemotionTerminationRequested = `-- name: MarkSandboxDemotionTer
 UPDATE sandboxes
 SET demotion_terminate_requested_at = now(), updated_at = now()
 WHERE session_id = $1
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint
 `
 
 // §30.4's own "demotion ... must terminate (or respawn) every sandbox of
@@ -384,6 +396,8 @@ func (q *Queries) MarkSandboxDemotionTerminationRequested(ctx context.Context, s
 		&i.DemotionTerminateRequestedAt,
 		&i.AgentVersion,
 		&i.ImageDigest,
+		&i.ImageDecisionReason,
+		&i.ImageDecisionFingerprint,
 	)
 	return i, err
 }
@@ -395,7 +409,7 @@ SET status = $2,
     last_seen_at = $3,
     updated_at = now()
 WHERE session_id = $1
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint
 `
 
 type RecoverSandboxFromSuspectParams struct {
@@ -446,6 +460,8 @@ func (q *Queries) RecoverSandboxFromSuspect(ctx context.Context, arg RecoverSand
 		&i.DemotionTerminateRequestedAt,
 		&i.AgentVersion,
 		&i.ImageDigest,
+		&i.ImageDecisionReason,
+		&i.ImageDecisionFingerprint,
 	)
 	return i, err
 }
@@ -454,7 +470,7 @@ const setSandboxPendingPush = `-- name: SetSandboxPendingPush :one
 UPDATE sandboxes
 SET pending_push_suppressed_in_shadow = $2, pending_push_cancelled = false, updated_at = now()
 WHERE session_id = $1
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint
 `
 
 type SetSandboxPendingPushParams struct {
@@ -496,6 +512,8 @@ func (q *Queries) SetSandboxPendingPush(ctx context.Context, arg SetSandboxPendi
 		&i.DemotionTerminateRequestedAt,
 		&i.AgentVersion,
 		&i.ImageDigest,
+		&i.ImageDecisionReason,
+		&i.ImageDecisionFingerprint,
 	)
 	return i, err
 }
@@ -504,7 +522,7 @@ const updateSandboxCircuitBreaker = `-- name: UpdateSandboxCircuitBreaker :one
 UPDATE sandboxes
 SET spawn_failure_count = $2, last_spawn_failure_at = $3, updated_at = now()
 WHERE session_id = $1
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint
 `
 
 type UpdateSandboxCircuitBreakerParams struct {
@@ -545,6 +563,64 @@ func (q *Queries) UpdateSandboxCircuitBreaker(ctx context.Context, arg UpdateSan
 		&i.DemotionTerminateRequestedAt,
 		&i.AgentVersion,
 		&i.ImageDigest,
+		&i.ImageDecisionReason,
+		&i.ImageDecisionFingerprint,
+	)
+	return i, err
+}
+
+const updateSandboxImageDecision = `-- name: UpdateSandboxImageDecision :one
+UPDATE sandboxes
+SET image_decision_reason = $2, image_decision_fingerprint = $3, updated_at = now()
+WHERE session_id = $1
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint
+`
+
+type UpdateSandboxImageDecisionParams struct {
+	SessionID                pgtype.UUID          `json:"session_id"`
+	ImageDecisionReason      *ImageDecisionReason `json:"image_decision_reason"`
+	ImageDecisionFingerprint *string              `json:"image_decision_fingerprint"`
+}
+
+// §19's own persisted-decision-provenance fix: records resolveAndSetImage's (imageresolve.go) own
+// per-spawn/-restore image-resolution outcome for THIS gen -- a real
+// warm-image selection (image_decision_reason = 'selected') or exactly
+// one of the closed set of fallback reasons
+// (internal/domain/imagedecision.Reason) that left plan.spec.Image at
+// defaultBaseImage instead. Called from its own small transact, separate
+// from planDispatch's (imageresolve.go's own "outside any transaction"
+// sequencing) -- a plain, best-effort write: a failure here is logged and
+// never blocks or fails the spawn (§10 Phase 2), mirroring
+// UpdateSandboxProviderID's own single-column-write shape exactly.
+// image_decision_fingerprint is nullable because ReasonNoRepos is the one
+// outcome with no fingerprint to compute at all (imageresolve.go's own
+// top-of-function bare return, before any repos exist to fingerprint).
+func (q *Queries) UpdateSandboxImageDecision(ctx context.Context, arg UpdateSandboxImageDecisionParams) (Sandbox, error) {
+	row := q.db.QueryRow(ctx, updateSandboxImageDecision, arg.SessionID, arg.ImageDecisionReason, arg.ImageDecisionFingerprint)
+	var i Sandbox
+	err := row.Scan(
+		&i.ID,
+		&i.SessionID,
+		&i.Gen,
+		&i.Status,
+		&i.LastSeenAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.TokenHash,
+		&i.ProviderID,
+		&i.SpawnFailureCount,
+		&i.LastSpawnFailureAt,
+		&i.SnapshotID,
+		&i.PendingSnapshotMessageID,
+		&i.PreSuspectStatus,
+		&i.SnapshotSuppressedInShadow,
+		&i.PendingPushSuppressedInShadow,
+		&i.PendingPushCancelled,
+		&i.DemotionTerminateRequestedAt,
+		&i.AgentVersion,
+		&i.ImageDigest,
+		&i.ImageDecisionReason,
+		&i.ImageDecisionFingerprint,
 	)
 	return i, err
 }
@@ -553,7 +629,7 @@ const updateSandboxPendingSnapshotMessageID = `-- name: UpdateSandboxPendingSnap
 UPDATE sandboxes
 SET pending_snapshot_message_id = $2, updated_at = now()
 WHERE session_id = $1
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint
 `
 
 type UpdateSandboxPendingSnapshotMessageIDParams struct {
@@ -598,6 +674,8 @@ func (q *Queries) UpdateSandboxPendingSnapshotMessageID(ctx context.Context, arg
 		&i.DemotionTerminateRequestedAt,
 		&i.AgentVersion,
 		&i.ImageDigest,
+		&i.ImageDecisionReason,
+		&i.ImageDecisionFingerprint,
 	)
 	return i, err
 }
@@ -606,7 +684,7 @@ const updateSandboxProviderID = `-- name: UpdateSandboxProviderID :one
 UPDATE sandboxes
 SET provider_id = $2, updated_at = now()
 WHERE session_id = $1
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint
 `
 
 type UpdateSandboxProviderIDParams struct {
@@ -643,6 +721,8 @@ func (q *Queries) UpdateSandboxProviderID(ctx context.Context, arg UpdateSandbox
 		&i.DemotionTerminateRequestedAt,
 		&i.AgentVersion,
 		&i.ImageDigest,
+		&i.ImageDecisionReason,
+		&i.ImageDecisionFingerprint,
 	)
 	return i, err
 }
@@ -651,7 +731,7 @@ const updateSandboxSnapshotID = `-- name: UpdateSandboxSnapshotID :one
 UPDATE sandboxes
 SET snapshot_id = $2, snapshot_suppressed_in_shadow = $3, pending_snapshot_message_id = NULL, updated_at = now()
 WHERE session_id = $1
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint
 `
 
 type UpdateSandboxSnapshotIDParams struct {
@@ -709,6 +789,8 @@ func (q *Queries) UpdateSandboxSnapshotID(ctx context.Context, arg UpdateSandbox
 		&i.DemotionTerminateRequestedAt,
 		&i.AgentVersion,
 		&i.ImageDigest,
+		&i.ImageDecisionReason,
+		&i.ImageDecisionFingerprint,
 	)
 	return i, err
 }
@@ -721,7 +803,7 @@ SET status = $2,
     image_digest = COALESCE($5, image_digest),
     updated_at = now()
 WHERE session_id = $1
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint
 `
 
 type UpdateSandboxStatusParams struct {
@@ -775,6 +857,8 @@ func (q *Queries) UpdateSandboxStatus(ctx context.Context, arg UpdateSandboxStat
 		&i.DemotionTerminateRequestedAt,
 		&i.AgentVersion,
 		&i.ImageDigest,
+		&i.ImageDecisionReason,
+		&i.ImageDecisionFingerprint,
 	)
 	return i, err
 }
@@ -785,7 +869,7 @@ SET status = 'suspect',
     pre_suspect_status = $2,
     updated_at = now()
 WHERE session_id = $1
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint
 `
 
 type UpdateSandboxStatusToSuspectParams struct {
@@ -830,6 +914,8 @@ func (q *Queries) UpdateSandboxStatusToSuspect(ctx context.Context, arg UpdateSa
 		&i.DemotionTerminateRequestedAt,
 		&i.AgentVersion,
 		&i.ImageDigest,
+		&i.ImageDecisionReason,
+		&i.ImageDecisionFingerprint,
 	)
 	return i, err
 }
@@ -844,8 +930,10 @@ SET gen = sandboxes.gen + 1,
     last_seen_at = now(),
     agent_version = NULL,
     image_digest = NULL,
+    image_decision_reason = NULL,
+    image_decision_fingerprint = NULL,
     updated_at = now()
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint
 `
 
 type UpsertSandboxForSpawnParams struct {
@@ -902,6 +990,17 @@ type UpsertSandboxForSpawnParams struct {
 // gen's own connecting/booting window would be actively misleading --
 // "not reported yet" (NULL) is the honest state until THIS gen's own
 // first "ready" event repopulates them.
+//
+// image_decision_reason/image_decision_fingerprint (§19's own persisted-
+// decision-provenance gap, migrations/000139_sandboxes_image_decision.
+// up.sql) are cleared here for
+// the IDENTICAL reason agent_version/image_digest already are: a stale
+// previous-gen decision must never linger and be misread as THIS gen's
+// own outcome. resolveAndSetImage (imageresolve.go) writes the real value
+// for this gen immediately after this upsert runs (dispatch.go's own
+// "outside any transaction, immediately before the provider is ever
+// called" sequencing) -- NULL here is simply the honest gap between that
+// gen bump and this gen's own first real decision.
 func (q *Queries) UpsertSandboxForSpawn(ctx context.Context, arg UpsertSandboxForSpawnParams) (Sandbox, error) {
 	row := q.db.QueryRow(ctx, upsertSandboxForSpawn, arg.SessionID, arg.TokenHash)
 	var i Sandbox
@@ -926,6 +1025,8 @@ func (q *Queries) UpsertSandboxForSpawn(ctx context.Context, arg UpsertSandboxFo
 		&i.DemotionTerminateRequestedAt,
 		&i.AgentVersion,
 		&i.ImageDigest,
+		&i.ImageDecisionReason,
+		&i.ImageDecisionFingerprint,
 	)
 	return i, err
 }

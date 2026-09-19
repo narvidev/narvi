@@ -195,3 +195,12 @@ func (s *SandboxStore) ListPendingDemotionTermination(ctx context.Context) ([]sq
 func (s *SandboxStore) ClearDemotionTerminationRequested(ctx context.Context, sessionID pgtype.UUID) (sqlcgen.Sandbox, error) {
 	return s.q.ClearSandboxDemotionTerminationRequested(ctx, sessionID)
 }
+
+// UpdateImageDecision records app/sessionactor's own resolveAndSetImage
+// (imageresolve.go) per-spawn/-restore image-resolution outcome for this
+// gen -- a real warm-image selection or one of internal/domain/
+// imagedecision.Reason's closed set of fallback reasons. See
+// UpdateSandboxImageDecision's own generated doc comment.
+func (s *SandboxStore) UpdateImageDecision(ctx context.Context, arg sqlcgen.UpdateSandboxImageDecisionParams) (sqlcgen.Sandbox, error) {
+	return s.q.UpdateSandboxImageDecision(ctx, arg)
+}
