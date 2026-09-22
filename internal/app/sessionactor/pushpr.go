@@ -178,6 +178,18 @@ func logProviderFailureDiagnostic(logger *slog.Logger, d *sandboxws.ExecutionCom
 	}
 	if d.Model != nil {
 		attrs = append(attrs, "diagnostic_model", *d.Model)
+	} else {
+		// F7: an absent Model is genuinely ambiguous on its own -- "we
+		// could not determine which model ran" (VERIFIED LIVE: a
+		// model-not-found session.error fires with no assistant message
+		// ever created at all, ProviderFailureDiagnostic.Model's own doc
+		// comment, internal/adapters/outbound/opencode/diagnostic.go) is
+		// indistinguishable, on this log line alone, from "this build
+		// does not record the model at all". Recording the gap
+		// explicitly, rather than inventing a value (the shortcut that
+		// produced this PR's worst defect), is the honest fix: never a
+		// guess, but never silent either.
+		attrs = append(attrs, "diagnostic_model_unknown", true)
 	}
 	if d.RuntimeVersion != nil {
 		attrs = append(attrs, "diagnostic_runtime_version", *d.RuntimeVersion)

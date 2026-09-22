@@ -156,6 +156,9 @@ func TestLogProviderFailureDiagnostic(t *testing.T) {
 				"diagnostic_runtime_version":     "1.17.15",
 				"diagnostic_sandbox_id":          "sbx-live-0001",
 			},
+			// F7: a KNOWN model must never also carry the "unknown" flag --
+			// the two are mutually exclusive.
+			wantAbsent: []string{"diagnostic_model_unknown"},
 		},
 		{
 			name:       "every field nil is omitted, not logged empty",
@@ -165,6 +168,12 @@ func TestLogProviderFailureDiagnostic(t *testing.T) {
 			wantAttrs: map[string]string{
 				"session_id": "ses-fixture-1",
 				"message_id": "msg-fixture-1",
+				// F7: Model is nil here same as every other field, but
+				// unlike every other field this ABSENCE must be logged
+				// explicitly rather than silently omitted -- "we could not
+				// determine which model ran" must never be indistinguishable
+				// from "this build does not record the model at all".
+				"diagnostic_model_unknown": "true",
 			},
 			wantAbsent: []string{
 				"diagnostic_message", "diagnostic_union_member", "diagnostic_status_code",
@@ -188,6 +197,36 @@ func TestLogProviderFailureDiagnostic(t *testing.T) {
 			},
 			wantAbsent: []string{
 				"diagnostic_message", "diagnostic_union_member", "diagnostic_status_code",
+				"diagnostic_runtime_version", "diagnostic_sandbox_id", "correlation_id",
+				"diagnostic_model_unknown",
+			},
+		},
+		{
+			// F7's own motivating scenario, VERIFIED LIVE
+			// (ProviderFailureDiagnostic.Model's own doc comment,
+			// internal/adapters/outbound/opencode/diagnostic.go): a genuine
+			// "model not found" session.error fires with no assistant
+			// message.updated ever created at all, so the diagnostic is
+			// otherwise populated (message/unionMember) but Model stays "".
+			// Before F7, this log line was silent about the model on
+			// exactly this genuinely-unknown case, indistinguishable from a
+			// build that simply never wired up model reporting.
+			name: "model genuinely unknown alongside an otherwise-populated diagnostic",
+			diagnostic: &sandboxws.ExecutionCompleteDiagnostic{
+				Message:     strPtr("ProviderModelNotFoundError: Model not found: bogus-model"),
+				UnionMember: strPtr("UnknownError"),
+			},
+			turnID: "trn-33333333-3333-3333-3333-333333333333",
+			wantAttrs: map[string]string{
+				"session_id":               "ses-fixture-1",
+				"message_id":               "msg-fixture-1",
+				"turn_id":                  "trn-33333333-3333-3333-3333-333333333333",
+				"diagnostic_message":       "ProviderModelNotFoundError: Model not found: bogus-model",
+				"diagnostic_union_member":  "UnknownError",
+				"diagnostic_model_unknown": "true",
+			},
+			wantAbsent: []string{
+				"diagnostic_model", "diagnostic_status_code", "diagnostic_provider_request_id",
 				"diagnostic_runtime_version", "diagnostic_sandbox_id", "correlation_id",
 			},
 		},
