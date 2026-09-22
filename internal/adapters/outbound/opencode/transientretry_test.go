@@ -2,6 +2,7 @@ package opencode
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -40,27 +41,47 @@ func apiErrorMessageUpdated(t *testing.T, sessionID, messageID string, retryable
 	})
 }
 
+// apiErrorMessageUpdatedWithModelJSONTemplate is the SAME real
+// message.updated bytes realbinarycapture_test.go's own
+// capturedAssistantMessageUpdatedWithErrorJSON captures (a genuine 401
+// APIError against an invalid provider credential, pinned OpenCode
+// 1.17.15, including the real responseHeaders/responseBody/metadata
+// shape) -- templated with %[n] positional verbs for the five values
+// apiErrorMessageUpdatedWithModel's own callers each control (sessionID,
+// messageID, retryable, providerID, modelID). Every OTHER key, and the
+// real key SET itself, is the identical literal structure captured live,
+// not reconstructed via this package's own openCodeMessageInfo/
+// openCodeErrorData struct literals -- see sseLineRaw's own doc comment
+// (realbinarycapture_test.go) for why that distinction is the whole point
+// (E2): a fixture built by marshaling the SAME struct that later decodes
+// it can never catch a wrong JSON tag, and this helper's own two callers
+// (TestTransientRetry_PermanentAPIErrorNeverRetried,
+// TestTransientRetry_RetryDispatchFailsIsNeverRetriedAgain) are exactly
+// the tests that assert ProviderFailureDiagnostic.Model came from THIS
+// payload's own modelID/providerID keys.
+//
+// statusCode/responseHeaders/responseBody/metadata stay fixed at the real
+// captured 401 values regardless of the retryable param below -- neither
+// varies with them in production either (isRetryable is OpenCode's own
+// independent verdict, openCodeErrorData's own doc comment, types.go),
+// and no caller of this helper asserts on those fields, so hardcoding the
+// one real capture this package actually has is strictly more realistic
+// than the old struct-literal version's leaving them entirely unset.
+const apiErrorMessageUpdatedWithModelJSONTemplate = `{"sessionID":%[1]q,"info":{"id":%[2]q,"parentID":"msg_0c904ce000013WrZ9O6KEEiDYZ","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/workspace","root":"/"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"modelID":%[5]q,"providerID":%[4]q,"time":{"created":1790078930544,"completed":1790078931960},"sessionID":%[1]q,"error":{"name":"APIError","data":{"message":"API key is invalid.","statusCode":401,"isRetryable":%[3]t,"responseHeaders":{"cf-cache-status":"DYNAMIC","cf-ray":"a3f1328d4e1be195-MRS","connection":"keep-alive","content-length":"106","content-security-policy":"default-src 'none'; frame-ancestors 'none'","content-type":"application/json","date":"Tue, 22 Sep 2026 12:08:52 GMT","server":"cloudflare","x-robots-tag":"none"},"responseBody":"{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"API key is invalid.\"},\"request_id\":null}","metadata":{"url":"https://api.anthropic.com/v1/messages"}}}}}`
+
 // apiErrorMessageUpdatedWithModel mirrors apiErrorMessageUpdated above, but
 // also plants the engine-reported ModelID/ProviderID openCodeMessageInfo
 // now carries (§7.3, A2) -- used by tests that specifically assert
 // ProviderFailureDiagnostic.Model, to prove it is sourced from the
 // message's OWN reported model, never from cmd.Model or any request-side
-// resolution.
+// resolution. Built from apiErrorMessageUpdatedWithModelJSONTemplate's own
+// captured real bytes (E2), broadcast via sseLineRaw so the production
+// json.Unmarshal path is what actually decodes it, not a struct-to-struct
+// round trip.
 func apiErrorMessageUpdatedWithModel(t *testing.T, sessionID, messageID string, retryable bool, providerID, modelID string) string {
 	t.Helper()
-	return sseLine(t, "message.updated", messageUpdatedProps{
-		SessionID: sessionID,
-		Info: openCodeMessageInfo{
-			ID:   messageID,
-			Role: "assistant",
-			Error: &openCodeTaggedError{
-				Name: "APIError",
-				Data: &openCodeErrorData{IsRetryable: retryable},
-			},
-			ModelID:    modelID,
-			ProviderID: providerID,
-		},
-	})
+	raw := fmt.Sprintf(apiErrorMessageUpdatedWithModelJSONTemplate, sessionID, messageID, retryable, providerID, modelID)
+	return sseLineRaw(t, "message.updated", raw)
 }
 
 // TestTransientRetry_SucceedsAfterTransientAPIError proves the full round
