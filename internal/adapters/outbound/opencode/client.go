@@ -22,8 +22,8 @@ const maxResponseBodySize = 4 << 20 // 4 MiB
 // doJSON executes one OpenCode HTTP call bounded by a.requestTimeout — a
 // thin wrapper around doJSONTimeout below, unchanged in behavior from
 // before this Step: every EXISTING doJSON-routed caller (resolveSession,
-// resolveModel, postPromptAsync, postAbort, fetchFinalMessages) keeps
-// exactly the same per-request bound it always had. See doJSONTimeout's
+// resolveProviderModel, postPromptAsync, postAbort, fetchFinalMessages)
+// keeps exactly the same per-request bound it always had. See doJSONTimeout's
 // own doc comment for the full write-up of what this does and why the
 // timeout is parameterized at all (Finding 3, §7.2): forceCompaction
 // (compact.go) is the one caller that needs a DIFFERENT, more generous

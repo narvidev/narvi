@@ -24,11 +24,12 @@
 //   - compact.go (§7.2): forceCompaction, the POST /session/{id}/summarize
 //     call finalizeOrRecoverFromOverflow/attemptCompactionRetry (adapter.go)
 //     use to force a compaction before retrying an overflowed turn.
-//   - session.go: OpenCode session resolution (create-vs-resume),
-//     the §7 model-catalog-fallback quirk (resolveModel/
-//     resolveProviderModel), its §7.2 "forced, never-nil" variant
-//     (resolveModelForced, needed because /summarize has no "omit model"
-//     option the way prompt_async does), and prompt_async/abort/final-
+//   - session.go: OpenCode session resolution (create-vs-resume), the §7
+//     model-catalog-fallback quirk (resolveModelForced/resolveProviderModel
+//     -- resolveModelForced is this adapter's only model-resolution
+//     entry point, "forced" because it never returns nil, used
+//     identically by StartTurn's own initial dispatch and every retry's
+//     own re-dispatch, §7.3 audit fix), and prompt_async/abort/final-
 //     message-fetch HTTP calls.
 //   - sse.go: the persistent global GET /event connection and per-event
 //     dispatch, including the tool-call/tool-result dedup logic (§7's own

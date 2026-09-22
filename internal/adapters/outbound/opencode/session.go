@@ -118,7 +118,7 @@ func fallbackModelRef() *promptModelRef {
 
 // postPromptAsync POSTs the translated turn to OpenCode's own
 // prompt_async endpoint (§7: "POSTs prompt_async"). model is already
-// resolved (resolveModel) before this is called.
+// resolved (resolveModelForced) before this is called.
 //
 // cmd.PlanMode ("plan mode, web", §8.1) selects OpenCode's own
 // native "plan" agent via the request's "agent" field when true, omitted

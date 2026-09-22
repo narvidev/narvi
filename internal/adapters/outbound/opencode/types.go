@@ -109,8 +109,9 @@ type summarizeRequest struct {
 // modelCatalogResponse is GET /api/model's response body — VERIFIED live:
 // {"location":{...},"data":[{"id","providerID",...}, ...]}. This adapter
 // only uses Data's own length (§7's "on empty/failed catalog, fall back"
-// quirk is a liveness check, not a per-model lookup — see resolveModel's
-// own doc comment), so individual entries are not modeled further.
+// quirk is a liveness check, not a per-model lookup — see
+// resolveModelForced's own doc comment), so individual entries are not
+// modeled further.
 type modelCatalogResponse struct {
 	Data []json.RawMessage `json:"data"`
 }
