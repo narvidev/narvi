@@ -109,8 +109,9 @@ type summarizeRequest struct {
 // modelCatalogResponse is GET /api/model's response body — VERIFIED live:
 // {"location":{...},"data":[{"id","providerID",...}, ...]}. This adapter
 // only uses Data's own length (§7's "on empty/failed catalog, fall back"
-// quirk is a liveness check, not a per-model lookup — see resolveModel's
-// own doc comment), so individual entries are not modeled further.
+// quirk is a liveness check, not a per-model lookup — see
+// resolveModelForced's own doc comment), so individual entries are not
+// modeled further.
 type modelCatalogResponse struct {
 	Data []json.RawMessage `json:"data"`
 }
@@ -141,20 +142,66 @@ type messageUpdatedProps struct {
 // observed live, however, on the third scripted turn (an aborted turn),
 // confirming the shape: {"error":{"name":"MessageAbortedError",
 // "data":{"message":"Aborted"}}}.
+//
+// ModelID/ProviderID (§7.3, "the model that actually ran"): NOW VERIFIED
+// LIVE against the pinned 1.17.15 binary — a later Step's own research
+// pass, once the binary became reachable, ran a real `opencode serve`,
+// set an invalid provider credential, and captured a genuine 401 APIError
+// on a real prompt_async turn. The real assistant message.updated payload
+// carries exactly {"modelID":"claude-opus-5","providerID":"anthropic",...}
+// alongside "id"/"role"/"error" — confirming both field names match what
+// this struct already claimed, byte for byte. See
+// TestRealOrdering_ModelSurvivesLateArrivingAssistantError
+// (realbinarycapture_test.go) for the literal captured JSON this was
+// decoded from through this exact struct.
+//
+// An EARLIER revision of this comment called this pair "SCHEMA-DERIVED
+// ONLY", sourced from OpenCode's own publicly-generated SDK type
+// definitions rather than the pinned binary itself (no opencode binary was
+// reachable in that dev environment) — and flagged that source as drawn
+// from a newer revision than the pinned binary, a real, confirmed drift
+// risk (the same fetch showed openCodeTaggedError's own error-union
+// membership had narrowed relative to what this file documents). That
+// verification gap is now closed for THIS pair specifically; the general
+// drift risk for fields this package has still never captured live
+// remains real. Regardless: json.Unmarshal leaves an absent key at its Go
+// zero value ("") with no error, so even a FUTURE OpenCode revision that
+// drops or renames one or both of these keys degrades to the exact same
+// "" this adapter already reported before this field existed — never a
+// wrong value, only possibly still an absent one. See
+// modelDisplayFromInfo's own doc comment (diagnostic.go) for how a
+// partial/absent pair is handled.
 type openCodeMessageInfo struct {
-	ID    string               `json:"id"`
-	Role  string               `json:"role"`
-	Error *openCodeTaggedError `json:"error"`
+	ID         string               `json:"id"`
+	Role       string               `json:"role"`
+	Error      *openCodeTaggedError `json:"error"`
+	ModelID    string               `json:"modelID"`
+	ProviderID string               `json:"providerID"`
 }
 
 // openCodeTaggedError is the tagged-union shape OpenCode uses for both
 // session.error's own "error" property and an assistant message's own
 // "error" field — VERIFIED live for name="MessageAbortedError" (an aborted
-// turn); the other 7 tagged-union member names (ProviderAuthError,
-// UnknownError, MessageOutputLengthError, StructuredOutputError,
-// ContextOverflowError, ContentFilterError, APIError) are schema-derived
-// only (confirmed present in /doc, not independently elicited live — none
-// of this Step's own scripted turns produced one).
+// turn) AND, since a later Step's own research pass (once the pinned
+// binary became reachable), name="APIError" too: a genuine 401 against an
+// invalid provider credential, {"name":"APIError","data":{"message":"API
+// key is invalid.","statusCode":401,"isRetryable":false,
+// "responseHeaders":{...9 real keys...},"responseBody":"...",
+// "metadata":{"url":"https://api.anthropic.com/v1/messages"}}} — see
+// openCodeErrorData's own doc comment below for the full captured
+// responseHeaders key set. The remaining 6 tagged-union member names
+// (ProviderAuthError, UnknownError, MessageOutputLengthError,
+// StructuredOutputError, ContextOverflowError, ContentFilterError) are
+// still schema-derived only (confirmed present in /doc, not independently
+// elicited live). A distinct "model not found" failure WAS also elicited
+// live during that same pass, but the pinned 1.17.15 binary reports it as
+// name="UnknownError" with the real reason embedded in Data.Message
+// ("ProviderModelNotFoundError: Model not found: ..."), not as its own
+// named union member — "ProviderModelNotFoundError" is not a real
+// openCodeTaggedError.Name this binary ever emits, despite being a
+// plausible-sounding member name; nothing in this package parses that
+// text to reclassify, so this is a documentation correction only, not a
+// behavior gap.
 //
 // Data (this Step: "typed transient-error retry for the OpenCode adapter")
 // decodes APIError's own "data" object — VERIFIED against the real,
@@ -177,20 +224,68 @@ type openCodeTaggedError struct {
 }
 
 // openCodeErrorData is openCodeTaggedError's own "data" object, modeled
-// only for the fields this Step's own typed-transient-retry classification
-// (isTransientAPIError, outcome.go) actually reads — VERIFIED against the
-// real, live-fetched /doc OpenAPI schema (components.schemas.APIError),
-// see openCodeTaggedError's own doc comment above for the full captured
-// shape. StatusCode is OPTIONAL (e.g. a real HTTP status the upstream
-// provider returned, 429/529) — corroborating detail only, never itself
-// consulted for retry classification (this Step's own explicit
-// instruction: classify ONLY on the typed isRetryable field, never on a
-// substring of error text, and statusCode is exactly that kind of
-// secondary signal a future misguided change might be tempted to
-// string/number-match on instead).
+// only for the fields this package actually reads anywhere — the
+// typed-transient-retry classification (isTransientAPIError, outcome.go)
+// and, since §7.3 ("a retry decision is not a diagnosis"), the
+// allowlisted provider-failure diagnostic (diagnostic.go) — VERIFIED
+// against the real, live-fetched /doc OpenAPI schema
+// (components.schemas.APIError), see openCodeTaggedError's own doc
+// comment above for the full captured shape:
+// {"data":{"message","statusCode"?,"isRetryable","responseHeaders"?,
+// "responseBody"?,"metadata"?}, "required":["message","isRetryable"]}.
+//
+// THIS STRUCT IS THE ALLOWLIST §7.3 REQUIRES, enforced structurally, not
+// by a comment: encoding/json silently drops any object key with no
+// matching struct field, so "responseBody" and "metadata" — the real
+// schema's own two other fields, exactly where credentials and the
+// prompt itself live (responseBody), and a free-form catch-all
+// (metadata) — are never modeled here AT ALL, which means they are never
+// decoded into any Go value anywhere in this program, not merely
+// "read and discarded" after the fact. A blocklist over those two named
+// fields would already be one behind the real schema today (metadata is
+// a THIRD field neither this struct nor any blocklist written against
+// "the two known-dangerous fields" would have named) — the allowlist
+// degrades safely instead: it can only ever retain less than the real
+// payload carries, never accidentally more.
+//
+// StatusCode is OPTIONAL (e.g. a real HTTP status the upstream provider
+// returned, 429/529) — corroborating detail only, never itself consulted
+// for retry classification (this Step's own explicit instruction:
+// classify ONLY on the typed isRetryable field, never on a substring of
+// error text, and statusCode is exactly that kind of secondary signal a
+// future misguided change might be tempted to string/number-match on
+// instead).
+//
+// Message and ResponseHeaders were added for §7.3's own diagnostic
+// alone — neither is read by isTransientAPIError, and ResponseHeaders is
+// read by exactly one function in this package, extractProviderRequestID
+// (diagnostic.go), which returns a single capped string and never the map
+// itself; see that function's own doc comment for why that keeps the
+// allowlist enforced by ProviderFailureDiagnostic's own field TYPES
+// (string/*int only — nothing a whole map could ever be assigned to)
+// rather than by convention.
+//
+// ResponseHeaders' own VALUE shape IS NOW VERIFIED LIVE: a real 401
+// APIError against the pinned 1.17.15 binary carried every header value
+// as a single JSON string (never an array) —
+// {"cf-cache-status":"DYNAMIC","cf-ray":"<opaque per-request id>",
+// "connection":"keep-alive","content-length":"106",
+// "content-security-policy":"default-src 'none'; frame-ancestors 'none'",
+// "content-type":"application/json","date":"<RFC1123>",
+// "server":"cloudflare","x-robots-tag":"none"} — reproduced identically
+// across 3 separate trials. Notably absent: BOTH "x-request-id" and
+// "request-id" (requestIDHeaderCandidates' own two long-standing
+// candidates, diagnostic.go) — see that variable's own doc comment for
+// what this means for extractProviderRequestID. json.RawMessage is kept
+// anyway, deliberately, rather than narrowed to a plain string: a
+// DIFFERENT provider (this adapter is provider-agnostic) or a future
+// OpenCode revision could still emit the array shape, and
+// decodeHeaderValue (diagnostic.go) already tries both.
 type openCodeErrorData struct {
-	IsRetryable bool `json:"isRetryable"`
-	StatusCode  *int `json:"statusCode,omitempty"`
+	Message         string                     `json:"message"`
+	IsRetryable     bool                       `json:"isRetryable"`
+	StatusCode      *int                       `json:"statusCode,omitempty"`
+	ResponseHeaders map[string]json.RawMessage `json:"responseHeaders,omitempty"`
 }
 
 // messagePartUpdatedProps is "message.part.updated"'s own properties shape

@@ -46,8 +46,16 @@ type fakeOpenCodeServer struct {
 	messages       []messageListEntry
 	summarizeCalls []summarizeRequest
 	promptCalls    []string // cmd.Text of every POST .../prompt_async body, in order (§7.2 regression test)
-	abortCalls     int      // count of every POST .../abort call -- a LATER audit's own round-2 Finding 1 regression test
-	summarizeOK    bool     // whether POST .../summarize succeeds -- false unless armed otherwise (Finding 5)
+	// lastPromptModel is the MOST RECENT POST .../prompt_async call's own
+	// "model" field (nil when that call omitted it entirely) -- audit fix
+	// (§7.3, C2): proves StartTurn/a retry's own re-dispatch actually SENT
+	// resolveModelForced's resolved model to OpenCode, not merely reported
+	// one in the diagnostic after the fact. Overwritten, not appended, by
+	// design -- callers that need every call's own model would need a
+	// slice, but nothing in this package needs that yet.
+	lastPromptModel *promptModelRef
+	abortCalls      int  // count of every POST .../abort call -- a LATER audit's own round-2 Finding 1 regression test
+	summarizeOK     bool // whether POST .../summarize succeeds -- false unless armed otherwise (Finding 5)
 
 	// messageCalls counts every GET /session/{id}/message call, incremented
 	// BEFORE the handler waits on messageGate below -- a LATER audit's own
@@ -221,6 +229,7 @@ func (f *fakeOpenCodeServer) handleSessionSubroutes(w http.ResponseWriter, r *ht
 		}
 		f.mu.Lock()
 		f.promptCalls = append(f.promptCalls, text)
+		f.lastPromptModel = body.Model
 		callIndex := len(f.promptCalls) // 1-based
 		gateFrom := f.promptAsyncGateFrom
 		gate := f.promptAsyncGate

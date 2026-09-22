@@ -58,6 +58,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"strings"
 	"time"
@@ -127,6 +128,76 @@ func executionOutcomeTrigger(outcome sandboxws.ExecutionCompleteOutcome) (turn.T
 	default:
 		return 0, false
 	}
+}
+
+// logProviderFailureDiagnostic renders §7.3's own allowlisted
+// ExecutionComplete.Diagnostic as one structured log line, via logger.
+// Every non-nil diagnostic field is named explicitly, one at a time —
+// never the struct logged wholesale via a %v/%+v verb — so a future field
+// added to the wire type without a matching line added here is silently
+// OMITTED from the log rather than silently INCLUDED: the same "an
+// allowlist can only ever retain less than it might, never accidentally
+// more" direction openCodeErrorData's own allowlist
+// (internal/adapters/outbound/opencode/types.go) is designed to fail in.
+// d is never nil (the one caller, completeProcessingTurn, only calls this
+// after checking evt.Diagnostic != nil).
+//
+// sessionID/messageID/turnID/correlationID (C4, confirmed MEDIUM) are the
+// join keys that make this line findable at all: logger itself is
+// deliberately NOT relied on for any of them (a.logger's own baked-in
+// correlation_id, if it has one, is whatever request first hydrated this
+// Actor — see completeProcessingTurn's own doc comment for why that is
+// often the WRONG request). sessionID/messageID come straight off the
+// wire event (evt.SessionId/evt.MessageId — always present, required wire
+// fields, contracts/sandbox-ws/v1/events.schema.json); turnID/correlationID
+// are the failing turn's own (processing.ID.String()/CorrelationID) when a
+// Processing turn was actually found for this delivery, "" and nil
+// otherwise (a late/redelivered execution_complete for a turn that has
+// already moved on some other way — sessionID/messageID still identify
+// exactly which wire event this line describes even then).
+func logProviderFailureDiagnostic(logger *slog.Logger, d *sandboxws.ExecutionCompleteDiagnostic, sessionID, messageID, turnID string, correlationID *string) {
+	attrs := make([]any, 0, 18)
+	attrs = append(attrs, "session_id", sessionID, "message_id", messageID)
+	if turnID != "" {
+		attrs = append(attrs, "turn_id", turnID)
+	}
+	if correlationID != nil && *correlationID != "" {
+		attrs = append(attrs, "correlation_id", *correlationID)
+	}
+	if d.Message != nil {
+		attrs = append(attrs, "diagnostic_message", *d.Message)
+	}
+	if d.UnionMember != nil {
+		attrs = append(attrs, "diagnostic_union_member", *d.UnionMember)
+	}
+	if d.StatusCode != nil {
+		attrs = append(attrs, "diagnostic_status_code", *d.StatusCode)
+	}
+	if d.ProviderRequestId != nil {
+		attrs = append(attrs, "diagnostic_provider_request_id", *d.ProviderRequestId)
+	}
+	if d.Model != nil {
+		attrs = append(attrs, "diagnostic_model", *d.Model)
+	} else {
+		// F7: an absent Model is genuinely ambiguous on its own -- "we
+		// could not determine which model ran" (VERIFIED LIVE: a
+		// model-not-found session.error fires with no assistant message
+		// ever created at all, ProviderFailureDiagnostic.Model's own doc
+		// comment, internal/adapters/outbound/opencode/diagnostic.go) is
+		// indistinguishable, on this log line alone, from "this build
+		// does not record the model at all". Recording the gap
+		// explicitly, rather than inventing a value (the shortcut that
+		// produced this PR's worst defect), is the honest fix: never a
+		// guess, but never silent either.
+		attrs = append(attrs, "diagnostic_model_unknown", true)
+	}
+	if d.RuntimeVersion != nil {
+		attrs = append(attrs, "diagnostic_runtime_version", *d.RuntimeVersion)
+	}
+	if d.SandboxId != nil {
+		attrs = append(attrs, "diagnostic_sandbox_id", *d.SandboxId)
+	}
+	logger.Warn("sessionactor: turn failed with a provider-reported diagnostic", attrs...)
 }
 
 // stampedSuppressor is the narrow, consumer-side view of the shadow SCM
@@ -230,11 +301,79 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 		return nil, nil
 	}
 
+	// turns/processing are resolved HERE, before the diagnostic log block
+	// below -- audit fix (C4): the log line needs the failing TURN's own
+	// identity (turn_id, and its own persisted correlation_id,
+	// turns.correlation_id, migrations/000121) to be joinable to anything,
+	// and that only exists once this lookup has run. Moving a READ a few
+	// lines earlier changes nothing about what this function writes or
+	// when -- ListForSession is unaffected either way.
 	turns, err := a.stores.turn.WithTx(tx).ListForSession(ctx, a.sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: list turns: %w", err)
 	}
 	processing, ok := findProcessingTurn(turns)
+
+	// §7.3 ("a retry decision is not a diagnosis"): the
+	// correlation-id-scoped operator half of "one record, in both
+	// surfaces". evt.Diagnostic is decoded from the EXACT SAME raw bytes
+	// appendRawEvent just persisted (handleSandboxEvent, sandboxevent.go)
+	// into the session's own event journal -- the other surface -- so
+	// this log line and that journal row are never two independently
+	// built copies of the same fact, they are two reads of one.
+	//
+	// Audit fix (C4, confirmed MEDIUM): an EARLIER version of this call
+	// passed only a.logger, which carries whatever correlation_id this
+	// Actor happened to be HYDRATED with (platform.Logger(ctx).With(...),
+	// hydrate.go) -- frozen for this Actor's whole process lifetime, set
+	// from whichever request first spawned it, not from the failing
+	// turn's own request. That comment used to claim this was "EXACTLY
+	// the mechanism §5.3 names as the operator diagnostic path" -- false
+	// as written: §5.3 scopes the operator path BY the failing turn's own
+	// correlation id, and an Actor's mailbox serially handles commands for
+	// MANY turns/requests across its own lifetime (actor.go's own "single
+	// writer" design), so a.logger's baked-in value is frequently some
+	// OTHER request's id, or none at all for an Actor first hydrated by a
+	// sandbox-initiated event that never carried one. Worse, ctx here
+	// carries no per-event correlation id to fall back to either: Actor.Send
+	// (actor.go) only ever uses its own ctx parameter to bound the mailbox
+	// enqueue, never threading it into command handling -- every command
+	// this Actor ever processes, including this one, runs on run(ctx)'s
+	// own process-lifetime ctx (Registry.GetOrSpawn's r.lifecycleCtx,
+	// registry.go), not the caller's.
+	//
+	// The fix: turns.correlation_id (migrations/000121) is the per-TURN
+	// fact that request-time ctx propagation cannot reach here anyway --
+	// set once, at turn-creation time, from whichever request dispatched
+	// THIS turn (httpapi.CreateTurnCore and friends) -- so processing's own
+	// CorrelationID, not a.logger's, is what actually answers "which
+	// request's failure is this". turn_id (processing.ID) and
+	// evt.SessionId/evt.MessageId are logged alongside it unconditionally,
+	// so an operator can join this line to the turn by id even on the rare
+	// path where no correlation id was ever recorded for it.
+	//
+	// Logged unconditionally on every delivery of a failed
+	// execution_complete (including a wire-level redelivery of an
+	// already-processed one, unlike the turn_false_failure_total metric
+	// below, which IS gated on `inserted`) -- this is an informational
+	// log line, not a cardinality-sensitive counter, so a redundant line
+	// on redelivery costs nothing and losing one to an over-eager gate
+	// would cost the one thing this Step exists to preserve. Fires
+	// regardless of whether a Processing turn was actually found (`ok`
+	// below) for the identical reason: a late/redelivered
+	// execution_complete for a turn that already finalized some other way
+	// must still be diagnosable, not silently swallowed because this
+	// specific delivery no longer has a Processing row to match.
+	if trig == turn.TriggerFail && evt.Diagnostic != nil {
+		var turnID string
+		var correlationID *string
+		if ok {
+			turnID = processing.ID.String()
+			correlationID = processing.CorrelationID
+		}
+		logProviderFailureDiagnostic(a.logger, evt.Diagnostic, evt.SessionId, evt.MessageId, turnID, correlationID)
+	}
+
 	if !ok {
 		// Confirmed audit finding (MEDIUM): gated on inserted, not just
 		// trig == TriggerComplete -- without this, EVERY wire-level

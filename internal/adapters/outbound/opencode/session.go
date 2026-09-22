@@ -48,6 +48,21 @@ func (a *Adapter) resolveSession(ctx context.Context, cmd sandboxws.Prompt) (str
 // default" (never resolved against the catalog or fallback, since there is
 // nothing to validate). A non-nil value is resolved via resolveProviderModel
 // below (shared with resolveModelForced, §7.2).
+//
+// This is the ONLY correct resolution for a wire dispatch whose own "model"
+// field is genuinely optional (promptAsyncRequest.Model, types.go, "model"?
+// in the real /doc OpenAPI schema) — StartTurn's own initial dispatch and
+// attemptTransientRetry's own re-dispatch (adapter.go) both use this,
+// exactly matching Composer/PlanModeView/Timeline resume/DecisionInbox's
+// own default `modelId: null` (web/src/session): a request that names no
+// model must NOT grow one on the wire that the client never asked for — an
+// audit fix (§7.3) undoing an EARLIER, incorrect version of this function
+// that force-resolved a nil raw to fallbackModelRef() here too, silently
+// changing which model every default-configuration turn actually ran on
+// (a production behavior change, not merely a diagnostic-completeness
+// one — see ProviderFailureDiagnostic.Model's own doc comment, diagnostic.go,
+// for why the diagnostic's own accuracy is now solved a different way, one
+// that does not require this).
 func (a *Adapter) resolveModel(ctx context.Context, raw *string) *promptModelRef {
 	if raw == nil {
 		return nil
@@ -73,7 +88,21 @@ func (a *Adapter) resolveModel(ctx context.Context, raw *string) *promptModelRef
 // resolveProviderModel resolution resolveModel itself uses. The return
 // value is NEVER nil — every caller (forceCompaction, and the retried
 // postPromptAsync that reuses the SAME resolved model, adapter.go's
-// finalizeOrRecoverFromOverflow/attemptCompactionRetry) can rely on that.
+// attemptCompactionRetry) can rely on that.
+//
+// attemptCompactionRetry (adapter.go) is the only caller that also reuses
+// this forced model for its own RE-dispatch of the prompt, not only for
+// forceCompaction's own /summarize call — deliberate: a compaction retry
+// already forces a concrete model for /summarize regardless of what the
+// original request named, so re-dispatching the retried prompt with that
+// SAME resolved model (rather than going back through resolveModel and
+// possibly omitting it) keeps both calls of one recovery attempt naming
+// the same model, instead of compacting on one model and replying on
+// whatever OpenCode would have defaulted to. attemptTransientRetry
+// (adapter.go), which never calls forceCompaction at all, has no such
+// reason to force one — it re-dispatches via resolveModel instead, so a
+// transient-error retry's own request shape matches the original attempt
+// it is retrying.
 func (a *Adapter) resolveModelForced(ctx context.Context, raw *string) *promptModelRef {
 	if raw == nil {
 		return fallbackModelRef()
@@ -111,7 +140,10 @@ func fallbackModelRef() *promptModelRef {
 
 // postPromptAsync POSTs the translated turn to OpenCode's own
 // prompt_async endpoint (§7: "POSTs prompt_async"). model is already
-// resolved (resolveModel) before this is called.
+// resolved (resolveModel for an ordinary dispatch, or resolveModelForced
+// for attemptCompactionRetry's own retry, session.go) before this is
+// called — nil is a legitimate value here (resolveModel's own "omit"
+// case), matching promptAsyncRequest.Model's own "model,omitempty" tag.
 //
 // cmd.PlanMode ("plan mode, web", §8.1) selects OpenCode's own
 // native "plan" agent via the request's "agent" field when true, omitted

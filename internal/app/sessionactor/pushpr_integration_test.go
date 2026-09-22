@@ -3,10 +3,13 @@
 package sessionactor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -384,6 +387,25 @@ func createProcessingTurn(ctx context.Context, t *testing.T, turns *narvipg.Turn
 	return created
 }
 
+// createProcessingTurnWithCorrelationID is createProcessingTurn's own
+// correlation-id-parameterized twin -- §7.3's own C4 audit fix needs a
+// turn whose OWN turns.correlation_id (migrations/000121) is set, set-once
+// at creation exactly like a real httpapi.CreateTurnCore call would, to
+// prove logProviderFailureDiagnostic reads THAT value rather than
+// whatever this Actor happened to be hydrated with.
+func createProcessingTurnWithCorrelationID(ctx context.Context, t *testing.T, turns *narvipg.TurnStore, sessionID pgtype.UUID, correlationID string) sqlcgen.Turn {
+	t.Helper()
+	created, err := turns.Create(ctx, sqlcgen.CreateTurnParams{
+		SessionID:     sessionID,
+		Status:        sqlcgen.TurnStatusProcessing,
+		CorrelationID: &correlationID,
+	})
+	if err != nil {
+		t.Fatalf("create processing turn with correlation id: %v", err)
+	}
+	return created
+}
+
 // sendSandboxEventForTest drives cmd through Actor.Send, exactly mirroring
 // TestHandleSandboxEvent_FullRoundTrip's own local `send` helper (this
 // file's own package-level copy, since Go test helpers are function-
@@ -408,14 +430,24 @@ func sendSandboxEventForTest(ctx context.Context, t *testing.T, a *Actor, cmd Sa
 // ExecutionComplete wire payload.
 func executionCompleteRaw(t *testing.T, sessionID string, gen int, outcome sandboxws.ExecutionCompleteOutcome) json.RawMessage {
 	t.Helper()
+	return executionCompleteRawWithDiagnostic(t, sessionID, gen, outcome, nil)
+}
+
+// executionCompleteRawWithDiagnostic is executionCompleteRaw's own sibling
+// for §7.3: marshals a real, schema-valid sandboxws.
+// ExecutionComplete wire payload carrying diagnostic (nil for none, the
+// SAME shape executionCompleteRaw above produces).
+func executionCompleteRawWithDiagnostic(t *testing.T, sessionID string, gen int, outcome sandboxws.ExecutionCompleteOutcome, diagnostic *sandboxws.ExecutionCompleteDiagnostic) json.RawMessage {
+	t.Helper()
 	messageID := uuid.NewString()
 	evt := sandboxws.ExecutionComplete{
-		Type:      "execution_complete",
-		MessageId: messageID,
-		SessionId: sessionID,
-		Gen:       gen,
-		AckId:     "execution_complete:" + messageID,
-		Outcome:   outcome,
+		Type:       "execution_complete",
+		MessageId:  messageID,
+		SessionId:  sessionID,
+		Gen:        gen,
+		AckId:      "execution_complete:" + messageID,
+		Outcome:    outcome,
+		Diagnostic: diagnostic,
 	}
 	raw, err := json.Marshal(evt)
 	if err != nil {
@@ -635,6 +667,593 @@ func TestHandleSandboxEvent_ExecutionCompleteFailed_NoPush(t *testing.T) {
 	}
 	if sessionRow.FailureReason == nil || *sessionRow.FailureReason != sqlcgen.SessionFailureReasonFailed {
 		t.Errorf("session.failure_reason = %v, want %q", sessionRow.FailureReason, sqlcgen.SessionFailureReasonFailed)
+	}
+}
+
+// TestHandleSandboxEvent_ExecutionCompleteFailed_DiagnosticSurvivesTheRealPostgresRoundTrip
+// is §7.3's own integration-level proof of the session-journal
+// half of "one record, in both surfaces": a REAL execution_complete
+// carrying a Diagnostic, appended through the REAL transact/appendRawEvent
+// path (actor.go) against a REAL Postgres instance (this file's own
+// testcontainers harness, newTestPool), is readable back from the
+// session's own event log byte-for-byte -- proving the diagnostic
+// actually survives the write+read round trip this adapter's own unit
+// tests (internal/adapters/outbound/opencode/diagnostic_test.go) cannot
+// exercise on their own, since they never touch a database at all.
+func TestHandleSandboxEvent_ExecutionCompleteFailed_DiagnosticSurvivesTheRealPostgresRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+
+	sessionID := createTestSessionWithRepos(ctx, t, pool, pgtype.UUID{},
+		"repo1", "https://github.com/acme/repo1.git", "feature-x")
+
+	sandboxStore := narvipg.NewSandboxStore(pool)
+	if _, err := sandboxStore.Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+
+	turnStore := narvipg.NewTurnStore(pool)
+	createProcessingTurn(ctx, t, turnStore, sessionID)
+
+	commander := &fakeSendCommander{}
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, commander, nil, "", nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	wantDiagnostic := &sandboxws.ExecutionCompleteDiagnostic{
+		Message:           strPtr("The upstream provider rejected this request."),
+		UnionMember:       strPtr("APIError"),
+		ProviderRequestId: strPtr("req_visible_public_abc123"),
+		Model:             strPtr("anthropic/claude-sonnet-4-5"),
+		RuntimeVersion:    strPtr("0.0.0-test"),
+		SandboxId:         strPtr("sbx-test-0001"),
+	}
+
+	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "execution_complete",
+		Gen:  1,
+		Raw:  executionCompleteRawWithDiagnostic(t, sessionID.String(), 1, sandboxws.ExecutionCompleteOutcomeFailed, wantDiagnostic),
+	})
+
+	waitUntil(t, 5*time.Second, func() bool {
+		got, err := turnStore.ListForSession(ctx, sessionID)
+		if err != nil || len(got) == 0 {
+			return false
+		}
+		return got[0].Status == sqlcgen.TurnStatusFailed
+	})
+
+	// The session journal itself (§7.3's own first surface): read the
+	// persisted raw event row back from Postgres exactly as any consumer
+	// of the session's own event log would (e.g. the WS client hub's
+	// replay-on-reconnect path, §6.2), and confirm the diagnostic is
+	// present byte-for-byte -- not re-derived, not a second copy, the
+	// SAME bytes appendRawEvent persisted from the wire payload above.
+	eventStore := narvipg.NewEventStore(pool)
+	events, err := eventStore.ListForSession(ctx, sessionID, 0, 100)
+	if err != nil {
+		t.Fatalf("ListForSession: %v", err)
+	}
+	var found *sandboxws.ExecutionComplete
+	for _, e := range events {
+		if e.Type != "execution_complete" {
+			continue
+		}
+		var evt sandboxws.ExecutionComplete
+		if err := json.Unmarshal(e.Payload, &evt); err != nil {
+			t.Fatalf("unmarshal persisted execution_complete: %v", err)
+		}
+		found = &evt
+	}
+	if found == nil {
+		t.Fatal("no execution_complete event found in the session's own journal")
+	}
+	if found.Diagnostic == nil {
+		t.Fatal("persisted execution_complete.Diagnostic = nil, want the diagnostic sent on the wire")
+	}
+	if got, want := found.Diagnostic.Message, wantDiagnostic.Message; got == nil || want == nil || *got != *want {
+		t.Errorf("persisted Diagnostic.Message = %v, want %v", got, want)
+	}
+	if got, want := found.Diagnostic.ProviderRequestId, wantDiagnostic.ProviderRequestId; got == nil || want == nil || *got != *want {
+		t.Errorf("persisted Diagnostic.ProviderRequestId = %v, want %v", got, want)
+	}
+	if got, want := found.Diagnostic.SandboxId, wantDiagnostic.SandboxId; got == nil || want == nil || *got != *want {
+		t.Errorf("persisted Diagnostic.SandboxId = %v, want %v", got, want)
+	}
+}
+
+// diagnosticFieldLogAttr maps every sandboxws.ExecutionCompleteDiagnostic
+// struct field name to the operator log attribute
+// logProviderFailureDiagnostic (pushpr.go) emits it under. F4's own
+// self-checking mechanism: the test below walks reflect.Type.Field over
+// the wire struct and requires an entry here for each one it finds, so a
+// field with no entry fails that test outright rather than silently
+// dropping out of the comparison -- exactly what happened to StatusCode
+// before this map existed (the comparison there used to enumerate six of
+// the struct's seven fields by hand, with nothing making that enumeration
+// exhaustive).
+var diagnosticFieldLogAttr = map[string]string{
+	"Message":           "diagnostic_message",
+	"UnionMember":       "diagnostic_union_member",
+	"StatusCode":        "diagnostic_status_code",
+	"ProviderRequestId": "diagnostic_provider_request_id",
+	"Model":             "diagnostic_model",
+	"RuntimeVersion":    "diagnostic_runtime_version",
+	"SandboxId":         "diagnostic_sandbox_id",
+}
+
+// diagnosticFieldString renders one ExecutionCompleteDiagnostic field's
+// own reflect.Value -- always a pointer type (every field in the struct
+// is *string or *int, matching ProviderFailureDiagnostic's own
+// allowlist-by-type discipline, internal/adapters/outbound/opencode/
+// diagnostic.go) -- as (formatted value, present). A nil pointer is "not
+// present", matching the wire's own omitempty semantics; fmt.Sprint on
+// the dereferenced value handles *string and *int identically, so this
+// needs no per-field-type branch and keeps working unchanged if a future
+// field is some other pointer-to-scalar type.
+func diagnosticFieldString(v reflect.Value) (string, bool) {
+	if v.Kind() != reflect.Pointer || v.IsNil() {
+		return "", false
+	}
+	return fmt.Sprint(v.Elem().Interface()), true
+}
+
+// logAttrString renders one decoded JSON log attribute (entry[key]) as
+// (formatted value, present) -- mirroring diagnosticFieldString's own
+// shape so the two sides of a comparison built from both stay symmetric.
+// JSON numbers decode to float64 through encoding/json's own
+// map[string]any convention (findLogEntry, planrecord_integration_test.go):
+// every diagnostic numeric field is a whole-number HTTP status, so
+// strconv.FormatFloat with 'f'/-1 precision renders "429", never
+// "429.000000" or the exponential form Go's default %v would pick for an
+// arbitrary bare float64.
+func logAttrString(entry map[string]any, key string) (string, bool) {
+	v, ok := entry[key]
+	if !ok {
+		return "", false
+	}
+	switch t := v.(type) {
+	case string:
+		return t, true
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64), true
+	default:
+		return fmt.Sprint(t), true
+	}
+}
+
+// TestHandleSandboxEvent_ExecutionCompleteFailed_OperatorLogReachesTheRealPathAndMatchesTheJournal
+// is §7.3's own C4 audit fix, proven three ways at once against a REAL
+// Postgres instance:
+//
+//  1. Reachability (C1): before this test existed, deleting
+//     completeProcessingTurn's own `logProviderFailureDiagnostic(...)`
+//     call site (pushpr.go) left every test in this package green --
+//     TestLogProviderFailureDiagnostic (pushpr_test.go) only ever calls
+//     that function directly, never through a real SandboxEvent. This
+//     test drives the real handleSandboxEvent path instead.
+//  2. The join key (C4): this Actor is hydrated (GetOrSpawn below) under
+//     a ctx carrying a DELIBERATELY WRONG correlation id
+//     ("hydrate-time-wrong-correlation-id") -- exactly the "whichever
+//     request first hydrated the Actor" value the confirmed finding says
+//     used to leak into this log line. The turn itself is seeded with
+//     its OWN, DIFFERENT correlation id (turns.correlation_id,
+//     migrations/000121), mirroring what a real httpapi.CreateTurnCore
+//     call sets at turn-creation time. The log line's own "correlation_id"
+//     attribute must read the TURN's value, never the hydration one --
+//     proving the join key actually points at the failing turn, not
+//     whatever request happened to spawn this Actor.
+//  3. "One record, in both surfaces" (§7.3), proven by comparing the two
+//     surfaces to EACH OTHER, not each independently against a shared Go
+//     literal (a reviewer's own explicit ask: two surfaces built from two
+//     separately-typed "same" literals can drift from each other while
+//     each still matches its own copy) -- the journal's own persisted
+//     execution_complete.Diagnostic (already proven to survive the
+//     Postgres round trip by the sibling test above) is decoded, the
+//     operator log line is parsed back out of its own JSON bytes, and
+//     every field is compared journal-value-to-log-value directly.
+func TestHandleSandboxEvent_ExecutionCompleteFailed_OperatorLogReachesTheRealPathAndMatchesTheJournal(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+
+	sessionID := createTestSessionWithRepos(ctx, t, pool, pgtype.UUID{},
+		"repo1", "https://github.com/acme/repo1.git", "feature-x")
+
+	sandboxStore := narvipg.NewSandboxStore(pool)
+	if _, err := sandboxStore.Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+
+	turnStore := narvipg.NewTurnStore(pool)
+	wantTurnCorrelationID := "corr-turn-own-" + uuid.NewString()
+	created := createProcessingTurnWithCorrelationID(ctx, t, turnStore, sessionID, wantTurnCorrelationID)
+
+	// Capture BEFORE hydration -- captureDefaultLoggerJSON's own doc
+	// comment (planrecord_integration_test.go) explains why: a.logger is
+	// resolved from slog.Default() exactly once, at hydrate time, and
+	// cached for this Actor's whole life.
+	logBuf := captureDefaultLoggerJSON(t)
+
+	commander := &fakeSendCommander{}
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, commander, nil, "", nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+
+	// Hydrate under a WRONG correlation id -- simulates whatever OTHER
+	// request first spawned this Actor (a Slack mention, an earlier turn
+	// entirely) being unrelated to the turn that is about to fail.
+	hydrateCtx := platform.WithCorrelationID(ctx, "hydrate-time-wrong-correlation-id")
+	a, err := r.GetOrSpawn(hydrateCtx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	// F4: StatusCode included here (the earlier version of this fixture
+	// omitted it) -- the field-by-field comparison below must exercise
+	// every field this diagnostic actually carries, StatusCode included,
+	// not six of its seven.
+	wantStatusCode := 429
+	wantDiagnostic := &sandboxws.ExecutionCompleteDiagnostic{
+		Message:           strPtr("The upstream provider rejected this request."),
+		UnionMember:       strPtr("APIError"),
+		StatusCode:        &wantStatusCode,
+		ProviderRequestId: strPtr("req_visible_public_abc123"),
+		Model:             strPtr("anthropic/claude-sonnet-4-5"),
+		RuntimeVersion:    strPtr("0.0.0-test"),
+		SandboxId:         strPtr("sbx-test-0001"),
+	}
+
+	// Sent (and later processed) with a plain, uncorrelated ctx -- proves
+	// the join key comes from the TURN row, not from any per-call ctx
+	// propagation (Actor.Send only uses its own ctx to bound the mailbox
+	// enqueue, never threading it into command handling -- actor.go).
+	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "execution_complete",
+		Gen:  1,
+		Raw:  executionCompleteRawWithDiagnostic(t, sessionID.String(), 1, sandboxws.ExecutionCompleteOutcomeFailed, wantDiagnostic),
+	})
+
+	waitUntil(t, 5*time.Second, func() bool {
+		got, err := turnStore.Get(ctx, created.ID)
+		return err == nil && got.Status == sqlcgen.TurnStatusFailed
+	})
+
+	// Surface 1: the session journal.
+	eventStore := narvipg.NewEventStore(pool)
+	events, err := eventStore.ListForSession(ctx, sessionID, 0, 100)
+	if err != nil {
+		t.Fatalf("ListForSession: %v", err)
+	}
+	var journal *sandboxws.ExecutionComplete
+	for _, e := range events {
+		if e.Type != "execution_complete" {
+			continue
+		}
+		var evt sandboxws.ExecutionComplete
+		if err := json.Unmarshal(e.Payload, &evt); err != nil {
+			t.Fatalf("unmarshal persisted execution_complete: %v", err)
+		}
+		journal = &evt
+	}
+	if journal == nil {
+		t.Fatal("no execution_complete event found in the session's own journal")
+	}
+	if journal.Diagnostic == nil {
+		t.Fatal("persisted execution_complete.Diagnostic = nil, want the diagnostic sent on the wire")
+	}
+
+	// Surface 2: the operator log -- reachability (finding 1 above): if
+	// logProviderFailureDiagnostic's own call site were ever deleted, this
+	// find fails outright rather than comparing against zero values.
+	entry := findLogEntry(t, logBuf, "sessionactor: turn failed with a provider-reported diagnostic")
+
+	// The join key (finding 2 above).
+	if got, ok := entry["correlation_id"].(string); !ok || got != wantTurnCorrelationID {
+		t.Errorf("operator log correlation_id = %v, want %q (the FAILING TURN's own persisted correlation id, "+
+			"not whatever request hydrated this Actor)", entry["correlation_id"], wantTurnCorrelationID)
+	}
+	if got, ok := entry["turn_id"].(string); !ok || got != created.ID.String() {
+		t.Errorf("operator log turn_id = %v, want %q", entry["turn_id"], created.ID.String())
+	}
+	if got, ok := entry["session_id"].(string); !ok || got != sessionID.String() {
+		t.Errorf("operator log session_id = %v, want %q", entry["session_id"], sessionID.String())
+	}
+	if _, ok := entry["message_id"].(string); !ok {
+		t.Errorf("operator log message_id missing or not a string: %v", entry["message_id"])
+	}
+
+	// Finding 3 (F4): compare the two surfaces to EACH OTHER, field by
+	// field -- never each against wantDiagnostic independently, which
+	// would pass even if the journal and the log had silently diverged
+	// from one another while each still happened to match the fixture.
+	//
+	// Driven by reflection over sandboxws.ExecutionCompleteDiagnostic
+	// itself, not a hand-enumerated field list: a hand-enumerated list
+	// silently stops covering a field the moment a new one is added to
+	// the wire type -- exactly what had already happened here once
+	// (statusCode had no entry in this comparison at all until this
+	// change). Walking diagType's own fields below and requiring a
+	// diagnosticFieldLogAttr entry (pushpr_test.go) for each turns that
+	// omission into a test FAILURE instead of a silent gap: a future
+	// field with no matching logProviderFailureDiagnostic case
+	// (pushpr.go) AND no entry in diagnosticFieldLogAttr fails this test
+	// outright, on the commit that adds the field, not on whatever later
+	// commit happens to notice the operator log is missing something.
+	diagType := reflect.TypeOf(sandboxws.ExecutionCompleteDiagnostic{})
+	journalVal := reflect.ValueOf(*journal.Diagnostic)
+	for i := 0; i < diagType.NumField(); i++ {
+		field := diagType.Field(i)
+		attr, ok := diagnosticFieldLogAttr[field.Name]
+		if !ok {
+			t.Fatalf("sandboxws.ExecutionCompleteDiagnostic gained a field %q with no entry in "+
+				"diagnosticFieldLogAttr (pushpr_test.go) -- add one (and a matching case to "+
+				"logProviderFailureDiagnostic, pushpr.go) so this comparison keeps covering every field",
+				field.Name)
+		}
+		journalStr, journalPresent := diagnosticFieldString(journalVal.Field(i))
+		logStr, logPresent := logAttrString(entry, attr)
+		switch {
+		case !journalPresent && !logPresent:
+			// Both surfaces agree the field is absent -- fine.
+		case journalPresent != logPresent:
+			t.Errorf("%s: journal_present=%v (%q) operator_log_present=%v (%q) -- one surface has this field, the other does not",
+				field.Name, journalPresent, journalStr, logPresent, logStr)
+		case journalStr != logStr:
+			t.Errorf("%s: journal=%q operator_log=%q -- the two §7.3 surfaces disagree", field.Name, journalStr, logStr)
+		}
+	}
+}
+
+// countLogEntriesForTest counts buf's own newline-delimited JSON log
+// lines whose "msg" field equals wantMsg -- findLogEntry's own sibling
+// (planrecord_integration_test.go), which returns only the FIRST match
+// and fails outright if there is none. This one is for proving a line
+// was emitted a SPECIFIC number of times (E6, below): zero is a valid,
+// non-fatal result here, unlike findLogEntry's.
+func countLogEntriesForTest(t *testing.T, buf *bytes.Buffer, wantMsg string) int {
+	t.Helper()
+	count := 0
+	for _, line := range bytes.Split(buf.Bytes(), []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal(line, &entry); err != nil {
+			t.Fatalf("unmarshal log line %q: %v", line, err)
+		}
+		if entry["msg"] == wantMsg {
+			count++
+		}
+	}
+	return count
+}
+
+// providerFailureDiagnosticLogMsg is the exact "msg" this file's own
+// completeProcessingTurn (pushpr.go) logs every provider-failure
+// diagnostic under -- named once here so the two tests below (and
+// TestHandleSandboxEvent_ExecutionCompleteFailed_OperatorLogReachesTheRealPathAndMatchesTheJournal
+// above) can never silently drift apart from each other on the literal
+// string.
+const providerFailureDiagnosticLogMsg = "sessionactor: turn failed with a provider-reported diagnostic"
+
+// TestHandleSandboxEvent_ExecutionCompleteFailed_DiagnosticLoggedEvenWithNoProcessingTurnFound
+// is E6's own pin for the FIRST of pushpr.go's two stated-but-previously-
+// unpinned invariants on the diagnostic log call site (completeProcessingTurn):
+// "Fires regardless of whether a Processing turn was actually found (`ok`
+// below) ... a late/redelivered execution_complete for a turn that
+// already finalized some other way must still be diagnosable, not
+// silently swallowed because this specific delivery no longer has a
+// Processing row to match."
+//
+// Reproduces TestHandleSandboxEvent_RedeliveredLateExecutionComplete_
+// RecordsFalseFailureOnce's own exact "already finalized by a real
+// turn_deadline fire" setup (opsmetrics_integration_test.go) -- the same,
+// already-proven way to genuinely reach completeProcessingTurn's own
+// `ok == false` branch -- then sends a LATE execution_complete carrying
+// outcome=Failed and a real diagnostic, and asserts the operator log line
+// still fires, with turn_id/correlation_id both absent (no Processing
+// turn to source them from) but session_id/message_id still present
+// (sourced off the wire event itself, unconditionally).
+//
+// Mutation-verified: wrapping pushpr.go's own diagnostic-logging block in
+// `if ok { ... }` makes this test fail with "no log line with msg ...
+// found", while TestHandleSandboxEvent_ExecutionCompleteFailed_
+// OperatorLogReachesTheRealPathAndMatchesTheJournal (the `ok == true`
+// case) stays green -- proving the two branches are independently
+// covered.
+func TestHandleSandboxEvent_ExecutionCompleteFailed_DiagnosticLoggedEvenWithNoProcessingTurnFound(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessionID := createTestSession(ctx, t, pool)
+
+	sandboxStore := narvipg.NewSandboxStore(pool)
+	if _, err := sandboxStore.Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+
+	timeouts := platform.DefaultTimeouts()
+	timeouts.TurnDeadline = 50 * time.Millisecond // tiny, injected -- not the real 60m default
+
+	turnStore := narvipg.NewTurnStore(pool)
+	created, err := turnStore.Create(ctx, sqlcgen.CreateTurnParams{
+		SessionID: sessionID,
+		Status:    sqlcgen.TurnStatusPending,
+	})
+	if err != nil {
+		t.Fatalf("create turn: %v", err)
+	}
+	dispatchedAt := time.Now().Add(-1 * time.Hour) // comfortably past the tiny deadline
+	if _, err := turnStore.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+		ID:           created.ID,
+		Status:       sqlcgen.TurnStatusProcessing,
+		DispatchedAt: pgtype.Timestamptz{Time: dispatchedAt, Valid: true},
+	}); err != nil {
+		t.Fatalf("move turn to processing: %v", err)
+	}
+
+	// Capture BEFORE hydration -- see captureDefaultLoggerJSON's own doc
+	// comment.
+	logBuf := captureDefaultLoggerJSON(t)
+
+	r, err := NewRegistry(ctx, pool, timeouts, nil, nil, nil, "", nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	// The real turn_deadline timer fires first, terminalizing the turn as
+	// Failed -- BEFORE any execution_complete ever arrives, exactly
+	// mirroring TestHandleSandboxEvent_RedeliveredLateExecutionComplete_
+	// RecordsFalseFailureOnce's own proven setup for reaching
+	// completeProcessingTurn's own `ok == false` branch.
+	if err := a.Send(ctx, TimerFired{Name: TimerTurnDeadline}); err != nil {
+		t.Fatalf("Send TimerFired turn_deadline: %v", err)
+	}
+	waitUntil(t, 5*time.Second, func() bool {
+		got, err := turnStore.Get(ctx, created.ID)
+		return err == nil && got.Status == sqlcgen.TurnStatusFailed
+	})
+
+	// The sandbox, unaware the control plane already gave up, genuinely
+	// finishes -- late -- and reports a real provider failure diagnostic.
+	// No Processing turn exists for this session any more.
+	wantDiagnostic := &sandboxws.ExecutionCompleteDiagnostic{
+		Message:     strPtr("The upstream provider rejected this request."),
+		UnionMember: strPtr("APIError"),
+		Model:       strPtr("anthropic/claude-sonnet-4-5"),
+	}
+	outcome := sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "execution_complete",
+		Gen:  1,
+		Raw:  executionCompleteRawWithDiagnostic(t, sessionID.String(), 1, sandboxws.ExecutionCompleteOutcomeFailed, wantDiagnostic),
+	})
+	if !outcome.Persisted {
+		t.Error("outcome.Persisted = false, want true (the raw event is always persisted, per this file's own top comment)")
+	}
+
+	entry := findLogEntry(t, logBuf, providerFailureDiagnosticLogMsg)
+	if _, present := entry["turn_id"]; present {
+		t.Errorf("operator log carries turn_id = %v, want it ABSENT -- no Processing turn was found for this delivery", entry["turn_id"])
+	}
+	if _, present := entry["correlation_id"]; present {
+		t.Errorf("operator log carries correlation_id = %v, want it ABSENT -- no Processing turn was found for this delivery", entry["correlation_id"])
+	}
+	if got, ok := entry["session_id"].(string); !ok || got != sessionID.String() {
+		t.Errorf("operator log session_id = %v, want %q -- unconditional, sourced off the wire event itself even with no Processing turn", entry["session_id"], sessionID.String())
+	}
+	if _, ok := entry["message_id"].(string); !ok {
+		t.Errorf("operator log message_id missing or not a string: %v -- unconditional, sourced off the wire event itself", entry["message_id"])
+	}
+}
+
+// TestHandleSandboxEvent_ExecutionCompleteFailed_DiagnosticLoggedOnEveryRedelivery
+// is E6's own pin for the SECOND of pushpr.go's two stated-but-previously-
+// unpinned invariants: "Logged unconditionally on every delivery of a
+// failed execution_complete (including a wire-level redelivery of an
+// already-processed one, unlike the turn_false_failure_total metric
+// below, which IS gated on `inserted`) -- this is an informational log
+// line, not a cardinality-sensitive counter, so a redundant line on
+// redelivery costs nothing."
+//
+// Sends the IDENTICAL raw execution_complete bytes (same messageID, so
+// appendRawEvent's own upsert-on-(session_id, message_id) sees the second
+// send as a genuine redelivery, Inserted == false, not a new event) TWICE
+// against a turn that stays genuinely Processing throughout, and asserts
+// the operator log line appears exactly TWICE -- once per delivery, never
+// gated the way the false-failure counter deliberately is.
+//
+// Mutation-verified: adding an `inserted` gate to pushpr.go's own
+// diagnostic-logging block (mirroring the false-failure gate immediately
+// below it) makes this test fail with "operator log line count = 1, want
+// 2", while TestHandleSandboxEvent_RedeliveredLateExecutionComplete_
+// RecordsFalseFailureOnce (which asserts the OPPOSITE for the counter)
+// stays green -- proving the log line and the counter are independently
+// gated exactly as documented.
+func TestHandleSandboxEvent_ExecutionCompleteFailed_DiagnosticLoggedOnEveryRedelivery(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessionID := createTestSession(ctx, t, pool)
+
+	sandboxStore := narvipg.NewSandboxStore(pool)
+	if _, err := sandboxStore.Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+
+	turnStore := narvipg.NewTurnStore(pool)
+	created := createProcessingTurn(ctx, t, turnStore, sessionID)
+
+	// Capture BEFORE hydration -- see captureDefaultLoggerJSON's own doc
+	// comment.
+	logBuf := captureDefaultLoggerJSON(t)
+
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	wantDiagnostic := &sandboxws.ExecutionCompleteDiagnostic{
+		Message:     strPtr("The upstream provider rejected this request."),
+		UnionMember: strPtr("APIError"),
+		Model:       strPtr("anthropic/claude-sonnet-4-5"),
+	}
+	// Minted ONCE -- never a fresh executionCompleteRawWithDiagnostic call
+	// per send, which would mint a DIFFERENT messageID and so a genuinely
+	// distinct event instead of a redelivery of this one (mirrors
+	// TestHandleSandboxEvent_RedeliveredLateExecutionComplete_
+	// RecordsFalseFailureOnce's own identical precedent).
+	raw := executionCompleteRawWithDiagnostic(t, sessionID.String(), 1, sandboxws.ExecutionCompleteOutcomeFailed, wantDiagnostic)
+
+	firstOutcome := sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "execution_complete",
+		Gen:  1,
+		Raw:  raw,
+	})
+	if !firstOutcome.Persisted {
+		t.Error("first delivery: outcome.Persisted = false, want true")
+	}
+	waitUntil(t, 5*time.Second, func() bool {
+		got, err := turnStore.Get(ctx, created.ID)
+		return err == nil && got.Status == sqlcgen.TurnStatusFailed
+	})
+	if got := countLogEntriesForTest(t, logBuf, providerFailureDiagnosticLogMsg); got != 1 {
+		t.Fatalf("operator log line count after the FIRST delivery = %d, want 1", got)
+	}
+
+	secondOutcome := sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "execution_complete",
+		Gen:  1,
+		Raw:  raw, // identical messageID -- a genuine wire-level redelivery.
+	})
+	if !secondOutcome.Persisted {
+		t.Error("redelivery: outcome.Persisted = false, want true (still persisted -- appendRawEvent's own upsert always succeeds)")
+	}
+
+	// sendSandboxEventForTest only returns once cmd.Reply has fired, and
+	// handleSandboxEvent sends that reply synchronously right after its
+	// own transact commits (sandboxevent.go's own doc comment) -- so by
+	// the time secondOutcome is in hand, whatever this redelivery did (or
+	// correctly did not do) to the log has already happened. No extra
+	// wait needed.
+	if got := countLogEntriesForTest(t, logBuf, providerFailureDiagnosticLogMsg); got != 2 {
+		t.Errorf("operator log line count after the REDELIVERED second delivery = %d, want 2 (logged unconditionally on every delivery, never gated on `inserted` the way turn_false_failure_total deliberately is)", got)
 	}
 }
 

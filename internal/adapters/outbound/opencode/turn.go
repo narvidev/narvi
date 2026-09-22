@@ -72,6 +72,37 @@ type turnState struct {
 	sawText            bool
 	sawToolCall        bool
 
+	// lastAssistantModel is the "providerID/modelID" display string
+	// (modelDisplayFromInfo, diagnostic.go) OpenCode itself reported on
+	// this turn's own MOST RECENT assistant message.updated — §7.3's own
+	// "the model that actually ran", sourced from the engine's report,
+	// never re-derived from this turn's own request. Set by
+	// setLastAssistantMessage, below, ATOMICALLY alongside
+	// lastAssistantError, from the identical message.updated event's own
+	// openCodeMessageInfo.
+	//
+	// NOT necessarily "the SAME message lastAssistantError came from" —
+	// an earlier revision of this comment claimed that, and modelForOutcome
+	// below used to gate on it (VERIFIED LIVE this was wrong for the
+	// ordinary failure path, see that method's own doc comment for the
+	// real captured ordering: the assistant message reporting the model
+	// arrives BEFORE session.error/session.idle, and that SAME message's
+	// own error field only arrives in a SECOND, later message.updated,
+	// too late for the live session.idle finalize to see it in
+	// lastAssistantError). This field is instead this turn's own running
+	// "last model OpenCode told us it used", independent of whether the
+	// most recent message.updated happened to carry an error too — see
+	// modelForOutcome for how that is reconciled with errorForOutcome's
+	// own lastAssistantError-vs-sessionError tie-break.
+	//
+	// "" when no assistant message.updated has been observed for this
+	// turn at all, OR the one that was carried no model info
+	// (modelDisplayFromInfo's own empty-half guard) — both honest
+	// "unknown", never a wrong guess. Reset to "" by clearErrorsForRetry
+	// at the start of every retry attempt, which is now load-bearing for
+	// correctness, not just hygiene — see that method's own doc comment.
+	lastAssistantModel string
+
 	// spentUSD is this turn's own running cost total (§7.1's own corrected
 	// text, §26.7) -- the accumulator §26.7's cost-budget
 	// mechanism assumed already existed (it did not, see
@@ -106,7 +137,7 @@ type turnState struct {
 	// (adapter.go) and either giving up or successfully re-dispatching the
 	// prompt — every dispatchEvent case that would otherwise corrupt this
 	// turnState's own tracked fields (markAssistantMessageID/
-	// setLastAssistantError/dispatchPart/finalize/setSessionError) with
+	// setLastAssistantMessage/dispatchPart/finalize/setSessionError) with
 	// compaction-INTERNAL SSE traffic checks isCompacting first and no-ops
 	// instead (see dispatchEvent's own doc comment, sse.go, and this
 	// Step's own VERIFIED LIVE finding: a synchronous POST /summarize call
@@ -297,10 +328,21 @@ func (ts *turnState) lastActivityTime() time.Time {
 	return ts.lastActivity
 }
 
-func (ts *turnState) setLastAssistantError(err *openCodeTaggedError) {
+// setLastAssistantMessage records ONE assistant message.updated event's own
+// error AND engine-reported model ATOMICALLY, from the SAME
+// openCodeMessageInfo — see lastAssistantModel's own field comment above
+// for why this must never be two separate calls (one setting the error,
+// one the model): that would let a later reader observe a torn pairing
+// where the error came from one message and the model from a different,
+// earlier one. Overwrites on every call, exactly like the error-only
+// setLastAssistantError this replaces did — the LAST assistant
+// message.updated observed before session.idle is the one
+// errorForOutcome/modelForOutcome below ultimately use.
+func (ts *turnState) setLastAssistantMessage(info openCodeMessageInfo) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
-	ts.lastAssistantError = err
+	ts.lastAssistantError = info.Error
+	ts.lastAssistantModel = modelDisplayFromInfo(info)
 }
 
 // markAssistantMessageID records messageID as belonging to an assistant
@@ -533,17 +575,40 @@ func (ts *turnState) attemptedRecoveryKind() recoveryKind {
 }
 
 // clearErrorsForRetry resets this turn's own tracked assistant/session
-// errors — called ONLY by Adapter.attemptCompactionRetry (adapter.go),
-// immediately after a successful forceCompaction and immediately before
-// re-dispatching the same prompt. CRITICAL: without this, a SUCCESSFUL
-// retry's own eventual session.idle would still see the STALE original
-// ContextOverflowError via errorForOutcome below and incorrectly finalize
-// the turn as failed even though the retry itself actually succeeded.
+// errors — called by BOTH of this turn's own recovery kinds immediately
+// before re-dispatching the same prompt: Adapter.attemptCompactionRetry
+// (adapter.go), right after a successful forceCompaction, and
+// Adapter.attemptTransientRetry, right after a first-time transient
+// APIError. CRITICAL: without this, a SUCCESSFUL retry's own eventual
+// session.idle would still see the STALE original error (a
+// ContextOverflowError or transient APIError) via errorForOutcome below
+// and incorrectly finalize the turn as failed even though the retry
+// itself actually succeeded.
 func (ts *turnState) clearErrorsForRetry() {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	ts.lastAssistantError = nil
 	ts.sessionError = nil
+	// lastAssistantModel is cleared alongside its own error, and this is
+	// NOW LOAD-BEARING FOR CORRECTNESS, not just hygiene (an earlier
+	// revision of this comment claimed the latter, back when
+	// modelForOutcome below only ever read lastAssistantModel while
+	// lastAssistantError was non-nil -- VERIFIED LIVE that guard was
+	// wrong for the ordinary failure path and was removed, see
+	// modelForOutcome's own doc comment). modelForOutcome now returns
+	// lastAssistantModel unconditionally, so WITHOUT this reset, a model
+	// recorded by the ORIGINAL, pre-retry attempt would survive into the
+	// RETRY's own window and get mis-attributed to any session-level
+	// error the retry itself produces before its own first assistant
+	// message.updated ever arrives (e.g. the retried postPromptAsync
+	// dispatch failing outright, or the retry's own model resolving to a
+	// DIFFERENT model than the original attempt used, resolveModel(Forced)'s
+	// own doc comment, session.go). This is the one guard against a stale
+	// per-message model leaking onto an unrelated error that remains
+	// after modelForOutcome stopped gating on lastAssistantError -- pinned
+	// by TestModelForOutcome_ClearedAfterRetryStartsBeforeNewAssistantMessage
+	// (modeloutcome_test.go).
+	ts.lastAssistantModel = ""
 }
 
 func (ts *turnState) markSawText() {
@@ -611,6 +676,62 @@ func (ts *turnState) errorForOutcome() *openCodeTaggedError {
 		return ts.lastAssistantError
 	}
 	return ts.sessionError
+}
+
+// modelForOutcome returns the engine-reported model (modelDisplayFromInfo,
+// diagnostic.go) OpenCode reported on this turn's own most recent
+// assistant message.updated (lastAssistantModel) — regardless of whether
+// errorForOutcome above ultimately resolves to that SAME message's own
+// lastAssistantError, or falls back to sessionError instead.
+//
+// An earlier revision of this method gated the return on
+// "ts.lastAssistantError != nil" — i.e. only reported the model when
+// errorForOutcome's own tie-break picked the assistant-message branch.
+// VERIFIED LIVE (pinned OpenCode 1.17.15 binary, a genuine 401 APIError
+// against an invalid provider key, 3/3 trials, reproduced again separately
+// against a real "model not found" session-level error) that this is
+// wrong for the ordinary provider-failure path — the real event ordering
+// is:
+//
+//	message.updated  role=assistant  modelID/providerID SET, error ABSENT
+//	session.error    APIError
+//	session.idle                       <- finalize reads *ForOutcome HERE
+//	message.updated  role=assistant  error=APIError (same message, now late)
+//	session.idle
+//
+// At the live session.idle finalize point, lastAssistantError is still nil
+// (the error-bearing message.updated has not arrived yet) — so
+// errorForOutcome correctly falls back to sessionError for the error text,
+// but the OLD gate on lastAssistantError made this method return "" even
+// though lastAssistantModel already held the right answer, discarding a
+// value the adapter had genuinely already learned. See
+// TestRealOrdering_ModelSurvivesLateArrivingAssistantError
+// (realbinarycapture_test.go) for the byte-for-byte pinned replay of this
+// exact captured trace, and modeloutcome_test.go for the turnState-level
+// table covering every case below.
+//
+// The new rule: report lastAssistantModel whenever one was genuinely
+// recorded for this turn, regardless of which branch produced the error;
+// return "" only when no assistant message.updated was ever observed for
+// this turn (the one case the OLD comment's own example,
+// ProviderModelNotFoundError, actually describes: a session-level
+// session.error with no assistant message created at all — VERIFIED LIVE
+// separately, a real "Model not found" session.error with no preceding
+// assistant message.updated) — or when the one assistant message this
+// turn did see carried no model info at all
+// (modelDisplayFromInfo's own empty-half guard). Both are the SAME
+// lastAssistantModel zero value, both honest "unknown".
+//
+// clearErrorsForRetry resets lastAssistantModel to "" at the start of
+// every retry attempt — see that method's own doc comment for why that
+// reset is what now guards against a STALE, pre-retry model being
+// attributed to a session-level error the retry itself produces before
+// its own first assistant message.updated arrives; this method no longer
+// guards against that case itself.
+func (ts *turnState) modelForOutcome() string {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	return ts.lastAssistantModel
 }
 
 func (ts *turnState) outcomeInputs() (hasText, hasToolCall bool) {

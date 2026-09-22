@@ -61,7 +61,7 @@ const (
 
 func newLivenessAdapter(t *testing.T, fake *fakeOpenCodeServer) *Adapter {
 	t.Helper()
-	a := New(fake.URL(), livenessSSEInactivityTimeout, livenessReconnectInterval, livenessRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(fake.URL(), livenessSSEInactivityTimeout, livenessReconnectInterval, livenessRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 	return a
 }
@@ -121,7 +121,7 @@ func textPartJSON(t *testing.T, id, messageID, text string) json.RawMessage {
 // prematurely -- the exact bug this batch fixes.
 func TestWaitForTurn_ReconnectWinsRaceAgainstFallback(t *testing.T) {
 	fake := newFakeOpenCodeServer(t)
-	a := New(fake.URL(), reconnectRaceSSEInactivityTimeout, reconnectRaceReconnectInterval, livenessRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(fake.URL(), reconnectRaceSSEInactivityTimeout, reconnectRaceReconnectInterval, livenessRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	connectCtx, connectCancel := context.WithTimeout(context.Background(), testWait)
@@ -306,6 +306,121 @@ func TestWaitForTurn_GenuinelyStuckTurnStillFallsBackWithinOriginalTimeout(t *te
 	if final.Outcome != sandboxws.ExecutionCompleteOutcomeCompleted {
 		t.Errorf("execution_complete.Outcome = %q, want %q (via the fallback's own final-message fetch)",
 			final.Outcome, sandboxws.ExecutionCompleteOutcomeCompleted)
+	}
+}
+
+// TestWaitForTurn_GenuinelyStuckTurnFallbackFailureCarriesDiagnostic is an
+// audit fix (§7.3, C1): finalizeByFallback (adapter.go) has its OWN,
+// SEPARATE call site that builds ProviderFailureDiagnostic --
+// `outcome.Diagnostic = a.buildProviderFailureDiagnostic(last.Info.Error,
+// ts)` -- reached only via the SSE-inactivity fallback's own final-message
+// fetch, never by dispatchEvent's live "session.idle" case
+// (transientretry_test.go's own TestTransientRetry_PermanentAPIErrorNeverRetried
+// covers THAT one). Before this test existed, deleting finalizeByFallback's
+// own call site left every test in this package green: nothing exercised a
+// genuine provider failure observed through the fallback's own final-state
+// fetch specifically. Mirrors
+// TestWaitForTurn_GenuinelyStuckTurnStillFallsBackWithinOriginalTimeout's
+// own exact scaffolding (heartbeats keep the connection looking alive;
+// session.idle for this turn is never sent; the fallback's own fetch is
+// the only thing that can possibly produce this turn's own terminal
+// event) but with the fetched message's own info.error set to a real,
+// permanent (non-retryable) APIError instead of a plain text reply.
+func TestWaitForTurn_GenuinelyStuckTurnFallbackFailureCarriesDiagnostic(t *testing.T) {
+	fake := newFakeOpenCodeServer(t)
+	a := newLivenessAdapter(t, fake)
+
+	connectCtx, connectCancel := context.WithTimeout(context.Background(), testWait)
+	defer connectCancel()
+	if err := a.Connected(connectCtx); err != nil {
+		t.Fatalf("Connected() error = %v", err)
+	}
+	<-fake.connected
+
+	stopHeartbeats := make(chan struct{})
+	var hbGroup errgroup.Group
+	hbGroup.Go(func() error {
+		ticker := time.NewTicker(livenessReconnectInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				fake.broadcast(sseLine(t, "server.heartbeat", struct{}{}))
+			case <-stopHeartbeats:
+				return nil
+			}
+		}
+	})
+	defer func() {
+		close(stopHeartbeats)
+		_ = hbGroup.Wait()
+	}()
+
+	statusCode := 503
+	fake.setMessages([]messageListEntry{{
+		Info: openCodeMessageInfo{
+			ID:   "msg_1",
+			Role: "assistant",
+			Error: &openCodeTaggedError{
+				Name: "APIError",
+				Data: &openCodeErrorData{
+					Message:    "the fallback's own fetch observed this permanent failure",
+					StatusCode: &statusCode,
+				},
+			},
+			// ModelID/ProviderID: the ENGINE's own report of which model
+			// produced this message -- audit fix (§7.3, A2): this is the
+			// ONLY source ProviderFailureDiagnostic.Model now reads from
+			// (diagnostic.go), precisely because cmd.Model below is nil
+			// (see its own comment) and the wire request correctly omits
+			// the "model" field entirely on that path (resolveModel,
+			// session.go) -- there is no request-side model to fall back
+			// to here, by design, so this field is the only way this test
+			// can prove Model still populates on the default,
+			// no-model-requested configuration.
+			ModelID:    "claude-sonnet-4-5",
+			ProviderID: "anthropic",
+		},
+	}})
+
+	collector := &eventCollector{}
+	// No modelId (the default configuration, C2) -- see
+	// TestTransientRetry_PermanentAPIErrorNeverRetried's own identical
+	// choice for why.
+	cmd := sandboxws.Prompt{Type: "prompt", MessageId: "m1", SessionId: "sess-1", Gen: 1, Text: "hi"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), testWait)
+	defer cancel()
+
+	if _, err := a.StartTurn(ctx, cmd, collector.sink, nil); err != nil {
+		t.Fatalf("StartTurn() error = %v", err)
+	}
+
+	final := lastExecutionComplete(t, collector.snapshot())
+	if final.Outcome != sandboxws.ExecutionCompleteOutcomeFailed {
+		t.Fatalf("execution_complete.Outcome = %q, want %q (via the fallback's own final-message fetch)",
+			final.Outcome, sandboxws.ExecutionCompleteOutcomeFailed)
+	}
+	if final.Diagnostic == nil {
+		t.Fatal("execution_complete.Diagnostic = nil, want the allowlisted provider-failure record " +
+			"(finalizeByFallback's own call site, adapter.go, was never reached)")
+	}
+	if final.Diagnostic.UnionMember == nil || *final.Diagnostic.UnionMember != "APIError" {
+		t.Errorf("Diagnostic.UnionMember = %v, want %q", final.Diagnostic.UnionMember, "APIError")
+	}
+	if final.Diagnostic.Message == nil || *final.Diagnostic.Message != "the fallback's own fetch observed this permanent failure" {
+		t.Errorf("Diagnostic.Message = %v, want the fetched message's own error text", final.Diagnostic.Message)
+	}
+	if final.Diagnostic.StatusCode == nil || *final.Diagnostic.StatusCode != statusCode {
+		t.Errorf("Diagnostic.StatusCode = %v, want %d", final.Diagnostic.StatusCode, statusCode)
+	}
+	// audit fix (§7.3, A2): Model comes from the fetched message's own
+	// engine-reported ModelID/ProviderID above, NOT from cmd.Model (nil
+	// here) or any request-side resolution -- proving this default,
+	// no-model-requested configuration still gets a real, accurate Model
+	// on the diagnostic, sourced the correct way.
+	if want := "anthropic/claude-sonnet-4-5"; final.Diagnostic.Model == nil || *final.Diagnostic.Model != want {
+		t.Errorf("Diagnostic.Model = %v, want %q (the fetched message's own engine-reported model)", final.Diagnostic.Model, want)
 	}
 }
 

@@ -145,7 +145,8 @@ func TestHandlePrompt_RunsFullSubstitutionChainInOrder(t *testing.T) {
 	timeouts := platform.DefaultTimeouts()
 	adapter := opencode.New(fakeOC.srv.URL, timeouts.SSEInactivityTimeout,
 		timeouts.OpenCodeSSEReconnectInterval, timeouts.OpenCodeRequestTimeout,
-		timeouts.OpenCodeSummarizeTimeout, timeouts.OpenCodeTransientRetryBackoff)
+		timeouts.OpenCodeSummarizeTimeout, timeouts.OpenCodeTransientRetryBackoff,
+		"0.0.0-test", "sbx-test-0001")
 	t.Cleanup(adapter.Close)
 
 	const liveBudgetURL = "http://127.0.0.1:19999/review-cost-budget"

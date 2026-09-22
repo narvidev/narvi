@@ -506,3 +506,83 @@ func TestTaskInputSubAgentType(t *testing.T) {
 		})
 	}
 }
+
+// childAssistantMessageWithModelAndErrorJSON is F5's own regression
+// fixture for the child (sub-task) session's own message.updated: unlike
+// every other child-session assistant fixture in this file (e.g.
+// TestDispatchTool_TaskSubtask_StartsAndTagsNestedEvents's own
+// {"id":"msg_child_asst","role":"assistant"} literal above -- no model, no
+// provider, no error, degenerate exactly where dispatchEvent's own
+// `if subTaskID == ""` gate (sse.go's "message.updated" case) matters),
+// this one carries a model DIFFERENT from the main lane's own AND a real
+// tagged error. Reachable, not hypothetical: reviewsubagents.go's own
+// counterReviewerAgentEntry pins a counter-reviewer sub-agent to its own
+// model, so a child session genuinely running on a different model than
+// the main agent is real production traffic in this codebase.
+func childAssistantMessageWithModelAndErrorJSON(sessionID string) []byte {
+	return []byte(`{"sessionID":"` + sessionID + `","info":{"id":"msg_child_asst","role":"assistant",` +
+		`"modelID":"child-only-model","providerID":"child-only-provider",` +
+		`"error":{"name":"APIError","data":{"message":"child sub-agent's own provider failure","statusCode":401,"isRetryable":false}}}}`)
+}
+
+// TestDispatchTool_TaskSubtask_ChildModelAndErrorDoNotLeakIntoEnclosingDiagnostic
+// is F5's own regression test for the widened `subTaskID == ""` gate
+// (dispatchEvent's "message.updated" case, sse.go) guarding
+// ts.setLastAssistantMessage -- the ONE call site that sets
+// lastAssistantModel/lastAssistantError, which modelForOutcome/
+// errorForOutcome (turn.go) feed straight into this turn's own §7.3
+// diagnostic. Deleting that gate outright leaves the rest of this
+// package's own suite green, because the only OTHER child-session
+// assistant fixture in this file carries neither a model nor an error --
+// nothing to leak even if the gate vanished. This test exercises the gate
+// for real: the child's own message.updated carries a DIFFERENT model AND
+// a genuine APIError, and the enclosing turn's own modelForOutcome/
+// errorForOutcome must still report the MAIN lane's own values,
+// completely unaffected by what the child session emits.
+//
+// Mutation-verified: deleting the `if subTaskID == ""` guard around
+// ts.setLastAssistantMessage(props.Info) (sse.go's "message.updated" case,
+// so it runs unconditionally for the main lane AND every sub-task lane
+// alike) makes this test fail with
+// modelForOutcome() = "child-only-provider/child-only-model", want
+// "main-only-provider/main-only-model" -- while
+// TestDispatchTool_TaskSubtask_StartsAndTagsNestedEvents (this file)
+// stays green throughout, exactly proving the "degenerate fixture" gap
+// this test closes.
+func TestDispatchTool_TaskSubtask_ChildModelAndErrorDoNotLeakIntoEnclosingDiagnostic(t *testing.T) {
+	a := newDispatchTestAdapter(t)
+	sink, _ := spyEventSink(t)
+
+	cmd := sandboxws.Prompt{SessionId: testSessionID, Gen: 1}
+	ts := newTurnState(cmd, sink)
+	a.registerTurn(testTaskMainSessionID, ts)
+
+	// The MAIN lane's own assistant message: a real model, no error --
+	// this is what the enclosing turn's own diagnostic must keep
+	// reporting no matter what the child session below goes on to emit.
+	a.dispatchEvent(sseEnvelope{
+		Type: "message.updated",
+		Properties: []byte(`{"sessionID":"` + testTaskMainSessionID + `","info":{"id":"msg_main_asst","role":"assistant",` +
+			`"modelID":"main-only-model","providerID":"main-only-provider"}}`),
+	})
+
+	// Start the sub-task (registers the child session for routing, exactly
+	// like TestDispatchTool_TaskSubtask_StartsAndTagsNestedEvents above).
+	a.dispatchEvent(sseEnvelope{Type: "message.part.updated", Properties: taskRunningPartJSON("call_task_f5")})
+
+	// The child's own assistant message: a DIFFERENT model, and a real
+	// tagged error -- exactly what F5 warns must never leak into the
+	// enclosing turn's own diagnostic.
+	a.dispatchEvent(sseEnvelope{
+		Type:       "message.updated",
+		Properties: childAssistantMessageWithModelAndErrorJSON(testTaskChildSessionID),
+	})
+
+	wantModel := "main-only-provider/main-only-model"
+	if got := ts.modelForOutcome(); got != wantModel {
+		t.Errorf("modelForOutcome() = %q, want %q -- the child sub-agent's own model must never leak into the enclosing turn's diagnostic", got, wantModel)
+	}
+	if err := ts.errorForOutcome(); err != nil {
+		t.Errorf("errorForOutcome() = %+v, want nil -- the child sub-agent's own error must never leak into the enclosing turn's diagnostic", err)
+	}
+}

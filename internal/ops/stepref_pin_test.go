@@ -61,6 +61,7 @@ var stepRefPins = []stepRefPin{
 	{"docs/DECISIONS.md", "163", "sandbox provider selection"},
 	{"docs/DECISIONS.md", "167", "the boundary: RuntimeClass, fail-closed"},
 	{"docs/DECISIONS.md", "171", "sandbox-agent must not run git against a runtime-owned `.git`"},
+	{"docs/DECISIONS.md", "177", "a provider failure names its union member and nothing that locates it"},
 	{"docs/guides/README.md", "64", "plan mode: follow-up intent classification (amend vs answer)"},
 	{"docs/guides/README.md", "77", "ops"},
 	{"docs/guides/README.md", "78", "launch readiness"},

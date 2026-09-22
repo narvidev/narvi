@@ -489,6 +489,18 @@ type ExecutionComplete struct {
 	// Deterministic ackId = 'execution_complete:{messageId}' (§6.1).
 	AckId string `json:"ackId" yaml:"ackId" mapstructure:"ackId"`
 
+	// §7.3 ("a retry decision is not a diagnosis"): the allowlisted, size-capped
+	// provider-failure record retained when outcome is "failed" AND the agent runtime
+	// (OpenCode) reported a real tagged-union error -- absent for every other
+	// outcome, and absent even for a failed outcome when no such error was ever
+	// observed (e.g. a turn that produced no output at all). Every property is
+	// OPTIONAL: OpenCode is free to omit any of these from its own error payload, and
+	// not every tagged-union member defines all of them. NEVER an input to any
+	// retry/classification decision -- that stays on OpenCode's own typed
+	// discriminator alone; this object exists purely for a human (or an operator's
+	// own correlation-id-scoped diagnostic path) to read once retries are exhausted.
+	Diagnostic *ExecutionCompleteDiagnostic `json:"diagnostic,omitempty,omitzero" yaml:"diagnostic,omitempty" mapstructure:"diagnostic,omitempty"`
+
 	// Gen corresponds to the JSON schema field "gen".
 	Gen int `json:"gen" yaml:"gen" mapstructure:"gen"`
 
@@ -512,6 +524,53 @@ type ExecutionComplete struct {
 
 	// Type corresponds to the JSON schema field "type".
 	Type string `json:"type" yaml:"type" mapstructure:"type"`
+}
+
+// §7.3 ("a retry decision is not a diagnosis"): the allowlisted, size-capped
+// provider-failure record retained when outcome is "failed" AND the agent runtime
+// (OpenCode) reported a real tagged-union error -- absent for every other outcome,
+// and absent even for a failed outcome when no such error was ever observed (e.g.
+// a turn that produced no output at all). Every property is OPTIONAL: OpenCode is
+// free to omit any of these from its own error payload, and not every tagged-union
+// member defines all of them. NEVER an input to any retry/classification decision
+// -- that stays on OpenCode's own typed discriminator alone; this object exists
+// purely for a human (or an operator's own correlation-id-scoped diagnostic path)
+// to read once retries are exhausted.
+type ExecutionCompleteDiagnostic struct {
+	// OpenCode's own human-readable error message, size-capped. Never the raw
+	// provider response body -- that is where credentials and prompt content live,
+	// and is never retained at all.
+	Message *string `json:"message,omitempty,omitzero" yaml:"message,omitempty" mapstructure:"message,omitempty"`
+
+	// "providerID/modelID" this turn actually dispatched with. Sourced from the agent
+	// runtime's own dispatch record, never from OpenCode's error payload.
+	Model *string `json:"model,omitempty,omitzero" yaml:"model,omitempty" mapstructure:"model,omitempty"`
+
+	// An identifier that locates this request with whoever operates the failing
+	// endpoint, extracted from a small, named, priority-ordered allowlist of
+	// response-header keys (x-request-id, request-id, cf-ray -- never the full
+	// headers map, which is where credentials can also live). Not guaranteed to be
+	// the upstream provider's own application-level request id: a real provider
+	// APIError has been observed carrying none of its own (its response body's own
+	// request_id null), with only cf-ray -- Cloudflare's edge-level per-request
+	// identifier -- present; when a provider's own request id IS present under one of
+	// the other two header names, that one wins.
+	ProviderRequestId *string `json:"providerRequestId,omitempty,omitzero" yaml:"providerRequestId,omitempty" mapstructure:"providerRequestId,omitempty"`
+
+	// The pinned OpenCode binary version this sandbox actually ran -- the same value
+	// the boot fingerprint records.
+	RuntimeVersion *string `json:"runtimeVersion,omitempty,omitzero" yaml:"runtimeVersion,omitempty" mapstructure:"runtimeVersion,omitempty"`
+
+	// The sandbox this turn ran on.
+	SandboxId *string `json:"sandboxId,omitempty,omitzero" yaml:"sandboxId,omitempty" mapstructure:"sandboxId,omitempty"`
+
+	// The HTTP status OpenCode itself already decoded from the upstream provider,
+	// when present. Corroborating detail only.
+	StatusCode *int `json:"statusCode,omitempty,omitzero" yaml:"statusCode,omitempty" mapstructure:"statusCode,omitempty"`
+
+	// OpenCode's own tagged-union error-kind name, e.g. "APIError" -- purely
+	// descriptive, never itself a classification input.
+	UnionMember *string `json:"unionMember,omitempty,omitzero" yaml:"unionMember,omitempty" mapstructure:"unionMember,omitempty"`
 }
 
 type ExecutionCompleteOutcome string

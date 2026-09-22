@@ -333,13 +333,51 @@ func translateSubTaskFinish(cmd sandboxws.Prompt, subTaskID string, outcome sand
 func translateExecutionComplete(cmd sandboxws.Prompt, out turnOutcome, subTaskID string) sandboxws.ExecutionComplete {
 	messageID := newEventID()
 	return sandboxws.ExecutionComplete{
-		Type:      "execution_complete",
-		MessageId: messageID,
-		SessionId: cmd.SessionId,
-		Gen:       cmd.Gen,
-		AckId:     "execution_complete:" + messageID,
-		Outcome:   out.Outcome,
-		Reason:    sandboxws.ExecutionCompleteReason(out.Reason),
-		SubTaskId: sandboxws.ExecutionCompleteSubTaskId(subTaskIDPtr(subTaskID)),
+		Type:       "execution_complete",
+		MessageId:  messageID,
+		SessionId:  cmd.SessionId,
+		Gen:        cmd.Gen,
+		AckId:      "execution_complete:" + messageID,
+		Outcome:    out.Outcome,
+		Reason:     sandboxws.ExecutionCompleteReason(out.Reason),
+		SubTaskId:  sandboxws.ExecutionCompleteSubTaskId(subTaskIDPtr(subTaskID)),
+		Diagnostic: diagnosticToWire(out.Diagnostic),
 	}
+}
+
+// diagnosticToWire converts §7.3's own internal, allowlisted
+// ProviderFailureDiagnostic (diagnostic.go) into the generated wire type
+// -- the ONLY function in this package that ever constructs a
+// sandboxws.ExecutionCompleteDiagnostic, so there is exactly one place
+// that could ever populate the wire shape, and it reads named fields off
+// ProviderFailureDiagnostic one at a time rather than copying anything
+// wholesale. nil in, nil out: an absent diagnostic (no tagged-union error
+// was ever observed for this failure) stays entirely absent on the wire
+// (the field's own "omitempty" -- see ExecutionComplete.Diagnostic,
+// sandboxws.go), never an empty object.
+func diagnosticToWire(d *ProviderFailureDiagnostic) *sandboxws.ExecutionCompleteDiagnostic {
+	if d == nil {
+		return nil
+	}
+	return &sandboxws.ExecutionCompleteDiagnostic{
+		Message:           emptyStringToNilPtr(d.Message),
+		UnionMember:       emptyStringToNilPtr(d.UnionMember),
+		StatusCode:        d.StatusCode,
+		ProviderRequestId: emptyStringToNilPtr(d.ProviderRequestID),
+		Model:             emptyStringToNilPtr(d.Model),
+		RuntimeVersion:    emptyStringToNilPtr(d.RuntimeVersion),
+		SandboxId:         emptyStringToNilPtr(d.SandboxID),
+	}
+}
+
+// emptyStringToNilPtr mirrors subTaskIDPtr's own identical "empty string
+// becomes a nil pointer" convention (above) -- every
+// ProviderFailureDiagnostic string field is "" when OpenCode/this adapter
+// never supplied a value, and the wire type's own "omitempty" only omits
+// a nil pointer, never a non-nil pointer to an empty string.
+func emptyStringToNilPtr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }

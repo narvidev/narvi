@@ -185,6 +185,20 @@ type Adapter struct {
 	// instantly without a short pause first.
 	transientRetryBackoff time.Duration
 
+	// runtimeVersion/sandboxID are §7.3's own ("a retry decision is
+	// not a diagnosis") two adapter-side facts a provider-failure
+	// diagnostic (diagnostic.go) needs and OpenCode's own error payload
+	// never carries: runtimeVersion is the pinned OpenCode binary version
+	// this sandbox actually ran (opencodeproc.Result.Version, best-effort
+	// — "" when undiscoverable — sourced identically to §7's own boot
+	// fingerprint, cmd/sandbox-agent/main.go's own postSpawnFingerprint);
+	// sandboxID is the sandbox this turn ran on
+	// (SessionConfig.SandboxId). Both set once, at construction, and
+	// never mutated — read-only from every goroutine thereafter, exactly
+	// like baseURL/capabilityRestricted above.
+	runtimeVersion string
+	sandboxID      string
+
 	mu               sync.Mutex
 	currentSessionID string
 
@@ -277,6 +291,16 @@ var _ ports.AgentRuntime = (*Adapter)(nil)
 // wait before re-dispatching after a first-time transient APIError — see
 // that field's own doc comment above for why this, unlike the compaction
 // retry, needs a backoff at all.
+// runtimeVersion/sandboxID (§7.3) are threaded straight onto the
+// Adapter fields of the same name — see those fields' own doc comment for
+// what each is and where a real caller sources it
+// (cmd/sandbox-agent/main.go: opencodeproc.Result.Version and
+// SessionConfig.SandboxId respectively). Neither is validated non-empty
+// here: an empty value is a legitimate, honest zero value (e.g. a
+// best-effort version discovery that failed) and simply renders as an
+// absent field on ProviderFailureDiagnostic (omitempty), never a
+// placeholder string.
+//
 // capabilityRestricted (§17.2) is a trailing, variadic bool
 // parameter -- so every EXISTING caller (cmd/sandbox-agent/main.go's own
 // production wiring, this package's own newAdapter(t) test helper) keeps
@@ -284,7 +308,7 @@ var _ ports.AgentRuntime = (*Adapter)(nil)
 // change of its own; only the ONE real caller that needs true (cmd/
 // sandbox-agent/main.go, threading SessionConfig.CapabilityRestricted)
 // supplies it explicitly.
-func New(baseURL string, sseInactivityTimeout, reconnectInterval, requestTimeout, summarizeTimeout, transientRetryBackoff time.Duration, capabilityRestricted ...bool) *Adapter {
+func New(baseURL string, sseInactivityTimeout, reconnectInterval, requestTimeout, summarizeTimeout, transientRetryBackoff time.Duration, runtimeVersion, sandboxID string, capabilityRestricted ...bool) *Adapter {
 	bgCtx, cancel := context.WithCancel(context.Background())
 
 	restricted := false
@@ -301,6 +325,8 @@ func New(baseURL string, sseInactivityTimeout, reconnectInterval, requestTimeout
 		requestTimeout:        requestTimeout,
 		summarizeTimeout:      summarizeTimeout,
 		transientRetryBackoff: transientRetryBackoff,
+		runtimeVersion:        runtimeVersion,
+		sandboxID:             sandboxID,
 		pollInterval:          sseInactivityTimeout / ssePollDivisor,
 		turns:                 make(map[string]*turnState),
 		subtaskSessions:       make(map[string]subtaskSession),
@@ -498,6 +524,19 @@ func (a *Adapter) StartTurn(ctx context.Context, cmd sandboxws.Prompt, sink port
 	a.registerTurn(sessionID, ts)
 	defer a.unregisterTurn(sessionID)
 
+	// resolveModel (session.go), NOT resolveModelForced: cmd.Model is
+	// genuinely optional on prompt_async's own wire shape
+	// (promptAsyncRequest.Model, types.go), and a nil cmd.Model (the
+	// default configuration every one of Composer/PlanModeView/Timeline
+	// resume/DecisionInbox dispatches through, web/src/session) must
+	// reach OpenCode with the "model" field OMITTED, letting the engine
+	// apply its own configured default — never a Narvi-side substitute of
+	// its own (§7.3; internal/app/workflowengine/advance.go states this
+	// same rule for modelID/effort's own session-row fallback). Which
+	// model actually ran is recovered a different way, from the engine's
+	// own report on the resulting assistant message, not by forcing one
+	// onto the request here — see ProviderFailureDiagnostic.Model's own
+	// doc comment (diagnostic.go).
 	model := a.resolveModel(ctx, (*string)(cmd.Model))
 	if err := a.postPromptAsync(ctx, sessionID, cmd, model); err != nil {
 		if ctx.Err() != nil {
@@ -790,7 +829,28 @@ func (a *Adapter) finalizeByFallback(ctx context.Context, sessionID string, ts *
 
 	last := entries[len(entries)-1]
 	hasText, hasToolCall := partsHaveOutput(last.Parts)
-	a.finalizeOrRecoverFromOverflow(sessionID, ts, deriveOutcome(last.Info.Error, hasText, hasToolCall), last.Info.Error, preFetchActivity)
+	outcome := deriveOutcome(last.Info.Error, hasText, hasToolCall)
+	// §7.3: built here, not inside deriveOutcome itself, since only this
+	// Adapter-receiver call site has runtimeVersion/sandboxID in scope —
+	// see turnOutcome.Diagnostic's own doc comment (outcome.go) for why
+	// deriveOutcome stays pure. Model comes from THIS SAME last message's
+	// own engine-reported ModelID/ProviderID (modelDisplayFromInfo,
+	// diagnostic.go) -- last.Info.Error and last.Info.ModelID/ProviderID
+	// are read off the identical messageListEntry, so the model reported
+	// here can never belong to some OTHER message than the one whose
+	// error it is being attached to. Gated on outcome.Outcome == Failed --
+	// mirrors dispatchEvent's own identical gate (sse.go) exactly, for the
+	// identical reason: last.Info.Error can be a MessageAbortedError too
+	// (the fallback's own final-message fetch observing a Stop that
+	// landed before session.idle ever arrived), and deriveOutcome maps
+	// that to Outcome: Cancelled -- a cancellation is not a provider
+	// failure, and the wire schema's own diagnostic description says
+	// "absent for every other outcome" (contracts/sandbox-ws/v1/
+	// events.schema.json).
+	if outcome.Outcome == sandboxws.ExecutionCompleteOutcomeFailed {
+		outcome.Diagnostic = a.buildProviderFailureDiagnostic(last.Info.Error, modelDisplayFromInfo(last.Info))
+	}
+	a.finalizeOrRecoverFromOverflow(sessionID, ts, outcome, last.Info.Error, preFetchActivity)
 }
 
 // finalizeOrRecoverFromOverflow implements §7.2's own "one retry, inside
@@ -939,7 +999,14 @@ func (a *Adapter) finalizeOrRecoverFromOverflow(sessionID string, ts *turnState,
 		}
 		slog.Warn("opencode: retried prompt also failed, finalizing as failed",
 			"sessionID", sessionID, "reason", reason)
-		a.finalize(ts, turnOutcome{Outcome: outcome.Outcome, Reason: &reason})
+		// Diagnostic carried forward from outcome (§7.3) --
+		// outcome is THIS session.idle's own freshly-derived outcome (the
+		// retried prompt's own failure, not the original one), so its own
+		// Diagnostic already describes whichever error just fired. Only
+		// Reason is rebuilt here (to note a retry already happened);
+		// Diagnostic must survive unchanged, per turnOutcome.Diagnostic's
+		// own doc comment (outcome.go).
+		a.finalize(ts, turnOutcome{Outcome: outcome.Outcome, Reason: &reason, Diagnostic: outcome.Diagnostic})
 
 	case overflowActionBeginRetry:
 		if kind == recoveryKindTransientAPI {
@@ -1124,7 +1191,15 @@ func (a *Adapter) attemptCompactionRetry(ctx context.Context, sessionID string, 
 		reason := enrichReasonForFailedRecovery(originalOutcome.Reason, fmt.Sprintf("forceCompaction: %v", compactionErr))
 		slog.Error("opencode: compaction attempt failed, finalizing with the original overflow error",
 			"sessionID", sessionID, "error", compactionErr)
-		a.finalize(ts, turnOutcome{Outcome: originalOutcome.Outcome, Reason: &reason})
+		// Diagnostic carried forward from originalOutcome (§7.3): clearErrorsForRetry was never reached on this branch
+		// (forceCompaction itself failed, before the retry prompt was
+		// ever dispatched), so ts's own current error state still holds
+		// the ORIGINAL overflow -- but only originalOutcome, captured
+		// BEFORE this attempt began, carries that error's own diagnostic.
+		// Rebuilding turnOutcome{} here without it would silently drop
+		// the one record §7.3 requires at exactly the moment ("retries
+		// exhausted") it matters most.
+		a.finalize(ts, turnOutcome{Outcome: originalOutcome.Outcome, Reason: &reason, Diagnostic: originalOutcome.Diagnostic})
 		return
 	}
 
@@ -1219,7 +1294,11 @@ func (a *Adapter) attemptCompactionRetry(ctx context.Context, sessionID string, 
 		reason := enrichReasonForFailedRecovery(originalOutcome.Reason, fmt.Sprintf("retry postPromptAsync: %v", err))
 		slog.Error("opencode: retry prompt dispatch failed, finalizing with the original overflow error",
 			"sessionID", sessionID, "error", err)
-		a.finalize(ts, turnOutcome{Outcome: originalOutcome.Outcome, Reason: &reason})
+		// Diagnostic carried forward from originalOutcome (§7.3) -- see attemptCompactionRetry's own identical
+		// compactionErr-branch comment above for why originalOutcome,
+		// not ts's own current (cleared) error state, is the right
+		// source here too.
+		a.finalize(ts, turnOutcome{Outcome: originalOutcome.Outcome, Reason: &reason, Diagnostic: originalOutcome.Diagnostic})
 		return
 	}
 
@@ -1293,7 +1372,12 @@ func (a *Adapter) attemptTransientRetry(ctx context.Context, sessionID string, t
 		reason := enrichReasonForFailedTransientRetry(originalOutcome.Reason, fmt.Sprintf("backoff wait: %v", waitErr))
 		slog.Error("opencode: transient-error retry backoff wait was interrupted, finalizing with the original error",
 			"sessionID", sessionID, "error", waitErr)
-		a.finalize(ts, turnOutcome{Outcome: originalOutcome.Outcome, Reason: &reason})
+		// Diagnostic carried forward from originalOutcome (§7.3) -- see attemptCompactionRetry's own identical
+		// compactionErr-branch comment (above, this file) for why the
+		// PRE-attempt outcome, not ts's own current error state, is the
+		// right source: no retry was ever dispatched on this branch
+		// either (the backoff wait itself was interrupted).
+		a.finalize(ts, turnOutcome{Outcome: originalOutcome.Outcome, Reason: &reason, Diagnostic: originalOutcome.Diagnostic})
 		return
 	}
 
@@ -1358,7 +1442,11 @@ func (a *Adapter) attemptTransientRetry(ctx context.Context, sessionID string, t
 		reason := enrichReasonForFailedTransientRetry(originalOutcome.Reason, fmt.Sprintf("retry postPromptAsync: %v", err))
 		slog.Error("opencode: retry prompt dispatch failed, finalizing with the original transient error",
 			"sessionID", sessionID, "error", err)
-		a.finalize(ts, turnOutcome{Outcome: originalOutcome.Outcome, Reason: &reason})
+		// Diagnostic carried forward from originalOutcome (§7.3) -- see attemptCompactionRetry's own identical
+		// compactionErr-branch comment (above, this file) for why the
+		// PRE-attempt outcome, not ts's own current (cleared) error
+		// state, is the right source here too.
+		a.finalize(ts, turnOutcome{Outcome: originalOutcome.Outcome, Reason: &reason, Diagnostic: originalOutcome.Diagnostic})
 		return
 	}
 

@@ -27,7 +27,7 @@ import (
 // not by inference.
 func TestStartTurn_OnConversationIDReporter_FiresBeforeTurnCompletes(t *testing.T) {
 	fake := newFakeOpenCodeServer(t)
-	a := New(fake.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(fake.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	connectCtx, connectCancel := context.WithTimeout(context.Background(), testWait)

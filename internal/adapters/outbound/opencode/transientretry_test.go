@@ -2,6 +2,7 @@ package opencode
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -40,6 +41,49 @@ func apiErrorMessageUpdated(t *testing.T, sessionID, messageID string, retryable
 	})
 }
 
+// apiErrorMessageUpdatedWithModelJSONTemplate is the SAME real
+// message.updated bytes realbinarycapture_test.go's own
+// capturedAssistantMessageUpdatedWithErrorJSON captures (a genuine 401
+// APIError against an invalid provider credential, pinned OpenCode
+// 1.17.15, including the real responseHeaders/responseBody/metadata
+// shape) -- templated with %[n] positional verbs for the five values
+// apiErrorMessageUpdatedWithModel's own callers each control (sessionID,
+// messageID, retryable, providerID, modelID). Every OTHER key, and the
+// real key SET itself, is the identical literal structure captured live,
+// not reconstructed via this package's own openCodeMessageInfo/
+// openCodeErrorData struct literals -- see sseLineRaw's own doc comment
+// (realbinarycapture_test.go) for why that distinction is the whole point
+// (E2): a fixture built by marshaling the SAME struct that later decodes
+// it can never catch a wrong JSON tag, and this helper's own two callers
+// (TestTransientRetry_PermanentAPIErrorNeverRetried,
+// TestTransientRetry_RetryDispatchFailsIsNeverRetriedAgain) are exactly
+// the tests that assert ProviderFailureDiagnostic.Model came from THIS
+// payload's own modelID/providerID keys.
+//
+// statusCode/responseHeaders/responseBody/metadata stay fixed at the real
+// captured 401 values regardless of the retryable param below -- neither
+// varies with them in production either (isRetryable is OpenCode's own
+// independent verdict, openCodeErrorData's own doc comment, types.go),
+// and no caller of this helper asserts on those fields, so hardcoding the
+// one real capture this package actually has is strictly more realistic
+// than the old struct-literal version's leaving them entirely unset.
+const apiErrorMessageUpdatedWithModelJSONTemplate = `{"sessionID":%[1]q,"info":{"id":%[2]q,"parentID":"msg_0c904ce000013WrZ9O6KEEiDYZ","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/workspace","root":"/"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"modelID":%[5]q,"providerID":%[4]q,"time":{"created":1790078930544,"completed":1790078931960},"sessionID":%[1]q,"error":{"name":"APIError","data":{"message":"API key is invalid.","statusCode":401,"isRetryable":%[3]t,"responseHeaders":{"cf-cache-status":"DYNAMIC","cf-ray":"a3f1328d4e1be195-MRS","connection":"keep-alive","content-length":"106","content-security-policy":"default-src 'none'; frame-ancestors 'none'","content-type":"application/json","date":"Tue, 22 Sep 2026 12:08:52 GMT","server":"cloudflare","x-robots-tag":"none"},"responseBody":"{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"API key is invalid.\"},\"request_id\":null}","metadata":{"url":"https://api.anthropic.com/v1/messages"}}}}}`
+
+// apiErrorMessageUpdatedWithModel mirrors apiErrorMessageUpdated above, but
+// also plants the engine-reported ModelID/ProviderID openCodeMessageInfo
+// now carries (§7.3, A2) -- used by tests that specifically assert
+// ProviderFailureDiagnostic.Model, to prove it is sourced from the
+// message's OWN reported model, never from cmd.Model or any request-side
+// resolution. Built from apiErrorMessageUpdatedWithModelJSONTemplate's own
+// captured real bytes (E2), broadcast via sseLineRaw so the production
+// json.Unmarshal path is what actually decodes it, not a struct-to-struct
+// round trip.
+func apiErrorMessageUpdatedWithModel(t *testing.T, sessionID, messageID string, retryable bool, providerID, modelID string) string {
+	t.Helper()
+	raw := fmt.Sprintf(apiErrorMessageUpdatedWithModelJSONTemplate, sessionID, messageID, retryable, providerID, modelID)
+	return sseLineRaw(t, "message.updated", raw)
+}
+
 // TestTransientRetry_SucceedsAfterTransientAPIError proves the full round
 // trip for the "transient -> retried" table case this Step's own
 // instructions require: a transient (isRetryable=true) APIError on the
@@ -52,7 +96,7 @@ func apiErrorMessageUpdated(t *testing.T, sessionID, messageID string, retryable
 func TestTransientRetry_SucceedsAfterTransientAPIError(t *testing.T) {
 	f := newFakeOpenCodeServer(t)
 
-	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	connCtx, connCancel := context.WithTimeout(context.Background(), testWait)
@@ -144,10 +188,24 @@ func TestTransientRetry_SucceedsAfterTransientAPIError(t *testing.T) {
 // APIError with isRetryable=false must finalize as Failed on the FIRST
 // occurrence, with no retry attempt at all -- classification happens on the
 // typed field alone, never a substring of any error text.
+//
+// Also this package's own §7.3 reachability + default-configuration proof
+// (audit fix, C1/C2): cmd below never sets Model at all -- the SAME "no
+// modelId" shape Composer/PlanModeView/Timeline resume/DecisionInbox all
+// dispatch by default (web/src/session) -- and this is the FIRST occurrence
+// of the error (dispatchEvent's own "session.idle" case, sse.go:289, the
+// live call site that builds ProviderFailureDiagnostic in production; no
+// retry machinery is involved at all for a permanent APIError). Before
+// this fix: deleting sse.go's own `outcome.Diagnostic =
+// a.buildProviderFailureDiagnostic(err, ts)` line left every existing test
+// in this package green, and even with that line intact,
+// ProviderFailureDiagnostic.Model read "" on exactly this default,
+// no-modelId path -- §7.3's own first-named-missing fact ("not the model
+// that ran") stayed missing. Both are pinned below.
 func TestTransientRetry_PermanentAPIErrorNeverRetried(t *testing.T) {
 	f := newFakeOpenCodeServer(t)
 
-	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	connCtx, connCancel := context.WithTimeout(context.Background(), testWait)
@@ -174,7 +232,14 @@ func TestTransientRetry_PermanentAPIErrorNeverRetried(t *testing.T) {
 
 	waitForTurnRegistered(t, a, "ses_fake")
 
-	f.broadcast(apiErrorMessageUpdated(t, "ses_fake", "msg_original", false))
+	// apiErrorMessageUpdatedWithModel, not the bare apiErrorMessageUpdated:
+	// cmd.Model is never set on this turn (the default configuration), so
+	// the wire request correctly omits "model" entirely (resolveModel,
+	// session.go, §7.3 A1) -- this planted ModelID/ProviderID is the ONLY
+	// source left for ProviderFailureDiagnostic.Model to read from (A2),
+	// simulating OpenCode itself picking its own configured default and
+	// reporting it back on the resulting assistant message.
+	f.broadcast(apiErrorMessageUpdatedWithModel(t, "ses_fake", "msg_original", false, "anthropic", "claude-sonnet-4-5"))
 	f.broadcast(sessionIdleLine(t, "ses_fake"))
 
 	if err := group.Wait(); err != nil {
@@ -193,12 +258,56 @@ func TestTransientRetry_PermanentAPIErrorNeverRetried(t *testing.T) {
 		t.Errorf("execution_complete.Reason = %q, want it to name APIError", reason)
 	}
 
+	// §7.3: the diagnostic must actually be reached in production (C1) --
+	// deleting sse.go's own call site leaves this nil -- and, on this
+	// DEFAULT, no-modelId configuration, Model must name the model the
+	// ENGINE itself reported for this message (A2), never "".
+	if final.Diagnostic == nil {
+		t.Fatal("execution_complete.Diagnostic = nil, want the allowlisted provider-failure record " +
+			"(sse.go's own dispatchEvent call site was never reached)")
+	}
+	if final.Diagnostic.UnionMember == nil || *final.Diagnostic.UnionMember != "APIError" {
+		t.Errorf("Diagnostic.UnionMember = %v, want %q", final.Diagnostic.UnionMember, "APIError")
+	}
+	wantModel := "anthropic/claude-sonnet-4-5"
+	if final.Diagnostic.Model == nil || *final.Diagnostic.Model != wantModel {
+		t.Errorf("Diagnostic.Model = %v, want %q (the message's own engine-reported model, even though "+
+			"cmd.Model was never set on this turn -- the default configuration every real client "+
+			"dispatches through) -- a wrong or empty Model here is §7.3's own headline fact still missing",
+			final.Diagnostic.Model, wantModel)
+	}
+	if final.Diagnostic.RuntimeVersion == nil || *final.Diagnostic.RuntimeVersion != testRuntimeVersion {
+		t.Errorf("Diagnostic.RuntimeVersion = %v, want %q", final.Diagnostic.RuntimeVersion, testRuntimeVersion)
+	}
+	if final.Diagnostic.SandboxId == nil || *final.Diagnostic.SandboxId != testSandboxID {
+		t.Errorf("Diagnostic.SandboxId = %v, want %q", final.Diagnostic.SandboxId, testSandboxID)
+	}
+
 	// No retry: exactly the original dispatch, nothing more.
 	if got := f.promptCallCount(); got != 1 {
 		t.Errorf("promptCallCount = %d, want exactly 1 (a permanent APIError must never be retried)", got)
 	}
 	if got := f.summarizeCallCount(); got != 0 {
 		t.Errorf("summarizeCallCount = %d, want exactly 0", got)
+	}
+
+	// audit fix (§7.3, A1): the wire request itself must OMIT "model"
+	// entirely on this default, no-modelId configuration -- restoring
+	// origin/main's own behavior (resolveModel, session.go), which an
+	// earlier version of this package regressed by forcing
+	// resolveModelForced's own fallback onto EVERY dispatch, changing
+	// which model every default turn actually ran on in production. The
+	// diagnostic's own Model above is populated a different way (the
+	// engine's own report), so there is no longer any reason -- and no
+	// longer any correct behavior -- for this adapter to invent a model
+	// on the wire just to know one afterward.
+	f.mu.Lock()
+	promptModel := f.lastPromptModel
+	f.mu.Unlock()
+	if promptModel != nil {
+		t.Errorf("fake server's own prompt_async request carried model=%+v, want the field omitted "+
+			"entirely (cmd.Model was nil) -- forcing one changes PRODUCTION behavior on every default "+
+			"turn just to populate a diagnostic string", promptModel)
 	}
 }
 
@@ -211,7 +320,7 @@ func TestTransientRetry_PermanentAPIErrorNeverRetried(t *testing.T) {
 func TestTransientRetry_RetryAlsoFailsFinalizesFailedExactlyOnce(t *testing.T) {
 	f := newFakeOpenCodeServer(t)
 
-	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	connCtx, connCancel := context.WithTimeout(context.Background(), testWait)
@@ -307,10 +416,18 @@ func TestTransientRetry_RetryAlsoFailsFinalizesFailedExactlyOnce(t *testing.T) {
 // exactly one attempt regardless of how that one attempt itself fails,
 // so a crashed local OpenCode process is surfaced as a failure, never
 // silently hidden behind a retry loop.
+//
+// Also §7.3's own reachability proof for adapter.go's attemptTransientRetry's
+// own `a.finalize(ts, turnOutcome{..., Diagnostic: originalOutcome.Diagnostic})`
+// call in this exact branch -- audit fix (C1), the SIBLING of
+// TestCompactionRetry_RetryPostPromptAsyncFails' own identical addition
+// (compactionretry_test.go) -- see retrydiagnostic_test.go's own corrected
+// doc comment for why these two tests, not that file, are where this pair
+// of reconstruction sites is actually covered.
 func TestTransientRetry_RetryDispatchFailsIsNeverRetriedAgain(t *testing.T) {
 	f := newFakeOpenCodeServer(t)
 
-	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	connCtx, connCancel := context.WithTimeout(context.Background(), testWait)
@@ -344,7 +461,12 @@ func TestTransientRetry_RetryDispatchFailsIsNeverRetriedAgain(t *testing.T) {
 	waitForCount(t, "promptCallCount", f.promptCallCount, 1)
 	f.setPromptAsyncOK(false)
 
-	f.broadcast(apiErrorMessageUpdated(t, "ses_fake", "msg_original", true))
+	// apiErrorMessageUpdatedWithModel, not the bare apiErrorMessageUpdated:
+	// cmd.Model is never set on this turn, so the wire request correctly
+	// omits "model" (resolveModel, session.go, §7.3 A1) -- this planted
+	// ModelID/ProviderID is the ONLY source left for
+	// ProviderFailureDiagnostic.Model, matching the assertion below.
+	f.broadcast(apiErrorMessageUpdatedWithModel(t, "ses_fake", "msg_original", true, "anthropic", "claude-sonnet-4-5"))
 	f.broadcast(sessionIdleLine(t, "ses_fake"))
 
 	waitForCount(t, "promptCallCount", f.promptCallCount, 2)
@@ -369,6 +491,30 @@ func TestTransientRetry_RetryDispatchFailsIsNeverRetriedAgain(t *testing.T) {
 	}
 	if !strings.Contains(reason, "retry postPromptAsync") {
 		t.Errorf("execution_complete.Reason = %q, want it to name retry postPromptAsync as the failed step", reason)
+	}
+
+	// §7.3: the ORIGINAL transient error's own Diagnostic must survive
+	// this reconstruction -- attemptTransientRetry rebuilds a fresh
+	// turnOutcome{} here (only Reason is enriched), and
+	// turnOutcome.Diagnostic's own doc comment (outcome.go) requires every
+	// such reconstruction to carry Diagnostic forward unchanged. Model
+	// comes from the ORIGINAL message's own engine-reported
+	// ModelID/ProviderID above, not from cmd.Model (never set on this
+	// turn) or any request-side resolution.
+	if final.Diagnostic == nil {
+		t.Fatal("execution_complete.Diagnostic = nil, want the ORIGINAL transient error's own diagnostic carried forward")
+	}
+	if final.Diagnostic.UnionMember == nil || *final.Diagnostic.UnionMember != "APIError" {
+		t.Errorf("Diagnostic.UnionMember = %v, want %q", final.Diagnostic.UnionMember, "APIError")
+	}
+	if want := "anthropic/claude-sonnet-4-5"; final.Diagnostic.Model == nil || *final.Diagnostic.Model != want {
+		t.Errorf("Diagnostic.Model = %v, want %q (the original message's own engine-reported model)", final.Diagnostic.Model, want)
+	}
+	if final.Diagnostic.RuntimeVersion == nil || *final.Diagnostic.RuntimeVersion != testRuntimeVersion {
+		t.Errorf("Diagnostic.RuntimeVersion = %v, want %q", final.Diagnostic.RuntimeVersion, testRuntimeVersion)
+	}
+	if final.Diagnostic.SandboxId == nil || *final.Diagnostic.SandboxId != testSandboxID {
+		t.Errorf("Diagnostic.SandboxId = %v, want %q", final.Diagnostic.SandboxId, testSandboxID)
 	}
 
 	// No summarize call (this failure class forces no compaction), and no
@@ -398,7 +544,7 @@ func TestTransientRetry_SharesOneShotBudgetWithCompactionRetry(t *testing.T) {
 	f := newFakeOpenCodeServer(t)
 	f.setSummarizeOK(true) // would succeed if (wrongly) called at all
 
-	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	connCtx, connCancel := context.WithTimeout(context.Background(), testWait)
@@ -526,7 +672,7 @@ func TestCompactionRetry_SharesOneShotBudgetWithTransientRetry(t *testing.T) {
 	closeGate := func() { closeGateOnce.Do(func() { close(gate) }) }
 	t.Cleanup(closeGate)
 
-	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	connCtx, connCancel := context.WithTimeout(context.Background(), testWait)
@@ -625,5 +771,101 @@ func TestCompactionRetry_SharesOneShotBudgetWithTransientRetry(t *testing.T) {
 	}
 	if got := f.promptCallCount(); got != 2 {
 		t.Errorf("promptCallCount = %d, want exactly 2 (original + the one compaction retry, no more)", got)
+	}
+}
+
+// TestTransientRetry_NilModelOmitsWireModelFieldOnRetryDispatch is E3's own
+// pin: attemptTransientRetry's own re-dispatch (adapter.go) must resolve
+// its model via resolveModel, NOT resolveModelForced, exactly like
+// StartTurn's own original dispatch does (pinned separately by
+// TestStartTurn_NilModelOmitsWireModelField, starturn_failure_test.go) --
+// on this turn's default, no-modelId configuration, the RETRY's own wire
+// prompt_async request must still OMIT "model" entirely, not silently
+// install a Narvi-side fallback the client never asked for just because
+// this particular dispatch happens to be a retry.
+//
+// A LATER audit's own finding: an earlier version of this fix corrected
+// StartTurn's own call site (line ~540, adapter.go) but left
+// attemptTransientRetry's own IDENTICAL call (line ~1399) reading
+// resolveModelForced -- swapping THAT one site back to resolveModelForced
+// passed this package's entire suite, because no existing test dispatched
+// a transient-retry re-dispatch with cmd.Model nil and then inspected the
+// RETRY's own wire request specifically (TestTransientRetry_
+// PermanentAPIErrorNeverRetried, which does check f.lastPromptModel,
+// never retries at all -- a permanent APIError finalizes on the FIRST
+// dispatch). This test targets exactly that gap.
+//
+// Mutation-verified: swapping adapter.go's own
+// `model := a.resolveModel(ctx, (*string)(ts.cmd.Model))` inside
+// attemptTransientRetry back to resolveModelForced makes this test fail
+// with `fake server's own RETRY prompt_async request carried
+// model=&{ProviderID:anthropic ModelID:claude-sonnet-4-5}` (fallbackModel,
+// session.go), while TestStartTurn_NilModelOmitsWireModelField (the OTHER
+// call site's own pin) stays green, proving the two sites are
+// independently guarded.
+func TestTransientRetry_NilModelOmitsWireModelFieldOnRetryDispatch(t *testing.T) {
+	f := newFakeOpenCodeServer(t)
+
+	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
+	t.Cleanup(a.Close)
+
+	connCtx, connCancel := context.WithTimeout(context.Background(), testWait)
+	defer connCancel()
+	if err := a.Connected(connCtx); err != nil {
+		t.Fatalf("Connected() error = %v", err)
+	}
+	waitForConnNumber(t, f, 1)
+
+	collector := &eventCollector{}
+	// Model deliberately left unset -- the default configuration every
+	// real client dispatches through (Composer/PlanModeView/Timeline
+	// resume/DecisionInbox, web/src/session).
+	cmd := sandboxws.Prompt{
+		Type: "prompt", MessageId: "m1", SessionId: "sess-transient-nilmodel-1", Gen: 1,
+		Text: "do something that will hit a transient provider blip",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), testWait)
+	defer cancel()
+
+	var group errgroup.Group
+	group.Go(func() error {
+		_, err := a.StartTurn(ctx, cmd, collector.sink, nil)
+		return err
+	})
+
+	ts := waitForTurnRegistered(t, a, "ses_fake")
+
+	// The original turn's own assistant message reports a transient
+	// APIError (no model planted -- irrelevant to this test, which only
+	// cares about the wire REQUEST, never the diagnostic), then goes idle.
+	f.broadcast(apiErrorMessageUpdated(t, "ses_fake", "msg_original", true))
+	f.broadcast(sessionIdleLine(t, "ses_fake"))
+
+	// Wait for the RETRY's own prompt_async call to actually land server-
+	// side before inspecting f.lastPromptModel -- mirrors this file's own
+	// established waitForCount precedent exactly (e.g.
+	// TestTransientRetry_SucceedsAfterTransientAPIError above).
+	waitForCount(t, "promptCallCount", f.promptCallCount, 2)
+
+	f.mu.Lock()
+	retryPromptModel := f.lastPromptModel
+	f.mu.Unlock()
+	if retryPromptModel != nil {
+		t.Errorf("fake server's own RETRY prompt_async request carried model=%+v, want the field omitted "+
+			"entirely (cmd.Model was nil) -- attemptTransientRetry's own re-dispatch must resolve its model "+
+			"via resolveModel, not resolveModelForced, exactly like StartTurn's own original dispatch does",
+			retryPromptModel)
+	}
+
+	// Let the retry complete cleanly so the turn finalizes and this test
+	// doesn't leak a goroutine waiting on group.Wait() below.
+	waitForNotCompacting(t, f, ts)
+	f.broadcast(plainAssistantMessageUpdated(t, "ses_fake", "msg_retry"))
+	f.broadcast(assistantTextPart(t, "ses_fake", "msg_retry", "prt_retry", "all good now"))
+	f.broadcast(sessionIdleLine(t, "ses_fake"))
+
+	if err := group.Wait(); err != nil {
+		t.Fatalf("StartTurn() error = %v", err)
 	}
 }
