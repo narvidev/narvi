@@ -498,12 +498,30 @@ func (a *Adapter) StartTurn(ctx context.Context, cmd sandboxws.Prompt, sink port
 	// it visible to the SSE dispatch goroutine, which would need its own
 	// lock (turnState.model's own doc comment, turn.go, explains exactly
 	// why this ordering is what makes an unsynchronized read of it safe).
-	// This is the SAME resolveModel call StartTurn always made — only
-	// moved earlier and reused below instead of called a second time.
-	// resolveModel needs no sessionID (session.go's own signature), so
-	// this reordering relative to resolveSession changes nothing about
-	// which OpenCode HTTP calls are made, only when.
-	model := a.resolveModel(ctx, (*string)(cmd.Model))
+	// This is the SAME resolveModelForced call StartTurn always made —
+	// only moved earlier and reused below instead of called a second
+	// time. resolveModelForced needs no sessionID (session.go's own
+	// signature), so this reordering relative to resolveSession is NOT
+	// free of effect on which OpenCode HTTP calls are made, only one
+	// case narrower than "changes nothing... only when" would claim: when
+	// cmd.Model names a concrete "provider/model" AND resolveSession then
+	// fails, this ordering now issues one GET /api/model catalog call
+	// that the pre-reorder code never made at all (the old code called
+	// resolveModel strictly AFTER a successful resolveSession, so a
+	// resolveSession failure short-circuited before ever reaching it).
+	// Accepted deliberately, not fixed by re-ordering back: ts must be
+	// constructed before resolveSession's own first return path (Finding
+	// 5, below), and turnState.model must be set at construction, from a
+	// value already known, to stay lock-free-readable for the SSE
+	// dispatch goroutine (turnState.model's own doc comment, turn.go) —
+	// so resolveModelForced genuinely cannot move any later than this
+	// without either field losing that guarantee. The extra call only
+	// ever happens on an already-failing path (resolveSession itself
+	// failed), never on the common success path this reordering exists
+	// for, and its own result is discarded on that path regardless (see
+	// the resolveSession failure branch below, which finalizes with no
+	// Diagnostic at all — a local transport failure, not a provider one).
+	model := a.resolveModelForced(ctx, (*string)(cmd.Model))
 
 	// Created up front, before resolveSession is ever called, so EVERY
 	// subsequent return path below — including the very first one — has
@@ -832,8 +850,18 @@ func (a *Adapter) finalizeByFallback(ctx context.Context, sessionID string, ts *
 	// §7.3: built here, not inside deriveOutcome itself, since
 	// only this Adapter-receiver call site has runtimeVersion/sandboxID
 	// (and ts.model) in scope — see turnOutcome.Diagnostic's own doc
-	// comment (outcome.go) for why deriveOutcome stays pure.
-	outcome.Diagnostic = a.buildProviderFailureDiagnostic(last.Info.Error, ts)
+	// comment (outcome.go) for why deriveOutcome stays pure. Gated on
+	// outcome.Outcome == Failed -- mirrors dispatchEvent's own identical
+	// gate (sse.go) exactly, for the identical reason: last.Info.Error can
+	// be a MessageAbortedError too (the fallback's own final-message fetch
+	// observing a Stop that landed before session.idle ever arrived), and
+	// deriveOutcome maps that to Outcome: Cancelled -- a cancellation is
+	// not a provider failure, and the wire schema's own diagnostic
+	// description says "absent for every other outcome" (contracts/
+	// sandbox-ws/v1/events.schema.json).
+	if outcome.Outcome == sandboxws.ExecutionCompleteOutcomeFailed {
+		outcome.Diagnostic = a.buildProviderFailureDiagnostic(last.Info.Error, ts)
+	}
 	a.finalizeOrRecoverFromOverflow(sessionID, ts, outcome, last.Info.Error, preFetchActivity)
 }
 
@@ -1332,12 +1360,18 @@ func (a *Adapter) attemptCompactionRetry(ctx context.Context, sessionID string, 
 //     eventual session.idle would still see the STALE original APIError
 //     and incorrectly finalize as failed even though the retry actually
 //     succeeded), re-dispatch the SAME prompt via postPromptAsync using
-//     resolveModel — NOT resolveModelForced — unlike forceCompaction's own
-//     /summarize call (which has no "omit and let OpenCode pick" option at
-//     all, session.go), postPromptAsync's own "model" field is genuinely
-//     optional, exactly as the ORIGINAL dispatch in StartTurn already
-//     treats it; forcing a resolved model here would silently change this
-//     retry's own request shape relative to the attempt it is retrying.
+//     resolveModelForced — audit fix (§7.3, "a diagnostic built for the
+//     retried failure can name a model the failing request did not use"):
+//     an EARLIER version of this call used the (now-removed) plain
+//     resolveModel, which treats a nil ts.cmd.Model as "omit the wire
+//     field, let OpenCode pick" — exactly like the ORIGINAL dispatch used
+//     to, at the time this comment was written. Since StartTurn's own
+//     initial dispatch now ALSO resolves via resolveModelForced
+//     (adapter.go, session.go's own doc comment), this call passing the
+//     SAME ts.cmd.Model through the SAME resolution function keeps this
+//     retry's own request shape matching the attempt it is retrying,
+//     rather than diverging from it the way "resolveModel here,
+//     resolveModelForced at StartTurn" would.
 //     THEN re-check ts.stillLive() a SECOND time — identical to
 //     attemptCompactionRetry's own round-2 check, and ts.compacting is
 //     likewise deliberately still true up to and through that second check
@@ -1380,7 +1414,7 @@ func (a *Adapter) attemptTransientRetry(ctx context.Context, sessionID string, t
 	slog.Warn("opencode: transient-error backoff elapsed, retrying the original prompt", "sessionID", sessionID)
 	ts.clearErrorsForRetry()
 
-	model := a.resolveModel(ctx, (*string)(ts.cmd.Model))
+	model := a.resolveModelForced(ctx, (*string)(ts.cmd.Model))
 
 	// setCompacting(false) intentionally happens AFTER postPromptAsync
 	// returns, not before it is called — mirrors attemptCompactionRetry's

@@ -8,16 +8,29 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 )
 
-// This file tests the "carry it forward" half of §7.3: every
-// turnOutcome{} reconstruction that only enriches Reason once §7.2's own
-// retries are exhausted must still carry the ORIGINAL failure's own
-// Diagnostic forward -- see turnOutcome.Diagnostic's own doc comment
-// (outcome.go) for the full list of reconstruction sites this covers.
-// Getting this wrong is exactly the failure mode this Step exists to fix:
-// §7.3's own framing is "once the retries are exhausted", and a
-// diagnostic that silently vanishes at exactly that moment is worse than
-// one that was never built at all, since nothing about the final
+// This file tests THREE of the five turnOutcome{} reconstruction sites
+// that only enrich Reason once §7.2's own retries are exhausted, and that
+// must still carry the ORIGINAL failure's own Diagnostic forward -- see
+// turnOutcome.Diagnostic's own doc comment (outcome.go) for the full list
+// of five. Getting this wrong is exactly the failure mode this Step
+// exists to fix: §7.3's own framing is "once the retries are exhausted",
+// and a diagnostic that silently vanishes at exactly that moment is worse
+// than one that was never built at all, since nothing about the final
 // execution_complete would even hint it once existed.
+//
+// Audit fix (C1): an EARLIER version of this comment claimed this file
+// covered "the full list of reconstruction sites" -- false as written. It
+// never covered attemptCompactionRetry's or attemptTransientRetry's own
+// "the RETRIED postPromptAsync dispatch itself fails" branches (the other
+// two of the five), and could not: each test below reaches its target
+// branch by pointing the WHOLE Adapter at one unreachable baseURL, so
+// forceCompaction/the backoff wait AND the retried postPromptAsync all
+// fail identically near-instantly -- there is no way, with one baseURL,
+// to make the RECOVERY step (forceCompaction/the backoff) succeed while
+// only the RETRY's own re-dispatch fails. Those two sites are covered
+// instead, with a real fake server that can fail each step independently,
+// by compactionretry_test.go's own TestCompactionRetry_RetryPostPromptAsyncFails
+// and transientretry_test.go's own TestTransientRetry_RetryDispatchFailsIsNeverRetriedAgain.
 //
 // Each test below reaches its target branch directly (no live OpenCode
 // server, no waiting out a real backoff) -- an unreachable baseURL makes

@@ -1,10 +1,13 @@
 package opencode
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 )
 
 // This file tests §7.3 ("a retry decision is not a diagnosis").
@@ -199,6 +202,123 @@ func interfaceViaJSON(t *testing.T, v any) map[string]any {
 	return m
 }
 
+// hostileProviderMessage is planted as err.Data.Message below -- unlike
+// maliciousAPIErrorPayload's own sentinels (which test the ALLOWLIST:
+// fields this package must never retain at all), Message is retained
+// VERBATIM by design (§7.3 names it explicitly, and ProviderFailureDiagnostic's
+// own doc comment: "the human-readable message... size-capped. Never the
+// raw provider response body"). This is a deliberate, audit-fix decision
+// (C6): a provider is untrusted, and nothing upstream of this package
+// sanitizes its own error message text -- an adversarial or compromised
+// provider (or an ordinary provider that happens to echo request content
+// back in an error, a documented real-world API failure mode) could
+// return a script-injection-shaped string or a credential-shaped string
+// as its own "message". Retaining it is still the right call (§7.3's own
+// "less diagnostic information... is the direction this must fail in"),
+// but the CONTAINMENT this relies on -- that Message reaches only
+// JSON-serialized surfaces, never raw markup -- must be true, not merely
+// assumed.
+const hostileProviderMessage = `<script>alert(document.cookie)</script> and also FAKE-SECRET-sk-live-DO-NOT-LEAK-abc123`
+
+// TestBuildProviderFailureDiagnostic_HostileMessageStaysJSONSafeOnTheWire
+// is C6's own required negative test: a benign message (every OTHER test
+// in this file) proves nothing about what happens when a provider echoes
+// something adversarial. Plants hostileProviderMessage above into the
+// REAL decode path (json.Unmarshal, exactly like
+// TestBuildProviderFailureDiagnostic_NeverLeaksCredentialsOrPromptContent
+// does for the allowlist), builds the diagnostic through the real
+// buildProviderFailureDiagnostic, and serializes it through the exact
+// diagnosticToWire+json.Marshal path that produces both the bytes
+// appendRawEvent persists into the session journal (§7.3's own "the
+// session's own event journal" surface, read by every logged-in
+// participant who can reach GET .../events or the client-WS replay -- no
+// role/session-membership check on that read path today) and the bytes
+// this package emits over the sandbox WS to begin with.
+//
+// The containment this asserts: Go's encoding/json defaults to escaping
+// HTML-significant characters (<, >, &) in string values UNLESS a caller
+// explicitly opts out via json.Encoder.SetEscapeHTML(false) -- this
+// package's own diagnosticToWire+json.Marshal call (translate.go) never
+// does. So even though Message is retained verbatim as Go string data
+// (asserted below -- this is NOT a claim that the content is dropped or
+// mangled, only that it can never be interpreted as live markup by
+// anything that renders these JSON bytes as HTML without a further,
+// separate unescape step), the SERIALIZED bytes a hostile "<script>" tag
+// produces can never execute as a script tag if naively embedded in an
+// HTML document: proven by asserting the literal, executable substring
+// "<script>" is ABSENT from the wire bytes, while the escaped form is
+// present.
+//
+// HONEST SCOPE, stated so this test is not read as proving more than it
+// does: this covers the WIRE/JOURNAL surface only. sessionactor's own
+// operator log line (logProviderFailureDiagnostic, pushpr.go) uses
+// log/slog's JSONHandler, which -- unlike encoding/json.Marshal -- does
+// NOT HTML-escape string values by default; that surface's own
+// containment depends on whatever consumes the structured log stream
+// never rendering a log value as raw HTML, which this package cannot
+// verify and does not attempt to here.
+func TestBuildProviderFailureDiagnostic_HostileMessageStaysJSONSafeOnTheWire(t *testing.T) {
+	t.Parallel()
+
+	payload := `{"name":"APIError","data":{"message":` + mustJSONString(t, hostileProviderMessage) + `,"statusCode":502}}`
+	var tagged openCodeTaggedError
+	if err := json.Unmarshal([]byte(payload), &tagged); err != nil {
+		t.Fatalf("json.Unmarshal(payload): %v", err)
+	}
+
+	a := &Adapter{runtimeVersion: testRuntimeVersion, sandboxID: testSandboxID}
+	ts := &turnState{model: "anthropic/claude-sonnet-4-5"}
+
+	d := a.buildProviderFailureDiagnostic(&tagged, ts)
+	if d == nil {
+		t.Fatal("buildProviderFailureDiagnostic returned nil for a non-nil tagged error")
+	}
+	// Retained verbatim (not dropped, not mangled) -- this is the whole
+	// point of a MESSAGE the plan names as retained; containment is
+	// asserted at the SERIALIZED level below, never by mutating the
+	// in-memory value.
+	if d.Message != hostileProviderMessage {
+		t.Fatalf("Message = %q, want the hostile message retained verbatim in memory", d.Message)
+	}
+
+	wire := diagnosticToWire(d)
+	wireJSON, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatalf("json.Marshal(diagnosticToWire(d)): %v", err)
+	}
+
+	rawTagBytes := []byte{'<', 's', 'c', 'r', 'i', 'p', 't', '>'}
+	if bytes.Contains(wireJSON, rawTagBytes) {
+		t.Errorf("wire diagnostic JSON contains a literal, executable <script> tag -- want it HTML-escaped: %s", wireJSON)
+	}
+	// Round-trip proof, not a hardcoded escape-sequence literal (Go's own
+	// \uXXXX JSON escaping is an implementation detail of encoding/json,
+	// not a contract this test should pin byte-for-byte): decoding the
+	// wire bytes back out must recover the EXACT same hostile string --
+	// proving containment comes from ENCODING, never from the content
+	// being silently dropped, truncated, or redacted along the way.
+	var decoded sandboxws.ExecutionCompleteDiagnostic
+	if err := json.Unmarshal(wireJSON, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal(wireJSON): %v", err)
+	}
+	if decoded.Message == nil || *decoded.Message != hostileProviderMessage {
+		t.Errorf("wire diagnostic JSON did not round-trip the hostile message unchanged: got %v, want %q",
+			decoded.Message, hostileProviderMessage)
+	}
+}
+
+// mustJSONString marshals s as a JSON string literal, for building a raw
+// JSON payload literal above without hand-escaping hostileProviderMessage's
+// own quotes/angle-brackets by hand.
+func mustJSONString(t *testing.T, s string) string {
+	t.Helper()
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("json.Marshal(%q): %v", s, err)
+	}
+	return string(b)
+}
+
 // TestBuildProviderFailureDiagnostic_ExtractsAllowlistedFields is the exit
 // criterion's own first half: a provider failure must be traceable from
 // the diagnostic to its cause. Uses the SAME malicious/realistic payload
@@ -296,6 +416,68 @@ func TestBuildProviderFailureDiagnostic_NilDataOmitsPayloadFields(t *testing.T) 
 	}
 }
 
+// TestBuildProviderFailureDiagnostic_CapsEveryFieldInThePathThatMatters is
+// an audit fix: TestCapDiagnosticField below proves capDiagnosticField
+// itself truncates correctly, but nothing exercised buildProviderFailureDiagnostic
+// with an over-cap INPUT before this test -- capDiagnosticField could be
+// deleted from all six of buildProviderFailureDiagnostic's own construction
+// sites (diagnostic.go: UnionMember/Model/RuntimeVersion/SandboxID always,
+// Message/ProviderRequestID when err.Data != nil) and every diagnostic test
+// still passed, so the plan row's "size-cap on top [of the allowlist]" was
+// unenforced in the one path that actually matters: this repository's own
+// dominant defect (a guard tested in isolation, never proven to be
+// REACHED) applied to a size cap instead of a call site. Plants an
+// over-cap value in EVERY field capDiagnosticField touches simultaneously
+// -- err.Name, ts.model, a.runtimeVersion, a.sandboxID, err.Data.Message,
+// and the one allowlisted request-id header -- and asserts every one of
+// the six resulting struct fields is capped AND visibly marked, proving
+// the cap is applied where it is actually exercised, not only where it is
+// called directly.
+func TestBuildProviderFailureDiagnostic_CapsEveryFieldInThePathThatMatters(t *testing.T) {
+	t.Parallel()
+
+	overCap := strings.Repeat("y", diagnosticFieldMaxBytes*2)
+	headers := map[string]json.RawMessage{
+		"x-request-id": json.RawMessage(`"` + overCap + `"`),
+	}
+
+	a := &Adapter{runtimeVersion: overCap, sandboxID: overCap}
+	ts := &turnState{model: overCap}
+	tagged := &openCodeTaggedError{
+		Name: overCap,
+		Data: &openCodeErrorData{
+			Message:         overCap,
+			ResponseHeaders: headers,
+		},
+	}
+
+	d := a.buildProviderFailureDiagnostic(tagged, ts)
+	if d == nil {
+		t.Fatal("buildProviderFailureDiagnostic returned nil for a non-nil tagged error")
+	}
+
+	fields := map[string]string{
+		"UnionMember":       d.UnionMember,
+		"Model":             d.Model,
+		"RuntimeVersion":    d.RuntimeVersion,
+		"SandboxID":         d.SandboxID,
+		"Message":           d.Message,
+		"ProviderRequestID": d.ProviderRequestID,
+	}
+	for name, value := range fields {
+		if len(value) > diagnosticFieldMaxBytes {
+			t.Errorf("ProviderFailureDiagnostic.%s is %d bytes, want <= %d (capDiagnosticField was not applied at this construction site)",
+				name, len(value), diagnosticFieldMaxBytes)
+		}
+		if !strings.HasSuffix(value, diagnosticTruncationMarker) {
+			t.Errorf("ProviderFailureDiagnostic.%s = %q, want it to end with the truncation marker %q "+
+				"(an over-cap input that comes back exactly diagnosticFieldMaxBytes long with no marker "+
+				"would also satisfy the length check above while still being silently shortened)",
+				name, value, diagnosticTruncationMarker)
+		}
+	}
+}
+
 // TestCapDiagnosticField covers diagnosticFieldMaxBytes/capDiagnosticField
 // directly: a field within the cap survives unchanged (the common,
 // zero-truncation case -- easy to get "backwards" by always appending the
@@ -327,12 +509,27 @@ func TestCapDiagnosticField(t *testing.T) {
 
 	t.Run("truncation never splits a multi-byte rune", func(t *testing.T) {
 		t.Parallel()
-		// A repeated 3-byte UTF-8 rune (€, U+20AC) sized so the cap lands
-		// mid-character if truncation is done by naive byte slicing.
-		long := strings.Repeat("€", diagnosticFieldMaxBytes)
+		// Audit fix: this subtest used to repeat "€" (U+20AC, 3 bytes) --
+		// diagnosticFieldMaxBytes-len(diagnosticTruncationMarker) is 2034,
+		// which is EXACTLY divisible by 3, so a naive byte-offset slice at
+		// that limit always lands on a rune boundary regardless, by sheer
+		// arithmetic coincidence -- this subtest passed even with the
+		// rune-safety walk-back loop in capDiagnosticField deleted
+		// entirely (mutation-verified: removing the `for limit > 0 &&
+		// !utf8.RuneStart(...)` loop still left this exact payload
+		// producing valid UTF-8). 2034 is ALSO divisible by 2, so a
+		// 2-byte rune would be just as vacuous. A 4-byte rune breaks the
+		// coincidence: 2034 mod 4 == 2, so a naive slice at byte 2034
+		// lands 2 bytes into a 4-byte sequence, which IS invalid UTF-8
+		// unless the walk-back logic actually runs. "😀" (U+1F600) is
+		// UTF-8's 4-byte case.
+		long := strings.Repeat("😀", diagnosticFieldMaxBytes)
 		got := capDiagnosticField(long)
 		if !utf8.ValidString(got) {
 			t.Errorf("capDiagnosticField produced invalid UTF-8: %q", got)
+		}
+		if !strings.HasSuffix(got, diagnosticTruncationMarker) {
+			t.Errorf("capDiagnosticField result does not end with the truncation marker %q: %q", diagnosticTruncationMarker, got)
 		}
 	})
 }

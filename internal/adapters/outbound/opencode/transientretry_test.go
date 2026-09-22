@@ -144,6 +144,20 @@ func TestTransientRetry_SucceedsAfterTransientAPIError(t *testing.T) {
 // APIError with isRetryable=false must finalize as Failed on the FIRST
 // occurrence, with no retry attempt at all -- classification happens on the
 // typed field alone, never a substring of any error text.
+//
+// Also this package's own §7.3 reachability + default-configuration proof
+// (audit fix, C1/C2): cmd below never sets Model at all -- the SAME "no
+// modelId" shape Composer/PlanModeView/Timeline resume/DecisionInbox all
+// dispatch by default (web/src/session) -- and this is the FIRST occurrence
+// of the error (dispatchEvent's own "session.idle" case, sse.go:289, the
+// live call site that builds ProviderFailureDiagnostic in production; no
+// retry machinery is involved at all for a permanent APIError). Before
+// this fix: deleting sse.go's own `outcome.Diagnostic =
+// a.buildProviderFailureDiagnostic(err, ts)` line left every existing test
+// in this package green, and even with that line intact,
+// ProviderFailureDiagnostic.Model read "" on exactly this default,
+// no-modelId path -- §7.3's own first-named-missing fact ("not the model
+// that ran") stayed missing. Both are pinned below.
 func TestTransientRetry_PermanentAPIErrorNeverRetried(t *testing.T) {
 	f := newFakeOpenCodeServer(t)
 
@@ -193,12 +207,58 @@ func TestTransientRetry_PermanentAPIErrorNeverRetried(t *testing.T) {
 		t.Errorf("execution_complete.Reason = %q, want it to name APIError", reason)
 	}
 
+	// §7.3: the diagnostic must actually be reached in production (C1) --
+	// deleting sse.go's own call site leaves this nil -- and, on this
+	// DEFAULT, no-modelId configuration, Model must name a real model
+	// (C2), never "".
+	if final.Diagnostic == nil {
+		t.Fatal("execution_complete.Diagnostic = nil, want the allowlisted provider-failure record " +
+			"(sse.go's own dispatchEvent call site was never reached)")
+	}
+	if final.Diagnostic.UnionMember == nil || *final.Diagnostic.UnionMember != "APIError" {
+		t.Errorf("Diagnostic.UnionMember = %v, want %q", final.Diagnostic.UnionMember, "APIError")
+	}
+	if final.Diagnostic.Model == nil || *final.Diagnostic.Model == "" {
+		t.Errorf("Diagnostic.Model = %v, want a real, non-empty model name even though cmd.Model was "+
+			"never set on this turn (the default configuration every real client dispatches through) "+
+			"-- an empty Model here is §7.3's own headline fact still missing", final.Diagnostic.Model)
+	}
+	wantProviderID, wantModelID, _ := strings.Cut(fallbackModel, "/")
+	wantModel := wantProviderID + "/" + wantModelID
+	if final.Diagnostic.Model != nil && *final.Diagnostic.Model != wantModel {
+		t.Errorf("Diagnostic.Model = %q, want %q (resolveModelForced's own fallback for a nil cmd.Model)",
+			*final.Diagnostic.Model, wantModel)
+	}
+	if final.Diagnostic.RuntimeVersion == nil || *final.Diagnostic.RuntimeVersion != testRuntimeVersion {
+		t.Errorf("Diagnostic.RuntimeVersion = %v, want %q", final.Diagnostic.RuntimeVersion, testRuntimeVersion)
+	}
+	if final.Diagnostic.SandboxId == nil || *final.Diagnostic.SandboxId != testSandboxID {
+		t.Errorf("Diagnostic.SandboxId = %v, want %q", final.Diagnostic.SandboxId, testSandboxID)
+	}
+
 	// No retry: exactly the original dispatch, nothing more.
 	if got := f.promptCallCount(); got != 1 {
 		t.Errorf("promptCallCount = %d, want exactly 1 (a permanent APIError must never be retried)", got)
 	}
 	if got := f.summarizeCallCount(); got != 0 {
 		t.Errorf("summarizeCallCount = %d, want exactly 0", got)
+	}
+
+	// The model this adapter DISPATCHED WITH must be genuinely resolved
+	// too (not merely reported in the diagnostic) -- the fake server's own
+	// prompt_async handler must have received the SAME resolved fallback
+	// model, since cmd.Model was nil: proves resolveModelForced's fallback
+	// is what StartTurn actually SENT, not a value invented only for the
+	// diagnostic after the fact.
+	f.mu.Lock()
+	promptModel := f.lastPromptModel
+	f.mu.Unlock()
+	if promptModel == nil {
+		t.Fatal("fake server's own prompt_async request carried no model field at all -- want the " +
+			"resolved fallback model explicitly sent, not omitted, now that StartTurn always resolves one")
+	}
+	if promptModel.ProviderID != wantProviderID || promptModel.ModelID != wantModelID {
+		t.Errorf("prompt_async request model = %+v, want providerID=%q modelID=%q", promptModel, wantProviderID, wantModelID)
 	}
 }
 
@@ -307,6 +367,14 @@ func TestTransientRetry_RetryAlsoFailsFinalizesFailedExactlyOnce(t *testing.T) {
 // exactly one attempt regardless of how that one attempt itself fails,
 // so a crashed local OpenCode process is surfaced as a failure, never
 // silently hidden behind a retry loop.
+//
+// Also §7.3's own reachability proof for adapter.go's attemptTransientRetry's
+// own `a.finalize(ts, turnOutcome{..., Diagnostic: originalOutcome.Diagnostic})`
+// call in this exact branch -- audit fix (C1), the SIBLING of
+// TestCompactionRetry_RetryPostPromptAsyncFails' own identical addition
+// (compactionretry_test.go) -- see retrydiagnostic_test.go's own corrected
+// doc comment for why these two tests, not that file, are where this pair
+// of reconstruction sites is actually covered.
 func TestTransientRetry_RetryDispatchFailsIsNeverRetriedAgain(t *testing.T) {
 	f := newFakeOpenCodeServer(t)
 
@@ -369,6 +437,27 @@ func TestTransientRetry_RetryDispatchFailsIsNeverRetriedAgain(t *testing.T) {
 	}
 	if !strings.Contains(reason, "retry postPromptAsync") {
 		t.Errorf("execution_complete.Reason = %q, want it to name retry postPromptAsync as the failed step", reason)
+	}
+
+	// §7.3: the ORIGINAL transient error's own Diagnostic must survive
+	// this reconstruction -- attemptTransientRetry rebuilds a fresh
+	// turnOutcome{} here (only Reason is enriched), and
+	// turnOutcome.Diagnostic's own doc comment (outcome.go) requires every
+	// such reconstruction to carry Diagnostic forward unchanged.
+	if final.Diagnostic == nil {
+		t.Fatal("execution_complete.Diagnostic = nil, want the ORIGINAL transient error's own diagnostic carried forward")
+	}
+	if final.Diagnostic.UnionMember == nil || *final.Diagnostic.UnionMember != "APIError" {
+		t.Errorf("Diagnostic.UnionMember = %v, want %q", final.Diagnostic.UnionMember, "APIError")
+	}
+	if final.Diagnostic.Model == nil || *final.Diagnostic.Model == "" {
+		t.Errorf("Diagnostic.Model = %v, want a real, non-empty model name (cmd.Model was never set on this turn)", final.Diagnostic.Model)
+	}
+	if final.Diagnostic.RuntimeVersion == nil || *final.Diagnostic.RuntimeVersion != testRuntimeVersion {
+		t.Errorf("Diagnostic.RuntimeVersion = %v, want %q", final.Diagnostic.RuntimeVersion, testRuntimeVersion)
+	}
+	if final.Diagnostic.SandboxId == nil || *final.Diagnostic.SandboxId != testSandboxID {
+		t.Errorf("Diagnostic.SandboxId = %v, want %q", final.Diagnostic.SandboxId, testSandboxID)
 	}
 
 	// No summarize call (this failure class forces no compaction), and no

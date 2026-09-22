@@ -309,6 +309,104 @@ func TestWaitForTurn_GenuinelyStuckTurnStillFallsBackWithinOriginalTimeout(t *te
 	}
 }
 
+// TestWaitForTurn_GenuinelyStuckTurnFallbackFailureCarriesDiagnostic is an
+// audit fix (§7.3, C1): finalizeByFallback (adapter.go) has its OWN,
+// SEPARATE call site that builds ProviderFailureDiagnostic --
+// `outcome.Diagnostic = a.buildProviderFailureDiagnostic(last.Info.Error,
+// ts)` -- reached only via the SSE-inactivity fallback's own final-message
+// fetch, never by dispatchEvent's live "session.idle" case
+// (transientretry_test.go's own TestTransientRetry_PermanentAPIErrorNeverRetried
+// covers THAT one). Before this test existed, deleting finalizeByFallback's
+// own call site left every test in this package green: nothing exercised a
+// genuine provider failure observed through the fallback's own final-state
+// fetch specifically. Mirrors
+// TestWaitForTurn_GenuinelyStuckTurnStillFallsBackWithinOriginalTimeout's
+// own exact scaffolding (heartbeats keep the connection looking alive;
+// session.idle for this turn is never sent; the fallback's own fetch is
+// the only thing that can possibly produce this turn's own terminal
+// event) but with the fetched message's own info.error set to a real,
+// permanent (non-retryable) APIError instead of a plain text reply.
+func TestWaitForTurn_GenuinelyStuckTurnFallbackFailureCarriesDiagnostic(t *testing.T) {
+	fake := newFakeOpenCodeServer(t)
+	a := newLivenessAdapter(t, fake)
+
+	connectCtx, connectCancel := context.WithTimeout(context.Background(), testWait)
+	defer connectCancel()
+	if err := a.Connected(connectCtx); err != nil {
+		t.Fatalf("Connected() error = %v", err)
+	}
+	<-fake.connected
+
+	stopHeartbeats := make(chan struct{})
+	var hbGroup errgroup.Group
+	hbGroup.Go(func() error {
+		ticker := time.NewTicker(livenessReconnectInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				fake.broadcast(sseLine(t, "server.heartbeat", struct{}{}))
+			case <-stopHeartbeats:
+				return nil
+			}
+		}
+	})
+	defer func() {
+		close(stopHeartbeats)
+		_ = hbGroup.Wait()
+	}()
+
+	statusCode := 503
+	fake.setMessages([]messageListEntry{{
+		Info: openCodeMessageInfo{
+			ID:   "msg_1",
+			Role: "assistant",
+			Error: &openCodeTaggedError{
+				Name: "APIError",
+				Data: &openCodeErrorData{
+					Message:    "the fallback's own fetch observed this permanent failure",
+					StatusCode: &statusCode,
+				},
+			},
+		},
+	}})
+
+	collector := &eventCollector{}
+	// No modelId (the default configuration, C2) -- see
+	// TestTransientRetry_PermanentAPIErrorNeverRetried's own identical
+	// choice for why.
+	cmd := sandboxws.Prompt{Type: "prompt", MessageId: "m1", SessionId: "sess-1", Gen: 1, Text: "hi"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), testWait)
+	defer cancel()
+
+	if _, err := a.StartTurn(ctx, cmd, collector.sink, nil); err != nil {
+		t.Fatalf("StartTurn() error = %v", err)
+	}
+
+	final := lastExecutionComplete(t, collector.snapshot())
+	if final.Outcome != sandboxws.ExecutionCompleteOutcomeFailed {
+		t.Fatalf("execution_complete.Outcome = %q, want %q (via the fallback's own final-message fetch)",
+			final.Outcome, sandboxws.ExecutionCompleteOutcomeFailed)
+	}
+	if final.Diagnostic == nil {
+		t.Fatal("execution_complete.Diagnostic = nil, want the allowlisted provider-failure record " +
+			"(finalizeByFallback's own call site, adapter.go, was never reached)")
+	}
+	if final.Diagnostic.UnionMember == nil || *final.Diagnostic.UnionMember != "APIError" {
+		t.Errorf("Diagnostic.UnionMember = %v, want %q", final.Diagnostic.UnionMember, "APIError")
+	}
+	if final.Diagnostic.Message == nil || *final.Diagnostic.Message != "the fallback's own fetch observed this permanent failure" {
+		t.Errorf("Diagnostic.Message = %v, want the fetched message's own error text", final.Diagnostic.Message)
+	}
+	if final.Diagnostic.StatusCode == nil || *final.Diagnostic.StatusCode != statusCode {
+		t.Errorf("Diagnostic.StatusCode = %v, want %d", final.Diagnostic.StatusCode, statusCode)
+	}
+	if final.Diagnostic.Model == nil || *final.Diagnostic.Model == "" {
+		t.Errorf("Diagnostic.Model = %v, want a real, non-empty model name on this default (no modelId) configuration", final.Diagnostic.Model)
+	}
+}
+
 // TestWaitForTurn_ConnectionNeverReturnsFallsBackWithinBoundedWait proves
 // the "connection also looks dead" wait is genuinely BOUNDED, not
 // infinite: once the connection drops and every subsequent reconnect

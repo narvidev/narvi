@@ -384,6 +384,25 @@ func createProcessingTurn(ctx context.Context, t *testing.T, turns *narvipg.Turn
 	return created
 }
 
+// createProcessingTurnWithCorrelationID is createProcessingTurn's own
+// correlation-id-parameterized twin -- §7.3's own C4 audit fix needs a
+// turn whose OWN turns.correlation_id (migrations/000121) is set, set-once
+// at creation exactly like a real httpapi.CreateTurnCore call would, to
+// prove logProviderFailureDiagnostic reads THAT value rather than
+// whatever this Actor happened to be hydrated with.
+func createProcessingTurnWithCorrelationID(ctx context.Context, t *testing.T, turns *narvipg.TurnStore, sessionID pgtype.UUID, correlationID string) sqlcgen.Turn {
+	t.Helper()
+	created, err := turns.Create(ctx, sqlcgen.CreateTurnParams{
+		SessionID:     sessionID,
+		Status:        sqlcgen.TurnStatusProcessing,
+		CorrelationID: &correlationID,
+	})
+	if err != nil {
+		t.Fatalf("create processing turn with correlation id: %v", err)
+	}
+	return created
+}
+
 // sendSandboxEventForTest drives cmd through Actor.Send, exactly mirroring
 // TestHandleSandboxEvent_FullRoundTrip's own local `send` helper (this
 // file's own package-level copy, since Go test helpers are function-
@@ -744,6 +763,176 @@ func TestHandleSandboxEvent_ExecutionCompleteFailed_DiagnosticSurvivesTheRealPos
 	}
 	if got, want := found.Diagnostic.SandboxId, wantDiagnostic.SandboxId; got == nil || want == nil || *got != *want {
 		t.Errorf("persisted Diagnostic.SandboxId = %v, want %v", got, want)
+	}
+}
+
+// TestHandleSandboxEvent_ExecutionCompleteFailed_OperatorLogReachesTheRealPathAndMatchesTheJournal
+// is §7.3's own C4 audit fix, proven three ways at once against a REAL
+// Postgres instance:
+//
+//  1. Reachability (C1): before this test existed, deleting
+//     completeProcessingTurn's own `logProviderFailureDiagnostic(...)`
+//     call site (pushpr.go) left every test in this package green --
+//     TestLogProviderFailureDiagnostic (pushpr_test.go) only ever calls
+//     that function directly, never through a real SandboxEvent. This
+//     test drives the real handleSandboxEvent path instead.
+//  2. The join key (C4): this Actor is hydrated (GetOrSpawn below) under
+//     a ctx carrying a DELIBERATELY WRONG correlation id
+//     ("hydrate-time-wrong-correlation-id") -- exactly the "whichever
+//     request first hydrated the Actor" value the confirmed finding says
+//     used to leak into this log line. The turn itself is seeded with
+//     its OWN, DIFFERENT correlation id (turns.correlation_id,
+//     migrations/000121), mirroring what a real httpapi.CreateTurnCore
+//     call sets at turn-creation time. The log line's own "correlation_id"
+//     attribute must read the TURN's value, never the hydration one --
+//     proving the join key actually points at the failing turn, not
+//     whatever request happened to spawn this Actor.
+//  3. "One record, in both surfaces" (§7.3), proven by comparing the two
+//     surfaces to EACH OTHER, not each independently against a shared Go
+//     literal (a reviewer's own explicit ask: two surfaces built from two
+//     separately-typed "same" literals can drift from each other while
+//     each still matches its own copy) -- the journal's own persisted
+//     execution_complete.Diagnostic (already proven to survive the
+//     Postgres round trip by the sibling test above) is decoded, the
+//     operator log line is parsed back out of its own JSON bytes, and
+//     every field is compared journal-value-to-log-value directly.
+func TestHandleSandboxEvent_ExecutionCompleteFailed_OperatorLogReachesTheRealPathAndMatchesTheJournal(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+
+	sessionID := createTestSessionWithRepos(ctx, t, pool, pgtype.UUID{},
+		"repo1", "https://github.com/acme/repo1.git", "feature-x")
+
+	sandboxStore := narvipg.NewSandboxStore(pool)
+	if _, err := sandboxStore.Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+
+	turnStore := narvipg.NewTurnStore(pool)
+	wantTurnCorrelationID := "corr-turn-own-" + uuid.NewString()
+	created := createProcessingTurnWithCorrelationID(ctx, t, turnStore, sessionID, wantTurnCorrelationID)
+
+	// Capture BEFORE hydration -- captureDefaultLoggerJSON's own doc
+	// comment (planrecord_integration_test.go) explains why: a.logger is
+	// resolved from slog.Default() exactly once, at hydrate time, and
+	// cached for this Actor's whole life.
+	logBuf := captureDefaultLoggerJSON(t)
+
+	commander := &fakeSendCommander{}
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, commander, nil, "", nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+
+	// Hydrate under a WRONG correlation id -- simulates whatever OTHER
+	// request first spawned this Actor (a Slack mention, an earlier turn
+	// entirely) being unrelated to the turn that is about to fail.
+	hydrateCtx := platform.WithCorrelationID(ctx, "hydrate-time-wrong-correlation-id")
+	a, err := r.GetOrSpawn(hydrateCtx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	wantDiagnostic := &sandboxws.ExecutionCompleteDiagnostic{
+		Message:           strPtr("The upstream provider rejected this request."),
+		UnionMember:       strPtr("APIError"),
+		ProviderRequestId: strPtr("req_visible_public_abc123"),
+		Model:             strPtr("anthropic/claude-sonnet-4-5"),
+		RuntimeVersion:    strPtr("0.0.0-test"),
+		SandboxId:         strPtr("sbx-test-0001"),
+	}
+
+	// Sent (and later processed) with a plain, uncorrelated ctx -- proves
+	// the join key comes from the TURN row, not from any per-call ctx
+	// propagation (Actor.Send only uses its own ctx to bound the mailbox
+	// enqueue, never threading it into command handling -- actor.go).
+	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "execution_complete",
+		Gen:  1,
+		Raw:  executionCompleteRawWithDiagnostic(t, sessionID.String(), 1, sandboxws.ExecutionCompleteOutcomeFailed, wantDiagnostic),
+	})
+
+	waitUntil(t, 5*time.Second, func() bool {
+		got, err := turnStore.Get(ctx, created.ID)
+		return err == nil && got.Status == sqlcgen.TurnStatusFailed
+	})
+
+	// Surface 1: the session journal.
+	eventStore := narvipg.NewEventStore(pool)
+	events, err := eventStore.ListForSession(ctx, sessionID, 0, 100)
+	if err != nil {
+		t.Fatalf("ListForSession: %v", err)
+	}
+	var journal *sandboxws.ExecutionComplete
+	for _, e := range events {
+		if e.Type != "execution_complete" {
+			continue
+		}
+		var evt sandboxws.ExecutionComplete
+		if err := json.Unmarshal(e.Payload, &evt); err != nil {
+			t.Fatalf("unmarshal persisted execution_complete: %v", err)
+		}
+		journal = &evt
+	}
+	if journal == nil {
+		t.Fatal("no execution_complete event found in the session's own journal")
+	}
+	if journal.Diagnostic == nil {
+		t.Fatal("persisted execution_complete.Diagnostic = nil, want the diagnostic sent on the wire")
+	}
+
+	// Surface 2: the operator log -- reachability (finding 1 above): if
+	// logProviderFailureDiagnostic's own call site were ever deleted, this
+	// find fails outright rather than comparing against zero values.
+	entry := findLogEntry(t, logBuf, "sessionactor: turn failed with a provider-reported diagnostic")
+
+	// The join key (finding 2 above).
+	if got, ok := entry["correlation_id"].(string); !ok || got != wantTurnCorrelationID {
+		t.Errorf("operator log correlation_id = %v, want %q (the FAILING TURN's own persisted correlation id, "+
+			"not whatever request hydrated this Actor)", entry["correlation_id"], wantTurnCorrelationID)
+	}
+	if got, ok := entry["turn_id"].(string); !ok || got != created.ID.String() {
+		t.Errorf("operator log turn_id = %v, want %q", entry["turn_id"], created.ID.String())
+	}
+	if got, ok := entry["session_id"].(string); !ok || got != sessionID.String() {
+		t.Errorf("operator log session_id = %v, want %q", entry["session_id"], sessionID.String())
+	}
+	if _, ok := entry["message_id"].(string); !ok {
+		t.Errorf("operator log message_id missing or not a string: %v", entry["message_id"])
+	}
+
+	// Finding 3: compare the two surfaces to EACH OTHER, field by field --
+	// never each against wantDiagnostic independently, which would pass
+	// even if the journal and the log had silently diverged from one
+	// another while each still happened to match the fixture.
+	logStr := func(key string) *string {
+		v, ok := entry[key].(string)
+		if !ok {
+			return nil
+		}
+		return &v
+	}
+	compare := []struct {
+		field       string
+		journal, ok *string
+	}{
+		{"message", journal.Diagnostic.Message, logStr("diagnostic_message")},
+		{"unionMember", journal.Diagnostic.UnionMember, logStr("diagnostic_union_member")},
+		{"providerRequestId", journal.Diagnostic.ProviderRequestId, logStr("diagnostic_provider_request_id")},
+		{"model", journal.Diagnostic.Model, logStr("diagnostic_model")},
+		{"runtimeVersion", journal.Diagnostic.RuntimeVersion, logStr("diagnostic_runtime_version")},
+		{"sandboxId", journal.Diagnostic.SandboxId, logStr("diagnostic_sandbox_id")},
+	}
+	for _, c := range compare {
+		switch {
+		case c.journal == nil && c.ok == nil:
+			// Both surfaces agree the field is absent -- fine.
+		case c.journal == nil || c.ok == nil:
+			t.Errorf("%s: journal=%v operator_log=%v -- one surface has this field, the other does not", c.field, c.journal, c.ok)
+		case *c.journal != *c.ok:
+			t.Errorf("%s: journal=%q operator_log=%q -- the two §7.3 surfaces disagree", c.field, *c.journal, *c.ok)
+		}
 	}
 }
 

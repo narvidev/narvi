@@ -21,10 +21,13 @@ type turnState struct {
 	sink ports.EventSink
 
 	// model is this turn's own "providerID/modelID" display string
-	// (modelDisplay, below) — "" when cmd.Model was nil (omitted, letting
-	// OpenCode pick its own configured default; this adapter never
-	// learns exactly which concrete model OpenCode chose to run in that
-	// case, only that none was explicitly requested). Set exactly once,
+	// (modelDisplay, below) — audit fix (§7.3, "the model is empty in the
+	// default configuration"): NEVER "" for a real turn now that StartTurn
+	// resolves cmd.Model via resolveModelForced (session.go, adapter.go),
+	// which always returns a concrete *promptModelRef -- falling back to
+	// fallbackModelRef() rather than omitting the field when cmd.Model was
+	// nil (Composer/PlanModeView/Timeline resume/DecisionInbox all
+	// dispatch this way by default, web/src/session). Set exactly once,
 	// by newTurnState, from a value already resolved BEFORE this
 	// turnState is ever constructed (StartTurn, adapter.go) — so, exactly
 	// like cmd above, it is safe to read from any goroutine (the SSE
@@ -221,10 +224,12 @@ func newTurnState(cmd sandboxws.Prompt, sink ports.EventSink, model string) *tur
 }
 
 // modelDisplay renders a resolved *promptModelRef (session.go's own
-// resolveModel) as the "providerID/modelID" string turnState.model and
-// ProviderFailureDiagnostic.Model both carry — "" for a nil ref (cmd.Model
-// was omitted; see turnState.model's own doc comment above for what that
-// means).
+// resolveModelForced) as the "providerID/modelID" string turnState.model
+// and ProviderFailureDiagnostic.Model both carry. The nil-ref guard below
+// is defensive only, not a real production case: resolveModelForced never
+// returns nil (session.go's own doc comment), so every caller today
+// passes a non-nil ref — kept so this function stays total rather than
+// panicking if a future caller ever passes nil.
 func modelDisplay(m *promptModelRef) string {
 	if m == nil {
 		return ""

@@ -200,7 +200,15 @@ type ProviderFailureDiagnostic struct {
 
 	// Model is the "providerID/modelID" string this turn actually
 	// dispatched with — adapter-side context, never itself part of
-	// OpenCode's own error payload.
+	// OpenCode's own error payload. Never "" for a real turn: StartTurn
+	// resolves cmd.Model via resolveModelForced (session.go) before this
+	// turn's own turnState even exists, which always returns a concrete
+	// ref (falling back to fallbackModelRef() rather than omitting the
+	// wire field when the request named no model at all — the default
+	// configuration every one of Composer/PlanModeView/Timeline resume/
+	// DecisionInbox dispatches through, web/src/session) — so this field
+	// answers §7.3's own first-named-missing fact on every path, not only
+	// a client-picked one.
 	Model string `json:"model,omitempty"`
 
 	// RuntimeVersion is the pinned OpenCode binary version this sandbox
@@ -226,10 +234,18 @@ type ProviderFailureDiagnostic struct {
 // ts is race-free) rather than re-resolving the model itself: this
 // function must describe whatever model THIS turn actually dispatched
 // with, not re-derive a possibly-different answer from cmd.Model (a
-// second resolveModel call could, in principle, resolve to a different
-// promptModelRef if the catalog changed between the original dispatch and
-// a later failure — ts.model is the one value known to match what was
-// actually sent).
+// second resolveModelForced call could, in principle, resolve to a
+// different promptModelRef if the catalog changed between the original
+// dispatch and a later failure — ts.model is the one value known to
+// match what was actually sent). This is why a RETRIED prompt's own
+// failure (attemptCompactionRetry/attemptTransientRetry, adapter.go)
+// never rebuilds a fresh Diagnostic from the retry's own freshly-resolved
+// model either — every reconstruction site there carries the ORIGINAL
+// outcome's Diagnostic (ts.model, frozen at StartTurn) forward unchanged,
+// per turnOutcome.Diagnostic's own doc comment (outcome.go); both the
+// original dispatch and any later retry resolve ts.cmd.Model through the
+// SAME resolveModelForced, so the two agree in practice except for that
+// same accepted, pre-existing "catalog changed mid-turn" edge case.
 func (a *Adapter) buildProviderFailureDiagnostic(err *openCodeTaggedError, ts *turnState) *ProviderFailureDiagnostic {
 	if err == nil {
 		return nil

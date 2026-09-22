@@ -48,15 +48,23 @@ func TestExecutionOutcomeTrigger(t *testing.T) {
 // present-but-empty one look identical to a human reading the line, but
 // only the first is honest about what OpenCode/this adapter actually
 // supplied (see ProviderFailureDiagnostic's own "omitempty" fields,
-// diagnostic.go).
+// diagnostic.go). Also covers the identity fields C4 added
+// (session_id/message_id/turn_id/correlation_id): session_id/message_id
+// are unconditional (always sourced off the wire event); turn_id/
+// correlation_id are each omitted exactly when the caller passes their
+// own zero value ("" / nil) -- the "no Processing turn found" case
+// completeProcessingTurn's own doc comment describes.
 func TestLogProviderFailureDiagnostic(t *testing.T) {
 	statusCode := 429
+	corrID := "corr-turn-own-abc123"
 
 	tests := []struct {
-		name       string
-		diagnostic *sandboxws.ExecutionCompleteDiagnostic
-		wantAttrs  map[string]string // attr -> substring expected in the line
-		wantAbsent []string          // attr keys that must NOT appear at all
+		name          string
+		diagnostic    *sandboxws.ExecutionCompleteDiagnostic
+		turnID        string
+		correlationID *string
+		wantAttrs     map[string]string // attr -> substring expected in the line
+		wantAbsent    []string          // attr keys that must NOT appear at all
 	}{
 		{
 			name: "every field present",
@@ -69,7 +77,13 @@ func TestLogProviderFailureDiagnostic(t *testing.T) {
 				RuntimeVersion:    strPtr("1.17.15"),
 				SandboxId:         strPtr("sbx-live-0001"),
 			},
+			turnID:        "trn-11111111-1111-1111-1111-111111111111",
+			correlationID: &corrID,
 			wantAttrs: map[string]string{
+				"session_id":                     "ses-fixture-1",
+				"message_id":                     "msg-fixture-1",
+				"turn_id":                        "trn-11111111-1111-1111-1111-111111111111",
+				"correlation_id":                 corrID,
 				"diagnostic_message":             "rate limited",
 				"diagnostic_union_member":        "APIError",
 				"diagnostic_status_code":         "429",
@@ -82,10 +96,16 @@ func TestLogProviderFailureDiagnostic(t *testing.T) {
 		{
 			name:       "every field nil is omitted, not logged empty",
 			diagnostic: &sandboxws.ExecutionCompleteDiagnostic{},
+			// turnID/correlationID left zero -- the "no Processing turn
+			// found for this delivery" case.
+			wantAttrs: map[string]string{
+				"session_id": "ses-fixture-1",
+				"message_id": "msg-fixture-1",
+			},
 			wantAbsent: []string{
 				"diagnostic_message", "diagnostic_union_member", "diagnostic_status_code",
 				"diagnostic_provider_request_id", "diagnostic_model", "diagnostic_runtime_version",
-				"diagnostic_sandbox_id",
+				"diagnostic_sandbox_id", "turn_id", "correlation_id",
 			},
 		},
 		{
@@ -94,13 +114,17 @@ func TestLogProviderFailureDiagnostic(t *testing.T) {
 				ProviderRequestId: strPtr("req_only_this_survived"),
 				Model:             strPtr("openai/gpt-5"),
 			},
+			turnID: "trn-22222222-2222-2222-2222-222222222222",
 			wantAttrs: map[string]string{
+				"session_id":                     "ses-fixture-1",
+				"message_id":                     "msg-fixture-1",
+				"turn_id":                        "trn-22222222-2222-2222-2222-222222222222",
 				"diagnostic_provider_request_id": "req_only_this_survived",
 				"diagnostic_model":               "openai/gpt-5",
 			},
 			wantAbsent: []string{
 				"diagnostic_message", "diagnostic_union_member", "diagnostic_status_code",
-				"diagnostic_runtime_version", "diagnostic_sandbox_id",
+				"diagnostic_runtime_version", "diagnostic_sandbox_id", "correlation_id",
 			},
 		},
 	}
@@ -110,7 +134,7 @@ func TestLogProviderFailureDiagnostic(t *testing.T) {
 			var buf bytes.Buffer
 			logger := slog.New(slog.NewTextHandler(&buf, nil))
 
-			logProviderFailureDiagnostic(logger, tc.diagnostic)
+			logProviderFailureDiagnostic(logger, tc.diagnostic, "ses-fixture-1", "msg-fixture-1", tc.turnID, tc.correlationID)
 
 			line := buf.String()
 			for attr, want := range tc.wantAttrs {

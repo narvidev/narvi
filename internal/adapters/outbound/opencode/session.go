@@ -42,38 +42,45 @@ func (a *Adapter) resolveSession(ctx context.Context, cmd sandboxws.Prompt) (str
 	return resp.ID, nil
 }
 
-// resolveModel implements §7's own minimal model-catalog-fallback quirk.
-// raw is cmd.Model (sandboxws.PromptModel, a *string) as a plain *string —
-// nil means "omit model entirely, let OpenCode use its own configured
-// default" (never resolved against the catalog or fallback, since there is
-// nothing to validate). A non-nil value is resolved via resolveProviderModel
-// below (shared with resolveModelForced, §7.2).
-func (a *Adapter) resolveModel(ctx context.Context, raw *string) *promptModelRef {
-	if raw == nil {
-		return nil
-	}
-	return a.resolveProviderModel(ctx, *raw)
-}
-
-// resolveModelForced implements §7.2's own "forced" model-resolution
-// variant, needed because POST /session/{id}/summarize has NO "omit and
-// let OpenCode pick" option the way prompt_async's own optional "model"
-// field does — VERIFIED live via GET /doc (the real OpenAPI schema):
-// /summarize's requestBody schema is {"providerID","modelID","auto"?},
-// with BOTH providerID and modelID listed under "required", and an empty
-// {} body independently reproduced live to return HTTP 400
+// resolveModelForced implements §7's own minimal model-catalog-fallback
+// quirk, and is now the ONLY model-resolution path this adapter has —
+// audit fix (§7.3, "the model is empty in the default configuration"): an
+// EARLIER version of this file also had a plain resolveModel, which
+// treated a nil raw (cmd.Model omitted — Composer/PlanModeView/Timeline
+// resume/DecisionInbox all dispatch this way by default, web/src/session)
+// as "omit the wire model field entirely, let OpenCode use its own
+// configured default", and this adapter never learned which concrete
+// model OpenCode actually ran. That meant ProviderFailureDiagnostic.Model
+// (diagnostic.go) — the very fact §7.3 names FIRST as missing from the
+// pre-Step status quo — stayed "" on the overwhelmingly common,
+// no-model-requested path, silently defeating this Step's own purpose.
+// Removed rather than kept as a second, rarely-taken branch: this Step's
+// OWN "typed transient-error retry" work already established the
+// precedent that a RETRIED dispatch (attemptCompactionRetry, adapter.go)
+// always forces a concrete model via this exact function, even when the
+// original request named none — extending that SAME, already-accepted
+// resolution strategy to the FIRST dispatch (StartTurn, adapter.go) and to
+// attemptTransientRetry's own re-dispatch (adapter.go) is a narrowing of
+// existing behavior, not a new category of risk, and it is the only way
+// every ProviderFailureDiagnostic this adapter ever builds can honestly
+// keep its own doc comment's promise: "the model this turn actually
+// dispatched with" (diagnostic.go), true of every path that can set it,
+// never "" for a real turn.
+//
+// raw is cmd.Model (sandboxws.PromptModel, a *string) as a plain *string.
+// nil (VERIFIED live via GET /doc, the real OpenAPI schema: /summarize's
+// requestBody schema is {"providerID","modelID","auto"?}, with BOTH
+// providerID and modelID listed under "required", and an empty {} body
+// independently reproduced live to return HTTP 400
 // {"name":"BadRequest","data":{"message":"Missing key\n  at
-// [\"providerID\"]"}} against the pinned OpenCode 1.17.15 binary. So
-// unlike resolveModel above, raw == nil here does NOT mean "omit" — there
-// is nothing to omit onto — it is treated exactly the same as resolveModel
-// treats a non-nil-but-unparseable raw: fall back to fallbackModelRef()
-// directly, no catalog call needed (matching resolveProviderModel's own
-// "unparseable raw skips the catalog entirely" branch, reused here rather
-// than duplicated). A non-nil raw goes through the SAME
-// resolveProviderModel resolution resolveModel itself uses. The return
-// value is NEVER nil — every caller (forceCompaction, and the retried
-// postPromptAsync that reuses the SAME resolved model, adapter.go's
-// finalizeOrRecoverFromOverflow/attemptCompactionRetry) can rely on that.
+// [\"providerID\"]"}} against the pinned OpenCode 1.17.15 binary — so
+// /summarize never had an "omit" option to begin with) falls back to
+// fallbackModelRef() directly, no catalog call needed (matching
+// resolveProviderModel's own "unparseable raw skips the catalog entirely"
+// branch, reused here rather than duplicated). A non-nil raw is resolved
+// via resolveProviderModel below. The return value is NEVER nil — every
+// caller (StartTurn's own initial dispatch, forceCompaction, and every
+// retried postPromptAsync re-dispatch, adapter.go) can rely on that.
 func (a *Adapter) resolveModelForced(ctx context.Context, raw *string) *promptModelRef {
 	if raw == nil {
 		return fallbackModelRef()
@@ -81,8 +88,8 @@ func (a *Adapter) resolveModelForced(ctx context.Context, raw *string) *promptMo
 	return a.resolveProviderModel(ctx, *raw)
 }
 
-// resolveProviderModel is the actual catalog-lookup logic resolveModel and
-// resolveModelForced above BOTH share for a non-nil raw value: a raw string
+// resolveProviderModel is the actual catalog-lookup logic
+// resolveModelForced above shares for a non-nil raw value: a raw string
 // that does not parse as "provider/model", or a best-effort GET /api/model
 // catalog call that fails or returns empty, falls back to fallbackModel —
 // deliberately minimal: this does NOT check whether the requested model is

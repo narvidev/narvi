@@ -2070,6 +2070,18 @@ func TestCompactionRetry_StopDuringRetryDispatchAbortsRedispatchedPrompt(t *test
 // the ENRICHED original-overflow reason (naming both the original
 // ContextOverflowError AND the fact that the retry's own dispatch failed),
 // never a bare, indistinguishable-from-first-time-overflow reason.
+//
+// Also §7.3's own reachability proof for adapter.go's
+// attemptCompactionRetry's own `a.finalize(ts, turnOutcome{...,
+// Diagnostic: originalOutcome.Diagnostic})` call in this exact branch --
+// audit fix (C1): retrydiagnostic_test.go's own doc comment used to claim
+// this file's own three tests covered "the full list of reconstruction
+// sites" turnOutcome.Diagnostic's doc comment (outcome.go) names; they
+// never covered this one, or attemptTransientRetry's identical-shaped
+// sibling (transientretry_test.go's own
+// TestTransientRetry_RetryDispatchFailsIsNeverRetriedAgain, extended
+// alongside this test for the identical reason) -- see that file's own
+// corrected doc comment.
 func TestCompactionRetry_RetryPostPromptAsyncFails(t *testing.T) {
 	f := newFakeOpenCodeServer(t)
 	f.setSummarizeOK(true)
@@ -2136,6 +2148,27 @@ func TestCompactionRetry_RetryPostPromptAsyncFails(t *testing.T) {
 	}
 	if !strings.Contains(reason, "retry postPromptAsync") {
 		t.Errorf("execution_complete.Reason = %q, want it to name retry postPromptAsync as the failed step", reason)
+	}
+
+	// §7.3: the ORIGINAL overflow's own Diagnostic must survive this
+	// reconstruction -- adapter.go's own attemptCompactionRetry rebuilds a
+	// fresh turnOutcome{} here (only Reason is enriched), and
+	// turnOutcome.Diagnostic's own doc comment (outcome.go) requires every
+	// such reconstruction to carry Diagnostic forward unchanged.
+	if final.Diagnostic == nil {
+		t.Fatal("execution_complete.Diagnostic = nil, want the ORIGINAL overflow's own diagnostic carried forward")
+	}
+	if final.Diagnostic.UnionMember == nil || *final.Diagnostic.UnionMember != "ContextOverflowError" {
+		t.Errorf("Diagnostic.UnionMember = %v, want %q", final.Diagnostic.UnionMember, "ContextOverflowError")
+	}
+	if final.Diagnostic.Model == nil || *final.Diagnostic.Model == "" {
+		t.Errorf("Diagnostic.Model = %v, want a real, non-empty model name (cmd.Model was never set on this turn)", final.Diagnostic.Model)
+	}
+	if final.Diagnostic.RuntimeVersion == nil || *final.Diagnostic.RuntimeVersion != testRuntimeVersion {
+		t.Errorf("Diagnostic.RuntimeVersion = %v, want %q", final.Diagnostic.RuntimeVersion, testRuntimeVersion)
+	}
+	if final.Diagnostic.SandboxId == nil || *final.Diagnostic.SandboxId != testSandboxID {
+		t.Errorf("Diagnostic.SandboxId = %v, want %q", final.Diagnostic.SandboxId, testSandboxID)
 	}
 
 	if got := f.summarizeCallCount(); got != 1 {
