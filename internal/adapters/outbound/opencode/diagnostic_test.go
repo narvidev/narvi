@@ -122,9 +122,9 @@ func TestBuildProviderFailureDiagnostic_NeverLeaksCredentialsOrPromptContent(t *
 	}
 
 	a := &Adapter{runtimeVersion: testRuntimeVersion, sandboxID: testSandboxID}
-	ts := &turnState{model: "anthropic/claude-sonnet-4-5"}
+	model := "anthropic/claude-sonnet-4-5"
 
-	d := a.buildProviderFailureDiagnostic(&tagged, ts)
+	d := a.buildProviderFailureDiagnostic(&tagged, model)
 	if d == nil {
 		t.Fatal("buildProviderFailureDiagnostic returned nil for a non-nil tagged error")
 	}
@@ -217,7 +217,10 @@ func interfaceViaJSON(t *testing.T, v any) map[string]any {
 // "less diagnostic information... is the direction this must fail in"),
 // but the CONTAINMENT this relies on -- that Message reaches only
 // JSON-serialized surfaces, never raw markup -- must be true, not merely
-// assumed.
+// assumed. Recorded as a taken decision in docs/DECISIONS.md's own
+// "Taken" table -- a design acceptance living only in this comment is not
+// discoverable from there, and this file's own doc comment is not a
+// substitute for that register.
 const hostileProviderMessage = `<script>alert(document.cookie)</script> and also FAKE-SECRET-sk-live-DO-NOT-LEAK-abc123`
 
 // TestBuildProviderFailureDiagnostic_HostileMessageStaysJSONSafeOnTheWire
@@ -267,9 +270,9 @@ func TestBuildProviderFailureDiagnostic_HostileMessageStaysJSONSafeOnTheWire(t *
 	}
 
 	a := &Adapter{runtimeVersion: testRuntimeVersion, sandboxID: testSandboxID}
-	ts := &turnState{model: "anthropic/claude-sonnet-4-5"}
+	model := "anthropic/claude-sonnet-4-5"
 
-	d := a.buildProviderFailureDiagnostic(&tagged, ts)
+	d := a.buildProviderFailureDiagnostic(&tagged, model)
 	if d == nil {
 		t.Fatal("buildProviderFailureDiagnostic returned nil for a non-nil tagged error")
 	}
@@ -334,9 +337,9 @@ func TestBuildProviderFailureDiagnostic_ExtractsAllowlistedFields(t *testing.T) 
 	}
 
 	a := &Adapter{runtimeVersion: testRuntimeVersion, sandboxID: testSandboxID}
-	ts := &turnState{model: "anthropic/claude-sonnet-4-5"}
+	model := "anthropic/claude-sonnet-4-5"
 
-	d := a.buildProviderFailureDiagnostic(&tagged, ts)
+	d := a.buildProviderFailureDiagnostic(&tagged, model)
 	if d == nil {
 		t.Fatal("buildProviderFailureDiagnostic returned nil for a non-nil tagged error")
 	}
@@ -374,10 +377,10 @@ func TestBuildProviderFailureDiagnostic_NilErrReturnsNil(t *testing.T) {
 	t.Parallel()
 
 	a := &Adapter{runtimeVersion: testRuntimeVersion, sandboxID: testSandboxID}
-	ts := &turnState{model: "anthropic/claude-sonnet-4-5"}
+	model := "anthropic/claude-sonnet-4-5"
 
-	if d := a.buildProviderFailureDiagnostic(nil, ts); d != nil {
-		t.Errorf("buildProviderFailureDiagnostic(nil, ts) = %+v, want nil", d)
+	if d := a.buildProviderFailureDiagnostic(nil, model); d != nil {
+		t.Errorf("buildProviderFailureDiagnostic(nil, model) = %+v, want nil", d)
 	}
 }
 
@@ -393,9 +396,9 @@ func TestBuildProviderFailureDiagnostic_NilDataOmitsPayloadFields(t *testing.T) 
 	t.Parallel()
 
 	a := &Adapter{runtimeVersion: testRuntimeVersion, sandboxID: testSandboxID}
-	ts := &turnState{model: "anthropic/claude-sonnet-4-5"}
+	model := "anthropic/claude-sonnet-4-5"
 
-	d := a.buildProviderFailureDiagnostic(&openCodeTaggedError{Name: "UnknownError"}, ts)
+	d := a.buildProviderFailureDiagnostic(&openCodeTaggedError{Name: "UnknownError"}, model)
 	if d == nil {
 		t.Fatal("buildProviderFailureDiagnostic returned nil for a non-nil tagged error")
 	}
@@ -428,8 +431,9 @@ func TestBuildProviderFailureDiagnostic_NilDataOmitsPayloadFields(t *testing.T) 
 // dominant defect (a guard tested in isolation, never proven to be
 // REACHED) applied to a size cap instead of a call site. Plants an
 // over-cap value in EVERY field capDiagnosticField touches simultaneously
-// -- err.Name, ts.model, a.runtimeVersion, a.sandboxID, err.Data.Message,
-// and the one allowlisted request-id header -- and asserts every one of
+// -- err.Name, the model argument, a.runtimeVersion, a.sandboxID,
+// err.Data.Message, and the one allowlisted request-id header -- and
+// asserts every one of
 // the six resulting struct fields is capped AND visibly marked, proving
 // the cap is applied where it is actually exercised, not only where it is
 // called directly.
@@ -442,7 +446,7 @@ func TestBuildProviderFailureDiagnostic_CapsEveryFieldInThePathThatMatters(t *te
 	}
 
 	a := &Adapter{runtimeVersion: overCap, sandboxID: overCap}
-	ts := &turnState{model: overCap}
+	model := overCap
 	tagged := &openCodeTaggedError{
 		Name: overCap,
 		Data: &openCodeErrorData{
@@ -451,7 +455,7 @@ func TestBuildProviderFailureDiagnostic_CapsEveryFieldInThePathThatMatters(t *te
 		},
 	}
 
-	d := a.buildProviderFailureDiagnostic(tagged, ts)
+	d := a.buildProviderFailureDiagnostic(tagged, model)
 	if d == nil {
 		t.Fatal("buildProviderFailureDiagnostic returned nil for a non-nil tagged error")
 	}
@@ -523,6 +527,30 @@ func TestCapDiagnosticField(t *testing.T) {
 		// lands 2 bytes into a 4-byte sequence, which IS invalid UTF-8
 		// unless the walk-back logic actually runs. "😀" (U+1F600) is
 		// UTF-8's 4-byte case.
+		//
+		// A LATER audit fix (A3): the paragraph above is a CLAIM about
+		// today's constants, and nothing enforced it -- editing either
+		// diagnosticFieldMaxBytes or diagnosticTruncationMarker later
+		// (for an unrelated reason) could silently move `limit` back onto
+		// a multiple of 4, restoring the exact vacuity this fix removed,
+		// with nothing here to notice. Compute the boundary from the LIVE
+		// constants and refuse to proceed if it lands on a 4-byte rune
+		// boundary, BEFORE exercising capDiagnosticField at all -- this
+		// subtest's own claim to test something must fail loudly, not the
+		// assertions below pass vacuously.
+		const runeWidth = 4 // "😀" (U+1F600) is UTF-8's 4-byte case, used below.
+		limit := diagnosticFieldMaxBytes - len(diagnosticTruncationMarker)
+		if limit%runeWidth == 0 {
+			t.Fatalf("this subtest is VACUOUS with today's diagnosticFieldMaxBytes (%d) and "+
+				"diagnosticTruncationMarker length (%d bytes): the truncation boundary (%d) is "+
+				"exactly divisible by %d, so a naive byte-offset slice there lands on a rune "+
+				"boundary regardless of whether capDiagnosticField's own rune-safety walk-back "+
+				"loop runs at all -- choose a differently-sized test rune (or otherwise re-derive "+
+				"a payload that genuinely straddles this boundary) before trusting the assertions "+
+				"below to catch a regression",
+				diagnosticFieldMaxBytes, len(diagnosticTruncationMarker), limit, runeWidth)
+		}
+
 		long := strings.Repeat("😀", diagnosticFieldMaxBytes)
 		got := capDiagnosticField(long)
 		if !utf8.ValidString(got) {

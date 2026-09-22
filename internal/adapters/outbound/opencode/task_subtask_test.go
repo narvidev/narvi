@@ -61,7 +61,7 @@ func TestDispatchTool_TaskSubtask_StartsAndTagsNestedEvents(t *testing.T) {
 	sink, events := spyEventSink(t)
 
 	cmd := sandboxws.Prompt{SessionId: testSessionID, Gen: 1}
-	ts := newTurnState(cmd, sink, "")
+	ts := newTurnState(cmd, sink)
 	a.registerTurn(testTaskMainSessionID, ts)
 
 	// The MAIN lane's own assistant message -- required before
@@ -224,7 +224,7 @@ func TestDispatchTool_TaskSubtask_ErrorStatusFinishesAsFailed(t *testing.T) {
 	sink, events := spyEventSink(t)
 
 	cmd := sandboxws.Prompt{SessionId: testSessionID, Gen: 1}
-	ts := newTurnState(cmd, sink, "")
+	ts := newTurnState(cmd, sink)
 	a.registerTurn(testTaskMainSessionID, ts)
 
 	a.dispatchEvent(sseEnvelope{
@@ -258,7 +258,7 @@ func TestDispatchTool_TaskSubtask_ResolvedBeforeRunningStillBracketed(t *testing
 	sink, events := spyEventSink(t)
 
 	cmd := sandboxws.Prompt{SessionId: testSessionID, Gen: 1}
-	ts := newTurnState(cmd, sink, "")
+	ts := newTurnState(cmd, sink)
 	a.registerTurn(testTaskMainSessionID, ts)
 
 	a.dispatchEvent(sseEnvelope{
@@ -294,7 +294,7 @@ func TestFinalize_DrainsOpenTaskSubtask_WhenNeverCompleted(t *testing.T) {
 	sink, events := spyEventSink(t)
 
 	cmd := sandboxws.Prompt{SessionId: testSessionID, Gen: 1}
-	ts := newTurnState(cmd, sink, "")
+	ts := newTurnState(cmd, sink)
 	a.registerTurn(testTaskMainSessionID, ts)
 
 	a.dispatchEvent(sseEnvelope{Type: "message.part.updated", Properties: taskRunningPartJSON("call_task4")})
@@ -347,7 +347,7 @@ func TestMaybeStartTaskSubtask_SkipsRegistrationWhenAlreadyFinalized(t *testing.
 	sink, events := spyEventSink(t)
 
 	cmd := sandboxws.Prompt{SessionId: testSessionID, Gen: 1}
-	ts := newTurnState(cmd, sink, "")
+	ts := newTurnState(cmd, sink)
 	a.registerTurn(testTaskMainSessionID, ts)
 	ts.finalized = true
 

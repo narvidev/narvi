@@ -85,7 +85,7 @@ func TestFinalizeOrRecoverFromOverflow_AlreadyAttempted_CarriesDiagnosticForward
 
 	a := &Adapter{}
 	collector := &eventCollector{}
-	ts := newTurnState(sandboxws.Prompt{SessionId: testSessionID, Gen: 1}, collector.sink, "anthropic/claude-sonnet-4-5")
+	ts := newTurnState(sandboxws.Prompt{SessionId: testSessionID, Gen: 1}, collector.sink)
 	// Simulate "a recovery retry was already fully attempted for this
 	// turn" directly on ts -- the exact precondition
 	// resolveOverflowAction's own overflowActionAlreadyAttempted branch
@@ -129,7 +129,7 @@ func TestAttemptCompactionRetry_ForceCompactionFails_CarriesDiagnosticForward(t 
 	t.Cleanup(a.Close)
 
 	collector := &eventCollector{}
-	ts := newTurnState(sandboxws.Prompt{SessionId: testSessionID, Gen: 1}, collector.sink, "anthropic/claude-sonnet-4-5")
+	ts := newTurnState(sandboxws.Prompt{SessionId: testSessionID, Gen: 1}, collector.sink)
 
 	reason := "opencode: ContextOverflowError"
 	originalOutcome := turnOutcome{
@@ -163,7 +163,7 @@ func TestAttemptTransientRetry_BackoffInterrupted_CarriesDiagnosticForward(t *te
 	t.Cleanup(a.Close)
 
 	collector := &eventCollector{}
-	ts := newTurnState(sandboxws.Prompt{SessionId: testSessionID, Gen: 1}, collector.sink, "anthropic/claude-sonnet-4-5")
+	ts := newTurnState(sandboxws.Prompt{SessionId: testSessionID, Gen: 1}, collector.sink)
 
 	reason := "opencode: APIError"
 	originalOutcome := turnOutcome{

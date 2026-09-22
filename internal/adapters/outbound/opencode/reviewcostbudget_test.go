@@ -38,7 +38,7 @@ func TestDispatchPart_StepFinishAccumulatesCostOnMainLane(t *testing.T) {
 	sink, _ := spyEventSink(t)
 
 	cmd := sandboxws.Prompt{SessionId: "sess-cost-1", Gen: 1}
-	ts := newTurnState(cmd, sink, "")
+	ts := newTurnState(cmd, sink)
 	a.registerTurn(testCostMainSessionID, ts)
 
 	a.dispatchEvent(sseEnvelope{
@@ -65,7 +65,7 @@ func TestDispatchPart_StepFinishAccumulatesCostAcrossMainLaneAndSubtask(t *testi
 	sink, _ := spyEventSink(t)
 
 	cmd := sandboxws.Prompt{SessionId: "sess-cost-2", Gen: 1}
-	ts := newTurnState(cmd, sink, "")
+	ts := newTurnState(cmd, sink)
 	a.registerTurn(testCostMainSessionID, ts)
 	a.registerSubtaskSession(testCostChildSessionID, ts, "subtask-1")
 
@@ -123,7 +123,7 @@ func TestAdapter_CurrentTurnSpentUSD_ReadsTheLiveTurnsAccumulator(t *testing.T) 
 	sink, _ := spyEventSink(t)
 
 	cmd := sandboxws.Prompt{SessionId: "sess-cost-3", Gen: 1}
-	ts := newTurnState(cmd, sink, "")
+	ts := newTurnState(cmd, sink)
 	a.setCurrentSession(testCostMainSessionID)
 	a.registerTurn(testCostMainSessionID, ts)
 	a.registerSubtaskSession(testCostChildSessionID, ts, "subtask-1")

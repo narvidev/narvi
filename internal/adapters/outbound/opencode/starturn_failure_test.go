@@ -3,9 +3,13 @@ package opencode
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 )
@@ -106,5 +110,95 @@ func TestStartTurn_PostPromptAsyncGenuineFailureEmitsFailedTerminalEvent(t *test
 	if final.Outcome != sandboxws.ExecutionCompleteOutcomeFailed {
 		t.Errorf("execution_complete.Outcome = %q, want %q (a genuine failure, not a cancellation)",
 			final.Outcome, sandboxws.ExecutionCompleteOutcomeFailed)
+	}
+}
+
+// TestStartTurn_NilModelOmitsWireModelField pins §7.3/A1: a request that
+// names no model (cmd.Model nil -- the default configuration every one of
+// Composer/PlanModeView/Timeline resume/DecisionInbox dispatches through,
+// web/src/session) must reach OpenCode's own POST .../prompt_async with
+// the "model" key ABSENT ENTIRELY, letting the engine apply its own
+// configured default -- exactly origin/main's own behavior, confirmed by a
+// parent-commit control run directly against both revisions during this
+// audit (matching byte-for-byte: `{"parts":[{"type":"text","text":"hi"}]}`
+// on both, and `{"model":{"providerID":"anthropic",
+// "modelID":"claude-sonnet-4-5"},"parts":[...]}` on both for a named
+// model). An earlier version of resolveModel/resolveModelForced (session.go)
+// forced a hardcoded fallback model onto this exact request instead, a
+// silent PRODUCTION behavior change on every default turn for every
+// client -- not a diagnostic-only concern (§7.3's own "not the model that
+// ran" gap is fixed a different way, see ProviderFailureDiagnostic.Model's
+// own doc comment, diagnostic.go). This asserts the RAW wire bytes (not
+// the parsed Go struct, which a struct-level nil check could satisfy even
+// if some OTHER code path re-added the key under a different Go field),
+// so a regression that reintroduces resolveModelForced at this call site
+// is caught here directly, not merely inferred from the diagnostic.
+func TestStartTurn_NilModelOmitsWireModelField(t *testing.T) {
+	captured := make(chan []byte, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/session" && r.Method == http.MethodPost:
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(sessionResponse{ID: "ses_fake"})
+		case r.Method == http.MethodPost:
+			// The only OTHER POST this test's own StartTurn call can reach
+			// is .../prompt_async -- captured verbatim, raw bytes, before
+			// any Go struct ever gets a chance to reshape them.
+			raw, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("reading prompt_async request body: %v", err)
+			}
+			select {
+			case captured <- raw:
+			default:
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`true`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	a := New(srv.URL, testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
+	t.Cleanup(a.Close)
+
+	sink, _ := spyEventSink(t)
+	// Model deliberately left unset -- the default configuration.
+	cmd := sandboxws.Prompt{Type: "prompt", MessageId: "m1", SessionId: "sess-1", Gen: 1, Text: "hi"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), testWait)
+	defer cancel()
+	var group errgroup.Group
+	group.Go(func() error {
+		_, err := a.StartTurn(ctx, cmd, sink, nil)
+		return err
+	})
+
+	var raw []byte
+	select {
+	case raw = <-captured:
+	case <-time.After(testWait):
+		t.Fatal("prompt_async request was never observed -- StartTurn never reached postPromptAsync")
+	}
+
+	// Captured -- no need to let StartTurn run out its own full wait; this
+	// test only cares about the request it already sent.
+	cancel()
+	_ = group.Wait()
+
+	var asMap map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &asMap); err != nil {
+		t.Fatalf("json.Unmarshal(prompt_async request body) = %v; body: %s", err, raw)
+	}
+	if _, present := asMap["model"]; present {
+		t.Errorf("prompt_async request body = %s, want the \"model\" key ABSENT entirely for a request "+
+			"that named no model -- installing a Narvi-side default here is a production behavior change "+
+			"on every default turn, for every client, not merely a diagnostic-completeness concern "+
+			"(resolveModel's own doc comment, session.go)", raw)
+	}
+	if _, present := asMap["parts"]; !present {
+		t.Errorf("prompt_async request body = %s, want a real \"parts\" key present -- "+
+			"a body that has neither key would pass the \"model\" check above vacuously", raw)
 	}
 }

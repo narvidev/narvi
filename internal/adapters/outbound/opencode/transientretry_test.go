@@ -40,6 +40,29 @@ func apiErrorMessageUpdated(t *testing.T, sessionID, messageID string, retryable
 	})
 }
 
+// apiErrorMessageUpdatedWithModel mirrors apiErrorMessageUpdated above, but
+// also plants the engine-reported ModelID/ProviderID openCodeMessageInfo
+// now carries (§7.3, A2) -- used by tests that specifically assert
+// ProviderFailureDiagnostic.Model, to prove it is sourced from the
+// message's OWN reported model, never from cmd.Model or any request-side
+// resolution.
+func apiErrorMessageUpdatedWithModel(t *testing.T, sessionID, messageID string, retryable bool, providerID, modelID string) string {
+	t.Helper()
+	return sseLine(t, "message.updated", messageUpdatedProps{
+		SessionID: sessionID,
+		Info: openCodeMessageInfo{
+			ID:   messageID,
+			Role: "assistant",
+			Error: &openCodeTaggedError{
+				Name: "APIError",
+				Data: &openCodeErrorData{IsRetryable: retryable},
+			},
+			ModelID:    modelID,
+			ProviderID: providerID,
+		},
+	})
+}
+
 // TestTransientRetry_SucceedsAfterTransientAPIError proves the full round
 // trip for the "transient -> retried" table case this Step's own
 // instructions require: a transient (isRetryable=true) APIError on the
@@ -188,7 +211,14 @@ func TestTransientRetry_PermanentAPIErrorNeverRetried(t *testing.T) {
 
 	waitForTurnRegistered(t, a, "ses_fake")
 
-	f.broadcast(apiErrorMessageUpdated(t, "ses_fake", "msg_original", false))
+	// apiErrorMessageUpdatedWithModel, not the bare apiErrorMessageUpdated:
+	// cmd.Model is never set on this turn (the default configuration), so
+	// the wire request correctly omits "model" entirely (resolveModel,
+	// session.go, §7.3 A1) -- this planted ModelID/ProviderID is the ONLY
+	// source left for ProviderFailureDiagnostic.Model to read from (A2),
+	// simulating OpenCode itself picking its own configured default and
+	// reporting it back on the resulting assistant message.
+	f.broadcast(apiErrorMessageUpdatedWithModel(t, "ses_fake", "msg_original", false, "anthropic", "claude-sonnet-4-5"))
 	f.broadcast(sessionIdleLine(t, "ses_fake"))
 
 	if err := group.Wait(); err != nil {
@@ -209,8 +239,8 @@ func TestTransientRetry_PermanentAPIErrorNeverRetried(t *testing.T) {
 
 	// §7.3: the diagnostic must actually be reached in production (C1) --
 	// deleting sse.go's own call site leaves this nil -- and, on this
-	// DEFAULT, no-modelId configuration, Model must name a real model
-	// (C2), never "".
+	// DEFAULT, no-modelId configuration, Model must name the model the
+	// ENGINE itself reported for this message (A2), never "".
 	if final.Diagnostic == nil {
 		t.Fatal("execution_complete.Diagnostic = nil, want the allowlisted provider-failure record " +
 			"(sse.go's own dispatchEvent call site was never reached)")
@@ -218,16 +248,12 @@ func TestTransientRetry_PermanentAPIErrorNeverRetried(t *testing.T) {
 	if final.Diagnostic.UnionMember == nil || *final.Diagnostic.UnionMember != "APIError" {
 		t.Errorf("Diagnostic.UnionMember = %v, want %q", final.Diagnostic.UnionMember, "APIError")
 	}
-	if final.Diagnostic.Model == nil || *final.Diagnostic.Model == "" {
-		t.Errorf("Diagnostic.Model = %v, want a real, non-empty model name even though cmd.Model was "+
-			"never set on this turn (the default configuration every real client dispatches through) "+
-			"-- an empty Model here is §7.3's own headline fact still missing", final.Diagnostic.Model)
-	}
-	wantProviderID, wantModelID, _ := strings.Cut(fallbackModel, "/")
-	wantModel := wantProviderID + "/" + wantModelID
-	if final.Diagnostic.Model != nil && *final.Diagnostic.Model != wantModel {
-		t.Errorf("Diagnostic.Model = %q, want %q (resolveModelForced's own fallback for a nil cmd.Model)",
-			*final.Diagnostic.Model, wantModel)
+	wantModel := "anthropic/claude-sonnet-4-5"
+	if final.Diagnostic.Model == nil || *final.Diagnostic.Model != wantModel {
+		t.Errorf("Diagnostic.Model = %v, want %q (the message's own engine-reported model, even though "+
+			"cmd.Model was never set on this turn -- the default configuration every real client "+
+			"dispatches through) -- a wrong or empty Model here is §7.3's own headline fact still missing",
+			final.Diagnostic.Model, wantModel)
 	}
 	if final.Diagnostic.RuntimeVersion == nil || *final.Diagnostic.RuntimeVersion != testRuntimeVersion {
 		t.Errorf("Diagnostic.RuntimeVersion = %v, want %q", final.Diagnostic.RuntimeVersion, testRuntimeVersion)
@@ -244,21 +270,23 @@ func TestTransientRetry_PermanentAPIErrorNeverRetried(t *testing.T) {
 		t.Errorf("summarizeCallCount = %d, want exactly 0", got)
 	}
 
-	// The model this adapter DISPATCHED WITH must be genuinely resolved
-	// too (not merely reported in the diagnostic) -- the fake server's own
-	// prompt_async handler must have received the SAME resolved fallback
-	// model, since cmd.Model was nil: proves resolveModelForced's fallback
-	// is what StartTurn actually SENT, not a value invented only for the
-	// diagnostic after the fact.
+	// audit fix (§7.3, A1): the wire request itself must OMIT "model"
+	// entirely on this default, no-modelId configuration -- restoring
+	// origin/main's own behavior (resolveModel, session.go), which an
+	// earlier version of this package regressed by forcing
+	// resolveModelForced's own fallback onto EVERY dispatch, changing
+	// which model every default turn actually ran on in production. The
+	// diagnostic's own Model above is populated a different way (the
+	// engine's own report), so there is no longer any reason -- and no
+	// longer any correct behavior -- for this adapter to invent a model
+	// on the wire just to know one afterward.
 	f.mu.Lock()
 	promptModel := f.lastPromptModel
 	f.mu.Unlock()
-	if promptModel == nil {
-		t.Fatal("fake server's own prompt_async request carried no model field at all -- want the " +
-			"resolved fallback model explicitly sent, not omitted, now that StartTurn always resolves one")
-	}
-	if promptModel.ProviderID != wantProviderID || promptModel.ModelID != wantModelID {
-		t.Errorf("prompt_async request model = %+v, want providerID=%q modelID=%q", promptModel, wantProviderID, wantModelID)
+	if promptModel != nil {
+		t.Errorf("fake server's own prompt_async request carried model=%+v, want the field omitted "+
+			"entirely (cmd.Model was nil) -- forcing one changes PRODUCTION behavior on every default "+
+			"turn just to populate a diagnostic string", promptModel)
 	}
 }
 
@@ -412,7 +440,12 @@ func TestTransientRetry_RetryDispatchFailsIsNeverRetriedAgain(t *testing.T) {
 	waitForCount(t, "promptCallCount", f.promptCallCount, 1)
 	f.setPromptAsyncOK(false)
 
-	f.broadcast(apiErrorMessageUpdated(t, "ses_fake", "msg_original", true))
+	// apiErrorMessageUpdatedWithModel, not the bare apiErrorMessageUpdated:
+	// cmd.Model is never set on this turn, so the wire request correctly
+	// omits "model" (resolveModel, session.go, §7.3 A1) -- this planted
+	// ModelID/ProviderID is the ONLY source left for
+	// ProviderFailureDiagnostic.Model, matching the assertion below.
+	f.broadcast(apiErrorMessageUpdatedWithModel(t, "ses_fake", "msg_original", true, "anthropic", "claude-sonnet-4-5"))
 	f.broadcast(sessionIdleLine(t, "ses_fake"))
 
 	waitForCount(t, "promptCallCount", f.promptCallCount, 2)
@@ -443,15 +476,18 @@ func TestTransientRetry_RetryDispatchFailsIsNeverRetriedAgain(t *testing.T) {
 	// this reconstruction -- attemptTransientRetry rebuilds a fresh
 	// turnOutcome{} here (only Reason is enriched), and
 	// turnOutcome.Diagnostic's own doc comment (outcome.go) requires every
-	// such reconstruction to carry Diagnostic forward unchanged.
+	// such reconstruction to carry Diagnostic forward unchanged. Model
+	// comes from the ORIGINAL message's own engine-reported
+	// ModelID/ProviderID above, not from cmd.Model (never set on this
+	// turn) or any request-side resolution.
 	if final.Diagnostic == nil {
 		t.Fatal("execution_complete.Diagnostic = nil, want the ORIGINAL transient error's own diagnostic carried forward")
 	}
 	if final.Diagnostic.UnionMember == nil || *final.Diagnostic.UnionMember != "APIError" {
 		t.Errorf("Diagnostic.UnionMember = %v, want %q", final.Diagnostic.UnionMember, "APIError")
 	}
-	if final.Diagnostic.Model == nil || *final.Diagnostic.Model == "" {
-		t.Errorf("Diagnostic.Model = %v, want a real, non-empty model name (cmd.Model was never set on this turn)", final.Diagnostic.Model)
+	if want := "anthropic/claude-sonnet-4-5"; final.Diagnostic.Model == nil || *final.Diagnostic.Model != want {
+		t.Errorf("Diagnostic.Model = %v, want %q (the original message's own engine-reported model)", final.Diagnostic.Model, want)
 	}
 	if final.Diagnostic.RuntimeVersion == nil || *final.Diagnostic.RuntimeVersion != testRuntimeVersion {
 		t.Errorf("Diagnostic.RuntimeVersion = %v, want %q", final.Diagnostic.RuntimeVersion, testRuntimeVersion)

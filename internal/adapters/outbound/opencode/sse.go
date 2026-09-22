@@ -177,15 +177,16 @@ func (a *Adapter) dispatchEvent(env sseEnvelope) {
 			// isAssistantMessage gate (keyed by messageID, globally
 			// unique across OpenCode) needs a sub-task's own assistant
 			// messages marked too, or its own text parts would never
-			// translate. lastAssistantError, in contrast, feeds the
-			// ENCLOSING turn's own deriveOutcome (below) -- a sub-task's
-			// own internal error must NOT leak into the main turn's own
-			// outcome (see maybeFinishTaskSubtask for the real signal
-			// that governs a sub-task's OWN outcome instead), so that is
-			// only set for the main lane.
+			// translate. lastAssistantError/lastAssistantModel, in
+			// contrast, feed the ENCLOSING turn's own deriveOutcome
+			// (below) -- a sub-task's own internal error (or model) must
+			// NOT leak into the main turn's own outcome (see
+			// maybeFinishTaskSubtask for the real signal that governs a
+			// sub-task's OWN outcome instead), so that is only set for
+			// the main lane.
 			ts.markAssistantMessageID(props.Info.ID)
 			if subTaskID == "" {
-				ts.setLastAssistantError(props.Info.Error)
+				ts.setLastAssistantMessage(props.Info)
 			}
 		}
 
@@ -285,20 +286,23 @@ func (a *Adapter) dispatchEvent(env sseEnvelope) {
 		outcome := deriveOutcome(err, hasText, hasToolCall)
 		// §7.3: built here, not inside deriveOutcome itself --
 		// see turnOutcome.Diagnostic's own doc comment (outcome.go) for
-		// why deriveOutcome stays pure/Adapter-free. Gated on
+		// why deriveOutcome stays pure/Adapter-free. model comes from
+		// ts.modelForOutcome() (turn.go), which mirrors errorForOutcome's
+		// own tie-break exactly, so it always names the model belonging to
+		// THIS SAME err, never some other message's. Gated on
 		// outcome.Outcome == Failed -- audit fix: err is non-nil for a
 		// cancelled turn too (deriveOutcome maps err.Name ==
 		// "MessageAbortedError" to Outcome: Cancelled, outcome.go), and
-		// buildProviderFailureDiagnostic(err, ts) does not itself know
-		// which Outcome deriveOutcome just chose -- it returns non-nil for
-		// ANY non-nil err. Calling it unconditionally attached a
+		// buildProviderFailureDiagnostic does not itself know which
+		// Outcome deriveOutcome just chose -- it returns non-nil for ANY
+		// non-nil err. Calling it unconditionally attached a
 		// provider-failure record to a plain user-initiated Stop, which is
 		// not a provider failure at all and violates the wire schema's own
 		// "absent for every other outcome" (contracts/sandbox-ws/v1/
 		// events.schema.json's diagnostic description) -- see
 		// diagnostic_cancelled_test.go for the reproduction this pins.
 		if outcome.Outcome == sandboxws.ExecutionCompleteOutcomeFailed {
-			outcome.Diagnostic = a.buildProviderFailureDiagnostic(err, ts)
+			outcome.Diagnostic = a.buildProviderFailureDiagnostic(err, ts.modelForOutcome())
 		}
 		// "now": nothing intervenes between ts.touch()/the isCompacting
 		// guard above and the reads that produced err/hasText/hasToolCall

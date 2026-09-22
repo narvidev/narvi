@@ -59,7 +59,7 @@ func TestFinalize_LateSubtaskEmitIsDroppedNotRacedPastExecutionComplete(t *testi
 	}
 
 	cmd := sandboxws.Prompt{SessionId: "sess-race", Gen: 1}
-	ts := newTurnState(cmd, sink, "")
+	ts := newTurnState(cmd, sink)
 	a.registerTurn("ses_race", ts)
 
 	var group errgroup.Group

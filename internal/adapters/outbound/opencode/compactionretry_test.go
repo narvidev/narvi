@@ -57,6 +57,27 @@ func overflowMessageUpdated(t *testing.T, sessionID, messageID string) string {
 	})
 }
 
+// overflowMessageUpdatedWithModel mirrors overflowMessageUpdated above, but
+// also plants the engine-reported ModelID/ProviderID openCodeMessageInfo
+// now carries (§7.3, A2) -- used by tests that specifically assert
+// ProviderFailureDiagnostic.Model, to prove it is sourced from the
+// message's OWN reported model, not from cmd.Model or any request-side
+// resolution (which overflowMessageUpdated's own bare version, above,
+// deliberately leaves unset, since most callers here don't care).
+func overflowMessageUpdatedWithModel(t *testing.T, sessionID, messageID, providerID, modelID string) string {
+	t.Helper()
+	return sseLine(t, "message.updated", messageUpdatedProps{
+		SessionID: sessionID,
+		Info: openCodeMessageInfo{
+			ID:         messageID,
+			Role:       "assistant",
+			Error:      &openCodeTaggedError{Name: "ContextOverflowError"},
+			ModelID:    modelID,
+			ProviderID: providerID,
+		},
+	})
+}
+
 func plainAssistantMessageUpdated(t *testing.T, sessionID, messageID string) string {
 	t.Helper()
 	return sseLine(t, "message.updated", messageUpdatedProps{
@@ -1042,7 +1063,7 @@ func TestTurnState_TryBeginCompactionRetryIsAtomic(t *testing.T) {
 	t.Parallel()
 
 	collector := &eventCollector{}
-	ts := newTurnState(sandboxws.Prompt{}, collector.sink, "")
+	ts := newTurnState(sandboxws.Prompt{}, collector.sink)
 
 	const n = 50
 	results := make([]bool, n)
@@ -1105,7 +1126,7 @@ func TestCompactionRetry_ConcurrentOverflowDetectionAttemptsExactlyOnce(t *testi
 		Type: "prompt", MessageId: "m1", SessionId: "sess-race", Gen: 1,
 		Text: "racing overflow detection",
 	}
-	ts := newTurnState(cmd, collector.sink, "")
+	ts := newTurnState(cmd, collector.sink)
 	a.registerTurn("ses_fake", ts)
 	t.Cleanup(func() { a.unregisterTurn("ses_fake") })
 
@@ -1230,7 +1251,7 @@ func TestCompactionRetry_ConcurrentOverflowDetectionNeverFinalizesPrematurely(t 
 		Type: "prompt", MessageId: "m1", SessionId: "sess-race-premature", Gen: 1,
 		Text: "racing overflow detection must never finalize prematurely for a losing racer",
 	}
-	ts := newTurnState(cmd, collector.sink, "")
+	ts := newTurnState(cmd, collector.sink)
 	a.registerTurn("ses_fake", ts)
 	t.Cleanup(func() { a.unregisterTurn("ses_fake") })
 
@@ -1330,7 +1351,7 @@ func TestCompactionRetry_ConcurrentOverflowDetectionNeverFinalizesPrematurely(t 
 // abandon without mutating anything).
 func TestTurnState_ResolveOverflowActionDetectsStalenessWithoutIsCompacting(t *testing.T) {
 	collector := &eventCollector{}
-	ts := newTurnState(sandboxws.Prompt{}, collector.sink, "")
+	ts := newTurnState(sandboxws.Prompt{}, collector.sink)
 
 	snapshotTime := ts.lastActivityTime()
 
@@ -2122,7 +2143,14 @@ func TestCompactionRetry_RetryPostPromptAsyncFails(t *testing.T) {
 	waitForCount(t, "promptCallCount", f.promptCallCount, 1)
 	f.setPromptAsyncOK(false)
 
-	f.broadcast(overflowMessageUpdated(t, "ses_fake", "msg_original"))
+	// overflowMessageUpdatedWithModel, not the bare overflowMessageUpdated:
+	// cmd.Model is never set on this turn (the default configuration), so
+	// the wire request correctly omits "model" entirely (resolveModel,
+	// session.go) -- this planted ModelID/ProviderID is the ONLY source
+	// left for ProviderFailureDiagnostic.Model to read from (§7.3, A2),
+	// exactly matching what this test's own Diagnostic.Model assertion
+	// below now checks.
+	f.broadcast(overflowMessageUpdatedWithModel(t, "ses_fake", "msg_original", "anthropic", "claude-sonnet-4-5"))
 	f.broadcast(sessionIdleLine(t, "ses_fake"))
 
 	waitForCount(t, "summarizeCallCount", f.summarizeCallCount, 1)
@@ -2161,8 +2189,11 @@ func TestCompactionRetry_RetryPostPromptAsyncFails(t *testing.T) {
 	if final.Diagnostic.UnionMember == nil || *final.Diagnostic.UnionMember != "ContextOverflowError" {
 		t.Errorf("Diagnostic.UnionMember = %v, want %q", final.Diagnostic.UnionMember, "ContextOverflowError")
 	}
-	if final.Diagnostic.Model == nil || *final.Diagnostic.Model == "" {
-		t.Errorf("Diagnostic.Model = %v, want a real, non-empty model name (cmd.Model was never set on this turn)", final.Diagnostic.Model)
+	// §7.3, A2: Model comes from the ORIGINAL message's own engine-reported
+	// ModelID/ProviderID (overflowMessageUpdatedWithModel above), not from
+	// cmd.Model (never set on this turn) or any request-side resolution.
+	if want := "anthropic/claude-sonnet-4-5"; final.Diagnostic.Model == nil || *final.Diagnostic.Model != want {
+		t.Errorf("Diagnostic.Model = %v, want %q (the original message's own engine-reported model)", final.Diagnostic.Model, want)
 	}
 	if final.Diagnostic.RuntimeVersion == nil || *final.Diagnostic.RuntimeVersion != testRuntimeVersion {
 		t.Errorf("Diagnostic.RuntimeVersion = %v, want %q", final.Diagnostic.RuntimeVersion, testRuntimeVersion)
@@ -2445,7 +2476,7 @@ func TestCompactionRetry_FallbackAbandonsWhenAlreadyAttemptedBeforeFetchBegins(t
 		Type: "prompt", MessageId: "m1", SessionId: "sess-already-attempted", Gen: 1,
 		Text: "a compaction retry already won before the fallback was ever called at all",
 	}
-	ts := newTurnState(cmd, collector.sink, "")
+	ts := newTurnState(cmd, collector.sink)
 	a.registerTurn("ses_fake", ts)
 	t.Cleanup(func() { a.unregisterTurn("ses_fake") })
 

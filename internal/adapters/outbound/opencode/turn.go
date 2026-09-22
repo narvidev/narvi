@@ -20,24 +20,6 @@ type turnState struct {
 	cmd  sandboxws.Prompt // for stamping SessionId/Gen on every translated event (see translate.go)
 	sink ports.EventSink
 
-	// model is this turn's own "providerID/modelID" display string
-	// (modelDisplay, below) — audit fix (§7.3, "the model is empty in the
-	// default configuration"): NEVER "" for a real turn now that StartTurn
-	// resolves cmd.Model via resolveModelForced (session.go, adapter.go),
-	// which always returns a concrete *promptModelRef -- falling back to
-	// fallbackModelRef() rather than omitting the field when cmd.Model was
-	// nil (Composer/PlanModeView/Timeline resume/DecisionInbox all
-	// dispatch this way by default, web/src/session). Set exactly once,
-	// by newTurnState, from a value already resolved BEFORE this
-	// turnState is ever constructed (StartTurn, adapter.go) — so, exactly
-	// like cmd above, it is safe to read from any goroutine (the SSE
-	// dispatch goroutine, via buildProviderFailureDiagnostic, diagnostic.go)
-	// with no lock: it is immutable for this turnState's entire life, and
-	// registerTurn (the first point another goroutine can even observe
-	// this turnState at all) only ever runs after both cmd and model are
-	// already set.
-	model string
-
 	mu sync.Mutex
 
 	// toolCallSent/toolResultSent implement §7's own "dedupe tool states
@@ -90,6 +72,19 @@ type turnState struct {
 	sawText            bool
 	sawToolCall        bool
 
+	// lastAssistantModel is the "providerID/modelID" display string
+	// (modelDisplayFromInfo, diagnostic.go) OpenCode itself reported for
+	// the SAME assistant message lastAssistantError above came from —
+	// §7.3's own "the model that actually ran", sourced from the engine's
+	// report, never re-derived from this turn's own request. Set by
+	// setLastAssistantMessage, below, ATOMICALLY alongside
+	// lastAssistantError, from the identical message.updated event's own
+	// openCodeMessageInfo, so a later modelForOutcome()/errorForOutcome()
+	// pairing (below) can never attribute one message's model to a
+	// DIFFERENT message's error. "" when the reporting message carried no
+	// model info at all — see modelDisplayFromInfo's own doc comment.
+	lastAssistantModel string
+
 	// spentUSD is this turn's own running cost total (§7.1's own corrected
 	// text, §26.7) -- the accumulator §26.7's cost-budget
 	// mechanism assumed already existed (it did not, see
@@ -124,7 +119,7 @@ type turnState struct {
 	// (adapter.go) and either giving up or successfully re-dispatching the
 	// prompt — every dispatchEvent case that would otherwise corrupt this
 	// turnState's own tracked fields (markAssistantMessageID/
-	// setLastAssistantError/dispatchPart/finalize/setSessionError) with
+	// setLastAssistantMessage/dispatchPart/finalize/setSessionError) with
 	// compaction-INTERNAL SSE traffic checks isCompacting first and no-ops
 	// instead (see dispatchEvent's own doc comment, sse.go, and this
 	// Step's own VERIFIED LIVE finding: a synchronous POST /summarize call
@@ -209,11 +204,10 @@ type turnState struct {
 	done chan struct{}
 }
 
-func newTurnState(cmd sandboxws.Prompt, sink ports.EventSink, model string) *turnState {
+func newTurnState(cmd sandboxws.Prompt, sink ports.EventSink) *turnState {
 	return &turnState{
 		cmd:                 cmd,
 		sink:                sink,
-		model:               model,
 		toolCallSent:        make(map[string]bool),
 		toolResultSent:      make(map[string]bool),
 		subtasksOpen:        make(map[string]bool),
@@ -221,20 +215,6 @@ func newTurnState(cmd sandboxws.Prompt, sink ports.EventSink, model string) *tur
 		lastActivity:        time.Now(),
 		done:                make(chan struct{}),
 	}
-}
-
-// modelDisplay renders a resolved *promptModelRef (session.go's own
-// resolveModelForced) as the "providerID/modelID" string turnState.model
-// and ProviderFailureDiagnostic.Model both carry. The nil-ref guard below
-// is defensive only, not a real production case: resolveModelForced never
-// returns nil (session.go's own doc comment), so every caller today
-// passes a non-nil ref — kept so this function stays total rather than
-// panicking if a future caller ever passes nil.
-func modelDisplay(m *promptModelRef) string {
-	if m == nil {
-		return ""
-	}
-	return m.ProviderID + "/" + m.ModelID
 }
 
 // emit populates AgentEvent.Critical/AckID via ports.ClassifyAgentEvent
@@ -330,10 +310,21 @@ func (ts *turnState) lastActivityTime() time.Time {
 	return ts.lastActivity
 }
 
-func (ts *turnState) setLastAssistantError(err *openCodeTaggedError) {
+// setLastAssistantMessage records ONE assistant message.updated event's own
+// error AND engine-reported model ATOMICALLY, from the SAME
+// openCodeMessageInfo — see lastAssistantModel's own field comment above
+// for why this must never be two separate calls (one setting the error,
+// one the model): that would let a later reader observe a torn pairing
+// where the error came from one message and the model from a different,
+// earlier one. Overwrites on every call, exactly like the error-only
+// setLastAssistantError this replaces did — the LAST assistant
+// message.updated observed before session.idle is the one
+// errorForOutcome/modelForOutcome below ultimately use.
+func (ts *turnState) setLastAssistantMessage(info openCodeMessageInfo) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
-	ts.lastAssistantError = err
+	ts.lastAssistantError = info.Error
+	ts.lastAssistantModel = modelDisplayFromInfo(info)
 }
 
 // markAssistantMessageID records messageID as belonging to an assistant
@@ -577,6 +568,12 @@ func (ts *turnState) clearErrorsForRetry() {
 	defer ts.mu.Unlock()
 	ts.lastAssistantError = nil
 	ts.sessionError = nil
+	// lastAssistantModel is cleared alongside its own error for hygiene,
+	// not correctness -- modelForOutcome below only ever reads it when
+	// lastAssistantError is non-nil, so a stale value here would never
+	// actually surface. Cleared anyway so no future reader can be tempted
+	// to read it unconditionally and get a torn, pre-retry answer.
+	ts.lastAssistantModel = ""
 }
 
 func (ts *turnState) markSawText() {
@@ -644,6 +641,25 @@ func (ts *turnState) errorForOutcome() *openCodeTaggedError {
 		return ts.lastAssistantError
 	}
 	return ts.sessionError
+}
+
+// modelForOutcome returns the engine-reported model (modelDisplayFromInfo,
+// diagnostic.go) belonging to whichever error errorForOutcome above would
+// return — the SAME tie-break, deliberately mirrored rather than shared
+// via a single combined return, so each method keeps its own single
+// responsibility (session.error's own sessionErrorProps, sse.go, carries
+// no per-message model at all — there is no THIRD case for this method to
+// reach for). A session-level sessionError (lastAssistantError nil) has no
+// associated assistant message to report a model FOR, so this honestly
+// returns "" on that branch rather than lastAssistantModel's own
+// possibly-stale value.
+func (ts *turnState) modelForOutcome() string {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if ts.lastAssistantError != nil {
+		return ts.lastAssistantModel
+	}
+	return ""
 }
 
 func (ts *turnState) outcomeInputs() (hasText, hasToolCall bool) {

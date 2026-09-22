@@ -148,17 +148,22 @@ func decodeHeaderValue(raw json.RawMessage) string {
 // the inverse risk this struct guards against is a field becoming an
 // input to THIS record without a deliberate, reviewed addition here).
 //
-// Two sources, never conflated:
+// Three sources, never conflated:
 //   - Message/UnionMember/StatusCode/ProviderRequestID come from
 //     OpenCode's own tagged-union error, decoded through
 //     openCodeErrorData's own allowlist (types.go) — never the error
 //     object whole, and never responseHeaders/responseBody/metadata
 //     wholesale (see extractProviderRequestID's own doc comment for the
 //     one narrow exception, and why it stays narrow).
-//   - Model/RuntimeVersion/SandboxID are THIS ADAPTER'S OWN already-known
-//     context — never read from the wire payload at all. Model is the
-//     "providerID/modelID" this turn actually dispatched with
-//     (turnState.model, turn.go, captured at StartTurn); RuntimeVersion
+//   - Model comes from OpenCode's own report of which model produced the
+//     specific assistant message this failure is attached to
+//     (openCodeMessageInfo.ModelID/ProviderID, types.go) — the ENGINE's
+//     own answer, deliberately never this adapter's own request-side
+//     cmd.Model/resolveModel(Forced) (see this field's own doc comment
+//     below for why the request is the wrong source). Extracted by
+//     modelDisplayFromInfo, below.
+//   - RuntimeVersion/SandboxID are THIS ADAPTER'S OWN already-known
+//     context — never read from the wire payload at all. RuntimeVersion
 //     is the pinned OpenCode binary version this Adapter was constructed
 //     with (Adapter.runtimeVersion) — the SAME value §7's own boot
 //     fingerprint records (opencodeproc.Result.Version, sourced
@@ -198,17 +203,45 @@ type ProviderFailureDiagnostic struct {
 	// (§7.3). Never the headers map itself.
 	ProviderRequestID string `json:"providerRequestId,omitempty"`
 
-	// Model is the "providerID/modelID" string this turn actually
-	// dispatched with — adapter-side context, never itself part of
-	// OpenCode's own error payload. Never "" for a real turn: StartTurn
-	// resolves cmd.Model via resolveModelForced (session.go) before this
-	// turn's own turnState even exists, which always returns a concrete
-	// ref (falling back to fallbackModelRef() rather than omitting the
-	// wire field when the request named no model at all — the default
-	// configuration every one of Composer/PlanModeView/Timeline resume/
-	// DecisionInbox dispatches through, web/src/session) — so this field
-	// answers §7.3's own first-named-missing fact on every path, not only
-	// a client-picked one.
+	// Model is the "providerID/modelID" string OpenCode itself reports for
+	// the specific assistant message this failure is attached to
+	// (openCodeMessageInfo.ModelID/ProviderID, types.go) — the ENGINE's
+	// own report of which model actually ran, never this adapter's own
+	// request-side cmd.Model or its resolveModel(Forced) return value.
+	//
+	// Reading the REQUEST was always the wrong source for this field, for
+	// two separate reasons, and an earlier version of this package tried
+	// exactly that and got it wrong twice over: (1) cmd.Model is commonly
+	// nil (the default configuration every one of Composer/PlanModeView/
+	// Timeline resume/DecisionInbox dispatches through, web/src/session),
+	// and the wire request correctly OMITS the model field on that path
+	// (resolveModel, session.go) rather than substituting a Narvi-side
+	// default of its own (§7.3; the exact rule
+	// internal/app/workflowengine/advance.go's own doc comment states for
+	// modelID/effort's session-row fallback) — so a request-sourced Model
+	// would have to either lie (force one onto the wire the client never
+	// asked for, changing PRODUCTION behavior just to populate a
+	// diagnostic string) or stay "" on the overwhelmingly common path,
+	// which is the ORIGINAL pre-Step defect this field exists to fix.
+	// (2) Even when cmd.Model IS set, the compaction-retry path
+	// (attemptCompactionRetry, adapter.go) can resolve a DIFFERENT model
+	// for its own retried dispatch than the original attempt used
+	// (resolveModelForced's own doc comment, session.go) -- a
+	// request-sourced Model on that retry's own failure would then name a
+	// model the failing request did not use. Sourcing from the engine's
+	// own per-message report sidesteps both problems at once: whichever
+	// model actually produced the SPECIFIC message this diagnostic
+	// describes is what gets reported, regardless of which resolution
+	// path (or none) put it there.
+	//
+	// "" is still possible, honestly: a session-level session.error with
+	// no assistant message ever created for this turn (errorForOutcome's
+	// own sessionError branch, turn.go) has no per-message model to
+	// report at all, and the pinned OpenCode binary's own real payload
+	// might not carry ModelID/ProviderID the way this adapter currently
+	// believes it does (openCodeMessageInfo's own doc comment, types.go,
+	// is explicit about that verification gap) -- both are honest
+	// "unknown", never a wrong guess.
 	Model string `json:"model,omitempty"`
 
 	// RuntimeVersion is the pinned OpenCode binary version this sandbox
@@ -228,32 +261,31 @@ type ProviderFailureDiagnostic struct {
 // never reached OpenCode) returns nil: a diagnostic describes a PROVIDER
 // failure, and there is none to describe.
 //
-// Deliberately takes ts.model (a plain string, immutable after
-// newTurnState — see that field's own doc comment, turn.go, for why
-// reading it here from a goroutine other than the one that constructed
-// ts is race-free) rather than re-resolving the model itself: this
-// function must describe whatever model THIS turn actually dispatched
-// with, not re-derive a possibly-different answer from cmd.Model (a
-// second resolveModelForced call could, in principle, resolve to a
-// different promptModelRef if the catalog changed between the original
-// dispatch and a later failure — ts.model is the one value known to
-// match what was actually sent). This is why a RETRIED prompt's own
-// failure (attemptCompactionRetry/attemptTransientRetry, adapter.go)
-// never rebuilds a fresh Diagnostic from the retry's own freshly-resolved
-// model either — every reconstruction site there carries the ORIGINAL
-// outcome's Diagnostic (ts.model, frozen at StartTurn) forward unchanged,
-// per turnOutcome.Diagnostic's own doc comment (outcome.go); both the
-// original dispatch and any later retry resolve ts.cmd.Model through the
-// SAME resolveModelForced, so the two agree in practice except for that
-// same accepted, pre-existing "catalog changed mid-turn" edge case.
-func (a *Adapter) buildProviderFailureDiagnostic(err *openCodeTaggedError, ts *turnState) *ProviderFailureDiagnostic {
+// model is a plain "providerID/modelID" string (or "") the CALLER has
+// already extracted from the engine's own report on whichever assistant
+// message err itself came from — modelDisplayFromInfo, below, run over
+// that SAME message's openCodeMessageInfo. Taking a plain string rather
+// than a *turnState (an earlier version of this function did) keeps that
+// pairing correct by construction at every call site: sse.go's session.idle
+// case pairs ts.errorForOutcome() with ts.modelForOutcome() (turn.go),
+// which mirrors errorForOutcome's own lastAssistantError-vs-sessionError
+// tie-break exactly, so the two can never describe different messages;
+// finalizeByFallback (adapter.go) pairs last.Info.Error with
+// modelDisplayFromInfo(last.Info), the identical messageListEntry. Neither
+// call site re-resolves cmd.Model or calls resolveModel(Forced) here —
+// seeing §7.3's own "a retry decision is not a diagnosis" gap tempted an
+// earlier version of this package into reading the REQUEST's resolved
+// model instead, which is wrong for two independent reasons documented on
+// ProviderFailureDiagnostic.Model's own doc comment above; this
+// parameter's own engine-report sourcing avoids both.
+func (a *Adapter) buildProviderFailureDiagnostic(err *openCodeTaggedError, model string) *ProviderFailureDiagnostic {
 	if err == nil {
 		return nil
 	}
 
 	d := &ProviderFailureDiagnostic{
 		UnionMember:    capDiagnosticField(err.Name),
-		Model:          capDiagnosticField(ts.model),
+		Model:          capDiagnosticField(model),
 		RuntimeVersion: capDiagnosticField(a.runtimeVersion),
 		SandboxID:      capDiagnosticField(a.sandboxID),
 	}
@@ -263,4 +295,19 @@ func (a *Adapter) buildProviderFailureDiagnostic(err *openCodeTaggedError, ts *t
 		d.ProviderRequestID = capDiagnosticField(extractProviderRequestID(err.Data.ResponseHeaders))
 	}
 	return d
+}
+
+// modelDisplayFromInfo renders an openCodeMessageInfo's own engine-reported
+// model as a "providerID/modelID" string — the SAME display format
+// ProviderFailureDiagnostic.Model already uses. "" when either half is
+// unset: OpenCode's own AssistantMessage schema lists ModelID/ProviderID as
+// required together (openCodeMessageInfo's own doc comment, types.go), but
+// a UserMessage carries neither, and this defends the same way against a
+// partial value from a payload shape this adapter has not independently
+// verified live.
+func modelDisplayFromInfo(info openCodeMessageInfo) string {
+	if info.ProviderID == "" || info.ModelID == "" {
+		return ""
+	}
+	return info.ProviderID + "/" + info.ModelID
 }

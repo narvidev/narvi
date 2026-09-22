@@ -368,6 +368,18 @@ func TestWaitForTurn_GenuinelyStuckTurnFallbackFailureCarriesDiagnostic(t *testi
 					StatusCode: &statusCode,
 				},
 			},
+			// ModelID/ProviderID: the ENGINE's own report of which model
+			// produced this message -- audit fix (§7.3, A2): this is the
+			// ONLY source ProviderFailureDiagnostic.Model now reads from
+			// (diagnostic.go), precisely because cmd.Model below is nil
+			// (see its own comment) and the wire request correctly omits
+			// the "model" field entirely on that path (resolveModel,
+			// session.go) -- there is no request-side model to fall back
+			// to here, by design, so this field is the only way this test
+			// can prove Model still populates on the default,
+			// no-model-requested configuration.
+			ModelID:    "claude-sonnet-4-5",
+			ProviderID: "anthropic",
 		},
 	}})
 
@@ -402,8 +414,13 @@ func TestWaitForTurn_GenuinelyStuckTurnFallbackFailureCarriesDiagnostic(t *testi
 	if final.Diagnostic.StatusCode == nil || *final.Diagnostic.StatusCode != statusCode {
 		t.Errorf("Diagnostic.StatusCode = %v, want %d", final.Diagnostic.StatusCode, statusCode)
 	}
-	if final.Diagnostic.Model == nil || *final.Diagnostic.Model == "" {
-		t.Errorf("Diagnostic.Model = %v, want a real, non-empty model name on this default (no modelId) configuration", final.Diagnostic.Model)
+	// audit fix (§7.3, A2): Model comes from the fetched message's own
+	// engine-reported ModelID/ProviderID above, NOT from cmd.Model (nil
+	// here) or any request-side resolution -- proving this default,
+	// no-model-requested configuration still gets a real, accurate Model
+	// on the diagnostic, sourced the correct way.
+	if want := "anthropic/claude-sonnet-4-5"; final.Diagnostic.Model == nil || *final.Diagnostic.Model != want {
+		t.Errorf("Diagnostic.Model = %v, want %q (the fetched message's own engine-reported model)", final.Diagnostic.Model, want)
 	}
 }
 

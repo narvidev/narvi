@@ -18,7 +18,7 @@ func TestFinalize_SecondCallIsNoOp(t *testing.T) {
 	sink, events := spyEventSink(t)
 
 	cmd := sandboxws.Prompt{SessionId: "sess-1", Gen: 1}
-	ts := newTurnState(cmd, sink, "")
+	ts := newTurnState(cmd, sink)
 
 	reason1 := "first"
 	a.finalize(ts, turnOutcome{Outcome: sandboxws.ExecutionCompleteOutcomeCompleted, Reason: &reason1})
@@ -51,7 +51,7 @@ func TestFinalize_DrainsOpenSubtasksWithSubTaskFinish(t *testing.T) {
 	sink, events := spyEventSink(t)
 
 	cmd := sandboxws.Prompt{SessionId: "sess-1", Gen: 1}
-	ts := newTurnState(cmd, sink, "")
+	ts := newTurnState(cmd, sink)
 	a.registerTurn("ses_test", ts)
 
 	a.dispatchSubtaskStart(ts, subtaskPart{ID: "sub-1", MessageID: "msg-1", Description: "an open subtask"})
@@ -95,7 +95,7 @@ func TestFinalizeByFallback_FetchFailureAlsoFinalizesAsFailed(t *testing.T) {
 	sink, events := spyEventSink(t)
 
 	cmd := sandboxws.Prompt{SessionId: "sess-1", Gen: 1}
-	ts := newTurnState(cmd, sink, "")
+	ts := newTurnState(cmd, sink)
 
 	// newDispatchTestAdapter points at an unreachable address
 	// (http://127.0.0.1:1), so fetchFinalMessages fails outright here --

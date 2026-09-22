@@ -142,10 +142,35 @@ type messageUpdatedProps struct {
 // observed live, however, on the third scripted turn (an aborted turn),
 // confirming the shape: {"error":{"name":"MessageAbortedError",
 // "data":{"message":"Aborted"}}}.
+//
+// ModelID/ProviderID (§7.3, "the model that actually ran"): SCHEMA-DERIVED
+// ONLY, and honestly weaker than this file's usual "schema-derived"
+// citation — the pinned 1.17.15 binary's own /doc was never re-queried for
+// this specific pair (no opencode binary is reachable in this dev
+// environment; the earlier research pass that captured every OTHER field
+// on this type never needed them). Sourced instead from OpenCode's own
+// publicly-generated SDK type definitions for its AssistantMessage type,
+// which list BOTH as required (non-optional) string fields alongside
+// "error" — i.e. the engine's own report of which model produced this
+// exact assistant message, not this adapter's own request-side guess.
+// That source is drawn from a newer revision than the pinned binary, and a
+// revision difference is a REAL, confirmed risk here, not a hypothetical
+// one: the SAME fetch also showed openCodeTaggedError's own error-union
+// membership narrowed relative to what THIS file documents (5 named
+// variants there vs. 8 here), proving the schema has drifted release to
+// release. Modeled anyway, deliberately fail-soft: json.Unmarshal leaves
+// an absent key at its Go zero value ("") with no error, so if the pinned
+// 1.17.15 binary's real payload turns out not to carry one or both of
+// these keys, decoding degrades to the exact same "" this adapter already
+// reported before this field existed — never a wrong value, only
+// possibly still an absent one. See modelDisplayFromInfo's own doc
+// comment (diagnostic.go) for how a partial/absent pair is handled.
 type openCodeMessageInfo struct {
-	ID    string               `json:"id"`
-	Role  string               `json:"role"`
-	Error *openCodeTaggedError `json:"error"`
+	ID         string               `json:"id"`
+	Role       string               `json:"role"`
+	Error      *openCodeTaggedError `json:"error"`
+	ModelID    string               `json:"modelID"`
+	ProviderID string               `json:"providerID"`
 }
 
 // openCodeTaggedError is the tagged-union shape OpenCode uses for both
