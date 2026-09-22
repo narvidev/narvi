@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -835,9 +836,15 @@ func TestHandleSandboxEvent_ExecutionCompleteFailed_OperatorLogReachesTheRealPat
 		t.Fatalf("GetOrSpawn: %v", err)
 	}
 
+	// F4: StatusCode included here (the earlier version of this fixture
+	// omitted it) -- the field-by-field comparison below must exercise
+	// every field this diagnostic actually carries, StatusCode included,
+	// not six of its seven.
+	wantStatusCode := 429
 	wantDiagnostic := &sandboxws.ExecutionCompleteDiagnostic{
 		Message:           strPtr("The upstream provider rejected this request."),
 		UnionMember:       strPtr("APIError"),
+		StatusCode:        &wantStatusCode,
 		ProviderRequestId: strPtr("req_visible_public_abc123"),
 		Model:             strPtr("anthropic/claude-sonnet-4-5"),
 		RuntimeVersion:    strPtr("0.0.0-test"),
@@ -903,36 +910,44 @@ func TestHandleSandboxEvent_ExecutionCompleteFailed_OperatorLogReachesTheRealPat
 		t.Errorf("operator log message_id missing or not a string: %v", entry["message_id"])
 	}
 
-	// Finding 3: compare the two surfaces to EACH OTHER, field by field --
-	// never each against wantDiagnostic independently, which would pass
-	// even if the journal and the log had silently diverged from one
-	// another while each still happened to match the fixture.
-	logStr := func(key string) *string {
-		v, ok := entry[key].(string)
+	// Finding 3 (F4): compare the two surfaces to EACH OTHER, field by
+	// field -- never each against wantDiagnostic independently, which
+	// would pass even if the journal and the log had silently diverged
+	// from one another while each still happened to match the fixture.
+	//
+	// Driven by reflection over sandboxws.ExecutionCompleteDiagnostic
+	// itself, not a hand-enumerated field list: a hand-enumerated list
+	// silently stops covering a field the moment a new one is added to
+	// the wire type -- exactly what had already happened here once
+	// (statusCode had no entry in this comparison at all until this
+	// change). Walking diagType's own fields below and requiring a
+	// diagnosticFieldLogAttr entry (pushpr_test.go) for each turns that
+	// omission into a test FAILURE instead of a silent gap: a future
+	// field with no matching logProviderFailureDiagnostic case
+	// (pushpr.go) AND no entry in diagnosticFieldLogAttr fails this test
+	// outright, on the commit that adds the field, not on whatever later
+	// commit happens to notice the operator log is missing something.
+	diagType := reflect.TypeOf(sandboxws.ExecutionCompleteDiagnostic{})
+	journalVal := reflect.ValueOf(*journal.Diagnostic)
+	for i := 0; i < diagType.NumField(); i++ {
+		field := diagType.Field(i)
+		attr, ok := diagnosticFieldLogAttr[field.Name]
 		if !ok {
-			return nil
+			t.Fatalf("sandboxws.ExecutionCompleteDiagnostic gained a field %q with no entry in "+
+				"diagnosticFieldLogAttr (pushpr_test.go) -- add one (and a matching case to "+
+				"logProviderFailureDiagnostic, pushpr.go) so this comparison keeps covering every field",
+				field.Name)
 		}
-		return &v
-	}
-	compare := []struct {
-		field       string
-		journal, ok *string
-	}{
-		{"message", journal.Diagnostic.Message, logStr("diagnostic_message")},
-		{"unionMember", journal.Diagnostic.UnionMember, logStr("diagnostic_union_member")},
-		{"providerRequestId", journal.Diagnostic.ProviderRequestId, logStr("diagnostic_provider_request_id")},
-		{"model", journal.Diagnostic.Model, logStr("diagnostic_model")},
-		{"runtimeVersion", journal.Diagnostic.RuntimeVersion, logStr("diagnostic_runtime_version")},
-		{"sandboxId", journal.Diagnostic.SandboxId, logStr("diagnostic_sandbox_id")},
-	}
-	for _, c := range compare {
+		journalStr, journalPresent := diagnosticFieldString(journalVal.Field(i))
+		logStr, logPresent := logAttrString(entry, attr)
 		switch {
-		case c.journal == nil && c.ok == nil:
+		case !journalPresent && !logPresent:
 			// Both surfaces agree the field is absent -- fine.
-		case c.journal == nil || c.ok == nil:
-			t.Errorf("%s: journal=%v operator_log=%v -- one surface has this field, the other does not", c.field, c.journal, c.ok)
-		case *c.journal != *c.ok:
-			t.Errorf("%s: journal=%q operator_log=%q -- the two §7.3 surfaces disagree", c.field, *c.journal, *c.ok)
+		case journalPresent != logPresent:
+			t.Errorf("%s: journal_present=%v (%q) operator_log_present=%v (%q) -- one surface has this field, the other does not",
+				field.Name, journalPresent, journalStr, logPresent, logStr)
+		case journalStr != logStr:
+			t.Errorf("%s: journal=%q operator_log=%q -- the two §7.3 surfaces disagree", field.Name, journalStr, logStr)
 		}
 	}
 }
