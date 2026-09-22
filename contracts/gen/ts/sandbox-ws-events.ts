@@ -266,6 +266,39 @@ export interface ExecutionComplete {
    * §6.1/§7.1 sub-task fan-out: OPTIONAL — absent or null means this event belongs to the turn's main lane; a non-null value is the subTaskId (same id sub_task_start/sub_task_finish carry) of the sub-task lane this event belongs to.
    */
   subTaskId?: string | null;
+  /**
+   * §7.3 ("a retry decision is not a diagnosis"): the allowlisted, size-capped provider-failure record retained when outcome is "failed" AND the agent runtime (OpenCode) reported a real tagged-union error -- absent for every other outcome, and absent even for a failed outcome when no such error was ever observed (e.g. a turn that produced no output at all). Every property is OPTIONAL: OpenCode is free to omit any of these from its own error payload, and not every tagged-union member defines all of them. NEVER an input to any retry/classification decision -- that stays on OpenCode's own typed discriminator alone; this object exists purely for a human (or an operator's own correlation-id-scoped diagnostic path) to read once retries are exhausted.
+   */
+  diagnostic?: {
+    /**
+     * OpenCode's own human-readable error message, size-capped. Never the raw provider response body -- that is where credentials and prompt content live, and is never retained at all.
+     */
+    message?: string;
+    /**
+     * OpenCode's own tagged-union error-kind name, e.g. "APIError" -- purely descriptive, never itself a classification input.
+     */
+    unionMember?: string;
+    /**
+     * The HTTP status OpenCode itself already decoded from the upstream provider, when present. Corroborating detail only.
+     */
+    statusCode?: number;
+    /**
+     * The upstream provider's own request identifier, extracted from a small, named allowlist of known response-header keys -- never the full headers map, which is where credentials can also live. The one token that makes a support conversation with the provider possible.
+     */
+    providerRequestId?: string;
+    /**
+     * "providerID/modelID" this turn actually dispatched with. Sourced from the agent runtime's own dispatch record, never from OpenCode's error payload.
+     */
+    model?: string;
+    /**
+     * The pinned OpenCode binary version this sandbox actually ran -- the same value the boot fingerprint records.
+     */
+    runtimeVersion?: string;
+    /**
+     * The sandbox this turn ran on.
+     */
+    sandboxId?: string;
+  };
 }
 /**
  * CRITICAL (requires ackId).
