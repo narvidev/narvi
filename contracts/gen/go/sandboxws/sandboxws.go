@@ -546,10 +546,15 @@ type ExecutionCompleteDiagnostic struct {
 	// runtime's own dispatch record, never from OpenCode's error payload.
 	Model *string `json:"model,omitempty,omitzero" yaml:"model,omitempty" mapstructure:"model,omitempty"`
 
-	// The upstream provider's own request identifier, extracted from a small, named
-	// allowlist of known response-header keys -- never the full headers map, which is
-	// where credentials can also live. The one token that makes a support
-	// conversation with the provider possible.
+	// An identifier that locates this request with whoever operates the failing
+	// endpoint, extracted from a small, named, priority-ordered allowlist of
+	// response-header keys (x-request-id, request-id, cf-ray -- never the full
+	// headers map, which is where credentials can also live). Not guaranteed to be
+	// the upstream provider's own application-level request id: a real provider
+	// APIError has been observed carrying none of its own (its response body's own
+	// request_id null), with only cf-ray -- Cloudflare's edge-level per-request
+	// identifier -- present; when a provider's own request id IS present under one of
+	// the other two header names, that one wins.
 	ProviderRequestId *string `json:"providerRequestId,omitempty,omitzero" yaml:"providerRequestId,omitempty" mapstructure:"providerRequestId,omitempty"`
 
 	// The pinned OpenCode binary version this sandbox actually ran -- the same value

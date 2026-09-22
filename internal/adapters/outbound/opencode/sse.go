@@ -287,9 +287,9 @@ func (a *Adapter) dispatchEvent(env sseEnvelope) {
 		// §7.3: built here, not inside deriveOutcome itself --
 		// see turnOutcome.Diagnostic's own doc comment (outcome.go) for
 		// why deriveOutcome stays pure/Adapter-free. model comes from
-		// ts.modelForOutcome() (turn.go), which mirrors errorForOutcome's
-		// own tie-break exactly, so it always names the model belonging to
-		// THIS SAME err, never some other message's. Gated on
+		// ts.modelForOutcome() (turn.go) -- see that method's own doc
+		// comment for why it is deliberately NOT required to name the
+		// same message err itself came from. Gated on
 		// outcome.Outcome == Failed -- audit fix: err is non-nil for a
 		// cancelled turn too (deriveOutcome maps err.Name ==
 		// "MessageAbortedError" to Outcome: Cancelled, outcome.go), and

@@ -627,3 +627,107 @@ func TestModelDisplayFromInfo(t *testing.T) {
 		})
 	}
 }
+
+// TestExtractProviderRequestID_AllowlistCoverage is F6's own regression
+// test: requestIDHeaderCandidates (above) was enforced by nothing but its
+// own hand-written loop -- before this test, deleting "request-id" from
+// that slice left this package's whole suite green, since no existing
+// test ever exercised a payload carrying ONLY that header (every other
+// caller uses either "x-request-id" alone,
+// TestBuildProviderFailureDiagnostic_ExtractsAllowlistedFields's own
+// maliciousAPIErrorPayload above, or "cf-ray" alone,
+// realbinarycapture_test.go's own captured bytes).
+//
+// Each "only <X> present" subtest below is a per-entry mutation target:
+// delete that ONE entry from requestIDHeaderCandidates and the matching
+// subtest fails while the rest stay green, proving each entry is
+// independently load-bearing. The remaining subtests cover the allowlist's
+// own priority order (x-request-id, then request-id, then cf-ray, see
+// requestIDHeaderCandidates' own doc comment) against payloads carrying
+// MORE than one candidate at once -- a genuine provider request id must
+// still win over cf-ray's own edge-level identifier when both are present
+// on the same response.
+func TestExtractProviderRequestID_AllowlistCoverage(t *testing.T) {
+	t.Parallel()
+
+	rawStr := func(s string) json.RawMessage { return json.RawMessage(mustJSONString(t, s)) }
+
+	tests := []struct {
+		name    string
+		headers map[string]json.RawMessage
+		want    string
+	}{
+		{
+			name:    "only x-request-id present",
+			headers: map[string]json.RawMessage{"x-request-id": rawStr("req_xrid_only")},
+			want:    "req_xrid_only",
+		},
+		{
+			name:    "only request-id present",
+			headers: map[string]json.RawMessage{"request-id": rawStr("req_ridonly")},
+			want:    "req_ridonly",
+		},
+		{
+			name:    "only cf-ray present",
+			headers: map[string]json.RawMessage{"cf-ray": rawStr("a3f1328d4e1be195-MRS")},
+			want:    "a3f1328d4e1be195-MRS",
+		},
+		{
+			name: "x-request-id wins over cf-ray -- a genuine provider request id present alongside the CDN's own",
+			headers: map[string]json.RawMessage{
+				"cf-ray":       rawStr("a3f1328d4e1be195-MRS"),
+				"x-request-id": rawStr("req_more_specific"),
+			},
+			want: "req_more_specific",
+		},
+		{
+			name: "request-id wins over cf-ray",
+			headers: map[string]json.RawMessage{
+				"cf-ray":     rawStr("a3f1328d4e1be195-MRS"),
+				"request-id": rawStr("req_more_specific_2"),
+			},
+			want: "req_more_specific_2",
+		},
+		{
+			name: "x-request-id wins over request-id -- the FIRST application-level convention, per priority order",
+			headers: map[string]json.RawMessage{
+				"request-id":   rawStr("req_second_priority"),
+				"x-request-id": rawStr("req_first_priority"),
+			},
+			want: "req_first_priority",
+		},
+		{
+			name: "all three present at once -- x-request-id still wins",
+			headers: map[string]json.RawMessage{
+				"cf-ray":       rawStr("a3f1328d4e1be195-MRS"),
+				"request-id":   rawStr("req_second_priority"),
+				"x-request-id": rawStr("req_first_priority"),
+			},
+			want: "req_first_priority",
+		},
+		{
+			name:    "header name match is case-insensitive",
+			headers: map[string]json.RawMessage{"X-Request-ID": rawStr("req_case_insensitive")},
+			want:    "req_case_insensitive",
+		},
+		{
+			name:    "none of the allowlisted headers present",
+			headers: map[string]json.RawMessage{"authorization": rawStr("Bearer secret")},
+			want:    "",
+		},
+		{
+			name:    "array-shaped header value (net/http.Header's own JSON shape) still decodes",
+			headers: map[string]json.RawMessage{"cf-ray": json.RawMessage(`["a3f1328d4e1be195-MRS", "second-element-ignored"]`)},
+			want:    "a3f1328d4e1be195-MRS",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := extractProviderRequestID(tt.headers); got != tt.want {
+				t.Errorf("extractProviderRequestID(%v) = %q, want %q", tt.headers, got, tt.want)
+			}
+		})
+	}
+}

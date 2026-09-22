@@ -143,14 +143,14 @@ func extractProviderRequestID(headers map[string]json.RawMessage) string {
 
 // decodeHeaderValue tolerates both shapes a JSON-encoded HTTP header
 // value might take in OpenCode's own responseHeaders object: a single
-// string (the common case for a header map serialized from a plain JS
-// object), or an array of strings (matching Go's own net/http.Header
-// JSON shape, in case OpenCode ever serializes it that way without
-// flattening) — since this adapter has never observed a real APIError's
-// own responseHeaders live (see requestIDHeaderCandidates' own doc
-// comment), it cannot assume either shape. Returns "" for anything else,
-// including a decode failure — extractProviderRequestID's own caller-side
-// loop already treats an empty result as "try the next candidate".
+// string (the shape the real captured responseHeaders payload actually
+// carries every value under — see openCodeErrorData's own doc comment,
+// types.go), or an array of strings (matching Go's own net/http.Header
+// JSON shape; never observed live, kept defensively for a provider or
+// OpenCode revision this adapter has not captured). Returns "" for
+// anything else, including a decode failure — extractProviderRequestID's
+// own caller-side loop already treats an empty result as "try the next
+// candidate".
 func decodeHeaderValue(raw json.RawMessage) string {
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
@@ -298,14 +298,14 @@ type ProviderFailureDiagnostic struct {
 // failure, and there is none to describe.
 //
 // model is a plain "providerID/modelID" string (or "") the CALLER has
-// already extracted from the engine's own report on whichever assistant
-// message err itself came from — modelDisplayFromInfo, below, run over
-// that SAME message's openCodeMessageInfo. Taking a plain string rather
-// than a *turnState (an earlier version of this function did) keeps that
-// pairing correct by construction at every call site: sse.go's session.idle
-// case pairs ts.errorForOutcome() with ts.modelForOutcome() (turn.go),
-// which mirrors errorForOutcome's own lastAssistantError-vs-sessionError
-// tie-break exactly, so the two can never describe different messages;
+// already resolved before calling this function, from the engine's own
+// per-message report (modelDisplayFromInfo, below) — never re-derived
+// here. Taking a plain string rather than a *turnState (an earlier
+// version of this function did) keeps that resolution a single call
+// site's own responsibility: sse.go's session.idle case pairs
+// ts.errorForOutcome() with ts.modelForOutcome() (turn.go) — see
+// modelForOutcome's own doc comment (turn.go) for why the two are
+// deliberately NOT required to describe the same assistant message;
 // finalizeByFallback (adapter.go) pairs last.Info.Error with
 // modelDisplayFromInfo(last.Info), the identical messageListEntry. Neither
 // call site re-resolves cmd.Model or calls resolveModel(Forced) here —
