@@ -561,3 +561,69 @@ func TestCapDiagnosticField(t *testing.T) {
 		}
 	})
 }
+
+// TestModelDisplayFromInfo is E4's own pin: modelDisplayFromInfo's
+// empty-half guard is the exact mechanism implementing this package's
+// stated mitigation for OpenCode's own AssistantMessage schema drifting
+// (openCodeMessageInfo's own doc comment, types.go) -- "degrades to an
+// empty string if the field is absent" -- rather than emitting a
+// half-populated, misleading "providerID/" or "/modelID" string. Before
+// this test, deleting the `if info.ProviderID == "" || info.ModelID ==
+// "" { return "" }` guard entirely (diagnostic.go) left this package's
+// whole suite green: nothing exercised a message.updated with exactly
+// ONE of the two fields set. Covers all four combinations.
+func TestModelDisplayFromInfo(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		providerID string
+		modelID    string
+		want       string
+	}{
+		{
+			name:       "both present",
+			providerID: "anthropic",
+			modelID:    "claude-opus-5",
+			want:       "anthropic/claude-opus-5",
+		},
+		{
+			// VERIFIED LIVE shape (openCodeMessageInfo's own doc comment,
+			// types.go): the pinned 1.17.15 binary's real AssistantMessage
+			// payload carries both fields together whenever it carries
+			// either -- this case (and "only modelID" below) covers the
+			// SCHEMA's own stated contract, not a shape this adapter has
+			// observed live, exactly the drift this guard defends against.
+			name:       "only providerID present",
+			providerID: "anthropic",
+			modelID:    "",
+			want:       "",
+		},
+		{
+			name:       "only modelID present",
+			providerID: "",
+			modelID:    "claude-opus-5",
+			want:       "",
+		},
+		{
+			name:       "neither present",
+			providerID: "",
+			modelID:    "",
+			want:       "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			info := openCodeMessageInfo{
+				ID: "msg1", Role: "assistant",
+				ProviderID: tt.providerID, ModelID: tt.modelID,
+			}
+			if got := modelDisplayFromInfo(info); got != tt.want {
+				t.Errorf("modelDisplayFromInfo(providerID=%q, modelID=%q) = %q, want %q",
+					tt.providerID, tt.modelID, got, tt.want)
+			}
+		})
+	}
+}

@@ -752,3 +752,99 @@ func TestCompactionRetry_SharesOneShotBudgetWithTransientRetry(t *testing.T) {
 		t.Errorf("promptCallCount = %d, want exactly 2 (original + the one compaction retry, no more)", got)
 	}
 }
+
+// TestTransientRetry_NilModelOmitsWireModelFieldOnRetryDispatch is E3's own
+// pin: attemptTransientRetry's own re-dispatch (adapter.go) must resolve
+// its model via resolveModel, NOT resolveModelForced, exactly like
+// StartTurn's own original dispatch does (pinned separately by
+// TestStartTurn_NilModelOmitsWireModelField, starturn_failure_test.go) --
+// on this turn's default, no-modelId configuration, the RETRY's own wire
+// prompt_async request must still OMIT "model" entirely, not silently
+// install a Narvi-side fallback the client never asked for just because
+// this particular dispatch happens to be a retry.
+//
+// A LATER audit's own finding: an earlier version of this fix corrected
+// StartTurn's own call site (line ~540, adapter.go) but left
+// attemptTransientRetry's own IDENTICAL call (line ~1399) reading
+// resolveModelForced -- swapping THAT one site back to resolveModelForced
+// passed this package's entire suite, because no existing test dispatched
+// a transient-retry re-dispatch with cmd.Model nil and then inspected the
+// RETRY's own wire request specifically (TestTransientRetry_
+// PermanentAPIErrorNeverRetried, which does check f.lastPromptModel,
+// never retries at all -- a permanent APIError finalizes on the FIRST
+// dispatch). This test targets exactly that gap.
+//
+// Mutation-verified: swapping adapter.go's own
+// `model := a.resolveModel(ctx, (*string)(ts.cmd.Model))` inside
+// attemptTransientRetry back to resolveModelForced makes this test fail
+// with `fake server's own RETRY prompt_async request carried
+// model=&{ProviderID:anthropic ModelID:claude-sonnet-4-5}` (fallbackModel,
+// session.go), while TestStartTurn_NilModelOmitsWireModelField (the OTHER
+// call site's own pin) stays green, proving the two sites are
+// independently guarded.
+func TestTransientRetry_NilModelOmitsWireModelFieldOnRetryDispatch(t *testing.T) {
+	f := newFakeOpenCodeServer(t)
+
+	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
+	t.Cleanup(a.Close)
+
+	connCtx, connCancel := context.WithTimeout(context.Background(), testWait)
+	defer connCancel()
+	if err := a.Connected(connCtx); err != nil {
+		t.Fatalf("Connected() error = %v", err)
+	}
+	waitForConnNumber(t, f, 1)
+
+	collector := &eventCollector{}
+	// Model deliberately left unset -- the default configuration every
+	// real client dispatches through (Composer/PlanModeView/Timeline
+	// resume/DecisionInbox, web/src/session).
+	cmd := sandboxws.Prompt{
+		Type: "prompt", MessageId: "m1", SessionId: "sess-transient-nilmodel-1", Gen: 1,
+		Text: "do something that will hit a transient provider blip",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), testWait)
+	defer cancel()
+
+	var group errgroup.Group
+	group.Go(func() error {
+		_, err := a.StartTurn(ctx, cmd, collector.sink, nil)
+		return err
+	})
+
+	ts := waitForTurnRegistered(t, a, "ses_fake")
+
+	// The original turn's own assistant message reports a transient
+	// APIError (no model planted -- irrelevant to this test, which only
+	// cares about the wire REQUEST, never the diagnostic), then goes idle.
+	f.broadcast(apiErrorMessageUpdated(t, "ses_fake", "msg_original", true))
+	f.broadcast(sessionIdleLine(t, "ses_fake"))
+
+	// Wait for the RETRY's own prompt_async call to actually land server-
+	// side before inspecting f.lastPromptModel -- mirrors this file's own
+	// established waitForCount precedent exactly (e.g.
+	// TestTransientRetry_SucceedsAfterTransientAPIError above).
+	waitForCount(t, "promptCallCount", f.promptCallCount, 2)
+
+	f.mu.Lock()
+	retryPromptModel := f.lastPromptModel
+	f.mu.Unlock()
+	if retryPromptModel != nil {
+		t.Errorf("fake server's own RETRY prompt_async request carried model=%+v, want the field omitted "+
+			"entirely (cmd.Model was nil) -- attemptTransientRetry's own re-dispatch must resolve its model "+
+			"via resolveModel, not resolveModelForced, exactly like StartTurn's own original dispatch does",
+			retryPromptModel)
+	}
+
+	// Let the retry complete cleanly so the turn finalizes and this test
+	// doesn't leak a goroutine waiting on group.Wait() below.
+	waitForNotCompacting(t, f, ts)
+	f.broadcast(plainAssistantMessageUpdated(t, "ses_fake", "msg_retry"))
+	f.broadcast(assistantTextPart(t, "ses_fake", "msg_retry", "prt_retry", "all good now"))
+	f.broadcast(sessionIdleLine(t, "ses_fake"))
+
+	if err := group.Wait(); err != nil {
+		t.Fatalf("StartTurn() error = %v", err)
+	}
+}

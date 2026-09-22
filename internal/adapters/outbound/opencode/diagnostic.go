@@ -81,16 +81,41 @@ func capDiagnosticField(s string) string {
 // responseHeaders wins, regardless of that map's own randomized (per Go's
 // map iteration) key order.
 //
-// NOT independently verified live against a real provider error — this
-// adapter's own research pass (openCodeTaggedError's own doc comment,
-// types.go) never elicited a genuine APIError from a live OpenCode
-// process, so no header name here has been confirmed against real
-// traffic. "x-request-id" and "request-id" are the two conventional,
-// provider-agnostic header names a support process is generally taught
-// to look for. Documented here, honestly, as schema-derived/best-effort —
-// exactly like this package's own subtaskPart (types.go) is labeled when
-// a real invocation never exercised it.
-var requestIDHeaderCandidates = []string{"x-request-id", "request-id"}
+// "x-request-id" and "request-id" are still schema-derived/best-effort
+// only (the two conventional, provider-agnostic header names a support
+// process is generally taught to look for) -- NOW EMPIRICALLY TESTED,
+// not merely guessed: a later Step's own research pass, once the pinned
+// binary became reachable, captured a genuine 401 APIError's real
+// responseHeaders (openCodeErrorData's own doc comment, types.go) and
+// NEITHER was present, reproduced identically across 3 separate trials.
+// Kept anyway, deliberately: this adapter is provider-agnostic (§7's own
+// anti-corruption layer), and a DIFFERENT upstream provider than the one
+// this specific trial exercised may well use one of these conventional
+// names even though this one didn't -- an allowlist candidate that never
+// matches on ONE provider's traffic costs nothing to keep for another's.
+//
+// "cf-ray" was ADDED after that same research pass, for the opposite
+// reason -- it is the one header the real captured payload actually DOES
+// carry a genuine per-request identifier under: Cloudflare's own Ray ID
+// (VERIFIED live, format "<16 hex chars>-<PoP code>", e.g.
+// "a3f1328d4e1be195-MRS", reproduced identically across all 3 trials),
+// present because this specific provider's own API is fronted by
+// Cloudflare (responseHeaders' own "server":"cloudflare", and the SAME
+// captured payload's responseBody carries "request_id":null --  the
+// provider's own APPLICATION-level request id was genuinely absent for
+// this failure, an authentication rejection that never reached the
+// provider's own request-processing layer at all). cf-ray is honestly
+// edge-level, not the provider's own application-level id -- but it is a
+// real, unique-per-request token a support conversation CAN use to trace
+// the request through Cloudflare's edge, which is exactly what makes it
+// belong on this allowlist rather than the two conventional names it
+// sits alongside: it carries an identifier, the one bar this allowlist
+// has ever required (never a blocklist, and never a key admitted for any
+// other reason -- see extractProviderRequestID's own doc comment).
+// Ordered LAST, after the two application-level conventions: when a
+// provider's own request_id IS present under one of those, it is the
+// more specific, more directly useful token, and should win.
+var requestIDHeaderCandidates = []string{"x-request-id", "request-id", "cf-ray"}
 
 // extractProviderRequestID is the ONLY function in this package that ever
 // reads openCodeErrorData.ResponseHeaders. It returns a single, capped
@@ -234,14 +259,25 @@ type ProviderFailureDiagnostic struct {
 	// describes is what gets reported, regardless of which resolution
 	// path (or none) put it there.
 	//
-	// "" is still possible, honestly: a session-level session.error with
-	// no assistant message ever created for this turn (errorForOutcome's
-	// own sessionError branch, turn.go) has no per-message model to
-	// report at all, and the pinned OpenCode binary's own real payload
-	// might not carry ModelID/ProviderID the way this adapter currently
-	// believes it does (openCodeMessageInfo's own doc comment, types.go,
-	// is explicit about that verification gap) -- both are honest
-	// "unknown", never a wrong guess.
+	// "" is still possible, honestly: NOT merely whenever errorForOutcome
+	// falls back to its own sessionError branch (turn.go) -- VERIFIED
+	// LIVE that a session-level session.error routinely fires WHILE an
+	// assistant message.updated reporting the model has already arrived
+	// (the model just hasn't been attached to an error yet at that
+	// point; that arrives in a separate, later message.updated -- see
+	// modelForOutcome's own doc comment, turn.go, for the full captured
+	// ordering), so that branch alone does NOT imply "no model". This
+	// field is "" only when no assistant message.updated was ever
+	// observed for this turn at all (e.g. a genuine "model not found"
+	// session-level failure that never gets far enough to create one --
+	// VERIFIED LIVE separately), or the one assistant message this turn
+	// did see carried no ModelID/ProviderID at all (modelDisplayFromInfo's
+	// own empty-half guard, below) -- both honest "unknown", never a
+	// wrong guess. ModelID/ProviderID's own real key names ARE now
+	// VERIFIED LIVE against the pinned 1.17.15 binary
+	// (openCodeMessageInfo's own doc comment, types.go, has the full
+	// captured payload) -- the earlier "schema-derived only" verification
+	// gap this comment used to cite is closed.
 	Model string `json:"model,omitempty"`
 
 	// RuntimeVersion is the pinned OpenCode binary version this sandbox

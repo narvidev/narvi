@@ -3,6 +3,7 @@
 package sessionactor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -933,6 +934,250 @@ func TestHandleSandboxEvent_ExecutionCompleteFailed_OperatorLogReachesTheRealPat
 		case *c.journal != *c.ok:
 			t.Errorf("%s: journal=%q operator_log=%q -- the two §7.3 surfaces disagree", c.field, *c.journal, *c.ok)
 		}
+	}
+}
+
+// countLogEntriesForTest counts buf's own newline-delimited JSON log
+// lines whose "msg" field equals wantMsg -- findLogEntry's own sibling
+// (planrecord_integration_test.go), which returns only the FIRST match
+// and fails outright if there is none. This one is for proving a line
+// was emitted a SPECIFIC number of times (E6, below): zero is a valid,
+// non-fatal result here, unlike findLogEntry's.
+func countLogEntriesForTest(t *testing.T, buf *bytes.Buffer, wantMsg string) int {
+	t.Helper()
+	count := 0
+	for _, line := range bytes.Split(buf.Bytes(), []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal(line, &entry); err != nil {
+			t.Fatalf("unmarshal log line %q: %v", line, err)
+		}
+		if entry["msg"] == wantMsg {
+			count++
+		}
+	}
+	return count
+}
+
+// providerFailureDiagnosticLogMsg is the exact "msg" this file's own
+// completeProcessingTurn (pushpr.go) logs every provider-failure
+// diagnostic under -- named once here so the two tests below (and
+// TestHandleSandboxEvent_ExecutionCompleteFailed_OperatorLogReachesTheRealPathAndMatchesTheJournal
+// above) can never silently drift apart from each other on the literal
+// string.
+const providerFailureDiagnosticLogMsg = "sessionactor: turn failed with a provider-reported diagnostic"
+
+// TestHandleSandboxEvent_ExecutionCompleteFailed_DiagnosticLoggedEvenWithNoProcessingTurnFound
+// is E6's own pin for the FIRST of pushpr.go's two stated-but-previously-
+// unpinned invariants on the diagnostic log call site (completeProcessingTurn):
+// "Fires regardless of whether a Processing turn was actually found (`ok`
+// below) ... a late/redelivered execution_complete for a turn that
+// already finalized some other way must still be diagnosable, not
+// silently swallowed because this specific delivery no longer has a
+// Processing row to match."
+//
+// Reproduces TestHandleSandboxEvent_RedeliveredLateExecutionComplete_
+// RecordsFalseFailureOnce's own exact "already finalized by a real
+// turn_deadline fire" setup (opsmetrics_integration_test.go) -- the same,
+// already-proven way to genuinely reach completeProcessingTurn's own
+// `ok == false` branch -- then sends a LATE execution_complete carrying
+// outcome=Failed and a real diagnostic, and asserts the operator log line
+// still fires, with turn_id/correlation_id both absent (no Processing
+// turn to source them from) but session_id/message_id still present
+// (sourced off the wire event itself, unconditionally).
+//
+// Mutation-verified: wrapping pushpr.go's own diagnostic-logging block in
+// `if ok { ... }` makes this test fail with "no log line with msg ...
+// found", while TestHandleSandboxEvent_ExecutionCompleteFailed_
+// OperatorLogReachesTheRealPathAndMatchesTheJournal (the `ok == true`
+// case) stays green -- proving the two branches are independently
+// covered.
+func TestHandleSandboxEvent_ExecutionCompleteFailed_DiagnosticLoggedEvenWithNoProcessingTurnFound(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessionID := createTestSession(ctx, t, pool)
+
+	sandboxStore := narvipg.NewSandboxStore(pool)
+	if _, err := sandboxStore.Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+
+	timeouts := platform.DefaultTimeouts()
+	timeouts.TurnDeadline = 50 * time.Millisecond // tiny, injected -- not the real 60m default
+
+	turnStore := narvipg.NewTurnStore(pool)
+	created, err := turnStore.Create(ctx, sqlcgen.CreateTurnParams{
+		SessionID: sessionID,
+		Status:    sqlcgen.TurnStatusPending,
+	})
+	if err != nil {
+		t.Fatalf("create turn: %v", err)
+	}
+	dispatchedAt := time.Now().Add(-1 * time.Hour) // comfortably past the tiny deadline
+	if _, err := turnStore.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+		ID:           created.ID,
+		Status:       sqlcgen.TurnStatusProcessing,
+		DispatchedAt: pgtype.Timestamptz{Time: dispatchedAt, Valid: true},
+	}); err != nil {
+		t.Fatalf("move turn to processing: %v", err)
+	}
+
+	// Capture BEFORE hydration -- see captureDefaultLoggerJSON's own doc
+	// comment.
+	logBuf := captureDefaultLoggerJSON(t)
+
+	r, err := NewRegistry(ctx, pool, timeouts, nil, nil, nil, "", nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	// The real turn_deadline timer fires first, terminalizing the turn as
+	// Failed -- BEFORE any execution_complete ever arrives, exactly
+	// mirroring TestHandleSandboxEvent_RedeliveredLateExecutionComplete_
+	// RecordsFalseFailureOnce's own proven setup for reaching
+	// completeProcessingTurn's own `ok == false` branch.
+	if err := a.Send(ctx, TimerFired{Name: TimerTurnDeadline}); err != nil {
+		t.Fatalf("Send TimerFired turn_deadline: %v", err)
+	}
+	waitUntil(t, 5*time.Second, func() bool {
+		got, err := turnStore.Get(ctx, created.ID)
+		return err == nil && got.Status == sqlcgen.TurnStatusFailed
+	})
+
+	// The sandbox, unaware the control plane already gave up, genuinely
+	// finishes -- late -- and reports a real provider failure diagnostic.
+	// No Processing turn exists for this session any more.
+	wantDiagnostic := &sandboxws.ExecutionCompleteDiagnostic{
+		Message:     strPtr("The upstream provider rejected this request."),
+		UnionMember: strPtr("APIError"),
+		Model:       strPtr("anthropic/claude-sonnet-4-5"),
+	}
+	outcome := sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "execution_complete",
+		Gen:  1,
+		Raw:  executionCompleteRawWithDiagnostic(t, sessionID.String(), 1, sandboxws.ExecutionCompleteOutcomeFailed, wantDiagnostic),
+	})
+	if !outcome.Persisted {
+		t.Error("outcome.Persisted = false, want true (the raw event is always persisted, per this file's own top comment)")
+	}
+
+	entry := findLogEntry(t, logBuf, providerFailureDiagnosticLogMsg)
+	if _, present := entry["turn_id"]; present {
+		t.Errorf("operator log carries turn_id = %v, want it ABSENT -- no Processing turn was found for this delivery", entry["turn_id"])
+	}
+	if _, present := entry["correlation_id"]; present {
+		t.Errorf("operator log carries correlation_id = %v, want it ABSENT -- no Processing turn was found for this delivery", entry["correlation_id"])
+	}
+	if got, ok := entry["session_id"].(string); !ok || got != sessionID.String() {
+		t.Errorf("operator log session_id = %v, want %q -- unconditional, sourced off the wire event itself even with no Processing turn", entry["session_id"], sessionID.String())
+	}
+	if _, ok := entry["message_id"].(string); !ok {
+		t.Errorf("operator log message_id missing or not a string: %v -- unconditional, sourced off the wire event itself", entry["message_id"])
+	}
+}
+
+// TestHandleSandboxEvent_ExecutionCompleteFailed_DiagnosticLoggedOnEveryRedelivery
+// is E6's own pin for the SECOND of pushpr.go's two stated-but-previously-
+// unpinned invariants: "Logged unconditionally on every delivery of a
+// failed execution_complete (including a wire-level redelivery of an
+// already-processed one, unlike the turn_false_failure_total metric
+// below, which IS gated on `inserted`) -- this is an informational log
+// line, not a cardinality-sensitive counter, so a redundant line on
+// redelivery costs nothing."
+//
+// Sends the IDENTICAL raw execution_complete bytes (same messageID, so
+// appendRawEvent's own upsert-on-(session_id, message_id) sees the second
+// send as a genuine redelivery, Inserted == false, not a new event) TWICE
+// against a turn that stays genuinely Processing throughout, and asserts
+// the operator log line appears exactly TWICE -- once per delivery, never
+// gated the way the false-failure counter deliberately is.
+//
+// Mutation-verified: adding an `inserted` gate to pushpr.go's own
+// diagnostic-logging block (mirroring the false-failure gate immediately
+// below it) makes this test fail with "operator log line count = 1, want
+// 2", while TestHandleSandboxEvent_RedeliveredLateExecutionComplete_
+// RecordsFalseFailureOnce (which asserts the OPPOSITE for the counter)
+// stays green -- proving the log line and the counter are independently
+// gated exactly as documented.
+func TestHandleSandboxEvent_ExecutionCompleteFailed_DiagnosticLoggedOnEveryRedelivery(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessionID := createTestSession(ctx, t, pool)
+
+	sandboxStore := narvipg.NewSandboxStore(pool)
+	if _, err := sandboxStore.Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+
+	turnStore := narvipg.NewTurnStore(pool)
+	created := createProcessingTurn(ctx, t, turnStore, sessionID)
+
+	// Capture BEFORE hydration -- see captureDefaultLoggerJSON's own doc
+	// comment.
+	logBuf := captureDefaultLoggerJSON(t)
+
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	wantDiagnostic := &sandboxws.ExecutionCompleteDiagnostic{
+		Message:     strPtr("The upstream provider rejected this request."),
+		UnionMember: strPtr("APIError"),
+		Model:       strPtr("anthropic/claude-sonnet-4-5"),
+	}
+	// Minted ONCE -- never a fresh executionCompleteRawWithDiagnostic call
+	// per send, which would mint a DIFFERENT messageID and so a genuinely
+	// distinct event instead of a redelivery of this one (mirrors
+	// TestHandleSandboxEvent_RedeliveredLateExecutionComplete_
+	// RecordsFalseFailureOnce's own identical precedent).
+	raw := executionCompleteRawWithDiagnostic(t, sessionID.String(), 1, sandboxws.ExecutionCompleteOutcomeFailed, wantDiagnostic)
+
+	firstOutcome := sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "execution_complete",
+		Gen:  1,
+		Raw:  raw,
+	})
+	if !firstOutcome.Persisted {
+		t.Error("first delivery: outcome.Persisted = false, want true")
+	}
+	waitUntil(t, 5*time.Second, func() bool {
+		got, err := turnStore.Get(ctx, created.ID)
+		return err == nil && got.Status == sqlcgen.TurnStatusFailed
+	})
+	if got := countLogEntriesForTest(t, logBuf, providerFailureDiagnosticLogMsg); got != 1 {
+		t.Fatalf("operator log line count after the FIRST delivery = %d, want 1", got)
+	}
+
+	secondOutcome := sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "execution_complete",
+		Gen:  1,
+		Raw:  raw, // identical messageID -- a genuine wire-level redelivery.
+	})
+	if !secondOutcome.Persisted {
+		t.Error("redelivery: outcome.Persisted = false, want true (still persisted -- appendRawEvent's own upsert always succeeds)")
+	}
+
+	// sendSandboxEventForTest only returns once cmd.Reply has fired, and
+	// handleSandboxEvent sends that reply synchronously right after its
+	// own transact commits (sandboxevent.go's own doc comment) -- so by
+	// the time secondOutcome is in hand, whatever this redelivery did (or
+	// correctly did not do) to the log has already happened. No extra
+	// wait needed.
+	if got := countLogEntriesForTest(t, logBuf, providerFailureDiagnosticLogMsg); got != 2 {
+		t.Errorf("operator log line count after the REDELIVERED second delivery = %d, want 2 (logged unconditionally on every delivery, never gated on `inserted` the way turn_false_failure_total deliberately is)", got)
 	}
 }
 
