@@ -83,7 +83,7 @@ func TestPostPromptAsync_CapabilityRestrictedSelectsSentinelFixAgent(t *testing.
 			}))
 			t.Cleanup(srv.Close)
 
-			a := New(srv.URL, testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, tt.capabilityRestricted)
+			a := New(srv.URL, testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID, tt.capabilityRestricted)
 			t.Cleanup(a.Close)
 
 			cmd := sandboxws.Prompt{Text: "fix the missing test coverage"}
@@ -141,7 +141,7 @@ func TestPostPromptAsync_PlanModeTakesPrecedenceOverCapabilityRestricted(t *test
 	}))
 	t.Cleanup(srv.Close)
 
-	a := New(srv.URL, testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, true)
+	a := New(srv.URL, testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID, true)
 	t.Cleanup(a.Close)
 
 	cmd := sandboxws.Prompt{Text: "do the thing", PlanMode: true}

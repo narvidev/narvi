@@ -28,7 +28,7 @@ func TestStartTurn_ResolveSessionGenuineFailureEmitsFailedTerminalEvent(t *testi
 	}))
 	defer srv.Close()
 
-	a := New(srv.URL, testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(srv.URL, testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	sink, events := spyEventSink(t)
@@ -71,7 +71,7 @@ func TestStartTurn_PostPromptAsyncGenuineFailureEmitsFailedTerminalEvent(t *test
 	}))
 	defer srv.Close()
 
-	a := New(srv.URL, testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(srv.URL, testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	sink, events := spyEventSink(t)

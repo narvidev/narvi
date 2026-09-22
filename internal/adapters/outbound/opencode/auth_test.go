@@ -36,7 +36,7 @@ func TestSetOAuthAuth_SendsTheVerifiedWireShape(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	a := New(srv.URL, testSSEInactivityTimeout, testReconnectInterval, clientRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(srv.URL, testSSEInactivityTimeout, testReconnectInterval, clientRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	err := a.SetOAuthAuth(context.Background(), "openai", OAuthCredential{
@@ -88,7 +88,7 @@ func TestSetOAuthAuth_PropagatesFailure(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	a := New(srv.URL, testSSEInactivityTimeout, testReconnectInterval, clientRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(srv.URL, testSSEInactivityTimeout, testReconnectInterval, clientRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	err := a.SetOAuthAuth(context.Background(), "openai", OAuthCredential{Access: "a", Expires: 1, AccountID: "acct"})

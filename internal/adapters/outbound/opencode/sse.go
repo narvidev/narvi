@@ -282,12 +282,17 @@ func (a *Adapter) dispatchEvent(env sseEnvelope) {
 		}
 		err := ts.errorForOutcome()
 		hasText, hasToolCall := ts.outcomeInputs()
+		outcome := deriveOutcome(err, hasText, hasToolCall)
+		// §7.3: built here, not inside deriveOutcome itself --
+		// see turnOutcome.Diagnostic's own doc comment (outcome.go) for
+		// why deriveOutcome stays pure/Adapter-free.
+		outcome.Diagnostic = a.buildProviderFailureDiagnostic(err, ts)
 		// "now": nothing intervenes between ts.touch()/the isCompacting
 		// guard above and the reads that produced err/hasText/hasToolCall
 		// (all synchronous, no I/O, same goroutine) -- see
 		// finalizeOrRecoverFromOverflow's own doc comment (adapter.go) for
 		// what this snapshotTime means to turnState.resolveOverflowAction.
-		a.finalizeOrRecoverFromOverflow(props.SessionID, ts, deriveOutcome(err, hasText, hasToolCall), err, time.Now())
+		a.finalizeOrRecoverFromOverflow(props.SessionID, ts, outcome, err, time.Now())
 
 	case "session.error":
 		var props sessionErrorProps

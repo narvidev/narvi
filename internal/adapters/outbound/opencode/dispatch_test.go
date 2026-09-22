@@ -20,7 +20,7 @@ import (
 // real connection.
 func newDispatchTestAdapter(t *testing.T) *Adapter {
 	t.Helper()
-	a := New("http://127.0.0.1:1", testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New("http://127.0.0.1:1", testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 	return a
 }
@@ -48,7 +48,7 @@ func TestDispatchPart_UserMessageTextIsNeverTranslated(t *testing.T) {
 	sink, events := spyEventSink(t)
 
 	cmd := sandboxws.Prompt{SessionId: "sess-1", Gen: 1}
-	ts := newTurnState(cmd, sink)
+	ts := newTurnState(cmd, sink, "")
 	a.registerTurn("ses_test", ts)
 
 	// message.updated for the USER's own message -- must NOT be recorded
@@ -107,7 +107,7 @@ func TestDispatchPart_TextFromUnknownMessageIDIsSkipped(t *testing.T) {
 	sink, events := spyEventSink(t)
 
 	cmd := sandboxws.Prompt{SessionId: "sess-1", Gen: 1}
-	ts := newTurnState(cmd, sink)
+	ts := newTurnState(cmd, sink, "")
 	a.registerTurn("ses_test", ts)
 
 	a.dispatchEvent(sseEnvelope{
@@ -129,7 +129,7 @@ func TestDispatchPart_CompactionOverflowEmitsWarning(t *testing.T) {
 	sink, events := spyEventSink(t)
 
 	cmd := sandboxws.Prompt{SessionId: "sess-1", Gen: 1}
-	ts := newTurnState(cmd, sink)
+	ts := newTurnState(cmd, sink, "")
 	a.registerTurn("ses_test", ts)
 
 	// Ordinary/auto compaction, no overflow -- must NOT emit anything.

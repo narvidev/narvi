@@ -58,6 +58,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"strings"
 	"time"
@@ -127,6 +128,45 @@ func executionOutcomeTrigger(outcome sandboxws.ExecutionCompleteOutcome) (turn.T
 	default:
 		return 0, false
 	}
+}
+
+// logProviderFailureDiagnostic renders §7.3's own allowlisted
+// ExecutionComplete.Diagnostic as one structured log line, via logger
+// (the caller's own a.logger, already carrying whatever correlation_id/
+// session_id this Actor was hydrated with — hydrate.go). Every non-nil
+// field is named explicitly, one at a time — never the struct logged
+// wholesale via a %v/%+v verb — so a future field added to the wire type
+// without a matching line added here is silently OMITTED from the log
+// rather than silently INCLUDED: the same "an allowlist can only ever
+// retain less than it might, never accidentally more" direction
+// openCodeErrorData's own allowlist (internal/adapters/outbound/opencode/
+// types.go) is designed to fail in. d is never nil (the one caller,
+// completeProcessingTurn, only calls this after checking
+// evt.Diagnostic != nil).
+func logProviderFailureDiagnostic(logger *slog.Logger, d *sandboxws.ExecutionCompleteDiagnostic) {
+	attrs := make([]any, 0, 14)
+	if d.Message != nil {
+		attrs = append(attrs, "diagnostic_message", *d.Message)
+	}
+	if d.UnionMember != nil {
+		attrs = append(attrs, "diagnostic_union_member", *d.UnionMember)
+	}
+	if d.StatusCode != nil {
+		attrs = append(attrs, "diagnostic_status_code", *d.StatusCode)
+	}
+	if d.ProviderRequestId != nil {
+		attrs = append(attrs, "diagnostic_provider_request_id", *d.ProviderRequestId)
+	}
+	if d.Model != nil {
+		attrs = append(attrs, "diagnostic_model", *d.Model)
+	}
+	if d.RuntimeVersion != nil {
+		attrs = append(attrs, "diagnostic_runtime_version", *d.RuntimeVersion)
+	}
+	if d.SandboxId != nil {
+		attrs = append(attrs, "diagnostic_sandbox_id", *d.SandboxId)
+	}
+	logger.Warn("sessionactor: turn failed with a provider-reported diagnostic", attrs...)
 }
 
 // stampedSuppressor is the narrow, consumer-side view of the shadow SCM
@@ -228,6 +268,27 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 		a.logger.Warn("sessionactor: execution_complete carries an unrecognized outcome; ignoring",
 			"outcome", string(evt.Outcome))
 		return nil, nil
+	}
+
+	// §7.3 ("a retry decision is not a diagnosis"): the
+	// correlation-id-scoped operator half of "one record, in both
+	// surfaces". evt.Diagnostic is decoded from the EXACT SAME raw bytes
+	// appendRawEvent just persisted (handleSandboxEvent, sandboxevent.go)
+	// into the session's own event journal -- the other surface -- so
+	// this log line and that journal row are never two independently
+	// built copies of the same fact, they are two reads of one. a.logger
+	// already carries whatever correlation_id/session_id this Actor was
+	// hydrated with (platform.Logger(ctx).With(...), hydrate.go) --
+	// EXACTLY the mechanism §5.3 names as the operator diagnostic path.
+	// Logged unconditionally on every delivery of a failed
+	// execution_complete (including a wire-level redelivery of an
+	// already-processed one, unlike the turn_false_failure_total metric
+	// below, which IS gated on `inserted`) -- this is an informational
+	// log line, not a cardinality-sensitive counter, so a redundant line
+	// on redelivery costs nothing and losing one to an over-eager gate
+	// would cost the one thing this Step exists to preserve.
+	if trig == turn.TriggerFail && evt.Diagnostic != nil {
+		logProviderFailureDiagnostic(a.logger, evt.Diagnostic)
 	}
 
 	turns, err := a.stores.turn.WithTx(tx).ListForSession(ctx, a.sessionID)

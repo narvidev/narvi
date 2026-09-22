@@ -24,7 +24,7 @@ import (
 // fast (net/http's transport checks ctx before ever dialing), deterministic
 // and immediate -- no real network wait needed.
 func TestStartTurn_ResolveSessionCanceledEmitsCancelledTerminalEvent(t *testing.T) {
-	a := New("http://127.0.0.1:1", testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New("http://127.0.0.1:1", testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -50,7 +50,7 @@ func TestStartTurn_ResolveSessionCanceledEmitsCancelledTerminalEvent(t *testing.
 // doc comment in session.go), but postPromptAsync's own POST then fails
 // because ctx is already canceled.
 func TestStartTurn_PostPromptAsyncCanceledEmitsCancelledTerminalEvent(t *testing.T) {
-	a := New("http://127.0.0.1:1", testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New("http://127.0.0.1:1", testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -94,7 +94,7 @@ func TestStartTurn_PostPromptAsyncCanceledEmitsCancelledTerminalEvent(t *testing
 // this test is the one that proves.
 func TestStartTurn_WaitForTurnCtxDoneEmitsCancelledTerminalEvent(t *testing.T) {
 	fake := newFakeOpenCodeServer(t)
-	a := New(fake.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(fake.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	connectCtx, connectCancel := context.WithTimeout(context.Background(), testWait)

@@ -16,6 +16,32 @@ import (
 type turnOutcome struct {
 	Outcome sandboxws.ExecutionCompleteOutcome
 	Reason  *string
+
+	// Diagnostic is §7.3's own allowlisted, size-capped
+	// provider-failure record (diagnostic.go) — nil except when Outcome
+	// is Failed AND a real *openCodeTaggedError was observed (built by
+	// Adapter.buildProviderFailureDiagnostic, never by deriveOutcome
+	// itself, which stays free of Adapter state so it can remain the
+	// pure, directly unit-testable function its own doc comment above
+	// promises). Deliberately NOT set here: both of deriveOutcome's real
+	// call sites (sse.go's own "session.idle" case, adapter.go's own
+	// finalizeByFallback) assign it onto the returned value themselves,
+	// right after calling deriveOutcome, since only they have an Adapter
+	// receiver in scope.
+	//
+	// Every later turnOutcome{} literal that only enriches Reason (§7.2's
+	// own retry-exhausted paths: finalizeOrRecoverFromOverflow's
+	// "already attempted" branch, attemptCompactionRetry's and
+	// attemptTransientRetry's own "recovery itself failed" branches, all
+	// adapter.go) MUST copy this field forward from the outcome it is
+	// enriching — never rebuild a bare turnOutcome{Outcome: ...,
+	// Reason: &reason} for a failure that already had a Diagnostic, or
+	// the one record §7.3 requires silently vanishes at the exact moment
+	// ("once the retries are exhausted") it matters most. A Cancelled
+	// reconstruction (a Stop landing mid-retry) is the one case that
+	// correctly builds a fresh literal with no Diagnostic at all — a
+	// cancellation is not a provider failure.
+	Diagnostic *ProviderFailureDiagnostic
 }
 
 // deriveOutcome implements the ground-truth mapping this Step's own

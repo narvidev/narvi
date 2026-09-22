@@ -1477,9 +1477,15 @@ func run() error {
 			return fmt.Errorf("sandbox-agent: spawn opencode: %w", spawnErr)
 		}
 
+		// result.Version/cfg.SessionConfig.SandboxId (§7.3): the
+		// SAME two adapter-side facts the post-spawn boot fingerprint
+		// below sources its own "opencode_version" from -- threaded into
+		// the adapter itself so a provider-failure diagnostic can name
+		// them without a second lookup.
 		agentRuntime = opencode.New(result.BaseURL, timeouts.SSEInactivityTimeout,
 			timeouts.OpenCodeSSEReconnectInterval, timeouts.OpenCodeRequestTimeout,
 			timeouts.OpenCodeSummarizeTimeout, timeouts.OpenCodeTransientRetryBackoff,
+			result.Version, cfg.SessionConfig.SandboxId,
 			cfg.SessionConfig.CapabilityRestricted)
 		defer agentRuntime.Close()
 

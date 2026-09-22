@@ -20,6 +20,21 @@ type turnState struct {
 	cmd  sandboxws.Prompt // for stamping SessionId/Gen on every translated event (see translate.go)
 	sink ports.EventSink
 
+	// model is this turn's own "providerID/modelID" display string
+	// (modelDisplay, below) — "" when cmd.Model was nil (omitted, letting
+	// OpenCode pick its own configured default; this adapter never
+	// learns exactly which concrete model OpenCode chose to run in that
+	// case, only that none was explicitly requested). Set exactly once,
+	// by newTurnState, from a value already resolved BEFORE this
+	// turnState is ever constructed (StartTurn, adapter.go) — so, exactly
+	// like cmd above, it is safe to read from any goroutine (the SSE
+	// dispatch goroutine, via buildProviderFailureDiagnostic, diagnostic.go)
+	// with no lock: it is immutable for this turnState's entire life, and
+	// registerTurn (the first point another goroutine can even observe
+	// this turnState at all) only ever runs after both cmd and model are
+	// already set.
+	model string
+
 	mu sync.Mutex
 
 	// toolCallSent/toolResultSent implement §7's own "dedupe tool states
@@ -191,10 +206,11 @@ type turnState struct {
 	done chan struct{}
 }
 
-func newTurnState(cmd sandboxws.Prompt, sink ports.EventSink) *turnState {
+func newTurnState(cmd sandboxws.Prompt, sink ports.EventSink, model string) *turnState {
 	return &turnState{
 		cmd:                 cmd,
 		sink:                sink,
+		model:               model,
 		toolCallSent:        make(map[string]bool),
 		toolResultSent:      make(map[string]bool),
 		subtasksOpen:        make(map[string]bool),
@@ -202,6 +218,18 @@ func newTurnState(cmd sandboxws.Prompt, sink ports.EventSink) *turnState {
 		lastActivity:        time.Now(),
 		done:                make(chan struct{}),
 	}
+}
+
+// modelDisplay renders a resolved *promptModelRef (session.go's own
+// resolveModel) as the "providerID/modelID" string turnState.model and
+// ProviderFailureDiagnostic.Model both carry — "" for a nil ref (cmd.Model
+// was omitted; see turnState.model's own doc comment above for what that
+// means).
+func modelDisplay(m *promptModelRef) string {
+	if m == nil {
+		return ""
+	}
+	return m.ProviderID + "/" + m.ModelID
 }
 
 // emit populates AgentEvent.Critical/AckID via ports.ClassifyAgentEvent

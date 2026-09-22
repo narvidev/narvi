@@ -408,14 +408,24 @@ func sendSandboxEventForTest(ctx context.Context, t *testing.T, a *Actor, cmd Sa
 // ExecutionComplete wire payload.
 func executionCompleteRaw(t *testing.T, sessionID string, gen int, outcome sandboxws.ExecutionCompleteOutcome) json.RawMessage {
 	t.Helper()
+	return executionCompleteRawWithDiagnostic(t, sessionID, gen, outcome, nil)
+}
+
+// executionCompleteRawWithDiagnostic is executionCompleteRaw's own sibling
+// for §7.3: marshals a real, schema-valid sandboxws.
+// ExecutionComplete wire payload carrying diagnostic (nil for none, the
+// SAME shape executionCompleteRaw above produces).
+func executionCompleteRawWithDiagnostic(t *testing.T, sessionID string, gen int, outcome sandboxws.ExecutionCompleteOutcome, diagnostic *sandboxws.ExecutionCompleteDiagnostic) json.RawMessage {
+	t.Helper()
 	messageID := uuid.NewString()
 	evt := sandboxws.ExecutionComplete{
-		Type:      "execution_complete",
-		MessageId: messageID,
-		SessionId: sessionID,
-		Gen:       gen,
-		AckId:     "execution_complete:" + messageID,
-		Outcome:   outcome,
+		Type:       "execution_complete",
+		MessageId:  messageID,
+		SessionId:  sessionID,
+		Gen:        gen,
+		AckId:      "execution_complete:" + messageID,
+		Outcome:    outcome,
+		Diagnostic: diagnostic,
 	}
 	raw, err := json.Marshal(evt)
 	if err != nil {
@@ -635,6 +645,105 @@ func TestHandleSandboxEvent_ExecutionCompleteFailed_NoPush(t *testing.T) {
 	}
 	if sessionRow.FailureReason == nil || *sessionRow.FailureReason != sqlcgen.SessionFailureReasonFailed {
 		t.Errorf("session.failure_reason = %v, want %q", sessionRow.FailureReason, sqlcgen.SessionFailureReasonFailed)
+	}
+}
+
+// TestHandleSandboxEvent_ExecutionCompleteFailed_DiagnosticSurvivesTheRealPostgresRoundTrip
+// is §7.3's own integration-level proof of the session-journal
+// half of "one record, in both surfaces": a REAL execution_complete
+// carrying a Diagnostic, appended through the REAL transact/appendRawEvent
+// path (actor.go) against a REAL Postgres instance (this file's own
+// testcontainers harness, newTestPool), is readable back from the
+// session's own event log byte-for-byte -- proving the diagnostic
+// actually survives the write+read round trip this adapter's own unit
+// tests (internal/adapters/outbound/opencode/diagnostic_test.go) cannot
+// exercise on their own, since they never touch a database at all.
+func TestHandleSandboxEvent_ExecutionCompleteFailed_DiagnosticSurvivesTheRealPostgresRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+
+	sessionID := createTestSessionWithRepos(ctx, t, pool, pgtype.UUID{},
+		"repo1", "https://github.com/acme/repo1.git", "feature-x")
+
+	sandboxStore := narvipg.NewSandboxStore(pool)
+	if _, err := sandboxStore.Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+
+	turnStore := narvipg.NewTurnStore(pool)
+	createProcessingTurn(ctx, t, turnStore, sessionID)
+
+	commander := &fakeSendCommander{}
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, commander, nil, "", nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	wantDiagnostic := &sandboxws.ExecutionCompleteDiagnostic{
+		Message:           strPtr("The upstream provider rejected this request."),
+		UnionMember:       strPtr("APIError"),
+		ProviderRequestId: strPtr("req_visible_public_abc123"),
+		Model:             strPtr("anthropic/claude-sonnet-4-5"),
+		RuntimeVersion:    strPtr("0.0.0-test"),
+		SandboxId:         strPtr("sbx-test-0001"),
+	}
+
+	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "execution_complete",
+		Gen:  1,
+		Raw:  executionCompleteRawWithDiagnostic(t, sessionID.String(), 1, sandboxws.ExecutionCompleteOutcomeFailed, wantDiagnostic),
+	})
+
+	waitUntil(t, 5*time.Second, func() bool {
+		got, err := turnStore.ListForSession(ctx, sessionID)
+		if err != nil || len(got) == 0 {
+			return false
+		}
+		return got[0].Status == sqlcgen.TurnStatusFailed
+	})
+
+	// The session journal itself (§7.3's own first surface): read the
+	// persisted raw event row back from Postgres exactly as any consumer
+	// of the session's own event log would (e.g. the WS client hub's
+	// replay-on-reconnect path, §6.2), and confirm the diagnostic is
+	// present byte-for-byte -- not re-derived, not a second copy, the
+	// SAME bytes appendRawEvent persisted from the wire payload above.
+	eventStore := narvipg.NewEventStore(pool)
+	events, err := eventStore.ListForSession(ctx, sessionID, 0, 100)
+	if err != nil {
+		t.Fatalf("ListForSession: %v", err)
+	}
+	var found *sandboxws.ExecutionComplete
+	for _, e := range events {
+		if e.Type != "execution_complete" {
+			continue
+		}
+		var evt sandboxws.ExecutionComplete
+		if err := json.Unmarshal(e.Payload, &evt); err != nil {
+			t.Fatalf("unmarshal persisted execution_complete: %v", err)
+		}
+		found = &evt
+	}
+	if found == nil {
+		t.Fatal("no execution_complete event found in the session's own journal")
+	}
+	if found.Diagnostic == nil {
+		t.Fatal("persisted execution_complete.Diagnostic = nil, want the diagnostic sent on the wire")
+	}
+	if got, want := found.Diagnostic.Message, wantDiagnostic.Message; got == nil || want == nil || *got != *want {
+		t.Errorf("persisted Diagnostic.Message = %v, want %v", got, want)
+	}
+	if got, want := found.Diagnostic.ProviderRequestId, wantDiagnostic.ProviderRequestId; got == nil || want == nil || *got != *want {
+		t.Errorf("persisted Diagnostic.ProviderRequestId = %v, want %v", got, want)
+	}
+	if got, want := found.Diagnostic.SandboxId, wantDiagnostic.SandboxId; got == nil || want == nil || *got != *want {
+		t.Errorf("persisted Diagnostic.SandboxId = %v, want %v", got, want)
 	}
 }
 

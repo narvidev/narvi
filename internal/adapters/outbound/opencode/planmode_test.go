@@ -74,7 +74,7 @@ func TestPostPromptAsync_PlanModeSelectsNativePlanAgent(t *testing.T) {
 			}))
 			t.Cleanup(srv.Close)
 
-			a := New(srv.URL, testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+			a := New(srv.URL, testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 			t.Cleanup(a.Close)
 
 			cmd := sandboxws.Prompt{Text: "do the thing", PlanMode: tt.planMode}

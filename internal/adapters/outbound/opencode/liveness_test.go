@@ -61,7 +61,7 @@ const (
 
 func newLivenessAdapter(t *testing.T, fake *fakeOpenCodeServer) *Adapter {
 	t.Helper()
-	a := New(fake.URL(), livenessSSEInactivityTimeout, livenessReconnectInterval, livenessRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(fake.URL(), livenessSSEInactivityTimeout, livenessReconnectInterval, livenessRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 	return a
 }
@@ -121,7 +121,7 @@ func textPartJSON(t *testing.T, id, messageID, text string) json.RawMessage {
 // prematurely -- the exact bug this batch fixes.
 func TestWaitForTurn_ReconnectWinsRaceAgainstFallback(t *testing.T) {
 	fake := newFakeOpenCodeServer(t)
-	a := New(fake.URL(), reconnectRaceSSEInactivityTimeout, reconnectRaceReconnectInterval, livenessRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(fake.URL(), reconnectRaceSSEInactivityTimeout, reconnectRaceReconnectInterval, livenessRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	connectCtx, connectCancel := context.WithTimeout(context.Background(), testWait)

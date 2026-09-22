@@ -72,6 +72,14 @@ const (
 	// polling budget above) so a test exercising the retry path does not
 	// spend most of its own runtime just waiting out the backoff.
 	testTransientRetryBackoff = 10 * time.Millisecond
+
+	// testRuntimeVersion/testSandboxID (§7.3) are the two New()
+	// params backing Adapter.runtimeVersion/sandboxID -- fixed, obviously
+	// synthetic values every test in this package's own New() call sites
+	// supplies, so a diagnostic-carrying test can assert on them without
+	// each call site inventing its own.
+	testRuntimeVersion = "0.0.0-test"
+	testSandboxID      = "sbx-test-0001"
 )
 
 // startServer spawns a REAL `opencode serve` process — via
@@ -160,7 +168,7 @@ func startServer(t *testing.T) string {
 // stopping its persistent SSE loop via t.Cleanup.
 func newAdapter(t *testing.T) *Adapter {
 	t.Helper()
-	a := New(startServer(t), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(startServer(t), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 	return a
 }

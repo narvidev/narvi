@@ -91,7 +91,7 @@ func mapKeys[K comparable, V any](m map[K]V) []K {
 // that method's own wire shape, not just the endpoint's existence.
 func TestChatGPTOAuth_RealBinary_SetAuthFlipsConnected(t *testing.T) {
 	baseURL := startServer(t)
-	a := New(baseURL, testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(baseURL, testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	ctx := context.Background()

@@ -52,7 +52,7 @@ func apiErrorMessageUpdated(t *testing.T, sessionID, messageID string, retryable
 func TestTransientRetry_SucceedsAfterTransientAPIError(t *testing.T) {
 	f := newFakeOpenCodeServer(t)
 
-	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	connCtx, connCancel := context.WithTimeout(context.Background(), testWait)
@@ -147,7 +147,7 @@ func TestTransientRetry_SucceedsAfterTransientAPIError(t *testing.T) {
 func TestTransientRetry_PermanentAPIErrorNeverRetried(t *testing.T) {
 	f := newFakeOpenCodeServer(t)
 
-	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	connCtx, connCancel := context.WithTimeout(context.Background(), testWait)
@@ -211,7 +211,7 @@ func TestTransientRetry_PermanentAPIErrorNeverRetried(t *testing.T) {
 func TestTransientRetry_RetryAlsoFailsFinalizesFailedExactlyOnce(t *testing.T) {
 	f := newFakeOpenCodeServer(t)
 
-	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	connCtx, connCancel := context.WithTimeout(context.Background(), testWait)
@@ -310,7 +310,7 @@ func TestTransientRetry_RetryAlsoFailsFinalizesFailedExactlyOnce(t *testing.T) {
 func TestTransientRetry_RetryDispatchFailsIsNeverRetriedAgain(t *testing.T) {
 	f := newFakeOpenCodeServer(t)
 
-	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	connCtx, connCancel := context.WithTimeout(context.Background(), testWait)
@@ -398,7 +398,7 @@ func TestTransientRetry_SharesOneShotBudgetWithCompactionRetry(t *testing.T) {
 	f := newFakeOpenCodeServer(t)
 	f.setSummarizeOK(true) // would succeed if (wrongly) called at all
 
-	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	connCtx, connCancel := context.WithTimeout(context.Background(), testWait)
@@ -526,7 +526,7 @@ func TestCompactionRetry_SharesOneShotBudgetWithTransientRetry(t *testing.T) {
 	closeGate := func() { closeGateOnce.Do(func() { close(gate) }) }
 	t.Cleanup(closeGate)
 
-	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff)
+	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
 
 	connCtx, connCancel := context.WithTimeout(context.Background(), testWait)

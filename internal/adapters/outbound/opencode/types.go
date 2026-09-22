@@ -177,20 +177,57 @@ type openCodeTaggedError struct {
 }
 
 // openCodeErrorData is openCodeTaggedError's own "data" object, modeled
-// only for the fields this Step's own typed-transient-retry classification
-// (isTransientAPIError, outcome.go) actually reads — VERIFIED against the
-// real, live-fetched /doc OpenAPI schema (components.schemas.APIError),
-// see openCodeTaggedError's own doc comment above for the full captured
-// shape. StatusCode is OPTIONAL (e.g. a real HTTP status the upstream
-// provider returned, 429/529) — corroborating detail only, never itself
-// consulted for retry classification (this Step's own explicit
-// instruction: classify ONLY on the typed isRetryable field, never on a
-// substring of error text, and statusCode is exactly that kind of
-// secondary signal a future misguided change might be tempted to
-// string/number-match on instead).
+// only for the fields this package actually reads anywhere — the
+// typed-transient-retry classification (isTransientAPIError, outcome.go)
+// and, since §7.3 ("a retry decision is not a diagnosis"), the
+// allowlisted provider-failure diagnostic (diagnostic.go) — VERIFIED
+// against the real, live-fetched /doc OpenAPI schema
+// (components.schemas.APIError), see openCodeTaggedError's own doc
+// comment above for the full captured shape:
+// {"data":{"message","statusCode"?,"isRetryable","responseHeaders"?,
+// "responseBody"?,"metadata"?}, "required":["message","isRetryable"]}.
+//
+// THIS STRUCT IS THE ALLOWLIST §7.3 REQUIRES, enforced structurally, not
+// by a comment: encoding/json silently drops any object key with no
+// matching struct field, so "responseBody" and "metadata" — the real
+// schema's own two other fields, exactly where credentials and the
+// prompt itself live (responseBody), and a free-form catch-all
+// (metadata) — are never modeled here AT ALL, which means they are never
+// decoded into any Go value anywhere in this program, not merely
+// "read and discarded" after the fact. A blocklist over those two named
+// fields would already be one behind the real schema today (metadata is
+// a THIRD field neither this struct nor any blocklist written against
+// "the two known-dangerous fields" would have named) — the allowlist
+// degrades safely instead: it can only ever retain less than the real
+// payload carries, never accidentally more.
+//
+// StatusCode is OPTIONAL (e.g. a real HTTP status the upstream provider
+// returned, 429/529) — corroborating detail only, never itself consulted
+// for retry classification (this Step's own explicit instruction:
+// classify ONLY on the typed isRetryable field, never on a substring of
+// error text, and statusCode is exactly that kind of secondary signal a
+// future misguided change might be tempted to string/number-match on
+// instead).
+//
+// Message and ResponseHeaders were added for §7.3's own diagnostic
+// alone — neither is read by isTransientAPIError, and ResponseHeaders is
+// read by exactly one function in this package, extractProviderRequestID
+// (diagnostic.go), which returns a single capped string and never the map
+// itself; see that function's own doc comment for why that keeps the
+// allowlist enforced by ProviderFailureDiagnostic's own field TYPES
+// (string/*int only — nothing a whole map could ever be assigned to)
+// rather than by convention. ResponseHeaders' own VALUE shape
+// (single string vs. an array, matching net/http.Header's own JSON
+// convention) is NOT independently verified live — this adapter's own
+// research pass (openCodeTaggedError's own doc comment above) never
+// elicited a genuine APIError from a live OpenCode process, so
+// json.RawMessage defers that decision to extractProviderRequestID
+// itself, which tries both shapes rather than assuming one.
 type openCodeErrorData struct {
-	IsRetryable bool `json:"isRetryable"`
-	StatusCode  *int `json:"statusCode,omitempty"`
+	Message         string                     `json:"message"`
+	IsRetryable     bool                       `json:"isRetryable"`
+	StatusCode      *int                       `json:"statusCode,omitempty"`
+	ResponseHeaders map[string]json.RawMessage `json:"responseHeaders,omitempty"`
 }
 
 // messagePartUpdatedProps is "message.part.updated"'s own properties shape

@@ -1,6 +1,9 @@
 package sessionactor
 
 import (
+	"bytes"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
@@ -32,6 +35,93 @@ func TestExecutionOutcomeTrigger(t *testing.T) {
 			}
 			if ok && got != tc.want {
 				t.Errorf("executionOutcomeTrigger(%q) = %v, want %v", tc.outcome, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLogProviderFailureDiagnostic covers §7.3's own
+// correlation-id-scoped operator log surface directly: every non-nil
+// wire field must appear on the log line, under its own documented
+// attribute name, and every nil field must be OMITTED rather than logged
+// as an empty string or a literal "<nil>" -- an omitted attribute and a
+// present-but-empty one look identical to a human reading the line, but
+// only the first is honest about what OpenCode/this adapter actually
+// supplied (see ProviderFailureDiagnostic's own "omitempty" fields,
+// diagnostic.go).
+func TestLogProviderFailureDiagnostic(t *testing.T) {
+	statusCode := 429
+
+	tests := []struct {
+		name       string
+		diagnostic *sandboxws.ExecutionCompleteDiagnostic
+		wantAttrs  map[string]string // attr -> substring expected in the line
+		wantAbsent []string          // attr keys that must NOT appear at all
+	}{
+		{
+			name: "every field present",
+			diagnostic: &sandboxws.ExecutionCompleteDiagnostic{
+				Message:           strPtr("rate limited"),
+				UnionMember:       strPtr("APIError"),
+				StatusCode:        &statusCode,
+				ProviderRequestId: strPtr("req_abc123"),
+				Model:             strPtr("anthropic/claude-sonnet-4-5"),
+				RuntimeVersion:    strPtr("1.17.15"),
+				SandboxId:         strPtr("sbx-live-0001"),
+			},
+			wantAttrs: map[string]string{
+				"diagnostic_message":             "rate limited",
+				"diagnostic_union_member":        "APIError",
+				"diagnostic_status_code":         "429",
+				"diagnostic_provider_request_id": "req_abc123",
+				"diagnostic_model":               "anthropic/claude-sonnet-4-5",
+				"diagnostic_runtime_version":     "1.17.15",
+				"diagnostic_sandbox_id":          "sbx-live-0001",
+			},
+		},
+		{
+			name:       "every field nil is omitted, not logged empty",
+			diagnostic: &sandboxws.ExecutionCompleteDiagnostic{},
+			wantAbsent: []string{
+				"diagnostic_message", "diagnostic_union_member", "diagnostic_status_code",
+				"diagnostic_provider_request_id", "diagnostic_model", "diagnostic_runtime_version",
+				"diagnostic_sandbox_id",
+			},
+		},
+		{
+			name: "only the allowlisted request id is present -- no message/status this time",
+			diagnostic: &sandboxws.ExecutionCompleteDiagnostic{
+				ProviderRequestId: strPtr("req_only_this_survived"),
+				Model:             strPtr("openai/gpt-5"),
+			},
+			wantAttrs: map[string]string{
+				"diagnostic_provider_request_id": "req_only_this_survived",
+				"diagnostic_model":               "openai/gpt-5",
+			},
+			wantAbsent: []string{
+				"diagnostic_message", "diagnostic_union_member", "diagnostic_status_code",
+				"diagnostic_runtime_version", "diagnostic_sandbox_id",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+			logProviderFailureDiagnostic(logger, tc.diagnostic)
+
+			line := buf.String()
+			for attr, want := range tc.wantAttrs {
+				if !strings.Contains(line, attr+"="+want) && !strings.Contains(line, attr+`="`+want+`"`) {
+					t.Errorf("log line missing %s=%s; got: %s", attr, want, line)
+				}
+			}
+			for _, attr := range tc.wantAbsent {
+				if strings.Contains(line, attr+"=") {
+					t.Errorf("log line unexpectedly carries %s; got: %s", attr, line)
+				}
 			}
 		})
 	}
