@@ -2225,9 +2225,22 @@ type warmBootSeedWarning struct {
 // Seed's own doc comment in internal/sandboxagent/gitdir/seed.go): a
 // refused Seed -- this boot, for whatever reason -- always leaves
 // repo.GitDir absent, so os.Stat fails and every later discovery call,
-// allowlisted or not, skips that repo. It is that structural guarantee,
-// not this function's own allowlist alone, that keeps a stale git-dir
-// from a PRIOR boot from ever being discovered against later in this one.
+// allowlisted or not, skips that repo.
+//
+// What that guarantee covers, precisely: every repo in THIS boot's own
+// SessionConfig.Repos, because Seed is attempted on each of them (a repo
+// with no <wt>/.git is never seeded but is also never discovered, since
+// DiscoverRepoSHAs gates on <wt>/.git too). It does NOT by itself cover a
+// /workspace directory whose name is absent from this boot's config but
+// which an EARLIER boot seeded: nothing here removes that agent git-dir.
+// That case is excluded by construction rather than by this code -- a
+// snapshot_restore boot restores the same session, whose repo list is
+// written once and never updated, and a repo_image boot only ever matches
+// an image built for an identical repo set (§19.1) -- and the runtime
+// cannot create an agent git-dir itself, since the root is agent-owned
+// and 0700. If either of those invariants ever changes, stale agent
+// git-dirs for dropped repos must be pruned under the root after
+// EnsureRoot.
 //
 // Factored out of run() specifically so this ordering is unit-testable
 // (capturing slog output) without booting the whole process -- see
