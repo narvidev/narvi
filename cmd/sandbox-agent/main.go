@@ -1187,12 +1187,13 @@ func run() error {
 	// EnsureRoot/seedWarmBootRepos FIRST but SILENTLY -- collecting a
 	// fatal error and any secondary-repo warnings without logging either
 	// -- then always logs the fingerprint, then logs the warnings, and
-	// only then returns the fatal error (if any) for run() to propagate.
-	// DiscoverRepoSHAs (boot.CollectFingerprint's own repo_shas source)
-	// already omits any repo whose agent git-dir was never seeded (its own
-	// doc comment), so a fatal EnsureRoot/primary failure still produces a
-	// well-formed, merely repo_shas-sparser fingerprint line rather than
-	// none at all. openCodeVersion is necessarily "" here (§7's own
+	// only then returns the fatal error (if any) for run() to propagate. A
+	// fatal EnsureRoot failure skips repo discovery entirely (empty
+	// repo_shas, no git spawned against the rejected root); a fatal primary
+	// failure still produces a well-formed, merely repo_shas-sparser
+	// fingerprint line, since DiscoverRepoSHAs (boot.CollectFingerprint's
+	// own repo_shas source) omits any repo whose agent git-dir was never
+	// seeded (its own doc comment). openCodeVersion is necessarily "" here (§7's own
 	// discovery requires the OpenCode server to already be running, which
 	// hasn't happened yet) -- see the supplementary fingerprint log below,
 	// once it has.
@@ -2148,6 +2149,14 @@ func run() error {
 	return stopErr
 }
 
+// warmBootSecondaryFailedMsg is warmBootSeedWarning.msg for a secondary
+// repo's failed Seed call (seedWarmBootRepos, below) -- named as a const so
+// bootFingerprintAndSeed can match on it by identity (rather than
+// duplicating the string) to exclude that repo from the fingerprint's own
+// repo_shas, since its agent git-dir was not (re)seeded THIS boot even if a
+// stale one from a previous boot is still on disk.
+const warmBootSecondaryFailedMsg = "sandbox-agent: warm-boot git-dir seed: secondary repo failed, continuing (will be reported by sync)"
+
 // warmBootSeedWarning is one non-fatal outcome of seedWarmBootRepos' own
 // loop (an invalid repo name, or a secondary repo's failed Seed call) --
 // captured rather than logged directly, so bootFingerprintAndSeed can log
@@ -2173,10 +2182,13 @@ type warmBootSeedWarning struct {
 // fatal error and every non-fatal warning from seedWarmBootRepos WITHOUT
 // logging anything, computing+logging the fingerprint unconditionally,
 // THEN logging the warnings, and only THEN returning the fatal error (if
-// any) for run() to propagate. boot.CollectFingerprint's own
-// DiscoverRepoSHAs already omits any repo whose agent git-dir was never
-// seeded, so a fatal EnsureRoot/primary failure still produces a
-// well-formed fingerprint line, merely with repo_shas sparser than usual.
+// any) for run() to propagate. A fatal EnsureRoot failure never calls
+// boot.CollectFingerprint at all (repo_shas is simply empty, and no git
+// runs against the rejected root -- see the rootRejected branch below); a
+// fatal primary-repo Seed failure still produces a well-formed fingerprint
+// line via CollectFingerprint, merely with repo_shas sparser than usual,
+// since DiscoverRepoSHAs omits any repo whose agent git-dir was never
+// seeded.
 //
 // Factored out of run() specifically so this ordering is unit-testable
 // (capturing slog output) without booting the whole process -- see
@@ -2184,15 +2196,47 @@ type warmBootSeedWarning struct {
 func bootFingerprintAndSeed(ctx context.Context, sup *supervisor.Supervisor, cfg boot.Config, layout gitdir.Layout, runtimeCredential *syscall.Credential, timeouts platform.Timeouts, logger *slog.Logger) error {
 	var warnings []warmBootSeedWarning
 	var seedErr error
+	rootRejected := false
 	if cfg.SessionConfig != nil {
 		if err := gitdir.EnsureRoot(cfg.GitDirRoot); err != nil {
 			seedErr = fmt.Errorf("sandbox-agent: ensure git-dir root: %w", err)
+			rootRejected = true
 		} else {
 			warnings, seedErr = seedWarmBootRepos(ctx, sup, cfg, layout, runtimeCredential, timeouts.GitSyncStepTimeout, timeouts.ProcessStopGracePeriod)
 		}
 	}
 
-	fingerprint := boot.CollectFingerprint(ctx, sup, cfg, layout, runtimeCredential, timeouts.RepoSHADiscoveryTimeout, timeouts.ProcessStopGracePeriod, "")
+	// gitdir.EnsureRoot's own doc comment: a rejected root (symlink, wrong
+	// owner, group/other-writable) "must not be used". boot.CollectFingerprint
+	// globs layout.WorkspaceDir and, via DiscoverRepoSHAs, os.Stats and
+	// spawns hardened git against layout.Repo(name).GitDir for whatever it
+	// finds there -- i.e. still under the very root EnsureRoot just refused.
+	// A rejected root must not be read from OR written to (SyncHeadIn writes
+	// HEAD before any rev-parse), so on rootRejected the fingerprint is
+	// built directly, with no repo discovery and no git spawned at all,
+	// rather than by calling CollectFingerprint.
+	var fingerprint sandboxboot.BootFingerprint
+	if rootRejected {
+		fingerprint = sandboxboot.BootFingerprint{
+			AgentVersion: cfg.AgentVersion,
+			ImageDigest:  cfg.ImageDigest,
+			BootMode:     cfg.BootMode,
+		}
+	} else {
+		fingerprint = boot.CollectFingerprint(ctx, sup, cfg, layout, runtimeCredential, timeouts.RepoSHADiscoveryTimeout, timeouts.ProcessStopGracePeriod, "")
+		// A secondary repo whose Seed call failed THIS boot must not be
+		// reported in repo_shas, even if its agent git-dir still exists on
+		// disk from a previous boot (DiscoverRepoSHAs' own os.Stat gate has
+		// no notion of "seeded this boot", only "a git-dir is present") --
+		// excluded here by name rather than threading a "seeded this boot"
+		// set down into CollectFingerprint/DiscoverRepoSHAs.
+		for _, w := range warnings {
+			if w.msg == warmBootSecondaryFailedMsg {
+				delete(fingerprint.RepoSHAs, w.repo)
+			}
+		}
+	}
+
 	logger.Info("sandbox-agent: boot fingerprint",
 		"agent_version", fingerprint.AgentVersion,
 		"image_digest", fingerprint.ImageDigest,
@@ -2257,7 +2301,7 @@ func seedWarmBootRepos(ctx context.Context, sup *supervisor.Supervisor, cfg boot
 				return warnings, fmt.Errorf("sandbox-agent: seed git-dir for %s (warm boot): %w", r.Name, err)
 			}
 			warnings = append(warnings, warmBootSeedWarning{
-				msg:  "sandbox-agent: warm-boot git-dir seed: secondary repo failed, continuing (will be reported by sync)",
+				msg:  warmBootSecondaryFailedMsg,
 				repo: r.Name,
 				err:  err,
 			})

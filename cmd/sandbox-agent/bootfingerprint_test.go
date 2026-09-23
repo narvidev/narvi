@@ -27,6 +27,28 @@ import (
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
 
+// loggedRepoSHAs parses buf the same way loggedMessages does and returns the
+// "repo_shas" field of the FIRST logged line (the §5.3 fingerprint, per this
+// file's own bootFingerprintMsg invariant).
+func loggedRepoSHAs(t *testing.T, buf *bytes.Buffer) map[string]string {
+	t.Helper()
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) == 0 || lines[0] == "" {
+		t.Fatal("loggedRepoSHAs: buf has no logged lines")
+	}
+	var entry struct {
+		Msg      string            `json:"msg"`
+		RepoSHAs map[string]string `json:"repo_shas"`
+	}
+	if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+		t.Fatalf("unmarshal first log line %q: %v", lines[0], err)
+	}
+	if entry.Msg != bootFingerprintMsg {
+		t.Fatalf("first logged line msg = %q, want %q", entry.Msg, bootFingerprintMsg)
+	}
+	return entry.RepoSHAs
+}
+
 // loggedMessages parses buf as a stream of JSON log lines (platform.
 // NewLogger's own slog.NewJSONHandler shape) and returns each line's "msg"
 // field, in emission order.
@@ -185,5 +207,129 @@ func TestBootFingerprintAndSeed_SecondaryFailure_FingerprintPrecedesWarning(t *t
 	}
 	if !foundWarning {
 		t.Errorf("logged messages = %v, want a secondary-repo-failed warning after the fingerprint", msgs)
+	}
+}
+
+// TestBootFingerprintAndSeed_EnsureRootRejected_NoDiscoveryNoGitSpawned
+// reproduces the R3 finding directly: gitdir.EnsureRoot refuses cfg.
+// GitDirRoot (here, mode 0777 -- group/other-writable), and
+// <GitDirRoot>/primary is planted as a symlink to a "victim" directory
+// outside the workspace entirely. Before the fix, boot.CollectFingerprint
+// ran anyway with the same (rejected) layout: DiscoverRepoSHAs would stat
+// through the symlink, and repoHeadSHA (via gitdir.Run/SyncHeadIn) would
+// write victim/HEAD and spawn `git rev-parse HEAD` against victim as
+// sandbox-agent, reporting whatever SHA the attacker-controlled victim
+// directory chose. This proves neither happens: victim/HEAD is never
+// created, and the fingerprint's own repo_shas is empty.
+func TestBootFingerprintAndSeed_EnsureRootRejected_NoDiscoveryNoGitSpawned(t *testing.T) {
+	t.Parallel()
+
+	workspaceDir := t.TempDir()
+	seedWarmBootTestGoodRepo(t, workspaceDir, "primary")
+
+	gitDirRoot := t.TempDir()
+	if err := os.Chmod(gitDirRoot, 0o777); err != nil {
+		t.Fatalf("chmod gitDirRoot 0777: %v", err)
+	}
+
+	// victim is deliberately OUTSIDE gitDirRoot and workspaceDir -- an
+	// attacker-controlled directory the planted symlink points at. It has
+	// no HEAD file yet, so a write reaching it is directly observable.
+	victim := t.TempDir()
+	if err := os.Symlink(victim, filepath.Join(gitDirRoot, "primary")); err != nil {
+		t.Fatalf("symlink %s/primary -> victim: %v", gitDirRoot, err)
+	}
+
+	cfg := boot.Config{
+		GitDirRoot:   gitDirRoot,
+		WorkspaceDir: workspaceDir,
+		SessionConfig: &sessionconfig.SessionConfig{
+			Repos: []sessionconfig.SessionConfigReposElem{
+				{Name: "primary", Url: "https://example.invalid/primary.git"},
+			},
+		},
+	}
+	layout := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}
+
+	var buf bytes.Buffer
+	logger := platform.NewLogger(&buf, cfg.LogLevel)
+
+	err := bootFingerprintAndSeed(context.Background(), supervisor.New(), cfg, layout, nil, platform.DefaultTimeouts(), logger)
+	if err == nil {
+		t.Fatal("bootFingerprintAndSeed() error = nil, want a fatal error for the rejected (0777) git-dir root")
+	}
+
+	if _, statErr := os.Stat(filepath.Join(victim, "HEAD")); statErr == nil {
+		t.Error("victim/HEAD exists -- SyncHeadIn wrote through the symlinked, rejected root; the fix must skip repo discovery entirely when EnsureRoot fails")
+	}
+
+	shas := loggedRepoSHAs(t, &buf)
+	if len(shas) != 0 {
+		t.Errorf("fingerprint repo_shas = %v, want empty -- a rejected git-dir root must not be discovered against at all", shas)
+	}
+}
+
+// TestBootFingerprintAndSeed_SecondaryFailure_ExcludedFromRepoSHAs proves
+// the second half of the R3 finding: a secondary repo whose Seed call
+// fails THIS boot must be excluded from the fingerprint's own repo_shas,
+// even if its agent git-dir already exists on disk (seeded successfully on
+// an earlier boot) -- DiscoverRepoSHAs' own os.Stat gate has no notion of
+// "seeded this boot", only "a git-dir is present", so without the fix a
+// stale SHA from the earlier, successful seed would still be reported as
+// if it were current.
+func TestBootFingerprintAndSeed_SecondaryFailure_ExcludedFromRepoSHAs(t *testing.T) {
+	t.Parallel()
+
+	workspaceDir := t.TempDir()
+	seedWarmBootTestGoodRepo(t, workspaceDir, "primary")
+	seedWarmBootTestGoodRepo(t, workspaceDir, "secondary")
+
+	gitDirRoot := t.TempDir()
+	layout := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}
+	if err := gitdir.EnsureRoot(gitDirRoot); err != nil {
+		t.Fatalf("gitdir.EnsureRoot() error = %v", err)
+	}
+
+	// Simulate an earlier, successful boot that already seeded "secondary"'s
+	// agent git-dir -- BEFORE this boot's own shallow marker (below) makes
+	// gitdir.Seed refuse it. This leaves a real, stale git-dir with a real
+	// SHA on disk at layout.Repo("secondary").GitDir.
+	timeouts := platform.DefaultTimeouts()
+	if err := gitdir.Seed(context.Background(), supervisor.New(), layout.Repo("secondary"), "https://example.invalid/secondary.git", nil, timeouts.GitSyncStepTimeout, timeouts.ProcessStopGracePeriod); err != nil {
+		t.Fatalf("precondition: gitdir.Seed(secondary) error = %v, want nil (must succeed once, to leave a stale git-dir behind)", err)
+	}
+
+	// NOW plant the .git/shallow marker that makes THIS boot's Seed call for
+	// "secondary" fail -- exactly seedWarmBootTestBadRepo's own shape,
+	// applied after the fact so the earlier Seed call above ran clean.
+	if err := os.WriteFile(filepath.Join(workspaceDir, "secondary", ".git", "shallow"), []byte("deadbeef\n"), 0o644); err != nil {
+		t.Fatalf("write .git/shallow: %v", err)
+	}
+
+	cfg := boot.Config{
+		GitDirRoot:   gitDirRoot,
+		WorkspaceDir: workspaceDir,
+		SessionConfig: &sessionconfig.SessionConfig{
+			Repos: []sessionconfig.SessionConfigReposElem{
+				{Name: "primary", Url: "https://example.invalid/primary.git"},
+				{Name: "secondary", Url: "https://example.invalid/secondary.git"},
+			},
+		},
+	}
+
+	var buf bytes.Buffer
+	logger := platform.NewLogger(&buf, cfg.LogLevel)
+
+	err := bootFingerprintAndSeed(context.Background(), supervisor.New(), cfg, layout, nil, timeouts, logger)
+	if err != nil {
+		t.Fatalf("bootFingerprintAndSeed() error = %v, want nil (a secondary repo's Seed failure is a warning, not fatal)", err)
+	}
+
+	shas := loggedRepoSHAs(t, &buf)
+	if _, present := shas["primary"]; !present {
+		t.Errorf("fingerprint repo_shas = %v, want a \"primary\" entry (its Seed call succeeded this boot)", shas)
+	}
+	if sha, present := shas["secondary"]; present {
+		t.Errorf("fingerprint repo_shas = %v, want NO \"secondary\" entry (its Seed call failed THIS boot; got stale sha %q from an earlier boot)", shas, sha)
 	}
 }
