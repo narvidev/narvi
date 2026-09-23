@@ -169,22 +169,60 @@ func TestCheckGuideDrift_Omission(t *testing.T) {
 		}
 	})
 
-	t.Run("known limitation: concatenating several denylisted phrases clears both mechanical checks", func(t *testing.T) {
+	t.Run("a punctuation-joined concatenation of denylisted phrases is now caught clause by clause", func(t *testing.T) {
+		// reasonClausesAllVacuous (guideomission.go) closes the gap this
+		// subtest used to pin as accepted: splitting the reason on
+		// commas/semicolons/periods/hyphens and requiring every resulting
+		// clause, not just the whole string, to individually clear
+		// vacuousExemptionReasons catches a concatenation like this one
+		// even though the WHOLE string is neither an exact denylist entry
+		// nor short enough to fail the length floor.
+		exemptions := []RouteGuideExemption{{Route: "POST /webhooks/probe", Reason: "internal only, not applicable, admin only"}}
+		errs := CheckGuideDrift(guides, routes, vocab, exemptions)
+		kinds := errKinds(errs)
+		if !kinds["exemption-vacuous-reason"] {
+			t.Errorf("CheckGuideDrift() = %v, want exemption-vacuous-reason (every comma-separated clause is itself a stock non-answer)", errs)
+		}
+		if !kinds["route-undocumented"] {
+			t.Errorf("CheckGuideDrift() = %v, want route-undocumented too (an invalid exemption exempts nothing)", errs)
+		}
+	})
+
+	t.Run("hyphen-padding a single denylisted phrase past the length floor is now caught the same way", func(t *testing.T) {
+		// The minExemptionReasonLen doc comment's own example: repeating
+		// "internal" with bare hyphens between repetitions clears the
+		// 30-character floor and was never a single exact
+		// vacuousExemptionReasons entry as a whole string either -- each
+		// hyphen-delimited clause is "internal" on its own, so this is
+		// caught the identical way the comma-joined case above is.
+		exemptions := []RouteGuideExemption{{Route: "POST /webhooks/probe", Reason: "internal-internal-internal-internal"}}
+		errs := CheckGuideDrift(guides, routes, vocab, exemptions)
+		if !errKinds(errs)["exemption-vacuous-reason"] {
+			t.Errorf("CheckGuideDrift() = %v, want exemption-vacuous-reason (hyphen-padding a single stock phrase)", errs)
+		}
+	})
+
+	t.Run("known limitation: concatenating denylisted phrases with NO punctuation between them still clears both mechanical checks", func(t *testing.T) {
 		// This is NOT a bug this test is pinning as correct behavior; it
-		// is the honest boundary of what "non-empty, long enough, not one
-		// exact stock phrase" can mechanically enforce, stated as a
-		// passing test rather than left to be discovered later by
+		// is the honest, NARROWER boundary that remains after
+		// reasonClausesAllVacuous (guideomission.go) closed the
+		// punctuation-joined case above: with no comma, hyphen, or other
+		// clauseSplitRE delimiter anywhere in the string, it yields
+		// exactly ONE clause -- the whole string -- which is neither a
+		// single exact vacuousExemptionReasons entry (it is four of them
+		// run together) nor short enough to fail the length floor. Stated
+		// as a passing test rather than left to be discovered later by
 		// someone assuming the denylist is smarter than it is (docs/
 		// guides/README.md's own "exhaustiveness claims" section makes
 		// the identical call for the route/classifier scanners: a check
 		// that validates a narrow, syntactic property stays honest by
 		// refusing to pretend it does semantic content review). A reason
-		// this hollow is exactly what "review the register as code"
-		// (this Step's own brief) exists to catch instead.
-		exemptions := []RouteGuideExemption{{Route: "POST /webhooks/probe", Reason: "Not user-facing, not applicable, internal use only."}}
+		// this hollow is exactly what "review the register as code" (this
+		// Step's own brief) exists to catch instead.
+		exemptions := []RouteGuideExemption{{Route: "POST /webhooks/probe", Reason: "internal only not applicable admin only"}}
 		errs := CheckGuideDrift(guides, routes, vocab, exemptions)
 		if len(errs) != 0 {
-			t.Errorf("CheckGuideDrift() = %v, want none (documenting the known gap, not asserting it is caught)", errs)
+			t.Errorf("CheckGuideDrift() = %v, want none (documenting the known, narrower gap, not asserting it is caught)", errs)
 		}
 	})
 

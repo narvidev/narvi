@@ -45,7 +45,7 @@ func (e GuideDriftError) Error() string {
 // field names a Surface/Target/Mode/Source value ScanIntentVocabulary
 // never found in source), "route-undocumented" (a real, registered route
 // is named in no guide's own Route field and in no exemptions entry —
-// guideomission.go's own completeness half), and six more over
+// guideomission.go's own completeness half), and eight more over
 // exemptions itself (guideomission.go's own doc comment): "exemption-
 // malformed-route", "exemption-wildcard", "exemption-empty-reason",
 // "exemption-reason-too-short", "exemption-vacuous-reason",
@@ -191,13 +191,13 @@ func CheckGuideDrift(guides []SurfaceGuide, routes map[string]RegisteredRoute, v
 				Command: route,
 				Detail:  "exemption has an empty reason -- every exemption must say who or what calls this route instead of a person",
 			})
-		case vacuousExemptionReasons[normalizeReasonForCheck(reason)]:
+		case vacuousExemptionReasons[normalizeReasonForCheck(reason)] || reasonClausesAllVacuous(reason):
 			reasonValid = false
 			errs = append(errs, GuideDriftError{
 				Kind:    "exemption-vacuous-reason",
 				Source:  guideExemptionSourceLabel,
 				Command: route,
-				Detail:  fmt.Sprintf("exemption reason %q is a stock non-answer, not a claim about who or what calls this route", reason),
+				Detail:  fmt.Sprintf("exemption reason %q is a stock non-answer, or a punctuation-joined concatenation of nothing but stock non-answers, not a claim about who or what calls this route", reason),
 			})
 		case len(reason) < minExemptionReasonLen:
 			reasonValid = false

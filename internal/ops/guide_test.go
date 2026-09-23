@@ -136,3 +136,65 @@ func TestLoadGuides(t *testing.T) {
 		}
 	})
 }
+
+// TestExtractCommandBlocks_HiddenFenceInHTMLComment is G2's own mutation
+// proof: a narvi-command fence written between <!-- and --> renders
+// invisibly in any real markdown viewer, so it must document nothing.
+// Before this fix, extractCommandBlocks was a pure line scanner with no
+// comment awareness at all and extracted this block exactly like a real,
+// visible one.
+func TestExtractCommandBlocks_HiddenFenceInHTMLComment(t *testing.T) {
+	content := []byte("# Web Guide\n\n" +
+		"<!--\n" +
+		"```json narvi-command\n" +
+		"{\"name\": \"Hidden\", \"route\": \"GET /hidden-in-comment\"}\n" +
+		"```\n" +
+		"-->\n\n" +
+		"```json narvi-command\n" +
+		"{\"name\": \"Visible\", \"route\": \"GET /visible\"}\n" +
+		"```\n")
+
+	commands, err := extractCommandBlocks("web.md", content)
+	if err != nil {
+		t.Fatalf("extractCommandBlocks: %v", err)
+	}
+	if len(commands) != 1 {
+		t.Fatalf("extractCommandBlocks() returned %d commands, want exactly 1 (the comment-hidden fence must not count): %+v", len(commands), commands)
+	}
+	if commands[0].Route != "GET /visible" {
+		t.Errorf("commands[0].Route = %q, want \"GET /visible\" (the visible fence, not the hidden one)", commands[0].Route)
+	}
+}
+
+// TestExtractCommandBlocks_HiddenFenceInEnclosingFence is G2's own second
+// mutation proof: a narvi-command fence nested inside a longer, unrelated
+// example fence (the shape docs/guides/README.md itself uses to show a
+// reader what the mechanism looks like, wrapped in a longer ```` fence so
+// the inner ``` renders as literal text, not a live block) must not be
+// extracted as real documentation either — it documents the FORMAT, not a
+// claim about the named route. Before this fix, extractCommandBlocks had
+// no notion of fence nesting at all and matched the inner line exactly
+// like a top-level one.
+func TestExtractCommandBlocks_HiddenFenceInEnclosingFence(t *testing.T) {
+	content := []byte("# Web Guide\n\n" +
+		"Example:\n\n" +
+		"````\n" +
+		"```json narvi-command\n" +
+		"{\"name\": \"Example only\", \"route\": \"GET /example-only\"}\n" +
+		"```\n" +
+		"````\n\n" +
+		"```json narvi-command\n" +
+		"{\"name\": \"Visible\", \"route\": \"GET /visible\"}\n" +
+		"```\n")
+
+	commands, err := extractCommandBlocks("web.md", content)
+	if err != nil {
+		t.Fatalf("extractCommandBlocks: %v", err)
+	}
+	if len(commands) != 1 {
+		t.Fatalf("extractCommandBlocks() returned %d commands, want exactly 1 (the fence nested inside the outer example fence must not count): %+v", len(commands), commands)
+	}
+	if commands[0].Route != "GET /visible" {
+		t.Errorf("commands[0].Route = %q, want \"GET /visible\" (the visible fence, not the nested example)", commands[0].Route)
+	}
+}

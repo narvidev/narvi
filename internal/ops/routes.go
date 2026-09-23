@@ -35,13 +35,41 @@ type RegisteredRoute struct {
 // of these five names is NOT guaranteed to be a real chi.Router — "Get"/
 // "Post"/etc. are common enough method names (an outbound http.Client.Get,
 // for instance) that this scanner will also record an unrelated call as a
-// "route". That is harmless for drift-detection purposes (it can only
-// ENLARGE the registered set, never omit a real route — see CheckDrift's
-// own identical "a false extra entry never hides a genuine one" property
-// in drift.go), and scanning is restricted to controlplane
-// specifically (the one place chi routes are registered in this codebase
-// — confirmed by grepping for chi.NewRouter/chi.Router across internal/
-// and cmd/) to keep the noise minimal.
+// "route". That specific trade-off is harmless (an unrelated same-named
+// call can only ENLARGE the registered set, never omit a real route — see
+// CheckDrift's own identical "a false extra entry never hides a genuine
+// one" property in drift.go).
+//
+// A DIFFERENT, real gap: this scanner recognizes exactly these five
+// method names plus Route(...) — nothing else. A route registered any
+// other real way — a path held in a `const` rather than a string
+// literal; router.Method(...)/.Handle(...)/.HandleFunc(...); a helper
+// function outside controlplane/ that takes a chi.Router and registers
+// routes on it; or a Mount'd sub-router, whose own unprefixed route name
+// can silently collide with, and overwrite, an existing top-level key in
+// this scanner's own "found" map, losing the real, Mount-prefixed route
+// entirely — is invisible to it while staying perfectly reachable in
+// production. An earlier version of this comment claimed the opposite:
+// that this scanner "can only enlarge the registered set, never omit a
+// real route". That is true of the same-named-method trade-off above and
+// false as a claim about this scanner in general — a reviewer proved it
+// with all four shapes just listed, each one leaving CheckGuideDrift's
+// own completeness check (guidedrift.go) silent about a real,
+// undocumented, unexempted route, because that check trusts this
+// scanner's own "found" set as ground truth and cannot see anything this
+// scanner never reports at all.
+// TestScanRegisteredRoutes_MatchesGolden (internal/ops/
+// routesgolden_test.go) is what closes that gap: it compares this
+// scanner's own output against controlplane/testdata/routes.golden — the
+// one artifact in this repo captured directly from the real, live
+// chi.Walk (controlplane.App.Routes(), pinned to it by the
+// integration-tagged TestBuild_RouteTableMatchesGolden) — in both
+// directions, so a route this scanner misses fails that test by name
+// the moment someone regenerates the golden from the live router,
+// instead of silently staying invisible here too. Scanning is restricted
+// to controlplane specifically (the one place chi routes are registered
+// in this codebase — confirmed by grepping for chi.NewRouter/chi.Router
+// across internal/ and cmd/) to keep the noise minimal.
 var chiRouterMethods = map[string]bool{
 	"Get":    true,
 	"Post":   true,

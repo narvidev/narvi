@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"regexp"
 	"strings"
 )
 
@@ -8,10 +9,10 @@ import (
 // not "does a documented command bind to something real" (that direction
 // already fails a guide that lies), but "does every real, registered route
 // appear SOMEWHERE" -- either documented in a guide, or named here with a
-// reason. See docs/guides/README.md's own "Two rules, one of which nothing
-// currently enforces" section for why this half was missing, and its "Which
-// lot owes which guide" table for the routes this batch resolved by adding
-// guide entries instead of a register entry.
+// reason. See docs/guides/README.md's own "Two rules, both enforced now"
+// section for why this half was missing, and its "Which lot owes which
+// guide" table for the routes this batch resolved by adding guide entries
+// instead of a register entry.
 //
 // Nothing in cmd/control-plane's own router wiring records which routes are
 // meant for a person and which are not -- a webhook receiver, a health
@@ -121,7 +122,7 @@ var RouteGuideExemptions = []RouteGuideExemption{
 	},
 	{
 		Route:  "POST /sessions/{sessionID}/workflow/step-outcome",
-		Reason: "Sandbox-agent bearer route: an in-sandbox workflow step posts its outcome here via the generic step-outcome tool (httpapi/workflowstepoutcome.go), never a browser.",
+		Reason: "Sandbox-agent bearer route: the handler side of the generic step-outcome-posting tool (httpapi/workflowstepoutcome.go), never a browser -- but no caller is wired today. Unlike its siblings review/verdict and turn/epistemic-outcome, each backed by a real cmd/sandbox-agent tool prompt (reviewverdicttoolprompt.go, epistemicoutcometoolprompt.go), cmd/sandbox-agent has no step-outcome tool prompt of its own; nothing in this repo currently posts to this route (confirmed by repo-wide search, not merely absence of a match). OnTurnCompleted (internal/app/workflowengine/completion.go) derives an implicit outcome from a turn's own terminal trigger whenever none was explicitly posted, so the workflow engine does not depend on a caller existing.",
 	},
 	{
 		Route:  "POST /sessions/{sessionID}/turn/epistemic-outcome",
@@ -147,12 +148,17 @@ var RouteGuideExemptions = []RouteGuideExemption{
 
 // minExemptionReasonLen is the length floor validateRouteGuideExemptions
 // enforces on RouteGuideExemption.Reason, AFTER trimming surrounding
-// whitespace. Chosen to be long enough that a one- or two-word non-answer
-// ("internal", "n/a", "admin only", "not user-facing") cannot clear it by
-// padding alone without also failing vacuousExemptionReasons below, while
-// staying short enough that a genuine one-clause reason naming a real
+// whitespace. A one- or two-word non-answer ("internal", "n/a", "admin
+// only", "not user-facing") padded past this floor with punctuation alone
+// -- repeating itself with commas or hyphens between the repetitions, say
+// -- does not clear vacuousExemptionReasons either, because
+// reasonClausesAllVacuous below checks each punctuation-delimited clause
+// on its own, not just the reason as one whole string; see that
+// function's own doc comment for the real, narrower gap that remains
+// (concatenation with NO punctuation at all between the stock phrases).
+// Staying short enough that a genuine one-clause reason naming a real
 // caller never has to be padded to satisfy a length rule that has nothing
-// to do with its content.
+// to do with its content is the other half of why 30 specifically.
 const minExemptionReasonLen = 30
 
 // vacuousExemptionReasons is the short denylist of stock non-answers this
@@ -198,6 +204,77 @@ func normalizeReasonForCheck(reason string) string {
 	s = strings.TrimRight(s, ".!?")
 	s = strings.TrimSpace(s)
 	return strings.Join(strings.Fields(s), " ")
+}
+
+// clauseSplitRE divides a reason into candidate "clauses" on the
+// punctuation a concatenated-denylisted-phrase attack realistically
+// glues several stock non-answers together with: commas, semicolons,
+// colons, periods, exclamation/question marks, parentheses, and hyphens
+// -- including a bare hyphen used purely as padding (e.g.
+// "internal-internal-internal-internal", the shape minExemptionReasonLen's
+// own doc comment names).
+//
+// Splitting on hyphens also fragments a genuine reason's own hyphenated
+// compound words ("in-sandbox", "Sandbox-agent") and even one
+// denylisted phrase's own internal hyphen ("not user-facing",
+// "self-explanatory") into pieces that no longer match anything in
+// vacuousExemptionReasons. reasonClausesAllVacuous below is unaffected by
+// that imprecision in the direction that matters: it can only ever
+// produce a FALSE NEGATIVE (a concatenation that happens to fragment a
+// denylisted phrase's own hyphen escapes detection), never a false
+// positive against a genuine reason -- a real reason's substantive
+// content (a file path, a route string, a caller's name) never vanishes
+// just because one adjacent compound word got split into two
+// non-denylisted pieces; some OTHER clause in the same reason still
+// carries it.
+var clauseSplitRE = regexp.MustCompile(`[,;:.!?()\-]+`)
+
+// reasonClausesAllVacuous reports whether EVERY non-empty clause
+// clauseSplitRE divides reason into is itself, after
+// normalizeReasonForCheck, an exact vacuousExemptionReasons entry --
+// catching a punctuation-joined concatenation like "internal only, not
+// applicable, admin only" or hyphen-padding like
+// "internal-internal-internal-internal" that clears both
+// minExemptionReasonLen and the whole-string exact-match check above
+// (neither is, as one whole string, a single denylisted phrase, and both
+// are long enough), one clause at a time.
+//
+// The gap this does NOT close: a reason with NO punctuation at all
+// between its concatenated stock phrases (e.g. "internal only not
+// applicable admin only", four denylisted words run together with plain
+// spaces) still yields exactly one clause -- clauseSplitRE finds nothing
+// to split on -- and that one clause, as a whole string, matches no
+// single vacuousExemptionReasons entry either. That is a real, narrower,
+// still-open gap, not a claim this function makes and fails to keep; see
+// guidedrift_test.go's own TestCheckGuideDrift_Omission ("known
+// limitation" subtest) and docs/guides/README.md's own "Two rules, both
+// enforced now" section for that gap stated as a passing test rather
+// than left for someone to discover later.
+//
+// This cannot flag a genuine reason: every one of the real
+// RouteGuideExemptions entries carries substantive content (a file path,
+// a route string, a caller's name) that survives clause-splitting in at
+// least one clause, so at least one clause is never in
+// vacuousExemptionReasons and this returns false for every one of them --
+// pinned by TestNoGuideDrift itself (a false positive here would fail
+// the real register's own entries on every `go test ./...` run) and,
+// narrower and faster, by
+// TestRouteGuideExemptions_RealReasonsPassVacuousCheck in
+// guideomission_test.go.
+func reasonClausesAllVacuous(reason string) bool {
+	clauses := clauseSplitRE.Split(reason, -1)
+	sawClause := false
+	for _, c := range clauses {
+		norm := normalizeReasonForCheck(c)
+		if norm == "" {
+			continue
+		}
+		sawClause = true
+		if !vacuousExemptionReasons[norm] {
+			return false
+		}
+	}
+	return sawClause
 }
 
 // isWellFormedExemptionRoute reports whether route looks like a real

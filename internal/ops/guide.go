@@ -189,25 +189,129 @@ func LoadGuides(dir string) ([]SurfaceGuide, error) {
 	return out, nil
 }
 
+// htmlCommentOpen/htmlCommentClose delimit an HTML comment in a guide's
+// raw markdown source — content a real markdown renderer (and therefore
+// every reader) never shows. extractCommandBlocks must not accept a
+// narvi-command fence found between these as real documentation: a route
+// "documented" only inside a comment is exactly as undocumented as one
+// with no guide entry at all, just harder to notice in a diff.
+const (
+	htmlCommentOpen  = "<!--"
+	htmlCommentClose = "-->"
+)
+
+// leadingBacktickRun returns the length of s's leading run of '`'
+// characters (0 if s does not start with one) — the minimum needed to
+// recognize a markdown fence delimiter line without a full CommonMark
+// parser: a fence opens with a run of 3-or-more backticks, optionally
+// followed by an info string.
+func leadingBacktickRun(s string) int {
+	n := 0
+	for n < len(s) && s[n] == '`' {
+		n++
+	}
+	return n
+}
+
+// isBareFenceCloseLine reports whether trimmed can CLOSE an already-open
+// fence that itself opened with a backtick run of length need. Real
+// CommonMark closing-fence syntax is strict about this: unlike an opening
+// fence, a closing fence line may contain nothing but the backtick run
+// itself (no info string) — "```json narvi-command" can OPEN a fence but
+// can never CLOSE one, exactly like a real markdown renderer treats it.
+// That asymmetry is exactly what lets a narvi-command fence nest, as
+// inert literal text, inside a longer outer example fence: the outer
+// fence's own bare "```"/"````" close is the only line able to end it: an
+// inner "```json narvi-command" line never can, so it never
+// (mis-)terminates the outer fence early and is never itself mistaken for
+// live documentation while the outer fence remains open.
+func isBareFenceCloseLine(trimmed string, need int) bool {
+	if trimmed == "" {
+		return false
+	}
+	for _, r := range trimmed {
+		if r != '`' {
+			return false
+		}
+	}
+	return len(trimmed) >= need
+}
+
 // extractCommandBlocks is a deliberately simple, purpose-built line
 // scanner over content — not a general CommonMark parser (this repo
 // controls every byte of docs/guides/*.md, exactly like schema.go's own
 // JSON loader controls every byte of deploy/observability/*.json; a full
 // markdown parser would be a dependency this narrow, strict extraction
 // doesn't need). It looks for a line matching commandFenceOpen EXACTLY
-// (after trimming surrounding whitespace) and collects every following
+// (after trimming surrounding whitespace), OUTSIDE both an HTML comment
+// and any other, enclosing markdown fence, and collects every following
 // line up to a line matching commandFenceClose exactly, as one block's
 // raw JSON. An opened fence with no matching close before EOF is a hard
 // error (fail closed) rather than silently dropping the trailing partial
 // block.
+//
+// Two shapes of "looks documented but no reader can ever see it" are
+// refused, not merely mis-parsed:
+//
+//   - A narvi-command fence written between htmlCommentOpen/
+//     htmlCommentClose is invisible to a rendered guide — it is simply
+//     never scanned for at all while a comment is open, so it produces no
+//     GuideCommand and CheckGuideDrift's completeness check treats the
+//     route it named as still undocumented, exactly as if the fence were
+//     never written.
+//   - A narvi-command fence nested inside a longer, unrelated example
+//     fence (e.g. a "how to document a route" walkthrough wrapped in its
+//     own ```` ```` ```` block) is real, visible markdown, but it
+//     documents the FORMAT, not a live claim that guide makes about that
+//     specific route — exactly the illustrative-not-authoritative text
+//     this mechanism must not treat as a real binding. This scanner
+//     tracks at most one open "enclosing" fence at a time (true
+//     CommonMark fences do not nest either: a fence's own content is
+//     entirely literal, including anything that looks like another fence,
+//     until its own matching close), so any narvi-command-shaped line
+//     found while one is open is left as literal text, never extracted.
+//
+// Both are mutation-tested in guide_test.go
+// (TestExtractCommandBlocks_HiddenFenceInHTMLComment/
+// TestExtractCommandBlocks_HiddenFenceInEnclosingFence).
 func extractCommandBlocks(sourcePath string, content []byte) ([]GuideCommand, error) {
 	lines := strings.Split(string(content), "\n")
 
 	var commands []GuideCommand
+	inComment := false
+	enclosingFenceLen := 0 // 0 = not currently inside an unrelated fence
 	for i := 0; i < len(lines); i++ {
-		if strings.TrimSpace(lines[i]) != commandFenceOpen {
+		raw := lines[i]
+		trimmed := strings.TrimSpace(raw)
+
+		if inComment {
+			if strings.Contains(raw, htmlCommentClose) {
+				inComment = false
+			}
 			continue
 		}
+
+		if enclosingFenceLen > 0 {
+			if isBareFenceCloseLine(trimmed, enclosingFenceLen) {
+				enclosingFenceLen = 0
+			}
+			continue // every line inside an enclosing fence is literal text
+		}
+
+		if strings.Contains(raw, htmlCommentOpen) {
+			if !strings.Contains(raw, htmlCommentClose) {
+				inComment = true
+			}
+			continue // a same-line "<!-- ... -->" comment hides its own line too
+		}
+
+		if trimmed != commandFenceOpen {
+			if run := leadingBacktickRun(trimmed); run >= 3 {
+				enclosingFenceLen = run // entering an unrelated fence
+			}
+			continue
+		}
+
 		startLine := i + 1 // 1-indexed, the fence-open line itself
 
 		var body strings.Builder

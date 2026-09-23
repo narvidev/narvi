@@ -97,6 +97,26 @@ semantics.**
   describes what the route actually does with its request body, its
   response shape, or its authorization rules — only that the route
   exists. A reviewer still has to read the diff.
+- **The omission direction's own completeness check is itself only as
+  good as its scanner.** `internal/ops.ScanRegisteredRoutes` recognizes
+  exactly five chi method names (`Get`/`Post`/`Put`/`Patch`/`Delete`) plus
+  a `Route(...)` grouping call — a route registered any other real way (a
+  path held in a `const`, `router.Method(...)`/`.Handle(...)`/
+  `.HandleFunc(...)`, a helper function outside `controlplane/` that takes
+  a `chi.Router`, or a `Mount`'d sub-router whose own unprefixed route
+  name collides with, and silently overwrites, an existing key) is
+  invisible to that scanner while staying perfectly reachable in
+  production, and `CheckGuideDrift`'s "every real route is documented or
+  exempted" check cannot report a route it never sees in the first place.
+  `internal/ops.TestScanRegisteredRoutes_MatchesGolden`
+  (`internal/ops/routesgolden_test.go`) is what closes that specific gap:
+  it compares `ScanRegisteredRoutes`'s own output, in both directions,
+  against `controlplane/testdata/routes.golden` — the one artifact in
+  this repo captured directly from the real, live `chi.Walk`
+  (`controlplane.App.Routes()`, pinned to it by the integration-tagged
+  `TestBuild_RouteTableMatchesGolden`) — so a route the scanner misses
+  fails that unit test by name instead of silently staying undetected by
+  both `CheckGuideDrift` and everyone reading its green output.
 - **This list does not claim to be complete, and the claim is the thing
   that keeps breaking.** An earlier draft asserted a complete accounting
   of the routes outside every guide's scope and had dropped five, one
@@ -359,10 +379,18 @@ actually TRUE, e.g. whether "the sandbox-agent's own bearer client is the
 real caller" is accurate for the specific route it's attached to — is left
 to code review, the same trust boundary "Prose is not machine-verified"
 above already draws for a guide's own surrounding text. A reason
-concatenating several denylisted phrases into one longer, still-hollow
-sentence currently clears both mechanical checks; `internal/ops/
-guidedrift_test.go`'s own `TestCheckGuideDrift_Omission` pins this as a
-known, accepted limitation rather than a silently-assumed guarantee.
+concatenating several denylisted phrases with punctuation between them
+(commas, semicolons, hyphens used as padding) is now caught too —
+`guideomission.go`'s own `reasonClausesAllVacuous` splits a reason on
+that punctuation and rejects it if EVERY resulting clause is itself an
+exact denylist entry, one clause at a time, not just the reason as one
+whole string. What remains, narrower than before: a concatenation with NO
+punctuation at all between the stock phrases (four denylisted words run
+together with plain spaces, say) still clears both checks, because it
+never splits into more than one clause in the first place. `internal/ops/
+guidedrift_test.go`'s own `TestCheckGuideDrift_Omission` pins that
+narrower gap as a known, accepted limitation rather than a
+silently-assumed guarantee.
 
 ## Which lot owes which guide
 
