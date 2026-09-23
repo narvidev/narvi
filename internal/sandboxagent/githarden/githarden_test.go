@@ -93,7 +93,23 @@ func assertFlag(t *testing.T, args []string, want, why string) {
 }
 
 // TestHardeningFlags_NeutralisesEveryRepoSettableCommandKey asserts the
-// SET, not a sample.
+// SET, not a sample -- of the -c overrides hardeningFlags carries, which
+// is deliberately NOT the same claim as "the set of protocols this class
+// permits". An earlier version of this test omitted ftp/ftps while making
+// that "not a sample" claim, which was itself the exact class of
+// near-miss this test exists to catch: ftp/ftps are enumerable, fixed
+// names, exactly like every other protocol.<name>.allow key here, and
+// were simply missing.
+//
+// What this test does NOT claim, and the -c list itself no longer is: the
+// FULL guarantee behind the transport class. GIT_ALLOW_PROTOCOL (see
+// githarden.go's own "transport class" doc comment, and TestEnv_* below)
+// is what actually closes the class this enumeration cannot reach at
+// all -- an arbitrary "<name>::" remote helper, whose name an attacker
+// chooses and this list can therefore never enumerate in advance. Every
+// key asserted below is still real, still defense-in-depth, and still
+// worth pinning by name -- it is just not, on its own, the reason the
+// class is closed any more.
 //
 // The phase audit found credential.helper missing while hooksPath and
 // fsmonitor were present — a check that names some of the dangerous keys
@@ -105,7 +121,8 @@ func assertFlag(t *testing.T, args []string, want, why string) {
 // Both entry points are asserted, because they were two separate lists
 // until this audit and a key added to one is exactly what gets missed.
 func TestHardeningFlags_NeutralisesEveryRepoSettableCommandKey(t *testing.T) {
-	// Every key here makes git RUN something and is settable from the
+	// Every key here makes git RUN something (or, for the proxy pair,
+	// redirect the one surviving transport) and is settable from the
 	// repository's own .git/config, which the agent runtime owns.
 	want := map[string]string{
 		"credential.helper":    "",
@@ -121,8 +138,11 @@ func TestHardeningFlags_NeutralisesEveryRepoSettableCommandKey(t *testing.T) {
 		"protocol.git.allow":   "never",
 		"protocol.ssh.allow":   "never",
 		"protocol.ext.allow":   "never",
+		"protocol.ftp.allow":   "never",
+		"protocol.ftps.allow":  "never",
 		"core.gitProxy":        "none",
 		"http.proxy":           "",
+		"remote.origin.proxy":  "",
 	}
 
 	for _, tc := range []struct {
@@ -555,6 +575,154 @@ func TestTransportClass_SSHBlocked(t *testing.T) {
 	}
 }
 
+// TestTransportClass_ArbitraryRemoteHelperBlockedByAllowProtocol is F1's
+// own executable proof: an ARBITRARY "<name>::" remote helper, whose name
+// the attacker chooses, has no fixed protocol.<name>.allow key for
+// hardeningFlags' own -c enumeration to reset in advance -- so the -c
+// flags alone (Args, with no GIT_ALLOW_PROTOCOL in the child's own
+// environment) do NOT stop it, and GIT_ALLOW_PROTOCOL=https (Env) is what
+// actually does. The planted "helper" here is a git ALIAS that runs an
+// arbitrary shell command (a documented git feature -- "alias.<name>" can
+// begin with "!" to run a shell command), invoked by git's own resolution
+// of a remote helper program named "git-remote-foo": this codebase does
+// not ship one, so the alias stands in for it, but the invocation path
+// (git resolves "foo::..." to a program named "git-remote-foo" on PATH,
+// which an attacker able to write BOTH .git/config's own alias section
+// AND control what PATH resolves for this process could plant for real --
+// the alias is the reliable, portable stand-in that does not depend on
+// PATH layout in a test environment) is git's own documented behavior,
+// not a test artifact.
+func TestTransportClass_ArbitraryRemoteHelperBlockedByAllowProtocol(t *testing.T) {
+	repoDir, marker := newAttackRepo(t)
+	gitInRepo(t, repoDir, "config", "protocol.foo.allow", "always")
+	// The leading "!" is load-bearing: without it, git treats an alias
+	// value as a literal git subcommand plus word-split arguments, never
+	// as a shell command -- verified directly (an earlier version of this
+	// test omitted it and the marker never appeared, even with no
+	// hardening at all).
+	gitInRepo(t, repoDir, "config", "alias.remote-foo", "!"+payload(marker, "true"))
+	gitInRepo(t, repoDir, "remote", "add", "origin", "foo::whatever")
+
+	// CONTROL: no hardening at all.
+	gitIgnoringExitCode(t, repoDir, "fetch", "origin")
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("control: the foo:: alias did NOT run with no hardening at all (marker absent: %v) -- this test proves nothing", err)
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatalf("remove marker between control and args-only runs: %v", err)
+	}
+
+	// ARGS-ONLY: hardeningFlags' own -c enumeration, with NO
+	// GIT_ALLOW_PROTOCOL in the environment -- the exact shape this PR
+	// shipped before this Step. "foo" has no protocol.foo.allow=never
+	// entry (and could not: the name is the attacker's own choice), so
+	// this must STILL execute.
+	argsOnly := exec.Command("git", Args(repoDir, "fetch", "origin")...)
+	argsOnly.Dir = repoDir
+	argsOnly.Env = gitEnv()
+	_ = argsOnly.Run()
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("args-only (hardeningFlags, no GIT_ALLOW_PROTOCOL): the foo:: alias did NOT run (marker absent) -- if this now passes, the -c enumeration alone started closing arbitrary remote helpers; investigate before touching this test")
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatalf("remove marker between args-only and fixed runs: %v", err)
+	}
+
+	// FIXED: Args() plus Env(gitEnv()) -- GIT_ALLOW_PROTOCOL=https now in
+	// the child's own environment. Must block it.
+	fixed := exec.Command("git", Args(repoDir, "fetch", "origin")...)
+	fixed.Dir = repoDir
+	fixed.Env = Env(gitEnv())
+	_ = fixed.Run()
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the foo:: alias ran even with Args()+Env() (GIT_ALLOW_PROTOCOL=https) in place")
+	}
+
+	// MUTATION: same as ARGS-ONLY above, restated as the mutation this
+	// class's own fix depends on -- removing GIT_ALLOW_PROTOCOL from the
+	// environment (keeping every -c flag) re-opens the attack.
+	mutated := exec.Command("git", Args(repoDir, "fetch", "origin")...)
+	mutated.Dir = repoDir
+	mutated.Env = gitEnv()
+	_ = mutated.Run()
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("mutation: removing GIT_ALLOW_PROTOCOL from the environment (keeping every -c flag) did not re-open the attack (marker absent) -- some OTHER mechanism is silently doing GIT_ALLOW_PROTOCOL's job")
+	}
+}
+
+// TestTransportClass_FTPBlockedByAllowProtocol is F1's own second
+// executable proof: ftp/ftps are FIXED names (git ships git-remote-ftp(s)
+// by default), so unlike the arbitrary "<name>::" helper above they COULD
+// have their own protocol.ftp(s).allow=never entry -- and now do (this
+// Step's own hardeningFlags addition) -- but the point this test pins is
+// narrower: even with NO protocol.ftp.allow entry at all (this repo never
+// arms "protocol.ftp.allow=always" -- the general protocol.allow=never
+// fallback is what this test exercises), GIT_ALLOW_PROTOCOL is what
+// actually stops git from even ATTEMPTING the transport (observed via
+// git's own error text: "Could not resolve host" -- a real connection
+// attempt -- with no GIT_ALLOW_PROTOCOL, versus "transport 'ftp' not
+// allowed" -- refused before any connection attempt -- with it).
+func TestTransportClass_FTPBlockedByAllowProtocol(t *testing.T) {
+	repoDir := t.TempDir()
+	gitInRepo(t, repoDir, "init", "-q", ".")
+	gitInRepo(t, repoDir, "remote", "add", "origin", "ftp://nonexistent-host-xyz-abc.invalid/repo.git")
+	gitInRepo(t, repoDir, "config", "protocol.ftp.allow", "always")
+
+	// argsNoFTPPolicy simulates the ORIGINAL PR's own -c enumeration --
+	// hardeningFlags MINUS this Step's own protocol.ftp.allow=never/
+	// protocol.ftps.allow=never additions (argsWithout) -- so this test
+	// isolates GIT_ALLOW_PROTOCOL's OWN independent contribution, not the
+	// -c flags this Step ALSO added for defense-in-depth. Without that
+	// exclusion, Args() already carries an explicit protocol.ftp.allow=never
+	// on the command line, which (like every other per-protocol key in
+	// this file) already outranks the repo's own "always" on its own,
+	// leaving nothing left for GIT_ALLOW_PROTOCOL to independently prove.
+	argsNoFTPPolicy := argsWithout(repoDir, []string{"protocol.ftp.allow=never", "protocol.ftps.allow=never"}, "fetch", "origin")
+
+	// ARGS-ONLY: no GIT_ALLOW_PROTOCOL. Must reach an actual connection
+	// attempt (DNS resolution), not a transport-level refusal -- proving
+	// the enumeration gap this Step's own doc comment describes.
+	argsOnly := exec.Command("git", argsNoFTPPolicy...)
+	argsOnly.Dir = repoDir
+	argsOnly.Env = gitEnv()
+	out, err := argsOnly.CombinedOutput()
+	if err == nil {
+		t.Fatal("fetch of an ftp:// remote from a nonexistent host unexpectedly SUCCEEDED -- this test proves nothing")
+	}
+	if !strings.Contains(string(out), "Could not resolve host") {
+		t.Fatalf("args-only (no protocol.ftp.allow=never, no GIT_ALLOW_PROTOCOL): expected a real connection attempt (DNS resolution failure), got: %s", out)
+	}
+
+	// FIXED: Env(gitEnv()) added -- must refuse the transport OUTRIGHT,
+	// before ever attempting DNS resolution, via GIT_ALLOW_PROTOCOL alone.
+	fixed := exec.Command("git", argsNoFTPPolicy...)
+	fixed.Dir = repoDir
+	fixed.Env = Env(gitEnv())
+	out, err = fixed.CombinedOutput()
+	if err == nil {
+		t.Fatal("fetch of an ftp:// remote unexpectedly SUCCEEDED with GIT_ALLOW_PROTOCOL=https in place")
+	}
+	if !strings.Contains(string(out), "ftp") {
+		t.Fatalf("with GIT_ALLOW_PROTOCOL=https in place, expected a transport-level refusal naming ftp, got: %s", out)
+	}
+	if strings.Contains(string(out), "Could not resolve host") {
+		t.Fatalf("with GIT_ALLOW_PROTOCOL=https in place, git still attempted a real connection instead of refusing the transport outright: %s", out)
+	}
+
+	// MUTATION: remove GIT_ALLOW_PROTOCOL again (same as ARGS-ONLY) --
+	// restated as the mutation this fix depends on.
+	mutated := exec.Command("git", argsNoFTPPolicy...)
+	mutated.Dir = repoDir
+	mutated.Env = gitEnv()
+	out, err = mutated.CombinedOutput()
+	if err == nil {
+		t.Fatal("fetch of an ftp:// remote unexpectedly SUCCEEDED")
+	}
+	if !strings.Contains(string(out), "Could not resolve host") {
+		t.Fatalf("mutation: removing GIT_ALLOW_PROTOCOL did not re-open a real connection attempt, got: %s", out)
+	}
+}
+
 // TestTransportClass_FileUploadPackNoLongerExecutes supersedes the former
 // TestOpenClass_UploadPackExecutes: remote.<name>.uploadpack has
 // no .gitattributes half at all -- it lives purely in .git/config -- but it
@@ -565,6 +733,22 @@ func TestTransportClass_SSHBlocked(t *testing.T) {
 // protocol.file.allow=never/protocol.ssh.allow=never now deny the only two
 // transports that ever consult this key, this class closes as a
 // consequence of the transport allowlist -- not by a key of its own.
+//
+// The origin here explicitly arms "protocol.file.allow=always" -- the real
+// attacker capability (an ordinary, unprivileged .git/config write, same
+// as every other transport test in this file) -- rather than relying on
+// the origin having no policy of its own, the way an earlier version of
+// this test did. That earlier shape's fixed arm was vacuous: with no
+// repo-level protocol.file.allow at all, the GENERAL protocol.allow=never
+// fallback alone already blocks the attack, so the run "proved" nothing
+// about protocol.file.allow=never specifically -- it would have passed
+// identically had that key been silently dropped from hardeningFlags
+// entirely. Arming the specific policy, mirroring
+// TestTransportClass_ExtRewriteBlocked/_GitProxyBlocked/_SSHBlocked
+// above, makes the mutation below actually exercise protocol.file.allow's
+// own necessity: once the repo has its own specific policy, that policy
+// outranks the general fallback (verified earlier in this file), so
+// dropping protocol.file.allow=never ALONE must reopen the attack.
 func TestTransportClass_FileUploadPackNoLongerExecutes(t *testing.T) {
 	srcDir := t.TempDir()
 	gitInRepo(t, srcDir, "init", "-q", ".")
@@ -580,6 +764,7 @@ func TestTransportClass_FileUploadPackNoLongerExecutes(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "EXECUTED")
 
 	gitInRepo(t, repoDir, "config", "remote.origin.uploadpack", payload(marker, "git-upload-pack"))
+	gitInRepo(t, repoDir, "config", "protocol.file.allow", "always")
 
 	// CONTROL: this is the former TestOpenClass_UploadPackExecutes, unchanged -- the
 	// historical record that the attack is real against a local-transport
@@ -597,14 +782,13 @@ func TestTransportClass_FileUploadPackNoLongerExecutes(t *testing.T) {
 		t.Fatal("armed uploadpack ran even with hardeningFlags in place -- if this now passes, it means file-transport denial stopped closing this class; investigate before touching this test")
 	}
 
-	// MUTATION: the origin here has no explicit protocol.file.allow of its
-	// own (unlike the ext:: tests above, which arm the specific policy),
-	// so the GENERAL protocol.allow=never fallback alone already covers
-	// it -- both must be dropped to prove neither is silently redundant
-	// with something else in the list.
-	gitIgnoringExitCode(t, repoDir, argsWithout(repoDir, []string{"protocol.allow=never", "protocol.file.allow=never"}, "fetch", "origin")...)
+	// MUTATION: drop protocol.file.allow=never ALONE -- the origin's own
+	// explicit "protocol.file.allow=always" is now a SPECIFIC policy,
+	// which outranks the general protocol.allow=never fallback this run
+	// still carries, so the attack must succeed again.
+	gitIgnoringExitCode(t, repoDir, argsWithout(repoDir, []string{"protocol.file.allow=never"}, "fetch", "origin")...)
 	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("mutation: removing protocol.allow=never and protocol.file.allow=never did not re-open the attack (marker absent) -- some OTHER flag is silently doing this job")
+		t.Fatalf("mutation: removing protocol.file.allow=never alone (repo's own protocol.file.allow=always still armed) did not re-open the attack (marker absent) -- protocol.allow=never's general fallback was NOT expected to be independently sufficient once a specific per-protocol policy is set")
 	}
 }
 
@@ -613,6 +797,18 @@ func TestTransportClass_FileUploadPackNoLongerExecutes(t *testing.T) {
 // configured proxy pointed at a port nothing listens on makes a fetch over
 // the one surviving transport (https) fail outright if honoured, and
 // succeed if the reset works.
+//
+// This has TWO independent guards, and the test pins both, mirroring
+// TestTransportClass_SSHBlocked's own shape: hardeningFlags' own
+// "remote.origin.proxy=" (added for the F3 audit finding below) turns out
+// to ALSO override a plain, non-url-scoped http.proxy on its own --
+// verified directly against real git, not assumed -- because git treats
+// an explicitly-set remote.<name>.proxy (even an empty one) as more
+// specific than the general http.proxy family regardless of source.
+// Dropping http.proxy= alone must NOT reopen the attack (remote.origin.
+// proxy= still covers this exact scenario), and dropping remote.origin.
+// proxy= alone must not either (http.proxy= still covers it, as it always
+// did) -- only dropping BOTH reopens it.
 func TestTransportClass_HTTPProxyNeutralised(t *testing.T) {
 	reposParent := t.TempDir()
 	srcDir := filepath.Join(reposParent, "src")
@@ -642,8 +838,8 @@ func TestTransportClass_HTTPProxyNeutralised(t *testing.T) {
 		t.Fatalf("control: fetch through the broken proxy SUCCEEDED (want failure) -- this test proves nothing\n%s", out)
 	}
 
-	// FIXED: Args()' own http.proxy= reset must override it and reach the
-	// real server directly.
+	// FIXED: Args()' own http.proxy=/remote.origin.proxy= resets must
+	// override it and reach the real server directly.
 	fixedCmd := exec.Command("git", Args(repoDir, "fetch", "origin")...)
 	fixedCmd.Dir = repoDir
 	fixedCmd.Env = gitEnv()
@@ -651,12 +847,77 @@ func TestTransportClass_HTTPProxyNeutralised(t *testing.T) {
 		t.Fatalf("fetch with hardeningFlags in place still went through the repository's own proxy: %v\n%s", err, out)
 	}
 
-	// MUTATION: drop http.proxy= alone -- the fetch must fail again.
-	mutatedCmd := exec.Command("git", argsWithout(repoDir, []string{"http.proxy="}, "fetch", "origin")...)
-	mutatedCmd.Dir = repoDir
-	mutatedCmd.Env = gitEnv()
-	if out, err := mutatedCmd.CombinedOutput(); err == nil {
-		t.Fatalf("mutation: removing http.proxy= alone did not re-open the attack (fetch still succeeded)\n%s", out)
+	// MUTATION 1: drop http.proxy= alone -- remote.origin.proxy= (still
+	// present) was expected to still cover this by itself, so the fetch
+	// must still SUCCEED (a failure here means removing http.proxy= alone
+	// already re-opened the attack, i.e. remote.origin.proxy= was NOT
+	// independently sufficient).
+	mutated1Cmd := exec.Command("git", argsWithout(repoDir, []string{"http.proxy="}, "fetch", "origin")...)
+	mutated1Cmd.Dir = repoDir
+	mutated1Cmd.Env = gitEnv()
+	if out, err := mutated1Cmd.CombinedOutput(); err != nil {
+		t.Fatalf("removing http.proxy= alone (remote.origin.proxy= still present) re-opened the attack (fetch failed) -- remote.origin.proxy= was expected to still cover this by itself: %v\n%s", err, out)
+	}
+
+	// MUTATION 2: drop remote.origin.proxy= alone -- http.proxy= (still
+	// present) was expected to still cover this by itself, exactly as it
+	// did before remote.origin.proxy= existed, so the fetch must still
+	// SUCCEED.
+	mutated2Cmd := exec.Command("git", argsWithout(repoDir, []string{"remote.origin.proxy="}, "fetch", "origin")...)
+	mutated2Cmd.Dir = repoDir
+	mutated2Cmd.Env = gitEnv()
+	if out, err := mutated2Cmd.CombinedOutput(); err != nil {
+		t.Fatalf("removing remote.origin.proxy= alone (http.proxy= still present) re-opened the attack (fetch failed) -- http.proxy= was expected to still cover this by itself: %v\n%s", err, out)
+	}
+
+	// MUTATION 3: drop BOTH -- the fetch must fail again.
+	mutated3Cmd := exec.Command("git", argsWithout(repoDir, []string{"http.proxy=", "remote.origin.proxy="}, "fetch", "origin")...)
+	mutated3Cmd.Dir = repoDir
+	mutated3Cmd.Env = gitEnv()
+	if out, err := mutated3Cmd.CombinedOutput(); err == nil {
+		t.Fatalf("mutation: removing BOTH http.proxy= and remote.origin.proxy= did not re-open the attack (fetch still succeeded) -- some OTHER flag is silently doing this job\n%s", out)
+	}
+}
+
+// TestEnv_AppendsGitAllowProtocolLast pins Env's own documented contract:
+// GIT_ALLOW_PROTOCOL=https is appended LAST (so it wins any earlier
+// duplicate, exec.Cmd's own "last key wins" Env behavior), and a nil base
+// becomes this process's own os.Environ() first rather than a bare
+// one-entry slice that would silently strip everything else a real git
+// child needs (PATH, HOME, ...).
+func TestEnv_AppendsGitAllowProtocolLast(t *testing.T) {
+	got := Env(nil)
+	if len(got) < 2 {
+		t.Fatalf("Env(nil) = %v, want this process's own environ plus GIT_ALLOW_PROTOCOL, not a bare one-entry slice", got)
+	}
+	if last := got[len(got)-1]; last != "GIT_ALLOW_PROTOCOL=https" {
+		t.Errorf("Env(nil)'s last entry = %q, want \"GIT_ALLOW_PROTOCOL=https\" (must be LAST to win over any earlier duplicate)", last)
+	}
+
+	got = Env([]string{"FOO=bar", "GIT_ALLOW_PROTOCOL=ssh"})
+	want := []string{"FOO=bar", "GIT_ALLOW_PROTOCOL=ssh", "GIT_ALLOW_PROTOCOL=https"}
+	if !slices.Equal(got, want) {
+		t.Errorf("Env(%v) = %v, want %v -- the caller-supplied base must be preserved verbatim, with GIT_ALLOW_PROTOCOL=https appended last", []string{"FOO=bar", "GIT_ALLOW_PROTOCOL=ssh"}, got, want)
+	}
+}
+
+// TestRepoURLProxyArg_RejectsAnEqualsSign pins the defensive guard: git's
+// own "-c key=value" parsing splits on the FIRST "=" in the whole
+// argument, so a repoURL containing one would corrupt the intended
+// "http.<url>.proxy=" key rather than merely fail to match anything.
+// reposource.ValidateRepoURL does not forbid "=" (legal in a URL query
+// string), so this is enforced here rather than assumed impossible
+// upstream.
+func TestRepoURLProxyArg_RejectsAnEqualsSign(t *testing.T) {
+	if got := RepoURLProxyArg("https://example.invalid/repo.git?a=b"); got != nil {
+		t.Errorf("RepoURLProxyArg with an '=' in the url = %v, want nil (skip, not a corrupted override)", got)
+	}
+	if got := RepoURLProxyArg(""); got != nil {
+		t.Errorf("RepoURLProxyArg(\"\") = %v, want nil", got)
+	}
+	want := []string{"-c", "http.https://example.invalid/repo.git.proxy="}
+	if got := RepoURLProxyArg("https://example.invalid/repo.git"); !slices.Equal(got, want) {
+		t.Errorf("RepoURLProxyArg(...) = %v, want %v", got, want)
 	}
 }
 

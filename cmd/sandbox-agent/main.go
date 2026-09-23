@@ -503,12 +503,23 @@ func (h *commandHandler) HandlePush(_ context.Context, cmd sandboxws.Push) {
 //
 // Both this function's own `git push` and headSHA's `git rev-parse HEAD`
 // below go through githarden.Args like every other git invocation here,
-// and that is the whole of the hardening either gets. No attributes
-// override precedes them: one was tried for the content-filter class,
-// measured, and withdrawn as net-negative -- see githarden's own doc
-// comment for why, and for the two further command classes (merge
-// drivers, the uploadpack/receivepack transport pair) that no flag in
-// this package reaches either.
+// plus githarden.Env (GIT_ALLOW_PROTOCOL) and, for push specifically,
+// githarden.RemoteProxyArg -- and that is the whole of the hardening
+// either gets. No attributes override precedes them: one was tried for
+// the content-filter class, measured, and withdrawn as net-negative --
+// see githarden's own doc comment for why, and for the two further
+// command classes (merge drivers, the uploadpack/receivepack transport
+// pair) that no flag in this package reaches either.
+//
+// pushOneRepo is also the one network-touching git invocation in this
+// codebase with no validated repo URL of its own (sandboxws.
+// Push.Repos[] carries name/branch/remote, never a url) -- so unlike
+// gitclone.cloneOne/gitFetchRef/resolveDefaultBranch, it cannot add
+// githarden.RepoURLProxyArg for the http.<url>.proxy vector; a
+// repository-authored proxy scoped to the exact url `git push` resolves
+// remote.<remote>.url to is a recorded, accepted residual here, not a
+// fixed one -- see docs/DECISIONS.md and githarden's own http.proxy doc
+// comment for the full reasoning.
 func (h *commandHandler) pushOneRepo(repoSpec sandboxws.PushReposElem) (string, error) {
 	if err := reposource.ValidateRepoName(repoSpec.Name); err != nil {
 		return "", fmt.Errorf("invalid repo name: %w", err)
@@ -544,33 +555,46 @@ func (h *commandHandler) pushOneRepo(repoSpec sandboxws.PushReposElem) (string, 
 	pushCtx, cancel := context.WithTimeout(h.runCtx, h.timeouts.RepoCloneTimeout)
 	defer cancel()
 
+	// remote.<remote>.proxy: hardeningFlags itself only ever resets
+	// "remote.origin.proxy" (the fixed name every OTHER call site in this
+	// codebase creates) -- remote here is session-controlled and not
+	// always "origin", so this call adds its own override for whatever
+	// name it actually validated above. Redundant, harmlessly, when
+	// remote == "origin". See githarden.RemoteProxyArg's own doc comment.
+	pushArgs := append([]string{"-c", "credential.helper=" + credHelperArg}, githarden.RemoteProxyArg(remote)...)
+	// "--" ends option parsing for everything after it (verified
+	// directly against real `git push` behavior, not assumed) --
+	// defense in depth alongside the validation above: even an
+	// already-validated remote/branch should never be positionally
+	// ambiguous to git's own argument parser.
+	pushArgs = append(pushArgs, "push", "--", remote, repoSpec.Branch)
+
 	var stderr bytes.Buffer
 	proc, err := h.sup.Spawn(supervisor.Spec{
-		Path: "git",
-		// "--" ends option parsing for everything after it (verified
-		// directly against real `git push` behavior, not assumed) --
-		// defense in depth alongside the validation above: even an
-		// already-validated remote/branch should never be positionally
-		// ambiguous to git's own argument parser.
-		Args:   githarden.Args(dir, "-c", "credential.helper="+credHelperArg, "push", "--", remote, repoSpec.Branch),
+		Path:   "git",
+		Args:   githarden.Args(dir, pushArgs...),
 		Stderr: &stderr,
-		// Env is DELIBERATELY left at its zero value (nil, "inherit this
-		// process's own environment") -- a reviewed choice, not an
-		// oversight. git's own credential.helper mechanism re-execs THIS
-		// SAME sandbox-agent binary as `<binary> credential-helper get`,
-		// as git's OWN child process, inheriting whatever env git itself
-		// received here -- i.e. exactly what this Spec.Env carries,
-		// nothing more. runCredentialHelper's own boot.Load() call reads
-		// NARVI_SESSION_CONFIG via os.Getenv and fails outright if it is
-		// absent (see its own "nothing to fetch credentials for" error),
-		// so stripping it here would BREAK git authentication for every
-		// push -- a real functional regression, not a hardening win. A
-		// hand-built allowlist would also risk silently omitting something
-		// the real `git` binary or its transport (http/ssh) legitimately
-		// needs (PATH, HOME, an ssh-agent socket, ...) that isn't yet
-		// enumerated anywhere in this codebase. See gitclone.cloneOne's own
-		// identical comment for the clone-side counterpart of this exact
-		// reasoning.
+		// Built via githarden.Env, not left at Spec.Env's nil zero value:
+		// GIT_ALLOW_PROTOCOL is now the actual guarantee behind the
+		// transport class (see githarden's own doc comment) and every
+		// hardened invocation carries it. Everything else about env
+		// inheritance here is UNCHANGED from before this Step, and still
+		// deliberate, not an oversight: git's own credential.helper
+		// mechanism re-execs THIS SAME sandbox-agent binary as `<binary>
+		// credential-helper get`, as git's OWN child process, inheriting
+		// whatever env git itself received here -- i.e. exactly what this
+		// Spec.Env carries, nothing more. runCredentialHelper's own
+		// boot.Load() call reads NARVI_SESSION_CONFIG via os.Getenv and
+		// fails outright if it is absent (see its own "nothing to fetch
+		// credentials for" error), so stripping it here would BREAK git
+		// authentication for every push -- a real functional regression,
+		// not a hardening win. A hand-built allowlist would also risk
+		// silently omitting something the real `git` binary or its
+		// transport (http/ssh) legitimately needs (PATH, HOME, an
+		// ssh-agent socket, ...) that isn't yet enumerated anywhere in
+		// this codebase. See gitclone.cloneOne's own identical comment
+		// for the clone-side counterpart of this exact reasoning.
+		Env: githarden.Env(nil),
 	})
 	if err != nil {
 		return "", fmt.Errorf("spawn git push for %s: %w", repoSpec.Name, err)
@@ -616,8 +640,11 @@ func (h *commandHandler) headSHA(dir string) (string, error) {
 		// plumbing command: no `-c credential.helper=...` flag is ever set
 		// for it, so it has no structural need for NARVI_SESSION_CONFIG
 		// (the sandbox's own plaintext bearer token) at all. Tightened for
-		// defense in depth.
-		Env: supervisor.EnvWithout(boot.SessionConfigEnvVar),
+		// defense in depth. Wrapped in githarden.Env so GIT_ALLOW_PROTOCOL
+		// still applies -- every hardened invocation builds its own env
+		// through Env, regardless of which other filtering it also needs,
+		// so the value can never drift or be forgotten at one call site.
+		Env: githarden.Env(supervisor.EnvWithout(boot.SessionConfigEnvVar)),
 	})
 	if err != nil {
 		return "", fmt.Errorf("spawn git rev-parse HEAD: %w", err)

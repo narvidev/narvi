@@ -334,7 +334,7 @@ func syncOne(
 	// "warm-boot latency" gating question with no visibility into this
 	// step's own contribution (up to GitFetchStepTimeout's 90s ceiling).
 	fetchStart := time.Now()
-	fetchResult := gitFetchStep(ctx, sup, credHelperArg, repo.Name, dir, branch, fetchStepTimeout, stopGrace)
+	fetchResult := gitFetchStep(ctx, sup, credHelperArg, repo.Name, repo.Url, dir, branch, fetchStepTimeout, stopGrace)
 	defaultBranch := fetchResult.defaultBranch
 	fetchErr := fetchResult.targetFetchErr
 	fetchSucceeded := fetchErr == nil
@@ -520,9 +520,19 @@ func runGit(ctx context.Context, sup *supervisor.Supervisor, args []string, step
 	// override closes that for a process that still runs git against a
 	// runtime-owned .git; see githarden's doc comment and
 	// githarden_test.go for the recorded, executable proof.
+	//
+	// Env is built via githarden.Env(nil) here too, for the same reason:
+	// GIT_ALLOW_PROTOCOL is the actual guarantee behind the transport
+	// class now (an arbitrary "<name>::" remote helper or ftp/ftps has no
+	// fixed name the -c flags above can enumerate), and runGit is the one
+	// shared choke point every non-clone git invocation in this package
+	// already goes through -- setting it once here, rather than at each
+	// of runGit's own callers, is the same "one list, not eight copies"
+	// reasoning hardeningFlags' own doc comment gives for -c.
 	proc, err := sup.Spawn(supervisor.Spec{
 		Path:   "git",
 		Args:   githarden.Harden(args),
+		Env:    githarden.Env(nil),
 		Stdout: &stdout,
 	})
 	if err != nil {
@@ -667,8 +677,14 @@ type fetchStepOutcome struct {
 // primary repo whose EXPLICIT branch fetches fine, while its default-branch
 // fetch alone silently fails, invisibly loses the fallback checkoutBase
 // would otherwise have used had this exact branch itself ever needed it).
-func gitFetchStep(ctx context.Context, sup *supervisor.Supervisor, credHelperArg, repoName, dir, branch string, stepTimeout, stopGrace time.Duration) fetchStepOutcome {
-	defaultBranch, lsErr := resolveDefaultBranch(ctx, sup, credHelperArg, dir, stepTimeout, stopGrace)
+// repoURL is the repo's own validated (reposource.ValidateRepoURL) clone
+// url from session config -- threaded through, here and below, ONLY so
+// resolveDefaultBranch/gitFetchRef can each add githarden.RepoURLProxyArg
+// for the exact url this fetch/ls-remote actually targets (see that
+// function's own doc comment for why it must be the validated, known-good
+// url, never one read back from the repository's own remote.origin.url).
+func gitFetchStep(ctx context.Context, sup *supervisor.Supervisor, credHelperArg, repoName, repoURL, dir, branch string, stepTimeout, stopGrace time.Duration) fetchStepOutcome {
+	defaultBranch, lsErr := resolveDefaultBranch(ctx, sup, credHelperArg, repoURL, dir, stepTimeout, stopGrace)
 	if lsErr != nil {
 		// The remote is unreachable (or its advertised default branch name
 		// itself failed validation) -- the target-branch fetch below is
@@ -684,11 +700,11 @@ func gitFetchStep(ctx context.Context, sup *supervisor.Supervisor, credHelperArg
 			"repo", repoName, "error", lsErr)
 		return fetchStepOutcome{
 			resolveDefaultErr: lsErr,
-			targetFetchErr:    gitFetchRef(ctx, sup, credHelperArg, dir, branch, stepTimeout, stopGrace),
+			targetFetchErr:    gitFetchRef(ctx, sup, credHelperArg, repoURL, dir, branch, stepTimeout, stopGrace),
 		}
 	}
 
-	defaultFetchErr := gitFetchRef(ctx, sup, credHelperArg, dir, defaultBranch, stepTimeout, stopGrace)
+	defaultFetchErr := gitFetchRef(ctx, sup, credHelperArg, repoURL, dir, defaultBranch, stepTimeout, stopGrace)
 	if branch == defaultBranch {
 		// Same ref -- the fetch above already covers it; a second,
 		// identical invocation would be pure waste, and this single outcome
@@ -696,7 +712,7 @@ func gitFetchStep(ctx context.Context, sup *supervisor.Supervisor, credHelperArg
 		return fetchStepOutcome{defaultBranch: defaultBranch, defaultFetchErr: defaultFetchErr, targetFetchErr: defaultFetchErr}
 	}
 
-	targetFetchErr := gitFetchRef(ctx, sup, credHelperArg, dir, branch, stepTimeout, stopGrace)
+	targetFetchErr := gitFetchRef(ctx, sup, credHelperArg, repoURL, dir, branch, stepTimeout, stopGrace)
 	if defaultFetchErr != nil {
 		// Logged here -- previously discarded entirely whenever branch !=
 		// defaultBranch (Finding 5): resolveDefaultBranch itself succeeded,
@@ -723,8 +739,11 @@ func gitFetchStep(ctx context.Context, sup *supervisor.Supervisor, credHelperArg
 // clone.go): an invalid/malicious advertised name is reported as an error
 // here, never silently passed through to a later git invocation's argument
 // list.
-func resolveDefaultBranch(ctx context.Context, sup *supervisor.Supervisor, credHelperArg, dir string, stepTimeout, stopGrace time.Duration) (string, error) {
-	out, err := runGit(ctx, sup, []string{"-C", dir, "-c", "credential.helper=" + credHelperArg, "ls-remote", "--symref", "origin", "HEAD"}, stepTimeout, stopGrace)
+func resolveDefaultBranch(ctx context.Context, sup *supervisor.Supervisor, credHelperArg, repoURL, dir string, stepTimeout, stopGrace time.Duration) (string, error) {
+	args := []string{"-C", dir, "-c", "credential.helper=" + credHelperArg}
+	args = append(args, githarden.RepoURLProxyArg(repoURL)...)
+	args = append(args, "ls-remote", "--symref", "origin", "HEAD")
+	out, err := runGit(ctx, sup, args, stepTimeout, stopGrace)
 	if err != nil {
 		return "", fmt.Errorf("resolve default branch: %w", err)
 	}
@@ -757,8 +776,11 @@ func resolveDefaultBranch(ctx context.Context, sup *supervisor.Supervisor, credH
 // cloneOne already use before every positional ref/path argument --
 // verified directly against real git (sync_test.go) that it does not change
 // fetch's own behavior for a bare ref name.
-func gitFetchRef(ctx context.Context, sup *supervisor.Supervisor, credHelperArg, dir, ref string, stepTimeout, stopGrace time.Duration) error {
-	_, err := runGit(ctx, sup, []string{"-C", dir, "-c", "credential.helper=" + credHelperArg, "fetch", "origin", "--", ref}, stepTimeout, stopGrace)
+func gitFetchRef(ctx context.Context, sup *supervisor.Supervisor, credHelperArg, repoURL, dir, ref string, stepTimeout, stopGrace time.Duration) error {
+	args := []string{"-C", dir, "-c", "credential.helper=" + credHelperArg}
+	args = append(args, githarden.RepoURLProxyArg(repoURL)...)
+	args = append(args, "fetch", "origin", "--", ref)
+	_, err := runGit(ctx, sup, args, stepTimeout, stopGrace)
 	return err
 }
 
@@ -778,6 +800,7 @@ func refExistsQuiet(ctx context.Context, sup *supervisor.Supervisor, dir, fullRe
 	proc, err := sup.Spawn(supervisor.Spec{
 		Path: "git",
 		Args: githarden.Args(dir, "rev-parse", "--verify", "--quiet", fullRef),
+		Env:  githarden.Env(nil),
 	})
 	if err != nil {
 		return false, fmt.Errorf("spawn git rev-parse --verify: %w", err)

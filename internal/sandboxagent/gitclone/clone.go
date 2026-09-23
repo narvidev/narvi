@@ -186,8 +186,12 @@ func applySparseCheckout(ctx context.Context, sup *supervisor.Supervisor, dir st
 		// is appended last so it always wins (exec.Cmd's own documented
 		// "last duplicate key wins" Env behavior), forcing git's own
 		// warning text below to a known, stable, English string regardless
-		// of the sandbox's ambient locale.
-		Env:    append(os.Environ(), "LC_ALL=C"),
+		// of the sandbox's ambient locale. Wrapped in githarden.Env so
+		// GIT_ALLOW_PROTOCOL still wins last, after LC_ALL -- order between
+		// those two does not matter (distinct keys), but every hardened
+		// invocation builds its env through Env so the value can never
+		// drift or be forgotten at one call site.
+		Env:    githarden.Env(append(os.Environ(), "LC_ALL=C")),
 		Stderr: &stderr,
 	})
 	if err != nil {
@@ -247,6 +251,7 @@ func isSparseCheckoutEnabled(ctx context.Context, sup *supervisor.Supervisor, di
 	proc, err := sup.Spawn(supervisor.Spec{
 		Path:   "git",
 		Args:   githarden.Args(dir, "config", "--type=bool", "core.sparseCheckout"),
+		Env:    githarden.Env(nil),
 		Stdout: &stdout,
 	})
 	if err != nil {
@@ -315,6 +320,7 @@ func disableSparseCheckoutIfEnabled(ctx context.Context, sup *supervisor.Supervi
 	proc, err := sup.Spawn(supervisor.Spec{
 		Path: "git",
 		Args: githarden.Args(dir, "sparse-checkout", "disable"),
+		Env:  githarden.Env(nil),
 	})
 	if err != nil {
 		return fmt.Errorf("spawn git sparse-checkout disable: %w", err)
@@ -385,36 +391,64 @@ func cloneOne(
 	dir string,
 	cloneTimeout, stopGrace time.Duration,
 ) error {
-	args := []string{"clone", "-c", "credential.helper=" + credHelperArg}
+	// Top-level -c overrides (hardeningFlags, plus the two proxy overrides
+	// below) MUST precede the "clone" subcommand -- git requires every
+	// top-level option before the subcommand name. They are built via
+	// githarden.ArgsForClone, never githarden.Harden: `git clone`'s own
+	// target directory is a trailing POSITIONAL argument, never reachable
+	// via "-C <dir>" (dir does not exist yet, and -C requires its target
+	// to already exist), so Harden's own "-C" scan finds nothing here and
+	// used to return this call's args COMPLETELY UNCHANGED -- every
+	// hardening flag silently absent despite the call site looking
+	// hardened. See ArgsForClone's own doc comment for the full story.
+	clone := []string{"clone", "-c", "credential.helper=" + credHelperArg}
 	if repo.Branch != nil {
-		args = append(args, "--branch", *repo.Branch)
+		clone = append(clone, "--branch", *repo.Branch)
 	}
 	// "--" ends option parsing for everything after it (verified directly
 	// against real `git clone` behavior, not assumed) -- defense in depth
 	// alongside validateRepoSpec's own rejection above: even an already-
 	// validated repo.Url/dir should never be positionally ambiguous to
 	// git's own argument parser.
-	args = append(args, "--", repo.Url, dir)
+	clone = append(clone, "--", repo.Url, dir)
+
+	// The remote this clone creates is always named "origin" -- git-clone(1)'s
+	// own default, and this codebase never passes --origin/-o to override
+	// it -- so hardeningFlags' own unconditional "remote.origin.proxy="
+	// already covers the remote-name-keyed proxy vector here; only the
+	// URL-keyed one (RepoURLProxyArg) needs adding explicitly, since
+	// hardeningFlags has no per-repo URL of its own to key it with. See
+	// githarden's own http.proxy/RepoURLProxyArg doc comments for why a
+	// command-line override for the EXACT clone url always closes this,
+	// even against a repository-authored entry for that same url.
+	topLevel := githarden.RepoURLProxyArg(repo.Url)
 
 	proc, err := sup.Spawn(supervisor.Spec{
 		Path: "git",
-		Args: githarden.Harden(args),
-		// Env is DELIBERATELY left at its zero value (nil, "inherit this
-		// process's own environment") -- a reviewed choice, not an
-		// oversight. git's own credential.helper mechanism (credHelperArg,
-		// configured above via CredHelperGitArg) re-execs THIS SAME
-		// sandbox-agent binary as `<binary> credential-helper get`, as
-		// git's OWN child process, inheriting whatever env git itself
-		// received here -- i.e. exactly what this Spec.Env carries,
-		// nothing more. cmd/sandbox-agent's own runCredentialHelper calls
-		// boot.Load(), which reads NARVI_SESSION_CONFIG via os.Getenv and
-		// fails outright ("nothing to fetch credentials for") if it is
-		// absent, so stripping it here would BREAK git authentication for
-		// every private repo clone -- a real functional regression, not a
-		// hardening win. A hand-built allowlist would also risk silently
-		// omitting something the real `git` binary or its transport
-		// (http/ssh) legitimately needs (PATH, HOME, an ssh-agent socket,
-		// ...) that isn't yet enumerated anywhere in this codebase.
+		Args: githarden.ArgsForClone(dir, append(topLevel, clone...)...),
+		// Built explicitly (githarden.Env(nil): this process's own
+		// os.Environ() plus GIT_ALLOW_PROTOCOL) rather than left at
+		// Spec.Env's nil zero value -- GIT_ALLOW_PROTOCOL is now the
+		// actual guarantee behind the transport class (see githarden's
+		// own doc comment), so every hardened git invocation carries it,
+		// including this one. Everything else about env inheritance here
+		// is UNCHANGED from before this Step, and still deliberate, not
+		// an oversight: git's own credential.helper mechanism
+		// (credHelperArg, configured above via CredHelperGitArg) re-execs
+		// THIS SAME sandbox-agent binary as `<binary> credential-helper
+		// get`, as git's OWN child process, inheriting whatever env git
+		// itself received here -- i.e. exactly what this Spec.Env
+		// carries, nothing more. cmd/sandbox-agent's own
+		// runCredentialHelper calls boot.Load(), which reads
+		// NARVI_SESSION_CONFIG via os.Getenv and fails outright ("nothing
+		// to fetch credentials for") if it is absent, so stripping it
+		// here would BREAK git authentication for every private repo
+		// clone -- a real functional regression, not a hardening win. A
+		// hand-built allowlist would also risk silently omitting
+		// something the real `git` binary or its transport (http/ssh)
+		// legitimately needs (PATH, HOME, an ssh-agent socket, ...) that
+		// isn't yet enumerated anywhere in this codebase.
+		Env: githarden.Env(nil),
 	})
 	if err != nil {
 		return fmt.Errorf("spawn git clone for %s: %w", repo.Name, err)
