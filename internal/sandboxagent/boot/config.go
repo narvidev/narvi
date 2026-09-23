@@ -352,10 +352,26 @@ func (e *InvalidGitDirRootError) Error() string {
 	return fmt.Sprintf("boot: invalid %s=%q: %s", gitDirRootEnvVar, e.Value, e.Reason)
 }
 
-// validateGitDirRoot enforces Config.GitDirRoot's own three requirements:
-// non-empty, absolute, and not nested under workspaceDir (checked via
-// filepath.Rel: a relative result with no leading ".." segment means root
-// is workspaceDir itself or a descendant of it).
+// validateGitDirRoot enforces Config.GitDirRoot's own four requirements:
+// non-empty, absolute, not nested under (or equal to) workspaceDir, and
+// not itself containing (or equal to) workspaceDir.
+//
+// (Correction, review): the original version of this function only ever
+// checked the first direction (root under-or-equal workspaceDir). It
+// never checked the REVERSE -- workspaceDir under-or-equal root -- which
+// is exactly as dangerous: gitdir.Layout.Repo builds GitDir as
+// filepath.Join(Root, name), and gitdir.Seed's very first destructive
+// step is os.RemoveAll(repo.GitDir). An operator who sets GitDirRoot to
+// WorkspaceDir's own parent directory (e.g. WorkspaceDir=/srv/narvi/
+// workspace, GitDirRoot=/srv/narvi) makes a session repo NAMED
+// "workspace" resolve GitDir to WorkspaceDir itself
+// (filepath.Join("/srv/narvi", "workspace") == "/srv/narvi/workspace") --
+// reposource.ValidateRepoName accepts "workspace" as an ordinary
+// identifier -- so Seed's own RemoveAll deletes the entire workspace,
+// every repo in it, not just the one being (re-)seeded. Both directions
+// are checked here, symmetrically, against CLEANED paths (filepath.Clean
+// -- so a trailing slash or a "GitDirRoot/.." style value cannot dodge
+// either check).
 func validateGitDirRoot(root, workspaceDir string) error {
 	if root == "" {
 		return &InvalidGitDirRootError{Value: root, Reason: "must not be empty"}
@@ -363,11 +379,25 @@ func validateGitDirRoot(root, workspaceDir string) error {
 	if !filepath.IsAbs(root) {
 		return &InvalidGitDirRootError{Value: root, Reason: "must be an absolute path"}
 	}
-	rel, err := filepath.Rel(workspaceDir, root)
-	if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	cleanRoot := filepath.Clean(root)
+	cleanWorkspace := filepath.Clean(workspaceDir)
+	if isPathUnderOrEqual(cleanRoot, cleanWorkspace) {
 		return &InvalidGitDirRootError{Value: root, Reason: fmt.Sprintf("must not be nested under WorkspaceDir (%s) -- an agent-owned git-dir inside the runtime-owned workspace tree defeats the structural guarantee §30.5 provides", workspaceDir)}
 	}
+	if isPathUnderOrEqual(cleanWorkspace, cleanRoot) {
+		return &InvalidGitDirRootError{Value: root, Reason: fmt.Sprintf("must not contain WorkspaceDir (%s) -- a session repo name could then resolve GitDirRoot/<name> to WorkspaceDir itself, letting gitdir.Seed's own RemoveAll delete the whole workspace", workspaceDir)}
+	}
 	return nil
+}
+
+// isPathUnderOrEqual reports whether path is base itself, or nested
+// anywhere under it -- checked via filepath.Rel: a relative result of "."
+// (equal) or one with no leading ".." segment (a strict descendant) both
+// count. Both arguments are expected already-cleaned (filepath.Clean);
+// this function does not clean them itself.
+func isPathUnderOrEqual(path, base string) bool {
+	rel, err := filepath.Rel(base, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // parseRuntimeID parses raw (the env var's own raw string value, "" when
