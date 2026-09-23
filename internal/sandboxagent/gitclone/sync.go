@@ -909,6 +909,7 @@ func checkoutBranch(ctx context.Context, sup *supervisor.Supervisor, repoName st
 	}
 
 	args := []string{"checkout"}
+	freshlyCreated := !exists
 	if exists {
 		args = append(args, branch, "--")
 	} else {
@@ -919,8 +920,26 @@ func checkoutBranch(ctx context.Context, sup *supervisor.Supervisor, repoName st
 		args = append(args, "-b", branch, base, "--")
 	}
 
-	_, err = runGit(ctx, sup, repo, cred, args, stepTimeout, stopGrace)
-	return err
+	if _, err := runGit(ctx, sup, repo, cred, args, stepTimeout, stopGrace); err != nil {
+		return err
+	}
+
+	if !freshlyCreated {
+		return nil
+	}
+
+	// §30.5 correction (review): `checkout -b <branch> origin/<x> --`,
+	// just above, may have made git's own branch.autoSetupMerge write
+	// branch.<branch>.remote/.merge into the AGENT's own config --
+	// invisible to the runtime and deleted by Seed on every boot. Mirror
+	// it onto the runtime's own config now, exactly like
+	// gitdir.MirrorSparseCheckout does for core.sparseCheckout, so a
+	// `git pull`/bare `git push` in this branch on the runtime side keeps
+	// working across a warm reboot the way it did before §30.5.
+	if err := gitdir.MirrorBranchUpstream(ctx, sup, repo, cred, branch, stepTimeout, stopGrace); err != nil {
+		return fmt.Errorf("mirror upstream tracking for %s onto runtime config: %w", branch, err)
+	}
+	return nil
 }
 
 // checkoutBase implements §19.3 point 2's own remote-tracking preference

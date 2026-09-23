@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/sandboxagent/githarden"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
@@ -303,6 +304,100 @@ func readAgentBoolConfig(ctx context.Context, sup *supervisor.Supervisor, repo g
 			return "", false, fmt.Errorf("unexpected value for %s: %q", key, val)
 		}
 		return val, true, nil
+	case 1:
+		return "", false, nil
+	default:
+		return "", false, fmt.Errorf("git config --get %s exited %d", key, result.ExitCode)
+	}
+}
+
+// MirrorBranchUpstream copies branch.<branch>.remote/branch.<branch>.merge
+// out of the agent-owned git-dir's own config and into the runtime's own
+// .git/config, as the runtime's own identity (RuntimeGit) -- the exact
+// same "agent writes, runtime never sees it" gap MirrorSparseCheckout
+// already closes for core.sparseCheckout, applied here to git's own
+// upstream-tracking config.
+//
+// (Correction, review): a `checkout -b <branch> origin/<x> --` run
+// through the agent-owned git-dir (syncOne's own checkoutBranch, when the
+// branch does not yet exist locally) makes git's default
+// branch.autoSetupMerge write branch.<branch>.remote/.merge into
+// $GIT_DIR/config -- which, since §30.5, is the AGENT's own config, never
+// shared with the runtime and deleted outright by Seed on every boot
+// (seed.go's own os.RemoveAll(repo.GitDir) at step 0). Before §30.5 the
+// same checkout ran directly against the runtime's own .git, so the
+// runtime kept the upstream it set for itself; after it, that tracking
+// silently evaporates the moment this sandbox next reboots warm, and
+// `git pull`/a bare `git push` in that branch then fail outright ("no
+// tracking information" / "has no upstream branch") for a branch that
+// worked identically before this package existed. Called once, right
+// after syncOne's own agent-side `checkout -b` succeeds -- mirroring
+// MirrorSparseCheckout's own "run immediately after the agent-side
+// mutation that could have changed it" placement exactly.
+//
+// A key that is unset on the agent side (exit 1 -- e.g. checkoutBase fell
+// through to "HEAD", which autoSetupMerge never sets tracking for) is
+// left untouched on the runtime side: nothing to mirror, and there is no
+// stale runtime-side value this call needs to clear (a freshly created
+// branch has no pre-existing branch.<branch>.* entry on either side).
+func MirrorBranchUpstream(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, branch string, timeout, stopGrace time.Duration) error {
+	if err := reposource.ValidateBranch(branch); err != nil {
+		return fmt.Errorf("gitdir: mirror branch upstream: invalid branch %q: %w", branch, err)
+	}
+
+	for _, suffix := range []string{"remote", "merge"} {
+		key := "branch." + branch + "." + suffix
+		val, ok, err := readAgentStringConfig(ctx, sup, repo, key, timeout, stopGrace)
+		if err != nil {
+			return fmt.Errorf("gitdir: mirror branch upstream: read agent %s: %w", key, err)
+		}
+		if !ok {
+			continue
+		}
+		result, err := RuntimeGit(ctx, sup, cred, repo.WorkTree, nil, nil, timeout, stopGrace, "config", key, val)
+		if err != nil {
+			return fmt.Errorf("gitdir: mirror branch upstream: set runtime %s: %w", key, err)
+		}
+		if result.ExitCode != 0 {
+			return fmt.Errorf("gitdir: mirror branch upstream: git config %s exited %d", key, result.ExitCode)
+		}
+	}
+	return nil
+}
+
+// readAgentStringConfig reads key directly from repo.GitDir's own config
+// (sandbox-agent's own identity -- an agent-owned file, no elevated read
+// needed), returning (value, true, nil) when set, (_, false, nil) when
+// the key is entirely unset (exit 1), and an error for any other git
+// failure. Unlike readAgentBoolConfig, this accepts any string value
+// verbatim (branch.<b>.remote/.merge are a remote name and a full refname
+// respectively, neither a bool) -- trimmed of the single trailing
+// newline `git config --get` always emits, nothing else validated here;
+// callers that need this value not to be an argument-injection risk
+// validate it themselves (MirrorBranchUpstream validates branch itself,
+// via reposource.ValidateBranch, before ever building this key).
+func readAgentStringConfig(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, key string, timeout, stopGrace time.Duration) (string, bool, error) {
+	var stdout bytes.Buffer
+	proc, err := sup.Spawn(supervisor.Spec{
+		Path:   "git",
+		Args:   []string{"--git-dir", repo.GitDir, "config", "--get", key},
+		Stdout: &stdout,
+	})
+	if err != nil {
+		return "", false, fmt.Errorf("spawn git config --get %s: %w", key, err)
+	}
+
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	result, waitErr := proc.Wait(runCtx)
+	if waitErr != nil {
+		_ = proc.Stop(ctx, stopGrace)
+		return "", false, fmt.Errorf("git config --get %s did not complete within %s: %w", key, timeout, waitErr)
+	}
+	switch result.ExitCode {
+	case 0:
+		return strings.TrimSuffix(stdout.String(), "\n"), true, nil
 	case 1:
 		return "", false, nil
 	default:

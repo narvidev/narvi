@@ -1415,6 +1415,68 @@ func TestSyncAll_FetchSucceeds_BranchExistsOnOrigin_PrefersOriginTrackingBranch(
 	}
 }
 
+// TestSyncAll_FreshBranchFromOrigin_MirrorsUpstreamTrackingOntoRuntime
+// proves the fix directly: `checkout -b <branch> origin/<branch> --`,
+// run through the agent-owned git-dir, makes git's own
+// branch.autoSetupMerge write branch.<branch>.remote/.merge into the
+// AGENT's own config -- invisible to the runtime and wiped by Seed on
+// the next boot unless gitdir.MirrorBranchUpstream copies it onto the
+// runtime's own .git/config too. Same fixture as
+// TestSyncAll_FetchSucceeds_BranchExistsOnOrigin_PrefersOriginTrackingBranch
+// above (a target branch that exists on origin but not locally), but
+// this test asserts on the runtime repo's OWN config afterward, not just
+// on the checked-out content.
+func TestSyncAll_FreshBranchFromOrigin_MirrorsUpstreamTrackingOntoRuntime(t *testing.T) {
+	t.Parallel()
+
+	workspaceDir := t.TempDir()
+	repoDir := filepath.Join(workspaceDir, "repo1")
+	initRepo(t, repoDir) // local "main" only -- the target branch does not exist here at all
+
+	originDir := newLocalOrigin(t)
+	targetBranch := "feature-with-upstream"
+	addOriginBranch(t, originDir, targetBranch, "origin's real tip content for feature-with-upstream\n")
+
+	originURL := newLocalOriginServer(t, originDir)
+	runGit(t, repoDir, "remote", "add", "origin", originURL)
+
+	repos := []sessionconfig.SessionConfigReposElem{
+		{Name: "repo1", Url: originURL, Branch: &targetBranch},
+	}
+
+	sup := supervisor.New()
+	results, err := gitclone.SyncAll(context.Background(), sup, gitdir.Layout{Root: t.TempDir(), WorkspaceDir: workspaceDir}, nil, repos, nil, "session-mirror-upstream",
+		testFetchStepTimeout, testSyncStepTimeout, testStopGrace, func(string, string, string) {}, noopGitFetchTiming, noopGitCheckoutTiming)
+	if err != nil {
+		t.Fatalf("SyncAll() error = %v, want nil", err)
+	}
+	if results[0].Err != nil {
+		t.Fatalf("results[0].Err = %v, want nil", results[0].Err)
+	}
+
+	// The proof: the RUNTIME's own .git/config (read directly with a
+	// plain `git -C repoDir`, never through the agent-owned git-dir) must
+	// carry the SAME upstream tracking git itself would have set had this
+	// checkout run directly against the runtime's own .git, pre-§30.5.
+	gotRemote := strings.TrimSpace(gitOutput(t, repoDir, "config", "--get", "branch."+targetBranch+".remote"))
+	if gotRemote != "origin" {
+		t.Errorf("runtime branch.%s.remote = %q, want \"origin\"", targetBranch, gotRemote)
+	}
+	gotMerge := strings.TrimSpace(gitOutput(t, repoDir, "config", "--get", "branch."+targetBranch+".merge"))
+	wantMerge := "refs/heads/" + targetBranch
+	if gotMerge != wantMerge {
+		t.Errorf("runtime branch.%s.merge = %q, want %q", targetBranch, gotMerge, wantMerge)
+	}
+
+	// `git status -sb` is the end-to-end proof a real `git pull`/`git
+	// push` on the runtime side would rely on: it must name the upstream,
+	// not just "## <branch>" with nothing after it.
+	statusOut := gitOutput(t, repoDir, "status", "-sb")
+	if !strings.Contains(statusOut, "...origin/"+targetBranch) {
+		t.Errorf("git status -sb = %q, want it to report tracking against origin/%s", statusOut, targetBranch)
+	}
+}
+
 // TestSyncAll_FetchSucceeds_InventedBranchNotOnOrigin_FallsBackToOriginDefaultBranch
 // covers §19.3 point 2's own second preference: the common invented
 // "narvi/<sessionID>" branch case (repo.Branch nil) -- the fetch of the
