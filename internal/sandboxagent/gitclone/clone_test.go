@@ -171,6 +171,104 @@ func TestCloneAll_SinglePrimarySucceeds(t *testing.T) {
 	}
 }
 
+// TestCloneAll_HardensTheActualCloneInvocation is F2's own regression
+// test. gitclone.cloneOne used to build `git clone`'s own argument list
+// and hand it to githarden.Harden, which requires a "-C <dir>" to rewrite
+// around -- but `git clone`'s own target directory is a trailing
+// POSITIONAL argument (it does not exist yet, and -C requires its target
+// to already exist), never a "-C <dir>", so Harden's own "-C" scan found
+// nothing and returned the args COMPLETELY UNCHANGED: every hardening
+// flag, and GIT_ALLOW_PROTOCOL, silently absent from the one git
+// invocation that creates a repo's own .git/config in the first place --
+// while the call site itself looked identical to every properly-hardened
+// one.
+//
+// This intercepts the REAL "git" binary CloneAll spawns, via a fake
+// executable placed first on PATH (matching exactly how
+// supervisor.Spawn's own exec.Command resolves a bare "git"), and
+// inspects the actual argv/env the real git binary would have received --
+// rather than merely asserting CloneAll "succeeds", which a successful
+// clone would have done even before this fix (the missing flags do not
+// break a normal clone; they just leave it unhardened).
+func TestCloneAll_HardensTheActualCloneInvocation(t *testing.T) {
+	fakeGitDir := t.TempDir()
+	captureFile := filepath.Join(t.TempDir(), "capture.txt")
+
+	// The fake git records its own argv (one token per line, delimited so
+	// a token containing no delimiter character is unambiguous -- every
+	// token this test checks for is a single "-c"/"key=value" pair with
+	// no embedded angle brackets) and GIT_ALLOW_PROTOCOL, then exits 0
+	// unconditionally: this test cares about what CloneAll ASKED git to
+	// do, not whether a real clone could complete against a fake binary.
+	fakeGit := "#!/bin/sh\n" +
+		"{\n" +
+		"  printf 'ARGV:'\n" +
+		"  for a in \"$@\"; do printf ' <%s>' \"$a\"; done\n" +
+		"  printf '\\n'\n" +
+		"  printf 'GIT_ALLOW_PROTOCOL=%s\\n' \"$GIT_ALLOW_PROTOCOL\"\n" +
+		"} >> \"" + captureFile + "\"\n" +
+		"exit 0\n"
+	if err := os.WriteFile(filepath.Join(fakeGitDir, "git"), []byte(fakeGit), 0o755); err != nil {
+		t.Fatalf("write fake git: %v", err)
+	}
+
+	// t.Setenv, not t.Parallel -- this test mutates process-wide PATH, and
+	// t.Setenv itself forbids combining the two.
+	t.Setenv("PATH", fakeGitDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	workspaceDir := t.TempDir()
+	repoURL := "https://example.invalid/owner/repo.git"
+	repos := []sessionconfig.SessionConfigReposElem{
+		{Name: "repo1", Url: repoURL},
+	}
+
+	sup := supervisor.New()
+	results, err := gitclone.CloneAll(context.Background(), sup, workspaceDir, repos, nil, testCloneTimeout, testStopGrace)
+	if err != nil {
+		t.Fatalf("CloneAll() error = %v, want nil (the fake git always exits 0)", err)
+	}
+	if len(results) != 1 || results[0].Err != nil {
+		t.Fatalf("CloneAll() results = %+v, want one successful result", results)
+	}
+
+	captured, readErr := os.ReadFile(captureFile)
+	if readErr != nil {
+		t.Fatalf("the fake git was never invoked (no capture file): %v", readErr)
+	}
+	out := string(captured)
+
+	wantDir := filepath.Join(workspaceDir, "repo1")
+	for _, want := range []string{
+		// safe.directory/hooksPath: the pair TestArgs_CarriesBothHalves
+		// (githarden_test.go) pins as inseparable -- proof this call site
+		// carries both, not just one.
+		"<-c> <safe.directory=" + wantDir + ">",
+		"<-c> <core.hooksPath=/dev/null>",
+		"<-c> <credential.helper=>",
+		"<-c> <protocol.allow=never>",
+		"<-c> <protocol.https.allow=always>",
+		"<-c> <protocol.ext.allow=never>",
+		"<-c> <protocol.ftp.allow=never>",
+		// remote.origin.proxy/http.<url>.proxy: F3's own two proxy
+		// overrides, both present here -- unlike gitFetchRef/
+		// resolveDefaultBranch (sync.go), which target "origin" by NAME
+		// and rely on remote.origin.proxy= alone, clone's own url-keyed
+		// http.<url>.proxy override is real: `git clone`'s initial fetch
+		// contacts the exact url on its own command line (repoURL,
+		// below), so RepoURLProxyArg's key is guaranteed to match it.
+		"<-c> <remote.origin.proxy=>",
+		"<-c> <http." + repoURL + ".proxy=>",
+		"<clone>",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("captured clone invocation missing %q\nfull capture:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, "GIT_ALLOW_PROTOCOL=https") {
+		t.Errorf("captured clone invocation's env did not carry GIT_ALLOW_PROTOCOL=https\nfull capture:\n%s", out)
+	}
+}
+
 func TestCloneAll_ExplicitBranchChecksOutThatBranch(t *testing.T) {
 	t.Parallel()
 

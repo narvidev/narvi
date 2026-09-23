@@ -520,9 +520,19 @@ func runGit(ctx context.Context, sup *supervisor.Supervisor, args []string, step
 	// override closes that for a process that still runs git against a
 	// runtime-owned .git; see githarden's doc comment and
 	// githarden_test.go for the recorded, executable proof.
+	//
+	// Env is built via githarden.Env(nil) here too, for the same reason:
+	// GIT_ALLOW_PROTOCOL is the actual guarantee behind the transport
+	// class now (an arbitrary "<name>::" remote helper or ftp/ftps has no
+	// fixed name the -c flags above can enumerate), and runGit is the one
+	// shared choke point every non-clone git invocation in this package
+	// already goes through -- setting it once here, rather than at each
+	// of runGit's own callers, is the same "one list, not eight copies"
+	// reasoning hardeningFlags' own doc comment gives for -c.
 	proc, err := sup.Spawn(supervisor.Spec{
 		Path:   "git",
 		Args:   githarden.Harden(args),
+		Env:    githarden.Env(nil),
 		Stdout: &stdout,
 	})
 	if err != nil {
@@ -667,6 +677,18 @@ type fetchStepOutcome struct {
 // primary repo whose EXPLICIT branch fetches fine, while its default-branch
 // fetch alone silently fails, invisibly loses the fallback checkoutBase
 // would otherwise have used had this exact branch itself ever needed it).
+//
+// Neither resolveDefaultBranch nor gitFetchRef takes the repo's own
+// validated (reposource.ValidateRepoURL) clone url from session config, and
+// that is deliberate, not an oversight -- see each function's own doc
+// comment, and githarden.go's "transport class" doc comment, for why a
+// session-url-keyed http.<url>.proxy override would not even match what
+// `fetch origin`/`ls-remote origin` actually contact (the remote NAME
+// "origin", resolved through remote.origin.url, which the runtime owns and
+// could have rewritten by the time this runs) -- and why that residual is
+// already closed regardless, unconditionally, by hardeningFlags' own
+// remote.origin.proxy= (githarden.go), which every runGit call below
+// carries via githarden.Harden.
 func gitFetchStep(ctx context.Context, sup *supervisor.Supervisor, credHelperArg, repoName, dir, branch string, stepTimeout, stopGrace time.Duration) fetchStepOutcome {
 	defaultBranch, lsErr := resolveDefaultBranch(ctx, sup, credHelperArg, dir, stepTimeout, stopGrace)
 	if lsErr != nil {
@@ -723,8 +745,23 @@ func gitFetchStep(ctx context.Context, sup *supervisor.Supervisor, credHelperArg
 // clone.go): an invalid/malicious advertised name is reported as an error
 // here, never silently passed through to a later git invocation's argument
 // list.
+//
+// This takes no repo URL and adds no githarden.RepoURLProxyArg override:
+// `ls-remote origin` contacts whatever remote.origin.url currently resolves
+// to, which is read from this repository's own runtime-owned .git/config,
+// not from session config -- so a proxy override keyed to the validated
+// session URL could silently fail to match the url git actually contacts
+// (the runtime owns .git after the §30.5 chown and could have rewritten
+// it), giving no real guarantee while reading as one. The actual guarantee
+// for this class is unconditional and remote-NAME-keyed instead:
+// hardeningFlags' own "-c remote.origin.proxy=" (githarden.go), added by
+// every runGit call via githarden.Harden regardless of what url "origin"
+// resolves to. See githarden.go's own "transport class" doc comment and
+// TestTransportClass_RemoteOriginProxyClosesRewrittenURL (githarden_test.go)
+// for the verified reasoning and its executable proof.
 func resolveDefaultBranch(ctx context.Context, sup *supervisor.Supervisor, credHelperArg, dir string, stepTimeout, stopGrace time.Duration) (string, error) {
-	out, err := runGit(ctx, sup, []string{"-C", dir, "-c", "credential.helper=" + credHelperArg, "ls-remote", "--symref", "origin", "HEAD"}, stepTimeout, stopGrace)
+	args := []string{"-C", dir, "-c", "credential.helper=" + credHelperArg, "ls-remote", "--symref", "origin", "HEAD"}
+	out, err := runGit(ctx, sup, args, stepTimeout, stopGrace)
 	if err != nil {
 		return "", fmt.Errorf("resolve default branch: %w", err)
 	}
@@ -757,8 +794,17 @@ func resolveDefaultBranch(ctx context.Context, sup *supervisor.Supervisor, credH
 // cloneOne already use before every positional ref/path argument --
 // verified directly against real git (sync_test.go) that it does not change
 // fetch's own behavior for a bare ref name.
+//
+// Like resolveDefaultBranch above, this takes no repo URL and adds no
+// githarden.RepoURLProxyArg override, for the identical reason: `fetch
+// origin` contacts remote.origin.url, not a url this function was ever
+// given, so the guarantee against a proxy vector here is hardeningFlags'
+// own unconditional, remote-NAME-keyed "-c remote.origin.proxy=", added by
+// runGit via githarden.Harden -- not a session-url-keyed override that
+// could silently miss the runtime-owned url git actually contacts.
 func gitFetchRef(ctx context.Context, sup *supervisor.Supervisor, credHelperArg, dir, ref string, stepTimeout, stopGrace time.Duration) error {
-	_, err := runGit(ctx, sup, []string{"-C", dir, "-c", "credential.helper=" + credHelperArg, "fetch", "origin", "--", ref}, stepTimeout, stopGrace)
+	args := []string{"-C", dir, "-c", "credential.helper=" + credHelperArg, "fetch", "origin", "--", ref}
+	_, err := runGit(ctx, sup, args, stepTimeout, stopGrace)
 	return err
 }
 
@@ -778,6 +824,7 @@ func refExistsQuiet(ctx context.Context, sup *supervisor.Supervisor, dir, fullRe
 	proc, err := sup.Spawn(supervisor.Spec{
 		Path: "git",
 		Args: githarden.Args(dir, "rev-parse", "--verify", "--quiet", fullRef),
+		Env:  githarden.Env(nil),
 	})
 	if err != nil {
 		return false, fmt.Errorf("spawn git rev-parse --verify: %w", err)
