@@ -18,6 +18,7 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/internal/sandboxagent/boot"
+	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
 
@@ -52,6 +53,54 @@ func initRealGitRepoForPushTest(t *testing.T, dir string) {
 
 func pushTestStrPtr(s string) *string { return &s }
 
+// newSeededPushTestHandler builds a *commandHandler wired the way run()
+// actually wires one (§30.5: layout/cred threaded through, matching
+// runtimeCredentialFor(cfg) and gitdir.Layout{Root, WorkspaceDir}) rather
+// than the bare `&commandHandler{cfg: boot.Config{WorkspaceDir: ...}}`
+// literal this file used before.
+//
+// (Correction, review): pushOneRepo now resolves its target via
+// h.layout.Repo(repoSpec.Name), not filepath.Join(h.cfg.WorkspaceDir, ...).
+// With a zero-value gitdir.Layout, Layout.Repo returns a RELATIVE,
+// nonexistent path ({WorkTree:"widgets", GitDir:"widgets"}), so
+// gitdir.Run's own assertRealDir guard rejects every call immediately with
+// "no such directory" -- an unrelated, structural reason that has nothing
+// to do with the validators this file exists to prove. That made every
+// "rejected before any real git process runs" proof below vacuous: a
+// regression that dropped a validator entirely would still "pass" the
+// timing/marker checks, rejected instead by the missing-directory check.
+// Wiring a real gitdir.Layout AND actually seeding the repo's agent-owned
+// git-dir (gitdir.Seed, exactly like gitclone.SyncAll/CloneAll do before
+// any push is ever attempted in production) restores a real target: a
+// validator regression now really does reach gitdir.Run and spawn git,
+// which the timing baseline in the tests below can actually catch.
+func newSeededPushTestHandler(t *testing.T, workspaceDir string, repoNames ...string) *commandHandler {
+	t.Helper()
+
+	layout := gitdir.Layout{Root: t.TempDir(), WorkspaceDir: workspaceDir}
+	if err := gitdir.EnsureRoot(layout.Root); err != nil {
+		t.Fatalf("gitdir.EnsureRoot(%s): %v", layout.Root, err)
+	}
+
+	sup := supervisor.New()
+	for _, name := range repoNames {
+		dir := filepath.Join(workspaceDir, name)
+		initRealGitRepoForPushTest(t, dir)
+		if err := gitdir.Seed(context.Background(), sup, layout.Repo(name), "https://example.invalid/"+name+".git", nil,
+			platform.DefaultTimeouts().GitSyncStepTimeout, platform.DefaultTimeouts().ProcessStopGracePeriod); err != nil {
+			t.Fatalf("gitdir.Seed(%s): %v", name, err)
+		}
+	}
+
+	return &commandHandler{
+		runCtx:   context.Background(),
+		cfg:      boot.Config{WorkspaceDir: workspaceDir},
+		timeouts: platform.DefaultTimeouts(),
+		sup:      sup,
+		layout:   layout,
+	}
+}
+
 // TestPushOneRepo_MaliciousInputsRejectedBeforeSpawn proves a malicious
 // repoSpec.Name/Branch/Remote is rejected by pushOneRepo's own
 // reposource validators BEFORE h.sup.Spawn is ever called for it.
@@ -69,7 +118,6 @@ func pushTestStrPtr(s string) *string { return &s }
 // under half that baseline is not expected to be flaky.
 func TestPushOneRepo_MaliciousInputsRejectedBeforeSpawn(t *testing.T) {
 	workspaceDir := t.TempDir()
-	initRealGitRepoForPushTest(t, filepath.Join(workspaceDir, "widgets"))
 	markerDir := t.TempDir()
 
 	baselineStart := time.Now()
@@ -78,12 +126,7 @@ func TestPushOneRepo_MaliciousInputsRejectedBeforeSpawn(t *testing.T) {
 	}
 	baseline := time.Since(baselineStart)
 
-	h := &commandHandler{
-		runCtx:   context.Background(),
-		cfg:      boot.Config{WorkspaceDir: workspaceDir},
-		timeouts: platform.DefaultTimeouts(),
-		sup:      supervisor.New(),
-	}
+	h := newSeededPushTestHandler(t, workspaceDir, "widgets")
 
 	branchMarker := filepath.Join(markerDir, "branch-marker-should-never-exist")
 	remoteMarker := filepath.Join(markerDir, "remote-marker-should-never-exist")
@@ -173,7 +216,7 @@ func TestPushOneRepo_MaliciousInputsRejectedBeforeSpawn(t *testing.T) {
 func TestPushOneRepo_PathLikeRemoteRejectedBeforeSpawn_RealTwoRepoProof(t *testing.T) {
 	workspaceDir := t.TempDir()
 	repoDir := filepath.Join(workspaceDir, "widgets")
-	initRealGitRepoForPushTest(t, repoDir)
+	h := newSeededPushTestHandler(t, workspaceDir, "widgets")
 
 	shaOut, err := exec.Command("git", "-C", repoDir, "rev-parse", "HEAD").CombinedOutput()
 	if err != nil {
@@ -188,13 +231,6 @@ func TestPushOneRepo_PathLikeRemoteRejectedBeforeSpawn_RealTwoRepoProof(t *testi
 	rogueDir := filepath.Join(t.TempDir(), "rogue-bare-repo.git")
 	if out, err := exec.Command("git", "init", "-q", "--bare", "-b", "main", rogueDir).CombinedOutput(); err != nil {
 		t.Fatalf("git init --bare (rogue): %v\n%s", err, out)
-	}
-
-	h := &commandHandler{
-		runCtx:   context.Background(),
-		cfg:      boot.Config{WorkspaceDir: workspaceDir},
-		timeouts: platform.DefaultTimeouts(),
-		sup:      supervisor.New(),
 	}
 
 	spec := sandboxws.PushReposElem{
