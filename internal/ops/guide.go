@@ -248,7 +248,35 @@ func isBareFenceCloseLine(trimmed string, need int) bool {
 // line up to a line matching commandFenceClose exactly, as one block's
 // raw JSON. An opened fence with no matching close before EOF is a hard
 // error (fail closed) rather than silently dropping the trailing partial
-// block.
+// block — and so are an HTML comment or an enclosing fence STILL OPEN at
+// EOF (checked once the line loop finishes, below): either one, left
+// open, would otherwise swallow every remaining line — including every
+// narvi-command block after it — with no error and no visible sign in a
+// diff, exactly the "looks like it was checked but wasn't" failure this
+// whole mechanism exists to refuse. See
+// TestExtractCommandBlocks_UnterminatedHTMLCommentAtEOF/
+// TestExtractCommandBlocks_UnterminatedEnclosingFenceAtEOF.
+//
+// Comment-open and fence-open detection both follow real CommonMark
+// rules, not a loose substring test — a loose test has a concrete false-
+// positive cost against guide prose that mentions either syntax:
+//
+//   - HTML-comment mode is entered only when the TRIMMED line STARTS WITH
+//     htmlCommentOpen, never merely CONTAINS it. Prose like "The plan
+//     message embeds a hidden `<!--` marker so edits can find it." is an
+//     inline-code example of the syntax, not a real opening comment, and
+//     must not be treated as one — a loose "contains" test would
+//     enter comment mode on that line and never leave, silently dropping
+//     every narvi-command block after it to EOF. See
+//     TestExtractCommandBlocks_InlineHTMLCommentMarkerInProseIsNotAComment.
+//   - A line is treated as an ENCLOSING fence opener only when its info
+//     string (everything after the leading backtick run) itself contains
+//     NO backtick. Prose like the sentence "```x``` is inline code"
+//     starts with a 3-backtick run but is not a real fence open; a loose
+//     "3-or-more leading backticks" test would wrongly enter enclosing-
+//     fence mode on that line and treat the very next real narvi-command
+//     fence as literal text inside it. See
+//     TestExtractCommandBlocks_FenceInfoStringWithBacktickIsNotAFenceOpener.
 //
 // Two shapes of "looks documented but no reader can ever see it" are
 // refused, not merely mis-parsed:
@@ -271,15 +299,21 @@ func isBareFenceCloseLine(trimmed string, need int) bool {
 //     until its own matching close), so any narvi-command-shaped line
 //     found while one is open is left as literal text, never extracted.
 //
-// Both are mutation-tested in guide_test.go
+// All four shapes above are mutation-tested in guide_test.go
 // (TestExtractCommandBlocks_HiddenFenceInHTMLComment/
-// TestExtractCommandBlocks_HiddenFenceInEnclosingFence).
+// TestExtractCommandBlocks_HiddenFenceInEnclosingFence/
+// TestExtractCommandBlocks_InlineHTMLCommentMarkerInProseIsNotAComment/
+// TestExtractCommandBlocks_FenceInfoStringWithBacktickIsNotAFenceOpener/
+// TestExtractCommandBlocks_UnterminatedHTMLCommentAtEOF/
+// TestExtractCommandBlocks_UnterminatedEnclosingFenceAtEOF).
 func extractCommandBlocks(sourcePath string, content []byte) ([]GuideCommand, error) {
 	lines := strings.Split(string(content), "\n")
 
 	var commands []GuideCommand
 	inComment := false
+	commentStartLine := 0
 	enclosingFenceLen := 0 // 0 = not currently inside an unrelated fence
+	enclosingFenceStartLine := 0
 	for i := 0; i < len(lines); i++ {
 		raw := lines[i]
 		trimmed := strings.TrimSpace(raw)
@@ -298,16 +332,18 @@ func extractCommandBlocks(sourcePath string, content []byte) ([]GuideCommand, er
 			continue // every line inside an enclosing fence is literal text
 		}
 
-		if strings.Contains(raw, htmlCommentOpen) {
+		if strings.HasPrefix(trimmed, htmlCommentOpen) {
 			if !strings.Contains(raw, htmlCommentClose) {
 				inComment = true
+				commentStartLine = i + 1
 			}
 			continue // a same-line "<!-- ... -->" comment hides its own line too
 		}
 
 		if trimmed != commandFenceOpen {
-			if run := leadingBacktickRun(trimmed); run >= 3 {
+			if run := leadingBacktickRun(trimmed); run >= 3 && !strings.Contains(trimmed[run:], "`") {
 				enclosingFenceLen = run // entering an unrelated fence
+				enclosingFenceStartLine = i + 1
 			}
 			continue
 		}
@@ -342,6 +378,19 @@ func extractCommandBlocks(sourcePath string, content []byte) ([]GuideCommand, er
 		}
 
 		commands = append(commands, cmd)
+	}
+
+	// An HTML comment or enclosing fence still open when the file ends is
+	// refused, not silently accepted -- see this function's own top doc
+	// comment for why silently accepting either here is the actual defect
+	// this rewrite fixes: each swallows every line after it, so treating
+	// EOF as an implicit close would drop every real narvi-command block
+	// past that point with no error at all.
+	if inComment {
+		return nil, fmt.Errorf("ops: %s:%d: unterminated %q comment (still open at EOF)", sourcePath, commentStartLine, htmlCommentOpen)
+	}
+	if enclosingFenceLen > 0 {
+		return nil, fmt.Errorf("ops: %s:%d: unterminated enclosing fence opened with a %d-backtick run (still open at EOF)", sourcePath, enclosingFenceStartLine, enclosingFenceLen)
 	}
 
 	return commands, nil

@@ -384,12 +384,16 @@ concatenating several denylisted phrases with punctuation between them
 `guideomission.go`'s own `reasonClausesAllVacuous` splits a reason on
 that punctuation and rejects it if EVERY resulting clause is itself an
 exact denylist entry, one clause at a time, not just the reason as one
-whole string. What remains, narrower than before: a concatenation with NO
-punctuation at all between the stock phrases (four denylisted words run
-together with plain spaces, say) still clears both checks, because it
-never splits into more than one clause in the first place. `internal/ops/
-guidedrift_test.go`'s own `TestCheckGuideDrift_Omission` pins that
-narrower gap as a known, accepted limitation rather than a
+whole string. What remains, narrower than before: `reasonClausesAllVacuous`
+only ever splits on `clauseSplitRE`'s own fixed class of separators
+(`,;:.!?()-`) — ANY joiner outside that class still leaves the
+concatenation as one un-split clause that clears both checks, because it
+never splits into more than one clause in the first place. Plain spaces
+(four denylisted words run together, say) are the narrowest case, but the
+same gap holds for a slash, a pipe, an ampersand, or a word like "and"/"or"
+used as the joiner — none of those are in `clauseSplitRE`'s class either.
+`internal/ops/guidedrift_test.go`'s own `TestCheckGuideDrift_Omission` pins
+the plain-space case as a known, accepted limitation rather than a
 silently-assumed guarantee.
 
 ## Which lot owes which guide

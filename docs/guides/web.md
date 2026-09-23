@@ -401,9 +401,11 @@ this route at all.
 {"name": "Get the extension & licensing capability set", "route": "GET /api/capabilities"}
 ```
 
-Read-only, and the one route in this whole section every role including
-viewer may call (`authz.ActionViewCapabilities`, §13.3 row 1) — everyone
-needs to know what this deployment is licensed for, not just an admin.
+Read-only, and open to every role including viewer
+(`authz.ActionViewCapabilities`, §13.3 row 1) — everyone needs to know
+what this deployment is licensed for, not just an admin. Two other routes
+in this section are every-role-including-viewer too (platform analytics
+and your profile, both immediately below) — this is not unique to it.
 
 **Platform analytics**
 

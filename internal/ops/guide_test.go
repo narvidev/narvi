@@ -3,6 +3,7 @@ package ops
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -196,5 +197,111 @@ func TestExtractCommandBlocks_HiddenFenceInEnclosingFence(t *testing.T) {
 	}
 	if commands[0].Route != "GET /visible" {
 		t.Errorf("commands[0].Route = %q, want \"GET /visible\" (the visible fence, not the nested example)", commands[0].Route)
+	}
+}
+
+// TestExtractCommandBlocks_InlineHTMLCommentMarkerInProseIsNotAComment is
+// this Step's own regression proof for the guide-drift-omission PR's own
+// defect: the OLD comment-detector entered HTML-comment mode whenever a
+// line merely CONTAINED htmlCommentOpen ("<!--"), so prose that just
+// mentions the marker inline -- never opening a real comment -- swallowed
+// every visible narvi-command fence after it to EOF, with no error. Real
+// CommonMark only starts an HTML-comment block when the line ITSELF
+// (after trimming) STARTS WITH "<!--"; this line does not (it starts with
+// "The plan message"), so the fence immediately below must still be
+// extracted. Before the fix, this test failed with 0 commands, not 1.
+func TestExtractCommandBlocks_InlineHTMLCommentMarkerInProseIsNotAComment(t *testing.T) {
+	content := []byte("# Web Guide\n\n" +
+		"The plan message embeds a hidden `<!--` marker so edits can find it.\n\n" +
+		"```json narvi-command\n" +
+		"{\"name\": \"Visible\", \"route\": \"GET /visible\"}\n" +
+		"```\n")
+
+	commands, err := extractCommandBlocks("web.md", content)
+	if err != nil {
+		t.Fatalf("extractCommandBlocks: %v", err)
+	}
+	if len(commands) != 1 {
+		t.Fatalf("extractCommandBlocks() returned %d commands, want exactly 1 (an inline \"<!--\" mention in prose must not open a comment): %+v", len(commands), commands)
+	}
+	if commands[0].Route != "GET /visible" {
+		t.Errorf("commands[0].Route = %q, want \"GET /visible\"", commands[0].Route)
+	}
+}
+
+// TestExtractCommandBlocks_FenceInfoStringWithBacktickIsNotAFenceOpener is
+// this Step's own second regression proof: the OLD fence-opener detector
+// treated ANY line starting with a 3-or-more backtick run as an enclosing
+// fence open, even when its info string itself contained a backtick (e.g.
+// "```x``` is inline code" -- a real CommonMark reader never treats this
+// as a fence open at all, since a fence's info string may not itself
+// contain a backtick). The old code wrongly entered enclosing-fence mode
+// on that line, which then swallowed the very next, real narvi-command
+// fence as literal example text. Before the fix, this test failed with 0
+// commands, not 1.
+func TestExtractCommandBlocks_FenceInfoStringWithBacktickIsNotAFenceOpener(t *testing.T) {
+	content := []byte("# Web Guide\n\n" +
+		"```x``` is inline code\n\n" +
+		"```json narvi-command\n" +
+		"{\"name\": \"Visible\", \"route\": \"GET /visible\"}\n" +
+		"```\n")
+
+	commands, err := extractCommandBlocks("web.md", content)
+	if err != nil {
+		t.Fatalf("extractCommandBlocks: %v", err)
+	}
+	if len(commands) != 1 {
+		t.Fatalf("extractCommandBlocks() returned %d commands, want exactly 1 (an info string with a backtick must not open an enclosing fence): %+v", len(commands), commands)
+	}
+	if commands[0].Route != "GET /visible" {
+		t.Errorf("commands[0].Route = %q, want \"GET /visible\"", commands[0].Route)
+	}
+}
+
+// TestExtractCommandBlocks_UnterminatedHTMLCommentAtEOF pins the honest
+// choice this rewrite makes for the failure mode H1 flagged: an HTML
+// comment opened but never closed before EOF swallows every remaining
+// line, including any real narvi-command fence inside it -- exactly like
+// the inline-marker false positive above, just genuinely open this time.
+// Silently accepting that (returning whatever commands were found before
+// the comment opened, with no error) would make a guide silently pass
+// with an aspirational-but-unchecked route hidden past the unterminated
+// comment; extractCommandBlocks must instead fail closed.
+func TestExtractCommandBlocks_UnterminatedHTMLCommentAtEOF(t *testing.T) {
+	content := []byte("# Web Guide\n\n" +
+		"<!-- opened but never closed\n\n" +
+		"```json narvi-command\n" +
+		"{\"name\": \"Hidden\", \"route\": \"GET /hidden\"}\n" +
+		"```\n")
+
+	_, err := extractCommandBlocks("web.md", content)
+	if err == nil {
+		t.Fatal("extractCommandBlocks() returned nil error, want an error for an HTML comment still open at EOF")
+	}
+	if !strings.Contains(err.Error(), "unterminated") || !strings.Contains(err.Error(), "comment") {
+		t.Errorf("extractCommandBlocks() error = %q, want it to mention an unterminated comment", err.Error())
+	}
+}
+
+// TestExtractCommandBlocks_UnterminatedEnclosingFenceAtEOF is the
+// enclosing-fence twin of the comment case immediately above: a longer
+// example fence opened but never closed before EOF swallows every
+// remaining line as literal text, including any real narvi-command fence
+// inside it. extractCommandBlocks must fail closed here too, exactly like
+// the already-pinned "unterminated narvi-command fence" case above it in
+// this file.
+func TestExtractCommandBlocks_UnterminatedEnclosingFenceAtEOF(t *testing.T) {
+	content := []byte("# Web Guide\n\n" +
+		"````\n\n" +
+		"```json narvi-command\n" +
+		"{\"name\": \"Hidden\", \"route\": \"GET /hidden\"}\n" +
+		"```\n")
+
+	_, err := extractCommandBlocks("web.md", content)
+	if err == nil {
+		t.Fatal("extractCommandBlocks() returned nil error, want an error for an enclosing fence still open at EOF")
+	}
+	if !strings.Contains(err.Error(), "unterminated") {
+		t.Errorf("extractCommandBlocks() error = %q, want it to mention an unterminated fence", err.Error())
 	}
 }

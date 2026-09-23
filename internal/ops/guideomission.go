@@ -82,11 +82,11 @@ var RouteGuideExemptions = []RouteGuideExemption{
 	},
 	{
 		Route:  "GET /.well-known/openid-configuration",
-		Reason: "Cloud-identity OIDC federation discovery document (cloudidentitycapability.go): fetched by an external OIDC relying party's own client library resolving this issuer, never by a human browsing the app.",
+		Reason: "Cloud-identity OIDC federation discovery document (httpapi/oidcdiscovery.go's OIDCDiscovery): fetched by an external OIDC relying party's own client library resolving this issuer, never by a human browsing the app.",
 	},
 	{
 		Route:  "GET /.well-known/jwks.json",
-		Reason: "Cloud-identity OIDC signing-key set (cloudidentitykeys.go): fetched by the same external OIDC relying-party client library as the openid-configuration document above, never by a human.",
+		Reason: "Cloud-identity OIDC signing-key set (httpapi/oidcdiscovery.go's OIDCJWKS): fetched by the same external OIDC relying-party client library as the openid-configuration document above, never by a human.",
 	},
 	{
 		Route:  "POST /sessions/{sessionID}/scm-credentials",
