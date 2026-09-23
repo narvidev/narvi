@@ -65,7 +65,7 @@ func TestSeedWarmBootRepos_PrimaryFailureIsFatal(t *testing.T) {
 		t.Fatalf("gitdir.EnsureRoot() error = %v", err)
 	}
 
-	err := seedWarmBootRepos(context.Background(), supervisor.New(), cfg, layout, nil,
+	_, err := seedWarmBootRepos(context.Background(), supervisor.New(), cfg, layout, nil,
 		platform.DefaultTimeouts().GitSyncStepTimeout, platform.DefaultTimeouts().ProcessStopGracePeriod)
 	if err == nil {
 		t.Fatal("seedWarmBootRepos() error = nil, want a fatal error for the failed primary repo's Seed call")
@@ -103,10 +103,13 @@ func TestSeedWarmBootRepos_SecondaryFailureContinues(t *testing.T) {
 		t.Fatalf("gitdir.EnsureRoot() error = %v", err)
 	}
 
-	err := seedWarmBootRepos(context.Background(), supervisor.New(), cfg, layout, nil,
+	warnings, err := seedWarmBootRepos(context.Background(), supervisor.New(), cfg, layout, nil,
 		platform.DefaultTimeouts().GitSyncStepTimeout, platform.DefaultTimeouts().ProcessStopGracePeriod)
 	if err != nil {
 		t.Fatalf("seedWarmBootRepos() error = %v, want nil (a secondary repo's Seed failure is a warning, not fatal)", err)
+	}
+	if len(warnings) != 1 || warnings[0].repo != "bad-secondary" {
+		t.Errorf("seedWarmBootRepos() warnings = %+v, want exactly one warning naming bad-secondary", warnings)
 	}
 
 	// "later" (position 2, after the failed secondary) must still have
