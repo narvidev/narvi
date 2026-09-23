@@ -27,6 +27,8 @@ to adopt, and an entry that leaves with `reject` and a reason has done its job.
 | Decision | Outcome | Recorded in |
 |---|---|---|
 | How `sandbox-agent` stops running git against a runtime-owned `.git` | The separate git-dir — the only one of three shapes measured against real git rather than reasoned about | Step 171 |
+| How `objects` is shared between the agent-owned git-dir and the runtime's own `.git` | A directory symlink, not `objects/info/alternates` — alternates was measured and rejected: an agent-written object never became visible to the runtime's own git through it, and this design needs both directions to stay pushable/committable from either side | Step 171 |
+| Whether `packed-refs`/`index` symlinks survive git's own lockfile-based writes (`pack-refs --all`, `gc`, a packed stash's own pop) | Yes, measured directly — git's own lockfile machinery resolves the symlink and renames the new content over the TARGET it points at, never replacing the symlink itself, so the agent-owned link is never orphaned | Step 171 |
 | How a compromised sandbox token is revoked | Explicit operator revocation, the only form that is true without network reachability | Step 152 |
 | How the bot token's egress is scoped | Its own independent required-set entry, never folded into another | Step 153 |
 | What a plan document reads from | The `plan_documents` snapshot is the read; recomputation is the fallback, not the reverse | Step 161 |
