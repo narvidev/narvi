@@ -215,12 +215,43 @@ func Run(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, c
 // runtime's own core.sparseCheckout still read back "true" afterward).
 // "--worktree" writes to the SAME config.worktree file git's own
 // sparse-checkout machinery already uses, so it always wins the same way a
-// direct `git sparse-checkout` invocation's own writes would -- and, verified
-// directly, is equally safe on a repo where the extension was never enabled
-// at all: with no pre-existing config.worktree, "--worktree" degrades to
-// writing the ordinary local config, with no side effect of newly turning
-// the extension on itself.
+// direct `git sparse-checkout` invocation's own writes would.
+//
+// (Correction, review): the claim this doc comment used to make here --
+// that "--worktree" degrades harmlessly to the ordinary local config when
+// extensions.worktreeConfig was never enabled -- is only true while the
+// runtime repo has exactly ONE worktree. Measured directly against real
+// git: the runtime is free to run an ordinary, unprivileged
+// `git worktree add` at any point during a session (its own metadata
+// lives under repo.WorkTree/.git/worktrees, which Seed never shares or
+// cleans up), and once a repo has MORE than one worktree entry --even a
+// prunable one whose directory no longer exists-- git refuses
+// "--worktree" outright ("fatal: --worktree cannot be used with multiple
+// working trees unless the config extension worktreeConfig is enabled"),
+// exit 128. That turned an ordinary session action into a fatal boot
+// error for the primary repo (gitclone.SyncAll's own criticality split).
+// The agent-side `sparse-checkout set/disable` enables the extension in
+// the AGENT's own config, which Seed deletes and rebuilds on every boot
+// -- it never reaches the runtime side, so the runtime repo's own
+// extensions.worktreeConfig stays off across that boundary no matter how
+// many times sparse-checkout runs on the agent side.
+//
+// Fixed by turning the extension on, on the RUNTIME side, explicitly and
+// unconditionally, before the very first "--worktree" write below --
+// idempotent (a plain `git config` write, always exit 0 whether the key
+// was already true or not) and exactly what `git sparse-checkout
+// set/disable`, run directly against a single-worktree repo, would end up
+// doing to that repo's own config anyway, so this does not change the
+// mirror's own resulting config shape versus the pre-PR direct-git path.
 func MirrorSparseCheckout(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, timeout, stopGrace time.Duration) error {
+	enableResult, err := RuntimeGit(ctx, sup, cred, repo.WorkTree, nil, nil, timeout, stopGrace, "config", "extensions.worktreeConfig", "true")
+	if err != nil {
+		return fmt.Errorf("gitdir: mirror sparse-checkout: enable runtime extensions.worktreeConfig: %w", err)
+	}
+	if enableResult.ExitCode != 0 {
+		return fmt.Errorf("gitdir: mirror sparse-checkout: git config extensions.worktreeConfig exited %d", enableResult.ExitCode)
+	}
+
 	for _, key := range []string{"core.sparseCheckout", "core.sparseCheckoutCone"} {
 		val, ok, err := readAgentBoolConfig(ctx, sup, repo, key, timeout, stopGrace)
 		if err != nil {

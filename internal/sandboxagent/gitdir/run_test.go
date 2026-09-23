@@ -159,3 +159,78 @@ func TestSessionConfigEnvVar_MatchesBoot(t *testing.T) {
 		t.Fatalf("gitdir's own duplicated sessionConfigEnvVar = %q, want %q (boot.SessionConfigEnvVar) -- these must never drift, see run.go's own doc comment", got, want)
 	}
 }
+
+// TestMirrorSparseCheckout_RuntimeHasLinkedWorktree reproduces the
+// finding directly against real git: the runtime is free to run an
+// ordinary, unprivileged `git worktree add` at any point during a
+// session (its own metadata lives under repo.WorkTree/.git/worktrees,
+// which Seed never shares or cleans up), including one that is later
+// deleted from disk but stays registered ("prunable") -- git still
+// counts it as a second worktree. Before the fix, MirrorSparseCheckout's
+// runtime-side `git config --worktree ...` write refused outright (exit
+// 128, "--worktree cannot be used with multiple working trees unless the
+// config extension worktreeConfig is enabled") the moment the runtime
+// repo had more than one worktree entry, which made an ordinary session
+// action fail an otherwise-healthy boot.
+func TestMirrorSparseCheckout_RuntimeHasLinkedWorktree(t *testing.T) {
+	base := t.TempDir()
+	workspaceDir := filepath.Join(base, "workspace")
+	wt := filepath.Join(workspaceDir, "repo1")
+	initRunTestRepo(t, wt)
+
+	// The runtime creates a second worktree, then deletes its directory --
+	// exactly the "prunable" shape the adversarial review reproduced.
+	// git still counts this repo as having more than one worktree entry
+	// until an explicit `git worktree prune` runs, which nothing in this
+	// codebase ever does.
+	runGitForRunTest(t, wt, "worktree", "add", "-q", filepath.Join(base, "wt2"), "-b", "other")
+	if err := os.RemoveAll(filepath.Join(base, "wt2")); err != nil {
+		t.Fatalf("remove linked worktree dir: %v", err)
+	}
+
+	gitDirRoot := filepath.Join(base, "gitdirs")
+	if err := gitdir.EnsureRoot(gitDirRoot); err != nil {
+		t.Fatalf("gitdir.EnsureRoot: %v", err)
+	}
+	layout := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}
+	repo := layout.Repo("repo1")
+	sup := supervisor.New()
+	ctx := context.Background()
+
+	if err := gitdir.Seed(ctx, sup, repo, "https://example.invalid/repo1.git", nil, 10*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("gitdir.Seed: %v", err)
+	}
+
+	// Agent-side sparse-checkout set, exactly like gitclone's own
+	// applySparseCheckout does, via the agent-owned git-dir -- this only
+	// ever touches the AGENT's own config, which Seed deletes and rebuilds
+	// on every boot, so it can never itself carry the extension over to
+	// the runtime side.
+	setSpec := supervisor.Spec{Path: "git", Args: githarden.Args(repo, "sparse-checkout", "set", "--no-cone", "--", "/README.md")}
+	if _, err := gitdir.Run(ctx, sup, repo, nil, setSpec, 10*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("agent-side sparse-checkout set: %v", err)
+	}
+
+	if err := gitdir.MirrorSparseCheckout(ctx, sup, repo, nil, 10*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("MirrorSparseCheckout() error = %v, want nil (an ordinary linked worktree must never fail the mirror)", err)
+	}
+
+	out, err := exec.Command("git", "-C", wt, "config", "--worktree", "--get", "core.sparseCheckout").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git -C %s config --worktree --get core.sparseCheckout: %v\n%s", wt, err, out)
+	}
+	if got := string(out); got != "true\n" {
+		t.Errorf("runtime core.sparseCheckout (worktree-scoped) = %q, want \"true\\n\"", got)
+	}
+
+	// The extension itself must actually be on, on the runtime side --
+	// what the fix turns on explicitly, since the agent-side
+	// sparse-checkout set never reaches it.
+	extOut, err := exec.Command("git", "-C", wt, "config", "--get", "extensions.worktreeConfig").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git -C %s config --get extensions.worktreeConfig: %v\n%s", wt, err, extOut)
+	}
+	if got := string(extOut); got != "true\n" {
+		t.Errorf("runtime extensions.worktreeConfig = %q, want \"true\\n\"", got)
+	}
+}
