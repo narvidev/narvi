@@ -235,7 +235,7 @@ func TestReadRuntimeRemoteURL_PassesHandlerCredential(t *testing.T) {
 
 	var gotCred *syscall.Credential
 	var gotCredCalls int
-	runtimeGitFunc = func(_ context.Context, _ *supervisor.Supervisor, cred *syscall.Credential, _ string, stdout, _ io.Writer, _, _ time.Duration, args ...string) (supervisor.ExitResult, error) {
+	runtimeGitFunc = func(_ context.Context, _ *supervisor.Supervisor, cred *syscall.Credential, _ string, stdout, _ io.Writer, _, _ time.Duration, _ ...string) (supervisor.ExitResult, error) {
 		gotCred = cred
 		gotCredCalls++
 		if stdout != nil {
