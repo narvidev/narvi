@@ -354,12 +354,22 @@ func MirrorBranchUpstream(ctx context.Context, sup *supervisor.Supervisor, repo 
 		if !ok {
 			continue
 		}
-		result, err := RuntimeGit(ctx, sup, cred, repo.WorkTree, nil, nil, timeout, stopGrace, "config", key, val)
+		// --replace-all (not a plain `git config <key> <val>`, round-2
+		// review, R4): a plain single-value write exits 5 ("cannot
+		// overwrite multiple values with a single value") whenever the
+		// RUNTIME's own config already holds more than one value for this
+		// key -- e.g. stale entries left behind by a branch the runtime
+		// deleted with `git update-ref -d`, which does not clean up its
+		// own config. git's own `checkout -b` tolerates a pre-existing
+		// multi-valued branch.<b>.merge (it just appends a new value with
+		// a warning, exit 0), so this mirror write must tolerate it too,
+		// rather than fail where plain git itself would have succeeded.
+		result, err := RuntimeGit(ctx, sup, cred, repo.WorkTree, nil, nil, timeout, stopGrace, "config", "--replace-all", key, val)
 		if err != nil {
 			return fmt.Errorf("gitdir: mirror branch upstream: set runtime %s: %w", key, err)
 		}
 		if result.ExitCode != 0 {
-			return fmt.Errorf("gitdir: mirror branch upstream: git config %s exited %d", key, result.ExitCode)
+			return fmt.Errorf("gitdir: mirror branch upstream: git config --replace-all %s exited %d", key, result.ExitCode)
 		}
 	}
 	return nil

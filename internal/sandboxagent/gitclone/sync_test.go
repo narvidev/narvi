@@ -1477,6 +1477,65 @@ func TestSyncAll_FreshBranchFromOrigin_MirrorsUpstreamTrackingOntoRuntime(t *tes
 	}
 }
 
+// TestSyncAll_FreshBranchFromOrigin_StaleMultiValuedRuntimeMergeKey_MirrorSucceeds
+// reproduces R4's own concrete trigger directly, end to end: the RUNTIME's
+// own .git/config already holds TWO branch.<target>.merge entries -- e.g.
+// left behind by a branch the runtime deleted with `git update-ref -d`,
+// which does not clean up config -- before this checkout ever runs. A
+// plain `git config branch.<target>.merge <val>` (the pre-fix write)
+// exits 5 ("cannot overwrite multiple values with a single value") against
+// exactly this shape; real git's own `checkout -b`, by contrast, tolerates
+// it (it just appends a third value with a warning). MirrorBranchUpstream
+// must tolerate it too -- via `git config --replace-all` -- so the mirror
+// write no longer fails where plain git itself would have succeeded.
+func TestSyncAll_FreshBranchFromOrigin_StaleMultiValuedRuntimeMergeKey_MirrorSucceeds(t *testing.T) {
+	t.Parallel()
+
+	workspaceDir := t.TempDir()
+	repoDir := filepath.Join(workspaceDir, "repo1")
+	initRepo(t, repoDir) // local "main" only -- the target branch does not exist here at all
+
+	originDir := newLocalOrigin(t)
+	targetBranch := "feature-with-stale-multivalued-merge"
+	addOriginBranch(t, originDir, targetBranch, "origin's real tip content for feature-with-stale-multivalued-merge\n")
+
+	originURL := newLocalOriginServer(t, originDir)
+	runGit(t, repoDir, "remote", "add", "origin", originURL)
+
+	// Two pre-existing values for the SAME key -- exactly the shape a
+	// plain `git config <key> <val>` write refuses (exit 5).
+	runGit(t, repoDir, "config", "--add", "branch."+targetBranch+".merge", "refs/heads/stale-1")
+	runGit(t, repoDir, "config", "--add", "branch."+targetBranch+".merge", "refs/heads/stale-2")
+
+	repos := []sessionconfig.SessionConfigReposElem{
+		{Name: "repo1", Url: originURL, Branch: &targetBranch},
+	}
+
+	sup := supervisor.New()
+	results, err := gitclone.SyncAll(context.Background(), sup, gitdir.Layout{Root: t.TempDir(), WorkspaceDir: workspaceDir}, nil, repos, nil, "session-mirror-multivalued",
+		testFetchStepTimeout, testSyncStepTimeout, testStopGrace, func(string, string, string) {}, noopGitFetchTiming, noopGitCheckoutTiming)
+	if err != nil {
+		t.Fatalf("SyncAll() error = %v, want nil -- a stale multi-valued runtime merge key must not fail the checkout", err)
+	}
+	if results[0].Err != nil {
+		t.Fatalf("results[0].Err = %v, want nil", results[0].Err)
+	}
+	if results[0].State != gitstate.StateReady {
+		t.Errorf("results[0].State = %s, want ready", results[0].State)
+	}
+	if head := currentBranch(t, repoDir); head != targetBranch {
+		t.Errorf("checked-out branch = %q, want %q", head, targetBranch)
+	}
+
+	// The mirror write must have REPLACED the stale values, not merely
+	// appended a third one: exactly one value, the new one.
+	gotMergeAll := strings.TrimSpace(gitOutput(t, repoDir, "config", "--get-all", "branch."+targetBranch+".merge"))
+	wantMerge := "refs/heads/" + targetBranch
+	if gotMergeAll != wantMerge {
+		t.Errorf("runtime branch.%s.merge (all values) = %q, want exactly %q (the stale values replaced, not appended to)", targetBranch, gotMergeAll, wantMerge)
+	}
+}
+
 // TestSyncAll_FetchSucceeds_InventedBranchNotOnOrigin_FallsBackToOriginDefaultBranch
 // covers §19.3 point 2's own second preference: the common invented
 // "narvi/<sessionID>" branch case (repo.Branch nil) -- the fetch of the

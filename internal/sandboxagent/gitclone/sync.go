@@ -902,6 +902,15 @@ func remoteBranchExists(ctx context.Context, sup *supervisor.Supervisor, repo gi
 // reason branch's own fetch did not land a usable remote-tracking ref,
 // rather than asserting a single, invented reason ("does not exist
 // upstream") regardless of what really happened.
+//
+// mirrorBranchUpstreamFunc indirects gitdir.MirrorBranchUpstream through a
+// package-level variable -- its default, production value -- solely so a
+// white-box test (sync_mirror_internal_test.go) can force a synthetic
+// mirror failure independent of real git behavior, proving checkoutBranch
+// logs it as a warning rather than propagating it as this function's own
+// fatal error (round-2 review, R4).
+var mirrorBranchUpstreamFunc = gitdir.MirrorBranchUpstream
+
 func checkoutBranch(ctx context.Context, sup *supervisor.Supervisor, repoName string, repo githarden.Repo, cred *syscall.Credential, branch, defaultBranch string, targetFetchErr error, stepTimeout, stopGrace time.Duration) error {
 	exists, err := branchExistsLocally(ctx, sup, repo, cred, branch, stepTimeout, stopGrace)
 	if err != nil {
@@ -936,8 +945,26 @@ func checkoutBranch(ctx context.Context, sup *supervisor.Supervisor, repoName st
 	// gitdir.MirrorSparseCheckout does for core.sparseCheckout, so a
 	// `git pull`/bare `git push` in this branch on the runtime side keeps
 	// working across a warm reboot the way it did before §30.5.
-	if err := gitdir.MirrorBranchUpstream(ctx, sup, repo, cred, branch, stepTimeout, stopGrace); err != nil {
-		return fmt.Errorf("mirror upstream tracking for %s onto runtime config: %w", branch, err)
+	//
+	// §30.5 correction (round-2 review, R4): a failure here is logged as
+	// a WARNING, never returned as this function's own error. By this
+	// point runGit's own `checkout -b`, just above, has already
+	// succeeded and SyncHeadOut has already moved the runtime's HEAD onto
+	// branch -- the checkout itself is a real success. Upstream tracking
+	// is a convenience for the runtime's own future `git pull`/bare
+	// `git push`, not a correctness requirement of the checkout syncOne is
+	// reporting on: treating this failure as fatal turned an
+	// already-successful checkout into a reported checkout-failure state
+	// (any stash taken for a dirty tree left unpopped, a spurious P0
+	// "stash outstanding" log) while the worktree was, in fact, already on
+	// branch. Confirmed end-to-end with a runtime config carrying a stale
+	// multi-valued branch.<b>.merge -- a shape git's own `checkout -b`
+	// tolerates, but the single-value `git config` write this mirror used
+	// to make did not (exit 5); see MirrorBranchUpstream's own doc
+	// comment (run.go) for the --replace-all fix alongside this one.
+	if err := mirrorBranchUpstreamFunc(ctx, sup, repo, cred, branch, stepTimeout, stopGrace); err != nil {
+		platform.Logger(ctx).Warn("gitclone: mirror upstream tracking onto runtime config failed, checkout itself already succeeded",
+			"repo", repoName, "branch", branch, "error", err)
 	}
 	return nil
 }
