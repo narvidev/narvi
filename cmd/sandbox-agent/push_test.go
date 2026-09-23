@@ -59,6 +59,27 @@ func pushTestStrPtr(s string) *string { return &s }
 // than the bare `&commandHandler{cfg: boot.Config{WorkspaceDir: ...}}`
 // literal this file used before.
 //
+// (Correction, round-2 review): this doc comment used to claim "cred
+// threaded through, matching runtimeCredentialFor(cfg)" while the
+// function actually left h.cred nil -- no test using this helper could
+// then observe pushOneRepo/readRuntimeRemoteURL using the wrong identity
+// at all. Fixed by actually calling runtimeCredentialFor with the
+// RuntimeUID/RuntimeGID set to THIS TEST PROCESS's own uid/gid: exactly
+// like production's own runtimeCredentialFor(cfg), this returns a real,
+// non-nil *syscall.Credential, but with NoSetGroups true because the
+// configured identity equals the calling process's own -- the identical
+// unprivileged-safe combination internal/sandboxagent/supervisor's own
+// credential_test.go already proves works without CAP_SETUID (see
+// Spec.Credential's own doc comment there). A literal runtime uid (e.g.
+// 65534) would make every real git spawn below (the push itself, and
+// readRuntimeRemoteURL's config read) fail outright with "operation not
+// permitted" under an unprivileged test run. h.cred being non-nil (rather
+// than nil) is what makes it possible for a test to tell "this call used
+// SOME identity" apart from "this call used none" at all; push_nonorigin_
+// test.go's own TestReadRuntimeRemoteURL_PassesHandlerCredential pins the
+// exact pointer identity through a dedicated seam (runtimeGitFunc, main.go)
+// -- distinguishing THIS credential from nil or any other.
+//
 // (Correction, review): pushOneRepo now resolves its target via
 // h.layout.Repo(repoSpec.Name), not filepath.Join(h.cfg.WorkspaceDir, ...).
 // With a zero-value gitdir.Layout, Layout.Repo returns a RELATIVE,
@@ -92,12 +113,19 @@ func newSeededPushTestHandler(t *testing.T, workspaceDir string, repoNames ...st
 		}
 	}
 
+	cfg := boot.Config{
+		WorkspaceDir: workspaceDir,
+		RuntimeUID:   uint32(os.Getuid()),
+		RuntimeGID:   uint32(os.Getgid()),
+	}
+
 	return &commandHandler{
 		runCtx:   context.Background(),
-		cfg:      boot.Config{WorkspaceDir: workspaceDir},
+		cfg:      cfg,
 		timeouts: platform.DefaultTimeouts(),
 		sup:      sup,
 		layout:   layout,
+		cred:     runtimeCredentialFor(cfg),
 	}
 }
 

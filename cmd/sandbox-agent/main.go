@@ -657,13 +657,24 @@ func (h *commandHandler) pushOneRepo(repoSpec sandboxws.PushReposElem) (string, 
 	return sha, nil
 }
 
+// runtimeGitFunc indirects gitdir.RuntimeGit through a package-level
+// variable -- its default, production value -- solely so a test
+// (push_nonorigin_test.go's own TestReadRuntimeRemoteURL_PassesHandlerCredential)
+// can substitute a spy that records the *syscall.Credential actually
+// passed by readRuntimeRemoteURL, below. Round-2 review (R3): no existing
+// test could tell a nil cred (sandbox-agent's own identity) apart from the
+// runtime's -- this is the minimal seam that makes that identity
+// observable without requiring the real, privileged uid drop
+// runtimeCredentialFor(cfg) would need in a real, unprivileged spawn.
+var runtimeGitFunc = gitdir.RuntimeGit
+
 // readRuntimeRemoteURL reads remote.<remote>.url from repo.WorkTree's own
-// RUNTIME-owned config, AS THE RUNTIME's OWN IDENTITY (gitdir.RuntimeGit)
-// -- see pushOneRepo's own doc comment for why this exists at all (a
-// remote the agent never itself configured).
+// RUNTIME-owned config, AS THE RUNTIME's OWN IDENTITY (gitdir.RuntimeGit,
+// via runtimeGitFunc above) -- see pushOneRepo's own doc comment for why
+// this exists at all (a remote the agent never itself configured).
 func readRuntimeRemoteURL(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, remote string, timeout, stopGrace time.Duration) (string, error) {
 	var stdout bytes.Buffer
-	result, err := gitdir.RuntimeGit(ctx, sup, cred, repo.WorkTree, &stdout, nil, timeout, stopGrace, "config", "--get", "remote."+remote+".url")
+	result, err := runtimeGitFunc(ctx, sup, cred, repo.WorkTree, &stdout, nil, timeout, stopGrace, "config", "--get", "remote."+remote+".url")
 	if err != nil {
 		return "", err
 	}

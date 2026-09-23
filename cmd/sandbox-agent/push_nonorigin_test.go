@@ -6,22 +6,37 @@
 // this branch at all -- the only tests with a non-nil repoSpec.Remote
 // (push_test.go) use values ValidateRemoteName itself rejects first, so
 // readRuntimeRemoteURL was never even called. Deleting the
-// ValidateRepoURL check, or making readRuntimeRemoteURL run as
-// sandbox-agent instead of the runtime uid, left the whole suite green.
+// ValidateRepoURL check leaves this file's own InvalidRuntimeURL cases
+// failing (proven below).
+//
+// (Correction, round-2 review, R3): this header used to also claim the
+// tests below catch readRuntimeRemoteURL running as sandbox-agent instead
+// of the runtime uid. They did not: newSeededPushTestHandler (push_test.go)
+// left h.cred nil, so neither test here could observe which identity was
+// actually used. TestReadRuntimeRemoteURL_PassesHandlerCredential, below,
+// is what actually closes that hole -- it pins the exact *syscall.Credential
+// readRuntimeRemoteURL hands to gitdir.RuntimeGit through a dedicated seam
+// (runtimeGitFunc, main.go), mutation-verified against a nil-cred
+// regression.
 package main
 
 import (
+	"context"
 	"errors"
+	"io"
 	"net/http/cgi"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 	"github.com/narvidev/narvi/internal/domain/reposource"
+	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
 
 // startPushTestGitHTTPSServer duplicates internal/sandboxagent/gitclone's
@@ -189,5 +204,65 @@ func TestPushOneRepo_NonOriginRemote_InvalidRuntimeURLRefusedBeforeSpawn(t *test
 	if _, statErr := os.Stat(execMarker); !os.IsNotExist(statErr) {
 		t.Errorf("marker file for the ext:: remote helper exists (stat error = %v) -- "+
 			"a real git push actually ran against the invalid runtime-config URL", statErr)
+	}
+}
+
+// TestReadRuntimeRemoteURL_PassesHandlerCredential proves, directly and
+// without any wall-clock/timing proxy, that readRuntimeRemoteURL hands
+// h.cred -- the runtime identity commandHandler was built with, never a
+// nil/sandbox-agent identity -- to gitdir.RuntimeGit. Round-2 review (R3):
+// before this test, newSeededPushTestHandler always left h.cred nil, so
+// nothing in this file (or push_test.go) could tell "ran as the runtime
+// uid" apart from "ran as sandbox-agent" at all -- a regression collapsing
+// readRuntimeRemoteURL's cred argument to nil left the whole suite green.
+//
+// This substitutes a spy for runtimeGitFunc (main.go's own seam,
+// restored via t.Cleanup before any other test in this package can run)
+// instead of actually executing a privileged uid drop -- proving the
+// VALUE that would be handed to the real spawn, exactly the assertion the
+// finding asked for, without needing CAP_SETUID in CI.
+func TestReadRuntimeRemoteURL_PassesHandlerCredential(t *testing.T) {
+	workspaceDir := t.TempDir()
+	h := newSeededPushTestHandler(t, workspaceDir, "widgets")
+	if h.cred == nil {
+		t.Fatal("newSeededPushTestHandler built a handler with a nil cred -- want a real, non-nil runtime identity (see its own doc comment)")
+	}
+
+	const wantURL = "https://example.invalid/spy-observed-upstream.git"
+
+	orig := runtimeGitFunc
+	t.Cleanup(func() { runtimeGitFunc = orig })
+
+	var gotCred *syscall.Credential
+	var gotCredCalls int
+	runtimeGitFunc = func(_ context.Context, _ *supervisor.Supervisor, cred *syscall.Credential, _ string, stdout, _ io.Writer, _, _ time.Duration, args ...string) (supervisor.ExitResult, error) {
+		gotCred = cred
+		gotCredCalls++
+		if stdout != nil {
+			_, _ = stdout.Write([]byte(wantURL + "\n"))
+		}
+		return supervisor.ExitResult{ExitCode: 0}, nil
+	}
+
+	repo := h.layout.Repo("widgets")
+	gotURL, err := readRuntimeRemoteURL(h.runCtx, h.sup, repo, h.cred, "upstream", h.timeouts.RepoSHADiscoveryTimeout, h.timeouts.ProcessStopGracePeriod)
+	if err != nil {
+		t.Fatalf("readRuntimeRemoteURL(...) error = %v, want nil", err)
+	}
+	if gotURL != wantURL {
+		t.Errorf("readRuntimeRemoteURL(...) = %q, want %q (the spy's own stdout)", gotURL, wantURL)
+	}
+	if gotCredCalls != 1 {
+		t.Fatalf("runtimeGitFunc called %d times, want exactly 1", gotCredCalls)
+	}
+
+	// The pinning assertion: readRuntimeRemoteURL must forward the EXACT
+	// credential it was called with (h.cred, the runtime identity) to
+	// gitdir.RuntimeGit -- not nil, and not some other value.
+	if gotCred == nil {
+		t.Fatal("runtimeGitFunc received a nil Credential -- readRuntimeRemoteURL must run as the RUNTIME's own identity (h.cred), never sandbox-agent's own (nil)")
+	}
+	if gotCred != h.cred {
+		t.Errorf("runtimeGitFunc received Credential %p (%+v), want exactly h.cred %p (%+v)", gotCred, *gotCred, h.cred, *h.cred)
 	}
 }
