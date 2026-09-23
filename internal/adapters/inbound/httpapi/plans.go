@@ -153,11 +153,18 @@ type planRenderedContent struct {
 // planDocumentSnapshotMap and resolvePlanRenderedContent below for the
 // precise three-way rule (no row / usable row / row with NULL content).
 //
-// ONE events fetch (the session's own most recent planContentEventFetchLimit
-// events, newest first, exactly like planapprovalcontent.go's own
-// single-turn fetch) and ONE snapshot batch fetch (planDocumentSnapshotMap)
-// are shared across every plan version in the session -- re-fetching either
-// per plan would be pure waste against the SAME underlying rows.
+// ONE snapshot batch fetch (planDocumentSnapshotMap) always runs, and is
+// shared across every plan version in the session -- re-fetching it per plan
+// would be pure waste against the SAME underlying rows. The live-recompute
+// inputs -- ONE turns query (turns.ListForSession) and ONE events fetch (the
+// session's own most recent planContentEventFetchLimit events, newest
+// first, exactly like planapprovalcontent.go's own single-turn fetch) -- are
+// fetched AFTER the snapshot batch, and only when at least one plan row
+// lacks a usable snapshot (usablePlanSnapshot): when every row is usable,
+// resolvePlanRenderedContent takes the snapshot branch for all of them and
+// never consults either fetch, so skipping both is safe and is the whole
+// point of making the snapshot the first choice rather than merely trying
+// it first while still paying for the fallback unconditionally.
 //
 // Bounds for the live recompute are derived from EVERY turn dispatched in
 // the session (turns.ListForSession), not only the plan-producing ones: a
@@ -176,20 +183,43 @@ func planContentMap(ctx context.Context, turns *postgres.TurnStore, events *post
 		return nil, nil
 	}
 
-	allTurns, err := turns.ListForSession(ctx, sessionID)
-	if err != nil {
-		return nil, err
-	}
-
-	recentEvents, err := events.ListRecentForSession(ctx, sessionID, planContentEventFetchLimit)
-	if err != nil {
-		return nil, err
-	}
-	contentEvents := sessionactor.ToContentEvents(recentEvents)
-
 	snapshotByPlanID, err := planDocumentSnapshotMap(ctx, planDocuments, planRows)
 	if err != nil {
 		return nil, err
+	}
+
+	// The live-recompute inputs (allTurns/contentEvents) are only fetched
+	// when at least one plan row lacks a usable snapshot -- see
+	// usablePlanSnapshot's own doc comment for why this predicate MUST be
+	// identical to the one resolvePlanRenderedContent below branches on.
+	// When every row is usable, both fetches (a turns query and a bounded
+	// 2000-event scan) are pure waste: resolvePlanRenderedContent will take
+	// the snapshot branch for every row and never consult allTurns/
+	// contentEvents, which is exactly the case the snapshot-first design
+	// was meant to make cheap.
+	needsFallback := false
+	for _, p := range planRows {
+		snapshot, snapshotOK := snapshotByPlanID[p.ID.String()]
+		if !usablePlanSnapshot(snapshot, snapshotOK) {
+			needsFallback = true
+			break
+		}
+	}
+
+	var allTurns []sqlcgen.Turn
+	var contentEvents []plandomain.ContentEvent
+	if needsFallback {
+		var err error
+		allTurns, err = turns.ListForSession(ctx, sessionID)
+		if err != nil {
+			return nil, err
+		}
+
+		recentEvents, err := events.ListRecentForSession(ctx, sessionID, planContentEventFetchLimit)
+		if err != nil {
+			return nil, err
+		}
+		contentEvents = sessionactor.ToContentEvents(recentEvents)
 	}
 
 	out := make(map[string]planRenderedContent, len(planRows))
@@ -227,6 +257,19 @@ func planDocumentSnapshotMap(ctx context.Context, planDocuments *postgres.PlanDo
 	return out, nil
 }
 
+// usablePlanSnapshot reports whether snapshot is a snapshot
+// resolvePlanRenderedContent will actually render from (its content
+// branch), as opposed to one it will fall back past (no row, or a
+// retention-nulled content). planContentMap's "is it safe to skip the live-
+// recompute fetch" decision and resolvePlanRenderedContent's own branch
+// condition MUST use this exact same predicate, or a plan that actually
+// needs the fallback could be handed an empty event set by a skipped fetch
+// and silently render plandomain.ContentFallbackText instead of its real
+// prose -- a correctness regression dressed as an optimization.
+func usablePlanSnapshot(snapshot sqlcgen.PlanDocument, snapshotOK bool) bool {
+	return snapshotOK && snapshot.Content != nil
+}
+
 // resolvePlanRenderedContent implements the three-era rule a plan approved
 // before, at, or after plan_documents existed must render under -- "prefer
 // the snapshot only where a usable snapshot exists":
@@ -255,7 +298,7 @@ func planDocumentSnapshotMap(ctx context.Context, planDocuments *postgres.PlanDo
 //     with no prose to show has nothing authoritative to pair it with
 //     either.
 func resolvePlanRenderedContent(planRow sqlcgen.Plan, snapshot sqlcgen.PlanDocument, snapshotOK bool, allTurns []sqlcgen.Turn, contentEvents []plandomain.ContentEvent) (planRenderedContent, error) {
-	if snapshotOK && snapshot.Content != nil {
+	if usablePlanSnapshot(snapshot, snapshotOK) {
 		content := *snapshot.Content
 		if snapshot.StructuredSteps != nil {
 			var structured plandomain.Structured

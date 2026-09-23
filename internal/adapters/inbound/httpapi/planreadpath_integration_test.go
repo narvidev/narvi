@@ -351,3 +351,181 @@ func TestListPlans_SnapshotStructuredStepsNull_DerivesFromSnapshotContent(t *tes
 		t.Errorf("Structured.Steps = %+v, want exactly the block embedded in the snapshot's own content", got.Structured.Steps)
 	}
 }
+
+// TestListPlans_AllPlansHaveUsableSnapshots_ContentComesFromSnapshotNotPlaceholder
+// proves half (i) of planContentMap's own optimization (plans.go): when
+// EVERY plan row returned for a session has a usable snapshot
+// (usablePlanSnapshot), the handler must still render each plan's correct
+// content/structured -- and must do so FROM the snapshot, never the
+// placeholder a live recompute would produce if it ran against a window
+// that no longer holds the original token events. Two plan versions are
+// approved (each snapshotting real prose via the approve endpoint itself),
+// then the session's own event log is flooded past
+// planReadPathEventFetchLimit -- exactly TestListPlans_
+// ApprovedPlanEventsAgedOut_ReturnsDurableSnapshotNotPlaceholder's own
+// technique, extended to every row in the list rather than a single plan,
+// since this optimization's skip decision is keyed on "EVERY row usable".
+// If planContentMap ever stopped consulting the snapshot map first (or
+// resolvePlanRenderedContent's own branch drifted from usablePlanSnapshot),
+// this test would observe the placeholder instead of the real prose.
+func TestListPlans_AllPlansHaveUsableSnapshots_ContentComesFromSnapshotNotPlaceholder(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	owner, token := rig.createAuthenticatedUser(ctx, t)
+	session := createSessionForUser(ctx, t, rig, owner.ID, nil)
+
+	turn1, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusCompleted, PlanMode: true})
+	if err != nil {
+		t.Fatalf("create turn1: %v", err)
+	}
+	dispatchTurn(ctx, t, rig, session.ID, turn1.ID)
+	const wantContent1 = "plan v1's own durable approved prose -- must survive the flood below"
+	seedTokenEvent(ctx, t, rig, session.ID, "allsnap-msg-1", wantContent1)
+	plan1, err := rig.plans.Create(ctx, sqlcgen.CreatePlanParams{SessionID: session.ID, TurnID: turn1.ID, Version: 1, Status: sqlcgen.PlanStatusAwaitingApproval})
+	if err != nil {
+		t.Fatalf("create plan1: %v", err)
+	}
+	var approve1Resp restdtos.PlanActionResponse
+	if status := rig.doJSON(t, http.MethodPost, "/api/sessions/"+session.ID.String()+"/plans/"+plan1.ID.String()+"/approve", []byte{}, &approve1Resp, token); status != http.StatusOK {
+		t.Fatalf("approve plan1 status = %d, want 200", status)
+	}
+	// Approving plan1 dispatched a new implementation turn, which is a
+	// non-terminal, session-blocking "open turn" (turn.go's hasOpenTurn) --
+	// close it out (status only, mirrors dispatchTurn's own direct-DB-seed
+	// precedent) so approving plan2 below doesn't hit ErrPlanOpenTurnInFlight
+	// (409, decideplan.go). This is test plumbing only, unrelated to the
+	// snapshot-vs-fallback behavior under test.
+	if approve1Resp.TurnId == nil {
+		t.Fatalf("approve plan1: response TurnId = nil, want the new implementation turn id")
+	}
+	if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: mustParseUUID(t, *approve1Resp.TurnId), Status: sqlcgen.TurnStatusCompleted}); err != nil {
+		t.Fatalf("complete plan1's own implementation turn: %v", err)
+	}
+
+	turn2, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusCompleted, PlanMode: true})
+	if err != nil {
+		t.Fatalf("create turn2: %v", err)
+	}
+	dispatchTurn(ctx, t, rig, session.ID, turn2.ID)
+	const wantContent2 = "plan v2's own durable approved prose -- a DIFFERENT snapshot, must also survive the flood"
+	seedTokenEvent(ctx, t, rig, session.ID, "allsnap-msg-2", wantContent2)
+	plan2, err := rig.plans.Create(ctx, sqlcgen.CreatePlanParams{SessionID: session.ID, TurnID: turn2.ID, Version: 2, Status: sqlcgen.PlanStatusAwaitingApproval})
+	if err != nil {
+		t.Fatalf("create plan2: %v", err)
+	}
+	if status := rig.doJSON(t, http.MethodPost, "/api/sessions/"+session.ID.String()+"/plans/"+plan2.ID.String()+"/approve", []byte{}, nil, token); status != http.StatusOK {
+		t.Fatalf("approve plan2 status = %d, want 200", status)
+	}
+
+	// Both plans now have a usable plan_documents snapshot. Flood the event
+	// log well past the live-recompute window so that if planContentMap ever
+	// fell back to a live recompute for either plan (instead of skipping the
+	// fetch entirely, as it should when every row is usable), it would find
+	// neither original token event and return the placeholder.
+	seedFillerEvents(ctx, t, rig, session.ID, planReadPathEventFetchLimit+100)
+
+	var resp restdtos.ListPlansResponse
+	status := rig.doJSON(t, http.MethodGet, "/api/sessions/"+session.ID.String()+"/plans", nil, &resp, token)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if len(resp.Plans) != 2 {
+		t.Fatalf("len(Plans) = %d, want 2", len(resp.Plans))
+	}
+	byID := map[string]restdtos.Plan{}
+	for _, p := range resp.Plans {
+		byID[p.Id] = p
+	}
+	if got := byID[plan1.ID.String()].Content; got != wantContent1 {
+		t.Errorf("plan1 Content = %q, want the durable snapshot's own prose %q -- if this is the placeholder, a live recompute ran even though every row had a usable snapshot", got, wantContent1)
+	}
+	if got := byID[plan2.ID.String()].Content; got != wantContent2 {
+		t.Errorf("plan2 Content = %q, want the durable snapshot's own prose %q -- if this is the placeholder, a live recompute ran even though every row had a usable snapshot", got, wantContent2)
+	}
+	// Neither wantContent1 nor wantContent2 embeds a ```plan-steps block, so
+	// the correct structured result is nil (plandomain.ExtractStructured's
+	// own "no structure" representation, never a fabricated empty object) --
+	// asserted here so a regression that started returning a non-nil
+	// placeholder structure would also be caught.
+	if got := byID[plan1.ID.String()].Structured; got != nil {
+		t.Errorf("plan1 Structured = %+v, want nil (content has no plan-steps block)", got)
+	}
+	if got := byID[plan2.ID.String()].Structured; got != nil {
+		t.Errorf("plan2 Structured = %+v, want nil (content has no plan-steps block)", got)
+	}
+}
+
+// TestListPlans_MixOfSnapshottedAndUnsnapshotted_FallbackFetchStillRunsForTheUnsnapshottedOne
+// proves half (ii) of planContentMap's own optimization, and is the guard
+// against this Step's own confirmed drift hazard: the skip-the-fallback-
+// fetch decision must require EVERY row to have a usable snapshot, not just
+// ANY row. One plan (plan1) is approved through the real endpoint, giving it
+// a usable snapshot; a second plan (plan2) is seeded directly as
+// 'approved' with NO plan_documents row at all (exactly
+// TestListPlans_ApprovedPlanWithNoSnapshotRow_FallsBackToLiveRecompute's own
+// technique), so it can ONLY render correctly via the live-recompute
+// fallback. Both plans must render their own correct content. If
+// planContentMap's skip condition were loosened from "every row usable" to
+// "any row usable" (or the predicate otherwise drifted from
+// resolvePlanRenderedContent's own branch), plan2 would be handed an empty
+// allTurns/contentEvents and silently render plandomain.ContentFallbackText
+// instead of its real prose -- this test's plan2 assertion is what catches
+// that regression (see this Step's mutation-verification notes).
+func TestListPlans_MixOfSnapshottedAndUnsnapshotted_FallbackFetchStillRunsForTheUnsnapshottedOne(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	owner, token := rig.createAuthenticatedUser(ctx, t)
+	session := createSessionForUser(ctx, t, rig, owner.ID, nil)
+
+	turn1, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusCompleted, PlanMode: true})
+	if err != nil {
+		t.Fatalf("create turn1: %v", err)
+	}
+	dispatchTurn(ctx, t, rig, session.ID, turn1.ID)
+	const wantContent1 = "plan1's own durable approved prose -- has a usable snapshot"
+	seedTokenEvent(ctx, t, rig, session.ID, "mix-msg-1", wantContent1)
+	plan1, err := rig.plans.Create(ctx, sqlcgen.CreatePlanParams{SessionID: session.ID, TurnID: turn1.ID, Version: 1, Status: sqlcgen.PlanStatusAwaitingApproval})
+	if err != nil {
+		t.Fatalf("create plan1: %v", err)
+	}
+	if status := rig.doJSON(t, http.MethodPost, "/api/sessions/"+session.ID.String()+"/plans/"+plan1.ID.String()+"/approve", []byte{}, nil, token); status != http.StatusOK {
+		t.Fatalf("approve plan1 status = %d, want 200", status)
+	}
+
+	turn2, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusCompleted, PlanMode: true})
+	if err != nil {
+		t.Fatalf("create turn2: %v", err)
+	}
+	dispatchTurn(ctx, t, rig, session.ID, turn2.ID)
+	const wantContent2 = "plan2's own live-recomputed prose -- has NO snapshot row, must come from the fallback fetch"
+	seedTokenEvent(ctx, t, rig, session.ID, "mix-msg-2", wantContent2)
+	// Created directly as 'approved', bypassing ApprovePlan/DecidePlanOnTx --
+	// no plan_documents row is ever written for plan2, exactly like
+	// TestListPlans_ApprovedPlanWithNoSnapshotRow_FallsBackToLiveRecompute.
+	plan2, err := rig.plans.Create(ctx, sqlcgen.CreatePlanParams{SessionID: session.ID, TurnID: turn2.ID, Version: 2, Status: sqlcgen.PlanStatusApproved})
+	if err != nil {
+		t.Fatalf("create plan2: %v", err)
+	}
+	if _, err := rig.planDocuments.GetByPlanID(ctx, plan2.ID); err == nil {
+		t.Fatalf("sanity check failed: plan2 %s has a plan_documents row, want none", plan2.ID.String())
+	}
+
+	var resp restdtos.ListPlansResponse
+	status := rig.doJSON(t, http.MethodGet, "/api/sessions/"+session.ID.String()+"/plans", nil, &resp, token)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if len(resp.Plans) != 2 {
+		t.Fatalf("len(Plans) = %d, want 2", len(resp.Plans))
+	}
+	byID := map[string]restdtos.Plan{}
+	for _, p := range resp.Plans {
+		byID[p.Id] = p
+	}
+	if got := byID[plan1.ID.String()].Content; got != wantContent1 {
+		t.Errorf("plan1 Content = %q, want the durable snapshot's own prose %q", got, wantContent1)
+	}
+	if got := byID[plan2.ID.String()].Content; got != wantContent2 {
+		t.Errorf("plan2 Content = %q, want the live-recomputed prose %q -- if this is the placeholder instead, the fallback fetch (turns.ListForSession/events.ListRecentForSession) was skipped even though plan2 had no usable snapshot, meaning planContentMap's skip decision only required ANY row to be usable instead of EVERY row", got, wantContent2)
+	}
+}
