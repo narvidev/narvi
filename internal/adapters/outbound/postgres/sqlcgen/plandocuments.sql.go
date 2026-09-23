@@ -44,6 +44,18 @@ type CreatePlanDocumentParams struct {
 // §12.2 item 3) rides the SAME insert as content, from the SAME
 // already-recovered prose -- see that migration's own comment for why NULL
 // is the only representation of "no structure recovered".
+//
+// ListPlanDocumentsByPlanIDs backs the OTHER read path this table was
+// always meant to serve and, until now, never did: GET .../plans
+// (httpapi.ListPlans, plans.go) makes the durable snapshot here its FIRST
+// choice, falling back to the bounded live event-log recompute only where
+// no USABLE snapshot exists (no row at all, or a row whose content has
+// been retention-nulled -- see this table's own migration comment for why
+// that column is nullable). ListPlans already loads every plans row for
+// the session in one query; this mirrors that -- ONE batch fetch keyed by
+// plan_id = ANY($1), never one GetPlanDocumentByPlanID call per plan
+// version (an N+1 this query exists specifically to avoid). Order is
+// whatever Postgres returns; callers key the result by plan_id into a map.
 func (q *Queries) CreatePlanDocument(ctx context.Context, arg CreatePlanDocumentParams) (PlanDocument, error) {
 	row := q.db.QueryRow(ctx, createPlanDocument, arg.PlanID, arg.Content, arg.StructuredSteps)
 	var i PlanDocument
@@ -72,4 +84,34 @@ func (q *Queries) GetPlanDocumentByPlanID(ctx context.Context, planID pgtype.UUI
 		&i.StructuredSteps,
 	)
 	return i, err
+}
+
+const listPlanDocumentsByPlanIDs = `-- name: ListPlanDocumentsByPlanIDs :many
+SELECT id, plan_id, content, created_at, structured_steps FROM plan_documents WHERE plan_id = ANY($1::uuid[])
+`
+
+func (q *Queries) ListPlanDocumentsByPlanIDs(ctx context.Context, planIds []pgtype.UUID) ([]PlanDocument, error) {
+	rows, err := q.db.Query(ctx, listPlanDocumentsByPlanIDs, planIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PlanDocument
+	for rows.Next() {
+		var i PlanDocument
+		if err := rows.Scan(
+			&i.ID,
+			&i.PlanID,
+			&i.Content,
+			&i.CreatedAt,
+			&i.StructuredSteps,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

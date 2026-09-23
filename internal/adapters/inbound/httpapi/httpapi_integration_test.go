@@ -592,7 +592,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		r.Post("/{sessionID}/plans/{planId}/reject", httpapi.RejectPlan(rig.pool, rig.sessions, rig.turns, rig.plans, rig.events, rig.planDocuments, rig.participants, rig.outbox, rig.linearAgentSessions, rig.auditLog, false))
 		// Audit-fix batch (completeness/discoverability, M3) -- see
 		// httpapi/plans.go's own doc comment.
-		r.Get("/{sessionID}/plans", httpapi.ListPlans(rig.sessions, rig.plans, rig.turns, rig.events))
+		r.Get("/{sessionID}/plans", httpapi.ListPlans(rig.sessions, rig.plans, rig.turns, rig.events, rig.planDocuments))
 		// review/retrigger ("review sessions", §8.2's own manual
 		// re-trigger-via-BUTTON surface) -- see reviewretrigger.go's own doc
 		// comment. rig.diffFetcher/rig.botToken default nil/"" -- see this
