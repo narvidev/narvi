@@ -197,6 +197,29 @@ func Run(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, c
 // and forcing it to "false" would be a real behavior change for a
 // runtime-owned repo whose own sparse-checkout state this package never
 // asked to change.
+//
+// The write is scoped "--worktree", not a bare "config key value" -- measured
+// directly against real git, not assumed: `git sparse-checkout set/disable`
+// itself, from Git 2.25 onward, silently turns on extensions.worktreeConfig
+// the FIRST time it ever runs against a repo and stores core.sparseCheckout/
+// core.sparseCheckoutCone in $GIT_DIR/config.worktree -- a config source that
+// resolves with HIGHER precedence than the plain, unscoped local config a
+// bare "git config key value" write lands in. Once that extension is on (the
+// overwhelmingly common case for any repo this package's own sparse-checkout
+// path has ever touched at all), a same-key unscoped write is silently
+// SHADOWED by the pre-existing worktree-scoped entry: `git config --get`
+// keeps reporting the OLD value even though the write itself reports exit 0
+// -- verified directly (the exact failure mode a bare write here produced:
+// disabling sparse-checkout on the agent side succeeded and even
+// re-materialized the runtime's own worktree files correctly, yet the
+// runtime's own core.sparseCheckout still read back "true" afterward).
+// "--worktree" writes to the SAME config.worktree file git's own
+// sparse-checkout machinery already uses, so it always wins the same way a
+// direct `git sparse-checkout` invocation's own writes would -- and, verified
+// directly, is equally safe on a repo where the extension was never enabled
+// at all: with no pre-existing config.worktree, "--worktree" degrades to
+// writing the ordinary local config, with no side effect of newly turning
+// the extension on itself.
 func MirrorSparseCheckout(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, timeout, stopGrace time.Duration) error {
 	for _, key := range []string{"core.sparseCheckout", "core.sparseCheckoutCone"} {
 		val, ok, err := readAgentBoolConfig(ctx, sup, repo, key, timeout, stopGrace)
@@ -206,7 +229,7 @@ func MirrorSparseCheckout(ctx context.Context, sup *supervisor.Supervisor, repo 
 		if !ok {
 			continue
 		}
-		result, err := RuntimeGit(ctx, sup, cred, repo.WorkTree, nil, nil, timeout, stopGrace, "config", key, val)
+		result, err := RuntimeGit(ctx, sup, cred, repo.WorkTree, nil, nil, timeout, stopGrace, "config", "--worktree", key, val)
 		if err != nil {
 			return fmt.Errorf("gitdir: mirror sparse-checkout: set runtime %s: %w", key, err)
 		}
