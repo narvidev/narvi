@@ -97,13 +97,29 @@ type Result struct {
 //     operationally load-bearing of the three, so it wins over either of
 //     the other two on a name collision.
 //
-// A collision between #1 and #3 is structurally impossible --
-// internal/domain/automation.ValidateEnvVars already rejects, at
-// CreateAutomation's own write path, any name providercredential.
+// A collision between #1 and #3 is NOT structurally impossible -- an
+// earlier version of this comment claimed it was, on the strength of
+// internal/domain/automation.ValidateEnvVars already rejecting, "at
+// CreateAutomation's own write path", any name providercredential.
 // AllEnvVarNames/cloudidentity.ReservedEnvVarNames/clusterbinding.
-// ReservedEnvVarNames/the NARVI_*/OPENCODE_* namespaces already own (reuses
-// sandboxsecret.ValidateNotReserved, the SAME check ValidateName itself
-// runs). A collision between #1 and #2 IS reachable (sandbox_secrets has
+// ReservedEnvVarNames/the NARVI_*/OPENCODE_* namespaces already own.
+// Adversarial review (W7) found CreateAutomation is not the only write
+// path automations.env_vars has: internal/app/seed's own seedAutomation
+// (internal/app/seed/automations.go) writes that column directly, from a
+// `control-plane seed -manifest <path>` run, without ever calling
+// ValidateEnvVars (internal/domain/seedmanifest.ValidateManifest does
+// call it, but nothing on the real seed-apply path ever calls
+// ValidateManifest) -- so a write-time-only guarantee does not actually
+// hold end to end. What DOES hold, regardless of write-path drift, is
+// cmd/sandbox-agent/automationenvvars.go's own injection-boundary
+// re-validation (fetchAutomationEnvVars, via internal/domain/automation.
+// ValidateEnvVarShapeAndReservation, which reuses this exact
+// sandboxsecret.ValidateNotReserved check): it drops any reserved name
+// from the resolved map BEFORE this parameter is ever built, for every
+// automation env var regardless of which write path produced it -- see
+// internal/domain/automation/envvar.go's own top doc comment for the
+// full "not the only fence" writeup this corrects. A collision between
+// #1 and #2 IS reachable (sandbox_secrets has
 // no equivalent reservation against an ARBITRARY automation-chosen name,
 // only against the names #3 and the cloud-identity/kubeconfig mechanisms
 // already own) -- #2 wins, matching "an operator-managed secret outranks

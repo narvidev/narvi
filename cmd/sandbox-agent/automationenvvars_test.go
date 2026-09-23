@@ -304,3 +304,174 @@ func TestFetchAutomationEnvVars_DropsReservedNamesDeliveredByControlPlane(t *tes
 		}
 	}
 }
+
+// TestFetchAutomationEnvVars_DropsShapeInvalidNamesDeliveredByControlPlane
+// is W3's own regression test: before that fix, this file's defense-in-
+// depth loop called sandboxsecret.ValidateNotReserved alone, which checks
+// reservation but not POSIX shape -- so a name containing "=" (which
+// exec.Cmd's own Env entries use as the key/value separator, corrupting
+// whichever entry follows it), an empty name, or a leading-digit name
+// (neither a legal POSIX identifier) would have passed straight through
+// to cmd.Env. Mirrors TestFetchAutomationEnvVars_DropsReservedNamesDeliveredByControlPlane's
+// own shape: a targeted drop, never a whole-payload failure, and the
+// legitimate sibling must survive. An empty-string map key is delivered
+// via a second, separate server (Go map literals cannot repeat the ""
+// key) so both shape violations get their own real round trip.
+func TestFetchAutomationEnvVars_DropsShapeInvalidNamesDeliveredByControlPlane(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"envVars": map[string]string{
+			"FOO=BAR":    "shape-invalid-contains-equals",
+			"2FOO":       "shape-invalid-leading-digit",
+			"TARGET_ENV": "staging",
+		}})
+	}))
+	defer server.Close()
+
+	cfg := boot.Config{
+		SessionConfig: &sessionconfig.SessionConfig{
+			ControlPlaneWsUrl: wsEquivalentForTest(server.URL),
+			SessionId:         "sess-1",
+			SandboxToken:      "tok",
+			Gen:               1,
+		},
+	}
+
+	got, ok := fetchAutomationEnvVars(context.Background(), cfg, testTimeouts())
+	if !ok {
+		t.Fatal("fetchAutomationEnvVars() ok = false, want true -- a shape-invalid name is dropped, never a whole-payload failure")
+	}
+	for _, invalid := range []string{"FOO=BAR", "2FOO"} {
+		if _, present := got[invalid]; present {
+			t.Errorf("fetchAutomationEnvVars() kept shape-invalid name %q, want it dropped before injection", invalid)
+		}
+	}
+	if got["TARGET_ENV"] != "staging" {
+		t.Errorf("fetchAutomationEnvVars()[TARGET_ENV] = %q, want %q -- the legitimate sibling must survive the drop", got["TARGET_ENV"], "staging")
+	}
+
+	for _, entry := range automationEnvVarSpawnEnv(got) {
+		if strings.HasPrefix(entry, "FOO=BAR") || strings.HasPrefix(entry, "2FOO") {
+			t.Errorf("automationEnvVarSpawnEnv() built shape-invalid entry %q, want it never reach a spawned process", entry)
+		}
+	}
+
+	// The empty-name case, in its own round trip: a Go map literal cannot
+	// carry two "" keys alongside a real one in the same JSON object
+	// (json.Marshal of map[string]string{"": ..., "TARGET_ENV": ...} is
+	// legal, but mixing it into the table above would obscure which
+	// server response is under test) -- reads more clearly as its own
+	// small, focused case.
+	emptyNameServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"envVars": map[string]string{
+			"":           "shape-invalid-empty-name",
+			"TARGET_ENV": "staging",
+		}})
+	}))
+	defer emptyNameServer.Close()
+
+	emptyNameCfg := boot.Config{
+		SessionConfig: &sessionconfig.SessionConfig{
+			ControlPlaneWsUrl: wsEquivalentForTest(emptyNameServer.URL),
+			SessionId:         "sess-1",
+			SandboxToken:      "tok",
+			Gen:               1,
+		},
+	}
+
+	got2, ok2 := fetchAutomationEnvVars(context.Background(), emptyNameCfg, testTimeouts())
+	if !ok2 {
+		t.Fatal("fetchAutomationEnvVars() ok = false, want true -- an empty name is dropped, never a whole-payload failure")
+	}
+	if _, present := got2[""]; present {
+		t.Error("fetchAutomationEnvVars() kept the empty name, want it dropped before injection")
+	}
+	if got2["TARGET_ENV"] != "staging" {
+		t.Errorf("fetchAutomationEnvVars()[TARGET_ENV] = %q, want %q -- the legitimate sibling must survive the drop", got2["TARGET_ENV"], "staging")
+	}
+}
+
+// TestAutomationAndSandboxSecretEnv_AutomationVarReachesFinalEnv is W1's
+// own direct proof that run()'s REAL assembly function (not a test-
+// reconstructed slice) produces an automation env var entry at all.
+func TestAutomationAndSandboxSecretEnv_AutomationVarReachesFinalEnv(t *testing.T) {
+	t.Parallel()
+
+	got := automationAndSandboxSecretEnv(map[string]string{"TARGET_ENV": "staging"}, nil)
+
+	want := []string{"TARGET_ENV=staging"}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("automationAndSandboxSecretEnv() = %v, want %v", got, want)
+	}
+}
+
+// TestAutomationAndSandboxSecretEnv_SandboxSecretWinsOverAutomationVar is
+// W1's own direct proof of the FIRST recorded collision pairing
+// (spawn.go's own doc comment), driven through run()'s REAL assembly
+// function rather than a hand-built []string literal handed straight to
+// opencodeproc.Spawn (the exact gap adversarial review flagged: the OLD
+// opencodeproc.TestSpawn_SandboxSecretEnvWinsOverAutomationEnvVar builds
+// `[]string{"SHARED_NAME=from-automation-env-var",
+// "SHARED_NAME=from-sandbox-secret"}` BY HAND, which proves Spawn's own
+// append order but says NOTHING about whether run() actually produces
+// that order). Deleting main.go's own automation-env-var injection line,
+// or swapping automationAndSandboxSecretEnv's own two statements, fails
+// THIS test.
+func TestAutomationAndSandboxSecretEnv_SandboxSecretWinsOverAutomationVar(t *testing.T) {
+	t.Parallel()
+
+	got := automationAndSandboxSecretEnv(
+		map[string]string{"SHARED_NAME": "from-automation-env-var"},
+		map[string]string{"SHARED_NAME": "from-sandbox-secret"},
+	)
+
+	want := []string{"SHARED_NAME=from-automation-env-var", "SHARED_NAME=from-sandbox-secret"}
+	if len(got) != len(want) {
+		t.Fatalf("automationAndSandboxSecretEnv() = %v, want %v", got, want)
+	}
+	for i, entry := range want {
+		if got[i] != entry {
+			t.Errorf("automationAndSandboxSecretEnv()[%d] = %q, want %q (automation env var first, sandbox secret appended on top so it wins on collision)", i, got[i], entry)
+		}
+	}
+	// The LAST entry for a duplicate key is what exec.Cmd's own Env
+	// semantics honor -- pin that explicitly too, not just the slice
+	// shape, since that is the actual, observable guarantee.
+	if last := got[len(got)-1]; last != "SHARED_NAME=from-sandbox-secret" {
+		t.Errorf("automationAndSandboxSecretEnv() last SHARED_NAME entry = %q, want %q (last duplicate wins)", last, "SHARED_NAME=from-sandbox-secret")
+	}
+}
+
+// TestAutomationAndSandboxSecretEnv_BothEmptyIsNil proves the
+// overwhelming common case (no automation env vars, no sandbox secrets)
+// produces a nil slice, matching automationEnvVarSpawnEnv's/
+// sandboxSecretSpawnEnv's own identical "nil in, nil out" convention.
+func TestAutomationAndSandboxSecretEnv_BothEmptyIsNil(t *testing.T) {
+	t.Parallel()
+
+	if got := automationAndSandboxSecretEnv(nil, nil); got != nil {
+		t.Errorf("automationAndSandboxSecretEnv(nil, nil) = %v, want nil", got)
+	}
+}
+
+// TestAutomationEnvVarDegradeNotes_NeverWarns is W6's own regression
+// test: unlike sandbox secrets/opencode config, an automation-env-var
+// fetch failure must never add an AGENTS.md degrade note, for EITHER
+// outcome -- see automationEnvVarDegradeNotes' own doc comment for the
+// full "why" (the value is already visible via the prompt preamble
+// regardless, and sandbox-agent has no reliable way to tell an
+// automation session from an ordinary one to target the warning at just
+// the sessions that would actually miss something).
+func TestAutomationEnvVarDegradeNotes_NeverWarns(t *testing.T) {
+	t.Parallel()
+
+	if got := automationEnvVarDegradeNotes(true); got != nil {
+		t.Errorf("automationEnvVarDegradeNotes(true) = %v, want nil", got)
+	}
+	if got := automationEnvVarDegradeNotes(false); got != nil {
+		t.Errorf("automationEnvVarDegradeNotes(false) = %v, want nil -- a fetch failure must never warn (W6)", got)
+	}
+}

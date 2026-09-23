@@ -39,17 +39,30 @@
 // about the exact same "one owning mechanism per env-var name" hazard
 // sandbox_secrets already re-validates against (fetchSandboxSecrets' own
 // doc comment, sandboxsecrets.go): a name reserved by provider-credential
-// injection, cloud-identity injection, or kubeconfig injection must never
-// reach cmd.Env from THIS source either, however the row reached the
-// table (internal/domain/automation.ValidateEnvVars already enforces this
-// at CreateAutomation's own write path, but re-checking here makes the
-// shadowing unrepresentable regardless of write-path drift, exactly like
-// fetchSandboxSecrets' own identical reasoning). Deliberately calls
-// sandboxsecret.ValidateNotReserved, NOT the stricter ValidateName --
-// automation env var names have never been required to be uppercase-only
-// (internal/domain/automation.ValidateEnvVars' own isValidEnvVarName
-// accepts lowercase), and re-validating here must not silently start
-// dropping a lowercase name that was valid the moment it was saved.
+// injection, cloud-identity injection, kubeconfig injection, or the
+// process-hijack surface (PATH/HOME/LD_PRELOAD and siblings, internal/
+// domain/sandboxsecret/name.go's own processHijackReservedNames) must
+// never reach cmd.Env from THIS source either, however the row reached
+// the table.
+//
+// Calls automation.ValidateEnvVarShapeAndReservation, NOT
+// sandboxsecret.ValidateName directly -- adversarial-review MEDIUM fix
+// (W3): an earlier version of this loop called sandboxsecret.
+// ValidateNotReserved alone, re-checking reservation but never shape, so
+// a delivered name containing "=", an empty name, or a leading-digit
+// name -- none legal in a POSIX environment -- would still have reached
+// cmd.Env. ValidateEnvVarShapeAndReservation runs the exact same shape
+// check CreateAutomation's own write-time ValidateEnvVars already
+// enforces (isValidEnvVarName, lowercase permitted -- automation env var
+// names have never been required to be uppercase-only, unlike
+// sandboxsecret.ValidateName's own stricter POSIX-uppercase shape rule),
+// so re-validating here cannot silently start dropping a lowercase name
+// that was valid the moment it was saved, while still closing the shape
+// hole. See internal/domain/automation/envvar.go's own top doc comment
+// for why this injection-boundary re-check -- not CreateAutomation's own
+// write-time one -- is the guarantee that actually holds end to end,
+// regardless of write-path drift (a second write path, internal/app/
+// seed's own seedAutomation, does not call ValidateEnvVars at all).
 
 package main
 
@@ -58,7 +71,7 @@ import (
 	"log/slog"
 	"sort"
 
-	"github.com/narvidev/narvi/internal/domain/sandboxsecret"
+	"github.com/narvidev/narvi/internal/domain/automation"
 	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/internal/sandboxagent/boot"
 	"github.com/narvidev/narvi/internal/sandboxagent/credentials"
@@ -113,9 +126,11 @@ func fetchAutomationEnvVars(ctx context.Context, cfg boot.Config, timeouts platf
 	}
 
 	// Defense in depth -- see this file's own top doc comment for the
-	// full "why ValidateNotReserved, not ValidateName" reasoning.
+	// full "why ValidateEnvVarShapeAndReservation, not sandboxsecret.
+	// ValidateName" reasoning (W3 fix: shape AND reservation, not
+	// reservation alone).
 	for name := range resolved {
-		if err := sandboxsecret.ValidateNotReserved(name); err != nil {
+		if err := automation.ValidateEnvVarShapeAndReservation(name); err != nil {
 			slog.Warn("sandbox-agent: dropping delivered automation env var whose name is not injectable", "name", name, "error", err)
 			delete(resolved, name)
 		}
@@ -155,4 +170,84 @@ func automationEnvVarSpawnEnv(envVars map[string]string) []string {
 		env = append(env, name+"="+envVars[name])
 	}
 	return env
+}
+
+// automationAndSandboxSecretEnv builds sandboxSecretEnv's own first two
+// layers, in the EXACT order run() (main.go) itself assembles them: the
+// recorded three-way order (opencodeproc.Spawn's own doc comment,
+// spawn.go's "The recorded three-way order, and why") puts automation
+// env vars (least-trusted -- "plain config a maintainer typed") first,
+// then general sandbox secrets (more-trusted -- "a secret the operator
+// configured") layered on top, so a later, more-trusted entry wins on a
+// name collision (exec.Cmd's own documented Env semantics). run() calls
+// this function DIRECTLY as the one and only place it builds this part
+// of sandboxSecretEnv -- this is not a test-facing replica of that
+// assembly, it IS the assembly, extracted so a test can drive it without
+// also driving every OTHER thing run() does (HTTP servers, supervised
+// process spawns, signal handling, ...).
+//
+// Adversarial-review MEDIUM fix (W1): before this extraction, run()'s
+// own two-line assembly (automationEnvVarSpawnEnv, then a separate
+// append of sandboxSecretSpawnEnv onto the front) was never exercised by
+// any test -- every existing collision-order test
+// (opencodeproc.TestSpawn_SandboxSecretEnvWinsOverAutomationEnvVar)
+// instead hand-built an already-in-final-order []string literal and
+// handed it straight to opencodeproc.Spawn, which proved Spawn's OWN
+// append order but said nothing about whether run() actually PRODUCES
+// that order. Deleting the automation-env-var injection line in main.go,
+// or swapping this function's own two statements (so sandbox secrets
+// would end up FIRST, automation env vars LAST -- inverting who wins),
+// now fails automationenvvars_test.go's own
+// TestAutomationAndSandboxSecretEnv_SandboxSecretWinsOverAutomationEnvVar
+// directly, because that test calls this exact function.
+func automationAndSandboxSecretEnv(resolvedAutomationEnvVars, resolvedSandboxSecrets map[string]string) []string {
+	env := automationEnvVarSpawnEnv(resolvedAutomationEnvVars)
+	return append(env, sandboxSecretSpawnEnv(resolvedSandboxSecrets)...)
+}
+
+// automationEnvVarDegradeNotes reports the AGENTS.md boot-degrade note
+// (if any) to record for this session's own automation-env-var fetch
+// outcome -- always nil, deliberately, unlike sandboxSecretEnv's/
+// openCodeConfigEnv's own sibling degrade notes (main.go's "sandbox
+// secrets"/"opencode config" blocks, which DO warn on a failed fetch).
+//
+// Adversarial-review LOW fix (W6): a prior version of run() appended a
+// warning UNCONDITIONALLY whenever automationEnvVarsFetchOK was false --
+// which fires on EVERY session during a control-plane outage, including
+// the overwhelming common case of an ordinary, non-automation session,
+// for which the warning is actively wrong (it never had any automation
+// env vars to lose in the first place). Fixing that by trying to detect
+// "is this session actually an automation session" was considered and
+// rejected: CP's own delivery response (automationenvvarsdelivery.go's
+// own doc comment, outcome 7) is `{}` for BOTH "not an automation
+// session" and "automation session with zero env_vars" on SUCCESS, and
+// carries no signal AT ALL on FAILURE -- SessionConfig (contracts/
+// session-config/v1/session-config.schema.json) has no automation-
+// association field to consult either, so any such detection would be a
+// heuristic guess, not a fact.
+//
+// The real fix is simpler and does not need that signal at all: §8.4's
+// own "keep the preamble" decision -- the prompt-preamble delivery and
+// this boot-time env-var injection are deliberately NOT exclusive
+// alternatives, because an agent that must KNOW a feature-flag name and
+// a shell that must RESOLVE it are different needs -- means
+// buildRunPrompt (internal/app/automation/settings.go)
+// ALREADY writes every one of this automation's own configured
+// NAME=value pairs into the dispatched turn's own prompt text,
+// UNCONDITIONALLY, at run-dispatch time -- entirely independent of
+// whether THIS boot-time fetch (which only controls $VAR/os.Getenv
+// visibility) ever succeeds. An agent that reads its own prompt already
+// knows every value this fetch would have injected, so a boot-time fetch
+// failure here degrades silently but never SILENTLY -- unlike a missing
+// sandbox secret (which CAN break a repo's own setup.sh/services.yml/
+// opencode auth with no other channel telling the agent anything went
+// wrong), there is no second, boot-time-only piece of information the
+// agent would otherwise be missing. A bool parameter (currently unused,
+// so named _ to satisfy this codebase's own revive/unused-parameter
+// lint rule) is kept in the signature -- rather than dropping it down to
+// an argument-less func() []string -- so a future, genuinely-informed
+// policy can be reinstated here without changing run()'s own call site
+// again.
+func automationEnvVarDegradeNotes(_ bool) []string {
+	return nil
 }

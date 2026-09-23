@@ -15,6 +15,44 @@ import (
 // this package DOES implement, precisely because it carries no
 // confidentiality requirement at all (a feature-flag name, a target
 // environment label, a non-sensitive tuning parameter).
+//
+// # Where a resolved value actually goes (corrected, W4)
+//
+// A prior version of this comment claimed a value threaded through
+// opencodeproc.Spawn's own sandboxSecretEnv parameter "only ever reaches
+// the spawned opencode process's own cmd.Env" -- false, disproved during
+// adversarial review with a real setup.sh. The same slice this package's
+// own resolved env vars are folded into (cmd/sandbox-agent/main.go's own
+// automationAndSandboxSecretEnv, automationenvvars.go) also reaches, at
+// SANDBOX-AGENT'S OWN uid -- root in production, no credential drop --
+// a repo's own setup.sh/start.sh hooks (internal/sandboxagent/boot/
+// hooks.go's runHook) and dockerd (internal/sandboxagent/boot/docker.go's
+// RunDocker), and reaches a repo's own services.yml-declared services
+// (internal/sandboxagent/services.Run, dropped to the runtime's OWN uid
+// via runtimeCredential, internal/sandboxagent/boot/runboot.go) -- all
+// BEFORE opencode is ever spawned.
+//
+// Accepted anyway, on two grounds that actually hold:
+//
+//  1. Parity: this is the EXACT SAME slice sandbox_secrets already
+//     threads through the same call sites (§27.1) -- an automation env
+//     var carries no reach a sandbox secret did not already have.
+//  2. The same role gate: creating/editing an automation
+//     (authz.ActionManageAutomations) and managing a repo/environment
+//     secret (authz.ActionManageRepoSecrets/ActionManageEnvSecrets) are
+//     ALL roles(RoleAdmin, RoleMaintainer)-only (internal/domain/authz/
+//     authorize.go) -- this reach is available only to the same
+//     privileged callers who could already reach it via sandbox_secrets.
+//
+// Given that reach, this package no longer excludes PATH/HOME/LD_PRELOAD
+// and siblings from the reserved set either (a change from this
+// comment's own prior, incorrect position that reach was contained to
+// opencode's own env) -- ValidateEnvVarShapeAndReservation's own
+// sandboxsecret.ValidateNotReserved call now refuses them, for BOTH
+// sandbox_secrets and automation env vars at once (internal/domain/
+// sandboxsecret/name.go's own processHijackReservedNames doc comment has
+// the full per-name "why", including the cross-PR GIT_ALLOW_PROTOCOL
+// collision this closes).
 type EnvVar struct {
 	// Name is the environment variable's own name -- validated by
 	// ValidateEnvVars against envVarNamePattern below.
@@ -105,53 +143,86 @@ func isValidEnvVarName(name string) bool {
 	return true
 }
 
+// ValidateEnvVarShapeAndReservation validates ONE candidate name: non-
+// empty, POSIX-identifier shaped (isValidEnvVarName, above -- lowercase
+// permitted, see that function's own doc comment for why), and not
+// reserved by another injection mechanism (sandboxsecret.
+// ValidateNotReserved -- the "one owning mechanism per env-var name" rule
+// §27.1 established, which now also covers the process-hijack surface,
+// PATH/HOME/LD_PRELOAD and siblings -- see name.go's own
+// processHijackReservedNames doc comment for the full per-name "why").
+// Factored out of ValidateEnvVars (below), which still runs this AND its
+// own list-level MaxEnvVars/duplicate checks together, unchanged --
+// specifically so a SECOND caller can reuse the exact same per-name rule
+// without also inheriting those list-level checks, which make no sense
+// against a single already-delivered name: cmd/sandbox-agent/
+// automationenvvars.go's own injection-boundary re-validation
+// (adversarial-review MEDIUM fix -- an earlier version there called
+// sandboxsecret.ValidateNotReserved alone, re-checking reservation but
+// never shape, so a name containing "=", an empty name, or a
+// leading-digit name -- none legal in a POSIX environment, any of them
+// capable of confusing an exec.Cmd.Env consumer -- could still reach
+// cmd.Env if it arrived at that boundary by any path other than through
+// ValidateEnvVars). One shared definition, not two independently
+// maintained copies that could drift apart -- see ValidateEnvVars' own
+// doc comment for why this is still not the ONLY fence in practice.
+func ValidateEnvVarShapeAndReservation(name string) error {
+	if name == "" {
+		return &InvalidEnvVarError{Name: name, Reason: ErrEmptyEnvVarName}
+	}
+	if !isValidEnvVarName(name) {
+		return &InvalidEnvVarError{Name: name, Reason: ErrInvalidEnvVarName}
+	}
+	if err := sandboxsecret.ValidateNotReserved(name); err != nil {
+		return &InvalidEnvVarError{Name: name, Reason: fmt.Errorf("%w: %w", ErrReservedEnvVarName, err)}
+	}
+	return nil
+}
+
 // ValidateEnvVars validates a candidate []EnvVar list before it is accepted
 // onto an automation, at creation/update time: at most MaxEnvVars entries,
-// each with a non-empty, syntactically valid Name not reserved by another
-// injection mechanism, and no two entries sharing the same Name. Returns
-// the first problem found (and stops) -- same "first error wins, no
-// accumulation" convention as environment.ValidatePathScope.
+// each valid per ValidateEnvVarShapeAndReservation (above), and no two
+// entries sharing the same Name. Returns the first problem found (and
+// stops) -- same "first error wins, no accumulation" convention as
+// environment.ValidatePathScope.
 //
-// The reservation check (sandboxsecret.ValidateNotReserved) is this
-// Step's own addition: once an automation's env_vars are threaded into
-// cmd.Env alongside provider credentials/sandbox secrets, a name this
-// package previously accepted (e.g. "ANTHROPIC_API_KEY" or "KUBECONFIG")
-// would silently shadow -- or be shadowed by -- a mechanism that name
-// already belongs to, rather than merely sitting unused in a prompt
-// preamble. This is a fail-CLOSED check at the one write path automation
-// env vars have (CreateAutomation, internal/adapters/inbound/httpapi/
-// automations.go) -- unlike sandbox_secrets, automations have no separate
-// UPDATE route yet and no second write path to re-validate at (contrast
-// fetchSandboxSecrets' own defense-in-depth re-validation, cmd/sandbox-
-// agent/sandboxsecrets.go), so this single check is the only fence.
+// # This is not the only fence, and CreateAutomation is not the only write path
 //
-// Deliberately does NOT also reject PATH/HOME the way this package's
-// caller (cmd/sandbox-agent) could still be handed an automation env var
-// named either: mirrors sandboxsecret.ValidateName's own identical,
-// already-shipped position (name.go: neither is in the reserved set
-// there either) -- for the SAME reason. A value threaded via
-// opencodeproc.Spawn's own sandboxSecretEnv parameter (which this Step's
-// automation env vars are folded into, cmd/sandbox-agent/main.go) only
-// ever reaches the spawned opencode process's own cmd.Env, NEVER
-// sandbox-agent's own os.Setenv'd process environment (see that
-// parameter's own doc comment for the incident this architecture
-// structurally prevents) -- so a PATH/HOME collision here is contained to
-// a maintainer's own automation misconfiguring its own session's agent
-// process, never a hazard to sandbox-agent itself.
+// A prior version of this comment claimed CreateAutomation (internal/
+// adapters/inbound/httpapi/automations.go) was "the one write path
+// automation env vars have" and this function "the only fence" -- an
+// adversarial review round (W7) found both false. internal/app/seed's own
+// seedAutomation (internal/app/seed/automations.go) writes
+// automations.env_vars directly, via sqlcgen.CreateAutomationParams, from
+// a `control-plane seed -manifest <path>` run -- WITHOUT ever calling
+// this function. internal/domain/seedmanifest.ValidateManifest
+// (validate.go) DOES call it, but nothing on the real seed-apply path
+// (controlplane/seed.go's own runSeedCommand -> internal/app/seed.Run ->
+// seedAutomation) ever calls ValidateManifest -- a repo-wide grep at the
+// time of this fix found zero non-test callers of it at all -- so a seed
+// manifest's own env_vars entries can reach Postgres with no shape or
+// reservation check whatsoever. Even setting that gap aside: cmd/
+// sandbox-agent/automationenvvars.go's own fetchAutomationEnvVars was
+// ALREADY a second, independent re-validation of every DELIVERED name
+// before this comment was corrected -- it drops (never fails the boot
+// on) any name that fails, regardless of which write path produced it.
+// THAT re-validation -- not this function -- is the guarantee that
+// actually holds end to end: it sits at the one place every automation
+// env var must pass through before it ever reaches cmd.Env, structurally
+// independent of how many write paths this table has, or whether a
+// future one remembers to call ValidateEnvVars at all. spawn.go's own
+// former "a collision ... is structurally impossible ... ValidateEnvVars
+// already rejects [it], at CreateAutomation's own write path" leaned on
+// this same wrong guard -- corrected there too, to point at the same
+// injection-boundary re-validation instead.
 func ValidateEnvVars(vars []EnvVar) error {
 	if len(vars) > MaxEnvVars {
 		return ErrTooManyEnvVars
 	}
 	seen := make(map[string]struct{}, len(vars))
 	for _, v := range vars {
-		if v.Name == "" {
-			return &InvalidEnvVarError{Name: v.Name, Reason: ErrEmptyEnvVarName}
-		}
-		if !isValidEnvVarName(v.Name) {
-			return &InvalidEnvVarError{Name: v.Name, Reason: ErrInvalidEnvVarName}
-		}
-		if err := sandboxsecret.ValidateNotReserved(v.Name); err != nil {
-			return &InvalidEnvVarError{Name: v.Name, Reason: fmt.Errorf("%w: %w", ErrReservedEnvVarName, err)}
+		if err := ValidateEnvVarShapeAndReservation(v.Name); err != nil {
+			return err
 		}
 		if _, dup := seen[v.Name]; dup {
 			return &InvalidEnvVarError{Name: v.Name, Reason: ErrDuplicateEnvVarName}

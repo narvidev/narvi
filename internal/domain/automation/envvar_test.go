@@ -45,6 +45,12 @@ func TestValidateEnvVars(t *testing.T) {
 		{"reserved provider credential name", []automation.EnvVar{{Name: "ANTHROPIC_API_KEY", Value: "v"}}, automation.ErrReservedEnvVarName},
 		{"reserved cloud identity name", []automation.EnvVar{{Name: "AWS_ROLE_ARN", Value: "v"}}, automation.ErrReservedEnvVarName},
 		{"reserved cluster binding name", []automation.EnvVar{{Name: "KUBECONFIG", Value: "v"}}, automation.ErrReservedEnvVarName},
+		// Process-hijack reservation (W4 fix, name.go's own
+		// processHijackReservedNames): one representative here too, same
+		// "this table only needs one per category" convention -- the
+		// exhaustive per-name coverage lives in sandboxsecret's own
+		// name_test.go (TestValidateName_EveryProcessHijackNameIsRejected).
+		{"reserved process-hijack name", []automation.EnvVar{{Name: "PATH", Value: "v"}}, automation.ErrReservedEnvVarName},
 		// A reserved-namespace-shaped name that ALSO fails the plain
 		// POSIX-identifier shape check must report the shape problem, not
 		// a reservation one -- shape is checked first (isValidEnvVarName,
@@ -81,5 +87,43 @@ func TestValidateEnvVars_ReservedNameUnwrapsToSandboxsecretReason(t *testing.T) 
 	}
 	if !errors.Is(err, sandboxsecret.ErrNameReservedProviderCredential) {
 		t.Errorf("errors.Is(err, sandboxsecret.ErrNameReservedProviderCredential) = false, want true (err = %v)", err)
+	}
+}
+
+// TestValidateEnvVarShapeAndReservation mirrors TestValidateEnvVars'
+// own per-name cases directly against the newly-exported single-name
+// function (W3/W7 fix: this is now the SHARED definition both
+// ValidateEnvVars and cmd/sandbox-agent/automationenvvars.go's own
+// injection-boundary re-validation call) -- proves the extraction
+// preserves every one of ValidateEnvVars' own per-name outcomes exactly,
+// with no list-level (MaxEnvVars/duplicate) concern folded in.
+func TestValidateEnvVarShapeAndReservation(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr error
+	}{
+		{"valid uppercase", "FOO", nil},
+		{"valid lowercase (never required to be uppercase)", "foo_bar", nil},
+		{"empty", "", automation.ErrEmptyEnvVarName},
+		{"contains equals", "FOO=BAR", automation.ErrInvalidEnvVarName},
+		{"starts with digit", "2FOO", automation.ErrInvalidEnvVarName},
+		{"contains space", "FOO BAR", automation.ErrInvalidEnvVarName},
+		{"reserved provider credential name", "ANTHROPIC_API_KEY", automation.ErrReservedEnvVarName},
+		{"reserved process-hijack name", "PATH", automation.ErrReservedEnvVarName},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := automation.ValidateEnvVarShapeAndReservation(tc.input)
+			if tc.wantErr == nil {
+				if err != nil {
+					t.Errorf("ValidateEnvVarShapeAndReservation(%q) = %v, want nil", tc.input, err)
+				}
+				return
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Errorf("ValidateEnvVarShapeAndReservation(%q) = %v, want error wrapping %v", tc.input, err, tc.wantErr)
+			}
+		})
 	}
 }

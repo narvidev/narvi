@@ -50,6 +50,21 @@ func TestValidateName(t *testing.T) {
 		{"cloud identity reserved azure client id", "AZURE_CLIENT_ID", ErrNameReservedCloudIdentity},
 		{"cloud identity reserved azure tenant id", "AZURE_TENANT_ID", ErrNameReservedCloudIdentity},
 		{"cluster binding reserved kubeconfig", "KUBECONFIG", ErrNameReservedClusterBinding},
+		{"process hijack reserved path", "PATH", ErrNameReservedProcessHijack},
+		{"process hijack reserved home", "HOME", ErrNameReservedProcessHijack},
+		{"process hijack reserved ld_preload", "LD_PRELOAD", ErrNameReservedProcessHijack},
+		{"process hijack reserved ld_library_path", "LD_LIBRARY_PATH", ErrNameReservedProcessHijack},
+		{"process hijack reserved bash_env", "BASH_ENV", ErrNameReservedProcessHijack},
+		{"process hijack reserved env", "ENV", ErrNameReservedProcessHijack},
+		{"process hijack reserved node_options", "NODE_OPTIONS", ErrNameReservedProcessHijack},
+		{"process hijack reserved pythonstartup", "PYTHONSTARTUP", ErrNameReservedProcessHijack},
+		{"process hijack reserved git_ssh_command", "GIT_SSH_COMMAND", ErrNameReservedProcessHijack},
+		{"process hijack reserved git_ssh", "GIT_SSH", ErrNameReservedProcessHijack},
+		{"process hijack reserved git_allow_protocol (cross-PR hazard)", "GIT_ALLOW_PROTOCOL", ErrNameReservedProcessHijack},
+		{"process hijack reserved git_config_ prefix boundary", "GIT_CONFIG_", ErrNameReservedProcessHijack},
+		{"process hijack reserved git_config_count", "GIT_CONFIG_COUNT", ErrNameReservedProcessHijack},
+		{"process hijack reserved git_config_key_0", "GIT_CONFIG_KEY_0", ErrNameReservedProcessHijack},
+		{"process hijack reserved git_config_value_0", "GIT_CONFIG_VALUE_0", ErrNameReservedProcessHijack},
 		{"too long", strings.Repeat("A", maxNameLength+1), ErrNameTooLong},
 		{"exactly at max length is fine", strings.Repeat("A", maxNameLength), nil},
 	}
@@ -167,6 +182,49 @@ func TestValidateName_EveryClusterBindingEnvVarNameIsRejected(t *testing.T) {
 			err := ValidateName(reserved)
 			if !errors.Is(err, ErrNameReservedClusterBinding) {
 				t.Errorf("ValidateName(%q) = %v, want ErrNameReservedClusterBinding", reserved, err)
+			}
+		})
+	}
+}
+
+// TestValidateName_EveryProcessHijackNameIsRejected is the exhaustive,
+// non-hardcoded mirror of TestValidateName_EveryProviderCredentialEnvVarNameIsRejected
+// for processHijackReservedNames (name.go's own "process-hijack surface"
+// addition, adversarial-review LOW-severity fix) -- ranged over rather
+// than copy-pasted, so removing any one name from that slice (or removing
+// ValidateNotReserved's own call into it) makes this test fail on that
+// exact name, the mutation-test-visible guard this codebase's sibling
+// exhaustive tests already establish.
+func TestValidateName_EveryProcessHijackNameIsRejected(t *testing.T) {
+	for _, reserved := range processHijackReservedNames {
+		t.Run(reserved, func(t *testing.T) {
+			err := ValidateName(reserved)
+			if !errors.Is(err, ErrNameReservedProcessHijack) {
+				t.Errorf("ValidateName(%q) = %v, want ErrNameReservedProcessHijack", reserved, err)
+			}
+		})
+	}
+}
+
+// TestValidateName_GitConfigPrefixRejectsEveryVariableTheMechanismUses
+// proves gitConfigReservedPrefix closes the WHOLE git env-config-override
+// mechanism (GIT_CONFIG_COUNT + as many GIT_CONFIG_KEY_<n>/GIT_CONFIG_
+// VALUE_<n> pairs as COUNT declares), not merely the one name
+// (GIT_CONFIG_COUNT) explicitly named in the adversarial-review finding
+// -- an enumerated {GIT_CONFIG_COUNT} check alone would miss
+// GIT_CONFIG_KEY_1/GIT_CONFIG_VALUE_1 the moment a caller declared a
+// second override.
+func TestValidateName_GitConfigPrefixRejectsEveryVariableTheMechanismUses(t *testing.T) {
+	names := []string{
+		"GIT_CONFIG_COUNT",
+		"GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
+		"GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_1",
+	}
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			err := ValidateName(name)
+			if !errors.Is(err, ErrNameReservedProcessHijack) {
+				t.Errorf("ValidateName(%q) = %v, want ErrNameReservedProcessHijack", name, err)
 			}
 		})
 	}

@@ -1317,25 +1317,27 @@ func run() error {
 
 		// §8 item 4 ("automation env vars reach the process, not
 		// just the prompt"): resolve this session's own automation env
-		// vars BEFORE sandboxSecretEnv is built immediately below, and
-		// PREPEND them to it -- the recorded three-way ordering
-		// (opencodeproc.Spawn's own doc comment, spawn.go): automation
-		// env vars (plain config a maintainer typed, never RBAC-gated the
-		// elevated way sandbox_secrets/provider_credentials are) lose to
-		// EITHER of the other two sources on a name collision, since both
-		// are appended AFTER this point (sandbox_secrets/OPENCODE_CONFIG/
-		// cloud-identity/kubeconfig onto sandboxSecretEnv itself, just
-		// below; providerCredentialEnv layered on top of the whole result
-		// by opencodeproc.Spawn itself, further down). Deliberately best-
-		// effort (see fetchAutomationEnvVars' own doc comment) -- the
-		// overwhelming common case is zero automation env vars (this
-		// session was never created by app/automation's own fanout.go at
-		// all), which changes nothing about this session's own env.
+		// vars BEFORE sandboxSecretEnv is built below -- the recorded
+		// three-way ordering (opencodeproc.Spawn's own doc comment,
+		// spawn.go): automation env vars (plain config a maintainer
+		// typed, never RBAC-gated the elevated way sandbox_secrets/
+		// provider_credentials are) lose to EITHER of the other two
+		// sources on a name collision, since both are folded in AFTER
+		// this point by automationAndSandboxSecretEnv, below
+		// (sandbox_secrets/OPENCODE_CONFIG/cloud-identity/kubeconfig onto
+		// sandboxSecretEnv itself, just below; providerCredentialEnv
+		// layered on top of the whole result by opencodeproc.Spawn
+		// itself, further down). Deliberately best-effort (see
+		// fetchAutomationEnvVars' own doc comment) -- the overwhelming
+		// common case is zero automation env vars (this session was
+		// never created by app/automation's own fanout.go at all), which
+		// changes nothing about this session's own env. See
+		// automationEnvVarDegradeNotes' own doc comment (automationenvvars.go)
+		// for why a failed fetch deliberately does NOT add an AGENTS.md
+		// warning the way the sandbox-secrets/opencode-config fetches
+		// below still do.
 		resolvedAutomationEnvVars, automationEnvVarsFetchOK := fetchAutomationEnvVars(ctx, cfg, timeouts)
-		sandboxSecretEnv = automationEnvVarSpawnEnv(resolvedAutomationEnvVars)
-		if !automationEnvVarsFetchOK {
-			bootDegradeNotes = append(bootDegradeNotes, "automation env vars: boot-time fetch failed after retrying; this session booted with NO automation env vars injected into its process environment (warn-and-continue degrade policy, mirrors §27.1) -- any value this automation's own prompt preamble still names may be missing from $VAR/os.Getenv")
-		}
+		bootDegradeNotes = append(bootDegradeNotes, automationEnvVarDegradeNotes(automationEnvVarsFetchOK)...)
 
 		// §27.1 ("sandbox secrets & opencode config", §27.1/§27.2):
 		// resolve this session's own general sandbox secrets and OpenCode
@@ -1351,12 +1353,17 @@ func run() error {
 		// this fixes) -- so sandboxSecretEnv must be fully built here,
 		// ahead of opencodeproc.Spawn (below) and runBootSequence (which
 		// threads it on into boot.RunBoot for hooks/services.yml).
-		// Appended ONTO the automation-env-var entries just resolved
-		// above, never replacing them -- exec.Cmd's own documented Env
+		// automationAndSandboxSecretEnv (automationenvvars.go) is the ONE
+		// place both resolved maps are combined, in the recorded order --
+		// automation env vars first, sandbox secrets appended on top,
+		// never the other way around: exec.Cmd's own documented Env
 		// semantics make a later entry for the same name win, so a
-		// sandbox secret always overrides a same-named automation env var.
+		// sandbox secret always overrides a same-named automation env
+		// var. See that function's own doc comment for why this call
+		// (not a test-reconstructed slice) is what a regression test
+		// exercises.
 		resolvedSandboxSecrets, sandboxSecretsFetchOK := fetchSandboxSecrets(ctx, cfg, timeouts)
-		sandboxSecretEnv = append(sandboxSecretEnv, sandboxSecretSpawnEnv(resolvedSandboxSecrets)...)
+		sandboxSecretEnv = automationAndSandboxSecretEnv(resolvedAutomationEnvVars, resolvedSandboxSecrets)
 		if !sandboxSecretsFetchOK {
 			// §27.1: "recorded in the boot log [already done, inside
 			// fetchSandboxSecrets itself] and AGENTS.md" (adversarial-review
