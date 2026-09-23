@@ -29,13 +29,15 @@ import (
 const testSyncStepTimeout = 10 * time.Second
 
 // testFetchStepTimeout bounds the new boot-time fetch step's own git
-// subprocesses (ls-remote/fetch) in these tests -- a real, but ALWAYS
-// LOCAL-transport (never actually crossing a network), git operation
-// against either a genuine local "origin" fixture (see initRepoWithOrigin,
-// below) or -- for every pre-existing test in this file that predates this
-// Step and configures no "origin" remote at all -- a fast, real git
+// subprocesses (ls-remote/fetch) in these tests -- a real, but NEVER
+// actually crossing a real network, git operation against either a genuine
+// origin fixture (a local git-http-backend server over a self-signed-TLS
+// loopback connection, or a deliberately nonexistent local path a
+// file-transport fetch fails against just as fast as a denied-transport
+// one does) or -- for every pre-existing test in this file that predates
+// this Step and configures no "origin" remote at all -- a fast, real git
 // failure ("origin" does not exist), never a hang. 10s (matching
-// testSyncStepTimeout) is generous for either real outcome.
+// testSyncStepTimeout) is generous for any of these real outcomes.
 const testFetchStepTimeout = 10 * time.Second
 
 // gitSyncEvent records one onGitSync callback invocation for assertions.
@@ -1229,21 +1231,58 @@ func TestSyncAll_StashPopFailure_StillReAppliesSparseCheckout(t *testing.T) {
 // target -- matching this package's own established "verify directly
 // against the real git binary, fully offline, deterministic" testing
 // philosophy (see checkoutBranch's/gitStashPop's own doc comments)
-// extended to SyncAll's new fetch step: a plain local filesystem path
-// works perfectly well as a git remote for `git fetch`/`git ls-remote`
-// (verified directly, not assumed), with no bare-repo ceremony needed and
-// no real network dependency anywhere in these tests.
+// extended to SyncAll's new fetch step.
+//
+// A plain local filesystem path used to work perfectly well as a git
+// remote for `git fetch`/`git ls-remote` here -- it still does for the
+// tests in this file that only need the fetch to FAIL (an "origin" pointed
+// at a nonexistent path, simulating an unreachable remote), since
+// githarden's transport-class hardening (§30.5's follow-up closing the
+// gap left open in remote.<name>.uploadpack/receivepack) makes that fetch
+// fail EITHER way, just for a different reason. But a test that
+// needs the fetch to SUCCEED can no longer wire a bare local path directly:
+// SyncAll's own runGit always goes through githarden.Harden, which now
+// denies file-transport git operations outright -- the exact same denial
+// that closes a runtime-rewritten remote.origin.url in production. Those
+// tests instead wire newLocalOriginServer's own https:// URL, serving the
+// SAME on-disk repository over a real, local, self-signed-TLS
+// git-http-backend server -- no real network dependency, still fully
+// offline and deterministic, just over the one transport this codebase
+// actually uses.
 
 // newLocalOrigin creates a real git repository at a fresh directory with
 // default branch "main" and one commit (README.md = "hello\n", via
 // initRepo) -- the repo_image's own "shared, tip-tracking remote" for these
-// tests' own purposes. Returns its directory, ready to be wired as
-// `git remote add origin <this path>` in a separate workspace repo.
+// tests' own purposes. Returns its directory -- pass it to
+// newLocalOriginServer to wire it as `git remote add origin <url>` in a
+// separate workspace repo (a bare local path no longer works; see this
+// section's own doc comment above).
 func newLocalOrigin(t *testing.T) string {
 	t.Helper()
 	originDir := filepath.Join(t.TempDir(), "origin")
 	initRepo(t, originDir)
 	return originDir
+}
+
+// newLocalOriginServer serves originDir over a real, local, self-signed-TLS
+// git-http-backend server (startGitHTTPSServer, clone_test.go -- same
+// package, same test binary) and returns the URL to wire as `git remote add
+// origin <url>`.
+//
+// githarden's own transport-class hardening now denies file-transport git
+// operations outright (the same denial that closes a runtime-rewritten
+// remote.origin.url in production), so a test that needs a REAL,
+// SUCCESSFUL fetch through SyncAll's own runGit (which always goes through
+// githarden.Harden) can no longer wire a plain local filesystem path as
+// "origin" -- every such test in this file now serves its origin the same
+// way production always does: https. originDir must be a repository
+// created directly under its own t.TempDir() parent (see newLocalOrigin) --
+// this serves that ENTIRE parent directory, so a second, unrelated repo
+// sharing the same parent would also become reachable through it.
+func newLocalOriginServer(t *testing.T, originDir string) string {
+	t.Helper()
+	server := startGitHTTPSServer(t, filepath.Dir(originDir))
+	return server.URL + "/" + filepath.Base(originDir)
 }
 
 // addOriginBranch creates a new branch on an already-initialized origin
@@ -1317,7 +1356,7 @@ func TestSyncAll_FetchSucceeds_BranchExistsOnOrigin_PrefersOriginTrackingBranch(
 	targetBranch := "feature-on-origin"
 	addOriginBranch(t, originDir, targetBranch, "origin's real tip content for feature-on-origin\n")
 
-	runGit(t, repoDir, "remote", "add", "origin", originDir)
+	runGit(t, repoDir, "remote", "add", "origin", newLocalOriginServer(t, originDir))
 
 	repos := []sessionconfig.SessionConfigReposElem{
 		{Name: "repo1", Url: "https://example.invalid/repo1.git", Branch: &targetBranch},
@@ -1368,7 +1407,7 @@ func TestSyncAll_FetchSucceeds_InventedBranchNotOnOrigin_FallsBackToOriginDefaul
 	originDir := newLocalOrigin(t)
 	updateOriginDefaultBranch(t, originDir, "origin's real default-branch tip\n")
 
-	runGit(t, repoDir, "remote", "add", "origin", originDir)
+	runGit(t, repoDir, "remote", "add", "origin", newLocalOriginServer(t, originDir))
 
 	sessionID := "session-fetch-invented-branch"
 	repos := []sessionconfig.SessionConfigReposElem{
@@ -1501,7 +1540,7 @@ func TestSyncAll_FetchSucceeds_InventedBranchNotOnOrigin_NoDegradeWarningLogged(
 	originDir := newLocalOrigin(t)
 	updateOriginDefaultBranch(t, originDir, "origin's real default-branch tip\n")
 
-	runGit(t, repoDir, "remote", "add", "origin", originDir)
+	runGit(t, repoDir, "remote", "add", "origin", newLocalOriginServer(t, originDir))
 
 	sessionID := "session-fetch-invented-branch-no-warn"
 	repos := []sessionconfig.SessionConfigReposElem{
@@ -1614,7 +1653,7 @@ func TestSyncAll_DefaultBranchFetchFailsIndependently_LogsWarningEvenWhenTargetF
 	workspaceDir := t.TempDir()
 	repoDir := filepath.Join(workspaceDir, "repo1")
 	initRepo(t, repoDir)
-	runGit(t, repoDir, "remote", "add", "origin", originDir)
+	runGit(t, repoDir, "remote", "add", "origin", newLocalOriginServer(t, originDir))
 
 	targetBranch := "feature"
 	repos := []sessionconfig.SessionConfigReposElem{

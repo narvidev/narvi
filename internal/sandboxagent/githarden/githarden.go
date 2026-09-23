@@ -98,15 +98,83 @@ func hardeningFlags(repoDir string) []string {
 
 		// core.fsmonitor names a command git runs on ordinary operations.
 		"-c", "core.fsmonitor=",
+
+		// -- transport class: which underlying connection mechanism git
+		// uses to reach a remote at all, closed by protocol.<name>.allow.
+		//
+		// Unlike filter.<driver>/merge.<driver> (the driver NAME is chosen
+		// by the repository's own .gitattributes -- an unbounded
+		// namespace no fixed -c key can reset) or remote.<name>.uploadpack/
+		// receivepack in its ssh/local-transport form (see this package's
+		// second doc comment for why that instantiation closes as a
+		// consequence of the allowlist below, not by a key of its own),
+		// every key here has a FIXED, enumerable name -- which is exactly
+		// what makes a -c override able to close it.
+		//
+		// sandbox-agent only ever legitimately speaks https:
+		// reposource.ValidateRepoURL (internal/domain/reposource) accepts
+		// nothing but an absolute "https://" URL, with a non-empty host,
+		// at session-config time -- every other scheme (including a bare
+		// local path, "ssh://", "git://", "ext::", "http://") is rejected
+		// before it ever reaches a git subprocess. This allowlist is not
+		// a guess at what SHOULD be permitted after that; it is exactly,
+		// and only, what this codebase's own clone/fetch/push/ls-remote
+		// call sites already use.
+		//
+		// protocol.allow alone is NOT sufficient: it is a DEFAULT policy
+		// for protocols with no policy of their own name
+		// (protocol.<name>.allow), so a repository-authored
+		// "protocol.ssh.allow = always" in the runtime-owned .git/config
+		// outranks a command-line "-c protocol.allow=never" entirely --
+		// verified directly against real git: the general fallback does
+		// NOT override a specific per-protocol policy set anywhere else.
+		// Every dangerous protocol is therefore named here explicitly, so
+		// the SAME key the runtime could set is the one this list resets
+		// on the command line, which command-line -c always wins for
+		// (verified: an explicit "-c protocol.file.allow=never" DOES
+		// override a repository-configured "protocol.file.allow=always").
+		"-c", "protocol.allow=never",
+		"-c", "protocol.https.allow=always",
+		"-c", "protocol.http.allow=never",
+		"-c", "protocol.file.allow=never",
+		"-c", "protocol.git.allow=never",
+		"-c", "protocol.ssh.allow=never",
+		"-c", "protocol.ext.allow=never",
+
+		// core.gitProxy names a command git runs (as "command host port")
+		// instead of connecting directly, but ONLY for the "git://" protocol
+		// -- already denied above by protocol.git.allow=never, which is what
+		// ACTUALLY closes this key: verified directly against real git that
+		// "-c core.gitProxy=none" (or an empty value) does NOT, on its own,
+		// override a repository-configured core.gitProxy. Unlike
+		// credential.helper, whose empty value is documented to discard
+		// every earlier entry, core.gitProxy is multi-valued with "first
+		// match wins" semantics and no reset behaviour of its own -- a
+		// file-sourced entry is consulted before anything the command line
+		// adds, so it wins regardless of what a later "-c core.gitProxy=..."
+		// says. Set anyway, harmlessly, as declared intent and defense in
+		// depth for the (today nonexistent) case where no repository-level
+		// value is present at all: "none" is git's own documented value for
+		// "use no proxy", applied with no trailing "for <domain>" so it
+		// matches every host git might ever try it against.
+		"-c", "core.gitProxy=none",
+
+		// http.proxy reroutes the one transport still permitted (https)
+		// through a proxy of the repository's choosing. Not a command by
+		// itself, but a redirection/exfiltration primitive for the
+		// surviving transport, neutralised the same way credential.helper
+		// is: an empty value overrides any repository- or environment-
+		// supplied proxy and forces a direct connection.
+		"-c", "http.proxy=",
 	}
 }
 
-// Three command classes are deliberately left off the list above, and NOT
-// because they are safe. Two adversarial audit rounds, both reproduced
-// against real git, established that none of the three can be closed by
-// anything this package does, and record why here so the gap cannot rot
-// into a comment nobody rechecks; see githarden_test.go for the
-// executable proof each class actually runs.
+// Three command classes were ONCE all left off the list above, and NOT
+// because they were safe. Two adversarial audit rounds, both reproduced
+// against real git, established that none of the three could be closed by
+// anything reachable through a fixed -c key -- and recorded why here so
+// the gap could not rot into a comment nobody rechecks; see
+// githarden_test.go for the executable proof each class actually runs.
 //
 //  1. filter.<driver>.clean/.smudge. A filter's driver name is chosen by
 //     the repository's own .gitattributes ("<path> filter=<anything>"),
@@ -114,7 +182,7 @@ func hardeningFlags(repoDir string) []string {
 //     once and cover every case: "-c filter.*.clean=" is not a wildcard
 //     to git, it names a literal, useless config section called "*".
 //     git documents no flag that disables the filter mechanism wholesale
-//     (gitattributes(5)).
+//     (gitattributes(5)). STILL OPEN.
 //
 //  2. merge.<driver>.driver. Same shape as (1) -- the driver name is
 //     chosen by the repository's own .gitattributes ("<path>
@@ -122,31 +190,42 @@ func hardeningFlags(repoDir string) []string {
 //     codebase actually runs: internal/sandboxagent/gitclone's syncOne
 //     runs `git stash pop --index` to restore a stashed working tree,
 //     which invokes the configured merge driver on conflict. Root in
-//     production (workspaceowner.go).
+//     production (workspaceowner.go). STILL OPEN.
 //
 //  3. remote.<name>.uploadpack / remote.<name>.receivepack. Unlike (1)
 //     and (2), this key has no attributes half at all to reason about --
 //     it lives only in .git/config, names a command git runs as the
 //     LOCAL side of the pack protocol, and fires deterministically, with
 //     no race, on a plain `git fetch` or `git push` against a remote
-//     configured with that key. Nothing in gitattributes(5) or a -c
-//     override touches it.
+//     configured with that key. NOW CLOSED, as a consequence rather than
+//     by a key of its own: this key is consulted only for a local
+//     ("file") or ssh transport (verified: it is inert over the smart-HTTP
+//     transport this codebase actually uses -- see
+//     TestArgs_RealHTTPSCloneAndFetchStillWork, githarden_test.go), and
+//     the transport-class hardening below denies both. See
+//     TestTransportClass_FileUploadPackNoLongerExecutes for the executable
+//     proof, and its own doc comment for why (1)/(2) do NOT get the same
+//     treatment: their driver NAME is repository-chosen and unbounded, so
+//     no fixed transport-style allowlist reaches them the way a fixed
+//     protocol name does here.
 //
-// A tempting answer for all three -- "the UID boundary (§30.5) already
+// A tempting answer for (1) and (2) -- "the UID boundary (§30.5) already
 // covers this, since a repository-authored command either runs as the
 // runtime already, or never runs at all" -- does not survive contact
 // with what §30.5 actually grants. The runtime owns .git BECAUSE of that
-// boundary, which makes writing any of the three keys above into
-// .git/config (and, for (1)/(2), a matching attribute into
-// .gitattributes) an ORDINARY, unprivileged act for it -- not a
-// violation of the boundary. The violation is what happens next:
-// sandbox-agent's OWN later git invocations against that SAME repository
-// -- gitclone's SyncAll reconciling an already-existing workspace exactly
-// like a repo_image/snapshot_restore boot presents one, its
-// CleanForImageBuild running `checkout -- .` at image-bake time, or any
-// plain fetch/push -- read that config back and run the planted command
-// AS SANDBOX-AGENT. Same shape as the pre-push-hook exploit this file's
-// own top comment documents, one call removed.
+// boundary, which makes writing either key above into .git/config (and a
+// matching attribute into .gitattributes) an ORDINARY, unprivileged act
+// for it -- not a violation of the boundary. The violation is what
+// happens next: sandbox-agent's OWN later git invocations against that
+// SAME repository -- gitclone's SyncAll reconciling an already-existing
+// workspace exactly like a repo_image/snapshot_restore boot presents one,
+// its CleanForImageBuild running `checkout -- .` at image-bake time, or
+// any plain fetch/push -- read that config back and run the planted
+// command AS SANDBOX-AGENT. Same shape as the pre-push-hook exploit this
+// file's own top comment documents, one call removed. The SAME reasoning
+// is why the transport class above could NOT be closed by relying on
+// §30.5 either -- it took a fixed, enumerable key set instead, which (1)
+// and (2) do not have.
 //
 // A first attempt at a mitigation for (1) alone -- writing "* -filter"
 // into $GIT_DIR/info/attributes, gitattributes(5)'s own highest-
@@ -155,23 +234,28 @@ func hardeningFlags(repoDir string) []string {
 // file it wrote into lives inside the same runtime-owned directory the
 // attack starts from, so the runtime can delete or replace it between
 // the write and git's read (0 of 60 racing trials blocked in
-// measurement); it addressed only (1), leaving (2) and (3) untouched;
-// and reaching it required a root-privileged os.WriteFile into a
-// directory an attacker controls, which is itself a primitive an
-// attacker could redirect (via a symlink planted at the parent
-// directory) into truncating an arbitrary file on the host. A mitigation
-// that adds a root-privileged write into an attacker-owned directory,
-// for a race it cannot win, is net-negative -- worse than doing nothing.
+// measurement); it addressed only (1), leaving (2) and (3) untouched (at
+// the time -- (3) closed later, by the transport class, not by this
+// mitigation or anything like it); and reaching it required a
+// root-privileged os.WriteFile into a directory an attacker controls,
+// which is itself a primitive an attacker could redirect (via a symlink
+// planted at the parent directory) into truncating an arbitrary file on
+// the host. A mitigation that adds a root-privileged write into an
+// attacker-owned directory, for a race it cannot win, is net-negative --
+// worse than doing nothing.
 //
-// CONCLUSION: none of these three classes is closed by anything in this
-// package, or closable by any flag, attributes override, or file written
-// into .git from a process that does not itself own .git. The only real
-// remedy is structural: sandbox-agent must stop running git against a
-// .git directory the sandbox runtime owns (filed as a follow-up plan
-// row; find it by its own citation, never by a Step number -- Step
-// numbers do not belong in this source per this codebase's own
-// convention). Until that lands, this is a recorded, accepted gap, not a
-// fixed one.
+// CONCLUSION: (1) and (2) remain open, closed by nothing in this package
+// or closable by any flag, attributes override, or file written into
+// .git from a process that does not itself own .git. The only real
+// remedy for those two is structural: sandbox-agent must stop running
+// git against a .git directory the sandbox runtime owns (filed as a
+// follow-up plan row; find it by its own citation, never by a Step
+// number -- Step numbers do not belong in this source per this
+// codebase's own convention). Until that lands, they are a recorded,
+// accepted gap, not a fixed one. (3) is the one exception: it is fixed,
+// by the transport-class hardening above, precisely because -- unlike
+// (1) and (2) -- it never had an unbounded, repository-chosen namespace
+// to hide in.
 //
 // The trade-off a real fix would still need, decided here rather than
 // left to be discovered by a user with a checkout full of pointer files:
