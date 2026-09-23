@@ -19,6 +19,7 @@ import (
 	"github.com/narvidev/narvi/internal/domain/sandboxboot"
 	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/internal/sandboxagent/boot"
+	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
 	"github.com/narvidev/narvi/internal/sandboxagent/services"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
@@ -93,6 +94,11 @@ func runBootSequenceRepoImage(t *testing.T, workspaceDir string, branch *string)
 		BootMode:           sandboxboot.BootModeRepoImage,
 		WorkspaceDir:       workspaceDir,
 		CredentialCacheDir: t.TempDir(),
+		// Step 171 (§30.5): see bootsequence_cleanbuild_integration_test.go's
+		// identical comment -- gitclone.SyncAll's own real lchown needs a
+		// self-uid/gid Credential to run unprivileged.
+		RuntimeUID: uint32(os.Getuid()),
+		RuntimeGID: uint32(os.Getgid()),
 		SessionConfig: &sessionconfig.SessionConfig{
 			BootMode:          sessionconfig.SessionConfigBootModeRepoImage,
 			ControlPlaneWsUrl: "wss://unused.invalid/ws",
@@ -115,7 +121,7 @@ func runBootSequenceRepoImage(t *testing.T, workspaceDir string, branch *string)
 	noopCheckoutTiming := func(string, float64, bool) {}
 	noopHookTiming := func(string, string, string, bool, bool, float64) {}
 
-	return runBootSequence(ctx, sup, cfg, platform.DefaultTimeouts(), nil, nil, noopProgress, noopGitSync, noopFetchTiming, noopCheckoutTiming, noopHookTiming)
+	return runBootSequence(ctx, sup, cfg, gitdir.Layout{Root: t.TempDir(), WorkspaceDir: cfg.WorkspaceDir}, nil, platform.DefaultTimeouts(), nil, nil, noopProgress, noopGitSync, noopFetchTiming, noopCheckoutTiming, noopHookTiming)
 }
 
 // TestResilienceScenario_FetchFailBoot_InventedBranch_DegradesAndBootSucceeds

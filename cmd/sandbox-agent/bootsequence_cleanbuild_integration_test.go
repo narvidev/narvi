@@ -34,6 +34,7 @@ import (
 	"github.com/narvidev/narvi/internal/domain/sandboxboot"
 	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/internal/sandboxagent/boot"
+	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
 	"github.com/narvidev/narvi/internal/sandboxagent/credentials"
 	"github.com/narvidev/narvi/internal/sandboxagent/services"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
@@ -117,6 +118,15 @@ func runBootSequenceForModeWithCredentialCacheDir(t *testing.T, mode sandboxboot
 		BootMode:           mode,
 		WorkspaceDir:       workspaceDir,
 		CredentialCacheDir: credentialCacheDir,
+		// Step 171 (§30.5): CloneAll now re-owns each repo's own worktree
+		// for the runtime (boot.ChownWorkspaceForRuntime) immediately after
+		// seeding its agent git-dir, a real lchown that requires
+		// CAP_CHOWN/root unless the target uid/gid is THIS test process's
+		// own -- exactly the same "self" escape hatch push_integration_test.
+		// go's own runSandboxAgent already documents for the identical
+		// reason.
+		RuntimeUID: uint32(os.Getuid()),
+		RuntimeGID: uint32(os.Getgid()),
 		SessionConfig: &sessionconfig.SessionConfig{
 			BootMode:          sessionconfig.SessionConfigBootMode(mode),
 			ControlPlaneWsUrl: "wss://unused.invalid/ws",
@@ -139,7 +149,7 @@ func runBootSequenceForModeWithCredentialCacheDir(t *testing.T, mode sandboxboot
 	noopCheckoutTiming := func(string, float64, bool) {}
 	noopHookTiming := func(string, string, string, bool, bool, float64) {}
 
-	bootErr = runBootSequence(ctx, sup, cfg, platform.DefaultTimeouts(), nil, nil, noopProgress, noopGitSync, noopFetchTiming, noopCheckoutTiming, noopHookTiming)
+	bootErr = runBootSequence(ctx, sup, cfg, gitdir.Layout{Root: t.TempDir(), WorkspaceDir: cfg.WorkspaceDir}, nil, platform.DefaultTimeouts(), nil, nil, noopProgress, noopGitSync, noopFetchTiming, noopCheckoutTiming, noopHookTiming)
 	return workspaceDir, bootErr
 }
 
