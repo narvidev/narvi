@@ -69,4 +69,25 @@
 // guidedrift_test.go wires TestNoGuideDrift into the exact same `go test
 // ./...` path TestNoMetricDrift already uses — one CI-enforced guard, not
 // two, over two structurally identical hazards.
+//
+// # The omission direction (§10-P6)
+//
+// Everything above catches a guide LYING about a route. It cannot catch a
+// guide staying silent about one the code actually implements — the
+// realistic failure, since shipping a capability and updating its guide
+// are two separate acts. guideomission.go closes that half:
+// RouteGuideExemptions is the explicit, code-reviewed register of routes
+// deliberately outside every guide (a webhook receiver, an infrastructure
+// endpoint, or sandbox-agent-only bearer-token plumbing), each with a
+// reason CheckGuideDrift itself validates (non-empty, past a length floor,
+// not one of a short denylist of stock non-answers) before ever letting it
+// count. CheckGuideDrift then requires every route ScanRegisteredRoutes
+// finds to be either documented in a guide or named in that register —
+// and separately fails a register entry that is stale (names a route that
+// no longer exists), a wildcard (this package implements no
+// pattern-matching lookup anywhere), or a contradiction (a route claimed
+// both absent from and present in the guides at once). See docs/guides/
+// README.md's own "Two rules, both enforced now" section for the full
+// account of what is and is not mechanically enforceable about a reason's
+// truth.
 package ops
