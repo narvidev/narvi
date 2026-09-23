@@ -125,15 +125,9 @@ var (
 )
 
 // ValidateName reports whether name is an acceptable sandbox_secrets env-
-// var name, per §27.1's own fail-closed rule: POSIX env-var shape, not in
-// the reserved NARVI_* namespace, not in the reserved OPENCODE_* namespace
-// (adversarial-review CRITICAL fix -- see OpenCodeReservedPrefix's own doc
-// comment), not one of the names providercredential.EnvVarNames already
-// owns, not one of §27.4's own §27.3 cloud-identity names
-// (cloudidentity.ReservedEnvVarNames), and not §27.4's own KUBECONFIG
-// (clusterbinding.ReservedEnvVarNames) -- the SAME "one owning mechanism
-// per env-var name" rule extended to this Step's own two injected
-// surfaces. Returns nil when name is acceptable. Pure -- no I/O, no
+// var name, per §27.1's own fail-closed rule: POSIX env-var shape, plus
+// ValidateNotReserved's own "one owning mechanism per env-var name" rule
+// (below). Returns nil when name is acceptable. Pure -- no I/O, no
 // time.Now(), no randomness (CLAUDE.md §11) -- this only inspects name
 // itself; it says nothing about whether name already has a row at some
 // OTHER (scope, scopeTargetID) pair (a Postgres UNIQUE-index concern, not
@@ -148,6 +142,35 @@ func ValidateName(name string) error {
 	if !posixEnvVarNamePattern.MatchString(name) {
 		return fmt.Errorf("%w: %q", ErrNameShape, name)
 	}
+	return ValidateNotReserved(name)
+}
+
+// ValidateNotReserved reports whether name collides with a namespace or
+// exact name another injection mechanism already owns: the reserved
+// NARVI_* namespace, the reserved OPENCODE_* namespace (adversarial-review
+// CRITICAL fix -- see OpenCodeReservedPrefix's own doc comment), one of
+// the names providercredential.EnvVarNames already owns, one of §27.4's
+// own §27.3 cloud-identity names (cloudidentity.ReservedEnvVarNames), or
+// §27.4's own KUBECONFIG (clusterbinding.ReservedEnvVarNames) -- the "one
+// owning mechanism per env-var name" rule §27.1 established for this
+// package's own sandbox_secrets rows.
+//
+// Factored out of ValidateName (which still runs this AND its own POSIX-
+// shape check together, unchanged) specifically so automation.
+// ValidateEnvVars (§8 item 4's own "automation env vars reach the
+// process, not just the prompt") can reuse this EXACT reservation logic
+// without also inheriting ValidateName's own stricter uppercase-only shape
+// rule -- automations.env_vars has never required that shape (isValidEnvVarName,
+// internal/domain/automation/envvar.go, accepts lowercase, matching every
+// automation env var saved before this reuse existed), and reservation
+// collision-safety does not depend on it: every reserved name/prefix this
+// function checks is itself always uppercase, so a lowercase candidate can
+// never collide with one regardless (env var names are compared
+// case-sensitively, both here and in the process environment they end up
+// in). One shared definition of "already owned by another mechanism" for
+// both callers, never two independently maintained copies that could
+// drift apart.
+func ValidateNotReserved(name string) error {
 	if strings.HasPrefix(name, narviReservedPrefix) {
 		return fmt.Errorf("%w: %q", ErrNameReservedNarviNamespace, name)
 	}

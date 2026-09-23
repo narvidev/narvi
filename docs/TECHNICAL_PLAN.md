@@ -2473,6 +2473,24 @@ sandbox_secrets(id, scope sandbox_secret_scope ENUM('automation','environment','
   never logged. The residual risk that an agent *writes* a secret value into code it then pushes
   is shared with every secrets mechanism in every CI system; output redaction is possible future
   work, not claimed here.
+- **A third source landed on this same injection path** (§8 item 4, "automation env vars reach
+  the process, not just the prompt"): `automations.env_vars` — plain, non-secret config a
+  maintainer typed, distinct from this section's own `sandbox_secrets` table — is now ALSO
+  threaded into `opencodeproc.Spawn`'s `sandboxSecretEnv` parameter, prepended to the FRONT of
+  the map/slice this section's own two sources already build, by `cmd/sandbox-agent`'s own
+  `fetchAutomationEnvVars` (mirroring `fetchSandboxSecrets`' identical bounded-retry/warn-and-
+  continue posture, delivered over its own sibling sandbox-facing endpoint, `POST
+  /sessions/{id}/automation-env-vars`). The recorded order, and why, is now three deep, least-
+  trusted first: automation env vars (plain config, never RBAC-gated the elevated way this
+  section's own secrets are) → `sandbox_secrets`/`OPENCODE_CONFIG`/cloud-identity/kubeconfig
+  (this section, an operator-configured secret) → `providerCredentialEnv` (§25.1/§25.3, the
+  credential `opencode serve` itself needs to authenticate at all). A later, more-trusted append
+  always wins on a name collision (`exec.Cmd`'s own documented Env semantics) — a provider-
+  credential collision is structurally impossible (`ValidateEnvVars` reuses this section's own
+  `sandboxsecret.ValidateNotReserved` disjoint-name rule at automation-creation time), but a
+  `sandbox_secrets` collision is reachable, and resolves in `sandbox_secrets`' favor: an
+  operator-managed secret outranks plain config a maintainer typed. The prompt preamble
+  (`buildRunPrompt`) is unchanged and keeps running alongside this — the two are not exclusive.
 
 ### 27.2 OpenCode config storage + injection
 

@@ -135,6 +135,41 @@ func (q *Queries) CreateAutomationRunIfAbsent(ctx context.Context, arg CreateAut
 	return i, err
 }
 
+const getAutomationEnvVarsForSession = `-- name: GetAutomationEnvVarsForSession :one
+SELECT automations.env_vars
+FROM automation_runs
+JOIN automations ON automations.id = automation_runs.automation_id
+WHERE automation_runs.session_id = $1
+ORDER BY automation_runs.created_at
+LIMIT 1
+`
+
+// §8 item 4's own "automation env vars reach the process, not just the
+// prompt": resolves the env_vars a session's own automation_runs row (at
+// most one -- app/automation's own fanout.go creates exactly one session
+// per run, and an ordinary web/Slack/Linear/GitHub-created session is
+// never referenced by any automation_runs row at all) points at, by
+// joining through to that run's parent automations row. Reads the CURRENT
+// env_vars column, not a snapshot frozen at run creation the way
+// buildRunPrompt's own preamble text is (internal/app/automation/
+// settings.go) -- this mirrors provider credentials/sandbox secrets,
+// which are ALSO re-resolved fresh at every spawn/respawn, never frozen.
+// pgx.ErrNoRows means no automation_runs row references this session at
+// all -- the overwhelming common case (any non-automation session) -- the
+// caller (httpapi's own AutomationEnvVarsDelivery, mirroring sandbox-
+// secrets/provider-credentials' own "absent means nothing configured"
+// contract) treats that identically to "zero env vars configured".
+// LIMIT 1/ORDER BY is a defensive tie-break only: automation_runs carries
+// no UNIQUE constraint on session_id, but nothing in this codebase ever
+// creates two runs for the same session, so this never actually
+// disambiguates a real row today.
+func (q *Queries) GetAutomationEnvVarsForSession(ctx context.Context, sessionID pgtype.UUID) ([]byte, error) {
+	row := q.db.QueryRow(ctx, getAutomationEnvVarsForSession, sessionID)
+	var env_vars []byte
+	err := row.Scan(&env_vars)
+	return env_vars, err
+}
+
 const getAutomationRun = `-- name: GetAutomationRun :one
 SELECT id, invocation_id, automation_id, target, session_id, status, started_at, running_at, completed_at, created_at FROM automation_runs
 WHERE id = $1

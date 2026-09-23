@@ -65,13 +65,49 @@ type Result struct {
 // own resolved general sandbox_secrets rows, plus (when an environment
 // OpenCode config document exists) a single OPENCODE_CONFIG entry pointing
 // at the file cmd/sandbox-agent's own applyOpenCodeConfig already wrote to
-// disk. Appended BEFORE providerCredentialEnv (§27.1's own explicit
-// ordering: "appended before providerCredentialEnv, so the ordering
-// question is moot anyway given the disjoint-name rule" --
-// internal/domain/sandboxsecret.ValidateName rejects every name
-// providercredential.AllEnvVarNames or this package's own OPENCODE_*
-// reservation already owns, so the two slices can never actually collide;
-// the ordering is honored anyway, matching the spec exactly).
+// disk, plus (§8 item 4, "automation env vars reach the process, not
+// just the prompt") this session's own resolved automation env vars,
+// PREPENDED to the front of this SAME slice by the caller (main.go, run())
+// before the sandbox_secrets/OPENCODE_CONFIG/cloud-identity/kubeconfig
+// entries above are appended on top of them -- a third source folded into
+// this EXISTING parameter, not a new one. Appended BEFORE
+// providerCredentialEnv (§27.1's own explicit ordering: "appended before
+// providerCredentialEnv, so the ordering question is moot anyway given the
+// disjoint-name rule" -- internal/domain/sandboxsecret.ValidateName
+// rejects every name providercredential.AllEnvVarNames or this package's
+// own OPENCODE_* reservation already owns, so the two slices can never
+// actually collide; the ordering is honored anyway, matching the spec
+// exactly).
+//
+// # The recorded three-way order, and why
+//
+// Least-trusted first, most-trusted last (a later entry for the same name
+// always wins, exec.Cmd's own documented Env semantics):
+//
+//  1. automation env vars (§8 item 4) -- "plain config a maintainer
+//     typed" (internal/domain/automation's own doc.go), never RBAC-gated
+//     the elevated way #2/#3 below are; automations.env_vars is explicitly
+//     documented non-secret.
+//  2. sandbox_secrets/OPENCODE_CONFIG/cloud-identity/kubeconfig (this
+//     parameter's own pre-existing contents, §27.1) -- "a secret the
+//     operator configured" (ActionManageRepoSecrets/ActionManageEnv
+//     Secrets/ActionManageGlobalSecrets), encrypted at rest.
+//  3. providerCredentialEnv (§25.1/§25.3, below) -- the single credential
+//     `opencode serve` itself needs to authenticate at all; the most
+//     operationally load-bearing of the three, so it wins over either of
+//     the other two on a name collision.
+//
+// A collision between #1 and #3 is structurally impossible --
+// internal/domain/automation.ValidateEnvVars already rejects, at
+// CreateAutomation's own write path, any name providercredential.
+// AllEnvVarNames/cloudidentity.ReservedEnvVarNames/clusterbinding.
+// ReservedEnvVarNames/the NARVI_*/OPENCODE_* namespaces already own (reuses
+// sandboxsecret.ValidateNotReserved, the SAME check ValidateName itself
+// runs). A collision between #1 and #2 IS reachable (sandbox_secrets has
+// no equivalent reservation against an ARBITRARY automation-chosen name,
+// only against the names #3 and the cloud-identity/kubeconfig mechanisms
+// already own) -- #2 wins, matching "an operator-managed secret outranks
+// plain config a maintainer typed".
 //
 // This parameter is this Step's OWN fix for a HIGH-severity finding: the
 // original implementation instead os.Setenv'd every resolved secret onto

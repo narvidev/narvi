@@ -1194,6 +1194,15 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	router.Post("/sessions/{sessionID}/opencode-config",
 		httpapi.OpenCodeConfigDelivery(sessionStore, sandboxStore, openCodeConfigStore))
 
+	// automation-env-vars ("automation env vars reach the process,
+	// not just the prompt", §8 item 4): deliberately mounted OUTSIDE
+	// /api/sessions and outside auth.Middleware entirely, mirroring
+	// sandbox-secrets/opencode-config immediately above VERBATIM (see
+	// httpapi/automationenvvarsdelivery.go's own doc comment) -- another
+	// sandbox-bearer-token-authenticated route, not a browser-facing one.
+	router.Post("/sessions/{sessionID}/automation-env-vars",
+		httpapi.AutomationEnvVarsDelivery(sandboxStore, automationRunStore))
+
 	// cloud-identity-token ("cloud identity: OIDC issuer,
 	// bindings, minting", §27.3): deliberately mounted OUTSIDE
 	// /api/sessions and outside auth.Middleware entirely, mirroring

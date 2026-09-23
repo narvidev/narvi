@@ -3,6 +3,8 @@ package automation
 import (
 	"errors"
 	"fmt"
+
+	"github.com/narvidev/narvi/internal/domain/sandboxsecret"
 )
 
 // EnvVar is one entry of §8.4's own "per-automation env vars" -- PLAIN
@@ -46,6 +48,19 @@ var (
 	// the dispatched turn's own environment), so rejected outright rather
 	// than silently letting the last one win.
 	ErrDuplicateEnvVarName = errors.New("automation: duplicate env var name")
+	// ErrReservedEnvVarName means an EnvVar's own Name collides with a
+	// namespace or exact name another injection mechanism already owns --
+	// checked because this Step threads automation env vars into cmd.Env
+	// alongside provider credentials (§25.1/§25.3) and sandbox secrets
+	// (§27.1), the SAME reserved-name/prefix set that already governs
+	// those two paths (sandboxsecret.ValidateNotReserved, reused here
+	// rather than a second, independently maintained list that could
+	// drift from it). Wraps the specific sandboxsecret sentinel
+	// (ErrNameReservedNarviNamespace/ErrNameReservedOpenCodeNamespace/
+	// ErrNameReservedProviderCredential/ErrNameReservedCloudIdentity/
+	// ErrNameReservedClusterBinding) so a caller can branch on either the
+	// generic automation-level reason or the specific underlying one.
+	ErrReservedEnvVarName = errors.New("automation: env var name is reserved by another injection mechanism")
 )
 
 // InvalidEnvVarError reports a single candidate EnvVar ValidateEnvVars
@@ -54,8 +69,9 @@ var (
 type InvalidEnvVarError struct {
 	// Name is the offending EnvVar's own Name, verbatim.
 	Name string
-	// Reason is one of ErrEmptyEnvVarName, ErrInvalidEnvVarName, or
-	// ErrDuplicateEnvVarName -- the base sentinel this error unwraps to.
+	// Reason is one of ErrEmptyEnvVarName, ErrInvalidEnvVarName,
+	// ErrReservedEnvVarName, or ErrDuplicateEnvVarName -- the base
+	// sentinel this error unwraps to.
 	Reason error
 }
 
@@ -91,10 +107,37 @@ func isValidEnvVarName(name string) bool {
 
 // ValidateEnvVars validates a candidate []EnvVar list before it is accepted
 // onto an automation, at creation/update time: at most MaxEnvVars entries,
-// each with a non-empty, syntactically valid Name, and no two entries
-// sharing the same Name. Returns the first problem found (and stops) --
-// same "first error wins, no accumulation" convention as
-// environment.ValidatePathScope.
+// each with a non-empty, syntactically valid Name not reserved by another
+// injection mechanism, and no two entries sharing the same Name. Returns
+// the first problem found (and stops) -- same "first error wins, no
+// accumulation" convention as environment.ValidatePathScope.
+//
+// The reservation check (sandboxsecret.ValidateNotReserved) is this
+// Step's own addition: once an automation's env_vars are threaded into
+// cmd.Env alongside provider credentials/sandbox secrets, a name this
+// package previously accepted (e.g. "ANTHROPIC_API_KEY" or "KUBECONFIG")
+// would silently shadow -- or be shadowed by -- a mechanism that name
+// already belongs to, rather than merely sitting unused in a prompt
+// preamble. This is a fail-CLOSED check at the one write path automation
+// env vars have (CreateAutomation, internal/adapters/inbound/httpapi/
+// automations.go) -- unlike sandbox_secrets, automations have no separate
+// UPDATE route yet and no second write path to re-validate at (contrast
+// fetchSandboxSecrets' own defense-in-depth re-validation, cmd/sandbox-
+// agent/sandboxsecrets.go), so this single check is the only fence.
+//
+// Deliberately does NOT also reject PATH/HOME the way this package's
+// caller (cmd/sandbox-agent) could still be handed an automation env var
+// named either: mirrors sandboxsecret.ValidateName's own identical,
+// already-shipped position (name.go: neither is in the reserved set
+// there either) -- for the SAME reason. A value threaded via
+// opencodeproc.Spawn's own sandboxSecretEnv parameter (which this Step's
+// automation env vars are folded into, cmd/sandbox-agent/main.go) only
+// ever reaches the spawned opencode process's own cmd.Env, NEVER
+// sandbox-agent's own os.Setenv'd process environment (see that
+// parameter's own doc comment for the incident this architecture
+// structurally prevents) -- so a PATH/HOME collision here is contained to
+// a maintainer's own automation misconfiguring its own session's agent
+// process, never a hazard to sandbox-agent itself.
 func ValidateEnvVars(vars []EnvVar) error {
 	if len(vars) > MaxEnvVars {
 		return ErrTooManyEnvVars
@@ -106,6 +149,9 @@ func ValidateEnvVars(vars []EnvVar) error {
 		}
 		if !isValidEnvVarName(v.Name) {
 			return &InvalidEnvVarError{Name: v.Name, Reason: ErrInvalidEnvVarName}
+		}
+		if err := sandboxsecret.ValidateNotReserved(v.Name); err != nil {
+			return &InvalidEnvVarError{Name: v.Name, Reason: fmt.Errorf("%w: %w", ErrReservedEnvVarName, err)}
 		}
 		if _, dup := seen[v.Name]; dup {
 			return &InvalidEnvVarError{Name: v.Name, Reason: ErrDuplicateEnvVarName}

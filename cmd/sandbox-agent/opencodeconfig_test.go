@@ -31,6 +31,11 @@ func testTimeouts() platform.Timeouts {
 		OpenCodeConfigFetchMaxAttempts:    1,
 		OpenCodeConfigFetchRetryBaseDelay: 1,
 		OpenCodeConfigFetchRetryMaxDelay:  1,
+
+		AutomationEnvVarFetchTimeout:        testSandboxSecretsFetchTimeout,
+		AutomationEnvVarFetchMaxAttempts:    1,
+		AutomationEnvVarFetchRetryBaseDelay: 1,
+		AutomationEnvVarFetchRetryMaxDelay:  1,
 	}
 }
 

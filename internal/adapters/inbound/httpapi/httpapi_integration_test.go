@@ -965,6 +965,11 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 	})
 	router.Post("/sessions/{sessionID}/sandbox-secrets",
 		httpapi.SandboxSecretsDelivery(rig.sessions, rig.sandboxes, rig.sandboxSecrets, rig.tokenEncryptionKey))
+	// automation-env-vars delivery (§8 item 4) -- mounted exactly like
+	// cmd/control-plane/main.go's own wiring (see
+	// automationenvvarsdelivery.go's own doc comment).
+	router.Post("/sessions/{sessionID}/automation-env-vars",
+		httpapi.AutomationEnvVarsDelivery(rig.sandboxes, rig.automationRuns))
 	// /api/environments/{environmentID}/cloud-identity-bindings,
 	// /api/cloud-identity-bindings, /api/cloud-identity/signing-keys/rotate,
 	// and the sandbox-facing minting route ("cloud identity:
