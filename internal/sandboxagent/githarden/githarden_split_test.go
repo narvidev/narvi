@@ -204,8 +204,25 @@ func TestClosedClass_StashPopIndexDoesNotExecuteEither(t *testing.T) {
 	gitInRepo(t, repo.WorkTree, "commit", "-qam", "head moved on")
 
 	popOut, popErr := hardenedGit(t, repo, "stash", "pop", "--index")
-	if !strings.Contains(popOut, "f.txt") && popErr == nil {
-		t.Fatalf("precondition unclear: stash pop did not appear to touch f.txt at all\n%s", popOut)
+	// Precondition: git must actually have attempted a three-way merge of
+	// the armed path -- UNCONDITIONALLY, exactly like the sibling
+	// TestClosedClass_MergeDriverDoesNotExecute's own precondition just
+	// above, not only "when popErr == nil".
+	//
+	// (Correction, review): the original condition here was
+	// `!strings.Contains(popOut, "f.txt") && popErr == nil`, which SKIPS
+	// the check entirely whenever popErr is non-nil -- and a pop that
+	// fails BEFORE ever reaching the merge (e.g. Seed sharing "logs" but
+	// not "refs/stash" correctly, or any other regression that makes
+	// `refs/stash@{0}` fail to resolve at all) also returns a non-nil
+	// popErr. That let the marker-absent check below report the
+	// merge-driver class "closed" even when the merge was never
+	// reachable at all -- reproduced directly: dropping the "logs" entry
+	// from gitdir.sharedEntries makes this pop fail with "refs/stash@{0}
+	// is not a valid reference" BEFORE any merge, yet the old condition
+	// still let the test pass.
+	if !strings.Contains(popOut, "f.txt") {
+		t.Fatalf("precondition failed: git never attempted a three-way merge of the armed path.\ngit stash pop said: %v\n%s", popErr, popOut)
 	}
 
 	if _, statErr := os.Stat(marker); statErr == nil {
