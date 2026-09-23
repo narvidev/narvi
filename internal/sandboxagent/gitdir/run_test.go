@@ -1,10 +1,12 @@
 package gitdir_test
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -157,6 +159,71 @@ func TestSessionConfigEnvVar_MatchesBoot(t *testing.T) {
 	want := boot.SessionConfigEnvVar
 	if got != want {
 		t.Fatalf("gitdir's own duplicated sessionConfigEnvVar = %q, want %q (boot.SessionConfigEnvVar) -- these must never drift, see run.go's own doc comment", got, want)
+	}
+}
+
+// TestRun_SyncsAgentHeadInBeforeEverySpawn pins Run's own SyncHeadIn
+// bracket (run.go, at the top of Run, BEFORE the spawn): nothing else in
+// the suite moves the RUNTIME's own HEAD between a Seed call and a later
+// Run call, so every other test's agent-owned HEAD happens to already be
+// correct from Seed's own one-time SyncHeadIn -- which would stay true
+// even if Run's own bracket were deleted outright. This test does what no
+// other one does: seed once, then have the RUNTIME switch to a new
+// branch and commit (exactly what the coding agent does mid-session),
+// THEN call Run -- proving the agent-owned HEAD Run's spawn actually
+// operates against reflects that switch, not the stale branch Seed saw.
+//
+// Mirrors headSHA's own exact spec shape in cmd/sandbox-agent/main.go
+// (githarden.Args(repo, "rev-parse", "HEAD") through gitdir.Run), so a
+// regression here is the exact regression that function would suffer in
+// production: a push of a freshly-created branch would report the
+// PREVIOUS branch's SHA as the pushed head.
+func TestRun_SyncsAgentHeadInBeforeEverySpawn(t *testing.T) {
+	base := t.TempDir()
+	workspaceDir := filepath.Join(base, "workspace")
+	wt := filepath.Join(workspaceDir, "repo1")
+	initRunTestRepo(t, wt)
+
+	gitDirRoot := filepath.Join(base, "gitdirs")
+	if err := gitdir.EnsureRoot(gitDirRoot); err != nil {
+		t.Fatalf("gitdir.EnsureRoot: %v", err)
+	}
+	layout := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}
+	repo := layout.Repo("repo1")
+	sup := supervisor.New()
+	ctx := context.Background()
+
+	if err := gitdir.Seed(ctx, sup, repo, "https://example.invalid/repo1.git", nil, 10*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("gitdir.Seed: %v", err)
+	}
+
+	// The RUNTIME switches to a new branch and commits -- exactly what the
+	// coding agent does mid-session -- entirely AFTER Seed's own one-time
+	// SyncHeadIn already ran, so the agent-owned HEAD Seed left behind
+	// still points at "main".
+	runGitForRunTest(t, wt, "checkout", "-q", "-b", "feat")
+	if err := os.WriteFile(filepath.Join(wt, "feat.txt"), []byte("feat\n"), 0o644); err != nil {
+		t.Fatalf("write feat.txt: %v", err)
+	}
+	runGitForRunTest(t, wt, "add", ".")
+	runGitForRunTest(t, wt, "commit", "-qm", "feat commit")
+
+	wantSHA, err := exec.Command("git", "-C", wt, "rev-parse", "HEAD").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git -C %s rev-parse HEAD: %v\n%s", wt, err, wantSHA)
+	}
+
+	var stdout bytes.Buffer
+	spec := supervisor.Spec{Path: "git", Args: githarden.Args(repo, "rev-parse", "HEAD"), Stdout: &stdout}
+	if _, err := gitdir.Run(ctx, sup, repo, nil, spec, 10*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("Run() rev-parse HEAD: unexpected error: %v", err)
+	}
+
+	got := strings.TrimSpace(stdout.String())
+	want := strings.TrimSpace(string(wantSHA))
+	if got != want {
+		t.Fatalf("Run()'s rev-parse HEAD = %q, want %q (the runtime's own \"feat\" head) -- "+
+			"the agent-owned HEAD Run spawned against was stale, still pointing at \"main\"", got, want)
 	}
 }
 
