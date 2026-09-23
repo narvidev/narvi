@@ -99,11 +99,30 @@ func SyncHeadIn(repo githarden.Repo) error {
 
 // validHeadContents reports whether data is exactly one of the two shapes
 // SyncHeadIn accepts. See its own doc comment.
+//
+// The branch name is checked TWICE, against two DIFFERENT rules, and both
+// must pass: reposource.ValidateBranch (this codebase's own general
+// argument-injection guard -- empty/leading-dash/control-chars only,
+// deliberately permissive about "." otherwise, since it exists to keep a
+// session-supplied branch name from being misread as a git command-line
+// flag, not to fully validate git's own refname grammar) is NOT sufficient
+// on its own here: it accepts a name containing "..", which git's OWN
+// check-ref-format rules forbid ANYWHERE in a refname (git-check-ref-
+// format(1): "They cannot have two consecutive dots .. anywhere"). A
+// runtime-planted "ref: refs/heads/../x\n" is exactly the shape that rule
+// exists to catch -- rejected here explicitly, independent of whatever a
+// later git invocation resolving this same HEAD would separately do with
+// it, since this package's own posture is "validate before trusting a
+// runtime-authored value," never "assume a downstream git call will also
+// catch it."
 func validHeadContents(data []byte) bool {
 	s := string(data)
 	if rest, ok := strings.CutPrefix(s, "ref: refs/heads/"); ok {
 		name, ok := strings.CutSuffix(rest, "\n")
 		if !ok || strings.Contains(name, "\n") {
+			return false
+		}
+		if strings.Contains(name, "..") {
 			return false
 		}
 		return reposource.ValidateBranch(name) == nil
