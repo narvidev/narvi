@@ -642,3 +642,72 @@ func TestLoad_GitDirRootValidation_TableCases(t *testing.T) {
 		})
 	}
 }
+
+// TestLoad_WorkspaceDirRejectsRelativePath proves a non-absolute
+// NARVI_WORKSPACE_DIR is refused fail-fast, mirroring
+// TestLoad_GitDirRootRejectsRelativePath's own identical proof for
+// NARVI_GIT_DIR_ROOT. Round-2 review (R5): before this check existed,
+// GitDirRoot's own filepath.IsAbs check had no WorkspaceDir counterpart,
+// so isPathUnderOrEqual's underlying filepath.Rel calls could receive one
+// absolute and one relative operand -- see InvalidWorkspaceDirError's own
+// doc comment for the fail-open consequence that had.
+func TestLoad_WorkspaceDirRejectsRelativePath(t *testing.T) {
+	t.Setenv("NARVI_BOOT_MODE", "fresh")
+	t.Setenv("NARVI_WORKSPACE_DIR", "relative/workspace")
+
+	_, err := boot.Load()
+	if err == nil {
+		t.Fatal("Load() error = nil, want *boot.InvalidWorkspaceDirError for a relative NARVI_WORKSPACE_DIR")
+	}
+	var invalidErr *boot.InvalidWorkspaceDirError
+	if !errors.As(err, &invalidErr) {
+		t.Fatalf("Load() error = %v (%T), want *boot.InvalidWorkspaceDirError", err, err)
+	}
+}
+
+// TestLoad_GitDirRootValidation_RelativeWorkspaceDirTableCases reproduces
+// R2's own concrete bypass cases directly: before the fix, a relative
+// WorkspaceDir made filepath.Rel error in BOTH directions at once, so
+// isPathUnderOrEqual (fail-open on that error) returned false for both
+// validateGitDirRoot checks, silently accepting a configuration where a
+// session repo could resolve GitDir onto WorkspaceDir itself.
+func TestLoad_GitDirRootValidation_RelativeWorkspaceDirTableCases(t *testing.T) {
+	tests := []struct {
+		name         string
+		workspaceDir string
+		gitDirRoot   string
+	}{
+		{
+			// The finding's own first repro: GitDirRoot is WorkspaceDir's
+			// (relative) parent -- a session repo named "workspace" would
+			// resolve GitDir onto WorkspaceDir itself.
+			name:         "relative workspace, root is its parent",
+			workspaceDir: "srv/narvi/workspace",
+			gitDirRoot:   "/srv/narvi",
+		},
+		{
+			// The finding's own second repro: GitDirRoot nested under a
+			// relative WorkspaceDir.
+			name:         "relative workspace, root nested under it",
+			workspaceDir: "srv/narvi/workspace",
+			gitDirRoot:   "/srv/narvi/workspace/x",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("NARVI_BOOT_MODE", "fresh")
+			t.Setenv("NARVI_WORKSPACE_DIR", tc.workspaceDir)
+			t.Setenv("NARVI_GIT_DIR_ROOT", tc.gitDirRoot)
+
+			_, err := boot.Load()
+			if err == nil {
+				t.Fatalf("Load() error = nil, want *boot.InvalidWorkspaceDirError (workspaceDir=%q, gitDirRoot=%q) -- a relative WorkspaceDir must be rejected before it can make the root/workspace overlap check fail open", tc.workspaceDir, tc.gitDirRoot)
+			}
+			var invalidErr *boot.InvalidWorkspaceDirError
+			if !errors.As(err, &invalidErr) {
+				t.Fatalf("Load() error = %v (%T), want *boot.InvalidWorkspaceDirError", err, err)
+			}
+		})
+	}
+}

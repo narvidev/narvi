@@ -338,6 +338,49 @@ func (e *RuntimeGIDIsRootError) Error() string {
 	return fmt.Sprintf("boot: %s=0 (root) would not drop any privilege; refusing to boot", runtimeGIDEnvVar)
 }
 
+// InvalidWorkspaceDirError is returned by Load when NARVI_WORKSPACE_DIR is
+// set to a non-absolute path.
+//
+// (round-2 review, R5): validateGitDirRoot's own two-direction check
+// (below) is purely lexical, via filepath.Rel -- which returns an error
+// whenever one argument is absolute and the other is relative.
+// isPathUnderOrEqual treated that error as "definitely not under",
+// failing OPEN in both directions at once for a relative WorkspaceDir: a
+// NARVI_WORKSPACE_DIR left relative (e.g. "srv/narvi/workspace") against
+// an absolute NARVI_GIT_DIR_ROOT (e.g. "/srv/narvi") would satisfy
+// neither the forward nor the reverse check, silently accepting a
+// configuration where a session repo literally named "workspace" resolves
+// GitDir to WorkspaceDir itself -- gitdir.Seed's own first destructive
+// step, os.RemoveAll(repo.GitDir), would then delete the entire
+// workspace. GitDirRoot was already required absolute; WorkspaceDir was
+// not. Failing closed here -- rejecting a relative WorkspaceDir outright,
+// before validateGitDirRoot's own relationship checks ever run -- removes
+// the mismatched-operand case that made filepath.Rel error in the first
+// place. isPathUnderOrEqual is ALSO hardened to fail closed on any
+// remaining Rel error (defense in depth), rather than relying solely on
+// this check.
+type InvalidWorkspaceDirError struct {
+	Value  string
+	Reason string
+}
+
+func (e *InvalidWorkspaceDirError) Error() string {
+	return fmt.Sprintf("boot: invalid %s=%q: %s", workspaceDirEnvVar, e.Value, e.Reason)
+}
+
+// validateWorkspaceDir enforces Config.WorkspaceDir's own one requirement
+// checked here: absolute. Required so validateGitDirRoot's own two-way
+// nesting check (isPathUnderOrEqual, below) always compares two absolute
+// paths -- see InvalidWorkspaceDirError's own doc comment for why a
+// relative WorkspaceDir made that check fail open in both directions at
+// once.
+func validateWorkspaceDir(dir string) error {
+	if !filepath.IsAbs(dir) {
+		return &InvalidWorkspaceDirError{Value: dir, Reason: "must be an absolute path"}
+	}
+	return nil
+}
+
 // InvalidGitDirRootError is returned by Load when NARVI_GIT_DIR_ROOT is
 // set to an empty value, a non-absolute path, or a path nested under
 // WorkspaceDir. See Config.GitDirRoot's own doc comment for why the
@@ -395,9 +438,25 @@ func validateGitDirRoot(root, workspaceDir string) error {
 // (equal) or one with no leading ".." segment (a strict descendant) both
 // count. Both arguments are expected already-cleaned (filepath.Clean);
 // this function does not clean them itself.
+//
+// (round-2 review, R5): fails CLOSED (returns true -- "treat as
+// overlapping") when filepath.Rel itself errors, rather than open
+// (returning false -- "definitely not under"). Rel errors only when the
+// two operands cannot be related at all under lexical rules (e.g. one
+// absolute, one relative) -- validateGitDirRoot's own caller now
+// guarantees both sides are absolute (validateWorkspaceDir, GitDirRoot's
+// own filepath.IsAbs check), so this branch should not be reachable in
+// practice; it exists as defense in depth, not as this bug's own primary
+// fix -- see InvalidWorkspaceDirError's own doc comment for why an
+// "err == nil -> false" default here made BOTH of validateGitDirRoot's
+// directional checks pass simultaneously for a relative WorkspaceDir,
+// silently accepting an overlapping root/workspace configuration.
 func isPathUnderOrEqual(path, base string) bool {
 	rel, err := filepath.Rel(base, path)
-	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	if err != nil {
+		return true
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // parseRuntimeID parses raw (the env var's own raw string value, "" when
@@ -438,6 +497,9 @@ func Load() (Config, error) {
 	workspaceDir := os.Getenv(workspaceDirEnvVar)
 	if workspaceDir == "" {
 		workspaceDir = defaultWorkspaceDir
+	}
+	if err := validateWorkspaceDir(workspaceDir); err != nil {
+		return Config{}, err
 	}
 
 	rawLogLevel := os.Getenv(logLevelEnvVar)
