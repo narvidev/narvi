@@ -455,8 +455,10 @@ func TestHeadSyncedOut_AfterAgentCheckoutMinusB_RuntimeCommitsOntoRightBranch(t 
 	ctx := context.Background()
 
 	spec := githarden.Spec(repo, "checkout", "-b", "feature-x")
-	if _, err := gitdir.Run(ctx, sup, repo, nil, spec, 10*time.Second, 5*time.Second); err != nil {
+	if result, err := gitdir.Run(ctx, sup, repo, nil, spec, 10*time.Second, 5*time.Second); err != nil {
 		t.Fatalf("gitdir.Run(checkout -b feature-x): %v", err)
+	} else if result.ExitCode != 0 {
+		t.Fatalf("gitdir.Run(checkout -b feature-x): git exited %d", result.ExitCode)
 	}
 
 	if got := currentBranch(t, repo.WorkTree); got != "feature-x" {

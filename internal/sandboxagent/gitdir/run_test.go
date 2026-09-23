@@ -42,6 +42,31 @@ func initRunTestRepo(t *testing.T, dir string) {
 	runGitForRunTest(t, dir, "commit", "-qm", "initial")
 }
 
+// runHardened runs a hardened git command (githarden.Args(repo, args...))
+// through gitdir.Run and fails the test unless the command actually
+// exited 0, capturing stdout/stderr into the failure message. gitdir.Run
+// itself only ever reports a spawn/wait/SyncHead error -- it never
+// inspects git's own exit code (see run.go's own Run doc comment) -- so a
+// caller that checks only the returned error, as every call site in this
+// file used to, treats a FAILED git invocation (e.g. an agent-side commit
+// with no configured identity, which git refuses with a non-zero exit
+// and no Go-level error at all) exactly like a successful one. Every
+// call site in this file that expects success now goes through this
+// helper instead of inlining that (broken) pattern.
+func runHardened(ctx context.Context, t *testing.T, sup *supervisor.Supervisor, repo githarden.Repo, args ...string) (stdout, stderr string) {
+	t.Helper()
+	var outBuf, errBuf bytes.Buffer
+	spec := supervisor.Spec{Path: "git", Args: githarden.Args(repo, args...), Stdout: &outBuf, Stderr: &errBuf}
+	result, err := gitdir.Run(ctx, sup, repo, nil, spec, 10*time.Second, 5*time.Second)
+	if err != nil {
+		t.Fatalf("gitdir.Run(%v): %v\nstdout: %s\nstderr: %s", args, err, outBuf.String(), errBuf.String())
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("gitdir.Run(%v): git exited %d\nstdout: %s\nstderr: %s", args, result.ExitCode, outBuf.String(), errBuf.String())
+	}
+	return outBuf.String(), errBuf.String()
+}
+
 // TestRun_RefusesASymlinkSwappedWorktree is correction 1's own executable
 // proof (review finding on the interrupted work): SyncHeadIn's own
 // O_NOFOLLOW only protects the FINAL path component (HEAD) -- if the
@@ -78,8 +103,10 @@ func TestRun_RefusesASymlinkSwappedWorktree(t *testing.T) {
 	// A benign Run call must succeed before the swap -- proves the guard
 	// isn't simply refusing everything.
 	spec := supervisor.Spec{Path: "git", Args: githarden.Args(repo, "status", "--porcelain")}
-	if _, err := gitdir.Run(ctx, sup, repo, nil, spec, 10*time.Second, 5*time.Second); err != nil {
+	if result, err := gitdir.Run(ctx, sup, repo, nil, spec, 10*time.Second, 5*time.Second); err != nil {
 		t.Fatalf("Run() before swap: unexpected error: %v", err)
+	} else if result.ExitCode != 0 {
+		t.Fatalf("Run() before swap: git exited %d", result.ExitCode)
 	}
 
 	// The swap: replace wt/.git with a symlink to the OTHER repo's own
@@ -150,8 +177,10 @@ func TestRun_RefusesASymlinkSwappedWorktreeItself(t *testing.T) {
 	// A benign Run call must succeed before the swap -- proves the guard
 	// isn't simply refusing everything.
 	spec := supervisor.Spec{Path: "git", Args: githarden.Args(repo, "status", "--porcelain")}
-	if _, err := gitdir.Run(ctx, sup, repo, nil, spec, 10*time.Second, 5*time.Second); err != nil {
+	if result, err := gitdir.Run(ctx, sup, repo, nil, spec, 10*time.Second, 5*time.Second); err != nil {
 		t.Fatalf("Run() before swap: unexpected error: %v", err)
+	} else if result.ExitCode != 0 {
+		t.Fatalf("Run() before swap: git exited %d", result.ExitCode)
 	}
 
 	// The swap: replace wt ITSELF (not just wt/.git) with a symlink to
@@ -206,10 +235,7 @@ func TestRun_AllowsAnOrdinaryRealWorktree(t *testing.T) {
 		t.Fatalf("gitdir.Seed: %v", err)
 	}
 
-	spec := supervisor.Spec{Path: "git", Args: githarden.Args(repo, "status", "--porcelain")}
-	if _, err := gitdir.Run(ctx, sup, repo, nil, spec, 10*time.Second, 5*time.Second); err != nil {
-		t.Fatalf("Run() on an ordinary, never-swapped worktree: unexpected error: %v", err)
-	}
+	runHardened(ctx, t, sup, repo, "status", "--porcelain")
 }
 
 // TestSessionConfigEnvVar_MatchesBoot pins gitdir's own duplicated
@@ -286,13 +312,9 @@ func TestRun_SyncsAgentHeadInBeforeEverySpawn(t *testing.T) {
 		t.Fatalf("git -C %s rev-parse HEAD: %v\n%s", wt, err, wantSHA)
 	}
 
-	var stdout bytes.Buffer
-	spec := supervisor.Spec{Path: "git", Args: githarden.Args(repo, "rev-parse", "HEAD"), Stdout: &stdout}
-	if _, err := gitdir.Run(ctx, sup, repo, nil, spec, 10*time.Second, 5*time.Second); err != nil {
-		t.Fatalf("Run() rev-parse HEAD: unexpected error: %v", err)
-	}
+	stdout, _ := runHardened(ctx, t, sup, repo, "rev-parse", "HEAD")
 
-	got := strings.TrimSpace(stdout.String())
+	got := strings.TrimSpace(stdout)
 	want := strings.TrimSpace(string(wantSHA))
 	if got != want {
 		t.Fatalf("Run()'s rev-parse HEAD = %q, want %q (the runtime's own \"feat\" head) -- "+
@@ -346,10 +368,7 @@ func TestMirrorSparseCheckout_RuntimeHasLinkedWorktree(t *testing.T) {
 	// ever touches the AGENT's own config, which Seed deletes and rebuilds
 	// on every boot, so it can never itself carry the extension over to
 	// the runtime side.
-	setSpec := supervisor.Spec{Path: "git", Args: githarden.Args(repo, "sparse-checkout", "set", "--no-cone", "--", "/README.md")}
-	if _, err := gitdir.Run(ctx, sup, repo, nil, setSpec, 10*time.Second, 5*time.Second); err != nil {
-		t.Fatalf("agent-side sparse-checkout set: %v", err)
-	}
+	runHardened(ctx, t, sup, repo, "sparse-checkout", "set", "--no-cone", "--", "/README.md")
 
 	if err := gitdir.MirrorSparseCheckout(ctx, sup, repo, nil, 10*time.Second, 5*time.Second); err != nil {
 		t.Fatalf("MirrorSparseCheckout() error = %v, want nil (an ordinary linked worktree must never fail the mirror)", err)
@@ -431,12 +450,24 @@ func TestSharedFileSymlinks_SurviveRealGitMaintenanceOperations(t *testing.T) {
 	assertSymlink(t, packedRefsPath, "Seed")
 	assertSymlink(t, indexPath, "Seed")
 
+	// runAgent's own -c user.name/user.email pair gives the agent-side
+	// commit below (step (2)) an identity: the agent-owned git-dir's
+	// config carries none (only the RUNTIME repo's own .git/config, set
+	// by initRunTestRepo, does), and unlike macOS, Linux never
+	// auto-detects one from the host -- without this, `git commit`
+	// refuses (exit 128, "unable to auto-detect email address") on every
+	// Linux CI runner, silently, because runHardened is the only thing
+	// that now notices (see this package's own review notes: the OLD
+	// runAgent checked only gitdir.Run's returned error, never git's own
+	// exit code, so this exact failure passed CI green on macOS -- where
+	// user.email auto-detects from the host -- and only failed on Linux,
+	// at the LATER `git log` assertion, several lines removed from its
+	// real cause). Test-only identity: production Seed/agent config never
+	// sets one, because production sandbox-agent never commits.
 	runAgent := func(args ...string) {
 		t.Helper()
-		spec := supervisor.Spec{Path: "git", Args: githarden.Args(repo, args...)}
-		if _, err := gitdir.Run(ctx, sup, repo, nil, spec, 10*time.Second, 5*time.Second); err != nil {
-			t.Fatalf("gitdir.Run(%v): %v", args, err)
-		}
+		full := append([]string{"-c", "user.name=T", "-c", "user.email=t@example.com"}, args...)
+		runHardened(ctx, t, sup, repo, full...)
 	}
 
 	// (1) `git pack-refs --all`, through the agent-owned git-dir --
@@ -588,10 +619,7 @@ func TestSparseCheckoutMirror_BothDirectionsAndSeedImport(t *testing.T) {
 	}
 
 	// -- (1) agent sets sparse; runtime's own next checkout stays sparse --
-	setSpec := supervisor.Spec{Path: "git", Args: githarden.Args(repo, "sparse-checkout", "set", "--no-cone", "--", "/apps/web/*", "/contracts/api/*")}
-	if _, err := gitdir.Run(ctx, sup, repo, nil, setSpec, 10*time.Second, 5*time.Second); err != nil {
-		t.Fatalf("agent sparse-checkout set: %v", err)
-	}
+	runHardened(ctx, t, sup, repo, "sparse-checkout", "set", "--no-cone", "--", "/apps/web/*", "/contracts/api/*")
 	if err := gitdir.MirrorSparseCheckout(ctx, sup, repo, nil, 10*time.Second, 5*time.Second); err != nil {
 		t.Fatalf("MirrorSparseCheckout (set): %v", err)
 	}
@@ -612,10 +640,7 @@ func TestSparseCheckoutMirror_BothDirectionsAndSeedImport(t *testing.T) {
 	mustNotExist(t, apiFile, "after runtime's own checkout, still sparse")
 
 	// -- (2) agent disables sparse; runtime's own next checkout re-materializes everything --
-	disableSpec := supervisor.Spec{Path: "git", Args: githarden.Args(repo, "sparse-checkout", "disable")}
-	if _, err := gitdir.Run(ctx, sup, repo, nil, disableSpec, 10*time.Second, 5*time.Second); err != nil {
-		t.Fatalf("agent sparse-checkout disable: %v", err)
-	}
+	runHardened(ctx, t, sup, repo, "sparse-checkout", "disable")
 	if err := gitdir.MirrorSparseCheckout(ctx, sup, repo, nil, 10*time.Second, 5*time.Second); err != nil {
 		t.Fatalf("MirrorSparseCheckout (disable): %v", err)
 	}
