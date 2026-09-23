@@ -256,17 +256,20 @@ func TestClosedClass_StashPopIndexDoesNotExecuteEither(t *testing.T) {
 // Fixed with two extra, explicit checks below, each isolating ONE of the
 // two independent defenses:
 //   - "split alone": the REAL githarden.Args(repo, ...) output, with the
-//     "-c core.hooksPath=..." PAIR's own value replaced to point at the
-//     agent's own real hooks/ dir (round-2 review, R6: replaced, not
-//     merely dropped -- Seed's own AGENT CONFIG belt persists
-//     core.hooksPath=/dev/null into the agent git-dir's own config file,
-//     independent of this command's -c flags, so dropping the flag alone
-//     left that belt in place, still suppressing the hook on its own) --
-//     so this check is sensitive to whatever --git-dir/--work-tree Args()
-//     actually emits (or fails to), unlike a hand-built command that would
-//     not notice Args() regressing at all. If the hook still does not
-//     run, the structural guarantee is real on its own, independent of
-//     BOTH the CLI flag and the persisted agent-config value.
+//     "-c core.hooksPath=..." PAIR dropped entirely (not merely replaced --
+//     round-3 review, Q2/Q3: replacing the pair's value with the agent's
+//     own real hooks/ dir, as round-2's R6 did, still points git's hook
+//     lookup at that directory NO MATTER which --git-dir/--work-tree Args()
+//     emits, so it could not tell "the split itself blocks the hook" apart
+//     from "this -c flag's own value does" -- e.g. Args() dropping
+//     --git-dir/--work-tree entirely went undetected). Seed's own AGENT
+//     CONFIG belt (core.hooksPath=/dev/null, persisted into the agent
+//     git-dir's own config file at Seed step 5) is unset explicitly before
+//     this command runs, so NEITHER a -c flag NOR the persisted config
+//     value can hide a regression in --git-dir/--work-tree -- only the
+//     split itself (Args' own -C/--git-dir/--work-tree) can suppress the
+//     hook here. If the hook still does not run, the structural guarantee
+//     is real on its own, independent of both defenses.
 //   - "neither defense, sanity control": plain "-C wt", the pre-§30.5
 //     shape, no --git-dir override and no -c flag at all -- the payload
 //     MUST execute here, or this whole test would be vacuous (proving
@@ -292,12 +295,20 @@ func TestClosedClass_RuntimeHookDoesNotExecute(t *testing.T) {
 	}
 
 	// Isolation check 1: githarden.Args' REAL output for this exact
-	// invocation, with only the "-c core.hooksPath=..." pair filtered
-	// back out -- proves the structural guarantee this test's own doc
+	// invocation, with the "-c core.hooksPath=..." pair filtered back out
+	// entirely -- proves the structural guarantee this test's own doc
 	// comment claims, independent of that one flag, WHILE staying
 	// sensitive to Args' own actual --git-dir/--work-tree emission (a
 	// hand-built command using fixed flags would not notice a regression
-	// in Args itself).
+	// in Args itself). Seed's own AGENT CONFIG belt (core.hooksPath=
+	// /dev/null, persisted at Seed step 5) is unset here too, so ONLY
+	// --git-dir/--work-tree can be isolating the hook below -- see this
+	// test's own doc comment (round-3 review, Q2/Q3) for why leaving either
+	// belt in place made this check unable to catch Args() dropping
+	// --git-dir/--work-tree.
+	if out, err := exec.Command("git", "--git-dir", repo.GitDir, "config", "--unset", "core.hooksPath").CombinedOutput(); err != nil {
+		t.Fatalf("git --git-dir %s config --unset core.hooksPath: %v\n%s", repo.GitDir, err, out)
+	}
 	splitMarker := filepath.Join(t.TempDir(), "EXECUTED-SPLIT-ONLY")
 	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\n"+payload(splitMarker, "exit 0")+"\n"), 0o755); err != nil {
 		t.Fatalf("rewrite runtime pre-commit hook (split-only check): %v", err)
@@ -388,8 +399,8 @@ func TestSharedObjects_VisibleBothWays(t *testing.T) {
 }
 
 // argsWithoutHooksPathFlag returns githarden.Args' OWN real output for
-// this exact repo/rest, with the "-c core.hooksPath=<value>" PAIR's own
-// value replaced -- everything else Args() actually emits (crucially,
+// this exact repo/rest, with the "-c core.hooksPath=<value>" PAIR dropped
+// entirely -- everything else Args() actually emits (crucially,
 // -C/--git-dir/--work-tree) is passed through untouched. Deriving from
 // the real Args() output, rather than hand-building a fixed command,
 // keeps TestClosedClass_RuntimeHookDoesNotExecute's own isolation check
@@ -397,28 +408,30 @@ func TestSharedObjects_VisibleBothWays(t *testing.T) {
 // emitting --git-dir) -- a hand-built command using fixed flags would
 // not notice that at all.
 //
-// (Correction, round-2 review, R6): simply DROPPING the "-c
-// core.hooksPath=..." pair, as this function used to, still left Seed's
-// own AGENT CONFIG belt in place -- core.hooksPath=/dev/null, PERSISTED
-// into the agent git-dir's own config file at Seed step 5, independent of
-// this command's own -c flags. That belt alone is enough to suppress any
-// hook regardless of whether hooks/ is actually split, so the "split
-// alone" isolation check below could not tell "the split itself blocks
-// the hook" apart from "the agent config's own /dev/null still does" --
-// e.g. a future change sharing hooks/ between agent and runtime (Seed
-// symlinking it the way it already does objects/refs/logs/info) would
-// not have been caught. Fixed by REPLACING the pair's value with the
-// AGENT's own real hooks directory (repo.GitDir/hooks) instead of
-// dropping it: a command-line -c always overrides the persisted config
-// value, so this neutralizes the agent-config belt too, while still
-// keeping hook lookup scoped to the agent's own (real, empty) hooks/ dir
-// -- exactly what "split alone" is supposed to isolate.
+// (Correction, round-2 review, R6, and its own round-3 correction, Q2/Q3):
+// R6 found that simply DROPPING the "-c core.hooksPath=..." pair, as this
+// function did before it, still left Seed's own AGENT CONFIG belt in
+// place -- core.hooksPath=/dev/null, PERSISTED into the agent git-dir's
+// own config file at Seed step 5, independent of this command's own -c
+// flags -- and "fixed" it by REPLACING the pair's value with the agent's
+// own real hooks directory (repo.GitDir/hooks) instead of dropping it.
+// That went too far the other way: an explicit core.hooksPath, wherever it
+// points, suppresses hook lookup on its own, NO MATTER which --git-dir/
+// --work-tree Args() actually emitted -- so the "split alone" isolation
+// check below could no longer tell "the split itself blocks the hook"
+// apart from "this -c flag's own value does" either, and a regression
+// dropping --git-dir/--work-tree from Args() went undetected. The actual
+// fix keeps BOTH belts out of the way at once: this function drops the -c
+// pair entirely (below), and the test's own call site (githarden_split_test.go)
+// separately unsets the persisted core.hooksPath from the agent's config
+// before running this command -- so hook lookup is governed ONLY by
+// whichever --git-dir/--work-tree Args() actually emits, which is exactly
+// what "split alone" needs to isolate.
 func argsWithoutHooksPathFlag(repo githarden.Repo, rest ...string) []string {
 	full := githarden.Args(repo, rest...)
 	filtered := make([]string, 0, len(full))
 	for i := 0; i < len(full); i++ {
 		if full[i] == "-c" && i+1 < len(full) && strings.HasPrefix(full[i+1], "core.hooksPath=") {
-			filtered = append(filtered, "-c", "core.hooksPath="+filepath.Join(repo.GitDir, "hooks"))
 			i++ // also skip the "core.hooksPath=<value>" that follows "-c"
 			continue
 		}
