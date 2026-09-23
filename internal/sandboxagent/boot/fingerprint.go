@@ -18,12 +18,17 @@ import (
 // CollectFingerprint assembles the boot fingerprint §5.3 requires
 // sandbox-agent log first -- before any other line -- directly from cfg,
 // plus a best-effort repo-SHA discovery pass over layout.WorkspaceDir.
-// repoSHATimeout bounds each individual repo's `git rev-parse` call (see
-// DiscoverRepoSHAs); callers pass platform.Timeouts.RepoSHADiscoveryTimeout
-// (never a literal -- this package must not import time.Duration unit
-// literals per §5.4/§11, enforced by tools/lint/narvichecks/notimeliteral).
-// stopGrace is platform.Timeouts.ProcessStopGracePeriod, threaded through
-// to gitdir.Run's own bounded Stop call on a hang.
+// allowed is threaded straight through to DiscoverRepoSHAs (see its own
+// doc comment for exactly what a nil vs. non-nil allowed means -- callers
+// that never seed a repo before calling this function pass nil, keeping
+// this function's long-standing "discover whatever CollectFingerprint
+// finds on disk" behavior unchanged). repoSHATimeout bounds each
+// individual repo's `git rev-parse` call (see DiscoverRepoSHAs); callers
+// pass platform.Timeouts.RepoSHADiscoveryTimeout (never a literal -- this
+// package must not import time.Duration unit literals per §5.4/§11,
+// enforced by tools/lint/narvichecks/notimeliteral). stopGrace is
+// platform.Timeouts.ProcessStopGracePeriod, threaded through to
+// gitdir.Run's own bounded Stop call on a hang.
 //
 // §30.5: every repo-SHA read this function makes now goes
 // through the SAME agent-owned git-dir every other sandbox-agent git
@@ -39,12 +44,12 @@ import (
 // *syscall.Credential (nil/self in tests), needed by gitdir.Run's own
 // SyncHeadOut bracket even though a plain rev-parse never actually moves
 // HEAD (so that bracket is always a no-op here in practice).
-func CollectFingerprint(ctx context.Context, sup *supervisor.Supervisor, cfg Config, layout gitdir.Layout, cred *syscall.Credential, repoSHATimeout, stopGrace time.Duration, openCodeVersion string) sandboxboot.BootFingerprint {
+func CollectFingerprint(ctx context.Context, sup *supervisor.Supervisor, cfg Config, layout gitdir.Layout, cred *syscall.Credential, allowed map[string]bool, repoSHATimeout, stopGrace time.Duration, openCodeVersion string) sandboxboot.BootFingerprint {
 	return sandboxboot.BootFingerprint{
 		AgentVersion:    cfg.AgentVersion,
 		ImageDigest:     cfg.ImageDigest,
 		BootMode:        cfg.BootMode,
-		RepoSHAs:        DiscoverRepoSHAs(ctx, sup, layout, cred, repoSHATimeout, stopGrace),
+		RepoSHAs:        DiscoverRepoSHAs(ctx, sup, layout, cred, allowed, repoSHATimeout, stopGrace),
 		OpenCodeVersion: openCodeVersion,
 	}
 }
@@ -61,7 +66,22 @@ func CollectFingerprint(ctx context.Context, sup *supervisor.Supervisor, cfg Con
 // a pure-ish, easily-testable function that returns data; the CALLER
 // decides whether/how to log an omission (at most debug-level, per this
 // Step's own instructions).
-func DiscoverRepoSHAs(ctx context.Context, sup *supervisor.Supervisor, layout gitdir.Layout, cred *syscall.Credential, timeout, stopGrace time.Duration) map[string]string {
+//
+// allowed is an explicit, POSITIVE allowlist of repo names this call is
+// permitted to discover against: nil means "no restriction" (this
+// function's original behavior -- discover every entry the os.Stat gates
+// below accept), a non-nil map restricts discovery to exactly the names
+// present in it (an empty-but-non-nil map therefore discovers nothing at
+// all). The allowed check runs BEFORE either os.Stat call and before
+// repoHeadSHA -- i.e. before any git-dir presence is even checked and
+// before gitdir.Run ever spawns anything -- so a repo outside allowed is
+// never discovered against, never mind reported. This exists because
+// os.Stat alone cannot tell a git-dir that was (re-)seeded THIS boot from
+// one merely left over on disk from an earlier boot (see
+// cmd/sandbox-agent/main.go's bootFingerprintAndSeed, whose warm-boot Seed
+// loop passes the positive set of repos it actually (re-)seeded this
+// boot, rather than trying to name every excluded repo after the fact).
+func DiscoverRepoSHAs(ctx context.Context, sup *supervisor.Supervisor, layout gitdir.Layout, cred *syscall.Credential, allowed map[string]bool, timeout, stopGrace time.Duration) map[string]string {
 	shas := make(map[string]string)
 
 	entries, err := os.ReadDir(layout.WorkspaceDir)
@@ -71,6 +91,9 @@ func DiscoverRepoSHAs(ctx context.Context, sup *supervisor.Supervisor, layout gi
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
+			continue
+		}
+		if allowed != nil && !allowed[entry.Name()] {
 			continue
 		}
 

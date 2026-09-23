@@ -47,7 +47,7 @@ func TestDiscoverRepoSHAs(t *testing.T) {
 	mkdirAll(t, plainDir)
 
 	layout, sup := seedFingerprintRepo(t, workspaceDir, "repo-a")
-	shas := boot.DiscoverRepoSHAs(context.Background(), sup, layout, nil, 5*time.Second, 5*time.Second)
+	shas := boot.DiscoverRepoSHAs(context.Background(), sup, layout, nil, nil, 5*time.Second, 5*time.Second)
 
 	sha, ok := shas["repo-a"]
 	if !ok {
@@ -68,7 +68,7 @@ func TestDiscoverRepoSHAs_NonexistentWorkspace(t *testing.T) {
 	workspaceDir := filepath.Join(t.TempDir(), "does-not-exist")
 	layout := gitdir.Layout{Root: t.TempDir(), WorkspaceDir: workspaceDir}
 	sup := supervisor.New()
-	shas := boot.DiscoverRepoSHAs(context.Background(), sup, layout, nil, 5*time.Second, 5*time.Second)
+	shas := boot.DiscoverRepoSHAs(context.Background(), sup, layout, nil, nil, 5*time.Second, 5*time.Second)
 	if len(shas) != 0 {
 		t.Errorf("DiscoverRepoSHAs() = %v, want empty map for a nonexistent workspaceDir", shas)
 	}
@@ -90,7 +90,7 @@ func TestCollectFingerprint(t *testing.T) {
 	}
 
 	layout, sup := seedFingerprintRepo(t, workspaceDir, "repo-a")
-	fp := boot.CollectFingerprint(context.Background(), sup, cfg, layout, nil, 5*time.Second, 5*time.Second, "")
+	fp := boot.CollectFingerprint(context.Background(), sup, cfg, layout, nil, nil, 5*time.Second, 5*time.Second, "")
 
 	if fp.AgentVersion != cfg.AgentVersion {
 		t.Errorf("AgentVersion = %q, want %q", fp.AgentVersion, cfg.AgentVersion)
@@ -121,7 +121,7 @@ func TestCollectFingerprint_OpenCodeVersion(t *testing.T) {
 
 	layout := gitdir.Layout{Root: t.TempDir(), WorkspaceDir: workspaceDir}
 	sup := supervisor.New()
-	fp := boot.CollectFingerprint(context.Background(), sup, cfg, layout, nil, 5*time.Second, 5*time.Second, "1.17.15")
+	fp := boot.CollectFingerprint(context.Background(), sup, cfg, layout, nil, nil, 5*time.Second, 5*time.Second, "1.17.15")
 	if fp.OpenCodeVersion != "1.17.15" {
 		t.Errorf("OpenCodeVersion = %q, want %q", fp.OpenCodeVersion, "1.17.15")
 	}

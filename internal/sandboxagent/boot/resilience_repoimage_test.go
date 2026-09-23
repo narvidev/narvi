@@ -229,7 +229,7 @@ func TestResilienceScenario_RepoAbsentFromWorkspaceMoved_SetupStillReruns(t *tes
 	// The real production path (cmd/sandbox-agent/main.go's own
 	// runBootSequence): discover current SHAs over the whole workspace, then
 	// compute workspaceMoved from that set -- never a hand-constructed map.
-	currentSHAs := boot.DiscoverRepoSHAs(context.Background(), seedSup, layout, nil, 5*time.Second, 5*time.Second)
+	currentSHAs := boot.DiscoverRepoSHAs(context.Background(), seedSup, layout, nil, nil, 5*time.Second, 5*time.Second)
 	if _, ok := currentSHAs["repo-no-sha"]; ok {
 		t.Fatalf("precondition failed: DiscoverRepoSHAs()[repo-no-sha] present, want absent (rev-parse HEAD should fail on a zero-commit repo); got %v", currentSHAs)
 	}

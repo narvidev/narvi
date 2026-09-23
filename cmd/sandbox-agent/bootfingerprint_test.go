@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sessionconfig"
 	"github.com/narvidev/narvi/internal/platform"
@@ -27,6 +28,43 @@ import (
 	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
+
+// bootFingerprintTestBackdate is a fixed, arbitrary timestamp well before
+// any test in this file runs -- used to backdate an agent git-dir's own
+// HEAD file so a later, unwanted write (SyncHeadIn, reached only via a
+// `git rev-parse` spawn through gitdir.Run) is directly observable as an
+// mtime that moved to "now", rather than staying pinned at this value.
+var bootFingerprintTestBackdate = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// backdateAgentHead sets repoGitDir/HEAD's own mtime (and atime) to
+// bootFingerprintTestBackdate -- repoGitDir must already have a real HEAD
+// file (i.e. the repo was already Seed'd once) -- so a later assertion
+// can prove that file was never rewritten.
+func backdateAgentHead(t *testing.T, repoGitDir string) {
+	t.Helper()
+	head := filepath.Join(repoGitDir, "HEAD")
+	if err := os.Chtimes(head, bootFingerprintTestBackdate, bootFingerprintTestBackdate); err != nil {
+		t.Fatalf("Chtimes(%s): %v", head, err)
+	}
+}
+
+// assertAgentHeadUntouched fails t unless repoGitDir/HEAD's mtime is still
+// exactly bootFingerprintTestBackdate -- i.e. nothing wrote through it
+// since backdateAgentHead was called, which (since SyncHeadIn always runs
+// immediately before any git spawn through gitdir.Run, see head.go's own
+// doc comment) is direct proof no git command was ever spawned against
+// this agent git-dir.
+func assertAgentHeadUntouched(t *testing.T, label, repoGitDir string) {
+	t.Helper()
+	head := filepath.Join(repoGitDir, "HEAD")
+	info, err := os.Stat(head)
+	if err != nil {
+		t.Fatalf("stat %s HEAD (%s): %v", label, head, err)
+	}
+	if !info.ModTime().Equal(bootFingerprintTestBackdate) {
+		t.Errorf("%s agent git-dir HEAD mtime = %v, want unchanged %v -- a write here means git was spawned against a repo not seeded this boot", label, info.ModTime(), bootFingerprintTestBackdate)
+	}
+}
 
 // installDefaultTestLogger builds a JSON logger writing to a buffer and
 // installs it as slog.Default() for the duration of the test (restored via
@@ -328,6 +366,12 @@ func TestBootFingerprintAndSeed_SecondaryFailure_ExcludedFromRepoSHAs(t *testing
 		t.Fatalf("precondition: gitdir.Seed(secondary) error = %v, want nil (must succeed once, to leave a stale git-dir behind)", err)
 	}
 
+	// Backdate secondary's agent HEAD -- any write through it (SyncHeadIn,
+	// reached only via a git spawn) after this point would move its mtime
+	// to "now"; staying pinned here is direct proof no git ever ran
+	// against the failed secondary's own (stale) agent git-dir.
+	backdateAgentHead(t, layout.Repo("secondary").GitDir)
+
 	// NOW plant the .git/shallow marker that makes THIS boot's Seed call for
 	// "secondary" fail -- exactly seedWarmBootTestBadRepo's own shape,
 	// applied after the fact so the earlier Seed call above ran clean.
@@ -361,4 +405,95 @@ func TestBootFingerprintAndSeed_SecondaryFailure_ExcludedFromRepoSHAs(t *testing
 	if sha, present := shas["secondary"]; present {
 		t.Errorf("fingerprint repo_shas = %v, want NO \"secondary\" entry (its Seed call failed THIS boot; got stale sha %q from an earlier boot)", shas, sha)
 	}
+
+	// Not merely absent from repo_shas -- proves no git was ever spawned
+	// against the failed secondary's own (stale, un-revalidated) agent
+	// git-dir in the first place.
+	assertAgentHeadUntouched(t, "secondary", layout.Repo("secondary").GitDir)
+}
+
+// TestBootFingerprintAndSeed_PrimaryFailureWarmBoot_NoDiscoveryNoGitSpawned
+// reproduces the round-4 finding directly: a WARM boot (repo_image/
+// snapshot_restore) where BOTH "primary" and "secondary" were already
+// seeded successfully on an EARLIER boot, so real, stale agent git-dirs
+// for both sit on disk before this boot's own seedWarmBootRepos loop ever
+// runs. This boot then plants primary/.git/shallow, so gitdir.Seed refuses
+// the PRIMARY at step 0 (before its own os.RemoveAll) -- seedWarmBootRepos
+// returns immediately, with an empty "seeded this boot" set: no warning
+// for the primary, and "secondary" never even attempted.
+//
+// Before the round-4 fix, the exclusion in bootFingerprintAndSeed only
+// matched warnings by message, and a failed PRIMARY produces no warning at
+// all (nor does a secondary that was never reached) -- so
+// boot.CollectFingerprint ran anyway, unrestricted, and found both stale
+// git-dirs still on disk: DiscoverRepoSHAs' os.Stat gate has no notion of
+// "seeded this boot", so it happily ran SyncHeadIn (a write) and spawned
+// `git rev-parse HEAD` against BOTH, including the very primary whose
+// layout gitdir.Seed had just refused to vouch for. This proves neither
+// happens now: the fatal error still propagates, repo_shas is completely
+// empty, and NEITHER agent git-dir's own HEAD file was ever written to --
+// i.e. no git was spawned against either.
+func TestBootFingerprintAndSeed_PrimaryFailureWarmBoot_NoDiscoveryNoGitSpawned(t *testing.T) {
+	t.Parallel()
+
+	workspaceDir := t.TempDir()
+	seedWarmBootTestGoodRepo(t, workspaceDir, "primary")
+	seedWarmBootTestGoodRepo(t, workspaceDir, "secondary")
+
+	gitDirRoot := t.TempDir()
+	layout := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}
+	if err := gitdir.EnsureRoot(gitDirRoot); err != nil {
+		t.Fatalf("gitdir.EnsureRoot() error = %v", err)
+	}
+
+	// Simulate an EARLIER, successful boot that already seeded BOTH
+	// repos' agent git-dirs -- BEFORE this boot's own shallow marker
+	// (below) makes gitdir.Seed refuse the primary. This leaves real,
+	// stale git-dirs with real SHAs on disk for both.
+	timeouts := platform.DefaultTimeouts()
+	if err := gitdir.Seed(context.Background(), supervisor.New(), layout.Repo("primary"), "https://example.invalid/primary.git", nil, timeouts.GitSyncStepTimeout, timeouts.ProcessStopGracePeriod); err != nil {
+		t.Fatalf("precondition: gitdir.Seed(primary) error = %v, want nil (must succeed once, to leave a stale git-dir behind)", err)
+	}
+	if err := gitdir.Seed(context.Background(), supervisor.New(), layout.Repo("secondary"), "https://example.invalid/secondary.git", nil, timeouts.GitSyncStepTimeout, timeouts.ProcessStopGracePeriod); err != nil {
+		t.Fatalf("precondition: gitdir.Seed(secondary) error = %v, want nil (must succeed once, to leave a stale git-dir behind)", err)
+	}
+
+	// Backdate BOTH agent HEADs -- any later write through either (only
+	// reachable via SyncHeadIn/a git spawn) would move its mtime to "now".
+	backdateAgentHead(t, layout.Repo("primary").GitDir)
+	backdateAgentHead(t, layout.Repo("secondary").GitDir)
+
+	// NOW plant the .git/shallow marker that makes THIS boot's Seed call
+	// for "primary" fail -- exactly seedWarmBootTestBadRepo's own shape,
+	// applied after the fact so the earlier Seed calls above ran clean.
+	if err := os.WriteFile(filepath.Join(workspaceDir, "primary", ".git", "shallow"), []byte("deadbeef\n"), 0o644); err != nil {
+		t.Fatalf("write .git/shallow: %v", err)
+	}
+
+	cfg := boot.Config{
+		GitDirRoot:   gitDirRoot,
+		WorkspaceDir: workspaceDir,
+		SessionConfig: &sessionconfig.SessionConfig{
+			Repos: []sessionconfig.SessionConfigReposElem{
+				{Name: "primary", Url: "https://example.invalid/primary.git"},
+				{Name: "secondary", Url: "https://example.invalid/secondary.git"},
+			},
+		},
+	}
+
+	var buf bytes.Buffer
+	logger := platform.NewLogger(&buf, cfg.LogLevel)
+
+	err := bootFingerprintAndSeed(context.Background(), supervisor.New(), cfg, layout, nil, timeouts, logger)
+	if err == nil {
+		t.Fatal("bootFingerprintAndSeed() error = nil, want a fatal error for the failed primary repo's Seed call (warm boot)")
+	}
+
+	shas := loggedRepoSHAs(t, &buf)
+	if len(shas) != 0 {
+		t.Errorf("fingerprint repo_shas = %v, want EMPTY -- neither repo was (re-)seeded THIS boot (primary's Seed call failed; secondary was never attempted)", shas)
+	}
+
+	assertAgentHeadUntouched(t, "primary", layout.Repo("primary").GitDir)
+	assertAgentHeadUntouched(t, "secondary", layout.Repo("secondary").GitDir)
 }
