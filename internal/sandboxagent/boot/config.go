@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -51,6 +52,16 @@ const (
 	// doc comment).
 	runtimeUIDEnvVar = "NARVI_RUNTIME_UID"
 	runtimeGIDEnvVar = "NARVI_RUNTIME_GID"
+
+	// gitDirRootEnvVar (Step 171, §30.5) names the sandbox-wide root
+	// internal/sandboxagent/gitdir seeds every repo's own AGENT-OWNED
+	// git-dir under (gitdir.Layout.Root) -- deliberately OUTSIDE
+	// WorkspaceDir (the agent-visible /workspace tree the isolated runtime
+	// owns after §30.5's own chown): a git-dir living inside the runtime's
+	// own tree would defeat the entire point of splitting it out in the
+	// first place. See gitdir's own package doc comment for the full
+	// shape.
+	gitDirRootEnvVar = "NARVI_GIT_DIR_ROOT"
 )
 
 // Defaults for every optional env var above.
@@ -103,6 +114,14 @@ const (
 	// either var to that account's own uid/gid instead.
 	defaultRuntimeUID uint32 = 65534
 	defaultRuntimeGID uint32 = 65534
+
+	// defaultGitDirRoot is used when NARVI_GIT_DIR_ROOT is unset --
+	// deliberately root-owned and NOT world-writable, matching gitdir.
+	// EnsureRoot's own default and doc comment exactly (this literal is
+	// this Step's own single source of truth for it; gitdir itself takes
+	// the root as a plain parameter, never re-deriving a default of its
+	// own).
+	defaultGitDirRoot = "/var/lib/narvi/gitdirs"
 )
 
 // Config is sandbox-agent's own typed, boot-time-validated configuration,
@@ -148,6 +167,18 @@ type Config struct {
 	// requirement already establishes for a different credential.
 	RuntimeUID uint32
 	RuntimeGID uint32
+
+	// GitDirRoot (Step 171, §30.5) is the sandbox-wide root
+	// internal/sandboxagent/gitdir seeds every repo's own agent-owned
+	// git-dir under -- gitdir.Layout.Root, gitdir.EnsureRoot's own
+	// argument. Resolved by Load from NARVI_GIT_DIR_ROOT: unset uses
+	// defaultGitDirRoot; set to anything empty, non-absolute, or nested
+	// UNDER WorkspaceDir is a fail-fast *InvalidGitDirRootError -- an
+	// agent-owned git-dir living inside the runtime-owned workspace tree
+	// would defeat the entire structural guarantee this Step exists to
+	// provide (the runtime could then reach it via an ordinary path
+	// inside its own tree).
+	GitDirRoot string
 
 	// SandboxID is the value internal/sandboxagent/wsbridge.New sends as
 	// the sandbox WS connection's X-Sandbox-ID header (§6.1). Resolved by
@@ -307,6 +338,38 @@ func (e *RuntimeGIDIsRootError) Error() string {
 	return fmt.Sprintf("boot: %s=0 (root) would not drop any privilege; refusing to boot", runtimeGIDEnvVar)
 }
 
+// InvalidGitDirRootError is returned by Load when NARVI_GIT_DIR_ROOT is
+// set to an empty value, a non-absolute path, or a path nested under
+// WorkspaceDir. See Config.GitDirRoot's own doc comment for why the
+// under-WorkspaceDir case specifically is refused, not merely
+// discouraged.
+type InvalidGitDirRootError struct {
+	Value  string
+	Reason string
+}
+
+func (e *InvalidGitDirRootError) Error() string {
+	return fmt.Sprintf("boot: invalid %s=%q: %s", gitDirRootEnvVar, e.Value, e.Reason)
+}
+
+// validateGitDirRoot enforces Config.GitDirRoot's own three requirements:
+// non-empty, absolute, and not nested under workspaceDir (checked via
+// filepath.Rel: a relative result with no leading ".." segment means root
+// is workspaceDir itself or a descendant of it).
+func validateGitDirRoot(root, workspaceDir string) error {
+	if root == "" {
+		return &InvalidGitDirRootError{Value: root, Reason: "must not be empty"}
+	}
+	if !filepath.IsAbs(root) {
+		return &InvalidGitDirRootError{Value: root, Reason: "must be an absolute path"}
+	}
+	rel, err := filepath.Rel(workspaceDir, root)
+	if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return &InvalidGitDirRootError{Value: root, Reason: fmt.Sprintf("must not be nested under WorkspaceDir (%s) -- an agent-owned git-dir inside the runtime-owned workspace tree defeats the structural guarantee Step 171 provides", workspaceDir)}
+	}
+	return nil
+}
+
 // parseRuntimeID parses raw (the env var's own raw string value, "" when
 // unset) as a uint32, applying fallback when raw is empty and rejecting 0
 // unconditionally (see RuntimeUIDIsRootError/RuntimeGIDIsRootError's own
@@ -377,6 +440,14 @@ func Load() (Config, error) {
 		return Config{}, &RuntimeGIDIsRootError{}
 	}
 
+	gitDirRoot := os.Getenv(gitDirRootEnvVar)
+	if gitDirRoot == "" {
+		gitDirRoot = defaultGitDirRoot
+	}
+	if err := validateGitDirRoot(gitDirRoot, workspaceDir); err != nil {
+		return Config{}, err
+	}
+
 	// sessionConfig is resolved BEFORE sandboxID below -- sandboxID's own
 	// resolution needs to know whether a SessionConfig is present (and,
 	// if so, its own SandboxId) to pick the right value/detect a mismatch.
@@ -399,6 +470,7 @@ func Load() (Config, error) {
 		CredentialCacheDir: credentialCacheDir,
 		RuntimeUID:         runtimeUID,
 		RuntimeGID:         runtimeGID,
+		GitDirRoot:         gitDirRoot,
 		SandboxID:          sandboxID,
 		SessionConfig:      sessionConfig,
 	}, nil

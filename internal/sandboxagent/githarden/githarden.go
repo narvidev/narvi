@@ -2,30 +2,46 @@
 // runs must carry, and the reason they are not optional.
 //
 // §30.5 drops the agent runtime to its own UID and hands it the workspace,
-// so the runtime owns the repositories it works in -- including each
-// repository's own .git directory. Sandbox-agent still runs git in those
-// same repositories, as itself, to clone, sync, read a head SHA and push.
-// That leaves two problems, and only the first one announces itself.
+// so the runtime owns the repositories it works in -- including, before
+// Step 171, each repository's own .git directory. Sandbox-agent used to
+// still run git in those same repositories, as itself, to clone, sync,
+// read a head SHA and push -- reading command-carrying config
+// (filter/merge drivers, hooks) straight out of a directory the runtime
+// controlled.
 //
-// The loud one: git refuses to operate on a repository owned by another
-// user ("detected dubious ownership") unless that path is declared safe.
-// Without this, every push and every head-sha read fails outright.
+// Step 171 (§30.5) closes that structurally: sandbox-agent's own git never
+// runs against the runtime-owned .git directory any more. Every hardened
+// invocation now names an AGENT-OWNED git-dir instead, via Repo/Args below
+// -- `git -C <worktree> --git-dir=<agent-dir> --work-tree=<worktree>`. The
+// agent-dir holds agent-owned config and hooks (internal/sandboxagent/
+// gitdir.Seed); data that carries no command (objects, refs, the index,
+// ...) is shared with the runtime's own .git via symlink, so runtime
+// commits stay pushable and vice versa, but nothing sandbox-agent's git
+// reads was ever written by the runtime.
 //
-// The quiet one, which is why declaring the path safe is not on its own a
-// fix: a repository the runtime owns is a repository the runtime can write
-// hooks into. `git push` runs .git/hooks/pre-push, so declaring the path
-// safe and stopping there hands a prompt-injected agent arbitrary
-// execution AS SANDBOX-AGENT -- recovering precisely the identity §30.5
-// exists to take away. Verified rather than reasoned: in a container, a
-// runtime-planted pre-push hook printed "HOOK RAN as uid=0" under a root
-// push with only safe.directory set, and did not run once hooksPath was
-// pointed away.
+// Two consequences of that shape, preserved here as defense in depth
+// rather than the primary guarantee they used to be:
 //
-// So both go together, always, at every call site -- which is why they
-// live in one function instead of being remembered eight times. Nothing
-// sandbox-agent does with git ever wants a repository-authored hook or a
-// repository-authored configuration value; those exist for humans working
-// in their own checkouts.
+// The formerly-loud one: git refuses to operate on a repository owned by
+// another user ("detected dubious ownership") unless that path is
+// declared safe -- MOOT now: an explicit --git-dir/--work-tree pair skips
+// git's dubious-ownership check entirely (verified directly), so
+// safe.directory is no longer set at all. Its old value was also fragile
+// to path resolution (/tmp vs /private/tmp); dropping it loses nothing --
+// see Args' own doc comment.
+//
+// The formerly-quiet one: `git push` runs .git/hooks/pre-push, so a
+// runtime-planted hook there would have handed a prompt-injected agent
+// arbitrary execution AS SANDBOX-AGENT. core.hooksPath=/dev/null is kept
+// below as defense in depth (the agent-owned git-dir's own hooks/ is
+// already empty and agent-owned, so this key is no longer reachable from a
+// runtime write at all, but a key that costs nothing to keep is kept).
+//
+// hardeningFlags remains the ONE list every hardened invocation shares,
+// never duplicated per call site -- nothing sandbox-agent does with git
+// ever wants a repository-authored hook or a repository-authored
+// configuration value; those exist for humans working in their own
+// checkouts.
 package githarden
 
 import (
@@ -42,12 +58,12 @@ import (
 // created it first.
 const noHooksPath = "/dev/null"
 
-// Args returns git's own arguments for a command operating on repoDir,
-// with the hardening ahead of whatever the caller wants to run.
+// Args returns git's own arguments for a command operating on repo, with
+// the hardening ahead of whatever the caller wants to run.
 //
 // Callers pass what they would have passed anyway; the flags this adds
 // come first because git requires its -c options before the subcommand.
-// hardeningFlags is the ONE list, used by both entry points below.
+// hardeningFlags is the ONE list, used by every entry point below.
 //
 // It was two lists, and that is a defect waiting to happen: a key added
 // to one and forgotten in the other leaves a live hole reachable through
@@ -55,21 +71,25 @@ const noHooksPath = "/dev/null"
 // missing from both, which is the cheaper version of the same mistake.
 //
 // Every entry names a git config key that (a) makes git RUN a command and
-// (b) is settable from the repository's own .git/config -- which the
-// agent runtime owns after the workspace chown, and which a
-// prompt-injected agent can therefore write.
+// (b) used to be settable from the repository's own .git/config, which
+// the agent runtime owned after the workspace chown. Step 171 (§30.5)
+// moved every hardened invocation off that runtime-owned .git entirely
+// (Repo/Args, below) -- these flags are kept anyway, as defense in depth
+// against a regression in that structural fix, not as the primary
+// guarantee any more.
 //
-// This list is the guarantee. It is NOT complete for all time: git adds
-// config keys, and one class is deliberately not covered below.
-func hardeningFlags(repoDir string) []string {
+// This list is NOT complete for all time: git adds config keys, and one
+// class -- filter/merge drivers named by a repository's own .gitattributes
+// -- has no fixed key this enumeration could ever cover (see this
+// package's own top doc comment for how Step 171 closes that class
+// instead, structurally).
+func hardeningFlags() []string {
 	return []string{
-		// The repository is owned by the runtime, not by this process.
-		// Scoped to this exact path rather than the wildcard: a wildcard
-		// would also cover any other foreign-owned repository this
-		// process is ever pointed at, including one it did not create.
-		"-c", "safe.directory=" + repoDir,
-
 		// A repository-authored hook must never execute as this process.
+		// Kept as defense in depth: the agent-owned git-dir's own hooks/
+		// is already empty and agent-owned (internal/sandboxagent/
+		// gitdir.Seed), so this key is no longer reachable from a runtime
+		// write at all -- but a key that costs nothing to keep is kept.
 		"-c", "core.hooksPath=" + noHooksPath,
 
 		// credential.helper is the most dangerous of these, and it was
@@ -273,113 +293,92 @@ func hardeningFlags(repoDir string) []string {
 	}
 }
 
-// Three command classes were ONCE all left off the list above, and NOT
-// because they were safe. Two adversarial audit rounds, both reproduced
-// against real git, established that none of the three could be closed by
-// anything reachable through a fixed -c key -- and recorded why here so
-// the gap could not rot into a comment nobody rechecks; see
-// githarden_test.go for the executable proof each class actually runs.
+// Two command classes used to be left off the list above, and NOT because
+// they were safe: filter.<driver>.clean/.smudge and merge.<driver>.driver
+// each name a command chosen by the repository's own .gitattributes
+// ("<path> filter=<anything>" / "<path> merge=<anything>"), so there was
+// no fixed key a -c entry could ever reset to cover every case -- git
+// documents no flag that disables either mechanism wholesale
+// (gitattributes(5)). Two live proofs used to sit in githarden_test.go
+// (TestOpenClass_ContentFilterExecutes, TestOpenClass_MergeDriverExecutes)
+// showing a planted driver actually running.
 //
-//  1. filter.<driver>.clean/.smudge. A filter's driver name is chosen by
-//     the repository's own .gitattributes ("<path> filter=<anything>"),
-//     so there is no fixed "filter.X.clean" key a -c entry could reset
-//     once and cover every case: "-c filter.*.clean=" is not a wildcard
-//     to git, it names a literal, useless config section called "*".
-//     git documents no flag that disables the filter mechanism wholesale
-//     (gitattributes(5)). STILL OPEN.
+// Step 171 (§30.5) CLOSES both classes STRUCTURALLY, not by a flag: the
+// filter/merge driver name is still repository-chosen and unbounded, but
+// the .gitattributes/.git/config PAIR that arms one now lives only in the
+// runtime-owned worktree's .git, which sandbox-agent's own git never reads
+// any more (Repo/Args, this file's own top doc comment) -- there is no
+// config left to resolve the driver name against. See
+// TestClosedClass_ContentFilterDoesNotExecute and
+// TestClosedClass_MergeDriverDoesNotExecute (githarden_test.go) for the
+// executable proof, built against a real split git-dir via
+// internal/sandboxagent/gitdir.Seed, and
+// TestClosedClass_StashPopIndexDoesNotExecuteEither /
+// TestClosedClass_RuntimeHookDoesNotExecute for the two call shapes
+// (`stash pop --index`, a runtime-planted hook) this codebase actually
+// reaches that used to be exposed to this same gap.
 //
-//  2. merge.<driver>.driver. Same shape as (1) -- the driver name is
-//     chosen by the repository's own .gitattributes ("<path>
-//     merge=<anything>") -- and reachable through a command this
-//     codebase actually runs: internal/sandboxagent/gitclone's syncOne
-//     runs `git stash pop --index` to restore a stashed working tree,
-//     which invokes the configured merge driver on conflict. Root in
-//     production (workspaceowner.go). STILL OPEN.
+// remote.<name>.uploadpack/receivepack (a third class this package used to
+// record here) has no attributes half to reason about at all -- it lives
+// purely in .git/config -- and was already closed by the transport-class
+// hardening below, which denies both transports (file/ssh) that ever
+// consult it; see TestTransportClass_FileUploadPackNoLongerExecutes.
 //
-//  3. remote.<name>.uploadpack / remote.<name>.receivepack. Unlike (1)
-//     and (2), this key has no attributes half at all to reason about --
-//     it lives only in .git/config, names a command git runs as the
-//     LOCAL side of the pack protocol, and fires deterministically, with
-//     no race, on a plain `git fetch` or `git push` against a remote
-//     configured with that key. NOW CLOSED, as a consequence rather than
-//     by a key of its own: this key is consulted only for a local
-//     ("file") or ssh transport (verified: it is inert over the smart-HTTP
-//     transport this codebase actually uses -- see
-//     TestArgs_RealHTTPSCloneAndFetchStillWork, githarden_test.go), and
-//     the transport-class hardening below denies both. See
-//     TestTransportClass_FileUploadPackNoLongerExecutes for the executable
-//     proof, and its own doc comment for why (1)/(2) do NOT get the same
-//     treatment: their driver NAME is repository-chosen and unbounded, so
-//     no fixed transport-style allowlist reaches them the way a fixed
-//     protocol name does here.
+// Why the split git-dir, not a flag or an attributes override: a mitigation
+// for the filter class alone -- writing "* -filter" into
+// $GIT_DIR/info/attributes, gitattributes(5)'s own highest-precedence
+// attributes source -- was tried, measured against real git, and
+// WITHDRAWN before Step 171: the attributes file it wrote into lived
+// inside the SAME runtime-owned directory the attack started from, so the
+// runtime could delete or replace it between the write and git's read (0
+// of 60 racing trials blocked in measurement); it covered only the filter
+// class, not merge; and reaching it required a root-privileged
+// os.WriteFile into a directory an attacker controlled, itself a
+// redirectable primitive (via a symlink planted at the parent directory)
+// into truncating an arbitrary file on the host. A mitigation that adds a
+// root-privileged write into an attacker-owned directory, for a race it
+// cannot win, was net-negative -- worse than doing nothing, and the reason
+// this package waited for the structural fix instead of shipping a
+// half-measure.
 //
-// A tempting answer for (1) and (2) -- "the UID boundary (§30.5) already
-// covers this, since a repository-authored command either runs as the
-// runtime already, or never runs at all" -- does not survive contact
-// with what §30.5 actually grants. The runtime owns .git BECAUSE of that
-// boundary, which makes writing either key above into .git/config (and a
-// matching attribute into .gitattributes) an ORDINARY, unprivileged act
-// for it -- not a violation of the boundary. The violation is what
-// happens next: sandbox-agent's OWN later git invocations against that
-// SAME repository -- gitclone's SyncAll reconciling an already-existing
-// workspace exactly like a repo_image/snapshot_restore boot presents one,
-// its CleanForImageBuild running `checkout -- .` at image-bake time, or
-// any plain fetch/push -- read that config back and run the planted
-// command AS SANDBOX-AGENT. Same shape as the pre-push-hook exploit this
-// file's own top comment documents, one call removed. The SAME reasoning
-// is why the transport class above could NOT be closed by relying on
-// §30.5 either -- it took a fixed, enumerable key set instead, which (1)
-// and (2) do not have.
-//
-// A first attempt at a mitigation for (1) alone -- writing "* -filter"
-// into $GIT_DIR/info/attributes, gitattributes(5)'s own highest-
-// precedence attributes source -- was tried, measured against real git,
-// and WITHDRAWN. It failed on every axis that matters: the attributes
-// file it wrote into lives inside the same runtime-owned directory the
-// attack starts from, so the runtime can delete or replace it between
-// the write and git's read (0 of 60 racing trials blocked in
-// measurement); it addressed only (1), leaving (2) and (3) untouched (at
-// the time -- (3) closed later, by the transport class, not by this
-// mitigation or anything like it); and reaching it required a
-// root-privileged os.WriteFile into a directory an attacker controls,
-// which is itself a primitive an attacker could redirect (via a symlink
-// planted at the parent directory) into truncating an arbitrary file on
-// the host. A mitigation that adds a root-privileged write into an
-// attacker-owned directory, for a race it cannot win, is net-negative --
-// worse than doing nothing.
-//
-// CONCLUSION: (1) and (2) remain open, closed by nothing in this package
-// or closable by any flag, attributes override, or file written into
-// .git from a process that does not itself own .git. The only real
-// remedy for those two is structural: sandbox-agent must stop running
-// git against a .git directory the sandbox runtime owns (filed as a
-// follow-up plan row; find it by its own citation, never by a Step
-// number -- Step numbers do not belong in this source per this
-// codebase's own convention). Until that lands, they are a recorded,
-// accepted gap, not a fixed one. (3) is the one exception: it is fixed,
-// by the transport-class hardening above, precisely because -- unlike
-// (1) and (2) -- it never had an unbounded, repository-chosen namespace
-// to hide in.
-//
-// The trade-off a real fix would still need, decided here rather than
-// left to be discovered by a user with a checkout full of pointer files:
-// git-lfs is itself implemented as exactly this kind of content filter.
-// Today that trade is free regardless of any of the above --
+// git-lfs is itself implemented as exactly this kind of content filter:
 // deploy/sandbox-image/Dockerfile installs `git`, never `git-lfs`, so no
-// repository's LFS content is materialized by sandbox-agent's own
-// clone/sync either way; a repository using LFS already gets pointer
-// files, not real blobs. If git-lfs is ever added to the image AND a
-// real, race-free fix is ever built, that fix will need a deliberate,
-// named exception for the literal driver name "lfs" -- not a silent
-// regression discovered later.
+// repository's LFS content is ever materialized by sandbox-agent's own
+// clone/sync -- a repository using LFS gets pointer files, not real blobs,
+// regardless of any of the above. If git-lfs is ever added to the image,
+// that will need its own deliberate decision, not a silent regression
+// discovered later.
 
-// Args returns git's own arguments for a command operating on repoDir,
-// with the hardening ahead of whatever the caller wants to run.
+// Repo names one repository's own two directories after Step 171 (§30.5):
+// WorkTree is the runtime-visible checkout under the workspace
+// (<workspaceDir>/<name>), and GitDir is the AGENT-OWNED git-dir outside
+// /workspace that sandbox-agent's own git always uses instead of
+// WorkTree's own ".git" (internal/sandboxagent/gitdir.Layout.Repo builds
+// this pair; see that package's own doc comment for the full shape: which
+// pieces are agent-owned real files versus symlinked to the runtime's own
+// .git, and how HEAD is kept in sync both ways).
+type Repo struct {
+	WorkTree string
+	GitDir   string
+}
+
+// Args returns git's own arguments for a command operating on repo, with
+// the hardening ahead of whatever the caller wants to run: `-C <worktree>
+// --git-dir=<agent-dir> --work-tree=<worktree>`, then hardeningFlags, then
+// rest. The explicit --git-dir/--work-tree pair is what makes every other
+// flag in hardeningFlags a belt to an already-fastened structural
+// guarantee, not the guarantee itself (see this file's own top doc
+// comment): it points every hardened invocation at repo.GitDir -- an
+// agent-owned directory the runtime never writes to -- rather than
+// repo.WorkTree's own ".git", which the runtime owns. It also sidesteps
+// git's "detected dubious ownership" check entirely (verified directly),
+// so no safe.directory entry is set here at all any more.
 //
 // Callers pass what they would have passed anyway; the flags this adds
 // come first because git requires its -c options before the subcommand.
-func Args(repoDir string, rest ...string) []string {
-	args := append([]string{"-C", repoDir}, hardeningFlags(repoDir)...)
+func Args(repo Repo, rest ...string) []string {
+	args := []string{"-C", repo.WorkTree, "--git-dir=" + repo.GitDir, "--work-tree=" + repo.WorkTree}
+	args = append(args, hardeningFlags()...)
 	return append(args, rest...)
 }
 
@@ -391,44 +390,8 @@ func Args(repoDir string, rest ...string) []string {
 // default every OTHER call site in this codebase now builds explicitly;
 // a caller that needs a different base environment should build its own
 // Spec with Env(base) rather than use this one.
-func Spec(repoDir string, rest ...string) supervisor.Spec {
-	return supervisor.Spec{Path: "git", Args: Args(repoDir, rest...), Env: Env(nil)}
-}
-
-// Harden rewrites an already-assembled git argument list, inserting the
-// flags immediately after the "-C <dir>" the caller supplied.
-//
-// This exists for call sites that build their arguments elsewhere and pass
-// them through one shared runner: hardening the runner covers every one of
-// them at once, which is the only way this stays true as callers are
-// added. An argument list with no "-C <dir>" is returned unchanged and
-// with no repository-scoped safe.directory -- there is no repository path
-// to scope it to, and inventing a wildcard would quietly widen the very
-// thing this narrows.
-//
-// That "unchanged" fallback is deliberate for --version/no-repository
-// callers, and was ALSO, silently, exactly the bug in gitclone.cloneOne's
-// own `git clone` invocation: clone's own target directory is its last
-// POSITIONAL argument, never a "-C <dir>" (a fresh clone's own -C target
-// would have to already exist, and it does not yet), so a `git clone`
-// argument list handed to Harden has no "-C" for this loop to find and is
-// returned COMPLETELY UNCHANGED -- every flag below, silently absent, with
-// nothing about the call site itself hinting that Harden did nothing. Use
-// ArgsForClone (below) for `git clone` specifically -- never Harden --
-// precisely because this failure mode exists and looks, at the call site,
-// identical to correct usage.
-func Harden(args []string) []string {
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == "-C" {
-			repoDir := args[i+1]
-			flags := hardeningFlags(repoDir)
-			out := make([]string, 0, len(args)+len(flags))
-			out = append(out, args[:i+2]...)
-			out = append(out, flags...)
-			return append(out, args[i+2:]...)
-		}
-	}
-	return args
+func Spec(repo Repo, rest ...string) supervisor.Spec {
+	return supervisor.Spec{Path: "git", Args: Args(repo, rest...), Env: Env(nil)}
 }
 
 // ArgsForClone returns the hardening flags for a `git clone` invocation
@@ -436,17 +399,18 @@ func Harden(args []string) []string {
 // caller's own "clone" subcommand and its arguments, in full, e.g.
 // ["clone", "-c", "credential.helper=...", "--", url, dir]).
 //
-// Neither Args nor Harden fits `git clone`'s own shape: both key off a
-// "-C <dir>" that must precede the subcommand, but `git -C <dir> clone`
-// requires <dir> to ALREADY exist (-C changes directory before running
-// anything), which a fresh clone's own target never does at invocation
-// time -- dir is clone's own trailing POSITIONAL argument instead. This
-// function scopes safe.directory to dir directly (hardeningFlags itself
-// tolerates a path that does not exist yet -- it is only ever compared
-// against an owner UID once git actually opens it) without pretending a
-// "-C <dir>" belongs in the argument list at all.
+// A fresh `git clone` creates its own pristine .git -- there is no
+// agent-owned git-dir to point at yet (internal/sandboxagent/gitdir.Seed
+// runs AFTER a successful clone, per gitclone.CloneAll's own ordering), so
+// this does not take a Repo and does not add --git-dir/--work-tree at all;
+// dir is clone's own trailing POSITIONAL argument, never reachable via
+// "-C <dir>" (-C requires its target to already exist). No safe.directory
+// entry is added here either, for the same reason Args no longer adds one:
+// a clone's freshly-created .git is owned by this process itself, not by
+// the runtime, so there is nothing dubious about its ownership in the
+// first place.
 func ArgsForClone(dir string, rest ...string) []string {
-	return append(hardeningFlags(dir), rest...)
+	return append(hardeningFlags(), rest...)
 }
 
 // AllowedProtocol is the one git transport scheme sandbox-agent's own git

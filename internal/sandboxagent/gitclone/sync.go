@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sessionconfig"
@@ -15,6 +16,7 @@ import (
 	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/internal/sandboxagent/credentials"
 	"github.com/narvidev/narvi/internal/sandboxagent/githarden"
+	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
 
@@ -152,7 +154,8 @@ func (r SyncResult) ToCloneResult() CloneResult {
 func SyncAll(
 	ctx context.Context,
 	sup *supervisor.Supervisor,
-	workspaceDir string,
+	layout gitdir.Layout,
+	cred *syscall.Credential,
 	repos []sessionconfig.SessionConfigReposElem,
 	pathScope []string,
 	sessionID string,
@@ -184,7 +187,7 @@ func SyncAll(
 	for i, repo := range repos {
 		primary := i == 0
 
-		result := syncOne(ctx, sup, workspaceDir, repo, primary, pathScope, sessionID, credHelperArg,
+		result := syncOne(ctx, sup, layout, cred, repo, primary, pathScope, sessionID, credHelperArg,
 			fetchStepTimeout, stepTimeout, stopGrace, onGitSync, onGitFetchTiming, onGitCheckoutTiming)
 		results = append(results, result)
 
@@ -210,7 +213,8 @@ func SyncAll(
 func syncOne(
 	ctx context.Context,
 	sup *supervisor.Supervisor,
-	workspaceDir string,
+	layout gitdir.Layout,
+	cred *syscall.Credential,
 	repo sessionconfig.SessionConfigReposElem,
 	primary bool,
 	pathScope []string,
@@ -230,7 +234,24 @@ func syncOne(
 		return SyncResult{Repo: repo, Primary: primary, Err: err}
 	}
 
-	dir := filepath.Join(workspaceDir, repo.Name)
+	workspaceDir := layout.WorkspaceDir
+	repoHandle := layout.Repo(repo.Name)
+
+	// Step 171 (§30.5): (re-)seed this repo's own agent-owned git-dir
+	// FIRST, before any other git invocation in this function ever runs --
+	// SyncAll's whole reason for existing is an ALREADY-EXISTING workspace
+	// (baked into the image or restored from a snapshot), so, unlike
+	// CloneAll's fresh clone, there is no earlier point in this codebase's
+	// own control flow where Seed could have already run for this exact
+	// on-disk repo. gitdir.Seed is idempotent -- safe to call again for a
+	// workspace that DOES already carry a seeded git-dir from an earlier
+	// boot of the same long-lived sandbox.
+	if err := gitdir.Seed(ctx, sup, repoHandle, repo.Url, cred, stepTimeout, stopGrace); err != nil {
+		return SyncResult{Repo: repo, Primary: primary, Dir: filepath.Join(workspaceDir, repo.Name),
+			Err: fmt.Errorf("gitclone: seed agent git-dir for %s: %w", repo.Name, err)}
+	}
+
+	dir := repoHandle.WorkTree
 
 	branch := gitstate.ResolveSessionBranch(repo.Branch, sessionID)
 	// The RESOLVED branch (§3.4's own invented "narvi/<sessionID>" case,
@@ -269,7 +290,7 @@ func syncOne(
 	// change.
 	if len(pathScope) > 0 {
 		defer func() {
-			sparseErr := applySparseCheckout(ctx, sup, dir, pathScope, stepTimeout, stopGrace)
+			sparseErr := applySparseCheckout(ctx, sup, repoHandle, cred, pathScope, stepTimeout, stopGrace)
 			if sparseErr == nil {
 				return
 			}
@@ -296,7 +317,7 @@ func syncOne(
 		// only appends on top of one if any, and never touches
 		// result.State.
 		defer func() {
-			disableErr := disableSparseCheckoutIfEnabled(ctx, sup, dir, stepTimeout, stopGrace)
+			disableErr := disableSparseCheckoutIfEnabled(ctx, sup, repoHandle, cred, stepTimeout, stopGrace)
 			if disableErr == nil {
 				return
 			}
@@ -321,7 +342,7 @@ func syncOne(
 	// session explicitly named a branch (repo.Branch != nil) that isn't
 	// already local -- exactly the one case §19.3 says must never silently
 	// degrade: forking a same-named branch at a stale base.
-	localBranchExists, err := branchExistsLocally(ctx, sup, dir, branch, stepTimeout, stopGrace)
+	localBranchExists, err := branchExistsLocally(ctx, sup, repoHandle, cred, branch, stepTimeout, stopGrace)
 	if err != nil {
 		result.Err = fmt.Errorf("gitclone: determine whether branch %s exists locally (fetch degrade policy) for %s: %w", branch, repo.Name, err)
 		return result
@@ -334,7 +355,7 @@ func syncOne(
 	// "warm-boot latency" gating question with no visibility into this
 	// step's own contribution (up to GitFetchStepTimeout's 90s ceiling).
 	fetchStart := time.Now()
-	fetchResult := gitFetchStep(ctx, sup, credHelperArg, repo.Name, dir, branch, fetchStepTimeout, stopGrace)
+	fetchResult := gitFetchStep(ctx, sup, credHelperArg, repo.Name, repoHandle, cred, branch, fetchStepTimeout, stopGrace)
 	defaultBranch := fetchResult.defaultBranch
 	fetchErr := fetchResult.targetFetchErr
 	fetchSucceeded := fetchErr == nil
@@ -403,7 +424,7 @@ func syncOne(
 	// original stash-if-dirty/checkout/pop sequence below begins here,
 	// completely unchanged from before this Step.
 
-	dirty, err := gitStatusDirty(ctx, sup, dir, stepTimeout, stopGrace)
+	dirty, err := gitStatusDirty(ctx, sup, repoHandle, cred, stepTimeout, stopGrace)
 	if err != nil {
 		result.Err = fmt.Errorf("gitclone: git status for %s: %w", repo.Name, err)
 		return result
@@ -422,7 +443,7 @@ func syncOne(
 
 	if dirty {
 		onGitSync(repo.Name, "stash", branch)
-		stashErr := gitStashPush(ctx, sup, dir, stepTimeout, stopGrace)
+		stashErr := gitStashPush(ctx, sup, repoHandle, cred, stepTimeout, stopGrace)
 		state, _ = gitstate.Transition(state, gitstate.TriggerForStash(stashErr == nil))
 		if state == gitstate.StateStashFailed {
 			result.State = state
@@ -438,7 +459,7 @@ func syncOne(
 	// below (each their own, separately meaningful phase, not this step's
 	// own checkout latency) and the fetch step already timed above.
 	checkoutStart := time.Now()
-	checkoutErr := checkoutBranch(ctx, sup, repo.Name, dir, branch, defaultBranch, fetchErr, stepTimeout, stopGrace)
+	checkoutErr := checkoutBranch(ctx, sup, repo.Name, repoHandle, cred, branch, defaultBranch, fetchErr, stepTimeout, stopGrace)
 	onGitCheckoutTiming(repo.Name, time.Since(checkoutStart).Seconds(), checkoutErr != nil)
 	// Checked directly against checkoutErr, not gitstate.IsTerminal(state):
 	// a SUCCESSFUL checkout also lands in a state IsTerminal reports true
@@ -456,7 +477,7 @@ func syncOne(
 
 	if state == gitstate.StatePoppingStash {
 		onGitSync(repo.Name, "pop", branch)
-		popErr := gitStashPop(ctx, sup, dir, stepTimeout, stopGrace)
+		popErr := gitStashPop(ctx, sup, repoHandle, cred, stepTimeout, stopGrace)
 		state, _ = gitstate.Transition(state, gitstate.TriggerForPop(popErr == nil))
 		if state == gitstate.StatePopFailed {
 			result.State = state
@@ -492,60 +513,38 @@ func logIfStashRecoveryNeeded(ctx context.Context, repoName, dir, branch string,
 	)
 }
 
-// runGit runs `git <args...>` (already fully built, including any -C <dir>
-// prefix the caller supplies) via sup (never a bare exec.Command), bounded
-// by stepTimeout, and returns its trimmed stdout -- mirroring cloneOne's
-// own exact timeout/stop/error-wrapping shape (clone.go) precisely: a hang
-// is stopped (bounded by stopGrace, using the OUTER ctx for the Stop call,
-// not the already-expired step-scoped context) and reported as a timeout
-// failure; a non-zero exit or a wait failure is likewise a real, returned
-// error.
-func runGit(ctx context.Context, sup *supervisor.Supervisor, args []string, stepTimeout, stopGrace time.Duration) (string, error) {
+// runGit runs `git <args...>` against repo (no "-C <dir>" prefix needed --
+// githarden.Args(repo, ...) already adds -C/--git-dir/--work-tree),
+// through gitdir.Run -- the SAME choke point (SyncHeadIn/SyncHeadOut
+// bracket around the hardened spawn, via sup, never a bare
+// exec.Command) every other sandbox-agent git invocation now uses --
+// bounded by stepTimeout, and returns its trimmed stdout. Mirrors
+// cloneOne's own exact timeout/stop/error-wrapping shape (clone.go)
+// precisely: a hang is stopped (bounded by stopGrace, using the OUTER ctx
+// for the Stop call, not the already-expired step-scoped context) and
+// reported as a timeout failure; a non-zero exit or a wait failure is
+// likewise a real, returned error.
+//
+// Step 171 (§30.5): this used to run `git -C <dir> ...` directly against
+// the runtime-owned worktree .git, which internal/sandboxagent/githarden's
+// own doc comment records as reachable by filter.<driver>/merge.<driver>.
+// driver/remote.<name>.uploadpack-receivepack -- no -c flag or attributes
+// override could close that for a process still pointed at a
+// runtime-owned .git. Every call through this function now instead names
+// repo's own AGENT-OWNED git-dir (githarden.Args(repo, ...)), closing that
+// class structurally; see githarden's own top doc comment and
+// githarden_test.go for the executable proof.
+func runGit(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, args []string, stepTimeout, stopGrace time.Duration) (string, error) {
 	var stdout bytes.Buffer
-	// Hardened here rather than at each caller: every command routed
-	// through runGit runs against a workspace the agent runtime owns
-	// (§30.5), and the flags that make that safe are the same every time.
-	// See internal/sandboxagent/githarden for what they are and what
-	// happens without them. Callers still pass their own "-C <dir>";
-	// githarden.Harden rewrites the invocation around it.
-	//
-	// githarden's own doc comment records, and does not paper over, the
-	// gap Harden's -c flags cannot reach: filter.<driver>,
-	// merge.<driver>.driver, and remote.<name>.uploadpack/receivepack are
-	// each a command chosen by this same repository's own .git/config,
-	// which the agent runtime owns (§30.5), and every one of them is
-	// reachable by git invocations this package makes against an
-	// already-existing workspace (SyncAll's checkout/stash-pop,
-	// CleanForImageBuild's own `checkout -- .`). No flag or attributes
-	// override closes that for a process that still runs git against a
-	// runtime-owned .git; see githarden's doc comment and
-	// githarden_test.go for the recorded, executable proof.
-	//
-	// Env is built via githarden.Env(nil) here too, for the same reason:
-	// GIT_ALLOW_PROTOCOL is the actual guarantee behind the transport
-	// class now (an arbitrary "<name>::" remote helper or ftp/ftps has no
-	// fixed name the -c flags above can enumerate), and runGit is the one
-	// shared choke point every non-clone git invocation in this package
-	// already goes through -- setting it once here, rather than at each
-	// of runGit's own callers, is the same "one list, not eight copies"
-	// reasoning hardeningFlags' own doc comment gives for -c.
-	proc, err := sup.Spawn(supervisor.Spec{
+	spec := supervisor.Spec{
 		Path:   "git",
-		Args:   githarden.Harden(args),
+		Args:   githarden.Args(repo, args...),
 		Env:    githarden.Env(nil),
 		Stdout: &stdout,
-	})
-	if err != nil {
-		return "", fmt.Errorf("spawn git %s: %w", strings.Join(args, " "), err)
 	}
-
-	stepCtx, cancel := context.WithTimeout(ctx, stepTimeout)
-	defer cancel()
-
-	result, waitErr := proc.Wait(stepCtx)
-	if waitErr != nil {
-		_ = proc.Stop(ctx, stopGrace)
-		return "", fmt.Errorf("git %s: did not complete within %s: %w", strings.Join(args, " "), stepTimeout, waitErr)
+	result, err := gitdir.Run(ctx, sup, repo, cred, spec, stepTimeout, stopGrace)
+	if err != nil {
+		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
 	if result.Err != nil {
 		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), result.Err)
@@ -556,14 +555,14 @@ func runGit(ctx context.Context, sup *supervisor.Supervisor, args []string, step
 	return strings.TrimSpace(stdout.String()), nil
 }
 
-// gitStatusDirty runs `git -C <dir> status --porcelain` and reports
+// gitStatusDirty runs `git status --porcelain` against repo and reports
 // whether the working tree has any uncommitted change (§3.4:
 // "stash-if-dirty"). Any output at all (even a single line) means dirty;
 // empty output means clean. A real command failure (e.g. dir is not a git
 // repository) is returned as an error, distinct from "clean" -- this repo
 // never even reaches gitstate.Transition in that case (see syncOne).
-func gitStatusDirty(ctx context.Context, sup *supervisor.Supervisor, dir string, stepTimeout, stopGrace time.Duration) (bool, error) {
-	out, err := runGit(ctx, sup, []string{"-C", dir, "status", "--porcelain"}, stepTimeout, stopGrace)
+func gitStatusDirty(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, stepTimeout, stopGrace time.Duration) (bool, error) {
+	out, err := runGit(ctx, sup, repo, cred, []string{"status", "--porcelain"}, stepTimeout, stopGrace)
 	if err != nil {
 		return false, err
 	}
@@ -588,8 +587,8 @@ func gitStatusDirty(ctx context.Context, sup *supervisor.Supervisor, dir string,
 // moving the untracked file into the stash (matching what gitStatusDirty
 // already decided counts as "dirty"), so the pop below has a real entry to
 // restore.
-func gitStashPush(ctx context.Context, sup *supervisor.Supervisor, dir string, stepTimeout, stopGrace time.Duration) error {
-	_, err := runGit(ctx, sup, []string{"-C", dir, "stash", "push", "--include-untracked"}, stepTimeout, stopGrace)
+func gitStashPush(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, stepTimeout, stopGrace time.Duration) error {
+	_, err := runGit(ctx, sup, repo, cred, []string{"stash", "push", "--include-untracked"}, stepTimeout, stopGrace)
 	return err
 }
 
@@ -609,8 +608,8 @@ func gitStashPush(ctx context.Context, sup *supervisor.Supervisor, dir string, s
 // leaves the stash entry in place in the stash list -- git itself never
 // drops it on a conflict -- so nothing is silently lost even on this path,
 // only left for a human to resolve.
-func gitStashPop(ctx context.Context, sup *supervisor.Supervisor, dir string, stepTimeout, stopGrace time.Duration) error {
-	_, err := runGit(ctx, sup, []string{"-C", dir, "stash", "pop", "--index"}, stepTimeout, stopGrace)
+func gitStashPop(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, stepTimeout, stopGrace time.Duration) error {
+	_, err := runGit(ctx, sup, repo, cred, []string{"stash", "pop", "--index"}, stepTimeout, stopGrace)
 	return err
 }
 
@@ -689,8 +688,8 @@ type fetchStepOutcome struct {
 // already closed regardless, unconditionally, by hardeningFlags' own
 // remote.origin.proxy= (githarden.go), which every runGit call below
 // carries via githarden.Harden.
-func gitFetchStep(ctx context.Context, sup *supervisor.Supervisor, credHelperArg, repoName, dir, branch string, stepTimeout, stopGrace time.Duration) fetchStepOutcome {
-	defaultBranch, lsErr := resolveDefaultBranch(ctx, sup, credHelperArg, dir, stepTimeout, stopGrace)
+func gitFetchStep(ctx context.Context, sup *supervisor.Supervisor, credHelperArg, repoName string, repo githarden.Repo, cred *syscall.Credential, branch string, stepTimeout, stopGrace time.Duration) fetchStepOutcome {
+	defaultBranch, lsErr := resolveDefaultBranch(ctx, sup, credHelperArg, repo, cred, stepTimeout, stopGrace)
 	if lsErr != nil {
 		// The remote is unreachable (or its advertised default branch name
 		// itself failed validation) -- the target-branch fetch below is
@@ -706,11 +705,11 @@ func gitFetchStep(ctx context.Context, sup *supervisor.Supervisor, credHelperArg
 			"repo", repoName, "error", lsErr)
 		return fetchStepOutcome{
 			resolveDefaultErr: lsErr,
-			targetFetchErr:    gitFetchRef(ctx, sup, credHelperArg, dir, branch, stepTimeout, stopGrace),
+			targetFetchErr:    gitFetchRef(ctx, sup, credHelperArg, repo, cred, branch, stepTimeout, stopGrace),
 		}
 	}
 
-	defaultFetchErr := gitFetchRef(ctx, sup, credHelperArg, dir, defaultBranch, stepTimeout, stopGrace)
+	defaultFetchErr := gitFetchRef(ctx, sup, credHelperArg, repo, cred, defaultBranch, stepTimeout, stopGrace)
 	if branch == defaultBranch {
 		// Same ref -- the fetch above already covers it; a second,
 		// identical invocation would be pure waste, and this single outcome
@@ -718,7 +717,7 @@ func gitFetchStep(ctx context.Context, sup *supervisor.Supervisor, credHelperArg
 		return fetchStepOutcome{defaultBranch: defaultBranch, defaultFetchErr: defaultFetchErr, targetFetchErr: defaultFetchErr}
 	}
 
-	targetFetchErr := gitFetchRef(ctx, sup, credHelperArg, dir, branch, stepTimeout, stopGrace)
+	targetFetchErr := gitFetchRef(ctx, sup, credHelperArg, repo, cred, branch, stepTimeout, stopGrace)
 	if defaultFetchErr != nil {
 		// Logged here -- previously discarded entirely whenever branch !=
 		// defaultBranch (Finding 5): resolveDefaultBranch itself succeeded,
@@ -759,9 +758,9 @@ func gitFetchStep(ctx context.Context, sup *supervisor.Supervisor, credHelperArg
 // resolves to. See githarden.go's own "transport class" doc comment and
 // TestTransportClass_RemoteOriginProxyClosesRewrittenURL (githarden_test.go)
 // for the verified reasoning and its executable proof.
-func resolveDefaultBranch(ctx context.Context, sup *supervisor.Supervisor, credHelperArg, dir string, stepTimeout, stopGrace time.Duration) (string, error) {
-	args := []string{"-C", dir, "-c", "credential.helper=" + credHelperArg, "ls-remote", "--symref", "origin", "HEAD"}
-	out, err := runGit(ctx, sup, args, stepTimeout, stopGrace)
+func resolveDefaultBranch(ctx context.Context, sup *supervisor.Supervisor, credHelperArg string, repo githarden.Repo, cred *syscall.Credential, stepTimeout, stopGrace time.Duration) (string, error) {
+	args := []string{"-c", "credential.helper=" + credHelperArg, "ls-remote", "--symref", "origin", "HEAD"}
+	out, err := runGit(ctx, sup, repo, cred, args, stepTimeout, stopGrace)
 	if err != nil {
 		return "", fmt.Errorf("resolve default branch: %w", err)
 	}
@@ -802,9 +801,9 @@ func resolveDefaultBranch(ctx context.Context, sup *supervisor.Supervisor, credH
 // own unconditional, remote-NAME-keyed "-c remote.origin.proxy=", added by
 // runGit via githarden.Harden -- not a session-url-keyed override that
 // could silently miss the runtime-owned url git actually contacts.
-func gitFetchRef(ctx context.Context, sup *supervisor.Supervisor, credHelperArg, dir, ref string, stepTimeout, stopGrace time.Duration) error {
-	args := []string{"-C", dir, "-c", "credential.helper=" + credHelperArg, "fetch", "origin", "--", ref}
-	_, err := runGit(ctx, sup, args, stepTimeout, stopGrace)
+func gitFetchRef(ctx context.Context, sup *supervisor.Supervisor, credHelperArg string, repo githarden.Repo, cred *syscall.Credential, ref string, stepTimeout, stopGrace time.Duration) error {
+	args := []string{"-c", "credential.helper=" + credHelperArg, "fetch", "origin", "--", ref}
+	_, err := runGit(ctx, sup, repo, cred, args, stepTimeout, stopGrace)
 	return err
 }
 
@@ -820,23 +819,15 @@ func gitFetchRef(ctx context.Context, sup *supervisor.Supervisor, credHelperArg,
 // checking whether this Step's own new boot-time fetch step actually
 // fetched it), each of which supplies its own prefix so this function itself
 // stays agnostic to which kind of ref it is checking.
-func refExistsQuiet(ctx context.Context, sup *supervisor.Supervisor, dir, fullRef string, stepTimeout, stopGrace time.Duration) (bool, error) {
-	proc, err := sup.Spawn(supervisor.Spec{
+func refExistsQuiet(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, fullRef string, stepTimeout, stopGrace time.Duration) (bool, error) {
+	spec := supervisor.Spec{
 		Path: "git",
-		Args: githarden.Args(dir, "rev-parse", "--verify", "--quiet", fullRef),
+		Args: githarden.Args(repo, "rev-parse", "--verify", "--quiet", fullRef),
 		Env:  githarden.Env(nil),
-	})
-	if err != nil {
-		return false, fmt.Errorf("spawn git rev-parse --verify: %w", err)
 	}
-
-	stepCtx, cancel := context.WithTimeout(ctx, stepTimeout)
-	defer cancel()
-
-	result, waitErr := proc.Wait(stepCtx)
-	if waitErr != nil {
-		_ = proc.Stop(ctx, stopGrace)
-		return false, fmt.Errorf("git rev-parse --verify: did not complete within %s: %w", stepTimeout, waitErr)
+	result, err := gitdir.Run(ctx, sup, repo, cred, spec, stepTimeout, stopGrace)
+	if err != nil {
+		return false, fmt.Errorf("git rev-parse --verify: %w", err)
 	}
 	if result.Err != nil {
 		return false, fmt.Errorf("git rev-parse --verify: %w", result.Err)
@@ -852,11 +843,11 @@ func refExistsQuiet(ctx context.Context, sup *supervisor.Supervisor, dir, fullRe
 }
 
 // branchExistsLocally reports whether branch exists as a LOCAL branch
-// (refs/heads/<branch>) in dir -- never a coincidentally-matching tag or
+// (refs/heads/<branch>) in repo -- never a coincidentally-matching tag or
 // remote-tracking ref. See refExistsQuiet's own doc comment for the
 // exit-code semantics this relies on.
-func branchExistsLocally(ctx context.Context, sup *supervisor.Supervisor, dir, branch string, stepTimeout, stopGrace time.Duration) (bool, error) {
-	return refExistsQuiet(ctx, sup, dir, "refs/heads/"+branch, stepTimeout, stopGrace)
+func branchExistsLocally(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, branch string, stepTimeout, stopGrace time.Duration) (bool, error) {
+	return refExistsQuiet(ctx, sup, repo, cred, "refs/heads/"+branch, stepTimeout, stopGrace)
 }
 
 // remoteBranchExists reports whether branch exists as a REMOTE-TRACKING
@@ -867,8 +858,8 @@ func branchExistsLocally(ctx context.Context, sup *supervisor.Supervisor, dir, b
 // remote-tracking preference chain does not need to: it only cares whether
 // the ref is USABLE right now as a checkout base. See refExistsQuiet's own
 // doc comment for the exit-code semantics this relies on.
-func remoteBranchExists(ctx context.Context, sup *supervisor.Supervisor, dir, branch string, stepTimeout, stopGrace time.Duration) (bool, error) {
-	return refExistsQuiet(ctx, sup, dir, "refs/remotes/origin/"+branch, stepTimeout, stopGrace)
+func remoteBranchExists(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, branch string, stepTimeout, stopGrace time.Duration) (bool, error) {
+	return refExistsQuiet(ctx, sup, repo, cred, "refs/remotes/origin/"+branch, stepTimeout, stopGrace)
 }
 
 // checkoutBranch checks out branch in dir, creating it from HEAD (§3.4:
@@ -911,24 +902,24 @@ func remoteBranchExists(ctx context.Context, sup *supervisor.Supervisor, dir, br
 // reason branch's own fetch did not land a usable remote-tracking ref,
 // rather than asserting a single, invented reason ("does not exist
 // upstream") regardless of what really happened.
-func checkoutBranch(ctx context.Context, sup *supervisor.Supervisor, repoName, dir, branch, defaultBranch string, targetFetchErr error, stepTimeout, stopGrace time.Duration) error {
-	exists, err := branchExistsLocally(ctx, sup, dir, branch, stepTimeout, stopGrace)
+func checkoutBranch(ctx context.Context, sup *supervisor.Supervisor, repoName string, repo githarden.Repo, cred *syscall.Credential, branch, defaultBranch string, targetFetchErr error, stepTimeout, stopGrace time.Duration) error {
+	exists, err := branchExistsLocally(ctx, sup, repo, cred, branch, stepTimeout, stopGrace)
 	if err != nil {
 		return fmt.Errorf("determine whether branch %s exists: %w", branch, err)
 	}
 
-	args := []string{"-C", dir, "checkout"}
+	args := []string{"checkout"}
 	if exists {
 		args = append(args, branch, "--")
 	} else {
-		base, err := checkoutBase(ctx, sup, repoName, dir, branch, defaultBranch, targetFetchErr, stepTimeout, stopGrace)
+		base, err := checkoutBase(ctx, sup, repoName, repo, cred, branch, defaultBranch, targetFetchErr, stepTimeout, stopGrace)
 		if err != nil {
 			return fmt.Errorf("determine checkout base for %s: %w", branch, err)
 		}
 		args = append(args, "-b", branch, base, "--")
 	}
 
-	_, err = runGit(ctx, sup, args, stepTimeout, stopGrace)
+	_, err = runGit(ctx, sup, repo, cred, args, stepTimeout, stopGrace)
 	return err
 }
 
@@ -960,8 +951,8 @@ func checkoutBranch(ctx context.Context, sup *supervisor.Supervisor, repoName, d
 // actual value, and targetFetchErr itself was silently discarded here --
 // this is the ONE place in this package that reason would otherwise have
 // been surfaced at all, even at Info.
-func checkoutBase(ctx context.Context, sup *supervisor.Supervisor, repoName, dir, branch, defaultBranch string, targetFetchErr error, stepTimeout, stopGrace time.Duration) (string, error) {
-	branchFetched, err := remoteBranchExists(ctx, sup, dir, branch, stepTimeout, stopGrace)
+func checkoutBase(ctx context.Context, sup *supervisor.Supervisor, repoName string, repo githarden.Repo, cred *syscall.Credential, branch, defaultBranch string, targetFetchErr error, stepTimeout, stopGrace time.Duration) (string, error) {
+	branchFetched, err := remoteBranchExists(ctx, sup, repo, cred, branch, stepTimeout, stopGrace)
 	if err != nil {
 		return "", err
 	}
@@ -975,7 +966,7 @@ func checkoutBase(ctx context.Context, sup *supervisor.Supervisor, repoName, dir
 	// only efficiency: were defaultBranch == branch, remoteBranchExists
 	// would simply re-confirm the same false result.
 	if defaultBranch != "" && defaultBranch != branch {
-		defaultFetched, err := remoteBranchExists(ctx, sup, dir, defaultBranch, stepTimeout, stopGrace)
+		defaultFetched, err := remoteBranchExists(ctx, sup, repo, cred, defaultBranch, stepTimeout, stopGrace)
 		if err != nil {
 			return "", err
 		}
@@ -1045,18 +1036,18 @@ func checkoutBase(ctx context.Context, sup *supervisor.Supervisor, repoName, dir
 // primary fix leaves no token file behind at all. A purge failure is
 // fatal, matching every other failure in this function's own loop above:
 // a workspace this function cannot fully clean is not safe to snapshot.
-func CleanForImageBuild(ctx context.Context, sup *supervisor.Supervisor, workspaceDir string, repoNames []string, credentialCacheDir string, timeout, stopGrace time.Duration) error {
+func CleanForImageBuild(ctx context.Context, sup *supervisor.Supervisor, layout gitdir.Layout, cred *syscall.Credential, repoNames []string, credentialCacheDir string, timeout, stopGrace time.Duration) error {
 	for _, name := range repoNames {
 		if err := reposource.ValidateRepoName(name); err != nil {
 			return fmt.Errorf("gitclone: invalid repo name %q before image-build clean (fatal): %w", name, err)
 		}
 
-		dir := filepath.Join(workspaceDir, name)
+		repo := layout.Repo(name)
 
-		if _, err := runGit(ctx, sup, []string{"-C", dir, "clean", "-fdx"}, timeout, stopGrace); err != nil {
+		if _, err := runGit(ctx, sup, repo, cred, []string{"clean", "-fdx"}, timeout, stopGrace); err != nil {
 			return fmt.Errorf("gitclone: clean %s before snapshot (fatal): %w", name, err)
 		}
-		if _, err := runGit(ctx, sup, []string{"-C", dir, "checkout", "--", "."}, timeout, stopGrace); err != nil {
+		if _, err := runGit(ctx, sup, repo, cred, []string{"checkout", "--", "."}, timeout, stopGrace); err != nil {
 			return fmt.Errorf("gitclone: discard tracked modifications in %s before snapshot (fatal): %w", name, err)
 		}
 	}
