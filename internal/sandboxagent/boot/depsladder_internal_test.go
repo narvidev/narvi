@@ -11,8 +11,32 @@ import (
 	"testing"
 	"time"
 
+	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
+	"github.com/narvidev/narvi/internal/sandboxagent/githarden"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
+
+// seedTestRepo builds a fresh agent-owned git-dir (a temp root, EnsureRoot
+// + Seed) for the already-existing, non-bare git repo at wt, and returns
+// the resulting githarden.Repo plus a Supervisor callers can drive
+// setupUnchangedSinceBuild's own gitdir.Run choke point through. cred is
+// always nil here -- these tests run as the same uid throughout (no real
+// runtime/agent identity split), matching every other gitdir-adjacent
+// test's own "cred == nil (self) in tests" convention.
+func seedTestRepo(t *testing.T, wt string) (githarden.Repo, *supervisor.Supervisor) {
+	t.Helper()
+	root := t.TempDir()
+	if err := gitdir.EnsureRoot(root); err != nil {
+		t.Fatalf("gitdir.EnsureRoot: %v", err)
+	}
+	layout := gitdir.Layout{Root: root, WorkspaceDir: filepath.Dir(wt)}
+	repo := layout.Repo(filepath.Base(wt))
+	sup := supervisor.New()
+	if err := gitdir.Seed(context.Background(), sup, repo, "https://example.invalid/repo.git", nil, 5*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("gitdir.Seed: %v", err)
+	}
+	return repo, sup
+}
 
 // mkdirAllInternal/initGitRepoInternal/runGitInternal duplicate
 // fingerprint_test.go's own boot_test-package helpers of almost the same
@@ -378,7 +402,8 @@ func TestSetupUnchangedSinceBuild_Unchanged(t *testing.T) {
 	runGitInternal(t, dir, "add", "other.txt")
 	runGitInternal(t, dir, "commit", "-m", "unrelated change")
 
-	unchanged, err := setupUnchangedSinceBuild(dir, builtSHA, 5*time.Second)
+	repo, sup := seedTestRepo(t, dir)
+	unchanged, err := setupUnchangedSinceBuild(context.Background(), sup, repo, nil, builtSHA, 5*time.Second, 5*time.Second)
 	if err != nil {
 		t.Fatalf("setupUnchangedSinceBuild() error = %v, want nil", err)
 	}
@@ -409,7 +434,8 @@ func TestSetupUnchangedSinceBuild_Changed(t *testing.T) {
 	runGitInternal(t, dir, "add", "setup.sh")
 	runGitInternal(t, dir, "commit", "-m", "change setup.sh")
 
-	unchanged, err := setupUnchangedSinceBuild(dir, builtSHA, 5*time.Second)
+	repo, sup := seedTestRepo(t, dir)
+	unchanged, err := setupUnchangedSinceBuild(context.Background(), sup, repo, nil, builtSHA, 5*time.Second, 5*time.Second)
 	if err != nil {
 		t.Fatalf("setupUnchangedSinceBuild() error = %v, want nil (a real diff is not an error)", err)
 	}
@@ -429,7 +455,8 @@ func TestSetupUnchangedSinceBuild_UnresolvableSHAIsAnError(t *testing.T) {
 	mkdirAllInternal(t, dir)
 	initGitRepoInternal(t, dir)
 
-	_, err := setupUnchangedSinceBuild(dir, "0000000000000000000000000000000000000000", 5*time.Second)
+	repo, sup := seedTestRepo(t, dir)
+	_, err := setupUnchangedSinceBuild(context.Background(), sup, repo, nil, "0000000000000000000000000000000000000000", 5*time.Second, 5*time.Second)
 	if err == nil {
 		t.Fatal("setupUnchangedSinceBuild() error = nil, want a real error for an unresolvable builtSHA")
 	}
@@ -464,11 +491,10 @@ func TestSetupUnchangedSinceBuild_RejectsMalformedBuiltSHA(t *testing.T) {
 		{"over-long value", strings.Repeat("a", 41)},
 		{"under-long value", strings.Repeat("a", 39)},
 	}
+	repo, sup := seedTestRepo(t, dir)
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			_, err := setupUnchangedSinceBuild(dir, tc.builtSHA, 5*time.Second)
+			_, err := setupUnchangedSinceBuild(context.Background(), sup, repo, nil, tc.builtSHA, 5*time.Second, 5*time.Second)
 			if err == nil {
 				t.Fatalf("setupUnchangedSinceBuild(builtSHA=%q) error = nil, want a validation error", tc.builtSHA)
 			}
@@ -502,7 +528,8 @@ func TestSetupUnchangedSinceBuild_AcceptsValidFullSHA(t *testing.T) {
 		t.Fatalf("precondition failed: git rev-parse HEAD returned %q (%d chars), want a 40-character sha", builtSHA, len(builtSHA))
 	}
 
-	unchanged, err := setupUnchangedSinceBuild(dir, builtSHA, 5*time.Second)
+	repo, sup := seedTestRepo(t, dir)
+	unchanged, err := setupUnchangedSinceBuild(context.Background(), sup, repo, nil, builtSHA, 5*time.Second, 5*time.Second)
 	if err != nil {
 		t.Fatalf("setupUnchangedSinceBuild() error = %v, want nil (a well-formed, resolvable sha must pass validation)", err)
 	}

@@ -21,6 +21,7 @@ import (
 	"github.com/narvidev/narvi/internal/domain/sandboxboot"
 	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/internal/sandboxagent/boot"
+	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
 	"github.com/narvidev/narvi/internal/sandboxagent/services"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
@@ -115,6 +116,11 @@ func TestRunBootSequence_DockerRequired_SpawnsDockerdBeforeRunBoot(t *testing.T)
 		WorkspaceDir:       t.TempDir(),
 		CredentialCacheDir: t.TempDir(),
 		SessionConfig:      dockerTestSessionConfig(true),
+		// §30.5: see bootsequence_cleanbuild_integration_test.go's
+		// identical comment -- gitclone.CloneAll's own real lchown needs a
+		// self-uid/gid Credential to run unprivileged.
+		RuntimeUID: uint32(os.Getuid()),
+		RuntimeGID: uint32(os.Getgid()),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), bootSequenceTestTimeout)
@@ -127,7 +133,7 @@ func TestRunBootSequence_DockerRequired_SpawnsDockerdBeforeRunBoot(t *testing.T)
 	noopHookTiming := func(string, string, string, bool, bool, float64) {}
 	secretEnv := []string{dockerMarkerEnvVar + "=" + markerPath}
 
-	bootErr := runBootSequence(ctx, sup, cfg, timeouts, secretEnv, nil, noopProgress, noopGitSync, noopFetchTiming, noopCheckoutTiming, noopHookTiming)
+	bootErr := runBootSequence(ctx, sup, cfg, gitdir.Layout{Root: t.TempDir(), WorkspaceDir: cfg.WorkspaceDir}, nil, timeouts, secretEnv, nil, noopProgress, noopGitSync, noopFetchTiming, noopCheckoutTiming, noopHookTiming)
 	t.Logf("runBootSequence() returned: %v (outcome depends on this machine's own real docker socket state; not asserted on)", bootErr)
 
 	// 10s, not a tighter budget: this test proved flaky under a full,
@@ -164,6 +170,11 @@ func TestRunBootSequence_DockerFalse_NeverSpawnsDockerd(t *testing.T) {
 		WorkspaceDir:       t.TempDir(),
 		CredentialCacheDir: t.TempDir(),
 		SessionConfig:      dockerTestSessionConfig(false),
+		// §30.5: see bootsequence_cleanbuild_integration_test.go's
+		// identical comment -- gitclone.CloneAll's own real lchown needs a
+		// self-uid/gid Credential to run unprivileged.
+		RuntimeUID: uint32(os.Getuid()),
+		RuntimeGID: uint32(os.Getgid()),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), bootSequenceTestTimeout)
@@ -176,7 +187,7 @@ func TestRunBootSequence_DockerFalse_NeverSpawnsDockerd(t *testing.T) {
 	noopHookTiming := func(string, string, string, bool, bool, float64) {}
 	secretEnv := []string{dockerMarkerEnvVar + "=" + markerPath}
 
-	if err := runBootSequence(ctx, sup, cfg, platform.DefaultTimeouts(), secretEnv, nil, noopProgress, noopGitSync, noopFetchTiming, noopCheckoutTiming, noopHookTiming); err != nil {
+	if err := runBootSequence(ctx, sup, cfg, gitdir.Layout{Root: t.TempDir(), WorkspaceDir: cfg.WorkspaceDir}, nil, platform.DefaultTimeouts(), secretEnv, nil, noopProgress, noopGitSync, noopFetchTiming, noopCheckoutTiming, noopHookTiming); err != nil {
 		t.Fatalf("runBootSequence() error = %v, want nil (Docker=false must never even attempt to spawn dockerd)", err)
 	}
 

@@ -1,6 +1,7 @@
 package boot_test
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,7 +10,29 @@ import (
 
 	"github.com/narvidev/narvi/internal/domain/sandboxboot"
 	"github.com/narvidev/narvi/internal/sandboxagent/boot"
+	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
+	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
+
+// seedFingerprintRepo builds a fresh agent-owned git-dir for the
+// already-existing, non-bare repo at workspaceDir/name -- §30.5:
+// DiscoverRepoSHAs now only reads a repo whose agent git-dir has
+// already been seeded (see that function's own doc comment), so every
+// test repo in this file needs one before DiscoverRepoSHAs/
+// CollectFingerprint can see it at all.
+func seedFingerprintRepo(t *testing.T, workspaceDir, name string) (gitdir.Layout, *supervisor.Supervisor) {
+	t.Helper()
+	root := t.TempDir()
+	if err := gitdir.EnsureRoot(root); err != nil {
+		t.Fatalf("gitdir.EnsureRoot: %v", err)
+	}
+	layout := gitdir.Layout{Root: root, WorkspaceDir: workspaceDir}
+	sup := supervisor.New()
+	if err := gitdir.Seed(context.Background(), sup, layout.Repo(name), "https://example.invalid/"+name+".git", nil, 5*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("gitdir.Seed: %v", err)
+	}
+	return layout, sup
+}
 
 func TestDiscoverRepoSHAs(t *testing.T) {
 	t.Parallel()
@@ -23,7 +46,8 @@ func TestDiscoverRepoSHAs(t *testing.T) {
 	plainDir := filepath.Join(workspaceDir, "not-a-repo")
 	mkdirAll(t, plainDir)
 
-	shas := boot.DiscoverRepoSHAs(workspaceDir, 5*time.Second)
+	layout, sup := seedFingerprintRepo(t, workspaceDir, "repo-a")
+	shas := boot.DiscoverRepoSHAs(context.Background(), sup, layout, nil, nil, 5*time.Second, 5*time.Second)
 
 	sha, ok := shas["repo-a"]
 	if !ok {
@@ -41,7 +65,10 @@ func TestDiscoverRepoSHAs(t *testing.T) {
 func TestDiscoverRepoSHAs_NonexistentWorkspace(t *testing.T) {
 	t.Parallel()
 
-	shas := boot.DiscoverRepoSHAs(filepath.Join(t.TempDir(), "does-not-exist"), 5*time.Second)
+	workspaceDir := filepath.Join(t.TempDir(), "does-not-exist")
+	layout := gitdir.Layout{Root: t.TempDir(), WorkspaceDir: workspaceDir}
+	sup := supervisor.New()
+	shas := boot.DiscoverRepoSHAs(context.Background(), sup, layout, nil, nil, 5*time.Second, 5*time.Second)
 	if len(shas) != 0 {
 		t.Errorf("DiscoverRepoSHAs() = %v, want empty map for a nonexistent workspaceDir", shas)
 	}
@@ -62,7 +89,8 @@ func TestCollectFingerprint(t *testing.T) {
 		WorkspaceDir: workspaceDir,
 	}
 
-	fp := boot.CollectFingerprint(cfg, 5*time.Second, "")
+	layout, sup := seedFingerprintRepo(t, workspaceDir, "repo-a")
+	fp := boot.CollectFingerprint(context.Background(), sup, cfg, layout, nil, nil, 5*time.Second, 5*time.Second, "")
 
 	if fp.AgentVersion != cfg.AgentVersion {
 		t.Errorf("AgentVersion = %q, want %q", fp.AgentVersion, cfg.AgentVersion)
@@ -84,13 +112,16 @@ func TestCollectFingerprint(t *testing.T) {
 func TestCollectFingerprint_OpenCodeVersion(t *testing.T) {
 	t.Parallel()
 
+	workspaceDir := t.TempDir()
 	cfg := boot.Config{
 		BootMode:     sandboxboot.BootModeFresh,
 		AgentVersion: "1.2.3",
-		WorkspaceDir: t.TempDir(),
+		WorkspaceDir: workspaceDir,
 	}
 
-	fp := boot.CollectFingerprint(cfg, 5*time.Second, "1.17.15")
+	layout := gitdir.Layout{Root: t.TempDir(), WorkspaceDir: workspaceDir}
+	sup := supervisor.New()
+	fp := boot.CollectFingerprint(context.Background(), sup, cfg, layout, nil, nil, 5*time.Second, 5*time.Second, "1.17.15")
 	if fp.OpenCodeVersion != "1.17.15" {
 		t.Errorf("OpenCodeVersion = %q, want %q", fp.OpenCodeVersion, "1.17.15")
 	}

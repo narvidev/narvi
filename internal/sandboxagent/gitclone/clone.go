@@ -7,12 +7,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sessionconfig"
 	"github.com/narvidev/narvi/internal/domain/environment"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/platform"
+	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
 	"github.com/narvidev/narvi/internal/sandboxagent/githarden"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
@@ -63,10 +65,31 @@ type CloneResult struct {
 // a warning and does not stop the loop; subsequent repos still get
 // cloned. results always reflects every repo actually attempted (in
 // order), regardless of outcome.
+// layout is this sandbox's own gitdir.Layout (Root = boot.Config.
+// GitDirRoot, WorkspaceDir = workspaceDir -- the two must agree; callers
+// build layout with the SAME workspaceDir this function derives its own
+// dir from). cred is the runtime's own *syscall.Credential
+// (§30.5) -- threaded through to gitdir.Seed (whose own sparse-checkout
+// import reads the runtime's worktree config AS the runtime) and to
+// applySparseCheckout's own gitdir.Run/MirrorSparseCheckout calls.
+// chownRepo re-owns one freshly-cloned-and-seeded repo's own worktree for
+// the isolated agent runtime (boot.ChownWorkspaceForRuntime, threaded in
+// as a plain func to avoid this package importing boot at all) --
+// deliberately called HERE, per repo, immediately after Seed, rather than
+// once at the very end of the whole boot sequence the way the flow this
+// replaces did: sandbox-agent's own later writes into this same
+// repo (hooks, the AGENTS.md manifest) still succeed regardless of this
+// chown's outcome when sandbox-agent runs as root (the real production
+// case) or as the same uid as the runtime (tests) -- see
+// boot.ChownWorkspaceForRuntime's own doc comment for why the runtime
+// needs this at all. nil is accepted (skips the chown -- the dev/test
+// default) for callers with no runtime identity to re-own for.
 func CloneAll(
 	ctx context.Context,
 	sup *supervisor.Supervisor,
-	workspaceDir string,
+	layout gitdir.Layout,
+	cred *syscall.Credential,
+	chownRepo func(dir string) error,
 	repos []sessionconfig.SessionConfigReposElem,
 	pathScope []string,
 	cloneTimeout, stopGrace time.Duration,
@@ -79,6 +102,7 @@ func CloneAll(
 		return nil, fmt.Errorf("gitclone: invalid path scope: %w", err)
 	}
 
+	workspaceDir := layout.WorkspaceDir
 	if err := os.MkdirAll(workspaceDir, 0o755); err != nil {
 		return nil, fmt.Errorf("gitclone: create workspace dir %s: %w", workspaceDir, err)
 	}
@@ -105,8 +129,23 @@ func CloneAll(
 			dir = filepath.Join(workspaceDir, repo.Name)
 			cloneErr = cloneOne(ctx, sup, credHelperArg, repo, dir, cloneTimeout, stopGrace)
 		}
+
+		// §30.5: seed this repo's own agent-owned git-dir
+		// IMMEDIATELY after a successful clone, before any later git
+		// invocation (applySparseCheckout, below, or anything a caller
+		// does afterward) ever runs against it -- see
+		// internal/sandboxagent/gitdir's own package doc comment for the
+		// shape this builds.
+		var repoHandle githarden.Repo
+		if cloneErr == nil {
+			repoHandle = layout.Repo(repo.Name)
+			cloneErr = gitdir.Seed(ctx, sup, repoHandle, repo.Url, cred, cloneTimeout, stopGrace)
+		}
+		if cloneErr == nil && chownRepo != nil {
+			cloneErr = chownRepo(dir)
+		}
 		if cloneErr == nil && scoped {
-			cloneErr = applySparseCheckout(ctx, sup, dir, pathScope, cloneTimeout, stopGrace)
+			cloneErr = applySparseCheckout(ctx, sup, repoHandle, cred, pathScope, cloneTimeout, stopGrace)
 		}
 		results = append(results, CloneResult{Repo: repo, Primary: primary, Dir: dir, Err: cloneErr})
 
@@ -164,22 +203,25 @@ func CloneAll(
 // beginning with "-" passes ValidatePathScope's own glob-SYNTAX check
 // (path.Match's own grammar does not forbid a leading "-"), so this is a
 // real, not merely theoretical, defense-in-depth gap were "--" omitted.
-func applySparseCheckout(ctx context.Context, sup *supervisor.Supervisor, dir string, patterns []string, timeout, stopGrace time.Duration) error {
+func applySparseCheckout(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, patterns []string, timeout, stopGrace time.Duration) error {
 	// `sparse-checkout set` materializes newly-in-scope paths into the
 	// working tree -- exactly the class of operation that can run a
-	// content filter, merge driver, or transport command a runtime-owned
-	// .git/config names (see internal/sandboxagent/githarden's own doc
-	// comment). Unlike cloneOne's fresh-clone call just above in this
-	// file, this function is ALSO reached from syncOne (sync.go) against
-	// an ALREADY-EXISTING repo, where the agent runtime has already had a
-	// full turn to write .git/config -- that gap is not mitigated here;
-	// it is filed (see githarden.go).
-	args := append([]string{"-C", dir, "sparse-checkout", "set", "--no-cone", "--"}, patterns...)
+	// content filter, merge driver, or transport command a repository's
+	// own .gitattributes/.git/config names (see internal/sandboxagent/
+	// githarden's own doc comment). §30.5 closes that
+	// structurally: this call now runs against repo's own agent-owned
+	// git-dir (githarden.Args(repo, ...), via gitdir.Run), never the
+	// runtime-owned worktree .git this function used to spawn against
+	// directly -- true both on cloneOne's fresh-clone call just above in
+	// this file AND on syncOne's identical call (sync.go) against an
+	// already-existing repo, where the agent runtime has already had a
+	// full turn to write its own worktree .git/config.
+	args := append([]string{"sparse-checkout", "set", "--no-cone", "--"}, patterns...)
 
 	var stderr bytes.Buffer
-	proc, err := sup.Spawn(supervisor.Spec{
+	spec := supervisor.Spec{
 		Path: "git",
-		Args: githarden.Harden(args),
+		Args: githarden.Args(repo, args...),
 		// Inherit the ambient environment (matching every other call site
 		// in this package -- see cloneOne's own doc comment for the full
 		// "why nil/inherit is deliberate" reasoning) EXCEPT locale: LC_ALL=C
@@ -193,18 +235,11 @@ func applySparseCheckout(ctx context.Context, sup *supervisor.Supervisor, dir st
 		// drift or be forgotten at one call site.
 		Env:    githarden.Env(append(os.Environ(), "LC_ALL=C")),
 		Stderr: &stderr,
-	})
-	if err != nil {
-		return fmt.Errorf("spawn git sparse-checkout set: %w", err)
 	}
 
-	stepCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	result, waitErr := proc.Wait(stepCtx)
-	if waitErr != nil {
-		_ = proc.Stop(ctx, stopGrace)
-		return fmt.Errorf("git sparse-checkout set: did not complete within %s: %w", timeout, waitErr)
+	result, err := gitdir.Run(ctx, sup, repo, cred, spec, timeout, stopGrace)
+	if err != nil {
+		return fmt.Errorf("git sparse-checkout set: %w", err)
 	}
 	if result.Err != nil {
 		return fmt.Errorf("git sparse-checkout set: %w", result.Err)
@@ -226,6 +261,15 @@ func applySparseCheckout(ctx context.Context, sup *supervisor.Supervisor, dir st
 			strings.TrimSpace(stderr.String()),
 		)
 	}
+
+	// §14.1's own path-scope enforcement must be visible to BOTH sides
+	// (the agent's own later `git status`, a runtime `git diff`, each
+	// consulting its own copy of core.sparseCheckout) -- mirror the value
+	// this call just set into the runtime's own worktree config too. See
+	// gitdir.MirrorSparseCheckout's own doc comment.
+	if err := gitdir.MirrorSparseCheckout(ctx, sup, repo, cred, timeout, stopGrace); err != nil {
+		return fmt.Errorf("git sparse-checkout set: mirror to runtime config: %w", err)
+	}
 	return nil
 }
 
@@ -246,25 +290,17 @@ func applySparseCheckout(ctx context.Context, sup *supervisor.Supervisor, dir st
 // running disable when it was never enabled, to avoid a wasted subprocess
 // on the overwhelming common case"), but an ambiguous/broken check is not
 // safe to treat as "definitely not enabled" either.
-func isSparseCheckoutEnabled(ctx context.Context, sup *supervisor.Supervisor, dir string, timeout, stopGrace time.Duration) (bool, error) {
+func isSparseCheckoutEnabled(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, timeout, stopGrace time.Duration) (bool, error) {
 	var stdout bytes.Buffer
-	proc, err := sup.Spawn(supervisor.Spec{
+	spec := supervisor.Spec{
 		Path:   "git",
-		Args:   githarden.Args(dir, "config", "--type=bool", "core.sparseCheckout"),
+		Args:   githarden.Args(repo, "config", "--type=bool", "core.sparseCheckout"),
 		Env:    githarden.Env(nil),
 		Stdout: &stdout,
-	})
-	if err != nil {
-		return false, fmt.Errorf("spawn git config core.sparseCheckout: %w", err)
 	}
-
-	stepCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	result, waitErr := proc.Wait(stepCtx)
-	if waitErr != nil {
-		_ = proc.Stop(ctx, stopGrace)
-		return false, fmt.Errorf("git config core.sparseCheckout: did not complete within %s: %w", timeout, waitErr)
+	result, err := gitdir.Run(ctx, sup, repo, cred, spec, timeout, stopGrace)
+	if err != nil {
+		return false, fmt.Errorf("git config core.sparseCheckout: %w", err)
 	}
 	if result.Err != nil {
 		return false, fmt.Errorf("git config core.sparseCheckout: %w", result.Err)
@@ -301,8 +337,8 @@ func isSparseCheckoutEnabled(ctx context.Context, sup *supervisor.Supervisor, di
 // overwhelming common case (a workspace that was never sparse to begin
 // with) costs exactly one cheap `git config` subprocess, never a second,
 // wasted `sparse-checkout disable` invocation.
-func disableSparseCheckoutIfEnabled(ctx context.Context, sup *supervisor.Supervisor, dir string, timeout, stopGrace time.Duration) error {
-	enabled, err := isSparseCheckoutEnabled(ctx, sup, dir, timeout, stopGrace)
+func disableSparseCheckoutIfEnabled(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, timeout, stopGrace time.Duration) error {
+	enabled, err := isSparseCheckoutEnabled(ctx, sup, repo, cred, timeout, stopGrace)
 	if err != nil {
 		return fmt.Errorf("determine whether sparse-checkout is enabled: %w", err)
 	}
@@ -314,31 +350,30 @@ func disableSparseCheckoutIfEnabled(ctx context.Context, sup *supervisor.Supervi
 	// path into the working tree -- the same class of operation as
 	// applySparseCheckout's own identical call just above in this file,
 	// and reached the same way, from syncOne against an already-existing
-	// repo. See that call's own comment and internal/sandboxagent/
-	// githarden's own doc comment for the full reasoning; that gap is
-	// filed, not mitigated here.
-	proc, err := sup.Spawn(supervisor.Spec{
+	// repo. §30.5 closes the class this used to be exposed to
+	// the same way applySparseCheckout's own call does: through repo's
+	// own agent-owned git-dir, via gitdir.Run, never the runtime-owned
+	// worktree .git directly.
+	spec := supervisor.Spec{
 		Path: "git",
-		Args: githarden.Args(dir, "sparse-checkout", "disable"),
+		Args: githarden.Args(repo, "sparse-checkout", "disable"),
 		Env:  githarden.Env(nil),
-	})
-	if err != nil {
-		return fmt.Errorf("spawn git sparse-checkout disable: %w", err)
 	}
-
-	stepCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	result, waitErr := proc.Wait(stepCtx)
-	if waitErr != nil {
-		_ = proc.Stop(ctx, stopGrace)
-		return fmt.Errorf("git sparse-checkout disable: did not complete within %s: %w", timeout, waitErr)
+	result, err := gitdir.Run(ctx, sup, repo, cred, spec, timeout, stopGrace)
+	if err != nil {
+		return fmt.Errorf("git sparse-checkout disable: %w", err)
 	}
 	if result.Err != nil {
 		return fmt.Errorf("git sparse-checkout disable: %w", result.Err)
 	}
 	if result.ExitCode != 0 {
 		return fmt.Errorf("git sparse-checkout disable: exited %d", result.ExitCode)
+	}
+
+	// Mirror the disabled state to the runtime's own worktree config too --
+	// same reasoning as applySparseCheckout's own identical mirror call.
+	if err := gitdir.MirrorSparseCheckout(ctx, sup, repo, cred, timeout, stopGrace); err != nil {
+		return fmt.Errorf("git sparse-checkout disable: mirror to runtime config: %w", err)
 	}
 	return nil
 }
@@ -425,7 +460,7 @@ func cloneOne(
 
 	proc, err := sup.Spawn(supervisor.Spec{
 		Path: "git",
-		Args: githarden.ArgsForClone(dir, append(topLevel, clone...)...),
+		Args: githarden.ArgsForClone(append(topLevel, clone...)...),
 		// Built explicitly (githarden.Env(nil): this process's own
 		// os.Environ() plus GIT_ALLOW_PROTOCOL) rather than left at
 		// Spec.Env's nil zero value -- GIT_ALLOW_PROTOCOL is now the

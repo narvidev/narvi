@@ -4,15 +4,18 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"syscall"
 	"time"
+
+	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
+	"github.com/narvidev/narvi/internal/sandboxagent/githarden"
+	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
 
 // dependencyManifestFilenames is the closed, fixed set of per-ecosystem
@@ -394,30 +397,40 @@ var builtSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 // likewise returned as a genuine error -- §19.6's own "any git error on
 // this check is conservative: ineligible, fall through to full setup.sh".
 //
-// Run via a bare exec.CommandContext, NOT through the supervisor -- exactly
-// DiscoverRepoSHAs/repoHeadSHA's own established precedent (fingerprint.go)
-// for this identical class of operation: a very minor, sub-second, local-
-// only git-plumbing call made at the same "collect boot facts" point in the
-// sequence, before RunBoot's own supervised-process machinery is ever
-// exercised.
-func setupUnchangedSinceBuild(repoDir, builtSHA string, timeout time.Duration) (bool, error) {
+// §30.5: run via gitdir.Run -- the SAME choke point
+// (SyncHeadIn/SyncHeadOut bracket around a githarden.Args-hardened spawn,
+// through sup, never a bare exec.CommandContext) every other sandbox-agent
+// git invocation now uses -- rather than the bare, unhardened
+// `exec.CommandContext("git", "-C", repoDir, ...)` this used to run
+// directly against the runtime-owned worktree .git. This diff never moves
+// HEAD, so gitdir.Run's own SyncHeadOut bracket is always a no-op here in
+// practice; SyncHeadIn still runs first, keeping the agent-owned HEAD this
+// spawn implicitly resolves "HEAD" against up to date with whatever the
+// runtime currently has checked out.
+func setupUnchangedSinceBuild(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, builtSHA string, timeout, stopGrace time.Duration) (bool, error) {
 	if !builtSHAPattern.MatchString(builtSHA) {
-		return false, fmt.Errorf("boot: image manifest built_repo_shas entry for %s is not a well-formed git object id: %q", repoDir, builtSHA)
+		return false, fmt.Errorf("boot: image manifest built_repo_shas entry for %s is not a well-formed git object id: %q", repo.WorkTree, builtSHA)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "git", "-C", repoDir, "diff", "--quiet", builtSHA, "HEAD", "--", string(dependencyManifestSetupFilename))
-	err := cmd.Run()
-	if err == nil {
+	spec := supervisor.Spec{
+		Path: "git",
+		Args: githarden.Args(repo, "diff", "--quiet", builtSHA, "HEAD", "--", string(dependencyManifestSetupFilename)),
+		Env:  githarden.Env(nil),
+	}
+	result, err := gitdir.Run(ctx, sup, repo, cred, spec, timeout, stopGrace)
+	if err != nil {
+		return false, fmt.Errorf("boot: git diff --quiet %s HEAD -- setup.sh in %s: %w", builtSHA, repo.WorkTree, err)
+	}
+	switch {
+	case result.Err != nil:
+		return false, fmt.Errorf("boot: git diff --quiet %s HEAD -- setup.sh in %s: %w", builtSHA, repo.WorkTree, result.Err)
+	case result.ExitCode == 0:
 		return true, nil
-	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+	case result.ExitCode == 1:
 		return false, nil
+	default:
+		return false, fmt.Errorf("boot: git diff --quiet %s HEAD -- setup.sh in %s: exited %d", builtSHA, repo.WorkTree, result.ExitCode)
 	}
-	return false, fmt.Errorf("boot: git diff --quiet %s HEAD -- setup.sh in %s: %w", builtSHA, repoDir, err)
 }
 
 // dependencyManifestSetupFilename names the one file setupUnchangedSinceBuild
@@ -532,7 +545,7 @@ const (
 // affect DeltaEligible below -- setupUnchangedSinceBuild diffs two
 // COMMITS via git's own object store, never the working tree, so
 // sparse-checkout has no bearing on its own correctness.
-func ComputeSetupRerunLadder(manifest ImageManifest, manifestFound bool, scoped bool, workspaceDir string, currentSHAs map[string]string, timeout time.Duration) map[string]SetupRerunLadder {
+func ComputeSetupRerunLadder(ctx context.Context, sup *supervisor.Supervisor, layout gitdir.Layout, cred *syscall.Credential, manifest ImageManifest, manifestFound bool, scoped bool, workspaceDir string, currentSHAs map[string]string, timeout, stopGrace time.Duration) map[string]SetupRerunLadder {
 	ladder := make(map[string]SetupRerunLadder, len(currentSHAs))
 	for name := range currentSHAs {
 		repoDir := filepath.Join(workspaceDir, name)
@@ -544,7 +557,8 @@ func ComputeSetupRerunLadder(manifest ImageManifest, manifestFound bool, scoped 
 		var eligible bool
 		if manifestFound {
 			if builtSHA, ok := manifest.BuiltRepoShas[name]; ok {
-				unchanged, err := setupUnchangedSinceBuild(repoDir, builtSHA, timeout)
+				repo := layout.Repo(name)
+				unchanged, err := setupUnchangedSinceBuild(ctx, sup, repo, cred, builtSHA, timeout, stopGrace)
 				eligible = err == nil && unchanged
 			}
 		}

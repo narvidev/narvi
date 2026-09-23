@@ -15,6 +15,7 @@ import (
 
 	"github.com/narvidev/narvi/contracts/gen/go/sessionconfig"
 	"github.com/narvidev/narvi/internal/sandboxagent/gitclone"
+	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
 
@@ -146,7 +147,7 @@ func TestCloneAll_SinglePrimarySucceeds(t *testing.T) {
 	}
 
 	sup := supervisor.New()
-	results, err := gitclone.CloneAll(context.Background(), sup, workspaceDir, repos, nil, testCloneTimeout, testStopGrace)
+	results, err := gitclone.CloneAll(context.Background(), sup, gitdir.Layout{Root: t.TempDir(), WorkspaceDir: workspaceDir}, nil, nil, repos, nil, testCloneTimeout, testStopGrace)
 	if err != nil {
 		t.Fatalf("CloneAll() error = %v, want nil", err)
 	}
@@ -191,15 +192,31 @@ func TestCloneAll_SinglePrimarySucceeds(t *testing.T) {
 // clone would have done even before this fix (the missing flags do not
 // break a normal clone; they just leave it unhardened).
 func TestCloneAll_HardensTheActualCloneInvocation(t *testing.T) {
+	realGit, lookErr := exec.LookPath("git")
+	if lookErr != nil {
+		t.Fatalf("exec.LookPath(git): %v", lookErr)
+	}
+
 	fakeGitDir := t.TempDir()
 	captureFile := filepath.Join(t.TempDir(), "capture.txt")
 
 	// The fake git records its own argv (one token per line, delimited so
 	// a token containing no delimiter character is unambiguous -- every
 	// token this test checks for is a single "-c"/"key=value" pair with
-	// no embedded angle brackets) and GIT_ALLOW_PROTOCOL, then exits 0
-	// unconditionally: this test cares about what CloneAll ASKED git to
-	// do, not whether a real clone could complete against a fake binary.
+	// no embedded angle brackets) and GIT_ALLOW_PROTOCOL, THEN either (for
+	// the "clone" invocation specifically) creates a real, local, empty
+	// git repo at its own target directory -- entirely offline, never
+	// actually contacting repoURL (an unreachable "https://example.invalid"
+	// address, deliberately, so this test never depends on network access)
+	// -- or (every OTHER invocation) execs the REAL git binary with the
+	// same argv/env. §30.5 made this test's own original
+	// concern (does CloneAll's OWN clone invocation carry the right
+	// hardening flags) inseparable from a second one this same PATH
+	// override now also intercepts: gitdir.Seed runs immediately after a
+	// successful clone, needs a REAL .git directory left behind by the
+	// clone to seed FROM, and its own `git init --bare`/`git config` calls
+	// need a REAL git binary underneath them -- a bare `exit 0` (this
+	// test's the old shape) satisfies neither.
 	fakeGit := "#!/bin/sh\n" +
 		"{\n" +
 		"  printf 'ARGV:'\n" +
@@ -207,7 +224,16 @@ func TestCloneAll_HardensTheActualCloneInvocation(t *testing.T) {
 		"  printf '\\n'\n" +
 		"  printf 'GIT_ALLOW_PROTOCOL=%s\\n' \"$GIT_ALLOW_PROTOCOL\"\n" +
 		"} >> \"" + captureFile + "\"\n" +
-		"exit 0\n"
+		"is_clone=0\n" +
+		"for a in \"$@\"; do [ \"$a\" = clone ] && is_clone=1; done\n" +
+		"if [ \"$is_clone\" = 1 ]; then\n" +
+		"  prev=\"\"; cur=\"\"\n" +
+		"  for a in \"$@\"; do prev=\"$cur\"; cur=\"$a\"; done\n" +
+		"  mkdir -p \"$cur\"\n" +
+		"  \"" + realGit + "\" init -q \"$cur\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exec \"" + realGit + "\" \"$@\"\n"
 	if err := os.WriteFile(filepath.Join(fakeGitDir, "git"), []byte(fakeGit), 0o755); err != nil {
 		t.Fatalf("write fake git: %v", err)
 	}
@@ -223,7 +249,7 @@ func TestCloneAll_HardensTheActualCloneInvocation(t *testing.T) {
 	}
 
 	sup := supervisor.New()
-	results, err := gitclone.CloneAll(context.Background(), sup, workspaceDir, repos, nil, testCloneTimeout, testStopGrace)
+	results, err := gitclone.CloneAll(context.Background(), sup, gitdir.Layout{Root: t.TempDir(), WorkspaceDir: workspaceDir}, nil, nil, repos, nil, testCloneTimeout, testStopGrace)
 	if err != nil {
 		t.Fatalf("CloneAll() error = %v, want nil (the fake git always exits 0)", err)
 	}
@@ -237,12 +263,13 @@ func TestCloneAll_HardensTheActualCloneInvocation(t *testing.T) {
 	}
 	out := string(captured)
 
-	wantDir := filepath.Join(workspaceDir, "repo1")
 	for _, want := range []string{
-		// safe.directory/hooksPath: the pair TestArgs_CarriesBothHalves
-		// (githarden_test.go) pins as inseparable -- proof this call site
-		// carries both, not just one.
-		"<-c> <safe.directory=" + wantDir + ">",
+		// §30.5: ArgsForClone no longer carries safe.directory
+		// at all -- a fresh `git clone`'s own target .git is owned by this
+		// process itself, never by the runtime, so there is nothing
+		// dubious about its ownership in the first place (see
+		// githarden.ArgsForClone's own doc comment). core.hooksPath is
+		// still kept, as defense in depth.
 		"<-c> <core.hooksPath=/dev/null>",
 		"<-c> <credential.helper=>",
 		"<-c> <protocol.allow=never>",
@@ -293,7 +320,7 @@ func TestCloneAll_ExplicitBranchChecksOutThatBranch(t *testing.T) {
 	}
 
 	sup := supervisor.New()
-	results, err := gitclone.CloneAll(context.Background(), sup, workspaceDir, repos, nil, testCloneTimeout, testStopGrace)
+	results, err := gitclone.CloneAll(context.Background(), sup, gitdir.Layout{Root: t.TempDir(), WorkspaceDir: workspaceDir}, nil, nil, repos, nil, testCloneTimeout, testStopGrace)
 	if err != nil {
 		t.Fatalf("CloneAll() error = %v, want nil", err)
 	}
@@ -320,7 +347,7 @@ func TestCloneAll_NilBranchClonesDefaultBranch(t *testing.T) {
 	}
 
 	sup := supervisor.New()
-	results, err := gitclone.CloneAll(context.Background(), sup, workspaceDir, repos, nil, testCloneTimeout, testStopGrace)
+	results, err := gitclone.CloneAll(context.Background(), sup, gitdir.Layout{Root: t.TempDir(), WorkspaceDir: workspaceDir}, nil, nil, repos, nil, testCloneTimeout, testStopGrace)
 	if err != nil {
 		t.Fatalf("CloneAll() error = %v, want nil", err)
 	}
@@ -347,7 +374,7 @@ func TestCloneAll_PrimaryFailureStopsImmediately(t *testing.T) {
 	}
 
 	sup := supervisor.New()
-	results, err := gitclone.CloneAll(context.Background(), sup, workspaceDir, repos, nil, testCloneTimeout, testStopGrace)
+	results, err := gitclone.CloneAll(context.Background(), sup, gitdir.Layout{Root: t.TempDir(), WorkspaceDir: workspaceDir}, nil, nil, repos, nil, testCloneTimeout, testStopGrace)
 	if err == nil {
 		t.Fatal("CloneAll() error = nil, want a fatal error for the failed primary repo")
 	}
@@ -386,7 +413,7 @@ func TestCloneAll_SecondaryFailureContinues(t *testing.T) {
 	}
 
 	sup := supervisor.New()
-	results, err := gitclone.CloneAll(context.Background(), sup, workspaceDir, repos, nil, testCloneTimeout, testStopGrace)
+	results, err := gitclone.CloneAll(context.Background(), sup, gitdir.Layout{Root: t.TempDir(), WorkspaceDir: workspaceDir}, nil, nil, repos, nil, testCloneTimeout, testStopGrace)
 	if err != nil {
 		t.Fatalf("CloneAll() error = %v, want nil (a secondary failure is a warning, not fatal)", err)
 	}
@@ -425,7 +452,7 @@ func TestCloneAll_MaliciousRepoNameRejectedBeforeAnySpawn(t *testing.T) {
 	}
 
 	sup := supervisor.New()
-	results, err := gitclone.CloneAll(context.Background(), sup, workspaceDir, repos, nil, testCloneTimeout, testStopGrace)
+	results, err := gitclone.CloneAll(context.Background(), sup, gitdir.Layout{Root: t.TempDir(), WorkspaceDir: workspaceDir}, nil, nil, repos, nil, testCloneTimeout, testStopGrace)
 	if err == nil {
 		t.Fatal("CloneAll() error = nil, want a fatal validation error for the malicious repo name")
 	}
@@ -470,7 +497,7 @@ func TestCloneAll_MaliciousRepoURLRejectedBeforeAnySpawn(t *testing.T) {
 	}
 
 	sup := supervisor.New()
-	results, err := gitclone.CloneAll(context.Background(), sup, workspaceDir, repos, nil, testCloneTimeout, testStopGrace)
+	results, err := gitclone.CloneAll(context.Background(), sup, gitdir.Layout{Root: t.TempDir(), WorkspaceDir: workspaceDir}, nil, nil, repos, nil, testCloneTimeout, testStopGrace)
 	if err == nil {
 		t.Fatal("CloneAll() error = nil, want a fatal validation error for the ext:: repo url")
 	}
@@ -680,7 +707,7 @@ func TestCloneAll_ScopedEnvironment_AppliesSparseCheckout(t *testing.T) {
 	pathScope := []string{"/apps/web/*", "/contracts/api/*"}
 
 	sup := supervisor.New()
-	results, err := gitclone.CloneAll(context.Background(), sup, workspaceDir, repos, pathScope, testCloneTimeout, testStopGrace)
+	results, err := gitclone.CloneAll(context.Background(), sup, gitdir.Layout{Root: t.TempDir(), WorkspaceDir: workspaceDir}, nil, nil, repos, pathScope, testCloneTimeout, testStopGrace)
 	if err != nil {
 		t.Fatalf("CloneAll() error = %v, want nil", err)
 	}
@@ -717,7 +744,7 @@ func TestCloneAll_UnscopedEnvironment_NoSparseCheckoutInvoked(t *testing.T) {
 	}
 
 	sup := supervisor.New()
-	results, err := gitclone.CloneAll(context.Background(), sup, workspaceDir, repos, nil, testCloneTimeout, testStopGrace)
+	results, err := gitclone.CloneAll(context.Background(), sup, gitdir.Layout{Root: t.TempDir(), WorkspaceDir: workspaceDir}, nil, nil, repos, nil, testCloneTimeout, testStopGrace)
 	if err != nil {
 		t.Fatalf("CloneAll() error = %v, want nil", err)
 	}
@@ -741,7 +768,7 @@ func TestCloneAll_InvalidPathScopeRejectedBeforeAnyClone(t *testing.T) {
 	pathScope := []string{"../escape"}
 
 	sup := supervisor.New()
-	results, err := gitclone.CloneAll(context.Background(), sup, workspaceDir, repos, pathScope, testCloneTimeout, testStopGrace)
+	results, err := gitclone.CloneAll(context.Background(), sup, gitdir.Layout{Root: t.TempDir(), WorkspaceDir: workspaceDir}, nil, nil, repos, pathScope, testCloneTimeout, testStopGrace)
 	if err == nil {
 		t.Fatal("CloneAll() error = nil, want a fatal validation error for the invalid path scope")
 	}

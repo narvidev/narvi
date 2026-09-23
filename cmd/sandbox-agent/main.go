@@ -168,6 +168,7 @@ import (
 	"github.com/narvidev/narvi/internal/sandboxagent/boot"
 	"github.com/narvidev/narvi/internal/sandboxagent/credentials"
 	"github.com/narvidev/narvi/internal/sandboxagent/gitclone"
+	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
 	"github.com/narvidev/narvi/internal/sandboxagent/githarden"
 	"github.com/narvidev/narvi/internal/sandboxagent/opencodeproc"
 	"github.com/narvidev/narvi/internal/sandboxagent/services"
@@ -326,6 +327,14 @@ type commandHandler struct {
 	cfg      boot.Config
 	timeouts platform.Timeouts
 	sup      *supervisor.Supervisor
+
+	// layout/cred (§30.5) are run()'s own already-built
+	// gitdir.Layout/*syscall.Credential -- threaded in so pushOneRepo/
+	// headSHA can route their own git invocations through the SAME
+	// agent-owned git-dir every other sandbox-agent git command now uses,
+	// rather than the runtime-owned worktree .git directly.
+	layout gitdir.Layout
+	cred   *syscall.Credential
 
 	// reviewCostBudgetURL is §26.5's own addition (§26.7/§26.9): the
 	// real, already-bound http://127.0.0.1:<port>/review-cost-budget URL
@@ -540,12 +549,59 @@ func (h *commandHandler) pushOneRepo(repoSpec sandboxws.PushReposElem) (string, 
 		return "", fmt.Errorf("invalid remote: %w", err)
 	}
 
-	dir := filepath.Join(h.cfg.WorkspaceDir, repoSpec.Name)
+	repo := h.layout.Repo(repoSpec.Name)
 
 	credHelperArg, err := gitclone.CredHelperGitArg()
 	if err != nil {
 		return "", fmt.Errorf("determine credential helper: %w", err)
 	}
+
+	pushArgs := []string{"-c", "credential.helper=" + credHelperArg}
+	// pushDestination is what `git push` actually names on its own command
+	// line -- a remote NAME by default, or a raw URL for the one case
+	// below where no remote of that name exists in the agent's own config
+	// at all.
+	pushDestination := remote
+
+	if remote == "origin" {
+		// "origin" is the one remote name gitdir.Seed ALWAYS configures
+		// (remote.origin.url, from this repo's own TRUSTED session config
+		// Repo.Url) -- push by NAME, hardened the same remote-NAME-keyed
+		// way every other origin-targeting call in this codebase already
+		// is. See githarden.RemoteProxyArg's own doc comment.
+		pushArgs = append(pushArgs, githarden.RemoteProxyArg(remote)...)
+	} else {
+		// A non-"origin" remote is never named in session config at all --
+		// sessionconfig.SessionConfigReposElem carries exactly one URL,
+		// this repo's own primary clone url -- so the agent's own seeded
+		// git-dir (gitdir.Seed) never configures anything but "origin"
+		// either; there is no "remote.<name>.url" key in the AGENT's own
+		// config to resolve a bare name against. If the coding agent
+		// itself added this remote during the session (an ordinary,
+		// unprivileged `git remote add` the runtime is free to run), its
+		// URL exists ONLY in the RUNTIME's own worktree config -- read it
+		// there, AS THE RUNTIME's OWN IDENTITY (gitdir.RuntimeGit, never
+		// sandbox-agent's own), validate it exactly like every other
+		// git-subprocess-bound value this codebase accepts from a
+		// less-trusted source (reposource.ValidateRepoURL), and push BY
+		// THAT URL directly instead of by name.
+		runtimeURL, err := readRuntimeRemoteURL(h.runCtx, h.sup, repo, h.cred, remote, h.timeouts.RepoSHADiscoveryTimeout, h.timeouts.ProcessStopGracePeriod)
+		if err != nil {
+			return "", fmt.Errorf("resolve remote %q url from runtime config: %w", remote, err)
+		}
+		if err := reposource.ValidateRepoURL(runtimeURL); err != nil {
+			return "", fmt.Errorf("remote %q url from runtime config: %w", remote, err)
+		}
+		pushDestination = runtimeURL
+		pushArgs = append(pushArgs, githarden.RepoURLProxyArg(runtimeURL)...)
+	}
+
+	// "--" ends option parsing for everything after it (verified
+	// directly against real `git push` behavior, not assumed) --
+	// defense in depth alongside the validation above: even an
+	// already-validated destination/branch should never be positionally
+	// ambiguous to git's own argument parser.
+	pushArgs = append(pushArgs, "push", "--", pushDestination, repoSpec.Branch)
 
 	// RepoCloneTimeout is reused here rather than a distinct field:
 	// `git push` and `git clone` are both single, network-bound git
@@ -556,27 +612,10 @@ func (h *commandHandler) pushOneRepo(repoSpec sandboxws.PushReposElem) (string, 
 	// matching headSHA's own precedent just below of reusing an existing
 	// Timeouts field for a materially identical class of operation rather
 	// than inventing a near-duplicate one.
-	pushCtx, cancel := context.WithTimeout(h.runCtx, h.timeouts.RepoCloneTimeout)
-	defer cancel()
-
-	// remote.<remote>.proxy: hardeningFlags itself only ever resets
-	// "remote.origin.proxy" (the fixed name every OTHER call site in this
-	// codebase creates) -- remote here is session-controlled and not
-	// always "origin", so this call adds its own override for whatever
-	// name it actually validated above. Redundant, harmlessly, when
-	// remote == "origin". See githarden.RemoteProxyArg's own doc comment.
-	pushArgs := append([]string{"-c", "credential.helper=" + credHelperArg}, githarden.RemoteProxyArg(remote)...)
-	// "--" ends option parsing for everything after it (verified
-	// directly against real `git push` behavior, not assumed) --
-	// defense in depth alongside the validation above: even an
-	// already-validated remote/branch should never be positionally
-	// ambiguous to git's own argument parser.
-	pushArgs = append(pushArgs, "push", "--", remote, repoSpec.Branch)
-
 	var stderr bytes.Buffer
-	proc, err := h.sup.Spawn(supervisor.Spec{
+	spec := supervisor.Spec{
 		Path:   "git",
-		Args:   githarden.Args(dir, pushArgs...),
+		Args:   githarden.Args(repo, pushArgs...),
 		Stderr: &stderr,
 		// Built via githarden.Env, not left at Spec.Env's nil zero value:
 		// GIT_ALLOW_PROTOCOL is now the actual guarantee behind the
@@ -599,15 +638,10 @@ func (h *commandHandler) pushOneRepo(repoSpec sandboxws.PushReposElem) (string, 
 		// this codebase. See gitclone.cloneOne's own identical comment
 		// for the clone-side counterpart of this exact reasoning.
 		Env: githarden.Env(nil),
-	})
-	if err != nil {
-		return "", fmt.Errorf("spawn git push for %s: %w", repoSpec.Name, err)
 	}
-
-	result, waitErr := proc.Wait(pushCtx)
-	if waitErr != nil {
-		_ = proc.Stop(h.runCtx, h.timeouts.ProcessStopGracePeriod)
-		return "", fmt.Errorf("git push %s: did not complete within %s: %w", repoSpec.Name, h.timeouts.RepoCloneTimeout, waitErr)
+	result, err := gitdir.Run(h.runCtx, h.sup, repo, h.cred, spec, h.timeouts.RepoCloneTimeout, h.timeouts.ProcessStopGracePeriod)
+	if err != nil {
+		return "", fmt.Errorf("git push %s: %w", repoSpec.Name, err)
 	}
 	if result.Err != nil {
 		return "", fmt.Errorf("git push %s: %w", repoSpec.Name, result.Err)
@@ -616,27 +650,57 @@ func (h *commandHandler) pushOneRepo(repoSpec sandboxws.PushReposElem) (string, 
 		return "", fmt.Errorf("git push %s: exited %d: %s", repoSpec.Name, result.ExitCode, strings.TrimSpace(stderr.String()))
 	}
 
-	sha, err := h.headSHA(dir)
+	sha, err := h.headSHA(repo)
 	if err != nil {
 		return "", fmt.Errorf("determine head sha for %s: %w", repoSpec.Name, err)
 	}
 	return sha, nil
 }
 
-// headSHA runs `git rev-parse HEAD` in dir and returns its trimmed
+// runtimeGitFunc indirects gitdir.RuntimeGit through a package-level
+// variable -- its default, production value -- solely so a test
+// (push_nonorigin_test.go's own TestReadRuntimeRemoteURL_PassesHandlerCredential)
+// can substitute a spy that records the *syscall.Credential actually
+// passed by readRuntimeRemoteURL, below. Round-2 review (R3): no existing
+// test could tell a nil cred (sandbox-agent's own identity) apart from the
+// runtime's -- this is the minimal seam that makes that identity
+// observable without requiring the real, privileged uid drop
+// runtimeCredentialFor(cfg) would need in a real, unprivileged spawn.
+var runtimeGitFunc = gitdir.RuntimeGit
+
+// readRuntimeRemoteURL reads remote.<remote>.url from repo.WorkTree's own
+// RUNTIME-owned config, AS THE RUNTIME's OWN IDENTITY (gitdir.RuntimeGit,
+// via runtimeGitFunc above) -- see pushOneRepo's own doc comment for why
+// this exists at all (a remote the agent never itself configured).
+func readRuntimeRemoteURL(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, remote string, timeout, stopGrace time.Duration) (string, error) {
+	var stdout bytes.Buffer
+	result, err := runtimeGitFunc(ctx, sup, cred, repo.WorkTree, &stdout, nil, timeout, stopGrace, "config", "--get", "remote."+remote+".url")
+	if err != nil {
+		return "", err
+	}
+	if result.ExitCode != 0 {
+		return "", fmt.Errorf("git config --get remote.%s.url exited %d (remote not configured anywhere this sandbox can see)", remote, result.ExitCode)
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}
+
+// headSHA runs `git rev-parse HEAD` against repo and returns its trimmed
 // stdout -- a very minor, sub-second local git-plumbing call (matching
 // platform.Timeouts.RepoSHADiscoveryTimeout's own existing "boot
 // fingerprint" precedent exactly, reused rather than duplicated for a
-// materially identical class of operation), still run via h.sup (never a
-// bare exec.Command) using supervisor.Spec's own new Stdout field.
-func (h *commandHandler) headSHA(dir string) (string, error) {
-	ctx, cancel := context.WithTimeout(h.runCtx, h.timeouts.RepoSHADiscoveryTimeout)
-	defer cancel()
-
+// materially identical class of operation), through gitdir.Run -- the SAME
+// choke point (SyncHeadIn/SyncHeadOut bracket around the hardened spawn,
+// via h.sup, never a bare exec.Command) every other sandbox-agent git
+// invocation now uses. The SyncHeadIn bracket is REQUIRED here, not merely
+// consistent style: without it, the agent-owned HEAD this "HEAD" argument
+// resolves against could be stale relative to whatever branch pushOneRepo's
+// own `git push` (and, before it, the runtime's own prior commits) actually
+// left checked out -- measured directly.
+func (h *commandHandler) headSHA(repo githarden.Repo) (string, error) {
 	var stdout bytes.Buffer
-	proc, err := h.sup.Spawn(supervisor.Spec{
+	spec := supervisor.Spec{
 		Path:   "git",
-		Args:   githarden.Args(dir, "rev-parse", "HEAD"),
+		Args:   githarden.Args(repo, "rev-parse", "HEAD"),
 		Stdout: &stdout,
 		// Unlike pushOneRepo's own git push Spawn call just above (which
 		// deliberately keeps full env inheritance -- see its own comment),
@@ -649,15 +713,10 @@ func (h *commandHandler) headSHA(dir string) (string, error) {
 		// through Env, regardless of which other filtering it also needs,
 		// so the value can never drift or be forgotten at one call site.
 		Env: githarden.Env(supervisor.EnvWithout(boot.SessionConfigEnvVar)),
-	})
+	}
+	result, err := gitdir.Run(h.runCtx, h.sup, repo, h.cred, spec, h.timeouts.RepoSHADiscoveryTimeout, h.timeouts.ProcessStopGracePeriod)
 	if err != nil {
 		return "", fmt.Errorf("spawn git rev-parse HEAD: %w", err)
-	}
-
-	result, waitErr := proc.Wait(ctx)
-	if waitErr != nil {
-		_ = proc.Stop(h.runCtx, h.timeouts.ProcessStopGracePeriod)
-		return "", fmt.Errorf("did not complete within %s: %w", h.timeouts.RepoSHADiscoveryTimeout, waitErr)
 	}
 	if result.Err != nil {
 		return "", result.Err
@@ -1084,22 +1143,67 @@ func run() error {
 	// DefaultTimeouts() verbatim), so reuse the shared defaults directly.
 	timeouts := platform.DefaultTimeouts()
 
+	// ctx/stop and sup are created earlier than they used to be --
+	// BEFORE the first boot-fingerprint log below -- so that §30.5's
+	// own warm-mode Seed loop (immediately below) has both available. This
+	// reordering has no other behavior change: neither signal.NotifyContext
+	// nor supervisor.New() has any side effect of its own, so moving their
+	// construction a few lines earlier in this function's own life changes
+	// nothing about when signals actually start being caught or processes
+	// actually start being spawned.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	sup := supervisor.New()
+
+	// §30.5: layout/runtimeCredential are this process's own
+	// single, canonical values -- built once, here, and threaded through
+	// every later call site that used to build its own
+	// runtimeCredentialFor(cfg) separately (a latent drift risk: two
+	// separately-built Credentials for the same cfg could disagree if this
+	// function's own logic ever changed unevenly at one call site and not
+	// the other).
+	layout := gitdir.Layout{Root: cfg.GitDirRoot, WorkspaceDir: cfg.WorkspaceDir}
+	runtimeCredential := runtimeCredentialFor(cfg)
+
+	// §30.5: on a WARM boot (repo_image/snapshot_restore), real
+	// repos already exist on disk BEFORE gitclone.SyncAll ever runs --
+	// baked into the image or restored from a snapshot. The very first
+	// boot-fingerprint log below (§5.3: "sandbox-agent logs a boot
+	// fingerprint first") already reads real repo SHAs off that pre-existing
+	// workspace via boot.DiscoverRepoSHAs, which now ALWAYS routes through
+	// an agent-owned git-dir (internal/sandboxagent/gitdir) -- so every such
+	// repo's git-dir must already be seeded before that first log line, not
+	// merely before SyncAll's own later per-repo Seed call. A cold boot
+	// (fresh/build) has nothing on disk yet at this point: the loop below
+	// finds no wt/.git for any repo and is a complete no-op.
+	//
 	// §5.3: "sandbox-agent logs a boot fingerprint first" -- this MUST be
-	// the very first line this binary emits; nothing above this point
-	// logs anything. openCodeVersion is necessarily "" here (§7's own
+	// the very first LOGGED line this binary emits, on EVERY path,
+	// including a fatal EnsureRoot/primary-Seed failure: an operator
+	// staring at a failed boot needs agent_version/image_digest/boot_mode
+	// to identify which image or snapshot produced it just as much as one
+	// staring at a healthy one does. bootFingerprintAndSeed therefore runs
+	// EnsureRoot/seedWarmBootRepos FIRST but SILENTLY -- collecting a
+	// fatal error and any secondary-repo warnings without logging either
+	// -- then always logs the fingerprint, then logs the warnings, and
+	// only then returns the fatal error (if any) for run() to propagate. A
+	// fatal EnsureRoot failure skips repo discovery entirely (empty
+	// repo_shas, no git spawned against the rejected root); a fatal primary
+	// failure still produces a well-formed fingerprint line, but with
+	// repo_shas restricted to exactly the repos seedWarmBootRepos itself
+	// (re-)seeded THIS boot BEFORE the failure -- for a primary failure
+	// (position 0), that set is always empty, since nothing was seeded yet
+	// -- never a repo merely left on disk from an earlier boot (see
+	// bootFingerprintAndSeed's own doc comment for why the fix threads a
+	// positive allowlist into boot.CollectFingerprint rather than relying
+	// on DiscoverRepoSHAs' plain os.Stat gate to notice). openCodeVersion is necessarily "" here (§7's own
 	// discovery requires the OpenCode server to already be running, which
 	// hasn't happened yet) -- see the supplementary fingerprint log below,
 	// once it has.
-	fingerprint := boot.CollectFingerprint(cfg, timeouts.RepoSHADiscoveryTimeout, "")
-	slog.Info("sandbox-agent: boot fingerprint",
-		"agent_version", fingerprint.AgentVersion,
-		"image_digest", fingerprint.ImageDigest,
-		"boot_mode", string(fingerprint.BootMode),
-		"repo_shas", fingerprint.RepoSHAs,
-	)
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	if err := bootFingerprintAndSeed(ctx, sup, cfg, layout, runtimeCredential, timeouts, logger); err != nil {
+		return err
+	}
 
 	// §5.3 "day one, not later": cmd/control-plane/main.go used to be the
 	// ONLY caller of platform.SetupOTel, so this binary ran its entire
@@ -1167,8 +1271,6 @@ func run() error {
 			slog.Error("sandbox-agent: otel shutdown failed", "error", err)
 		}
 	}()
-
-	sup := supervisor.New()
 
 	// agentRuntime is nil exactly when cfg.SessionConfig is nil (the
 	// common dev/test case with no real session) -- there is nothing to
@@ -1518,7 +1620,10 @@ func run() error {
 		// identity, so this condition never triggers there:
 		// NoSetGroups stays false and supplementary groups are genuinely
 		// cleared as part of the real privilege drop, exactly as wanted.
-		runtimeCredential := runtimeCredentialFor(cfg)
+		//
+		// runtimeCredential itself is this function's own single,
+		// already-built value (constructed once, near the top of run(),
+		// alongside layout -- see that declaration's own comment for why).
 
 		// HOME must name the runtime's OWN home, or everything the runtime
 		// resolves relative to it lands somewhere it cannot reach: it
@@ -1569,7 +1674,7 @@ func run() error {
 		// once more is known" pattern §6.4 already established for
 		// repo_shas (see runBootSequence's own post-clone fingerprint
 		// log).
-		postSpawnFingerprint := boot.CollectFingerprint(cfg, timeouts.RepoSHADiscoveryTimeout, result.Version)
+		postSpawnFingerprint := boot.CollectFingerprint(ctx, sup, cfg, layout, runtimeCredential, nil, timeouts.RepoSHADiscoveryTimeout, timeouts.ProcessStopGracePeriod, result.Version)
 		slog.Info("sandbox-agent: boot fingerprint (post-opencode-spawn)",
 			"opencode_version", postSpawnFingerprint.OpenCodeVersion)
 
@@ -1612,7 +1717,7 @@ func run() error {
 	var bridge *wsbridge.Bridge
 	var handler *commandHandler
 	if cfg.SessionConfig != nil {
-		handler = &commandHandler{adapter: agentRuntime, runCtx: ctx, cfg: cfg, timeouts: timeouts, sup: sup, reviewCostBudgetURL: reviewCostBudgetURL}
+		handler = &commandHandler{adapter: agentRuntime, runCtx: ctx, cfg: cfg, timeouts: timeouts, sup: sup, layout: layout, cred: runtimeCredential, reviewCostBudgetURL: reviewCostBudgetURL}
 		bridge = wsbridge.New(*cfg.SessionConfig, cfg.SandboxID, cfg.AgentVersion, cfg.ImageDigest, handler,
 			timeouts.SandboxWSDialTimeout, timeouts.SandboxWSHeartbeatInterval,
 			timeouts.SandboxWSReconnectMinBackoff, timeouts.SandboxWSReconnectMaxBackoff)
@@ -1893,7 +1998,7 @@ func run() error {
 	// span is measured directly around runBootSequence, in this SAME
 	// function, which already has sendBootTiming in scope.
 	bootStart := time.Now()
-	bootErr := runBootSequence(ctx, sup, cfg, timeouts, sandboxSecretEnv, bootDegradeNotes, reportBootProgress, onGitSync, onGitFetchTiming, onGitCheckoutTiming, onHookRerunTiming)
+	bootErr := runBootSequence(ctx, sup, cfg, layout, runtimeCredential, timeouts, sandboxSecretEnv, bootDegradeNotes, reportBootProgress, onGitSync, onGitFetchTiming, onGitCheckoutTiming, onHookRerunTiming)
 	bootMode := string(cfg.BootMode)
 	bootFailed := bootErr != nil
 	sendBootTiming(sandboxws.BootTiming{
@@ -2048,6 +2153,220 @@ func run() error {
 	return stopErr
 }
 
+// warmBootSecondaryFailedMsg is warmBootSeedWarning.msg for a secondary
+// repo's failed Seed call (seedWarmBootRepos, below) -- named as a const
+// purely so the log message itself lives in one place rather than being
+// duplicated at both the append site and any test asserting on it. It is
+// NOT used to decide which repos the fingerprint may discover against
+// (that decision is now the positive "seeded this boot" set
+// seedWarmBootRepos returns, below -- see bootFingerprintAndSeed's own doc
+// comment for why matching on this message was insufficient: a repo never
+// even ATTEMPTED this boot, such as every repo after a failed PRIMARY,
+// produced no warning at all, so nothing could be excluded by matching on
+// one).
+const warmBootSecondaryFailedMsg = "sandbox-agent: warm-boot git-dir seed: secondary repo failed, continuing (will be reported by sync)"
+
+// warmBootSeedWarning is one non-fatal outcome of seedWarmBootRepos' own
+// loop (an invalid repo name, or a secondary repo's failed Seed call) --
+// captured rather than logged directly, so bootFingerprintAndSeed can log
+// the §5.3 fingerprint line BEFORE any of these, never after (see its own
+// doc comment).
+type warmBootSeedWarning struct {
+	msg  string
+	repo string
+	err  error
+}
+
+// bootFingerprintAndSeed runs run()'s own warm-boot git-dir seeding step
+// and then always collects and logs the §5.3 boot fingerprint as the
+// first thing this function (and therefore run()) logs -- on EVERY path,
+// including a fatal gitdir.EnsureRoot or primary-repo Seed failure. Before
+// this function existed, EnsureRoot/seedWarmBootRepos ran inline in run(),
+// ahead of the fingerprint log, and returned straight out of run() on a
+// fatal error -- silently skipping the fingerprint line the operator needs
+// most on a failed boot (agent_version/image_digest/boot_mode identify
+// which image or snapshot produced the failure) -- and a secondary-repo
+// warning logged before the fingerprint broke the "first LOGGED line"
+// invariant even on a successful boot. Fixed here by collecting BOTH the
+// fatal error and every non-fatal warning from seedWarmBootRepos WITHOUT
+// logging anything, computing+logging the fingerprint unconditionally,
+// THEN logging the warnings, and only THEN returning the fatal error (if
+// any) for run() to propagate. A fatal EnsureRoot failure never calls
+// boot.CollectFingerprint at all (repo_shas is simply empty, and no git
+// runs against the rejected root -- see the rootRejected branch below).
+//
+// The fingerprint's own repo_shas is restricted to exactly the repos
+// seedWarmBootRepos itself (re-)seeded THIS boot -- seededRepos, its first
+// return value, threaded straight into boot.CollectFingerprint's own
+// allowed parameter. This is a POSITIVE allowlist, not a post-hoc
+// exclusion: DiscoverRepoSHAs' os.Stat gate has no notion of "seeded this
+// boot", only "a git-dir is present" on disk (which a warm boot's
+// repo_image/snapshot_restore layout can satisfy from a PRIOR boot even
+// for a repo this boot never touched), so the allowlist is applied inside
+// DiscoverRepoSHAs itself, before either os.Stat call and before any git
+// spawn -- never after the fact by matching a warning message. Earlier
+// revisions tried exactly that (matching warmBootSecondaryFailedMsg) and
+// it only ever covered an ATTEMPTED-and-failed secondary: a fatal PRIMARY
+// Seed failure makes seedWarmBootRepos return immediately with no warning
+// for the primary and no attempt at any later repo, so nothing was ever
+// excluded and CollectFingerprint still spawned git through every stale,
+// un-revalidated agent git-dir on disk. With the positive allowlist, a
+// fatal primary-repo Seed failure now yields an EMPTY repo_shas (seededRepos
+// is empty at that point -- nothing had been (re-)seeded yet), and THIS
+// call spawns no git against a repo outside seededRepos.
+//
+// This allowlist only covers this one call, though -- it says nothing
+// about the LATER boot.CollectFingerprint calls in this same boot (the
+// post-opencode-spawn call in run(), and the post-clone call in
+// runBootSequence), both of which pass allowed=nil and so rely on
+// DiscoverRepoSHAs' plain os.Stat(repo.GitDir) gate alone. That gate is
+// only safe because gitdir.Seed itself now removes repo.GitDir as its
+// very first action, before any guard that could refuse the call (see
+// Seed's own doc comment in internal/sandboxagent/gitdir/seed.go): a
+// refused Seed -- this boot, for whatever reason -- always leaves
+// repo.GitDir absent, so os.Stat fails and every later discovery call,
+// allowlisted or not, skips that repo.
+//
+// What that guarantee covers, precisely: every repo in THIS boot's own
+// SessionConfig.Repos, because Seed is attempted on each of them (a repo
+// with no <wt>/.git is never seeded but is also never discovered, since
+// DiscoverRepoSHAs gates on <wt>/.git too). It does NOT by itself cover a
+// /workspace directory whose name is absent from this boot's config but
+// which an EARLIER boot seeded: nothing here removes that agent git-dir.
+// That case is excluded by construction rather than by this code -- a
+// snapshot_restore boot restores the same session, whose repo list is
+// written once and never updated, and a repo_image boot only ever matches
+// an image built for an identical repo set (§19.1) -- and the runtime
+// cannot create an agent git-dir itself, since the root is agent-owned
+// and 0700. If either of those invariants ever changes, stale agent
+// git-dirs for dropped repos must be pruned under the root after
+// EnsureRoot.
+//
+// Factored out of run() specifically so this ordering is unit-testable
+// (capturing slog output) without booting the whole process -- see
+// main_test.go's own TestBootFingerprintAndSeed_* cases.
+func bootFingerprintAndSeed(ctx context.Context, sup *supervisor.Supervisor, cfg boot.Config, layout gitdir.Layout, runtimeCredential *syscall.Credential, timeouts platform.Timeouts, logger *slog.Logger) error {
+	var warnings []warmBootSeedWarning
+	var seedErr error
+	var seededRepos map[string]bool // nil unless warm-boot seeding was attempted this boot (cfg.SessionConfig != nil) -- nil means "no allowlist" to boot.CollectFingerprint, i.e. this function's own pre-Step behavior, for the (seed-less) callers that never populate it.
+	rootRejected := false
+	if cfg.SessionConfig != nil {
+		if err := gitdir.EnsureRoot(cfg.GitDirRoot); err != nil {
+			seedErr = fmt.Errorf("sandbox-agent: ensure git-dir root: %w", err)
+			rootRejected = true
+		} else {
+			seededRepos, warnings, seedErr = seedWarmBootRepos(ctx, sup, cfg, layout, runtimeCredential, timeouts.GitSyncStepTimeout, timeouts.ProcessStopGracePeriod)
+		}
+	}
+
+	// gitdir.EnsureRoot's own doc comment: a rejected root (symlink, wrong
+	// owner, group/other-writable) "must not be used". boot.CollectFingerprint
+	// globs layout.WorkspaceDir and, via DiscoverRepoSHAs, os.Stats and
+	// spawns hardened git against layout.Repo(name).GitDir for whatever it
+	// finds there -- i.e. still under the very root EnsureRoot just refused.
+	// A rejected root must not be read from OR written to (SyncHeadIn writes
+	// HEAD before any rev-parse), so on rootRejected the fingerprint is
+	// built directly, with no repo discovery and no git spawned at all,
+	// rather than by calling CollectFingerprint.
+	var fingerprint sandboxboot.BootFingerprint
+	if rootRejected {
+		fingerprint = sandboxboot.BootFingerprint{
+			AgentVersion: cfg.AgentVersion,
+			ImageDigest:  cfg.ImageDigest,
+			BootMode:     cfg.BootMode,
+		}
+	} else {
+		fingerprint = boot.CollectFingerprint(ctx, sup, cfg, layout, runtimeCredential, seededRepos, timeouts.RepoSHADiscoveryTimeout, timeouts.ProcessStopGracePeriod, "")
+	}
+
+	logger.Info("sandbox-agent: boot fingerprint",
+		"agent_version", fingerprint.AgentVersion,
+		"image_digest", fingerprint.ImageDigest,
+		"boot_mode", string(fingerprint.BootMode),
+		"repo_shas", fingerprint.RepoSHAs,
+	)
+
+	for _, w := range warnings {
+		logger.Warn(w.msg, "repo", w.repo, "error", w.err)
+	}
+
+	return seedErr
+}
+
+// seedWarmBootRepos runs bootFingerprintAndSeed's own pre-fingerprint
+// gitdir.Seed loop for a WARM boot (repo_image/snapshot_restore): every
+// session repo that already has an on-disk <wt>/.git gets its agent-owned
+// git-dir (re-)seeded before boot.CollectFingerprint (§5.3's own "first
+// logged line") and wsbridge.New ever run, since DiscoverRepoSHAs already
+// routes through the agent-owned git-dir. Criticality mirrors
+// gitclone.SyncAll's OWN policy exactly (sync.go: "position 0 = primary"
+// -- a primary failure is fatal, a secondary failure is a warning, never
+// fatal): reusing that same split here, rather than inventing a second
+// one, is the fix for the finding that this loop used to return fatally
+// from run() on ANY repo's Seed failure, including a secondary one
+// SyncAll's own later per-repo Seed call would only have warned about.
+//
+// Its first return value is the POSITIVE set of repo names whose agent
+// git-dir this call actually (re-)seeded successfully THIS boot -- always
+// non-nil (even when empty), built up incrementally as each repo's Seed
+// call succeeds, so a fatal primary-repo failure returns it before ANY
+// entry was ever added. bootFingerprintAndSeed threads it straight into
+// boot.CollectFingerprint's own allowed parameter, so the fingerprint's
+// repo_shas can never include a repo this exact call did not vouch for --
+// see that function's own doc comment for why a name never even attempted
+// (e.g. every repo after a failed primary) needs the SAME treatment as one
+// that was attempted and failed, and why matching a warning message after
+// the fact could not give it to them.
+//
+// Every non-fatal outcome (an invalid repo name, a secondary repo's
+// failed Seed call) is returned as a warmBootSeedWarning rather than
+// logged directly here -- logging is the caller's job (bootFingerprintAndSeed,
+// above), specifically so the §5.3 fingerprint line can always be logged
+// first, ahead of any of these.
+//
+// Factored out of run() specifically so this policy is unit-testable
+// without booting the whole process (seedwarmboot_test.go's own
+// TestSeedWarmBootRepos_PrimaryFailureIsFatal/SecondaryFailureContinues).
+func seedWarmBootRepos(ctx context.Context, sup *supervisor.Supervisor, cfg boot.Config, layout gitdir.Layout, runtimeCredential *syscall.Credential, gitSyncStepTimeout, stopGrace time.Duration) (map[string]bool, []warmBootSeedWarning, error) {
+	seeded := make(map[string]bool)
+	var warnings []warmBootSeedWarning
+	for i, r := range cfg.SessionConfig.Repos {
+		primary := i == 0
+		if err := reposource.ValidateRepoName(r.Name); err != nil {
+			// Left for gitclone.CloneAll/SyncAll's own validateRepoSpec to
+			// report properly, with the full session-config context this
+			// early warm-boot loop does not have reason to duplicate.
+			warnings = append(warnings, warmBootSeedWarning{
+				msg:  "sandbox-agent: warm-boot git-dir seed: invalid repo name, skipping (will be reported by clone/sync)",
+				repo: r.Name,
+				err:  err,
+			})
+			continue
+		}
+		wt := filepath.Join(cfg.WorkspaceDir, r.Name)
+		if _, statErr := os.Stat(filepath.Join(wt, ".git")); statErr != nil {
+			// No pre-existing checkout for this repo -- the common cold-boot
+			// case, or a repo newly added to this session's own repo list
+			// since the image/snapshot was last built. gitclone.CloneAll/
+			// SyncAll will seed it in its own turn.
+			continue
+		}
+		if err := gitdir.Seed(ctx, sup, layout.Repo(r.Name), r.Url, runtimeCredential, gitSyncStepTimeout, stopGrace); err != nil {
+			if primary {
+				return seeded, warnings, fmt.Errorf("sandbox-agent: seed git-dir for %s (warm boot): %w", r.Name, err)
+			}
+			warnings = append(warnings, warmBootSeedWarning{
+				msg:  warmBootSecondaryFailedMsg,
+				repo: r.Name,
+				err:  err,
+			})
+			continue
+		}
+		seeded[r.Name] = true
+	}
+	return seeded, warnings, nil
+}
+
 // logImageManifest logs whatever boot.LoadImageManifest(boot.ImageManifestPath)
 // (runBootSequence's own one call site, below) actually found, split three
 // ways -- previously, only the manifestErr != nil case logged anything at
@@ -2185,6 +2504,8 @@ func runBootSequence(
 	ctx context.Context,
 	sup *supervisor.Supervisor,
 	cfg boot.Config,
+	layout gitdir.Layout,
+	cred *syscall.Credential,
 	timeouts platform.Timeouts,
 	secretEnv []string,
 	degradeNotes []string,
@@ -2259,9 +2580,18 @@ func runBootSequence(
 			pathScope = []string(*cfg.SessionConfig.PathScope)
 		}
 
+		// chownRepo re-owns one repo's own worktree for the isolated agent
+		// runtime (§30.5) immediately after gitclone seeds its agent
+		// git-dir -- see gitclone.CloneAll's own doc comment for why this
+		// is threaded in as a plain func rather than that package
+		// importing boot directly.
+		chownRepo := func(dir string) error {
+			return boot.ChownWorkspaceForRuntime(dir, cfg.RuntimeUID, cfg.RuntimeGID)
+		}
+
 		switch cfg.BootMode {
 		case sandboxboot.BootModeRepoImage, sandboxboot.BootModeSnapshotRestore:
-			results, syncErr := gitclone.SyncAll(ctx, sup, cfg.WorkspaceDir, cfg.SessionConfig.Repos, pathScope,
+			results, syncErr := gitclone.SyncAll(ctx, sup, layout, cred, cfg.SessionConfig.Repos, pathScope,
 				cfg.SessionConfig.SessionId, timeouts.GitFetchStepTimeout, timeouts.GitSyncStepTimeout, timeouts.ProcessStopGracePeriod, onGitSync,
 				onGitFetchTiming, onGitCheckoutTiming)
 			if syncErr != nil {
@@ -2281,7 +2611,7 @@ func runBootSequence(
 			// already rejected anything outside the four §6.4 values by the
 			// time cfg reaches here, so falling through to the existing,
 			// pre-existing behavior is the correct, conservative default).
-			results, cloneErr := gitclone.CloneAll(ctx, sup, cfg.WorkspaceDir, cfg.SessionConfig.Repos, pathScope,
+			results, cloneErr := gitclone.CloneAll(ctx, sup, layout, cred, chownRepo, cfg.SessionConfig.Repos, pathScope,
 				timeouts.RepoCloneTimeout, timeouts.ProcessStopGracePeriod)
 			if cloneErr != nil {
 				return fmt.Errorf("clone repos: %w", cloneErr)
@@ -2311,7 +2641,7 @@ func runBootSequence(
 		// (run()'s own separate "post-opencode-spawn" supplementary line
 		// already covers that field, logged before runBootSequence is ever
 		// called).
-		postCloneFingerprint := boot.CollectFingerprint(cfg, timeouts.RepoSHADiscoveryTimeout, "")
+		postCloneFingerprint := boot.CollectFingerprint(ctx, sup, cfg, layout, cred, nil, timeouts.RepoSHADiscoveryTimeout, timeouts.ProcessStopGracePeriod, "")
 		slog.Info("sandbox-agent: boot fingerprint (post-clone)",
 			"repo_shas", postCloneFingerprint.RepoSHAs,
 		)
@@ -2355,7 +2685,7 @@ func runBootSequence(
 		// unable to drift. See ComputeSetupRerunLadder's own doc comment
 		// for why a scoped session must always resolve the digest tier to
 		// ineligible.
-		setupRerunLadder = boot.ComputeSetupRerunLadder(manifest, manifestFound, len(pathScope) > 0, cfg.WorkspaceDir, postCloneFingerprint.RepoSHAs, timeouts.RepoSHADiscoveryTimeout)
+		setupRerunLadder = boot.ComputeSetupRerunLadder(ctx, sup, layout, cred, manifest, manifestFound, len(pathScope) > 0, cfg.WorkspaceDir, postCloneFingerprint.RepoSHAs, timeouts.RepoSHADiscoveryTimeout, timeouts.ProcessStopGracePeriod)
 	}
 
 	// §27.5: dockerd is supervised ONCE per boot, before RunBoot's
@@ -2393,7 +2723,7 @@ func runBootSequence(
 	if err := boot.RunBoot(ctx, sup, cfg.WorkspaceDir, repos, cfg.BootMode, workspaceMoved, setupRerunLadder, secretEnv, reportBootProgress, onHookRerunTiming,
 		timeouts.HookTimeout, timeouts.ProcessStopGracePeriod,
 		timeouts.ServiceReadinessTimeout, timeouts.ServiceReadinessPollInterval,
-		timeouts.SetupRerunRetryBackoff, runtimeCredentialFor(cfg),
+		timeouts.SetupRerunRetryBackoff, cred,
 		// Re-own each repo before its own services.yml commands start,
 		// because those are dropped to the runtime uid and every writer
 		// before them ran as this process. Guarded exactly like the
@@ -2427,7 +2757,7 @@ func runBootSequence(
 		for i, r := range repos {
 			repoNames[i] = r.Name
 		}
-		if err := gitclone.CleanForImageBuild(ctx, sup, cfg.WorkspaceDir, repoNames, cfg.CredentialCacheDir,
+		if err := gitclone.CleanForImageBuild(ctx, sup, layout, cred, repoNames, cfg.CredentialCacheDir,
 			timeouts.GitSyncStepTimeout, timeouts.ProcessStopGracePeriod); err != nil {
 			return fmt.Errorf("clean workspace before snapshot: %w", err)
 		}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -51,6 +52,16 @@ const (
 	// doc comment).
 	runtimeUIDEnvVar = "NARVI_RUNTIME_UID"
 	runtimeGIDEnvVar = "NARVI_RUNTIME_GID"
+
+	// gitDirRootEnvVar (§30.5) names the sandbox-wide root
+	// internal/sandboxagent/gitdir seeds every repo's own AGENT-OWNED
+	// git-dir under (gitdir.Layout.Root) -- deliberately OUTSIDE
+	// WorkspaceDir (the agent-visible /workspace tree the isolated runtime
+	// owns after §30.5's own chown): a git-dir living inside the runtime's
+	// own tree would defeat the entire point of splitting it out in the
+	// first place. See gitdir's own package doc comment for the full
+	// shape.
+	gitDirRootEnvVar = "NARVI_GIT_DIR_ROOT"
 )
 
 // Defaults for every optional env var above.
@@ -103,6 +114,14 @@ const (
 	// either var to that account's own uid/gid instead.
 	defaultRuntimeUID uint32 = 65534
 	defaultRuntimeGID uint32 = 65534
+
+	// defaultGitDirRoot is used when NARVI_GIT_DIR_ROOT is unset --
+	// deliberately root-owned and NOT world-writable, matching gitdir.
+	// EnsureRoot's own default and doc comment exactly (this literal is
+	// this Step's own single source of truth for it; gitdir itself takes
+	// the root as a plain parameter, never re-deriving a default of its
+	// own).
+	defaultGitDirRoot = "/var/lib/narvi/gitdirs"
 )
 
 // Config is sandbox-agent's own typed, boot-time-validated configuration,
@@ -148,6 +167,18 @@ type Config struct {
 	// requirement already establishes for a different credential.
 	RuntimeUID uint32
 	RuntimeGID uint32
+
+	// GitDirRoot (§30.5) is the sandbox-wide root
+	// internal/sandboxagent/gitdir seeds every repo's own agent-owned
+	// git-dir under -- gitdir.Layout.Root, gitdir.EnsureRoot's own
+	// argument. Resolved by Load from NARVI_GIT_DIR_ROOT: unset uses
+	// defaultGitDirRoot; set to anything empty, non-absolute, or nested
+	// UNDER WorkspaceDir is a fail-fast *InvalidGitDirRootError -- an
+	// agent-owned git-dir living inside the runtime-owned workspace tree
+	// would defeat the entire structural guarantee this Step exists to
+	// provide (the runtime could then reach it via an ordinary path
+	// inside its own tree).
+	GitDirRoot string
 
 	// SandboxID is the value internal/sandboxagent/wsbridge.New sends as
 	// the sandbox WS connection's X-Sandbox-ID header (§6.1). Resolved by
@@ -307,6 +338,127 @@ func (e *RuntimeGIDIsRootError) Error() string {
 	return fmt.Sprintf("boot: %s=0 (root) would not drop any privilege; refusing to boot", runtimeGIDEnvVar)
 }
 
+// InvalidWorkspaceDirError is returned by Load when NARVI_WORKSPACE_DIR is
+// set to a non-absolute path.
+//
+// (round-2 review, R5): validateGitDirRoot's own two-direction check
+// (below) is purely lexical, via filepath.Rel -- which returns an error
+// whenever one argument is absolute and the other is relative.
+// isPathUnderOrEqual treated that error as "definitely not under",
+// failing OPEN in both directions at once for a relative WorkspaceDir: a
+// NARVI_WORKSPACE_DIR left relative (e.g. "srv/narvi/workspace") against
+// an absolute NARVI_GIT_DIR_ROOT (e.g. "/srv/narvi") would satisfy
+// neither the forward nor the reverse check, silently accepting a
+// configuration where a session repo literally named "workspace" resolves
+// GitDir to WorkspaceDir itself -- gitdir.Seed's own first destructive
+// step, os.RemoveAll(repo.GitDir), would then delete the entire
+// workspace. GitDirRoot was already required absolute; WorkspaceDir was
+// not. Failing closed here -- rejecting a relative WorkspaceDir outright,
+// before validateGitDirRoot's own relationship checks ever run -- removes
+// the mismatched-operand case that made filepath.Rel error in the first
+// place. isPathUnderOrEqual is ALSO hardened to fail closed on any
+// remaining Rel error (defense in depth), rather than relying solely on
+// this check.
+type InvalidWorkspaceDirError struct {
+	Value  string
+	Reason string
+}
+
+func (e *InvalidWorkspaceDirError) Error() string {
+	return fmt.Sprintf("boot: invalid %s=%q: %s", workspaceDirEnvVar, e.Value, e.Reason)
+}
+
+// validateWorkspaceDir enforces Config.WorkspaceDir's own one requirement
+// checked here: absolute. Required so validateGitDirRoot's own two-way
+// nesting check (isPathUnderOrEqual, below) always compares two absolute
+// paths -- see InvalidWorkspaceDirError's own doc comment for why a
+// relative WorkspaceDir made that check fail open in both directions at
+// once.
+func validateWorkspaceDir(dir string) error {
+	if !filepath.IsAbs(dir) {
+		return &InvalidWorkspaceDirError{Value: dir, Reason: "must be an absolute path"}
+	}
+	return nil
+}
+
+// InvalidGitDirRootError is returned by Load when NARVI_GIT_DIR_ROOT is
+// set to an empty value, a non-absolute path, or a path nested under
+// WorkspaceDir. See Config.GitDirRoot's own doc comment for why the
+// under-WorkspaceDir case specifically is refused, not merely
+// discouraged.
+type InvalidGitDirRootError struct {
+	Value  string
+	Reason string
+}
+
+func (e *InvalidGitDirRootError) Error() string {
+	return fmt.Sprintf("boot: invalid %s=%q: %s", gitDirRootEnvVar, e.Value, e.Reason)
+}
+
+// validateGitDirRoot enforces Config.GitDirRoot's own four requirements:
+// non-empty, absolute, not nested under (or equal to) workspaceDir, and
+// not itself containing (or equal to) workspaceDir.
+//
+// (Correction, review): the original version of this function only ever
+// checked the first direction (root under-or-equal workspaceDir). It
+// never checked the REVERSE -- workspaceDir under-or-equal root -- which
+// is exactly as dangerous: gitdir.Layout.Repo builds GitDir as
+// filepath.Join(Root, name), and gitdir.Seed's very first destructive
+// step is os.RemoveAll(repo.GitDir). An operator who sets GitDirRoot to
+// WorkspaceDir's own parent directory (e.g. WorkspaceDir=/srv/narvi/
+// workspace, GitDirRoot=/srv/narvi) makes a session repo NAMED
+// "workspace" resolve GitDir to WorkspaceDir itself
+// (filepath.Join("/srv/narvi", "workspace") == "/srv/narvi/workspace") --
+// reposource.ValidateRepoName accepts "workspace" as an ordinary
+// identifier -- so Seed's own RemoveAll deletes the entire workspace,
+// every repo in it, not just the one being (re-)seeded. Both directions
+// are checked here, symmetrically, against CLEANED paths (filepath.Clean
+// -- so a trailing slash or a "GitDirRoot/.." style value cannot dodge
+// either check).
+func validateGitDirRoot(root, workspaceDir string) error {
+	if root == "" {
+		return &InvalidGitDirRootError{Value: root, Reason: "must not be empty"}
+	}
+	if !filepath.IsAbs(root) {
+		return &InvalidGitDirRootError{Value: root, Reason: "must be an absolute path"}
+	}
+	cleanRoot := filepath.Clean(root)
+	cleanWorkspace := filepath.Clean(workspaceDir)
+	if isPathUnderOrEqual(cleanRoot, cleanWorkspace) {
+		return &InvalidGitDirRootError{Value: root, Reason: fmt.Sprintf("must not be nested under WorkspaceDir (%s) -- an agent-owned git-dir inside the runtime-owned workspace tree defeats the structural guarantee §30.5 provides", workspaceDir)}
+	}
+	if isPathUnderOrEqual(cleanWorkspace, cleanRoot) {
+		return &InvalidGitDirRootError{Value: root, Reason: fmt.Sprintf("must not contain WorkspaceDir (%s) -- a session repo name could then resolve GitDirRoot/<name> to WorkspaceDir itself, letting gitdir.Seed's own RemoveAll delete the whole workspace", workspaceDir)}
+	}
+	return nil
+}
+
+// isPathUnderOrEqual reports whether path is base itself, or nested
+// anywhere under it -- checked via filepath.Rel: a relative result of "."
+// (equal) or one with no leading ".." segment (a strict descendant) both
+// count. Both arguments are expected already-cleaned (filepath.Clean);
+// this function does not clean them itself.
+//
+// (round-2 review, R5): fails CLOSED (returns true -- "treat as
+// overlapping") when filepath.Rel itself errors, rather than open
+// (returning false -- "definitely not under"). Rel errors only when the
+// two operands cannot be related at all under lexical rules (e.g. one
+// absolute, one relative) -- validateGitDirRoot's own caller now
+// guarantees both sides are absolute (validateWorkspaceDir, GitDirRoot's
+// own filepath.IsAbs check), so this branch should not be reachable in
+// practice; it exists as defense in depth, not as this bug's own primary
+// fix -- see InvalidWorkspaceDirError's own doc comment for why an
+// "err == nil -> false" default here made BOTH of validateGitDirRoot's
+// directional checks pass simultaneously for a relative WorkspaceDir,
+// silently accepting an overlapping root/workspace configuration.
+func isPathUnderOrEqual(path, base string) bool {
+	rel, err := filepath.Rel(base, path)
+	if err != nil {
+		return true
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 // parseRuntimeID parses raw (the env var's own raw string value, "" when
 // unset) as a uint32, applying fallback when raw is empty and rejecting 0
 // unconditionally (see RuntimeUIDIsRootError/RuntimeGIDIsRootError's own
@@ -346,6 +498,9 @@ func Load() (Config, error) {
 	if workspaceDir == "" {
 		workspaceDir = defaultWorkspaceDir
 	}
+	if err := validateWorkspaceDir(workspaceDir); err != nil {
+		return Config{}, err
+	}
 
 	rawLogLevel := os.Getenv(logLevelEnvVar)
 	if rawLogLevel == "" {
@@ -377,6 +532,14 @@ func Load() (Config, error) {
 		return Config{}, &RuntimeGIDIsRootError{}
 	}
 
+	gitDirRoot := os.Getenv(gitDirRootEnvVar)
+	if gitDirRoot == "" {
+		gitDirRoot = defaultGitDirRoot
+	}
+	if err := validateGitDirRoot(gitDirRoot, workspaceDir); err != nil {
+		return Config{}, err
+	}
+
 	// sessionConfig is resolved BEFORE sandboxID below -- sandboxID's own
 	// resolution needs to know whether a SessionConfig is present (and,
 	// if so, its own SandboxId) to pick the right value/detect a mismatch.
@@ -399,6 +562,7 @@ func Load() (Config, error) {
 		CredentialCacheDir: credentialCacheDir,
 		RuntimeUID:         runtimeUID,
 		RuntimeGID:         runtimeGID,
+		GitDirRoot:         gitDirRoot,
 		SandboxID:          sandboxID,
 		SessionConfig:      sessionConfig,
 	}, nil

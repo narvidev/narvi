@@ -427,6 +427,13 @@ func runSandboxAgent(t *testing.T, binPath, gitServerURL, workspaceDir string, f
 		"NARVI_SESSION_CONFIG="+sessionConfigJSON,
 		"NARVI_WORKSPACE_DIR="+workspaceDir,
 		"NARVI_CREDENTIAL_CACHE_DIR="+credCacheDir,
+		// §30.5: boot.Config.GitDirRoot defaults to
+		// /var/lib/narvi/gitdirs, which an ordinary unprivileged `go test`
+		// process cannot create/write on a real dev machine or CI runner --
+		// gitdir.EnsureRoot would fail boot outright. Pointed at a fresh
+		// t.TempDir() instead, exactly like every other *_test.go call site
+		// in this codebase that builds a gitdir.Layout of its own.
+		"NARVI_GIT_DIR_ROOT="+t.TempDir(),
 		// TECHNICAL_PLAN.md §30.5 ("OS-level isolation between
 		// sandbox-agent and the agent runtime"): this real subprocess
 		// spawns a real `opencode serve` for its own agent runtime, which

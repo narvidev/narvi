@@ -21,6 +21,7 @@ import (
 
 	"github.com/narvidev/narvi/internal/domain/sandboxboot"
 	"github.com/narvidev/narvi/internal/sandboxagent/boot"
+	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
 
@@ -88,7 +89,16 @@ func TestSetupRerunLadder_DigestMatch_SkipsSetupEntirely(t *testing.T) {
 	if !workspaceMoved["repo1"] {
 		t.Fatalf("precondition failed: workspaceMoved[repo1] = false, want true")
 	}
-	ladder := boot.ComputeSetupRerunLadder(manifest, true, false, workspaceDir, currentSHAs, 5*time.Second)
+	gitDirRoot := t.TempDir()
+	if err := gitdir.EnsureRoot(gitDirRoot); err != nil {
+		t.Fatalf("gitdir.EnsureRoot() error = %v", err)
+	}
+	ladderLayout := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}
+	ladderSup := supervisor.New()
+	if err := gitdir.Seed(context.Background(), ladderSup, ladderLayout.Repo("repo1"), "https://example.invalid/repo1.git", nil, 5*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("gitdir.Seed() error = %v", err)
+	}
+	ladder := boot.ComputeSetupRerunLadder(context.Background(), ladderSup, ladderLayout, nil, manifest, true, false, workspaceDir, currentSHAs, 5*time.Second, 5*time.Second)
 
 	sup := supervisor.New()
 	repos := []boot.RepoInfo{{Name: "repo1", Primary: true}}
@@ -135,7 +145,16 @@ func TestSetupRerunLadder_DeltaEligible_RunsSyncInsteadOfSetup(t *testing.T) {
 	if !workspaceMoved["repo1"] {
 		t.Fatalf("precondition failed: workspaceMoved[repo1] = false, want true")
 	}
-	ladder := boot.ComputeSetupRerunLadder(manifest, true, false, workspaceDir, currentSHAs, 5*time.Second)
+	gitDirRoot := t.TempDir()
+	if err := gitdir.EnsureRoot(gitDirRoot); err != nil {
+		t.Fatalf("gitdir.EnsureRoot() error = %v", err)
+	}
+	ladderLayout := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}
+	ladderSup := supervisor.New()
+	if err := gitdir.Seed(context.Background(), ladderSup, ladderLayout.Repo("repo1"), "https://example.invalid/repo1.git", nil, 5*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("gitdir.Seed() error = %v", err)
+	}
+	ladder := boot.ComputeSetupRerunLadder(context.Background(), ladderSup, ladderLayout, nil, manifest, true, false, workspaceDir, currentSHAs, 5*time.Second, 5*time.Second)
 	if !ladder["repo1"].DeltaEligible {
 		t.Fatalf("precondition failed: ladder[repo1].DeltaEligible = false, want true (setup.sh was never touched since builtSHA)")
 	}
@@ -176,7 +195,16 @@ func TestSetupRerunLadder_DeltaFails_FallsBackToFullSetup(t *testing.T) {
 	manifest := boot.ImageManifest{BuiltRepoShas: map[string]string{"repo1": builtSHA}}
 	currentSHAs := map[string]string{"repo1": currentSHA}
 	workspaceMoved := boot.ComputeWorkspaceMoved(manifest, true, currentSHAs)
-	ladder := boot.ComputeSetupRerunLadder(manifest, true, false, workspaceDir, currentSHAs, 5*time.Second)
+	gitDirRoot := t.TempDir()
+	if err := gitdir.EnsureRoot(gitDirRoot); err != nil {
+		t.Fatalf("gitdir.EnsureRoot() error = %v", err)
+	}
+	ladderLayout := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}
+	ladderSup := supervisor.New()
+	if err := gitdir.Seed(context.Background(), ladderSup, ladderLayout.Repo("repo1"), "https://example.invalid/repo1.git", nil, 5*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("gitdir.Seed() error = %v", err)
+	}
+	ladder := boot.ComputeSetupRerunLadder(context.Background(), ladderSup, ladderLayout, nil, manifest, true, false, workspaceDir, currentSHAs, 5*time.Second, 5*time.Second)
 	if !ladder["repo1"].DeltaEligible {
 		t.Fatalf("precondition failed: ladder[repo1].DeltaEligible = false, want true")
 	}
@@ -217,7 +245,16 @@ func TestSetupRerunLadder_DeltaIneligible_SetupChanged_RunsFullSetup(t *testing.
 	manifest := boot.ImageManifest{BuiltRepoShas: map[string]string{"repo1": builtSHA}}
 	currentSHAs := map[string]string{"repo1": currentSHA}
 	workspaceMoved := boot.ComputeWorkspaceMoved(manifest, true, currentSHAs)
-	ladder := boot.ComputeSetupRerunLadder(manifest, true, false, workspaceDir, currentSHAs, 5*time.Second)
+	gitDirRoot := t.TempDir()
+	if err := gitdir.EnsureRoot(gitDirRoot); err != nil {
+		t.Fatalf("gitdir.EnsureRoot() error = %v", err)
+	}
+	ladderLayout := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}
+	ladderSup := supervisor.New()
+	if err := gitdir.Seed(context.Background(), ladderSup, ladderLayout.Repo("repo1"), "https://example.invalid/repo1.git", nil, 5*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("gitdir.Seed() error = %v", err)
+	}
+	ladder := boot.ComputeSetupRerunLadder(context.Background(), ladderSup, ladderLayout, nil, manifest, true, false, workspaceDir, currentSHAs, 5*time.Second, 5*time.Second)
 	if ladder["repo1"].DeltaEligible {
 		t.Fatalf("precondition failed: ladder[repo1].DeltaEligible = true, want false (setup.sh WAS changed since builtSHA)")
 	}
@@ -272,7 +309,16 @@ func TestSetupRerunLadder_DigestMismatch_FallsThroughToFullSetup(t *testing.T) {
 	}
 	currentSHAs := map[string]string{"repo1": currentSHA}
 	workspaceMoved := boot.ComputeWorkspaceMoved(manifest, true, currentSHAs)
-	ladder := boot.ComputeSetupRerunLadder(manifest, true, false, workspaceDir, currentSHAs, 5*time.Second)
+	gitDirRoot := t.TempDir()
+	if err := gitdir.EnsureRoot(gitDirRoot); err != nil {
+		t.Fatalf("gitdir.EnsureRoot() error = %v", err)
+	}
+	ladderLayout := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}
+	ladderSup := supervisor.New()
+	if err := gitdir.Seed(context.Background(), ladderSup, ladderLayout.Repo("repo1"), "https://example.invalid/repo1.git", nil, 5*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("gitdir.Seed() error = %v", err)
+	}
+	ladder := boot.ComputeSetupRerunLadder(context.Background(), ladderSup, ladderLayout, nil, manifest, true, false, workspaceDir, currentSHAs, 5*time.Second, 5*time.Second)
 	if ladder["repo1"].DependencySkip != boot.DependencySkipMismatch {
 		t.Fatalf("precondition failed: ladder[repo1].DependencySkip = %q, want %q", ladder["repo1"].DependencySkip, boot.DependencySkipMismatch)
 	}
@@ -343,7 +389,16 @@ func TestSetupRerunLadder_DigestMatchButSetupChanged_RunsFullSetup(t *testing.T)
 	if !workspaceMoved["repo1"] {
 		t.Fatalf("precondition failed: workspaceMoved[repo1] = false, want true")
 	}
-	ladder := boot.ComputeSetupRerunLadder(manifest, true, false, workspaceDir, currentSHAs, 5*time.Second)
+	gitDirRoot := t.TempDir()
+	if err := gitdir.EnsureRoot(gitDirRoot); err != nil {
+		t.Fatalf("gitdir.EnsureRoot() error = %v", err)
+	}
+	ladderLayout := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}
+	ladderSup := supervisor.New()
+	if err := gitdir.Seed(context.Background(), ladderSup, ladderLayout.Repo("repo1"), "https://example.invalid/repo1.git", nil, 5*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("gitdir.Seed() error = %v", err)
+	}
+	ladder := boot.ComputeSetupRerunLadder(context.Background(), ladderSup, ladderLayout, nil, manifest, true, false, workspaceDir, currentSHAs, 5*time.Second, 5*time.Second)
 	if ladder["repo1"].DependencySkip != boot.DependencySkipMatch {
 		t.Fatalf("precondition failed: ladder[repo1].DependencySkip = %q, want %q (package-lock.json is unchanged)",
 			ladder["repo1"].DependencySkip, boot.DependencySkipMatch)
@@ -433,7 +488,16 @@ func TestSetupRerunLadder_ScopedSession_DigestTierAlwaysIneligible(t *testing.T)
 	// TestSetupRerunLadder_DigestMatch_SkipsSetupEntirely's own identical
 	// setup, which resolves to DependencySkipMatch and skips setup.sh
 	// entirely.
-	ladder := boot.ComputeSetupRerunLadder(manifest, true, true, workspaceDir, currentSHAs, 5*time.Second)
+	gitDirRoot := t.TempDir()
+	if err := gitdir.EnsureRoot(gitDirRoot); err != nil {
+		t.Fatalf("gitdir.EnsureRoot() error = %v", err)
+	}
+	ladderLayout := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}
+	ladderSup := supervisor.New()
+	if err := gitdir.Seed(context.Background(), ladderSup, ladderLayout.Repo("repo1"), "https://example.invalid/repo1.git", nil, 5*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("gitdir.Seed() error = %v", err)
+	}
+	ladder := boot.ComputeSetupRerunLadder(context.Background(), ladderSup, ladderLayout, nil, manifest, true, true, workspaceDir, currentSHAs, 5*time.Second, 5*time.Second)
 	if ladder["repo1"].DependencySkip != boot.DependencySkipIneligible {
 		t.Fatalf("ladder[repo1].DependencySkip = %q, want %q (a scoped session must never trust the digest tier, even on what looks like an exact match)",
 			ladder["repo1"].DependencySkip, boot.DependencySkipIneligible)
@@ -513,7 +577,16 @@ func TestSetupRerunLadder_LogsStructuredDecisionsForEachTier(t *testing.T) {
 	manifest := boot.ImageManifest{BuiltRepoShas: map[string]string{"repo1": builtSHA}}
 	currentSHAs := map[string]string{"repo1": currentSHA}
 	workspaceMoved := boot.ComputeWorkspaceMoved(manifest, true, currentSHAs)
-	ladder := boot.ComputeSetupRerunLadder(manifest, true, false, workspaceDir, currentSHAs, 5*time.Second)
+	gitDirRoot := t.TempDir()
+	if err := gitdir.EnsureRoot(gitDirRoot); err != nil {
+		t.Fatalf("gitdir.EnsureRoot() error = %v", err)
+	}
+	ladderLayout := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}
+	ladderSup := supervisor.New()
+	if err := gitdir.Seed(context.Background(), ladderSup, ladderLayout.Repo("repo1"), "https://example.invalid/repo1.git", nil, 5*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("gitdir.Seed() error = %v", err)
+	}
+	ladder := boot.ComputeSetupRerunLadder(context.Background(), ladderSup, ladderLayout, nil, manifest, true, false, workspaceDir, currentSHAs, 5*time.Second, 5*time.Second)
 
 	sup := supervisor.New()
 	repos := []boot.RepoInfo{{Name: "repo1", Primary: true}}

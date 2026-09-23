@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/narvidev/narvi/internal/domain/sandboxboot"
 	"github.com/narvidev/narvi/internal/sandboxagent/boot"
+	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
 
@@ -203,10 +205,31 @@ func TestResilienceScenario_RepoAbsentFromWorkspaceMoved_SetupStillReruns(t *tes
 	rerunMarker := filepath.Join(workspaceDir, "setup-rerun-marker-no-sha")
 	writeScript(t, filepath.Join(repoDir, "setup.sh"), "touch "+rerunMarker)
 
+	// §30.5: DiscoverRepoSHAs now only reads a repo whose agent
+	// git-dir has already been seeded -- seed repo-no-sha's here too, so
+	// the omission this test proves is still genuinely `git rev-parse
+	// HEAD` failing (a zero-commit repo), not merely "never seeded".
+	// gitdir.Seed itself succeeds fine against a zero-commit repo: `git
+	// init` still writes a well-formed symbolic-ref HEAD
+	// ("ref: refs/heads/<branch>\n") even with no commits yet, which is
+	// exactly the shape SyncHeadIn accepts (see that function's own doc
+	// comment) -- the FAILURE this test cares about is `rev-parse HEAD`
+	// itself finding no commit to resolve the ref to, which still happens
+	// identically through the agent-owned git-dir.
+	gitDirRoot := t.TempDir()
+	if err := gitdir.EnsureRoot(gitDirRoot); err != nil {
+		t.Fatalf("gitdir.EnsureRoot() error = %v", err)
+	}
+	layout := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}
+	seedSup := supervisor.New()
+	if err := gitdir.Seed(context.Background(), seedSup, layout.Repo("repo-no-sha"), "https://example.invalid/repo-no-sha.git", nil, 5*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("gitdir.Seed() error = %v", err)
+	}
+
 	// The real production path (cmd/sandbox-agent/main.go's own
 	// runBootSequence): discover current SHAs over the whole workspace, then
 	// compute workspaceMoved from that set -- never a hand-constructed map.
-	currentSHAs := boot.DiscoverRepoSHAs(workspaceDir, 5*time.Second)
+	currentSHAs := boot.DiscoverRepoSHAs(context.Background(), seedSup, layout, nil, nil, 5*time.Second, 5*time.Second)
 	if _, ok := currentSHAs["repo-no-sha"]; ok {
 		t.Fatalf("precondition failed: DiscoverRepoSHAs()[repo-no-sha] present, want absent (rev-parse HEAD should fail on a zero-commit repo); got %v", currentSHAs)
 	}
@@ -232,16 +255,20 @@ func TestResilienceScenario_RepoAbsentFromWorkspaceMoved_SetupStillReruns(t *tes
 	assertFileExists(t, rerunMarker)
 }
 
-// gitRevParseHEAD returns dir's own checked-out HEAD SHA via a real `git
-// rev-parse HEAD` call.
+// gitRevParseHEAD returns dir's own checked-out HEAD SHA via a real,
+// direct `git -C dir rev-parse HEAD` call -- deliberately NOT routed
+// through boot.DiscoverRepoSHAs (§30.5 made that function require
+// an already-seeded agent git-dir, which this helper's own callers should
+// not need to set up just to read back a SHA they themselves just
+// committed).
 func gitRevParseHEAD(t *testing.T, dir string) string {
 	t.Helper()
-	shas := boot.DiscoverRepoSHAs(filepath.Dir(dir), 5*time.Second)
-	sha, ok := shas[filepath.Base(dir)]
-	if !ok {
-		t.Fatalf("DiscoverRepoSHAs found no entry for %s", dir)
+	cmd := exec.Command("git", "-C", dir, "rev-parse", "HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git -C %s rev-parse HEAD: %v", dir, err)
 	}
-	return sha
+	return strings.TrimSpace(string(out))
 }
 
 // countingFailThenSucceedScript returns a setup.sh body that counts its own
