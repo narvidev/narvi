@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +27,34 @@ import (
 	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
+
+// installDefaultTestLogger builds a JSON logger writing to a buffer and
+// installs it as slog.Default() for the duration of the test (restored via
+// t.Cleanup) -- exactly mirroring production's own run() (main.go), which
+// calls slog.SetDefault(logger) right after building the identical logger,
+// so any global slog.* call anywhere in the seed path -- not just the
+// explicit *slog.Logger bootFingerprintAndSeed itself is handed -- lands in
+// the SAME stream the fingerprint line does, in the same relative order.
+//
+// (Round-3 review, Q5): the tests below used to build a private
+// platform.NewLogger(&buf, ...) and pass it ONLY as bootFingerprintAndSeed's
+// explicit logger argument, never installing it as slog.Default(). A
+// global slog call reached through the seed path (e.g. the exact
+// round-2 regression: an inline slog.Warn in seedWarmBootRepos, logged
+// before the fingerprint) went to Go's own default stderr handler and
+// never reached the captured buffer, so these tests could not have caught
+// that regression coming back. Callers of this helper must NOT use
+// t.Parallel(): slog.SetDefault mutates process-global state, so two such
+// tests running concurrently would race each other's captured output.
+func installDefaultTestLogger(t *testing.T, level slog.Level) (*bytes.Buffer, *slog.Logger) {
+	t.Helper()
+	var buf bytes.Buffer
+	logger := platform.NewLogger(&buf, level)
+	orig := slog.Default()
+	slog.SetDefault(logger)
+	t.Cleanup(func() { slog.SetDefault(orig) })
+	return &buf, logger
+}
 
 // loggedRepoSHAs parses buf the same way loggedMessages does and returns the
 // "repo_shas" field of the FIRST logged line (the §5.3 fingerprint, per this
@@ -79,7 +108,8 @@ const bootFingerprintMsg = "sandbox-agent: boot fingerprint"
 // exactly as a repo_image/snapshot_restore boot can produce) the round-2
 // review reproduced.
 func TestBootFingerprintAndSeed_PrimaryFailure_FingerprintLoggedFirst(t *testing.T) {
-	t.Parallel()
+	// Deliberately NOT t.Parallel() -- installDefaultTestLogger installs a
+	// process-global slog.Default(), see its own doc comment.
 
 	workspaceDir := t.TempDir()
 	seedWarmBootTestBadRepo(t, workspaceDir, "bad-primary")
@@ -96,15 +126,14 @@ func TestBootFingerprintAndSeed_PrimaryFailure_FingerprintLoggedFirst(t *testing
 	}
 	layout := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}
 
-	var buf bytes.Buffer
-	logger := platform.NewLogger(&buf, cfg.LogLevel)
+	buf, logger := installDefaultTestLogger(t, cfg.LogLevel)
 
 	err := bootFingerprintAndSeed(context.Background(), supervisor.New(), cfg, layout, nil, platform.DefaultTimeouts(), logger)
 	if err == nil {
 		t.Fatal("bootFingerprintAndSeed() error = nil, want a fatal error for the failed primary repo's Seed call")
 	}
 
-	msgs := loggedMessages(t, &buf)
+	msgs := loggedMessages(t, buf)
 	if len(msgs) == 0 {
 		t.Fatal("bootFingerprintAndSeed() logged nothing, want the boot fingerprint line even on a primary Seed failure")
 	}
@@ -119,7 +148,8 @@ func TestBootFingerprintAndSeed_PrimaryFailure_FingerprintLoggedFirst(t *testing
 // fatal path identified by the round-2 review that used to return from
 // run() before ever logging the fingerprint.
 func TestBootFingerprintAndSeed_EnsureRootFailure_FingerprintLoggedFirst(t *testing.T) {
-	t.Parallel()
+	// Deliberately NOT t.Parallel() -- installDefaultTestLogger installs a
+	// process-global slog.Default(), see its own doc comment.
 
 	tmp := t.TempDir()
 	blocker := filepath.Join(tmp, "blocker")
@@ -142,15 +172,14 @@ func TestBootFingerprintAndSeed_EnsureRootFailure_FingerprintLoggedFirst(t *test
 	}
 	layout := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}
 
-	var buf bytes.Buffer
-	logger := platform.NewLogger(&buf, cfg.LogLevel)
+	buf, logger := installDefaultTestLogger(t, cfg.LogLevel)
 
 	err := bootFingerprintAndSeed(context.Background(), supervisor.New(), cfg, layout, nil, platform.DefaultTimeouts(), logger)
 	if err == nil {
 		t.Fatal("bootFingerprintAndSeed() error = nil, want a fatal error for the failed gitdir.EnsureRoot call")
 	}
 
-	msgs := loggedMessages(t, &buf)
+	msgs := loggedMessages(t, buf)
 	if len(msgs) == 0 {
 		t.Fatal("bootFingerprintAndSeed() logged nothing, want the boot fingerprint line even on an EnsureRoot failure")
 	}
@@ -165,7 +194,8 @@ func TestBootFingerprintAndSeed_EnsureRootFailure_FingerprintLoggedFirst(t *test
 // the round-2 review found broken even on the success path (the inline
 // warning used to be logged before the fingerprint).
 func TestBootFingerprintAndSeed_SecondaryFailure_FingerprintPrecedesWarning(t *testing.T) {
-	t.Parallel()
+	// Deliberately NOT t.Parallel() -- installDefaultTestLogger installs a
+	// process-global slog.Default(), see its own doc comment.
 
 	workspaceDir := t.TempDir()
 	seedWarmBootTestGoodRepo(t, workspaceDir, "primary")
@@ -184,15 +214,14 @@ func TestBootFingerprintAndSeed_SecondaryFailure_FingerprintPrecedesWarning(t *t
 	}
 	layout := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}
 
-	var buf bytes.Buffer
-	logger := platform.NewLogger(&buf, cfg.LogLevel)
+	buf, logger := installDefaultTestLogger(t, cfg.LogLevel)
 
 	err := bootFingerprintAndSeed(context.Background(), supervisor.New(), cfg, layout, nil, platform.DefaultTimeouts(), logger)
 	if err != nil {
 		t.Fatalf("bootFingerprintAndSeed() error = %v, want nil (a secondary repo's Seed failure is a warning, not fatal)", err)
 	}
 
-	msgs := loggedMessages(t, &buf)
+	msgs := loggedMessages(t, buf)
 	if len(msgs) < 2 {
 		t.Fatalf("bootFingerprintAndSeed() logged %d lines, want at least 2 (fingerprint, then the secondary warning): %v", len(msgs), msgs)
 	}
