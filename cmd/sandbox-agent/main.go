@@ -514,12 +514,16 @@ func (h *commandHandler) HandlePush(_ context.Context, cmd sandboxws.Push) {
 // pushOneRepo is also the one network-touching git invocation in this
 // codebase with no validated repo URL of its own (sandboxws.
 // Push.Repos[] carries name/branch/remote, never a url) -- so unlike
-// gitclone.cloneOne/gitFetchRef/resolveDefaultBranch, it cannot add
-// githarden.RepoURLProxyArg for the http.<url>.proxy vector; a
-// repository-authored proxy scoped to the exact url `git push` resolves
-// remote.<remote>.url to is a recorded, accepted residual here, not a
-// fixed one -- see docs/DECISIONS.md and githarden's own http.proxy doc
-// comment for the full reasoning.
+// gitclone.cloneOne, it cannot add githarden.RepoURLProxyArg for the
+// http.<url>.proxy vector; a repository-authored proxy scoped to the
+// exact url `git push` resolves remote.<remote>.url to is a recorded,
+// accepted residual here, not a fixed one -- see docs/DECISIONS.md and
+// githarden's own http.proxy doc comment for the full reasoning.
+// gitclone's own fetch/ls-remote helpers (gitFetchRef, resolveDefaultBranch)
+// are not a comparison point here either way: they target "origin" by
+// NAME, so RemoteProxyArg's own unconditional guarantee (githarden.go's
+// hardeningFlags carries the "origin" case already) covers them without
+// needing a URL at all -- see githarden's own RepoURLProxyArg doc comment.
 func (h *commandHandler) pushOneRepo(repoSpec sandboxws.PushReposElem) (string, error) {
 	if err := reposource.ValidateRepoName(repoSpec.Name); err != nil {
 		return "", fmt.Errorf("invalid repo name: %w", err)

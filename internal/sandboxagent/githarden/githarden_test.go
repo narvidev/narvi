@@ -1,6 +1,8 @@
 package githarden
 
 import (
+	"bufio"
+	"net"
 	"net/http/cgi"
 	"net/http/httptest"
 	"os"
@@ -9,6 +11,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // TestMain sets GIT_SSL_NO_VERIFY=true ONCE, before any test runs (never
@@ -876,6 +881,159 @@ func TestTransportClass_HTTPProxyNeutralised(t *testing.T) {
 	mutated3Cmd.Env = gitEnv()
 	if out, err := mutated3Cmd.CombinedOutput(); err == nil {
 		t.Fatalf("mutation: removing BOTH http.proxy= and remote.origin.proxy= did not re-open the attack (fetch still succeeded) -- some OTHER flag is silently doing this job\n%s", out)
+	}
+}
+
+// startCaptureProxy starts a real TCP listener that stands in for an
+// attacker-controlled HTTP proxy, and reports on connected whether the
+// FIRST connection it ever accepts opens with an HTTP CONNECT line -- the
+// tunnel handshake a proxied https fetch issues. This observes the same
+// thing a real attacker-run proxy would observe (a connection actually
+// arriving), rather than inferring "was the proxy used" indirectly from
+// whether the fetch failed: an unreachable-port fixture (as
+// TestTransportClass_HTTPProxyNeutralised, above, uses) can only prove the
+// fetch failed, never WHY -- "routed through the proxy, which then refused
+// it" and "went direct and the destination refused it" look identical from
+// the git process's own exit code. No real proxying happens behind this
+// listener: it deliberately closes the connection the instant it has read
+// enough to answer the one question this test asks, so a fetch that does
+// dial it fails fast rather than hanging until a timeout.
+func startCaptureProxy(t *testing.T) (proxyURL string, connected <-chan bool) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	ch := make(chan bool, 1)
+	// errgroup.Group.Go, never a bare `go` statement -- §11/nakedgoroutine
+	// grants no test exemption (mirrors credentials/cache_test.go's own
+	// TestCache_FlockSerializesConcurrentAccess).
+	var group errgroup.Group
+	group.Go(func() error {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			// t.Cleanup below closed the listener -- this phase's fetch
+			// never dialed it at all, which is the expected shape of the
+			// FIXED case below and not itself a test failure.
+			return nil
+		}
+		defer func() { _ = conn.Close() }()
+		line, _ := bufio.NewReader(conn).ReadString('\n')
+		ch <- strings.HasPrefix(line, "CONNECT ")
+		return nil
+	})
+	t.Cleanup(func() {
+		_ = ln.Close()
+		_ = group.Wait()
+	})
+	return "http://" + ln.Addr().String(), ch
+}
+
+// TestTransportClass_RemoteOriginProxyClosesRewrittenURL pins the actual
+// guarantee behind gitclone's fetch/ls-remote helpers (resolveDefaultBranch,
+// gitFetchRef, sync.go): hardeningFlags' own unconditional, remote-NAME-keyed
+// "-c remote.origin.proxy=" -- not a url-keyed override, which a previous
+// version of this codebase added at those two call sites
+// (githarden.RepoURLProxyArg, keyed to the validated SESSION url) and which
+// docs/DECISIONS.md and both call sites' own comments credited with closing
+// this vector. That credit was never earned there: `fetch origin`/`ls-remote
+// origin` contact whatever remote.origin.url currently resolves to, read
+// from THIS repository's own runtime-owned .git/config, which §30.5 hands
+// the agent runtime -- a url the validated session config never re-checks
+// against. This test arms the WORST case for that gap: an attacker who has
+// rewritten remote.origin.url and planted an http.<url>.proxy for the EXACT
+// resulting url (the single most specific match http.<url>.proxy's own
+// urlmatch scoring could ever be given), and proves remote.origin.proxy=
+// alone -- present regardless of what remote.origin.url says -- still closes
+// it, observed directly via a real listening proxy (startCaptureProxy,
+// above) rather than inferred from a failure.
+func TestTransportClass_RemoteOriginProxyClosesRewrittenURL(t *testing.T) {
+	reposParent := t.TempDir()
+	srcDir := filepath.Join(reposParent, "src")
+	gitInRepo(t, "", "init", "-q", srcDir)
+	if err := os.WriteFile(filepath.Join(srcDir, "a.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatalf("write a: %v", err)
+	}
+	gitInRepo(t, srcDir, "add", "-A")
+	gitInRepo(t, srcDir, "commit", "-qm", "seed")
+	server := startLocalHTTPSGitServer(t, reposParent)
+	// Stands in for the url the runtime rewrote remote.origin.url to --
+	// this test does not need it to differ from any "original" session url
+	// at all (githarden itself never sees a session url in the first
+	// place); what matters is that http.<url>.proxy is armed for the EXACT
+	// string remote.origin.url resolves to, the case a url-keyed override
+	// would, at best, only ever match.
+	remoteURL := server.URL + "/src"
+
+	repoDir := t.TempDir()
+	gitInRepo(t, repoDir, "init", "-q", ".")
+	gitInRepo(t, repoDir, "config", "remote.origin.url", remoteURL)
+	gitInRepo(t, repoDir, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+
+	// armProxy (re)plants http.<remoteURL>.proxy pointed at a FRESH
+	// listener for one phase -- a fresh listener per phase, rather than
+	// one long-lived listener shared across all three, so each phase's own
+	// "did a CONNECT arrive" question has an unambiguous, race-free answer.
+	armProxy := func() <-chan bool {
+		t.Helper()
+		proxyURL, connected := startCaptureProxy(t)
+		gitInRepo(t, repoDir, "config", "http."+remoteURL+".proxy", proxyURL)
+		return connected
+	}
+
+	// CONTROL: with no hardening at all, the fetch must actually dial the
+	// planted proxy -- otherwise this fixture proves nothing.
+	controlConnected := armProxy()
+	controlCmd := exec.Command("git", "-c", "http.sslVerify=false", "fetch", "origin")
+	controlCmd.Dir = repoDir
+	controlCmd.Env = gitEnv()
+	_ = controlCmd.Run() // the fake proxy always refuses the tunnel; only the CONNECT itself is observed
+	select {
+	case gotConnect := <-controlConnected:
+		if !gotConnect {
+			t.Fatal("control: the listener accepted a connection that did not open with CONNECT -- fixture is wrong")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("control: fetch never dialed the planted proxy at all (want a CONNECT) -- this test proves nothing")
+	}
+
+	// FIXED: the real Args()/hardeningFlags output -- remote.origin.proxy=
+	// must keep the fetch off the planted proxy entirely, reaching the real
+	// server directly instead.
+	fixedConnected := armProxy()
+	fixedCmd := exec.Command("git", Args(repoDir, "fetch", "origin")...)
+	fixedCmd.Dir = repoDir
+	fixedCmd.Env = gitEnv()
+	if out, err := fixedCmd.CombinedOutput(); err != nil {
+		t.Fatalf("fetch with hardeningFlags in place failed (want it to reach the real server directly): %v\n%s", err, out)
+	}
+	select {
+	case gotConnect := <-fixedConnected:
+		if gotConnect {
+			t.Fatal("fixed: fetch with remote.origin.proxy= in place still dialed the planted proxy (CONNECT observed) -- the vector is NOT closed")
+		}
+	case <-time.After(300 * time.Millisecond):
+		// No connection at all -- the expected, correct outcome: the fetch
+		// already completed above, so nothing is still in flight to wait for.
+	}
+
+	// MUTATION: drop remote.origin.proxy= alone -- the attack must reopen.
+	// This is the in-test mirror of "delete the flag from hardeningFlags
+	// itself and confirm this test fails", verified by hand (see PR body)
+	// against the real, unedited production list.
+	mutatedConnected := armProxy()
+	mutatedCmd := exec.Command("git", argsWithout(repoDir, []string{"remote.origin.proxy="}, "fetch", "origin")...)
+	mutatedCmd.Dir = repoDir
+	mutatedCmd.Env = gitEnv()
+	_ = mutatedCmd.Run()
+	select {
+	case gotConnect := <-mutatedConnected:
+		if !gotConnect {
+			t.Fatal("mutation: removing remote.origin.proxy= did not re-open the attack (no CONNECT observed) -- some OTHER flag is silently doing this job")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("mutation: removing remote.origin.proxy= did not re-open the attack (fetch never dialed the proxy)")
 	}
 }
 

@@ -232,23 +232,42 @@ func hardeningFlags(repoDir string) []string {
 		// identically-shaped override for whatever remote name it actually
 		// validated, on top of this one.
 		//
-		// http.<url>.proxy is the residual this flag alone does not close:
-		// it is keyed by the ACTUAL clone URL, which most call sites in
-		// this package do not carry (a `git push`/`git fetch` targets a
-		// remote NAME, not a URL of its own). Closed at the two call sites
-		// that DO know the exact URL from validated session config
-		// (gitclone.cloneOne, gitclone's own fetch/ls-remote helpers) via
-		// RepoURLProxyArg, below -- NOT closed here, because embedding a
-		// URL this function was never given would either require reading
-		// remote.<name>.url back from the very runtime-owned config this
-		// package treats as hostile (a TOCTOU risk, and circular: the
-		// value read could itself be the attacker's own rewrite) or leave
-		// a wrong, stale URL in place. `git push` (cmd/sandbox-agent) is
-		// the one network-touching call site with NO validated URL of its
-		// own at all (sandboxws.Push.Repos[] carries name/branch/remote,
-		// never a url) -- its own http.<url>.proxy exposure is therefore a
-		// recorded, accepted residual, not a fixed one; see
-		// docs/DECISIONS.md.
+		// http.<url>.proxy is the residual this flag alone does not close,
+		// but remote.<name>.proxy above already closes it in full for every
+		// call site that ever contacts a remote by NAME -- which is every
+		// gitclone call site EXCEPT the clone itself: gitclone's own fetch/
+		// ls-remote helpers (resolveDefaultBranch, gitFetchRef, sync.go) both
+		// run `... origin ...`, so remote.origin.proxy= above already wins
+		// for them unconditionally, regardless of what url remote.origin.url
+		// (read from this repository's own runtime-owned .git/config, not
+		// from session config) actually resolves to. An earlier version of
+		// this package also added RepoURLProxyArg, below, at those two call
+		// sites, keyed to the validated SESSION url -- that was not a second
+		// layer of defense, it was dead: the key it built could only ever
+		// match remote.origin.proxy's own guarantee when the session url and
+		// the runtime-owned remote.origin.url happened to already agree, and
+		// would silently match nothing the one time it would matter (the
+		// runtime having rewritten remote.origin.url), while the comments at
+		// both call sites credited it with closing the vector regardless.
+		// Removed; see gitclone/sync.go's own doc comments on
+		// resolveDefaultBranch and gitFetchRef, and
+		// TestTransportClass_RemoteOriginProxyClosesRewrittenURL below for the
+		// executable proof that remote.origin.proxy= alone is what actually
+		// holds here.
+		//
+		// gitclone.cloneOne is the one call site where RepoURLProxyArg is
+		// still real, load-bearing defense-in-depth: `git clone`'s own
+		// initial fetch contacts the url given on ITS OWN command line
+		// (repo.Url, from validated session config) to create the "origin"
+		// remote in the first place, so the url RepoURLProxyArg keys off of
+		// there is, by construction, the exact url this invocation ever
+		// contacts -- unlike fetch/ls-remote above, there is no separate,
+		// potentially-rewritten remote.origin.url in play for that same
+		// invocation to diverge from. `git push` (cmd/sandbox-agent) is the
+		// one network-touching call site with NO validated URL of its own at
+		// all (sandboxws.Push.Repos[] carries name/branch/remote, never a
+		// url) -- its own http.<url>.proxy exposure is therefore a recorded,
+		// accepted residual, not a fixed one; see docs/DECISIONS.md.
 		"-c", "http.proxy=",
 		"-c", "remote.origin.proxy=",
 	}
@@ -523,12 +542,21 @@ func RemoteProxyArg(remoteName string) []string {
 // stops routing through the planted address; a repository-set entry for
 // a LESS specific prefix of the same url loses outright, as expected).
 //
-// repoURL must be the literal string this invocation's own clone/fetch
-// target url -- never read back from the repository's own (potentially
-// runtime-rewritten) remote.<name>.url, which would be racy and circular
-// (see hardeningFlags' own http.proxy doc comment for why call sites that
-// do not carry a validated url of their own, e.g. `git push`, get no
-// override from this function at all).
+// repoURL must be the literal string this invocation's own command line
+// will contact directly -- never read back from the repository's own
+// (potentially runtime-rewritten) remote.<name>.url, which would be racy
+// and circular. That is why gitclone.cloneOne is this function's one
+// caller: `git clone`'s own target url IS its own command-line argument,
+// so the two can never diverge. gitclone's fetch/ls-remote helpers
+// (resolveDefaultBranch, gitFetchRef, sync.go) do NOT call this -- they
+// contact remote.origin.url, resolved from the repository's own
+// runtime-owned config, which this function's repoURL parameter (the
+// validated SESSION url) is not guaranteed to match; their own guarantee
+// is hardeningFlags' unconditional, remote-NAME-keyed
+// "remote.origin.proxy=" instead (see hardeningFlags' own http.proxy doc
+// comment for the full reasoning, and for why a call site with no
+// validated url of its own, e.g. `git push`, gets no override from this
+// function at all).
 //
 // A repoURL containing "=" is rejected (returns nil) rather than risking
 // a corrupted override: git's own "-c key=value" parsing splits on the

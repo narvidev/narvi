@@ -250,9 +250,12 @@ func TestCloneAll_HardensTheActualCloneInvocation(t *testing.T) {
 		"<-c> <protocol.ext.allow=never>",
 		"<-c> <protocol.ftp.allow=never>",
 		// remote.origin.proxy/http.<url>.proxy: F3's own two proxy
-		// overrides, present here too -- the clone path is a
-		// network-touching call site with a validated URL of its own,
-		// exactly like gitFetchRef/resolveDefaultBranch.
+		// overrides, both present here -- unlike gitFetchRef/
+		// resolveDefaultBranch (sync.go), which target "origin" by NAME
+		// and rely on remote.origin.proxy= alone, clone's own url-keyed
+		// http.<url>.proxy override is real: `git clone`'s initial fetch
+		// contacts the exact url on its own command line (repoURL,
+		// below), so RepoURLProxyArg's key is guaranteed to match it.
 		"<-c> <remote.origin.proxy=>",
 		"<-c> <http." + repoURL + ".proxy=>",
 		"<clone>",
