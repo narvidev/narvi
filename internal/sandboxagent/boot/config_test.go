@@ -466,3 +466,90 @@ func TestLoad_RuntimeGIDZeroRefused(t *testing.T) {
 		t.Fatalf("Load() error = %v (%T), want *boot.RuntimeGIDIsRootError", err, err)
 	}
 }
+
+// TestLoad_GitDirRootDefault proves NARVI_GIT_DIR_ROOT unset resolves to
+// the documented default -- deliberately outside the default
+// NARVI_WORKSPACE_DIR ("/workspace"), matching Config.GitDirRoot's own
+// doc comment.
+func TestLoad_GitDirRootDefault(t *testing.T) {
+	t.Setenv("NARVI_BOOT_MODE", "fresh")
+	t.Setenv("NARVI_GIT_DIR_ROOT", "")
+
+	cfg, err := boot.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
+	}
+	if cfg.GitDirRoot != "/var/lib/narvi/gitdirs" {
+		t.Errorf("GitDirRoot = %q, want %q", cfg.GitDirRoot, "/var/lib/narvi/gitdirs")
+	}
+}
+
+// TestLoad_GitDirRootOverride proves a valid, explicit NARVI_GIT_DIR_ROOT
+// (absolute, outside WorkspaceDir) is accepted verbatim.
+func TestLoad_GitDirRootOverride(t *testing.T) {
+	t.Setenv("NARVI_BOOT_MODE", "fresh")
+	t.Setenv("NARVI_WORKSPACE_DIR", "/workspace")
+	t.Setenv("NARVI_GIT_DIR_ROOT", "/custom/gitdirs")
+
+	cfg, err := boot.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
+	}
+	if cfg.GitDirRoot != "/custom/gitdirs" {
+		t.Errorf("GitDirRoot = %q, want %q", cfg.GitDirRoot, "/custom/gitdirs")
+	}
+}
+
+// TestLoad_GitDirRootRejectsRelativePath proves a non-absolute
+// NARVI_GIT_DIR_ROOT is refused fail-fast, never silently resolved
+// relative to some working directory.
+func TestLoad_GitDirRootRejectsRelativePath(t *testing.T) {
+	t.Setenv("NARVI_BOOT_MODE", "fresh")
+	t.Setenv("NARVI_GIT_DIR_ROOT", "relative/gitdirs")
+
+	_, err := boot.Load()
+	if err == nil {
+		t.Fatal("Load() error = nil, want *boot.InvalidGitDirRootError for a relative NARVI_GIT_DIR_ROOT")
+	}
+	var invalidErr *boot.InvalidGitDirRootError
+	if !errors.As(err, &invalidErr) {
+		t.Fatalf("Load() error = %v (%T), want *boot.InvalidGitDirRootError", err, err)
+	}
+}
+
+// TestLoad_GitDirRootRejectsNestedUnderWorkspace proves the load-bearing
+// guard: an agent-owned git-dir root that is WorkspaceDir itself, or
+// nested under it, would put it inside the runtime-owned tree the whole
+// split-git-dir design exists to keep it out of.
+func TestLoad_GitDirRootRejectsNestedUnderWorkspace(t *testing.T) {
+	t.Setenv("NARVI_BOOT_MODE", "fresh")
+	t.Setenv("NARVI_WORKSPACE_DIR", "/workspace")
+	t.Setenv("NARVI_GIT_DIR_ROOT", "/workspace/gitdirs")
+
+	_, err := boot.Load()
+	if err == nil {
+		t.Fatal("Load() error = nil, want *boot.InvalidGitDirRootError for a NARVI_GIT_DIR_ROOT nested under WorkspaceDir")
+	}
+	var invalidErr *boot.InvalidGitDirRootError
+	if !errors.As(err, &invalidErr) {
+		t.Fatalf("Load() error = %v (%T), want *boot.InvalidGitDirRootError", err, err)
+	}
+}
+
+// TestLoad_GitDirRootRejectsEqualToWorkspace proves the degenerate case
+// (GitDirRoot == WorkspaceDir exactly) is refused too, not just a proper
+// descendant.
+func TestLoad_GitDirRootRejectsEqualToWorkspace(t *testing.T) {
+	t.Setenv("NARVI_BOOT_MODE", "fresh")
+	t.Setenv("NARVI_WORKSPACE_DIR", "/workspace")
+	t.Setenv("NARVI_GIT_DIR_ROOT", "/workspace")
+
+	_, err := boot.Load()
+	if err == nil {
+		t.Fatal("Load() error = nil, want *boot.InvalidGitDirRootError for NARVI_GIT_DIR_ROOT == WorkspaceDir")
+	}
+	var invalidErr *boot.InvalidGitDirRootError
+	if !errors.As(err, &invalidErr) {
+		t.Fatalf("Load() error = %v (%T), want *boot.InvalidGitDirRootError", err, err)
+	}
+}
