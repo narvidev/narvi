@@ -1,6 +1,6 @@
 package githarden_test
 
-// Step 171 (§30.5): the split-repo shape, and the classes it closes --
+// §30.5: the split-repo shape, and the classes it closes --
 // this file lives in package githarden_test (an EXTERNAL test package),
 // not githarden's own internal test file (githarden_test.go, package
 // githarden), specifically so it CAN import internal/sandboxagent/gitdir:
@@ -23,12 +23,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/narvidev/narvi/internal/sandboxagent/githarden"
 	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
+	"github.com/narvidev/narvi/internal/sandboxagent/githarden"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
 
-// -- Step 171 (§30.5): the split-repo shape, and the classes it closes --
+// -- §30.5: the split-repo shape, and the classes it closes --
 //
 // newSplitRepo builds the REAL, measured production shape: a runtime
 // worktree (a plain, non-bare git repo with one commit, exactly like a
@@ -387,7 +387,6 @@ func currentBranch(t *testing.T, dir string) string {
 	return strings.TrimSpace(string(out))
 }
 
-
 // gitEnv/gitInRepo/payload duplicate githarden_test.go's own identically-
 // named helpers (package githarden, an internal test file) -- a DIFFERENT
 // Go package from this file even though it lives in the same directory,
@@ -423,7 +422,7 @@ func payload(marker, passthrough string) string {
 
 // TestTransportClass_AgentConfigArbitraryHelperBlockedByAllowProtocol is
 // TestTransportClass_ArbitraryRemoteHelperBlockedByAllowProtocol's own
-// Step 171 (§30.5) companion: the SAME "foo::" arbitrary-remote-helper
+// §30.5 companion: the SAME "foo::" arbitrary-remote-helper
 // attack, but planted directly in the AGENT's OWN seeded git-dir config
 // (the one config source the split shape can no longer keep the runtime
 // away from BY CONSTRUCTION -- gitdir.Seed itself only ever writes

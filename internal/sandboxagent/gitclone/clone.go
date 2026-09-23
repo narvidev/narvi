@@ -14,8 +14,8 @@ import (
 	"github.com/narvidev/narvi/internal/domain/environment"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/platform"
-	"github.com/narvidev/narvi/internal/sandboxagent/githarden"
 	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
+	"github.com/narvidev/narvi/internal/sandboxagent/githarden"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
 
@@ -68,16 +68,16 @@ type CloneResult struct {
 // layout is this sandbox's own gitdir.Layout (Root = boot.Config.
 // GitDirRoot, WorkspaceDir = workspaceDir -- the two must agree; callers
 // build layout with the SAME workspaceDir this function derives its own
-// dir from). cred is the runtime's own *syscall.Credential (Step 171,
-// §30.5) -- threaded through to gitdir.Seed (whose own sparse-checkout
+// dir from). cred is the runtime's own *syscall.Credential
+// (§30.5) -- threaded through to gitdir.Seed (whose own sparse-checkout
 // import reads the runtime's worktree config AS the runtime) and to
 // applySparseCheckout's own gitdir.Run/MirrorSparseCheckout calls.
 // chownRepo re-owns one freshly-cloned-and-seeded repo's own worktree for
 // the isolated agent runtime (boot.ChownWorkspaceForRuntime, threaded in
 // as a plain func to avoid this package importing boot at all) --
 // deliberately called HERE, per repo, immediately after Seed, rather than
-// once at the very end of the whole boot sequence the way the
-// pre-Step-171 flow did: sandbox-agent's own later writes into this same
+// once at the very end of the whole boot sequence the way the flow this
+// replaces did: sandbox-agent's own later writes into this same
 // repo (hooks, the AGENTS.md manifest) still succeed regardless of this
 // chown's outcome when sandbox-agent runs as root (the real production
 // case) or as the same uid as the runtime (tests) -- see
@@ -130,7 +130,7 @@ func CloneAll(
 			cloneErr = cloneOne(ctx, sup, credHelperArg, repo, dir, cloneTimeout, stopGrace)
 		}
 
-		// Step 171 (§30.5): seed this repo's own agent-owned git-dir
+		// §30.5: seed this repo's own agent-owned git-dir
 		// IMMEDIATELY after a successful clone, before any later git
 		// invocation (applySparseCheckout, below, or anything a caller
 		// does afterward) ever runs against it -- see
@@ -208,7 +208,7 @@ func applySparseCheckout(ctx context.Context, sup *supervisor.Supervisor, repo g
 	// working tree -- exactly the class of operation that can run a
 	// content filter, merge driver, or transport command a repository's
 	// own .gitattributes/.git/config names (see internal/sandboxagent/
-	// githarden's own doc comment). Step 171 (§30.5) closes that
+	// githarden's own doc comment). §30.5 closes that
 	// structurally: this call now runs against repo's own agent-owned
 	// git-dir (githarden.Args(repo, ...), via gitdir.Run), never the
 	// runtime-owned worktree .git this function used to spawn against
@@ -350,7 +350,7 @@ func disableSparseCheckoutIfEnabled(ctx context.Context, sup *supervisor.Supervi
 	// path into the working tree -- the same class of operation as
 	// applySparseCheckout's own identical call just above in this file,
 	// and reached the same way, from syncOne against an already-existing
-	// repo. Step 171 (§30.5) closes the class this used to be exposed to
+	// repo. §30.5 closes the class this used to be exposed to
 	// the same way applySparseCheckout's own call does: through repo's
 	// own agent-owned git-dir, via gitdir.Run, never the runtime-owned
 	// worktree .git directly.
@@ -460,7 +460,7 @@ func cloneOne(
 
 	proc, err := sup.Spawn(supervisor.Spec{
 		Path: "git",
-		Args: githarden.ArgsForClone(dir, append(topLevel, clone...)...),
+		Args: githarden.ArgsForClone(append(topLevel, clone...)...),
 		// Built explicitly (githarden.Env(nil): this process's own
 		// os.Environ() plus GIT_ALLOW_PROTOCOL) rather than left at
 		// Spec.Env's nil zero value -- GIT_ALLOW_PROTOCOL is now the

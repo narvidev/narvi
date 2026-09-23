@@ -167,9 +167,9 @@ import (
 	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/internal/sandboxagent/boot"
 	"github.com/narvidev/narvi/internal/sandboxagent/credentials"
-	"github.com/narvidev/narvi/internal/sandboxagent/githarden"
 	"github.com/narvidev/narvi/internal/sandboxagent/gitclone"
 	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
+	"github.com/narvidev/narvi/internal/sandboxagent/githarden"
 	"github.com/narvidev/narvi/internal/sandboxagent/opencodeproc"
 	"github.com/narvidev/narvi/internal/sandboxagent/services"
 	"github.com/narvidev/narvi/internal/sandboxagent/snapshotclient"
@@ -328,7 +328,7 @@ type commandHandler struct {
 	timeouts platform.Timeouts
 	sup      *supervisor.Supervisor
 
-	// layout/cred (Step 171, §30.5) are run()'s own already-built
+	// layout/cred (§30.5) are run()'s own already-built
 	// gitdir.Layout/*syscall.Credential -- threaded in so pushOneRepo/
 	// headSHA can route their own git invocations through the SAME
 	// agent-owned git-dir every other sandbox-agent git command now uses,
@@ -1133,7 +1133,7 @@ func run() error {
 	timeouts := platform.DefaultTimeouts()
 
 	// ctx/stop and sup are created earlier than they used to be --
-	// BEFORE the first boot-fingerprint log below -- so that Step 171's
+	// BEFORE the first boot-fingerprint log below -- so that §30.5's
 	// own warm-mode Seed loop (immediately below) has both available. This
 	// reordering has no other behavior change: neither signal.NotifyContext
 	// nor supervisor.New() has any side effect of its own, so moving their
@@ -1145,7 +1145,7 @@ func run() error {
 
 	sup := supervisor.New()
 
-	// Step 171 (§30.5): layout/runtimeCredential are this process's own
+	// §30.5: layout/runtimeCredential are this process's own
 	// single, canonical values -- built once, here, and threaded through
 	// every later call site that used to build its own
 	// runtimeCredentialFor(cfg) separately (a latent drift risk: two
@@ -1155,7 +1155,7 @@ func run() error {
 	layout := gitdir.Layout{Root: cfg.GitDirRoot, WorkspaceDir: cfg.WorkspaceDir}
 	runtimeCredential := runtimeCredentialFor(cfg)
 
-	// Step 171 (§30.5): on a WARM boot (repo_image/snapshot_restore), real
+	// §30.5: on a WARM boot (repo_image/snapshot_restore), real
 	// repos already exist on disk BEFORE gitclone.SyncAll ever runs --
 	// baked into the image or restored from a snapshot. The very first
 	// boot-fingerprint log below (§5.3: "sandbox-agent logs a boot

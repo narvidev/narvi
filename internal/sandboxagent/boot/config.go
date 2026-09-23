@@ -53,7 +53,7 @@ const (
 	runtimeUIDEnvVar = "NARVI_RUNTIME_UID"
 	runtimeGIDEnvVar = "NARVI_RUNTIME_GID"
 
-	// gitDirRootEnvVar (Step 171, §30.5) names the sandbox-wide root
+	// gitDirRootEnvVar (§30.5) names the sandbox-wide root
 	// internal/sandboxagent/gitdir seeds every repo's own AGENT-OWNED
 	// git-dir under (gitdir.Layout.Root) -- deliberately OUTSIDE
 	// WorkspaceDir (the agent-visible /workspace tree the isolated runtime
@@ -168,7 +168,7 @@ type Config struct {
 	RuntimeUID uint32
 	RuntimeGID uint32
 
-	// GitDirRoot (Step 171, §30.5) is the sandbox-wide root
+	// GitDirRoot (§30.5) is the sandbox-wide root
 	// internal/sandboxagent/gitdir seeds every repo's own agent-owned
 	// git-dir under -- gitdir.Layout.Root, gitdir.EnsureRoot's own
 	// argument. Resolved by Load from NARVI_GIT_DIR_ROOT: unset uses
@@ -365,7 +365,7 @@ func validateGitDirRoot(root, workspaceDir string) error {
 	}
 	rel, err := filepath.Rel(workspaceDir, root)
 	if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return &InvalidGitDirRootError{Value: root, Reason: fmt.Sprintf("must not be nested under WorkspaceDir (%s) -- an agent-owned git-dir inside the runtime-owned workspace tree defeats the structural guarantee Step 171 provides", workspaceDir)}
+		return &InvalidGitDirRootError{Value: root, Reason: fmt.Sprintf("must not be nested under WorkspaceDir (%s) -- an agent-owned git-dir inside the runtime-owned workspace tree defeats the structural guarantee §30.5 provides", workspaceDir)}
 	}
 	return nil
 }

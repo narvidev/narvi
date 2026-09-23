@@ -427,7 +427,7 @@ func runSandboxAgent(t *testing.T, binPath, gitServerURL, workspaceDir string, f
 		"NARVI_SESSION_CONFIG="+sessionConfigJSON,
 		"NARVI_WORKSPACE_DIR="+workspaceDir,
 		"NARVI_CREDENTIAL_CACHE_DIR="+credCacheDir,
-		// Step 171 (§30.5): boot.Config.GitDirRoot defaults to
+		// §30.5: boot.Config.GitDirRoot defaults to
 		// /var/lib/narvi/gitdirs, which an ordinary unprivileged `go test`
 		// process cannot create/write on a real dev machine or CI runner --
 		// gitdir.EnsureRoot would fail boot outright. Pointed at a fresh

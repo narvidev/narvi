@@ -2,14 +2,14 @@
 // runs must carry, and the reason they are not optional.
 //
 // §30.5 drops the agent runtime to its own UID and hands it the workspace,
-// so the runtime owns the repositories it works in -- including, before
-// Step 171, each repository's own .git directory. Sandbox-agent used to
+// so the runtime owns the repositories it works in -- including,
+// previously, each repository's own .git directory. Sandbox-agent used to
 // still run git in those same repositories, as itself, to clone, sync,
 // read a head SHA and push -- reading command-carrying config
 // (filter/merge drivers, hooks) straight out of a directory the runtime
 // controlled.
 //
-// Step 171 (§30.5) closes that structurally: sandbox-agent's own git never
+// §30.5 closes that structurally: sandbox-agent's own git never
 // runs against the runtime-owned .git directory any more. Every hardened
 // invocation now names an AGENT-OWNED git-dir instead, via Repo/Args below
 // -- `git -C <worktree> --git-dir=<agent-dir> --work-tree=<worktree>`. The
@@ -72,7 +72,7 @@ const noHooksPath = "/dev/null"
 //
 // Every entry names a git config key that (a) makes git RUN a command and
 // (b) used to be settable from the repository's own .git/config, which
-// the agent runtime owned after the workspace chown. Step 171 (§30.5)
+// the agent runtime owned after the workspace chown. §30.5
 // moved every hardened invocation off that runtime-owned .git entirely
 // (Repo/Args, below) -- these flags are kept anyway, as defense in depth
 // against a regression in that structural fix, not as the primary
@@ -81,7 +81,7 @@ const noHooksPath = "/dev/null"
 // This list is NOT complete for all time: git adds config keys, and one
 // class -- filter/merge drivers named by a repository's own .gitattributes
 // -- has no fixed key this enumeration could ever cover (see this
-// package's own top doc comment for how Step 171 closes that class
+// package's own top doc comment for how §30.5 closes that class
 // instead, structurally).
 func hardeningFlags() []string {
 	return []string{
@@ -303,7 +303,7 @@ func hardeningFlags() []string {
 // (TestOpenClass_ContentFilterExecutes, TestOpenClass_MergeDriverExecutes)
 // showing a planted driver actually running.
 //
-// Step 171 (§30.5) CLOSES both classes STRUCTURALLY, not by a flag: the
+// §30.5 CLOSES both classes STRUCTURALLY, not by a flag: the
 // filter/merge driver name is still repository-chosen and unbounded, but
 // the .gitattributes/.git/config PAIR that arms one now lives only in the
 // runtime-owned worktree's .git, which sandbox-agent's own git never reads
@@ -328,7 +328,7 @@ func hardeningFlags() []string {
 // for the filter class alone -- writing "* -filter" into
 // $GIT_DIR/info/attributes, gitattributes(5)'s own highest-precedence
 // attributes source -- was tried, measured against real git, and
-// WITHDRAWN before Step 171: the attributes file it wrote into lived
+// WITHDRAWN previously: the attributes file it wrote into lived
 // inside the SAME runtime-owned directory the attack started from, so the
 // runtime could delete or replace it between the write and git's read (0
 // of 60 racing trials blocked in measurement); it covered only the filter
@@ -349,7 +349,7 @@ func hardeningFlags() []string {
 // that will need its own deliberate decision, not a silent regression
 // discovered later.
 
-// Repo names one repository's own two directories after Step 171 (§30.5):
+// Repo names one repository's own two directories after §30.5:
 // WorkTree is the runtime-visible checkout under the workspace
 // (<workspaceDir>/<name>), and GitDir is the AGENT-OWNED git-dir outside
 // /workspace that sandbox-agent's own git always uses instead of
@@ -395,21 +395,20 @@ func Spec(repo Repo, rest ...string) supervisor.Spec {
 }
 
 // ArgsForClone returns the hardening flags for a `git clone` invocation
-// whose target directory (dir) does not exist yet, followed by rest (the
+// whose target directory does not exist yet, followed by rest (the
 // caller's own "clone" subcommand and its arguments, in full, e.g.
-// ["clone", "-c", "credential.helper=...", "--", url, dir]).
-//
-// A fresh `git clone` creates its own pristine .git -- there is no
-// agent-owned git-dir to point at yet (internal/sandboxagent/gitdir.Seed
-// runs AFTER a successful clone, per gitclone.CloneAll's own ordering), so
-// this does not take a Repo and does not add --git-dir/--work-tree at all;
-// dir is clone's own trailing POSITIONAL argument, never reachable via
-// "-C <dir>" (-C requires its target to already exist). No safe.directory
-// entry is added here either, for the same reason Args no longer adds one:
-// a clone's freshly-created .git is owned by this process itself, not by
+// ["clone", "-c", "credential.helper=...", "--", url, dir]) -- dir itself
+// is one of rest's own trailing positionals, never a parameter of this
+// function: a fresh `git clone` creates its own pristine .git, so there is
+// no agent-owned git-dir to point at yet (internal/sandboxagent/gitdir.Seed
+// runs AFTER a successful clone, per gitclone.CloneAll's own ordering),
+// and no "-C <dir>"/--git-dir/--work-tree to add at all (-C requires its
+// target to already exist; dir does not, yet). No safe.directory entry is
+// added here either, for the same reason Args no longer adds one: a
+// clone's freshly-created .git is owned by this process itself, not by
 // the runtime, so there is nothing dubious about its ownership in the
 // first place.
-func ArgsForClone(dir string, rest ...string) []string {
+func ArgsForClone(rest ...string) []string {
 	return append(hardeningFlags(), rest...)
 }
 

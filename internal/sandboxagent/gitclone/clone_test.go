@@ -209,14 +209,14 @@ func TestCloneAll_HardensTheActualCloneInvocation(t *testing.T) {
 	// actually contacting repoURL (an unreachable "https://example.invalid"
 	// address, deliberately, so this test never depends on network access)
 	// -- or (every OTHER invocation) execs the REAL git binary with the
-	// same argv/env. Step 171 (§30.5) made this test's own original
+	// same argv/env. §30.5 made this test's own original
 	// concern (does CloneAll's OWN clone invocation carry the right
 	// hardening flags) inseparable from a second one this same PATH
 	// override now also intercepts: gitdir.Seed runs immediately after a
 	// successful clone, needs a REAL .git directory left behind by the
 	// clone to seed FROM, and its own `git init --bare`/`git config` calls
 	// need a REAL git binary underneath them -- a bare `exit 0` (this
-	// test's pre-Step-171 shape) satisfies neither.
+	// test's the old shape) satisfies neither.
 	fakeGit := "#!/bin/sh\n" +
 		"{\n" +
 		"  printf 'ARGV:'\n" +
@@ -264,7 +264,7 @@ func TestCloneAll_HardensTheActualCloneInvocation(t *testing.T) {
 	out := string(captured)
 
 	for _, want := range []string{
-		// Step 171 (§30.5): ArgsForClone no longer carries safe.directory
+		// §30.5: ArgsForClone no longer carries safe.directory
 		// at all -- a fresh `git clone`'s own target .git is owned by this
 		// process itself, never by the runtime, so there is nothing
 		// dubious about its ownership in the first place (see

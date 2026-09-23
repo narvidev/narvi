@@ -15,8 +15,8 @@ import (
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/internal/sandboxagent/credentials"
-	"github.com/narvidev/narvi/internal/sandboxagent/githarden"
 	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
+	"github.com/narvidev/narvi/internal/sandboxagent/githarden"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
 
@@ -237,7 +237,7 @@ func syncOne(
 	workspaceDir := layout.WorkspaceDir
 	repoHandle := layout.Repo(repo.Name)
 
-	// Step 171 (§30.5): (re-)seed this repo's own agent-owned git-dir
+	// §30.5: (re-)seed this repo's own agent-owned git-dir
 	// FIRST, before any other git invocation in this function ever runs --
 	// SyncAll's whole reason for existing is an ALREADY-EXISTING workspace
 	// (baked into the image or restored from a snapshot), so, unlike
@@ -525,7 +525,7 @@ func logIfStashRecoveryNeeded(ctx context.Context, repoName, dir, branch string,
 // reported as a timeout failure; a non-zero exit or a wait failure is
 // likewise a real, returned error.
 //
-// Step 171 (§30.5): this used to run `git -C <dir> ...` directly against
+// §30.5: this used to run `git -C <dir> ...` directly against
 // the runtime-owned worktree .git, which internal/sandboxagent/githarden's
 // own doc comment records as reachable by filter.<driver>/merge.<driver>.
 // driver/remote.<name>.uploadpack-receivepack -- no -c flag or attributes

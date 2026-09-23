@@ -35,7 +35,7 @@ func TestMain(m *testing.M) {
 // file's transport-class tests only ever needed (they exercise
 // hardeningFlags/Env, which do not care whether GitDir is split from
 // WorkTree or not). Distinct from newSplitRepo (below), which builds the
-// REAL, measured Step 171 shape (an agent-owned git-dir seeded via
+// REAL, measured §30.5 shape (an agent-owned git-dir seeded via
 // internal/sandboxagent/gitdir.Seed) for the tests that specifically need
 // to prove something about THAT split.
 func soloRepo(dir string) Repo {
@@ -43,8 +43,8 @@ func soloRepo(dir string) Repo {
 }
 
 // TestArgs_CarriesTheHardenedShape pins the pair that must never be
-// separated -- the Step 171 (§30.5) successor to this test's own
-// pre-Step-171 shape (which pinned safe.directory+hooksPath together;
+// separated -- the §30.5 successor to this test's own
+// the old shape (which pinned safe.directory+hooksPath together;
 // safe.directory is gone entirely now, see Args' own doc comment for why
 // the explicit --git-dir/--work-tree pair replaces it structurally rather
 // than merely widening a config allowlist).
@@ -67,7 +67,7 @@ func TestArgs_CarriesTheHardenedShape(t *testing.T) {
 		"core.fsmonitor names a command git runs, and it is settable from the repository config the runtime owns")
 	for _, a := range got {
 		if strings.HasPrefix(a, "safe.directory=") || a == "safe.directory" {
-			t.Errorf("safe.directory must never be set any more (Step 171/§30.5 -- --git-dir/--work-tree makes it moot): %v", got)
+			t.Errorf("safe.directory must never be set any more (§30.5 -- --git-dir/--work-tree makes it moot): %v", got)
 		}
 	}
 
@@ -105,7 +105,7 @@ func assertFlag(t *testing.T, args []string, want, why string) {
 // worth pinning by name -- it is just not, on its own, the reason the
 // class is closed any more.
 //
-// Step 171 (§30.5): only Args is asserted now -- Harden (the "insert
+// §30.5: only Args is asserted now -- Harden (the "insert
 // around an existing -C" entry point) is deleted, since every hardened
 // invocation now names an agent-owned Repo explicitly rather than
 // rewriting an already-built argv.
@@ -487,7 +487,6 @@ func TestTransportClass_ArbitraryRemoteHelperBlockedByAllowProtocol(t *testing.T
 	}
 }
 
-
 // TestTransportClass_FTPBlockedByAllowProtocol is F1's own second
 // executable proof: ftp/ftps are FIXED names (git ships git-remote-ftp(s)
 // by default), so unlike the arbitrary "<name>::" helper above they COULD
@@ -836,7 +835,7 @@ func TestArgs_RealHTTPSCloneAndFetchStillWork(t *testing.T) {
 
 	cloneParent := t.TempDir()
 	cloneDir := filepath.Join(cloneParent, "clone")
-	cloneCmd := exec.Command("git", append([]string{"-C", cloneParent}, ArgsForClone(cloneDir)...)...)
+	cloneCmd := exec.Command("git", append([]string{"-C", cloneParent}, ArgsForClone()...)...)
 	cloneCmd.Args = append(cloneCmd.Args, "clone", "--", server.URL+"/src", cloneDir)
 	cloneCmd.Env = gitEnv()
 	if out, err := cloneCmd.CombinedOutput(); err != nil {

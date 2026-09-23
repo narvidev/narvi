@@ -116,7 +116,7 @@ func TestRunBootSequence_DockerRequired_SpawnsDockerdBeforeRunBoot(t *testing.T)
 		WorkspaceDir:       t.TempDir(),
 		CredentialCacheDir: t.TempDir(),
 		SessionConfig:      dockerTestSessionConfig(true),
-		// Step 171 (§30.5): see bootsequence_cleanbuild_integration_test.go's
+		// §30.5: see bootsequence_cleanbuild_integration_test.go's
 		// identical comment -- gitclone.CloneAll's own real lchown needs a
 		// self-uid/gid Credential to run unprivileged.
 		RuntimeUID: uint32(os.Getuid()),
@@ -170,7 +170,7 @@ func TestRunBootSequence_DockerFalse_NeverSpawnsDockerd(t *testing.T) {
 		WorkspaceDir:       t.TempDir(),
 		CredentialCacheDir: t.TempDir(),
 		SessionConfig:      dockerTestSessionConfig(false),
-		// Step 171 (§30.5): see bootsequence_cleanbuild_integration_test.go's
+		// §30.5: see bootsequence_cleanbuild_integration_test.go's
 		// identical comment -- gitclone.CloneAll's own real lchown needs a
 		// self-uid/gid Credential to run unprivileged.
 		RuntimeUID: uint32(os.Getuid()),

@@ -15,8 +15,8 @@ import (
 )
 
 // seedFingerprintRepo builds a fresh agent-owned git-dir for the
-// already-existing, non-bare repo at workspaceDir/name -- Step 171
-// (§30.5): DiscoverRepoSHAs now only reads a repo whose agent git-dir has
+// already-existing, non-bare repo at workspaceDir/name -- §30.5:
+// DiscoverRepoSHAs now only reads a repo whose agent git-dir has
 // already been seeded (see that function's own doc comment), so every
 // test repo in this file needs one before DiscoverRepoSHAs/
 // CollectFingerprint can see it at all.

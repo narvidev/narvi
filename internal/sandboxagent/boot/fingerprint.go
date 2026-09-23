@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/narvidev/narvi/internal/domain/sandboxboot"
-	"github.com/narvidev/narvi/internal/sandboxagent/githarden"
 	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
+	"github.com/narvidev/narvi/internal/sandboxagent/githarden"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
 
@@ -25,7 +25,7 @@ import (
 // stopGrace is platform.Timeouts.ProcessStopGracePeriod, threaded through
 // to gitdir.Run's own bounded Stop call on a hang.
 //
-// Step 171 (§30.5): every repo-SHA read this function makes now goes
+// §30.5: every repo-SHA read this function makes now goes
 // through the SAME agent-owned git-dir every other sandbox-agent git
 // invocation uses (internal/sandboxagent/gitdir) rather than a bare,
 // unhardened `git -C <dir> rev-parse HEAD` against the runtime-owned

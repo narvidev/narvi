@@ -205,7 +205,7 @@ func TestResilienceScenario_RepoAbsentFromWorkspaceMoved_SetupStillReruns(t *tes
 	rerunMarker := filepath.Join(workspaceDir, "setup-rerun-marker-no-sha")
 	writeScript(t, filepath.Join(repoDir, "setup.sh"), "touch "+rerunMarker)
 
-	// Step 171 (§30.5): DiscoverRepoSHAs now only reads a repo whose agent
+	// §30.5: DiscoverRepoSHAs now only reads a repo whose agent
 	// git-dir has already been seeded -- seed repo-no-sha's here too, so
 	// the omission this test proves is still genuinely `git rev-parse
 	// HEAD` failing (a zero-commit repo), not merely "never seeded".
@@ -257,7 +257,7 @@ func TestResilienceScenario_RepoAbsentFromWorkspaceMoved_SetupStillReruns(t *tes
 
 // gitRevParseHEAD returns dir's own checked-out HEAD SHA via a real,
 // direct `git -C dir rev-parse HEAD` call -- deliberately NOT routed
-// through boot.DiscoverRepoSHAs (Step 171/§30.5 made that function require
+// through boot.DiscoverRepoSHAs (§30.5 made that function require
 // an already-seeded agent git-dir, which this helper's own callers should
 // not need to set up just to read back a SHA they themselves just
 // committed).

@@ -34,8 +34,8 @@ import (
 	"github.com/narvidev/narvi/internal/domain/sandboxboot"
 	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/internal/sandboxagent/boot"
-	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
 	"github.com/narvidev/narvi/internal/sandboxagent/credentials"
+	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
 	"github.com/narvidev/narvi/internal/sandboxagent/services"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
@@ -118,7 +118,7 @@ func runBootSequenceForModeWithCredentialCacheDir(t *testing.T, mode sandboxboot
 		BootMode:           mode,
 		WorkspaceDir:       workspaceDir,
 		CredentialCacheDir: credentialCacheDir,
-		// Step 171 (§30.5): CloneAll now re-owns each repo's own worktree
+		// §30.5: CloneAll now re-owns each repo's own worktree
 		// for the runtime (boot.ChownWorkspaceForRuntime) immediately after
 		// seeding its agent git-dir, a real lchown that requires
 		// CAP_CHOWN/root unless the target uid/gid is THIS test process's

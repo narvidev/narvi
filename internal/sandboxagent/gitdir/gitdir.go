@@ -1,4 +1,4 @@
-// Package gitdir builds and maintains the AGENT-OWNED git-dir Step 171
+// Package gitdir builds and maintains the AGENT-OWNED git-dir
 // (§30.5) requires every sandbox-agent git invocation to use instead of a
 // runtime-owned worktree's own ".git" -- see internal/sandboxagent/
 // githarden's own top doc comment for why: a repository the runtime owns

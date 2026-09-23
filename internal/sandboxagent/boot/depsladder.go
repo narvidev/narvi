@@ -13,8 +13,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/narvidev/narvi/internal/sandboxagent/githarden"
 	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
+	"github.com/narvidev/narvi/internal/sandboxagent/githarden"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
 
@@ -397,7 +397,7 @@ var builtSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 // likewise returned as a genuine error -- §19.6's own "any git error on
 // this check is conservative: ineligible, fall through to full setup.sh".
 //
-// Step 171 (§30.5): run via gitdir.Run -- the SAME choke point
+// §30.5: run via gitdir.Run -- the SAME choke point
 // (SyncHeadIn/SyncHeadOut bracket around a githarden.Args-hardened spawn,
 // through sup, never a bare exec.CommandContext) every other sandbox-agent
 // git invocation now uses -- rather than the bare, unhardened

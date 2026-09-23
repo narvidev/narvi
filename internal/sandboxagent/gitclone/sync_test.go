@@ -1372,12 +1372,12 @@ func TestSyncAll_FetchSucceeds_BranchExistsOnOrigin_PrefersOriginTrackingBranch(
 	addOriginBranch(t, originDir, targetBranch, "origin's real tip content for feature-on-origin\n")
 
 	originURL := newLocalOriginServer(t, originDir)
-	// Step 171 (§30.5): sandbox-agent's own git now runs against the
+	// §30.5: sandbox-agent's own git now runs against the
 	// AGENT-OWNED git-dir (internal/sandboxagent/gitdir.Seed), whose own
 	// remote.origin.url is configured from THIS repo's session config Url
 	// -- never read back from the runtime's own .git/config the way it
 	// used to be (see this file's own section doc comment above, written
-	// for the pre-Step-171 shape). repos[].Url below is therefore what
+	// for the the old shape). repos[].Url below is therefore what
 	// actually determines what "origin" resolves to for the fetch this
 	// test needs to succeed; the runGit "remote add origin" call is kept
 	// only for realism (a repo_image's own baked workspace would
@@ -1433,7 +1433,7 @@ func TestSyncAll_FetchSucceeds_InventedBranchNotOnOrigin_FallsBackToOriginDefaul
 	originDir := newLocalOrigin(t)
 	updateOriginDefaultBranch(t, originDir, "origin's real default-branch tip\n")
 
-	// Step 171 (§30.5): repos[].Url (below), not this runGit call, is what
+	// §30.5: repos[].Url (below), not this runGit call, is what
 	// actually drives the agent's own fetch -- see
 	// TestSyncAll_FetchSucceeds_BranchExistsOnOrigin_PrefersOriginTrackingBranch's
 	// own comment for the full reasoning.
@@ -1571,7 +1571,7 @@ func TestSyncAll_FetchSucceeds_InventedBranchNotOnOrigin_NoDegradeWarningLogged(
 	originDir := newLocalOrigin(t)
 	updateOriginDefaultBranch(t, originDir, "origin's real default-branch tip\n")
 
-	// Step 171 (§30.5): repos[].Url (below), not this runGit call, is what
+	// §30.5: repos[].Url (below), not this runGit call, is what
 	// actually drives the agent's own fetch -- see
 	// TestSyncAll_FetchSucceeds_BranchExistsOnOrigin_PrefersOriginTrackingBranch's
 	// own comment for the full reasoning.
@@ -1689,7 +1689,7 @@ func TestSyncAll_DefaultBranchFetchFailsIndependently_LogsWarningEvenWhenTargetF
 	workspaceDir := t.TempDir()
 	repoDir := filepath.Join(workspaceDir, "repo1")
 	initRepo(t, repoDir)
-	// Step 171 (§30.5): repos[].Url (below), not this runGit call, is what
+	// §30.5: repos[].Url (below), not this runGit call, is what
 	// actually drives the agent's own fetch -- see
 	// TestSyncAll_FetchSucceeds_BranchExistsOnOrigin_PrefersOriginTrackingBranch's
 	// own comment for the full reasoning.

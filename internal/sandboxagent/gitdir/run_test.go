@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/narvidev/narvi/internal/sandboxagent/boot"
-	"github.com/narvidev/narvi/internal/sandboxagent/githarden"
 	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
+	"github.com/narvidev/narvi/internal/sandboxagent/githarden"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
 

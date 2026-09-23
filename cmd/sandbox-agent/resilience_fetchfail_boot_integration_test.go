@@ -94,7 +94,7 @@ func runBootSequenceRepoImage(t *testing.T, workspaceDir string, branch *string)
 		BootMode:           sandboxboot.BootModeRepoImage,
 		WorkspaceDir:       workspaceDir,
 		CredentialCacheDir: t.TempDir(),
-		// Step 171 (§30.5): see bootsequence_cleanbuild_integration_test.go's
+		// §30.5: see bootsequence_cleanbuild_integration_test.go's
 		// identical comment -- gitclone.SyncAll's own real lchown needs a
 		// self-uid/gid Credential to run unprivileged.
 		RuntimeUID: uint32(os.Getuid()),
