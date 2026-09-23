@@ -75,6 +75,10 @@ claiming a different `spawnSource` in its own JSON body gets no different
 treatment).
 
 ```json narvi-command
+{"name": "List sessions", "route": "GET /api/sessions"}
+```
+
+```json narvi-command
 {"name": "Get a session", "route": "GET /api/sessions/{sessionID}"}
 ```
 
@@ -173,11 +177,50 @@ a second, conflicting decision.
 {"name": "Apply a review finding's suggested fix", "route": "POST /api/sessions/{sessionID}/review/findings/{identityHash}/apply-suggestion"}
 ```
 
-**Negative.** All three require maintainer role or above (§13.3: "Edit
-review verdicts; re-trigger reviews ... admin/maintainer" only) — a
-member or viewer gets `403`, even on a session they created or joined.
-This is stricter than plan approval on purpose: an ordinary member can
-approve their own plan, but cannot re-open or rebut a review verdict.
+```json narvi-command
+{"name": "Get a session's code-review readout", "route": "GET /api/sessions/{sessionID}/review"}
+```
+
+**Negative.** Re-trigger/rebut/apply-suggestion all require maintainer
+role or above (§13.3: "Edit review verdicts; re-trigger reviews ...
+admin/maintainer" only) — a member or viewer gets `403`, even on a
+session they created or joined. This is stricter than plan approval on
+purpose: an ordinary member can approve their own plan, but cannot
+re-open or rebut a review verdict. The readout GET carries no extra RBAC
+beyond session visibility — a viewer may read it.
+
+## Release review
+
+The dedicated release-review screen (§12.2 item 9): a read model plus
+three composition-finding actions over the same underlying
+`release_manifest_checks` row.
+
+```json narvi-command
+{"name": "Get a session's release-manifest readout", "route": "GET /api/sessions/{sessionID}/release-manifest"}
+```
+
+```json narvi-command
+{"name": "Block a release on a composition finding", "route": "POST /api/sessions/{sessionID}/release-manifest/block"}
+```
+
+```json narvi-command
+{"name": "Acknowledge a composition finding and ship anyway", "route": "POST /api/sessions/{sessionID}/release-manifest/acknowledge"}
+```
+
+```json narvi-command
+{"name": "Unblock a previously blocked release", "route": "POST /api/sessions/{sessionID}/release-manifest/unblock"}
+```
+
+**Negative — three different rows, not one RBAC gate.** Block requires
+maintainer role or above (the same §13.3 row as re-triggering a review) —
+blocking is the safety-additive response to a composition finding.
+Acknowledge and Unblock are **admin-only**: both are a human electing to
+ship (or re-open) despite an already-computed cross-PR risk signal, and
+that override sits in the stricter, admin-only §13.3 row, not the
+maintainer one Block uses. All three reject a transition that the
+finding's own current state does not allow (an already-decided
+composition, or one whose own composition review has not completed yet)
+with a structured error rather than silently no-op'ing.
 
 ## Decision inbox
 
@@ -188,6 +231,21 @@ approve their own plan, but cannot re-open or rebut a review verdict.
 ```json narvi-command
 {"name": "Merge a pull request from the decision inbox", "route": "POST /api/decision-inbox/merge"}
 ```
+
+```json narvi-command
+{"name": "Accept a review verdict the engine refused to publish as low-risk", "route": "POST /api/decision-inbox/accept-verdict"}
+```
+
+```json narvi-command
+{"name": "Revoke a previously accepted verdict", "route": "POST /api/decision-inbox/revoke-verdict-acceptance"}
+```
+
+**Negative.** Accept/revoke both require maintainer role or above
+(§13.3's `accept_review_verdict` action) — this is the human-acceptance
+surface [github.md](github.md)'s own "Review verdicts and decision inbox"
+section describes from the GitHub-ingress side; accepting binds to one
+exact verdict, attempt, and review context, and a new attempt or a moved
+base makes the acceptance inapplicable again, never silently still-valid.
 
 ## Uploads
 
@@ -288,6 +346,10 @@ a maintainer gets `403` on those specifically, not a degraded response.
 ```
 
 ```json narvi-command
+{"name": "List an automation's invocations", "route": "GET /api/automations/{automationID}/invocations"}
+```
+
+```json narvi-command
 {"name": "Pause an automation", "route": "POST /api/automations/{automationID}/pause"}
 ```
 
@@ -306,12 +368,65 @@ a maintainer gets `403` on those specifically, not a degraded response.
 **Intent classifier templates**
 
 ```json narvi-command
+{"name": "List intent-classifier prompt templates", "route": "GET /api/intent-templates"}
+```
+
+```json narvi-command
 {"name": "Preview an intent-classifier prompt template", "route": "POST /api/intent-templates/preview"}
 ```
 
 ```json narvi-command
 {"name": "Upsert an intent-classifier prompt template", "route": "POST /api/intent-templates"}
 ```
+
+**Environments**
+
+```json narvi-command
+{"name": "List environments", "route": "GET /api/environments"}
+```
+
+**Integrations**
+
+```json narvi-command
+{"name": "List configured ingress integrations", "route": "GET /api/integrations"}
+```
+
+One row per ingress surface (Slack, Linear, GitHub) — a derived read
+model, never a connect/disconnect write; there is no POST/PUT/DELETE on
+this route at all.
+
+**Capabilities**
+
+```json narvi-command
+{"name": "Get the extension & licensing capability set", "route": "GET /api/capabilities"}
+```
+
+Read-only, and open to every role including viewer
+(`authz.ActionViewCapabilities`, §13.3 row 1) — everyone needs to know
+what this deployment is licensed for, not just an admin. Two other routes
+in this section are every-role-including-viewer too (platform analytics
+and your profile, both immediately below) — this is not unique to it.
+
+**Platform analytics**
+
+```json narvi-command
+{"name": "Get the platform-wide analytics rollup", "route": "GET /api/analytics"}
+```
+
+The un-scoped sibling of `GET /api/repos/{owner}/{repo}/review-analytics`
+below — same `authz.ActionViewAnalytics` gate (every role, including
+viewer).
+
+**Your profile**
+
+```json narvi-command
+{"name": "Get your own profile", "route": "GET /api/me"}
+```
+
+The sign-in view's identity auto-link panel and already-signed-in state
+read. Deliberately not `/api/members/{userID}` with a self filter — see
+httpapi/me.go's own doc comment — and, like capabilities above, open to
+every role including viewer (`authz.ActionViewOwnProfile`).
 
 **Per-repo settings**
 
@@ -358,6 +473,42 @@ a maintainer gets `403` on those specifically, not a degraded response.
 ```json narvi-command
 {"name": "Get a repo's review analytics", "route": "GET /api/repos/{owner}/{repo}/review-analytics"}
 ```
+
+```json narvi-command
+{"name": "Get a repo's digest scope", "route": "GET /api/repos/{owner}/{repo}/digest-scope"}
+```
+
+Read-only derived view of which Slack channels/Linear organizations are
+"in scope for" this repo's own daily digest — not "will receive": the
+scope is computed fresh on every read, never stored.
+
+```json narvi-command
+{"name": "Get a repo's preview-link config", "route": "GET /api/repos/{owner}/{repo}/preview-config"}
+```
+
+```json narvi-command
+{"name": "Update a repo's preview-link config", "route": "PUT /api/repos/{owner}/{repo}/preview-config"}
+```
+
+A further, separately-gated route — deliberately NOT folded into
+`PUT /settings` above, because a preview-link config's request body
+carries a credential, and a credential-carrying body must never share a
+shape with ordinary configuration.
+
+```json narvi-command
+{"name": "Get a repo's shadow-mode ledger", "route": "GET /api/repos/{owner}/{repo}/shadow-ledger"}
+```
+
+```json narvi-command
+{"name": "Activate a repo from shadow mode to live", "route": "POST /api/repos/{owner}/{repo}/shadow-ledger/activate"}
+```
+
+**Negative.** The shadow ledger pair is **admin-only** and carries no
+§13.3 table row at all — see that action's own doc comment
+(`internal/domain/authz/action.go`) for why: this ledger holds a
+customer's source code at rest in full, and that is treated as a
+strictly narrower audience than the rest of this section's already
+admin-gated rows.
 
 **Per-repo, per-environment, and global provider credentials / sandbox
 secrets** — the SAME four-verb CRUD shape at three different scopes
@@ -541,11 +692,60 @@ reading the old one back.
 {"name": "Delete the global OpenCode config", "route": "DELETE /api/opencode-config"}
 ```
 
-**Workflow runs**
+**Workflow definitions, bindings, and runs**
+
+The workflow definition & run API (§25.10/§25.11): authoring a workflow
+definition, activating it onto a repo via a binding, and the HITL
+approve/reject/revise gate a running workflow step can stop at.
+
+```json narvi-command
+{"name": "List workflow definitions", "route": "GET /api/workflow-definitions"}
+```
+
+```json narvi-command
+{"name": "Create a workflow definition", "route": "POST /api/workflow-definitions"}
+```
+
+```json narvi-command
+{"name": "Get a workflow definition", "route": "GET /api/workflow-definitions/{id}"}
+```
+
+```json narvi-command
+{"name": "Replace a workflow definition", "route": "PUT /api/workflow-definitions/{id}"}
+```
+
+```json narvi-command
+{"name": "Delete a workflow definition", "route": "DELETE /api/workflow-definitions/{id}"}
+```
+
+```json narvi-command
+{"name": "List workflow bindings", "route": "GET /api/workflow-bindings"}
+```
+
+```json narvi-command
+{"name": "Activate a workflow binding", "route": "PUT /api/workflow-bindings"}
+```
+
+```json narvi-command
+{"name": "Get a workflow run", "route": "GET /api/workflow-runs/{runId}"}
+```
+
+```json narvi-command
+{"name": "List a session's workflow runs", "route": "GET /api/sessions/{sessionID}/workflow-runs"}
+```
 
 ```json narvi-command
 {"name": "Decide a workflow HITL step", "route": "POST /api/workflow-runs/{runId}/steps/{stepRunId}/decide"}
 ```
+
+**Negative.** Definition reads/writes require maintainer role or above
+(`authz.ActionManageWorkflowDefinitions`); a definition already built-in
+or already bound to a repo refuses delete with a structured error rather
+than silently orphaning the binding. Binding writes are **admin-only**
+(`authz.ActionActivateWorkflowBinding`) — a maintainer may author a
+definition but not activate it onto a repo. The two session-scoped GETs
+(a run, a session's own run list) carry no RBAC beyond session
+visibility, like every other session-read route in this guide.
 
 **Diagnostics**
 

@@ -36,7 +36,7 @@ this README, which is prose only); `internal/ops.CheckGuideDrift` checks
 each one against:
 
 - **`route`** — a real, currently-registered chi route, scanned directly
-  out of `cmd/control-plane/main.go`'s own router wiring via
+  out of `controlplane/serve.go`'s own router wiring via
   `internal/ops.ScanRegisteredRoutes` (a `go/ast` walk, the exact same
   mechanism `ScanRegisteredInstruments` already uses to keep
   `deploy/observability/{dashboards,alerts}` honest — see
@@ -97,6 +97,26 @@ semantics.**
   describes what the route actually does with its request body, its
   response shape, or its authorization rules — only that the route
   exists. A reviewer still has to read the diff.
+- **The omission direction's own completeness check is itself only as
+  good as its scanner.** `internal/ops.ScanRegisteredRoutes` recognizes
+  exactly five chi method names (`Get`/`Post`/`Put`/`Patch`/`Delete`) plus
+  a `Route(...)` grouping call — a route registered any other real way (a
+  path held in a `const`, `router.Method(...)`/`.Handle(...)`/
+  `.HandleFunc(...)`, a helper function outside `controlplane/` that takes
+  a `chi.Router`, or a `Mount`'d sub-router whose own unprefixed route
+  name collides with, and silently overwrites, an existing key) is
+  invisible to that scanner while staying perfectly reachable in
+  production, and `CheckGuideDrift`'s "every real route is documented or
+  exempted" check cannot report a route it never sees in the first place.
+  `internal/ops.TestScanRegisteredRoutes_MatchesGolden`
+  (`internal/ops/routesgolden_test.go`) is what closes that specific gap:
+  it compares `ScanRegisteredRoutes`'s own output, in both directions,
+  against `controlplane/testdata/routes.golden` — the one artifact in
+  this repo captured directly from the real, live `chi.Walk`
+  (`controlplane.App.Routes()`, pinned to it by the integration-tagged
+  `TestBuild_RouteTableMatchesGolden`) — so a route the scanner misses
+  fails that unit test by name instead of silently staying undetected by
+  both `CheckGuideDrift` and everyone reading its green output.
 - **This list does not claim to be complete, and the claim is the thing
   that keeps breaking.** An earlier draft asserted a complete accounting
   of the routes outside every guide's scope and had dropped five, one
@@ -105,14 +125,14 @@ semantics.**
   audit found it short by twenty routes — twelve of them a single phase's
   new API. A hand-maintained inventory that declares itself complete goes
   stale on the next Step that adds a route, and says nothing while it
-  does.
-
-  What IS enforced lives in `internal/ops`: `TestNoGuideDrift` scans the
-  real route wiring and fails when a guide documents a route the code
-  does not implement. That guard runs the direction that matters — no
-  guide may lie about a route. The reverse direction, every route being
-  either documented or deliberately excluded, is not enforced, and this
-  list is a reading aid for it rather than a guarantee.
+  does. This prose list is now a READING AID over that same territory,
+  not the authority — see "Two rules, both enforced now" below for the
+  authority itself, `internal/ops/guideomission.go`'s own
+  `RouteGuideExemptions`, which `TestNoGuideDrift` reads and fails the
+  build against on every `go test ./...` run. This section drifting from
+  that register is now a documentation-quality problem, not a coverage
+  hole — the register cannot silently go stale the way this prose
+  already has, twice.
 
   The categories below are the reasons a route is deliberately outside a
   guide, and remain accurate as reasons even when the enumeration lags:
@@ -125,8 +145,15 @@ semantics.**
      `provider-credentials`, `sandbox-secrets`, `opencode-config`,
      `cloud-identity-token`, `cloud-identity-config`, `snapshot`,
      `review/verdict`, `workflow/step-outcome`, `turn/epistemic-outcome`,
-     and the bearer variant of `uploads` — machine-to-machine wiring a
-     human never calls directly, not a "surface" in this guide's sense.
+     `release-manifest/composition-findings`, and the bearer variant of
+     `uploads` (mint, confirm, and content-fetch) — machine-to-machine
+     wiring a human never calls directly, not a "surface" in this guide's
+     sense. (`release-manifest/composition-findings` is itself a
+     once-missed case: absent from an earlier draft of exactly this list,
+     confirmed against the router wiring while building the register
+     below — the same failure mode item 1 above already names, one more
+     time, which is exactly why the register and not this prose is now
+     what `TestNoGuideDrift` actually reads.)
      **`GET /sessions/{sessionID}/ws` (the live-stream WebSocket) is
      deliberately NOT in this list** — an earlier draft put it here too,
      and that was itself a confirmed review finding: this one route's
@@ -147,7 +174,7 @@ semantics.**
      `GET /.well-known/openid-configuration` /
      `GET /.well-known/jwks.json` (§27.3's cloud-identity OIDC
      federation discovery, deliberately unauthenticated — see their own
-     doc comment in `cmd/control-plane/main.go` for why). None of the
+     doc comment in `controlplane/serve.go` for why). None of the
      three represents any actor — human or machine — starting or
      continuing a session; there is no sense in which any per-surface
      guide's "what does this surface accept" question applies to them at
@@ -155,9 +182,10 @@ semantics.**
 
   Every route in categories 1–3 is a real, working route — none of this
   is a gap in the *check*, which never claims to enumerate every route in
-  the binary, only to validate the ones a guide actually cites. The
-  now-fixed gap was specifically this section's own prose claiming
-  completeness while omitting five of them.
+  the binary, only to validate the ones a guide actually cites (or, now,
+  the ones `RouteGuideExemptions` names). The now-fixed gap was
+  specifically this section's own prose claiming completeness while
+  omitting five of them.
 
 ## Prose is not machine-verified
 
@@ -272,18 +300,39 @@ true by hand.
 
 Verified by hand as part of Step 78 (§10-P6), reverted byte-identical
 afterward — see `internal/ops/guidedrift_test.go`'s own
-`TestNoGuideDrift` doc comment and the Step's own PR description for the
+`TestNoGuideDrift` doc comment and that Step's own PR description for the
 exact mutations and test names:
 
 1. Documenting a command whose `route` matches no real endpoint makes
    `TestNoGuideDrift` fail.
-2. Renaming a real route in `cmd/control-plane/main.go` without updating
+2. Renaming a real route in `controlplane/serve.go` without updating
    the guide that documents it makes `TestNoGuideDrift` fail identically.
 3. Malforming a guide file (breaking its embedded JSON, or removing a
    closing fence) makes `internal/ops.LoadGuides` itself fail — the test
    errors out rather than silently treating that file as empty.
 
-## Two rules, one of which nothing currently enforces
+A second round, over the omission direction below (`internal/ops/
+guideomission.go`), was verified by hand the same way — see
+`TestNoGuideDrift`'s own doc comment (updated) and this batch's own PR
+description for the exact mutations, exact failure messages, and
+confirmation each was reverted byte-identical:
+
+4. A new, real, user-facing route with no guide entry and no
+   `RouteGuideExemptions` entry makes `TestNoGuideDrift` fail with
+   `route-undocumented`.
+5. An empty `Reason` on a `RouteGuideExemptions` entry makes it fail with
+   `exemption-empty-reason` — AND the route it named stays reported as
+   `route-undocumented` too: an invalid exemption entry exempts nothing.
+6. A wildcard `Route` (`"POST /api/foo/*"`) fails with
+   `exemption-wildcard`, not silently accepted as a prefix exemption, and
+   the real route it was aimed at stays `route-undocumented`.
+7. A `RouteGuideExemptions` entry naming a route that no longer exists
+   fails with `exemption-stale`.
+8. A `RouteGuideExemptions` entry naming a route ALSO documented in a
+   guide fails with `exemption-contradicts-guide` — a route cannot be
+   claimed both absent from and present in the guides.
+
+## Two rules, both enforced now
 
 **Shipped behavior only, and this stays.** A proposal from a documentation-gap
 review was to let a guide describe planned behavior behind a marker — the
@@ -299,21 +348,53 @@ no "coming soon". A capability appears here when it ships and not before —
 which is also why the rule above is stated as an invariant and not a
 preference. Adding the marker would weaken a property that currently holds.
 
-**The drift check only runs one way, and the other way is the one that
-happens.** `TestNoGuideDrift` fails a guide documenting a command the code does
-not implement. It cannot fail a guide that **omits** a command the code does
-implement. Omission is the realistic failure: shipping a capability and
-updating its guide are two acts, usually by two people, at two different
-times, and only one of them is enforced. A check that catches aspirational
-text, living in a directory whose stated risk is aspirational text, reads as
-covering the subject; it covers half of it, and the visible half.
+**The drift check now runs both ways.** `TestNoGuideDrift` fails a guide
+documenting a command the code does not implement (the direction Step 78
+shipped) — AND, as of Step 178, fails a real route the code implements that
+is **omitted** from every guide and named in no exemption. Omission was the
+realistic failure: shipping a capability and updating its guide are two
+acts, usually by two people, at two different times, and previously only
+one of them was enforced. A check that catches aspirational text, living
+in a directory whose stated risk is aspirational text, reads as covering
+the subject; a check that catches only that half covers half of it, and
+only the visible half.
 
-Step 178 is where the missing direction is filed, including the reason it is
-harder than its sibling: nothing in the router knows which routes are meant
-for a person. A webhook receiver, a health endpoint and a BFF route the web
-app calls are all real routes that belong in no user guide, so the check needs
-an explicit list of what is deliberately undocumented — and that list is a
-claim someone makes, never a default.
+Step 178 is where the missing direction was filed and then closed: nothing
+in the router knows which routes are meant for a person — a webhook
+receiver, a health endpoint, and a sandbox-agent-only bearer route are all
+real routes that belong in no user guide. `internal/ops/guideomission.go`'s
+own `RouteGuideExemptions` is the explicit register that names every one of
+them and why, read by `TestNoGuideDrift` from the exact same source a
+reviewer reads in a diff — never a copy, never a re-derived summary. That
+register is a claim someone makes, never a default, and the check enforces
+what can be checked mechanically about the claim itself: a non-empty
+`Reason`, past a length floor, not one of a short denylist of stock
+non-answers ("internal", "not user-facing", "n/a", and similar — see
+`guideomission.go`'s own `vacuousExemptionReasons`); an exact, real route
+string, never a wildcard or a prefix; no entry naming a route that no
+longer exists (stale); no entry naming a route ALSO documented in a guide
+(contradiction — claimed both absent and present at once). What it cannot
+mechanically enforce — whether a reason clearing all of the above is
+actually TRUE, e.g. whether "the sandbox-agent's own bearer client is the
+real caller" is accurate for the specific route it's attached to — is left
+to code review, the same trust boundary "Prose is not machine-verified"
+above already draws for a guide's own surrounding text. A reason
+concatenating several denylisted phrases with punctuation between them
+(commas, semicolons, hyphens used as padding) is now caught too —
+`guideomission.go`'s own `reasonClausesAllVacuous` splits a reason on
+that punctuation and rejects it if EVERY resulting clause is itself an
+exact denylist entry, one clause at a time, not just the reason as one
+whole string. What remains, narrower than before: `reasonClausesAllVacuous`
+only ever splits on `clauseSplitRE`'s own fixed class of separators
+(`,;:.!?()-`) — ANY joiner outside that class still leaves the
+concatenation as one un-split clause that clears both checks, because it
+never splits into more than one clause in the first place. Plain spaces
+(four denylisted words run together, say) are the narrowest case, but the
+same gap holds for a slash, a pipe, an ampersand, or a word like "and"/"or"
+used as the joiner — none of those are in `clauseSplitRE`'s class either.
+`internal/ops/guidedrift_test.go`'s own `TestCheckGuideDrift_Omission` pins
+the plain-space case as a known, accepted limitation rather than a
+silently-assumed guarantee.
 
 ## Which lot owes which guide
 
