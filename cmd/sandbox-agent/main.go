@@ -1170,25 +1170,8 @@ func run() error {
 		if err := gitdir.EnsureRoot(cfg.GitDirRoot); err != nil {
 			return fmt.Errorf("sandbox-agent: ensure git-dir root: %w", err)
 		}
-		for _, r := range cfg.SessionConfig.Repos {
-			if err := reposource.ValidateRepoName(r.Name); err != nil {
-				// Left for gitclone.CloneAll/SyncAll's own validateRepoSpec to
-				// report properly, with the full session-config context this
-				// early warm-boot loop does not have reason to duplicate.
-				slog.Warn("sandbox-agent: warm-boot git-dir seed: invalid repo name, skipping (will be reported by clone/sync)", "repo", r.Name, "error", err)
-				continue
-			}
-			wt := filepath.Join(cfg.WorkspaceDir, r.Name)
-			if _, statErr := os.Stat(filepath.Join(wt, ".git")); statErr != nil {
-				// No pre-existing checkout for this repo -- the common cold-boot
-				// case, or a repo newly added to this session's own repo list
-				// since the image/snapshot was last built. gitclone.CloneAll/
-				// SyncAll will seed it in its own turn.
-				continue
-			}
-			if err := gitdir.Seed(ctx, sup, layout.Repo(r.Name), r.Url, runtimeCredential, timeouts.GitSyncStepTimeout, timeouts.ProcessStopGracePeriod); err != nil {
-				return fmt.Errorf("sandbox-agent: seed git-dir for %s (warm boot): %w", r.Name, err)
-			}
+		if err := seedWarmBootRepos(ctx, sup, cfg, layout, runtimeCredential, timeouts.GitSyncStepTimeout, timeouts.ProcessStopGracePeriod); err != nil {
+			return err
 		}
 	}
 
@@ -2153,6 +2136,53 @@ func run() error {
 		return fmt.Errorf("sandbox-agent: boot: %w", bootErr)
 	}
 	return stopErr
+}
+
+// seedWarmBootRepos runs run()'s own pre-fingerprint gitdir.Seed loop for a
+// WARM boot (repo_image/snapshot_restore): every session repo that already
+// has an on-disk <wt>/.git gets its agent-owned git-dir (re-)seeded before
+// boot.CollectFingerprint (§5.3's own "first logged line") and wsbridge.New
+// ever run, since DiscoverRepoSHAs already routes through the agent-owned
+// git-dir. Criticality mirrors gitclone.SyncAll's OWN policy exactly
+// (sync.go: "position 0 = primary" -- a primary failure is fatal, a
+// secondary failure is a logged warning, never fatal): reusing that same
+// split here, rather than inventing a second one, is the fix for the
+// finding that this loop used to return fatally from run() on ANY repo's
+// Seed failure, including a secondary one SyncAll's own later per-repo Seed
+// call would only have warned about. Returning nil (never a fatal error)
+// for a secondary-repo failure is exactly what lets run() reach the §5.3
+// fingerprint log and the bridge afterward.
+//
+// Factored out of run() specifically so this policy is unit-testable
+// without booting the whole process (main_test.go's own
+// TestSeedWarmBootRepos_PrimaryFatal/SecondaryWarns).
+func seedWarmBootRepos(ctx context.Context, sup *supervisor.Supervisor, cfg boot.Config, layout gitdir.Layout, runtimeCredential *syscall.Credential, gitSyncStepTimeout, stopGrace time.Duration) error {
+	for i, r := range cfg.SessionConfig.Repos {
+		primary := i == 0
+		if err := reposource.ValidateRepoName(r.Name); err != nil {
+			// Left for gitclone.CloneAll/SyncAll's own validateRepoSpec to
+			// report properly, with the full session-config context this
+			// early warm-boot loop does not have reason to duplicate.
+			slog.Warn("sandbox-agent: warm-boot git-dir seed: invalid repo name, skipping (will be reported by clone/sync)", "repo", r.Name, "error", err)
+			continue
+		}
+		wt := filepath.Join(cfg.WorkspaceDir, r.Name)
+		if _, statErr := os.Stat(filepath.Join(wt, ".git")); statErr != nil {
+			// No pre-existing checkout for this repo -- the common cold-boot
+			// case, or a repo newly added to this session's own repo list
+			// since the image/snapshot was last built. gitclone.CloneAll/
+			// SyncAll will seed it in its own turn.
+			continue
+		}
+		if err := gitdir.Seed(ctx, sup, layout.Repo(r.Name), r.Url, runtimeCredential, gitSyncStepTimeout, stopGrace); err != nil {
+			if primary {
+				return fmt.Errorf("sandbox-agent: seed git-dir for %s (warm boot): %w", r.Name, err)
+			}
+			slog.Warn("sandbox-agent: warm-boot git-dir seed: secondary repo failed, continuing (will be reported by sync)", "repo", r.Name, "error", err)
+			continue
+		}
+	}
+	return nil
 }
 
 // logImageManifest logs whatever boot.LoadImageManifest(boot.ImageManifestPath)
