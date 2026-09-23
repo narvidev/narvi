@@ -134,7 +134,7 @@ var RouteGuideExemptions = []RouteGuideExemption{
 	},
 	{
 		Route:  "POST /sessions/{sessionID}/uploads",
-		Reason: "Sandbox-agent bearer route: the in-sandbox download_file tool mints an agent-produced upload here (httpapi/uploadmint.go's MintUpload), never a browser -- distinct from its cookie-authenticated browser twin POST /api/sessions/{sessionID}/uploads, already documented in web.md.",
+		Reason: "Sandbox-agent bearer route: the in-sandbox agent mints an agent-produced upload here when it follows the upload-tool note that cmd/sandbox-agent's renderUploadToolPromptText adds to its prompt (httpapi/uploadmint.go's MintUpload), never a browser -- distinct from its cookie-authenticated browser twin POST /api/sessions/{sessionID}/uploads, already documented in web.md.",
 	},
 	{
 		Route:  "POST /sessions/{sessionID}/uploads/{uploadID}/complete",

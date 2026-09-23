@@ -36,7 +36,7 @@ this README, which is prose only); `internal/ops.CheckGuideDrift` checks
 each one against:
 
 - **`route`** — a real, currently-registered chi route, scanned directly
-  out of `cmd/control-plane/main.go`'s own router wiring via
+  out of `controlplane/serve.go`'s own router wiring via
   `internal/ops.ScanRegisteredRoutes` (a `go/ast` walk, the exact same
   mechanism `ScanRegisteredInstruments` already uses to keep
   `deploy/observability/{dashboards,alerts}` honest — see
@@ -174,7 +174,7 @@ semantics.**
      `GET /.well-known/openid-configuration` /
      `GET /.well-known/jwks.json` (§27.3's cloud-identity OIDC
      federation discovery, deliberately unauthenticated — see their own
-     doc comment in `cmd/control-plane/main.go` for why). None of the
+     doc comment in `controlplane/serve.go` for why). None of the
      three represents any actor — human or machine — starting or
      continuing a session; there is no sense in which any per-surface
      guide's "what does this surface accept" question applies to them at
@@ -305,7 +305,7 @@ exact mutations and test names:
 
 1. Documenting a command whose `route` matches no real endpoint makes
    `TestNoGuideDrift` fail.
-2. Renaming a real route in `cmd/control-plane/main.go` without updating
+2. Renaming a real route in `controlplane/serve.go` without updating
    the guide that documents it makes `TestNoGuideDrift` fail identically.
 3. Malforming a guide file (breaking its embedded JSON, or removing a
    closing fence) makes `internal/ops.LoadGuides` itself fail — the test
