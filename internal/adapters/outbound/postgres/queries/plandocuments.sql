@@ -18,6 +18,18 @@
 -- §12.2 item 3) rides the SAME insert as content, from the SAME
 -- already-recovered prose -- see that migration's own comment for why NULL
 -- is the only representation of "no structure recovered".
+--
+-- ListPlanDocumentsByPlanIDs backs the OTHER read path this table was
+-- always meant to serve and, until now, never did: GET .../plans
+-- (httpapi.ListPlans, plans.go) makes the durable snapshot here its FIRST
+-- choice, falling back to the bounded live event-log recompute only where
+-- no USABLE snapshot exists (no row at all, or a row whose content has
+-- been retention-nulled -- see this table's own migration comment for why
+-- that column is nullable). ListPlans already loads every plans row for
+-- the session in one query; this mirrors that -- ONE batch fetch keyed by
+-- plan_id = ANY($1), never one GetPlanDocumentByPlanID call per plan
+-- version (an N+1 this query exists specifically to avoid). Order is
+-- whatever Postgres returns; callers key the result by plan_id into a map.
 
 -- name: CreatePlanDocument :one
 INSERT INTO plan_documents (plan_id, content, structured_steps)
@@ -26,3 +38,6 @@ RETURNING *;
 
 -- name: GetPlanDocumentByPlanID :one
 SELECT * FROM plan_documents WHERE plan_id = $1;
+
+-- name: ListPlanDocumentsByPlanIDs :many
+SELECT * FROM plan_documents WHERE plan_id = ANY(sqlc.arg(plan_ids)::uuid[]);

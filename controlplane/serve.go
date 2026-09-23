@@ -1905,7 +1905,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// plans/{planId}/approve|reject above was always missing -- a web
 		// client had no way to ever discover a planId to approve. See
 		// httpapi/plans.go's own doc comment.
-		r.Get("/{sessionID}/plans", httpapi.ListPlans(sessionStore, planStore, turnStore, eventStore))
+		r.Get("/{sessionID}/plans", httpapi.ListPlans(sessionStore, planStore, turnStore, eventStore, planDocumentStore))
 		// review/retrigger ("review sessions", §8.2's own manual
 		// re-trigger-via-BUTTON surface, §12.2 item 2's "re-run action") --
 		// see httpapi/reviewretrigger.go's own doc comment. githubPRSessionStore/

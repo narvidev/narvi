@@ -22,28 +22,39 @@
 //
 // The plan-mode UI (§12.2 item 3) needs more than a planId -- it needs the
 // plan's own rendered text to show the human deciding on it. planContentMap
-// below computes restdtos.Plan.content for every version returned, reusing
-// internal/domain/plan.ExtractContent (the same bounded scan the Slack/
-// Linear cross-channel notifiers already use, internal/app/sessionactor/
-// planapprovalcontent.go) -- see that function's own doc comment for why a
-// per-version UPPER bound (the next turn dispatched in the session, if any)
-// is required here and was not needed by the single-turn notifier caller:
-// an older, already-superseded/decided plan version is never the session's
-// own most-recently-dispatched turn by the time anyone lists it.
+// below resolves restdtos.Plan.content for every version returned.
+//
+// The durable plan_documents snapshot (migrations/000112_plan_documents.
+// up.sql) is the FIRST choice wherever a usable row exists; the bounded
+// live event-log recompute -- internal/domain/plan.ExtractContent, the same
+// scan the Slack/Linear cross-channel notifiers already use,
+// internal/app/sessionactor/planapprovalcontent.go -- is the FALLBACK, used
+// only where no usable snapshot exists (see resolvePlanRenderedContent's
+// own doc comment for the exact three-way rule). See ExtractContent's own
+// doc comment for why a per-version UPPER bound (the next turn dispatched
+// in the session, if any) is required for that fallback and was not needed
+// by the single-turn notifier caller: an older, already-superseded/decided
+// plan version is never the session's own most-recently-dispatched turn by
+// the time anyone lists it.
 //
 // # Plan-mode UI addition: structured (§12.2 item 3's own missing schema)
 //
-// planWireMap additionally computes restdtos.Plan.structured from that SAME
-// content, via internal/domain/plan.ExtractStructured -- see that
-// function's and planWireMap's own doc comments for the extraction rule
-// and why nil (never a partial value) is the only "no structure"
-// representation.
+// planContentMap additionally resolves restdtos.Plan.structured alongside
+// content, following the SAME snapshot-first rule: a snapshot's own
+// persisted structured_steps (decoded) when non-NULL, or
+// internal/domain/plan.ExtractStructured re-derived from whichever content
+// was resolved (snapshot or live recompute) when it is NULL -- see that
+// function's and resolvePlanRenderedContent's own doc comments for the
+// extraction rule and why nil (never a partial value) is the only "no
+// structure" representation.
 
 package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"time"
@@ -73,9 +84,10 @@ const planContentEventFetchLimit = 2000
 // completeness). Session existence is checked first -- 404 if it doesn't
 // exist; otherwise every plan VERSION for the session (PlanStore.
 // ListForSession, ordered by version), mapped to restdtos.Plan (including
-// its own best-effort-extracted content, see this file's own top doc
-// comment) and returned as restdtos.ListPlansResponse.
-func ListPlans(sessions *postgres.SessionStore, plans *postgres.PlanStore, turns *postgres.TurnStore, events *postgres.EventStore) http.HandlerFunc {
+// its own rendered content/structured, see this file's own top doc comment
+// and planContentMap's own "snapshot first, live recompute as fallback"
+// doc comment) and returned as restdtos.ListPlansResponse.
+func ListPlans(sessions *postgres.SessionStore, plans *postgres.PlanStore, turns *postgres.TurnStore, events *postgres.EventStore, planDocuments *postgres.PlanDocumentStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sessionID, ok := parseSessionID(w, r)
 		if !ok {
@@ -101,7 +113,7 @@ func ListPlans(sessions *postgres.SessionStore, plans *postgres.PlanStore, turns
 			return
 		}
 
-		contentByPlanID, err := planContentMap(ctx, turns, events, sessionID, rows)
+		renderedByPlanID, err := planContentMap(ctx, turns, events, planDocuments, sessionID, rows)
 		if err != nil {
 			logger.Error("httpapi: compute plan content failed", "error", err)
 			writeError(w, http.StatusInternalServerError, "internal error")
@@ -110,33 +122,56 @@ func ListPlans(sessions *postgres.SessionStore, plans *postgres.PlanStore, turns
 
 		wire := make([]restdtos.Plan, len(rows))
 		for i, p := range rows {
-			wire[i] = planWireMap(p, contentByPlanID[p.ID.String()])
+			wire[i] = planWireMap(p, renderedByPlanID[p.ID.String()])
 		}
 
 		writeJSON(w, http.StatusOK, restdtos.ListPlansResponse{Plans: wire})
 	}
 }
 
-// planContentMap computes plandomain.ExtractContent's own result for every
-// row in planRows, keyed by plan id (string form) -- ONE events fetch (the
-// session's own most recent planContentEventFetchLimit events, newest
-// first, exactly like planapprovalcontent.go's own single-turn fetch)
-// shared across every plan version, since ExtractContent's own bounds do
-// all the per-version scoping work; re-fetching per plan would be pure
-// waste against the SAME underlying rows.
+// planRenderedContent is one plan version's own rendered content/structured
+// pair, as planContentMap resolves it -- see that function's own doc
+// comment for the "snapshot first, live recompute as fallback" rule that
+// produces it.
+type planRenderedContent struct {
+	Content    string
+	Structured *plandomain.Structured
+}
+
+// planContentMap resolves restdtos.Plan.content/structured for every row in
+// planRows, keyed by plan id (string form).
 //
-// Bounds are derived from EVERY turn dispatched in the session (turns.
-// ListForSession), not only the plan-producing ones: a plan version's own
-// upper bound is the NEXT turn dispatched afterward REGARDLESS of what kind
-// of turn it was (an approved plan's own approval-dispatched IMPLEMENTATION
-// turn is exactly such a turn, and is what makes an unbounded-above scan
-// wrong for a decided plan -- see plandomain.ExtractContent's own doc
-// comment). Turns with no DispatchedEventID (never dispatched -- e.g. still
-// pending) carry no scan boundary of their own and are excluded from the
-// ordered boundary list; a plan's own producing turn always HAS one by the
-// time a plan row exists for it (a plan is only ever created once its
-// producing turn completes, which requires having been dispatched first).
-func planContentMap(ctx context.Context, turns *postgres.TurnStore, events *postgres.EventStore, sessionID pgtype.UUID, planRows []sqlcgen.Plan) (map[string]string, error) {
+// The durable plan_documents snapshot (migrations/000112_plan_documents.
+// up.sql, written once at approval time by decideplan.go's own
+// snapshotApprovedPlanContent) is now the FIRST choice, not merely a
+// coverage-measurement side table nothing in production ever read: past
+// this package's own planContentEventFetchLimit, the live recompute below
+// can only return plandomain.ContentFallbackText even though the exact
+// approved prose sits durably in that snapshot. The bounded live recompute
+// (exactly what this function did before the snapshot existed) is now the
+// FALLBACK, used only where no USABLE snapshot exists -- see
+// planDocumentSnapshotMap and resolvePlanRenderedContent below for the
+// precise three-way rule (no row / usable row / row with NULL content).
+//
+// ONE events fetch (the session's own most recent planContentEventFetchLimit
+// events, newest first, exactly like planapprovalcontent.go's own
+// single-turn fetch) and ONE snapshot batch fetch (planDocumentSnapshotMap)
+// are shared across every plan version in the session -- re-fetching either
+// per plan would be pure waste against the SAME underlying rows.
+//
+// Bounds for the live recompute are derived from EVERY turn dispatched in
+// the session (turns.ListForSession), not only the plan-producing ones: a
+// plan version's own upper bound is the NEXT turn dispatched afterward
+// REGARDLESS of what kind of turn it was (an approved plan's own
+// approval-dispatched IMPLEMENTATION turn is exactly such a turn, and is
+// what makes an unbounded-above scan wrong for a decided plan -- see
+// plandomain.ExtractContent's own doc comment). Turns with no
+// DispatchedEventID (never dispatched -- e.g. still pending) carry no scan
+// boundary of their own and are excluded from the ordered boundary list; a
+// plan's own producing turn always HAS one by the time a plan row exists
+// for it (a plan is only ever created once its producing turn completes,
+// which requires having been dispatched first).
+func planContentMap(ctx context.Context, turns *postgres.TurnStore, events *postgres.EventStore, planDocuments *postgres.PlanDocumentStore, sessionID pgtype.UUID, planRows []sqlcgen.Plan) (map[string]planRenderedContent, error) {
 	if len(planRows) == 0 {
 		return nil, nil
 	}
@@ -152,22 +187,98 @@ func planContentMap(ctx context.Context, turns *postgres.TurnStore, events *post
 	}
 	contentEvents := sessionactor.ToContentEvents(recentEvents)
 
-	out := make(map[string]string, len(planRows))
+	snapshotByPlanID, err := planDocumentSnapshotMap(ctx, planDocuments, planRows)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]planRenderedContent, len(planRows))
 	for _, p := range planRows {
-		lower, upper, ok := turnContentBounds(allTurns, p.TurnID)
-		if !ok {
-			// Defensive: plans.turn_id is a NOT NULL FK to turns and a plan
-			// row is only ever created once its producing turn has already
-			// been dispatched (see this function's own top doc comment) --
-			// this branch should be unreachable in practice, but degrades to
-			// the SAME honest fallback ExtractContent itself would return
-			// for an empty window, never a panic on a missing map key.
-			out[p.ID.String()] = plandomain.ContentFallbackText
-			continue
+		snapshot, snapshotOK := snapshotByPlanID[p.ID.String()]
+		rendered, err := resolvePlanRenderedContent(p, snapshot, snapshotOK, allTurns, contentEvents)
+		if err != nil {
+			return nil, err
 		}
-		out[p.ID.String()] = plandomain.ExtractContent(contentEvents, lower, upper)
+		out[p.ID.String()] = rendered
 	}
 	return out, nil
+}
+
+// planDocumentSnapshotMap fetches every plan_documents row for planRows'
+// own plan ids, in ONE batch call (PlanDocumentStore.ListByPlanIDs) --
+// mirrors planContentMap's own "one events fetch shared across every
+// version" discipline, never one snapshot lookup per plan. A plan with no
+// snapshot row simply has no entry in the returned map -- ok(false) from a
+// plain map lookup is how resolvePlanRenderedContent below distinguishes
+// "no snapshot" from "a snapshot exists".
+func planDocumentSnapshotMap(ctx context.Context, planDocuments *postgres.PlanDocumentStore, planRows []sqlcgen.Plan) (map[string]sqlcgen.PlanDocument, error) {
+	ids := make([]pgtype.UUID, len(planRows))
+	for i, p := range planRows {
+		ids[i] = p.ID
+	}
+	docs, err := planDocuments.ListByPlanIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]sqlcgen.PlanDocument, len(docs))
+	for _, d := range docs {
+		out[d.PlanID.String()] = d
+	}
+	return out, nil
+}
+
+// resolvePlanRenderedContent implements the three-era rule a plan approved
+// before, at, or after plan_documents existed must render under -- "prefer
+// the snapshot only where a usable snapshot exists":
+//
+//   - No snapshot row at all (planRow predates migration 000112, or was
+//     never approved): there is nothing to prefer, so this falls back to
+//     EXACTLY the live event-log recompute this package always did --
+//     placeholder included when the window has nothing left to find. This
+//     is the deliberate settlement, not a gap: snapshot-first applies only
+//     where a row exists.
+//   - A snapshot row whose content is non-NULL (approved on/after 000112):
+//     that content is used VERBATIM -- even when it happens to equal
+//     plandomain.ContentFallbackText itself, which is the honest durable
+//     record of what approval-time recovery actually found; a live
+//     recompute now could only match it or do worse (the window has moved
+//     on). structured comes from the snapshot's own structured_steps when
+//     non-NULL (decoded, never re-derived -- the persisted document IS the
+//     immutable record of what was approved, §5.1), or from
+//     plandomain.ExtractStructured(snapshotContent) when structured_steps
+//     itself is NULL.
+//   - A snapshot row whose content IS NULL (a future retention policy
+//     nulled it, migrations/000112_plan_documents.up.sql's own reason that
+//     column is nullable at all): there is no usable snapshot, so this
+//     falls back to the live recompute exactly like the "no row" case --
+//     structured_steps on such a row is never consulted, since a snapshot
+//     with no prose to show has nothing authoritative to pair it with
+//     either.
+func resolvePlanRenderedContent(planRow sqlcgen.Plan, snapshot sqlcgen.PlanDocument, snapshotOK bool, allTurns []sqlcgen.Turn, contentEvents []plandomain.ContentEvent) (planRenderedContent, error) {
+	if snapshotOK && snapshot.Content != nil {
+		content := *snapshot.Content
+		if snapshot.StructuredSteps != nil {
+			var structured plandomain.Structured
+			if err := json.Unmarshal(snapshot.StructuredSteps, &structured); err != nil {
+				return planRenderedContent{}, fmt.Errorf("httpapi: decode plan_documents.structured_steps for plan %s: %w", planRow.ID.String(), err)
+			}
+			return planRenderedContent{Content: content, Structured: &structured}, nil
+		}
+		return planRenderedContent{Content: content, Structured: plandomain.ExtractStructured(content)}, nil
+	}
+
+	content := plandomain.ContentFallbackText
+	if lower, upper, ok := turnContentBounds(allTurns, planRow.TurnID); ok {
+		content = plandomain.ExtractContent(contentEvents, lower, upper)
+	}
+	// Defensive: the !ok branch above (plans.turn_id names no dispatched
+	// turn) should be unreachable in practice -- plans.turn_id is a NOT
+	// NULL FK to turns and a plan row is only ever created once its
+	// producing turn has already been dispatched (see planContentMap's own
+	// top doc comment) -- but degrades to the SAME honest fallback
+	// ExtractContent itself would return for an empty window, never a
+	// panic on a missing map key.
+	return planRenderedContent{Content: content, Structured: plandomain.ExtractStructured(content)}, nil
 }
 
 // turnContentBounds returns plandomain.ExtractContent's own (lower, upper)
@@ -214,22 +325,19 @@ func turnContentBounds(sessionTurns []sqlcgen.Turn, turnID pgtype.UUID) (lower, 
 	return nil, nil, false
 }
 
-// planWireMap maps one sqlcgen.Plan row (plus its own separately-computed
-// content, planContentMap above) onto restdtos.Plan -- deliberately
-// dropping TurnID/SlackChannelID/SlackMessageTs, present on the underlying
-// row but not on the wire DTO (see Plan's own schema doc comment,
+// planWireMap maps one sqlcgen.Plan row (plus its own separately-resolved
+// rendered content/structured pair, planContentMap/resolvePlanRenderedContent
+// above) onto restdtos.Plan -- deliberately dropping TurnID/
+// SlackChannelID/SlackMessageTs, present on the underlying row but not on
+// the wire DTO (see Plan's own schema doc comment,
 // contracts/rest/v1/dtos.schema.json, for why).
 //
-// structured is recomputed live from content, via plandomain.
-// ExtractStructured, every time -- exactly like content itself is
-// recomputed live from the event log on every read, never cached from a
-// prior computation. This is what makes an already-persisted plan (from
-// before this field existed) and a freshly-created one behave identically
-// with no backfill: the SAME function runs against whatever content
-// happens to contain, so an old plan's prose (never asked to carry a
-// ```plan-steps block) simply extracts nil, the same nil a brand-new
-// plan's own failed extraction attempt would produce.
-func planWireMap(p sqlcgen.Plan, content string) restdtos.Plan {
+// rendered.Structured already reflects resolvePlanRenderedContent's own
+// snapshot-first rule -- this function never calls plandomain.
+// ExtractStructured itself, so it never has an opinion of its own on
+// whether a re-derivation from rendered.Content would disagree with a
+// persisted structured_steps value; it renders exactly what was resolved.
+func planWireMap(p sqlcgen.Plan, rendered planRenderedContent) restdtos.Plan {
 	var decidedAt *time.Time
 	if p.DecidedAt.Valid {
 		t := p.DecidedAt.Time
@@ -249,8 +357,8 @@ func planWireMap(p sqlcgen.Plan, content string) restdtos.Plan {
 		CreatedAt:   p.CreatedAt.Time,
 		DecidedAt:   decidedAt,
 		DecidedBy:   decidedBy,
-		Content:     content,
-		Structured:  planStructuredWireMap(plandomain.ExtractStructured(content)),
+		Content:     rendered.Content,
+		Structured:  planStructuredWireMap(rendered.Structured),
 	}
 }
 

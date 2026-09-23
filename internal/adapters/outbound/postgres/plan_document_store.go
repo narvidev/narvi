@@ -76,3 +76,15 @@ func (s *PlanDocumentStore) Create(ctx context.Context, planID pgtype.UUID, cont
 func (s *PlanDocumentStore) GetByPlanID(ctx context.Context, planID pgtype.UUID) (sqlcgen.PlanDocument, error) {
 	return s.q.GetPlanDocumentByPlanID(ctx, planID)
 }
+
+// ListByPlanIDs fetches every plan_documents row whose plan_id appears in
+// planIDs, in ONE batch query -- ListPlans' own read path (plans.go's own
+// planContentMap) shares this single call across every plan version
+// returned for a session, never one GetByPlanID call per plan (the N+1
+// this method exists specifically to avoid). A planID with no snapshot row
+// simply has no corresponding entry in the result -- never an error, never
+// a zero-value placeholder row -- and the result carries no particular
+// order; callers key it by PlanID into a map.
+func (s *PlanDocumentStore) ListByPlanIDs(ctx context.Context, planIDs []pgtype.UUID) ([]sqlcgen.PlanDocument, error) {
+	return s.q.ListPlanDocumentsByPlanIDs(ctx, planIDs)
+}
