@@ -255,13 +255,18 @@ func TestClosedClass_StashPopIndexDoesNotExecuteEither(t *testing.T) {
 //
 // Fixed with two extra, explicit checks below, each isolating ONE of the
 // two independent defenses:
-//   - "split alone": the REAL githarden.Args(repo, ...) output, with only
-//     the "-c core.hooksPath=..." PAIR filtered back out -- so this check
-//     is sensitive to whatever --git-dir/--work-tree Args() actually
-//     emits (or fails to), unlike a hand-built command that would not
-//     notice Args() regressing at all. If the hook still does not run,
-//     the structural guarantee is real on its own, independent of the
-//     flag.
+//   - "split alone": the REAL githarden.Args(repo, ...) output, with the
+//     "-c core.hooksPath=..." PAIR's own value replaced to point at the
+//     agent's own real hooks/ dir (round-2 review, R6: replaced, not
+//     merely dropped -- Seed's own AGENT CONFIG belt persists
+//     core.hooksPath=/dev/null into the agent git-dir's own config file,
+//     independent of this command's -c flags, so dropping the flag alone
+//     left that belt in place, still suppressing the hook on its own) --
+//     so this check is sensitive to whatever --git-dir/--work-tree Args()
+//     actually emits (or fails to), unlike a hand-built command that would
+//     not notice Args() regressing at all. If the hook still does not
+//     run, the structural guarantee is real on its own, independent of
+//     BOTH the CLI flag and the persisted agent-config value.
 //   - "neither defense, sanity control": plain "-C wt", the pre-§30.5
 //     shape, no --git-dir override and no -c flag at all -- the payload
 //     MUST execute here, or this whole test would be vacuous (proving
@@ -383,19 +388,37 @@ func TestSharedObjects_VisibleBothWays(t *testing.T) {
 }
 
 // argsWithoutHooksPathFlag returns githarden.Args' OWN real output for
-// this exact repo/rest, with only the "-c core.hooksPath=<value>" pair
-// filtered back out -- everything else Args() actually emits (crucially,
+// this exact repo/rest, with the "-c core.hooksPath=<value>" PAIR's own
+// value replaced -- everything else Args() actually emits (crucially,
 // -C/--git-dir/--work-tree) is passed through untouched. Deriving from
 // the real Args() output, rather than hand-building a fixed command,
 // keeps TestClosedClass_RuntimeHookDoesNotExecute's own isolation check
 // sensitive to a regression in Args() itself (e.g. Args no longer
 // emitting --git-dir) -- a hand-built command using fixed flags would
 // not notice that at all.
+//
+// (Correction, round-2 review, R6): simply DROPPING the "-c
+// core.hooksPath=..." pair, as this function used to, still left Seed's
+// own AGENT CONFIG belt in place -- core.hooksPath=/dev/null, PERSISTED
+// into the agent git-dir's own config file at Seed step 5, independent of
+// this command's own -c flags. That belt alone is enough to suppress any
+// hook regardless of whether hooks/ is actually split, so the "split
+// alone" isolation check below could not tell "the split itself blocks
+// the hook" apart from "the agent config's own /dev/null still does" --
+// e.g. a future change sharing hooks/ between agent and runtime (Seed
+// symlinking it the way it already does objects/refs/logs/info) would
+// not have been caught. Fixed by REPLACING the pair's value with the
+// AGENT's own real hooks directory (repo.GitDir/hooks) instead of
+// dropping it: a command-line -c always overrides the persisted config
+// value, so this neutralizes the agent-config belt too, while still
+// keeping hook lookup scoped to the agent's own (real, empty) hooks/ dir
+// -- exactly what "split alone" is supposed to isolate.
 func argsWithoutHooksPathFlag(repo githarden.Repo, rest ...string) []string {
 	full := githarden.Args(repo, rest...)
 	filtered := make([]string, 0, len(full))
 	for i := 0; i < len(full); i++ {
 		if full[i] == "-c" && i+1 < len(full) && strings.HasPrefix(full[i+1], "core.hooksPath=") {
+			filtered = append(filtered, "-c", "core.hooksPath="+filepath.Join(repo.GitDir, "hooks"))
 			i++ // also skip the "core.hooksPath=<value>" that follows "-c"
 			continue
 		}
