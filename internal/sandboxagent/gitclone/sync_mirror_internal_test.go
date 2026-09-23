@@ -11,6 +11,7 @@ package gitclone
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"os"
@@ -147,11 +148,39 @@ func TestSyncAll_MirrorBranchUpstreamFails_ChecksOutAnywayAndWarns(t *testing.T)
 		t.Fatalf("mirrorBranchUpstreamFunc called %d times, want exactly 1 -- otherwise this test didn't actually exercise the failure path", mirrorCalls)
 	}
 
-	logged := logBuf.String()
-	if !strings.Contains(logged, "mirror upstream tracking onto runtime config failed") {
-		t.Errorf("log output = %q, want a warning naming the mirror failure", logged)
+	// (Round-3 review, Q6): the old checks here were two independent
+	// strings.Contains calls against the WHOLE log buffer -- one for the
+	// message text, one for `"level":"WARN"` anywhere in it. Nothing tied
+	// the two together, and this fixture's own checkoutBase fallback
+	// (local HEAD only, no origin remote) unconditionally logs three OTHER
+	// WARN lines before the mirror failure ("resolve default branch
+	// failed", "boot-time fetch failed", "checkout base falls back to
+	// local HEAD"), so the level check passed regardless of what level the
+	// mirror-failure line itself was actually logged at. Fixed by parsing
+	// each JSON line and checking "level" on the specific entry whose
+	// "msg" is the mirror-failure message.
+	const mirrorFailureMsg = "mirror upstream tracking onto runtime config failed"
+	var foundMirrorFailureLine bool
+	for _, line := range strings.Split(strings.TrimSpace(logBuf.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry struct {
+			Level string `json:"level"`
+			Msg   string `json:"msg"`
+		}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("unmarshal log line %q: %v", line, err)
+		}
+		if !strings.Contains(entry.Msg, mirrorFailureMsg) {
+			continue
+		}
+		foundMirrorFailureLine = true
+		if entry.Level != "WARN" {
+			t.Errorf("mirror-failure log line level = %q, want %q (msg = %q)", entry.Level, "WARN", entry.Msg)
+		}
 	}
-	if !strings.Contains(logged, `"level":"WARN"`) {
-		t.Errorf("log output = %q, want the mirror-failure line logged at WARN, not a higher/lower level", logged)
+	if !foundMirrorFailureLine {
+		t.Errorf("log output = %q, want a line naming the mirror failure (%q)", logBuf.String(), mirrorFailureMsg)
 	}
 }
