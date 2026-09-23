@@ -590,6 +590,27 @@ func TestSparseCheckoutMirror_BothDirectionsAndSeedImport(t *testing.T) {
 	runGitForRunTest(t, wt, "add", ".")
 	runGitForRunTest(t, wt, "commit", "-qm", "add apps/web, apps/api, contracts/api")
 
+	// A second branch whose apps/api/index.js content DIFFERS from main's
+	// -- created now, while the tree is still fully materialized, so no
+	// sparse-checkout state is in play yet. Round-2 review (R7): step (1)
+	// below used to prove "still sparse" only by switching between two
+	// branches with IDENTICAL trees (tmp-branch/main) -- git's unpack-trees
+	// never even looks at a path whose content is unchanged between the
+	// two commits, so apps/api stayed absent whether or not the mirror had
+	// actually set core.sparseCheckout on the runtime side. Verified
+	// directly against real git: with a shared index/skip-worktree bits
+	// (from the agent's own sparse-checkout set) but the RUNTIME's own
+	// core.sparseCheckout left unset (the exact "mirror never ran" shape),
+	// switching to a branch whose apps/api content genuinely differs DOES
+	// re-materialize the file -- so this divergent branch, unlike the
+	// same-tree round trip, is a real, config-dependent proof.
+	runGitForRunTest(t, wt, "checkout", "-qb", "divergent-api")
+	if err := os.WriteFile(filepath.Join(wt, "apps/api/index.js"), []byte("api v2 -- must never land on a sparse runtime\n"), 0o644); err != nil {
+		t.Fatalf("write apps/api/index.js (divergent-api): %v", err)
+	}
+	runGitForRunTest(t, wt, "commit", "-aqm", "apps/api v2 on divergent-api")
+	runGitForRunTest(t, wt, "checkout", "-q", "main")
+
 	gitDirRoot := filepath.Join(base, "gitdirs")
 	if err := gitdir.EnsureRoot(gitDirRoot); err != nil {
 		t.Fatalf("gitdir.EnsureRoot: %v", err)
@@ -634,10 +655,30 @@ func TestSparseCheckoutMirror_BothDirectionsAndSeedImport(t *testing.T) {
 
 	// The runtime's own NEXT checkout -- an ordinary, unprivileged branch
 	// switch -- must keep the tree sparse (not re-materialize apps/api).
+	// This SAME-tree round trip (tmp-branch/main, identical content) is
+	// kept as a sanity baseline, but it is NOT on its own proof of
+	// anything sparse-config-dependent -- see the divergent-branch check
+	// immediately below for why.
 	runGitForRunTest(t, wt, "checkout", "-q", "-b", "tmp-branch")
 	runGitForRunTest(t, wt, "checkout", "-q", "main")
 	mustExist(t, webFile, "after runtime's own checkout, still sparse")
 	mustNotExist(t, apiFile, "after runtime's own checkout, still sparse")
+
+	// The REAL, discriminating proof (round-2 review, R7): switch onto
+	// divergent-api, whose apps/api/index.js content genuinely DIFFERS
+	// from main's. Unlike the same-tree round trip above, git's own
+	// unpack-trees must actually decide, for THIS checkout, whether to
+	// materialize the new content -- a decision that depends on the
+	// RUNTIME's own core.sparseCheckout value (mirrored, or not) and the
+	// (shared, via "info") sparse-checkout patterns, not merely on
+	// whatever skip-worktree bits already happened to sit in the shared
+	// index already. Verified directly against real git: with the
+	// runtime's own core.sparseCheckout genuinely unmirrored (left unset),
+	// this exact checkout re-materializes apps/api/index.js -- so a no-op
+	// mirror is caught here, not just by the config-value read above.
+	runGitForRunTest(t, wt, "checkout", "-q", "divergent-api")
+	mustNotExist(t, apiFile, "after runtime's own checkout onto a tree that DIFFERS under apps/api, still sparse")
+	runGitForRunTest(t, wt, "checkout", "-q", "main")
 
 	// -- (2) agent disables sparse; runtime's own next checkout re-materializes everything --
 	runHardened(ctx, t, sup, repo, "sparse-checkout", "disable")
@@ -652,14 +693,32 @@ func TestSparseCheckoutMirror_BothDirectionsAndSeedImport(t *testing.T) {
 		t.Fatalf("runtime core.sparseCheckout after mirror(disable) = %q, want \"false\" or unset", runtimeSparseConfigAfterDisable)
 	}
 
-	// Remove apps/api/index.js by hand and let the runtime's own next
-	// checkout restore it -- proving that checkout does NOT re-sparsify
-	// (a regression here would leave it gone).
-	if err := os.Remove(apiFile); err != nil {
-		t.Fatalf("remove apiFile: %v", err)
+	// (Correction, round-2 review, R7): this used to remove apps/api/
+	// index.js by hand and let a PATHSPEC-limited `git checkout -- <path>`
+	// restore it -- but that restores the file regardless of whether the
+	// mirror actually disabled core.sparseCheckout on the runtime side:
+	// the agent's own `sparse-checkout disable`, just above, already
+	// clears every skip-worktree bit in the SHARED index unconditionally
+	// (§30.5: index is one of the entries Seed symlinks), so a
+	// pathspec-limited restore of an already-tracked, already-unmarked
+	// path succeeds either way -- it is not sensitive to the runtime's
+	// own config at all.
+	//
+	// The discriminating proof instead: a REAL, full ref switch onto
+	// divergent-api, whose apps/api/index.js content DIFFERS from main's
+	// -- exactly like step (1)'s own divergent-branch check, but now
+	// proving the OPPOSITE direction (materializes, with the CORRECT new
+	// content, rather than staying absent). Checking the CONTENT, not
+	// just presence, additionally rules out a stale, pre-disable copy of
+	// the file satisfying a presence-only check.
+	runGitForRunTest(t, wt, "checkout", "-q", "divergent-api")
+	mustExist(t, apiFile, "after runtime's own checkout onto a tree that DIFFERS under apps/api, post-disable")
+	if data, err := os.ReadFile(apiFile); err != nil {
+		t.Fatalf("read apiFile after runtime's own post-disable checkout: %v", err)
+	} else if want := "api v2 -- must never land on a sparse runtime\n"; string(data) != want {
+		t.Errorf("apiFile content after runtime's own post-disable checkout = %q, want %q (divergent-api's own real content, not a stale/sparse artifact)", data, want)
 	}
-	runGitForRunTest(t, wt, "checkout", "-q", "--", "apps/api/index.js")
-	mustExist(t, apiFile, "after runtime's own checkout, post-disable")
+	runGitForRunTest(t, wt, "checkout", "-q", "main")
 
 	// -- (3) Seed imports a sparse runtime's state into a fresh agent config --
 	// Re-enable sparse on the runtime side directly (an ordinary,
