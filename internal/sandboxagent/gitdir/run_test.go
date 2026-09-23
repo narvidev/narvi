@@ -374,3 +374,145 @@ func TestMirrorSparseCheckout_RuntimeHasLinkedWorktree(t *testing.T) {
 		t.Errorf("runtime extensions.worktreeConfig = %q, want \"true\\n\"", got)
 	}
 }
+
+// assertSymlink fails the test unless path is STILL a symlink (os.Lstat,
+// never following it).
+func assertSymlink(t *testing.T, path, context string) {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("Lstat(%s) after %s: %v", path, context, err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("%s is no longer a symlink after %s (mode=%s) -- a real git maintenance operation replaced the agent-side symlink with a real file, breaking the shared-file model this package's own doc comment (gitdir.go) depends on", path, context, info.Mode())
+	}
+}
+
+// TestSharedFileSymlinks_SurviveRealGitMaintenanceOperations is a
+// PERMANENT pin (queued from this package's own implementer notes) of a
+// property this package has always relied on but never directly tested:
+// the agent-side packed-refs/index symlinks are FILE symlinks (unlike
+// objects/refs/logs/info, which are DIRECTORY symlinks a plain rename
+// could never silently replace). git's own lockfile-and-rename write
+// path -- used by `pack-refs`, `gc`, and a stash pop's own index
+// reapplication -- resolves a symlink at the final path component and
+// renames its own lockfile OVER THE RESOLVED TARGET, never replacing the
+// symlink itself with a real file (seed.go's own doc comment, and the F1
+// finding notes this package's own review left on record, both measured
+// this directly for `index`). This test pins the SAME property for real,
+// routine git maintenance operations run through the agent-owned
+// git-dir -- `git pack-refs --all`, `git gc --prune=now`, and a `stash
+// pop --index` whose OWN refs/stash entry is itself PACKED (not loose)
+// -- so a future git release that changes this lockfile semantics (e.g.
+// unlinks and recreates the final path instead of renaming over it) goes
+// RED here immediately, rather than silently corrupting the split
+// git-dir shape in production.
+func TestSharedFileSymlinks_SurviveRealGitMaintenanceOperations(t *testing.T) {
+	base := t.TempDir()
+	workspaceDir := filepath.Join(base, "workspace")
+	wt := filepath.Join(workspaceDir, "repo1")
+	initRunTestRepo(t, wt)
+
+	gitDirRoot := filepath.Join(base, "gitdirs")
+	if err := gitdir.EnsureRoot(gitDirRoot); err != nil {
+		t.Fatalf("gitdir.EnsureRoot: %v", err)
+	}
+	layout := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}
+	repo := layout.Repo("repo1")
+	sup := supervisor.New()
+	ctx := context.Background()
+
+	if err := gitdir.Seed(ctx, sup, repo, "https://example.invalid/repo1.git", nil, 10*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("gitdir.Seed: %v", err)
+	}
+
+	packedRefsPath := filepath.Join(repo.GitDir, "packed-refs")
+	indexPath := filepath.Join(repo.GitDir, "index")
+	assertSymlink(t, packedRefsPath, "Seed")
+	assertSymlink(t, indexPath, "Seed")
+
+	runAgent := func(args ...string) {
+		t.Helper()
+		spec := supervisor.Spec{Path: "git", Args: githarden.Args(repo, args...)}
+		if _, err := gitdir.Run(ctx, sup, repo, nil, spec, 10*time.Second, 5*time.Second); err != nil {
+			t.Fatalf("gitdir.Run(%v): %v", args, err)
+		}
+	}
+
+	// (1) `git pack-refs --all`, through the agent-owned git-dir --
+	// rewrites packed-refs via lockfile-and-rename.
+	runAgent("pack-refs", "--all")
+	assertSymlink(t, packedRefsPath, "pack-refs --all")
+
+	// (2) An agent-side commit (writes the index via `git add`), then
+	// `git gc --prune=now`, through the agent-owned git-dir -- rewrites
+	// packed-refs, objects, AND index.
+	if err := os.WriteFile(filepath.Join(wt, "gc-trigger.txt"), []byte("gc\n"), 0o644); err != nil {
+		t.Fatalf("write gc-trigger.txt: %v", err)
+	}
+	runAgent("add", "gc-trigger.txt")
+	assertSymlink(t, indexPath, "add")
+	runAgent("commit", "-qm", "trigger gc")
+	runAgent("gc", "--prune=now")
+	assertSymlink(t, packedRefsPath, "gc --prune=now")
+	assertSymlink(t, indexPath, "gc --prune=now")
+
+	// The runtime's own, entirely unhardened git must still resolve the
+	// gc'd history -- proves the shared objects/refs survived compaction,
+	// not just that the symlinks themselves are intact.
+	if out, err := exec.Command("git", "-C", wt, "log", "--oneline", "-1").CombinedOutput(); err != nil {
+		t.Fatalf("git -C %s log --oneline -1 (after gc): %v\n%s", wt, err, out)
+	} else if !strings.Contains(string(out), "trigger gc") {
+		t.Errorf("git log after gc = %q, want it to contain the gc-triggering commit", out)
+	}
+
+	// (3) A stash whose OWN refs/stash entry is itself PACKED (not
+	// loose): the runtime stashes a change, the agent packs ALL refs
+	// (including refs/stash, verified directly against real git), then
+	// the agent pops it -- `stash pop --index` reapplies the INDEX via
+	// the same lockfile-and-rename path.
+	if err := os.WriteFile(filepath.Join(wt, "f.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("write f.txt: %v", err)
+	}
+	runGitForRunTest(t, wt, "add", "f.txt")
+	runGitForRunTest(t, wt, "commit", "-qm", "seed f.txt")
+	if err := os.WriteFile(filepath.Join(wt, "f.txt"), []byte("stashed\n"), 0o644); err != nil {
+		t.Fatalf("write stashed f.txt: %v", err)
+	}
+	runGitForRunTest(t, wt, "stash", "push", "-q", "-m", "wip")
+
+	runAgent("pack-refs", "--all")
+	assertSymlink(t, packedRefsPath, "pack-refs --all (with refs/stash)")
+	// Confirm refs/stash itself is really packed now, not loose --
+	// otherwise this test would not actually be exercising the packed
+	// case P1 exists to pin.
+	if _, statErr := os.Lstat(filepath.Join(wt, ".git", "refs", "stash")); !os.IsNotExist(statErr) {
+		t.Fatalf("loose .git/refs/stash still exists after pack-refs --all (stat err = %v) -- "+
+			"this test's own premise (a PACKED refs/stash) no longer holds", statErr)
+	}
+	packedRefsContent, err := os.ReadFile(filepath.Join(wt, ".git", "packed-refs"))
+	if err != nil {
+		t.Fatalf("read wt/.git/packed-refs: %v", err)
+	}
+	if !strings.Contains(string(packedRefsContent), "refs/stash") {
+		t.Fatalf("packed-refs does not contain refs/stash -- this test's own premise (a PACKED refs/stash) no longer holds:\n%s", packedRefsContent)
+	}
+
+	runAgent("stash", "pop", "--index")
+	assertSymlink(t, packedRefsPath, "stash pop --index (packed refs/stash)")
+	assertSymlink(t, indexPath, "stash pop --index (packed refs/stash)")
+
+	// The runtime's own worktree must show the popped content.
+	data, err := os.ReadFile(filepath.Join(wt, "f.txt"))
+	if err != nil {
+		t.Fatalf("read f.txt after stash pop: %v", err)
+	}
+	if string(data) != "stashed\n" {
+		t.Errorf("f.txt after popping the packed stash = %q, want %q", data, "stashed\n")
+	}
+	if out, err := exec.Command("git", "-C", wt, "stash", "list").CombinedOutput(); err != nil {
+		t.Fatalf("git -C %s stash list: %v\n%s", wt, err, out)
+	} else if strings.TrimSpace(string(out)) != "" {
+		t.Errorf("git stash list after pop = %q, want empty (the packed stash entry must be gone)", out)
+	}
+}
