@@ -110,6 +110,79 @@ func TestRun_RefusesASymlinkSwappedWorktree(t *testing.T) {
 	}
 }
 
+// TestRun_RefusesASymlinkSwappedWorktreeItself is
+// TestRun_RefusesASymlinkSwappedWorktree's own missing case (finding on
+// the interrupted work): that test only ever swaps wt/.git for a
+// symlink, never wt itself. Run calls assertRealDir on BOTH
+// repo.WorkTree and repo.WorkTree/.git, but os.Lstat only refuses a
+// symlink at the FINAL path component of whatever it is given -- so
+// Lstat(wt/.git), on its own, silently FOLLOWS a symlinked wt as an
+// intermediate component and lands on the OTHER repo's real .git
+// directory, passing that check cleanly. Only the separate
+// assertRealDir(repo.WorkTree) call catches a swapped wt itself. Without
+// this test, deleting that one call left the sibling test fully green
+// (verified directly, see this package's own review notes) -- this test
+// is the one that actually pins it.
+func TestRun_RefusesASymlinkSwappedWorktreeItself(t *testing.T) {
+	base := t.TempDir()
+	workspaceDir := filepath.Join(base, "workspace")
+	wt := filepath.Join(workspaceDir, "repo1")
+	initRunTestRepo(t, wt)
+
+	// A second, entirely unrelated repository -- the "other repo" the
+	// swapped wt symlink will point at directly (not just its .git).
+	otherRepo := filepath.Join(base, "other-repo")
+	initRunTestRepo(t, otherRepo)
+
+	gitDirRoot := filepath.Join(base, "gitdirs")
+	if err := gitdir.EnsureRoot(gitDirRoot); err != nil {
+		t.Fatalf("gitdir.EnsureRoot: %v", err)
+	}
+	layout := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}
+	repo := layout.Repo("repo1")
+	sup := supervisor.New()
+	ctx := context.Background()
+
+	if err := gitdir.Seed(ctx, sup, repo, "https://example.invalid/repo1.git", nil, 10*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("gitdir.Seed: %v", err)
+	}
+
+	// A benign Run call must succeed before the swap -- proves the guard
+	// isn't simply refusing everything.
+	spec := supervisor.Spec{Path: "git", Args: githarden.Args(repo, "status", "--porcelain")}
+	if _, err := gitdir.Run(ctx, sup, repo, nil, spec, 10*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("Run() before swap: unexpected error: %v", err)
+	}
+
+	// The swap: replace wt ITSELF (not just wt/.git) with a symlink to
+	// the OTHER repo's own worktree directory. wt/.git therefore resolves
+	// -- via the symlinked wt as an intermediate path component -- to a
+	// perfectly real directory (the other repo's own .git), which the
+	// wt/.git-only guard would pass cleanly.
+	if err := os.RemoveAll(wt); err != nil {
+		t.Fatalf("remove wt: %v", err)
+	}
+	if err := os.Symlink(otherRepo, wt); err != nil {
+		t.Fatalf("symlink wt -> other repo: %v", err)
+	}
+
+	// A marker file in the OTHER repo's worktree that must never be
+	// touched by anything this call spawns.
+	marker := filepath.Join(otherRepo, "MUST-NOT-BE-TOUCHED")
+	if err := os.WriteFile(marker, []byte("untouched\n"), 0o644); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	_, err := gitdir.Run(ctx, sup, repo, nil, spec, 10*time.Second, 5*time.Second)
+	if err == nil {
+		t.Fatal("Run() after wt itself was swapped for a symlink: error = nil, want a refusal -- the wt-swap guard did not fire")
+	}
+
+	if data, readErr := os.ReadFile(marker); readErr != nil || string(data) != "untouched\n" {
+		t.Errorf("marker in the OTHER repo was modified (readErr=%v, data=%q) -- Run spawned something against the swapped target instead of refusing outright", readErr, data)
+	}
+}
+
 // TestRun_AllowsAnOrdinaryRealWorktree is the negative control for the
 // test above: an ordinary, never-swapped worktree must keep working
 // exactly as before -- the guard must not be so broad it refuses
