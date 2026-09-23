@@ -118,3 +118,13 @@ func (s *AutomationRunStore) ListOrphanedStarting(ctx context.Context, cutoff pg
 func (s *AutomationRunStore) ListOrphanedRunning(ctx context.Context, cutoff pgtype.Timestamptz, limit int32) ([]sqlcgen.AutomationRun, error) {
 	return s.q.ListOrphanedRunningRuns(ctx, sqlcgen.ListOrphanedRunningRunsParams{RunningAt: cutoff, Limit: limit})
 }
+
+// EnvVarsForSession returns the raw env_vars JSONB of the automation
+// sessionID's own automation_runs row (if any) belongs to -- §8 item 4's
+// own "automation env vars reach the process, not just the prompt".
+// pgx.ErrNoRows means sessionID is not referenced by any automation_runs
+// row at all (the overwhelming common case: an ordinary web/Slack/
+// Linear/GitHub-created session).
+func (s *AutomationRunStore) EnvVarsForSession(ctx context.Context, sessionID pgtype.UUID) ([]byte, error) {
+	return s.q.GetAutomationEnvVarsForSession(ctx, sessionID)
+}

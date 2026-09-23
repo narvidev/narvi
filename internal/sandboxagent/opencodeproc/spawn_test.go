@@ -353,6 +353,147 @@ func TestSpawn_ProviderCredentialEnvWinsOverSandboxSecretEnv(t *testing.T) {
 	}
 }
 
+// TestSpawn_AutomationEnvVarAppendedViaSandboxSecretEnv proves §8 item
+// 4's own ("automation env vars reach the process, not just the prompt")
+// threading mechanism: an automation env var, folded by the caller
+// (cmd/sandbox-agent's own run()) into the SAME sandboxSecretEnv
+// parameter sandbox_secrets already use (no new opencodeproc.Spawn
+// parameter -- a third source on the existing path, not a new mechanism),
+// actually reaches the spawned opencode process's own environment.
+// Mirrors TestSpawn_SandboxSecretEnvAppended's own fake-script-probe
+// technique exactly -- from Spawn's own point of view this parameter's
+// entries are indistinguishable by source, which is exactly the point.
+func TestSpawn_AutomationEnvVarAppendedViaSandboxSecretEnv(t *testing.T) {
+	// Not t.Parallel(): t.Setenv forbids combining the two.
+	binDir := t.TempDir()
+	probeFile := filepath.Join(t.TempDir(), "probe")
+
+	script := "#!/bin/sh\n" +
+		`printf '%s\n' "${TARGET_ENV:-ABSENT}" > "$PROBE_FILE"` + "\n" +
+		"exit 1\n"
+	if err := os.WriteFile(filepath.Join(binDir, "opencode"), []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	t.Setenv("PATH", binDir)
+	t.Setenv("PROBE_FILE", probeFile)
+	// Proves this parameter is genuinely threaded, not read from ambient
+	// process env: TARGET_ENV is deliberately left UNSET on the test
+	// process itself.
+
+	sup := supervisor.New()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Simulates exactly what main.go's own run() produces: automation env
+	// vars prepended to the FRONT of sandboxSecretEnv (cmd/sandbox-agent's
+	// own automationEnvVarSpawnEnv output, folded in ahead of
+	// sandboxSecretSpawnEnv's own).
+	sandboxSecretEnv := []string{"TARGET_ENV=staging"}
+	_, err := opencodeproc.Spawn(ctx, sup, t.TempDir(), nil, sandboxSecretEnv, nil, 5*time.Second, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("Spawn() error = nil, want an error (the fake opencode script exits 1 before ever becoming healthy)")
+	}
+
+	got, readErr := os.ReadFile(probeFile)
+	if readErr != nil {
+		t.Fatalf("read probe file: %v", readErr)
+	}
+	if got := strings.TrimSpace(string(got)); got != "staging" {
+		t.Errorf("TARGET_ENV as seen by the spawned process = %q, want %q (threaded via sandboxSecretEnv, exactly like a sandbox secret)", got, "staging")
+	}
+}
+
+// TestSpawn_SandboxSecretEnvWinsOverAutomationEnvVar proves the FIRST
+// recorded collision pairing (spawn.go's own doc comment, "The recorded
+// three-way order, and why"): when an automation env var and a sandbox
+// secret share a name, main.go's own append order (automation env vars
+// prepended to the FRONT of sandboxSecretEnv, sandbox secrets appended
+// AFTER them onto the SAME slice) means the sandbox secret -- "a secret
+// the operator configured" -- is what the spawned process actually sees,
+// never the automation's own "plain config a maintainer typed" value.
+func TestSpawn_SandboxSecretEnvWinsOverAutomationEnvVar(t *testing.T) {
+	// Not t.Parallel(): t.Setenv forbids combining the two.
+	binDir := t.TempDir()
+	probeFile := filepath.Join(t.TempDir(), "probe")
+
+	script := "#!/bin/sh\n" +
+		`printf '%s\n' "${SHARED_NAME:-ABSENT}" > "$PROBE_FILE"` + "\n" +
+		"exit 1\n"
+	if err := os.WriteFile(filepath.Join(binDir, "opencode"), []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	t.Setenv("PATH", binDir)
+	t.Setenv("PROBE_FILE", probeFile)
+
+	sup := supervisor.New()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Exactly main.go's own construction order: automation env var first
+	// (least-trusted), sandbox secret appended second (more-trusted).
+	sandboxSecretEnv := []string{"SHARED_NAME=from-automation-env-var", "SHARED_NAME=from-sandbox-secret"}
+	_, err := opencodeproc.Spawn(ctx, sup, t.TempDir(), nil, sandboxSecretEnv, nil, 5*time.Second, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("Spawn() error = nil, want an error (the fake opencode script exits 1 before ever becoming healthy)")
+	}
+
+	got, readErr := os.ReadFile(probeFile)
+	if readErr != nil {
+		t.Fatalf("read probe file: %v", readErr)
+	}
+	if got := strings.TrimSpace(string(got)); got != "from-sandbox-secret" {
+		t.Errorf("SHARED_NAME as seen by the spawned process = %q, want %q (sandbox secret appended after automation env var, so it wins)", got, "from-sandbox-secret")
+	}
+}
+
+// TestSpawn_ProviderCredentialEnvWinsOverAutomationEnvVar proves the
+// SECOND recorded collision pairing: an automation env var loses to a
+// provider credential too, even though this specific collision is
+// structurally unreachable in production (internal/domain/automation.
+// ValidateEnvVars already rejects, at automation-creation time, any name
+// providercredential.AllEnvVarNames owns -- reusing
+// sandboxsecret.ValidateNotReserved, the SAME disjoint-name rule
+// TestSpawn_ProviderCredentialEnvWinsOverSandboxSecretEnv's own doc
+// comment already notes for sandbox secrets). Pinned as the correct
+// observable behavior regardless, mirroring that test's own reasoning
+// exactly.
+func TestSpawn_ProviderCredentialEnvWinsOverAutomationEnvVar(t *testing.T) {
+	// Not t.Parallel(): t.Setenv forbids combining the two.
+	binDir := t.TempDir()
+	probeFile := filepath.Join(t.TempDir(), "probe")
+
+	script := "#!/bin/sh\n" +
+		`printf '%s\n' "${SHARED_NAME:-ABSENT}" > "$PROBE_FILE"` + "\n" +
+		"exit 1\n"
+	if err := os.WriteFile(filepath.Join(binDir, "opencode"), []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	t.Setenv("PATH", binDir)
+	t.Setenv("PROBE_FILE", probeFile)
+
+	sup := supervisor.New()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	providerCredentialEnv := []string{"SHARED_NAME=from-provider-credential"}
+	sandboxSecretEnv := []string{"SHARED_NAME=from-automation-env-var"}
+	_, err := opencodeproc.Spawn(ctx, sup, t.TempDir(), providerCredentialEnv, sandboxSecretEnv, nil, 5*time.Second, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("Spawn() error = nil, want an error (the fake opencode script exits 1 before ever becoming healthy)")
+	}
+
+	got, readErr := os.ReadFile(probeFile)
+	if readErr != nil {
+		t.Fatalf("read probe file: %v", readErr)
+	}
+	if got := strings.TrimSpace(string(got)); got != "from-provider-credential" {
+		t.Errorf("SHARED_NAME as seen by the spawned process = %q, want %q (providerCredentialEnv appended last, wins over an automation env var too)", got, "from-provider-credential")
+	}
+}
+
 // A self-uid Credential's harmlessness is proven one layer down, by
 // supervisor's own TestSpawn_CredentialSelfUID_Succeeds, and it is proven
 // better there: that test spawns /bin/sh rather than the real opencode

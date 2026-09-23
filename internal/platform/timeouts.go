@@ -2679,6 +2679,42 @@ type Timeouts struct {
 	OpenCodeConfigFetchRetryBaseDelay time.Duration
 	OpenCodeConfigFetchRetryMaxDelay  time.Duration
 
+	// AutomationEnvVarFetchTimeout (§8 item 4, "automation env vars
+	// reach the process, not just the prompt") bounds a SINGLE ATTEMPT at
+	// CP's /sessions/{id}/automation-env-vars delivery endpoint
+	// (internal/sandboxagent/credentials.CPClient.FetchAutomationEnvVars),
+	// tried up to AutomationEnvVarFetchMaxAttempts times (below) at boot,
+	// alongside SandboxSecretFetchTimeout/OpenCodeConfigFetchTimeout's own
+	// calls, before `opencode serve` spawns (cmd/sandbox-agent's own
+	// fetchAutomationEnvVars, automationenvvars.go). Not specified in the
+	// plan; chosen the SAME 10s as every other boot-time delivery-endpoint
+	// fetch in this file -- this call resolves at most one automation_runs
+	// row plus its parent automations row, comparably lightweight to
+	// SandboxSecretFetchTimeout's own "handful of name-keyed rows"
+	// reasoning. Deliberately its own field, not a reuse of
+	// SandboxSecretFetchTimeout -- the two calls hit different CP endpoints
+	// resolving different tables (this codebase's own established
+	// "separate field per delivery endpoint" precedent, see that field's
+	// own doc comment for the identical choice against
+	// ProviderCredentialFetchTimeout).
+	AutomationEnvVarFetchTimeout time.Duration
+
+	// AutomationEnvVarFetchMaxAttempts/AutomationEnvVarFetchRetryBaseDelay/
+	// AutomationEnvVarFetchRetryMaxDelay mirror
+	// SandboxSecretFetchMaxAttempts/SandboxSecretFetchRetryBaseDelay/
+	// SandboxSecretFetchRetryMaxDelay's own identical shape and identical
+	// values (3 attempts / 500ms base / 2s max), for
+	// cmd/sandbox-agent/automationenvvars.go's own fetchAutomationEnvVars
+	// call to CPClient.FetchAutomationEnvVars -- see those fields' own doc
+	// comment for the full retry-classification and worst-case-budget
+	// reasoning (this fetch's own worst case, 3*10s+2*2s=34s, stacks onto
+	// that same running total of sequential boot-time delivery fetches,
+	// still comfortably inside the 240s FirstConnectBudget ceiling
+	// alongside every other boot-time activity).
+	AutomationEnvVarFetchMaxAttempts    int
+	AutomationEnvVarFetchRetryBaseDelay time.Duration
+	AutomationEnvVarFetchRetryMaxDelay  time.Duration
+
 	// CloudIdentityTokenLifetime (§27.3) is how long a CP-minted
 	// cloud-identity OIDC token (POST /sessions/{id}/cloud-identity-token)
 	// remains valid before its own `exp` claim expires. §27.3 gives this
@@ -3181,6 +3217,11 @@ func DefaultTimeouts() Timeouts {
 		OpenCodeConfigFetchMaxAttempts:    3,                      // adversarial-review MEDIUM fix; mirrors SandboxSecretFetchMaxAttempts
 		OpenCodeConfigFetchRetryBaseDelay: 500 * time.Millisecond, // adversarial-review MEDIUM fix; mirrors SandboxSecretFetchRetryBaseDelay
 		OpenCodeConfigFetchRetryMaxDelay:  2 * time.Second,        // adversarial-review MEDIUM fix; mirrors SandboxSecretFetchRetryMaxDelay
+
+		AutomationEnvVarFetchTimeout:        10 * time.Second,       // §8 item 4; not specified, chosen, matches SandboxSecretFetchTimeout's own reasoning
+		AutomationEnvVarFetchMaxAttempts:    3,                      // mirrors SandboxSecretFetchMaxAttempts
+		AutomationEnvVarFetchRetryBaseDelay: 500 * time.Millisecond, // mirrors SandboxSecretFetchRetryBaseDelay
+		AutomationEnvVarFetchRetryMaxDelay:  2 * time.Second,        // mirrors SandboxSecretFetchRetryMaxDelay
 
 		CloudIdentityTokenLifetime:           10 * time.Minute, // §27.3, explicit ("exp ≈ 10 minutes")
 		CloudIdentitySigningKeyOverlapWindow: 15 * time.Minute, // §27.3; not specified numerically beyond ">= max token lifetime", chosen with margin -- see field doc comment

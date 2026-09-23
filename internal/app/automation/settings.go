@@ -116,24 +116,18 @@ const envVarPreamblePrefix = "Environment variables for this automation run:"
 // labeled "Environment variables for this automation run" block when the
 // automation carries any env_vars.
 //
-// This is NOT the same thing as injecting env_vars into the sandboxed
-// agent PROCESS's own OS environment (cmd.Env) -- no generic mechanism for
-// that exists anywhere in this codebase yet for ANY per-automation/
-// per-session value (§25.1 is
-// explicit that even provider API keys, the simplest possible case, are
-// not wired into cmd.Env today: "no ANTHROPIC_API_KEY/OPENAI_API_KEY/
-// Google-equivalent is wired anywhere"). Building a SEPARATE, automation-
-// specific env-injection mechanism ahead of §25.1's own generic one would
-// risk exactly the same conflict-or-be-thrown-away outcome this package's
-// own doc.go already names for per-automation secrets. Surfacing env_vars
-// into the dispatched prompt's own text is the honest, working alternative
-// available today: the agent genuinely sees and can act on these values
-// (a feature-flag name, a target-environment label -- the non-sensitive
-// config this field exists for), with no change to the sandbox spawn path
-// at all. Once §25.1 lands a generic cmd.Env injection mechanism, a
-// small follow-up can thread automations.env_vars through THAT mechanism
-// too, alongside the prompt preamble kept here (the two are not mutually
-// exclusive).
+// This is DELIBERATELY NOT the only place env_vars reach this run:
+// automations.env_vars is ALSO threaded into the sandboxed agent
+// PROCESS's own OS environment (cmd.Env) now, via
+// cmd/sandbox-agent's own fetchAutomationEnvVars/automationEnvVarSpawnEnv
+// (automationenvvars.go), folded into the SAME opencodeproc.Spawn
+// sandboxSecretEnv parameter provider credentials (§25.1/§25.3) and
+// sandbox secrets (§27.1) already use -- see that parameter's own doc
+// comment (spawn.go) for the full three-way resolution order and why.
+// The two are deliberately NOT exclusive: an agent that must KNOW a
+// flag's name (this function's own preamble text) and a shell that must
+// RESOLVE it ($VAR/os.Getenv, the cmd.Env path) are different needs, and
+// this function is kept exactly as-is for the former.
 func buildRunPrompt(logger *slog.Logger, automationRow sqlcgen.Automation) *string {
 	prompt := ""
 	if automationRow.Prompt != nil {

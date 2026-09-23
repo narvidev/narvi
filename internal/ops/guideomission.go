@@ -105,6 +105,10 @@ var RouteGuideExemptions = []RouteGuideExemption{
 		Reason: "Sandbox-agent bearer route: the in-sandbox OpenCode runtime fetches its resolved config here at boot (httpapi/opencodeconfigdelivery.go), never a browser -- the human-facing CRUD over the same config is documented in web.md.",
 	},
 	{
+		Route:  "POST /sessions/{sessionID}/automation-env-vars",
+		Reason: "Sandbox-agent bearer route: the in-sandbox agent fetches this automation's own configured env vars here at boot (httpapi/automationenvvarsdelivery.go), never a browser -- the human-facing CRUD over the same env vars is documented in web.md's own Automations section.",
+	},
+	{
 		Route:  "POST /sessions/{sessionID}/cloud-identity-token",
 		Reason: "Sandbox-agent bearer route: the in-sandbox agent mints a short-lived cloud-identity OIDC token here (httpapi/cloudidentitytoken.go), never a browser.",
 	},

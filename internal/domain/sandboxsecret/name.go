@@ -122,18 +122,148 @@ var (
 	// identical "one owning mechanism per env-var name" reason
 	// ErrNameReservedCloudIdentity's own doc comment gives.
 	ErrNameReservedClusterBinding = errors.New("sandboxsecret: name is already owned by kubeconfig injection")
+	// ErrNameReservedProcessHijack means name is one of
+	// processHijackReservedNames or starts with gitConfigReservedPrefix --
+	// see that slice's own doc comment for the full per-name "why". A
+	// different HAZARD CLASS than every reservation above: those protect
+	// one specific injection MECHANISM from being shadowed; this protects
+	// every ROOT-UID CONSUMER of a resolved sandbox_secrets/automation
+	// env var row (a repo's own setup.sh/start.sh, dockerd) from having
+	// its own binary/library/startup-file resolution redirected by a
+	// value that was never meant to be anything more than an ordinary
+	// application-level env var.
+	ErrNameReservedProcessHijack = errors.New("sandboxsecret: name is reserved -- it can redirect which binary, library, or startup file a spawned root-uid process runs, not merely configure that process's own behavior")
 )
 
+// processHijackReservedNames / gitConfigReservedPrefix ("process-hijack
+// surface", adversarial-review LOW-severity fix, §8 item 4 review round):
+// exact names (plus one prefix) that let a value threaded through
+// cmd.Env redirect which BINARY, LIBRARY, or STARTUP FILE a spawned
+// process actually runs, rather than merely configuring that process's
+// own behavior -- a fundamentally different hazard class than every
+// OTHER name this file reserves (those protect one specific injection
+// MECHANISM from being shadowed by a same-named row; these protect every
+// CONSUMER of a resolved row from having its own process substrate
+// hijacked).
+//
+// Reserved HERE, at the one shared "one owning mechanism per env-var
+// name" choke point both cmd/sandbox-agent/sandboxsecrets.go's own
+// fetchSandboxSecrets (general sandbox_secrets) and internal/domain/
+// automation.ValidateEnvVarShapeAndReservation (automation env vars,
+// reused by both CreateAutomation's own write-time check AND cmd/
+// sandbox-agent/automationenvvars.go's own injection-boundary
+// re-validation) already call -- rather than in only one of the two --
+// because BOTH mechanisms fold into the EXACT SAME sandboxSecretEnv
+// slice (cmd/sandbox-agent/main.go's own automationAndSandboxSecretEnv)
+// that reaches a repo's own setup.sh/start.sh hooks (internal/
+// sandboxagent/boot/hooks.go's own runHook) and dockerd (internal/
+// sandboxagent/boot/docker.go's own RunDocker) at SANDBOX-AGENT'S OWN
+// uid -- root in production, no credential drop at all, unlike
+// opencodeproc.Spawn's own single call site, which both env-filters
+// (supervisor.EnvWithout) and uid-drops (runtimeCredential) -- see
+// internal/domain/automation/envvar.go's own top doc comment for the
+// full "where these values actually go" audit this reservation responds
+// to. Reserving here closes the hazard for BOTH mechanisms at once, for
+// every FUTURE fetch, with one edit:
+//
+//   - PATH: a hook/dockerd process's own bare-name exec.Command
+//     lookups (`npm`, `git`, `curl`, ...) resolve against ITS OWN
+//     cmd.Env PATH at the point IT execs something, not sandbox-agent's
+//     (contrast sandbox-agent's OWN exec.Command call that spawns the
+//     hook in the first place, which resolves against the CALLING
+//     process's env and is therefore untouched by this -- see
+//     opencodeproc.Spawn's own doc comment for that exact distinction).
+//     A poisoned PATH here silently substitutes a trojan binary for the
+//     real one, running as root.
+//   - HOME: redirects every dotfile a root-uid hook/dockerd process
+//     reads at startup (~/.bashrc, ~/.gitconfig, ~/.npmrc, ~/.docker/
+//     config.json, an SSH client config, ...) to an attacker-chosen
+//     location.
+//   - LD_PRELOAD / LD_LIBRARY_PATH / LD_AUDIT: ld.so(8) honors all
+//     three at dynamic-link time -- LD_PRELOAD and LD_AUDIT each inject
+//     an arbitrary shared object into every dynamically-linked binary a
+//     hook/dockerd process (or anything it spawns) loads (LD_AUDIT
+//     identically to LD_PRELOAD, via the runtime linker's own auditing
+//     interface, not merely a debug knob), LD_LIBRARY_PATH redirects
+//     where the loader searches for those objects in the first place.
+//   - BASH_ENV: bash sources the file this names before running ANY
+//     non-interactive script -- exactly runHook's own invocation shape
+//     (a `#!/bin/bash` setup.sh) -- arbitrary code execution as root,
+//     before the script's own first line ever runs.
+//   - NODE_OPTIONS: Node.js reads this at every invocation and honors
+//     "--require <path>" inside it -- arbitrary code execution at
+//     process start, the identical hazard class as BASH_ENV for a
+//     Node-based hook/service.
+//   - ENV: POSIX sh sources the file this names, but ONLY for an
+//     INTERACTIVE shell -- runHook's own invocation (a `#!/bin/sh`
+//     setup.sh, spawned directly, no `-i`, no controlling TTY) never
+//     triggers it today. Reserved anyway, defensively: this package has
+//     no way to guarantee every current and future consumer of a
+//     resolved sandbox_secrets/automation row stays non-interactive,
+//     and the cost of reserving a name no legitimate config would need
+//     is near zero.
+//   - PYTHONSTARTUP: CPython's identical INTERACTIVE-only hazard --
+//     also does not fire in runHook's non-interactive invocation today,
+//     reserved for the same defensive reason as ENV immediately above.
+//   - GIT_SSH_COMMAND / GIT_SSH: git substitutes this for its own ssh
+//     invocation outright -- arbitrary command execution for any hook/
+//     dockerd step that touches a git-over-ssh remote.
+//   - GIT_EXEC_PATH: git execs "$GIT_EXEC_PATH/git-<subcommand>" to
+//     resolve its OWN built-in subcommands (git-commit, git-push, ...)
+//     -- a poisoned value substitutes a trojan binary for any git
+//     subcommand a hook/dockerd step invokes, the identical hazard
+//     class as PATH but specific to git's own resolution mechanism,
+//     which does not go through PATH first.
+//   - GIT_ALLOW_PROTOCOL: a NAMED cross-PR hazard, not a general
+//     process-hijack one -- a separate, concurrent Step hardens git in
+//     this same sandbox by setting this var to restrict which
+//     transports git honors; an automation env var or sandbox secret
+//     that happened to share the name could silently override or
+//     shadow that restriction depending on append order. Reserved here
+//     so the two mechanisms can never collide, regardless of which
+//     lands first.
+//
+// This list is best-effort, not exhaustive: it is a DENYLIST of names
+// known today to redirect which binary/library/startup-file a root-uid
+// consumer runs, not a proof that no other name can. A future env var
+// this codebase has not yet considered, honored by some other root-uid
+// consumer added later, can still hijack that consumer's process
+// substrate without ever appearing here -- adding a name here closes a
+// known hole, it does not certify the absence of unknown ones (the same
+// lesson a separate Step's own enumerated-protocol denylist relearned
+// when an unlisted transport helper defeated it). A strict allowlist was
+// considered and rejected: automation env vars legitimately carry
+// arbitrary application-level config names chosen by whoever authors the
+// automation, so an allowlist narrow enough to be safe would also reject
+// ordinary, non-hazardous config.
+//
+// gitConfigReservedPrefix ("GIT_CONFIG_") is a PREFIX, not an
+// enumerated {GIT_CONFIG_COUNT, GIT_CONFIG_KEY_0, GIT_CONFIG_VALUE_0,
+// ...} list, mirroring narviReservedPrefix's/OpenCodeReservedPrefix's
+// own "reject the whole mechanism, not today's specific variable names"
+// reasoning: git's own env-based config-override mechanism
+// (GIT_CONFIG_COUNT declares how many GIT_CONFIG_KEY_<n>/GIT_CONFIG_
+// VALUE_<n> pairs follow) can set core.sshCommand, core.fsmonitor, or
+// any other git config key to the same arbitrary-execution effect as
+// GIT_SSH_COMMAND, one level of indirection removed -- an enumerated
+// pair would miss GIT_CONFIG_KEY_1/GIT_CONFIG_VALUE_1 the moment a
+// caller declared a second override.
+var processHijackReservedNames = []string{
+	"PATH", "HOME",
+	"LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+	"BASH_ENV", "ENV",
+	"NODE_OPTIONS",
+	"PYTHONSTARTUP",
+	"GIT_SSH_COMMAND", "GIT_SSH", "GIT_EXEC_PATH",
+	"GIT_ALLOW_PROTOCOL",
+}
+
+const gitConfigReservedPrefix = "GIT_CONFIG_"
+
 // ValidateName reports whether name is an acceptable sandbox_secrets env-
-// var name, per §27.1's own fail-closed rule: POSIX env-var shape, not in
-// the reserved NARVI_* namespace, not in the reserved OPENCODE_* namespace
-// (adversarial-review CRITICAL fix -- see OpenCodeReservedPrefix's own doc
-// comment), not one of the names providercredential.EnvVarNames already
-// owns, not one of §27.4's own §27.3 cloud-identity names
-// (cloudidentity.ReservedEnvVarNames), and not §27.4's own KUBECONFIG
-// (clusterbinding.ReservedEnvVarNames) -- the SAME "one owning mechanism
-// per env-var name" rule extended to this Step's own two injected
-// surfaces. Returns nil when name is acceptable. Pure -- no I/O, no
+// var name, per §27.1's own fail-closed rule: POSIX env-var shape, plus
+// ValidateNotReserved's own "one owning mechanism per env-var name" rule
+// (below). Returns nil when name is acceptable. Pure -- no I/O, no
 // time.Now(), no randomness (CLAUDE.md §11) -- this only inspects name
 // itself; it says nothing about whether name already has a row at some
 // OTHER (scope, scopeTargetID) pair (a Postgres UNIQUE-index concern, not
@@ -148,6 +278,35 @@ func ValidateName(name string) error {
 	if !posixEnvVarNamePattern.MatchString(name) {
 		return fmt.Errorf("%w: %q", ErrNameShape, name)
 	}
+	return ValidateNotReserved(name)
+}
+
+// ValidateNotReserved reports whether name collides with a namespace or
+// exact name another injection mechanism already owns: the reserved
+// NARVI_* namespace, the reserved OPENCODE_* namespace (adversarial-review
+// CRITICAL fix -- see OpenCodeReservedPrefix's own doc comment), one of
+// the names providercredential.EnvVarNames already owns, one of §27.4's
+// own §27.3 cloud-identity names (cloudidentity.ReservedEnvVarNames), or
+// §27.4's own KUBECONFIG (clusterbinding.ReservedEnvVarNames) -- the "one
+// owning mechanism per env-var name" rule §27.1 established for this
+// package's own sandbox_secrets rows.
+//
+// Factored out of ValidateName (which still runs this AND its own POSIX-
+// shape check together, unchanged) specifically so automation.
+// ValidateEnvVars (§8 item 4's own "automation env vars reach the
+// process, not just the prompt") can reuse this EXACT reservation logic
+// without also inheriting ValidateName's own stricter uppercase-only shape
+// rule -- automations.env_vars has never required that shape (isValidEnvVarName,
+// internal/domain/automation/envvar.go, accepts lowercase, matching every
+// automation env var saved before this reuse existed), and reservation
+// collision-safety does not depend on it: every reserved name/prefix this
+// function checks is itself always uppercase, so a lowercase candidate can
+// never collide with one regardless (env var names are compared
+// case-sensitively, both here and in the process environment they end up
+// in). One shared definition of "already owned by another mechanism" for
+// both callers, never two independently maintained copies that could
+// drift apart.
+func ValidateNotReserved(name string) error {
 	if strings.HasPrefix(name, narviReservedPrefix) {
 		return fmt.Errorf("%w: %q", ErrNameReservedNarviNamespace, name)
 	}
@@ -167,6 +326,14 @@ func ValidateName(name string) error {
 	for _, reserved := range clusterbinding.ReservedEnvVarNames() {
 		if name == reserved {
 			return fmt.Errorf("%w: %q", ErrNameReservedClusterBinding, name)
+		}
+	}
+	if strings.HasPrefix(name, gitConfigReservedPrefix) {
+		return fmt.Errorf("%w: %q", ErrNameReservedProcessHijack, name)
+	}
+	for _, reserved := range processHijackReservedNames {
+		if name == reserved {
+			return fmt.Errorf("%w: %q", ErrNameReservedProcessHijack, name)
 		}
 	}
 	return nil
