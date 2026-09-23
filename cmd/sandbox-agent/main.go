@@ -2212,8 +2212,22 @@ type warmBootSeedWarning struct {
 // excluded and CollectFingerprint still spawned git through every stale,
 // un-revalidated agent git-dir on disk. With the positive allowlist, a
 // fatal primary-repo Seed failure now yields an EMPTY repo_shas (seededRepos
-// is empty at that point -- nothing had been (re-)seeded yet), and no git
-// is spawned against any repo this boot did not seed, period.
+// is empty at that point -- nothing had been (re-)seeded yet), and THIS
+// call spawns no git against a repo outside seededRepos.
+//
+// This allowlist only covers this one call, though -- it says nothing
+// about the LATER boot.CollectFingerprint calls in this same boot (the
+// post-opencode-spawn call in run(), and the post-clone call in
+// runBootSequence), both of which pass allowed=nil and so rely on
+// DiscoverRepoSHAs' plain os.Stat(repo.GitDir) gate alone. That gate is
+// only safe because gitdir.Seed itself now removes repo.GitDir as its
+// very first action, before any guard that could refuse the call (see
+// Seed's own doc comment in internal/sandboxagent/gitdir/seed.go): a
+// refused Seed -- this boot, for whatever reason -- always leaves
+// repo.GitDir absent, so os.Stat fails and every later discovery call,
+// allowlisted or not, skips that repo. It is that structural guarantee,
+// not this function's own allowlist alone, that keeps a stale git-dir
+// from a PRIOR boot from ever being discovered against later in this one.
 //
 // Factored out of run() specifically so this ordering is unit-testable
 // (capturing slog output) without booting the whole process -- see

@@ -66,11 +66,35 @@ func Seed(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, 
 		return fmt.Errorf("gitdir: seed: invalid repo url: %w", err)
 	}
 
-	// (0) wt and wt/.git must both be real directories, never symlinks --
+	// (0) Remove any agent git-dir already on repo.GitDir BEFORE any guard
+	// below runs, so that a REFUSED Seed (unsupported layout, symlinked
+	// worktree/.git) never leaves a previous boot's agent git-dir behind.
+	// This is the structural fix for the finding that DiscoverRepoSHAs'
+	// (boot/fingerprint.go) os.Stat(repo.GitDir) gate -- the thing every
+	// caller of boot.CollectFingerprint relies on to skip a repo this exact
+	// call did not vouch for -- cannot distinguish "never seeded" from
+	// "seeded on an earlier boot, refused on this one": on a warm boot
+	// where a repo's Seed is refused, its stale agent git-dir was still on
+	// disk from the PRIOR boot, so the gate found it and let git run
+	// against a SHA this boot never validated. repo.GitDir lives under a
+	// root gitdir.EnsureRoot has already validated (root-owned, 0700, not
+	// a symlink) and is fully derived state this package owns end to end,
+	// so removing it unconditionally, before even looking at repo.WorkTree,
+	// is always safe -- there is nothing under it a later guard could need
+	// to inspect first. If this fails, Seed returns the error and the repo
+	// is treated as failed, exactly as before.
+	if err := os.RemoveAll(repo.GitDir); err != nil {
+		return fmt.Errorf("gitdir: seed: remove existing agent git-dir %s: %w", repo.GitDir, err)
+	}
+
+	// (0b) wt and wt/.git must both be real directories, never symlinks --
 	// the SAME Lstat guard Run itself re-checks on every later spawn (see
 	// run.go's own correction), checked here too so a Seed call is never
 	// the one place this guard is skipped. Also refuse an unsupported
-	// on-disk .git layout before touching anything.
+	// on-disk .git layout before touching anything else -- the agent
+	// git-dir this repo may have had is already gone (above), so a refusal
+	// past this point leaves nothing for a later CollectFingerprint call to
+	// find.
 	if err := assertRealDir(repo.WorkTree); err != nil {
 		return fmt.Errorf("gitdir: seed: %w", err)
 	}
@@ -82,9 +106,6 @@ func Seed(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, 
 		if _, statErr := os.Lstat(filepath.Join(runtimeGitDir, entry)); statErr == nil {
 			return fmt.Errorf("gitdir: seed: %s uses an unsupported layout (%s present) -- this package's own symlink shape has not been measured against it", runtimeGitDir, entry)
 		}
-	}
-	if err := os.RemoveAll(repo.GitDir); err != nil {
-		return fmt.Errorf("gitdir: seed: remove existing agent git-dir %s: %w", repo.GitDir, err)
 	}
 
 	// (1) git init -q --bare --template= <agent>. --template= (empty)
