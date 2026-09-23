@@ -516,3 +516,179 @@ func TestSharedFileSymlinks_SurviveRealGitMaintenanceOperations(t *testing.T) {
 		t.Errorf("git stash list after pop = %q, want empty (the packed stash entry must be gone)", out)
 	}
 }
+
+// TestSparseCheckoutMirror_BothDirectionsAndSeedImport is a queued pin
+// (from the implementer's own admission) of the sparse-checkout mirror in
+// BOTH directions, plus Seed's own reverse import, in one end-to-end
+// test:
+//
+//  1. Agent-side `sparse-checkout set` -> gitdir.MirrorSparseCheckout ->
+//     the RUNTIME's own config says sparse, and the runtime's own NEXT
+//     checkout (an ordinary branch switch, its own unprivileged action)
+//     keeps the tree sparse -- it must not re-materialize an
+//     out-of-scope path.
+//  2. Agent-side `sparse-checkout disable` -> gitdir.MirrorSparseCheckout
+//     -> the RUNTIME's own config says NOT sparse, and the runtime's
+//     NEXT checkout re-materializes the full tree (does not stay
+//     sparse).
+//  3. gitdir.Seed, called again for a repo the RUNTIME has since left
+//     sparse (core.sparseCheckout=true in the runtime's own config),
+//     imports that state into the FRESHLY rebuilt agent config --
+//     importSparseCheckoutConfig's own reverse-direction counterpart to
+//     MirrorSparseCheckout, exercised here for real rather than assumed.
+func TestSparseCheckoutMirror_BothDirectionsAndSeedImport(t *testing.T) {
+	base := t.TempDir()
+	workspaceDir := filepath.Join(base, "workspace")
+	wt := filepath.Join(workspaceDir, "repo1")
+	initRunTestRepo(t, wt)
+
+	for _, dir := range []string{"apps/web", "apps/api", "contracts/api"} {
+		if err := os.MkdirAll(filepath.Join(wt, dir), 0o755); err != nil {
+			t.Fatalf("MkdirAll(%s): %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(wt, "apps/web/index.js"), []byte("web\n"), 0o644); err != nil {
+		t.Fatalf("write apps/web/index.js: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "apps/api/index.js"), []byte("api\n"), 0o644); err != nil {
+		t.Fatalf("write apps/api/index.js: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "contracts/api/openapi.yaml"), []byte("spec\n"), 0o644); err != nil {
+		t.Fatalf("write contracts/api/openapi.yaml: %v", err)
+	}
+	runGitForRunTest(t, wt, "add", ".")
+	runGitForRunTest(t, wt, "commit", "-qm", "add apps/web, apps/api, contracts/api")
+
+	gitDirRoot := filepath.Join(base, "gitdirs")
+	if err := gitdir.EnsureRoot(gitDirRoot); err != nil {
+		t.Fatalf("gitdir.EnsureRoot: %v", err)
+	}
+	layout := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}
+	repo := layout.Repo("repo1")
+	sup := supervisor.New()
+	ctx := context.Background()
+
+	if err := gitdir.Seed(ctx, sup, repo, "https://example.invalid/repo1.git", nil, 10*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("gitdir.Seed: %v", err)
+	}
+
+	apiFile := filepath.Join(wt, "apps/api/index.js")
+	webFile := filepath.Join(wt, "apps/web/index.js")
+	mustExist := func(t *testing.T, path, context string) {
+		t.Helper()
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("%s: %s does not exist (stat err = %v), want it present", context, path, err)
+		}
+	}
+	mustNotExist := func(t *testing.T, path, context string) {
+		t.Helper()
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("%s: %s exists (stat err = %v), want it absent", context, path, err)
+		}
+	}
+
+	// -- (1) agent sets sparse; runtime's own next checkout stays sparse --
+	setSpec := supervisor.Spec{Path: "git", Args: githarden.Args(repo, "sparse-checkout", "set", "--no-cone", "--", "/apps/web/*", "/contracts/api/*")}
+	if _, err := gitdir.Run(ctx, sup, repo, nil, setSpec, 10*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("agent sparse-checkout set: %v", err)
+	}
+	if err := gitdir.MirrorSparseCheckout(ctx, sup, repo, nil, 10*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("MirrorSparseCheckout (set): %v", err)
+	}
+
+	mustExist(t, webFile, "after agent sparse-checkout set")
+	mustNotExist(t, apiFile, "after agent sparse-checkout set")
+
+	runtimeSparseConfig := strings.TrimSpace(runGitOutputForRunTest(t, wt, "config", "--get", "core.sparseCheckout"))
+	if runtimeSparseConfig != "true" {
+		t.Fatalf("runtime core.sparseCheckout after mirror(set) = %q, want \"true\"", runtimeSparseConfig)
+	}
+
+	// The runtime's own NEXT checkout -- an ordinary, unprivileged branch
+	// switch -- must keep the tree sparse (not re-materialize apps/api).
+	runGitForRunTest(t, wt, "checkout", "-q", "-b", "tmp-branch")
+	runGitForRunTest(t, wt, "checkout", "-q", "main")
+	mustExist(t, webFile, "after runtime's own checkout, still sparse")
+	mustNotExist(t, apiFile, "after runtime's own checkout, still sparse")
+
+	// -- (2) agent disables sparse; runtime's own next checkout re-materializes everything --
+	disableSpec := supervisor.Spec{Path: "git", Args: githarden.Args(repo, "sparse-checkout", "disable")}
+	if _, err := gitdir.Run(ctx, sup, repo, nil, disableSpec, 10*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("agent sparse-checkout disable: %v", err)
+	}
+	if err := gitdir.MirrorSparseCheckout(ctx, sup, repo, nil, 10*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("MirrorSparseCheckout (disable): %v", err)
+	}
+
+	mustExist(t, apiFile, "after agent sparse-checkout disable")
+
+	runtimeSparseConfigAfterDisable := strings.TrimSpace(runGitOutputForRunTestAllowFailure(t, wt, "config", "--get", "core.sparseCheckout"))
+	if runtimeSparseConfigAfterDisable == "true" {
+		t.Fatalf("runtime core.sparseCheckout after mirror(disable) = %q, want \"false\" or unset", runtimeSparseConfigAfterDisable)
+	}
+
+	// Remove apps/api/index.js by hand and let the runtime's own next
+	// checkout restore it -- proving that checkout does NOT re-sparsify
+	// (a regression here would leave it gone).
+	if err := os.Remove(apiFile); err != nil {
+		t.Fatalf("remove apiFile: %v", err)
+	}
+	runGitForRunTest(t, wt, "checkout", "-q", "--", "apps/api/index.js")
+	mustExist(t, apiFile, "after runtime's own checkout, post-disable")
+
+	// -- (3) Seed imports a sparse runtime's state into a fresh agent config --
+	// Re-enable sparse on the runtime side directly (an ordinary,
+	// unprivileged write -- standing in for whatever earlier boot left it
+	// this way), WITHOUT going through the agent at all this time, so
+	// Seed's own import is what is actually being tested here, not the
+	// mirror direction again. Written "--worktree"-scoped, matching how
+	// git's own sparse-checkout machinery (and MirrorSparseCheckout
+	// itself, since the fix for the linked-worktree finding) actually
+	// represents this state once extensions.worktreeConfig is on for this
+	// repo (step (2)'s own disable mirror already turned it on) -- a bare,
+	// unscoped write here would be silently SHADOWED by that pre-existing
+	// worktree-scoped entry at read time (see MirrorSparseCheckout's own
+	// doc comment for the identical shadowing hazard, measured directly).
+	runGitForRunTest(t, wt, "config", "--worktree", "core.sparseCheckout", "true")
+
+	// A fresh Seed (gitdir.Seed is idempotent -- os.RemoveAll(repo.GitDir)
+	// then rebuilt from scratch -- exactly what a warm boot's own
+	// (re-)seed does) must import that value into the newly-built agent
+	// config.
+	if err := gitdir.Seed(ctx, sup, repo, "https://example.invalid/repo1.git", nil, 10*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("gitdir.Seed (re-seed, import check): %v", err)
+	}
+
+	agentConfigOut := exec.Command("git", "--git-dir", repo.GitDir, "config", "--get", "core.sparseCheckout")
+	out, err := agentConfigOut.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git --git-dir %s config --get core.sparseCheckout: %v\n%s", repo.GitDir, err, out)
+	}
+	if got := strings.TrimSpace(string(out)); got != "true" {
+		t.Errorf("agent core.sparseCheckout after re-seed = %q, want \"true\" (Seed must import the runtime's own sparse state)", got)
+	}
+}
+
+// runGitOutputForRunTest runs git in dir and returns stdout, failing the
+// test on any error.
+func runGitOutputForRunTest(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %v (dir=%s): %v", args, dir, err)
+	}
+	return string(out)
+}
+
+// runGitOutputForRunTestAllowFailure runs git in dir and returns stdout,
+// tolerating a non-zero exit (e.g. `config --get` on an unset key, exit
+// 1) -- the empty string in that case, never failing the test.
+func runGitOutputForRunTestAllowFailure(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, _ := cmd.Output()
+	return string(out)
+}
