@@ -221,6 +221,35 @@ func TestClosedClass_StashPopIndexDoesNotExecuteEither(t *testing.T) {
 // empty and agent-owned -- the runtime's own hooks/ directory is never
 // even consulted, independent of core.hooksPath=/dev/null's own
 // defense-in-depth value.
+//
+// (Correction, review): the original version of this test only ever ran
+// through hardenedGit, i.e. githarden.Args' full output, which ALWAYS
+// carries "-c core.hooksPath=/dev/null" (hardeningFlags, defense in
+// depth). That flag alone is sufficient to suppress ANY hook, split
+// git-dir or not -- so the marker-absent assertion could not tell the
+// structural guarantee this doc comment claims ("the runtime's own
+// hooks/ directory is never even consulted, independent of
+// core.hooksPath") from the flag doing all the work. Unlike this file's
+// other ClosedClass tests, it had no mutation/isolation step of its own:
+// with Args changed to still emit hardeningFlags but drop the
+// --git-dir/--work-tree pair (the exact regression an adversarial review
+// reproduced), this test kept passing while the filter/merge/stash-pop
+// ClosedClass tests correctly failed.
+//
+// Fixed with two extra, explicit checks below, each isolating ONE of the
+// two independent defenses:
+//   - "split alone": the REAL githarden.Args(repo, ...) output, with only
+//     the "-c core.hooksPath=..." PAIR filtered back out -- so this check
+//     is sensitive to whatever --git-dir/--work-tree Args() actually
+//     emits (or fails to), unlike a hand-built command that would not
+//     notice Args() regressing at all. If the hook still does not run,
+//     the structural guarantee is real on its own, independent of the
+//     flag.
+//   - "neither defense, sanity control": plain "-C wt", the pre-§30.5
+//     shape, no --git-dir override and no -c flag at all -- the payload
+//     MUST execute here, or this whole test would be vacuous (proving
+//     nothing ever runs hooks in this environment, rather than proving
+//     THESE TWO specific defenses do the blocking).
 func TestClosedClass_RuntimeHookDoesNotExecute(t *testing.T) {
 	repo, _ := newSplitRepo(t)
 	marker := filepath.Join(t.TempDir(), "EXECUTED")
@@ -238,6 +267,48 @@ func TestClosedClass_RuntimeHookDoesNotExecute(t *testing.T) {
 
 	if _, statErr := os.Stat(marker); statErr == nil {
 		t.Fatal("the runtime-planted pre-commit hook EXECUTED through the agent-owned git-dir")
+	}
+
+	// Isolation check 1: githarden.Args' REAL output for this exact
+	// invocation, with only the "-c core.hooksPath=..." pair filtered
+	// back out -- proves the structural guarantee this test's own doc
+	// comment claims, independent of that one flag, WHILE staying
+	// sensitive to Args' own actual --git-dir/--work-tree emission (a
+	// hand-built command using fixed flags would not notice a regression
+	// in Args itself).
+	splitMarker := filepath.Join(t.TempDir(), "EXECUTED-SPLIT-ONLY")
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\n"+payload(splitMarker, "exit 0")+"\n"), 0o755); err != nil {
+		t.Fatalf("rewrite runtime pre-commit hook (split-only check): %v", err)
+	}
+	splitOnlyArgs := argsWithoutHooksPathFlag(repo, "commit", "--allow-empty", "-m", "trigger pre-commit (split only, no -c flag)")
+	splitOnly := exec.Command("git", splitOnlyArgs...)
+	splitOnly.Env = gitEnv()
+	if out, err := splitOnly.CombinedOutput(); err != nil {
+		t.Fatalf("git commit --allow-empty (split only, no -c flag): %v\n%s", err, out)
+	}
+	if _, statErr := os.Stat(splitMarker); statErr == nil {
+		t.Fatal("the runtime-planted pre-commit hook EXECUTED with the split shape alone (no -c core.hooksPath override) -- " +
+			"the structural guarantee this test claims does not actually hold on its own")
+	}
+
+	// Isolation check 2 (sanity control): NEITHER defense -- a plain
+	// "-C wt", the pre-§30.5 shape, no --git-dir override and no -c flag.
+	// The hook MUST run here, or this test proves nothing about either
+	// defense (it would just mean nothing in this environment executes
+	// hooks at all).
+	controlMarker := filepath.Join(t.TempDir(), "EXECUTED-CONTROL")
+	if err := os.WriteFile(hookPath, []byte("#!/bin/sh\n"+payload(controlMarker, "exit 0")+"\n"), 0o755); err != nil {
+		t.Fatalf("rewrite runtime pre-commit hook (control check): %v", err)
+	}
+	control := exec.Command("git", "-C", repo.WorkTree, "commit", "--allow-empty", "-m", "trigger pre-commit (control, neither defense)")
+	control.Env = gitEnv()
+	if out, err := control.CombinedOutput(); err != nil {
+		t.Fatalf("git commit --allow-empty (control, neither defense): %v\n%s", err, out)
+	}
+	if _, statErr := os.Stat(controlMarker); statErr != nil {
+		t.Fatalf("sanity check failed: the runtime-planted pre-commit hook did NOT execute even with neither defense in place " +
+			"(plain \"-C wt\", no --git-dir override, no -c core.hooksPath flag) -- this test's own premise no longer holds " +
+			"against this git version/environment")
 	}
 }
 
@@ -292,6 +363,28 @@ func TestSharedObjects_VisibleBothWays(t *testing.T) {
 	if out, err := hardenedGit(t, repo, "cat-file", "-e", runtimeSHA); err != nil {
 		t.Fatalf("agent git-dir cannot see the runtime's own commit %s: %v\n%s", runtimeSHA, err, out)
 	}
+}
+
+// argsWithoutHooksPathFlag returns githarden.Args' OWN real output for
+// this exact repo/rest, with only the "-c core.hooksPath=<value>" pair
+// filtered back out -- everything else Args() actually emits (crucially,
+// -C/--git-dir/--work-tree) is passed through untouched. Deriving from
+// the real Args() output, rather than hand-building a fixed command,
+// keeps TestClosedClass_RuntimeHookDoesNotExecute's own isolation check
+// sensitive to a regression in Args() itself (e.g. Args no longer
+// emitting --git-dir) -- a hand-built command using fixed flags would
+// not notice that at all.
+func argsWithoutHooksPathFlag(repo githarden.Repo, rest ...string) []string {
+	full := githarden.Args(repo, rest...)
+	filtered := make([]string, 0, len(full))
+	for i := 0; i < len(full); i++ {
+		if full[i] == "-c" && i+1 < len(full) && strings.HasPrefix(full[i+1], "core.hooksPath=") {
+			i++ // also skip the "core.hooksPath=<value>" that follows "-c"
+			continue
+		}
+		filtered = append(filtered, full[i])
+	}
+	return filtered
 }
 
 // mustHardenedGit is hardenedGit's own "fail the test on error" variant,
