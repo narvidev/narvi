@@ -179,23 +179,41 @@ var (
 //     reads at startup (~/.bashrc, ~/.gitconfig, ~/.npmrc, ~/.docker/
 //     config.json, an SSH client config, ...) to an attacker-chosen
 //     location.
-//   - LD_PRELOAD / LD_LIBRARY_PATH: injects an arbitrary shared object
-//     into every dynamically-linked binary a hook/dockerd process (or
-//     anything it spawns) loads.
-//   - BASH_ENV / ENV: bash and POSIX sh both source the file this
-//     names before running ANY non-interactive script -- exactly
-//     runHook's own invocation shape (a `#!/bin/sh`/`#!/bin/bash`
-//     setup.sh) -- arbitrary code execution as root, before the
-//     script's own first line ever runs.
+//   - LD_PRELOAD / LD_LIBRARY_PATH / LD_AUDIT: ld.so(8) honors all
+//     three at dynamic-link time -- LD_PRELOAD and LD_AUDIT each inject
+//     an arbitrary shared object into every dynamically-linked binary a
+//     hook/dockerd process (or anything it spawns) loads (LD_AUDIT
+//     identically to LD_PRELOAD, via the runtime linker's own auditing
+//     interface, not merely a debug knob), LD_LIBRARY_PATH redirects
+//     where the loader searches for those objects in the first place.
+//   - BASH_ENV: bash sources the file this names before running ANY
+//     non-interactive script -- exactly runHook's own invocation shape
+//     (a `#!/bin/bash` setup.sh) -- arbitrary code execution as root,
+//     before the script's own first line ever runs.
 //   - NODE_OPTIONS: Node.js reads this at every invocation and honors
 //     "--require <path>" inside it -- arbitrary code execution at
 //     process start, the identical hazard class as BASH_ENV for a
 //     Node-based hook/service.
-//   - PYTHONSTARTUP: CPython's own identical hazard for a Python-based
-//     hook/service.
+//   - ENV: POSIX sh sources the file this names, but ONLY for an
+//     INTERACTIVE shell -- runHook's own invocation (a `#!/bin/sh`
+//     setup.sh, spawned directly, no `-i`, no controlling TTY) never
+//     triggers it today. Reserved anyway, defensively: this package has
+//     no way to guarantee every current and future consumer of a
+//     resolved sandbox_secrets/automation row stays non-interactive,
+//     and the cost of reserving a name no legitimate config would need
+//     is near zero.
+//   - PYTHONSTARTUP: CPython's identical INTERACTIVE-only hazard --
+//     also does not fire in runHook's non-interactive invocation today,
+//     reserved for the same defensive reason as ENV immediately above.
 //   - GIT_SSH_COMMAND / GIT_SSH: git substitutes this for its own ssh
 //     invocation outright -- arbitrary command execution for any hook/
 //     dockerd step that touches a git-over-ssh remote.
+//   - GIT_EXEC_PATH: git execs "$GIT_EXEC_PATH/git-<subcommand>" to
+//     resolve its OWN built-in subcommands (git-commit, git-push, ...)
+//     -- a poisoned value substitutes a trojan binary for any git
+//     subcommand a hook/dockerd step invokes, the identical hazard
+//     class as PATH but specific to git's own resolution mechanism,
+//     which does not go through PATH first.
 //   - GIT_ALLOW_PROTOCOL: a NAMED cross-PR hazard, not a general
 //     process-hijack one -- a separate, concurrent Step hardens git in
 //     this same sandbox by setting this var to restrict which
@@ -204,6 +222,20 @@ var (
 //     shadow that restriction depending on append order. Reserved here
 //     so the two mechanisms can never collide, regardless of which
 //     lands first.
+//
+// This list is best-effort, not exhaustive: it is a DENYLIST of names
+// known today to redirect which binary/library/startup-file a root-uid
+// consumer runs, not a proof that no other name can. A future env var
+// this codebase has not yet considered, honored by some other root-uid
+// consumer added later, can still hijack that consumer's process
+// substrate without ever appearing here -- adding a name here closes a
+// known hole, it does not certify the absence of unknown ones (the same
+// lesson a separate Step's own enumerated-protocol denylist relearned
+// when an unlisted transport helper defeated it). A strict allowlist was
+// considered and rejected: automation env vars legitimately carry
+// arbitrary application-level config names chosen by whoever authors the
+// automation, so an allowlist narrow enough to be safe would also reject
+// ordinary, non-hazardous config.
 //
 // gitConfigReservedPrefix ("GIT_CONFIG_") is a PREFIX, not an
 // enumerated {GIT_CONFIG_COUNT, GIT_CONFIG_KEY_0, GIT_CONFIG_VALUE_0,
@@ -218,11 +250,11 @@ var (
 // caller declared a second override.
 var processHijackReservedNames = []string{
 	"PATH", "HOME",
-	"LD_PRELOAD", "LD_LIBRARY_PATH",
+	"LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
 	"BASH_ENV", "ENV",
 	"NODE_OPTIONS",
 	"PYTHONSTARTUP",
-	"GIT_SSH_COMMAND", "GIT_SSH",
+	"GIT_SSH_COMMAND", "GIT_SSH", "GIT_EXEC_PATH",
 	"GIT_ALLOW_PROTOCOL",
 }
 

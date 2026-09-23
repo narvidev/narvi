@@ -194,24 +194,26 @@ func ValidateEnvVarShapeAndReservation(name string) error {
 // adversarial review round (W7) found both false. internal/app/seed's own
 // seedAutomation (internal/app/seed/automations.go) writes
 // automations.env_vars directly, via sqlcgen.CreateAutomationParams, from
-// a `control-plane seed -manifest <path>` run -- WITHOUT ever calling
-// this function. internal/domain/seedmanifest.ValidateManifest
-// (validate.go) DOES call it, but nothing on the real seed-apply path
-// (controlplane/seed.go's own runSeedCommand -> internal/app/seed.Run ->
-// seedAutomation) ever calls ValidateManifest -- a repo-wide grep at the
-// time of this fix found zero non-test callers of it at all -- so a seed
-// manifest's own env_vars entries can reach Postgres with no shape or
-// reservation check whatsoever. Even setting that gap aside: cmd/
-// sandbox-agent/automationenvvars.go's own fetchAutomationEnvVars was
-// ALREADY a second, independent re-validation of every DELIVERED name
-// before this comment was corrected -- it drops (never fails the boot
-// on) any name that fails, regardless of which write path produced it.
-// THAT re-validation -- not this function -- is the guarantee that
-// actually holds end to end: it sits at the one place every automation
-// env var must pass through before it ever reaches cmd.Env, structurally
-// independent of how many write paths this table has, or whether a
-// future one remembers to call ValidateEnvVars at all. spawn.go's own
-// former "a collision ... is structurally impossible ... ValidateEnvVars
+// a `control-plane seed -manifest <path>` run -- WITHOUT itself calling
+// this function. That does not leave the seed path unvalidated: a later
+// "correction" to this comment claimed it did, and named a
+// seedmanifest.ValidateManifest that does not exist -- both false. The
+// real seed-apply path is controlplane/seed.go's own runSeedCommand ->
+// seed.LoadManifest (internal/app/seed/manifest_io.go) ->
+// seedmanifest.Validate (validate.go), which runSeedCommand calls and
+// aborts the command on error BEFORE seed.Run -> seedAutomation ever
+// writes -- and seedmanifest.Validate's own validateAutomations calls
+// this exact function on every manifest automation's env vars. So this
+// write path has TWO independent fences, not the single wrongly-named
+// one an earlier revision of this comment asserted: seedmanifest.Validate
+// at load time, and cmd/sandbox-agent/automationenvvars.go's own
+// fetchAutomationEnvVars -- ALREADY a second, independent re-validation
+// of every DELIVERED name, regardless of which write path produced it --
+// at the injection boundary. THAT re-validation is still the guarantee
+// that actually holds end to end even if a future write path forgets to
+// call ValidateEnvVars at all: it sits at the one place every automation
+// env var must pass through before it ever reaches cmd.Env. spawn.go's
+// own former "a collision ... is structurally impossible ... ValidateEnvVars
 // already rejects [it], at CreateAutomation's own write path" leaned on
 // this same wrong guard -- corrected there too, to point at the same
 // injection-boundary re-validation instead.
