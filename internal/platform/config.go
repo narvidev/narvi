@@ -50,6 +50,16 @@ const (
 // deploy mints.
 const envVarName = "NARVI_STAGE"
 
+// StageEnvVarName exports envVarName's own value -- the ONLY reason this
+// otherwise-internal constant needs an exported alias at all is
+// internal/ops's Secret-template drift guard (§41.1 review round 2,
+// findings Q4/Q5/Q8/Q9), which calls LoadWithLookup against an injected,
+// empty environment map it builds itself and therefore needs the exact
+// key Load reads Stage from, rather than a second, hand-copied
+// "NARVI_STAGE" literal that could silently drift from this one if it
+// were ever renamed.
+const StageEnvVarName = envVarName
+
 // InvalidStageError is returned by Load when NARVI_STAGE is set to a value
 // that is not one of StageDevelopment, StageStaging, or StageProduction.
 type InvalidStageError struct {
@@ -1872,7 +1882,41 @@ type ObjectStorageConfig struct {
 // check fails) instead of letting an invalid config boot silently. Callers
 // (cmd/control-plane/main.go) call this once at process start.
 func Load() (*Config, error) {
-	stage := Stage(os.Getenv(envVarName))
+	return load(os.LookupEnv)
+}
+
+// LoadWithLookup runs the exact same validation Load does, against a
+// caller-supplied environment lookup instead of the real process
+// environment (§41.1 review round 2, findings Q4/Q5/Q8/Q9). It exists
+// solely as the seam internal/ops's Secret-template drift guard needs to
+// determine which variables Load can report missing BEHAVIOURALLY -- by
+// actually calling this loader once per accepted Stage value against an
+// injected, empty environment and collecting the typed errors it
+// returns -- instead of a second, parallel static heuristic
+// (go/ast-walking config.go's own source for shapes that "look required")
+// that a previous round of this scanner proved could never keep up with
+// every way a future change might express "this variable is required."
+//
+// No production code calls this: Load (immediately above) is, and stays,
+// the only path cmd/control-plane/main.go or any other real binary uses.
+// This is a second, ADDITIONAL entry point, not a replacement -- Load
+// itself is defined purely in terms of it, so there is exactly one
+// implementation of the actual validation logic (this file's own
+// convention against a second, parallel copy) rather than two loaders
+// that could drift apart.
+func LoadWithLookup(lookupEnv func(string) (string, bool)) (*Config, error) {
+	return load(lookupEnv)
+}
+
+// load is Load/LoadWithLookup's shared body -- see LoadWithLookup's own
+// doc comment for why this indirection exists at all.
+func load(lookupEnv func(string) (string, bool)) (*Config, error) {
+	getenv := func(key string) string {
+		v, _ := lookupEnv(key)
+		return v
+	}
+
+	stage := Stage(getenv(envVarName))
 
 	var errs []error
 
@@ -1894,7 +1938,7 @@ func Load() (*Config, error) {
 		errs = append(errs, err)
 	}
 
-	rawLogLevel := os.Getenv(logLevelEnvVarName)
+	rawLogLevel := getenv(logLevelEnvVarName)
 	if rawLogLevel == "" {
 		rawLogLevel = defaultLogLevelValue
 	}
@@ -1903,18 +1947,18 @@ func Load() (*Config, error) {
 		errs = append(errs, err)
 	}
 
-	databaseURL := os.Getenv(databaseURLEnvVarName)
+	databaseURL := getenv(databaseURLEnvVarName)
 	if databaseURL == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: databaseURLEnvVarName})
 	}
 
-	httpAddr := os.Getenv(httpAddrEnvVarName)
+	httpAddr := getenv(httpAddrEnvVarName)
 	if httpAddr == "" {
 		httpAddr = defaultHTTPAddr
 	}
 
 	dbPoolMaxConns := int32(defaultDBPoolMaxConns)
-	if rawDBPoolMaxConns := os.Getenv(dbPoolMaxConnsEnvVarName); rawDBPoolMaxConns != "" {
+	if rawDBPoolMaxConns := getenv(dbPoolMaxConnsEnvVarName); rawDBPoolMaxConns != "" {
 		parsed, parseErr := strconv.Atoi(rawDBPoolMaxConns)
 		if parseErr != nil || parsed <= 0 {
 			errs = append(errs, &InvalidDBPoolMaxConnsError{Value: rawDBPoolMaxConns})
@@ -1935,7 +1979,7 @@ func Load() (*Config, error) {
 		integrations.ProviderLinear: true,
 		integrations.ProviderGitHub: true,
 	}
-	if rawIngressEnabled, isSet := os.LookupEnv(ingressEnabledEnvVarName); isSet {
+	if rawIngressEnabled, isSet := lookupEnv(ingressEnabledEnvVarName); isSet {
 		ingressEnabled = make(map[integrations.Provider]bool, len(integrations.Providers))
 		for _, entry := range parseCommaSeparatedList(rawIngressEnabled) {
 			p, ok := integrations.ParseProvider(entry)
@@ -1947,32 +1991,32 @@ func Load() (*Config, error) {
 		}
 	}
 
-	hmacSandboxSecret := os.Getenv(hmacSandboxSecretEnvVarName)
+	hmacSandboxSecret := getenv(hmacSandboxSecretEnvVarName)
 	if hmacSandboxSecret == "" {
 		errs = append(errs, &InvalidHMACSecretError{EnvVar: hmacSandboxSecretEnvVarName})
 	}
 
-	hmacBotsSecret := os.Getenv(hmacBotsSecretEnvVarName)
+	hmacBotsSecret := getenv(hmacBotsSecretEnvVarName)
 	if hmacBotsSecret == "" {
 		errs = append(errs, &InvalidHMACSecretError{EnvVar: hmacBotsSecretEnvVarName})
 	}
 
-	hmacWebhookSecret := os.Getenv(hmacWebhookSecretEnvVarName)
+	hmacWebhookSecret := getenv(hmacWebhookSecretEnvVarName)
 	if hmacWebhookSecret == "" {
 		errs = append(errs, &InvalidHMACSecretError{EnvVar: hmacWebhookSecretEnvVarName})
 	}
 
-	gitHubClientID := os.Getenv(gitHubClientIDEnvVarName)
+	gitHubClientID := getenv(gitHubClientIDEnvVarName)
 	if gitHubClientID == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: gitHubClientIDEnvVarName})
 	}
 
-	gitHubClientSecret := os.Getenv(gitHubClientSecretEnvVarName)
+	gitHubClientSecret := getenv(gitHubClientSecretEnvVarName)
 	if gitHubClientSecret == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: gitHubClientSecretEnvVarName})
 	}
 
-	publicBaseURL := os.Getenv(publicBaseURLEnvVarName)
+	publicBaseURL := getenv(publicBaseURLEnvVarName)
 	if publicBaseURL == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: publicBaseURLEnvVarName})
 	}
@@ -1985,12 +2029,12 @@ func Load() (*Config, error) {
 	// pair's own non-empty-ness -- is what every consumer downstream
 	// (controlplane/serve.go's route mounting, httpapi.
 	// configuredForProvider) actually gates on.
-	gitHubWebhookSecret := os.Getenv(gitHubWebhookSecretEnvVarName)
+	gitHubWebhookSecret := getenv(gitHubWebhookSecretEnvVarName)
 	if ingressEnabled[integrations.ProviderGitHub] && gitHubWebhookSecret == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: gitHubWebhookSecretEnvVarName})
 	}
 
-	gitHubBotHandle := os.Getenv(gitHubBotHandleEnvVarName)
+	gitHubBotHandle := getenv(gitHubBotHandleEnvVarName)
 	if ingressEnabled[integrations.ProviderGitHub] && gitHubBotHandle == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: gitHubBotHandleEnvVarName})
 	}
@@ -1999,7 +2043,7 @@ func Load() (*Config, error) {
 	// doc comment above. No MissingRequiredEnvError is ever appended for
 	// it; an unset value defaults to defaultGitHubReReviewLabel, mirroring
 	// httpAddr's own defaulting immediately above.
-	gitHubReReviewLabel := os.Getenv(gitHubReReviewLabelEnvVarName)
+	gitHubReReviewLabel := getenv(gitHubReReviewLabelEnvVarName)
 	if gitHubReReviewLabel == "" {
 		gitHubReReviewLabel = defaultGitHubReReviewLabel
 	}
@@ -2007,16 +2051,16 @@ func Load() (*Config, error) {
 	// gitHubReleaseLabel/gitHubReleaseBranchPattern are DELIBERATELY
 	// OPTIONAL -- see their own env-var doc comment above. No
 	// MissingRequiredEnvError is ever appended for either.
-	gitHubReleaseLabel := os.Getenv(gitHubReleaseLabelEnvVarName)
+	gitHubReleaseLabel := getenv(gitHubReleaseLabelEnvVarName)
 	if gitHubReleaseLabel == "" {
 		gitHubReleaseLabel = defaultGitHubReleaseLabel
 	}
-	gitHubReleaseBranchPattern := os.Getenv(gitHubReleaseBranchPatternEnvVarName)
+	gitHubReleaseBranchPattern := getenv(gitHubReleaseBranchPatternEnvVarName)
 	if gitHubReleaseBranchPattern == "" {
 		gitHubReleaseBranchPattern = defaultGitHubReleaseBranchPattern
 	}
 
-	gitHubBotToken := os.Getenv(gitHubBotTokenEnvVarName)
+	gitHubBotToken := getenv(gitHubBotTokenEnvVarName)
 	if ingressEnabled[integrations.ProviderGitHub] && gitHubBotToken == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: gitHubBotTokenEnvVarName})
 	}
@@ -2025,16 +2069,16 @@ func Load() (*Config, error) {
 	// doc comment above. No MissingRequiredEnvError is ever appended for
 	// it; an empty value here is a valid, expected, degraded-gracefully
 	// configuration, not a boot-time failure.
-	gitHubImageBuildToken := os.Getenv(gitHubImageBuildTokenEnvVarName)
+	gitHubImageBuildToken := getenv(gitHubImageBuildTokenEnvVarName)
 
 	// reviewModelDeep (§26.3): OPTIONAL, no default -- an empty
 	// value here is a valid, expected, degraded-gracefully configuration
 	// (reviewModelDeepEnvVarName's own doc comment), not a boot-time
 	// failure.
-	reviewModelDeep := os.Getenv(reviewModelDeepEnvVarName)
+	reviewModelDeep := getenv(reviewModelDeepEnvVarName)
 
 	var tokenEncryptionKey []byte
-	rawTokenEncryptionKey := os.Getenv(tokenEncryptionKeyEnvVarName)
+	rawTokenEncryptionKey := getenv(tokenEncryptionKeyEnvVarName)
 	if rawTokenEncryptionKey == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: tokenEncryptionKeyEnvVarName})
 	} else {
@@ -2053,21 +2097,21 @@ func Load() (*Config, error) {
 		}
 	}
 
-	allowedEmailDomains := parseCommaSeparatedList(os.Getenv(allowedEmailDomainsEnvVarName))
-	allowedGitHubOrgs := parseCommaSeparatedList(os.Getenv(allowedGitHubOrgsEnvVarName))
-	allowedEmails := parseCommaSeparatedList(os.Getenv(allowedEmailsEnvVarName))
+	allowedEmailDomains := parseCommaSeparatedList(getenv(allowedEmailDomainsEnvVarName))
+	allowedGitHubOrgs := parseCommaSeparatedList(getenv(allowedGitHubOrgsEnvVarName))
+	allowedEmails := parseCommaSeparatedList(getenv(allowedEmailsEnvVarName))
 	if len(allowedEmailDomains) == 0 && len(allowedGitHubOrgs) == 0 && len(allowedEmails) == 0 {
 		errs = append(errs, &EmptyAllowlistError{})
 	}
 
-	initialAdminEmails := parseCommaSeparatedList(os.Getenv(initialAdminEmailsEnvVarName))
+	initialAdminEmails := parseCommaSeparatedList(getenv(initialAdminEmailsEnvVarName))
 
 	// epistemicCheckDefault (§20.4): optional, default false --
 	// mirrors objectStoreUsePathStyle's own identical "empty means
 	// unset, parse only when present, reject anything ParseBool doesn't
 	// recognize" idiom (Load's own object-storage block, below).
 	epistemicCheckDefault := false
-	if raw := os.Getenv(epistemicCheckDefaultEnvVarName); raw != "" {
+	if raw := getenv(epistemicCheckDefaultEnvVarName); raw != "" {
 		parsed, parseErr := strconv.ParseBool(raw)
 		if parseErr != nil {
 			errs = append(errs, &InvalidEpistemicCheckDefaultError{Value: raw})
@@ -2083,7 +2127,7 @@ func Load() (*Config, error) {
 	// above) rather than strconv.ParseBool, since this is a two-value
 	// enum, not a boolean.
 	rolloutMode := rollout.ModeOpen
-	if raw := os.Getenv(rolloutModeEnvVarName); raw != "" {
+	if raw := getenv(rolloutModeEnvVarName); raw != "" {
 		switch rollout.Mode(raw) {
 		case rollout.ModeOpen, rollout.ModeCohort:
 			rolloutMode = rollout.Mode(raw)
@@ -2097,7 +2141,7 @@ func Load() (*Config, error) {
 	// only when present, reject anything ParseBool doesn't recognize"
 	// idiom above.
 	shadowMode := false
-	if raw := os.Getenv(shadowModeEnvVarName); raw != "" {
+	if raw := getenv(shadowModeEnvVarName); raw != "" {
 		parsed, parseErr := strconv.ParseBool(raw)
 		if parseErr != nil {
 			errs = append(errs, &InvalidShadowModeError{Value: raw})
@@ -2111,7 +2155,7 @@ func Load() (*Config, error) {
 	// from gitHubImageBuildToken's own optional precedent immediately
 	// above despite both being GitHub-flavored platform credentials.
 	var gitHubAppID int64
-	rawGitHubAppID := os.Getenv(gitHubAppIDEnvVarName)
+	rawGitHubAppID := getenv(gitHubAppIDEnvVarName)
 	if rawGitHubAppID == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: gitHubAppIDEnvVarName})
 	} else {
@@ -2124,7 +2168,7 @@ func Load() (*Config, error) {
 	}
 
 	var gitHubAppPrivateKey *rsa.PrivateKey
-	rawGitHubAppPrivateKey := os.Getenv(gitHubAppPrivateKeyEnvVarName)
+	rawGitHubAppPrivateKey := getenv(gitHubAppPrivateKeyEnvVarName)
 	if rawGitHubAppPrivateKey == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: gitHubAppPrivateKeyEnvVarName})
 	} else {
@@ -2141,7 +2185,7 @@ func Load() (*Config, error) {
 	// at all despite every other GitHub-flavored value on this file being
 	// a credential rather than an endpoint.
 	gitHubAPIBaseURL := defaultGitHubAPIBaseURL
-	if raw := os.Getenv(gitHubAPIBaseURLEnvVarName); raw != "" {
+	if raw := getenv(gitHubAPIBaseURLEnvVarName); raw != "" {
 		canonical, canonErr := canonicalGitHubAPIBaseURL(raw, stage)
 		if canonErr != nil {
 			errs = append(errs, canonErr)
@@ -2150,17 +2194,17 @@ func Load() (*Config, error) {
 		}
 	}
 
-	modalBaseURL := os.Getenv(modalBaseURLEnvVarName)
+	modalBaseURL := getenv(modalBaseURLEnvVarName)
 	if modalBaseURL == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: modalBaseURLEnvVarName})
 	}
 
-	modalAuthToken := os.Getenv(modalAuthTokenEnvVarName)
+	modalAuthToken := getenv(modalAuthTokenEnvVarName)
 	if modalAuthToken == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: modalAuthTokenEnvVarName})
 	}
 
-	modalEgressProxyURL := os.Getenv(modalEgressProxyURLEnvVarName)
+	modalEgressProxyURL := getenv(modalEgressProxyURLEnvVarName)
 
 	// rwxAccessToken is optional -- see its own env-var-name doc comment
 	// above. No MissingRequiredEnvError is ever appended for it. But
@@ -2170,12 +2214,12 @@ func Load() (*Config, error) {
 	// needs cfg.GitHubBotToken, which is only ever populated when GitHub
 	// ingress is enabled), and both halves of the check are plain env vars
 	// with no I/O, so Load is where it belongs.
-	rwxAccessToken := os.Getenv(rwxAccessTokenEnvVarName)
+	rwxAccessToken := getenv(rwxAccessTokenEnvVarName)
 	if rwxAccessToken != "" && !ingressEnabled[integrations.ProviderGitHub] {
 		errs = append(errs, &RWXPreviewsRequireGitHubIngressError{})
 	}
 
-	openCodeRuntimeVersion := os.Getenv(openCodeRuntimeVersionEnvVarName)
+	openCodeRuntimeVersion := getenv(openCodeRuntimeVersionEnvVarName)
 	if openCodeRuntimeVersion == "" {
 		openCodeRuntimeVersion = defaultOpenCodeRuntimeVersion
 	}
@@ -2183,37 +2227,37 @@ func Load() (*Config, error) {
 	// All five Linear fields below (and both Slack fields further down) are
 	// required ONLY when their own ingress surface is enabled -- see the
 	// identical GitHub comment above this same pattern started with.
-	linearWebhookSecret := os.Getenv(linearWebhookSecretEnvVarName)
+	linearWebhookSecret := getenv(linearWebhookSecretEnvVarName)
 	if ingressEnabled[integrations.ProviderLinear] && linearWebhookSecret == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: linearWebhookSecretEnvVarName})
 	}
 
-	linearOAuthClientID := os.Getenv(linearOAuthClientIDEnvVarName)
+	linearOAuthClientID := getenv(linearOAuthClientIDEnvVarName)
 	if ingressEnabled[integrations.ProviderLinear] && linearOAuthClientID == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: linearOAuthClientIDEnvVarName})
 	}
 
-	linearOAuthClientSecret := os.Getenv(linearOAuthClientSecretEnvVarName)
+	linearOAuthClientSecret := getenv(linearOAuthClientSecretEnvVarName)
 	if ingressEnabled[integrations.ProviderLinear] && linearOAuthClientSecret == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: linearOAuthClientSecretEnvVarName})
 	}
 
-	linearDefaultRepoName := os.Getenv(linearDefaultRepoNameEnvVarName)
+	linearDefaultRepoName := getenv(linearDefaultRepoNameEnvVarName)
 	if ingressEnabled[integrations.ProviderLinear] && linearDefaultRepoName == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: linearDefaultRepoNameEnvVarName})
 	}
 
-	linearDefaultRepoURL := os.Getenv(linearDefaultRepoURLEnvVarName)
+	linearDefaultRepoURL := getenv(linearDefaultRepoURLEnvVarName)
 	if ingressEnabled[integrations.ProviderLinear] && linearDefaultRepoURL == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: linearDefaultRepoURLEnvVarName})
 	}
 
-	slackSigningSecret := os.Getenv(slackSigningSecretEnvVarName)
+	slackSigningSecret := getenv(slackSigningSecretEnvVarName)
 	if ingressEnabled[integrations.ProviderSlack] && slackSigningSecret == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: slackSigningSecretEnvVarName})
 	}
 
-	slackBotToken := os.Getenv(slackBotTokenEnvVarName)
+	slackBotToken := getenv(slackBotTokenEnvVarName)
 	if ingressEnabled[integrations.ProviderSlack] && slackBotToken == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: slackBotTokenEnvVarName})
 	}
@@ -2224,35 +2268,35 @@ func Load() (*Config, error) {
 	// (internal/adapters/inbound/httpapi.CreateSessionCore), so a typo'd
 	// operator-configured repo fails fast at boot rather than surfacing
 	// as a confusing 500 on the first Slack mention that tries to use it.
-	slackDefaultRepoName := os.Getenv(slackDefaultRepoNameEnvVarName)
+	slackDefaultRepoName := getenv(slackDefaultRepoNameEnvVarName)
 	if slackDefaultRepoName != "" {
 		if err := reposource.ValidateRepoName(slackDefaultRepoName); err != nil {
 			errs = append(errs, fmt.Errorf("invalid %s: %w", slackDefaultRepoNameEnvVarName, err))
 		}
 	}
-	slackDefaultRepoURL := os.Getenv(slackDefaultRepoURLEnvVarName)
+	slackDefaultRepoURL := getenv(slackDefaultRepoURLEnvVarName)
 	if slackDefaultRepoURL != "" {
 		if err := reposource.ValidateRepoURL(slackDefaultRepoURL); err != nil {
 			errs = append(errs, fmt.Errorf("invalid %s: %w", slackDefaultRepoURLEnvVarName, err))
 		}
 	}
 
-	anthropicAPIKey := os.Getenv(anthropicAPIKeyEnvVarName)
+	anthropicAPIKey := getenv(anthropicAPIKeyEnvVarName)
 	if anthropicAPIKey == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: anthropicAPIKeyEnvVarName})
 	}
 
-	intentClassifierProvider := os.Getenv(intentClassifierProviderEnvVarName)
+	intentClassifierProvider := getenv(intentClassifierProviderEnvVarName)
 	if intentClassifierProvider == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: intentClassifierProviderEnvVarName})
 	}
 
-	intentClassifierModel := os.Getenv(intentClassifierModelEnvVarName)
+	intentClassifierModel := getenv(intentClassifierModelEnvVarName)
 	if intentClassifierModel == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: intentClassifierModelEnvVarName})
 	}
 
-	intentClassifierActiveSurfaces := parseCommaSeparatedList(os.Getenv(intentClassifierActiveSurfacesEnvVarName))
+	intentClassifierActiveSurfaces := parseCommaSeparatedList(getenv(intentClassifierActiveSurfacesEnvVarName))
 
 	// cloudIdentityIssuerURL (§27.3): DELIBERATELY OPTIONAL --
 	// see cloudIdentityIssuerURLEnvVarName's own doc comment for the full
@@ -2262,7 +2306,7 @@ func Load() (*Config, error) {
 	// raw env value -- see that function's own doc comment for why the
 	// raw value must never reach Config.CloudIdentityIssuerURL.
 	cloudIdentityIssuerURL := ""
-	if raw := os.Getenv(cloudIdentityIssuerURLEnvVarName); raw != "" {
+	if raw := getenv(cloudIdentityIssuerURLEnvVarName); raw != "" {
 		canonical, err := canonicalCloudIdentityIssuerURL(raw)
 		if err != nil {
 			errs = append(errs, err)
@@ -2279,7 +2323,7 @@ func Load() (*Config, error) {
 	// canonicalOTLPEndpointURL returns, never the raw env value, mirroring
 	// cloudIdentityIssuerURL's own identical assignment immediately above.
 	otlpEndpoint := ""
-	if raw := os.Getenv(otlpEndpointEnvVarName); raw != "" {
+	if raw := getenv(otlpEndpointEnvVarName); raw != "" {
 		canonical, err := canonicalOTLPEndpointURL(raw)
 		if err != nil {
 			errs = append(errs, err)
@@ -2295,26 +2339,26 @@ func Load() (*Config, error) {
 	// trips a boot error over an unrelated stray/leftover object-store
 	// var.
 	var objectStorage *ObjectStorageConfig
-	objectStoreEndpoint := os.Getenv(objectStoreEndpointEnvVarName)
+	objectStoreEndpoint := getenv(objectStoreEndpointEnvVarName)
 	if objectStoreEndpoint != "" {
-		objectStoreRegion := os.Getenv(objectStoreRegionEnvVarName)
+		objectStoreRegion := getenv(objectStoreRegionEnvVarName)
 		if objectStoreRegion == "" {
 			errs = append(errs, &MissingRequiredEnvError{EnvVar: objectStoreRegionEnvVarName})
 		}
 
-		objectStoreBucket := os.Getenv(objectStoreBucketEnvVarName)
+		objectStoreBucket := getenv(objectStoreBucketEnvVarName)
 		if objectStoreBucket == "" {
 			errs = append(errs, &MissingRequiredEnvError{EnvVar: objectStoreBucketEnvVarName})
 		}
 
-		objectStoreAccessKeyID := os.Getenv(objectStoreAccessKeyIDEnvVarName)
-		objectStoreSecretAccessKey := os.Getenv(objectStoreSecretAccessKeyEnvVarName)
+		objectStoreAccessKeyID := getenv(objectStoreAccessKeyIDEnvVarName)
+		objectStoreSecretAccessKey := getenv(objectStoreSecretAccessKeyEnvVarName)
 		if (objectStoreAccessKeyID == "") != (objectStoreSecretAccessKey == "") {
 			errs = append(errs, &InvalidObjectStoreCredentialsError{})
 		}
 
 		objectStoreUsePathStyle := false
-		if raw := os.Getenv(objectStoreUsePathStyleEnvVarName); raw != "" {
+		if raw := getenv(objectStoreUsePathStyleEnvVarName); raw != "" {
 			parsed, parseErr := strconv.ParseBool(raw)
 			if parseErr != nil {
 				errs = append(errs, &InvalidObjectStoreUsePathStyleError{Value: raw})
@@ -2330,7 +2374,7 @@ func Load() (*Config, error) {
 		// nothing else even inspected" gating rule rather than treating
 		// these two as independently-always-validated knobs.
 		maxUploadBytes := defaultMaxUploadBytes
-		if raw := os.Getenv(objectStoreMaxUploadBytesEnvVarName); raw != "" {
+		if raw := getenv(objectStoreMaxUploadBytesEnvVarName); raw != "" {
 			parsed, parseErr := strconv.ParseInt(raw, 10, 64)
 			if parseErr != nil || parsed <= 0 {
 				errs = append(errs, &InvalidObjectStoreMaxBytesError{EnvVar: objectStoreMaxUploadBytesEnvVarName, Value: raw})
@@ -2340,7 +2384,7 @@ func Load() (*Config, error) {
 		}
 
 		maxSessionUploadBytes := defaultMaxSessionUploadBytes
-		if raw := os.Getenv(objectStoreMaxSessionUploadBytesEnvVarName); raw != "" {
+		if raw := getenv(objectStoreMaxSessionUploadBytesEnvVarName); raw != "" {
 			parsed, parseErr := strconv.ParseInt(raw, 10, 64)
 			if parseErr != nil || parsed <= 0 {
 				errs = append(errs, &InvalidObjectStoreMaxBytesError{EnvVar: objectStoreMaxSessionUploadBytesEnvVarName, Value: raw})
@@ -2351,7 +2395,7 @@ func Load() (*Config, error) {
 
 		objectStorage = &ObjectStorageConfig{
 			Endpoint:              objectStoreEndpoint,
-			PublicEndpoint:        os.Getenv(objectStorePublicEndpointEnvVarName),
+			PublicEndpoint:        getenv(objectStorePublicEndpointEnvVarName),
 			Region:                objectStoreRegion,
 			Bucket:                objectStoreBucket,
 			AccessKeyID:           objectStoreAccessKeyID,
@@ -2366,7 +2410,7 @@ func Load() (*Config, error) {
 	// UNVALIDATED -- see Config.LicenseKey's own doc comment for why a
 	// malformed value here must never fail this function, unlike every
 	// other credential-shaped field above.
-	licenseKey := os.Getenv(licenseKeyEnvVarName)
+	licenseKey := getenv(licenseKeyEnvVarName)
 
 	if len(errs) > 0 {
 		return nil, errors.Join(errs...)

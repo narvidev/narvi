@@ -2,346 +2,226 @@ package ops
 
 import (
 	"fmt"
-	"go/ast"
-	"go/parser"
-	"go/token"
-	"strconv"
+	"os"
+	"reflect"
+	"regexp"
 	"strings"
+
+	"github.com/narvidev/narvi/internal/platform"
 )
 
-// requiredConfigErrorTypes are the two composite-literal type names
-// Load's own source uses for a plain "this env var is missing" failure --
-// see this file's own top doc comment for why both, and why nothing else
-// in config.go carries an EnvVar field with this same "value = the exact
-// env var name" meaning.
-var requiredConfigErrorTypes = map[string]bool{
-	"MissingRequiredEnvError": true,
-	"InvalidHMACSecretError":  true,
-}
+// requiredConfigStages is every platform.Stage value RequiredConfigEnvVars
+// actually boots platform.Load against to discover which variables it
+// reports missing (§41.1 review round 2, findings Q4/Q5/Q8/Q9's own
+// "production-relevant" wording). StageDevelopment is deliberately
+// excluded: deploy/control-plane/secret.yaml is a PRODUCTION artifact --
+// its own top comment says so -- and nothing it exists to fill in should
+// be driven by whatever additionally-lenient behavior a development boot
+// might one day grow (there isn't one today; this list should not depend
+// on that staying true).
+var requiredConfigStages = []platform.Stage{platform.StageStaging, platform.StageProduction}
 
 // deploySecretExtraVars is the named, documented exception list this
 // file's own top comment explains in full: variables platform.Config
-// READS but never marks "required" through the mechanical
-// MissingRequiredEnvError/InvalidHMACSecretError shape
-// RequiredConfigEnvVars scans for, which a real, fully-featured
-// deployment still needs a placeholder for. Kept here, not inferred, so a
-// reviewer sees the exact, closed list rather than a scan whose "required"
-// set silently grew a special case.
+// requires only once an operator opts into a feature by setting some
+// OTHER variable first, which RequiredConfigEnvVars' single-pass, flat
+// empty-environment probe cannot discover on its own -- see that
+// function's own doc comment for exactly why. Kept here, not inferred, so
+// a reviewer sees the exact, closed list rather than a scan whose
+// "required" set silently grew a special case.
 var deploySecretExtraVars = []string{
 	// The allowlist group (§13.1): EmptyAllowlistError fires only when
-	// all three are empty together, so none of the three is ever the
-	// EnvVar value of a MissingRequiredEnvError on its own.
+	// all three are empty together, and carries no EnvVar field at all
+	// (it is an empty struct) -- so no single one of them, and no group
+	// name, is ever something RequiredConfigEnvVars' reflection-based
+	// extraction can find.
 	"NARVI_ALLOWED_EMAIL_DOMAINS",
 	"NARVI_ALLOWED_GITHUB_ORGS",
 	"NARVI_ALLOWED_EMAILS",
-	// Object storage (§28.7): REGION/BUCKET already surface through
-	// RequiredConfigEnvVars (they sit inside the `if objectStoreEndpoint
-	// != ""` block, but the composite literal is still found regardless
-	// of that guard -- see this file's own top doc comment). ENDPOINT
-	// itself is the feature flag Load gates the whole bundle on, so it
-	// never appears as an EnvVar value of its own; the credential pair
-	// and the path-style/public-endpoint knobs never throw a
-	// MissingRequiredEnvError at all (InvalidObjectStoreCredentialsError
-	// only fires on a MISMATCHED pair). All four are added back by hand
-	// so the template is usable against a real S3/MinIO bucket, not just
-	// the two fields Load's own scan happens to find.
+	// Object storage (§28.7): the whole bundle lives behind `if
+	// objectStoreEndpoint != ""` in Load's own source. RequiredConfigEnvVars'
+	// empty-environment probe never sets NARVI_OBJECT_STORE_ENDPOINT, so
+	// that whole block -- REGION and BUCKET's own MissingRequiredEnvError
+	// included -- never even runs; and the credential pair
+	// (ACCESS_KEY_ID/SECRET_ACCESS_KEY) and PUBLIC_ENDPOINT/USE_PATH_STYLE
+	// are optional even once the bundle IS enabled
+	// (InvalidObjectStoreCredentialsError only fires on a MISMATCHED
+	// pair, and it too carries no EnvVar field). All seven are added back
+	// by hand so the template is usable against a real S3/MinIO bucket,
+	// not just whatever this probe happens to trigger with everything
+	// else left empty.
 	"NARVI_OBJECT_STORE_ENDPOINT",
+	"NARVI_OBJECT_STORE_REGION",
+	"NARVI_OBJECT_STORE_BUCKET",
 	"NARVI_OBJECT_STORE_ACCESS_KEY_ID",
 	"NARVI_OBJECT_STORE_SECRET_ACCESS_KEY",
 	"NARVI_OBJECT_STORE_PUBLIC_ENDPOINT",
 	"NARVI_OBJECT_STORE_USE_PATH_STYLE",
 }
 
+// narviEnvVarLiteralPattern is the "read" half's own, deliberately crude,
+// superset scan -- see RequiredConfigEnvVars' own doc comment for why a
+// plain text scan is the right tool for this direction specifically.
+var narviEnvVarLiteralPattern = regexp.MustCompile(`"(NARVI_[A-Z0-9_]+)"`)
+
+// narviTokenPattern finds every bare NARVI_* token inside an
+// already-rendered error message -- envVarNamesOf's own fallback path,
+// below.
+var narviTokenPattern = regexp.MustCompile(`NARVI_[A-Z0-9_]+`)
+
 // RequiredConfigEnvVars is this repository's own drift guard (§41.1): the
 // repository claims deploy/control-plane/secret.yaml names "every required
 // platform.Config variable" (that file's own top comment, and this
 // package's own doc.go house style of keeping a claim honest with a test
-// rather than discipline). This function is the mechanism, on the same
-// go/ast-scan model routes.go and instruments.go already established:
-// read the ground truth (internal/platform/config.go's own source) rather
-// than a hand-maintained copy of it, so a future change to Load's own
-// validation cannot silently outrun the committed Secret template.
+// rather than discipline).
 //
-// # What "required" means here
+// # Behavioral, not source-pattern-matched (§41.1 review round 2, findings Q4/Q5/Q8/Q9)
 //
-// platform.Config.Load's own validation is not a flat list: some
-// variables are unconditionally required (NARVI_STAGE, NARVI_DATABASE_URL,
-// ...), others only once a feature surface is turned on (the five Linear
-// fields, only when NARVI_INGRESS_ENABLED includes "linear"; the object
-// store bundle, only once NARVI_OBJECT_STORE_ENDPOINT is set). Modeling
-// that full conditional structure statically would mean re-implementing
-// Load's own control flow a second time -- exactly the "second, parallel
-// copy" this repo's own conventions (CLAUDE.md: "no I/O... every state
-// transition"; the Dockerfile's own top comment for `make dist`) refuse
-// everywhere else.
+// An earlier version of this function was a go/ast walk over
+// internal/platform/config.go's own SOURCE, hunting for the handful of
+// shapes Load's own source used to say "this variable is missing":
+// a MissingRequiredEnvError/InvalidHMACSecretError composite literal, or a
+// fmt.Errorf whose format string said "required" or "missing". Every
+// review round found another real shape it missed -- an unkeyed composite
+// literal (MissingRequiredEnvError{x} compiles fine, and the scan's own
+// "keyed field only" walk skipped it in silence), a fmt.Errorf built
+// through a helper's own parameter instead of a literal identifier, a
+// table-driven loop accumulating names into a []string before ever
+// calling fmt.Errorf -- because a source-shape scanner can only recognize
+// shapes someone thought to teach it, and "how do I signal a missing
+// variable" is exactly the kind of thing a future contributor has no
+// reason to know this file's scanner cares about.
 //
-// Every one of those variables -- unconditional or feature-gated alike --
-// shares ONE mechanical shape in Load's own source, though: the exact
-// moment Load decides a variable is missing, it appends either
-// &MissingRequiredEnvError{EnvVar: xEnvVarName} (the general case) or
-// &InvalidHMACSecretError{EnvVar: xEnvVarName} (the three HMAC secrets'
-// own distinctly-worded sibling, config.go's own InvalidHMACSecretError
-// doc comment). This function finds every composite literal
-// of either type, anywhere in the file, regardless of which `if` guards
-// it -- an unconditionally-required field and a feature-gated one look
-// identical to this scan, which is exactly the property that makes this
-// scan immune to Load's own branching. A Secret template built for a
-// deployment that enables every surface (the only kind three-plain-
-// manifests-no-Helm, §41.1's own "one configuration surface" principle,
-// can describe) needs every one of these set regardless.
+// This version asks a different question entirely: not "does config.go's
+// SOURCE look like it requires this variable," but "does platform.Load
+// ACTUALLY refuse to boot without it." It calls platform.LoadWithLookup
+// (internal/platform/config.go's own seam, added for exactly this) once
+// per requiredConfigStages value, against a totally empty injected
+// environment (Stage set, nothing else), and walks the errors that call
+// actually returns -- via errors.Join's own Unwrap() []error shape --
+// through envVarNamesOf's own two tiers: a field named EnvVar via
+// reflection (MissingRequiredEnvError, InvalidHMACSecretError,
+// InvalidObjectStoreMaxBytesError, and any FUTURE typed error Load starts
+// returning that happens to expose one -- no list of type names for a new
+// one to be missing from), and, for an error with no such field at all, a
+// fallback that reads the NARVI_* token(s) directly out of the rendered
+// error message itself, whenever that message says "required" or
+// "missing". This is immune, by construction, to every shape named above:
+// a composite literal (keyed or not), a fmt.Errorf built from a literal
+// identifier, a helper function's own parameter, or a table-driven loop's
+// accumulated slice all end up producing SOME error whose Error() text is
+// what an operator would actually see on a failed boot -- and that text,
+// not config.go's source, is what this scanner reads.
 //
-// Two known variables are DELIBERATELY excluded from this mechanical
-// scan, and named here rather than silently missed:
+// Two known variable groups are still handled by hand, via
+// deploySecretExtraVars (see its own doc comment): variables that only
+// become required once an operator sets some OTHER variable first (the
+// allowlist group, the object-store bundle) can't be discovered by a
+// single flat, empty-environment probe -- reaching them would mean
+// simulating every combination of feature flags Load's own branches can
+// take, which is exactly the "re-implement Load's own control flow a
+// second time" this design refuses (CLAUDE.md's own "no I/O... every
+// state transition" convention, applied to this scanner too).
 //
-//   - The three allowlist variables (NARVI_ALLOWED_EMAIL_DOMAINS/
-//     _GITHUB_ORGS/_EMAILS) are required as a GROUP -- Load's own
-//     EmptyAllowlistError fires only when all three are empty at once,
-//     never naming one -- so no single one of them ever appears in a
-//     MissingRequiredEnvError. deploySecretExtraVars (above) adds all three
-//     back in by name (a deployment needs at least one set, and a
-//     template that showed none of them would be actively misleading).
-//   - The object store credential pair (NARVI_OBJECT_STORE_ACCESS_KEY_ID/
-//     _SECRET_ACCESS_KEY) is optional even once object storage itself is
-//     turned on (Load's own InvalidObjectStoreCredentialsError only
-//     fires on a MISMATCHED pair, both-or-neither), so neither name is
-//     required in Load's own sense either. deploySecretExtraVars adds
-//     the whole object-store bundle back in (the endpoint, region and
-//     bucket variables ARE mechanically required once
-//     NARVI_OBJECT_STORE_ENDPOINT is set, but every OTHER
-//     NARVI_OBJECT_STORE_* variable stays invisible to this scan without
-//     it) because a real deployment that wants object storage needs
-//     every one of them, and the Secret template exists to be useful to
-//     an operator, not merely mechanically minimal.
-//
-// Both exceptions are handled the same way ScanRegisteredRoutes's own doc
-// comment handles ITS scanner's blind spots: named in prose, not
-// silently absorbed into the "required" set as if the AST walk had found
-// them on its own.
-//
-// Concretely, RequiredConfigEnvVars parses configPath
-// (internal/platform/config.go) and returns two sets: required (every
-// NARVI_* env var name that can appear as the EnvVar field of a
-// MissingRequiredEnvError or InvalidHMACSecretError composite literal
-// ANYWHERE in the file -- see above for why "anywhere", not "on an
-// unconditional path", is the correct scope) and read (every NARVI_* env
-// var name passed to os.Getenv or os.LookupEnv anywhere in the file, the
-// full superset TestDeploySecretTemplate's own "names one it no longer
-// reads" direction checks against).
-//
-// Mirrors ScanRegisteredRoutes's own two-pass shape (routes.go): a first
-// pass over top-level `const` declarations resolves every
-// `xEnvVarName = "NARVI_..."` identifier to its string value, and a
-// second ast.Inspect walk resolves every CallExpr/CompositeLit site back
-// through that same map.
-//
-// # Fail closed, not silently skip (§41.1 review round 1, finding P5)
-//
-// An earlier version of this function silently `continue`d past three
-// shapes it could not classify: an EnvVar value that was a literal string
-// rather than a resolvable const identifier, an EnvVar value that WAS an
-// identifier but did not resolve to any top-level const (e.g. a helper
-// function's own parameter -- a `requireEnv(&errs, name)`-shaped
-// indirection around MissingRequiredEnvError construction), and a
-// "missing required" signal built any other way entirely (e.g.
-// `fmt.Errorf("missing required %s", xEnvVarName)` instead of one of the
-// two blessed composite-literal types). Every one of those is a real,
-// reachable way to make a variable required that this scanner would then
-// under-count -- proven by mutation: adding any of the three to config.go
-// left TestDeploySecretTemplate green even though secret.yaml named none
-// of the newly-required variables. The only backstop left was
-// `len(required)==0`, which catches a complete refactor but not a
-// realistic partial one (§41.2's own future NARVI_SANDBOX_PROVIDER
-// "refused at boot with the missing names" phrasing reads exactly like
-// the fmt.Errorf shape above).
-//
-// This version closes that gap two ways rather than one, because the two
-// known-missed shapes need different treatment:
-//
-//   - A composite literal of one of requiredConfigErrorTypes now accepts
-//     a literal string EnvVar value directly (no identifier resolution
-//     needed -- there is nothing left to resolve), and now treats an
-//     Ident EnvVar value that does NOT resolve via constValue as a hard
-//     scan error (via scanErr below) instead of silently doing nothing:
-//     a value in this exact shape is unambiguously claiming "this
-//     variable is required," and this scanner has no business pretending
-//     it didn't see the claim just because it can't name the variable.
-//   - A `fmt.Errorf(format, args...)` call whose format string contains
-//     "required" or "missing" (case-insensitively) is now ALSO treated as
-//     a required-variable signal: every arg that is an Ident resolving
-//     via constValue is added to required exactly as if it had come from
-//     a MissingRequiredEnvError literal. Scoped to format strings that
-//     actually say so, rather than every fmt.Errorf call in the file, so
-//     an unrelated validation message (e.g. "invalid X: must be a
-//     positive integer") is never mistaken for a required-variable claim.
-//
-// Finally, as a backstop under BOTH of the above rather than a
-// replacement for either: every "NARVI_..." string literal found ANYWHERE
-// in the file (not merely inside a recognized shape) must end up in
-// required or read by the time the walk finishes, checked once, after the
-// walk, against the accumulated literals map -- a literal this scanner
-// still cannot account for, in a shape nobody anticipated yet, fails the
-// scan outright rather than being invisibly absorbed. Every literal
-// config.go declares today already round-trips through some xEnvVarName
-// const that IS read via os.Getenv/LookupEnv somewhere in the file, so
-// this backstop costs nothing today (§41.1 review's own finding: "every
-// current site in config.go resolves") -- it only ever fires the moment a
-// FUTURE change introduces a truly unclassifiable one.
+// read is still a plain, deliberately crude superset scan for every
+// "NARVI_..." string literal appearing anywhere in configPath's raw
+// source text (narviEnvVarLiteralPattern) -- TestDeploySecretTemplate's
+// own "names a variable config.go no longer reads at all" direction only
+// ever needs a superset (a literal env var name appearing in config.go's
+// source at all, in any shape whatsoever), never a precise
+// shape-by-shape classification the way "required" did, so a plain text
+// scan is the right tool here and was never the fragile half of this
+// file.
 func RequiredConfigEnvVars(configPath string) (required map[string]bool, read map[string]bool, err error) {
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, configPath, nil, 0)
-	if err != nil {
-		return nil, nil, fmt.Errorf("ops: parse %s: %w", configPath, err)
-	}
-
-	constValue := map[string]string{}
-	for _, decl := range file.Decls {
-		gen, ok := decl.(*ast.GenDecl)
-		if !ok || gen.Tok != token.CONST {
-			continue
-		}
-		for _, spec := range gen.Specs {
-			vs, ok := spec.(*ast.ValueSpec)
-			if !ok || len(vs.Names) != 1 || len(vs.Values) != 1 {
-				continue
-			}
-			lit, ok := vs.Values[0].(*ast.BasicLit)
-			if !ok || lit.Kind != token.STRING {
-				continue
-			}
-			v, err := strconv.Unquote(lit.Value)
-			if err != nil {
-				continue
-			}
-			constValue[vs.Names[0].Name] = v
-		}
-	}
-
 	required = map[string]bool{}
-	read = map[string]bool{}
-	// literalLine records the FIRST line every "NARVI_..." string literal
-	// was found at, anywhere in the file -- the fail-closed backstop's own
-	// input, checked once after the walk below finishes.
-	literalLine := map[string]int{}
-
-	var scanErr error
-	ast.Inspect(file, func(n ast.Node) bool {
-		if scanErr != nil {
-			return false
+	for _, stage := range requiredConfigStages {
+		env := map[string]string{platform.StageEnvVarName: string(stage)}
+		lookup := func(key string) (string, bool) {
+			v, ok := env[key]
+			return v, ok
 		}
-		switch node := n.(type) {
-		case *ast.BasicLit:
-			if node.Kind != token.STRING {
-				return true
-			}
-			v, unquoteErr := strconv.Unquote(node.Value)
-			if unquoteErr != nil || !strings.HasPrefix(v, "NARVI_") {
-				return true
-			}
-			if _, seen := literalLine[v]; !seen {
-				literalLine[v] = fset.Position(node.Pos()).Line
-			}
-
-		case *ast.CallExpr:
-			sel, ok := node.Fun.(*ast.SelectorExpr)
-			if !ok {
-				return true
-			}
-			pkgIdent, ok := sel.X.(*ast.Ident)
-			if !ok {
-				return true
-			}
-			switch {
-			case pkgIdent.Name == "os" && (sel.Sel.Name == "Getenv" || sel.Sel.Name == "LookupEnv"):
-				if len(node.Args) == 0 {
-					return true
-				}
-				argIdent, ok := node.Args[0].(*ast.Ident)
-				if !ok {
-					return true
-				}
-				if v, ok := constValue[argIdent.Name]; ok {
-					read[v] = true
-				}
-
-			case pkgIdent.Name == "fmt" && sel.Sel.Name == "Errorf":
-				if len(node.Args) < 2 {
-					return true
-				}
-				formatLit, ok := node.Args[0].(*ast.BasicLit)
-				if !ok || formatLit.Kind != token.STRING {
-					return true
-				}
-				format, unquoteErr := strconv.Unquote(formatLit.Value)
-				if unquoteErr != nil {
-					return true
-				}
-				lower := strings.ToLower(format)
-				if !strings.Contains(lower, "required") && !strings.Contains(lower, "missing") {
-					return true
-				}
-				for _, arg := range node.Args[1:] {
-					argIdent, ok := arg.(*ast.Ident)
-					if !ok {
-						continue
-					}
-					if v, ok := constValue[argIdent.Name]; ok {
-						required[v] = true
-					}
-				}
-			}
-
-		case *ast.CompositeLit:
-			typeIdent, ok := node.Type.(*ast.Ident)
-			if !ok || !requiredConfigErrorTypes[typeIdent.Name] {
-				return true
-			}
-			for _, elt := range node.Elts {
-				kv, ok := elt.(*ast.KeyValueExpr)
-				if !ok {
-					continue
-				}
-				keyIdent, ok := kv.Key.(*ast.Ident)
-				if !ok || keyIdent.Name != "EnvVar" {
-					continue
-				}
-				switch val := kv.Value.(type) {
-				case *ast.Ident:
-					if v, ok := constValue[val.Name]; ok {
-						required[v] = true
-					} else {
-						scanErr = fmt.Errorf("ops: %s:%d: %s{EnvVar: %s} -- %s does not resolve to any top-level NARVI_* const in this file (a helper function's own parameter, perhaps); RequiredConfigEnvVars cannot classify this required-variable claim, and a claim it cannot see is a claim deploy/control-plane/secret.yaml's own drift guard cannot protect either",
-							configPath, fset.Position(val.Pos()).Line, typeIdent.Name, val.Name, val.Name)
-						return false
-					}
-				case *ast.BasicLit:
-					if val.Kind != token.STRING {
-						scanErr = fmt.Errorf("ops: %s:%d: %s{EnvVar: ...} -- EnvVar is a non-string literal RequiredConfigEnvVars cannot classify",
-							configPath, fset.Position(val.Pos()).Line, typeIdent.Name)
-						return false
-					}
-					if v, unquoteErr := strconv.Unquote(val.Value); unquoteErr == nil {
-						required[v] = true
-					}
-				default:
-					scanErr = fmt.Errorf("ops: %s:%d: %s{EnvVar: ...} -- EnvVar is neither an identifier nor a string literal; RequiredConfigEnvVars cannot classify this required-variable claim",
-						configPath, fset.Position(kv.Value.Pos()).Line, typeIdent.Name)
-					return false
+		if _, loadErr := platform.LoadWithLookup(lookup); loadErr != nil {
+			for _, leaf := range flattenJoinedErrors(loadErr) {
+				for _, name := range envVarNamesOf(leaf) {
+					required[name] = true
 				}
 			}
 		}
-		return true
-	})
-	if scanErr != nil {
-		return nil, nil, scanErr
 	}
 
-	for v, line := range literalLine {
-		if required[v] || read[v] {
-			continue
-		}
-		return nil, nil, fmt.Errorf("ops: %s:%d: found the literal %q, which looks like an env var name, in a shape RequiredConfigEnvVars does not recognize as either a required-variable signal or a plain os.Getenv/LookupEnv read -- classify it explicitly (route it through a top-level xxxEnvVarName const referenced by identifier, exactly like every other variable in this file) or teach this scanner its new shape; a variable this scanner cannot see is a variable deploy/control-plane/secret.yaml's own drift guard cannot protect either",
-			configPath, line, v)
+	raw, readErr := os.ReadFile(configPath)
+	if readErr != nil {
+		return nil, nil, fmt.Errorf("ops: read %s: %w", configPath, readErr)
+	}
+	read = map[string]bool{}
+	for _, m := range narviEnvVarLiteralPattern.FindAllStringSubmatch(string(raw), -1) {
+		read[m[1]] = true
 	}
 
 	return required, read, nil
+}
+
+// flattenJoinedErrors recursively expands every errors.Join tree (Load's
+// own Unwrap() []error shape) into its leaf errors, so envVarFieldOf below
+// only ever has to look at one error at a time.
+func flattenJoinedErrors(err error) []error {
+	if err == nil {
+		return nil
+	}
+	if u, ok := err.(interface{ Unwrap() []error }); ok {
+		var out []error
+		for _, e := range u.Unwrap() {
+			out = append(out, flattenJoinedErrors(e)...)
+		}
+		return out
+	}
+	return []error{err}
+}
+
+// envVarNamesOf extracts every NARVI_* variable name a single leaf error
+// (already unwrapped from Load's own errors.Join tree by
+// flattenJoinedErrors) names as missing, in two tiers:
+//
+//  1. Structured, via reflection on a field called EnvVar -- deliberately
+//     not a hard-coded list of type names (see RequiredConfigEnvVars' own
+//     doc comment for why): any error type platform.Load returns that
+//     exposes a string field named EnvVar is picked up, with nothing here
+//     needing to change the day Load starts returning a new one.
+//     MissingRequiredEnvError, InvalidHMACSecretError, and
+//     InvalidObjectStoreMaxBytesError all satisfy this today.
+//  2. A fallback, for a "this is missing/required" error that carries NO
+//     structured field at all -- a plain fmt.Errorf, however it was
+//     built (a bare identifier, a helper function's own parameter, a
+//     table-driven loop's accumulated []string joined into the message):
+//     if the error's own rendered String() both mentions "required" or
+//     "missing" AND contains an actual NARVI_* token, every such token is
+//     extracted directly from the message text Load itself produced.
+//     This is NOT a source-shape heuristic -- it never looks at
+//     config.go's source at all -- it only reads the message an operator
+//     would see on a real failed boot, which is necessarily the SAME
+//     text regardless of which of the shapes above built it. A message
+//     that says "required"/"missing" but names no NARVI_ variable (e.g.
+//     EmptyAllowlistError's own "at least one of ... must be set", which
+//     says neither word) is deliberately left to deploySecretExtraVars
+//     instead of being guessed at here.
+func envVarNamesOf(err error) []string {
+	v := reflect.ValueOf(err)
+	for v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			break
+		}
+		v = v.Elem()
+	}
+	if v.Kind() == reflect.Struct {
+		if f := v.FieldByName("EnvVar"); f.IsValid() && f.Kind() == reflect.String && f.String() != "" {
+			return []string{f.String()}
+		}
+	}
+
+	msg := err.Error()
+	lower := strings.ToLower(msg)
+	if !strings.Contains(lower, "required") && !strings.Contains(lower, "missing") {
+		return nil
+	}
+	return narviTokenPattern.FindAllString(msg, -1)
 }
