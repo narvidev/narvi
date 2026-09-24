@@ -94,6 +94,41 @@ func Compare(in Input) (Report, error) {
 		}
 	}
 
+	// D6/D12: a surface whose BASE row already says "retired" produces NO
+	// row-37 finding at all when its file disappears (DiffSurfaceSet's own
+	// `if b.Status == StatusRetired { continue }` -- that is the point of
+	// the three-PR retirement procedure's own PR C, COMPATIBILITY.md
+	// "Retiring an old version"). But the loop above only ever forces a
+	// MAJOR bump and marks the surface changed FROM a row-37/38 Finding,
+	// so exactly the one deletion this policy sanctions escaped both the
+	// MAJOR-bump requirement and the CHANGELOG "### <path>" subsection
+	// requirement COMPATIBILITY.md's versioning section says removal
+	// "always requires at least a MAJOR bump" for. Determine "a surface
+	// disappeared" directly from the two manifests instead of from
+	// whichever Finding happened to fire, so the retired case is covered
+	// on the exact same terms as the non-retired one (which already gets
+	// this from row 37's own MAJOR severity, redundantly with this check).
+	baseByPath := map[string]ManifestSurface{}
+	for _, s := range baseManifest.Surfaces {
+		baseByPath[s.Path] = s
+	}
+	headByPath := map[string]ManifestSurface{}
+	for _, s := range headManifest.Surfaces {
+		headByPath[s.Path] = s
+	}
+	for p := range baseByPath {
+		if _, stillPresent := headByPath[p]; !stillPresent {
+			changedSurfaces[p] = true
+			forceMajorBump = true
+		}
+	}
+	for p := range headByPath {
+		if _, existedBefore := baseByPath[p]; !existedBefore {
+			changedSurfaces[p] = true
+			forceMajorBump = true
+		}
+	}
+
 	// C1: a surface present in BOTH manifests must keep the same
 	// direction -- a manifest-only flip (rule 44) is MAJOR even when the
 	// schema content is byte-identical, and is never something a PR can
