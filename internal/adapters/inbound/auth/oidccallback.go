@@ -102,7 +102,12 @@ const (
 // timeouts/secureCookies mirror NewCallbackHandler's own identical
 // parameters one-for-one (callback.go) -- the SAME stores, the SAME
 // allowlist config, reused rather than a second, independently-wired
-// copy of any of them.
+// copy of any of them. linkPrompts is the SAME identity_link_prompts
+// store the Slack/Linear auto-link algorithm already uses
+// (internal/app/identitylink.Deps.LinkPrompts) -- threaded through here
+// because identitylink.AutoLink (called from resolveOIDCUser's own graph
+// -merge branch) unconditionally deletes any still-pending prompt for the
+// identity it just linked, exactly like it does for Slack/Linear.
 func NewOIDCCallbackHandler(
 	pool *pgxpool.Pool,
 	cache *OIDCProviderCache,
@@ -110,6 +115,7 @@ func NewOIDCCallbackHandler(
 	identities *postgres.IdentityStore,
 	auditLog *postgres.AuditLogStore,
 	userSessions *postgres.UserSessionStore,
+	linkPrompts *postgres.IdentityLinkPromptStore,
 	allowlist AllowlistConfig,
 	initialAdminEmails []string,
 	timeouts platform.Timeouts,
@@ -245,6 +251,7 @@ func NewOIDCCallbackHandler(
 			users:              users,
 			identities:         identities,
 			auditLog:           auditLog,
+			linkPrompts:        linkPrompts,
 			allowlist:          allowlist,
 			initialAdminEmails: initialAdminEmails,
 		}, externalID, email, claims)
@@ -328,6 +335,7 @@ type oidcResolveDeps struct {
 	users              *postgres.UserStore
 	identities         *postgres.IdentityStore
 	auditLog           *postgres.AuditLogStore
+	linkPrompts        *postgres.IdentityLinkPromptStore
 	allowlist          AllowlistConfig
 	initialAdminEmails []string
 }
@@ -372,10 +380,11 @@ func resolveOIDCUser(ctx context.Context, deps oidcResolveDeps, externalID, emai
 	// "never guess."
 	if matchedUserIDStr, ok := domainidentitylink.Decide(matched); ok {
 		res, err := identitylink.AutoLink(ctx, identitylink.Deps{
-			Pool:       deps.pool,
-			Users:      deps.users,
-			Identities: deps.identities,
-			AuditLog:   deps.auditLog,
+			Pool:        deps.pool,
+			Users:       deps.users,
+			Identities:  deps.identities,
+			AuditLog:    deps.auditLog,
+			LinkPrompts: deps.linkPrompts,
 		}, sqlcgen.IdentityProviderOidc, externalID, email, matchedUserIDStr)
 		if err != nil {
 			return pgtype.UUID{}, "", http.StatusInternalServerError, "internal error"

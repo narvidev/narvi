@@ -1731,6 +1731,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		identityStore,
 		auditLogStore,
 		userSessionStore,
+		identityLinkPromptStore,
 		allowlist,
 		cfg.InitialAdminEmails,
 		cfg.Timeouts,
