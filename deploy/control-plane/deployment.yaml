@@ -71,14 +71,34 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
-          # /health (controlplane/health.go): a real pool.Ping bounded by
-          # Timeouts.HealthCheckTimeout, 503 on a DB failure -- fit for
-          # both liveness and readiness. Distinct probes (rather than one
-          # reused verbatim) so a slow-starting DB delays readiness
-          # without tripping a liveness restart during the same window.
+          # readinessProbe uses /health (controlplane/health.go): a real
+          # pool.Ping bounded by Timeouts.HealthCheckTimeout, 503 on a DB
+          # failure -- exactly what readiness is for for (take a replica
+          # out of the Service's own endpoint list the moment its own DB
+          # connection is bad, put it back the moment Ping succeeds
+          # again).
+          #
+          # livenessProbe deliberately does NOT reuse /health (§41.1
+          # review round 1, finding P8): liveness exists to catch a wedged
+          # PROCESS, never an unavailable DEPENDENCY -- wiring it to the
+          # same DB-backed endpoint means a Postgres outage past
+          # roughly failureThreshold*periodSeconds (45s here) gets EVERY
+          # replica SIGKILLed at once (dropping in-flight SSE/WebSocket
+          # streams), and the restart then fails at boot-time migrations
+          # (controlplane/serve.go's own applyMigrations call) while the
+          # DB is still down, pushing every replica into CrashLoopBackOff
+          # instead of simply going unready and recovering the moment
+          # Ping succeeds again. This binary exposes no other lightweight,
+          # DB-independent HTTP endpoint today (only /health and the
+          # DB/auth-backed /api/*, /.well-known/* routes exist), and
+          # adding one JUST for this would change controlplane/testdata/
+          # routes.golden for a probe's sake alone -- a plain tcpSocket
+          # check on the serving port is the least-surprising
+          # process-liveness signal available without doing that: it
+          # fails only when the listener itself is gone (a wedged/dead
+          # process), never on a DB blip.
           livenessProbe:
-            httpGet:
-              path: /health
+            tcpSocket:
               port: http
             initialDelaySeconds: 10
             periodSeconds: 15
