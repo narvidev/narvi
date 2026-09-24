@@ -365,44 +365,96 @@ dist: web-build lint-web-assets
 
 # verify-control-plane-image is Step 162's own exit-criterion proof
 # (docs/TECHNICAL_PLAN.md §41.1), run locally and by
-# .github/workflows/ci.yml's own "control-plane-image" job on every PR.
-# Builds the repo-root Dockerfile, brings up docker-compose.dev.yml (the
-# SAME Postgres+MinIO `make dev` itself uses), runs the image against it
-# with `make dev`'s own environment variables -- copied here rather than
-# shared via a macro, matching this repo's own established precedent for
-# this exact list (controlplane/build_integration_test.go's own
-# setRequiredEnv doc comment: "an exact copy... for the same reason") --
-# with DATABASE_URL/OBJECT_STORE_ENDPOINT's hostnames rewritten to
-# host.docker.internal, since those two are the only values the
-# CONTAINERIZED binary itself must dial out to (every other "localhost" in
-# `make dev`'s list is a value baked into config, e.g. PUBLIC_BASE_URL,
-# never dialed by this process). Checks both exit-criterion halves:
+# .github/workflows/ci.yml's own "control-plane-image" job on every PR AND
+# every v*.*.* tag push (publish-control-plane-image `needs:` that same
+# job -- §41.1 review round 1, finding P6 -- so nothing reaches GHCR
+# without this target passing against that exact commit first).
 #
-#   1. Every "METHOD /path" line in controlplane/testdata/routes.golden
-#      (Phase 12's own golden, reused rather than a second comparison
-#      invented for this Step) is requested against the running image,
-#      with each "{param}" path segment substituted for a fixed
-#      placeholder, and must NOT come back 404. A negative control (a path
-#      guaranteed absent from any real router) is checked FIRST and must
-#      itself 404 -- otherwise every route check below would be vacuous
-#      (internal/adapters/inbound/webui's own Mount answers a real,
-#      unmodified 404 for an unmatched request under any of routes.
-#      golden's own path prefixes, per that package's own isProtectedPath;
-#      it never falls through to the SPA's 200 shell for one of these).
-#      This is a plain curl loop, deliberately -- a Go HTTP client here
-#      would trip tools/lint/narvichecks's own httpclientban (§30.3: net/
-#      http's client-side surface is confined to the outbound/sandbox
-#      trees), which this standalone verification step has no business
-#      joining.
-#   2. A second, freshly-run container with ZERO configuration must exit
+# Brings up ONLY docker-compose.dev.yml's own postgres service -- never
+# minio/minio-init (§41.1 review round 1, finding P4): the object-store
+# variables are entirely optional, feature-flagged on
+# NARVI_OBJECT_STORE_ENDPOINT alone (internal/platform/config.go), and
+# this target's own containers never set it, so no running MinIO is ever
+# needed to boot. Sidestepped rather than fixed: minio-init's own image
+# (docker-compose.dev.yml) still pulls minio/mc from Docker Hub, which
+# stopped answering anonymous pulls -- this target has no reason to bring
+# MinIO up at all, so it never hits that pull.
+#
+# Runs the compose stack under its OWN project name (-p), fully separate
+# from `make dev`'s default project: this target must not disturb (or be
+# disturbed by) a developer's already-running dev stack, and bringing up
+# a SEPARATE, disposable Postgres (own container, own volume, own
+# network, torn down in the trap below) is simpler and safer than trying
+# to share one — a fresh, guaranteed-freshly-migrated database beats
+# reusing whatever schema state a long-lived `make dev` volume happens to
+# be in. NARVI_DEV_PG_PORT is overridden to a dedicated port for this
+# project alone, so its own host-published port binding can never collide
+# with a `make dev` stack that is already up on the default one.
+#
+# The control-plane container(s) below reach Postgres over that compose
+# project's OWN network, by the plain service name "postgres" (compose's
+# embedded DNS resolves it, confirmed empirically), NOT via
+# host.docker.internal + the published host port the way this target used
+# to. That published port is bound to 127.0.0.1 only (docker-compose.dev.
+# yml), which host.docker.internal resolves straight to on Docker
+# Desktop's own loopback-routing gateway -- but NOT on a plain Linux
+# Engine, where host.docker.internal resolves to the docker0 bridge
+# gateway, and a 127.0.0.1-bound published port's own docker-proxy/DNAT
+# rule never answers traffic arriving from there (§41.1 review round 1,
+# finding P4 -- reproduced directly: a container dialing the docker0
+# gateway got connection-refused against a port docker-compose.dev.yml
+# publishes exactly this way). The compose-network approach sidesteps the
+# whole distinction: confirmed working identically against a real Docker
+# Desktop instance and Linux Engine's own bridge-network DNS resolution
+# path alike, since neither depends on host.docker.internal at all.
+#
+# This Step's own exit criterion (§41.1) has three parts, checked in
+# order below -- each one replacing what an earlier version of this
+# target tried to prove with a single `curl` loop, which could not
+# actually prove any of them (§41.1 review round 1, findings P1-P3: a
+# live probe that only checks "not 404" cannot distinguish a genuinely
+# absent route from one behind auth middleware that answers 401 for ANY
+# unmatched sub-path — including a REMOVED one — and never notices an
+# EXTRA route the golden doesn't have at all):
+#
+#   1. `docker run <image> routes` (the "routes" subcommand,
+#      controlplane/routescmd.go) against the SAME migrated Postgres,
+#      piped straight to `cmp` against controlplane/testdata/
+#      routes.golden. "routes" loads config, opens the pool, applies
+#      migrations, and calls the EXACT SAME Build serve() calls -- it
+#      just never calls GitHub and never starts a listener (no
+#      verifyGitHubAppScopeAtBoot, no app.Run) -- so this is a clean,
+#      byte-for-byte route-table-identity proof, independent of GitHub
+#      reachability entirely. TestRunRoutesCommand_MatchesGolden
+#      (controlplane/routescmd_integration_test.go) pins this same
+#      output format in Go; this is that same proof, run against the
+#      actual packaged image instead of `go test`.
+#   2. The image actually SERVES real HTTP traffic. tools/ghappstub is a
+#      tiny local stand-in for GitHub's own REST API (GET /app only),
+#      built and run as a plain background process on THIS host (never a
+#      new image pull). The control-plane container is pointed at it via
+#      NARVI_GITHUB_API_BASE_URL (internal/platform/config.go -- §41.1
+#      review round 1 finding P2's own fix for the hard-coded
+#      "https://api.github.com" literal that made this proof impossible:
+#      serve()'s own real, UNMODIFIED verifyGitHubAppScopeAtBoot check
+#      used to refuse to boot against a bogus fixture App ID, and the
+#      only alternatives were reaching the real GitHub API from CI or
+#      weakening the boot-time check itself, which §30.4(4) forbids).
+#      ghappstub grants exactly the read-only permission set that check
+#      accepts, so the packaged image's own real scope check runs,
+#      succeeds, and /health then answers a genuine 200 -- proving the
+#      image opens its listener and serves, not merely that its router
+#      object can be constructed. Reached via
+#      --add-host=host.docker.internal:host-gateway (this one IS the
+#      right tool for reaching a wildcard-bound HOST PROCESS, unlike the
+#      Postgres case above -- host-gateway resolves to an address the
+#      HOST'S OWN kernel routes to any 0.0.0.0-bound process, on both
+#      Docker Desktop and a plain Linux Engine, which is exactly what
+#      tools/ghappstub's own doc comment requires of it).
+#   3. A second, freshly-run container with ZERO configuration must exit
 #      non-zero with platform.Config's own validation message on stderr,
-#      never a panic/stack trace.
-#
-# docker-compose.dev.yml's own Postgres/MinIO are left running afterward
-# (this target only ever tears down the container IT started) -- `make
-# dev`'s own compose stack is long-lived across invocations by design
-# (named volumes), and this target must not surprise a developer who has
-# it up in another terminal.
+#      never a panic/stack trace -- unchanged from before, and checked
+#      FIRST below since it needs neither Postgres nor ghappstub.
 #
 # --platform linux/amd64 is pinned deliberately, not left to the host's
 # own default: .github/workflows/ci.yml's own control-plane-image and
@@ -410,24 +462,61 @@ dist: web-build lint-web-assets
 # and deploy/control-plane/deployment.yaml targets an ordinary amd64 cloud
 # node pool -- an arm64 host (e.g. Apple Silicon) building without this
 # pin gets a DIFFERENT image than the one CI verifies and the one that
-# ships, and this repository's own internal/platform/otel_test.go
-# currently fails to even compile under GOOS=linux GOARCH=arm64
-# (syscall.Dup2 is undefined on that platform -- confirmed empirically
-# while building this target; a pre-existing gap in this repository's own
-# arm64 support, out of this Step's scope to fix), which
-# `lint-web-assets`'s own `go run ./tools/lint/narvichecks ./...` would
-# otherwise hit on exactly that host/architecture combination.
+# ships. §41.1 review round 1 (finding P7) asked whether this pin is still
+# earning its keep, since the control-plane BINARY itself builds cleanly
+# for arm64 (`GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build
+# ./cmd/control-plane` succeeds). It is: `make dist` (what this
+# Dockerfile's own build stage runs) depends on lint-web-assets, which
+# loads every package under GOFLAGS=-tags=web_assets, INCLUDING _test.go
+# files that never ship in the binary -- and
+# internal/platform/otel_test.go fails to even compile under
+# GOOS=linux/GOARCH=arm64 (undefined: syscall.Dup2, confirmed directly
+# against this exact worktree, both as a bare `go vet` and through the
+# built narvichecks binary). So a plain `docker build .` with no
+# --platform, on a real arm64 host, DOES fail in stage 1 without this pin
+# -- a pre-existing, out-of-scope arm64 test bug (unix.Dup2/syscall.Dup3
+# would work there instead), left unfixed here and named in this PR's own
+# description; the pin stays.
+NARVI_CPVERIFY_COMPOSE_PROJECT := narvi-cpverify
+NARVI_CPVERIFY_PG_PORT := 25432
+NARVI_CPVERIFY_GHAPPSTUB_PORT := 18081
+
 verify-control-plane-image:
 	set -eu; \
-	trap 'docker rm -f narvi-control-plane-verify >/dev/null 2>&1 || true' EXIT; \
+	GHAPPSTUB_PID=""; \
+	trap ' \
+		docker rm -f narvi-control-plane-verify >/dev/null 2>&1 || true; \
+		if [ -n "$$GHAPPSTUB_PID" ]; then kill "$$GHAPPSTUB_PID" >/dev/null 2>&1 || true; fi; \
+		NARVI_DEV_PG_PORT=$(NARVI_CPVERIFY_PG_PORT) docker compose -f docker-compose.dev.yml -p $(NARVI_CPVERIFY_COMPOSE_PROJECT) down -v >/dev/null 2>&1 || true \
+	' EXIT; \
 	docker build --platform linux/amd64 -t narvi-control-plane:verify .; \
-	docker compose -f docker-compose.dev.yml up -d --wait; \
-	docker rm -f narvi-control-plane-verify >/dev/null 2>&1 || true; \
-	docker run -d --name narvi-control-plane-verify \
-		--add-host=host.docker.internal:host-gateway \
-		-p 18080:8080 \
+	NARVI_DEV_PG_PORT=$(NARVI_CPVERIFY_PG_PORT) docker compose -f docker-compose.dev.yml -p $(NARVI_CPVERIFY_COMPOSE_PROJECT) up -d --wait postgres; \
+	NETWORK=$(NARVI_CPVERIFY_COMPOSE_PROJECT)_default; \
+	DBURL=postgres://narvi:narvi@postgres:5432/narvi?sslmode=disable; \
+	echo "--- checking unconfigured boot refuses cleanly ---"; \
+	set +e; \
+	docker run --rm narvi-control-plane:verify serve >/tmp/narvi-control-plane-noconfig.stdout 2>/tmp/narvi-control-plane-noconfig.stderr; \
+	status=$$?; \
+	set -e; \
+	if [ "$$status" -eq 0 ]; then \
+		echo "expected non-zero exit with no configuration at all, got 0" >&2; \
+		exit 1; \
+	fi; \
+	if ! grep -qi "missing required" /tmp/narvi-control-plane-noconfig.stderr; then \
+		echo "expected platform.Config's own validation message (\"missing required ...\") on stderr" >&2; \
+		cat /tmp/narvi-control-plane-noconfig.stderr >&2; \
+		exit 1; \
+	fi; \
+	if grep -qiE 'panic:|goroutine [0-9]+ \[' /tmp/narvi-control-plane-noconfig.stderr; then \
+		echo "got a panic/stack trace on stderr, not a clean validation error" >&2; \
+		cat /tmp/narvi-control-plane-noconfig.stderr >&2; \
+		exit 1; \
+	fi; \
+	echo "unconfigured boot OK: exit=$$status, stderr names platform.Config's own validation message, no panic"; \
+	echo "--- checking the route table (docker run <image> routes) ---"; \
+	docker run --rm --network "$$NETWORK" \
 		-e NARVI_STAGE=development \
-		-e NARVI_DATABASE_URL=postgres://narvi:narvi@host.docker.internal:$${NARVI_DEV_PG_PORT:-5432}/narvi?sslmode=disable \
+		-e NARVI_DATABASE_URL="$$DBURL" \
 		-e NARVI_HMAC_SANDBOX_SECRET=dev-only-insecure-sandbox-secret \
 		-e NARVI_HMAC_BOTS_SECRET=dev-only-insecure-bots-secret \
 		-e NARVI_HMAC_WEBHOOK_SECRET=dev-only-insecure-webhook-secret \
@@ -451,12 +540,59 @@ verify-control-plane-image:
 		-e NARVI_ANTHROPIC_API_KEY=dev-anthropic-api-key-placeholder \
 		-e NARVI_INTENT_CLASSIFIER_PROVIDER=anthropic \
 		-e NARVI_INTENT_CLASSIFIER_MODEL=claude-haiku-4-5 \
-		-e NARVI_OBJECT_STORE_ENDPOINT=http://host.docker.internal:$${NARVI_DEV_MINIO_PORT:-9000} \
-		-e NARVI_OBJECT_STORE_REGION=us-east-1 \
-		-e NARVI_OBJECT_STORE_BUCKET=narvi-dev-uploads \
-		-e NARVI_OBJECT_STORE_ACCESS_KEY_ID=narvi \
-		-e NARVI_OBJECT_STORE_SECRET_ACCESS_KEY=narvi-dev-secret \
-		-e NARVI_OBJECT_STORE_USE_PATH_STYLE=true \
+		-e NARVI_GITHUB_APP_ID=999999 \
+		-e NARVI_GITHUB_APP_PRIVATE_KEY=LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVktLS0tLQpNSUlFcEFJQkFBS0NBUUVBMlozYVRnSXR6cE1YaXd0UVZGZW16VlZsd0JYY1E1RUJ1UUNnT281SG1tNnpyV25DCjliR0xUSzF4S1I1eFVqLy9Rck9taXJBb25lZlB3QmhnVmloTXpoL1NYMHpPOUgvWWhiS3F5aVVsRHI3ck0vMlYKMDZhVWxFdEtLcEZwbWVDemNSaUtPaGFTeWt1Q09XYVJzQWpWMzFSUGVVTi9MaVl6VUswTmlhL2piU05BRENYQwp3MzJKUjh0TmE1U1VwOFJ6amJkdWdUd0EvT1l4SXZTNmZSTnYvM0lWUXVBSGZaTFhHTmFhZGt3KzBPem1LY2x3Ck9NQmZZejRYRjdzOHFGOWR5eFhscm84eTNZak1COGcxYXJBcG9IeExyVlZ5S0xmN3h6VWJ3cG1uTW9QS2NKanYKMXN4bG5BMFhWcEwrZk1RN3RoV3dkOUZuSDBpOS8vcCs0c0dmeXdJREFRQUJBb0lCQUNIUngyQ0NOQzQ3YTlnLwpETi9lczF5TDNnRkpKRzhYdFFYVVZCSmxsRGtxNVIrWkpTUmIwRU05WFMyL3ZtckM2VityWGNHRitQbjVVYThQCjJzRHBDRzZzUVZ4d0ttV1RETXBTWnZwOVpWSHlWOGsvcXE0MjREWmZzUW9HaVR2UjBQRk5tQVhKQmswTUNSUDAKbmNXV3llNG9ReVdjV01LS1MwVkpiNllyUUpQd01lYVpwbkxEUGsvUDFhZnZyVkxHMG81SXRZNUxGa1dHaVdTYgpDbCtwOERGbytSWlFmVW1ERzdEY2hPWHIvZTJvd1NEODFIV2N3SXlzUlZxcGxPL3d4M2xuMjJIaUR5dVVxWTN4CmNQS2w5RHZ6c0I1NzZVU09MS0IvSGkvTjNIemc1bCt2V1MzZVZYeXovWlZYRnkrY3NkVkV6eG03QjA4QWlZK1UKRmo3Q3hjRUNnWUVBLzVDMkRWazMwQXUzRElYTnpxalFXUWJYV3BsWG5MNFU1NUJsUExYSWt3QlRHVU4rNFlOMQppQUNOM00wMUkyVnRHQ1B4a2pVbTg1WWxMc2tJYitaNGpyeW9NWk5XQzd1dzNyQ01LYit4aCtmZmdpdWNjSnRMClBMWGNsU203NzFBQ2FBT2FOR0R5RkduK3V3UzM5WDZ6MGJvaXIzc1I2NkFkVGx6TzJVYlhDNnNDZ1lFQTJmeWQKemhaYXRaMGxsYnZrcHdTbnozOEd5aWpnQjI1NmNyQ1dBSFo1dmwrVndvZ2Y0ZnllT0tacTFIalZkVSs3cUJOUgpEcGJDYVlkQWEwTXdMdXZ2Ti9jWVROVkpYUlM2S2ZOL3ZLUXBFQVFSMXN4L29Rd2s5TW9lbjJoSFoxVnBzM0pCClYrdVk3cDE0bVYxR2JIdjM1V3hQeXdKR1FWdlZiMklVWnNaK25HRUNnWUVBNVYwNUpxM0YyNkJIL3FNdjNLUEIKcWNUc0RsSEZRZFdPNld5OGowb080Mi9OSk1WZzRJQ2RRUnhPTmJhdVZFQTVNd3MvU1pzT2hGdGlyNlNaUCtTMgptbFJURjN0R0pHMmxCWmVwaythSkxKSThGSldUWjdUWVIzcG9xQzYyanNkZUFZQUtLNncrVjNmeHVHTTV2c2lpCkZqNVoxdWc3WXg5bWJlZjVkU09RNk5VQ2dZQlBWRGx4aUgwV1hzd1F3OElnYmZkTDhlUmNxYWR0ek96TzFDaWkKbm5zTHB1bHZVKzZXWlVLSFJ6alZmZXZndDFXSmd3NGFpdzdSTEtGcTU1YWZYTWsveXJLVE00TnhWbHV4YktYdAoxcWdDNWhnLzNVZ05LY2hCTlZVVG1mVnlTNGtkL3RSODFJWmhQL2xsaHFaY1VIa1VpdWcyN3VyMldoOUFXNmNsCkI5T0h3UUtCZ1FEekt2YzMvWDZ6NzdMeUFqb1BIZUpIbXQyL2tSWllJQjNmUUlsRkg0R3JoVUg1TXdLNklIeUkKWGxPUU53ZHVwdm5QaXlHS0dYeUwvcHJSVGdxQXpGMUFPNW0xWG8wVlJnMVZTeGp6Y1RPTU0zVGpnYU5GYmlMdwpreUovZjlhdzhrUTU2RFA2OWlzV1BKaVUyQko1blZLUTJPVEJwSHNTa2h5eS94amZaT29zbFE9PQotLS0tLUVORCBSU0EgUFJJVkFURSBLRVktLS0tLQo= \
+		narvi-control-plane:verify routes > /tmp/narvi-control-plane-routes.actual; \
+	if ! cmp -s controlplane/testdata/routes.golden /tmp/narvi-control-plane-routes.actual; then \
+		echo "route table does not match controlplane/testdata/routes.golden byte-for-byte:" >&2; \
+		diff -u controlplane/testdata/routes.golden /tmp/narvi-control-plane-routes.actual >&2 || true; \
+		exit 1; \
+	fi; \
+	echo "routes OK: docker run <image> routes matches controlplane/testdata/routes.golden byte-for-byte"; \
+	echo "--- checking the image actually serves (ghappstub + /health) ---"; \
+	go build -o /tmp/narvi-ghappstub ./tools/ghappstub; \
+	PORT=$(NARVI_CPVERIFY_GHAPPSTUB_PORT) /tmp/narvi-ghappstub & \
+	GHAPPSTUB_PID=$$!; \
+	stub_ok=""; \
+	for i in $$(seq 1 30); do \
+		if curl -fsS "http://127.0.0.1:$(NARVI_CPVERIFY_GHAPPSTUB_PORT)/app" >/dev/null 2>&1; then stub_ok=1; break; fi; \
+		sleep 1; \
+	done; \
+	if [ -z "$$stub_ok" ]; then \
+		echo "tools/ghappstub never became ready" >&2; \
+		exit 1; \
+	fi; \
+	docker rm -f narvi-control-plane-verify >/dev/null 2>&1 || true; \
+	docker run -d --name narvi-control-plane-verify \
+		--network "$$NETWORK" \
+		--add-host=host.docker.internal:host-gateway \
+		-p 18080:8080 \
+		-e NARVI_STAGE=development \
+		-e NARVI_DATABASE_URL="$$DBURL" \
+		-e NARVI_GITHUB_API_BASE_URL=http://host.docker.internal:$(NARVI_CPVERIFY_GHAPPSTUB_PORT) \
+		-e NARVI_HMAC_SANDBOX_SECRET=dev-only-insecure-sandbox-secret \
+		-e NARVI_HMAC_BOTS_SECRET=dev-only-insecure-bots-secret \
+		-e NARVI_HMAC_WEBHOOK_SECRET=dev-only-insecure-webhook-secret \
+		-e NARVI_GITHUB_CLIENT_ID=dev-github-client-id-placeholder \
+		-e NARVI_GITHUB_CLIENT_SECRET=dev-github-client-secret-placeholder \
+		-e NARVI_GITHUB_WEBHOOK_SECRET=dev-only-insecure-github-webhook-secret \
+		-e NARVI_GITHUB_BOT_HANDLE=narvi-bot \
+		-e NARVI_GITHUB_BOT_TOKEN=dev-github-bot-token-placeholder \
+		-e NARVI_PUBLIC_BASE_URL=http://localhost:18080 \
+		-e NARVI_TOKEN_ENCRYPTION_KEY=X4x5GAK5D4bwFxg5fEzToXLfPfe2XwZp8U3CR/Pl1Z4= \
+		-e NARVI_ALLOWED_GITHUB_ORGS=dev-org-placeholder \
+		-e NARVI_MODAL_BASE_URL=http://host.docker.internal:9999 \
+		-e NARVI_MODAL_AUTH_TOKEN=dev-modal-token-placeholder \
+		-e NARVI_LINEAR_WEBHOOK_SECRET=dev-linear-webhook-secret-placeholder \
+		-e NARVI_LINEAR_CLIENT_ID=dev-linear-client-id-placeholder \
+		-e NARVI_LINEAR_CLIENT_SECRET=dev-linear-client-secret-placeholder \
+		-e NARVI_LINEAR_DEFAULT_REPO_NAME=narvi \
+		-e NARVI_LINEAR_DEFAULT_REPO_URL=https://github.com/narvidev/narvi \
+		-e NARVI_SLACK_SIGNING_SECRET=dev-slack-signing-secret-placeholder \
+		-e NARVI_SLACK_BOT_TOKEN=dev-slack-bot-token-placeholder \
+		-e NARVI_ANTHROPIC_API_KEY=dev-anthropic-api-key-placeholder \
+		-e NARVI_INTENT_CLASSIFIER_PROVIDER=anthropic \
+		-e NARVI_INTENT_CLASSIFIER_MODEL=claude-haiku-4-5 \
 		-e NARVI_GITHUB_APP_ID=999999 \
 		-e NARVI_GITHUB_APP_PRIVATE_KEY=LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVktLS0tLQpNSUlFcEFJQkFBS0NBUUVBMlozYVRnSXR6cE1YaXd0UVZGZW16VlZsd0JYY1E1RUJ1UUNnT281SG1tNnpyV25DCjliR0xUSzF4S1I1eFVqLy9Rck9taXJBb25lZlB3QmhnVmloTXpoL1NYMHpPOUgvWWhiS3F5aVVsRHI3ck0vMlYKMDZhVWxFdEtLcEZwbWVDemNSaUtPaGFTeWt1Q09XYVJzQWpWMzFSUGVVTi9MaVl6VUswTmlhL2piU05BRENYQwp3MzJKUjh0TmE1U1VwOFJ6amJkdWdUd0EvT1l4SXZTNmZSTnYvM0lWUXVBSGZaTFhHTmFhZGt3KzBPem1LY2x3Ck9NQmZZejRYRjdzOHFGOWR5eFhscm84eTNZak1COGcxYXJBcG9IeExyVlZ5S0xmN3h6VWJ3cG1uTW9QS2NKanYKMXN4bG5BMFhWcEwrZk1RN3RoV3dkOUZuSDBpOS8vcCs0c0dmeXdJREFRQUJBb0lCQUNIUngyQ0NOQzQ3YTlnLwpETi9lczF5TDNnRkpKRzhYdFFYVVZCSmxsRGtxNVIrWkpTUmIwRU05WFMyL3ZtckM2VityWGNHRitQbjVVYThQCjJzRHBDRzZzUVZ4d0ttV1RETXBTWnZwOVpWSHlWOGsvcXE0MjREWmZzUW9HaVR2UjBQRk5tQVhKQmswTUNSUDAKbmNXV3llNG9ReVdjV01LS1MwVkpiNllyUUpQd01lYVpwbkxEUGsvUDFhZnZyVkxHMG81SXRZNUxGa1dHaVdTYgpDbCtwOERGbytSWlFmVW1ERzdEY2hPWHIvZTJvd1NEODFIV2N3SXlzUlZxcGxPL3d4M2xuMjJIaUR5dVVxWTN4CmNQS2w5RHZ6c0I1NzZVU09MS0IvSGkvTjNIemc1bCt2V1MzZVZYeXovWlZYRnkrY3NkVkV6eG03QjA4QWlZK1UKRmo3Q3hjRUNnWUVBLzVDMkRWazMwQXUzRElYTnpxalFXUWJYV3BsWG5MNFU1NUJsUExYSWt3QlRHVU4rNFlOMQppQUNOM00wMUkyVnRHQ1B4a2pVbTg1WWxMc2tJYitaNGpyeW9NWk5XQzd1dzNyQ01LYit4aCtmZmdpdWNjSnRMClBMWGNsU203NzFBQ2FBT2FOR0R5RkduK3V3UzM5WDZ6MGJvaXIzc1I2NkFkVGx6TzJVYlhDNnNDZ1lFQTJmeWQKemhaYXRaMGxsYnZrcHdTbnozOEd5aWpnQjI1NmNyQ1dBSFo1dmwrVndvZ2Y0ZnllT0tacTFIalZkVSs3cUJOUgpEcGJDYVlkQWEwTXdMdXZ2Ti9jWVROVkpYUlM2S2ZOL3ZLUXBFQVFSMXN4L29Rd2s5TW9lbjJoSFoxVnBzM0pCClYrdVk3cDE0bVYxR2JIdjM1V3hQeXdKR1FWdlZiMklVWnNaK25HRUNnWUVBNVYwNUpxM0YyNkJIL3FNdjNLUEIKcWNUc0RsSEZRZFdPNld5OGowb080Mi9OSk1WZzRJQ2RRUnhPTmJhdVZFQTVNd3MvU1pzT2hGdGlyNlNaUCtTMgptbFJURjN0R0pHMmxCWmVwaythSkxKSThGSldUWjdUWVIzcG9xQzYyanNkZUFZQUtLNncrVjNmeHVHTTV2c2lpCkZqNVoxdWc3WXg5bWJlZjVkU09RNk5VQ2dZQlBWRGx4aUgwV1hzd1F3OElnYmZkTDhlUmNxYWR0ek96TzFDaWkKbm5zTHB1bHZVKzZXWlVLSFJ6alZmZXZndDFXSmd3NGFpdzdSTEtGcTU1YWZYTWsveXJLVE00TnhWbHV4YktYdAoxcWdDNWhnLzNVZ05LY2hCTlZVVG1mVnlTNGtkL3RSODFJWmhQL2xsaHFaY1VIa1VpdWcyN3VyMldoOUFXNmNsCkI5T0h3UUtCZ1FEekt2YzMvWDZ6NzdMeUFqb1BIZUpIbXQyL2tSWllJQjNmUUlsRkg0R3JoVUg1TXdLNklIeUkKWGxPUU53ZHVwdm5QaXlHS0dYeUwvcHJSVGdxQXpGMUFPNW0xWG8wVlJnMVZTeGp6Y1RPTU0zVGpnYU5GYmlMdwpreUovZjlhdzhrUTU2RFA2OWlzV1BKaVUyQko1blZLUTJPVEJwSHNTa2h5eS94amZaT29zbFE9PQotLS0tLUVORCBSU0EgUFJJVkFURSBLRVktLS0tLQo= \
 		narvi-control-plane:verify serve; \
@@ -471,54 +607,5 @@ verify-control-plane-image:
 		docker logs narvi-control-plane-verify >&2 || true; \
 		exit 1; \
 	fi; \
-	neg_code=$$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://localhost:18080/api/this-path-must-never-be-a-real-route-x7f3q9"); \
-	if [ "$$neg_code" != "404" ]; then \
-		echo "negative control returned $$neg_code, want 404 -- every route check below would be vacuous, refusing to proceed" >&2; \
-		exit 1; \
-	fi; \
-	echo "negative control OK (404)"; \
-	fail=0; \
-	checked=0; \
-	while IFS= read -r goldenline; do \
-		[ -z "$$goldenline" ] && continue; \
-		checked=$$((checked + 1)); \
-		method=$${goldenline%% *}; \
-		path=$${goldenline#* }; \
-		path=$$(printf '%s' "$$path" | sed -E 's/\{[^}]+\}/verify-probe/g'); \
-		code=$$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X "$$method" "http://localhost:18080$$path"); \
-		if [ "$$code" = "404" ]; then \
-			echo "MISSING: $$method $$path -> 404 (route absent from running image)" >&2; \
-			fail=1; \
-		fi; \
-	done < controlplane/testdata/routes.golden; \
-	if [ "$$checked" -eq 0 ]; then \
-		echo "golden file has zero routes -- refusing a vacuous check" >&2; \
-		exit 1; \
-	fi; \
-	if [ "$$fail" -ne 0 ]; then \
-		echo "one or more golden routes did not resolve on the running image" >&2; \
-		exit 1; \
-	fi; \
-	echo "all $$checked golden routes resolve on the running image (status != 404); route table matches controlplane/testdata/routes.golden"; \
-	docker rm -f narvi-control-plane-verify >/dev/null 2>&1 || true; \
-	echo "checking unconfigured boot refuses cleanly..."; \
-	set +e; \
-	docker run --rm narvi-control-plane:verify serve >/tmp/narvi-control-plane-noconfig.stdout 2>/tmp/narvi-control-plane-noconfig.stderr; \
-	status=$$?; \
-	set -e; \
-	if [ "$$status" -eq 0 ]; then \
-		echo "expected non-zero exit with no configuration at all, got 0" >&2; \
-		exit 1; \
-	fi; \
-	if ! grep -qi "missing required" /tmp/narvi-control-plane-noconfig.stderr; then \
-		echo "expected platform.Config's own validation message (\"missing required ...\") on stderr" >&2; \
-		cat /tmp/narvi-control-plane-noconfig.stderr >&2; \
-		exit 1; \
-	fi; \
-	if grep -qiE 'panic:|goroutine [0-9]+ \[' /tmp/narvi-control-plane-noconfig.stderr; then \
-		echo "got a panic/stack trace on stderr, not a clean validation error" >&2; \
-		cat /tmp/narvi-control-plane-noconfig.stderr >&2; \
-		exit 1; \
-	fi; \
-	echo "unconfigured boot OK: exit=$$status, stderr names platform.Config's own validation message, no panic"; \
+	echo "serve OK: /health returned 200 (the image's own real, unmodified GitHub App scope check passed against tools/ghappstub)"; \
 	echo "verify-control-plane-image: PASS"

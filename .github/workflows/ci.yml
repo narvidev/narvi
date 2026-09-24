@@ -368,15 +368,30 @@ jobs:
   # exactly the kind of change this job exists to catch, not one it can
   # afford to skip.
   #
+  # Runs on every pull_request AND every v*.*.* tag push, not
+  # pull_request alone (§41.1 review round 1, finding P6): publish-
+  # control-plane-image below `needs:` this exact job, so a tag push runs
+  # this Step's own exit criterion against the commit actually being
+  # published, rather than trusting that SOME earlier PR once ran it
+  # against an ancestor of that commit.
+  #
   # Runs Makefile's own verify-control-plane-image target -- the SAME
   # script a developer runs locally (that target's own doc comment has
-  # the full "why" and exactly which two exit-criterion halves it checks:
-  # the running image's route table against controlplane/testdata/
-  # routes.golden, and an unconfigured `docker run` failing cleanly with
+  # the full "why" and exactly which three exit-criterion parts it
+  # checks: `docker run <image> routes` against
+  # controlplane/testdata/routes.golden byte-for-byte, the image actually
+  # serving real HTTP traffic against tools/ghappstub's own local GitHub
+  # App stub, and an unconfigured `docker run` failing cleanly with
   # platform.Config's own validation message) -- so this job can never
-  # drift from what a contributor actually ran before opening the PR.
+  # drift from what a contributor actually ran before opening the PR. The
+  # target brings up ONLY docker-compose.dev.yml's own postgres service,
+  # under its own disposable compose project, and reaches it over that
+  # project's own compose network -- not host.docker.internal, which a
+  # 127.0.0.1-bound published port never answers from a Linux runner's
+  # own docker0 bridge gateway (§41.1 review round 1, finding P4 -- this
+  # is what makes this job able to pass on ubuntu-latest at all).
   control-plane-image:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -395,14 +410,26 @@ jobs:
         if: always()
         run: |
           docker rm -f narvi-control-plane-verify >/dev/null 2>&1 || true
-          docker compose -f docker-compose.dev.yml down -v >/dev/null 2>&1 || true
+          docker compose -f docker-compose.dev.yml -p narvi-cpverify down -v >/dev/null 2>&1 || true
 
   # publish-control-plane-image (§41.1, Step 162): publishes the image
   # control-plane-image above already proved boots and serves the golden
   # route table -- built again here from the SAME, unmodified Dockerfile,
-  # since a tag push carries no guarantee the PR that landed this exact
-  # commit on main ran this workflow's own control-plane-image job (a
-  # direct push to main, or a tag on an older commit, would not have).
+  # since a tag push builds a fresh image (a different build context than
+  # whatever the merging PR built) even though it's the identical
+  # Dockerfile and commit.
+  #
+  # `needs: control-plane-image` (§41.1 review round 1, finding P6) is
+  # what actually closes the gap that used to exist here: this job used to
+  # run on a tag push with no guarantee the PR that landed this exact
+  # commit on main ever ran control-plane-image at all (a direct push to
+  # main, or a tag on an older commit, would not have) -- this workflow's
+  # own on.push.tags trigger fires this SAME control-plane-image job again
+  # on every tag push (see that job's own `if:` above), so `needs:` makes
+  # this job wait for, and require success from, THIS job's own
+  # exit-criterion run against the exact commit being tagged, not a
+  # historical PR run against some ancestor of it.
+  #
   # Gated on a tag push ONLY (this workflow's own top-level `on.push.tags`
   # trigger), never an ordinary push to main -- a tag is the one signal
   # that promotes an image to something operators pull from the GitHub
@@ -427,6 +454,7 @@ jobs:
   # runner-architecture change can never silently publish a different
   # image than the one control-plane-image already verified.
   publish-control-plane-image:
+    needs: control-plane-image
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:

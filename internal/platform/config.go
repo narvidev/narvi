@@ -1313,6 +1313,86 @@ func parseGitHubAppPrivateKey(raw string) (*rsa.PrivateKey, error) {
 	return rsaKey, nil
 }
 
+// gitHubAPIBaseURLEnvVarName configures NARVI_GITHUB_API_BASE_URL (§41.1
+// review round 1, finding P2): the GitHub REST API base every production
+// githubapp/githubapi construction site in controlplane/serve.go dials,
+// in place of the "https://api.github.com" literal those call sites used
+// to bake in directly. Optional -- defaults to defaultGitHubAPIBaseURL
+// (the real GitHub.com API) when unset. The one deployment shape that
+// genuinely needs to override it is GitHub Enterprise Server, whose own
+// REST API lives at "https://HOST/api/v3", not at api.github.com's own
+// host -- see canonicalGitHubAPIBaseURL's own doc comment for the exact
+// shape this value must satisfy. The other reason this exists at all:
+// Makefile's own verify-control-plane-image target (§41.1's exit
+// criterion) needs to point the packaged image's own real, UNMODIFIED
+// boot-time GitHub App scope check (verifyGitHubAppScopeAtBoot) at a
+// local stub instead of the real api.github.com, which is unreachable
+// (and undesirable as a CI dependency even when reachable) -- a
+// stage-based bypass of that check would have weakened §30.4(4) instead.
+const gitHubAPIBaseURLEnvVarName = "NARVI_GITHUB_API_BASE_URL"
+
+// defaultGitHubAPIBaseURL is GitHub's own real REST API base -- the value
+// gitHubAPIBaseURLEnvVarName defaults to when unset. Still the ONLY place
+// the literal "https://api.github.com" appears in this repository's
+// production wiring; it just lives here, in config.go, instead of
+// directly in controlplane/serve.go's own now-removed same-named const.
+const defaultGitHubAPIBaseURL = "https://api.github.com"
+
+// InvalidGitHubAPIBaseURLError is returned by Load when
+// NARVI_GITHUB_API_BASE_URL is set but is not a well-formed absolute
+// http(s) URL naming a host, or uses plain http outside StageDevelopment
+// -- mirrors InvalidCloudIdentityIssuerURLError/InvalidOTLPEndpointError's
+// own identical named-error shape immediately above.
+type InvalidGitHubAPIBaseURLError struct {
+	Value  string
+	Reason string
+}
+
+func (e *InvalidGitHubAPIBaseURLError) Error() string {
+	return fmt.Sprintf("invalid %s=%q: %s", gitHubAPIBaseURLEnvVarName, e.Value, e.Reason)
+}
+
+// canonicalGitHubAPIBaseURL enforces the URL shape Config.GitHubAPIBaseURL
+// needs to be safely usable as a plain-concatenation base for both
+// githubapp.Client (baseURL+path, no normalization of its own) and
+// githubapi.Adapter (which already trims its own trailing "/" -- this
+// function applies that same trim so BOTH call sites see an identical,
+// already-canonical value, whichever one a future reader happens to check
+// first): a well-formed absolute URL, http or https scheme, non-empty
+// host, and https required unless stage is StageDevelopment -- a
+// production or staging deploy pointed at plain http would send its
+// GitHub App's own signed JWT, and any Enterprise Server credential, over
+// the wire unencrypted.
+//
+// Unlike canonicalCloudIdentityIssuerURL/canonicalOTLPEndpointURL's own
+// neighboring "no path at all" rule, a path IS allowed and preserved here
+// (a trailing slash aside): GitHub Enterprise Server's own REST API lives
+// at https://HOST/api/v3, not at the host root, so rejecting any path
+// would make this validation refuse the one real non-default value this
+// field exists to accept.
+func canonicalGitHubAPIBaseURL(raw string, stage Stage) (string, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", &InvalidGitHubAPIBaseURLError{Value: raw, Reason: fmt.Sprintf("not a valid URL: %v", err)}
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", &InvalidGitHubAPIBaseURLError{Value: raw, Reason: "scheme must be http or https"}
+	}
+	// Hostname(), not Host -- see canonicalOTLPEndpointURL's own identical
+	// reasoning: a port-only authority has a non-empty Host and an empty
+	// Hostname().
+	if parsed.Hostname() == "" {
+		return "", &InvalidGitHubAPIBaseURLError{Value: raw, Reason: "must include a host (a port-only value names no host)"}
+	}
+	if parsed.Scheme != "https" && stage != StageDevelopment {
+		return "", &InvalidGitHubAPIBaseURLError{Value: raw, Reason: fmt.Sprintf("must use https outside %s -- this URL carries the GitHub App's own signed JWT and any Enterprise Server credential", StageDevelopment)}
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", &InvalidGitHubAPIBaseURLError{Value: raw, Reason: "must not carry a query string or fragment"}
+	}
+	return strings.TrimSuffix(parsed.String(), "/"), nil
+}
+
 // Config is the top-level, typed control-plane configuration, validated
 // once at boot (§5.4, §11: "typed config validated at boot, fail-fast,
 // named errors").
@@ -1553,6 +1633,16 @@ type Config struct {
 	// discipline immediately above. Never logged anywhere.
 	GitHubAppID         int64
 	GitHubAppPrivateKey *rsa.PrivateKey
+
+	// GitHubAPIBaseURL is the GitHub REST API base every production
+	// githubapp/githubapi construction site dials (controlplane/serve.go),
+	// read from NARVI_GITHUB_API_BASE_URL and canonicalized by
+	// canonicalGitHubAPIBaseURL. Optional -- defaults to
+	// defaultGitHubAPIBaseURL ("https://api.github.com") when unset; see
+	// gitHubAPIBaseURLEnvVarName's own doc comment for the two reasons a
+	// deployment (or this repository's own verify-control-plane-image
+	// target) needs to override it.
+	GitHubAPIBaseURL string
 
 	// ModalBaseURL and ModalAuthToken configure the real
 	// internal/adapters/outbound/modal.Provider cmd/control-plane/main.go
@@ -2046,6 +2136,20 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// gitHubAPIBaseURL: optional, defaults to defaultGitHubAPIBaseURL --
+	// see gitHubAPIBaseURLEnvVarName's own doc comment for why this exists
+	// at all despite every other GitHub-flavored value on this file being
+	// a credential rather than an endpoint.
+	gitHubAPIBaseURL := defaultGitHubAPIBaseURL
+	if raw := os.Getenv(gitHubAPIBaseURLEnvVarName); raw != "" {
+		canonical, canonErr := canonicalGitHubAPIBaseURL(raw, stage)
+		if canonErr != nil {
+			errs = append(errs, canonErr)
+		} else {
+			gitHubAPIBaseURL = canonical
+		}
+	}
+
 	modalBaseURL := os.Getenv(modalBaseURLEnvVarName)
 	if modalBaseURL == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: modalBaseURLEnvVarName})
@@ -2300,6 +2404,7 @@ func Load() (*Config, error) {
 		ShadowMode:                 shadowMode,
 		GitHubAppID:                gitHubAppID,
 		GitHubAppPrivateKey:        gitHubAppPrivateKey,
+		GitHubAPIBaseURL:           gitHubAPIBaseURL,
 		ModalBaseURL:               modalBaseURL,
 		ModalAuthToken:             modalAuthToken,
 		ModalEgressProxyURL:        modalEgressProxyURL,

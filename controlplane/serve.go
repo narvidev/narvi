@@ -11,12 +11,19 @@
 // /health, and errgroup-managed graceful shutdown (§5.2, §10-P0). The
 // full REST/WS API landed in later PRs.
 //
-// Main dispatches "serve"/"seed"; the "serve" path loads config, opens the
-// pool, applies migrations, and verifies the configured GitHub App's own
-// scope at boot (none of that is wiring), then calls Build (every store,
-// adapter, decorator, route group, and background-loop constructor,
-// assembled against the already-open pool) and Run (the listener and every
-// background loop, through one errgroup).
+// Main dispatches "serve"/"seed"/"routes"; the "serve" path loads config,
+// opens the pool, applies migrations, and verifies the configured GitHub
+// App's own scope at boot (none of that is wiring), then calls Build
+// (every store, adapter, decorator, route group, and background-loop
+// constructor, assembled against the already-open pool) and Run (the
+// listener and every background loop, through one errgroup). "routes"
+// (routescmd.go) is §41.1's own exit-criterion proof: it loads config,
+// opens the pool, applies migrations, and calls the SAME Build serve()
+// uses, then prints App.Routes() one "METHOD /path" per line -- never
+// calling GitHub and never starting a listener -- so
+// `docker run <image> routes` can be diffed byte-for-byte against
+// controlplane/testdata/routes.golden without needing serve()'s own
+// GitHub App scope check to succeed first.
 package controlplane
 
 import (
@@ -86,26 +93,23 @@ import (
 	"github.com/narvidev/narvi/internal/platform"
 )
 
-// githubAPIBaseURL is GitHub's own real REST API base, passed to
-// auth.NewCallbackHandler's own apiBaseURL parameter in production wiring.
-// That parameter exists specifically so internal/adapters/inbound/auth's
-// own tests can override it with a local httptest.Server standing in for
-// GitHub's API — this constant is the ONLY place the real
-// "https://api.github.com" literal appears in this binary's wiring.
-const githubAPIBaseURL = "https://api.github.com"
-
 // linearAPIBaseURL is Linear's own real API base (its GraphQL endpoint and
 // OAuth2 token endpoint both live under this host), passed to
 // linearapi.New's own apiBaseURL parameter in production wiring -- the
-// ONLY place this literal appears in this binary's wiring, mirroring
-// githubAPIBaseURL's own identical precedent immediately above (
-// "Linear ingress", §8.10).
+// ONLY place this literal appears in this binary's wiring ("Linear
+// ingress", §8.10). Unlike GitHub's own equivalent base URL
+// (cfg.GitHubAPIBaseURL, internal/platform.Config -- configurable via
+// NARVI_GITHUB_API_BASE_URL specifically for GitHub Enterprise Server and
+// this repository's own verify-control-plane-image target, §41.1 review
+// round 1 finding P2), no deployment shape needs to override Linear's or
+// Slack's own API host, so both stay a plain wiring-layer const here.
 const linearAPIBaseURL = "https://api.linear.app"
 
 // slackAPIBaseURL is Slack's own real Web API base, passed to
 // slack.Deps.SlackAPIBaseURL in production wiring (§8.10, "Slack
 // ingress") -- the ONLY place this literal appears in this binary's
-// wiring, mirroring githubAPIBaseURL's own identical precedent exactly.
+// wiring, mirroring linearAPIBaseURL's own identical "no override needed"
+// reasoning immediately above.
 const slackAPIBaseURL = "https://slack.com/api"
 
 // App is the built control plane: the router Build assembled, plus every
@@ -182,16 +186,17 @@ func (d releaseCompositionDispatcher) EnsureDispatched(ctx context.Context, sess
 }
 
 // Main is intentionally a bare-bones dispatch, not a flag-parsing
-// library: two subcommands, "serve" and "seed" ("config/data
-// seeding", §10-P6/§13.4 -- see seed.go). "seed" lives here, as a
-// control-plane subcommand, rather than its own cmd/ binary: it needs
-// the SAME DB access and the SAME platform.Load() config "serve" already
-// has (postgres pool, TokenEncryptionKey, InitialAdminEmails), and
-// cmd/sandbox-agent's own "credential-helper" is the existing precedent
-// in this repo for a second subcommand living alongside a binary's main
-// server mode rather than forcing a whole new cmd/ tree for one
-// operator-run tool. Anything else prints a one-line usage message to
-// stderr and exits non-zero.
+// library: three subcommands, "serve", "seed" ("config/data
+// seeding", §10-P6/§13.4 -- see seed.go), and "routes" (§41.1's own
+// exit-criterion proof -- see routescmd.go). "seed" and "routes" both
+// live here, as control-plane subcommands, rather than their own cmd/
+// binaries: each needs the SAME DB access and the SAME platform.Load()
+// config "serve" already has, and cmd/sandbox-agent's own
+// "credential-helper" is the existing precedent in this repo for a second
+// subcommand living alongside a binary's main server mode rather than
+// forcing a whole new cmd/ tree for one operator-run (or, for "routes",
+// CI-run) tool. Anything else prints a one-line usage message to stderr
+// and exits non-zero.
 //
 // Returns the process exit code instead of calling os.Exit itself, so
 // cmd/control-plane's own main() -- now just
@@ -204,7 +209,7 @@ func (d releaseCompositionDispatcher) EnsureDispatched(ctx context.Context, sess
 // package. Threaded straight through to serve, unchanged.
 func Main(args []string, modules ...extension.Module) int {
 	if len(args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: control-plane <serve|seed> [args...]")
+		fmt.Fprintln(os.Stderr, "usage: control-plane <serve|seed|routes> [args...]")
 		return 1
 	}
 
@@ -214,8 +219,10 @@ func Main(args []string, modules ...extension.Module) int {
 		err = serve(modules...)
 	case "seed":
 		err = runSeedCommand(args[2:])
+	case "routes":
+		err = runRoutesCommand(context.Background(), os.Stdout)
 	default:
-		fmt.Fprintln(os.Stderr, "usage: control-plane <serve|seed> [args...]")
+		fmt.Fprintln(os.Stderr, "usage: control-plane <serve|seed|routes> [args...]")
 		return 1
 	}
 
@@ -309,7 +316,7 @@ func serve(modules ...extension.Module) error {
 	// parameter -- would put a boot pre-flight's own output on Build's
 	// signature, which is supposed to take nothing but an already-open
 	// pool and hand back a fully wired App.
-	preflightGitHubAppClient := githubapp.New(http.DefaultClient, githubAPIBaseURL, cfg.GitHubAppID, cfg.GitHubAppPrivateKey, cfg.Timeouts.GitHubAppJWTTTL, cfg.Timeouts.GitHubAppJWTClockSkew)
+	preflightGitHubAppClient := githubapp.New(http.DefaultClient, cfg.GitHubAPIBaseURL, cfg.GitHubAppID, cfg.GitHubAppPrivateKey, cfg.Timeouts.GitHubAppJWTTTL, cfg.Timeouts.GitHubAppJWTClockSkew)
 	if err := verifyGitHubAppScopeAtBoot(ctx, preflightGitHubAppClient, cfg.Timeouts.GitHubAppScopeCheckTimeout); err != nil {
 		return err
 	}
@@ -504,10 +511,10 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// here, the ONE production construction site, mirroring
 	// gatedHTTPClient/liveSourceControl's own identical "one seam" pattern
 	// immediately below.
-	githubAppClient := githubapp.New(http.DefaultClient, githubAPIBaseURL, cfg.GitHubAppID, cfg.GitHubAppPrivateKey, cfg.Timeouts.GitHubAppJWTTTL, cfg.Timeouts.GitHubAppJWTClockSkew)
+	githubAppClient := githubapp.New(http.DefaultClient, cfg.GitHubAPIBaseURL, cfg.GitHubAppID, cfg.GitHubAppPrivateKey, cfg.Timeouts.GitHubAppJWTTTL, cfg.Timeouts.GitHubAppJWTClockSkew)
 
 	gatedHTTPClient := githubapi.NewGatedClient(shadowLedger, isLiveEgress)
-	liveSourceControl := githubapi.New(gatedHTTPClient, githubAPIBaseURL)
+	liveSourceControl := githubapi.New(gatedHTTPClient, cfg.GitHubAPIBaseURL)
 
 	// Layer 1 on top of layer 0 (§30.2), redundant in one direction only:
 	// the decorator records the six port writes with their real types and
@@ -1625,7 +1632,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		cfg.TokenEncryptionKey,
 		cfg.Timeouts,
 		secureCookies,
-		githubAPIBaseURL,
+		cfg.GitHubAPIBaseURL,
 	))
 	router.Post("/auth/logout", auth.NewLogoutHandler(userSessionStore, secureCookies))
 
