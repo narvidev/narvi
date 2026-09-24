@@ -244,6 +244,33 @@ event-level enums (`Artifact.status`, `GitSync.status`,
 for now, since that surface is only ever version-skew between this
 system's own two halves, never a third party.
 
+### Genesis mode: the first PR to add `contracts/manifest.json`
+
+`openEnums` and `status: retired` are read from the merge-base manifest
+precisely so a PR can never grade its own relaxation — but the very first
+PR to add `contracts/manifest.json` (and any later PR whose merge-base
+still predates that landing on `main`) has no merge-base manifest at all.
+`tools/contractscompat` calls this **genesis mode**: it substitutes
+HEAD's own manifest as a stand-in base so the surface set still lines up,
+but neutralizes `openEnums` and `retired` outright — neither relaxation
+is honored in genesis mode, full stop.
+
+Per-surface **direction** (`by-suffix` / `platform-to-client` /
+`client-to-platform` / `both`) is a different case: unlike the two
+relaxations above, direction has no merge-base fallback to read in
+genesis mode — there is no OLD direction to compare against, and every
+surface still needs one to be classified at all. So in genesis mode,
+direction is read from HEAD's own manifest, exactly as it always is for a
+brand-new surface. This is **not verified by the tool** — nothing checks
+that a genesis-mode PR's claimed directions match how those surfaces are
+actually used. `contractscompat` prints an explicit `GENESIS MODE` notice
+naming every surface's direction as taken from HEAD when this fires, so
+the PR's human reviewer knows to check each one by hand (does
+`rest/v1/dtos.schema.json` really split `*Request` shapes as
+client-to-platform and everything else as platform-to-client? does a
+fixed-direction file's claimed direction match how it's actually used?)
+instead of assuming the tool already did.
+
 ## Versioned siblings (the only way to make a breaking REST/protocol change)
 
 A MAJOR change is never made in place on an existing `vN` file. Instead:

@@ -52,6 +52,22 @@ func run(args []string, stdout, stderr *os.File) int {
 		return 1
 	}
 
+	// F5 (round 4 review): genesis mode has no real base manifest.json to
+	// read a per-surface direction from at all -- loadInput's own
+	// substitution means every surface's direction below is whatever
+	// THIS diff's own head manifest claims, not something an earlier,
+	// reviewed PR established (the same reasoning compat.Compare's own
+	// Genesis handling already applies to openEnums and `retired`; see
+	// its doc comment). That is not a code-path change -- direction has
+	// always come from head in genesis mode, and COMPATIBILITY.md's
+	// "Relaxations" section says the first manifest's directions are a
+	// human review responsibility, not this tool's -- but it was silent
+	// about it. Name it explicitly so whoever is reviewing this diff
+	// knows to check every direction below by hand.
+	if in.Genesis {
+		printGenesisNotice(stdout, in.HeadManifestRaw)
+	}
+
 	report, err := compat.Compare(in)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, "contractscompat:", err)
@@ -85,6 +101,26 @@ func run(args []string, stdout, stderr *os.File) int {
 	}
 	_, _ = fmt.Fprintln(stdout, "contractscompat: no breaking changes (MINOR/PATCH only)")
 	return 0
+}
+
+// printGenesisNotice implements F5: name each surface's direction, taken
+// from headRaw's own manifest.json, so a reviewer of a genesis-mode diff
+// knows those directions are THIS PR's own unreviewed claim, not
+// something an earlier PR already established. A parse failure here is
+// not this function's job to report -- compat.Compare (called right
+// after) will fail on the exact same bytes and report it properly -- so
+// this silently prints nothing rather than duplicating that error.
+func printGenesisNotice(stdout *os.File, headRaw []byte) {
+	m, err := compat.ParseManifest(headRaw)
+	if err != nil {
+		return
+	}
+	_, _ = fmt.Fprintln(stdout, "contractscompat: GENESIS MODE -- no base contracts/manifest.json (this PR's merge-base predates contracts governance). Every surface's DIRECTION below is taken from HEAD's own manifest.json and has not been checked against any earlier, reviewed PR -- a human must review each one (see COMPATIBILITY.md's \"Relaxations\" section):")
+	surfaces := append([]compat.ManifestSurface{}, m.Surfaces...)
+	sort.Slice(surfaces, func(i, j int) bool { return surfaces[i].Path < surfaces[j].Path })
+	for _, s := range surfaces {
+		_, _ = fmt.Fprintf(stdout, "  %s: %s\n", s.Path, s.Direction)
+	}
 }
 
 // loadInput does every bit of this command's own file I/O, then hands a

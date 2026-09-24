@@ -147,6 +147,68 @@ func TestCLIExitOneOnBreakingDiff(t *testing.T) {
 	}
 }
 
+// TestCLIGenesisModePrintsDirectionNotice pins F5 (round 4 review): a
+// genesis-mode run (base has the real schema file on disk but no
+// manifest.json at all) must print a notice naming the surface's
+// direction as taken from HEAD's own manifest -- so a human reviewing a
+// genesis-mode PR knows to check it by hand, per COMPATIBILITY.md's
+// "Relaxations" section. This is a print-only change (F5's scope): the
+// underlying genesis behavior (direction read from head) is unchanged.
+func TestCLIGenesisModePrintsDirectionNotice(t *testing.T) {
+	head := writeContractsDir(t, "1.0.0", "## [1.0.0]\n", map[string]any{
+		"Widget": map[string]any{"type": "string"},
+	})
+
+	// Genesis base: the same schema file on disk (as the real merge-base
+	// commit would have), but no manifest.json/VERSION/CHANGELOG.md --
+	// loadInput's own genesis substitution kicks in for exactly this
+	// shape.
+	baseDir := t.TempDir()
+	writeSchemaDoc(t, baseDir, "https://narvi.dev/t/v1/x.schema.json", map[string]any{
+		"Widget": map[string]any{"type": "string"},
+	})
+
+	routes := writeRoutesGolden(t, t.TempDir())
+
+	// The exit code here is governed by ordinary VERSION/CHANGELOG
+	// discipline (genesis synthesizes base VERSION as "0.0.0", so head's
+	// real "1.0.0" needs a matching CHANGELOG heading, unrelated to F5) --
+	// this test only cares that the notice itself was printed.
+	_, stdout, _ := runCLI(t, []string{
+		"--base", baseDir, "--head", head.dir,
+		"--routes-base", routes, "--routes-head", routes,
+	})
+	if !bytes.Contains([]byte(stdout), []byte("GENESIS MODE")) {
+		t.Fatalf("want a GENESIS MODE notice in stdout, got %q", stdout)
+	}
+	if !bytes.Contains([]byte(stdout), []byte("t/v1/x.schema.json: by-suffix")) {
+		t.Fatalf("want the notice to name t/v1/x.schema.json's direction (by-suffix, from HEAD's own manifest), got %q", stdout)
+	}
+}
+
+// TestCLINonGenesisModeOmitsDirectionNotice: a normal (non-genesis) run,
+// where base already has its own real manifest.json, must NOT print the
+// genesis notice -- it is specific to the one-time governance-adoption
+// case, not every run.
+func TestCLINonGenesisModeOmitsDirectionNotice(t *testing.T) {
+	changelog := "## [1.0.0]\n"
+	fixture := writeContractsDir(t, "1.0.0", changelog, map[string]any{
+		"Widget": map[string]any{"type": "string"},
+	})
+	routes := writeRoutesGolden(t, t.TempDir())
+
+	code, stdout, stderr := runCLI(t, []string{
+		"--base", fixture.dir, "--head", fixture.dir,
+		"--routes-base", routes, "--routes-head", routes,
+	})
+	if code != 0 {
+		t.Fatalf("want exit 0 for a clean diff, got %d; stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if bytes.Contains([]byte(stdout), []byte("GENESIS MODE")) {
+		t.Fatalf("a non-genesis run must not print the genesis notice, got %q", stdout)
+	}
+}
+
 // TestCLIExitNonZeroOnReadError pins the "genuine tool failure" half: a
 // BASE directory that does not exist at all must not be treated as the
 // genesis case (that only covers a MISSING manifest.json specifically,
