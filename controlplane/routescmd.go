@@ -10,23 +10,27 @@ import (
 )
 
 // runRoutesCommand is the "routes" subcommand's own implementation (§41.1
-// review round 1, findings P1/P3): load config, open the pool, apply
-// migrations, build the router with the SAME Build serve() uses, and
-// print its route table to w -- one "METHOD /path" per line, sorted --
-// exactly controlplane/testdata/routes.golden's own format (App.Routes()
-// already returns it pre-sorted; see that method's own doc comment).
+// review round 1, findings P1/P3; round 2, findings Q1/Q3): load config,
+// open the pool, and build the router with the SAME Build serve() uses,
+// then print its route table to w -- one "METHOD /path" per line, sorted
+// -- exactly controlplane/testdata/routes.golden's own format
+// (App.Routes() already returns it pre-sorted; see that method's own doc
+// comment).
 //
-// Deliberately mirrors serve()'s own "load config, open the pool, apply
-// migrations, then Build" sequence up to (but never past) the point where
-// serve() calls verifyGitHubAppScopeAtBoot: this command never
-// constructs a GitHub App client and never calls out to GitHub at all,
-// and it never calls App.Run, so no listener ever opens. That is what
-// makes `docker run <image> routes` -- against a real, migrated Postgres,
-// with no other configuration a live boot would need -- a clean,
-// GitHub-independent proof that the packaged image's router is IDENTICAL
-// to routes.golden, byte for byte, wholly separate from the "does this
-// image actually serve traffic" proof (which does need a reachable
-// GitHub App scope check, real or stubbed).
+// This command is READ-ONLY: unlike round 1's version, it does NOT apply
+// migrations (§41.1 review round 2, finding Q1/Q3). Build does not need a
+// migrated schema to construct the router -- its only DB read at
+// construction time, CountSuppressedRepos, merely logs a WARN on failure
+// -- and the pool returned by NewPoolWithMaxConns is lazy (it never
+// pings), so no reachable database is required either. Forward-migrating
+// a database that a "list the routes" command was only asked to inspect
+// is exactly the hazard round 2 found: it can advance a production
+// schema ahead of a rollout, race serve()'s own migration lock, or fail
+// outright under a read-only DB role where a listing should still
+// succeed. If the target schema is missing tables Build wants to read
+// (e.g. a fresh, unmigrated database), the affected reads log a WARN to
+// stderr and are otherwise silently skipped -- that is acceptable for a
+// read-only introspection command.
 func runRoutesCommand(ctx context.Context, w io.Writer) error {
 	cfg, err := platform.Load()
 	if err != nil {
@@ -38,10 +42,6 @@ func runRoutesCommand(ctx context.Context, w io.Writer) error {
 		return fmt.Errorf("open postgres pool: %w", err)
 	}
 	defer pool.Close()
-
-	if err := applyMigrations(cfg.DatabaseURL); err != nil {
-		return fmt.Errorf("apply migrations: %w", err)
-	}
 
 	app, err := Build(ctx, cfg, pool)
 	if err != nil {

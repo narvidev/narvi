@@ -418,14 +418,19 @@ dist: web-build lint-web-assets
 # EXTRA route the golden doesn't have at all):
 #
 #   1. `docker run <image> routes` (the "routes" subcommand,
-#      controlplane/routescmd.go) against the SAME migrated Postgres,
+#      controlplane/routescmd.go) against a fresh, UNMIGRATED Postgres,
 #      piped straight to `cmp` against controlplane/testdata/
-#      routes.golden. "routes" loads config, opens the pool, applies
-#      migrations, and calls the EXACT SAME Build serve() calls -- it
-#      just never calls GitHub and never starts a listener (no
+#      routes.golden. "routes" is READ-ONLY (§41.1 review round 2, finding
+#      Q1/Q3 -- it used to apply migrations before Build, which made a
+#      read-only listing forward-migrate whatever database it was pointed
+#      at; it no longer does, since Build's router construction does not
+#      need a migrated schema at all). It loads config, opens the pool,
+#      and calls the EXACT SAME Build serve() calls -- it just never
+#      calls GitHub and never starts a listener (no
 #      verifyGitHubAppScopeAtBoot, no app.Run) -- so this is a clean,
 #      byte-for-byte route-table-identity proof, independent of GitHub
-#      reachability entirely. TestRunRoutesCommand_MatchesGolden
+#      reachability AND of the schema's migration state.
+#      TestRunRoutesCommand_MatchesGolden
 #      (controlplane/routescmd_integration_test.go) pins this same
 #      output format in Go; this is that same proof, run against the
 #      actual packaged image instead of `go test`.
