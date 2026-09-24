@@ -3,6 +3,7 @@ package compat
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // Manifest mirrors contracts/manifest.json (§6.3 design spec §3): one row
@@ -13,6 +14,13 @@ import (
 // for why: a PR that both adds an enum value AND opens the enum, or both
 // deletes a file AND retires it in the same diff, would otherwise grade
 // its own homework.
+//
+// G3 (round 5 review): every OpenEnums entry is qualified by the surface
+// it belongs to ("<surface path>#<json pointer>", e.g. "rest/v1/dtos.
+// schema.json#/$defs/Session/properties/status") -- see
+// OpenEnumSetForSurface's own doc comment for why an unqualified entry
+// used to leak a relaxation authored for one surface into any OTHER
+// surface with a same-named def.
 type Manifest struct {
 	Version   string            `json:"version"`
 	Surfaces  []ManifestSurface `json:"surfaces"`
@@ -46,11 +54,84 @@ func ParseManifest(data []byte) (Manifest, error) {
 	return m, nil
 }
 
-// OpenEnumSet returns m.OpenEnums as a set, for diffEnum's lookup.
-func (m Manifest) OpenEnumSet() map[string]bool {
-	out := make(map[string]bool, len(m.OpenEnums))
-	for _, n := range m.OpenEnums {
-		out[n] = true
+// openEnumEntry is one parsed contracts/manifest.json "openEnums" string,
+// split into the surface it is qualified for and the in-document JSON
+// Pointer within that surface's own file.
+type openEnumEntry struct {
+	surface string // e.g. "rest/v1/dtos.schema.json"
+	pointer string // e.g. "#/$defs/Session/properties/status" -- defPtr-shaped, leading "#"
+}
+
+// parseOpenEnumEntry splits one raw "openEnums" string into its surface
+// and pointer halves, per the qualified format COMPATIBILITY.md's own
+// "Relaxations" section documents: "<surface path>#<json pointer>". The
+// surface half must be non-empty (an entry cannot be "#/$defs/..." with
+// nothing before the "#" -- that is exactly the unqualified shape G3
+// closes), and the pointer half must itself be a well-formed
+// in-document JSON Pointer ("#/...", matching the defPtr/oldDefPtr shape
+// diffEnum already looks entries up by).
+func parseOpenEnumEntry(raw string) (openEnumEntry, error) {
+	i := strings.IndexByte(raw, '#')
+	if i <= 0 {
+		return openEnumEntry{}, fmt.Errorf("openEnums entry %q is not qualified by a surface path -- want \"<surface path>#<json pointer>\" (e.g. \"rest/v1/dtos.schema.json#/$defs/Session/properties/status\")", raw)
+	}
+	surface, pointer := raw[:i], raw[i:]
+	if pointer == "#" || !strings.HasPrefix(pointer, "#/") {
+		return openEnumEntry{}, fmt.Errorf("openEnums entry %q has a malformed JSON Pointer half %q", raw, pointer)
+	}
+	return openEnumEntry{surface: surface, pointer: pointer}, nil
+}
+
+// ValidateOpenEnums checks that every m.OpenEnums entry is qualified (G3)
+// and names a surface actually present in m.Surfaces -- called against
+// the MERGE-BASE manifest only, same as every other relaxation (see this
+// file's own doc comment). An unqualified entry, or one naming a surface
+// this manifest does not list, is a manifest authoring error this
+// checker fails closed on rather than silently ignoring (which would
+// have exactly G3's own failure mode: the entry quietly does nothing for
+// the surface its author meant, while -- before this fix -- doing
+// something unintended for whichever OTHER surface happened to share a
+// def name).
+func (m Manifest) ValidateOpenEnums() error {
+	known := make(map[string]bool, len(m.Surfaces))
+	for _, s := range m.Surfaces {
+		known[s.Path] = true
+	}
+	for _, raw := range m.OpenEnums {
+		entry, err := parseOpenEnumEntry(raw)
+		if err != nil {
+			return err
+		}
+		if !known[entry.surface] {
+			return fmt.Errorf("openEnums entry %q names surface %q, which is not in this manifest's own surfaces list", raw, entry.surface)
+		}
+	}
+	return nil
+}
+
+// OpenEnumSetForSurface returns the openEnums relaxations that apply to
+// ONE surface, keyed by the in-document pointer diffEnum looks entries up
+// by (l.defPtr/l.oldDefPtr, both "#/..."-rooted) -- an entry qualified
+// for a DIFFERENT surface never contributes here (G3, round 5 review): a
+// relaxation authored for rest/v1/dtos.schema.json's own $defs.Automation
+// must never open an enum in client-ws/v1/protocol.schema.json just
+// because some unrelated def THERE happens to be named "Automation" too
+// -- reproduced against the real binary as a two-PR exploit (PR1 adds the
+// same-named def to a different surface, PR2 widens its enum and is
+// wrongly scored MINOR). Compare calls this once per surface, from the
+// merge-base manifest only, after ValidateOpenEnums has already
+// confirmed every entry parses and names a real surface -- an entry that
+// still fails to parse here (should be unreachable) is simply skipped,
+// since this method -- like the OpenEnumSet it replaces -- is a pure,
+// error-free lookup.
+func (m Manifest) OpenEnumSetForSurface(path string) map[string]bool {
+	out := map[string]bool{}
+	for _, raw := range m.OpenEnums {
+		entry, err := parseOpenEnumEntry(raw)
+		if err != nil || entry.surface != path {
+			continue
+		}
+		out[entry.pointer] = true
 	}
 	return out
 }

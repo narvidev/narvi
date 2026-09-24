@@ -99,13 +99,26 @@ func Compare(in Input) (Report, error) {
 	}
 
 	// C1: openEnums is a relaxation read from the MERGE-BASE manifest
-	// only. Per-surface DIRECTION is the same kind of relaxation-adjacent
-	// decision and is resolved the same way below, surface by surface --
-	// never defaulted to HEAD's own declared value for a surface the base
-	// already governs.
-	openEnums := baseManifest.OpenEnumSet()
-
+	// only, and (G3, round 5 review) scoped to the ONE surface each entry
+	// is qualified for -- manifest.go's OpenEnumSetForSurface is called
+	// per surface, below, instead of computing one global set here the
+	// way this used to. Per-surface DIRECTION is the same kind of
+	// relaxation-adjacent decision and is resolved the same way below,
+	// surface by surface -- never defaulted to HEAD's own declared value
+	// for a surface the base already governs.
 	var all []Finding
+	if err := baseManifest.ValidateOpenEnums(); err != nil {
+		// G3: fail closed rather than silently ignore a malformed or
+		// mis-scoped entry -- an unqualified entry, or one naming a
+		// surface this manifest does not list, is a manifest authoring
+		// error, not a diff finding about any particular surface.
+		all = append(all, Finding{
+			RuleID:   "fc-openenums-scope",
+			Severity: SeverityFailClosed,
+			Pointer:  "#/openEnums",
+			Message:  err.Error(),
+		})
+	}
 	all = append(all, DiffSurfaceSet(baseManifest, headManifest)...)
 	all = append(all, DiffRoutes(in.BaseRoutes, in.HeadRoutes)...)
 
@@ -262,7 +275,7 @@ func Compare(in Input) (Report, error) {
 			return Report{}, fmt.Errorf("surface %s has no manifest row on either side", path)
 		}
 
-		findings, err := DiffSurface(directive, baseRaw, headRaw, openEnums)
+		findings, err := DiffSurface(directive, baseRaw, headRaw, baseManifest.OpenEnumSetForSurface(path))
 		if err != nil {
 			return Report{}, fmt.Errorf("diff %s: %w", path, err)
 		}

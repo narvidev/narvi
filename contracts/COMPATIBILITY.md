@@ -246,17 +246,27 @@ mirror image.
 Both relaxations are read from the **merge-base** copy of
 `contracts/manifest.json`, never from the head (PR) copy:
 
-- **`openEnums`** lists the EXACT JSON Pointer (`#/$defs/Session/
-  properties/status`, `#/$defs/Plan/properties/status`, ...) of each open
-  string enum's own schema node — never a name derived by stripping
-  `$defs`/`properties` segments out of that pointer, which would let a
-  property literally named `properties` (or `$defs`) inherit an unrelated
-  entry's relaxation. Adding a new value to a pointer on this list is
-  treated as MINOR instead of MAJOR on the P2C column. A PR that both adds
-  an enum value AND adds that enum's pointer to `openEnums` is still
-  scored as if the enum were closed (MAJOR) — opening an enum and using
-  the opening have to be two different PRs, so the second one isn't
-  grading its own homework.
+- **`openEnums`** lists each open string enum's own schema node as
+  `"<surface path>#<json pointer>"` — e.g. `"rest/v1/dtos.schema.json#/
+  $defs/Session/properties/status"` — the surface half naming the exact
+  `manifest.json` "path" the entry applies to, and the pointer half the
+  EXACT JSON Pointer of that enum's own schema node within THAT file —
+  never a name derived by stripping `$defs`/`properties` segments out of
+  the pointer, which would let a property literally named `properties`
+  (or `$defs`) inherit an unrelated entry's relaxation. An entry only
+  ever relaxes the surface it names (round 5 review, G3): a def sharing a
+  name across two different files — `rest/v1/dtos.schema.json`'s own
+  `Automation` and an unrelated `Automation` def some other surface
+  happens to also declare, say — does NOT share a relaxation just because
+  one of them is open; an unqualified entry, or one naming a surface not
+  in this manifest, is a manifest authoring error this checker fails
+  closed on (`fc-openenums-scope`) rather than silently doing nothing (or,
+  before this fix, silently applying everywhere). Adding a new value to a
+  pointer on this list is treated as MINOR instead of MAJOR on the P2C
+  column. A PR that both adds an enum value AND adds that enum's pointer
+  to `openEnums` is still scored as if the enum were closed (MAJOR) —
+  opening an enum and using the opening have to be two different PRs, so
+  the second one isn't grading its own homework.
 - **`status: retired`** on a manifest surface row is what lets that row's
   schema file be deleted without the removal being MAJOR (rule 37) — and
   it, too, has to already say `retired` in the PR's OWN base, meaning the
@@ -267,7 +277,8 @@ Both relaxations are read from the **merge-base** copy of
 The lifecycle status enums of platform-produced REST shapes backed by a
 Postgres enum column, which this project expects to grow over time (named
 here by field, for readability — `contracts/manifest.json` itself stores
-each entry as the field's own exact JSON Pointer, per the rule above):
+each entry qualified for `rest/v1/dtos.schema.json`, as its own exact
+JSON Pointer within that file, per the rule above):
 `Session.status`, `Plan.status`, `PlanActionResponse.status`,
 `CreateTurnResponse.status`, `ShadowComparisonTurn.status`,
 `Automation.status`, `AutomationRun.status`, `AutomationInvocation.status`,

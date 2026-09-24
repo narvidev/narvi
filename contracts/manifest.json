@@ -28,17 +28,17 @@
     }
   ],
   "openEnums": [
-    "#/$defs/Session/properties/status",
-    "#/$defs/Plan/properties/status",
-    "#/$defs/PlanActionResponse/properties/status",
-    "#/$defs/CreateTurnResponse/properties/status",
-    "#/$defs/ShadowComparisonTurn/properties/status",
-    "#/$defs/Automation/properties/status",
-    "#/$defs/AutomationRun/properties/status",
-    "#/$defs/AutomationInvocation/properties/status",
-    "#/$defs/WorkflowRun/properties/status",
-    "#/$defs/WorkflowStepRun/properties/status",
-    "#/$defs/WorkflowStepDecideResponse/properties/runStatus",
-    "#/$defs/WorkflowStepDecideResponse/properties/stepRunStatus"
+    "rest/v1/dtos.schema.json#/$defs/Session/properties/status",
+    "rest/v1/dtos.schema.json#/$defs/Plan/properties/status",
+    "rest/v1/dtos.schema.json#/$defs/PlanActionResponse/properties/status",
+    "rest/v1/dtos.schema.json#/$defs/CreateTurnResponse/properties/status",
+    "rest/v1/dtos.schema.json#/$defs/ShadowComparisonTurn/properties/status",
+    "rest/v1/dtos.schema.json#/$defs/Automation/properties/status",
+    "rest/v1/dtos.schema.json#/$defs/AutomationRun/properties/status",
+    "rest/v1/dtos.schema.json#/$defs/AutomationInvocation/properties/status",
+    "rest/v1/dtos.schema.json#/$defs/WorkflowRun/properties/status",
+    "rest/v1/dtos.schema.json#/$defs/WorkflowStepRun/properties/status",
+    "rest/v1/dtos.schema.json#/$defs/WorkflowStepDecideResponse/properties/runStatus",
+    "rest/v1/dtos.schema.json#/$defs/WorkflowStepDecideResponse/properties/stepRunStatus"
   ]
 }
