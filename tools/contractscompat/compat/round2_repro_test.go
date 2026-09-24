@@ -673,7 +673,7 @@ func TestRound2_D19a_ExhaustivenessBackstopFires(t *testing.T) {
 	ctx := &diffCtx{baseR: resolver{defs: map[string]any{}}, headR: resolver{defs: map[string]any{}}}
 	base := map[string]any{"type": "string", "zzz-not-a-real-keyword": true}
 	head := map[string]any{"type": "string"}
-	_, err := ctx.diffResolved(base, head, DirP2C, "#/$defs/X")
+	_, err := ctx.diffResolved(base, head, DirP2C, loc{ptr: "#/$defs/X", defPtr: "#/$defs/X"})
 	fc, ok := err.(*FailClosedError)
 	if !ok {
 		t.Fatalf("want *FailClosedError from the exhaustiveness backstop, got err=%v", err)

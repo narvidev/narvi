@@ -26,10 +26,22 @@ type diffCtx struct {
 	// self-referencing def whose recursive path also differs between
 	// base and head never reaches diffResolved's own
 	// reflect.DeepEqual short-circuit (the two sides are never bit-for-
-	// bit equal), so diffNode would call itself forever. Lazily
-	// initialized; never cleared -- it is scoped to one ctx's lifetime,
-	// which is one top-level DiffDef/root call, exactly the span within
-	// which the same def pair could recur.
+	// bit equal), so diffNode would call itself forever.
+	//
+	// E2: this key deliberately omits the POINTER the (base, head, dir)
+	// triple was reached at -- a revisit through a second referencing
+	// site is graded identically to the first, now that grading itself
+	// (loc.defPtr, below) no longer depends on the referencing path
+	// either. Before that fix, two sites retargeting the SAME (old, new)
+	// def pair could legitimately grade differently (an openEnums
+	// pointer match at one site's traversal pointer but not the
+	// other's), which made skipping the second site's diff silently
+	// wrong. See TestRound3_E2_RetargetRecursionGuardIsSound for the
+	// pinning test that this is now sound.
+	//
+	// Lazily initialized; never cleared -- it is scoped to one ctx's
+	// lifetime, which is one top-level DiffDef/root call, exactly the
+	// span within which the same def pair could recur.
 	visited map[visitKey]bool
 }
 
@@ -54,6 +66,59 @@ func (c *diffCtx) visitOnce(bName, hName string, dir Direction) bool {
 	}
 	c.visited[key] = true
 	return true
+}
+
+// loc bundles the two JSON Pointers a diffed schema node carries as
+// diffNode's recursive walk descends (E2/E3/E7):
+//
+//   - ptr is the TRAVERSAL pointer -- rooted at whichever $defs entry (or
+//     document root) the outermost DiffDef/DiffSurface call started from,
+//     and prefixed by every referencing property/items/union-member/
+//     retarget the walk crossed to reach this node. Every Finding.Pointer
+//     reported anywhere in this package is a ptr, unchanged from before
+//     this fix -- WHERE a change is reported has never been the problem.
+//   - defPtr is the DEFINING pointer -- rooted at THIS node's own
+//     nearest enclosing $defs entry: the one whose content this node is
+//     literally written inside. It resets to that def's own canonical
+//     "#/$defs/<Name>" every time the walk crosses INTO a different def
+//     via a $ref (a same-name re-reference in diffNode, or a retarget's
+//     NEW target in diffRetargetedRef), and otherwise grows by the exact
+//     same suffix as ptr.
+//
+// openEnums is authored against a pointer of the second kind
+// (COMPATIBILITY.md: "the EXACT JSON Pointer ... of each open string
+// enum's own schema node") -- diffEnum is the one place that reads
+// defPtr; every other handler only ever reports at ptr and never looks
+// at defPtr. Before this fix there was only one pointer, doing both
+// jobs, so an enum's relaxation was lost the moment it was reached
+// through ANY $ref (E3), a root surface whose own root is a $ref
+// re-graded its defs' enums under the wrong, traversal-only pointer
+// (E7), and two retarget sites sharing a (base target, head target,
+// direction) triple could grade the SAME enum differently depending on
+// which site the recursion guard happened to visit first (E2).
+type loc struct {
+	ptr, defPtr string
+}
+
+// child extends both of l's pointers by the same suffix -- used for
+// every recursive step that does NOT cross a $ref (into a property,
+// items, additionalProperties schema, or union member): ptr and defPtr
+// stay in lockstep until the walk actually enters a different def.
+func (l loc) child(suffix string) loc {
+	return loc{ptr: l.ptr + suffix, defPtr: l.defPtr + suffix}
+}
+
+// intoDef returns the loc for a node reached by crossing a $ref into
+// name's own def content: ptr keeps accumulating through the
+// REFERENCING path (a Finding inside the def is still reported at the
+// location a maintainer diffing the file would actually see -- e.g.
+// "#/$defs/CreateAutomationResponse/properties/automation/properties/
+// status/enum"), while defPtr resets to that def's own canonical root
+// ("#/$defs/Automation") so an openEnums entry authored against the
+// def's OWN pointer keeps matching regardless of how many $refs away it
+// was reached from.
+func intoDef(l loc, name string) loc {
+	return loc{ptr: l.ptr, defPtr: "#/$defs/" + jsonPointerEscape(name)}
 }
 
 // DiffDef compares one def (already looked up in both sides' $defs maps)
@@ -89,7 +154,7 @@ func DiffDef(baseDefs, headDefs map[string]any, name string, dir Direction, open
 	}
 	ptr := "#/$defs/" + jsonPointerEscape(name)
 	base, head := baseDefs[name], headDefs[name]
-	return ctx.diffNode(base, head, dir, ptr)
+	return ctx.diffNode(base, head, dir, loc{ptr: ptr, defPtr: ptr})
 }
 
 // mergeBothDirections combines the two per-column readings of a DirBoth
@@ -141,13 +206,13 @@ func mergeBothDirections(p2c, c2p []Finding) []Finding {
 // by diffRetargetedRef, which fully dereferences each side's OWN target
 // (through any alias chain) and diffs the two resulting concrete nodes
 // directly, with no merge either.
-func (c *diffCtx) diffNode(base, head any, dir Direction, ptr string) ([]Finding, error) {
+func (c *diffCtx) diffNode(base, head any, dir Direction, l loc) ([]Finding, error) {
 	if dir == DirBoth {
-		p2c, err := c.diffNode(base, head, DirP2C, ptr)
+		p2c, err := c.diffNode(base, head, DirP2C, l)
 		if err != nil {
 			return nil, err
 		}
-		c2p, err := c.diffNode(base, head, DirC2P, ptr)
+		c2p, err := c.diffNode(base, head, DirC2P, l)
 		if err != nil {
 			return nil, err
 		}
@@ -169,34 +234,39 @@ func (c *diffCtx) diffNode(base, head any, dir Direction, ptr string) ([]Finding
 	if bRefName != "" {
 		if bObj, ok := base.(map[string]any); ok {
 			if err := checkRefSiblings(bObj); err != nil {
-				return nil, failClosed("fc-ref", ptr, "%v", err)
+				return nil, failClosed("fc-ref", l.ptr, "%v", err)
 			}
 		}
 	}
 	if hRefName != "" {
 		if hObj, ok := head.(map[string]any); ok {
 			if err := checkRefSiblings(hObj); err != nil {
-				return nil, failClosed("fc-ref", ptr, "%v", err)
+				return nil, failClosed("fc-ref", l.ptr, "%v", err)
 			}
 		}
 	}
 
 	var descFindings []Finding
 	if bRefName != "" || hRefName != "" {
-		descFindings = diffRefSiblingDescription(base, head, ptr)
+		descFindings = diffRefSiblingDescription(base, head, l.ptr)
 	}
 
 	if bRefName != "" && hRefName != "" {
-		// Recursion guard (D17/D22): this exact (base target, head
+		// Recursion guard (D17/D22, E2): this exact (base target, head
 		// target, direction) triple may already have been diffed earlier
 		// in this def's own recursive structure -- a revisit can only
-		// happen by looping through a self-referencing def, and cannot
-		// discover anything new, so stop rather than re-diff.
+		// happen by looping through a self-referencing def, or by a
+		// second, independent site referencing the same (base, head)
+		// pair. Either way it cannot discover anything new: grading
+		// (loc.defPtr) depends only on the (base, head) pair's OWN
+		// defining location, never on the referencing path that got us
+		// here, so a revisit is provably redundant. See this file's own
+		// loc doc comment.
 		if !c.visitOnce(bRefName, hRefName, dir) {
 			return descFindings, nil
 		}
 		if bRefName != hRefName {
-			wrapper, err := c.diffRetargetedRef(bRefName, hRefName, dir, ptr)
+			wrapper, err := c.diffRetargetedRef(bRefName, hRefName, dir, l)
 			if err != nil {
 				return nil, err
 			}
@@ -206,11 +276,11 @@ func (c *diffCtx) diffNode(base, head any, dir Direction, ptr string) ([]Finding
 
 	rBase, err := c.baseR.resolve(base, nil)
 	if err != nil {
-		return nil, failClosed("fc-ref", ptr, "%v", err)
+		return nil, failClosed("fc-ref", l.ptr, "%v", err)
 	}
 	rHead, err := c.headR.resolve(head, nil)
 	if err != nil {
-		return nil, failClosed("fc-ref", ptr, "%v", err)
+		return nil, failClosed("fc-ref", l.ptr, "%v", err)
 	}
 
 	bObj, bIsObj := rBase.(map[string]any)
@@ -226,10 +296,22 @@ func (c *diffCtx) diffNode(base, head any, dir Direction, ptr string) ([]Finding
 		if reflect.DeepEqual(rBase, rHead) {
 			return descFindings, nil
 		}
-		return append(descFindings, ruleFinding("6", dir, majorMajor, ptr, "schema literal changed")), nil
+		return append(descFindings, ruleFinding("6", dir, majorMajor, l.ptr, "schema literal changed")), nil
 	}
 
-	resolvedFindings, err := c.diffResolved(bObj, hObj, dir, ptr)
+	// E3/E7: bRefName == hRefName here whenever it is non-empty (the
+	// bRefName != hRefName case already returned above, via
+	// diffRetargetedRef) -- a same-name $ref means this node's resolved
+	// content is literally the content of def bRefName, so the node's
+	// DEFINING location resets to that def's own root even though its
+	// TRAVERSAL location (l.ptr) keeps accumulating through whatever
+	// property/item/union-member path led here.
+	nodeLoc := l
+	if bRefName != "" {
+		nodeLoc = intoDef(l, bRefName)
+	}
+
+	resolvedFindings, err := c.diffResolved(bObj, hObj, dir, nodeLoc)
 	if err != nil {
 		return nil, err
 	}
@@ -259,23 +341,31 @@ func diffRefSiblingDescription(base, head any, ptr string) []Finding {
 // can itself carry a constraint-bearing sibling (ref.go's resolve/
 // resolveDef already fail closed on that, along the whole alias chain),
 // so there is nothing left to merge here.
-func (c *diffCtx) diffRetargetedRef(bRefName, hRefName string, dir Direction, ptr string) ([]Finding, error) {
+//
+// E2/E3: the nested comparison's DEFINING location (for openEnums) is
+// rooted at the NEW target's own def ("#/$defs/"+hRefName) -- openEnums
+// grades what an added enum value means as it exists in HEAD, and a
+// retarget's new content is what governs that from here on; the
+// referencing node's TRAVERSAL location (l.ptr) is unchanged, so a
+// nested Finding is still reported where a maintainer diffing the file
+// would look for it.
+func (c *diffCtx) diffRetargetedRef(bRefName, hRefName string, dir Direction, l loc) ([]Finding, error) {
 	if _, ok := c.headR.defs[bRefName]; !ok {
 		return []Finding{{
 			RuleID:   "27",
 			Severity: SeverityMajor,
-			Pointer:  ptr,
+			Pointer:  l.ptr,
 			Message:  fmt.Sprintf("$ref retargeted from %q to %q, and %q no longer exists", bRefName, hRefName, bRefName),
 		}}, nil
 	}
 
 	oldTarget, err := c.baseR.resolveDef(bRefName, nil)
 	if err != nil {
-		return nil, failClosed("fc-ref", ptr, "%v", err)
+		return nil, failClosed("fc-ref", l.ptr, "%v", err)
 	}
 	newTarget, err := c.headR.resolveDef(hRefName, nil)
 	if err != nil {
-		return nil, failClosed("fc-ref", ptr, "%v", err)
+		return nil, failClosed("fc-ref", l.ptr, "%v", err)
 	}
 
 	var nested []Finding
@@ -284,10 +374,11 @@ func (c *diffCtx) diffRetargetedRef(bRefName, hRefName string, dir Direction, pt
 	switch {
 	case !oldIsObj || !newIsObj:
 		if !reflect.DeepEqual(oldTarget, newTarget) {
-			nested = []Finding{ruleFinding("6", dir, majorMajor, ptr, "schema literal changed")}
+			nested = []Finding{ruleFinding("6", dir, majorMajor, l.ptr, "schema literal changed")}
 		}
 	default:
-		nested, err = c.diffResolved(oldObj, newObj, dir, ptr)
+		targetLoc := loc{ptr: l.ptr, defPtr: "#/$defs/" + jsonPointerEscape(hRefName)}
+		nested, err = c.diffResolved(oldObj, newObj, dir, targetLoc)
 		if err != nil {
 			return nil, err
 		}
@@ -300,7 +391,7 @@ func (c *diffCtx) diffRetargetedRef(bRefName, hRefName string, dir Direction, pt
 	wrapper := Finding{
 		RuleID:   "27",
 		Severity: worst,
-		Pointer:  ptr,
+		Pointer:  l.ptr,
 		Message:  fmt.Sprintf("$ref retargeted from %q to %q", bRefName, hRefName),
 	}
 	return []Finding{wrapper}, nil
@@ -318,7 +409,7 @@ func (c *diffCtx) diffRetargetedRef(bRefName, hRefName string, dir Direction, pt
 // the structural backstop against exactly the class of bug this rewrite
 // exists to close (a keyword nobody thought to compare passing through
 // silently).
-func (c *diffCtx) diffResolved(bObj, hObj map[string]any, dir Direction, ptr string) ([]Finding, error) {
+func (c *diffCtx) diffResolved(bObj, hObj map[string]any, dir Direction, l loc) ([]Finding, error) {
 	if reflect.DeepEqual(bObj, hObj) {
 		// Nothing changed at or under this node: skip it entirely, rather
 		// than run e.g. oneOf/anyOf pairing on content nobody touched. A
@@ -337,48 +428,48 @@ func (c *diffCtx) diffResolved(bObj, hObj map[string]any, dir Direction, ptr str
 
 	var findings []Finding
 
-	findings = append(findings, diffAnnotations(bObj, hObj, ptr)...)
+	findings = append(findings, diffAnnotations(bObj, hObj, l.ptr)...)
 	mark("description", "goJSONSchema")
 
-	typeFindings, err := c.diffType(bObj, hObj, dir, ptr)
+	typeFindings, err := c.diffType(bObj, hObj, dir, l.ptr)
 	if err != nil {
 		return nil, err
 	}
 	findings = append(findings, typeFindings...)
 	mark("type")
 
-	findings = append(findings, c.diffEnum(bObj, hObj, dir, ptr)...)
+	findings = append(findings, c.diffEnum(bObj, hObj, dir, l)...)
 	mark("enum")
-	findings = append(findings, diffConst(bObj, hObj, ptr)...)
+	findings = append(findings, diffConst(bObj, hObj, l.ptr)...)
 	mark("const")
-	findings = append(findings, diffFormat(bObj, hObj, dir, ptr)...)
+	findings = append(findings, diffFormat(bObj, hObj, dir, l.ptr)...)
 	mark("format")
-	findings = append(findings, diffPattern(bObj, hObj, dir, ptr)...)
+	findings = append(findings, diffPattern(bObj, hObj, dir, l.ptr)...)
 	mark("pattern")
-	findings = append(findings, diffNumericFloor(bObj, hObj, dir, ptr, "minimum")...)
+	findings = append(findings, diffNumericFloor(bObj, hObj, dir, l.ptr, "minimum")...)
 	mark("minimum")
-	findings = append(findings, diffNumericFloor(bObj, hObj, dir, ptr, "minLength")...)
+	findings = append(findings, diffNumericFloor(bObj, hObj, dir, l.ptr, "minLength")...)
 	mark("minLength")
-	findings = append(findings, diffNumericFloor(bObj, hObj, dir, ptr, "minItems")...)
+	findings = append(findings, diffNumericFloor(bObj, hObj, dir, l.ptr, "minItems")...)
 	mark("minItems")
-	findings = append(findings, diffDefault(bObj, hObj, ptr)...)
+	findings = append(findings, diffDefault(bObj, hObj, l.ptr)...)
 	mark("default")
 
-	propFindings, err := c.diffProperties(bObj, hObj, dir, ptr)
+	propFindings, err := c.diffProperties(bObj, hObj, dir, l)
 	if err != nil {
 		return nil, err
 	}
 	findings = append(findings, propFindings...)
 	mark("properties", "required")
 
-	apFindings, err := c.diffAdditionalProperties(bObj, hObj, dir, ptr)
+	apFindings, err := c.diffAdditionalProperties(bObj, hObj, dir, l)
 	if err != nil {
 		return nil, err
 	}
 	findings = append(findings, apFindings...)
 	mark("additionalProperties")
 
-	itemsFindings, err := c.diffItems(bObj, hObj, dir, ptr)
+	itemsFindings, err := c.diffItems(bObj, hObj, dir, l)
 	if err != nil {
 		return nil, err
 	}
@@ -386,7 +477,7 @@ func (c *diffCtx) diffResolved(bObj, hObj map[string]any, dir Direction, ptr str
 	mark("items")
 
 	for _, kw := range []string{"oneOf", "anyOf"} {
-		fs, err := c.diffUnion(bObj, hObj, dir, ptr, kw)
+		fs, err := c.diffUnion(bObj, hObj, dir, l, kw)
 		if err != nil {
 			return nil, err
 		}
@@ -417,7 +508,7 @@ func (c *diffCtx) diffResolved(bObj, hObj map[string]any, dir Direction, ptr str
 	if len(leftover) > 0 {
 		sort.Strings(leftover)
 		leftover = dedupSorted(leftover)
-		return nil, failClosed("fc-unhandled-keyword", ptr, "keyword(s) %v present at this node were not classified by any rule handler", leftover)
+		return nil, failClosed("fc-unhandled-keyword", l.ptr, "keyword(s) %v present at this node were not classified by any rule handler", leftover)
 	}
 
 	return findings, nil
@@ -569,7 +660,7 @@ func (c *diffCtx) diffType(base, head map[string]any, dir Direction, ptr string)
 
 // --- enum (rows 11, 12, 13) ---
 
-func (c *diffCtx) diffEnum(base, head map[string]any, dir Direction, ptr string) []Finding {
+func (c *diffCtx) diffEnum(base, head map[string]any, dir Direction, l loc) []Finding {
 	bRaw, bHas := base["enum"]
 	hRaw, hHas := head["enum"]
 
@@ -578,11 +669,11 @@ func (c *diffCtx) diffEnum(base, head map[string]any, dir Direction, ptr string)
 	}
 	if bHas && !hHas {
 		// row 13, removed
-		return []Finding{ruleFinding("13", dir, severityPair{SeverityMajor, SeverityMinor}, ptr+"/enum", "enum keyword removed")}
+		return []Finding{ruleFinding("13", dir, severityPair{SeverityMajor, SeverityMinor}, l.ptr+"/enum", "enum keyword removed")}
 	}
 	if !bHas && hHas {
 		// row 13, added
-		return []Finding{ruleFinding("13", dir, severityPair{SeverityMinor, SeverityMajor}, ptr+"/enum", "enum keyword added")}
+		return []Finding{ruleFinding("13", dir, severityPair{SeverityMinor, SeverityMajor}, l.ptr+"/enum", "enum keyword added")}
 	}
 
 	bVals, _ := bRaw.([]any)
@@ -597,15 +688,20 @@ func (c *diffCtx) diffEnum(base, head map[string]any, dir Direction, ptr string)
 	}
 
 	var findings []Finding
-	// D14: openEnums matches the enum's schema node by its EXACT JSON
-	// Pointer (ptr, the node diffEnum was called with -- e.g.
-	// "#/$defs/Session/properties/status"), never a name derived by
-	// stripping "$defs"/"properties" segments out of it. Stripping by
-	// segment NAME (rather than position) let a property literally named
-	// "properties" (or "$defs") inherit an unrelated openEnums
-	// relaxation; matching the raw pointer has no such ambiguity, since
-	// every pointer is unique by construction.
-	isOpen := c.openEnums[ptr]
+	// D14/E2/E3/E7: openEnums matches the enum's schema node (the node
+	// that itself carries "enum" -- NOT that node's own "/enum" child;
+	// COMPATIBILITY.md's own example, "#/$defs/Session/properties/
+	// status", names the property node, not ".../status/enum") by the
+	// EXACT JSON Pointer of the $defs entry that DECLARES it (l.defPtr),
+	// never a name derived by stripping "$defs"/"properties" segments
+	// out of a pointer, and never the traversal pointer a particular
+	// caller happened to reach it through (l.ptr) -- see this file's own
+	// loc doc comment. Matching defPtr instead of ptr is what makes the
+	// relaxation survive being reached through an UNRELATED def's own
+	// $ref (E3), a root surface whose root is itself a $ref (E7), and a
+	// second retarget site sharing the same (base, head, direction)
+	// triple as an already-visited one (E2).
+	isOpen := c.openEnums[l.defPtr]
 
 	var addedKeys, removedKeys []string
 	for k := range hSet {
@@ -626,10 +722,10 @@ func (c *diffCtx) diffEnum(base, head map[string]any, dir Direction, ptr string)
 		if isOpen {
 			p2c = SeverityMinor
 		}
-		findings = append(findings, ruleFinding("11", dir, severityPair{p2c, SeverityMinor}, ptr+"/enum", "enum value added: "+describeEnumValue(hSet[k])))
+		findings = append(findings, ruleFinding("11", dir, severityPair{p2c, SeverityMinor}, l.ptr+"/enum", "enum value added: "+describeEnumValue(hSet[k])))
 	}
 	for _, k := range removedKeys {
-		findings = append(findings, ruleFinding("12", dir, severityPair{SeverityMinor, SeverityMajor}, ptr+"/enum", "enum value removed: "+describeEnumValue(bSet[k])))
+		findings = append(findings, ruleFinding("12", dir, severityPair{SeverityMinor, SeverityMajor}, l.ptr+"/enum", "enum value removed: "+describeEnumValue(bSet[k])))
 	}
 	return findings
 }
@@ -801,7 +897,7 @@ func diffDefault(base, head map[string]any, ptr string) []Finding {
 // into, or to have "moved into required" relative to), so it fails
 // closed as a malformed schema rather than being silently accepted the
 // way it was before.
-func (c *diffCtx) diffProperties(base, head map[string]any, dir Direction, ptr string) ([]Finding, error) {
+func (c *diffCtx) diffProperties(base, head map[string]any, dir Direction, l loc) ([]Finding, error) {
 	bProps, _ := base["properties"].(map[string]any)
 	hProps, _ := head["properties"].(map[string]any)
 	bReq := stringSet(base["required"])
@@ -828,15 +924,16 @@ func (c *diffCtx) diffProperties(base, head map[string]any, dir Direction, ptr s
 
 	var findings []Finding
 	for _, name := range sorted {
-		propPtr := ptr + "/properties/" + jsonPointerEscape(name)
+		propLoc := l.child("/properties/" + jsonPointerEscape(name))
+		propPtr := propLoc.ptr
 		bSchema, inBaseProp := bProps[name]
 		hSchema, inHeadProp := hProps[name]
 
 		if bReq[name] && !inBaseProp {
-			return nil, failClosed("fc-required-orphan", ptr+"/required", "%q is required in base but has no matching properties entry", name)
+			return nil, failClosed("fc-required-orphan", l.ptr+"/required", "%q is required in base but has no matching properties entry", name)
 		}
 		if hReq[name] && !inHeadProp {
-			return nil, failClosed("fc-required-orphan", ptr+"/required", "%q is required in head but has no matching properties entry", name)
+			return nil, failClosed("fc-required-orphan", l.ptr+"/required", "%q is required in head but has no matching properties entry", name)
 		}
 
 		switch {
@@ -856,7 +953,7 @@ func (c *diffCtx) diffProperties(base, head map[string]any, dir Direction, ptr s
 			if wasReq && !isReq {
 				findings = append(findings, ruleFinding("5", dir, severityPair{SeverityMajor, SeverityMinor}, propPtr, "property removed from required"))
 			}
-			nested, err := c.diffNode(bSchema, hSchema, dir, propPtr)
+			nested, err := c.diffNode(bSchema, hSchema, dir, propLoc)
 			if err != nil {
 				return nil, err
 			}
@@ -922,14 +1019,15 @@ func classifyAP(obj map[string]any) (apKind, any) {
 	}
 }
 
-func (c *diffCtx) diffAdditionalProperties(base, head map[string]any, dir Direction, ptr string) ([]Finding, error) {
+func (c *diffCtx) diffAdditionalProperties(base, head map[string]any, dir Direction, l loc) ([]Finding, error) {
 	bKind, bSchema := classifyAP(base)
 	hKind, hSchema := classifyAP(head)
 
-	apPtr := ptr + "/additionalProperties"
+	apLoc := l.child("/additionalProperties")
+	apPtr := apLoc.ptr
 
 	if bKind == apSchema && hKind == apSchema {
-		nested, err := c.diffNode(bSchema, hSchema, dir, apPtr)
+		nested, err := c.diffNode(bSchema, hSchema, dir, apLoc)
 		if err != nil {
 			return nil, err
 		}
@@ -975,21 +1073,119 @@ func (c *diffCtx) diffAdditionalProperties(base, head map[string]any, dir Direct
 
 // --- items (row 39) ---
 
-func (c *diffCtx) diffItems(base, head map[string]any, dir Direction, ptr string) ([]Finding, error) {
+func (c *diffCtx) diffItems(base, head map[string]any, dir Direction, l loc) ([]Finding, error) {
 	bItems, bHas := base["items"]
 	hItems, hHas := head["items"]
 	if bHas != hHas {
-		return []Finding{ruleFinding("39", dir, majorMajor, ptr+"/items", "items presence changed")}, nil
+		return []Finding{ruleFinding("39", dir, majorMajor, l.ptr+"/items", "items presence changed")}, nil
 	}
 	if !bHas {
 		return nil, nil
 	}
-	return c.diffNode(bItems, hItems, dir, ptr+"/items")
+	return c.diffNode(bItems, hItems, dir, l.child("/items"))
 }
 
 // --- oneOf/anyOf (rows 9, 10, 28, 29, 30, 43) ---
 
-func (c *diffCtx) diffUnion(base, head map[string]any, dir Direction, ptr, keyword string) ([]Finding, error) {
+// inlineUnionMemberKey classifies an INLINE (non-$ref) oneOf/anyOf
+// member: a discriminated object variant keys by its own
+// properties.type.const value; a bare scalar type -- {"type":X} or
+// {"type":[X,"null"]}, nothing else besides an optional "description" --
+// keys by X itself (bareUnionTypeKey). Anything else, including a bare
+// {"type":"object"} node that carries OTHER keywords but no
+// discriminator, is not classifiable here and the caller fails closed --
+// deliberately UNCHANGED from before E1 (only $ref member classification
+// needed fixing; see resolvedUnionMemberKey).
+func inlineUnionMemberKey(obj map[string]any) (string, bool) {
+	if props, has := obj["properties"].(map[string]any); has {
+		if t, has := props["type"].(map[string]any); has {
+			if constVal, has := t["const"]; has {
+				return "const:" + fmt.Sprint(constVal), true
+			}
+		}
+	}
+	if t, ok := bareUnionTypeKey(obj); ok {
+		return "type:" + t, true
+	}
+	return "", false
+}
+
+// resolvedUnionMemberKey classifies a $ref member by the shape its
+// TARGET resolves to (E1): an object def -- its own "type" is the bare
+// string "object" (regardless of whatever else it carries: a real
+// object def always has "properties"/"required"/etc. alongside
+// "type":"object", unlike the inline case there is no need to require
+// bareness here), or it carries a properties.type.const discriminator --
+// is the discriminated variant rows 28/29 describe, keyed by the $ref's
+// own target NAME (there is no const value to key by here the way an
+// inline discriminated member has one, but a $ref is already a stable,
+// unique name to pair on). A resolved bare scalar type keys exactly like
+// the equivalent inline member would (bareUnionTypeKey). Anything else
+// -- an array-shaped def, an alias chain ending somewhere that is
+// neither, a mixed shape (e.g. type:["object","null"] alongside its own
+// "properties") -- is not classifiable: ok is false and the caller fails
+// closed, exactly as it would for the same shape written inline.
+func resolvedUnionMemberKey(ref string, robj map[string]any) (string, bool) {
+	if t, isStr := robj["type"].(string); isStr && t == "object" {
+		return "ref:" + ref, true
+	}
+	if props, has := robj["properties"].(map[string]any); has {
+		if t, has := props["type"].(map[string]any); has {
+			if _, has := t["const"]; has {
+				return "ref:" + ref, true
+			}
+		}
+	}
+	if t, ok := bareUnionTypeKey(robj); ok {
+		return "type:" + t, true
+	}
+	return "", false
+}
+
+// bareUnionTypeKey reports the scalar type name a bare {"type":X} or
+// {"type":[X,"null"]} union member should key on -- a two-element type
+// array whose other element is "null" is graded exactly like the
+// equivalent inline scalar member (X's own key), the same way rows
+// 7/8/9/10 already treat null-vs-non-null members throughout diffType.
+// Requires the node carry NOTHING besides "type" and an optional
+// "description": any other constraint keyword makes this shape "mixed,"
+// not a bare type, and the caller fails closed rather than guess at how
+// to key it.
+func bareUnionTypeKey(obj map[string]any) (string, bool) {
+	if !onlyKeys(obj, "type", "description") {
+		return "", false
+	}
+	switch t := obj["type"].(type) {
+	case string:
+		if t == "null" {
+			return "null", true
+		}
+		return t, true
+	case []any:
+		if len(t) != 2 {
+			return "", false
+		}
+		var nonNull string
+		nullCount := 0
+		for _, el := range t {
+			s, ok := el.(string)
+			if !ok {
+				return "", false
+			}
+			if s == "null" {
+				nullCount++
+			} else {
+				nonNull = s
+			}
+		}
+		if nullCount == 1 && nonNull != "" {
+			return nonNull, true
+		}
+	}
+	return "", false
+}
+
+func (c *diffCtx) diffUnion(base, head map[string]any, dir Direction, l loc, keyword string) ([]Finding, error) {
 	bRaw, bHas := base[keyword]
 	hRaw, hHas := head[keyword]
 	if !bHas && !hHas {
@@ -1004,16 +1200,16 @@ func (c *diffCtx) diffUnion(base, head map[string]any, dir Direction, ptr, keywo
 		// constraint the old code scored as though every member had
 		// simply been deleted one at a time (row 29, still MAJOR/MAJOR,
 		// so removal already happened to be safe -- but addition was not).
-		return []Finding{ruleFinding("43", dir, majorMajor, ptr+"/"+keyword, keyword+" keyword presence changed")}, nil
+		return []Finding{ruleFinding("43", dir, majorMajor, l.ptr+"/"+keyword, keyword+" keyword presence changed")}, nil
 	}
 
 	bArr, ok := bRaw.([]any)
 	if !ok {
-		return nil, failClosed("fc-shape", ptr+"/"+keyword, "%s must be an array", keyword)
+		return nil, failClosed("fc-shape", l.ptr+"/"+keyword, "%s must be an array", keyword)
 	}
 	hArr, ok := hRaw.([]any)
 	if !ok {
-		return nil, failClosed("fc-shape", ptr+"/"+keyword, "%s must be an array", keyword)
+		return nil, failClosed("fc-shape", l.ptr+"/"+keyword, "%s must be an array", keyword)
 	}
 
 	type member struct {
@@ -1021,54 +1217,59 @@ func (c *diffCtx) diffUnion(base, head map[string]any, dir Direction, ptr, keywo
 		idx  int
 		node any
 	}
-	keyOf := func(node any) (string, bool) {
-		if ref := refTargetName(node); ref != "" {
-			return "ref:" + ref, true
-		}
-		obj, ok := node.(map[string]any)
-		if !ok {
-			return "", false
-		}
-		if props, ok := obj["properties"].(map[string]any); ok {
-			if t, ok := props["type"].(map[string]any); ok {
-				if constVal, ok := t["const"]; ok {
-					return "const:" + fmt.Sprint(constVal), true
-				}
+
+	// keyOf resolves node (through r, base or head's own resolver) to the
+	// shape that actually decides its pairing key -- E1: a $ref member is
+	// no longer trusted at face value as "a discriminated variant" the
+	// way it used to be; it is resolved first, exactly like the
+	// referenced def's OWN content would be classified if it were
+	// written inline at this position instead of behind a $ref.
+	keyOf := func(r resolver, node any) (string, error) {
+		ref := refTargetName(node)
+		if ref == "" {
+			obj, ok := node.(map[string]any)
+			if !ok {
+				return "", fmt.Errorf("%s member must be an object or $ref", keyword)
 			}
+			if k, ok := inlineUnionMemberKey(obj); ok {
+				return k, nil
+			}
+			return "", fmt.Errorf("cannot pair this %s member (no $ref or properties.type.const to key on, and not a bare scalar type)", keyword)
 		}
-		// A bare {"type": "..."} branch with no $ref and no discriminator
-		// -- the common "anyOf: [{$ref: X}, {type: null}]" nullable-via-
-		// anyOf idiom this codebase's own rest/v1/dtos.schema.json uses
-		// (e.g. ReviewReadout.latestVerdict) is exactly this: pairing by
-		// the plain scalar type name is still a closed, deterministic
-		// key, not a guess. keyOf returning "type:null" specifically is
-		// what lets the loop below re-route that member through rows
-		// 9/10 instead of the generic 28/29 (C3).
-		if t, ok := obj["type"].(string); ok && onlyKeys(obj, "type", "description") {
-			return "type:" + t, true
+
+		resolved, err := r.resolve(node, nil)
+		if err != nil {
+			return "", err
 		}
-		return "", false
+		robj, isObj := resolved.(map[string]any)
+		if !isObj {
+			return "", fmt.Errorf("$ref %q resolves to the boolean schema literal, which cannot be paired as a %s member", ref, keyword)
+		}
+		if k, ok := resolvedUnionMemberKey(ref, robj); ok {
+			return k, nil
+		}
+		return "", fmt.Errorf("$ref %q resolves to a shape (neither an object def nor a bare scalar type) that cannot be paired as a %s member", ref, keyword)
 	}
 
 	baseMembers := map[string]member{}
 	for i, n := range bArr {
-		k, ok := keyOf(n)
-		if !ok {
-			return nil, failClosed("fc-oneof-unpairable", fmt.Sprintf("%s/%s/%d", ptr, keyword, i), "cannot pair this %s member (no $ref or properties.type.const to key on)", keyword)
+		k, err := keyOf(c.baseR, n)
+		if err != nil {
+			return nil, failClosed("fc-oneof-unpairable", fmt.Sprintf("%s/%s/%d", l.ptr, keyword, i), "%v", err)
 		}
 		if _, dup := baseMembers[k]; dup {
-			return nil, failClosed("fc-oneof-unpairable", fmt.Sprintf("%s/%s/%d", ptr, keyword, i), "duplicate pairing key %q in base %s", k, keyword)
+			return nil, failClosed("fc-oneof-unpairable", fmt.Sprintf("%s/%s/%d", l.ptr, keyword, i), "duplicate pairing key %q in base %s", k, keyword)
 		}
 		baseMembers[k] = member{k, i, n}
 	}
 	headMembers := map[string]member{}
 	for i, n := range hArr {
-		k, ok := keyOf(n)
-		if !ok {
-			return nil, failClosed("fc-oneof-unpairable", fmt.Sprintf("%s/%s/%d", ptr, keyword, i), "cannot pair this %s member (no $ref or properties.type.const to key on)", keyword)
+		k, err := keyOf(c.headR, n)
+		if err != nil {
+			return nil, failClosed("fc-oneof-unpairable", fmt.Sprintf("%s/%s/%d", l.ptr, keyword, i), "%v", err)
 		}
 		if _, dup := headMembers[k]; dup {
-			return nil, failClosed("fc-oneof-unpairable", fmt.Sprintf("%s/%s/%d", ptr, keyword, i), "duplicate pairing key %q in head %s", k, keyword)
+			return nil, failClosed("fc-oneof-unpairable", fmt.Sprintf("%s/%s/%d", l.ptr, keyword, i), "duplicate pairing key %q in head %s", k, keyword)
 		}
 		headMembers[k] = member{k, i, n}
 	}
@@ -1092,7 +1293,7 @@ func (c *diffCtx) diffUnion(base, head map[string]any, dir Direction, ptr, keywo
 		hm, inHead := headMembers[k]
 		switch {
 		case inBase && !inHead:
-			removedPtr := fmt.Sprintf("%s/%s/%d", ptr, keyword, bm.idx)
+			removedPtr := fmt.Sprintf("%s/%s/%d", l.ptr, keyword, bm.idx)
 			switch {
 			case k == "type:null":
 				findings = append(findings, ruleFinding("10", dir, severityPair{SeverityMinor, SeverityMajor}, removedPtr, "null variant removed from "+keyword))
@@ -1110,7 +1311,7 @@ func (c *diffCtx) diffUnion(base, head map[string]any, dir Direction, ptr, keywo
 				findings = append(findings, ruleFinding("29", dir, majorMajor, removedPtr, "union member removed: "+k))
 			}
 		case !inBase && inHead:
-			addedPtr := fmt.Sprintf("%s/%s/%d", ptr, keyword, hm.idx)
+			addedPtr := fmt.Sprintf("%s/%s/%d", l.ptr, keyword, hm.idx)
 			switch {
 			case k == "type:null":
 				findings = append(findings, ruleFinding("9", dir, severityPair{SeverityMajor, SeverityMinor}, addedPtr, "null variant added to "+keyword))
@@ -1124,8 +1325,8 @@ func (c *diffCtx) diffUnion(base, head map[string]any, dir Direction, ptr, keywo
 				findings = append(findings, ruleFinding("28", dir, severityPair{SeverityMinor, SeverityMinor}, addedPtr, "union member added: "+k))
 			}
 		default:
-			memberPtr := fmt.Sprintf("%s/%s/%d", ptr, keyword, hm.idx)
-			nested, err := c.diffNode(bm.node, hm.node, dir, memberPtr)
+			memberLoc := l.child(fmt.Sprintf("/%s/%d", keyword, hm.idx))
+			nested, err := c.diffNode(bm.node, hm.node, dir, memberLoc)
 			if err != nil {
 				return nil, err
 			}
@@ -1136,7 +1337,7 @@ func (c *diffCtx) diffUnion(base, head map[string]any, dir Direction, ptr, keywo
 			for _, f := range nested {
 				worst = maxSeverity(worst, f.Severity)
 			}
-			wrapper := Finding{RuleID: "30", Severity: worst, Pointer: memberPtr, Message: "union member changed: " + k}
+			wrapper := Finding{RuleID: "30", Severity: worst, Pointer: memberLoc.ptr, Message: "union member changed: " + k}
 			findings = append(findings, wrapper)
 			findings = append(findings, nested...)
 		}

@@ -414,34 +414,42 @@ var corpus = []corpusCase{
 		fixed: &wantFinding{"27", SeverityPatch},
 	},
 	{
+		// E1 (round 3): row 28/29 are scoped to a $ref to an OBJECT def
+		// (COMPATIBILITY.md row 28), so A/B must actually resolve to
+		// object defs here -- a $ref to a bare scalar-type def (the
+		// shape this fixture used before E1) is the type-widened/
+		// -narrowed case, rows 7/8, covered separately by
+		// TestRound3_E1_RefToScalarAliasIsTypeWidened and friends.
 		name:    "row28 oneOf member added",
 		ruleID:  "28",
 		defName: "Envelope",
 		baseDefs: map[string]any{
 			"Envelope": schemaObj("oneOf", []any{schemaObj("$ref", "#/$defs/A")}),
-			"A":        schemaObj("type", "string"),
-			"B":        schemaObj("type", "integer"),
+			"A":        schemaObj("type", "object"),
+			"B":        schemaObj("type", "object"),
 		},
 		headDefs: map[string]any{
 			"Envelope": schemaObj("oneOf", []any{schemaObj("$ref", "#/$defs/A"), schemaObj("$ref", "#/$defs/B")}),
-			"A":        schemaObj("type", "string"),
-			"B":        schemaObj("type", "integer"),
+			"A":        schemaObj("type", "object"),
+			"B":        schemaObj("type", "object"),
 		},
 		fixed: &wantFinding{"28", SeverityMinor},
 	},
 	{
+		// E1 (round 3): see the sibling "row28 oneOf member added" case
+		// above -- A/B must be object defs for rows 28/29 to apply.
 		name:    "row29 oneOf member removed",
 		ruleID:  "29",
 		defName: "Envelope",
 		baseDefs: map[string]any{
 			"Envelope": schemaObj("oneOf", []any{schemaObj("$ref", "#/$defs/A"), schemaObj("$ref", "#/$defs/B")}),
-			"A":        schemaObj("type", "string"),
-			"B":        schemaObj("type", "integer"),
+			"A":        schemaObj("type", "object"),
+			"B":        schemaObj("type", "object"),
 		},
 		headDefs: map[string]any{
 			"Envelope": schemaObj("oneOf", []any{schemaObj("$ref", "#/$defs/A")}),
-			"A":        schemaObj("type", "string"),
-			"B":        schemaObj("type", "integer"),
+			"A":        schemaObj("type", "object"),
+			"B":        schemaObj("type", "object"),
 		},
 		fixed: &wantFinding{"29", SeverityMajor},
 	},
@@ -468,18 +476,20 @@ var corpus = []corpusCase{
 		c2pWant: &wantFinding{"30", SeverityMajor},
 	},
 	{
+		// E1 (round 3): see "row28 oneOf member added" above -- A/B must
+		// be object defs for row 28 to apply.
 		name:    "row28 anyOf member added (keyword coverage)",
 		ruleID:  "28",
 		defName: "Envelope2",
 		baseDefs: map[string]any{
 			"Envelope2": schemaObj("anyOf", []any{schemaObj("$ref", "#/$defs/A")}),
-			"A":         schemaObj("type", "string"),
-			"B":         schemaObj("type", "integer"),
+			"A":         schemaObj("type", "object"),
+			"B":         schemaObj("type", "object"),
 		},
 		headDefs: map[string]any{
 			"Envelope2": schemaObj("anyOf", []any{schemaObj("$ref", "#/$defs/A"), schemaObj("$ref", "#/$defs/B")}),
-			"A":         schemaObj("type", "string"),
-			"B":         schemaObj("type", "integer"),
+			"A":         schemaObj("type", "object"),
+			"B":         schemaObj("type", "object"),
 		},
 		fixed: &wantFinding{"28", SeverityMinor},
 	},
