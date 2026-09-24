@@ -292,10 +292,24 @@ func (e *InvalidOIDCIssuerURLError) Error() string {
 // canonicalCloudIdentityIssuerURL's own neighboring "must not carry a
 // path" rule, a real-world IdP issuer legitimately CAN carry a path
 // segment (e.g. a multi-realm IdP mounting each realm's own issuer under
-// a distinct path) -- go-oidc's own discovery call trims a trailing
-// slash and appends the fixed ".well-known/openid-configuration" suffix
-// itself, so this function only trims that same trailing slash for a
-// stable, canonical stored value, never rejects a path outright.
+// a distinct path).
+//
+// Despite this function's own name, the returned value is NEVER
+// trailing-slash-trimmed (a prior version of this function did, on the
+// mistaken belief that go-oidc.NewProvider "trims a trailing slash"
+// itself -- it does, but ONLY to build the .well-known request URL; it
+// then requires the discovery document's own `issuer` field to equal the
+// configured issuer STRING EXACTLY (oidc.go's own IssuerMismatchError),
+// and the ID token's `iss` claim is checked the same way. Plenty of real
+// IdPs publish an issuer ending in "/" -- Auth0 is the standard example,
+// "https://TENANT.auth0.com/" -- and for those, trimming here made every
+// value this function could ever return provably wrong: the operator's
+// only option that could ever match discovery was the exact string this
+// function refused to keep. §41.3 requires only that the configured
+// value be a well-formed https (or, in development, http) URL naming a
+// host with no userinfo/query/fragment -- shape validation, not
+// canonicalization -- so parsed.String() (a faithful re-serialization of
+// what was parsed, trailing slash and all) is returned as-is.
 func canonicalOIDCIssuerURL(raw string, stage Stage) (string, error) {
 	parsed, err := url.Parse(raw)
 	if err != nil {
@@ -324,7 +338,7 @@ func canonicalOIDCIssuerURL(raw string, stage Stage) (string, error) {
 	if parsed.RawQuery != "" || parsed.Fragment != "" {
 		return "", &InvalidOIDCIssuerURLError{Value: raw, Reason: "must not carry a query string or fragment"}
 	}
-	return strings.TrimSuffix(parsed.String(), "/"), nil
+	return parsed.String(), nil
 }
 
 // ingressEnabledEnvVarName is the process environment variable Load reads

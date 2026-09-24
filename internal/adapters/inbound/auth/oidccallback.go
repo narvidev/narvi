@@ -15,8 +15,6 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/auditlog"
-	"github.com/narvidev/narvi/internal/app/identitylink"
-	domainidentitylink "github.com/narvidev/narvi/internal/domain/identitylink"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -342,12 +340,25 @@ type oidcResolveDeps struct {
 	initialAdminEmails []string
 }
 
+// auditActionOIDCAmbiguousMatch is the audit_log action recorded when a
+// first-time OIDC identity's verified email matches more than one
+// existing user -- kept as its own named constant, and passed explicitly
+// to resolveFirstTimeIdentity (firsttimeidentity.go), so this exact
+// string survives byte-for-byte across the review-round-1 refactor that
+// made the ambiguous-match branch itself shared with callback.go's own
+// GitHub callback (findings O1/O2/O9) -- this package's own pre-existing
+// tests (e.g. TestOIDCCallback_AmbiguousMatch_Refused) assert this exact
+// value.
+const auditActionOIDCAmbiguousMatch = "identity.oidc_ambiguous_match"
+
 // resolveOIDCUser implements this file's own steps after the ID token is
-// fully verified: returning-user fast path, then §13.2 step 3's own
-// email-based graph merge (identitylink.MatchUserIDs + domain/
-// identitylink.Decide), then -- only for a genuinely new identity matching
-// no existing user -- the SAME allowlist-gated first-time-sign-in path
-// GitHub's own callback.go uses.
+// fully verified: returning-user fast path, then -- for a genuinely new
+// identity -- resolveFirstTimeIdentity's own shared §13.2 step 3 graph
+// merge (firsttimeidentity.go), the SAME function callback.go's own
+// GitHub callback now shares this logic with (review round 1, findings
+// O1/O2/O9: before that share existed, only THIS file ran the merge, so
+// an OIDC-only user's later GitHub sign-in could never merge onto their
+// existing account).
 //
 // Returns (userID, outcome, 0, "") on success (httpStatus==0 is the
 // caller's own "proceed to mint a session" signal), or (invalid,
@@ -362,77 +373,46 @@ func resolveOIDCUser(ctx context.Context, deps oidcResolveDeps, externalID, emai
 		return pgtype.UUID{}, "", http.StatusInternalServerError, "internal error"
 	}
 
-	// §13.2 step 3's own graph merge, reused verbatim (never a second
-	// copy) via identitylink.MatchUserIDs -- the SAME two lookups
-	// (users.primary_email, verified identities.email) Slack/Linear's own
-	// auto-link algorithm runs.
-	matched, err := identitylink.MatchUserIDs(ctx, identitylink.Deps{
-		Pool:       deps.pool,
-		Users:      deps.users,
-		Identities: deps.identities,
-		AuditLog:   deps.auditLog,
-	}, email)
-	if err != nil {
-		return pgtype.UUID{}, "", http.StatusInternalServerError, "internal error"
+	firstTimeDeps := firstTimeIdentityDeps{
+		pool:        deps.pool,
+		users:       deps.users,
+		identities:  deps.identities,
+		auditLog:    deps.auditLog,
+		linkPrompts: deps.linkPrompts,
 	}
-
-	// domain/identitylink.Decide is the SAME pure verdict Resolve's own
-	// zero-match branch renders for Slack/Linear (§13.2 step 3) -- exactly
-	// one match auto-links, anything else (zero, or more than one) is
-	// "never guess."
-	if matchedUserIDStr, ok := domainidentitylink.Decide(matched); ok {
-		res, err := identitylink.AutoLink(ctx, identitylink.Deps{
-			Pool:        deps.pool,
-			Users:       deps.users,
-			Identities:  deps.identities,
-			AuditLog:    deps.auditLog,
-			LinkPrompts: deps.linkPrompts,
-		}, sqlcgen.IdentityProviderOidc, externalID, email, matchedUserIDStr)
-		if err != nil {
-			return pgtype.UUID{}, "", http.StatusInternalServerError, "internal error"
-		}
-		return res.UserID, OIDCOutcomeAutoLinked, 0, ""
-	}
-
-	switch len(matched) {
-	case 0:
-		if !deps.allowlist.EmailAllowed(email) {
-			// Deliberately generic, mirroring callback.go's own identical
-			// "does not say which mechanism almost matched" discipline
-			// (enumeration hardening) -- OIDC has no org-membership
-			// mechanism to check (that is a GitHub-specific concept), so
-			// this is the email/domain check alone.
-			return pgtype.UUID{}, OIDCOutcomeFirstTimeDenied, http.StatusForbidden, "not authorized to sign up"
-		}
-		userID, err := createOIDCUserAndIdentity(ctx, deps.pool, deps.users, deps.identities, deps.auditLog, oidcUserAndIdentityParams{
+	// checkAllowed mirrors this file's own pre-existing zero-match check
+	// exactly: OIDC has no org-membership mechanism to check (that is a
+	// GitHub-specific concept), so this is the email/domain allowlist
+	// alone -- deliberately generic on refusal, matching callback.go's own
+	// identical "does not say which mechanism almost matched" discipline
+	// (enumeration hardening).
+	checkAllowed := func() bool { return deps.allowlist.EmailAllowed(email) }
+	createFirstTime := func(ctx context.Context) (pgtype.UUID, error) {
+		return createOIDCUserAndIdentity(ctx, deps.pool, deps.users, deps.identities, deps.auditLog, oidcUserAndIdentityParams{
 			verifiedEmail:      email,
 			displayName:        oidcDisplayName(claims, email),
 			externalID:         externalID,
 			initialAdminEmails: deps.initialAdminEmails,
 		})
-		if err != nil {
-			return pgtype.UUID{}, "", http.StatusInternalServerError, "internal error"
-		}
-		return userID, OIDCOutcomeFirstTimeAllowed, 0, ""
+	}
 
-	default:
-		// More than one existing user matches this verified email --
+	userID, outcome, err := resolveFirstTimeIdentity(ctx, firstTimeDeps, sqlcgen.IdentityProviderOidc, externalID, email, nil, auditActionOIDCAmbiguousMatch, checkAllowed, createFirstTime)
+	if err != nil {
+		return pgtype.UUID{}, "", http.StatusInternalServerError, "internal error"
+	}
+
+	switch outcome {
+	case firstTimeAutoLinked:
+		return userID, OIDCOutcomeAutoLinked, 0, ""
+	case firstTimeCreated:
+		return userID, OIDCOutcomeFirstTimeAllowed, 0, ""
+	case firstTimeDenied:
+		return pgtype.UUID{}, OIDCOutcomeFirstTimeDenied, http.StatusForbidden, "not authorized to sign up"
+	default: // firstTimeAmbiguous
 		// §13.2's own "never guess" rule, and (unlike Slack/Linear) this
 		// live sign-in has no bot-attribution fallback to defer to; see
 		// NewOIDCCallbackHandler's own outcome-table doc comment for the
-		// full reasoning. Audited: a human should look at why more than
-		// one account shares a verified email.
-		auditErr := auditlog.Record(ctx, deps.auditLog, pgtype.UUID{}, "identity.oidc_ambiguous_match", "identity", externalID, map[string]any{
-			"external_id":      externalID,
-			"matched_user_ids": matched,
-			"matched_count":    len(matched),
-		})
-		if auditErr != nil {
-			// Never block the refusal on the audit write failing -- the
-			// refusal itself is the safe direction either way; a lost
-			// audit row here is an observability gap, not a security one.
-			_ = auditErr
-		}
+		// full reasoning.
 		return pgtype.UUID{}, OIDCOutcomeAmbiguousMatch, http.StatusForbidden, "not authorized to sign up"
 	}
 }

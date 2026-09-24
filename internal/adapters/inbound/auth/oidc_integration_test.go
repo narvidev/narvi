@@ -24,6 +24,8 @@ package auth_test
 import (
 	"context"
 	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -75,6 +77,31 @@ type fakeOIDCProvider struct {
 	// anything else.
 	requireCodeVerifier string
 
+	// requireCodeChallenge, when non-empty, makes /token respond 400
+	// unless S256(code_verifier) (base64url, no padding -- RFC 7636)
+	// equals this exactly -- the real PKCE binding, used by
+	// TestOIDCCallback_PKCE_S256BindsVerifierToChallenge to prove the
+	// verifier this flow presents at /token is cryptographically tied to
+	// the code_challenge minted at /authorize, not merely "some string
+	// the login handler remembered" (see that test's own doc comment for
+	// why requireCodeVerifier above cannot prove this). code_challenge
+	// itself is never hit at a real /authorize endpoint here (this
+	// file's own top doc comment: /authorize is never actually called) --
+	// a test reads it straight off the login redirect's own query string
+	// (oauth2.S256ChallengeOption appends it there) and sets it here
+	// before driving the callback.
+	requireCodeChallenge string
+
+	// issuerOverride, when non-empty, replaces this fake's own
+	// server.URL as the discovery document's `issuer` field (and
+	// therefore the value go-oidc.NewProvider requires the CONFIGURED
+	// issuer to equal exactly) -- lets a test simulate an IdP whose real
+	// issuer differs from this httptest.Server's own URL, e.g. one
+	// carrying a trailing slash (TestOIDCIssuer_TrailingSlash_
+	// DiscoverySucceeds) or one that plain differs from what was
+	// configured (TestOIDCIssuer_Mismatch_DiscoveryRefused).
+	issuerOverride string
+
 	server *httptest.Server
 }
 
@@ -94,9 +121,15 @@ func newFakeOIDCProvider(t *testing.T, clientID string) *fakeOIDCProvider {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		f.mu.Lock()
+		issuer := f.server.URL
+		if f.issuerOverride != "" {
+			issuer = f.issuerOverride
+		}
+		f.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"issuer":                 f.server.URL,
+			"issuer":                 issuer,
 			"authorization_endpoint": f.server.URL + "/authorize",
 			"token_endpoint":         f.server.URL + "/token",
 			"jwks_uri":               f.server.URL + "/jwks",
@@ -116,6 +149,7 @@ func newFakeOIDCProvider(t *testing.T, clientID string) *fakeOIDCProvider {
 		f.mu.Lock()
 		f.tokenCalls++
 		requireVerifier := f.requireCodeVerifier
+		requireChallenge := f.requireCodeChallenge
 		idToken := f.nextIDToken
 		f.mu.Unlock()
 
@@ -128,6 +162,24 @@ func newFakeOIDCProvider(t *testing.T, clientID string) *fakeOIDCProvider {
 			w.WriteHeader(http.StatusBadRequest)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid_grant", "error_description": "code_verifier mismatch"})
 			return
+		}
+		if requireChallenge != "" {
+			// The real RFC 7636 S256 binding: BASE64URL(SHA256(code_verifier))
+			// must equal the code_challenge minted at login time -- proves
+			// the verifier THIS request presents is cryptographically tied
+			// to that specific challenge, not merely "some non-empty
+			// string" (requireVerifier's own exact-string-match above
+			// cannot distinguish a real S256 relationship from a
+			// coincidentally-matching fixed value).
+			verifier := r.FormValue("code_verifier")
+			sum := sha256.Sum256([]byte(verifier))
+			computedChallenge := base64.RawURLEncoding.EncodeToString(sum[:])
+			if verifier == "" || computedChallenge != requireChallenge {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid_grant", "error_description": "code_verifier does not match code_challenge (S256)"})
+				return
+			}
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -164,6 +216,18 @@ func (f *fakeOIDCProvider) setRequireCodeVerifier(v string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.requireCodeVerifier = v
+}
+
+func (f *fakeOIDCProvider) setRequireCodeChallenge(v string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.requireCodeChallenge = v
+}
+
+func (f *fakeOIDCProvider) setIssuerOverride(v string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.issuerOverride = v
 }
 
 // defaultClaims builds a baseline, otherwise-valid ID token claims map
@@ -765,6 +829,46 @@ func TestOIDCCallback_WrongSigningKey_Refused(t *testing.T) {
 	}
 }
 
+// TestOIDCCallback_WrongIssuer_Refused proves the ID token's own `iss`
+// claim is actually checked against the configured/discovered issuer --
+// review round 1, finding O7: every OTHER negative test in this file
+// (state, nonce, PKCE, audience, expiry, signing key, email_verified)
+// leaves `iss` at its default (the fake IdP's own real issuer), so none
+// of them can catch the issuer check itself being disabled -- e.g.
+// SkipIssuerCheck: true added to the oidc.Config in oidcconfig.go's own
+// provider.Verifier(...) call. A token signed by the IdP's own real key,
+// with a real nonce and a real email_verified claim, but a DIFFERENT
+// `iss`, must still be refused: oidcExternalID(idToken.Issuer, ...)
+// (oidccallback.go) makes the issuer value load-bearing for identity
+// keying, not just a formality -- accepting a wrong issuer here would let
+// a token meant for a different (but key-sharing, e.g. multi-tenant)
+// issuer be replayed against this one.
+func TestOIDCCallback_WrongIssuer_Refused(t *testing.T) {
+	rig := newOIDCTestRig(t, defaultOIDCRiggedOptions())
+	ctx := context.Background()
+	client := newClient(t)
+
+	state, nonce := doOIDCLogin(t, client, rig.server.URL)
+	claims := rig.provider.defaultClaims("oidc-subject-wrong-iss")
+	claims["iss"] = "https://attacker-tenant.example.test"
+	claims["email"] = "wrongiss@example.com"
+	claims["email_verified"] = true
+	claims["nonce"] = nonce
+	rig.provider.setNextIDToken(rig.provider.signIDToken(t, claims))
+
+	resp := doOIDCCallback(t, client, rig.server.URL, state, "code")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d (an id_token whose iss differs from the configured/discovered issuer must be refused)", resp.StatusCode, http.StatusUnauthorized)
+	}
+
+	wantExternalID := "https://attacker-tenant.example.test|oidc-subject-wrong-iss"
+	if _, err := rig.identities.GetByProviderAndExternalID(ctx, sqlcgen.IdentityProviderOidc, wantExternalID); !errorsIsNoRows(err) {
+		t.Errorf("an identities row was created keyed to the attacker-chosen issuer (err=%v) -- want none", err)
+	}
+}
+
 // --- (g) allowlist still gates a brand-new OIDC identity exactly like
 // GitHub's own first-time sign-in ---
 
@@ -790,5 +894,221 @@ func TestOIDCCallback_FirstTimeSignIn_AllowlistDenied(t *testing.T) {
 	wantExternalID := rig.provider.issuer() + "|oidc-subject-denied"
 	if _, err := rig.identities.GetByProviderAndExternalID(ctx, sqlcgen.IdentityProviderOidc, wantExternalID); !errorsIsNoRows(err) {
 		t.Errorf("an identities row was created for the denied sign-in (err=%v) -- want none", err)
+	}
+}
+
+// --- (h) PKCE: S256 code_challenge/code_verifier are genuinely bound to
+// each other, not merely present -- review round 1, finding O6. ---
+//
+// TestOIDCCallback_MissingOrWrongPKCEVerifier_Refused (above) cannot
+// catch PKCE being removed entirely: its fake /token rejects every
+// code_verifier that is not one fixed, never-matching string, so it
+// returns 400 whether the real flow sends the correct verifier, a wrong
+// one, or none at all -- it only proves "a failed Exchange returns 401".
+// The two tests below exercise the REAL RFC 7636 S256 relationship: the
+// fake IdP's /token now recomputes BASE64URL(SHA256(code_verifier)) and
+// compares it against the code_challenge captured off the login
+// redirect's own query string (oauth2.S256ChallengeOption's doc
+// comment -- exactly what a real IdP does), so only the genuine verifier
+// this flow's own narvi_oidc_verifier cookie carries can ever satisfy it.
+
+// oidcVerifierCookieNameForTest mirrors oidclogin.go's own unexported
+// oidcVerifierCookieName constant ("narvi_oidc_verifier") -- this file is
+// package auth_test (external, black-box), so it cannot reference that
+// unexported identifier directly; duplicated here, by value, rather than
+// exporting it just for this one test.
+const oidcVerifierCookieNameForTest = "narvi_oidc_verifier"
+
+func TestOIDCLogin_PKCE_ChallengeMethodS256Present(t *testing.T) {
+	rig := newOIDCTestRig(t, defaultOIDCRiggedOptions())
+	client := newClient(t)
+
+	resp, err := client.Get(rig.server.URL + "/auth/oidc/login")
+	if err != nil {
+		t.Fatalf("GET /auth/oidc/login: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusFound)
+	}
+	loc, err := resp.Location()
+	if err != nil {
+		t.Fatalf("resp.Location(): %v", err)
+	}
+	if loc.Query().Get("code_challenge") == "" {
+		t.Error("login redirect Location has no code_challenge query param")
+	}
+	if got := loc.Query().Get("code_challenge_method"); got != "S256" {
+		t.Errorf("code_challenge_method = %q, want %q", got, "S256")
+	}
+}
+
+func TestOIDCCallback_PKCE_S256BindsVerifierToChallenge(t *testing.T) {
+	t.Run("real verifier satisfies the challenge recorded at login", func(t *testing.T) {
+		rig := newOIDCTestRig(t, defaultOIDCRiggedOptions())
+		client := newClient(t)
+
+		loginResp, err := client.Get(rig.server.URL + "/auth/oidc/login")
+		if err != nil {
+			t.Fatalf("GET /auth/oidc/login: %v", err)
+		}
+		defer func() { _ = loginResp.Body.Close() }()
+		loc, err := loginResp.Location()
+		if err != nil {
+			t.Fatalf("resp.Location(): %v", err)
+		}
+		state, nonce, challenge := loc.Query().Get("state"), loc.Query().Get("nonce"), loc.Query().Get("code_challenge")
+		if state == "" || nonce == "" || challenge == "" {
+			t.Fatalf("login redirect missing state/nonce/code_challenge: %v", loc)
+		}
+		rig.provider.setRequireCodeChallenge(challenge)
+
+		claims := rig.provider.defaultClaims("oidc-subject-pkce-real")
+		claims["email"] = "pkce-real@example.com"
+		claims["email_verified"] = true
+		claims["nonce"] = nonce
+		rig.provider.setNextIDToken(rig.provider.signIDToken(t, claims))
+
+		resp := doOIDCCallback(t, client, rig.server.URL, state, "pkce-real-code")
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusFound {
+			t.Errorf("status = %d, want %d (the REAL verifier this flow's own cookie carries must satisfy the S256 challenge it minted)", resp.StatusCode, http.StatusFound)
+		}
+	})
+
+	t.Run("a tampered verifier cookie does not satisfy the challenge, refused", func(t *testing.T) {
+		rig := newOIDCTestRig(t, defaultOIDCRiggedOptions())
+		client := newClient(t)
+
+		loginResp, err := client.Get(rig.server.URL + "/auth/oidc/login")
+		if err != nil {
+			t.Fatalf("GET /auth/oidc/login: %v", err)
+		}
+		defer func() { _ = loginResp.Body.Close() }()
+		loc, err := loginResp.Location()
+		if err != nil {
+			t.Fatalf("resp.Location(): %v", err)
+		}
+		state, nonce, challenge := loc.Query().Get("state"), loc.Query().Get("nonce"), loc.Query().Get("code_challenge")
+		if state == "" || nonce == "" || challenge == "" {
+			t.Fatalf("login redirect missing state/nonce/code_challenge: %v", loc)
+		}
+		rig.provider.setRequireCodeChallenge(challenge)
+
+		// Tamper: overwrite the httpOnly narvi_oidc_verifier cookie the
+		// login handler just minted with a DIFFERENT, syntactically-valid
+		// verifier -- code_verifier reaching /token no longer matches
+		// what code_challenge was actually derived from.
+		serverURL, err := url.Parse(rig.server.URL)
+		if err != nil {
+			t.Fatalf("url.Parse: %v", err)
+		}
+		client.Jar.SetCookies(serverURL, []*http.Cookie{{
+			Name:  oidcVerifierCookieNameForTest,
+			Value: "an-attacker-controlled-verifier-that-does-not-match-the-real-one",
+		}})
+
+		claims := rig.provider.defaultClaims("oidc-subject-pkce-tampered")
+		claims["email"] = "pkce-tampered@example.com"
+		claims["email_verified"] = true
+		claims["nonce"] = nonce
+		rig.provider.setNextIDToken(rig.provider.signIDToken(t, claims))
+
+		resp := doOIDCCallback(t, client, rig.server.URL, state, "pkce-tampered-code")
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("status = %d, want %d (a verifier that does not satisfy the recorded S256 challenge must be refused)", resp.StatusCode, http.StatusUnauthorized)
+		}
+	})
+}
+
+// --- (i) issuer exactness: the configured issuer must equal the
+// discovery document's own `issuer` field EXACTLY, trailing slash and
+// all -- review round 1, findings O3/O4/O10. See
+// internal/platform/config_test.go's own TestLoadOIDCIssuerURL for the
+// config-layer half of this fix (canonicalOIDCIssuerURL no longer strips
+// a trailing slash); these two tests prove the SAME fix end-to-end
+// through real discovery and a real sign-in.
+
+func TestOIDCSignIn_TrailingSlashIssuer_DiscoverySucceeds(t *testing.T) {
+	pool := newTestPool(t)
+	provider := newFakeOIDCProvider(t, oidcTestClientID)
+	// An Auth0-shaped issuer: the discovery document's own `issuer` field
+	// carries a trailing slash, and the CONFIGURED issuer below matches it
+	// exactly, trailing slash and all.
+	issuer := provider.issuer() + "/"
+	provider.setIssuerOverride(issuer)
+
+	users := narvipg.NewUserStore(pool)
+	identities := narvipg.NewIdentityStore(pool)
+	auditLog := narvipg.NewAuditLogStore(pool)
+	userSessions := narvipg.NewUserSessionStore(pool)
+	linkPrompts := narvipg.NewIdentityLinkPromptStore(pool)
+
+	cfg := auth.OIDCConfig{
+		Issuer:        issuer,
+		ClientID:      oidcTestClientID,
+		ClientSecret:  "test-oidc-client-secret",
+		PublicBaseURL: "http://narvi.test",
+	}
+	cache := auth.NewOIDCProviderCache(cfg)
+	timeouts := platform.DefaultTimeouts()
+
+	router := chi.NewRouter()
+	router.Get("/auth/oidc/login", auth.NewOIDCLoginHandler(cache, timeouts, false))
+	router.Get("/auth/oidc/callback", auth.NewOIDCCallbackHandler(
+		pool, cache, users, identities, auditLog, userSessions, linkPrompts,
+		defaultOIDCRiggedOptions().allowlist, nil, timeouts, false,
+	))
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+
+	client := newClient(t)
+	state, nonce := doOIDCLogin(t, client, server.URL)
+	claims := provider.defaultClaims("oidc-subject-trailing-slash")
+	claims["iss"] = issuer // must equal the discovered/configured issuer exactly
+	claims["email"] = "trailingslash@example.com"
+	claims["email_verified"] = true
+	claims["nonce"] = nonce
+	provider.setNextIDToken(provider.signIDToken(t, claims))
+
+	resp := doOIDCCallback(t, client, server.URL, state, "trailing-slash-code")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("callback status = %d, want %d (discovery must succeed when the configured issuer matches the discovery document's own trailing-slash issuer exactly)", resp.StatusCode, http.StatusFound)
+	}
+}
+
+func TestOIDCSignIn_MismatchedDiscoveryIssuer_Refused(t *testing.T) {
+	provider := newFakeOIDCProvider(t, oidcTestClientID)
+	// Discovery reports a DIFFERENT issuer than what is configured below
+	// -- go-oidc.NewProvider must refuse this (IssuerMismatchError),
+	// exactly the failure mode a misconfigured/typo'd NARVI_OIDC_ISSUER
+	// would hit against a real IdP.
+	provider.setIssuerOverride(provider.issuer() + "/unexpected-path")
+
+	cfg := auth.OIDCConfig{
+		Issuer:        provider.issuer(), // does NOT match what discovery reports
+		ClientID:      oidcTestClientID,
+		ClientSecret:  "test-oidc-client-secret",
+		PublicBaseURL: "http://narvi.test",
+	}
+	cache := auth.NewOIDCProviderCache(cfg)
+	timeouts := platform.DefaultTimeouts()
+
+	router := chi.NewRouter()
+	router.Get("/auth/oidc/login", auth.NewOIDCLoginHandler(cache, timeouts, false))
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+
+	client := newClient(t)
+	resp, err := client.Get(server.URL + "/auth/oidc/login")
+	if err != nil {
+		t.Fatalf("GET /auth/oidc/login: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d (discovery must fail closed when the configured issuer does not match the discovery document's own issuer)", resp.StatusCode, http.StatusServiceUnavailable)
 	}
 }

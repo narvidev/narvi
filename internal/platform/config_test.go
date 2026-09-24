@@ -1893,6 +1893,156 @@ func TestLoadOTLPEndpoint(t *testing.T) {
 	}
 }
 
+// TestLoadOIDCIssuerURL covers §41.3's own NARVI_OIDC_ISSUER shape
+// validation (canonicalOIDCIssuerURL) -- all-or-none with
+// NARVI_OIDC_CLIENT_ID/NARVI_OIDC_CLIENT_SECRET (see
+// oidcIssuerEnvVarName's own doc comment), a well-formed absolute URL
+// naming a host, no userinfo/query/fragment, https outside development.
+//
+// The "trailing slash preserved" subtest is this Step's own review-round-1
+// regression test (finding O3/O4/O10): an earlier version of
+// canonicalOIDCIssuerURL trimmed a trailing slash on the mistaken belief
+// that go-oidc.NewProvider "trims it too" -- it only does so to build the
+// discovery request URL, then requires the discovery document's own
+// `issuer` field to equal the CONFIGURED string exactly
+// (*oidc.IssuerMismatchError otherwise). Real IdPs that publish a
+// trailing-slash issuer (Auth0: "https://TENANT.auth0.com/") could
+// therefore never be configured at all -- restoring the old
+// strings.TrimSuffix(parsed.String(), "/") call makes this subtest fail
+// (Load().OIDCIssuer would come back without the trailing slash the
+// operator configured).
+func TestLoadOIDCIssuerURL(t *testing.T) {
+	t.Run("unset succeeds with an empty value (second sign-in provider off)", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("NARVI_OIDC_ISSUER", "")
+		t.Setenv("NARVI_OIDC_CLIENT_ID", "")
+		t.Setenv("NARVI_OIDC_CLIENT_SECRET", "")
+
+		cfg, err := platform.Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v, want nil (all three unset is a valid, off configuration)", err)
+		}
+		if cfg.OIDCIssuer != "" {
+			t.Errorf("Load().OIDCIssuer = %q, want empty when unset", cfg.OIDCIssuer)
+		}
+	})
+
+	t.Run("only some of the three set is refused", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("NARVI_OIDC_ISSUER", "https://idp.example.test")
+		t.Setenv("NARVI_OIDC_CLIENT_ID", "")
+		t.Setenv("NARVI_OIDC_CLIENT_SECRET", "")
+
+		_, err := platform.Load()
+		if err == nil {
+			t.Fatal("Load() error = nil, want *platform.InvalidOIDCConfigError for a partially-set OIDC config")
+		}
+		var cfgErr *platform.InvalidOIDCConfigError
+		if !errors.As(err, &cfgErr) {
+			t.Fatalf("Load() error = %v, want *platform.InvalidOIDCConfigError", err)
+		}
+	})
+
+	t.Run("a well-formed https URL with no trailing slash carries through unchanged", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("NARVI_OIDC_ISSUER", "https://idp.example.test")
+		t.Setenv("NARVI_OIDC_CLIENT_ID", "test-oidc-client-id")
+		t.Setenv("NARVI_OIDC_CLIENT_SECRET", "test-oidc-client-secret")
+
+		cfg, err := platform.Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v, want nil", err)
+		}
+		if cfg.OIDCIssuer != "https://idp.example.test" {
+			t.Errorf("Load().OIDCIssuer = %q, want %q", cfg.OIDCIssuer, "https://idp.example.test")
+		}
+	})
+
+	t.Run("a trailing slash is PRESERVED, never stripped (Auth0-shaped issuer)", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("NARVI_OIDC_ISSUER", "https://tenant.eu.auth0.com/")
+		t.Setenv("NARVI_OIDC_CLIENT_ID", "test-oidc-client-id")
+		t.Setenv("NARVI_OIDC_CLIENT_SECRET", "test-oidc-client-secret")
+
+		cfg, err := platform.Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v, want nil", err)
+		}
+		if cfg.OIDCIssuer != "https://tenant.eu.auth0.com/" {
+			t.Errorf("Load().OIDCIssuer = %q, want %q (trailing slash must survive verbatim)", cfg.OIDCIssuer, "https://tenant.eu.auth0.com/")
+		}
+	})
+
+	t.Run("a bare http issuer is accepted in development", func(t *testing.T) {
+		setRequiredEnv(t) // NARVI_STAGE=development
+		t.Setenv("NARVI_OIDC_ISSUER", "http://127.0.0.1:9999/")
+		t.Setenv("NARVI_OIDC_CLIENT_ID", "test-oidc-client-id")
+		t.Setenv("NARVI_OIDC_CLIENT_SECRET", "test-oidc-client-secret")
+
+		cfg, err := platform.Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v, want nil (plain http is tolerated in development)", err)
+		}
+		if cfg.OIDCIssuer != "http://127.0.0.1:9999/" {
+			t.Errorf("Load().OIDCIssuer = %q, want %q", cfg.OIDCIssuer, "http://127.0.0.1:9999/")
+		}
+	})
+
+	invalidCases := []struct {
+		name string
+		val  string
+	}{
+		{"not a URL at all", "://not a url"},
+		{"missing scheme", "idp.example.test"},
+		{"non-http(s) scheme", "ftp://idp.example.test"},
+		{"missing host", "https:///.well-known"},
+		{"port-only authority names no host", "https://:8443"},
+		{"carries userinfo", "https://user:pass@idp.example.test"},
+		{"carries a query string", "https://idp.example.test?x=1"},
+		{"carries a fragment", "https://idp.example.test#frag"},
+	}
+	for _, tc := range invalidCases {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("NARVI_OIDC_ISSUER", tc.val)
+			t.Setenv("NARVI_OIDC_CLIENT_ID", "test-oidc-client-id")
+			t.Setenv("NARVI_OIDC_CLIENT_SECRET", "test-oidc-client-secret")
+
+			_, err := platform.Load()
+			if err == nil {
+				t.Fatalf("Load() error = nil, want *platform.InvalidOIDCIssuerURLError for %q", tc.val)
+			}
+			var urlErr *platform.InvalidOIDCIssuerURLError
+			if !errors.As(err, &urlErr) {
+				t.Fatalf("Load() error = %v, want *platform.InvalidOIDCIssuerURLError", err)
+			}
+		})
+	}
+
+	t.Run("http outside development is refused", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("NARVI_STAGE", "production")
+		// TestLoad's own note: production also requires a Secure-cookie-
+		// affecting set of prod-only env vars in some codepaths, but
+		// canonicalOIDCIssuerURL's own scheme check runs before anything
+		// downstream would need those -- if this subtest starts failing for
+		// an unrelated missing-env reason, see setRequiredEnv's own doc
+		// comment for what a production stage additionally requires.
+		t.Setenv("NARVI_OIDC_ISSUER", "http://idp.example.test")
+		t.Setenv("NARVI_OIDC_CLIENT_ID", "test-oidc-client-id")
+		t.Setenv("NARVI_OIDC_CLIENT_SECRET", "test-oidc-client-secret")
+
+		_, err := platform.Load()
+		if err == nil {
+			t.Fatal("Load() error = nil, want *platform.InvalidOIDCIssuerURLError (http is refused outside development)")
+		}
+		var urlErr *platform.InvalidOIDCIssuerURLError
+		if !errors.As(err, &urlErr) {
+			t.Fatalf("Load() error = %v, want *platform.InvalidOIDCIssuerURLError", err)
+		}
+	})
+}
+
 // TestLoadGitHubAPIBaseURL covers NARVI_GITHUB_API_BASE_URL (§41.1 review
 // round 1, finding P2; narrowed by round 2, findings Q2/Q7/Q10/Q11): this
 // value feeds ONLY the GitHub App client (githubapp/githubapi, plus

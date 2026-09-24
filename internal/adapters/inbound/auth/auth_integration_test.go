@@ -215,6 +215,7 @@ type testRig struct {
 	identities   *narvipg.IdentityStore
 	auditLog     *narvipg.AuditLogStore
 	userSessions *narvipg.UserSessionStore
+	linkPrompts  *narvipg.IdentityLinkPromptStore
 	github       *fakeGitHubAPI
 	token        *fakeTokenServer
 	server       *httptest.Server
@@ -248,6 +249,7 @@ func newTestRig(t *testing.T, opts riggedOptions) testRig {
 		identities:   narvipg.NewIdentityStore(pool),
 		auditLog:     narvipg.NewAuditLogStore(pool),
 		userSessions: narvipg.NewUserSessionStore(pool),
+		linkPrompts:  narvipg.NewIdentityLinkPromptStore(pool),
 		github:       githubAPI,
 		token:        tokenServer,
 	}
@@ -279,6 +281,7 @@ func newTestRig(t *testing.T, opts riggedOptions) testRig {
 		rig.identities,
 		rig.auditLog,
 		rig.userSessions,
+		rig.linkPrompts,
 		opts.allowlist,
 		opts.initialAdminEmails,
 		tokenKey,
@@ -781,6 +784,7 @@ func newRigSharingPool(t *testing.T, base testRig, opts riggedOptions) testRig {
 		identities:   base.identities,
 		auditLog:     base.auditLog,
 		userSessions: base.userSessions,
+		linkPrompts:  base.linkPrompts,
 		github:       newFakeGitHubAPI(t),
 		token:        newFakeTokenServer(t),
 	}
@@ -813,6 +817,7 @@ func newRigSharingPool(t *testing.T, base testRig, opts riggedOptions) testRig {
 		rig.identities,
 		rig.auditLog,
 		rig.userSessions,
+		rig.linkPrompts,
 		opts.allowlist,
 		opts.initialAdminEmails,
 		tokenKey,
