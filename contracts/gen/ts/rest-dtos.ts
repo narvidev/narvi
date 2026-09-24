@@ -304,7 +304,7 @@ export interface Identity {
   /**
    * Matches Postgres identity_provider exactly.
    */
-  provider: 'github' | 'slack' | 'linear' | 'google';
+  provider: 'github' | 'slack' | 'linear' | 'google' | 'oidc';
   externalId: string;
   /**
    * Matches Postgres identity_linked_via exactly.
@@ -340,7 +340,7 @@ export interface PendingLinkPrompt {
   /**
    * Matches Postgres identity_provider exactly.
    */
-  provider: 'github' | 'slack' | 'linear' | 'google';
+  provider: 'github' | 'slack' | 'linear' | 'google' | 'oidc';
   externalId: string;
   expiresAt: string;
   createdAt: string;
@@ -408,7 +408,7 @@ export interface UpdateMemberRoleRequest {
  */
 export interface LinkMemberIdentityRequest {
   /**
-   * One of github/slack/linear/google at the application layer (matches Postgres identity_provider); not enforced here, see this shape's own description.
+   * One of github/slack/linear/google/oidc at the application layer (matches Postgres identity_provider); not enforced here, see this shape's own description.
    */
   provider: string;
   externalId: string;

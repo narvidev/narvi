@@ -301,6 +301,7 @@ var validProviders = map[string]sqlcgen.IdentityProvider{
 	string(sqlcgen.IdentityProviderSlack):  sqlcgen.IdentityProviderSlack,
 	string(sqlcgen.IdentityProviderLinear): sqlcgen.IdentityProviderLinear,
 	string(sqlcgen.IdentityProviderGoogle): sqlcgen.IdentityProviderGoogle,
+	string(sqlcgen.IdentityProviderOidc):   sqlcgen.IdentityProviderOidc,
 }
 
 // LinkMemberIdentity backs POST /api/members/{userID}/identities:

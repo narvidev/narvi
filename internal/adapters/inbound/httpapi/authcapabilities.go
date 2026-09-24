@@ -14,6 +14,7 @@
 // knowledge_retrieval), mounted behind auth.Middleware and therefore
 // structurally unusable by a signed-out visitor -- the sign-in view's own
 // one caller for THIS handler.
+
 package httpapi
 
 import (
@@ -33,7 +34,7 @@ import (
 // re-evaluated per request against a licence that CAN change live) a
 // closed-over constant is the honest shape here.
 func GetAuthCapabilities(oidcConfigured bool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, restdtos.AuthCapabilitiesResponse{
 			OidcConfigured: oidcConfigured,
 		})

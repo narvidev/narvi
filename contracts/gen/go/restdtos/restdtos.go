@@ -3864,6 +3864,7 @@ type IdentityProvider string
 const IdentityProviderGithub IdentityProvider = "github"
 const IdentityProviderGoogle IdentityProvider = "google"
 const IdentityProviderLinear IdentityProvider = "linear"
+const IdentityProviderOidc IdentityProvider = "oidc"
 const IdentityProviderSlack IdentityProvider = "slack"
 
 var enumValues_IdentityProvider = []interface{}{
@@ -3871,6 +3872,7 @@ var enumValues_IdentityProvider = []interface{}{
 	"slack",
 	"linear",
 	"google",
+	"oidc",
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -4086,8 +4088,9 @@ type LinkMemberIdentityRequest struct {
 	// ExternalId corresponds to the JSON schema field "externalId".
 	ExternalId string `json:"externalId" yaml:"externalId" mapstructure:"externalId"`
 
-	// One of github/slack/linear/google at the application layer (matches Postgres
-	// identity_provider); not enforced here, see this shape's own description.
+	// One of github/slack/linear/google/oidc at the application layer (matches
+	// Postgres identity_provider); not enforced here, see this shape's own
+	// description.
 	Provider string `json:"provider" yaml:"provider" mapstructure:"provider"`
 }
 
@@ -5229,6 +5232,7 @@ type PendingLinkPromptProvider string
 const PendingLinkPromptProviderGithub PendingLinkPromptProvider = "github"
 const PendingLinkPromptProviderGoogle PendingLinkPromptProvider = "google"
 const PendingLinkPromptProviderLinear PendingLinkPromptProvider = "linear"
+const PendingLinkPromptProviderOidc PendingLinkPromptProvider = "oidc"
 const PendingLinkPromptProviderSlack PendingLinkPromptProvider = "slack"
 
 var enumValues_PendingLinkPromptProvider = []interface{}{
@@ -5236,6 +5240,7 @@ var enumValues_PendingLinkPromptProvider = []interface{}{
 	"slack",
 	"linear",
 	"google",
+	"oidc",
 }
 
 // UnmarshalJSON implements json.Unmarshaler.

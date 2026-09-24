@@ -524,7 +524,8 @@
             "github",
             "slack",
             "linear",
-            "google"
+            "google",
+            "oidc"
           ],
           "description": "Matches Postgres identity_provider exactly."
         },
@@ -612,7 +613,8 @@
             "github",
             "slack",
             "linear",
-            "google"
+            "google",
+            "oidc"
           ],
           "description": "Matches Postgres identity_provider exactly."
         },
@@ -752,7 +754,7 @@
       "properties": {
         "provider": {
           "type": "string",
-          "description": "One of github/slack/linear/google at the application layer (matches Postgres identity_provider); not enforced here, see this shape's own description."
+          "description": "One of github/slack/linear/google/oidc at the application layer (matches Postgres identity_provider); not enforced here, see this shape's own description."
         },
         "externalId": {
           "type": "string"

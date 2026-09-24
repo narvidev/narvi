@@ -28,6 +28,8 @@ import (
 // package's own tests.
 type OIDCCallbackOutcome string
 
+// The full outcome table (see NewOIDCCallbackHandler's own doc comment
+// for the complete branch-by-branch writeup).
 const (
 	OIDCOutcomeReturningUser    OIDCCallbackOutcome = "oidc_returning_user"
 	OIDCOutcomeAutoLinked       OIDCCallbackOutcome = "oidc_auto_linked"
