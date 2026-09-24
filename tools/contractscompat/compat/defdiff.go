@@ -42,6 +42,27 @@ type diffCtx struct {
 	// lifetime, which is one top-level DiffDef/root call, exactly the
 	// span within which the same def pair could recur.
 	visited map[visitKey]bool
+	// selfCheck (Step 157, review round 6): set only by validateStructure's
+	// own diffDefSelf/root call, NEVER by a real DiffDef/DiffSurface
+	// comparison. It disables diffResolved's own `reflect.DeepEqual(bObj,
+	// hObj)` bail -- see that function's doc comment -- which exists so a
+	// real base/head diff never re-derives a pairing for a sibling nobody
+	// touched. That short-circuit is exactly right for a genuine
+	// comparison, but it means literally diffing a document against
+	// itself (the same node passed as both base and head) is a silent
+	// no-op: every node trivially equals itself, so diffResolved would
+	// return before diffProperties, diffUnion, or the resolve()/
+	// resolveDef() call inside diffNode's own $ref-crossing logic ever
+	// ran past the outermost node. selfCheck is what makes
+	// validateStructure's walk actually reach every property, def, and
+	// union member -- while still calling the EXACT SAME rule functions a
+	// real diff calls, never a second implementation of what they check.
+	// Because every node is now visited even though nothing ever
+	// "changes," diffCtx.visited (above) is the ONLY thing that stops an
+	// unbounded walk through a self-referencing def in this mode -- the
+	// DeepEqual bail no longer backs it up here, which is why
+	// diffDefSelf pre-seeds it exactly as DiffDef itself does.
+	selfCheck bool
 }
 
 // visitKey identifies one (base $ref target name, head $ref target name,
@@ -476,12 +497,16 @@ func (c *diffCtx) diffRetargetedRef(bRefName, hRefName string, dir Direction, l 
 // exists to close (a keyword nobody thought to compare passing through
 // silently).
 func (c *diffCtx) diffResolved(bObj, hObj map[string]any, dir Direction, l loc) ([]Finding, error) {
-	if reflect.DeepEqual(bObj, hObj) {
+	if !c.selfCheck && reflect.DeepEqual(bObj, hObj) {
 		// Nothing changed at or under this node: skip it entirely, rather
 		// than run e.g. oneOf/anyOf pairing on content nobody touched. A
 		// pairing heuristic that cannot key every member of some
 		// untouched, pre-existing union would otherwise fail closed on
 		// files that have never changed at all.
+		//
+		// Step 157: this bail is exactly what validateStructure's own
+		// selfCheck mode needs to skip -- see diffCtx.selfCheck's doc
+		// comment.
 		return nil, nil
 	}
 

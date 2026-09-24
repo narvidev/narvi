@@ -256,6 +256,21 @@ func Compare(in Input) (Report, error) {
 			if _, err := rootDirection(directive); err != nil {
 				return Report{}, fmt.Errorf("new surface %s: %w", path, err)
 			}
+			// Step 157: walkSchema above only enforces the keyword
+			// allowlist -- it does not run the union-shape whitelist, the
+			// required/properties orphan check, or the boolean-$ref-target
+			// rejection, all three of which otherwise only ever fire
+			// inside a two-sided diff this brand-new file never goes
+			// through. validateStructure closes that gap; see its own doc
+			// comment.
+			structFindings, err := validateStructure(directive, headRaw, baseManifest.OpenEnumSetForSurface(path))
+			if err != nil {
+				return Report{}, fmt.Errorf("validate new surface %s: %w", path, err)
+			}
+			for i := range structFindings {
+				structFindings[i].Surface = path
+			}
+			all = append(all, structFindings...)
 			changedSurfaces[path] = true
 			continue
 		}
@@ -273,6 +288,31 @@ func Compare(in Input) (Report, error) {
 		}
 		if !ok {
 			return Report{}, fmt.Errorf("surface %s has no manifest row on either side", path)
+		}
+
+		// Step 157: a $defs entry or property that is new IN THIS PR,
+		// added alongside unrelated pre-existing content in an
+		// already-governed file, is otherwise never routed through
+		// diffProperties/diffUnion/resolveDef at all -- DiffSurface's own
+		// row-32 "$defs entry added" branch and diffProperties' own
+		// rows-2/3 "property added" branch both record the addition and
+		// move on, neither recurses diffNode into the new content. Run
+		// validateStructure against HEAD unconditionally, independent of
+		// what DiffSurface itself finds below, so a violation introduced
+		// this way still fails closed here rather than waiting for some
+		// later PR to touch it from the other side too. A well-formed,
+		// previously-validated file (the common case) reports zero
+		// findings here and leaves changedSurfaces untouched.
+		structFindings, err := validateStructure(directive, headRaw, baseManifest.OpenEnumSetForSurface(path))
+		if err != nil {
+			return Report{}, fmt.Errorf("validate %s: %w", path, err)
+		}
+		if len(structFindings) > 0 {
+			for i := range structFindings {
+				structFindings[i].Surface = path
+			}
+			all = append(all, structFindings...)
+			changedSurfaces[path] = true
 		}
 
 		findings, err := DiffSurface(directive, baseRaw, headRaw, baseManifest.OpenEnumSetForSurface(path))
