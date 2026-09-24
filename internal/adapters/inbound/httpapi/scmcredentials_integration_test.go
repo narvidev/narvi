@@ -470,18 +470,21 @@ func TestScmCredentials_NoGitHubIdentity(t *testing.T) {
 	}
 }
 
-// TestScmCredentials_NoGitHubIdentity_FallsBackToBotToken proves review
-// round 1's own finding O5: a creator with NO github identity at all --
-// the ordinary case for a user who signed in ONLY through OIDC (§41.3)
-// and has never linked GitHub -- now falls back to the SAME static bot
-// credential a review session already receives (step 7), when this
-// deployment has one configured. Otherwise identical to
-// TestScmCredentials_NoGitHubIdentity above, except rig.botToken is set:
-// without this fallback, such a creator's live session could never push
-// at all, so sessionactor's own §8.11 createPRBestEffort bot-fallback PR
-// path could never even be reached (only theoretically correct).
-func TestScmCredentials_NoGitHubIdentity_FallsBackToBotToken(t *testing.T) {
-	const realBotToken = "bot-token-for-oidc-only-creator"
+// TestScmCredentials_NoGitHubIdentity_NeverFallsBackToBotToken_EvenWhenConfigured
+// proves review round 2's own finding P1 (HIGH): review round 1 (finding
+// O5) had added a bot-token fallback here for a creator with NO github
+// identity at all -- the ordinary case for a user who signed in ONLY
+// through OIDC (§41.3) and has never linked GitHub -- but that handed
+// exactly this least-privileged principal the deployment's single static
+// write credential for a LIVE session whose branch the creator itself
+// chooses (including "main"), unaudited. This endpoint must now deny with
+// 403 regardless of whether a bot token is configured for this
+// deployment -- otherwise identical to TestScmCredentials_NoGitHubIdentity
+// above, except rig.botToken IS set here, specifically to prove its mere
+// presence can no longer change the outcome for this case (a review
+// session, step 7, is the ONLY branch that still uses it).
+func TestScmCredentials_NoGitHubIdentity_NeverFallsBackToBotToken_EvenWhenConfigured(t *testing.T) {
+	const realBotToken = "bot-token-must-never-cover-a-github-less-creator"
 	rig := newTestRig(t, func(r *testRig) { r.botToken = realBotToken })
 	ctx := context.Background()
 
@@ -496,7 +499,7 @@ func TestScmCredentials_NoGitHubIdentity_FallsBackToBotToken(t *testing.T) {
 	promoteRepoLive(ctx, t, rig, reviewSessionRepos)
 	session, err := rig.sessions.Create(ctx, sqlcgen.CreateSessionParams{
 		SpawnSource: sqlcgen.SessionSpawnSourceWeb, CreatedBy: user.ID,
-		Repos: []byte(`[{"name":"narvi","url":"https://github.com/narvidev/narvi","branch":null}]`),
+		Repos: []byte(`[{"name":"narvi","url":"https://github.com/narvidev/narvi","branch":"main"}]`),
 	})
 	if err != nil {
 		t.Fatalf("create session: %v", err)
@@ -504,11 +507,11 @@ func TestScmCredentials_NoGitHubIdentity_FallsBackToBotToken(t *testing.T) {
 	createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
 
 	status, got := postScmCredentials(t, rig, session.ID.String(), "sandbox-bearer-token")
-	if status != http.StatusOK {
-		t.Fatalf("status = %d, want %d (a bot token IS configured for this deployment)", status, http.StatusOK)
+	if status != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d (no bot/service-account fallback exists for a live, non-review session's github-less creator, bot token configured or not)", status, http.StatusForbidden)
 	}
-	if got.Password != realBotToken {
-		t.Errorf("Password = %q, want the bot token %q -- never the (nonexistent) creator token", got.Password, realBotToken)
+	if got.Password == realBotToken {
+		t.Fatalf("Password equals the deployment's bot token -- the exact privilege-escalation gap review round 2's finding P1 closes")
 	}
 }
 
@@ -654,6 +657,101 @@ func TestScmCredentials_GitHubIdentityNoStoredToken_NeverFallsBackToBot(t *testi
 	}
 	if got.Password == realBotToken {
 		t.Error("Password == the bot token -- an existing GitHub identity with no stored token must never receive the bot fallback")
+	}
+}
+
+// TestScmCredentials_TamperedCiphertext_WithBotToken_NeverFallsBackToBot
+// proves review round 2's own finding P5 (mutant M5b): the decrypt-failure
+// sub-case must never fall back to the bot token either, even when one is
+// configured for this deployment -- otherwise identical to
+// TestScmCredentials_TamperedCiphertext above (a real, tampered
+// access_token_encrypted value, AES-GCM's own authentication tag catching
+// it, never a mocked failure), except rig.botToken IS set here.
+// TestScmCredentials_TamperedCiphertext's own doc comment claimed this
+// exact scenario was covered "identically" -- it was not: that test's rig
+// has no bot token configured at all, so it cannot observe a bot
+// fallback (M5b survived against it, per review round 2's own
+// reproduction).
+func TestScmCredentials_TamperedCiphertext_WithBotToken_NeverFallsBackToBot(t *testing.T) {
+	const realBotToken = "bot-token-must-never-cover-a-decrypt-failure"
+	rig := newTestRig(t, func(r *testRig) { r.botToken = realBotToken })
+	ctx := context.Background()
+
+	session := createSessionWithGitHubIdentity(ctx, t, rig, "gho_realGitHubAccessToken")
+	createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
+
+	if _, err := rig.pool.Exec(ctx,
+		`UPDATE identities SET access_token_encrypted = access_token_encrypted || '\xff'::bytea WHERE user_id = $1`,
+		session.CreatedBy,
+	); err != nil {
+		t.Fatalf("corrupt access_token_encrypted: %v", err)
+	}
+
+	status, got := postScmCredentials(t, rig, session.ID.String(), "sandbox-bearer-token")
+	if status != http.StatusForbidden {
+		t.Errorf("status = %d, want %d (a decrypt failure must never fall back to the bot token, bot token configured or not)", status, http.StatusForbidden)
+	}
+	if got.Password == realBotToken {
+		t.Error("Password == the bot token -- a tampered/undecryptable existing identity must never receive the bot fallback")
+	}
+}
+
+// TestScmCredentials_IdentityLookupError_WithBotToken_NeverFallsBackToBot
+// proves review round 2's own finding P5 (mutant M5c): a GENUINE
+// identities.GetByUserAndProvider failure other than pgx.ErrNoRows must
+// never fall back to the bot token either, even when one is configured.
+// No fake/mock of postgres.IdentityStore exists in this package (its
+// signature takes the concrete store, not an interface), so this proves
+// it against a REAL query failure: the identities table itself is
+// renamed away for the single request this test makes (restored via
+// defer before this function returns, whether it passes or fails), which
+// is what a genuine "row scan"/"connection"/"relation" failure from this
+// exact query looks like from ScmCredentials' own point of view --
+// completely distinct from -- and reached only by a DIFFERENT branch
+// than -- the ordinary "no such row" (pgx.ErrNoRows) case every other
+// test in this file drives. This test does not call t.Parallel, and
+// nothing else in this package's own test binary does either during its
+// own sequential test phase (Go only starts parallel subtests once every
+// non-parallel one has returned), so no other test can observe the table
+// renamed away.
+func TestScmCredentials_IdentityLookupError_WithBotToken_NeverFallsBackToBot(t *testing.T) {
+	const realBotToken = "bot-token-must-never-cover-a-lookup-error"
+	rig := newTestRig(t, func(r *testRig) { r.botToken = realBotToken })
+	ctx := context.Background()
+
+	// Deliberately NO identities row of any provider -- irrelevant here,
+	// since the table itself will be unreachable for the request below.
+	user, err := rig.users.Create(ctx, sqlcgen.CreateUserParams{
+		PrimaryEmail: "lookup-error-with-bot@example.com", DisplayName: "Lookup Error, Bot Configured", Role: sqlcgen.UserRoleMember,
+	})
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	promoteRepoLive(ctx, t, rig, reviewSessionRepos)
+	session, err := rig.sessions.Create(ctx, sqlcgen.CreateSessionParams{
+		SpawnSource: sqlcgen.SessionSpawnSourceWeb, CreatedBy: user.ID,
+		Repos: []byte(`[{"name":"narvi","url":"https://github.com/narvidev/narvi","branch":null}]`),
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
+
+	if _, err := rig.pool.Exec(ctx, `ALTER TABLE identities RENAME TO identities_disabled_for_test`); err != nil {
+		t.Fatalf("rename identities table away: %v", err)
+	}
+	defer func() {
+		if _, err := rig.pool.Exec(context.Background(), `ALTER TABLE identities_disabled_for_test RENAME TO identities`); err != nil {
+			t.Fatalf("restore identities table: %v", err)
+		}
+	}()
+
+	status, got := postScmCredentials(t, rig, session.ID.String(), "sandbox-bearer-token")
+	if status != http.StatusForbidden {
+		t.Errorf("status = %d, want %d (a genuine identity-lookup failure must never fall back to the bot token, and must never be a 500 either -- §5.2's own outcome-class discipline)", status, http.StatusForbidden)
+	}
+	if got.Password == realBotToken {
+		t.Error("Password == the bot token -- a genuine identity-lookup failure must never receive the bot fallback")
 	}
 }
 
