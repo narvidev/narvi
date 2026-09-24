@@ -1159,6 +1159,30 @@ func (e *InvalidShadowModeError) Error() string {
 	return fmt.Sprintf("invalid %s=%q: must be a boolean (true/false/1/0/T/F/...)", shadowModeEnvVarName, e.Value)
 }
 
+// mcpEnabledEnvVarName configures technical plan §43's own MCP surface
+// feature flag, read from NARVI_MCP_ENABLED. Optional, default
+// false -- mirrors epistemicCheckDefaultEnvVarName's own "optional
+// boolean, safe default" idiom exactly, one boolean env var over. The
+// surface's own /mcp route group is mounted UNCONDITIONALLY
+// (controlplane/serve.go), gated by mcpadapter.RequireEnabled reading
+// Config.MCPEnabled at request time -- this flag decides only whether
+// that gate answers 503, never whether the route exists in
+// routes.golden (see that gate's own doc comment for the full
+// "observable as off, never absent" reasoning, mirroring httpapi.
+// RequireCapability's identical precedent one package over).
+const mcpEnabledEnvVarName = "NARVI_MCP_ENABLED"
+
+// InvalidMCPEnabledError is returned by Load when NARVI_MCP_ENABLED is set
+// to a value strconv.ParseBool does not recognize -- mirrors
+// InvalidShadowModeError's own identical shape, one boolean env var over.
+type InvalidMCPEnabledError struct {
+	Value string
+}
+
+func (e *InvalidMCPEnabledError) Error() string {
+	return fmt.Sprintf("invalid %s=%q: must be a boolean (true/false/1/0/T/F/...)", mcpEnabledEnvVarName, e.Value)
+}
+
 // RolloutMode is a type ALIAS (not a new, parallel type) for
 // internal/domain/rollout.Mode -- Config.RolloutMode below is spelled
 // platform.RolloutMode purely so every one of this Step's own call sites
@@ -1763,6 +1787,17 @@ type Config struct {
 	// item this backs.
 	ShadowMode bool
 
+	// MCPEnabled is technical plan §43's own feature flag for the MCP
+	// surface ("entry point, transport, protocol versions, and the first
+	// tools"), read from NARVI_MCP_ENABLED. Optional: defaults
+	// to false, mirroring EpistemicCheckDefault/ShadowMode's own "off by
+	// default" shape immediately above -- until an operator opts in, POST
+	// /mcp answers 503 (mcpadapter.RequireEnabled), same as an
+	// unconfigured OIDC route. The route itself is mounted
+	// UNCONDITIONALLY regardless of this flag's value (§43: "a surface
+	// that is off must be observable as off, never a missing route").
+	MCPEnabled bool
+
 	// GitHubAppID and GitHubAppPrivateKey are §30.4's own GitHub App
 	// plumbing, read from NARVI_GITHUB_APP_ID / NARVI_GITHUB_APP_PRIVATE_KEY
 	// (both required in every stage -- see gitHubAppIDEnvVarName's own doc
@@ -2322,6 +2357,19 @@ func load(lookupEnv func(string) (string, bool)) (*Config, error) {
 		}
 	}
 
+	// mcpEnabled (§43): optional, default false -- mirrors shadowMode's
+	// own identical "empty means unset, parse only when present, reject
+	// anything ParseBool doesn't recognize" idiom immediately above.
+	mcpEnabled := false
+	if raw := getenv(mcpEnabledEnvVarName); raw != "" {
+		parsed, parseErr := strconv.ParseBool(raw)
+		if parseErr != nil {
+			errs = append(errs, &InvalidMCPEnabledError{Value: raw})
+		} else {
+			mcpEnabled = parsed
+		}
+	}
+
 	// gitHubAppID/gitHubAppPrivateKey (§30.4): required in every stage --
 	// see gitHubAppIDEnvVarName's own doc comment for why this differs
 	// from gitHubImageBuildToken's own optional precedent immediately
@@ -2626,6 +2674,7 @@ func load(lookupEnv func(string) (string, bool)) (*Config, error) {
 		EpistemicCheckDefault:      epistemicCheckDefault,
 		RolloutMode:                rolloutMode,
 		ShadowMode:                 shadowMode,
+		MCPEnabled:                 mcpEnabled,
 		GitHubAppID:                gitHubAppID,
 		GitHubAppPrivateKey:        gitHubAppPrivateKey,
 		GitHubAPIBaseURL:           gitHubAPIBaseURL,

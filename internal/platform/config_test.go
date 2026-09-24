@@ -1463,6 +1463,67 @@ func TestLoadShadowMode(t *testing.T) {
 	})
 }
 
+// TestLoadMCPEnabled covers technical plan §43's own MCP surface feature
+// flag -- mirrors TestLoadShadowMode's own shape exactly
+// (optional boolean env var, off by default, InvalidXError on an
+// unparseable value): before this test existed, flipping MCPEnabled's own
+// default false->true in Load, or breaking the invalid-value branch,
+// would have shipped green.
+func TestLoadMCPEnabled(t *testing.T) {
+	t.Run("unset defaults to false (§43: disabled by default)", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("NARVI_MCP_ENABLED", "")
+
+		cfg, err := platform.Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v, want nil (this flag is optional)", err)
+		}
+		if cfg.MCPEnabled {
+			t.Errorf("Load().MCPEnabled = true, want false when unset")
+		}
+	})
+
+	t.Run("set true carries the real value through", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("NARVI_MCP_ENABLED", "true")
+
+		cfg, err := platform.Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v, want nil", err)
+		}
+		if !cfg.MCPEnabled {
+			t.Errorf("Load().MCPEnabled = false, want true")
+		}
+	})
+
+	t.Run("set false explicitly carries through", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("NARVI_MCP_ENABLED", "false")
+
+		cfg, err := platform.Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v, want nil", err)
+		}
+		if cfg.MCPEnabled {
+			t.Errorf("Load().MCPEnabled = true, want false")
+		}
+	})
+
+	t.Run("invalid value fails", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("NARVI_MCP_ENABLED", "not-a-bool")
+
+		_, err := platform.Load()
+		if err == nil {
+			t.Fatal("Load() error = nil, want error")
+		}
+		var mcpErr *platform.InvalidMCPEnabledError
+		if !errors.As(err, &mcpErr) {
+			t.Fatalf("Load() error = %v, want *platform.InvalidMCPEnabledError", err)
+		}
+	})
+}
+
 // TestLoadRolloutMode covers §10's own master switch (§10 Phase 6,
 // §32) -- mirrors TestLoadEpistemicCheckDefault's own shape exactly,
 // with an explicit two-value enum in place of a boolean: unset defaults

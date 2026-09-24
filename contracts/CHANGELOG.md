@@ -9,6 +9,33 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.3.0]
+
+### rest/v1/dtos.schema.json
+
+- Added: `ListModelsToolRequest`, `ListSessionsToolRequest`,
+  `GetSessionToolRequest` -- the input shapes for the first three MCP
+  tools (`narvi_list_models`, `narvi_list_sessions`, `narvi_get_session`;
+  technical plan §43, "the MCP surface", Step 180). Each is the exact
+  wire `inputSchema` its tool's `tools/list` entry carries, passed
+  verbatim (never reflected) into the official Go SDK's `mcp.Tool.
+  InputSchema`. All three are wholly new, independent named shapes,
+  additive to this schema -- no existing shape changed. Classified
+  client-to-platform by the existing `*Request`-suffix `by-suffix`
+  direction rule (`manifest.json`), no checker change needed. The three
+  tools' OUTPUT shapes are NOT new `$defs`: they reuse `ModelCatalog`,
+  `ListSessionsResponse`, and `Session` unchanged, bundled with their own
+  transitive `$defs` at boot (`internal/adapters/inbound/mcp/schemas.go`).
+
+### controlplane/testdata/routes.golden
+
+- Added: `POST /mcp` -- the MCP Streamable HTTP endpoint (§43), mounted
+  unconditionally (gated 503 at request time by `NARVI_MCP_ENABLED`,
+  default off). Not an `/api/` route, so `tools/contractscompat`'s own
+  `DiffRoutes` (rows 40/41) does not grade it either way -- recorded here
+  only for the same VERSION/CHANGELOG discipline every schema-touching PR
+  follows.
+
 ## [1.2.0]
 
 ### rest/v1/dtos.schema.json

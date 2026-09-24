@@ -50,6 +50,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 	identitylinkhttp "github.com/narvidev/narvi/internal/adapters/inbound/identitylink"
 	"github.com/narvidev/narvi/internal/adapters/inbound/linear"
+	mcpadapter "github.com/narvidev/narvi/internal/adapters/inbound/mcp"
 	"github.com/narvidev/narvi/internal/adapters/inbound/slack"
 	"github.com/narvidev/narvi/internal/adapters/inbound/webui"
 	"github.com/narvidev/narvi/internal/adapters/inbound/wshub"
@@ -2589,6 +2590,38 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 			AutomationInvocations: automationInvocationStore,
 		}))
 	}
+
+	// /mcp (technical plan §43, "the MCP surface"): the Streamable HTTP
+	// entry point for the first three read-only MCP tools --
+	// narvi_list_models, narvi_list_sessions, narvi_get_session.
+	// Deliberately NOT under /api/ (a protocol endpoint, the same
+	// category as /sessions/{sessionID}/ws or /webhooks/*, never graded
+	// by tools/contractscompat's own /api/-only DiffRoutes) and mounted
+	// UNCONDITIONALLY regardless of cfg.MCPEnabled -- a surface that is
+	// off must be OBSERVABLE as off (503, mcpadapter.RequireEnabled,
+	// FIRST in this group's own chain, mirroring the OIDC routes'
+	// identical "mounted unconditionally, 503 when unconfigured"
+	// precedent above) rather than a route that does not exist at all
+	// (§43.6). auth.Middleware runs SECOND, the exact same gate every
+	// /api/** group above already uses -- this surface is cookie-
+	// authenticated, nothing else (§43.2); 181 is what makes it usable
+	// by a real, non-cookie-holding client. Twins are the SAME three
+	// httpapi handlers /api/models and /api/sessions[/{sessionID}] above
+	// already register -- the bridge invokes them in-process, never a
+	// second implementation (§43.4; mcp/bridge.go's own doc comment).
+	mcpHandler, err := mcpadapter.NewHandler(mcpadapter.Config{PublicBaseURL: cfg.PublicBaseURL}, mcpadapter.Twins{
+		ListModels:   httpapi.GetModelCatalog(),
+		ListSessions: httpapi.ListSessions(sessionStore),
+		GetSession:   httpapi.GetSession(sessionStore),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("build mcp handler: %w", err)
+	}
+	router.Route("/mcp", func(r chi.Router) {
+		r.Use(mcpadapter.RequireEnabled(cfg.MCPEnabled))
+		r.Use(auth.Middleware(userSessionStore, userStore))
+		r.Post("/", mcpHandler.ServeHTTP)
+	})
 
 	// Module routes (docs/design/boundaries-design.md, section 3.2): mounted
 	// AFTER every public route group, under /api/ext/<Name>/, behind the

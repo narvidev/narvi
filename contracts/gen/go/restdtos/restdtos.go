@@ -3805,6 +3805,36 @@ func (j *FalsePositivePattern) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// The narvi_get_session MCP tool's own input (technical plan §43.4) -- the tool
+// bridge's twin of GET /api/sessions/{sessionID}, carrying the path parameter as a
+// plain required field the bridge maps onto chi's own URLParams before invoking
+// the twin handler in-process (technical plan §43.4's bridge).
+type GetSessionToolRequest struct {
+	// The session id, matching Session.id's own format exactly. A malformed value
+	// fails the bridge's own outcome mapping the same way GET
+	// /api/sessions/{sessionID} fails on a malformed path segment (400, translated to
+	// JSON-RPC -32602).
+	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *GetSessionToolRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["sessionId"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionId in GetSessionToolRequest: required")
+	}
+	type Plain GetSessionToolRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = GetSessionToolRequest(plain)
+	return nil
+}
+
 // One linked-identity row's own REST wire shape (§13.2/§13.3 members API) --
 // returned both standalone (POST/DELETE .../identities) and nested inside
 // Member.identities. provider/linkedVia enums match the Postgres
@@ -4429,6 +4459,15 @@ func (j *ListMembersResponse) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// The narvi_list_models MCP tool's own input (technical plan §43.4) -- the tool
+// bridge's twin of GET /api/models, which takes no query parameters at all, so
+// this is an intentionally empty object shape. A real $def (never an inline {}
+// literal) so the wire inputSchema every narvi_list_models tools/list response
+// carries is byte-derived from /contracts like every other tool input, per the
+// *Request-suffix client-to-platform convention every existing request shape here
+// already follows (tools/contractscompat's own by-suffix direction rule).
+type ListModelsToolRequest map[string]interface{}
+
 // GET /api/sessions/:id/plans's own response body (audit finding M3, completeness)
 // -- every plan VERSION for the session, ordered by version, so a web client can
 // render v1->v2 history and find the currently awaiting_approval version's own id
@@ -4571,6 +4610,38 @@ func (j *ListSessionsResponse) UnmarshalJSON(value []byte) error {
 	}
 	*j = ListSessionsResponse(plain)
 	return nil
+}
+
+// The narvi_list_sessions MCP tool's own input (technical plan §43.4) -- the tool
+// bridge's twin of GET /api/sessions?filter=&limit=, mirroring that route's own
+// two optional query parameters exactly (httpapi/listsessions.go: filter defaults
+// "mine" when omitted, limit defaults listSessionsDefaultLimit and is capped at
+// listSessionsMaxLimit server-side). Both fields are optional; the bridge builds
+// the twin's own url.Values from whichever of these two the caller actually set,
+// omitting the rest so the handler's own defaulting behavior runs unchanged.
+type ListSessionsToolRequest struct {
+	// Matches GET /api/sessions's own ?filter= values exactly
+	// (httpapi/listsessions.go) -- "mine" (the default when omitted) or "all".
+	// Deliberately NOT a schema-level "enum" here: the pinned SDK
+	// (github.com/google/jsonschema-go) DOES enforce "enum", and enforcing it here
+	// would let an invalid value (e.g. "x") be rejected by the SDK's own generic
+	// argument-validation error -- a DIFFERENT, less specific message than the REST
+	// route's own "filter must be \"mine\" or \"all\"" -- before the request ever
+	// reaches the bridge. Declaring only "type" lets every value reach the twin
+	// handler unchanged, so the bridge's own outcome mapping (technical plan §43.4)
+	// always carries the REST route's own exact error text, preserving byte-for-byte
+	// HTTP/MCP parity for this row instead of two divergent validation paths.
+	Filter *string `json:"filter,omitempty,omitzero" yaml:"filter,omitempty" mapstructure:"filter,omitempty"`
+
+	// Matches GET /api/sessions's own ?limit= exactly
+	// (httpapi.listSessionsDefaultLimit/listSessionsMaxLimit): omitted means the
+	// route's own default. Deliberately NOT a schema-level "minimum"/"maximum" here
+	// -- same reasoning as filter's own doc comment immediately above: the pinned SDK
+	// DOES enforce "minimum", which would substitute the SDK's own generic message
+	// for the REST route's exact "malformed limit" text before the bridge ever runs.
+	// A value above the route's own upper bound (200) is not rejected either way --
+	// like the REST route itself, it is silently clamped server-side.
+	Limit *int `json:"limit,omitempty,omitzero" yaml:"limit,omitempty" mapstructure:"limit,omitempty"`
 }
 
 // 200 response for GET /api/workflow-bindings (§25.10) -- every (lane, repo)
@@ -13037,14 +13108,6 @@ const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
 const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
 const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
 
-var enumValues_WorkflowStepRunStatus = []interface{}{
-	"awaiting_decision",
-	"running",
-	"completed",
-	"failed",
-	"cancelled",
-}
-
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 	var v string
@@ -13066,6 +13129,14 @@ func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 }
 
 type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
+
+var enumValues_WorkflowStepRunStatus = []interface{}{
+	"awaiting_decision",
+	"running",
+	"completed",
+	"failed",
+	"cancelled",
+}
 
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
 // sequential turn'). Null while an awaiting_decision (hitlBefore-gated) attempt

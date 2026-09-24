@@ -3164,3 +3164,38 @@ export interface AuthCapabilitiesResponse {
    */
   oidcConfigured: boolean;
 }
+/**
+ * The narvi_list_models MCP tool's own input (technical plan §43.4) -- the tool bridge's twin of GET /api/models, which takes no query parameters at all, so this is an intentionally empty object shape. A real $def (never an inline {} literal) so the wire inputSchema every narvi_list_models tools/list response carries is byte-derived from /contracts like every other tool input, per the *Request-suffix client-to-platform convention every existing request shape here already follows (tools/contractscompat's own by-suffix direction rule).
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "ListModelsToolRequest".
+ */
+export interface ListModelsToolRequest {}
+/**
+ * The narvi_list_sessions MCP tool's own input (technical plan §43.4) -- the tool bridge's twin of GET /api/sessions?filter=&limit=, mirroring that route's own two optional query parameters exactly (httpapi/listsessions.go: filter defaults "mine" when omitted, limit defaults listSessionsDefaultLimit and is capped at listSessionsMaxLimit server-side). Both fields are optional; the bridge builds the twin's own url.Values from whichever of these two the caller actually set, omitting the rest so the handler's own defaulting behavior runs unchanged.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "ListSessionsToolRequest".
+ */
+export interface ListSessionsToolRequest {
+  /**
+   * Matches GET /api/sessions's own ?filter= values exactly (httpapi/listsessions.go) -- "mine" (the default when omitted) or "all". Deliberately NOT a schema-level "enum" here: the pinned SDK (github.com/google/jsonschema-go) DOES enforce "enum", and enforcing it here would let an invalid value (e.g. "x") be rejected by the SDK's own generic argument-validation error -- a DIFFERENT, less specific message than the REST route's own "filter must be \"mine\" or \"all\"" -- before the request ever reaches the bridge. Declaring only "type" lets every value reach the twin handler unchanged, so the bridge's own outcome mapping (technical plan §43.4) always carries the REST route's own exact error text, preserving byte-for-byte HTTP/MCP parity for this row instead of two divergent validation paths.
+   */
+  filter?: string;
+  /**
+   * Matches GET /api/sessions's own ?limit= exactly (httpapi.listSessionsDefaultLimit/listSessionsMaxLimit): omitted means the route's own default. Deliberately NOT a schema-level "minimum"/"maximum" here -- same reasoning as filter's own doc comment immediately above: the pinned SDK DOES enforce "minimum", which would substitute the SDK's own generic message for the REST route's exact "malformed limit" text before the bridge ever runs. A value above the route's own upper bound (200) is not rejected either way -- like the REST route itself, it is silently clamped server-side.
+   */
+  limit?: number;
+}
+/**
+ * The narvi_get_session MCP tool's own input (technical plan §43.4) -- the tool bridge's twin of GET /api/sessions/{sessionID}, carrying the path parameter as a plain required field the bridge maps onto chi's own URLParams before invoking the twin handler in-process (technical plan §43.4's bridge).
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "GetSessionToolRequest".
+ */
+export interface GetSessionToolRequest {
+  /**
+   * The session id, matching Session.id's own format exactly. A malformed value fails the bridge's own outcome mapping the same way GET /api/sessions/{sessionID} fails on a malformed path segment (400, translated to JSON-RPC -32602).
+   */
+  sessionId: string;
+}
