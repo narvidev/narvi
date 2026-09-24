@@ -206,7 +206,11 @@ func (d releaseCompositionDispatcher) EnsureDispatched(ctx context.Context, sess
 // modules is the extension seam docs/design/boundaries-design.md,
 // section 3, adds: zero for the public binary (cmd/control-plane's own call site
 // passes none), one or more for a private binary composed on top of this
-// package. Threaded straight through to serve, unchanged.
+// package. Threaded straight through to BOTH serve and routes, unchanged
+// (§41.1 review round 2, finding Q6/Q12 -- "routes" used to drop modules
+// on the floor, so a composed binary's route listing silently omitted
+// every module's mounted routes and skipped validateModules; it now
+// receives the exact same list serve() does).
 func Main(args []string, modules ...extension.Module) int {
 	if len(args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: control-plane <serve|seed|routes> [args...]")
@@ -220,7 +224,7 @@ func Main(args []string, modules ...extension.Module) int {
 	case "seed":
 		err = runSeedCommand(args[2:])
 	case "routes":
-		err = runRoutesCommand(context.Background(), os.Stdout)
+		err = runRoutesCommand(context.Background(), os.Stdout, modules...)
 	default:
 		fmt.Fprintln(os.Stderr, "usage: control-plane <serve|seed|routes> [args...]")
 		return 1

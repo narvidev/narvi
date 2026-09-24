@@ -23,14 +23,18 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
+	"github.com/narvidev/narvi/extension"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 )
 
@@ -148,5 +152,36 @@ func TestRunRoutesCommand_DoesNotMigrate(t *testing.T) {
 
 	if err := assertDatabaseHasNoTables(t.Context(), connStr); err != nil {
 		t.Error(err)
+	}
+}
+
+// TestRunRoutesCommand_IncludesModuleRoutes is §41.1 review round 2,
+// finding Q6/Q12's own proof obligation: with a module registered,
+// runRoutesCommand's printed output must include that module's own
+// mounted routes -- exactly what serve() would expose for the same
+// composed binary, per this command's own "SAME Build serve() uses"
+// doc-comment claim.
+func TestRunRoutesCommand_IncludesModuleRoutes(t *testing.T) {
+	setRequiredEnv(t)
+
+	_, connStr := newTestPool(t)
+	t.Setenv("NARVI_DATABASE_URL", connStr)
+
+	fakeModule := extension.Module{
+		Name: "acmetest",
+		Mount: func(r chi.Router, _ extension.Runtime) {
+			r.Get("/", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			})
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := runRoutesCommand(t.Context(), &buf, fakeModule); err != nil {
+		t.Fatalf("runRoutesCommand with a module: %v", err)
+	}
+
+	if !strings.Contains(buf.String(), "/api/ext/acmetest") {
+		t.Errorf("runRoutesCommand's output with a registered module does not contain its /api/ext/acmetest route -- routes must print what serve() would serve for the same composed binary.\ngot:\n%s", buf.String())
 	}
 }
