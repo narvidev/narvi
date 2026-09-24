@@ -10,9 +10,10 @@
 // check, confirm's Stat-based verification + re-checked quota + guarded
 // transition + event/outbox, content's presigned-redirect) against a
 // fake, in-memory ports.BlobStore (fakeBlobStore, below) rather than a
-// real S3/MinIO backend -- real SigV4/HTTP-status-classification behavior
-// is covered separately, exhaustively, by internal/adapters/outbound/
-// objstore's own unit and MinIO-testcontainer integration tests (§28.7).
+// real S3-compatible backend -- real SigV4/HTTP-status-classification
+// behavior is covered separately, exhaustively, by
+// internal/adapters/outbound/objstore's own unit and S3-compatible-
+// testcontainer integration tests (§28.7).
 package httpapi_test
 
 import (

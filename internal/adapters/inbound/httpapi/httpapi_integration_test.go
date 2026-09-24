@@ -334,8 +334,8 @@ type testRig struct {
 	// routes, both auth variants (upload_integration_test.go). blobStore
 	// defaults to a fresh *fakeBlobStore per rig (upload_integration_test.go's
 	// own in-memory, httptest.Server-backed ports.BlobStore -- real
-	// S3/MinIO behavior is covered separately, exhaustively, by
-	// internal/adapters/outbound/objstore's own unit/integration tests;
+	// S3-compatible-backend behavior is covered separately, exhaustively,
+	// by internal/adapters/outbound/objstore's own unit/integration tests;
 	// this rig only needs to exercise the UPLOAD LIFECYCLE'S own logic).
 	// objCfg defaults to small, deliberately test-friendly byte limits so
 	// oversize/quota tests don't need to move real megabytes.
