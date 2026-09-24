@@ -36,6 +36,20 @@ type ruleExpectation struct {
 	kind ruleKind
 	// fixedSeverity is only meaningful for kindFixed.
 	fixedSeverity Severity
+	// docP2C/docC2P are the severity COMPATIBILITY.md's own rule table
+	// documents for this rule's P→C/C→P columns respectively (the FIRST
+	// severity word in each cell -- see compatibility_doc_test.go's own
+	// parser doc comment for why that, not "every severity word anywhere
+	// in the cell," is the right thing to compare) -- populated for
+	// kindDual rows (a kindFixed row's value is always fixedSeverity in
+	// both columns; a kindVariable row's doc text, "recurse"/"same," never
+	// reduces to a fixed severity at all). TestCompatibilityDocRuleIDsMatchCode
+	// cross-checks these against what it actually parses out of the
+	// markdown table, so a row whose CODE severity and DOCUMENTED severity
+	// drift apart -- C22's own failure mode, a goJSONSchema change
+	// documented as PATCH while the code scores it MAJOR -- fails the
+	// build instead of only being caught by the id-set check.
+	docP2C, docC2P Severity
 }
 
 // ruleTable mirrors the design spec's own rule table (§6.3 design spec §2,
@@ -47,25 +61,25 @@ type ruleExpectation struct {
 var ruleTable = map[string]ruleExpectation{
 	"1":  {kind: kindFixed, fixedSeverity: SeverityMajor},
 	"2":  {kind: kindFixed, fixedSeverity: SeverityMinor},
-	"3":  {kind: kindDual},
-	"4":  {kind: kindDual},
-	"5":  {kind: kindDual},
+	"3":  {kind: kindDual, docP2C: SeverityMinor, docC2P: SeverityMajor},
+	"4":  {kind: kindDual, docP2C: SeverityMinor, docC2P: SeverityMajor},
+	"5":  {kind: kindDual, docP2C: SeverityMajor, docC2P: SeverityMinor},
 	"6":  {kind: kindFixed, fixedSeverity: SeverityMajor},
-	"7":  {kind: kindDual},
-	"8":  {kind: kindDual},
-	"9":  {kind: kindDual},
-	"10": {kind: kindDual},
-	"11": {kind: kindDual},
-	"12": {kind: kindDual},
-	"13": {kind: kindDual},
+	"7":  {kind: kindDual, docP2C: SeverityMajor, docC2P: SeverityMinor},
+	"8":  {kind: kindDual, docP2C: SeverityMinor, docC2P: SeverityMajor},
+	"9":  {kind: kindDual, docP2C: SeverityMajor, docC2P: SeverityMinor},
+	"10": {kind: kindDual, docP2C: SeverityMinor, docC2P: SeverityMajor},
+	"11": {kind: kindDual, docP2C: SeverityMajor, docC2P: SeverityMinor}, // default (closed) case is the doc cell's FIRST word
+	"12": {kind: kindDual, docP2C: SeverityMinor, docC2P: SeverityMajor},
+	"13": {kind: kindDual, docP2C: SeverityMinor, docC2P: SeverityMajor}, // "added" case is the doc cell's FIRST word
 	"14": {kind: kindFixed, fixedSeverity: SeverityMajor},
-	"15": {kind: kindDual},
-	"16": {kind: kindDual},
+	"15": {kind: kindDual, docP2C: SeverityMinor, docC2P: SeverityMajor},
+	"16": {kind: kindDual, docP2C: SeverityMajor, docC2P: SeverityMinor},
 	"17": {kind: kindFixed, fixedSeverity: SeverityMajor},
-	"18": {kind: kindDual},
-	"19": {kind: kindDual},
-	"20": {kind: kindDual},
-	"21": {kind: kindDual},
+	"18": {kind: kindDual, docP2C: SeverityMinor, docC2P: SeverityMajor},
+	"19": {kind: kindDual, docP2C: SeverityMajor, docC2P: SeverityMinor},
+	"20": {kind: kindDual, docP2C: SeverityMinor, docC2P: SeverityMajor},
+	"21": {kind: kindDual, docP2C: SeverityMajor, docC2P: SeverityMinor},
 	"22": {kind: kindFixed, fixedSeverity: SeverityMajor},
 	"23": {kind: kindFixed, fixedSeverity: SeverityMinor},
 	"24": {kind: kindFixed, fixedSeverity: SeverityMajor},
@@ -86,10 +100,10 @@ var ruleTable = map[string]ruleExpectation{
 	"39": {kind: kindFixed, fixedSeverity: SeverityMajor},
 	"40": {kind: kindFixed, fixedSeverity: SeverityMajor},
 	"41": {kind: kindFixed, fixedSeverity: SeverityMinor},
-	"42": {kind: kindDual},                                // C13
-	"43": {kind: kindFixed, fixedSeverity: SeverityMajor}, // C15
-	"44": {kind: kindFixed, fixedSeverity: SeverityMajor}, // C1
-	"45": {kind: kindFixed, fixedSeverity: SeverityMajor}, // C19
+	"42": {kind: kindDual, docP2C: SeverityMajor, docC2P: SeverityMinor}, // C13
+	"43": {kind: kindFixed, fixedSeverity: SeverityMajor},                // C15
+	"44": {kind: kindFixed, fixedSeverity: SeverityMajor},                // C1
+	"45": {kind: kindFixed, fixedSeverity: SeverityMajor},                // C19
 }
 
 // TestCorpusCoverage is guard 7's meta-test: every rule id in the closed

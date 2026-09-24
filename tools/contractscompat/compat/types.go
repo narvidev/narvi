@@ -2,7 +2,7 @@
 // technical plan §6.3's "make /contracts a stable external API": given a
 // BASE and a HEAD copy of the same versioned JSON Schema surfaces (plus
 // controlplane/testdata/routes.golden), it classifies every change as
-// PATCH, MINOR, or MAJOR under the closed 41-row rule table in
+// PATCH, MINOR, or MAJOR under the closed 45-row rule table in
 // docs/../COMPATIBILITY.md, and fails closed -- refusing to classify at
 // all -- on anything the table does not name.
 //
@@ -88,7 +88,7 @@ func maxSeverity(a, b Severity) Severity {
 
 // Finding is one classified (or fail-closed-refused) change, keyed to the
 // rule table row that produced it wherever one applies. RuleID is the
-// table's own row number as a string ("1".."41"), or a "fc-*" id for the
+// table's own row number as a string ("1".."45"), or a "fc-*" id for the
 // handful of fail-closed guards that sit outside the numbered table (an
 // unknown keyword, a non-local $ref, an unpairable oneOf, a malformed type
 // array -- see keywords.go and defdiff.go).
