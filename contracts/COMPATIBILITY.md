@@ -112,21 +112,97 @@ that would be its own separate incident, not a `/contracts` change.
 
 ## The rule table
 
-See `tools/contractscompat/compat`'s own package documentation for the
-authoritative, machine-checked version of this table (41 rows) plus the
-closed keyword allowlist and the fail-closed conditions outside it. In
-summary: a property/enum-value/union-variant/def **removed** or a
+This is the authoritative version — `tools/contractscompat/compat`'s own
+`ruleTable` (meta_test.go) pins the exact same rule-id set, and
+`TestCompatibilityDocRuleIDsMatchCode` (compatibility_doc_test.go) fails
+the build if this table and that code-side list ever diverge, so the two
+cannot drift silently the way they did before this rewrite (C22).
+
+P→C = platform-produced, client-consumed. C→P = client-produced,
+platform-consumed. "Both" (see "Direction vocabulary" above) means
+compatible only if compatible under **both** columns.
+
+| # | Change | P→C | C→P |
+|---|---|---|---|
+| 1 | Property removed or renamed | MAJOR | MAJOR |
+| 2 | Property added, not required | MINOR | MINOR |
+| 3 | Property added and required | MINOR | MAJOR |
+| 4 | Property moved into required | MINOR | MAJOR |
+| 5 | Property removed from required | MAJOR | MINOR |
+| 6 | `type` changed outright, or the `type` keyword itself added/removed | MAJOR | MAJOR |
+| 7 | `type` widened (union gains a non-null member) | MAJOR | MINOR |
+| 8 | `type` narrowed (union loses a non-null member, keyword stays present both sides) | MINOR | MAJOR |
+| 9 | `null` added to `type` (including a `{"type":"null"}` anyOf/oneOf member added to an already-existing union) | MAJOR | MINOR |
+| 10 | `null` removed from `type` (including a `{"type":"null"}` member removed) | MINOR | MAJOR |
+| 11 | enum value added | MAJOR, unless the enum is listed in the MERGE-BASE manifest's `openEnums` (then MINOR) | MINOR |
+| 12 | enum value removed | MINOR | MAJOR |
+| 13 | `enum` keyword added / removed | added MINOR / removed MAJOR | added MAJOR / removed MINOR |
+| 14 | `const` changed/added/removed | MAJOR | MAJOR |
+| 15 | `format` added | MINOR | MAJOR |
+| 16 | `format` removed | MAJOR | MINOR |
+| 17 | `format` changed | MAJOR | MAJOR |
+| 18 | `minimum`/`minLength`/`minItems` raised (or added, floor raised from none) | MINOR | MAJOR |
+| 19 | `minimum`/`minLength`/`minItems` lowered (or removed, floor lowered to none) | MAJOR | MINOR |
+| 20 | `pattern` added | MINOR | MAJOR |
+| 21 | `pattern` removed | MAJOR | MINOR |
+| 22 | `pattern` changed | MAJOR | MAJOR |
+| 23 | `additionalProperties` `false`→`true` or `false`→schema | MINOR | MINOR |
+| 24 | `additionalProperties` `true`→`false` or schema→`false` | MAJOR | MAJOR |
+| 25 | `additionalProperties` `true`→schema | MAJOR | MAJOR |
+| 26 | `additionalProperties` schema on both sides, content differs | recurse, same direction | recurse, same direction |
+| 27 | `$ref` retargeted (siblings on the referencing node are diffed too, as part of the same comparison) | compare dereferenced+merged schemas under rows 1-26/42; MAJOR if the old target def no longer exists (row 31) | same |
+| 28 | `oneOf`/`anyOf` variant added (keyword already present both sides) | MINOR | MINOR |
+| 29 | `oneOf`/`anyOf` variant removed (keyword already present both sides) | MAJOR | MAJOR |
+| 30 | `oneOf`/`anyOf` variant changed (paired by `$ref` target name, else by `properties.type.const`, else FAIL-CLOSED) | recurse | recurse |
+| 31 | `$defs` entry removed or renamed | MAJOR | MAJOR |
+| 32 | `$defs` entry added | MINOR | MINOR |
+| 33 | `default` added/changed/removed | MAJOR | MAJOR |
+| 34 | root `title` or root `$id` changed | MAJOR | MAJOR |
+| 35 | `description` changed/added/removed | PATCH | PATCH |
+| 36 | root `$schema` changed | FAIL-CLOSED | FAIL-CLOSED |
+| 37 | schema file removed/renamed, unless the BASE manifest already marks it `retired` | MAJOR (also forces a MAJOR version bump, §4) | same |
+| 38 | schema file added under a new manifest row | MINOR (also forces a MAJOR version bump, §4 — a new vN sibling is how a breaking change is made) | same |
+| 39 | `items` changed; `items` presence itself added/removed | recurse; presence change is MAJOR | same |
+| 40 | route removed/renamed, or method changed, in `routes.golden` under `/api/` | MAJOR | n/a |
+| 41 | route added | MINOR | n/a |
+| 42 | `additionalProperties` schema→`true`/absent (permissive) — distinct from row 23's `false`→anything "unlock" | MAJOR | MINOR |
+| 43 | `oneOf`/`anyOf` keyword itself added or removed (not a member of an already-existing union — that's rows 28/29) | MAJOR | MAJOR |
+| 44 | a surface's `direction` changed between the base and head `manifest.json` | MAJOR | MAJOR |
+| 45 | `goJSONSchema` changed | MAJOR | MAJOR |
+
+Also FAIL-CLOSED, outside the numbered table: any keyword not in the
+closed allowlist below; a `title` on a non-root sub-schema; a non-local
+`$ref`; a `type` array that isn't a known JSON Schema type vocabulary, or
+that has a duplicate; an unpairable `oneOf`/`anyOf` member; a `required`
+name with no matching `properties` entry on that same side (rows 3/4
+still apply normally to a required name that DOES have a matching
+property, even one only declared via an unchanged `$ref` target); and any
+keyword — anywhere in the closed allowlist — present at a schema node
+that no rule handler above actually consumed (the checker's own internal
+exhaustiveness assertion; this should never fire in practice, since every
+allowlisted keyword has a handler, but it is there as a structural
+backstop rather than a promise kept by convention).
+
+The closed keyword allowlist (schema positions only): `$schema, $id,
+$defs, $ref, title, description, type, properties, required,
+additionalProperties, enum, const, oneOf, anyOf, items, format, pattern,
+minimum, minLength, minItems, default, goJSONSchema`. `$schema`, `$id`,
+`title`, and `$defs` are additionally restricted to the document ROOT —
+finding any of them on a nested sub-schema is itself FAIL-CLOSED.
+`goJSONSchema` is go-jsonschema's own vendor extension controlling the
+exact Go type generated for one property; changing it is row 45 (MAJOR),
+not an annotation, because it changes what the generated Go decoder
+accepts (C19) — unlike `description`, which is a genuine annotation
+(row 35, PATCH).
+
+In summary: a property/enum-value/union-variant/def **removed** or a
 constraint **tightened** on a client-produced (C2P) shape is MAJOR (an old
 client's request would now be rejected); the same change on a
 platform-produced (P2C) shape is usually MINOR (an old client simply never
 looks at the new absence) UNLESS it removes something a consumer might
 already depend on (a property disappearing, a type narrowing under it,
 etc. — see the table for the exact list). **Adding** something is the
-mirror image. A change to `$schema`, or any keyword outside the closed
-allowlist (`$schema, $id, $defs, $ref, title, description, type,
-properties, required, additionalProperties, enum, const, oneOf, anyOf,
-items, format, pattern, minimum, minLength, minItems, default`), makes the
-checker refuse to classify at all (fail closed) rather than guess.
+mirror image.
 
 ## Relaxations: `openEnums` and `status: retired`
 
@@ -193,10 +269,19 @@ changed at all: `contracts/VERSION` must be strictly greater than the
 base's, the bump's own class (major/minor/patch) must be at least as
 severe as the worst finding in the diff, `CHANGELOG.md`'s first `## 
 [x.y.z]` heading must equal the new VERSION, and that section must carry a
-`### <surface path>` subsection for every surface that actually changed.
-If NOTHING changed, VERSION and the CHANGELOG's top heading must stay
-exactly as they were — a version bump with no content change is exactly
-as wrong as a content change with no version bump.
+`### <surface path>` subsection for every surface that actually
+changed — including a surface whose only change is its `manifest.json`
+row (direction, status) or a new/removed manifest row, not just a schema
+content diff. If NOTHING changed, VERSION and the CHANGELOG's top heading
+must stay exactly as they were — a version bump with no content change is
+exactly as wrong as a content change with no version bump.
+
+A schema file being added (row 38) or removed (row 37) always requires
+**at least a MAJOR bump**, regardless of that row's own graded
+compatibility severity (row 38 is MINOR — a new file's mere existence
+breaks nobody) — the MAJOR requirement here is the versioned-sibling/
+retirement DISCIPLINE from the section above, not a claim that adding a
+file is itself a wire-compatibility break.
 
 ## Extending the checker
 
