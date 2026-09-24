@@ -1,16 +1,17 @@
 //go:build integration
 
 // Integration test proving the objstore adapter actually round-trips
-// against a real S3-compatible backend (a MinIO testcontainer), not just
-// against the httptest.Server stand-ins store_test.go/presign_test.go use
-// for the unit-level HTTP-status classification table. Gated behind the
-// "integration" build tag (needs Docker) so it does not run as part of
-// the fast `make test` -- run via `make test-integration`. Mirrors
-// internal/adapters/outbound/postgres/postgres_integration_test.go's own
-// build-tag comment, package-naming (_test external package), and
-// testcontainers-go conventions (§28.7: "the adapter's integration tests
-// run against a MinIO testcontainer, the postgres:17-alpine testcontainers
-// precedent").
+// against a real S3-compatible backend (a testcontainer running Versity
+// S3 Gateway, "versitygw" -- see s3GatewayImage's own doc comment for why
+// this replaced MinIO), not just against the httptest.Server stand-ins
+// store_test.go/presign_test.go use for the unit-level HTTP-status
+// classification table. Gated behind the "integration" build tag (needs
+// Docker) so it does not run as part of the fast `make test` -- run via
+// `make test-integration`. Mirrors internal/adapters/outbound/postgres/
+// postgres_integration_test.go's own build-tag comment, package-naming
+// (_test external package), and testcontainers-go conventions (§28.7:
+// "the adapter's integration tests run against an S3-compatible
+// testcontainer, the postgres:17-alpine testcontainers precedent").
 package objstore_test
 
 import (
@@ -27,37 +28,88 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/testcontainers/testcontainers-go"
-	tcminio "github.com/testcontainers/testcontainers-go/modules/minio"
+	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/objstore"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
-// minioImage names quay.io, MinIO's own registry, NOT Docker Hub.
+// s3GatewayImage names versity/versitygw (Apache-2.0, github.com/versity/
+// versitygw), a purpose-built S3-protocol gateway, pinned by BOTH an
+// explicit release tag and its content digest (never ":latest" -- a
+// local `docker compose pull` or a fresh testcontainers pull must not be
+// able to silently change what this test runs against).
 //
-// The tag is unchanged and was always correct; what moved is where it can
-// be fetched from. `minio/minio` on Docker Hub now answers every anonymous
-// pull with "pull access denied ... repository does not exist or may
-// require 'docker login'" -- not a rate limit, which would say so, and not
-// transient: it reproduces from a developer machine as readily as from CI.
-// This service's own compose comment had already recorded that Docker Hub
-// publishing "appears to have gone quiet after this exact release"; the
-// repository has since stopped answering altogether.
+// This replaced MinIO (quay.io/minio/minio and Docker Hub's minio/minio)
+// after BOTH registries independently started answering every anonymous
+// pull with "unauthorized"/"pull access denied ... repository does not
+// exist or may require 'docker login'" -- reproduced directly against
+// this exact pinned tag from a developer machine and confirmed as the
+// cause of CI's test-integration shard going red on every PR, not a rate
+// limit (which would say so) and not transient (it reproduces every
+// time).
 //
-// quay.io/minio/minio serves the SAME pinned tag (verified by pulling it),
-// so nothing about what this test runs against changes. Still deliberately
-// not ":latest" -- see docker-compose.dev.yml's own minio comment, which
-// names the same registry for the same reason.
-const minioImage = "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z"
+// Four MinIO-replacement candidates were pulled and run for real,
+// anonymously, against this exact test's own operations (PresignPut -> a
+// real PUT, Stat, PresignGet with response-content-disposition -> a real
+// GET, Delete, idempotent re-Delete) using the actual objstore.Store
+// production code (github.com/aws/aws-sdk-go-v2/service/s3), not a
+// separate hand-rolled signer:
+//
+//   - rustfs/rustfs: Apache-2.0, pullable anonymously, passed every
+//     check via aws-sdk-go-v2 and correctly rejects a wrong-secret
+//     presigned PUT with 403. Ruled out anyway: as of this writing its
+//     own published tags are still pre-1.0 (alpha/beta/rc), a materially
+//     less stable pin for a dependency CI relies on than the other two
+//     candidates' tagged 1.x/4.x releases.
+//   - chrislusf/seaweedfs (server -s3): Apache-2.0, pullable anonymously,
+//     passed every check, correctly rejects a wrong-secret presigned PUT
+//     with 403, and is the most battle-tested/widely-deployed of the
+//     four. Ruled out for THIS narrow use only: its all-in-one
+//     "server -s3" command boots an entire master+volume+filer+S3-gateway
+//     cluster (plus unrelated Iceberg/Lance namespace servers neither
+//     this adapter nor any Narvi code touches) and needs a mounted JSON
+//     identity config file just to accept SigV4 credentials --
+//     empirically ~3.4s to become ready here, roughly 8x versitygw's own
+//     ~0.4s, for capability this test and docker-compose.dev.yml's dev
+//     loop never use.
+//   - adobe/s3mock: Apache-2.0, pullable anonymously, passed every
+//     *functional* check -- but empirically does NOT validate SigV4 at
+//     all: a presigned PUT signed with a deliberately wrong secret key
+//     was accepted with 200 instead of rejected with 403/401. A backend
+//     that accepts an incorrectly-signed write is not exercising the
+//     real behavior this adapter's presigning exists to enforce, so it
+//     was ruled out regardless of how convenient it otherwise is as a
+//     pure unit-test double.
+//   - versity/versitygw (chosen): Apache-2.0, pullable anonymously,
+//     passed every check, correctly rejects a wrong-secret presigned PUT
+//     with 403, is a stable tagged release (v1.8.0, not a pre-1.0 tag),
+//     is purpose-built as a standalone S3 protocol gateway (its own
+//     posix backend needs nothing but a filesystem directory --
+//     no separate identity config file), has the smallest image of the
+//     four (~31MB vs. rustfs's ~110MB and seaweedfs's ~92MB), and was
+//     empirically the fastest to become ready (~0.4s, tied with rustfs,
+//     both far ahead of seaweedfs).
+const s3GatewayImage = "versity/versitygw:v1.8.0@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499"
 
-// minioTestBucket is created fresh inside TestStore_MinIORoundTrip via a
-// raw admin *s3.Client (see that test) -- ports.BlobStore itself
-// deliberately has no bucket-management method (§28.1: "one configured
-// bucket per deployment", provisioned out of band, never by the adapter).
-const minioTestBucket = "objstore-integration-test"
+// s3GatewayAccessKey/s3GatewaySecretKey are fixed, test-only SigV4
+// credentials passed to the container via ROOT_ACCESS_KEY/ROOT_SECRET_KEY
+// (versitygw's own root-account env vars, verified directly against this
+// exact pinned image) -- never real credentials, matching
+// docker-compose.dev.yml's own equally fixed dev-only pair.
+const (
+	s3GatewayAccessKey = "narvi-objstore-test"
+	s3GatewaySecretKey = "narvi-objstore-test-secret"
+)
 
-// startMinIOContainer starts a MinIO testcontainer bounded by a
+// s3TestBucket is created fresh inside TestStore_S3RoundTrip via a raw
+// admin *s3.Client (see that test) -- ports.BlobStore itself deliberately
+// has no bucket-management method (§28.1: "one configured bucket per
+// deployment", provisioned out of band, never by the adapter).
+const s3TestBucket = "objstore-integration-test"
+
+// startS3GatewayContainer starts a versitygw testcontainer bounded by a
 // context.WithTimeout, deliberately WITHOUT the heavier errgroup+
 // independent-watchdog race postgres_integration_test.go's own
 // newMigrate/TestSchemaSqlcStoresPipeline uses around tcpostgres.Run.
@@ -79,15 +131,43 @@ const minioTestBucket = "objstore-integration-test"
 // same hang symptom in real CI, promote it to the same errgroup+watchdog
 // shape postgres_integration_test.go already uses (still via
 // errgroup.Group.Go, never a naked `go` statement, either way -- §11).
-func startMinIOContainer(t *testing.T, ctx context.Context) *tcminio.MinioContainer {
+//
+// There is no dedicated testcontainers-go module for versitygw (unlike
+// MinIO's own tcminio), so this uses testcontainers.GenericContainer
+// directly. The entrypoint is overridden to `mkdir -p /data` before
+// exec-ing the real binary: the pinned image's posix backend refuses to
+// start against a top-level directory that does not already exist
+// (verified directly -- "chdir /data: no such file or directory" against
+// this exact image when /data is not pre-created), and no volume is
+// mounted here since the container is single-use and torn down at the
+// end of the test.
+func startS3GatewayContainer(t *testing.T, ctx context.Context) testcontainers.Container {
 	t.Helper()
 
 	startCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
-	container, err := tcminio.Run(startCtx, minioImage)
+	req := testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			Image:      s3GatewayImage,
+			Entrypoint: []string{"sh", "-c"},
+			Cmd:        []string{"mkdir -p /data && exec /usr/local/bin/versitygw posix /data"},
+			Env: map[string]string{
+				"ROOT_ACCESS_KEY": s3GatewayAccessKey,
+				"ROOT_SECRET_KEY": s3GatewaySecretKey,
+			},
+			ExposedPorts: []string{"7070/tcp"},
+			WaitingFor: wait.ForAll(
+				wait.ForListeningPort("7070/tcp"),
+				wait.ForLog("VersityGW"),
+			),
+		},
+		Started: true,
+	}
+
+	container, err := testcontainers.GenericContainer(startCtx, req)
 	if err != nil {
-		t.Fatalf("start minio container: %v", err)
+		t.Fatalf("start versitygw container: %v", err)
 	}
 	t.Cleanup(func() {
 		if err := testcontainers.TerminateContainer(container); err != nil {
@@ -112,25 +192,30 @@ func adminClient(t *testing.T, endpoint, username, password string) *s3.Client {
 	})
 }
 
-// TestStore_MinIORoundTrip exercises the full ports.BlobStore contract
+// TestStore_S3RoundTrip exercises the full ports.BlobStore contract
 // against a real backend: PresignPut -> an actual PUT via a plain
 // http.Client -> Stat returns the correct SizeBytes/ETag -> PresignGet ->
 // an actual GET round-trips the same bytes -> Delete -> Stat now returns
 // ports.ErrBlobNotFound -> Delete again on the now-absent key still
 // returns nil (idempotency, asserted explicitly, not just assumed).
-func TestStore_MinIORoundTrip(t *testing.T) {
+//
+// Named "S3RoundTrip", not "MinIORoundTrip" -- nothing else in the repo
+// pinned the old name (verified: grep -rn "TestStore_MinIORoundTrip"
+// found only this file), and the backend under test is no longer MinIO
+// (see s3GatewayImage's own doc comment).
+func TestStore_S3RoundTrip(t *testing.T) {
 	ctx := context.Background()
 
-	container := startMinIOContainer(t, ctx)
+	container := startS3GatewayContainer(t, ctx)
 
-	endpoint, err := container.PortEndpoint(ctx, "9000/tcp", "http")
+	endpoint, err := container.PortEndpoint(ctx, "7070/tcp", "http")
 	if err != nil {
 		t.Fatalf("PortEndpoint: %v", err)
 	}
 
-	admin := adminClient(t, endpoint, container.Username, container.Password)
-	if _, err := admin.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(minioTestBucket)}); err != nil {
-		t.Fatalf("CreateBucket(%q): %v", minioTestBucket, err)
+	admin := adminClient(t, endpoint, s3GatewayAccessKey, s3GatewaySecretKey)
+	if _, err := admin.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(s3TestBucket)}); err != nil {
+		t.Fatalf("CreateBucket(%q): %v", s3TestBucket, err)
 	}
 
 	timeouts := platform.DefaultTimeouts()
@@ -138,11 +223,11 @@ func TestStore_MinIORoundTrip(t *testing.T) {
 
 	store, err := objstore.New(objstore.Config{
 		Endpoint:        endpoint,
-		Region:          "us-east-1", // MinIO accepts any string (§28.7).
-		Bucket:          minioTestBucket,
-		AccessKeyID:     container.Username,
-		SecretAccessKey: container.Password,
-		UsePathStyle:    true, // required for MinIO-style backends.
+		Region:          "us-east-1", // versitygw accepts any string (§28.7), same as MinIO did.
+		Bucket:          s3TestBucket,
+		AccessKeyID:     s3GatewayAccessKey,
+		SecretAccessKey: s3GatewaySecretKey,
+		UsePathStyle:    true, // required for MinIO/versitygw-style backends.
 		Timeouts:        timeouts,
 	})
 	if err != nil {
@@ -150,7 +235,7 @@ func TestStore_MinIORoundTrip(t *testing.T) {
 	}
 
 	const key = ports.BlobKey("sessions/integration-test-session/uploads/integration-test-upload")
-	content := []byte("hello from the objstore MinIO integration test, round-tripped byte for byte")
+	content := []byte("hello from the objstore S3 integration test, round-tripped byte for byte")
 
 	// -- PresignPut, then a real PUT via a plain http.Client. --
 	putSpec := ports.PresignPutSpec{
