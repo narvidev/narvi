@@ -234,6 +234,24 @@ type pushSignal struct {
 	// true means sendPushBestEffort must never send the sandbox a push
 	// command at all for this cycle.
 	suppressedInShadow bool
+	// blockedNoGitHubIdentity (review round 2, finding P1) is the SAME
+	// shape of decision as suppressedInShadow above, for a DIFFERENT
+	// reason: this session's creator passes the §13.3 viewer-guard
+	// staleness recheck but has no linked github identity at all, and
+	// this is not a review session (see
+	// pushBlockedByMissingGitHubIdentity's own doc comment) -- so
+	// scmcredentials.go's own step 10 is now certain to 403 the sandbox's
+	// credential fetch, unconditionally, no bot/service-account fallback
+	// existing for this case any more. Sending the push command anyway
+	// would only produce an opaque credential-helper failure the creator
+	// has no way to act on. Mutually exclusive with suppressedInShadow in
+	// practice (completeProcessingTurn only ever evaluates this when
+	// suppressedInShadow is false), but kept as its own field rather than
+	// collapsing both into one enum: they are recorded via two entirely
+	// different mechanisms (the shadow ledger vs. a session-visible
+	// warning event) and a caller should never need to guess which from
+	// a shared value.
+	blockedNoGitHubIdentity bool
 }
 
 // completeProcessingTurn implements this file's own first half: given a
@@ -530,9 +548,103 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 		if err := a.recordSuppressedPush(ctx, tx, repos); err != nil {
 			return nil, err
 		}
+		return &pushSignal{gen: int(sandboxRow.Gen), repos: repos, suppressedInShadow: true}, nil
 	}
 
-	return &pushSignal{gen: int(sandboxRow.Gen), repos: repos, suppressedInShadow: suppressedInShadow}, nil
+	// Review round 2, finding P1: a live, non-review session whose
+	// creator has no linked github identity is now certain to have its
+	// push denied by scmcredentials.go's own step 10 (no bot/
+	// service-account fallback exists for that case any more -- see that
+	// file's own doc comment). Detected and recorded HERE,
+	// deterministically, before ever asking the sandbox to try -- exactly
+	// mirroring the shadow-suppression gate immediately above (§30.9's
+	// own "gate the send itself" reasoning: a real push attempt against a
+	// credential that cannot be minted does not silently no-op, it fails,
+	// and a raw credential-helper failure gives this creator nothing
+	// actionable).
+	blocked, err := a.pushBlockedByMissingGitHubIdentity(ctx, tx, sessionRow.CreatedBy)
+	if err != nil {
+		return nil, err
+	}
+	if blocked {
+		if err := a.recordPushBlockedNoGitHubIdentity(ctx, tx, int(sandboxRow.Gen)); err != nil {
+			return nil, err
+		}
+		return &pushSignal{gen: int(sandboxRow.Gen), repos: repos, blockedNoGitHubIdentity: true}, nil
+	}
+
+	return &pushSignal{gen: int(sandboxRow.Gen), repos: repos}, nil
+}
+
+// pushBlockedByMissingGitHubIdentity reports whether this turn's push is
+// certain to be denied by internal/adapters/inbound/httpapi's own
+// scmcredentials.go ScmCredentials handler, step 10 (review round 2,
+// finding P1): true only for a session that is NOT a review session (a
+// review session's own github_pr_sessions row makes ScmCredentials mint
+// the bot token unconditionally instead, that handler's own step 7 -- see
+// its doc comment) AND whose creator passes the SAME §13.3 viewer-guard
+// staleness recheck creatorMayGetPRAttribution already performs (a
+// disabled/viewer/missing creator is denied for THAT unrelated reason,
+// never reaching step 10 at all) but has no linked github identity, at
+// all, for provider=github (creatorHasNoGitHubIdentity). Deliberately
+// reuses both of those already-established helpers rather than
+// re-deriving their logic a third time -- this function's own value is
+// purely in combining them with the review-session check, matching
+// ScmCredentials' own step ordering (7, then 9, then 10) exactly.
+func (a *Actor) pushBlockedByMissingGitHubIdentity(ctx context.Context, tx pgx.Tx, createdBy pgtype.UUID) (bool, error) {
+	if _, err := a.stores.githubPRSession.WithTx(tx).GetBySessionID(ctx, a.sessionID); err == nil {
+		// A review session: ScmCredentials' own step 7 always mints the
+		// bot token for it, regardless of the creator's own identity.
+		return false, nil
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		return false, fmt.Errorf("sessionactor: get github pr session: %w", err)
+	}
+
+	if !a.creatorMayGetPRAttribution(ctx, createdBy) {
+		// Denied for an unrelated reason (no creator at all, disabled, or
+		// viewer) -- ScmCredentials' own step 8/9 would deny this before
+		// ever reaching step 10's identity check, so telling this creator
+		// to link a github identity would not even be the true reason
+		// their push fails.
+		return false, nil
+	}
+
+	return a.creatorHasNoGitHubIdentity(ctx, createdBy), nil
+}
+
+// recordPushBlockedNoGitHubIdentity appends a session-visible "warning"
+// wire event (contracts/sandbox-ws/v1's own pre-existing Warning type --
+// no new wire event, no new endpoint) naming the honest, actionable
+// reason this turn's push was never even attempted: the SAME mechanism
+// cmd/sandbox-agent/main.go already uses for its own analogous
+// credential-shaped warning (the oauth-provider-injection-failure
+// message) and internal/adapters/outbound/opencode/translate.go's
+// context-window warning -- both reach the session via this exact
+// wire type, and web/src/routes/session/$sessionId.tsx already renders
+// every "warning" event as a session-visible banner (model.warnings),
+// so this reuses that existing, already-working path rather than
+// inventing a new one. Appended via a.appendRawEvent, inside the SAME
+// transact as the rest of this turn's completion (§2's transactional-
+// write rule; §6.2's "→ broadcast stream" -- queued for broadcast only
+// on a successful commit, exactly like every other event this package
+// ever appends), with a freshly minted messageId (this event
+// originates here, it does not echo any wire message's own id).
+func (a *Actor) recordPushBlockedNoGitHubIdentity(ctx context.Context, tx pgx.Tx, gen int) error {
+	msg := sandboxws.Warning{
+		Type:      "warning",
+		MessageId: uuid.NewString(),
+		SessionId: a.sessionID.String(),
+		Gen:       gen,
+		Message:   "This session's creator has no linked GitHub account, so this push could not be authenticated. Sign in with GitHub (the ordinary GitHub sign-in) to link one, then retry.",
+	}
+	raw, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("sessionactor: marshal push-blocked warning event: %w", err)
+	}
+	if _, err := a.appendRawEvent(ctx, tx, "warning", msg.MessageId, raw); err != nil {
+		return fmt.Errorf("sessionactor: append push-blocked warning event: %w", err)
+	}
+	return nil
 }
 
 // recordFalseFailureIfApplicable implements the "false failures"
@@ -682,6 +794,16 @@ func (a *Actor) sendPushBestEffort(sessionID string, sig *pushSignal) {
 		// The ledger row was already written, inside the transaction that
 		// resolved this decision (completeProcessingTurn). Nothing to do
 		// here but not send the command.
+		return
+	}
+
+	if sig.blockedNoGitHubIdentity {
+		// The session-visible warning event was already written, inside
+		// the transaction that resolved this decision
+		// (completeProcessingTurn's own recordPushBlockedNoGitHubIdentity
+		// call). Nothing to do here but not send a push command certain
+		// to fail against a credential this session's creator cannot
+		// obtain (review round 2, finding P1).
 		return
 	}
 
@@ -934,9 +1056,11 @@ func (a *Actor) createPRBestEffort(ctx context.Context, raw json.RawMessage) {
 	// than silently dropping the PR entirely. The bot cannot be attributed
 	// as "the prompting user" on GitHub's own side (GitHub has no concept
 	// of attributing a PR to someone who never authenticated with it), so
-	// usedBotFallback below renders an honest PR body naming the real
-	// creator and pointing at Settings -> Identities to link a GitHub
-	// account for future sessions -- the "manual PR URL" half of §8.11's
+	// usedBotFallback below renders an honest PR body (review round 2,
+	// findings P4/P7: it does not name the creator, this function has no
+	// access to their identity) pointing at the sign-in view's own
+	// identity panel to link a GitHub account for future sessions -- see
+	// prBody's own doc comment -- the "manual PR URL" half of §8.11's
 	// own fallback: the artifact row this function already records below
 	// (recordPRArtifact, unconditionally, on EITHER path) is what
 	// surfaces that URL to the creator, exactly as it always has.
@@ -1314,15 +1438,24 @@ func prTitle(sessionRow sqlcgen.Session) string {
 // richer changelog/summary mechanism than "which branch, which commit".
 //
 // usedBotFallback is true iff createPRBestEffort's own §8.11 bot-identity
-// fallback opened this PR (the session creator has no usable stored
-// GitHub OAuth token, e.g. a user who signed in only through OIDC and has
-// never linked a GitHub identity) -- an added, honest sentence naming that
-// plainly, so a reviewer of the PR (and the creator themselves, reading it
-// back) understands why it is bot-attributed rather than assuming a bug.
+// fallback opened this PR -- as of review round 2 (findings P4/P7), that
+// is ONLY the creatorHasNoGitHubIdentity case (the session creator has NO
+// github identity row at all, e.g. a user who signed in only through
+// OIDC and has never linked one): an existing-but-unusable stored token
+// never reaches this fallback (createPRBestEffort's own call site skips
+// PR creation entirely for that case instead) -- so this sentence never
+// claims "or no usable stored token" any more, and never names the
+// creator (this function has no access to their identity, only the
+// pushed repo/branch/sha) -- it points at the ONE place a GitHub identity
+// can actually be linked: the sign-in view's own identity panel (§41.3,
+// web/src/routes/sign-in.tsx's IdentityStatusPanel, visible once already
+// signed in), reached by signing out and back in with GitHub -- never
+// "Settings -> Identities", which does not exist
+// (web/src/session/SettingsView.tsx's own TABS has no such tab).
 func prBody(pushed sandboxws.PushCompleteReposElem, usedBotFallback bool) string {
 	body := fmt.Sprintf("Automated changes from a Narvi session (branch %q, commit %s).", pushed.Branch, pushed.Sha)
 	if usedBotFallback {
-		body += " Opened under the bot identity: this session's creator has no linked GitHub account (or no usable stored token) to attribute it to -- link one in Settings -> Identities to open future PRs under your own account."
+		body += " Opened under the bot identity: this session's creator has no linked GitHub account to attribute it to -- sign in with GitHub (the identity panel on the sign-in page, reachable by signing out and back in) to open future PRs under your own account."
 	}
 	return body
 }

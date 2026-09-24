@@ -99,18 +99,22 @@ func (a *Actor) decryptCreatorGitHubToken(ctx context.Context, createdBy pgtype.
 
 // creatorHasNoGitHubIdentity reports whether createdBy has NO github
 // identity row at all -- as distinct from having one whose stored token
-// is merely unusable (missing, undecryptable). Used ONLY by pushpr.go's
-// own createPRBestEffort (review round 1, finding O5) to decide whether
-// its §8.11 bot-identity fallback applies: an OIDC-only creator who has
-// never linked GitHub (this reports true) is exactly the case that
-// fallback exists for -- the honest PR body names them and points at
-// Settings -> Identities. A creator who DOES have a github identity, but
-// whose token has expired, been revoked, or fails to decrypt (this
-// reports false), must NOT be silently re-attributed to the bot: that
-// would misrepresent a token problem as "no linked account" to whoever
-// reviews the PR. That case keeps origin/main's own pre-existing
-// behavior -- decryptCreatorGitHubToken's caller simply skips PR
-// creation entirely (see createPRBestEffort's own call site).
+// is merely unusable (missing, undecryptable). Used by pushpr.go's own
+// createPRBestEffort (review round 1, finding O5) to decide whether its
+// §8.11 bot-identity fallback applies: an OIDC-only creator who has never
+// linked GitHub (this reports true) is exactly the case that fallback
+// exists for -- the honest PR body (see prBody's own doc comment, review
+// round 2 findings P4/P7) points at the sign-in view's own identity
+// panel, never a name or a "Settings -> Identities" page that does not
+// exist. A creator who DOES have a github identity, but whose token has
+// expired, been revoked, or fails to decrypt (this reports false), must
+// NOT be silently re-attributed to the bot: that would misrepresent a
+// token problem as "no linked account" to whoever reviews the PR. That
+// case keeps origin/main's own pre-existing behavior --
+// decryptCreatorGitHubToken's caller simply skips PR creation entirely
+// (see createPRBestEffort's own call site). Also used by pushpr.go's own
+// pushBlockedByMissingGitHubIdentity (review round 2, finding P1) for the
+// SAME "no identity at all" test, before the push is even attempted.
 //
 // A createdBy with no valid row at all (sentinel-auto-fix, no human
 // creator) is treated as "no identity" here too -- never reached by
