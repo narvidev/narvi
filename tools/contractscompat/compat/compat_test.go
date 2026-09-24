@@ -414,6 +414,85 @@ var corpus = []corpusCase{
 		fixed: &wantFinding{"27", SeverityPatch},
 	},
 	{
+		// F1 (round 4): a retarget's added enum value must be graded open
+		// only when BOTH the OLD target's own pointer (here, "#/$defs/A"
+		// -- what the "value" property's consumers were actually bound to
+		// before this diff) AND the NEW target's (here, "#/$defs/B") are
+		// listed in openEnums. This models the real two-PR exploit the
+		// round-4 review found: PR1 adds B as a copy of A with one extra
+		// enum value and opens ONLY B's own pointer (modeled here as this
+		// corpus case's own base, as if PR1 had already landed); PR2
+		// (this diff) retargets "value" from A to B. Before F1, grading
+		// read only B's pointer and called this MINOR -- silently handing
+		// "value"'s existing consumers (bound to A's closed enum) a value
+		// they reject.
+		name:    "row27 ref retargeted, enum addition open at NEW target only (F1, must stay MAJOR)",
+		ruleID:  "27",
+		defName: "Wrapper",
+		baseDefs: map[string]any{
+			"Wrapper": schemaObj("type", "object", "properties", schemaObj("value", schemaObj("$ref", "#/$defs/A"))),
+			"A":       schemaObj("type", "string", "enum", []any{"a", "b"}),
+			"B":       schemaObj("type", "string", "enum", []any{"a", "b", "c"}),
+		},
+		headDefs: map[string]any{
+			"Wrapper": schemaObj("type", "object", "properties", schemaObj("value", schemaObj("$ref", "#/$defs/B"))),
+			"A":       schemaObj("type", "string", "enum", []any{"a", "b"}),
+			"B":       schemaObj("type", "string", "enum", []any{"a", "b", "c"}),
+		},
+		openEnums: map[string]bool{"#/$defs/B": true},
+		p2cWant:   &wantFinding{"27", SeverityMajor},
+		c2pWant:   &wantFinding{"27", SeverityMinor},
+	},
+	{
+		// F1 control: the identical retarget, but with BOTH the old
+		// target's pointer ("#/$defs/A") and the new target's
+		// ("#/$defs/B") open -- only then is the addition safe, since
+		// "value"'s pre-existing consumers were independently already
+		// told (via A's own pointer) to expect growth.
+		name:    "row27 ref retargeted, enum addition open at BOTH old and new target (F1 control)",
+		ruleID:  "27",
+		defName: "Wrapper",
+		baseDefs: map[string]any{
+			"Wrapper": schemaObj("type", "object", "properties", schemaObj("value", schemaObj("$ref", "#/$defs/A"))),
+			"A":       schemaObj("type", "string", "enum", []any{"a", "b"}),
+			"B":       schemaObj("type", "string", "enum", []any{"a", "b", "c"}),
+		},
+		headDefs: map[string]any{
+			"Wrapper": schemaObj("type", "object", "properties", schemaObj("value", schemaObj("$ref", "#/$defs/B"))),
+			"A":       schemaObj("type", "string", "enum", []any{"a", "b"}),
+			"B":       schemaObj("type", "string", "enum", []any{"a", "b", "c"}),
+		},
+		openEnums: map[string]bool{"#/$defs/A": true, "#/$defs/B": true},
+		fixed:     &wantFinding{"27", SeverityMinor},
+	},
+	{
+		// F1 inline control: the SAME enum addition reached through a
+		// STABLE (non-retargeted) $ref -- outside a retarget, defPtr and
+		// oldDefPtr are always identical (see loc's own doc comment), so
+		// a single open pointer is still sufficient, same as before F1
+		// (compare "row11 enum value added, open" above). Wrapper also
+		// picks up an unrelated description change so diffResolved's own
+		// DeepEqual short-circuit does not skip recursing into "value"
+		// entirely (E3's own technique) -- without SOME change at the
+		// Wrapper level, base and head Wrapper objects would be
+		// byte-identical (both merely say {"$ref":"#/$defs/A"}) even
+		// though A's own content, one hop away, differs.
+		name:    "row27 (no retarget) enum addition open at the single stable target (F1 inline control)",
+		ruleID:  "11",
+		defName: "Wrapper",
+		baseDefs: map[string]any{
+			"Wrapper": schemaObj("type", "object", "description", "v1", "properties", schemaObj("value", schemaObj("$ref", "#/$defs/A"))),
+			"A":       schemaObj("type", "string", "enum", []any{"a", "b"}),
+		},
+		headDefs: map[string]any{
+			"Wrapper": schemaObj("type", "object", "description", "v2", "properties", schemaObj("value", schemaObj("$ref", "#/$defs/A"))),
+			"A":       schemaObj("type", "string", "enum", []any{"a", "b", "c"}),
+		},
+		openEnums: map[string]bool{"#/$defs/A": true},
+		p2cWant:   &wantFinding{"11", SeverityMinor},
+		c2pWant:   &wantFinding{"11", SeverityMinor},
+	},
+	{
 		// E1 (round 3): row 28/29 are scoped to a $ref to an OBJECT def
 		// (COMPATIBILITY.md row 28), so A/B must actually resolve to
 		// object defs here -- a $ref to a bare scalar-type def (the

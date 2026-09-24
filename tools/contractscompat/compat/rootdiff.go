@@ -137,7 +137,7 @@ func DiffSurface(directive string, baseRaw, headRaw []byte, openEnums map[string
 		return nil, err
 	}
 	ctx := &diffCtx{baseR: resolver{defs: baseDefs}, headR: resolver{defs: headDefs}, openEnums: openEnums}
-	rootFindings, err := ctx.diffNode(stripAdminKeys(baseRoot), stripAdminKeys(headRoot), rootDir, loc{ptr: "#", defPtr: "#"})
+	rootFindings, err := ctx.diffNode(stripAdminKeys(baseRoot), stripAdminKeys(headRoot), rootDir, loc{ptr: "#", defPtr: "#", oldDefPtr: "#"})
 	if err != nil {
 		if fc, ok := err.(*FailClosedError); ok {
 			return append(findings, fc.Finding), nil

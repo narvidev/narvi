@@ -68,8 +68,8 @@ func (c *diffCtx) visitOnce(bName, hName string, dir Direction) bool {
 	return true
 }
 
-// loc bundles the two JSON Pointers a diffed schema node carries as
-// diffNode's recursive walk descends (E2/E3/E7):
+// loc bundles the JSON Pointers a diffed schema node carries as
+// diffNode's recursive walk descends (E2/E3/E7, F1/F6):
 //
 //   - ptr is the TRAVERSAL pointer -- rooted at whichever $defs entry (or
 //     document root) the outermost DiffDef/DiffSurface call started from,
@@ -77,48 +77,73 @@ func (c *diffCtx) visitOnce(bName, hName string, dir Direction) bool {
 //     retarget the walk crossed to reach this node. Every Finding.Pointer
 //     reported anywhere in this package is a ptr, unchanged from before
 //     this fix -- WHERE a change is reported has never been the problem.
-//   - defPtr is the DEFINING pointer -- rooted at THIS node's own
-//     nearest enclosing $defs entry: the one whose content this node is
-//     literally written inside. It resets to that def's own canonical
-//     "#/$defs/<Name>" every time the walk crosses INTO a different def
-//     via a $ref (a same-name re-reference in diffNode, or a retarget's
-//     NEW target in diffRetargetedRef), and otherwise grows by the exact
-//     same suffix as ptr.
+//   - defPtr is the DEFINING pointer as it stands in HEAD -- rooted at
+//     THIS node's own nearest enclosing $defs entry: the one whose
+//     content this node is literally written inside. It resets to that
+//     def's own canonical "#/$defs/<Name>" every time the walk crosses
+//     INTO a different def via a $ref (a same-name re-reference in
+//     diffNode, or a retarget's NEW target in diffRetargetedRef) --
+//     using the TERMINAL name each side's own alias chain resolves to
+//     (F6: resolver.resolveDefName), never the raw $ref name at the
+//     crossing -- and otherwise grows by the exact same suffix as ptr.
+//   - oldDefPtr mirrors defPtr but rooted at the def as it stood in
+//     BASE. Outside a retargeted $ref the two are always identical (a
+//     same-name crossing resets both to the same terminal name); they
+//     only diverge across a retarget's own nested diff (F1), where the
+//     content being compared genuinely comes from two differently-named
+//     defs -- the OLD target the referencing site's existing consumers
+//     were bound to, and the NEW target that now governs it.
 //
-// openEnums is authored against a pointer of the second kind
+// openEnums is authored against a pointer of the defPtr/oldDefPtr kind
 // (COMPATIBILITY.md: "the EXACT JSON Pointer ... of each open string
 // enum's own schema node") -- diffEnum is the one place that reads
-// defPtr; every other handler only ever reports at ptr and never looks
-// at defPtr. Before this fix there was only one pointer, doing both
-// jobs, so an enum's relaxation was lost the moment it was reached
-// through ANY $ref (E3), a root surface whose own root is a $ref
-// re-graded its defs' enums under the wrong, traversal-only pointer
-// (E7), and two retarget sites sharing a (base target, head target,
-// direction) triple could grade the SAME enum differently depending on
-// which site the recursion guard happened to visit first (E2).
+// either; every other handler only ever reports at ptr and never looks
+// at them. Before E3/E7/E2 there was only one pointer, doing both jobs,
+// so an enum's relaxation was lost the moment it was reached through ANY
+// $ref (E3), a root surface whose own root is a $ref re-graded its defs'
+// enums under the wrong, traversal-only pointer (E7), and two retarget
+// sites sharing a (base target, head target, direction) triple could
+// grade the SAME enum differently depending on which site the recursion
+// guard happened to visit first (E2). F1: even after that fix, a
+// retarget's added enum value was graded open-or-closed by the NEW
+// target's pointer alone -- a closed enum at a consumed site could be
+// silently widened by retargeting it to a def that happens to be open
+// under a DIFFERENT name; diffEnum now requires BOTH oldDefPtr and
+// defPtr to be open.
 type loc struct {
-	ptr, defPtr string
+	ptr, defPtr, oldDefPtr string
 }
 
-// child extends both of l's pointers by the same suffix -- used for
+// child extends every one of l's pointers by the same suffix -- used for
 // every recursive step that does NOT cross a $ref (into a property,
-// items, additionalProperties schema, or union member): ptr and defPtr
-// stay in lockstep until the walk actually enters a different def.
+// items, additionalProperties schema, or union member): ptr, defPtr and
+// oldDefPtr all stay in lockstep until the walk actually enters a
+// different def.
 func (l loc) child(suffix string) loc {
-	return loc{ptr: l.ptr + suffix, defPtr: l.defPtr + suffix}
+	return loc{ptr: l.ptr + suffix, defPtr: l.defPtr + suffix, oldDefPtr: l.oldDefPtr + suffix}
 }
 
-// intoDef returns the loc for a node reached by crossing a $ref into
-// name's own def content: ptr keeps accumulating through the
-// REFERENCING path (a Finding inside the def is still reported at the
-// location a maintainer diffing the file would actually see -- e.g.
-// "#/$defs/CreateAutomationResponse/properties/automation/properties/
-// status/enum"), while defPtr resets to that def's own canonical root
-// ("#/$defs/Automation") so an openEnums entry authored against the
-// def's OWN pointer keeps matching regardless of how many $refs away it
-// was reached from.
-func intoDef(l loc, name string) loc {
-	return loc{ptr: l.ptr, defPtr: "#/$defs/" + jsonPointerEscape(name)}
+// intoDef returns the loc for a node reached by crossing a $ref: ptr
+// keeps accumulating through the REFERENCING path (a Finding inside the
+// def is still reported at the location a maintainer diffing the file
+// would actually see -- e.g. "#/$defs/CreateAutomationResponse/
+// properties/automation/properties/status/enum"), while defPtr/oldDefPtr
+// reset to headTermName's/baseTermName's own canonical "#/$defs/<Name>"
+// root -- the TERMINAL name each side's OWN alias chain resolves to
+// (F6), not the raw $ref name at this crossing -- so an openEnums entry
+// authored against the resolved def's own pointer keeps matching
+// regardless of how many alias hops or $refs away it was reached from.
+// Outside a retarget, baseTermName == headTermName (the same-name path
+// that calls this always resolves the SAME $ref string on both sides,
+// unless the alias def it points at was itself edited between base and
+// head -- rare, but not assumed away here), so the two pointers this
+// produces are identical, same as before F1 split defPtr in two.
+func intoDef(l loc, baseTermName, headTermName string) loc {
+	return loc{
+		ptr:       l.ptr,
+		defPtr:    "#/$defs/" + jsonPointerEscape(headTermName),
+		oldDefPtr: "#/$defs/" + jsonPointerEscape(baseTermName),
+	}
 }
 
 // DiffDef compares one def (already looked up in both sides' $defs maps)
@@ -154,7 +179,7 @@ func DiffDef(baseDefs, headDefs map[string]any, name string, dir Direction, open
 	}
 	ptr := "#/$defs/" + jsonPointerEscape(name)
 	base, head := baseDefs[name], headDefs[name]
-	return ctx.diffNode(base, head, dir, loc{ptr: ptr, defPtr: ptr})
+	return ctx.diffNode(base, head, dir, loc{ptr: ptr, defPtr: ptr, oldDefPtr: ptr})
 }
 
 // mergeBothDirections combines the two per-column readings of a DirBoth
@@ -299,16 +324,32 @@ func (c *diffCtx) diffNode(base, head any, dir Direction, l loc) ([]Finding, err
 		return append(descFindings, ruleFinding("6", dir, majorMajor, l.ptr, "schema literal changed")), nil
 	}
 
-	// E3/E7: bRefName == hRefName here whenever it is non-empty (the
+	// E3/E7: bRefName == hRefName here whenever both are non-empty (the
 	// bRefName != hRefName case already returned above, via
 	// diffRetargetedRef) -- a same-name $ref means this node's resolved
-	// content is literally the content of def bRefName, so the node's
-	// DEFINING location resets to that def's own root even though its
-	// TRAVERSAL location (l.ptr) keeps accumulating through whatever
-	// property/item/union-member path led here.
+	// content is literally the content bRefName's own alias chain
+	// resolves to, so the node's DEFINING location resets to THAT def's
+	// own root (F6: the TERMINAL name, not bRefName itself, in case
+	// bRefName names a pure alias def) even though its TRAVERSAL location
+	// (l.ptr) keeps accumulating through whatever property/item/
+	// union-member path led here. A bare $ref->inline transition
+	// (bRefName != "", hRefName == "") resets the same way, using base's
+	// own terminal name for both defPtr and oldDefPtr -- there is no head
+	// def to resolve a second, independent name from.
 	nodeLoc := l
 	if bRefName != "" {
-		nodeLoc = intoDef(l, bRefName)
+		baseTerm, err := c.baseR.resolveDefName(bRefName, nil)
+		if err != nil {
+			return nil, failClosed("fc-ref", l.ptr, "%v", err)
+		}
+		headTerm := baseTerm
+		if hRefName != "" {
+			headTerm, err = c.headR.resolveDefName(hRefName, nil)
+			if err != nil {
+				return nil, failClosed("fc-ref", l.ptr, "%v", err)
+			}
+		}
+		nodeLoc = intoDef(l, baseTerm, headTerm)
 	}
 
 	resolvedFindings, err := c.diffResolved(bObj, hObj, dir, nodeLoc)
@@ -342,13 +383,21 @@ func diffRefSiblingDescription(base, head any, ptr string) []Finding {
 // resolveDef already fail closed on that, along the whole alias chain),
 // so there is nothing left to merge here.
 //
-// E2/E3: the nested comparison's DEFINING location (for openEnums) is
-// rooted at the NEW target's own def ("#/$defs/"+hRefName) -- openEnums
-// grades what an added enum value means as it exists in HEAD, and a
-// retarget's new content is what governs that from here on; the
-// referencing node's TRAVERSAL location (l.ptr) is unchanged, so a
-// nested Finding is still reported where a maintainer diffing the file
-// would look for it.
+// E2/E3/F1/F6: the nested comparison's DEFINING locations (for
+// openEnums) are rooted at BOTH the OLD target's own def ("#/$defs/"+
+// its terminal alias name) and the NEW target's ("#/$defs/"+its terminal
+// alias name) -- F1: an added enum value is graded open (MINOR on P2C)
+// only when BOTH are open. Grading by the new target's pointer alone (as
+// this function did before F1) let a closed enum at a consumed site be
+// silently widened by retargeting it to a def that merely HAPPENS to be
+// open under its own, different name -- the referencing site's own
+// consumers never accepted that promise, only the def's own direct
+// consumers did. Requiring the OLD target's pointer too means the
+// relaxation must ALSO have already covered this site before the
+// retarget (independently of it) for the addition to be safe. The
+// referencing node's TRAVERSAL location (l.ptr) is unchanged either way,
+// so a nested Finding is still reported where a maintainer diffing the
+// file would look for it.
 func (c *diffCtx) diffRetargetedRef(bRefName, hRefName string, dir Direction, l loc) ([]Finding, error) {
 	if _, ok := c.headR.defs[bRefName]; !ok {
 		return []Finding{{
@@ -377,7 +426,25 @@ func (c *diffCtx) diffRetargetedRef(bRefName, hRefName string, dir Direction, l 
 			nested = []Finding{ruleFinding("6", dir, majorMajor, l.ptr, "schema literal changed")}
 		}
 	default:
-		targetLoc := loc{ptr: l.ptr, defPtr: "#/$defs/" + jsonPointerEscape(hRefName)}
+		// F6: root each pointer at the TERMINAL name its own alias
+		// chain resolves to, not bRefName/hRefName directly -- either
+		// could itself be a pure alias def (walkSchema explicitly
+		// allows one), in which case the content just resolved above
+		// (oldObj/newObj) actually belongs to that terminal def, not
+		// the alias that merely points at it.
+		baseTerm, err := c.baseR.resolveDefName(bRefName, nil)
+		if err != nil {
+			return nil, failClosed("fc-ref", l.ptr, "%v", err)
+		}
+		headTerm, err := c.headR.resolveDefName(hRefName, nil)
+		if err != nil {
+			return nil, failClosed("fc-ref", l.ptr, "%v", err)
+		}
+		targetLoc := loc{
+			ptr:       l.ptr,
+			defPtr:    "#/$defs/" + jsonPointerEscape(headTerm),
+			oldDefPtr: "#/$defs/" + jsonPointerEscape(baseTerm),
+		}
 		nested, err = c.diffResolved(oldObj, newObj, dir, targetLoc)
 		if err != nil {
 			return nil, err
@@ -688,20 +755,29 @@ func (c *diffCtx) diffEnum(base, head map[string]any, dir Direction, l loc) []Fi
 	}
 
 	var findings []Finding
-	// D14/E2/E3/E7: openEnums matches the enum's schema node (the node
+	// D14/E2/E3/E7/F1: openEnums matches the enum's schema node (the node
 	// that itself carries "enum" -- NOT that node's own "/enum" child;
 	// COMPATIBILITY.md's own example, "#/$defs/Session/properties/
 	// status", names the property node, not ".../status/enum") by the
-	// EXACT JSON Pointer of the $defs entry that DECLARES it (l.defPtr),
-	// never a name derived by stripping "$defs"/"properties" segments
-	// out of a pointer, and never the traversal pointer a particular
-	// caller happened to reach it through (l.ptr) -- see this file's own
-	// loc doc comment. Matching defPtr instead of ptr is what makes the
-	// relaxation survive being reached through an UNRELATED def's own
-	// $ref (E3), a root surface whose root is itself a $ref (E7), and a
-	// second retarget site sharing the same (base, head, direction)
-	// triple as an already-visited one (E2).
-	isOpen := c.openEnums[l.defPtr]
+	// EXACT JSON Pointer of the $defs entry that DECLARES it (l.defPtr/
+	// l.oldDefPtr), never a name derived by stripping "$defs"/
+	// "properties" segments out of a pointer, and never the traversal
+	// pointer a particular caller happened to reach it through (l.ptr) --
+	// see this file's own loc doc comment. Matching defPtr/oldDefPtr
+	// instead of ptr is what makes the relaxation survive being reached
+	// through an UNRELATED def's own $ref (E3), a root surface whose root
+	// is itself a $ref (E7), and a second retarget site sharing the same
+	// (base, head, direction) triple as an already-visited one (E2).
+	//
+	// F1: requiring BOTH defPtr (the NEW target's own pointer, as it
+	// stands in head) AND oldDefPtr (the OLD target's, as it stood in
+	// base) to be open is what stops a retarget from laundering a closed
+	// enum through a def that merely happens to be open under a
+	// DIFFERENT name -- outside a retarget the two pointers are always
+	// identical (see loc's own doc comment), so this is a strict
+	// generalization of the single-pointer check it replaces, not a new
+	// restriction on the common case.
+	isOpen := c.openEnums[l.defPtr] && c.openEnums[l.oldDefPtr]
 
 	var addedKeys, removedKeys []string
 	for k := range hSet {
@@ -1111,30 +1187,38 @@ func inlineUnionMemberKey(obj map[string]any) (string, bool) {
 }
 
 // resolvedUnionMemberKey classifies a $ref member by the shape its
-// TARGET resolves to (E1): an object def -- its own "type" is the bare
-// string "object" (regardless of whatever else it carries: a real
-// object def always has "properties"/"required"/etc. alongside
-// "type":"object", unlike the inline case there is no need to require
-// bareness here), or it carries a properties.type.const discriminator --
+// TARGET resolves to (E1): a PURE object def -- its own "type" is
+// EXACTLY the bare string "object" (not an array that merely includes
+// "object" alongside something else, e.g. "null", and not absent) --
 // is the discriminated variant rows 28/29 describe, keyed by the $ref's
 // own target NAME (there is no const value to key by here the way an
 // inline discriminated member has one, but a $ref is already a stable,
-// unique name to pair on). A resolved bare scalar type keys exactly like
-// the equivalent inline member would (bareUnionTypeKey). Anything else
-// -- an array-shaped def, an alias chain ending somewhere that is
-// neither, a mixed shape (e.g. type:["object","null"] alongside its own
-// "properties") -- is not classifiable: ok is false and the caller fails
-// closed, exactly as it would for the same shape written inline.
+// unique name to pair on); whatever else that def carries besides "type"
+// -- "properties"/"required"/a properties.type.const discriminator --
+// does not change this, a real object def always has those alongside
+// "type":"object" and none of them are what makes it classifiable here.
+// A resolved bare scalar type keys exactly like the equivalent inline
+// member would (bareUnionTypeKey). Anything else -- an array-shaped def,
+// an alias chain ending somewhere that is neither, a mixed shape (e.g.
+// type:["object","null"] alongside its own "properties", or a
+// properties.type.const discriminator on a def whose own "type" allows
+// null/strings or is absent entirely) -- is not classifiable: ok is
+// false and the caller fails closed, exactly as it would for the same
+// shape written inline.
+//
+// F2: this used to ALSO key a def as "ref:"+ref purely because it had a
+// properties.type.const, without checking "type" at all -- so a def
+// whose "type" allowed null (or any other type) alongside "object", or
+// had no "type" keyword at all, was wrongly treated as a discriminated
+// object variant (MINOR/MINOR, row 28) instead of failing closed the way
+// the identical shape already does when written inline. Every real
+// object variant in this repo's own union members already has a bare
+// "type":"object", so requiring it here does not change behavior for
+// any of them -- it only closes the loophole for a shape none of them
+// use.
 func resolvedUnionMemberKey(ref string, robj map[string]any) (string, bool) {
 	if t, isStr := robj["type"].(string); isStr && t == "object" {
 		return "ref:" + ref, true
-	}
-	if props, has := robj["properties"].(map[string]any); has {
-		if t, has := props["type"].(map[string]any); has {
-			if _, has := t["const"]; has {
-				return "ref:" + ref, true
-			}
-		}
 	}
 	if t, ok := bareUnionTypeKey(robj); ok {
 		return "type:" + t, true

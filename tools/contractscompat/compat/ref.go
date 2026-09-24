@@ -141,6 +141,59 @@ func (r resolver) resolveDef(name string, path []string) (any, error) {
 	return r.resolve(target, append(path, name))
 }
 
+// resolveDefName follows name's own $defs entry through any alias chain
+// -- a $defs entry that is itself a bare "$ref" to another def, nothing
+// else besides the one legal sibling "description" (walkSchema explicitly
+// allows this shape; see its own comment) -- and returns the LAST name in
+// the chain: the def whose OWN content is what diffNode/diffRetargetedRef
+// actually diff. This is the pointer an openEnums entry for an enum
+// living inside that content must be authored against (F6): grading at
+// the DIRECT $ref name instead (as intoDef/diffRetargetedRef did before
+// this fix) loses the relaxation the moment a def is reached through an
+// alias, since the resolved CONTENT belongs to the terminal def, not the
+// alias that merely points at it.
+//
+// Mirrors resolveDef's own chain-following (same cycle guard, same
+// disallowed-sibling and boolean-literal rejections), but returns the
+// name reached instead of dereferencing all the way to content -- callers
+// that already hold the resolved content (via resolve/resolveDef, which
+// this file's other functions already called first) call this purely to
+// recover the NAME that content is filed under.
+func (r resolver) resolveDefName(name string, path []string) (string, error) {
+	for _, seen := range path {
+		if seen == name {
+			return "", fmt.Errorf("$ref cycle detected: %s -> %s", strings.Join(path, " -> "), name)
+		}
+	}
+	target, ok := r.defs[name]
+	if !ok {
+		return "", fmt.Errorf("$ref target %q not found in $defs", name)
+	}
+	if _, isBool := target.(bool); isBool {
+		return "", fmt.Errorf("$ref target %q is the boolean schema literal, which is not supported behind a $ref", name)
+	}
+	obj, isObj := target.(map[string]any)
+	if !isObj {
+		return name, nil
+	}
+	raw, hasRef := obj["$ref"]
+	if !hasRef {
+		return name, nil
+	}
+	if err := checkRefSiblings(obj); err != nil {
+		return "", err
+	}
+	s, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("$ref must be a string")
+	}
+	nextName, err := localRefTarget(s)
+	if err != nil {
+		return "", err
+	}
+	return r.resolveDefName(nextName, append(path, name))
+}
+
 // refTargetName returns the $defs name a node's own (non-recursive)
 // $ref points at, or "" if node has no $ref at all. Used to detect a
 // same-name vs. retargeted vs. newly-$ref'd/un-$ref'd $ref between base
