@@ -470,6 +470,48 @@ func TestScmCredentials_NoGitHubIdentity(t *testing.T) {
 	}
 }
 
+// TestScmCredentials_NoGitHubIdentity_FallsBackToBotToken proves review
+// round 1's own finding O5: a creator with NO github identity at all --
+// the ordinary case for a user who signed in ONLY through OIDC (§41.3)
+// and has never linked GitHub -- now falls back to the SAME static bot
+// credential a review session already receives (step 7), when this
+// deployment has one configured. Otherwise identical to
+// TestScmCredentials_NoGitHubIdentity above, except rig.botToken is set:
+// without this fallback, such a creator's live session could never push
+// at all, so sessionactor's own §8.11 createPRBestEffort bot-fallback PR
+// path could never even be reached (only theoretically correct).
+func TestScmCredentials_NoGitHubIdentity_FallsBackToBotToken(t *testing.T) {
+	const realBotToken = "bot-token-for-oidc-only-creator"
+	rig := newTestRig(t, func(r *testRig) { r.botToken = realBotToken })
+	ctx := context.Background()
+
+	user, err := rig.users.Create(ctx, sqlcgen.CreateUserParams{
+		PrimaryEmail: "oidc-only@example.com", DisplayName: "OIDC Only", Role: sqlcgen.UserRoleMember,
+	})
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	// Deliberately NO identities row of any provider -- this user has
+	// never linked a GitHub account.
+	promoteRepoLive(ctx, t, rig, reviewSessionRepos)
+	session, err := rig.sessions.Create(ctx, sqlcgen.CreateSessionParams{
+		SpawnSource: sqlcgen.SessionSpawnSourceWeb, CreatedBy: user.ID,
+		Repos: []byte(`[{"name":"narvi","url":"https://github.com/narvidev/narvi","branch":null}]`),
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
+
+	status, got := postScmCredentials(t, rig, session.ID.String(), "sandbox-bearer-token")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want %d (a bot token IS configured for this deployment)", status, http.StatusOK)
+	}
+	if got.Password != realBotToken {
+		t.Errorf("Password = %q, want the bot token %q -- never the (nonexistent) creator token", got.Password, realBotToken)
+	}
+}
+
 // TestScmCredentials_NilTokenHash_Rejected proves this endpoint's own
 // bearer check (verifySandboxBearerToken) does NOT inherit wshub's own
 // WS-handshake nil-token_hash bypass ("accept any non-empty presented
@@ -564,6 +606,54 @@ func TestScmCredentials_NoStoredToken(t *testing.T) {
 	status, _ := postScmCredentials(t, rig, session.ID.String(), "sandbox-bearer-token")
 	if status != http.StatusForbidden {
 		t.Errorf("status = %d, want %d", status, http.StatusForbidden)
+	}
+}
+
+// TestScmCredentials_GitHubIdentityNoStoredToken_NeverFallsBackToBot
+// proves review round 1's own O5 distinction the OTHER direction: a
+// creator who DOES have a github identity, but whose stored token is
+// unusable (nil, here -- TestScmCredentials_TamperedCiphertext above
+// covers the decrypt-failure sub-case identically), must NEVER receive
+// the bot-token fallback TestScmCredentials_NoGitHubIdentity_
+// FallsBackToBotToken proves for the "no identity at all" case --
+// otherwise identical to TestScmCredentials_NoStoredToken above, except
+// rig.botToken IS configured here. Falling back would misrepresent an
+// existing account's broken credential as "no linked account" to
+// whoever reviews the resulting push/PR.
+func TestScmCredentials_GitHubIdentityNoStoredToken_NeverFallsBackToBot(t *testing.T) {
+	const realBotToken = "bot-token-must-never-cover-a-broken-existing-identity"
+	rig := newTestRig(t, func(r *testRig) { r.botToken = realBotToken })
+	ctx := context.Background()
+
+	user, err := rig.users.Create(ctx, sqlcgen.CreateUserParams{
+		PrimaryEmail: "no-token-with-bot@example.com", DisplayName: "No Token, Bot Configured", Role: sqlcgen.UserRoleMember,
+	})
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	email := "no-token-with-bot@example.com"
+	if _, err := rig.identities.Create(ctx, sqlcgen.CreateIdentityParams{
+		UserID: user.ID, Provider: sqlcgen.IdentityProviderGithub, ExternalID: "ext-no-token-with-bot",
+		Email: &email, EmailVerified: true, LinkedVia: sqlcgen.IdentityLinkedViaAdmin,
+	}); err != nil {
+		t.Fatalf("create identity: %v", err)
+	}
+	promoteRepoLive(ctx, t, rig, reviewSessionRepos)
+	session, err := rig.sessions.Create(ctx, sqlcgen.CreateSessionParams{
+		SpawnSource: sqlcgen.SessionSpawnSourceWeb, CreatedBy: user.ID,
+		Repos: []byte(`[{"name":"narvi","url":"https://github.com/narvidev/narvi","branch":null}]`),
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
+
+	status, got := postScmCredentials(t, rig, session.ID.String(), "sandbox-bearer-token")
+	if status != http.StatusForbidden {
+		t.Errorf("status = %d, want %d (an existing-but-unusable identity must never fall back to the bot token)", status, http.StatusForbidden)
+	}
+	if got.Password == realBotToken {
+		t.Error("Password == the bot token -- an existing GitHub identity with no stored token must never receive the bot fallback")
 	}
 }
 

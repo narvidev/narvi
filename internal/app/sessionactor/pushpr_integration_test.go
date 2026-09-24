@@ -1549,6 +1549,94 @@ func TestHandleSandboxEvent_PushComplete_CreatorNoGitHubToken_NoBotToken_SkipsHo
 	}
 }
 
+// TestHandleSandboxEvent_PushComplete_CreatorHasGitHubIdentityButNoUsableToken_NeverFallsBackToBot
+// proves review round 1's own O5 distinction: a creator who DOES have a
+// linked GitHub identity, but whose stored token is unusable (nil here --
+// TestScmCredentials_TamperedCiphertext's own decrypt-failure sub-case is
+// the parallel case one layer down, at the credential-minting endpoint),
+// must NEVER receive the §8.11 bot-identity fallback
+// TestHandleSandboxEvent_PushComplete_CreatorNoGitHubToken_FallsBackToBot
+// proves immediately above for the "no identity at all" case -- even
+// though a bot token IS configured here. This is origin/main's own
+// pre-existing behavior (git show origin/main:internal/app/sessionactor/
+// pushpr.go: decryptCreatorGitHubToken failing always meant "skip, no PR
+// at all" -- there was no bot fallback of any kind to misapply). Before
+// this fix, this exact setup opened a PR under the bot identity whose
+// body wrongly claimed "this session's creator has no linked GitHub
+// account" -- false, and misleading to whoever reviews it.
+func TestHandleSandboxEvent_PushComplete_CreatorHasGitHubIdentityButNoUsableToken_NeverFallsBackToBot(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+
+	userStore := narvipg.NewUserStore(pool)
+	identityStore := narvipg.NewIdentityStore(pool)
+	user, err := userStore.Create(ctx, sqlcgen.CreateUserParams{
+		PrimaryEmail: fmt.Sprintf("has-identity-no-token-%d@example.com", time.Now().UnixNano()),
+		DisplayName:  "Has Identity, No Usable Token",
+		Role:         sqlcgen.UserRoleMember,
+	})
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	// A REAL github identity row exists -- unlike the no-identity-at-all
+	// case above -- but with no stored access token at all.
+	email := user.PrimaryEmail
+	if _, err := identityStore.Create(ctx, sqlcgen.CreateIdentityParams{
+		UserID:        user.ID,
+		Provider:      sqlcgen.IdentityProviderGithub,
+		ExternalID:    fmt.Sprintf("has-identity-no-token-external-%d", time.Now().UnixNano()),
+		Email:         &email,
+		EmailVerified: true,
+		LinkedVia:     sqlcgen.IdentityLinkedViaAdmin,
+		// AccessTokenEncrypted deliberately left nil.
+	}); err != nil {
+		t.Fatalf("create identity: %v", err)
+	}
+
+	sessionID := createTestSessionWithRepos(ctx, t, pool, user.ID,
+		"repo1", "https://github.com/acme/repo1.git", "feature-x")
+
+	sandboxStore := narvipg.NewSandboxStore(pool)
+	if _, err := sandboxStore.Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+
+	const wantBotToken = "gh-fake-bot-token-must-never-be-used-here"
+	sourceControl := &fakeSourceControl{
+		nextRef: ports.PRRef{Number: 78, URL: "https://github.com/acme/repo1/pull/78"},
+	}
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", sourceControl, testTokenEncryptionKey, "", nil, false, RegistryOptions{GitHubBotToken: wantBotToken})
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "push_complete",
+		Gen:  1,
+		Raw:  pushCompleteRaw(t, sessionID.String(), 1, "repo1", "feature-x", "abc123"),
+	})
+
+	time.Sleep(300 * time.Millisecond)
+	if got := sourceControl.callCount(); got != 0 {
+		t.Errorf("CreatePR called %d times, want 0 (an existing github identity with no usable token must never fall back to the bot, even though one is configured)", got)
+	}
+
+	artifactStore := narvipg.NewArtifactStore(pool)
+	rows, err := artifactStore.ListForSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("list artifacts: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("artifact count = %d, want 0", len(rows))
+	}
+}
+
 // TestHandleSandboxEvent_PushComplete_ResolveDefaultBranchFails_SkipsPRCreation
 // is fix/setup-drift-and-pr-base's own regression test for
 // resolvePRBaseBranch's error path: when the real GitHub API call that

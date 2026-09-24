@@ -925,11 +925,11 @@ func (a *Actor) createPRBestEffort(ctx context.Context, raw json.RawMessage) {
 	}
 
 	// §8.11 ("multiplayer... PR created with the prompting user's OAuth
-	// token (fallback: bot + manual PR URL)"): a creator with no usable
-	// stored GitHub OAuth token -- the ordinary case for a user who signed
-	// in ONLY through OIDC (§41.3) and has never linked a GitHub identity
-	// -- falls back to this Actor's own bot credential (a.githubBotToken,
-	// the SAME static credential createSentinelFixPRBestEffort's own
+	// token (fallback: bot + manual PR URL)"): a creator with NO GITHUB
+	// IDENTITY AT ALL -- the ordinary case for a user who signed in ONLY
+	// through OIDC (§41.3) and has never linked a GitHub identity -- falls
+	// back to this Actor's own bot credential (a.githubBotToken, the SAME
+	// static credential createSentinelFixPRBestEffort's own
 	// system-initiated path already authenticates with, below) rather
 	// than silently dropping the PR entirely. The bot cannot be attributed
 	// as "the prompting user" on GitHub's own side (GitHub has no concept
@@ -940,14 +940,30 @@ func (a *Actor) createPRBestEffort(ctx context.Context, raw json.RawMessage) {
 	// own fallback: the artifact row this function already records below
 	// (recordPRArtifact, unconditionally, on EITHER path) is what
 	// surfaces that URL to the creator, exactly as it always has.
+	//
+	// A creator who DOES have a github identity, but whose stored token is
+	// merely unusable (expired, revoked, fails to decrypt, or the lookup
+	// itself failed for some other reason) is a DIFFERENT case (review
+	// round 1, finding O5): the fallback below is never applied to them --
+	// re-attributing to the bot here would tell a reviewer "this creator
+	// has no linked GitHub account" when that is false, and would silently
+	// paper over what is really a token problem. That case keeps
+	// origin/main's own pre-existing behavior: skip PR creation entirely,
+	// exactly as decryptCreatorGitHubToken's own doc comment always
+	// described ("no bot/service-account fallback exists" -- true for
+	// THIS case, no longer true for the no-identity-at-all case above).
 	token, ok := a.decryptCreatorGitHubToken(ctx, sessionRow.CreatedBy)
 	usedBotFallback := false
 	if !ok {
+		if !a.creatorHasNoGitHubIdentity(ctx, sessionRow.CreatedBy) {
+			a.logger.Warn("sessionactor: session creator has a github identity but no usable token; skipping PR creation (never misattributing to the bot, §8.11)")
+			return
+		}
 		if a.githubBotToken == "" {
 			a.logger.Warn("sessionactor: session creator has no usable github token and no bot token is configured; skipping PR creation (§8.11)")
 			return
 		}
-		a.logger.Info("sessionactor: session creator has no usable github token; falling back to bot identity for PR creation (§8.11)")
+		a.logger.Info("sessionactor: session creator has no github identity; falling back to bot identity for PR creation (§8.11)")
 		token = a.githubBotToken
 		usedBotFallback = true
 	}

@@ -97,6 +97,34 @@ func (a *Actor) decryptCreatorGitHubToken(ctx context.Context, createdBy pgtype.
 	return string(plaintext), true
 }
 
+// creatorHasNoGitHubIdentity reports whether createdBy has NO github
+// identity row at all -- as distinct from having one whose stored token
+// is merely unusable (missing, undecryptable). Used ONLY by pushpr.go's
+// own createPRBestEffort (review round 1, finding O5) to decide whether
+// its §8.11 bot-identity fallback applies: an OIDC-only creator who has
+// never linked GitHub (this reports true) is exactly the case that
+// fallback exists for -- the honest PR body names them and points at
+// Settings -> Identities. A creator who DOES have a github identity, but
+// whose token has expired, been revoked, or fails to decrypt (this
+// reports false), must NOT be silently re-attributed to the bot: that
+// would misrepresent a token problem as "no linked account" to whoever
+// reviews the PR. That case keeps origin/main's own pre-existing
+// behavior -- decryptCreatorGitHubToken's caller simply skips PR
+// creation entirely (see createPRBestEffort's own call site).
+//
+// A createdBy with no valid row at all (sentinel-auto-fix, no human
+// creator) is treated as "no identity" here too -- never reached by
+// createPRBestEffort's own call site in practice (that path returns
+// earlier via the sentinel-auto-fix branch), but consistent with
+// decryptCreatorGitHubToken's own identical createdBy.Valid short-circuit.
+func (a *Actor) creatorHasNoGitHubIdentity(ctx context.Context, createdBy pgtype.UUID) bool {
+	if !createdBy.Valid {
+		return true
+	}
+	_, err := a.stores.identity.GetByUserAndProvider(ctx, createdBy, sqlcgen.IdentityProviderGithub)
+	return errors.Is(err, pgx.ErrNoRows)
+}
+
 // CreatorGuardVerdict is CheckCreatorGuard's own result (below) -- the
 // SAME §13.3 viewer-guard staleness recheck every one of this audit
 // sweep's four call sites performs, deliberately returned as a small
