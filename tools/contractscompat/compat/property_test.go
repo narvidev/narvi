@@ -270,15 +270,34 @@ type mutationKind struct {
 // generic kinds structurally cannot reach (E6): enum value add/remove
 // (as opposed to replacing the whole array), required add/remove naming
 // a REAL property (so it never fails closed as an orphan), property
-// add/remove that never orphans `required`, a single oneOf/anyOf member
-// add/remove, and a $ref retargeted to another EXISTING def. `type`
-// change/add/remove, `format`/`pattern`/`minimum`/`minLength`/`minItems`
-// add/remove/change, `additionalProperties` changes, `description`
-// change, and `default` change are all already reliably reachable
-// through the three GENERIC kinds above -- none of those needs its own
-// targeted kind (mutableLeafKeywords covers every one of those
+// add/remove that never orphans `required`, a property added AND
+// required in the same mutation (F7 -- row 3; see mutatePropertyAddRequired),
+// a single oneOf/anyOf member add/remove, a $defs entry added (F7 -- row
+// 32; see mutateDefAdd), and a $ref retargeted to another EXISTING def.
+// `type` change/add/remove, `format`/`pattern`/`minimum`/`minLength`/
+// `minItems` add/remove/change, `additionalProperties` changes,
+// `description` change, and `default` change are all already reliably
+// reachable through the three GENERIC kinds above -- none of those needs
+// its own targeted kind (mutableLeafKeywords covers every one of those
 // keywords, uniformly, at any position, regardless of whether it is
 // already present).
+//
+// F7 (round 4 review): the property test's own doc comment used to claim
+// this list reaches "every rule-table change kind" -- it did not. Row 3
+// (property added AND required) was structurally impossible
+// (mutatePropertyAdd never marked the new property required), row 32
+// (a $defs entry added) had no mutation kind at all, and row 28 (a
+// discriminated union variant added) could only ever be produced ALONGSIDE
+// row 7 or buried under other findings (unionMemberAdd only ever
+// appended a bare {"type":"boolean"}, which resolvedUnionMemberKey keys
+// as a scalar-type widening, not a discriminated variant) -- so a mutant
+// that disabled JUST that row's own emission line was never caught: the
+// document this test mutates never produced row 3, 32, or (in isolation)
+// row 28 at all. mutatePropertyAddRequired, mutateDefAdd, and
+// unionMemberAdd's own new $ref-to-object-def branch close exactly those
+// three gaps. See TestRealContractsMutationNeverSilentlyDropsAChange's
+// own doc comment below for the EXACT measured kill fraction against a
+// representative mutant sample -- not a blanket "every kind" claim.
 var targetedMutationKinds = []mutationKind{
 	{"enumValueAdd", func(rng *rand.Rand, _ map[string]any, positions []schemaPos) bool {
 		return mutateEnumValueAdd(rng, positions)
@@ -295,16 +314,18 @@ var targetedMutationKinds = []mutationKind{
 	{"propertyAdd", func(rng *rand.Rand, _ map[string]any, positions []schemaPos) bool {
 		return mutatePropertyAdd(rng, positions)
 	}},
+	{"propertyAddRequired", func(rng *rand.Rand, _ map[string]any, positions []schemaPos) bool {
+		return mutatePropertyAddRequired(rng, positions)
+	}},
 	{"propertyRemove", func(rng *rand.Rand, _ map[string]any, positions []schemaPos) bool {
 		return mutatePropertyRemove(rng, positions)
 	}},
-	{"unionMemberAdd", func(rng *rand.Rand, _ map[string]any, positions []schemaPos) bool {
-		return mutateUnionMemberAdd(rng, positions)
-	}},
+	{"unionMemberAdd", mutateUnionMemberAdd},
 	{"unionMemberRemove", func(rng *rand.Rand, _ map[string]any, positions []schemaPos) bool {
 		return mutateUnionMemberRemove(rng, positions)
 	}},
 	{"refRetarget", mutateRefRetarget},
+	{"defAdd", mutateDefAdd},
 }
 
 // mutateEnumValueAdd appends ONE brand-new value to an EXISTING "enum"
@@ -455,6 +476,47 @@ func mutatePropertyAdd(rng *rand.Rand, positions []schemaPos) bool {
 	return true
 }
 
+// mutatePropertyAddRequired adds ONE brand-new property to an EXISTING
+// "properties" map AND adds its name to "required" in the same mutation
+// (F7) -- mutatePropertyAdd above deliberately never does this (it is
+// what makes it reliably produce row 2's "not required" case), so row 3
+// ("property added and required") was otherwise structurally impossible
+// for the generator to produce at all: the generic kinds' "required"
+// pool almost never names a property that ALSO doesn't already exist in
+// "properties" on the same node in the same draw, and even a lucky hit
+// there is still two independent random choices landing together, not a
+// mutation that reliably targets row 3 the way this one does.
+func mutatePropertyAddRequired(rng *rand.Rand, positions []schemaPos) bool {
+	var candidates []schemaPos
+	for _, p := range positions {
+		if _, ok := p.node["properties"].(map[string]any); ok {
+			candidates = append(candidates, p)
+		}
+	}
+	if len(candidates) == 0 {
+		return false
+	}
+	pos := candidates[rng.Intn(len(candidates))]
+	props, _ := pos.node["properties"].(map[string]any)
+	newProps := make(map[string]any, len(props)+1)
+	for k, v := range props {
+		newProps[k] = v
+	}
+	base := "zzzGeneratedRequiredProperty"
+	name := base
+	for i := 1; ; i++ {
+		if _, exists := newProps[name]; !exists {
+			break
+		}
+		name = fmt.Sprintf("%s%d", base, i)
+	}
+	newProps[name] = map[string]any{"type": "string"}
+	pos.node["properties"] = newProps
+	reqRaw, _ := pos.node["required"].([]any)
+	pos.node["required"] = append(append([]any{}, reqRaw...), name)
+	return true
+}
+
 // mutatePropertyRemove removes ONE existing property that is NOT in
 // "required" -- reliably produces row 1 (property removed) WITHOUT
 // orphaning "required" the way the generic kinds' wholesale-only
@@ -497,15 +559,25 @@ func mutatePropertyRemove(rng *rand.Rand, positions []schemaPos) bool {
 	return true
 }
 
-// mutateUnionMemberAdd appends a bare {"type":"boolean"} member to an
-// EXISTING oneOf/anyOf array -- reliably produces row 7 (a non-null
-// scalar-type member added, type widened). "boolean" is not a type any
-// real union in these five files pairs on today, so it is very unlikely
-// to collide with an existing member's own pairing key; on the rare
-// chance it does, diffUnion's own "duplicate pairing key" guard still
-// fails closed, which the property test also accepts as "not silently
-// dropped."
-func mutateUnionMemberAdd(rng *rand.Rand, positions []schemaPos) bool {
+// mutateUnionMemberAdd appends a new member to an EXISTING oneOf/anyOf
+// array -- EITHER a bare {"type":"boolean"} (reliably produces row 7, a
+// non-null scalar-type member added/type widened) OR, when the file has
+// a $defs entry with a bare "type":"object" not already referenced as a
+// member of the CHOSEN array, a {"$ref": "#/$defs/<name>"} to it
+// (reliably produces row 28, a discriminated object variant added --
+// F7: before this, no mutation kind ever added a $ref-shaped member, so
+// row 28 could only ever occur alongside whatever unrelated change
+// {"type":"boolean"} itself produces (row 7), never in isolation -- a
+// mutant disabling row 28's own emission was never caught, since the
+// document it needed to silently mis-classify never occurred). Which of
+// the two this call produces is picked at random each time a ref target
+// is available, so row 7 stays reachable too. "boolean" is not a type
+// any real union in these five files pairs on today, so appending it is
+// very unlikely to collide with an existing member's own pairing key; on
+// the rare chance either form does collide, diffUnion's own "duplicate
+// pairing key" guard still fails closed, which the property test also
+// accepts as "not silently dropped."
+func mutateUnionMemberAdd(rng *rand.Rand, headRoot map[string]any, positions []schemaPos) bool {
 	type candidate struct {
 		pos schemaPos
 		kw  string
@@ -523,8 +595,51 @@ func mutateUnionMemberAdd(rng *rand.Rand, positions []schemaPos) bool {
 	}
 	c := candidates[rng.Intn(len(candidates))]
 	arr, _ := c.pos.node[c.kw].([]any)
+
+	if rng.Intn(2) == 0 {
+		if refTarget, ok := pickUnreferencedObjectDef(rng, headRoot, arr); ok {
+			c.pos.node[c.kw] = append(append([]any{}, arr...), map[string]any{"$ref": "#/$defs/" + refTarget})
+			return true
+		}
+	}
 	c.pos.node[c.kw] = append(append([]any{}, arr...), map[string]any{"type": "boolean"})
 	return true
+}
+
+// pickUnreferencedObjectDef returns the name of a $defs entry whose own
+// "type" is EXACTLY the bare string "object" (F2's own classification
+// rule for a $ref union member to count as a discriminated variant) and
+// that is not ALREADY a "$ref" member of existingMembers -- so appending
+// it never collides with an existing member's own pairing key. Picks
+// among all such candidates by index rng.Intn, for determinism (E4).
+func pickUnreferencedObjectDef(rng *rand.Rand, headRoot map[string]any, existingMembers []any) (string, bool) {
+	defs, ok := headRoot["$defs"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	already := map[string]bool{}
+	for _, m := range existingMembers {
+		if name := refTargetName(m); name != "" {
+			already[name] = true
+		}
+	}
+	var candidates []string
+	for _, name := range sortedMapKeys(defs) {
+		if already[name] {
+			continue
+		}
+		def, ok := defs[name].(map[string]any)
+		if !ok {
+			continue
+		}
+		if t, isStr := def["type"].(string); isStr && t == "object" {
+			candidates = append(candidates, name)
+		}
+	}
+	if len(candidates) == 0 {
+		return "", false
+	}
+	return candidates[rng.Intn(len(candidates))], true
 }
 
 // mutateUnionMemberRemove removes ONE existing oneOf/anyOf member --
@@ -590,6 +705,39 @@ func mutateRefRetarget(rng *rand.Rand, headRoot map[string]any, positions []sche
 	return true
 }
 
+// mutateDefAdd adds ONE brand-new, unreferenced entry to headRoot's own
+// top-level "$defs" -- reliably produces row 32 ($defs entry added). No
+// generic kind can ever produce this (they only ever touch an EXISTING
+// position's own keywords, never add a new $defs NAME), and before F7 no
+// targeted kind did either, so row 32 was structurally impossible for
+// the generator to reach at all (confirmed unreachable at every seed
+// tried in the round-4 review). The new def is deliberately never
+// referenced by anything -- an unreferenced def is still a real, valid
+// addition (row 32 does not require reachability), and leaving it
+// unreferenced keeps this mutation from also silently changing some
+// OTHER position's own pairing/direction behavior as a side effect.
+func mutateDefAdd(rng *rand.Rand, headRoot map[string]any, _ []schemaPos) bool {
+	defs, ok := headRoot["$defs"].(map[string]any)
+	if !ok {
+		return false
+	}
+	newDefs := make(map[string]any, len(defs)+1)
+	for k, v := range defs {
+		newDefs[k] = v
+	}
+	base := "ZzzGeneratedDef"
+	name := base
+	for i := 1; ; i++ {
+		if _, exists := newDefs[name]; !exists {
+			break
+		}
+		name = fmt.Sprintf("%s%d", base, i)
+	}
+	newDefs[name] = map[string]any{"type": "string"}
+	headRoot["$defs"] = newDefs
+	return true
+}
+
 // canonicalizeForComparison normalizes away the handful of JSON-Schema-
 // level equivalences this checker's OWN rule table already treats as
 // no-ops, so the property test's notion of "did anything change" matches
@@ -643,6 +791,29 @@ func canonicalizeForComparison(v any) any {
 // silently accept this," which is the property under test). "No
 // findings" is only ever correct when the canonical documents are
 // actually equal.
+//
+// F7 (round 4 review) measured kill fraction: this test does NOT reach
+// "every rule-table change kind" -- an earlier version of this comment
+// implied that, and it was not true. A round-4 line-level mutation sweep
+// against a representative sample of 41 emission sites across
+// defdiff.go/rootdiff.go (each mutant neutering exactly ONE rule's own
+// Finding-producing return/append statement, one at a time, restored
+// between runs) found this test alone -- run in isolation, not the rest
+// of the suite -- catches 23/41 (56.1%). The other 18 are still caught
+// elsewhere in the suite (a corpus case in compat_test.go, or a
+// dedicated round2/round3/round4 repro test) except where a corpus gap
+// was itself the finding (F3's row 19 "removed" branch, now pinned).
+// Structural reasons some rows can never reach this test at all: no
+// mutation kind produces a bare boolean-schema-literal position or an
+// additionalProperties-SCHEMA position (none exist in the real files
+// today), the root-only administrative keywords ($id/title, row 34) are
+// deliberately outside mutableLeafKeywords (this test mutates schema
+// CONTENT, not document identity), and a handful of rows need a second,
+// independent structural precondition (e.g. row 42 needs an
+// additionalProperties schema to already exist at some position) that
+// happens not to occur anywhere in the current five files. Re-run the
+// sweep (or a similar one) after any future generator change and update
+// this fraction rather than letting it go stale.
 func TestRealContractsMutationNeverSilentlyDropsAChange(t *testing.T) {
 	directives := map[string]string{
 		"rest/v1/dtos.schema.json":                     DirectiveBySuffix,
