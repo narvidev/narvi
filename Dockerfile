@@ -18,10 +18,12 @@
 
 # --- Stage 1: build -----------------------------------------------------
 #
-# golang:1.26-bookworm, pinned by tag AND digest (§41.1's own "pin base
-# images by version, preferably digest" instruction) -- must track this
-# repo's own go.mod "go" directive, exactly like deploy/sandbox-image/
-# Dockerfile's own builder stage.
+# golang:1.26-bookworm, pinned by tag AND digest -- this repository's own
+# convention for a build-stage base image (deploy/sandbox-image/
+# Dockerfile's own builder stage does the same, §27.7: "versions pinned
+# and visible via the boot fingerprint's existing image digest"), not
+# anything §41.1 itself states (that section names no pinning rule at
+# all). Must track this repo's own go.mod "go" directive.
 FROM golang:1.26-bookworm@sha256:a688600ca24f8a4d3ca77f95b0dd40704a9fc787c826660eb7ba0b641b8b175d AS build
 
 # `make dist` needs BOTH toolchains in the SAME stage (it runs

@@ -129,9 +129,13 @@ spec:
             # (migrations are embedded via go:embed, applied straight
             # against Postgres), but a sized emptyDir at /tmp is cheap
             # insurance against any stdlib/dependency code path that
-            # expects one to exist (os.TempDir's default), mirroring
-            # Step 166's own "read-only root except sized emptyDirs"
-            # convention for the Kubernetes sandbox provider (§42.1).
+            # expects one to exist (os.TempDir's default). Read-only root
+            # plus a sized emptyDir is the same shape §42.1 specifies for
+            # the Kubernetes sandbox provider's own pod spec -- that
+            # provider has not shipped (no internal/adapters/outbound/
+            # kubernetes exists yet), so this comment cites the plan
+            # section describing the convention, never a Step number that
+            # would read as "already-built code to go look at."
             - name: tmp
               mountPath: /tmp
       volumes:
