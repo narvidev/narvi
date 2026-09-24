@@ -7,8 +7,15 @@
 // all (see __tests__/identityStatus.test.ts).
 import type { Identity } from '@narvi/contracts/rest-dtos'
 
-/** DISPLAYED_PROVIDERS is the mockup's own fixed 3-row order -- Identity.provider's 4th enum value, "google", is never a distinct login the sign-in view offers (§13.1: GitHub primary, generic OIDC secondary), so it is deliberately not a row here. */
-export const DISPLAYED_PROVIDERS = ['github', 'slack', 'linear'] as const satisfies readonly Identity['provider'][]
+/**
+ * DISPLAYED_PROVIDERS is the mockup's own fixed row order, extended by one
+ * (§41.3): "google" is never a distinct login the sign-in view offers and
+ * stays excluded, but "oidc" now is one (§13.1: "GitHub primary, generic
+ * OIDC secondary") -- a signed-in caller's own OIDC identity, if any, is
+ * exactly as real and exactly as worth showing here as their GitHub/Slack/
+ * Linear ones.
+ */
+export const DISPLAYED_PROVIDERS = ['github', 'slack', 'linear', 'oidc'] as const satisfies readonly Identity['provider'][]
 
 export type DisplayedProvider = (typeof DISPLAYED_PROVIDERS)[number]
 

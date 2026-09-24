@@ -17,7 +17,7 @@ function makeIdentity(overrides: Partial<Identity>): Identity {
 }
 
 describe('deriveIdentityStatuses', () => {
-  it('reports all three displayed providers as not connected when identities is empty', () => {
+  it('reports every displayed provider as not connected when identities is empty', () => {
     const statuses = deriveIdentityStatuses([])
     expect(statuses.map((s) => s.provider)).toEqual([...DISPLAYED_PROVIDERS])
     expect(statuses.every((s) => !s.connected)).toBe(true)
@@ -29,6 +29,12 @@ describe('deriveIdentityStatuses', () => {
     expect(github).toEqual({ provider: 'github', connected: true, linkedVia: 'auto_email' })
     const slack = statuses.find((s) => s.provider === 'slack')
     expect(slack).toEqual({ provider: 'slack', connected: false })
+  })
+
+  it('reports a connected oidc identity (§41.3) exactly like any other provider row', () => {
+    const statuses = deriveIdentityStatuses([makeIdentity({ provider: 'oidc', linkedVia: 'admin' })])
+    const oidc = statuses.find((s) => s.provider === 'oidc')
+    expect(oidc).toEqual({ provider: 'oidc', connected: true, linkedVia: 'admin' })
   })
 
   it('never reports a "pending" status -- there is no honest self-view source for one (see this module\'s own doc comment)', () => {
