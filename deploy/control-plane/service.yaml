@@ -1,0 +1,18 @@
+# deploy/control-plane/service.yaml -- see deployment.yaml's own top
+# comment for why this directory holds exactly three plain manifests and
+# no Helm chart.
+apiVersion: v1
+kind: Service
+metadata:
+  name: narvi-control-plane
+  labels:
+    app.kubernetes.io/name: narvi-control-plane
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: narvi-control-plane
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

@@ -32,6 +32,7 @@ var stepRefPins = []stepRefPin{
 	{".github/workflows/ci.yml", "17", "OpenCode adapter"},
 	{".github/workflows/ci.yml", "74", "sandbox substrate: docker, egress policy, toolchain"},
 	{".github/workflows/ci.yml", "80", "ui data layer"},
+	{".github/workflows/ci.yml", "162", "control-plane packaging"},
 	{"deploy/sandbox-image/Dockerfile", "13", "sandbox-agent: supervisor"},
 	{"deploy/sandbox-image/Dockerfile", "74", "sandbox substrate: docker, egress policy, toolchain"},
 	{"deploy/seed/example.yaml", "75", "config/data seeding"},

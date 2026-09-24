@@ -1,0 +1,144 @@
+# deploy/control-plane/deployment.yaml is one of the three plain manifests
+# §41.1 calls for -- no Helm chart, deliberately: platform.Config's own
+# boot-time validation (internal/platform/config.go) is the single
+# configuration surface, and a chart would be a second one with its own
+# defaults, drifting independently of it.
+#
+# Image: this repository's own GHCR path under its GitHub owner (git
+# remote -v), published by .github/workflows/ci.yml's own "publish
+# control-plane image" job on every tag push, labeled with that tag and
+# the git SHA as org.opencontainers.image.version/.revision -- the same
+# two values sandbox-agent's own boot fingerprint logs (§5.3), so a
+# running control plane can be matched to its source. The placeholder tag
+# below is deliberately NOT :latest -- pin an explicit tag or digest
+# before deploying.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: narvi-control-plane
+  labels:
+    app.kubernetes.io/name: narvi-control-plane
+spec:
+  # §5.1: Postgres is the single source of truth for session/sandbox
+  # state, and internal/app/sessionactor's own Actor hydration coordinates
+  # across replicas through a real Postgres advisory lock
+  # (hydrateAndAcquire) plus the session row's own epoch lock at every
+  # write -- this deployment is designed to run more than one replica
+  # from day one, not scaled up later against code that assumed a single
+  # process. 2 is a placeholder floor for availability during a rollout,
+  # not a capacity number -- size it to real traffic.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: narvi-control-plane
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: narvi-control-plane
+    spec:
+      # No ServiceAccount token is mounted: this process talks to
+      # Postgres and the outbound integrations platform.Config wires it
+      # to, never the Kubernetes API itself.
+      automountServiceAccountToken: false
+      securityContext:
+        # Matches the distroless nonroot base image's own default UID/GID
+        # (gcr.io/distroless/static-debian12:nonroot) -- stated explicitly
+        # here rather than left implicit, so this manifest keeps enforcing
+        # it even against a future image built on a different base.
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: narvi-control-plane
+          image: ghcr.io/narvidev/narvi/control-plane:REPLACE_ME_TAG_OR_DIGEST
+          args: ["serve"]
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            # Every key in this Secret is one platform.Config reads --
+            # see secret.yaml's own top comment and
+            # internal/ops/deploysecret_test.go (TestDeploySecretTemplate),
+            # this repository's drift guard between the two.
+            - secretRef:
+                name: narvi-control-plane
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # readinessProbe uses /health (controlplane/health.go): a real
+          # pool.Ping bounded by Timeouts.HealthCheckTimeout, 503 on a DB
+          # failure -- exactly what readiness is for for (take a replica
+          # out of the Service's own endpoint list the moment its own DB
+          # connection is bad, put it back the moment Ping succeeds
+          # again).
+          #
+          # livenessProbe deliberately does NOT reuse /health (§41.1
+          # review round 1, finding P8): liveness exists to catch a wedged
+          # PROCESS, never an unavailable DEPENDENCY -- wiring it to the
+          # same DB-backed endpoint means a Postgres outage past
+          # roughly failureThreshold*periodSeconds (45s here) gets EVERY
+          # replica SIGKILLed at once (dropping in-flight SSE/WebSocket
+          # streams), and the restart then fails at boot-time migrations
+          # (controlplane/serve.go's own applyMigrations call) while the
+          # DB is still down, pushing every replica into CrashLoopBackOff
+          # instead of simply going unready and recovering the moment
+          # Ping succeeds again. This binary exposes no other lightweight,
+          # DB-independent HTTP endpoint today (only /health and the
+          # DB/auth-backed /api/*, /.well-known/* routes exist), and
+          # adding one JUST for this would change controlplane/testdata/
+          # routes.golden for a probe's sake alone -- a plain tcpSocket
+          # check on the serving port is the least-surprising
+          # process-liveness signal available without doing that: it
+          # fails only when the listener itself is gone (a wedged/dead
+          # process), never on a DB blip.
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # Placeholders -- size to real traffic. The binary itself holds
+          # no large in-memory state by design (§5.1: Postgres is the
+          # source of truth), so these are a starting floor, not a
+          # measurement.
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+          volumeMounts:
+            # readOnlyRootFilesystem above leaves no writable path at all
+            # -- this binary writes nothing to disk in normal operation
+            # (migrations are embedded via go:embed, applied straight
+            # against Postgres), but a sized emptyDir at /tmp is cheap
+            # insurance against any stdlib/dependency code path that
+            # expects one to exist (os.TempDir's default). Read-only root
+            # plus a sized emptyDir is the same shape §42.1 specifies for
+            # the Kubernetes sandbox provider's own pod spec -- that
+            # provider has not shipped (no internal/adapters/outbound/
+            # kubernetes exists yet), so this comment cites the plan
+            # section describing the convention, never a Step number that
+            # would read as "already-built code to go look at."
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
