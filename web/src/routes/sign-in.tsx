@@ -146,7 +146,7 @@ function SignInView() {
         {meQuery.isSuccess && (
           <>
             <SignedInGreeting member={meQuery.data} />
-            <IdentityStatusPanel member={meQuery.data} />
+            <IdentityStatusPanel member={meQuery.data} oidcConfigured={oidcConfigured} />
             <button
               type="button"
               className="ghbtn"
