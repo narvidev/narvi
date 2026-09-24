@@ -269,19 +269,44 @@ func resolveFirstTimeIdentity(
 //     helpers above read "a user's github identity"; OIDC sign-in only
 //     ever looks its own (provider, external_id) up directly, never by
 //     (user, provider) alone), so only a SAME-issuer conflict is refused
-//     here.
+//     here -- checked against EVERY oidc row matchedUserID has (review
+//     round 3, finding Q3), not just one: a user migrated from an earlier
+//     issuer legitimately carries more than one oidc row, by this same
+//     rule's own design, and identities.GetByUserAndProvider (a ":one"
+//     query, no ORDER BY) returns whichever row Postgres happens to scan
+//     first -- often the OLDEST, stale-issuer one -- which let a second
+//     SAME-issuer sub slip through merged instead of refused whenever a
+//     user already had an earlier issuer's row on file.
 func identityConflictsWithExistingProvider(ctx context.Context, identities *postgres.IdentityStore, matchedUserID pgtype.UUID, provider sqlcgen.IdentityProvider, externalID string) (bool, error) {
-	existing, err := identities.GetByUserAndProvider(ctx, matchedUserID, provider)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return false, nil
-		}
-		return false, fmt.Errorf("get existing identity for same-provider conflict check: %w", err)
-	}
 	if provider != sqlcgen.IdentityProviderOidc {
+		_, err := identities.GetByUserAndProvider(ctx, matchedUserID, provider)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return false, nil
+			}
+			return false, fmt.Errorf("get existing identity for same-provider conflict check: %w", err)
+		}
 		return true, nil
 	}
-	return oidcIssuerPrefix(existing.ExternalID) == oidcIssuerPrefix(externalID), nil
+
+	// OIDC: refuse only when SOME existing oidc row shares externalID's
+	// own issuer prefix -- never just the first row a ":one" lookup
+	// happens to return. ListForUser is oldest-first but that order is
+	// irrelevant here: every row is checked, not just the first.
+	rows, err := identities.ListForUser(ctx, matchedUserID)
+	if err != nil {
+		return false, fmt.Errorf("list existing identities for same-provider conflict check: %w", err)
+	}
+	newIssuer := oidcIssuerPrefix(externalID)
+	for _, row := range rows {
+		if row.Provider != sqlcgen.IdentityProviderOidc {
+			continue
+		}
+		if oidcIssuerPrefix(row.ExternalID) == newIssuer {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // oidcIssuerPrefix extracts the "{issuer}" half of an OIDC identity's own

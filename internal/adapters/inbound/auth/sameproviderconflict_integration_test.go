@@ -16,6 +16,8 @@ import (
 	"context"
 	"net/http"
 	"testing"
+
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 )
 
 // TestCallback_SameProviderConflict_Refused proves the GitHub-side half:
@@ -143,6 +145,116 @@ func TestOIDCCallback_SameProviderConflict_Refused(t *testing.T) {
 	}
 
 	wantExternalIDB := rig.provider.issuer() + "|oidc-subject-conflict-b"
+	rows := getAuditLogRowsForResource(context.Background(), t, rig.pool, "identity", wantExternalIDB)
+	if len(rows) != 1 {
+		t.Fatalf("audit_log rows for the same-provider-conflict refusal = %d, want 1", len(rows))
+	}
+	if rows[0].Action != "identity.oidc_already_linked" {
+		t.Errorf("audit_log action = %q, want %q", rows[0].Action, "identity.oidc_already_linked")
+	}
+}
+
+// TestOIDCCallback_SameIssuerConflict_RefusedEvenWithEarlierIssuerIdentity
+// proves review round 3's own finding Q3: identityConflictsWithExistingProvider
+// (firsttimeidentity.go) used to compare a new OIDC sign-in's issuer
+// against only ONE existing row (identities.GetByUserAndProvider, a ":one"
+// query with no ORDER BY) -- for a user who already carries an identity
+// from an EARLIER issuer (a legitimate, allowed case: see this test's own
+// first phase below), that one row was often the stale, old-issuer one,
+// so the same-issuer comparison never matched and a second SAME-issuer sub
+// was merged instead of refused. The fix checks every one of the user's
+// oidc rows.
+//
+// Two phases, both against the SAME existing user:
+//
+//  1. A sign-in through the CURRENT (different) issuer merges onto the
+//     user despite their pre-existing OLD-issuer identity -- a genuinely
+//     different issuer is a different provider instance and may still be
+//     linked (identityConflictsWithExistingProvider's own doc comment).
+//  2. A SECOND sign-in through that SAME current issuer, a different sub,
+//     the same verified email -- must be refused (403), never merged, even
+//     though the stale old-issuer row is still on file too.
+func TestOIDCCallback_SameIssuerConflict_RefusedEvenWithEarlierIssuerIdentity(t *testing.T) {
+	rig := newOIDCTestRig(t, defaultOIDCRiggedOptions())
+	ctx := context.Background()
+
+	const sharedEmail = "migrated@example.com"
+
+	existingUser, err := rig.users.Create(ctx, sqlcgen.CreateUserParams{
+		PrimaryEmail: sharedEmail,
+		DisplayName:  "Migrated Person",
+		Role:         sqlcgen.UserRoleMember,
+	})
+	if err != nil {
+		t.Fatalf("create existing user: %v", err)
+	}
+
+	oldExternalID := "https://old-issuer.example|old-sub"
+	oldIdentityEmail := sharedEmail
+	if _, err := rig.identities.Create(ctx, sqlcgen.CreateIdentityParams{
+		UserID:        existingUser.ID,
+		Provider:      sqlcgen.IdentityProviderOidc,
+		ExternalID:    oldExternalID,
+		Email:         &oldIdentityEmail,
+		EmailVerified: true,
+		LinkedVia:     sqlcgen.IdentityLinkedViaAutoEmail,
+	}); err != nil {
+		t.Fatalf("seed old-issuer identity: %v", err)
+	}
+
+	// Phase 1: a DIFFERENT issuer (this rig's own current one) merges onto
+	// the existing user -- allowed, by design.
+	clientA := newClient(t)
+	stateA, nonceA := doOIDCLogin(t, clientA, rig.server.URL)
+	claimsA := rig.provider.defaultClaims("oidc-subject-migrated-a")
+	claimsA["email"] = sharedEmail
+	claimsA["email_verified"] = true
+	claimsA["nonce"] = nonceA
+	rig.provider.setNextIDToken(rig.provider.signIDToken(t, claimsA))
+	respA := doOIDCCallback(t, clientA, rig.server.URL, stateA, "migrated-code-a")
+	defer func() { _ = respA.Body.Close() }()
+	if respA.StatusCode != http.StatusFound {
+		t.Fatalf("first (different-issuer) sign-in status = %d, want %d (a different issuer may legitimately coexist)", respA.StatusCode, http.StatusFound)
+	}
+
+	wantExternalIDA := rig.provider.issuer() + "|oidc-subject-migrated-a"
+	identityA, err := rig.identities.GetByProviderAndExternalID(ctx, sqlcgen.IdentityProviderOidc, wantExternalIDA)
+	if err != nil {
+		t.Fatalf("GetByProviderAndExternalID (a): %v", err)
+	}
+	if identityA.UserID != existingUser.ID {
+		t.Errorf("identityA.UserID = %v, want %v (merged onto the existing user)", identityA.UserID, existingUser.ID)
+	}
+
+	// Phase 2: a SECOND sign-in through the SAME current issuer, a
+	// different sub, the same email -- must be refused, never merged, even
+	// though the OLD-issuer row from before phase 1 is still on file.
+	clientB := newClient(t)
+	stateB, nonceB := doOIDCLogin(t, clientB, rig.server.URL)
+	claimsB := rig.provider.defaultClaims("oidc-subject-migrated-b")
+	claimsB["email"] = sharedEmail
+	claimsB["email_verified"] = true
+	claimsB["nonce"] = nonceB
+	rig.provider.setNextIDToken(rig.provider.signIDToken(t, claimsB))
+	respB := doOIDCCallback(t, clientB, rig.server.URL, stateB, "migrated-code-b")
+	defer func() { _ = respB.Body.Close() }()
+	if respB.StatusCode != http.StatusForbidden {
+		t.Errorf("second (same-issuer) sign-in status = %d, want %d (never attach a second same-issuer identity, even with an earlier-issuer row present)", respB.StatusCode, http.StatusForbidden)
+	}
+
+	wantExternalIDB := rig.provider.issuer() + "|oidc-subject-migrated-b"
+	if _, err := rig.identities.GetByProviderAndExternalID(ctx, sqlcgen.IdentityProviderOidc, wantExternalIDB); !errorsIsNoRows(err) {
+		t.Errorf("an identities row was created for the refused same-issuer sign-in (err=%v) -- want none", err)
+	}
+
+	identities, err := rig.identities.ListForUser(ctx, existingUser.ID)
+	if err != nil {
+		t.Fatalf("list identities for existingUser: %v", err)
+	}
+	if len(identities) != 2 {
+		t.Fatalf("identities for existingUser = %d, want 2 (the seeded old-issuer row + phase 1's merged current-issuer row only)", len(identities))
+	}
+
 	rows := getAuditLogRowsForResource(context.Background(), t, rig.pool, "identity", wantExternalIDB)
 	if len(rows) != 1 {
 		t.Fatalf("audit_log rows for the same-provider-conflict refusal = %d, want 1", len(rows))
