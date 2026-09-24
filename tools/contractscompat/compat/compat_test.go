@@ -2,6 +2,7 @@ package compat
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 )
 
@@ -495,14 +496,18 @@ var corpus = []corpusCase{
 		fixed:    &wantFinding{"35", SeverityPatch},
 	},
 	{
-		name:    "row35 goJSONSchema codegen hint changed (keyword coverage)",
-		ruleID:  "35",
+		name:    "row45 goJSONSchema codegen hint changed (keyword coverage, C19)",
+		ruleID:  "45",
 		defName: "Value",
 		baseDefs: defsOf("Value", schemaObj("type", "string", "format", "date-time",
 			"goJSONSchema", schemaObj("type", "time.Time", "imports", []any{"time"}))),
 		headDefs: defsOf("Value", schemaObj("type", "string", "format", "date-time",
 			"goJSONSchema", schemaObj("type", "*time.Time", "imports", []any{"time"}))),
-		fixed: &wantFinding{"35", SeverityPatch},
+		// C19: a goJSONSchema change is scored MAJOR in both columns, not
+		// PATCH -- it changes what the generated Go decoder accepts,
+		// which matters on the C2P column (the platform is that
+		// decoder's own consumer).
+		fixed: &wantFinding{"45", SeverityMajor},
 	},
 	{
 		name:     "row39 items presence toggled",
@@ -511,6 +516,51 @@ var corpus = []corpusCase{
 		baseDefs: defsOf("List", schemaObj("type", "array")),
 		headDefs: defsOf("List", schemaObj("type", "array", "items", schemaObj("type", "string"))),
 		fixed:    &wantFinding{"39", SeverityMajor},
+	},
+	{
+		// C13: additionalProperties schema -> permissive (true/absent) is
+		// its own row, distinct from row 23's false -> anything "unlock".
+		name:    "row42 additionalProperties schema loosened to permissive",
+		ruleID:  "42",
+		defName: "Widget",
+		baseDefs: defsOf("Widget", schemaObj(
+			"type", "object", "additionalProperties", schemaObj("type", "string"),
+		)),
+		headDefs: defsOf("Widget", schemaObj(
+			"type", "object", "additionalProperties", true,
+		)),
+		p2cWant: &wantFinding{"42", SeverityMajor},
+		c2pWant: &wantFinding{"42", SeverityMinor},
+	},
+	{
+		// C15: introducing oneOf/anyOf where the keyword did not exist at
+		// all before is a presence change, MAJOR in both columns -- not
+		// the generic row-28 "variant added" MINOR bucket.
+		name:     "row43 oneOf keyword presence changed (introduced)",
+		ruleID:   "43",
+		defName:  "Envelope",
+		baseDefs: defsOf("Envelope", schemaObj("description", "x")),
+		headDefs: defsOf("Envelope", schemaObj("description", "x", "oneOf", []any{schemaObj("type", "string")})),
+		fixed:    &wantFinding{"43", SeverityMajor},
+	},
+	{
+		// C3: a newly added anyOf member that is exactly {"type": "null"}
+		// is nullability introduced via a union, not a generic "variant
+		// added" -- it must be scored like row 9 (null added to type), by
+		// direction, not the flat MINOR/MINOR row 28.
+		name:    "row9 nullable-via-anyOf member added (C3)",
+		ruleID:  "9",
+		defName: "Wrapper",
+		baseDefs: map[string]any{
+			"Wrapper": schemaObj("anyOf", []any{schemaObj("$ref", "#/$defs/A")}),
+			"A":       schemaObj("type", "string"),
+		},
+		headDefs: map[string]any{
+			"Wrapper": schemaObj("anyOf", []any{schemaObj("$ref", "#/$defs/A"), schemaObj("type", "null")}),
+			"A":       schemaObj("type", "string"),
+		},
+		p2cWant: &wantFinding{"9", SeverityMajor},
+		c2pWant: &wantFinding{"9", SeverityMinor},
 	},
 }
 
@@ -551,7 +601,19 @@ func containsFinding(findings []Finding, ruleID string, sev Severity) bool {
 
 // --- rules that need a whole-surface, whole-manifest, or routes.golden
 // comparison rather than a single def pair: 31, 32, 34, 36 (DiffSurface),
-// 37, 38 (DiffSurfaceSet), 40, 41 (DiffRoutes). ---
+// 37, 38, 44 (DiffSurfaceSet/Compare), 40, 41 (DiffRoutes). ---
+//
+// wholeSurfaceCorpus is deliberately a DATA TABLE, run through the real
+// entry points by BOTH TestWholeSurfaceCorpus (the per-case assertion,
+// below) AND TestCorpusCoverage (meta_test.go's guard-7 coverage check).
+// The two tests share this table rather than TestCorpusCoverage hard-
+// coding which rule ids it considers "covered" (C17: a hard-coded
+// record() call cannot notice its own fixture rotting or being deleted --
+// a mutant that disables TestWholeSurfaceCorpus, or one of its individual
+// t.Run cases, does not touch this table, so TestCorpusCoverage keeps
+// running the SAME producer function fresh and keeps failing/passing on
+// what it actually returns, independent of whatever happened to the other
+// test).
 
 func minimalFile(id string, defs map[string]any) map[string]any {
 	return schemaObj(
@@ -572,86 +634,177 @@ func mustMarshalFile(t *testing.T, doc map[string]any) []byte {
 	return data
 }
 
-func TestRow31DefRemoved(t *testing.T) {
-	base := mustMarshalFile(t, minimalFile("https://narvi.dev/t/v1/x.schema.json", defsOf("Widget", schemaObj("type", "string"))))
-	head := mustMarshalFile(t, minimalFile("https://narvi.dev/t/v1/x.schema.json", map[string]any{}))
-	findings, err := DiffSurface(DirectiveBySuffix, base, head, nil)
+// mustMarshal is mustMarshalFile without a *testing.T, for use inside
+// wholeSurfaceCorpus producer functions that TestCorpusCoverage also
+// calls directly (outside of any t.Run) -- every input here is
+// hand-written valid JSON-able data, so a marshal error would be a bug in
+// this test file itself, worth a hard panic rather than a swallowed
+// error.
+func mustMarshal(doc any) []byte {
+	data, err := json.Marshal(doc)
 	if err != nil {
-		t.Fatalf("DiffSurface: %v", err)
+		panic(fmt.Sprintf("mustMarshal: %v", err))
 	}
-	if !containsFinding(findings, "31", SeverityMajor) {
-		t.Fatalf("want rule 31 MAJOR, got %v", findings)
+	return data
+}
+
+// wholeSurfaceProducer runs one whole-surface/whole-manifest/routes
+// scenario against the real entry point and returns whatever Findings it
+// produced (or an error, for the handful of guard-level fail-closed
+// cases). keywordsUsed lists the allowlisted keywords this fixture's own
+// JSON literally contains, at the fixture-construction level, so
+// TestCorpusCoverage's keyword-coverage half can be derived from the same
+// data instead of a second hard-coded list.
+type wholeSurfaceCase struct {
+	name         string
+	ruleID       string
+	severity     Severity
+	keywordsUsed []string
+	run          func() ([]Finding, error)
+}
+
+var wholeSurfaceCorpus = []wholeSurfaceCase{
+	{
+		name:         "row31 defs entry removed",
+		ruleID:       "31",
+		severity:     SeverityMajor,
+		keywordsUsed: []string{"$schema", "$id", "title", "description", "$defs", "type"},
+		run: func() ([]Finding, error) {
+			base := mustMarshal(minimalFile("https://narvi.dev/t/v1/x.schema.json", defsOf("Widget", schemaObj("type", "string"))))
+			head := mustMarshal(minimalFile("https://narvi.dev/t/v1/x.schema.json", map[string]any{}))
+			return DiffSurface(DirectiveBySuffix, base, head, nil)
+		},
+	},
+	{
+		name:         "row32 defs entry added",
+		ruleID:       "32",
+		severity:     SeverityMinor,
+		keywordsUsed: []string{"$schema", "$id", "title", "description", "$defs", "type"},
+		run: func() ([]Finding, error) {
+			base := mustMarshal(minimalFile("https://narvi.dev/t/v1/x.schema.json", map[string]any{}))
+			head := mustMarshal(minimalFile("https://narvi.dev/t/v1/x.schema.json", defsOf("Widget", schemaObj("type", "string"))))
+			return DiffSurface(DirectiveBySuffix, base, head, nil)
+		},
+	},
+	{
+		name:         "row34 root $id changed",
+		ruleID:       "34",
+		severity:     SeverityMajor,
+		keywordsUsed: []string{"$schema", "$id", "title", "description", "$defs", "type"},
+		run: func() ([]Finding, error) {
+			base := mustMarshal(minimalFile("https://narvi.dev/t/v1/x.schema.json", defsOf("Widget", schemaObj("type", "string"))))
+			head := mustMarshal(minimalFile("https://narvi.dev/t/v1/y.schema.json", defsOf("Widget", schemaObj("type", "string"))))
+			return DiffSurface(DirectiveBySuffix, base, head, nil)
+		},
+	},
+	{
+		name:         "row36 root $schema changed",
+		ruleID:       "36",
+		severity:     SeverityFailClosed,
+		keywordsUsed: []string{"$schema", "$id", "title", "description", "$defs", "type"},
+		run: func() ([]Finding, error) {
+			baseDoc := minimalFile("https://narvi.dev/t/v1/x.schema.json", defsOf("Widget", schemaObj("type", "string")))
+			headDoc := minimalFile("https://narvi.dev/t/v1/x.schema.json", defsOf("Widget", schemaObj("type", "string")))
+			headDoc["$schema"] = "https://json-schema.org/draft/2019-09/schema"
+			return DiffSurface(DirectiveBySuffix, mustMarshal(baseDoc), mustMarshal(headDoc), nil)
+		},
+	},
+	{
+		name:     "row37 schema file removed, not retired",
+		ruleID:   "37",
+		severity: SeverityMajor,
+		run: func() ([]Finding, error) {
+			base := Manifest{Surfaces: []ManifestSurface{{Path: "a.schema.json", Direction: DirectiveBySuffix, Status: StatusCurrent}}}
+			return DiffSurfaceSet(base, Manifest{}), nil
+		},
+	},
+	{
+		name:     "row38 schema file added",
+		ruleID:   "38",
+		severity: SeverityMinor,
+		run: func() ([]Finding, error) {
+			head := Manifest{Surfaces: []ManifestSurface{{Path: "b.schema.json", Direction: DirectiveBySuffix, Status: StatusCurrent}}}
+			return DiffSurfaceSet(Manifest{}, head), nil
+		},
+	},
+	{
+		name:     "row40 route removed",
+		ruleID:   "40",
+		severity: SeverityMajor,
+		run: func() ([]Finding, error) {
+			base := []byte("GET /api/sessions/{sessionID}/plans\nGET /api/sessions\n")
+			head := []byte("GET /api/sessions\n")
+			return DiffRoutes(base, head), nil
+		},
+	},
+	{
+		name:     "row41 route added",
+		ruleID:   "41",
+		severity: SeverityMinor,
+		run: func() ([]Finding, error) {
+			base := []byte("GET /api/sessions\n")
+			head := []byte("GET /api/sessions\nGET /api/sessions/{sessionID}/new-plans\n")
+			return DiffRoutes(base, head), nil
+		},
+	},
+	{
+		// C1: a surface's direction flipping between base and head is its
+		// own dedicated MAJOR finding (rule 44), exercised through the
+		// full Compare() pipeline since that is where base-vs-head
+		// manifest rows are actually compared.
+		name:     "row44 manifest direction changed",
+		ruleID:   "44",
+		severity: SeverityMajor,
+		run: func() ([]Finding, error) {
+			schemaFile := "t/v1/x.schema.json"
+			doc := mustMarshal(minimalFile("https://narvi.dev/t/v1/x.schema.json", defsOf("Widget", schemaObj("type", "string"))))
+			baseManifest := mustMarshal(map[string]any{
+				"version":  "1.0.0",
+				"surfaces": []any{map[string]any{"path": schemaFile, "direction": DirectiveBySuffix, "status": StatusCurrent}},
+			})
+			headManifest := mustMarshal(map[string]any{
+				"version":  "1.0.0",
+				"surfaces": []any{map[string]any{"path": schemaFile, "direction": string(DirP2C), "status": StatusCurrent}},
+			})
+			report, err := Compare(Input{
+				BaseManifestRaw:  baseManifest,
+				HeadManifestRaw:  headManifest,
+				BaseVersion:      "1.0.0",
+				HeadVersion:      "1.0.1",
+				BaseChangelogRaw: []byte("## [1.0.0]\n"),
+				HeadChangelogRaw: []byte("## [1.0.1]\n### " + schemaFile + "\n- direction flip\n\n## [1.0.0]\n"),
+				BaseRoutes:       []byte(""),
+				HeadRoutes:       []byte(""),
+				BaseSchemaFiles:  map[string][]byte{schemaFile: doc},
+				HeadSchemaFiles:  map[string][]byte{schemaFile: doc},
+			})
+			return report.Findings, err
+		},
+	},
+}
+
+func TestWholeSurfaceCorpus(t *testing.T) {
+	for _, tc := range wholeSurfaceCorpus {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			findings, err := tc.run()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !containsFinding(findings, tc.ruleID, tc.severity) {
+				t.Fatalf("want rule %s severity %s, got %v", tc.ruleID, tc.severity, findings)
+			}
+		})
 	}
 }
 
-func TestRow32DefAdded(t *testing.T) {
-	base := mustMarshalFile(t, minimalFile("https://narvi.dev/t/v1/x.schema.json", map[string]any{}))
-	head := mustMarshalFile(t, minimalFile("https://narvi.dev/t/v1/x.schema.json", defsOf("Widget", schemaObj("type", "string"))))
-	findings, err := DiffSurface(DirectiveBySuffix, base, head, nil)
-	if err != nil {
-		t.Fatalf("DiffSurface: %v", err)
-	}
-	if !containsFinding(findings, "32", SeverityMinor) {
-		t.Fatalf("want rule 32 MINOR, got %v", findings)
-	}
-}
-
-func TestRow34RootIDChanged(t *testing.T) {
-	base := mustMarshalFile(t, minimalFile("https://narvi.dev/t/v1/x.schema.json", defsOf("Widget", schemaObj("type", "string"))))
-	head := mustMarshalFile(t, minimalFile("https://narvi.dev/t/v1/y.schema.json", defsOf("Widget", schemaObj("type", "string"))))
-	findings, err := DiffSurface(DirectiveBySuffix, base, head, nil)
-	if err != nil {
-		t.Fatalf("DiffSurface: %v", err)
-	}
-	if !containsFinding(findings, "34", SeverityMajor) {
-		t.Fatalf("want rule 34 MAJOR, got %v", findings)
-	}
-}
-
-func TestRow36SchemaDialectChanged(t *testing.T) {
-	baseDoc := minimalFile("https://narvi.dev/t/v1/x.schema.json", defsOf("Widget", schemaObj("type", "string")))
-	headDoc := minimalFile("https://narvi.dev/t/v1/x.schema.json", defsOf("Widget", schemaObj("type", "string")))
-	headDoc["$schema"] = "https://json-schema.org/draft/2019-09/schema"
-	base := mustMarshalFile(t, baseDoc)
-	head := mustMarshalFile(t, headDoc)
-	findings, err := DiffSurface(DirectiveBySuffix, base, head, nil)
-	if err != nil {
-		t.Fatalf("DiffSurface: %v", err)
-	}
-	if !containsFinding(findings, "36", SeverityFailClosed) {
-		t.Fatalf("want rule 36 FAIL-CLOSED, got %v", findings)
-	}
-}
-
-func TestRow37And38SurfaceSet(t *testing.T) {
-	baseManifest := Manifest{Surfaces: []ManifestSurface{{Path: "a.schema.json", Direction: DirectiveBySuffix, Status: StatusCurrent}}}
-	headManifestRemoved := Manifest{}
-	findings := DiffSurfaceSet(baseManifest, headManifestRemoved)
-	if !containsFinding(findings, "37", SeverityMajor) {
-		t.Fatalf("want rule 37 MAJOR for un-retired removal, got %v", findings)
-	}
-
+// TestRow37RetiredRemovalIsNotBreaking and TestOpenNewSurfaceHasNoManifestRowError
+// pin the negative/error-path behavior around row 37/38's own guard rails
+// that wholeSurfaceCorpus's straight-line cases above don't exercise.
+func TestRow37RetiredRemovalIsNotBreaking(t *testing.T) {
 	retiredBase := Manifest{Surfaces: []ManifestSurface{{Path: "a.schema.json", Direction: DirectiveBySuffix, Status: StatusRetired}}}
-	findingsRetired := DiffSurfaceSet(retiredBase, headManifestRemoved)
-	if containsFinding(findingsRetired, "37", SeverityMajor) {
-		t.Fatalf("removing a retired surface must not raise rule 37, got %v", findingsRetired)
-	}
-
-	headAdded := Manifest{Surfaces: []ManifestSurface{{Path: "b.schema.json", Direction: DirectiveBySuffix, Status: StatusCurrent}}}
-	findingsAdded := DiffSurfaceSet(Manifest{}, headAdded)
-	if !containsFinding(findingsAdded, "38", SeverityMinor) {
-		t.Fatalf("want rule 38 MINOR for a new surface, got %v", findingsAdded)
-	}
-}
-
-func TestRow40And41Routes(t *testing.T) {
-	base := []byte("GET /api/sessions/{sessionID}/plans\nGET /api/sessions\n")
-	head := []byte("GET /api/sessions\nGET /api/sessions/{sessionID}/new-plans\n")
-	findings := DiffRoutes(base, head)
-	if !containsFinding(findings, "40", SeverityMajor) {
-		t.Fatalf("want rule 40 MAJOR for removed route, got %v", findings)
-	}
-	if !containsFinding(findings, "41", SeverityMinor) {
-		t.Fatalf("want rule 41 MINOR for added route, got %v", findings)
+	findings := DiffSurfaceSet(retiredBase, Manifest{})
+	if containsFinding(findings, "37", SeverityMajor) {
+		t.Fatalf("removing a retired surface must not raise rule 37, got %v", findings)
 	}
 }

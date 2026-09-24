@@ -134,6 +134,20 @@ func TestSmokeRealContractsWithPropertyDeleted(t *testing.T) {
 		t.Fatal("real $defs.Session.properties has no \"id\" -- fixture assumption changed, update this test")
 	}
 	delete(props, "id")
+	// Also drop it from "required": otherwise this mutation trips the
+	// fc-required-orphan fail-closed guard (a required name with no
+	// matching properties entry, C4/C9's fix) instead of exercising row
+	// 1 in isolation -- a real PR deleting a property normally removes it
+	// from required in the same diff too.
+	if req, ok := session["required"].([]any); ok {
+		filtered := req[:0]
+		for _, r := range req {
+			if r != "id" {
+				filtered = append(filtered, r)
+			}
+		}
+		session["required"] = filtered
+	}
 
 	mutated, err := json.Marshal(doc)
 	if err != nil {
