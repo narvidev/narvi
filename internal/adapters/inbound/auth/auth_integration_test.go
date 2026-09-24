@@ -914,6 +914,87 @@ func TestCallback_NoVerifiedPrimaryEmail(t *testing.T) {
 	}
 }
 
+// TestCallback_AmbiguousMatch_Refused proves the GitHub-side half of
+// review round 2's own finding P6: cae3c81 gave the GitHub callback its
+// own §13.2 "never guess" ambiguous-match branch (shared with the OIDC
+// callback via resolveFirstTimeIdentity), but no test drove it -- only
+// TestOIDCCallback_AmbiguousMatch_Refused (oidc_integration_test.go)
+// covered the OIDC variant. Mirrors that test exactly, one provider over:
+// two existing users each already have their OWN verified identity
+// sharing the SAME email (via Slack, so this test proves the merge logic
+// itself, not merely a users.primary_email collision) -- a first-time
+// GitHub sign-in reporting that same verified email must be refused,
+// never guessed, and audited under auditActionGitHubAmbiguousMatch.
+func TestCallback_AmbiguousMatch_Refused(t *testing.T) {
+	rig := newTestRig(t, defaultRiggedOptions())
+	ctx := context.Background()
+
+	userA, err := rig.users.Create(ctx, sqlcgen.CreateUserParams{
+		PrimaryEmail: "gh-ambiguous-person-a@example.com",
+		DisplayName:  "GH Ambiguous Person A",
+		Role:         sqlcgen.UserRoleMember,
+	})
+	if err != nil {
+		t.Fatalf("create userA: %v", err)
+	}
+	userB, err := rig.users.Create(ctx, sqlcgen.CreateUserParams{
+		PrimaryEmail: "gh-ambiguous-person-b@example.com",
+		DisplayName:  "GH Ambiguous Person B",
+		Role:         sqlcgen.UserRoleMember,
+	})
+	if err != nil {
+		t.Fatalf("create userB: %v", err)
+	}
+	ambiguousEmail := "gh-ambiguous@example.com"
+	if _, err := rig.identities.Create(ctx, sqlcgen.CreateIdentityParams{
+		UserID:        userA.ID,
+		Provider:      sqlcgen.IdentityProviderSlack,
+		ExternalID:    "gh-ambiguous-slack-a",
+		Email:         &ambiguousEmail,
+		EmailVerified: true,
+		LinkedVia:     sqlcgen.IdentityLinkedViaAutoEmail,
+	}); err != nil {
+		t.Fatalf("create identity for userA: %v", err)
+	}
+	if _, err := rig.identities.Create(ctx, sqlcgen.CreateIdentityParams{
+		UserID:        userB.ID,
+		Provider:      sqlcgen.IdentityProviderSlack,
+		ExternalID:    "gh-ambiguous-slack-b",
+		Email:         &ambiguousEmail,
+		EmailVerified: true,
+		LinkedVia:     sqlcgen.IdentityLinkedViaAutoEmail,
+	}); err != nil {
+		t.Fatalf("create identity for userB: %v", err)
+	}
+
+	rig.github.setEmails([]map[string]any{
+		{"email": ambiguousEmail, "primary": true, "verified": true},
+	})
+
+	client := newClient(t)
+	state := doLogin(t, client, rig.server.URL)
+	resp := doCallback(t, client, rig.server.URL, state, "gh-ambiguous-code")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d, want %d (never guess between two matching users)", resp.StatusCode, http.StatusForbidden)
+	}
+
+	// The fake GitHub API's own default userID (555000111, set by
+	// newFakeGitHubAPI) is this sign-in's own external_id.
+	if _, err := rig.identities.GetByProviderAndExternalID(ctx, sqlcgen.IdentityProviderGithub, "555000111"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("GetByProviderAndExternalID error = %v, want pgx.ErrNoRows (no identity should have been created for the ambiguous sign-in)", err)
+	}
+
+	rows := getAuditLogRowsForResource(context.Background(), t, rig.pool, "identity", "555000111")
+	if len(rows) != 1 {
+		t.Fatalf("audit_log rows for the ambiguous refusal = %d, want 1", len(rows))
+	}
+	if rows[0].Action != "identity.github_ambiguous_match" {
+		t.Errorf("audit_log action = %q, want %q", rows[0].Action, "identity.github_ambiguous_match")
+	}
+}
+
 // --- (d) allowlist rejection/acceptance via each of the 3 mechanisms ---
 
 func TestCallback_Allowlist_EmailExactMatch(t *testing.T) {
