@@ -9,6 +9,14 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.1.0]
+
+### rest/v1/dtos.schema.json
+
+#### Changed
+
+- `Identity.provider` and `PendingLinkPrompt.provider` are now open enums (listed in `manifest.json`'s `openEnums`). Consumers MUST tolerate a provider value they do not recognise on these two fields. No value is added in this release; a following release adds `oidc` (second sign-in provider, technical plan §41.3).
+
 ## [1.0.0]
 
 Baseline: `/contracts` becomes a versioned, policy-governed external API
