@@ -576,6 +576,46 @@ var corpus = []corpusCase{
 		p2cWant: &wantFinding{"9", SeverityMajor},
 		c2pWant: &wantFinding{"9", SeverityMinor},
 	},
+	{
+		// E5 (round 3): the mirror image of "row9 nullable-via-anyOf
+		// member added (C3)" above -- before this case, diffUnion's row
+		// 10 branch (a {"type":"null"} member REMOVED from an existing
+		// union) had no corpus pin at all, and a mutant that replaced
+		// its finding-append with a no-op survived the entire suite
+		// (verified by hand: applying that exact mutant made THIS case
+		// fail with "want rule 10 severity MINOR, got []", confirming it
+		// now kills the mutant; PR body's "Review round 3" section has
+		// the full mutation-verification record).
+		name:    "row10 nullable-via-anyOf member removed (C3)",
+		ruleID:  "10",
+		defName: "Wrapper",
+		baseDefs: map[string]any{
+			"Wrapper": schemaObj("anyOf", []any{schemaObj("$ref", "#/$defs/A"), schemaObj("type", "null")}),
+			"A":       schemaObj("type", "string"),
+		},
+		headDefs: map[string]any{
+			"Wrapper": schemaObj("anyOf", []any{schemaObj("$ref", "#/$defs/A")}),
+			"A":       schemaObj("type", "string"),
+		},
+		p2cWant: &wantFinding{"10", SeverityMinor},
+		c2pWant: &wantFinding{"10", SeverityMajor},
+	},
+	{
+		// E5 (round 3): a bare boolean schema literal (true/false, e.g.
+		// as an `items` value) changing had no corpus pin at all, and a
+		// mutant that replaced diffNode's own boolean-literal comparison
+		// branch with a no-op survived the entire suite (verified by
+		// hand: applying that exact mutant made THIS case fail with
+		// "want rule 6 severity MAJOR, got []", confirming it now kills
+		// the mutant; PR body's "Review round 3" section has the full
+		// mutation-verification record).
+		name:     "row6 boolean schema literal changed (items)",
+		ruleID:   "6",
+		defName:  "Widget",
+		baseDefs: defsOf("Widget", schemaObj("type", "array", "items", true)),
+		headDefs: defsOf("Widget", schemaObj("type", "array", "items", false)),
+		fixed:    &wantFinding{"6", SeverityMajor},
+	},
 }
 
 func TestCorpus(t *testing.T) {

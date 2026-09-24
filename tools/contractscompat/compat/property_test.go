@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 )
 
@@ -50,11 +51,31 @@ type schemaPos struct {
 	node map[string]any
 }
 
+// sortedMapKeys returns m's keys (of a map[string]any -- $defs or
+// properties) in sorted order. E4: Go deliberately randomizes plain
+// `range` order over a map on every process run; collectSchemaPositions
+// and mutateSchemaTree's keyword-removal branch (below) both choose a
+// position/keyword by rng-indexing into a slice built by ranging over
+// such a map, so without sorting first, the exact same seed selects a
+// DIFFERENT node or keyword on every run -- silently contradicting this
+// file's own "deterministic, fixed-seed" claim.
+func sortedMapKeys(m map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // collectSchemaPositions walks root the same way walkSchema does
 // (keywords.go), collecting every schema-node position that is a
 // map[string]any (skipping the boolean schema literals true/false, which
 // have no keyword to mutate). The returned nodes are references into
-// root's own tree -- mutating pos.node mutates root in place.
+// root's own tree -- mutating pos.node mutates root in place. $defs and
+// properties are walked in SORTED key order (E4) so the resulting
+// `positions` slice -- and therefore which position a given rng draw
+// selects -- is identical on every run for the same input document.
 func collectSchemaPositions(root map[string]any) []schemaPos {
 	var out []schemaPos
 	var walk func(node any)
@@ -65,13 +86,13 @@ func collectSchemaPositions(root map[string]any) []schemaPos {
 		}
 		out = append(out, schemaPos{obj})
 		if defs, ok := obj["$defs"].(map[string]any); ok {
-			for _, sub := range defs {
-				walk(sub)
+			for _, name := range sortedMapKeys(defs) {
+				walk(defs[name])
 			}
 		}
 		if props, ok := obj["properties"].(map[string]any); ok {
-			for _, sub := range props {
-				walk(sub)
+			for _, name := range sortedMapKeys(props) {
+				walk(props[name])
 			}
 		}
 		if items, ok := obj["items"]; ok {
@@ -176,6 +197,7 @@ func mutateSchemaTree(rng *rand.Rand, headRoot map[string]any) {
 				present = append(present, k)
 			}
 		}
+		sort.Strings(present) // E4: deterministic selection order
 		if len(present) == 0 {
 			addOrChange()
 			return
@@ -325,4 +347,60 @@ func sortedKeys(m map[string]string) []string {
 		}
 	}
 	return out
+}
+
+// TestRound3_E4_MutationGeneratorIsDeterministic pins the property
+// test's own core promise: the SAME seed must produce the SAME
+// mutation SEQUENCE on every run. Before E4, collectSchemaPositions and
+// mutateSchemaTree's keyword-removal branch both chose a position/
+// keyword by rng-indexing into a slice built by ranging over a Go map
+// ($defs, properties, or a node's own keys) with no sort -- Go
+// deliberately randomizes plain `range` order over a map on every
+// process run, so the exact same seed selected a DIFFERENT node or
+// keyword each time, even though the file's own doc comment and this
+// PR's commit message both called the test "deterministic." Both call
+// sites now go through sortedMapKeys/sort.Strings first.
+func TestRound3_E4_MutationGeneratorIsDeterministic(t *testing.T) {
+	const seed = 20260924
+	const iterations = 40
+
+	raw, err := os.ReadFile(filepath.Join(repoContractsDir, filepath.FromSlash("rest/v1/dtos.schema.json")))
+	if err != nil {
+		t.Fatalf("read real rest/v1/dtos.schema.json: %v", err)
+	}
+	var baseRoot map[string]any
+	if err := json.Unmarshal(raw, &baseRoot); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	run := func() []string {
+		rng := rand.New(rand.NewSource(seed))
+		hashes := make([]string, 0, iterations)
+		for i := 0; i < iterations; i++ {
+			headRootAny := deepCopyJSON(baseRoot)
+			headRoot := headRootAny.(map[string]any)
+			mutateSchemaTree(rng, headRoot)
+			// encoding/json sorts map keys when marshaling, so this is a
+			// stable, byte-for-byte comparable fingerprint of the
+			// mutated document regardless of Go's own internal map
+			// iteration order.
+			headBytes, err := json.Marshal(headRoot)
+			if err != nil {
+				t.Fatalf("marshal mutated document (iteration %d): %v", i, err)
+			}
+			hashes = append(hashes, string(headBytes))
+		}
+		return hashes
+	}
+
+	first := run()
+	second := run()
+	if len(first) != len(second) {
+		t.Fatalf("want %d mutations on both runs, got %d and %d", iterations, len(first), len(second))
+	}
+	for i := range first {
+		if first[i] != second[i] {
+			t.Fatalf("iteration %d: the SAME seed produced a DIFFERENT mutation on a second run (E4) --\nfirst:\n%s\nsecond:\n%s", i, first[i], second[i])
+		}
+	}
 }
