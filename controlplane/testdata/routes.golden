@@ -60,11 +60,14 @@ GET /api/workflow-bindings
 GET /api/workflow-definitions
 GET /api/workflow-definitions/{id}
 GET /api/workflow-runs/{runId}
+GET /auth/capabilities
 GET /auth/github/callback
 GET /auth/github/login
 GET /auth/identity-link/{nonce}
 GET /auth/linear/callback
 GET /auth/linear/install
+GET /auth/oidc/callback
+GET /auth/oidc/login
 GET /health
 GET /sessions/{sessionID}/uploads/{uploadID}/content
 GET /sessions/{sessionID}/ws

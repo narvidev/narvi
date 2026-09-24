@@ -119,6 +119,14 @@ func NewOIDCCallbackHandler(
 		ctx := r.Context()
 		logger := platform.Logger(ctx)
 
+		// This route is mounted UNCONDITIONALLY (controlplane/serve.go's
+		// own doc comment on why) -- mirrors NewOIDCLoginHandler's own
+		// identical guard.
+		if !cache.cfg.Configured() {
+			http.Error(w, "oidc sign-in is not configured for this deployment", http.StatusServiceUnavailable)
+			return
+		}
+
 		// a. State check: exact-match against the short-lived cookie set
 		// by NewOIDCLoginHandler -- consumed (cleared) regardless of the
 		// outcome, so it can never be replayed. Mirrors

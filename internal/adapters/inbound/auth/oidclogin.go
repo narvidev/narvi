@@ -76,6 +76,17 @@ func NewOIDCLoginHandler(cache *OIDCProviderCache, timeouts platform.Timeouts, s
 		ctx := r.Context()
 		logger := platform.Logger(ctx)
 
+		// This route is mounted UNCONDITIONALLY (controlplane/serve.go's
+		// own doc comment on why) -- an unconfigured deployment refuses
+		// every request here with 503, mirroring the cloud-identity
+		// discovery routes' own identical "fail closed (503) when ...
+		// is unset" precedent, rather than not existing as a route at
+		// all.
+		if !cache.cfg.Configured() {
+			http.Error(w, "oidc sign-in is not configured for this deployment", http.StatusServiceUnavailable)
+			return
+		}
+
 		rt, err := cache.get(ctx)
 		if err != nil {
 			logger.Error("auth: oidc login discovery failed", "error", err)

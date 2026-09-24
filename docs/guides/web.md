@@ -1,12 +1,14 @@
 # Web guide
 
 The web surface is Narvi's own browser-facing REST API (`spawnSource:
-"web"`) — every route below is under `/api/...` except the three
-GitHub-OAuth sign-in routes and the live session WebSocket, both listed in
-their own sections. Every request (except sign-in itself) is authenticated
-by the `narvi_auth_session` cookie `GET /auth/github/callback` mints (a
-GitHub OAuth redirect, never a client-initiated `POST` — see the
-machine-checked block below); a request with no valid cookie gets `401`.
+"web"`) — every route below is under `/api/...` except the sign-in routes
+(GitHub OAuth, generic OIDC SSO, and the public sign-in-capabilities probe)
+and the live session WebSocket, both listed in their own sections. Every
+request (except sign-in itself) is authenticated by the
+`narvi_auth_session` cookie either `GET /auth/github/callback` or
+`GET /auth/oidc/callback` mints (an OAuth/OIDC redirect, never a
+client-initiated `POST` — see the machine-checked block below); a request
+with no valid cookie gets `401`.
 
 Two things this guide deliberately does **not** cover — see
 [README.md](README.md#what-this-check-cannot-catch) for why: the
@@ -29,20 +31,47 @@ connection this guide documents.
 ```
 
 ```json narvi-command
+{"name": "Sign in with SSO (OIDC)", "route": "GET /auth/oidc/login"}
+```
+
+```json narvi-command
+{"name": "OIDC callback (completes sign-in)", "route": "GET /auth/oidc/callback"}
+```
+
+```json narvi-command
+{"name": "Sign-in capabilities probe (whether OIDC SSO is configured for this deployment; public, unauthenticated)", "route": "GET /auth/capabilities"}
+```
+
+```json narvi-command
 {"name": "Sign out", "route": "POST /auth/logout"}
 ```
 
-**Negatives.** GitHub is the *only* sign-in method — there is no
-password, no magic-link login, no other OAuth provider. Signing in
-requires the GitHub account's own primary/verified email (or, org
-membership — see below) to match this deployment's own allowlist
-(`NARVI_ALLOWED_EMAIL_DOMAINS`/`NARVI_ALLOWED_GITHUB_ORGS`/
-`NARVI_ALLOWED_EMAILS`); an account that matches none of the three is
-refused sign-in outright, with no self-service way to request access —
-an admin has to widen the allowlist or add the person to
-`NARVI_INITIAL_ADMIN_EMAILS`. A brand-new user's role always starts at
+**Negatives.** GitHub OAuth and generic OIDC SSO are the *only* two
+sign-in methods — there is no password, no magic-link login, and no
+other OAuth provider. `GET /auth/oidc/login`/`GET /auth/oidc/callback`
+are always mounted, but refuse every request with `503` unless this
+deployment configures
+`NARVI_OIDC_ISSUER`/`NARVI_OIDC_CLIENT_ID`/`NARVI_OIDC_CLIENT_SECRET`
+(all-or-none) — mirroring the cloud-identity discovery routes' own
+identical "fail closed when unset" behavior below, rather than the route
+not existing at all; `GET /auth/capabilities` reports
+`oidcConfigured: false` in that case, and the sign-in view keeps its SSO
+button disabled. Signing in via
+either provider requires a **verified** email — GitHub's own
+primary/verified `/user/emails` entry, or the OIDC ID token's own `email`
+claim with `email_verified` strictly `true` (absent, `false`, or any
+non-boolean value is refused, never trusted) — matching this deployment's
+own allowlist (`NARVI_ALLOWED_EMAIL_DOMAINS`/`NARVI_ALLOWED_GITHUB_ORGS`/
+`NARVI_ALLOWED_EMAILS`; GitHub org membership is a GitHub-only mechanism,
+not available to an OIDC sign-in). An account that matches none of the
+allowed mechanisms is refused sign-in outright, with no self-service way
+to request access — an admin has to widen the allowlist or add the person
+to `NARVI_INITIAL_ADMIN_EMAILS`. A brand-new user's role always starts at
 **viewer** (§13.3's own lowest role) unless they're on the admin allowlist
-— nobody self-elevates.
+— nobody self-elevates. A verified email that already matches an existing
+user (by primary email or another linked identity's own verified email)
+merges onto that SAME account instead of creating a second one — the
+identical graph-merge rule §13.2 already applies to Slack/Linear identities.
 
 ```json narvi-command
 {"name": "Consume an identity-link magic link (posted privately in a Slack/Linear reply, never a real sign-in route)", "route": "GET /auth/identity-link/{nonce}"}

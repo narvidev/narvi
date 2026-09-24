@@ -3160,7 +3160,7 @@ export interface CapabilitiesResponse {
  */
 export interface AuthCapabilitiesResponse {
   /**
-   * Whether this deployment has a generic OIDC SSO provider configured (platform.Config.OIDCIssuer non-empty -- NARVI_OIDC_ISSUER/CLIENT_ID/CLIENT_SECRET are all-or-none, so this one boolean fully answers the question). true means GET /auth/oidc/login is a real, mounted route; false means it is not mounted at all (a 404), and the sign-in view's own SSO button must stay disabled -- exactly as disabled as it was before this field existed.
+   * Whether this deployment has a generic OIDC SSO provider configured (platform.Config.OIDCIssuer non-empty -- NARVI_OIDC_ISSUER/CLIENT_ID/CLIENT_SECRET are all-or-none, so this one boolean fully answers the question). GET /auth/oidc/login and GET /auth/oidc/callback are always mounted, regardless of this value -- false means both refuse every request with 503 rather than not existing as routes at all (mirrors the cloud-identity discovery routes' own identical 'fail closed when unset' precedent). true means they will actually complete a sign-in; false means the sign-in view's own SSO button must stay disabled -- exactly as disabled as it was before this field existed.
    */
   oidcConfigured: boolean;
 }
