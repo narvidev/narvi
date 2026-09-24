@@ -5733,6 +5733,10 @@
           "type": "array",
           "items": { "$ref": "#/$defs/CapabilityStatus" },
           "description": "One row per internal/domain/license.All entry, in that package's own fixed order (organization_governance, compliance, knowledge_retrieval) -- always all three, regardless of gatekeeperInstalled or licence state."
+        },
+        "contractsVersion": {
+          "type": "string",
+          "description": "contracts.Version (contracts/VERSION, §6.3) at the moment this binary was built -- e.g. \"1.0.0\". Deliberately optional (never in required): an older control-plane binary built before this field existed simply omits it, and a consumer generated from this schema already has to tolerate an absent optional key, so adding it here is MINOR under tools/contractscompat's own rule table, not a breaking change to GET /api/capabilities."
         }
       }
     }

@@ -24,6 +24,7 @@ import (
 	migratepg "github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 
+	"github.com/narvidev/narvi/contracts"
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/extension"
 	"github.com/narvidev/narvi/internal/app/capability"
@@ -216,10 +217,12 @@ func buildCapabilitiesResponse(reg *capability.Registry, gatekeeperInstalled boo
 			State: restdtos.CapabilityState(reg.State(c)),
 		})
 	}
+	contractsVersion := contracts.Version
 	return restdtos.CapabilitiesResponse{
 		GatekeeperInstalled: gatekeeperInstalled,
 		LicenseExpiresAt:    reg.ExpiresAt(),
 		Capabilities:        rows,
+		ContractsVersion:    &contractsVersion,
 	}
 }
 

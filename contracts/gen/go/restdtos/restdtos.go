@@ -960,6 +960,14 @@ type CapabilitiesResponse struct {
 	// three, regardless of gatekeeperInstalled or licence state.
 	Capabilities []CapabilityStatus `json:"capabilities" yaml:"capabilities" mapstructure:"capabilities"`
 
+	// contracts.Version (contracts/VERSION, §6.3) at the moment this binary was built
+	// -- e.g. "1.0.0". Deliberately optional (never in required): an older
+	// control-plane binary built before this field existed simply omits it, and a
+	// consumer generated from this schema already has to tolerate an absent optional
+	// key, so adding it here is MINOR under tools/contractscompat's own rule table,
+	// not a breaking change to GET /api/capabilities.
+	ContractsVersion *string `json:"contractsVersion,omitempty,omitzero" yaml:"contractsVersion,omitempty" mapstructure:"contractsVersion,omitempty"`
+
 	// Whether ANY module is composed into this binary, never which one -- true iff
 	// this deployment's own composition root (controlplane.Build) was given at least
 	// one extension.Module, independent of whether that module implements any

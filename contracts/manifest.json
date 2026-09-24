@@ -1,0 +1,44 @@
+{
+  "version": "1.0.0",
+  "surfaces": [
+    {
+      "path": "rest/v1/dtos.schema.json",
+      "direction": "by-suffix",
+      "status": "current"
+    },
+    {
+      "path": "client-ws/v1/protocol.schema.json",
+      "direction": "by-suffix",
+      "status": "current"
+    },
+    {
+      "path": "sandbox-ws/v1/commands.schema.json",
+      "direction": "platform-to-client",
+      "status": "current"
+    },
+    {
+      "path": "sandbox-ws/v1/events.schema.json",
+      "direction": "both",
+      "status": "current"
+    },
+    {
+      "path": "session-config/v1/session-config.schema.json",
+      "direction": "platform-to-client",
+      "status": "current"
+    }
+  ],
+  "openEnums": [
+    "Session.status",
+    "Plan.status",
+    "PlanActionResponse.status",
+    "CreateTurnResponse.status",
+    "ShadowComparisonTurn.status",
+    "Automation.status",
+    "AutomationRun.status",
+    "AutomationInvocation.status",
+    "WorkflowRun.status",
+    "WorkflowStepRun.status",
+    "WorkflowStepDecideResponse.runStatus",
+    "WorkflowStepDecideResponse.stepRunStatus"
+  ]
+}
