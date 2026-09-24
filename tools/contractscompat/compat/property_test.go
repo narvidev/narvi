@@ -716,7 +716,7 @@ func mutateRefRetarget(rng *rand.Rand, headRoot map[string]any, positions []sche
 // addition (row 32 does not require reachability), and leaving it
 // unreferenced keeps this mutation from also silently changing some
 // OTHER position's own pairing/direction behavior as a side effect.
-func mutateDefAdd(rng *rand.Rand, headRoot map[string]any, _ []schemaPos) bool {
+func mutateDefAdd(_ *rand.Rand, headRoot map[string]any, _ []schemaPos) bool {
 	defs, ok := headRoot["$defs"].(map[string]any)
 	if !ok {
 		return false
