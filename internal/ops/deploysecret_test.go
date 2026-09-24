@@ -54,13 +54,15 @@ func loadDeploySecretTemplate(t *testing.T, root string) map[string]bool {
 
 // TestDeploySecretTemplate is this repository's own drift guard (§41.1: "a
 // Secret template naming every required platform.Config variable... and
-// nothing else"). deploysecret.go's own RequiredConfigEnvVars parses
-// internal/platform/config.go's REAL source -- the ground truth Load
-// itself validates against -- for two sets: every NARVI_* variable that
-// can trip a "missing" boot failure (required, mechanically derived plus
-// the documented deploySecretExtraVars exceptions -- see deploysecret.go's
-// own top comment for exactly which two groups those are and why), and
-// every NARVI_* variable Load reads at all (read, the superset).
+// nothing else"). deploysecret.go's own RequiredConfigEnvVars computes two
+// sets: every NARVI_* variable that can trip a "missing" boot failure
+// (required -- derived BEHAVIORALLY, by actually booting
+// platform.LoadWithLookup against injected environments, plus the
+// documented deploySecretExtraVars exceptions -- see deploysecret.go's own
+// top comment for exactly which classes those are and why), and every
+// NARVI_* variable internal/platform's own non-test source reads at all,
+// via a go/ast scan (read, the superset -- see narviStringLiteralsIn's own
+// doc comment for why comments can't inflate it).
 //
 // Two failure directions, matching this Step's own exit criterion
 // verbatim:
@@ -72,11 +74,19 @@ func loadDeploySecretTemplate(t *testing.T, root string) map[string]bool {
 //     no longer reads at all (a stale placeholder, e.g. a renamed or
 //     removed env var config.go moved on from) -- extraNotRead, below.
 //
-// Mutation-verified by hand (see this Step's own PR description for the
-// exact commands): deleting a required key from secret.yaml makes this
-// test fail naming it under "omits"; adding a bogus
-// NARVI_NOT_A_REAL_VAR key makes it fail naming it under "names... no
-// longer reads". Both mutations were reverted byte-identical afterward.
+// Mutation-verified by hand (§41.1 review round 3 -- see this Step's own
+// PR description for the exact commands): deleting a required key from
+// secret.yaml makes this test fail naming it under "omits"; deleting
+// NARVI_STAGE specifically (the one required key the probes themselves can
+// never discover missing -- RequiredConfigEnvVars' own doc comment, "NARVI_
+// STAGE itself") does the same; a variable required only once another is
+// SET (simulated in platform's own package) is caught by the single-
+// variable presence probe; a required-variable error whose message says
+// "must be set" rather than "required"/"missing" is still caught under the
+// empty-environment probe's laxer fallback; and adding a bogus NARVI_ name
+// only inside a comment (never a string literal) does NOT make read treat
+// it as read. All mutations were made on scratch copies or reverted
+// byte-identical afterward.
 func TestDeploySecretTemplate(t *testing.T) {
 	root := repoRoot(t)
 
