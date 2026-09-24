@@ -108,19 +108,31 @@ func loadInput(baseDir, headDir, routesBasePath, routesHeadPath string) (compat.
 	// three to compare against at all -- BASE predates contracts
 	// governance existing. Rather than hard-erroring on every PR until
 	// this one lands on main, treat a missing base manifest.json as "base
-	// governance was identical to head's" (so DiffSurfaceSet finds
-	// nothing to complain about for files that aren't actually new, and
-	// openEnums/status start from whatever this PR itself establishes --
-	// which is safe precisely because there IS no prior state to escape
-	// scrutiny of) and synthesize "0.0.0"/empty for VERSION/CHANGELOG so
-	// the strictly-greater-version and CHANGELOG-heading checks still run
-	// meaningfully against a real content diff.
+	// governance was identical to head's" for the SURFACE SET (so
+	// DiffSurfaceSet finds nothing to complain about for files that
+	// aren't actually new) and synthesize "0.0.0"/empty for VERSION/
+	// CHANGELOG so the strictly-greater-version and CHANGELOG-heading
+	// checks still run meaningfully against a real content diff.
+	//
+	// E8 (round 3): this must NOT extend to openEnums or a `retired`
+	// status -- those are relaxations, and the reasoning "safe because
+	// there IS no prior state to escape scrutiny of" is wrong: the base
+	// SCHEMA FILES genuinely exist and their enums were genuinely
+	// closed; only the GOVERNANCE files (manifest.json/VERSION/
+	// CHANGELOG.md) are new. Substituting HEAD's own manifest as BASE
+	// would let a genesis-mode PR open a closed enum and add a value to
+	// it in the very same diff -- exactly what the merge-base-only rule
+	// (C1, compare.go) exists to prevent. compat.Compare's own Genesis
+	// flag (set below) strips both relaxations from the parsed copy
+	// regardless of what this substituted content says.
 	baseManifest, err := os.ReadFile(filepath.Join(baseDir, "manifest.json"))
+	genesis := false
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return compat.Input{}, fmt.Errorf("read base manifest.json: %w", err)
 		}
 		baseManifest = headManifest
+		genesis = true
 	}
 	baseVersion, err := os.ReadFile(filepath.Join(baseDir, "VERSION"))
 	if err != nil {
@@ -165,6 +177,7 @@ func loadInput(baseDir, headDir, routesBasePath, routesHeadPath string) (compat.
 		HeadRoutes:       headRoutes,
 		BaseSchemaFiles:  baseFiles,
 		HeadSchemaFiles:  headFiles,
+		Genesis:          genesis,
 	}, nil
 }
 

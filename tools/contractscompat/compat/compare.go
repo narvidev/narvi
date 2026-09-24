@@ -28,6 +28,22 @@ type Input struct {
 	// "path" field exactly.
 	BaseSchemaFiles map[string][]byte
 	HeadSchemaFiles map[string][]byte
+	// Genesis is true when the CLI's own caller (main.go's loadInput) had
+	// no real base manifest.json to read at all -- the PR that FIRST adds
+	// contracts governance, and (per CI's BASE = merge-base) any PR whose
+	// merge-base predates that PR, has no prior state to compare against.
+	// BaseManifestRaw is still a parseable Manifest in that case (main.go
+	// substitutes HEAD's own copy, so the SURFACE SET lines up and
+	// DiffSurfaceSet/validateManifestMatchesFiles have something
+	// structurally sound to work with), but E8 (round 3): its RELAXATIONS
+	// must never be trusted -- an openEnums pointer or a `retired` status
+	// that only exists because it is literally a copy of HEAD's own
+	// manifest is not a relaxation any earlier, reviewed PR actually
+	// established, which is the entire premise both relaxations rely on
+	// (COMPATIBILITY.md's "Relaxations" section, and this file's own C1
+	// comment on openEnums below). Compare neutralizes both the moment
+	// this is true, regardless of what BaseManifestRaw's own content says.
+	Genesis bool
 }
 
 // Compare runs the full pipeline (§6.3 design spec §3) and returns every
@@ -45,6 +61,23 @@ func Compare(in Input) (Report, error) {
 	headManifest, err := ParseManifest(in.HeadManifestRaw)
 	if err != nil {
 		return Report{}, fmt.Errorf("head manifest: %w", err)
+	}
+
+	// E8 (round 3): in genesis mode, BaseManifestRaw's own content is a
+	// synthesized stand-in for "no prior governance," never a real
+	// merge-base -- strip BOTH relaxations from the parsed copy before
+	// anything below can read them, rather than trusting whatever HEAD
+	// itself happens to say. openEnums empty means every enum in this
+	// diff is scored as CLOSED (row 11 MAJOR on P2C); no `retired`
+	// status means DiffSurfaceSet's row 37 exemption never fires, so a
+	// file disappearing still requires the MAJOR bump row 37 demands.
+	if in.Genesis {
+		baseManifest.OpenEnums = nil
+		for i := range baseManifest.Surfaces {
+			if baseManifest.Surfaces[i].Status == StatusRetired {
+				baseManifest.Surfaces[i].Status = StatusCurrent
+			}
+		}
 	}
 
 	if err := validateManifestMatchesFiles("base", baseManifest, in.BaseSchemaFiles); err != nil {

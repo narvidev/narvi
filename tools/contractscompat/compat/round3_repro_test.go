@@ -450,3 +450,106 @@ func TestRound3_E2_RetargetRecursionGuardIsSound(t *testing.T) {
 		t.Fatalf("the second site, diffed in isolation, must grade IDENTICALLY to the first site (both %v) -- the recursion guard's skip must never discard a DIFFERENT result; got solo=%v shared=%v", statusSev, soloSev, statusSev)
 	}
 }
+
+// --- E8: in genesis mode (no real base manifest.json at all), NEITHER
+// relaxation may be honoured -- openEnums is treated as empty, and no
+// surface's `retired` status is trusted -- because both relaxations
+// only ever come from a base manifest an earlier, REVIEWED PR actually
+// established, and genesis mode has no such PR: main.go's own
+// BaseManifestRaw substitution is just a copy of HEAD's own claims. ---
+
+// E8 case 1 (openEnums): a genesis-mode PR that adds an openEnums
+// pointer AND a value to that enum, in the same diff, must still be
+// MAJOR (an enum reachable only through the synthesized base's own
+// openEnums list is not "already open" -- nothing reviewed established
+// that).
+func TestRound3_E8_GenesisOpenEnumsNotHonoured(t *testing.T) {
+	schemaFile := "t/v1/x.schema.json"
+	baseSchema := mustMarshalFile(t, minimalFile("https://narvi.dev/t/v1/x.schema.json", defsOf("Status", schemaObj("type", "string", "enum", []any{"a", "b"}))))
+	headSchema := mustMarshalFile(t, minimalFile("https://narvi.dev/t/v1/x.schema.json", defsOf("Status", schemaObj("type", "string", "enum", []any{"a", "b", "c"}))))
+
+	// Genesis substitution means BaseManifestRaw is literally a copy of
+	// HeadManifestRaw -- so if head's own manifest already opens the
+	// enum (the exploit's whole premise), the synthesized base does too.
+	manifestWithOpenEnum := minimalManifestJSON(t, []string{"#/$defs/Status"})
+
+	in := Input{
+		BaseManifestRaw:  manifestWithOpenEnum,
+		HeadManifestRaw:  manifestWithOpenEnum,
+		BaseVersion:      "0.0.0",
+		HeadVersion:      "1.1.0",
+		BaseChangelogRaw: nil,
+		HeadChangelogRaw: []byte("## [1.1.0]\n### " + schemaFile + "\n- Changed: Status enum, opened openEnums\n\n"),
+		BaseRoutes:       []byte(""),
+		HeadRoutes:       []byte(""),
+		BaseSchemaFiles:  map[string][]byte{schemaFile: baseSchema},
+		HeadSchemaFiles:  map[string][]byte{schemaFile: headSchema},
+		Genesis:          true,
+	}
+
+	report, err := Compare(in)
+	if err != nil {
+		t.Fatalf("Compare: %v", err)
+	}
+	if !containsFinding(report.Findings, "11", SeverityMajor) {
+		t.Fatalf("a genesis-mode openEnums entry must never relax an enum addition to MINOR, got: %+v", report.Findings)
+	}
+	if containsFinding(report.Findings, "11", SeverityMinor) {
+		t.Fatalf("must NOT ALSO report the same change as MINOR, got: %+v", report.Findings)
+	}
+	if !report.HasBreaking() {
+		t.Fatal("report must be breaking")
+	}
+}
+
+// E8 case 2 (`retired` status): a genesis-mode base manifest that
+// claims a surface is already `retired` must not exempt that surface's
+// deletion from row 37's MAJOR severity.
+func TestRound3_E8_GenesisRetiredStatusNotHonoured(t *testing.T) {
+	retiredFile := "t/v1/retired.schema.json"
+	keptFile := "t/v1/kept.schema.json"
+	retiredDoc := mustMarshal(minimalFile("https://narvi.dev/"+retiredFile, defsOf("Widget", schemaObj("type", "string"))))
+	keptDoc := mustMarshal(minimalFile("https://narvi.dev/"+keptFile, defsOf("Other", schemaObj("type", "string"))))
+
+	// Genesis substitution: this row's "retired" status exists ONLY
+	// because it is a synthesized copy of HEAD's own claim -- no
+	// earlier, reviewed PR actually established it.
+	baseManifest := mustMarshal(map[string]any{
+		"version": "1.0.0",
+		"surfaces": []any{
+			map[string]any{"path": retiredFile, "direction": string(DirP2C), "status": StatusRetired},
+			map[string]any{"path": keptFile, "direction": DirectiveBySuffix, "status": StatusCurrent},
+		},
+	})
+	headManifest := mustMarshal(map[string]any{
+		"version": "1.0.1",
+		"surfaces": []any{
+			map[string]any{"path": keptFile, "direction": DirectiveBySuffix, "status": StatusCurrent},
+		},
+	})
+
+	in := Input{
+		BaseManifestRaw:  baseManifest,
+		HeadManifestRaw:  headManifest,
+		BaseVersion:      "1.0.0",
+		HeadVersion:      "1.0.1",
+		BaseChangelogRaw: []byte("## [1.0.0]\n"),
+		HeadChangelogRaw: []byte("## [1.0.1]\n- deleted a supposedly-already-retired surface\n\n## [1.0.0]\n"),
+		BaseRoutes:       []byte(""),
+		HeadRoutes:       []byte(""),
+		BaseSchemaFiles:  map[string][]byte{retiredFile: retiredDoc, keptFile: keptDoc},
+		HeadSchemaFiles:  map[string][]byte{keptFile: keptDoc},
+		Genesis:          true,
+	}
+
+	report, err := Compare(in)
+	if err != nil {
+		t.Fatalf("Compare: %v", err)
+	}
+	if !containsFinding(report.Findings, "37", SeverityMajor) {
+		t.Fatalf("a genesis-mode `retired` status must never exempt a deletion from row 37 MAJOR, got: %+v", report.Findings)
+	}
+	if !report.HasBreaking() {
+		t.Fatal("report must be breaking")
+	}
+}
