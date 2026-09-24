@@ -308,6 +308,40 @@ var corpus = []corpusCase{
 		c2pWant:  &wantFinding{"19", SeverityMinor},
 	},
 	{
+		// F3 (round 4): row 19's "removed" branch (diffNumericFloor's
+		// `case bHas && !hHas`) had NO corpus case at all before this --
+		// only "lowered" (above) was pinned, so a mutant that deleted the
+		// removed-branch's own finding entirely passed the whole suite,
+		// silently accepting a dropped minimum as if it were unchanged.
+		name:     "row19 minimum removed (floor lowered to none)",
+		ruleID:   "19",
+		defName:  "Value",
+		baseDefs: defsOf("Value", schemaObj("type", "integer", "minimum", float64(5))),
+		headDefs: defsOf("Value", schemaObj("type", "integer")),
+		p2cWant:  &wantFinding{"19", SeverityMajor},
+		c2pWant:  &wantFinding{"19", SeverityMinor},
+	},
+	{
+		// F3: same branch, minLength (keyword coverage).
+		name:     "row19 minLength removed (floor lowered to none, keyword coverage)",
+		ruleID:   "19",
+		defName:  "Value",
+		baseDefs: defsOf("Value", schemaObj("type", "string", "minLength", float64(3))),
+		headDefs: defsOf("Value", schemaObj("type", "string")),
+		p2cWant:  &wantFinding{"19", SeverityMajor},
+		c2pWant:  &wantFinding{"19", SeverityMinor},
+	},
+	{
+		// F3: same branch, minItems (keyword coverage).
+		name:     "row19 minItems removed (floor lowered to none, keyword coverage)",
+		ruleID:   "19",
+		defName:  "Value",
+		baseDefs: defsOf("Value", schemaObj("type", "array", "minItems", float64(1))),
+		headDefs: defsOf("Value", schemaObj("type", "array")),
+		p2cWant:  &wantFinding{"19", SeverityMajor},
+		c2pWant:  &wantFinding{"19", SeverityMinor},
+	},
+	{
 		name:     "row20 pattern added",
 		ruleID:   "20",
 		defName:  "Value",

@@ -373,7 +373,7 @@ func TestRound3_E7_OpenEnumUsableOnRootRefSurface(t *testing.T) {
 	}
 }
 
-// E2: the (base def, head def, direction) recursion guard skips a
+// E2/F4: the (base def, head def, direction) recursion guard skips a
 // SECOND site retargeting the same pair -- this is only sound once
 // grading no longer depends on the referencing path. Prove it: a def
 // reached from two sites sharing the same retarget must be graded
@@ -381,7 +381,37 @@ func TestRound3_E7_OpenEnumUsableOnRootRefSurface(t *testing.T) {
 // second site's own diff) and when computed for that second site ALONE
 // (where nothing is skipped) -- so the skip never discards a different
 // result.
+//
+// F4 (round 4): the round-3 version of this test passed openEnums=nil
+// AND dropped SessionStatus from head entirely, so diffRetargetedRef's
+// FIRST branch ("and %q no longer exists", an unconditional MAJOR)
+// fired before line 380's targetLoc was ever built -- the test never
+// actually exercised the code path it claimed to pin. Reverting E2's own
+// fix (diffRetargetedRef's targetLoc back to `targetLoc := l`, grading
+// by the referencing node's own TRAVERSAL location instead of the
+// retarget's (old, new) pair) left the whole suite green, this test
+// included. This version keeps SessionStatus present, unchanged, in
+// HEAD (so diffRetargetedRef reaches the targetLoc computation for
+// real), and gives openEnums a TRAVERSAL-shaped pointer
+// ("#/$defs/Holder/properties/status") that only a location computed
+// from the referencing path -- never one computed from the retargeted
+// (old, new) def pair itself -- could ever match. Under the real fix,
+// that pointer never matches (isOpen is false at both sites, defPtr and
+// oldDefPtr both name SessionStatus/SessionStatus2), so "status" and
+// "zzzStatus" grade IDENTICALLY (both MAJOR), same as before. Under the
+// `targetLoc := l` revert, "status" (visited first, sharing its own
+// traversal pointer with openEnums' entry) grades MINOR while
+// "zzzStatus" -- diffed in isolation below, its own traversal pointer
+// NOT in openEnums -- grades MAJOR: the mismatch this test's final
+// assertion catches.
 func TestRound3_E2_RetargetRecursionGuardIsSound(t *testing.T) {
+	// A pointer shaped like a REFERENCING SITE's own traversal path, not
+	// like either def's own canonical "#/$defs/<Name>" root -- COMPATIBILITY.md's
+	// convention (and F1's fix) means this can never legitimately open
+	// anything; it exists purely to detect whether grading has regressed
+	// to using the traversal path again.
+	openEnums := map[string]bool{"#/$defs/Holder/properties/status": true}
+
 	baseDefs := map[string]any{
 		"Holder": schemaObj("type", "object", "properties", schemaObj(
 			"status", schemaObj("$ref", "#/$defs/SessionStatus"),
@@ -398,10 +428,16 @@ func TestRound3_E2_RetargetRecursionGuardIsSound(t *testing.T) {
 			"status", schemaObj("$ref", "#/$defs/SessionStatus2"),
 			"zzzStatus", schemaObj("$ref", "#/$defs/SessionStatus2"),
 		)),
+		// Kept, unchanged, so the retarget's OLD target still exists in
+		// HEAD -- diffRetargetedRef's own "no longer exists" branch (an
+		// unconditional MAJOR that returns before targetLoc is ever
+		// built) must NOT fire, or this test would not exercise the
+		// fixed code at all (round 3's own gap).
+		"SessionStatus":  schemaObj("type", "string", "enum", []any{"a", "b"}),
 		"SessionStatus2": schemaObj("type", "string", "enum", []any{"a", "b", "c"}),
 	}
 
-	findings, err := DiffDef(baseDefs, headDefs, "Holder", DirP2C, nil)
+	findings, err := DiffDef(baseDefs, headDefs, "Holder", DirP2C, openEnums)
 	if err != nil {
 		t.Fatalf("DiffDef: %v", err)
 	}
@@ -417,7 +453,7 @@ func TestRound3_E2_RetargetRecursionGuardIsSound(t *testing.T) {
 		t.Fatalf("want a row-27 finding at .../properties/status, got: %+v", findings)
 	}
 	if statusSev != SeverityMajor {
-		t.Fatalf("retargeting to a def whose closed enum gained a value must be row 27 MAJOR, got %v: %+v", statusSev, findings)
+		t.Fatalf("a traversal-shaped openEnums entry must never open this retarget's enum addition (F1: grading is by the (old,new) def pair's own pointers, never the referencing path) -- got %v: %+v", statusSev, findings)
 	}
 
 	// Now diff the SECOND site (zzzStatus) completely on its own, in a
@@ -429,9 +465,10 @@ func TestRound3_E2_RetargetRecursionGuardIsSound(t *testing.T) {
 	}
 	soloHeadDefs := map[string]any{
 		"Holder2":        schemaObj("type", "object", "properties", schemaObj("zzzStatus", schemaObj("$ref", "#/$defs/SessionStatus2"))),
+		"SessionStatus":  schemaObj("type", "string", "enum", []any{"a", "b"}),
 		"SessionStatus2": schemaObj("type", "string", "enum", []any{"a", "b", "c"}),
 	}
-	soloFindings, err := DiffDef(soloBaseDefs, soloHeadDefs, "Holder2", DirP2C, nil)
+	soloFindings, err := DiffDef(soloBaseDefs, soloHeadDefs, "Holder2", DirP2C, openEnums)
 	if err != nil {
 		t.Fatalf("DiffDef (solo zzzStatus): %v", err)
 	}
