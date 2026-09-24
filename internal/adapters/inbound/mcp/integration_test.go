@@ -439,35 +439,43 @@ func TestParity_GetSession_UnknownUUID(t *testing.T) {
 	}
 }
 
-// --- Parity: malformed sessionId -> 400 both, JSON-RPC protocol error on
-// the MCP side ---
+// --- Parity: malformed sessionId -> both reject (technical plan §43.8):
+// REST 400, MCP isError:true. The MCP side now rejects "not-a-uuid"
+// BEFORE the twin is ever invoked -- this package's own bridge validates
+// arguments against the SAME contracts $def its InputSchema advertises
+// (format:"uuid" included, schemas.go's validateArguments), so the
+// REST-side 400 the twin would otherwise answer is unreachable for this
+// exact value. Parity means "both reject", never byte-identical text:
+// the MCP side's own message comes from the schema validator, not the
+// REST route. ---
 
 func TestParity_GetSession_MalformedUUID(t *testing.T) {
 	ctx := context.Background()
 	rig := newMCPTestRig(t)
 	_, token := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMember)
 
-	var restBody struct {
-		Error string `json:"error"`
-	}
-	restStatus := rig.doJSON(t, http.MethodGet, "/api/sessions/not-a-uuid", nil, &restBody, token)
+	restStatus := rig.doJSON(t, http.MethodGet, "/api/sessions/not-a-uuid", nil, nil, token)
 	if restStatus != http.StatusBadRequest {
 		t.Fatalf("REST GET malformed session id: status = %d, want 400", restStatus)
 	}
 
 	mcpStatus, env := rig.callTool(t, "narvi_get_session", `{"sessionId":"not-a-uuid"}`, token)
-	if mcpStatus != http.StatusBadRequest {
-		t.Fatalf("MCP narvi_get_session malformed uuid: status = %d, want 400 (a JSON-RPC protocol error)", mcpStatus)
+	if mcpStatus != http.StatusOK {
+		t.Fatalf("MCP narvi_get_session malformed uuid: status = %d, want 200 (isError:true is a SUCCESSFUL JSON-RPC response, per the MCP tools spec's own input-validation-failure classification)", mcpStatus)
 	}
-	if env.Error == nil || env.Error.Code != -32602 {
-		t.Fatalf("MCP narvi_get_session malformed uuid: error = %+v, want code -32602", env.Error)
+	if env.Error != nil {
+		t.Fatalf("MCP narvi_get_session malformed uuid: error = %+v, want no top-level JSON-RPC error", env.Error)
 	}
-	if env.Error.Message != restBody.Error {
-		t.Errorf("MCP error.message = %q, want REST's own exact text %q", env.Error.Message, restBody.Error)
+	if env.Result == nil || !env.Result.IsError {
+		t.Fatalf("MCP narvi_get_session malformed uuid: result = %+v, want IsError:true", env.Result)
 	}
 }
 
-// --- Parity: bad filter/limit -> 400 both, exact text preserved ---
+// --- Parity: bad filter/limit -> both reject (REST 400, MCP
+// isError:true), same reasoning as TestParity_GetSession_MalformedUUID
+// above -- filter/limit now carry real enum/minimum/maximum constraints
+// (contracts/rest/v1/dtos.schema.json), so this package's own bridge
+// rejects both values before the twin is ever invoked. ---
 
 func TestParity_ListSessions_BadFilterAndLimit(t *testing.T) {
 	ctx := context.Background()
@@ -475,36 +483,36 @@ func TestParity_ListSessions_BadFilterAndLimit(t *testing.T) {
 	_, token := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMember)
 
 	t.Run("filter=x", func(t *testing.T) {
-		var restBody struct {
-			Error string `json:"error"`
-		}
-		restStatus := rig.doJSON(t, http.MethodGet, "/api/sessions?filter=x", nil, &restBody, token)
+		restStatus := rig.doJSON(t, http.MethodGet, "/api/sessions?filter=x", nil, nil, token)
 		if restStatus != http.StatusBadRequest {
 			t.Fatalf("REST filter=x: status = %d, want 400", restStatus)
 		}
 		mcpStatus, env := rig.callTool(t, "narvi_list_sessions", `{"filter":"x"}`, token)
-		if mcpStatus != http.StatusBadRequest {
-			t.Fatalf("MCP filter=x: status = %d, want 400", mcpStatus)
+		if mcpStatus != http.StatusOK {
+			t.Fatalf("MCP filter=x: status = %d, want 200 (isError:true is a SUCCESSFUL JSON-RPC response)", mcpStatus)
 		}
-		if env.Error == nil || env.Error.Code != -32602 || env.Error.Message != restBody.Error {
-			t.Errorf("MCP filter=x error = %+v, want code -32602 message %q", env.Error, restBody.Error)
+		if env.Error != nil {
+			t.Fatalf("MCP filter=x: error = %+v, want no top-level JSON-RPC error", env.Error)
+		}
+		if env.Result == nil || !env.Result.IsError {
+			t.Fatalf("MCP filter=x: result = %+v, want IsError:true", env.Result)
 		}
 	})
 
 	t.Run("limit=0", func(t *testing.T) {
-		var restBody struct {
-			Error string `json:"error"`
-		}
-		restStatus := rig.doJSON(t, http.MethodGet, "/api/sessions?limit=0", nil, &restBody, token)
+		restStatus := rig.doJSON(t, http.MethodGet, "/api/sessions?limit=0", nil, nil, token)
 		if restStatus != http.StatusBadRequest {
 			t.Fatalf("REST limit=0: status = %d, want 400", restStatus)
 		}
 		mcpStatus, env := rig.callTool(t, "narvi_list_sessions", `{"limit":0}`, token)
-		if mcpStatus != http.StatusBadRequest {
-			t.Fatalf("MCP limit=0: status = %d, want 400", mcpStatus)
+		if mcpStatus != http.StatusOK {
+			t.Fatalf("MCP limit=0: status = %d, want 200 (isError:true is a SUCCESSFUL JSON-RPC response)", mcpStatus)
 		}
-		if env.Error == nil || env.Error.Code != -32602 || env.Error.Message != restBody.Error {
-			t.Errorf("MCP limit=0 error = %+v, want code -32602 message %q", env.Error, restBody.Error)
+		if env.Error != nil {
+			t.Fatalf("MCP limit=0: error = %+v, want no top-level JSON-RPC error", env.Error)
+		}
+		if env.Result == nil || !env.Result.IsError {
+			t.Fatalf("MCP limit=0: result = %+v, want IsError:true", env.Result)
 		}
 	})
 }

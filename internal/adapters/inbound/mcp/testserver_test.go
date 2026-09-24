@@ -42,12 +42,19 @@ func fakeAuth(authenticated bool, user platform.AuthenticatedUser) func(http.Han
 	}
 }
 
+// testPublicBaseURL is the PublicBaseURL every unit test in this package
+// builds NewHandler/RequireTrustedOrigin against -- "http://example.test"
+// is therefore the ONE trusted origin for every test in this file and
+// its siblings.
+const testPublicBaseURL = "http://example.test"
+
 // newTestHandler wires the SAME /mcp route SHAPE controlplane/serve.go
-// registers (RequireEnabled, then the auth gate, then the real
-// NewHandler) as a plain http.Handler -- so this package's own unit
-// tests exercise the real gate ORDER and the real NewHandler, driven
-// directly via ServeHTTP (httptest.NewRequest/NewRecorder, never a real
-// listening httptest.Server + net/http client: tools/lint/narvichecks'
+// registers (RequireTrustedOrigin, then RequireEnabled, then the auth
+// gate, then the real NewHandler -- §43.2/§43.6's own gate order) as a
+// plain http.Handler -- so this package's own unit tests exercise the
+// real gate ORDER and the real NewHandler, driven directly via ServeHTTP
+// (httptest.NewRequest/NewRecorder, never a real listening
+// httptest.Server + net/http client: tools/lint/narvichecks'
 // httpclientban analyzer reserves net/http's CLIENT-side symbols for the
 // outbound trees, exactly as httpapi's own *_test.go unit tests --
 // distinct from its *_integration_test.go rig, which DOES dial a real
@@ -56,12 +63,18 @@ func fakeAuth(authenticated bool, user platform.AuthenticatedUser) func(http.Han
 // dependency-free one.
 func newTestHandler(t testing.TB, enabled, authenticated bool, twins Twins) http.Handler {
 	t.Helper()
-	mcpHandler, err := NewHandler(Config{PublicBaseURL: "http://example.test"}, twins)
+	cfg := Config{PublicBaseURL: testPublicBaseURL}
+	originGate, err := RequireTrustedOrigin(cfg)
+	if err != nil {
+		t.Fatalf("RequireTrustedOrigin: %v", err)
+	}
+	mcpHandler, err := NewHandler(cfg, twins)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
 	router := chi.NewRouter()
 	router.Route("/mcp", func(r chi.Router) {
+		r.Use(originGate)
 		r.Use(RequireEnabled(enabled))
 		r.Use(fakeAuth(authenticated, testUser))
 		r.Post("/", mcpHandler.ServeHTTP)

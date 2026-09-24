@@ -3,14 +3,18 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"strconv"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // Twins bundles the pre-built REST handlers this package's tools invoke
@@ -79,7 +83,7 @@ func buildListSessionsRequest(arguments json.RawMessage) (map[string]string, url
 	}
 	query := url.Values{}
 	if in.Filter != nil {
-		query.Set("filter", *in.Filter)
+		query.Set("filter", string(*in.Filter))
 	}
 	if in.Limit != nil {
 		query.Set("limit", strconv.Itoa(*in.Limit))
@@ -153,24 +157,67 @@ func boolPtr(b bool) *bool { return &b }
 //
 // Deliberately the RAW, non-generic sdkmcp.ToolHandler API (Server.
 // AddTool(*Tool, ToolHandler)), never the generic package-level
-// AddTool[In, Out] wrapper: that wrapper's own automatic argument
-// validation runs against the SAME InputSchema this handler's own Tool
-// carries, which -- per contracts/rest/v1/dtos.schema.json's own
-// ListSessionsToolRequest/filter and .limit doc comments -- deliberately
-// omits "enum"/"minimum" precisely so a value the REST route itself
-// still needs to reject (e.g. filter:"x", limit:0) reaches this handler
-// and the REAL twin, rather than being intercepted earlier by the SDK's
-// own generic validation error (a DIFFERENT message than the REST
-// route's own -- verified against the pinned github.com/google/
-// jsonschema-go, which DOES enforce "enum"/"minimum" but does NOT
-// enforce "format", the asymmetry this design relies on). Validating
-// arguments a second, divergent way here would reintroduce exactly the
-// two-validation-paths problem the bridge exists to avoid.
+// AddTool[In, Out] wrapper -- NOT because that wrapper's own validation
+// would run against a looser schema than intended (a prior version of
+// this comment claimed exactly that, and it was wrong: the pinned SDK's
+// raw AddTool path validates arguments against InputSchema not at all,
+// on ANY path, not merely a "different, less specific" way -- see
+// validateArguments' own doc comment in schemas.go, which is what this
+// function now calls to close that gap itself, in one place, before any
+// tool's own BuildRequest or twin ever sees an argument). The raw API is
+// still the right one for an unrelated reason: it is what lets this
+// handler wrap the ENTIRE call in the recover below, and what lets
+// mapOutcome (outcome.go) render a twin's business refusal as
+// IsError:true instead of the wrapper's own automatic, coarser
+// success/failure split.
 func (spec toolSpec) toolHandler(ctx context.Context) sdkmcp.ToolHandler {
-	return func(_ context.Context, req *sdkmcp.CallToolRequest) (*sdkmcp.CallToolResult, error) {
-		urlParams, query, err := spec.BuildRequest(req.Params.Arguments)
-		if err != nil {
-			return nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: err.Error()}
+	return func(_ context.Context, req *sdkmcp.CallToolRequest) (result *sdkmcp.CallToolResult, err error) {
+		// Defense in depth against ANY future twin or argument shape
+		// that panics instead of erroring (bridge.go's own doc comment
+		// covers the concrete defect this closes: httptest.NewRequest
+		// panicking on an unparseable target built from a raw tool
+		// argument) -- the MCP SDK runs every tool handler in its own
+		// goroutine with no recover anywhere in ITS call stack
+		// (internal/jsonrpc2), so a panic here would otherwise kill the
+		// whole process, not just this request.
+		defer func() {
+			if r := recover(); r != nil {
+				platform.Logger(ctx).Error("mcp: tool handler panicked",
+					"tool", spec.Name,
+					"panic", fmt.Sprint(r),
+					"stack", string(debug.Stack()),
+				)
+				result = nil
+				err = &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: "internal error"}
+			}
+		}()
+
+		// Validate the raw arguments against the SAME contracts $def
+		// this tool's own InputSchema advertises, BEFORE BuildRequest
+		// or the twin ever sees them (schemas.go's own
+		// validateArguments doc comment: the pinned SDK's raw AddTool
+		// path never does this itself). Per the MCP tools spec, an
+		// input-validation failure is a TOOL EXECUTION error
+		// (IsError:true), never a JSON-RPC protocol error -- the model
+		// can read this text and retry with corrected arguments.
+		if verr := validateArguments(spec.InputDef, req.Params.Arguments); verr != nil {
+			invalid := &sdkmcp.CallToolResult{}
+			invalid.SetError(errors.New(invalidArgumentsMessage(verr)))
+			return invalid, nil
+		}
+
+		urlParams, query, buildErr := spec.BuildRequest(req.Params.Arguments)
+		if buildErr != nil {
+			// Validation above already passed, so this should be
+			// unreachable in practice; defended anyway, and never the
+			// raw error text -- a json.Unmarshal error names internal
+			// Go struct/field types the client has no business seeing
+			// (doc.go's own "never leak" discipline).
+			platform.Logger(ctx).Error("mcp: BuildRequest failed after schema validation passed",
+				"tool", spec.Name, "error", buildErr)
+			invalid := &sdkmcp.CallToolResult{}
+			invalid.SetError(errors.New("invalid arguments"))
+			return invalid, nil
 		}
 		status, body := callTwin(ctx, spec.Twin, urlParams, query)
 		return mapOutcome(status, body)

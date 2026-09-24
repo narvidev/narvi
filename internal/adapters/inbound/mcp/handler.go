@@ -30,6 +30,56 @@ type Config struct {
 	PublicBaseURL string
 }
 
+// crossOriginProtection builds the *http.CrossOriginProtection value
+// trusting cfg.PublicBaseURL's own origin -- shared by NewHandler (which
+// wires it into the SDK's own StreamableHTTPOptions, a second,
+// defense-in-depth layer) and RequireTrustedOrigin below (the ONE that
+// actually determines what a client sees, since it runs first -- see
+// RequireTrustedOrigin's own doc comment), so the two can never name a
+// different trusted origin from each other.
+func crossOriginProtection(cfg Config) (*http.CrossOriginProtection, error) {
+	origin, err := originOf(cfg.PublicBaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("mcp: resolve trusted origin from PublicBaseURL %q: %w", cfg.PublicBaseURL, err)
+	}
+	protection := http.NewCrossOriginProtection()
+	if err := protection.AddTrustedOrigin(origin); err != nil {
+		return nil, fmt.Errorf("mcp: add trusted origin %q: %w", origin, err)
+	}
+	return protection, nil
+}
+
+// RequireTrustedOrigin returns chi middleware enforcing the Streamable
+// HTTP transport's own Origin/Sec-Fetch-Site CSRF check (net/http's own
+// CrossOriginProtection.Handler) -- mounted FIRST in the /mcp route
+// group's own chain (technical plan §43.2; controlplane/serve.go),
+// BEFORE RequireEnabled, auth.Middleware, or NewHandler's own returned
+// handler (which also carries this SAME check, wired into the SDK's own
+// StreamableHTTPOptions -- kept there too, as defense in depth, but no
+// longer the check that determines what a client actually observes).
+//
+// This is load-bearing, not merely tidier: the Streamable HTTP transport
+// spec requires "if the Origin header is present and invalid, servers
+// MUST respond with HTTP 403 Forbidden" UNCONDITIONALLY -- not "once the
+// surface is known to be enabled" or "once the caller is authenticated".
+// Before this gate existed, an invalid Origin reaching this package
+// SOMETIMES got 403 (a request that also carried a valid cookie and a
+// supported protocol version -- the SDK's own internal check, deep
+// inside NewHandler's returned handler, ran last) and sometimes did not
+// (RequireEnabled's 503, auth.Middleware's 401, or versionGate's -32022
+// each fired first for a request that failed one of THOSE checks too,
+// since every one of them runs before the SDK's own handler is ever
+// reached). Mounting the SAME check first removes that ordering
+// dependency entirely: an invalid Origin now gets 403 whatever the
+// flag/auth/version state of the rest of the request.
+func RequireTrustedOrigin(cfg Config) (func(http.Handler) http.Handler, error) {
+	protection, err := crossOriginProtection(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return protection.Handler, nil
+}
+
 // NewHandler builds the complete /mcp POST handler (technical plan §43):
 // OUR OWN version gate (versions.go) wrapping the official SDK's
 // Streamable HTTP handler, stateless, JSON-response, Origin-protected,
@@ -39,20 +89,21 @@ type Config struct {
 // the composition root, which alone holds the Postgres stores those
 // closures capture.
 //
+// The returned handler's OWN CrossOriginProtection (below) is
+// defense-in-depth, not this surface's primary Origin check anymore --
+// see RequireTrustedOrigin's own doc comment for why a SECOND gate,
+// mounted first in the route group, is what actually determines the
+// observable 403 behavior now.
+//
 // Returns an error only for a malformed cfg.PublicBaseURL (required,
 // non-empty config every OAuth redirect URL in this binary already
 // depends on being a real absolute URL -- see Config.PublicBaseURL's own
 // doc comment); a real deployment's own boot-time GitHub OAuth wiring
 // already depends on that same assumption holding.
 func NewHandler(cfg Config, twins Twins) (http.Handler, error) {
-	origin, err := originOf(cfg.PublicBaseURL)
+	protection, err := crossOriginProtection(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("mcp: resolve trusted origin from PublicBaseURL %q: %w", cfg.PublicBaseURL, err)
-	}
-
-	protection := http.NewCrossOriginProtection()
-	if err := protection.AddTrustedOrigin(origin); err != nil {
-		return nil, fmt.Errorf("mcp: add trusted origin %q: %w", origin, err)
+		return nil, err
 	}
 
 	sdkHandler := sdkmcp.NewStreamableHTTPHandler(

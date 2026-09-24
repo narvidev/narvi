@@ -162,8 +162,19 @@ type jsonrpcErrorObj struct {
 
 // writeUnsupportedVersion writes the -32022 refusal, HTTP 400, naming
 // every version SupportedProtocolVersions holds in its own message text
-// (technical plan §43.4 case 1) -- the one detail the pinned SDK's own
-// otherwise-identical refusal leaves out.
+// (technical plan §43.4 case 1). What this improves on is the pinned
+// SDK's own refusal SHAPE, not merely its wording: for a header version
+// below the current protocol revision that the SDK does not recognize
+// (streamable.go's own version check), the SDK already answers a
+// plain-text, non-JSON-RPC HTTP 400 that DOES name every supported
+// version -- just not in the JSON-RPC -32022 shape the modern spec
+// requires. For a request naming an unsupported version at or above the
+// current revision instead, the SDK's own -32022 refusal (server.go) has
+// the correct JSON-RPC shape already, but a FIXED message text
+// ("unsupported protocol version") that never names them. This function
+// answers the same, correct -32022 JSON-RPC shape either way, always
+// naming every version -- closing both gaps with one refusal, not just
+// the second one.
 func writeUnsupportedVersion(w http.ResponseWriter, r *http.Request, requested string) {
 	id := peekRequestID(r)
 	body := jsonrpcErrorBody{

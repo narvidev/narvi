@@ -44,20 +44,20 @@ func mapOutcome(status int, body []byte) (*sdkmcp.CallToolResult, error) {
 			StructuredContent: json.RawMessage(body),
 		}, nil
 
-	case http.StatusBadRequest:
-		// A request-STRUCTURE problem (malformed session id, a bad
-		// filter/limit that reached the real handler because this
-		// package's own input schema deliberately does not duplicate
-		// that value-space check -- see contracts/rest/v1/dtos.schema.json's
-		// own ListSessionsToolRequest doc comment for why). A protocol
-		// error, not a business refusal.
-		return nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: errorTextFrom(body)}
-
-	case http.StatusForbidden, http.StatusNotFound, http.StatusConflict:
-		// A business refusal the model or user can act on (§43 D6):
-		// "ask a maintainer", "re-list", or similar -- a tool execution
-		// error, never a JSON-RPC application code, so the protocol layer
-		// stays purely protocol.
+	case http.StatusBadRequest, http.StatusForbidden, http.StatusNotFound, http.StatusConflict:
+		// Both a request-STRUCTURE problem (malformed session id, a bad
+		// filter/limit) and a business refusal (§43 D6: "ask a
+		// maintainer", "re-list", or similar) are TOOL EXECUTION errors
+		// per the MCP tools specification's own error taxonomy --
+		// IsError:true, never a JSON-RPC protocol code. (A prior
+		// version of this function treated 400 as a protocol error; the
+		// tools spec classifies "input validation errors (e.g., date in
+		// wrong format, value out of range)" as tool execution errors
+		// explicitly, and toolHandler's own validateArguments call,
+		// tools.go, now catches nearly every one of these before the
+		// twin is ever invoked -- this branch is what remains reachable
+		// for a value the schema's own value-space cannot express, and
+		// it must be classified the SAME way.)
 		result := &sdkmcp.CallToolResult{}
 		result.SetError(errors.New(errorTextFrom(body)))
 		return result, nil

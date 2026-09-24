@@ -46,7 +46,20 @@ func modelCatalogResponse(providers []modelcatalog.Provider) restdtos.ModelCatal
 				ContextWindow: m.ContextWindow,
 				ToolCall:      m.ToolCall,
 				Reasoning:     m.Reasoning,
-				Variants:      m.Variants,
+				// Always a non-nil slice, even for a model whose
+				// catalog entry carries zero variants: the contract
+				// (ModelCatalogModel.variants) declares this field
+				// {"type":"array"} and required, so encoding/json's
+				// default "nil slice -> null" behavior would emit a
+				// body this schema itself rejects (a client validating
+				// structuredContent against the tool's own outputSchema
+				// -- e.g. the TypeScript SDK -- would fail every
+				// narvi_list_models call). copyModel
+				// (internal/app/modelcatalog/catalog.go) turns even an
+				// explicit "variants": [] in snapshot.json into a nil
+				// slice; nonNilStrings undoes that here, at the one
+				// place this value crosses into the wire DTO.
+				Variants: nonNilStrings(m.Variants),
 				Cost: restdtos.ModelCatalogCost{
 					Input:      m.Cost.Input,
 					Output:     m.Cost.Output,
@@ -58,4 +71,17 @@ func modelCatalogResponse(providers []modelcatalog.Provider) restdtos.ModelCatal
 		out.Providers = append(out.Providers, restdtos.ModelCatalogProvider{Id: p.ID, Models: models})
 	}
 	return out
+}
+
+// nonNilStrings returns s unchanged if it already has at least one
+// element, otherwise a non-nil, zero-length []string -- so
+// encoding/json always encodes it as "[]", never "null", regardless of
+// whether the nil came from an omitted field or (per copyModel's own
+// deep-copy, internal/app/modelcatalog/catalog.go) an explicit empty
+// one.
+func nonNilStrings(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
 }

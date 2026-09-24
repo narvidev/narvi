@@ -69,10 +69,19 @@ var Analyzer = &analysis.Analyzer{
 	Run:  run,
 }
 
-// targetPackage is the ONE package this analyzer ever reports inside --
-// every other package in the repository is silently ignored, regardless
-// of what it imports (see this package's own doc comment, "Scope"
-// section).
+// targetPackage is internal/adapters/inbound/mcp itself, AND every one of
+// its subpackages (isTargetPackage below matches this exactly OR this
+// plus "/" plus anything) -- every OTHER package in the repository is
+// silently ignored, regardless of what it imports (see this package's
+// own doc comment, "Scope" section). A prior version of isTargetPackage
+// compared pass.Pkg.Path() for exact equality only, so a subpackage such
+// as internal/adapters/inbound/mcp/internal/direct could import postgres
+// (or any other banned path) freely, and package mcp could then import
+// THAT subpackage -- never itself importing a banned path directly, so
+// never reported -- and call a method on the value it returned, reaching
+// a store or an authz verdict exactly as if the ban did not exist. The
+// analyzer's own doc comment already claimed "there is no dodge
+// available"; a subpackage was exactly that dodge.
 const targetPackage = "github.com/narvidev/narvi/internal/adapters/inbound/mcp"
 
 // bannedExactImports are banned by exact import path.
@@ -89,8 +98,17 @@ var bannedExactImports = []string{
 // class, not an enumerated list of today's members" precedent).
 const bannedPrefix = "github.com/narvidev/narvi/internal/app/"
 
+// isTargetPackage reports whether path is internal/adapters/inbound/mcp
+// itself or one of its subpackages -- a PREFIX match on "/", never a
+// bare strings.HasPrefix(path, targetPackage) (which would also match an
+// unrelated sibling package that merely starts with the same characters,
+// e.g. a hypothetical .../mcp2).
+func isTargetPackage(path string) bool {
+	return path == targetPackage || strings.HasPrefix(path, targetPackage+"/")
+}
+
 func run(pass *analysis.Pass) (any, error) {
-	if pass.Pkg.Path() != targetPackage {
+	if !isTargetPackage(pass.Pkg.Path()) {
 		return nil, nil
 	}
 	for _, file := range pass.Files {

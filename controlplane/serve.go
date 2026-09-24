@@ -2598,17 +2598,30 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// category as /sessions/{sessionID}/ws or /webhooks/*, never graded
 	// by tools/contractscompat's own /api/-only DiffRoutes) and mounted
 	// UNCONDITIONALLY regardless of cfg.MCPEnabled -- a surface that is
-	// off must be OBSERVABLE as off (503, mcpadapter.RequireEnabled,
-	// FIRST in this group's own chain, mirroring the OIDC routes'
-	// identical "mounted unconditionally, 503 when unconfigured"
-	// precedent above) rather than a route that does not exist at all
-	// (§43.6). auth.Middleware runs SECOND, the exact same gate every
+	// off must be OBSERVABLE as off (503, mcpadapter.RequireEnabled)
+	// rather than a route that does not exist at all (§43.6).
+	//
+	// Gate order (§43.2/§43.11): mcpadapter.RequireTrustedOrigin runs
+	// FIRST, before every other gate in this group -- the Streamable
+	// HTTP transport spec's own "if the Origin header is present and
+	// invalid, servers MUST respond with HTTP 403 Forbidden" is
+	// unconditional, not "once the surface is known to be enabled" or
+	// "once the caller is authenticated" (see that function's own doc
+	// comment for the concrete ordering defect this closes: an invalid
+	// Origin used to get 503/401/-32022 instead of 403 whenever the
+	// request ALSO failed one of those later gates). mcpadapter.
+	// RequireEnabled runs second (503 when off, before the session store
+	// is ever touched), then auth.Middleware, the exact same gate every
 	// /api/** group above already uses -- this surface is cookie-
-	// authenticated, nothing else (§43.2); 181 is what makes it usable
-	// by a real, non-cookie-holding client. Twins are the SAME three
-	// httpapi handlers /api/models and /api/sessions[/{sessionID}] above
-	// already register -- the bridge invokes them in-process, never a
-	// second implementation (§43.4; mcp/bridge.go's own doc comment).
+	// authenticated, nothing else; 181 is what makes it usable by a
+	// real, non-cookie-holding client. Twins are the SAME three httpapi
+	// handlers /api/models and /api/sessions[/{sessionID}] above already
+	// register -- the bridge invokes them in-process, never a second
+	// implementation (§43.7; mcp/bridge.go's own doc comment).
+	mcpOriginGate, err := mcpadapter.RequireTrustedOrigin(mcpadapter.Config{PublicBaseURL: cfg.PublicBaseURL})
+	if err != nil {
+		return nil, fmt.Errorf("build mcp origin gate: %w", err)
+	}
 	mcpHandler, err := mcpadapter.NewHandler(mcpadapter.Config{PublicBaseURL: cfg.PublicBaseURL}, mcpadapter.Twins{
 		ListModels:   httpapi.GetModelCatalog(),
 		ListSessions: httpapi.ListSessions(sessionStore),
@@ -2618,6 +2631,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		return nil, fmt.Errorf("build mcp handler: %w", err)
 	}
 	router.Route("/mcp", func(r chi.Router) {
+		r.Use(mcpOriginGate)
 		r.Use(mcpadapter.RequireEnabled(cfg.MCPEnabled))
 		r.Use(auth.Middleware(userSessionStore, userStore))
 		r.Post("/", mcpHandler.ServeHTTP)

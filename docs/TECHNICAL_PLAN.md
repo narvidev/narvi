@@ -6640,7 +6640,10 @@ not per-user-surface, and consumed by a WS frame, not an HTTP header). Because t
 cookie-authenticated, it additionally needs what a `POST /api/**` route gets for free from `SameSite=Lax`:
 `Origin` validation (`net/http.CrossOriginProtection`, trusting only the origin of `cfg.PublicBaseURL`) —
 a cross-site browser POST is refused 403; a request with no `Origin`/`Sec-Fetch-Site` header at all
-(every non-browser MCP client) passes.
+(every non-browser MCP client) passes. This check is mounted as its OWN chi middleware, first in the
+route group's own chain, before the enabled-gate or the auth gate (§43.6) — the Streamable HTTP
+transport spec's own "MUST respond with HTTP 403 Forbidden" for an invalid Origin is unconditional, not
+"once the surface is known to be enabled" or "once the caller is authenticated".
 
 ### 43.3 Transport: stateless Streamable HTTP
 
@@ -6664,8 +6667,13 @@ official SDK's own broader default list, never widens it.
 
 A request whose `MCP-Protocol-Version` header names a version outside that list is refused before the
 SDK ever sees it: HTTP 400, JSON-RPC code `-32022`, with `data.supported`/`data.requested` and a message
-naming every version this server speaks — the one respect in which this deployment's own gate improves
-on the pinned SDK's own otherwise-identical refusal, whose message text does not name them. A request
+naming every version this server speaks. What this gate improves on is the pinned SDK's own otherwise
+comparable refusal's SHAPE, not its wording: for a header version below the current revision that the
+SDK does not recognize, the SDK itself already answers plain-text HTTP 400 naming every supported
+version — it is simply not the JSON-RPC `-32022` shape the modern spec requires, and (for a request-body
+`_meta.protocolVersion` at or above the current revision) the SDK's OWN `-32022` message is the fixed
+string "unsupported protocol version", which does not name them. This gate answers the same, correct
+`-32022` JSON-RPC shape either way, always naming every version. A request
 with NO version header at all is passed straight through: the spec's own backward-compatibility
 allowance is that such a request may be a pre-2025-06-18 `initialize` handshake, which carries its own
 protocol version inside the request body instead — the SDK's own legacy handling negotiates it, and
@@ -6691,10 +6699,12 @@ category as `GET /sessions/{sessionID}/ws` or `/webhooks/*`, never graded by the
 diff a wire-contract compatibility change is checked against. The route group is mounted
 UNCONDITIONALLY regardless of whether the surface is enabled — a surface that is off must be
 OBSERVABLE as off, never a route that does not exist at all, the same discipline the OIDC routes
-already establish. Gate order inside the group is deliberate and fixed: the enabled-gate (§43.11)
-answers 503 FIRST, before the session store is ever touched; only once the surface is known to be on
-does the auth gate (§43.2) run, second, producing the identical 401 every other route produces on a
-missing/expired/disabled session.
+already establish. Gate order inside the group is deliberate and fixed: the Origin gate (§43.2) answers
+403 FIRST, on an invalid Origin, whatever the state of every gate after it — the transport spec's own
+"MUST respond with HTTP 403 Forbidden" is unconditional, and no LATER gate can know that without
+running first. The enabled-gate (§43.11) answers 503 SECOND, before the session store is ever touched;
+only once the surface is known to be on does the auth gate (§43.2) run, third, producing the identical
+401 every other route produces on a missing/expired/disabled session.
 
 ### 43.7 The bridge: one authorization path, never a second
 
@@ -6712,29 +6722,51 @@ per-principal tool filtering possible in 181 without this Step needing to build 
 not use a tool must not be told the tool exists, and the SDK's own seam for that is exactly this
 per-request construction.
 
-### 43.8 Tool table and outcome mapping
+The synthesized `*http.Request` callTwin builds is assembled directly (a literal `&http.Request{...}`),
+never by parsing a request line from attacker-controlled text: an argument is substituted into the
+twin's own path template with `url.PathEscape`, and the value chi's own route context carries (what
+every real handler actually reads) is the raw, unescaped argument, populated on that context directly
+rather than re-derived from the request's own URL. No header or cookie an argument names can ever reach
+the synthesized request either way. Defense in depth beyond that: every tool handler's entire call is
+wrapped in a `recover`, logging the panic with whatever correlation id the request's own context
+carries and answering `-32603` — so no future twin or argument shape that panics instead of erroring can
+take the whole process down with it.
+
+### 43.8 Tool table, argument validation, and outcome mapping
 
 The tool table is the one place a tool is declared: its wire name, its REST twin, the two contracts
 `$def` names its schemas come from, and how a caller's `arguments` object becomes the twin's own URL
 params / query string. Every tool advertises the same four annotations: `readOnlyHint: true`,
 `destructiveHint: false`, `idempotentHint: true`, `openWorldHint: false`.
 
+Before any of that runs, the raw `arguments` object is validated against that SAME tool's own input
+`$def` (santhosh-tekuri/jsonschema/v6, format assertions on) — the pinned SDK's low-level
+`Server.AddTool(*Tool, ToolHandler)` path this Step deliberately uses (so a business refusal can be
+rendered `isError:true` and the whole call can be wrapped in a recover, above) validates nothing against
+`InputSchema` itself; that is documented as the caller's own responsibility, and this Step is that
+caller. A validation failure is a TOOL EXECUTION error (`isError:true`, message = the schema validator's
+own "at '<path>': <reason>" text), per the MCP tools specification's own classification of an
+input-validation failure — never a JSON-RPC protocol code.
+
 One function converts a twin's raw HTTP outcome into the MCP outcome a tool handler returns:
 
 | HTTP from the twin | MCP outcome | Why |
 |---|---|---|
 | 200 | a successful result; content and structured content are the REST body's own bytes, verbatim | never re-encoded, so a caller sees byte-for-byte what the REST route would have written |
-| 400 | a JSON-RPC PROTOCOL error (`-32602`), message = the REST body's own error string | a request-structure problem, not a business refusal — mostly unreachable, since the pinned SDK's own input-schema validation catches most malformed arguments first |
-| 403 / 404 / 409 | a successful result with `isError:true`, content = the REST body's own error string | a business refusal the caller can act on — never a JSON-RPC application code, so the protocol layer stays purely protocol |
+| 400 / 403 / 404 / 409 | a successful result with `isError:true`, content = the REST body's own error string | both a request-structure problem and a business refusal are tool execution errors per the MCP tools specification's own taxonomy — never a JSON-RPC application code, so the model can read the text and correct itself. Argument validation above already catches nearly every 400 case before the twin is ever invoked; this row is what remains reachable for a value the schema's own value-space cannot express |
 | 401 | unreachable inside the bridge (the auth gate already ran); if seen, a defect signal | never trusted as a legitimate outcome |
 | anything else (5xx, …) | `-32603`, "internal error" | a server error is a protocol error; the body is never leaked |
+| a panic anywhere in the tool handler's own call | `-32603`, "internal error", logged with the request's own correlation id | caught by the handler's own recover (§43.7) — defense in depth, not a legitimate outcome either |
 
 ### 43.9 Structural guards
 
 Two mechanical guarantees turn "never a second path" from a review note into a CI property. First, an
-import ban: the MCP adapter package may import the official SDK, the REST handler package, the auth and
-platform packages, contracts, chi, and stdlib — never the Postgres adapter, sqlcgen, the authz domain,
-or any application service package. With that ban in place the adapter cannot reach a store or render an
+import ban: the MCP adapter package — and every one of its own subpackages, a prefix match, not merely
+the exact package path, so a future subpackage cannot import a banned path itself and hand the parent
+package a value that lets it reach a store or the authz domain without ever importing either directly —
+may import the official SDK, the REST handler package, the auth and platform packages, contracts, chi,
+and stdlib — never the Postgres adapter, sqlcgen, the authz domain, or any application service package.
+With that ban in place the adapter cannot reach a store or render an
 authorization verdict except through an HTTP handler it did not write itself. Second, a twin-registration
 test: every tool in the table must name a "METHOD /path" that is a real, registered route — a tool
 without a registered HTTP route cannot be declared. A third, narrower guarantee pins the wire contract
@@ -6749,13 +6781,24 @@ Tool INPUT shapes are new, independent `$def`s in the existing wire-contracts do
 `*Request` suffix so the existing suffix-based direction convention classifies them client-to-platform
 with no checker change — and passed to the SDK VERBATIM, never reflected from a Go type, so the schema a
 client sees is byte-derived from the same contracts document every REST DTO already is. A tool's INPUT
-schema deliberately narrows what it validates when the REST route's own value-space check (an enum, a
-numeric bound) would otherwise be enforced twice, by two divergent messages: once, generically, by the
-schema library, and once by the real route — the schema declares only the wire TYPE, and the single real
-check stays in the twin, so the two paths can never disagree about the same rejection's own wording.
+schema states its REAL value-space constraints (`enum`, `minimum`, `format:"uuid"`,
+`additionalProperties:false`) directly, matching the REST route's own REJECTION bounds where the route
+has one -- deliberately no `maximum` on `limit` (tools/contractscompat's own closed keyword allowlist
+does not recognize it yet, and the REST route does not reject an over-large limit either, only clamps
+it, so a hard `maximum` here would make this contract reject a value REST itself accepts). (A
+prior revision of this section argued for narrowing these to the bare wire TYPE, on the premise that the
+pinned SDK's own generic argument validation would otherwise enforce the same constraint a second, more
+generic way before the twin ever saw it — that premise does not hold for the low-level
+`Server.AddTool(*Tool, ToolHandler)` path this Step actually uses, which validates nothing itself; §43.8
+covers the validation layer this Step provides instead, once, in one place). Because these three `$def`s
+are new in this same Step, stating the real constraints from the start costs nothing in wire-contract
+compatibility terms (a later PR adding `enum`/`minimum` to an ALREADY-published client-to-platform
+`*Request` shape would be a MAJOR change; declaring it here, before anything has shipped, is not).
 Tool OUTPUT shapes are NOT new `$def`s: they reuse the existing REST response shapes unchanged, bundled
-with their own transitively-referenced `$def`s into one self-contained document at boot — no hand-written
-output shape anywhere, matching the wire-contracts document's own long-standing rule.
+with their own transitively-referenced `$def`s into one self-contained document at boot, with a root
+`"type":"object"` added alongside `$ref` — no hand-written output shape anywhere, matching the
+wire-contracts document's own long-standing rule, and satisfying the legacy MCP protocol revisions this
+server also speaks, which restrict `Tool.outputSchema` to `type:"object"` at the root.
 
 ### 43.11 Feature flag
 

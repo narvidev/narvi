@@ -2,8 +2,10 @@ package mcp
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -103,6 +105,82 @@ func TestOrigin_CrossSiteRefused_TrustedAndAbsentPass(t *testing.T) {
 	})
 }
 
+// TestOrigin_RunsBeforeEveryOtherGate proves technical plan §43.2/§43.6's
+// own gate order is load-bearing, not merely tidier: RequireTrustedOrigin
+// is mounted FIRST in the /mcp route group's own chain (newTestHandler),
+// so an invalid Origin gets refused 403 REGARDLESS of the flag, auth, or
+// protocol-version state of the rest of the request -- the Streamable
+// HTTP transport spec's own "MUST respond with HTTP 403 Forbidden" for
+// an invalid Origin is unconditional. A prior revision of this package
+// left the equivalent check to run LAST, deep inside NewHandler's own
+// returned handler (behind RequireEnabled and auth.Middleware in
+// controlplane/serve.go's own route group), so each of the three cases
+// below used to answer 503/401/-32022 INSTEAD of 403 whenever the
+// request also failed that later gate.
+func TestOrigin_RunsBeforeEveryOtherGate(t *testing.T) {
+	badOrigin := map[string]string{"Origin": "https://evil.example"}
+
+	t.Run("disabled + bad Origin -> still 403, not 503", func(t *testing.T) {
+		handler := newTestHandler(t, false, true, testTwins())
+		status, body := rawPost(t, handler, "/mcp", `{}`, badOrigin)
+		if status != http.StatusForbidden {
+			t.Fatalf("status = %d, body = %s, want 403 (the disabled gate must never run first)", status, body)
+		}
+	})
+
+	t.Run("unauthenticated + bad Origin -> still 403, not 401", func(t *testing.T) {
+		handler := newTestHandler(t, true, false, testTwins())
+		status, body := rawPost(t, handler, "/mcp", `{}`, badOrigin)
+		if status != http.StatusForbidden {
+			t.Fatalf("status = %d, body = %s, want 403 (the auth gate must never run first)", status, body)
+		}
+	})
+
+	t.Run("unsupported protocol version + bad Origin -> still 403, not -32022", func(t *testing.T) {
+		handler := newTestHandler(t, true, true, testTwins())
+		headers := map[string]string{"Origin": "https://evil.example", protocolVersionHeader: "1900-01-01"}
+		status, body := rawPost(t, handler, "/mcp", `{}`, headers)
+		if status != http.StatusForbidden {
+			t.Fatalf("status = %d, body = %s, want 403 (the version gate must never run first)", status, body)
+		}
+	})
+}
+
+// TestUnsupportedVersion_Is32022ThroughRealHandler pins technical plan
+// §43.4 through the REAL NewHandler, not a stub: every TestVersionGate_*
+// case in versions_test.go builds versionGate(passthroughHandler(...))
+// directly, around a plain 418-teapot sentinel, never through NewHandler
+// or newTestHandler -- so a regression that stopped wiring versionGate
+// in front of the real SDK handler at all (e.g. handler.go's own `return
+// versionGate(sdkHandler), nil` collapsing to `return sdkHandler, nil`)
+// would leave every one of those tests green while every REAL request
+// through this surface silently lost the gate.
+func TestUnsupportedVersion_Is32022ThroughRealHandler(t *testing.T) {
+	handler := newTestHandler(t, true, true, testTwins())
+
+	status, body := rawPost(t, handler, "/mcp",
+		`{"jsonrpc":"2.0","id":9,"method":"tools/list"}`,
+		map[string]string{protocolVersionHeader: "1900-01-01"})
+	if status != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s, want 400", status, body)
+	}
+	var env jsonrpcEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("unmarshal: %v (body: %s)", err, body)
+	}
+	if env.Error == nil {
+		t.Fatalf("error = nil, want a JSON-RPC -32022 protocol error (body: %s)", body)
+	}
+	if env.Error.Code != -32022 {
+		t.Errorf("error.code = %d, want -32022", env.Error.Code)
+	}
+	for _, v := range SupportedProtocolVersions {
+		if !strings.Contains(env.Error.Message, v) {
+			t.Errorf("error.message = %q does not name version %q", env.Error.Message, v)
+		}
+	}
+}
+
 // TestMethodNotAllowed_GetAndDelete pins technical plan §43.3:
 // Streamable HTTP in stateless mode is POST-only.
 func TestMethodNotAllowed_GetAndDelete(t *testing.T) {
@@ -117,6 +195,42 @@ func TestMethodNotAllowed_GetAndDelete(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestMaxRequestBodyBytes_LargerBodyRefused pins technical plan §43.3: a
+// request body larger than the SAME 1 MiB cap httpapi.
+// MaxRequestBodyBytes already enforces on every REST body this codebase
+// decodes is refused (413), not silently accepted at the SDK's own
+// larger DefaultMaxRequestBodyBytes (4 MiB) -- which is exactly what
+// removing `MaxRequestBodyBytes: MaxRequestBodyBytes` from handler.go's
+// own StreamableHTTPOptions would fall back to.
+func TestMaxRequestBodyBytes_LargerBodyRefused(t *testing.T) {
+	handler := newTestHandler(t, true, true, testTwins())
+	headers := map[string]string{protocolVersionHeader: "2026-07-28", "Mcp-Method": "tools/list"}
+
+	// Comfortably under the cap: accepted.
+	t.Run("under the cap is accepted", func(t *testing.T) {
+		padding := strings.Repeat("x", 1024)
+		body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"padding":%q}}}`, padding)
+		status, respBody := rawPost(t, handler, "/mcp", body, headers)
+		if status != http.StatusOK {
+			t.Fatalf("status = %d, body = %s, want 200", status, respBody)
+		}
+	})
+
+	// Comfortably over the cap (MaxRequestBodyBytes is 1 MiB; this pads
+	// to roughly 2 MiB): refused before the SDK ever parses it as JSON.
+	t.Run("over the cap is refused 413", func(t *testing.T) {
+		padding := strings.Repeat("x", 2<<20)
+		body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"padding":%q}}}`, padding)
+		if len(body) <= MaxRequestBodyBytes {
+			t.Fatalf("test body is %d bytes, want more than MaxRequestBodyBytes (%d)", len(body), MaxRequestBodyBytes)
+		}
+		status, respBody := rawPost(t, handler, "/mcp", body, headers)
+		if status != http.StatusRequestEntityTooLarge {
+			t.Fatalf("status = %d, body = %s, want 413", status, respBody)
+		}
+	})
 }
 
 // legacyInitializeBody builds a pre-2025-06-18-shaped `initialize` call
@@ -285,11 +399,18 @@ func TestServerDiscover_AdvertisesConstant(t *testing.T) {
 			t.Errorf("supportedVersions[%d] = %q, want %q", i, env.Result.SupportedVersions[i], v)
 		}
 	}
-	if _, ok := env.Result.Capabilities["tools"]; !ok {
-		t.Errorf("capabilities = %v, want a \"tools\" key", env.Result.Capabilities)
-	}
-	if _, ok := env.Result.Capabilities["resources"]; ok {
-		t.Errorf("capabilities = %v, must not advertise resources", env.Result.Capabilities)
+	// Assert the EXACT capabilities map, not merely "has tools, lacks
+	// resources": a prior version of this check let "tools" be ANY
+	// shape (e.g. {"listChanged":true}, the SDK's own default when
+	// serverOptions() forgets to set Capabilities explicitly) and never
+	// looked at "logging"/"prompts" at all, so dropping
+	// `Capabilities: &sdkmcp.ServerCapabilities{...}` from serverOptions()
+	// entirely (handler.go) -- which falls back to the SDK's own
+	// default, {"logging":{},"tools":{"listChanged":true}} -- passed this
+	// test undetected.
+	wantCapabilities := map[string]any{"tools": map[string]any{}}
+	if !reflect.DeepEqual(env.Result.Capabilities, wantCapabilities) {
+		t.Errorf("capabilities = %#v, want EXACTLY %#v (no listChanged, no logging, no resources, no prompts)", env.Result.Capabilities, wantCapabilities)
 	}
 	if !strings.Contains(strings.ToLower(env.Result.Instructions), "read-only") {
 		t.Errorf("instructions = %q, want it to say the tools are read-only", env.Result.Instructions)

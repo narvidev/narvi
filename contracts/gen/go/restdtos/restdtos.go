@@ -3805,15 +3805,17 @@ func (j *FalsePositivePattern) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
-// The narvi_get_session MCP tool's own input (technical plan §43.4) -- the tool
+// The narvi_get_session MCP tool's own input (technical plan §43.7) -- the tool
 // bridge's twin of GET /api/sessions/{sessionID}, carrying the path parameter as a
 // plain required field the bridge maps onto chi's own URLParams before invoking
-// the twin handler in-process (technical plan §43.4's bridge).
+// the twin handler in-process (technical plan §43.7's bridge).
 type GetSessionToolRequest struct {
-	// The session id, matching Session.id's own format exactly. A malformed value
-	// fails the bridge's own outcome mapping the same way GET
-	// /api/sessions/{sessionID} fails on a malformed path segment (400, translated to
-	// JSON-RPC -32602).
+	// The session id, matching Session.id's own format exactly. "format":"uuid" is
+	// enforced by this package's own bridge
+	// (internal/adapters/inbound/mcp/schemas.go's validateArguments compiles this
+	// schema with format assertions on), so a malformed value never reaches the twin
+	// at all -- reported as a tool execution error (isError:true), not a JSON-RPC
+	// protocol code.
 	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
 }
 
@@ -4612,36 +4614,84 @@ func (j *ListSessionsResponse) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
-// The narvi_list_sessions MCP tool's own input (technical plan §43.4) -- the tool
+// The narvi_list_sessions MCP tool's own input (technical plan §43.7) -- the tool
 // bridge's twin of GET /api/sessions?filter=&limit=, mirroring that route's own
 // two optional query parameters exactly (httpapi/listsessions.go: filter defaults
 // "mine" when omitted, limit defaults listSessionsDefaultLimit and is capped at
 // listSessionsMaxLimit server-side). Both fields are optional; the bridge builds
 // the twin's own url.Values from whichever of these two the caller actually set,
 // omitting the rest so the handler's own defaulting behavior runs unchanged.
+// filter/limit carry the REAL value-space constraints below, validated by this
+// package's own bridge (internal/adapters/inbound/mcp/schemas.go's
+// validateArguments) before either BuildRequest or the twin ever sees an argument
+// -- a prior revision of this $def deliberately omitted "enum"/"minimum" on the
+// mistaken premise that the pinned MCP SDK's own raw Server.AddTool path enforced
+// them; it enforces nothing on that path, so the omission bought no parity
+// benefit, only a weaker contract.
 type ListSessionsToolRequest struct {
 	// Matches GET /api/sessions's own ?filter= values exactly
-	// (httpapi/listsessions.go) -- "mine" (the default when omitted) or "all".
-	// Deliberately NOT a schema-level "enum" here: the pinned SDK
-	// (github.com/google/jsonschema-go) DOES enforce "enum", and enforcing it here
-	// would let an invalid value (e.g. "x") be rejected by the SDK's own generic
-	// argument-validation error -- a DIFFERENT, less specific message than the REST
-	// route's own "filter must be \"mine\" or \"all\"" -- before the request ever
-	// reaches the bridge. Declaring only "type" lets every value reach the twin
-	// handler unchanged, so the bridge's own outcome mapping (technical plan §43.4)
-	// always carries the REST route's own exact error text, preserving byte-for-byte
-	// HTTP/MCP parity for this row instead of two divergent validation paths.
-	Filter *string `json:"filter,omitempty,omitzero" yaml:"filter,omitempty" mapstructure:"filter,omitempty"`
+	// (httpapi/listsessions.go) -- "mine" (the default when omitted) or "all". A
+	// value outside this enum fails validation before the twin is ever invoked, and
+	// is reported as a tool execution error (isError:true), never a JSON-RPC protocol
+	// code -- see doc.go's own HTTP-outcome-to-MCP-outcome table.
+	Filter *ListSessionsToolRequestFilter `json:"filter,omitempty,omitzero" yaml:"filter,omitempty" mapstructure:"filter,omitempty"`
 
 	// Matches GET /api/sessions's own ?limit= exactly
 	// (httpapi.listSessionsDefaultLimit/listSessionsMaxLimit): omitted means the
-	// route's own default. Deliberately NOT a schema-level "minimum"/"maximum" here
-	// -- same reasoning as filter's own doc comment immediately above: the pinned SDK
-	// DOES enforce "minimum", which would substitute the SDK's own generic message
-	// for the REST route's exact "malformed limit" text before the bridge ever runs.
-	// A value above the route's own upper bound (200) is not rejected either way --
-	// like the REST route itself, it is silently clamped server-side.
+	// route's own default. minimum matches the REST route's own rejection (<= 0 is
+	// refused, "malformed limit"). Deliberately NO "maximum" here, for two
+	// independent reasons: tools/contractscompat's own closed keyword allowlist does
+	// not recognize "maximum" yet (it fails closed on any schema node using it -- see
+	// that tool's own keywords.go), and a value above listSessionsMaxLimit is not
+	// actually a REST-route REJECTION either way -- like the REST route itself, it is
+	// silently clamped server-side, so declaring a hard "maximum" here would make
+	// this tool's own contract reject a value the REST route accepts, a real behavior
+	// divergence "restore the real constraints" is not asking for.
 	Limit *int `json:"limit,omitempty,omitzero" yaml:"limit,omitempty" mapstructure:"limit,omitempty"`
+}
+
+type ListSessionsToolRequestFilter string
+
+const ListSessionsToolRequestFilterAll ListSessionsToolRequestFilter = "all"
+const ListSessionsToolRequestFilterMine ListSessionsToolRequestFilter = "mine"
+
+var enumValues_ListSessionsToolRequestFilter = []interface{}{
+	"mine",
+	"all",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *ListSessionsToolRequestFilter) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_ListSessionsToolRequestFilter {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_ListSessionsToolRequestFilter, v)
+	}
+	*j = ListSessionsToolRequestFilter(v)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *ListSessionsToolRequest) UnmarshalJSON(value []byte) error {
+	type Plain ListSessionsToolRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if plain.Limit != nil && 1 > *plain.Limit {
+		return fmt.Errorf("field %s: must be >= %v", "limit", 1)
+	}
+	*j = ListSessionsToolRequest(plain)
+	return nil
 }
 
 // 200 response for GET /api/workflow-bindings (§25.10) -- every (lane, repo)
@@ -13108,6 +13158,14 @@ const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
 const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
 const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
 
+var enumValues_WorkflowStepRunStatus = []interface{}{
+	"awaiting_decision",
+	"running",
+	"completed",
+	"failed",
+	"cancelled",
+}
+
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 	var v string
@@ -13126,16 +13184,6 @@ func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 	}
 	*j = WorkflowStepRunStatus(v)
 	return nil
-}
-
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
-
-var enumValues_WorkflowStepRunStatus = []interface{}{
-	"awaiting_decision",
-	"running",
-	"completed",
-	"failed",
-	"cancelled",
 }
 
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
@@ -13199,3 +13247,5 @@ func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
 	*j = WorkflowStepRun(plain)
 	return nil
 }
+
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict

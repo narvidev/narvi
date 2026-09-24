@@ -33,11 +33,10 @@ func TestOutcomeMapping(t *testing.T) {
 			wantStructured: true,
 		},
 		{
-			name:        "400 becomes a protocol error, not isError",
-			status:      http.StatusBadRequest,
-			body:        `{"error":"malformed session id"}`,
-			wantErr:     true,
-			wantErrCode: jsonrpc.CodeInvalidParams,
+			name:     "400 becomes isError:true with the handler's own text, not a protocol error",
+			status:   http.StatusBadRequest,
+			body:     `{"error":"malformed session id"}`,
+			wantText: "malformed session id",
 		},
 		{
 			name:     "403 becomes isError:true with the handler's own text",
@@ -65,9 +64,16 @@ func TestOutcomeMapping(t *testing.T) {
 			wantErrCode: jsonrpc.CodeInternalError,
 		},
 		{
+			// The extracted text here is DELIBERATELY different from
+			// the fixed "internal error" message mapOutcome must return
+			// -- see the "never leak" check below for why a fixture
+			// whose own extracted text coincides with the fixed message
+			// (a prior revision of this table used exactly
+			// {"error":"internal error"} here) can never tell a correct
+			// mapping from a leaking one apart.
 			name:        "5xx is a protocol error, body never leaked",
 			status:      http.StatusInternalServerError,
-			body:        `{"error":"internal error"}`,
+			body:        `{"error":"boom: db connection refused"}`,
 			wantErr:     true,
 			wantErrCode: jsonrpc.CodeInternalError,
 		},
@@ -91,11 +97,25 @@ func TestOutcomeMapping(t *testing.T) {
 				if result != nil {
 					t.Errorf("result = %+v, want nil alongside a protocol error", result)
 				}
-				// Never leak the raw body into a protocol-error message
-				// for the two "never leak" rows.
+				// Never leak the handler's own extracted error text into
+				// a protocol-error message for the two "never leak"
+				// rows -- compared against errorTextFrom(body) (the
+				// SAME extraction every isError branch displays
+				// verbatim), never the raw JSON body. A prior version
+				// of this check compared jerr.Message against tt.body
+				// directly: jerr.Message is always the fixed string
+				// "internal error", and tt.body is always a raw JSON
+				// object -- the two can NEVER be byte-equal, so that
+				// check could never fail, whatever mapOutcome actually
+				// returned (verified: swapping either branch below to
+				// `Message: errorTextFrom(body)` still passed the old
+				// check). Comparing against errorTextFrom(body) instead
+				// -- combined with the 5xx fixture's own extracted text
+				// now deliberately differing from "internal error" --
+				// makes this a real assertion.
 				if tt.status == http.StatusUnauthorized || tt.status >= 500 {
-					if jerr.Message == tt.body {
-						t.Errorf("error.Message leaked the raw body: %q", jerr.Message)
+					if jerr.Message == errorTextFrom([]byte(tt.body)) {
+						t.Errorf("error.Message leaked the handler's own text: %q", jerr.Message)
 					}
 				}
 				return

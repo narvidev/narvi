@@ -84,3 +84,63 @@ func TestCallTwin_NoQueryOmitsQuestionMark(t *testing.T) {
 		t.Errorf("constructed URL = %q, want %q", gotURL, "/api/models")
 	}
 }
+
+// TestCallTwin_MaliciousURLParamsNeverPanic reproduces findings M1/M2/M3
+// of the adversarial review of PR #324 (a prior version of callTwin
+// called httptest.NewRequest(method, target, nil), where target held the
+// raw urlParams value spliced in unescaped: that function PANICS,
+// rather than returning an error, on a target it cannot parse as an
+// HTTP request line -- and the SDK runs every tool handler in its own
+// goroutine with no recover anywhere in ITS call stack, so the panic
+// killed the whole process, not merely this request). Every value below
+// crashed the test binary before this fix (verified by temporarily
+// reverting callTwin to the old construction: every subtest below
+// crashes instead of failing cleanly). Each must now: reach the stub
+// handler (proving no panic happened along the way), carry the value
+// UNCHANGED in chi's own route context (the actual source of truth every
+// real handler reads -- see replaceURLParam's own doc comment), and
+// inject NO header/cookie into the synthesized request.
+func TestCallTwin_MaliciousURLParamsNeverPanic(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{"space", "a b"},
+		{"invalid percent-escape", "%zz"},
+		{"tab", "x\ty"},
+		{"bare CRLF", "x\r\nX-Injected: yes"},
+		{"header/cookie injection attempt", "x HTTP/1.1\r\nX-Injected: yes\r\nCookie: narvi_auth_session=forged"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotSessionID string
+			var gotHeader http.Header
+			stub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotSessionID = chi.URLParam(r, "sessionID")
+				gotHeader = r.Header.Clone()
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"ok":true}`))
+			})
+			tw := twin{method: http.MethodGet, pathTemplate: "/api/sessions/{sessionID}", handler: stub}
+
+			// The call itself must not panic -- if it did, this
+			// subtest (and the whole test binary, since the SDK's own
+			// goroutine has no recover either) would never reach the
+			// assertions below at all.
+			status, body := callTwin(context.Background(), tw, map[string]string{"sessionID": tt.value}, nil)
+
+			if status != http.StatusOK {
+				t.Fatalf("status = %d, body = %s, want 200 (the stub handler must have run)", status, body)
+			}
+			if gotSessionID != tt.value {
+				t.Errorf("chi.URLParam(sessionID) = %q, want the RAW value %q unchanged", gotSessionID, tt.value)
+			}
+			if gotHeader.Get("X-Injected") != "" {
+				t.Errorf("synthesized request carried an injected header: X-Injected = %q, want none", gotHeader.Get("X-Injected"))
+			}
+			if gotHeader.Get("Cookie") != "" {
+				t.Errorf("synthesized request carried an injected cookie: Cookie = %q, want none", gotHeader.Get("Cookie"))
+			}
+		})
+	}
+}
