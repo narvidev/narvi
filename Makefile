@@ -177,12 +177,14 @@ test-integration-group-4:
 # configured, same caveat as Modal/Slack/Linear above.
 # Step 58 ("uploads, blob storage & the in-sandbox download_file tool",
 # §28.7) adds the NARVI_OBJECT_STORE_* block, pointed at
-# docker-compose.dev.yml's own new minio service: the root user/password/
-# bucket here match that file's own MINIO_ROOT_USER/MINIO_ROOT_PASSWORD and
-# the minio-init service's own provisioned bucket name EXACTLY -- unlike
-# every credential above, these are not placeholders, uploads actually
-# work end to end against this local MinIO. NARVI_OBJECT_STORE_USE_PATH_STYLE
-# is required true for MinIO (§28.7's own path-style toggle).
+# docker-compose.dev.yml's own objectstore service (versity/versitygw,
+# replacing MinIO -- see that file's own comment): the root user/password/
+# bucket here match that file's own ROOT_ACCESS_KEY/ROOT_SECRET_KEY and its
+# own self-provisioned bucket name EXACTLY -- unlike every credential
+# above, these are not placeholders, uploads actually work end to end
+# against this local objectstore service. NARVI_OBJECT_STORE_USE_PATH_STYLE
+# is required true for it (§28.7's own path-style toggle, same requirement
+# MinIO-style backends generally have).
 dev:
 	docker compose -f docker-compose.dev.yml up -d --wait
 	NARVI_STAGE=development \
@@ -210,7 +212,7 @@ dev:
 	NARVI_ANTHROPIC_API_KEY=dev-anthropic-api-key-placeholder \
 	NARVI_INTENT_CLASSIFIER_PROVIDER=anthropic \
 	NARVI_INTENT_CLASSIFIER_MODEL=claude-haiku-4-5 \
-	NARVI_OBJECT_STORE_ENDPOINT=http://localhost:$${NARVI_DEV_MINIO_PORT:-9000} \
+	NARVI_OBJECT_STORE_ENDPOINT=http://localhost:$${NARVI_DEV_OBJSTORE_PORT:-9000} \
 	NARVI_OBJECT_STORE_REGION=us-east-1 \
 	NARVI_OBJECT_STORE_BUCKET=narvi-dev-uploads \
 	NARVI_OBJECT_STORE_ACCESS_KEY_ID=narvi \
@@ -371,14 +373,17 @@ dist: web-build lint-web-assets
 # without this target passing against that exact commit first).
 #
 # Brings up ONLY docker-compose.dev.yml's own postgres service -- never
-# minio/minio-init (§41.1 review round 1, finding P4): the object-store
-# variables are entirely optional, feature-flagged on
-# NARVI_OBJECT_STORE_ENDPOINT alone (internal/platform/config.go), and
-# this target's own containers never set it, so no running MinIO is ever
-# needed to boot. Sidestepped rather than fixed: minio-init's own image
-# (docker-compose.dev.yml) still pulls minio/mc from Docker Hub, which
-# stopped answering anonymous pulls -- this target has no reason to bring
-# MinIO up at all, so it never hits that pull.
+# its objectstore service (§41.1 review round 1, finding P4, written when
+# that service was still MinIO+minio-init): the object-store variables are
+# entirely optional, feature-flagged on NARVI_OBJECT_STORE_ENDPOINT alone
+# (internal/platform/config.go), and this target's own containers never
+# set it, so no running object-store backend is ever needed to boot. This
+# was originally ALSO a deliberate sidestep of MinIO's own broken
+# anonymous pull (minio-init's image had stopped answering Docker Hub
+# pulls) -- that reason no longer applies now that docker-compose.dev.yml's
+# objectstore service pulls cleanly (see that file's own comment), but the
+# underlying reason to skip it here still holds on its own: this target
+# has no reason to bring any object-store backend up at all.
 #
 # Runs the compose stack under its OWN project name (-p), fully separate
 # from `make dev`'s default project: this target must not disturb (or be

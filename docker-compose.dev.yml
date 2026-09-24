@@ -22,80 +22,77 @@ services:
       timeout: 5s
       retries: 30
 
-  # minio is §28's own dev-loop story for object storage (§28.7:
+  # objectstore is §28's own dev-loop story for object storage (§28.7:
   # "docker-compose.dev.yml gains a MinIO service for `make dev`") -- the
   # S3-compatible backend internal/adapters/outbound/objstore talks to in
-  # development, mirroring the postgres service above exactly (same
+  # development, mirroring the postgres service above (same
   # override-via-.env port convention, same CMD-SHELL healthcheck shape).
-  # Pulled from quay.io, MinIO's own registry, NOT Docker Hub. The comment
-  # here used to note that minio/minio's Docker Hub publishing "appears to
-  # have gone quiet after this exact release" -- it has since stopped
-  # answering anonymous pulls entirely ("repository does not exist or may
-  # require 'docker login'"), which broke CI and every local
-  # `docker compose up` alike. quay.io serves the SAME pinned tag, so the
-  # only thing that changed is where it comes from.
   #
-  # Same tag internal/adapters/outbound/objstore/
-  # objstore_integration_test.go's own testcontainer uses, for the same
-  # consistency reason the postgres service's own image comment above
-  # already gives. Deliberately not ":latest", so a local
-  # `docker compose pull` can't silently change dev's behavior out from
-  # under anyone.
-  minio:
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
-    command: server /data --console-address ":9001"
+  # This was MinIO through RELEASE.2025-09-07T16-13-09Z, pulled from
+  # quay.io after Docker Hub's minio/minio first went quiet. Both
+  # registries have since stopped answering ANY anonymous pull at all
+  # ("unauthorized" / "pull access denied ... repository does not exist
+  # or may require 'docker login'"), reproduced directly against this
+  # exact pinned tag from a developer machine -- not a rate limit, not
+  # transient, and it broke CI and every local `docker compose up` alike.
+  #
+  # Replaced with versity/versitygw (Apache-2.0,
+  # github.com/versity/versitygw), a purpose-built S3-protocol gateway,
+  # after four MinIO-replacement candidates were run for real against
+  # internal/adapters/outbound/objstore's own integration test using the
+  # actual production SDK code -- see that test's own s3GatewayImage doc
+  # comment for the full candidate comparison (rustfs, seaweedfs, and
+  # adobe/s3mock were also tried; versitygw won on maturity, image size,
+  # startup time, and being the only candidate besides seaweedfs that
+  # actually enforces SigV4 signatures). Same image, same pinned tag AND
+  # digest that package's own testcontainer uses, for the same consistency
+  # reason the postgres service's own image comment above already gives.
+  # Deliberately not ":latest", so a local `docker compose pull` can't
+  # silently change dev's behavior out from under anyone.
+  #
+  # versitygw's own posix backend needs zero separate provisioning: unlike
+  # MinIO (which booted with zero buckets and needed a whole separate
+  # minio-init service running `mc mb`), the posix backend treats every
+  # SUBdirectory of its top-level directory as a bucket (its own --help:
+  # "All sub directories of the top level directory are treated as
+  # buckets") -- so `mkdir -p /data/narvi-dev-uploads` before starting the
+  # binary is the entire bucket-provisioning story, folded into this one
+  # service. The bucket name (narvi-dev-uploads) matches the Makefile's
+  # own `dev` target's NARVI_OBJECT_STORE_BUCKET value exactly -- a
+  # mismatch here would only surface once someone actually ran `make dev`
+  # and tried to upload something. `command` MUST be a one-element YAML
+  # list, not a bare scalar string -- see the old minio-init service's own
+  # (now-removed) comment on why: Compose word-splits a scalar `command`
+  # string into a separate exec-argv element per word, silently truncating
+  # at "&&".
+  #
+  # No web-console equivalent is published (MinIO's old 9001) -- nothing
+  # in this repo depends on it; use versitygw's own --webui flag locally
+  # if you want one.
+  objectstore:
+    image: versity/versitygw:v1.8.0@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499
+    entrypoint: ["sh", "-c"]
+    command:
+      - "mkdir -p /data/narvi-dev-uploads && exec /usr/local/bin/versitygw --health /healthz posix /data"
     environment:
-      MINIO_ROOT_USER: narvi
-      MINIO_ROOT_PASSWORD: narvi-dev-secret
-    # Override the published ports per worktree the same way NARVI_DEV_PG_PORT
-    # does above, via an untracked .env file (NARVI_DEV_MINIO_PORT /
-    # NARVI_DEV_MINIO_CONSOLE_PORT). 9000 is the S3 API; 9001 is the web
-    # console.
+      ROOT_ACCESS_KEY: narvi
+      ROOT_SECRET_KEY: narvi-dev-secret
+    # Override the published port per worktree the same way NARVI_DEV_PG_PORT
+    # does above, via an untracked .env file (NARVI_DEV_OBJSTORE_PORT).
     ports:
-      - "127.0.0.1:${NARVI_DEV_MINIO_PORT:-9000}:9000"
-      - "127.0.0.1:${NARVI_DEV_MINIO_CONSOLE_PORT:-9001}:9001"
+      - "127.0.0.1:${NARVI_DEV_OBJSTORE_PORT:-9000}:7070"
     volumes:
-      - narvi-dev-minio:/data
+      - narvi-dev-objectstore:/data
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live"]
+      # --health above configures an unauthenticated GET /healthz
+      # (verified directly against this pinned image); wget, not curl,
+      # since that's what this image's own alpine/busybox base actually
+      # ships (confirmed directly -- no curl binary present).
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:7070/healthz"]
       interval: 2s
       timeout: 5s
       retries: 30
 
-  # minio-init is a one-shot bucket-provisioning step. MinIO itself boots
-  # with zero buckets, and BlobStore deliberately has no bucket-management
-  # method of its own (§28.1 -- provisioning a bucket is a deployment
-  # concern, never the adapter's job): without this, `make dev` would hand
-  # you a running, empty MinIO, and every presigned PUT/GET against the
-  # configured bucket would 404 until someone created it by hand. Runs
-  # once, against the SAME root credentials the minio service above was
-  # given, then exits -- depends_on's service_healthy condition (not just
-  # "started") ensures minio's own health check, not merely its process
-  # starting, has already passed before this runs. The bucket name
-  # (narvi-dev-uploads) matches the Makefile's own `dev` target's
-  # NARVI_OBJECT_STORE_BUCKET value exactly -- a mismatch here would only
-  # surface once someone actually ran `make dev` and tried to upload
-  # something.
-  minio-init:
-    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
-    depends_on:
-      minio:
-        condition: service_healthy
-    # mc's own image entrypoint is ["mc"] -- overridden here so `command`
-    # below can chain two mc invocations (alias set, then bucket create)
-    # through a real shell instead of being passed as literal arguments to
-    # a single mc call. `command` MUST be a one-element YAML list, not a
-    # bare scalar string: Compose word-splits a scalar `command` string
-    # into a separate exec-argv element per word (like Dockerfile CMD's
-    # own shell-form-to-exec-form conversion) -- confirmed directly, this
-    # silently truncated the whole script at "&&" and ran a bare, argless
-    # `mc` (its own usage/help text) instead. Wrapping the full script as
-    # the single list element passes it to "/bin/sh -c" verbatim, with no
-    # further splitting.
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - "mc alias set local http://minio:9000 narvi narvi-dev-secret && mc mb --ignore-existing local/narvi-dev-uploads"
-
 volumes:
   narvi-dev-postgres:
-  narvi-dev-minio:
+  narvi-dev-objectstore:
