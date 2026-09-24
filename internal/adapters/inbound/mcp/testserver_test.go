@@ -1,6 +1,8 @@
 package mcp
 
 import (
+	"bytes"
+	"log/slog"
 	"net/http"
 	"testing"
 
@@ -8,6 +10,21 @@ import (
 
 	"github.com/narvidev/narvi/internal/platform"
 )
+
+// swapDefaultLogger points slog.SetDefault at a fresh handler writing into
+// the returned *bytes.Buffer for the duration of the calling test (t.
+// Cleanup restores the prior default) -- platform.Logger(ctx) always
+// resolves to slog.Default() (internal/platform/logging.go), so this is
+// how a test observes (or asserts the ABSENCE of) a log line this
+// package's own handlers write, without a real logging backend.
+func swapDefaultLogger(t testing.TB) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
 
 // testUser stands in for a real, authenticated platform.AuthenticatedUser
 // -- an arbitrary but syntactically valid UUID, "member" role (an

@@ -215,7 +215,7 @@ func TestToolCall_ListSessions_BadFilterIsToolExecutionError(t *testing.T) {
 // over-large limit either, only clamps it), so limit:300 reaches the
 // twin exactly like the REST route's own identical clamping behavior.
 func TestToolCall_ListSessions_InvalidLimitIsToolExecutionError(t *testing.T) {
-	for _, limit := range []int{0, -5} {
+	for _, limit := range []int{0, -1, -5} {
 		t.Run(fmt.Sprintf("limit=%d", limit), func(t *testing.T) {
 			invoked := false
 			twins := testTwins()
@@ -240,6 +240,96 @@ func TestToolCall_ListSessions_InvalidLimitIsToolExecutionError(t *testing.T) {
 			}
 			if env.Result == nil || !env.Result.IsError {
 				t.Fatalf("result = %+v, want IsError:true", env.Result)
+			}
+		})
+	}
+}
+
+// TestToolCall_ListSessions_SchemaValidIntegerSpellings pins the fix for
+// round 2 review findings N8/N11/N17: JSON Schema's own "integer" type
+// accepts any number with a zero fractional part -- "1.0" and "1e2" are
+// both integers, with no int64 bound, so a value like 2^63
+// (9223372036854775808) is one too. A prior revision of BuildRequest
+// unmarshaled limit straight into a generated *int field, whose
+// encoding/json decoder rejects every one of these literally, landing in
+// a branch its own comment called "unreachable in practice" that logged
+// the raw Go error at ERROR ("mcp: BuildRequest failed after schema
+// validation passed") on every occurrence and returned a bare, unhelpful
+// "invalid arguments".
+//
+// intFromJSONNumber (tools.go) now converts these explicitly: "1.0" and
+// "1e2" are schema-valid AND representable, so they must now reach the
+// twin as the plain integers they denote (1 and 100) -- a strictly
+// better outcome than before, not merely a quieter failure. 2^63 is
+// schema-valid but NOT representable in a Go int, so it must still be
+// refused, but as an ordinary tool execution error with no ERROR log
+// line and no leaked Go type/field name.
+func TestToolCall_ListSessions_SchemaValidIntegerSpellings(t *testing.T) {
+	tests := []struct {
+		name       string
+		limitJSON  string
+		wantLimit  string // twin's own ?limit= value, iff invoked
+		wantCalled bool
+	}{
+		{name: "1.0 is the integer 1", limitJSON: `1.0`, wantLimit: "1", wantCalled: true},
+		{name: "1e2 is the integer 100", limitJSON: `1e2`, wantLimit: "100", wantCalled: true},
+		{name: "2^63 does not fit an int64", limitJSON: `9223372036854775808`, wantCalled: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logBuf := swapDefaultLogger(t)
+
+			var gotQuery string
+			invoked := false
+			twins := testTwins()
+			twins.ListSessions = func(w http.ResponseWriter, r *http.Request) {
+				invoked = true
+				gotQuery = r.URL.RawQuery
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"sessions":[]}`))
+			}
+			handler := newTestHandler(t, true, true, twins)
+
+			args := fmt.Sprintf(`{"limit":%s}`, tt.limitJSON)
+			status, body := rawPost(t, handler, "/mcp", callToolBody(1, "narvi_list_sessions", args), callToolHeaders("narvi_list_sessions"))
+			if status != http.StatusOK {
+				t.Fatalf("status = %d, body = %s, want 200", status, body)
+			}
+			if invoked != tt.wantCalled {
+				t.Fatalf("twin invoked = %v, want %v", invoked, tt.wantCalled)
+			}
+
+			var env callToolResultEnvelope
+			if err := json.Unmarshal(body, &env); err != nil {
+				t.Fatalf("unmarshal: %v (body: %s)", err, body)
+			}
+
+			if tt.wantCalled {
+				if env.Result == nil || env.Result.IsError {
+					t.Fatalf("result = %+v, want a successful result", env.Result)
+				}
+				if gotQuery != "limit="+tt.wantLimit {
+					t.Errorf("twin's own raw query = %q, want %q", gotQuery, "limit="+tt.wantLimit)
+				}
+			} else {
+				if env.Result == nil || !env.Result.IsError {
+					t.Fatalf("result = %+v, want IsError:true", env.Result)
+				}
+				if len(env.Result.Content) != 1 {
+					t.Fatalf("content = %+v, want exactly one text block", env.Result.Content)
+				}
+				text := env.Result.Content[0].Text
+				if !strings.Contains(text, "invalid arguments") {
+					t.Errorf("content text = %q, want it to say the arguments are invalid", text)
+				}
+				if strings.Contains(text, "Go struct field") || strings.Contains(text, "restdtos.") {
+					t.Errorf("content text = %q, leaks an internal Go type/field name", text)
+				}
+			}
+
+			if strings.Contains(logBuf.String(), "level=ERROR") {
+				t.Errorf("an out-of-range but schema-valid integer must not log at ERROR (this is an ordinary caller mistake, not a defect); log output:\n%s", logBuf.String())
 			}
 		})
 	}
