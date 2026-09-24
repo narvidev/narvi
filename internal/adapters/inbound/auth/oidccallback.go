@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -38,10 +39,56 @@ const (
 	OIDCOutcomeExchangeFailed   OIDCCallbackOutcome = "oidc_exchange_failed"
 	OIDCOutcomeMissingIDToken   OIDCCallbackOutcome = "oidc_missing_id_token"
 	OIDCOutcomeVerifyFailed     OIDCCallbackOutcome = "oidc_verify_failed"
+	OIDCOutcomeEmptySubject     OIDCCallbackOutcome = "oidc_empty_subject"
 	OIDCOutcomeNonceMismatch    OIDCCallbackOutcome = "oidc_nonce_mismatch"
 	OIDCOutcomeAudienceMismatch OIDCCallbackOutcome = "oidc_audience_mismatch"
 	OIDCOutcomeEmailNotVerified OIDCCallbackOutcome = "oidc_email_not_verified"
 )
+
+// auditActionForOIDCOutcome names the audit_log action recorded for each
+// AUDITABLE OIDC refusal reason -- review round 1, finding O8: §41.3's
+// own exit criterion for the email_verified refusal ("refused with the
+// audited reason") generalizes to every refusal this handler can reach
+// ONCE the ID token itself is verified (idToken.Issuer/Subject valid,
+// so a meaningful external_id exists to key the row on) -- empty
+// subject, nonce mismatch, audience mismatch, email_verified, and
+// first-time-denied all get a row now, exactly like the pre-existing
+// ambiguous-match refusal already does (auditActionOIDCAmbiguousMatch).
+// Deliberately NOT extended to state mismatch, exchange failure, a
+// missing id_token, or a verify failure itself: none of those have a
+// verified issuer/sub to key a meaningful row on (a state/nonce cookie
+// mismatch could be anyone; an unverified token's own claims cannot be
+// trusted as identity at all) -- inventing a synthetic key there would
+// be noise, not a security-relevant audit trail.
+var auditActionForOIDCOutcome = map[OIDCCallbackOutcome]string{
+	OIDCOutcomeEmptySubject:     "identity.oidc_empty_subject",
+	OIDCOutcomeNonceMismatch:    "identity.oidc_nonce_mismatch",
+	OIDCOutcomeAudienceMismatch: "identity.oidc_audience_mismatch",
+	OIDCOutcomeEmailNotVerified: "identity.oidc_email_not_verified",
+	OIDCOutcomeFirstTimeDenied:  "identity.oidc_first_time_denied",
+}
+
+// auditOIDCRefusal records the audit_log row for one of
+// auditActionForOIDCOutcome's own named outcomes -- resourceID is the
+// caller's own best-known identity key (externalID once the ID token is
+// verified; may legitimately be "{issuer}|" for OIDCOutcomeEmptySubject,
+// since sub is exactly what's missing there). Never blocks the refusal
+// itself on the audit write failing -- mirrors the pre-existing
+// ambiguous-match branch's own identical "a lost audit row here is an
+// observability gap, not a security one" discipline.
+func auditOIDCRefusal(ctx context.Context, auditLog *postgres.AuditLogStore, outcome OIDCCallbackOutcome, resourceID string, detail map[string]any) {
+	action, ok := auditActionForOIDCOutcome[outcome]
+	if !ok {
+		return
+	}
+	if detail == nil {
+		detail = map[string]any{}
+	}
+	detail["external_id"] = resourceID
+	if err := auditlog.Record(ctx, auditLog, pgtype.UUID{}, action, "identity", resourceID, detail); err != nil {
+		_ = err
+	}
+}
 
 // NewOIDCCallbackHandler backs GET /auth/oidc/callback (§41.3).
 //
@@ -60,14 +107,20 @@ const (
 //   - verifier.Verify failure (bad signature, wrong issuer, expired token)
 //     -> 401 (OIDCOutcomeVerifyFailed) -- go-oidc's own job; this package
 //     never re-implements it.
+//   - ID token's own `sub` claim is empty or whitespace-only -> 401
+//     (OIDCOutcomeEmptySubject), audited (review round 1, finding O11):
+//     OIDC Core §2 makes `sub` REQUIRED, but go-oidc's own Verify never
+//     enforces that -- an empty sub would collapse oidcExternalID onto
+//     "{issuer}|" for every affected sign-in, regardless of who the real
+//     person is.
 //   - ID token's own `nonce` claim != the narvi_oidc_nonce cookie -> 401
-//     (OIDCOutcomeNonceMismatch).
+//     (OIDCOutcomeNonceMismatch), audited.
 //   - ID token's own `aud` does not contain the configured client id -> 401
-//     (OIDCOutcomeAudienceMismatch).
+//     (OIDCOutcomeAudienceMismatch), audited.
 //   - `email_verified` claim absent, false, or not literally the JSON
 //     boolean true (e.g. a string "true") -> 403
-//     (OIDCOutcomeEmailNotVerified) -- §41.3: "Never fall back to an
-//     unverified email."
+//     (OIDCOutcomeEmailNotVerified), audited -- §41.3: "Never fall back to
+//     an unverified email... refused with the audited reason."
 //   - Identity already linked (GetByProviderAndExternalID hits) ->
 //     "returning user" (OIDCOutcomeReturningUser) -- a fresh session is
 //     minted, 302 to "/". The allowlist is skipped entirely, exactly like
@@ -85,8 +138,8 @@ const (
 //     users row model, default-role assignment, and allowlist gate as
 //     GitHub's own first-time-sign-in branch.
 //   - Identity not linked, zero existing users match, allowlist fails ->
-//     403 (OIDCOutcomeFirstTimeDenied); no user/identity/session row is
-//     ever created.
+//     403 (OIDCOutcomeFirstTimeDenied), audited; no user/identity/session
+//     row is ever created.
 //   - Identity not linked, MORE THAN ONE existing user matches the
 //     verified email -> 403 (OIDCOutcomeAmbiguousMatch), audited, no
 //     row ever created -- §13.2's own "never guess" rule: unlike Slack/
@@ -97,6 +150,14 @@ const (
 //     to page whoever owns identity hygiene for this deployment, rather
 //     than silently guess which of several accounts just proved control
 //     of one email address.
+//
+// Every refusal from the empty-subject check onward is written to
+// audit_log (auditOIDCRefusal/auditActionForOIDCOutcome, below) -- once
+// the ID token is verified and its subject is known non-empty, every
+// later refusal has a meaningful external_id to key the row on. State
+// mismatch, exchange failure, a missing id_token, and a verify failure
+// itself are deliberately NOT audited: none of those have a verified
+// identity to attribute the row to.
 //
 // pool/users/identities/auditLog/userSessions/allowlist/initialAdminEmails/
 // timeouts/secureCookies mirror NewCallbackHandler's own identical
@@ -198,7 +259,10 @@ func NewOIDCCallbackHandler(
 		// go-oidc's own job (rt.verifier was built with
 		// SkipClientIDCheck: true -- OIDCProviderCache.get's own doc
 		// comment explains why the audience check below is this
-		// package's own, explicit responsibility instead).
+		// package's own, explicit responsibility instead). No verified
+		// issuer/sub exists yet on failure here, so this refusal is
+		// logged only, never audited -- see auditActionForOIDCOutcome's
+		// own doc comment for why.
 		idToken, err := rt.verifier.Verify(ctx, rawIDToken)
 		if err != nil {
 			logger.Warn("auth: oidc callback rejected", "outcome", OIDCOutcomeVerifyFailed, "error", err)
@@ -206,31 +270,56 @@ func NewOIDCCallbackHandler(
 			return
 		}
 
+		// c.1. Empty (or whitespace-only) `sub` (review round 1, finding
+		// O11): OIDC Core §2 makes `sub` REQUIRED, but go-oidc's own
+		// Verify never enforces that -- an empty sub would make
+		// oidcExternalID collapse onto "{issuer}|", the SAME row for
+		// every future sign-in from any OTHER person whose IdP has the
+		// identical bug/misconfiguration (the second such person to sign
+		// in would hit the returning-user fast path on the FIRST
+		// person's own identity/user row). Checked here, before
+		// externalID is ever built or used for anything -- one line
+		// closes it outright, rather than relying on every downstream
+		// consumer to notice.
+		if strings.TrimSpace(idToken.Subject) == "" {
+			logger.Warn("auth: oidc callback rejected", "outcome", OIDCOutcomeEmptySubject, "issuer", idToken.Issuer)
+			auditOIDCRefusal(ctx, auditLog, OIDCOutcomeEmptySubject, oidcExternalID(idToken.Issuer, ""), nil)
+			http.Error(w, "oidc id token has no subject", http.StatusUnauthorized)
+			return
+		}
+		externalID := oidcExternalID(idToken.Issuer, idToken.Subject)
+
 		// d. Nonce check: the ID token's own nonce claim (go-oidc reads it
 		// off the token, IDToken.Nonce) must equal the value THIS
 		// browser's own login request minted -- binds the ID token to
 		// this specific browser's own pre-auth cookie, exactly like state
-		// binds the authorization code to it.
+		// binds the authorization code to it. Audited (review round 1,
+		// finding O8): idToken is already verified and non-empty-subject
+		// at this point, so externalID is a meaningful identity key.
 		if idToken.Nonce == "" || idToken.Nonce != nonceCookie.Value {
 			logger.Warn("auth: oidc callback rejected", "outcome", OIDCOutcomeNonceMismatch)
+			auditOIDCRefusal(ctx, auditLog, OIDCOutcomeNonceMismatch, externalID, nil)
 			http.Error(w, "oidc nonce mismatch", http.StatusUnauthorized)
 			return
 		}
 
 		// e. Audience check, explicit (see rt.verifier's own construction
-		// comment for why this is not delegated to go-oidc).
+		// comment for why this is not delegated to go-oidc). Audited,
+		// same reasoning as the nonce check above.
 		if !audienceContains(idToken.Audience, cache.cfg.ClientID) {
 			logger.Warn("auth: oidc callback rejected", "outcome", OIDCOutcomeAudienceMismatch)
+			auditOIDCRefusal(ctx, auditLog, OIDCOutcomeAudienceMismatch, externalID, nil)
 			http.Error(w, "oidc audience mismatch", http.StatusUnauthorized)
 			return
 		}
 
 		// f. email_verified: ONLY the `email` claim with `email_verified`
 		// === the JSON boolean true is accepted -- §41.3: absent, false,
-		// or any non-boolean value (e.g. a string "true") is refused, with
-		// an audited reason (this log line -- the same audit-worthy-log
-		// path callback.go's own OutcomeNoVerifiedEmail refusal uses for
-		// the identical GitHub-side gap).
+		// or any non-boolean value (e.g. a string "true") is refused,
+		// "with the audited reason" (§41.3's own exit criterion, review
+		// round 1 finding O8) -- the SAME audit_log sink the
+		// pre-existing ambiguous-match refusal below already writes to,
+		// not a second, differently-shaped mechanism.
 		var claims map[string]any
 		if err := idToken.Claims(&claims); err != nil {
 			logger.Error("auth: oidc callback: decode id token claims failed", "error", err)
@@ -240,11 +329,10 @@ func NewOIDCCallbackHandler(
 		email, emailVerified := verifiedOIDCEmail(claims)
 		if !emailVerified {
 			logger.Warn("auth: oidc callback rejected", "outcome", OIDCOutcomeEmailNotVerified)
+			auditOIDCRefusal(ctx, auditLog, OIDCOutcomeEmailNotVerified, externalID, nil)
 			http.Error(w, "no verified email", http.StatusForbidden)
 			return
 		}
-
-		externalID := oidcExternalID(idToken.Issuer, idToken.Subject)
 
 		userID, outcome, httpStatus, publicMsg := resolveOIDCUser(ctx, oidcResolveDeps{
 			pool:               pool,
@@ -257,6 +345,13 @@ func NewOIDCCallbackHandler(
 		}, externalID, email, claims)
 		if httpStatus != 0 {
 			logger.Warn("auth: oidc callback rejected", "outcome", outcome)
+			// OIDCOutcomeAmbiguousMatch already wrote its own audit row
+			// inside resolveFirstTimeIdentity (shared with callback.go's
+			// GitHub flow, under its own auditActionOIDCAmbiguousMatch
+			// action name) -- auditOIDCRefusal is a no-op for any outcome
+			// not in auditActionForOIDCOutcome, so this call is safe to
+			// make unconditionally rather than needing its own branch.
+			auditOIDCRefusal(ctx, auditLog, outcome, externalID, map[string]any{"email": email})
 			http.Error(w, publicMsg, httpStatus)
 			return
 		}

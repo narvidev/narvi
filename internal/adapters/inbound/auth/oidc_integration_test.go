@@ -649,12 +649,13 @@ func errorsIsNoRows(err error) bool {
 
 func TestOIDCCallback_EmailVerified_RefusalShapes(t *testing.T) {
 	tests := []struct {
-		name          string
-		setClaims     func(claims map[string]any)
-		wantAuditable bool
+		name      string
+		sub       string
+		setClaims func(claims map[string]any)
 	}{
 		{
 			name: "email_verified absent entirely",
+			sub:  "oidc-subject-absent-verified",
 			setClaims: func(claims map[string]any) {
 				claims["email"] = "absent-verified@example.com"
 				// email_verified deliberately never set.
@@ -662,6 +663,7 @@ func TestOIDCCallback_EmailVerified_RefusalShapes(t *testing.T) {
 		},
 		{
 			name: "email_verified is the boolean false",
+			sub:  "oidc-subject-false-verified",
 			setClaims: func(claims map[string]any) {
 				claims["email"] = "false-verified@example.com"
 				claims["email_verified"] = false
@@ -669,6 +671,7 @@ func TestOIDCCallback_EmailVerified_RefusalShapes(t *testing.T) {
 		},
 		{
 			name: "email_verified is the STRING \"true\", not the JSON boolean",
+			sub:  "oidc-subject-string-true-verified",
 			setClaims: func(claims map[string]any) {
 				claims["email"] = "string-true-verified@example.com"
 				claims["email_verified"] = "true"
@@ -682,7 +685,7 @@ func TestOIDCCallback_EmailVerified_RefusalShapes(t *testing.T) {
 			client := newClient(t)
 
 			state, nonce := doOIDCLogin(t, client, rig.server.URL)
-			claims := rig.provider.defaultClaims("oidc-subject-" + tc.name)
+			claims := rig.provider.defaultClaims(tc.sub)
 			claims["nonce"] = nonce
 			tc.setClaims(claims)
 			rig.provider.setNextIDToken(rig.provider.signIDToken(t, claims))
@@ -692,6 +695,20 @@ func TestOIDCCallback_EmailVerified_RefusalShapes(t *testing.T) {
 
 			if resp.StatusCode != http.StatusForbidden {
 				t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+			}
+
+			// §41.3's own exit criterion: "refused with the audited
+			// reason" (review round 1, finding O8) -- the SAME audit_log
+			// sink the pre-existing ambiguous-match refusal already
+			// writes to, asserted here for every email_verified shape,
+			// not just one.
+			wantExternalID := rig.provider.issuer() + "|" + tc.sub
+			rows := getAuditLogRowsForResource(context.Background(), t, rig.pool, "identity", wantExternalID)
+			if len(rows) != 1 {
+				t.Fatalf("audit_log rows for the email_verified refusal = %d, want 1", len(rows))
+			}
+			if rows[0].Action != "identity.oidc_email_not_verified" {
+				t.Errorf("audit_log action = %q, want %q", rows[0].Action, "identity.oidc_email_not_verified")
 			}
 		})
 	}
@@ -733,6 +750,19 @@ func TestOIDCCallback_WrongNonce_Refused(t *testing.T) {
 
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+	}
+
+	// Audited (review round 1, finding O8) -- the ID token itself is
+	// valid (real signature, real non-empty sub), so externalID is a
+	// meaningful identity key even though the NONCE bound to this
+	// specific browser round trip didn't match.
+	wantExternalID := rig.provider.issuer() + "|oidc-subject-wrong-nonce"
+	rows := getAuditLogRowsForResource(context.Background(), t, rig.pool, "identity", wantExternalID)
+	if len(rows) != 1 {
+		t.Fatalf("audit_log rows for the nonce-mismatch refusal = %d, want 1", len(rows))
+	}
+	if rows[0].Action != "identity.oidc_nonce_mismatch" {
+		t.Errorf("audit_log action = %q, want %q", rows[0].Action, "identity.oidc_nonce_mismatch")
 	}
 }
 
@@ -780,6 +810,17 @@ func TestOIDCCallback_WrongAudience_Refused(t *testing.T) {
 
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+	}
+
+	// Audited (review round 1, finding O8) -- same reasoning as the
+	// nonce-mismatch test above.
+	wantExternalID := rig.provider.issuer() + "|oidc-subject-wrong-aud"
+	rows := getAuditLogRowsForResource(context.Background(), t, rig.pool, "identity", wantExternalID)
+	if len(rows) != 1 {
+		t.Fatalf("audit_log rows for the audience-mismatch refusal = %d, want 1", len(rows))
+	}
+	if rows[0].Action != "identity.oidc_audience_mismatch" {
+		t.Errorf("audit_log action = %q, want %q", rows[0].Action, "identity.oidc_audience_mismatch")
 	}
 }
 
@@ -894,6 +935,15 @@ func TestOIDCCallback_FirstTimeSignIn_AllowlistDenied(t *testing.T) {
 	wantExternalID := rig.provider.issuer() + "|oidc-subject-denied"
 	if _, err := rig.identities.GetByProviderAndExternalID(ctx, sqlcgen.IdentityProviderOidc, wantExternalID); !errorsIsNoRows(err) {
 		t.Errorf("an identities row was created for the denied sign-in (err=%v) -- want none", err)
+	}
+
+	// Audited (review round 1, finding O8).
+	rows := getAuditLogRowsForResource(ctx, t, rig.pool, "identity", wantExternalID)
+	if len(rows) != 1 {
+		t.Fatalf("audit_log rows for the first-time-denied refusal = %d, want 1", len(rows))
+	}
+	if rows[0].Action != "identity.oidc_first_time_denied" {
+		t.Errorf("audit_log action = %q, want %q", rows[0].Action, "identity.oidc_first_time_denied")
 	}
 }
 
@@ -1110,5 +1160,133 @@ func TestOIDCSignIn_MismatchedDiscoveryIssuer_Refused(t *testing.T) {
 
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want %d (discovery must fail closed when the configured issuer does not match the discovery document's own issuer)", resp.StatusCode, http.StatusServiceUnavailable)
+	}
+}
+
+// --- (j) empty `sub` is refused outright -- review round 1, finding
+// O11: OIDC Core §2 makes `sub` REQUIRED, but go-oidc's own Verify never
+// enforces that. Before this fix, an ID token with sub="" (or sub
+// omitted entirely) collapsed oidcExternalID onto "{issuer}|" for EVERY
+// affected sign-in -- the first person to sign in this way created a
+// user under that row; the SECOND, wholly different person to do the
+// same (from any IdP with this bug/misconfiguration) hit the
+// returning-user fast path on the FIRST person's own identity and was
+// issued a session for THEIR account. ---
+
+func TestOIDCCallback_EmptySubject_Refused(t *testing.T) {
+	tests := []struct {
+		name      string
+		setClaims func(claims map[string]any)
+	}{
+		{
+			name: "sub is the empty string",
+			setClaims: func(claims map[string]any) {
+				claims["sub"] = ""
+			},
+		},
+		{
+			name: "sub claim omitted entirely",
+			setClaims: func(claims map[string]any) {
+				delete(claims, "sub")
+			},
+		},
+		{
+			name: "sub is whitespace only",
+			setClaims: func(claims map[string]any) {
+				claims["sub"] = "   "
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newOIDCTestRig(t, defaultOIDCRiggedOptions())
+			ctx := context.Background()
+			client := newClient(t)
+
+			state, nonce := doOIDCLogin(t, client, rig.server.URL)
+			claims := rig.provider.defaultClaims("placeholder-overwritten-below")
+			tc.setClaims(claims)
+			claims["email"] = "empty-subject@example.com"
+			claims["email_verified"] = true
+			claims["nonce"] = nonce
+			rig.provider.setNextIDToken(rig.provider.signIDToken(t, claims))
+
+			resp := doOIDCCallback(t, client, rig.server.URL, state, "empty-subject-code")
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Errorf("status = %d, want %d (an empty/missing sub must be refused, never accepted)", resp.StatusCode, http.StatusUnauthorized)
+			}
+
+			wantExternalID := rig.provider.issuer() + "|"
+			if _, err := rig.identities.GetByProviderAndExternalID(ctx, sqlcgen.IdentityProviderOidc, wantExternalID); !errorsIsNoRows(err) {
+				t.Errorf("an identities row was created for external_id %q (err=%v) -- want none", wantExternalID, err)
+			}
+
+			rows := getAuditLogRowsForResource(ctx, t, rig.pool, "identity", wantExternalID)
+			if len(rows) != 1 {
+				t.Fatalf("audit_log rows for the empty-subject refusal = %d, want 1", len(rows))
+			}
+			if rows[0].Action != "identity.oidc_empty_subject" {
+				t.Errorf("audit_log action = %q, want %q", rows[0].Action, "identity.oidc_empty_subject")
+			}
+		})
+	}
+}
+
+// TestOIDCCallback_EmptySubject_NeverCollapsesDifferentUsers reproduces
+// the exact repro finding O11 describes -- two DIFFERENT people, both
+// presenting an ID token with an empty sub -- and proves the fix: NEITHER
+// sign-in succeeds, no user is ever created for either, and (the
+// specific failure mode this finding named) the second person's session
+// is never minted for the first person's account, because the first
+// person's own sign-in was itself refused rather than silently
+// succeeding under a shared "{issuer}|" identity key.
+func TestOIDCCallback_EmptySubject_NeverCollapsesDifferentUsers(t *testing.T) {
+	rig := newOIDCTestRig(t, defaultOIDCRiggedOptions())
+	ctx := context.Background()
+
+	aliceClient := newClient(t)
+	aliceState, aliceNonce := doOIDCLogin(t, aliceClient, rig.server.URL)
+	aliceClaims := rig.provider.defaultClaims("")
+	aliceClaims["email"] = "alice@example.com"
+	aliceClaims["email_verified"] = true
+	aliceClaims["nonce"] = aliceNonce
+	rig.provider.setNextIDToken(rig.provider.signIDToken(t, aliceClaims))
+	aliceResp := doOIDCCallback(t, aliceClient, rig.server.URL, aliceState, "alice-empty-sub-code")
+	defer func() { _ = aliceResp.Body.Close() }()
+	if aliceResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("alice's callback status = %d, want %d", aliceResp.StatusCode, http.StatusUnauthorized)
+	}
+
+	bobClient := newClient(t)
+	bobState, bobNonce := doOIDCLogin(t, bobClient, rig.server.URL)
+	bobClaims := rig.provider.defaultClaims("")
+	bobClaims["email"] = "bob@example.com"
+	bobClaims["email_verified"] = true
+	bobClaims["nonce"] = bobNonce
+	rig.provider.setNextIDToken(rig.provider.signIDToken(t, bobClaims))
+	bobResp := doOIDCCallback(t, bobClient, rig.server.URL, bobState, "bob-empty-sub-code")
+	defer func() { _ = bobResp.Body.Close() }()
+	if bobResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("bob's callback status = %d, want %d", bobResp.StatusCode, http.StatusUnauthorized)
+	}
+
+	// Neither sign-in ever minted a session cookie.
+	for _, resp := range []*http.Response{aliceResp, bobResp} {
+		for _, c := range resp.Cookies() {
+			if c.Name == "narvi_auth_session" && c.Value != "" {
+				t.Errorf("a narvi_auth_session cookie was minted (value present) for a refused empty-subject sign-in")
+			}
+		}
+	}
+
+	var userCount int
+	if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE primary_email IN ('alice@example.com', 'bob@example.com')`).Scan(&userCount); err != nil {
+		t.Fatalf("count users: %v", err)
+	}
+	if userCount != 0 {
+		t.Errorf("users created for alice/bob = %d, want 0 -- neither empty-subject sign-in may create or reuse ANY user row", userCount)
 	}
 }
