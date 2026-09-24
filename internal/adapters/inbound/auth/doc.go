@@ -146,7 +146,32 @@
 //     "must be logged in" gate only; "role skeleton" this Step means the
 //     DATA MODEL (real role assignment at creation time) is correct, not
 //     that any route enforces a role check yet.
-//   - OIDC/Google/enterprise SSO -- §13.1 names it explicitly as
-//     "configuration, not code" and secondary to GitHub OAuth; not this
-//     package's job to build a pluggable second provider.
+//
+// # §41.3 ("OIDC as a second sign-in provider") additions
+//
+// An earlier version of this doc comment (and of §13.1 itself) called
+// generic OIDC/enterprise SSO "configuration, not code" and out of this
+// package's scope. It is code: GET /auth/oidc/login (oidclogin.go) and
+// GET /auth/oidc/callback (oidccallback.go), beside the GitHub pair --
+// discovery + JWKS via github.com/coreos/go-oidc/v3 (oidcconfig.go's own
+// OIDCProviderCache, lazily discovered and cached for this process's
+// life), authorization-code + PKCE (S256) + nonce + state bound to the
+// SAME short-lived pre-auth cookie mechanism the GitHub flow uses (three
+// cookies instead of one -- oidclogin.go's own doc comment). Both routes
+// are mounted UNCONDITIONALLY (controlplane/serve.go) and refuse with 503
+// when NARVI_OIDC_ISSUER/CLIENT_ID/CLIENT_SECRET are unset (all-or-none,
+// internal/platform/config.go) -- never absent as routes, so the static
+// route scanner and the real router never diverge.
+//
+// The verified `email` claim (`email_verified` required literally `true`
+// -- absent, `false`, or any non-boolean value is refused, audited) enters
+// the SAME allowlist gate, default-role assignment, and users row model as
+// GitHub sign-in. identities gains provider `oidc`, external_id
+// `{issuer}|{sub}` (migrations/000140); a second sign-in through the same
+// issuer+sub resolves to the SAME user, and an unrecognized OIDC identity
+// whose verified email matches exactly one existing user auto-links onto
+// it (identitylink.MatchUserIDs/AutoLink, exported and reused from the
+// Slack/Linear algorithm, §13.2 step 3) rather than creating a duplicate
+// account -- oidccallback.go's own NewOIDCCallbackHandler doc comment has
+// the complete outcome table.
 package auth
