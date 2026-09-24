@@ -1,8 +1,6 @@
 package compat
 
 import (
-	"reflect"
-	"sort"
 	"testing"
 )
 
@@ -15,42 +13,34 @@ import (
 // to; E2/E3/E7, openEnums matched the TRAVERSAL pointer a node happened
 // to be reached through instead of the def that actually DECLARES the
 // enum, so the same relaxation could be honored or lost depending on
-// which property referenced it.
+// which property referenced it. E1's own fix was later superseded by the
+// round-5 review (G1/G2, see this file's own E1 test comments below) --
+// assertIdenticalFindings, which used to compare a $ref member's graded
+// findings against its inline spelling's, no longer has a caller now
+// that both forms simply fail closed identically (asserted directly by
+// FailClosedError/RuleID checks instead) -- removed rather than kept
+// around unused.
 
-// assertIdenticalFindings asserts ref and inline produce byte-for-byte
-// the same (sorted) finding set -- E1's own acceptance criterion is that
-// a $ref member is graded EXACTLY like the equivalent inline spelling,
-// not merely "close" to it.
-func assertIdenticalFindings(t *testing.T, refFindings, inlineFindings []Finding) {
-	t.Helper()
-	sortFindings := func(fs []Finding) []Finding {
-		out := append([]Finding{}, fs...)
-		sort.Slice(out, func(i, j int) bool {
-			if out[i].Pointer != out[j].Pointer {
-				return out[i].Pointer < out[j].Pointer
-			}
-			if out[i].RuleID != out[j].RuleID {
-				return out[i].RuleID < out[j].RuleID
-			}
-			return out[i].Message < out[j].Message
-		})
-		return out
-	}
-	a, b := sortFindings(refFindings), sortFindings(inlineFindings)
-	if !reflect.DeepEqual(a, b) {
-		t.Fatalf("a $ref union member must be graded EXACTLY like its inline spelling (E1):\n  $ref form:   %+v\n  inline form: %+v", a, b)
-	}
-}
+// --- E1: diffUnion's keyOf used to resolve a $ref member through the
+// base/head resolver and key it by the RESOLVED shape, instead of
+// trusting "any $ref = a discriminated variant" at face value.
+// SUPERSEDED by the round-5 review (G1/G2): E1's own fix was itself
+// still modeling a general union shape ("whatever a $ref resolves to,
+// key it the way the equivalent inline spelling would key") -- G1/G2
+// found the THIRD bypass in that lineage (E1, then F2, then G1/G2) and
+// round 5 replaced the modeling outright with a whitelist of the two
+// union shapes the real /contracts files actually use (defdiff.go's own
+// union-section doc comment). A $ref to a bare scalar def -- case 1, 2,
+// and 3 below -- matches neither permitted shape, so all three now fail
+// closed, in BOTH the $ref and the inline form, rather than reaching
+// rows 7/8/9/10 through a union member at all. That is at least as safe
+// as the graded outcome these tests used to pin. ---
 
-// --- E1: diffUnion's keyOf resolves a $ref member through the base/head
-// resolver and keys it by the RESOLVED shape, instead of trusting "any
-// $ref = a discriminated variant" at face value. ---
-
-// E1 case 1 ("scalar alias"): a $ref to a bare {"type":"string"} def
-// added to an existing union must be graded row 7 (type widened, MAJOR
-// on P2C), exactly like the inline {"type":"string"} member -- NOT row
-// 28 (MINOR/MINOR "discriminated variant added"), which is what a bare
-// "any $ref is 'ref:'+name" keying produced before this fix.
+// E1 case 1 ("scalar alias"), now G1: a $ref to a bare {"type":"string"}
+// def added to an existing union matches neither permitted union shape
+// (not a pure discriminated object, not the bare null literal) and must
+// fail closed -- in both the $ref and the equivalent inline form, the
+// same way case 4/5 below (never graded at all) already do.
 func TestRound3_E1_RefToScalarAliasIsTypeWidened(t *testing.T) {
 	baseDefs := map[string]any{
 		"Envelope": schemaObj("oneOf", []any{schemaObj("$ref", "#/$defs/Obj")}),
@@ -66,29 +56,32 @@ func TestRound3_E1_RefToScalarAliasIsTypeWidened(t *testing.T) {
 		"Obj":      schemaObj("type", "object"),
 	}
 
-	refFindings, err := DiffDef(baseDefs, refHeadDefs, "Envelope", DirP2C, nil)
-	if err != nil {
-		t.Fatalf("DiffDef ($ref form): %v", err)
+	_, refErr := DiffDef(baseDefs, refHeadDefs, "Envelope", DirP2C, nil)
+	refFC, ok := refErr.(*FailClosedError)
+	if !ok {
+		t.Fatalf("want *FailClosedError for a $ref to a scalar-type def added to a union, got err=%v", refErr)
 	}
-	if !containsFinding(refFindings, "7", SeverityMajor) {
-		t.Fatalf("a $ref to a scalar-type def added to a union must be row 7 MAJOR (type widened), got: %+v", refFindings)
-	}
-	if containsFinding(refFindings, "28", SeverityMinor) {
-		t.Fatalf("must NOT be graded as the discriminated-variant row 28 just because it arrived via $ref, got: %+v", refFindings)
+	if refFC.Finding.RuleID != "fc-oneof-unpairable" {
+		t.Fatalf("want fc-oneof-unpairable, got %s", refFC.Finding.RuleID)
 	}
 
-	inlineFindings, err := DiffDef(baseDefs, inlineHeadDefs, "Envelope", DirP2C, nil)
-	if err != nil {
-		t.Fatalf("DiffDef (inline form): %v", err)
+	_, inlineErr := DiffDef(baseDefs, inlineHeadDefs, "Envelope", DirP2C, nil)
+	inlineFC, ok := inlineErr.(*FailClosedError)
+	if !ok {
+		t.Fatalf("want *FailClosedError for the equivalent INLINE scalar member too, got err=%v", inlineErr)
 	}
-	assertIdenticalFindings(t, refFindings, inlineFindings)
+	if inlineFC.Finding.RuleID != "fc-oneof-unpairable" {
+		t.Fatalf("want fc-oneof-unpairable, got %s", inlineFC.Finding.RuleID)
+	}
 }
 
-// E1 case 2 ("['null','string'] alias swapped for the null member"): a
-// union's {"type":"null"} member is replaced with a $ref to a def whose
-// own type is ["null","string"] -- the null member disappearing is row
-// 10, and the field's own type ALSO gaining "string" is row 7 (MAJOR on
-// P2C either way), never silently absorbed as a same-severity swap.
+// E1 case 2 ("['null','string'] alias swapped for the null member"), now
+// G1: a union's {"type":"null"} member replaced with a $ref to a def
+// whose own type is ["null","string"] matches neither permitted shape --
+// shape B's null branch must be the bare INLINE {"type":"null"} literal,
+// never a $ref (even to a def that itself allows null), and a def typed
+// ["null","string"] is not a pure object def either. Both the $ref and
+// inline forms fail closed.
 func TestRound3_E1_RefToNullableStringAliasSwappedForNullMember(t *testing.T) {
 	baseDefs := map[string]any{
 		"Envelope": schemaObj("anyOf", []any{schemaObj("$ref", "#/$defs/Obj"), schemaObj("type", "null")}),
@@ -104,29 +97,29 @@ func TestRound3_E1_RefToNullableStringAliasSwappedForNullMember(t *testing.T) {
 		"Obj":      schemaObj("type", "object"),
 	}
 
-	refFindings, err := DiffDef(baseDefs, refHeadDefs, "Envelope", DirP2C, nil)
-	if err != nil {
-		t.Fatalf("DiffDef ($ref form): %v", err)
+	_, refErr := DiffDef(baseDefs, refHeadDefs, "Envelope", DirP2C, nil)
+	refFC, ok := refErr.(*FailClosedError)
+	if !ok {
+		t.Fatalf("want *FailClosedError for a $ref to a [\"null\",\"string\"] def swapped in for the null member, got err=%v", refErr)
 	}
-	if !containsFinding(refFindings, "10", SeverityMinor) {
-		t.Fatalf("the null member disappearing must still be row 10 MINOR (P2C), got: %+v", refFindings)
-	}
-	if !containsFinding(refFindings, "7", SeverityMajor) {
-		t.Fatalf("the replacement member's own \"string\" type must be row 7 MAJOR (P2C) -- the control's own inline spelling, got: %+v", refFindings)
+	if refFC.Finding.RuleID != "fc-oneof-unpairable" {
+		t.Fatalf("want fc-oneof-unpairable, got %s", refFC.Finding.RuleID)
 	}
 
-	inlineFindings, err := DiffDef(baseDefs, inlineHeadDefs, "Envelope", DirP2C, nil)
-	if err != nil {
-		t.Fatalf("DiffDef (inline form): %v", err)
+	_, inlineErr := DiffDef(baseDefs, inlineHeadDefs, "Envelope", DirP2C, nil)
+	inlineFC, ok := inlineErr.(*FailClosedError)
+	if !ok {
+		t.Fatalf("want *FailClosedError for the equivalent INLINE [\"null\",\"string\"] member too, got err=%v", inlineErr)
 	}
-	assertIdenticalFindings(t, refFindings, inlineFindings)
+	if inlineFC.Finding.RuleID != "fc-oneof-unpairable" {
+		t.Fatalf("want fc-oneof-unpairable, got %s", inlineFC.Finding.RuleID)
+	}
 }
 
-// E1 case 3 ("alias chain to integer"): a $ref that only resolves to a
-// bare scalar type after following a chain of pure-alias defs (each
-// legal under round 2's $ref-sibling rule: nothing but "$ref" itself)
-// must still be graded by that final resolved type, not fail closed and
-// not fall into row 28.
+// E1 case 3 ("alias chain to integer"), now G1: a $ref that only resolves
+// to a bare scalar type after following a chain of pure-alias defs is
+// still not a pure object def -- matches neither permitted shape, and
+// must fail closed rather than being graded by its final resolved type.
 func TestRound3_E1_RefChainToScalarIsTypeWidened(t *testing.T) {
 	baseDefs := map[string]any{
 		"Envelope": schemaObj("oneOf", []any{schemaObj("$ref", "#/$defs/Obj")}),
@@ -143,19 +136,23 @@ func TestRound3_E1_RefChainToScalarIsTypeWidened(t *testing.T) {
 		"Obj":      schemaObj("type", "object"),
 	}
 
-	refFindings, err := DiffDef(baseDefs, refHeadDefs, "Envelope", DirP2C, nil)
-	if err != nil {
-		t.Fatalf("DiffDef ($ref chain form): %v", err)
+	_, refErr := DiffDef(baseDefs, refHeadDefs, "Envelope", DirP2C, nil)
+	refFC, ok := refErr.(*FailClosedError)
+	if !ok {
+		t.Fatalf("want *FailClosedError for a $ref chain resolving to a bare scalar type, got err=%v", refErr)
 	}
-	if !containsFinding(refFindings, "7", SeverityMajor) {
-		t.Fatalf("a $ref chain resolving to a bare scalar type must be row 7 MAJOR, got: %+v", refFindings)
+	if refFC.Finding.RuleID != "fc-oneof-unpairable" {
+		t.Fatalf("want fc-oneof-unpairable, got %s", refFC.Finding.RuleID)
 	}
 
-	inlineFindings, err := DiffDef(baseDefs, inlineHeadDefs, "Envelope", DirP2C, nil)
-	if err != nil {
-		t.Fatalf("DiffDef (inline form): %v", err)
+	_, inlineErr := DiffDef(baseDefs, inlineHeadDefs, "Envelope", DirP2C, nil)
+	inlineFC, ok := inlineErr.(*FailClosedError)
+	if !ok {
+		t.Fatalf("want *FailClosedError for the equivalent INLINE scalar member too, got err=%v", inlineErr)
 	}
-	assertIdenticalFindings(t, refFindings, inlineFindings)
+	if inlineFC.Finding.RuleID != "fc-oneof-unpairable" {
+		t.Fatalf("want fc-oneof-unpairable, got %s", inlineFC.Finding.RuleID)
+	}
 }
 
 // E1 case 4 ("object-copy with type:['object','null']"): a def that
@@ -238,10 +235,13 @@ func TestRound3_E1_RefToArrayDefFailsClosed(t *testing.T) {
 	}
 }
 
-// E1 case 6 (events.schema.json's own root oneOf shape): a scalar alias
-// appended to a whole SURFACE's root oneOf (not merely a $defs entry),
-// under a "both" direction, must still be graded row 7 MAJOR (the P2C
-// column), never row 28.
+// E1 case 6 (events.schema.json's own root oneOf shape), now G1: a
+// scalar alias appended to a whole SURFACE's root oneOf (not merely a
+// $defs entry) matches neither permitted union shape and must fail
+// closed -- DiffSurface (unlike DiffDef) turns a root-level
+// *FailClosedError into a Finding of SeverityFailClosed rather than a Go
+// error (see its own doc comment), so the assertion here checks the
+// finding, not err.
 func TestRound3_E1_RootOneOfScalarAliasIsTypeWidened(t *testing.T) {
 	buildRoot := func(extraDefs map[string]any, extraMember any) map[string]any {
 		defs := map[string]any{"Ready": schemaObj("type", "object")}
@@ -270,19 +270,16 @@ func TestRound3_E1_RootOneOfScalarAliasIsTypeWidened(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DiffSurface ($ref form): %v", err)
 	}
-	if !containsFinding(refFindings, "7", SeverityMajor) {
-		t.Fatalf("a scalar $ref alias added to the root oneOf must be row 7 MAJOR, got: %+v", refFindings)
-	}
-	if containsFinding(refFindings, "28", SeverityMinor) {
-		t.Fatalf("must NOT be graded row 28, got: %+v", refFindings)
+	if !containsFinding(refFindings, "fc-oneof-unpairable", SeverityFailClosed) {
+		t.Fatalf("a scalar $ref alias added to the root oneOf must fail closed, got: %+v", refFindings)
 	}
 
 	inlineFindings, err := DiffSurface(string(DirBoth), mustMarshal(base), mustMarshal(inlineHead), nil)
 	if err != nil {
 		t.Fatalf("DiffSurface (inline form): %v", err)
 	}
-	if !containsFinding(inlineFindings, "7", SeverityMajor) {
-		t.Fatalf("inline control must also be row 7 MAJOR, got: %+v", inlineFindings)
+	if !containsFinding(inlineFindings, "fc-oneof-unpairable", SeverityFailClosed) {
+		t.Fatalf("the equivalent INLINE scalar member must also fail closed, got: %+v", inlineFindings)
 	}
 }
 

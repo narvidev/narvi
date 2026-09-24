@@ -326,52 +326,83 @@ func TestRound2_RefSiblingDescriptionIsDiffed(t *testing.T) {
 	})
 }
 
-// --- D9: union scalar-type branches are type widening/narrowing (rows
-// 7/8), not discriminated-variant add/remove (rows 28/29) ---
+// --- D9: union scalar-type branches used to be graded as type
+// widening/narrowing (rows 7/8), not discriminated-variant add/remove
+// (rows 28/29) -- SUPERSEDED by the round-5 review (G1/G2): rows 7/8's
+// own union-member reading modeled a general shape ("a bare scalar
+// {"type":X} member") no real file ever uses, which is exactly the kind
+// of general-shape guess three straight review rounds (E1, F2, G1/G2)
+// kept finding a bypass in. Round 5 replaced that modeling with a
+// whitelist of the two union shapes the real /contracts files actually
+// use (defdiff.go's own union-section doc comment) -- a bare scalar
+// union member, {"type":"boolean"}/{"type":"string"} here, matches
+// neither, so both the base and the head document in these two fixtures
+// now fail closed instead of reaching rows 7/8 at all. That is at least
+// as safe as the graded outcome these tests used to pin (FAIL-CLOSED
+// still blocks CI), so D9's original point -- a scalar union member must
+// not be silently absorbed as a MINOR "variant added"/"removed" -- still
+// holds; it is just enforced one step earlier now.
+// ---
 
-func TestRound2_D9_ScalarUnionMemberAddedIsTypeWidened(t *testing.T) {
+func TestRound2_D9_ScalarUnionMemberAddedNowFailsClosed(t *testing.T) {
 	baseDefs := defsOf("ContractsVersion", schemaObj("anyOf", []any{schemaObj("type", "boolean")}))
 	headDefs := defsOf("ContractsVersion", schemaObj("anyOf", []any{schemaObj("type", "boolean"), schemaObj("type", "string")}))
-	findings, err := DiffDef(baseDefs, headDefs, "ContractsVersion", DirP2C, nil)
-	if err != nil {
-		t.Fatalf("DiffDef: %v", err)
+	_, err := DiffDef(baseDefs, headDefs, "ContractsVersion", DirP2C, nil)
+	fc, ok := err.(*FailClosedError)
+	if !ok {
+		t.Fatalf("want *FailClosedError for a bare scalar-type anyOf (matches neither permitted union shape), got err=%v", err)
 	}
-	if !containsFinding(findings, "7", SeverityMajor) {
-		t.Fatalf("a non-null scalar-type union member added on a P2C shape must be row 7 (type widened) MAJOR, not row 28, got: %+v", findings)
-	}
-	if containsFinding(findings, "28", SeverityMinor) {
-		t.Fatalf("must NOT also be graded as the discriminated-variant row 28, got: %+v", findings)
+	if fc.Finding.RuleID != "fc-oneof-unpairable" {
+		t.Fatalf("want fc-oneof-unpairable, got %s", fc.Finding.RuleID)
 	}
 }
 
-func TestRound2_D9_ScalarUnionMemberRemovedIsTypeNarrowed(t *testing.T) {
+func TestRound2_D9_ScalarUnionMemberRemovedNowFailsClosed(t *testing.T) {
 	baseDefs := defsOf("ContractsVersion", schemaObj("anyOf", []any{schemaObj("type", "boolean"), schemaObj("type", "string")}))
 	headDefs := defsOf("ContractsVersion", schemaObj("anyOf", []any{schemaObj("type", "boolean")}))
-	findings, err := DiffDef(baseDefs, headDefs, "ContractsVersion", DirP2C, nil)
-	if err != nil {
-		t.Fatalf("DiffDef: %v", err)
+	_, err := DiffDef(baseDefs, headDefs, "ContractsVersion", DirP2C, nil)
+	fc, ok := err.(*FailClosedError)
+	if !ok {
+		t.Fatalf("want *FailClosedError for a bare scalar-type anyOf (matches neither permitted union shape), got err=%v", err)
 	}
-	if !containsFinding(findings, "8", SeverityMinor) {
-		t.Fatalf("a non-null scalar-type union member removed on a P2C shape must be row 8 (type narrowed) MINOR, not row 29, got: %+v", findings)
-	}
-	if containsFinding(findings, "29", SeverityMajor) {
-		t.Fatalf("must NOT also be graded as the discriminated-variant row 29, got: %+v", findings)
+	if fc.Finding.RuleID != "fc-oneof-unpairable" {
+		t.Fatalf("want fc-oneof-unpairable, got %s", fc.Finding.RuleID)
 	}
 }
 
-// Discriminated object variants (a $ref to an object def, or an object
-// with properties.type.const) still go through rows 28/29 as before --
-// D9's fix must not over-reach into that bucket.
+// Discriminated object variants ($ref to a pure object def carrying its
+// own properties.type.const, distinct from every other member's -- round
+// 5's shape A, see defdiff.go's own union-section doc comment) still go
+// through rows 28/29 as before -- D9's fix must not over-reach into that
+// bucket. Round 5: A/B must actually carry a discriminator for this to be
+// shape A at all -- an undiscriminated $ref to a bare {"type":"object"}
+// def (this fixture's own shape before round 5) is shape A only when it
+// is the ONLY member; a SECOND undiscriminated object member does not
+// match shape A (nothing to distinguish it by) or shape B (more than one
+// object slot), so it now fails closed instead -- see
+// TestRound5_G1_UndiscriminatedSecondObjectMemberFailsClosed.
 func TestRound2_D9_DiscriminatedVariantStillRow28(t *testing.T) {
 	baseDefs := map[string]any{
 		"Envelope": schemaObj("oneOf", []any{schemaObj("$ref", "#/$defs/A")}),
-		"A":        schemaObj("type", "object"),
-		"B":        schemaObj("type", "object"),
+		"A": schemaObj("type", "object",
+			"properties", schemaObj("type", schemaObj("const", "a")),
+			"required", []any{"type"},
+		),
+		"B": schemaObj("type", "object",
+			"properties", schemaObj("type", schemaObj("const", "b")),
+			"required", []any{"type"},
+		),
 	}
 	headDefs := map[string]any{
 		"Envelope": schemaObj("oneOf", []any{schemaObj("$ref", "#/$defs/A"), schemaObj("$ref", "#/$defs/B")}),
-		"A":        schemaObj("type", "object"),
-		"B":        schemaObj("type", "object"),
+		"A": schemaObj("type", "object",
+			"properties", schemaObj("type", schemaObj("const", "a")),
+			"required", []any{"type"},
+		),
+		"B": schemaObj("type", "object",
+			"properties", schemaObj("type", schemaObj("const", "b")),
+			"required", []any{"type"},
+		),
 	}
 	findings, err := DiffDef(baseDefs, headDefs, "Envelope", DirP2C, nil)
 	if err != nil {

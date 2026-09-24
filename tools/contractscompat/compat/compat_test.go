@@ -527,61 +527,78 @@ var corpus = []corpusCase{
 		c2pWant:   &wantFinding{"11", SeverityMinor},
 	},
 	{
-		// E1 (round 3): row 28/29 are scoped to a $ref to an OBJECT def
-		// (COMPATIBILITY.md row 28), so A/B must actually resolve to
-		// object defs here -- a $ref to a bare scalar-type def (the
-		// shape this fixture used before E1) is the type-widened/
-		// -narrowed case, rows 7/8, covered separately by
-		// TestRound3_E1_RefToScalarAliasIsTypeWidened and friends.
+		// Round 5 (G1/G2): shape A (defdiff.go's own union-section doc
+		// comment) requires every member to be a $ref to a PURE object
+		// def carrying its own properties.type.const discriminator,
+		// distinct from every other member's -- A/B must carry one for
+		// this to be a permitted union at all, not merely resolve to an
+		// object (E1/round 3's own bar, now tightened further).
 		name:    "row28 oneOf member added",
 		ruleID:  "28",
 		defName: "Envelope",
 		baseDefs: map[string]any{
 			"Envelope": schemaObj("oneOf", []any{schemaObj("$ref", "#/$defs/A")}),
-			"A":        schemaObj("type", "object"),
-			"B":        schemaObj("type", "object"),
+			"A":        schemaObj("type", "object", "properties", schemaObj("type", schemaObj("const", "a")), "required", []any{"type"}),
+			"B":        schemaObj("type", "object", "properties", schemaObj("type", schemaObj("const", "b")), "required", []any{"type"}),
 		},
 		headDefs: map[string]any{
 			"Envelope": schemaObj("oneOf", []any{schemaObj("$ref", "#/$defs/A"), schemaObj("$ref", "#/$defs/B")}),
-			"A":        schemaObj("type", "object"),
-			"B":        schemaObj("type", "object"),
+			"A":        schemaObj("type", "object", "properties", schemaObj("type", schemaObj("const", "a")), "required", []any{"type"}),
+			"B":        schemaObj("type", "object", "properties", schemaObj("type", schemaObj("const", "b")), "required", []any{"type"}),
 		},
 		fixed: &wantFinding{"28", SeverityMinor},
 	},
 	{
-		// E1 (round 3): see the sibling "row28 oneOf member added" case
-		// above -- A/B must be object defs for rows 28/29 to apply.
+		// Round 5 (G1/G2): see the sibling "row28 oneOf member added" case
+		// above -- A/B must carry a distinct discriminator for shape A to
+		// apply at all.
 		name:    "row29 oneOf member removed",
 		ruleID:  "29",
 		defName: "Envelope",
 		baseDefs: map[string]any{
 			"Envelope": schemaObj("oneOf", []any{schemaObj("$ref", "#/$defs/A"), schemaObj("$ref", "#/$defs/B")}),
-			"A":        schemaObj("type", "object"),
-			"B":        schemaObj("type", "object"),
+			"A":        schemaObj("type", "object", "properties", schemaObj("type", schemaObj("const", "a")), "required", []any{"type"}),
+			"B":        schemaObj("type", "object", "properties", schemaObj("type", schemaObj("const", "b")), "required", []any{"type"}),
 		},
 		headDefs: map[string]any{
 			"Envelope": schemaObj("oneOf", []any{schemaObj("$ref", "#/$defs/A")}),
-			"A":        schemaObj("type", "object"),
-			"B":        schemaObj("type", "object"),
+			"A":        schemaObj("type", "object", "properties", schemaObj("type", schemaObj("const", "a")), "required", []any{"type"}),
+			"B":        schemaObj("type", "object", "properties", schemaObj("type", schemaObj("const", "b")), "required", []any{"type"}),
 		},
 		fixed: &wantFinding{"29", SeverityMajor},
 	},
 	{
-		name:    "row30 oneOf member changed, paired by const discriminator",
+		// Round 5 (G1/G2): shape A's members must be a "$ref" (defdiff.go's
+		// own union-section doc comment) -- this fixture used to spell A
+		// INLINE, which round 5 no longer permits (G1: an inline
+		// discriminated member is unclassifiable, not a legitimate
+		// alternate pairing strategy). Pairing is by the $ref's own target
+		// NAME now, not the discriminator value itself -- "A" is unchanged
+		// between base and head, so this still recurses into A's own
+		// content and reports the nested change under row 30. Envelope
+		// ALSO picks up an unrelated description change so diffResolved's
+		// own DeepEqual short-circuit does not skip recursing into the
+		// oneOf array entirely -- Envelope's own JSON is otherwise
+		// byte-identical between base and head (only A, a separate $defs
+		// entry, differs), the same technique row27's own "F1 inline
+		// control" corpus case above uses.
+		name:    "row30 oneOf member changed (paired by $ref name)",
 		ruleID:  "30",
 		defName: "Envelope",
-		baseDefs: defsOf("Envelope", schemaObj("oneOf", []any{
-			schemaObj("type", "object",
+		baseDefs: map[string]any{
+			"Envelope": schemaObj("description", "v1", "oneOf", []any{schemaObj("$ref", "#/$defs/A")}),
+			"A": schemaObj("type", "object",
 				"properties", schemaObj("type", schemaObj("const", "a")),
 				"required", []any{"type"},
 			),
-		})),
-		headDefs: defsOf("Envelope", schemaObj("oneOf", []any{
-			schemaObj("type", "object",
+		},
+		headDefs: map[string]any{
+			"Envelope": schemaObj("description", "v2", "oneOf", []any{schemaObj("$ref", "#/$defs/A")}),
+			"A": schemaObj("type", "object",
 				"properties", schemaObj("type", schemaObj("const", "a"), "extra", schemaObj("type", "string")),
 				"required", []any{"type", "extra"},
 			),
-		})),
+		},
 		// The nested change is "extra" added-and-required (row 3): MINOR
 		// under P2C, MAJOR under C2P -- the row 30 wrapper inherits
 		// whichever severity the nested diff produced.
@@ -589,20 +606,20 @@ var corpus = []corpusCase{
 		c2pWant: &wantFinding{"30", SeverityMajor},
 	},
 	{
-		// E1 (round 3): see "row28 oneOf member added" above -- A/B must
-		// be object defs for row 28 to apply.
+		// Round 5 (G1/G2): see "row28 oneOf member added" above -- A/B
+		// must carry a distinct discriminator for shape A to apply.
 		name:    "row28 anyOf member added (keyword coverage)",
 		ruleID:  "28",
 		defName: "Envelope2",
 		baseDefs: map[string]any{
 			"Envelope2": schemaObj("anyOf", []any{schemaObj("$ref", "#/$defs/A")}),
-			"A":         schemaObj("type", "object"),
-			"B":         schemaObj("type", "object"),
+			"A":         schemaObj("type", "object", "properties", schemaObj("type", schemaObj("const", "a")), "required", []any{"type"}),
+			"B":         schemaObj("type", "object", "properties", schemaObj("type", schemaObj("const", "b")), "required", []any{"type"}),
 		},
 		headDefs: map[string]any{
 			"Envelope2": schemaObj("anyOf", []any{schemaObj("$ref", "#/$defs/A"), schemaObj("$ref", "#/$defs/B")}),
-			"A":         schemaObj("type", "object"),
-			"B":         schemaObj("type", "object"),
+			"A":         schemaObj("type", "object", "properties", schemaObj("type", schemaObj("const", "a")), "required", []any{"type"}),
+			"B":         schemaObj("type", "object", "properties", schemaObj("type", schemaObj("const", "b")), "required", []any{"type"}),
 		},
 		fixed: &wantFinding{"28", SeverityMinor},
 	},
@@ -674,17 +691,23 @@ var corpus = []corpusCase{
 		// C3: a newly added anyOf member that is exactly {"type": "null"}
 		// is nullability introduced via a union, not a generic "variant
 		// added" -- it must be scored like row 9 (null added to type), by
-		// direction, not the flat MINOR/MINOR row 28.
+		// direction, not the flat MINOR/MINOR row 28. Round 5 (G1/G2): A
+		// must be a $ref to a pure object def for this to be shape B (the
+		// nullable-object pattern, defdiff.go's own union-section doc
+		// comment, matching rest/v1/dtos.schema.json's real
+		// ReviewReadout.latestVerdict) -- A used to be a bare
+		// {"type":"string"} here, which no longer matches any permitted
+		// shape once paired with a null branch.
 		name:    "row9 nullable-via-anyOf member added (C3)",
 		ruleID:  "9",
 		defName: "Wrapper",
 		baseDefs: map[string]any{
 			"Wrapper": schemaObj("anyOf", []any{schemaObj("$ref", "#/$defs/A")}),
-			"A":       schemaObj("type", "string"),
+			"A":       schemaObj("type", "object"),
 		},
 		headDefs: map[string]any{
 			"Wrapper": schemaObj("anyOf", []any{schemaObj("$ref", "#/$defs/A"), schemaObj("type", "null")}),
-			"A":       schemaObj("type", "string"),
+			"A":       schemaObj("type", "object"),
 		},
 		p2cWant: &wantFinding{"9", SeverityMajor},
 		c2pWant: &wantFinding{"9", SeverityMinor},
@@ -699,16 +722,19 @@ var corpus = []corpusCase{
 		// fail with "want rule 10 severity MINOR, got []", confirming it
 		// now kills the mutant; PR body's "Review round 3" section has
 		// the full mutation-verification record).
+		// Round 5 (G1/G2): see "row9 nullable-via-anyOf member added (C3)"
+		// above -- A must be a $ref to a pure object def for this to be
+		// shape B.
 		name:    "row10 nullable-via-anyOf member removed (C3)",
 		ruleID:  "10",
 		defName: "Wrapper",
 		baseDefs: map[string]any{
 			"Wrapper": schemaObj("anyOf", []any{schemaObj("$ref", "#/$defs/A"), schemaObj("type", "null")}),
-			"A":       schemaObj("type", "string"),
+			"A":       schemaObj("type", "object"),
 		},
 		headDefs: map[string]any{
 			"Wrapper": schemaObj("anyOf", []any{schemaObj("$ref", "#/$defs/A")}),
-			"A":       schemaObj("type", "string"),
+			"A":       schemaObj("type", "object"),
 		},
 		p2cWant: &wantFinding{"10", SeverityMinor},
 		c2pWant: &wantFinding{"10", SeverityMajor},

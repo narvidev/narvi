@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
-	"strings"
 )
 
 // diffCtx carries everything a single def-pair comparison needs beyond the
@@ -1161,112 +1160,257 @@ func (c *diffCtx) diffItems(base, head map[string]any, dir Direction, l loc) ([]
 	return c.diffNode(bItems, hItems, dir, l.child("/items"))
 }
 
-// --- oneOf/anyOf (rows 9, 10, 28, 29, 30, 43) ---
-
-// inlineUnionMemberKey classifies an INLINE (non-$ref) oneOf/anyOf
-// member: a discriminated object variant keys by its own
-// properties.type.const value; a bare scalar type -- {"type":X} or
-// {"type":[X,"null"]}, nothing else besides an optional "description" --
-// keys by X itself (bareUnionTypeKey). Anything else, including a bare
-// {"type":"object"} node that carries OTHER keywords but no
-// discriminator, is not classifiable here and the caller fails closed --
-// deliberately UNCHANGED from before E1 (only $ref member classification
-// needed fixing; see resolvedUnionMemberKey).
-func inlineUnionMemberKey(obj map[string]any) (string, bool) {
-	if props, has := obj["properties"].(map[string]any); has {
-		if t, has := props["type"].(map[string]any); has {
-			if constVal, has := t["const"]; has {
-				return "const:" + fmt.Sprint(constVal), true
-			}
-		}
-	}
-	if t, ok := bareUnionTypeKey(obj); ok {
-		return "type:" + t, true
-	}
-	return "", false
-}
-
-// resolvedUnionMemberKey classifies a $ref member by the shape its
-// TARGET resolves to (E1): a PURE object def -- its own "type" is
-// EXACTLY the bare string "object" (not an array that merely includes
-// "object" alongside something else, e.g. "null", and not absent) --
-// is the discriminated variant rows 28/29 describe, keyed by the $ref's
-// own target NAME (there is no const value to key by here the way an
-// inline discriminated member has one, but a $ref is already a stable,
-// unique name to pair on); whatever else that def carries besides "type"
-// -- "properties"/"required"/a properties.type.const discriminator --
-// does not change this, a real object def always has those alongside
-// "type":"object" and none of them are what makes it classifiable here.
-// A resolved bare scalar type keys exactly like the equivalent inline
-// member would (bareUnionTypeKey). Anything else -- an array-shaped def,
-// an alias chain ending somewhere that is neither, a mixed shape (e.g.
-// type:["object","null"] alongside its own "properties", or a
-// properties.type.const discriminator on a def whose own "type" allows
-// null/strings or is absent entirely) -- is not classifiable: ok is
-// false and the caller fails closed, exactly as it would for the same
-// shape written inline.
+// --- oneOf/anyOf (rows 9, 10, 27, 28, 29, 30, 43, 46) ---
 //
-// F2: this used to ALSO key a def as "ref:"+ref purely because it had a
-// properties.type.const, without checking "type" at all -- so a def
-// whose "type" allowed null (or any other type) alongside "object", or
-// had no "type" keyword at all, was wrongly treated as a discriminated
-// object variant (MINOR/MINOR, row 28) instead of failing closed the way
-// the identical shape already does when written inline. Every real
-// object variant in this repo's own union members already has a bare
-// "type":"object", so requiring it here does not change behavior for
-// any of them -- it only closes the loophole for a shape none of them
-// use.
-func resolvedUnionMemberKey(ref string, robj map[string]any) (string, bool) {
-	if t, isStr := robj["type"].(string); isStr && t == "object" {
-		return "ref:" + ref, true
-	}
-	if t, ok := bareUnionTypeKey(robj); ok {
-		return "type:" + t, true
-	}
-	return "", false
+// Round 5 review (G1/G2): three straight rounds (E1, F2, and now G1/G2)
+// found a HIGH bypass by MODELING which oneOf/anyOf shapes ought to be
+// safe to pair -- an inline discriminated member, a mixed/absent "type",
+// a $ref chain ending at a scalar -- and getting the model wrong in a new
+// way each round. This repo's own five real schema files use exactly TWO
+// union shapes (enumerated by hand and by script against both HEAD and
+// origin/main; see the PR body's "Review round 5" section for the full
+// list):
+//
+//   - shape A (sandbox-ws/v1/commands.schema.json and events.schema.json,
+//     each a root `oneOf`): every member is a "$ref" to a def whose own
+//     "type" is EXACTLY the bare string "object" -- never an array that
+//     merely includes "object", never absent -- carrying a
+//     "properties.type.const" discriminator, with every member's
+//     discriminator value distinct from every other member's.
+//   - shape B (rest/v1/dtos.schema.json's ReviewReadout.latestVerdict
+//     `anyOf`): exactly one "$ref" to a pure object def (discriminator
+//     optional: there is nothing to discriminate between when there is
+//     only one non-null shape), plus an optional bare {"type":"null"}
+//     literal, written INLINE -- never itself behind a $ref, which is
+//     not a shape any real file uses either.
+//
+// So instead of modelling a general union shape, this checker WHITELISTS
+// exactly these two and fails closed on anything else: an inline
+// discriminated member (G1 -- the exact object shape rows 28/29 are FOR,
+// just spelled without a $ref, in any of its "type" variants: object+
+// null, a bare scalar, no "type" at all, or an array), a $ref to a
+// mixed/absent-"type"/array-shaped def, a scalar $ref or alias chain, a
+// second non-null object member beyond shape B's own single slot, or
+// (G2) a union whose members' own discriminator values are not all
+// distinct. classifyUnionMembers/unionShapeOf below implement the
+// whitelist; diffUnionShapeA/diffUnionShapeB implement the two shapes'
+// own (different) pairing and grading rules on top of it. Any prior
+// pairing strategy this replaced (keying an inline member by a bare
+// scalar `type`, keying a $ref by resolving it to one) is gone --
+// unreachable now that neither shape it served still exists.
+//
+// G2: shape A's variant-added/removed grading (rows 28/29) still pairs by
+// the $ref's own target NAME, exactly as before round 5 -- a retarget
+// disguised as "remove the old name, add a new one" is still visible as
+// exactly that, under those two rows. What round 5 adds is row 46: an
+// ADDED variant (a $ref name present in head but not base) whose
+// discriminator value was already used by ANY base member -- not only a
+// member that happens to share its own pairing key, which duplicate-key
+// detection alone can never catch, since the two members are keyed by
+// DIFFERENT $ref names -- is graded row 46 (MAJOR both columns), never
+// row 28's MINOR "variant added". An in-flight consumer dispatches on
+// the WIRE discriminator value, never the $ref's own $defs name, so
+// handing that value to a differently-shaped struct under a new name is
+// exactly as unsafe as reusing an existing $ref name outright would be.
+// A head union whose OWN members' discriminator values collide with EACH
+// OTHER never reaches grading at all: it does not match shape A's own
+// definition ("every member's discriminator value distinct"), so
+// unionShapeOf fails the whole array closed before diffUnionShapeA ever
+// runs -- this is "FAIL-CLOSED for the non-distinct head", not row 46.
+
+// memberKind classifies what ONE oneOf/anyOf array element resolves to,
+// on one side of the diff -- purely to decide whether the array AS A
+// WHOLE matches a permitted shape (unionShapeOf); nothing pairs on a
+// memberKind value directly the way the old per-member "pairing key" did.
+type memberKind int
+
+const (
+	// kindObject: this member IS a live "$ref" node (resolveUnionMember
+	// never assigns kindObject to an inline member -- both permitted
+	// shapes require their object slot(s) to be a $ref, exactly how the
+	// real files use them) whose resolved "type" is EXACTLY the bare
+	// string "object".
+	kindObject memberKind = iota
+	// kindNull: the member is written INLINE as exactly {"type":"null"},
+	// plus an optional "description" -- shape B's own null branch. Never
+	// assigned to a $ref, even one that resolves to this same content:
+	// no real file spells it that way, and modelling that it MIGHT is
+	// exactly the kind of general-shape guess round 5 exists to stop.
+	kindNull
+	// kindOther: anything else -- an inline discriminated object (G1), a
+	// scalar (inline, $ref, or an alias chain ending at one), a $ref to
+	// a mixed-"type" or "type"-absent def, an array-shaped def, or a
+	// $ref to the boolean schema literal. Never part of a permitted
+	// shape; unionShapeOf fails closed the moment one of these appears.
+	kindOther
+)
+
+// unionMember is one oneOf/anyOf array element, resolved through ONE
+// side's own resolver.
+type unionMember struct {
+	idx     int
+	node    any // the raw (un-dereferenced) array element, for recursing into
+	ref     string
+	kind    memberKind
+	discKey string // canonicalEnumKey of properties.type.const; meaningful only when hasDisc
+	hasDisc bool
 }
 
-// bareUnionTypeKey reports the scalar type name a bare {"type":X} or
-// {"type":[X,"null"]} union member should key on -- a two-element type
-// array whose other element is "null" is graded exactly like the
-// equivalent inline scalar member (X's own key), the same way rows
-// 7/8/9/10 already treat null-vs-non-null members throughout diffType.
-// Requires the node carry NOTHING besides "type" and an optional
-// "description": any other constraint keyword makes this shape "mixed,"
-// not a bare type, and the caller fails closed rather than guess at how
-// to key it.
-func bareUnionTypeKey(obj map[string]any) (string, bool) {
+// resolveUnionMember classifies one array element against r (base's or
+// head's own resolver). Its only returned errors are structural (not an
+// object/$ref, a $ref cycle, a $ref to a missing def, a $ref carrying a
+// disallowed sibling -- resolver.resolve's own existing checks) --
+// anything that resolves cleanly but simply is not a shape this checker
+// whitelists comes back as kindOther, nil, which unionShapeOf turns into
+// ONE clear, named rejection of the whole array rather than a plumbing
+// error naming only the first offending member.
+func resolveUnionMember(r resolver, node any, idx int) (unionMember, error) {
+	um := unionMember{idx: idx, node: node}
+	um.ref = refTargetName(node)
+
+	if um.ref == "" {
+		obj, ok := node.(map[string]any)
+		if !ok {
+			return um, fmt.Errorf("must be an object or $ref")
+		}
+		if isBareNullMember(obj) {
+			um.kind = kindNull
+			return um, nil
+		}
+		um.kind = kindOther
+		return um, nil
+	}
+
+	resolved, err := r.resolve(node, nil)
+	if err != nil {
+		return um, err
+	}
+	robj, isObj := resolved.(map[string]any)
+	if !isObj {
+		// The $ref resolves to the boolean schema literal true/false.
+		um.kind = kindOther
+		return um, nil
+	}
+	t, isStr := robj["type"].(string)
+	if !isStr || t != "object" {
+		// Not a pure object def: a mixed or absent "type", an array, a
+		// scalar, or an alias chain ending at one of those.
+		um.kind = kindOther
+		return um, nil
+	}
+	um.kind = kindObject
+	if props, ok := robj["properties"].(map[string]any); ok {
+		if typeSchema, ok := props["type"].(map[string]any); ok {
+			if constVal, ok := typeSchema["const"]; ok {
+				um.discKey = canonicalEnumKey(constVal)
+				um.hasDisc = true
+			}
+		}
+	}
+	return um, nil
+}
+
+// isBareNullMember reports whether obj is exactly {"type":"null"}, plus
+// an optional "description" -- shape B's own null-branch spelling, and
+// the ONLY inline member either permitted shape ever admits.
+func isBareNullMember(obj map[string]any) bool {
 	if !onlyKeys(obj, "type", "description") {
-		return "", false
+		return false
 	}
-	switch t := obj["type"].(type) {
-	case string:
-		if t == "null" {
-			return "null", true
-		}
-		return t, true
-	case []any:
-		if len(t) != 2 {
-			return "", false
-		}
-		var nonNull string
-		nullCount := 0
-		for _, el := range t {
-			s, ok := el.(string)
-			if !ok {
-				return "", false
-			}
-			if s == "null" {
-				nullCount++
-			} else {
-				nonNull = s
-			}
-		}
-		if nullCount == 1 && nonNull != "" {
-			return nonNull, true
+	t, ok := obj["type"].(string)
+	return ok && t == "null"
+}
+
+// unionShape names which of the two permitted oneOf/anyOf shapes an
+// array matches (this file's own union-section doc comment).
+type unionShape int
+
+const (
+	shapeNone unionShape = iota
+	shapeA
+	shapeB
+)
+
+// unionShapeOf classifies members (already resolved by
+// classifyUnionMembers, all on the SAME side of one diff) against the two
+// permitted shapes: shape A requires EVERY member to be a discriminated
+// object, with every discriminator value distinct from every other
+// member's; shape B requires EXACTLY one object member (discriminator
+// optional) plus at most one null member. Anything else -- including a
+// shape-A-LIKE array whose discriminators collide (G2) -- is shapeNone,
+// and the caller fails the WHOLE array closed rather than pairing
+// whatever part of it happens to look regular.
+func unionShapeOf(members []unionMember) (unionShape, error) {
+	var nullCount, objectCount, otherCount int
+	for _, m := range members {
+		switch m.kind {
+		case kindNull:
+			nullCount++
+		case kindObject:
+			objectCount++
+		default:
+			otherCount++
 		}
 	}
-	return "", false
+	if otherCount > 0 {
+		return shapeNone, fmt.Errorf("member(s) are neither a $ref to a pure object def (type exactly \"object\") nor the bare {\"type\":\"null\"} literal")
+	}
+	if nullCount > 1 {
+		return shapeNone, fmt.Errorf("more than one bare null member")
+	}
+
+	if nullCount == 0 && objectCount >= 1 {
+		allDiscriminated := true
+		seen := map[string]bool{}
+		distinct := true
+		for _, m := range members {
+			if !m.hasDisc {
+				allDiscriminated = false
+				break
+			}
+			if seen[m.discKey] {
+				distinct = false
+			}
+			seen[m.discKey] = true
+		}
+		if allDiscriminated {
+			if !distinct {
+				return shapeNone, fmt.Errorf("members' properties.type.const discriminator values are not all distinct (G2)")
+			}
+			return shapeA, nil
+		}
+	}
+
+	if objectCount == 1 {
+		return shapeB, nil
+	}
+
+	return shapeNone, fmt.Errorf("matches neither the discriminated-object union shape (every member a distinctly-discriminated $ref to a pure object def) nor the nullable-object shape (exactly one $ref to a pure object def, plus an optional bare null)")
+}
+
+// classifyUnionMembers resolves every element of arr (base's or head's
+// own array, through r).
+func classifyUnionMembers(r resolver, arr []any) ([]unionMember, error) {
+	out := make([]unionMember, len(arr))
+	for i, n := range arr {
+		um, err := resolveUnionMember(r, n, i)
+		if err != nil {
+			return nil, fmt.Errorf("member %d: %w", i, err)
+		}
+		out[i] = um
+	}
+	return out, nil
+}
+
+func shapeName(s unionShape) string {
+	switch s {
+	case shapeA:
+		return "discriminated-object"
+	case shapeB:
+		return "nullable-object"
+	default:
+		return "unrecognized"
+	}
 }
 
 func (c *diffCtx) diffUnion(base, head map[string]any, dir Direction, l loc, keyword string) ([]Finding, error) {
@@ -1279,11 +1423,9 @@ func (c *diffCtx) diffUnion(base, head map[string]any, dir Direction, l loc, key
 		// C15: the KEYWORD ITSELF appearing or disappearing (not a
 		// member within an already-existing union) is a presence change,
 		// scored MAJOR in both columns -- introducing a oneOf/anyOf where
-		// none existed adds a constraint the table's row 28 ("variant
-		// added", MINOR/MINOR) does not name; removing one removes a
-		// constraint the old code scored as though every member had
-		// simply been deleted one at a time (row 29, still MAJOR/MAJOR,
-		// so removal already happened to be safe -- but addition was not).
+		// none existed adds a constraint rows 28/46 ("variant added") do
+		// not name; removing one removes a constraint (row 29, still
+		// MAJOR/MAJOR either way).
 		return []Finding{ruleFinding("43", dir, majorMajor, l.ptr+"/"+keyword, keyword+" keyword presence changed")}, nil
 	}
 
@@ -1296,117 +1438,104 @@ func (c *diffCtx) diffUnion(base, head map[string]any, dir Direction, l loc, key
 		return nil, failClosed("fc-shape", l.ptr+"/"+keyword, "%s must be an array", keyword)
 	}
 
-	type member struct {
-		key  string
-		idx  int
-		node any
+	bMembers, err := classifyUnionMembers(c.baseR, bArr)
+	if err != nil {
+		return nil, failClosed("fc-oneof-unpairable", l.ptr+"/"+keyword, "base: %v", err)
+	}
+	hMembers, err := classifyUnionMembers(c.headR, hArr)
+	if err != nil {
+		return nil, failClosed("fc-oneof-unpairable", l.ptr+"/"+keyword, "head: %v", err)
 	}
 
-	// keyOf resolves node (through r, base or head's own resolver) to the
-	// shape that actually decides its pairing key -- E1: a $ref member is
-	// no longer trusted at face value as "a discriminated variant" the
-	// way it used to be; it is resolved first, exactly like the
-	// referenced def's OWN content would be classified if it were
-	// written inline at this position instead of behind a $ref.
-	keyOf := func(r resolver, node any) (string, error) {
-		ref := refTargetName(node)
-		if ref == "" {
-			obj, ok := node.(map[string]any)
-			if !ok {
-				return "", fmt.Errorf("%s member must be an object or $ref", keyword)
-			}
-			if k, ok := inlineUnionMemberKey(obj); ok {
-				return k, nil
-			}
-			return "", fmt.Errorf("cannot pair this %s member (no $ref or properties.type.const to key on, and not a bare scalar type)", keyword)
-		}
-
-		resolved, err := r.resolve(node, nil)
-		if err != nil {
-			return "", err
-		}
-		robj, isObj := resolved.(map[string]any)
-		if !isObj {
-			return "", fmt.Errorf("$ref %q resolves to the boolean schema literal, which cannot be paired as a %s member", ref, keyword)
-		}
-		if k, ok := resolvedUnionMemberKey(ref, robj); ok {
-			return k, nil
-		}
-		return "", fmt.Errorf("$ref %q resolves to a shape (neither an object def nor a bare scalar type) that cannot be paired as a %s member", ref, keyword)
+	bShape, err := unionShapeOf(bMembers)
+	if err != nil {
+		return nil, failClosed("fc-oneof-unpairable", l.ptr+"/"+keyword, "base %s: %v", keyword, err)
+	}
+	hShape, err := unionShapeOf(hMembers)
+	if err != nil {
+		return nil, failClosed("fc-oneof-unpairable", l.ptr+"/"+keyword, "head %s: %v", keyword, err)
+	}
+	if bShape != hShape {
+		return nil, failClosed("fc-oneof-unpairable", l.ptr+"/"+keyword, "%s changed from the %s shape to the %s shape -- not a pairing this checker models", keyword, shapeName(bShape), shapeName(hShape))
 	}
 
-	baseMembers := map[string]member{}
-	for i, n := range bArr {
-		k, err := keyOf(c.baseR, n)
-		if err != nil {
-			return nil, failClosed("fc-oneof-unpairable", fmt.Sprintf("%s/%s/%d", l.ptr, keyword, i), "%v", err)
-		}
-		if _, dup := baseMembers[k]; dup {
-			return nil, failClosed("fc-oneof-unpairable", fmt.Sprintf("%s/%s/%d", l.ptr, keyword, i), "duplicate pairing key %q in base %s", k, keyword)
-		}
-		baseMembers[k] = member{k, i, n}
+	switch bShape {
+	case shapeA:
+		return c.diffUnionShapeA(bMembers, hMembers, dir, l, keyword)
+	case shapeB:
+		return c.diffUnionShapeB(bMembers, hMembers, dir, l, keyword)
+	default:
+		// Unreachable: unionShapeOf never returns (shapeNone, nil) --
+		// fail closed rather than silently do nothing if that invariant
+		// is ever broken by a future edit.
+		return nil, failClosed("fc-oneof-unpairable", l.ptr+"/"+keyword, "unclassifiable %s shape", keyword)
 	}
-	headMembers := map[string]member{}
-	for i, n := range hArr {
-		k, err := keyOf(c.headR, n)
-		if err != nil {
-			return nil, failClosed("fc-oneof-unpairable", fmt.Sprintf("%s/%s/%d", l.ptr, keyword, i), "%v", err)
-		}
-		if _, dup := headMembers[k]; dup {
-			return nil, failClosed("fc-oneof-unpairable", fmt.Sprintf("%s/%s/%d", l.ptr, keyword, i), "duplicate pairing key %q in head %s", k, keyword)
-		}
-		headMembers[k] = member{k, i, n}
+}
+
+// diffUnionShapeA grades rows 28 (variant added), 29 (variant removed),
+// 30 (variant changed, recursed), and 46 (G2: variant added reusing a
+// discriminator value base already assigned to some member, under a
+// DIFFERENT $ref name). Pairing is by the $ref's own target NAME, exactly
+// as before round 5 -- shape A's whole point is that it has several
+// independently-named variants, so a name change IS "remove the old one,
+// add a new one," never a retarget the way shape B's single object slot
+// treats it (diffUnionShapeB, row 27).
+//
+// A duplicate $ref name WITHIN one side's own array is never reachable
+// here: two members pointing at the same def necessarily share that
+// def's own discriminator value too, which unionShapeOf's own
+// distinctness check (part of shape A's very definition) already fails
+// closed on before diffUnion ever calls this function -- so bByRef/hByRef
+// below can build their maps with a plain assignment, no separate
+// duplicate guard needed.
+func (c *diffCtx) diffUnionShapeA(bMembers, hMembers []unionMember, dir Direction, l loc, keyword string) ([]Finding, error) {
+	bByRef := map[string]unionMember{}
+	for _, m := range bMembers {
+		bByRef[m.ref] = m
+	}
+	hByRef := map[string]unionMember{}
+	for _, m := range hMembers {
+		hByRef[m.ref] = m
 	}
 
-	allKeys := map[string]bool{}
-	for k := range baseMembers {
-		allKeys[k] = true
+	// G2: every discriminator value base assigned to ANY member -- not
+	// only ones that survive in head under the SAME name -- so a variant
+	// removed and re-added under a new $ref name but the identical wire
+	// discriminator is still caught (row 46), never laundered through
+	// "old one removed (29), unrelated new one added (28)".
+	baseDiscValues := map[string]bool{}
+	for _, m := range bMembers {
+		baseDiscValues[m.discKey] = true
 	}
-	for k := range headMembers {
-		allKeys[k] = true
+
+	allRefs := map[string]bool{}
+	for r := range bByRef {
+		allRefs[r] = true
 	}
-	sortedKeys := make([]string, 0, len(allKeys))
-	for k := range allKeys {
-		sortedKeys = append(sortedKeys, k)
+	for r := range hByRef {
+		allRefs[r] = true
 	}
-	sort.Strings(sortedKeys)
+	sortedRefs := make([]string, 0, len(allRefs))
+	for r := range allRefs {
+		sortedRefs = append(sortedRefs, r)
+	}
+	sort.Strings(sortedRefs)
 
 	var findings []Finding
-	for _, k := range sortedKeys {
-		bm, inBase := baseMembers[k]
-		hm, inHead := headMembers[k]
+	for _, ref := range sortedRefs {
+		bm, inBase := bByRef[ref]
+		hm, inHead := hByRef[ref]
 		switch {
 		case inBase && !inHead:
 			removedPtr := fmt.Sprintf("%s/%s/%d", l.ptr, keyword, bm.idx)
-			switch {
-			case k == "type:null":
-				findings = append(findings, ruleFinding("10", dir, severityPair{SeverityMinor, SeverityMajor}, removedPtr, "null variant removed from "+keyword))
-			case strings.HasPrefix(k, "type:"):
-				// D9: a bare {"type":X} branch (X != null) is not a
-				// discriminated variant a robust consumer can just skip
-				// over -- it is the field's own wire type losing a
-				// member, the same change row 8 already grades when
-				// spelled as a `type` array. Only "ref:"/"const:" keyed
-				// members (a $ref to an object def, or an object with a
-				// properties.type.const discriminator) are the
-				// discriminated-object variants rows 28/29 are for.
-				findings = append(findings, ruleFinding("8", dir, severityPair{SeverityMinor, SeverityMajor}, removedPtr, "scalar-type union member removed (type narrowed): "+k))
-			default:
-				findings = append(findings, ruleFinding("29", dir, majorMajor, removedPtr, "union member removed: "+k))
-			}
+			findings = append(findings, ruleFinding("29", dir, majorMajor, removedPtr, "discriminated union member removed: ref:"+ref))
 		case !inBase && inHead:
 			addedPtr := fmt.Sprintf("%s/%s/%d", l.ptr, keyword, hm.idx)
-			switch {
-			case k == "type:null":
-				findings = append(findings, ruleFinding("9", dir, severityPair{SeverityMajor, SeverityMinor}, addedPtr, "null variant added to "+keyword))
-			case strings.HasPrefix(k, "type:"):
-				// D9: same reasoning as the removed case above, mirrored:
-				// a non-null bare-type branch added to an existing union
-				// widens the field's own wire type (row 7), not a MINOR
-				// "variant added" a consumer could simply ignore.
-				findings = append(findings, ruleFinding("7", dir, severityPair{SeverityMajor, SeverityMinor}, addedPtr, "scalar-type union member added (type widened): "+k))
-			default:
-				findings = append(findings, ruleFinding("28", dir, severityPair{SeverityMinor, SeverityMinor}, addedPtr, "union member added: "+k))
+			if baseDiscValues[hm.discKey] {
+				findings = append(findings, ruleFinding("46", dir, majorMajor, addedPtr,
+					"discriminated union member added, reusing a discriminator value base already assigned elsewhere: ref:"+ref))
+			} else {
+				findings = append(findings, ruleFinding("28", dir, severityPair{SeverityMinor, SeverityMinor}, addedPtr, "discriminated union member added: ref:"+ref))
 			}
 		default:
 			memberLoc := l.child(fmt.Sprintf("/%s/%d", keyword, hm.idx))
@@ -1421,10 +1550,77 @@ func (c *diffCtx) diffUnion(base, head map[string]any, dir Direction, l loc, key
 			for _, f := range nested {
 				worst = maxSeverity(worst, f.Severity)
 			}
-			wrapper := Finding{RuleID: "30", Severity: worst, Pointer: memberLoc.ptr, Message: "union member changed: " + k}
-			findings = append(findings, wrapper)
+			findings = append(findings, Finding{RuleID: "30", Severity: worst, Pointer: memberLoc.ptr, Message: "union member changed: ref:" + ref})
 			findings = append(findings, nested...)
 		}
 	}
 	return findings, nil
+}
+
+// diffUnionShapeB grades rows 9/10 (the null branch's own add/remove --
+// exactly like `type` gaining/losing "null" anywhere else in this table,
+// since that is shape B's whole point) and row 27 (the single object
+// slot retargeted to a different $ref -- NOT rows 28/29's remove+add,
+// because shape B never has more than one object variant to pair by
+// name; a same-$ref-name object slot simply recurses, wrapped in row 30
+// if anything nested changed).
+func (c *diffCtx) diffUnionShapeB(bMembers, hMembers []unionMember, dir Direction, l loc, keyword string) ([]Finding, error) {
+	var bObj, hObj, bNull, hNull *unionMember
+	for i := range bMembers {
+		switch bMembers[i].kind {
+		case kindObject:
+			bObj = &bMembers[i]
+		case kindNull:
+			bNull = &bMembers[i]
+		}
+	}
+	for i := range hMembers {
+		switch hMembers[i].kind {
+		case kindObject:
+			hObj = &hMembers[i]
+		case kindNull:
+			hNull = &hMembers[i]
+		}
+	}
+	if bObj == nil || hObj == nil {
+		// unionShapeOf(shapeB) guarantees objectCount == 1 on both sides
+		// -- unreachable, but fail closed rather than panic if that
+		// invariant is ever broken by a future edit to unionShapeOf.
+		return nil, failClosed("fc-oneof-unpairable", l.ptr+"/"+keyword, "nullable-object %s has no object member", keyword)
+	}
+
+	var findings []Finding
+
+	switch {
+	case bNull != nil && hNull == nil:
+		removedPtr := fmt.Sprintf("%s/%s/%d", l.ptr, keyword, bNull.idx)
+		findings = append(findings, ruleFinding("10", dir, severityPair{SeverityMinor, SeverityMajor}, removedPtr, "null variant removed from "+keyword))
+	case bNull == nil && hNull != nil:
+		addedPtr := fmt.Sprintf("%s/%s/%d", l.ptr, keyword, hNull.idx)
+		findings = append(findings, ruleFinding("9", dir, severityPair{SeverityMajor, SeverityMinor}, addedPtr, "null variant added to "+keyword))
+	}
+
+	if bObj.ref == hObj.ref {
+		memberLoc := l.child(fmt.Sprintf("/%s/%d", keyword, hObj.idx))
+		nested, err := c.diffNode(bObj.node, hObj.node, dir, memberLoc)
+		if err != nil {
+			return nil, err
+		}
+		if len(nested) > 0 {
+			worst := SeverityPatch
+			for _, f := range nested {
+				worst = maxSeverity(worst, f.Severity)
+			}
+			findings = append(findings, Finding{RuleID: "30", Severity: worst, Pointer: memberLoc.ptr, Message: "union member changed: ref:" + hObj.ref})
+			findings = append(findings, nested...)
+		}
+		return findings, nil
+	}
+
+	memberLoc := l.child(fmt.Sprintf("/%s/%d", keyword, hObj.idx))
+	wrapper, err := c.diffRetargetedRef(bObj.ref, hObj.ref, dir, memberLoc)
+	if err != nil {
+		return nil, err
+	}
+	return append(findings, wrapper...), nil
 }
