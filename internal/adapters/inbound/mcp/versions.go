@@ -6,16 +6,25 @@ import (
 	"io"
 	"net/http"
 	"strings"
-
-	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 )
 
-// MaxRequestBodyBytes is httpapi.MaxRequestBodyBytes, the SAME 1 MiB cap
-// every REST body this codebase decodes is bounded by -- referenced
-// here, not re-declared, so this package's own StreamableHTTPOptions.
-// MaxRequestBodyBytes (handler.go) and peekRequestID's own read bound
-// below can never drift from that single figure.
-const MaxRequestBodyBytes = httpapi.MaxRequestBodyBytes
+// MaxRequestBodyBytes bounds every /mcp request body -- deliberately far
+// below httpapi.MaxRequestBodyBytes (1 MiB, the cap every REST body this
+// codebase decodes otherwise shares): a tool call's own arguments are a
+// handful of small fields (a filter enum, a limit integer, a session
+// UUID), never a file upload or a document body, so 1 MiB bought no
+// legitimate request room, only attack surface (round 2 review of PR
+// #324, finding N2/N7). At 1 MiB, a single legacy JSON-RPC batch request
+// -- an array of ~8,000 minimal tools/call objects -- fit under the cap
+// and fanned out into ~8,000 concurrent twin invocations before this
+// package wrote a single reply byte; rejectBatches below closes that
+// specific shape structurally, but shrinking the cap ALSO bounds the
+// unrelated cost finding N7 named (a single JSON number literal near the
+// old 1 MiB cap costs over a second of CPU in santhosh-tekuri/jsonschema's
+// own big.Rat-based integer check -- util.go's isInteger, validator.go's
+// numValidate) to a small fraction of that, even before validateArguments
+// itself ever normalizes it (tools.go's intFromJSONNumber).
+const MaxRequestBodyBytes = 64 * 1024
 
 // SupportedProtocolVersions is the SINGLE source of truth for which MCP
 // protocol revisions this deployment speaks, newest first (technical
@@ -26,15 +35,25 @@ const MaxRequestBodyBytes = httpapi.MaxRequestBodyBytes
 // all read this one slice -- nothing else declares a second copy.
 //
 // 2026-07-28 is current (the per-request `_meta` era, no `initialize`
-// handshake). 2025-11-25, 2025-06-18, and 2025-03-26 are the legacy
-// Streamable-HTTP revisions this server also serves through the
-// `initialize` handshake, because "existing MCP clients" -- the exit
-// criterion's own phrase -- mostly still speak one of those.
-// 2024-11-05 is deliberately EXCLUDED: its transport is the deprecated
-// HTTP+SSE pair, which would require hosting a second endpoint shape
-// entirely, not merely a version this server negotiates on the one
-// endpoint it has (§43 D4).
-var SupportedProtocolVersions = []string{"2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"}
+// handshake). 2025-11-25 and 2025-06-18 are the legacy Streamable-HTTP
+// revisions this server also serves through the `initialize` handshake,
+// because "existing MCP clients" -- the exit criterion's own phrase --
+// mostly still speak one of those. 2025-03-26 is deliberately EXCLUDED
+// (round 2 review of PR #324, finding N2, revising §43 D4): that
+// revision's own spec text requires a Streamable HTTP server to accept a
+// legacy JSON-RPC batch request, which the pinned SDK does for any
+// request naming (or, absent a header, defaulting to) that revision --
+// with no option to turn it off -- and a batch amplifies a single small
+// request into thousands of concurrent twin invocations plus a
+// multi-gigabyte buffered reply (rejectBatches, below, refuses every
+// batch at this package's own gate regardless). Claiming 2025-03-26 while
+// refusing the batches it requires would not be conformant to that
+// revision; dropping it is what keeps this list honest about every
+// revision it still names. 2024-11-05 is deliberately EXCLUDED for an
+// unrelated reason: its transport is the deprecated HTTP+SSE pair, which
+// would require hosting a second endpoint shape entirely, not merely a
+// version this server negotiates on the one endpoint it has (§43 D4).
+var SupportedProtocolVersions = []string{"2026-07-28", "2025-11-25", "2025-06-18"}
 
 // protocolVersionHeader is the Streamable HTTP transport's own version
 // header (net/http canonicalizes header lookups case-insensitively, so

@@ -198,12 +198,14 @@ func TestMethodNotAllowed_GetAndDelete(t *testing.T) {
 }
 
 // TestMaxRequestBodyBytes_LargerBodyRefused pins technical plan §43.3: a
-// request body larger than the SAME 1 MiB cap httpapi.
-// MaxRequestBodyBytes already enforces on every REST body this codebase
-// decodes is refused (413), not silently accepted at the SDK's own
-// larger DefaultMaxRequestBodyBytes (4 MiB) -- which is exactly what
-// removing `MaxRequestBodyBytes: MaxRequestBodyBytes` from handler.go's
-// own StreamableHTTPOptions would fall back to.
+// request body larger than MaxRequestBodyBytes (round 2 review of PR
+// #324, finding N2: deliberately shrunk to 64 KiB, far below
+// httpapi.MaxRequestBodyBytes's own 1 MiB -- a tool call's own arguments
+// are a handful of small fields, never a file upload) is refused (413),
+// not silently accepted at the SDK's own larger DefaultMaxRequestBodyBytes
+// (4 MiB) -- which is exactly what removing
+// `MaxRequestBodyBytes: MaxRequestBodyBytes` from handler.go's own
+// StreamableHTTPOptions would fall back to.
 func TestMaxRequestBodyBytes_LargerBodyRefused(t *testing.T) {
 	handler := newTestHandler(t, true, true, testTwins())
 	headers := map[string]string{protocolVersionHeader: "2026-07-28", "Mcp-Method": "tools/list"}
@@ -218,10 +220,10 @@ func TestMaxRequestBodyBytes_LargerBodyRefused(t *testing.T) {
 		}
 	})
 
-	// Comfortably over the cap (MaxRequestBodyBytes is 1 MiB; this pads
-	// to roughly 2 MiB): refused before the SDK ever parses it as JSON.
+	// Comfortably over the cap: refused before the SDK ever parses it as
+	// JSON.
 	t.Run("over the cap is refused 413", func(t *testing.T) {
-		padding := strings.Repeat("x", 2<<20)
+		padding := strings.Repeat("x", 2*MaxRequestBodyBytes)
 		body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"padding":%q}}}`, padding)
 		if len(body) <= MaxRequestBodyBytes {
 			t.Fatalf("test body is %d bytes, want more than MaxRequestBodyBytes (%d)", len(body), MaxRequestBodyBytes)
