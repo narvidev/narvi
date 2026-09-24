@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"math/big"
 	"net/http"
 	"net/url"
 	"runtime/debug"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
+	jsonschema "github.com/santhosh-tekuri/jsonschema/v6"
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/platform"
@@ -68,14 +71,91 @@ func noArguments(json.RawMessage) (map[string]string, url.Values, error) {
 	return nil, nil, nil
 }
 
-// buildListSessionsRequest unmarshals arguments as a restdtos.
-// ListSessionsToolRequest and builds ?filter=&limit= exactly as a client
-// calling GET /api/sessions directly would -- omitting either query key
-// entirely when the caller left the corresponding field unset, so the
-// twin's OWN defaulting (filter defaults "mine"; limit defaults
-// listSessionsDefaultLimit) runs completely unchanged.
+// invalidArgumentError marks a BuildRequest failure caused by an argument
+// value that IS schema-valid (validateArguments already accepted it)
+// but cannot be carried through to the twin's own Go type -- e.g. a JSON
+// Schema integer spelled in a form encoding/json's own int decoder
+// rejects ("1.0", "1e2"), or one outside this platform's int range
+// (round 2 review of PR #324, findings N8/N11/N17: JSON Schema's own
+// "integer" type accepts any number with a zero fractional part, with no
+// int64 bound, so a value like these passes validateArguments and used
+// to fall into toolHandler's own "should be unreachable in practice"
+// defect branch instead -- logged at ERROR, on every occurrence, for
+// what is really an ordinary caller mistake this codebase's own contract
+// deliberately leaves room for: ListSessionsToolRequest.limit carries no
+// "maximum", see its own doc comment in dtos.schema.json). Error() is
+// safe to show a client verbatim: it never repeats an internal Go
+// type/field name, unlike the json.Unmarshal error a true BuildRequest
+// defect carries (toolHandler's own doc.go "never leak" discipline).
+// toolHandler tells this apart from every OTHER BuildRequest error (a
+// genuine, should-never-happen defect, still logged at ERROR) via
+// errors.As.
+type invalidArgumentError struct{ msg string }
+
+func (e *invalidArgumentError) Error() string { return e.msg }
+
+// intFromJSONNumber converts num -- a JSON number validateArguments
+// already confirmed satisfies a "type":"integer" schema constraint,
+// i.e. ANY textual form with a zero fractional part per JSON Schema
+// 2020-12, not merely a bare int64 literal -- into a Go int, or reports
+// ok=false when num does not fit (round 2 review of PR #324, findings
+// N8/N11/N17). The fast path (json.Number.Int64) covers the ordinary
+// case; the slow path mirrors santhosh-tekuri/jsonschema/v6's OWN
+// isInteger check (util.go, new(big.Rat).SetString(fmt.Sprint(num))) so
+// this function accepts exactly the same value space the schema already
+// validated as an integer -- "1.0" and "1e2" included -- rather than the
+// narrower "must already look like an int64 literal" space encoding/json
+// itself enforces.
+func intFromJSONNumber(num json.Number) (int, bool) {
+	if i, err := num.Int64(); err == nil {
+		return int64ToInt(i)
+	}
+	r, ok := new(big.Rat).SetString(num.String())
+	if !ok || !r.IsInt() {
+		return 0, false
+	}
+	i := r.Num() // r.Denom() == 1 is exactly what r.IsInt() just confirmed
+	if !i.IsInt64() {
+		return 0, false
+	}
+	return int64ToInt(i.Int64())
+}
+
+// int64ToInt range-checks i against this platform's own int (identical
+// to int64 on every platform this codebase ships to, but written this
+// way -- not "always safe on 64-bit" -- so the check stays correct if
+// that ever changes).
+func int64ToInt(i int64) (int, bool) {
+	if i < math.MinInt || i > math.MaxInt {
+		return 0, false
+	}
+	return int(i), true
+}
+
+// listSessionsArgs is buildListSessionsRequest's own decode target --
+// deliberately NOT restdtos.ListSessionsToolRequest: that generated
+// type's Limit field is a plain *int, whose json.Unmarshal (through its
+// own Plain-alias UnmarshalJSON) rejects any JSON Schema-valid integer
+// spelling encoding/json does not accept literally as an int ("1.0",
+// "1e2", anything outside the int64 range) -- exactly the values
+// intFromJSONNumber above exists to accept instead (findings N8/N11/N17).
+// Filter keeps using the generated enum type: it is a plain string on
+// the wire, so encoding/json's default decode never has this problem,
+// and reusing ListSessionsToolRequestFilter's own UnmarshalJSON keeps its
+// enum check exactly as it already is.
+type listSessionsArgs struct {
+	Filter *restdtos.ListSessionsToolRequestFilter `json:"filter"`
+	Limit  *json.Number                            `json:"limit"`
+}
+
+// buildListSessionsRequest unmarshals arguments and builds
+// ?filter=&limit= exactly as a client calling GET /api/sessions directly
+// would -- omitting either query key entirely when the caller left the
+// corresponding field unset, so the twin's OWN defaulting (filter
+// defaults "mine"; limit defaults listSessionsDefaultLimit) runs
+// completely unchanged.
 func buildListSessionsRequest(arguments json.RawMessage) (map[string]string, url.Values, error) {
-	var in restdtos.ListSessionsToolRequest
+	var in listSessionsArgs
 	if len(arguments) > 0 {
 		if err := json.Unmarshal(arguments, &in); err != nil {
 			return nil, nil, err
@@ -86,7 +166,11 @@ func buildListSessionsRequest(arguments json.RawMessage) (map[string]string, url
 		query.Set("filter", string(*in.Filter))
 	}
 	if in.Limit != nil {
-		query.Set("limit", strconv.Itoa(*in.Limit))
+		limit, ok := intFromJSONNumber(*in.Limit)
+		if !ok {
+			return nil, nil, &invalidArgumentError{msg: fmt.Sprintf("limit %s is not representable as a bounded whole number", in.Limit.String())}
+		}
+		query.Set("limit", strconv.Itoa(limit))
 	}
 	return nil, query, nil
 }
@@ -150,10 +234,26 @@ var readOnlyAnnotations = &sdkmcp.ToolAnnotations{
 
 func boolPtr(b bool) *bool { return &b }
 
+// toolInputDefs returns every 180 tool's own InputDef name, in table
+// order -- the exact, complete set NewHandler must compile EAGERLY at
+// boot (schemas.go's own compileInputSchemas doc comment) before this
+// build can serve a single /mcp request.
+func toolInputDefs() []string {
+	specs := toolSpecs(Twins{})
+	defs := make([]string, len(specs))
+	for i, spec := range specs {
+		defs[i] = spec.InputDef
+	}
+	return defs
+}
+
 // toolHandler returns the low-level sdkmcp.ToolHandler for spec, closing
 // over ctx (the authenticated MCP HTTP request's own context -- see
 // getServer's doc comment for why THIS context, not the one the SDK
-// passes into the handler at call time, is what callTwin receives).
+// passes into the handler at call time, is what callTwin receives) and
+// inputSchemas (NewHandler's own eagerly-compiled map, schemas.go's
+// compileInputSchemas -- built once, at boot, never written to again, so
+// reading it concurrently from every tool call needs no lock).
 //
 // Deliberately the RAW, non-generic sdkmcp.ToolHandler API (Server.
 // AddTool(*Tool, ToolHandler)), never the generic package-level
@@ -170,7 +270,7 @@ func boolPtr(b bool) *bool { return &b }
 // mapOutcome (outcome.go) render a twin's business refusal as
 // IsError:true instead of the wrapper's own automatic, coarser
 // success/failure split.
-func (spec toolSpec) toolHandler(ctx context.Context) sdkmcp.ToolHandler {
+func (spec toolSpec) toolHandler(ctx context.Context, inputSchemas map[string]*jsonschema.Schema) sdkmcp.ToolHandler {
 	return func(_ context.Context, req *sdkmcp.CallToolRequest) (result *sdkmcp.CallToolResult, err error) {
 		// Defense in depth against ANY future twin or argument shape
 		// that panics instead of erroring (bridge.go's own doc comment
@@ -200,7 +300,20 @@ func (spec toolSpec) toolHandler(ctx context.Context) sdkmcp.ToolHandler {
 		// input-validation failure is a TOOL EXECUTION error
 		// (IsError:true), never a JSON-RPC protocol error -- the model
 		// can read this text and retry with corrected arguments.
-		if verr := validateArguments(spec.InputDef, req.Params.Arguments); verr != nil {
+		//
+		// schema is looked up, never compiled, here: inputSchemas was
+		// built once, eagerly, by NewHandler at boot (compileInputSchemas'
+		// own doc comment) -- every name toolInputDefs() names is
+		// guaranteed present, so a miss here is this package's own
+		// defect (a spec.InputDef with no matching table entry), not a
+		// legitimate per-request outcome.
+		schema, ok := inputSchemas[spec.InputDef]
+		if !ok {
+			platform.Logger(ctx).Error("mcp: no compiled input schema for tool (toolInputDefs/toolSpecs drifted apart?)",
+				"tool", spec.Name, "inputDef", spec.InputDef)
+			return nil, &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: "internal error"}
+		}
+		if verr := validateArguments(schema, req.Params.Arguments); verr != nil {
 			invalid := &sdkmcp.CallToolResult{}
 			invalid.SetError(errors.New(invalidArgumentsMessage(verr)))
 			return invalid, nil
@@ -208,6 +321,18 @@ func (spec toolSpec) toolHandler(ctx context.Context) sdkmcp.ToolHandler {
 
 		urlParams, query, buildErr := spec.BuildRequest(req.Params.Arguments)
 		if buildErr != nil {
+			var iae *invalidArgumentError
+			if errors.As(buildErr, &iae) {
+				// A schema-valid argument BuildRequest still cannot
+				// carry through to the twin's own Go type (findings
+				// N8/N11/N17) -- an ordinary tool execution error, safe
+				// to show verbatim (invalidArgumentError's own doc
+				// comment), never logged: this is an expected, named
+				// outcome, not a defect.
+				invalid := &sdkmcp.CallToolResult{}
+				invalid.SetError(errors.New("invalid arguments: " + iae.msg))
+				return invalid, nil
+			}
 			// Validation above already passed, so this should be
 			// unreachable in practice; defended anyway, and never the
 			// raw error text -- a json.Unmarshal error names internal
@@ -248,14 +373,15 @@ func buildTool(spec toolSpec) (*sdkmcp.Tool, error) {
 }
 
 // registerTools adds all three 180 tools to s, each handler closing over
-// ctx and twins per toolSpec.toolHandler's own doc comment.
-func registerTools(ctx context.Context, s *sdkmcp.Server, twins Twins) error {
+// ctx, twins, and inputSchemas per toolSpec.toolHandler's own doc
+// comment.
+func registerTools(ctx context.Context, s *sdkmcp.Server, twins Twins, inputSchemas map[string]*jsonschema.Schema) error {
 	for _, spec := range toolSpecs(twins) {
 		tool, err := buildTool(spec)
 		if err != nil {
 			return err
 		}
-		s.AddTool(tool, spec.toolHandler(ctx))
+		s.AddTool(tool, spec.toolHandler(ctx, inputSchemas))
 	}
 	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -313,6 +314,68 @@ func TestToolCall_TwinPanicIsRecovered(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("follow-up call after the panic: status = %d, body = %s, want 200 (proves the process survived)", status, body2)
 	}
+}
+
+// TestToolCall_ConcurrentFirstCalls_NoRace pins the fix for round 2
+// review findings N1/N3/N4: a FRESH handler (built by this test alone,
+// never shared with an earlier one -- newTestHandler calls NewHandler
+// itself, which now compiles every tool's input schema EAGERLY, before
+// this function ever returns) receiving many concurrent, independent
+// tools/call requests, spread across all three tools and released
+// together, must run cleanly under -race and never crash the process.
+//
+// A prior revision of schemas.go compiled each tool's input $def LAZILY,
+// on the first tools/call that named it, on the single shared
+// *jsonschema.Compiler restDefsCompiler memoized -- guarded only by a
+// sync.Map around the CACHED RESULT, never around the Compile call
+// itself. santhosh-tekuri/jsonschema/v6 has no locking anywhere in its
+// own package (verified by reading its source under GOMODCACHE: Compiler
+// and Schema are plain, unsynchronized maps, and neither Compile is
+// documented safe for concurrent use). Two goroutines racing on the
+// FIRST tools/call this process had ever seen for a given $def name --
+// entirely ordinary MCP client behavior, e.g. a model issuing
+// narvi_list_sessions and narvi_get_session in parallel right after a
+// deploy -- hit a Go runtime "fatal error: concurrent map writes": a
+// fatal THROW, not a panic, which toolHandler's own recover (this file's
+// own TestToolCall_TwinPanicIsRecovered) cannot catch, killing the WHOLE
+// process and every other in-flight request on that replica with it.
+//
+// Mutation check performed by hand (not committed): temporarily
+// restoring that prior lazy-compile-on-a-shared-compiler shape in
+// schemas.go/tools.go/handler.go and rerunning this exact test in
+// isolation (`go test -race -run TestToolCall_ConcurrentFirstCalls_NoRace`,
+// so no earlier test in the same binary has already warmed the
+// package-level cache) reliably reproduces DATA RACE reports in
+// jsonschema's own roots.addRoot/Compiler.schemas, confirming this test
+// is not vacuous against the defect it exists to catch.
+func TestToolCall_ConcurrentFirstCalls_NoRace(t *testing.T) {
+	const n = 64
+	handler := newTestHandler(t, true, true, testTwins())
+
+	calls := []struct {
+		name, args string
+	}{
+		{"narvi_list_models", "{}"},
+		{"narvi_list_sessions", `{"filter":"all","limit":5}`},
+		{"narvi_get_session", `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a"}`},
+	}
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		call := calls[i%len(calls)]
+		go func(id int, name, args string) {
+			defer wg.Done()
+			<-start
+			status, body := rawPost(t, handler, "/mcp", callToolBody(id, name, args), callToolHeaders(name))
+			if status != http.StatusOK {
+				t.Errorf("concurrent tools/call %s (id=%d): status = %d, body = %s", name, id, status, body)
+			}
+		}(i, call.name, call.args)
+	}
+	close(start)
+	wg.Wait()
 }
 
 // TestToolCall_ListSessions_OmittedArgsUseTwinDefaults proves an empty

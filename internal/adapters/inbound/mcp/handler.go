@@ -9,6 +9,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
+	jsonschema "github.com/santhosh-tekuri/jsonschema/v6"
 
 	"github.com/narvidev/narvi/contracts"
 	"github.com/narvidev/narvi/internal/platform"
@@ -16,27 +17,29 @@ import (
 
 // Config is NewHandler's own configuration -- deliberately small: this
 // package needs exactly one platform.Config field (PublicBaseURL, to
-// resolve the one origin CrossOriginProtection trusts), never a whole
+// resolve the one origin this surface trusts), never a whole
 // *platform.Config (which would let this package reach for an unrelated
 // field it has no business reading).
 type Config struct {
 	// PublicBaseURL is platform.Config.PublicBaseURL -- this deployment's
 	// own externally-reachable base URL (already required config, used
 	// for the OAuth RedirectURL the same way). Its origin (scheme+host,
-	// no path) is the ONE origin the MCP endpoint's own CSRF protection
-	// trusts (technical plan §43.2) -- a browser cross-site POST from
-	// anywhere else is refused 403; a request with no Origin/Sec-Fetch-Site
-	// header at all (every non-browser client) passes.
+	// no path) is the ONE origin RequireTrustedOrigin below ever accepts
+	// (technical plan §43.2) -- a browser cross-site POST from anywhere
+	// else is refused 403; a request with no Origin/Sec-Fetch-Site header
+	// at all (every non-browser client) passes.
 	PublicBaseURL string
 }
 
 // crossOriginProtection builds the *http.CrossOriginProtection value
-// trusting cfg.PublicBaseURL's own origin -- shared by NewHandler (which
-// wires it into the SDK's own StreamableHTTPOptions, a second,
-// defense-in-depth layer) and RequireTrustedOrigin below (the ONE that
-// actually determines what a client sees, since it runs first -- see
-// RequireTrustedOrigin's own doc comment), so the two can never name a
-// different trusted origin from each other.
+// trusting cfg.PublicBaseURL's own origin, for NewHandler's own SECOND,
+// defense-in-depth Origin layer (its returned handler's own
+// StreamableHTTPOptions.CrossOriginProtection field, below) -- NOT for
+// RequireTrustedOrigin, which performs its own explicit comparison
+// instead of delegating to this type (see that function's own doc
+// comment for why). Kept as a second, independent layer in case a future
+// mount of NewHandler's returned handler is ever reachable without
+// RequireTrustedOrigin in front of it.
 func crossOriginProtection(cfg Config) (*http.CrossOriginProtection, error) {
 	origin, err := originOf(cfg.PublicBaseURL)
 	if err != nil {
@@ -49,35 +52,66 @@ func crossOriginProtection(cfg Config) (*http.CrossOriginProtection, error) {
 	return protection, nil
 }
 
+// originForbiddenBody is RequireTrustedOrigin's own 403 body -- a fixed,
+// generic message (never echoing the request's own Origin value back,
+// which would just be reflecting attacker-controlled text).
+const originForbiddenBody = `{"error":"cross-origin request denied"}`
+
 // RequireTrustedOrigin returns chi middleware enforcing the Streamable
-// HTTP transport's own Origin/Sec-Fetch-Site CSRF check (net/http's own
-// CrossOriginProtection.Handler) -- mounted FIRST in the /mcp route
+// HTTP transport's own Origin check -- mounted FIRST in the /mcp route
 // group's own chain (technical plan §43.2; controlplane/serve.go),
 // BEFORE RequireEnabled, auth.Middleware, or NewHandler's own returned
-// handler (which also carries this SAME check, wired into the SDK's own
-// StreamableHTTPOptions -- kept there too, as defense in depth, but no
-// longer the check that determines what a client actually observes).
+// handler (which also carries a SEPARATE, defense-in-depth Origin check,
+// wired into the SDK's own StreamableHTTPOptions -- kept there too, but
+// no longer the check that determines what a client actually observes).
 //
-// This is load-bearing, not merely tidier: the Streamable HTTP transport
-// spec requires "if the Origin header is present and invalid, servers
-// MUST respond with HTTP 403 Forbidden" UNCONDITIONALLY -- not "once the
-// surface is known to be enabled" or "once the caller is authenticated".
-// Before this gate existed, an invalid Origin reaching this package
-// SOMETIMES got 403 (a request that also carried a valid cookie and a
-// supported protocol version -- the SDK's own internal check, deep
-// inside NewHandler's returned handler, ran last) and sometimes did not
-// (RequireEnabled's 503, auth.Middleware's 401, or versionGate's -32022
-// each fired first for a request that failed one of THOSE checks too,
-// since every one of them runs before the SDK's own handler is ever
-// reached). Mounting the SAME check first removes that ordering
-// dependency entirely: an invalid Origin now gets 403 whatever the
-// flag/auth/version state of the rest of the request.
+// This performs its OWN explicit comparison -- an Origin header, if
+// present, must resolve to EXACTLY cfg.PublicBaseURL's own origin, or the
+// request is refused 403 -- rather than delegating to net/http's own
+// CrossOriginProtection (which crossOriginProtection above still builds,
+// for NewHandler's separate inner layer). That stdlib type exempts two
+// shapes the Streamable HTTP transport spec's own Origin check exists
+// specifically to catch: a request whose Sec-Fetch-Site header reads
+// "same-origin"/"none", and -- load-bearing here -- a request whose
+// Origin equals its OWN Host header, checked BEFORE its trusted-origin
+// list is ever consulted (Go's net/http/csrf.go, CrossOriginProtection.
+// Check). The second shape is exactly a DNS-rebinding request: an
+// attacker-controlled hostname resolved to this deployment's own IP, with
+// Host and Origin both naming that attacker hostname -- round 2 review of
+// PR #324, finding N12, which caught a prior revision of this function
+// (protection.Handler, unmodified) answering 503/401 for such a request
+// instead of the 403 this comment and technical plan §43.2 both already
+// claimed unconditionally. Comparing directly against cfg.PublicBaseURL's
+// own origin, with no exemption, is what makes that claim true.
+//
+// This gate is load-bearing beyond that one gap, too: the Streamable HTTP
+// transport spec requires "if the Origin header is present and invalid,
+// servers MUST respond with HTTP 403 Forbidden" UNCONDITIONALLY -- not
+// "once the surface is known to be enabled" or "once the caller is
+// authenticated". Mounting this check FIRST, ahead of RequireEnabled,
+// auth.Middleware, and versionGate, means an invalid Origin gets 403
+// whatever the flag/auth/version state of the rest of the request --
+// never the 503/401/-32022 those later gates would otherwise answer
+// first.
 func RequireTrustedOrigin(cfg Config) (func(http.Handler) http.Handler, error) {
-	protection, err := crossOriginProtection(cfg)
+	trusted, err := originOf(cfg.PublicBaseURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("mcp: resolve trusted origin from PublicBaseURL %q: %w", cfg.PublicBaseURL, err)
 	}
-	return protection.Handler, nil
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if origin := r.Header.Get("Origin"); origin != "" {
+				got, err := originOf(origin)
+				if err != nil || got != trusted {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusForbidden)
+					_, _ = w.Write([]byte(originForbiddenBody))
+					return
+				}
+			}
+			next.ServeHTTP(w, r)
+		})
+	}, nil
 }
 
 // NewHandler builds the complete /mcp POST handler (technical plan §43):
@@ -95,19 +129,31 @@ func RequireTrustedOrigin(cfg Config) (func(http.Handler) http.Handler, error) {
 // mounted first in the route group, is what actually determines the
 // observable 403 behavior now.
 //
-// Returns an error only for a malformed cfg.PublicBaseURL (required,
+// Returns an error for a malformed cfg.PublicBaseURL (required,
 // non-empty config every OAuth redirect URL in this binary already
 // depends on being a real absolute URL -- see Config.PublicBaseURL's own
 // doc comment); a real deployment's own boot-time GitHub OAuth wiring
-// already depends on that same assumption holding.
+// already depends on that same assumption holding. Also returns an error
+// if any of the three 180 tools' own input $defs fails to compile
+// (schemas.go's compileInputSchemas) -- deliberately here, at BOOT, not
+// discovered lazily on some later request: round 2 review of PR #324,
+// findings N1/N3/N4. See compileInputSchemas' own doc comment for why
+// compiling every tool's schema here, once, and threading the resulting
+// immutable map into every request's own *sdkmcp.Server (buildServer
+// below) is what removes the concurrent-first-call crash entirely,
+// rather than merely making it less likely.
 func NewHandler(cfg Config, twins Twins) (http.Handler, error) {
 	protection, err := crossOriginProtection(cfg)
 	if err != nil {
 		return nil, err
 	}
+	inputSchemas, err := compileInputSchemas(toolInputDefs())
+	if err != nil {
+		return nil, fmt.Errorf("mcp: compile tool input schemas: %w", err)
+	}
 
 	sdkHandler := sdkmcp.NewStreamableHTTPHandler(
-		func(r *http.Request) *sdkmcp.Server { return buildServer(r, twins) },
+		func(r *http.Request) *sdkmcp.Server { return buildServer(r, twins, inputSchemas) },
 		&sdkmcp.StreamableHTTPOptions{
 			// Stateless (§43.3): the 2026-07-28 era is served ONLY in
 			// stateless mode by the pinned SDK, the protocol itself is
@@ -131,7 +177,7 @@ func NewHandler(cfg Config, twins Twins) (http.Handler, error) {
 		},
 	)
 
-	return versionGate(sdkHandler), nil
+	return rejectBatches(versionGate(sdkHandler)), nil
 }
 
 // originOf parses rawURL (platform.Config.PublicBaseURL) into its own
@@ -195,7 +241,7 @@ func implementation() *sdkmcp.Implementation {
 // per-request outcome), this returns a server that still advertises the
 // same three tools (so tools/list stays stable) but whose every call
 // answers -32603, logged loudly server-side.
-func buildServer(r *http.Request, twins Twins) *sdkmcp.Server {
+func buildServer(r *http.Request, twins Twins, inputSchemas map[string]*jsonschema.Schema) *sdkmcp.Server {
 	ctx := r.Context()
 	logger := platform.Logger(ctx)
 
@@ -205,7 +251,7 @@ func buildServer(r *http.Request, twins Twins) *sdkmcp.Server {
 	}
 
 	server := sdkmcp.NewServer(implementation(), serverOptions())
-	if err := registerTools(ctx, server, twins); err != nil {
+	if err := registerTools(ctx, server, twins, inputSchemas); err != nil {
 		logger.Error("mcp: register tools failed", "error", err)
 		return defectServer(logger)
 	}

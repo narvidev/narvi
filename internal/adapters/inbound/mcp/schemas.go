@@ -191,78 +191,72 @@ func collectDefRefsFrom(v any, seen map[string]bool) {
 	}
 }
 
-// restDefsCompiler memoizes ONE santhosh-tekuri/jsonschema/v6 compiler
+// compileInputSchemas builds ONE santhosh-tekuri/jsonschema/v6 compiler
 // with rest/v1/dtos.schema.json added as a resource (format assertions
 // ON, so "format":"uuid" on GetSessionToolRequest.sessionId is actually
 // enforced -- mirroring contracts/contractstest/helpers_test.go's own
-// newCompiler) plus that document's own "$id", so any of its $defs can be
-// compiled by fragment. This is the validation layer this package's
-// tools always needed and never had: registerTools uses the SDK's raw,
-// non-generic Server.AddTool(*Tool, ToolHandler) path specifically
-// because that path's own OWN InputSchema is never checked against
-// arguments by the SDK itself (go-sdk v1.8.0's own doc comment on that
-// call: "Unmarshaling the arguments and validating them against the
-// input schema are the caller's responsibility") -- validateArguments
-// below is this package acting as that caller, once, in one place,
-// before ANY tool's own BuildRequest or twin ever sees an argument.
-// restDefsResource bundles the compiler produced by restDefsCompiler
-// with the "$id" its one resource was added under -- sync.OnceValues
-// only supports two return values, hence the struct rather than a bare
-// (*jsonschema.Compiler, string) pair.
-type restDefsResource struct {
-	compiler *jsonschema.Compiler
-	id       string
-}
-
-var restDefsCompiler = sync.OnceValues(func() (restDefsResource, error) {
+// newCompiler), then compiles EVERY name in defNames from it EAGERLY,
+// right here, returning an error the instant any one of them fails to
+// compile -- never lazily, never on a shared, unlocked compiler reached
+// from more than one request goroutine at a time (round 2 review of PR
+// #324, findings N1/N3/N4: a prior revision of this file compiled each
+// $def lazily, on the first tools/call that named it, guarded only by a
+// sync.Map that deduplicated the CACHED RESULT, never the Compile call
+// itself; santhosh-tekuri/jsonschema/v6 has no locking anywhere in its
+// own package -- Compile mutates the Compiler's own plain maps
+// (roots.addRoot, Compiler.schemas) -- so two tools/call requests naming
+// different $defs, or the SAME $def, racing on the very first call after
+// a process starts, hit a Go runtime "fatal error: concurrent map
+// writes": a fatal THROW, not a panic, which toolHandler's own recover
+// cannot catch and which kills the whole process, dropping every other
+// in-flight request on that replica). Calling this once, at NewHandler
+// time (boot), and returning its error there instead means a schema
+// defect fails the control plane's OWN BOOT, not a live request, and the
+// map this returns is never written to again -- so every later, purely
+// concurrent *jsonschema.Schema.Validate call against it (validateArguments
+// below) needs no lock at all: Schema.Validate builds a fresh, per-call
+// validator over an already-compiled, now-immutable *Schema tree and the
+// instance value alone (santhosh-tekuri/jsonschema/v6@v6.0.2's own
+// validator.go, (*Schema).Validate/.validate), never mutating the
+// *Compiler or the *Schema itself -- verified by reading that source
+// under GOMODCACHE: only Compile (roots.go, compiler.go, objcompiler.go)
+// touches the Compiler's or a Schema's own maps; Validate never does.
+func compileInputSchemas(defNames []string) (map[string]*jsonschema.Schema, error) {
 	data, err := contracts.FS.ReadFile("rest/v1/dtos.schema.json")
 	if err != nil {
-		return restDefsResource{}, fmt.Errorf("mcp: read embedded rest/v1/dtos.schema.json: %w", err)
+		return nil, fmt.Errorf("mcp: read embedded rest/v1/dtos.schema.json: %w", err)
 	}
 	var probe struct {
 		ID string `json:"$id"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
-		return restDefsResource{}, fmt.Errorf("mcp: probe $id in rest/v1/dtos.schema.json: %w", err)
+		return nil, fmt.Errorf("mcp: probe $id in rest/v1/dtos.schema.json: %w", err)
 	}
 	if probe.ID == "" {
-		return restDefsResource{}, fmt.Errorf("mcp: rest/v1/dtos.schema.json has no $id")
+		return nil, fmt.Errorf("mcp: rest/v1/dtos.schema.json has no $id")
 	}
 	doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(data))
 	if err != nil {
-		return restDefsResource{}, fmt.Errorf("mcp: decode rest/v1/dtos.schema.json for argument validation: %w", err)
+		return nil, fmt.Errorf("mcp: decode rest/v1/dtos.schema.json for argument validation: %w", err)
 	}
 	c := jsonschema.NewCompiler()
 	c.AssertFormat()
 	if err := c.AddResource(probe.ID, doc); err != nil {
-		return restDefsResource{}, fmt.Errorf("mcp: add rest/v1/dtos.schema.json as a validation resource: %w", err)
+		return nil, fmt.Errorf("mcp: add rest/v1/dtos.schema.json as a validation resource: %w", err)
 	}
-	return restDefsResource{compiler: c, id: probe.ID}, nil
-})
 
-// compiledInputSchemas memoizes one compiled *jsonschema.Schema per $def
-// name -- Compile itself is not documented safe for concurrent use, so
-// each name is compiled at most once (sync.Map's own LoadOrStore),
-// rather than compiling per-request.
-var compiledInputSchemas sync.Map // name (string) -> *jsonschema.Schema
-
-// compiledInputSchema returns the compiled validator for name's own
-// $def, compiling and caching it on first use.
-func compiledInputSchema(name string) (*jsonschema.Schema, error) {
-	if v, ok := compiledInputSchemas.Load(name); ok {
-		return v.(*jsonschema.Schema), nil
+	out := make(map[string]*jsonschema.Schema, len(defNames))
+	for _, name := range defNames {
+		if _, ok := out[name]; ok {
+			continue // toolInputDefs() may repeat a name; compile each one once
+		}
+		sch, err := c.Compile(probe.ID + "#/$defs/" + name)
+		if err != nil {
+			return nil, fmt.Errorf("mcp: compile input schema %q: %w", name, err)
+		}
+		out[name] = sch
 	}
-	res, err := restDefsCompiler()
-	if err != nil {
-		return nil, err
-	}
-	c, id := res.compiler, res.id
-	sch, err := c.Compile(id + "#/$defs/" + name)
-	if err != nil {
-		return nil, fmt.Errorf("mcp: compile input schema %q: %w", name, err)
-	}
-	actual, _ := compiledInputSchemas.LoadOrStore(name, sch)
-	return actual.(*jsonschema.Schema), nil
+	return out, nil
 }
 
 // errArgumentsNotJSONObject is validateArguments' own fixed message for
@@ -276,16 +270,19 @@ var errArgumentsNotJSONObject = fmt.Errorf("arguments must be a JSON object")
 // validateArguments validates raw -- a tools/call request's own
 // "arguments" value, exactly as the client sent it, which may be
 // empty/absent when the caller omitted the field entirely -- against
-// defName's own $def in rest/v1/dtos.schema.json. An empty/absent value
-// is treated as "{}": every one of this package's three input $defs is
-// {"type":"object",...}, and GetSessionToolRequest's own "required":
-// ["sessionId"] must still fire when the caller sends no arguments at
-// all, exactly as it would for a truly empty object.
-func validateArguments(defName string, raw json.RawMessage) error {
-	schema, err := compiledInputSchema(defName)
-	if err != nil {
-		return err
-	}
+// schema, an already-compiled *jsonschema.Schema for the calling tool's
+// own input $def (compileInputSchemas above, compiled once at NewHandler
+// time -- never here, and never against a schema this function compiles
+// itself: see compileInputSchemas' own doc comment for why compiling on
+// the request path at all is the defect this closes). An empty/absent
+// value is treated as "{}": every one of this package's three input
+// $defs is {"type":"object",...}, and GetSessionToolRequest's own
+// "required": ["sessionId"] must still fire when the caller sends no
+// arguments at all, exactly as it would for a truly empty object.
+// Concurrent calls against the SAME schema value need no lock --
+// (*jsonschema.Schema).Validate never mutates the schema it validates
+// against (compileInputSchemas' own doc comment).
+func validateArguments(schema *jsonschema.Schema, raw json.RawMessage) error {
 	instText := []byte(raw)
 	if len(bytes.TrimSpace(instText)) == 0 {
 		instText = []byte("{}")
