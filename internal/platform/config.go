@@ -1324,21 +1324,33 @@ func parseGitHubAppPrivateKey(raw string) (*rsa.PrivateKey, error) {
 }
 
 // gitHubAPIBaseURLEnvVarName configures NARVI_GITHUB_API_BASE_URL (§41.1
-// review round 1, finding P2): the GitHub REST API base every production
-// githubapp/githubapi construction site in controlplane/serve.go dials,
-// in place of the "https://api.github.com" literal those call sites used
-// to bake in directly. Optional -- defaults to defaultGitHubAPIBaseURL
-// (the real GitHub.com API) when unset. The one deployment shape that
-// genuinely needs to override it is GitHub Enterprise Server, whose own
-// REST API lives at "https://HOST/api/v3", not at api.github.com's own
-// host -- see canonicalGitHubAPIBaseURL's own doc comment for the exact
-// shape this value must satisfy. The other reason this exists at all:
-// Makefile's own verify-control-plane-image target (§41.1's exit
-// criterion) needs to point the packaged image's own real, UNMODIFIED
-// boot-time GitHub App scope check (verifyGitHubAppScopeAtBoot) at a
-// local stub instead of the real api.github.com, which is unreachable
-// (and undesirable as a CI dependency even when reachable) -- a
-// stage-based bypass of that check would have weakened §30.4(4) instead.
+// review round 1, finding P2; narrowed in round 2, findings Q2/Q11). This
+// knob exists for EXACTLY ONE reason: Makefile's own
+// verify-control-plane-image target (§41.1's exit criterion) needs to
+// point the packaged image's own real, UNMODIFIED boot-time GitHub App
+// scope check (verifyGitHubAppScopeAtBoot) at tools/ghappstub, a local
+// stand-in for GitHub's REST API, instead of the real api.github.com --
+// which is unreachable in CI, and undesirable as a CI dependency even
+// when reachable. A stage-based bypass of that check would have weakened
+// §30.4(4) instead.
+//
+// It is NOT General Enterprise Server support, and round 2's own review
+// found that claiming otherwise was actively dangerous: this value feeds
+// ONLY the GitHub App client (githubapp/githubapi -- App-credential API
+// calls), never the user-facing OAuth login flow. OAuth authorize/token
+// exchange (internal/adapters/inbound/auth/oauth.go) is hard-coded to
+// github.com, and so is every call the auth callback makes with a user's
+// own OAuth token (/user, /user/emails, /orgs/...) -- see
+// auth.NewCallbackHandler's own call site in controlplane/serve.go for
+// why. Pointing this variable at a non-github.com host would therefore
+// have sent every logging-in user's github.com-scoped OAuth token
+// (scopes include "repo") to whatever host this variable named, while
+// login itself stayed on github.com -- a credential-leak shape entirely
+// unrelated to this variable's one real purpose. To make that
+// misconfiguration unrepresentable rather than merely undocumented, this
+// value may ONLY be set when Stage is StageDevelopment; Load returns a
+// validation error otherwise. Optional even in development -- defaults
+// to defaultGitHubAPIBaseURL (the real GitHub.com API) when unset.
 const gitHubAPIBaseURLEnvVarName = "NARVI_GITHUB_API_BASE_URL"
 
 // defaultGitHubAPIBaseURL is GitHub's own real REST API base -- the value
@@ -1349,10 +1361,11 @@ const gitHubAPIBaseURLEnvVarName = "NARVI_GITHUB_API_BASE_URL"
 const defaultGitHubAPIBaseURL = "https://api.github.com"
 
 // InvalidGitHubAPIBaseURLError is returned by Load when
-// NARVI_GITHUB_API_BASE_URL is set but is not a well-formed absolute
-// http(s) URL naming a host, or uses plain http outside StageDevelopment
-// -- mirrors InvalidCloudIdentityIssuerURLError/InvalidOTLPEndpointError's
-// own identical named-error shape immediately above.
+// NARVI_GITHUB_API_BASE_URL is set but Stage is not StageDevelopment, or
+// the value is not a well-formed absolute http(s) URL naming a host with
+// no userinfo, query, or fragment -- mirrors
+// InvalidCloudIdentityIssuerURLError/InvalidOTLPEndpointError's own
+// identical named-error shape immediately above.
 type InvalidGitHubAPIBaseURLError struct {
 	Value  string
 	Reason string
@@ -1368,25 +1381,21 @@ func (e *InvalidGitHubAPIBaseURLError) Error() string {
 // githubapi.Adapter (which already trims its own trailing "/" -- this
 // function applies that same trim so BOTH call sites see an identical,
 // already-canonical value, whichever one a future reader happens to check
-// first): a well-formed absolute URL, http or https scheme, non-empty
-// host, and https required unless stage is StageDevelopment -- a
-// production or staging deploy pointed at plain http would send its
-// GitHub App's own signed JWT, and any Enterprise Server credential, over
-// the wire unencrypted.
+// first): a well-formed absolute URL, http or https scheme, a non-empty
+// host, no userinfo, and no query string or fragment.
 //
-// Unlike canonicalCloudIdentityIssuerURL/canonicalOTLPEndpointURL's own
-// neighboring "no path at all" rule, a path IS allowed and preserved here
-// (a trailing slash aside): GitHub Enterprise Server's own REST API lives
-// at https://HOST/api/v3, not at the host root, so rejecting any path
-// would make this validation refuse the one real non-default value this
-// field exists to accept.
-func canonicalGitHubAPIBaseURL(raw string, stage Stage) (string, error) {
+// The caller (Load) only invokes this once it has already confirmed
+// Stage is StageDevelopment (gitHubAPIBaseURLEnvVarName's own doc comment
+// -- §41.1 review round 2, findings Q2/Q11), so this function itself does
+// not restrict scheme by stage: plain http is exactly what
+// tools/ghappstub, reached over Docker's host.docker.internal, needs.
+func canonicalGitHubAPIBaseURL(raw string) (string, error) {
 	parsed, err := url.Parse(raw)
 	if err != nil {
 		return "", &InvalidGitHubAPIBaseURLError{Value: raw, Reason: fmt.Sprintf("not a valid URL: %v", err)}
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return "", &InvalidGitHubAPIBaseURLError{Value: raw, Reason: "scheme must be http or https"}
+		return "", &InvalidGitHubAPIBaseURLError{Value: raw, Reason: "scheme must be http or https (must be an absolute URL, not a relative path)"}
 	}
 	// Hostname(), not Host -- see canonicalOTLPEndpointURL's own identical
 	// reasoning: a port-only authority has a non-empty Host and an empty
@@ -1394,8 +1403,8 @@ func canonicalGitHubAPIBaseURL(raw string, stage Stage) (string, error) {
 	if parsed.Hostname() == "" {
 		return "", &InvalidGitHubAPIBaseURLError{Value: raw, Reason: "must include a host (a port-only value names no host)"}
 	}
-	if parsed.Scheme != "https" && stage != StageDevelopment {
-		return "", &InvalidGitHubAPIBaseURLError{Value: raw, Reason: fmt.Sprintf("must use https outside %s -- this URL carries the GitHub App's own signed JWT and any Enterprise Server credential", StageDevelopment)}
+	if parsed.User != nil {
+		return "", &InvalidGitHubAPIBaseURLError{Value: raw, Reason: "must not carry userinfo (a username or password in the URL)"}
 	}
 	if parsed.RawQuery != "" || parsed.Fragment != "" {
 		return "", &InvalidGitHubAPIBaseURLError{Value: raw, Reason: "must not carry a query string or fragment"}
@@ -1644,14 +1653,17 @@ type Config struct {
 	GitHubAppID         int64
 	GitHubAppPrivateKey *rsa.PrivateKey
 
-	// GitHubAPIBaseURL is the GitHub REST API base every production
-	// githubapp/githubapi construction site dials (controlplane/serve.go),
-	// read from NARVI_GITHUB_API_BASE_URL and canonicalized by
+	// GitHubAPIBaseURL is the GitHub REST API base every githubapp/githubapi
+	// construction site dials (controlplane/serve.go) -- the GitHub App's
+	// OWN API calls, never a user's OAuth token -- read from
+	// NARVI_GITHUB_API_BASE_URL and canonicalized by
 	// canonicalGitHubAPIBaseURL. Optional -- defaults to
-	// defaultGitHubAPIBaseURL ("https://api.github.com") when unset; see
-	// gitHubAPIBaseURLEnvVarName's own doc comment for the two reasons a
-	// deployment (or this repository's own verify-control-plane-image
-	// target) needs to override it.
+	// defaultGitHubAPIBaseURL ("https://api.github.com") when unset, and
+	// may only be non-default when Stage is StageDevelopment; see
+	// gitHubAPIBaseURLEnvVarName's own doc comment for why (§41.1 review
+	// round 2, findings Q2/Q11 -- this is this repository's own
+	// verify-control-plane-image target's knob, not GitHub Enterprise
+	// Server support).
 	GitHubAPIBaseURL string
 
 	// ModalBaseURL and ModalAuthToken configure the real
@@ -1889,9 +1901,9 @@ func Load() (*Config, error) {
 // caller-supplied environment lookup instead of the real process
 // environment (§41.1 review round 2, findings Q4/Q5/Q8/Q9). It exists
 // solely as the seam internal/ops's Secret-template drift guard needs to
-// determine which variables Load can report missing BEHAVIOURALLY -- by
-// actually calling this loader once per accepted Stage value against an
-// injected, empty environment and collecting the typed errors it
+// determine which variables Load can report missing BEHAVIOURALLY --
+// by actually calling this loader once per accepted Stage value against
+// an injected, empty environment and collecting the typed errors it
 // returns -- instead of a second, parallel static heuristic
 // (go/ast-walking config.go's own source for shapes that "look required")
 // that a previous round of this scanner proved could never keep up with
@@ -2183,14 +2195,19 @@ func load(lookupEnv func(string) (string, bool)) (*Config, error) {
 	// gitHubAPIBaseURL: optional, defaults to defaultGitHubAPIBaseURL --
 	// see gitHubAPIBaseURLEnvVarName's own doc comment for why this exists
 	// at all despite every other GitHub-flavored value on this file being
-	// a credential rather than an endpoint.
+	// a credential rather than an endpoint, and for why it is refused
+	// outside StageDevelopment (§41.1 review round 2, findings Q2/Q11).
 	gitHubAPIBaseURL := defaultGitHubAPIBaseURL
 	if raw := getenv(gitHubAPIBaseURLEnvVarName); raw != "" {
-		canonical, canonErr := canonicalGitHubAPIBaseURL(raw, stage)
-		if canonErr != nil {
-			errs = append(errs, canonErr)
+		if stage != StageDevelopment {
+			errs = append(errs, &InvalidGitHubAPIBaseURLError{Value: raw, Reason: fmt.Sprintf("may only be set when %s=%s -- it exists solely so verify-control-plane-image can point the GitHub App client at a local stub; OAuth login and every user-token API call always use %s regardless of this setting", envVarName, StageDevelopment, defaultGitHubAPIBaseURL)})
 		} else {
-			gitHubAPIBaseURL = canonical
+			canonical, canonErr := canonicalGitHubAPIBaseURL(raw)
+			if canonErr != nil {
+				errs = append(errs, canonErr)
+			} else {
+				gitHubAPIBaseURL = canonical
+			}
 		}
 	}
 

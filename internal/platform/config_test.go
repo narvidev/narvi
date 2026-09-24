@@ -1892,3 +1892,118 @@ func TestLoadOTLPEndpoint(t *testing.T) {
 		})
 	}
 }
+
+// TestLoadGitHubAPIBaseURL covers NARVI_GITHUB_API_BASE_URL (§41.1 review
+// round 1, finding P2; narrowed by round 2, findings Q2/Q7/Q10/Q11): this
+// value feeds ONLY the GitHub App client (githubapp/githubapi, plus
+// verifyGitHubAppScopeAtBoot) -- never OAuth login or any user-token API
+// call, both of which stay hard-coded to api.github.com regardless of
+// this setting (controlplane/serve.go's own githubUserTokenAPIBaseURL).
+// It exists solely so this repository's own verify-control-plane-image
+// Makefile target can point the packaged image's GitHub App client at
+// tools/ghappstub, so it may ONLY be set when Stage is StageDevelopment;
+// Load refuses to boot with a named validation error otherwise. This is
+// this Step's own required mutation test (§41.1 review round 2, findings
+// Q7/Q10): weakening/removing either the stage gate or
+// canonicalGitHubAPIBaseURL's own shape checks makes the corresponding
+// subtest below fail.
+func TestLoadGitHubAPIBaseURL(t *testing.T) {
+	t.Run("unset defaults to https://api.github.com in every stage", func(t *testing.T) {
+		for _, stage := range []string{"development", "staging", "production"} {
+			t.Run(stage, func(t *testing.T) {
+				setRequiredEnv(t)
+				t.Setenv("NARVI_STAGE", stage)
+				t.Setenv("NARVI_GITHUB_API_BASE_URL", "")
+
+				cfg, err := platform.Load()
+				if err != nil {
+					t.Fatalf("Load() error = %v, want nil (this field is optional)", err)
+				}
+				if cfg.GitHubAPIBaseURL != "https://api.github.com" {
+					t.Errorf("Load().GitHubAPIBaseURL = %q, want %q", cfg.GitHubAPIBaseURL, "https://api.github.com")
+				}
+			})
+		}
+	})
+
+	t.Run("set in development is accepted and canonicalized", func(t *testing.T) {
+		cases := []struct {
+			name string
+			val  string
+			want string
+		}{
+			{"no trailing slash carries through unchanged", "http://localhost:18081", "http://localhost:18081"},
+			{"a trailing slash is trimmed", "http://localhost:18081/", "http://localhost:18081"},
+			{"a GHES-shaped path is preserved (trailing slash aside)", "https://ghes.corp/api/v3/", "https://ghes.corp/api/v3"},
+			{"plain http is accepted in development", "http://host.docker.internal:18081", "http://host.docker.internal:18081"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				setRequiredEnv(t) // sets NARVI_STAGE=development
+				t.Setenv("NARVI_GITHUB_API_BASE_URL", tc.val)
+
+				cfg, err := platform.Load()
+				if err != nil {
+					t.Fatalf("Load() error = %v, want nil", err)
+				}
+				if cfg.GitHubAPIBaseURL != tc.want {
+					t.Errorf("Load().GitHubAPIBaseURL = %q, want %q", cfg.GitHubAPIBaseURL, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("set outside development is refused regardless of shape", func(t *testing.T) {
+		for _, stage := range []string{"staging", "production"} {
+			t.Run(stage, func(t *testing.T) {
+				setRequiredEnv(t)
+				t.Setenv("NARVI_STAGE", stage)
+				// A perfectly well-formed https URL -- this must still be
+				// refused: the gate is on Stage, not on URL shape (§41.1
+				// review round 2, findings Q2/Q11 -- this is NOT GitHub
+				// Enterprise Server support).
+				t.Setenv("NARVI_GITHUB_API_BASE_URL", "https://ghes.corp/api/v3")
+
+				_, err := platform.Load()
+				if err == nil {
+					t.Fatalf("Load() error = nil, want *platform.InvalidGitHubAPIBaseURLError when set outside development")
+				}
+				var urlErr *platform.InvalidGitHubAPIBaseURLError
+				if !errors.As(err, &urlErr) {
+					t.Fatalf("Load() error = %v, want *platform.InvalidGitHubAPIBaseURLError", err)
+				}
+			})
+		}
+	})
+
+	t.Run("malformed, relative, or userinfo-bearing values are refused in development", func(t *testing.T) {
+		invalidCases := []struct {
+			name string
+			val  string
+		}{
+			{"not a URL at all", "://not a url"},
+			{"missing scheme (a relative path)", "/api/v3"},
+			{"non-http(s) scheme", "ftp://ghes.corp/api/v3"},
+			{"missing host", "https:///api/v3"},
+			{"port-only authority names no host", "https://:8443"},
+			{"carries userinfo", "https://user:pass@ghes.corp/api/v3"},
+			{"carries a query string", "https://ghes.corp/api/v3?x=1"},
+			{"carries a fragment", "https://ghes.corp/api/v3#frag"},
+		}
+		for _, tc := range invalidCases {
+			t.Run(tc.name, func(t *testing.T) {
+				setRequiredEnv(t) // sets NARVI_STAGE=development
+				t.Setenv("NARVI_GITHUB_API_BASE_URL", tc.val)
+
+				_, err := platform.Load()
+				if err == nil {
+					t.Fatalf("Load() error = nil, want *platform.InvalidGitHubAPIBaseURLError for %q", tc.val)
+				}
+				var urlErr *platform.InvalidGitHubAPIBaseURLError
+				if !errors.As(err, &urlErr) {
+					t.Fatalf("Load() error = %v, want *platform.InvalidGitHubAPIBaseURLError", err)
+				}
+			})
+		}
+	})
+}

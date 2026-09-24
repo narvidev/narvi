@@ -97,12 +97,12 @@ import (
 // OAuth2 token endpoint both live under this host), passed to
 // linearapi.New's own apiBaseURL parameter in production wiring -- the
 // ONLY place this literal appears in this binary's wiring ("Linear
-// ingress", §8.10). Unlike GitHub's own equivalent base URL
-// (cfg.GitHubAPIBaseURL, internal/platform.Config -- configurable via
-// NARVI_GITHUB_API_BASE_URL specifically for GitHub Enterprise Server and
-// this repository's own verify-control-plane-image target, §41.1 review
-// round 1 finding P2), no deployment shape needs to override Linear's or
-// Slack's own API host, so both stay a plain wiring-layer const here.
+// ingress", §8.10). Unlike GitHub App API calls (cfg.GitHubAPIBaseURL,
+// internal/platform.Config -- configurable ONLY in StageDevelopment,
+// solely for this repository's own verify-control-plane-image target,
+// §41.1 review round 1 finding P2, narrowed by round 2 findings Q2/Q11),
+// no deployment shape needs to override Linear's or Slack's own API host,
+// so both stay a plain wiring-layer const here.
 const linearAPIBaseURL = "https://api.linear.app"
 
 // slackAPIBaseURL is Slack's own real Web API base, passed to
@@ -111,6 +111,39 @@ const linearAPIBaseURL = "https://api.linear.app"
 // wiring, mirroring linearAPIBaseURL's own identical "no override needed"
 // reasoning immediately above.
 const slackAPIBaseURL = "https://slack.com/api"
+
+// githubUserTokenAPIBaseURL is GitHub's own real REST API base, used for
+// EVERY call site in this file that sends a user's own OAuth access
+// token, rather than a GitHub App credential or the operator-configured
+// bot token -- deliberately NEVER cfg.GitHubAPIBaseURL (§41.1 review
+// round 2, findings Q2/Q11).
+//
+// Round 1 threaded cfg.GitHubAPIBaseURL into auth.NewCallbackHandler
+// (this file's own OAuth callback wiring) alongside the GitHub App
+// client construction sites, on the theory that both were "the GitHub
+// API base". Round 2 found that conflation live: OAuth authorize/token
+// exchange (internal/adapters/inbound/auth/oauth.go) is, and stays,
+// hard-coded to github.com/login/oauth -- it is NOT threaded through
+// cfg.GitHubAPIBaseURL and never will be, since NARVI_GITHUB_API_BASE_URL
+// is a StageDevelopment-only knob for this repository's own
+// verify-control-plane-image target, not a GitHub Enterprise Server
+// setting. So a configured non-default base received the github.com-
+// issued user token (scopes including "repo") the callback had just
+// exchanged, while login itself never left github.com -- a genuine
+// credential-leak shape, not merely a broken GHES deployment. Every call
+// site below that carries a user's own OAuth token -- the auth callback's
+// own /user, /user/emails, /orgs/... calls, and
+// internal/adapters/outbound/githubapi's liveSourceControl (whose
+// CreatePR/ResolveBranchSHA/IsAncestor calls carry the session creator's
+// own decrypted OAuth token, ports.CreatePRSpec.Token's own doc comment)
+// -- now uses this hard-coded constant again, exactly like before round
+// 1, regardless of what NARVI_GITHUB_API_BASE_URL names. Only the GitHub
+// App client (githubapp.New, both construction sites below) and
+// verifyGitHubAppScopeAtBoot still follow cfg.GitHubAPIBaseURL: the App's
+// own signed-JWT credential is the one thing this repository's own
+// verify-control-plane-image target (Makefile) needs redirected at
+// tools/ghappstub.
+const githubUserTokenAPIBaseURL = "https://api.github.com"
 
 // App is the built control plane: the router Build assembled, plus every
 // background worker Run drives through its own errgroup. Constructed by
@@ -320,6 +353,9 @@ func serve(modules ...extension.Module) error {
 	// parameter -- would put a boot pre-flight's own output on Build's
 	// signature, which is supposed to take nothing but an already-open
 	// pool and hand back a fully wired App.
+	// preflightGitHubAppClient signs and sends the GitHub App's OWN JWT --
+	// never a user's OAuth token -- so cfg.GitHubAPIBaseURL is correct here
+	// (§41.1 review round 2, findings Q2/Q11).
 	preflightGitHubAppClient := githubapp.New(http.DefaultClient, cfg.GitHubAPIBaseURL, cfg.GitHubAppID, cfg.GitHubAppPrivateKey, cfg.Timeouts.GitHubAppJWTTTL, cfg.Timeouts.GitHubAppJWTClockSkew)
 	if err := verifyGitHubAppScopeAtBoot(ctx, preflightGitHubAppClient, cfg.Timeouts.GitHubAppScopeCheckTimeout); err != nil {
 		return err
@@ -514,11 +550,23 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// write-capable creator OAuth/bot-token credentials. Constructed once
 	// here, the ONE production construction site, mirroring
 	// gatedHTTPClient/liveSourceControl's own identical "one seam" pattern
-	// immediately below.
+	// immediately below. Like preflightGitHubAppClient above, this signs
+	// and sends the GitHub App's OWN JWT/installation-token credential --
+	// never a user's OAuth token -- so cfg.GitHubAPIBaseURL is correct
+	// here too (§41.1 review round 2, findings Q2/Q11).
 	githubAppClient := githubapp.New(http.DefaultClient, cfg.GitHubAPIBaseURL, cfg.GitHubAppID, cfg.GitHubAppPrivateKey, cfg.Timeouts.GitHubAppJWTTTL, cfg.Timeouts.GitHubAppJWTClockSkew)
 
+	// liveSourceControl carries per-call tokens that are NOT the GitHub
+	// App's own credential -- cfg.GitHubBotToken for the notifier wrappers
+	// below, and the session creator's own decrypted OAuth token for
+	// CreatePR/ResolveBranchSHA/IsAncestor (ports.CreatePRSpec.Token's own
+	// doc comment). Its base URL is therefore githubUserTokenAPIBaseURL,
+	// never cfg.GitHubAPIBaseURL (§41.1 review round 2, findings Q2/Q11 --
+	// see that constant's own doc comment), matching
+	// ports.GitHubSourceControlHost/SupportedSourceControlHosts' own
+	// existing "production wiring always talks to github.com" invariant.
 	gatedHTTPClient := githubapi.NewGatedClient(shadowLedger, isLiveEgress)
-	liveSourceControl := githubapi.New(gatedHTTPClient, cfg.GitHubAPIBaseURL)
+	liveSourceControl := githubapi.New(gatedHTTPClient, githubUserTokenAPIBaseURL)
 
 	// Layer 1 on top of layer 0 (§30.2), redundant in one direction only:
 	// the decorator records the six port writes with their real types and
@@ -1624,6 +1672,14 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// auth gate. See internal/adapters/inbound/auth's own doc.go for the
 	// full routes/outcome-table writeup.
 	router.Get("/auth/github/login", auth.NewLoginHandler(oauthConfig, cfg.Timeouts, secureCookies))
+	// NewCallbackHandler's own apiBaseURL argument is githubUserTokenAPIBaseURL,
+	// never cfg.GitHubAPIBaseURL (§41.1 review round 2, findings Q2/Q11):
+	// oauthConfig (auth.NewGitHubOAuthConfig) always exchanges the OAuth
+	// code at github.com, so the token this handler carries into
+	// fetchGitHubUser/fetchVerifiedPrimaryEmail/checkAnyOrgMembership
+	// (/user, /user/emails, /orgs/...) is always a github.com-issued user
+	// access token -- sending it anywhere but github.com would leak it to
+	// whatever host NARVI_GITHUB_API_BASE_URL named.
 	router.Get("/auth/github/callback", auth.NewCallbackHandler(
 		pool,
 		oauthConfig,
@@ -1636,7 +1692,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		cfg.TokenEncryptionKey,
 		cfg.Timeouts,
 		secureCookies,
-		cfg.GitHubAPIBaseURL,
+		githubUserTokenAPIBaseURL,
 	))
 	router.Post("/auth/logout", auth.NewLogoutHandler(userSessionStore, secureCookies))
 
