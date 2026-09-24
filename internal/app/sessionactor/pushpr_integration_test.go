@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1391,6 +1392,160 @@ func TestHandleSandboxEvent_PushComplete_CreatesPRArtifact(t *testing.T) {
 	}
 	if rows[0].Url != "https://github.com/acme/repo1/pull/42" {
 		t.Errorf("artifact url = %q, want %q", rows[0].Url, "https://github.com/acme/repo1/pull/42")
+	}
+}
+
+// TestHandleSandboxEvent_PushComplete_CreatorNoGitHubToken_FallsBackToBot
+// proves §8.11's own fallback half ("PR created with the prompting user's
+// OAuth token (fallback: bot + manual PR URL)") for the ordinary case that
+// motivates it: a session creator who signed in ONLY through a provider
+// other than GitHub (§41.3, generic OIDC) and has never linked a GitHub
+// identity has no row at all in identities for provider=github, so
+// decryptCreatorGitHubToken's own "no usable github identity" branch
+// fires -- otherwise an identical setup to
+// TestHandleSandboxEvent_PushComplete_CreatesPRArtifact immediately above
+// (same repo, same push), except NO identities row is ever created for
+// this user, and the registry is built WITH a configured bot token
+// (RegistryOptions.GitHubBotToken). The PR must still open -- under the
+// bot token, never the (nonexistent) creator token -- and its own body
+// must say so honestly.
+func TestHandleSandboxEvent_PushComplete_CreatorNoGitHubToken_FallsBackToBot(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+
+	userStore := narvipg.NewUserStore(pool)
+	user, err := userStore.Create(ctx, sqlcgen.CreateUserParams{
+		PrimaryEmail: fmt.Sprintf("oidc-only-%d@example.com", time.Now().UnixNano()),
+		DisplayName:  "OIDC-Only User",
+		Role:         sqlcgen.UserRoleMember,
+	})
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	// Deliberately NO identities row of any provider -- this user has
+	// never linked a GitHub account. decryptCreatorGitHubToken's own
+	// GetByUserAndProvider(github) lookup must miss.
+
+	sessionID := createTestSessionWithRepos(ctx, t, pool, user.ID,
+		"repo1", "https://github.com/acme/repo1.git", "feature-x")
+
+	sandboxStore := narvipg.NewSandboxStore(pool)
+	if _, err := sandboxStore.Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+
+	const wantBotToken = "gh-fake-bot-token"
+	const wantDefaultBranch = "trunk"
+	sourceControl := &fakeSourceControl{
+		nextRef:           ports.PRRef{Number: 77, URL: "https://github.com/acme/repo1/pull/77"},
+		defaultBranchName: wantDefaultBranch,
+	}
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", sourceControl, testTokenEncryptionKey, "", nil, false, RegistryOptions{GitHubBotToken: wantBotToken})
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "push_complete",
+		Gen:  1,
+		Raw:  pushCompleteRaw(t, sessionID.String(), 1, "repo1", "feature-x", "abc123"),
+	})
+
+	waitUntil(t, 5*time.Second, func() bool {
+		return sourceControl.callCount() == 1
+	})
+
+	spec := sourceControl.lastSpec()
+	if spec.Token != wantBotToken {
+		t.Errorf("CreatePRSpec.Token = %q, want the bot token %q (§8.11 fallback -- no creator github token exists)", spec.Token, wantBotToken)
+	}
+	if spec.Base != wantDefaultBranch {
+		t.Errorf("CreatePRSpec.Base = %q, want %q", spec.Base, wantDefaultBranch)
+	}
+	if !strings.Contains(spec.Body, "bot identity") {
+		t.Errorf("CreatePRSpec.Body = %q, want it to name the bot-identity fallback honestly (§8.11)", spec.Body)
+	}
+
+	artifactStore := narvipg.NewArtifactStore(pool)
+	waitUntil(t, 5*time.Second, func() bool {
+		rows, err := artifactStore.ListForSession(ctx, sessionID)
+		return err == nil && len(rows) == 1
+	})
+	rows, err := artifactStore.ListForSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("list artifacts: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Url != "https://github.com/acme/repo1/pull/77" {
+		t.Fatalf("artifacts = %+v, want exactly one PR artifact for the bot-opened PR", rows)
+	}
+}
+
+// TestHandleSandboxEvent_PushComplete_CreatorNoGitHubToken_NoBotToken_SkipsHonestly
+// proves the OTHER half of §8.11's fallback is still honest when NEITHER
+// credential exists: a creator with no linked GitHub identity AND no bot
+// token configured for this deployment gets no PR at all -- logged, never
+// a panic or a silently-wrong credential -- an otherwise identical setup
+// to TestHandleSandboxEvent_PushComplete_CreatorNoGitHubToken_FallsBackToBot
+// immediately above, except the registry is built with NO
+// RegistryOptions.GitHubBotToken (the zero value, "").
+func TestHandleSandboxEvent_PushComplete_CreatorNoGitHubToken_NoBotToken_SkipsHonestly(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+
+	userStore := narvipg.NewUserStore(pool)
+	user, err := userStore.Create(ctx, sqlcgen.CreateUserParams{
+		PrimaryEmail: fmt.Sprintf("oidc-only-nobot-%d@example.com", time.Now().UnixNano()),
+		DisplayName:  "OIDC-Only User, No Bot",
+		Role:         sqlcgen.UserRoleMember,
+	})
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	sessionID := createTestSessionWithRepos(ctx, t, pool, user.ID,
+		"repo1", "https://github.com/acme/repo1.git", "feature-x")
+
+	sandboxStore := narvipg.NewSandboxStore(pool)
+	if _, err := sandboxStore.Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+
+	sourceControl := &fakeSourceControl{}
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", sourceControl, testTokenEncryptionKey, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "push_complete",
+		Gen:  1,
+		Raw:  pushCompleteRaw(t, sessionID.String(), 1, "repo1", "feature-x", "abc123"),
+	})
+
+	time.Sleep(300 * time.Millisecond)
+	if got := sourceControl.callCount(); got != 0 {
+		t.Errorf("CreatePR called %d times, want 0 (no creator github token, no bot token configured)", got)
+	}
+
+	artifactStore := narvipg.NewArtifactStore(pool)
+	rows, err := artifactStore.ListForSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("list artifacts: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("artifact count = %d, want 0", len(rows))
 	}
 }
 

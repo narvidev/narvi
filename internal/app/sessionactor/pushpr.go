@@ -924,9 +924,32 @@ func (a *Actor) createPRBestEffort(ctx context.Context, raw json.RawMessage) {
 		return // already logged by creatorMayGetPRAttribution
 	}
 
+	// §8.11 ("multiplayer... PR created with the prompting user's OAuth
+	// token (fallback: bot + manual PR URL)"): a creator with no usable
+	// stored GitHub OAuth token -- the ordinary case for a user who signed
+	// in ONLY through OIDC (§41.3) and has never linked a GitHub identity
+	// -- falls back to this Actor's own bot credential (a.githubBotToken,
+	// the SAME static credential createSentinelFixPRBestEffort's own
+	// system-initiated path already authenticates with, below) rather
+	// than silently dropping the PR entirely. The bot cannot be attributed
+	// as "the prompting user" on GitHub's own side (GitHub has no concept
+	// of attributing a PR to someone who never authenticated with it), so
+	// usedBotFallback below renders an honest PR body naming the real
+	// creator and pointing at Settings -> Identities to link a GitHub
+	// account for future sessions -- the "manual PR URL" half of §8.11's
+	// own fallback: the artifact row this function already records below
+	// (recordPRArtifact, unconditionally, on EITHER path) is what
+	// surfaces that URL to the creator, exactly as it always has.
 	token, ok := a.decryptCreatorGitHubToken(ctx, sessionRow.CreatedBy)
+	usedBotFallback := false
 	if !ok {
-		return // already logged by decryptCreatorGitHubToken
+		if a.githubBotToken == "" {
+			a.logger.Warn("sessionactor: session creator has no usable github token and no bot token is configured; skipping PR creation (§8.11)")
+			return
+		}
+		a.logger.Info("sessionactor: session creator has no usable github token; falling back to bot identity for PR creation (§8.11)")
+		token = a.githubBotToken
+		usedBotFallback = true
 	}
 
 	repos, err := reposFromJSON(sessionRow.Repos)
@@ -987,7 +1010,7 @@ func (a *Actor) createPRBestEffort(ctx context.Context, raw json.RawMessage) {
 			Head:  pushed.Branch,
 			Base:  base,
 			Title: title,
-			Body:  prBody(pushed),
+			Body:  prBody(pushed, usedBotFallback),
 			Token: token,
 		}
 		prCtx, cancel := context.WithTimeout(ctx, a.timeouts.PRCreateTimeout)
@@ -1273,8 +1296,19 @@ func prTitle(sessionRow sqlcgen.Session) string {
 
 // prBody builds a minimal, honest PR description -- this Step invents no
 // richer changelog/summary mechanism than "which branch, which commit".
-func prBody(pushed sandboxws.PushCompleteReposElem) string {
-	return fmt.Sprintf("Automated changes from a Narvi session (branch %q, commit %s).", pushed.Branch, pushed.Sha)
+//
+// usedBotFallback is true iff createPRBestEffort's own §8.11 bot-identity
+// fallback opened this PR (the session creator has no usable stored
+// GitHub OAuth token, e.g. a user who signed in only through OIDC and has
+// never linked a GitHub identity) -- an added, honest sentence naming that
+// plainly, so a reviewer of the PR (and the creator themselves, reading it
+// back) understands why it is bot-attributed rather than assuming a bug.
+func prBody(pushed sandboxws.PushCompleteReposElem, usedBotFallback bool) string {
+	body := fmt.Sprintf("Automated changes from a Narvi session (branch %q, commit %s).", pushed.Branch, pushed.Sha)
+	if usedBotFallback {
+		body += " Opened under the bot identity: this session's creator has no linked GitHub account (or no usable stored token) to attribute it to -- link one in Settings -> Identities to open future PRs under your own account."
+	}
+	return body
 }
 
 // parseOwnerRepo used to live here as a byte-for-byte fork of

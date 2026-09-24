@@ -13,7 +13,7 @@
 import { queryOptions, type QueryClient } from '@tanstack/react-query'
 
 import { authQueryKeys } from '../api/queryKeys'
-import { getMe } from '../api/endpoints'
+import { getMe, getAuthCapabilities } from '../api/endpoints'
 import { ApiError, setUnauthorizedHandler } from '../api/http'
 
 /**
@@ -43,6 +43,23 @@ export const meQueryOptions = queryOptions({
   // below (not a short staleTime) is what catches the one case they DO --
   // an expired/revoked session -- promptly, from wherever in the app it
   // is first noticed.
+  staleTime: 60_000,
+})
+
+/**
+ * authCapabilitiesQueryOptions (§41.3) backs GET /auth/capabilities --
+ * the sign-in view's own "is OIDC configured" probe. Deliberately a
+ * SEPARATE query from meQueryOptions above: this one is PUBLIC (never
+ * 401s -- an unconfigured deployment still returns 200 with
+ * `oidcConfigured: false`), so it is safe, and correct, to fetch even
+ * while signed out -- exactly when the sign-in view needs the answer.
+ * staleTime matches meQueryOptions' own reasoning: whether this
+ * deployment has OIDC configured is boot-time config, not something that
+ * changes within a browser session.
+ */
+export const authCapabilitiesQueryOptions = queryOptions({
+  queryKey: authQueryKeys.capabilities(),
+  queryFn: ({ signal }) => getAuthCapabilities(signal),
   staleTime: 60_000,
 })
 

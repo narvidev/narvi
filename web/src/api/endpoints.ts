@@ -23,6 +23,7 @@ import type {
   Automation,
   ArtifactsResponse,
   AuditLogEntry,
+  AuthCapabilitiesResponse,
   CapabilitiesResponse,
   ChatGPTLinkStatus,
   CloudIdentityBinding,
@@ -194,6 +195,20 @@ export function getMe(signal?: AbortSignal): Promise<Member> {
  */
 export function logout(signal?: AbortSignal): Promise<undefined> {
   return request<undefined>('/auth/logout', { method: 'POST', signal })
+}
+
+/**
+ * getAuthCapabilities calls GET /auth/capabilities (§41.3) -- the ONE
+ * public, UNAUTHENTICATED signal the sign-in view needs before a visitor
+ * is signed in at all: whether this deployment has a generic OIDC SSO
+ * provider configured, so its SSO button can link to /auth/oidc/login
+ * instead of staying permanently disabled. Deliberately NOT GET
+ * /api/capabilities (getCapabilities, below) -- that is a different,
+ * auth-gated read model (licensed-module capabilities) a signed-out
+ * visitor cannot call at all.
+ */
+export function getAuthCapabilities(signal?: AbortSignal): Promise<AuthCapabilitiesResponse> {
+  return request<AuthCapabilitiesResponse>('/auth/capabilities', { signal })
 }
 
 // -- §12.2 item 1 / §28: the composer's model/effort selector,

@@ -49,8 +49,8 @@ import { useState } from 'react'
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { meQueryOptions, isSignedOut } from '../auth/session'
-import { githubLoginHref, safeContinueTarget } from '../auth/loginLinks'
+import { meQueryOptions, authCapabilitiesQueryOptions, isSignedOut } from '../auth/session'
+import { githubLoginHref, oidcLoginHref, safeContinueTarget } from '../auth/loginLinks'
 import { logout } from '../api/endpoints'
 import { authQueryKeys } from '../api/queryKeys'
 import { IdentityStatusPanel } from '../components/auth/IdentityStatusPanel'
@@ -87,6 +87,16 @@ export const Route = createFileRoute('/sign-in')({
 function SignInView() {
   const search = Route.useSearch()
   const meQuery = useQuery(meQueryOptions)
+  // authCapabilitiesQuery (§41.3) is PUBLIC -- fetched regardless of
+  // meQuery's own state, since the one place its answer matters is the
+  // signed-out rendering branch below, which by definition runs before
+  // any session exists. A failure here degrades to the SAME "disabled,
+  // configuration-gated" rendering the button always had before this
+  // Step -- never a loading spinner or an error blocking the rest of the
+  // sign-in view, since GitHub sign-in must keep working even if this
+  // one small probe is unreachable.
+  const authCapabilitiesQuery = useQuery(authCapabilitiesQueryOptions)
+  const oidcConfigured = authCapabilitiesQuery.data?.oidcConfigured ?? false
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [logoutError, setLogoutError] = useState(false)
@@ -170,22 +180,30 @@ function SignInView() {
             </a>
             <div className="ordiv">or</div>
             {/* SSO (OIDC) is rendered per §12.2 item 7 / §12.1's "auth
-                pluggable" for visual parity with the mockup, but stays
-                disabled: internal/adapters/inbound/auth's own doc.go
-                names generic OIDC/SSO explicitly as "configuration, not
-                code... not this package's job to build a pluggable second
-                provider" -- no backend route or config surface for it
-                exists yet. A disabled, honestly-captioned button is the
-                correct rendering of "unconfigured" (matches this codebase's
-                own "no X affordance at all when the capability is
-                unconfigured" convention elsewhere, e.g. the §27.3
-                signing-key-rotation UI) -- not a live link to a route that
-                would 404, and not silently omitting the affordance the
-                visual spec calls for. */}
-            <button type="button" className="ssobtn" disabled title="Not configured for this deployment">
-              Continue with SSO (OIDC)
-            </button>
-            <p className="signin-notice-sub">SSO becomes available once your organization configures it.</p>
+                pluggable" for visual parity with the mockup -- §41.3 made
+                it real: oidcConfigured (above) is GET /auth/capabilities'
+                own live answer, PUBLIC and fetched even while signed out,
+                for exactly this branch. Enabled and a real link to
+                /auth/oidc/login iff the backend reports it configured;
+                otherwise the SAME disabled, honestly-captioned button
+                this view has always rendered for "unconfigured" (matches
+                this codebase's own "no X affordance at all when the
+                capability is unconfigured" convention elsewhere, e.g. the
+                §27.3 signing-key-rotation UI) -- never a live link to a
+                route that would refuse, and never silently omitting the
+                affordance the visual spec calls for. */}
+            {oidcConfigured ? (
+              <a className="ssobtn" href={oidcLoginHref()}>
+                Continue with SSO (OIDC)
+              </a>
+            ) : (
+              <>
+                <button type="button" className="ssobtn" disabled title="Not configured for this deployment">
+                  Continue with SSO (OIDC)
+                </button>
+                <p className="signin-notice-sub">SSO becomes available once your organization configures it.</p>
+              </>
+            )}
 
             <div className="linknote">
               <span className="lt">Identities link themselves</span>
