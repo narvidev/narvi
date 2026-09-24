@@ -233,14 +233,14 @@ func mutateSchemaTree(rng *rand.Rand, headRoot map[string]any) {
 	}
 
 	total := 3 + len(targetedMutationKinds)
-	switch choice := rng.Intn(total); {
-	case choice == 0:
+	switch choice := rng.Intn(total); choice {
+	case 0:
 		genericAddOrChange()
-	case choice == 1:
+	case 1:
 		if !genericRemoveExisting() {
 			genericAddOrChange()
 		}
-	case choice == 2:
+	case 2:
 		if !genericChangeExisting() {
 			genericAddOrChange()
 		}
