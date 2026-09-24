@@ -110,6 +110,40 @@ If either of those stops being true for a given generated decoder, this
 whole policy's severity table stops being accurate for that surface —
 that would be its own separate incident, not a `/contracts` change.
 
+## Permitted `oneOf`/`anyOf` shapes
+
+`tools/contractscompat` does not attempt to grade an arbitrary `oneOf`/
+`anyOf` shape. Three straight adversarial review rounds found a bypass in
+that approach (a general shape the checker MODELED turned out to admit a
+change nothing actually reviewed) — the checker instead whitelists
+EXACTLY the two shapes the five files under `/contracts` actually use
+today (verified by hand and by script against every `oneOf`/`anyOf` in
+every file). A union that matches neither shape, on either side of the
+diff, is FAIL-CLOSED, naming the pointer — there is no third, general
+case.
+
+- **Shape A** (`sandbox-ws/v1/commands.schema.json` and
+  `events.schema.json`, each a root `oneOf`): every member is a `$ref` to
+  a def whose own `type` is EXACTLY the bare string `"object"` — never an
+  array that merely includes `"object"`, never absent — carrying its own
+  `properties.type.const` discriminator, with every member's
+  discriminator value distinct from every other member's.
+- **Shape B** (`rest/v1/dtos.schema.json`'s `ReviewReadout.latestVerdict`
+  `anyOf`): exactly one `$ref` to a pure object def (discriminator
+  optional — there is nothing to discriminate between when there is only
+  one non-null shape), plus an optional bare `{"type":"null"}` literal,
+  written INLINE (never itself behind a `$ref`).
+
+An inline discriminated member (the exact object shape rows 28/29/46 are
+for, just spelled without a `$ref`), a `$ref` to a mixed- or absent-
+`"type"` def, a scalar `$ref`/alias chain, or a second non-null object
+member beyond shape B's own single slot all fail closed — none of them
+is a shape any real file uses, so none of them is graded at all. Within
+shape A, an added member's discriminator value must also be distinct
+from every value BASE ever assigned (row 46) — pairing by `$ref` name
+alone cannot catch a variant renamed while keeping (or colliding with)
+another member's wire discriminator.
+
 ## The rule table
 
 This is the authoritative version — `tools/contractscompat/compat`'s own
@@ -130,10 +164,10 @@ compatible only if compatible under **both** columns.
 | 4 | Property moved into required | MINOR | MAJOR |
 | 5 | Property removed from required | MAJOR | MINOR |
 | 6 | `type` changed outright, or the `type` keyword itself added/removed | MAJOR | MAJOR |
-| 7 | `type` widened (union gains a non-null member, including a bare `{"type":X}` anyOf/oneOf member, X != null, added to an already-existing union -- D9: a consumer cannot "ignore" an unrecognized scalar the way it skips an unrecognized discriminated variant, so this is a type change, not row 28) | MAJOR | MINOR |
-| 8 | `type` narrowed (union loses a non-null member, keyword stays present both sides; same D9 scope for a bare `{"type":X}` member removed) | MINOR | MAJOR |
-| 9 | `null` added to `type` (including a `{"type":"null"}` anyOf/oneOf member added to an already-existing union) | MAJOR | MINOR |
-| 10 | `null` removed from `type` (including a `{"type":"null"}` member removed) | MINOR | MAJOR |
+| 7 | `type` widened (union gains a non-null member) | MAJOR | MINOR |
+| 8 | `type` narrowed (union loses a non-null member, keyword stays present both sides) | MINOR | MAJOR |
+| 9 | `null` added to `type`, including shape B's own bare `{"type":"null"}` `anyOf` member added ("Permitted `oneOf`/`anyOf` shapes" above) | MAJOR | MINOR |
+| 10 | `null` removed from `type`, including shape B's own bare `{"type":"null"}` member removed | MINOR | MAJOR |
 | 11 | enum value added | MAJOR, unless the enum is listed in the MERGE-BASE manifest's `openEnums` (then MINOR) | MINOR |
 | 12 | enum value removed | MINOR | MAJOR |
 | 13 | `enum` keyword added / removed | added MINOR / removed MAJOR | added MAJOR / removed MINOR |
@@ -150,10 +184,10 @@ compatible only if compatible under **both** columns.
 | 24 | `additionalProperties` `true`→`false` or schema→`false` | MAJOR | MAJOR |
 | 25 | `additionalProperties` `true`→schema | MAJOR | MAJOR |
 | 26 | `additionalProperties` schema on both sides, content differs | recurse, same direction | recurse, same direction |
-| 27 | `$ref` retargeted (siblings on the referencing node are diffed too, as part of the same comparison) | compare dereferenced+merged schemas under rows 1-26/42; MAJOR if the old target def no longer exists (row 31) | same |
-| 28 | `oneOf`/`anyOf` DISCRIMINATED variant added (a member that is a `$ref` to an object def, or an object with `properties.type.const` -- keyword already present both sides; a bare `{"type":X}` member, X != null, is rows 7/8 instead, not this row) | MINOR | MINOR |
+| 27 | `$ref` retargeted (siblings on the referencing node are diffed too, as part of the same comparison; also covers shape B's own single object slot retargeted to a different `$ref`) | compare dereferenced+merged schemas under rows 1-26/42; MAJOR if the old target def no longer exists (row 31) | same |
+| 28 | `oneOf`/`anyOf` DISCRIMINATED variant added (shape A: a member that is a `$ref` to a pure object def carrying its own `properties.type.const`, distinct from every other member's -- keyword already present both sides; a variant whose discriminator value reuses one BASE already assigned is row 46 instead, not this row) | MINOR | MINOR |
 | 29 | `oneOf`/`anyOf` DISCRIMINATED variant removed (same scope as row 28) | MAJOR | MAJOR |
-| 30 | `oneOf`/`anyOf` variant changed (paired by `$ref` target name, else by `properties.type.const`, else by a bare `{"type":X}` member's own type name, else FAIL-CLOSED) | recurse | recurse |
+| 30 | `oneOf`/`anyOf` variant changed (paired by the `$ref` target's own NAME under shape A, or shape B's single object slot when its `$ref` name is unchanged; anything not matching a permitted shape at all is FAIL-CLOSED, never paired) | recurse | recurse |
 | 31 | `$defs` entry removed or renamed | MAJOR | MAJOR |
 | 32 | `$defs` entry added | MINOR | MINOR |
 | 33 | `default` added/changed/removed | MAJOR | MAJOR |
@@ -169,11 +203,14 @@ compatible only if compatible under **both** columns.
 | 43 | `oneOf`/`anyOf` keyword itself added or removed (not a member of an already-existing union — that's rows 28/29) | MAJOR | MAJOR |
 | 44 | a surface's `direction` changed between the base and head `manifest.json` | MAJOR | MAJOR |
 | 45 | `goJSONSchema` changed | MAJOR | MAJOR |
+| 46 | `oneOf`/`anyOf` shape-A variant added whose `properties.type.const` discriminator value was already assigned to a DIFFERENT member in BASE (round 5, G2) — an in-flight consumer dispatches on the wire value, not the `$ref`'s own `$defs` name, so this is unsafe even when the member that used to own the value was removed in the same diff | MAJOR | MAJOR |
 
 Also FAIL-CLOSED, outside the numbered table: any keyword not in the
 closed allowlist below; a `title` on a non-root sub-schema; a non-local
 `$ref`; a `type` array that isn't a known JSON Schema type vocabulary, or
-that has a duplicate; an unpairable `oneOf`/`anyOf` member; a `required`
+that has a duplicate; an unpairable `oneOf`/`anyOf` member (including any
+union that does not match one of the two permitted shapes above, on
+either side of the diff — "Permitted `oneOf`/`anyOf` shapes"); a `required`
 name with no matching `properties` entry on that same side (rows 3/4
 still apply normally to a required name that DOES have a matching
 property, even one only declared via an unchanged `$ref` target); and any
@@ -319,7 +356,7 @@ file is itself a wire-compatibility break.
 
 ## Extending the checker
 
-A change the closed keyword allowlist or the 45-row rule table doesn't
+A change the closed keyword allowlist or the 46-row rule table doesn't
 name makes `tools/contractscompat` fail closed with a message naming the
 JSON Pointer and asking for a separate PR first. That PR should extend
 `tools/contractscompat/compat`'s allowlist/rule table AND its own corpus

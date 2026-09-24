@@ -624,6 +624,28 @@ var corpus = []corpusCase{
 		fixed: &wantFinding{"28", SeverityMinor},
 	},
 	{
+		// Round 5 (G2): an added shape-A variant (a NEW $ref name, "B")
+		// whose discriminator value ("a") was already assigned to a
+		// DIFFERENT member in base ("A", which is REMOVED in this same
+		// diff) is row 46 MAJOR, not row 28 MINOR -- an in-flight
+		// consumer still dispatches on the wire value "a", not on which
+		// $defs name produced it, so it would decode this payload as the
+		// OLD "A" shape and reject it the moment the two shapes diverge
+		// (here, "B" additionally requires "extra").
+		name:    "row46 discriminated union member added reusing a base discriminator value (G2)",
+		ruleID:  "46",
+		defName: "Envelope",
+		baseDefs: map[string]any{
+			"Envelope": schemaObj("oneOf", []any{schemaObj("$ref", "#/$defs/A")}),
+			"A":        schemaObj("type", "object", "properties", schemaObj("type", schemaObj("const", "a")), "required", []any{"type"}),
+		},
+		headDefs: map[string]any{
+			"Envelope": schemaObj("oneOf", []any{schemaObj("$ref", "#/$defs/B")}),
+			"B":        schemaObj("type", "object", "properties", schemaObj("type", schemaObj("const", "a")), "required", []any{"type", "extra"}),
+		},
+		fixed: &wantFinding{"46", SeverityMajor},
+	},
+	{
 		name:     "row33 default changed",
 		ruleID:   "33",
 		defName:  "Value",

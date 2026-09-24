@@ -104,6 +104,7 @@ var ruleTable = map[string]ruleExpectation{
 	"43": {kind: kindFixed, fixedSeverity: SeverityMajor},                // C15
 	"44": {kind: kindFixed, fixedSeverity: SeverityMajor},                // C1
 	"45": {kind: kindFixed, fixedSeverity: SeverityMajor},                // C19
+	"46": {kind: kindFixed, fixedSeverity: SeverityMajor},                // G2 (round 5)
 }
 
 // TestCorpusCoverage is guard 7's meta-test: every rule id in the closed
