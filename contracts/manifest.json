@@ -1,5 +1,5 @@
 {
-  "version": "1.0.0",
+  "version": "1.1.0",
   "surfaces": [
     {
       "path": "rest/v1/dtos.schema.json",
@@ -39,6 +39,8 @@
     "rest/v1/dtos.schema.json#/$defs/WorkflowRun/properties/status",
     "rest/v1/dtos.schema.json#/$defs/WorkflowStepRun/properties/status",
     "rest/v1/dtos.schema.json#/$defs/WorkflowStepDecideResponse/properties/runStatus",
-    "rest/v1/dtos.schema.json#/$defs/WorkflowStepDecideResponse/properties/stepRunStatus"
+    "rest/v1/dtos.schema.json#/$defs/WorkflowStepDecideResponse/properties/stepRunStatus",
+    "rest/v1/dtos.schema.json#/$defs/Identity/properties/provider",
+    "rest/v1/dtos.schema.json#/$defs/PendingLinkPrompt/properties/provider"
   ]
 }
