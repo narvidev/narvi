@@ -4,7 +4,7 @@
 // is refused" -- §13.1's own requirement on redirect handling.
 import { describe, expect, it } from 'vitest'
 
-import { githubLoginHref, safeContinueTarget } from '../loginLinks'
+import { githubLoginHref, oidcLoginHref, safeContinueTarget } from '../loginLinks'
 
 describe('githubLoginHref', () => {
   it('appends next when it is a known, safe route', () => {
@@ -25,6 +25,12 @@ describe('githubLoginHref', () => {
 
   it('omits next when it names no known route (allowlist rejection, not just malformed input)', () => {
     expect(githubLoginHref('/not-a-real-route')).toBe('/auth/github/login')
+  })
+})
+
+describe('oidcLoginHref', () => {
+  it('returns the fixed OIDC login route, no query string', () => {
+    expect(oidcLoginHref()).toBe('/auth/oidc/login')
   })
 })
 

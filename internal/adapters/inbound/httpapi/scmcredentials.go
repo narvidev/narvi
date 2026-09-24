@@ -306,19 +306,41 @@ type ReadOnlyMinter interface {
 //     matching how sessions.Get/sandboxes.Get above already treat a real
 //     DB failure (only the row's clean absence is folded into this 403
 //     class, not any other lookup failure).
-//  10. OR (regardless of step 9 passing): that user has no linked
-//     identities row for provider=github, OR that identity's
-//     access_token_encrypted is NULL, OR platform.DecryptToken fails on
-//     it -> 403. These, plus step 6's host-scoping failure, step 8's
-//     no-creator failure, and step 9's disabled/demoted failure above, are
-//     deliberately grouped as ONE outcome class ("no usable OAuth
-//     credential is available for this session/host") -- the honest "no
-//     bot/service-account fallback exists" gap named in this Step's own
-//     brief, not a bug to work around by inventing a fake bot credential
-//     (§8.11's own fallback half is explicitly out of scope). 403 (not
-//     500): this is an authorization-shaped absence from the caller's
-//     perspective, not a server malfunction, and mirrors auth.Middleware's
-//     own generic-rejection-body discipline (never distinguishing WHICH
+//  10. OR (regardless of step 9 passing): that user has NO linked
+//     identities row for provider=github at all -> 403, the SAME generic
+//     body as every other sub-case in this class -- the ordinary case
+//     for a creator who signed in ONLY through OIDC (§41.3) and has
+//     never linked GitHub. Review round 1 (finding O5) added a botToken
+//     fallback here (mirroring step 7's review-session branch); review
+//     round 2 (finding P1, HIGH) reverted it: unlike a review session (no
+//     human creator, read-only clone), a live session's creator picks
+//     the branch a push targets (reposource.ValidateBranch accepts
+//     "main"), so that fallback handed exactly the principal with the
+//     LEAST GitHub authority -- an OIDC-only creator -- the bot's full,
+//     unaudited write authority on a branch of their own choosing. There
+//     is no bot/service-account fallback for this case (§8.11's own
+//     honest gap, restored): such a creator cannot push until they link
+//     a GitHub identity via the ordinary GitHub sign-in.
+//     completeProcessingTurn (internal/app/sessionactor/pushpr.go)
+//     detects this SAME condition before ever asking the sandbox to
+//     push, and records a session-visible warning naming it honestly --
+//     see that package's pushBlockedByMissingGitHubIdentity. OR that
+//     identity's access_token_encrypted is NULL, OR platform.DecryptToken
+//     fails on it -> 403, exactly the same as the no-identity-at-all
+//     case above (never a bot fallback either) -- a creator who DOES
+//     have a github identity, but whose stored token is merely unusable,
+//     must not be silently re-attributed to the bot (that would
+//     misrepresent a token problem as "no linked account" to whoever
+//     reviews the resulting push/PR); see createPRBestEffort's own
+//     identical, deliberate distinction (creatorHasNoGitHubIdentity).
+//     These two decrypt-failure sub-cases, plus step 6's host-scoping
+//     failure, step 8's no-creator failure, and step 9's
+//     disabled/demoted failure above, are deliberately
+//     grouped as ONE outcome class ("no usable OAuth credential is
+//     available for this session/host"). 403 (not 500): this is an
+//     authorization-shaped absence from the caller's perspective, not a
+//     server malfunction, and mirrors auth.Middleware's own
+//     generic-rejection-body discipline (never distinguishing WHICH
 //     sub-case applied, in the response body -- an enumeration-hardening
 //     precedent this package already established at §13.1). §5.3's
 //     gen-mismatch reuses the SAME 403 status code but is logged
@@ -633,9 +655,42 @@ func ScmCredentials(
 		if err != nil {
 			if !errors.Is(err, pgx.ErrNoRows) {
 				logger.Error("httpapi: scm-credentials: get identity failed", "error", err)
-			} else {
-				logger.Warn("httpapi: scm-credentials: user has no github identity")
+				writeError(w, http.StatusForbidden, "no usable git credential for this session")
+				return
 			}
+			// No github identity AT ALL -- the ordinary case for a
+			// creator who signed in ONLY through OIDC (§41.3) and has
+			// never linked a GitHub identity. review round 1 (finding
+			// O5) added a bot-token fallback here; review round 2
+			// (finding P1, HIGH) reverted it: this endpoint mints a
+			// SANDBOX credential for a LIVE session whose creator picks
+			// the target branch (reposource.ValidateBranch accepts
+			// "main"), so falling back to the deployment's single
+			// static write credential handed this exact creator the
+			// bot's full write authority on a branch of their own
+			// choosing, unaudited -- a privilege escalation, not a
+			// convenience. The review-session branch above (step 7) is
+			// NOT this case: that session has no human creator making a
+			// push/branch choice at all, it only clones read-only, and
+			// it mints the bot token for THAT reason -- see this file's
+			// own top comment. There is no bot/service-account fallback
+			// for a live, non-review session's creator (§8.11's own
+			// honest gap, restored): such a creator cannot push until
+			// they link a GitHub identity via the ordinary GitHub
+			// sign-in. completeProcessingTurn (pushpr.go) detects this
+			// SAME condition before ever asking the sandbox to push, and
+			// records a session-visible warning naming it honestly --
+			// see pushBlockedByMissingGitHubIdentity's own doc comment.
+			//
+			// A creator who DOES have a github identity, but whose
+			// stored token is merely unusable (nil, or fails to
+			// decrypt, below), is a DIFFERENT case and was NEVER given
+			// any fallback -- see createPRBestEffort's own identical,
+			// deliberate distinction (creatorHasNoGitHubIdentity) for
+			// why: re-attributing a push to the bot here would
+			// misrepresent an existing account's broken credential as
+			// "no linked account" to whoever reviews the resulting PR.
+			logger.Warn("httpapi: scm-credentials: user has no github identity; no bot/service-account fallback exists for a live, non-review session (§8.11, review round 2 finding P1)")
 			writeError(w, http.StatusForbidden, "no usable git credential for this session")
 			return
 		}

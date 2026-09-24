@@ -1,0 +1,15 @@
+-- Step 164 (§41.3, "OIDC as a second sign-in provider"): identity_provider
+-- gains 'oidc' -- a generic OIDC identity's external_id is
+-- "{issuer}|{sub}" (issuer-qualified, since two IdPs can issue the same
+-- sub), never bare "sub" alone, matching migrations/000003_identities.up.sql's
+-- own UNIQUE (provider, external_id) constraint's expectations exactly
+-- (two different issuers minting the same sub value must never collide).
+--
+-- This is its OWN migration, deliberately -- Postgres forbids using a
+-- value added via ALTER TYPE ... ADD VALUE inside the SAME transaction/
+-- statement batch that added it (migrations/000042_image_builds_permanent_failure.up.sql's
+-- own doc comment; migrations/000061_provider_credentials_user_scope.up.sql
+-- is the identical precedent for THIS exact enum-widening shape). No other
+-- statement in this file, or any later migration landing in the same PR,
+-- ever references the literal 'oidc' value.
+ALTER TYPE identity_provider ADD VALUE 'oidc';

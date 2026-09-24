@@ -23,10 +23,19 @@ import '../../styles/identity.css'
 
 export interface IdentityStatusPanelProps {
   member: Member
+  /**
+   * oidcConfigured (review round 1, finding O12) is the SAME
+   * GET /auth/capabilities signal the sign-in view's own SSO button
+   * already gates on -- passed down explicitly rather than re-fetched
+   * here, so this component stays a plain, render-independent function of
+   * its own props (deriveIdentityStatuses's own doc comment: no affordance
+   * for a capability this deployment doesn't offer).
+   */
+  oidcConfigured: boolean
 }
 
-export function IdentityStatusPanel({ member }: IdentityStatusPanelProps) {
-  const statuses = deriveIdentityStatuses(member.identities)
+export function IdentityStatusPanel({ member, oidcConfigured }: IdentityStatusPanelProps) {
+  const statuses = deriveIdentityStatuses(member.identities, oidcConfigured)
 
   return (
     <div className="linknote">

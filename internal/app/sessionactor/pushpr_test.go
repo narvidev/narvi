@@ -190,6 +190,23 @@ func TestLogProviderFailureDiagnostic(t *testing.T) {
 	}
 }
 
+// TestPrBody proves prBody's own plain, honest PR description -- this Step
+// invents no richer changelog/summary mechanism than "which branch, which
+// commit". Review round 3 (finding Q2) removed the usedBotFallback
+// parameter this test used to cover two shapes for: the bot-identity
+// fallback it described had already gone unreachable in production
+// (createPRBestEffort's own push-blocked gate, 0a49b49, never lets a
+// push_complete arrive for the creator shape that fallback existed for),
+// so prBody now has exactly one shape.
+func TestPrBody(t *testing.T) {
+	pushed := sandboxws.PushCompleteReposElem{Branch: "feature-x", Sha: "abc123"}
+	got := prBody(pushed)
+	want := `Automated changes from a Narvi session (branch "feature-x", commit abc123).`
+	if got != want {
+		t.Errorf("prBody(_) = %q, want %q", got, want)
+	}
+}
+
 // parseOwnerRepo's own table-driven test used to live here -- audit-
 // remediation batch B3 moved both this file's own parseOwnerRepo AND
 // internal/app/imagebuild/builder.go's byte-for-byte fork of it into

@@ -71,6 +71,27 @@ var deploySecretExtraVars = []string{
 	"NARVI_OBJECT_STORE_SECRET_ACCESS_KEY",
 	"NARVI_OBJECT_STORE_PUBLIC_ENDPOINT",
 	"NARVI_OBJECT_STORE_USE_PATH_STYLE",
+	// OIDC sign-in (§41.3): NARVI_OIDC_ISSUER/CLIENT_ID/
+	// CLIENT_SECRET are all-or-none (InvalidOIDCConfigError, gated on all
+	// three variables' joint state, and -- like
+	// InvalidObjectStoreCredentialsError immediately above -- itself
+	// carries no EnvVar field). Verified NOT discoverable by either probe:
+	// the single-variable presence probe DOES trip InvalidOIDCConfigError
+	// when probing any one of the three alone (unlike the allowlist
+	// group's own "all three empty" trigger, which no single-variable
+	// probe can ever produce), but envVarNamesOf's own pass-2 "lax=false"
+	// tier additionally requires the error text to contain "required" or
+	// "missing" before it will extract ANY bare NARVI_ token from an
+	// EnvVar-less error's message -- and this error's own wording
+	// ("must be set together or all left empty... almost certainly a
+	// misconfiguration") contains neither word, exactly like
+	// InvalidObjectStoreCredentialsError's identical wording immediately
+	// above. All three are added back by hand so the template stays
+	// usable against a real OIDC provider, not just whatever the probes
+	// happen to trigger with everything else left empty.
+	"NARVI_OIDC_ISSUER",
+	"NARVI_OIDC_CLIENT_ID",
+	"NARVI_OIDC_CLIENT_SECRET",
 }
 
 // probeValuesByVar supplies a syntactically-valid placeholder for the

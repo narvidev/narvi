@@ -174,25 +174,39 @@ func Resolve(ctx context.Context, deps Deps, provider sqlcgen.IdentityProvider, 
 		return Resolution{}, nil
 	}
 
-	matchedUserIDs, err := matchUserIDs(ctx, deps, email)
+	matchedUserIDs, err := MatchUserIDs(ctx, deps, email)
 	if err != nil {
 		return Resolution{}, fmt.Errorf("identitylink: match user ids: %w", err)
 	}
 
 	if userIDStr, ok := domainidentitylink.Decide(matchedUserIDs); ok {
-		return autoLink(ctx, deps, provider, externalID, email, userIDStr)
+		// nil: Resolve's own Slack/Linear callers never have a provider
+		// access token to store on the auto-linked identity row -- see
+		// AutoLink's own accessTokenEncrypted parameter doc comment for
+		// the ONE caller that does (internal/adapters/inbound/auth's own
+		// GitHub-side first-time merge).
+		return AutoLink(ctx, deps, provider, externalID, email, userIDStr, nil)
 	}
 
 	return createOrReuseLinkPrompt(ctx, deps, provider, externalID)
 }
 
-// matchUserIDs runs §13.2 step 2's own two lookups (users.primary_email,
+// MatchUserIDs runs §13.2 step 2's own two lookups (users.primary_email,
 // verified identities.email) and returns the DEDUPLICATED union of user
 // ids either matched -- the same user matching both ways at once (e.g.
 // their GitHub-derived primary_email happens to equal their own Slack
 // profile email, which is ALSO independently verified on some other
 // identity) must still count as exactly one match, never two.
-func matchUserIDs(ctx context.Context, deps Deps, email string) ([]string, error) {
+//
+// Exported (capital M) so internal/adapters/inbound/auth's own OIDC
+// callback (§41.3) can run the EXACT SAME email-based graph
+// merge Resolve's own zero-match branch below does for Slack/Linear,
+// rather than a second, drifting copy of these two lookups -- that
+// caller's own "zero matches" case differs from Resolve's (a brand new
+// sign-in creates a user instead of minting a link prompt), so it cannot
+// just call Resolve itself, but the MATCHING half is identical either
+// way.
+func MatchUserIDs(ctx context.Context, deps Deps, email string) ([]string, error) {
 	seen := make(map[string]struct{}, 2)
 	var out []string
 	add := func(id pgtype.UUID) {
@@ -225,11 +239,21 @@ func matchUserIDs(ctx context.Context, deps Deps, email string) ([]string, error
 	return out, nil
 }
 
-// autoLink inserts the identities row (linked_via=auto_email) and its
+// AutoLink inserts the identities row (linked_via=auto_email) and its
 // audit-log entry in ONE transaction (§13.3: "written in the same
 // transaction as the change"), then deletes any still-pending link
 // prompt for this same identity -- a resolved auto-link supersedes an
 // earlier "we couldn't tell yet" prompt.
+//
+// Exported (capital A) for the SAME reason MatchUserIDs above is:
+// internal/adapters/inbound/auth's own resolveFirstTimeIdentity (shared,
+// verbatim, by BOTH the GitHub and OIDC callbacks, §41.3/review round 1
+// findings O1/O2/O9) calls this EXACT function -- never a second copy --
+// once its own caller-supplied email/provider/externalID resolve to
+// exactly one existing user via MatchUserIDs+domain/identitylink.Decide,
+// so a second sign-in through a DIFFERENT provider that happens to share
+// a verified email merges onto the same user row exactly like an
+// unrecognized Slack/Linear identity already does (§13.2 step 3).
 //
 // email_verified=true: unlike GitHub's /user/emails (githubUser's own doc
 // comment, internal/adapters/inbound/auth/callback.go), Slack/Linear's own
@@ -240,7 +264,25 @@ func matchUserIDs(ctx context.Context, deps Deps, email string) ([]string, error
 // value fetched this way as verified for identities.email_verified's own
 // purpose ("attested by the provider", not "independently re-verified by
 // this codebase") -- the SAME standard GetByProviderAndExternalID's own
-// GitHub-originated rows already apply.
+// GitHub-originated rows already apply. The OIDC caller's own email is
+// ALREADY independently verified (the ID token's own email_verified
+// claim, checked before this is ever called) -- so this parameter is
+// correct for that caller too, not merely reused loosely.
+//
+// accessTokenEncrypted is nil for every caller except the GitHub-side
+// first-time merge (resolveFirstTimeIdentity's own encryptedToken
+// parameter): Resolve's own Slack/Linear callers above, and the OIDC
+// callback (§41.3: "this package never stores an OIDC provider token"),
+// never have one to store. A first-time GitHub sign-in whose verified
+// email merges onto an EXISTING user (rather than creating a new one)
+// must still store the just-obtained GitHub OAuth token on the newly
+// auto-linked identity row -- omitting it here would silently leave that
+// merged user with a GitHub identity but no usable git credential,
+// defeating §41.3's own "the graph merges... exactly as §13.2 step 3"
+// promise (a merge that can't actually push or open a PR is not a
+// working merge) -- this was review round 1's own O1/O2/O9 follow-on
+// finding, caught by this package's own cross-provider integration test
+// asserting the decrypted token on the merged identity row.
 //
 // actor_user_id is NULL on the audit-log row: this is a SYSTEM-driven
 // match (an automated algorithm resolved it), not a human clicking
@@ -249,7 +291,7 @@ func matchUserIDs(ctx context.Context, deps Deps, email string) ([]string, error
 // fabricated "system user" row; the matched user's own id is still
 // recorded, in detail_json, for a reader of the audit log to see exactly
 // who was linked.
-func autoLink(ctx context.Context, deps Deps, provider sqlcgen.IdentityProvider, externalID, email, matchedUserIDStr string) (Resolution, error) {
+func AutoLink(ctx context.Context, deps Deps, provider sqlcgen.IdentityProvider, externalID, email, matchedUserIDStr string, accessTokenEncrypted []byte) (Resolution, error) {
 	var matchedUserID pgtype.UUID
 	if err := matchedUserID.Scan(matchedUserIDStr); err != nil {
 		return Resolution{}, fmt.Errorf("identitylink: parse matched user id: %w", err)
@@ -262,12 +304,13 @@ func autoLink(ctx context.Context, deps Deps, provider sqlcgen.IdentityProvider,
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	created, err := deps.Identities.WithTx(tx).Create(ctx, sqlcgen.CreateIdentityParams{
-		UserID:        matchedUserID,
-		Provider:      provider,
-		ExternalID:    externalID,
-		Email:         &email,
-		EmailVerified: true,
-		LinkedVia:     sqlcgen.IdentityLinkedViaAutoEmail,
+		UserID:               matchedUserID,
+		Provider:             provider,
+		ExternalID:           externalID,
+		Email:                &email,
+		EmailVerified:        true,
+		LinkedVia:            sqlcgen.IdentityLinkedViaAutoEmail,
+		AccessTokenEncrypted: accessTokenEncrypted,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

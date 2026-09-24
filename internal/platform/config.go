@@ -225,6 +225,122 @@ const (
 	publicBaseURLEnvVarName      = "NARVI_PUBLIC_BASE_URL"
 )
 
+// oidcIssuerEnvVarName, oidcClientIDEnvVarName, and
+// oidcClientSecretEnvVarName configure §41.3's ("OIDC as a second sign-in
+// provider") generic OIDC SSO wiring, read from
+// NARVI_OIDC_ISSUER / NARVI_OIDC_CLIENT_ID / NARVI_OIDC_CLIENT_SECRET.
+//
+// DELIBERATELY all-or-none, and off by default -- unlike
+// GitHubClientID/GitHubClientSecret immediately above (required in every
+// stage, no off switch: GitHub is the primary, always-on login), every
+// one of these three empty together simply means "this deployment has no
+// second sign-in provider configured" -- Config.OIDCConfigured is then
+// false, the two /auth/oidc/... routes are never mounted at all
+// (controlplane/serve.go), and the sign-in view's own SSO button stays
+// exactly as disabled as it was before this Step (§41.3: "unset leaves
+// the SSO button exactly as disabled as today"). Exactly one or two of
+// the three being set is rejected (InvalidOIDCConfigError below) --
+// almost certainly a copy-paste/typo mistake, mirroring
+// InvalidObjectStoreCredentialsError's own identical "matched pair, never
+// half-set" reasoning one field wider.
+const (
+	oidcIssuerEnvVarName       = "NARVI_OIDC_ISSUER"
+	oidcClientIDEnvVarName     = "NARVI_OIDC_CLIENT_ID"
+	oidcClientSecretEnvVarName = "NARVI_OIDC_CLIENT_SECRET"
+)
+
+// InvalidOIDCConfigError is returned by Load when exactly one or two of
+// NARVI_OIDC_ISSUER/NARVI_OIDC_CLIENT_ID/NARVI_OIDC_CLIENT_SECRET are set.
+// Carries no EnvVar field, by design -- mirrors
+// InvalidObjectStoreCredentialsError's own identical shape: naming a
+// single culprit would be misleading here, since the "mistake" is never
+// any one variable's own value, only the joint state of all three.
+type InvalidOIDCConfigError struct{}
+
+func (e *InvalidOIDCConfigError) Error() string {
+	return fmt.Sprintf(
+		"%s, %s, and %s must be set together or all left empty (all empty disables the OIDC sign-in provider entirely, §41.3) -- setting only some of them is almost certainly a misconfiguration",
+		oidcIssuerEnvVarName, oidcClientIDEnvVarName, oidcClientSecretEnvVarName,
+	)
+}
+
+// InvalidOIDCIssuerURLError is returned by Load when NARVI_OIDC_ISSUER is
+// set (alongside both other OIDC vars) but is not a well-formed absolute
+// URL naming a host, with no userinfo/query/fragment, and (outside
+// StageDevelopment) an https scheme -- §41.3: "issuer must be an absolute
+// https URL except in the development stage" (a plain http issuer is
+// tolerated only in development, the same "relax over plain http locally,
+// never elsewhere" exception gitHubAPIBaseURLEnvVarName's own doc comment
+// draws, here applied to the ISSUER go-oidc dials rather than the GitHub
+// App API base).
+type InvalidOIDCIssuerURLError struct {
+	Value  string
+	Reason string
+}
+
+func (e *InvalidOIDCIssuerURLError) Error() string {
+	return fmt.Sprintf("invalid %s=%q: %s", oidcIssuerEnvVarName, e.Value, e.Reason)
+}
+
+// canonicalOIDCIssuerURL enforces the URL shape Config.OIDCIssuer needs to
+// be safely usable as the issuer go-oidc.NewProvider dials for discovery
+// (GET {issuer}/.well-known/openid-configuration) -- a well-formed
+// absolute URL, non-empty host, no userinfo/query/fragment, scheme https
+// unless stage is StageDevelopment (which additionally tolerates plain
+// http, exactly like a local IdP stand-in reached over
+// host.docker.internal with no TLS terminator in front of it). Unlike
+// canonicalCloudIdentityIssuerURL's own neighboring "must not carry a
+// path" rule, a real-world IdP issuer legitimately CAN carry a path
+// segment (e.g. a multi-realm IdP mounting each realm's own issuer under
+// a distinct path).
+//
+// Despite this function's own name, the returned value is NEVER
+// trailing-slash-trimmed (a prior version of this function did, on the
+// mistaken belief that go-oidc.NewProvider "trims a trailing slash"
+// itself -- it does, but ONLY to build the .well-known request URL; it
+// then requires the discovery document's own `issuer` field to equal the
+// configured issuer STRING EXACTLY (oidc.go's own IssuerMismatchError),
+// and the ID token's `iss` claim is checked the same way. Plenty of real
+// IdPs publish an issuer ending in "/" -- Auth0 is the standard example,
+// "https://TENANT.auth0.com/" -- and for those, trimming here made every
+// value this function could ever return provably wrong: the operator's
+// only option that could ever match discovery was the exact string this
+// function refused to keep. §41.3 requires only that the configured
+// value be a well-formed https (or, in development, http) URL naming a
+// host with no userinfo/query/fragment -- shape validation, not
+// canonicalization -- so parsed.String() (a faithful re-serialization of
+// what was parsed, trailing slash and all) is returned as-is.
+func canonicalOIDCIssuerURL(raw string, stage Stage) (string, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", &InvalidOIDCIssuerURLError{Value: raw, Reason: fmt.Sprintf("not a valid URL: %v", err)}
+	}
+	switch parsed.Scheme {
+	case "https":
+		// always fine.
+	case "http":
+		if stage != StageDevelopment {
+			return "", &InvalidOIDCIssuerURLError{Value: raw, Reason: "scheme must be https outside the development stage"}
+		}
+	default:
+		reason := "scheme must be https"
+		if stage == StageDevelopment {
+			reason += " (or http, in development only)"
+		}
+		return "", &InvalidOIDCIssuerURLError{Value: raw, Reason: reason}
+	}
+	if parsed.Hostname() == "" {
+		return "", &InvalidOIDCIssuerURLError{Value: raw, Reason: "must include a host (a port-only value names no host)"}
+	}
+	if parsed.User != nil {
+		return "", &InvalidOIDCIssuerURLError{Value: raw, Reason: "must not carry userinfo (a username or password in the URL)"}
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", &InvalidOIDCIssuerURLError{Value: raw, Reason: "must not carry a query string or fragment"}
+	}
+	return parsed.String(), nil
+}
+
 // ingressEnabledEnvVarName is the process environment variable Load reads
 // for §12.5's own ingress-surface-optionality decision: an explicit,
 // comma-separated list of which of the three ingress surfaces (Slack,
@@ -1493,6 +1609,19 @@ type Config struct {
 	GitHubClientID     string
 	GitHubClientSecret string
 
+	// OIDCIssuer, OIDCClientID, and OIDCClientSecret configure §41.3's
+	// generic OIDC SSO provider, read from NARVI_OIDC_ISSUER /
+	// NARVI_OIDC_CLIENT_ID / NARVI_OIDC_CLIENT_SECRET. All three are
+	// empty together when this deployment has no second sign-in provider
+	// configured -- OIDCConfigured is false in that case, and no other
+	// field here is meaningful. See oidcIssuerEnvVarName's own doc
+	// comment for the all-or-none validation and canonicalOIDCIssuerURL
+	// for OIDCIssuer's own shape validation. OIDCClientSecret is never
+	// logged anywhere, exactly like GitHubClientSecret above.
+	OIDCIssuer       string
+	OIDCClientID     string
+	OIDCClientSecret string
+
 	// GitHubWebhookSecret and GitHubBotHandle configure §8.2's
 	// ("GitHub ingress", §8.2) webhook adapter, read from
 	// NARVI_GITHUB_WEBHOOK_SECRET / NARVI_GITHUB_BOT_HANDLE. Both required
@@ -2033,6 +2162,37 @@ func load(lookupEnv func(string) (string, bool)) (*Config, error) {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: publicBaseURLEnvVarName})
 	}
 
+	// oidcIssuer/oidcClientID/oidcClientSecret (§41.3):
+	// all-or-none -- see oidcIssuerEnvVarName's own doc comment. Only once
+	// all three are non-empty does oidcIssuer get real shape validation
+	// (canonicalOIDCIssuerURL); a raw, un-canonicalized value would
+	// otherwise reach Config.OIDCIssuer on the "none set" branch, which
+	// is harmless (nothing reads it when the other two are empty) but
+	// pointless to canonicalize.
+	oidcIssuerRaw := getenv(oidcIssuerEnvVarName)
+	oidcClientID := getenv(oidcClientIDEnvVarName)
+	oidcClientSecret := getenv(oidcClientSecretEnvVarName)
+	oidcSetCount := 0
+	for _, v := range []string{oidcIssuerRaw, oidcClientID, oidcClientSecret} {
+		if v != "" {
+			oidcSetCount++
+		}
+	}
+	var oidcIssuer string
+	switch oidcSetCount {
+	case 0:
+		// Off. oidcIssuer/oidcClientID/oidcClientSecret all stay "".
+	case 3:
+		canonicalIssuer, issuerErr := canonicalOIDCIssuerURL(oidcIssuerRaw, stage)
+		if issuerErr != nil {
+			errs = append(errs, issuerErr)
+		} else {
+			oidcIssuer = canonicalIssuer
+		}
+	default:
+		errs = append(errs, &InvalidOIDCConfigError{})
+	}
+
 	// WebhookSecret/BotHandle/BotToken (below) are required ONLY when
 	// GitHub ingress is enabled (ingressEnabled[integrations.ProviderGitHub]
 	// -- ingressEnabledEnvVarName's own doc comment, §12.5). A deployment
@@ -2446,6 +2606,9 @@ func load(lookupEnv func(string) (string, bool)) (*Config, error) {
 		HMACWebhookSecret:          hmacWebhookSecret,
 		GitHubClientID:             gitHubClientID,
 		GitHubClientSecret:         gitHubClientSecret,
+		OIDCIssuer:                 oidcIssuer,
+		OIDCClientID:               oidcClientID,
+		OIDCClientSecret:           oidcClientSecret,
 		GitHubWebhookSecret:        gitHubWebhookSecret,
 		GitHubBotHandle:            gitHubBotHandle,
 		GitHubReReviewLabel:        gitHubReReviewLabel,

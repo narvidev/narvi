@@ -304,7 +304,7 @@ export interface Identity {
   /**
    * Matches Postgres identity_provider exactly.
    */
-  provider: 'github' | 'slack' | 'linear' | 'google';
+  provider: 'github' | 'slack' | 'linear' | 'google' | 'oidc';
   externalId: string;
   /**
    * Matches Postgres identity_linked_via exactly.
@@ -340,7 +340,7 @@ export interface PendingLinkPrompt {
   /**
    * Matches Postgres identity_provider exactly.
    */
-  provider: 'github' | 'slack' | 'linear' | 'google';
+  provider: 'github' | 'slack' | 'linear' | 'google' | 'oidc';
   externalId: string;
   expiresAt: string;
   createdAt: string;
@@ -408,7 +408,7 @@ export interface UpdateMemberRoleRequest {
  */
 export interface LinkMemberIdentityRequest {
   /**
-   * One of github/slack/linear/google at the application layer (matches Postgres identity_provider); not enforced here, see this shape's own description.
+   * One of github/slack/linear/google/oidc at the application layer (matches Postgres identity_provider); not enforced here, see this shape's own description.
    */
   provider: string;
   externalId: string;
@@ -3151,4 +3151,16 @@ export interface CapabilitiesResponse {
    * contracts.Version (contracts/VERSION, §6.3) at the moment this binary was built -- e.g. "1.0.0". Deliberately optional (never in required): an older control-plane binary built before this field existed simply omits it, and a consumer generated from this schema already has to tolerate an absent optional key, so adding it here is MINOR under tools/contractscompat's own rule table, not a breaking change to GET /api/capabilities.
    */
   contractsVersion?: string;
+}
+/**
+ * GET /auth/capabilities's own response body (technical plan §41.3, 'OIDC as a second sign-in provider') -- the ONE public, UNAUTHENTICATED signal the sign-in view needs before a visitor is signed in at all. Deliberately a SEPARATE shape from CapabilitiesResponse immediately above, not an added field on it: that response is a DIFFERENT read model entirely (§34's licensed-module capabilities), mounted behind auth.Middleware and therefore unusable by a signed-out visitor by construction -- conflating the two would either leak an unauthenticated route into an authenticated-only contract's own documented gating, or force every already-shipped CapabilitiesResponse consumer to handle a field it can never actually need. Carries no secret and no licence-shaped fact of any kind, only whether a sign-in provider is configured.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "AuthCapabilitiesResponse".
+ */
+export interface AuthCapabilitiesResponse {
+  /**
+   * Whether this deployment has a generic OIDC SSO provider configured (platform.Config.OIDCIssuer non-empty -- NARVI_OIDC_ISSUER/CLIENT_ID/CLIENT_SECRET are all-or-none, so this one boolean fully answers the question). GET /auth/oidc/login and GET /auth/oidc/callback are always mounted, regardless of this value -- false means both refuse every request with 503 rather than not existing as routes at all (mirrors the cloud-identity discovery routes' own identical 'fail closed when unset' precedent). true means they will actually complete a sign-in; false means the sign-in view's own SSO button must stay disabled -- exactly as disabled as it was before this field existed.
+   */
+  oidcConfigured: boolean;
 }

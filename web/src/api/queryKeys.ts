@@ -42,6 +42,11 @@ export const decisionInboxQueryKeys = {
 // sessionQueryKeys above (which is parameterized per session id).
 export const authQueryKeys = {
   me: () => ['auth', 'me'] as const,
+  // capabilities (§41.3) -- the sign-in view's own PUBLIC, unauthenticated
+  // "is OIDC configured" probe (GET /auth/capabilities), fetched even
+  // while signed out -- unlike me() above, which 401s until a real
+  // session exists.
+  capabilities: () => ['auth', 'capabilities'] as const,
 }
 
 // modelCatalogQueryKeys (§8.8) -- the composer's own model/effort

@@ -1394,6 +1394,232 @@ func TestHandleSandboxEvent_PushComplete_CreatesPRArtifact(t *testing.T) {
 	}
 }
 
+// TestHandleSandboxEvent_PushComplete_CreatorNoGitHubIdentity_NeverFallsBackToBot
+// proves review round 3's own finding Q2: a session creator who signed in
+// ONLY through a provider other than GitHub (§41.3, generic OIDC) and has
+// never linked a GitHub identity gets NO PR at all, even when a bot token
+// IS configured for this deployment (RegistryOptions.GitHubBotToken) --
+// the round-2 bot-identity fallback for exactly this creator shape is
+// gone, since the push itself is now blocked before ever reaching this
+// creator's push_complete (0a49b49's own pushBlockedByMissingGitHubIdentity,
+// pushpr.go's completeProcessingTurn). This synthetic push_complete
+// (production never sends one for this creator shape once the push is
+// blocked, exactly like its "NoBotToken_SkipsHonestly" sibling below)
+// still proves the fallback code is gone, not merely unreachable: even
+// handed a push_complete directly, createPRBestEffort must still skip PR
+// creation, honestly, never opening one under the bot's own identity.
+func TestHandleSandboxEvent_PushComplete_CreatorNoGitHubIdentity_NeverFallsBackToBot(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+
+	userStore := narvipg.NewUserStore(pool)
+	user, err := userStore.Create(ctx, sqlcgen.CreateUserParams{
+		PrimaryEmail: fmt.Sprintf("oidc-only-%d@example.com", time.Now().UnixNano()),
+		DisplayName:  "OIDC-Only User",
+		Role:         sqlcgen.UserRoleMember,
+	})
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	// Deliberately NO identities row of any provider -- this user has
+	// never linked a GitHub account. decryptCreatorGitHubToken's own
+	// GetByUserAndProvider(github) lookup must miss.
+
+	sessionID := createTestSessionWithRepos(ctx, t, pool, user.ID,
+		"repo1", "https://github.com/acme/repo1.git", "feature-x")
+
+	sandboxStore := narvipg.NewSandboxStore(pool)
+	if _, err := sandboxStore.Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+
+	const wantBotToken = "gh-fake-bot-token-must-never-be-used-here"
+	sourceControl := &fakeSourceControl{
+		nextRef: ports.PRRef{Number: 77, URL: "https://github.com/acme/repo1/pull/77"},
+	}
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", sourceControl, testTokenEncryptionKey, "", nil, false, RegistryOptions{GitHubBotToken: wantBotToken})
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "push_complete",
+		Gen:  1,
+		Raw:  pushCompleteRaw(t, sessionID.String(), 1, "repo1", "feature-x", "abc123"),
+	})
+
+	time.Sleep(300 * time.Millisecond)
+	if got := sourceControl.callCount(); got != 0 {
+		t.Errorf("CreatePR called %d times, want 0 (no creator github identity -- the bot-identity fallback is gone, §8.11/round-3 finding Q2)", got)
+	}
+
+	artifactStore := narvipg.NewArtifactStore(pool)
+	rows, err := artifactStore.ListForSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("list artifacts: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("artifact count = %d, want 0", len(rows))
+	}
+}
+
+// TestHandleSandboxEvent_PushComplete_CreatorNoGitHubToken_NoBotToken_SkipsHonestly
+// proves the SAME "no PR at all" outcome holds with no bot token
+// configured either -- an otherwise identical setup to
+// TestHandleSandboxEvent_PushComplete_CreatorNoGitHubIdentity_NeverFallsBackToBot
+// immediately above, except the registry is built with NO
+// RegistryOptions.GitHubBotToken (the zero value, ""), proving a bot
+// token's mere presence or absence no longer changes this outcome either
+// way.
+func TestHandleSandboxEvent_PushComplete_CreatorNoGitHubToken_NoBotToken_SkipsHonestly(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+
+	userStore := narvipg.NewUserStore(pool)
+	user, err := userStore.Create(ctx, sqlcgen.CreateUserParams{
+		PrimaryEmail: fmt.Sprintf("oidc-only-nobot-%d@example.com", time.Now().UnixNano()),
+		DisplayName:  "OIDC-Only User, No Bot",
+		Role:         sqlcgen.UserRoleMember,
+	})
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	sessionID := createTestSessionWithRepos(ctx, t, pool, user.ID,
+		"repo1", "https://github.com/acme/repo1.git", "feature-x")
+
+	sandboxStore := narvipg.NewSandboxStore(pool)
+	if _, err := sandboxStore.Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+
+	sourceControl := &fakeSourceControl{}
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", sourceControl, testTokenEncryptionKey, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "push_complete",
+		Gen:  1,
+		Raw:  pushCompleteRaw(t, sessionID.String(), 1, "repo1", "feature-x", "abc123"),
+	})
+
+	time.Sleep(300 * time.Millisecond)
+	if got := sourceControl.callCount(); got != 0 {
+		t.Errorf("CreatePR called %d times, want 0 (no creator github token, no bot token configured)", got)
+	}
+
+	artifactStore := narvipg.NewArtifactStore(pool)
+	rows, err := artifactStore.ListForSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("list artifacts: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("artifact count = %d, want 0", len(rows))
+	}
+}
+
+// TestHandleSandboxEvent_PushComplete_CreatorHasGitHubIdentityButNoUsableToken_NeverFallsBackToBot
+// proves review round 1's own O5 distinction: a creator who DOES have a
+// linked GitHub identity, but whose stored token is unusable (nil here --
+// TestScmCredentials_TamperedCiphertext's own decrypt-failure sub-case is
+// the parallel case one layer down, at the credential-minting endpoint),
+// must NEVER receive the §8.11 bot-identity fallback
+// TestHandleSandboxEvent_PushComplete_CreatorNoGitHubToken_FallsBackToBot
+// proves immediately above for the "no identity at all" case -- even
+// though a bot token IS configured here. This is origin/main's own
+// pre-existing behavior (git show origin/main:internal/app/sessionactor/
+// pushpr.go: decryptCreatorGitHubToken failing always meant "skip, no PR
+// at all" -- there was no bot fallback of any kind to misapply). Before
+// this fix, this exact setup opened a PR under the bot identity whose
+// body wrongly claimed "this session's creator has no linked GitHub
+// account" -- false, and misleading to whoever reviews it.
+func TestHandleSandboxEvent_PushComplete_CreatorHasGitHubIdentityButNoUsableToken_NeverFallsBackToBot(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+
+	userStore := narvipg.NewUserStore(pool)
+	identityStore := narvipg.NewIdentityStore(pool)
+	user, err := userStore.Create(ctx, sqlcgen.CreateUserParams{
+		PrimaryEmail: fmt.Sprintf("has-identity-no-token-%d@example.com", time.Now().UnixNano()),
+		DisplayName:  "Has Identity, No Usable Token",
+		Role:         sqlcgen.UserRoleMember,
+	})
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	// A REAL github identity row exists -- unlike the no-identity-at-all
+	// case above -- but with no stored access token at all.
+	email := user.PrimaryEmail
+	if _, err := identityStore.Create(ctx, sqlcgen.CreateIdentityParams{
+		UserID:        user.ID,
+		Provider:      sqlcgen.IdentityProviderGithub,
+		ExternalID:    fmt.Sprintf("has-identity-no-token-external-%d", time.Now().UnixNano()),
+		Email:         &email,
+		EmailVerified: true,
+		LinkedVia:     sqlcgen.IdentityLinkedViaAdmin,
+		// AccessTokenEncrypted deliberately left nil.
+	}); err != nil {
+		t.Fatalf("create identity: %v", err)
+	}
+
+	sessionID := createTestSessionWithRepos(ctx, t, pool, user.ID,
+		"repo1", "https://github.com/acme/repo1.git", "feature-x")
+
+	sandboxStore := narvipg.NewSandboxStore(pool)
+	if _, err := sandboxStore.Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+
+	const wantBotToken = "gh-fake-bot-token-must-never-be-used-here"
+	sourceControl := &fakeSourceControl{
+		nextRef: ports.PRRef{Number: 78, URL: "https://github.com/acme/repo1/pull/78"},
+	}
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", sourceControl, testTokenEncryptionKey, "", nil, false, RegistryOptions{GitHubBotToken: wantBotToken})
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "push_complete",
+		Gen:  1,
+		Raw:  pushCompleteRaw(t, sessionID.String(), 1, "repo1", "feature-x", "abc123"),
+	})
+
+	time.Sleep(300 * time.Millisecond)
+	if got := sourceControl.callCount(); got != 0 {
+		t.Errorf("CreatePR called %d times, want 0 (an existing github identity with no usable token must never fall back to the bot, even though one is configured)", got)
+	}
+
+	artifactStore := narvipg.NewArtifactStore(pool)
+	rows, err := artifactStore.ListForSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("list artifacts: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("artifact count = %d, want 0", len(rows))
+	}
+}
+
 // TestHandleSandboxEvent_PushComplete_ResolveDefaultBranchFails_SkipsPRCreation
 // is fix/setup-drift-and-pr-base's own regression test for
 // resolvePRBaseBranch's error path: when the real GitHub API call that

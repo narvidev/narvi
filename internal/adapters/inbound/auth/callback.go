@@ -54,13 +54,33 @@ type CallbackOutcome string
 // The full outcome table (see doc.go for the complete branch-by-branch
 // writeup).
 const (
-	OutcomeReturningUser    CallbackOutcome = "returning_user"
-	OutcomeFirstTimeAllowed CallbackOutcome = "first_time_allowed"
-	OutcomeFirstTimeDenied  CallbackOutcome = "first_time_denied"
-	OutcomeNoVerifiedEmail  CallbackOutcome = "no_verified_email"
-	OutcomeStateMismatch    CallbackOutcome = "state_mismatch"
-	OutcomeExchangeFailed   CallbackOutcome = "exchange_failed"
+	OutcomeReturningUser        CallbackOutcome = "returning_user"
+	OutcomeAutoLinked           CallbackOutcome = "auto_linked"
+	OutcomeFirstTimeAllowed     CallbackOutcome = "first_time_allowed"
+	OutcomeFirstTimeDenied      CallbackOutcome = "first_time_denied"
+	OutcomeAmbiguousMatch       CallbackOutcome = "ambiguous_match"
+	OutcomeSameProviderConflict CallbackOutcome = "same_provider_conflict"
+	OutcomeNoVerifiedEmail      CallbackOutcome = "no_verified_email"
+	OutcomeStateMismatch        CallbackOutcome = "state_mismatch"
+	OutcomeExchangeFailed       CallbackOutcome = "exchange_failed"
 )
+
+// auditActionGitHubAmbiguousMatch is the audit_log action recorded when a
+// first-time GitHub identity's verified email matches more than one
+// existing user -- the GitHub-side counterpart of oidccallback.go's own
+// auditActionOIDCAmbiguousMatch, kept as a DISTINCT string (never the
+// same constant) so an operator reading audit_log can tell which
+// provider's sign-in attempt hit the "never guess" refusal without
+// having to cross-reference detail_json's own "provider" key.
+const auditActionGitHubAmbiguousMatch = "identity.github_ambiguous_match"
+
+// auditActionGitHubSameProviderConflict is the audit_log action recorded
+// when a first-time GitHub sign-in's verified email matches exactly one
+// existing user who ALREADY has a (different) github identity (review
+// round 2, findings P2/P3) -- refused rather than merged, see
+// resolveFirstTimeIdentity's own identityConflictsWithExistingProvider
+// doc comment.
+const auditActionGitHubSameProviderConflict = "identity.github_already_linked"
 
 // NewCallbackHandler backs GET /auth/github/callback (§13.1/§13.2/§13.4).
 // See doc.go for the complete outcome table this flow implements.
@@ -85,6 +105,15 @@ const (
 // comment for why a first-time sign-in (bootstrap admin included) was
 // previously the one identity/role mutation in this codebase with no
 // audit trail at all.
+//
+// linkPrompts (review round 1, findings O1/O2/O9) is the SAME
+// identity_link_prompts store NewOIDCCallbackHandler already takes --
+// threaded through here too because this handler's own first-time branch
+// now shares resolveFirstTimeIdentity (firsttimeidentity.go) with the
+// OIDC callback: identitylink.AutoLink (called from that shared branch's
+// own graph-merge match) unconditionally deletes any still-pending link
+// prompt for the identity it just linked, exactly like it does for
+// Slack/Linear/OIDC.
 func NewCallbackHandler(
 	pool *pgxpool.Pool,
 	oauthConfig *oauth2.Config,
@@ -92,6 +121,7 @@ func NewCallbackHandler(
 	identities *postgres.IdentityStore,
 	auditLog *postgres.AuditLogStore,
 	userSessions *postgres.UserSessionStore,
+	linkPrompts *postgres.IdentityLinkPromptStore,
 	allowlist AllowlistConfig,
 	initialAdminEmails []string,
 	tokenEncryptionKey []byte,
@@ -214,12 +244,56 @@ func NewCallbackHandler(
 			logger.Info("auth: oauth callback", "outcome", OutcomeReturningUser)
 
 		case errors.Is(err, pgx.ErrNoRows):
-			// d (first-time sign-in): evaluate the allowlist.
-			allowed := allowlist.EmailAllowed(verifiedEmail)
-			if !allowed && len(allowlist.GitHubOrgs) > 0 {
-				allowed = checkAnyOrgMembership(ctx, httpClient, apiBaseURL, ghUser.Login, allowlist.GitHubOrgs)
+			// d (first-time sign-in): §13.2 step 3's own email-based graph
+			// merge (review round 1, findings O1/O2/O9) -- shared,
+			// verbatim, with oidccallback.go's own identical first-time
+			// branch (resolveFirstTimeIdentity, firsttimeidentity.go), so
+			// an OIDC-only user's verified email is found here exactly the
+			// same way an OIDC sign-in finds a GitHub-only user's. Only
+			// once that merge finds ZERO matching users is the allowlist
+			// (including the org-membership check, a real GitHub API call)
+			// evaluated at all -- checkAllowed below is called lazily, so
+			// a merge match never pays for it.
+			checkAllowed := func() bool {
+				allowed := allowlist.EmailAllowed(verifiedEmail)
+				if !allowed && len(allowlist.GitHubOrgs) > 0 {
+					allowed = checkAnyOrgMembership(ctx, httpClient, apiBaseURL, ghUser.Login, allowlist.GitHubOrgs)
+				}
+				return allowed
 			}
-			if !allowed {
+			createFirstTime := func(ctx context.Context) (pgtype.UUID, error) {
+				return createUserAndIdentity(ctx, pool, users, identities, auditLog, createUserAndIdentityParams{
+					verifiedEmail:      verifiedEmail,
+					githubLogin:        ghUser.Login,
+					githubName:         ghUser.Name,
+					externalID:         externalID,
+					encryptedToken:     encryptedToken,
+					initialAdminEmails: initialAdminEmails,
+				})
+			}
+
+			firstTimeDeps := firstTimeIdentityDeps{
+				pool:        pool,
+				users:       users,
+				identities:  identities,
+				auditLog:    auditLog,
+				linkPrompts: linkPrompts,
+			}
+			resolvedUserID, outcome, resolveErr := resolveFirstTimeIdentity(ctx, firstTimeDeps, sqlcgen.IdentityProviderGithub, externalID, verifiedEmail, encryptedToken, auditActionGitHubAmbiguousMatch, auditActionGitHubSameProviderConflict, checkAllowed, createFirstTime)
+			if resolveErr != nil {
+				logger.Error("auth: create user+identity failed", "error", resolveErr)
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+
+			switch outcome {
+			case firstTimeAutoLinked:
+				userID = resolvedUserID
+				logger.Info("auth: oauth callback", "outcome", OutcomeAutoLinked)
+			case firstTimeCreated:
+				userID = resolvedUserID
+				logger.Info("auth: oauth callback", "outcome", OutcomeFirstTimeAllowed)
+			case firstTimeDenied:
 				// Deliberately generic: does not say WHICH of the 3
 				// mechanisms almost matched -- that's enumeration
 				// information an attacker could use to probe the
@@ -227,23 +301,19 @@ func NewCallbackHandler(
 				logger.Warn("auth: oauth callback rejected", "outcome", OutcomeFirstTimeDenied)
 				http.Error(w, "not authorized to sign up", http.StatusForbidden)
 				return
-			}
-
-			createdUserID, createErr := createUserAndIdentity(ctx, pool, users, identities, auditLog, createUserAndIdentityParams{
-				verifiedEmail:      verifiedEmail,
-				githubLogin:        ghUser.Login,
-				githubName:         ghUser.Name,
-				externalID:         externalID,
-				encryptedToken:     encryptedToken,
-				initialAdminEmails: initialAdminEmails,
-			})
-			if createErr != nil {
-				logger.Error("auth: create user+identity failed", "error", createErr)
-				http.Error(w, "internal error", http.StatusInternalServerError)
+			case firstTimeSameProviderConflict:
+				// Review round 2, findings P2/P3: already audited (its own
+				// action string) inside resolveFirstTimeIdentity above --
+				// same generic public body as every other refusal in this
+				// class, never distinguishing WHY.
+				logger.Warn("auth: oauth callback rejected", "outcome", OutcomeSameProviderConflict)
+				http.Error(w, "not authorized to sign up", http.StatusForbidden)
+				return
+			default: // firstTimeAmbiguous
+				logger.Warn("auth: oauth callback rejected", "outcome", OutcomeAmbiguousMatch)
+				http.Error(w, "not authorized to sign up", http.StatusForbidden)
 				return
 			}
-			userID = createdUserID
-			logger.Info("auth: oauth callback", "outcome", OutcomeFirstTimeAllowed)
 
 		default:
 			logger.Error("auth: lookup identity failed", "error", err)
@@ -292,6 +362,24 @@ type createUserAndIdentityParams struct {
 	initialAdminEmails []string
 }
 
+// resolveInitialRole implements §13.4's own "initial admins set by
+// config" rule: a verified email matching any entry in initialAdminEmails
+// (case-insensitive) becomes admin, every other first-time sign-in
+// defaults to member. Extracted out of createUserAndIdentity so
+// oidccallback.go's own generic-provider first-time-sign-in path
+// (createOIDCUserAndIdentity) applies the EXACT SAME role-assignment rule
+// GitHub sign-in always has, rather than a second, drifting copy of this
+// loop -- the plan's own §41.3 requirement ("the same default-role
+// assignment... as GitHub sign-in").
+func resolveInitialRole(verifiedEmail string, initialAdminEmails []string) sqlcgen.UserRole {
+	for _, adminEmail := range initialAdminEmails {
+		if strings.EqualFold(adminEmail, verifiedEmail) {
+			return sqlcgen.UserRoleAdmin
+		}
+	}
+	return sqlcgen.UserRoleMember
+}
+
 // createUserAndIdentity runs the first-time-sign-in write path: a users row
 // then an identities row, then a "user.created" audit_log row, in ONE
 // Postgres transaction (§13.1's own explicit requirement) so a failure
@@ -312,13 +400,7 @@ type createUserAndIdentityParams struct {
 // should be attributed to; there is simply no OTHER, distinct user to
 // attribute it to instead (a self-registration/self-authentication event).
 func createUserAndIdentity(ctx context.Context, pool *pgxpool.Pool, users *postgres.UserStore, identities *postgres.IdentityStore, auditLog *postgres.AuditLogStore, p createUserAndIdentityParams) (pgtype.UUID, error) {
-	role := sqlcgen.UserRoleMember
-	for _, adminEmail := range p.initialAdminEmails {
-		if strings.EqualFold(adminEmail, p.verifiedEmail) {
-			role = sqlcgen.UserRoleAdmin
-			break
-		}
-	}
+	role := resolveInitialRole(p.verifiedEmail, p.initialAdminEmails)
 
 	displayName := p.githubLogin
 	if p.githubName != "" {

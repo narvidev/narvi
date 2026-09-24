@@ -1687,6 +1687,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		identityStore,
 		auditLogStore,
 		userSessionStore,
+		identityLinkPromptStore,
 		allowlist,
 		cfg.InitialAdminEmails,
 		cfg.TokenEncryptionKey,
@@ -1695,6 +1696,63 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		githubUserTokenAPIBaseURL,
 	))
 	router.Post("/auth/logout", auth.NewLogoutHandler(userSessionStore, secureCookies))
+
+	// /auth/oidc/login, /auth/oidc/callback (§41.3): the generic OIDC SSO
+	// provider, beside the GitHub pair immediately above -- mounted
+	// UNCONDITIONALLY, mirroring this file's own established
+	// "/.well-known/openid-configuration"/"/.well-known/jwks.json"
+	// precedent immediately above (§27.3's cloud-identity discovery
+	// routes, "both handlers fail closed (503) when ... is unset"): both
+	// handlers themselves refuse with 503 when oidcConfig.Configured() is
+	// false, rather than the route being conditionally registered at all.
+	// This is deliberate, not the simpler-looking alternative: routesgolden_test.go's
+	// own TestScanRegisteredRoutes_MatchesGolden asserts the STATIC
+	// go/ast route scan (internal/ops.ScanRegisteredRoutes, which cannot
+	// see a runtime `if` around a router.Get call) matches the REAL,
+	// running router's own route table byte for byte -- a conditionally
+	// -registered route would make that assertion depend on which
+	// config the golden happened to be captured against, exactly the
+	// "static scan and the real router have diverged" case that test
+	// exists to catch. oidcConfig.Configured() (§41.3: NARVI_OIDC_ISSUER/
+	// CLIENT_ID/CLIENT_SECRET are all-or-none) is threaded into
+	// httpapi.GetAuthCapabilities below unconditionally too, for the same
+	// reason.
+	oidcConfig := auth.OIDCConfig{
+		Issuer:        cfg.OIDCIssuer,
+		ClientID:      cfg.OIDCClientID,
+		ClientSecret:  cfg.OIDCClientSecret,
+		PublicBaseURL: cfg.PublicBaseURL,
+	}
+	oidcProviderCache := auth.NewOIDCProviderCache(oidcConfig)
+	router.Get("/auth/oidc/login", auth.NewOIDCLoginHandler(oidcProviderCache, cfg.Timeouts, secureCookies))
+	router.Get("/auth/oidc/callback", auth.NewOIDCCallbackHandler(
+		pool,
+		oidcProviderCache,
+		userStore,
+		identityStore,
+		auditLogStore,
+		userSessionStore,
+		identityLinkPromptStore,
+		allowlist,
+		cfg.InitialAdminEmails,
+		cfg.Timeouts,
+		secureCookies,
+	))
+
+	// /auth/capabilities (§41.3): the ONE public, unauthenticated signal
+	// the sign-in view (web/src/routes/sign-in.tsx) needs before a visitor
+	// is signed in at all -- whether THIS deployment has OIDC configured,
+	// so the SSO button can be a real link instead of a permanently
+	// disabled one. GET /api/capabilities (httpapi/capabilities.go) is
+	// NOT this: that endpoint is a DIFFERENT read model entirely (§34's
+	// licensed-module capabilities: organization_governance/compliance/
+	// knowledge_retrieval), gated behind auth.Middleware -- unusable by a
+	// signed-out visitor by construction, and conceptually unrelated to
+	// sign-in provider configuration. This is deliberately its OWN small
+	// route, mounted OUTSIDE auth.Middleware like every other auth route
+	// on this page, rather than a new unauthenticated branch grafted onto
+	// that unrelated, already-shipped contract.
+	router.Get("/auth/capabilities", httpapi.GetAuthCapabilities(oidcConfig.Configured()))
 
 	// /auth/identity-link/{nonce}: the magic-link consume flow (
 	// "identities + full RBAC", §13.2 step 4's own "connect your account"
