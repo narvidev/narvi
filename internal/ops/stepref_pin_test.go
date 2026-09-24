@@ -106,6 +106,7 @@ var stepRefPins = []stepRefPin{
 	{"migrations/000028_github_pr_sessions.up.sql", "32", "GitHub ingress"},
 	{"migrations/000029_slack_thread_sessions.up.sql", "33", "Slack ingress"},
 	{"migrations/000030_linear_agent_sessions.up.sql", "34", "Linear ingress"},
+	{"migrations/000140_identities_oidc_provider.up.sql", "164", "OIDC sign-in"},
 	{"migrations/000031_linear_installations.up.sql", "20", "auth v1"},
 	{"migrations/000031_linear_installations.up.sql", "34", "Linear ingress"},
 	{"migrations/000032_github_pr_sessions_session_id_idx.up.sql", "32", "GitHub ingress"},

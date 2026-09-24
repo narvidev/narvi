@@ -538,6 +538,7 @@ const (
 	IdentityProviderSlack  IdentityProvider = "slack"
 	IdentityProviderLinear IdentityProvider = "linear"
 	IdentityProviderGoogle IdentityProvider = "google"
+	IdentityProviderOidc   IdentityProvider = "oidc"
 )
 
 func (e *IdentityProvider) Scan(src interface{}) error {
