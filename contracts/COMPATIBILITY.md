@@ -130,8 +130,8 @@ compatible only if compatible under **both** columns.
 | 4 | Property moved into required | MINOR | MAJOR |
 | 5 | Property removed from required | MAJOR | MINOR |
 | 6 | `type` changed outright, or the `type` keyword itself added/removed | MAJOR | MAJOR |
-| 7 | `type` widened (union gains a non-null member) | MAJOR | MINOR |
-| 8 | `type` narrowed (union loses a non-null member, keyword stays present both sides) | MINOR | MAJOR |
+| 7 | `type` widened (union gains a non-null member, including a bare `{"type":X}` anyOf/oneOf member, X != null, added to an already-existing union -- D9: a consumer cannot "ignore" an unrecognized scalar the way it skips an unrecognized discriminated variant, so this is a type change, not row 28) | MAJOR | MINOR |
+| 8 | `type` narrowed (union loses a non-null member, keyword stays present both sides; same D9 scope for a bare `{"type":X}` member removed) | MINOR | MAJOR |
 | 9 | `null` added to `type` (including a `{"type":"null"}` anyOf/oneOf member added to an already-existing union) | MAJOR | MINOR |
 | 10 | `null` removed from `type` (including a `{"type":"null"}` member removed) | MINOR | MAJOR |
 | 11 | enum value added | MAJOR, unless the enum is listed in the MERGE-BASE manifest's `openEnums` (then MINOR) | MINOR |
@@ -151,9 +151,9 @@ compatible only if compatible under **both** columns.
 | 25 | `additionalProperties` `true`→schema | MAJOR | MAJOR |
 | 26 | `additionalProperties` schema on both sides, content differs | recurse, same direction | recurse, same direction |
 | 27 | `$ref` retargeted (siblings on the referencing node are diffed too, as part of the same comparison) | compare dereferenced+merged schemas under rows 1-26/42; MAJOR if the old target def no longer exists (row 31) | same |
-| 28 | `oneOf`/`anyOf` variant added (keyword already present both sides) | MINOR | MINOR |
-| 29 | `oneOf`/`anyOf` variant removed (keyword already present both sides) | MAJOR | MAJOR |
-| 30 | `oneOf`/`anyOf` variant changed (paired by `$ref` target name, else by `properties.type.const`, else FAIL-CLOSED) | recurse | recurse |
+| 28 | `oneOf`/`anyOf` DISCRIMINATED variant added (a member that is a `$ref` to an object def, or an object with `properties.type.const` -- keyword already present both sides; a bare `{"type":X}` member, X != null, is rows 7/8 instead, not this row) | MINOR | MINOR |
+| 29 | `oneOf`/`anyOf` DISCRIMINATED variant removed (same scope as row 28) | MAJOR | MAJOR |
+| 30 | `oneOf`/`anyOf` variant changed (paired by `$ref` target name, else by `properties.type.const`, else by a bare `{"type":X}` member's own type name, else FAIL-CLOSED) | recurse | recurse |
 | 31 | `$defs` entry removed or renamed | MAJOR | MAJOR |
 | 32 | `$defs` entry added | MINOR | MINOR |
 | 33 | `default` added/changed/removed | MAJOR | MAJOR |
@@ -209,12 +209,17 @@ mirror image.
 Both relaxations are read from the **merge-base** copy of
 `contracts/manifest.json`, never from the head (PR) copy:
 
-- **`openEnums`** lists canonical dotted names (`Session.status`,
-  `Plan.status`, ...) of string enums where adding a new value is treated
-  as MINOR instead of MAJOR on the P2C column. A PR that both adds an enum
-  value AND adds that enum to `openEnums` is still scored as if the enum
-  were closed (MAJOR) — opening an enum and using the opening have to be
-  two different PRs, so the second one isn't grading its own homework.
+- **`openEnums`** lists the EXACT JSON Pointer (`#/$defs/Session/
+  properties/status`, `#/$defs/Plan/properties/status`, ...) of each open
+  string enum's own schema node — never a name derived by stripping
+  `$defs`/`properties` segments out of that pointer, which would let a
+  property literally named `properties` (or `$defs`) inherit an unrelated
+  entry's relaxation. Adding a new value to a pointer on this list is
+  treated as MINOR instead of MAJOR on the P2C column. A PR that both adds
+  an enum value AND adds that enum's pointer to `openEnums` is still
+  scored as if the enum were closed (MAJOR) — opening an enum and using
+  the opening have to be two different PRs, so the second one isn't
+  grading its own homework.
 - **`status: retired`** on a manifest surface row is what lets that row's
   schema file be deleted without the removal being MAJOR (rule 37) — and
   it, too, has to already say `retired` in the PR's OWN base, meaning the
@@ -223,7 +228,9 @@ Both relaxations are read from the **merge-base** copy of
 ### Day-one `openEnums`
 
 The lifecycle status enums of platform-produced REST shapes backed by a
-Postgres enum column, which this project expects to grow over time:
+Postgres enum column, which this project expects to grow over time (named
+here by field, for readability — `contracts/manifest.json` itself stores
+each entry as the field's own exact JSON Pointer, per the rule above):
 `Session.status`, `Plan.status`, `PlanActionResponse.status`,
 `CreateTurnResponse.status`, `ShadowComparisonTurn.status`,
 `Automation.status`, `AutomationRun.status`, `AutomationInvocation.status`,
@@ -285,7 +292,7 @@ file is itself a wire-compatibility break.
 
 ## Extending the checker
 
-A change the closed keyword allowlist or the 41-row rule table doesn't
+A change the closed keyword allowlist or the 45-row rule table doesn't
 name makes `tools/contractscompat` fail closed with a message naming the
 JSON Pointer and asking for a separate PR first. That PR should extend
 `tools/contractscompat/compat`'s allowlist/rule table AND its own corpus

@@ -197,12 +197,16 @@ var corpus = []corpusCase{
 		c2pWant:  &wantFinding{"11", SeverityMinor},
 	},
 	{
-		name:      "row11 enum value added, open",
-		ruleID:    "11",
-		defName:   "Status",
-		baseDefs:  defsOf("Status", schemaObj("type", "string", "enum", []any{"a", "b"})),
-		headDefs:  defsOf("Status", schemaObj("type", "string", "enum", []any{"a", "b", "c"})),
-		openEnums: map[string]bool{"Status": true},
+		name:     "row11 enum value added, open",
+		ruleID:   "11",
+		defName:  "Status",
+		baseDefs: defsOf("Status", schemaObj("type", "string", "enum", []any{"a", "b"})),
+		headDefs: defsOf("Status", schemaObj("type", "string", "enum", []any{"a", "b", "c"})),
+		// D14: openEnums matches by the enum's own EXACT JSON Pointer (here,
+		// the def's own root pointer -- "Status"'s enum is declared directly
+		// at "#/$defs/Status", not nested under a "properties" entry), not a
+		// dotted name.
+		openEnums: map[string]bool{"#/$defs/Status": true},
 		p2cWant:   &wantFinding{"11", SeverityMinor},
 		c2pWant:   &wantFinding{"11", SeverityMinor},
 	},

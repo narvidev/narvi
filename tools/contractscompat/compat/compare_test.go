@@ -27,8 +27,8 @@ func TestOpenEnumsReadFromMergeBaseOnly(t *testing.T) {
 	headSchema := mustMarshalFile(t, minimalFile("https://narvi.dev/t/v1/x.schema.json", defsOf("Status", schemaObj("type", "string", "enum", []any{"a", "b", "c"}))))
 
 	in := Input{
-		BaseManifestRaw:  minimalManifestJSON(t, nil),                // base does NOT open Status
-		HeadManifestRaw:  minimalManifestJSON(t, []string{"Status"}), // head opens it in the SAME PR
+		BaseManifestRaw:  minimalManifestJSON(t, nil),                        // base does NOT open Status
+		HeadManifestRaw:  minimalManifestJSON(t, []string{"#/$defs/Status"}), // head opens it in the SAME PR
 		BaseVersion:      "1.0.0",
 		HeadVersion:      "1.1.0",
 		BaseChangelogRaw: []byte("## [1.0.0]\n"),
@@ -61,8 +61,8 @@ func TestOpenEnumsAlreadyEstablishedInBase(t *testing.T) {
 	headSchema := mustMarshalFile(t, minimalFile("https://narvi.dev/t/v1/x.schema.json", defsOf("Status", schemaObj("type", "string", "enum", []any{"a", "b", "c"}))))
 
 	in := Input{
-		BaseManifestRaw:  minimalManifestJSON(t, []string{"Status"}), // already open in base
-		HeadManifestRaw:  minimalManifestJSON(t, []string{"Status"}),
+		BaseManifestRaw:  minimalManifestJSON(t, []string{"#/$defs/Status"}), // already open in base
+		HeadManifestRaw:  minimalManifestJSON(t, []string{"#/$defs/Status"}),
 		BaseVersion:      "1.0.0",
 		HeadVersion:      "1.1.0",
 		BaseChangelogRaw: []byte("## [1.0.0]\n"),

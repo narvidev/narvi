@@ -99,6 +99,9 @@ func DiffSurface(directive string, baseRaw, headRaw []byte, openEnums map[string
 
 	dirs, err := DefDirections(directive, baseDefs, headDefs)
 	if err != nil {
+		if fc, ok := err.(*FailClosedError); ok {
+			return append(findings, fc.Finding), nil
+		}
 		return nil, err
 	}
 

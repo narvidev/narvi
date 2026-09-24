@@ -53,11 +53,13 @@ var allowedKeywords = map[string]bool{
 	// of a named pointer alias, or json.RawMessage for an opaque passthrough
 	// field). It is genuinely in use today (rest/v1/dtos.schema.json,
 	// verified while implementing this checker) and, unlike a real
-	// unknown keyword, changing it cannot change the JSON wire shape any
+	// unknown keyword, changing it cannot change the JSON WIRE shape any
 	// consumer -- Go, TS, or otherwise -- actually sees: it only steers
-	// THIS repository's own generated Go type. defdiff.go's
-	// diffAnnotations treats a change to it the same as a description
-	// change (row 35, PATCH), never a compatibility break.
+	// THIS repository's own generated Go type. Unlike description
+	// (row 35, PATCH, a genuine no-op annotation), that still changes what
+	// the generated Go decoder accepts on the platform's own C2P side, so
+	// defdiff.go's diffAnnotations scores it MAJOR both columns (row 45,
+	// C19), not PATCH.
 	"goJSONSchema": true,
 }
 
@@ -209,6 +211,34 @@ func walkSchemaObject(obj map[string]any, ptr string, isRoot bool) error {
 		}
 		if _, err := localRefTarget(s); err != nil {
 			return failClosed("fc-ref", ptr+"/$ref", "%v", err)
+		}
+		// $ref is a CONJUNCTION with its siblings in draft 2020-12, not an
+		// override -- modeling that conjunction correctly across every
+		// keyword kept getting it wrong (see ref.go's own doc comment on
+		// refAllowedSiblingKeys). This repo's own five schema files never
+		// need the general case, so any sibling other than "description"
+		// (a pure annotation) is illegal outright: FAIL CLOSED here, at
+		// structural validation time, for BOTH base and head independently,
+		// before diffing (or reachability) ever runs -- this also covers a
+		// $defs entry that is itself a bare "$ref" (an alias def): it may
+		// only ever be exactly {"$ref": ..., "description"?: ...}. The
+		// document ROOT's own four administrative keywords ($schema, $id,
+		// title, $defs) are exempt here -- they sit beside the root's own
+		// $ref in session-config's real schema today, but DiffSurface
+		// already strips and compares them entirely separately
+		// (stripAdminKeys) before ever routing the root through diffNode,
+		// so they are not "siblings" in the sense this guard cares about.
+		for key := range obj {
+			if key == "$ref" || refAllowedSiblingKeys[key] {
+				continue
+			}
+			if isRoot {
+				switch key {
+				case "$schema", "$id", "title", "$defs":
+					continue
+				}
+			}
+			return failClosed("fc-ref-sibling", ptr+"/"+key, "keyword %q may not accompany \"$ref\" on the same schema node (only \"description\" may)", key)
 		}
 	}
 

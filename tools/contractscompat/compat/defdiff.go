@@ -1,6 +1,7 @@
 package compat
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"sort"
@@ -15,6 +16,44 @@ type diffCtx struct {
 	baseR     resolver
 	headR     resolver
 	openEnums map[string]bool
+	// visited is the self-reference recursion guard (D17/D22): once
+	// diffNode has dereferenced a given (base $ref target, head $ref
+	// target, Direction) triple once within this ctx's own diff, a later
+	// revisit of the EXACT same triple -- inevitable for a def that
+	// (directly or through a chain of properties/items/oneOf/anyOf)
+	// $refs itself, since resolving it always lands back on the same
+	// name -- returns immediately instead of re-diffing. Without this, a
+	// self-referencing def whose recursive path also differs between
+	// base and head never reaches diffResolved's own
+	// reflect.DeepEqual short-circuit (the two sides are never bit-for-
+	// bit equal), so diffNode would call itself forever. Lazily
+	// initialized; never cleared -- it is scoped to one ctx's lifetime,
+	// which is one top-level DiffDef/root call, exactly the span within
+	// which the same def pair could recur.
+	visited map[visitKey]bool
+}
+
+// visitKey identifies one (base $ref target name, head $ref target name,
+// Direction) triple for diffCtx.visitOnce.
+type visitKey struct {
+	baseName, headName string
+	dir                Direction
+}
+
+// visitOnce reports whether (bName, hName, dir) is being seen for the
+// FIRST time in this ctx (true: proceed normally) or was already visited
+// earlier in this same diff (false: the caller must stop without
+// re-diffing -- see diffCtx.visited's own doc comment).
+func (c *diffCtx) visitOnce(bName, hName string, dir Direction) bool {
+	if c.visited == nil {
+		c.visited = map[visitKey]bool{}
+	}
+	key := visitKey{bName, hName, dir}
+	if c.visited[key] {
+		return false
+	}
+	c.visited[key] = true
+	return true
 }
 
 // DiffDef compares one def (already looked up in both sides' $defs maps)
@@ -29,6 +68,24 @@ func DiffDef(baseDefs, headDefs map[string]any, name string, dir Direction, open
 		baseR:     resolver{defs: baseDefs},
 		headR:     resolver{defs: headDefs},
 		openEnums: openEnums,
+	}
+	// Pre-seed the recursion guard (D17/D22) with this def's own identity.
+	// diffNode's own visitOnce call only fires when it encounters a LIVE
+	// "$ref": name node during its recursive walk -- this OUTERMOST call
+	// compares the two defs' raw content directly, with no $ref node of
+	// its own to trip that check. Without pre-seeding, a self-referencing
+	// def's own top-level content would be diffed once here, and THEN the
+	// first "$ref": name node reached while walking that content would
+	// still be allowed one more full recursive pass before the guard
+	// caught the SECOND one -- reporting the same recursive-path change
+	// twice, and doing one extra unbounded-sized diff pass, before
+	// stopping. Pre-seeding means the very FIRST "$ref": name node
+	// encountered anywhere in this def's own structure is already a
+	// revisit, so recursion stops after exactly one full pass.
+	if dir == DirBoth {
+		ctx.visited = map[visitKey]bool{{name, name, DirP2C}: true, {name, name, DirC2P}: true}
+	} else {
+		ctx.visited = map[visitKey]bool{{name, name, dir}: true}
 	}
 	ptr := "#/$defs/" + jsonPointerEscape(name)
 	base, head := baseDefs[name], headDefs[name]
@@ -74,12 +131,16 @@ func mergeBothDirections(p2c, c2p []Finding) []Finding {
 // exponential; it would also be wrong, since Direction is a property of a
 // whole def/root, not of an individual nested node).
 //
-// $ref handling (rows 27, 31-32's caller): a same-target (or no-$ref-on-
-// either-side) pair is resolved and its SIBLING keywords merged in via
-// effectiveNode (C5, C8 -- a node carrying "$ref" plus other keywords is
-// walked like any other node, never with its siblings silently dropped).
-// A retargeted $ref (row 27) is handled by diffRetargetedRef, which does
-// the same sibling-merge against each side's OWN resolved target.
+// $ref handling (rows 27, 31-32's caller): $ref is illegal beside any
+// sibling keyword other than "description" (see ref.go's own doc comment
+// on refAllowedSiblingKeys) -- so resolving a $ref node is simply
+// "follow it to its def," never a merge. The one legal sibling,
+// "description," is diffed on its own by diffRefSiblingDescription,
+// independent of whatever the $ref resolves to (it is a pure annotation,
+// row 35, never a wire constraint). A retargeted $ref (row 27) is handled
+// by diffRetargetedRef, which fully dereferences each side's OWN target
+// (through any alias chain) and diffs the two resulting concrete nodes
+// directly, with no merge either.
 func (c *diffCtx) diffNode(base, head any, dir Direction, ptr string) ([]Finding, error) {
 	if dir == DirBoth {
 		p2c, err := c.diffNode(base, head, DirP2C, ptr)
@@ -96,8 +157,51 @@ func (c *diffCtx) diffNode(base, head any, dir Direction, ptr string) ([]Finding
 	bRefName := refTargetName(base)
 	hRefName := refTargetName(head)
 
-	if bRefName != "" && hRefName != "" && bRefName != hRefName {
-		return c.diffRetargetedRef(base, head, bRefName, hRefName, dir, ptr)
+	// The referencing node's OWN siblings (base and head, independently):
+	// diffRetargetedRef below only ever resolves each side's DEF content,
+	// never the raw referencing node itself, so a disallowed sibling
+	// sitting right here would otherwise slip past it. walkSchema already
+	// enforces this structurally for every real PR (DiffSurface always
+	// calls it on the whole document before diffing anything), but DiffDef
+	// is itself an exported, independently-callable entry point (this
+	// package's own tests call it directly) -- checking here too keeps it
+	// correct on its own, not just when walkSchema happened to run first.
+	if bRefName != "" {
+		if bObj, ok := base.(map[string]any); ok {
+			if err := checkRefSiblings(bObj); err != nil {
+				return nil, failClosed("fc-ref", ptr, "%v", err)
+			}
+		}
+	}
+	if hRefName != "" {
+		if hObj, ok := head.(map[string]any); ok {
+			if err := checkRefSiblings(hObj); err != nil {
+				return nil, failClosed("fc-ref", ptr, "%v", err)
+			}
+		}
+	}
+
+	var descFindings []Finding
+	if bRefName != "" || hRefName != "" {
+		descFindings = diffRefSiblingDescription(base, head, ptr)
+	}
+
+	if bRefName != "" && hRefName != "" {
+		// Recursion guard (D17/D22): this exact (base target, head
+		// target, direction) triple may already have been diffed earlier
+		// in this def's own recursive structure -- a revisit can only
+		// happen by looping through a self-referencing def, and cannot
+		// discover anything new, so stop rather than re-diff.
+		if !c.visitOnce(bRefName, hRefName, dir) {
+			return descFindings, nil
+		}
+		if bRefName != hRefName {
+			wrapper, err := c.diffRetargetedRef(bRefName, hRefName, dir, ptr)
+			if err != nil {
+				return nil, err
+			}
+			return append(descFindings, wrapper...), nil
+		}
 	}
 
 	rBase, err := c.baseR.resolve(base, nil)
@@ -112,31 +216,50 @@ func (c *diffCtx) diffNode(base, head any, dir Direction, ptr string) ([]Finding
 	bObj, bIsObj := rBase.(map[string]any)
 	hObj, hIsObj := rHead.(map[string]any)
 	if !bIsObj || !hIsObj {
-		// At least one side resolves to the boolean schema literal
-		// true/false. Compare the literals directly rather than through
-		// effectiveNode: collapsing a bare `false` ("reject everything")
-		// into the empty object `{}` ("accept everything") there would
-		// silently invert its meaning. A bool node can never itself carry
-		// $ref siblings (its whole value IS the boolean), so there is
-		// nothing to merge in this case anyway.
+		// At least one side is the boolean schema literal true/false,
+		// reached with NO $ref involved (a bare `true`/`false` directly
+		// in this node's own position, e.g. as an `items` value) -- a
+		// $ref to a boolean def is rejected earlier, by resolveDef.
+		// Compare the literals directly: collapsing a bare `false`
+		// ("reject everything") into the empty object `{}` ("accept
+		// everything") would silently invert its meaning.
 		if reflect.DeepEqual(rBase, rHead) {
-			return nil, nil
+			return descFindings, nil
 		}
-		return []Finding{ruleFinding("6", dir, majorMajor, ptr, "schema literal changed")}, nil
+		return append(descFindings, ruleFinding("6", dir, majorMajor, ptr, "schema literal changed")), nil
 	}
 
-	mergedBase := effectiveNode(bObj, base)
-	mergedHead := effectiveNode(hObj, head)
-	return c.diffResolved(mergedBase, mergedHead, dir, ptr)
+	resolvedFindings, err := c.diffResolved(bObj, hObj, dir, ptr)
+	if err != nil {
+		return nil, err
+	}
+	return append(descFindings, resolvedFindings...), nil
+}
+
+// diffRefSiblingDescription diffs the "description" annotation that may
+// legally sit beside a $ref -- the one sibling keyword this checker
+// tolerates (ref.go's refAllowedSiblingKeys). It runs independent of
+// whatever the $ref resolves to: description is annotation-only (row 35),
+// so dropping the merge machinery that used to fold it into the resolved
+// node's own content must not make a change to THIS sibling invisible.
+func diffRefSiblingDescription(base, head any, ptr string) []Finding {
+	bObj, _ := base.(map[string]any)
+	hObj, _ := head.(map[string]any)
+	if f := diffAnnotationKey(bObj, hObj, ptr, "description", "35", SeverityPatch); f != nil {
+		return []Finding{*f}
+	}
+	return nil
 }
 
 // diffRetargetedRef implements row 27: the finding's severity comes from
-// comparing the OLD target's content (as it stood in base, plus base's own
-// sibling keywords) against the NEW target's content (as it stands in
-// head, plus head's own siblings), unless the old target no longer exists
-// in head's own $defs at all (row 31 territory), which is unconditionally
-// MAJOR.
-func (c *diffCtx) diffRetargetedRef(base, head any, bRefName, hRefName string, dir Direction, ptr string) ([]Finding, error) {
+// comparing the OLD target's fully-dereferenced content (as it stood in
+// base) against the NEW target's fully-dereferenced content (as it stands
+// in head), unless the old target no longer exists in head's own $defs at
+// all (row 31 territory), which is unconditionally MAJOR. Neither target
+// can itself carry a constraint-bearing sibling (ref.go's resolve/
+// resolveDef already fail closed on that, along the whole alias chain),
+// so there is nothing left to merge here.
+func (c *diffCtx) diffRetargetedRef(bRefName, hRefName string, dir Direction, ptr string) ([]Finding, error) {
 	if _, ok := c.headR.defs[bRefName]; !ok {
 		return []Finding{{
 			RuleID:   "27",
@@ -146,11 +269,11 @@ func (c *diffCtx) diffRetargetedRef(base, head any, bRefName, hRefName string, d
 		}}, nil
 	}
 
-	oldTarget, err := c.baseR.resolve(c.baseR.defs[bRefName], nil)
+	oldTarget, err := c.baseR.resolveDef(bRefName, nil)
 	if err != nil {
 		return nil, failClosed("fc-ref", ptr, "%v", err)
 	}
-	newTarget, err := c.headR.resolve(c.headR.defs[hRefName], nil)
+	newTarget, err := c.headR.resolveDef(hRefName, nil)
 	if err != nil {
 		return nil, failClosed("fc-ref", ptr, "%v", err)
 	}
@@ -164,9 +287,7 @@ func (c *diffCtx) diffRetargetedRef(base, head any, bRefName, hRefName string, d
 			nested = []Finding{ruleFinding("6", dir, majorMajor, ptr, "schema literal changed")}
 		}
 	default:
-		mergedOld := effectiveNode(oldObj, base)
-		mergedNew := effectiveNode(newObj, head)
-		nested, err = c.diffResolved(mergedOld, mergedNew, dir, ptr)
+		nested, err = c.diffResolved(oldObj, newObj, dir, ptr)
 		if err != nil {
 			return nil, err
 		}
@@ -468,16 +589,23 @@ func (c *diffCtx) diffEnum(base, head map[string]any, dir Direction, ptr string)
 	hVals, _ := hRaw.([]any)
 	bSet := map[string]any{}
 	for _, v := range bVals {
-		bSet[fmt.Sprint(v)] = v
+		bSet[canonicalEnumKey(v)] = v
 	}
 	hSet := map[string]any{}
 	for _, v := range hVals {
-		hSet[fmt.Sprint(v)] = v
+		hSet[canonicalEnumKey(v)] = v
 	}
 
 	var findings []Finding
-	openName := canonicalName(ptr)
-	isOpen := c.openEnums[openName]
+	// D14: openEnums matches the enum's schema node by its EXACT JSON
+	// Pointer (ptr, the node diffEnum was called with -- e.g.
+	// "#/$defs/Session/properties/status"), never a name derived by
+	// stripping "$defs"/"properties" segments out of it. Stripping by
+	// segment NAME (rather than position) let a property literally named
+	// "properties" (or "$defs") inherit an unrelated openEnums
+	// relaxation; matching the raw pointer has no such ambiguity, since
+	// every pointer is unique by construction.
+	isOpen := c.openEnums[ptr]
 
 	var addedKeys, removedKeys []string
 	for k := range hSet {
@@ -498,44 +626,71 @@ func (c *diffCtx) diffEnum(base, head map[string]any, dir Direction, ptr string)
 		if isOpen {
 			p2c = SeverityMinor
 		}
-		findings = append(findings, ruleFinding("11", dir, severityPair{p2c, SeverityMinor}, ptr+"/enum", "enum value added: "+k))
+		findings = append(findings, ruleFinding("11", dir, severityPair{p2c, SeverityMinor}, ptr+"/enum", "enum value added: "+describeEnumValue(hSet[k])))
 	}
 	for _, k := range removedKeys {
-		findings = append(findings, ruleFinding("12", dir, severityPair{SeverityMinor, SeverityMajor}, ptr+"/enum", "enum value removed: "+k))
+		findings = append(findings, ruleFinding("12", dir, severityPair{SeverityMinor, SeverityMajor}, ptr+"/enum", "enum value removed: "+describeEnumValue(bSet[k])))
 	}
 	return findings
 }
 
-// canonicalName turns a def-rooted JSON Pointer such as
-// "#/$defs/Session/properties/status" into the dotted name
-// ("Session.status") the day-one openEnums list (contracts/manifest.json)
-// and COMPATIBILITY.md both use, by dropping "$defs" and every literal
-// "properties" path segment.
-func canonicalName(ptr string) string {
-	ptr = strings.TrimPrefix(ptr, "#/")
-	segs := strings.Split(ptr, "/")
-	var kept []string
-	for i, s := range segs {
-		if s == "$defs" || s == "properties" {
-			continue
-		}
-		// Drop the trailing "/enum" (or any other keyword suffix): keep
-		// only up to and including the property/def name segments.
-		if i == len(segs)-1 && !isNameSegment(s) {
-			continue
-		}
-		kept = append(kept, jsonPointerUnescape(s))
+// canonicalEnumKey returns a type-tagged, canonically-serialized key for
+// an enum value decoded by encoding/json (nil/bool/float64/string/[]any/
+// map[string]any) -- used to compare enum VALUES by their real JSON type
+// AND content (D15/D20), not by fmt.Sprint text, which collides values
+// across types that merely print the same: fmt.Sprint(nil) and
+// fmt.Sprint("<nil>") are both "<nil>"; fmt.Sprint(float64(1)) and
+// fmt.Sprint("1") are both "1". Those collisions let a value silently
+// change JSON type between base and head (null -> the string "<nil>", the
+// number 1 -> the string "1") without diffEnum ever noticing, even though
+// every consumer sees a different wire type. The tag prefix keeps values
+// of different JSON types from ever sharing a key regardless of what
+// json.Marshal happens to produce for either; json.Marshal on a
+// map[string]any sorts its keys, so two structurally-equal object/array
+// enum values also always key identically.
+func canonicalEnumKey(v any) string {
+	tag := jsonTypeTag(v)
+	data, err := json.Marshal(v)
+	if err != nil {
+		// v was itself decoded FROM JSON by encoding/json, so re-marshaling
+		// it cannot fail -- a panic here would mean a bug in this
+		// function's own assumptions, not bad input.
+		panic(fmt.Sprintf("canonicalEnumKey: re-marshal failed for %#v: %v", v, err))
 	}
-	return strings.Join(kept, ".")
+	return tag + ":" + string(data)
 }
 
-// isNameSegment heuristically distinguishes a $defs/properties NAME
-// segment from a trailing keyword segment (like "enum" or "type") when
-// canonicalName strips the pointer down to a dotted name -- every keyword
-// this checker ever appends as a final segment is in the allowlist, so
-// anything else is assumed to be a real name.
-func isNameSegment(s string) bool {
-	return !allowedKeywords[s]
+// describeEnumValue renders an enum value for a Finding's own message text
+// -- unlike canonicalEnumKey, this is for a human reader, not a comparison
+// key, but it still carries the JSON type tag so "number 1 added" and
+// "string \"1\" added" never look identical in output the way plain
+// fmt.Sprint(v) would.
+func describeEnumValue(v any) string {
+	data, err := json.Marshal(v)
+	if err != nil {
+		panic(fmt.Sprintf("describeEnumValue: re-marshal failed for %#v: %v", v, err))
+	}
+	return jsonTypeTag(v) + " " + string(data)
+}
+
+// jsonTypeTag names the JSON type encoding/json decoded v into.
+func jsonTypeTag(v any) string {
+	switch v.(type) {
+	case nil:
+		return "null"
+	case bool:
+		return "bool"
+	case float64:
+		return "number"
+	case string:
+		return "string"
+	case []any:
+		return "array"
+	case map[string]any:
+		return "object"
+	default:
+		return fmt.Sprintf("%T", v)
+	}
 }
 
 // --- const (row 14) ---
@@ -938,16 +1093,34 @@ func (c *diffCtx) diffUnion(base, head map[string]any, dir Direction, ptr, keywo
 		switch {
 		case inBase && !inHead:
 			removedPtr := fmt.Sprintf("%s/%s/%d", ptr, keyword, bm.idx)
-			if k == "type:null" {
+			switch {
+			case k == "type:null":
 				findings = append(findings, ruleFinding("10", dir, severityPair{SeverityMinor, SeverityMajor}, removedPtr, "null variant removed from "+keyword))
-			} else {
+			case strings.HasPrefix(k, "type:"):
+				// D9: a bare {"type":X} branch (X != null) is not a
+				// discriminated variant a robust consumer can just skip
+				// over -- it is the field's own wire type losing a
+				// member, the same change row 8 already grades when
+				// spelled as a `type` array. Only "ref:"/"const:" keyed
+				// members (a $ref to an object def, or an object with a
+				// properties.type.const discriminator) are the
+				// discriminated-object variants rows 28/29 are for.
+				findings = append(findings, ruleFinding("8", dir, severityPair{SeverityMinor, SeverityMajor}, removedPtr, "scalar-type union member removed (type narrowed): "+k))
+			default:
 				findings = append(findings, ruleFinding("29", dir, majorMajor, removedPtr, "union member removed: "+k))
 			}
 		case !inBase && inHead:
 			addedPtr := fmt.Sprintf("%s/%s/%d", ptr, keyword, hm.idx)
-			if k == "type:null" {
+			switch {
+			case k == "type:null":
 				findings = append(findings, ruleFinding("9", dir, severityPair{SeverityMajor, SeverityMinor}, addedPtr, "null variant added to "+keyword))
-			} else {
+			case strings.HasPrefix(k, "type:"):
+				// D9: same reasoning as the removed case above, mirrored:
+				// a non-null bare-type branch added to an existing union
+				// widens the field's own wire type (row 7), not a MINOR
+				// "variant added" a consumer could simply ignore.
+				findings = append(findings, ruleFinding("7", dir, severityPair{SeverityMajor, SeverityMinor}, addedPtr, "scalar-type union member added (type widened): "+k))
+			default:
 				findings = append(findings, ruleFinding("28", dir, severityPair{SeverityMinor, SeverityMinor}, addedPtr, "union member added: "+k))
 			}
 		default:

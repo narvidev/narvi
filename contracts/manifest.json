@@ -28,17 +28,17 @@
     }
   ],
   "openEnums": [
-    "Session.status",
-    "Plan.status",
-    "PlanActionResponse.status",
-    "CreateTurnResponse.status",
-    "ShadowComparisonTurn.status",
-    "Automation.status",
-    "AutomationRun.status",
-    "AutomationInvocation.status",
-    "WorkflowRun.status",
-    "WorkflowStepRun.status",
-    "WorkflowStepDecideResponse.runStatus",
-    "WorkflowStepDecideResponse.stepRunStatus"
+    "#/$defs/Session/properties/status",
+    "#/$defs/Plan/properties/status",
+    "#/$defs/PlanActionResponse/properties/status",
+    "#/$defs/CreateTurnResponse/properties/status",
+    "#/$defs/ShadowComparisonTurn/properties/status",
+    "#/$defs/Automation/properties/status",
+    "#/$defs/AutomationRun/properties/status",
+    "#/$defs/AutomationInvocation/properties/status",
+    "#/$defs/WorkflowRun/properties/status",
+    "#/$defs/WorkflowStepRun/properties/status",
+    "#/$defs/WorkflowStepDecideResponse/properties/runStatus",
+    "#/$defs/WorkflowStepDecideResponse/properties/stepRunStatus"
   ]
 }

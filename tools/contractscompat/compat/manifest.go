@@ -106,8 +106,14 @@ func DefDirections(directive string, baseDefs, headDefs map[string]any) (map[str
 		return out, nil
 	}
 
-	baseReach := reachabilityByCategory(baseDefs)
-	headReach := reachabilityByCategory(headDefs)
+	baseReach, err := reachabilityByCategory(baseDefs)
+	if err != nil {
+		return nil, err
+	}
+	headReach, err := reachabilityByCategory(headDefs)
+	if err != nil {
+		return nil, err
+	}
 
 	out := make(map[string]Direction, len(names))
 	for n := range names {
@@ -160,11 +166,13 @@ func suffixCategory(name string) Direction {
 // root categories (DirP2C/DirC2P, by suffix) that can reach it via a
 // transitive $ref chain -- including itself, trivially, under its own
 // suffix category.
-func reachabilityByCategory(defs map[string]any) map[string]map[Direction]bool {
+func reachabilityByCategory(defs map[string]any) (map[string]map[Direction]bool, error) {
 	edges := make(map[string][]string, len(defs))
 	for name, node := range defs {
 		refs := map[string]bool{}
-		collectRefs(node, refs)
+		if err := collectRefs(node, refs); err != nil {
+			return nil, failClosed("fc-ref-sibling-reachability", "#/$defs/"+jsonPointerEscape(name), "%v", err)
+		}
 		for r := range refs {
 			edges[name] = append(edges[name], r)
 		}
@@ -196,42 +204,71 @@ func reachabilityByCategory(defs map[string]any) map[string]map[Direction]bool {
 			}
 		}
 	}
-	return result
+	return result, nil
 }
 
 // collectRefs gathers every $ref target name reachable by walking node's
 // own schema-shaped structure (properties/items/oneOf/anyOf/
 // additionalProperties), stopping at each $ref itself -- the def IT names
 // is a separate node in the defs map, visited on its own turn.
-func collectRefs(node any, out map[string]bool) {
+//
+// A $ref node may carry no schema-position sibling at all (ref.go's
+// refAllowedSiblingKeys permits only "description" beside "$ref", and
+// walkSchema has already fail-closed on anything else, for BOTH base and
+// head, before reachability ever runs -- see DiffSurface's own call
+// order). So there is structurally nothing left to walk into once a $ref
+// is found; this function's own early `return` after recording it is
+// correct BY CONSTRUCTION, not by omission (that was D2/D8/D11's actual
+// bug: this function used to return early while the diff engine still
+// treated properties/items/etc. beside a $ref as live, comparable
+// content, so a def reached only through such a sibling was invisible to
+// reachability). The loop below is the assertion that backs that
+// construction: it FAILS CLOSED if a $ref node is ever found carrying one
+// of these sibling keywords anyway, rather than silently mis-scoping
+// reachability the way the pre-fix code did.
+func collectRefs(node any, out map[string]bool) error {
 	obj, ok := node.(map[string]any)
 	if !ok {
-		return
+		return nil
 	}
 	if ref, ok := obj["$ref"].(string); ok {
 		if name, err := localRefTarget(ref); err == nil {
 			out[name] = true
 		}
-		return
+		for _, kw := range []string{"properties", "items", "oneOf", "anyOf", "additionalProperties"} {
+			if _, has := obj[kw]; has {
+				return fmt.Errorf("$ref node unexpectedly carries schema-position sibling %q -- walkSchema's $ref-sibling guard should already have rejected this", kw)
+			}
+		}
+		return nil
 	}
 	if props, ok := obj["properties"].(map[string]any); ok {
 		for _, v := range props {
-			collectRefs(v, out)
+			if err := collectRefs(v, out); err != nil {
+				return err
+			}
 		}
 	}
 	if items, ok := obj["items"]; ok {
-		collectRefs(items, out)
+		if err := collectRefs(items, out); err != nil {
+			return err
+		}
 	}
 	for _, kw := range []string{"oneOf", "anyOf"} {
 		if arr, ok := obj[kw].([]any); ok {
 			for _, v := range arr {
-				collectRefs(v, out)
+				if err := collectRefs(v, out); err != nil {
+					return err
+				}
 			}
 		}
 	}
 	if ap, ok := obj["additionalProperties"]; ok {
 		if _, isBool := ap.(bool); !isBool {
-			collectRefs(ap, out)
+			if err := collectRefs(ap, out); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }

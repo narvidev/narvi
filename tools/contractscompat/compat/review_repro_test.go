@@ -118,9 +118,22 @@ func TestReviewRepro_C4_RequiredEntryWithNoPropertyFailsClosed(t *testing.T) {
 	}
 }
 
-// C5/C8: keywords sitting BESIDE a $ref (siblings) must be diffed, not
-// silently dropped when the $ref itself is unchanged.
-func TestReviewRepro_C5_SiblingKeywordsBesideUnchangedRefAreDiffed(t *testing.T) {
+// C5/C8, SUPERSEDED by the round-2 review (D1/D3/D4/D5/D7/D21 and
+// friends): round 1 fixed "a sibling beside $ref is silently dropped" by
+// MODELING draft 2020-12's $ref-plus-siblings conjunction (merging
+// "required"/"properties" as a union, letting every other sibling
+// override the target's value). Round 2 found that override/merge model
+// itself kept being wrong in a new way every time (a wrapper alias def's
+// own siblings dropped on a retarget, a sibling "properties" shadowing a
+// stricter target one, a sibling "additionalProperties: false" merging
+// away to a no-op...). This repo's own five schema files never need the
+// general case (every real $ref sibling is "description"), so the fix is
+// now to make any OTHER sibling illegal -- FAIL CLOSED, not modeled --
+// per ref.go's refAllowedSiblingKeys. These two tests now pin exactly
+// that: the same "required"/"minLength" siblings beside an unchanged
+// $ref that round 1 taught the checker to MERGE now instead make it
+// refuse to classify at all.
+func TestReviewRepro_C5_SiblingKeywordsBesideUnchangedRefFailClosed(t *testing.T) {
 	baseDefs := map[string]any{
 		"Wrapper": schemaObj("type", "object", "properties", schemaObj(
 			"digest", schemaObj("$ref", "#/$defs/Digest"),
@@ -132,23 +145,24 @@ func TestReviewRepro_C5_SiblingKeywordsBesideUnchangedRefAreDiffed(t *testing.T)
 	headDefs := map[string]any{
 		"Wrapper": schemaObj("type", "object", "properties", schemaObj(
 			// same $ref, but a "required" sibling now added directly on
-			// the referencing node -- archDecisions moves into required.
+			// the referencing node -- the exact D1/D7 wrapper shape.
 			"digest", schemaObj("$ref", "#/$defs/Digest", "required", []any{"archDecisions"}),
 		)),
 		"Digest": schemaObj("type", "object", "properties", schemaObj(
 			"archDecisions", schemaObj("type", "string"),
 		)),
 	}
-	findings, err := DiffDef(baseDefs, headDefs, "Wrapper", DirC2P, nil)
-	if err != nil {
-		t.Fatalf("DiffDef: %v", err)
+	_, err := DiffDef(baseDefs, headDefs, "Wrapper", DirC2P, nil)
+	fc, ok := err.(*FailClosedError)
+	if !ok {
+		t.Fatalf("want *FailClosedError for a disallowed $ref sibling, got err=%v", err)
 	}
-	if !containsFinding(findings, "4", SeverityMajor) {
-		t.Fatalf("a required-name added beside an unchanged $ref must be classified (row 4, MAJOR on C2P), got: %+v", findings)
+	if fc.Finding.Severity != SeverityFailClosed {
+		t.Fatalf("want SeverityFailClosed, got %v", fc.Finding.Severity)
 	}
 }
 
-func TestReviewRepro_C8_ConstraintAddedBesideRefIsMajor(t *testing.T) {
+func TestReviewRepro_C8_ConstraintAddedBesideRefFailClosed(t *testing.T) {
 	baseDefs := map[string]any{
 		"Wrapper": schemaObj("type", "object", "properties", schemaObj(
 			"digest", schemaObj("$ref", "#/$defs/Digest"),
@@ -161,12 +175,13 @@ func TestReviewRepro_C8_ConstraintAddedBesideRefIsMajor(t *testing.T) {
 		)),
 		"Digest": schemaObj("type", "string"),
 	}
-	findings, err := DiffDef(baseDefs, headDefs, "Wrapper", DirC2P, nil)
-	if err != nil {
-		t.Fatalf("DiffDef: %v", err)
+	_, err := DiffDef(baseDefs, headDefs, "Wrapper", DirC2P, nil)
+	fc, ok := err.(*FailClosedError)
+	if !ok {
+		t.Fatalf("want *FailClosedError for a disallowed $ref sibling, got err=%v", err)
 	}
-	if !containsFinding(findings, "18", SeverityMajor) {
-		t.Fatalf("minLength added beside an unchanged $ref must be classified (row 18, MAJOR on C2P), got: %+v", findings)
+	if fc.Finding.Severity != SeverityFailClosed {
+		t.Fatalf("want SeverityFailClosed, got %v", fc.Finding.Severity)
 	}
 }
 

@@ -2,7 +2,6 @@ package compat
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 )
 
@@ -35,18 +34,64 @@ func jsonPointerUnescape(s string) string {
 	return s
 }
 
+// refAllowedSiblingKeys is the CLOSED set of keywords a node carrying
+// "$ref" may carry besides it. In draft 2020-12, $ref is a CONJUNCTION
+// with its siblings (they are ANDed together), not an override -- every
+// earlier attempt to MODEL that conjunction (merging "required"/
+// "properties" as a union, letting every other keyword override the
+// target's own value) kept getting the semantics wrong in a new way each
+// review round (a wrapper def's own siblings dropped on a retarget, a
+// sibling "properties" shadowing the target's stricter one, a sibling
+// "additionalProperties: false" merging away to a no-op...). This repo's
+// own five schema files never need the general case: every "$ref" sibling
+// in them, at HEAD and at origin/main alike, is "description" and nothing
+// else (verified by hand across all five files before writing this rule).
+// So instead of modelling the conjunction, this checker refuses to: a
+// "$ref" node may carry AT MOST "description" besides it (a pure
+// annotation, diffed on its own -- see diffRefSiblingDescription -- never
+// a wire constraint). Anything else FAILS CLOSED, naming the pointer, on
+// either side of the diff.
+var refAllowedSiblingKeys = map[string]bool{
+	"description": true,
+}
+
+// checkRefSiblings validates that obj, a node known to carry "$ref", has
+// no sibling keyword besides what refAllowedSiblingKeys permits. Called
+// both by resolve (for every node it dereferences, including every def
+// along an alias chain) and directly by diffNode for the RETARGETED path
+// (diffRetargetedRef resolves each side's DEF content, never the raw
+// referencing node itself, so diffNode checks the referencing node's own
+// siblings up front instead) -- so DiffDef stays a robust, independently
+// correct entry point even when called directly, the way this package's
+// own tests already do, rather than depending on walkSchema having run
+// first (walkSchema does also enforce this, structurally, for every real
+// PR that goes through DiffSurface/Compare -- this is belt-and-suspenders
+// for the lower-level entry point, the same reasoning behind
+// diffResolved's own exhaustiveness assertion and collectRefs' sibling
+// assert).
+func checkRefSiblings(obj map[string]any) error {
+	for k := range obj {
+		if k != "$ref" && !refAllowedSiblingKeys[k] {
+			return fmt.Errorf("$ref node carries disallowed sibling keyword %q (only \"description\" may accompany $ref -- $ref is a conjunction in draft 2020-12, and this checker refuses to model that instead of getting it wrong)", k)
+		}
+	}
+	return nil
+}
+
 // resolver dereferences $ref nodes against one file's own $defs map, with
 // a cycle guard (a def that (directly or transitively) $refs itself would
-// otherwise recurse forever -- none of today's schemas do this, but a
-// future one might, and silently stack-overflowing is a worse failure
-// mode than fail-closing).
+// otherwise recurse forever -- see diffCtx.visitOnce for the SEPARATE
+// guard against unbounded recursion through a self-referencing def's own
+// properties/items, which this cycle guard does not cover since it only
+// ever sees one $ref-to-$ref chain at a time).
 type resolver struct {
 	defs map[string]any
 }
 
 // resolve follows node's $ref chain (if any) to a concrete schema node
-// (object or bool). A node with no $ref is returned unchanged. path
-// accumulates the def names visited, for the cycle-guard message.
+// (an object; never a boolean -- see resolveDef). A node with no $ref is
+// returned unchanged. path accumulates the def names visited, for the
+// cycle-guard message.
 func (r resolver) resolve(node any, path []string) (any, error) {
 	obj, ok := node.(map[string]any)
 	if !ok {
@@ -56,6 +101,9 @@ func (r resolver) resolve(node any, path []string) (any, error) {
 	if !ok {
 		return node, nil
 	}
+	if err := checkRefSiblings(obj); err != nil {
+		return nil, err
+	}
 	s, ok := raw.(string)
 	if !ok {
 		return nil, fmt.Errorf("$ref must be a string")
@@ -64,6 +112,20 @@ func (r resolver) resolve(node any, path []string) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	return r.resolveDef(name, path)
+}
+
+// resolveDef looks up name in r.defs and follows any further $ref chain
+// from there, applying the exact same rules a live "$ref": name node
+// would: cycle detection, and FAIL-CLOSED if the def that name names is
+// itself the boolean schema literal true/false (a "$ref" to a boolean
+// schema has no content to merge with the referencing node's own
+// siblings, and silently treating it as the empty object `{}` would
+// invert `false`'s "reject everything" into "accept everything" --
+// callers that legitimately want a bare boolean $defs entry as a node's
+// OWN value, never referenced via $ref, still get one: this rejection
+// only fires when resolving THROUGH a $ref).
+func (r resolver) resolveDef(name string, path []string) (any, error) {
 	for _, seen := range path {
 		if seen == name {
 			return nil, fmt.Errorf("$ref cycle detected: %s -> %s", strings.Join(path, " -> "), name)
@@ -72,6 +134,9 @@ func (r resolver) resolve(node any, path []string) (any, error) {
 	target, ok := r.defs[name]
 	if !ok {
 		return nil, fmt.Errorf("$ref target %q not found in $defs", name)
+	}
+	if _, isBool := target.(bool); isBool {
+		return nil, fmt.Errorf("$ref target %q is the boolean schema literal, which is not supported behind a $ref", name)
 	}
 	return r.resolve(target, append(path, name))
 }
@@ -98,112 +163,4 @@ func refTargetName(node any) string {
 		return ""
 	}
 	return name
-}
-
-// effectiveNode computes the schema a node with (or without) a $ref
-// actually enforces: the $ref target's own resolved content (if any),
-// overlaid by every SIBLING keyword on the raw node itself. Draft
-// 2020-12 applies a $ref together with its siblings (they are ANDed
-// together), so a node like {"$ref": "#/$defs/Digest", "required":
-// ["archDecisions"]} must be diffed as Digest's own content PLUS the
-// sibling constraint, never as Digest alone -- silently dropping the
-// siblings (the bug this replaces) hid every compatibility break a PR
-// introduced next to a $ref (C5, C8).
-//
-// resolved is always a map (callers only invoke this once they know the
-// $ref-resolved value is an object, never the boolean schema literals
-// true/false -- see diffNode, which handles that case itself before ever
-// calling effectiveNode, precisely because collapsing `false` into the
-// empty object `{}` here would silently turn "reject everything" into
-// "accept everything").
-//
-// "required" and "properties" are merged as a UNION (both the target's
-// names/keys and the sibling's own apply together, matching $ref's real
-// AND semantics). Every other sibling keyword OVERRIDES the target's own
-// value. That is not a full JSON Schema intersection (a sibling `type`
-// narrower than the target's own `type` should, strictly, become the
-// intersection of the two, not simply replace it) -- but this checker
-// only needs to classify a CHANGE between two already-merged views, not
-// evaluate a schema against data, and overriding still correctly detects
-// "a constraint was added or changed here" for every case in this
-// repo's own corpus and the review's own reproductions.
-func effectiveNode(resolved map[string]any, raw any) map[string]any {
-	out := make(map[string]any, len(resolved))
-	for k, v := range resolved {
-		out[k] = v
-	}
-	rawObj, ok := raw.(map[string]any)
-	if !ok {
-		return out
-	}
-	for k, v := range rawObj {
-		switch k {
-		case "$ref":
-			continue
-		case "required":
-			out["required"] = unionStringArrays(out["required"], v)
-		case "properties":
-			out["properties"] = unionPropertyMaps(out["properties"], v)
-		default:
-			out[k] = v
-		}
-	}
-	return out
-}
-
-// unionStringArrays merges two JSON-decoded ([]any of string) arrays into
-// one deduplicated, sorted []any -- used to union a $ref target's own
-// "required" list with a sibling "required" list on the same node.
-// Non-string elements (which validateTypeShape/walkSchema's own
-// "required" shape check would already have fail-closed on, elsewhere)
-// are simply skipped rather than panicking.
-func unionStringArrays(a, b any) []any {
-	seen := map[string]bool{}
-	var names []string
-	add := func(v any) {
-		arr, _ := v.([]any)
-		for _, el := range arr {
-			s, ok := el.(string)
-			if !ok || seen[s] {
-				continue
-			}
-			seen[s] = true
-			names = append(names, s)
-		}
-	}
-	add(a)
-	add(b)
-	if len(names) == 0 {
-		return nil
-	}
-	sort.Strings(names)
-	out := make([]any, len(names))
-	for i, n := range names {
-		out[i] = n
-	}
-	return out
-}
-
-// unionPropertyMaps merges two "properties" objects (map[string]any) into
-// one, keyed by property name -- used to union a $ref target's own
-// declared properties with any the sibling node declares directly. On a
-// name collision the sibling's own schema wins (this repo's real schemas
-// never declare "properties" directly beside a "$ref" today, so this is a
-// defensive default, not something any real fixture exercises).
-func unionPropertyMaps(a, b any) map[string]any {
-	out := map[string]any{}
-	if am, ok := a.(map[string]any); ok {
-		for k, v := range am {
-			out[k] = v
-		}
-	}
-	if bm, ok := b.(map[string]any); ok {
-		for k, v := range bm {
-			out[k] = v
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
 }
