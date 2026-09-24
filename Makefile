@@ -1,6 +1,6 @@
 .PHONY: build vet fmt tidy lint lint-web-assets test test-integration \
 	test-integration-group-1 test-integration-group-2 test-integration-group-3 test-integration-group-4 \
-	contracts-generate contracts-check dev \
+	contracts-generate contracts-check contracts-compat dev \
 	web-typecheck web-lint web-check-dto-types web-test web-build web-check dist \
 	verify-control-plane-image
 
@@ -266,6 +266,40 @@ contracts-check:
 	fi; \
 	rm -rf "$$tmp"
 	cd contracts && npm run typecheck
+
+# contracts-compat (§6.3, technical plan's "make /contracts a stable
+# external API") is the CI gate that FAILS a breaking wire-contract
+# change rather than merely reporting one. BASE defaults to the
+# merge-base with origin/main -- the CI job (contracts-compat in
+# .github/workflows/ci.yml) passes an already-computed BASE sha instead
+# (its own comment covers why: a PR's own merge-base moves once, at PR
+# open/rebase time, but a push to main needs the PREVIOUS main tip, which
+# is a different computation `git merge-base origin/main HEAD` cannot
+# make from inside a push event).
+#
+# `git archive BASE contracts controlplane/testdata/routes.golden | tar -x`
+# is the ONLY git operation anywhere in this pipeline, and it lives here,
+# in the Makefile, deliberately: tools/lint/narvichecks/execimportban
+# forbids "os/exec" anywhere under tools/ (outside the sandbox/outbound
+# trees §30.3 already carves out), so tools/contractscompat itself never
+# shells out -- it only ever reads two already-extracted directories plus
+# two already-identified routes.golden files, both passed in by path.
+#
+# An empty extracted BASE directory (a botched archive, or BASE resolving
+# to a commit that predates /contracts entirely) is a hard error inside
+# the tool itself (compat.Compare's own vacuous-pass guard), never
+# silently "no findings" -- see tools/contractscompat/compat's own
+# package documentation.
+contracts-compat:
+	@base="$${BASE:-$$(git merge-base origin/main HEAD)}"; \
+	tmp="$$(mktemp -d)"; \
+	git archive "$$base" contracts controlplane/testdata/routes.golden | tar -x -C "$$tmp"; \
+	go run ./tools/contractscompat \
+		--base "$$tmp/contracts" --head contracts \
+		--routes-base "$$tmp/controlplane/testdata/routes.golden" --routes-head controlplane/testdata/routes.golden; \
+	status=$$?; \
+	rm -rf "$$tmp"; \
+	exit $$status
 
 # web-* targets (§12.1, "ui bootstrap"): the frontend's own equivalent of
 # vet/lint/test/build above, over web/ (Vite + React + TanStack Query/

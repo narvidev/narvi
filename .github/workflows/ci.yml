@@ -216,6 +216,72 @@ jobs:
   # those targets for how group 4 (the catch-all for everything not
   # explicitly bin-packed into 1-3) is computed, so a newly added package
   # is never silently skipped.
+  # contracts-compat (§6.3, technical plan's "make /contracts a stable
+  # external API") is the required CI gate that classifies every change
+  # under /contracts and controlplane/testdata/routes.golden against the
+  # closed rule table in contracts/COMPATIBILITY.md and FAILS the build on
+  # a MAJOR (or fail-closed) finding, rather than merely reporting one --
+  # see tools/contractscompat/compat's own package documentation for the
+  # mechanism. fetch-depth 0 is required: the Makefile target computes a
+  # real merge-base with `git merge-base`, which needs full history, not
+  # the default single-commit checkout every other job here uses.
+  #
+  # BASE/HEAD are threaded through env vars, never interpolated directly
+  # into a shell body (this workflow's own commit-scope job already
+  # establishes that convention, for the same shell-injection reason). On
+  # a pull_request, BASE is the PR's own base sha -- the point this branch
+  # forked from, which is what a reviewer actually wants "did this PR
+  # introduce a breaking change" measured against, even after a rebase.
+  # On a push (to main; see the on.push trigger above), there is no PR
+  # base sha at all, so BASE is github.event.before, the previous tip of
+  # the branch that was just pushed -- EXCEPT the very first push of a new
+  # branch (or a history rewrite) reports that as the all-zeros sha, which
+  # is not a commit `git merge-base` can resolve at all; that case is
+  # logged and skipped rather than failed, since there is no prior state
+  # to compare against.
+  contracts-compat:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Determine base sha (or skip)
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "sha=$PR_BASE_SHA" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif [ "$PUSH_BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "::notice::push before-sha is the all-zeros sha (first push of a new branch, or a history rewrite) -- skipping contracts-compat, there is no prior state to compare against"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=$PUSH_BEFORE_SHA" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Contracts compatibility check
+        if: steps.base.outputs.skip != 'true'
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          merge_base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+          make contracts-compat BASE="$merge_base"
+
   test-integration:
     needs: checks
     runs-on: ubuntu-latest

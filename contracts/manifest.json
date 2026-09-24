@@ -1,0 +1,44 @@
+{
+  "version": "1.0.0",
+  "surfaces": [
+    {
+      "path": "rest/v1/dtos.schema.json",
+      "direction": "by-suffix",
+      "status": "current"
+    },
+    {
+      "path": "client-ws/v1/protocol.schema.json",
+      "direction": "by-suffix",
+      "status": "current"
+    },
+    {
+      "path": "sandbox-ws/v1/commands.schema.json",
+      "direction": "platform-to-client",
+      "status": "current"
+    },
+    {
+      "path": "sandbox-ws/v1/events.schema.json",
+      "direction": "both",
+      "status": "current"
+    },
+    {
+      "path": "session-config/v1/session-config.schema.json",
+      "direction": "platform-to-client",
+      "status": "current"
+    }
+  ],
+  "openEnums": [
+    "rest/v1/dtos.schema.json#/$defs/Session/properties/status",
+    "rest/v1/dtos.schema.json#/$defs/Plan/properties/status",
+    "rest/v1/dtos.schema.json#/$defs/PlanActionResponse/properties/status",
+    "rest/v1/dtos.schema.json#/$defs/CreateTurnResponse/properties/status",
+    "rest/v1/dtos.schema.json#/$defs/ShadowComparisonTurn/properties/status",
+    "rest/v1/dtos.schema.json#/$defs/Automation/properties/status",
+    "rest/v1/dtos.schema.json#/$defs/AutomationRun/properties/status",
+    "rest/v1/dtos.schema.json#/$defs/AutomationInvocation/properties/status",
+    "rest/v1/dtos.schema.json#/$defs/WorkflowRun/properties/status",
+    "rest/v1/dtos.schema.json#/$defs/WorkflowStepRun/properties/status",
+    "rest/v1/dtos.schema.json#/$defs/WorkflowStepDecideResponse/properties/runStatus",
+    "rest/v1/dtos.schema.json#/$defs/WorkflowStepDecideResponse/properties/stepRunStatus"
+  ]
+}
