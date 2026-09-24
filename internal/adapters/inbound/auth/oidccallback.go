@@ -30,19 +30,20 @@ type OIDCCallbackOutcome string
 // The full outcome table (see NewOIDCCallbackHandler's own doc comment
 // for the complete branch-by-branch writeup).
 const (
-	OIDCOutcomeReturningUser    OIDCCallbackOutcome = "oidc_returning_user"
-	OIDCOutcomeAutoLinked       OIDCCallbackOutcome = "oidc_auto_linked"
-	OIDCOutcomeFirstTimeAllowed OIDCCallbackOutcome = "oidc_first_time_allowed"
-	OIDCOutcomeFirstTimeDenied  OIDCCallbackOutcome = "oidc_first_time_denied"
-	OIDCOutcomeAmbiguousMatch   OIDCCallbackOutcome = "oidc_ambiguous_match"
-	OIDCOutcomeStateMismatch    OIDCCallbackOutcome = "oidc_state_mismatch"
-	OIDCOutcomeExchangeFailed   OIDCCallbackOutcome = "oidc_exchange_failed"
-	OIDCOutcomeMissingIDToken   OIDCCallbackOutcome = "oidc_missing_id_token"
-	OIDCOutcomeVerifyFailed     OIDCCallbackOutcome = "oidc_verify_failed"
-	OIDCOutcomeEmptySubject     OIDCCallbackOutcome = "oidc_empty_subject"
-	OIDCOutcomeNonceMismatch    OIDCCallbackOutcome = "oidc_nonce_mismatch"
-	OIDCOutcomeAudienceMismatch OIDCCallbackOutcome = "oidc_audience_mismatch"
-	OIDCOutcomeEmailNotVerified OIDCCallbackOutcome = "oidc_email_not_verified"
+	OIDCOutcomeReturningUser        OIDCCallbackOutcome = "oidc_returning_user"
+	OIDCOutcomeAutoLinked           OIDCCallbackOutcome = "oidc_auto_linked"
+	OIDCOutcomeFirstTimeAllowed     OIDCCallbackOutcome = "oidc_first_time_allowed"
+	OIDCOutcomeFirstTimeDenied      OIDCCallbackOutcome = "oidc_first_time_denied"
+	OIDCOutcomeAmbiguousMatch       OIDCCallbackOutcome = "oidc_ambiguous_match"
+	OIDCOutcomeSameProviderConflict OIDCCallbackOutcome = "oidc_same_provider_conflict"
+	OIDCOutcomeStateMismatch        OIDCCallbackOutcome = "oidc_state_mismatch"
+	OIDCOutcomeExchangeFailed       OIDCCallbackOutcome = "oidc_exchange_failed"
+	OIDCOutcomeMissingIDToken       OIDCCallbackOutcome = "oidc_missing_id_token"
+	OIDCOutcomeVerifyFailed         OIDCCallbackOutcome = "oidc_verify_failed"
+	OIDCOutcomeEmptySubject         OIDCCallbackOutcome = "oidc_empty_subject"
+	OIDCOutcomeNonceMismatch        OIDCCallbackOutcome = "oidc_nonce_mismatch"
+	OIDCOutcomeAudienceMismatch     OIDCCallbackOutcome = "oidc_audience_mismatch"
+	OIDCOutcomeEmailNotVerified     OIDCCallbackOutcome = "oidc_email_not_verified"
 )
 
 // auditActionForOIDCOutcome names the audit_log action recorded for each
@@ -446,6 +447,18 @@ type oidcResolveDeps struct {
 // value.
 const auditActionOIDCAmbiguousMatch = "identity.oidc_ambiguous_match"
 
+// auditActionOIDCSameProviderConflict is the audit_log action recorded
+// when a first-time OIDC sign-in's verified email matches exactly one
+// existing user who ALREADY has a (same-issuer) OIDC identity (review
+// round 2, findings P2/P3) -- refused rather than merged, see
+// resolveFirstTimeIdentity's own identityConflictsWithExistingProvider
+// doc comment. Deliberately NOT added to auditActionForOIDCOutcome
+// above: its own audit row is already written inside
+// resolveFirstTimeIdentity itself (exactly like
+// auditActionOIDCAmbiguousMatch's), so auditOIDCRefusal must stay a
+// no-op for this outcome to avoid a second, duplicate row.
+const auditActionOIDCSameProviderConflict = "identity.oidc_already_linked"
+
 // resolveOIDCUser implements this file's own steps after the ID token is
 // fully verified: returning-user fast path, then -- for a genuinely new
 // identity -- resolveFirstTimeIdentity's own shared §13.2 step 3 graph
@@ -491,7 +504,7 @@ func resolveOIDCUser(ctx context.Context, deps oidcResolveDeps, externalID, emai
 		})
 	}
 
-	userID, outcome, err := resolveFirstTimeIdentity(ctx, firstTimeDeps, sqlcgen.IdentityProviderOidc, externalID, email, nil, auditActionOIDCAmbiguousMatch, checkAllowed, createFirstTime)
+	userID, outcome, err := resolveFirstTimeIdentity(ctx, firstTimeDeps, sqlcgen.IdentityProviderOidc, externalID, email, nil, auditActionOIDCAmbiguousMatch, auditActionOIDCSameProviderConflict, checkAllowed, createFirstTime)
 	if err != nil {
 		return pgtype.UUID{}, "", http.StatusInternalServerError, "internal error"
 	}
@@ -503,6 +516,12 @@ func resolveOIDCUser(ctx context.Context, deps oidcResolveDeps, externalID, emai
 		return userID, OIDCOutcomeFirstTimeAllowed, 0, ""
 	case firstTimeDenied:
 		return pgtype.UUID{}, OIDCOutcomeFirstTimeDenied, http.StatusForbidden, "not authorized to sign up"
+	case firstTimeSameProviderConflict:
+		// Review round 2, findings P2/P3: already audited (its own action
+		// string) inside resolveFirstTimeIdentity above -- see
+		// auditActionOIDCSameProviderConflict's own doc comment for why
+		// auditOIDCRefusal must stay a no-op for this outcome.
+		return pgtype.UUID{}, OIDCOutcomeSameProviderConflict, http.StatusForbidden, "not authorized to sign up"
 	default: // firstTimeAmbiguous
 		// §13.2's own "never guess" rule, and (unlike Slack/Linear) this
 		// live sign-in has no bot-attribution fallback to defer to; see

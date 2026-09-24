@@ -54,14 +54,15 @@ type CallbackOutcome string
 // The full outcome table (see doc.go for the complete branch-by-branch
 // writeup).
 const (
-	OutcomeReturningUser    CallbackOutcome = "returning_user"
-	OutcomeAutoLinked       CallbackOutcome = "auto_linked"
-	OutcomeFirstTimeAllowed CallbackOutcome = "first_time_allowed"
-	OutcomeFirstTimeDenied  CallbackOutcome = "first_time_denied"
-	OutcomeAmbiguousMatch   CallbackOutcome = "ambiguous_match"
-	OutcomeNoVerifiedEmail  CallbackOutcome = "no_verified_email"
-	OutcomeStateMismatch    CallbackOutcome = "state_mismatch"
-	OutcomeExchangeFailed   CallbackOutcome = "exchange_failed"
+	OutcomeReturningUser        CallbackOutcome = "returning_user"
+	OutcomeAutoLinked           CallbackOutcome = "auto_linked"
+	OutcomeFirstTimeAllowed     CallbackOutcome = "first_time_allowed"
+	OutcomeFirstTimeDenied      CallbackOutcome = "first_time_denied"
+	OutcomeAmbiguousMatch       CallbackOutcome = "ambiguous_match"
+	OutcomeSameProviderConflict CallbackOutcome = "same_provider_conflict"
+	OutcomeNoVerifiedEmail      CallbackOutcome = "no_verified_email"
+	OutcomeStateMismatch        CallbackOutcome = "state_mismatch"
+	OutcomeExchangeFailed       CallbackOutcome = "exchange_failed"
 )
 
 // auditActionGitHubAmbiguousMatch is the audit_log action recorded when a
@@ -72,6 +73,14 @@ const (
 // provider's sign-in attempt hit the "never guess" refusal without
 // having to cross-reference detail_json's own "provider" key.
 const auditActionGitHubAmbiguousMatch = "identity.github_ambiguous_match"
+
+// auditActionGitHubSameProviderConflict is the audit_log action recorded
+// when a first-time GitHub sign-in's verified email matches exactly one
+// existing user who ALREADY has a (different) github identity (review
+// round 2, findings P2/P3) -- refused rather than merged, see
+// resolveFirstTimeIdentity's own identityConflictsWithExistingProvider
+// doc comment.
+const auditActionGitHubSameProviderConflict = "identity.github_already_linked"
 
 // NewCallbackHandler backs GET /auth/github/callback (§13.1/§13.2/§13.4).
 // See doc.go for the complete outcome table this flow implements.
@@ -270,7 +279,7 @@ func NewCallbackHandler(
 				auditLog:    auditLog,
 				linkPrompts: linkPrompts,
 			}
-			resolvedUserID, outcome, resolveErr := resolveFirstTimeIdentity(ctx, firstTimeDeps, sqlcgen.IdentityProviderGithub, externalID, verifiedEmail, encryptedToken, auditActionGitHubAmbiguousMatch, checkAllowed, createFirstTime)
+			resolvedUserID, outcome, resolveErr := resolveFirstTimeIdentity(ctx, firstTimeDeps, sqlcgen.IdentityProviderGithub, externalID, verifiedEmail, encryptedToken, auditActionGitHubAmbiguousMatch, auditActionGitHubSameProviderConflict, checkAllowed, createFirstTime)
 			if resolveErr != nil {
 				logger.Error("auth: create user+identity failed", "error", resolveErr)
 				http.Error(w, "internal error", http.StatusInternalServerError)
@@ -290,6 +299,14 @@ func NewCallbackHandler(
 				// information an attacker could use to probe the
 				// allowlist's own configuration.
 				logger.Warn("auth: oauth callback rejected", "outcome", OutcomeFirstTimeDenied)
+				http.Error(w, "not authorized to sign up", http.StatusForbidden)
+				return
+			case firstTimeSameProviderConflict:
+				// Review round 2, findings P2/P3: already audited (its own
+				// action string) inside resolveFirstTimeIdentity above --
+				// same generic public body as every other refusal in this
+				// class, never distinguishing WHY.
+				logger.Warn("auth: oauth callback rejected", "outcome", OutcomeSameProviderConflict)
 				http.Error(w, "not authorized to sign up", http.StatusForbidden)
 				return
 			default: // firstTimeAmbiguous
