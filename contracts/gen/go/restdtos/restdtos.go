@@ -265,6 +265,46 @@ func (j *AuditLogEntry) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// GET /auth/capabilities's own response body (technical plan §41.3, 'OIDC as a
+// second sign-in provider') -- the ONE public, UNAUTHENTICATED signal the sign-in
+// view needs before a visitor is signed in at all. Deliberately a SEPARATE shape
+// from CapabilitiesResponse immediately above, not an added field on it: that
+// response is a DIFFERENT read model entirely (§34's licensed-module
+// capabilities), mounted behind auth.Middleware and therefore unusable by a
+// signed-out visitor by construction -- conflating the two would either leak an
+// unauthenticated route into an authenticated-only contract's own documented
+// gating, or force every already-shipped CapabilitiesResponse consumer to handle a
+// field it can never actually need. Carries no secret and no licence-shaped fact
+// of any kind, only whether a sign-in provider is configured.
+type AuthCapabilitiesResponse struct {
+	// Whether this deployment has a generic OIDC SSO provider configured
+	// (platform.Config.OIDCIssuer non-empty --
+	// NARVI_OIDC_ISSUER/CLIENT_ID/CLIENT_SECRET are all-or-none, so this one boolean
+	// fully answers the question). true means GET /auth/oidc/login is a real, mounted
+	// route; false means it is not mounted at all (a 404), and the sign-in view's own
+	// SSO button must stay disabled -- exactly as disabled as it was before this
+	// field existed.
+	OidcConfigured bool `json:"oidcConfigured" yaml:"oidcConfigured" mapstructure:"oidcConfigured"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *AuthCapabilitiesResponse) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["oidcConfigured"]; raw != nil && !ok {
+		return fmt.Errorf("field oidcConfigured in AuthCapabilitiesResponse: required")
+	}
+	type Plain AuthCapabilitiesResponse
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = AuthCapabilitiesResponse(plain)
+	return nil
+}
+
 // One automations row's own REST wire shape (migrations/000051_automations.up.sql,
 // extended by migrations/000055_automations_triggers_and_extras.up.sql '§8.4').
 // Returned by POST/GET/list.

@@ -292,6 +292,24 @@ type createUserAndIdentityParams struct {
 	initialAdminEmails []string
 }
 
+// resolveInitialRole implements §13.4's own "initial admins set by
+// config" rule: a verified email matching any entry in initialAdminEmails
+// (case-insensitive) becomes admin, every other first-time sign-in
+// defaults to member. Extracted out of createUserAndIdentity so
+// oidccallback.go's own generic-provider first-time-sign-in path
+// (createOIDCUserAndIdentity) applies the EXACT SAME role-assignment rule
+// GitHub sign-in always has, rather than a second, drifting copy of this
+// loop -- the plan's own §41.3 requirement ("the same default-role
+// assignment... as GitHub sign-in").
+func resolveInitialRole(verifiedEmail string, initialAdminEmails []string) sqlcgen.UserRole {
+	for _, adminEmail := range initialAdminEmails {
+		if strings.EqualFold(adminEmail, verifiedEmail) {
+			return sqlcgen.UserRoleAdmin
+		}
+	}
+	return sqlcgen.UserRoleMember
+}
+
 // createUserAndIdentity runs the first-time-sign-in write path: a users row
 // then an identities row, then a "user.created" audit_log row, in ONE
 // Postgres transaction (§13.1's own explicit requirement) so a failure
@@ -312,13 +330,7 @@ type createUserAndIdentityParams struct {
 // should be attributed to; there is simply no OTHER, distinct user to
 // attribute it to instead (a self-registration/self-authentication event).
 func createUserAndIdentity(ctx context.Context, pool *pgxpool.Pool, users *postgres.UserStore, identities *postgres.IdentityStore, auditLog *postgres.AuditLogStore, p createUserAndIdentityParams) (pgtype.UUID, error) {
-	role := sqlcgen.UserRoleMember
-	for _, adminEmail := range p.initialAdminEmails {
-		if strings.EqualFold(adminEmail, p.verifiedEmail) {
-			role = sqlcgen.UserRoleAdmin
-			break
-		}
-	}
+	role := resolveInitialRole(p.verifiedEmail, p.initialAdminEmails)
 
 	displayName := p.githubLogin
 	if p.githubName != "" {

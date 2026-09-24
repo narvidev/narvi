@@ -1696,6 +1696,59 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	))
 	router.Post("/auth/logout", auth.NewLogoutHandler(userSessionStore, secureCookies))
 
+	// /auth/oidc/login, /auth/oidc/callback (§41.3): the generic OIDC SSO
+	// provider, beside the GitHub pair immediately above -- mounted ONLY
+	// when cfg.OIDCIssuer is non-empty (platform.Load's own all-or-none
+	// validation means any ONE of the three OIDC_* vars being set implies
+	// all three are, oidcConfig.Configured()'s own doc comment). An
+	// unconfigured deployment gets NO route here at all -- not a handler
+	// that 404s or 503s on every request -- exactly mirroring §41.3's own
+	// "unset leaves the SSO button exactly as disabled as today" and this
+	// file's own established "absent config, absent route" precedent for
+	// every other optional surface (e.g. the ingress-disabled webhook
+	// routes below). oidcProviderCache is constructed unconditionally
+	// (cheap: no network call happens until the first real login/callback
+	// request) so httpapi.GetAuthCapabilities (below) can report
+	// oidcConfig.Configured() regardless of whether these two routes are
+	// mounted.
+	oidcConfig := auth.OIDCConfig{
+		Issuer:        cfg.OIDCIssuer,
+		ClientID:      cfg.OIDCClientID,
+		ClientSecret:  cfg.OIDCClientSecret,
+		PublicBaseURL: cfg.PublicBaseURL,
+	}
+	oidcProviderCache := auth.NewOIDCProviderCache(oidcConfig)
+	if oidcConfig.Configured() {
+		router.Get("/auth/oidc/login", auth.NewOIDCLoginHandler(oidcProviderCache, cfg.Timeouts, secureCookies))
+		router.Get("/auth/oidc/callback", auth.NewOIDCCallbackHandler(
+			pool,
+			oidcProviderCache,
+			userStore,
+			identityStore,
+			auditLogStore,
+			userSessionStore,
+			allowlist,
+			cfg.InitialAdminEmails,
+			cfg.Timeouts,
+			secureCookies,
+		))
+	}
+
+	// /auth/capabilities (§41.3): the ONE public, unauthenticated signal
+	// the sign-in view (web/src/routes/sign-in.tsx) needs before a visitor
+	// is signed in at all -- whether THIS deployment has OIDC configured,
+	// so the SSO button can be a real link instead of a permanently
+	// disabled one. GET /api/capabilities (httpapi/capabilities.go) is
+	// NOT this: that endpoint is a DIFFERENT read model entirely (§34's
+	// licensed-module capabilities: organization_governance/compliance/
+	// knowledge_retrieval), gated behind auth.Middleware -- unusable by a
+	// signed-out visitor by construction, and conceptually unrelated to
+	// sign-in provider configuration. This is deliberately its OWN small
+	// route, mounted OUTSIDE auth.Middleware like every other auth route
+	// on this page, rather than a new unauthenticated branch grafted onto
+	// that unrelated, already-shipped contract.
+	router.Get("/auth/capabilities", httpapi.GetAuthCapabilities(oidcConfig.Configured()))
+
 	// /auth/identity-link/{nonce}: the magic-link consume flow (
 	// "identities + full RBAC", §13.2 step 4's own "connect your account"
 	// link) -- deliberately mounted OUTSIDE auth.Middleware entirely, like

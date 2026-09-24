@@ -9,6 +9,18 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.1.0]
+
+### rest/v1/dtos.schema.json
+
+- Added: `AuthCapabilitiesResponse` (`oidcConfigured`) -- the response body
+  of a NEW public, unauthenticated route, `GET /auth/capabilities`
+  (technical plan §41.3, "OIDC as a second sign-in provider"), letting the
+  sign-in view learn whether this deployment has a generic OIDC SSO
+  provider configured before a visitor is signed in at all. A wholly new,
+  independent named shape, additive to this schema -- no existing shape
+  changed.
+
 ## [1.0.0]
 
 Baseline: `/contracts` becomes a versioned, policy-governed external API
