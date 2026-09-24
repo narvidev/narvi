@@ -2,6 +2,7 @@ package compat
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -97,4 +98,112 @@ func refTargetName(node any) string {
 		return ""
 	}
 	return name
+}
+
+// effectiveNode computes the schema a node with (or without) a $ref
+// actually enforces: the $ref target's own resolved content (if any),
+// overlaid by every SIBLING keyword on the raw node itself. Draft
+// 2020-12 applies a $ref together with its siblings (they are ANDed
+// together), so a node like {"$ref": "#/$defs/Digest", "required":
+// ["archDecisions"]} must be diffed as Digest's own content PLUS the
+// sibling constraint, never as Digest alone -- silently dropping the
+// siblings (the bug this replaces) hid every compatibility break a PR
+// introduced next to a $ref (C5, C8).
+//
+// resolved is always a map (callers only invoke this once they know the
+// $ref-resolved value is an object, never the boolean schema literals
+// true/false -- see diffNode, which handles that case itself before ever
+// calling effectiveNode, precisely because collapsing `false` into the
+// empty object `{}` here would silently turn "reject everything" into
+// "accept everything").
+//
+// "required" and "properties" are merged as a UNION (both the target's
+// names/keys and the sibling's own apply together, matching $ref's real
+// AND semantics). Every other sibling keyword OVERRIDES the target's own
+// value. That is not a full JSON Schema intersection (a sibling `type`
+// narrower than the target's own `type` should, strictly, become the
+// intersection of the two, not simply replace it) -- but this checker
+// only needs to classify a CHANGE between two already-merged views, not
+// evaluate a schema against data, and overriding still correctly detects
+// "a constraint was added or changed here" for every case in this
+// repo's own corpus and the review's own reproductions.
+func effectiveNode(resolved map[string]any, raw any) map[string]any {
+	out := make(map[string]any, len(resolved))
+	for k, v := range resolved {
+		out[k] = v
+	}
+	rawObj, ok := raw.(map[string]any)
+	if !ok {
+		return out
+	}
+	for k, v := range rawObj {
+		switch k {
+		case "$ref":
+			continue
+		case "required":
+			out["required"] = unionStringArrays(out["required"], v)
+		case "properties":
+			out["properties"] = unionPropertyMaps(out["properties"], v)
+		default:
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// unionStringArrays merges two JSON-decoded ([]any of string) arrays into
+// one deduplicated, sorted []any -- used to union a $ref target's own
+// "required" list with a sibling "required" list on the same node.
+// Non-string elements (which validateTypeShape/walkSchema's own
+// "required" shape check would already have fail-closed on, elsewhere)
+// are simply skipped rather than panicking.
+func unionStringArrays(a, b any) []any {
+	seen := map[string]bool{}
+	var names []string
+	add := func(v any) {
+		arr, _ := v.([]any)
+		for _, el := range arr {
+			s, ok := el.(string)
+			if !ok || seen[s] {
+				continue
+			}
+			seen[s] = true
+			names = append(names, s)
+		}
+	}
+	add(a)
+	add(b)
+	if len(names) == 0 {
+		return nil
+	}
+	sort.Strings(names)
+	out := make([]any, len(names))
+	for i, n := range names {
+		out[i] = n
+	}
+	return out
+}
+
+// unionPropertyMaps merges two "properties" objects (map[string]any) into
+// one, keyed by property name -- used to union a $ref target's own
+// declared properties with any the sibling node declares directly. On a
+// name collision the sibling's own schema wins (this repo's real schemas
+// never declare "properties" directly beside a "$ref" today, so this is a
+// defensive default, not something any real fixture exercises).
+func unionPropertyMaps(a, b any) map[string]any {
+	out := map[string]any{}
+	if am, ok := a.(map[string]any); ok {
+		for k, v := range am {
+			out[k] = v
+		}
+	}
+	if bm, ok := b.(map[string]any); ok {
+		for k, v := range bm {
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

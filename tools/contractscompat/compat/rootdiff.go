@@ -7,18 +7,24 @@ import (
 )
 
 // DiffSurface compares one schema FILE's base and head bytes end to end:
-// the keyword allowlist (fail-closed), the root's own $schema/$id/title/
-// description (rows 34-36), the $defs set (rows 31-32), every def present
-// on both sides (rows 1-30/33/35/39, via DefDirections + DiffDef), and --
-// for commands.schema.json/events.schema.json, whose root itself is a
-// oneOf -- rows 28-30 at the root.
+// the keyword allowlist (fail-closed), the root's own administrative
+// keywords ($schema/$id/title -- rows 34/36), the $defs set (rows 31-32),
+// every def present on both sides (via DefDirections + DiffDef), and
+// finally every OTHER root-level keyword the allowlist permits ($ref,
+// type, properties, required, additionalProperties, enum, const, oneOf,
+// anyOf, items, format, pattern, minimum*, default, description,
+// goJSONSchema) by routing the root itself through the SAME diffNode
+// machinery a $defs entry goes through (C6/C7/C20: the root's own $ref --
+// the entirety of session-config's contract -- and any other root
+// keyword used to be walked by the allowlist but never actually
+// compared).
 //
 // directive is this surface's own contracts/manifest.json "direction"
-// value (by-suffix | platform-to-client | client-to-platform | both,
-// read from HEAD's manifest -- direction assignment is not a relaxation,
-// unlike openEnums/retired, so there is no anti-gaming reason to pin it
-// to the merge-base). openEnums, by contrast, IS read from the
-// merge-base manifest by the caller (see Compare), never from head.
+// value (by-suffix | platform-to-client | client-to-platform | both).
+// Compare's caller resolves this from the MERGE-BASE manifest wherever a
+// row for the surface exists there (C1 -- direction is a relaxation-
+// adjacent decision, same as openEnums/retired, so it is never taken from
+// HEAD for a surface the base already governs).
 //
 // A returned (non-nil) error is a genuine tool failure (malformed JSON):
 // every OTHER kind of problem, including every fail-closed condition,
@@ -51,24 +57,21 @@ func DiffSurface(directive string, baseRaw, headRaw []byte, openEnums map[string
 	// Row 36: root $schema changed -- fail closed unconditionally, and
 	// stop: everything downstream assumes the same JSON Schema dialect.
 	if fmt.Sprint(baseRoot["$schema"]) != fmt.Sprint(headRoot["$schema"]) {
-		findings = append(findings, Finding{
+		return []Finding{{
 			RuleID:   "36",
 			Severity: SeverityFailClosed,
 			Pointer:  "#/$schema",
 			Message:  "root $schema changed -- extend tools/contractscompat and its corpus in a separate PR first",
-		})
-		return findings, nil
+		}}, nil
 	}
 
-	// Row 34: root $id / root title.
+	// Row 34: root $id / root title -- administrative, root-only.
 	if fmt.Sprint(baseRoot["$id"]) != fmt.Sprint(headRoot["$id"]) {
 		findings = append(findings, Finding{RuleID: "34", Severity: SeverityMajor, Pointer: "#/$id", Message: "root $id changed"})
 	}
 	if fmt.Sprint(baseRoot["title"]) != fmt.Sprint(headRoot["title"]) {
 		findings = append(findings, Finding{RuleID: "34", Severity: SeverityMajor, Pointer: "#/title", Message: "root title changed"})
 	}
-	// Row 35: root description (root never carries goJSONSchema).
-	findings = append(findings, diffAnnotations(baseRoot, headRoot, "#")...)
 
 	baseDefs, _ := baseRoot["$defs"].(map[string]any)
 	headDefs, _ := headRoot["$defs"].(map[string]any)
@@ -79,7 +82,8 @@ func DiffSurface(directive string, baseRaw, headRaw []byte, openEnums map[string
 		headDefs = map[string]any{}
 	}
 
-	// Rows 31/32: $defs entries added/removed.
+	// Rows 31/32: $defs entries added/removed, plus DiffDef on every
+	// shared def.
 	names := map[string]bool{}
 	for n := range baseDefs {
 		names[n] = true
@@ -120,46 +124,59 @@ func DiffSurface(directive string, baseRaw, headRaw []byte, openEnums map[string
 		}
 	}
 
-	// Root oneOf (commands.schema.json, events.schema.json): the fixed
-	// surfaces (platform-to-client, both) also govern the root union
-	// itself, not just what's inside each $defs entry.
-	if directive != DirectiveBySuffix {
-		rootDir, err := fixedDirection(directive)
-		if err != nil {
-			return nil, err
-		}
-		ctx := &diffCtx{baseR: resolver{defs: baseDefs}, headR: resolver{defs: headDefs}, openEnums: openEnums}
-		var rootFindings []Finding
-		if rootDir == DirBoth {
-			p2c, err := ctx.diffUnion(baseRoot, headRoot, DirP2C, "#", "oneOf")
-			if err != nil {
-				if fc, ok := err.(*FailClosedError); ok {
-					findings = append(findings, fc.Finding)
-					return findings, nil
-				}
-				return nil, err
-			}
-			c2p, err := ctx.diffUnion(baseRoot, headRoot, DirC2P, "#", "oneOf")
-			if err != nil {
-				if fc, ok := err.(*FailClosedError); ok {
-					findings = append(findings, fc.Finding)
-					return findings, nil
-				}
-				return nil, err
-			}
-			rootFindings = mergeBothDirections(p2c, c2p)
-		} else {
-			rootFindings, err = ctx.diffUnion(baseRoot, headRoot, rootDir, "#", "oneOf")
-			if err != nil {
-				if fc, ok := err.(*FailClosedError); ok {
-					findings = append(findings, fc.Finding)
-					return findings, nil
-				}
-				return nil, err
-			}
-		}
-		findings = append(findings, rootFindings...)
+	// Every root keyword besides the four administrative/structural ones
+	// just handled ($schema, $id, title, $defs) is diffed by routing the
+	// stripped root itself through diffNode -- the exact same machinery
+	// every $defs entry goes through, including its own DirBoth
+	// split-and-merge and its own exhaustiveness assertion.
+	rootDir, err := rootDirection(directive)
+	if err != nil {
+		return nil, err
 	}
+	ctx := &diffCtx{baseR: resolver{defs: baseDefs}, headR: resolver{defs: headDefs}, openEnums: openEnums}
+	rootFindings, err := ctx.diffNode(stripAdminKeys(baseRoot), stripAdminKeys(headRoot), rootDir, "#")
+	if err != nil {
+		if fc, ok := err.(*FailClosedError); ok {
+			return append(findings, fc.Finding), nil
+		}
+		return nil, err
+	}
+	findings = append(findings, rootFindings...)
 
 	return findings, nil
+}
+
+// rootDirection is the Direction the document ROOT itself is compared
+// under. A fixed-direction surface's root gets that same direction -- it
+// is what governs commands.schema.json/events.schema.json's own root
+// oneOf, and session-config's own root $ref. A by-suffix surface's root
+// has no single def-suffix to key off; rest/v1 and client-ws/v1 today
+// carry nothing but $defs (plus description/$schema/$id/title) at the
+// root, so this is dormant in practice, but DirBoth is the conservative
+// default if a future root keyword ever appears there: it requires
+// compatibility under BOTH columns rather than guessing one.
+func rootDirection(directive string) (Direction, error) {
+	if directive == DirectiveBySuffix {
+		return DirBoth, nil
+	}
+	return fixedDirection(directive)
+}
+
+// stripAdminKeys returns a shallow copy of root without the four
+// administrative/structural keywords ($schema, $id, title, $defs) that
+// DiffSurface already compares on its own above -- everything else
+// reaching diffNode/diffResolved is a genuine schema-constraint keyword
+// those functions know how to classify (and will fail closed on
+// otherwise, via their own exhaustiveness assertion).
+func stripAdminKeys(root map[string]any) map[string]any {
+	out := make(map[string]any, len(root))
+	for k, v := range root {
+		switch k {
+		case "$schema", "$id", "title", "$defs":
+			continue
+		default:
+			out[k] = v
+		}
+	}
+	return out
 }

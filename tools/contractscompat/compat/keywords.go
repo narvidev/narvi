@@ -130,8 +130,18 @@ func walkSchemaObject(obj map[string]any, ptr string, isRoot bool) error {
 		if !allowedKeywords[key] {
 			return failClosed("fc-keyword", ptr+"/"+key, "keyword %q is not in the closed allowlist", key)
 		}
-		if key == "title" && !isRoot {
-			return failClosed("fc-title", ptr+"/title", "\"title\" is only permitted on the document root")
+		if !isRoot {
+			switch key {
+			case "title":
+				return failClosed("fc-title", ptr+"/title", "\"title\" is only permitted on the document root")
+			case "$schema", "$id", "$defs":
+				// Administrative/structural keywords diffResolved's own
+				// exhaustiveness assertion does not know how to classify
+				// at a non-root node -- reject them here, at parse time,
+				// with a clearer message than that fail-closed backstop
+				// would give.
+				return failClosed("fc-root-only", ptr+"/"+key, "%q is only permitted on the document root", key)
+			}
 		}
 	}
 

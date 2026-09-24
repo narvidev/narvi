@@ -128,6 +128,14 @@ type VersionCheckInput struct {
 	AnythingChanged  bool
 	WorstFinding     Severity
 	ChangedSurfaces  []string // contracts-relative paths with any diff (schema content, manifest row, or routes.golden)
+	// ForceMajorBump is true when the diff includes a row-37 (schema file
+	// removed) or row-38 (schema file added) surface-set event -- §4
+	// requires a MAJOR version bump for those regardless of the graded
+	// compatibility severity (row 38 itself is MINOR: a new file's mere
+	// existence breaks no current consumer). C18: the checker used to let
+	// a brand-new vN sibling, or a retired file's deletion, land with
+	// nothing more than a MINOR bump.
+	ForceMajorBump bool
 }
 
 // CheckVersionAndChangelog returns Findings (always Severity Major -- this
@@ -169,6 +177,9 @@ func CheckVersionAndChangelog(in VersionCheckInput) []Finding {
 	}
 
 	required := RequiredBump(in.WorstFinding)
+	if in.ForceMajorBump && required < SeverityMajor {
+		required = SeverityMajor
+	}
 	actual := base.BumpClass(head)
 	if actual < required {
 		fail(fmt.Sprintf("VERSION bump (%s -> %s, a %s bump) is smaller than the highest finding class (%s) requires", base, head, actual, required))

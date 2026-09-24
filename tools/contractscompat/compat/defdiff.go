@@ -18,9 +18,12 @@ type diffCtx struct {
 }
 
 // DiffDef compares one def (already looked up in both sides' $defs maps)
-// under a single Direction, or under DirBoth by requiring compatibility
-// under BOTH the P2C and C2P columns (§6.3 design spec §2) and keeping the
-// worse-severity finding per pointer+rule.
+// under a single Direction -- or, when dir is DirBoth, requiring
+// compatibility under BOTH the P2C and C2P columns (§6.3 design spec §2)
+// -- by delegating straight to diffNode, which implements the DirBoth
+// split-and-merge itself (see diffNode's own doc comment for why pushing
+// that down makes the root-level diff (rootdiff.go) able to reuse the
+// exact same machinery instead of duplicating it).
 func DiffDef(baseDefs, headDefs map[string]any, name string, dir Direction, openEnums map[string]bool) ([]Finding, error) {
 	ctx := &diffCtx{
 		baseR:     resolver{defs: baseDefs},
@@ -29,24 +32,11 @@ func DiffDef(baseDefs, headDefs map[string]any, name string, dir Direction, open
 	}
 	ptr := "#/$defs/" + jsonPointerEscape(name)
 	base, head := baseDefs[name], headDefs[name]
-
-	if dir != DirBoth {
-		return ctx.diffNode(base, head, dir, ptr)
-	}
-
-	p2c, err := ctx.diffNode(base, head, DirP2C, ptr)
-	if err != nil {
-		return nil, err
-	}
-	c2p, err := ctx.diffNode(base, head, DirC2P, ptr)
-	if err != nil {
-		return nil, err
-	}
-	return mergeBothDirections(p2c, c2p), nil
+	return ctx.diffNode(base, head, dir, ptr)
 }
 
 // mergeBothDirections combines the two per-column readings of a DirBoth
-// def: a finding present under only one column still applies (that
+// node: a finding present under only one column still applies (that
 // column's role is real), and a finding present under both (same rule +
 // pointer) keeps the worse of the two severities.
 func mergeBothDirections(p2c, c2p []Finding) []Finding {
@@ -70,40 +60,83 @@ func mergeBothDirections(p2c, c2p []Finding) []Finding {
 	return out
 }
 
-// diffNode is the recursive engine behind rows 1-30, 33, 35, 39 of the
-// rule table. It handles $ref resolution (including a retargeted $ref,
-// row 27) before comparing the resolved schema content.
+// diffNode is the recursive engine behind rows 1-30, 33, 35, 39, 42, 43 of
+// the rule table, AND the mechanism the root document itself is diffed
+// through (rootdiff.go) -- there is exactly one place in this package that
+// knows how to compare two schema nodes, whether that node is a $defs
+// entry, a nested property, a oneOf/anyOf member, or a whole file's root.
+//
+// dir == DirBoth is handled by splitting into one DirP2C and one DirC2P
+// pass over the SAME base/head pair and merging (mergeBothDirections),
+// entirely at the point where DirBoth was first given -- every recursive
+// call this makes passes a concrete DirP2C/DirC2P down, so a DirBoth node
+// is never re-split at every level of its own subtree (that would be
+// exponential; it would also be wrong, since Direction is a property of a
+// whole def/root, not of an individual nested node).
+//
+// $ref handling (rows 27, 31-32's caller): a same-target (or no-$ref-on-
+// either-side) pair is resolved and its SIBLING keywords merged in via
+// effectiveNode (C5, C8 -- a node carrying "$ref" plus other keywords is
+// walked like any other node, never with its siblings silently dropped).
+// A retargeted $ref (row 27) is handled by diffRetargetedRef, which does
+// the same sibling-merge against each side's OWN resolved target.
 func (c *diffCtx) diffNode(base, head any, dir Direction, ptr string) ([]Finding, error) {
+	if dir == DirBoth {
+		p2c, err := c.diffNode(base, head, DirP2C, ptr)
+		if err != nil {
+			return nil, err
+		}
+		c2p, err := c.diffNode(base, head, DirC2P, ptr)
+		if err != nil {
+			return nil, err
+		}
+		return mergeBothDirections(p2c, c2p), nil
+	}
+
 	bRefName := refTargetName(base)
 	hRefName := refTargetName(head)
 
-	switch {
-	case bRefName != "" && hRefName != "" && bRefName != hRefName:
-		return c.diffRetargetedRef(bRefName, hRefName, dir, ptr)
-	default:
-		// Same $ref (or no $ref at all on one or both sides): resolve
-		// whichever side has one and keep comparing the resolved content
-		// at the SAME pointer -- an asymmetric ref (inline on one side,
-		// $ref on the other) is not itself a named rule; only the
-		// resulting content diff is.
-		rBase, err := c.baseR.resolve(base, nil)
-		if err != nil {
-			return nil, failClosed("fc-ref", ptr, "%v", err)
-		}
-		rHead, err := c.headR.resolve(head, nil)
-		if err != nil {
-			return nil, failClosed("fc-ref", ptr, "%v", err)
-		}
-		return c.diffResolved(rBase, rHead, dir, ptr)
+	if bRefName != "" && hRefName != "" && bRefName != hRefName {
+		return c.diffRetargetedRef(base, head, bRefName, hRefName, dir, ptr)
 	}
+
+	rBase, err := c.baseR.resolve(base, nil)
+	if err != nil {
+		return nil, failClosed("fc-ref", ptr, "%v", err)
+	}
+	rHead, err := c.headR.resolve(head, nil)
+	if err != nil {
+		return nil, failClosed("fc-ref", ptr, "%v", err)
+	}
+
+	bObj, bIsObj := rBase.(map[string]any)
+	hObj, hIsObj := rHead.(map[string]any)
+	if !bIsObj || !hIsObj {
+		// At least one side resolves to the boolean schema literal
+		// true/false. Compare the literals directly rather than through
+		// effectiveNode: collapsing a bare `false` ("reject everything")
+		// into the empty object `{}` ("accept everything") there would
+		// silently invert its meaning. A bool node can never itself carry
+		// $ref siblings (its whole value IS the boolean), so there is
+		// nothing to merge in this case anyway.
+		if reflect.DeepEqual(rBase, rHead) {
+			return nil, nil
+		}
+		return []Finding{ruleFinding("6", dir, majorMajor, ptr, "schema literal changed")}, nil
+	}
+
+	mergedBase := effectiveNode(bObj, base)
+	mergedHead := effectiveNode(hObj, head)
+	return c.diffResolved(mergedBase, mergedHead, dir, ptr)
 }
 
 // diffRetargetedRef implements row 27: the finding's severity comes from
-// comparing the OLD target's content (as it stood in base) against the
-// NEW target's content (as it stands in head), unless the old target no
-// longer exists in head's own $defs at all (row 31 territory), which is
-// unconditionally MAJOR.
-func (c *diffCtx) diffRetargetedRef(bRefName, hRefName string, dir Direction, ptr string) ([]Finding, error) {
+// comparing the OLD target's content (as it stood in base, plus base's own
+// sibling keywords) against the NEW target's content (as it stands in
+// head, plus head's own siblings), unless the old target no longer exists
+// in head's own $defs at all (row 31 territory), which is unconditionally
+// MAJOR.
+func (c *diffCtx) diffRetargetedRef(base, head any, bRefName, hRefName string, dir Direction, ptr string) ([]Finding, error) {
 	if _, ok := c.headR.defs[bRefName]; !ok {
 		return []Finding{{
 			RuleID:   "27",
@@ -113,18 +146,32 @@ func (c *diffCtx) diffRetargetedRef(bRefName, hRefName string, dir Direction, pt
 		}}, nil
 	}
 
-	oldContent, err := c.baseR.resolve(c.baseR.defs[bRefName], nil)
+	oldTarget, err := c.baseR.resolve(c.baseR.defs[bRefName], nil)
 	if err != nil {
 		return nil, failClosed("fc-ref", ptr, "%v", err)
 	}
-	newContent, err := c.headR.resolve(c.headR.defs[hRefName], nil)
+	newTarget, err := c.headR.resolve(c.headR.defs[hRefName], nil)
 	if err != nil {
 		return nil, failClosed("fc-ref", ptr, "%v", err)
 	}
-	nested, err := c.diffResolved(oldContent, newContent, dir, ptr)
-	if err != nil {
-		return nil, err
+
+	var nested []Finding
+	oldObj, oldIsObj := oldTarget.(map[string]any)
+	newObj, newIsObj := newTarget.(map[string]any)
+	switch {
+	case !oldIsObj || !newIsObj:
+		if !reflect.DeepEqual(oldTarget, newTarget) {
+			nested = []Finding{ruleFinding("6", dir, majorMajor, ptr, "schema literal changed")}
+		}
+	default:
+		mergedOld := effectiveNode(oldObj, base)
+		mergedNew := effectiveNode(newObj, head)
+		nested, err = c.diffResolved(mergedOld, mergedNew, dir, ptr)
+		if err != nil {
+			return nil, err
+		}
 	}
+
 	worst := SeverityPatch
 	for _, f := range nested {
 		worst = maxSeverity(worst, f.Severity)
@@ -138,69 +185,84 @@ func (c *diffCtx) diffRetargetedRef(bRefName, hRefName string, dir Direction, pt
 	return []Finding{wrapper}, nil
 }
 
-// diffResolved compares two already-dereferenced schema nodes (each
-// either a JSON object or the boolean literals true/false).
-func (c *diffCtx) diffResolved(base, head any, dir Direction, ptr string) ([]Finding, error) {
-	bObj, bIsObj := base.(map[string]any)
-	hObj, hIsObj := head.(map[string]any)
-
-	if bIsObj && hIsObj && reflect.DeepEqual(bObj, hObj) {
+// diffResolved compares two already-dereferenced-and-sibling-merged
+// schema nodes (see effectiveNode). This is the ONE place every
+// allowlisted schema-constraint keyword (everything except the
+// root-only/administrative $schema, $id, title, $defs, which DiffSurface
+// handles itself before ever calling into diffNode for the root) must be
+// dispatched to a rule handler: every handler below marks the keyword(s)
+// it looked at as "consumed" regardless of whether it found a
+// difference, and the exhaustiveness assertion at the bottom fails closed
+// if ANY key present on either side was never consumed by anything --
+// the structural backstop against exactly the class of bug this rewrite
+// exists to close (a keyword nobody thought to compare passing through
+// silently).
+func (c *diffCtx) diffResolved(bObj, hObj map[string]any, dir Direction, ptr string) ([]Finding, error) {
+	if reflect.DeepEqual(bObj, hObj) {
 		// Nothing changed at or under this node: skip it entirely, rather
-		// than run e.g. oneOf/anyOf pairing (defdiff.go's diffUnion) on
-		// content nobody touched. A pairing heuristic that cannot key
-		// every member of some untouched, pre-existing union would
-		// otherwise fail closed on files that have never changed at all.
+		// than run e.g. oneOf/anyOf pairing on content nobody touched. A
+		// pairing heuristic that cannot key every member of some
+		// untouched, pre-existing union would otherwise fail closed on
+		// files that have never changed at all.
 		return nil, nil
 	}
 
-	if !bIsObj || !hIsObj {
-		// Boolean schemas (true/false) at a generic recursion point are
-		// vanishingly rare in this codebase (additionalProperties/items
-		// handle their own bool case before ever calling diffResolved on
-		// a bare bool) -- treat any mismatch here defensively as a type
-		// change rather than pretend to know a finer rule applies.
-		if reflect.DeepEqual(base, head) {
-			return nil, nil
+	consumed := map[string]bool{}
+	mark := func(keys ...string) {
+		for _, k := range keys {
+			consumed[k] = true
 		}
-		return []Finding{ruleFinding("6", dir, majorMajor, ptr, "schema literal changed")}, nil
 	}
 
 	var findings []Finding
 
 	findings = append(findings, diffAnnotations(bObj, hObj, ptr)...)
+	mark("description", "goJSONSchema")
 
 	typeFindings, err := c.diffType(bObj, hObj, dir, ptr)
 	if err != nil {
 		return nil, err
 	}
 	findings = append(findings, typeFindings...)
+	mark("type")
 
 	findings = append(findings, c.diffEnum(bObj, hObj, dir, ptr)...)
+	mark("enum")
 	findings = append(findings, diffConst(bObj, hObj, ptr)...)
+	mark("const")
 	findings = append(findings, diffFormat(bObj, hObj, dir, ptr)...)
+	mark("format")
 	findings = append(findings, diffPattern(bObj, hObj, dir, ptr)...)
+	mark("pattern")
 	findings = append(findings, diffNumericFloor(bObj, hObj, dir, ptr, "minimum")...)
+	mark("minimum")
 	findings = append(findings, diffNumericFloor(bObj, hObj, dir, ptr, "minLength")...)
+	mark("minLength")
 	findings = append(findings, diffNumericFloor(bObj, hObj, dir, ptr, "minItems")...)
+	mark("minItems")
 	findings = append(findings, diffDefault(bObj, hObj, ptr)...)
+	mark("default")
 
 	propFindings, err := c.diffProperties(bObj, hObj, dir, ptr)
 	if err != nil {
 		return nil, err
 	}
 	findings = append(findings, propFindings...)
+	mark("properties", "required")
 
 	apFindings, err := c.diffAdditionalProperties(bObj, hObj, dir, ptr)
 	if err != nil {
 		return nil, err
 	}
 	findings = append(findings, apFindings...)
+	mark("additionalProperties")
 
 	itemsFindings, err := c.diffItems(bObj, hObj, dir, ptr)
 	if err != nil {
 		return nil, err
 	}
 	findings = append(findings, itemsFindings...)
+	mark("items")
 
 	for _, kw := range []string{"oneOf", "anyOf"} {
 		fs, err := c.diffUnion(bObj, hObj, dir, ptr, kw)
@@ -208,9 +270,48 @@ func (c *diffCtx) diffResolved(base, head any, dir Direction, ptr string) ([]Fin
 			return nil, err
 		}
 		findings = append(findings, fs...)
+		mark(kw)
+	}
+
+	// Exhaustiveness assertion: every keyword present on either side of
+	// this (already sibling-merged) node must have been consumed by a
+	// handler above. This is deliberately redundant with the keyword
+	// allowlist (walkSchema/keywords.go) for everything except the four
+	// root-only keywords -- it is the belt to that allowlist's suspenders,
+	// so a future handler that gets deleted, or a keyword that reaches
+	// this node in a position the allowlist did not anticipate (a nested
+	// $defs/$id/$schema slipping past a walkSchema regression, say),
+	// fails the run rather than passing it silently.
+	var leftover []string
+	for k := range bObj {
+		if !consumed[k] {
+			leftover = append(leftover, k)
+		}
+	}
+	for k := range hObj {
+		if !consumed[k] {
+			leftover = append(leftover, k)
+		}
+	}
+	if len(leftover) > 0 {
+		sort.Strings(leftover)
+		leftover = dedupSorted(leftover)
+		return nil, failClosed("fc-unhandled-keyword", ptr, "keyword(s) %v present at this node were not classified by any rule handler", leftover)
 	}
 
 	return findings, nil
+}
+
+func dedupSorted(in []string) []string {
+	out := in[:0]
+	var prev string
+	for i, s := range in {
+		if i == 0 || s != prev {
+			out = append(out, s)
+		}
+		prev = s
+	}
+	return out
 }
 
 // severityPair is a (P2C, C2P) severity pair for a rule row that does not
@@ -230,32 +331,39 @@ func ruleFinding(ruleID string, dir Direction, sev severityPair, ptr, msg string
 	return Finding{RuleID: ruleID, Severity: sev.at(dir), Pointer: ptr, Message: msg}
 }
 
-// --- annotations: description, goJSONSchema (row 35) ---
+// --- annotations: description (row 35), goJSONSchema (row 45) ---
 
-// diffAnnotations covers row 35 ("description changed", PATCH) and,
-// broadened to match reality, a change to go-jsonschema's own
-// "goJSONSchema" codegen-hint extension -- see that keyword's own doc
-// comment in keywords.go for why a change there is PATCH-class same as a
-// description edit: it steers this repository's generated Go type, never
-// the JSON wire shape any consumer actually decodes.
+// diffAnnotations covers row 35 ("description changed", PATCH) and row 45
+// ("goJSONSchema changed", MAJOR both columns -- C19: go-jsonschema's own
+// codegen-hint extension steers this repository's OWN generated Go
+// decoder type for a property; for a client-to-platform shape the
+// platform is the consumer, so a narrower generated Go type can reject
+// input the schema itself still describes as valid. Scored as a break
+// rather than an annotation, unlike description).
 func diffAnnotations(base, head map[string]any, ptr string) []Finding {
 	var findings []Finding
-	if f := diffAnnotationKey(base, head, ptr, "description"); f != nil {
+	if f := diffAnnotationKey(base, head, ptr, "description", "35", SeverityPatch); f != nil {
 		findings = append(findings, *f)
 	}
-	if f := diffAnnotationKey(base, head, ptr, "goJSONSchema"); f != nil {
+	if f := diffAnnotationKey(base, head, ptr, "goJSONSchema", "45", SeverityMajor); f != nil {
 		findings = append(findings, *f)
 	}
 	return findings
 }
 
-func diffAnnotationKey(base, head map[string]any, ptr, key string) *Finding {
+// diffAnnotationKey covers a single not-direction-graded keyword (row 35's
+// description is PATCH regardless of P2C/C2P; row 45's goJSONSchema is
+// MAJOR regardless) -- sev is used for both columns alike.
+func diffAnnotationKey(base, head map[string]any, ptr, key, ruleID string, sev Severity) *Finding {
 	b, bok := base[key]
 	h, hok := head[key]
 	if bok == hok && reflect.DeepEqual(b, h) {
 		return nil
 	}
-	return &Finding{RuleID: "35", Severity: SeverityPatch, Pointer: ptr + "/" + key, Message: key + " changed"}
+	if !bok && !hok {
+		return nil
+	}
+	return &Finding{RuleID: ruleID, Severity: sev, Pointer: ptr + "/" + key, Message: key + " changed"}
 }
 
 // --- type (rows 6, 7, 8, 9, 10) ---
@@ -281,6 +389,22 @@ func (c *diffCtx) diffType(base, head map[string]any, dir Direction, ptr string)
 	if !bHas && !hHas {
 		return nil, nil
 	}
+	if bHas != hHas {
+		// C2/C12/C14: the `type` keyword's own PRESENCE changing is
+		// scored MAJOR in both columns, regardless of what the
+		// surviving/incoming value says. Dropping `type` removes a
+		// constraint entirely (the value may now be any JSON type, which
+		// the old row-8 "narrowed" bucket scored backwards, as MINOR on
+		// P2C); adding it narrows what was previously unconstrained. This
+		// is deliberately coarser than rows 7-10's per-value grading --
+		// exactly because a presence change is also how a field can be
+		// rewritten as an equivalent anyOf/oneOf union (see diffUnion's
+		// own presence-change rule, 43), and erring MAJOR on the `type`
+		// side of that rewrite is the fail-closed choice, not a
+		// precision bug.
+		return []Finding{ruleFinding("6", dir, majorMajor, ptr+"/type", "type keyword presence changed")}, nil
+	}
+
 	bSet, hSet := typeSet(base), typeSet(head)
 
 	var added, removed []string
@@ -510,6 +634,18 @@ func diffDefault(base, head map[string]any, ptr string) []Finding {
 
 // --- properties/required (rows 1-5) ---
 
+// diffProperties covers rows 1-5. `required` is compared as a FULL SET,
+// independent of whether a matching `properties` entry exists on that
+// same side (C4/C9): the old implementation built its comparison universe
+// solely from `properties` keys, so a name added to (or removed from)
+// `required` with no property declaration at all was invisible -- yet
+// this repo's own generated decoders enforce `required` by raw key
+// lookup regardless of whether `properties` describes that key. A
+// `required` name with NO matching `properties` entry on that same side
+// cannot be structurally diffed (there is no nested schema to recurse
+// into, or to have "moved into required" relative to), so it fails
+// closed as a malformed schema rather than being silently accepted the
+// way it was before.
 func (c *diffCtx) diffProperties(base, head map[string]any, dir Direction, ptr string) ([]Finding, error) {
 	bProps, _ := base["properties"].(map[string]any)
 	hProps, _ := head["properties"].(map[string]any)
@@ -523,6 +659,12 @@ func (c *diffCtx) diffProperties(base, head map[string]any, dir Direction, ptr s
 	for n := range hProps {
 		names[n] = true
 	}
+	for n := range bReq {
+		names[n] = true
+	}
+	for n := range hReq {
+		names[n] = true
+	}
 	sorted := make([]string, 0, len(names))
 	for n := range names {
 		sorted = append(sorted, n)
@@ -532,19 +674,26 @@ func (c *diffCtx) diffProperties(base, head map[string]any, dir Direction, ptr s
 	var findings []Finding
 	for _, name := range sorted {
 		propPtr := ptr + "/properties/" + jsonPointerEscape(name)
-		bSchema, inBase := bProps[name]
-		hSchema, inHead := hProps[name]
+		bSchema, inBaseProp := bProps[name]
+		hSchema, inHeadProp := hProps[name]
+
+		if bReq[name] && !inBaseProp {
+			return nil, failClosed("fc-required-orphan", ptr+"/required", "%q is required in base but has no matching properties entry", name)
+		}
+		if hReq[name] && !inHeadProp {
+			return nil, failClosed("fc-required-orphan", ptr+"/required", "%q is required in head but has no matching properties entry", name)
+		}
 
 		switch {
-		case inBase && !inHead:
+		case inBaseProp && !inHeadProp:
 			findings = append(findings, ruleFinding("1", dir, majorMajor, propPtr, "property removed"))
-		case !inBase && inHead:
+		case !inBaseProp && inHeadProp:
 			if hReq[name] {
 				findings = append(findings, ruleFinding("3", dir, severityPair{SeverityMinor, SeverityMajor}, propPtr, "property added and required"))
 			} else {
 				findings = append(findings, ruleFinding("2", dir, severityPair{SeverityMinor, SeverityMinor}, propPtr, "property added, not required"))
 			}
-		default:
+		case inBaseProp && inHeadProp:
 			wasReq, isReq := bReq[name], hReq[name]
 			if !wasReq && isReq {
 				findings = append(findings, ruleFinding("4", dir, severityPair{SeverityMinor, SeverityMajor}, propPtr, "property moved into required"))
@@ -558,6 +707,11 @@ func (c *diffCtx) diffProperties(base, head map[string]any, dir Direction, ptr s
 			}
 			findings = append(findings, nested...)
 		}
+		// The remaining case (!inBaseProp && !inHeadProp) is unreachable:
+		// `name` only enters this loop via bReq/hReq membership when it
+		// is not a properties key on either side, and the orphan guard
+		// above already fails closed for any side where that combination
+		// occurs.
 	}
 	return findings, nil
 }
@@ -587,7 +741,7 @@ func stringSet(v any) map[string]bool {
 	return out
 }
 
-// --- additionalProperties (rows 23, 24, 25, 26) ---
+// --- additionalProperties (rows 23, 24, 25, 26, 42) ---
 
 type apKind int
 
@@ -639,6 +793,17 @@ func (c *diffCtx) diffAdditionalProperties(base, head map[string]any, dir Direct
 		return nil, nil
 	}
 
+	// C13: schema -> permissive (true or absent) is its OWN row (42), not
+	// the generic MINOR/MINOR "loosening" bucket below. Unlike false ->
+	// anything (a pure unlock: no extra properties were ever allowed
+	// before, some now are, safe both ways), a schema constraining
+	// additional-property VALUES going away widens what a P2C map's
+	// values may be -- a Go client decoding into map[string]string breaks
+	// on a value the platform is now free to send that isn't a string.
+	if bKind == apSchema && hKind == apPermissive {
+		return []Finding{ruleFinding("42", dir, severityPair{SeverityMajor, SeverityMinor}, apPtr, "additionalProperties schema loosened to permissive (true/absent)")}, nil
+	}
+
 	// Restricting: (permissive|schema) -> false, or permissive -> schema.
 	restricting := (hKind == apFalse) || (bKind == apPermissive && hKind == apSchema)
 	if restricting {
@@ -649,7 +814,7 @@ func (c *diffCtx) diffAdditionalProperties(base, head map[string]any, dir Direct
 		return []Finding{ruleFinding(ruleID, dir, majorMajor, apPtr, "additionalProperties made more restrictive")}, nil
 	}
 
-	// Loosening: false -> (permissive|schema), or schema -> permissive.
+	// Remaining loosening cases: false -> permissive, false -> schema.
 	return []Finding{ruleFinding("23", dir, severityPair{SeverityMinor, SeverityMinor}, apPtr, "additionalProperties made less restrictive")}, nil
 }
 
@@ -667,13 +832,33 @@ func (c *diffCtx) diffItems(base, head map[string]any, dir Direction, ptr string
 	return c.diffNode(bItems, hItems, dir, ptr+"/items")
 }
 
-// --- oneOf/anyOf (rows 28, 29, 30) ---
+// --- oneOf/anyOf (rows 9, 10, 28, 29, 30, 43) ---
 
 func (c *diffCtx) diffUnion(base, head map[string]any, dir Direction, ptr, keyword string) ([]Finding, error) {
-	bArr, bHas := base[keyword].([]any)
-	hArr, hHas := head[keyword].([]any)
+	bRaw, bHas := base[keyword]
+	hRaw, hHas := head[keyword]
 	if !bHas && !hHas {
 		return nil, nil
+	}
+	if bHas != hHas {
+		// C15: the KEYWORD ITSELF appearing or disappearing (not a
+		// member within an already-existing union) is a presence change,
+		// scored MAJOR in both columns -- introducing a oneOf/anyOf where
+		// none existed adds a constraint the table's row 28 ("variant
+		// added", MINOR/MINOR) does not name; removing one removes a
+		// constraint the old code scored as though every member had
+		// simply been deleted one at a time (row 29, still MAJOR/MAJOR,
+		// so removal already happened to be safe -- but addition was not).
+		return []Finding{ruleFinding("43", dir, majorMajor, ptr+"/"+keyword, keyword+" keyword presence changed")}, nil
+	}
+
+	bArr, ok := bRaw.([]any)
+	if !ok {
+		return nil, failClosed("fc-shape", ptr+"/"+keyword, "%s must be an array", keyword)
+	}
+	hArr, ok := hRaw.([]any)
+	if !ok {
+		return nil, failClosed("fc-shape", ptr+"/"+keyword, "%s must be an array", keyword)
 	}
 
 	type member struct {
@@ -700,8 +885,10 @@ func (c *diffCtx) diffUnion(base, head map[string]any, dir Direction, ptr, keywo
 		// -- the common "anyOf: [{$ref: X}, {type: null}]" nullable-via-
 		// anyOf idiom this codebase's own rest/v1/dtos.schema.json uses
 		// (e.g. ReviewReadout.latestVerdict) is exactly this: pairing by
-		// the plain scalar type name is still a closed, deterministic key,
-		// not a guess.
+		// the plain scalar type name is still a closed, deterministic
+		// key, not a guess. keyOf returning "type:null" specifically is
+		// what lets the loop below re-route that member through rows
+		// 9/10 instead of the generic 28/29 (C3).
 		if t, ok := obj["type"].(string); ok && onlyKeys(obj, "type", "description") {
 			return "type:" + t, true
 		}
@@ -750,9 +937,19 @@ func (c *diffCtx) diffUnion(base, head map[string]any, dir Direction, ptr, keywo
 		hm, inHead := headMembers[k]
 		switch {
 		case inBase && !inHead:
-			findings = append(findings, ruleFinding("29", dir, majorMajor, fmt.Sprintf("%s/%s/%d", ptr, keyword, bm.idx), "union member removed: "+k))
+			removedPtr := fmt.Sprintf("%s/%s/%d", ptr, keyword, bm.idx)
+			if k == "type:null" {
+				findings = append(findings, ruleFinding("10", dir, severityPair{SeverityMinor, SeverityMajor}, removedPtr, "null variant removed from "+keyword))
+			} else {
+				findings = append(findings, ruleFinding("29", dir, majorMajor, removedPtr, "union member removed: "+k))
+			}
 		case !inBase && inHead:
-			findings = append(findings, ruleFinding("28", dir, severityPair{SeverityMinor, SeverityMinor}, fmt.Sprintf("%s/%s/%d", ptr, keyword, hm.idx), "union member added: "+k))
+			addedPtr := fmt.Sprintf("%s/%s/%d", ptr, keyword, hm.idx)
+			if k == "type:null" {
+				findings = append(findings, ruleFinding("9", dir, severityPair{SeverityMajor, SeverityMinor}, addedPtr, "null variant added to "+keyword))
+			} else {
+				findings = append(findings, ruleFinding("28", dir, severityPair{SeverityMinor, SeverityMinor}, addedPtr, "union member added: "+k))
+			}
 		default:
 			memberPtr := fmt.Sprintf("%s/%s/%d", ptr, keyword, hm.idx)
 			nested, err := c.diffNode(bm.node, hm.node, dir, memberPtr)

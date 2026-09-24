@@ -2,6 +2,7 @@ package compat
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"sort"
 )
@@ -64,14 +65,63 @@ func Compare(in Input) (Report, error) {
 		}
 	}
 
+	// C1: openEnums is a relaxation read from the MERGE-BASE manifest
+	// only. Per-surface DIRECTION is the same kind of relaxation-adjacent
+	// decision and is resolved the same way below, surface by surface --
+	// never defaulted to HEAD's own declared value for a surface the base
+	// already governs.
 	openEnums := baseManifest.OpenEnumSet()
 
 	var all []Finding
 	all = append(all, DiffSurfaceSet(baseManifest, headManifest)...)
 	all = append(all, DiffRoutes(in.BaseRoutes, in.HeadRoutes)...)
 
-	var changedSurfaces []string
-	anythingChanged := len(all) > 0 || !bytes.Equal(in.BaseManifestRaw, in.HeadManifestRaw)
+	changedSurfaces := map[string]bool{}
+	forceMajorBump := false
+	for _, f := range all {
+		if f.Surface != "" {
+			changedSurfaces[f.Surface] = true
+		}
+		if f.RuleID == "37" || f.RuleID == "38" {
+			// §4: a surface gaining a new vN sibling, or losing a
+			// retired one, always requires a MAJOR version bump -- that
+			// is the versioned-sibling/retirement DISCIPLINE, a separate
+			// concern from row 37/38's own graded compatibility severity
+			// (MAJOR/MINOR respectively, which describes whether the
+			// file's mere presence change breaks an existing consumer;
+			// it usually does not).
+			forceMajorBump = true
+		}
+	}
+
+	// C1: a surface present in BOTH manifests must keep the same
+	// direction -- a manifest-only flip (rule 44) is MAJOR even when the
+	// schema content is byte-identical, and is never something a PR can
+	// launder by ALSO changing head's own manifest row in the same diff
+	// (Compare always reads the comparison direction from base below, so
+	// a flip only ever shows up here, as its own dedicated finding).
+	// Any manifest row change at all (direction OR status) also marks the
+	// surface "changed" for the VERSION/CHANGELOG discipline (C18), even
+	// when nothing else about it moved.
+	for _, hs := range headManifest.Surfaces {
+		bs, ok := baseManifest.SurfaceByPath(hs.Path)
+		if !ok {
+			continue
+		}
+		if bs.Direction != hs.Direction {
+			all = append(all, Finding{
+				RuleID:   "44",
+				Severity: SeverityMajor,
+				Surface:  hs.Path,
+				Pointer:  "#",
+				Message:  fmt.Sprintf("manifest direction changed: %s -> %s", bs.Direction, hs.Direction),
+			})
+			changedSurfaces[hs.Path] = true
+		}
+		if bs.Status != hs.Status {
+			changedSurfaces[hs.Path] = true
+		}
+	}
 
 	paths := map[string]bool{}
 	for p := range in.BaseSchemaFiles {
@@ -89,15 +139,56 @@ func Compare(in Input) (Report, error) {
 	for _, path := range sortedPaths {
 		baseRaw, inBase := in.BaseSchemaFiles[path]
 		headRaw, inHead := in.HeadSchemaFiles[path]
-		if !inBase || !inHead {
-			// Whole-file add/remove is DiffSurfaceSet's job (rows 37/38);
-			// there is nothing to structurally diff here.
+
+		if inBase && !inHead {
+			// DiffSurfaceSet's row 37 already covers a whole-file
+			// removal; there is nothing left to structurally diff.
 			continue
 		}
 
-		directive, ok := surfaceDirective(headManifest, path)
+		if !inBase && inHead {
+			// C11: a brand-new file was, until now, admitted with its
+			// content entirely unexamined -- not walked against the
+			// keyword allowlist, and its manifest direction never
+			// validated -- so the FIRST later edit to it was the one
+			// that discovered a pre-existing disallowed keyword or a bad
+			// manifest row, as a fail-closed surprise blocking an
+			// unrelated change. Walk it now, at the point it is
+			// introduced, instead.
+			var headRoot map[string]any
+			if err := json.Unmarshal(headRaw, &headRoot); err != nil {
+				return Report{}, fmt.Errorf("parse head %s: %w", path, err)
+			}
+			if err := walkSchema(headRoot, "#", true); err != nil {
+				if fc, ok := err.(*FailClosedError); ok {
+					fc.Finding.Surface = path
+					all = append(all, fc.Finding)
+					changedSurfaces[path] = true
+					continue
+				}
+				return Report{}, err
+			}
+			directive, ok := surfaceDirective(headManifest, path)
+			if !ok {
+				return Report{}, fmt.Errorf("new surface %s has no manifest row", path)
+			}
+			if _, err := rootDirection(directive); err != nil {
+				return Report{}, fmt.Errorf("new surface %s: %w", path, err)
+			}
+			changedSurfaces[path] = true
+			continue
+		}
+
+		// C1: direction comes from the MERGE-BASE manifest row whenever
+		// one exists for this path (it always does here, since `path` is
+		// present in both BaseSchemaFiles and HeadSchemaFiles, and guard
+		// 1/2 above already required the manifest and on-disk sets to
+		// match on each side). The head fallback only matters for a
+		// surface genuinely new to both sides at once, which cannot
+		// happen in this branch.
+		directive, ok := surfaceDirective(baseManifest, path)
 		if !ok {
-			directive, ok = surfaceDirective(baseManifest, path)
+			directive, ok = surfaceDirective(headManifest, path)
 		}
 		if !ok {
 			return Report{}, fmt.Errorf("surface %s has no manifest row on either side", path)
@@ -108,14 +199,15 @@ func Compare(in Input) (Report, error) {
 			return Report{}, fmt.Errorf("diff %s: %w", path, err)
 		}
 		if len(findings) > 0 || !bytes.Equal(baseRaw, headRaw) {
-			anythingChanged = true
-			changedSurfaces = append(changedSurfaces, path)
+			changedSurfaces[path] = true
 		}
 		for i := range findings {
 			findings[i].Surface = path
 		}
 		all = append(all, findings...)
 	}
+
+	anythingChanged := len(all) > 0 || !bytes.Equal(in.BaseManifestRaw, in.HeadManifestRaw) || len(changedSurfaces) > 0
 
 	worst := SeverityPatch
 	for _, f := range all {
@@ -129,6 +221,12 @@ func Compare(in Input) (Report, error) {
 	}
 	headChangelogSections := ParseChangelog(in.HeadChangelogRaw)
 
+	sortedChanged := make([]string, 0, len(changedSurfaces))
+	for p := range changedSurfaces {
+		sortedChanged = append(sortedChanged, p)
+	}
+	sort.Strings(sortedChanged)
+
 	all = append(all, CheckVersionAndChangelog(VersionCheckInput{
 		BaseVersion:      in.BaseVersion,
 		HeadVersion:      in.HeadVersion,
@@ -136,7 +234,8 @@ func Compare(in Input) (Report, error) {
 		HeadChangelog:    headChangelogSections,
 		AnythingChanged:  anythingChanged,
 		WorstFinding:     worst,
-		ChangedSurfaces:  changedSurfaces,
+		ChangedSurfaces:  sortedChanged,
+		ForceMajorBump:   forceMajorBump,
 	})...)
 
 	return Report{Findings: all}, nil
