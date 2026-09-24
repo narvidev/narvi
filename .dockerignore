@@ -1,0 +1,48 @@
+# .dockerignore keeps the build context Dockerfile's stage-1 `make dist`
+# runs against small, without excluding anything that target needs (its
+# own `web-build` + `lint-web-assets` + `go build -tags web_assets`
+# recipe touches nearly every tracked directory in this repository,
+# including test/ and contracts/ -- narvichecks's own `./...` scope and
+# pushpr.go's own contracts/ import respectively -- so this list is
+# deliberately narrow: build tooling, dependency caches, and worktrees,
+# never source).
+
+# Git metadata -- never needed inside the build context, and often the
+# single largest thing in it.
+.git
+.gitignore
+
+# Sibling git worktrees checked out alongside this one (this repository's
+# own multi-worktree development convention, CLAUDE.md) -- never inside
+# this checkout's own directory tree in practice, listed defensively in
+# case a worktree is ever created as a subdirectory.
+.worktrees/
+worktrees/
+
+# npm dependencies -- COPY web/package.json web/package-lock.json + npm ci
+# inside the build stage installs these fresh; a host checkout's own
+# node_modules/ (if `npm install` was ever run locally) must never be
+# copied in over that fresh install.
+node_modules/
+web/node_modules/
+contracts/node_modules/
+
+# Go/npm build artifacts a local checkout may have lying around (.gitignore's
+# own list) -- never something `make dist` reads, always something it
+# writes.
+/narvi
+/control-plane
+/sandbox-agent
+/contractspatch
+/narvichecks
+/internal/adapters/inbound/webui/dist
+
+# Test/coverage artifacts and editor/OS cruft -- never inputs to the
+# build.
+*.test
+*.out
+coverage.*
+.DS_Store
+.env
+.vscode/
+.idea/

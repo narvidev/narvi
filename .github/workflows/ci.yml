@@ -3,6 +3,11 @@ name: CI
 on:
   push:
     branches: [main]
+    # v*.*.* is Step 162's own (§41.1) tag-push trigger for
+    # publish-control-plane-image below -- a tag, not an ordinary push to
+    # main, is the one signal that promotes an image to something
+    # operators pull from the GitHub Container Registry.
+    tags: ["v*.*.*"]
   pull_request:
 
 jobs:
@@ -351,6 +356,104 @@ jobs:
         run: |
           docker rm -f sandbox-dockerd-smoke >/dev/null 2>&1 || true
           docker rmi narvi-sandbox-runtime-base:ci >/dev/null 2>&1 || true
+
+  # control-plane-image (§41.1, Step 162): the repository-root Dockerfile
+  # is this Step's own proof obligation that "packaged as standard
+  # containers" is true of the binary, not merely of the plan -- so unlike
+  # sandbox-image and web above, this job is deliberately NOT gated on a
+  # path filter. This Dockerfile's own top comment explains why: stage
+  # one runs `make dist` itself, whose own recipe (web-build +
+  # lint-web-assets + go build) already touches nearly every tracked
+  # directory in this repository, so an ordinary Go or web change is
+  # exactly the kind of change this job exists to catch, not one it can
+  # afford to skip.
+  #
+  # Runs Makefile's own verify-control-plane-image target -- the SAME
+  # script a developer runs locally (that target's own doc comment has
+  # the full "why" and exactly which two exit-criterion halves it checks:
+  # the running image's route table against controlplane/testdata/
+  # routes.golden, and an unconfigured `docker run` failing cleanly with
+  # platform.Config's own validation message) -- so this job can never
+  # drift from what a contributor actually ran before opening the PR.
+  control-plane-image:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build image and run this Step's own exit criterion
+        run: make verify-control-plane-image
+
+      - name: Clean up
+        if: always()
+        run: |
+          docker rm -f narvi-control-plane-verify >/dev/null 2>&1 || true
+          docker compose -f docker-compose.dev.yml down -v >/dev/null 2>&1 || true
+
+  # publish-control-plane-image (§41.1, Step 162): publishes the image
+  # control-plane-image above already proved boots and serves the golden
+  # route table -- built again here from the SAME, unmodified Dockerfile,
+  # since a tag push carries no guarantee the PR that landed this exact
+  # commit on main ran this workflow's own control-plane-image job (a
+  # direct push to main, or a tag on an older commit, would not have).
+  # Gated on a tag push ONLY (this workflow's own top-level `on.push.tags`
+  # trigger), never an ordinary push to main -- a tag is the one signal
+  # that promotes an image to something operators pull from the GitHub
+  # Container Registry, matching how deploy/control-plane/deployment.yaml's
+  # own image placeholder names an explicit tag, never :latest.
+  #
+  # Labeled (this Dockerfile's own stage-2 LABEL instructions, populated
+  # via --build-arg below) with the tag and the git SHA as
+  # org.opencontainers.image.version/.revision -- the SAME two values
+  # sandbox-agent's own boot fingerprint already logs (§5.3), so a running
+  # control plane can be matched to its source.
+  #
+  # permissions is scoped to THIS job alone (this workflow file carries no
+  # top-level permissions block, so every other job keeps the default,
+  # read-only GITHUB_TOKEN) -- packages: write is the one scope this job
+  # needs and no other job in this file does.
+  #
+  # --platform linux/amd64 (below) is explicit rather than implied by the
+  # ubuntu-latest runner's own architecture -- matches
+  # verify-control-plane-image's own identical pin (Makefile) and
+  # deployment.yaml's own ordinary-amd64-node-pool assumption, so a future
+  # runner-architecture change can never silently publish a different
+  # image than the one control-plane-image already verified.
+  publish-control-plane-image:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Log in to the GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push
+        env:
+          # This repository's own GHCR path under its GitHub owner (git
+          # remote -v: git@github.com:narvidev/narvi.git) -- never a
+          # placeholder or unrelated organization name.
+          IMAGE: ghcr.io/narvidev/narvi/control-plane
+          TAG: ${{ github.ref_name }}
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            --build-arg NARVI_VERSION="$TAG" \
+            --build-arg NARVI_REVISION="${{ github.sha }}" \
+            -t "$IMAGE:$TAG" \
+            -f Dockerfile .
+          docker push "$IMAGE:$TAG"
 
   # web (§12.1, "ui bootstrap"): typecheck + lint + the generated-DTO-name
   # guard + build for web/ (Vite + React + TanStack Query/Router) -- the
