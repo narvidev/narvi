@@ -254,6 +254,40 @@ type pushSignal struct {
 	blockedNoGitHubIdentity bool
 }
 
+// repoHasExplicitBranch reports whether r names an explicit, non-empty
+// branch, per restdtos.CreateSessionRequestReposElem's own "nil means use
+// the repo's default base branch" convention. This is the ONE predicate
+// "would a push ever be attempted for this repo" reduces to, wherever that
+// question is asked -- sendPushBestEffort's own per-repo skip and
+// recordSuppressedPush's identical skip both delegate to it now, rather
+// than each carrying their own copy of the same nil-or-empty check.
+func repoHasExplicitBranch(r sessionconfig.SessionConfigReposElem) bool {
+	return r.Branch != nil && *r.Branch != ""
+}
+
+// anyRepoHasExplicitBranch reports whether at least one of repos names an
+// explicit branch -- i.e. whether this turn's push was EVER going to be
+// attempted, for any repo, live or shadow. Review round 3, finding Q1: a
+// session whose repos ALL leave branch nil (every Slack-spawned session,
+// slack/handler.go; every Linear-spawned session, linear/webhook.go; every
+// SPA-created automation, AutomationsView.tsx's own branch:null) never
+// sends a push at all -- sendPushBestEffort's own per-repo loop skips
+// every one of them, unconditionally. completeProcessingTurn's own
+// push-blocked-warning gate (pushBlockedByMissingGitHubIdentity /
+// recordPushBlockedNoGitHubIdentity, below) must consult this BEFORE ever
+// firing: warning an OIDC-only creator that "this push could not be
+// authenticated" is not just noise for a session like that, it is false --
+// no push was ever going to happen, authenticated or not -- and left
+// unchecked it stacks one such warning per completed turn, forever.
+func anyRepoHasExplicitBranch(repos []sessionconfig.SessionConfigReposElem) bool {
+	for _, r := range repos {
+		if repoHasExplicitBranch(r) {
+			return true
+		}
+	}
+	return false
+}
+
 // completeProcessingTurn implements this file's own first half: given a
 // real, already-schema-validated execution_complete event's raw wire
 // bytes (already persisted verbatim by handleSandboxEvent's own
@@ -562,15 +596,24 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 	// credential that cannot be minted does not silently no-op, it fails,
 	// and a raw credential-helper failure gives this creator nothing
 	// actionable).
-	blocked, err := a.pushBlockedByMissingGitHubIdentity(ctx, tx, sessionRow.CreatedBy)
-	if err != nil {
-		return nil, err
-	}
-	if blocked {
-		if err := a.recordPushBlockedNoGitHubIdentity(ctx, tx, int(sandboxRow.Gen)); err != nil {
+	// Review round 3, finding Q1: only ever evaluate (let alone record) the
+	// push-blocked warning for a session that would have attempted a push
+	// AT ALL -- see anyRepoHasExplicitBranch's own doc comment. A session
+	// whose repos all lack an explicit branch falls straight through to
+	// the ordinary, unblocked pushSignal below: sendPushBestEffort's own
+	// per-repo skip already makes that a no-op send, exactly as it always
+	// was.
+	if anyRepoHasExplicitBranch(repos) {
+		blocked, err := a.pushBlockedByMissingGitHubIdentity(ctx, tx, sessionRow.CreatedBy)
+		if err != nil {
 			return nil, err
 		}
-		return &pushSignal{gen: int(sandboxRow.Gen), repos: repos, blockedNoGitHubIdentity: true}, nil
+		if blocked {
+			if err := a.recordPushBlockedNoGitHubIdentity(ctx, tx, int(sandboxRow.Gen)); err != nil {
+				return nil, err
+			}
+			return &pushSignal{gen: int(sandboxRow.Gen), repos: repos, blockedNoGitHubIdentity: true}, nil
+		}
 	}
 
 	return &pushSignal{gen: int(sandboxRow.Gen), repos: repos}, nil
@@ -814,7 +857,7 @@ func (a *Actor) sendPushBestEffort(sessionID string, sig *pushSignal) {
 
 	repos := make([]sandboxws.PushReposElem, 0, len(sig.repos))
 	for _, r := range sig.repos {
-		if r.Branch == nil || *r.Branch == "" {
+		if !repoHasExplicitBranch(r) {
 			a.logger.Warn("sessionactor: session repo has no explicit branch; skipping auto-push for it", "repo", r.Name)
 			continue
 		}
@@ -869,7 +912,7 @@ func (a *Actor) sendPushBestEffort(sessionID string, sig *pushSignal) {
 // inside a string.
 func (a *Actor) recordSuppressedPush(ctx context.Context, tx pgx.Tx, repos []sessionconfig.SessionConfigReposElem) error {
 	for _, r := range repos {
-		if r.Branch == nil || *r.Branch == "" {
+		if !repoHasExplicitBranch(r) {
 			// Skipped by sendPushBestEffort too, for the same reason:
 			// there is no branch to push, so nothing was suppressed.
 			continue
@@ -1047,49 +1090,32 @@ func (a *Actor) createPRBestEffort(ctx context.Context, raw json.RawMessage) {
 	}
 
 	// §8.11 ("multiplayer... PR created with the prompting user's OAuth
-	// token (fallback: bot + manual PR URL)"): a creator with NO GITHUB
-	// IDENTITY AT ALL -- the ordinary case for a user who signed in ONLY
-	// through OIDC (§41.3) and has never linked a GitHub identity -- falls
-	// back to this Actor's own bot credential (a.githubBotToken, the SAME
-	// static credential createSentinelFixPRBestEffort's own
-	// system-initiated path already authenticates with, below) rather
-	// than silently dropping the PR entirely. The bot cannot be attributed
-	// as "the prompting user" on GitHub's own side (GitHub has no concept
-	// of attributing a PR to someone who never authenticated with it), so
-	// usedBotFallback below renders an honest PR body (review round 2,
-	// findings P4/P7: it does not name the creator, this function has no
-	// access to their identity) pointing at the sign-in view's own
-	// identity panel to link a GitHub account for future sessions -- see
-	// prBody's own doc comment -- the "manual PR URL" half of §8.11's
-	// own fallback: the artifact row this function already records below
-	// (recordPRArtifact, unconditionally, on EITHER path) is what
-	// surfaces that URL to the creator, exactly as it always has.
-	//
-	// A creator who DOES have a github identity, but whose stored token is
-	// merely unusable (expired, revoked, fails to decrypt, or the lookup
-	// itself failed for some other reason) is a DIFFERENT case (review
-	// round 1, finding O5): the fallback below is never applied to them --
-	// re-attributing to the bot here would tell a reviewer "this creator
-	// has no linked GitHub account" when that is false, and would silently
-	// paper over what is really a token problem. That case keeps
-	// origin/main's own pre-existing behavior: skip PR creation entirely,
-	// exactly as decryptCreatorGitHubToken's own doc comment always
-	// described ("no bot/service-account fallback exists" -- true for
-	// THIS case, no longer true for the no-identity-at-all case above).
+	// token"): no bot/service-account fallback exists here, for either
+	// shape of "no usable creator token" -- a creator with NO github
+	// identity at all (the ordinary case for someone who has only ever
+	// signed in through OIDC, §41.3) or one whose linked identity's stored
+	// token is merely unusable (expired, revoked, fails to decrypt). A
+	// round-2 bot-identity fallback used to exist here for the first case
+	// (findings P4/P7's own honest PR-body wording), but it is gone: once
+	// completeProcessingTurn started blocking that creator's PUSH itself
+	// (0a49b49, pushBlockedByMissingGitHubIdentity) after the bot-token
+	// credential fallback it depended on was reverted
+	// (a716fd8, scmcredentials.go's own step 10 now 403s unconditionally),
+	// no push command is ever sent for a live, non-review session whose
+	// creator has no github identity -- so no push_complete for it ever
+	// reaches this function to begin with. Review round 3 (finding Q2)
+	// found the fallback below had already gone dead for exactly that
+	// reason and removed it, rather than leave it firing only for the
+	// narrow, effectively-unreachable window of a creator's github
+	// identity being unlinked between THIS turn's own push send and this
+	// push_complete arriving. An OIDC-only creator's only signal is the
+	// session-visible warning recordPushBlockedNoGitHubIdentity already
+	// wrote at push-send time (pushpr.go's own completeProcessingTurn):
+	// sign in with GitHub (the sign-in view's own identity panel, §41.3)
+	// to link an identity, then retry.
 	token, ok := a.decryptCreatorGitHubToken(ctx, sessionRow.CreatedBy)
-	usedBotFallback := false
 	if !ok {
-		if !a.creatorHasNoGitHubIdentity(ctx, sessionRow.CreatedBy) {
-			a.logger.Warn("sessionactor: session creator has a github identity but no usable token; skipping PR creation (never misattributing to the bot, §8.11)")
-			return
-		}
-		if a.githubBotToken == "" {
-			a.logger.Warn("sessionactor: session creator has no usable github token and no bot token is configured; skipping PR creation (§8.11)")
-			return
-		}
-		a.logger.Info("sessionactor: session creator has no github identity; falling back to bot identity for PR creation (§8.11)")
-		token = a.githubBotToken
-		usedBotFallback = true
+		return // already logged by decryptCreatorGitHubToken
 	}
 
 	repos, err := reposFromJSON(sessionRow.Repos)
@@ -1150,7 +1176,7 @@ func (a *Actor) createPRBestEffort(ctx context.Context, raw json.RawMessage) {
 			Head:  pushed.Branch,
 			Base:  base,
 			Title: title,
-			Body:  prBody(pushed, usedBotFallback),
+			Body:  prBody(pushed),
 			Token: token,
 		}
 		prCtx, cancel := context.WithTimeout(ctx, a.timeouts.PRCreateTimeout)
@@ -1437,27 +1463,14 @@ func prTitle(sessionRow sqlcgen.Session) string {
 // prBody builds a minimal, honest PR description -- this Step invents no
 // richer changelog/summary mechanism than "which branch, which commit".
 //
-// usedBotFallback is true iff createPRBestEffort's own §8.11 bot-identity
-// fallback opened this PR -- as of review round 2 (findings P4/P7), that
-// is ONLY the creatorHasNoGitHubIdentity case (the session creator has NO
-// github identity row at all, e.g. a user who signed in only through
-// OIDC and has never linked one): an existing-but-unusable stored token
-// never reaches this fallback (createPRBestEffort's own call site skips
-// PR creation entirely for that case instead) -- so this sentence never
-// claims "or no usable stored token" any more, and never names the
-// creator (this function has no access to their identity, only the
-// pushed repo/branch/sha) -- it points at the ONE place a GitHub identity
-// can actually be linked: the sign-in view's own identity panel (§41.3,
-// web/src/routes/sign-in.tsx's IdentityStatusPanel, visible once already
-// signed in), reached by signing out and back in with GitHub -- never
-// "Settings -> Identities", which does not exist
-// (web/src/session/SettingsView.tsx's own TABS has no such tab).
-func prBody(pushed sandboxws.PushCompleteReposElem, usedBotFallback bool) string {
-	body := fmt.Sprintf("Automated changes from a Narvi session (branch %q, commit %s).", pushed.Branch, pushed.Sha)
-	if usedBotFallback {
-		body += " Opened under the bot identity: this session's creator has no linked GitHub account to attribute it to -- sign in with GitHub (the identity panel on the sign-in page, reachable by signing out and back in) to open future PRs under your own account."
-	}
-	return body
+// Review round 3 (finding Q2) removed this function's own usedBotFallback
+// parameter: the bot-identity fallback sentence it used to render only
+// ever applied to a creator with no linked GitHub identity at all, and
+// that case can no longer reach PR creation in the first place -- the push
+// itself is blocked, and a session-visible warning recorded, before this
+// function is ever called (createPRBestEffort's own doc comment above).
+func prBody(pushed sandboxws.PushCompleteReposElem) string {
+	return fmt.Sprintf("Automated changes from a Narvi session (branch %q, commit %s).", pushed.Branch, pushed.Sha)
 }
 
 // parseOwnerRepo used to live here as a byte-for-byte fork of

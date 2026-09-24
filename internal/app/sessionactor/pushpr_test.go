@@ -190,39 +190,21 @@ func TestLogProviderFailureDiagnostic(t *testing.T) {
 	}
 }
 
-// TestPrBody proves review round 2's own findings P4/P7: the bot-fallback
-// sentence must state only what is true (usedBotFallback is now set ONLY
-// when creatorHasNoGitHubIdentity is true, never for an existing-but-
-// unusable stored token, so the old "(or no usable stored token)" clause
-// is never accurate any more) and must point at a real destination (the
-// sign-in view's own identity panel, never the nonexistent
-// "Settings -> Identities").
+// TestPrBody proves prBody's own plain, honest PR description -- this Step
+// invents no richer changelog/summary mechanism than "which branch, which
+// commit". Review round 3 (finding Q2) removed the usedBotFallback
+// parameter this test used to cover two shapes for: the bot-identity
+// fallback it described had already gone unreachable in production
+// (createPRBestEffort's own push-blocked gate, 0a49b49, never lets a
+// push_complete arrive for the creator shape that fallback existed for),
+// so prBody now has exactly one shape.
 func TestPrBody(t *testing.T) {
 	pushed := sandboxws.PushCompleteReposElem{Branch: "feature-x", Sha: "abc123"}
-
-	t.Run("no bot fallback: plain body, no bot-identity sentence at all", func(t *testing.T) {
-		got := prBody(pushed, false)
-		want := `Automated changes from a Narvi session (branch "feature-x", commit abc123).`
-		if got != want {
-			t.Errorf("prBody(_, false) = %q, want %q", got, want)
-		}
-	})
-
-	t.Run("bot fallback: honest reason, no stale stored-token clause", func(t *testing.T) {
-		got := prBody(pushed, true)
-		if strings.Contains(got, "or no usable stored token") {
-			t.Errorf("prBody(_, true) = %q, still claims the stale (or no usable stored token) reason -- usedBotFallback is only ever true for the no-identity-at-all case now", got)
-		}
-		if strings.Contains(got, "Settings -> Identities") || strings.Contains(got, "Settings->Identities") {
-			t.Errorf("prBody(_, true) = %q, still points at the nonexistent Settings -> Identities page", got)
-		}
-		if !strings.Contains(got, "no linked GitHub account") {
-			t.Errorf("prBody(_, true) = %q, want it to name the real reason (no linked GitHub account)", got)
-		}
-		if !strings.Contains(got, "sign-in page") && !strings.Contains(got, "sign in with GitHub") {
-			t.Errorf("prBody(_, true) = %q, want it to point at the real destination (the sign-in view's identity panel)", got)
-		}
-	})
+	got := prBody(pushed)
+	want := `Automated changes from a Narvi session (branch "feature-x", commit abc123).`
+	if got != want {
+		t.Errorf("prBody(_) = %q, want %q", got, want)
+	}
 }
 
 // parseOwnerRepo's own table-driven test used to live here -- audit-

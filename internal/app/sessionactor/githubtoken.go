@@ -100,26 +100,25 @@ func (a *Actor) decryptCreatorGitHubToken(ctx context.Context, createdBy pgtype.
 // creatorHasNoGitHubIdentity reports whether createdBy has NO github
 // identity row at all -- as distinct from having one whose stored token
 // is merely unusable (missing, undecryptable). Used by pushpr.go's own
-// createPRBestEffort (review round 1, finding O5) to decide whether its
-// §8.11 bot-identity fallback applies: an OIDC-only creator who has never
-// linked GitHub (this reports true) is exactly the case that fallback
-// exists for -- the honest PR body (see prBody's own doc comment, review
-// round 2 findings P4/P7) points at the sign-in view's own identity
-// panel, never a name or a "Settings -> Identities" page that does not
-// exist. A creator who DOES have a github identity, but whose token has
-// expired, been revoked, or fails to decrypt (this reports false), must
-// NOT be silently re-attributed to the bot: that would misrepresent a
-// token problem as "no linked account" to whoever reviews the PR. That
-// case keeps origin/main's own pre-existing behavior --
-// decryptCreatorGitHubToken's caller simply skips PR creation entirely
-// (see createPRBestEffort's own call site). Also used by pushpr.go's own
-// pushBlockedByMissingGitHubIdentity (review round 2, finding P1) for the
-// SAME "no identity at all" test, before the push is even attempted.
+// pushBlockedByMissingGitHubIdentity (review round 2, finding P1) to
+// decide, before a push is even attempted, whether this creator's push is
+// certain to be denied by scmcredentials.go's own step 10: an OIDC-only
+// creator who has never linked GitHub (this reports true) is exactly that
+// case, and gets a session-visible warning instead of a doomed push
+// attempt (recordPushBlockedNoGitHubIdentity).
+//
+// createPRBestEffort used to call this too, to decide whether its own
+// §8.11 bot-identity fallback applied for a creator with no github
+// identity at all -- review round 3 (finding Q2) removed that fallback:
+// once the push itself is blocked for this creator shape (above), no
+// push_complete for it ever reaches createPRBestEffort in the first
+// place, so the fallback had already gone dead. That function now simply
+// skips PR creation for ANY unusable creator token, no-identity-at-all or
+// merely-unusable alike -- origin/main's own original, pre-round-2
+// behavior (see createPRBestEffort's own call site).
 //
 // A createdBy with no valid row at all (sentinel-auto-fix, no human
-// creator) is treated as "no identity" here too -- never reached by
-// createPRBestEffort's own call site in practice (that path returns
-// earlier via the sentinel-auto-fix branch), but consistent with
+// creator) is treated as "no identity" here too, consistent with
 // decryptCreatorGitHubToken's own identical createdBy.Valid short-circuit.
 func (a *Actor) creatorHasNoGitHubIdentity(ctx context.Context, createdBy pgtype.UUID) bool {
 	if !createdBy.Valid {
