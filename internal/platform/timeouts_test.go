@@ -1559,6 +1559,7 @@ func TestDefaultTimeouts_MCPOAuthFields(t *testing.T) {
 		{"MCPAuthorizationRequestTTL", to.MCPAuthorizationRequestTTL, 10 * time.Minute},
 		{"MCPAuthorizationCodeTTL", to.MCPAuthorizationCodeTTL, 60 * time.Second},
 		{"MCPAccessTokenTTL", to.MCPAccessTokenTTL, time.Hour},
+		{"MCPRefreshTokenTTL", to.MCPRefreshTokenTTL, 30 * 24 * time.Hour},
 		{"MCPGrantMaxLifetime", to.MCPGrantMaxLifetime, 90 * 24 * time.Hour},
 		{"MCPGrantLastUsedWriteInterval", to.MCPGrantLastUsedWriteInterval, 5 * time.Minute},
 		{"MCPDiscoveryCacheMaxAge", to.MCPDiscoveryCacheMaxAge, 5 * time.Minute},
@@ -1576,9 +1577,24 @@ func TestDefaultTimeouts_MCPOAuthFields(t *testing.T) {
 	}
 }
 
-// TestValidate_MCPOAuthChain proves the three MCP ordering links
-// (§43.14/§43.16) are actually checked: breaking any one alone is
-// reported by name.
+// TestValidate_MCPDiscoveryCacheOrderedAgainstNoToken pins a deliberate
+// absence: the discovery documents' cache lifetime is not ordered against
+// any token lifetime, because a client refreshing its access token never
+// re-reads them (MCPDiscoveryCacheMaxAge's own doc comment). A cache
+// lifetime longer than an access token is therefore a valid
+// configuration.
+func TestValidate_MCPDiscoveryCacheOrderedAgainstNoToken(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+	to.MCPDiscoveryCacheMaxAge = 2 * to.MCPAccessTokenTTL
+	if err := to.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil: no link orders MCPDiscoveryCacheMaxAge", err)
+	}
+}
+
+// TestValidate_MCPOAuthChain proves the three MCP ordering links (§43.16)
+// are actually checked: breaking any one alone is reported by name.
 func TestValidate_MCPOAuthChain(t *testing.T) {
 	t.Parallel()
 
@@ -1593,14 +1609,14 @@ func TestValidate_MCPOAuthChain(t *testing.T) {
 			wantChain: "MCPAuthorizationRequestTTL > MCPAuthorizationCodeTTL",
 		},
 		{
-			name:      "access token outlives the grant",
-			mutate:    func(to *platform.Timeouts) { to.MCPAccessTokenTTL = to.MCPGrantMaxLifetime },
-			wantChain: "MCPGrantMaxLifetime > MCPAccessTokenTTL",
+			name:      "access token outlives the refresh token beside it",
+			mutate:    func(to *platform.Timeouts) { to.MCPAccessTokenTTL = to.MCPRefreshTokenTTL },
+			wantChain: "MCPRefreshTokenTTL > MCPAccessTokenTTL",
 		},
 		{
-			name:      "discovery documents cached for a whole token lifetime",
-			mutate:    func(to *platform.Timeouts) { to.MCPDiscoveryCacheMaxAge = to.MCPAccessTokenTTL },
-			wantChain: "MCPAccessTokenTTL > MCPDiscoveryCacheMaxAge",
+			name:      "refresh token outlives the grant",
+			mutate:    func(to *platform.Timeouts) { to.MCPRefreshTokenTTL = to.MCPGrantMaxLifetime },
+			wantChain: "MCPGrantMaxLifetime > MCPRefreshTokenTTL",
 		},
 	}
 	for _, tc := range tests {
