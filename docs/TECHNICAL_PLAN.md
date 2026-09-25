@@ -7036,12 +7036,16 @@ own — the code's, fixed when the chain began, never the grant's, which a later
 token to it. A `scope` must name only
 advertised scopes (`invalid_scope`), and each must be one the PRESENTED refresh token holds — its own
 scopes, hierarchy included (`mcpscope.Covers`), never the grant's — so a refresh narrows or keeps, and
-never widens (`invalid_scope`); an absent `scope` keeps the presented token's scopes. Presenting a
-refresh token that was already rotated is a replay, and so is presenting one as a client it was not
-issued to, rotated or not (that client never received it): the grant is deleted (§43.16) and the answer
-is `invalid_grant`. The answer is `invalid_grant` too, revoking nothing, for a refresh token that is
-unknown or expired, whose chain has reached its end, or whose grant has expired or been revoked, and for
-an access token presented as one. Unlike a code, a refresh token
+never widens (`invalid_scope`); an absent `scope` keeps the presented token's scopes. A refresh token
+past its own expiry, whose chain has reached its end (`chain_expires_at`), or whose grant has expired is
+answered `invalid_grant` and revokes nothing — rotated or not, and whichever client presents it. These
+three lifetimes are checked first, before either replay check, so the answer is the same whether or not
+the expired-credential sweep has deleted the row yet (once it has, the token is unknown). Only a refresh
+token still inside all three can be a replay. Presenting one that was already rotated is a replay, and
+so is presenting one as a client it was not issued to, rotated or not (that client never received it):
+the grant is deleted (§43.16) and the answer is `invalid_grant`. The answer is `invalid_grant` too,
+revoking nothing, for a refresh token that is unknown or whose grant has been revoked, and for an access
+token presented as one. Unlike a code, a refresh token
 is **not** spent by a refusal: every check runs before the rotation and a refused request writes
 nothing, so a client can correct a `scope` or `resource` and retry with the same token rather than
 tripping reuse detection. Success rotates the presented token and answers exactly like the code
@@ -7059,7 +7063,8 @@ the requesting client, its whole grant is deleted, so both token types revoke th
 that is unknown, already gone, or issued to another client is left alone and gets the very same answer:
 the caller learns nothing about a token that is not its own, and this endpoint never revokes another
 client's authorization (RFC 7009 section 2.1). Presenting another client's refresh token at the token endpoint
-is a different act — an attempt to use a copied credential — and is a replay (§43.16). A disabled client
+is a different act — an attempt to use a copied credential — and is a replay (§43.16), unless the token,
+its chain or its grant has expired, which the token endpoint refuses without revoking. A disabled client
 may still revoke, since revocation only gives access back. Like
 the token endpoint, it reads no cookie; a person disconnects an app from Settings instead (§43.18).
 
@@ -7131,7 +7136,13 @@ and one replay, whichever client sends the second — the second learns of the r
 conditional rotation missing, or, as another client, is a replay at once
 (`TestRefresh_ConcurrentUseIsAReplay` pins both races). The price is that a client retrying a refresh
 whose answer it never received is revoked too, and its user must consent again. A chain past its end,
-or a grant past its absolute lifetime, refreshes nothing, whatever its refresh tokens say.
+or a grant past its absolute lifetime, refreshes nothing, whatever its refresh tokens say. Neither
+replay rule reaches a refresh token past any of its three lifetimes — its own expiry, its chain's end,
+its grant's expiry: the refresh checks those first, and such a token is refused `invalid_grant`,
+revoking nothing, rotated or not and whichever client presents it
+(`TestRefresh_ExpiredTokenIsNeverAReplay`). So what a lapsed token does at the token endpoint never
+depends on when the expired-credential sweep last ran: before the sweep it is refused as expired, after
+it as unknown, and neither revokes.
 **Revocation by the client** (RFC
 7009, §43.14) deletes the grant too, for either token type, only when the token was issued to the
 requesting client, and is audited with reason `client`.
@@ -7241,9 +7252,9 @@ other users' authorizations — and revocation on their behalf — is piece (d).
 | Open redirect, redirect-URI substitution | exact match (loopback-IP port only); a bad `client_id`/`redirect_uri` renders a page and never redirects; the decision redirects to the stored URI, never the form's | `TestMatchRedirectURI_Table`, `TestAuthorize_RedirectURI_Table`, `TestConsent_RedirectsOnlyToStoredURI` |
 | Code interception | PKCE S256 mandatory, 60-second single-use code bound to client, redirect URI and resource | `TestToken_PKCE_WrongVerifierIsInvalidGrant`, `TestToken_PlainChallengeRefusedAtAuthorize`, `TestToken_ExpiredCodeIsInvalidGrant`, `TestToken_CodeForOtherClientIsInvalidGrant`, `TestPKCE_UsesConstantTimeCompare` |
 | Code replay | a second use revokes the grant | `TestToken_CodeReuseRevokesGrant` |
-| Refresh-token theft | rotation on every use; a rotated token presented again — or any refresh token presented by a client it was not issued to — deletes the grant, with no grace window (two racing uses are one use and one replay, whichever client sends the second); a refusal spends nothing, so reuse detection is never tripped by a corrected request; 30 days per rotation, never past the chain's end or the grant; a chain's end is fixed when it begins, so a later consent never keeps a stolen chain alive; a chain or grant past its end refreshes nothing; a refresh token is never a bearer | `TestRefresh_RotationAndReuseRevokesGrant`, `TestRefresh_ConcurrentUseIsAReplay`, `TestRefresh_AnotherClientPresentingIsAReplay`, `TestRefresh_RefreshesNothingItShouldNot`, `TestRefresh_ExpiryCappedByGrant`, `TestRefresh_ChainLifetimeFixedAtIssuance`, `TestRefresh_RefreshTokenIsNeverABearer`, `TestMCPOAuthGrantStore_RefreshTokenRotatesOnce` |
+| Refresh-token theft | rotation on every use; a rotated token presented again — or any refresh token presented by a client it was not issued to — deletes the grant while the token, its chain and its grant are unexpired, with no grace window (two racing uses are one use and one replay, whichever client sends the second); a refusal spends nothing, so reuse detection is never tripped by a corrected request; 30 days per rotation, never past the chain's end or the grant; a chain's end is fixed when it begins, so a later consent never keeps a stolen chain alive; a token, chain or grant past its end refreshes nothing and revokes nothing, even presented as a replay, so the sweep's timing never decides it; a refresh token is never a bearer | `TestRefresh_RotationAndReuseRevokesGrant`, `TestRefresh_ConcurrentUseIsAReplay`, `TestRefresh_AnotherClientPresentingIsAReplay`, `TestRefresh_RefreshesNothingItShouldNot`, `TestRefresh_ExpiredTokenIsNeverAReplay`, `TestRefresh_ExpiryCappedByGrant`, `TestRefresh_ChainLifetimeFixedAtIssuance`, `TestRefresh_RefreshTokenIsNeverABearer`, `TestMCPOAuthGrantStore_RefreshTokenRotatesOnce` |
 | Mix-up | `iss` on every authorization response, advertised | `TestAuthorize_IssOnSuccessAndError`, the end-to-end test's own SDK issuer check |
-| Audience confusion | `resource` required and bound at authorize and at the code exchange, checked when sent on a refresh (and the refresh chain's own on every refresh — fixed when the chain began, so a later consent never rebinds it), and on every call | `TestAuthorize_ResourceMismatchIsInvalidTarget`, `TestToken_ResourceMismatchIsInvalidTarget`, `TestRefresh_ResourceMustMatch`, `TestBearer_GrantResourceMismatchIs401` |
+| Audience confusion | `resource` required and bound at authorize and at the code exchange, checked when sent on a refresh (and the refresh chain's own on every refresh — fixed when the chain began, so a later consent never rebinds it), and on every call | `TestAuthorize_ResourceMismatchIsInvalidTarget`, `TestToken_ResourceMismatchIsInvalidTarget`, `TestRefresh_ResourceMustMatch`, `TestRefresh_ChainLifetimeFixedAtIssuance`, `TestBearer_GrantResourceMismatchIs401` |
 | Token passthrough | the bearer gate strips the header; the twin's synthesized request carries no header at all | `TestRequireMCPBearer_AttachesPrincipalAndStripsToken`, `TestBridge_NoAuthorizationHeaderReachesTwin` |
 | Consent clickjacking and CSRF | frame headers; SameSite cookie, hashed per-render nonce, same-origin check, request bound to one user | `TestConsent_FrameHeaders`, `TestConsent_MissingOrWrongNonceRefused`, `TestConsent_CrossSiteOriginRefused`, `TestConsent_OtherUserCannotDecide` |
 | Scope escalation, at consent and on refresh | consent narrows only; unadvertised scopes refused; a token's scopes are fixed at issuance, so a later consent can neither widen nor narrow it — the refresh token a code is exchanged for holds the code's scopes, never the grant's; a refresh narrows only relative to the presented refresh token, never to the grant's scopes, so a later wider consent never widens a refresh chain | `TestConsent_CannotAddUnrequestedScope`, `TestAuthorize_UnadvertisedScopeRefused`, `TestToken_ScopesFixedAtIssuance_LaterConsentCannotWiden`, `TestToken_ScopesFixedAtIssuance_LaterConsentCannotNarrow`, `TestRefresh_CannotWidenScope`, `TestCovers_Matrix` |
