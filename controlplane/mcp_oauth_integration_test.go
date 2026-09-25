@@ -58,7 +58,7 @@ import (
 // disabled-capability body.
 const mcpDisabledBody = `{"error":"this capability is not enabled on this deployment"}`
 
-// createRouterUser creates a user of role, with a GitHub identity and a
+// createRouterUser creates a user of role, with a linked sign-in identity and a
 // live session cookie.
 func createRouterUser(ctx context.Context, t *testing.T, pool *pgxpool.Pool, role sqlcgen.UserRole) (sqlcgen.User, string) {
 	t.Helper()
