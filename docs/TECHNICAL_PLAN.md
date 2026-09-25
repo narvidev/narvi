@@ -1297,6 +1297,13 @@ cannot resolve — absent, null, or naming something it cannot see. That is a th
 "matches" and "differs", and it must never satisfy a freshness check: an absent value is not evidence
 that a review still covers the code. §21.1's amended context rule is what this feeds.
 
+**A parent closed without merging ends the wait it created (upstream parity).** The deferral above
+waits for a parent to merge and for the provider to re-target its child. A parent closed unmerged
+does neither: the child keeps a base that will never merge, no re-target follows, and the deferral
+would hold forever while its notice still says it is waiting for the parent. The close is routed like
+the other membership events above, and the notice is replaced by one naming the closed parent and
+what unblocks the pull request: re-targeting it, or an explicit trigger, which stays ungated.
+
 One question this section does **not** settle, deliberately: whether a trigger policy should look at
 a PR's direct parent or at the stack's ultimate target. The review's diff is the increment against
 the direct parent and stays that way — §21.1 is explicit that a verdict pinned to one head cannot
@@ -5667,6 +5674,9 @@ stopped by inactivity and restored on the next prompt, exactly as now.
 - **Fencing is unchanged and load-bearing**: a rotation increments `sandbox.gen` like any other
   restore, and the superseded identity is locked out immediately rather than at its natural expiry.
   §9.3 scenario 6 already covers the stale-gen reconnect this produces.
+- **A snapshot that finds its sandbox gone keeps the last valid one (upstream parity).** A rotation
+  whose snapshot fails because the sandbox already exited, or is shutting down, restores from the
+  previous valid snapshot and records the failure. The failed attempt never becomes a restore point.
 
 `RotationRunwayFloor` is a new entry in `platform/timeouts.go` and nowhere else (§11), and the gate
 itself is a pure decision function in `internal/domain/sandbox`, added to the exhaustive
@@ -6042,6 +6052,31 @@ visible in production.
   afterwards has no session to reach, and delivering it to the last session known is worse than
   reporting that there is none.
 
+**What makes a train recoverable, not merely correct (amendment, upstream parity).** The bullets above
+say what a link is. Four more say what happens when the machinery around a link fails or a human
+steps in; upstream shipped each of them after a train stalled in a way nobody could clear.
+
+- **A spawn claim is a lease, not a one-way door.** §39.1's short-lived claim holds a session id
+  reserved before the session is created, and an expiry. An expired claim is recovered by whoever
+  finds it: if the reserved session exists, it is adopted as the link's session; if not, the spawn is
+  retried a bounded number of times, and then the link takes its terminal outcome with the reason. A
+  claim only its original holder could release is a link that stalls forever the first time a process
+  dies between claiming and spawning.
+- **A predecessor merged by a human clears the gate.** §39.3 advances on a verdict. A human who merges
+  the predecessor's pull request without a clean verdict (under §21.1b's acceptance, for instance) has
+  given the strongest authorization this system can observe, and a successor waiting on a verdict that
+  will not change would wait forever. A merge, as the source-control provider reports it, releases the
+  successor, whose base then resolves at start as the bullet on effective bases requires.
+- **Resume is the inverse of Stop.** A stopped train resumes only on an explicit, audited human action,
+  which releases the links still waiting and never a link whose ticket was closed in the meantime.
+- **Replanning is a decision, not a default.** The mother plans once (§39.1). Letting a second
+  submission for the same parent replace only the links that have not started (a started link's
+  ticket, session and branch stay immutable, and a replan is refused while any spawn is claimed) is
+  what would make a wrong decomposition correctable without stopping the whole train. It changes
+  §39.1's rule rather than completing it, so it is recorded as an open decision in
+  `docs/DECISIONS.md`. An agent advancing the train itself, from the ticket or through a tool, is not
+  among the options: the train advances on server-observed facts only.
+
 ### 39.6 What this changes in §17.6, stated rather than left to be noticed
 §17.6 declines to build an N-deep stack producer, on the ground that "nothing else in this plan
 produces a chain of more than two dependent pull requests today." That premise was true when
@@ -6188,6 +6223,14 @@ progress** — the whole failure being bounded is an agent that believes it is a
 self-report is the one signal that cannot be trusted here, and a tool call announcing success must
 not reset this window. The check is therefore server-side and fires whether or not the agent
 cooperates, which distinguishes it from any budget the agent is asked to respect.
+
+**Attempts are counted by the server (upstream parity).** The attempts in this window are the turns
+this control plane dispatched within it, counted from the rows that exist, never a number of attempts
+the agent reports about itself through a tool. Upstream removed exactly such a self-declared counter
+from its own no-progress budget: an agent that never calls the tool never consumes it, and a diligent
+one that records every retry is the one it stops. And because expiry closes the session to new turns
+and lets the one in flight end rather than cancelling it, upstream's reporting window before
+cancellation has no counterpart here to build.
 
 The window resets on observed progress and on nothing else. Its expiry is not a failure and not a
 `failed` status: same shape as a bound above, a named reason, a persisted `warning`, one notice, and
@@ -6625,6 +6668,15 @@ result/verdict tools, bounded wait, and transcript paging; 183 adds plan read/ap
 prompt-while-running, stop, and delegate (create session). Repository discovery (`narvi_list_repositories`)
 is deliberately absent from 180 too: this codebase has no `GET /api/repos` route for it to sit over,
 and the one-adapter rule (§43.7) means a tool ships only once its HTTP twin exists.
+
+**Two requirements on 182's tools (upstream parity).** A verdict the reviewing turn produced but whose
+publication is still pending (an outbox row not yet delivered, or deferred by a rate limit, §44.2) is
+neither absent nor published: the verdict tool returns its content, its publication state and the
+cause of the delay, and never answers that nothing was reviewed. A client told there is no verdict
+starts a second review the first one already paid for. And every tool in §43.8's table is exercised
+by at least one scenario through the production router, checked by a test that enumerates the table
+and fails on a tool no scenario calls, beside §43.9's twin-registration test: a tool added without a
+real path through the router is a tool whose authorization nobody exercised.
 
 ### 43.2 Authentication: a bearer token from this deployment's own authorization server
 
@@ -7278,3 +7330,155 @@ client revoke its refresh token at the advertised revocation endpoint and its ve
 The same test proves the surface switched off: the discovery documents and every `/oauth` route answer
 the disabled `503`, and the Settings routes still list and revoke. The parity suite of §43.12 now runs
 over bearer principals minted per role.
+
+## 44. The GitHub App pool (new capability)
+
+Adopted by owner decision on 2026-09-25, without waiting for a measured saturation. This section
+specifies what that decision builds. It starts with what the pool is **for** in this design, because
+one of the reasons a pool exists elsewhere is a question this document should not answer by accident.
+
+### 44.1 What the pool is for, and what it is not
+
+Three purposes, none of which needs a rate-limit argument:
+
+- **Roles one credential cannot hold at once.** The only GitHub App this deployment can mint tokens
+  for is refused at boot unless it is read-only (`verifyGitHubAppScopeAtBoot`, `controlplane/boot.go`),
+  because it backs §30.4's read-only mint. Every write the control plane makes on its own behalf goes
+  through `NARVI_GITHUB_BOT_TOKEN`, a static string read once at boot (`platform.Config.GitHubBotToken`).
+  GitHub's own documentation for check runs says: "To create a check run, you must use a GitHub App."
+  An App's installation token expires after one hour. So the `narvi/review` check §21.1b specifies and
+  Step 174 publishes has no durable credential today: a personal token cannot create it, and an
+  installation token pasted into the environment stops working an hour after boot. Granting
+  `checks:write` to an installation does not change that on its own. The read role and the publish
+  role need different Apps, and this design has no way to hold the second.
+- **Rotation and retirement without an outage.** Replacing the one bot credential today means a
+  restart, and any write attempted between revoking the old credential and booting with the new one
+  fails. A retiring App drains instead.
+- **One identity per turn.** A turn's push, pull request, review, comments and check are attributed to
+  one App, chosen once, and a retry never changes the author.
+
+**What it is not: a way to multiply one workload's rate limit.** Section H of GitHub's Terms of
+Service reads: "You may not share API tokens to exceed GitHub's rate limitations", and the same
+section says GitHub may offer subscription-based access to users who need high throughput. Whether
+several Apps registered by one operator for one workload fall under that sentence is GitHub's call,
+not this document's. Budget-aware selection (§44.6) is built, because choosing among Apps that are each needed
+for their own reason is ordinary scheduling; registering Apps **in order to** gain headroom is a
+different act, and whether a deployment may do it is recorded as an open decision in
+`docs/DECISIONS.md` rather than settled by default.
+
+### 44.2 GitHub's deadlines are honored end to end
+
+This applies with one App as much as with several, which is why it is the first Step of the phase.
+
+What exists: `githubapi.APIError` carries `Status`, `Message` and `RateLimited`, and no deadline.
+`isRateLimitedResponse` reads `x-ratelimit-remaining` and the presence of `retry-after` to set that
+boolean, then discards both values. The outbox retries every failure the same way
+(`domain/outbox.EvaluateBackoff`: 30 seconds doubling to a 5-minute plateau, dead-letter at
+`MaxAttempts`, 10), so a primary limit reached early in its hour dead-letters about 33 minutes later,
+before the reset, and the notification is lost although nothing was wrong except the time.
+
+The rule:
+
+- The adapter's error carries the deadline GitHub stated, typed: `x-ratelimit-reset` when
+  `x-ratelimit-remaining` is `0`, `retry-after` when present, and otherwise the one-minute floor
+  GitHub's own guidance gives for a secondary limit. Never re-derived from message text.
+- A rate-limited failure is rescheduled **at** that deadline rather than on the backoff curve, and it
+  does not spend the dead-letter budget. A separate, longer ceiling in `platform/timeouts.go` still
+  bounds a row that stays rate-limited, and dead-letters it naming the rate limit as the reason.
+- A permission or authentication refusal is not a rate limit. The 403 split `isRateLimitedResponse`
+  already draws is kept, and those refusals keep their existing path.
+- Every GitHub caller that retries on its own schedule outside the outbox receives the same deadline.
+  The Step enumerates them rather than leaving any on a fixed interval; the auto-merge worker and the
+  image freshness pump (§19) are two known ones.
+
+### 44.3 Budgets are observed, never assumed
+
+Per credential (the bot token, or one App installation) and per GitHub resource: limit, remaining,
+used and reset, read from the headers of responses to requests this system actually made, with the
+time observed and whether the reading came from a response or a probe.
+
+- **Never observed is its own state.** An installation nothing has called yet has an unknown budget,
+  not a full one. Reading an absent measurement as a full budget is the same shape as an unassessed
+  review rendering clean.
+- **A probe is labeled as a probe.** A rate-limit endpoint read answers a different question from a
+  response header; it is recorded beside the response-sourced reading, never merged into it.
+- **The first consumer is background shedding.** Below a floor, background reads (the image freshness
+  pump, reconcile sweeps) defer with a recorded reason; human-initiated work and publications do not.
+  A count of `gh` commands a sandbox ran is not a count of HTTP requests and is never presented as one.
+
+### 44.4 The registry, its roles and its states
+
+Each App is registered with its id, its bot login, its private key and webhook secret (encrypted at
+rest with `platform.EncryptToken`, never readable back through any API), its installations (account,
+repositories reached, permissions as GitHub reports them), one role and one state.
+
+- **Roles.** `read`: every sandbox clone that needs no write (shadow, image builds, review), which is
+  §30.4's mint. `publish`: the writes the control plane makes on its own behalf (formal reviews,
+  comments, labels, check runs). `work`: a push or pull request for a session that no human GitHub
+  identity covers.
+- **Eligibility is derived, never declared.** An App is eligible for a role on a repository only if an
+  active installation reaches that repository with the permissions the role needs, as GitHub reports
+  them (installation webhooks, and a periodic re-read). An App whose permissions exceed its role is
+  refused at registration, which generalizes today's boot refusal of a writable read App.
+- **States.** `active`; `retiring` (no new binding, existing ones finish); `retired`.
+- **Seeded from configuration.** Today's `NARVI_GITHUB_APP_ID` App becomes the `read` App. A deployment
+  configured exactly as today boots with a one-row registry and behaves exactly as it does now.
+- **Writes are admin-only and audited** (§13.3).
+
+What the `work` role does not settle: whether a session whose creator has no linked GitHub identity
+(§41.3's OIDC-only user) may push through a bounded App credential at all. That question was left
+open when OIDC sign-in shipped; the registry makes either answer implementable and gives neither.
+
+### 44.5 Tokens are minted per purpose, and a cache never widens one
+
+- An installation token is minted per (App, installation, repositories, permissions requested),
+  narrowed with the `repositories` and `permissions` parameters GitHub's mint accepts, which is the
+  narrowing §30.4's read-only mint already performs. It is cached until shortly before GitHub's own
+  `expires_at`.
+- The cache key includes what was requested. A request for read never receives a cached token minted
+  for write, and a request for one repository never receives a token minted for several.
+- A token's granted permissions are checked against the request before use, as §30.4(4) already does
+  for the read-only mint.
+- With no `publish` App registered, the static bot token stays in use exactly as today and boot says
+  so. The migration is additive.
+
+### 44.6 A turn's App is bound once, durably
+
+When a turn needs a `work` or `publish` identity, one eligible App is chosen and bound to the turn
+with an expiring claim, atomically (§5.1's claim idiom), so two dispatchers cannot bind two Apps to
+one turn, and a restart finds the binding rather than choosing again.
+
+- Every write the turn causes uses its binding: push, pull request, review, comments, check. A retry
+  never silently changes the author.
+- A check run records the App that created it and is updated through that App for its whole life. The
+  publisher's self-learned writer identity (§21.1b's selection by head and App) becomes a fact per
+  check rather than per process, so a change to the pool never orphans a live check.
+- Selection reads §44.3's budgets, treats unknown as unknown, and never binds a retiring App.
+
+### 44.7 Webhooks from several Apps, and retirement
+
+- **One App is the designated receiver.** With several Apps installed on one repository, GitHub sends
+  the same event once per App, each under its own delivery id, so the per-delivery claim (§5.1) would
+  process it once per App. Deliveries from the other Apps are verified with their own secret and then
+  not processed. Changing the receiver designates the new one before the old one stops.
+- **Every registered App's bot login is this system's own.** Today the ingress recognizes itself by a
+  single configured handle; with several Apps, a comment from any of them must never re-trigger a
+  review or an automation.
+- **Retirement drains.** A retiring App takes no new binding, work already bound to it finishes, and
+  it becomes retired once nothing references it. The receiver cannot be retired before another is
+  designated.
+
+### 44.8 The operator surface
+
+An admin-only Settings view with one row per App: role, state, installations and eligible
+repositories, budget with its provenance and age ("never observed" shown as such), live bindings and
+recent refusals. Register, rotate a key, retire and designate the receiver are audited actions. A
+runbook under `docs/runbooks/` covers registering a second App, rotating a private key, retiring an
+App and moving the receiver.
+
+### 44.9 Phasing
+
+Phase 20, appended. The deadline rule (§44.2) comes first because it repairs a shipped behavior with
+one App. The registry comes before any consumer. The publisher is the first consumer because it is
+the one that makes a shipped Step work. Binding needs the budgets it selects on. Webhooks with several
+Apps and the operator surface come last, because a second App is what makes them matter.
