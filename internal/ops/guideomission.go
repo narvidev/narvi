@@ -162,7 +162,11 @@ var RouteGuideExemptions = []RouteGuideExemption{
 	},
 	{
 		Route:  "POST /oauth/token",
-		Reason: "OAuth token endpoint for MCP clients (internal/adapters/inbound/mcpauth's Token): the MCP client program itself exchanges an authorization code for an access token here after the person approved it on the consent page (documented in web.md) -- no page of this web app posts to it, and it reads no cookie.",
+		Reason: "OAuth token endpoint for MCP clients (internal/adapters/inbound/mcpauth's Token): the MCP client program itself exchanges an authorization code for an access token here after the person approved it on the consent page (documented in web.md), and later trades its refresh token for a new one -- no page of this web app posts to it, and it reads no cookie.",
+	},
+	{
+		Route:  "POST /oauth/revoke",
+		Reason: "OAuth token revocation endpoint (RFC 7009) for MCP clients (internal/adapters/inbound/mcpauth's Revoke): an MCP client program gives back one of its own tokens here, for instance when the person signs out of it -- no page of this web app posts to it and it reads no cookie; a person disconnects an app from Settings instead (DELETE /api/me/mcp-authorizations/{authorizationID}, documented in web.md).",
 	},
 }
 
