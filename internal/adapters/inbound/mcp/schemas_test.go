@@ -348,8 +348,11 @@ func (s jsonschemaRefSite) String() string {
 // refuses to build a handler without a complete schema map and serves
 // every request from a private copy taken at construction; and
 // TestInjectedSchemaMap_DecidesEveryToolCall drives newHandler's full
-// HTTP path with a reject-all and an accept-all map, so any layer that
-// validates a request against something other than that map fails it.
+// HTTP path with a reject-all and an accept-all map, so a layer that
+// validates a request against something other than that map fails it
+// when its verdict differs from the map's on one of the arguments
+// objects the test sends -- for every keyword those rows probe, and no
+// wider (round 7 review, finding W1).
 //
 // What this test checks, for every non-_test.go file of this package in
 // every shippedBuildContexts entry, resolving identifiers with go/types
@@ -380,10 +383,17 @@ func (s jsonschemaRefSite) String() string {
 //   - reflection or any other dynamic dispatch.
 //
 // Each of these fails TestInjectedSchemaMap_DecidesEveryToolCall when a
-// request validates against its result. When nothing does -- a
-// request-path compile whose result is discarded -- no outcome changes,
-// and only an isolated `go test -race -run
-// TestToolCall_ConcurrentFirstCalls_NoRace` shows it.
+// request validates against its result and that verdict differs from
+// the injected map's on one of the arguments objects the test sends --
+// for every keyword those rows probe, and no wider. It passes when
+// nothing validates against the result (a request-path compile whose
+// result is discarded), and when the verdict agrees with the injected
+// map on every row sent: a validator built only from a keyword
+// BuildRequest enforces itself, or applied to a form of the arguments
+// that hides a row's violation (the top of toolhandler_test.go lists
+// these). Only an isolated `go test -race -run
+// TestToolCall_ConcurrentFirstCalls_NoRace` shows those, and only when
+// the compile shares a compiler across requests.
 func TestNoSecondJSONSchemaCompiler(t *testing.T) {
 	// Keyed by the reference's own file:line:column, so a file compiled
 	// in more than one build context is counted once.

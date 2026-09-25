@@ -599,12 +599,16 @@ func TestToolCall_TwinPanicIsRecovered(t *testing.T) {
 // toolhandler_test.go has the full account). newHandler refuses a
 // schema map with a missing or nil entry and serves from a private copy
 // taken at construction. TestInjectedSchemaMap_DecidesEveryToolCall
-// fails, cache warm or not, whenever any layer of newHandler's request
-// path validates against something other than that map. Neither can see
-// a request-path compile whose result is discarded, since that changes
-// no outcome; only an isolated run of this test does. This test stays
-// as the runtime check for races in per-handler state and in the
-// concurrent Validate path itself.
+// fails, cache warm or not, when a layer of newHandler's request path
+// validates against something other than that map and its verdict
+// differs from the map's on one of the arguments objects the test
+// sends -- for every keyword those rows probe, and no wider. Neither
+// sees a request-path compile whose result is discarded, or one whose
+// verdict agrees with the map on every row sent (the top of
+// toolhandler_test.go lists those shapes); only an isolated run of this
+// test does, and only when that compile shares a compiler across
+// requests. This test stays as the runtime check for races in
+// per-handler state and in the concurrent Validate path itself.
 func TestToolCall_ConcurrentFirstCalls_NoRace(t *testing.T) {
 	const n = 64
 	handler := newTestHandler(t, true, true, testTwins())
