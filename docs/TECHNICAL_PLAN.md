@@ -6911,13 +6911,16 @@ carry its own foreign `Origin`, cannot reach `/mcp` even with a valid token. Rel
 bearer-authenticated requests is a separate, later decision; native and desktop clients, which send no
 `Origin`, are unaffected.
 
-Row 181 ships in four pieces behind the existing flag (§43.11). (a) — this section as written — is the
-authorization-code core: discovery, pre-registered clients, authorization with consent, code-for-token
-exchange, bearer verification on every call, scope-gated discovery, and user revocation in Settings.
-(b) adds refresh tokens with rotation and reuse detection and an RFC 7009 revocation endpoint; (c) adds
-client ID metadata documents and dynamic client registration; (d) adds the admin view of other users'
-authorizations, rate limits and the pending-request cap. Until (b), a client re-runs the authorization
-flow when its access token expires.
+Row 181 ships in four pieces behind the existing flag (§43.11). (a) is the authorization-code core:
+discovery, pre-registered clients, authorization with consent, code-for-token exchange, bearer
+verification on every call, scope-gated discovery, and user revocation in Settings. (b) adds refresh
+tokens with rotation and reuse detection, and an RFC 7009 revocation endpoint through which a client
+gives its tokens back. This section describes both as built. (c) adds client ID metadata documents and
+dynamic client registration; (d) adds the admin view of other users' authorizations, rate limits and
+the pending-request cap. A client in use refreshes its access token with the refresh token issued
+beside it and goes back through consent only when that refresh token lapses unused
+(`MCPRefreshTokenTTL`), when the grant reaches its absolute lifetime (`MCPGrantMaxLifetime`), or after
+a revocation.
 
 ### 43.14 Discovery documents and endpoints
 
@@ -6932,17 +6935,22 @@ two consent routes read the cookie themselves, and nothing else here accepts one
 | `GET /oauth/authorize` | the user's browser, opened by the client | validate the request, record it, send the browser to consent (or sign-in first) |
 | `GET /oauth/consent?request=<id>` | the user's browser | the consent page |
 | `POST /oauth/consent` | the consent page's own form | approve or deny |
-| `POST /oauth/token` | the MCP client program | exchange a code for an access token |
+| `POST /oauth/token` | the MCP client program | exchange a code for an access token and a refresh token, or a refresh token for new ones |
+| `POST /oauth/revoke` | the MCP client program | give a token back (RFC 7009), revoking its whole authorization |
 
 The protected-resource document is `{"resource", "authorization_servers":[issuer], "scopes_supported",
 "bearer_methods_supported":["header"], "resource_name"}`, served only at the path-inserted location: a
 root `/.well-known/oauth-protected-resource` would have to name `PublicBaseURL` itself as the resource,
 and a client falling back to it would ask for a token with the wrong audience. The authorization-server
-document is Narvi's own small struct — issuer, both endpoints, the advertised scopes, `response_types`
-`["code"]`, `response_modes` `["query"]`, `grant_types` `["authorization_code"]`,
-`token_endpoint_auth_methods` `["none"]`, `code_challenge_methods` `["S256"]`, and
+document is Narvi's own small struct — issuer, the authorization, token and revocation endpoints, the
+advertised scopes, `response_types` `["code"]`, `response_modes` `["query"]`, `grant_types`
+`["authorization_code", "refresh_token"]`, `token_endpoint_auth_methods` `["none"]`,
+`revocation_endpoint_auth_methods` `["none"]`, `code_challenge_methods` `["S256"]`, and
 `authorization_response_iss_parameter_supported: true` — with no `jwks_uri` (no token here is a JWT), no
-revocation or registration endpoint, and no metadata-document support until the pieces that build them.
+registration endpoint, and no metadata-document support until the piece that builds them. No
+`offline_access` scope is offered: refresh tokens are issued by policy to every client that completes
+the code flow, never gated on a scope (the MCP authorization spec asks a resource server not to list
+one).
 Both documents carry `Cache-Control: public, max-age=<MCPDiscoveryCacheMaxAge in seconds>` (§43.16)
 and `Access-Control-Allow-Origin: *`.
 
@@ -7001,8 +7009,9 @@ consumes the request and redirects with `error=access_denied`; a refusal is not 
 answers JSON with `Cache-Control: no-store`. Client authentication is the public-client form: `client_id`
 in the body, or HTTP Basic with an empty secret (what a standard OAuth library's auto-detection tries
 first); both present must agree, any client secret is refused, and a `client_id` Postgres cannot
-store (invalid UTF-8, a NUL byte) is an unknown client. Only `grant_type=authorization_code` is
-supported. A missing `resource`, or one that is not this deployment's canonical resource, is
+store (invalid UTF-8, a NUL byte) is an unknown client; a disabled client gets no token. Two grants
+are supported, `authorization_code` and `refresh_token`; any other is `unsupported_grant_type`. For the
+code grant, a missing `resource`, or one that is not this deployment's canonical resource, is
 `invalid_target` (RFC 8707 §2); like every refusal decided from the request alone — a malformed or
 missing parameter, a failed client authentication, an unsupported grant type — it is answered before
 the code is looked up and leaves the code unspent (still bound by PKCE, still expiring after
@@ -7013,10 +7022,36 @@ the attempt whatever follows: an expired code, one issued to another client, a `
 differs from the stored one, or a `code_verifier` whose S256 digest does not equal the stored challenge
 (compared in constant time) is `invalid_grant`, and a code whose stored resource is not this
 deployment's canonical resource (possible only if `PublicBaseURL` changed between authorization and
-exchange) is `invalid_target`. Success issues one access token (`MCPAccessTokenTTL`, never past the
-grant's own expiry) holding exactly the code's scopes, and answers `access_token`, `token_type`
-`Bearer`, `expires_in`, and `scope` — always present, because the user may have narrowed it, and always
-the token's own scopes.
+exchange) is `invalid_target`. Success issues one access token (`MCPAccessTokenTTL`) and one refresh
+token (`MCPRefreshTokenTTL`), neither past the grant's own expiry, both holding exactly the code's
+scopes, and answers `access_token`, `token_type` `Bearer`, `expires_in`, `scope` — always present,
+because the user may have narrowed it, and always the tokens' own scopes — and `refresh_token`.
+
+**The refresh grant** takes `refresh_token`, an optional `scope` and an optional `resource`. A
+`resource` that is sent must be this deployment's canonical resource (`invalid_target`); a standard
+OAuth library sends none, since the grant already binds the token to it. A `scope` must name only
+advertised scopes (`invalid_scope`), and each must be one the PRESENTED refresh token holds — its own
+scopes, hierarchy included (`mcpscope.Covers`), never the grant's — so a refresh narrows or keeps, and
+never widens (`invalid_scope`); an absent `scope` keeps the presented token's scopes. Presenting a
+refresh token that was already rotated is a replay: the grant is deleted (§43.16) and the answer is
+`invalid_grant`. So is a refresh token that is unknown, expired, issued to another client, or whose
+grant has expired or been revoked, and an access token presented as one. Unlike a code, a refresh token
+is **not** spent by a refusal: every check runs before the rotation and a refused request writes
+nothing, so a client can correct a `scope` or `resource` and retry with the same token rather than
+tripping reuse detection. Success rotates the presented token and answers exactly like the code
+grant: a new access token and a new refresh token, both holding the presented token's scopes or the
+narrowing asked for.
+
+**The revocation endpoint** (`POST /oauth/revoke`, RFC 7009) takes `token`, an optional
+`token_type_hint`, and the same public-client identification as the token endpoint. A request that
+cannot be read is `invalid_request`, and one whose client cannot be identified is `invalid_client`;
+every other request is answered `200` with an empty body, whatever happened. If the token — an access
+token or a refresh token, expired or rotated or not; the hint only decides which is looked up first —
+was issued to the requesting client, its whole grant is deleted, so both token types revoke the same
+thing. A token that is unknown, already gone, or issued to another client is left alone and gets the
+very same answer: the caller learns nothing about a token that is not its own, and a client can never
+revoke another's. A disabled client may still revoke, since revocation only gives access back. Like
+the token endpoint, it reads no cookie; a person disconnects an app from Settings instead (§43.18).
 
 ### 43.15 Clients: pre-registration, metadata documents, dynamic registration
 
@@ -7044,38 +7079,58 @@ enum already carries their two values so that piece needs no enum-only migration
 ### 43.16 Grants, tokens, and revocation
 
 A grant (`mcp_oauth_grants`) is a user's authorization of one client — its resource and lifetime — and
-a user holds at most one per client: consenting to the same client again renews the grant's lifetime in
-place (same id) rather than adding a row. Without refresh tokens a client re-runs consent whenever its
-access token expires, and one row per consent would grow the table and the Connected apps list without
-bound. **What a credential may do is fixed when it is issued:** an authorization code carries exactly
-the scopes approved in the consent decision that issued it, the access token it is exchanged for copies
-them, and the bearer check reads the token's own scopes — never the grant's. The grant's `scopes` only
-record the most recent approval, for the Connected apps list, and no authorization decision reads them,
-so a later consent for the same client — from a second install, say, whose `client_id` is shared — can
-neither widen nor narrow a token already issued. Withdrawing access is revocation, not re-consent. The
-grant exists
-if and only if the authorization is live: every authorization code and access token references it
-with `ON DELETE CASCADE`, so revocation is deleting the grant — nothing to invalidate, nothing to
-broadcast. Codes, access tokens and consent nonces are stored only as `platform.HashToken`
-output; the plaintext code and token carry recognizable prefixes (`narvi_mcp_ac_`, `narvi_mcp_at_`) so a
-secret scanner or a reviewer reading a log can tell the family, and the whole string is hashed.
+a user holds at most one per client: consenting to the same client again — from a second install whose
+`client_id` is shared, or after a refresh token lapsed — renews the grant's lifetime in place (same id)
+rather than adding a row, so neither the table nor the Connected apps list grows with every consent.
+**What a credential may do is fixed when it is issued:** an authorization code carries exactly the
+scopes approved in the consent decision that issued it; the access token and the refresh token it is
+exchanged for copy them; a refresh copies the PRESENTED refresh token's scopes into the tokens it issues,
+or narrows them; and the bearer check reads the access token's own scopes. None of these ever reads the
+grant's. The grant's `scopes` only record the most recent approval, for the Connected apps list, and no
+authorization decision reads them, so a later consent for the same client can neither widen nor narrow
+a credential already issued — not an access token, and not a refresh chain either, however long it
+runs. Withdrawing access is revocation, not re-consent. The grant exists if and only if the
+authorization is live: every authorization code, access token and refresh token references it with
+`ON DELETE CASCADE`, so revocation is deleting the grant — nothing to invalidate, nothing to broadcast.
+Codes, access tokens, refresh tokens and consent nonces are stored only as `platform.HashToken`
+output; the plaintext code and tokens carry recognizable prefixes (`narvi_mcp_ac_`, `narvi_mcp_at_`,
+`narvi_mcp_rt_`) so a secret scanner or a reviewer reading a log can tell the family, and the whole
+string is hashed.
+
+**Refresh tokens rotate on every use** (`mcp_oauth_refresh_tokens`, migration 000142): a successful
+refresh marks the presented token rotated, names its successor, and issues a new refresh token — with a
+fresh `MCPRefreshTokenTTL`, never past the grant's expiry — beside a new access token. Access tokens
+issued earlier stay valid until their own expiry. A rotated token is kept until its own expiry so that
+presenting it again is recognised: that is a replay (OAuth 2.1 §4.3.1), and the grant is deleted — the
+legitimate client's tokens with the thief's, since the server cannot tell them apart — with an
+`mcp_authorization.revoked` audit row (reason `refresh_reuse`). There is **no grace window**: two
+refreshes racing with one token are one use and one replay, whichever client sends it. A grant past its
+absolute lifetime refreshes nothing, whatever its refresh tokens say. **Revocation by the client** (RFC
+7009, §43.14) deletes the grant too, for either token type, only when the token was issued to the
+requesting client, and is audited with reason `client`.
 
 Every transaction on these tables takes its row locks in one order, parent before child — the client, then
 the grant, then the requests, codes and tokens under them (written down once, at the top of
-`internal/adapters/outbound/postgres/mcpoauthgrant_store.go`): the consent decision locks the client, and
-the code exchange the client and then the code's grant, `FOR KEY SHARE` before consuming its request or
-code, while every revocation locks the client or the grant before its cascade reaches the rows under it,
-so a revocation racing an issuance waits for it and then deletes what it issued — or the issuance waits
-and finds its parent gone — instead of the two deadlocking (`TestLockOrder_RevocationRacingIssuance`).
+`internal/adapters/outbound/postgres/mcpoauthgrant_store.go`): the consent decision locks the client; the
+code exchange the client and then the code's grant; the refresh the client and then the refresh token's
+grant — each `FOR KEY SHARE`, before consuming its request or code or rotating its refresh token — while
+every revocation (a user's, a client deletion, a code or refresh-token replay, a client's RFC 7009
+request) locks the client or the grant before its cascade reaches the rows under it. So a revocation
+racing an issuance waits for it and then deletes what it issued — or the issuance waits and finds its
+parent gone — instead of the two deadlocking (`TestLockOrder_RevocationRacingIssuance`, both orders of
+every pair).
 
 Lifetimes live in `platform/timeouts.go`: `MCPAuthorizationRequestTTL` (10 minutes, the consent window),
-`MCPAuthorizationCodeTTL` (60 seconds), `MCPAccessTokenTTL` (1 hour), `MCPGrantMaxLifetime` (90 days,
-absolute), `MCPGrantLastUsedWriteInterval` (5 minutes), and `MCPDiscoveryCacheMaxAge` (5 minutes, the
-discovery documents' `Cache-Control` max-age); `Validate` requires the code to expire inside the consent
-window, the token inside the grant, and the discovery cache inside one token lifetime (until (b) a client
-re-authorizes every token lifetime, so each re-authorization reads documents fetched after the previous
-token was issued). The expired-credential sweep deletes expired
-requests, codes, tokens and grants on the same tick as `user_sessions`.
+`MCPAuthorizationCodeTTL` (60 seconds), `MCPAccessTokenTTL` (1 hour), `MCPRefreshTokenTTL` (30 days per
+rotation), `MCPGrantMaxLifetime` (90 days, absolute), `MCPGrantLastUsedWriteInterval` (5 minutes), and
+`MCPDiscoveryCacheMaxAge` (5 minutes, the discovery documents' `Cache-Control` max-age); `Validate`
+requires the code to expire inside the consent window, the access token inside the refresh token, and the
+refresh token inside the grant. The discovery cache is ordered against no token lifetime: a client
+refreshes at the token endpoint it already knows and never re-reads the documents to do so, so no token
+lifetime bounds when it next reads them — the max-age only bounds how stale they are when a client next
+authorizes, and a scope newly offered after an upgrade needs a new consent anyway, since a refresh can
+only narrow. The expired-credential sweep deletes expired requests, codes, access tokens, refresh tokens
+(rotated ones included, once past their own expiry) and grants on the same tick as `user_sessions`.
 
 **Bearer verification** (`auth.RequireMCPBearer`, in place of the cookie middleware on `/mcp`) runs on
 every call: parse exactly one `Authorization: Bearer` token (never a query parameter), hash it, and read
@@ -7130,8 +7185,9 @@ enters discovery without admitting the authz domain into the adapter.
 
 Every user manages their own authorizations in Settings → Integrations, in a "Connected apps" section
 beside the ChatGPT-account link: client name, the scopes of the most recent approval, when it was
-granted, when it was last used, when it expires, and a Revoke action behind a confirmation — the one way
-to withdraw access, since approving an app again never takes back what an earlier approval issued. `GET /api/me/mcp-authorizations`
+granted, when it was last used, when it expires, and a Revoke action behind a confirmation — a person's
+one way to withdraw access (the app itself may also give its tokens back, §43.14), since approving an
+app again never takes back what an earlier approval issued, refresh chains included. `GET /api/me/mcp-authorizations`
 (`authz.ActionViewOwnProfile`) lists the caller's own unexpired grants; `DELETE
 /api/me/mcp-authorizations/{authorizationID}` (`authz.ActionRevokeOwnMCPAuthorization`, open to every
 role and deliberately separate from the connect action so disconnecting can never be taken away) deletes
@@ -7141,10 +7197,12 @@ same panel (`/api/mcp-clients`, §43.15).
 
 Audit rows, each written in the same transaction as the change: `mcp_client.created`,
 `mcp_client.deleted` (resource type `mcp_client`); `mcp_authorization.granted` and
-`mcp_authorization.revoked` with `detail.reason` one of `user`, `client_deleted`, `code_reuse` (resource
-type `mcp_authorization`). A `code_reuse` row is attributed to the grant's user with `detail.actor =
-"system"`. Not audited: denials, failed token requests, token issuance. The admin view of other users'
-authorizations — and revocation on their behalf — is piece (d).
+`mcp_authorization.revoked` with `detail.reason` one of `user`, `client_deleted`, `code_reuse`,
+`refresh_reuse`, `client` (resource type `mcp_authorization`). A `code_reuse` or `refresh_reuse` row is
+attributed to the grant's user with `detail.actor = "system"`; a `client` row (the client's own RFC 7009
+revocation) to the grant's user with `detail.actor = "client"`. Not audited: denials, failed token
+requests, token issuance and refresh, and a revocation request that revoked nothing. The admin view of
+other users' authorizations — and revocation on their behalf — is piece (d).
 
 ### 43.19 Threat model and tests
 
@@ -7153,22 +7211,27 @@ authorizations — and revocation on their behalf — is piece (d).
 | Open redirect, redirect-URI substitution | exact match (loopback-IP port only); a bad `client_id`/`redirect_uri` renders a page and never redirects; the decision redirects to the stored URI, never the form's | `TestMatchRedirectURI_Table`, `TestAuthorize_RedirectURI_Table`, `TestConsent_RedirectsOnlyToStoredURI` |
 | Code interception | PKCE S256 mandatory, 60-second single-use code bound to client, redirect URI and resource | `TestToken_PKCE_WrongVerifierIsInvalidGrant`, `TestToken_PlainChallengeRefusedAtAuthorize`, `TestToken_ExpiredCodeIsInvalidGrant`, `TestToken_CodeForOtherClientIsInvalidGrant`, `TestPKCE_UsesConstantTimeCompare` |
 | Code replay | a second use revokes the grant | `TestToken_CodeReuseRevokesGrant` |
+| Refresh-token theft | rotation on every use; a rotated token presented again deletes the grant, with no grace window (two racing uses are one use and one replay); a refusal spends nothing, so reuse detection is never tripped by a retry; 30 days per rotation, never past the grant, and an expired grant refreshes nothing; a refresh token is never a bearer | `TestRefresh_RotationAndReuseRevokesGrant`, `TestRefresh_ConcurrentUseIsAReplay`, `TestRefresh_RefreshesNothingItShouldNot`, `TestRefresh_ExpiryCappedByGrant`, `TestRefresh_RefreshTokenIsNeverABearer`, `TestMCPOAuthGrantStore_RefreshTokenRotatesOnce` |
 | Mix-up | `iss` on every authorization response, advertised | `TestAuthorize_IssOnSuccessAndError`, the end-to-end test's own SDK issuer check |
-| Audience confusion | `resource` required and bound at authorize, token and every call | `TestAuthorize_ResourceMismatchIsInvalidTarget`, `TestToken_ResourceMismatchIsInvalidTarget`, `TestBearer_GrantResourceMismatchIs401` |
+| Audience confusion | `resource` required and bound at authorize and at the code exchange, checked when sent on a refresh (and the grant's own on every refresh), and on every call | `TestAuthorize_ResourceMismatchIsInvalidTarget`, `TestToken_ResourceMismatchIsInvalidTarget`, `TestRefresh_ResourceMustMatch`, `TestBearer_GrantResourceMismatchIs401` |
 | Token passthrough | the bearer gate strips the header; the twin's synthesized request carries no header at all | `TestRequireMCPBearer_AttachesPrincipalAndStripsToken`, `TestBridge_NoAuthorizationHeaderReachesTwin` |
 | Consent clickjacking and CSRF | frame headers; SameSite cookie, hashed per-render nonce, same-origin check, request bound to one user | `TestConsent_FrameHeaders`, `TestConsent_MissingOrWrongNonceRefused`, `TestConsent_CrossSiteOriginRefused`, `TestConsent_OtherUserCannotDecide` |
-| Scope escalation | consent narrows only; unadvertised scopes refused; a token's scopes are fixed at issuance, so a later consent can neither widen nor narrow it | `TestConsent_CannotAddUnrequestedScope`, `TestAuthorize_UnadvertisedScopeRefused`, `TestToken_ScopesFixedAtIssuance_LaterConsentCannotWiden`, `TestToken_ScopesFixedAtIssuance_LaterConsentCannotNarrow` |
+| Scope escalation, at consent and on refresh | consent narrows only; unadvertised scopes refused; a token's scopes are fixed at issuance, so a later consent can neither widen nor narrow it; a refresh narrows only relative to the presented refresh token, never to the grant's scopes, so a later wider consent never widens a refresh chain | `TestConsent_CannotAddUnrequestedScope`, `TestAuthorize_UnadvertisedScopeRefused`, `TestToken_ScopesFixedAtIssuance_LaterConsentCannotWiden`, `TestToken_ScopesFixedAtIssuance_LaterConsentCannotNarrow`, `TestRefresh_CannotWidenScope`, `TestCovers_Matrix` |
 | Client identity spoofing | the page shows who registered the client and the true redirect host, with a loopback warning | `TestConsent_ShowsClientIdentityAndRedirectHost` |
-| Revoked, disabled or deleted principals | one join per call, no cache; deleting a client cascades its grants, each audited; a disabled client gets no consent page; a revocation racing a consent or code exchange waits for it, then deletes what it issued (§43.16's lock order) | `TestBearer_NoCacheBetweenCalls`, `TestLockOrder_RevocationRacingIssuance`, `TestOAuth_ProductionRouter/RevokedAuthorizationStopsOnNextCall_User`, `_ClientDeleted`, `_DisabledUser`, `TestOAuth_ProductionRouter/DisabledClientIs401NextCall`, `TestClient_DeleteCascadesGrants`, `TestClient_DeleteAuditsGrantAddedByConcurrentConsent`, `TestConsent_ClientDisabledBeforeRenderRefused` |
+| Revoked, disabled or deleted principals | one join per call, no cache; deleting a client cascades its grants and every refresh chain under them, each grant audited; a disabled client gets no consent page and no token; a client's RFC 7009 revocation of either token type deletes the grant, and never another client's; a revocation racing a consent, code exchange or refresh waits for it, then deletes what it issued (§43.16's lock order) | `TestBearer_NoCacheBetweenCalls`, `TestLockOrder_RevocationRacingIssuance`, `TestRevoke_RFC7009_StopsOnNextCall`, `TestRevoke_Refusals`, `TestMCPOAuthGrantStore_RevocationCascadesRefreshChain`, `TestOAuth_ProductionRouter/RevokedAuthorizationStopsOnNextCall_User`, `_RFC7009`, `_ClientDeleted`, `_DisabledUser`, `TestOAuth_ProductionRouter/DisabledClientIs401NextCall`, `TestClient_DeleteCascadesGrants`, `TestClient_DeleteAuditsGrantAddedByConcurrentConsent`, `TestConsent_ClientDisabledBeforeRenderRefused` |
 | Discovery leak | per-request tool registration by scope; composed instructions; empty defect server | `TestToolsList_ScopeFilter_Table`, `TestInstructions_NameOnlyVisibleTools`, `TestHiddenToolCall_IsIndistinguishableFromUnknownTool`, `TestOAuth_ProductionRouter/ScopelessGrant_ToolsListEmpty` |
 | Phishing through the login return path | the sign-in view accepts only `/oauth/consent?request=<uuid>` as a server-rendered return target; both login handlers accept only same-origin paths | `TestLogin_NextAcceptsConsentPath`, `TestOIDCLogin_NextReturnsToConsentPage`, the sign-in view's own return-to test |
-| Table growth | a TTL on every row kind, swept | `TestExpiredCleanup_SweepsMCPRows` |
+| Table growth | a TTL on every row kind, rotated refresh tokens included, swept | `TestExpiredCleanup_SweepsMCPRows` |
 | A token doing more than its user | same twins, same authz check, role read per call | `TestParity_BearerEqualsCookieForEveryRole` |
 
 The row's exit criterion is proven end to end by `TestOAuth_ProductionRouter/EndToEnd_SDKClient`, on
 the production router itself — `controlplane.Build`'s own, the surface on, served at `PublicBaseURL` —
 never a copy of its routes: the official Go SDK's own client discovers the resource and the
 authorization server from a live `401`, drives consent, exchanges the code, lists exactly the three
-tools, and calls one. The same test proves the surface switched off: the discovery documents and every
-`/oauth` route answer the disabled `503`, and the Settings routes still list and revoke. The parity suite of §43.12 now runs
+tools, and calls one. On the same router, `RefreshAfterAccessTokenExpires_NoSecondConsent` lets the
+access token lapse — on the server and in the client's own clock — and the SDK client refreshes and
+keeps working, twice, with no second consent, and `RevokedAuthorizationStopsOnNextCall_RFC7009` has the
+client revoke its refresh token at the advertised revocation endpoint and its very next call refused.
+The same test proves the surface switched off: the discovery documents and every `/oauth` route answer
+the disabled `503`, and the Settings routes still list and revoke. The parity suite of §43.12 now runs
 over bearer principals minted per role.
