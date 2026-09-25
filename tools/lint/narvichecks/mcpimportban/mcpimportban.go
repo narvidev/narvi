@@ -71,6 +71,10 @@ bridge) may import ONLY:
   - this repo's own contracts and contracts/gen/go/restdtos EXACTLY (never
     a sibling contracts/gen/go/* wire-protocol package, and never
     contracts/contractstest);
+  - this repo's own internal/domain/mcpscope EXACTLY (technical plan
+    §43.17: the scope vocabulary that decides which tools a request may
+    see -- a pure rule with no I/O, never any other domain package, and
+    never a subpackage of it);
   - its own subpackages;
   - the Go standard library, EXCEPT database/sql, database/sql/driver,
     os/exec, and net/rpc.
@@ -149,9 +153,17 @@ var allowedPrefixes = []string{
 // itself also holds contractstest (a test-only package); allowing
 // "contracts" as a PREFIX would sweep all of those in too, which this
 // package has no legitimate reason to import.
+//
+// internal/domain/mcpscope (technical plan §43.17) is here, EXACT, for the
+// same reason: it is the one domain rule this package needs (which tools
+// a grant's scopes let a request see), it holds no I/O and can reach no
+// store, and a PREFIX entry would admit any subpackage someone later adds
+// under it. Every other internal/domain package -- authz above all --
+// stays banned: the tools' authorization is always their REST twins' own.
 var allowedExact = []string{
 	"github.com/narvidev/narvi/contracts",
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos",
+	"github.com/narvidev/narvi/internal/domain/mcpscope",
 }
 
 // matchesPathOrSubpackage reports whether path is exactly prefix, or one

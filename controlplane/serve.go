@@ -51,6 +51,7 @@ import (
 	identitylinkhttp "github.com/narvidev/narvi/internal/adapters/inbound/identitylink"
 	"github.com/narvidev/narvi/internal/adapters/inbound/linear"
 	mcpadapter "github.com/narvidev/narvi/internal/adapters/inbound/mcp"
+	"github.com/narvidev/narvi/internal/adapters/inbound/mcpauth"
 	"github.com/narvidev/narvi/internal/adapters/inbound/slack"
 	"github.com/narvidev/narvi/internal/adapters/inbound/webui"
 	"github.com/narvidev/narvi/internal/adapters/inbound/wshub"
@@ -90,6 +91,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/shadowslack"
 	"github.com/narvidev/narvi/internal/app/uploadsweep"
 	"github.com/narvidev/narvi/internal/domain/integrations"
+	"github.com/narvidev/narvi/internal/domain/mcpscope"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -2591,33 +2593,79 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		}))
 	}
 
+	// The MCP authorization server (technical plan §43.13-§43.16): Narvi
+	// issues the bearer tokens /mcp accepts. Its identifiers (issuer,
+	// resource, both metadata URLs) all derive from cfg.PublicBaseURL
+	// inside mcpauth, and the scopes it offers are exactly the ones the
+	// MCP tool table requires (mcpadapter.AdvertisedScopes) -- the SAME
+	// list the bearer gate's own 401 challenge names below, so the two can
+	// never disagree. Every route is mounted UNCONDITIONALLY behind the
+	// same enabled-gate as /mcp (503 when off, §43.11), and NONE behind
+	// auth.Middleware: the consent routes authenticate the cookie
+	// themselves (a signed-out browser is sent to sign in, not answered
+	// 401), and the token endpoint must never accept a cookie at all.
+	mcpOAuthClientStore := postgres.NewMCPOAuthClientStore(pool)
+	mcpOAuthGrantStore := postgres.NewMCPOAuthGrantStore(pool)
+	mcpAdvertisedScopes := mcpadapter.AdvertisedScopes()
+	mcpAuthServer, err := mcpauth.New(mcpauth.Config{
+		PublicBaseURL: cfg.PublicBaseURL,
+		Enabled:       cfg.MCPEnabled,
+		Scopes:        mcpAdvertisedScopes,
+		Timeouts:      cfg.Timeouts,
+	}, mcpauth.Deps{
+		Pool:         pool,
+		Clients:      mcpOAuthClientStore,
+		Grants:       mcpOAuthGrantStore,
+		UserSessions: userSessionStore,
+		Users:        userStore,
+		AuditLog:     auditLogStore,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("build mcp authorization server: %w", err)
+	}
+	mcpIdentifiers := mcpAuthServer.Identifiers()
+	router.Route("/.well-known/oauth-protected-resource", func(r chi.Router) {
+		r.Use(mcpadapter.RequireEnabled(cfg.MCPEnabled))
+		r.Get("/mcp", mcpAuthServer.ProtectedResourceMetadata)
+	})
+	router.Route("/.well-known/oauth-authorization-server", func(r chi.Router) {
+		r.Use(mcpadapter.RequireEnabled(cfg.MCPEnabled))
+		r.Get("/oauth", mcpAuthServer.AuthorizationServerMetadata)
+	})
+	router.Route("/oauth", func(r chi.Router) {
+		r.Use(mcpadapter.RequireEnabled(cfg.MCPEnabled))
+		r.Get("/authorize", mcpAuthServer.Authorize)
+		r.Get("/consent", mcpAuthServer.ConsentPage)
+		r.Post("/consent", mcpAuthServer.ConsentDecision)
+		r.Post("/token", mcpAuthServer.Token)
+	})
+
 	// /mcp (technical plan §43, "the MCP surface"): the Streamable HTTP
-	// entry point for the first three read-only MCP tools --
-	// narvi_list_models, narvi_list_sessions, narvi_get_session.
-	// Deliberately NOT under /api/ (a protocol endpoint, the same
-	// category as /sessions/{sessionID}/ws or /webhooks/*, never graded
-	// by tools/contractscompat's own /api/-only DiffRoutes) and mounted
-	// UNCONDITIONALLY regardless of cfg.MCPEnabled -- a surface that is
-	// off must be OBSERVABLE as off (503, mcpadapter.RequireEnabled)
-	// rather than a route that does not exist at all (§43.6).
+	// entry point for the read-only MCP tools -- narvi_list_models,
+	// narvi_list_sessions, narvi_get_session. Deliberately NOT under /api/
+	// (a protocol endpoint, the same category as /sessions/{sessionID}/ws
+	// or /webhooks/*, never graded by tools/contractscompat's own
+	// /api/-only DiffRoutes) and mounted UNCONDITIONALLY regardless of
+	// cfg.MCPEnabled -- a surface that is off must be OBSERVABLE as off
+	// (503, mcpadapter.RequireEnabled) rather than a route that does not
+	// exist at all (§43.6).
 	//
-	// Gate order (§43.2/§43.11): mcpadapter.RequireTrustedOrigin runs
-	// FIRST, before every other gate in this group -- the Streamable
+	// Gate order (§43.2/§43.6/§43.11): mcpadapter.RequireTrustedOrigin
+	// runs FIRST, before every other gate in this group -- the Streamable
 	// HTTP transport spec's own "if the Origin header is present and
 	// invalid, servers MUST respond with HTTP 403 Forbidden" is
 	// unconditional, not "once the surface is known to be enabled" or
-	// "once the caller is authenticated" (see that function's own doc
-	// comment for the concrete ordering defect this closes: an invalid
-	// Origin used to get 503/401/-32022 instead of 403 whenever the
-	// request ALSO failed one of those later gates). mcpadapter.
-	// RequireEnabled runs second (503 when off, before the session store
-	// is ever touched), then auth.Middleware, the exact same gate every
-	// /api/** group above already uses -- this surface is cookie-
-	// authenticated, nothing else; 181 is what makes it usable by a
-	// real, non-cookie-holding client. Twins are the SAME three httpapi
-	// handlers /api/models and /api/sessions[/{sessionID}] above already
-	// register -- the bridge invokes them in-process, never a second
-	// implementation (§43.7; mcp/bridge.go's own doc comment).
+	// "once the caller is authenticated". mcpadapter.RequireEnabled runs
+	// second (503 when off, before any credential store is touched), then
+	// auth.RequireMCPBearer: this surface accepts ONLY a bearer token from
+	// the authorization server above, never the cookie every /api/** group
+	// uses (§43.2) -- it reads token, grant, client and user in one lookup
+	// on every call, with no cache, and attaches the grant whose scopes
+	// decide which tools the request can see (§43.16/§43.17). Twins are the
+	// SAME three httpapi handlers /api/models and
+	// /api/sessions[/{sessionID}] above already register -- the bridge
+	// invokes them in-process, never a second implementation (§43.7;
+	// mcp/bridge.go's own doc comment).
 	mcpOriginGate, err := mcpadapter.RequireTrustedOrigin(mcpadapter.Config{PublicBaseURL: cfg.PublicBaseURL})
 	if err != nil {
 		return nil, fmt.Errorf("build mcp origin gate: %w", err)
@@ -2630,11 +2678,37 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	if err != nil {
 		return nil, fmt.Errorf("build mcp handler: %w", err)
 	}
+	mcpBearerGate := auth.RequireMCPBearer(mcpOAuthGrantStore, auth.MCPBearerConfig{
+		Resource:              mcpIdentifiers.Resource,
+		ResourceMetadataURL:   mcpIdentifiers.ProtectedResourceMetadataURL,
+		Scopes:                mcpscope.Strings(mcpAdvertisedScopes),
+		LastUsedWriteInterval: cfg.Timeouts.MCPGrantLastUsedWriteInterval,
+	})
 	router.Route("/mcp", func(r chi.Router) {
 		r.Use(mcpOriginGate)
 		r.Use(mcpadapter.RequireEnabled(cfg.MCPEnabled))
-		r.Use(auth.Middleware(userSessionStore, userStore))
+		r.Use(mcpBearerGate)
 		r.Post("/", mcpHandler.ServeHTTP)
+	})
+
+	// /api/me/mcp-authorizations, /api/mcp-clients (technical plan
+	// §43.15/§43.18): Settings' own view of the MCP authorization server --
+	// a user's own connected clients (list, revoke) and the admin-only
+	// pre-registration of clients. Ordinary cookie-authenticated /api
+	// groups, each handler rendering its own authz verdict. Deliberately
+	// NOT behind mcpadapter.RequireEnabled: an operator who turns the
+	// surface off must still be able to see and revoke every
+	// authorization it issued, and to remove a client.
+	router.Route("/api/me/mcp-authorizations", func(r chi.Router) {
+		r.Use(auth.Middleware(userSessionStore, userStore))
+		r.Get("/", httpapi.ListMyMCPAuthorizations(mcpOAuthGrantStore))
+		r.Delete("/{authorizationID}", httpapi.RevokeMyMCPAuthorization(pool, mcpOAuthGrantStore, mcpOAuthClientStore, auditLogStore))
+	})
+	router.Route("/api/mcp-clients", func(r chi.Router) {
+		r.Use(auth.Middleware(userSessionStore, userStore))
+		r.Get("/", httpapi.ListMCPClients(mcpOAuthClientStore))
+		r.Post("/", httpapi.CreateMCPClient(pool, mcpOAuthClientStore, auditLogStore))
+		r.Delete("/{clientID}", httpapi.DeleteMCPClient(pool, mcpOAuthClientStore, mcpOAuthGrantStore, auditLogStore))
 	})
 
 	// Module routes (docs/design/boundaries-design.md, section 3.2): mounted

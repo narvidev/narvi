@@ -1,10 +1,13 @@
 // This file (expiredcleanup.go) implements RunExpiredTokenCleanup: a
 // small, standalone periodic loop that purges expired ws_tokens/
 // user_sessions rows (audit-remediation, config/platform-hardening
-// batch). Both tables (migrations/000016_ws_tokens.up.sql,
-// migrations/000017_auth_v1.up.sql) have an expires_at TIMESTAMPTZ NOT
-// NULL column that is checked only at read/verify time -- nothing else
-// ever DELETEs an expired row, so left alone table growth is unbounded.
+// batch) and the MCP authorization server's own expired rows (technical
+// plan §43.16: authorization requests, codes, access tokens, grants).
+// Every one of these tables (migrations/000016_ws_tokens.up.sql,
+// migrations/000017_auth_v1.up.sql, migrations/000141_mcp_oauth.up.sql)
+// has an expires_at TIMESTAMPTZ NOT NULL column that is checked only at
+// read/verify time -- nothing else ever DELETEs an expired row, so left
+// alone table growth is unbounded.
 //
 // Deliberately NOT a new "reconciler" subsystem: this mirrors
 // internal/app/sessionactor/timerpump.go's own RunTimerPump precedent
@@ -27,8 +30,10 @@ import (
 // RunExpiredTokenCleanup runs the process-wide expired-credential cleanup
 // loop until ctx is done, ticking every interval (callers pass
 // platform.Timeouts.ExpiredCredentialCleanupInterval). On each tick it
-// deletes every ws_tokens/user_sessions row whose expires_at has already
-// passed, logging the deleted row counts at Info level for observability.
+// deletes every ws_tokens/user_sessions row and every expired MCP
+// authorization-server row (cleanupExpiredCredentialsOnce lists them)
+// whose expires_at has already passed, logging the deleted row counts at
+// Info level for observability.
 // A single tick's failure is logged, never propagated -- exactly like
 // RunTimerPump's own per-tick error handling -- so one bad tick never
 // takes down the whole loop.
@@ -53,11 +58,12 @@ func RunExpiredTokenCleanup(ctx context.Context, pool *pgxpool.Pool, interval ti
 }
 
 // cleanupExpiredCredentialsOnce runs exactly one cleanup tick: deletes
-// every expired ws_tokens row, then every expired user_sessions row (two
-// independent statements -- deliberately not one shared transaction, since
-// neither table's cleanup depends on the other's outcome, and a failure in
-// one must not roll back an already-successful delete in the other),
-// logging both deleted row counts together. Unexported: PumpOnce's own
+// every expired ws_tokens row, then every expired user_sessions row, then
+// every expired MCP authorization request, authorization code, access
+// token and grant (independent statements -- deliberately not one shared
+// transaction, since no table's cleanup depends on another's outcome, and
+// a failure in one must not roll back an already-successful delete in
+// another), logging every deleted row count together. Unexported: PumpOnce's own
 // "exported so tests can drive exactly one tick deterministically"
 // precedent isn't needed here since the integration test drives cleanup
 // through RunExpiredTokenCleanup's own loop instead (see
@@ -75,9 +81,35 @@ func cleanupExpiredCredentialsOnce(ctx context.Context, pool *pgxpool.Pool) erro
 		return err
 	}
 
+	// The MCP authorization server's own rows (technical plan §43.16,
+	// migrations/000141_mcp_oauth.up.sql) -- every one of them carries an
+	// expires_at that is otherwise only checked at read time. Grants go
+	// last: deleting an expired grant cascades whatever codes and tokens
+	// it still has, so sweeping those first only keeps the counts honest.
+	mcpRequestsDeleted, err := q.DeleteExpiredMCPOAuthAuthorizationRequests(ctx)
+	if err != nil {
+		return err
+	}
+	mcpCodesDeleted, err := q.DeleteExpiredMCPOAuthAuthorizationCodes(ctx)
+	if err != nil {
+		return err
+	}
+	mcpTokensDeleted, err := q.DeleteExpiredMCPOAuthAccessTokens(ctx)
+	if err != nil {
+		return err
+	}
+	mcpGrantsDeleted, err := q.DeleteExpiredMCPOAuthGrants(ctx)
+	if err != nil {
+		return err
+	}
+
 	platform.Logger(ctx).Info("postgres: expired credential cleanup",
 		"ws_tokens_deleted", wsTokensDeleted,
 		"user_sessions_deleted", userSessionsDeleted,
+		"mcp_authorization_requests_deleted", mcpRequestsDeleted,
+		"mcp_authorization_codes_deleted", mcpCodesDeleted,
+		"mcp_access_tokens_deleted", mcpTokensDeleted,
+		"mcp_grants_deleted", mcpGrantsDeleted,
 	)
 	return nil
 }

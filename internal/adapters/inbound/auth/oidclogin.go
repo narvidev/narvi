@@ -23,6 +23,15 @@ const (
 	oidcStateCookieName    = "narvi_oidc_state"
 	oidcNonceCookieName    = "narvi_oidc_nonce"
 	oidcVerifierCookieName = "narvi_oidc_verifier"
+	// oidcNextCookieName carries an optional post-sign-in redirect target
+	// through the OIDC round trip -- the SAME role oauthNextCookieName
+	// plays for the GitHub flow (login.go), and validated by the SAME
+	// isSafeRedirectNext on the way in and again on the way out. Its
+	// first caller is the MCP consent page (technical plan §43.14): a
+	// signed-out browser arriving at /oauth/authorize is sent through
+	// sign-in with next=/oauth/consent?request=<id>, and an OIDC-only
+	// deployment needs this cookie to come back there.
+	oidcNextCookieName = "narvi_oidc_next"
 )
 
 // setOIDCPreAuthCookie is the one place this file builds a pre-auth OIDC
@@ -52,10 +61,11 @@ func setOIDCPreAuthCookie(w http.ResponseWriter, name, value string, timeouts pl
 
 // NewOIDCLoginHandler backs GET /auth/oidc/login (§41.3):
 // authorization-code flow with PKCE (S256), state, and nonce, mirroring
-// NewLoginHandler's own shape (login.go) one level wider. Only ever
-// mounted when cfg.Configured() (controlplane/serve.go) -- see that
-// file's own route-mounting comment for why an unconfigured deployment
-// has no route here at all, rather than one that 404s or 503s.
+// NewLoginHandler's own shape (login.go) one level wider. Mounted
+// unconditionally (controlplane/serve.go); an unconfigured deployment
+// answers every request here with 503 (the guard at the top of the
+// handler below) rather than having no route at all. An optional ?next=
+// is honored exactly like NewLoginHandler's own (oidcNextCookieName).
 //
 // Unlike GitHub's plain state-parameter CSRF protection (NewLoginHandler's
 // own doc comment: "this is a confidential, server-side client... plain
@@ -111,6 +121,12 @@ func NewOIDCLoginHandler(cache *OIDCProviderCache, timeouts platform.Timeouts, s
 		setOIDCPreAuthCookie(w, oidcStateCookieName, state, timeouts, secureCookies)
 		setOIDCPreAuthCookie(w, oidcNonceCookieName, nonce, timeouts, secureCookies)
 		setOIDCPreAuthCookie(w, oidcVerifierCookieName, verifier, timeouts, secureCookies)
+		// An optional ?next= (a same-origin absolute path only --
+		// isSafeRedirectNext) is carried to the callback exactly like the
+		// GitHub flow's own; absent or unsafe next sets no cookie at all.
+		if next := r.URL.Query().Get("next"); isSafeRedirectNext(next) {
+			setOIDCPreAuthCookie(w, oidcNextCookieName, next, timeouts, secureCookies)
+		}
 
 		authCodeURL := rt.oauth2Config.AuthCodeURL(state,
 			oauth2.S256ChallengeOption(verifier),

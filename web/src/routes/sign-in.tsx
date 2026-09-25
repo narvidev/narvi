@@ -64,7 +64,7 @@ import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { meQueryOptions, authCapabilitiesQueryOptions } from '../auth/session'
-import { safeContinueTarget } from '../auth/loginLinks'
+import { continueNavigation } from '../auth/loginLinks'
 import { logout } from '../api/endpoints'
 import { authQueryKeys } from '../api/queryKeys'
 import { SignInViewBody, type SignInSearch } from '../components/auth/SignInViewBody'
@@ -124,7 +124,16 @@ function SignInView() {
       search={search}
       meQuery={meQuery}
       oidcConfigured={oidcConfigured}
-      onContinue={() => void navigate({ to: safeContinueTarget(search.next) })}
+      onContinue={() => {
+        // A server-rendered return target (the MCP consent page) is not a
+        // route of this SPA: leave it with a full page load.
+        const nav = continueNavigation(search.next)
+        if (nav.kind === 'document') {
+          window.location.assign(nav.href)
+        } else {
+          void navigate({ to: nav.to })
+        }
+      }}
       logoutMutation={logoutMutation}
       logoutError={logoutError}
     />

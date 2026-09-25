@@ -2986,6 +2986,68 @@ type Timeouts struct {
 	// "conceptually separate axis, numerically the same 30 days" relationship
 	// to ReviewVerdictAnalyticsWindow.
 	PlatformAnalyticsWindow time.Duration
+
+	// -- technical plan §43.16 ("Grants, tokens, and revocation": the MCP
+	// authorization server) --
+	//
+	// Three ordering links, all checked by Validate: an authorization code
+	// must expire well inside the consent window that produced it
+	// (MCPAuthorizationRequestTTL > MCPAuthorizationCodeTTL), an access
+	// token well inside the grant it is issued under (MCPGrantMaxLifetime >
+	// MCPAccessTokenTTL -- the token endpoint also caps each token at its
+	// grant's own expiry, so the link is about sane configuration, not a
+	// correctness guarantee on its own), and the discovery documents may be
+	// cached for well under one access-token lifetime (MCPAccessTokenTTL >
+	// MCPDiscoveryCacheMaxAge, on the field). Every TTL here fails CLOSED
+	// at zero: a zero TTL makes what it bounds read as already expired.
+	// The two fields that are not TTLs do not fail closed, and need not:
+	// a zero MCPGrantLastUsedWriteInterval only undoes its own coalescing
+	// (one last_used_at write per /mcp call), and a zero
+	// MCPDiscoveryCacheMaxAge only makes clients re-fetch the discovery
+	// documents every time -- neither widens what anything may do.
+
+	// MCPAuthorizationRequestTTL is how long a validated GET
+	// /oauth/authorize request waits for the user's consent decision,
+	// sign-in included. Mirrors OAuthStateTTL's own 10-minute "a real
+	// browser round trip, and no longer" figure.
+	MCPAuthorizationRequestTTL time.Duration
+
+	// MCPAuthorizationCodeTTL is how long an issued authorization code may
+	// be exchanged at POST /oauth/token. OAuth 2.1 recommends at most 10
+	// minutes; the exchange happens immediately after the redirect in
+	// every real client, so 60 seconds.
+	MCPAuthorizationCodeTTL time.Duration
+
+	// MCPAccessTokenTTL is how long an MCP access token authenticates
+	// /mcp calls before the client must obtain a new one. The MCP
+	// authorization spec asks for short-lived access tokens; one hour.
+	// Revocation never waits for this: the bearer check re-reads the grant
+	// on every call.
+	MCPAccessTokenTTL time.Duration
+
+	// MCPGrantMaxLifetime is the absolute lifetime of a consented grant --
+	// after it, the user must consent again, whatever the client does.
+	// 90 days.
+	MCPGrantMaxLifetime time.Duration
+
+	// MCPGrantLastUsedWriteInterval coalesces the bearer check's
+	// "last used" stamp: a grant's last_used_at is rewritten at most once
+	// per interval, so a busy client costs one write per interval rather
+	// than one per call. 5 minutes -- the Connected apps list shows
+	// "last used" to the nearest few minutes, which is all it needs.
+	MCPGrantLastUsedWriteInterval time.Duration
+
+	// MCPDiscoveryCacheMaxAge is the Cache-Control max-age both discovery
+	// documents carry (the protected-resource and authorization-server
+	// metadata, technical plan §43.14): how long a client may reuse them
+	// before asking again. Validate keeps it well under MCPAccessTokenTTL:
+	// until refresh tokens exist a client re-runs the authorization flow
+	// whenever its access token expires, so each re-authorization then
+	// reads documents fetched after the previous token was issued -- a
+	// change in what the deployment advertises (a newly offered scope
+	// after an upgrade) reaches a client within one token lifetime.
+	// 5 minutes.
+	MCPDiscoveryCacheMaxAge time.Duration
 }
 
 // DefaultTimeouts returns the shipped defaults for every field, each
@@ -3249,6 +3311,13 @@ func DefaultTimeouts() Timeouts {
 		KnowledgeRankerTimeout: 10 * time.Second, // design note section 2.2; not specified numerically, chosen -- see field doc comment
 
 		PlatformAnalyticsWindow: 30 * 24 * time.Hour, // §12.2 item 6; not specified, mirrors ReviewVerdictAnalyticsWindow's own identical "a month, bounded" reasoning
+
+		MCPAuthorizationRequestTTL:    10 * time.Minute,    // §43.16; mirrors OAuthStateTTL
+		MCPAuthorizationCodeTTL:       60 * time.Second,    // §43.16; single-use, exchanged immediately
+		MCPAccessTokenTTL:             time.Hour,           // §43.16; "short-lived access tokens"
+		MCPGrantMaxLifetime:           90 * 24 * time.Hour, // §43.16; absolute, re-consent after
+		MCPGrantLastUsedWriteInterval: 5 * time.Minute,     // §43.16; write coalescing
+		MCPDiscoveryCacheMaxAge:       5 * time.Minute,     // §43.14; discovery documents' Cache-Control max-age
 	}
 }
 
@@ -3402,6 +3471,18 @@ func (t Timeouts) Validate() error {
 	// requires of sandbox-token rotation).
 	check("CloudIdentitySigningKeyOverlapWindow > CloudIdentityTokenLifetime",
 		"CloudIdentitySigningKeyOverlapWindow", t.CloudIdentitySigningKeyOverlapWindow, "CloudIdentityTokenLifetime", t.CloudIdentityTokenLifetime)
+
+	// §43.14/§43.16: an authorization code must expire well inside the
+	// consent window that produced it, an access token well inside its
+	// grant, and the discovery documents' cache lifetime well inside one
+	// access-token lifetime (the MCP fields' own block comment on the
+	// struct, and MCPDiscoveryCacheMaxAge's own doc comment).
+	check("MCPAuthorizationRequestTTL > MCPAuthorizationCodeTTL",
+		"MCPAuthorizationRequestTTL", t.MCPAuthorizationRequestTTL, "MCPAuthorizationCodeTTL", t.MCPAuthorizationCodeTTL)
+	check("MCPGrantMaxLifetime > MCPAccessTokenTTL",
+		"MCPGrantMaxLifetime", t.MCPGrantMaxLifetime, "MCPAccessTokenTTL", t.MCPAccessTokenTTL)
+	check("MCPAccessTokenTTL > MCPDiscoveryCacheMaxAge",
+		"MCPAccessTokenTTL", t.MCPAccessTokenTTL, "MCPDiscoveryCacheMaxAge", t.MCPDiscoveryCacheMaxAge)
 
 	// U2 audit fix, SECURITY (confirmed HIGH finding: "the gate creates the
 	// identity it then checks" batch's own sibling finding -- "the

@@ -122,6 +122,12 @@ type testRig struct {
 	// (cmd/control-plane/main.go).
 	auditLog *narvipg.AuditLogStore
 
+	// mcpClients/mcpGrants back the MCP authorization server's own
+	// Settings routes below (technical plan §43.15/§43.18,
+	// mcp_integration_test.go).
+	mcpClients *narvipg.MCPOAuthClientStore
+	mcpGrants  *narvipg.MCPOAuthGrantStore
+
 	// linkPrompts backs the members API's own GET /api/members (below) --
 	// ListMembers's own "pending-link state" half (§13.2).
 	linkPrompts *narvipg.IdentityLinkPromptStore
@@ -435,6 +441,8 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		outbox:                narvipg.NewOutboxStore(pool, false),
 		linearAgentSessions:   narvipg.NewLinearAgentSessionStore(pool),
 		auditLog:              narvipg.NewAuditLogStore(pool),
+		mcpClients:            narvipg.NewMCPOAuthClientStore(pool),
+		mcpGrants:             narvipg.NewMCPOAuthGrantStore(pool),
 		linkPrompts:           narvipg.NewIdentityLinkPromptStore(pool),
 		promptTemplates:       narvipg.NewPromptTemplateStore(pool),
 		digestChannels:        narvipg.NewDigestChannelStore(pool),
@@ -670,6 +678,19 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 	// /api/me/chatgpt-link ("models: Codex via ChatGPT-account
 	// OAuth", §29.3/§29.9) -- mounted exactly like cmd/control-plane/
 	// main.go's own wiring.
+	// /api/me/mcp-authorizations, /api/mcp-clients (technical plan
+	// §43.15/§43.18) -- mounted exactly like controlplane/serve.go.
+	router.Route("/api/me/mcp-authorizations", func(r chi.Router) {
+		r.Use(auth.Middleware(rig.userSessions, rig.users))
+		r.Get("/", httpapi.ListMyMCPAuthorizations(rig.mcpGrants))
+		r.Delete("/{authorizationID}", httpapi.RevokeMyMCPAuthorization(rig.pool, rig.mcpGrants, rig.mcpClients, rig.auditLog))
+	})
+	router.Route("/api/mcp-clients", func(r chi.Router) {
+		r.Use(auth.Middleware(rig.userSessions, rig.users))
+		r.Get("/", httpapi.ListMCPClients(rig.mcpClients))
+		r.Post("/", httpapi.CreateMCPClient(rig.pool, rig.mcpClients, rig.auditLog))
+		r.Delete("/{clientID}", httpapi.DeleteMCPClient(rig.pool, rig.mcpClients, rig.mcpGrants, rig.auditLog))
+	})
 	router.Route("/api/me/chatgpt-link", func(r chi.Router) {
 		r.Use(auth.Middleware(rig.userSessions, rig.users))
 		chatGPTLinkDeps := chatgptlink.Deps{

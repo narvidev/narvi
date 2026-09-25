@@ -217,6 +217,16 @@ func NewOIDCCallbackHandler(
 		http.SetCookie(w, expiredCookie(oidcNonceCookieName, secureCookies))
 		verifierCookie, verifierErr := r.Cookie(oidcVerifierCookieName)
 		http.SetCookie(w, expiredCookie(oidcVerifierCookieName, secureCookies))
+		// The optional post-sign-in target (oidclogin.go's
+		// oidcNextCookieName), read and cleared here with the rest, and
+		// re-checked with isSafeRedirectNext rather than trusted -- the
+		// GitHub callback's own identical belt-and-suspenders. Used only
+		// on a successful sign-in, below; "/" otherwise, as before.
+		redirectTarget := "/"
+		if nextCookie, nextErr := r.Cookie(oidcNextCookieName); nextErr == nil && isSafeRedirectNext(nextCookie.Value) {
+			redirectTarget = nextCookie.Value
+		}
+		http.SetCookie(w, expiredCookie(oidcNextCookieName, secureCookies))
 		if nonceErr != nil || nonceCookie.Value == "" || verifierErr != nil || verifierCookie.Value == "" {
 			// Belt and suspenders: state already matched above (state and
 			// nonce/verifier are minted and cleared together by
@@ -378,7 +388,7 @@ func NewOIDCCallbackHandler(
 		}
 
 		http.SetCookie(w, platform.WithAuthSessionCookie(sessionToken, expiresAt, secureCookies))
-		http.Redirect(w, r, "/", http.StatusFound)
+		http.Redirect(w, r, redirectTarget, http.StatusFound)
 	}
 }
 

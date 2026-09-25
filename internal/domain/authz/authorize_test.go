@@ -78,6 +78,21 @@ func TestAuthorize_ExhaustiveMatrix(t *testing.T) {
 		{"member views capabilities", authz.RoleMember, authz.ActionViewCapabilities, false, true},
 		{"viewer views capabilities", authz.RoleViewer, authz.ActionViewCapabilities, false, true},
 
+		// Row 1 (cont'd, technical plan §43.16/§43.18): connecting an MCP
+		// client and revoking one's own MCP authorization -- every role,
+		// viewer included, and OwnedOrJoined irrelevant (asserted both
+		// ways). Revocation in particular must never be closed to a role.
+		{"admin connects mcp client", authz.RoleAdmin, authz.ActionConnectMCPClient, false, true},
+		{"maintainer connects mcp client", authz.RoleMaintainer, authz.ActionConnectMCPClient, false, true},
+		{"member connects mcp client", authz.RoleMember, authz.ActionConnectMCPClient, false, true},
+		{"viewer connects mcp client", authz.RoleViewer, authz.ActionConnectMCPClient, false, true},
+		{"viewer connects mcp client (ownedOrJoined irrelevant)", authz.RoleViewer, authz.ActionConnectMCPClient, true, true},
+		{"admin revokes own mcp authorization", authz.RoleAdmin, authz.ActionRevokeOwnMCPAuthorization, false, true},
+		{"maintainer revokes own mcp authorization", authz.RoleMaintainer, authz.ActionRevokeOwnMCPAuthorization, false, true},
+		{"member revokes own mcp authorization", authz.RoleMember, authz.ActionRevokeOwnMCPAuthorization, false, true},
+		{"viewer revokes own mcp authorization", authz.RoleViewer, authz.ActionRevokeOwnMCPAuthorization, false, true},
+		{"viewer revokes own mcp authorization (ownedOrJoined irrelevant)", authz.RoleViewer, authz.ActionRevokeOwnMCPAuthorization, true, true},
+
 		// Row 2a: create session -- admin/maintainer/member, viewer
 		// never. No ownership concept (new resource) -- OwnedOrJoined is
 		// irrelevant, asserted both false and true to prove that.

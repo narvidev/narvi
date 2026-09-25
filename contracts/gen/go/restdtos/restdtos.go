@@ -1915,6 +1915,50 @@ func (j *CreateCloudIdentityBindingRequest) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// POST /api/mcp-clients's own request body (technical plan §43.15): pre-register
+// an MCP client. The server generates the client_id. Every redirect URI must be
+// https with any host, or http on 127.0.0.1, [::1] or localhost, with no fragment
+// and no userinfo -- anything else is refused 400 (internal/domain/mcpclient).
+// clientName is trimmed and must be 1 to 100 characters with no control or
+// invisible formatting character.
+type CreateMCPClientRequest struct {
+	// ClientName corresponds to the JSON schema field "clientName".
+	ClientName string `json:"clientName" yaml:"clientName" mapstructure:"clientName"`
+
+	// Optional https homepage of the client; the consent page shows its host.
+	ClientUri *string `json:"clientUri,omitempty,omitzero" yaml:"clientUri,omitempty" mapstructure:"clientUri,omitempty"`
+
+	// 1 to 10 redirect URIs, each checked by the rule above.
+	RedirectUris []string `json:"redirectUris" yaml:"redirectUris" mapstructure:"redirectUris"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *CreateMCPClientRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["clientName"]; raw != nil && !ok {
+		return fmt.Errorf("field clientName in CreateMCPClientRequest: required")
+	}
+	if _, ok := raw["redirectUris"]; raw != nil && !ok {
+		return fmt.Errorf("field redirectUris in CreateMCPClientRequest: required")
+	}
+	type Plain CreateMCPClientRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if utf8.RuneCountInString(string(plain.ClientName)) < 1 {
+		return fmt.Errorf("field %s length: must be >= %d", "clientName", 1)
+	}
+	if plain.RedirectUris != nil && len(plain.RedirectUris) < 1 {
+		return fmt.Errorf("field %s length: must be >= %d", "redirectUris", 1)
+	}
+	*j = CreateMCPClientRequest(plain)
+	return nil
+}
+
 // POST request body for all 3 provider-credentials route groups
 // (repo/environment/global -- see ProviderCredential's own doc comment for why
 // scope/scopeTarget are never body fields). Gated by
@@ -4429,6 +4473,58 @@ func (j *ListIntegrationsResponse) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// GET /api/me/mcp-authorizations's own response body (technical plan §43.18): the
+// caller's own unexpired MCP authorizations, most recently created first. Readable
+// by every role (authz.ActionViewOwnProfile).
+type ListMCPAuthorizationsResponse struct {
+	// Authorizations corresponds to the JSON schema field "authorizations".
+	Authorizations []MCPAuthorization `json:"authorizations" yaml:"authorizations" mapstructure:"authorizations"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *ListMCPAuthorizationsResponse) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["authorizations"]; raw != nil && !ok {
+		return fmt.Errorf("field authorizations in ListMCPAuthorizationsResponse: required")
+	}
+	type Plain ListMCPAuthorizationsResponse
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = ListMCPAuthorizationsResponse(plain)
+	return nil
+}
+
+// GET /api/mcp-clients's own response body (technical plan §43.15): every
+// registered MCP client, oldest first. Admin only
+// (authz.ActionManageIntegrations).
+type ListMCPClientsResponse struct {
+	// Clients corresponds to the JSON schema field "clients".
+	Clients []MCPClient `json:"clients" yaml:"clients" mapstructure:"clients"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *ListMCPClientsResponse) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["clients"]; raw != nil && !ok {
+		return fmt.Errorf("field clients in ListMCPClientsResponse: required")
+	}
+	type Plain ListMCPClientsResponse
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = ListMCPClientsResponse(plain)
+	return nil
+}
+
 // GET /api/members's own response body (§13.2/§13.3): every user with
 // role/disabled and their own currently-linked identities, plus every system-wide
 // still-pending link prompt.
@@ -4778,6 +4874,235 @@ func (j *ListWorkflowRunsResponse) UnmarshalJSON(value []byte) error {
 		return err
 	}
 	*j = ListWorkflowRunsResponse(plain)
+	return nil
+}
+
+// One MCP client authorization the caller granted (technical plan §43.18) -- one
+// row of GET /api/me/mcp-authorizations, and what DELETE
+// /api/me/mcp-authorizations/{authorizationID} revokes (by id). A user holds at
+// most one per client: consenting to the same client again renews its expiry in
+// place and records that approval's scopes. Never carries a token, a code, or any
+// other secret -- none exists in plaintext anywhere once it has been handed to the
+// client.
+type MCPAuthorization struct {
+	// The client's own public OAuth client_id (never a secret).
+	ClientId string `json:"clientId" yaml:"clientId" mapstructure:"clientId"`
+
+	// Matches Postgres mcp_oauth_client_kind exactly
+	// (migrations/000141_mcp_oauth.up.sql). An OPEN enum (manifest.json's openEnums):
+	// only preregistered is produced today -- the other two values are declared for
+	// the client-registration mechanisms technical plan §43.15 reserves -- so a
+	// consumer MUST tolerate a value it does not recognise.
+	ClientKind MCPAuthorizationClientKind `json:"clientKind" yaml:"clientKind" mapstructure:"clientKind"`
+
+	// The client's display name, as registered.
+	ClientName string `json:"clientName" yaml:"clientName" mapstructure:"clientName"`
+
+	// When the user first authorized this client.
+	CreatedAt time.Time `json:"createdAt" yaml:"createdAt" mapstructure:"createdAt"`
+
+	// When this authorization lapses and the user must consent again
+	// (platform.Timeouts.MCPGrantMaxLifetime after the latest consent).
+	ExpiresAt time.Time `json:"expiresAt" yaml:"expiresAt" mapstructure:"expiresAt"`
+
+	// Id corresponds to the JSON schema field "id".
+	Id string `json:"id" yaml:"id" mapstructure:"id"`
+
+	// When the client last called /mcp under this authorization, to within
+	// platform.Timeouts.MCPGrantLastUsedWriteInterval; null if it never has.
+	// goJSONSchema forces the literal *time.Time for the same named-pointer-type
+	// reason Plan.decidedAt documents in full.
+	LastUsedAt *time.Time `json:"lastUsedAt" yaml:"lastUsedAt" mapstructure:"lastUsedAt"`
+
+	// The scopes of the user's most recent approval of this client, possibly none: a
+	// scope-less approval confirms who the user is but lets the client see no tool
+	// (technical plan §43.17). Display only: each access token keeps exactly the
+	// scopes approved when it was issued, so a later approval neither widens nor
+	// narrows a token issued earlier (technical plan §43.16).
+	Scopes []string `json:"scopes" yaml:"scopes" mapstructure:"scopes"`
+}
+
+type MCPAuthorizationClientKind string
+
+const MCPAuthorizationClientKindDynamic MCPAuthorizationClientKind = "dynamic"
+const MCPAuthorizationClientKindMetadataDocument MCPAuthorizationClientKind = "metadata_document"
+const MCPAuthorizationClientKindPreregistered MCPAuthorizationClientKind = "preregistered"
+
+var enumValues_MCPAuthorizationClientKind = []interface{}{
+	"preregistered",
+	"dynamic",
+	"metadata_document",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *MCPAuthorizationClientKind) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_MCPAuthorizationClientKind {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_MCPAuthorizationClientKind, v)
+	}
+	*j = MCPAuthorizationClientKind(v)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *MCPAuthorization) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["clientId"]; raw != nil && !ok {
+		return fmt.Errorf("field clientId in MCPAuthorization: required")
+	}
+	if _, ok := raw["clientKind"]; raw != nil && !ok {
+		return fmt.Errorf("field clientKind in MCPAuthorization: required")
+	}
+	if _, ok := raw["clientName"]; raw != nil && !ok {
+		return fmt.Errorf("field clientName in MCPAuthorization: required")
+	}
+	if _, ok := raw["createdAt"]; raw != nil && !ok {
+		return fmt.Errorf("field createdAt in MCPAuthorization: required")
+	}
+	if _, ok := raw["expiresAt"]; raw != nil && !ok {
+		return fmt.Errorf("field expiresAt in MCPAuthorization: required")
+	}
+	if _, ok := raw["id"]; raw != nil && !ok {
+		return fmt.Errorf("field id in MCPAuthorization: required")
+	}
+	if _, ok := raw["lastUsedAt"]; raw != nil && !ok {
+		return fmt.Errorf("field lastUsedAt in MCPAuthorization: required")
+	}
+	if _, ok := raw["scopes"]; raw != nil && !ok {
+		return fmt.Errorf("field scopes in MCPAuthorization: required")
+	}
+	type Plain MCPAuthorization
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = MCPAuthorization(plain)
+	return nil
+}
+
+// One OAuth client an MCP client program identifies itself as (technical plan
+// §43.15) -- returned by POST /api/mcp-clients and listed by GET /api/mcp-clients
+// (admin only, authz.ActionManageIntegrations). clientId is public (a public OAuth
+// client with PKCE has no secret), so there is no write-only field here.
+type MCPClient struct {
+	// The public OAuth client_id to configure in the MCP client program.
+	ClientId string `json:"clientId" yaml:"clientId" mapstructure:"clientId"`
+
+	// The display name the consent page shows.
+	ClientName string `json:"clientName" yaml:"clientName" mapstructure:"clientName"`
+
+	// The client's optional https homepage; null when none was registered.
+	ClientUri MCPClientClientUri `json:"clientUri" yaml:"clientUri" mapstructure:"clientUri"`
+
+	// CreatedAt corresponds to the JSON schema field "createdAt".
+	CreatedAt time.Time `json:"createdAt" yaml:"createdAt" mapstructure:"createdAt"`
+
+	// Set when an operator disabled the client: its authorizations stop working on
+	// their next call. Null for an active client. goJSONSchema forces the literal
+	// *time.Time for the same named-pointer-type reason Plan.decidedAt documents in
+	// full.
+	DisabledAt *time.Time `json:"disabledAt" yaml:"disabledAt" mapstructure:"disabledAt"`
+
+	// The internal id DELETE /api/mcp-clients/{clientID} takes.
+	Id string `json:"id" yaml:"id" mapstructure:"id"`
+
+	// Matches Postgres mcp_oauth_client_kind exactly
+	// (migrations/000141_mcp_oauth.up.sql). An OPEN enum (manifest.json's openEnums):
+	// only preregistered is produced today -- the other two values are declared for
+	// the client-registration mechanisms technical plan §43.15 reserves -- so a
+	// consumer MUST tolerate a value it does not recognise.
+	Kind MCPClientKind `json:"kind" yaml:"kind" mapstructure:"kind"`
+
+	// Every registered redirect URI. The authorization endpoint compares a presented
+	// URI against these exactly, except that the port of a registered
+	// http://127.0.0.1 or http://[::1] URI is ignored (technical plan §43.15).
+	RedirectUris []string `json:"redirectUris" yaml:"redirectUris" mapstructure:"redirectUris"`
+}
+
+// The client's optional https homepage; null when none was registered.
+type MCPClientClientUri *string
+
+type MCPClientKind string
+
+const MCPClientKindDynamic MCPClientKind = "dynamic"
+const MCPClientKindMetadataDocument MCPClientKind = "metadata_document"
+const MCPClientKindPreregistered MCPClientKind = "preregistered"
+
+var enumValues_MCPClientKind = []interface{}{
+	"preregistered",
+	"dynamic",
+	"metadata_document",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *MCPClientKind) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_MCPClientKind {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_MCPClientKind, v)
+	}
+	*j = MCPClientKind(v)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *MCPClient) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["clientId"]; raw != nil && !ok {
+		return fmt.Errorf("field clientId in MCPClient: required")
+	}
+	if _, ok := raw["clientName"]; raw != nil && !ok {
+		return fmt.Errorf("field clientName in MCPClient: required")
+	}
+	if _, ok := raw["clientUri"]; raw != nil && !ok {
+		return fmt.Errorf("field clientUri in MCPClient: required")
+	}
+	if _, ok := raw["createdAt"]; raw != nil && !ok {
+		return fmt.Errorf("field createdAt in MCPClient: required")
+	}
+	if _, ok := raw["disabledAt"]; raw != nil && !ok {
+		return fmt.Errorf("field disabledAt in MCPClient: required")
+	}
+	if _, ok := raw["id"]; raw != nil && !ok {
+		return fmt.Errorf("field id in MCPClient: required")
+	}
+	if _, ok := raw["kind"]; raw != nil && !ok {
+		return fmt.Errorf("field kind in MCPClient: required")
+	}
+	if _, ok := raw["redirectUris"]; raw != nil && !ok {
+		return fmt.Errorf("field redirectUris in MCPClient: required")
+	}
+	type Plain MCPClient
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = MCPClient(plain)
 	return nil
 }
 

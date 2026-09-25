@@ -5,7 +5,9 @@ DELETE /api/environments/{environmentID}/cluster-binding
 DELETE /api/environments/{environmentID}/opencode-config
 DELETE /api/environments/{environmentID}/provider-credentials/{credentialID}
 DELETE /api/environments/{environmentID}/sandbox-secrets/{secretID}
+DELETE /api/mcp-clients/{clientID}
 DELETE /api/me/chatgpt-link
+DELETE /api/me/mcp-authorizations/{authorizationID}
 DELETE /api/members/{userID}/identities/{identityID}
 DELETE /api/opencode-config
 DELETE /api/provider-credentials/{credentialID}
@@ -14,6 +16,8 @@ DELETE /api/repos/{owner}/{repo}/sandbox-secrets/{secretID}
 DELETE /api/sandbox-secrets/{secretID}
 DELETE /api/workflow-definitions/{id}
 GET /.well-known/jwks.json
+GET /.well-known/oauth-authorization-server/oauth
+GET /.well-known/oauth-protected-resource/mcp
 GET /.well-known/openid-configuration
 GET /api/admin/shadow-compare
 GET /api/analytics
@@ -32,8 +36,10 @@ GET /api/environments/{environmentID}/provider-credentials
 GET /api/environments/{environmentID}/sandbox-secrets
 GET /api/integrations
 GET /api/intent-templates
+GET /api/mcp-clients
 GET /api/me
 GET /api/me/chatgpt-link
+GET /api/me/mcp-authorizations
 GET /api/members
 GET /api/models
 GET /api/opencode-config
@@ -69,6 +75,8 @@ GET /auth/linear/install
 GET /auth/oidc/callback
 GET /auth/oidc/login
 GET /health
+GET /oauth/authorize
+GET /oauth/consent
 GET /sessions/{sessionID}/uploads/{uploadID}/content
 GET /sessions/{sessionID}/ws
 PATCH /api/members/{userID}/role
@@ -86,6 +94,7 @@ POST /api/environments/{environmentID}/provider-credentials
 POST /api/environments/{environmentID}/sandbox-secrets
 POST /api/intent-templates
 POST /api/intent-templates/preview
+POST /api/mcp-clients
 POST /api/me/chatgpt-link
 POST /api/members/{userID}/identities
 POST /api/provider-credentials
@@ -111,6 +120,8 @@ POST /api/workflow-definitions
 POST /api/workflow-runs/{runId}/steps/{stepRunId}/decide
 POST /auth/logout
 POST /mcp
+POST /oauth/consent
+POST /oauth/token
 POST /sessions/{sessionID}/automation-env-vars
 POST /sessions/{sessionID}/cloud-identity-config
 POST /sessions/{sessionID}/cloud-identity-token

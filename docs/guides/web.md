@@ -349,6 +349,81 @@ refusal" section for the sharpest example of this).
 {"name": "Remove a ChatGPT account link", "route": "DELETE /api/me/chatgpt-link"}
 ```
 
+## Connected apps (MCP clients)
+
+An MCP client — an editor plugin or desktop assistant that speaks the Model
+Context Protocol — connects to this deployment's `POST /mcp` with a bearer
+token it obtains through Narvi's own OAuth authorization server (technical
+plan §43.13). You never type a token anywhere: the app opens the
+authorization page in your browser, you sign in if you are not already, and
+you decide on the consent page.
+
+```json narvi-command
+{"name": "Approve an MCP client's access (the app opens this in your browser; it continues to the consent page, through sign-in first if needed)", "route": "GET /oauth/authorize"}
+```
+
+```json narvi-command
+{"name": "The MCP consent page (who the app is, where your browser returns, what it may do)", "route": "GET /oauth/consent"}
+```
+
+```json narvi-command
+{"name": "Allow or deny the MCP client (the consent page's own form)", "route": "POST /oauth/consent"}
+```
+
+The consent page shows the app's name and who vouched for it (an
+administrator of this deployment registers every app), the host your
+browser is sent back to — with a warning when that is your own computer —
+and one checkbox per kind of access; you can uncheck any of them, never add
+one. An app never does more than your own role allows: its tools call the
+same routes this guide documents, checked against your role on every call.
+
+Once an app is connected, you manage it in Settings → Integrations →
+Connected apps: what you last allowed it, when you connected it, when it
+last called, and when the authorization lapses. Each approval gives the app
+access for one hour; when that runs out the app sends you back to the
+consent page to approve it again (this deployment does not yet issue
+long-lived refresh tokens), and each approval pushes the authorization's
+90-day limit back. Approving an app again never takes away access you
+allowed it before — each approval's access runs its own hour — so to
+withdraw access, disconnect the app.
+
+```json narvi-command
+{"name": "List your own connected MCP apps", "route": "GET /api/me/mcp-authorizations"}
+```
+
+```json narvi-command
+{"name": "Disconnect one of your MCP apps (its very next call is refused)", "route": "DELETE /api/me/mcp-authorizations/{authorizationID}"}
+```
+
+Administrators decide which apps may ask at all, in the same panel:
+
+```json narvi-command
+{"name": "List registered MCP clients (admin)", "route": "GET /api/mcp-clients"}
+```
+
+```json narvi-command
+{"name": "Register an MCP client and get its client ID (admin)", "route": "POST /api/mcp-clients"}
+```
+
+```json narvi-command
+{"name": "Delete a registered MCP client, disconnecting every user of it (admin)", "route": "DELETE /api/mcp-clients/{clientID}"}
+```
+
+**Negatives.** The MCP surface is off unless the deployment sets
+`NARVI_MCP_ENABLED=true`; while it is off, `/oauth/...` answers `503` — but
+the Settings routes above keep working, so an authorization can always be
+listed and revoked. Every role, viewer included, can connect an app and
+disconnect its own; only an admin can register or delete a client.
+Disconnecting deletes the authorization outright, and deleting a client
+deletes every authorization issued to it — there is no "paused" state.
+An app registered with a redirect address that does not match exactly
+(except the port of a `127.0.0.1`/`[::1]` address) is shown an error page
+and your browser is never sent anywhere. Each approval is single-use and
+expires ten minutes after the app asked; another signed-in account can
+never decide a request someone else opened first. A browser-hosted MCP
+client (one running inside a web page on another site) cannot reach
+`/mcp` even with a token — the Origin check refuses it.
+
 ## Administration & configuration
 
 Everything below is settings/configuration surface, not day-to-day

@@ -4,11 +4,12 @@
 // §43.6/§43.11) end to end against the REAL composition root -- not
 // merely against internal/adapters/inbound/mcp's own package-level rigs
 // (newTestHandler, newMCPTestRig), each of which builds its OWN copy of
-// the gate chain (RequireTrustedOrigin, RequireEnabled, auth.Middleware)
-// and its OWN Twins, never the wiring serve.go actually registers. A
-// regression in serve.go itself -- auth.Middleware dropped, the gates
-// reordered, NARVI_MCP_ENABLED hardwired to true, or the wrong twin
-// handler wired to the wrong tool -- would pass every test in that
+// the gate chain (RequireTrustedOrigin, RequireEnabled,
+// auth.RequireMCPBearer) and its OWN Twins, never the wiring serve.go
+// actually registers. A regression in serve.go itself -- the bearer gate
+// dropped or swapped back for the cookie gate, the gates reordered,
+// NARVI_MCP_ENABLED hardwired to true, or the wrong twin handler wired to
+// the wrong tool -- would pass every test in that
 // package and in this package's own TestBuild_RouteTableMatchesGolden
 // (which only checks that "POST /mcp" exists as a route STRING, never
 // what sits in front of it) undetected.
@@ -31,25 +32,71 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/narvidev/narvi/internal/adapters/inbound/mcpauth"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
-// TestBuild_MCPSurface_RealRouter drives four cases against the REAL
+// mintBuildBearer issues an mcp:read access token for userID straight
+// through the stores, bound to the resource Build derives from
+// cfg.PublicBaseURL -- the token the authorization server would have
+// issued after consent (whose own flow TestOAuth_ProductionRouter drives
+// end to end through the official SDK client).
+func mintBuildBearer(ctx context.Context, t *testing.T, pool *pgxpool.Pool, cfg *platform.Config, userID pgtype.UUID) string {
+	t.Helper()
+	ids, err := mcpauth.DeriveIdentifiers(cfg.PublicBaseURL)
+	if err != nil {
+		t.Fatalf("DeriveIdentifiers: %v", err)
+	}
+	client, err := narvipg.NewMCPOAuthClientStore(pool).Create(ctx, sqlcgen.CreateMCPOAuthClientParams{
+		ClientID:     fmt.Sprintf("narvi_mcp_c_build_%d", time.Now().UnixNano()),
+		Kind:         sqlcgen.McpOauthClientKindPreregistered,
+		ClientName:   "Build Test Client",
+		RedirectUris: []string{"http://127.0.0.1/callback"},
+	})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	grants := narvipg.NewMCPOAuthGrantStore(pool)
+	grant, err := grants.UpsertGrant(ctx, sqlcgen.UpsertMCPOAuthGrantParams{
+		UserID: userID, ClientID: client.ID, Scopes: []string{"mcp:read"}, Resource: ids.Resource,
+		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("create grant: %v", err)
+	}
+	raw, err := platform.GenerateToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := "narvi_mcp_at_" + raw
+	if _, err := grants.CreateAccessToken(ctx, sqlcgen.CreateMCPOAuthAccessTokenParams{
+		GrantID: grant.ID, TokenHash: platform.HashToken(token), Scopes: []string{"mcp:read"},
+		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
+	}); err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+	return token
+}
+
+// TestBuild_MCPSurface_RealRouter drives the cases below against the REAL
 // /mcp wiring, each a distinct gate that a regression in serve.go's own
 // route group could silently drop:
 //  1. flag off -> 503 (RequireEnabled, mounted first among the
-//     flag/auth/version gates -- before the session store is ever
-//     touched).
-//  2. flag on, no cookie -> 401 (auth.Middleware, the SAME gate every
-//     /api/** route group already uses).
-//  3. flag on, invalid Origin -> 403, REGARDLESS of the missing cookie
+//     flag/auth/version gates -- before any credential store is ever
+//     touched), for /mcp AND every route of the authorization server.
+//  2. flag on, no credential -> 401 with the bearer challenge
+//     (auth.RequireMCPBearer).
+//  3. flag on, invalid Origin -> 403, REGARDLESS of the missing credential
 //     above (RequireTrustedOrigin, mounted first of all -- technical
 //     plan §43.2/§43.6).
-//  4. flag on, valid cookie, trusted Origin -> 200, a real tools/list
-//     response naming this build's own three tools.
+//  4. flag on, a valid session COOKIE and nothing else -> 401: the cookie
+//     is not a credential on /mcp (§43.2).
+//  5. flag on, a valid bearer token, trusted Origin -> 200, a real
+//     tools/list naming this build's own three tools and a real call.
 func TestBuild_MCPSurface_RealRouter(t *testing.T) {
 	setRequiredEnv(t)
 	pool, connStr := newTestPool(t)
@@ -76,6 +123,24 @@ func TestBuild_MCPSurface_RealRouter(t *testing.T) {
 
 		if rec.Code != http.StatusServiceUnavailable {
 			t.Fatalf("status = %d, body = %s, want 503", rec.Code, rec.Body.String())
+		}
+
+		// Every route of the authorization server answers the same 503
+		// while the surface is off (§43.11/§43.14): observable as off, never
+		// a route that is missing.
+		for _, route := range []struct{ method, path string }{
+			{http.MethodGet, "/.well-known/oauth-protected-resource/mcp"},
+			{http.MethodGet, "/.well-known/oauth-authorization-server/oauth"},
+			{http.MethodGet, "/oauth/authorize"},
+			{http.MethodGet, "/oauth/consent"},
+			{http.MethodPost, "/oauth/consent"},
+			{http.MethodPost, "/oauth/token"},
+		} {
+			rec := httptest.NewRecorder()
+			app.Router.ServeHTTP(rec, httptest.NewRequest(route.method, route.path, nil))
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Errorf("%s %s while disabled: status = %d, want 503", route.method, route.path, rec.Code)
+			}
 		}
 	})
 
@@ -119,7 +184,7 @@ func TestBuild_MCPSurface_RealRouter(t *testing.T) {
 		}
 	})
 
-	t.Run("enabled, no cookie: POST /mcp -> 401", func(t *testing.T) {
+	t.Run("enabled, no credential: POST /mcp -> 401 with the bearer challenge", func(t *testing.T) {
 		t.Setenv("NARVI_MCP_ENABLED", "true")
 		cfg, err := platform.Load()
 		if err != nil {
@@ -139,9 +204,20 @@ func TestBuild_MCPSurface_RealRouter(t *testing.T) {
 		if rec.Code != http.StatusUnauthorized {
 			t.Fatalf("status = %d, body = %s, want 401", rec.Code, rec.Body.String())
 		}
+		want := `Bearer resource_metadata="http://localhost:8080/.well-known/oauth-protected-resource/mcp", scope="mcp:read"`
+		if got := rec.Header().Get("WWW-Authenticate"); got != want {
+			t.Fatalf("WWW-Authenticate = %q, want %q", got, want)
+		}
+
+		// The discovery documents are served, and name this deployment.
+		prm := httptest.NewRecorder()
+		app.Router.ServeHTTP(prm, httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource/mcp", nil))
+		if prm.Code != http.StatusOK || !strings.Contains(prm.Body.String(), `"resource":"http://localhost:8080/mcp"`) {
+			t.Fatalf("protected resource metadata: status %d body %s", prm.Code, prm.Body.String())
+		}
 	})
 
-	t.Run("enabled, invalid Origin: POST /mcp -> 403, regardless of the missing cookie", func(t *testing.T) {
+	t.Run("enabled, invalid Origin: POST /mcp -> 403, regardless of the missing credential", func(t *testing.T) {
 		t.Setenv("NARVI_MCP_ENABLED", "true")
 		cfg, err := platform.Load()
 		if err != nil {
@@ -160,11 +236,11 @@ func TestBuild_MCPSurface_RealRouter(t *testing.T) {
 		app.Router.ServeHTTP(rec, req)
 
 		if rec.Code != http.StatusForbidden {
-			t.Fatalf("status = %d, body = %s, want 403 (the Origin gate must run before auth.Middleware, so a missing cookie must never be observed first)", rec.Code, rec.Body.String())
+			t.Fatalf("status = %d, body = %s, want 403 (the Origin gate must run before the bearer gate, so a missing credential must never be observed first)", rec.Code, rec.Body.String())
 		}
 	})
 
-	t.Run("enabled, valid cookie: POST /mcp tools/list -> 200", func(t *testing.T) {
+	t.Run("enabled: a cookie alone is refused, a bearer token is served", func(t *testing.T) {
 		t.Setenv("NARVI_MCP_ENABLED", "true")
 		cfg, err := platform.Load()
 		if err != nil {
@@ -209,12 +285,30 @@ func TestBuild_MCPSurface_RealRouter(t *testing.T) {
 		}
 
 		body := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`
-		req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "application/json, text/event-stream")
-		req.Header.Set("MCP-Protocol-Version", "2026-07-28")
-		req.Header.Set("Mcp-Method", "tools/list")
-		req.AddCookie(&http.Cookie{Name: platform.AuthSessionCookieName, Value: token})
+		mcpRequest := func(body, method, name string) *http.Request {
+			req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "application/json, text/event-stream")
+			req.Header.Set("MCP-Protocol-Version", "2026-07-28")
+			req.Header.Set("Mcp-Method", method)
+			if name != "" {
+				req.Header.Set("Mcp-Name", name)
+			}
+			return req
+		}
+
+		// A valid session cookie is NOT a credential on /mcp (§43.2).
+		cookieReq := mcpRequest(body, "tools/list", "")
+		cookieReq.AddCookie(&http.Cookie{Name: platform.AuthSessionCookieName, Value: token})
+		cookieRec := httptest.NewRecorder()
+		app.Router.ServeHTTP(cookieRec, cookieReq)
+		if cookieRec.Code != http.StatusUnauthorized {
+			t.Fatalf("cookie only: status = %d, body = %s, want 401", cookieRec.Code, cookieRec.Body.String())
+		}
+
+		bearer := mintBuildBearer(ctx, t, pool, cfg, user.ID)
+		req := mcpRequest(body, "tools/list", "")
+		req.Header.Set("Authorization", "Bearer "+bearer)
 		rec := httptest.NewRecorder()
 		app.Router.ServeHTTP(rec, req)
 
@@ -227,22 +321,13 @@ func TestBuild_MCPSurface_RealRouter(t *testing.T) {
 			}
 		}
 
-		// tools/list alone is not enough to prove auth.Middleware ran:
-		// buildServer's own "no authenticated user in context" defect
-		// fallback (handler.go's defectServer) advertises the SAME three
-		// tools but answers -32603 to every actual CALL -- so a mutant
-		// that dropped auth.Middleware from this route group entirely
-		// would still pass the tools/list check above. A real tool CALL
-		// succeeding is what actually depends on auth.Middleware having
-		// populated platform.UserFromContext.
+		// A real tool CALL succeeding is what proves the bearer gate
+		// populated both the principal and the grant: without either,
+		// buildServer's own defect fallback (handler.go's defectServer)
+		// registers no tool at all.
 		callBody := `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"narvi_list_models","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`
-		callReq := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(callBody))
-		callReq.Header.Set("Content-Type", "application/json")
-		callReq.Header.Set("Accept", "application/json, text/event-stream")
-		callReq.Header.Set("MCP-Protocol-Version", "2026-07-28")
-		callReq.Header.Set("Mcp-Method", "tools/call")
-		callReq.Header.Set("Mcp-Name", "narvi_list_models")
-		callReq.AddCookie(&http.Cookie{Name: platform.AuthSessionCookieName, Value: token})
+		callReq := mcpRequest(callBody, "tools/call", "narvi_list_models")
+		callReq.Header.Set("Authorization", "Bearer "+bearer)
 		callRec := httptest.NewRecorder()
 		app.Router.ServeHTTP(callRec, callReq)
 
@@ -250,7 +335,7 @@ func TestBuild_MCPSurface_RealRouter(t *testing.T) {
 			t.Fatalf("tools/call narvi_list_models: status = %d, body = %s, want 200", callRec.Code, callRec.Body.String())
 		}
 		if strings.Contains(callRec.Body.String(), `"error"`) || strings.Contains(callRec.Body.String(), `"isError":true`) {
-			t.Errorf("tools/call narvi_list_models: body = %s, want a successful result (proves auth.Middleware populated the authenticated user, not the defectServer fallback)", callRec.Body.String())
+			t.Errorf("tools/call narvi_list_models: body = %s, want a successful result (proves the bearer gate populated the principal and grant, not the defectServer fallback)", callRec.Body.String())
 		}
 	})
 }
@@ -269,8 +354,9 @@ func TestBuild_MCPSurface_RealRouter(t *testing.T) {
 // integration rigs (which each build their OWN Twins, never serve.go's)
 // can catch it either.
 //
-// This test instead calls the REST route directly AND the matching
-// tools/call, for the SAME user/cookie, for all three 180 tools, and
+// This test instead calls the REST route directly (with the user's cookie)
+// AND the matching tools/call (with a bearer token for the SAME user), for
+// all three tools, and
 // requires the two bodies to be canonically equal JSON -- a swapped twin
 // returns the wrong SHAPE, which fails this comparison immediately,
 // regardless of whether the wrong shape happens to contain "error".
@@ -329,6 +415,7 @@ func TestBuild_MCPSurface_TwinParity(t *testing.T) {
 		t.Fatalf("create test session: %v", err)
 	}
 	sessionID := session.ID.String()
+	bearer := mintBuildBearer(ctx, t, pool, cfg, user.ID)
 
 	tests := []struct {
 		name        string
@@ -358,7 +445,7 @@ func TestBuild_MCPSurface_TwinParity(t *testing.T) {
 			callReq.Header.Set("MCP-Protocol-Version", "2026-07-28")
 			callReq.Header.Set("Mcp-Method", "tools/call")
 			callReq.Header.Set("Mcp-Name", tt.toolName)
-			callReq.AddCookie(&http.Cookie{Name: platform.AuthSessionCookieName, Value: token})
+			callReq.Header.Set("Authorization", "Bearer "+bearer)
 			callRec := httptest.NewRecorder()
 			app.Router.ServeHTTP(callRec, callReq)
 			if callRec.Code != http.StatusOK {

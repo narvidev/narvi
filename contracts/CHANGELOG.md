@@ -9,6 +9,42 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.4.0]
+
+### rest/v1/dtos.schema.json
+
+- Added: `MCPAuthorization`, `ListMCPAuthorizationsResponse` -- the
+  response of `GET /api/me/mcp-authorizations` (technical plan §43.18):
+  the caller's own connected MCP clients, each revocable by
+  `DELETE /api/me/mcp-authorizations/{authorizationID}`.
+- Added: `MCPClient`, `ListMCPClientsResponse`, `CreateMCPClientRequest`
+  -- admin pre-registration of MCP clients at `GET`/`POST
+  /api/mcp-clients` and `DELETE /api/mcp-clients/{clientID}` (technical
+  plan §43.15). `CreateMCPClientRequest` is classified client-to-platform
+  by the existing `*Request`-suffix rule; the others platform-to-client.
+- All five are wholly new, independent named shapes, additive to this
+  schema; no existing shape changed. None carries a token, code or other
+  secret. `MCPAuthorization.clientKind` and `MCPClient.kind` are open
+  enums (`manifest.json`'s `openEnums` gains both pointers): only
+  `preregistered` is produced today, so consumers must tolerate the two
+  values reserved for later client-registration mechanisms.
+
+### controlplane/testdata/routes.golden
+
+- Added: `GET /api/me/mcp-authorizations`,
+  `DELETE /api/me/mcp-authorizations/{authorizationID}`,
+  `GET /api/mcp-clients`, `POST /api/mcp-clients`,
+  `DELETE /api/mcp-clients/{clientID}` -- the Settings routes above.
+- Added (not `/api/`, so not graded by `tools/contractscompat`'s own
+  `DiffRoutes`, recorded for the same VERSION/CHANGELOG discipline): the
+  MCP authorization server's own routes (technical plan §43.14) --
+  `GET /.well-known/oauth-protected-resource/mcp`,
+  `GET /.well-known/oauth-authorization-server/oauth`,
+  `GET /oauth/authorize`, `GET /oauth/consent`, `POST /oauth/consent`,
+  `POST /oauth/token`. `POST /mcp` is unchanged as a route; it now accepts
+  only a bearer token from that authorization server (technical plan
+  §43.2).
+
 ## [1.3.0]
 
 ### rest/v1/dtos.schema.json

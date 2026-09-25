@@ -4,7 +4,9 @@
 // is refused" -- §13.1's own requirement on redirect handling.
 import { describe, expect, it } from 'vitest'
 
-import { githubLoginHref, oidcLoginHref, safeContinueTarget } from '../loginLinks'
+import { continueNavigation, githubLoginHref, oidcLoginHref, safeContinueTarget } from '../loginLinks'
+
+const consentPath = '/oauth/consent?request=3f2504e0-4f89-11d3-9a0c-0305e82c3301'
 
 describe('githubLoginHref', () => {
   it('appends next when it is a known, safe route', () => {
@@ -29,8 +31,31 @@ describe('githubLoginHref', () => {
 })
 
 describe('oidcLoginHref', () => {
-  it('returns the fixed OIDC login route, no query string', () => {
-    expect(oidcLoginHref()).toBe('/auth/oidc/login')
+  it('returns the bare OIDC login route when next is undefined', () => {
+    expect(oidcLoginHref(undefined)).toBe('/auth/oidc/login')
+  })
+
+  it('appends next under the same rule as githubLoginHref', () => {
+    expect(oidcLoginHref('/settings')).toBe('/auth/oidc/login?next=%2Fsettings')
+    expect(oidcLoginHref(consentPath)).toBe(`/auth/oidc/login?next=${encodeURIComponent(consentPath)}`)
+  })
+
+  it('omits an unsafe next', () => {
+    expect(oidcLoginHref('//evil.example.test/')).toBe('/auth/oidc/login')
+    expect(oidcLoginHref('/not-a-real-route')).toBe('/auth/oidc/login')
+  })
+})
+
+describe('the MCP consent page as a sign-in return target (technical plan §43.14)', () => {
+  it('githubLoginHref carries it through sign-in', () => {
+    expect(githubLoginHref(consentPath)).toBe(`/auth/github/login?next=${encodeURIComponent(consentPath)}`)
+  })
+
+  it('continueNavigation leaves the SPA with a full page load for it, and navigates client-side for a SPA route', () => {
+    expect(continueNavigation(consentPath)).toEqual({ kind: 'document', href: consentPath })
+    expect(continueNavigation('/settings')).toEqual({ kind: 'spa', to: '/settings' })
+    expect(continueNavigation(undefined)).toEqual({ kind: 'spa', to: '/' })
+    expect(continueNavigation('https://evil.example.test/')).toEqual({ kind: 'spa', to: '/' })
   })
 })
 

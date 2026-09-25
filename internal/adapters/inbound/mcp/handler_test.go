@@ -208,12 +208,13 @@ func TestOrigin_NearMissesRefused(t *testing.T) {
 // TestOrigin_NearMissesRefused's own table along two dimensions it never
 // covers (round 4 review of PR #324, finding S8): every case in that
 // table -- and every other unit test in this package -- trusts
-// testPublicBaseURL ("http://example.test"), so canonicalOrigin's own
-// https default-port branch (handler.go's defaultPortFor("https") ==
-// "443") and its IPv6 re-bracketing were never exercised against a real
-// RequireTrustedOrigin/NewHandler pair built from a base URL that
-// actually needs either one. Mutation-verified against modified copies of
-// handler.go: making defaultPortFor return "80" for "https" flips BOTH
+// testPublicBaseURL ("http://example.test"), so platform.CanonicalOrigin's
+// own https default-port branch (internal/platform/origin.go's
+// defaultPortFor("https") == "443") and its IPv6 re-bracketing were never
+// exercised against a real RequireTrustedOrigin/NewHandler pair built from
+// a base URL that actually needs either one. Mutation-verified against
+// modified copies of that file (the helper lived in handler.go when this
+// test was written): making defaultPortFor return "80" for "https" flips BOTH
 // https cases below (accepts :80, refuses :443); deleting the IPv6
 // re-bracketing (`if strings.Contains(host, ":") { host = "[" + host +
 // "]" }`) makes NewHandler itself fail to construct for the IPv6 base,
@@ -262,7 +263,7 @@ func TestOrigin_HTTPSDefaultPortAndIPv6TrustedOrigin(t *testing.T) {
 
 		// NewHandler must actually SUCCEED booting against an IPv6
 		// PublicBaseURL: crossOriginProtection's own AddTrustedOrigin
-		// call re-parses canonicalOrigin's serialized origin, which is
+		// call re-parses platform.CanonicalOrigin's serialized origin, which is
 		// no longer a valid authority (a bare "::1:8443", indistinguishable
 		// from a host with an extra port segment) the instant the IPv6
 		// literal's own brackets are dropped.

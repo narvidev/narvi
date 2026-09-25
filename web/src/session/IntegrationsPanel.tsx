@@ -21,7 +21,11 @@
 //      distinct value (rather than a boolean "healthy" flag) IS how the
 //      pump's own terminal failure state reaches this screen; see
 //      restdtos.ChatGPTLinkStatus's own doc comment.
-//   3. Cloud-identity signing-key rotation (§27.3/§27.8, admin): fails
+//   3. Connected apps and MCP clients (technical plan §43.15/§43.18):
+//      ConnectedAppsSection.tsx -- every user's own connected MCP clients
+//      (list, revoke), and the admin-only registration of the clients
+//      that may ask at all. Its own file; see that file's doc comment.
+//   4. Cloud-identity signing-key rotation (§27.3/§27.8, admin): fails
 //      closed exactly like every other §27.3 surface -- relocated here
 //      verbatim from EnvironmentsPanel.tsx (this Step's own "one screen
 //      for every outside-connecting surface" mandate), which used to own
@@ -60,6 +64,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { ChatGPTLinkStatus, Integration } from '@narvi/contracts/rest-dtos'
 
 import { getChatGPTLinkStatus, getIntegrations, listCloudIdentityBindings, rotateCloudIdentitySigningKey, startChatGPTLink, unlinkChatGPTAccount } from '../api/endpoints'
+import { ConnectedAppsSection, MCPClientsSection } from './ConnectedAppsSection'
 import { ApiError } from '../api/http'
 import { chatgptLinkQueryKeys, cloudIdentityBindingQueryKeys, integrationQueryKeys } from '../api/queryKeys'
 import { meQueryOptions } from '../auth/session'
@@ -414,6 +419,8 @@ export function IntegrationsPanel() {
     <>
       <IngressIntegrationsSection />
       <ChatGPTLinkSection canLink={canLinkChatGPT(meQuery.data?.role)} />
+      <ConnectedAppsSection />
+      {isAdmin(meQuery.data?.role) && <MCPClientsSection />}
       <SigningKeyRotationSection canRotate={isAdmin(meQuery.data?.role)} />
     </>
   )

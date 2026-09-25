@@ -151,7 +151,7 @@ export function SignInViewBody({ search, meQuery, oidcConfigured, onContinue, lo
                 route that would refuse, and never silently omitting the
                 affordance the visual spec calls for. */}
             {oidcConfigured ? (
-              <a className="ssobtn" href={oidcLoginHref()}>
+              <a className="ssobtn" href={oidcLoginHref(search.next)}>
                 Continue with SSO (OIDC)
               </a>
             ) : (
