@@ -22,10 +22,18 @@ import type { EventEnvelope } from './types'
 // EventLog.entries() (eventLog.ts), which is ALWAYS id-sorted ascending
 // by construction, regardless of the order appendMany was called in. So
 // the one assumption this module actually makes is narrower and is
-// something the server genuinely guarantees: events.id is a strictly
-// monotonic, per-session sequence assigned once, by Postgres, at commit
-// time (a bigserial column -- migrations/*_events*.up.sql), and every
-// wire representation this client trusts as log data (SubscribedPayload.
+// something the server genuinely guarantees: within one session, event
+// ids are allocated in commit order. The sequence alone does not give
+// that: events.id is a bigserial (migrations/*_events*.up.sql) drawn from
+// one table-wide sequence when the row is inserted, not when it commits.
+// What gives it is that every insert (CreateEvent, internal/adapters/
+// outbound/postgres/queries/events.sql) takes the session row lock
+// BEFORE drawing its id, so a session's inserts draw their ids one at a
+// time, in the order they commit. That lock is load-bearing, not
+// redundant: an insert path without it can commit a lower id after a
+// higher one of the same session, and every `id > cursor` reader (this
+// client's backfill included) then skips that event for good. Every wire
+// representation this client trusts as log data (SubscribedPayload.
 // events, FetchHistoryResponse.events) carries that same id verbatim
 // (internal/adapters/inbound/wshub/client.go's own eventWireMap: "id (for
 // client-side de-dup against live broadcasts)"). Folding by id order is
