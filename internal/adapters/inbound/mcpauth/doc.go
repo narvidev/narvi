@@ -38,9 +38,11 @@
 //     the STORED URI, never one read from the form.
 //   - PKCE S256 is mandatory; the verifier is checked in constant time.
 //   - A code is single-use; a replayed code deletes the grant it produced.
-//   - A refresh token rotates on every use; presenting a rotated one
-//     deletes its grant. A refresh can only narrow the scopes the refresh
-//     token holds, never widen them to the grant's.
+//   - A refresh token rotates on every use; presenting a rotated one, or
+//     one issued to another client, deletes its grant -- unless it, its
+//     chain or its grant has expired, which refreshes nothing and revokes
+//     nothing. A refresh can only narrow the scopes the refresh token
+//     holds, never widen them to the grant's.
 //   - A refresh chain's scopes, resource and absolute end are fixed when
 //     its code is exchanged and carried unchanged through every rotation:
 //     a later consent for the same client, which renews the grant in

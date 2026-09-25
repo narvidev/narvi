@@ -4,6 +4,7 @@ package mcpauth_test
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
@@ -22,7 +24,19 @@ import (
 // rotation on every use, reuse detection that deletes the grant, scopes
 // that can only narrow relative to the presented refresh token (never the
 // grant's), the resource binding, and a grant past its absolute lifetime
-// refreshing nothing.
+// refreshing nothing -- nor a refresh token past any of its lifetimes,
+// which is refused before it can count as a replay.
+
+// captureWarnLog routes slog.Default's WARN-and-above lines -- where every
+// refusal logs its outcome -- into a buffer until the test ends.
+func captureWarnLog(t *testing.T) *errorLog {
+	t.Helper()
+	l := &errorLog{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(l, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return l
+}
 
 // refreshWith posts form to the token endpoint and decodes the answer.
 func (r *asRig) refreshWith(t *testing.T, form url.Values) (*httptest.ResponseRecorder, tokenBody) {
@@ -451,8 +465,9 @@ func TestRefresh_ResourceMustMatch(t *testing.T) {
 // expired refresh token, an access token presented as a refresh token,
 // and a token nobody holds are each invalid_grant: nothing is issued,
 // nothing is spent, and nothing is revoked. (A refresh token presented by
-// another client is a replay instead:
-// TestRefresh_AnotherClientPresentingIsAReplay.)
+// another client is a replay instead,
+// TestRefresh_AnotherClientPresentingIsAReplay -- unless it is past a
+// lifetime, TestRefresh_ExpiredTokenIsNeverAReplay.)
 func TestRefresh_RefreshesNothingItShouldNot(t *testing.T) {
 	r := newASRig(t)
 
@@ -513,6 +528,114 @@ func TestRefresh_RefreshesNothingItShouldNot(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestRefresh_ExpiredTokenIsNeverAReplay is PR #327's round-2 review's
+// reproduction (technical plan §43.14/§43.16): a refresh token past its
+// own expiry, its chain's end or its grant's expiry is refused
+// invalid_grant and revokes nothing -- rotated or not, and whichever
+// client presents it. The lifetimes are checked before either replay
+// check, so the answer does not depend on whether the expired-credential
+// sweep has deleted the row yet. Every combination the reviewers ran is a
+// row here, with the rest of the matrix: the refusal logs the lifetime's
+// own outcome and never refresh_reuse, the grant is still the same row, no
+// revocation is audited, and a fresh chain F under that grant still
+// refreshes. F is begun by a later consent before the lapsed token is
+// presented -- except when the lapse is the grant's own, which that
+// consent would renew: F is then begun after, and the consent renewing
+// the same grant row in place is itself proof it was never deleted.
+func TestRefresh_ExpiredTokenIsNeverAReplay(t *testing.T) {
+	ctx := context.Background()
+	r := newASRig(t)
+	other := r.newClient(t, "narvi_mcp_c_other", "Other App", loopbackRedirect)
+	execOne := func(t *testing.T, sql string, arg any) {
+		t.Helper()
+		if tag, err := r.pool.Exec(ctx, sql, arg); err != nil || tag.RowsAffected() != 1 {
+			t.Fatalf("%s: err %v, rows %d", sql, err, tag.RowsAffected())
+		}
+	}
+
+	lapses := []struct {
+		name    string
+		outcome string
+		// ofGrant is true when the lapse is the grant's own expiry.
+		ofGrant bool
+		lapse   func(t *testing.T, userID pgtype.UUID, presented string)
+	}{
+		{"past its own expiry", "refresh_token_expired", false, func(t *testing.T, _ pgtype.UUID, presented string) {
+			execOne(t, `UPDATE mcp_oauth_refresh_tokens SET expires_at = now() - interval '1 second' WHERE token_hash = $1`, platform.HashToken(presented))
+		}},
+		{"past its chain's end", "refresh_chain_expired", false, func(t *testing.T, _ pgtype.UUID, presented string) {
+			execOne(t, `UPDATE mcp_oauth_refresh_tokens SET chain_expires_at = now() - interval '1 second' WHERE token_hash = $1`, platform.HashToken(presented))
+		}},
+		{"past its grant's expiry", "grant_expired", true, func(t *testing.T, userID pgtype.UUID, _ string) {
+			execOne(t, `UPDATE mcp_oauth_grants SET expires_at = now() - interval '1 second' WHERE user_id = $1`, userID)
+		}},
+	}
+	for _, rotated := range []bool{false, true} {
+		for _, byOther := range []bool{false, true} {
+			for _, l := range lapses {
+				state, presenter := "unrotated", "its own client"
+				if rotated {
+					state = "rotated"
+				}
+				if byOther {
+					presenter = "another client"
+				}
+				t.Run(state+", "+l.name+", presented by "+presenter, func(t *testing.T) {
+					user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+					pair := r.issuePair(t, cookie, "mcp:read")
+					grantID := r.grantIDs(t, user.ID)[0]
+					sameGrant := func(when string) {
+						t.Helper()
+						if ids := r.grantIDs(t, user.ID); len(ids) != 1 || ids[0] != grantID {
+							t.Fatalf("grants %s = %v, want the one grant %s", when, ids, grantID)
+						}
+					}
+					if rotated {
+						if rec, _ := r.refreshWith(t, r.refreshForm(pair.RefreshToken)); rec.Code != http.StatusOK {
+							t.Fatalf("the legitimate refresh: status %d body %s", rec.Code, rec.Body.String())
+						}
+						if !r.refreshRow(t, pair.RefreshToken).RotatedAt.Valid {
+							t.Fatal("the legitimate refresh did not rotate the token")
+						}
+					}
+					l.lapse(t, user.ID, pair.RefreshToken)
+					var fresh tokenBody
+					if !l.ofGrant {
+						fresh = r.issuePair(t, cookie, "mcp:read")
+						sameGrant("after the later consent")
+					}
+
+					form := r.refreshForm(pair.RefreshToken)
+					if byOther {
+						form.Set("client_id", other.ClientID)
+					}
+					logs := captureWarnLog(t)
+					rec, body := r.refreshWith(t, form)
+					if rec.Code != http.StatusBadRequest || body.Error != "invalid_grant" || body.AccessToken != "" || body.RefreshToken != "" {
+						t.Fatalf("status %d body %s, want 400 invalid_grant and no token", rec.Code, rec.Body.String())
+					}
+					if got := logs.String(); !strings.Contains(got, `"outcome":"`+l.outcome+`"`) || strings.Contains(got, "refresh_reuse") {
+						t.Fatalf("the refusal logged %s, want outcome %s and no refresh_reuse", got, l.outcome)
+					}
+					sameGrant("after the refusal")
+					for _, row := range r.auditRows(t, grantID) {
+						if row.action == "mcp_authorization.revoked" {
+							t.Fatalf("the refusal was audited as a revocation: %+v", row)
+						}
+					}
+					if l.ofGrant {
+						fresh = r.issuePair(t, cookie, "mcp:read")
+						sameGrant("after the later consent renewed it")
+					}
+					if rec, body := r.refreshWith(t, r.refreshForm(fresh.RefreshToken)); rec.Code != http.StatusOK || body.Scope != "mcp:read" {
+						t.Fatalf("the fresh chain F: status %d body %s, want 200 scope mcp:read", rec.Code, rec.Body.String())
+					}
+				})
+			}
+		}
 	}
 }
 

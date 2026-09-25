@@ -26,6 +26,13 @@ import (
 // is presenting one to a client it was not issued to, rotated or not: both
 // are handled by handleRefreshReuse.
 //
+// Lifetimes are checked before replays. A token past its own expiry, its
+// chain's end or its grant's expiry is refused, and revokes nothing,
+// rotated or not and whichever client presents it; only a token still
+// inside all three can be a replay. So the answer is the same whether or
+// not the expired-credential sweep has deleted the row yet -- once it has,
+// the token is unknown, which revokes nothing either.
+//
 // The same holds for the rest of what the chain can do: its resource and
 // its absolute end were fixed when the chain began (refreshChain) and are
 // read from the presented token, which the rotation copies them from
@@ -46,7 +53,8 @@ import (
 // rotation locks. So the token is read first, without a lock. The client
 // locked is the requesting one -- the grant's own client whenever tokens
 // are issued, since a refresh token presented by another client is a
-// replay (below).
+// replay (below). A replay found once both are locked ends this
+// transaction before handleRefreshReuse starts its own.
 func (s *Server) refreshGrant(w http.ResponseWriter, r *http.Request, client sqlcgen.McpOauthClient, form url.Values) {
 	ctx := r.Context()
 	logger := platform.Logger(ctx)
@@ -84,9 +92,6 @@ func (s *Server) refreshGrant(w http.ResponseWriter, r *http.Request, client sql
 	case err != nil:
 		fail("load refresh token failed", err)
 		return
-	case presentedRow.RotatedAt.Valid:
-		s.handleRefreshReuse(w, r, tokenHash, client)
-		return
 	}
 
 	tx, err := s.deps.Pool.Begin(ctx)
@@ -118,21 +123,6 @@ func (s *Server) refreshGrant(w http.ResponseWriter, r *http.Request, client sql
 		return
 	}
 
-	if grant.ClientID != client.ID {
-		// A refresh token presented by a client it was not issued to: one
-		// that client never received, so a copy -- a replay whether or not
-		// it was rotated yet (technical plan §43.16). This is also how a
-		// racing refresh from another client, which reads the token
-		// unrotated while the grant's own client rotates it, still counts
-		// as one use and one replay. This transaction holds the requesting
-		// client and the grant FOR KEY SHARE, so it ends here, before
-		// handleRefreshReuse locks the grant's client and deletes the grant
-		// in a transaction of its own.
-		_ = tx.Rollback(ctx)
-		s.handleRefreshReuse(w, r, tokenHash, client)
-		return
-	}
-
 	// Every refusal below returns before anything is written: the deferred
 	// rollback leaves the presented token exactly as it was.
 	refuse := func(errCode, description, outcome string) {
@@ -140,7 +130,10 @@ func (s *Server) refreshGrant(w http.ResponseWriter, r *http.Request, client sql
 		writeTokenError(w, errCode, description, false)
 	}
 	now := time.Now()
-	held := mcpscope.FromStrings(presentedRow.Scopes)
+
+	// The three lifetimes come first, before either replay check below: a
+	// token outside any of them is refused, and revokes nothing, rotated or
+	// not and whichever client presents it (technical plan §43.14).
 	switch {
 	case !presentedRow.ExpiresAt.Time.After(now):
 		refuse(errInvalidGrant, "the refresh token is invalid", "refresh_token_expired")
@@ -157,6 +150,26 @@ func (s *Server) refreshGrant(w http.ResponseWriter, r *http.Request, client sql
 		// its refresh tokens say: the user must consent again.
 		refuse(errInvalidGrant, "the refresh token is invalid", "grant_expired")
 		return
+	}
+
+	if presentedRow.RotatedAt.Valid || grant.ClientID != client.ID {
+		// A replay (technical plan §43.16): a token already rotated,
+		// whichever client presents it, or one presented by a client it
+		// was not issued to -- one that client never received, so a copy,
+		// whether or not it was rotated yet. The latter is also how a
+		// racing refresh from another client, which reads the token
+		// unrotated while the grant's own client rotates it, still counts
+		// as one use and one replay. This transaction holds the requesting
+		// client and the grant FOR KEY SHARE, so it ends here, before
+		// handleRefreshReuse locks the grant's client and deletes the grant
+		// in a transaction of its own.
+		_ = tx.Rollback(ctx)
+		s.handleRefreshReuse(w, r, tokenHash, client)
+		return
+	}
+
+	held := mcpscope.FromStrings(presentedRow.Scopes)
+	switch {
 	case presentedRow.Resource != s.ids.Resource:
 		// The chain's own resource, fixed when it began -- never the
 		// grant's, which a later consent rebinds in place. Only possible
@@ -228,7 +241,9 @@ func (s *Server) requestedRefreshScopes(raw string) (requested []mcpscope.Scope,
 // included, which is the point: the server cannot tell the thief from the
 // victim, so it ends both, and the user must consent again. There is no
 // grace window. The revocation is audited (reason refresh_reuse,
-// attributed to the grant's user with actor "system").
+// attributed to the grant's user with actor "system"). refreshGrant sends
+// it only a token it found still inside its own lifetime, its chain's and
+// its grant's: an expired one is refused there and revokes nothing.
 //
 // It runs in a transaction of its own, never the refresh's, and locks in
 // the one order (the top of postgres/mcpoauthgrant_store.go): the grant's
