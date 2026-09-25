@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"strconv"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -50,14 +51,17 @@ type Deps struct {
 // Server is the MCP authorization server's HTTP surface (technical plan
 // §43.13-§43.16). Every exported method is one route's handler.
 type Server struct {
-	cfg        Config
-	deps       Deps
-	ids        Identifiers
-	scopes     []mcpscope.Scope
-	prmJSON    []byte
-	asmJSON    []byte
-	consentTpl *template.Template
-	errorTmpl  *template.Template
+	cfg     Config
+	deps    Deps
+	ids     Identifiers
+	scopes  []mcpscope.Scope
+	prmJSON []byte
+	asmJSON []byte
+	// metadataCacheControl is both discovery documents' Cache-Control,
+	// from platform.Timeouts.MCPDiscoveryCacheMaxAge.
+	metadataCacheControl string
+	consentTpl           *template.Template
+	errorTmpl            *template.Template
 }
 
 // New builds a Server. It fails for a PublicBaseURL that is not an
@@ -90,6 +94,7 @@ func New(cfg Config, deps Deps) (*Server, error) {
 		return nil, fmt.Errorf("mcpauth: parse error template: %w", err)
 	}
 	s := &Server{cfg: cfg, deps: deps, ids: ids, scopes: scopes, consentTpl: consentTpl, errorTmpl: errorTmpl}
+	s.metadataCacheControl = "public, max-age=" + strconv.Itoa(int(platform.DurationToSeconds(cfg.Timeouts.MCPDiscoveryCacheMaxAge)))
 	if s.prmJSON, err = json.Marshal(s.protectedResourceMetadata()); err != nil {
 		return nil, fmt.Errorf("mcpauth: encode protected resource metadata: %w", err)
 	}

@@ -60,14 +60,14 @@ func (s *Server) authorizationServerMetadata() authorizationServerMetadataDoc {
 }
 
 // writeMetadata writes one precomputed discovery document. Both are
-// public, identical for every caller, and cacheable for a few minutes;
-// Access-Control-Allow-Origin: * lets a browser-based tool read them even
-// though /mcp itself still refuses a foreign Origin (technical plan
-// §43.13).
-func writeMetadata(w http.ResponseWriter, body []byte) {
+// public, identical for every caller, and cacheable for
+// platform.Timeouts.MCPDiscoveryCacheMaxAge; Access-Control-Allow-Origin:
+// * lets a browser-based tool read them even though /mcp itself still
+// refuses a foreign Origin (technical plan §43.13).
+func (s *Server) writeMetadata(w http.ResponseWriter, body []byte) {
 	h := w.Header()
 	h.Set("Content-Type", "application/json")
-	h.Set("Cache-Control", "public, max-age=300")
+	h.Set("Cache-Control", s.metadataCacheControl)
 	h.Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
@@ -76,11 +76,11 @@ func writeMetadata(w http.ResponseWriter, body []byte) {
 // ProtectedResourceMetadata backs GET
 // /.well-known/oauth-protected-resource/mcp.
 func (s *Server) ProtectedResourceMetadata(w http.ResponseWriter, _ *http.Request) {
-	writeMetadata(w, s.prmJSON)
+	s.writeMetadata(w, s.prmJSON)
 }
 
 // AuthorizationServerMetadata backs GET
 // /.well-known/oauth-authorization-server/oauth.
 func (s *Server) AuthorizationServerMetadata(w http.ResponseWriter, _ *http.Request) {
-	writeMetadata(w, s.asmJSON)
+	s.writeMetadata(w, s.asmJSON)
 }

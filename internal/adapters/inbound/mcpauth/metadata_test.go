@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/narvidev/narvi/internal/domain/mcpscope"
 	"github.com/narvidev/narvi/internal/platform"
@@ -18,6 +19,27 @@ func newUnitServer(t *testing.T, base string, scopes []mcpscope.Scope) *Server {
 		t.Fatalf("New: %v", err)
 	}
 	return s
+}
+
+// TestMetadata_CacheLifetimeComesFromTimeouts: both discovery documents'
+// max-age is platform.Timeouts.MCPDiscoveryCacheMaxAge (technical plan
+// §43.14), never a literal of this package's own.
+func TestMetadata_CacheLifetimeComesFromTimeouts(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+	to.MCPDiscoveryCacheMaxAge = 90 * time.Second
+	s, err := New(Config{PublicBaseURL: "https://narvi.example", Enabled: true, Scopes: []mcpscope.Scope{mcpscope.Read}, Timeouts: to}, Deps{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	for name, serve := range map[string]http.HandlerFunc{"prm": s.ProtectedResourceMetadata, "asm": s.AuthorizationServerMetadata} {
+		rec := httptest.NewRecorder()
+		serve(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+		if got := rec.Header().Get("Cache-Control"); got != "public, max-age=90" {
+			t.Errorf("%s Cache-Control = %q, want %q", name, got, "public, max-age=90")
+		}
+	}
 }
 
 // TestMetadata_Documents pins both discovery documents field by field

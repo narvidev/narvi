@@ -1541,10 +1541,12 @@ func TestValidate_DefaultAutomationDispatchTotalBudgetCoversOneFullAutomation(t 
 }
 
 // TestDefaultTimeouts_MCPOAuthFields pins the MCP authorization server's
-// shipped lifetimes (technical plan §43.16) and that none of them is zero
-// -- every one fails closed at zero, which would make the whole flow
-// refuse everything rather than silently widen anything, but a zero here
-// is still a broken build, not a configuration.
+// shipped lifetimes and intervals (technical plan §43.14/§43.16) and that
+// none of them is zero. A zero TTL fails closed -- it would make the whole
+// flow refuse everything rather than silently widen anything -- while a
+// zero MCPGrantLastUsedWriteInterval or MCPDiscoveryCacheMaxAge only
+// undoes write coalescing or discovery caching; either way a zero here is
+// a broken build, not a configuration.
 func TestDefaultTimeouts_MCPOAuthFields(t *testing.T) {
 	t.Parallel()
 
@@ -1559,6 +1561,7 @@ func TestDefaultTimeouts_MCPOAuthFields(t *testing.T) {
 		{"MCPAccessTokenTTL", to.MCPAccessTokenTTL, time.Hour},
 		{"MCPGrantMaxLifetime", to.MCPGrantMaxLifetime, 90 * 24 * time.Hour},
 		{"MCPGrantLastUsedWriteInterval", to.MCPGrantLastUsedWriteInterval, 5 * time.Minute},
+		{"MCPDiscoveryCacheMaxAge", to.MCPDiscoveryCacheMaxAge, 5 * time.Minute},
 	}
 	for _, tc := range tests {
 		if tc.got <= 0 {
@@ -1573,8 +1576,9 @@ func TestDefaultTimeouts_MCPOAuthFields(t *testing.T) {
 	}
 }
 
-// TestValidate_MCPOAuthChain proves both §43.16 ordering links are
-// actually checked: breaking either one alone is reported by name.
+// TestValidate_MCPOAuthChain proves the three MCP ordering links
+// (§43.14/§43.16) are actually checked: breaking any one alone is
+// reported by name.
 func TestValidate_MCPOAuthChain(t *testing.T) {
 	t.Parallel()
 
@@ -1592,6 +1596,11 @@ func TestValidate_MCPOAuthChain(t *testing.T) {
 			name:      "access token outlives the grant",
 			mutate:    func(to *platform.Timeouts) { to.MCPAccessTokenTTL = to.MCPGrantMaxLifetime },
 			wantChain: "MCPGrantMaxLifetime > MCPAccessTokenTTL",
+		},
+		{
+			name:      "discovery documents cached for a whole token lifetime",
+			mutate:    func(to *platform.Timeouts) { to.MCPDiscoveryCacheMaxAge = to.MCPAccessTokenTTL },
+			wantChain: "MCPAccessTokenTTL > MCPDiscoveryCacheMaxAge",
 		},
 	}
 	for _, tc := range tests {
