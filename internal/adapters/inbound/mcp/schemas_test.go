@@ -3,8 +3,12 @@ package mcp
 import (
 	"bytes"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -269,5 +273,95 @@ func TestCompileInputSchemas_UnknownDefFails(t *testing.T) {
 	_, err := compileInputSchemas([]string{"ThisDefDoesNotExist"})
 	if err == nil {
 		t.Fatal("compileInputSchemas with an unknown $def name: error = nil, want an error")
+	}
+}
+
+// TestNoSecondJSONSchemaCompiler is the STRUCTURAL half of round 3
+// review of PR #324, finding R3: TestToolCall_ConcurrentFirstCalls_NoRace
+// (toolcall_test.go) only reproduces the lazy-compile crash it exists to
+// catch when it runs BEFORE any other test in the same binary has already
+// exercised all three tools (its own doc comment says so) -- but
+// `go test -race ./...`, the exact command CI runs (Makefile), gives no
+// such guarantee: Go does not randomize test order by default, and
+// several earlier tests in this package's own file order already call
+// tools/call for every tool, warming any package-level cache before the
+// concurrency test ever gets to run. A mutant that reintroduces
+// f307de9's own lazy shape (a package-level `sync.OnceValues` compiler
+// plus a `sync.Map` result cache, with toolHandler reading THAT instead
+// of NewHandler's own eagerly-built map) therefore left the ENTIRE suite
+// green, including the concurrency test, even though running that one
+// test alone still failed under -race.
+//
+// This test does not depend on runtime ordering or on triggering a race
+// at all: it parses this package's OWN production source (every *.go
+// file in its directory, excluding _test.go -- exactly
+// tools/lint/narvichecks/mcpimportban's identical "a test constructing X
+// is not a production decision point" exemption) and asserts that
+// jsonschema.NewCompiler is called from exactly ONE call site, inside
+// schemas.go. That is a structural fact about the CODE, true or false
+// before a single request is ever served: compileInputSchemas (schemas.go)
+// is the only place this package may ever construct a
+// *jsonschema.Compiler, and its result -- an immutable
+// map[string]*jsonschema.Schema, built once at NewHandler/boot time
+// (round 2 review findings N1/N3/N4) -- is the ONLY source toolHandler
+// may read a compiled schema from. Reintroducing ANY lazy-compile shape,
+// f307de9's own or a future variant, necessarily needs a SECOND
+// jsonschema.NewCompiler() call site to compile anything at all (you
+// cannot call (*jsonschema.Compiler).Compile without first constructing
+// one), so this test fails at plain `go test` time -- no -race, no
+// goroutines, no test-order dependence -- the instant such a call site
+// exists, regardless of which other tests ran first or how many of them
+// warmed some cache.
+func TestNoSecondJSONSchemaCompiler(t *testing.T) {
+	names, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob *.go: %v", err)
+	}
+	if len(names) == 0 {
+		t.Fatal("glob *.go found no files -- this test must run from its own package directory (go test's own documented working-directory contract)")
+	}
+
+	type callSite struct {
+		file string
+		line int
+	}
+	var sites []callSite
+	fset := token.NewFileSet()
+	for _, name := range names {
+		if strings.HasSuffix(name, "_test.go") {
+			// A test building its own throwaway compiler (this file's own
+			// TestCompileInputSchemas_* helpers, or schemas_test.go's
+			// output-schema validation tests) is not a production
+			// decision point.
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "NewCompiler" {
+				return true
+			}
+			ident, ok := sel.X.(*ast.Ident)
+			if !ok || ident.Name != "jsonschema" {
+				return true
+			}
+			pos := fset.Position(call.Pos())
+			sites = append(sites, callSite{file: name, line: pos.Line})
+			return true
+		})
+	}
+
+	if len(sites) != 1 {
+		t.Fatalf("found %d call site(s) constructing a jsonschema.Compiler (%v), want exactly 1 -- every tool's input schema must come from schemas.go's own compileInputSchemas, compiled EAGERLY at NewHandler/boot time (round 2 N1/N3/N4); a second call site is exactly the shape a reintroduced lazy, per-request compile takes (round 3 R3)", len(sites), sites)
+	}
+	if sites[0].file != "schemas.go" {
+		t.Fatalf("the one jsonschema.NewCompiler() call site is in %s:%d, want schemas.go's own compileInputSchemas", sites[0].file, sites[0].line)
 	}
 }
