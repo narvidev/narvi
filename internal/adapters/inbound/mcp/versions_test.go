@@ -208,3 +208,44 @@ func TestSupportedProtocolVersions_ExcludesDeprecatedSSEEra(t *testing.T) {
 		t.Errorf("SupportedProtocolVersions[0] = %q, want the current revision 2026-07-28 first", SupportedProtocolVersions[0])
 	}
 }
+
+// TestMaxRequestBodyBytes_PinnedAt64KiB pins round 3 review finding R6:
+// both TestMaxRequestBodyBytes_BoundsHugeIntegerLiteralCost (batch_test.go)
+// and TestMaxRequestBodyBytes_LargerBodyRefused (handler_test.go) size
+// their OWN payload FROM the MaxRequestBodyBytes constant itself, so
+// raising it -- even all the way back to round 2's own original 1 MiB --
+// passes both of those tests completely unchanged: the exact 64 KiB bound
+// finding N7's cost mitigation and the batch-fan-out cap both rely on is
+// never itself pinned anywhere. This test closes that on two independent,
+// constant-value-INDEPENDENT axes: the numeric value of the constant
+// itself (spelled here as a literal, "64 << 10", never by reference to
+// versions.go's own "64 * 1024"), and a request body built to a FIXED
+// byte count -- one byte over 64 KiB, not derived from
+// MaxRequestBodyBytes+1 -- which must still be refused even if some
+// future change silently raised the constant.
+func TestMaxRequestBodyBytes_PinnedAt64KiB(t *testing.T) {
+	const want64KiB = 64 << 10
+	if MaxRequestBodyBytes != want64KiB {
+		t.Fatalf("MaxRequestBodyBytes = %d, want %d (64 KiB) -- round 2's own N7/N2 mitigations both depend on this EXACT bound, not merely on whatever value each derived test happens to size itself against", MaxRequestBodyBytes, want64KiB)
+	}
+
+	handler := newTestHandler(t, true, true, testTwins())
+	headers := map[string]string{protocolVersionHeader: "2026-07-28", "Mcp-Method": "tools/list"}
+
+	const totalWant = 64*1024 + 1 // one byte over the cap, a FIXED absolute size
+	prefix := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"padding":"`
+	suffix := `"}}}`
+	padLen := totalWant - len(prefix) - len(suffix)
+	if padLen <= 0 {
+		t.Fatalf("prefix+suffix alone is already %d bytes, want less than %d", len(prefix)+len(suffix), totalWant)
+	}
+	body := prefix + strings.Repeat("x", padLen) + suffix
+	if len(body) != totalWant {
+		t.Fatalf("test body is %d bytes, want exactly %d", len(body), totalWant)
+	}
+
+	status, respBody := rawPost(t, handler, "/mcp", body, headers)
+	if status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, body = %s, want 413 for a fixed %d-byte body (64 KiB + 1)", status, respBody, totalWant)
+	}
+}
