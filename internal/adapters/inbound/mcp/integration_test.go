@@ -41,18 +41,19 @@ import (
 // mcpTestRig is this package's own rig: just enough real Postgres stores
 // to construct BOTH the REST routes (/api/models, /api/sessions,
 // /api/sessions/{sessionID}, cookie-authenticated) and the MCP route
-// (/mcp) behind the IDENTICAL gates controlplane/serve.go wires in
-// production -- mcpadapter.RequireTrustedOrigin first, then
-// RequireEnabled, then auth.RequireMCPBearer (§43.2/§43.6's own gate
-// order) -- plus the MCP authorization server's own routes (mcpauth,
-// §43.14), so a parity test and the SDK-driven end-to-end tests
-// (oauth_integration_test.go) exercise the real thing, never a stand-in.
+// (/mcp) behind the same gates, in the same order, controlplane/serve.go
+// wires -- mcpadapter.RequireTrustedOrigin first, then RequireEnabled,
+// then auth.RequireMCPBearer (§43.2/§43.6) -- so a parity test compares
+// the bridge against its REST twins over real stores. It is a copy, not
+// the production router: the authorization flow end to end, and the
+// production wiring itself, are proven against controlplane.Build's own
+// router (controlplane's TestOAuth_ProductionRouter). Tokens here are
+// minted straight through the stores (mintMCPToken).
 //
 // The server is built UNSTARTED so its real listener address is known
 // before the router is: PublicBaseURL -- and so the canonical /mcp
-// resource every token is bound to, and the protected-resource
-// metadata's "resource" -- must equal the URL a client actually dials,
-// which the official SDK client checks byte for byte (§43.13).
+// resource every token is bound to -- must equal the URL a client
+// actually dials (§43.13).
 type mcpTestRig struct {
 	pool         *pgxpool.Pool
 	users        *narvipg.UserStore
@@ -68,11 +69,7 @@ type mcpTestRig struct {
 	tokenClient *sqlcgen.McpOauthClient
 }
 
-// rigRoutes lets a test file mount extra routes on the rig's router
-// before the server starts (oauth_integration_test.go's Settings routes).
-type rigRoutes func(router chi.Router, rig *mcpTestRig)
-
-func newMCPTestRig(t *testing.T, extra ...rigRoutes) *mcpTestRig {
+func newMCPTestRig(t *testing.T) *mcpTestRig {
 	t.Helper()
 	pool := IntegrationTestPool(t)
 
@@ -104,23 +101,10 @@ func newMCPTestRig(t *testing.T, extra ...rigRoutes) *mcpTestRig {
 		t.Fatalf("mcpadapter.RequireTrustedOrigin: %v", err)
 	}
 	advertised := mcpadapter.AdvertisedScopes()
-	authServer, err := mcpauth.New(mcpauth.Config{
-		PublicBaseURL: baseURL,
-		Enabled:       true,
-		Scopes:        advertised,
-		Timeouts:      platform.DefaultTimeouts(),
-	}, mcpauth.Deps{
-		Pool:         pool,
-		Clients:      rig.clients,
-		Grants:       rig.grants,
-		UserSessions: rig.userSessions,
-		Users:        rig.users,
-		AuditLog:     narvipg.NewAuditLogStore(pool),
-	})
+	rig.ids, err = mcpauth.DeriveIdentifiers(baseURL)
 	if err != nil {
-		t.Fatalf("mcpauth.New: %v", err)
+		t.Fatalf("mcpauth.DeriveIdentifiers: %v", err)
 	}
-	rig.ids = authServer.Identifiers()
 
 	router.Route("/api/models", func(r chi.Router) {
 		r.Use(auth.Middleware(rig.userSessions, rig.users))
@@ -130,21 +114,6 @@ func newMCPTestRig(t *testing.T, extra ...rigRoutes) *mcpTestRig {
 		r.Use(auth.Middleware(rig.userSessions, rig.users))
 		r.Get("/", httpapi.ListSessions(rig.sessions))
 		r.Get("/{sessionID}", httpapi.GetSession(rig.sessions))
-	})
-	router.Route("/.well-known/oauth-protected-resource", func(r chi.Router) {
-		r.Use(mcpadapter.RequireEnabled(true))
-		r.Get("/mcp", authServer.ProtectedResourceMetadata)
-	})
-	router.Route("/.well-known/oauth-authorization-server", func(r chi.Router) {
-		r.Use(mcpadapter.RequireEnabled(true))
-		r.Get("/oauth", authServer.AuthorizationServerMetadata)
-	})
-	router.Route("/oauth", func(r chi.Router) {
-		r.Use(mcpadapter.RequireEnabled(true))
-		r.Get("/authorize", authServer.Authorize)
-		r.Get("/consent", authServer.ConsentPage)
-		r.Post("/consent", authServer.ConsentDecision)
-		r.Post("/token", authServer.Token)
 	})
 	router.Route("/mcp", func(r chi.Router) {
 		r.Use(mcpOriginGate)
@@ -157,9 +126,6 @@ func newMCPTestRig(t *testing.T, extra ...rigRoutes) *mcpTestRig {
 		}))
 		r.Post("/", mcpHandler.ServeHTTP)
 	})
-	for _, mount := range extra {
-		mount(router, rig)
-	}
 
 	server.Start()
 	t.Cleanup(server.Close)
@@ -167,11 +133,11 @@ func newMCPTestRig(t *testing.T, extra ...rigRoutes) *mcpTestRig {
 }
 
 // mintMCPToken issues an access token for userID straight through the
-// stores -- a grant with exactly scopes under the rig's own pre-registered
-// client, and one token under it -- for the parity tests, whose subject is
-// the bridge, not the authorization flow (oauth_integration_test.go drives
-// that flow end to end through the official SDK client instead). Returns
-// the plaintext token.
+// stores -- a grant under the rig's own pre-registered client, and one
+// token under it holding exactly scopes -- for the parity tests, whose
+// subject is the bridge, not the authorization flow (controlplane's
+// TestOAuth_ProductionRouter drives that flow end to end through the
+// official SDK client instead). Returns the plaintext token.
 func mintMCPToken(ctx context.Context, t *testing.T, r *mcpTestRig, userID pgtype.UUID, scopes []string) string {
 	t.Helper()
 	if r.tokenClient == nil {

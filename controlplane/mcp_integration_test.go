@@ -40,10 +40,11 @@ import (
 	"github.com/narvidev/narvi/internal/platform"
 )
 
-// mintBuildBearer issues an MCP access token for userID straight through
-// the stores, bound to the resource Build derives from cfg.PublicBaseURL
-// -- the token the authorization server would have issued after consent
-// (whose own flow the mcp package's SDK-driven end-to-end test covers).
+// mintBuildBearer issues an mcp:read access token for userID straight
+// through the stores, bound to the resource Build derives from
+// cfg.PublicBaseURL -- the token the authorization server would have
+// issued after consent (whose own flow TestOAuth_ProductionRouter drives
+// end to end through the official SDK client).
 func mintBuildBearer(ctx context.Context, t *testing.T, pool *pgxpool.Pool, cfg *platform.Config, userID pgtype.UUID) string {
 	t.Helper()
 	ids, err := mcpauth.DeriveIdentifiers(cfg.PublicBaseURL)
