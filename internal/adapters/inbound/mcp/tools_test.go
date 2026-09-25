@@ -24,10 +24,28 @@ func repoRoot(t testing.TB) string {
 	return filepath.Join(filepath.Dir(file), "..", "..", "..", "..")
 }
 
+// wantTwinRoutes pins each 180 tool's OWN declared twin route explicitly
+// (technical plan §43.9 item 2) -- round 2 review of PR #324, finding
+// N14: a prior version of TestEveryToolHasARegisteredTwin below checked
+// only that "<METHOD> <pathTemplate>" was SOME line of routes.golden,
+// never that it was the RIGHT line for that specific tool. A tool
+// declaring a different real route (e.g. narvi_get_session's own
+// pathTemplate swapped for "/api/models", while still invoking the
+// correct twins.GetSession handler) passed that check undetected, since
+// "GET /api/models" is itself a real golden line. This map is the
+// missing piece: each tool's route, named once, independently of
+// toolSpecs itself.
+var wantTwinRoutes = map[string]string{
+	"narvi_list_models":   "GET /api/models",
+	"narvi_list_sessions": "GET /api/sessions",
+	"narvi_get_session":   "GET /api/sessions/{sessionID}",
+}
+
 // TestEveryToolHasARegisteredTwin pins technical plan §43.9 item 2: a
-// tool with no registered HTTP route cannot be declared. For every entry
-// in toolSpecs, "<METHOD> <pathTemplate>" must be a line of
-// controlplane/testdata/routes.golden, read as a file -- the same golden
+// tool with no registered HTTP route cannot be declared, AND (finding
+// N14) that its declared route is its OWN expected one (wantTwinRoutes
+// above), not merely some other tool's -- both checked against
+// controlplane/testdata/routes.golden, the same golden
 // TestScanRegisteredRoutes_MatchesGolden (internal/ops) compares the
 // static route scanner against.
 func TestEveryToolHasARegisteredTwin(t *testing.T) {
@@ -45,9 +63,16 @@ func TestEveryToolHasARegisteredTwin(t *testing.T) {
 	}
 
 	for _, spec := range toolSpecs(Twins{}) {
-		want := spec.Twin.method + " " + spec.Twin.pathTemplate
+		got := spec.Twin.method + " " + spec.Twin.pathTemplate
+		want, ok := wantTwinRoutes[spec.Name]
+		if !ok {
+			t.Fatalf("tool %q has no entry in wantTwinRoutes -- add one naming its own declared twin route explicitly", spec.Name)
+		}
+		if got != want {
+			t.Errorf("tool %q declares twin %q, want its OWN route %q", spec.Name, got, want)
+		}
 		if !lines[want] {
-			t.Errorf("tool %q declares twin %q, which is not a line of %s", spec.Name, want, goldenPath)
+			t.Errorf("tool %q's own twin route %q is not a line of %s", spec.Name, want, goldenPath)
 		}
 	}
 }
