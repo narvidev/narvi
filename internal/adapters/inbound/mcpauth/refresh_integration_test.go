@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
@@ -118,45 +119,115 @@ func TestRefresh_RotationAndReuseRevokesGrant(t *testing.T) {
 	}
 }
 
-// TestRefresh_ConcurrentUseIsAReplay: two refreshes racing with the same
+// TestRefresh_ConcurrentUseIsAReplay: two refreshes racing with one
 // refresh token are one use and one replay -- there is no grace window --
-// so at most one answers 200, the grant is revoked either way, and no
-// request fails (no deadlock, no 500).
+// on their own, whatever ran before them in the process. The race is
+// deterministic. A blocker holds the token's row, so the first refresh
+// reads the token unrotated and stops at its conditional rotation, queued
+// on that row (seen in pg_locks, behind the blocker alone); the second,
+// reading it unrotated too, is then seen queued as well, and only then is
+// the blocker released. The first rotates the token and answers 200. The
+// second learns of the rotation only when its own rotation misses -- the
+// lost-rotation branch, since the token was unrotated when it read it --
+// and revokes the grant, the first's new tokens with it, audited once as
+// refresh_reuse. Nothing fails (no deadlock, no 500).
 func TestRefresh_ConcurrentUseIsAReplay(t *testing.T) {
-	r := newASRig(t)
-	user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
-	pair := r.issuePair(t, cookie, "mcp:read")
-	errs := captureErrorLog(t)
+	for _, tc := range []struct {
+		name string
+		// secondClient is the client_id the second refresh presents.
+		secondClient func(r *asRig) string
+		// secondQueuedOn is the table whose row the second refresh is
+		// seen queued on, behind the first.
+		secondQueuedOn string
+	}{
+		{"both as the token's own client", func(r *asRig) string { return r.client.ClientID }, "mcp_oauth_refresh_tokens"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			r := newASRig(t)
+			user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+			pair := r.issuePair(t, cookie, "mcp:read")
+			grantID := r.grantIDs(t, user.ID)[0]
+			second := r.refreshForm(pair.RefreshToken)
+			second.Set("client_id", tc.secondClient(r))
+			forms := []url.Values{r.refreshForm(pair.RefreshToken), second}
+			errs := captureErrorLog(t)
 
-	const racers = 4
-	recs := make([]*httptest.ResponseRecorder, racers)
-	var eg errgroup.Group
-	for i := range recs {
-		eg.Go(func() error {
-			recs[i] = r.exchange(r.refreshForm(pair.RefreshToken), nil)
-			return nil
+			blocker, err := r.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var blockerPID int32
+			if err := blocker.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&blockerPID); err != nil {
+				t.Fatal(err)
+			}
+			if tag, err := blocker.Exec(ctx, `SELECT 1 FROM mcp_oauth_refresh_tokens WHERE token_hash = $1 FOR UPDATE`, platform.HashToken(pair.RefreshToken)); err != nil || tag.RowsAffected() != 1 {
+				t.Fatalf("blocker: hold the refresh token's row: err %v, rows %d", err, tag.RowsAffected())
+			}
+			var eg errgroup.Group
+			release := func() {
+				_ = blocker.Rollback(ctx)
+				_ = eg.Wait()
+			}
+			defer release()
+			recs := make([]*httptest.ResponseRecorder, len(forms))
+			done := make([]chan struct{}, len(forms))
+			for i := range done {
+				done[i] = make(chan struct{})
+			}
+			start := func(i int) {
+				eg.Go(func() error { defer close(done[i]); recs[i] = r.exchange(forms[i], nil); return nil })
+			}
+
+			start(0)
+			firstPID := waitForLockWaiter(ctx, t, r.pool, []int32{blockerPID}, done[0])
+			if firstPID == 0 {
+				t.Fatal("the first refresh finished without reaching its rotation")
+			}
+			if by, on := blockingPIDs(ctx, t, r.pool, firstPID), queuedOnTables(ctx, t, r.pool, firstPID); len(by) != 1 || by[0] != blockerPID || len(on) != 1 || on[0] != "mcp_oauth_refresh_tokens" {
+				t.Fatalf("the first refresh (pid %d) is queued on a row of %v behind %v, want on mcp_oauth_refresh_tokens behind the blocker (pid %d) alone", firstPID, on, by, blockerPID)
+			}
+			start(1)
+			secondPID := waitForLockWaiter(ctx, t, r.pool, []int32{blockerPID, firstPID}, done[1])
+			if secondPID == 0 {
+				t.Fatal("the second refresh finished without queuing behind the first")
+			}
+			if by, on := blockingPIDs(ctx, t, r.pool, secondPID), queuedOnTables(ctx, t, r.pool, secondPID); len(by) != 1 || by[0] != firstPID || len(on) != 1 || on[0] != tc.secondQueuedOn {
+				t.Fatalf("the second refresh (pid %d) is queued on a row of %v behind %v, want on %s behind the first (pid %d) alone", secondPID, on, by, tc.secondQueuedOn, firstPID)
+			}
+			release()
+
+			if log := errs.String(); log != "" {
+				t.Fatalf("a refresh failed (a deadlock victim logs SQLSTATE 40P01):\n%s", log)
+			}
+			won, replayed := decodeToken(t, recs[0]), decodeToken(t, recs[1])
+			if recs[0].Code != http.StatusOK || won.AccessToken == "" {
+				t.Fatalf("the first refresh: status %d body %s, want 200: the one use", recs[0].Code, recs[0].Body.String())
+			}
+			if recs[1].Code != http.StatusBadRequest || replayed.Error != "invalid_grant" || replayed.AccessToken != "" {
+				t.Fatalf("the second refresh: status %d body %s, want 400 invalid_grant: the replay", recs[1].Code, recs[1].Body.String())
+			}
+			if got := r.callMCP(won.AccessToken); got != http.StatusUnauthorized {
+				t.Errorf("/mcp with the access token the use issued, after the replay: status %d, want 401", got)
+			}
+			if rec, body := r.refreshWith(t, r.refreshForm(won.RefreshToken)); rec.Code != http.StatusBadRequest || body.Error != "invalid_grant" {
+				t.Errorf("refresh with the token the use issued, after the replay: status %d body %s, want 400 invalid_grant", rec.Code, rec.Body.String())
+			}
+			if ids := r.grantIDs(t, user.ID); len(ids) != 0 {
+				t.Fatalf("grants after a concurrent replay = %v, want none", ids)
+			}
+			var reasons []string
+			rows, err := r.pool.Query(ctx, `SELECT detail_json->>'reason' FROM audit_log WHERE action = 'mcp_authorization.revoked' AND resource_id = $1`, grantID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reasons, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
+				t.Fatal(err)
+			}
+			if len(reasons) != 1 || reasons[0] != "refresh_reuse" {
+				t.Fatalf("revocation audit rows for the grant = %v, want exactly one, reason refresh_reuse", reasons)
+			}
 		})
-	}
-	_ = eg.Wait()
-
-	succeeded := 0
-	for _, rec := range recs {
-		switch body := decodeToken(t, rec); {
-		case rec.Code == http.StatusOK:
-			succeeded++
-		case rec.Code == http.StatusBadRequest && body.Error == "invalid_grant":
-		default:
-			t.Errorf("racer: status %d body %s, want 200 or 400 invalid_grant", rec.Code, rec.Body.String())
-		}
-	}
-	if succeeded > 1 {
-		t.Fatalf("%d concurrent refreshes with one token succeeded, want at most 1", succeeded)
-	}
-	if ids := r.grantIDs(t, user.ID); len(ids) != 0 {
-		t.Fatalf("grants after a concurrent replay = %v, want none", ids)
-	}
-	if log := errs.String(); log != "" {
-		t.Fatalf("a racer failed:\n%s", log)
 	}
 }
 
@@ -378,26 +449,44 @@ func TestRefresh_RefreshesNothingItShouldNot(t *testing.T) {
 }
 
 // TestRefresh_ExpiryCappedByGrant: every refresh token lives
-// MCPRefreshTokenTTL from its issuance -- a fresh lifetime per rotation --
-// and neither a refresh token nor an access token ever outlives its grant.
+// MCPRefreshTokenTTL from its issuance -- a fresh lifetime per rotation,
+// never the presented token's remaining one -- and neither a refresh token
+// nor an access token ever outlives its grant.
 func TestRefresh_ExpiryCappedByGrant(t *testing.T) {
+	ctx := context.Background()
 	r := newASRig(t)
 	user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
 	pair := r.issuePair(t, cookie, "mcp:read")
-	want := time.Now().Add(platform.DefaultTimeouts().MCPRefreshTokenTTL)
-	if got := r.refreshRow(t, pair.RefreshToken).ExpiresAt.Time; got.Before(want.Add(-time.Minute)) || got.After(want.Add(time.Minute)) {
-		t.Fatalf("refresh token expires at %v, want about %v (MCPRefreshTokenTTL from issuance)", got, want)
+	ttl := platform.DefaultTimeouts().MCPRefreshTokenTTL
+	aboutTTLFromNow := func(label string, got time.Time) {
+		t.Helper()
+		if want := time.Now().Add(ttl); got.Before(want.Add(-time.Minute)) || got.After(want.Add(time.Minute)) {
+			t.Fatalf("%s expires at %v, want about %v (MCPRefreshTokenTTL from its issuance)", label, got, want)
+		}
 	}
+	aboutTTLFromNow("the code exchange's refresh token", r.refreshRow(t, pair.RefreshToken).ExpiresAt.Time)
 
-	if _, err := r.pool.Exec(context.Background(), `UPDATE mcp_oauth_grants SET expires_at = now() + interval '10 minutes' WHERE user_id = $1`, user.ID); err != nil {
+	// A rotation, with the grant and the chain far from their end: the
+	// presented token has ten days left, its replacement a whole
+	// MCPRefreshTokenTTL (PR #327's round-1 review).
+	if _, err := r.pool.Exec(ctx, `UPDATE mcp_oauth_refresh_tokens SET expires_at = now() + interval '10 days' WHERE token_hash = $1`, platform.HashToken(pair.RefreshToken)); err != nil {
 		t.Fatal(err)
 	}
-	rec, next := r.refreshWith(t, r.refreshForm(pair.RefreshToken))
+	rec, rotated := r.refreshWith(t, r.refreshForm(pair.RefreshToken))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("refresh with ten days left: status %d body %s", rec.Code, rec.Body.String())
+	}
+	aboutTTLFromNow("the rotated-in refresh token", r.refreshRow(t, rotated.RefreshToken).ExpiresAt.Time)
+
+	if _, err := r.pool.Exec(ctx, `UPDATE mcp_oauth_grants SET expires_at = now() + interval '10 minutes' WHERE user_id = $1`, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	rec, next := r.refreshWith(t, r.refreshForm(rotated.RefreshToken))
 	if rec.Code != http.StatusOK || next.ExpiresIn <= 0 || next.ExpiresIn > 600 {
 		t.Fatalf("refresh under a grant expiring in 10 minutes: status %d body %s, want expires_in within 600", rec.Code, rec.Body.String())
 	}
 	var grantExpires time.Time
-	if err := r.pool.QueryRow(context.Background(), `SELECT expires_at FROM mcp_oauth_grants WHERE user_id = $1`, user.ID).Scan(&grantExpires); err != nil {
+	if err := r.pool.QueryRow(ctx, `SELECT expires_at FROM mcp_oauth_grants WHERE user_id = $1`, user.ID).Scan(&grantExpires); err != nil {
 		t.Fatal(err)
 	}
 	if got := r.refreshRow(t, next.RefreshToken).ExpiresAt.Time; got.After(grantExpires) {
@@ -496,6 +585,43 @@ func TestRefresh_ChainLifetimeFixedAtIssuance(t *testing.T) {
 	}
 	if rec, body := r.refreshWith(t, r.refreshForm(b.RefreshToken)); rec.Code != http.StatusOK || body.Scope != "" {
 		t.Fatalf("consent #2's chain after chain #1 ended: status %d body %s, want 200 with its own (empty) scope", rec.Code, rec.Body.String())
+	}
+}
+
+// TestRefresh_DisabledClientCannotRefresh: an operator-disabled client
+// gets no token from a refresh either -- invalid_client, exactly as at the
+// code exchange -- and the refusal spends nothing and revokes nothing:
+// once the client is enabled again, the same refresh token refreshes (PR
+// #327's round-1 review).
+func TestRefresh_DisabledClientCannotRefresh(t *testing.T) {
+	ctx := context.Background()
+	r := newASRig(t)
+	user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+	pair := r.issuePair(t, cookie, "mcp:read")
+	if _, err := r.pool.Exec(ctx, `UPDATE mcp_oauth_clients SET disabled_at = now() WHERE id = $1`, r.client.ID); err != nil {
+		t.Fatal(err)
+	}
+	accessBefore, refreshBefore := r.tokenCounts(t, user.ID)
+
+	rec, body := r.refreshWith(t, r.refreshForm(pair.RefreshToken))
+	if rec.Code != http.StatusBadRequest || body.Error != "invalid_client" || body.AccessToken != "" || body.RefreshToken != "" {
+		t.Fatalf("refresh by a disabled client: status %d body %s, want 400 invalid_client and no token", rec.Code, rec.Body.String())
+	}
+	if access, refresh := r.tokenCounts(t, user.ID); access != accessBefore || refresh != refreshBefore {
+		t.Fatalf("tokens %d/%d -> %d/%d, want nothing issued to a disabled client", accessBefore, refreshBefore, access, refresh)
+	}
+	if r.refreshRow(t, pair.RefreshToken).RotatedAt.Valid {
+		t.Fatalf("a disabled client's refused refresh spent the refresh token")
+	}
+	if ids := r.grantIDs(t, user.ID); len(ids) != 1 {
+		t.Fatalf("grants after a disabled client's refresh = %v, want the one grant, not revoked", ids)
+	}
+
+	if _, err := r.pool.Exec(ctx, `UPDATE mcp_oauth_clients SET disabled_at = NULL WHERE id = $1`, r.client.ID); err != nil {
+		t.Fatal(err)
+	}
+	if rec, body := r.refreshWith(t, r.refreshForm(pair.RefreshToken)); rec.Code != http.StatusOK || body.Scope != "mcp:read" {
+		t.Fatalf("refresh once the client is enabled again: status %d body %s, want 200 scope mcp:read", rec.Code, rec.Body.String())
 	}
 }
 

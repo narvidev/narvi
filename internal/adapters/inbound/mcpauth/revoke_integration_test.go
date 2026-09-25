@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // assertRevokedAnswer: 200, an empty body, never cached (RFC 7009 section
@@ -143,6 +144,95 @@ func TestRevoke_RFC7009_StopsOnNextCall(t *testing.T) {
 				t.Fatalf("refresh after a revocation that must revoke nothing: status %d body %+v, want 200", rec.Code, body)
 			}
 		})
+	}
+}
+
+// TestRevoke_ExpiredOrRotatedTokenStillRevokes: a client may give back a
+// token that no longer works on its own -- an access token past its expiry
+// (until the expired-credential sweep deletes it; after that it is
+// unknown), a refresh token past its expiry, or a refresh token already
+// rotated -- with the matching hint or none, and it still revokes the
+// whole authorization: every token the client does still hold stops
+// working, and the revocation is audited (reason client) (PR #327's
+// round-1 review).
+func TestRevoke_ExpiredOrRotatedTokenStillRevokes(t *testing.T) {
+	ctx := context.Background()
+	r := newASRig(t)
+	expire := func(t *testing.T, table, token string) {
+		t.Helper()
+		if tag, err := r.pool.Exec(ctx, `UPDATE `+table+` SET expires_at = now() - interval '1 second' WHERE token_hash = $1`, platform.HashToken(token)); err != nil || tag.RowsAffected() != 1 {
+			t.Fatalf("expire the %s row: err %v rows %d", table, err, tag.RowsAffected())
+		}
+	}
+
+	for _, tc := range []struct {
+		name string
+		hint string
+		// giveBack readies the token the client gives back and returns it,
+		// with the access and refresh tokens the client still holds.
+		giveBack func(t *testing.T, pair tokenBody) (token, heldAccess, heldRefresh string)
+	}{
+		{"an expired access token", "access_token", func(t *testing.T, p tokenBody) (string, string, string) {
+			expire(t, "mcp_oauth_access_tokens", p.AccessToken)
+			if got := r.callMCP(p.AccessToken); got != http.StatusUnauthorized {
+				t.Fatalf("/mcp with the expired access token: status %d, want 401", got)
+			}
+			return p.AccessToken, "", p.RefreshToken
+		}},
+		{"an expired refresh token", "refresh_token", func(t *testing.T, p tokenBody) (string, string, string) {
+			expire(t, "mcp_oauth_refresh_tokens", p.RefreshToken)
+			return p.RefreshToken, p.AccessToken, ""
+		}},
+		{"a rotated refresh token", "refresh_token", func(t *testing.T, p tokenBody) (string, string, string) {
+			rec, next := r.refreshWith(t, r.refreshForm(p.RefreshToken))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("refresh: status %d body %s", rec.Code, rec.Body.String())
+			}
+			return p.RefreshToken, next.AccessToken, next.RefreshToken
+		}},
+	} {
+		for _, hint := range []string{"", tc.hint} {
+			name := tc.name + ", no hint"
+			if hint != "" {
+				name = tc.name + ", hint " + hint
+			}
+			t.Run(name, func(t *testing.T) {
+				user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+				pair := r.issuePair(t, cookie, "mcp:read")
+				grantID := r.grantIDs(t, user.ID)[0]
+				token, heldAccess, heldRefresh := tc.giveBack(t, pair)
+				if heldAccess != "" {
+					if got := r.callMCP(heldAccess); got != http.StatusOK {
+						t.Fatalf("/mcp with the held access token before the revocation: status %d, want 200", got)
+					}
+				}
+
+				form := url.Values{"token": {token}, "client_id": {r.client.ClientID}}
+				if hint != "" {
+					form.Set("token_type_hint", hint)
+				}
+				rec := r.revoke(form, nil)
+				assertRevokedAnswer(t, rec.Code, rec.Header(), rec.Body.String())
+
+				if ids := r.grantIDs(t, user.ID); len(ids) != 0 {
+					t.Fatalf("grants after giving back %s = %v, want none", tc.name, ids)
+				}
+				if heldAccess != "" {
+					if got := r.callMCP(heldAccess); got != http.StatusUnauthorized {
+						t.Errorf("/mcp with the held access token after the revocation: status %d, want 401", got)
+					}
+				}
+				if heldRefresh != "" {
+					if rec, body := r.refreshWith(t, r.refreshForm(heldRefresh)); rec.Code != http.StatusBadRequest || body.Error != "invalid_grant" {
+						t.Errorf("refresh with the held refresh token after the revocation: status %d body %s, want 400 invalid_grant", rec.Code, rec.Body.String())
+					}
+				}
+				rows := r.auditRows(t, grantID)
+				if last := rows[len(rows)-1]; last.action != "mcp_authorization.revoked" || last.detail["reason"] != "client" {
+					t.Fatalf("audit rows = %+v, want a final mcp_authorization.revoked, reason client", rows)
+				}
+			})
+		}
 	}
 }
 
