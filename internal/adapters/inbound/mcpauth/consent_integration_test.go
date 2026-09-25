@@ -338,20 +338,6 @@ func TestConsent_ReconsentKeepsOneGrant(t *testing.T) {
 	}
 }
 
-// issueWithScopes runs one whole authorization flow approving exactly
-// scopes and returns the token and the scope its token response named.
-func (r *asRig) issueWithScopes(t *testing.T, cookie string, scopes ...string) (token, scope string) {
-	t.Helper()
-	verifier := newVerifier(t)
-	loc := r.approve(t, r.authorizeParams(verifier), cookie, scopes...)
-	rec := r.exchange(r.exchangeForm(loc.Query().Get("code"), verifier), nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("exchange: status %d body %s", rec.Code, rec.Body.String())
-	}
-	body := decodeToken(t, rec)
-	return body.AccessToken, body.Scope
-}
-
 // wantScopes asserts the bearer gate accepts token and attaches exactly
 // want (in order) -- what the MCP handler decides tool visibility from.
 func (r *asRig) wantScopes(t *testing.T, label, token string, want ...string) {
@@ -372,7 +358,7 @@ func TestToken_ScopesFixedAtIssuance_LaterConsentCannotWiden(t *testing.T) {
 	r := newASRig(t)
 	user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
 
-	scopeless, scope := r.issueWithScopes(t, cookie)
+	scopeless, scope := r.issueToken(t, cookie)
 	if scope != "" {
 		t.Fatalf("scope-less approval: token response scope %q, want empty", scope)
 	}
@@ -382,7 +368,7 @@ func TestToken_ScopesFixedAtIssuance_LaterConsentCannotWiden(t *testing.T) {
 	pendingVerifier := newVerifier(t)
 	pendingCode := r.approve(t, r.authorizeParams(pendingVerifier), cookie).Query().Get("code")
 
-	read, scope := r.issueWithScopes(t, cookie, "mcp:read")
+	read, scope := r.issueToken(t, cookie, "mcp:read")
 	if scope != "mcp:read" {
 		t.Fatalf("mcp:read approval: token response scope %q, want mcp:read", scope)
 	}
@@ -408,8 +394,8 @@ func TestToken_ScopesFixedAtIssuance_LaterConsentCannotNarrow(t *testing.T) {
 	r := newASRig(t)
 	user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
 
-	read, _ := r.issueWithScopes(t, cookie, "mcp:read")
-	scopeless, scope := r.issueWithScopes(t, cookie)
+	read, _ := r.issueToken(t, cookie, "mcp:read")
+	scopeless, scope := r.issueToken(t, cookie)
 	if scope != "" {
 		t.Fatalf("scope-less approval: token response scope %q, want empty", scope)
 	}

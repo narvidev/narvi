@@ -317,8 +317,10 @@ func decodeToken(t *testing.T, rec *httptest.ResponseRecorder) tokenBody {
 	return b
 }
 
-// issueToken runs the whole flow and returns a live access token.
-func (r *asRig) issueToken(t *testing.T, cookie string, scopes ...string) string {
+// issueToken runs one whole authorization flow approving exactly scopes
+// and returns the live access token and the scope its token response
+// named.
+func (r *asRig) issueToken(t *testing.T, cookie string, scopes ...string) (token, scope string) {
 	t.Helper()
 	verifier := newVerifier(t)
 	loc := r.approve(t, r.authorizeParams(verifier), cookie, scopes...)
@@ -326,7 +328,8 @@ func (r *asRig) issueToken(t *testing.T, cookie string, scopes ...string) string
 	if rec.Code != http.StatusOK {
 		t.Fatalf("exchange: status %d body %s", rec.Code, rec.Body.String())
 	}
-	return decodeToken(t, rec).AccessToken
+	body := decodeToken(t, rec)
+	return body.AccessToken, body.Scope
 }
 
 // callMCP presents token at the rig's bearer-protected /mcp.
