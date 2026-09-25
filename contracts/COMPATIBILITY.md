@@ -14,8 +14,16 @@ changing the code and this file together, in one PR.
 ## What is covered
 
 - `rest/v1/dtos.schema.json` — every REST request/response/entity `$defs`
-  entry, AND the REST route table itself
-  (`controlplane/testdata/routes.golden`, only rows under `/api/`).
+  entry, AND the REST route table itself (the `/api/` rows of
+  `controlplane/testdata/routes.golden`).
+- The rest of `controlplane/testdata/routes.golden` — every route the
+  control plane serves outside `/api/`: `/.well-known/*`, `/oauth/*` and
+  `/mcp` (called by third-party MCP clients), `/auth/*` and `/webhooks/*`
+  (registered with OAuth providers and webhook senders),
+  `/sessions/{sessionID}/*` (called by the sandbox-agent, an older one
+  included during a rolling deploy), and `/health` (probes). Each has a
+  consumer outside the running build, so each row is graded exactly like
+  an `/api/` row — see "Routes" below.
 - `client-ws/v1/protocol.schema.json` — the browser↔control-plane
   WebSocket protocol (subscribe/fetch-history requests and their
   responses).
@@ -197,8 +205,8 @@ compatible only if compatible under **both** columns.
 | 37 | schema file removed/renamed, unless the BASE manifest already marks it `retired` | MAJOR (also forces a MAJOR version bump, §4) | same |
 | 38 | schema file added under a new manifest row | MINOR (also forces a MAJOR version bump, §4 — a new vN sibling is how a breaking change is made) | same |
 | 39 | `items` changed; `items` presence itself added/removed | recurse; presence change is MAJOR | same |
-| 40 | route removed/renamed, or method changed, in `routes.golden` under `/api/` | MAJOR | n/a |
-| 41 | route added | MINOR | n/a |
+| 40 | route removed/renamed (a path-parameter rename included), or method changed, on any row of `routes.golden`, under `/api/` or not ("Routes" below) | MAJOR | n/a |
+| 41 | route added, on any row of `routes.golden`, under `/api/` or not | MINOR | n/a |
 | 42 | `additionalProperties` schema→`true`/absent (permissive) — distinct from row 23's `false`→anything "unlock" | MAJOR | MINOR |
 | 43 | `oneOf`/`anyOf` keyword itself added or removed (not a member of an already-existing union — that's rows 28/29) | MAJOR | MAJOR |
 | 44 | a surface's `direction` changed between the base and head `manifest.json` | MAJOR | MAJOR |
@@ -213,7 +221,10 @@ union that does not match one of the two permitted shapes above, on
 either side of the diff — "Permitted `oneOf`/`anyOf` shapes"); a `required`
 name with no matching `properties` entry on that same side (rows 3/4
 still apply normally to a required name that DOES have a matching
-property, even one only declared via an unchanged `$ref` target); and any
+property, even one only declared via an unchanged `$ref` target); a
+`routes.golden` line, on either side of the diff, that is not exactly
+`METHOD /path` or that repeats another line (`fc-routes-line`, "Routes"
+below); and any
 keyword — anywhere in the closed allowlist — present at a schema node
 that no rule handler above actually consumed (the checker's own internal
 exhaustiveness assertion; this should never fire in practice, since every
@@ -240,6 +251,42 @@ looks at the new absence) UNLESS it removes something a consumer might
 already depend on (a property disappearing, a type narrowing under it,
 etc. — see the table for the exact list). **Adding** something is the
 mirror image.
+
+## Routes: `controlplane/testdata/routes.golden`
+
+The route table is graded line by line — every line, under `/api/` or
+not ("What is covered" above says why):
+
+- A line in head but not in base is row 41, MINOR: a route added.
+- A line in base but not in head is row 40, MAJOR: a route removed. A
+  renamed path, a renamed path parameter (`{sessionID}` → `{id}`) and a
+  changed method each read as the old line removed plus a new one added,
+  so all three are MAJOR. That is conservative for a parameter rename,
+  which changes nothing on the wire, but at this line grain the checker
+  cannot tell one from a real rename.
+- Like any MAJOR finding, a removed or changed route fails the check
+  whatever the VERSION bump. There is no sanctioned path for one yet: the
+  versioned-sibling procedure below is for schema files, and REST
+  addressing for a breaking change is still an open decision ("Who this
+  governs"). Removing or changing a route needs an owner decision, and a
+  checker change, first.
+- Every line must be exactly `METHOD /path`: an upper-case method, one
+  space, and a path starting with `/` with no whitespace in it. A line
+  that is not — a blank line, a trailing field, a CRLF ending, a
+  lower-case method — or that repeats another line, on either side of
+  the diff, is FAIL-CLOSED (`fc-routes-line`), naming the side and the
+  line number, and no route diff is reported for that run. The file is
+  the control-plane binary's own `routes` output, so the fix is to
+  regenerate it, never to edit it by hand.
+- Any byte change to the file, even one that changes no route (a
+  reorder), counts as a change for the VERSION/CHANGELOG discipline
+  below.
+
+Until this section was written the checker read only the `/api/` rows and
+skipped every other line, so a route outside `/api/` could be added,
+removed or re-methoded with no VERSION bump and no CHANGELOG entry.
+CHANGELOG entries up to 1.4.1 that call such a route "not graded"
+describe that old behaviour, not this policy.
 
 ## Relaxations: `openEnums` and `status: retired`
 
@@ -357,6 +404,13 @@ row (direction, status) or a new/removed manifest row, not just a schema
 content diff. If NOTHING changed, VERSION and the CHANGELOG's top heading
 must stay exactly as they were — a version bump with no content change is
 exactly as wrong as a content change with no version bump.
+
+`controlplane/testdata/routes.golden` is one surface here, under that
+path: any byte of it changing — a route under `/api/` or outside it, or
+no route at all — needs a `### controlplane/testdata/routes.golden`
+subsection, and a bump at least as large as the route grades demand
+(MINOR for an added route; a removed or changed one is MAJOR and fails
+the check regardless, "Routes" above).
 
 A schema file being added (row 38) or removed (row 37) always requires
 **at least a MAJOR bump**, regardless of that row's own graded
