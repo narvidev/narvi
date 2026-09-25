@@ -359,6 +359,15 @@ func (s *Server) decide(w http.ResponseWriter, r *http.Request, requestID, userI
 		fail("load client failed", err)
 		return
 	}
+	if client.DisabledAt.Valid || client.Kind != sqlcgen.McpOauthClientKindPreregistered {
+		// Disabled after the page was rendered: nothing is granted. The
+		// rollback also leaves the request unconsumed, but the page's
+		// own render refuses a disabled client, so it can never be
+		// decided again.
+		logger.Warn("mcpauth: consent decision refused", "outcome", "client_not_usable", "client_id", client.ClientID)
+		s.renderError(w, r, http.StatusBadRequest, "This app is not available", "An administrator of this deployment has disabled this app.")
+		return
+	}
 	now := time.Now()
 	grant, err := grants.UpsertGrant(ctx, sqlcgen.UpsertMCPOAuthGrantParams{
 		UserID:    userID,

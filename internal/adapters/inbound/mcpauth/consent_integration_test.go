@@ -335,3 +335,27 @@ func TestConsent_ReconsentKeepsOneGrant(t *testing.T) {
 		t.Fatalf("scopes after narrowing re-consent = %v (err %v), want none", scopes, err)
 	}
 }
+
+// TestConsent_ClientDisabledAfterRenderGrantsNothing: a client an
+// operator disables while its consent page is open cannot be approved --
+// no grant, no code, no redirect.
+func TestConsent_ClientDisabledAfterRenderGrantsNothing(t *testing.T) {
+	r := newASRig(t)
+	user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+	requestID := r.startConsent(t, r.authorizeParams(newVerifier(t)), cookie)
+	_, nonce := r.renderConsent(t, requestID, cookie)
+	if _, err := r.pool.Exec(context.Background(), `UPDATE mcp_oauth_clients SET disabled_at = now() WHERE id = $1`, r.client.ID); err != nil {
+		t.Fatal(err)
+	}
+	form := url.Values{"request": {requestID}, "nonce": {nonce}, "decision": {"approve"}, "scope": {"mcp:read"}}
+	if rec := r.postConsent(form, sameOriginHeaders(), cookie); rec.Code != http.StatusBadRequest || rec.Header().Get("Location") != "" {
+		t.Fatalf("status %d Location %q, want 400 and no redirect", rec.Code, rec.Header().Get("Location"))
+	}
+	if ids := r.grantIDs(t, user.ID); len(ids) != 0 {
+		t.Fatalf("grants = %v, want none", ids)
+	}
+	var codes int
+	if err := r.pool.QueryRow(context.Background(), `SELECT count(*) FROM mcp_oauth_authorization_codes`).Scan(&codes); err != nil || codes != 0 {
+		t.Fatalf("codes = %d (err %v), want none", codes, err)
+	}
+}
