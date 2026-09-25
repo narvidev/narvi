@@ -26,7 +26,9 @@ const accessTokenPrefix = "narvi_mcp_at_"
 
 // tokenResponse is a successful token response (RFC 6749 section 5.1). scope is
 // always present: the user may have narrowed what the client asked for,
-// and a scope-less grant answers "".
+// and a scope-less approval answers "". It is the token's own scopes --
+// exactly what the user approved in the flow that produced the code --
+// which is all the token will ever be able to do.
 type tokenResponse struct {
 	AccessToken string `json:"access_token"`
 	TokenType   string `json:"token_type"`
@@ -225,9 +227,13 @@ func (s *Server) exchangeCode(w http.ResponseWriter, r *http.Request, client sql
 	if grant.ExpiresAt.Time.Before(expiresAt) {
 		expiresAt = grant.ExpiresAt.Time
 	}
+	// The token's scopes are the code's -- what the user approved in the
+	// consent decision that issued it -- never the grant's, which a later
+	// consent for the same client overwrites (technical plan §43.16).
 	if _, err := grants.CreateAccessToken(ctx, sqlcgen.CreateMCPOAuthAccessTokenParams{
 		GrantID:   grant.ID,
 		TokenHash: platform.HashToken(accessToken),
+		Scopes:    row.Scopes,
 		ExpiresAt: pgtype.Timestamptz{Time: expiresAt, Valid: true},
 	}); err != nil {
 		fail("record token failed", err)
@@ -241,7 +247,7 @@ func (s *Server) exchangeCode(w http.ResponseWriter, r *http.Request, client sql
 		AccessToken: accessToken,
 		TokenType:   "Bearer",
 		ExpiresIn:   int64(platform.DurationToSeconds(expiresAt.Sub(now))),
-		Scope:       mcpscope.Join(mcpscope.FromStrings(grant.Scopes)),
+		Scope:       mcpscope.Join(mcpscope.FromStrings(row.Scopes)),
 	})
 }
 

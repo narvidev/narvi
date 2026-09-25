@@ -285,8 +285,9 @@ func implementation() *sdkmcp.Implementation {
 // (platform.UserFromContext) and the MCP grant it was authenticated under
 // (platform.MCPGrantFromContext) -- both attached by auth.RequireMCPBearer,
 // the /mcp route group's own gate (controlplane/serve.go) -- and builds an
-// *sdkmcp.Server holding ONLY the tools that grant's scopes satisfy
-// (technical plan §43.17): a tool the grant does not cover is never
+// *sdkmcp.Server holding ONLY the tools that grant's scopes -- the access
+// token's own, fixed at issuance (§43.16) -- satisfy (technical plan
+// §43.17): a tool the grant does not cover is never
 // registered, so tools/list omits it and a tools/call naming it answers
 // the SDK's own "unknown tool" error, exactly as for a name that never
 // existed. The instructions paragraph is composed from the same visible

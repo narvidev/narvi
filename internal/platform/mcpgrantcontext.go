@@ -13,8 +13,10 @@ package platform
 import "context"
 
 // MCPGrant is the authorization an MCP access token was issued under.
-// Scopes holds the grant's scope strings verbatim (possibly empty: a
-// scope-less grant is legitimate and sees no tools).
+// Scopes holds the ACCESS TOKEN's scope strings verbatim -- fixed when the
+// token was issued to exactly what the user approved in that flow, never
+// widened or narrowed by a later consent for the same client (possibly
+// empty: a scope-less token is legitimate and sees no tools).
 type MCPGrant struct {
 	GrantID  string
 	ClientID string

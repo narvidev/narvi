@@ -318,8 +318,10 @@ func TestConsent_ExpiredRequestRefused(t *testing.T) {
 }
 
 // TestConsent_ReconsentKeepsOneGrant: approving the same client again
-// updates the user's one grant (same id, new scopes) instead of adding a
-// row per consent.
+// updates the user's one grant (same id) instead of adding a row per
+// consent; the row records the latest approval's scopes, for display
+// only -- what each token may do is its own (the two
+// TestToken_ScopesFixedAtIssuance tests below).
 func TestConsent_ReconsentKeepsOneGrant(t *testing.T) {
 	r := newASRig(t)
 	user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
@@ -332,7 +334,99 @@ func TestConsent_ReconsentKeepsOneGrant(t *testing.T) {
 	}
 	var scopes []string
 	if err := r.pool.QueryRow(context.Background(), `SELECT scopes FROM mcp_oauth_grants WHERE id = $1`, second[0]).Scan(&scopes); err != nil || len(scopes) != 0 {
-		t.Fatalf("scopes after narrowing re-consent = %v (err %v), want none", scopes, err)
+		t.Fatalf("grant scopes after the second (scope-less) approval = %v (err %v), want the latest approval recorded: none", scopes, err)
+	}
+}
+
+// issueWithScopes runs one whole authorization flow approving exactly
+// scopes and returns the token and the scope its token response named.
+func (r *asRig) issueWithScopes(t *testing.T, cookie string, scopes ...string) (token, scope string) {
+	t.Helper()
+	verifier := newVerifier(t)
+	loc := r.approve(t, r.authorizeParams(verifier), cookie, scopes...)
+	rec := r.exchange(r.exchangeForm(loc.Query().Get("code"), verifier), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("exchange: status %d body %s", rec.Code, rec.Body.String())
+	}
+	body := decodeToken(t, rec)
+	return body.AccessToken, body.Scope
+}
+
+// wantScopes asserts the bearer gate accepts token and attaches exactly
+// want (in order) -- what the MCP handler decides tool visibility from.
+func (r *asRig) wantScopes(t *testing.T, label, token string, want ...string) {
+	t.Helper()
+	status, got := r.mcpScopes(t, token)
+	if status != http.StatusOK || strings.Join(got, " ") != strings.Join(want, " ") || got == nil {
+		t.Fatalf("%s: /mcp status %d scopes %q, want 200 with %q", label, status, got, want)
+	}
+}
+
+// TestToken_ScopesFixedAtIssuance_LaterConsentCannotWiden is the round-1
+// review's probe (technical plan §43.16): a token issued scope-less stays
+// scope-less after the same user approves the same client again with
+// mcp:read -- on another install, say -- and so does a code approved
+// scope-less but exchanged only after that wider consent. All of them
+// hang off the one grant, which is why the grant's scopes are never read.
+func TestToken_ScopesFixedAtIssuance_LaterConsentCannotWiden(t *testing.T) {
+	r := newASRig(t)
+	user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+
+	scopeless, scope := r.issueWithScopes(t, cookie)
+	if scope != "" {
+		t.Fatalf("scope-less approval: token response scope %q, want empty", scope)
+	}
+	r.wantScopes(t, "scope-less token", scopeless)
+
+	// A second scope-less approval whose code is not exchanged yet.
+	pendingVerifier := newVerifier(t)
+	pendingCode := r.approve(t, r.authorizeParams(pendingVerifier), cookie).Query().Get("code")
+
+	read, scope := r.issueWithScopes(t, cookie, "mcp:read")
+	if scope != "mcp:read" {
+		t.Fatalf("mcp:read approval: token response scope %q, want mcp:read", scope)
+	}
+	if ids := r.grantIDs(t, user.ID); len(ids) != 1 {
+		t.Fatalf("grants = %v, want the one grant every token hangs off", ids)
+	}
+	r.wantScopes(t, "mcp:read token", read, "mcp:read")
+	r.wantScopes(t, "scope-less token after a wider consent", scopeless)
+
+	rec := r.exchange(r.exchangeForm(pendingCode, pendingVerifier), nil)
+	body := decodeToken(t, rec)
+	if rec.Code != http.StatusOK || body.Scope != "" {
+		t.Fatalf("scope-less code exchanged after a wider consent: status %d scope %q, want 200 with an empty scope", rec.Code, body.Scope)
+	}
+	r.wantScopes(t, "token from the scope-less code exchanged after a wider consent", body.AccessToken)
+}
+
+// TestToken_ScopesFixedAtIssuance_LaterConsentCannotNarrow: a later,
+// narrower approval of the same client does not strip a token issued
+// earlier -- withdrawing access is revocation, not re-consent -- and
+// revoking the grant still stops every token under it on the next call.
+func TestToken_ScopesFixedAtIssuance_LaterConsentCannotNarrow(t *testing.T) {
+	r := newASRig(t)
+	user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+
+	read, _ := r.issueWithScopes(t, cookie, "mcp:read")
+	scopeless, scope := r.issueWithScopes(t, cookie)
+	if scope != "" {
+		t.Fatalf("scope-less approval: token response scope %q, want empty", scope)
+	}
+	r.wantScopes(t, "mcp:read token after a narrower consent", read, "mcp:read")
+	r.wantScopes(t, "scope-less token", scopeless)
+
+	ids := r.grantIDs(t, user.ID)
+	if len(ids) != 1 {
+		t.Fatalf("grants = %v, want one", ids)
+	}
+	if _, err := r.pool.Exec(context.Background(), `DELETE FROM mcp_oauth_grants WHERE id = $1`, ids[0]); err != nil {
+		t.Fatal(err)
+	}
+	for name, token := range map[string]string{"mcp:read": read, "scope-less": scopeless} {
+		if got := r.callMCP(token); got != http.StatusUnauthorized {
+			t.Errorf("%s token after the grant was revoked: status %d, want 401", name, got)
+		}
 	}
 }
 

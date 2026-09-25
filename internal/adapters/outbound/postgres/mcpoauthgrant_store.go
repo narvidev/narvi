@@ -78,8 +78,9 @@ func (s *MCPOAuthGrantStore) ConsumeAuthorizationRequest(ctx context.Context, id
 }
 
 // UpsertGrant records a consent: it creates the user's one grant for this
-// client, or replaces that grant's scopes, resource and expiry in place
-// (queries/mcp_oauth_grants.sql's own doc comment).
+// client, or renews that grant's resource and expiry in place and records
+// the scopes just approved -- for display only; no authorization decision
+// reads a grant's scopes (queries/mcp_oauth_grants.sql's own doc comment).
 func (s *MCPOAuthGrantStore) UpsertGrant(ctx context.Context, arg sqlcgen.UpsertMCPOAuthGrantParams) (sqlcgen.McpOauthGrant, error) {
 	arg.Scopes = nonNilScopes(arg.Scopes)
 	return s.q.UpsertMCPOAuthGrant(ctx, arg)
@@ -116,8 +117,10 @@ func (s *MCPOAuthGrantStore) ListGrantsForClient(ctx context.Context, clientID p
 	return s.q.ListMCPOAuthGrantsForClient(ctx, clientID)
 }
 
-// CreateAuthorizationCode inserts one (hashed) authorization code.
+// CreateAuthorizationCode inserts one (hashed) authorization code,
+// carrying the scopes approved in the consent decision that issued it.
 func (s *MCPOAuthGrantStore) CreateAuthorizationCode(ctx context.Context, arg sqlcgen.CreateMCPOAuthAuthorizationCodeParams) (sqlcgen.McpOauthAuthorizationCode, error) {
+	arg.Scopes = nonNilScopes(arg.Scopes)
 	return s.q.CreateMCPOAuthAuthorizationCode(ctx, arg)
 }
 
@@ -134,20 +137,26 @@ func (s *MCPOAuthGrantStore) GetAuthorizationCodeByHash(ctx context.Context, cod
 	return s.q.GetMCPOAuthAuthorizationCodeByHash(ctx, codeHash)
 }
 
-// CreateAccessToken inserts one (hashed) access token.
+// CreateAccessToken inserts one (hashed) access token with its scopes,
+// fixed for the token's whole lifetime.
 func (s *MCPOAuthGrantStore) CreateAccessToken(ctx context.Context, arg sqlcgen.CreateMCPOAuthAccessTokenParams) (sqlcgen.McpOauthAccessToken, error) {
+	arg.Scopes = nonNilScopes(arg.Scopes)
 	return s.q.CreateMCPOAuthAccessToken(ctx, arg)
 }
 
 // MCPAccessTokenPrincipal is everything the /mcp bearer check needs to
 // decide one call, read by LookupAccessToken's single join: the token's
-// own expiry, its grant (scopes, audience, expiry), its client (disabled
-// or not) and its user (role, email, disabled or not). Plain Go values,
-// so auth.RequireMCPBearer's own unit tests can hand it a fake lookup.
+// own expiry and scopes, its grant (audience, expiry), its client
+// (disabled or not) and its user (role, email, disabled or not). Plain Go
+// values, so auth.RequireMCPBearer's own unit tests can hand it a fake
+// lookup.
 type MCPAccessTokenPrincipal struct {
 	TokenExpiresAt time.Time
+	// TokenScopes are the scopes approved in the flow that issued this
+	// token, fixed at issuance. The grant's own scopes column is never
+	// read here: it only records the most recent consent for display.
+	TokenScopes    []string
 	GrantID        pgtype.UUID
-	GrantScopes    []string
 	GrantResource  string
 	GrantExpiresAt time.Time
 	// GrantLastUsedAt is the zero time when the grant was never used.
@@ -171,8 +180,8 @@ func (s *MCPOAuthGrantStore) LookupAccessToken(ctx context.Context, tokenHash st
 	}
 	p := MCPAccessTokenPrincipal{
 		TokenExpiresAt: row.TokenExpiresAt.Time,
+		TokenScopes:    row.TokenScopes,
 		GrantID:        row.GrantID,
-		GrantScopes:    row.Scopes,
 		GrantResource:  row.Resource,
 		GrantExpiresAt: row.GrantExpiresAt.Time,
 		ClientID:       row.ClientPublicID,

@@ -41,9 +41,9 @@
       {{range .Scopes}}<label><input type="checkbox" name="scope" value="{{.Value}}" checked> {{.Description}} <code>{{.Value}}</code></label>
       {{end}}
     </fieldset>
-    <p class="note">Uncheck anything you do not want to allow. The app can never do more than your own role allows, and you can disconnect it at any time in Settings, Integrations, Connected apps.</p>
+    <p class="note">Uncheck anything you do not want to allow. The app can never do more than your own role allows. Your choice applies to this approval only and does not change access you allowed the app before: to take access away, disconnect it in Settings, Integrations, Connected apps.</p>
     {{else}}
-    <p class="note">This app asked for no access. If you allow it, it can confirm who you are but will see no tools. You can disconnect it at any time in Settings, Integrations, Connected apps.</p>
+    <p class="note">This app asked for no access. If you allow it, this approval lets it confirm who you are but see no tools. It does not take away access you allowed the app before: to do that, disconnect it in Settings, Integrations, Connected apps.</p>
     {{end}}
     <div class="actions">
       <button type="submit" name="decision" value="approve" class="primary">Allow</button>

@@ -15,7 +15,7 @@ const consumeMCPOAuthAuthorizationCode = `-- name: ConsumeMCPOAuthAuthorizationC
 UPDATE mcp_oauth_authorization_codes
 SET consumed_at = now()
 WHERE code_hash = $1 AND consumed_at IS NULL
-RETURNING id, grant_id, code_hash, code_challenge, redirect_uri, resource, expires_at, consumed_at, created_at
+RETURNING id, grant_id, code_hash, code_challenge, redirect_uri, resource, scopes, expires_at, consumed_at, created_at
 `
 
 func (q *Queries) ConsumeMCPOAuthAuthorizationCode(ctx context.Context, codeHash string) (McpOauthAuthorizationCode, error) {
@@ -28,6 +28,7 @@ func (q *Queries) ConsumeMCPOAuthAuthorizationCode(ctx context.Context, codeHash
 		&i.CodeChallenge,
 		&i.RedirectUri,
 		&i.Resource,
+		&i.Scopes,
 		&i.ExpiresAt,
 		&i.ConsumedAt,
 		&i.CreatedAt,
@@ -37,9 +38,9 @@ func (q *Queries) ConsumeMCPOAuthAuthorizationCode(ctx context.Context, codeHash
 
 const createMCPOAuthAuthorizationCode = `-- name: CreateMCPOAuthAuthorizationCode :one
 
-INSERT INTO mcp_oauth_authorization_codes (grant_id, code_hash, code_challenge, redirect_uri, resource, expires_at)
-VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, grant_id, code_hash, code_challenge, redirect_uri, resource, expires_at, consumed_at, created_at
+INSERT INTO mcp_oauth_authorization_codes (grant_id, code_hash, code_challenge, redirect_uri, resource, scopes, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+RETURNING id, grant_id, code_hash, code_challenge, redirect_uri, resource, scopes, expires_at, consumed_at, created_at
 `
 
 type CreateMCPOAuthAuthorizationCodeParams struct {
@@ -48,6 +49,7 @@ type CreateMCPOAuthAuthorizationCodeParams struct {
 	CodeChallenge string             `json:"code_challenge"`
 	RedirectUri   string             `json:"redirect_uri"`
 	Resource      string             `json:"resource"`
+	Scopes        []string           `json:"scopes"`
 	ExpiresAt     pgtype.Timestamptz `json:"expires_at"`
 }
 
@@ -65,6 +67,7 @@ func (q *Queries) CreateMCPOAuthAuthorizationCode(ctx context.Context, arg Creat
 		arg.CodeChallenge,
 		arg.RedirectUri,
 		arg.Resource,
+		arg.Scopes,
 		arg.ExpiresAt,
 	)
 	var i McpOauthAuthorizationCode
@@ -75,6 +78,7 @@ func (q *Queries) CreateMCPOAuthAuthorizationCode(ctx context.Context, arg Creat
 		&i.CodeChallenge,
 		&i.RedirectUri,
 		&i.Resource,
+		&i.Scopes,
 		&i.ExpiresAt,
 		&i.ConsumedAt,
 		&i.CreatedAt,
@@ -96,7 +100,7 @@ func (q *Queries) DeleteExpiredMCPOAuthAuthorizationCodes(ctx context.Context) (
 }
 
 const getMCPOAuthAuthorizationCodeByHash = `-- name: GetMCPOAuthAuthorizationCodeByHash :one
-SELECT id, grant_id, code_hash, code_challenge, redirect_uri, resource, expires_at, consumed_at, created_at FROM mcp_oauth_authorization_codes
+SELECT id, grant_id, code_hash, code_challenge, redirect_uri, resource, scopes, expires_at, consumed_at, created_at FROM mcp_oauth_authorization_codes
 WHERE code_hash = $1
 `
 
@@ -110,6 +114,7 @@ func (q *Queries) GetMCPOAuthAuthorizationCodeByHash(ctx context.Context, codeHa
 		&i.CodeChallenge,
 		&i.RedirectUri,
 		&i.Resource,
+		&i.Scopes,
 		&i.ExpiresAt,
 		&i.ConsumedAt,
 		&i.CreatedAt,

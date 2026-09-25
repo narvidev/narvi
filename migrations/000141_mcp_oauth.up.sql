@@ -65,11 +65,15 @@ CREATE INDEX mcp_oauth_authorization_requests_client_id_idx ON mcp_oauth_authori
 CREATE INDEX mcp_oauth_authorization_requests_expires_at_idx ON mcp_oauth_authorization_requests (expires_at);
 
 -- One user's authorization of one client: at most one row per (user,
--- client) -- consenting again replaces the row's scopes and renews its
--- lifetime rather than adding a second row, so the Connected apps list
--- names each app once and re-consent cannot grow this table without
--- bound. scopes may be empty: a scope-less grant authenticates the user
--- but sees no tools (§43.17). resource is the canonical /mcp URI the
+-- client) -- consenting again renews the row's lifetime rather than
+-- adding a second row, so the Connected apps list names each app once and
+-- re-consent cannot grow this table without bound. scopes records the
+-- most recent approval, for display only: it is never read to authorize
+-- anything, because what a credential may do is fixed when it is issued
+-- -- each authorization code and access token below carries the scopes
+-- approved in the flow that produced it, and a later consent can neither
+-- widen nor narrow a token already issued (withdrawing access is
+-- revocation: deleting this row). resource is the canonical /mcp URI the
 -- grant was issued for; the bearer check compares it against this
 -- deployment's own on every call (audience binding). expires_at is the
 -- absolute lifetime after which the user must consent again.
@@ -88,9 +92,11 @@ CREATE INDEX mcp_oauth_grants_client_id_idx ON mcp_oauth_grants (client_id);
 CREATE INDEX mcp_oauth_grants_expires_at_idx ON mcp_oauth_grants (expires_at);
 
 -- One authorization code, single-use (consumed_at), bound to the PKCE
--- challenge, redirect URI and resource of the request that produced it.
--- A consumed row is kept until it expires so a replay can be recognised
--- as a replay -- and a replay deletes the grant (§43.16).
+-- challenge, redirect URI and resource of the request that produced it,
+-- and carrying the scopes the user approved in that one consent decision
+-- -- the scopes the access token it is exchanged for will hold. A consumed
+-- row is kept until it expires so a replay can be recognised as a replay
+-- -- and a replay deletes the grant (§43.16).
 CREATE TABLE mcp_oauth_authorization_codes (
     id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     grant_id       UUID NOT NULL REFERENCES mcp_oauth_grants(id) ON DELETE CASCADE,
@@ -98,6 +104,7 @@ CREATE TABLE mcp_oauth_authorization_codes (
     code_challenge TEXT NOT NULL,
     redirect_uri   TEXT NOT NULL,
     resource       TEXT NOT NULL,
+    scopes         TEXT[] NOT NULL,
     expires_at     TIMESTAMPTZ NOT NULL,
     consumed_at    TIMESTAMPTZ,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -106,10 +113,13 @@ CREATE INDEX mcp_oauth_authorization_codes_grant_id_idx ON mcp_oauth_authorizati
 CREATE INDEX mcp_oauth_authorization_codes_expires_at_idx ON mcp_oauth_authorization_codes (expires_at);
 
 -- One bearer access token, looked up by token_hash on every /mcp call.
+-- scopes is copied from the code it was exchanged for and never changes:
+-- the bearer check reads the token's own scopes, never the grant's.
 CREATE TABLE mcp_oauth_access_tokens (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     grant_id   UUID NOT NULL REFERENCES mcp_oauth_grants(id) ON DELETE CASCADE,
     token_hash TEXT NOT NULL UNIQUE,
+    scopes     TEXT[] NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

@@ -11,7 +11,8 @@
 // platform.AuthenticatedUser a cookie would, plus the platform.MCPGrant
 // the token was issued under. No cookie authenticates this route. It is
 // disabled by default (NARVI_MCP_ENABLED, platform.Config.MCPEnabled).
-// The grant's scopes decide which tools a request can even SEE
+// The MCPGrant's scopes -- the access token's own, fixed when it was
+// issued (§43.16) -- decide which tools a request can even SEE
 // (§43.17, buildServer); they never widen what a tool may do, because
 // every tool runs its REST twin's own authorization against the user's
 // own role. Result/verdict tools, bounded wait, transcript paging, and the

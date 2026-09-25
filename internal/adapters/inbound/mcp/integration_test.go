@@ -196,11 +196,12 @@ func mintMCPToken(ctx context.Context, t *testing.T, r *mcpTestRig, userID pgtyp
 	if err != nil {
 		t.Fatalf("mint grant: %v", err)
 	}
-	return mintTokenForGrant(ctx, t, r, grant.ID, time.Now().Add(time.Hour))
+	return mintTokenForGrant(ctx, t, r, grant.ID, scopes, time.Now().Add(time.Hour))
 }
 
-// mintTokenForGrant issues one more access token under grantID.
-func mintTokenForGrant(ctx context.Context, t *testing.T, r *mcpTestRig, grantID pgtype.UUID, expires time.Time) string {
+// mintTokenForGrant issues one more access token under grantID, holding
+// exactly scopes (a token's scopes are its own, fixed at issuance).
+func mintTokenForGrant(ctx context.Context, t *testing.T, r *mcpTestRig, grantID pgtype.UUID, scopes []string, expires time.Time) string {
 	t.Helper()
 	raw, err := platform.GenerateToken()
 	if err != nil {
@@ -210,6 +211,7 @@ func mintTokenForGrant(ctx context.Context, t *testing.T, r *mcpTestRig, grantID
 	if _, err := r.grants.CreateAccessToken(ctx, sqlcgen.CreateMCPOAuthAccessTokenParams{
 		GrantID:   grantID,
 		TokenHash: platform.HashToken(token),
+		Scopes:    scopes,
 		ExpiresAt: pgtype.Timestamptz{Time: expires, Valid: true},
 	}); err != nil {
 		t.Fatalf("mint access token: %v", err)
@@ -463,7 +465,7 @@ func TestParity_ExpiredCredential(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lookup minted token: %v", err)
 	}
-	expired := mintTokenForGrant(ctx, t, rig, lookup.GrantID, time.Now().Add(-time.Second))
+	expired := mintTokenForGrant(ctx, t, rig, lookup.GrantID, []string{"mcp:read"}, time.Now().Add(-time.Second))
 	mcpStatus, _ := rig.callTool(t, "narvi_list_models", "{}", expired)
 	if mcpStatus != http.StatusUnauthorized {
 		t.Fatalf("MCP with expired token: status = %d, want 401", mcpStatus)

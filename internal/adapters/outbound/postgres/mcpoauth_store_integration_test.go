@@ -78,6 +78,7 @@ func (f mcpOAuthFixture) createGrantWithToken(ctx context.Context, t *testing.T,
 	tok, err := f.grants.CreateAccessToken(ctx, sqlcgen.CreateMCPOAuthAccessTokenParams{
 		GrantID:   g.ID,
 		TokenHash: tokenHash,
+		Scopes:    scopes,
 		ExpiresAt: mcpTS(tokenExpires),
 	})
 	if err != nil {
@@ -103,8 +104,8 @@ func TestMCPOAuthGrantStore_EmptyScopesStoredAsEmptyArray(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LookupAccessToken: %v", err)
 	}
-	if len(p.GrantScopes) != 0 {
-		t.Fatalf("principal scopes = %#v, want empty", p.GrantScopes)
+	if p.TokenScopes == nil || len(p.TokenScopes) != 0 {
+		t.Fatalf("principal scopes = %#v, want a non-nil empty slice", p.TokenScopes)
 	}
 
 	req, err := f.grants.CreateAuthorizationRequest(ctx, sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
@@ -369,10 +370,12 @@ func TestMCPOAuthGrantStore_DeleteGrantForUserIsOwnOnly(t *testing.T) {
 }
 
 // TestMCPOAuthGrantStore_UpsertKeepsOneGrantPerUserAndClient proves
-// consenting again to the same client replaces the one grant in place --
-// same id, new scopes, renewed expiry, original created_at -- so tokens
-// issued under the first consent keep working under the scopes just
-// consented to, and the table cannot grow one row per consent.
+// consenting again to the same client updates the one grant in place --
+// same id, renewed expiry, original created_at, the latest approval's
+// scopes recorded for display -- so the table cannot grow one row per
+// consent; and that a token issued under the first consent keeps exactly
+// the scopes it was issued with (technical plan §43.16): the bearer
+// lookup reads the token's scopes, never the grant's.
 func TestMCPOAuthGrantStore_UpsertKeepsOneGrantPerUserAndClient(t *testing.T) {
 	ctx := context.Background()
 	f := newMCPOAuthFixture(ctx, t)
@@ -396,8 +399,8 @@ func TestMCPOAuthGrantStore_UpsertKeepsOneGrantPerUserAndClient(t *testing.T) {
 		t.Fatalf("second consent = %+v, want scopes {}, expiry %v, created_at unchanged %v", second, later, first.CreatedAt.Time)
 	}
 	p, err := f.grants.LookupAccessToken(ctx, "hash-upsert")
-	if err != nil || len(p.GrantScopes) != 0 {
-		t.Fatalf("first consent's token after re-consent: principal = %+v, err = %v, want it alive under the new (empty) scopes", p, err)
+	if err != nil || len(p.TokenScopes) != 1 || p.TokenScopes[0] != "mcp:read" {
+		t.Fatalf("first consent's token after re-consent: principal = %+v, err = %v, want it alive and still holding exactly [mcp:read]", p, err)
 	}
 	listed, err := f.grants.ListGrantsForUser(ctx, f.user.ID)
 	if err != nil || len(listed) != 1 {

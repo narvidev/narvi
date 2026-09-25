@@ -38,10 +38,13 @@ const (
 	localhostRedirect = "http://localhost:8080/cb"
 )
 
-// asRig is a real-Postgres authorization server mounted exactly the way
+// asRig is a real-Postgres authorization server mounted the way
 // controlplane/serve.go mounts it (no cookie middleware on any /oauth
 // route), plus a /mcp stand-in behind the real auth.RequireMCPBearer so a
-// test can ask "does this token still work".
+// test can ask "does this token still work" -- and, through the scopes
+// the stand-in echoes back, "what may it see".
+// controlplane's own TestOAuth_ProductionRouter proves the production
+// wiring itself.
 type asRig struct {
 	pool         *pgxpool.Pool
 	users        *postgres.UserStore
@@ -103,7 +106,14 @@ func newASRig(t *testing.T) *asRig {
 			Scopes:                []string{"mcp:read"},
 			LastUsedWriteInterval: platform.DefaultTimeouts().MCPGrantLastUsedWriteInterval,
 		}))
-		rt.Post("/", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+		// The stand-in answers 200 with the scopes the bearer gate
+		// attached to the request: exactly what tool visibility is
+		// decided from (technical plan §43.17).
+		rt.Post("/", func(w http.ResponseWriter, req *http.Request) {
+			g, _ := platform.MCPGrantFromContext(req.Context())
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(g.Scopes)
+		})
 	})
 	r.router = router
 	return r
@@ -322,6 +332,22 @@ func (r *asRig) issueToken(t *testing.T, cookie string, scopes ...string) string
 // callMCP presents token at the rig's bearer-protected /mcp.
 func (r *asRig) callMCP(token string) int {
 	return r.do(http.MethodPost, "/mcp", "{}", map[string]string{"Authorization": "Bearer " + token}, "").Code
+}
+
+// mcpScopes presents token at the rig's /mcp and returns the status and
+// the scopes the real bearer gate attached to the request (nil unless the
+// call was accepted).
+func (r *asRig) mcpScopes(t *testing.T, token string) (int, []string) {
+	t.Helper()
+	rec := r.do(http.MethodPost, "/mcp", "{}", map[string]string{"Authorization": "Bearer " + token}, "")
+	if rec.Code != http.StatusOK {
+		return rec.Code, nil
+	}
+	var scopes []string
+	if err := json.Unmarshal(rec.Body.Bytes(), &scopes); err != nil {
+		t.Fatalf("/mcp stand-in body %q: %v", rec.Body.String(), err)
+	}
+	return rec.Code, scopes
 }
 
 // auditActions returns (action, detail) for every audit row about one MCP

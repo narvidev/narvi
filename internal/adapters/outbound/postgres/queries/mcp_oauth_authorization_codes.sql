@@ -7,8 +7,8 @@
 -- existed.
 
 -- name: CreateMCPOAuthAuthorizationCode :one
-INSERT INTO mcp_oauth_authorization_codes (grant_id, code_hash, code_challenge, redirect_uri, resource, expires_at)
-VALUES ($1, $2, $3, $4, $5, $6)
+INSERT INTO mcp_oauth_authorization_codes (grant_id, code_hash, code_challenge, redirect_uri, resource, scopes, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 RETURNING *;
 
 -- name: ConsumeMCPOAuthAuthorizationCode :one

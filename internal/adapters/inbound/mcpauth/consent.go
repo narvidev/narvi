@@ -368,6 +368,9 @@ func (s *Server) decide(w http.ResponseWriter, r *http.Request, requestID, userI
 		s.renderError(w, r, http.StatusBadRequest, "This app is not available", "An administrator of this deployment has disabled this app.")
 		return
 	}
+	// The grant records this approval's scopes for display only; what the
+	// resulting token may do is the code's own scopes below, fixed now and
+	// never re-read from the grant (technical plan §43.16).
 	now := time.Now()
 	grant, err := grants.UpsertGrant(ctx, sqlcgen.UpsertMCPOAuthGrantParams{
 		UserID:    userID,
@@ -392,6 +395,7 @@ func (s *Server) decide(w http.ResponseWriter, r *http.Request, requestID, userI
 		CodeChallenge: consumed.CodeChallenge,
 		RedirectUri:   consumed.RedirectUri,
 		Resource:      consumed.Resource,
+		Scopes:        mcpscope.Strings(selected),
 		ExpiresAt:     pgtype.Timestamptz{Time: now.Add(s.cfg.Timeouts.MCPAuthorizationCodeTTL), Valid: true},
 	}); err != nil {
 		fail("record code failed", err)

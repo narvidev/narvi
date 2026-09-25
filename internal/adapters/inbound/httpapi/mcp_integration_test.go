@@ -76,7 +76,7 @@ func grantWithToken(ctx context.Context, t *testing.T, r testRig, userID, client
 	}
 	hash := platform.HashToken("narvi_mcp_at_" + g.ID.String())
 	if _, err := r.mcpGrants.CreateAccessToken(ctx, sqlcgen.CreateMCPOAuthAccessTokenParams{
-		GrantID: g.ID, TokenHash: hash, ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
+		GrantID: g.ID, TokenHash: hash, Scopes: []string{"mcp:read"}, ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
 	}); err != nil {
 		t.Fatalf("create token: %v", err)
 	}

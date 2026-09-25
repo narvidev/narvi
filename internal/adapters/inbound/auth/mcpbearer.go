@@ -64,7 +64,9 @@ type MCPBearerConfig struct {
 // not send a client back through consent.
 //
 // Success attaches the SAME platform.AuthenticatedUser a cookie would
-// (read from the users row on this call) plus the platform.MCPGrant, and
+// (read from the users row on this call) plus the platform.MCPGrant --
+// whose scopes are the token's own, fixed when it was issued, never the
+// grant row's (which only records the most recent consent) -- and
 // strips the Authorization header from the request it passes on: nothing
 // downstream -- the SDK handler, a tool, a REST twin -- ever holds the
 // token (the MCP spec's token-passthrough prohibition; the bridge's own
@@ -123,7 +125,7 @@ func RequireMCPBearer(tokens MCPAccessTokenLookup, cfg MCPBearerConfig) func(htt
 			ctx = platform.WithMCPGrant(ctx, platform.MCPGrant{
 				GrantID:  p.GrantID.String(),
 				ClientID: p.ClientID,
-				Scopes:   p.GrantScopes,
+				Scopes:   p.TokenScopes,
 			})
 			forward := r.WithContext(ctx)
 			forward.Header = r.Header.Clone()

@@ -3200,7 +3200,7 @@ export interface GetSessionToolRequest {
   sessionId: string;
 }
 /**
- * One MCP client authorization the caller granted (technical plan §43.18) -- one row of GET /api/me/mcp-authorizations, and what DELETE /api/me/mcp-authorizations/{authorizationID} revokes (by id). A user holds at most one per client: consenting to the same client again replaces its scopes and renews its expiry in place. Never carries a token, a code, or any other secret -- none exists in plaintext anywhere once it has been handed to the client.
+ * One MCP client authorization the caller granted (technical plan §43.18) -- one row of GET /api/me/mcp-authorizations, and what DELETE /api/me/mcp-authorizations/{authorizationID} revokes (by id). A user holds at most one per client: consenting to the same client again renews its expiry in place and records that approval's scopes. Never carries a token, a code, or any other secret -- none exists in plaintext anywhere once it has been handed to the client.
  *
  * This interface was referenced by `RestDtos`'s JSON-Schema
  * via the `definition` "MCPAuthorization".
@@ -3220,7 +3220,7 @@ export interface MCPAuthorization {
    */
   clientKind: 'preregistered' | 'dynamic' | 'metadata_document';
   /**
-   * The scopes the user granted, possibly none: a scope-less authorization confirms who the user is but lets the client see no tool (technical plan §43.17).
+   * The scopes of the user's most recent approval of this client, possibly none: a scope-less approval confirms who the user is but lets the client see no tool (technical plan §43.17). Display only: each access token keeps exactly the scopes approved when it was issued, so a later approval neither widens nor narrows a token issued earlier (technical plan §43.16).
    */
   scopes: string[];
   /**

@@ -10,9 +10,13 @@
 
 -- UpsertMCPOAuthGrant records a consent: a user's first approval of a
 -- client creates its one grant row; a later approval of the same client
--- replaces that row's scopes, resource and expiry in place (same id, so
--- tokens already issued under it keep working, now under the scopes just
--- consented to). created_at keeps the first approval's time.
+-- renews that row's resource and expiry in place and records the scopes
+-- just approved (same id, so the Connected apps list names the client
+-- once). The row's scopes are the most recent approval, for display
+-- only: no authorization decision reads them -- every code and access
+-- token carries its own scopes, fixed at issuance, so this update can
+-- neither widen nor narrow a token issued earlier. created_at keeps the
+-- first approval's time.
 -- name: UpsertMCPOAuthGrant :one
 INSERT INTO mcp_oauth_grants (user_id, client_id, scopes, resource, expires_at)
 VALUES ($1, $2, $3, $4, $5)

@@ -80,7 +80,7 @@ func livePrincipal(t *testing.T) postgres.MCPAccessTokenPrincipal {
 	return postgres.MCPAccessTokenPrincipal{
 		TokenExpiresAt: time.Now().Add(time.Hour),
 		GrantID:        mustUUID(t, "22222222-2222-2222-2222-222222222222"),
-		GrantScopes:    []string{"mcp:read"},
+		TokenScopes:    []string{"mcp:read"},
 		GrantResource:  testResource,
 		GrantExpiresAt: time.Now().Add(24 * time.Hour),
 		ClientID:       "narvi_mcp_c_test",

@@ -73,7 +73,7 @@ func mintBuildBearer(ctx context.Context, t *testing.T, pool *pgxpool.Pool, cfg 
 	}
 	token := "narvi_mcp_at_" + raw
 	if _, err := grants.CreateAccessToken(ctx, sqlcgen.CreateMCPOAuthAccessTokenParams{
-		GrantID: grant.ID, TokenHash: platform.HashToken(token),
+		GrantID: grant.ID, TokenHash: platform.HashToken(token), Scopes: []string{"mcp:read"},
 		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
 	}); err != nil {
 		t.Fatalf("create token: %v", err)

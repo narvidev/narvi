@@ -13,14 +13,15 @@ import (
 
 const createMCPOAuthAccessToken = `-- name: CreateMCPOAuthAccessToken :one
 
-INSERT INTO mcp_oauth_access_tokens (grant_id, token_hash, expires_at)
-VALUES ($1, $2, $3)
-RETURNING id, grant_id, token_hash, expires_at, created_at
+INSERT INTO mcp_oauth_access_tokens (grant_id, token_hash, scopes, expires_at)
+VALUES ($1, $2, $3, $4)
+RETURNING id, grant_id, token_hash, scopes, expires_at, created_at
 `
 
 type CreateMCPOAuthAccessTokenParams struct {
 	GrantID   pgtype.UUID        `json:"grant_id"`
 	TokenHash string             `json:"token_hash"`
+	Scopes    []string           `json:"scopes"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
 }
 
@@ -32,14 +33,23 @@ type CreateMCPOAuthAccessTokenParams struct {
 // every fact that can revoke the call (token or grant expiry, a deleted
 // grant, a disabled or deleted client, a disabled user, a changed role, a
 // foreign resource) is re-read on every request. There is no cache of any
-// kind in front of it (auth.RequireMCPBearer's own doc comment).
+// kind in front of it (auth.RequireMCPBearer's own doc comment). The
+// scopes it returns are the TOKEN's own (t.scopes), fixed when the token
+// was issued -- never the grant's, which only records the most recent
+// consent for display (queries/mcp_oauth_grants.sql).
 func (q *Queries) CreateMCPOAuthAccessToken(ctx context.Context, arg CreateMCPOAuthAccessTokenParams) (McpOauthAccessToken, error) {
-	row := q.db.QueryRow(ctx, createMCPOAuthAccessToken, arg.GrantID, arg.TokenHash, arg.ExpiresAt)
+	row := q.db.QueryRow(ctx, createMCPOAuthAccessToken,
+		arg.GrantID,
+		arg.TokenHash,
+		arg.Scopes,
+		arg.ExpiresAt,
+	)
 	var i McpOauthAccessToken
 	err := row.Scan(
 		&i.ID,
 		&i.GrantID,
 		&i.TokenHash,
+		&i.Scopes,
 		&i.ExpiresAt,
 		&i.CreatedAt,
 	)
@@ -60,8 +70,8 @@ func (q *Queries) DeleteExpiredMCPOAuthAccessTokens(ctx context.Context) (int64,
 }
 
 const lookupMCPOAuthAccessToken = `-- name: LookupMCPOAuthAccessToken :one
-SELECT t.id AS token_id, t.expires_at AS token_expires_at,
-       g.id AS grant_id, g.scopes, g.resource, g.expires_at AS grant_expires_at, g.last_used_at,
+SELECT t.id AS token_id, t.expires_at AS token_expires_at, t.scopes AS token_scopes,
+       g.id AS grant_id, g.resource, g.expires_at AS grant_expires_at, g.last_used_at,
        c.client_id AS client_public_id, c.disabled_at AS client_disabled_at,
        u.id AS user_id, u.role AS user_role, u.primary_email, u.disabled AS user_disabled
 FROM mcp_oauth_access_tokens t
@@ -74,8 +84,8 @@ WHERE t.token_hash = $1
 type LookupMCPOAuthAccessTokenRow struct {
 	TokenID          pgtype.UUID        `json:"token_id"`
 	TokenExpiresAt   pgtype.Timestamptz `json:"token_expires_at"`
+	TokenScopes      []string           `json:"token_scopes"`
 	GrantID          pgtype.UUID        `json:"grant_id"`
-	Scopes           []string           `json:"scopes"`
 	Resource         string             `json:"resource"`
 	GrantExpiresAt   pgtype.Timestamptz `json:"grant_expires_at"`
 	LastUsedAt       pgtype.Timestamptz `json:"last_used_at"`
@@ -93,8 +103,8 @@ func (q *Queries) LookupMCPOAuthAccessToken(ctx context.Context, tokenHash strin
 	err := row.Scan(
 		&i.TokenID,
 		&i.TokenExpiresAt,
+		&i.TokenScopes,
 		&i.GrantID,
-		&i.Scopes,
 		&i.Resource,
 		&i.GrantExpiresAt,
 		&i.LastUsedAt,

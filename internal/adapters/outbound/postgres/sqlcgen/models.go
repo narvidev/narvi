@@ -1957,6 +1957,7 @@ type McpOauthAccessToken struct {
 	ID        pgtype.UUID        `json:"id"`
 	GrantID   pgtype.UUID        `json:"grant_id"`
 	TokenHash string             `json:"token_hash"`
+	Scopes    []string           `json:"scopes"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
@@ -1968,6 +1969,7 @@ type McpOauthAuthorizationCode struct {
 	CodeChallenge string             `json:"code_challenge"`
 	RedirectUri   string             `json:"redirect_uri"`
 	Resource      string             `json:"resource"`
+	Scopes        []string           `json:"scopes"`
 	ExpiresAt     pgtype.Timestamptz `json:"expires_at"`
 	ConsumedAt    pgtype.Timestamptz `json:"consumed_at"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
