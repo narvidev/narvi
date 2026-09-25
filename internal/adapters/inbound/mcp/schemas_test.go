@@ -3,6 +3,7 @@ package mcp
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
@@ -10,6 +11,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -279,199 +281,269 @@ func TestCompileInputSchemas_UnknownDefFails(t *testing.T) {
 }
 
 // jsonschemaImportPath is the JSON Schema compiler package's own IMPORT
-// PATH -- TestNoSecondJSONSchemaCompiler below resolves every candidate
-// call against THIS, via go/types, rather than against the literal
-// identifier "jsonschema" a file happens to spell an import with (round 4
-// review of PR #324, findings S3/S5: an import aliased to anything else,
-// "js" or otherwise, made a prior, identifier-text-only revision of this
-// test blind to a second, lazy compile hiding behind it).
+// PATH -- TestNoSecondJSONSchemaCompiler below resolves every identifier
+// against THIS, via go/types, never against the literal identifier
+// "jsonschema" a file happens to spell an import with (round 4 review of
+// PR #324, findings S3/S5: an aliased import made an identifier-text
+// check blind).
 const jsonschemaImportPath = "github.com/santhosh-tekuri/jsonschema/v6"
 
-// eagerCompileFile and eagerCompileFunc name compileInputSchemas'
-// (schemas.go) own home -- the ONE place this package's production code
-// may ever call a Compile or MustCompile method on a *jsonschema.
-// Compiler value (see TestNoSecondJSONSchemaCompiler's own doc comment).
+// eagerCompileFile and eagerCompileFunc name compileInputSchemas' own
+// home: the one top-level function in this package's production code
+// allowed to reference jsonschema.NewCompiler, or the Compile/MustCompile
+// method of a jsonschema.Compiler (see TestNoSecondJSONSchemaCompiler).
 const (
 	eagerCompileFile = "schemas.go"
 	eagerCompileFunc = "compileInputSchemas"
 )
 
-// TestNoSecondJSONSchemaCompiler is the STRUCTURAL half of round 3
-// review of PR #324, finding R3: TestToolCall_ConcurrentFirstCalls_NoRace
-// (toolcall_test.go) only reproduces the lazy-compile crash it exists to
-// catch when it runs BEFORE any other test in the same binary has already
-// exercised all three tools (its own doc comment says so) -- but
-// `go test -race ./...`, the exact command CI runs (Makefile), gives no
-// such guarantee: Go does not randomize test order by default, and
-// several earlier tests in this package's own file order already call
-// tools/call for every tool, warming any package-level cache before the
-// concurrency test ever gets to run.
+// shippedBuildContexts are the build-tag sets this repo compiles
+// production code under (Makefile): the default context (`go build`,
+// `make test`, `make lint`) and web_assets (`make dist`, which builds the
+// release binary with `go build -tags web_assets`, and `make
+// lint-web-assets`). packages.Load type-checks only the files its own
+// build context selects -- a file under `//go:build web_assets` is absent
+// from a default-context load while still shipping in the release binary
+// (round 5 review of PR #324, finding T3) -- so
+// TestNoSecondJSONSchemaCompiler loads this package once per entry here.
+var shippedBuildContexts = []struct {
+	name       string
+	buildFlags []string
+}{
+	{name: "default"},
+	{name: "web_assets", buildFlags: []string{"-tags=web_assets"}},
+}
+
+// jsonschemaRefSite is one identifier TestNoSecondJSONSchemaCompiler
+// found resolving to jsonschema.NewCompiler or to a jsonschema.Compiler
+// Compile/MustCompile method.
+type jsonschemaRefSite struct {
+	file  string // base name
+	line  int
+	fn    string // enclosing top-level func declaration, "" at package level
+	eager bool   // inside compileInputSchemas in schemas.go
+}
+
+func (s jsonschemaRefSite) String() string {
+	fn := s.fn
+	if fn == "" {
+		fn = "<package level>"
+	}
+	return fmt.Sprintf("%s:%d in %s", s.file, s.line, fn)
+}
+
+// TestNoSecondJSONSchemaCompiler is a cheap, STATIC early warning for the
+// most common shapes a reintroduced lazy schema compile takes. The defect
+// it watches for is round 2 review of PR #324, findings N1/N3/N4: input
+// schemas compiled lazily, per request, on a shared *jsonschema.Compiler
+// that has no locking -- the first concurrent tools/call after boot then
+// dies with "fatal error: concurrent map writes", which no recover
+// catches.
 //
-// This test does not depend on runtime ordering or on triggering a race
-// at all: it type-checks this package's OWN production source (every
-// *.go file in its directory, excluding _test.go -- exactly
-// tools/lint/narvichecks/mcpimportban's identical "a test constructing X
-// is not a production decision point" exemption, via golang.org/x/tools/
-// go/packages) and inspects every call expression by what it RESOLVES TO
-// (go/types' own Uses map), never by how its identifier is spelled.
+// This test is NOT the guarantee. The guarantee is behavioural:
+// TestToolHandler_ValidatesOnlyAgainstTheInjectedSchemaMap
+// (toolhandler_test.go) proves toolHandler decides whether arguments are
+// valid from the eagerly compiled map it is handed and from nothing else,
+// so a lazy path that toolHandler validates against fails it whatever
+// its shape (round 5 review, finding T1: three different shapes passed a
+// static check alone).
 //
-// Round 4 review, findings S3/S5: a prior revision counted only CallExprs
-// of the literal shape `jsonschema.NewCompiler(...)`, matched purely on
-// identifier TEXT, and its own doc comment claimed any reintroduced lazy
-// compile "necessarily needs a SECOND jsonschema.NewCompiler() call
-// site" -- false on two counts, both closed here:
+// What this test checks, for every non-_test.go file of this package in
+// every shippedBuildContexts entry, resolving identifiers with go/types
+// (pkg.TypesInfo.Uses) rather than by spelling:
 //
-//  1. An import aliased to anything other than "jsonschema" (`js
-//     "github.com/santhosh-tekuri/jsonschema/v6"`) made every call
-//     through it invisible to identifier-text matching. Resolving
-//     `pkg.TypesInfo.Uses[ident]` to the actual `*types.Func` and
-//     checking ITS OWN package path closes this regardless of alias --
-//     and a dot or blank import of this package is refused outright,
-//     below, rather than taught its own special-case matching rule.
-//  2. f307de9's own lazy shape needed only ONE NewCompiler call site (a
-//     package-level `sync.OnceValues`) -- a SECOND, independently
-//     compiled schema cache can share that SAME call site through an
-//     ordinary helper function, reached from a second, lazy caller
-//     the eager path never uses. Counting call SITES textually can never
-//     see this: the defect is WHERE `.Compile`/`.MustCompile` is ever
-//     invoked on the resulting *jsonschema.Compiler value, not how many
-//     places construct one. This test therefore also resolves every
-//     Compile/MustCompile call by RECEIVER TYPE (its Named type's own
-//     package path and name), and requires every one of them to be
-//     lexically inside compileInputSchemas itself -- the one function
-//     NewHandler's own boot path relies on to compile eagerly.
+//  1. Every REFERENCE to jsonschema.NewCompiler -- a call, or the function
+//     taken as a value -- is counted. There must be exactly one, and it
+//     must sit lexically inside compileInputSchemas in schemas.go.
+//  2. Every REFERENCE to jsonschema.Compiler's Compile or MustCompile
+//     method -- a call, a method value (`f := c.Compile`), a method
+//     expression, or a method promoted through an embedded field -- must
+//     sit lexically inside compileInputSchemas in schemas.go.
+//  3. A dot or blank import of the jsonschema package is refused.
+//  4. A non-_test.go file that no shippedBuildContexts entry compiles
+//     (pkg.IgnoredFiles in every context) fails the test: nothing here
+//     would ever inspect it. A GOOS/GOARCH-specific file counts too, on
+//     a host it does not match -- deliberately loud, since none exists in
+//     this package today.
 //
-// compileInputSchemas' result -- an immutable map[string]*jsonschema.
-// Schema, built once at NewHandler/boot time (round 2 review findings
-// N1/N3/N4) -- remains the ONLY source toolHandler may read a compiled
-// schema from.
+// What it does NOT catch, by construction (the behavioural test does):
+//
+//   - a Compile called through a package-local interface -- that
+//     reference resolves to the interface's own method, not to
+//     jsonschema.Compiler's;
+//   - a lazy path that goes through compileInputSchemas itself (called
+//     per request, or handed a shared compiler), because every reference
+//     then sits inside the allowed function;
+//   - reflection or any other dynamic dispatch.
 func TestNoSecondJSONSchemaCompiler(t *testing.T) {
+	// Keyed by the reference's own file:line:column, so a file compiled
+	// in more than one build context is counted once.
+	newCompilerRefs := map[string]jsonschemaRefSite{}
+	badCompileRefs := map[string]jsonschemaRefSite{}
+	compiled := map[string]bool{}      // absolute path -> compiled in some shipped context
+	ignoredBy := map[string][]string{} // absolute path -> contexts that ignored it
+
+	for _, bc := range shippedBuildContexts {
+		pkg := loadProductionPackage(t, bc.name, bc.buildFlags)
+		for _, f := range pkg.GoFiles {
+			compiled[f] = true
+		}
+		for _, f := range pkg.IgnoredFiles {
+			if strings.HasSuffix(f, ".go") && !strings.HasSuffix(f, "_test.go") {
+				ignoredBy[f] = append(ignoredBy[f], bc.name)
+			}
+		}
+
+		for _, file := range pkg.Syntax {
+			base := filepath.Base(pkg.Fset.Position(file.Pos()).Filename)
+
+			// A dot import lets NewCompiler appear as a bare identifier
+			// and a blank import serves this package no purpose beyond
+			// obscuring a real one alongside it; neither is allowed.
+			for _, imp := range file.Imports {
+				path, err := strconv.Unquote(imp.Path.Value)
+				if err != nil || path != jsonschemaImportPath {
+					continue
+				}
+				if imp.Name != nil && (imp.Name.Name == "." || imp.Name.Name == "_") {
+					t.Errorf("[%s] %s: %s is imported as %q -- a dot or blank import of the JSON Schema compiler package is never allowed in this package's production code", bc.name, base, jsonschemaImportPath, imp.Name.Name)
+				}
+			}
+
+			ast.Inspect(file, func(n ast.Node) bool {
+				ident, ok := n.(*ast.Ident)
+				if !ok {
+					return true
+				}
+				fn, ok := pkg.TypesInfo.Uses[ident].(*types.Func)
+				if !ok {
+					return true
+				}
+				isNewCompiler := isJSONSchemaNewCompiler(fn)
+				isCompile := isJSONSchemaCompileMethod(fn)
+				if !isNewCompiler && !isCompile {
+					return true
+				}
+				pos := pkg.Fset.Position(ident.Pos())
+				decl := enclosingFuncDecl(file, ident.Pos())
+				site := jsonschemaRefSite{file: base, line: pos.Line, eager: base == eagerCompileFile && decl != nil && decl.Recv == nil && decl.Name.Name == eagerCompileFunc}
+				if decl != nil {
+					site.fn = decl.Name.Name
+				}
+				switch {
+				case isNewCompiler:
+					newCompilerRefs[pos.String()] = site
+				case !site.eager:
+					badCompileRefs[pos.String()] = site
+				}
+				return true
+			})
+		}
+	}
+
+	contextNames := make([]string, len(shippedBuildContexts))
+	for i, bc := range shippedBuildContexts {
+		contextNames[i] = bc.name
+	}
+	var uncovered []string
+	for f, contexts := range ignoredBy {
+		if !compiled[f] {
+			uncovered = append(uncovered, fmt.Sprintf("%s (ignored by: %s)", filepath.Base(f), strings.Join(contexts, ", ")))
+		}
+	}
+	sort.Strings(uncovered)
+	if len(uncovered) > 0 {
+		t.Errorf("production (non-_test.go) file(s) that no shipped build context (%s) compiles: %v -- this test never inspects them; add the build context that selects them to shippedBuildContexts, or make them _test.go files", strings.Join(contextNames, ", "), uncovered)
+	}
+
+	newSites := sortedRefSites(newCompilerRefs)
+	switch {
+	case len(newSites) != 1:
+		t.Errorf("found %d reference(s) to %s.NewCompiler (%v), want exactly 1, inside %s's own %s -- every tool's input schema is compiled EAGERLY there, at NewHandler/boot time (round 2 N1/N3/N4); a second compiler is the shape a reintroduced lazy compile takes", len(newSites), jsonschemaImportPath, newSites, eagerCompileFile, eagerCompileFunc)
+	case !newSites[0].eager:
+		t.Errorf("the one reference to %s.NewCompiler is at %v, want it inside %s's own %s -- a compiler built anywhere else (a helper, a package-level var) can be shared with a lazy, per-request compile path (round 5 review, finding T1)", jsonschemaImportPath, newSites[0], eagerCompileFile, eagerCompileFunc)
+	}
+	if badSites := sortedRefSites(badCompileRefs); len(badSites) > 0 {
+		t.Errorf("found reference(s) to a %s.Compiler Compile/MustCompile method outside %s's own %s: %v -- every compile must happen EAGERLY, at boot, in that one function (round 2 N1/N3/N4)", jsonschemaImportPath, eagerCompileFile, eagerCompileFunc, badSites)
+	}
+}
+
+// loadProductionPackage type-checks this package's own production files
+// (no _test.go files: a test's own throwaway compiler is not a production
+// decision point, exactly tools/lint/narvichecks/mcpimportban's own
+// exemption) in the build context buildFlags selects.
+func loadProductionPackage(t *testing.T, contextName string, buildFlags []string) *packages.Package {
+	t.Helper()
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
 			packages.NeedImports | packages.NeedDeps |
 			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedSyntax,
-		Tests: false, // production files only -- a test's own throwaway compiler is not a production decision point.
+		BuildFlags: buildFlags,
+		Tests:      false,
 	}
 	pkgs, err := packages.Load(cfg, ".")
 	if err != nil {
-		t.Fatalf("packages.Load(\".\"): %v", err)
+		t.Fatalf("[%s] packages.Load(\".\"): %v", contextName, err)
 	}
 	if n := packages.PrintErrors(pkgs); n > 0 {
-		t.Fatalf("packages.Load(\".\") reported %d error(s) loading this package (see stderr above)", n)
+		t.Fatalf("[%s] packages.Load(\".\") reported %d error(s) loading this package (see stderr above)", contextName, n)
 	}
 	if len(pkgs) != 1 {
-		t.Fatalf("packages.Load(\".\") returned %d packages, want exactly 1", len(pkgs))
+		t.Fatalf("[%s] packages.Load(\".\") returned %d packages, want exactly 1", contextName, len(pkgs))
 	}
-	pkg := pkgs[0]
-	if len(pkg.Syntax) == 0 {
-		t.Fatal("packages.Load(\".\") found no source files -- this test must run from its own package directory (go test's own documented working-directory contract)")
+	if len(pkgs[0].Syntax) == 0 {
+		t.Fatalf("[%s] packages.Load(\".\") found no source files -- this test must run from its own package directory (go test's own documented working-directory contract)", contextName)
 	}
+	return pkgs[0]
+}
 
-	// A dot or blank import of the compiler package is refused outright:
-	// a dot import lets NewCompiler be called with no qualifier at all
-	// (a bare *ast.Ident, not a *ast.SelectorExpr with something to
-	// resolve), and a blank import serves this package no purpose beyond
-	// obscuring a real one alongside it -- neither is worth teaching the
-	// call-site logic below its own special case for.
-	for _, file := range pkg.Syntax {
-		filename := pkg.Fset.Position(file.Pos()).Filename
-		for _, imp := range file.Imports {
-			path, err := strconv.Unquote(imp.Path.Value)
-			if err != nil || path != jsonschemaImportPath {
-				continue
-			}
-			if imp.Name != nil && (imp.Name.Name == "." || imp.Name.Name == "_") {
-				t.Fatalf("%s: %s is imported as %q -- a dot or blank import of the JSON Schema compiler package is never allowed in this package's production code", filepath.Base(filename), jsonschemaImportPath, imp.Name.Name)
-			}
+// isJSONSchemaNewCompiler reports whether fn is the package-level
+// jsonschema.NewCompiler function.
+func isJSONSchemaNewCompiler(fn *types.Func) bool {
+	return fn.Signature().Recv() == nil && fn.Pkg() != nil &&
+		fn.Pkg().Path() == jsonschemaImportPath && fn.Name() == "NewCompiler"
+}
+
+// isJSONSchemaCompileMethod reports whether fn is jsonschema.Compiler's
+// own Compile or MustCompile method (pointer or value receiver).
+func isJSONSchemaCompileMethod(fn *types.Func) bool {
+	recv := fn.Signature().Recv()
+	if recv == nil || (fn.Name() != "Compile" && fn.Name() != "MustCompile") {
+		return false
+	}
+	recvType := recv.Type()
+	if ptr, ok := recvType.(*types.Pointer); ok {
+		recvType = ptr.Elem()
+	}
+	named, ok := recvType.(*types.Named)
+	return ok && named.Obj().Pkg() != nil &&
+		named.Obj().Pkg().Path() == jsonschemaImportPath && named.Obj().Name() == "Compiler"
+}
+
+// enclosingFuncDecl returns the top-level func declaration lexically
+// containing pos, or nil when pos is at package level (e.g. inside a
+// package-level var's own func literal -- exactly the shape a
+// `sync.OnceValues(func() {...})` lazy cache takes).
+func enclosingFuncDecl(file *ast.File, pos token.Pos) *ast.FuncDecl {
+	for _, decl := range file.Decls {
+		if fd, ok := decl.(*ast.FuncDecl); ok && fd.Pos() <= pos && pos <= fd.End() {
+			return fd
 		}
 	}
+	return nil
+}
 
-	type callSite struct {
-		file, fn string
-		line     int
+// sortedRefSites returns m's values ordered by file, then line.
+func sortedRefSites(m map[string]jsonschemaRefSite) []jsonschemaRefSite {
+	sites := make([]jsonschemaRefSite, 0, len(m))
+	for _, s := range m {
+		sites = append(sites, s)
 	}
-	var newCompilerSites []callSite
-	var badCompileSites []callSite
-
-	for _, file := range pkg.Syntax {
-		base := filepath.Base(pkg.Fset.Position(file.Pos()).Filename)
-
-		// enclosingFunc reports the name of the top-level func
-		// declaration lexically containing pos, or "" if pos falls
-		// outside every one of them (e.g. inside a package-level var's
-		// own func literal -- exactly the shape a package-level
-		// `sync.OnceValues(func() {...})` lazy cache takes, which must
-		// never count as "inside compileInputSchemas").
-		enclosingFunc := func(pos token.Pos) string {
-			var name string
-			ast.Inspect(file, func(n ast.Node) bool {
-				if fd, ok := n.(*ast.FuncDecl); ok && fd.Pos() <= pos && pos <= fd.End() {
-					name = fd.Name.Name
-				}
-				return true
-			})
-			return name
+	sort.Slice(sites, func(i, j int) bool {
+		if sites[i].file != sites[j].file {
+			return sites[i].file < sites[j].file
 		}
-
-		ast.Inspect(file, func(n ast.Node) bool {
-			call, ok := n.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-			var funcIdent *ast.Ident
-			switch fn := call.Fun.(type) {
-			case *ast.Ident: // a dot-imported or package-local call
-				funcIdent = fn
-			case *ast.SelectorExpr: // <pkg-or-value>.Name(...)
-				funcIdent = fn.Sel
-			default:
-				return true
-			}
-			fnObj, ok := pkg.TypesInfo.Uses[funcIdent].(*types.Func)
-			if !ok {
-				return true
-			}
-			sig, ok := fnObj.Type().(*types.Signature)
-			if !ok {
-				return true
-			}
-			pos := pkg.Fset.Position(call.Pos())
-
-			// A call resolving to the package-level jsonschema.
-			// NewCompiler function, whatever local alias it was
-			// spelled with.
-			if sig.Recv() == nil && fnObj.Pkg() != nil && fnObj.Pkg().Path() == jsonschemaImportPath && fnObj.Name() == "NewCompiler" {
-				newCompilerSites = append(newCompilerSites, callSite{file: base, fn: enclosingFunc(call.Pos()), line: pos.Line})
-				return true
-			}
-
-			// A Compile or MustCompile method call whose RECEIVER
-			// resolves to jsonschema.Compiler (by pointer or by
-			// value) -- caught regardless of which variable, cache,
-			// or helper the value flowed through to get here.
-			if sig.Recv() != nil && (fnObj.Name() == "Compile" || fnObj.Name() == "MustCompile") {
-				recvType := sig.Recv().Type()
-				if ptr, ok := recvType.(*types.Pointer); ok {
-					recvType = ptr.Elem()
-				}
-				named, ok := recvType.(*types.Named)
-				if ok && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == jsonschemaImportPath && named.Obj().Name() == "Compiler" {
-					if fn := enclosingFunc(call.Pos()); fn != eagerCompileFunc || base != eagerCompileFile {
-						badCompileSites = append(badCompileSites, callSite{file: base, fn: fn, line: pos.Line})
-					}
-				}
-			}
-			return true
-		})
-	}
-
-	if len(newCompilerSites) != 1 {
-		t.Fatalf("found %d call site(s) resolving to %s.NewCompiler (%v), want exactly 1 -- every tool's input schema must come from %s's own %s, compiled EAGERLY at NewHandler/boot time (round 2 N1/N3/N4); a second call site is exactly the shape a reintroduced lazy, per-request compile takes (round 3 R3)", len(newCompilerSites), jsonschemaImportPath, newCompilerSites, eagerCompileFile, eagerCompileFunc)
-	}
-	if site := newCompilerSites[0]; site.file != eagerCompileFile {
-		t.Fatalf("the one %s.NewCompiler() call site is in %s:%d, want it in %s", jsonschemaImportPath, site.file, site.line, eagerCompileFile)
-	}
-	if len(badCompileSites) > 0 {
-		t.Fatalf("found Compile/MustCompile call(s) on a %s.Compiler value outside %s's own %s (%v) -- every compile must happen EAGERLY, at boot, in that one function; round 4 review finding S3/S5's own reproduction shows a SECOND, lazily-built shared instance can reuse the ONE NewCompiler call site above and still slip past a call-site count alone", jsonschemaImportPath, eagerCompileFile, eagerCompileFunc, badCompileSites)
-	}
+		return sites[i].line < sites[j].line
+	})
+	return sites
 }
