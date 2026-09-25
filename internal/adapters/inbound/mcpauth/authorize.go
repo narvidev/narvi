@@ -4,7 +4,9 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -38,6 +40,15 @@ func singleParam(q url.Values, name string) (string, bool) {
 	return vals[0], true
 }
 
+// storableText reports whether s can be sent to Postgres as TEXT: valid
+// UTF-8 with no NUL byte. Postgres rejects anything else (SQLSTATE
+// 22021), which is the caller's malformed input, not a server fault --
+// so an unauthenticated client_id or state is checked here first and
+// refused as a client error, never answered 500 or logged at ERROR.
+func storableText(s string) bool {
+	return utf8.ValidString(s) && strings.IndexByte(s, 0) < 0
+}
+
 // Authorize backs GET /oauth/authorize (technical plan §43.14). Errors in
 // client_id or redirect_uri render a page and never redirect; every later
 // error redirects to the validated redirect_uri with error, state and
@@ -52,6 +63,13 @@ func (s *Server) Authorize(w http.ResponseWriter, r *http.Request) {
 	if !ok || clientIDParam == "" {
 		logger.Warn("mcpauth: authorize refused", "outcome", "missing_client_id")
 		s.renderError(w, r, http.StatusBadRequest, "This app could not be identified", "The request did not carry a valid client identifier.")
+		return
+	}
+	if !storableText(clientIDParam) {
+		// No registered client_id carries such bytes: refused exactly
+		// like an unknown one.
+		logger.Warn("mcpauth: authorize refused", "outcome", "unknown_client")
+		s.renderError(w, r, http.StatusBadRequest, "This app is not registered", "This deployment does not know the app that sent you here.")
 		return
 	}
 	client, err := s.deps.Clients.GetByClientID(ctx, clientIDParam)
@@ -88,6 +106,10 @@ func (s *Server) Authorize(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(state) > maxStateLength {
 		s.redirectError(w, r, redirectURI, errInvalidRequest, "state is too long", "")
+		return
+	}
+	if !storableText(state) {
+		s.redirectError(w, r, redirectURI, errInvalidRequest, "state must be valid UTF-8 text", "")
 		return
 	}
 	for _, name := range []string{"response_type", "code_challenge", "code_challenge_method", "resource", "scope"} {

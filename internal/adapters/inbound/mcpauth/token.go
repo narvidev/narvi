@@ -69,6 +69,13 @@ func (s *Server) Token(w http.ResponseWriter, r *http.Request) {
 		writeTokenError(w, errInvalidClient, "public clients authenticate with client_id alone", basicAttempted)
 		return
 	}
+	if !storableText(clientID) {
+		// No registered client_id carries such bytes: refused exactly
+		// like an unknown one (storableText's own doc comment).
+		logger.Warn("mcpauth: token refused", "outcome", "unknown_client")
+		writeTokenError(w, errInvalidClient, "unknown client", basicAttempted)
+		return
+	}
 	client, err := s.deps.Clients.GetByClientID(ctx, clientID)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):

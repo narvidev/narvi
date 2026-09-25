@@ -3,11 +3,15 @@
 package mcpauth_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
@@ -260,5 +264,96 @@ func TestAuthorize_SignedOutGoesThroughSignIn(t *testing.T) {
 	loc2, _ := url.Parse(rec.Header().Get("Location"))
 	if rec.Code != http.StatusFound || loc2 == nil || loc2.Path != "/sign-in" || loc2.Query().Get("next") != next {
 		t.Fatalf("signed-out consent: status %d Location %q, want the same sign-in redirect", rec.Code, rec.Header().Get("Location"))
+	}
+}
+
+// errorLog captures every ERROR-level line slog.Default receives -- what
+// platform.Logger writes through -- for the test that installs it.
+type errorLog struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *errorLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *errorLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+// captureErrorLog routes slog.Default's ERROR lines into a buffer until
+// the test ends.
+func captureErrorLog(t *testing.T) *errorLog {
+	t.Helper()
+	l := &errorLog{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(l, &slog.HandlerOptions{Level: slog.LevelError})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return l
+}
+
+// TestOAuth_UnstorableBytesAreClientErrors: a client_id or state carrying
+// a NUL byte or invalid UTF-8 -- bytes Postgres refuses as TEXT -- is the
+// caller's malformed input. Unauthenticated, it must never surface as a
+// 500 or an ERROR log line: client_id is refused like an unknown client
+// (an error page at authorize, never a redirect; invalid_client at
+// token, 401 with a Basic challenge when Basic was used), and state is
+// invalid_request, redirected without being echoed or stored.
+func TestOAuth_UnstorableBytesAreClientErrors(t *testing.T) {
+	r := newASRig(t)
+	_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+	errs := captureErrorLog(t)
+
+	for _, bad := range []string{"\x00", "\xff", "abc\x00", "narvi_mcp_c_rig\xff"} {
+		t.Run("authorize client_id "+url.QueryEscape(bad), func(t *testing.T) {
+			params := r.authorizeParams(newVerifier(t))
+			params.Set("client_id", bad)
+			rec := r.authorize(params, cookie)
+			if rec.Code != http.StatusBadRequest || rec.Header().Get("Location") != "" {
+				t.Fatalf("status %d Location %q, want a 400 page and no redirect", rec.Code, rec.Header().Get("Location"))
+			}
+		})
+		t.Run("token body client_id "+url.QueryEscape(bad), func(t *testing.T) {
+			form := r.exchangeForm("narvi_mcp_ac_x", newVerifier(t))
+			form.Set("client_id", bad)
+			rec := r.exchange(form, nil)
+			if rec.Code != http.StatusBadRequest || decodeToken(t, rec).Error != "invalid_client" || rec.Header().Get("WWW-Authenticate") != "" {
+				t.Fatalf("status %d body %s, want 400 invalid_client", rec.Code, rec.Body.String())
+			}
+		})
+		t.Run("token basic client_id "+url.QueryEscape(bad), func(t *testing.T) {
+			form := r.exchangeForm("narvi_mcp_ac_x", newVerifier(t))
+			form.Del("client_id")
+			basic := "Basic " + base64.StdEncoding.EncodeToString([]byte(url.QueryEscape(bad)+":"))
+			rec := r.exchange(form, map[string]string{"Authorization": basic})
+			if rec.Code != http.StatusUnauthorized || decodeToken(t, rec).Error != "invalid_client" || rec.Header().Get("WWW-Authenticate") == "" {
+				t.Fatalf("status %d body %s WWW-Authenticate %q, want 401 invalid_client with a Basic challenge", rec.Code, rec.Body.String(), rec.Header().Get("WWW-Authenticate"))
+			}
+		})
+		t.Run("authorize state "+url.QueryEscape(bad), func(t *testing.T) {
+			var before int
+			if err := r.pool.QueryRow(context.Background(), `SELECT count(*) FROM mcp_oauth_authorization_requests`).Scan(&before); err != nil {
+				t.Fatal(err)
+			}
+			params := r.authorizeParams(newVerifier(t))
+			params.Set("state", bad)
+			rec := r.authorize(params, cookie)
+			loc, err := url.Parse(rec.Header().Get("Location"))
+			if rec.Code != http.StatusFound || err != nil || loc.Query().Get("error") != "invalid_request" || loc.Query().Has("state") {
+				t.Fatalf("status %d Location %q, want a redirect with error=invalid_request and no state", rec.Code, rec.Header().Get("Location"))
+			}
+			var after int
+			if err := r.pool.QueryRow(context.Background(), `SELECT count(*) FROM mcp_oauth_authorization_requests`).Scan(&after); err != nil || after != before {
+				t.Fatalf("stored requests %d -> %d (err %v), want nothing stored", before, after, err)
+			}
+		})
+	}
+	if got := errs.String(); got != "" {
+		t.Fatalf("malformed client input was logged at ERROR:\n%s", got)
 	}
 }
