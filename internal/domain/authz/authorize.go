@@ -111,6 +111,13 @@ var matrix = map[Action]actionRule{
 	// -- same row, same reasoning as ActionViewOwnProfile immediately
 	// above: see action.go's own doc comment.
 	ActionViewCapabilities: {allow: roles(RoleAdmin, RoleMaintainer, RoleMember, RoleViewer)},
+	// ActionConnectMCPClient / ActionRevokeOwnMCPAuthorization
+	// (technical plan §43.16/§43.18) -- same row: a connected MCP client
+	// can never do more than its user already can, and revoking one's own
+	// authorization must stay open to every role (action.go's own doc
+	// comments).
+	ActionConnectMCPClient:          {allow: roles(RoleAdmin, RoleMaintainer, RoleMember, RoleViewer)},
+	ActionRevokeOwnMCPAuthorization: {allow: roles(RoleAdmin, RoleMaintainer, RoleMember, RoleViewer)},
 
 	// Row 2: create/prompt/approve-plan on own/joined -- viewer excluded
 	// entirely; member gated by ownership on the two actions that name an

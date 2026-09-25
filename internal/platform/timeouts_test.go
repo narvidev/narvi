@@ -1539,3 +1539,77 @@ func TestValidate_DefaultAutomationDispatchTotalBudgetCoversOneFullAutomation(t 
 		t.Fatalf("AutomationDispatchTotalBudget = %v, want > %v (list call + one matching automation's own full retry chain)", to.AutomationDispatchTotalBudget, oneAutomationWorstCase)
 	}
 }
+
+// TestDefaultTimeouts_MCPOAuthFields pins the MCP authorization server's
+// shipped lifetimes (technical plan §43.16) and that none of them is zero
+// -- every one fails closed at zero, which would make the whole flow
+// refuse everything rather than silently widen anything, but a zero here
+// is still a broken build, not a configuration.
+func TestDefaultTimeouts_MCPOAuthFields(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+	tests := []struct {
+		name string
+		got  time.Duration
+		want time.Duration
+	}{
+		{"MCPAuthorizationRequestTTL", to.MCPAuthorizationRequestTTL, 10 * time.Minute},
+		{"MCPAuthorizationCodeTTL", to.MCPAuthorizationCodeTTL, 60 * time.Second},
+		{"MCPAccessTokenTTL", to.MCPAccessTokenTTL, time.Hour},
+		{"MCPGrantMaxLifetime", to.MCPGrantMaxLifetime, 90 * 24 * time.Hour},
+		{"MCPGrantLastUsedWriteInterval", to.MCPGrantLastUsedWriteInterval, 5 * time.Minute},
+	}
+	for _, tc := range tests {
+		if tc.got <= 0 {
+			t.Errorf("%s = %v, want > 0", tc.name, tc.got)
+		}
+		if tc.got != tc.want {
+			t.Errorf("%s = %v, want %v", tc.name, tc.got, tc.want)
+		}
+	}
+	if err := to.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+}
+
+// TestValidate_MCPOAuthChain proves both §43.16 ordering links are
+// actually checked: breaking either one alone is reported by name.
+func TestValidate_MCPOAuthChain(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		mutate    func(*platform.Timeouts)
+		wantChain string
+	}{
+		{
+			name:      "code outlives the consent window",
+			mutate:    func(to *platform.Timeouts) { to.MCPAuthorizationCodeTTL = to.MCPAuthorizationRequestTTL },
+			wantChain: "MCPAuthorizationRequestTTL > MCPAuthorizationCodeTTL",
+		},
+		{
+			name:      "access token outlives the grant",
+			mutate:    func(to *platform.Timeouts) { to.MCPAccessTokenTTL = to.MCPGrantMaxLifetime },
+			wantChain: "MCPGrantMaxLifetime > MCPAccessTokenTTL",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			to := platform.DefaultTimeouts()
+			tc.mutate(&to)
+			err := to.Validate()
+			if err == nil {
+				t.Fatalf("Validate() = nil, want an error for broken link %q", tc.wantChain)
+			}
+			var inv *platform.TimeoutInvariantError
+			if !errors.As(err, &inv) {
+				t.Fatalf("Validate() = %v, want a *TimeoutInvariantError", err)
+			}
+			if inv.Chain != tc.wantChain {
+				t.Fatalf("TimeoutInvariantError.Chain = %q, want %q", inv.Chain, tc.wantChain)
+			}
+		})
+	}
+}

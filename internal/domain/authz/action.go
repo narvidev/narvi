@@ -43,6 +43,24 @@ const (
 	// nothing here for a viewer to be denied. No own/joined carve-out:
 	// this is a deployment-wide fact, not a per-resource one.
 	ActionViewCapabilities Action = "view_capabilities"
+	// ActionConnectMCPClient covers approving an MCP client's request for
+	// access on the consent page (POST /oauth/consent, technical plan
+	// §43.16) -- the SAME everyone-including-viewer row as the view
+	// actions above: a grant only ever SUBTRACTS from what its user may do
+	// (every tool still runs its REST twin's own Authorize call against
+	// the user's own role, §43.17), so a viewer's connected client reads
+	// exactly what that viewer already reads and nothing more. No
+	// own/joined carve-out: the resource is the caller's own
+	// authorization.
+	ActionConnectMCPClient Action = "connect_mcp_client"
+	// ActionRevokeOwnMCPAuthorization covers revoking one of the caller's
+	// OWN MCP authorizations (DELETE /api/me/mcp-authorizations/{id},
+	// technical plan §43.18) -- deliberately a separate action from
+	// ActionConnectMCPClient above, with the same everyone row, so that
+	// narrowing who may CONNECT a client later can never also take away
+	// a user's ability to DISCONNECT one they already connected. This row
+	// must stay open to every role.
+	ActionRevokeOwnMCPAuthorization Action = "revoke_own_mcp_authorization"
 
 	// -- Row 2: "Create sessions, prompt, approve plans on own/joined
 	// sessions" — admin, maintainer, member (never viewer). Prompting and
@@ -613,6 +631,8 @@ var AllActions = []Action{
 	ActionViewAnalytics,
 	ActionViewOwnProfile,
 	ActionViewCapabilities,
+	ActionConnectMCPClient,
+	ActionRevokeOwnMCPAuthorization,
 	ActionCreateSession,
 	ActionPromptSession,
 	ActionApprovePlan,

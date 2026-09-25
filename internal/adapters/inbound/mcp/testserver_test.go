@@ -91,8 +91,8 @@ func newTestHandler(t testing.TB, enabled, authenticated bool, twins Twins) http
 
 // newTestHandlerWithBaseURL is newTestHandler, parameterized on
 // PublicBaseURL -- round 4 review of PR #324, finding S8: every existing
-// unit test trusts "http://example.test", so canonicalOrigin's own IPv6
-// re-bracketing and its https default-port branch (handler.go) were
+// unit test trusts "http://example.test", so platform.CanonicalOrigin's own
+// IPv6 re-bracketing and its https default-port branch (origin.go) were
 // never exercised through a real RequireTrustedOrigin/NewHandler pair
 // built against a base URL that actually needs either one.
 func newTestHandlerWithBaseURL(t testing.TB, enabled, authenticated bool, twins Twins, baseURL string) http.Handler {

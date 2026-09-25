@@ -2986,6 +2986,49 @@ type Timeouts struct {
 	// "conceptually separate axis, numerically the same 30 days" relationship
 	// to ReviewVerdictAnalyticsWindow.
 	PlatformAnalyticsWindow time.Duration
+
+	// -- technical plan §43.16 ("Grants, tokens, and revocation": the MCP
+	// authorization server) --
+	//
+	// Two ordering links, both checked by Validate: an authorization code
+	// must expire well inside the consent window that produced it
+	// (MCPAuthorizationRequestTTL > MCPAuthorizationCodeTTL), and an access
+	// token well inside the grant it is issued under (MCPGrantMaxLifetime >
+	// MCPAccessTokenTTL -- the token endpoint also caps each token at its
+	// grant's own expiry, so the link is about sane configuration, not a
+	// correctness guarantee on its own). Every field here fails CLOSED at
+	// zero: a zero TTL makes what it bounds read as already expired.
+
+	// MCPAuthorizationRequestTTL is how long a validated GET
+	// /oauth/authorize request waits for the user's consent decision,
+	// sign-in included. Mirrors OAuthStateTTL's own 10-minute "a real
+	// browser round trip, and no longer" figure.
+	MCPAuthorizationRequestTTL time.Duration
+
+	// MCPAuthorizationCodeTTL is how long an issued authorization code may
+	// be exchanged at POST /oauth/token. OAuth 2.1 recommends at most 10
+	// minutes; the exchange happens immediately after the redirect in
+	// every real client, so 60 seconds.
+	MCPAuthorizationCodeTTL time.Duration
+
+	// MCPAccessTokenTTL is how long an MCP access token authenticates
+	// /mcp calls before the client must obtain a new one. The MCP
+	// authorization spec asks for short-lived access tokens; one hour.
+	// Revocation never waits for this: the bearer check re-reads the grant
+	// on every call.
+	MCPAccessTokenTTL time.Duration
+
+	// MCPGrantMaxLifetime is the absolute lifetime of a consented grant --
+	// after it, the user must consent again, whatever the client does.
+	// 90 days.
+	MCPGrantMaxLifetime time.Duration
+
+	// MCPGrantLastUsedWriteInterval coalesces the bearer check's
+	// "last used" stamp: a grant's last_used_at is rewritten at most once
+	// per interval, so a busy client costs one write per interval rather
+	// than one per call. 5 minutes -- the Connected apps list shows
+	// "last used" to the nearest few minutes, which is all it needs.
+	MCPGrantLastUsedWriteInterval time.Duration
 }
 
 // DefaultTimeouts returns the shipped defaults for every field, each
@@ -3249,6 +3292,12 @@ func DefaultTimeouts() Timeouts {
 		KnowledgeRankerTimeout: 10 * time.Second, // design note section 2.2; not specified numerically, chosen -- see field doc comment
 
 		PlatformAnalyticsWindow: 30 * 24 * time.Hour, // §12.2 item 6; not specified, mirrors ReviewVerdictAnalyticsWindow's own identical "a month, bounded" reasoning
+
+		MCPAuthorizationRequestTTL:    10 * time.Minute,    // §43.16; mirrors OAuthStateTTL
+		MCPAuthorizationCodeTTL:       60 * time.Second,    // §43.16; single-use, exchanged immediately
+		MCPAccessTokenTTL:             time.Hour,           // §43.16; "short-lived access tokens"
+		MCPGrantMaxLifetime:           90 * 24 * time.Hour, // §43.16; absolute, re-consent after
+		MCPGrantLastUsedWriteInterval: 5 * time.Minute,     // §43.16; write coalescing
 	}
 }
 
@@ -3402,6 +3451,14 @@ func (t Timeouts) Validate() error {
 	// requires of sandbox-token rotation).
 	check("CloudIdentitySigningKeyOverlapWindow > CloudIdentityTokenLifetime",
 		"CloudIdentitySigningKeyOverlapWindow", t.CloudIdentitySigningKeyOverlapWindow, "CloudIdentityTokenLifetime", t.CloudIdentityTokenLifetime)
+
+	// §43.16: an authorization code must expire well inside the consent
+	// window that produced it, and an access token well inside its grant
+	// (the MCP fields' own block comment on the struct).
+	check("MCPAuthorizationRequestTTL > MCPAuthorizationCodeTTL",
+		"MCPAuthorizationRequestTTL", t.MCPAuthorizationRequestTTL, "MCPAuthorizationCodeTTL", t.MCPAuthorizationCodeTTL)
+	check("MCPGrantMaxLifetime > MCPAccessTokenTTL",
+		"MCPGrantMaxLifetime", t.MCPGrantMaxLifetime, "MCPAccessTokenTTL", t.MCPAccessTokenTTL)
 
 	// U2 audit fix, SECURITY (confirmed HIGH finding: "the gate creates the
 	// identity it then checks" batch's own sibling finding -- "the
