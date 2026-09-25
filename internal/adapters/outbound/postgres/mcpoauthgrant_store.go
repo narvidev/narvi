@@ -30,6 +30,11 @@
 // issuance already holds and then deletes what it issued, or the issuance
 // waits on the revocation and then finds its parent gone; neither ever
 // holds a child the other is waiting for, so they cannot deadlock.
+// Taking the client first in a grant's revocation also keeps a client
+// deletion's audit exact: the deletion's Lock waits for any revocation
+// already holding the client, so the grants it lists are exactly the ones
+// its cascade removes, each audited once (never both by the revocation and
+// as client_deleted).
 //
 // The consent decision is the one transaction that locks both a request
 // and a grant (request first): both hang off the client it holds FOR KEY

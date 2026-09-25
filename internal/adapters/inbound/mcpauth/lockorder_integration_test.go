@@ -468,3 +468,141 @@ func queuedOnTables(ctx context.Context, t *testing.T, pool *pgxpool.Pool, pid i
 	}
 	return tables
 }
+
+// TestLockOrder_RevocationRacingClientDeletion: every revocation that
+// deletes one grant -- the user's own, a code or refresh-token replay, the
+// client's RFC 7009 request -- takes the grant's client FOR KEY SHARE
+// before the grant, so it and a deletion of that client serialize on the
+// CLIENT row, never deeper. Whichever goes first, the other queues on the
+// client behind it alone, nothing deadlocks, and the grant's revocation is
+// audited exactly once: by the revocation that went first, or -- when the
+// client deletion went first -- as client_deleted, the late revocation
+// finding nothing left to revoke. (Were the client lock skipped, the
+// deletion would list a grant the revocation was already deleting and
+// audit it a second time; technical plan §43.16/§43.18.)
+func TestLockOrder_RevocationRacingClientDeletion(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		fixture         issuance
+		revoker         revocation
+		revocationFirst bool
+	}{
+		{"GrantRevocationHoldsClient_ClientDeletionQueues", refreshExchange, grantRevocation, true},
+		{"ClientDeletionHoldsClient_GrantRevocationQueues", refreshExchange, grantRevocation, false},
+		{"CodeReuseHoldsClient_ClientDeletionQueues", codeExchange, codeReuse, true},
+		{"ClientDeletionHoldsClient_CodeReuseQueues", codeExchange, codeReuse, false},
+		{"RefreshReuseHoldsClient_ClientDeletionQueues", refreshExchange, refreshReuse, true},
+		{"ClientDeletionHoldsClient_RefreshReuseQueues", refreshExchange, refreshReuse, false},
+		{"TokenRevocationHoldsClient_ClientDeletionQueues", refreshExchange, tokenRevocation, true},
+		{"ClientDeletionHoldsClient_TokenRevocationQueues", refreshExchange, tokenRevocation, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			r := newASRig(t)
+			f := newRaceFixture(t, r, tc.fixture)
+			errs := captureErrorLog(t)
+
+			// The blocker holds a token inside both cascades, so whichever
+			// side goes first stops there, holding the client and the grant.
+			blocker, err := r.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var blockerPID int32
+			if err := blocker.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&blockerPID); err != nil {
+				t.Fatal(err)
+			}
+			if tag, err := blocker.Exec(ctx, `SELECT 1 FROM mcp_oauth_access_tokens WHERE token_hash = $1 FOR UPDATE`, platform.HashToken(f.heldToken)); err != nil || tag.RowsAffected() != 1 {
+				t.Fatalf("blocker: hold the gate row: err %v, rows %d", err, tag.RowsAffected())
+			}
+
+			var eg errgroup.Group
+			release := func() {
+				_ = blocker.Rollback(ctx)
+				_ = eg.Wait()
+			}
+			defer release()
+			var revoked, deleted *httptest.ResponseRecorder
+			revokerDone, deletionDone := make(chan struct{}), make(chan struct{})
+			startRevoker := func() {
+				eg.Go(func() error { defer close(revokerDone); revoked = f.revoke(r, tc.revoker); return nil })
+			}
+			startDeletion := func() {
+				eg.Go(func() error { defer close(deletionDone); deleted = f.revoke(r, clientDeletion); return nil })
+			}
+			first, second := string(tc.revoker), string(clientDeletion)
+			startFirst, startSecond := startRevoker, startDeletion
+			firstDone, secondDone := revokerDone, deletionDone
+			if !tc.revocationFirst {
+				first, second = second, first
+				startFirst, startSecond = startSecond, startFirst
+				firstDone, secondDone = secondDone, firstDone
+			}
+
+			startFirst()
+			firstPID := waitForLockWaiter(ctx, t, r.pool, []int32{blockerPID}, firstDone)
+			if firstPID == 0 {
+				t.Fatalf("the %s finished without reaching the row the blocker holds", first)
+			}
+			startSecond()
+			if secondPID := waitForLockWaiter(ctx, t, r.pool, []int32{blockerPID, firstPID}, secondDone); secondPID == 0 {
+				t.Errorf("the %s finished without queuing behind the %s", second, first)
+			} else {
+				by := blockingPIDs(ctx, t, r.pool, secondPID)
+				on := queuedOnTables(ctx, t, r.pool, secondPID)
+				if len(by) != 1 || by[0] != firstPID || len(on) != 1 || on[0] != "mcp_oauth_clients" {
+					t.Errorf("the %s (pid %d) is queued on a row of %v behind %v, want on mcp_oauth_clients behind the %s (pid %d) alone",
+						second, secondPID, on, by, first, firstPID)
+				}
+			}
+			release()
+
+			if log := errs.String(); log != "" {
+				t.Errorf("a handler failed (a deadlock victim logs SQLSTATE 40P01):\n%s", log)
+			}
+			if deleted.Code != http.StatusNoContent {
+				t.Errorf("client deletion: status %d body %s, want 204", deleted.Code, deleted.Body.String())
+			}
+			wantReason := "client_deleted"
+			if tc.revocationFirst {
+				assertRevoked(ctx, t, r, f, tc.revoker, revoked)
+				wantReason = map[revocation]string{grantRevocation: "user", codeReuse: "code_reuse", refreshReuse: "refresh_reuse", tokenRevocation: "client"}[tc.revoker]
+			} else {
+				assertLateRevocation(t, tc.revoker, revoked)
+			}
+			var reasons []string
+			rows, err := r.pool.Query(ctx, `SELECT detail_json->>'reason' FROM audit_log WHERE action = 'mcp_authorization.revoked' AND resource_id = $1`, f.grantID.String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reasons, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
+				t.Fatal(err)
+			}
+			if len(reasons) != 1 || reasons[0] != wantReason {
+				t.Errorf("revocation audit rows for the grant = %v, want exactly one, reason %s", reasons, wantReason)
+			}
+			assertNothingSurvives(ctx, t, r, f, clientDeletion)
+		})
+	}
+}
+
+// assertLateRevocation: a revocation that queued behind the deletion of
+// its grant's client found nothing left to revoke, and answered as its
+// route answers a grant that is already gone.
+func assertLateRevocation(t *testing.T, revoker revocation, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	switch revoker {
+	case grantRevocation:
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("%s after the client's deletion: status %d body %s, want 404", revoker, rec.Code, rec.Body.String())
+		}
+	case tokenRevocation:
+		if rec.Code != http.StatusOK || rec.Body.Len() != 0 {
+			t.Errorf("%s after the client's deletion: status %d body %q, want 200 and an empty body", revoker, rec.Code, rec.Body.String())
+		}
+	default:
+		if body := decodeToken(t, rec); rec.Code != http.StatusBadRequest || body.Error != "invalid_grant" {
+			t.Errorf("%s after the client's deletion: status %d body %s, want 400 invalid_grant", revoker, rec.Code, rec.Body.String())
+		}
+	}
+}
