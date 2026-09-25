@@ -574,6 +574,22 @@ func TestToolCall_TwinPanicIsRecovered(t *testing.T) {
 // package-level cache) reliably reproduces DATA RACE reports in
 // jsonschema's own roots.addRoot/Compiler.schemas, confirming this test
 // is not vacuous against the defect it exists to catch.
+//
+// What this test cannot do (round 3 review finding R3, round 5 finding
+// T1): see a PACKAGE-LEVEL lazy cache in the full suite. The handler
+// here is fresh, but a package-level cache outlives every handler, and
+// earlier tests in the same binary (Go runs them in file order, with no
+// shuffling by default) have already called all three tools and warmed
+// it -- so under `go test -race ./...` a reintroduced package-level lazy
+// compile passes this test; only an isolated run shows the race. A
+// cold-process re-exec would close that, but it needs os/exec, which
+// tools/lint/narvichecks' execimportban forbids in this tree, test files
+// included. The order-independent guarantee is
+// TestToolHandler_ValidatesOnlyAgainstTheInjectedSchemaMap
+// (toolhandler_test.go), which fails whenever toolHandler validates
+// against anything but the map it is handed, cache warm or not; this
+// test stays as the runtime check for races in per-handler
+// state and in the concurrent Validate path itself.
 func TestToolCall_ConcurrentFirstCalls_NoRace(t *testing.T) {
 	const n = 64
 	handler := newTestHandler(t, true, true, testTwins())
