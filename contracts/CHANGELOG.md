@@ -11,6 +11,17 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 
 ## [1.4.1]
 
+### rest/v1/dtos.schema.json
+
+- Changed (description only, annotation-only PATCH):
+  `MCPAuthorization.expiresAt` now says what it is since refresh chains
+  keep their own end (technical plan §43.16): when the authorization
+  itself lapses, `MCPGrantMaxLifetime` after the latest consent, which is
+  the latest any install of the client can keep refreshing. An install
+  connected by an earlier consent must consent again sooner, when that
+  consent's own chain ends. The field, its type and its value are
+  unchanged.
+
 ### controlplane/testdata/routes.golden
 
 - Added (not `/api/`, so not graded by `tools/contractscompat`'s own
@@ -19,8 +30,8 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   revocation endpoint (technical plan §43.14/§43.16). `POST /oauth/token`
   is unchanged as a route; it now also accepts
   `grant_type=refresh_token`, and its responses carry a `refresh_token`.
-  No `/api/` route and no DTO changed, so the highest finding class is
-  PATCH.
+  No `/api/` route changed and no DTO changed shape, so the highest
+  finding class is PATCH.
 
 ## [1.4.0]
 
