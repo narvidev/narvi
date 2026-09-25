@@ -1,6 +1,7 @@
 package mcpauth
 
 import (
+	"context"
 	"errors"
 	"mime"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/auditlog"
 	"github.com/narvidev/narvi/internal/domain/mcpscope"
@@ -20,71 +22,44 @@ import (
 // form parameters.
 const maxTokenRequestBytes = 16 << 10
 
-// accessTokenPrefix marks the access-token family (technical plan
-// §43.16); the whole prefixed string is what gets hashed.
-const accessTokenPrefix = "narvi_mcp_at_"
+// accessTokenPrefix and refreshTokenPrefix mark the two token families
+// (technical plan §43.16) for a secret scanner or a reviewer reading a
+// log; the whole prefixed string is what gets hashed.
+const (
+	accessTokenPrefix  = "narvi_mcp_at_"
+	refreshTokenPrefix = "narvi_mcp_rt_"
+)
 
 // tokenResponse is a successful token response (RFC 6749 section 5.1). scope is
 // always present: the user may have narrowed what the client asked for,
-// and a scope-less approval answers "". It is the token's own scopes --
-// exactly what the user approved in the flow that produced the code --
-// which is all the token will ever be able to do.
+// and a scope-less approval answers "". It is the tokens' own scopes --
+// exactly what the user approved in the flow that produced the code, or
+// a narrowing of them a refresh asked for -- which is all they will ever
+// be able to do. refresh_token is the token the client presents at the
+// next refresh (every successful response carries a new one).
 type tokenResponse struct {
-	AccessToken string `json:"access_token"`
-	TokenType   string `json:"token_type"`
-	ExpiresIn   int64  `json:"expires_in"`
-	Scope       string `json:"scope"`
+	AccessToken  string `json:"access_token"`
+	TokenType    string `json:"token_type"`
+	ExpiresIn    int64  `json:"expires_in"`
+	Scope        string `json:"scope"`
+	RefreshToken string `json:"refresh_token,omitempty"`
 }
 
-// Token backs POST /oauth/token (technical plan §43.14). It is never
-// behind the cookie middleware and reads no cookie: the only client
-// authentication is the public-client form (client_id in the body, or
-// HTTP Basic with an empty secret), and the code itself, bound by PKCE,
-// is the credential.
+// Token backs POST /oauth/token (technical plan §43.14/§43.16): the
+// authorization_code grant (codeGrant) and the refresh_token grant
+// (refreshGrant). It is never behind the cookie middleware and reads no
+// cookie: the only client authentication is the public-client form
+// (client_id in the body, or HTTP Basic with an empty secret), and the
+// code -- bound by PKCE -- or the refresh token is the credential.
 func (s *Server) Token(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	logger := platform.Logger(ctx)
+	logger := platform.Logger(r.Context())
 
-	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	if err != nil || mediaType != "application/x-www-form-urlencoded" {
-		writeTokenError(w, errInvalidRequest, "the body must be application/x-www-form-urlencoded", false)
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxTokenRequestBytes)
-	if err := r.ParseForm(); err != nil {
-		writeTokenError(w, errInvalidRequest, "the body could not be parsed", false)
-		return
-	}
-	form := r.PostForm
-	for _, vals := range form {
-		if len(vals) > 1 {
-			writeTokenError(w, errInvalidRequest, "a parameter was repeated", false)
-			return
-		}
-	}
-
-	clientID, basicAttempted, ok := tokenClientID(r, form)
+	form, ok := parseOAuthForm(w, r)
 	if !ok {
-		logger.Warn("mcpauth: token refused", "outcome", "client_authentication")
-		writeTokenError(w, errInvalidClient, "public clients authenticate with client_id alone", basicAttempted)
 		return
 	}
-	if !storableText(clientID) {
-		// No registered client_id carries such bytes: refused exactly
-		// like an unknown one (storableText's own doc comment).
-		logger.Warn("mcpauth: token refused", "outcome", "unknown_client")
-		writeTokenError(w, errInvalidClient, "unknown client", basicAttempted)
-		return
-	}
-	client, err := s.deps.Clients.GetByClientID(ctx, clientID)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		logger.Warn("mcpauth: token refused", "outcome", "unknown_client")
-		writeTokenError(w, errInvalidClient, "unknown client", basicAttempted)
-		return
-	case err != nil:
-		logger.Error("mcpauth: token: load client failed", "error", err)
-		writeTokenError(w, errServerError, "", false)
+	client, basicAttempted, ok := s.authenticateClient(w, r, form, "token")
+	if !ok {
 		return
 	}
 	if client.DisabledAt.Valid || client.Kind != sqlcgen.McpOauthClientKindPreregistered {
@@ -95,14 +70,82 @@ func (s *Server) Token(w http.ResponseWriter, r *http.Request) {
 
 	switch form.Get("grant_type") {
 	case "authorization_code":
+		s.codeGrant(w, r, client, form)
+	case "refresh_token":
+		s.refreshGrant(w, r, client, form)
 	case "":
 		writeTokenError(w, errInvalidRequest, "grant_type is required", false)
-		return
 	default:
-		writeTokenError(w, errUnsupportedGrantType, "only the authorization_code grant is supported", false)
-		return
+		writeTokenError(w, errUnsupportedGrantType, "only the authorization_code and refresh_token grants are supported", false)
 	}
+}
 
+// parseOAuthForm reads the application/x-www-form-urlencoded body POST
+// /oauth/token and POST /oauth/revoke both take -- the body only, never
+// the query string -- refusing any other media type, an oversized body,
+// or a repeated parameter (RFC 6749 section 3.2) with invalid_request.
+func parseOAuthForm(w http.ResponseWriter, r *http.Request) (url.Values, bool) {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/x-www-form-urlencoded" {
+		writeTokenError(w, errInvalidRequest, "the body must be application/x-www-form-urlencoded", false)
+		return nil, false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxTokenRequestBytes)
+	if err := r.ParseForm(); err != nil {
+		writeTokenError(w, errInvalidRequest, "the body could not be parsed", false)
+		return nil, false
+	}
+	form := r.PostForm
+	for _, vals := range form {
+		if len(vals) > 1 {
+			writeTokenError(w, errInvalidRequest, "a parameter was repeated", false)
+			return nil, false
+		}
+	}
+	return form, true
+}
+
+// authenticateClient resolves the public client a token or revocation
+// request identifies itself as (tokenClientID), answering invalid_client
+// itself when it cannot: no usable client_id, a secret, a Basic/body
+// disagreement, or a client_id no registered client carries. It says
+// nothing about whether the client may still obtain tokens -- that is the
+// caller's rule. endpoint names the caller in logs.
+func (s *Server) authenticateClient(w http.ResponseWriter, r *http.Request, form url.Values, endpoint string) (client sqlcgen.McpOauthClient, basicAttempted, ok bool) {
+	ctx := r.Context()
+	logger := platform.Logger(ctx)
+
+	clientID, basicAttempted, ok := tokenClientID(r, form)
+	if !ok {
+		logger.Warn("mcpauth: "+endpoint+" refused", "outcome", "client_authentication")
+		writeTokenError(w, errInvalidClient, "public clients authenticate with client_id alone", basicAttempted)
+		return sqlcgen.McpOauthClient{}, basicAttempted, false
+	}
+	if !storableText(clientID) {
+		// No registered client_id carries such bytes: refused exactly
+		// like an unknown one (storableText's own doc comment).
+		logger.Warn("mcpauth: "+endpoint+" refused", "outcome", "unknown_client")
+		writeTokenError(w, errInvalidClient, "unknown client", basicAttempted)
+		return sqlcgen.McpOauthClient{}, basicAttempted, false
+	}
+	client, err := s.deps.Clients.GetByClientID(ctx, clientID)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		logger.Warn("mcpauth: "+endpoint+" refused", "outcome", "unknown_client")
+		writeTokenError(w, errInvalidClient, "unknown client", basicAttempted)
+		return sqlcgen.McpOauthClient{}, basicAttempted, false
+	case err != nil:
+		logger.Error("mcpauth: "+endpoint+": load client failed", "error", err)
+		writeTokenError(w, errServerError, "", false)
+		return sqlcgen.McpOauthClient{}, basicAttempted, false
+	}
+	return client, basicAttempted, true
+}
+
+// codeGrant answers grant_type=authorization_code: every refusal it can
+// decide from the request alone comes first and leaves the code unspent;
+// exchangeCode does the rest.
+func (s *Server) codeGrant(w http.ResponseWriter, r *http.Request, client sqlcgen.McpOauthClient, form url.Values) {
 	code := form.Get("code")
 	verifier := form.Get("code_verifier")
 	if code == "" {
@@ -155,7 +198,8 @@ func tokenClientID(r *http.Request, form url.Values) (clientID string, basicAtte
 }
 
 // exchangeCode consumes the authorization code and, if every binding
-// holds, issues one access token -- in one transaction. A code that
+// holds, issues one access token and one refresh token -- in one
+// transaction. A code that
 // reaches this point is spent by the attempt even when a later check
 // fails (single use is not "single successful use"), and a code that was
 // already spent is a replay: the
@@ -279,37 +323,114 @@ func (s *Server) exchangeCode(w http.ResponseWriter, r *http.Request, client sql
 		return
 	}
 
-	token, err := platform.GenerateToken()
-	if err != nil {
-		fail("generate token failed", err)
-		return
-	}
-	accessToken := accessTokenPrefix + token
-	expiresAt := now.Add(s.cfg.Timeouts.MCPAccessTokenTTL)
-	if grant.ExpiresAt.Time.Before(expiresAt) {
-		expiresAt = grant.ExpiresAt.Time
-	}
-	// The token's scopes are the code's -- what the user approved in the
+	// The tokens' scopes are the code's -- what the user approved in the
 	// consent decision that issued it -- never the grant's, which a later
-	// consent for the same client overwrites (technical plan §43.16).
-	if _, err := grants.CreateAccessToken(ctx, sqlcgen.CreateMCPOAuthAccessTokenParams{
-		GrantID:   grant.ID,
-		TokenHash: platform.HashToken(accessToken),
-		Scopes:    row.Scopes,
-		ExpiresAt: pgtype.Timestamptz{Time: expiresAt, Valid: true},
-	}); err != nil {
-		fail("record token failed", err)
+	// consent for the same client overwrites (technical plan §43.16). The
+	// refresh chain this exchange begins is bound to the code's resource
+	// and ends when the grant ends NOW: a later consent renews the grant
+	// row, never this chain.
+	issued, err := s.issueTokens(ctx, grants, grant, mcpscope.FromStrings(row.Scopes), refreshChain{
+		resource:  row.Resource,
+		expiresAt: grant.ExpiresAt.Time,
+	}, now)
+	if err != nil {
+		fail("record tokens failed", err)
 		return
 	}
 	if err := tx.Commit(ctx); err != nil {
-		fail("commit token failed", err)
+		fail("commit tokens failed", err)
 		return
 	}
+	writeIssued(w, issued, now)
+}
+
+// refreshChain is what a refresh chain -- the refresh tokens one code
+// exchange begins and every rotation continues -- fixes when it begins and
+// carries unchanged through every rotation (technical plan §43.16): the
+// resource the code was issued for, and the chain's absolute end, the
+// grant's expiry at that code exchange. Neither is ever re-read from the
+// grant, whose resource and expiry a later consent for the same client
+// renews in place: that consent must neither extend nor rebind a chain an
+// earlier consent began.
+type refreshChain struct {
+	resource  string
+	expiresAt time.Time
+}
+
+// issuedTokens is one successful token response's credentials, stored and
+// not yet committed: the plaintexts exist here and in the response only.
+type issuedTokens struct {
+	accessToken     string
+	accessExpiresAt time.Time
+	refreshToken    string
+	// refreshID is the new refresh token's row: what a refresh rotates the
+	// presented token into.
+	refreshID pgtype.UUID
+	scopes    []mcpscope.Scope
+}
+
+// issueTokens mints and stores, under grant and inside grants' own
+// transaction, one access token and one refresh token, both holding
+// exactly scopes -- fixed for their whole lifetime -- the refresh token
+// continuing chain, and each expiring after its own TTL
+// (MCPAccessTokenTTL, MCPRefreshTokenTTL), at the chain's end, or at the
+// grant's own expiry, whichever comes first (technical plan §43.16).
+func (s *Server) issueTokens(ctx context.Context, grants *postgres.MCPOAuthGrantStore, grant sqlcgen.McpOauthGrant, scopes []mcpscope.Scope, chain refreshChain, now time.Time) (issuedTokens, error) {
+	capped := func(ttl time.Duration) time.Time {
+		at := now.Add(ttl)
+		for _, end := range []time.Time{grant.ExpiresAt.Time, chain.expiresAt} {
+			if end.Before(at) {
+				at = end
+			}
+		}
+		return at
+	}
+	access, err := platform.GenerateToken()
+	if err != nil {
+		return issuedTokens{}, err
+	}
+	refresh, err := platform.GenerateToken()
+	if err != nil {
+		return issuedTokens{}, err
+	}
+	out := issuedTokens{
+		accessToken:     accessTokenPrefix + access,
+		accessExpiresAt: capped(s.cfg.Timeouts.MCPAccessTokenTTL),
+		refreshToken:    refreshTokenPrefix + refresh,
+		scopes:          scopes,
+	}
+	stored := mcpscope.Strings(scopes)
+	if _, err := grants.CreateAccessToken(ctx, sqlcgen.CreateMCPOAuthAccessTokenParams{
+		GrantID:   grant.ID,
+		TokenHash: platform.HashToken(out.accessToken),
+		Scopes:    stored,
+		ExpiresAt: pgtype.Timestamptz{Time: out.accessExpiresAt, Valid: true},
+	}); err != nil {
+		return issuedTokens{}, err
+	}
+	rt, err := grants.CreateRefreshToken(ctx, sqlcgen.CreateMCPOAuthRefreshTokenParams{
+		GrantID:        grant.ID,
+		TokenHash:      platform.HashToken(out.refreshToken),
+		Scopes:         stored,
+		Resource:       chain.resource,
+		ExpiresAt:      pgtype.Timestamptz{Time: capped(s.cfg.Timeouts.MCPRefreshTokenTTL), Valid: true},
+		ChainExpiresAt: pgtype.Timestamptz{Time: chain.expiresAt, Valid: true},
+	})
+	if err != nil {
+		return issuedTokens{}, err
+	}
+	out.refreshID = rt.ID
+	return out, nil
+}
+
+// writeIssued answers a successful token request with issued, committed.
+func writeIssued(w http.ResponseWriter, issued issuedTokens, now time.Time) {
 	writeTokenJSON(w, http.StatusOK, tokenResponse{
-		AccessToken: accessToken,
-		TokenType:   "Bearer",
-		ExpiresIn:   int64(platform.DurationToSeconds(expiresAt.Sub(now))),
-		Scope:       mcpscope.Join(mcpscope.FromStrings(row.Scopes)),
+		AccessToken:  issued.accessToken,
+		TokenType:    "Bearer",
+		ExpiresIn:    int64(platform.DurationToSeconds(issued.accessExpiresAt.Sub(now))),
+		Scope:        mcpscope.Join(issued.scopes),
+		RefreshToken: issued.refreshToken,
 	})
 }
 

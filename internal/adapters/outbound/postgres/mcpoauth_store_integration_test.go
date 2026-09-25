@@ -5,10 +5,12 @@ package postgres_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
@@ -405,5 +407,137 @@ func TestMCPOAuthGrantStore_UpsertKeepsOneGrantPerUserAndClient(t *testing.T) {
 	listed, err := f.grants.ListGrantsForUser(ctx, f.user.ID)
 	if err != nil || len(listed) != 1 {
 		t.Fatalf("ListGrantsForUser = %+v, err = %v, want exactly one grant", listed, err)
+	}
+}
+
+// createRefreshToken inserts one refresh token under grantID, the whole
+// chain ending when the token does.
+func (f mcpOAuthFixture) createRefreshToken(ctx context.Context, t *testing.T, grantID pgtype.UUID, tokenHash string, scopes []string, expires time.Time) sqlcgen.McpOauthRefreshToken {
+	t.Helper()
+	rt, err := f.grants.CreateRefreshToken(ctx, sqlcgen.CreateMCPOAuthRefreshTokenParams{
+		GrantID:        grantID,
+		TokenHash:      tokenHash,
+		Scopes:         scopes,
+		Resource:       "http://127.0.0.1:9/mcp",
+		ExpiresAt:      mcpTS(expires),
+		ChainExpiresAt: mcpTS(expires),
+	})
+	if err != nil {
+		t.Fatalf("create refresh token %s: %v", tokenHash, err)
+	}
+	return rt
+}
+
+// TestMCPOAuthGrantStore_RefreshTokenRotatesOnce proves the refresh
+// grant's single-use step (technical plan §43.16): a refresh token is
+// rotated at most once -- also under a concurrent race -- naming its
+// successor, and a rotated token stays findable by hash so presenting it
+// again is recognisable as a replay. Scopes are stored as issued, a nil
+// set as '{}'.
+func TestMCPOAuthGrantStore_RefreshTokenRotatesOnce(t *testing.T) {
+	ctx := context.Background()
+	f := newMCPOAuthFixture(ctx, t)
+	g, _ := f.createGrantWithToken(ctx, t, []string{"mcp:read"}, "hash-refresh-test", time.Now().Add(time.Hour), time.Now().Add(time.Hour))
+
+	first := f.createRefreshToken(ctx, t, g.ID, "refresh-hash-1", nil, time.Now().Add(time.Hour))
+	if first.Scopes == nil || len(first.Scopes) != 0 || first.RotatedAt.Valid || first.SupersededBy.Valid {
+		t.Fatalf("new refresh token = %+v, want non-nil empty scopes and not rotated", first)
+	}
+
+	const racers = 8
+	successors := make([]sqlcgen.McpOauthRefreshToken, racers)
+	for i := range successors {
+		successors[i] = f.createRefreshToken(ctx, t, g.ID, fmt.Sprintf("refresh-successor-%d", i), []string{"mcp:read"}, time.Now().Add(time.Hour))
+	}
+	wins := make(chan pgtype.UUID, racers)
+	var eg errgroup.Group
+	for i := 0; i < racers; i++ {
+		eg.Go(func() error {
+			rotated, err := f.grants.RotateRefreshToken(ctx, first.ID, successors[i].ID)
+			switch {
+			case err == nil:
+				wins <- rotated.SupersededBy
+				return nil
+			case errors.Is(err, pgx.ErrNoRows):
+				return nil
+			default:
+				return err
+			}
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		t.Fatalf("concurrent rotate: %v", err)
+	}
+	close(wins)
+	if n := len(wins); n != 1 {
+		t.Fatalf("concurrent rotations that won = %d, want exactly 1", n)
+	}
+	winner := <-wins
+
+	row, err := f.grants.GetRefreshTokenByHash(ctx, "refresh-hash-1")
+	if err != nil {
+		t.Fatalf("GetRefreshTokenByHash after rotation: %v", err)
+	}
+	if !row.RotatedAt.Valid || row.SupersededBy != winner {
+		t.Fatalf("rotated row = %+v, want rotated_at set and superseded_by = the winning successor %v", row, winner)
+	}
+	if _, err := f.grants.GetRefreshTokenByHash(ctx, "never-issued"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("GetRefreshTokenByHash(never-issued): err = %v, want pgx.ErrNoRows", err)
+	}
+}
+
+// TestMCPOAuthGrantStore_RevocationCascadesRefreshChain proves revocation
+// stays structural with refresh tokens (technical plan §43.16): deleting
+// the grant -- or the client above it -- takes a whole rotation chain
+// with it, the self-reference (superseded_by) included, in one statement.
+func TestMCPOAuthGrantStore_RevocationCascadesRefreshChain(t *testing.T) {
+	for _, revoke := range []string{"grant", "client"} {
+		t.Run(revoke, func(t *testing.T) {
+			ctx := context.Background()
+			f := newMCPOAuthFixture(ctx, t)
+			g, _ := f.createGrantWithToken(ctx, t, []string{"mcp:read"}, "hash-chain-"+revoke, time.Now().Add(time.Hour), time.Now().Add(time.Hour))
+			chain := []sqlcgen.McpOauthRefreshToken{
+				f.createRefreshToken(ctx, t, g.ID, "chain-0-"+revoke, []string{"mcp:read"}, time.Now().Add(time.Hour)),
+				f.createRefreshToken(ctx, t, g.ID, "chain-1-"+revoke, []string{"mcp:read"}, time.Now().Add(time.Hour)),
+				f.createRefreshToken(ctx, t, g.ID, "chain-2-"+revoke, []string{"mcp:read"}, time.Now().Add(time.Hour)),
+			}
+			for i := 0; i+1 < len(chain); i++ {
+				if _, err := f.grants.RotateRefreshToken(ctx, chain[i].ID, chain[i+1].ID); err != nil {
+					t.Fatalf("rotate %d -> %d: %v", i, i+1, err)
+				}
+			}
+
+			switch revoke {
+			case "grant":
+				if n, err := f.grants.DeleteGrant(ctx, g.ID); err != nil || n != 1 {
+					t.Fatalf("DeleteGrant: n = %d, err = %v, want 1 row", n, err)
+				}
+			default:
+				if _, err := f.clients.Delete(ctx, f.client.ID); err != nil {
+					t.Fatalf("Delete client: %v", err)
+				}
+			}
+			var left int
+			if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM mcp_oauth_refresh_tokens`).Scan(&left); err != nil || left != 0 {
+				t.Fatalf("refresh tokens after revocation = %d (err %v), want 0", left, err)
+			}
+		})
+	}
+}
+
+// TestMCPOAuthGrantStore_RefreshSuccessorOnlyOnceRotated pins the table's
+// own CHECK: a refresh token can name a successor only once it has been
+// rotated.
+func TestMCPOAuthGrantStore_RefreshSuccessorOnlyOnceRotated(t *testing.T) {
+	ctx := context.Background()
+	f := newMCPOAuthFixture(ctx, t)
+	g, _ := f.createGrantWithToken(ctx, t, []string{"mcp:read"}, "hash-check-test", time.Now().Add(time.Hour), time.Now().Add(time.Hour))
+	a := f.createRefreshToken(ctx, t, g.ID, "check-a", nil, time.Now().Add(time.Hour))
+	b := f.createRefreshToken(ctx, t, g.ID, "check-b", nil, time.Now().Add(time.Hour))
+
+	_, err := f.pool.Exec(ctx, `UPDATE mcp_oauth_refresh_tokens SET superseded_by = $1 WHERE id = $2`, b.ID, a.ID)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.ConstraintName != "mcp_oauth_refresh_tokens_superseded_only_when_rotated" {
+		t.Fatalf("naming a successor on an unrotated token: err = %v, want a check violation", err)
 	}
 }

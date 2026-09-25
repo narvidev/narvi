@@ -135,6 +135,7 @@ func TestBuild_MCPSurface_RealRouter(t *testing.T) {
 			{http.MethodGet, "/oauth/consent"},
 			{http.MethodPost, "/oauth/consent"},
 			{http.MethodPost, "/oauth/token"},
+			{http.MethodPost, "/oauth/revoke"},
 		} {
 			rec := httptest.NewRecorder()
 			app.Router.ServeHTTP(rec, httptest.NewRequest(route.method, route.path, nil))

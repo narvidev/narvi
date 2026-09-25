@@ -59,8 +59,8 @@ func ListMyMCPAuthorizations(grants *postgres.MCPOAuthGrantStore) http.HandlerFu
 // RevokeMyMCPAuthorization backs DELETE
 // /api/me/mcp-authorizations/{authorizationID} (technical plan §43.18):
 // deletes one of the caller's OWN authorizations -- and, by cascade, every
-// code and access token issued under it, so the client's very next /mcp
-// call is refused. Another user's authorization id is indistinguishable
+// code, access token and refresh token issued under it, so the client's
+// very next /mcp call is refused and it cannot refresh. Another user's authorization id is indistinguishable
 // from a missing one (404). Gated by authz.ActionRevokeOwnMCPAuthorization,
 // deliberately not ActionConnectMCPClient: disconnecting must stay open to
 // every role even if connecting is ever narrowed. Audited as

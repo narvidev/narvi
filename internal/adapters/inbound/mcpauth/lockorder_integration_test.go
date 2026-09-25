@@ -23,13 +23,14 @@ import (
 // This file proves the lock order written at the top of
 // internal/adapters/outbound/postgres/mcpoauthgrant_store.go (technical
 // plan §43.16) with the real handlers on both sides: a revocation racing a
-// consent decision or a code exchange never deadlocks, never fails, and
-// leaves nothing the issuance produced alive.
+// consent decision, a code exchange or a refresh never deadlocks, never
+// fails, and leaves nothing the issuance produced alive.
 //
 // Every race is deterministic. A third transaction, the blocker, holds the
 // one row the side that goes first needs right after its parent lock --
-// the issuance's own request or code, or a token inside the revocation's
-// cascade -- so that side stops there, holding the parent. The other side
+// the issuance's own request, code or refresh token, or a token inside
+// the revocation's cascade -- so that side stops there, holding the
+// parent. The other side
 // is then started and must be SEEN in pg_locks queued on that parent row,
 // behind the first side and nothing else. Only then is the blocker
 // released. Every wait is on observed state, never on elapsed time.
@@ -49,6 +50,9 @@ const (
 	consentApproval issuance = "consent"
 	// codeExchange is POST /oauth/token for the member's code.
 	codeExchange issuance = "code exchange"
+	// refreshExchange is POST /oauth/token refreshing with the member's
+	// current refresh token.
+	refreshExchange issuance = "refresh"
 )
 
 // revocation is the side of a race that revokes something.
@@ -63,6 +67,13 @@ const (
 	// codeReuse is POST /oauth/token replaying the member's already-spent
 	// code, which revokes the grant it was issued under.
 	codeReuse revocation = "code reuse"
+	// refreshReuse is POST /oauth/token replaying the member's
+	// already-rotated refresh token, which revokes the grant it was issued
+	// under.
+	refreshReuse revocation = "refresh reuse"
+	// tokenRevocation is the client's own POST /oauth/revoke (RFC 7009) of
+	// the member's held access token, which revokes its whole grant.
+	tokenRevocation revocation = "token revocation"
 )
 
 // parentTable is the row both sides of a race lock first: the one the
@@ -83,7 +94,7 @@ type raceFixture struct {
 	// issuance never touches: the row the blocker holds to stop a
 	// revocation inside its cascade.
 	heldToken string
-	// grantID is the member's grant (code-exchange races only).
+	// grantID is the member's grant (code-exchange and refresh races).
 	grantID pgtype.UUID
 	// requestID and nonce are the member's rendered, undecided
 	// authorization request (consent races); code is the member's
@@ -94,6 +105,11 @@ type raceFixture struct {
 	// spentVerifier its PKCE verifier (code-exchange races): replaying it
 	// is the code-reuse revocation.
 	spentCode, spentVerifier string
+	// refresh is the member's current refresh token, the one a refresh
+	// race presents, and spentRefresh the one it was rotated from
+	// (refresh races): replaying spentRefresh is the refresh-reuse
+	// revocation.
+	refresh, spentRefresh string
 }
 
 func newRaceFixture(t *testing.T, r *asRig, issuer issuance) raceFixture {
@@ -121,6 +137,19 @@ func newRaceFixture(t *testing.T, r *asRig, issuer issuance) raceFixture {
 		}
 		f.heldToken = decodeToken(t, rec).AccessToken
 		f.code = r.approve(t, r.authorizeParams(f.verifier), f.memberCookie, "mcp:read").Query().Get("code")
+	case refreshExchange:
+		// The held token is the first exchange's access token; its refresh
+		// token was then rotated once, so the member's grant holds a
+		// current refresh token and a spent one.
+		first := r.issuePair(t, f.memberCookie, "mcp:read")
+		f.heldToken, f.spentRefresh = first.AccessToken, first.RefreshToken
+		rec := r.exchange(r.refreshForm(first.RefreshToken), nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("first refresh: status %d body %s", rec.Code, rec.Body.String())
+		}
+		f.refresh = decodeToken(t, rec).RefreshToken
+	}
+	if issuer != consentApproval {
 		ids := r.grantIDs(t, f.member.ID)
 		if len(ids) != 1 {
 			t.Fatalf("member grants = %v, want exactly one", ids)
@@ -133,11 +162,15 @@ func newRaceFixture(t *testing.T, r *asRig, issuer issuance) raceFixture {
 }
 
 func (f raceFixture) issue(r *asRig, issuer issuance) *httptest.ResponseRecorder {
-	if issuer == consentApproval {
+	switch issuer {
+	case consentApproval:
 		form := url.Values{"request": {f.requestID}, "nonce": {f.nonce}, "decision": {"approve"}, "scope": {"mcp:read"}}
 		return r.postConsent(form, sameOriginHeaders(), f.memberCookie)
+	case refreshExchange:
+		return r.exchange(r.refreshForm(f.refresh), nil)
+	default:
+		return r.exchange(r.exchangeForm(f.code, f.verifier), nil)
 	}
-	return r.exchange(r.exchangeForm(f.code, f.verifier), nil)
 }
 
 func (f raceFixture) revoke(r *asRig, revoker revocation) *httptest.ResponseRecorder {
@@ -146,28 +179,43 @@ func (f raceFixture) revoke(r *asRig, revoker revocation) *httptest.ResponseReco
 		return r.do(http.MethodDelete, "/api/me/mcp-authorizations/"+f.grantID.String(), "", nil, f.memberCookie)
 	case codeReuse:
 		return r.exchange(r.exchangeForm(f.spentCode, f.spentVerifier), nil)
+	case refreshReuse:
+		return r.exchange(r.refreshForm(f.spentRefresh), nil)
+	case tokenRevocation:
+		return r.revoke(url.Values{"token": {f.heldToken}, "client_id": {r.client.ClientID}}, nil)
 	default:
 		return r.do(http.MethodDelete, "/api/mcp-clients/"+r.client.ID.String(), "", nil, f.adminCookie)
 	}
 }
 
-// assertRevoked: the revocation succeeded -- 204 from a Settings route; a
-// replayed code is refused invalid_grant, and its grant's revocation is
-// audited with reason code_reuse.
+// assertRevoked: the revocation succeeded -- 204 from a Settings route; 200
+// and an empty body from the revocation endpoint; a replayed code or
+// refresh token is refused invalid_grant -- and a revocation of the
+// member's grant by the token endpoint or the revocation endpoint is
+// audited with its own reason.
 func assertRevoked(ctx context.Context, t *testing.T, r *asRig, f raceFixture, revoker revocation, rec *httptest.ResponseRecorder) {
 	t.Helper()
-	if revoker != codeReuse {
+	reason := ""
+	switch revoker {
+	case codeReuse, refreshReuse:
+		if body := decodeToken(t, rec); rec.Code != http.StatusBadRequest || body.Error != "invalid_grant" {
+			t.Errorf("%s: status %d body %s, want 400 invalid_grant", revoker, rec.Code, rec.Body.String())
+		}
+		reason = map[revocation]string{codeReuse: "code_reuse", refreshReuse: "refresh_reuse"}[revoker]
+	case tokenRevocation:
+		if rec.Code != http.StatusOK || rec.Body.Len() != 0 {
+			t.Errorf("%s: status %d body %q, want 200 and an empty body", revoker, rec.Code, rec.Body.String())
+		}
+		reason = "client"
+	default:
 		if rec.Code != http.StatusNoContent {
 			t.Errorf("%s: status %d body %s, want 204", revoker, rec.Code, rec.Body.String())
 		}
 		return
 	}
-	if body := decodeToken(t, rec); rec.Code != http.StatusBadRequest || body.Error != "invalid_grant" {
-		t.Errorf("%s: status %d body %s, want 400 invalid_grant", revoker, rec.Code, rec.Body.String())
-	}
-	var reused int
-	if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM audit_log WHERE action = 'mcp_authorization.revoked' AND resource_id = $1 AND detail_json->>'reason' = 'code_reuse'`, f.grantID.String()).Scan(&reused); err != nil || reused != 1 {
-		t.Errorf("code_reuse revocation audit rows for the grant = %d (err %v), want 1", reused, err)
+	var audited int
+	if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM audit_log WHERE action = 'mcp_authorization.revoked' AND resource_id = $1 AND detail_json->>'reason' = $2`, f.grantID.String(), reason).Scan(&audited); err != nil || audited != 1 {
+		t.Errorf("%s revocation audit rows for the grant = %d (err %v), want 1", reason, audited, err)
 	}
 }
 
@@ -179,6 +227,8 @@ func (f raceFixture) gate(issuer issuance, issuanceFirst bool) (string, any) {
 		return `SELECT 1 FROM mcp_oauth_access_tokens WHERE token_hash = $1 FOR UPDATE`, platform.HashToken(f.heldToken)
 	case issuer == consentApproval:
 		return `SELECT 1 FROM mcp_oauth_authorization_requests WHERE id = $1::uuid FOR UPDATE`, f.requestID
+	case issuer == refreshExchange:
+		return `SELECT 1 FROM mcp_oauth_refresh_tokens WHERE token_hash = $1 FOR UPDATE`, platform.HashToken(f.refresh)
 	default:
 		return `SELECT 1 FROM mcp_oauth_authorization_codes WHERE code_hash = $1 FOR UPDATE`, platform.HashToken(f.code)
 	}
@@ -207,6 +257,16 @@ func TestLockOrder_RevocationRacingIssuance(t *testing.T) {
 		{"ClientDeletionHoldsClient_ExchangeQueues", codeExchange, clientDeletion, false},
 		{"ExchangeHoldsGrant_CodeReuseQueues", codeExchange, codeReuse, true},
 		{"CodeReuseHoldsGrant_ExchangeQueues", codeExchange, codeReuse, false},
+		{"ExchangeHoldsGrant_TokenRevocationQueues", codeExchange, tokenRevocation, true},
+		{"TokenRevocationHoldsGrant_ExchangeQueues", codeExchange, tokenRevocation, false},
+		{"RefreshHoldsGrant_GrantRevocationQueues", refreshExchange, grantRevocation, true},
+		{"GrantRevocationHoldsGrant_RefreshQueues", refreshExchange, grantRevocation, false},
+		{"RefreshHoldsClient_ClientDeletionQueues", refreshExchange, clientDeletion, true},
+		{"ClientDeletionHoldsClient_RefreshQueues", refreshExchange, clientDeletion, false},
+		{"RefreshHoldsGrant_RefreshReuseQueues", refreshExchange, refreshReuse, true},
+		{"RefreshReuseHoldsGrant_RefreshQueues", refreshExchange, refreshReuse, false},
+		{"RefreshHoldsGrant_TokenRevocationQueues", refreshExchange, tokenRevocation, true},
+		{"TokenRevocationHoldsGrant_RefreshQueues", refreshExchange, tokenRevocation, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -283,8 +343,8 @@ func TestLockOrder_RevocationRacingIssuance(t *testing.T) {
 }
 
 // assertIssuanceOutcome: an issuance that held the parent first succeeded,
-// and what it issued no longer works; one that queued behind the
-// revocation issued nothing.
+// and what it issued no longer works -- a refresh's new refresh token
+// included; one that queued behind the revocation issued nothing.
 func assertIssuanceOutcome(t *testing.T, r *asRig, f raceFixture, issuer issuance, succeeded bool, rec *httptest.ResponseRecorder) {
 	t.Helper()
 	switch {
@@ -302,14 +362,18 @@ func assertIssuanceOutcome(t *testing.T, r *asRig, f raceFixture, issuer issuanc
 		}
 	case succeeded:
 		if rec.Code != http.StatusOK {
-			t.Fatalf("exchange: status %d body %s, want 200", rec.Code, rec.Body.String())
+			t.Fatalf("%s: status %d body %s, want 200", issuer, rec.Code, rec.Body.String())
 		}
-		if got := r.callMCP(decodeToken(t, rec).AccessToken); got != http.StatusUnauthorized {
-			t.Errorf("the token the exchange issued answers %d at /mcp after the revocation, want 401", got)
+		body := decodeToken(t, rec)
+		if got := r.callMCP(body.AccessToken); got != http.StatusUnauthorized {
+			t.Errorf("the token the %s issued answers %d at /mcp after the revocation, want 401", issuer, got)
+		}
+		if again := r.exchange(r.refreshForm(body.RefreshToken), nil); again.Code == http.StatusOK {
+			t.Errorf("the refresh token the %s issued still refreshed after the revocation: %s", issuer, again.Body.String())
 		}
 	default:
 		if body := decodeToken(t, rec); rec.Code != http.StatusBadRequest || body.Error != "invalid_grant" || body.AccessToken != "" {
-			t.Errorf("exchange: status %d body %s, want 400 invalid_grant and no token", rec.Code, rec.Body.String())
+			t.Errorf("%s: status %d body %s, want 400 invalid_grant and no token", issuer, rec.Code, rec.Body.String())
 		}
 	}
 }
@@ -320,20 +384,21 @@ func assertIssuanceOutcome(t *testing.T, r *asRig, f raceFixture, issuer issuanc
 // granted was audited as revoked.
 func assertNothingSurvives(ctx context.Context, t *testing.T, r *asRig, f raceFixture, revoker revocation) {
 	t.Helper()
-	var grants, codes, tokens, unaudited int
+	var grants, codes, tokens, refreshTokens, unaudited int
 	if err := r.pool.QueryRow(ctx, `
 		SELECT (SELECT count(*) FROM mcp_oauth_grants WHERE user_id = $1),
 		       (SELECT count(*) FROM mcp_oauth_authorization_codes),
 		       (SELECT count(*) FROM mcp_oauth_access_tokens),
+		       (SELECT count(*) FROM mcp_oauth_refresh_tokens),
 		       (SELECT count(*) FROM audit_log g
 		         WHERE g.action = 'mcp_authorization.granted'
 		           AND NOT EXISTS (SELECT 1 FROM audit_log v
 		                            WHERE v.action = 'mcp_authorization.revoked' AND v.resource_id = g.resource_id))`,
-		f.member.ID).Scan(&grants, &codes, &tokens, &unaudited); err != nil {
+		f.member.ID).Scan(&grants, &codes, &tokens, &refreshTokens, &unaudited); err != nil {
 		t.Fatal(err)
 	}
-	if grants != 0 || codes != 0 || tokens != 0 {
-		t.Errorf("after the race: member grants %d, codes %d, tokens %d, want none left", grants, codes, tokens)
+	if grants != 0 || codes != 0 || tokens != 0 || refreshTokens != 0 {
+		t.Errorf("after the race: member grants %d, codes %d, access tokens %d, refresh tokens %d, want none left", grants, codes, tokens, refreshTokens)
 	}
 	if unaudited != 0 {
 		t.Errorf("%d granted authorizations have no mcp_authorization.revoked row", unaudited)
@@ -402,4 +467,142 @@ func queuedOnTables(ctx context.Context, t *testing.T, pool *pgxpool.Pool, pid i
 		t.Fatalf("pg_locks for pid %d: %v", pid, err)
 	}
 	return tables
+}
+
+// TestLockOrder_RevocationRacingClientDeletion: every revocation that
+// deletes one grant -- the user's own, a code or refresh-token replay, the
+// client's RFC 7009 request -- takes the grant's client FOR KEY SHARE
+// before the grant, so it and a deletion of that client serialize on the
+// CLIENT row, never deeper. Whichever goes first, the other queues on the
+// client behind it alone, nothing deadlocks, and the grant's revocation is
+// audited exactly once: by the revocation that went first, or -- when the
+// client deletion went first -- as client_deleted, the late revocation
+// finding nothing left to revoke. (Were the client lock skipped, the
+// deletion would list a grant the revocation was already deleting and
+// audit it a second time; technical plan §43.16/§43.18.)
+func TestLockOrder_RevocationRacingClientDeletion(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		fixture         issuance
+		revoker         revocation
+		revocationFirst bool
+	}{
+		{"GrantRevocationHoldsClient_ClientDeletionQueues", refreshExchange, grantRevocation, true},
+		{"ClientDeletionHoldsClient_GrantRevocationQueues", refreshExchange, grantRevocation, false},
+		{"CodeReuseHoldsClient_ClientDeletionQueues", codeExchange, codeReuse, true},
+		{"ClientDeletionHoldsClient_CodeReuseQueues", codeExchange, codeReuse, false},
+		{"RefreshReuseHoldsClient_ClientDeletionQueues", refreshExchange, refreshReuse, true},
+		{"ClientDeletionHoldsClient_RefreshReuseQueues", refreshExchange, refreshReuse, false},
+		{"TokenRevocationHoldsClient_ClientDeletionQueues", refreshExchange, tokenRevocation, true},
+		{"ClientDeletionHoldsClient_TokenRevocationQueues", refreshExchange, tokenRevocation, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			r := newASRig(t)
+			f := newRaceFixture(t, r, tc.fixture)
+			errs := captureErrorLog(t)
+
+			// The blocker holds a token inside both cascades, so whichever
+			// side goes first stops there, holding the client and the grant.
+			blocker, err := r.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var blockerPID int32
+			if err := blocker.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&blockerPID); err != nil {
+				t.Fatal(err)
+			}
+			if tag, err := blocker.Exec(ctx, `SELECT 1 FROM mcp_oauth_access_tokens WHERE token_hash = $1 FOR UPDATE`, platform.HashToken(f.heldToken)); err != nil || tag.RowsAffected() != 1 {
+				t.Fatalf("blocker: hold the gate row: err %v, rows %d", err, tag.RowsAffected())
+			}
+
+			var eg errgroup.Group
+			release := func() {
+				_ = blocker.Rollback(ctx)
+				_ = eg.Wait()
+			}
+			defer release()
+			var revoked, deleted *httptest.ResponseRecorder
+			revokerDone, deletionDone := make(chan struct{}), make(chan struct{})
+			startRevoker := func() {
+				eg.Go(func() error { defer close(revokerDone); revoked = f.revoke(r, tc.revoker); return nil })
+			}
+			startDeletion := func() {
+				eg.Go(func() error { defer close(deletionDone); deleted = f.revoke(r, clientDeletion); return nil })
+			}
+			first, second := string(tc.revoker), string(clientDeletion)
+			startFirst, startSecond := startRevoker, startDeletion
+			firstDone, secondDone := revokerDone, deletionDone
+			if !tc.revocationFirst {
+				first, second = second, first
+				startFirst, startSecond = startSecond, startFirst
+				firstDone, secondDone = secondDone, firstDone
+			}
+
+			startFirst()
+			firstPID := waitForLockWaiter(ctx, t, r.pool, []int32{blockerPID}, firstDone)
+			if firstPID == 0 {
+				t.Fatalf("the %s finished without reaching the row the blocker holds", first)
+			}
+			startSecond()
+			if secondPID := waitForLockWaiter(ctx, t, r.pool, []int32{blockerPID, firstPID}, secondDone); secondPID == 0 {
+				t.Errorf("the %s finished without queuing behind the %s", second, first)
+			} else {
+				by := blockingPIDs(ctx, t, r.pool, secondPID)
+				on := queuedOnTables(ctx, t, r.pool, secondPID)
+				if len(by) != 1 || by[0] != firstPID || len(on) != 1 || on[0] != "mcp_oauth_clients" {
+					t.Errorf("the %s (pid %d) is queued on a row of %v behind %v, want on mcp_oauth_clients behind the %s (pid %d) alone",
+						second, secondPID, on, by, first, firstPID)
+				}
+			}
+			release()
+
+			if log := errs.String(); log != "" {
+				t.Errorf("a handler failed (a deadlock victim logs SQLSTATE 40P01):\n%s", log)
+			}
+			if deleted.Code != http.StatusNoContent {
+				t.Errorf("client deletion: status %d body %s, want 204", deleted.Code, deleted.Body.String())
+			}
+			wantReason := "client_deleted"
+			if tc.revocationFirst {
+				assertRevoked(ctx, t, r, f, tc.revoker, revoked)
+				wantReason = map[revocation]string{grantRevocation: "user", codeReuse: "code_reuse", refreshReuse: "refresh_reuse", tokenRevocation: "client"}[tc.revoker]
+			} else {
+				assertLateRevocation(t, tc.revoker, revoked)
+			}
+			var reasons []string
+			rows, err := r.pool.Query(ctx, `SELECT detail_json->>'reason' FROM audit_log WHERE action = 'mcp_authorization.revoked' AND resource_id = $1`, f.grantID.String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reasons, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
+				t.Fatal(err)
+			}
+			if len(reasons) != 1 || reasons[0] != wantReason {
+				t.Errorf("revocation audit rows for the grant = %v, want exactly one, reason %s", reasons, wantReason)
+			}
+			assertNothingSurvives(ctx, t, r, f, clientDeletion)
+		})
+	}
+}
+
+// assertLateRevocation: a revocation that queued behind the deletion of
+// its grant's client found nothing left to revoke, and answered as its
+// route answers a grant that is already gone.
+func assertLateRevocation(t *testing.T, revoker revocation, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	switch revoker {
+	case grantRevocation:
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("%s after the client's deletion: status %d body %s, want 404", revoker, rec.Code, rec.Body.String())
+		}
+	case tokenRevocation:
+		if rec.Code != http.StatusOK || rec.Body.Len() != 0 {
+			t.Errorf("%s after the client's deletion: status %d body %q, want 200 and an empty body", revoker, rec.Code, rec.Body.String())
+		}
+	default:
+		if body := decodeToken(t, rec); rec.Code != http.StatusBadRequest || body.Error != "invalid_grant" {
+			t.Errorf("%s after the client's deletion: status %d body %s, want 400 invalid_grant", revoker, rec.Code, rec.Body.String())
+		}
+	}
 }

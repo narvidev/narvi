@@ -2,10 +2,11 @@
 // small, standalone periodic loop that purges expired ws_tokens/
 // user_sessions rows (audit-remediation, config/platform-hardening
 // batch) and the MCP authorization server's own expired rows (technical
-// plan §43.16: authorization requests, codes, access tokens, grants).
-// Every one of these tables (migrations/000016_ws_tokens.up.sql,
-// migrations/000017_auth_v1.up.sql, migrations/000141_mcp_oauth.up.sql)
-// has an expires_at TIMESTAMPTZ NOT NULL column that is checked only at
+// plan §43.16: authorization requests, codes, access tokens, refresh
+// tokens, grants). Every one of these tables
+// (migrations/000016_ws_tokens.up.sql, migrations/000017_auth_v1.up.sql,
+// migrations/000141_mcp_oauth.up.sql,
+// migrations/000142_mcp_oauth_refresh_tokens.up.sql) has an expires_at TIMESTAMPTZ NOT NULL column that is checked only at
 // read/verify time -- nothing else ever DELETEs an expired row, so left
 // alone table growth is unbounded.
 //
@@ -60,7 +61,7 @@ func RunExpiredTokenCleanup(ctx context.Context, pool *pgxpool.Pool, interval ti
 // cleanupExpiredCredentialsOnce runs exactly one cleanup tick: deletes
 // every expired ws_tokens row, then every expired user_sessions row, then
 // every expired MCP authorization request, authorization code, access
-// token and grant (independent statements -- deliberately not one shared
+// token, refresh token and grant (independent statements -- deliberately not one shared
 // transaction, since no table's cleanup depends on another's outcome, and
 // a failure in one must not roll back an already-successful delete in
 // another), logging every deleted row count together. Unexported: PumpOnce's own
@@ -82,10 +83,13 @@ func cleanupExpiredCredentialsOnce(ctx context.Context, pool *pgxpool.Pool) erro
 	}
 
 	// The MCP authorization server's own rows (technical plan §43.16,
-	// migrations/000141_mcp_oauth.up.sql) -- every one of them carries an
-	// expires_at that is otherwise only checked at read time. Grants go
-	// last: deleting an expired grant cascades whatever codes and tokens
-	// it still has, so sweeping those first only keeps the counts honest.
+	// migrations/000141_mcp_oauth.up.sql and
+	// 000142_mcp_oauth_refresh_tokens.up.sql) -- every one of them carries
+	// an expires_at that is otherwise only checked at read time. A rotated
+	// refresh token is kept until its own expiry (so a replay of it is
+	// still recognised) and swept like any other. Grants go last: deleting
+	// an expired grant cascades whatever codes and tokens it still has, so
+	// sweeping those first only keeps the counts honest.
 	mcpRequestsDeleted, err := q.DeleteExpiredMCPOAuthAuthorizationRequests(ctx)
 	if err != nil {
 		return err
@@ -95,6 +99,10 @@ func cleanupExpiredCredentialsOnce(ctx context.Context, pool *pgxpool.Pool) erro
 		return err
 	}
 	mcpTokensDeleted, err := q.DeleteExpiredMCPOAuthAccessTokens(ctx)
+	if err != nil {
+		return err
+	}
+	mcpRefreshTokensDeleted, err := q.DeleteExpiredMCPOAuthRefreshTokens(ctx)
 	if err != nil {
 		return err
 	}
@@ -109,6 +117,7 @@ func cleanupExpiredCredentialsOnce(ctx context.Context, pool *pgxpool.Pool) erro
 		"mcp_authorization_requests_deleted", mcpRequestsDeleted,
 		"mcp_authorization_codes_deleted", mcpCodesDeleted,
 		"mcp_access_tokens_deleted", mcpTokensDeleted,
+		"mcp_refresh_tokens_deleted", mcpRefreshTokensDeleted,
 		"mcp_grants_deleted", mcpGrantsDeleted,
 	)
 	return nil

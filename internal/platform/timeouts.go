@@ -2993,13 +2993,16 @@ type Timeouts struct {
 	// Three ordering links, all checked by Validate: an authorization code
 	// must expire well inside the consent window that produced it
 	// (MCPAuthorizationRequestTTL > MCPAuthorizationCodeTTL), an access
-	// token well inside the grant it is issued under (MCPGrantMaxLifetime >
-	// MCPAccessTokenTTL -- the token endpoint also caps each token at its
-	// grant's own expiry, so the link is about sane configuration, not a
-	// correctness guarantee on its own), and the discovery documents may be
-	// cached for well under one access-token lifetime (MCPAccessTokenTTL >
-	// MCPDiscoveryCacheMaxAge, on the field). Every TTL here fails CLOSED
-	// at zero: a zero TTL makes what it bounds read as already expired.
+	// token well inside the refresh token issued beside it
+	// (MCPRefreshTokenTTL > MCPAccessTokenTTL), and a refresh token well
+	// inside the grant it is issued under (MCPGrantMaxLifetime >
+	// MCPRefreshTokenTTL) -- which also puts the access token inside the
+	// grant. The token endpoint caps every token at its grant's own expiry
+	// anyway, so the last two links are about sane configuration, not a
+	// correctness guarantee on their own. MCPDiscoveryCacheMaxAge is
+	// ordered against nothing (its own doc comment says why). Every TTL
+	// here fails CLOSED at zero: a zero TTL makes what it bounds read as
+	// already expired.
 	// The two fields that are not TTLs do not fail closed, and need not:
 	// a zero MCPGrantLastUsedWriteInterval only undoes its own coalescing
 	// (one last_used_at write per /mcp call), and a zero
@@ -3019,15 +3022,27 @@ type Timeouts struct {
 	MCPAuthorizationCodeTTL time.Duration
 
 	// MCPAccessTokenTTL is how long an MCP access token authenticates
-	// /mcp calls before the client must obtain a new one. The MCP
-	// authorization spec asks for short-lived access tokens; one hour.
-	// Revocation never waits for this: the bearer check re-reads the grant
-	// on every call.
+	// /mcp calls before the client must obtain a new one -- with the
+	// refresh token issued beside it, without going back through consent.
+	// The MCP authorization spec asks for short-lived access tokens; one
+	// hour. Revocation never waits for this: the bearer check re-reads the
+	// grant on every call.
 	MCPAccessTokenTTL time.Duration
 
-	// MCPGrantMaxLifetime is the absolute lifetime of a consented grant --
-	// after it, the user must consent again, whatever the client does.
-	// 90 days.
+	// MCPRefreshTokenTTL is how long an MCP refresh token may be exchanged
+	// for a new access token. Every refresh rotates it -- the replacement
+	// gets a fresh MCPRefreshTokenTTL -- and every refresh token is capped
+	// at its chain's end (MCPGrantMaxLifetime after the consent that began
+	// the chain) and at its grant's own expiry, so a client in regular use
+	// refreshes until MCPGrantMaxLifetime and one left idle this long must
+	// consent again. 30 days.
+	MCPRefreshTokenTTL time.Duration
+
+	// MCPGrantMaxLifetime is the absolute lifetime of a consent: of the
+	// grant it creates or renews, and of the refresh chain its code
+	// begins -- after it, the user must consent again, whatever the client
+	// does. A later consent renews the grant, never a chain an earlier
+	// consent began (technical plan §43.16). 90 days.
 	MCPGrantMaxLifetime time.Duration
 
 	// MCPGrantLastUsedWriteInterval coalesces the bearer check's
@@ -3040,13 +3055,13 @@ type Timeouts struct {
 	// MCPDiscoveryCacheMaxAge is the Cache-Control max-age both discovery
 	// documents carry (the protected-resource and authorization-server
 	// metadata, technical plan §43.14): how long a client may reuse them
-	// before asking again. Validate keeps it well under MCPAccessTokenTTL:
-	// until refresh tokens exist a client re-runs the authorization flow
-	// whenever its access token expires, so each re-authorization then
-	// reads documents fetched after the previous token was issued -- a
-	// change in what the deployment advertises (a newly offered scope
-	// after an upgrade) reaches a client within one token lifetime.
-	// 5 minutes.
+	// before asking again, which bounds how stale they can be when a client
+	// next starts an authorization flow. Validate orders it against no
+	// token lifetime: a client refreshes its access token at the token
+	// endpoint it already knows, without re-reading either document, so no
+	// token lifetime bounds when it next reads them -- and a scope newly
+	// offered after an upgrade needs a new consent anyway, since a refresh
+	// can only narrow. 5 minutes.
 	MCPDiscoveryCacheMaxAge time.Duration
 }
 
@@ -3315,6 +3330,7 @@ func DefaultTimeouts() Timeouts {
 		MCPAuthorizationRequestTTL:    10 * time.Minute,    // §43.16; mirrors OAuthStateTTL
 		MCPAuthorizationCodeTTL:       60 * time.Second,    // §43.16; single-use, exchanged immediately
 		MCPAccessTokenTTL:             time.Hour,           // §43.16; "short-lived access tokens"
+		MCPRefreshTokenTTL:            30 * 24 * time.Hour, // §43.16; per rotation, capped by the chain and the grant
 		MCPGrantMaxLifetime:           90 * 24 * time.Hour, // §43.16; absolute, re-consent after
 		MCPGrantLastUsedWriteInterval: 5 * time.Minute,     // §43.16; write coalescing
 		MCPDiscoveryCacheMaxAge:       5 * time.Minute,     // §43.14; discovery documents' Cache-Control max-age
@@ -3472,17 +3488,16 @@ func (t Timeouts) Validate() error {
 	check("CloudIdentitySigningKeyOverlapWindow > CloudIdentityTokenLifetime",
 		"CloudIdentitySigningKeyOverlapWindow", t.CloudIdentitySigningKeyOverlapWindow, "CloudIdentityTokenLifetime", t.CloudIdentityTokenLifetime)
 
-	// §43.14/§43.16: an authorization code must expire well inside the
-	// consent window that produced it, an access token well inside its
-	// grant, and the discovery documents' cache lifetime well inside one
-	// access-token lifetime (the MCP fields' own block comment on the
-	// struct, and MCPDiscoveryCacheMaxAge's own doc comment).
+	// §43.16: an authorization code must expire well inside the consent
+	// window that produced it, an access token well inside the refresh
+	// token issued beside it, and a refresh token well inside its grant
+	// (the MCP fields' own block comment on the struct).
 	check("MCPAuthorizationRequestTTL > MCPAuthorizationCodeTTL",
 		"MCPAuthorizationRequestTTL", t.MCPAuthorizationRequestTTL, "MCPAuthorizationCodeTTL", t.MCPAuthorizationCodeTTL)
-	check("MCPGrantMaxLifetime > MCPAccessTokenTTL",
-		"MCPGrantMaxLifetime", t.MCPGrantMaxLifetime, "MCPAccessTokenTTL", t.MCPAccessTokenTTL)
-	check("MCPAccessTokenTTL > MCPDiscoveryCacheMaxAge",
-		"MCPAccessTokenTTL", t.MCPAccessTokenTTL, "MCPDiscoveryCacheMaxAge", t.MCPDiscoveryCacheMaxAge)
+	check("MCPRefreshTokenTTL > MCPAccessTokenTTL",
+		"MCPRefreshTokenTTL", t.MCPRefreshTokenTTL, "MCPAccessTokenTTL", t.MCPAccessTokenTTL)
+	check("MCPGrantMaxLifetime > MCPRefreshTokenTTL",
+		"MCPGrantMaxLifetime", t.MCPGrantMaxLifetime, "MCPRefreshTokenTTL", t.MCPRefreshTokenTTL)
 
 	// U2 audit fix, SECURITY (confirmed HIGH finding: "the gate creates the
 	// identity it then checks" batch's own sibling finding -- "the

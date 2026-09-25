@@ -5827,7 +5827,7 @@
         "expiresAt": {
           "type": "string",
           "format": "date-time",
-          "description": "When this authorization lapses and the user must consent again (platform.Timeouts.MCPGrantMaxLifetime after the latest consent)."
+          "description": "When this authorization itself lapses, platform.Timeouts.MCPGrantMaxLifetime after the latest consent: the latest any install of the client can keep refreshing without consenting again. Each consent's own refresh chain keeps the end it began with, MCPGrantMaxLifetime after that consent, so an install connected by an earlier consent must consent again sooner (technical plan §43.16)."
         },
         "lastUsedAt": {
           "type": ["string", "null"],

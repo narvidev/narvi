@@ -1,7 +1,8 @@
 // Package mcpauth is the MCP surface's own OAuth 2.1 authorization server
 // (technical plan §43.13-§43.16): the discovery documents, the
-// authorization endpoint, the consent page, and the token endpoint that
-// issue the bearer tokens POST /mcp accepts. The resource-server half --
+// authorization endpoint, the consent page, the token endpoint that issues
+// -- and, with a refresh token, renews -- the bearer tokens POST /mcp
+// accepts, and the RFC 7009 endpoint a client gives them back through. The resource-server half --
 // verifying a bearer token on every /mcp call -- is
 // internal/adapters/inbound/auth's RequireMCPBearer, because the mcp
 // adapter may import auth but never a store.
@@ -20,13 +21,14 @@
 //	GET  /oauth/authorize                              authorize.go
 //	GET  /oauth/consent?request=<id>                   consent.go
 //	POST /oauth/consent                                consent.go
-//	POST /oauth/token                                  token.go
+//	POST /oauth/token                                  token.go, refresh.go
+//	POST /oauth/revoke                                 revoke.go
 //
 // Every route is mounted by controlplane/serve.go behind the MCP surface's
 // own enabled-gate (503 when off) and none behind the cookie middleware:
 // the consent routes authenticate the cookie themselves (auth.Authenticate)
 // because a signed-out browser must be sent to sign in, not answered 401;
-// the token endpoint reads no cookie at all.
+// the token and revocation endpoints read no cookie at all.
 //
 // # Invariants this package is responsible for
 //
@@ -36,10 +38,25 @@
 //     the STORED URI, never one read from the form.
 //   - PKCE S256 is mandatory; the verifier is checked in constant time.
 //   - A code is single-use; a replayed code deletes the grant it produced.
-//   - resource is required and bound at authorization, at exchange, and
-//     (by auth.RequireMCPBearer) on every call.
+//   - A refresh token rotates on every use; presenting a rotated one, or
+//     one issued to another client, deletes its grant -- unless it, its
+//     chain or its grant has expired, which refreshes nothing and revokes
+//     nothing. A refresh can only narrow the scopes the refresh token
+//     holds, never widen them to the grant's.
+//   - A refresh chain's scopes, resource and absolute end are fixed when
+//     its code is exchanged and carried unchanged through every rotation:
+//     a later consent for the same client, which renews the grant in
+//     place, never extends, rebinds or widens a chain an earlier consent
+//     began.
+//   - Revoking any token revokes its whole grant, and only the client it
+//     was issued to can do so; the answer never says which happened.
+//   - resource is required and bound at authorization and at the code
+//     exchange; on a refresh it is optional, but one that is sent must
+//     match, and the refresh chain's own must still be this deployment's;
+//     and auth.RequireMCPBearer checks it on every call.
 //   - Only scopes the tool table requires are offered; the user can only
 //     narrow them.
+//   - Every token and code holds the scopes fixed when it was issued.
 //   - Codes, tokens and consent nonces exist in plaintext only in the one
 //     response that hands them out.
 package mcpauth

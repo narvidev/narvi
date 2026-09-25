@@ -87,6 +87,22 @@ func Satisfies(granted []Scope, required Scope) bool {
 	return false
 }
 
+// Covers reports whether a credential holding held may be narrowed to
+// requested: every requested scope is one held satisfies (Satisfies, so
+// the hierarchy counts -- a Write holder may narrow to Read). This is the
+// refresh grant's rule (technical plan §43.16): a refreshed token may
+// only ever hold what the token it replaces held, or less. An empty
+// requested set is covered by anything -- narrowing to nothing never
+// widens -- and an unknown requested scope by nothing.
+func Covers(held, requested []Scope) bool {
+	for _, r := range requested {
+		if !Satisfies(held, r) {
+			return false
+		}
+	}
+	return true
+}
+
 // Advertised returns the scopes a client may request from this build:
 // exactly the known scopes at least one entry of required names, in
 // canonical order, without duplicates. A scope nothing requires is never

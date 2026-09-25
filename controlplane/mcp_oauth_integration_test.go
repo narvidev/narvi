@@ -13,9 +13,12 @@
 // client and OAuth handler drive the whole flow: they discover the
 // resource and the authorization server from a live 401, a user approves
 // on the consent page, the client exchanges the code, sees the tools its
-// token allows and calls one; a revoked authorization, a deleted or
-// disabled client and a disabled user each stop working on the very next
-// call; and a scope-less approval's tool list is empty.
+// token allows and calls one; once its access token expires the client
+// refreshes it and keeps working with no second consent; a revoked
+// authorization -- from Settings or through the client's own RFC 7009
+// revocation -- a deleted or disabled client and a disabled user each stop
+// working on the very next call; and a scope-less approval's tool list is
+// empty.
 //
 // With the surface OFF, the discovery documents and every /oauth route
 // answer the documented disabled response (§43.11/§43.14), while the
@@ -46,6 +49,7 @@ import (
 	sdkauth "github.com/modelcontextprotocol/go-sdk/auth"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/modelcontextprotocol/go-sdk/oauthex"
+	"golang.org/x/oauth2"
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
@@ -354,10 +358,66 @@ func (d *consentDriver) fetch(ctx context.Context, args *sdkauth.AuthorizationAr
 	return &sdkauth.AuthorizationResult{Code: q.Get("code"), State: q.Get("state"), Iss: q.Get("iss")}, nil
 }
 
+// clientClock is the SDK OAuth handler's token source (its NewTokenSource
+// hook) with the one thing a test cannot wait for put under its control:
+// the client's own reading of when its access token expires. Through
+// golang.org/x/oauth2, the SDK refreshes only once its token source reads
+// the token as expired -- a time it computed from expires_in -- and until
+// then keeps sending it even if the server has let it lapse, answering the
+// resulting 401 by running the whole authorization flow again. In
+// production the two lapse together; expire makes the client's lapse now,
+// so a test can expire both. Otherwise it is exactly the SDK's default,
+// cfg.TokenSource.
+type clientClock struct {
+	mu    sync.Mutex
+	ctx   context.Context
+	cfg   *oauth2.Config
+	inner oauth2.TokenSource
+	last  *oauth2.Token
+}
+
+func (c *clientClock) newTokenSource(ctx context.Context, cfg *oauth2.Config, tok *oauth2.Token) (oauth2.TokenSource, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ctx, c.cfg, c.inner, c.last = ctx, cfg, cfg.TokenSource(ctx, tok), tok
+	return c, nil
+}
+
+// Token is oauth2.TokenSource: the SDK's own token source's answer,
+// remembered.
+func (c *clientClock) Token() (*oauth2.Token, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	tok, err := c.inner.Token()
+	if err == nil {
+		c.last = tok
+	}
+	return tok, err
+}
+
+// current returns the tokens the client holds now.
+func (c *clientClock) current() oauth2.Token {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return *c.last
+}
+
+// expire makes the client read its current access token as expired --
+// what happens by itself once expires_in elapses -- so its next request
+// refreshes first, with the refresh token it holds.
+func (c *clientClock) expire() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lapsed := *c.last
+	lapsed.Expiry = time.Now().Add(-time.Second)
+	c.inner = c.cfg.TokenSource(c.ctx, &lapsed)
+}
+
 // sdkFlow is one connected official-SDK client and what it went through.
 type sdkFlow struct {
 	session     *sdkmcp.ClientSession
 	driver      *consentDriver
+	clock       *clientClock
 	recorder    *recordingTransport
 	member      sqlcgen.User
 	cookie      string
@@ -385,11 +445,13 @@ func (r *oauthRouterRig) connectSDKClient(ctx context.Context, t *testing.T, con
 	}
 	recorder := &recordingTransport{}
 	httpClient := &http.Client{Transport: recorder}
+	clock := &clientClock{}
 	handler, err := sdkauth.NewAuthorizationCodeHandler(&sdkauth.AuthorizationCodeHandlerConfig{
 		PreregisteredClient:      &oauthex.ClientCredentials{ClientID: client.ClientId},
 		RedirectURL:              "http://127.0.0.1:1/callback",
 		AuthorizationCodeFetcher: driver.fetch,
 		Client:                   httpClient,
+		NewTokenSource:           clock.newTokenSource,
 	})
 	if err != nil {
 		t.Fatalf("NewAuthorizationCodeHandler: %v", err)
@@ -405,7 +467,7 @@ func (r *oauthRouterRig) connectSDKClient(ctx context.Context, t *testing.T, con
 		t.Fatalf("SDK Connect: %v", err)
 	}
 	t.Cleanup(func() { _ = session.Close() })
-	return &sdkFlow{session: session, driver: driver, recorder: recorder, member: member, cookie: memberCookie, adminCookie: adminCookie, client: client}
+	return &sdkFlow{session: session, driver: driver, clock: clock, recorder: recorder, member: member, cookie: memberCookie, adminCookie: adminCookie, client: client}
 }
 
 func toolNames(ctx context.Context, t *testing.T, s *sdkmcp.ClientSession) []string {
@@ -460,6 +522,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 			{http.MethodGet, "/oauth/consent"},
 			{http.MethodPost, "/oauth/consent"},
 			{http.MethodPost, "/oauth/token"},
+			{http.MethodPost, "/oauth/revoke"},
 		} {
 			rec := serveRouter(off.Router, route.method, route.path, "")
 			if rec.Code != http.StatusServiceUnavailable || rec.Body.String() != mcpDisabledBody || rec.Header().Get("Content-Type") != "application/json" {
@@ -629,6 +692,137 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		var tokens int
 		if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM mcp_oauth_access_tokens WHERE grant_id = $1`, grantID).Scan(&tokens); err != nil || tokens != 0 {
 			t.Fatalf("access tokens left for the revoked grant = %d (err %v), want 0", tokens, err)
+		}
+	})
+
+	// Refresh end to end (§43.16): once the access token lapses -- on the
+	// server, as MCPAccessTokenTTL elapsing would, and in the client's own
+	// clock -- the SDK client refreshes with the refresh token it was
+	// issued and keeps working, with no second consent and no 401 on the
+	// way. Twice, so the second refresh presents the token the first one
+	// rotated in.
+	t.Run("RefreshAfterAccessTokenExpires_NoSecondConsent", func(t *testing.T) {
+		ctx := oauthTestCtx(t)
+		flow := rig.connectSDKClient(ctx, t, nil)
+		if res, err := callListModels(ctx, flow.session); err != nil || res.IsError {
+			t.Fatalf("call before expiry: res %+v err %v", res, err)
+		}
+
+		presented := map[string]bool{}
+		for cycle := 1; cycle <= 2; cycle++ {
+			lapsed := flow.recorder.lastBearer()
+			refresh := flow.clock.current().RefreshToken
+			if !strings.HasPrefix(refresh, "narvi_mcp_rt_") || presented[refresh] {
+				t.Fatalf("cycle %d: the client holds refresh token %q, want a new narvi_mcp_rt_ token", cycle, refresh)
+			}
+			presented[refresh] = true
+			tag, err := rig.pool.Exec(ctx, `UPDATE mcp_oauth_access_tokens SET expires_at = now() - interval '1 second' WHERE token_hash = $1`, platform.HashToken(lapsed))
+			if err != nil || tag.RowsAffected() != 1 {
+				t.Fatalf("cycle %d: expire the access token on the server: rows %d err %v", cycle, tag.RowsAffected(), err)
+			}
+			rig.revokedCallFails(t, lapsed)
+			flow.clock.expire()
+
+			before := len(flow.recorder.snapshot())
+			if res, err := callListModels(ctx, flow.session); err != nil || res.IsError {
+				t.Fatalf("cycle %d: call after expiry: res %+v err %v", cycle, res, err)
+			}
+			for _, o := range flow.recorder.snapshot()[before:] {
+				if o.status != http.StatusOK || o.authorization == "Bearer "+lapsed {
+					t.Fatalf("cycle %d: /mcp exchanges after expiry = %+v, want only 200s with a refreshed token", cycle, flow.recorder.snapshot()[before:])
+				}
+			}
+			if n := flow.driver.calls.Load(); n != 1 {
+				t.Fatalf("cycle %d: consent flow ran %d times, want 1 (a refresh needs no consent)", cycle, n)
+			}
+		}
+
+		var grants, live, rotated, revoked int
+		if err := rig.pool.QueryRow(ctx, `
+			SELECT (SELECT count(*) FROM mcp_oauth_grants WHERE user_id = $1),
+			       (SELECT count(*) FROM mcp_oauth_refresh_tokens t JOIN mcp_oauth_grants g ON g.id = t.grant_id WHERE g.user_id = $1 AND t.rotated_at IS NULL),
+			       (SELECT count(*) FROM mcp_oauth_refresh_tokens t JOIN mcp_oauth_grants g ON g.id = t.grant_id WHERE g.user_id = $1 AND t.rotated_at IS NOT NULL),
+			       (SELECT count(*) FROM audit_log WHERE action = 'mcp_authorization.revoked' AND actor_user_id = $1)`,
+			flow.member.ID).Scan(&grants, &live, &rotated, &revoked); err != nil {
+			t.Fatal(err)
+		}
+		if grants != 1 || live != 1 || rotated != 2 || revoked != 0 {
+			t.Fatalf("after two refreshes: grants %d, live refresh tokens %d, rotated %d, revocations %d; want 1, 1, 2, 0", grants, live, rotated, revoked)
+		}
+	})
+
+	// RFC 7009 end to end (§43.16): the client gives its refresh token back
+	// at the revocation endpoint the authorization-server metadata
+	// advertises; the whole authorization is gone, so the very next call
+	// with its access token is refused -- the SDK's one Authorize retry
+	// sends the user back through consent, declined -- and the refresh
+	// token refreshes nothing.
+	t.Run("RevokedAuthorizationStopsOnNextCall_RFC7009", func(t *testing.T) {
+		ctx := oauthTestCtx(t)
+		flow := rig.connectSDKClient(ctx, t, func(d *consentDriver) {
+			d.deny = func(n int32) bool { return n > 1 }
+		})
+		if res, err := callListModels(ctx, flow.session); err != nil || res.IsError {
+			t.Fatalf("call before revocation: res %+v err %v", res, err)
+		}
+		token := flow.recorder.lastBearer()
+		refresh := flow.clock.current().RefreshToken
+
+		var asm struct {
+			RevocationEndpoint          string   `json:"revocation_endpoint"`
+			RevocationEndpointAuthMeths []string `json:"revocation_endpoint_auth_methods_supported"`
+			GrantTypesSupported         []string `json:"grant_types_supported"`
+		}
+		if status := rig.doJSON(t, http.MethodGet, "/.well-known/oauth-authorization-server/oauth", nil, &asm, ""); status != http.StatusOK {
+			t.Fatalf("authorization-server metadata: status %d", status)
+		}
+		if asm.RevocationEndpoint != rig.server.URL+"/oauth/revoke" || strings.Join(asm.RevocationEndpointAuthMeths, ",") != "none" ||
+			strings.Join(asm.GrantTypesSupported, ",") != "authorization_code,refresh_token" {
+			t.Fatalf("authorization-server metadata = %+v, want the revocation endpoint and the refresh_token grant advertised", asm)
+		}
+
+		form := url.Values{"token": {refresh}, "token_type_hint": {"refresh_token"}, "client_id": {flow.client.ClientId}}
+		resp, err := http.PostForm(asm.RevocationEndpoint, form)
+		if err != nil {
+			t.Fatalf("revoke: %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || len(body) != 0 {
+			t.Fatalf("revoke: status %d body %q, want 200 and an empty body", resp.StatusCode, body)
+		}
+
+		before := len(flow.recorder.snapshot())
+		if _, err := callListModels(ctx, flow.session); err == nil {
+			t.Fatalf("the very next CallTool after the revocation succeeded")
+		}
+		after := flow.recorder.snapshot()[before:]
+		if len(after) == 0 || after[0].status != http.StatusUnauthorized || after[0].authorization != "Bearer "+token {
+			t.Fatalf("exchanges after revocation = %+v, want the old token refused 401 first", after)
+		}
+		if n := flow.driver.calls.Load(); n != 2 {
+			t.Fatalf("consent flow ran %d times, want 2 (the SDK's single Authorize retry)", n)
+		}
+		rig.revokedCallFails(t, token)
+
+		resp, err = http.PostForm(rig.server.URL+"/oauth/token", url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refresh}, "client_id": {flow.client.ClientId}})
+		if err != nil {
+			t.Fatalf("refresh after revocation: %v", err)
+		}
+		var refused struct {
+			Error string `json:"error"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&refused)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest || refused.Error != "invalid_grant" {
+			t.Fatalf("refresh after revocation: status %d error %q, want 400 invalid_grant", resp.StatusCode, refused.Error)
+		}
+		var grants, audited int
+		if err := rig.pool.QueryRow(ctx, `
+			SELECT (SELECT count(*) FROM mcp_oauth_grants WHERE user_id = $1),
+			       (SELECT count(*) FROM audit_log WHERE action = 'mcp_authorization.revoked' AND actor_user_id = $1 AND detail_json->>'reason' = 'client')`,
+			flow.member.ID).Scan(&grants, &audited); err != nil || grants != 0 || audited != 1 {
+			t.Fatalf("after the revocation: grants %d, client revocation audit rows %d (err %v); want 0, 1", grants, audited, err)
 		}
 	})
 

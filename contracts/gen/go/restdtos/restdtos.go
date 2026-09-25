@@ -4901,8 +4901,12 @@ type MCPAuthorization struct {
 	// When the user first authorized this client.
 	CreatedAt time.Time `json:"createdAt" yaml:"createdAt" mapstructure:"createdAt"`
 
-	// When this authorization lapses and the user must consent again
-	// (platform.Timeouts.MCPGrantMaxLifetime after the latest consent).
+	// When this authorization itself lapses, platform.Timeouts.MCPGrantMaxLifetime
+	// after the latest consent: the latest any install of the client can keep
+	// refreshing without consenting again. Each consent's own refresh chain keeps the
+	// end it began with, MCPGrantMaxLifetime after that consent, so an install
+	// connected by an earlier consent must consent again sooner (technical plan
+	// §43.16).
 	ExpiresAt time.Time `json:"expiresAt" yaml:"expiresAt" mapstructure:"expiresAt"`
 
 	// Id corresponds to the JSON schema field "id".

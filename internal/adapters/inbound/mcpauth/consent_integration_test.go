@@ -352,8 +352,10 @@ func (r *asRig) wantScopes(t *testing.T, label, token string, want ...string) {
 // review's probe (technical plan §43.16): a token issued scope-less stays
 // scope-less after the same user approves the same client again with
 // mcp:read -- on another install, say -- and so does a code approved
-// scope-less but exchanged only after that wider consent. All of them
-// hang off the one grant, which is why the grant's scopes are never read.
+// scope-less but exchanged only after that wider consent: its access
+// token and its refresh token alike, so the refresh chain it begins stays
+// scope-less too (PR #327's round-1 review). All of them hang off the one
+// grant, which is why the grant's scopes are never read.
 func TestToken_ScopesFixedAtIssuance_LaterConsentCannotWiden(t *testing.T) {
 	r := newASRig(t)
 	user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
@@ -384,6 +386,15 @@ func TestToken_ScopesFixedAtIssuance_LaterConsentCannotWiden(t *testing.T) {
 		t.Fatalf("scope-less code exchanged after a wider consent: status %d scope %q, want 200 with an empty scope", rec.Code, body.Scope)
 	}
 	r.wantScopes(t, "token from the scope-less code exchanged after a wider consent", body.AccessToken)
+	if rt := r.refreshRow(t, body.RefreshToken); len(rt.Scopes) != 0 {
+		t.Fatalf("the refresh token from the scope-less code exchanged after a wider consent holds %v, want the code's scopes: none", rt.Scopes)
+	}
+	rec = r.exchange(r.refreshForm(body.RefreshToken), nil)
+	refreshed := decodeToken(t, rec)
+	if rec.Code != http.StatusOK || refreshed.Scope != "" || !strings.Contains(rec.Body.String(), `"scope":""`) {
+		t.Fatalf("refreshing that code's refresh token: status %d body %s, want 200 with an empty scope", rec.Code, rec.Body.String())
+	}
+	r.wantScopes(t, "token refreshed from the scope-less code's refresh token", refreshed.AccessToken)
 }
 
 // TestToken_ScopesFixedAtIssuance_LaterConsentCannotNarrow: a later,

@@ -2603,7 +2603,8 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// same enabled-gate as /mcp (503 when off, §43.11), and NONE behind
 	// auth.Middleware: the consent routes authenticate the cookie
 	// themselves (a signed-out browser is sent to sign in, not answered
-	// 401), and the token endpoint must never accept a cookie at all.
+	// 401), and the token and revocation endpoints must never accept a
+	// cookie at all.
 	mcpOAuthClientStore := postgres.NewMCPOAuthClientStore(pool)
 	mcpOAuthGrantStore := postgres.NewMCPOAuthGrantStore(pool)
 	mcpAdvertisedScopes := mcpadapter.AdvertisedScopes()
@@ -2638,6 +2639,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		r.Get("/consent", mcpAuthServer.ConsentPage)
 		r.Post("/consent", mcpAuthServer.ConsentDecision)
 		r.Post("/token", mcpAuthServer.Token)
+		r.Post("/revoke", mcpAuthServer.Revoke)
 	})
 
 	// /mcp (technical plan §43, "the MCP surface"): the Streamable HTTP
