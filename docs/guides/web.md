@@ -378,8 +378,14 @@ one. An app never does more than your own role allows: its tools call the
 same routes this guide documents, checked against your role on every call.
 
 Once an app is connected, you manage it in Settings → Integrations →
-Connected apps: what it may do, when you connected it, when it last called,
-and when the authorization lapses (after 90 days you are asked again).
+Connected apps: what you last allowed it, when you connected it, when it
+last called, and when the authorization lapses. Each approval gives the app
+access for one hour; when that runs out the app sends you back to the
+consent page to approve it again (this deployment does not yet issue
+long-lived refresh tokens), and each approval pushes the authorization's
+90-day limit back. Approving an app again never takes away access you
+allowed it before — each approval's access runs its own hour — so to
+withdraw access, disconnect the app.
 
 ```json narvi-command
 {"name": "List your own connected MCP apps", "route": "GET /api/me/mcp-authorizations"}
