@@ -158,3 +158,33 @@ func (q *Queries) ListMCPOAuthClients(ctx context.Context) ([]McpOauthClient, er
 	}
 	return items, nil
 }
+
+const lockMCPOAuthClient = `-- name: LockMCPOAuthClient :one
+SELECT id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at FROM mcp_oauth_clients
+WHERE id = $1
+FOR UPDATE
+`
+
+// LockMCPOAuthClient takes the client row's FOR UPDATE lock, which
+// conflicts with the FOR KEY SHARE lock a new grant's foreign-key check
+// takes: once it returns, no consent can add a grant under this client
+// until the transaction ends, and a consent that had already added one
+// has committed (and is visible to the next statement) or rolled back.
+// DELETE /api/mcp-clients/{clientID} takes it before listing the grants
+// it audits, so the list is exactly what the cascade removes.
+func (q *Queries) LockMCPOAuthClient(ctx context.Context, id pgtype.UUID) (McpOauthClient, error) {
+	row := q.db.QueryRow(ctx, lockMCPOAuthClient, id)
+	var i McpOauthClient
+	err := row.Scan(
+		&i.ID,
+		&i.ClientID,
+		&i.Kind,
+		&i.ClientName,
+		&i.ClientUri,
+		&i.RedirectUris,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.DisabledAt,
+	)
+	return i, err
+}

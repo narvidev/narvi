@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
@@ -196,6 +197,96 @@ func TestClient_DeleteCascadesGrants(t *testing.T) {
 	}
 	if s := r.doJSON(t, http.MethodDelete, "/api/mcp-clients/"+client.Id, nil, nil, admin); s != http.StatusNotFound {
 		t.Fatalf("second delete: status %d, want 404", s)
+	}
+}
+
+// TestClient_DeleteAuditsGrantAddedByConcurrentConsent: a consent that
+// has added a grant under a client, and not yet committed, when an admin
+// deletes that client must not end up with its grant cascaded away
+// unaudited (technical plan §43.15: one mcp_authorization.revoked per
+// authorization the deletion took with it). The consent's uncommitted
+// insert holds the client row's FOR KEY SHARE lock; the deletion waits on
+// it, and must list the grants only after it -- so both grants, the one
+// that existed and the one the consent added, are audited and counted.
+func TestClient_DeleteAuditsGrantAddedByConcurrentConsent(t *testing.T) {
+	ctx := context.Background()
+	r := newTestRig(t)
+	_, admin := createUserWithRole(ctx, t, r, sqlcgen.UserRoleAdmin)
+	existing, _ := createUserWithRole(ctx, t, r, sqlcgen.UserRoleMember)
+	consenting, _ := createUserWithRole(ctx, t, r, sqlcgen.UserRoleMember)
+	client := createMCPClientViaAPI(t, r, admin, `{"clientName":"Contended","redirectUris":["http://127.0.0.1/cb"]}`)
+	existingGrant, _ := grantWithToken(ctx, t, r, existing.ID, mustUUID(t, client.Id))
+
+	// The consent decision's own write, left open: the grant insert's
+	// foreign-key check holds FOR KEY SHARE on the client row.
+	consent, err := r.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = consent.Rollback(ctx) }()
+	added, err := r.mcpGrants.WithTx(consent).UpsertGrant(ctx, sqlcgen.UpsertMCPOAuthGrantParams{
+		UserID: consenting.ID, ClientID: mustUUID(t, client.Id), Scopes: []string{"mcp:read"}, Resource: "http://localhost:8080/mcp",
+		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("consent's grant: %v", err)
+	}
+
+	var eg errgroup.Group
+	var status int
+	eg.Go(func() error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, r.server.URL+"/api/mcp-clients/"+client.Id, nil)
+		if err != nil {
+			return err
+		}
+		req.AddCookie(&http.Cookie{Name: platform.AuthSessionCookieName, Value: admin})
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return err
+		}
+		status = resp.StatusCode
+		return resp.Body.Close()
+	})
+
+	// Wait until the deletion is blocked behind the consent's lock.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		var waiting int
+		if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = consent.Rollback(ctx)
+			_ = eg.Wait()
+			t.Fatalf("the deletion never waited on the consent's lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := consent.Commit(ctx); err != nil {
+		t.Fatalf("commit consent: %v", err)
+	}
+	if err := eg.Wait(); err != nil {
+		t.Fatalf("DELETE: %v", err)
+	}
+	if status != http.StatusNoContent {
+		t.Fatalf("DELETE: status %d, want 204", status)
+	}
+
+	for name, id := range map[string]pgtype.UUID{"existing": existingGrant, "added by the concurrent consent": added.ID} {
+		if _, err := r.mcpGrants.GetGrant(ctx, id); !errors.Is(err, pgx.ErrNoRows) {
+			t.Errorf("%s grant after the deletion: err = %v, want deleted", name, err)
+		}
+		rows := mcpAuditRows(ctx, t, r, "mcp_authorization", id.String())
+		if len(rows) != 1 || rows[0].action != "mcp_authorization.revoked" || rows[0].detail["reason"] != "client_deleted" {
+			t.Errorf("%s grant audit rows = %+v, want one revocation with reason client_deleted", name, rows)
+		}
+	}
+	clientRows := mcpAuditRows(ctx, t, r, "mcp_client", client.Id)
+	if last := clientRows[len(clientRows)-1]; last.action != "mcp_client.deleted" || last.detail["revoked_authorizations"] != float64(2) {
+		t.Fatalf("client audit rows = %+v, want a final mcp_client.deleted counting 2 revocations", clientRows)
 	}
 }
 

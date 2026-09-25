@@ -195,6 +195,19 @@ func DeleteMCPClient(pool *pgxpool.Pool, clients *postgres.MCPOAuthClientStore, 
 		}
 		defer func() { _ = tx.Rollback(ctx) }()
 
+		// Lock the client row first: a consent adding a grant under it
+		// either finishes before the list below (and is listed) or waits
+		// until the client is gone (and fails its foreign key). Without
+		// the lock, a grant committed between the list and the cascade
+		// would be deleted with no revocation audit row.
+		if _, err := clients.WithTx(tx).Lock(ctx, clientID); errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "client not found")
+			return
+		} else if err != nil {
+			logger.Error("httpapi: delete mcp client: lock client failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
 		affected, err := grants.WithTx(tx).ListGrantsForClient(ctx, clientID)
 		if err != nil {
 			logger.Error("httpapi: delete mcp client: list grants failed", "error", err)

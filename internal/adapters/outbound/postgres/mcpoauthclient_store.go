@@ -56,6 +56,14 @@ func (s *MCPOAuthClientStore) List(ctx context.Context) ([]sqlcgen.McpOauthClien
 	return s.q.ListMCPOAuthClients(ctx)
 }
 
+// Lock takes the client row's FOR UPDATE lock for the rest of the
+// transaction (queries/mcp_oauth_clients.sql's own doc comment): no grant
+// can be added under the client until it ends. pgx.ErrNoRows means no
+// such client.
+func (s *MCPOAuthClientStore) Lock(ctx context.Context, id pgtype.UUID) (sqlcgen.McpOauthClient, error) {
+	return s.q.LockMCPOAuthClient(ctx, id)
+}
+
 // Delete removes a client by internal id and returns the deleted row
 // (pgx.ErrNoRows when there was none). Every grant, pending authorization
 // request, code and access token issued to the client cascades with it.
