@@ -32,13 +32,17 @@ var routeLineRE = regexp.MustCompile(`^[A-Z]+ /\S*$`)
 // /api/ (/oauth/*, /.well-known/*, /mcp, /auth/*, /webhooks/*,
 // /sessions/{sessionID}/*, /health) has a consumer outside the running
 // build just as surely as an /api/ one does -- a third-party MCP client,
-// an OAuth provider or webhook sender configured with the URL, an older
-// sandbox-agent mid rolling deploy, a health probe. This used to read the
+// a cloud token service reading the issuer's discovery documents, an
+// OAuth provider or webhook sender configured with the URL, the browser,
+// an older sandbox-agent mid rolling deploy, a health probe -- and GET
+// /sessions/{sessionID}/ws is both the sandbox-agent's socket and the
+// client-ws/v1 socket offered to third parties. This used to read the
 // /api/ rows only and skip every other line, so such a route could be
 // added, removed, or re-methoded with no VERSION bump and no CHANGELOG
 // entry at all, contradicting COMPATIBILITY.md's own VERSION/CHANGELOG
-// discipline. COMPATIBILITY.md's "What is covered" section and rows 40/41
-// say the same thing in prose.
+// discipline. COMPATIBILITY.md's "What is covered" section (which names
+// the consumers class by class) and rows 40/41 say the same thing in
+// prose.
 //
 // Fail closed: a line on either side that is not exactly "METHOD /path"
 // (routeLineRE), or that repeats an earlier line, is a FAIL-CLOSED

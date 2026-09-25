@@ -17,13 +17,42 @@ changing the code and this file together, in one PR.
   entry, AND the REST route table itself (the `/api/` rows of
   `controlplane/testdata/routes.golden`).
 - The rest of `controlplane/testdata/routes.golden` — every route the
-  control plane serves outside `/api/`: `/.well-known/*`, `/oauth/*` and
-  `/mcp` (called by third-party MCP clients), `/auth/*` and `/webhooks/*`
-  (registered with OAuth providers and webhook senders),
-  `/sessions/{sessionID}/*` (called by the sandbox-agent, an older one
-  included during a rolling deploy), and `/health` (probes). Each has a
-  consumer outside the running build, so each row is graded exactly like
-  an `/api/` row — see "Routes" below.
+  control plane serves outside `/api/`. Each has a consumer outside the
+  running build, so each row is graded exactly like an `/api/` row — see
+  "Routes" below. The consumers, class by class:
+  - `/mcp`, `/.well-known/oauth-protected-resource/mcp`,
+    `/.well-known/oauth-authorization-server/oauth` and `/oauth/*` — the
+    MCP surface and its authorization server, used by third-party MCP
+    clients. The client calls `/oauth/token` and `/oauth/revoke` itself;
+    `/oauth/authorize` and `/oauth/consent` are opened in the user's
+    browser during the client's sign-in.
+  - `/.well-known/openid-configuration` and `/.well-known/jwks.json` — the
+    cloud-identity issuer's discovery documents, fetched with no
+    credential by a cloud provider's token service during workload
+    identity federation.
+  - `/auth/*` — browser sign-in and account linking. Each
+    `/auth/*/callback` row is a redirect URI registered with that OAuth or
+    OIDC provider; `/auth/*/login` and `/auth/*/install` are opened in the
+    browser;
+    `/auth/capabilities` and `/auth/logout` are called by the SPA; and
+    `/auth/identity-link/{nonce}` is a link posted in a chat or
+    issue-tracker message and opened in a browser.
+  - `/webhooks/*` — URLs registered with webhook senders: each provider's
+    own `/webhooks/<provider>` rows (sub-paths included) with that
+    provider, and `/webhooks/automations/{automationID}` with whatever
+    external system an automation's owner handed the URL and its token to.
+  - `GET /sessions/{sessionID}/ws` — one route carrying two protocols.
+    With `?type=sandbox` it is the sandbox-agent's socket
+    (`sandbox-ws/v1`); with `?type=client` it is the browser's socket
+    (`client-ws/v1`), which "Who this governs" below offers to third
+    parties. This row is therefore in the third-party class, not only the
+    sandbox one.
+  - Every other `/sessions/{sessionID}/*` row (credentials, config,
+    snapshot, verdict, outcome and findings reports, uploads) —
+    sandbox-agent callbacks, authenticated by the sandbox's bearer token
+    and called by whichever sandbox-agent is running, an older one
+    included during a rolling deploy.
+  - `/health` — health probes.
 - `client-ws/v1/protocol.schema.json` — the browser↔control-plane
   WebSocket protocol (subscribe/fetch-history requests and their
   responses).

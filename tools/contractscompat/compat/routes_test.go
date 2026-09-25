@@ -7,8 +7,9 @@ import (
 
 // routesGoldenFixture is a slice of the real controlplane/testdata/
 // routes.golden, byte order and all: /api/ rows mixed with the non-/api/
-// rows (well-known metadata, the MCP endpoint, OAuth, sandbox callbacks,
-// the health probe) that DiffRoutes used to skip without a finding.
+// rows (well-known metadata, the MCP endpoint, OAuth, the socket the
+// sandbox-agent and client-ws clients share, the health probe) that
+// DiffRoutes used to skip without a finding.
 const routesGoldenFixture = "GET /.well-known/oauth-protected-resource/mcp\n" +
 	"GET /api/sessions\n" +
 	"GET /health\n" +
