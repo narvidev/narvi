@@ -14,7 +14,9 @@ const disabledBody = `{"error":"this capability is not enabled on this deploymen
 
 // RequireEnabled returns chi middleware that answers 503 for the ENTIRE
 // /mcp route group whenever enabled is false (technical plan §43.11).
-// Mounted FIRST in the group's own middleware chain -- BEFORE auth.
+// Mounted SECOND in the group's own middleware chain -- after
+// mcp.RequireTrustedOrigin (§43.2/§43.6: an invalid Origin is refused 403
+// unconditionally, before this gate ever runs), but still BEFORE auth.
 // Middleware -- so a deployment that has not opted in never touches the
 // session store at all for this surface, mirroring the OIDC routes' own
 // "503 unauthenticated when unconfigured" precedent (§43 D9). The route

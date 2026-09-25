@@ -6638,12 +6638,20 @@ the MCP authorization spec itself forbids); a new personal-API-token table (a th
 181's OAuth surface would then have to reconcile against); reusing the per-session WS token (per-session,
 not per-user-surface, and consumed by a WS frame, not an HTTP header). Because this surface is
 cookie-authenticated, it additionally needs what a `POST /api/**` route gets for free from `SameSite=Lax`:
-`Origin` validation (`net/http.CrossOriginProtection`, trusting only the origin of `cfg.PublicBaseURL`) —
-a cross-site browser POST is refused 403; a request with no `Origin`/`Sec-Fetch-Site` header at all
-(every non-browser MCP client) passes. This check is mounted as its OWN chi middleware, first in the
-route group's own chain, before the enabled-gate or the auth gate (§43.6) — the Streamable HTTP
-transport spec's own "MUST respond with HTTP 403 Forbidden" for an invalid Origin is unconditional, not
-"once the surface is known to be enabled" or "once the caller is authenticated".
+`Origin` validation — an Origin header, if present, must resolve to EXACTLY the origin of
+`cfg.PublicBaseURL`, or the request is refused 403; a request with no `Origin` header at all (every
+non-browser MCP client) passes. `RequireTrustedOrigin` performs this comparison directly rather than
+delegating to `net/http.CrossOriginProtection` (which `NewHandler`'s own returned handler still wires in
+as a second, defense-in-depth layer): that stdlib type exempts a request whose `Sec-Fetch-Site` reads
+"same-origin"/"none", and — load-bearing — a request whose Origin equals its own Host header, checked
+BEFORE its trusted-origin list is ever consulted. That second shape is exactly a DNS-rebinding request
+(an attacker-controlled hostname resolved to this deployment's own IP), which a round 2 review of this
+Step's own fix caught passing through as 503/401 instead of 403 (finding N12) — closed by comparing
+directly against `cfg.PublicBaseURL`'s own origin with no exemption at all. This check is mounted as its
+OWN chi middleware, first in the route group's own chain, before the enabled-gate or the auth gate
+(§43.6) — the Streamable HTTP transport spec's own "MUST respond with HTTP 403 Forbidden" for an invalid
+Origin is unconditional, not "once the surface is known to be enabled" or "once the caller is
+authenticated".
 
 ### 43.3 Transport: stateless Streamable HTTP
 
@@ -6653,17 +6661,30 @@ the current protocol revision is served only in stateless mode by the pinned SDK
 is declared stateless, and a protocol-level session table would be a second authority over state
 (§5.1 forbids exactly that). `JSONResponse: true`: every 180 tool is a short DB read, so a plain
 `application/json` response avoids SSE plumbing and keep-alive timers entirely — no new
-`platform/timeouts.go` constant for this Step. The request body is capped at the same figure every REST
-body in this codebase already is (`httpapi.MaxRequestBodyBytes`, exported for this reuse).
+`platform/timeouts.go` constant for this Step. The request body is capped at 64 KiB — deliberately far
+below `httpapi.MaxRequestBodyBytes`'s own 1 MiB (every other REST body this codebase decodes): a tool
+call's own arguments are a handful of small fields, never a file upload, so the larger cap bought no
+legitimate room, only attack surface. A round 2 review of this Step's own fix measured a single ~1 MiB
+legacy JSON-RPC batch request fanning out into roughly 8,000 concurrent twin invocations and a
+multi-gigabyte buffered reply before a single byte was written back (finding N2); this surface now
+refuses any batch (a body whose first non-whitespace byte is `[`) with a single JSON-RPC `-32600`
+"batching is not supported" error at its own gate, before the SDK ever sees it, and the shrunk cap also
+bounds an unrelated cost the same review found (a single huge JSON number literal costing over a second
+of CPU in the argument validator's own integer check, finding N7) to a small fraction of that.
 
 ### 43.4 Protocol versions and the version gate
 
 One constant is the single source of truth for which protocol revisions this deployment speaks, newest
-first: `2026-07-28` (current), `2025-11-25`, `2025-06-18`, `2025-03-26` (the legacy Streamable-HTTP
-revisions "existing MCP clients" — this row's own phrase — mostly still speak). `2024-11-05` is
-deliberately excluded: its transport is the deprecated HTTP+SSE pair, a second endpoint shape entirely,
-not merely a version this server negotiates on the one endpoint it has. This constant only NARROWS the
-official SDK's own broader default list, never widens it.
+first: `2026-07-28` (current), `2025-11-25`, `2025-06-18` (the legacy Streamable-HTTP revisions "existing
+MCP clients" — this row's own phrase — mostly still speak). `2025-03-26` is deliberately EXCLUDED (revised
+by a round 2 review of this Step's own fix, finding N2 — D4 originally included it): that revision's own
+spec text requires a Streamable HTTP server to accept a legacy JSON-RPC batch request, which the pinned
+SDK does unconditionally for any request it treats as pre-2025-06-18, with no option to disable; §43.3
+above covers why this surface now refuses every batch structurally. Claiming a revision while refusing
+part of what it requires would not be conformant, so the revision itself is dropped instead. `2024-11-05`
+is deliberately excluded for an unrelated, original reason: its transport is the deprecated HTTP+SSE pair,
+a second endpoint shape entirely, not merely a version this server negotiates on the one endpoint it has.
+This constant only NARROWS the official SDK's own broader default list, never widens it.
 
 A request whose `MCP-Protocol-Version` header names a version outside that list is refused before the
 SDK ever sees it: HTTP 400, JSON-RPC code `-32022`, with `data.supported`/`data.requested` and a message
@@ -6804,11 +6825,13 @@ server also speaks, which restrict `Tool.outputSchema` to `type:"object"` at the
 
 A boolean environment variable, optional, default false, parsed with the same "empty means unset, parse
 only when present, reject anything the parser does not recognize" idiom every sibling boolean flag in
-this codebase already uses. The gate gets its own chi middleware, mounted FIRST in the route group's own
-chain (§43.6), answering 503 with the same body every other disabled-capability gate in this codebase
-already answers with. Because the route is mounted unconditionally, the route table, the guide-omission
-register, and the wire-contracts compatibility check all see the same table whether the flag is on or
-off. 181 does not change this default; enabling the surface is a per-deployment operator act.
+this codebase already uses. The gate gets its own chi middleware, mounted SECOND in the route group's own
+chain — after the Origin gate (§43.2/§43.6: an invalid Origin is refused 403 unconditionally, whatever
+this flag's value, so no later gate including this one may run first) — answering 503 with the same body
+every other disabled-capability gate in this codebase already answers with. Because the route is mounted
+unconditionally, the route table, the guide-omission register, and the wire-contracts compatibility check
+all see the same table whether the flag is on or off. 181 does not change this default; enabling the
+surface is a per-deployment operator act.
 
 ### 43.12 Tests
 

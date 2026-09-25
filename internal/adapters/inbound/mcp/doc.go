@@ -86,9 +86,11 @@
 // claim was never true on the AddTool path this package actually calls;
 // see git history for the correction. validateArguments is this package
 // acting as that caller: every tool's raw arguments are validated, once,
-// against that SAME tool's own contracts $def (enum, minimum/maximum,
-// format:"uuid", additionalProperties:false, all of it) before
-// BuildRequest or the twin ever sees them.
+// against that SAME tool's own contracts $def (enum, minimum,
+// format:"uuid", additionalProperties:false, all of it -- deliberately
+// NOT "maximum": no $def in this bundle declares that keyword; §43.10
+// explains why ListSessionsToolRequest.limit carries no upper bound)
+// before BuildRequest or the twin ever sees them.
 //
 // # HTTP outcome -> MCP outcome (outcome.go)
 //
