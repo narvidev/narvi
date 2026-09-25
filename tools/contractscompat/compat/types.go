@@ -98,11 +98,14 @@ type Finding struct {
 	// Pointer is a JSON Pointer (RFC 6901), rooted at the schema file it
 	// was found in, e.g. "#/$defs/Session/properties/title". For a
 	// same-name change it points at the HEAD location; for a pure removal
-	// (nothing to point at in HEAD) it points at the BASE location.
+	// (nothing to point at in HEAD) it points at the BASE location. A
+	// routes.golden finding points at the route line itself instead, or
+	// at "<side> line <n>" for a line it refused to read.
 	Pointer string
 	// Surface is the contracts-relative file path the finding belongs to,
-	// e.g. "rest/v1/dtos.schema.json", or "" for a routes.golden or
-	// manifest/VERSION/CHANGELOG-level finding.
+	// e.g. "rest/v1/dtos.schema.json", RoutesSurface for a routes.golden
+	// finding (which is what makes its CHANGELOG subsection required), or
+	// "" for a manifest/VERSION/CHANGELOG-level finding.
 	Surface string
 	Message string
 }
