@@ -9,7 +9,7 @@
 package leak
 
 import (
-	"github.com/narvidev/narvi/internal/adapters/outbound/postgres" // want `importing "github.com/narvidev/narvi/internal/adapters/outbound/postgres" is banned inside internal/adapters/inbound/mcp`
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres" // want `importing "github.com/narvidev/narvi/internal/adapters/outbound/postgres" is not on the allow-list for internal/adapters/inbound/mcp`
 )
 
 // Store stands for the dodge itself: a subpackage handing back a real
