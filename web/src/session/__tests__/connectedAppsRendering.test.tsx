@@ -77,8 +77,10 @@ describe('ConnectedAppRow', () => {
     expect(renderAuthorization(baseAuthorization())).toContain('>never<')
   })
 
-  it('a scope-less authorization says it sees no tools', () => {
-    expect(renderAuthorization(baseAuthorization({ scopes: [] }))).toContain('No access (sees no tools)')
+  it('a scope-less last approval says so, never that the app has no access', () => {
+    const html = renderAuthorization(baseAuthorization({ scopes: [] }))
+    expect(html).toContain('Last approved: no tools')
+    expect(html).not.toMatch(/no access/i)
   })
 
   it('a hostile client name renders as text', () => {

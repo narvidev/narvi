@@ -10,9 +10,12 @@ describe('connectedAppsFormat', () => {
     expect(scopeLabel('mcp:future')).toBe('mcp:future')
   })
 
-  it('scopesSummary states an empty grant plainly', () => {
-    expect(scopesSummary([])).toBe('No access (sees no tools)')
-    expect(scopesSummary(['mcp:read', 'mcp:write'])).toBe('Read models and sessions, Act on sessions')
+  it('scopesSummary describes the most recent approval, never the access an app holds now', () => {
+    expect(scopesSummary(['mcp:read', 'mcp:write'])).toBe('Last approved: Read models and sessions, Act on sessions')
+    // An earlier approval's token keeps its own scopes, so an empty last
+    // approval must not read as "no access".
+    expect(scopesSummary([])).toBe('Last approved: no tools')
+    expect(scopesSummary([])).not.toMatch(/no access/i)
   })
 
   it('clientIdentityLabel claims admin registration only for preregistered clients', () => {

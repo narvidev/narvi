@@ -22,10 +22,18 @@ export function scopeLabel(scope: string): string {
   }
 }
 
-/** scopesSummary renders an authorization's scopes; an empty list is stated plainly, since a scope-less app sees no tools at all. */
+/**
+ * scopesSummary renders what the user allowed an app in their MOST RECENT
+ * approval -- and says so, because it is not what the app can do now: each
+ * token the app already holds keeps the scopes approved when it was issued,
+ * and approving again never takes those back (technical plan §43.16). So an
+ * empty list reads "no tools" for that approval, never "No access": an
+ * earlier approval's token may still be live, and revoking is what withdraws
+ * it.
+ */
 export function scopesSummary(scopes: string[]): string {
-  if (scopes.length === 0) return 'No access (sees no tools)'
-  return scopes.map(scopeLabel).join(', ')
+  if (scopes.length === 0) return 'Last approved: no tools'
+  return `Last approved: ${scopes.map(scopeLabel).join(', ')}`
 }
 
 /**
