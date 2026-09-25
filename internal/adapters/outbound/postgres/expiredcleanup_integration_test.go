@@ -122,10 +122,12 @@ func TestRunExpiredTokenCleanup_DeletesExpiredLeavesLive(t *testing.T) {
 // TestExpiredCleanup_SweepsMCPRows proves the same tick also purges the MCP
 // authorization server's expired rows (technical plan §43.16): an expired
 // authorization request, code, access token, refresh token and grant are
-// deleted, while a live row of each survives untouched -- including a
-// live, already-rotated refresh token whose expired successor is swept
-// from under it (its superseded_by is cleared, the row itself kept so a
-// replay of it is still recognised).
+// deleted -- the refresh tokens rotated or not: an expired rotated one is
+// swept like any other, from in front of its live successor (the §43.19
+// "Table growth" row) -- while a live row of each survives untouched,
+// including a live, already-rotated refresh token whose expired successor
+// is swept from under it (its superseded_by is cleared, the row itself
+// kept so a replay of it is still recognised).
 func TestExpiredCleanup_SweepsMCPRows(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
@@ -212,24 +214,30 @@ func TestExpiredCleanup_SweepsMCPRows(t *testing.T) {
 	for _, rt := range []struct {
 		hash    string
 		expires pgtype.Timestamptz
-	}{{"expired-refresh", past}, {"live-refresh", future}, {"live-rotated-refresh", future}} {
+	}{{"expired-refresh", past}, {"live-refresh", future}, {"live-rotated-refresh", future}, {"expired-rotated-refresh", past}} {
 		if _, err := grants.CreateRefreshToken(ctx, sqlcgen.CreateMCPOAuthRefreshTokenParams{
 			GrantID: liveGrant, TokenHash: rt.hash, Resource: "http://127.0.0.1:9/mcp", ExpiresAt: rt.expires, ChainExpiresAt: rt.expires,
 		}); err != nil {
 			t.Fatalf("create refresh token %s: %v", rt.hash, err)
 		}
 	}
-	rotated, err := grants.GetRefreshTokenByHash(ctx, "live-rotated-refresh")
-	if err != nil {
-		t.Fatal(err)
+	// rotate rotates the refresh token hashed from into the one hashed to.
+	rotate := func(from, to string) {
+		t.Helper()
+		f, err := grants.GetRefreshTokenByHash(ctx, from)
+		if err != nil {
+			t.Fatal(err)
+		}
+		successor, err := grants.GetRefreshTokenByHash(ctx, to)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := grants.RotateRefreshToken(ctx, f.ID, successor.ID); err != nil {
+			t.Fatalf("rotate %s into %s: %v", from, to, err)
+		}
 	}
-	expiredSuccessor, err := grants.GetRefreshTokenByHash(ctx, "expired-refresh")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := grants.RotateRefreshToken(ctx, rotated.ID, expiredSuccessor.ID); err != nil {
-		t.Fatalf("rotate: %v", err)
-	}
+	rotate("live-rotated-refresh", "expired-refresh")
+	rotate("expired-rotated-refresh", "live-refresh")
 
 	cleanupCtx, cancel := context.WithCancel(ctx)
 	var eg errgroup.Group
@@ -272,6 +280,9 @@ func TestExpiredCleanup_SweepsMCPRows(t *testing.T) {
 	}
 	if _, err := grants.GetRefreshTokenByHash(ctx, "expired-refresh"); !errors.Is(err, pgx.ErrNoRows) {
 		t.Errorf("expired refresh token: err = %v, want pgx.ErrNoRows", err)
+	}
+	if _, err := grants.GetRefreshTokenByHash(ctx, "expired-rotated-refresh"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("expired rotated refresh token: err = %v, want pgx.ErrNoRows", err)
 	}
 	if _, err := grants.GetRefreshTokenByHash(ctx, "live-refresh"); err != nil {
 		t.Errorf("live refresh token: err = %v, want nil", err)
