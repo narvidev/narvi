@@ -70,7 +70,11 @@ func (s *Server) Revoke(w http.ResponseWriter, r *http.Request) {
 
 // revocableGrant finds the grant the token with this hash was issued
 // under: an access token or a refresh token, expired or rotated or not
-// (the client is giving it back either way), looked up in the order hint
+// (the client is giving it back either way) -- as long as its row exists:
+// the expired-credential sweep deletes an expired token's row within
+// ExpiredCredentialCleanupInterval of its expiry (a rotated refresh token
+// is kept until its own expiry), and a token swept is unknown here. Looked
+// up in the order hint
 // suggests -- "refresh_token" first for that hint, access tokens first
 // otherwise, including for a hint this server does not recognise (RFC 7009
 // section 2.1 lets a server ignore it). found is false when neither table
