@@ -7,7 +7,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"golang.org/x/sync/errgroup"
 )
@@ -261,23 +260,30 @@ func TestToolCall_ListSessions_InvalidLimitIsToolExecutionError(t *testing.T) {
 // entry this deployment still speaks reaches the argument validator with
 // this shape (not merely the legacy era). schemas.go's own
 // rejectOversizedNumbers now refuses any number token with an exponent
-// outside +/-20 BEFORE jsonschema.UnmarshalJSON/Schema.Validate ever
-// runs, so this must come back fast: comfortably faster than the ~50ms
-// baseline this same shape cost before the fix, with the twin never
-// invoked.
+// outside +/-maxJSONNumberExponent BEFORE jsonschema.UnmarshalJSON/
+// Schema.Validate ever runs.
+//
+// Round 4 review of PR #324, findings S1/S2: a prior revision of this
+// test asserted `elapsed > 25*time.Millisecond` as its own proof that the
+// pre-scan ran -- flaky under `go test -race` (the exact command CI
+// runs, Makefile/ci.yml), which alone costs more of that budget than the
+// refusal itself ever could, with no headroom on a loaded runner (2-9 of
+// 10 runs failed in reproduction, entirely from -race's own per-request
+// fixed overhead, never from the exponent check actually running slow).
+// The property this test needs is deterministic and needs no clock at
+// all: checkNumberTokenSize's own exponent check is the ONLY code path
+// that ever produces THIS EXACT text, for every one of these four
+// inputs. Disabling the pre-scan (verified against a modified copy of
+// this package) does not just make these four inputs slower -- it
+// changes what they answer: the real jsonschema validator refuses
+// "-1e1000000"/"1e-1000000" itself, with a *jsonschema.ValidationError's
+// own "- at '/limit': ..." text, and lets "1e1000000"/"1.5e1000000"
+// through to intFromJSONNumber's own "limit ... is not representable as
+// a bounded whole number" fallback -- never this message. Asserting this
+// exact text, with the twin never invoked, therefore pins the fix
+// exactly as precisely as the timing bound tried to, with no clock and
+// no flake.
 func TestToolCall_ExponentFormNumberIsRefusedCheaply(t *testing.T) {
-	// Warm up every package-level, process-lifetime-memoized cost this
-	// package pays exactly ONCE (schemas.go's own loadedRestDefs, plus
-	// whatever the jsonschema/encoding-json packages themselves memoize on
-	// first use) with one throwaway call, on a throwaway handler, BEFORE
-	// timing anything below -- otherwise, whichever subtest happens to run
-	// first (in this test alone, or in the whole suite, depending on
-	// -shuffle/order) would unfairly absorb that one-time cost, exactly
-	// the same "average of 5 requests after a warm-up" methodology the
-	// round 3 review's own reproduction used.
-	warmupHandler := newTestHandler(t, true, true, testTwins())
-	rawPost(t, warmupHandler, "/mcp", callToolBody(0, "narvi_list_sessions", `{"limit":5}`), callToolHeaders("narvi_list_sessions"))
-
 	for _, limit := range []string{"1e1000000", "1.5e1000000", "-1e1000000", "1e-1000000"} {
 		t.Run(limit, func(t *testing.T) {
 			invoked := false
@@ -292,9 +298,7 @@ func TestToolCall_ExponentFormNumberIsRefusedCheaply(t *testing.T) {
 			args := fmt.Sprintf(`{"limit":%s}`, limit)
 			body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"narvi_list_sessions","arguments":%s}}`, args)
 
-			start := time.Now()
 			status, respBody := rawPost(t, handler, "/mcp", body, nil)
-			elapsed := time.Since(start)
 
 			if invoked {
 				t.Fatalf("the twin was invoked for limit=%s -- an oversized exponent must be rejected by this package's own bridge first", limit)
@@ -309,8 +313,69 @@ func TestToolCall_ExponentFormNumberIsRefusedCheaply(t *testing.T) {
 			if env.Result == nil || !env.Result.IsError {
 				t.Fatalf("result = %+v, want IsError:true", env.Result)
 			}
-			if elapsed > 25*time.Millisecond {
-				t.Errorf("refusing limit=%s took %s, want well under the ~50ms this exact shape cost before the fix (three big.Rat.SetString computations of a ~2.3-million-bit natural) -- the whole point of rejectOversizedNumbers is to refuse BEFORE any of those ever runs", limit, elapsed)
+			wantText := fmt.Sprintf("invalid arguments: a number in the request arguments has an exponent outside +/-%d", maxJSONNumberExponent)
+			if len(env.Result.Content) != 1 || env.Result.Content[0].Text != wantText {
+				t.Fatalf("content = %+v, want a single text block = %q -- this EXACT text can only come from checkNumberTokenSize's own exponent check; the real (unfixed) jsonschema validator and intFromJSONNumber's own fallback both answer differently for this input", env.Result.Content, wantText)
+			}
+		})
+	}
+}
+
+// TestToolCall_OversizedNumberTokenLengthIsRefused pins schemas.go's own
+// checkNumberTokenSize LENGTH bound (maxJSONNumberTokenLen), separately
+// from its EXPONENT bound above (round 4 review of PR #324, finding S7):
+// every existing test exercising rejectOversizedNumbers used an
+// exponent-form literal, all comfortably under maxJSONNumberTokenLen, so
+// a mutant that disables the length check alone (`if len(text) >
+// maxJSONNumberTokenLen`) left the whole suite green. A 33-digit integer
+// and a long, all-zero decimal (both plain JSON integers, neither one
+// carrying an 'e'/'E' at all) are refused by the LENGTH check alone.
+// Verified against a modified copy of this package with the length check
+// disabled: the 33-digit literal is then refused with a DIFFERENT
+// message (intFromJSONNumber's own "is not representable" fallback,
+// since santhosh-tekuri/jsonschema/v6's own "integer"/"minimum" checks
+// both accept it), and the long decimal -- which denotes the plain,
+// perfectly ordinary integer 1 -- is no longer refused AT ALL.
+func TestToolCall_OversizedNumberTokenLengthIsRefused(t *testing.T) {
+	tests := []struct {
+		name  string
+		limit string
+	}{
+		{"33-digit integer (one character over the bound)", strings.Repeat("7", maxJSONNumberTokenLen+1)},
+		{"long all-zero decimal (denotes the plain integer 1, but its own token text is over the bound)", "1." + strings.Repeat("0", maxJSONNumberTokenLen)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			invoked := false
+			twins := testTwins()
+			twins.ListSessions = func(w http.ResponseWriter, _ *http.Request) {
+				invoked = true
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"sessions":[]}`))
+			}
+			handler := newTestHandler(t, true, true, twins)
+
+			args := fmt.Sprintf(`{"limit":%s}`, tt.limit)
+			body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"narvi_list_sessions","arguments":%s}}`, args)
+
+			status, respBody := rawPost(t, handler, "/mcp", body, nil)
+
+			if invoked {
+				t.Fatalf("the twin was invoked for limit=%s -- an oversized number token must be rejected by this package's own bridge first", tt.limit)
+			}
+			if status != http.StatusOK {
+				t.Fatalf("status = %d, body = %s, want 200 (isError:true is a SUCCESSFUL JSON-RPC response)", status, respBody)
+			}
+			var env callToolResultEnvelope
+			if err := json.Unmarshal(respBody, &env); err != nil {
+				t.Fatalf("unmarshal: %v (body: %s)", err, respBody)
+			}
+			if env.Result == nil || !env.Result.IsError {
+				t.Fatalf("result = %+v, want IsError:true", env.Result)
+			}
+			wantText := fmt.Sprintf("invalid arguments: a number in the request arguments is too long (%d characters, max %d)", len(tt.limit), maxJSONNumberTokenLen)
+			if len(env.Result.Content) != 1 || env.Result.Content[0].Text != wantText {
+				t.Fatalf("content = %+v, want a single text block = %q", env.Result.Content, wantText)
 			}
 		})
 	}

@@ -204,6 +204,108 @@ func TestOrigin_NearMissesRefused(t *testing.T) {
 	}
 }
 
+// TestOrigin_HTTPSDefaultPortAndIPv6TrustedOrigin extends
+// TestOrigin_NearMissesRefused's own table along two dimensions it never
+// covers (round 4 review of PR #324, finding S8): every case in that
+// table -- and every other unit test in this package -- trusts
+// testPublicBaseURL ("http://example.test"), so canonicalOrigin's own
+// https default-port branch (handler.go's defaultPortFor("https") ==
+// "443") and its IPv6 re-bracketing were never exercised against a real
+// RequireTrustedOrigin/NewHandler pair built from a base URL that
+// actually needs either one. Mutation-verified against modified copies of
+// handler.go: making defaultPortFor return "80" for "https" flips BOTH
+// https cases below (accepts :80, refuses :443); deleting the IPv6
+// re-bracketing (`if strings.Contains(host, ":") { host = "[" + host +
+// "]" }`) makes NewHandler itself fail to construct for the IPv6 base,
+// asserted directly below.
+func TestOrigin_HTTPSDefaultPortAndIPv6TrustedOrigin(t *testing.T) {
+	t.Run("https trusted origin", func(t *testing.T) {
+		const httpsBase = "https://narvi.example"
+		cases := []struct {
+			name    string
+			origin  string
+			refused bool
+		}{
+			{"exact trusted origin, no port", httpsBase, false},
+			{"explicit default port (:443) equals implicit", "https://narvi.example:443", false},
+			{"explicit non-default port (:80)", "https://narvi.example:80", true},
+		}
+		for _, gate := range []struct {
+			name          string
+			enabled, auth bool
+		}{
+			{"disabled", false, true},
+			{"unauthenticated", true, false},
+		} {
+			t.Run(gate.name, func(t *testing.T) {
+				handler := newTestHandlerWithBaseURL(t, gate.enabled, gate.auth, testTwins(), httpsBase)
+				for _, tc := range cases {
+					t.Run(tc.name, func(t *testing.T) {
+						status, body := rawPost(t, handler, "/mcp", `{}`, map[string]string{"Origin": tc.origin})
+						if tc.refused {
+							if status != http.StatusForbidden {
+								t.Fatalf("Origin %q: status = %d, body = %s, want 403 (refused)", tc.origin, status, body)
+							}
+							return
+						}
+						if status == http.StatusForbidden {
+							t.Fatalf("Origin %q: status = %d, body = %s, want NOT 403 (this origin must pass RequireTrustedOrigin)", tc.origin, status, body)
+						}
+					})
+				}
+			})
+		}
+	})
+
+	t.Run("IPv6 trusted origin", func(t *testing.T) {
+		const ipv6Base = "https://[::1]:8443"
+
+		// NewHandler must actually SUCCEED booting against an IPv6
+		// PublicBaseURL: crossOriginProtection's own AddTrustedOrigin
+		// call re-parses canonicalOrigin's serialized origin, which is
+		// no longer a valid authority (a bare "::1:8443", indistinguishable
+		// from a host with an extra port segment) the instant the IPv6
+		// literal's own brackets are dropped.
+		if _, err := NewHandler(Config{PublicBaseURL: ipv6Base}, testTwins()); err != nil {
+			t.Fatalf("NewHandler(Config{PublicBaseURL: %q}) = %v, want nil -- a deployment configured with an IPv6 PublicBaseURL must still boot", ipv6Base, err)
+		}
+
+		cases := []struct {
+			name    string
+			origin  string
+			refused bool
+		}{
+			{"exact trusted IPv6 origin", ipv6Base, false},
+			{"a DIFFERENT IPv6 host that only looks similar once brackets are lost", "https://[::1:8443]", true},
+		}
+		for _, gate := range []struct {
+			name          string
+			enabled, auth bool
+		}{
+			{"disabled", false, true},
+			{"unauthenticated", true, false},
+		} {
+			t.Run(gate.name, func(t *testing.T) {
+				handler := newTestHandlerWithBaseURL(t, gate.enabled, gate.auth, testTwins(), ipv6Base)
+				for _, tc := range cases {
+					t.Run(tc.name, func(t *testing.T) {
+						status, body := rawPost(t, handler, "/mcp", `{}`, map[string]string{"Origin": tc.origin})
+						if tc.refused {
+							if status != http.StatusForbidden {
+								t.Fatalf("Origin %q: status = %d, body = %s, want 403 (refused)", tc.origin, status, body)
+							}
+							return
+						}
+						if status == http.StatusForbidden {
+							t.Fatalf("Origin %q: status = %d, body = %s, want NOT 403 (this origin must pass RequireTrustedOrigin)", tc.origin, status, body)
+						}
+					})
+				}
+			})
+		}
+	})
+}
+
 // TestOrigin_AbsentOriginCrossSiteFetchMetadataRefused pins the other
 // half of finding R4: RequireTrustedOrigin's own doc comment (and
 // technical plan §43.2) claim "a request with no Origin header at all
@@ -215,22 +317,52 @@ func TestOrigin_NearMissesRefused(t *testing.T) {
 // be refused exactly like a bad Origin would be. A request with NEITHER
 // header (the ordinary non-browser MCP client this surface targets) still
 // passes.
+//
+// Round 4 review of PR #324, finding S6: a prior revision of this test
+// built its handler with newTestHandler(t, true, true, ...) (enabled AND
+// authenticated) -- the ONE gate state in which a request that clears
+// RequireTrustedOrigin goes on to reach NewHandler's own SEPARATE, inner
+// net/http CrossOriginProtection layer (handler.go's own doc comment),
+// which refuses a cross-site Sec-Fetch-Site request entirely on its own,
+// with its own 403 and its own plain-text body. Deleting
+// RequireTrustedOrigin's own absent-Origin check therefore left this test
+// green: the inner SDK layer answered the same 403 the test asserted,
+// for a completely different reason. Mirroring
+// TestOrigin_NearMissesRefused's own "disabled or unauthenticated, never
+// enabled+authenticated" discipline (that test's own doc comment) drives
+// the request through RequireTrustedOrigin ALONE -- the later gates
+// answer 503/401 for a trusted origin instead of ever reaching the inner
+// layer -- so this test can only pass because RequireTrustedOrigin
+// itself, not the SDK's own masking layer, produced the 403.
 func TestOrigin_AbsentOriginCrossSiteFetchMetadataRefused(t *testing.T) {
-	handler := newTestHandler(t, true, true, testTwins())
+	for _, gate := range []struct {
+		name          string
+		enabled, auth bool
+	}{
+		{"disabled", false, true},
+		{"unauthenticated", true, false},
+	} {
+		t.Run(gate.name, func(t *testing.T) {
+			handler := newTestHandler(t, gate.enabled, gate.auth, testTwins())
 
-	t.Run("no Origin, Sec-Fetch-Site: cross-site -> refused", func(t *testing.T) {
-		status, body := rawPost(t, handler, "/mcp", `{}`, map[string]string{"Sec-Fetch-Site": "cross-site"})
-		if status != http.StatusForbidden {
-			t.Fatalf("status = %d, body = %s, want 403", status, body)
-		}
-	})
+			t.Run("no Origin, Sec-Fetch-Site: cross-site -> refused", func(t *testing.T) {
+				status, body := rawPost(t, handler, "/mcp", `{}`, map[string]string{"Sec-Fetch-Site": "cross-site"})
+				if status != http.StatusForbidden {
+					t.Fatalf("status = %d, body = %s, want 403", status, body)
+				}
+				if string(body) != originForbiddenBody {
+					t.Fatalf("body = %s, want RequireTrustedOrigin's own %s -- a different body means some OTHER layer answered 403", body, originForbiddenBody)
+				}
+			})
 
-	t.Run("no Origin, no Sec-Fetch-Site -> passes (non-browser client)", func(t *testing.T) {
-		status, body := rawPost(t, handler, "/mcp", `{}`, nil)
-		if status == http.StatusForbidden {
-			t.Fatalf("status = %d, body = %s, want NOT 403", status, body)
-		}
-	})
+			t.Run("no Origin, no Sec-Fetch-Site -> passes (non-browser client)", func(t *testing.T) {
+				status, body := rawPost(t, handler, "/mcp", `{}`, nil)
+				if status == http.StatusForbidden {
+					t.Fatalf("status = %d, body = %s, want NOT 403", status, body)
+				}
+			})
+		})
+	}
 }
 
 // TestNewHandler_InnerCrossOriginProtection_RefusesCrossSite pins the fix

@@ -3,7 +3,9 @@ package mcp
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -245,5 +247,66 @@ func TestSupportedProtocolVersions_ExcludesBatchingEra(t *testing.T) {
 		if !strings.Contains(env.Error.Message, v) {
 			t.Errorf("error.message = %q does not name version %q", env.Error.Message, v)
 		}
+	}
+}
+
+// countingReadCloser wraps an io.Reader (never itself an io.ReadCloser)
+// so it can stand in for an http.Request's own Body while recording
+// exactly how many bytes were ever pulled out of it -- used below to
+// prove rejectBatches' own body read never runs past its own cap, rather
+// than merely asserting on the STATUS its cap produces.
+type countingReadCloser struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReadCloser) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
+}
+
+func (c *countingReadCloser) Close() error { return nil }
+
+// TestRejectBatches_OverCapBodyNeverFullyRead pins the fix for round 4
+// review of PR #324, finding S4: round 3's own fix (commit f5e2a50)
+// replaced rejectBatches' prior bounded 64-byte peek with a full
+// io.ReadAll of the request body, and added `r.Body =
+// http.MaxBytesReader(w, r.Body, MaxRequestBodyBytes)` immediately before
+// it -- that ONE line is now the only thing standing between rejectBatches
+// and buffering an ARBITRARILY large POST body into memory in full, since
+// every existing size test in this file (TestMaxRequestBodyBytes_*) drives
+// the request through the full newTestHandler stack, where the SDK's own
+// downstream StreamableHTTPOptions.MaxRequestBodyBytes answers the
+// identical 413 regardless of whether rejectBatches' own cap ever ran at
+// all. This test calls rejectBatches DIRECTLY -- bypassing that outer
+// cap entirely -- with an over-cap body wrapped in a countingReadCloser,
+// and asserts both the observable outcome (413, the SAME over-cap
+// response the SDK itself would answer) and the internal one no status
+// code alone can show: the reader was never pulled past
+// MaxRequestBodyBytes+1 bytes (http.MaxBytesReader's own documented
+// "reads one byte more than the limit" contract). Mutation-verified:
+// deleting the MaxBytesReader line makes rejectBatches read the ENTIRE
+// body (tens of megabytes) before ever answering, and the status changes
+// from 413 to 400 (writeBatchRejected, since the oversized body here is
+// itself a legacy batch array).
+func TestRejectBatches_OverCapBodyNeverFullyRead(t *testing.T) {
+	next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("next handler invoked -- an over-cap body must be refused before ever reaching it")
+	})
+	handler := rejectBatches(next)
+
+	overCapBody := "[" + strings.Repeat(" ", 2*MaxRequestBodyBytes) + "]"
+	body := &countingReadCloser{r: strings.NewReader(overCapBody)}
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp", body)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, body = %s, want %d (the same over-cap response the SDK's own StreamableHTTPOptions.MaxRequestBodyBytes would answer)", rec.Code, rec.Body.String(), http.StatusRequestEntityTooLarge)
+	}
+	if body.n > MaxRequestBodyBytes+1 {
+		t.Errorf("rejectBatches read %d bytes from an over-cap body, want at most MaxRequestBodyBytes+1 (%d) -- http.MaxBytesReader's own cap must be what stops this read, never a full io.ReadAll of the whole body", body.n, MaxRequestBodyBytes+1)
 	}
 }

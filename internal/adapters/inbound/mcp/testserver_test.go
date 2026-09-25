@@ -77,10 +77,24 @@ const testPublicBaseURL = "http://example.test"
 // distinct from its *_integration_test.go rig, which DOES dial a real
 // httptest.Server -- already avoid them), substituting only auth.
 // Middleware's own Postgres-backed check for fakeAuth's equivalent,
-// dependency-free one.
+// dependency-free one. Every unit test in this file and its siblings
+// trusts testPublicBaseURL; a test that needs a DIFFERENT trusted origin
+// (e.g. an https or IPv6 PublicBaseURL -- round 4 review of PR #324,
+// finding S8) calls newTestHandlerWithBaseURL directly instead.
 func newTestHandler(t testing.TB, enabled, authenticated bool, twins Twins) http.Handler {
 	t.Helper()
-	cfg := Config{PublicBaseURL: testPublicBaseURL}
+	return newTestHandlerWithBaseURL(t, enabled, authenticated, twins, testPublicBaseURL)
+}
+
+// newTestHandlerWithBaseURL is newTestHandler, parameterized on
+// PublicBaseURL -- round 4 review of PR #324, finding S8: every existing
+// unit test trusts "http://example.test", so canonicalOrigin's own IPv6
+// re-bracketing and its https default-port branch (handler.go) were
+// never exercised through a real RequireTrustedOrigin/NewHandler pair
+// built against a base URL that actually needs either one.
+func newTestHandlerWithBaseURL(t testing.TB, enabled, authenticated bool, twins Twins, baseURL string) http.Handler {
+	t.Helper()
+	cfg := Config{PublicBaseURL: baseURL}
 	originGate, err := RequireTrustedOrigin(cfg)
 	if err != nil {
 		t.Fatalf("RequireTrustedOrigin: %v", err)
