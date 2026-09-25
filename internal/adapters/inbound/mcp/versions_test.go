@@ -144,6 +144,56 @@ func TestVersionGate_AbsentHeaderPassesThrough(t *testing.T) {
 	}
 }
 
+// TestVersionGate_FutureVersionRefusedWithMessage pins the case round 2
+// review finding N16 found untested: every OTHER refusal test in this
+// package uses a header OLDER than the current revision ("1900-01-01"),
+// which happens to work whether versionGate compares by SET MEMBERSHIP
+// (isSupportedVersion, the real check) or by some other rule entirely, so
+// none of them can tell those two apart. A NEWER-than-current header
+// (here, "2099-01-01" -- the likeliest real-world mismatch, a client
+// built against a future revision this deployment does not speak yet)
+// must be refused exactly the same way: -32022, HTTP 400, a message
+// naming every version this server actually speaks. Without this test, a
+// mutant that only refused OLDER-than-current versions (e.g. comparing
+// against SupportedProtocolVersions[0] instead of set membership) would
+// let a future version fall through to the SDK's own -32022, whose fixed
+// message names none of them -- the exact gap the exit criterion
+// ("a message naming the versions it does") exists to close.
+func TestVersionGate_FutureVersionRefusedWithMessage(t *testing.T) {
+	var called bool
+	gate := versionGate(passthroughHandler(&called))
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":3,"method":"tools/list"}`))
+	req.Header.Set(protocolVersionHeader, "2099-01-01")
+	rec := httptest.NewRecorder()
+	gate.ServeHTTP(rec, req)
+
+	if called {
+		t.Fatal("versionGate passed a future, unsupported version through to next")
+	}
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+	var body versionRefusalBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v (body: %s)", err, rec.Body.String())
+	}
+	if body.Error.Code != codeUnsupportedProtocolVersion {
+		t.Errorf("error.code = %d, want %d", body.Error.Code, codeUnsupportedProtocolVersion)
+	}
+	if body.Error.Data.Requested != "2099-01-01" {
+		t.Errorf("error.data.requested = %q, want %q", body.Error.Data.Requested, "2099-01-01")
+	}
+	if !slices.Equal(body.Error.Data.Supported, SupportedProtocolVersions) {
+		t.Errorf("error.data.supported = %v, want %v", body.Error.Data.Supported, SupportedProtocolVersions)
+	}
+	for _, v := range SupportedProtocolVersions {
+		if !strings.Contains(body.Error.Message, v) {
+			t.Errorf("error.message = %q does not name version %q", body.Error.Message, v)
+		}
+	}
+}
+
 // TestSupportedProtocolVersions_ExcludesDeprecatedSSEEra pins §43 D4:
 // 2024-11-05 (the deprecated HTTP+SSE transport era) is deliberately not
 // in the list.
