@@ -237,7 +237,8 @@ func boolPtr(b bool) *bool { return &b }
 // toolInputDefs returns every 180 tool's own InputDef name, in table
 // order -- the exact, complete set NewHandler must compile EAGERLY at
 // boot (schemas.go's own compileInputSchemas doc comment) before this
-// build can serve a single /mcp request.
+// build can serve a single /mcp request, and the set newHandler
+// (handler.go) refuses to build a handler without.
 func toolInputDefs() []string {
 	specs := toolSpecs(Twins{})
 	defs := make([]string, len(specs))
@@ -251,8 +252,9 @@ func toolInputDefs() []string {
 // over ctx (the authenticated MCP HTTP request's own context -- see
 // getServer's doc comment for why THIS context, not the one the SDK
 // passes into the handler at call time, is what callTwin receives) and
-// inputSchemas (NewHandler's own eagerly-compiled map, schemas.go's
-// compileInputSchemas -- built once, at boot, never written to again, so
+// inputSchemas (newHandler's private copy of the map NewHandler compiled
+// eagerly at boot with schemas.go's compileInputSchemas -- complete,
+// checked and copied once at construction, never written to again, so
 // reading it concurrently from every tool call needs no lock).
 //
 // Deliberately the RAW, non-generic sdkmcp.ToolHandler API (Server.
@@ -303,10 +305,13 @@ func (spec toolSpec) toolHandler(ctx context.Context, inputSchemas map[string]*j
 		//
 		// schema is looked up, never compiled, here: inputSchemas was
 		// built once, eagerly, by NewHandler at boot (compileInputSchemas'
-		// own doc comment) -- every name toolInputDefs() names is
-		// guaranteed present, so a miss here is this package's own
-		// defect (a spec.InputDef with no matching table entry), not a
-		// legitimate per-request outcome.
+		// own doc comment), and newHandler refuses to build a handler
+		// whose map lacks a non-nil entry for any name toolInputDefs()
+		// returns -- so no handler it built ever reaches this branch. It
+		// stays as a defensive refusal for any other caller: a miss is
+		// this package's own defect, answered -32603 without invoking
+		// the twin and without compiling anything
+		// (TestToolHandler_MissingSchemaIsRefusedWithoutCompiling).
 		schema, ok := inputSchemas[spec.InputDef]
 		if !ok {
 			platform.Logger(ctx).Error("mcp: no compiled input schema for tool (toolInputDefs/toolSpecs drifted apart?)",

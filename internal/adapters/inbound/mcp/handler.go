@@ -165,18 +165,51 @@ func writeOriginForbidden(w http.ResponseWriter) {
 // immutable map into every request's own *sdkmcp.Server (buildServer
 // below) is what removes the concurrent-first-call crash entirely,
 // rather than merely making it less likely.
+//
+// NewHandler does only that compile; newHandler below builds everything
+// else from the map it produces (round 6 review of PR #324, findings
+// U1/U2/U3).
 func NewHandler(cfg Config, twins Twins) (http.Handler, error) {
-	protection, err := crossOriginProtection(cfg)
-	if err != nil {
-		return nil, err
-	}
 	inputSchemas, err := compileInputSchemas(toolInputDefs())
 	if err != nil {
 		return nil, fmt.Errorf("mcp: compile tool input schemas: %w", err)
 	}
+	return newHandler(cfg, twins, inputSchemas)
+}
+
+// newHandler is NewHandler with its tool input schemas injected: the
+// middleware chain, the per-request closure, buildServer and
+// registerTools -- everything except the compile itself. It is the
+// outermost seam at which this package's tests can hand the real request
+// path a schema map of their own (toolhandler_test.go).
+//
+// It refuses to build a handler at all -- a boot failure, like a compile
+// error in NewHandler -- unless inputSchemas holds a non-nil
+// *jsonschema.Schema for every name toolInputDefs() returns, and every
+// request validates against a private copy of those entries taken here,
+// never against inputSchemas itself (copyCompleteInputSchemas). Two
+// things follow by construction:
+//
+//   - toolHandler's missing-schema branch (tools.go) is unreachable from
+//     any handler this function builds, so the request path never lacks
+//     a schema it might be tempted to go and compile;
+//   - the copy is reachable only through the per-request closure below,
+//     which hands it to buildServer -> registerTools -> toolHandler, and
+//     all three only read it -- so neither a caller changing its own map
+//     after this returns nor anything a request does can change what a
+//     later request validates against.
+func newHandler(cfg Config, twins Twins, inputSchemas map[string]*jsonschema.Schema) (http.Handler, error) {
+	protection, err := crossOriginProtection(cfg)
+	if err != nil {
+		return nil, err
+	}
+	schemas, err := copyCompleteInputSchemas(inputSchemas)
+	if err != nil {
+		return nil, err
+	}
 
 	sdkHandler := sdkmcp.NewStreamableHTTPHandler(
-		func(r *http.Request) *sdkmcp.Server { return buildServer(r, twins, inputSchemas) },
+		func(r *http.Request) *sdkmcp.Server { return buildServer(r, twins, schemas) },
 		&sdkmcp.StreamableHTTPOptions{
 			// Stateless (§43.3): the 2026-07-28 era is served ONLY in
 			// stateless mode by the pinned SDK, the protocol itself is
@@ -201,6 +234,26 @@ func NewHandler(cfg Config, twins Twins) (http.Handler, error) {
 	)
 
 	return rejectBatches(versionGate(sdkHandler)), nil
+}
+
+// copyCompleteInputSchemas returns a fresh map holding inputSchemas'
+// entry for every name toolInputDefs() returns, or an error naming the
+// first such name whose entry is missing or nil. An entry for any other
+// name is not copied: no tool ever looks it up.
+func copyCompleteInputSchemas(inputSchemas map[string]*jsonschema.Schema) (map[string]*jsonschema.Schema, error) {
+	defs := toolInputDefs()
+	out := make(map[string]*jsonschema.Schema, len(defs))
+	for _, name := range defs {
+		sch, ok := inputSchemas[name]
+		if !ok {
+			return nil, fmt.Errorf("mcp: tool input schema map has no entry for %q", name)
+		}
+		if sch == nil {
+			return nil, fmt.Errorf("mcp: tool input schema map has a nil entry for %q", name)
+		}
+		out[name] = sch
+	}
+	return out, nil
 }
 
 // originOf parses rawURL (platform.Config.PublicBaseURL, or an incoming
