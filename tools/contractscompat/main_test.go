@@ -209,6 +209,43 @@ func TestCLINonGenesisModeOmitsDirectionNotice(t *testing.T) {
 	}
 }
 
+// TestCLINonAPIRouteChangeNeedsVersionBump is the end-to-end form of the
+// defect this test was added for: a routes.golden change outside /api/
+// (here, one OAuth route added), with VERSION and CHANGELOG untouched,
+// used to exit 0 with "no findings" -- the checker read the /api/ rows
+// only. It must exit 1, grading the route and demanding the bump.
+func TestCLINonAPIRouteChangeNeedsVersionBump(t *testing.T) {
+	fixture := writeContractsDir(t, "1.0.0", "## [1.0.0]\n", map[string]any{
+		"Widget": map[string]any{"type": "string"},
+	})
+	routesDir := t.TempDir()
+	baseRoutes := filepath.Join(routesDir, "base.golden")
+	headRoutes := filepath.Join(routesDir, "head.golden")
+	if err := os.WriteFile(baseRoutes, []byte("GET /api/sessions\nPOST /oauth/token\n"), 0o644); err != nil {
+		t.Fatalf("write base routes: %v", err)
+	}
+	if err := os.WriteFile(headRoutes, []byte("GET /api/sessions\nPOST /oauth/revoke\nPOST /oauth/token\n"), 0o644); err != nil {
+		t.Fatalf("write head routes: %v", err)
+	}
+
+	code, stdout, stderr := runCLI(t, []string{
+		"--base", fixture.dir, "--head", fixture.dir,
+		"--routes-base", baseRoutes, "--routes-head", headRoutes,
+	})
+	if code != 1 {
+		t.Fatalf("want exit 1 for a non-/api/ route added with no VERSION bump, got %d; stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	for _, want := range []string{
+		"[MINOR] rule 41 controlplane/testdata/routes.golden POST /oauth/revoke",
+		"[MAJOR] rule version-changelog",
+		"BREAKING",
+	} {
+		if !bytes.Contains([]byte(stdout), []byte(want)) {
+			t.Errorf("want %q in stdout, got %q", want, stdout)
+		}
+	}
+}
+
 // TestCLIExitNonZeroOnReadError pins the "genuine tool failure" half: a
 // BASE directory that does not exist at all must not be treated as the
 // genesis case (that only covers a MISSING manifest.json specifically,

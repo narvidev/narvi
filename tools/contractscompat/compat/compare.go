@@ -123,6 +123,16 @@ func Compare(in Input) (Report, error) {
 	all = append(all, DiffRoutes(in.BaseRoutes, in.HeadRoutes)...)
 
 	changedSurfaces := map[string]bool{}
+	// routes.golden is compared as a whole, not only through the route
+	// Findings DiffRoutes grades: COMPATIBILITY.md's VERSION/CHANGELOG
+	// discipline applies when the file "changed at all", so any byte of
+	// difference marks it changed -- the same `!bytes.Equal` rule a schema
+	// file gets below -- and CheckVersionAndChangelog then demands the
+	// bump and its own "### controlplane/testdata/routes.golden"
+	// subsection, whatever DiffRoutes itself did or did not report.
+	if !bytes.Equal(in.BaseRoutes, in.HeadRoutes) {
+		changedSurfaces[RoutesSurface] = true
+	}
 	forceMajorBump := false
 	for _, f := range all {
 		if f.Surface != "" {
