@@ -3,7 +3,8 @@
 -- program identifies itself as. client_id is the public identifier a
 -- client sends; id is the internal key every other mcp_oauth_* table
 -- references. DeleteMCPOAuthClient cascades every grant, pending
--- authorization request, code and access token issued to the client.
+-- authorization request, code, access token and refresh token issued to
+-- the client.
 
 -- name: CreateMCPOAuthClient :one
 INSERT INTO mcp_oauth_clients (client_id, kind, client_name, client_uri, redirect_uris, created_by)
@@ -24,9 +25,10 @@ ORDER BY created_at, id;
 
 -- LockMCPOAuthClient takes the client row's FOR UPDATE lock for the rest
 -- of the transaction. It conflicts with the FOR KEY SHARE lock every
--- consent decision and code exchange takes on the client before touching
--- anything under it (LockMCPOAuthClientKeyShare; the lock order is at the
--- top of mcpoauthgrant_store.go), and with the one a grant insert's
+-- consent decision, code exchange, refresh and grant revocation takes on
+-- the client before touching anything under it
+-- (LockMCPOAuthClientKeyShare; the lock order is at the top of
+-- mcpoauthgrant_store.go), and with the one a grant insert's
 -- foreign-key check takes: once it returns, an issuance that got there
 -- first has committed (and is visible to the next statement) or rolled
 -- back, and one that arrives later waits until this transaction ends.

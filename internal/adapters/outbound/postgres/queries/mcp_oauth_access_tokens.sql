@@ -27,6 +27,12 @@ JOIN mcp_oauth_clients c ON c.id = g.client_id
 JOIN users u ON u.id = g.user_id
 WHERE t.token_hash = $1;
 
+-- GetMCPOAuthAccessTokenByHash reads one access token row -- expired or
+-- not -- for POST /oauth/revoke, which only needs the grant it belongs to.
+-- name: GetMCPOAuthAccessTokenByHash :one
+SELECT * FROM mcp_oauth_access_tokens
+WHERE token_hash = $1;
+
 -- name: DeleteExpiredMCPOAuthAccessTokens :execrows
 DELETE FROM mcp_oauth_access_tokens
 WHERE expires_at < now();

@@ -69,6 +69,27 @@ func (q *Queries) DeleteExpiredMCPOAuthAccessTokens(ctx context.Context) (int64,
 	return result.RowsAffected(), nil
 }
 
+const getMCPOAuthAccessTokenByHash = `-- name: GetMCPOAuthAccessTokenByHash :one
+SELECT id, grant_id, token_hash, scopes, expires_at, created_at FROM mcp_oauth_access_tokens
+WHERE token_hash = $1
+`
+
+// GetMCPOAuthAccessTokenByHash reads one access token row -- expired or
+// not -- for POST /oauth/revoke, which only needs the grant it belongs to.
+func (q *Queries) GetMCPOAuthAccessTokenByHash(ctx context.Context, tokenHash string) (McpOauthAccessToken, error) {
+	row := q.db.QueryRow(ctx, getMCPOAuthAccessTokenByHash, tokenHash)
+	var i McpOauthAccessToken
+	err := row.Scan(
+		&i.ID,
+		&i.GrantID,
+		&i.TokenHash,
+		&i.Scopes,
+		&i.ExpiresAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const lookupMCPOAuthAccessToken = `-- name: LookupMCPOAuthAccessToken :one
 SELECT t.id AS token_id, t.expires_at AS token_expires_at, t.scopes AS token_scopes,
        g.id AS grant_id, g.resource, g.expires_at AS grant_expires_at, g.last_used_at,

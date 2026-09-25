@@ -1,7 +1,7 @@
 -- Queries backing MCPOAuthGrantStore's grant half (technical plan §43.16,
 -- migrations/000141_mcp_oauth.up.sql). A grant row exists iff the
--- authorization is live: deleting it IS revocation, and every code and
--- access token issued under it cascades with it.
+-- authorization is live: deleting it IS revocation, and every code,
+-- access token and refresh token issued under it cascades with it.
 --
 -- TouchMCPOAuthGrantLastUsed is the bearer check's own coalesced write:
 -- it only updates a row whose last_used_at is NULL or older than
@@ -13,9 +13,9 @@
 -- renews that row's resource and expiry in place and records the scopes
 -- just approved (same id, so the Connected apps list names the client
 -- once). The row's scopes are the most recent approval, for display
--- only: no authorization decision reads them -- every code and access
--- token carries its own scopes, fixed at issuance, so this update can
--- neither widen nor narrow a token issued earlier. created_at keeps the
+-- only: no authorization decision reads them -- every code, access token
+-- and refresh token carries its own scopes, fixed at issuance, so this
+-- update can neither widen nor narrow a credential issued earlier. created_at keeps the
 -- first approval's time.
 -- name: UpsertMCPOAuthGrant :one
 INSERT INTO mcp_oauth_grants (user_id, client_id, scopes, resource, expires_at)
@@ -29,11 +29,12 @@ SELECT * FROM mcp_oauth_grants
 WHERE id = $1;
 
 -- LockMCPOAuthGrantKeyShare takes the grant row's FOR KEY SHARE lock for
--- the rest of the transaction: the lock an access-token insert's own
--- foreign-key check would take anyway, taken FIRST, before the code
--- exchange consumes the code the token is issued for (the lock order at
--- the top of mcpoauthgrant_store.go). It conflicts only with the grant's
--- deletion, never with another exchange or a consent renewing the grant.
+-- the rest of the transaction: the lock a token insert's own foreign-key
+-- check would take anyway, taken FIRST, before the code exchange consumes
+-- its code or the refresh grant rotates its refresh token (the lock order
+-- at the top of mcpoauthgrant_store.go). It conflicts only with the
+-- grant's deletion, never with another exchange, another refresh, or a
+-- consent renewing the grant.
 -- name: LockMCPOAuthGrantKeyShare :one
 SELECT * FROM mcp_oauth_grants
 WHERE id = $1

@@ -2014,6 +2014,17 @@ type McpOauthGrant struct {
 	LastUsedAt pgtype.Timestamptz `json:"last_used_at"`
 }
 
+type McpOauthRefreshToken struct {
+	ID           pgtype.UUID        `json:"id"`
+	GrantID      pgtype.UUID        `json:"grant_id"`
+	TokenHash    string             `json:"token_hash"`
+	Scopes       []string           `json:"scopes"`
+	ExpiresAt    pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	RotatedAt    pgtype.Timestamptz `json:"rotated_at"`
+	SupersededBy pgtype.UUID        `json:"superseded_by"`
+}
+
 type OidcSigningKey struct {
 	Kid                 string             `json:"kid"`
 	PrivateKeyEncrypted []byte             `json:"private_key_encrypted"`
