@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 )
@@ -242,6 +243,74 @@ func TestToolCall_ListSessions_InvalidLimitIsToolExecutionError(t *testing.T) {
 			}
 			if env.Result == nil || !env.Result.IsError {
 				t.Fatalf("result = %+v, want IsError:true", env.Result)
+			}
+		})
+	}
+}
+
+// TestToolCall_ExponentFormNumberIsRefusedCheaply pins the fix for round
+// 3 review finding R5: an exponent-form JSON number like "1e1000000" is
+// only 9 bytes on the wire, but santhosh-tekuri/jsonschema/v6's own
+// integer check (util.go isInteger) and "minimum" check (validator.go
+// numValidate), plus this package's own intFromJSONNumber (tools.go),
+// each parse it through math/big.Rat.SetString -- whose own cost is set
+// by the number's MAGNITUDE, not its text length, so a value this short
+// measured ~50ms of CPU per request against the real stack (three
+// separate big.Rat computations of a ~2.3-million-BIT natural). Because
+// the request has no MCP-Protocol-Version header, every SupportedProtocolVersions
+// entry this deployment still speaks reaches the argument validator with
+// this shape (not merely the legacy era). schemas.go's own
+// rejectOversizedNumbers now refuses any number token with an exponent
+// outside +/-20 BEFORE jsonschema.UnmarshalJSON/Schema.Validate ever
+// runs, so this must come back fast: comfortably faster than the ~50ms
+// baseline this same shape cost before the fix, with the twin never
+// invoked.
+func TestToolCall_ExponentFormNumberIsRefusedCheaply(t *testing.T) {
+	// Warm up every package-level, process-lifetime-memoized cost this
+	// package pays exactly ONCE (schemas.go's own loadedRestDefs, plus
+	// whatever the jsonschema/encoding-json packages themselves memoize on
+	// first use) with one throwaway call, on a throwaway handler, BEFORE
+	// timing anything below -- otherwise, whichever subtest happens to run
+	// first (in this test alone, or in the whole suite, depending on
+	// -shuffle/order) would unfairly absorb that one-time cost, exactly
+	// the same "average of 5 requests after a warm-up" methodology the
+	// round 3 review's own reproduction used.
+	warmupHandler := newTestHandler(t, true, true, testTwins())
+	rawPost(t, warmupHandler, "/mcp", callToolBody(0, "narvi_list_sessions", `{"limit":5}`), callToolHeaders("narvi_list_sessions"))
+
+	for _, limit := range []string{"1e1000000", "1.5e1000000", "-1e1000000", "1e-1000000"} {
+		t.Run(limit, func(t *testing.T) {
+			invoked := false
+			twins := testTwins()
+			twins.ListSessions = func(w http.ResponseWriter, _ *http.Request) {
+				invoked = true
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"sessions":[]}`))
+			}
+			handler := newTestHandler(t, true, true, twins)
+
+			args := fmt.Sprintf(`{"limit":%s}`, limit)
+			body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"narvi_list_sessions","arguments":%s}}`, args)
+
+			start := time.Now()
+			status, respBody := rawPost(t, handler, "/mcp", body, nil)
+			elapsed := time.Since(start)
+
+			if invoked {
+				t.Fatalf("the twin was invoked for limit=%s -- an oversized exponent must be rejected by this package's own bridge first", limit)
+			}
+			if status != http.StatusOK {
+				t.Fatalf("status = %d, body = %s, want 200 (isError:true is a SUCCESSFUL JSON-RPC response)", status, respBody)
+			}
+			var env callToolResultEnvelope
+			if err := json.Unmarshal(respBody, &env); err != nil {
+				t.Fatalf("unmarshal: %v (body: %s)", err, respBody)
+			}
+			if env.Result == nil || !env.Result.IsError {
+				t.Fatalf("result = %+v, want IsError:true", env.Result)
+			}
+			if elapsed > 25*time.Millisecond {
+				t.Errorf("refusing limit=%s took %s, want well under the ~50ms this exact shape cost before the fix (three big.Rat.SetString computations of a ~2.3-million-bit natural) -- the whole point of rejectOversizedNumbers is to refuse BEFORE any of those ever runs", limit, elapsed)
 			}
 		})
 	}

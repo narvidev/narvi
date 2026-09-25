@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -287,11 +288,95 @@ func validateArguments(schema *jsonschema.Schema, raw json.RawMessage) error {
 	if len(bytes.TrimSpace(instText)) == 0 {
 		instText = []byte("{}")
 	}
+	if err := rejectOversizedNumbers(instText); err != nil {
+		return err
+	}
 	inst, err := jsonschema.UnmarshalJSON(bytes.NewReader(instText))
 	if err != nil {
 		return errArgumentsNotJSONObject
 	}
 	return schema.Validate(inst)
+}
+
+// maxJSONNumberTokenLen and maxJSONNumberExponent bound every JSON number
+// token rejectOversizedNumbers below will ever let through to
+// jsonschema.UnmarshalJSON/Schema.Validate (round 3 review of PR #324,
+// finding R5): santhosh-tekuri/jsonschema/v6's own "integer" check
+// (util.go isInteger) and its "minimum"/"maximum" numeric check
+// (validator.go numValidate) both parse a JSON number through
+// math/big.Rat.SetString, and this package's own intFromJSONNumber (tools.go)
+// mirrors that same parse a third time. That cost is set by the number's
+// own MAGNITUDE, not by how many bytes it took to write it: an exponent
+// form like "1e1000000" is 9 bytes on the wire but a natural with roughly
+// 2.3 million BITS, computed from scratch, three times, for a single
+// request -- roughly 50ms of CPU measured against the real stack, for a
+// tool whose only numeric field (ListSessionsToolRequest.limit) has no
+// legitimate use for a value outside 1..200. MaxRequestBodyBytes
+// (versions.go) bounds a LONG DIGIT STRING (finding N7's own original
+// vector) because that shape's cost genuinely scales with its own text
+// length; it does nothing for an exponent, whose text stays tiny while
+// its value explodes. Both bounds here are deliberately far more
+// generous than anything this package's three schemas could ever
+// legitimately need, so nothing legitimate is lost.
+const (
+	maxJSONNumberTokenLen = 32
+	maxJSONNumberExponent = 20
+)
+
+// rejectOversizedNumbers scans every JSON number token in raw -- at any
+// depth, not just the top level (round 3 review's own "no bounded window"
+// principle) -- using encoding/json's OWN tokenizer (UseNumber, so a
+// number is returned as its raw TEXT, never evaluated): recognizing a
+// number's syntax (an optional sign, digits, an optional fraction, an
+// optional exponent) is linear in the token's own TEXT length and does no
+// arbitrary-precision arithmetic at all, unlike santhosh-tekuri/
+// jsonschema/v6's own big.Rat-based checks this function runs BEFORE
+// (validateArguments above never reaches jsonschema.UnmarshalJSON/
+// Schema.Validate until this returns nil). A malformed body is left for
+// the real decode immediately after this call to answer for, with its own
+// existing, client-safe message (errArgumentsNotJSONObject) -- this scan
+// only ever adds a NEW refusal, never removes one.
+func rejectOversizedNumbers(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			// EOF (scan complete) or malformed JSON either way: leave it
+			// for validateArguments' own real decode, right after this
+			// call, to answer for.
+			return nil
+		}
+		num, ok := tok.(json.Number)
+		if !ok {
+			continue
+		}
+		if err := checkNumberTokenSize(num.String()); err != nil {
+			return err
+		}
+	}
+}
+
+// checkNumberTokenSize refuses text (one JSON number token's own literal
+// spelling) if it is longer than maxJSONNumberTokenLen, or if it carries
+// an exponent ('e'/'E') whose own parsed magnitude exceeds
+// maxJSONNumberExponent in either direction -- the second check is the
+// load-bearing one: "1e1000000" is only 9 characters, comfortably under
+// the length bound alone, yet is exactly the shape finding R5 measured
+// costing ~50ms of CPU three times over.
+func checkNumberTokenSize(text string) error {
+	if len(text) > maxJSONNumberTokenLen {
+		return fmt.Errorf("a number in the request arguments is too long (%d characters, max %d)", len(text), maxJSONNumberTokenLen)
+	}
+	idx := strings.IndexAny(text, "eE")
+	if idx < 0 {
+		return nil
+	}
+	exp, err := strconv.Atoi(text[idx+1:])
+	if err != nil || exp > maxJSONNumberExponent || exp < -maxJSONNumberExponent {
+		return fmt.Errorf("a number in the request arguments has an exponent outside +/-%d", maxJSONNumberExponent)
+	}
+	return nil
 }
 
 // invalidArgumentsMessage turns verr (validateArguments' own return
