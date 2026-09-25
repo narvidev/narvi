@@ -272,19 +272,29 @@ func TestToolCall_ListSessions_InvalidLimitIsToolExecutionError(t *testing.T) {
 // fixed overhead, never from the exponent check actually running slow).
 // The property this test needs is deterministic and needs no clock at
 // all: checkNumberTokenSize's own exponent check is the ONLY code path
-// that ever produces THIS EXACT text, for every one of these four
-// inputs. Disabling the pre-scan (verified against a modified copy of
-// this package) does not just make these four inputs slower -- it
-// changes what they answer: the real jsonschema validator refuses
-// "-1e1000000"/"1e-1000000" itself, with a *jsonschema.ValidationError's
-// own "- at '/limit': ..." text, and lets "1e1000000"/"1.5e1000000"
-// through to intFromJSONNumber's own "limit ... is not representable as
-// a bounded whole number" fallback -- never this message. Asserting this
-// exact text, with the twin never invoked, therefore pins the fix
-// exactly as precisely as the timing bound tried to, with no clock and
-// no flake.
+// that ever produces THIS EXACT text, for every one of these inputs.
+// Disabling the pre-scan (verified against a modified copy of this
+// package) does not just make these inputs slower -- it changes what
+// they answer: the real jsonschema validator refuses "-1e1000000"/
+// "1e-1000000" itself, with a *jsonschema.ValidationError's own "- at
+// '/limit': ..." text, and lets "1e1000000"/"1.5e1000000" through to
+// intFromJSONNumber's own "limit ... is not representable as a bounded
+// whole number" fallback -- never this message. Asserting this exact
+// text, with the twin never invoked, therefore pins the fix exactly as
+// precisely as the timing bound tried to, with no clock and no flake.
+//
+// Round 5 review of PR #324, finding T2: JSON allows an uppercase 'E'
+// exponent too, and Go's decoder accepts it, so "1E1000000" costs the
+// same big.Rat work. The rows above were all lowercase, so a pre-scan
+// narrowed to `strings.IndexByte(text, 'e')` left the suite green while
+// re-opening R5 for every uppercase spelling. The uppercase rows pin
+// that branch with the same exact-text assertion: on that mutant they
+// answer with the fallback or validator text instead.
 func TestToolCall_ExponentFormNumberIsRefusedCheaply(t *testing.T) {
-	for _, limit := range []string{"1e1000000", "1.5e1000000", "-1e1000000", "1e-1000000"} {
+	for _, limit := range []string{
+		"1e1000000", "1.5e1000000", "-1e1000000", "1e-1000000",
+		"1E1000000", "1.5E1000000", "-1E-1000000",
+	} {
 		t.Run(limit, func(t *testing.T) {
 			invoked := false
 			twins := testTwins()
