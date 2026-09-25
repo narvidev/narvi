@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // callToolBody builds a modern (2026-07-28) tools/call request body
@@ -450,22 +452,35 @@ func TestToolCall_ConcurrentFirstCalls_NoRace(t *testing.T) {
 		{"narvi_get_session", `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a"}`},
 	}
 
+	// Launched through errgroup.Group.Go, per technical plan §11 (no naked
+	// goroutines) -- the ready/start pair below is what makes every one
+	// of these n goroutines fire its first tools/call at (as close to)
+	// the same instant as Go can arrange, rather than merely running
+	// "concurrently" in whatever loose sense errgroup.Go alone would
+	// give: without it, an early goroutine could finish before a later
+	// one even starts, which would not exercise a genuine "n first calls,
+	// all racing together" scenario.
 	start := make(chan struct{})
-	var wg sync.WaitGroup
-	wg.Add(n)
+	var ready sync.WaitGroup
+	ready.Add(n)
+	var g errgroup.Group
 	for i := 0; i < n; i++ {
-		call := calls[i%len(calls)]
-		go func(id int, name, args string) {
-			defer wg.Done()
+		id, call := i, calls[i%len(calls)]
+		g.Go(func() error {
+			ready.Done()
 			<-start
-			status, body := rawPost(t, handler, "/mcp", callToolBody(id, name, args), callToolHeaders(name))
+			status, body := rawPost(t, handler, "/mcp", callToolBody(id, call.name, call.args), callToolHeaders(call.name))
 			if status != http.StatusOK {
-				t.Errorf("concurrent tools/call %s (id=%d): status = %d, body = %s", name, id, status, body)
+				return fmt.Errorf("concurrent tools/call %s (id=%d): status = %d, body = %s", call.name, id, status, body)
 			}
-		}(i, call.name, call.args)
+			return nil
+		})
 	}
+	ready.Wait()
 	close(start)
-	wg.Wait()
+	if err := g.Wait(); err != nil {
+		t.Error(err)
+	}
 }
 
 // TestToolCall_ListSessions_OmittedArgsUseTwinDefaults proves an empty

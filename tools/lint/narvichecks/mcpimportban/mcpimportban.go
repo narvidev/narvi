@@ -53,14 +53,19 @@ const doc = `report a banned import inside internal/adapters/inbound/mcp
 
 Technical plan §43 §4.5 item 1: internal/adapters/inbound/mcp (the MCP tool
 bridge) may import the official MCP SDK, httpapi, auth, platform, contracts
-(+contracts/gen/go/restdtos), chi, and stdlib -- never internal/adapters/
-outbound/postgres (or sqlcgen), internal/domain/authz, or any internal/app/*
-application service (including internal/app/actorauthz). Every MCP tool must
-reach the application exclusively by invoking an existing httpapi
-http.HandlerFunc in-process (the bridge); a banned import here would let a
-tool reach a store or render an authz verdict directly, reintroducing a
-second, divergent authorization path. _test.go files are exempt (a test rig
-constructing a real store is not a production decision point).`
+(+contracts/gen/go/restdtos), chi, and stdlib EXCEPT database/sql -- never
+internal/adapters/outbound/postgres (or sqlcgen), internal/domain/authz, any
+internal/app/* application service (including internal/app/actorauthz), the
+github.com/jackc/pgx/v5 module tree (including pgxpool), or database/sql.
+Every MCP tool must reach the application exclusively by invoking an
+existing httpapi http.HandlerFunc in-process (the bridge); a banned import
+here would let a tool reach a store or render an authz verdict directly --
+or, via pgx/database/sql plus platform.Load()'s own DatabaseURL, run raw SQL
+against this deployment's database directly, a second read path with no
+authz.Authorize call and no REST twin at all (round 2 review of PR #324,
+findings N9/N18) -- reintroducing a second, divergent authorization path
+either way. _test.go files are exempt (a test rig constructing a real store
+is not a production decision point).`
 
 // Analyzer reports any banned import inside internal/adapters/inbound/mcp.
 var Analyzer = &analysis.Analyzer{
@@ -89,6 +94,13 @@ var bannedExactImports = []string{
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres",
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen",
 	"github.com/narvidev/narvi/internal/domain/authz",
+	// database/sql (round 2 review of PR #324, finding N9): Go's own
+	// generic SQL interface is a second, driver-level path to Postgres
+	// that would let a tool run raw SQL with no authz.Authorize call and
+	// no REST twin, exactly the store-bypass the postgres/sqlcgen ban
+	// above exists to close -- banning THOSE two paths alone left this
+	// one wide open.
+	"database/sql",
 }
 
 // bannedPrefix bans EVERY internal/app/* package, not an enumerated list
@@ -97,6 +109,17 @@ var bannedExactImports = []string{
 // (execimportban's and capabilityimportban's own identical "ban the
 // class, not an enumerated list of today's members" precedent).
 const bannedPrefix = "github.com/narvidev/narvi/internal/app/"
+
+// bannedPgxPrefix bans the entire github.com/jackc/pgx/v5 module tree --
+// its own top-level import AND every subpackage (pgxpool, pgtype, ...) --
+// by prefix, mirroring bannedPrefix's own "ban the class" reasoning
+// rather than naming pgxpool alone (round 2 review of PR #324, finding
+// N9): pgx.Connect and pgxpool.New are both a second, driver-level path
+// straight to this deployment's own Postgres, reachable with nothing
+// more than platform.Load()'s own (allowed) Config.DatabaseURL -- no
+// authz.Authorize call, no REST twin, and (before this ban) no
+// diagnostic from `make lint`.
+const bannedPgxPrefix = "github.com/jackc/pgx/v5"
 
 // isTargetPackage reports whether path is internal/adapters/inbound/mcp
 // itself or one of its subpackages -- a PREFIX match on "/", never a
@@ -127,13 +150,17 @@ func run(pass *analysis.Pass) (any, error) {
 	return nil, nil
 }
 
-// isBanned reports whether path is one of bannedExactImports or matches
-// bannedPrefix.
+// isBanned reports whether path is one of bannedExactImports, matches
+// bannedPrefix (every internal/app/* package), or matches bannedPgxPrefix
+// (the pgx module tree, itself or any subpackage).
 func isBanned(path string) bool {
 	for _, banned := range bannedExactImports {
 		if path == banned {
 			return true
 		}
+	}
+	if path == bannedPgxPrefix || strings.HasPrefix(path, bannedPgxPrefix+"/") {
+		return true
 	}
 	return strings.HasPrefix(path, bannedPrefix)
 }
