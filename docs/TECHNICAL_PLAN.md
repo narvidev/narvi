@@ -6616,29 +6616,37 @@ only the *protocol* a caller speaks, never the *authorization* it is checked aga
 Step 180 ships the entry point, the transport, the protocol-version gate, and exactly three read-only
 tools: `narvi_list_models`, `narvi_list_sessions`, `narvi_get_session` — the minimum that proves
 "discovery and one session read through the same authorization path an equivalent HTTP call takes",
-this row's own exit criterion. It is cookie-authenticated (§43.2) and disabled by default (§43.11):
-**no off-the-shelf MCP client can use this surface yet**, because none carries a browser cookie. What
-can use it is a script client in this repository's own tests, which is exactly this row's own studied
-scope. Everything past that is later Steps' own row, not this section's: 181 is what makes the surface
-reachable by a real client (OAuth 2.1 resource-server behavior, per-principal tool filtering); 182 adds
+this row's own exit criterion. It shipped cookie-authenticated and disabled by default (§43.11), usable
+only by a script client in this repository's own tests, because no off-the-shelf MCP client carries a
+browser cookie. Row 181 replaced the cookie with a bearer token from Narvi's own OAuth authorization
+server and made the tool list depend on the grant (§43.13–§43.19), which is what makes the surface
+reachable by a real client. Everything past that is later rows' own work, not this section's: 182 adds
 result/verdict tools, bounded wait, and transcript paging; 183 adds plan read/approve/reject,
 prompt-while-running, stop, and delegate (create session). Repository discovery (`narvi_list_repositories`)
 is deliberately absent from 180 too: this codebase has no `GET /api/repos` route for it to sit over,
 and the one-adapter rule (§43.7) means a tool ships only once its HTTP twin exists.
 
-### 43.2 Authentication: the same cookie, the same middleware, nothing else
+### 43.2 Authentication: a bearer token from this deployment's own authorization server
 
-`POST /mcp` sits behind the EXACT same `auth.Middleware(userSessionStore, userStore)` every `/api/**`
-route group already uses. The principal a tool handler sees is `platform.UserFromContext(ctx)` — the
-same `AuthenticatedUser{ID, Role, Email}` every REST handler already reads. No new credential store, no
-new hash, no new token TTL, no new rejection body: the same generic `{"error":"unauthorized"}` 401 every
-other route already answers. Rejected alternatives, so they are not re-proposed: accepting the cookie's
-own value as a bearer token (turns an HttpOnly, host-scoped cookie into a copyable long-lived credential
-the MCP authorization spec itself forbids); a new personal-API-token table (a third credential family
-181's OAuth surface would then have to reconcile against); reusing the per-session WS token (per-session,
-not per-user-surface, and consumed by a WS frame, not an HTTP header). Because this surface is
-cookie-authenticated, it additionally needs what a `POST /api/**` route gets for free from `SameSite=Lax`:
-`Origin` validation — an Origin header, if present, must resolve to EXACTLY the origin of
+`POST /mcp` accepts only an `Authorization: Bearer` access token issued by Narvi's own authorization
+server (§43.13), verified on every call by `auth.RequireMCPBearer` (§43.16). The principal a tool handler
+sees is still `platform.UserFromContext(ctx)` — the same `AuthenticatedUser{ID, Role, Email}` every REST
+handler reads, derived from the same `users` row on every call — plus the grant the token was issued
+under, which only decides which tools are visible (§43.17). A refusal is the same generic
+`{"error":"unauthorized"}` 401 every other route answers, with a `WWW-Authenticate: Bearer` challenge
+pointing at the protected-resource metadata. In 180 this route sat behind the cookie middleware; that
+gate is gone, not kept alongside the bearer: one credential family per surface, one principal
+derivation, an unambiguous 401 challenge. Rejected alternatives, so they are not re-proposed: accepting
+the cookie's own value as a bearer token (turns an HttpOnly, host-scoped cookie into a copyable
+long-lived credential the MCP authorization spec itself forbids); a personal-API-token table (a fourth
+credential family beside the OAuth one); reusing the per-session WS token (per-session, not
+per-user-surface, and consumed by a WS frame, not an HTTP header); keeping the cookie as a second way in
+with an implicit full-scope grant (two principal derivations to keep in step, and a cookie holder told by
+the challenge to go and get a token it does not need). Cross-site request forgery, the reason a
+cookie-authenticated POST needed an Origin check, no longer applies to a bearer-only endpoint; the same
+reasoning now protects the consent page's own POST instead (§43.14). The Origin check stays anyway,
+because the transport specification requires it unconditionally and it is the defense against DNS
+rebinding: `Origin` validation — an Origin header, if present, must resolve to EXACTLY the origin of
 `cfg.PublicBaseURL`, or the request is refused 403; a request with no `Origin` header at all (every
 non-browser MCP client) passes. `RequireTrustedOrigin` performs this comparison directly rather than
 delegating to `net/http.CrossOriginProtection` (which `NewHandler`'s own returned handler still wires in
@@ -6716,8 +6724,9 @@ own job, exercised and pinned by this Step's own tests rather than re-implemente
 (no `listChanged` — the tool set is static per build; no resources, no prompts, no logging capability),
 and `_meta`'s own `serverInfo` — `{"name":"narvi","version":contracts.Version}`, since the contracts
 bundle version is what a client can actually reason about (which DTO shapes it will get). `instructions`
-is one paragraph telling the model the three tools are read-only and that `filter:"all"` on
-`narvi_list_sessions` lists every session on the deployment, not only the caller's own. The legacy
+is one paragraph telling the model which tools it has, that they are read-only, and that `filter:"all"`
+on `narvi_list_sessions` lists every session on the deployment, not only the caller's own — composed per
+request from the tools the request's grant can see, so it never names a hidden one (§43.17). The legacy
 `initialize` handshake answers with the same `serverInfo`/`capabilities`.
 
 ### 43.6 Registration: where the endpoint mounts, and in what order
@@ -6730,9 +6739,11 @@ OBSERVABLE as off, never a route that does not exist at all, the same discipline
 already establish. Gate order inside the group is deliberate and fixed: the Origin gate (§43.2) answers
 403 FIRST, on an invalid Origin, whatever the state of every gate after it — the transport spec's own
 "MUST respond with HTTP 403 Forbidden" is unconditional, and no LATER gate can know that without
-running first. The enabled-gate (§43.11) answers 503 SECOND, before the session store is ever touched;
-only once the surface is known to be on does the auth gate (§43.2) run, third, producing the identical
-401 every other route produces on a missing/expired/disabled session.
+running first. The enabled-gate (§43.11) answers 503 SECOND, before any credential store is ever
+touched; only once the surface is known to be on does the bearer gate (§43.2, §43.16) run, third,
+producing the same 401 body every other route produces, with its `WWW-Authenticate` challenge. The
+authorization server's own routes (§43.14) mount beside it at the router root under the same
+enabled-gate, and never behind the cookie middleware.
 
 ### 43.7 The bridge: one authorization path, never a second
 
@@ -6745,10 +6756,9 @@ stores those closures capture — the adapter itself never imports a store type 
 structurally (§43.9) rather than left to review discipline. A tool with no HTTP twin yet (182's wait,
 183's stop) is exactly the moment a real application service is needed, gaining its own HTTP twin or an
 explicit, reviewed exemption — never a shortcut around the bridge. Per-request server construction
-(one small `*mcp.Server` per HTTP request, built from the incoming request's own context) is what makes
-per-principal tool filtering possible in 181 without this Step needing to build it: a client that may
-not use a tool must not be told the tool exists, and the SDK's own seam for that is exactly this
-per-request construction.
+(one small `*mcp.Server` per HTTP request, built from the incoming request's own context) is the seam
+per-grant tool filtering uses: each request's server registers only the tools its grant's scopes
+satisfy, so a client that may not use a tool is never told the tool exists (§43.17).
 
 The synthesized `*http.Request` callTwin builds is assembled directly (a literal `&http.Request{...}`),
 never by parsing a request line from attacker-controlled text: an argument is substituted into the
@@ -6837,8 +6847,11 @@ chain — after the Origin gate (§43.2/§43.6: an invalid Origin is refused 403
 this flag's value, so no later gate including this one may run first) — answering 503 with the same body
 every other disabled-capability gate in this codebase already answers with. Because the route is mounted
 unconditionally, the route table, the guide-omission register, and the wire-contracts compatibility check
-all see the same table whether the flag is on or off. 181 does not change this default; enabling the
-surface is a per-deployment operator act.
+all see the same table whether the flag is on or off. The same flag gates the authorization server's
+own routes and discovery documents (§43.14): with the surface off, every one of them answers the same
+503, and Settings still lists and revokes existing authorizations so an operator switching the surface
+off never strands one. Row 181 does not change this default; enabling the surface is a per-deployment
+operator act.
 
 ### 43.12 Tests
 
@@ -6849,10 +6862,266 @@ exact echo for a supported one, and a following call succeeding with no session 
 outcome-mapping table (§43.8) exercised directly, both structural guards (§43.9), and the tool-list
 golden. Integration tests, against a real Postgres-backed rig: the same parity table over every role
 (viewer through admin) this repository's own REST integration tests already establish for the identical
-routes — the MCP call and the HTTP call must agree on status-shape and body for every one of them,
+routes — the MCP call (made with a bearer token minted for that role's user since row 181) and the HTTP
+call (made with that user's cookie) must agree on status-shape and body for every one of them,
 including the two rows that pin this codebase's own existing behavior rather than inventing a stricter
 one for MCP alone: a session created by one member is visible to another member under `filter:"all"`,
 and `narvi_get_session` on another user's session succeeds, because there is no per-session visibility
 concept in this codebase today. Every repo-wide guard that must stay green with no edits beyond the ones
 this row makes: the route-table golden (both directions), the guide-omission register, the wire-contracts
 compatibility check (MINOR only), and `go test -race ./...`.
+
+### 43.13 Narvi as the MCP authorization server
+
+Row 181 makes the surface usable by a real, third-party MCP client. Narvi is both halves of the OAuth
+picture the MCP authorization specification describes: the *resource server* (`POST /mcp`) and the
+*authorization server* that issues the tokens it accepts (`/oauth/*`) — one binary, one Postgres, no
+external identity service. A person authorizes a client through the sign-in they already have (GitHub
+OAuth or the generic OIDC provider, §41.3): the authorization endpoint sends a signed-out browser to
+`/sign-in` and brings it back to the consent page afterwards. Every client is a public OAuth 2.1 client
+using PKCE; confidential clients are not supported.
+
+Two identifiers are derived from `PublicBaseURL` (canonicalized per RFC 6454: lower-case scheme and
+host, default port elided) and never configured separately. The **resource** is `PublicBaseURL + "/mcp"`
+— the canonical URI of the MCP endpoint, the audience every token is bound to, and the value the
+protected-resource metadata advertises; a client's dialed URL must equal it byte for byte, which is the
+same assumption the Origin gate (§43.2) already makes about `PublicBaseURL`. The **issuer** is
+`PublicBaseURL + "/oauth"`, deliberately path-qualified: the root `/.well-known/openid-configuration` is
+already the cloud-identity issuer's document (§27.3), and a second, root-level issuer on the same host
+would put two issuers behind one well-known path. Because both discovery documents live at the root of
+`PublicBaseURL`'s origin, a `PublicBaseURL` carrying a path is refused at boot whenever the surface is
+enabled.
+
+`POST /mcp` accepts **only** an `Authorization: Bearer` access token from this authorization server; the
+cookie gate it carried in 180 is gone (§43.2). One credential family per surface keeps one principal
+derivation to audit and makes the 401 challenge unambiguous. The access token is a third credential
+family, kept apart from the two it resembles: the model-provider OAuth link (§29, where Narvi is the
+*client*, and the secret is encrypted because it must be replayed upstream) and the deployment's own
+secrets (encrypted, delivered into sandboxes). An MCP access token is issued and verified by Narvi
+alone, so it is stored only as `platform.HashToken` output — irreversible, looked up by equality, never
+encrypted, never logged, never in an error or an audit row — in its own `mcp_oauth_*` tables.
+
+The Origin gate stays first on `/mcp`: the transport specification's 403 for a present-but-foreign
+`Origin` is unconditional, and DNS rebinding still matters for a loopback deployment. The consequence is
+stated here rather than discovered later: a *browser-hosted* third-party MCP client, whose requests
+carry its own foreign `Origin`, cannot reach `/mcp` even with a valid token. Relaxing that for
+bearer-authenticated requests is a separate, later decision; native and desktop clients, which send no
+`Origin`, are unaffected.
+
+Row 181 ships in four pieces behind the existing flag (§43.11). (a) — this section as written — is the
+authorization-code core: discovery, pre-registered clients, authorization with consent, code-for-token
+exchange, bearer verification on every call, scope-gated discovery, and user revocation in Settings.
+(b) adds refresh tokens with rotation and reuse detection and an RFC 7009 revocation endpoint; (c) adds
+client ID metadata documents and dynamic client registration; (d) adds the admin view of other users'
+authorizations, rate limits and the pending-request cap. Until (b), a client re-runs the authorization
+flow when its access token expires.
+
+### 43.14 Discovery documents and endpoints
+
+Every route below is mounted unconditionally and answers `503` with the standard disabled-capability
+body while the surface is off, exactly like `/mcp`. None of them sits behind the cookie middleware; the
+two consent routes read the cookie themselves, and nothing else here accepts one.
+
+| Route | Called by | Purpose |
+|---|---|---|
+| `GET /.well-known/oauth-protected-resource/mcp` | the MCP client's library | RFC 9728 protected-resource metadata |
+| `GET /.well-known/oauth-authorization-server/oauth` | the MCP client's library | RFC 8414 authorization-server metadata (path insertion for the `/oauth` issuer) |
+| `GET /oauth/authorize` | the user's browser, opened by the client | validate the request, record it, send the browser to consent (or sign-in first) |
+| `GET /oauth/consent?request=<id>` | the user's browser | the consent page |
+| `POST /oauth/consent` | the consent page's own form | approve or deny |
+| `POST /oauth/token` | the MCP client program | exchange a code for an access token |
+
+The protected-resource document is `{"resource", "authorization_servers":[issuer], "scopes_supported",
+"bearer_methods_supported":["header"], "resource_name"}`, served only at the path-inserted location: a
+root `/.well-known/oauth-protected-resource` would have to name `PublicBaseURL` itself as the resource,
+and a client falling back to it would ask for a token with the wrong audience. The authorization-server
+document is Narvi's own small struct — issuer, both endpoints, the advertised scopes, `response_types`
+`["code"]`, `response_modes` `["query"]`, `grant_types` `["authorization_code"]`,
+`token_endpoint_auth_methods` `["none"]`, `code_challenge_methods` `["S256"]`, and
+`authorization_response_iss_parameter_supported: true` — with no `jwks_uri` (no token here is a JWT), no
+revocation or registration endpoint, and no metadata-document support until the pieces that build them.
+Both documents carry `Cache-Control: max-age=300` and `Access-Control-Allow-Origin: *`.
+
+**The authorization endpoint** validates in the order OAuth 2.1 prescribes. A missing, unknown or
+disabled `client_id`, or a `redirect_uri` that does not match one registered for it (§43.15), renders an
+HTML error page (400) and **never redirects** — a redirect to an unvalidated URI is the open-redirect
+this rule exists to prevent. Every later failure redirects to the validated `redirect_uri` with `error`,
+`error_description`, the client's `state`, and `iss`: `response_type` other than `code` is
+`unsupported_response_type`; a missing or malformed `code_challenge`, or a `code_challenge_method` other
+than `S256` (absent and `plain` included), is `invalid_request` — PKCE is mandatory for every client; a
+missing `resource`, or one that is not this deployment's canonical resource after scheme/host case
+folding, default-port elision and one trailing slash trimmed, is `invalid_target` (RFC 8707); any scope
+this build does not advertise is `invalid_scope`; a `state` over 512 bytes, or any parameter repeated, is
+`invalid_request`. An absent or empty `scope` is legitimate: it asks for a scope-less grant (§43.17). A
+valid request is stored (`mcp_oauth_authorization_requests`, expiring after
+`MCPAuthorizationRequestTTL`) and the browser is redirected to `/oauth/consent?request=<id>` — through
+`/sign-in?next=` first when it carries no valid session. Only the request id travels through sign-in,
+never the raw OAuth query; the sign-in view's own return-to allowlist and both login handlers accept
+exactly that one server path.
+
+**The consent page** authenticates the cookie itself. The first render binds the request to that user
+for good — any other user gets an error page — and every render mints a fresh CSRF nonce, storing only
+its hash (so the plaintext exists in the rendered form and nowhere else). The page shows the client's
+true identity (for a pre-registered client: that an administrator of this deployment registered it),
+the host the browser will be sent back to — with an explicit warning when it is this machine
+(`127.0.0.1`, `[::1]`, `localhost`), since any local program on that port receives the code — the
+signed-in user's email, and each requested scope as a checkbox with a plain description. It is Go
+`html/template`, embedded in the binary, auto-escaped, and served with
+`Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'self' <the
+redirect URI's own origin>; frame-ancestors 'none'; base-uri 'none'` (the redirect origin is in
+`form-action` because browsers apply that directive to the redirect a form submission follows),
+`X-Frame-Options: DENY`, `Cache-Control: no-store`, and `Referrer-Policy: no-referrer`.
+
+The decision (`POST /oauth/consent`) is checked in this order: a same-origin check — an `Origin` header,
+when present and not the literal `null`, must equal `PublicBaseURL`'s canonical origin (the same
+`platform.CanonicalOrigin` comparison the `/mcp` Origin gate uses); otherwise `Sec-Fetch-Site` must read
+`same-origin`, and a present `Sec-Fetch-Site` of anything else is refused. (`Referrer-Policy:
+no-referrer` makes a conforming browser send `Origin: null` on the page's own form POST, which is why
+the browser-set, unforgeable `Sec-Fetch-Site` is what vouches for that case.) Then: a signed-in user,
+who must be the request's bound user; the nonce, compared as hashes in constant time; the request
+neither consumed nor expired; `authz.ActionConnectMCPClient` for the user's role; and every selected
+scope one the request asked for — the user can narrow, never widen. Approval, in one transaction,
+consumes the request, creates the grant (expiring after `MCPGrantMaxLifetime`), issues a single
+authorization code bound to the request's PKCE challenge, redirect URI and resource (expiring after
+`MCPAuthorizationCodeTTL`), and records `mcp_authorization.granted`; the browser is then redirected to
+the **stored** redirect URI — never one read from the form — with `code`, `state` and `iss`. Denial
+consumes the request and redirects with `error=access_denied`; a refusal is not an audit row.
+
+**The token endpoint** takes `application/x-www-form-urlencoded` parameters from the body only and
+answers JSON with `Cache-Control: no-store`. Client authentication is the public-client form: `client_id`
+in the body, or HTTP Basic with an empty secret (what a standard OAuth library's auto-detection tries
+first); both present must agree, and any client secret is refused. Only `grant_type=authorization_code`
+is supported. The code is consumed at most once; a code that was already consumed is a replay, and the
+grant it produced is deleted — its tokens stop working on their next use — with an
+`mcp_authorization.revoked` audit row (reason `code_reuse`). An expired code, one issued to another
+client, a `redirect_uri` that differs from the stored one, a `resource` that differs from the stored one,
+or a `code_verifier` whose S256 digest does not equal the stored challenge (compared in constant time)
+is `invalid_grant`. A failed exchange still consumes the code. Success issues one access token
+(`MCPAccessTokenTTL`, never past the grant's own expiry) and answers `access_token`, `token_type`
+`Bearer`, `expires_in`, and `scope` — always present, because the user may have narrowed it.
+
+### 43.15 Clients: pre-registration, metadata documents, dynamic registration
+
+A client is a row in `mcp_oauth_clients`: a public `client_id` (never a secret), a display name, an
+optional homepage, and its registered redirect URIs. In (a) the only way to create one is
+pre-registration by an administrator (`POST /api/mcp-clients`, `authz.ActionManageIntegrations`), which
+generates the `client_id` and records `mcp_client.created`; `DELETE /api/mcp-clients/{clientID}` removes
+the client and, by cascade, every grant, pending request, code and token issued to it, auditing
+`mcp_client.deleted` and one `mcp_authorization.revoked` (reason `client_deleted`) per grant it took with
+it. Every affected user's client stops working on its next call. `disabled_at` is an operator kill
+switch the bearer check honors on every call.
+
+The redirect URI rule (`internal/domain/mcpclient`) is enforced identically at registration and at
+authorization, so the consent page can never see a URI that could not have been registered: `https://`
+with any host; `http://` only on the loopback IP literals `127.0.0.1` and `[::1]` or on `localhost`; no
+other scheme, no fragment, no userinfo, printable ASCII only. Matching is exact string comparison, with
+the one exception RFC 8252 §7.3 requires for native clients: for a registered loopback IP literal, the
+presented port is ignored (everything else must still be identical). `localhost` gets no such exception.
+
+Client ID metadata documents (a client identified by an `https://` URL whose document Narvi fetches,
+behind an SSRF-guarded outbound adapter) and dynamic client registration (RFC 7591, off by default) are
+piece (c). Neither exists yet, and the authorization-server metadata advertises neither. The client-kind
+enum already carries their two values so that piece needs no enum-only migration.
+
+### 43.16 Grants, tokens, and revocation
+
+A grant (`mcp_oauth_grants`) is one (user, client, scopes, resource) authorization the user consented
+to. It exists if and only if the authorization is live: every authorization code and access token
+references it with `ON DELETE CASCADE`, so revocation is deleting the grant — nothing to invalidate,
+nothing to broadcast. Codes, access tokens and consent nonces are stored only as `platform.HashToken`
+output; the plaintext code and token carry recognizable prefixes (`narvi_mcp_ac_`, `narvi_mcp_at_`) so a
+secret scanner or a reviewer reading a log can tell the family, and the whole string is hashed.
+
+Lifetimes live in `platform/timeouts.go`: `MCPAuthorizationRequestTTL` (10 minutes, the consent window),
+`MCPAuthorizationCodeTTL` (60 seconds), `MCPAccessTokenTTL` (1 hour), `MCPGrantMaxLifetime` (90 days,
+absolute), and `MCPGrantLastUsedWriteInterval` (5 minutes); `Validate` requires the code to expire
+inside the consent window and the token inside the grant. The expired-credential sweep deletes expired
+requests, codes, tokens and grants on the same tick as `user_sessions`.
+
+**Bearer verification** (`auth.RequireMCPBearer`, in place of the cookie middleware on `/mcp`) runs on
+every call: parse exactly one `Authorization: Bearer` token (never a query parameter), hash it, and read
+the token, its grant, its client and its user in **one join** — then refuse unless the token and the
+grant are unexpired, the client is not disabled, the user is not disabled, and the grant's resource is
+this deployment's canonical resource. There is no cache of any kind in front of that read, so a
+revocation, a client deletion, a user disable or a role change takes effect on the very next call. A
+refusal is the same `401 {"error":"unauthorized"}` every other route answers, with
+`WWW-Authenticate: Bearer` carrying `resource_metadata` and `scope` (and `error="invalid_token"` when a
+token was presented); the reason is logged, never returned. A lookup that fails for any reason other
+than "no such token" is a 500, not a 401, so a database fault never sends a client back through consent.
+Success attaches the same `platform.AuthenticatedUser` a cookie would (id, role and email read from the
+`users` row on this call) plus the `platform.MCPGrant`; a grant's `last_used_at` is refreshed at most once
+per `MCPGrantLastUsedWriteInterval`, and a failure to write it is logged without affecting the call.
+
+A token never does more than its user: the role is re-read on every call, the tools run the same REST
+twins with the same `authz.Authorize` check as a browser (§43.7), and the grant only ever subtracts
+(§43.17). The synthesized request a tool hands its twin carries no header at all, so the bearer token is
+never passed through. A user whose role is later narrowed keeps any grant already consented to, but
+every call is still governed by the narrowed role.
+
+### 43.17 Scopes and discovery gating
+
+The scope vocabulary is `internal/domain/mcpscope`: `mcp:read` covers every read-only tool (all three
+of 180's), `mcp:write` will cover every state-changing tool and implies `mcp:read`. A scope is advertised
+— in `scopes_supported`, in the 401 challenge, and as acceptable at the authorization endpoint — only
+when at least one registered tool requires it, so today exactly `mcp:read` is offered and `mcp:write` is
+refused as `invalid_scope`; no contract promises a scope nothing consumes. Repository restriction is not
+a scope string: a per-grant repository allowlist, enforced as an argument-level precondition on tools
+that name a repository, is reserved for the first such tool.
+
+Each tool declares the scope it requires, and the per-request server (§43.7) registers **only** the tools
+the request's grant satisfies. A client that may not use a tool is not told it exists:
+
+- `tools/list` for a scope-less grant is `200` with `"tools": []`, and `server/discover` still succeeds;
+- `tools/call` naming a hidden tool answers the SDK's own `-32602` "unknown tool" error, byte-identical
+  to a name that never existed — never an `insufficient_scope` that would confirm the tool is there;
+- `instructions` is composed from the visible tools only, and names none when none are visible;
+- a request that reaches the handler without both a principal and a grant (a mounting defect) gets a
+  server with no tools at all.
+
+The 401 challenge's `scope` is every advertised scope; the person at the consent screen, not the client,
+decides how much to grant. Role does not gate discovery today — every read tool is open to every role,
+so the tool list is role-independent — and the first tool some role can never use decides how role
+enters discovery without admitting the authz domain into the adapter.
+
+### 43.18 Settings, audit, and the admin view
+
+Every user manages their own authorizations in Settings → Integrations, in a "Connected apps" section
+beside the ChatGPT-account link: client name, granted scopes, when it was granted, when it was last used,
+when it expires, and a Revoke action behind a confirmation. `GET /api/me/mcp-authorizations`
+(`authz.ActionViewOwnProfile`) lists the caller's own unexpired grants; `DELETE
+/api/me/mcp-authorizations/{authorizationID}` (`authz.ActionRevokeOwnMCPAuthorization`, open to every
+role and deliberately separate from the connect action so disconnecting can never be taken away) deletes
+one of the caller's own grants — another user's id is indistinguishable from a missing one (404) — and
+records `mcp_authorization.revoked` (reason `user`). Administrators register and delete clients in the
+same panel (`/api/mcp-clients`, §43.15).
+
+Audit rows, each written in the same transaction as the change: `mcp_client.created`,
+`mcp_client.deleted` (resource type `mcp_client`); `mcp_authorization.granted` and
+`mcp_authorization.revoked` with `detail.reason` one of `user`, `client_deleted`, `code_reuse` (resource
+type `mcp_authorization`). A `code_reuse` row is attributed to the grant's user with `detail.actor =
+"system"`. Not audited: denials, failed token requests, token issuance. The admin view of other users'
+authorizations — and revocation on their behalf — is piece (d).
+
+### 43.19 Threat model and tests
+
+| Threat | Control | Proven by |
+|---|---|---|
+| Open redirect, redirect-URI substitution | exact match (loopback-IP port only); a bad `client_id`/`redirect_uri` renders a page and never redirects; the decision redirects to the stored URI, never the form's | `TestMatchRedirectURI_Table`, `TestAuthorize_RedirectURI_Table`, `TestConsent_RedirectsOnlyToStoredURI` |
+| Code interception | PKCE S256 mandatory, 60-second single-use code bound to client, redirect URI and resource | `TestToken_PKCE_WrongVerifierIsInvalidGrant`, `TestToken_PlainChallengeRefusedAtAuthorize`, `TestToken_ExpiredCodeIsInvalidGrant`, `TestToken_CodeForOtherClientIsInvalidGrant`, `TestPKCE_UsesConstantTimeCompare` |
+| Code replay | a second use revokes the grant | `TestToken_CodeReuseRevokesGrant` |
+| Mix-up | `iss` on every authorization response, advertised | `TestAuthorize_IssOnSuccessAndError`, the end-to-end test's own SDK issuer check |
+| Audience confusion | `resource` required and bound at authorize, token and every call | `TestAuthorize_ResourceMismatchIsInvalidTarget`, `TestBearer_GrantResourceMismatchIs401` |
+| Token passthrough | the twin's synthesized request carries no header | `TestBridge_NoAuthorizationHeaderReachesTwin` |
+| Consent clickjacking and CSRF | frame headers; SameSite cookie, hashed per-render nonce, same-origin check, request bound to one user | `TestConsent_FrameHeaders`, `TestConsent_MissingOrWrongNonceRefused`, `TestConsent_CrossSiteOriginRefused`, `TestConsent_OtherUserCannotDecide` |
+| Scope escalation | consent narrows only; unadvertised scopes refused | `TestConsent_CannotAddUnrequestedScope`, `TestAuthorize_UnadvertisedScopeRefused` |
+| Client identity spoofing | the page shows who registered the client and the true redirect host, with a loopback warning | `TestConsent_ShowsClientIdentityAndRedirectHost` |
+| Revoked, disabled or deleted principals | one join per call, no cache | `TestBearer_NoCacheBetweenCalls`, `TestOAuth_RevokedAuthorizationStopsOnNextCall_User`, `_ClientDeleted`, `_DisabledUser`, `TestBearer_DisabledClientIs401NextCall` |
+| Discovery leak | per-request tool registration by scope; composed instructions; empty defect server | `TestToolsList_ScopeFilter_Table`, `TestInstructions_NameOnlyVisibleTools`, `TestHiddenToolCall_IsIndistinguishableFromUnknownTool`, `TestOAuth_ScopelessGrant_ToolsListEmpty` |
+| Phishing through the login return path | only `/oauth/consent?request=<uuid>` is accepted as a server-side return target | `TestLogin_NextAcceptsConsentPath`, the sign-in view's own return-to test |
+| Table growth | a TTL on every row kind, swept | `TestExpiredCleanup_SweepsMCPRows` |
+| A token doing more than its user | same twins, same authz check, role read per call | `TestParity_BearerEqualsCookieForEveryRole` |
+
+The row's exit criterion is proven end to end by `TestOAuth_EndToEnd_SDKClient`: the official Go SDK's
+own client discovers the resource and the authorization server from a live `401`, drives consent,
+exchanges the code, lists exactly the three tools, and calls one. The parity suite of §43.12 now runs
+over bearer principals minted per role.
