@@ -3,12 +3,17 @@ package mcp
 import (
 	"bytes"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	jsonschema "github.com/santhosh-tekuri/jsonschema/v6"
 
 	"github.com/narvidev/narvi/contracts"
+	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // rawRestDef independently re-parses contracts.FS's own rest/v1/
@@ -171,4 +176,67 @@ func defKeys(m map[string]any) []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+// TestListModelsOutputSchema_ValidatesRealCatalogBody closes round 2
+// review findings N6/N10: TestToolOutputSchemas_ValidateRealBodies above
+// validates only a HAND-WRITTEN ModelCatalog body, in which every model
+// already carries a non-empty "variants" array -- it cannot notice
+// httpapi.GetModelCatalog()'s own nonNilStrings fix (round 1 finding M5)
+// ever regressing, since a body that never exercises the empty-variants
+// case validates identically whether or not that fix is even present.
+// This test instead drives the REAL httpapi.GetModelCatalog() handler --
+// the exact function narvi_list_models' own twin invokes -- directly
+// (authorize's own check is pure role logic, no store, so no Postgres is
+// needed here), and validates the REAL body it writes against the SAME
+// bundled schema narvi_list_models advertises as its OutputSchema. The
+// real catalog (internal/app/modelcatalog's own compiled-in snapshot)
+// has multiple models with zero variants (google's gemini-2.0-flash and
+// others), so a regression back to `Variants: m.Variants` (letting a nil
+// slice encode as JSON null) fails this test where the hand-written-body
+// test above cannot.
+func TestListModelsOutputSchema_ValidatesRealCatalogBody(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/models", nil)
+	req = req.WithContext(platform.WithUser(req.Context(), testUser))
+	rec := httptest.NewRecorder()
+	httpapi.GetModelCatalog()(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("httpapi.GetModelCatalog(): status = %d, body = %s, want 200", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.Bytes()
+
+	if strings.Contains(string(body), `"variants":null`) {
+		t.Errorf("the real model catalog body contains \"variants\":null -- round 1 finding M5's fix (nonNilStrings, httpapi/modelcatalog.go) has regressed:\n%s", body)
+	}
+
+	bundled, err := bundleOutputSchema("ModelCatalog")
+	if err != nil {
+		t.Fatalf("bundleOutputSchema(%q) error = %v", "ModelCatalog", err)
+	}
+	bundledJSON, err := json.Marshal(bundled)
+	if err != nil {
+		t.Fatalf("marshal bundled schema: %v", err)
+	}
+	c := jsonschema.NewCompiler()
+	c.AssertFormat()
+	doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(bundledJSON))
+	if err != nil {
+		t.Fatalf("decode bundled schema: %v", err)
+	}
+	const resourceURL = "mem://bundled-real-catalog.json"
+	if err := c.AddResource(resourceURL, doc); err != nil {
+		t.Fatalf("add bundled schema resource: %v", err)
+	}
+	sch, err := c.Compile(resourceURL)
+	if err != nil {
+		t.Fatalf("compile bundled schema: %v", err)
+	}
+
+	inst, err := jsonschema.UnmarshalJSON(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("decode real catalog body: %v", err)
+	}
+	if err := sch.Validate(inst); err != nil {
+		t.Errorf("the real model catalog body does not validate against narvi_list_models' own advertised outputSchema: %v\nbody: %s", err, body)
+	}
 }
