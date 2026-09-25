@@ -86,14 +86,106 @@ func TestRejectBatches_SingleCallStillWorks(t *testing.T) {
 // TestRejectBatches_LeadingWhitespaceSingleCallStillWorks proves a
 // legitimate single call prefixed with insignificant whitespace (legal
 // JSON, and not a batch) is still forwarded correctly, byte for byte --
-// peekFirstNonSpaceByte's own bufio.Reader must re-serve every peeked
-// byte to the SDK, not just the ones after the first non-space one.
+// rejectBatches' own full-body read must reinstall EVERY byte it read,
+// not just the ones after the first non-space one.
 func TestRejectBatches_LeadingWhitespaceSingleCallStillWorks(t *testing.T) {
 	handler := newTestHandler(t, true, true, testTwins())
 	body := "  \n" + callToolBody(1, "narvi_list_models", "{}")
 	status, respBody := rawPost(t, handler, "/mcp", body, callToolHeaders("narvi_list_models"))
 	if status != http.StatusOK {
 		t.Fatalf("status = %d, body = %s, want 200", status, respBody)
+	}
+}
+
+// TestRejectBatches_WhitespacePrefixLengthIrrelevant is the direct
+// regression test for round 3 review findings R1/R2 (both HIGH): a prior
+// revision of rejectBatches peeked only the first 64 bytes of the body
+// (batchPeekBytes) through a bufio.Reader, and treated a peek that was
+// ENTIRELY whitespace as "not a batch" -- forwarding the WHOLE body,
+// batch and all, straight to versionGate and the SDK. The SDK's own
+// batch decoder skips leading whitespace with NO length bound, so any
+// amount of padding at or beyond the look-ahead window defeated the
+// look-ahead outright: a body of 64 spaces followed by hundreds of
+// legacy tools/call objects (well under the 64 KiB cap, no
+// MCP-Protocol-Version header) sailed through as a non-batch and fanned
+// out every call concurrently -- the exact N2 amplification this gate
+// exists to close. This table proves the fix has NO such boundary: every
+// padding length from 0 up to just under the body cap is refused
+// identically, with -32600 and ZERO twin invocations, while a
+// non-batch single call with the SAME large whitespace prefix still
+// works.
+func TestRejectBatches_WhitespacePrefixLengthIrrelevant(t *testing.T) {
+	batchArray := func(prefix string) string {
+		return prefix + "[" + callToolBody(1, "narvi_list_models", "{}") + "," + callToolBody(2, "narvi_list_models", "{}") + "]"
+	}
+
+	cases := []struct {
+		name   string
+		prefix string
+	}{
+		{"no padding", ""},
+		{"63 spaces (just under the old 64-byte window)", strings.Repeat(" ", 63)},
+		{"64 spaces (exactly the old window)", strings.Repeat(" ", 64)},
+		{"65 spaces (one past the old window)", strings.Repeat(" ", 65)},
+		{"1000 spaces", strings.Repeat(" ", 1000)},
+		{"32 CRLF pairs", strings.Repeat("\r\n", 32)},
+		{"70 tabs", strings.Repeat("\t", 70)},
+		{"mixed whitespace", strings.Repeat(" \t\r\n", 200)},
+		{"whitespace up to just under the cap", strings.Repeat(" ", MaxRequestBodyBytes-1024)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			invoked := 0
+			twins := testTwins()
+			twins.ListModels = func(w http.ResponseWriter, _ *http.Request) {
+				invoked++
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"providers":[]}`))
+			}
+			handler := newTestHandler(t, true, true, twins)
+
+			status, body := rawPost(t, handler, "/mcp", batchArray(tc.prefix), nil)
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, body = %s, want 400 (a batch, however much whitespace precedes it, must always be refused)", status, body)
+			}
+			if invoked != 0 {
+				t.Fatalf("twin invoked %d times, want 0 -- a refused batch must never reach a tool, regardless of leading whitespace length", invoked)
+			}
+
+			var env jsonrpcEnvelope
+			if err := json.Unmarshal(body, &env); err != nil {
+				t.Fatalf("unmarshal: %v (body: %s)", err, body)
+			}
+			if env.Error == nil || env.Error.Code != codeInvalidRequest {
+				t.Fatalf("error = %+v, want -32600", env.Error)
+			}
+		})
+	}
+}
+
+// TestRejectBatches_LargeWhitespacePrefixSingleCallStillWorks proves the
+// fix above does not overcorrect: a legitimate SINGLE call (not an
+// array) preceded by a large amount of insignificant whitespace -- well
+// past the old 64-byte look-ahead window -- still reaches its twin
+// exactly once, with the response the twin returned.
+func TestRejectBatches_LargeWhitespacePrefixSingleCallStillWorks(t *testing.T) {
+	invoked := 0
+	twins := testTwins()
+	twins.ListModels = func(w http.ResponseWriter, _ *http.Request) {
+		invoked++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"providers":[]}`))
+	}
+	handler := newTestHandler(t, true, true, twins)
+
+	body := strings.Repeat(" \t\r\n", 500) + callToolBody(1, "narvi_list_models", "{}")
+	status, respBody := rawPost(t, handler, "/mcp", body, callToolHeaders("narvi_list_models"))
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, body = %s, want 200", status, respBody)
+	}
+	if invoked != 1 {
+		t.Fatalf("twin invoked %d times, want exactly 1", invoked)
 	}
 }
 

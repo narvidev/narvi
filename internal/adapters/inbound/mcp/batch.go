@@ -1,24 +1,16 @@
 package mcp
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 )
 
 // codeInvalidRequest is JSON-RPC 2.0's own "Invalid Request" error code.
 const codeInvalidRequest = -32600
-
-// batchPeekBytes bounds rejectBatches' own look-ahead: a JSON-RPC request
-// body may legally begin with a little insignificant whitespace before
-// its first structural byte ('{' for a single call, '[' for a legacy
-// batch), but never more than a token amount of it in practice. 64 bytes
-// is generous for that and nothing else -- this is a look-AHEAD, not a
-// read limit on the request as a whole (MaxRequestBodyBytes, versions.go,
-// still bounds the full body, enforced downstream by the SDK's own
-// StreamableHTTPOptions.MaxRequestBodyBytes).
-const batchPeekBytes = 64
 
 // batchRejectedBody is the JSON-RPC 2.0 error envelope rejectBatches
 // writes -- deliberately carrying no "data" and always "id":null: a
@@ -55,60 +47,67 @@ type batchRejectedErr struct {
 // amplification entirely, rather than merely capping it, and needs no
 // new platform/timeouts.go entry since nothing here waits on anything.
 //
-// A request whose body is not an array is forwarded completely
-// unconsumed: peekFirstNonSpaceByte below reads only a small, bounded
-// look-ahead through a bufio.Reader and reinstalls THAT reader (buffered
-// bytes included) as r.Body, so every byte the caller sent still reaches
-// versionGate and the SDK afterward, untouched.
+// This reads the ENTIRE request body -- never a bounded look-ahead --
+// before deciding (round 3 review of PR #324, findings R1/R2: a prior
+// revision peeked only the first batchPeekBytes=64 bytes through a
+// bufio.Reader, and treated a peek that was ENTIRELY whitespace as "not a
+// batch", forwarding the body untouched. RFC 8259's own insignificant
+// whitespace allowance -- space, tab, LF, CR -- has NO length bound, and
+// the pinned SDK's own batch decoder (segmentio/encoding/json, reached
+// through go-sdk's readBatch) skips exactly that same unbounded run
+// before deciding whether a body is a batch. A look-ahead of ANY fixed
+// size N is therefore a gate an attacker defeats trivially, with N bytes
+// of leading whitespace -- proven against the 64-byte window: a body of
+// 64 spaces followed by hundreds of legacy tools/call objects, comfortably
+// under the 64 KiB cap, sailed through as "not a batch" and fanned out
+// exactly like the original, un-fixed N2 defect). Reading the whole body
+// here costs nothing extra that was not already going to be spent: the
+// body is capped at MaxRequestBodyBytes (versions.go, 64 KiB) via the
+// SAME http.MaxBytesReader shape the SDK's own StreamableHTTPOptions.
+// MaxRequestBodyBytes already applies downstream, and the SDK was always
+// going to io.ReadAll that identical body itself (streamable.go's
+// servePOST) -- this handler merely performs that read ONE call earlier,
+// then reinstalls the exact same bytes for the SDK to read again.
 func rejectBatches(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, isBatch, err := peekFirstNonSpaceByte(r)
-		if err != nil {
-			// Could not even peek the body -- let the SDK's own body
-			// handling (and MaxRequestBodyBytes) answer for it; this
-			// gate has nothing useful to add for an I/O error this
-			// early.
+		if r.Body == nil || r.Body == http.NoBody {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if isBatch {
+		r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBodyBytes)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			var mbe *http.MaxBytesError
+			if errors.As(err, &mbe) {
+				// Mirrors the SDK's own shape for the identical condition
+				// (go-sdk v1.8.0 mcp/streamable.go, servePOST/
+				// ephemeralConnectOpts) -- this handler now performs the
+				// capped read before the SDK ever gets the chance to, so
+				// it must answer the SAME 413 the SDK would have.
+				http.Error(w, fmt.Sprintf("request body exceeds %d bytes", mbe.Limit), http.StatusRequestEntityTooLarge)
+				return
+			}
+			http.Error(w, "failed to read body", http.StatusBadRequest)
+			return
+		}
+		if firstNonSpace(body) == '[' {
 			writeBatchRejected(w)
 			return
 		}
-		r.Body = body
+		r.Body = io.NopCloser(bytes.NewReader(body))
 		next.ServeHTTP(w, r)
 	})
 }
 
-// peekFirstNonSpaceByte looks ahead into r.Body far enough (batchPeekBytes)
-// to find its first non-whitespace byte, reporting whether that byte is
-// '[' -- the sole, well-defined signature of a JSON-RPC batch (a JSON
-// array), per RFC 8259's own four insignificant-whitespace characters
-// (space, tab, LF, CR). It returns a replacement io.ReadCloser carrying
-// the SAME bytes r.Body would have, byte for byte, whether or not this
-// turns out to be a batch: a bufio.Reader's own Peek fills its internal
-// buffer WITHOUT draining it, so wrapping that same *bufio.Reader as the
-// new body (paired with the original Close) re-serves every peeked byte
-// to the next reader, then falls through to the underlying body for the
-// rest.
-func peekFirstNonSpaceByte(r *http.Request) (io.ReadCloser, bool, error) {
-	if r.Body == nil || r.Body == http.NoBody {
-		return http.NoBody, false, nil
-	}
-	br := bufio.NewReaderSize(r.Body, batchPeekBytes)
-	peeked, err := br.Peek(batchPeekBytes)
-	if err != nil && err != io.EOF && err != bufio.ErrBufferFull {
-		return nil, false, err
-	}
-	body := struct {
-		io.Reader
-		io.Closer
-	}{br, r.Body}
-	return body, firstNonSpace(peeked) == '[', nil
-}
-
 // firstNonSpace returns the first byte of b that is not JSON insignificant
-// whitespace (RFC 8259 §2), or 0 if b is empty or entirely whitespace.
+// whitespace (RFC 8259 §2 -- space, tab, LF, CR, exactly the four bytes
+// the pinned SDK's own batch decoder also skips, with NO bound on how
+// many of them may precede the first structural byte -- round 3 review
+// of PR #324, findings R1/R2), or 0 if b is empty or entirely whitespace
+// (an entirely-whitespace body is never itself the '[' this function
+// exists to detect, so returning "not a batch" is correct either way --
+// the SDK's own downstream JSON parsing is what answers for an
+// otherwise-empty/malformed body).
 func firstNonSpace(b []byte) byte {
 	for _, c := range b {
 		switch c {

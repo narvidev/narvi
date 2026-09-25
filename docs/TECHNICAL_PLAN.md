@@ -6670,7 +6670,14 @@ multi-gigabyte buffered reply before a single byte was written back (finding N2)
 refuses any batch (a body whose first non-whitespace byte is `[`) with a single JSON-RPC `-32600`
 "batching is not supported" error at its own gate, before the SDK ever sees it, and the shrunk cap also
 bounds an unrelated cost the same review found (a single huge JSON number literal costing over a second
-of CPU in the argument validator's own integer check, finding N7) to a small fraction of that.
+of CPU in the argument validator's own integer check, finding N7) to a small fraction of that. This gate
+reads the WHOLE (already-capped) body before deciding, not a bounded look-ahead: a round 3 review of this
+Step's own fix (findings R1/R2, both high) caught a prior revision that peeked only the first 64 bytes
+through a `bufio.Reader` and treated an all-whitespace peek as "not a batch" — since RFC 8259's own
+insignificant-whitespace allowance has no length bound and the pinned SDK's own batch decoder skips
+exactly that same unbounded run, a fixed-size look-ahead of any length is a gate an attacker defeats with
+that many bytes of leading whitespace. Reading the full body first costs nothing extra: the SDK was
+always going to `io.ReadAll` that same (64 KiB-capped) body itself.
 
 ### 43.4 Protocol versions and the version gate
 
