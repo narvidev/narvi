@@ -1524,6 +1524,63 @@ func TestLoadMCPEnabled(t *testing.T) {
 	})
 }
 
+// TestLoadMCPClientRegistrationFlags covers the MCP authorization server's
+// two client-registration flags (technical plan §43.15): client ID
+// metadata documents default ON, dynamic client registration defaults OFF,
+// an explicit value carries through, and an unparseable one fails Load
+// with the flag's own error type. Flipping either default, or losing an
+// invalid-value branch, fails a row here.
+func TestLoadMCPClientRegistrationFlags(t *testing.T) {
+	cimd := func(c *platform.Config) bool { return c.MCPCIMDEnabled }
+	dcr := func(c *platform.Config) bool { return c.MCPDCREnabled }
+	isCIMDErr := func(err error) bool {
+		var e *platform.InvalidMCPCIMDEnabledError
+		return errors.As(err, &e)
+	}
+	isDCRErr := func(err error) bool {
+		var e *platform.InvalidMCPDCREnabledError
+		return errors.As(err, &e)
+	}
+	for _, tc := range []struct {
+		name    string
+		envVar  string
+		value   string
+		field   func(*platform.Config) bool
+		want    bool
+		wantErr func(error) bool
+	}{
+		{"CIMD unset defaults to true", "NARVI_MCP_CIMD_ENABLED", "", cimd, true, nil},
+		{"CIMD false carries through", "NARVI_MCP_CIMD_ENABLED", "false", cimd, false, nil},
+		{"CIMD true carries through", "NARVI_MCP_CIMD_ENABLED", "true", cimd, true, nil},
+		{"CIMD invalid fails", "NARVI_MCP_CIMD_ENABLED", "sometimes", cimd, false, isCIMDErr},
+		{"DCR unset defaults to false", "NARVI_MCP_DCR_ENABLED", "", dcr, false, nil},
+		{"DCR true carries through", "NARVI_MCP_DCR_ENABLED", "true", dcr, true, nil},
+		{"DCR false carries through", "NARVI_MCP_DCR_ENABLED", "false", dcr, false, nil},
+		{"DCR invalid fails", "NARVI_MCP_DCR_ENABLED", "sometimes", dcr, false, isDCRErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("NARVI_MCP_CIMD_ENABLED", "")
+			t.Setenv("NARVI_MCP_DCR_ENABLED", "")
+			t.Setenv(tc.envVar, tc.value)
+
+			cfg, err := platform.Load()
+			if tc.wantErr != nil {
+				if err == nil || !tc.wantErr(err) {
+					t.Fatalf("Load() error = %v, want the flag's own invalid-value error", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v, want nil (the flag is optional)", err)
+			}
+			if got := tc.field(cfg); got != tc.want {
+				t.Errorf("%s=%q: flag = %v, want %v", tc.envVar, tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestLoadRolloutMode covers §10's own master switch (§10 Phase 6,
 // §32) -- mirrors TestLoadEpistemicCheckDefault's own shape exactly,
 // with an explicit two-value enum in place of a boolean: unset defaults

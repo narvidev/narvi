@@ -1638,3 +1638,94 @@ func TestValidate_MCPOAuthChain(t *testing.T) {
 		})
 	}
 }
+
+// TestDefaultTimeouts_MCPClientRegistrationFields pins the client
+// registration defaults (technical plan §43.15) and that each is positive.
+func TestDefaultTimeouts_MCPClientRegistrationFields(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+	tests := []struct {
+		name string
+		got  time.Duration
+		want time.Duration
+	}{
+		{"MCPClientMetadataFetchTimeout", to.MCPClientMetadataFetchTimeout, 5 * time.Second},
+		{"MCPClientMetadataCacheTTL", to.MCPClientMetadataCacheTTL, time.Hour},
+		{"MCPDynamicClientUnusedTTL", to.MCPDynamicClientUnusedTTL, 24 * time.Hour},
+		{"MCPRegisterRateInterval", to.MCPRegisterRateInterval, 12 * time.Minute},
+	}
+	for _, tc := range tests {
+		if tc.got <= 0 || tc.got != tc.want {
+			t.Errorf("%s = %v, want %v (> 0)", tc.name, tc.got, tc.want)
+		}
+	}
+	if to.MCPRegisterRateBurst != 5 {
+		t.Errorf("MCPRegisterRateBurst = %d, want 5", to.MCPRegisterRateBurst)
+	}
+	if err := to.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+}
+
+// TestValidate_MCPClientRegistrationChain proves every client-registration
+// link and positivity check (§43.15) is checked: breaking one alone is
+// reported by name.
+func TestValidate_MCPClientRegistrationChain(t *testing.T) {
+	t.Parallel()
+
+	links := []struct {
+		name      string
+		mutate    func(*platform.Timeouts)
+		wantChain string
+	}{
+		{
+			name:      "the fetch outlasts the time its result is trusted",
+			mutate:    func(to *platform.Timeouts) { to.MCPClientMetadataFetchTimeout = to.MCPClientMetadataCacheTTL },
+			wantChain: "MCPClientMetadataCacheTTL > MCPClientMetadataFetchTimeout",
+		},
+		{
+			name:      "a cached metadata-document client is old enough to sweep",
+			mutate:    func(to *platform.Timeouts) { to.MCPDynamicClientUnusedTTL = to.MCPClientMetadataCacheTTL },
+			wantChain: "MCPDynamicClientUnusedTTL > MCPClientMetadataCacheTTL",
+		},
+		{
+			name: "a registered client is swept inside its consent window",
+			mutate: func(to *platform.Timeouts) {
+				to.MCPClientMetadataCacheTTL = to.MCPAuthorizationRequestTTL / 4
+				to.MCPDynamicClientUnusedTTL = to.MCPAuthorizationRequestTTL
+			},
+			wantChain: "MCPDynamicClientUnusedTTL > MCPAuthorizationRequestTTL",
+		},
+	}
+	for _, tc := range links {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			to := platform.DefaultTimeouts()
+			tc.mutate(&to)
+			var inv *platform.TimeoutInvariantError
+			if err := to.Validate(); !errors.As(err, &inv) || inv.Chain != tc.wantChain {
+				t.Fatalf("Validate() = %v, want exactly the broken link %q", err, tc.wantChain)
+			}
+		})
+	}
+
+	t.Run("a zero registration interval is no limit at all", func(t *testing.T) {
+		t.Parallel()
+		to := platform.DefaultTimeouts()
+		to.MCPRegisterRateInterval = 0
+		var pos *platform.TimeoutMustBePositiveError
+		if err := to.Validate(); !errors.As(err, &pos) || pos.Field != "MCPRegisterRateInterval" {
+			t.Fatalf("Validate() = %v, want MCPRegisterRateInterval refused as non-positive", err)
+		}
+	})
+	t.Run("a registration burst below one refuses everything", func(t *testing.T) {
+		t.Parallel()
+		to := platform.DefaultTimeouts()
+		to.MCPRegisterRateBurst = 0
+		var cnt *platform.CountMustBePositiveError
+		if err := to.Validate(); !errors.As(err, &cnt) || cnt.Field != "MCPRegisterRateBurst" {
+			t.Fatalf("Validate() = %v, want MCPRegisterRateBurst refused as below one", err)
+		}
+	})
+}

@@ -1183,6 +1183,48 @@ func (e *InvalidMCPEnabledError) Error() string {
 	return fmt.Sprintf("invalid %s=%q: must be a boolean (true/false/1/0/T/F/...)", mcpEnabledEnvVarName, e.Value)
 }
 
+// mcpCIMDEnabledEnvVarName configures whether the MCP authorization
+// server accepts client ID metadata documents (technical plan §43.15): a
+// client identified by an https URL whose document Narvi fetches. Optional,
+// default TRUE -- the registration mechanism current MCP clients prefer,
+// and the one a client without a prior relationship uses; its price is the
+// SSRF-guarded fetch. Parsed with the same "empty means unset, parse only
+// when present, reject anything ParseBool does not recognize" idiom as
+// NARVI_MCP_ENABLED. It matters only while the surface itself is on.
+const mcpCIMDEnabledEnvVarName = "NARVI_MCP_CIMD_ENABLED"
+
+// InvalidMCPCIMDEnabledError is returned by Load when
+// NARVI_MCP_CIMD_ENABLED is set to a value strconv.ParseBool does not
+// recognize -- InvalidMCPEnabledError's own shape, one flag over.
+type InvalidMCPCIMDEnabledError struct {
+	Value string
+}
+
+func (e *InvalidMCPCIMDEnabledError) Error() string {
+	return fmt.Sprintf("invalid %s=%q: must be a boolean (true/false/1/0/T/F/...)", mcpCIMDEnabledEnvVarName, e.Value)
+}
+
+// mcpDCREnabledEnvVarName configures whether the MCP authorization server
+// accepts RFC 7591 dynamic client registration at POST /oauth/register
+// (technical plan §43.15). Optional, default FALSE: registration is an
+// unauthenticated table write, the name a registering client gives is
+// verified by nothing, and the current MCP authorization spec deprecates
+// the mechanism -- an operator turns it on only for clients that cannot
+// use a metadata document or a pre-registered client id. Same parse idiom
+// as NARVI_MCP_ENABLED; it matters only while the surface itself is on.
+const mcpDCREnabledEnvVarName = "NARVI_MCP_DCR_ENABLED"
+
+// InvalidMCPDCREnabledError is returned by Load when NARVI_MCP_DCR_ENABLED
+// is set to a value strconv.ParseBool does not recognize --
+// InvalidMCPEnabledError's own shape, one flag over.
+type InvalidMCPDCREnabledError struct {
+	Value string
+}
+
+func (e *InvalidMCPDCREnabledError) Error() string {
+	return fmt.Sprintf("invalid %s=%q: must be a boolean (true/false/1/0/T/F/...)", mcpDCREnabledEnvVarName, e.Value)
+}
+
 // RolloutMode is a type ALIAS (not a new, parallel type) for
 // internal/domain/rollout.Mode -- Config.RolloutMode below is spelled
 // platform.RolloutMode purely so every one of this Step's own call sites
@@ -1798,6 +1840,24 @@ type Config struct {
 	// that is off must be observable as off, never a missing route").
 	MCPEnabled bool
 
+	// MCPCIMDEnabled is whether the MCP authorization server accepts
+	// client ID metadata documents (technical plan §43.15), read from
+	// NARVI_MCP_CIMD_ENABLED. Optional: defaults to TRUE. Off, an https
+	// client_id is an unknown client, the authorization-server metadata
+	// stops advertising client_id_metadata_document_supported, and every
+	// metadata-document client already stored is refused like a disabled
+	// one -- at authorization, consent, the token endpoint and on /mcp.
+	MCPCIMDEnabled bool
+
+	// MCPDCREnabled is whether the MCP authorization server accepts RFC
+	// 7591 dynamic client registration (technical plan §43.15), read from
+	// NARVI_MCP_DCR_ENABLED. Optional: defaults to FALSE. Off, POST
+	// /oauth/register answers the surface's own disabled response (the
+	// route is mounted either way), the metadata omits
+	// registration_endpoint, and every dynamically registered client
+	// already stored is refused like a disabled one.
+	MCPDCREnabled bool
+
 	// GitHubAppID and GitHubAppPrivateKey are §30.4's own GitHub App
 	// plumbing, read from NARVI_GITHUB_APP_ID / NARVI_GITHUB_APP_PRIVATE_KEY
 	// (both required in every stage -- see gitHubAppIDEnvVarName's own doc
@@ -2370,6 +2430,29 @@ func load(lookupEnv func(string) (string, bool)) (*Config, error) {
 		}
 	}
 
+	// mcpCIMDEnabled / mcpDCREnabled (§43.15): optional, mcpEnabled's own
+	// idiom immediately above -- but client ID metadata documents default
+	// ON and dynamic registration defaults OFF (each constant's own doc
+	// comment says why).
+	mcpCIMDEnabled := true
+	if raw := getenv(mcpCIMDEnabledEnvVarName); raw != "" {
+		parsed, parseErr := strconv.ParseBool(raw)
+		if parseErr != nil {
+			errs = append(errs, &InvalidMCPCIMDEnabledError{Value: raw})
+		} else {
+			mcpCIMDEnabled = parsed
+		}
+	}
+	mcpDCREnabled := false
+	if raw := getenv(mcpDCREnabledEnvVarName); raw != "" {
+		parsed, parseErr := strconv.ParseBool(raw)
+		if parseErr != nil {
+			errs = append(errs, &InvalidMCPDCREnabledError{Value: raw})
+		} else {
+			mcpDCREnabled = parsed
+		}
+	}
+
 	// gitHubAppID/gitHubAppPrivateKey (§30.4): required in every stage --
 	// see gitHubAppIDEnvVarName's own doc comment for why this differs
 	// from gitHubImageBuildToken's own optional precedent immediately
@@ -2675,6 +2758,8 @@ func load(lookupEnv func(string) (string, bool)) (*Config, error) {
 		RolloutMode:                rolloutMode,
 		ShadowMode:                 shadowMode,
 		MCPEnabled:                 mcpEnabled,
+		MCPCIMDEnabled:             mcpCIMDEnabled,
+		MCPDCREnabled:              mcpDCREnabled,
 		GitHubAppID:                gitHubAppID,
 		GitHubAppPrivateKey:        gitHubAppPrivateKey,
 		GitHubAPIBaseURL:           gitHubAPIBaseURL,
