@@ -7028,8 +7028,9 @@ scopes, and answers `access_token`, `token_type` `Bearer`, `expires_in`, `scope`
 because the user may have narrowed it, and always the tokens' own scopes — and `refresh_token`.
 
 **The refresh grant** takes `refresh_token`, an optional `scope` and an optional `resource`. A
-`resource` that is sent must be this deployment's canonical resource (`invalid_target`); a standard
-OAuth library sends none, since the grant already binds the token to it. A `scope` must name only
+`resource` that is sent must be this deployment's canonical resource, and so must the grant's own
+(`invalid_target` either way); a standard OAuth library sends none, since the grant already binds the
+token to it. A `scope` must name only
 advertised scopes (`invalid_scope`), and each must be one the PRESENTED refresh token holds — its own
 scopes, hierarchy included (`mcpscope.Covers`), never the grant's — so a refresh narrows or keeps, and
 never widens (`invalid_scope`); an absent `scope` keeps the presented token's scopes. Presenting a
@@ -7044,8 +7045,9 @@ narrowing asked for.
 
 **The revocation endpoint** (`POST /oauth/revoke`, RFC 7009) takes `token`, an optional
 `token_type_hint`, and the same public-client identification as the token endpoint. A request that
-cannot be read is `invalid_request`, and one whose client cannot be identified is `invalid_client`;
-every other request is answered `200` with an empty body, whatever happened. If the token — an access
+cannot be read or names no `token` is `invalid_request`, one whose client cannot be identified is
+`invalid_client`, and a database failure is a `500` (so the client knows nothing was revoked); every
+other request is answered `200` with an empty body, whatever happened. If the token — an access
 token or a refresh token, expired or rotated or not; the hint only decides which is looked up first —
 was issued to the requesting client, its whole grant is deleted, so both token types revoke the same
 thing. A token that is unknown, already gone, or issued to another client is left alone and gets the
