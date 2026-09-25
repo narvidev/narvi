@@ -594,12 +594,17 @@ func TestToolCall_TwinPanicIsRecovered(t *testing.T) {
 // compile passes this test; only an isolated run shows the race. A
 // cold-process re-exec would close that, but it needs os/exec, which
 // tools/lint/narvichecks' execimportban forbids in this tree, test files
-// included. The order-independent guarantee is
-// TestToolHandler_ValidatesOnlyAgainstTheInjectedSchemaMap
-// (toolhandler_test.go), which fails whenever toolHandler validates
-// against anything but the map it is handed, cache warm or not; this
-// test stays as the runtime check for races in per-handler
-// state and in the concurrent Validate path itself.
+// included. So this test is not what keeps the request path from
+// compiling (round 6 review, findings U1/U2/U3; the top of
+// toolhandler_test.go has the full account). newHandler refuses a
+// schema map with a missing or nil entry and serves from a private copy
+// taken at construction. TestInjectedSchemaMap_DecidesEveryToolCall
+// fails, cache warm or not, whenever any layer of newHandler's request
+// path validates against something other than that map. Neither can see
+// a request-path compile whose result is discarded, since that changes
+// no outcome; only an isolated run of this test does. This test stays
+// as the runtime check for races in per-handler state and in the
+// concurrent Validate path itself.
 func TestToolCall_ConcurrentFirstCalls_NoRace(t *testing.T) {
 	const n = 64
 	handler := newTestHandler(t, true, true, testTwins())

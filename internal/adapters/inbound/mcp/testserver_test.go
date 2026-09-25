@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/go-chi/chi/v5"
+	jsonschema "github.com/santhosh-tekuri/jsonschema/v6"
 
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -80,7 +81,9 @@ const testPublicBaseURL = "http://example.test"
 // dependency-free one. Every unit test in this file and its siblings
 // trusts testPublicBaseURL; a test that needs a DIFFERENT trusted origin
 // (e.g. an https or IPv6 PublicBaseURL -- round 4 review of PR #324,
-// finding S8) calls newTestHandlerWithBaseURL directly instead.
+// finding S8) calls newTestHandlerWithBaseURL directly instead, and a
+// test that needs to choose the tool input schema map calls
+// newTestHandlerWithInputSchemas.
 func newTestHandler(t testing.TB, enabled, authenticated bool, twins Twins) http.Handler {
 	t.Helper()
 	return newTestHandlerWithBaseURL(t, enabled, authenticated, twins, testPublicBaseURL)
@@ -95,13 +98,39 @@ func newTestHandler(t testing.TB, enabled, authenticated bool, twins Twins) http
 func newTestHandlerWithBaseURL(t testing.TB, enabled, authenticated bool, twins Twins, baseURL string) http.Handler {
 	t.Helper()
 	cfg := Config{PublicBaseURL: baseURL}
-	originGate, err := RequireTrustedOrigin(cfg)
-	if err != nil {
-		t.Fatalf("RequireTrustedOrigin: %v", err)
-	}
 	mcpHandler, err := NewHandler(cfg, twins)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
+	}
+	return mountTestRoute(t, cfg, enabled, authenticated, mcpHandler)
+}
+
+// newTestHandlerWithInputSchemas is newTestHandler(t, true, true, twins)
+// built with newHandler and inputSchemas in place of NewHandler and the
+// map NewHandler compiles itself (round 6 review of PR #324, findings
+// U1/U2/U3): the same route shape, gate order, middleware chain,
+// per-request closure, buildServer and registerTools, with only the
+// schema map chosen by the test. newHandler refusing inputSchemas fails
+// the calling test; a test that expects the refusal calls newHandler
+// directly.
+func newTestHandlerWithInputSchemas(t testing.TB, twins Twins, inputSchemas map[string]*jsonschema.Schema) http.Handler {
+	t.Helper()
+	cfg := Config{PublicBaseURL: testPublicBaseURL}
+	mcpHandler, err := newHandler(cfg, twins, inputSchemas)
+	if err != nil {
+		t.Fatalf("newHandler: %v", err)
+	}
+	return mountTestRoute(t, cfg, true, true, mcpHandler)
+}
+
+// mountTestRoute mounts mcpHandler at POST /mcp behind the /mcp route
+// group's own gates, in controlplane/serve.go's order (newTestHandler's
+// doc comment).
+func mountTestRoute(t testing.TB, cfg Config, enabled, authenticated bool, mcpHandler http.Handler) http.Handler {
+	t.Helper()
+	originGate, err := RequireTrustedOrigin(cfg)
+	if err != nil {
+		t.Fatalf("RequireTrustedOrigin: %v", err)
 	}
 	router := chi.NewRouter()
 	router.Route("/mcp", func(r chi.Router) {

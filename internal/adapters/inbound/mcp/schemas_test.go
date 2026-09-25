@@ -340,13 +340,16 @@ func (s jsonschemaRefSite) String() string {
 // dies with "fatal error: concurrent map writes", which no recover
 // catches.
 //
-// This test is NOT the guarantee. The guarantee is behavioural:
-// TestToolHandler_ValidatesOnlyAgainstTheInjectedSchemaMap
-// (toolhandler_test.go) proves toolHandler decides whether arguments are
-// valid from the eagerly compiled map it is handed and from nothing else,
-// so a lazy path that toolHandler validates against fails it whatever
-// its shape (round 5 review, finding T1: three different shapes passed a
-// static check alone).
+// This test is an early warning with the documented gaps below, NOT the
+// guarantee (round 5 review, finding T1: three different lazy shapes
+// passed a static check alone). The guarantee is structural plus one
+// behavioural test at the outermost seam, both described at the top of
+// toolhandler_test.go (round 6 review, findings U1/U2/U3): newHandler
+// refuses to build a handler without a complete schema map and serves
+// every request from a private copy taken at construction; and
+// TestInjectedSchemaMap_DecidesEveryToolCall drives newHandler's full
+// HTTP path with a reject-all and an accept-all map, so any layer that
+// validates a request against something other than that map fails it.
 //
 // What this test checks, for every non-_test.go file of this package in
 // every shippedBuildContexts entry, resolving identifiers with go/types
@@ -366,7 +369,7 @@ func (s jsonschemaRefSite) String() string {
 //     a host it does not match -- deliberately loud, since none exists in
 //     this package today.
 //
-// What it does NOT catch, by construction (the behavioural test does):
+// What it does NOT catch, by construction:
 //
 //   - a Compile called through a package-local interface -- that
 //     reference resolves to the interface's own method, not to
@@ -375,6 +378,12 @@ func (s jsonschemaRefSite) String() string {
 //     per request, or handed a shared compiler), because every reference
 //     then sits inside the allowed function;
 //   - reflection or any other dynamic dispatch.
+//
+// Each of these fails TestInjectedSchemaMap_DecidesEveryToolCall when a
+// request validates against its result. When nothing does -- a
+// request-path compile whose result is discarded -- no outcome changes,
+// and only an isolated `go test -race -run
+// TestToolCall_ConcurrentFirstCalls_NoRace` shows it.
 func TestNoSecondJSONSchemaCompiler(t *testing.T) {
 	// Keyed by the reference's own file:line:column, so a file compiled
 	// in more than one build context is counted once.
