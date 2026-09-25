@@ -138,6 +138,101 @@ func TestOrigin_DNSRebindingRefused(t *testing.T) {
 	}
 }
 
+// TestOrigin_NearMissesRefused is a table test against the REAL
+// RequireTrustedOrigin (round 3 review of PR #324, finding R4): every
+// existing test in this file that asserts a 403 sends an Origin whose
+// entire HOST differs from the trusted origin ("http://example.test" --
+// testPublicBaseURL), so a comparison weakened along a single axis --
+// ignore the port, ignore the scheme, accept a subdomain, accept "null",
+// or match only a PREFIX of the trusted origin string -- would still pass
+// every one of them. This table instead varies exactly ONE dimension per
+// case, so a comparison weakened along any single axis is caught.
+//
+// Run through BOTH the disabled and the unauthenticated handler
+// configuration, never enabled+authenticated: those two later gates
+// (RequireEnabled, auth.Middleware) answer their OWN status (503/401) for
+// the trusted origin, so RequireTrustedOrigin's own result -- 403 or not
+// -- is never masked by NewHandler's own separate, inner
+// CrossOriginProtection layer, which only ever runs once a request has
+// already cleared enabled+authenticated (see
+// TestNewHandler_InnerCrossOriginProtection_RefusesCrossSite's own doc
+// comment).
+func TestOrigin_NearMissesRefused(t *testing.T) {
+	cases := []struct {
+		name    string
+		origin  string
+		refused bool
+	}{
+		{"exact trusted origin", "http://example.test", false},
+		{"different port", "http://example.test:8080", true},
+		{"different scheme", "https://example.test", true},
+		{"same-site subdomain", "http://sub.example.test", true},
+		{"parent domain", "http://test", true},
+		{"literal null", "null", true},
+		{"prefix-extended host (trusted origin string + suffix)", "http://example.test.evil.com", true},
+		{"trailing slash (still no path in the ORIGIN itself)", "http://example.test/", false},
+		{"uppercase scheme and host", "HTTP://EXAMPLE.TEST", false},
+		{"IPv6 literal, unrelated host", "http://[::1]:8080", true},
+		{"explicit default port (:80) equals implicit", "http://example.test:80", false},
+		{"explicit non-default port (:443)", "http://example.test:443", true},
+	}
+
+	for _, gate := range []struct {
+		name          string
+		enabled, auth bool
+	}{
+		{"disabled", false, true},
+		{"unauthenticated", true, false},
+	} {
+		t.Run(gate.name, func(t *testing.T) {
+			handler := newTestHandler(t, gate.enabled, gate.auth, testTwins())
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					status, body := rawPost(t, handler, "/mcp", `{}`, map[string]string{"Origin": tc.origin})
+					if tc.refused {
+						if status != http.StatusForbidden {
+							t.Fatalf("Origin %q: status = %d, body = %s, want 403 (refused)", tc.origin, status, body)
+						}
+						return
+					}
+					if status == http.StatusForbidden {
+						t.Fatalf("Origin %q: status = %d, body = %s, want NOT 403 (this origin must pass RequireTrustedOrigin)", tc.origin, status, body)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestOrigin_AbsentOriginCrossSiteFetchMetadataRefused pins the other
+// half of finding R4: RequireTrustedOrigin's own doc comment (and
+// technical plan §43.2) claim "a request with no Origin header at all
+// (every non-browser MCP client) passes" -- but a BROWSER making a
+// cross-site request always sets its own Sec-Fetch-Site fetch-metadata
+// header, a value script cannot forge, so a request naming
+// "cross-site" there despite carrying no Origin is a browser under attack
+// conditions this deployment has no legitimate reason to accept, and must
+// be refused exactly like a bad Origin would be. A request with NEITHER
+// header (the ordinary non-browser MCP client this surface targets) still
+// passes.
+func TestOrigin_AbsentOriginCrossSiteFetchMetadataRefused(t *testing.T) {
+	handler := newTestHandler(t, true, true, testTwins())
+
+	t.Run("no Origin, Sec-Fetch-Site: cross-site -> refused", func(t *testing.T) {
+		status, body := rawPost(t, handler, "/mcp", `{}`, map[string]string{"Sec-Fetch-Site": "cross-site"})
+		if status != http.StatusForbidden {
+			t.Fatalf("status = %d, body = %s, want 403", status, body)
+		}
+	})
+
+	t.Run("no Origin, no Sec-Fetch-Site -> passes (non-browser client)", func(t *testing.T) {
+		status, body := rawPost(t, handler, "/mcp", `{}`, nil)
+		if status == http.StatusForbidden {
+			t.Fatalf("status = %d, body = %s, want NOT 403", status, body)
+		}
+	})
+}
+
 // TestNewHandler_InnerCrossOriginProtection_RefusesCrossSite pins the fix
 // for round 2 review finding N19: NewHandler's OWN doc comment calls its
 // returned handler "Origin-protected" as a second, defense-in-depth

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -100,18 +101,40 @@ func RequireTrustedOrigin(cfg Config) (func(http.Handler) http.Handler, error) {
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if origin := r.Header.Get("Origin"); origin != "" {
-				got, err := originOf(origin)
-				if err != nil || got != trusted {
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusForbidden)
-					_, _ = w.Write([]byte(originForbiddenBody))
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				// No Origin header at all: per this function's own doc
+				// comment, every non-browser MCP client passes. A BROWSER
+				// making a cross-site request, though, always sets its own
+				// Sec-Fetch-Site fetch-metadata header (a caller cannot
+				// forge or omit this from script -- the user agent alone
+				// sets it), so a request naming "cross-site" here despite
+				// carrying no Origin is refused too (round 3 review of PR
+				// #324, finding R4): this handler's own doc comment already
+				// claimed exactly this outcome, but the code never checked
+				// it.
+				if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+					writeOriginForbidden(w)
 					return
 				}
+				next.ServeHTTP(w, r)
+				return
+			}
+			got, err := originOf(origin)
+			if err != nil || got != trusted {
+				writeOriginForbidden(w)
+				return
 			}
 			next.ServeHTTP(w, r)
 		})
 	}, nil
+}
+
+// writeOriginForbidden writes RequireTrustedOrigin's own fixed 403 body.
+func writeOriginForbidden(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusForbidden)
+	_, _ = w.Write([]byte(originForbiddenBody))
 }
 
 // NewHandler builds the complete /mcp POST handler (technical plan §43):
@@ -180,9 +203,20 @@ func NewHandler(cfg Config, twins Twins) (http.Handler, error) {
 	return rejectBatches(versionGate(sdkHandler)), nil
 }
 
-// originOf parses rawURL (platform.Config.PublicBaseURL) into its own
-// origin -- scheme + host, no path -- the shape net/http.
-// CrossOriginProtection.AddTrustedOrigin requires.
+// originOf parses rawURL (platform.Config.PublicBaseURL, or an incoming
+// request's own Origin header value) into its own CANONICAL origin --
+// scheme + host + (non-default) port, no path -- the shape net/http.
+// CrossOriginProtection.AddTrustedOrigin requires, and the same shape
+// RequireTrustedOrigin above compares two origins by (round 3 review of
+// PR #324, finding R4). Per RFC 6454 §4/§5 ("Origin of a URI", "Serializing
+// an Origin"): the scheme and host are compared CASE-INSENSITIVELY, and a
+// port that is absent is exactly equivalent to that scheme's own default
+// port made explicit (":80" for "http", ":443" for "https") -- so
+// "HTTP://EXAMPLE.test" and "http://example.test:80" must both resolve to
+// the identical string this function returns for "http://example.test".
+// canonicalOrigin (below) does that normalization; url.URL.Hostname()/
+// Port() (rather than the raw, still-bracketed-for-IPv6 u.Host) is what
+// makes it safe for an IPv6-literal host too.
 func originOf(rawURL string) (string, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -191,7 +225,41 @@ func originOf(rawURL string) (string, error) {
 	if u.Scheme == "" || u.Host == "" {
 		return "", fmt.Errorf("not an absolute URL (missing scheme or host): %q", rawURL)
 	}
-	return u.Scheme + "://" + u.Host, nil
+	return canonicalOrigin(u.Scheme, u.Hostname(), u.Port()), nil
+}
+
+// defaultPortFor returns scheme's own default port ("" for a scheme this
+// function does not know, which canonicalOrigin then never strips).
+func defaultPortFor(scheme string) string {
+	switch scheme {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
+}
+
+// canonicalOrigin serializes scheme/hostname/port into the ONE string two
+// origins are compared by, applying RFC 6454's own two case-INsensitivity
+// rules (scheme, host) and stripping a port that is exactly that scheme's
+// own default (an EXPLICIT ":80" on "http", or ":443" on "https", is the
+// same origin as no port at all -- round 3 review of PR #324, finding
+// R4). hostname must already be bracket-free (url.URL.Hostname()'s own
+// contract); an IPv6 literal is re-bracketed here, after lower-casing,
+// only if it still contains a ':' -- exactly the shape
+// AddTrustedOrigin/url.Parse expects back.
+func canonicalOrigin(scheme, hostname, port string) string {
+	scheme = strings.ToLower(scheme)
+	host := strings.ToLower(hostname)
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	if port != "" && port != defaultPortFor(scheme) {
+		host += ":" + port
+	}
+	return scheme + "://" + host
 }
 
 // serverOptions is shared by buildServer's own real path and its defect
