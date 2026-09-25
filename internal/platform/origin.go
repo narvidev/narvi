@@ -17,7 +17,7 @@ import (
 // CanonicalOrigin parses rawURL (a configured base URL such as
 // Config.PublicBaseURL, or an incoming request's own Origin header value)
 // into its CANONICAL origin -- scheme + host + non-default port, no path --
-// the one string two origins are compared by. Per RFC 6454 §4/§5 ("Origin
+// the one string two origins are compared by. Per RFC 6454 section 4/section 5 ("Origin
 // of a URI", "Serializing an Origin"), scheme and host compare
 // case-insensitively, and an absent port is exactly the scheme's own
 // default port made explicit (":80" for http, ":443" for https): so

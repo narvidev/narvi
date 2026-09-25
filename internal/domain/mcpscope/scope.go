@@ -111,7 +111,7 @@ func Advertised(required []Scope) []Scope {
 // the offered set.
 var ErrUnknownScope = errors.New("mcpscope: scope not offered")
 
-// ParseRequested parses an OAuth "scope" parameter (RFC 6749 §3.3:
+// ParseRequested parses an OAuth "scope" parameter (RFC 6749 section 3.3:
 // space-delimited, case-sensitive) against offered, returning the
 // requested scopes in canonical order without duplicates. An empty or
 // all-whitespace value is a legitimate request for no scopes at all and

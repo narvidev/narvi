@@ -29,7 +29,7 @@ type twin struct {
 }
 
 // callTwin invokes t.handler in-process, through an httptest recorder,
-// with ctx (the MCP request's own context AFTER auth.Middleware ran --
+// with ctx (the MCP request's own context AFTER auth.RequireMCPBearer ran --
 // see handler.go's getServer) carrying the authenticated
 // platform.AuthenticatedUser forward exactly as if this were a real
 // /api/** request. urlParams populates chi's own URLParams the same way
@@ -62,7 +62,12 @@ type twin struct {
 // left for attacker data to corrupt in the first place). Building the
 // *http.Request directly instead means Header is always a freshly
 // allocated, empty http.Header: no header or cookie derived from a tool
-// argument can ever reach the synthesized request.
+// argument can ever reach the synthesized request -- and neither can the
+// bearer token that authenticated the MCP request itself. The MCP
+// authorization spec forbids passing that token through (technical plan
+// §43.16); the twin authorizes from the context principal, never from a
+// credential, and TestBridge_NoAuthorizationHeaderReachesTwin pins that
+// the request it receives carries no header at all.
 func callTwin(ctx context.Context, t twin, urlParams map[string]string, query url.Values) (status int, body []byte) {
 	path := t.pathTemplate
 	for name, value := range urlParams {

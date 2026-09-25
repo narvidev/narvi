@@ -38,15 +38,31 @@ var testUser = platform.AuthenticatedUser{
 	Email: "test@example.com",
 }
 
-// fakeAuth is a MINIMAL stand-in for auth.Middleware's own OBSERVABLE
-// contract, used only by this package's own unit tests (never a
+// testGrantScopes is the grant every unit test's fakeAuth attaches unless
+// a test chooses otherwise: every scope this build advertises, so the
+// full tool table is visible -- what a user who approved everything gets.
+var testGrantScopes = []string{"mcp:read"}
+
+// fakeAuth is a MINIMAL stand-in for auth.RequireMCPBearer's own
+// OBSERVABLE contract, used only by this package's own unit tests (never a
 // reimplementation of its real, DB-backed logic -- that stays tested in
-// its own package and reused UNCHANGED by the real parity tests in
-// integration_test.go): authenticated==true injects platform.WithUser
-// before calling next, exactly like the real middleware after a valid
-// cookie resolves; authenticated==false writes the SAME generic 401 body
-// auth.Middleware's own writeUnauthorized writes on every rejection path.
+// its own package, and the real gate is what integration_test.go and
+// oauth_integration_test.go mount): authenticated==true injects
+// platform.WithUser AND platform.WithMCPGrant (testGrantScopes) before
+// calling next, exactly like the real gate after a valid token resolves;
+// authenticated==false writes the SAME generic 401 body the real gate
+// writes on every rejection path. Unlike the real gate it does NOT strip
+// the Authorization header -- deliberately, so the bridge's own
+// empty-header request is proven on its own
+// (TestBridge_NoAuthorizationHeaderReachesTwin).
 func fakeAuth(authenticated bool, user platform.AuthenticatedUser) func(http.Handler) http.Handler {
+	return fakeAuthWithGrant(authenticated, user, &testGrantScopes)
+}
+
+// fakeAuthWithGrant is fakeAuth with the grant's scopes chosen by the
+// test; a nil scopes pointer attaches NO grant at all (the defect case
+// buildServer must answer with an empty server).
+func fakeAuthWithGrant(authenticated bool, user platform.AuthenticatedUser, scopes *[]string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if !authenticated {
@@ -55,7 +71,11 @@ func fakeAuth(authenticated bool, user platform.AuthenticatedUser) func(http.Han
 				_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
 				return
 			}
-			next.ServeHTTP(w, r.WithContext(platform.WithUser(r.Context(), user)))
+			ctx := platform.WithUser(r.Context(), user)
+			if scopes != nil {
+				ctx = platform.WithMCPGrant(ctx, platform.MCPGrant{GrantID: "33333333-3333-3333-3333-333333333333", ClientID: "narvi_mcp_c_unit", Scopes: *scopes})
+			}
+			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }
@@ -67,7 +87,7 @@ func fakeAuth(authenticated bool, user platform.AuthenticatedUser) func(http.Han
 const testPublicBaseURL = "http://example.test"
 
 // newTestHandler wires the SAME /mcp route SHAPE controlplane/serve.go
-// registers (RequireTrustedOrigin, then RequireEnabled, then the auth
+// registers (RequireTrustedOrigin, then RequireEnabled, then the bearer
 // gate, then the real NewHandler -- §43.2/§43.6's own gate order) as a
 // plain http.Handler -- so this package's own unit tests exercise the
 // real gate ORDER and the real NewHandler, driven directly via ServeHTTP
@@ -77,7 +97,7 @@ const testPublicBaseURL = "http://example.test"
 // outbound trees, exactly as httpapi's own *_test.go unit tests --
 // distinct from its *_integration_test.go rig, which DOES dial a real
 // httptest.Server -- already avoid them), substituting only auth.
-// Middleware's own Postgres-backed check for fakeAuth's equivalent,
+// RequireMCPBearer's own Postgres-backed check for fakeAuth's equivalent,
 // dependency-free one. Every unit test in this file and its siblings
 // trusts testPublicBaseURL; a test that needs a DIFFERENT trusted origin
 // (e.g. an https or IPv6 PublicBaseURL -- round 4 review of PR #324,
@@ -128,6 +148,13 @@ func newTestHandlerWithInputSchemas(t testing.TB, twins Twins, inputSchemas map[
 // doc comment).
 func mountTestRoute(t testing.TB, cfg Config, enabled, authenticated bool, mcpHandler http.Handler) http.Handler {
 	t.Helper()
+	return mountTestRouteWithAuth(t, cfg, enabled, fakeAuth(authenticated, testUser), mcpHandler)
+}
+
+// mountTestRouteWithAuth is mountTestRoute with the auth stand-in chosen
+// by the test (e.g. fakeAuthWithGrant, for a specific scope set).
+func mountTestRouteWithAuth(t testing.TB, cfg Config, enabled bool, authGate func(http.Handler) http.Handler, mcpHandler http.Handler) http.Handler {
+	t.Helper()
 	originGate, err := RequireTrustedOrigin(cfg)
 	if err != nil {
 		t.Fatalf("RequireTrustedOrigin: %v", err)
@@ -136,10 +163,22 @@ func mountTestRoute(t testing.TB, cfg Config, enabled, authenticated bool, mcpHa
 	router.Route("/mcp", func(r chi.Router) {
 		r.Use(originGate)
 		r.Use(RequireEnabled(enabled))
-		r.Use(fakeAuth(authenticated, testUser))
+		r.Use(authGate)
 		r.Post("/", mcpHandler.ServeHTTP)
 	})
 	return router
+}
+
+// newTestHandlerWithGrant is newTestHandler(t, true, true, twins) with
+// the grant's scopes chosen by the test (nil: no grant at all).
+func newTestHandlerWithGrant(t testing.TB, twins Twins, scopes *[]string) http.Handler {
+	t.Helper()
+	cfg := Config{PublicBaseURL: testPublicBaseURL}
+	mcpHandler, err := NewHandler(cfg, twins)
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	return mountTestRouteWithAuth(t, cfg, true, fakeAuthWithGrant(true, testUser, scopes), mcpHandler)
 }
 
 // stubHandler returns an http.HandlerFunc writing status and body

@@ -1,16 +1,14 @@
 package mcp
 
 import (
-	"context"
 	"fmt"
-	"log/slog"
 	"net/http"
 
-	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	jsonschema "github.com/santhosh-tekuri/jsonschema/v6"
 
 	"github.com/narvidev/narvi/contracts"
+	"github.com/narvidev/narvi/internal/domain/mcpscope"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -59,7 +57,7 @@ const originForbiddenBody = `{"error":"cross-origin request denied"}`
 // RequireTrustedOrigin returns chi middleware enforcing the Streamable
 // HTTP transport's own Origin check -- mounted FIRST in the /mcp route
 // group's own chain (technical plan §43.2; controlplane/serve.go),
-// BEFORE RequireEnabled, auth.Middleware, or NewHandler's own returned
+// BEFORE RequireEnabled, auth.RequireMCPBearer, or NewHandler's own returned
 // handler (which also carries a SEPARATE, defense-in-depth Origin check,
 // wired into the SDK's own StreamableHTTPOptions -- kept there too, but
 // no longer the check that determines what a client actually observes).
@@ -88,7 +86,7 @@ const originForbiddenBody = `{"error":"cross-origin request denied"}`
 // servers MUST respond with HTTP 403 Forbidden" UNCONDITIONALLY -- not
 // "once the surface is known to be enabled" or "once the caller is
 // authenticated". Mounting this check FIRST, ahead of RequireEnabled,
-// auth.Middleware, and versionGate, means an invalid Origin gets 403
+// auth.RequireMCPBearer, and versionGate, means an invalid Origin gets 403
 // whatever the flag/auth/version state of the rest of the request --
 // never the 503/401/-32022 those later gates would otherwise answer
 // first.
@@ -254,15 +252,15 @@ func copyCompleteInputSchemas(inputSchemas map[string]*jsonschema.Schema) (map[s
 	return out, nil
 }
 
-// serverOptions is shared by buildServer's own real path and its defect
-// fallback, so both advertise the identical protocol-version list,
-// capabilities, and instructions -- only whether a tool CALL can ever
-// succeed differs between the two.
-func serverOptions() *sdkmcp.ServerOptions {
+// serverOptions builds the options every per-request server shares --
+// the same protocol-version list and capabilities for every request --
+// with the instructions paragraph composed for that request's own visible
+// tools (instructionsFor).
+func serverOptions(instructions string) *sdkmcp.ServerOptions {
 	return &sdkmcp.ServerOptions{
 		Instructions: instructions,
 		// {"tools":{}} only (technical plan §43.5): no listChanged
-		// (the tool set is static per build), no resources, no prompts,
+		// (the tool set is static per request), no resources, no prompts,
 		// no logging capability. Setting Capabilities explicitly (rather
 		// than leaving it nil) is what suppresses the SDK's own default
 		// {"logging":{}} capability -- see mcp.ServerOptions.Capabilities'
@@ -283,58 +281,55 @@ func implementation() *sdkmcp.Implementation {
 
 // buildServer is this handler's own getServer (called once per incoming
 // HTTP request in stateless mode -- mcp.NewStreamableHTTPHandler's own
-// documented contract). It reads platform.UserFromContext(r.Context())
-// -- guaranteed present, because this handler is only ever reached
-// behind auth.Middleware (controlplane/serve.go's own /mcp route group)
-// -- and builds an *sdkmcp.Server whose three tool closures capture
-// r.Context() itself, not the context the SDK later passes into each
-// tool handler at call time: capturing HERE is simpler to reason about
-// and is what technical plan §43.7 specifies, and in stateless mode
-// (a fresh Server per HTTP request) there is no "long-lived session, stale
-// context" concern that would make the distinction matter.
+// documented contract). It reads the request's principal
+// (platform.UserFromContext) and the MCP grant it was authenticated under
+// (platform.MCPGrantFromContext) -- both attached by auth.RequireMCPBearer,
+// the /mcp route group's own gate (controlplane/serve.go) -- and builds an
+// *sdkmcp.Server holding ONLY the tools that grant's scopes satisfy
+// (technical plan §43.17): a tool the grant does not cover is never
+// registered, so tools/list omits it and a tools/call naming it answers
+// the SDK's own "unknown tool" error, exactly as for a name that never
+// existed. The instructions paragraph is composed from the same visible
+// set. Each tool closure captures r.Context() itself (technical plan
+// §43.7); in stateless mode (a fresh Server per HTTP request) there is no
+// "long-lived session, stale context" concern that would make the
+// distinction matter.
 //
-// If no authenticated user is found -- unreachable behind auth.
-// Middleware, defended against anyway, mirroring httpapi.
-// authenticatedUserID's own identical "should never happen, defended
-// against anyway" precedent -- or if a tool's own contracts-sourced
-// schema fails to resolve (a defect in this build, never a legitimate
-// per-request outcome), this returns a server that still advertises the
-// same three tools (so tools/list stays stable) but whose every call
-// answers -32603, logged loudly server-side.
+// A request that reaches this point without BOTH a principal and a grant
+// -- unreachable behind RequireMCPBearer, defended against anyway, like
+// httpapi.authenticatedUserID's own "should never happen" precedent -- or
+// whose tool schemas fail to resolve (a defect in this build) gets
+// defectServer: no tools at all, logged loudly server-side.
 func buildServer(r *http.Request, twins Twins, inputSchemas map[string]*jsonschema.Schema) *sdkmcp.Server {
 	ctx := r.Context()
 	logger := platform.Logger(ctx)
 
 	if _, ok := platform.UserFromContext(ctx); !ok {
-		logger.Error("mcp: no authenticated user in context (route not mounted behind auth.Middleware?)")
-		return defectServer(logger)
+		logger.Error("mcp: no authenticated user in context (route not mounted behind auth.RequireMCPBearer?)")
+		return defectServer()
+	}
+	grant, ok := platform.MCPGrantFromContext(ctx)
+	if !ok {
+		logger.Error("mcp: no MCP grant in context (route not mounted behind auth.RequireMCPBearer?)")
+		return defectServer()
 	}
 
-	server := sdkmcp.NewServer(implementation(), serverOptions())
-	if err := registerTools(ctx, server, twins, inputSchemas); err != nil {
+	visible := visibleSpecs(toolSpecs(twins), mcpscope.FromStrings(grant.Scopes))
+	server := sdkmcp.NewServer(implementation(), serverOptions(instructionsFor(visible)))
+	if err := registerTools(ctx, server, visible, inputSchemas); err != nil {
 		logger.Error("mcp: register tools failed", "error", err)
-		return defectServer(logger)
+		return defectServer()
 	}
 	return server
 }
 
-// defectServer builds a server advertising the same three tools (each
-// resolved with a zero-value Twins{} -- never invoked, since every
-// handler below answers -32603 unconditionally) so a client's tools/list
-// call still sees a stable, correctly-shaped catalog even while every
-// actual call fails loudly. Used only by buildServer's own two defensive
-// branches (doc comment above) -- never reachable in ordinary operation.
-func defectServer(logger *slog.Logger) *sdkmcp.Server {
-	server := sdkmcp.NewServer(implementation(), serverOptions())
-	for _, spec := range toolSpecs(Twins{}) {
-		tool, err := buildTool(spec)
-		if err != nil {
-			logger.Error("mcp: defectServer: build tool failed", "tool", spec.Name, "error", err)
-			continue
-		}
-		server.AddTool(tool, func(context.Context, *sdkmcp.CallToolRequest) (*sdkmcp.CallToolResult, error) {
-			return nil, &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: "internal error"}
-		})
-	}
-	return server
+// defectServer builds a server with NO tools, for buildServer's own
+// defensive branches (its doc comment). A request without a principal and
+// a grant must see nothing: advertising the tool table to it would
+// describe the deployment to a caller no authorization vouches for
+// (technical plan §43.17). tools/list answers an empty list, every
+// tools/call the SDK's own "unknown tool" error, and instructions name no
+// tool.
+func defectServer() *sdkmcp.Server {
+	return sdkmcp.NewServer(implementation(), serverOptions(instructionsFor(nil)))
 }

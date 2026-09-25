@@ -4,20 +4,19 @@
 //
 // # What this is, plainly
 //
-// This surface is cookie-authenticated (the SAME narvi_auth_session
-// cookie and auth.Middleware every /api/** route already uses -- see
-// §43.2 below), disabled by default (NARVI_MCP_ENABLED, platform.Config.
-// MCPEnabled), and NOT usable by a real, off-the-shelf MCP client: no
-// browser-based client carries a cookie, and no bearer-token credential
-// exists for a human caller yet. What CAN use it today is a test client
-// built against this same repository (the "existing MCP clients" this
-// Step's own exit criterion names) and, in a later Step, an operator's
-// own scripted tooling. 181 is the Step that makes this surface usable by
-// a real third-party client (OAuth 2.1 resource-server behavior, RFC 9728
-// protected-resource metadata, per-principal tool filtering). 182 adds
-// result/verdict tools, bounded wait, and transcript paging. 183 adds
-// plan read/approve/reject, prompt-while-running, stop, and delegate
-// (create session). None of that is here.
+// This surface is bearer-authenticated ONLY (technical plan §43.2): an
+// access token issued by this deployment's own OAuth authorization server
+// (internal/adapters/inbound/mcpauth, §43.13-§43.16) and verified on
+// every call by auth.RequireMCPBearer, which attaches the SAME
+// platform.AuthenticatedUser a cookie would, plus the platform.MCPGrant
+// the token was issued under. No cookie authenticates this route. It is
+// disabled by default (NARVI_MCP_ENABLED, platform.Config.MCPEnabled).
+// The grant's scopes decide which tools a request can even SEE
+// (§43.17, buildServer); they never widen what a tool may do, because
+// every tool runs its REST twin's own authorization against the user's
+// own role. Result/verdict tools, bounded wait, transcript paging, and the
+// plan/prompt/stop/delegate tools belong to later rows of the plan; none
+// of that is here.
 //
 // # Registration (controlplane/serve.go)
 //
@@ -31,7 +30,7 @@
 //	router.Route("/mcp", func(r chi.Router) {
 //	    r.Use(mcp.RequireTrustedOrigin(...)) // 403 on a bad Origin, FIRST
 //	    r.Use(mcp.RequireEnabled(cfg.MCPEnabled)) // 503 when off, SECOND
-//	    r.Use(auth.Middleware(userSessionStore, userStore)) // same /api gate
+//	    r.Use(auth.RequireMCPBearer(grantStore, bearerCfg)) // bearer only, THIRD
 //	    r.Post("/", mcpHandler.ServeHTTP)
 //	})
 //
@@ -50,10 +49,11 @@
 // equivalent check to run LAST, deep inside NewHandler's own returned
 // handler, so an invalid Origin got 403 only when every other gate ALSO
 // happened to pass -- 503/401/-32022 otherwise). mcp.RequireEnabled runs
-// second, answering 503 before the session store is ever touched (§43
-// D9); only once the surface is known to be on does auth.Middleware run,
-// producing the SAME generic 401 body every other route produces on a
-// missing/expired/disabled session.
+// second, answering 503 before any credential store is ever touched (§43
+// D9); only once the surface is known to be on does auth.RequireMCPBearer
+// run, producing the SAME generic 401 body every other route produces,
+// plus the WWW-Authenticate: Bearer challenge that tells a client where
+// to find the authorization server.
 //
 // # The bridge: one authorization path, never a second (§43.7)
 //
@@ -111,7 +111,7 @@
 //     400 on; this is what remains reachable for a value the schema's
 //     own value-space genuinely cannot express.
 //   - 401                         -> unreachable inside the bridge
-//     (auth.Middleware already ran); if ever seen, a defect signal:
+//     (auth.RequireMCPBearer already ran); if ever seen, a defect signal:
 //     -32603, logged loudly.
 //   - anything else                -> -32603 (jsonrpc.CodeInternalError),
 //     "internal error" -- never the raw body text.
@@ -127,8 +127,21 @@
 //
 // No repository discovery (needs a REST route this codebase does not
 // have yet, §43 D5). No result/verdict/wait/poll tools (182). No plan/
-// delegate/prompt/stop tools (183). No OAuth, no bearer credential, no
-// per-principal tool filtering (181). No resources, no prompts, no
-// logging capability -- capabilities advertise {"tools":{}} only, no
-// listChanged (the tool set is static per build).
+// delegate/prompt/stop tools (183). No OAuth endpoint of its own (the
+// authorization server is internal/adapters/inbound/mcpauth; this package
+// only reads the grant auth.RequireMCPBearer attached). No resources, no
+// prompts, no logging capability -- capabilities advertise {"tools":{}}
+// only, no listChanged (the tool set is static per request).
+//
+// # Scope-gated discovery (§43.17)
+//
+// Every toolSpec names the scope it requires. buildServer registers only
+// the tools the request's grant satisfies (mcpscope.Satisfies, which
+// fails closed on an unset or unknown scope), so a scope-less grant gets
+// tools/list == [] and a tools/call naming a hidden tool gets the SDK's
+// own "unknown tool" error -- the same bytes as a name that never
+// existed. instructionsFor composes the instructions paragraph from the
+// same visible set, and defectServer (no principal or no grant) has no
+// tools at all. AdvertisedScopes is the one list of scopes this build
+// offers, derived from the same table.
 package mcp

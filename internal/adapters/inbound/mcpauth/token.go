@@ -24,7 +24,7 @@ const maxTokenRequestBytes = 16 << 10
 // §43.16); the whole prefixed string is what gets hashed.
 const accessTokenPrefix = "narvi_mcp_at_"
 
-// tokenResponse is a successful token response (RFC 6749 §5.1). scope is
+// tokenResponse is a successful token response (RFC 6749 section 5.1). scope is
 // always present: the user may have narrowed what the client asked for,
 // and a scope-less grant answers "".
 type tokenResponse struct {
@@ -113,7 +113,7 @@ func (s *Server) Token(w http.ResponseWriter, r *http.Request) {
 }
 
 // tokenClientID extracts the public client's id: from HTTP Basic (whose
-// credentials are form-encoded, RFC 6749 §2.3.1), from the body, or both
+// credentials are form-encoded, RFC 6749 section 2.3.1), from the body, or both
 // -- which must then agree. Any client secret, in either place, refuses
 // the request: every client here is public. basicAttempted reports
 // whether the request tried HTTP Basic (an invalid_client answer then

@@ -91,7 +91,7 @@ func canonicalJSON(t testing.TB, v any) []byte {
 }
 
 // realToolsList calls tools/list against a real *sdkmcp.Server built the
-// SAME way buildServer builds one for a real request (three tools,
+// SAME way buildServer builds one for a full-scope grant (three tools,
 // stub Twins since this test never actually invokes a twin), by
 // constructing the server directly and calling its own ListTools method
 // in-process -- no HTTP, no client transport, since only the SHAPE of
@@ -135,9 +135,10 @@ func TestToolsList_MatchesGolden(t *testing.T) {
 	}
 }
 
-// TestToolsList_ExactlyThreeToolsDeterministicOrder pins "no discovery
-// gating in 180" (technical plan §43.9 item 3's own parity row): every
-// principal sees exactly the same three tools, in the same order.
+// TestToolsList_ExactlyThreeToolsDeterministicOrder pins the full table:
+// a grant holding every advertised scope sees exactly these three tools,
+// in this order. Which subset a narrower grant sees is
+// TestToolsList_ScopeFilter_Table's (technical plan §43.17).
 func TestToolsList_ExactlyThreeToolsDeterministicOrder(t *testing.T) {
 	want := []string{"narvi_list_models", "narvi_list_sessions", "narvi_get_session"}
 	tools := realToolsListTools(t)

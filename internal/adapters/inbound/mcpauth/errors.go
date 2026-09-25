@@ -10,8 +10,8 @@ import (
 	"github.com/narvidev/narvi/internal/platform"
 )
 
-// OAuth error codes this server answers with (RFC 6749 §4.1.2.1/§5.2,
-// RFC 8707 §2).
+// OAuth error codes this server answers with (RFC 6749 sections 4.1.2.1
+// and 5.2, RFC 8707 section 2).
 const (
 	errInvalidRequest          = "invalid_request"
 	errUnsupportedResponseType = "unsupported_response_type"
@@ -64,7 +64,7 @@ func (s *Server) renderError(w http.ResponseWriter, r *http.Request, status int,
 // redirectToClient sends the browser to redirectURI -- which the caller
 // has already validated against the client's registration, or read back
 // from a stored request -- with params appended to its query (any query
-// the registered URI already carries is kept verbatim, RFC 6749 §3.1.2)
+// the registered URI already carries is kept verbatim, RFC 6749 section 3.1.2)
 // plus iss (RFC 9207), on success and error alike.
 func (s *Server) redirectToClient(w http.ResponseWriter, r *http.Request, redirectURI string, params url.Values) {
 	u, err := url.Parse(redirectURI)
@@ -102,7 +102,7 @@ func (s *Server) redirectError(w http.ResponseWriter, r *http.Request, redirectU
 	s.redirectToClient(w, r, redirectURI, params)
 }
 
-// tokenError is the token endpoint's own JSON error body (RFC 6749 §5.2).
+// tokenError is the token endpoint's own JSON error body (RFC 6749 section 5.2).
 type tokenError struct {
 	Error            string `json:"error"`
 	ErrorDescription string `json:"error_description,omitempty"`
@@ -110,7 +110,7 @@ type tokenError struct {
 
 // writeTokenError answers the token endpoint with an OAuth error: 400,
 // or 401 with a Basic challenge for invalid_client when the client
-// attempted HTTP Basic authentication (RFC 6749 §5.2). description is a
+// attempted HTTP Basic authentication (RFC 6749 section 5.2). description is a
 // fixed string chosen by the caller -- never a code, token or verifier.
 func writeTokenError(w http.ResponseWriter, code, description string, basicAttempted bool) {
 	status := http.StatusBadRequest
@@ -125,7 +125,7 @@ func writeTokenError(w http.ResponseWriter, code, description string, basicAttem
 }
 
 // writeTokenJSON writes v with the token endpoint's own headers (RFC 6749
-// §5.1: never cached).
+// section 5.1: never cached).
 func writeTokenJSON(w http.ResponseWriter, status int, v any) {
 	h := w.Header()
 	h.Set("Content-Type", "application/json")

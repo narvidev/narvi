@@ -12,7 +12,7 @@
 // http://localhost. Anything else -- another http host, a custom scheme, a
 // fragment, userinfo, a relative or opaque URI, a non-printable or
 // non-ASCII byte -- is refused. Matching is exact string comparison, with
-// one exception taken from RFC 8252 §7.3: for a registered loopback IP
+// one exception taken from RFC 8252 section 7.3: for a registered loopback IP
 // literal (never "localhost"), the port of the presented URI is ignored,
 // because a native client picks a free port at run time. Everything else
 // about that presented URI -- scheme, host, path, query -- must still be

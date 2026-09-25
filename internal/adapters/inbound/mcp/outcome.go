@@ -63,7 +63,7 @@ func mapOutcome(status int, body []byte) (*sdkmcp.CallToolResult, error) {
 		return result, nil
 
 	case http.StatusUnauthorized:
-		// Unreachable inside the bridge: auth.Middleware already ran
+		// Unreachable inside the bridge: auth.RequireMCPBearer already ran
 		// before this handler could ever be reached. If this fires
 		// anyway, it is a defect in THIS package, not a legitimate
 		// outcome to translate -- surfaced as a protocol error, never

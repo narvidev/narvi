@@ -58,7 +58,7 @@ type MCPBearerConfig struct {
 // A refusal is the same 401 {"error":"unauthorized"} body every other
 // route answers, plus a WWW-Authenticate: Bearer challenge carrying
 // resource_metadata and scope -- and error="invalid_token" when a token
-// was presented (RFC 6750 §3.1: none when no credential was sent). The
+// was presented (RFC 6750 section 3.1: none when no credential was sent). The
 // reason is logged, never returned. A lookup that fails for any reason
 // other than "no such token" answers 500, not 401: a database fault must
 // not send a client back through consent.
@@ -152,7 +152,7 @@ func refusalReason(p postgres.MCPAccessTokenPrincipal, cfg MCPBearerConfig, now 
 	}
 }
 
-// bearerToken extracts an RFC 6750 §2.1 bearer token: exactly one
+// bearerToken extracts an RFC 6750 section 2.1 bearer token: exactly one
 // Authorization header, scheme "Bearer" (case-insensitive), then one
 // b64token. presented reports whether any Authorization header was sent
 // at all; ok is false for a missing or malformed credential. A token in
@@ -209,7 +209,7 @@ func bearerChallenge(cfg MCPBearerConfig, invalidToken bool) string {
 }
 
 // quoteChallengeValue escapes a quoted-string's two special characters
-// (RFC 9110 §5.6.4).
+// (RFC 9110 section 5.6.4).
 func quoteChallengeValue(s string) string {
 	return strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s)
 }

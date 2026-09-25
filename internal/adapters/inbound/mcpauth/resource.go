@@ -97,7 +97,7 @@ func ValidatePublicBaseURL(publicBaseURL string) error {
 }
 
 // canonicalResource normalizes a client-sent resource indicator for
-// comparison (RFC 8707 §2; the MCP authorization spec asks servers to
+// comparison (RFC 8707 section 2; the MCP authorization spec asks servers to
 // accept upper-case scheme and host and the form with a trailing slash):
 // scheme and host lower-cased, the default port elided, ONE trailing
 // slash trimmed from the path. Path case and percent-encoding are NOT

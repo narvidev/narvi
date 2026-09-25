@@ -14,6 +14,8 @@ DELETE /api/repos/{owner}/{repo}/sandbox-secrets/{secretID}
 DELETE /api/sandbox-secrets/{secretID}
 DELETE /api/workflow-definitions/{id}
 GET /.well-known/jwks.json
+GET /.well-known/oauth-authorization-server/oauth
+GET /.well-known/oauth-protected-resource/mcp
 GET /.well-known/openid-configuration
 GET /api/admin/shadow-compare
 GET /api/analytics
@@ -69,6 +71,8 @@ GET /auth/linear/install
 GET /auth/oidc/callback
 GET /auth/oidc/login
 GET /health
+GET /oauth/authorize
+GET /oauth/consent
 GET /sessions/{sessionID}/uploads/{uploadID}/content
 GET /sessions/{sessionID}/ws
 PATCH /api/members/{userID}/role
@@ -111,6 +115,8 @@ POST /api/workflow-definitions
 POST /api/workflow-runs/{runId}/steps/{stepRunId}/decide
 POST /auth/logout
 POST /mcp
+POST /oauth/consent
+POST /oauth/token
 POST /sessions/{sessionID}/automation-env-vars
 POST /sessions/{sessionID}/cloud-identity-config
 POST /sessions/{sessionID}/cloud-identity-token

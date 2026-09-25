@@ -13,16 +13,18 @@ import "net/http"
 const disabledBody = `{"error":"this capability is not enabled on this deployment"}`
 
 // RequireEnabled returns chi middleware that answers 503 for the ENTIRE
-// /mcp route group whenever enabled is false (technical plan §43.11).
-// Mounted SECOND in the group's own middleware chain -- after
-// mcp.RequireTrustedOrigin (§43.2/§43.6: an invalid Origin is refused 403
-// unconditionally, before this gate ever runs), but still BEFORE auth.
-// Middleware -- so a deployment that has not opted in never touches the
-// session store at all for this surface, mirroring the OIDC routes' own
-// "503 unauthenticated when unconfigured" precedent (§43 D9). The route
-// itself is still mounted unconditionally regardless of enabled's value,
-// so routes.golden, the guide-omission register, and tools/contractscompat
-// see the identical route table whether the flag is on or off.
+// /mcp route group whenever enabled is false (technical plan §43.11) --
+// and, mounted by controlplane/serve.go the same way, for every route of
+// the MCP authorization server and both discovery documents (§43.14).
+// In the /mcp group it runs SECOND -- after mcp.RequireTrustedOrigin
+// (§43.2/§43.6: an invalid Origin is refused 403 unconditionally, before
+// this gate ever runs), but still BEFORE auth.RequireMCPBearer -- so a
+// deployment that has not opted in never touches a credential store at all
+// for this surface, mirroring the OIDC routes' own "503 unauthenticated
+// when unconfigured" precedent (§43 D9). Every route is still mounted
+// unconditionally regardless of enabled's value, so routes.golden, the
+// guide-omission register, and tools/contractscompat see the identical
+// route table whether the flag is on or off.
 func RequireEnabled(enabled bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

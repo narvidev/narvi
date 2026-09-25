@@ -33,7 +33,7 @@ func validPKCEValue(s string) bool {
 }
 
 // verifyPKCES256 reports whether BASE64URL(SHA256(verifier)) equals
-// challenge (RFC 7636 §4.6, method S256 -- the only method this server
+// challenge (RFC 7636 section 4.6, method S256 -- the only method this server
 // accepts). The comparison is constant-time: this is the one place a
 // client-supplied value is compared against a stored secret-derived one,
 // and TestPKCE_UsesConstantTimeCompare pins that no plain string

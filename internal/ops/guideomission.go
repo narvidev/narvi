@@ -150,7 +150,19 @@ var RouteGuideExemptions = []RouteGuideExemption{
 	},
 	{
 		Route:  "POST /mcp",
-		Reason: "MCP protocol endpoint (internal/adapters/inbound/mcp, technical plan §43): a JSON-RPC Streamable HTTP surface whose commands are MCP tools, not routes, consumed by an MCP client a user configures rather than a browser page. The connection procedure belongs to a later OAuth/resource-server guide, not this one; it cannot be a per-surface guide file until mcp is a sessions.spawn_source value (TestNoGuideDrift's own guide-surface rule), which a later change may or may not add. Cookie-authenticated exactly like every /api/** route today -- disabled by default (NARVI_MCP_ENABLED) and not reachable by any off-the-shelf MCP client until a real bearer credential exists.",
+		Reason: "MCP protocol endpoint (internal/adapters/inbound/mcp, technical plan §43): a JSON-RPC Streamable HTTP surface whose commands are MCP tools, not routes, called by an MCP client program with a bearer token from this deployment's own OAuth authorization server (§43.13) -- never by a page of this web app, and never with the session cookie, which it refuses. How a person connects such a client is documented in web.md's own \"Connected apps (MCP clients)\" section (GET /oauth/authorize and the consent page). It cannot be a per-surface guide file until mcp is a sessions.spawn_source value (TestNoGuideDrift's own guide-surface rule).",
+	},
+	{
+		Route:  "GET /.well-known/oauth-protected-resource/mcp",
+		Reason: "RFC 9728 protected-resource metadata for POST /mcp (internal/adapters/inbound/mcpauth's ProtectedResourceMetadata): fetched by an MCP client's own OAuth library after a 401 from /mcp, to learn which authorization server issues tokens for it -- never opened by a person browsing the app.",
+	},
+	{
+		Route:  "GET /.well-known/oauth-authorization-server/oauth",
+		Reason: "RFC 8414 authorization-server metadata for the MCP issuer (internal/adapters/inbound/mcpauth's AuthorizationServerMetadata): fetched by an MCP client's own OAuth library to find the authorization and token endpoints -- never opened by a person browsing the app.",
+	},
+	{
+		Route:  "POST /oauth/token",
+		Reason: "OAuth token endpoint for MCP clients (internal/adapters/inbound/mcpauth's Token): the MCP client program itself exchanges an authorization code for an access token here after the person approved it on the consent page (documented in web.md) -- no page of this web app posts to it, and it reads no cookie.",
 	},
 }
 

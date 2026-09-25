@@ -25,7 +25,7 @@ const maxStateLength = 512
 const signInPath = "/sign-in"
 
 // singleParam returns q[name]'s one value: ok is false when the parameter
-// is repeated (OAuth 2.1 §3.1: request parameters MUST NOT be included
+// is repeated (OAuth 2.1 section 3.1: request parameters MUST NOT be included
 // more than once). An absent parameter is ("", true).
 func singleParam(q url.Values, name string) (string, bool) {
 	vals := q[name]

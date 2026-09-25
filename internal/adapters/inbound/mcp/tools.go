@@ -11,12 +11,14 @@ import (
 	"net/url"
 	"runtime/debug"
 	"strconv"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	jsonschema "github.com/santhosh-tekuri/jsonschema/v6"
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
+	"github.com/narvidev/narvi/internal/domain/mcpscope"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -45,24 +47,60 @@ type Twins struct {
 	GetSession http.HandlerFunc
 }
 
-// toolSpec is the ONLY place a 180 tool is declared: its wire name, its
-// REST twin, the two contracts $def names its schemas come from
+// toolSpec is the ONLY place a tool is declared: its wire name, the
+// scope a grant must satisfy for the tool to exist at all for a request
+// (technical plan §43.17), the one-line fragment instructionsFor names it
+// with, its REST twin, the two contracts $def names its schemas come from
 // (verbatim for input, bundled for output -- schemas.go), and a
 // BuildRequest closure translating the raw `arguments` object a client
 // sent into the twin's own URL params / query string.
 type toolSpec struct {
 	Name         string
 	Description  string
+	Scope        mcpscope.Scope
+	Instruction  string
 	Twin         twin
 	InputDef     string
 	OutputDef    string
 	BuildRequest func(arguments json.RawMessage) (urlParams map[string]string, query url.Values, err error)
 }
 
-// instructions is server/discover's and the legacy initialize handshake's
-// own "instructions" field (technical plan §43.5) -- one paragraph
-// telling the model what this deployment's three tools actually are.
-const instructions = "This server exposes three READ-ONLY tools over this deployment's session data: narvi_list_models (the model catalog), narvi_list_sessions (this deployment's sessions; filter:\"all\" lists EVERY session on the deployment, not only the caller's own), and narvi_get_session (one session's full detail). None of these tools writes anything, and none of the write/plan/stop tools a later Step adds exist on this build."
+// countWords spells small tool counts the way the instructions paragraph
+// reads them.
+var countWords = []string{"no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"}
+
+// instructionsFor is server/discover's and the legacy initialize
+// handshake's own "instructions" field (technical plan §43.5), composed
+// per request from ONLY the tools that request can see (§43.17): a fixed
+// paragraph naming every tool would describe the deployment to a client
+// that may not use any of it. With no visible tool it names none.
+func instructionsFor(visible []toolSpec) string {
+	if len(visible) == 0 {
+		return "This authorization gives access to no tools on this server. The user can connect this client again and approve more access."
+	}
+	fragments := make([]string, len(visible))
+	for i, spec := range visible {
+		fragments[i] = spec.Instruction
+	}
+	var list string
+	switch len(fragments) {
+	case 1:
+		list = fragments[0]
+	case 2:
+		list = fragments[0] + " and " + fragments[1]
+	default:
+		list = strings.Join(fragments[:len(fragments)-1], ", ") + ", and " + fragments[len(fragments)-1]
+	}
+	count := strconv.Itoa(len(visible))
+	if len(visible) < len(countWords) {
+		count = countWords[len(visible)]
+	}
+	noun := "tools"
+	if len(visible) == 1 {
+		noun = "tool"
+	}
+	return "This server exposes " + count + " READ-ONLY " + noun + " over this deployment's session data: " + list + ". None of these tools writes anything."
+}
 
 // noArguments is the BuildRequest closure every argument-less tool
 // shares (only narvi_list_models today): no urlParams, no query, no
@@ -198,6 +236,8 @@ func toolSpecs(twins Twins) []toolSpec {
 		{
 			Name:         "narvi_list_models",
 			Description:  "List every model this deployment's catalog offers (provider, context window, cost, reasoning-effort variants) -- the same catalog GET /api/models returns. Read-only; every authenticated role may call it.",
+			Scope:        mcpscope.Read,
+			Instruction:  "narvi_list_models (the model catalog)",
 			Twin:         twin{method: http.MethodGet, pathTemplate: "/api/models", handler: twins.ListModels},
 			InputDef:     "ListModelsToolRequest",
 			OutputDef:    "ModelCatalog",
@@ -206,6 +246,8 @@ func toolSpecs(twins Twins) []toolSpec {
 		{
 			Name:         "narvi_list_sessions",
 			Description:  "List this deployment's sessions -- the same list GET /api/sessions returns. filter:\"mine\" (the default) returns sessions the caller created or joined; filter:\"all\" returns EVERY unarchived session on the deployment, regardless of who created it -- there is no per-session visibility restriction in this codebase today. limit bounds how many are returned (server-side default and cap apply when omitted or too large).",
+			Scope:        mcpscope.Read,
+			Instruction:  "narvi_list_sessions (this deployment's sessions; filter:\"all\" lists EVERY session on the deployment, not only the caller's own)",
 			Twin:         twin{method: http.MethodGet, pathTemplate: "/api/sessions", handler: twins.ListSessions},
 			InputDef:     "ListSessionsToolRequest",
 			OutputDef:    "ListSessionsResponse",
@@ -214,6 +256,8 @@ func toolSpecs(twins Twins) []toolSpec {
 		{
 			Name:         "narvi_get_session",
 			Description:  "Get one session's full detail by id -- the same detail GET /api/sessions/{sessionID} returns. Any authenticated role may read any session's detail; there is no per-session visibility restriction in this codebase today.",
+			Scope:        mcpscope.Read,
+			Instruction:  "narvi_get_session (one session's full detail)",
 			Twin:         twin{method: http.MethodGet, pathTemplate: "/api/sessions/{sessionID}", handler: twins.GetSession},
 			InputDef:     "GetSessionToolRequest",
 			OutputDef:    "Session",
@@ -355,10 +399,7 @@ func (spec toolSpec) toolHandler(ctx context.Context, inputSchemas map[string]*j
 }
 
 // buildTool resolves spec's own contracts-sourced schemas into a real
-// *sdkmcp.Tool -- shared by registerTools (the real server) and
-// defectServer (the "no authenticated user in context" fallback) so
-// tools/list advertises the SAME three tools either way; only whether a
-// CALL can ever succeed differs between the two.
+// *sdkmcp.Tool for registerTools.
 func buildTool(spec toolSpec) (*sdkmcp.Tool, error) {
 	in, err := inputSchema(spec.InputDef)
 	if err != nil {
@@ -377,11 +418,27 @@ func buildTool(spec toolSpec) (*sdkmcp.Tool, error) {
 	}, nil
 }
 
-// registerTools adds all three 180 tools to s, each handler closing over
-// ctx, twins, and inputSchemas per toolSpec.toolHandler's own doc
-// comment.
-func registerTools(ctx context.Context, s *sdkmcp.Server, twins Twins, inputSchemas map[string]*jsonschema.Schema) error {
-	for _, spec := range toolSpecs(twins) {
+// visibleSpecs returns the specs whose scope granted satisfies, in table
+// order -- the ONLY tools a request may see or call (technical plan
+// §43.17). mcpscope.Satisfies fails closed: a spec whose Scope was never
+// set is visible to no grant at all.
+func visibleSpecs(specs []toolSpec, granted []mcpscope.Scope) []toolSpec {
+	out := make([]toolSpec, 0, len(specs))
+	for _, spec := range specs {
+		if mcpscope.Satisfies(granted, spec.Scope) {
+			out = append(out, spec)
+		}
+	}
+	return out
+}
+
+// registerTools adds exactly the tools in visible to s, each handler
+// closing over ctx and inputSchemas per toolSpec.toolHandler's own doc
+// comment. A tool that is not added does not exist for this request: its
+// tools/call answers the SDK's own "unknown tool" error, byte-identical
+// to a name that never existed.
+func registerTools(ctx context.Context, s *sdkmcp.Server, visible []toolSpec, inputSchemas map[string]*jsonschema.Schema) error {
+	for _, spec := range visible {
 		tool, err := buildTool(spec)
 		if err != nil {
 			return err
@@ -389,4 +446,18 @@ func registerTools(ctx context.Context, s *sdkmcp.Server, twins Twins, inputSche
 		s.AddTool(tool, spec.toolHandler(ctx, inputSchemas))
 	}
 	return nil
+}
+
+// AdvertisedScopes returns every scope this build offers: exactly the
+// scopes at least one tool in the table requires (mcpscope.Advertised).
+// controlplane hands this one list to both the authorization server
+// (what a client may request) and the bearer gate (what its 401 challenge
+// names), so the two can never disagree with the tool table.
+func AdvertisedScopes() []mcpscope.Scope {
+	specs := toolSpecs(Twins{})
+	required := make([]mcpscope.Scope, len(specs))
+	for i, spec := range specs {
+		required[i] = spec.Scope
+	}
+	return mcpscope.Advertised(required)
 }
