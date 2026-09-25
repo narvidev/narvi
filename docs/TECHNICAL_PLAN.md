@@ -6956,8 +6956,10 @@ this build does not advertise is `invalid_scope`; a `state` over 512 bytes, or a
 valid request is stored (`mcp_oauth_authorization_requests`, expiring after
 `MCPAuthorizationRequestTTL`) and the browser is redirected to `/oauth/consent?request=<id>` — through
 `/sign-in?next=` first when it carries no valid session. Only the request id travels through sign-in,
-never the raw OAuth query; the sign-in view's own return-to allowlist and both login handlers accept
-exactly that one server path.
+never the raw OAuth query. The sign-in view's own return-to allowlist gains exactly that one shape,
+`/oauth/consent?request=<uuid>` (reached with a full page load, since the SPA does not render it); both
+login handlers — GitHub's and, for OIDC-only deployments, the OIDC one — already carry any same-origin
+path through the round trip and re-check it before redirecting.
 
 **The consent page** authenticates the cookie itself. The first render binds the request to that user
 for good — any other user gets an error page — and every render mints a fresh CSRF nonce, storing only
@@ -6969,7 +6971,8 @@ signed-in user's email, and each requested scope as a checkbox with a plain desc
 `html/template`, embedded in the binary, auto-escaped, and served with
 `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'self' <the
 redirect URI's own origin>; frame-ancestors 'none'; base-uri 'none'` (the redirect origin is in
-`form-action` because browsers apply that directive to the redirect a form submission follows),
+`form-action` because browsers apply that directive to the redirect a form submission follows; an
+`[::1]` redirect, which a CSP host-source cannot express, falls back to its scheme),
 `X-Frame-Options: DENY`, `Cache-Control: no-store`, and `Referrer-Policy: no-referrer`.
 
 The decision (`POST /oauth/consent`) is checked in this order: a same-origin check — an `Origin` header,
@@ -6981,7 +6984,8 @@ the browser-set, unforgeable `Sec-Fetch-Site` is what vouches for that case.) Th
 who must be the request's bound user; the nonce, compared as hashes in constant time; the request
 neither consumed nor expired; `authz.ActionConnectMCPClient` for the user's role; and every selected
 scope one the request asked for — the user can narrow, never widen. Approval, in one transaction,
-consumes the request, creates the grant (expiring after `MCPGrantMaxLifetime`), issues a single
+consumes the request, records the grant (§43.16: the user's one grant for this client, created or
+replaced, expiring after `MCPGrantMaxLifetime`), issues a single
 authorization code bound to the request's PKCE challenge, redirect URI and resource (expiring after
 `MCPAuthorizationCodeTTL`), and records `mcp_authorization.granted`; the browser is then redirected to
 the **stored** redirect URI — never one read from the form — with `code`, `state` and `iss`. Denial
@@ -7025,10 +7029,14 @@ enum already carries their two values so that piece needs no enum-only migration
 
 ### 43.16 Grants, tokens, and revocation
 
-A grant (`mcp_oauth_grants`) is one (user, client, scopes, resource) authorization the user consented
-to. It exists if and only if the authorization is live: every authorization code and access token
-references it with `ON DELETE CASCADE`, so revocation is deleting the grant — nothing to invalidate,
-nothing to broadcast. Codes, access tokens and consent nonces are stored only as `platform.HashToken`
+A grant (`mcp_oauth_grants`) is a user's authorization of one client — scopes and resource — and a user
+holds at most one per client: consenting to the same client again replaces the grant's scopes and
+renews its lifetime in place (same id, so tokens already issued keep working, under the scopes just
+consented to). Without refresh tokens a client re-runs consent whenever its access token expires, and
+one row per consent would grow the table and the Connected apps list without bound. The grant exists
+if and only if the authorization is live: every authorization code and access token references it
+with `ON DELETE CASCADE`, so revocation is deleting the grant — nothing to invalidate, nothing to
+broadcast. Codes, access tokens and consent nonces are stored only as `platform.HashToken`
 output; the plaintext code and token carry recognizable prefixes (`narvi_mcp_ac_`, `narvi_mcp_at_`) so a
 secret scanner or a reviewer reading a log can tell the family, and the whole string is hashed.
 
@@ -7049,8 +7057,10 @@ refusal is the same `401 {"error":"unauthorized"}` every other route answers, wi
 token was presented); the reason is logged, never returned. A lookup that fails for any reason other
 than "no such token" is a 500, not a 401, so a database fault never sends a client back through consent.
 Success attaches the same `platform.AuthenticatedUser` a cookie would (id, role and email read from the
-`users` row on this call) plus the `platform.MCPGrant`; a grant's `last_used_at` is refreshed at most once
-per `MCPGrantLastUsedWriteInterval`, and a failure to write it is logged without affecting the call.
+`users` row on this call) plus the `platform.MCPGrant`, and removes the `Authorization` header from the
+request it passes on, so nothing downstream ever holds the token; a grant's `last_used_at` is refreshed
+at most once per `MCPGrantLastUsedWriteInterval`, and a failure to write it is logged without affecting
+the call.
 
 A token never does more than its user: the role is re-read on every call, the tools run the same REST
 twins with the same `authz.Authorize` check as a browser (§43.7), and the grant only ever subtracts
@@ -7111,13 +7121,13 @@ authorizations — and revocation on their behalf — is piece (d).
 | Code replay | a second use revokes the grant | `TestToken_CodeReuseRevokesGrant` |
 | Mix-up | `iss` on every authorization response, advertised | `TestAuthorize_IssOnSuccessAndError`, the end-to-end test's own SDK issuer check |
 | Audience confusion | `resource` required and bound at authorize, token and every call | `TestAuthorize_ResourceMismatchIsInvalidTarget`, `TestBearer_GrantResourceMismatchIs401` |
-| Token passthrough | the twin's synthesized request carries no header | `TestBridge_NoAuthorizationHeaderReachesTwin` |
+| Token passthrough | the bearer gate strips the header; the twin's synthesized request carries no header at all | `TestRequireMCPBearer_AttachesPrincipalAndStripsToken`, `TestBridge_NoAuthorizationHeaderReachesTwin` |
 | Consent clickjacking and CSRF | frame headers; SameSite cookie, hashed per-render nonce, same-origin check, request bound to one user | `TestConsent_FrameHeaders`, `TestConsent_MissingOrWrongNonceRefused`, `TestConsent_CrossSiteOriginRefused`, `TestConsent_OtherUserCannotDecide` |
 | Scope escalation | consent narrows only; unadvertised scopes refused | `TestConsent_CannotAddUnrequestedScope`, `TestAuthorize_UnadvertisedScopeRefused` |
 | Client identity spoofing | the page shows who registered the client and the true redirect host, with a loopback warning | `TestConsent_ShowsClientIdentityAndRedirectHost` |
-| Revoked, disabled or deleted principals | one join per call, no cache | `TestBearer_NoCacheBetweenCalls`, `TestOAuth_RevokedAuthorizationStopsOnNextCall_User`, `_ClientDeleted`, `_DisabledUser`, `TestBearer_DisabledClientIs401NextCall` |
+| Revoked, disabled or deleted principals | one join per call, no cache; deleting a client cascades its grants | `TestBearer_NoCacheBetweenCalls`, `TestOAuth_RevokedAuthorizationStopsOnNextCall_User`, `_ClientDeleted`, `_DisabledUser`, `TestBearer_DisabledClientIs401NextCall`, `TestClient_DeleteCascadesGrants` |
 | Discovery leak | per-request tool registration by scope; composed instructions; empty defect server | `TestToolsList_ScopeFilter_Table`, `TestInstructions_NameOnlyVisibleTools`, `TestHiddenToolCall_IsIndistinguishableFromUnknownTool`, `TestOAuth_ScopelessGrant_ToolsListEmpty` |
-| Phishing through the login return path | only `/oauth/consent?request=<uuid>` is accepted as a server-side return target | `TestLogin_NextAcceptsConsentPath`, the sign-in view's own return-to test |
+| Phishing through the login return path | the sign-in view accepts only `/oauth/consent?request=<uuid>` as a server-rendered return target; both login handlers accept only same-origin paths | `TestLogin_NextAcceptsConsentPath`, `TestOIDCLogin_NextReturnsToConsentPage`, the sign-in view's own return-to test |
 | Table growth | a TTL on every row kind, swept | `TestExpiredCleanup_SweepsMCPRows` |
 | A token doing more than its user | same twins, same authz check, role read per call | `TestParity_BearerEqualsCookieForEveryRole` |
 
