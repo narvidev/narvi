@@ -121,26 +121,34 @@ func TestRefresh_RotationAndReuseRevokesGrant(t *testing.T) {
 
 // TestRefresh_ConcurrentUseIsAReplay: two refreshes racing with one
 // refresh token are one use and one replay -- there is no grace window --
-// on their own, whatever ran before them in the process. The race is
-// deterministic. A blocker holds the token's row, so the first refresh
-// reads the token unrotated and stops at its conditional rotation, queued
-// on that row (seen in pg_locks, behind the blocker alone); the second,
-// reading it unrotated too, is then seen queued as well, and only then is
-// the blocker released. The first rotates the token and answers 200. The
-// second learns of the rotation only when its own rotation misses -- the
-// lost-rotation branch, since the token was unrotated when it read it --
-// and revokes the grant, the first's new tokens with it, audited once as
-// refresh_reuse. Nothing fails (no deadlock, no 500).
+// whichever client the second presents it as, and on their own, whatever
+// ran before them in the process. The race is deterministic. A blocker
+// holds the token's row, so the first refresh reads the token unrotated
+// and stops at its conditional rotation, queued on that row (seen in
+// pg_locks, behind the blocker alone); the second, reading it unrotated
+// too, is then seen queued behind the first, and only then is the blocker
+// released. The first rotates the token and answers 200. The second, as
+// the token's own client, learns of the rotation only when its own
+// rotation misses -- the lost-rotation branch, since the token was
+// unrotated when it read it; as another client, it is a replay at once.
+// Either way it revokes the grant, the first's new tokens with it,
+// audited once as refresh_reuse. Nothing fails (no deadlock, no 500).
 func TestRefresh_ConcurrentUseIsAReplay(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		// secondClient is the client_id the second refresh presents.
-		secondClient func(r *asRig) string
+		secondClient func(t *testing.T, r *asRig) string
 		// secondQueuedOn is the table whose row the second refresh is
 		// seen queued on, behind the first.
 		secondQueuedOn string
 	}{
-		{"both as the token's own client", func(r *asRig) string { return r.client.ClientID }, "mcp_oauth_refresh_tokens"},
+		{"both as the token's own client", func(_ *testing.T, r *asRig) string { return r.client.ClientID }, "mcp_oauth_refresh_tokens"},
+		// The round-1 review's cross-client race: the second presents the
+		// token as another client, so it is a replay without ever reaching
+		// a rotation; its revocation queues on the grant the first holds.
+		{"the second as another client", func(t *testing.T, r *asRig) string {
+			return r.newClient(t, "narvi_mcp_c_other", "Other App", loopbackRedirect).ClientID
+		}, "mcp_oauth_grants"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -149,7 +157,7 @@ func TestRefresh_ConcurrentUseIsAReplay(t *testing.T) {
 			pair := r.issuePair(t, cookie, "mcp:read")
 			grantID := r.grantIDs(t, user.ID)[0]
 			second := r.refreshForm(pair.RefreshToken)
-			second.Set("client_id", tc.secondClient(r))
+			second.Set("client_id", tc.secondClient(t, r))
 			forms := []url.Values{r.refreshForm(pair.RefreshToken), second}
 			errs := captureErrorLog(t)
 
@@ -226,6 +234,71 @@ func TestRefresh_ConcurrentUseIsAReplay(t *testing.T) {
 			}
 			if len(reasons) != 1 || reasons[0] != "refresh_reuse" {
 				t.Fatalf("revocation audit rows for the grant = %v, want exactly one, reason refresh_reuse", reasons)
+			}
+		})
+	}
+}
+
+// TestRefresh_AnotherClientPresentingIsAReplay: replay detection ignores
+// which client presents a refresh token. A rotated token presented as
+// another client revokes the grant exactly as it would presented as its
+// own (PR #327's round-1 review), and so does an unrotated one: a client
+// can only hold a refresh token issued to another client by copying it.
+// The grant is deleted -- the tokens the legitimate client still holds
+// with it -- and audited once as refresh_reuse, actor system, naming the
+// grant's own client.
+func TestRefresh_AnotherClientPresentingIsAReplay(t *testing.T) {
+	r := newASRig(t)
+	other := r.newClient(t, "narvi_mcp_c_other", "Other App", loopbackRedirect)
+
+	for _, tc := range []struct {
+		name string
+		// replay readies the token another client presents and returns it,
+		// with the access and refresh tokens the legitimate client holds.
+		replay func(t *testing.T, pair tokenBody) (presented, heldAccess, heldRefresh string)
+	}{
+		{"a rotated token", func(t *testing.T, p tokenBody) (string, string, string) {
+			rec, next := r.refreshWith(t, r.refreshForm(p.RefreshToken))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("the legitimate refresh: status %d body %s", rec.Code, rec.Body.String())
+			}
+			return p.RefreshToken, next.AccessToken, next.RefreshToken
+		}},
+		{"an unrotated token", func(_ *testing.T, p tokenBody) (string, string, string) {
+			return p.RefreshToken, p.AccessToken, p.RefreshToken
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+			pair := r.issuePair(t, cookie, "mcp:read")
+			grantID := r.grantIDs(t, user.ID)[0]
+			presented, heldAccess, heldRefresh := tc.replay(t, pair)
+
+			form := r.refreshForm(presented)
+			form.Set("client_id", other.ClientID)
+			if rec, body := r.refreshWith(t, form); rec.Code != http.StatusBadRequest || body.Error != "invalid_grant" || body.AccessToken != "" {
+				t.Fatalf("another client presents %s: status %d body %s, want 400 invalid_grant", tc.name, rec.Code, rec.Body.String())
+			}
+			if ids := r.grantIDs(t, user.ID); len(ids) != 0 {
+				t.Fatalf("grants after another client presented %s = %v, want none", tc.name, ids)
+			}
+			if got := r.callMCP(heldAccess); got != http.StatusUnauthorized {
+				t.Errorf("/mcp with the legitimate client's access token: status %d, want 401", got)
+			}
+			if rec, body := r.refreshWith(t, r.refreshForm(heldRefresh)); rec.Code != http.StatusBadRequest || body.Error != "invalid_grant" {
+				t.Errorf("refresh with the legitimate client's refresh token: status %d body %s, want 400 invalid_grant", rec.Code, rec.Body.String())
+			}
+			rows := r.auditRows(t, grantID)
+			revoked := 0
+			for _, row := range rows {
+				if row.action == "mcp_authorization.revoked" {
+					revoked++
+				}
+			}
+			last := rows[len(rows)-1]
+			if revoked != 1 || last.action != "mcp_authorization.revoked" || last.detail["reason"] != "refresh_reuse" || last.detail["actor"] != "system" ||
+				last.detail["client_id"] != r.client.ClientID || last.actor != user.ID {
+				t.Fatalf("audit rows = %+v, want one final mcp_authorization.revoked, reason refresh_reuse, actor system, naming the grant's client, attributed to the user", rows)
 			}
 		})
 	}
@@ -375,13 +448,13 @@ func TestRefresh_ResourceMustMatch(t *testing.T) {
 // TestRefresh_RefreshesNothingItShouldNot: an expired grant -- its
 // absolute lifetime over, whatever its refresh tokens say -- a refresh
 // chain past its own absolute end, whatever the token's expiry says, an
-// expired refresh token, a refresh token presented by another client, an access
-// token presented as a refresh token, and a token nobody holds are each
-// invalid_grant: nothing is issued, nothing is spent, and nothing is
-// revoked.
+// expired refresh token, an access token presented as a refresh token,
+// and a token nobody holds are each invalid_grant: nothing is issued,
+// nothing is spent, and nothing is revoked. (A refresh token presented by
+// another client is a replay instead:
+// TestRefresh_AnotherClientPresentingIsAReplay.)
 func TestRefresh_RefreshesNothingItShouldNot(t *testing.T) {
 	r := newASRig(t)
-	other := r.newClient(t, "narvi_mcp_c_other", "Other App", loopbackRedirect)
 
 	tests := []struct {
 		name  string
@@ -405,11 +478,6 @@ func TestRefresh_RefreshesNothingItShouldNot(t *testing.T) {
 				t.Fatal(err)
 			}
 			return r.refreshForm(pair.RefreshToken)
-		}},
-		{"another client presents it", func(_ *testing.T, _ any, pair tokenBody) url.Values {
-			form := r.refreshForm(pair.RefreshToken)
-			form.Set("client_id", other.ClientID)
-			return form
 		}},
 		{"an access token presented as a refresh token", func(_ *testing.T, _ any, pair tokenBody) url.Values {
 			return r.refreshForm(pair.AccessToken)

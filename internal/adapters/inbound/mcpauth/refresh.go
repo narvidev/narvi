@@ -22,8 +22,9 @@ import (
 // for (mcpscope.Covers). Never the grant's scopes: those only record the
 // most recent consent, which a later approval for the same client
 // overwrites, so reading them here would let a consent widen a refresh
-// chain. Presenting a token that was already rotated is a replay, handled
-// by handleRefreshReuse.
+// chain. Presenting a token that was already rotated is a replay, and so
+// is presenting one to a client it was not issued to, rotated or not: both
+// are handled by handleRefreshReuse.
 //
 // The same holds for the rest of what the chain can do: its resource and
 // its absolute end were fixed when the chain began (refreshChain) and are
@@ -44,8 +45,8 @@ import (
 // both FOR KEY SHARE, and only then the refresh token itself, which the
 // rotation locks. So the token is read first, without a lock. The client
 // locked is the requesting one -- the grant's own client whenever tokens
-// are issued, since a refresh token issued to another client is refused
-// below.
+// are issued, since a refresh token presented by another client is a
+// replay (below).
 func (s *Server) refreshGrant(w http.ResponseWriter, r *http.Request, client sqlcgen.McpOauthClient, form url.Values) {
 	ctx := r.Context()
 	logger := platform.Logger(ctx)
@@ -84,7 +85,7 @@ func (s *Server) refreshGrant(w http.ResponseWriter, r *http.Request, client sql
 		fail("load refresh token failed", err)
 		return
 	case presentedRow.RotatedAt.Valid:
-		s.handleRefreshReuse(w, r, tokenHash)
+		s.handleRefreshReuse(w, r, tokenHash, client)
 		return
 	}
 
@@ -117,6 +118,21 @@ func (s *Server) refreshGrant(w http.ResponseWriter, r *http.Request, client sql
 		return
 	}
 
+	if grant.ClientID != client.ID {
+		// A refresh token presented by a client it was not issued to: one
+		// that client never received, so a copy -- a replay whether or not
+		// it was rotated yet (technical plan §43.16). This is also how a
+		// racing refresh from another client, which reads the token
+		// unrotated while the grant's own client rotates it, still counts
+		// as one use and one replay. This transaction holds the requesting
+		// client and the grant FOR KEY SHARE, so it ends here, before
+		// handleRefreshReuse locks the grant's client and deletes the grant
+		// in a transaction of its own.
+		_ = tx.Rollback(ctx)
+		s.handleRefreshReuse(w, r, tokenHash, client)
+		return
+	}
+
 	// Every refusal below returns before anything is written: the deferred
 	// rollback leaves the presented token exactly as it was.
 	refuse := func(errCode, description, outcome string) {
@@ -126,9 +142,6 @@ func (s *Server) refreshGrant(w http.ResponseWriter, r *http.Request, client sql
 	now := time.Now()
 	held := mcpscope.FromStrings(presentedRow.Scopes)
 	switch {
-	case grant.ClientID != client.ID:
-		refuse(errInvalidGrant, "the refresh token is invalid", "refresh_token_for_other_client")
-		return
 	case !presentedRow.ExpiresAt.Time.After(now):
 		refuse(errInvalidGrant, "the refresh token is invalid", "refresh_token_expired")
 		return
@@ -175,7 +188,7 @@ func (s *Server) refreshGrant(w http.ResponseWriter, r *http.Request, client sql
 		// handleRefreshReuse locks the grant's client and deletes the
 		// grant in a transaction of its own.
 		_ = tx.Rollback(ctx)
-		s.handleRefreshReuse(w, r, tokenHash)
+		s.handleRefreshReuse(w, r, tokenHash, client)
 		return
 	} else if err != nil {
 		fail("rotate refresh token failed", err)
@@ -205,16 +218,17 @@ func (s *Server) requestedRefreshScopes(raw string) (requested []mcpscope.Scope,
 	return requested, true, true
 }
 
-// handleRefreshReuse answers a refresh token that was already rotated: a
-// replay (OAuth 2.1 section 4.3.1, technical plan §43.16). The grant it
-// was issued under is deleted, so every access and refresh token under it
-// stops working -- the legitimate client's included, which is the point:
-// the server cannot tell the thief from the victim, so it ends both, and
-// the user must consent again. There is no grace window. Whichever client
-// presents the token, the answer is the same: a client_id is public, so
-// requiring the grant's own would protect nothing. The revocation is
-// audited (reason refresh_reuse, attributed to the grant's user with
-// actor "system").
+// handleRefreshReuse answers a replayed refresh token (OAuth 2.1 section
+// 4.3.1, technical plan §43.16): one that was already rotated, whichever
+// client presents it -- a client_id is public, so requiring the grant's
+// own would protect nothing -- or one presented by a client other than
+// the one it was issued to, rotated or not, since that client never
+// received it. The grant it was issued under is deleted, so every access
+// and refresh token under it stops working -- the legitimate client's
+// included, which is the point: the server cannot tell the thief from the
+// victim, so it ends both, and the user must consent again. There is no
+// grace window. The revocation is audited (reason refresh_reuse,
+// attributed to the grant's user with actor "system").
 //
 // It runs in a transaction of its own, never the refresh's, and locks in
 // the one order (the top of postgres/mcpoauthgrant_store.go): the grant's
@@ -222,7 +236,7 @@ func (s *Server) requestedRefreshScopes(raw string) (requested []mcpscope.Scope,
 // or code exchange still in flight under the grant holds it FOR KEY
 // SHARE, so the deletion waits for it to commit and then takes what it
 // issued too.
-func (s *Server) handleRefreshReuse(w http.ResponseWriter, r *http.Request, tokenHash string) {
+func (s *Server) handleRefreshReuse(w http.ResponseWriter, r *http.Request, tokenHash string, presenter sqlcgen.McpOauthClient) {
 	ctx := r.Context()
 	logger := platform.Logger(ctx)
 	fail := func(msg string, err error) {
@@ -243,19 +257,13 @@ func (s *Server) handleRefreshReuse(w http.ResponseWriter, r *http.Request, toke
 	grants := s.deps.Grants.WithTx(tx)
 
 	row, err := grants.GetRefreshTokenByHash(ctx, tokenHash)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
+	if errors.Is(err, pgx.ErrNoRows) {
 		// Gone since: revoked with its grant, or expired and swept.
 		invalid("unknown_refresh_token")
 		return
-	case err != nil:
-		fail("load rotated refresh token failed", err)
-		return
-	case !row.RotatedAt.Valid:
-		// Never reached (a token only comes here once seen rotated, and
-		// rotation is never undone); refused without revoking, since only
-		// a rotated token is a replay.
-		invalid("refresh_token_not_rotated")
+	}
+	if err != nil {
+		fail("load replayed refresh token failed", err)
 		return
 	}
 	grant, err := grants.GetGrant(ctx, row.GrantID)
@@ -265,6 +273,14 @@ func (s *Server) handleRefreshReuse(w http.ResponseWriter, r *http.Request, toke
 	}
 	if err != nil {
 		fail("load replayed grant failed", err)
+		return
+	}
+	if !row.RotatedAt.Valid && grant.ClientID == presenter.ID {
+		// Never reached (a token comes here only once seen rotated, and
+		// rotation is never undone, or presented by another client);
+		// refused without revoking, since the grant's own client presenting
+		// its current token is no replay.
+		invalid("refresh_token_not_rotated")
 		return
 	}
 	client, err := s.deps.Clients.WithTx(tx).LockKeyShare(ctx, grant.ClientID)
@@ -297,6 +313,7 @@ func (s *Server) handleRefreshReuse(w http.ResponseWriter, r *http.Request, toke
 		fail("commit reuse revocation failed", err)
 		return
 	}
-	logger.Warn("mcpauth: token refused; grant revoked", "outcome", "refresh_reuse", "grant_id", grant.ID.String())
+	logger.Warn("mcpauth: token refused; grant revoked", "outcome", "refresh_reuse", "grant_id", grant.ID.String(),
+		"presented_by", presenter.ClientID, "rotated", row.RotatedAt.Valid)
 	writeTokenError(w, errInvalidGrant, "the refresh token is invalid", false)
 }
