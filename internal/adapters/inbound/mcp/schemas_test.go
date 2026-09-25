@@ -240,3 +240,34 @@ func TestListModelsOutputSchema_ValidatesRealCatalogBody(t *testing.T) {
 		t.Errorf("the real model catalog body does not validate against narvi_list_models' own advertised outputSchema: %v\nbody: %s", err, body)
 	}
 }
+
+// TestCompileInputSchemas_RealDefsSucceed and
+// TestCompileInputSchemas_UnknownDefFails pin compileInputSchemas' own two
+// documented outcomes (schemas.go): every one of toolInputDefs()'s real
+// names compiles into a non-nil *jsonschema.Schema, and a name with no
+// matching $def in rest/v1/dtos.schema.json returns an error rather than
+// panicking or silently omitting an entry -- the exact error NewHandler
+// now surfaces as a BOOT failure (round 2 review of PR #324, findings
+// N1/N3/N4: a schema defect must fail boot, never a live request).
+func TestCompileInputSchemas_RealDefsSucceed(t *testing.T) {
+	defs := toolInputDefs()
+	schemas, err := compileInputSchemas(defs)
+	if err != nil {
+		t.Fatalf("compileInputSchemas(%v) error = %v", defs, err)
+	}
+	if len(schemas) != len(defs) {
+		t.Fatalf("len(schemas) = %d, want %d", len(schemas), len(defs))
+	}
+	for _, name := range defs {
+		if schemas[name] == nil {
+			t.Errorf("schemas[%q] = nil, want a compiled *jsonschema.Schema", name)
+		}
+	}
+}
+
+func TestCompileInputSchemas_UnknownDefFails(t *testing.T) {
+	_, err := compileInputSchemas([]string{"ThisDefDoesNotExist"})
+	if err == nil {
+		t.Fatal("compileInputSchemas with an unknown $def name: error = nil, want an error")
+	}
+}
