@@ -57,11 +57,20 @@ func (s *MCPOAuthClientStore) List(ctx context.Context) ([]sqlcgen.McpOauthClien
 }
 
 // Lock takes the client row's FOR UPDATE lock for the rest of the
-// transaction (queries/mcp_oauth_clients.sql's own doc comment): no grant
-// can be added under the client until it ends. pgx.ErrNoRows means no
-// such client.
+// transaction (queries/mcp_oauth_clients.sql's own doc comment): no
+// consent or code exchange can issue anything under the client until it
+// ends. pgx.ErrNoRows means no such client.
 func (s *MCPOAuthClientStore) Lock(ctx context.Context, id pgtype.UUID) (sqlcgen.McpOauthClient, error) {
 	return s.q.LockMCPOAuthClient(ctx, id)
+}
+
+// LockKeyShare takes the client row's FOR KEY SHARE lock for the rest of
+// the transaction and returns the row as of that lock: the first lock of
+// every transaction that issues or revokes something under the client
+// (the lock order at the top of mcpoauthgrant_store.go). pgx.ErrNoRows
+// means no such client -- it was deleted, and everything under it with it.
+func (s *MCPOAuthClientStore) LockKeyShare(ctx context.Context, id pgtype.UUID) (sqlcgen.McpOauthClient, error) {
+	return s.q.LockMCPOAuthClientKeyShare(ctx, id)
 }
 
 // Delete removes a client by internal id and returns the deleted row

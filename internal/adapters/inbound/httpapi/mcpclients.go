@@ -195,11 +195,18 @@ func DeleteMCPClient(pool *pgxpool.Pool, clients *postgres.MCPOAuthClientStore, 
 		}
 		defer func() { _ = tx.Rollback(ctx) }()
 
-		// Lock the client row first: a consent adding a grant under it
-		// either finishes before the list below (and is listed) or waits
-		// until the client is gone (and fails its foreign key). Without
-		// the lock, a grant committed between the list and the cascade
-		// would be deleted with no revocation audit row.
+		// Lock the client row first, FOR UPDATE, and hold it until this
+		// transaction ends: parent before child, the one lock order every
+		// transaction on these tables follows (the top of
+		// postgres/mcpoauthgrant_store.go, technical plan §43.16). Every
+		// consent decision and code exchange takes this row FOR KEY SHARE
+		// before touching anything under it, so one that got there first
+		// has committed (its grant or token is in the list below and the
+		// cascade) or rolled back by the time this returns, and one that
+		// arrives later waits until the client is gone and then issues
+		// nothing (a bare grant insert fails its foreign key). Without the
+		// lock, a grant committed between the list and the cascade would be
+		// deleted with no revocation audit row.
 		if _, err := clients.WithTx(tx).Lock(ctx, clientID); errors.Is(err, pgx.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "client not found")
 			return

@@ -165,6 +165,34 @@ func (q *Queries) ListMCPOAuthGrantsForUser(ctx context.Context, userID pgtype.U
 	return items, nil
 }
 
+const lockMCPOAuthGrantKeyShare = `-- name: LockMCPOAuthGrantKeyShare :one
+SELECT id, user_id, client_id, scopes, resource, created_at, expires_at, last_used_at FROM mcp_oauth_grants
+WHERE id = $1
+FOR KEY SHARE
+`
+
+// LockMCPOAuthGrantKeyShare takes the grant row's FOR KEY SHARE lock for
+// the rest of the transaction: the lock an access-token insert's own
+// foreign-key check would take anyway, taken FIRST, before the code
+// exchange consumes the code the token is issued for (the lock order at
+// the top of mcpoauthgrant_store.go). It conflicts only with the grant's
+// deletion, never with another exchange or a consent renewing the grant.
+func (q *Queries) LockMCPOAuthGrantKeyShare(ctx context.Context, id pgtype.UUID) (McpOauthGrant, error) {
+	row := q.db.QueryRow(ctx, lockMCPOAuthGrantKeyShare, id)
+	var i McpOauthGrant
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.ClientID,
+		&i.Scopes,
+		&i.Resource,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+		&i.LastUsedAt,
+	)
+	return i, err
+}
+
 const touchMCPOAuthGrantLastUsed = `-- name: TouchMCPOAuthGrantLastUsed :exec
 UPDATE mcp_oauth_grants
 SET last_used_at = now()

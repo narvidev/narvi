@@ -161,12 +161,35 @@ func tokenClientID(r *http.Request, form url.Values) (clientID string, basicAtte
 // already spent is a replay: the
 // grant it produced is deleted, so every token issued under it stops
 // working on its next use (technical plan §43.16).
+//
+// Locks follow the one order every transaction on these tables follows,
+// parent before child (the top of postgres/mcpoauthgrant_store.go): the
+// client this request authenticated as, then the code's grant, both FOR
+// KEY SHARE, and only then the code itself. So the code's grant is read
+// first, without a lock. The client locked is the requesting one -- the
+// grant's own client whenever a token is issued, since a code issued to
+// another client is refused below.
 func (s *Server) exchangeCode(w http.ResponseWriter, r *http.Request, client sqlcgen.McpOauthClient, code, verifier, redirectURI string) {
 	ctx := r.Context()
 	logger := platform.Logger(ctx)
 	fail := func(msg string, err error) {
 		logger.Error("mcpauth: token: "+msg, "error", err)
 		writeTokenError(w, errServerError, "", false)
+	}
+	codeHash := platform.HashToken(code)
+
+	presented, err := s.deps.Grants.GetAuthorizationCodeByHash(ctx, codeHash)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		logger.Warn("mcpauth: token refused", "outcome", "unknown_code")
+		writeTokenError(w, errInvalidGrant, "the authorization code is invalid", false)
+		return
+	case err != nil:
+		fail("load code failed", err)
+		return
+	case presented.ConsumedAt.Valid:
+		s.handleUnusableCode(w, r, codeHash)
+		return
 	}
 
 	tx, err := s.deps.Pool.Begin(ctx)
@@ -176,11 +199,37 @@ func (s *Server) exchangeCode(w http.ResponseWriter, r *http.Request, client sql
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	grants := s.deps.Grants.WithTx(tx)
-	codeHash := platform.HashToken(code)
+
+	if _, err := s.deps.Clients.WithTx(tx).LockKeyShare(ctx, client.ID); errors.Is(err, pgx.ErrNoRows) {
+		// Deleted since Token read it, and every code issued to it with it.
+		logger.Warn("mcpauth: token refused", "outcome", "client_deleted", "client_id", client.ClientID)
+		writeTokenError(w, errInvalidGrant, "the authorization code is invalid", false)
+		return
+	} else if err != nil {
+		fail("lock client failed", err)
+		return
+	}
+	grant, err := grants.LockGrantKeyShare(ctx, presented.GrantID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Revoked since the code was read, and the code with it.
+		logger.Warn("mcpauth: token refused", "outcome", "grant_revoked", "client_id", client.ClientID)
+		writeTokenError(w, errInvalidGrant, "the authorization code is invalid", false)
+		return
+	}
+	if err != nil {
+		fail("lock grant failed", err)
+		return
+	}
 
 	row, err := grants.ConsumeAuthorizationCode(ctx, codeHash)
 	if errors.Is(err, pgx.ErrNoRows) {
-		s.handleUnusableCode(w, r, tx, codeHash)
+		// Spent by a concurrent exchange since it was read (or swept).
+		// This transaction may now hold the code row's lock -- a consume
+		// that waited keeps it -- so it ends here, before
+		// handleUnusableCode locks the grant's client and deletes the
+		// grant in a transaction of its own.
+		_ = tx.Rollback(ctx)
+		s.handleUnusableCode(w, r, codeHash)
 		return
 	}
 	if err != nil {
@@ -204,15 +253,6 @@ func (s *Server) exchangeCode(w http.ResponseWriter, r *http.Request, client sql
 	}
 
 	now := time.Now()
-	grant, err := grants.GetGrant(ctx, row.GrantID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		refuse("grant_revoked")
-		return
-	}
-	if err != nil {
-		fail("load grant failed", err)
-		return
-	}
 	switch {
 	case !row.ExpiresAt.Time.After(now):
 		refuse("code_expired")
@@ -274,11 +314,25 @@ func (s *Server) exchangeCode(w http.ResponseWriter, r *http.Request, client sql
 }
 
 // handleUnusableCode answers a code ConsumeAuthorizationCode would not
-// hand out: never issued (invalid_grant) or already spent -- a replay,
-// which deletes the grant it produced and records why.
-func (s *Server) handleUnusableCode(w http.ResponseWriter, r *http.Request, tx pgx.Tx, codeHash string) {
+// hand out: never issued or gone (invalid_grant), or already spent -- a
+// replay, which deletes the grant it produced and records why. It runs in
+// a transaction of its own, never the exchange's, and locks in the one
+// order (the top of postgres/mcpoauthgrant_store.go): the grant's client
+// FOR KEY SHARE, then the grant, whose deletion cascades to its codes and
+// tokens. An exchange still in flight under the grant holds it FOR KEY
+// SHARE, so the deletion waits for that exchange to commit and then takes
+// its token too.
+func (s *Server) handleUnusableCode(w http.ResponseWriter, r *http.Request, codeHash string) {
 	ctx := r.Context()
 	logger := platform.Logger(ctx)
+
+	tx, err := s.deps.Pool.Begin(ctx)
+	if err != nil {
+		logger.Error("mcpauth: token: begin replay tx failed", "error", err)
+		writeTokenError(w, errServerError, "", false)
+		return
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
 	grants := s.deps.Grants.WithTx(tx)
 
 	spent, err := grants.GetAuthorizationCodeByHash(ctx, codeHash)
@@ -294,9 +348,14 @@ func (s *Server) handleUnusableCode(w http.ResponseWriter, r *http.Request, tx p
 	}
 	grant, err := grants.GetGrant(ctx, spent.GrantID)
 	if err == nil {
-		client, cerr := s.deps.Clients.WithTx(tx).GetByID(ctx, grant.ClientID)
+		client, cerr := s.deps.Clients.WithTx(tx).LockKeyShare(ctx, grant.ClientID)
+		if errors.Is(cerr, pgx.ErrNoRows) {
+			// The client was deleted since, and this grant with it.
+			writeTokenError(w, errInvalidGrant, "the authorization code is invalid", false)
+			return
+		}
 		if cerr != nil {
-			logger.Error("mcpauth: token: load client for replay audit failed", "error", cerr)
+			logger.Error("mcpauth: token: lock client for replay revocation failed", "error", cerr)
 			writeTokenError(w, errServerError, "", false)
 			return
 		}

@@ -88,20 +88,44 @@ func RevokeMyMCPAuthorization(pool *pgxpool.Pool, grants *postgres.MCPOAuthGrant
 			return
 		}
 		defer func() { _ = tx.Rollback(ctx) }()
+		grantsTx := grants.WithTx(tx)
 
-		deleted, err := grants.WithTx(tx).DeleteGrantForUser(ctx, grantID, userID)
+		// Locks follow the one order every transaction on these tables
+		// follows, parent before child (the top of
+		// postgres/mcpoauthgrant_store.go, technical plan §43.16): the
+		// grant's client FOR KEY SHARE, then the grant, whose deletion
+		// cascades to its codes and tokens. So the grant's client is read
+		// first, without a lock. A code exchange in flight under the grant
+		// already holds it FOR KEY SHARE: the deletion waits for it to
+		// commit, then takes the token it issued too.
+		existing, err := grantsTx.GetGrant(ctx, grantID)
+		if errors.Is(err, pgx.ErrNoRows) || (err == nil && existing.UserID != userID) {
+			writeError(w, http.StatusNotFound, "authorization not found")
+			return
+		}
+		if err != nil {
+			logger.Error("httpapi: revoke mcp authorization: load grant failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		client, err := clients.WithTx(tx).LockKeyShare(ctx, existing.ClientID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// The client was deleted since, and this grant with it.
+			writeError(w, http.StatusNotFound, "authorization not found")
+			return
+		}
+		if err != nil {
+			logger.Error("httpapi: revoke mcp authorization: lock client failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		deleted, err := grantsTx.DeleteGrantForUser(ctx, grantID, userID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			writeError(w, http.StatusNotFound, "authorization not found")
 			return
 		}
 		if err != nil {
 			logger.Error("httpapi: revoke mcp authorization: delete failed", "error", err)
-			writeError(w, http.StatusInternalServerError, "internal error")
-			return
-		}
-		client, err := clients.WithTx(tx).GetByID(ctx, deleted.ClientID)
-		if err != nil {
-			logger.Error("httpapi: revoke mcp authorization: load client failed", "error", err)
 			writeError(w, http.StatusInternalServerError, "internal error")
 			return
 		}

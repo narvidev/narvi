@@ -28,6 +28,17 @@ RETURNING *;
 SELECT * FROM mcp_oauth_grants
 WHERE id = $1;
 
+-- LockMCPOAuthGrantKeyShare takes the grant row's FOR KEY SHARE lock for
+-- the rest of the transaction: the lock an access-token insert's own
+-- foreign-key check would take anyway, taken FIRST, before the code
+-- exchange consumes the code the token is issued for (the lock order at
+-- the top of mcpoauthgrant_store.go). It conflicts only with the grant's
+-- deletion, never with another exchange or a consent renewing the grant.
+-- name: LockMCPOAuthGrantKeyShare :one
+SELECT * FROM mcp_oauth_grants
+WHERE id = $1
+FOR KEY SHARE;
+
 -- name: DeleteMCPOAuthGrant :execrows
 DELETE FROM mcp_oauth_grants
 WHERE id = $1;

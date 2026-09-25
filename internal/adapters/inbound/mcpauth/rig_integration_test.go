@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/narvidev/narvi/internal/adapters/inbound/auth"
+	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 	"github.com/narvidev/narvi/internal/adapters/inbound/mcpauth"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
@@ -42,7 +43,9 @@ const (
 // controlplane/serve.go mounts it (no cookie middleware on any /oauth
 // route), plus a /mcp stand-in behind the real auth.RequireMCPBearer so a
 // test can ask "does this token still work" -- and, through the scopes
-// the stand-in echoes back, "what may it see".
+// the stand-in echoes back, "what may it see" -- and the two Settings
+// revocation routes, the real httpapi handlers behind the real cookie
+// middleware, so a test can race a revocation against an issuance.
 // controlplane's own TestOAuth_ProductionRouter proves the production
 // wiring itself.
 type asRig struct {
@@ -51,6 +54,7 @@ type asRig struct {
 	userSessions *postgres.UserSessionStore
 	clients      *postgres.MCPOAuthClientStore
 	grants       *postgres.MCPOAuthGrantStore
+	auditLog     *postgres.AuditLogStore
 	server       *mcpauth.Server
 	router       http.Handler
 	client       sqlcgen.McpOauthClient
@@ -65,6 +69,7 @@ func newASRig(t *testing.T) *asRig {
 		userSessions: postgres.NewUserSessionStore(pool),
 		clients:      postgres.NewMCPOAuthClientStore(pool),
 		grants:       postgres.NewMCPOAuthGrantStore(pool),
+		auditLog:     postgres.NewAuditLogStore(pool),
 	}
 	var err error
 	r.server, err = mcpauth.New(mcpauth.Config{
@@ -78,7 +83,7 @@ func newASRig(t *testing.T) *asRig {
 		Grants:       r.grants,
 		UserSessions: r.userSessions,
 		Users:        r.users,
-		AuditLog:     postgres.NewAuditLogStore(pool),
+		AuditLog:     r.auditLog,
 	})
 	if err != nil {
 		t.Fatalf("mcpauth.New: %v", err)
@@ -114,6 +119,16 @@ func newASRig(t *testing.T) *asRig {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(g.Scopes)
 		})
+	})
+	// Mounted exactly like controlplane/serve.go (technical plan
+	// §43.15/§43.18).
+	router.Route("/api/me/mcp-authorizations", func(rt chi.Router) {
+		rt.Use(auth.Middleware(r.userSessions, r.users))
+		rt.Delete("/{authorizationID}", httpapi.RevokeMyMCPAuthorization(pool, r.grants, r.clients, r.auditLog))
+	})
+	router.Route("/api/mcp-clients", func(rt chi.Router) {
+		rt.Use(auth.Middleware(r.userSessions, r.users))
+		rt.Delete("/{clientID}", httpapi.DeleteMCPClient(pool, r.clients, r.grants, r.auditLog))
 	})
 	r.router = router
 	return r

@@ -309,13 +309,14 @@ func (s *Server) ConsentDecision(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.decide(w, r, requestID, userID, decision == "approve", selected)
+	s.decide(w, r, requestID, row.ClientID, userID, decision == "approve", selected)
 }
 
 // decide records one consent decision in a single transaction and
 // redirects to the request's STORED redirect URI -- never a URI read from
-// the form.
-func (s *Server) decide(w http.ResponseWriter, r *http.Request, requestID, userID pgtype.UUID, approve bool, selected []mcpscope.Scope) {
+// the form. clientID is the request's client (a request's client never
+// changes).
+func (s *Server) decide(w http.ResponseWriter, r *http.Request, requestID, clientID, userID pgtype.UUID, approve bool, selected []mcpscope.Scope) {
 	ctx := r.Context()
 	logger := platform.Logger(ctx)
 	fail := func(msg string, err error) {
@@ -330,6 +331,23 @@ func (s *Server) decide(w http.ResponseWriter, r *http.Request, requestID, userI
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	grants := s.deps.Grants.WithTx(tx)
+
+	// The client first, FOR KEY SHARE, before the request is consumed:
+	// parent before child, the lock order every transaction on these
+	// tables follows (the top of postgres/mcpoauthgrant_store.go,
+	// technical plan §43.16). A client deletion that got here first is
+	// waited out and leaves no client; one that arrives later waits for
+	// this decision to commit and then deletes what it granted.
+	client, err := s.deps.Clients.WithTx(tx).LockKeyShare(ctx, clientID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		logger.Warn("mcpauth: consent decision refused", "outcome", "client_deleted")
+		s.renderError(w, r, http.StatusBadRequest, "This app is not available", "The app that asked for access is no longer registered on this deployment.")
+		return
+	}
+	if err != nil {
+		fail("lock client failed", err)
+		return
+	}
 
 	consumed, err := grants.ConsumeAuthorizationRequest(ctx, requestID, userID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -354,16 +372,12 @@ func (s *Server) decide(w http.ResponseWriter, r *http.Request, requestID, userI
 		return
 	}
 
-	client, err := s.deps.Clients.WithTx(tx).GetByID(ctx, consumed.ClientID)
-	if err != nil {
-		fail("load client failed", err)
-		return
-	}
 	if client.DisabledAt.Valid || client.Kind != sqlcgen.McpOauthClientKindPreregistered {
 		// Disabled after the page was rendered: nothing is granted. The
-		// rollback also leaves the request unconsumed, but the page's
-		// own render refuses a disabled client, so it can never be
-		// decided again.
+		// row is the one the lock above returned, and the client cannot
+		// be deleted before this transaction ends. The rollback also
+		// leaves the request unconsumed, but the page's own render
+		// refuses a disabled client, so it can never be decided again.
 		logger.Warn("mcpauth: consent decision refused", "outcome", "client_not_usable", "client_id", client.ClientID)
 		s.renderError(w, r, http.StatusBadRequest, "This app is not available", "An administrator of this deployment has disabled this app.")
 		return

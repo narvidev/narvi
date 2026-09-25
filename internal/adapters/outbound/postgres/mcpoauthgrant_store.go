@@ -1,3 +1,40 @@
+// Lock order for the MCP authorization server's tables (technical plan
+// §43.16, migrations/000141_mcp_oauth.up.sql). Every transaction that
+// touches them takes its row locks parent before child, in this one order:
+//
+//	mcp_oauth_clients
+//	  -> mcp_oauth_grants
+//	       -> mcp_oauth_authorization_requests (a client's children),
+//	          mcp_oauth_authorization_codes, mcp_oauth_access_tokens (a grant's)
+//
+// Every row lock counts, however it is taken: SELECT ... FOR UPDATE or FOR
+// KEY SHARE, an UPDATE or DELETE of the row, the FOR KEY SHARE an insert's
+// foreign-key check takes on its parent, and an ON DELETE CASCADE reaching
+// a child. A plain read locks nothing and may come in any order.
+//
+// Revocation locks downwards by construction: deleting a client
+// (MCPOAuthClientStore.Lock first) or a grant locks that row, then its
+// cascade locks the rows under it. So every transaction that issues
+// something locks its parents FIRST, explicitly, before it consumes the
+// child that gates the issuance -- the consent decision takes the client
+// FOR KEY SHARE (MCPOAuthClientStore.LockKeyShare) before consuming its
+// authorization request; the code exchange takes the client, then the
+// code's grant (LockGrantKeyShare), before consuming its code. Deleting a
+// grant -- by its user, or on code reuse -- takes the grant's client FOR
+// KEY SHARE before the grant. A revocation racing an issuance therefore
+// waits on the parent the issuance already holds and then deletes what it
+// issued, or the issuance waits on the revocation and then finds its
+// parent gone; neither ever holds a child the other is waiting for, so
+// they cannot deadlock.
+//
+// The consent decision is the one transaction that locks both a request
+// and a grant (request first): both hang off the client it holds FOR KEY
+// SHARE throughout, so the only transaction that could lock them the other
+// way round -- the client's deletion, which needs the client FOR UPDATE --
+// never interleaves with it. users(id) is a parent of grants and requests
+// too; nothing here locks a users row except those foreign-key checks, and
+// users rows are never deleted.
+
 package postgres
 
 import (
@@ -72,7 +109,8 @@ func (s *MCPOAuthGrantStore) BindAuthorizationRequest(ctx context.Context, id, u
 
 // ConsumeAuthorizationRequest marks a request decided, at most once, for
 // its bound user only. pgx.ErrNoRows means it was not (any longer)
-// decidable by userID.
+// decidable by userID. Lock the request's client first (the lock order at
+// the top of this file).
 func (s *MCPOAuthGrantStore) ConsumeAuthorizationRequest(ctx context.Context, id, userID pgtype.UUID) (sqlcgen.McpOauthAuthorizationRequest, error) {
 	return s.q.ConsumeMCPOAuthAuthorizationRequest(ctx, sqlcgen.ConsumeMCPOAuthAuthorizationRequestParams{ID: id, UserID: userID})
 }
@@ -91,8 +129,18 @@ func (s *MCPOAuthGrantStore) GetGrant(ctx context.Context, id pgtype.UUID) (sqlc
 	return s.q.GetMCPOAuthGrant(ctx, id)
 }
 
+// LockGrantKeyShare takes the grant row's FOR KEY SHARE lock for the rest
+// of the transaction and returns the row as of that lock: what the code
+// exchange takes before consuming a code issued under the grant (the lock
+// order at the top of this file). pgx.ErrNoRows means no such grant -- it
+// was revoked, and its codes and tokens with it.
+func (s *MCPOAuthGrantStore) LockGrantKeyShare(ctx context.Context, id pgtype.UUID) (sqlcgen.McpOauthGrant, error) {
+	return s.q.LockMCPOAuthGrantKeyShare(ctx, id)
+}
+
 // DeleteGrant revokes a grant (and, by cascade, every code and access
 // token issued under it), returning how many rows were deleted (0 or 1).
+// Lock the grant's client first (the lock order at the top of this file).
 func (s *MCPOAuthGrantStore) DeleteGrant(ctx context.Context, id pgtype.UUID) (int64, error) {
 	return s.q.DeleteMCPOAuthGrant(ctx, id)
 }
@@ -100,6 +148,7 @@ func (s *MCPOAuthGrantStore) DeleteGrant(ctx context.Context, id pgtype.UUID) (i
 // DeleteGrantForUser revokes a grant only if it belongs to userID,
 // returning the deleted row; pgx.ErrNoRows means no such grant for this
 // user (another user's grant is indistinguishable from a missing one).
+// Lock the grant's client first (the lock order at the top of this file).
 func (s *MCPOAuthGrantStore) DeleteGrantForUser(ctx context.Context, id, userID pgtype.UUID) (sqlcgen.McpOauthGrant, error) {
 	return s.q.DeleteMCPOAuthGrantForUser(ctx, sqlcgen.DeleteMCPOAuthGrantForUserParams{ID: id, UserID: userID})
 }
@@ -126,7 +175,9 @@ func (s *MCPOAuthGrantStore) CreateAuthorizationCode(ctx context.Context, arg sq
 
 // ConsumeAuthorizationCode marks the code with this hash used and returns
 // it -- at most once per code. pgx.ErrNoRows means it was already used or
-// never existed (GetAuthorizationCodeByHash tells the two apart).
+// never existed (GetAuthorizationCodeByHash tells the two apart). Lock the
+// client, then the code's grant, first (the lock order at the top of this
+// file).
 func (s *MCPOAuthGrantStore) ConsumeAuthorizationCode(ctx context.Context, codeHash string) (sqlcgen.McpOauthAuthorizationCode, error) {
 	return s.q.ConsumeMCPOAuthAuthorizationCode(ctx, codeHash)
 }

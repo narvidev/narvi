@@ -7059,6 +7059,14 @@ broadcast. Codes, access tokens and consent nonces are stored only as `platform.
 output; the plaintext code and token carry recognizable prefixes (`narvi_mcp_ac_`, `narvi_mcp_at_`) so a
 secret scanner or a reviewer reading a log can tell the family, and the whole string is hashed.
 
+Every transaction on these tables takes its row locks in one order, parent before child — the client, then
+the grant, then the requests, codes and tokens under them (written down once, at the top of
+`internal/adapters/outbound/postgres/mcpoauthgrant_store.go`): the consent decision locks the client, and
+the code exchange the client and then the code's grant, `FOR KEY SHARE` before consuming its request or
+code, while every revocation locks the client or the grant before its cascade reaches the rows under it,
+so a revocation racing an issuance waits for it and then deletes what it issued — or the issuance waits
+and finds its parent gone — instead of the two deadlocking (`TestLockOrder_RevocationRacingIssuance`).
+
 Lifetimes live in `platform/timeouts.go`: `MCPAuthorizationRequestTTL` (10 minutes, the consent window),
 `MCPAuthorizationCodeTTL` (60 seconds), `MCPAccessTokenTTL` (1 hour), `MCPGrantMaxLifetime` (90 days,
 absolute), `MCPGrantLastUsedWriteInterval` (5 minutes), and `MCPDiscoveryCacheMaxAge` (5 minutes, the
@@ -7149,7 +7157,7 @@ authorizations — and revocation on their behalf — is piece (d).
 | Consent clickjacking and CSRF | frame headers; SameSite cookie, hashed per-render nonce, same-origin check, request bound to one user | `TestConsent_FrameHeaders`, `TestConsent_MissingOrWrongNonceRefused`, `TestConsent_CrossSiteOriginRefused`, `TestConsent_OtherUserCannotDecide` |
 | Scope escalation | consent narrows only; unadvertised scopes refused; a token's scopes are fixed at issuance, so a later consent can neither widen nor narrow it | `TestConsent_CannotAddUnrequestedScope`, `TestAuthorize_UnadvertisedScopeRefused`, `TestToken_ScopesFixedAtIssuance_LaterConsentCannotWiden`, `TestToken_ScopesFixedAtIssuance_LaterConsentCannotNarrow` |
 | Client identity spoofing | the page shows who registered the client and the true redirect host, with a loopback warning | `TestConsent_ShowsClientIdentityAndRedirectHost` |
-| Revoked, disabled or deleted principals | one join per call, no cache; deleting a client cascades its grants, each audited; a disabled client gets no consent page | `TestBearer_NoCacheBetweenCalls`, `TestOAuth_ProductionRouter/RevokedAuthorizationStopsOnNextCall_User`, `_ClientDeleted`, `_DisabledUser`, `TestOAuth_ProductionRouter/DisabledClientIs401NextCall`, `TestClient_DeleteCascadesGrants`, `TestClient_DeleteAuditsGrantAddedByConcurrentConsent`, `TestConsent_ClientDisabledBeforeRenderRefused` |
+| Revoked, disabled or deleted principals | one join per call, no cache; deleting a client cascades its grants, each audited; a disabled client gets no consent page; a revocation racing a consent or code exchange waits for it, then deletes what it issued (§43.16's lock order) | `TestBearer_NoCacheBetweenCalls`, `TestLockOrder_RevocationRacingIssuance`, `TestOAuth_ProductionRouter/RevokedAuthorizationStopsOnNextCall_User`, `_ClientDeleted`, `_DisabledUser`, `TestOAuth_ProductionRouter/DisabledClientIs401NextCall`, `TestClient_DeleteCascadesGrants`, `TestClient_DeleteAuditsGrantAddedByConcurrentConsent`, `TestConsent_ClientDisabledBeforeRenderRefused` |
 | Discovery leak | per-request tool registration by scope; composed instructions; empty defect server | `TestToolsList_ScopeFilter_Table`, `TestInstructions_NameOnlyVisibleTools`, `TestHiddenToolCall_IsIndistinguishableFromUnknownTool`, `TestOAuth_ProductionRouter/ScopelessGrant_ToolsListEmpty` |
 | Phishing through the login return path | the sign-in view accepts only `/oauth/consent?request=<uuid>` as a server-rendered return target; both login handlers accept only same-origin paths | `TestLogin_NextAcceptsConsentPath`, `TestOIDCLogin_NextReturnsToConsentPage`, the sign-in view's own return-to test |
 | Table growth | a TTL on every row kind, swept | `TestExpiredCleanup_SweepsMCPRows` |
