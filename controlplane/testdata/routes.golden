@@ -5,7 +5,9 @@ DELETE /api/environments/{environmentID}/cluster-binding
 DELETE /api/environments/{environmentID}/opencode-config
 DELETE /api/environments/{environmentID}/provider-credentials/{credentialID}
 DELETE /api/environments/{environmentID}/sandbox-secrets/{secretID}
+DELETE /api/mcp-clients/{clientID}
 DELETE /api/me/chatgpt-link
+DELETE /api/me/mcp-authorizations/{authorizationID}
 DELETE /api/members/{userID}/identities/{identityID}
 DELETE /api/opencode-config
 DELETE /api/provider-credentials/{credentialID}
@@ -34,8 +36,10 @@ GET /api/environments/{environmentID}/provider-credentials
 GET /api/environments/{environmentID}/sandbox-secrets
 GET /api/integrations
 GET /api/intent-templates
+GET /api/mcp-clients
 GET /api/me
 GET /api/me/chatgpt-link
+GET /api/me/mcp-authorizations
 GET /api/members
 GET /api/models
 GET /api/opencode-config
@@ -90,6 +94,7 @@ POST /api/environments/{environmentID}/provider-credentials
 POST /api/environments/{environmentID}/sandbox-secrets
 POST /api/intent-templates
 POST /api/intent-templates/preview
+POST /api/mcp-clients
 POST /api/me/chatgpt-link
 POST /api/members/{userID}/identities
 POST /api/provider-credentials

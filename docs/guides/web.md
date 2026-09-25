@@ -377,8 +377,39 @@ and one checkbox per kind of access; you can uncheck any of them, never add
 one. An app never does more than your own role allows: its tools call the
 same routes this guide documents, checked against your role on every call.
 
-**Negatives.** The whole surface is off unless the deployment sets
-`NARVI_MCP_ENABLED=true`; while it is off every route above answers `503`.
+Once an app is connected, you manage it in Settings → Integrations →
+Connected apps: what it may do, when you connected it, when it last called,
+and when the authorization lapses (after 90 days you are asked again).
+
+```json narvi-command
+{"name": "List your own connected MCP apps", "route": "GET /api/me/mcp-authorizations"}
+```
+
+```json narvi-command
+{"name": "Disconnect one of your MCP apps (its very next call is refused)", "route": "DELETE /api/me/mcp-authorizations/{authorizationID}"}
+```
+
+Administrators decide which apps may ask at all, in the same panel:
+
+```json narvi-command
+{"name": "List registered MCP clients (admin)", "route": "GET /api/mcp-clients"}
+```
+
+```json narvi-command
+{"name": "Register an MCP client and get its client ID (admin)", "route": "POST /api/mcp-clients"}
+```
+
+```json narvi-command
+{"name": "Delete a registered MCP client, disconnecting every user of it (admin)", "route": "DELETE /api/mcp-clients/{clientID}"}
+```
+
+**Negatives.** The MCP surface is off unless the deployment sets
+`NARVI_MCP_ENABLED=true`; while it is off, `/oauth/...` answers `503` — but
+the Settings routes above keep working, so an authorization can always be
+listed and revoked. Every role, viewer included, can connect an app and
+disconnect its own; only an admin can register or delete a client.
+Disconnecting deletes the authorization outright, and deleting a client
+deletes every authorization issued to it — there is no "paused" state.
 An app registered with a redirect address that does not match exactly
 (except the port of a `127.0.0.1`/`[::1]` address) is shown an error page
 and your browser is never sent anywhere. Each approval is single-use and

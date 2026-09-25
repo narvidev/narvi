@@ -1,5 +1,5 @@
 {
-  "version": "1.3.0",
+  "version": "1.4.0",
   "surfaces": [
     {
       "path": "rest/v1/dtos.schema.json",
@@ -41,6 +41,8 @@
     "rest/v1/dtos.schema.json#/$defs/WorkflowStepDecideResponse/properties/runStatus",
     "rest/v1/dtos.schema.json#/$defs/WorkflowStepDecideResponse/properties/stepRunStatus",
     "rest/v1/dtos.schema.json#/$defs/Identity/properties/provider",
-    "rest/v1/dtos.schema.json#/$defs/PendingLinkPrompt/properties/provider"
+    "rest/v1/dtos.schema.json#/$defs/PendingLinkPrompt/properties/provider",
+    "rest/v1/dtos.schema.json#/$defs/MCPAuthorization/properties/clientKind",
+    "rest/v1/dtos.schema.json#/$defs/MCPClient/properties/kind"
   ]
 }

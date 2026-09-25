@@ -1290,3 +1290,50 @@ func TestOIDCCallback_EmptySubject_NeverCollapsesDifferentUsers(t *testing.T) {
 		t.Errorf("users created for alice/bob = %d, want 0 -- neither empty-subject sign-in may create or reuse ANY user row", userCount)
 	}
 }
+
+// TestOIDCLogin_NextReturnsToConsentPage: an OIDC-only deployment can
+// complete MCP consent (technical plan §43.14) -- GET
+// /auth/oidc/login?next=/oauth/consent?request=<id> lands the browser back
+// on that exact path after a successful callback, while an unsafe next is
+// ignored and the callback falls back to "/".
+func TestOIDCLogin_NextReturnsToConsentPage(t *testing.T) {
+	const consent = "/oauth/consent?request=3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+	for _, tc := range []struct {
+		name, email, next, wantPath, wantQuery string
+	}{
+		{"consent path", "next-consent@example.com", consent, "/oauth/consent", "request=3f2504e0-4f89-11d3-9a0c-0305e82c3301"},
+		{"scheme-relative next ignored", "next-unsafe@example.com", "//evil.example/x", "/", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newOIDCTestRig(t, defaultOIDCRiggedOptions())
+			client := newClient(t)
+
+			resp, err := client.Get(rig.server.URL + "/auth/oidc/login?next=" + url.QueryEscape(tc.next))
+			if err != nil {
+				t.Fatalf("GET /auth/oidc/login: %v", err)
+			}
+			_ = resp.Body.Close()
+			loc, err := resp.Location()
+			if err != nil {
+				t.Fatalf("login Location: %v", err)
+			}
+			state, nonce := loc.Query().Get("state"), loc.Query().Get("nonce")
+
+			claims := rig.provider.defaultClaims("oidc-subject-next-" + tc.name)
+			claims["email"] = tc.email
+			claims["email_verified"] = true
+			claims["nonce"] = nonce
+			rig.provider.setNextIDToken(rig.provider.signIDToken(t, claims))
+
+			cb := doOIDCCallback(t, client, rig.server.URL, state, "a-fresh-code")
+			defer func() { _ = cb.Body.Close() }()
+			if cb.StatusCode != http.StatusFound {
+				t.Fatalf("callback status = %d, want 302", cb.StatusCode)
+			}
+			got, _ := cb.Location()
+			if got == nil || got.Path != tc.wantPath || got.RawQuery != tc.wantQuery {
+				t.Fatalf("callback redirected to %v, want %s?%s", got, tc.wantPath, tc.wantQuery)
+			}
+		})
+	}
+}

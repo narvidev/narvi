@@ -30,6 +30,7 @@ import type {
   ClusterBinding,
   ConfirmUploadResponse,
   CreateAutomationRequest,
+  CreateMCPClientRequest,
   CreateAutomationResponse,
   CreateCloudIdentityBindingRequest,
   CreateProviderCredentialRequest,
@@ -50,6 +51,8 @@ import type {
   ListEnvironmentsResponse,
   ListFalsePositivePatternsResponse,
   ListIntegrationsResponse,
+  ListMCPAuthorizationsResponse,
+  ListMCPClientsResponse,
   ListMembersResponse,
   ListPlansResponse,
   ListPromptTemplatesResponse,
@@ -59,6 +62,7 @@ import type {
   ListWorkflowBindingsResponse,
   ListWorkflowDefinitionsResponse,
   ListWorkflowRunsResponse,
+  MCPClient,
   Member,
   MergePullRequestRequest,
   MergePullRequestResponse,
@@ -414,6 +418,33 @@ export function getChatGPTLinkStatus(signal?: AbortSignal): Promise<ChatGPTLinkS
 /** unlinkChatGPTAccount calls DELETE /api/me/chatgpt-link (§29.3: "unlink deletes it") -- idempotent, 204 whether or not an account was actually linked. */
 export function unlinkChatGPTAccount(signal?: AbortSignal): Promise<undefined> {
   return request<undefined>('/api/me/chatgpt-link', { method: 'DELETE', signal })
+}
+
+// -- connected MCP apps (technical plan §43.15/§43.18) --
+
+/** listMyMCPAuthorizations calls GET /api/me/mcp-authorizations -- the caller's own connected MCP clients (every role, authz.ActionViewOwnProfile). No field is a secret: tokens exist server-side only as hashes. */
+export function listMyMCPAuthorizations(signal?: AbortSignal): Promise<ListMCPAuthorizationsResponse> {
+  return request<ListMCPAuthorizationsResponse>('/api/me/mcp-authorizations', { signal })
+}
+
+/** revokeMyMCPAuthorization calls DELETE /api/me/mcp-authorizations/:id -- deletes one of the caller's OWN authorizations; the client's very next /mcp call is refused. 404 for an id that is not the caller's own. */
+export function revokeMyMCPAuthorization(authorizationId: string, signal?: AbortSignal): Promise<undefined> {
+  return request<undefined>(`/api/me/mcp-authorizations/${encodeURIComponent(authorizationId)}`, { method: 'DELETE', signal })
+}
+
+/** listMCPClients calls GET /api/mcp-clients -- every registered MCP client (admin only, authz.ActionManageIntegrations; 403 otherwise). */
+export function listMCPClients(signal?: AbortSignal): Promise<ListMCPClientsResponse> {
+  return request<ListMCPClientsResponse>('/api/mcp-clients', { signal })
+}
+
+/** createMCPClient calls POST /api/mcp-clients -- pre-registers an MCP client (admin only). The server generates the public clientId and refuses any redirect URI the authorization endpoint could not use (400). */
+export function createMCPClient(body: CreateMCPClientRequest, signal?: AbortSignal): Promise<MCPClient> {
+  return request<MCPClient>('/api/mcp-clients', { method: 'POST', body, signal })
+}
+
+/** deleteMCPClient calls DELETE /api/mcp-clients/:id -- removes the client and every authorization issued to it (admin only). */
+export function deleteMCPClient(clientId: string, signal?: AbortSignal): Promise<undefined> {
+  return request<undefined>(`/api/mcp-clients/${encodeURIComponent(clientId)}`, { method: 'DELETE', signal })
 }
 
 // -- environments (§14.1) --

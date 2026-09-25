@@ -2691,6 +2691,26 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		r.Post("/", mcpHandler.ServeHTTP)
 	})
 
+	// /api/me/mcp-authorizations, /api/mcp-clients (technical plan
+	// §43.15/§43.18): Settings' own view of the MCP authorization server --
+	// a user's own connected clients (list, revoke) and the admin-only
+	// pre-registration of clients. Ordinary cookie-authenticated /api
+	// groups, each handler rendering its own authz verdict. Deliberately
+	// NOT behind mcpadapter.RequireEnabled: an operator who turns the
+	// surface off must still be able to see and revoke every
+	// authorization it issued, and to remove a client.
+	router.Route("/api/me/mcp-authorizations", func(r chi.Router) {
+		r.Use(auth.Middleware(userSessionStore, userStore))
+		r.Get("/", httpapi.ListMyMCPAuthorizations(mcpOAuthGrantStore))
+		r.Delete("/{authorizationID}", httpapi.RevokeMyMCPAuthorization(pool, mcpOAuthGrantStore, mcpOAuthClientStore, auditLogStore))
+	})
+	router.Route("/api/mcp-clients", func(r chi.Router) {
+		r.Use(auth.Middleware(userSessionStore, userStore))
+		r.Get("/", httpapi.ListMCPClients(mcpOAuthClientStore))
+		r.Post("/", httpapi.CreateMCPClient(pool, mcpOAuthClientStore, auditLogStore))
+		r.Delete("/{clientID}", httpapi.DeleteMCPClient(pool, mcpOAuthClientStore, mcpOAuthGrantStore, auditLogStore))
+	})
+
 	// Module routes (docs/design/boundaries-design.md, section 3.2): mounted
 	// AFTER every public route group, under /api/ext/<Name>/, behind the
 	// SAME auth.Middleware every public route above already uses --

@@ -135,6 +135,16 @@ export const chatgptLinkQueryKeys = {
   status: () => ['chatgpt-link', 'status'] as const,
 }
 
+// mcpAuthorizationQueryKeys (technical plan §43.18) -- the Integrations screen's own "Connected apps" list, scoped to the current caller like chatgptLinkQueryKeys above (there is no admin view of another member's authorizations in this piece).
+export const mcpAuthorizationQueryKeys = {
+  mine: () => ['mcp-authorizations', 'mine'] as const,
+}
+
+// mcpClientQueryKeys (technical plan §43.15) -- the admin-only registered MCP clients list, deployment-wide like integrationQueryKeys above.
+export const mcpClientQueryKeys = {
+  list: () => ['mcp-clients', 'list'] as const,
+}
+
 export const promptTemplateQueryKeys = {
   list: () => ['prompt-templates', 'list'] as const,
 }

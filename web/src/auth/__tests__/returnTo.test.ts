@@ -4,7 +4,7 @@
 // authority and is proved separately by that package's own Go tests).
 import { describe, expect, it } from 'vitest'
 
-import { isSafeReturnTo, KNOWN_RETURN_TO_ROUTES } from '../returnTo'
+import { isSafeReturnTo, isServerRenderedReturnTo, KNOWN_RETURN_TO_ROUTES } from '../returnTo'
 
 describe('isSafeReturnTo', () => {
   it('accepts every route in the known allowlist', () => {
@@ -71,5 +71,31 @@ describe('isSafeReturnTo -- the allowlist must cover the routes that actually ex
     expect(isSafeReturnTo('/settingsevil')).toBe(false)
     expect(isSafeReturnTo('//evil.example')).toBe(false)
     expect(isSafeReturnTo('/session/3f2504e0-4f89-11d3-9a0c-0305e82c3301/evil')).toBe(false)
+  })
+})
+
+describe('isSafeReturnTo -- the MCP consent page (technical plan §43.14)', () => {
+  const id = '3f2504e0-4f89-11d3-9a0c-0305e82c3301'
+
+  it('accepts exactly /oauth/consent?request=<uuid>, and marks it server-rendered', () => {
+    expect(isSafeReturnTo(`/oauth/consent?request=${id}`)).toBe(true)
+    expect(isServerRenderedReturnTo(`/oauth/consent?request=${id}`)).toBe(true)
+    expect(isServerRenderedReturnTo('/settings')).toBe(false)
+  })
+
+  it('refuses every near miss', () => {
+    for (const path of [
+      '/oauth/consent',
+      '/oauth/consent?request=not-a-uuid',
+      `/oauth/consent?request=${id.toUpperCase()}`,
+      `/oauth/consent?request=${id}&next=//evil.example`,
+      `/oauth/consent?request=${id}#frag`,
+      `/oauth/authorize?request=${id}`,
+      `/oauth/consent/?request=${id}`,
+      `//evil.example/oauth/consent?request=${id}`,
+      `https://evil.example/oauth/consent?request=${id}`,
+    ]) {
+      expect(isSafeReturnTo(path), path).toBe(false)
+    }
   })
 })

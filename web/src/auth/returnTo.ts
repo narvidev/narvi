@@ -46,6 +46,16 @@ const KNOWN_RETURN_TO_ROUTES: readonly string[] = [
 const SESSION_ROUTE_PATTERN =
   /^\/session\/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(\/(plan|review|release-review|runs))?$/
 
+// The MCP consent page (technical plan §43.14) is the one SERVER-rendered
+// page a sign-in may return to: GET /oauth/authorize sends a signed-out
+// browser to /sign-in?next=/oauth/consent?request=<uuid>, and nothing
+// else. Exactly that shape -- a lower-case uuid and no other parameter --
+// never a prefix of it. Because it is not a route of this SPA, reaching it
+// takes a full page load (isServerRenderedReturnTo), never client-side
+// navigation.
+const MCP_CONSENT_RETURN_PATTERN =
+  /^\/oauth\/consent\?request=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
 /**
  * isSafeReturnTo reports whether path is one of this app's own known,
  * top-level route paths -- an EXACT match against KNOWN_RETURN_TO_ROUTES
@@ -57,7 +67,16 @@ const SESSION_ROUTE_PATTERN =
  * bug to route around with a looser check.
  */
 export function isSafeReturnTo(path: string): boolean {
-  return KNOWN_RETURN_TO_ROUTES.includes(path) || SESSION_ROUTE_PATTERN.test(path)
+  return KNOWN_RETURN_TO_ROUTES.includes(path) || SESSION_ROUTE_PATTERN.test(path) || isServerRenderedReturnTo(path)
+}
+
+/**
+ * isServerRenderedReturnTo reports whether path is a safe return target
+ * that this SPA does NOT render -- today only the MCP consent page -- so
+ * the caller must leave the SPA with a full page load to reach it.
+ */
+export function isServerRenderedReturnTo(path: string): boolean {
+  return MCP_CONSENT_RETURN_PATTERN.test(path)
 }
 
 export { KNOWN_RETURN_TO_ROUTES }
