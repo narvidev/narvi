@@ -106,6 +106,10 @@ func (s *Server) Token(w http.ResponseWriter, r *http.Request) {
 		writeTokenError(w, errInvalidRequest, "code_verifier is required (PKCE)", false)
 		return
 	}
+	// Checked before the code is looked up: a missing or foreign resource
+	// is invalid_target (RFC 8707 section 2) and leaves the code unspent,
+	// like every refusal decided from the request alone -- the code is
+	// still bound by PKCE and expires in MCPAuthorizationCodeTTL.
 	if !s.ids.matchesResource(form.Get("resource")) {
 		writeTokenError(w, errInvalidTarget, "resource must be this deployment's MCP endpoint", false)
 		return
@@ -144,9 +148,10 @@ func tokenClientID(r *http.Request, form url.Values) (clientID string, basicAtte
 }
 
 // exchangeCode consumes the authorization code and, if every binding
-// holds, issues one access token -- in one transaction. A code is spent by
-// the attempt even when a later check fails (single use is not "single
-// successful use"), and a code that was already spent is a replay: the
+// holds, issues one access token -- in one transaction. A code that
+// reaches this point is spent by the attempt even when a later check
+// fails (single use is not "single successful use"), and a code that was
+// already spent is a replay: the
 // grant it produced is deleted, so every token issued under it stops
 // working on its next use (technical plan §43.16).
 func (s *Server) exchangeCode(w http.ResponseWriter, r *http.Request, client sqlcgen.McpOauthClient, code, verifier, redirectURI string) {
@@ -176,14 +181,19 @@ func (s *Server) exchangeCode(w http.ResponseWriter, r *http.Request, client sql
 		return
 	}
 
-	// refuse commits the code's consumption, then answers invalid_grant.
-	refuse := func(outcome string) {
+	// refuseAs commits the code's consumption, then answers errCode;
+	// refuse is the invalid_grant case every binding but the resource
+	// answers.
+	refuseAs := func(errCode, description, outcome string) {
 		if err := tx.Commit(ctx); err != nil {
 			fail("commit spent code failed", err)
 			return
 		}
 		logger.Warn("mcpauth: token refused", "outcome", outcome, "client_id", client.ClientID)
-		writeTokenError(w, errInvalidGrant, "the authorization code is invalid", false)
+		writeTokenError(w, errCode, description, false)
+	}
+	refuse := func(outcome string) {
+		refuseAs(errInvalidGrant, "the authorization code is invalid", outcome)
 	}
 
 	now := time.Now()
@@ -207,7 +217,12 @@ func (s *Server) exchangeCode(w http.ResponseWriter, r *http.Request, client sql
 		refuse("redirect_uri_mismatch")
 		return
 	case row.Resource != s.ids.Resource:
-		refuse("resource_mismatch")
+		// The request's resource matched this deployment above, so this is
+		// a code granted for another resource -- only possible when
+		// PublicBaseURL changed between authorization and exchange. RFC
+		// 8707 section 2 answers a resource outside what was granted with
+		// invalid_target.
+		refuseAs(errInvalidTarget, "the authorization code was issued for another resource", "resource_mismatch")
 		return
 	case !verifyPKCES256(verifier, row.CodeChallenge):
 		refuse("pkce_mismatch")

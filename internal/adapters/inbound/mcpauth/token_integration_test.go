@@ -115,8 +115,9 @@ func TestToken_CodeForOtherClientIsInvalidGrant(t *testing.T) {
 	}
 }
 
-// TestToken_BindingMismatchesAreRefused: redirect_uri and resource must
-// match what the code was issued for.
+// TestToken_BindingMismatchesAreRefused: redirect_uri must match what the
+// code was issued for (the resource binding is
+// TestToken_ResourceMismatchIsInvalidTarget's).
 func TestToken_BindingMismatchesAreRefused(t *testing.T) {
 	r := newASRig(t)
 	_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
@@ -134,18 +135,46 @@ func TestToken_BindingMismatchesAreRefused(t *testing.T) {
 	if rec := r.exchange(form, nil); rec.Code != http.StatusOK {
 		t.Errorf("redirect_uri omitted: status %d body %s, want 200 (optional; the stored one binds)", rec.Code, rec.Body.String())
 	}
+}
+
+// TestToken_ResourceMismatchIsInvalidTarget pins the token endpoint's
+// resource binding to RFC 8707 section 2 (technical plan §43.14): a
+// missing or foreign resource is invalid_target, decided from the request
+// before the code is looked up, so the code is NOT spent -- the same code
+// with this deployment's resource still exchanges. A code whose STORED
+// resource is not this deployment's (PublicBaseURL changed between
+// authorization and exchange) is invalid_target too, and, having reached
+// the code, spends it.
+func TestToken_ResourceMismatchIsInvalidTarget(t *testing.T) {
+	r := newASRig(t)
+	_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
 
 	for _, bad := range []string{"", "http://other.test/mcp"} {
-		code, verifier = r.approvedCode(t, cookie)
-		form = r.exchangeForm(code, verifier)
+		code, verifier := r.approvedCode(t, cookie)
+		form := r.exchangeForm(code, verifier)
 		if bad == "" {
 			form.Del("resource")
 		} else {
 			form.Set("resource", bad)
 		}
 		if rec := r.exchange(form, nil); rec.Code != http.StatusBadRequest || decodeToken(t, rec).Error != "invalid_target" {
-			t.Errorf("resource %q: status %d body %s, want invalid_target", bad, rec.Code, rec.Body.String())
+			t.Fatalf("resource %q: status %d body %s, want invalid_target", bad, rec.Code, rec.Body.String())
 		}
+		if rec := r.exchange(r.exchangeForm(code, verifier), nil); rec.Code != http.StatusOK {
+			t.Fatalf("the same code with the right resource after resource %q was refused: status %d body %s, want 200 (the refusal must not spend the code)", bad, rec.Code, rec.Body.String())
+		}
+	}
+
+	code, verifier := r.approvedCode(t, cookie)
+	if _, err := r.pool.Exec(context.Background(), `UPDATE mcp_oauth_authorization_codes SET resource = 'http://other.test/mcp' WHERE code_hash = $1`, platform.HashToken(code)); err != nil {
+		t.Fatal(err)
+	}
+	if rec := r.exchange(r.exchangeForm(code, verifier), nil); rec.Code != http.StatusBadRequest || decodeToken(t, rec).Error != "invalid_target" {
+		t.Fatalf("code stored for another resource: status %d body %s, want invalid_target", rec.Code, rec.Body.String())
+	}
+	var spent bool
+	if err := r.pool.QueryRow(context.Background(), `SELECT consumed_at IS NOT NULL FROM mcp_oauth_authorization_codes WHERE code_hash = $1`, platform.HashToken(code)).Scan(&spent); err != nil || !spent {
+		t.Fatalf("code stored for another resource: spent = %v (err %v), want spent", spent, err)
 	}
 }
 
