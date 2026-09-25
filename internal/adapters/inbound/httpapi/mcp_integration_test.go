@@ -7,15 +7,23 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
+	"github.com/narvidev/narvi/internal/adapters/inbound/auth"
+	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
+	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -200,93 +208,237 @@ func TestClient_DeleteCascadesGrants(t *testing.T) {
 	}
 }
 
-// TestClient_DeleteAuditsGrantAddedByConcurrentConsent: a consent that
-// has added a grant under a client, and not yet committed, when an admin
-// deletes that client must not end up with its grant cascaded away
-// unaudited (technical plan §43.15: one mcp_authorization.revoked per
-// authorization the deletion took with it). The consent's uncommitted
-// insert holds the client row's FOR KEY SHARE lock; the deletion waits on
-// it, and must list the grants only after it -- so both grants, the one
-// that existed and the one the consent added, are audited and counted.
-func TestClient_DeleteAuditsGrantAddedByConcurrentConsent(t *testing.T) {
-	ctx := context.Background()
-	r := newTestRig(t)
-	_, admin := createUserWithRole(ctx, t, r, sqlcgen.UserRoleAdmin)
-	existing, _ := createUserWithRole(ctx, t, r, sqlcgen.UserRoleMember)
-	consenting, _ := createUserWithRole(ctx, t, r, sqlcgen.UserRoleMember)
-	client := createMCPClientViaAPI(t, r, admin, `{"clientName":"Contended","redirectUris":["http://127.0.0.1/cb"]}`)
-	existingGrant, _ := grantWithToken(ctx, t, r, existing.ID, mustUUID(t, client.Id))
+// lockWaitObservationTimeout bounds how long a test waits to SEE a backend
+// queued on a lock. It is a failure deadline, not a pacing delay: the poll
+// returns on the first observation, normally within a few round trips.
+const lockWaitObservationTimeout = 10 * time.Second
 
-	// The consent decision's own write, left open: the grant insert's
-	// foreign-key check holds FOR KEY SHARE on the client row.
-	consent, err := r.pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
+// pauseBeforeQuery is a pgx.QueryTracer that stops the first query whose
+// SQL contains marker, before it is sent, until resume is closed -- after
+// reporting on paused the backend pid it is about to run on. It lets a
+// test hold a real handler at an exact point of its transaction.
+type pauseBeforeQuery struct {
+	marker string
+	paused chan uint32
+	resume chan struct{}
+	once   sync.Once
+}
+
+func newPauseBeforeQuery(marker string) *pauseBeforeQuery {
+	return &pauseBeforeQuery{marker: marker, paused: make(chan uint32, 1), resume: make(chan struct{})}
+}
+
+func (p *pauseBeforeQuery) TraceQueryStart(ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if strings.Contains(data.SQL, p.marker) {
+		p.once.Do(func() {
+			p.paused <- conn.PgConn().PID()
+			<-p.resume
+		})
 	}
-	defer func() { _ = consent.Rollback(ctx) }()
-	added, err := r.mcpGrants.WithTx(consent).UpsertGrant(ctx, sqlcgen.UpsertMCPOAuthGrantParams{
-		UserID: consenting.ID, ClientID: mustUUID(t, client.Id), Scopes: []string{"mcp:read"}, Resource: "http://localhost:8080/mcp",
-		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
-	})
-	if err != nil {
-		t.Fatalf("consent's grant: %v", err)
-	}
+	return ctx
+}
 
-	var eg errgroup.Group
-	var status int
-	eg.Go(func() error {
-		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, r.server.URL+"/api/mcp-clients/"+client.Id, nil)
-		if err != nil {
-			return err
-		}
-		req.AddCookie(&http.Cookie{Name: platform.AuthSessionCookieName, Value: admin})
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return err
-		}
-		status = resp.StatusCode
-		return resp.Body.Close()
-	})
+func (p *pauseBeforeQuery) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
-	// Wait until the deletion is blocked behind the consent's lock.
-	deadline := time.Now().Add(15 * time.Second)
+// waitUntilBlockedBy returns the pid of a backend of this database queued
+// behind blocker -- polling back to back, never sleeping -- or 0 if done
+// closes first (whatever should have queued finished without waiting).
+func waitUntilBlockedBy(ctx context.Context, t *testing.T, pool *pgxpool.Pool, blocker int32, done <-chan struct{}) int32 {
+	t.Helper()
+	waitCtx, cancel := context.WithTimeout(ctx, lockWaitObservationTimeout)
+	defer cancel()
 	for {
-		var waiting int
-		if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&waiting); err != nil {
-			t.Fatal(err)
+		select {
+		case <-done:
+			return 0
+		default:
 		}
-		if waiting > 0 {
-			break
+		var waiters []int32
+		if err := pool.QueryRow(waitCtx, `SELECT coalesce(array_agg(pid), '{}') FROM pg_stat_activity WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid))`, blocker).Scan(&waiters); err != nil {
+			t.Fatalf("poll for a backend queued behind pid %d: %v", blocker, err)
 		}
-		if time.Now().After(deadline) {
-			_ = consent.Rollback(ctx)
-			_ = eg.Wait()
-			t.Fatalf("the deletion never waited on the consent's lock")
+		if len(waiters) > 0 {
+			return waiters[0]
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
-	if err := consent.Commit(ctx); err != nil {
-		t.Fatalf("commit consent: %v", err)
-	}
-	if err := eg.Wait(); err != nil {
-		t.Fatalf("DELETE: %v", err)
-	}
-	if status != http.StatusNoContent {
-		t.Fatalf("DELETE: status %d, want 204", status)
-	}
+}
 
-	for name, id := range map[string]pgtype.UUID{"existing": existingGrant, "added by the concurrent consent": added.ID} {
-		if _, err := r.mcpGrants.GetGrant(ctx, id); !errors.Is(err, pgx.ErrNoRows) {
-			t.Errorf("%s grant after the deletion: err = %v, want deleted", name, err)
-		}
-		rows := mcpAuditRows(ctx, t, r, "mcp_authorization", id.String())
-		if len(rows) != 1 || rows[0].action != "mcp_authorization.revoked" || rows[0].detail["reason"] != "client_deleted" {
-			t.Errorf("%s grant audit rows = %+v, want one revocation with reason client_deleted", name, rows)
-		}
-	}
-	clientRows := mcpAuditRows(ctx, t, r, "mcp_client", client.Id)
-	if last := clientRows[len(clientRows)-1]; last.action != "mcp_client.deleted" || last.detail["revoked_authorizations"] != float64(2) {
-		t.Fatalf("client audit rows = %+v, want a final mcp_client.deleted counting 2 revocations", clientRows)
+// TestClient_DeleteAuditsGrantAddedByConcurrentConsent: a consent adding a
+// grant under a client while an admin deletes that client must never end
+// with its grant cascaded away unaudited (technical plan §43.15/§43.18:
+// one mcp_authorization.revoked per authorization the deletion took with
+// it). The deletion locks the client FOR UPDATE before listing the grants
+// it audits and holds that lock until it commits, so:
+//
+//   - a consent whose grant insert is already in flight (holding the
+//     client FOR KEY SHARE through its foreign-key check) is waited out,
+//     and its grant is listed, audited and counted;
+//   - a consent whose grant insert starts AFTER the deletion took its lock
+//     waits for the deletion to commit and then fails its foreign key --
+//     which only a lock held for the deletion's whole transaction, not
+//     one released at the end of its own statement, guarantees.
+//
+// The deletion runs the real handler on a pool of its own, whose tracer
+// holds it right after the lock, just before it lists the grants.
+func TestClient_DeleteAuditsGrantAddedByConcurrentConsent(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// consentFirst: the consent's grant insert is in flight before the
+		// deletion locks the client; otherwise it starts once the deletion
+		// holds the lock.
+		consentFirst bool
+	}{
+		{"ConsentInsertInFlightBeforeTheLock", true},
+		{"ConsentInsertStartsAfterTheLock", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			r := newTestRig(t)
+			_, admin := createUserWithRole(ctx, t, r, sqlcgen.UserRoleAdmin)
+			existing, _ := createUserWithRole(ctx, t, r, sqlcgen.UserRoleMember)
+			consenting, _ := createUserWithRole(ctx, t, r, sqlcgen.UserRoleMember)
+			client := createMCPClientViaAPI(t, r, admin, `{"clientName":"Contended","redirectUris":["http://127.0.0.1/cb"]}`)
+			clientID := mustUUID(t, client.Id)
+			existingGrant, _ := grantWithToken(ctx, t, r, existing.ID, clientID)
+
+			pause := newPauseBeforeQuery("-- name: ListMCPOAuthGrantsForClient ")
+			_, connStr := httpapi.IntegrationTestPoolAndConnStr(t)
+			cfg, err := pgxpool.ParseConfig(connStr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.ConnConfig.Tracer = pause
+			traced, err := pgxpool.NewWithConfig(ctx, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(traced.Close)
+			router := chi.NewRouter()
+			router.Route("/api/mcp-clients", func(rt chi.Router) {
+				rt.Use(auth.Middleware(r.userSessions, r.users))
+				rt.Delete("/{clientID}", httpapi.DeleteMCPClient(traced, narvipg.NewMCPOAuthClientStore(traced), narvipg.NewMCPOAuthGrantStore(traced), narvipg.NewAuditLogStore(traced)))
+			})
+
+			// The consent decision's own grant write, in a transaction the
+			// test commits or rolls back.
+			consent, err := r.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var consentPID int32
+			if err := consent.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&consentPID); err != nil {
+				t.Fatal(err)
+			}
+			addGrant := func() (sqlcgen.McpOauthGrant, error) {
+				return r.mcpGrants.WithTx(consent).UpsertGrant(ctx, sqlcgen.UpsertMCPOAuthGrantParams{
+					UserID: consenting.ID, ClientID: clientID, Scopes: []string{"mcp:read"}, Resource: "http://localhost:8080/mcp",
+					ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
+				})
+			}
+
+			var eg errgroup.Group
+			resume := sync.OnceFunc(func() { close(pause.resume) })
+			defer func() {
+				resume()
+				_ = consent.Rollback(ctx)
+				_ = eg.Wait()
+			}()
+			var status int
+			deleteDone := make(chan struct{})
+			startDelete := func() {
+				eg.Go(func() error {
+					defer close(deleteDone)
+					req := httptest.NewRequest(http.MethodDelete, "/api/mcp-clients/"+client.Id, nil)
+					req.AddCookie(&http.Cookie{Name: platform.AuthSessionCookieName, Value: admin})
+					rec := httptest.NewRecorder()
+					router.ServeHTTP(rec, req)
+					status = rec.Code
+					return nil
+				})
+			}
+			// heldAfterLock returns once the deletion holds the client and
+			// is stopped before its grant list.
+			heldAfterLock := func() int32 {
+				select {
+				case pid := <-pause.paused:
+					return int32(pid)
+				case <-deleteDone:
+					t.Fatalf("the deletion finished without reaching its grant list (status %d)", status)
+					return 0
+				}
+			}
+
+			var added sqlcgen.McpOauthGrant
+			var addErr error
+			if tc.consentFirst {
+				if added, addErr = addGrant(); addErr != nil {
+					t.Fatalf("consent's grant: %v", addErr)
+				}
+				startDelete()
+				if waitUntilBlockedBy(ctx, t, r.pool, consentPID, deleteDone) == 0 {
+					t.Fatalf("the deletion never waited on the consent's lock")
+				}
+				if err := consent.Commit(ctx); err != nil {
+					t.Fatalf("commit consent: %v", err)
+				}
+				heldAfterLock()
+				resume()
+			} else {
+				startDelete()
+				deletionPID := heldAfterLock()
+				addDone := make(chan struct{})
+				eg.Go(func() error {
+					defer close(addDone)
+					added, addErr = addGrant()
+					return nil
+				})
+				if waiter := waitUntilBlockedBy(ctx, t, r.pool, deletionPID, addDone); waiter != consentPID {
+					t.Errorf("the consent's grant insert, started after the deletion locked the client, did not wait for the deletion's transaction (queued: pid %d, want %d): the lock does not last until the deletion commits", waiter, consentPID)
+				}
+				resume()
+				<-addDone
+				var pgErr *pgconn.PgError
+				if !errors.As(addErr, &pgErr) || pgErr.Code != "23503" || pgErr.ConstraintName != "mcp_oauth_grants_client_id_fkey" {
+					t.Errorf("consent's grant insert after the lock: err = %v, want the client foreign-key violation (23503) once the deletion committed", addErr)
+				}
+				if addErr == nil {
+					// The insert went through: commit it as a real consent
+					// would, once the deletion has listed its grants and is
+					// queued behind this consent at its DELETE -- the
+					// cascade then takes a grant the list never saw.
+					waitUntilBlockedBy(ctx, t, r.pool, consentPID, deleteDone)
+					if err := consent.Commit(ctx); err != nil {
+						t.Fatalf("commit consent: %v", err)
+					}
+				} else {
+					_ = consent.Rollback(ctx)
+				}
+			}
+			if err := eg.Wait(); err != nil {
+				t.Fatal(err)
+			}
+			if status != http.StatusNoContent {
+				t.Fatalf("DELETE: status %d, want 204", status)
+			}
+
+			committed := map[string]pgtype.UUID{"existing": existingGrant}
+			if addErr == nil {
+				committed["added by the concurrent consent"] = added.ID
+			}
+			for name, id := range committed {
+				if _, err := r.mcpGrants.GetGrant(ctx, id); !errors.Is(err, pgx.ErrNoRows) {
+					t.Errorf("%s grant after the deletion: err = %v, want deleted", name, err)
+				}
+				rows := mcpAuditRows(ctx, t, r, "mcp_authorization", id.String())
+				if len(rows) != 1 || rows[0].action != "mcp_authorization.revoked" || rows[0].detail["reason"] != "client_deleted" {
+					t.Errorf("%s grant audit rows = %+v, want one revocation with reason client_deleted", name, rows)
+				}
+			}
+			clientRows := mcpAuditRows(ctx, t, r, "mcp_client", client.Id)
+			if last := clientRows[len(clientRows)-1]; last.action != "mcp_client.deleted" || last.detail["revoked_authorizations"] != float64(len(committed)) {
+				t.Errorf("client audit rows = %+v, want a final mcp_client.deleted counting %d revocations", clientRows, len(committed))
+			}
+		})
 	}
 }
 
