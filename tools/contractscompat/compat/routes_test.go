@@ -3,6 +3,8 @@ package compat
 import (
 	"strings"
 	"testing"
+	"unicode"
+	"unicode/utf8"
 )
 
 // routesGoldenFixture is a slice of the real controlplane/testdata/
@@ -223,6 +225,26 @@ func TestRoutesGoldenGradedAsAWhole(t *testing.T) {
 			want:     []wantFinding{{"fc-routes-line", SeverityFailClosed}},
 			breaking: true,
 		},
+		{
+			// The review repro: with \S as the path class this passed with
+			// exit 0 as a MINOR "route added: GET /health\u00a0".
+			name: "whitespace-only variant of an existing route (trailing no-break space) fails closed, not graded as an added route",
+			base: fixture, head: replaceLine(t, fixture, "GET /health", "GET /health\nGET /health\u00a0\n"),
+			headVersion: "1.1.0", headChangelog: changelogWith("1.1.0", RoutesSurface),
+			want:     []wantFinding{{"fc-routes-line", SeverityFailClosed}},
+			wantMsg:  []string{`head routes.golden line 4 is not a "METHOD /path" route line: "GET /health\u00a0"`},
+			absent:   []string{"40", "41"},
+			breaking: true,
+		},
+		{
+			name: "route replaced by a vertical-tab variant fails closed, not graded as a removal plus an addition",
+			base: fixture, head: replaceLine(t, fixture, "GET /health", "GET /health\v\n"),
+			headVersion: "2.0.0", headChangelog: changelogWith("2.0.0", RoutesSurface),
+			want:     []wantFinding{{"fc-routes-line", SeverityFailClosed}},
+			wantMsg:  []string{`head routes.golden line 3 is not a "METHOD /path" route line: "GET /health\v"`},
+			absent:   []string{"40", "41"},
+			breaking: true,
+		},
 	}
 
 	for _, tc := range cases {
@@ -291,5 +313,71 @@ func TestParseRoutesAcceptsTheGeneratedShape(t *testing.T) {
 				t.Fatalf("want %d routes, got %d (%v)", tc.wantCount, len(routes), routes)
 			}
 		})
+	}
+}
+
+// TestParseRoutesRefusesOffGrammarLines pins COMPATIBILITY.md's "Routes"
+// grammar line by line: exactly an upper-case method ([A-Z]+), one ASCII
+// space, and a path starting with "/" with no whitespace of any kind and
+// no control character in it. Every shape below is one a looser grammar
+// would read as a route -- a whitespace-only variant of a real route
+// included -- and each must be refused as fc-routes-line at exactly the
+// line(s) named, never skipped and never graded.
+func TestParseRoutesRefusesOffGrammarLines(t *testing.T) {
+	cases := []struct {
+		name string
+		data string
+		want []string // Pointers of the refused lines, in order
+	}{
+		// Whitespace RE2's \S admits, and control characters, in the path.
+		{"trailing vertical tab", "GET /health\v\n", []string{"head line 1"}},
+		{"trailing no-break space U+00A0", "GET /health\u00a0\n", []string{"head line 1"}},
+		{"line separator U+2028 inside the path", "GET /he\u2028alth\n", []string{"head line 1"}},
+		{"paragraph separator U+2029", "GET /health\u2029\n", []string{"head line 1"}},
+		{"ideographic space U+3000", "GET /health\u3000\n", []string{"head line 1"}},
+		{"next line U+0085", "GET /health\u0085\n", []string{"head line 1"}},
+		{"trailing tab", "GET /health\t\n", []string{"head line 1"}},
+		{"trailing form feed", "GET /health\f\n", []string{"head line 1"}},
+		{"NUL inside the path", "GET /he\x00alth\n", []string{"head line 1"}},
+		{"escape inside the path", "GET /\x1b[0m\n", []string{"head line 1"}},
+		{"trailing DEL", "GET /health\x7f\n", []string{"head line 1"}},
+		{"C1 control U+009B", "GET /health\u009b\n", []string{"head line 1"}},
+		{"bad line after a good one is refused at its own line", "GET /a\nGET /health\u00a0\n", []string{"head line 2"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, bad := parseRoutes("head", []byte(tc.data))
+			var got []string
+			for _, f := range bad {
+				if f.RuleID != "fc-routes-line" || f.Severity != SeverityFailClosed || f.Surface != RoutesSurface {
+					t.Errorf("want an fc-routes-line FAIL-CLOSED finding on %s, got %+v", RoutesSurface, f)
+				}
+				got = append(got, f.Pointer)
+			}
+			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Fatalf("refused %q, want %q; findings %+v", got, tc.want, bad)
+			}
+		})
+	}
+}
+
+// TestRouteLinePathRunes checks routeLineRE's path class against
+// COMPATIBILITY.md's wording for every Unicode code point, rather than
+// trusting the \p{Z}/\p{Cc} argument on routeLineRE: a rune inside a path
+// is accepted exactly when it is neither whitespace of any kind
+// (unicode.IsSpace) nor a control character (unicode.IsControl).
+func TestRouteLinePathRunes(t *testing.T) {
+	mismatches := 0
+	for r := rune(0); r <= unicode.MaxRune; r++ {
+		if !utf8.ValidRune(r) {
+			continue // a surrogate half: no UTF-8 encoding, cannot occur in a line
+		}
+		want := !unicode.IsSpace(r) && !unicode.IsControl(r)
+		if got := routeLineRE.MatchString("GET /a" + string(r) + "b"); got != want {
+			t.Errorf("U+%04X inside a path: accepted = %v, want %v (IsSpace %v, IsControl %v)", r, got, want, unicode.IsSpace(r), unicode.IsControl(r))
+			if mismatches++; mismatches >= 20 {
+				t.Fatal("too many mismatches, stopping")
+			}
+		}
 	}
 }

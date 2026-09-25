@@ -299,10 +299,13 @@ not ("What is covered" above says why):
   addressing for a breaking change is still an open decision ("Who this
   governs"). Removing or changing a route needs an owner decision, and a
   checker change, first.
-- Every line must be exactly `METHOD /path`: an upper-case method, one
-  space, and a path starting with `/` with no whitespace in it. A line
-  that is not — a blank line, a trailing field, a CRLF ending, a
-  lower-case method — or that repeats another line, on either side of
+- Every line must be exactly `METHOD /path`: an upper-case method
+  (`A`–`Z` only), one ASCII space, and a path starting with `/` with no
+  whitespace of any kind in it — no tab, vertical tab, no-break space,
+  line separator or other Unicode space — and no control character. A
+  line that is not — a blank line, a trailing field, a CRLF ending, a
+  lower-case method, a copy of another line with a no-break space or
+  vertical tab added — or that repeats another line, on either side of
   the diff, is FAIL-CLOSED (`fc-routes-line`), naming the side and the
   line number, and no route diff is reported for that run. The file is
   the control-plane binary's own `routes` output, so the fix is to

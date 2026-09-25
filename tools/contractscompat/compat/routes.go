@@ -14,10 +14,21 @@ import (
 const RoutesSurface = "controlplane/testdata/routes.golden"
 
 // routeLineRE is routes.golden's entire line grammar: an upper-case HTTP
-// method, exactly one space, and a path that starts with "/" and contains
-// no whitespace -- exactly what the control-plane binary's own `routes`
-// subcommand prints, one fmt.Fprintln per route.
-var routeLineRE = regexp.MustCompile(`^[A-Z]+ /\S*$`)
+// method ([A-Z]+), exactly one ASCII space, and a path that starts with
+// "/" and contains no whitespace of any kind and no control character --
+// exactly what the control-plane binary's own `routes` subcommand prints,
+// one fmt.Fprintln per route.
+//
+// The path class is deliberately NOT \S: in RE2, \s is only
+// [\t\n\f\r ], so \S admits a vertical tab, U+0085 and every Unicode
+// space (U+00A0, U+2028, U+3000, ...), and "GET /health" followed by a
+// no-break space would read as a second, distinct route instead of being
+// refused. [^\p{Z}\p{Cc}] refuses exactly the runes unicode.IsSpace or
+// unicode.IsControl reports: \p{Z} is every Unicode space separator, and
+// the only White_Space runes outside it (\t \n \v \f \r, U+0085) are
+// themselves \p{Cc}. TestRouteLinePathRunes checks that equivalence rune
+// by rune over all of Unicode rather than trusting this paragraph.
+var routeLineRE = regexp.MustCompile(`^[A-Z]+ /[^\p{Z}\p{Cc}]*$`)
 
 // DiffRoutes implements rows 40-41 against controlplane/testdata/
 // routes.golden: one "METHOD /path" line per route. A line present in
