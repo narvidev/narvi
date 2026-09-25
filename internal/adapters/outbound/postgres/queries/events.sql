@@ -11,14 +11,72 @@
 -- upsert-on-messageId") -- a resend of an already-seen messageId hits the
 -- unique index (migrations/000019_events_message_id.up.sql) and this
 -- DO UPDATE (a deliberate, self-referential no-op: type is set back to
--- its own current value) guarantees RETURNING always yields exactly one
--- row either way, so callers never need a separate "0 rows means
--- duplicate" branch. `(xmax = 0) AS inserted` is the standard Postgres
--- idiom for "was this row just inserted by THIS statement" (xmax is 0
--- only immediately after a fresh insert, non-zero after any update) --
--- callers use it to decide whether to (re-)broadcast this event to live
--- subscribers.
-INSERT INTO events (session_id, type, message_id, payload) VALUES ($1, $2, $3, $4)
+-- its own current value) guarantees RETURNING yields exactly one row
+-- either way for an existing session, so callers never need a separate
+-- "0 rows means duplicate" branch. `(xmax = 0) AS inserted` is the
+-- standard Postgres idiom for "was this row just inserted by THIS
+-- statement" (xmax is 0 only immediately after a fresh insert, non-zero
+-- after any update) -- callers use it to decide whether to (re-)broadcast
+-- this event to live subscribers.
+--
+-- # Why the session row is locked before the id is drawn
+--
+-- Every `id > cursor` reader of this table -- ListEventsForSession's own
+-- REST/fetch_history pagination, the web client's backfill (web/src/ws/
+-- sessionStream.ts, highestId()), MaxEventIDForSession's high-water
+-- mark -- relies on one guarantee: within one session, ids are allocated
+-- in commit order. events.id is a single global sequence, and nextval
+-- runs when the row is formed, not when it commits, so that guarantee
+-- only holds if every insert for a session is serialized on something
+-- per-session BEFORE nextval runs.
+--
+-- The session actor already serializes its own writes on the session row
+-- (GetSessionActorEpochForUpdate, FOR UPDATE, the first statement of
+-- every transact). Writers outside the actor -- httpapi's upload confirm,
+-- uploadsweep, ShadowSCMWriteStore.AppendSuppressionEvent -- did not: a
+-- plain INSERT reaches the session row only through the foreign-key
+-- check, which runs at the end of the statement, after nextval. Such a
+-- writer drew id N, then blocked on the actor's lock; the actor's next
+-- event drew N+1 and committed first; a reader between the two commits
+-- saw N+1, moved its cursor past N, and never saw N.
+--
+-- session_row takes that per-session lock inside this statement, so it
+-- covers every caller -- in a transaction or autocommit, present or
+-- future -- without any of them having to remember to. In the plan the
+-- CTE is a LockRows node under the CTE Scan whose output projection is
+-- where nextval('events_id_seq') is evaluated, so the id is drawn only
+-- once the lock is granted. MATERIALIZED states that ordering rather
+-- than enabling it: Postgres 17 plans the NOT MATERIALIZED form
+-- identically.
+--
+-- FOR NO KEY UPDATE is the weakest mode that conflicts both with itself
+-- (two outside writers serialize) and with the actor's FOR UPDATE, while
+-- not conflicting with FOR KEY SHARE, so it never blocks the foreign-key
+-- checks of inserts into other tables that reference sessions. FOR KEY
+-- SHARE or FOR SHARE here would still wait behind the actor, but would
+-- let two outside writers interleave exactly as before. Inside the
+-- actor's own transaction it waits for nothing: that transaction already
+-- holds FOR UPDATE. The lock is held until the inserting transaction
+-- ends, which is exactly the window in which a later id must not become
+-- visible first.
+--
+-- A nonexistent session yields no session_row, so nothing is inserted and
+-- RETURNING yields no row: the caller gets pgx.ErrNoRows (previously the
+-- foreign-key violation, SQLSTATE 23503). Every caller treats either as a
+-- failure; none inspects the error code.
+--
+-- Two sqlc-driven details: the CTE qualifies sessions.id because sqlc
+-- resolves it with the INSERT's target table in scope (a bare `id` is
+-- reported ambiguous), and the select list inserts sqlc.arg(session_id)
+-- rather than session_row.id -- the same value, gated by FROM
+-- session_row either way -- so sqlc numbers session_id $1 and
+-- CreateEventParams keeps its field order.
+WITH session_row AS MATERIALIZED (
+    SELECT sessions.id FROM sessions WHERE sessions.id = sqlc.arg(session_id) FOR NO KEY UPDATE
+)
+INSERT INTO events (session_id, type, message_id, payload)
+SELECT sqlc.arg(session_id), sqlc.arg(type)::text, sqlc.arg(message_id)::text, sqlc.arg(payload)::jsonb
+FROM session_row
 ON CONFLICT (session_id, message_id) DO UPDATE SET type = events.type
 RETURNING *, (xmax = 0) AS inserted;
 
@@ -163,6 +221,15 @@ ORDER BY id ASC;
 -- events yet yields a real watermark rather than NULL -- 0 is below every
 -- BIGSERIAL id (which starts at 1), so a turn dispatched before any event
 -- exists correctly admits every event that follows it.
+--
+-- A high-water mark is only sound because, within one session, ids are
+-- allocated in commit order: every insert takes the session row lock
+-- before drawing its id and holds it until its transaction ends
+-- (CreateEvent above). So every event of this session that this read
+-- cannot see yet -- in flight or still to come -- gets an id above every
+-- id it can see, and `id > watermark` misses none of them. The id is
+-- drawn at insert, not at commit; it is the per-session lock, not the
+-- sequence, that makes id order commit order.
 SELECT COALESCE(MAX(id), 0)::bigint AS max_event_id FROM events WHERE session_id = $1;
 
 -- name: GetBootP95InWindow :one

@@ -39,6 +39,15 @@ func (s *EventStore) WithTx(tx pgx.Tx) *EventStore {
 // -- CreateEventRow.Inserted reports whether this call actually inserted a
 // fresh row (true) or found an already-persisted one from an earlier call
 // with the same messageId (false, a genuine resend/dedupe, §6.1).
+//
+// It takes arg.SessionID's session row lock (FOR NO KEY UPDATE) before
+// drawing the event id, and the caller's transaction holds it until it
+// ends: that is what keeps a session's ids in commit order for every
+// `id > cursor` reader -- see CreateEvent's doc comment in
+// queries/events.sql. Keep a transaction that calls this short, and do
+// not wait inside it on anything that itself appends to the same session
+// from another connection. A session that does not exist returns
+// pgx.ErrNoRows.
 func (s *EventStore) Create(ctx context.Context, arg sqlcgen.CreateEventParams) (sqlcgen.CreateEventRow, error) {
 	return s.q.CreateEvent(ctx, arg)
 }
