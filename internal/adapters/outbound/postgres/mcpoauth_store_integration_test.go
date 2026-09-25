@@ -1,0 +1,369 @@
+//go:build integration
+
+package postgres_test
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/errgroup"
+
+	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+)
+
+// mcpOAuthFixture seeds one user and one pre-registered client -- the
+// minimum every MCP authorization-server store test starts from.
+type mcpOAuthFixture struct {
+	pool    *pgxpool.Pool
+	users   *narvipg.UserStore
+	clients *narvipg.MCPOAuthClientStore
+	grants  *narvipg.MCPOAuthGrantStore
+	user    sqlcgen.User
+	client  sqlcgen.McpOauthClient
+}
+
+func newMCPOAuthFixture(ctx context.Context, t *testing.T) mcpOAuthFixture {
+	t.Helper()
+	pool := newTestPool(t)
+	f := mcpOAuthFixture{
+		pool:    pool,
+		users:   narvipg.NewUserStore(pool),
+		clients: narvipg.NewMCPOAuthClientStore(pool),
+		grants:  narvipg.NewMCPOAuthGrantStore(pool),
+	}
+	var err error
+	f.user, err = f.users.Create(ctx, sqlcgen.CreateUserParams{
+		PrimaryEmail: "mcp-oauth-store@example.com",
+		DisplayName:  "MCP OAuth Store",
+		Role:         sqlcgen.UserRoleMember,
+	})
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	f.client, err = f.clients.Create(ctx, sqlcgen.CreateMCPOAuthClientParams{
+		ClientID:     "narvi_mcp_c_store_test",
+		Kind:         sqlcgen.McpOauthClientKindPreregistered,
+		ClientName:   "Store Test Client",
+		RedirectUris: []string{"http://127.0.0.1/callback"},
+		CreatedBy:    f.user.ID,
+	})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	return f
+}
+
+func mcpTS(t time.Time) pgtype.Timestamptz { return pgtype.Timestamptz{Time: t, Valid: true} }
+
+// createGrantWithToken inserts a grant plus one access token under it,
+// returning both.
+func (f mcpOAuthFixture) createGrantWithToken(ctx context.Context, t *testing.T, scopes []string, tokenHash string, grantExpires, tokenExpires time.Time) (sqlcgen.McpOauthGrant, sqlcgen.McpOauthAccessToken) {
+	t.Helper()
+	g, err := f.grants.CreateGrant(ctx, sqlcgen.CreateMCPOAuthGrantParams{
+		UserID:    f.user.ID,
+		ClientID:  f.client.ID,
+		Scopes:    scopes,
+		Resource:  "http://127.0.0.1:9/mcp",
+		ExpiresAt: mcpTS(grantExpires),
+	})
+	if err != nil {
+		t.Fatalf("create grant: %v", err)
+	}
+	tok, err := f.grants.CreateAccessToken(ctx, sqlcgen.CreateMCPOAuthAccessTokenParams{
+		GrantID:   g.ID,
+		TokenHash: tokenHash,
+		ExpiresAt: mcpTS(tokenExpires),
+	})
+	if err != nil {
+		t.Fatalf("create access token: %v", err)
+	}
+	return g, tok
+}
+
+// TestMCPOAuthGrantStore_EmptyScopesStoredAsEmptyArray pins nonNilScopes:
+// a scope-less grant (technical plan §43.17) is a first-class outcome, so
+// a nil scope slice must land as '{}' -- never a NOT NULL violation, never
+// read back as nil-vs-empty ambiguity the bearer check would have to guess
+// about.
+func TestMCPOAuthGrantStore_EmptyScopesStoredAsEmptyArray(t *testing.T) {
+	ctx := context.Background()
+	f := newMCPOAuthFixture(ctx, t)
+
+	g, _ := f.createGrantWithToken(ctx, t, nil, "hash-empty-scopes", time.Now().Add(time.Hour), time.Now().Add(time.Hour))
+	if g.Scopes == nil || len(g.Scopes) != 0 {
+		t.Fatalf("grant scopes = %#v, want a non-nil empty slice", g.Scopes)
+	}
+	p, err := f.grants.LookupAccessToken(ctx, "hash-empty-scopes")
+	if err != nil {
+		t.Fatalf("LookupAccessToken: %v", err)
+	}
+	if len(p.GrantScopes) != 0 {
+		t.Fatalf("principal scopes = %#v, want empty", p.GrantScopes)
+	}
+
+	req, err := f.grants.CreateAuthorizationRequest(ctx, sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
+		ClientID:            f.client.ID,
+		RedirectUri:         "http://127.0.0.1/callback",
+		Scopes:              nil,
+		CodeChallenge:       "challenge",
+		CodeChallengeMethod: "S256",
+		Resource:            "http://127.0.0.1:9/mcp",
+		ExpiresAt:           mcpTS(time.Now().Add(time.Minute)),
+	})
+	if err != nil {
+		t.Fatalf("CreateAuthorizationRequest with nil scopes: %v", err)
+	}
+	if req.Scopes == nil || len(req.Scopes) != 0 {
+		t.Fatalf("request scopes = %#v, want a non-nil empty slice", req.Scopes)
+	}
+}
+
+// TestMCPOAuthGrantStore_AuthorizationRequestBindAndConsume proves the
+// consent page's two atomic steps: the first render binds the request to
+// its user and every other user is refused afterwards; the decision
+// consumes it exactly once, only for the bound user, only after a nonce
+// was minted, and only before expiry.
+func TestMCPOAuthGrantStore_AuthorizationRequestBindAndConsume(t *testing.T) {
+	ctx := context.Background()
+	f := newMCPOAuthFixture(ctx, t)
+	other, err := f.users.Create(ctx, sqlcgen.CreateUserParams{PrimaryEmail: "other@example.com", DisplayName: "Other", Role: sqlcgen.UserRoleMember})
+	if err != nil {
+		t.Fatalf("create other user: %v", err)
+	}
+
+	newReq := func(expires time.Time) sqlcgen.McpOauthAuthorizationRequest {
+		t.Helper()
+		r, err := f.grants.CreateAuthorizationRequest(ctx, sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
+			ClientID:            f.client.ID,
+			RedirectUri:         "http://127.0.0.1/callback",
+			Scopes:              []string{"mcp:read"},
+			CodeChallenge:       "challenge",
+			CodeChallengeMethod: "S256",
+			Resource:            "http://127.0.0.1:9/mcp",
+			ExpiresAt:           mcpTS(expires),
+		})
+		if err != nil {
+			t.Fatalf("CreateAuthorizationRequest: %v", err)
+		}
+		return r
+	}
+
+	req := newReq(time.Now().Add(time.Minute))
+
+	// A request nobody has rendered yet cannot be consumed: no nonce exists.
+	if _, err := f.grants.ConsumeAuthorizationRequest(ctx, req.ID, f.user.ID); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("consume before any render: err = %v, want pgx.ErrNoRows", err)
+	}
+
+	bound, err := f.grants.BindAuthorizationRequest(ctx, req.ID, f.user.ID, "nonce-hash-1")
+	if err != nil {
+		t.Fatalf("first bind: %v", err)
+	}
+	if bound.UserID != f.user.ID || bound.CsrfNonceHash == nil || *bound.CsrfNonceHash != "nonce-hash-1" {
+		t.Fatalf("bound request = %+v, want user %v and nonce hash nonce-hash-1", bound, f.user.ID)
+	}
+	if _, err := f.grants.BindAuthorizationRequest(ctx, req.ID, other.ID, "nonce-hash-other"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("bind by another user: err = %v, want pgx.ErrNoRows", err)
+	}
+	rebound, err := f.grants.BindAuthorizationRequest(ctx, req.ID, f.user.ID, "nonce-hash-2")
+	if err != nil || rebound.CsrfNonceHash == nil || *rebound.CsrfNonceHash != "nonce-hash-2" {
+		t.Fatalf("re-render by the bound user: row = %+v, err = %v, want nonce rotated to nonce-hash-2", rebound, err)
+	}
+
+	if _, err := f.grants.ConsumeAuthorizationRequest(ctx, req.ID, other.ID); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("consume by another user: err = %v, want pgx.ErrNoRows", err)
+	}
+	if _, err := f.grants.ConsumeAuthorizationRequest(ctx, req.ID, f.user.ID); err != nil {
+		t.Fatalf("first consume: %v", err)
+	}
+	if _, err := f.grants.ConsumeAuthorizationRequest(ctx, req.ID, f.user.ID); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("second consume: err = %v, want pgx.ErrNoRows", err)
+	}
+	if _, err := f.grants.BindAuthorizationRequest(ctx, req.ID, f.user.ID, "nonce-hash-3"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("bind after consume: err = %v, want pgx.ErrNoRows", err)
+	}
+
+	expired := newReq(time.Now().Add(-time.Second))
+	if _, err := f.grants.BindAuthorizationRequest(ctx, expired.ID, f.user.ID, "nonce-hash-x"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("bind an expired request: err = %v, want pgx.ErrNoRows", err)
+	}
+}
+
+// TestMCPOAuthGrantStore_AuthorizationCodeSingleUse proves a code can be
+// consumed exactly once -- also under a concurrent race -- and that a
+// consumed code stays findable by hash so a replay is recognisable.
+func TestMCPOAuthGrantStore_AuthorizationCodeSingleUse(t *testing.T) {
+	ctx := context.Background()
+	f := newMCPOAuthFixture(ctx, t)
+	g, _ := f.createGrantWithToken(ctx, t, []string{"mcp:read"}, "hash-code-test", time.Now().Add(time.Hour), time.Now().Add(time.Hour))
+
+	if _, err := f.grants.CreateAuthorizationCode(ctx, sqlcgen.CreateMCPOAuthAuthorizationCodeParams{
+		GrantID:       g.ID,
+		CodeHash:      "code-hash-1",
+		CodeChallenge: "challenge",
+		RedirectUri:   "http://127.0.0.1/callback",
+		Resource:      "http://127.0.0.1:9/mcp",
+		ExpiresAt:     mcpTS(time.Now().Add(time.Minute)),
+	}); err != nil {
+		t.Fatalf("CreateAuthorizationCode: %v", err)
+	}
+
+	const racers = 8
+	wins := make(chan struct{}, racers)
+	var eg errgroup.Group
+	for i := 0; i < racers; i++ {
+		eg.Go(func() error {
+			_, err := f.grants.ConsumeAuthorizationCode(ctx, "code-hash-1")
+			switch {
+			case err == nil:
+				wins <- struct{}{}
+				return nil
+			case errors.Is(err, pgx.ErrNoRows):
+				return nil
+			default:
+				return err
+			}
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		t.Fatalf("concurrent consume: %v", err)
+	}
+	close(wins)
+	if n := len(wins); n != 1 {
+		t.Fatalf("concurrent consumers that won = %d, want exactly 1", n)
+	}
+
+	row, err := f.grants.GetAuthorizationCodeByHash(ctx, "code-hash-1")
+	if err != nil {
+		t.Fatalf("GetAuthorizationCodeByHash after consume: %v", err)
+	}
+	if !row.ConsumedAt.Valid {
+		t.Fatalf("consumed code row has consumed_at unset")
+	}
+	if _, err := f.grants.GetAuthorizationCodeByHash(ctx, "never-issued"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("GetAuthorizationCodeByHash(never-issued): err = %v, want pgx.ErrNoRows", err)
+	}
+}
+
+// TestMCPOAuthGrantStore_LookupReadsLiveState proves LookupAccessToken is
+// a live read of every fact that can revoke a call: a disabled user, a
+// disabled client and a changed role all show on the very next lookup,
+// and deleting the grant (revocation) or the client makes the token
+// unfindable.
+func TestMCPOAuthGrantStore_LookupReadsLiveState(t *testing.T) {
+	ctx := context.Background()
+	f := newMCPOAuthFixture(ctx, t)
+	g, _ := f.createGrantWithToken(ctx, t, []string{"mcp:read"}, "hash-live", time.Now().Add(time.Hour), time.Now().Add(time.Hour))
+
+	p, err := f.grants.LookupAccessToken(ctx, "hash-live")
+	if err != nil {
+		t.Fatalf("LookupAccessToken: %v", err)
+	}
+	if p.GrantID != g.ID || p.UserID != f.user.ID || p.UserRole != "member" || p.UserEmail != f.user.PrimaryEmail ||
+		p.ClientID != f.client.ClientID || p.ClientDisabled || p.UserDisabled || p.GrantResource != "http://127.0.0.1:9/mcp" ||
+		!p.GrantLastUsedAt.IsZero() {
+		t.Fatalf("principal = %+v, want the seeded grant/user/client, nothing disabled, never used", p)
+	}
+
+	if _, err := f.pool.Exec(ctx, "UPDATE users SET role = 'viewer', disabled = true WHERE id = $1", f.user.ID); err != nil {
+		t.Fatalf("update user: %v", err)
+	}
+	if _, err := f.pool.Exec(ctx, "UPDATE mcp_oauth_clients SET disabled_at = now() WHERE id = $1", f.client.ID); err != nil {
+		t.Fatalf("disable client: %v", err)
+	}
+	p, err = f.grants.LookupAccessToken(ctx, "hash-live")
+	if err != nil {
+		t.Fatalf("LookupAccessToken after updates: %v", err)
+	}
+	if p.UserRole != "viewer" || !p.UserDisabled || !p.ClientDisabled {
+		t.Fatalf("principal after updates = %+v, want role viewer, user disabled, client disabled", p)
+	}
+
+	if err := f.grants.TouchGrantLastUsed(ctx, g.ID, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("TouchGrantLastUsed: %v", err)
+	}
+	p, err = f.grants.LookupAccessToken(ctx, "hash-live")
+	if err != nil || p.GrantLastUsedAt.IsZero() {
+		t.Fatalf("after touch: principal = %+v, err = %v, want last_used_at stamped", p, err)
+	}
+	stamped := p.GrantLastUsedAt
+	// A second touch whose stale_before predates the stamp is a no-op.
+	if err := f.grants.TouchGrantLastUsed(ctx, g.ID, stamped.Add(-time.Hour)); err != nil {
+		t.Fatalf("second TouchGrantLastUsed: %v", err)
+	}
+	p, err = f.grants.LookupAccessToken(ctx, "hash-live")
+	if err != nil || !p.GrantLastUsedAt.Equal(stamped) {
+		t.Fatalf("after coalesced touch: last_used_at = %v (err %v), want unchanged %v", p.GrantLastUsedAt, err, stamped)
+	}
+
+	n, err := f.grants.DeleteGrant(ctx, g.ID)
+	if err != nil || n != 1 {
+		t.Fatalf("DeleteGrant: n = %d, err = %v, want 1 row", n, err)
+	}
+	if _, err := f.grants.LookupAccessToken(ctx, "hash-live"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("lookup after revocation: err = %v, want pgx.ErrNoRows (the token must cascade with its grant)", err)
+	}
+}
+
+// TestMCPOAuthClientStore_DeleteCascadesGrants proves deleting a client
+// takes every grant and token issued to it with it -- the structural half
+// of "a deleted client's users lose access on their next call".
+func TestMCPOAuthClientStore_DeleteCascadesGrants(t *testing.T) {
+	ctx := context.Background()
+	f := newMCPOAuthFixture(ctx, t)
+	g, _ := f.createGrantWithToken(ctx, t, []string{"mcp:read"}, "hash-cascade", time.Now().Add(time.Hour), time.Now().Add(time.Hour))
+
+	listed, err := f.grants.ListGrantsForClient(ctx, f.client.ID)
+	if err != nil || len(listed) != 1 || listed[0].ID != g.ID || listed[0].UserID != f.user.ID {
+		t.Fatalf("ListGrantsForClient = %+v, err = %v, want the one seeded grant", listed, err)
+	}
+
+	deleted, err := f.clients.Delete(ctx, f.client.ID)
+	if err != nil || deleted.ID != f.client.ID {
+		t.Fatalf("Delete client: row = %+v, err = %v", deleted, err)
+	}
+	if _, err := f.grants.GetGrant(ctx, g.ID); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("grant after client delete: err = %v, want pgx.ErrNoRows", err)
+	}
+	if _, err := f.grants.LookupAccessToken(ctx, "hash-cascade"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("token after client delete: err = %v, want pgx.ErrNoRows", err)
+	}
+	if _, err := f.clients.Delete(ctx, f.client.ID); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("second client delete: err = %v, want pgx.ErrNoRows", err)
+	}
+}
+
+// TestMCPOAuthGrantStore_DeleteGrantForUserIsOwnOnly proves a user can
+// only revoke their own grant: another user's id is indistinguishable
+// from a missing one, and the grant survives.
+func TestMCPOAuthGrantStore_DeleteGrantForUserIsOwnOnly(t *testing.T) {
+	ctx := context.Background()
+	f := newMCPOAuthFixture(ctx, t)
+	other, err := f.users.Create(ctx, sqlcgen.CreateUserParams{PrimaryEmail: "other2@example.com", DisplayName: "Other", Role: sqlcgen.UserRoleAdmin})
+	if err != nil {
+		t.Fatalf("create other user: %v", err)
+	}
+	g, _ := f.createGrantWithToken(ctx, t, []string{"mcp:read"}, "hash-own", time.Now().Add(time.Hour), time.Now().Add(time.Hour))
+
+	if _, err := f.grants.DeleteGrantForUser(ctx, g.ID, other.ID); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("delete by another user: err = %v, want pgx.ErrNoRows", err)
+	}
+	listed, err := f.grants.ListGrantsForUser(ctx, f.user.ID)
+	if err != nil || len(listed) != 1 || listed[0].ID != g.ID || listed[0].ClientName != f.client.ClientName ||
+		listed[0].ClientPublicID != f.client.ClientID || listed[0].ClientKind != sqlcgen.McpOauthClientKindPreregistered {
+		t.Fatalf("ListGrantsForUser = %+v, err = %v, want the one grant with its client facts", listed, err)
+	}
+	if _, err := f.grants.DeleteGrantForUser(ctx, g.ID, f.user.ID); err != nil {
+		t.Fatalf("delete by owner: %v", err)
+	}
+	listed, err = f.grants.ListGrantsForUser(ctx, f.user.ID)
+	if err != nil || len(listed) != 0 {
+		t.Fatalf("ListGrantsForUser after revoke = %+v, err = %v, want none", listed, err)
+	}
+}

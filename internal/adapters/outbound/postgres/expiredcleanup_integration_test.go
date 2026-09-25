@@ -118,3 +118,120 @@ func TestRunExpiredTokenCleanup_DeletesExpiredLeavesLive(t *testing.T) {
 		t.Errorf("GetByHash(live-user-session) error = %v, want nil (cleanup must leave a non-expired row alone)", err)
 	}
 }
+
+// TestExpiredCleanup_SweepsMCPRows proves the same tick also purges the MCP
+// authorization server's expired rows (technical plan §43.16): an expired
+// authorization request, code, access token and grant are deleted, while
+// a live row of each survives untouched.
+func TestExpiredCleanup_SweepsMCPRows(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+
+	user, err := narvipg.NewUserStore(pool).Create(ctx, sqlcgen.CreateUserParams{
+		PrimaryEmail: "mcp-sweep@example.com",
+		DisplayName:  "MCP Sweep",
+		Role:         sqlcgen.UserRoleMember,
+	})
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	client, err := narvipg.NewMCPOAuthClientStore(pool).Create(ctx, sqlcgen.CreateMCPOAuthClientParams{
+		ClientID:     "narvi_mcp_c_sweep",
+		Kind:         sqlcgen.McpOauthClientKindPreregistered,
+		ClientName:   "Sweep",
+		RedirectUris: []string{"http://127.0.0.1/cb"},
+	})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	grants := narvipg.NewMCPOAuthGrantStore(pool)
+
+	past := pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true}
+	future := pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
+
+	newRequest := func(expires pgtype.Timestamptz) pgtype.UUID {
+		t.Helper()
+		r, err := grants.CreateAuthorizationRequest(ctx, sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
+			ClientID: client.ID, RedirectUri: "http://127.0.0.1/cb", CodeChallenge: "c", CodeChallengeMethod: "S256",
+			Resource: "http://127.0.0.1:9/mcp", ExpiresAt: expires,
+		})
+		if err != nil {
+			t.Fatalf("create request: %v", err)
+		}
+		return r.ID
+	}
+	newGrant := func(expires pgtype.Timestamptz) pgtype.UUID {
+		t.Helper()
+		g, err := grants.CreateGrant(ctx, sqlcgen.CreateMCPOAuthGrantParams{
+			UserID: user.ID, ClientID: client.ID, Scopes: []string{"mcp:read"}, Resource: "http://127.0.0.1:9/mcp", ExpiresAt: expires,
+		})
+		if err != nil {
+			t.Fatalf("create grant: %v", err)
+		}
+		return g.ID
+	}
+
+	expiredRequest, liveRequest := newRequest(past), newRequest(future)
+	expiredGrant, liveGrant := newGrant(past), newGrant(future)
+	for _, c := range []struct {
+		hash    string
+		expires pgtype.Timestamptz
+	}{{"expired-code", past}, {"live-code", future}} {
+		if _, err := grants.CreateAuthorizationCode(ctx, sqlcgen.CreateMCPOAuthAuthorizationCodeParams{
+			GrantID: liveGrant, CodeHash: c.hash, CodeChallenge: "c", RedirectUri: "http://127.0.0.1/cb",
+			Resource: "http://127.0.0.1:9/mcp", ExpiresAt: c.expires,
+		}); err != nil {
+			t.Fatalf("create code %s: %v", c.hash, err)
+		}
+	}
+	for _, tok := range []struct {
+		hash    string
+		expires pgtype.Timestamptz
+	}{{"expired-token", past}, {"live-token", future}} {
+		if _, err := grants.CreateAccessToken(ctx, sqlcgen.CreateMCPOAuthAccessTokenParams{
+			GrantID: liveGrant, TokenHash: tok.hash, ExpiresAt: tok.expires,
+		}); err != nil {
+			t.Fatalf("create token %s: %v", tok.hash, err)
+		}
+	}
+
+	cleanupCtx, cancel := context.WithCancel(ctx)
+	var eg errgroup.Group
+	eg.Go(func() error {
+		err := narvipg.RunExpiredTokenCleanup(cleanupCtx, pool, 20*time.Millisecond)
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
+	})
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	if err := eg.Wait(); err != nil {
+		t.Fatalf("RunExpiredTokenCleanup: %v", err)
+	}
+
+	if _, err := grants.GetAuthorizationRequest(ctx, expiredRequest); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("expired authorization request: err = %v, want pgx.ErrNoRows", err)
+	}
+	if _, err := grants.GetAuthorizationRequest(ctx, liveRequest); err != nil {
+		t.Errorf("live authorization request: err = %v, want nil", err)
+	}
+	if _, err := grants.GetGrant(ctx, expiredGrant); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("expired grant: err = %v, want pgx.ErrNoRows", err)
+	}
+	if _, err := grants.GetGrant(ctx, liveGrant); err != nil {
+		t.Errorf("live grant: err = %v, want nil", err)
+	}
+	if _, err := grants.GetAuthorizationCodeByHash(ctx, "expired-code"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("expired code: err = %v, want pgx.ErrNoRows", err)
+	}
+	if _, err := grants.GetAuthorizationCodeByHash(ctx, "live-code"); err != nil {
+		t.Errorf("live code: err = %v, want nil", err)
+	}
+	if _, err := grants.LookupAccessToken(ctx, "expired-token"); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("expired token: err = %v, want pgx.ErrNoRows", err)
+	}
+	if _, err := grants.LookupAccessToken(ctx, "live-token"); err != nil {
+		t.Errorf("live token: err = %v, want nil", err)
+	}
+}

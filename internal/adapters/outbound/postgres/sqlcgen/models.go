@@ -682,6 +682,49 @@ func (ns NullImageDecisionReason) Value() (driver.Value, error) {
 	return string(ns.ImageDecisionReason), nil
 }
 
+type McpOauthClientKind string
+
+const (
+	McpOauthClientKindPreregistered    McpOauthClientKind = "preregistered"
+	McpOauthClientKindDynamic          McpOauthClientKind = "dynamic"
+	McpOauthClientKindMetadataDocument McpOauthClientKind = "metadata_document"
+)
+
+func (e *McpOauthClientKind) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = McpOauthClientKind(s)
+	case string:
+		*e = McpOauthClientKind(s)
+	default:
+		return fmt.Errorf("unsupported scan type for McpOauthClientKind: %T", src)
+	}
+	return nil
+}
+
+type NullMcpOauthClientKind struct {
+	McpOauthClientKind McpOauthClientKind `json:"mcp_oauth_client_kind"`
+	Valid              bool               `json:"valid"` // Valid is true if McpOauthClientKind is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullMcpOauthClientKind) Scan(value interface{}) error {
+	if value == nil {
+		ns.McpOauthClientKind, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.McpOauthClientKind.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullMcpOauthClientKind) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.McpOauthClientKind), nil
+}
+
 type OpencodeConfigScope string
 
 const (
@@ -1908,6 +1951,65 @@ type LinearInstallation struct {
 	ConnectedByUserID     pgtype.UUID        `json:"connected_by_user_id"`
 	CreatedAt             pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
+}
+
+type McpOauthAccessToken struct {
+	ID        pgtype.UUID        `json:"id"`
+	GrantID   pgtype.UUID        `json:"grant_id"`
+	TokenHash string             `json:"token_hash"`
+	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+type McpOauthAuthorizationCode struct {
+	ID            pgtype.UUID        `json:"id"`
+	GrantID       pgtype.UUID        `json:"grant_id"`
+	CodeHash      string             `json:"code_hash"`
+	CodeChallenge string             `json:"code_challenge"`
+	RedirectUri   string             `json:"redirect_uri"`
+	Resource      string             `json:"resource"`
+	ExpiresAt     pgtype.Timestamptz `json:"expires_at"`
+	ConsumedAt    pgtype.Timestamptz `json:"consumed_at"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+}
+
+type McpOauthAuthorizationRequest struct {
+	ID                  pgtype.UUID        `json:"id"`
+	ClientID            pgtype.UUID        `json:"client_id"`
+	UserID              pgtype.UUID        `json:"user_id"`
+	RedirectUri         string             `json:"redirect_uri"`
+	Scopes              []string           `json:"scopes"`
+	State               *string            `json:"state"`
+	CodeChallenge       string             `json:"code_challenge"`
+	CodeChallengeMethod string             `json:"code_challenge_method"`
+	Resource            string             `json:"resource"`
+	CsrfNonceHash       *string            `json:"csrf_nonce_hash"`
+	ExpiresAt           pgtype.Timestamptz `json:"expires_at"`
+	ConsumedAt          pgtype.Timestamptz `json:"consumed_at"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+}
+
+type McpOauthClient struct {
+	ID           pgtype.UUID        `json:"id"`
+	ClientID     string             `json:"client_id"`
+	Kind         McpOauthClientKind `json:"kind"`
+	ClientName   string             `json:"client_name"`
+	ClientUri    *string            `json:"client_uri"`
+	RedirectUris []string           `json:"redirect_uris"`
+	CreatedBy    pgtype.UUID        `json:"created_by"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	DisabledAt   pgtype.Timestamptz `json:"disabled_at"`
+}
+
+type McpOauthGrant struct {
+	ID         pgtype.UUID        `json:"id"`
+	UserID     pgtype.UUID        `json:"user_id"`
+	ClientID   pgtype.UUID        `json:"client_id"`
+	Scopes     []string           `json:"scopes"`
+	Resource   string             `json:"resource"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	ExpiresAt  pgtype.Timestamptz `json:"expires_at"`
+	LastUsedAt pgtype.Timestamptz `json:"last_used_at"`
 }
 
 type OidcSigningKey struct {
