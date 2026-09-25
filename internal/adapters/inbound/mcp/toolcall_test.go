@@ -1,0 +1,677 @@
+package mcp
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"testing"
+
+	"golang.org/x/sync/errgroup"
+)
+
+// callToolBody builds a modern (2026-07-28) tools/call request body
+// naming toolName and arguments (already-encoded JSON, or "{}").
+func callToolBody(id int, toolName, argumentsJSON string) string {
+	return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":%q,"arguments":%s,"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`, id, toolName, argumentsJSON)
+}
+
+func callToolHeaders(toolName string) map[string]string {
+	return map[string]string{
+		protocolVersionHeader: "2026-07-28",
+		"Mcp-Method":          "tools/call",
+		"Mcp-Name":            toolName,
+	}
+}
+
+type callToolResultEnvelope struct {
+	JSONRPC string `json:"jsonrpc"`
+	ID      any    `json:"id"`
+	Result  *struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+		StructuredContent any  `json:"structuredContent"`
+		IsError           bool `json:"isError"`
+	} `json:"result"`
+	Error *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+// TestToolCall_ListModels_HappyPath drives narvi_list_models through the
+// FULL stack (RequireEnabled -> auth -> versionGate -> the real SDK ->
+// the bridge -> mapOutcome), proving a 200 from the twin becomes a
+// successful CallToolResult whose content/structuredContent are the
+// twin's own body, byte for byte.
+func TestToolCall_ListModels_HappyPath(t *testing.T) {
+	const wantBody = `{"providers":[{"id":"openai","models":[]}]}`
+	twins := testTwins()
+	twins.ListModels = stubHandler(http.StatusOK, wantBody)
+	handler := newTestHandler(t, true, true, twins)
+
+	status, body := rawPost(t, handler, "/mcp", callToolBody(1, "narvi_list_models", "{}"), callToolHeaders("narvi_list_models"))
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, body = %s, want 200", status, body)
+	}
+	var env callToolResultEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("unmarshal: %v (body: %s)", err, body)
+	}
+	if env.Error != nil {
+		t.Fatalf("error = %+v, want a successful result", env.Error)
+	}
+	if env.Result == nil {
+		t.Fatal("result = nil")
+	}
+	if env.Result.IsError {
+		t.Error("IsError = true, want false")
+	}
+	if len(env.Result.Content) != 1 || env.Result.Content[0].Text != wantBody {
+		t.Errorf("content = %+v, want a single text block = %q", env.Result.Content, wantBody)
+	}
+	structuredJSON, err := json.Marshal(env.Result.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structuredContent: %v", err)
+	}
+	var gotStructured, wantStructured any
+	_ = json.Unmarshal(structuredJSON, &gotStructured)
+	_ = json.Unmarshal([]byte(wantBody), &wantStructured)
+	gotCanon, _ := json.Marshal(gotStructured)
+	wantCanon, _ := json.Marshal(wantStructured)
+	if string(gotCanon) != string(wantCanon) {
+		t.Errorf("structuredContent = %s, want (canonical) %s", gotCanon, wantCanon)
+	}
+}
+
+// TestToolCall_GetSession_NotFoundIsErrorTrue proves a 404 from the twin
+// becomes IsError:true with the twin's own error text -- a SUCCESSFUL
+// JSON-RPC response (no top-level "error"), per §43 D6.
+func TestToolCall_GetSession_NotFoundIsErrorTrue(t *testing.T) {
+	twins := testTwins()
+	twins.GetSession = stubHandler(http.StatusNotFound, `{"error":"session not found"}`)
+	handler := newTestHandler(t, true, true, twins)
+
+	args := `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a"}`
+	status, body := rawPost(t, handler, "/mcp", callToolBody(1, "narvi_get_session", args), callToolHeaders("narvi_get_session"))
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, body = %s, want 200 (isError is a SUCCESSFUL response)", status, body)
+	}
+	var env callToolResultEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("unmarshal: %v (body: %s)", err, body)
+	}
+	if env.Error != nil {
+		t.Fatalf("error = %+v, want no top-level JSON-RPC error", env.Error)
+	}
+	if env.Result == nil || !env.Result.IsError {
+		t.Fatalf("result = %+v, want IsError:true", env.Result)
+	}
+	if len(env.Result.Content) != 1 || env.Result.Content[0].Text != "session not found" {
+		t.Errorf("content = %+v, want text = %q", env.Result.Content, "session not found")
+	}
+	if env.Result.StructuredContent != nil {
+		t.Errorf("structuredContent = %v, want nil on an isError result", env.Result.StructuredContent)
+	}
+}
+
+// TestToolCall_GetSession_MalformedIDIsToolExecutionError proves a
+// malformed sessionId is caught by THIS package's own argument
+// validation (schemas.go's validateArguments, "format":"uuid" enforced
+// with format assertions on) BEFORE the twin is ever invoked -- a TOOL
+// EXECUTION error (isError:true), never a JSON-RPC protocol code, per
+// the MCP tools specification's own classification of an
+// input-validation failure. A prior revision of this test (and of
+// contracts/rest/v1/dtos.schema.json's own GetSessionToolRequest.
+// sessionId doc comment) asserted the OPPOSITE on the premise that the
+// pinned SDK enforced no schema keyword on the raw Server.AddTool path
+// at all -- true of the SDK itself, but this package now validates
+// arguments itself before BuildRequest or the twin ever sees them.
+func TestToolCall_GetSession_MalformedIDIsToolExecutionError(t *testing.T) {
+	var gotPath string
+	twins := testTwins()
+	twins.GetSession = func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"malformed session id"}`))
+	}
+	handler := newTestHandler(t, true, true, twins)
+
+	args := `{"sessionId":"not-a-uuid"}`
+	status, body := rawPost(t, handler, "/mcp", callToolBody(1, "narvi_get_session", args), callToolHeaders("narvi_get_session"))
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, body = %s, want 200 (isError:true is a SUCCESSFUL JSON-RPC response)", status, body)
+	}
+	if gotPath != "" {
+		t.Fatal("the twin was invoked -- \"not-a-uuid\" must be rejected by this package's own bridge (format:\"uuid\") before BuildRequest or the twin ever runs")
+	}
+	var env callToolResultEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("unmarshal: %v (body: %s)", err, body)
+	}
+	if env.Error != nil {
+		t.Fatalf("error = %+v, want no top-level JSON-RPC error", env.Error)
+	}
+	if env.Result == nil || !env.Result.IsError {
+		t.Fatalf("result = %+v, want IsError:true", env.Result)
+	}
+	if len(env.Result.Content) != 1 || !strings.Contains(env.Result.Content[0].Text, "sessionId") {
+		t.Errorf("content = %+v, want a message naming the offending field (\"sessionId\")", env.Result.Content)
+	}
+}
+
+// TestToolCall_ListSessions_BadFilterIsToolExecutionError proves
+// filter:"x" is caught by THIS package's own argument validation (the
+// "enum":["mine","all"] restored to contracts/rest/v1/dtos.schema.json's
+// ListSessionsToolRequest.filter) BEFORE the twin is ever invoked -- the
+// twin is never called at all, unlike a prior revision of this test
+// (and that $def's own doc comment), which asserted the OPPOSITE on the
+// mistaken premise that declaring "enum" would let the pinned SDK's own
+// generic validation intercept it FIRST, with a less specific message --
+// the SDK's raw Server.AddTool path validates nothing itself; see
+// schemas.go's own doc comment.
+func TestToolCall_ListSessions_BadFilterIsToolExecutionError(t *testing.T) {
+	invoked := false
+	twins := testTwins()
+	twins.ListSessions = func(w http.ResponseWriter, _ *http.Request) {
+		invoked = true
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"filter must be \"mine\" or \"all\""}`))
+	}
+	handler := newTestHandler(t, true, true, twins)
+
+	status, body := rawPost(t, handler, "/mcp", callToolBody(1, "narvi_list_sessions", `{"filter":"x"}`), callToolHeaders("narvi_list_sessions"))
+	if invoked {
+		t.Fatal("the twin was invoked -- \"x\" must be rejected by this package's own bridge (enum: mine|all) before BuildRequest or the twin ever runs")
+	}
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, body = %s, want 200 (isError:true is a SUCCESSFUL JSON-RPC response)", status, body)
+	}
+	var env callToolResultEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("unmarshal: %v (body: %s)", err, body)
+	}
+	if env.Error != nil {
+		t.Fatalf("error = %+v, want no top-level JSON-RPC error", env.Error)
+	}
+	if env.Result == nil || !env.Result.IsError {
+		t.Fatalf("result = %+v, want IsError:true", env.Result)
+	}
+	if len(env.Result.Content) != 1 || !strings.Contains(env.Result.Content[0].Text, "filter") {
+		t.Errorf("content = %+v, want a message naming the offending field (\"filter\")", env.Result.Content)
+	}
+}
+
+// TestToolCall_ListSessions_InvalidLimitIsToolExecutionError proves
+// limit:0 and limit:-5 (both below the restored "minimum":1) are caught
+// by this package's own bridge -- before the twin is ever invoked.
+// Deliberately no "maximum" case here: the ListSessionsToolRequest.limit
+// $def carries no "maximum" at all (its own doc comment, contracts/
+// rest/v1/dtos.schema.json, covers why -- tools/contractscompat does not
+// recognize that keyword yet, and REST itself does not reject an
+// over-large limit either, only clamps it), so limit:300 reaches the
+// twin exactly like the REST route's own identical clamping behavior.
+func TestToolCall_ListSessions_InvalidLimitIsToolExecutionError(t *testing.T) {
+	for _, limit := range []int{0, -1, -5} {
+		t.Run(fmt.Sprintf("limit=%d", limit), func(t *testing.T) {
+			invoked := false
+			twins := testTwins()
+			twins.ListSessions = func(w http.ResponseWriter, _ *http.Request) {
+				invoked = true
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"sessions":[]}`))
+			}
+			handler := newTestHandler(t, true, true, twins)
+
+			args := fmt.Sprintf(`{"limit":%d}`, limit)
+			status, body := rawPost(t, handler, "/mcp", callToolBody(1, "narvi_list_sessions", args), callToolHeaders("narvi_list_sessions"))
+			if invoked {
+				t.Fatalf("the twin was invoked for limit=%d -- it must be rejected by this package's own bridge first", limit)
+			}
+			if status != http.StatusOK {
+				t.Fatalf("status = %d, body = %s, want 200 (isError:true is a SUCCESSFUL JSON-RPC response)", status, body)
+			}
+			var env callToolResultEnvelope
+			if err := json.Unmarshal(body, &env); err != nil {
+				t.Fatalf("unmarshal: %v (body: %s)", err, body)
+			}
+			if env.Result == nil || !env.Result.IsError {
+				t.Fatalf("result = %+v, want IsError:true", env.Result)
+			}
+		})
+	}
+}
+
+// TestToolCall_ExponentFormNumberIsRefusedCheaply pins the fix for round
+// 3 review finding R5: an exponent-form JSON number like "1e1000000" is
+// only 9 bytes on the wire, but santhosh-tekuri/jsonschema/v6's own
+// integer check (util.go isInteger) and "minimum" check (validator.go
+// numValidate), plus this package's own intFromJSONNumber (tools.go),
+// each parse it through math/big.Rat.SetString -- whose own cost is set
+// by the number's MAGNITUDE, not its text length, so a value this short
+// measured ~50ms of CPU per request against the real stack (three
+// separate big.Rat computations of a ~2.3-million-BIT natural). Because
+// the request has no MCP-Protocol-Version header, every SupportedProtocolVersions
+// entry this deployment still speaks reaches the argument validator with
+// this shape (not merely the legacy era). schemas.go's own
+// rejectOversizedNumbers now refuses any number token with an exponent
+// outside +/-maxJSONNumberExponent BEFORE jsonschema.UnmarshalJSON/
+// Schema.Validate ever runs.
+//
+// Round 4 review of PR #324, findings S1/S2: a prior revision of this
+// test asserted `elapsed > 25*time.Millisecond` as its own proof that the
+// pre-scan ran -- flaky under `go test -race` (the exact command CI
+// runs, Makefile/ci.yml), which alone costs more of that budget than the
+// refusal itself ever could, with no headroom on a loaded runner (2-9 of
+// 10 runs failed in reproduction, entirely from -race's own per-request
+// fixed overhead, never from the exponent check actually running slow).
+// The property this test needs is deterministic and needs no clock at
+// all: checkNumberTokenSize's own exponent check is the ONLY code path
+// that ever produces THIS EXACT text, for every one of these inputs.
+// Disabling the pre-scan (verified against a modified copy of this
+// package) does not just make these inputs slower -- it changes what
+// they answer: the real jsonschema validator refuses "-1e1000000"/
+// "1e-1000000" itself, with a *jsonschema.ValidationError's own "- at
+// '/limit': ..." text, and lets "1e1000000"/"1.5e1000000" through to
+// intFromJSONNumber's own "limit ... is not representable as a bounded
+// whole number" fallback -- never this message. Asserting this exact
+// text, with the twin never invoked, therefore pins the fix exactly as
+// precisely as the timing bound tried to, with no clock and no flake.
+//
+// Round 5 review of PR #324, finding T2: JSON allows an uppercase 'E'
+// exponent too, and Go's decoder accepts it, so "1E1000000" costs the
+// same big.Rat work. The rows above were all lowercase, so a pre-scan
+// narrowed to `strings.IndexByte(text, 'e')` left the suite green while
+// re-opening R5 for every uppercase spelling. The uppercase rows pin
+// that branch with the same exact-text assertion: on that mutant they
+// answer with the fallback or validator text instead.
+func TestToolCall_ExponentFormNumberIsRefusedCheaply(t *testing.T) {
+	for _, limit := range []string{
+		"1e1000000", "1.5e1000000", "-1e1000000", "1e-1000000",
+		"1E1000000", "1.5E1000000", "-1E-1000000",
+	} {
+		t.Run(limit, func(t *testing.T) {
+			invoked := false
+			twins := testTwins()
+			twins.ListSessions = func(w http.ResponseWriter, _ *http.Request) {
+				invoked = true
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"sessions":[]}`))
+			}
+			handler := newTestHandler(t, true, true, twins)
+
+			args := fmt.Sprintf(`{"limit":%s}`, limit)
+			body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"narvi_list_sessions","arguments":%s}}`, args)
+
+			status, respBody := rawPost(t, handler, "/mcp", body, nil)
+
+			if invoked {
+				t.Fatalf("the twin was invoked for limit=%s -- an oversized exponent must be rejected by this package's own bridge first", limit)
+			}
+			if status != http.StatusOK {
+				t.Fatalf("status = %d, body = %s, want 200 (isError:true is a SUCCESSFUL JSON-RPC response)", status, respBody)
+			}
+			var env callToolResultEnvelope
+			if err := json.Unmarshal(respBody, &env); err != nil {
+				t.Fatalf("unmarshal: %v (body: %s)", err, respBody)
+			}
+			if env.Result == nil || !env.Result.IsError {
+				t.Fatalf("result = %+v, want IsError:true", env.Result)
+			}
+			wantText := fmt.Sprintf("invalid arguments: a number in the request arguments has an exponent outside +/-%d", maxJSONNumberExponent)
+			if len(env.Result.Content) != 1 || env.Result.Content[0].Text != wantText {
+				t.Fatalf("content = %+v, want a single text block = %q -- this EXACT text can only come from checkNumberTokenSize's own exponent check; the real (unfixed) jsonschema validator and intFromJSONNumber's own fallback both answer differently for this input", env.Result.Content, wantText)
+			}
+		})
+	}
+}
+
+// TestToolCall_OversizedNumberTokenLengthIsRefused pins schemas.go's own
+// checkNumberTokenSize LENGTH bound (maxJSONNumberTokenLen), separately
+// from its EXPONENT bound above (round 4 review of PR #324, finding S7):
+// every existing test exercising rejectOversizedNumbers used an
+// exponent-form literal, all comfortably under maxJSONNumberTokenLen, so
+// a mutant that disables the length check alone (`if len(text) >
+// maxJSONNumberTokenLen`) left the whole suite green. A 33-digit integer
+// and a long, all-zero decimal (both plain JSON integers, neither one
+// carrying an 'e'/'E' at all) are refused by the LENGTH check alone.
+// Verified against a modified copy of this package with the length check
+// disabled: the 33-digit literal is then refused with a DIFFERENT
+// message (intFromJSONNumber's own "is not representable" fallback,
+// since santhosh-tekuri/jsonschema/v6's own "integer"/"minimum" checks
+// both accept it), and the long decimal -- which denotes the plain,
+// perfectly ordinary integer 1 -- is no longer refused AT ALL.
+func TestToolCall_OversizedNumberTokenLengthIsRefused(t *testing.T) {
+	tests := []struct {
+		name  string
+		limit string
+	}{
+		{"33-digit integer (one character over the bound)", strings.Repeat("7", maxJSONNumberTokenLen+1)},
+		{"long all-zero decimal (denotes the plain integer 1, but its own token text is over the bound)", "1." + strings.Repeat("0", maxJSONNumberTokenLen)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			invoked := false
+			twins := testTwins()
+			twins.ListSessions = func(w http.ResponseWriter, _ *http.Request) {
+				invoked = true
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"sessions":[]}`))
+			}
+			handler := newTestHandler(t, true, true, twins)
+
+			args := fmt.Sprintf(`{"limit":%s}`, tt.limit)
+			body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"narvi_list_sessions","arguments":%s}}`, args)
+
+			status, respBody := rawPost(t, handler, "/mcp", body, nil)
+
+			if invoked {
+				t.Fatalf("the twin was invoked for limit=%s -- an oversized number token must be rejected by this package's own bridge first", tt.limit)
+			}
+			if status != http.StatusOK {
+				t.Fatalf("status = %d, body = %s, want 200 (isError:true is a SUCCESSFUL JSON-RPC response)", status, respBody)
+			}
+			var env callToolResultEnvelope
+			if err := json.Unmarshal(respBody, &env); err != nil {
+				t.Fatalf("unmarshal: %v (body: %s)", err, respBody)
+			}
+			if env.Result == nil || !env.Result.IsError {
+				t.Fatalf("result = %+v, want IsError:true", env.Result)
+			}
+			wantText := fmt.Sprintf("invalid arguments: a number in the request arguments is too long (%d characters, max %d)", len(tt.limit), maxJSONNumberTokenLen)
+			if len(env.Result.Content) != 1 || env.Result.Content[0].Text != wantText {
+				t.Fatalf("content = %+v, want a single text block = %q", env.Result.Content, wantText)
+			}
+		})
+	}
+}
+
+// TestToolCall_ListSessions_SchemaValidIntegerSpellings pins the fix for
+// round 2 review findings N8/N11/N17: JSON Schema's own "integer" type
+// accepts any number with a zero fractional part -- "1.0" and "1e2" are
+// both integers, with no int64 bound, so a value like 2^63
+// (9223372036854775808) is one too. A prior revision of BuildRequest
+// unmarshaled limit straight into a generated *int field, whose
+// encoding/json decoder rejects every one of these literally, landing in
+// a branch its own comment called "unreachable in practice" that logged
+// the raw Go error at ERROR ("mcp: BuildRequest failed after schema
+// validation passed") on every occurrence and returned a bare, unhelpful
+// "invalid arguments".
+//
+// intFromJSONNumber (tools.go) now converts these explicitly: "1.0" and
+// "1e2" are schema-valid AND representable, so they must now reach the
+// twin as the plain integers they denote (1 and 100) -- a strictly
+// better outcome than before, not merely a quieter failure. 2^63 is
+// schema-valid but NOT representable in a Go int, so it must still be
+// refused, but as an ordinary tool execution error with no ERROR log
+// line and no leaked Go type/field name.
+func TestToolCall_ListSessions_SchemaValidIntegerSpellings(t *testing.T) {
+	tests := []struct {
+		name       string
+		limitJSON  string
+		wantLimit  string // twin's own ?limit= value, iff invoked
+		wantCalled bool
+	}{
+		{name: "1.0 is the integer 1", limitJSON: `1.0`, wantLimit: "1", wantCalled: true},
+		{name: "1e2 is the integer 100", limitJSON: `1e2`, wantLimit: "100", wantCalled: true},
+		{name: "2^63 does not fit an int64", limitJSON: `9223372036854775808`, wantCalled: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logBuf := swapDefaultLogger(t)
+
+			var gotQuery string
+			invoked := false
+			twins := testTwins()
+			twins.ListSessions = func(w http.ResponseWriter, r *http.Request) {
+				invoked = true
+				gotQuery = r.URL.RawQuery
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"sessions":[]}`))
+			}
+			handler := newTestHandler(t, true, true, twins)
+
+			args := fmt.Sprintf(`{"limit":%s}`, tt.limitJSON)
+			status, body := rawPost(t, handler, "/mcp", callToolBody(1, "narvi_list_sessions", args), callToolHeaders("narvi_list_sessions"))
+			if status != http.StatusOK {
+				t.Fatalf("status = %d, body = %s, want 200", status, body)
+			}
+			if invoked != tt.wantCalled {
+				t.Fatalf("twin invoked = %v, want %v", invoked, tt.wantCalled)
+			}
+
+			var env callToolResultEnvelope
+			if err := json.Unmarshal(body, &env); err != nil {
+				t.Fatalf("unmarshal: %v (body: %s)", err, body)
+			}
+
+			if tt.wantCalled {
+				if env.Result == nil || env.Result.IsError {
+					t.Fatalf("result = %+v, want a successful result", env.Result)
+				}
+				if gotQuery != "limit="+tt.wantLimit {
+					t.Errorf("twin's own raw query = %q, want %q", gotQuery, "limit="+tt.wantLimit)
+				}
+			} else {
+				if env.Result == nil || !env.Result.IsError {
+					t.Fatalf("result = %+v, want IsError:true", env.Result)
+				}
+				if len(env.Result.Content) != 1 {
+					t.Fatalf("content = %+v, want exactly one text block", env.Result.Content)
+				}
+				text := env.Result.Content[0].Text
+				if !strings.Contains(text, "invalid arguments") {
+					t.Errorf("content text = %q, want it to say the arguments are invalid", text)
+				}
+				if strings.Contains(text, "Go struct field") || strings.Contains(text, "restdtos.") {
+					t.Errorf("content text = %q, leaks an internal Go type/field name", text)
+				}
+			}
+
+			if strings.Contains(logBuf.String(), "level=ERROR") {
+				t.Errorf("an out-of-range but schema-valid integer must not log at ERROR (this is an ordinary caller mistake, not a defect); log output:\n%s", logBuf.String())
+			}
+		})
+	}
+}
+
+// TestToolCall_AdditionalPropertyRejected proves an unknown argument key
+// is rejected by this package's own bridge ("additionalProperties":false
+// on every one of the three input $defs), before the twin is ever
+// invoked -- the raw Server.AddTool path enforces nothing here either.
+func TestToolCall_AdditionalPropertyRejected(t *testing.T) {
+	invoked := false
+	twins := testTwins()
+	twins.ListSessions = func(w http.ResponseWriter, _ *http.Request) {
+		invoked = true
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"sessions":[]}`))
+	}
+	handler := newTestHandler(t, true, true, twins)
+
+	status, body := rawPost(t, handler, "/mcp", callToolBody(1, "narvi_list_sessions", `{"filter":"all","bogus":1}`), callToolHeaders("narvi_list_sessions"))
+	if invoked {
+		t.Fatal("the twin was invoked -- an unknown \"bogus\" key must be rejected first (additionalProperties:false)")
+	}
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, body = %s, want 200 (isError:true is a SUCCESSFUL JSON-RPC response)", status, body)
+	}
+	var env callToolResultEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("unmarshal: %v (body: %s)", err, body)
+	}
+	if env.Result == nil || !env.Result.IsError {
+		t.Fatalf("result = %+v, want IsError:true", env.Result)
+	}
+}
+
+// TestToolCall_TwinPanicIsRecovered proves toolHandler's own recover
+// (tools.go) protects the WHOLE call, not merely bridge.go's own request
+// construction: a twin that panics outright -- any future twin or
+// argument shape, not merely the httptest.NewRequest defect bridge.go's
+// own doc comment names -- is caught, logged, and answered a JSON-RPC
+// -32603 protocol error. The MCP SDK runs every tool handler in its own
+// goroutine with NO recover anywhere in its own call stack (internal/
+// jsonrpc2), so an uncaught panic here would otherwise crash the whole
+// process. This test's own continued execution past the panicking call
+// is itself part of the proof: if the recover did not run, this test
+// binary would not still be alive to make the assertions below, let
+// alone the follow-up call to a DIFFERENT tool afterward.
+func TestToolCall_TwinPanicIsRecovered(t *testing.T) {
+	twins := testTwins()
+	twins.GetSession = func(http.ResponseWriter, *http.Request) {
+		panic("simulated twin panic -- narvi_get_session")
+	}
+	handler := newTestHandler(t, true, true, twins)
+
+	args := `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a"}`
+	_, body := rawPost(t, handler, "/mcp", callToolBody(1, "narvi_get_session", args), callToolHeaders("narvi_get_session"))
+
+	var env callToolResultEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("unmarshal: %v (body: %s)", err, body)
+	}
+	if env.Error == nil {
+		t.Fatalf("error = nil, want a JSON-RPC -32603 protocol error (body: %s)", body)
+	}
+	if env.Error.Code != -32603 {
+		t.Errorf("error.code = %d, want -32603", env.Error.Code)
+	}
+
+	// The test binary is still alive: prove it by successfully calling a
+	// DIFFERENT tool, in the SAME process, right after the panic.
+	status, body2 := rawPost(t, handler, "/mcp", callToolBody(2, "narvi_list_models", "{}"), callToolHeaders("narvi_list_models"))
+	if status != http.StatusOK {
+		t.Fatalf("follow-up call after the panic: status = %d, body = %s, want 200 (proves the process survived)", status, body2)
+	}
+}
+
+// TestToolCall_ConcurrentFirstCalls_NoRace pins the fix for round 2
+// review findings N1/N3/N4: a FRESH handler (built by this test alone,
+// never shared with an earlier one -- newTestHandler calls NewHandler
+// itself, which now compiles every tool's input schema EAGERLY, before
+// this function ever returns) receiving many concurrent, independent
+// tools/call requests, spread across all three tools and released
+// together, must run cleanly under -race and never crash the process.
+//
+// A prior revision of schemas.go compiled each tool's input $def LAZILY,
+// on the first tools/call that named it, on the single shared
+// *jsonschema.Compiler restDefsCompiler memoized -- guarded only by a
+// sync.Map around the CACHED RESULT, never around the Compile call
+// itself. santhosh-tekuri/jsonschema/v6 has no locking anywhere in its
+// own package (verified by reading its source under GOMODCACHE: Compiler
+// and Schema are plain, unsynchronized maps, and neither Compile is
+// documented safe for concurrent use). Two goroutines racing on the
+// FIRST tools/call this process had ever seen for a given $def name --
+// entirely ordinary MCP client behavior, e.g. a model issuing
+// narvi_list_sessions and narvi_get_session in parallel right after a
+// deploy -- hit a Go runtime "fatal error: concurrent map writes": a
+// fatal THROW, not a panic, which toolHandler's own recover (this file's
+// own TestToolCall_TwinPanicIsRecovered) cannot catch, killing the WHOLE
+// process and every other in-flight request on that replica with it.
+//
+// Mutation check performed by hand (not committed): temporarily
+// restoring that prior lazy-compile-on-a-shared-compiler shape in
+// schemas.go/tools.go/handler.go and rerunning this exact test in
+// isolation (`go test -race -run TestToolCall_ConcurrentFirstCalls_NoRace`,
+// so no earlier test in the same binary has already warmed the
+// package-level cache) reliably reproduces DATA RACE reports in
+// jsonschema's own roots.addRoot/Compiler.schemas, confirming this test
+// is not vacuous against the defect it exists to catch.
+//
+// What this test cannot do (round 3 review finding R3, round 5 finding
+// T1): see a PACKAGE-LEVEL lazy cache in the full suite. The handler
+// here is fresh, but a package-level cache outlives every handler, and
+// earlier tests in the same binary (Go runs them in file order, with no
+// shuffling by default) have already called all three tools and warmed
+// it -- so under `go test -race ./...` a reintroduced package-level lazy
+// compile passes this test; only an isolated run shows the race. A
+// cold-process re-exec would close that, but it needs os/exec, which
+// tools/lint/narvichecks' execimportban forbids in this tree, test files
+// included. So this test is not what keeps the request path from
+// compiling (round 6 review, findings U1/U2/U3; the top of
+// toolhandler_test.go has the full account). newHandler refuses a
+// schema map with a missing or nil entry and serves from a private copy
+// taken at construction. TestInjectedSchemaMap_DecidesEveryToolCall
+// fails, cache warm or not, when a layer of newHandler's request path
+// validates against something other than that map and its verdict
+// differs from the map's on one of the arguments objects the test
+// sends -- for every keyword those rows probe, and no wider. Neither
+// sees a request-path compile whose result is discarded, or one whose
+// verdict agrees with the map on every row sent (the top of
+// toolhandler_test.go lists those shapes); only an isolated run of this
+// test does, and only when that compile shares a compiler across
+// requests. This test stays as the runtime check for races in
+// per-handler state and in the concurrent Validate path itself.
+func TestToolCall_ConcurrentFirstCalls_NoRace(t *testing.T) {
+	const n = 64
+	handler := newTestHandler(t, true, true, testTwins())
+
+	calls := []struct {
+		name, args string
+	}{
+		{"narvi_list_models", "{}"},
+		{"narvi_list_sessions", `{"filter":"all","limit":5}`},
+		{"narvi_get_session", `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a"}`},
+	}
+
+	// Launched through errgroup.Group.Go, per technical plan §11 (no naked
+	// goroutines) -- the ready/start pair below is what makes every one
+	// of these n goroutines fire its first tools/call at (as close to)
+	// the same instant as Go can arrange, rather than merely running
+	// "concurrently" in whatever loose sense errgroup.Go alone would
+	// give: without it, an early goroutine could finish before a later
+	// one even starts, which would not exercise a genuine "n first calls,
+	// all racing together" scenario.
+	start := make(chan struct{})
+	var ready sync.WaitGroup
+	ready.Add(n)
+	var g errgroup.Group
+	for i := 0; i < n; i++ {
+		id, call := i, calls[i%len(calls)]
+		g.Go(func() error {
+			ready.Done()
+			<-start
+			status, body := rawPost(t, handler, "/mcp", callToolBody(id, call.name, call.args), callToolHeaders(call.name))
+			if status != http.StatusOK {
+				return fmt.Errorf("concurrent tools/call %s (id=%d): status = %d, body = %s", call.name, id, status, body)
+			}
+			return nil
+		})
+	}
+	ready.Wait()
+	close(start)
+	if err := g.Wait(); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestToolCall_ListSessions_OmittedArgsUseTwinDefaults proves an empty
+// arguments object never forces filter/limit onto the twin's own query
+// string -- the twin's own defaulting (filter="mine", a default limit)
+// runs completely unchanged.
+func TestToolCall_ListSessions_OmittedArgsUseTwinDefaults(t *testing.T) {
+	var gotQuery string
+	twins := testTwins()
+	twins.ListSessions = func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"sessions":[]}`))
+	}
+	handler := newTestHandler(t, true, true, twins)
+
+	status, body := rawPost(t, handler, "/mcp", callToolBody(1, "narvi_list_sessions", `{}`), callToolHeaders("narvi_list_sessions"))
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, body = %s, want 200", status, body)
+	}
+	if gotQuery != "" {
+		t.Errorf("twin's own raw query = %q, want empty (no filter/limit forced by the bridge)", gotQuery)
+	}
+}

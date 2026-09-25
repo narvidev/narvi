@@ -6601,3 +6601,258 @@ and the acceptance run) and 168 (egress) are the two decisions, and neither can 
 declaring a capability false — 167 because a provider without it is a shared kernel, 168 because
 §27.6's fail-closed rule leaves an `allowlist` Environment unspawnable until it lands. 169 and 170 are
 independent of each other and gate nothing. Scenario 16 gates the phase.
+
+## 43. The MCP surface
+
+§27 ("Enterprise sandbox glue") is where rows 180-183 point today, and it is the wrong section: §27's
+own MCP mentions run the other way — an org-authored engine config *naming* MCP servers a sandbox
+connects to as a *client* (docs/DECISIONS.md D-01 says so itself). This section is the surface those
+rows actually build: this repository's control plane as an MCP *server*. Nothing here widens what an
+external caller may do beyond what an authenticated browser session can already do today — it changes
+only the *protocol* a caller speaks, never the *authorization* it is checked against.
+
+### 43.1 Scope: what 180 ships, and what it deliberately does not
+
+Step 180 ships the entry point, the transport, the protocol-version gate, and exactly three read-only
+tools: `narvi_list_models`, `narvi_list_sessions`, `narvi_get_session` — the minimum that proves
+"discovery and one session read through the same authorization path an equivalent HTTP call takes",
+this row's own exit criterion. It is cookie-authenticated (§43.2) and disabled by default (§43.11):
+**no off-the-shelf MCP client can use this surface yet**, because none carries a browser cookie. What
+can use it is a script client in this repository's own tests, which is exactly this row's own studied
+scope. Everything past that is later Steps' own row, not this section's: 181 is what makes the surface
+reachable by a real client (OAuth 2.1 resource-server behavior, per-principal tool filtering); 182 adds
+result/verdict tools, bounded wait, and transcript paging; 183 adds plan read/approve/reject,
+prompt-while-running, stop, and delegate (create session). Repository discovery (`narvi_list_repositories`)
+is deliberately absent from 180 too: this codebase has no `GET /api/repos` route for it to sit over,
+and the one-adapter rule (§43.7) means a tool ships only once its HTTP twin exists.
+
+### 43.2 Authentication: the same cookie, the same middleware, nothing else
+
+`POST /mcp` sits behind the EXACT same `auth.Middleware(userSessionStore, userStore)` every `/api/**`
+route group already uses. The principal a tool handler sees is `platform.UserFromContext(ctx)` — the
+same `AuthenticatedUser{ID, Role, Email}` every REST handler already reads. No new credential store, no
+new hash, no new token TTL, no new rejection body: the same generic `{"error":"unauthorized"}` 401 every
+other route already answers. Rejected alternatives, so they are not re-proposed: accepting the cookie's
+own value as a bearer token (turns an HttpOnly, host-scoped cookie into a copyable long-lived credential
+the MCP authorization spec itself forbids); a new personal-API-token table (a third credential family
+181's OAuth surface would then have to reconcile against); reusing the per-session WS token (per-session,
+not per-user-surface, and consumed by a WS frame, not an HTTP header). Because this surface is
+cookie-authenticated, it additionally needs what a `POST /api/**` route gets for free from `SameSite=Lax`:
+`Origin` validation — an Origin header, if present, must resolve to EXACTLY the origin of
+`cfg.PublicBaseURL`, or the request is refused 403; a request with no `Origin` header at all (every
+non-browser MCP client) passes. `RequireTrustedOrigin` performs this comparison directly rather than
+delegating to `net/http.CrossOriginProtection` (which `NewHandler`'s own returned handler still wires in
+as a second, defense-in-depth layer): that stdlib type exempts a request whose `Sec-Fetch-Site` reads
+"same-origin"/"none", and — load-bearing — a request whose Origin equals its own Host header, checked
+BEFORE its trusted-origin list is ever consulted. That second shape is exactly a DNS-rebinding request
+(an attacker-controlled hostname resolved to this deployment's own IP), which a round 2 review of this
+Step's own fix caught passing through as 503/401 instead of 403 (finding N12) — closed by comparing
+directly against `cfg.PublicBaseURL`'s own origin with no exemption at all. This check is mounted as its
+OWN chi middleware, first in the route group's own chain, before the enabled-gate or the auth gate
+(§43.6) — the Streamable HTTP transport spec's own "MUST respond with HTTP 403 Forbidden" for an invalid
+Origin is unconditional, not "once the surface is known to be enabled" or "once the caller is
+authenticated".
+
+### 43.3 Transport: stateless Streamable HTTP
+
+Streamable HTTP, not stdio — this is a multi-tenant Go control plane serving many clients over the
+network, with Postgres as the only state (§5.1), not a client-launched subprocess. `Stateless: true`:
+the current protocol revision is served only in stateless mode by the pinned SDK, the protocol itself
+is declared stateless, and a protocol-level session table would be a second authority over state
+(§5.1 forbids exactly that). `JSONResponse: true`: every 180 tool is a short DB read, so a plain
+`application/json` response avoids SSE plumbing and keep-alive timers entirely — no new
+`platform/timeouts.go` constant for this Step. The request body is capped at 64 KiB — deliberately far
+below `httpapi.MaxRequestBodyBytes`'s own 1 MiB (every other REST body this codebase decodes): a tool
+call's own arguments are a handful of small fields, never a file upload, so the larger cap bought no
+legitimate room, only attack surface. A round 2 review of this Step's own fix measured a single ~1 MiB
+legacy JSON-RPC batch request fanning out into roughly 8,000 concurrent twin invocations and a
+multi-gigabyte buffered reply before a single byte was written back (finding N2); this surface now
+refuses any batch (a body whose first non-whitespace byte is `[`) with a single JSON-RPC `-32600`
+"batching is not supported" error at its own gate, before the SDK ever sees it, and the shrunk cap also
+bounds an unrelated cost the same review found (a single huge JSON number literal costing over a second
+of CPU in the argument validator's own integer check, finding N7) to a small fraction of that. This gate
+reads the WHOLE (already-capped) body before deciding, not a bounded look-ahead: a round 3 review of this
+Step's own fix (findings R1/R2, both high) caught a prior revision that peeked only the first 64 bytes
+through a `bufio.Reader` and treated an all-whitespace peek as "not a batch" — since RFC 8259's own
+insignificant-whitespace allowance has no length bound and the pinned SDK's own batch decoder skips
+exactly that same unbounded run, a fixed-size look-ahead of any length is a gate an attacker defeats with
+that many bytes of leading whitespace. Reading the full body first costs nothing extra: the SDK was
+always going to `io.ReadAll` that same (64 KiB-capped) body itself.
+
+### 43.4 Protocol versions and the version gate
+
+One constant is the single source of truth for which protocol revisions this deployment speaks, newest
+first: `2026-07-28` (current), `2025-11-25`, `2025-06-18` (the legacy Streamable-HTTP revisions "existing
+MCP clients" — this row's own phrase — mostly still speak). `2025-03-26` is deliberately EXCLUDED (revised
+by a round 2 review of this Step's own fix, finding N2 — D4 originally included it): that revision's own
+spec text requires a Streamable HTTP server to accept a legacy JSON-RPC batch request, which the pinned
+SDK does unconditionally for any request it treats as pre-2025-06-18, with no option to disable; §43.3
+above covers why this surface now refuses every batch structurally. Claiming a revision while refusing
+part of what it requires would not be conformant, so the revision itself is dropped instead. `2024-11-05`
+is deliberately excluded for an unrelated, original reason: its transport is the deprecated HTTP+SSE pair,
+a second endpoint shape entirely, not merely a version this server negotiates on the one endpoint it has.
+This constant only NARROWS the official SDK's own broader default list, never widens it.
+
+A request whose `MCP-Protocol-Version` header names a version outside that list is refused before the
+SDK ever sees it: HTTP 400, JSON-RPC code `-32022`, with `data.supported`/`data.requested` and a message
+naming every version this server speaks. What this gate improves on is the pinned SDK's own otherwise
+comparable refusal's SHAPE, not its wording: for a header version below the current revision that the
+SDK does not recognize, the SDK itself already answers plain-text HTTP 400 naming every supported
+version — it is simply not the JSON-RPC `-32022` shape the modern spec requires, and (for a request-body
+`_meta.protocolVersion` at or above the current revision) the SDK's OWN `-32022` message is the fixed
+string "unsupported protocol version", which does not name them. This gate answers the same, correct
+`-32022` JSON-RPC shape either way, always naming every version. A request
+with NO version header at all is passed straight through: the spec's own backward-compatibility
+allowance is that such a request may be a pre-2025-06-18 `initialize` handshake, which carries its own
+protocol version inside the request body instead — the SDK's own legacy handling negotiates it, and
+counter-offers a version this server does speak when the requested one is unsupported, rather than
+refusing outright (a legacy client has no other fall-forward path). Every other version-adjacent
+rejection — header/body mismatch, a modern call missing a required `_meta` field — is the pinned SDK's
+own job, exercised and pinned by this Step's own tests rather than re-implemented.
+
+### 43.5 `server/discover` and capabilities
+
+`server/discover` returns `supportedVersions` equal to §43.4's own constant, `capabilities: {"tools":{}}`
+(no `listChanged` — the tool set is static per build; no resources, no prompts, no logging capability),
+and `_meta`'s own `serverInfo` — `{"name":"narvi","version":contracts.Version}`, since the contracts
+bundle version is what a client can actually reason about (which DTO shapes it will get). `instructions`
+is one paragraph telling the model the three tools are read-only and that `filter:"all"` on
+`narvi_list_sessions` lists every session on the deployment, not only the caller's own. The legacy
+`initialize` handshake answers with the same `serverInfo`/`capabilities`.
+
+### 43.6 Registration: where the endpoint mounts, and in what order
+
+`POST /mcp` is mounted at the router root, not under `/api/`: this is a protocol endpoint, the same
+category as `GET /sessions/{sessionID}/ws` or `/webhooks/*`, never graded by the `/api/`-only route
+diff a wire-contract compatibility change is checked against. The route group is mounted
+UNCONDITIONALLY regardless of whether the surface is enabled — a surface that is off must be
+OBSERVABLE as off, never a route that does not exist at all, the same discipline the OIDC routes
+already establish. Gate order inside the group is deliberate and fixed: the Origin gate (§43.2) answers
+403 FIRST, on an invalid Origin, whatever the state of every gate after it — the transport spec's own
+"MUST respond with HTTP 403 Forbidden" is unconditional, and no LATER gate can know that without
+running first. The enabled-gate (§43.11) answers 503 SECOND, before the session store is ever touched;
+only once the surface is known to be on does the auth gate (§43.2) run, third, producing the identical
+401 every other route produces on a missing/expired/disabled session.
+
+### 43.7 The bridge: one authorization path, never a second
+
+Every tool in this surface is implemented by invoking the EXISTING REST `http.HandlerFunc` in-process,
+through a response recorder, with the authenticated request's own context — never a second
+implementation sharing an extracted "core" function, and never a direct call into a store or the authz
+domain. The tool bridge receives only already-constructed handler VALUES (`httpapi.GetModelCatalog()`,
+`httpapi.ListSessions(sessionStore)`, …) from the composition root, which alone holds the Postgres
+stores those closures capture — the adapter itself never imports a store type at all, enforced
+structurally (§43.9) rather than left to review discipline. A tool with no HTTP twin yet (182's wait,
+183's stop) is exactly the moment a real application service is needed, gaining its own HTTP twin or an
+explicit, reviewed exemption — never a shortcut around the bridge. Per-request server construction
+(one small `*mcp.Server` per HTTP request, built from the incoming request's own context) is what makes
+per-principal tool filtering possible in 181 without this Step needing to build it: a client that may
+not use a tool must not be told the tool exists, and the SDK's own seam for that is exactly this
+per-request construction.
+
+The synthesized `*http.Request` callTwin builds is assembled directly (a literal `&http.Request{...}`),
+never by parsing a request line from attacker-controlled text: an argument is substituted into the
+twin's own path template with `url.PathEscape`, and the value chi's own route context carries (what
+every real handler actually reads) is the raw, unescaped argument, populated on that context directly
+rather than re-derived from the request's own URL. No header or cookie an argument names can ever reach
+the synthesized request either way. Defense in depth beyond that: every tool handler's entire call is
+wrapped in a `recover`, logging the panic with whatever correlation id the request's own context
+carries and answering `-32603` — so no future twin or argument shape that panics instead of erroring can
+take the whole process down with it.
+
+### 43.8 Tool table, argument validation, and outcome mapping
+
+The tool table is the one place a tool is declared: its wire name, its REST twin, the two contracts
+`$def` names its schemas come from, and how a caller's `arguments` object becomes the twin's own URL
+params / query string. Every tool advertises the same four annotations: `readOnlyHint: true`,
+`destructiveHint: false`, `idempotentHint: true`, `openWorldHint: false`.
+
+Before any of that runs, the raw `arguments` object is validated against that SAME tool's own input
+`$def` (santhosh-tekuri/jsonschema/v6, format assertions on) — the pinned SDK's low-level
+`Server.AddTool(*Tool, ToolHandler)` path this Step deliberately uses (so a business refusal can be
+rendered `isError:true` and the whole call can be wrapped in a recover, above) validates nothing against
+`InputSchema` itself; that is documented as the caller's own responsibility, and this Step is that
+caller. A validation failure is a TOOL EXECUTION error (`isError:true`, message = the schema validator's
+own "at '<path>': <reason>" text), per the MCP tools specification's own classification of an
+input-validation failure — never a JSON-RPC protocol code.
+
+One function converts a twin's raw HTTP outcome into the MCP outcome a tool handler returns:
+
+| HTTP from the twin | MCP outcome | Why |
+|---|---|---|
+| 200 | a successful result; content and structured content are the REST body's own bytes, verbatim | never re-encoded, so a caller sees byte-for-byte what the REST route would have written |
+| 400 / 403 / 404 / 409 | a successful result with `isError:true`, content = the REST body's own error string | both a request-structure problem and a business refusal are tool execution errors per the MCP tools specification's own taxonomy — never a JSON-RPC application code, so the model can read the text and correct itself. Argument validation above already catches nearly every 400 case before the twin is ever invoked; this row is what remains reachable for a value the schema's own value-space cannot express |
+| 401 | unreachable inside the bridge (the auth gate already ran); if seen, a defect signal | never trusted as a legitimate outcome |
+| anything else (5xx, …) | `-32603`, "internal error" | a server error is a protocol error; the body is never leaked |
+| a panic anywhere in the tool handler's own call | `-32603`, "internal error", logged with the request's own correlation id | caught by the handler's own recover (§43.7) — defense in depth, not a legitimate outcome either |
+
+### 43.9 Structural guards
+
+Two mechanical guarantees turn "never a second path" from a review note into a CI property. First, an
+import ban: the MCP adapter package — and every one of its own subpackages, a prefix match, not merely
+the exact package path, so a future subpackage cannot import a banned path itself and hand the parent
+package a value that lets it reach a store or the authz domain without ever importing either directly —
+may import the official SDK, the REST handler package, the auth and platform packages, contracts, chi,
+and stdlib — never the Postgres adapter, sqlcgen, the authz domain, or any application service package.
+With that ban in place the adapter cannot reach a store or render an
+authorization verdict except through an HTTP handler it did not write itself. Second, a twin-registration
+test: every tool in the table must name a "METHOD /path" that is a real, registered route — a tool
+without a registered HTTP route cannot be declared. A third, narrower guarantee pins the wire contract
+itself: `tools/list`'s exact JSON (names, descriptions, annotations, schemas) is checked byte-for-byte
+against a committed golden, the same update-on-purpose discipline the route table's own golden already
+uses — an edit to a tool's name, description, or schema requires a deliberate golden update in the same
+change, never a silent drift.
+
+### 43.10 Contracts
+
+Tool INPUT shapes are new, independent `$def`s in the existing wire-contracts document, named with the
+`*Request` suffix so the existing suffix-based direction convention classifies them client-to-platform
+with no checker change — and passed to the SDK VERBATIM, never reflected from a Go type, so the schema a
+client sees is byte-derived from the same contracts document every REST DTO already is. A tool's INPUT
+schema states its REAL value-space constraints (`enum`, `minimum`, `format:"uuid"`,
+`additionalProperties:false`) directly, matching the REST route's own REJECTION bounds where the route
+has one -- deliberately no `maximum` on `limit` (tools/contractscompat's own closed keyword allowlist
+does not recognize it yet, and the REST route does not reject an over-large limit either, only clamps
+it, so a hard `maximum` here would make this contract reject a value REST itself accepts). (A
+prior revision of this section argued for narrowing these to the bare wire TYPE, on the premise that the
+pinned SDK's own generic argument validation would otherwise enforce the same constraint a second, more
+generic way before the twin ever saw it — that premise does not hold for the low-level
+`Server.AddTool(*Tool, ToolHandler)` path this Step actually uses, which validates nothing itself; §43.8
+covers the validation layer this Step provides instead, once, in one place). Because these three `$def`s
+are new in this same Step, stating the real constraints from the start costs nothing in wire-contract
+compatibility terms (a later PR adding `enum`/`minimum` to an ALREADY-published client-to-platform
+`*Request` shape would be a MAJOR change; declaring it here, before anything has shipped, is not).
+Tool OUTPUT shapes are NOT new `$def`s: they reuse the existing REST response shapes unchanged, bundled
+with their own transitively-referenced `$def`s into one self-contained document at boot, with a root
+`"type":"object"` added alongside `$ref` — no hand-written output shape anywhere, matching the
+wire-contracts document's own long-standing rule, and satisfying the legacy MCP protocol revisions this
+server also speaks, which restrict `Tool.outputSchema` to `type:"object"` at the root.
+
+### 43.11 Feature flag
+
+A boolean environment variable, optional, default false, parsed with the same "empty means unset, parse
+only when present, reject anything the parser does not recognize" idiom every sibling boolean flag in
+this codebase already uses. The gate gets its own chi middleware, mounted SECOND in the route group's own
+chain — after the Origin gate (§43.2/§43.6: an invalid Origin is refused 403 unconditionally, whatever
+this flag's value, so no later gate including this one may run first) — answering 503 with the same body
+every other disabled-capability gate in this codebase already answers with. Because the route is mounted
+unconditionally, the route table, the guide-omission register, and the wire-contracts compatibility check
+all see the same table whether the flag is on or off. 181 does not change this default; enabling the
+surface is a per-deployment operator act.
+
+### 43.12 Tests
+
+Unit tests, without Postgres: the version gate's own refusal (message naming every supported version,
+`id` echoed or `null`), the legacy `initialize` handshake (counter-offer for an unsupported version,
+exact echo for a supported one, and a following call succeeding with no session id at all), the header/
+`_meta` validation cases the pinned SDK itself enforces, `server/discover`'s advertised capabilities, the
+outcome-mapping table (§43.8) exercised directly, both structural guards (§43.9), and the tool-list
+golden. Integration tests, against a real Postgres-backed rig: the same parity table over every role
+(viewer through admin) this repository's own REST integration tests already establish for the identical
+routes — the MCP call and the HTTP call must agree on status-shape and body for every one of them,
+including the two rows that pin this codebase's own existing behavior rather than inventing a stricter
+one for MCP alone: a session created by one member is visible to another member under `filter:"all"`,
+and `narvi_get_session` on another user's session succeeds, because there is no per-session visibility
+concept in this codebase today. Every repo-wide guard that must stay green with no edits beyond the ones
+this row makes: the route-table golden (both directions), the guide-omission register, the wire-contracts
+compatibility check (MINOR only), and `go test -race ./...`.

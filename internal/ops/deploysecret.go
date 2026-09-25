@@ -117,6 +117,7 @@ var probeValuesByVar = map[string]string{
 	"NARVI_OBJECT_STORE_USE_PATH_STYLE":           "true",
 	"NARVI_EPISTEMIC_CHECK_DEFAULT":               "true",
 	"NARVI_SHADOW_MODE":                           "true",
+	"NARVI_MCP_ENABLED":                           "true",
 	"NARVI_LOG_LEVEL":                             "info",
 	"NARVI_ROLLOUT_MODE":                          "open",
 	"NARVI_INGRESS_ENABLED":                       "github,linear,slack",

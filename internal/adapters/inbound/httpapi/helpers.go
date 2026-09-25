@@ -21,6 +21,18 @@ import (
 // prompt string).
 const maxRequestBodyBytes = 1 << 20 // 1 MiB
 
+// MaxRequestBodyBytes is maxRequestBodyBytes, exported (technical plan
+// §43, "the MCP surface") so internal/adapters/inbound/mcp's
+// own mcp.StreamableHTTPOptions.MaxRequestBodyBytes can reference the SAME
+// figure instead of a second, independently-drifting 1 MiB literal --
+// this package's own many internal r.Body = http.MaxBytesReader(...,
+// maxRequestBodyBytes) call sites are deliberately left referring to the
+// unexported name unchanged; only a new name is added here, cross-
+// referencing the one already-existing literal above rather than
+// touching every one of those call sites for a rename with no behavior
+// change.
+const MaxRequestBodyBytes = maxRequestBodyBytes
+
 // parseSessionID parses chi's own "sessionID" URL path param as a UUID,
 // writing a 400 response and returning ok=false on failure. REST callers
 // get a plain, idiomatic Bad Request for a malformed path segment here,

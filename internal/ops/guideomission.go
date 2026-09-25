@@ -148,6 +148,10 @@ var RouteGuideExemptions = []RouteGuideExemption{
 		Route:  "GET /sessions/{sessionID}/uploads/{uploadID}/content",
 		Reason: "Sandbox-agent bearer route: the in-sandbox download_file tool reads back previously uploaded content here (httpapi/uploadcontent.go's UploadContent), never a browser -- distinct from its cookie-authenticated browser twin GET /api/sessions/{sessionID}/uploads/{uploadID}/content, already documented in web.md.",
 	},
+	{
+		Route:  "POST /mcp",
+		Reason: "MCP protocol endpoint (internal/adapters/inbound/mcp, technical plan §43): a JSON-RPC Streamable HTTP surface whose commands are MCP tools, not routes, consumed by an MCP client a user configures rather than a browser page. The connection procedure belongs to a later OAuth/resource-server guide, not this one; it cannot be a per-surface guide file until mcp is a sessions.spawn_source value (TestNoGuideDrift's own guide-surface rule), which a later change may or may not add. Cookie-authenticated exactly like every /api/** route today -- disabled by default (NARVI_MCP_ENABLED) and not reachable by any off-the-shelf MCP client until a real bearer credential exists.",
+	},
 }
 
 // minExemptionReasonLen is the length floor validateRouteGuideExemptions

@@ -1,0 +1,526 @@
+[
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List every model this deployment's catalog offers (provider, context window, cost, reasoning-effort variants) -- the same catalog GET /api/models returns. Read-only; every authenticated role may call it.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "description": "The narvi_list_models MCP tool's own input (technical plan §43.4) -- the tool bridge's twin of GET /api/models, which takes no query parameters at all, so this is an intentionally empty object shape. A real $def (never an inline {} literal) so the wire inputSchema every narvi_list_models tools/list response carries is byte-derived from /contracts like every other tool input, per the *Request-suffix client-to-platform convention every existing request shape here already follows (tools/contractscompat's own by-suffix direction rule).",
+      "type": "object"
+    },
+    "name": "narvi_list_models",
+    "outputSchema": {
+      "$defs": {
+        "ModelCatalog": {
+          "additionalProperties": false,
+          "description": "Response body for GET /api/models -- §8.8's own 'Catalog' deliverable (§8 item 8; §29; §25.2). STRUCTURAL DECISION, named here since §29 leaves it open: sourced from a control-plane-embedded snapshot of OpenCode's own GET /provider catalog (live-verified against the pinned OpenCode 1.17.15 binary during this Step's own implementation), NOT a live per-sandbox proxy -- the control-plane image does not ship the OpenCode binary (§29.9's own identical reasoning for why the ChatGPT device-flow client is a direct CP-side adapter rather than brokered through a spawned sandbox), so there is no running OpenCode server this endpoint could query live even if it wanted to. This is the SAME 'pinned known-good set' convention §7 already established for the sandbox-side per-turn fallback (the opencode adapter's own resolveProviderModel/fallbackModel), applied here as the control plane's ONLY source rather than a fallback of last resort -- refreshed by hand whenever the pinned OpenCode version bumps, exactly like that fallback constant already is. Scope: the 3 providers §25.1 already wires credential injection for (google/anthropic/openai) -- every model id is the exact catalog id OpenCode itself recognizes, usable verbatim as the '\u003cproviderId\u003e/\u003cmodelId\u003e' string modelId/buildModelId/effort/buildEffort already accept end to end today (§25.1's own 'no Narvi-side allowlist' passthrough, unchanged by this catalog's existence -- it is a discovery aid, never a validating allowlist).",
+          "properties": {
+            "providers": {
+              "items": {
+                "$ref": "#/$defs/ModelCatalogProvider"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "providers"
+          ],
+          "type": "object"
+        },
+        "ModelCatalogCost": {
+          "additionalProperties": false,
+          "properties": {
+            "cacheRead": {
+              "description": "USD per million cache-read tokens when this model supports prompt caching; null otherwise.",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "cacheWrite": {
+              "description": "USD per million cache-write tokens when this model supports prompt caching; null otherwise.",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "input": {
+              "description": "USD per million input tokens.",
+              "type": "number"
+            },
+            "output": {
+              "description": "USD per million output tokens.",
+              "type": "number"
+            }
+          },
+          "required": [
+            "input",
+            "output"
+          ],
+          "type": "object"
+        },
+        "ModelCatalogModel": {
+          "additionalProperties": false,
+          "properties": {
+            "contextWindow": {
+              "description": "Total context window, in tokens.",
+              "type": "integer"
+            },
+            "cost": {
+              "$ref": "#/$defs/ModelCatalogCost"
+            },
+            "id": {
+              "description": "The catalog model id, e.g. \"gpt-5.3-codex-spark\" -- combine with the owning ModelCatalogProvider.id and a \"/\" to get the exact modelId/buildModelId string this Step's own generic passthrough already accepts.",
+              "type": "string"
+            },
+            "name": {
+              "description": "Human-readable display name.",
+              "type": "string"
+            },
+            "reasoning": {
+              "description": "Whether this model exposes a reasoning-effort dial at all -- OpenCode's own catalog capabilities.reasoning. False means variants is always empty for this model: effort has nothing to override.",
+              "type": "boolean"
+            },
+            "toolCall": {
+              "description": "Whether this model supports tool calling -- OpenCode's own catalog capabilities.toolcall.",
+              "type": "boolean"
+            },
+            "variants": {
+              "description": "The valid effort/buildEffort override values for THIS model, e.g. [\"none\",\"low\",\"medium\",\"high\",\"xhigh\"] for an OpenAI reasoning model, or [\"high\",\"max\"] for anthropic/claude-sonnet-4-5 (both live-verified during this Step) -- owned per-model by OpenCode's own catalog (§29.8), never a Narvi-side enum. The composer's own model/effort selector (§12.2 item 1, Phase 7) reads this list to populate its effort dropdown once a model is chosen.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "id",
+            "name",
+            "contextWindow",
+            "toolCall",
+            "reasoning",
+            "variants",
+            "cost"
+          ],
+          "type": "object"
+        },
+        "ModelCatalogProvider": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "description": "The catalog provider id, e.g. \"openai\" -- the exact string used as the '\u003cproviderId\u003e/...' prefix, matching internal/domain/providercredential.Provider's own values.",
+              "type": "string"
+            },
+            "models": {
+              "items": {
+                "$ref": "#/$defs/ModelCatalogModel"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "id",
+            "models"
+          ],
+          "type": "object"
+        }
+      },
+      "$ref": "#/$defs/ModelCatalog",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List this deployment's sessions -- the same list GET /api/sessions returns. filter:\"mine\" (the default) returns sessions the caller created or joined; filter:\"all\" returns EVERY unarchived session on the deployment, regardless of who created it -- there is no per-session visibility restriction in this codebase today. limit bounds how many are returned (server-side default and cap apply when omitted or too large).",
+    "inputSchema": {
+      "additionalProperties": false,
+      "description": "The narvi_list_sessions MCP tool's own input (technical plan §43.7) -- the tool bridge's twin of GET /api/sessions?filter=\u0026limit=, mirroring that route's own two optional query parameters exactly (httpapi/listsessions.go: filter defaults \"mine\" when omitted, limit defaults listSessionsDefaultLimit and is capped at listSessionsMaxLimit server-side). Both fields are optional; the bridge builds the twin's own url.Values from whichever of these two the caller actually set, omitting the rest so the handler's own defaulting behavior runs unchanged. filter/limit carry the REAL value-space constraints below, validated by this package's own bridge (internal/adapters/inbound/mcp/schemas.go's validateArguments) before either BuildRequest or the twin ever sees an argument -- a prior revision of this $def deliberately omitted \"enum\"/\"minimum\" on the mistaken premise that the pinned MCP SDK's own raw Server.AddTool path enforced them; it enforces nothing on that path, so the omission bought no parity benefit, only a weaker contract.",
+      "properties": {
+        "filter": {
+          "description": "Matches GET /api/sessions's own ?filter= values exactly (httpapi/listsessions.go) -- \"mine\" (the default when omitted) or \"all\". A value outside this enum fails validation before the twin is ever invoked, and is reported as a tool execution error (isError:true), never a JSON-RPC protocol code -- see doc.go's own HTTP-outcome-to-MCP-outcome table.",
+          "enum": [
+            "mine",
+            "all"
+          ],
+          "type": "string"
+        },
+        "limit": {
+          "description": "Matches GET /api/sessions's own ?limit= exactly (httpapi.listSessionsDefaultLimit/listSessionsMaxLimit): omitted means the route's own default. minimum matches the REST route's own rejection (\u003c= 0 is refused, \"malformed limit\"). Deliberately NO \"maximum\" here, for two independent reasons: tools/contractscompat's own closed keyword allowlist does not recognize \"maximum\" yet (it fails closed on any schema node using it -- see that tool's own keywords.go), and a value above listSessionsMaxLimit is not actually a REST-route REJECTION either way -- like the REST route itself, it is silently clamped server-side, so declaring a hard \"maximum\" here would make this tool's own contract reject a value the REST route accepts, a real behavior divergence \"restore the real constraints\" is not asking for.",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "name": "narvi_list_sessions",
+    "outputSchema": {
+      "$defs": {
+        "AutomationReposElem": {
+          "additionalProperties": false,
+          "description": "Same shape as CreateSessionRequest's own inline repos item (name/url/branch) -- a REAL top-level $def here (unlike CreateSessionRequest.repos' own inline item schema, which go-jsonschema cannot be $ref'd across sibling $defs) so Automation/CreateAutomationRequest can both reference it directly.",
+          "properties": {
+            "branch": {
+              "description": "Null means create runs from the repo's default base branch.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "url",
+            "branch"
+          ],
+          "type": "object"
+        },
+        "ListSessionsResponse": {
+          "additionalProperties": false,
+          "description": "GET /api/sessions's own response body (§12.2 item 1's own sidebar/session-list addition -- no route existed for this before now). sessions is ordered most-recently-updated first (sessions.updated_at DESC), bounded by the request's own limit (default/max enforced server-side, never truly unbounded) -- no cursor pagination in this first cut, matching ArtifactsResponse/ListPlansResponse's own identical 'expected to stay small enough, deepen later if that stops being true' precedent immediately above.",
+          "properties": {
+            "sessions": {
+              "items": {
+                "$ref": "#/$defs/Session"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "sessions"
+          ],
+          "type": "object"
+        },
+        "Session": {
+          "additionalProperties": false,
+          "description": "Mirrors the sessions table (migrations/000004_sessions.up.sql). status/failureReason/spawnSource enums match session_status/session_failure_reason/session_spawn_source exactly. repos/sandboxStatus (§12.2 item 1's own GET /api/sessions list endpoint) are two additions to a DTO that otherwise predates them. buildModelId/buildEffort (§12.2 item 3, the plan-mode UI) are a THIRD, read-only addition: sessions.build_model_id/build_effort (migrations/000034_plan_mode.up.sql, 000063_turn_session_effort.up.sql) were write-only via CreateSessionRequest before this -- set once at session-creation time (meaningful only when planMode was true) and never surfaced back on any GET response, which left the plan-mode view (§12.2 item 3's own \"plan-model vs build-model split visible in header\") with no way to ever read back what CreateSessionRequest.buildModelId/buildEffort had written. This is the exact same shape as createdBy/repos above: an addition to a DTO that predates it, sourced from a column that already existed.",
+          "properties": {
+            "archived": {
+              "type": "boolean"
+            },
+            "buildEffort": {
+              "description": "The reasoning effort the approval-dispatched IMPLEMENTATION turn uses (or used), mirroring buildModelId immediately above and CreateSessionRequest.buildEffort's own doc comment.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "buildModelId": {
+              "description": "The model the approval-dispatched IMPLEMENTATION turn uses (or used), mirroring CreateSessionRequest.buildModelId's own doc comment exactly -- set once at session-creation time, meaningful only when this session was created with planMode true. Null means either 'use the default model catalog entry' or 'this session was never created under plan mode' -- the two are indistinguishable from this column alone, exactly like modelId's own existing null-means-default convention offers no way to distinguish 'explicit default' from 'never set' either.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "createdAt": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "createdBy": {
+              "description": "Null for bot/automation-created sessions with no direct human user.",
+              "format": "uuid",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "failureReason": {
+              "description": "Matches Postgres session_failure_reason exactly. Null except on a terminal non-completed path.",
+              "enum": [
+                "cancelled",
+                "failed",
+                "timeout",
+                "never_started",
+                null
+              ],
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "repos": {
+              "description": "This session's own repo list (sessions.repos, migrations/000018_session_repos.up.sql -- \"position 0 = primary; repos are always a list\"), set once at session-creation time and never mutated afterward. Same shape as AutomationReposElem/CreateSessionRequest.repos' own inline item -- reused here rather than a third near-identical inline copy.",
+              "items": {
+                "$ref": "#/$defs/AutomationReposElem"
+              },
+              "type": "array"
+            },
+            "sandboxStatus": {
+              "description": "Matches Postgres sandbox_status exactly (migrations/000006_sandboxes.up.sql). Null when this session has no sandbox row yet (e.g. status='created', never dispatched). Populated by GET /api/sessions (list) only, sourced from a LEFT JOIN against sandboxes -- GET /api/sessions/{id} always returns null here: the single-session view derives its own live boot/ready state from its own event stream instead (§6.1's typed events already carry 'ready'/'boot_progress' verbatim), never from a second, potentially-stale read of this column.",
+              "enum": [
+                "pending",
+                "spawning",
+                "connecting",
+                "booting",
+                "ready",
+                "snapshotting",
+                "suspect",
+                "stopped",
+                "failed",
+                null
+              ],
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "spawnSource": {
+              "description": "Matches Postgres session_spawn_source exactly.",
+              "enum": [
+                "web",
+                "slack",
+                "linear",
+                "github"
+              ],
+              "type": "string"
+            },
+            "status": {
+              "description": "Matches Postgres session_status exactly.",
+              "enum": [
+                "created",
+                "active",
+                "completed",
+                "failed",
+                "cancelled"
+              ],
+              "type": "string"
+            },
+            "title": {
+              "description": "Null until the session_title WS event (§6.1) sets it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "updatedAt": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "title",
+            "status",
+            "failureReason",
+            "archived",
+            "spawnSource",
+            "createdBy",
+            "createdAt",
+            "updatedAt",
+            "repos",
+            "sandboxStatus",
+            "buildModelId",
+            "buildEffort"
+          ],
+          "type": "object"
+        }
+      },
+      "$ref": "#/$defs/ListSessionsResponse",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Get one session's full detail by id -- the same detail GET /api/sessions/{sessionID} returns. Any authenticated role may read any session's detail; there is no per-session visibility restriction in this codebase today.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "description": "The narvi_get_session MCP tool's own input (technical plan §43.7) -- the tool bridge's twin of GET /api/sessions/{sessionID}, carrying the path parameter as a plain required field the bridge maps onto chi's own URLParams before invoking the twin handler in-process (technical plan §43.7's bridge).",
+      "properties": {
+        "sessionId": {
+          "description": "The session id, matching Session.id's own format exactly. \"format\":\"uuid\" is enforced by this package's own bridge (internal/adapters/inbound/mcp/schemas.go's validateArguments compiles this schema with format assertions on), so a malformed value never reaches the twin at all -- reported as a tool execution error (isError:true), not a JSON-RPC protocol code.",
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "type": "object"
+    },
+    "name": "narvi_get_session",
+    "outputSchema": {
+      "$defs": {
+        "AutomationReposElem": {
+          "additionalProperties": false,
+          "description": "Same shape as CreateSessionRequest's own inline repos item (name/url/branch) -- a REAL top-level $def here (unlike CreateSessionRequest.repos' own inline item schema, which go-jsonschema cannot be $ref'd across sibling $defs) so Automation/CreateAutomationRequest can both reference it directly.",
+          "properties": {
+            "branch": {
+              "description": "Null means create runs from the repo's default base branch.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "url",
+            "branch"
+          ],
+          "type": "object"
+        },
+        "Session": {
+          "additionalProperties": false,
+          "description": "Mirrors the sessions table (migrations/000004_sessions.up.sql). status/failureReason/spawnSource enums match session_status/session_failure_reason/session_spawn_source exactly. repos/sandboxStatus (§12.2 item 1's own GET /api/sessions list endpoint) are two additions to a DTO that otherwise predates them. buildModelId/buildEffort (§12.2 item 3, the plan-mode UI) are a THIRD, read-only addition: sessions.build_model_id/build_effort (migrations/000034_plan_mode.up.sql, 000063_turn_session_effort.up.sql) were write-only via CreateSessionRequest before this -- set once at session-creation time (meaningful only when planMode was true) and never surfaced back on any GET response, which left the plan-mode view (§12.2 item 3's own \"plan-model vs build-model split visible in header\") with no way to ever read back what CreateSessionRequest.buildModelId/buildEffort had written. This is the exact same shape as createdBy/repos above: an addition to a DTO that predates it, sourced from a column that already existed.",
+          "properties": {
+            "archived": {
+              "type": "boolean"
+            },
+            "buildEffort": {
+              "description": "The reasoning effort the approval-dispatched IMPLEMENTATION turn uses (or used), mirroring buildModelId immediately above and CreateSessionRequest.buildEffort's own doc comment.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "buildModelId": {
+              "description": "The model the approval-dispatched IMPLEMENTATION turn uses (or used), mirroring CreateSessionRequest.buildModelId's own doc comment exactly -- set once at session-creation time, meaningful only when this session was created with planMode true. Null means either 'use the default model catalog entry' or 'this session was never created under plan mode' -- the two are indistinguishable from this column alone, exactly like modelId's own existing null-means-default convention offers no way to distinguish 'explicit default' from 'never set' either.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "createdAt": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "createdBy": {
+              "description": "Null for bot/automation-created sessions with no direct human user.",
+              "format": "uuid",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "failureReason": {
+              "description": "Matches Postgres session_failure_reason exactly. Null except on a terminal non-completed path.",
+              "enum": [
+                "cancelled",
+                "failed",
+                "timeout",
+                "never_started",
+                null
+              ],
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "repos": {
+              "description": "This session's own repo list (sessions.repos, migrations/000018_session_repos.up.sql -- \"position 0 = primary; repos are always a list\"), set once at session-creation time and never mutated afterward. Same shape as AutomationReposElem/CreateSessionRequest.repos' own inline item -- reused here rather than a third near-identical inline copy.",
+              "items": {
+                "$ref": "#/$defs/AutomationReposElem"
+              },
+              "type": "array"
+            },
+            "sandboxStatus": {
+              "description": "Matches Postgres sandbox_status exactly (migrations/000006_sandboxes.up.sql). Null when this session has no sandbox row yet (e.g. status='created', never dispatched). Populated by GET /api/sessions (list) only, sourced from a LEFT JOIN against sandboxes -- GET /api/sessions/{id} always returns null here: the single-session view derives its own live boot/ready state from its own event stream instead (§6.1's typed events already carry 'ready'/'boot_progress' verbatim), never from a second, potentially-stale read of this column.",
+              "enum": [
+                "pending",
+                "spawning",
+                "connecting",
+                "booting",
+                "ready",
+                "snapshotting",
+                "suspect",
+                "stopped",
+                "failed",
+                null
+              ],
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "spawnSource": {
+              "description": "Matches Postgres session_spawn_source exactly.",
+              "enum": [
+                "web",
+                "slack",
+                "linear",
+                "github"
+              ],
+              "type": "string"
+            },
+            "status": {
+              "description": "Matches Postgres session_status exactly.",
+              "enum": [
+                "created",
+                "active",
+                "completed",
+                "failed",
+                "cancelled"
+              ],
+              "type": "string"
+            },
+            "title": {
+              "description": "Null until the session_title WS event (§6.1) sets it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "updatedAt": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "title",
+            "status",
+            "failureReason",
+            "archived",
+            "spawnSource",
+            "createdBy",
+            "createdAt",
+            "updatedAt",
+            "repos",
+            "sandboxStatus",
+            "buildModelId",
+            "buildEffort"
+          ],
+          "type": "object"
+        }
+      },
+      "$ref": "#/$defs/Session",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object"
+    }
+  }
+]

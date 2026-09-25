@@ -1,7 +1,7 @@
 {
   "name": "@narvi/contracts",
   "private": true,
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Codegen + typecheck for Narvi's wire contracts (/contracts, §6). Scoped npm project — does not make the repo root an npm project; phase 6 (the web UI) brings its own frontend package.",
   "type": "module",
   "scripts": {

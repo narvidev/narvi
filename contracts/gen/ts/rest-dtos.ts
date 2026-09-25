@@ -3164,3 +3164,38 @@ export interface AuthCapabilitiesResponse {
    */
   oidcConfigured: boolean;
 }
+/**
+ * The narvi_list_models MCP tool's own input (technical plan §43.4) -- the tool bridge's twin of GET /api/models, which takes no query parameters at all, so this is an intentionally empty object shape. A real $def (never an inline {} literal) so the wire inputSchema every narvi_list_models tools/list response carries is byte-derived from /contracts like every other tool input, per the *Request-suffix client-to-platform convention every existing request shape here already follows (tools/contractscompat's own by-suffix direction rule).
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "ListModelsToolRequest".
+ */
+export interface ListModelsToolRequest {}
+/**
+ * The narvi_list_sessions MCP tool's own input (technical plan §43.7) -- the tool bridge's twin of GET /api/sessions?filter=&limit=, mirroring that route's own two optional query parameters exactly (httpapi/listsessions.go: filter defaults "mine" when omitted, limit defaults listSessionsDefaultLimit and is capped at listSessionsMaxLimit server-side). Both fields are optional; the bridge builds the twin's own url.Values from whichever of these two the caller actually set, omitting the rest so the handler's own defaulting behavior runs unchanged. filter/limit carry the REAL value-space constraints below, validated by this package's own bridge (internal/adapters/inbound/mcp/schemas.go's validateArguments) before either BuildRequest or the twin ever sees an argument -- a prior revision of this $def deliberately omitted "enum"/"minimum" on the mistaken premise that the pinned MCP SDK's own raw Server.AddTool path enforced them; it enforces nothing on that path, so the omission bought no parity benefit, only a weaker contract.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "ListSessionsToolRequest".
+ */
+export interface ListSessionsToolRequest {
+  /**
+   * Matches GET /api/sessions's own ?filter= values exactly (httpapi/listsessions.go) -- "mine" (the default when omitted) or "all". A value outside this enum fails validation before the twin is ever invoked, and is reported as a tool execution error (isError:true), never a JSON-RPC protocol code -- see doc.go's own HTTP-outcome-to-MCP-outcome table.
+   */
+  filter?: 'mine' | 'all';
+  /**
+   * Matches GET /api/sessions's own ?limit= exactly (httpapi.listSessionsDefaultLimit/listSessionsMaxLimit): omitted means the route's own default. minimum matches the REST route's own rejection (<= 0 is refused, "malformed limit"). Deliberately NO "maximum" here, for two independent reasons: tools/contractscompat's own closed keyword allowlist does not recognize "maximum" yet (it fails closed on any schema node using it -- see that tool's own keywords.go), and a value above listSessionsMaxLimit is not actually a REST-route REJECTION either way -- like the REST route itself, it is silently clamped server-side, so declaring a hard "maximum" here would make this tool's own contract reject a value the REST route accepts, a real behavior divergence "restore the real constraints" is not asking for.
+   */
+  limit?: number;
+}
+/**
+ * The narvi_get_session MCP tool's own input (technical plan §43.7) -- the tool bridge's twin of GET /api/sessions/{sessionID}, carrying the path parameter as a plain required field the bridge maps onto chi's own URLParams before invoking the twin handler in-process (technical plan §43.7's bridge).
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "GetSessionToolRequest".
+ */
+export interface GetSessionToolRequest {
+  /**
+   * The session id, matching Session.id's own format exactly. "format":"uuid" is enforced by this package's own bridge (internal/adapters/inbound/mcp/schemas.go's validateArguments compiles this schema with format assertions on), so a malformed value never reaches the twin at all -- reported as a tool execution error (isError:true), not a JSON-RPC protocol code.
+   */
+  sessionId: string;
+}

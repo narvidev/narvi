@@ -110,6 +110,7 @@ POST /api/sessions/{sessionID}/ws-token
 POST /api/workflow-definitions
 POST /api/workflow-runs/{runId}/steps/{stepRunId}/decide
 POST /auth/logout
+POST /mcp
 POST /sessions/{sessionID}/automation-env-vars
 POST /sessions/{sessionID}/cloud-identity-config
 POST /sessions/{sessionID}/cloud-identity-token
