@@ -43,10 +43,10 @@ func TestMetadata_CacheLifetimeComesFromTimeouts(t *testing.T) {
 }
 
 // TestMetadata_Documents pins both discovery documents field by field
-// (technical plan §43.14): what they advertise, and -- as importantly --
-// what they must not (refresh tokens, revocation, registration, client ID
-// metadata documents, a jwks_uri, mcp:write) before the pieces that build
-// them exist.
+// (technical plan §43.14): what they advertise -- the refresh-token grant
+// and the RFC 7009 revocation endpoint included -- and, as importantly,
+// what they must not (registration, client ID metadata documents, a
+// jwks_uri, mcp:write) before the pieces that build them exist.
 func TestMetadata_Documents(t *testing.T) {
 	t.Parallel()
 
@@ -61,7 +61,7 @@ func TestMetadata_Documents(t *testing.T) {
 
 	asm := httptest.NewRecorder()
 	s.AuthorizationServerMetadata(asm, httptest.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server/oauth", nil))
-	const wantASM = `{"issuer":"https://narvi.example/oauth","authorization_endpoint":"https://narvi.example/oauth/authorize","token_endpoint":"https://narvi.example/oauth/token","scopes_supported":["mcp:read"],"response_types_supported":["code"],"response_modes_supported":["query"],"grant_types_supported":["authorization_code"],"token_endpoint_auth_methods_supported":["none"],"code_challenge_methods_supported":["S256"],"authorization_response_iss_parameter_supported":true}`
+	const wantASM = `{"issuer":"https://narvi.example/oauth","authorization_endpoint":"https://narvi.example/oauth/authorize","token_endpoint":"https://narvi.example/oauth/token","revocation_endpoint":"https://narvi.example/oauth/revoke","scopes_supported":["mcp:read"],"response_types_supported":["code"],"response_modes_supported":["query"],"grant_types_supported":["authorization_code","refresh_token"],"token_endpoint_auth_methods_supported":["none"],"revocation_endpoint_auth_methods_supported":["none"],"code_challenge_methods_supported":["S256"],"authorization_response_iss_parameter_supported":true}`
 	if got := asm.Body.String(); got != wantASM {
 		t.Errorf("authorization server metadata =\n %s\nwant\n %s", got, wantASM)
 	}
@@ -83,7 +83,7 @@ func TestMetadata_Documents(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
 			t.Fatalf("%s: not JSON: %v", name, err)
 		}
-		for _, absent := range []string{"jwks_uri", "revocation_endpoint", "registration_endpoint", "client_id_metadata_document_supported"} {
+		for _, absent := range []string{"jwks_uri", "registration_endpoint", "client_id_metadata_document_supported"} {
 			if _, ok := doc[absent]; ok {
 				t.Errorf("%s advertises %q, which this piece does not build", name, absent)
 			}

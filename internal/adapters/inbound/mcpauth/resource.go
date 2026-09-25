@@ -19,6 +19,7 @@ const (
 	authorizePath                     = issuerPath + "/authorize"
 	consentPath                       = issuerPath + "/consent"
 	tokenPath                         = issuerPath + "/token"
+	revokePath                        = issuerPath + "/revoke"
 	protectedResourceMetadataPrefix   = "/.well-known/oauth-protected-resource"
 	authorizationServerMetadataPrefix = "/.well-known/oauth-authorization-server"
 )
@@ -45,10 +46,11 @@ type Identifiers struct {
 	// AuthorizationServerMetadataURL is where the RFC 8414 document lives
 	// (path insertion of Issuer's path).
 	AuthorizationServerMetadataURL string
-	// AuthorizationEndpoint and TokenEndpoint are the two endpoints the
-	// authorization server metadata advertises.
+	// AuthorizationEndpoint, TokenEndpoint and RevocationEndpoint are the
+	// endpoints the authorization server metadata advertises.
 	AuthorizationEndpoint string
 	TokenEndpoint         string
+	RevocationEndpoint    string
 }
 
 // DeriveIdentifiers computes Identifiers from publicBaseURL. It fails only
@@ -74,6 +76,7 @@ func DeriveIdentifiers(publicBaseURL string) (Identifiers, error) {
 		AuthorizationServerMetadataURL: origin + authorizationServerMetadataPrefix + basePath + issuerPath,
 		AuthorizationEndpoint:          base + authorizePath,
 		TokenEndpoint:                  base + tokenPath,
+		RevocationEndpoint:             base + revokePath,
 	}, nil
 }
 

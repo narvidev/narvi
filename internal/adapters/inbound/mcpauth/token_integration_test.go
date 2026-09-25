@@ -24,7 +24,9 @@ func (r *asRig) approvedCode(t *testing.T, cookie string) (code, verifier string
 
 // TestToken_ExchangeIssuesWorkingToken is the happy path, both client
 // authentication forms: body client_id, and HTTP Basic with an empty
-// secret (what a standard OAuth library's auto-detection sends first).
+// secret (what a standard OAuth library's auto-detection sends first). The
+// response carries a refresh token beside the access token, and neither
+// plaintext is stored.
 func TestToken_ExchangeIssuesWorkingToken(t *testing.T) {
 	r := newASRig(t)
 	_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
@@ -53,8 +55,14 @@ func TestToken_ExchangeIssuesWorkingToken(t *testing.T) {
 			if got := r.callMCP(body.AccessToken); got != http.StatusOK {
 				t.Fatalf("/mcp with the new token: status %d, want 200", got)
 			}
+			if !strings.HasPrefix(body.RefreshToken, "narvi_mcp_rt_") || body.RefreshToken == body.AccessToken {
+				t.Fatalf("refresh_token = %q, want a narvi_mcp_rt_ token distinct from the access token", body.RefreshToken)
+			}
+			if rt := r.refreshRow(t, body.RefreshToken); rt.RotatedAt.Valid || strings.Join(rt.Scopes, ",") != "mcp:read" {
+				t.Fatalf("stored refresh token = %+v, want unrotated, holding the code's scopes", rt)
+			}
 			var stored int
-			if err := r.pool.QueryRow(context.Background(), `SELECT count(*) FROM mcp_oauth_access_tokens WHERE token_hash = $1`, body.AccessToken).Scan(&stored); err != nil || stored != 0 {
+			if err := r.pool.QueryRow(context.Background(), `SELECT (SELECT count(*) FROM mcp_oauth_access_tokens WHERE token_hash IN ($1, $2)) + (SELECT count(*) FROM mcp_oauth_refresh_tokens WHERE token_hash IN ($1, $2))`, body.AccessToken, body.RefreshToken).Scan(&stored); err != nil || stored != 0 {
 				t.Fatalf("plaintext token found in token_hash (%d rows, err %v): tokens must be stored hashed only", stored, err)
 			}
 		})
@@ -250,7 +258,8 @@ func TestToken_ClientAuthentication(t *testing.T) {
 		{"bearer header instead", nil, map[string]string{"Authorization": "Bearer x"}, http.StatusUnauthorized, "invalid_client", true},
 		{"no client at all", func(f url.Values) { f.Del("client_id") }, nil, http.StatusBadRequest, "invalid_client", false},
 		{"unknown client", func(f url.Values) { f.Set("client_id", "narvi_mcp_c_nope") }, nil, http.StatusBadRequest, "invalid_client", false},
-		{"refresh grant not built", func(f url.Values) { f.Set("grant_type", "refresh_token") }, nil, http.StatusBadRequest, "unsupported_grant_type", false},
+		{"unsupported grant type", func(f url.Values) { f.Set("grant_type", "client_credentials") }, nil, http.StatusBadRequest, "unsupported_grant_type", false},
+		{"refresh grant without a refresh token", func(f url.Values) { f.Set("grant_type", "refresh_token") }, nil, http.StatusBadRequest, "invalid_request", false},
 		{"grant_type missing", func(f url.Values) { f.Del("grant_type") }, nil, http.StatusBadRequest, "invalid_request", false},
 		{"code missing", func(f url.Values) { f.Del("code") }, nil, http.StatusBadRequest, "invalid_request", false},
 		{"repeated parameter", func(f url.Values) { f.Add("code", "x") }, nil, http.StatusBadRequest, "invalid_request", false},

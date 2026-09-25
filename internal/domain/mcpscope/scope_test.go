@@ -44,6 +44,40 @@ func TestSatisfies_Matrix(t *testing.T) {
 	}
 }
 
+// TestCovers_Matrix: narrowing is allowed, widening never is -- whatever
+// the requested set, a covered one grants nothing held did not.
+func TestCovers_Matrix(t *testing.T) {
+	t.Parallel()
+
+	const unknown = mcpscope.Scope("mcp:admin")
+	read, write := mcpscope.Read, mcpscope.Write
+	tests := []struct {
+		name      string
+		held      []mcpscope.Scope
+		requested []mcpscope.Scope
+		want      bool
+	}{
+		{"nothing held, nothing requested", nil, nil, true},
+		{"nothing held, read requested", nil, []mcpscope.Scope{read}, false},
+		{"read held, nothing requested", []mcpscope.Scope{read}, []mcpscope.Scope{}, true},
+		{"read held, read requested", []mcpscope.Scope{read}, []mcpscope.Scope{read}, true},
+		{"read held, write requested", []mcpscope.Scope{read}, []mcpscope.Scope{write}, false},
+		{"read held, read and write requested", []mcpscope.Scope{read}, []mcpscope.Scope{read, write}, false},
+		{"write held, read requested (narrowing through the hierarchy)", []mcpscope.Scope{write}, []mcpscope.Scope{read}, true},
+		{"write held, write requested", []mcpscope.Scope{write}, []mcpscope.Scope{write}, true},
+		{"unknown held covers nothing", []mcpscope.Scope{unknown}, []mcpscope.Scope{read}, false},
+		{"unknown requested is covered by nothing", []mcpscope.Scope{read, write}, []mcpscope.Scope{unknown}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := mcpscope.Covers(tc.held, tc.requested); got != tc.want {
+				t.Fatalf("Covers(%v, %v) = %v, want %v", tc.held, tc.requested, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestImplies(t *testing.T) {
 	t.Parallel()
 

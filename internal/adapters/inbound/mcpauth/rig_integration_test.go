@@ -103,6 +103,7 @@ func newASRig(t *testing.T) *asRig {
 		rt.Get("/consent", r.server.ConsentPage)
 		rt.Post("/consent", r.server.ConsentDecision)
 		rt.Post("/token", r.server.Token)
+		rt.Post("/revoke", r.server.Revoke)
 	})
 	router.Route("/mcp", func(rt chi.Router) {
 		rt.Use(auth.RequireMCPBearer(r.grants, auth.MCPBearerConfig{
@@ -319,6 +320,7 @@ type tokenBody struct {
 	TokenType        string `json:"token_type"`
 	ExpiresIn        int64  `json:"expires_in"`
 	Scope            string `json:"scope"`
+	RefreshToken     string `json:"refresh_token"`
 	Error            string `json:"error"`
 	ErrorDescription string `json:"error_description"`
 }
@@ -345,6 +347,54 @@ func (r *asRig) issueToken(t *testing.T, cookie string, scopes ...string) (token
 	}
 	body := decodeToken(t, rec)
 	return body.AccessToken, body.Scope
+}
+
+// issuePair runs one whole authorization flow approving exactly scopes and
+// returns the whole token response: the access token and the refresh token
+// issued beside it.
+func (r *asRig) issuePair(t *testing.T, cookie string, scopes ...string) tokenBody {
+	t.Helper()
+	verifier := newVerifier(t)
+	loc := r.approve(t, r.authorizeParams(verifier), cookie, scopes...)
+	rec := r.exchange(r.exchangeForm(loc.Query().Get("code"), verifier), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("exchange: status %d body %s", rec.Code, rec.Body.String())
+	}
+	body := decodeToken(t, rec)
+	if body.RefreshToken == "" {
+		t.Fatalf("exchange issued no refresh token: %s", rec.Body.String())
+	}
+	return body
+}
+
+// refreshForm is a valid refresh request for refreshToken from the rig's
+// client -- with no resource and no scope, exactly what a standard OAuth
+// library sends.
+func (r *asRig) refreshForm(refreshToken string) url.Values {
+	return url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refreshToken},
+		"client_id":     {r.client.ClientID},
+	}
+}
+
+// revoke posts form to the RFC 7009 revocation endpoint.
+func (r *asRig) revoke(form url.Values, headers map[string]string) *httptest.ResponseRecorder {
+	h := map[string]string{"Content-Type": "application/x-www-form-urlencoded"}
+	for k, v := range headers {
+		h[k] = v
+	}
+	return r.do(http.MethodPost, "/oauth/revoke", form.Encode(), h, "")
+}
+
+// refreshRow reads the refresh token row for plaintext (by its hash).
+func (r *asRig) refreshRow(t *testing.T, plaintext string) sqlcgen.McpOauthRefreshToken {
+	t.Helper()
+	row, err := r.grants.GetRefreshTokenByHash(context.Background(), platform.HashToken(plaintext))
+	if err != nil {
+		t.Fatalf("read refresh token row: %v", err)
+	}
+	return row
 }
 
 // callMCP presents token at the rig's bearer-protected /mcp.

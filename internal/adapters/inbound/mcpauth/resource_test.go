@@ -27,6 +27,7 @@ func TestDeriveIdentifiers(t *testing.T) {
 				AuthorizationServerMetadataURL: "https://narvi.example/.well-known/oauth-authorization-server/oauth",
 				AuthorizationEndpoint:          "https://narvi.example/oauth/authorize",
 				TokenEndpoint:                  "https://narvi.example/oauth/token",
+				RevocationEndpoint:             "https://narvi.example/oauth/revoke",
 			},
 		},
 		{
@@ -39,6 +40,7 @@ func TestDeriveIdentifiers(t *testing.T) {
 				AuthorizationServerMetadataURL: "https://narvi.example/.well-known/oauth-authorization-server/oauth",
 				AuthorizationEndpoint:          "https://narvi.example/oauth/authorize",
 				TokenEndpoint:                  "https://narvi.example/oauth/token",
+				RevocationEndpoint:             "https://narvi.example/oauth/revoke",
 			},
 		},
 		{
@@ -51,6 +53,7 @@ func TestDeriveIdentifiers(t *testing.T) {
 				AuthorizationServerMetadataURL: "http://127.0.0.1:52345/.well-known/oauth-authorization-server/oauth",
 				AuthorizationEndpoint:          "http://127.0.0.1:52345/oauth/authorize",
 				TokenEndpoint:                  "http://127.0.0.1:52345/oauth/token",
+				RevocationEndpoint:             "http://127.0.0.1:52345/oauth/revoke",
 			},
 		},
 		{
@@ -64,6 +67,7 @@ func TestDeriveIdentifiers(t *testing.T) {
 				AuthorizationServerMetadataURL: "https://narvi.example/.well-known/oauth-authorization-server/prefix/oauth",
 				AuthorizationEndpoint:          "https://narvi.example/prefix/oauth/authorize",
 				TokenEndpoint:                  "https://narvi.example/prefix/oauth/token",
+				RevocationEndpoint:             "https://narvi.example/prefix/oauth/revoke",
 			},
 		},
 	}

@@ -303,7 +303,10 @@ func captureErrorLog(t *testing.T) *errorLog {
 // 500 or an ERROR log line: client_id is refused like an unknown client
 // (an error page at authorize, never a redirect; invalid_client at
 // token, 401 with a Basic challenge when Basic was used), and state is
-// invalid_request, redirected without being echoed or stored.
+// invalid_request, redirected without being echoed or stored. The same
+// client_id rule holds at the revocation endpoint; a refresh token or a
+// token to revoke carrying such bytes is only ever hashed, so it is simply
+// one nobody holds.
 func TestOAuth_UnstorableBytesAreClientErrors(t *testing.T) {
 	r := newASRig(t)
 	_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
@@ -333,6 +336,26 @@ func TestOAuth_UnstorableBytesAreClientErrors(t *testing.T) {
 			rec := r.exchange(form, map[string]string{"Authorization": basic})
 			if rec.Code != http.StatusUnauthorized || decodeToken(t, rec).Error != "invalid_client" || rec.Header().Get("WWW-Authenticate") == "" {
 				t.Fatalf("status %d body %s WWW-Authenticate %q, want 401 invalid_client with a Basic challenge", rec.Code, rec.Body.String(), rec.Header().Get("WWW-Authenticate"))
+			}
+		})
+		t.Run("revoke body client_id "+url.QueryEscape(bad), func(t *testing.T) {
+			rec := r.revoke(url.Values{"token": {"narvi_mcp_at_x"}, "client_id": {bad}}, nil)
+			if rec.Code != http.StatusBadRequest || decodeToken(t, rec).Error != "invalid_client" {
+				t.Fatalf("status %d body %s, want 400 invalid_client", rec.Code, rec.Body.String())
+			}
+		})
+		t.Run("revoke token "+url.QueryEscape(bad), func(t *testing.T) {
+			// A token is only ever hashed, never stored or sent as TEXT:
+			// such bytes are just a token nobody holds.
+			rec := r.revoke(url.Values{"token": {bad}, "client_id": {r.client.ClientID}}, nil)
+			if rec.Code != http.StatusOK || rec.Body.Len() != 0 {
+				t.Fatalf("status %d body %q, want 200 and an empty body", rec.Code, rec.Body.String())
+			}
+		})
+		t.Run("refresh token "+url.QueryEscape(bad), func(t *testing.T) {
+			rec := r.exchange(r.refreshForm(bad), nil)
+			if rec.Code != http.StatusBadRequest || decodeToken(t, rec).Error != "invalid_grant" {
+				t.Fatalf("status %d body %s, want 400 invalid_grant", rec.Code, rec.Body.String())
 			}
 		})
 		t.Run("authorize state "+url.QueryEscape(bad), func(t *testing.T) {
