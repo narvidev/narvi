@@ -208,9 +208,16 @@ never has to.
 
 ### Ordering
 
-`reduceLog` (`src/ws/reducer.ts`) assumes `events.id` (a Postgres
-bigserial, strictly monotonic per session, assigned once at commit time)
-is causal order, and folds strictly in that order — never in network
+`reduceLog` (`src/ws/reducer.ts`) assumes `events.id` is causal order
+within a session. The id is a Postgres bigserial drawn from one
+table-wide sequence when the row is inserted, not when it commits; what
+makes it order is that within one session ids are allocated in commit
+order, because every insert takes the session row lock before drawing its
+id (`CreateEvent`, `internal/adapters/outbound/postgres/queries/events.sql`).
+So an event never becomes visible after a higher id of the same session
+has, which is also what lets a backfill ask only for ids above the
+highest one it holds without skipping any. `reduceLog` folds strictly in
+id order — never in network
 arrival order. This is safe because `EventLog.entries()` is always
 id-sorted by construction (`eventLog.ts`'s own `lowerBound`-based sorted
 insertion), regardless of the order `appendMany` was called in — which
