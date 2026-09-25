@@ -343,6 +343,23 @@ func TestParseRoutesRefusesOffGrammarLines(t *testing.T) {
 		{"trailing DEL", "GET /health\x7f\n", []string{"head line 1"}},
 		{"C1 control U+009B", "GET /health\u009b\n", []string{"head line 1"}},
 		{"bad line after a good one is refused at its own line", "GET /a\nGET /health\u00a0\n", []string{"head line 2"}},
+
+		// The method, the separator, and where a line starts.
+		{"leading space before the method", " GET /health\n", []string{"head line 1"}},
+		{"leading tab before the method", "\tGET /health\n", []string{"head line 1"}},
+		{"junk before the method", "xGET /health\n", []string{"head line 1"}},
+		{"empty method", " /health\n", []string{"head line 1"}},
+		{"double-space separator", "GET  /health\n", []string{"head line 1"}},
+		{"tab separator", "GET\t/health\n", []string{"head line 1"}},
+		{"no-break space separator", "GET\u00a0/health\n", []string{"head line 1"}},
+
+		// Blank lines at either end of the file: only ONE trailing newline
+		// ends the last line; nothing is trimmed beyond it.
+		{"trailing blank line at end of file", "GET /a\n\n", []string{"head line 2"}},
+		{"two trailing blank lines", "GET /a\n\n\n", []string{"head line 2", "head line 3"}},
+		{"whitespace-only last line", "GET /a\n \n", []string{"head line 2"}},
+		{"leading blank line", "\nGET /a\n", []string{"head line 1"}},
+		{"leading whitespace-only line", " \nGET /a\n", []string{"head line 1"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
