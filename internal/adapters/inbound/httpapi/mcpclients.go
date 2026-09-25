@@ -165,9 +165,9 @@ func CreateMCPClient(pool *pgxpool.Pool, clients *postgres.MCPOAuthClientStore, 
 
 // DeleteMCPClient backs DELETE /api/mcp-clients/{clientID} (technical plan
 // §43.15, clientID = the client's internal id): removes the client and, by
-// cascade, every authorization, pending request, code and access token
-// issued to it -- each affected user's client is refused on its very next
-// /mcp call. Admin only (authz.ActionManageIntegrations). Audited in the
+// cascade, every authorization, pending request, code, access token and
+// refresh token issued to it -- each affected user's client is refused on
+// its very next /mcp call. Admin only (authz.ActionManageIntegrations). Audited in the
 // same transaction: mcp_client.deleted, plus one mcp_authorization.revoked
 // (reason "client_deleted") per authorization the deletion took with it,
 // attributed to the administrator who deleted the client.

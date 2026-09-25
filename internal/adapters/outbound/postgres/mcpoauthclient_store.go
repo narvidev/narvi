@@ -75,7 +75,8 @@ func (s *MCPOAuthClientStore) LockKeyShare(ctx context.Context, id pgtype.UUID) 
 
 // Delete removes a client by internal id and returns the deleted row
 // (pgx.ErrNoRows when there was none). Every grant, pending authorization
-// request, code and access token issued to the client cascades with it.
+// request, code, access token and refresh token issued to the client
+// cascades with it.
 func (s *MCPOAuthClientStore) Delete(ctx context.Context, id pgtype.UUID) (sqlcgen.McpOauthClient, error) {
 	return s.q.DeleteMCPOAuthClient(ctx, id)
 }
