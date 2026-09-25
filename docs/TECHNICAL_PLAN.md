@@ -6619,7 +6619,7 @@ tools: `narvi_list_models`, `narvi_list_sessions`, `narvi_get_session` — the m
 this row's own exit criterion. It shipped cookie-authenticated and disabled by default (§43.11), usable
 only by a script client in this repository's own tests, because no off-the-shelf MCP client carries a
 browser cookie. Row 181 replaced the cookie with a bearer token from Narvi's own OAuth authorization
-server and made the tool list depend on the grant (§43.13–§43.19), which is what makes the surface
+server and made the tool list depend on the token's scopes (§43.13–§43.19), which is what makes the surface
 reachable by a real client. Everything past that is later rows' own work, not this section's: 182 adds
 result/verdict tools, bounded wait, and transcript paging; 183 adds plan read/approve/reject,
 prompt-while-running, stop, and delegate (create session). Repository discovery (`narvi_list_repositories`)
@@ -6631,8 +6631,8 @@ and the one-adapter rule (§43.7) means a tool ships only once its HTTP twin exi
 `POST /mcp` accepts only an `Authorization: Bearer` access token issued by Narvi's own authorization
 server (§43.13), verified on every call by `auth.RequireMCPBearer` (§43.16). The principal a tool handler
 sees is still `platform.UserFromContext(ctx)` — the same `AuthenticatedUser{ID, Role, Email}` every REST
-handler reads, derived from the same `users` row on every call — plus the grant the token was issued
-under, which only decides which tools are visible (§43.17). A refusal is the same generic
+handler reads, derived from the same `users` row on every call — plus the token's own scopes, fixed when
+the token was issued (§43.16), which only decide which tools are visible (§43.17). A refusal is the same generic
 `{"error":"unauthorized"}` 401 every other route answers, with a `WWW-Authenticate: Bearer` challenge
 pointing at the protected-resource metadata. In 180 this route sat behind the cookie middleware; that
 gate is gone, not kept alongside the bearer: one credential family per surface, one principal
@@ -6726,7 +6726,8 @@ and `_meta`'s own `serverInfo` — `{"name":"narvi","version":contracts.Version}
 bundle version is what a client can actually reason about (which DTO shapes it will get). `instructions`
 is one paragraph telling the model which tools it has, that they are read-only, and that `filter:"all"`
 on `narvi_list_sessions` lists every session on the deployment, not only the caller's own — composed per
-request from the tools the request's grant can see, so it never names a hidden one (§43.17). The legacy
+request from the tools the request's token can see (its own scopes, §43.16), so it never names a hidden one
+(§43.17). The legacy
 `initialize` handshake answers with the same `serverInfo`/`capabilities`.
 
 ### 43.6 Registration: where the endpoint mounts, and in what order
@@ -6757,8 +6758,8 @@ structurally (§43.9) rather than left to review discipline. A tool with no HTTP
 183's stop) is exactly the moment a real application service is needed, gaining its own HTTP twin or an
 explicit, reviewed exemption — never a shortcut around the bridge. Per-request server construction
 (one small `*mcp.Server` per HTTP request, built from the incoming request's own context) is the seam
-per-grant tool filtering uses: each request's server registers only the tools its grant's scopes
-satisfy, so a client that may not use a tool is never told the tool exists (§43.17).
+per-token tool filtering uses: each request's server registers only the tools its token's own scopes
+satisfy (§43.16), so a client that may not use a tool is never told the tool exists (§43.17).
 
 The synthesized `*http.Request` callTwin builds is assembled directly (a literal `&http.Request{...}`),
 never by parsing a request line from attacker-controlled text: an argument is substituted into the
@@ -6956,7 +6957,7 @@ missing `resource`, or one that is not this deployment's canonical resource afte
 folding, default-port elision and one trailing slash trimmed, is `invalid_target` (RFC 8707); any scope
 this build does not advertise is `invalid_scope`; a `state` over 512 bytes, a `state` that is not valid
 UTF-8 or carries a NUL byte, or any parameter repeated, is `invalid_request` (such a `client_id` is an
-unknown client: text Postgres cannot store is the caller's error, never a server fault). An absent or empty `scope` is legitimate: it asks for a scope-less grant (§43.17). A
+unknown client: text Postgres cannot store is the caller's error, never a server fault). An absent or empty `scope` is legitimate: it asks for a scope-less approval, whose token sees no tools (§43.17). A
 valid request is stored (`mcp_oauth_authorization_requests`, expiring after
 `MCPAuthorizationRequestTTL`) and the browser is redirected to `/oauth/consent?request=<id>` — through
 `/sign-in?next=` first when it carries no valid session. Only the request id travels through sign-in,
@@ -7093,8 +7094,8 @@ at most once per `MCPGrantLastUsedWriteInterval`, and a failure to write it is l
 the call.
 
 A token never does more than its user: the role is re-read on every call, the tools run the same REST
-twins with the same `authz.Authorize` check as a browser (§43.7), and the grant only ever subtracts
-(§43.17). The synthesized request a tool hands its twin carries no header at all, so the bearer token is
+twins with the same `authz.Authorize` check as a browser (§43.7), and the token's scopes only ever
+subtract (§43.17). The synthesized request a tool hands its twin carries no header at all, so the bearer token is
 never passed through. A user whose role is later narrowed keeps any grant already consented to, but
 every call is still governed by the narrowed role.
 
@@ -7105,7 +7106,8 @@ of 180's), `mcp:write` will cover every state-changing tool and implies `mcp:rea
 — in `scopes_supported`, in the 401 challenge, and as acceptable at the authorization endpoint — only
 when at least one registered tool requires it, so today exactly `mcp:read` is offered and `mcp:write` is
 refused as `invalid_scope`; no contract promises a scope nothing consumes. Repository restriction is not
-a scope string: a per-grant repository allowlist, enforced as an argument-level precondition on tools
+a scope string: a per-token repository allowlist, fixed at issuance like the token's scopes (§43.16) and
+enforced as an argument-level precondition on tools
 that name a repository, is reserved for the first such tool.
 
 Each tool declares the scope it requires, and the per-request server (§43.7) registers **only** the tools
@@ -7116,8 +7118,8 @@ exists:
 - `tools/call` naming a hidden tool answers the SDK's own `-32602` "unknown tool" error, byte-identical
   to a name that never existed — never an `insufficient_scope` that would confirm the tool is there;
 - `instructions` is composed from the visible tools only, and names none when none are visible;
-- a request that reaches the handler without both a principal and a grant (a mounting defect) gets a
-  server with no tools at all.
+- a request that reaches the handler without both a principal and a `platform.MCPGrant` carrying its
+  token's scopes (a mounting defect) gets a server with no tools at all.
 
 The 401 challenge's `scope` is every advertised scope; the person at the consent screen, not the client,
 decides how much to grant. Role does not gate discovery today — every read tool is open to every role,
