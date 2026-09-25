@@ -231,6 +231,10 @@ func TestToken_ClientAuthentication(t *testing.T) {
 	basic := func(id, secret string) string {
 		return "Basic " + base64.StdEncoding.EncodeToString([]byte(url.QueryEscape(id)+":"+url.QueryEscape(secret)))
 	}
+	// A second, real client: the disagreement row below needs both ids to
+	// exist, or the answer would be the unknown-client refusal whatever
+	// the agreement check does.
+	other := r.newClient(t, "narvi_mcp_c_other", "Other App", loopbackRedirect)
 
 	tests := []struct {
 		name        string
@@ -242,7 +246,7 @@ func TestToken_ClientAuthentication(t *testing.T) {
 	}{
 		{"client_secret in body", func(f url.Values) { f.Set("client_secret", "s") }, nil, http.StatusBadRequest, "invalid_client", false},
 		{"basic with a secret", func(f url.Values) { f.Del("client_id") }, map[string]string{"Authorization": basic(r.client.ClientID, "s")}, http.StatusUnauthorized, "invalid_client", true},
-		{"basic disagrees with body", nil, map[string]string{"Authorization": basic("narvi_mcp_c_other", "")}, http.StatusUnauthorized, "invalid_client", true},
+		{"basic disagrees with body", func(f url.Values) { f.Set("client_id", other.ClientID) }, map[string]string{"Authorization": basic(r.client.ClientID, "")}, http.StatusUnauthorized, "invalid_client", true},
 		{"bearer header instead", nil, map[string]string{"Authorization": "Bearer x"}, http.StatusUnauthorized, "invalid_client", true},
 		{"no client at all", func(f url.Values) { f.Del("client_id") }, nil, http.StatusBadRequest, "invalid_client", false},
 		{"unknown client", func(f url.Values) { f.Set("client_id", "narvi_mcp_c_nope") }, nil, http.StatusBadRequest, "invalid_client", false},
