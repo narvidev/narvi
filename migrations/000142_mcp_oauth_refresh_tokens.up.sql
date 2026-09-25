@@ -24,9 +24,10 @@
 -- both unchanged into the token it issues; every token a refresh issues
 -- expires by chain_expires_at (or by the grant's own expiry, if that comes
 -- first). A later consent for the same client renews the grant row in
--- place -- its expiry and its resource -- so reading either from the grant
+-- place -- its expiry and its resource -- so taking either from the grant
 -- at a refresh would let that consent extend, or rebind, a chain an
--- earlier consent began. Neither is read from it.
+-- earlier consent began. Neither is taken from it: the grant's resource
+-- is never read at a refresh, and its expiry only ever limits the chain.
 --
 -- Rotation: every refresh replaces the token presented. rotated_at marks
 -- it used and superseded_by names the token that replaced it (NULL once

@@ -244,13 +244,19 @@ type UpsertMCPOAuthGrantParams struct {
 // once). The row's scopes are the most recent approval, for display
 // only: no authorization decision reads them -- every code, access token
 // and refresh token carries its own scopes, fixed at issuance. Nor does a
-// refresh read the row's resource or expiry: a refresh chain carries its
-// own resource and its own end (chain_expires_at), copied when the chain
-// began and never renewed. So this update can neither widen nor narrow a
-// credential issued earlier, and neither extends nor rebinds a refresh
-// chain an earlier consent began: it renews the grant, and the chains
-// this consent's own code will begin. created_at keeps the first
-// approval's time.
+// refresh read the row's resource: a refresh chain carries its own
+// resource and its own end (chain_expires_at), copied when the chain
+// began and never renewed. A refresh does read the row's expiry, only
+// ever as a limit: it refuses once the grant has expired, and caps every
+// token it issues at the grant's expiry as well as the chain's end. So
+// this update can neither widen nor narrow a credential's scopes, and
+// neither extends nor rebinds a refresh chain an earlier consent began:
+// it renews the grant, and the chains this consent's own code will begin.
+// Renewing normally moves the expiry later, past every older chain's own
+// end, so no chain is shortened either; but an expiry written earlier
+// than before -- MCPGrantMaxLifetime lowered since the last consent --
+// caps, and then ends, every chain under the grant (technical plan
+// §43.16). created_at keeps the first approval's time.
 func (q *Queries) UpsertMCPOAuthGrant(ctx context.Context, arg UpsertMCPOAuthGrantParams) (McpOauthGrant, error) {
 	row := q.db.QueryRow(ctx, upsertMCPOAuthGrant,
 		arg.UserID,
