@@ -19,7 +19,8 @@
 // the session row only through the foreign-key check, which runs after
 // the id is drawn. Such a writer drew id N, blocked on the actor's lock,
 // and committed after the actor's own later event N+1. These tests hold
-// that open window deliberately and assert on which id each side gets.
+// that open window deliberately and assert on which id each side gets,
+// or on whether the waiting writer has drawn one yet.
 //
 // Waiting is always on observed state -- the writer's own backend showing
 // an ungranted lock in pg_locks -- never on elapsed time.
@@ -164,6 +165,23 @@ func waitUntilBackendWaitsOnLock(ctx context.Context, t *testing.T, observer *pg
 	}
 }
 
+// eventsIDSequenceLastValue reads last_value of the sequence behind
+// events.id, resolved with pg_get_serial_sequence rather than named. A
+// sequence is not transactional, and events.id is a BIGSERIAL (CACHE 1),
+// so this is the last id any writer has drawn, committed or not.
+func eventsIDSequenceLastValue(ctx context.Context, t *testing.T, pool *pgxpool.Pool) int64 {
+	t.Helper()
+	var sequence string
+	if err := pool.QueryRow(ctx, `SELECT pg_get_serial_sequence('events', 'id')`).Scan(&sequence); err != nil {
+		t.Fatalf("resolve the sequence behind events.id: %v", err)
+	}
+	var lastValue int64
+	if err := pool.QueryRow(ctx, `SELECT last_value FROM `+sequence).Scan(&lastValue); err != nil {
+		t.Fatalf("read last_value of %s: %v", sequence, err)
+	}
+	return lastValue
+}
+
 func eventParams(sessionID pgtype.UUID, eventType, messageID string) sqlcgen.CreateEventParams {
 	return sqlcgen.CreateEventParams{
 		SessionID: sessionID,
@@ -234,11 +252,18 @@ func TestEventStore_CreateAllocatesIDAfterOpenSessionTxCommits(t *testing.T) {
 
 // TestEventStore_CreateSerializesNonActorWriters: two outside writers on
 // one session. The first holds its insert in an open transaction (upload
-// confirm's shape: more statements follow before commit); the second must
-// be observed queued behind it, and so draws the higher id. Without the
-// wait, the second could commit first with a higher id while the first's
-// lower id is still invisible -- the same skip, between two writers
-// neither of which is the actor.
+// confirm's shape: more statements follow before commit). The second must
+// be observed waiting on a lock while the events id sequence still stands
+// at the first writer's id: it queued on the session BEFORE drawing an id.
+//
+// That, and not "the second gets the higher id", is what this proves: the
+// first drew its id before the second started, so the second's id is
+// higher whatever the query does. The property matters for a writer that
+// draws first and locks after (say, a session-row lock taken after the
+// INSERT): it also waits here, but two such writers racing can draw N and
+// N+1 and take the lock in the opposite order, so N+1 commits while N is
+// still invisible -- the same skip, between two writers neither of which
+// is the actor.
 func TestEventStore_CreateSerializesNonActorWriters(t *testing.T) {
 	for _, writer := range outsideEventWriters() {
 		t.Run(writer.name, func(t *testing.T) {
@@ -265,18 +290,22 @@ func TestEventStore_CreateSerializesNonActorWriters(t *testing.T) {
 				_ = g.Wait()
 			}()
 
-			writerDone, second := startOutsideWrite(gctx, g, create, eventParams(sessionID, "shadow_egress_suppressed", "second-writer"))
+			writerDone, _ := startOutsideWrite(gctx, g, create, eventParams(sessionID, "shadow_egress_suppressed", "second-writer"))
 			waitUntilBackendWaitsOnLock(ctx, t, pool, pid, writerDone)
+
+			// The second writer is blocked and cannot move until tx1
+			// commits below, so this read cannot race its nextval.
+			if lastValue := eventsIDSequenceLastValue(ctx, t, pool); lastValue != firstRow.ID {
+				t.Fatalf("while the second writer waits, the events id sequence stands at %d, not the first writer's id %d: "+
+					"the second drew its id before queuing on the session, so two such writers can commit out of id order",
+					lastValue, firstRow.ID)
+			}
 
 			if err := tx1.Commit(ctx); err != nil {
 				t.Fatalf("commit first writer tx: %v", err)
 			}
 			if err := g.Wait(); err != nil {
 				t.Fatalf("second writer: %v", err)
-			}
-
-			if second.ID <= firstRow.ID {
-				t.Fatalf("second writer's id %d <= first writer's id %d, but the first committed first", second.ID, firstRow.ID)
 			}
 		})
 	}
