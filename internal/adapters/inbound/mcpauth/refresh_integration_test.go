@@ -38,6 +38,29 @@ func captureWarnLog(t *testing.T) *errorLog {
 	return l
 }
 
+// rebindGrant makes the write a consent for the rig's client makes
+// (consent.go's own UpsertGrant) with resource in place of this
+// deployment's: what a replica at another PublicBaseURL sharing this
+// database, as during a move of the deployment, records for the user's
+// one grant. It returns the grant's id, which must be the same row's.
+func (r *asRig) rebindGrant(t *testing.T, userID pgtype.UUID, resource string) string {
+	t.Helper()
+	g, err := r.grants.UpsertGrant(context.Background(), sqlcgen.UpsertMCPOAuthGrantParams{
+		UserID:    userID,
+		ClientID:  r.client.ID,
+		Scopes:    []string{"mcp:read"},
+		Resource:  resource,
+		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(platform.DefaultTimeouts().MCPGrantMaxLifetime), Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("rebind the grant to %s: %v", resource, err)
+	}
+	if g.Resource != resource {
+		t.Fatalf("grant resource after the rebinding consent = %q, want %q", g.Resource, resource)
+	}
+	return g.ID.String()
+}
+
 // refreshWith posts form to the token endpoint and decodes the answer.
 func (r *asRig) refreshWith(t *testing.T, form url.Values) (*httptest.ResponseRecorder, tokenBody) {
 	t.Helper()
@@ -402,7 +425,11 @@ func TestRefresh_CannotWidenScope(t *testing.T) {
 // for another resource refreshes nothing -- the chain's own resource,
 // fixed when it began, never the grant's: a later consent that rebinds
 // the grant to this deployment in place does not revive the chain (the
-// round-1 review's resource case). A refusal spends nothing.
+// round-1 review's resource case). A refusal spends nothing. And a code
+// exchanged after a later consent rebound the grant elsewhere begins a
+// chain bound to the code's resource, never the grant's, which refreshes
+// here (the round-2 review; TestRefresh_ChainLifetimeFixedAtIssuance
+// proves the same of a rotation).
 func TestRefresh_ResourceMustMatch(t *testing.T) {
 	r := newASRig(t)
 	user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
@@ -456,6 +483,23 @@ func TestRefresh_ResourceMustMatch(t *testing.T) {
 	}
 	if ids := r.grantIDs(t, user.ID); len(ids) != 1 {
 		t.Fatalf("grants after the refused refreshes = %v, want the one grant, not revoked", ids)
+	}
+
+	// A code issued here, then a consent through a replica at another
+	// PublicBaseURL, inside the code's lifetime, rebinds the grant there.
+	verifier := newVerifier(t)
+	code := r.approve(t, r.authorizeParams(verifier), cookie, "mcp:read").Query().Get("code")
+	r.rebindGrant(t, user.ID, "http://other.test/mcp")
+	rec = r.exchange(r.exchangeForm(code, verifier), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("exchanging this deployment's code after the grant was rebound: status %d body %s, want 200", rec.Code, rec.Body.String())
+	}
+	exchanged := decodeToken(t, rec)
+	if got := r.refreshRow(t, exchanged.RefreshToken).Resource; got != rigBase+"/mcp" {
+		t.Fatalf("the exchange's refresh token is bound to %q, want the code's %q", got, rigBase+"/mcp")
+	}
+	if rec, _ := r.refreshWith(t, r.refreshForm(exchanged.RefreshToken)); rec.Code != http.StatusOK {
+		t.Fatalf("refreshing the chain the exchange began: status %d body %s, want 200", rec.Code, rec.Body.String())
 	}
 }
 
@@ -691,12 +735,17 @@ func TestRefresh_ExpiryCappedByGrant(t *testing.T) {
 // client again. Consent #1's code is exchanged while its grant has ten
 // minutes left, so its chain ends then. Consent #2 for the same client --
 // another install, approving no scope -- renews the one grant in place for
-// MCPGrantMaxLifetime. Chain #1 keeps consent #1's end and resource
-// exactly, every token it still issues expires by that end (access token
-// included), and it keeps consent #1's scopes (a later consent never
-// narrows it either). Once consent #1's end has passed, chain #1 refreshes
-// nothing and revokes nothing, while consent #2's own chain, ending with
-// the renewed grant, keeps refreshing.
+// MCPGrantMaxLifetime. Consent #3, through a replica at another
+// PublicBaseURL sharing this database, rebinds the one grant's resource in
+// place (PR #327's round-2 review). Chain #1 keeps consent #1's end and
+// resource exactly -- it still refreshes here after consent #3, since a
+// refresh compares the chain's resource and never the grant's, and every
+// token it issues carries consent #1's, copied from the presented token
+// and never from the grant -- every token it still issues expires by that
+// end (access token included), and it keeps consent #1's scopes (a later
+// consent never narrows it either). Once consent #1's end has passed,
+// chain #1 refreshes nothing and revokes nothing, while consent #2's own
+// chain, ending with the renewed grant, keeps refreshing.
 func TestRefresh_ChainLifetimeFixedAtIssuance(t *testing.T) {
 	ctx := context.Background()
 	r := newASRig(t)
@@ -763,12 +812,25 @@ func TestRefresh_ChainLifetimeFixedAtIssuance(t *testing.T) {
 	inChain1("chain #1 after consent #2", a3)
 	r.wantScopes(t, "chain #1's access token after consent #2", a3.AccessToken, "mcp:read")
 
+	// Consent #3 rebinds the grant's resource; chain #1 is still consent
+	// #1's, resource included. (Its access tokens are refused at this
+	// deployment's /mcp from now on: the bearer check reads the grant's
+	// resource, §43.16.)
+	if id := r.rebindGrant(t, user.ID, "http://other.test/mcp"); id != grantID[0] {
+		t.Fatalf("consent #3 wrote grant %s, want the one grant %s renewed in place", id, grantID[0])
+	}
+	rec, a4 := r.refreshWith(t, r.refreshForm(a3.RefreshToken))
+	if rec.Code != http.StatusOK || a4.Scope != "mcp:read" {
+		t.Fatalf("chain #1 after consent #3 rebound the grant's resource: status %d body %s, want 200 with consent #1's scope mcp:read", rec.Code, rec.Body.String())
+	}
+	inChain1("chain #1 after consent #3", a4)
+
 	// Consent #1's end passes -- for chain #1's live token, as the clock
 	// would move it.
-	if tag, err := r.pool.Exec(ctx, `UPDATE mcp_oauth_refresh_tokens SET expires_at = expires_at - interval '11 minutes', chain_expires_at = chain_expires_at - interval '11 minutes' WHERE token_hash = $1`, platform.HashToken(a3.RefreshToken)); err != nil || tag.RowsAffected() != 1 {
+	if tag, err := r.pool.Exec(ctx, `UPDATE mcp_oauth_refresh_tokens SET expires_at = expires_at - interval '11 minutes', chain_expires_at = chain_expires_at - interval '11 minutes' WHERE token_hash = $1`, platform.HashToken(a4.RefreshToken)); err != nil || tag.RowsAffected() != 1 {
 		t.Fatalf("move chain #1 past its end: err %v rows %d", err, tag.RowsAffected())
 	}
-	if rec, body := r.refreshWith(t, r.refreshForm(a3.RefreshToken)); rec.Code != http.StatusBadRequest || body.Error != "invalid_grant" || body.AccessToken != "" {
+	if rec, body := r.refreshWith(t, r.refreshForm(a4.RefreshToken)); rec.Code != http.StatusBadRequest || body.Error != "invalid_grant" || body.AccessToken != "" {
 		t.Fatalf("chain #1 past consent #1's end: status %d body %s, want 400 invalid_grant", rec.Code, rec.Body.String())
 	}
 	if ids := r.grantIDs(t, user.ID); len(ids) != 1 {
