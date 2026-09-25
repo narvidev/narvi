@@ -94,7 +94,7 @@ export function ConnectedAppsSection() {
     <div className="panel">
       <h4>Connected apps</h4>
       <p className="ph">
-        MCP clients -- editor plugins and assistants -- you allowed to use Narvi as you. An app can never do more than your own role allows. Revoking takes effect on the app's very next call.
+        MCP clients -- editor plugins and assistants -- you allowed to use Narvi as you. An app can never do more than your own role allows. Access shows your most recent approval; approving an app again never takes away access you allowed it before, so revoke to withdraw it. Revoking takes effect on the app's very next call.
       </p>
       {query.isPending && <p className="rail-empty">Loading connected apps…</p>}
       {query.isError && <p className="rail-empty">Couldn't load your connected apps.</p>}
