@@ -325,8 +325,14 @@ func (s *Server) exchangeCode(w http.ResponseWriter, r *http.Request, client sql
 
 	// The tokens' scopes are the code's -- what the user approved in the
 	// consent decision that issued it -- never the grant's, which a later
-	// consent for the same client overwrites (technical plan §43.16).
-	issued, err := s.issueTokens(ctx, grants, grant, mcpscope.FromStrings(row.Scopes), now)
+	// consent for the same client overwrites (technical plan §43.16). The
+	// refresh chain this exchange begins is bound to the code's resource
+	// and ends when the grant ends NOW: a later consent renews the grant
+	// row, never this chain.
+	issued, err := s.issueTokens(ctx, grants, grant, mcpscope.FromStrings(row.Scopes), refreshChain{
+		resource:  row.Resource,
+		expiresAt: grant.ExpiresAt.Time,
+	}, now)
 	if err != nil {
 		fail("record tokens failed", err)
 		return
@@ -336,6 +342,19 @@ func (s *Server) exchangeCode(w http.ResponseWriter, r *http.Request, client sql
 		return
 	}
 	writeIssued(w, issued, now)
+}
+
+// refreshChain is what a refresh chain -- the refresh tokens one code
+// exchange begins and every rotation continues -- fixes when it begins and
+// carries unchanged through every rotation (technical plan §43.16): the
+// resource the code was issued for, and the chain's absolute end, the
+// grant's expiry at that code exchange. Neither is ever re-read from the
+// grant, whose resource and expiry a later consent for the same client
+// renews in place: that consent must neither extend nor rebind a chain an
+// earlier consent began.
+type refreshChain struct {
+	resource  string
+	expiresAt time.Time
 }
 
 // issuedTokens is one successful token response's credentials, stored and
@@ -352,14 +371,17 @@ type issuedTokens struct {
 
 // issueTokens mints and stores, under grant and inside grants' own
 // transaction, one access token and one refresh token, both holding
-// exactly scopes -- fixed for their whole lifetime -- and each expiring
-// after its own TTL (MCPAccessTokenTTL, MCPRefreshTokenTTL) or at the
+// exactly scopes -- fixed for their whole lifetime -- the refresh token
+// continuing chain, and each expiring after its own TTL
+// (MCPAccessTokenTTL, MCPRefreshTokenTTL), at the chain's end, or at the
 // grant's own expiry, whichever comes first (technical plan §43.16).
-func (s *Server) issueTokens(ctx context.Context, grants *postgres.MCPOAuthGrantStore, grant sqlcgen.McpOauthGrant, scopes []mcpscope.Scope, now time.Time) (issuedTokens, error) {
-	capAtGrant := func(ttl time.Duration) time.Time {
+func (s *Server) issueTokens(ctx context.Context, grants *postgres.MCPOAuthGrantStore, grant sqlcgen.McpOauthGrant, scopes []mcpscope.Scope, chain refreshChain, now time.Time) (issuedTokens, error) {
+	capped := func(ttl time.Duration) time.Time {
 		at := now.Add(ttl)
-		if grant.ExpiresAt.Time.Before(at) {
-			return grant.ExpiresAt.Time
+		for _, end := range []time.Time{grant.ExpiresAt.Time, chain.expiresAt} {
+			if end.Before(at) {
+				at = end
+			}
 		}
 		return at
 	}
@@ -373,7 +395,7 @@ func (s *Server) issueTokens(ctx context.Context, grants *postgres.MCPOAuthGrant
 	}
 	out := issuedTokens{
 		accessToken:     accessTokenPrefix + access,
-		accessExpiresAt: capAtGrant(s.cfg.Timeouts.MCPAccessTokenTTL),
+		accessExpiresAt: capped(s.cfg.Timeouts.MCPAccessTokenTTL),
 		refreshToken:    refreshTokenPrefix + refresh,
 		scopes:          scopes,
 	}
@@ -387,10 +409,12 @@ func (s *Server) issueTokens(ctx context.Context, grants *postgres.MCPOAuthGrant
 		return issuedTokens{}, err
 	}
 	rt, err := grants.CreateRefreshToken(ctx, sqlcgen.CreateMCPOAuthRefreshTokenParams{
-		GrantID:   grant.ID,
-		TokenHash: platform.HashToken(out.refreshToken),
-		Scopes:    stored,
-		ExpiresAt: pgtype.Timestamptz{Time: capAtGrant(s.cfg.Timeouts.MCPRefreshTokenTTL), Valid: true},
+		GrantID:        grant.ID,
+		TokenHash:      platform.HashToken(out.refreshToken),
+		Scopes:         stored,
+		Resource:       chain.resource,
+		ExpiresAt:      pgtype.Timestamptz{Time: capped(s.cfg.Timeouts.MCPRefreshTokenTTL), Valid: true},
+		ChainExpiresAt: pgtype.Timestamptz{Time: chain.expiresAt, Valid: true},
 	})
 	if err != nil {
 		return issuedTokens{}, err

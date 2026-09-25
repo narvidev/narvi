@@ -214,7 +214,7 @@ func TestExpiredCleanup_SweepsMCPRows(t *testing.T) {
 		expires pgtype.Timestamptz
 	}{{"expired-refresh", past}, {"live-refresh", future}, {"live-rotated-refresh", future}} {
 		if _, err := grants.CreateRefreshToken(ctx, sqlcgen.CreateMCPOAuthRefreshTokenParams{
-			GrantID: liveGrant, TokenHash: rt.hash, ExpiresAt: rt.expires,
+			GrantID: liveGrant, TokenHash: rt.hash, Resource: "http://127.0.0.1:9/mcp", ExpiresAt: rt.expires, ChainExpiresAt: rt.expires,
 		}); err != nil {
 			t.Fatalf("create refresh token %s: %v", rt.hash, err)
 		}

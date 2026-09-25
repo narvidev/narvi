@@ -13,16 +13,18 @@ import (
 
 const createMCPOAuthRefreshToken = `-- name: CreateMCPOAuthRefreshToken :one
 
-INSERT INTO mcp_oauth_refresh_tokens (grant_id, token_hash, scopes, expires_at)
-VALUES ($1, $2, $3, $4)
-RETURNING id, grant_id, token_hash, scopes, expires_at, created_at, rotated_at, superseded_by
+INSERT INTO mcp_oauth_refresh_tokens (grant_id, token_hash, scopes, resource, expires_at, chain_expires_at)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, grant_id, token_hash, scopes, resource, expires_at, chain_expires_at, created_at, rotated_at, superseded_by
 `
 
 type CreateMCPOAuthRefreshTokenParams struct {
-	GrantID   pgtype.UUID        `json:"grant_id"`
-	TokenHash string             `json:"token_hash"`
-	Scopes    []string           `json:"scopes"`
-	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+	GrantID        pgtype.UUID        `json:"grant_id"`
+	TokenHash      string             `json:"token_hash"`
+	Scopes         []string           `json:"scopes"`
+	Resource       string             `json:"resource"`
+	ExpiresAt      pgtype.Timestamptz `json:"expires_at"`
+	ChainExpiresAt pgtype.Timestamptz `json:"chain_expires_at"`
 }
 
 // Queries backing MCPOAuthGrantStore's refresh-token half (technical plan
@@ -34,12 +36,18 @@ type CreateMCPOAuthRefreshTokenParams struct {
 // mcpauth's refresh grant then revokes its grant.
 // GetMCPOAuthRefreshTokenByHash reads a token whether or not it was
 // rotated, which is how a replay is recognised as one.
+// CreateMCPOAuthRefreshToken inserts one refresh token. resource and
+// chain_expires_at are its chain's, fixed when the chain began (the code
+// exchange) and copied unchanged by every rotation -- never re-read from
+// the grant (migrations/000142_mcp_oauth_refresh_tokens.up.sql).
 func (q *Queries) CreateMCPOAuthRefreshToken(ctx context.Context, arg CreateMCPOAuthRefreshTokenParams) (McpOauthRefreshToken, error) {
 	row := q.db.QueryRow(ctx, createMCPOAuthRefreshToken,
 		arg.GrantID,
 		arg.TokenHash,
 		arg.Scopes,
+		arg.Resource,
 		arg.ExpiresAt,
+		arg.ChainExpiresAt,
 	)
 	var i McpOauthRefreshToken
 	err := row.Scan(
@@ -47,7 +55,9 @@ func (q *Queries) CreateMCPOAuthRefreshToken(ctx context.Context, arg CreateMCPO
 		&i.GrantID,
 		&i.TokenHash,
 		&i.Scopes,
+		&i.Resource,
 		&i.ExpiresAt,
+		&i.ChainExpiresAt,
 		&i.CreatedAt,
 		&i.RotatedAt,
 		&i.SupersededBy,
@@ -69,7 +79,7 @@ func (q *Queries) DeleteExpiredMCPOAuthRefreshTokens(ctx context.Context) (int64
 }
 
 const getMCPOAuthRefreshTokenByHash = `-- name: GetMCPOAuthRefreshTokenByHash :one
-SELECT id, grant_id, token_hash, scopes, expires_at, created_at, rotated_at, superseded_by FROM mcp_oauth_refresh_tokens
+SELECT id, grant_id, token_hash, scopes, resource, expires_at, chain_expires_at, created_at, rotated_at, superseded_by FROM mcp_oauth_refresh_tokens
 WHERE token_hash = $1
 `
 
@@ -81,7 +91,9 @@ func (q *Queries) GetMCPOAuthRefreshTokenByHash(ctx context.Context, tokenHash s
 		&i.GrantID,
 		&i.TokenHash,
 		&i.Scopes,
+		&i.Resource,
 		&i.ExpiresAt,
+		&i.ChainExpiresAt,
 		&i.CreatedAt,
 		&i.RotatedAt,
 		&i.SupersededBy,
@@ -93,7 +105,7 @@ const rotateMCPOAuthRefreshToken = `-- name: RotateMCPOAuthRefreshToken :one
 UPDATE mcp_oauth_refresh_tokens
 SET rotated_at = now(), superseded_by = $1
 WHERE id = $2 AND rotated_at IS NULL
-RETURNING id, grant_id, token_hash, scopes, expires_at, created_at, rotated_at, superseded_by
+RETURNING id, grant_id, token_hash, scopes, resource, expires_at, chain_expires_at, created_at, rotated_at, superseded_by
 `
 
 type RotateMCPOAuthRefreshTokenParams struct {
@@ -109,7 +121,9 @@ func (q *Queries) RotateMCPOAuthRefreshToken(ctx context.Context, arg RotateMCPO
 		&i.GrantID,
 		&i.TokenHash,
 		&i.Scopes,
+		&i.Resource,
 		&i.ExpiresAt,
+		&i.ChainExpiresAt,
 		&i.CreatedAt,
 		&i.RotatedAt,
 		&i.SupersededBy,

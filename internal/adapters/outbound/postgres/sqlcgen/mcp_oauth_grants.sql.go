@@ -243,9 +243,14 @@ type UpsertMCPOAuthGrantParams struct {
 // just approved (same id, so the Connected apps list names the client
 // once). The row's scopes are the most recent approval, for display
 // only: no authorization decision reads them -- every code, access token
-// and refresh token carries its own scopes, fixed at issuance, so this
-// update can neither widen nor narrow a credential issued earlier. created_at keeps the
-// first approval's time.
+// and refresh token carries its own scopes, fixed at issuance. Nor does a
+// refresh read the row's resource or expiry: a refresh chain carries its
+// own resource and its own end (chain_expires_at), copied when the chain
+// began and never renewed. So this update can neither widen nor narrow a
+// credential issued earlier, and neither extends nor rebinds a refresh
+// chain an earlier consent began: it renews the grant, and the chains
+// this consent's own code will begin. created_at keeps the first
+// approval's time.
 func (q *Queries) UpsertMCPOAuthGrant(ctx context.Context, arg UpsertMCPOAuthGrantParams) (McpOauthGrant, error) {
 	row := q.db.QueryRow(ctx, upsertMCPOAuthGrant,
 		arg.UserID,

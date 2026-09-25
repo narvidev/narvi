@@ -3032,14 +3032,17 @@ type Timeouts struct {
 	// MCPRefreshTokenTTL is how long an MCP refresh token may be exchanged
 	// for a new access token. Every refresh rotates it -- the replacement
 	// gets a fresh MCPRefreshTokenTTL -- and every refresh token is capped
-	// at its grant's own expiry, so a client in regular use refreshes
-	// until MCPGrantMaxLifetime and one left idle this long must consent
-	// again. 30 days.
+	// at its chain's end (MCPGrantMaxLifetime after the consent that began
+	// the chain) and at its grant's own expiry, so a client in regular use
+	// refreshes until MCPGrantMaxLifetime and one left idle this long must
+	// consent again. 30 days.
 	MCPRefreshTokenTTL time.Duration
 
-	// MCPGrantMaxLifetime is the absolute lifetime of a consented grant --
-	// after it, the user must consent again, whatever the client does.
-	// 90 days.
+	// MCPGrantMaxLifetime is the absolute lifetime of a consent: of the
+	// grant it creates or renews, and of the refresh chain its code
+	// begins -- after it, the user must consent again, whatever the client
+	// does. A later consent renews the grant, never a chain an earlier
+	// consent began (technical plan §43.16). 90 days.
 	MCPGrantMaxLifetime time.Duration
 
 	// MCPGrantLastUsedWriteInterval coalesces the bearer check's
@@ -3327,7 +3330,7 @@ func DefaultTimeouts() Timeouts {
 		MCPAuthorizationRequestTTL:    10 * time.Minute,    // §43.16; mirrors OAuthStateTTL
 		MCPAuthorizationCodeTTL:       60 * time.Second,    // §43.16; single-use, exchanged immediately
 		MCPAccessTokenTTL:             time.Hour,           // §43.16; "short-lived access tokens"
-		MCPRefreshTokenTTL:            30 * 24 * time.Hour, // §43.16; per rotation, capped by the grant
+		MCPRefreshTokenTTL:            30 * 24 * time.Hour, // §43.16; per rotation, capped by the chain and the grant
 		MCPGrantMaxLifetime:           90 * 24 * time.Hour, // §43.16; absolute, re-consent after
 		MCPGrantLastUsedWriteInterval: 5 * time.Minute,     // §43.16; write coalescing
 		MCPDiscoveryCacheMaxAge:       5 * time.Minute,     // §43.14; discovery documents' Cache-Control max-age

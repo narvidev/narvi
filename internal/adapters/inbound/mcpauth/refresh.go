@@ -25,6 +25,13 @@ import (
 // chain. Presenting a token that was already rotated is a replay, handled
 // by handleRefreshReuse.
 //
+// The same holds for the rest of what the chain can do: its resource and
+// its absolute end were fixed when the chain began (refreshChain) and are
+// read from the presented token, which the rotation copies them from
+// unchanged. The grant's expiry still ends the chain early if it comes
+// first -- a grant past its lifetime refreshes nothing -- but the grant's
+// resource is never compared, and its expiry never extends the chain.
+//
 // Unlike a code, a refresh token is NOT spent by a refusal: every check
 // that can refuse runs before the rotation, and a refused request commits
 // nothing. A client that sent a scope it may not have, or a foreign
@@ -53,8 +60,9 @@ func (s *Server) refreshGrant(w http.ResponseWriter, r *http.Request, client sql
 		return
 	}
 	// resource is optional on a refresh -- the token is already bound to
-	// this deployment's resource through its grant -- but one that is sent
-	// must be it (RFC 8707 section 2).
+	// the resource its chain was issued for -- but one that is sent must be
+	// this deployment's (RFC 8707 section 2), and so must the chain's,
+	// below.
 	if raw := form.Get("resource"); raw != "" && !s.ids.matchesResource(raw) {
 		writeTokenError(w, errInvalidTarget, "resource must be this deployment's MCP endpoint", false)
 		return
@@ -124,14 +132,23 @@ func (s *Server) refreshGrant(w http.ResponseWriter, r *http.Request, client sql
 	case !presentedRow.ExpiresAt.Time.After(now):
 		refuse(errInvalidGrant, "the refresh token is invalid", "refresh_token_expired")
 		return
+	case !presentedRow.ChainExpiresAt.Time.After(now):
+		// A chain past its absolute end refreshes nothing, whatever the
+		// token's own expiry says -- and however recently the user
+		// consented again: a later consent renews the grant, never a chain
+		// an earlier one began.
+		refuse(errInvalidGrant, "the refresh token is invalid", "refresh_chain_expired")
+		return
 	case !grant.ExpiresAt.Time.After(now):
 		// A grant past its absolute lifetime refreshes nothing, whatever
 		// its refresh tokens say: the user must consent again.
 		refuse(errInvalidGrant, "the refresh token is invalid", "grant_expired")
 		return
-	case grant.Resource != s.ids.Resource:
-		// Only possible when PublicBaseURL changed since the grant was
-		// consented to (the code exchange's own resource_mismatch case).
+	case presentedRow.Resource != s.ids.Resource:
+		// The chain's own resource, fixed when it began -- never the
+		// grant's, which a later consent rebinds in place. Only possible
+		// when PublicBaseURL changed since the chain began (the code
+		// exchange's own resource_mismatch case).
 		refuse(errInvalidTarget, "the refresh token was issued for another resource", "resource_mismatch")
 		return
 	case narrowing && !mcpscope.Covers(held, requested):
@@ -143,7 +160,10 @@ func (s *Server) refreshGrant(w http.ResponseWriter, r *http.Request, client sql
 		scopes = requested
 	}
 
-	issued, err := s.issueTokens(ctx, grants, grant, scopes, now)
+	issued, err := s.issueTokens(ctx, grants, grant, scopes, refreshChain{
+		resource:  presentedRow.Resource,
+		expiresAt: presentedRow.ChainExpiresAt.Time,
+	}, now)
 	if err != nil {
 		fail("record tokens failed", err)
 		return

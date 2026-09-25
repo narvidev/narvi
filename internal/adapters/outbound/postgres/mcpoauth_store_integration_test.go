@@ -410,14 +410,17 @@ func TestMCPOAuthGrantStore_UpsertKeepsOneGrantPerUserAndClient(t *testing.T) {
 	}
 }
 
-// createRefreshToken inserts one refresh token under grantID.
+// createRefreshToken inserts one refresh token under grantID, the whole
+// chain ending when the token does.
 func (f mcpOAuthFixture) createRefreshToken(ctx context.Context, t *testing.T, grantID pgtype.UUID, tokenHash string, scopes []string, expires time.Time) sqlcgen.McpOauthRefreshToken {
 	t.Helper()
 	rt, err := f.grants.CreateRefreshToken(ctx, sqlcgen.CreateMCPOAuthRefreshTokenParams{
-		GrantID:   grantID,
-		TokenHash: tokenHash,
-		Scopes:    scopes,
-		ExpiresAt: mcpTS(expires),
+		GrantID:        grantID,
+		TokenHash:      tokenHash,
+		Scopes:         scopes,
+		Resource:       "http://127.0.0.1:9/mcp",
+		ExpiresAt:      mcpTS(expires),
+		ChainExpiresAt: mcpTS(expires),
 	})
 	if err != nil {
 		t.Fatalf("create refresh token %s: %v", tokenHash, err)

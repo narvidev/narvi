@@ -41,12 +41,17 @@
 //   - A refresh token rotates on every use; presenting a rotated one
 //     deletes its grant. A refresh can only narrow the scopes the refresh
 //     token holds, never widen them to the grant's.
+//   - A refresh chain's scopes, resource and absolute end are fixed when
+//     its code is exchanged and carried unchanged through every rotation:
+//     a later consent for the same client, which renews the grant in
+//     place, never extends, rebinds or widens a chain an earlier consent
+//     began.
 //   - Revoking any token revokes its whole grant, and only the client it
 //     was issued to can do so; the answer never says which happened.
 //   - resource is required and bound at authorization and at the code
 //     exchange; on a refresh it is optional, but one that is sent must
-//     match, and the grant's own must still be this deployment's; and
-//     auth.RequireMCPBearer checks it on every call.
+//     match, and the refresh chain's own must still be this deployment's;
+//     and auth.RequireMCPBearer checks it on every call.
 //   - Only scopes the tool table requires are offered; the user can only
 //     narrow them.
 //   - Every token and code holds the scopes fixed when it was issued.

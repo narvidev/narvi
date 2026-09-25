@@ -8,9 +8,13 @@
 -- GetMCPOAuthRefreshTokenByHash reads a token whether or not it was
 -- rotated, which is how a replay is recognised as one.
 
+-- CreateMCPOAuthRefreshToken inserts one refresh token. resource and
+-- chain_expires_at are its chain's, fixed when the chain began (the code
+-- exchange) and copied unchanged by every rotation -- never re-read from
+-- the grant (migrations/000142_mcp_oauth_refresh_tokens.up.sql).
 -- name: CreateMCPOAuthRefreshToken :one
-INSERT INTO mcp_oauth_refresh_tokens (grant_id, token_hash, scopes, expires_at)
-VALUES ($1, $2, $3, $4)
+INSERT INTO mcp_oauth_refresh_tokens (grant_id, token_hash, scopes, resource, expires_at, chain_expires_at)
+VALUES ($1, $2, $3, $4, $5, $6)
 RETURNING *;
 
 -- name: GetMCPOAuthRefreshTokenByHash :one
