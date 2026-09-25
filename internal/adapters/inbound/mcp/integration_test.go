@@ -36,10 +36,14 @@ import (
 // mcpTestRig is this package's own minimal rig: just enough real Postgres
 // stores to construct BOTH the REST routes (/api/models, /api/sessions,
 // /api/sessions/{sessionID}) and the MCP route (/mcp) behind the
-// IDENTICAL gates controlplane/serve.go wires in production -- auth.
-// Middleware first (well, RequireEnabled first for /mcp, then auth.
-// Middleware -- §43.6's own gate order), so a parity test exercises
-// the real thing, never a stand-in.
+// IDENTICAL gates controlplane/serve.go wires in production for /mcp --
+// mcpadapter.RequireTrustedOrigin first, then RequireEnabled, then auth.
+// Middleware (§43.2/§43.6's own gate order) -- so a parity test exercises
+// the real thing, never a stand-in. (A prior revision of this rig omitted
+// RequireTrustedOrigin entirely, despite this same comment already
+// claiming "the IDENTICAL gates" -- round 2 review of PR #324, finding
+// N19's own "why nothing catches it" note. No test in this file sends an
+// Origin header, so adding it changes no existing test's outcome.)
 type mcpTestRig struct {
 	users        *narvipg.UserStore
 	identities   *narvipg.IdentityStore
@@ -65,6 +69,10 @@ func newMCPTestRig(t *testing.T) mcpTestRig {
 	if err != nil {
 		t.Fatalf("mcpadapter.NewHandler: %v", err)
 	}
+	mcpOriginGate, err := mcpadapter.RequireTrustedOrigin(mcpadapter.Config{PublicBaseURL: "http://example.test"})
+	if err != nil {
+		t.Fatalf("mcpadapter.RequireTrustedOrigin: %v", err)
+	}
 
 	router := chi.NewRouter()
 	router.Route("/api/models", func(r chi.Router) {
@@ -77,6 +85,7 @@ func newMCPTestRig(t *testing.T) mcpTestRig {
 		r.Get("/{sessionID}", httpapi.GetSession(sessions))
 	})
 	router.Route("/mcp", func(r chi.Router) {
+		r.Use(mcpOriginGate)
 		r.Use(mcpadapter.RequireEnabled(true))
 		r.Use(auth.Middleware(userSessions, users))
 		r.Post("/", mcpHandler.ServeHTTP)
