@@ -379,10 +379,13 @@ same routes this guide documents, checked against your role on every call.
 
 Once an app is connected, you manage it in Settings → Integrations →
 Connected apps: what you last allowed it, when you connected it, when it
-last called, and when the authorization lapses. An app you approve keeps
-working without asking you again: it renews its own access in the
-background, for up to 90 days after the approval that connected it. It
-sends you back to the consent page when it has gone unused for 30 days,
+last called, and when the authorization lapses, 90 days after your latest
+approval of it. That date is the latest any copy of the app can keep
+working without asking you again. A copy connected by an earlier approval
+asks you sooner, when that approval's own 90 days are up. An app you
+approve keeps working without asking you again: it renews its own access
+in the background, for up to 90 days after the approval that connected
+it. It sends you back to the consent page when it has gone unused for 30 days,
 when those 90 days are up, once it has been disconnected, or when Narvi
 disconnects it itself after seeing one of its renewal tokens used twice,
 or by another app. That is how a copied token shows itself, but an app that retries a renewal
