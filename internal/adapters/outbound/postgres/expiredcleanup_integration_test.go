@@ -144,6 +144,18 @@ func TestExpiredCleanup_SweepsMCPRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create client: %v", err)
 	}
+	// A second client for the live grant: a user holds at most one grant
+	// per client (UpsertGrant), so the expired and the live grant need
+	// different clients to coexist.
+	liveClient, err := narvipg.NewMCPOAuthClientStore(pool).Create(ctx, sqlcgen.CreateMCPOAuthClientParams{
+		ClientID:     "narvi_mcp_c_sweep_live",
+		Kind:         sqlcgen.McpOauthClientKindPreregistered,
+		ClientName:   "Sweep live",
+		RedirectUris: []string{"http://127.0.0.1/cb"},
+	})
+	if err != nil {
+		t.Fatalf("create live client: %v", err)
+	}
 	grants := narvipg.NewMCPOAuthGrantStore(pool)
 
 	past := pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true}
@@ -160,10 +172,10 @@ func TestExpiredCleanup_SweepsMCPRows(t *testing.T) {
 		}
 		return r.ID
 	}
-	newGrant := func(expires pgtype.Timestamptz) pgtype.UUID {
+	newGrant := func(clientID pgtype.UUID, expires pgtype.Timestamptz) pgtype.UUID {
 		t.Helper()
-		g, err := grants.CreateGrant(ctx, sqlcgen.CreateMCPOAuthGrantParams{
-			UserID: user.ID, ClientID: client.ID, Scopes: []string{"mcp:read"}, Resource: "http://127.0.0.1:9/mcp", ExpiresAt: expires,
+		g, err := grants.UpsertGrant(ctx, sqlcgen.UpsertMCPOAuthGrantParams{
+			UserID: user.ID, ClientID: clientID, Scopes: []string{"mcp:read"}, Resource: "http://127.0.0.1:9/mcp", ExpiresAt: expires,
 		})
 		if err != nil {
 			t.Fatalf("create grant: %v", err)
@@ -172,7 +184,7 @@ func TestExpiredCleanup_SweepsMCPRows(t *testing.T) {
 	}
 
 	expiredRequest, liveRequest := newRequest(past), newRequest(future)
-	expiredGrant, liveGrant := newGrant(past), newGrant(future)
+	expiredGrant, liveGrant := newGrant(client.ID, past), newGrant(liveClient.ID, future)
 	for _, c := range []struct {
 		hash    string
 		expires pgtype.Timestamptz

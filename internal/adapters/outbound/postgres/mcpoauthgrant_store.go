@@ -77,10 +77,12 @@ func (s *MCPOAuthGrantStore) ConsumeAuthorizationRequest(ctx context.Context, id
 	return s.q.ConsumeMCPOAuthAuthorizationRequest(ctx, sqlcgen.ConsumeMCPOAuthAuthorizationRequestParams{ID: id, UserID: userID})
 }
 
-// CreateGrant inserts one consented grant.
-func (s *MCPOAuthGrantStore) CreateGrant(ctx context.Context, arg sqlcgen.CreateMCPOAuthGrantParams) (sqlcgen.McpOauthGrant, error) {
+// UpsertGrant records a consent: it creates the user's one grant for this
+// client, or replaces that grant's scopes, resource and expiry in place
+// (queries/mcp_oauth_grants.sql's own doc comment).
+func (s *MCPOAuthGrantStore) UpsertGrant(ctx context.Context, arg sqlcgen.UpsertMCPOAuthGrantParams) (sqlcgen.McpOauthGrant, error) {
 	arg.Scopes = nonNilScopes(arg.Scopes)
-	return s.q.CreateMCPOAuthGrant(ctx, arg)
+	return s.q.UpsertMCPOAuthGrant(ctx, arg)
 }
 
 // GetGrant fetches one grant by id.

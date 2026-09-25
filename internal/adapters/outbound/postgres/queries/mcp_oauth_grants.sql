@@ -8,9 +8,16 @@
 -- stale_before, so a busy client costs one write per interval, not one per
 -- call.
 
--- name: CreateMCPOAuthGrant :one
+-- UpsertMCPOAuthGrant records a consent: a user's first approval of a
+-- client creates its one grant row; a later approval of the same client
+-- replaces that row's scopes, resource and expiry in place (same id, so
+-- tokens already issued under it keep working, now under the scopes just
+-- consented to). created_at keeps the first approval's time.
+-- name: UpsertMCPOAuthGrant :one
 INSERT INTO mcp_oauth_grants (user_id, client_id, scopes, resource, expires_at)
 VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (user_id, client_id) DO UPDATE
+SET scopes = EXCLUDED.scopes, resource = EXCLUDED.resource, expires_at = EXCLUDED.expires_at
 RETURNING *;
 
 -- name: GetMCPOAuthGrant :one

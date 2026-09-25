@@ -11,52 +11,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const createMCPOAuthGrant = `-- name: CreateMCPOAuthGrant :one
-
-INSERT INTO mcp_oauth_grants (user_id, client_id, scopes, resource, expires_at)
-VALUES ($1, $2, $3, $4, $5)
-RETURNING id, user_id, client_id, scopes, resource, created_at, expires_at, last_used_at
-`
-
-type CreateMCPOAuthGrantParams struct {
-	UserID    pgtype.UUID        `json:"user_id"`
-	ClientID  pgtype.UUID        `json:"client_id"`
-	Scopes    []string           `json:"scopes"`
-	Resource  string             `json:"resource"`
-	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
-}
-
-// Queries backing MCPOAuthGrantStore's grant half (technical plan §43.16,
-// migrations/000141_mcp_oauth.up.sql). A grant row exists iff the
-// authorization is live: deleting it IS revocation, and every code and
-// access token issued under it cascades with it.
-//
-// TouchMCPOAuthGrantLastUsed is the bearer check's own coalesced write:
-// it only updates a row whose last_used_at is NULL or older than
-// stale_before, so a busy client costs one write per interval, not one per
-// call.
-func (q *Queries) CreateMCPOAuthGrant(ctx context.Context, arg CreateMCPOAuthGrantParams) (McpOauthGrant, error) {
-	row := q.db.QueryRow(ctx, createMCPOAuthGrant,
-		arg.UserID,
-		arg.ClientID,
-		arg.Scopes,
-		arg.Resource,
-		arg.ExpiresAt,
-	)
-	var i McpOauthGrant
-	err := row.Scan(
-		&i.ID,
-		&i.UserID,
-		&i.ClientID,
-		&i.Scopes,
-		&i.Resource,
-		&i.CreatedAt,
-		&i.ExpiresAt,
-		&i.LastUsedAt,
-	)
-	return i, err
-}
-
 const deleteExpiredMCPOAuthGrants = `-- name: DeleteExpiredMCPOAuthGrants :execrows
 DELETE FROM mcp_oauth_grants
 WHERE expires_at < now()
@@ -226,4 +180,57 @@ type TouchMCPOAuthGrantLastUsedParams struct {
 func (q *Queries) TouchMCPOAuthGrantLastUsed(ctx context.Context, arg TouchMCPOAuthGrantLastUsedParams) error {
 	_, err := q.db.Exec(ctx, touchMCPOAuthGrantLastUsed, arg.ID, arg.StaleBefore)
 	return err
+}
+
+const upsertMCPOAuthGrant = `-- name: UpsertMCPOAuthGrant :one
+
+INSERT INTO mcp_oauth_grants (user_id, client_id, scopes, resource, expires_at)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (user_id, client_id) DO UPDATE
+SET scopes = EXCLUDED.scopes, resource = EXCLUDED.resource, expires_at = EXCLUDED.expires_at
+RETURNING id, user_id, client_id, scopes, resource, created_at, expires_at, last_used_at
+`
+
+type UpsertMCPOAuthGrantParams struct {
+	UserID    pgtype.UUID        `json:"user_id"`
+	ClientID  pgtype.UUID        `json:"client_id"`
+	Scopes    []string           `json:"scopes"`
+	Resource  string             `json:"resource"`
+	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+}
+
+// Queries backing MCPOAuthGrantStore's grant half (technical plan §43.16,
+// migrations/000141_mcp_oauth.up.sql). A grant row exists iff the
+// authorization is live: deleting it IS revocation, and every code and
+// access token issued under it cascades with it.
+//
+// TouchMCPOAuthGrantLastUsed is the bearer check's own coalesced write:
+// it only updates a row whose last_used_at is NULL or older than
+// stale_before, so a busy client costs one write per interval, not one per
+// call.
+// UpsertMCPOAuthGrant records a consent: a user's first approval of a
+// client creates its one grant row; a later approval of the same client
+// replaces that row's scopes, resource and expiry in place (same id, so
+// tokens already issued under it keep working, now under the scopes just
+// consented to). created_at keeps the first approval's time.
+func (q *Queries) UpsertMCPOAuthGrant(ctx context.Context, arg UpsertMCPOAuthGrantParams) (McpOauthGrant, error) {
+	row := q.db.QueryRow(ctx, upsertMCPOAuthGrant,
+		arg.UserID,
+		arg.ClientID,
+		arg.Scopes,
+		arg.Resource,
+		arg.ExpiresAt,
+	)
+	var i McpOauthGrant
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.ClientID,
+		&i.Scopes,
+		&i.Resource,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+		&i.LastUsedAt,
+	)
+	return i, err
 }

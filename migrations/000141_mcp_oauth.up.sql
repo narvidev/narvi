@@ -64,12 +64,15 @@ CREATE TABLE mcp_oauth_authorization_requests (
 CREATE INDEX mcp_oauth_authorization_requests_client_id_idx ON mcp_oauth_authorization_requests (client_id);
 CREATE INDEX mcp_oauth_authorization_requests_expires_at_idx ON mcp_oauth_authorization_requests (expires_at);
 
--- One (user, client, scopes, resource) authorization the user consented
--- to. scopes may be empty: a scope-less grant authenticates the user but
--- sees no tools (§43.17). resource is the canonical /mcp URI the grant was
--- issued for; the bearer check compares it against this deployment's own
--- on every call (audience binding). expires_at is the absolute lifetime
--- after which the user must consent again.
+-- One user's authorization of one client: at most one row per (user,
+-- client) -- consenting again replaces the row's scopes and renews its
+-- lifetime rather than adding a second row, so the Connected apps list
+-- names each app once and re-consent cannot grow this table without
+-- bound. scopes may be empty: a scope-less grant authenticates the user
+-- but sees no tools (§43.17). resource is the canonical /mcp URI the
+-- grant was issued for; the bearer check compares it against this
+-- deployment's own on every call (audience binding). expires_at is the
+-- absolute lifetime after which the user must consent again.
 CREATE TABLE mcp_oauth_grants (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -80,7 +83,7 @@ CREATE TABLE mcp_oauth_grants (
     expires_at   TIMESTAMPTZ NOT NULL,
     last_used_at TIMESTAMPTZ
 );
-CREATE INDEX mcp_oauth_grants_user_id_idx ON mcp_oauth_grants (user_id);
+CREATE UNIQUE INDEX mcp_oauth_grants_user_client_idx ON mcp_oauth_grants (user_id, client_id);
 CREATE INDEX mcp_oauth_grants_client_id_idx ON mcp_oauth_grants (client_id);
 CREATE INDEX mcp_oauth_grants_expires_at_idx ON mcp_oauth_grants (expires_at);
 

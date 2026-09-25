@@ -65,7 +65,7 @@ func mcpTS(t time.Time) pgtype.Timestamptz { return pgtype.Timestamptz{Time: t, 
 // returning both.
 func (f mcpOAuthFixture) createGrantWithToken(ctx context.Context, t *testing.T, scopes []string, tokenHash string, grantExpires, tokenExpires time.Time) (sqlcgen.McpOauthGrant, sqlcgen.McpOauthAccessToken) {
 	t.Helper()
-	g, err := f.grants.CreateGrant(ctx, sqlcgen.CreateMCPOAuthGrantParams{
+	g, err := f.grants.UpsertGrant(ctx, sqlcgen.UpsertMCPOAuthGrantParams{
 		UserID:    f.user.ID,
 		ClientID:  f.client.ID,
 		Scopes:    scopes,
@@ -365,5 +365,42 @@ func TestMCPOAuthGrantStore_DeleteGrantForUserIsOwnOnly(t *testing.T) {
 	listed, err = f.grants.ListGrantsForUser(ctx, f.user.ID)
 	if err != nil || len(listed) != 0 {
 		t.Fatalf("ListGrantsForUser after revoke = %+v, err = %v, want none", listed, err)
+	}
+}
+
+// TestMCPOAuthGrantStore_UpsertKeepsOneGrantPerUserAndClient proves
+// consenting again to the same client replaces the one grant in place --
+// same id, new scopes, renewed expiry, original created_at -- so tokens
+// issued under the first consent keep working under the scopes just
+// consented to, and the table cannot grow one row per consent.
+func TestMCPOAuthGrantStore_UpsertKeepsOneGrantPerUserAndClient(t *testing.T) {
+	ctx := context.Background()
+	f := newMCPOAuthFixture(ctx, t)
+	first, _ := f.createGrantWithToken(ctx, t, []string{"mcp:read"}, "hash-upsert", time.Now().Add(time.Hour), time.Now().Add(time.Hour))
+
+	later := time.Now().Add(48 * time.Hour).Truncate(time.Microsecond)
+	second, err := f.grants.UpsertGrant(ctx, sqlcgen.UpsertMCPOAuthGrantParams{
+		UserID:    f.user.ID,
+		ClientID:  f.client.ID,
+		Scopes:    nil,
+		Resource:  "http://127.0.0.1:9/mcp",
+		ExpiresAt: mcpTS(later),
+	})
+	if err != nil {
+		t.Fatalf("second UpsertGrant: %v", err)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("second consent id = %v, want the same grant %v", second.ID, first.ID)
+	}
+	if len(second.Scopes) != 0 || !second.ExpiresAt.Time.Equal(later) || !second.CreatedAt.Time.Equal(first.CreatedAt.Time) {
+		t.Fatalf("second consent = %+v, want scopes {}, expiry %v, created_at unchanged %v", second, later, first.CreatedAt.Time)
+	}
+	p, err := f.grants.LookupAccessToken(ctx, "hash-upsert")
+	if err != nil || len(p.GrantScopes) != 0 {
+		t.Fatalf("first consent's token after re-consent: principal = %+v, err = %v, want it alive under the new (empty) scopes", p, err)
+	}
+	listed, err := f.grants.ListGrantsForUser(ctx, f.user.ID)
+	if err != nil || len(listed) != 1 {
+		t.Fatalf("ListGrantsForUser = %+v, err = %v, want exactly one grant", listed, err)
 	}
 }
