@@ -44,6 +44,7 @@ to adopt, and an entry that leaves with `reject` and a reason has done its job.
 | Whether browser-side errors and user feedback are captured | **Adopt** (2026-09-17). Server traces do not cover browser failures; reading them as coverage would be a capability claimed by adjacency | Step 185 |
 | Whether session replay is adopted | **Adopt** (2026-09-17), decided separately from the line above because it is a choice about other people's data. Masking, activation and per-deployment data destination are all open inside the Step | Step 186 |
 | Whether `ProviderFailureDiagnostic.Message` (§7.3) retains a provider's own error text verbatim, even when the provider echoes request content or a masked credential fragment back into it | **Retained verbatim** (2026-09-22). Less diagnostic information is the wrong direction for an allowlist built specifically so a support conversation with the provider is possible at all; the plan row's own "neither credentials nor request content" exit criterion is met a different way — containment is JSON-string encoding at the wire/journal boundary (`json.Marshal`'s default HTML-escaping, `translate.go`), never redacting or truncating text on suspicion, since Message is untrusted PROVIDER output, not this adapter's own construction. `buildProviderFailureDiagnostic` (internal/adapters/outbound/opencode/diagnostic.go) copies `err.Data.Message` unfiltered; `hostileProviderMessage` (internal/adapters/outbound/opencode/diagnostic_test.go) is the regression test pinning it, exercised through the same real json.Unmarshal→build→marshal path the credential-allowlist test uses. Reverses if a real provider is ever observed constructing an error message FROM raw upstream secret material it should not have echoed at all, rather than merely reflecting content already visible to the requester (a request header, a fragment of the prompt) back at them — that is a different, worse failure mode a verbatim policy cannot answer for | Step 177 |
+| Whether this deployment runs a pool of GitHub Apps | **Adopt** (2026-09-25), without waiting for a measured saturation. Justified in this design by roles one credential cannot hold (a check run can only be created by an App, and the one App this deployment mints for must stay read-only for §30.4), by rotation without an outage, and by one identity per turn; not by rate-limit headroom, which stays open below | Phase 20 (Steps 190-196), §44 |
 
 ## Deferred — and what reopens each
 
@@ -104,6 +105,8 @@ it gates. They are listed here so the set is visible in one place, not so it is 
 | Which cluster, and whether its node pool has the hypervisor capability — that acceptance run is what decides Kata against gVisor, not a preference | Phase 18 entirely | Step 167 |
 | Whether a trigger consults a stack's direct parent or its ultimate target | The stack policy's incremental diff, implemented by Step 142 | §24.8 — the row itself does not raise it |
 | Whether an external client is built at all | Phase 16, which is gated rather than scheduled | Phase 16 preamble |
+| Whether a deployment may register GitHub Apps in order to gain rate-limit headroom | Nothing in Phase 20 depends on it; it decides whether budget-aware selection may be an operator's reason for adding an App. Section H of GitHub's Terms of Service forbids sharing API tokens to exceed its rate limits, and whether several Apps for one workload fall under that is GitHub's call | §44.1, Phase 20 preamble |
+| Whether a train may be replanned | A second submission for the same parent replacing only the links not yet started, a started link's ticket, session and branch immutable, refused while any spawn is claimed. It changes §39.1's "plans once" rather than completing it | §39.5b, Step 147 |
 
 **What the build decision on mode B turns on.** Step 156 stops being conditional: a hosted
 embeddings provider receiving customer-derived prose is a real egress channel, and the wire-compatible
@@ -316,6 +319,67 @@ request path, against whatever delivery history this deployment retains. Until e
 `automation_dispatch_dropped_total` is the honest, shipped mitigation: a drop is now OBSERVABLE
 (alertable via `AutomationDispatchDroppedAny`, deploy/observability/alerts/reliability.json), never
 retried.
+
+### D-09 - Publish a verdict's findings as inline comments on the diff
+
+Raised by the upstream-parity pass of 2026-09-25 (upstream PRs 920, 921 and 925, still open there).
+
+**The question.** Whether a verdict's findings are also posted as inline review comments anchored to
+the commit that was reviewed, and whether a finding this system already raised in an open thread of
+its own is answered in that thread rather than posted a second time.
+
+**Why it cannot be defaulted.** Today the formal review carries a body and an event and nothing else;
+findings live in the verdict comment's collapsed appendix. Inline comments change what a reviewer sees
+on the pull request and open threads that humans answer, which this system would then have to read
+without ever overwriting a human conversation.
+
+**What adoption costs.** Anchoring on the commit actually reviewed, with a finding that cannot be
+anchored still readable in the verdict. A receipt per inline write, because GitHub offers no
+transaction across inline comments and the verdict comment, so a failure between them leaves a
+partial state that has to be recoverable; Step 197's idempotency is the prerequisite. Thread reuse
+decided from GitHub's state read at decision time, never from a mirror of past webhooks. And the
+review sandbox's own GitHub credential kept unable to post, so every inline write stays the server's.
+
+### D-10 - Record a human's ruling on one finding, and measure review quality from it
+
+Raised by the upstream-parity pass of 2026-09-25 (upstream PRs 746, 748, 762, 778 and 782, still
+open there).
+
+**The question.** Whether a maintainer can rule on an individual finding (false positive, accepted
+risk, policy disagreement, duplicate, fixed later) as a record of its own, distinct from the
+resolution the system infers; and whether review quality is measured from it: the nature of findings
+(a demonstrated defect against missing coverage), the light or deep routing actually applied, what
+the fact-check pass removed against what it saw, and how often consecutive verdicts repeat a finding.
+
+**Why it cannot be defaulted.** Pieces exist: rebuttals keyed on finding identity (Step 48), learned
+false-positive patterns (Step 63), acceptance of a whole verdict (Step 188), and the triage decision
+and fact-check outcome persisted with each verdict. None of them is a ruling on one finding, and an
+accepted risk is not a false positive: folding the two corrupts every precision number built on them.
+
+**What adoption costs.** A ruling vocabulary kept apart from Step 188's acceptance. Denominators
+recorded where they are observed: the number of findings the fact-check pass saw is not reconstructed
+by the list published after counter-review. The presence of each finding in each verdict recorded as
+history rather than inferred from a mutable findings table. And "not measured" kept distinct from zero
+on every view that shows these numbers.
+
+### D-11 - A second agent runtime, and provider accounts managed in the product
+
+Raised by the upstream-parity pass of 2026-09-25 (upstream PR 927, still open there).
+
+**The question.** Whether a session or an automation may run on a second agent runtime beside OpenCode
+(one built on a provider's own agent SDK), selected per session or per automation, and whether a model
+provider's accounts, including subscription sign-in, are managed as product objects.
+
+**Why it cannot be defaulted.** The runtime port was designed to take a second adapter (§4.2), so the
+question is not whether one can exist but what parity it must reach before a session may select it:
+the review, stack and auto-fix tools this design gives its agents, credential selection, cancellation
+and resume. The upstream implementation is not portable as it stands: any signed-in user administers
+the accounts, the first connected account silently becomes the default for sessions that pinned none,
+the fork's own tools are missing from the new runtime, and none of its checks runs a real turn on it.
+
+**What adoption costs.** Tool parity verified against the real binary; account management under
+§13.3's matrix with an explicit default; one real end-to-end turn per runtime in CI; and a reading of
+the provider's own terms on whether subscription credentials may drive automated sessions.
 
 ## Recording an outcome
 
