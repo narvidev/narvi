@@ -7058,7 +7058,7 @@ deletes it; after that it is unknown); the hint only decides which is looked up 
 the requesting client, its whole grant is deleted, so both token types revoke the same thing. A token
 that is unknown, already gone, or issued to another client is left alone and gets the very same answer:
 the caller learns nothing about a token that is not its own, and this endpoint never revokes another
-client's authorization (RFC 7009 §2.1). Presenting another client's refresh token at the token endpoint
+client's authorization (RFC 7009 section 2.1). Presenting another client's refresh token at the token endpoint
 is a different act — an attempt to use a copied credential — and is a replay (§43.16). A disabled client
 may still revoke, since revocation only gives access back. Like
 the token endpoint, it reads no cookie; a person disconnects an app from Settings instead (§43.18).
