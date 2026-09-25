@@ -105,6 +105,76 @@ func TestOrigin_CrossSiteRefused_TrustedAndAbsentPass(t *testing.T) {
 	})
 }
 
+// TestOrigin_DNSRebindingRefused pins the fix for round 2 review finding
+// N12: net/http's own CrossOriginProtection.Handler exempts a request
+// whose Origin equals its own Host header -- checked BEFORE its own
+// trusted-origin list is ever consulted -- and exempts
+// Sec-Fetch-Site:"same-origin"/"none" outright. A DNS-rebinding request
+// (an attacker-controlled hostname resolved to this deployment's own IP)
+// has EXACTLY that shape: Host and Origin both name the attacker's own
+// hostname, and a same-origin XHR/fetch from that page sends
+// Sec-Fetch-Site: same-origin. A prior revision of RequireTrustedOrigin
+// (protection.Handler, unmodified) answered 503/401 for such a request
+// instead of the 403 handler.go's own doc comment and technical plan
+// §43.2 both already claimed unconditionally. RequireTrustedOrigin now
+// performs its own explicit comparison against cfg.PublicBaseURL's own
+// origin, with no such exemption, so this request -- Host and Origin
+// BOTH "attacker.example:1234", never PublicBaseURL's own
+// "http://example.test" -- must be refused 403 regardless.
+func TestOrigin_DNSRebindingRefused(t *testing.T) {
+	handler := newTestHandler(t, true, true, testTwins())
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Host = "attacker.example:1234"
+	req.Header.Set("Origin", "http://attacker.example:1234")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, body = %s, want 403 (a DNS-rebinding-style Origin -- equal to its own Host, with Sec-Fetch-Site:same-origin -- must never be exempted)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestNewHandler_InnerCrossOriginProtection_RefusesCrossSite pins the fix
+// for round 2 review finding N19: NewHandler's OWN doc comment calls its
+// returned handler "Origin-protected" as a second, defense-in-depth
+// layer (StreamableHTTPOptions.CrossOriginProtection), independent of
+// RequireTrustedOrigin mounted in front of it in every other test in this
+// file. None of those other tests can tell that inner layer apart from
+// "no protection at all", because RequireTrustedOrigin's own 403 always
+// fires first. This test mounts NewHandler's returned handler DIRECTLY,
+// deliberately WITHOUT RequireTrustedOrigin in front (mirroring a rig
+// that only wires RequireEnabled + auth, which is exactly what this
+// package's own mcp_test parity rig, integration_test.go's
+// newMCPTestRig, used to do before this fix), so a cross-site Origin
+// reaching this handler is refused ONLY if the inner layer itself is
+// still there. Setting NewHandler's own StreamableHTTPOptions.
+// CrossOriginProtection to nil (go-sdk v1.8.0: nil means "no protection
+// applied") would make this exact request succeed instead, failing this
+// test.
+func TestNewHandler_InnerCrossOriginProtection_RefusesCrossSite(t *testing.T) {
+	cfg := Config{PublicBaseURL: testPublicBaseURL}
+	mcpHandler, err := NewHandler(cfg, testTwins())
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	handler := RequireEnabled(true)(fakeAuth(true, testUser)(mcpHandler))
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Origin", "https://evil.example")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, body = %s, want 403 from NewHandler's OWN inner CrossOriginProtection layer (no RequireTrustedOrigin is mounted in front of it here)", rec.Code, rec.Body.String())
+	}
+}
+
 // TestOrigin_RunsBeforeEveryOtherGate proves technical plan §43.2/§43.6's
 // own gate order is load-bearing, not merely tidier: RequireTrustedOrigin
 // is mounted FIRST in the /mcp route group's own chain (newTestHandler),
