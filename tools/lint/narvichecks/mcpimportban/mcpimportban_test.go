@@ -35,7 +35,14 @@ import (
 // mcpgateway -- a sibling of internal/adapters/inbound/mcp that merely
 // shares its own "mcp" prefix as CHARACTERS, not as a path segment
 // (finding N18: pins isTargetPackage's/matchesPathOrSubpackage's own
-// "+/" boundary).
+// "+/" boundary). It also fires for two NEAR MISSES of the allow-list
+// itself (bad3.go, round 4 review finding S9): wshub, a real sibling of
+// mcp under the SAME internal/adapters/inbound tree (proving httpapi/
+// auth are on the allow-list INDIVIDUALLY, never as "the whole inbound
+// tree"), and httpapix, a package whose path merely shares httpapi's own
+// characters as a string prefix (proving allowedPrefixes' own loop
+// applies the same "+/" boundary matchesPathOrSubpackage already gives
+// isTargetPackage, never a bare strings.HasPrefix).
 func TestAnalyzer(t *testing.T) {
 	testdata := analysistest.TestData()
 	analysistest.Run(t, testdata, mcpimportban.Analyzer,
