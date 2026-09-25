@@ -6803,7 +6803,9 @@ import ban: the MCP adapter package — and every one of its own subpackages, a 
 the exact package path, so a future subpackage cannot import a banned path itself and hand the parent
 package a value that lets it reach a store or the authz domain without ever importing either directly —
 may import the official SDK, the REST handler package, the auth and platform packages, contracts, chi,
-and stdlib — never the Postgres adapter, sqlcgen, the authz domain, or any application service package.
+stdlib, and one domain package, the scope vocabulary `internal/domain/mcpscope` (§43.17: a pure table
+that can reach no store; its exact path only, never a subpackage) — never the Postgres adapter, sqlcgen,
+the authz domain, or any application service package.
 With that ban in place the adapter cannot reach a store or render an
 authorization verdict except through an HTTP handler it did not write itself. Second, a twin-registration
 test: every tool in the table must name a "METHOD /path" that is a real, registered route — a tool
@@ -6940,7 +6942,8 @@ document is Narvi's own small struct — issuer, both endpoints, the advertised 
 `token_endpoint_auth_methods` `["none"]`, `code_challenge_methods` `["S256"]`, and
 `authorization_response_iss_parameter_supported: true` — with no `jwks_uri` (no token here is a JWT), no
 revocation or registration endpoint, and no metadata-document support until the pieces that build them.
-Both documents carry `Cache-Control: max-age=300` and `Access-Control-Allow-Origin: *`.
+Both documents carry `Cache-Control: public, max-age=<MCPDiscoveryCacheMaxAge in seconds>` (§43.16)
+and `Access-Control-Allow-Origin: *`.
 
 **The authorization endpoint** validates in the order OAuth 2.1 prescribes. A missing, unknown or
 disabled `client_id`, or a `redirect_uri` that does not match one registered for it (§43.15), renders an
@@ -6951,8 +6954,9 @@ this rule exists to prevent. Every later failure redirects to the validated `red
 than `S256` (absent and `plain` included), is `invalid_request` — PKCE is mandatory for every client; a
 missing `resource`, or one that is not this deployment's canonical resource after scheme/host case
 folding, default-port elision and one trailing slash trimmed, is `invalid_target` (RFC 8707); any scope
-this build does not advertise is `invalid_scope`; a `state` over 512 bytes, or any parameter repeated, is
-`invalid_request`. An absent or empty `scope` is legitimate: it asks for a scope-less grant (§43.17). A
+this build does not advertise is `invalid_scope`; a `state` over 512 bytes, a `state` that is not valid
+UTF-8 or carries a NUL byte, or any parameter repeated, is `invalid_request` (such a `client_id` is an
+unknown client: text Postgres cannot store is the caller's error, never a server fault). An absent or empty `scope` is legitimate: it asks for a scope-less grant (§43.17). A
 valid request is stored (`mcp_oauth_authorization_requests`, expiring after
 `MCPAuthorizationRequestTTL`) and the browser is redirected to `/oauth/consent?request=<id>` — through
 `/sign-in?next=` first when it carries no valid session. Only the request id travels through sign-in,
@@ -6985,24 +6989,33 @@ who must be the request's bound user; the nonce, compared as hashes in constant 
 neither consumed nor expired; `authz.ActionConnectMCPClient` for the user's role; and every selected
 scope one the request asked for — the user can narrow, never widen. Approval, in one transaction,
 consumes the request, records the grant (§43.16: the user's one grant for this client, created or
-replaced, expiring after `MCPGrantMaxLifetime`), issues a single
-authorization code bound to the request's PKCE challenge, redirect URI and resource (expiring after
-`MCPAuthorizationCodeTTL`), and records `mcp_authorization.granted`; the browser is then redirected to
+renewed, expiring after `MCPGrantMaxLifetime`), issues a single
+authorization code bound to the request's PKCE challenge, redirect URI and resource and carrying exactly
+the scopes just approved (expiring after `MCPAuthorizationCodeTTL`), and records
+`mcp_authorization.granted`; the browser is then redirected to
 the **stored** redirect URI — never one read from the form — with `code`, `state` and `iss`. Denial
 consumes the request and redirects with `error=access_denied`; a refusal is not an audit row.
 
 **The token endpoint** takes `application/x-www-form-urlencoded` parameters from the body only and
 answers JSON with `Cache-Control: no-store`. Client authentication is the public-client form: `client_id`
 in the body, or HTTP Basic with an empty secret (what a standard OAuth library's auto-detection tries
-first); both present must agree, and any client secret is refused. Only `grant_type=authorization_code`
-is supported. The code is consumed at most once; a code that was already consumed is a replay, and the
-grant it produced is deleted — its tokens stop working on their next use — with an
-`mcp_authorization.revoked` audit row (reason `code_reuse`). An expired code, one issued to another
-client, a `redirect_uri` that differs from the stored one, a `resource` that differs from the stored one,
-or a `code_verifier` whose S256 digest does not equal the stored challenge (compared in constant time)
-is `invalid_grant`. A failed exchange still consumes the code. Success issues one access token
-(`MCPAccessTokenTTL`, never past the grant's own expiry) and answers `access_token`, `token_type`
-`Bearer`, `expires_in`, and `scope` — always present, because the user may have narrowed it.
+first); both present must agree, any client secret is refused, and a `client_id` Postgres cannot
+store (invalid UTF-8, a NUL byte) is an unknown client. Only `grant_type=authorization_code` is
+supported. A missing `resource`, or one that is not this deployment's canonical resource, is
+`invalid_target` (RFC 8707 §2); like every refusal decided from the request alone — a malformed or
+missing parameter, a failed client authentication, an unsupported grant type — it is answered before
+the code is looked up and leaves the code unspent (still bound by PKCE, still expiring after
+`MCPAuthorizationCodeTTL`). The code is consumed at most once; a code that was already consumed is a
+replay, and the grant it produced is deleted — its tokens stop working on their next use — with an
+`mcp_authorization.revoked` audit row (reason `code_reuse`). A code that has been looked up is spent by
+the attempt whatever follows: an expired code, one issued to another client, a `redirect_uri` that
+differs from the stored one, or a `code_verifier` whose S256 digest does not equal the stored challenge
+(compared in constant time) is `invalid_grant`, and a code whose stored resource is not this
+deployment's canonical resource (possible only if `PublicBaseURL` changed between authorization and
+exchange) is `invalid_target`. Success issues one access token (`MCPAccessTokenTTL`, never past the
+grant's own expiry) holding exactly the code's scopes, and answers `access_token`, `token_type`
+`Bearer`, `expires_in`, and `scope` — always present, because the user may have narrowed it, and always
+the token's own scopes.
 
 ### 43.15 Clients: pre-registration, metadata documents, dynamic registration
 
@@ -7029,11 +7042,17 @@ enum already carries their two values so that piece needs no enum-only migration
 
 ### 43.16 Grants, tokens, and revocation
 
-A grant (`mcp_oauth_grants`) is a user's authorization of one client — scopes and resource — and a user
-holds at most one per client: consenting to the same client again replaces the grant's scopes and
-renews its lifetime in place (same id, so tokens already issued keep working, under the scopes just
-consented to). Without refresh tokens a client re-runs consent whenever its access token expires, and
-one row per consent would grow the table and the Connected apps list without bound. The grant exists
+A grant (`mcp_oauth_grants`) is a user's authorization of one client — its resource and lifetime — and
+a user holds at most one per client: consenting to the same client again renews the grant's lifetime in
+place (same id) rather than adding a row. Without refresh tokens a client re-runs consent whenever its
+access token expires, and one row per consent would grow the table and the Connected apps list without
+bound. **What a credential may do is fixed when it is issued:** an authorization code carries exactly
+the scopes approved in the consent decision that issued it, the access token it is exchanged for copies
+them, and the bearer check reads the token's own scopes — never the grant's. The grant's `scopes` only
+record the most recent approval, for the Connected apps list, and no authorization decision reads them,
+so a later consent for the same client — from a second install, say, whose `client_id` is shared — can
+neither widen nor narrow a token already issued. Withdrawing access is revocation, not re-consent. The
+grant exists
 if and only if the authorization is live: every authorization code and access token references it
 with `ON DELETE CASCADE`, so revocation is deleting the grant — nothing to invalidate, nothing to
 broadcast. Codes, access tokens and consent nonces are stored only as `platform.HashToken`
@@ -7042,8 +7061,11 @@ secret scanner or a reviewer reading a log can tell the family, and the whole st
 
 Lifetimes live in `platform/timeouts.go`: `MCPAuthorizationRequestTTL` (10 minutes, the consent window),
 `MCPAuthorizationCodeTTL` (60 seconds), `MCPAccessTokenTTL` (1 hour), `MCPGrantMaxLifetime` (90 days,
-absolute), and `MCPGrantLastUsedWriteInterval` (5 minutes); `Validate` requires the code to expire
-inside the consent window and the token inside the grant. The expired-credential sweep deletes expired
+absolute), `MCPGrantLastUsedWriteInterval` (5 minutes), and `MCPDiscoveryCacheMaxAge` (5 minutes, the
+discovery documents' `Cache-Control` max-age); `Validate` requires the code to expire inside the consent
+window, the token inside the grant, and the discovery cache inside one token lifetime (until (b) a client
+re-authorizes every token lifetime, so each re-authorization reads documents fetched after the previous
+token was issued). The expired-credential sweep deletes expired
 requests, codes, tokens and grants on the same tick as `user_sessions`.
 
 **Bearer verification** (`auth.RequireMCPBearer`, in place of the cookie middleware on `/mcp`) runs on
@@ -7057,7 +7079,7 @@ refusal is the same `401 {"error":"unauthorized"}` every other route answers, wi
 token was presented); the reason is logged, never returned. A lookup that fails for any reason other
 than "no such token" is a 500, not a 401, so a database fault never sends a client back through consent.
 Success attaches the same `platform.AuthenticatedUser` a cookie would (id, role and email read from the
-`users` row on this call) plus the `platform.MCPGrant`, and removes the `Authorization` header from the
+`users` row on this call) plus the `platform.MCPGrant`, whose scopes are the token's own, and removes the `Authorization` header from the
 request it passes on, so nothing downstream ever holds the token; a grant's `last_used_at` is refreshed
 at most once per `MCPGrantLastUsedWriteInterval`, and a failure to write it is logged without affecting
 the call.
@@ -7079,9 +7101,10 @@ a scope string: a per-grant repository allowlist, enforced as an argument-level 
 that name a repository, is reserved for the first such tool.
 
 Each tool declares the scope it requires, and the per-request server (§43.7) registers **only** the tools
-the request's grant satisfies. A client that may not use a tool is not told it exists:
+the request's token satisfies (its own scopes, §43.16). A client that may not use a tool is not told it
+exists:
 
-- `tools/list` for a scope-less grant is `200` with `"tools": []`, and `server/discover` still succeeds;
+- `tools/list` for a scope-less token is `200` with `"tools": []`, and `server/discover` still succeeds;
 - `tools/call` naming a hidden tool answers the SDK's own `-32602` "unknown tool" error, byte-identical
   to a name that never existed — never an `insufficient_scope` that would confirm the tool is there;
 - `instructions` is composed from the visible tools only, and names none when none are visible;
@@ -7096,8 +7119,9 @@ enters discovery without admitting the authz domain into the adapter.
 ### 43.18 Settings, audit, and the admin view
 
 Every user manages their own authorizations in Settings → Integrations, in a "Connected apps" section
-beside the ChatGPT-account link: client name, granted scopes, when it was granted, when it was last used,
-when it expires, and a Revoke action behind a confirmation. `GET /api/me/mcp-authorizations`
+beside the ChatGPT-account link: client name, the scopes of the most recent approval, when it was
+granted, when it was last used, when it expires, and a Revoke action behind a confirmation — the one way
+to withdraw access, since approving an app again never takes back what an earlier approval issued. `GET /api/me/mcp-authorizations`
 (`authz.ActionViewOwnProfile`) lists the caller's own unexpired grants; `DELETE
 /api/me/mcp-authorizations/{authorizationID}` (`authz.ActionRevokeOwnMCPAuthorization`, open to every
 role and deliberately separate from the connect action so disconnecting can never be taken away) deletes
@@ -7120,18 +7144,21 @@ authorizations — and revocation on their behalf — is piece (d).
 | Code interception | PKCE S256 mandatory, 60-second single-use code bound to client, redirect URI and resource | `TestToken_PKCE_WrongVerifierIsInvalidGrant`, `TestToken_PlainChallengeRefusedAtAuthorize`, `TestToken_ExpiredCodeIsInvalidGrant`, `TestToken_CodeForOtherClientIsInvalidGrant`, `TestPKCE_UsesConstantTimeCompare` |
 | Code replay | a second use revokes the grant | `TestToken_CodeReuseRevokesGrant` |
 | Mix-up | `iss` on every authorization response, advertised | `TestAuthorize_IssOnSuccessAndError`, the end-to-end test's own SDK issuer check |
-| Audience confusion | `resource` required and bound at authorize, token and every call | `TestAuthorize_ResourceMismatchIsInvalidTarget`, `TestBearer_GrantResourceMismatchIs401` |
+| Audience confusion | `resource` required and bound at authorize, token and every call | `TestAuthorize_ResourceMismatchIsInvalidTarget`, `TestToken_ResourceMismatchIsInvalidTarget`, `TestBearer_GrantResourceMismatchIs401` |
 | Token passthrough | the bearer gate strips the header; the twin's synthesized request carries no header at all | `TestRequireMCPBearer_AttachesPrincipalAndStripsToken`, `TestBridge_NoAuthorizationHeaderReachesTwin` |
 | Consent clickjacking and CSRF | frame headers; SameSite cookie, hashed per-render nonce, same-origin check, request bound to one user | `TestConsent_FrameHeaders`, `TestConsent_MissingOrWrongNonceRefused`, `TestConsent_CrossSiteOriginRefused`, `TestConsent_OtherUserCannotDecide` |
-| Scope escalation | consent narrows only; unadvertised scopes refused | `TestConsent_CannotAddUnrequestedScope`, `TestAuthorize_UnadvertisedScopeRefused` |
+| Scope escalation | consent narrows only; unadvertised scopes refused; a token's scopes are fixed at issuance, so a later consent can neither widen nor narrow it | `TestConsent_CannotAddUnrequestedScope`, `TestAuthorize_UnadvertisedScopeRefused`, `TestToken_ScopesFixedAtIssuance_LaterConsentCannotWiden`, `TestToken_ScopesFixedAtIssuance_LaterConsentCannotNarrow` |
 | Client identity spoofing | the page shows who registered the client and the true redirect host, with a loopback warning | `TestConsent_ShowsClientIdentityAndRedirectHost` |
-| Revoked, disabled or deleted principals | one join per call, no cache; deleting a client cascades its grants | `TestBearer_NoCacheBetweenCalls`, `TestOAuth_RevokedAuthorizationStopsOnNextCall_User`, `_ClientDeleted`, `_DisabledUser`, `TestBearer_DisabledClientIs401NextCall`, `TestClient_DeleteCascadesGrants` |
-| Discovery leak | per-request tool registration by scope; composed instructions; empty defect server | `TestToolsList_ScopeFilter_Table`, `TestInstructions_NameOnlyVisibleTools`, `TestHiddenToolCall_IsIndistinguishableFromUnknownTool`, `TestOAuth_ScopelessGrant_ToolsListEmpty` |
+| Revoked, disabled or deleted principals | one join per call, no cache; deleting a client cascades its grants, each audited; a disabled client gets no consent page | `TestBearer_NoCacheBetweenCalls`, `TestOAuth_ProductionRouter/RevokedAuthorizationStopsOnNextCall_User`, `_ClientDeleted`, `_DisabledUser`, `TestOAuth_ProductionRouter/DisabledClientIs401NextCall`, `TestClient_DeleteCascadesGrants`, `TestClient_DeleteAuditsGrantAddedByConcurrentConsent`, `TestConsent_ClientDisabledBeforeRenderRefused` |
+| Discovery leak | per-request tool registration by scope; composed instructions; empty defect server | `TestToolsList_ScopeFilter_Table`, `TestInstructions_NameOnlyVisibleTools`, `TestHiddenToolCall_IsIndistinguishableFromUnknownTool`, `TestOAuth_ProductionRouter/ScopelessGrant_ToolsListEmpty` |
 | Phishing through the login return path | the sign-in view accepts only `/oauth/consent?request=<uuid>` as a server-rendered return target; both login handlers accept only same-origin paths | `TestLogin_NextAcceptsConsentPath`, `TestOIDCLogin_NextReturnsToConsentPage`, the sign-in view's own return-to test |
 | Table growth | a TTL on every row kind, swept | `TestExpiredCleanup_SweepsMCPRows` |
 | A token doing more than its user | same twins, same authz check, role read per call | `TestParity_BearerEqualsCookieForEveryRole` |
 
-The row's exit criterion is proven end to end by `TestOAuth_EndToEnd_SDKClient`: the official Go SDK's
-own client discovers the resource and the authorization server from a live `401`, drives consent,
-exchanges the code, lists exactly the three tools, and calls one. The parity suite of §43.12 now runs
+The row's exit criterion is proven end to end by `TestOAuth_ProductionRouter/EndToEnd_SDKClient`, on
+the production router itself — `controlplane.Build`'s own, the surface on, served at `PublicBaseURL` —
+never a copy of its routes: the official Go SDK's own client discovers the resource and the
+authorization server from a live `401`, drives consent, exchanges the code, lists exactly the three
+tools, and calls one. The same test proves the surface switched off: the discovery documents and every
+`/oauth` route answer the disabled `503`, and the Settings routes still list and revoke. The parity suite of §43.12 now runs
 over bearer principals minted per role.
