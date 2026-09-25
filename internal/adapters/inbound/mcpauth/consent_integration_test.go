@@ -430,6 +430,29 @@ func TestToken_ScopesFixedAtIssuance_LaterConsentCannotNarrow(t *testing.T) {
 	}
 }
 
+// TestConsent_ClientDisabledBeforeRenderRefused: a client an operator
+// disables between /oauth/authorize and the consent page's first render
+// gets no page -- 400, no nonce minted, the request left unbound -- so
+// it can be neither approved nor denied (denying would redirect to the
+// disabled client). decide()'s own re-check is the second layer
+// (TestConsent_ClientDisabledAfterRenderGrantsNothing).
+func TestConsent_ClientDisabledBeforeRenderRefused(t *testing.T) {
+	r := newASRig(t)
+	_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+	requestID := r.startConsent(t, r.authorizeParams(newVerifier(t)), cookie)
+	if _, err := r.pool.Exec(context.Background(), `UPDATE mcp_oauth_clients SET disabled_at = now() WHERE id = $1`, r.client.ID); err != nil {
+		t.Fatal(err)
+	}
+	rec, nonce := r.renderConsent(t, requestID, cookie)
+	if rec.Code != http.StatusBadRequest || nonce != "" || strings.Contains(rec.Body.String(), `name="nonce"`) {
+		t.Fatalf("render for a disabled client: status %d nonce %q, want 400 and no consent form", rec.Code, nonce)
+	}
+	var bound bool
+	if err := r.pool.QueryRow(context.Background(), `SELECT user_id IS NOT NULL OR csrf_nonce_hash IS NOT NULL FROM mcp_oauth_authorization_requests WHERE id = $1`, requestID).Scan(&bound); err != nil || bound {
+		t.Fatalf("request after a refused render: bound = %v (err %v), want unbound and without a nonce", bound, err)
+	}
+}
+
 // TestConsent_ClientDisabledAfterRenderGrantsNothing: a client an
 // operator disables while its consent page is open cannot be approved --
 // no grant, no code, no redirect.
