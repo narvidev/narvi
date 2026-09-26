@@ -85,17 +85,21 @@
 // callback a section hands a row, and the section's own Register client,
 // sends exactly the request asserted. Each list holds two rows, and every
 // call a flow makes in one of them -- Confirm delete, Confirm disable,
-// Enable, Confirm revoke -- a flow also makes in the other, so the id sent
-// is the clicked row's own whichever row that is: a handler that always
-// sends the first row's id, or the last's, fails a flow. Disable shows
-// only in a row whose client is enabled, and Enable only in one whose
-// client is disabled, so their second flows run over the two clients the
-// other way round. A flow also asserts every row's buttons in the render
-// right after its last click -- with its request in flight, only the row
-// that sent it shows the in-flight label and is locked, the other row's
-// own confirmation open where the flow opened it -- and, once the request
-// is done, exactly which of the screen's cached lists and audit pages it
-// invalidated.
+// Enable, Confirm revoke -- a flow also makes in the other: a handler that
+// always sends the first row's id, or the last's, fails a flow. The two
+// rows are lookalikes, one name and different ids, so a handler that finds
+// its row by name fails one too. Disable shows only in a row whose client
+// is enabled, and Enable only in one whose client is disabled, so their
+// second flows run over the two clients the other way round, and a third
+// over two clients both enabled, or both disabled: a handler that finds
+// its row by whether it is disabled fails that one. What else tells the
+// rows apart -- an authorization's host, a client's client ID -- is what
+// a flow finds its row by. A flow also asserts every row's buttons in the
+// render right after its last click -- with its request in flight, only
+// the row that sent it shows the in-flight label and is locked, the other
+// row's own confirmation open where the flow opened it -- and, once the
+// request is done, exactly which of the screen's cached lists and audit
+// pages it invalidated.
 //
 // A request ends after the static render has returned, so no render here
 // reaches its end for real. Each flow that sends one therefore runs again,
@@ -141,6 +145,8 @@
 //     its OTHER one: the check above is per request, and today a client
 //     whose disable is in flight can still be deleted, and one whose
 //     delete is in flight disabled or enabled;
+//   - a section handler that finds its row by what a flow finds it by: an
+//     authorization's client ID, whose host its row shows, or a client's;
 //   - a section once its list has refetched after a request: a finished
 //     request is shown over the list the flow started with, and what a
 //     row does as its props change is the row walk's;
@@ -1100,14 +1106,31 @@ describe('MCPClientRow -- a disable that has gone through closes its confirmatio
 
 // -- Section flows: each callback a section hands a row, down to fetch --
 
-const TWO_AUTHORIZATIONS = [authorization(), authorization({ id: 'auth/2', clientId: 'narvi_mcp_c_two', clientName: 'Other Tool' })]
+// Every list's two rows are lookalikes: one name, 'Editor Plugin' -- a
+// name the app chooses itself, so never an identity -- and different ids.
+// A handler that finds its row by name finds the first in both.
 
-// The first client is disabled, the second enabled.
-const TWO_CLIENTS = [client({ disabledAt: DISABLED_AT }), client({ id: 'client/2', clientId: 'narvi_mcp_c_two', clientName: 'Other Tool' })]
+// Two apps identified by their description's address: the real one, and a
+// lookalike on another host. Their rows differ only in that host.
+const REAL_HOST = 'tools.example'
+const LOOKALIKE_HOST = 'lookalike.example'
+const TWO_AUTHORIZATIONS = [
+  authorization({ clientKind: 'metadata_document', clientId: `https://${REAL_HOST}/mcp/client.json` }),
+  authorization({ id: 'auth/2', clientKind: 'metadata_document', clientId: `https://${LOOKALIKE_HOST}/mcp/client.json` }),
+]
+
+// Two clients, each row showing its own client ID: the first disabled, the
+// second enabled.
+const TWO_CLIENTS = [client({ disabledAt: DISABLED_AT }), client({ id: 'client/2', clientId: 'narvi_mcp_c_two' })]
 
 // The same two clients, the first enabled and the second disabled: so that
 // Disable and Enable are each clicked in both rows.
-const TWO_CLIENTS_SWAPPED = [client(), client({ id: 'client/2', clientId: 'narvi_mcp_c_two', clientName: 'Other Tool', disabledAt: DISABLED_AT })]
+const TWO_CLIENTS_SWAPPED = [client(), client({ id: 'client/2', clientId: 'narvi_mcp_c_two', disabledAt: DISABLED_AT })]
+
+// The same two clients, both enabled, then both disabled: so that Disable
+// and Enable are each clicked in the second of two rows alike in that too.
+const TWO_CLIENTS_ENABLED = [client(), client({ id: 'client/2', clientId: 'narvi_mcp_c_two' })]
+const TWO_CLIENTS_DISABLED = [client({ disabledAt: DISABLED_AT }), client({ id: 'client/2', clientId: 'narvi_mcp_c_two', disabledAt: DISABLED_AT })]
 
 const OTHER_MEMBER_ID = 'user/2'
 
@@ -1204,11 +1227,15 @@ type SectionFlow = {
 }
 
 const CLIENTS_SWAPPED = { name: 'its first client enabled and its second disabled', data: { clients: TWO_CLIENTS_SWAPPED } }
+const CLIENTS_ENABLED = { name: 'both its clients enabled', data: { clients: TWO_CLIENTS_ENABLED } }
+const CLIENTS_DISABLED = { name: 'both its clients disabled', data: { clients: TWO_CLIENTS_DISABLED } }
 
 // Every call a section's rows make is made in each of its two rows (the
-// last test below says so by name): Confirm delete, Confirm disable,
-// Enable and both Confirm revokes each send the id of the row clicked in,
-// whichever row that is.
+// last test below says so by name), over rows of one name: Confirm delete,
+// Confirm disable, Enable and both Confirm revokes each send the id of the
+// row clicked in, whether it is the first or the last, and whether or not
+// another row has its name -- or, for Confirm disable and Enable, its
+// state.
 const SECTION_FLOWS: readonly SectionFlow[] = [
   {
     start: 'the MCP clients section',
@@ -1258,6 +1285,29 @@ const SECTION_FLOWS: readonly SectionFlow[] = [
     steps: [{ row: 'narvi_mcp_c_two', click: 'Enable' }],
     mutation: 'disable/enable',
     after: { rows: { narvi_mcp_c_one: ['Disable', 'Delete'], narvi_mcp_c_two: ['Enabling… (disabled)', 'Delete'] }, outside: ['Register client (disabled)'] },
+    sends: [{ url: '/api/mcp-clients/client%2F2/enable', method: 'POST' }],
+    calls: ['MCPClientRow.onSetDisabled'],
+    invalidates: ['the MCP clients list'],
+  },
+  {
+    start: 'the MCP clients section',
+    list: CLIENTS_ENABLED,
+    steps: [
+      { row: 'narvi_mcp_c_two', click: 'Disable' },
+      { row: 'narvi_mcp_c_two', click: 'Confirm disable' },
+    ],
+    mutation: 'disable/enable',
+    after: { rows: { narvi_mcp_c_one: ['Disable', 'Delete'], narvi_mcp_c_two: ['Disabling… (disabled)', 'Cancel'] }, outside: ['Register client (disabled)'] },
+    sends: [{ url: '/api/mcp-clients/client%2F2/disable', method: 'POST' }],
+    calls: ['MCPClientRow.onSetDisabled'],
+    invalidates: ['the MCP clients list'],
+  },
+  {
+    start: 'the MCP clients section',
+    list: CLIENTS_DISABLED,
+    steps: [{ row: 'narvi_mcp_c_two', click: 'Enable' }],
+    mutation: 'disable/enable',
+    after: { rows: { narvi_mcp_c_one: ['Enable', 'Delete'], narvi_mcp_c_two: ['Enabling… (disabled)', 'Delete'] }, outside: ['Register client (disabled)'] },
     sends: [{ url: '/api/mcp-clients/client%2F2/enable', method: 'POST' }],
     calls: ['MCPClientRow.onSetDisabled'],
     invalidates: ['the MCP clients list'],
@@ -1316,12 +1366,12 @@ const SECTION_FLOWS: readonly SectionFlow[] = [
   {
     start: "a member's drawer",
     steps: [
-      { row: 'Editor Plugin', click: 'Revoke' },
-      { row: 'Other Tool', click: 'Revoke' },
-      { row: 'Other Tool', click: 'Confirm revoke' },
+      { row: REAL_HOST, click: 'Revoke' },
+      { row: LOOKALIKE_HOST, click: 'Revoke' },
+      { row: LOOKALIKE_HOST, click: 'Confirm revoke' },
     ],
     mutation: 'revoke',
-    after: { rows: { 'Editor Plugin': ['Confirm revoke', 'Cancel'], 'Other Tool': ['Revoking… (disabled)', 'Cancel'] }, outside: [] },
+    after: { rows: { [REAL_HOST]: ['Confirm revoke', 'Cancel'], [LOOKALIKE_HOST]: ['Revoking… (disabled)', 'Cancel'] }, outside: [] },
     sends: [{ url: '/api/members/user%2F1%3Fx/mcp-authorizations/auth%2F2', method: 'DELETE' }],
     calls: ['ConnectedAppRow.onRevoke'],
     // Every user's list, the admin's own included, and the audit log below.
@@ -1330,12 +1380,12 @@ const SECTION_FLOWS: readonly SectionFlow[] = [
   {
     start: "a member's drawer",
     steps: [
-      { row: 'Other Tool', click: 'Revoke' },
-      { row: 'Editor Plugin', click: 'Revoke' },
-      { row: 'Editor Plugin', click: 'Confirm revoke' },
+      { row: LOOKALIKE_HOST, click: 'Revoke' },
+      { row: REAL_HOST, click: 'Revoke' },
+      { row: REAL_HOST, click: 'Confirm revoke' },
     ],
     mutation: 'revoke',
-    after: { rows: { 'Editor Plugin': ['Revoking… (disabled)', 'Cancel'], 'Other Tool': ['Confirm revoke', 'Cancel'] }, outside: [] },
+    after: { rows: { [REAL_HOST]: ['Revoking… (disabled)', 'Cancel'], [LOOKALIKE_HOST]: ['Confirm revoke', 'Cancel'] }, outside: [] },
     sends: [{ url: '/api/members/user%2F1%3Fx/mcp-authorizations/auth%2F1', method: 'DELETE' }],
     calls: ['ConnectedAppRow.onRevoke'],
     invalidates: ['your own connected apps', "this member's connected apps", "another member's connected apps", 'an audit log page'],
@@ -1343,12 +1393,12 @@ const SECTION_FLOWS: readonly SectionFlow[] = [
   {
     start: 'your own connected apps',
     steps: [
-      { row: 'Editor Plugin', click: 'Revoke' },
-      { row: 'Other Tool', click: 'Revoke' },
-      { row: 'Other Tool', click: 'Confirm revoke' },
+      { row: REAL_HOST, click: 'Revoke' },
+      { row: LOOKALIKE_HOST, click: 'Revoke' },
+      { row: LOOKALIKE_HOST, click: 'Confirm revoke' },
     ],
     mutation: 'revoke',
-    after: { rows: { 'Editor Plugin': ['Confirm revoke', 'Cancel'], 'Other Tool': ['Revoking… (disabled)', 'Cancel'] }, outside: [] },
+    after: { rows: { [REAL_HOST]: ['Confirm revoke', 'Cancel'], [LOOKALIKE_HOST]: ['Revoking… (disabled)', 'Cancel'] }, outside: [] },
     sends: [{ url: '/api/me/mcp-authorizations/auth%2F2', method: 'DELETE' }],
     calls: ['ConnectedAppRow.onRevoke'],
     invalidates: ['your own connected apps'],
@@ -1356,12 +1406,12 @@ const SECTION_FLOWS: readonly SectionFlow[] = [
   {
     start: 'your own connected apps',
     steps: [
-      { row: 'Other Tool', click: 'Revoke' },
-      { row: 'Editor Plugin', click: 'Revoke' },
-      { row: 'Editor Plugin', click: 'Confirm revoke' },
+      { row: LOOKALIKE_HOST, click: 'Revoke' },
+      { row: REAL_HOST, click: 'Revoke' },
+      { row: REAL_HOST, click: 'Confirm revoke' },
     ],
     mutation: 'revoke',
-    after: { rows: { 'Editor Plugin': ['Revoking… (disabled)', 'Cancel'], 'Other Tool': ['Confirm revoke', 'Cancel'] }, outside: [] },
+    after: { rows: { [REAL_HOST]: ['Revoking… (disabled)', 'Cancel'], [LOOKALIKE_HOST]: ['Confirm revoke', 'Cancel'] }, outside: [] },
     sends: [{ url: '/api/me/mcp-authorizations/auth%2F1', method: 'DELETE' }],
     calls: ['ConnectedAppRow.onRevoke'],
     invalidates: ['your own connected apps'],
