@@ -7083,7 +7083,9 @@ narrowing asked for.
 
 **The brakes.** The authorization and token endpoints are braked per client network, as dynamic
 registration is (§43.15): the same in-memory token bucket, keyed on the connecting peer alone
-(`RemoteAddr`: an IPv4 address, or an IPv6 address by its /48 — never a forwarded header), one bounded
+(`RemoteAddr`: an IPv4 address, or an IPv6 address by its /48 — never a forwarded header — except that an
+IPv6 address carrying an IPv4 client's address is keyed as that IPv4 address: IPv4-mapped, RFC 6052's
+well-known NAT64 prefix `64:ff9b::/96`, the IPv4-compatible form and Teredo), one bounded
 table per route that forgets the network seen least recently rather than refusing a newcomer, so one
 network's flood never touches another network's bucket. `GET /oauth/authorize` admits a burst of
 `MCPAuthorizeRateBurst` (10) requests, then one per `MCPAuthorizeRateInterval` (3 seconds); `POST
@@ -7097,7 +7099,9 @@ credential is dead (the MCP Go SDK's client, handed `invalid_grant` by a refresh
 sends its user back through consent, while any other error only fails that one call and keeps its refresh
 token for the next). Each refusal is logged at WARN with the route's path and the client network, never
 the request's query or body. The price is stated, not hidden: everyone behind one address shares one
-bucket — behind a proxy that hides client addresses, everyone shares one — and a party rotating through
+bucket — behind a proxy that hides client addresses, everyone shares one, and so does every IPv4 client
+behind a translator using a network-specific prefix, which nothing in the address tells from any other
+IPv6 network — and a party rotating through
 more networks than a table holds gets each one's burst afresh; the pending-request cap and every row's
 TTL are the bounds that hold whatever the brakes do. The cap has a price of its own: it is per client, so
 a sustained flood of authorization requests for one client — even from one network at its brake's pace,
@@ -7500,7 +7504,7 @@ a brake or the pending-request cap (§43.14), which is logged instead.
 | Discovery leak | per-request tool registration by scope; composed instructions; empty defect server | `TestToolsList_ScopeFilter_Table`, `TestInstructions_NameOnlyVisibleTools`, `TestHiddenToolCall_IsIndistinguishableFromUnknownTool`, `TestOAuth_ProductionRouter/ScopelessGrant_ToolsListEmpty` |
 | Phishing through the login return path | the sign-in view accepts only `/oauth/consent?request=<uuid>` as a server-rendered return target; both login handlers accept only same-origin paths | `TestLogin_NextAcceptsConsentPath`, `TestOIDCLogin_NextReturnsToConsentPage`, the sign-in view's own return-to test |
 | Table growth | a TTL on every row kind, rotated refresh tokens included, swept; unused, enabled self-registered clients swept, never one whose request or grant committed while the sweep waited; dynamic registration and the authorization endpoint braked per client network (`RemoteAddr` only; IPv6 by /48), with bounded limiter memory that no network can use to lock out another; at most `MCPMaxPendingAuthorizationRequestsPerClient` requests of one client pending, counted and stored under the client's lock so no race exceeds it, refused past it with a page that stores nothing — a flood for one client can hold that client at its cap, stated in §43.14, never touching a connected app or another client | `TestExpiredCleanup_SweepsMCPRows`, `TestExpiredCleanup_SweepsUnusedMCPClients`, `TestLockOrder_ClientRegistrationWriters`, `TestLockOrder_AuthorizationRequestWriter`, `TestAuthorize_PendingCapRefused`, `TestMCPOAuthGrantStore_PendingAuthorizationRequestCap`, `TestRateLimiter_BurstThenOnePerInterval`, `TestRateLimiter_BoundedMemoryEvictsLeastRecentlyUsed`, `TestRateLimiter_OneNetworkCannotLockOutOthers`, `TestClientAddressKey`, `TestAuthorizeRateLimited_Answer`, `TestOAuth_ProductionRouter/Register_RateLimited`, `TestOAuth_ProductionRouter/RateLimit_AuthorizeEndpoint`, `TestOAuth_ProductionRouter/Authorize_PendingCapRefused` |
-| Abuse of the token endpoint, and a brake that locks users out | the token endpoint braked per client network; a refused request is read no further — no code consumed, no refresh token rotated — and answered `429` `temporarily_unavailable`, never `invalid_grant`, so a client keeps its refresh token and is never sent back to consent by the brake; one network's flood, an IPv6 /48 spraying /64s included, never spends another's bucket; the refusal is logged with the path and the network, never a token or a query | `TestTokenRateLimited_Answer`, `TestRateLimiter_RefusalLogCarriesNoCredential`, `TestOAuth_ProductionRouter/RateLimit_TokenEndpoint429`, `TestOAuth_ProductionRouter/RateLimit_OneNetworkCannotLockOutAnotherRefresh`, `TestOAuth_ProductionRouter/RateLimit_RefusedRefreshSpendsNothing_SDK` |
+| Abuse of the token endpoint, and a brake that locks users out | the token endpoint braked per client network; a refused request is read no further — no code consumed, no refresh token rotated — and answered `429` `temporarily_unavailable`, never `invalid_grant`, so a client keeps its refresh token and is never sent back to consent by the brake; one network's flood, an IPv6 /48 spraying /64s included, never spends another's bucket, and IPv4 clients behind a translator the address names (NAT64's well-known prefix, Teredo) are each their own network; the refusal is logged with the path and the network, never a token or a query | `TestTokenRateLimited_Answer`, `TestRateLimiter_RefusalLogCarriesNoCredential`, `TestRateLimiter_TranslatedIPv4ClientsKeepTheirOwnBuckets`, `TestOAuth_ProductionRouter/RateLimit_TokenEndpoint429`, `TestOAuth_ProductionRouter/RateLimit_OneNetworkCannotLockOutAnotherRefresh`, `TestOAuth_ProductionRouter/RateLimit_RefusedRefreshSpendsNothing_SDK` |
 | A token doing more than its user | same twins, same authz check, role read per call | `TestParity_BearerEqualsCookieForEveryRole` |
 
 The row's exit criterion is proven end to end by `TestOAuth_ProductionRouter/EndToEnd_SDKClient`, on

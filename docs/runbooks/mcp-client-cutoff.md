@@ -125,4 +125,8 @@ listed and revoked.
   its refresh token and renews once the brake refills (a few seconds). Every
   user behind the same address shares one bucket: a deployment behind a proxy
   that hides client addresses sees one network for everyone, and trusting a
-  forwarded-for header is a deployment decision not yet made (§43.15).
+  forwarded-for header is a deployment decision not yet made (§43.15). An IPv4
+  client reaching Narvi inside an IPv6 address is keyed as its IPv4 address
+  when the address says so (IPv4-mapped, the well-known NAT64 prefix
+  `64:ff9b::/96`, IPv4-compatible, Teredo); behind a translator using a
+  network-specific prefix, every IPv4 client shares that prefix's `/48`.

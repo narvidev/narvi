@@ -77,6 +77,25 @@ func TestClientAddressKey(t *testing.T) {
 		{"[2001:db8:2::1]:443", "2001:db8:2::/48"},
 		{"[fe80::1%eth0]:443", "fe80::/48"},
 		{"not-an-address", "not-an-address"},
+		// An IPv4 client presented through RFC 6052's well-known NAT64
+		// prefix is keyed as its own IPv4 address, never the prefix's /48.
+		{"[64:ff9b::c633:6401]:1", "198.51.100.1"},
+		{"[64:ff9b::cb00:7109]:1", "203.0.113.9"},
+		{"[64:ff9b::198.51.100.1]:1", "198.51.100.1"},
+		// The deprecated IPv4-compatible form likewise; :: and ::1 are not
+		// IPv4 addresses.
+		{"[::198.51.100.7]:4321", "198.51.100.7"},
+		{"[::1]:443", "::/48"},
+		{"[::]:443", "::/48"},
+		// Teredo (RFC 4380's own example): the client's public IPv4
+		// address, inverted, in the last 32 bits -- two clients behind one
+		// Teredo server are two keys.
+		{"[2001:0:4136:e378:8000:63bf:3fff:fdd2]:443", "192.0.2.45"},
+		{"[2001:0:4136:e378:8000:63bf:34ff:8ef6]:443", "203.0.113.9"},
+		// A network-specific translation prefix cannot be told from any
+		// other IPv6 network: its /48, the stated caveat.
+		{"[2001:db8:64::c633:6401]:1", "2001:db8:64::/48"},
+		{"[64:ff9b:1::c633:6401]:1", "64:ff9b:1::/48"},
 	} {
 		r := httptest.NewRequest(http.MethodPost, "/oauth/register", nil)
 		r.RemoteAddr = tc.remote
@@ -184,6 +203,51 @@ func TestRateLimiter_OneNetworkCannotLockOutOthers(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestRateLimiter_TranslatedIPv4ClientsKeepTheirOwnBuckets: on the token
+// endpoint's brake, as shipped, an IPv4 client reaching the server through
+// a NAT64 translator's well-known prefix -- or as a Teredo client --
+// floods its own bucket alone: another IPv4 client behind the same
+// translator, or the same Teredo server, still refreshes. The flooder's
+// bucket is its IPv4 address's, however it arrives.
+func TestRateLimiter_TranslatedIPv4ClientsKeepTheirOwnBuckets(t *testing.T) {
+	t.Parallel()
+	timeouts := platform.DefaultTimeouts()
+	for _, tc := range []struct {
+		name, flooder, other, flooderAsIPv4 string
+	}{
+		{"NAT64 well-known prefix", "[64:ff9b::c633:6401]:4000", "[64:ff9b::cb00:7109]:4000", "198.51.100.1:4000"},
+		{"Teredo, one server", "[2001:0:4136:e378:8000:63bf:3fff:fdd2]:4000", "[2001:0:4136:e378:8000:63bf:34ff:8ef6]:4000", "192.0.2.45:4000"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l, _ := newTestLimiter(timeouts.MCPTokenEndpointRateInterval, timeouts.MCPTokenEndpointRateBurst)
+			h := l.Limit(TokenRateLimited)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+			send := func(remote string) int {
+				r := httptest.NewRequest(http.MethodPost, "/oauth/token", nil)
+				r.RemoteAddr = remote
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, r)
+				return rec.Code
+			}
+			for i := range timeouts.MCPTokenEndpointRateBurst {
+				if code := send(tc.flooder); code != http.StatusOK {
+					t.Fatalf("request %d of the flooder's burst: status %d, want 200", i+1, code)
+				}
+			}
+			if code := send(tc.flooder); code != http.StatusTooManyRequests {
+				t.Fatalf("the flooder past its burst: status %d, want 429", code)
+			}
+			if code := send(tc.other); code != http.StatusOK {
+				t.Fatalf("another IPv4 client through the same translator: status %d, want 200 -- its own bucket", code)
+			}
+			if code := send(tc.flooderAsIPv4); code != http.StatusTooManyRequests {
+				t.Fatalf("the flooder arriving as plain IPv4: status %d, want 429 -- the same bucket", code)
+			}
+		})
+	}
 }
 
 // TestRegisterRateLimited_Answer: 429, Retry-After in whole seconds
