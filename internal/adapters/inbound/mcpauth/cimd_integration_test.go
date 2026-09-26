@@ -215,9 +215,9 @@ func TestCIMD_CacheTTLOnlyShortened_Stored(t *testing.T) {
 	}
 }
 
-// TestCIMD_RefetchNeverChangesIssuedCredentials is the first rule 181's
-// own reviews established (technical plan §43.16: what a credential may
-// do is fixed when it is issued), for metadata documents: the document is
+// TestCIMD_RefetchNeverChangesIssuedCredentials proves technical plan
+// §43.16's rule that what a credential may do is fixed when it is
+// issued, for metadata documents: the document is
 // re-fetched after a code, an access token and a refresh token were
 // issued, and now names other redirect URIs and another name. The code
 // still exchanges -- for its own bound redirect URI only, never the
