@@ -23,8 +23,8 @@ import (
 // technical plan §43.16) to the authorization endpoint's own transaction
 // -- CreatePendingAuthorizationRequest: the client FOR NO KEY UPDATE, the
 // count of its pending requests, the insert (§43.14's pending-request
-// cap) -- raced, in both orders, against every other transaction that
-// locks the client row. Same method as the other lock-order tests: the
+// cap) -- raced, in both orders, against each transaction listed below
+// that locks the client row. Same method as the other lock-order tests: the
 // side that goes first is stopped holding the client -- the
 // authorization's own statements held open in a test transaction, or a
 // real handler stopped at the child row a blocker holds -- and the other
@@ -46,6 +46,11 @@ import (
 //
 // Another authorization of the same client is TestAuthorize_PendingCapRefused's
 // pair; the unused-client sweep is TestLockOrder_ClientRegistrationWriters'.
+// An administrator's disable or enable of the client, which also takes it
+// FOR NO KEY UPDATE and so serializes with an authorization, is raced by
+// no test: it is one statement locking one row, and it waits at most
+// once, holding nothing, so it can never be part of a wait cycle (the
+// lock-order comment at the top of mcpoauthgrant_store.go).
 func TestLockOrder_AuthorizationRequestWriter(t *testing.T) {
 	maxPending := platform.DefaultTimeouts().MCPMaxPendingAuthorizationRequestsPerClient
 
