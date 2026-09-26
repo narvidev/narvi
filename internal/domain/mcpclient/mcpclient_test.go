@@ -149,10 +149,18 @@ func TestValidateClientName(t *testing.T) {
 		{"Vi\u0065\u0323\u0302t", "Vi\u0065\u0323\u0302t", true}, // e + dot below + circumflex
 		{"Key 1\ufe0f\u20e3", "Key 1\ufe0f\u20e3", true},         // keycap: variation selector + enclosing mark
 		{"a\u0301\u0302\u0303", "a\u0301\u0302\u0303", true},     // exactly the limit
-		{"a\u0301b\u0301c\u0301", "a\u0301b\u0301c\u0301", true}, // one per character, any number of characters
-		{"a\u0301\u0302\u0303\u0304", "", false},                 // one past the limit
-		{"x\u20dd\u20dd\u20dd\u20dd", "", false},                 // enclosing marks count too
-		{"Editor" + strings.Repeat("\u030d", 94), "", false},     // 100 runes: 94 marks on one letter
+		// The count is per character: a name may carry more marks in all
+		// than the limit, so long as no one character stacks more. One
+		// per character, four in all; the limit on one, then one more;
+		// Thai, four marks and two at most on one letter; Vietnamese
+		// decomposed (NFD), four marks, two on each e.
+		{"a\u0301b\u0301c\u0301d\u0301", "a\u0301b\u0301c\u0301d\u0301", true},
+		{"a\u0301\u0302\u0303b\u0301", "a\u0301\u0302\u0303b\u0301", true},
+		{"\u0e1c\u0e39\u0e49\u0e0a\u0e48\u0e27\u0e22\u0e40\u0e02\u0e35\u0e22\u0e19", "\u0e1c\u0e39\u0e49\u0e0a\u0e48\u0e27\u0e22\u0e40\u0e02\u0e35\u0e22\u0e19", true},
+		{"Tie\u0302\u0301ng Vie\u0323\u0302t", "Tie\u0302\u0301ng Vie\u0323\u0302t", true},
+		{"a\u0301\u0302\u0303\u0304", "", false},             // one past the limit
+		{"x\u20dd\u20dd\u20dd\u20dd", "", false},             // enclosing marks count too
+		{"Editor" + strings.Repeat("\u030d", 94), "", false}, // 100 runes: 94 marks on one letter
 	}
 	for _, tc := range tests {
 		got, err := mcpclient.ValidateClientName(tc.in)
