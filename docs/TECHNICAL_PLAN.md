@@ -6733,8 +6733,10 @@ request from the tools the request's token can see (its own scopes, §43.16), so
 ### 43.6 Registration: where the endpoint mounts, and in what order
 
 `POST /mcp` is mounted at the router root, not under `/api/`: this is a protocol endpoint, the same
-category as `GET /sessions/{sessionID}/ws` or `/webhooks/*`, never graded by the `/api/`-only route
-diff a wire-contract compatibility change is checked against. The route group is mounted
+category as `GET /sessions/{sessionID}/ws` or `/webhooks/*`. Its row in the route table is still
+graded by the wire-contract compatibility check exactly like an `/api/` row, and still takes a
+contracts VERSION bump and CHANGELOG entry when it changes (`contracts/COMPATIBILITY.md`, "Routes").
+The route group is mounted
 UNCONDITIONALLY regardless of whether the surface is enabled — a surface that is off must be
 OBSERVABLE as off, never a route that does not exist at all, the same discipline the OIDC routes
 already establish. Gate order inside the group is deliberate and fixed: the Origin gate (§43.2) answers

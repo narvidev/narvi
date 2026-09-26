@@ -962,6 +962,39 @@ var wholeSurfaceCorpus = []wholeSurfaceCase{
 			return DiffRoutes(base, head), nil
 		},
 	},
+	// Rows 40/41 grade every routes.golden row, not only /api/ ones: the
+	// three cases below are the non-/api/ counterparts of the two above,
+	// each of which DiffRoutes used to skip without a finding.
+	{
+		name:     "row40 non-/api/ route removed",
+		ruleID:   "40",
+		severity: SeverityMajor,
+		run: func() ([]Finding, error) {
+			base := []byte("GET /api/sessions\nGET /health\nPOST /mcp\n")
+			head := []byte("GET /api/sessions\nPOST /mcp\n")
+			return DiffRoutes(base, head), nil
+		},
+	},
+	{
+		name:     "row40 non-/api/ route method changed",
+		ruleID:   "40",
+		severity: SeverityMajor,
+		run: func() ([]Finding, error) {
+			base := []byte("GET /api/sessions\nPOST /oauth/revoke\n")
+			head := []byte("DELETE /oauth/revoke\nGET /api/sessions\n")
+			return DiffRoutes(base, head), nil
+		},
+	},
+	{
+		name:     "row41 non-/api/ route added",
+		ruleID:   "41",
+		severity: SeverityMinor,
+		run: func() ([]Finding, error) {
+			base := []byte("GET /api/sessions\nPOST /oauth/token\n")
+			head := []byte("GET /.well-known/oauth-authorization-server/oauth\nGET /api/sessions\nPOST /oauth/token\n")
+			return DiffRoutes(base, head), nil
+		},
+	},
 	{
 		// C1: a surface's direction flipping between base and head is its
 		// own dedicated MAJOR finding (rule 44), exercised through the

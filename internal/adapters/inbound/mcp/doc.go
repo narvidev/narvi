@@ -23,8 +23,11 @@
 //
 // POST /mcp is mounted at the router ROOT, not under /api/ (§43.6: a
 // protocol endpoint, the same category as GET /sessions/{id}/ws or
-// /webhooks/*, never graded by tools/contractscompat's own /api/-only
-// DiffRoutes). The registration form is load-bearing --
+// /webhooks/*). Its routes.golden row is still graded by
+// tools/contractscompat exactly like an /api/ row, so a change to it
+// still takes a contracts VERSION bump and a CHANGELOG entry (§43.6,
+// contracts/COMPATIBILITY.md "Routes"). The registration form is
+// load-bearing --
 // internal/ops.ScanRegisteredRoutes only recognizes Get/Post/Put/Patch/
 // Delete plus Route(...) groups, so this is ALWAYS:
 //

@@ -2671,11 +2671,14 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// entry point for the read-only MCP tools -- narvi_list_models,
 	// narvi_list_sessions, narvi_get_session. Deliberately NOT under /api/
 	// (a protocol endpoint, the same category as /sessions/{sessionID}/ws
-	// or /webhooks/*, never graded by tools/contractscompat's own
-	// /api/-only DiffRoutes) and mounted UNCONDITIONALLY regardless of
+	// or /webhooks/*) and mounted UNCONDITIONALLY regardless of
 	// cfg.MCPEnabled -- a surface that is off must be OBSERVABLE as off
 	// (503, mcpadapter.RequireEnabled) rather than a route that does not
-	// exist at all (§43.6).
+	// exist at all (§43.6). Being outside /api/ does NOT take it out of
+	// the wire-contract check: tools/contractscompat grades its
+	// routes.golden row exactly like an /api/ row, so changing this group
+	// still takes a contracts VERSION bump and a CHANGELOG entry (§43.6,
+	// contracts/COMPATIBILITY.md "Routes").
 	//
 	// Gate order (§43.2/§43.6/§43.11): mcpadapter.RequireTrustedOrigin
 	// runs FIRST, before every other gate in this group -- the Streamable
