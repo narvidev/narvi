@@ -112,8 +112,8 @@
 // not while it is pending, as it is once sent again, nor once it has
 // succeeded.
 //
-// The last describe block makes a section control without a flow fail the
-// suite by name:
+// The "no section control without a flow" describe block makes a section
+// control without a flow fail the suite by name:
 //   - every callback a section hands a row is called by one of that
 //     section's flows, and every call one of them makes in a row -- the
 //     callback and its arguments -- one of them makes in each row of the
@@ -131,6 +131,13 @@
 //     every enabled button outside the rows is clicked, in that very state,
 //     by a SECTION_FLOW step that names it outside the rows -- a click in a
 //     row on a button of the same name does not count.
+//
+// # A member's drawer's list
+//
+// In each state of its list, the drawer says exactly what DRAWER_LIST
+// does -- a list it could not load is never a member with no apps -- and
+// its list's options, mounted on a query observer, fetch that member's
+// list: a query that never ran would leave it loading for good.
 //
 // Not covered here:
 //   - a row's text fields and lists -- names, ids, scopes, redirect URIs,
@@ -159,7 +166,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { isValidElement, useState, type ReactElement, type ReactNode, type SetStateAction } from 'react'
 import type * as ReactModule from 'react'
-import { QueryClient, QueryClientProvider, type QueryKey } from '@tanstack/react-query'
+import { QueryClient, QueryClientProvider, QueryObserver, type QueryKey, type QueryObserverOptions } from '@tanstack/react-query'
 import type * as ReactQuery from '@tanstack/react-query'
 
 import type { Identity, MCPAuthorization, MCPClient, Member } from '@narvi/contracts/rest-dtos'
@@ -1429,7 +1436,10 @@ function seeded(start: SectionStart, rows: boolean | undefined, list: SectionFlo
   return queryClient
 }
 
-function runSection(start: SectionStartName, steps: readonly Step[], wiring: Wiring, rows: boolean | undefined = true, list?: SectionFlow['list']): { run: Run; queryClient: QueryClient } {
+// runSection drives start's section through steps, over a query client
+// seeded as seeded() says: rows is never defaulted, since an undefined one
+// -- no list cached, a list still loading -- must stay undefined.
+function runSection(start: SectionStartName, steps: readonly Step[], wiring: Wiring, rows: boolean | undefined, list?: SectionFlow['list']): { run: Run; queryClient: QueryClient } {
   const section = SECTION_STARTS[start] as SectionStart
   const queryClient = seeded(section, rows, list)
   return { run: drive(section.ui(), steps, queryClient, { wiring }), queryClient }
@@ -1585,7 +1595,7 @@ function subsets<T>(values: readonly T[]): T[][] {
 // over its listed rows, empty or filled.
 function formStates(start: SectionStartName): string[][] {
   stubFetch()
-  const { run } = runSection(start, [], newWiring())
+  const { run } = runSection(start, [], newWiring(), true)
   const fields = fieldsIn(run.last).map((f) => f.props.placeholder ?? '(a field with no placeholder)')
   return subsets(fields)
 }
@@ -1603,7 +1613,7 @@ describe('no section control without a flow', () => {
     for (const start of Object.keys(SECTION_STARTS) as SectionStartName[]) {
       stubFetch()
       const listed = newWiring()
-      const { run } = runSection(start, [], listed)
+      const { run } = runSection(start, [], listed, true)
       expect([...listed.handed], `${start} hands its rows no callback`).not.toEqual([])
       const rows = rowsIn(run.last).length
       const called = new Set<string>()
@@ -1655,7 +1665,7 @@ describe('no section control without a flow', () => {
     for (const start of Object.keys(SECTION_STARTS) as SectionStartName[]) {
       for (const filled of formStates(start)) {
         const setup = filled.map(typeInto)
-        const { run } = runSection(start, setup, newWiring())
+        const { run } = runSection(start, setup, newWiring(), true)
         for (const button of buttonsOutsideRows(run.last)) {
           if (button.props.disabled === true) continue
           const label = labelOf(button)
@@ -1672,5 +1682,56 @@ describe('no section control without a flow', () => {
       }
     }
     expect(missing).toEqual([])
+  })
+})
+
+// -- A member's drawer: what it says of its own list --
+
+// DRAWER_LIST is what a member's drawer says of its list in each state of
+// it -- each list status it shows -- and whether it shows the table: a
+// list it could not load never reads as a member with no connected apps.
+const DRAWER_LIST: Readonly<Record<ListState, { says: readonly string[]; table: boolean }>> = {
+  loading: { says: ['Loading connected apps…'], table: false },
+  failed: { says: ["Couldn't load this member's connected apps."], table: false },
+  refused: { says: ['Your role cannot do this.'], table: false },
+  empty: { says: ['No connected apps.'], table: false },
+  listed: { says: [], table: true },
+}
+
+// listStatusIn is the text of each list status a render shows.
+function listStatusIn(tree: Resolved[]): string[] {
+  const statuses = (nodes: Resolved[]): Host[] => nodes.flatMap((n) => (typeof n === 'string' ? [] : [...(n.props.className === 'rail-empty' ? [n] : []), ...statuses(n.children)]))
+  return statuses(tree).map(textOf)
+}
+
+describe("a member's drawer -- what it says of its list in each state, and that it asks for the list at all", () => {
+  for (const list of LIST_STATES) {
+    it(`list ${list}: it says ${DRAWER_LIST[list].says.length === 0 ? 'nothing of it' : DRAWER_LIST[list].says.join(', ')}, ${DRAWER_LIST[list].table ? 'and shows' : 'and shows no'} table`, () => {
+      stubFetch()
+      forcing.queries = [forcedList(list)]
+      const { run } = runSection("a member's drawer", [], newWiring(), list === 'listed' ? true : list === 'empty' ? false : undefined)
+      forcing.queries = []
+      expect(listStatusIn(run.last)).toEqual(DRAWER_LIST[list].says)
+      expect(hostsIn(run.last, 'table')).toHaveLength(DRAWER_LIST[list].table ? 1 : 0)
+    })
+  }
+
+  // No render here runs a query, so the drawer's own list options, as it
+  // passed them, are mounted on an observer of their own: one that never
+  // fetched would leave the drawer loading for good.
+  it("its list, mounted, sends GET for that member's list and loads it", async () => {
+    render(<MemberConnectedApps member={member()} />)
+    expect(captured.queries).toHaveLength(1)
+    const calls = stubFetch()
+    const queryClient = new QueryClient()
+    const observer = new QueryObserver(queryClient, captured.queries[0] as QueryObserverOptions)
+    const unsubscribe = observer.subscribe(() => {})
+    try {
+      await vi.waitFor(() => expect(observer.getCurrentResult().status).toBe('success'), { interval: 1 })
+    } finally {
+      unsubscribe()
+      queryClient.clear()
+    }
+    expect(calls).toEqual([{ url: '/api/members/user%2F1%3Fx/mcp-authorizations', method: 'GET' }])
   })
 })
