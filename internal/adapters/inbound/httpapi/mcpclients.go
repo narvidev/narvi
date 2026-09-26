@@ -274,8 +274,11 @@ func DeleteMCPClient(pool *pgxpool.Pool, clients *postgres.MCPOAuthClientStore, 
 // The row is the durable block a deletion is not: the unused-client sweep
 // never deletes a disabled client, and a disabled metadata-document
 // client's document is never fetched again, so the app cannot come back
-// under the same URL. A dynamically registered app can still register
-// afresh, under a new client_id, while dynamic registration is on. Admin
+// under the same URL. It blocks that URL only: whoever controls the
+// document's host can publish it under another URL, which registers as a
+// new client while metadata documents are on. A dynamically registered app
+// can still register afresh, under a new client_id, while dynamic
+// registration is on. There is no block by host. Admin
 // only (authz.ActionManageIntegrations); 404 for no such client, 409 for
 // one already disabled. Audited as mcp_client.disabled in the same
 // transaction. Answers the client as it now stands.

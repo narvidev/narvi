@@ -79,21 +79,37 @@ audited, both taking the internal `id`:
   authorization naming its `clientId` is refused as an unknown client --
   until something registers that `clientId` again (below). Cannot be undone.
 
-What keeps the app out depends on how its client was registered (the kind:
-"Find the client" above):
+Either action holds for one `clientId`, never for the app behind it, and
+what it holds depends on how the client was registered (the kind: "Find the
+client" above):
 
 | Kind | Disable | Delete |
 |---|---|---|
-| pre-registered (`narvi_mcp_c_...`) | keeps it out until enabled | keeps it out for good: only an administrator can register it again, and a new registration gets a new `clientId` |
-| metadata document (an https URL) | keeps it out until enabled: the disabled row is the block | does **not** keep it out: the next authorization naming the URL fetches its document and registers it afresh, enabled -- disable it instead |
+| pre-registered (`narvi_mcp_c_...`) | keeps that `clientId` out until enabled | keeps that `clientId` out for good: only an administrator can register the app again, and a new registration gets a new `clientId` |
+| metadata document (an https URL) | keeps that exact URL out until enabled: the disabled row blocks that URL and no other | does **not** keep even that URL out: the next authorization naming it fetches its document and registers it afresh, enabled -- disable it instead |
 | dynamic (`narvi_mcp_d_...`) | stops that `clientId` only | stops that `clientId` only |
 
-A dynamically registered app is kept out by neither: while
-`NARVI_MCP_DCR_ENABLED=true` it can register afresh under a new `clientId`,
-and nothing ties that registration to the old one. Each of its users would
-have to approve the new registration, and until they do it can do nothing.
-To keep such apps out, switch dynamic registration off (next item), which
-pauses every one of them.
+An app that can present itself as another client comes back as a new one.
+Each of its users would have to approve the new client, and until they do
+it can do nothing:
+
+- A **metadata-document** app is kept out by neither. Whoever controls its
+  document's host can publish the document under another URL -- another
+  path on that host, or the same path with a query added -- and the next
+  authorization naming that URL fetches it and registers a new client,
+  enabled, with no administrator involved. Its consent page names the same
+  host its users already trusted. To keep such apps out, switch metadata
+  documents off (next item), which pauses every one of them. There is no
+  block by host: Narvi has no way to refuse every URL on one host while
+  metadata documents stay on.
+- A **dynamically registered** app is kept out by neither: while
+  `NARVI_MCP_DCR_ENABLED=true` it can register afresh under a new
+  `clientId`, and nothing ties that registration to the old one. To keep
+  such apps out, switch dynamic registration off (next item), which pauses
+  every one of them.
+- A **pre-registered** client stays out, but an app that can also identify
+  itself by a metadata document, or register itself, can come back that way
+  while that mechanism is on.
 
 **Every client of one registration mechanism** -- set
 `NARVI_MCP_CIMD_ENABLED=false` (metadata-document clients) or

@@ -21,8 +21,11 @@
 //      refuses any redirect URI the consent flow could not use), delete
 //      one, which disconnects every user of it, or disable one -- every
 //      user of it refused from its next call, nothing deleted -- and enable
-//      it again. Disabling, not deleting, keeps out an app identified by its
-//      description's address, which a deletion would let register again.
+//      it again. Disabling, not deleting, keeps out the client ID of an app
+//      identified by its description's address, which a deletion would let
+//      register again -- that address only: the app's publisher can come
+//      back under another, and only switching such apps off for the
+//      deployment keeps every one of them out.
 //
 // # Adversarial rendering
 //
@@ -159,8 +162,10 @@ export function ConnectedAppsTable({ authorizations, revokingId, onRevoke }: { a
  * Revoke behind the same confirmation, which disconnects the app on the
  * member's behalf from its very next call. The member can approve the app
  * again; keeping it out is disabling its client (MCPClientsSection), which
- * holds for every kind but an app that registered itself -- that one can
- * register again under a new client ID while self-registration is on.
+ * holds for that client ID only -- an app that registered itself can
+ * register again under a new client ID while self-registration is on, and
+ * an app identified by its description's address can come back under
+ * another address on the same host while such apps are accepted.
  */
 export function MemberConnectedApps({ member }: { member: Member }) {
   const queryClient = useQueryClient()
@@ -187,7 +192,7 @@ export function MemberConnectedApps({ member }: { member: Member }) {
         Connected apps · <T text={member.displayName} />
       </b>
       <p className="ph">
-        The MCP apps this member allowed to use Narvi as them -- the same list they see under Integrations; no token is ever shown. Revoking disconnects the app on their behalf from its very next call, and is audited. They can approve it again. To keep the app out for everyone, disable its client under Integrations → MCP clients -- except an app that registered itself, which can register again under a new client ID while the deployment allows self-registration.
+        The MCP apps this member allowed to use Narvi as them -- the same list they see under Integrations; no token is ever shown. Revoking disconnects the app on their behalf from its very next call, and is audited. They can approve it again. To keep the app out for everyone, disable its client under Integrations → MCP clients. That blocks that client ID only: an app that registered itself can register again under a new one while the deployment allows self-registration, and an app identified by its description's address can come back under another address on the same host while the deployment accepts such apps.
       </p>
       {query.isPending && <p className="rail-empty">Loading connected apps…</p>}
       {query.isError && <p className="rail-empty">{apiErrorMessage(query.error, "Couldn't load this member's connected apps.")}</p>}
@@ -357,7 +362,7 @@ export function MCPClientsSection() {
     <div className="panel">
       <h4>MCP clients</h4>
       <p className="ph">
-        The apps that may ask this deployment's users for access. Configure the client ID below in the app; each user still approves it themselves. Redirect URIs must be https, or http on 127.0.0.1, [::1] or localhost -- the port of a 127.0.0.1 or [::1] URI may vary. Disabling a client refuses every user of it from its next call and deletes nothing; it is how to keep out an app identified by its description's address (a client ID that is an https URL), which a deletion would let register again.
+        The apps that may ask this deployment's users for access. Configure the client ID below in the app; each user still approves it themselves. Redirect URIs must be https, or http on 127.0.0.1, [::1] or localhost -- the port of a 127.0.0.1 or [::1] URI may vary. Disabling a client refuses every user of it from its next call and deletes nothing. For an app identified by its description's address (a client ID that is an https URL), disabling blocks that address, which a deletion would let register again -- that address only: the app's publisher can come back under another address on the same host, and only switching such apps off for the deployment keeps every one of them out.
       </p>
       {forbidden && <p className="notavailable">MCP client registration is admin-only -- enforced server-side, not merely hidden here.</p>}
       {!forbidden && (

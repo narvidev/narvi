@@ -441,9 +441,9 @@ Administrators decide which apps may ask at all, in the same panel:
 {"name": "Enable a disabled MCP client again (admin)", "route": "POST /api/mcp-clients/{clientID}/enable"}
 ```
 
-Deleting and disabling a client differ, and which one keeps an app out
-depends on how the app came to be known. Deleting removes the client and
-every authorization issued to it, for good. That keeps out an app an
+Deleting and disabling a client differ, and what each keeps out depends
+on how the app came to be known. Deleting removes the client and
+every authorization issued to it, for good. That keeps out a client an
 administrator registered, since only an administrator can register it
 again. It does not keep out an app known by its description's address:
 the next time anyone starts to connect it, Narvi reads its description
@@ -456,10 +456,15 @@ stays listed and can still be revoked, and enabling the client lets it
 carry on with the access it still holds, without asking anyone again,
 unless that access lapsed meanwhile. A disabled client stays as it is:
 Narvi never reads a disabled app's description again and never removes it
-as unused, so disabling is how an app known by its description's address
-is kept out. An app that registered itself can register again under a new
-client ID whichever you do; only switching self-registration off (below)
-keeps such apps out, and it pauses every one of them.
+as unused, so, for an app known by its description's address, disabling
+keeps that address out, which deleting would not — but that one address
+only. Whoever publishes the app's description can publish it at another
+address on the same host, and the app then arrives as a new client that
+people can approve, its page naming the same host. An app that registered
+itself can register again under a new client ID whichever you do. Only
+switching off apps known by their description's address, or
+self-registration (below), keeps every such app out, and it pauses every
+one of them; Narvi cannot block a whole host.
 
 Administrators also see every member's connected apps, in Settings →
 Members & access, under the "Connected apps" button on the member's row: the
@@ -470,10 +475,11 @@ very next call is refused, exactly as when the member disconnects it, and
 the audit log records it as revoked by that administrator, naming the
 member. It withdraws what was approved, not the app itself: the member can
 approve the app again. To keep an app out, an administrator disables its
-client, or deletes it if an administrator registered it — for an app that
-registered itself, neither holds (above); the on-call runbook
-[`mcp-client-cutoff.md`](../runbooks/mcp-client-cutoff.md) says how, and what
-each step does on the app's next call.
+client, or deletes it if an administrator registered it — which holds for
+that client only: an app that registered itself, or one known by its
+description's address, can come back as a new client (above); the
+on-call runbook [`mcp-client-cutoff.md`](../runbooks/mcp-client-cutoff.md)
+says how, and what each step does on the app's next call.
 
 ```json narvi-command
 {"name": "List a member's connected MCP apps (admin)", "route": "GET /api/members/{userID}/mcp-authorizations"}
