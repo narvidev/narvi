@@ -24,8 +24,11 @@
 // confirmation, the drawer's open flag, a form field -- is a hook of that
 // wrapper. Each step clicks the named button's real onClick, or types into
 // a field through its real onChange; React then renders the wrapper again,
-// and the next step acts in that render. The test never re-implements a
-// confirmation. A bare label clicks a section's own button, outside its
+// and the next step acts in that render. A render in which a component
+// updates its own state as it renders -- a row closing a confirmation its
+// props say is done -- React throws away and renders again at once, and
+// so does the wrapper: no step acts in it, and it is not the last render.
+// The test never re-implements a confirmation. A bare label clicks a section's own button, outside its
 // rows; { row, click } clicks in the one row showing that text.
 //
 // The render after a click shows the mutation it started pending, for
@@ -52,19 +55,23 @@
 // checked against the contract types: a value missing from an axis fails
 // the typecheck. The harness holds the props in its own state, so a step
 // can change them under the row, as the section does when a request starts
-// or ends or its list refetches. Starting from every combination of the
-// axes, a walk reaches every own state through the row's own clicks and
-// every combination by changing one prop at a time. It tells two states
-// apart by the props, the model's own state AND the row's own React state
-// -- every useState value read while the row renders -- so a state that
-// renders like another but holds something else is a state of its own,
-// followed on by every click and every prop change: a disable confirmation
-// left open under Enable shows once the list shows the client enabled
-// again. Then, for each row:
-//   - every combination is reached, and in every state the walk reaches,
-//     the row offers exactly the model's buttons, and a click on each calls
-//     exactly the model's callbacks and leaves the row where the model says
-//     -- checked up to CLICK_DEPTH clicks on from every state it reaches;
+// or ends or its list refetches. A prop change leaves the row's own state
+// where it was, unless the model says the new props close it (settles): a
+// disable confirmation is done once the list shows the client disabled.
+// Starting from every combination of the axes, a walk reaches every own
+// state through the row's own clicks and every combination the row can be
+// in by changing one prop at a time. It tells two states apart by the
+// props, the model's own state AND the row's own React state -- every
+// useState value read while the row renders -- so a state that renders
+// like another but holds something else is a state of its own, followed on
+// by every click and every prop change: a disable confirmation kept, not
+// closed, under Enable would show again once the list showed the client
+// enabled, where the model offers Disable. Then, for each row:
+//   - every combination the row can be in is reached, and in every state
+//     the walk reaches, the row offers exactly the model's buttons, and a
+//     click on each calls exactly the model's callbacks and leaves the row
+//     where the model says -- checked up to CLICK_DEPTH clicks on from
+//     every state it reaches;
 //   - while a request is in flight, the button that sends it shows its
 //     in-flight label ("Deleting…", "Disabling…", "Enabling…",
 //     "Revoking…") and is disabled, and no other button in the row sends
@@ -166,6 +173,7 @@ const updates = vi.hoisted(() => {
   let atClick: number | undefined
   return {
     made: () => void count++,
+    count: () => count,
     clickStarts: () => void (atClick = count),
     clickEnds: () => void (atClick = undefined),
     madeDuringClick: () => atClick !== undefined && count > atClick,
@@ -592,7 +600,11 @@ function click(tree: Resolved[], step: Step, options: ResolveOptions): void {
 function Driver({ ui, steps, run, options }: { ui: ReactNode; steps: readonly Step[]; run: Run; options: ResolveOptions }) {
   const [, rerender] = useState(0)
   forcing.renders(run.applied.length === steps.length)
+  const before = updates.count()
   const tree = resolveRender(ui, options, run)
+  // A component updated its own state as it rendered: React throws this
+  // render away and renders again at once (see # Clicks above).
+  if (updates.count() !== before) return null
   const step = rendered(run, tree, steps)
   if (step !== undefined) {
     click(tree, step, options)
@@ -701,6 +713,10 @@ type RowModel = {
   // The row's own states, and the one it starts in.
   states: readonly string[]
   initial: string
+  // The own state the row is in, handed props, when it was in state: a
+  // state the props close gives way to another with no click. Omitted,
+  // every state stays under every props.
+  settles?: (props: RowProps, state: string) => string
   // Each prop that says a request is in flight, and the callback that sends it.
   inFlight: Readonly<Record<string, string>>
   row: (props: RowProps, log: string[]) => ReactNode
@@ -721,6 +737,10 @@ const ROW_MODELS: readonly RowModel[] = [
     axes: { kind: CLIENT_KINDS, disabled: [false, true], deleting: [false, true], settingDisabled: [false, true] },
     states: ['no confirmation', 'confirming disable', 'confirming delete'],
     initial: 'no confirmation',
+    // The disable confirmation is done once the list shows the client
+    // disabled: it closes, and stays closed if the list later shows the
+    // client enabled -- by anyone, with no click here.
+    settles: (p, state) => (state === 'confirming disable' && p.disabled === true ? 'no confirmation' : state),
     inFlight: { deleting: 'onDelete', settingDisabled: 'onSetDisabled' },
     row: (p, log) => (
       <MCPClientRow
@@ -738,15 +758,13 @@ const ROW_MODELS: readonly RowModel[] = [
           { label: 'Cancel', then: 'no confirmation' },
         ]
       }
-      if (state === 'confirming disable' && p.disabled !== true) {
+      if (state === 'confirming disable') {
         return [
           { label: p.settingDisabled === true ? 'Disabling…' : 'Confirm disable', disabled: p.settingDisabled === true, calls: ['onSetDisabled(true)'], then: 'confirming disable' },
           { label: 'Cancel', then: 'no confirmation' },
         ]
       }
-      // No confirmation open -- or the disable confirmation once the list
-      // shows the client disabled: it gives way to Enable and Delete, and
-      // opens again if the list shows the client enabled.
+      // No confirmation open.
       if (p.disabled === true) {
         return [
           { label: p.settingDisabled === true ? 'Enabling…' : 'Enable', disabled: p.settingDisabled === true, calls: ['onSetDisabled(false)'], then: 'no confirmation' },
@@ -848,6 +866,18 @@ function product(axes: RowModel['axes']): RowProps[] {
   return Object.entries(axes).reduce<RowProps[]>((all, [axis, values]) => all.flatMap((p) => values.map((v) => ({ ...p, [axis]: v }))), [{}])
 }
 
+// settle is the own state a row is in once a step has left it in state
+// with props (RowModel.settles).
+function settle(model: RowModel, props: RowProps, state: string): string {
+  return model.settles?.(props, state) ?? state
+}
+
+// restingCombinations is every combination of the axes and own states
+// the row can be in: those no props close.
+function restingCombinations(model: RowModel): string[] {
+  return product(model.axes).flatMap((p) => model.states.filter((s) => settle(model, p, s) === s).map((s) => JSON.stringify([p, s])))
+}
+
 // A state the walk reached: the props it started the harness with, the
 // steps from there, and the props and the model's own state they lead to.
 type RowNode = { start: RowProps; steps: readonly Step[]; props: RowProps; state: string }
@@ -905,14 +935,16 @@ function conform(model: RowModel, node: RowNode, rendered: RowRun, calls: Calls,
   for (const offer of offers) {
     if (offer.disabled === true) continue
     const steps = [...node.steps, offer.label]
-    conform(model, { ...node, steps, state: offer.then }, runRow(model, node.start, steps), { before: log.length, want: offer.calls ?? [] }, depth - 1, problems)
+    conform(model, { ...node, steps, state: settle(model, node.props, offer.then) }, runRow(model, node.start, steps), { before: log.length, want: offer.calls ?? [] }, depth - 1, problems)
   }
   return true
 }
 
-// walkRow reaches every combination of the model's axes and own states:
-// from every combination of the axes, each own state through the row's
-// own clicks, and each combination by changing one prop at a time. Two
+// walkRow reaches every combination of the model's axes and own states
+// the row can be in: from every combination of the axes, each own state
+// through the row's own clicks, and each combination by changing one prop
+// at a time -- each step leaving the model's own state where the model
+// says it settles (RowModel.settles). Two
 // states are the same only if the props, the model's own state AND the
 // row's own React state (ResolveOptions.own) are: a state that renders
 // like another, but holds something else, is followed on by every click
@@ -937,14 +969,14 @@ function walkRow(model: RowModel): { reached: RowNode[]; problems: string[] } {
     const before = rendered.log.length
     if (conform(model, node, rendered, calls, CLICK_DEPTH, problems)) {
       for (const offer of model.offers(node.props, node.state)) {
-        if (offer.disabled !== true) queue.push({ node: { ...node, steps: [...node.steps, offer.label], state: offer.then }, calls: { before, want: offer.calls ?? [] } })
+        if (offer.disabled !== true) queue.push({ node: { ...node, steps: [...node.steps, offer.label], state: settle(model, node.props, offer.then) }, calls: { before, want: offer.calls ?? [] } })
       }
     }
     for (const [axis, values] of Object.entries(model.axes)) {
       for (const v of values) {
         if (v === node.props[axis]) continue
         const props = { ...node.props, [axis]: v }
-        queue.push({ node: { ...node, steps: [...node.steps, { become: props }], props }, calls: { before, want: [] } })
+        queue.push({ node: { ...node, steps: [...node.steps, { become: props }], props, state: settle(model, props, node.state) }, calls: { before, want: [] } })
       }
     }
   }
@@ -1021,13 +1053,13 @@ function firstProblems(problems: readonly string[]): string[] {
 
 describe('each row, in every combination of its props and its own state, offers what its model says, and each click does what it says', () => {
   for (const model of ROW_MODELS) {
-    it(`${model.component}: every combination is reached, and every button in it, clicked, calls and leaves open what the model says`, () => {
+    it(`${model.component}: every combination it can be in is reached, and every button in it, clicked, calls and leaves open what the model says`, () => {
       const { reached, problems } = walked(model)
       expect(firstProblems(problems)).toEqual([])
       const states = new Set(reached.map((n) => n.state))
       expect([...states].sort()).toEqual([...model.states].sort())
       const combinations = new Set(reached.map((n) => JSON.stringify([n.props, n.state])))
-      expect(combinations.size).toBe(product(model.axes).length * model.states.length)
+      expect([...combinations].sort()).toEqual(restingCombinations(model).sort())
     })
 
     it(`${model.component}: while a request is in flight, the button that sends it says so and is disabled, and no other button sends it again`, () => {
@@ -1035,6 +1067,35 @@ describe('each row, in every combination of its props and its own state, offers 
       expect(firstProblems(inFlightProblems(model, reached))).toEqual([])
     })
   }
+})
+
+describe('MCPClientRow -- a disable that has gone through closes its confirmation for good', () => {
+  const enabled: RowProps = { kind: 'preregistered', disabled: false, deleting: false, settingDisabled: false }
+  // Disable, Confirm disable, the request in flight, then the list showing
+  // the client disabled, the request done.
+  const disabled: readonly Step[] = ['Disable', 'Confirm disable', { become: { ...enabled, settingDisabled: true } }, { become: { ...enabled, disabled: true } }]
+
+  function clientRow(steps: readonly Step[]): RowRun & { offers: string[]; text: string } {
+    const model = ROW_MODELS.find((m) => m.component === 'MCPClientRow')
+    if (model === undefined) throw new Error('no MCPClientRow model')
+    const ran = runRow(model, enabled, steps)
+    expect(ran.run.applied).toEqual(steps.map(stepName))
+    return { ...ran, offers: hostsIn(ran.run.last, 'button').map(offered), text: ran.run.last.map(textOf).join('') }
+  }
+
+  it('once the list shows the client disabled, the row offers Enable and Delete, and Enable, clicked in that very render, sends the enable', () => {
+    const { offers, log } = clientRow(disabled)
+    expect(offers).toEqual(['Enable', 'Delete'])
+    expect(log).toEqual(['onSetDisabled(true)'])
+    expect(clientRow([...disabled, 'Enable']).log).toEqual(['onSetDisabled(true)', 'onSetDisabled(false)'])
+  })
+
+  it('when the list then shows the client enabled -- by anyone else, with no click here -- the row offers Disable and Delete, no confirmation, and sends nothing more', () => {
+    const { offers, text, log } = clientRow([...disabled, { become: enabled }])
+    expect(offers).toEqual(['Disable', 'Delete'])
+    expect(text).not.toContain('Disabling this client')
+    expect(log).toEqual(['onSetDisabled(true)'])
+  })
 })
 
 // -- Section flows: each callback a section hands a row, down to fetch --

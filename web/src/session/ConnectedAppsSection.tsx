@@ -220,10 +220,13 @@ export function MCPClientRow({
   settingDisabled: boolean
 }) {
   const [confirming, setConfirming] = useState<'delete' | 'disable' | null>(null)
-  // The disable confirmation stays open while the request runs, and gives
-  // way to the Enable button once the list shows the client disabled.
-  const confirmingDisable = confirming === 'disable' && !client.disabledAt
-  const idle = confirming === null || (confirming === 'disable' && client.disabledAt !== null)
+  // The disable confirmation stays open while the request runs, and is
+  // done once the list shows the client disabled: it closes then, and the
+  // row offers Enable. Closed, it never opens again by itself: when the
+  // list later shows the client enabled -- whoever enabled it, and however
+  // -- the row offers Disable. React renders the row again at once, before
+  // anything shows, with the confirmation closed.
+  if (confirming === 'disable' && client.disabledAt) setConfirming(null)
   return (
     <tr>
       <td>
@@ -268,7 +271,7 @@ export function MCPClientRow({
             </span>
           </div>
         )}
-        {confirmingDisable && (
+        {confirming === 'disable' && (
           <div className="confirmbox">
             <p>Disabling this client refuses every user of it from its next call. Nothing is deleted, and Enable undoes it.</p>
             <span className="btnrow">
@@ -281,18 +284,10 @@ export function MCPClientRow({
             </span>
           </div>
         )}
-        {idle && (
+        {confirming === null && (
           <span className="btnrow">
             {client.disabledAt ? (
-              <button
-                type="button"
-                className="btn"
-                disabled={settingDisabled}
-                onClick={() => {
-                  setConfirming(null)
-                  onSetDisabled(false)
-                }}
-              >
+              <button type="button" className="btn" disabled={settingDisabled} onClick={() => onSetDisabled(false)}>
                 {settingDisabled ? 'Enabling…' : 'Enable'}
               </button>
             ) : (
