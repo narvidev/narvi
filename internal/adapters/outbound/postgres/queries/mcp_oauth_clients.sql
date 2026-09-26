@@ -101,23 +101,48 @@ WHERE id = sqlc.arg(id)
   AND metadata_fetched_at = sqlc.arg(metadata_fetched_at)
 RETURNING *;
 
--- DeleteUnusedMCPOAuthClients is the expired-credential sweep's
--- unused-client pass (technical plan §43.15): it deletes every
--- dynamically registered or metadata-document client that holds no grant
--- and no authorization request (pending, or consumed and not yet swept)
--- and was registered -- or, for a metadata-document client, last fetched
--- -- before unused_before (now - MCPDynamicClientUnusedTTL).
--- Pre-registered clients are never deleted here. The pending-request
--- clause is what keeps it from ever racing a consent: a consent decision
--- can only decide a request that exists and has not expired, so its
--- client is never a candidate. Its locks follow the one order: each
--- candidate client FOR UPDATE, then its cascade -- which reaches nothing,
--- a candidate having no grant and no request. A candidate a metadata
--- re-fetch is updating is re-checked once the re-fetch commits, and
--- skipped: its metadata_fetched_at is then fresh.
+-- The expired-credential sweep's unused-client pass (technical plan
+-- §43.15) is these two statements, in one transaction
+-- (MCPOAuthClientStore.DeleteUnused). A candidate is a dynamically
+-- registered or metadata-document client that no operator disabled -- a
+-- disabled row IS the block: deleting it would let the next authorization
+-- register the same URL afresh, enabled -- holding no grant and no
+-- authorization request (pending, or consumed and not yet swept), last
+-- used before unused_before (now - MCPDynamicClientUnusedTTL): the latest
+-- of its registration, its last successful fetch and the end of the time
+-- its cached document may be used without a fetch -- which a failed
+-- re-fetch's grace pushes out, so a client still served from its cache is
+-- never a candidate. Pre-registered clients never are.
+--
+-- LockUnusedMCPOAuthClients takes every candidate FOR UPDATE, in id order
+-- (the lock order at the top of mcpoauthgrant_store.go: the client
+-- first). A candidate a re-fetch is updating is re-checked once the
+-- re-fetch commits, and skipped. A candidate an authorization request's
+-- (or a grant's) insert holds FOR KEY SHARE -- its foreign-key check --
+-- is waited for, and returned: a row only locked, not updated, is not
+-- re-checked.
+-- name: LockUnusedMCPOAuthClients :many
+SELECT c.id FROM mcp_oauth_clients c
+WHERE c.kind IN ('dynamic', 'metadata_document')
+  AND c.disabled_at IS NULL
+  AND GREATEST(c.created_at, c.metadata_fetched_at, c.metadata_stale_at) < sqlc.arg(unused_before)::timestamptz
+  AND NOT EXISTS (SELECT 1 FROM mcp_oauth_grants g WHERE g.client_id = c.id)
+  AND NOT EXISTS (SELECT 1 FROM mcp_oauth_authorization_requests r WHERE r.client_id = c.id)
+ORDER BY c.id
+FOR UPDATE OF c;
+
+-- DeleteUnusedMCPOAuthClients deletes the candidates the transaction
+-- locked above that are STILL candidates: a new statement, so a new
+-- snapshot, which sees every request or grant committed before the lock
+-- was taken -- the one that committed while the lock waited included --
+-- and, the client held FOR UPDATE, none can be added until the
+-- transaction ends (its insert's foreign-key check waits, then finds the
+-- client gone). Its cascade therefore reaches no row.
 -- name: DeleteUnusedMCPOAuthClients :execrows
 DELETE FROM mcp_oauth_clients c
-WHERE c.kind IN ('dynamic', 'metadata_document')
-  AND COALESCE(c.metadata_fetched_at, c.created_at) < sqlc.arg(unused_before)::timestamptz
+WHERE c.id = ANY(sqlc.arg(ids)::uuid[])
+  AND c.kind IN ('dynamic', 'metadata_document')
+  AND c.disabled_at IS NULL
+  AND GREATEST(c.created_at, c.metadata_fetched_at, c.metadata_stale_at) < sqlc.arg(unused_before)::timestamptz
   AND NOT EXISTS (SELECT 1 FROM mcp_oauth_grants g WHERE g.client_id = c.id)
   AND NOT EXISTS (SELECT 1 FROM mcp_oauth_authorization_requests r WHERE r.client_id = c.id);

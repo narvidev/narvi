@@ -296,10 +296,13 @@ func TestExpiredCleanup_SweepsMCPRows(t *testing.T) {
 // TestExpiredCleanup_SweepsUnusedMCPClients proves the sweep's
 // unused-client pass (technical plan §43.15): a dynamically registered or
 // metadata-document client with no grant and no authorization request,
-// registered -- or last fetched -- more than MCPDynamicClientUnusedTTL ago,
-// is deleted, including one whose only grant expired on the same tick;
-// a younger one, one with a live grant, one with a pending request, a
-// metadata-document client fetched again recently, and every
+// last used more than MCPDynamicClientUnusedTTL ago -- registered, last
+// fetched, or last usable from its cache -- is deleted, including one
+// whose only grant expired on the same tick; a younger one, one with a
+// live grant, one with a pending request, a metadata-document client
+// fetched again recently, one fetched long ago but still served from its
+// cache through a failed re-fetch's grace, a disabled client of either
+// kind however old (the disabled row IS the operator's block), and every
 // pre-registered client, however old and unused, survive.
 func TestExpiredCleanup_SweepsUnusedMCPClients(t *testing.T) {
 	ctx := context.Background()
@@ -307,7 +310,7 @@ func TestExpiredCleanup_SweepsUnusedMCPClients(t *testing.T) {
 	clients := narvipg.NewMCPOAuthClientStore(pool)
 	grants := narvipg.NewMCPOAuthGrantStore(pool)
 	ttl := platform.DefaultTimeouts().MCPDynamicClientUnusedTTL
-	old := time.Now().Add(-ttl - time.Hour)
+	old := time.Now().Add(-ttl - 2*time.Hour)
 	recent := time.Now().Add(-time.Hour)
 
 	user, err := narvipg.NewUserStore(pool).Create(ctx, sqlcgen.CreateUserParams{
@@ -373,8 +376,22 @@ func TestExpiredCleanup_SweepsUnusedMCPClients(t *testing.T) {
 		t.Fatalf("create request: %v", err)
 	}
 	refetched := newDocument("https://refetched.example/client.json", old, recent)
+	// Fetched successfully long ago, its re-fetch failing since a moment
+	// ago: the authorization endpoint still serves it from its cache for
+	// one more cache lifetime, so it is not unused.
+	inGrace := newDocument("https://in-grace.example/client.json", old, old)
+	if _, err := clients.ExtendMetadataStale(ctx, inGrace.ID, old, time.Now().Add(platform.DefaultTimeouts().MCPClientMetadataCacheTTL)); err != nil {
+		t.Fatalf("record the failed re-fetch: %v", err)
+	}
+	disabledDynamic := newClient("narvi_mcp_d_disabled", sqlcgen.McpOauthClientKindDynamic, old)
+	disabledDocument := newDocument("https://disabled.example/client.json", old, old)
+	for _, c := range []sqlcgen.McpOauthClient{disabledDynamic, disabledDocument} {
+		if _, err := pool.Exec(ctx, `UPDATE mcp_oauth_clients SET disabled_at = $2 WHERE id = $1`, c.ID, old); err != nil {
+			t.Fatal(err)
+		}
+	}
 	preregistered := newClient("narvi_mcp_c_old", sqlcgen.McpOauthClientKindPreregistered, old)
-	kept := []sqlcgen.McpOauthClient{young, granted, pending, refetched, preregistered}
+	kept := []sqlcgen.McpOauthClient{young, granted, pending, refetched, inGrace, disabledDynamic, disabledDocument, preregistered}
 
 	cleanupCtx, cancel := context.WithCancel(ctx)
 	defer cancel()

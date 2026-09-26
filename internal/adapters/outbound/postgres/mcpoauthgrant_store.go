@@ -47,17 +47,23 @@
 // Client registration (technical plan §43.15) adds four writers, each
 // following the same order. A metadata document's upsert, and the
 // extension of its cache after a failed re-fetch, are each ONE statement
-// locking ONE row -- the client, FOR NO KEY UPDATE: that never conflicts
-// with the FOR KEY SHARE every issuance and grant revocation takes, only
-// with a client's deletion, and a statement holding a single lock cannot
-// be part of a wait cycle. A dynamic registration inserts a new client row
-// and locks nothing that exists. The expired-credential sweep's
-// unused-client pass (MCPOAuthClientStore.DeleteUnused) deletes a client
-// exactly as an administrator's deletion does -- the client FOR UPDATE,
-// then its cascade -- and only a client with no grant and no
-// authorization request, so its cascade reaches no row at all; a consent
-// in flight always has its request, so its client is never swept from
-// under it (TestLockOrder_ClientRegistrationWriters).
+// locking ONE row --
+// the client, FOR NO KEY UPDATE: that never conflicts with the FOR KEY
+// SHARE every issuance and grant revocation takes, only with a client's
+// deletion, and a statement holding a single lock cannot be part of a
+// wait cycle. A dynamic registration inserts a new client row and locks
+// nothing that exists. The expired-credential sweep's unused-client pass
+// (MCPOAuthClientStore.DeleteUnused) deletes a client as an
+// administrator's deletion does -- the client FOR UPDATE, then its
+// cascade -- in two statements: it locks its candidates first (in id
+// order), then deletes only those a fresh look still finds with no grant
+// and no authorization request, so its cascade reaches no row at all. A
+// request or grant whose insert holds the client FOR KEY SHARE (its
+// foreign-key check) when the sweep arrives makes the sweep wait, and,
+// once committed, keeps its client; one that arrives after the lock waits
+// for the sweep, then finds its client gone. A consent in flight always
+// has its request, so its client is never even a candidate
+// (TestLockOrder_ClientRegistrationWriters).
 //
 // Refresh tokens also reference each other (superseded_by, ON DELETE SET
 // NULL), which adds no cycle. Under its grant, the refresh grant locks

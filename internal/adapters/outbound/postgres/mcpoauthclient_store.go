@@ -24,16 +24,26 @@ import (
 // mcpclients.go, internal/adapters/inbound/mcpauth).
 type MCPOAuthClientStore struct {
 	q *sqlcgen.Queries
+	// db is what q runs on -- the pool, or the transaction WithTx was
+	// given -- for the one method that needs a transaction of its own
+	// (DeleteUnused; on a caller's transaction, a savepoint in it).
+	db txBeginner
+}
+
+// txBeginner is a *pgxpool.Pool or a pgx.Tx: something a transaction (or
+// a savepoint) can be begun on.
+type txBeginner interface {
+	Begin(ctx context.Context) (pgx.Tx, error)
 }
 
 // NewMCPOAuthClientStore builds an MCPOAuthClientStore backed by pool.
 func NewMCPOAuthClientStore(pool *pgxpool.Pool) *MCPOAuthClientStore {
-	return &MCPOAuthClientStore{q: sqlcgen.New(pool)}
+	return &MCPOAuthClientStore{q: sqlcgen.New(pool), db: pool}
 }
 
 // WithTx returns an MCPOAuthClientStore whose queries run on tx.
 func (s *MCPOAuthClientStore) WithTx(tx pgx.Tx) *MCPOAuthClientStore {
-	return &MCPOAuthClientStore{q: s.q.WithTx(tx)}
+	return &MCPOAuthClientStore{q: s.q.WithTx(tx), db: tx}
 }
 
 // Create inserts a new client row and returns it. A nil RedirectUris is
@@ -106,13 +116,30 @@ func (s *MCPOAuthClientStore) ExtendMetadataStale(ctx context.Context, id pgtype
 }
 
 // DeleteUnused deletes every dynamically registered or metadata-document
-// client with no grant and no authorization request, registered -- or,
-// for a metadata-document client, last fetched -- before unusedBefore,
-// returning how many it deleted (the expired-credential sweep's
-// unused-client pass; queries/mcp_oauth_clients.sql's own doc comment).
-// Pre-registered clients are never deleted.
+// client no operator disabled, with no grant and no authorization
+// request, last used before unusedBefore -- registered, last fetched, or
+// last usable from its cache -- returning how many it deleted (the
+// expired-credential sweep's unused-client pass). One transaction, two
+// statements (queries/mcp_oauth_clients.sql's own doc comment): the
+// candidates are locked FOR UPDATE, client first as the lock order
+// requires, then deleted only if a fresh look still finds them unused --
+// so a request or grant that committed while the lock waited keeps its
+// client. On a store built WithTx, the transaction is a savepoint in the
+// caller's, whose locks the caller then holds. Pre-registered clients are
+// never deleted.
 func (s *MCPOAuthClientStore) DeleteUnused(ctx context.Context, unusedBefore time.Time) (int64, error) {
-	return s.q.DeleteUnusedMCPOAuthClients(ctx, pgtype.Timestamptz{Time: unusedBefore, Valid: true})
+	cutoff := pgtype.Timestamptz{Time: unusedBefore, Valid: true}
+	var deleted int64
+	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		q := s.q.WithTx(tx)
+		ids, err := q.LockUnusedMCPOAuthClients(ctx, cutoff)
+		if err != nil || len(ids) == 0 {
+			return err
+		}
+		deleted, err = q.DeleteUnusedMCPOAuthClients(ctx, sqlcgen.DeleteUnusedMCPOAuthClientsParams{Ids: ids, UnusedBefore: cutoff})
+		return err
+	})
+	return deleted, err
 }
 
 // Delete removes a client by internal id and returns the deleted row

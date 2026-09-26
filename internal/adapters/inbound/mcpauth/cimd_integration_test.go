@@ -16,6 +16,7 @@ import (
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/domain/mcpclient"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // assertPageNotRedirect: an authorization refused as a client_id error --
@@ -281,5 +282,50 @@ func TestCIMD_RefetchNeverChangesIssuedCredentials(t *testing.T) {
 	decision := r.postConsent(url.Values{"request": {pendingID}, "nonce": {pendingNonce}, "decision": {"approve"}, "scope": {"mcp:read"}}, sameOriginHeaders(), cookie)
 	if decision.Code != http.StatusFound || !strings.HasPrefix(decision.Header().Get("Location"), boundRedirect+"?") {
 		t.Fatalf("pending decision: status %d Location %q, want a redirect to %s", decision.Code, decision.Header().Get("Location"), boundRedirect)
+	}
+}
+
+// TestCIMD_DisabledClientSurvivesTheSweep: a metadata-document client an
+// operator disabled is never swept, however long unused -- its disabled
+// row IS the block, since the URL is the client's identity and a deleted
+// row would let the next authorization register it afresh, enabled -- so
+// the next authorization is still refused, and nothing is fetched
+// (technical plan §43.15).
+func TestCIMD_DisabledClientSurvivesTheSweep(t *testing.T) {
+	ctx := context.Background()
+	r := newASRig(t)
+	_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+	const blocked = "https://blocked.example/client.json"
+	r.documents.set(blocked, fakeDocument{body: metadataDocument(blocked, "Blocked Plugin", loopbackRedirect)})
+	r.startConsent(t, forClient(r.authorizeParams(newVerifier(t)), blocked), cookie)
+	if _, err := r.pool.Exec(ctx, `UPDATE mcp_oauth_clients SET disabled_at = now() WHERE client_id = $1`, blocked); err != nil {
+		t.Fatal(err)
+	}
+	assertPageNotRedirect(t, "the disabled client", r.authorize(forClient(r.authorizeParams(newVerifier(t)), blocked), cookie))
+
+	// Long past the unused TTL: its requests expired and swept, every
+	// stamp aged beyond the sweep's cutoff.
+	c, _ := r.clientRow(t, blocked)
+	if _, err := r.pool.Exec(ctx, `DELETE FROM mcp_oauth_authorization_requests WHERE client_id = $1`, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-platform.DefaultTimeouts().MCPDynamicClientUnusedTTL - 2*time.Hour)
+	if _, err := r.pool.Exec(ctx, `UPDATE mcp_oauth_clients SET created_at = $2, disabled_at = $2 WHERE id = $1`, c.ID, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.pool.Exec(ctx, `UPDATE mcp_oauth_clients SET metadata_fetched_at = $2, metadata_stale_at = $3 WHERE id = $1`, c.ID, old, old.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if swept, err := r.clients.DeleteUnused(ctx, sweepCutoff()); err != nil || swept != 0 {
+		t.Fatalf("the sweep deleted %d clients (err %v), want 0: a disabled client is never swept", swept, err)
+	}
+
+	fetches := r.documents.count(blocked)
+	assertPageNotRedirect(t, "the disabled client after the sweep", r.authorize(forClient(r.authorizeParams(newVerifier(t)), blocked), cookie))
+	if after, ok := r.clientRow(t, blocked); !ok || after.ID != c.ID || !after.DisabledAt.Valid {
+		t.Fatalf("after the sweep: client %+v (found %v), want the same row, still disabled", after, ok)
+	}
+	if n := r.documents.count(blocked); n != fetches {
+		t.Fatalf("fetches for the disabled client after the sweep = %d, want none", n-fetches)
 	}
 }

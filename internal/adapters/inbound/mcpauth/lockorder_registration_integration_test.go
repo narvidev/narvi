@@ -123,7 +123,7 @@ func holdInTx(ctx context.Context, t *testing.T, pool *pgxpool.Pool, run func(tx
 func (r *asRig) oldUnusedClient(t *testing.T, kind sqlcgen.McpOauthClientKind, clientID string) sqlcgen.McpOauthClient {
 	t.Helper()
 	ctx := context.Background()
-	old := time.Now().Add(-platform.DefaultTimeouts().MCPDynamicClientUnusedTTL - time.Hour)
+	old := time.Now().Add(-platform.DefaultTimeouts().MCPDynamicClientUnusedTTL - 2*time.Hour)
 	var c sqlcgen.McpOauthClient
 	var err error
 	if kind == sqlcgen.McpOauthClientKindMetadataDocument {
@@ -165,8 +165,10 @@ func sweepCutoff() time.Time {
 //     a re-fetch behind the sweep registers the document afresh, and a
 //     sweep behind a re-fetch re-checks the row and spares it. An
 //     authorization of a client the sweep is deleting queues behind it and
-//     is then refused with a page -- never a 500. A client whose consent
-//     is in flight is never a sweep candidate at all.
+//     is then refused with a page -- never a 500; a sweep reaching a client
+//     whose authorization request or grant insert is in flight queues
+//     behind it, and spares the client once the insert commits. A client
+//     whose consent is in flight is never a sweep candidate at all.
 //   - A dynamic registration inserts a new row and queues behind nothing.
 func TestLockOrder_ClientRegistrationWriters(t *testing.T) {
 	// A re-fetch racing a holder of the client's FOR KEY SHARE: whichever
@@ -459,6 +461,85 @@ func TestLockOrder_ClientRegistrationWriters(t *testing.T) {
 			t.Fatalf("after the re-fetch and the sweep: client %+v (found %v), want the same client kept", c, ok)
 		}
 	})
+
+	// The other order of the pair below: an authorization request -- or a
+	// grant -- inserted under an unused client holds that client FOR KEY
+	// SHARE (its foreign-key check) when the sweep reaches it. The sweep
+	// queues on the client row behind the insert alone, then, the insert
+	// committed, looks again under the client's lock and spares it: the
+	// row just committed keeps its client, never cascaded away.
+	for _, tc := range []struct {
+		name     string
+		kind     sqlcgen.McpOauthClientKind
+		clientID string
+		grant    bool
+	}{
+		{"AuthorizationRequestHoldsDynamicClient_SweepQueuesAndSparesIt", sqlcgen.McpOauthClientKindDynamic, "narvi_mcp_d_old", false},
+		{"AuthorizationRequestHoldsMetadataDocumentClient_SweepQueuesAndSparesIt", sqlcgen.McpOauthClientKindMetadataDocument, "https://unused.example/client.json", false},
+		{"GrantHoldsDynamicClient_SweepQueuesAndSparesIt", sqlcgen.McpOauthClientKindDynamic, "narvi_mcp_d_old", true},
+		{"GrantHoldsMetadataDocumentClient_SweepQueuesAndSparesIt", sqlcgen.McpOauthClientKindMetadataDocument, "https://unused.example/client.json", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			r := newASRig(t)
+			old := r.oldUnusedClient(t, tc.kind, tc.clientID)
+			user, _ := r.newUser(t, sqlcgen.UserRoleMember)
+			errs := captureErrorLog(t)
+			expires := pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
+
+			hold := holdInTx(ctx, t, r.pool, func(tx pgx.Tx) {
+				var err error
+				if tc.grant {
+					_, err = r.grants.WithTx(tx).UpsertGrant(ctx, sqlcgen.UpsertMCPOAuthGrantParams{
+						UserID: user.ID, ClientID: old.ID, Scopes: []string{"mcp:read"}, Resource: r.server.Identifiers().Resource, ExpiresAt: expires,
+					})
+				} else {
+					_, err = r.grants.WithTx(tx).CreateAuthorizationRequest(ctx, sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
+						ClientID: old.ID, RedirectUri: loopbackRedirect, CodeChallenge: "c", CodeChallengeMethod: "S256",
+						Resource: r.server.Identifiers().Resource, ExpiresAt: expires,
+					})
+				}
+				if err != nil {
+					t.Fatalf("held insert: %v", err)
+				}
+			})
+			var eg errgroup.Group
+			var swept int64
+			sweepDone := make(chan struct{})
+			eg.Go(func() error {
+				defer close(sweepDone)
+				var err error
+				swept, err = r.clients.DeleteUnused(ctx, sweepCutoff())
+				return err
+			})
+			sweepPID := waitForLockWaiter(ctx, t, r.pool, []int32{hold.pid}, sweepDone)
+			if sweepPID == 0 {
+				t.Fatal("the sweep finished without queuing behind the insert holding its candidate")
+			}
+			assertQueuedOnClientBehind(ctx, t, r.pool, sweepPID, hold.pid)
+			if err := hold.tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := eg.Wait(); err != nil {
+				t.Fatalf("sweep: %v", err)
+			}
+			if log := errs.String(); log != "" {
+				t.Errorf("a handler failed:\n%s", log)
+			}
+			if swept != 0 {
+				t.Fatalf("the sweep deleted %d clients, want 0: the client gained a committed row while the sweep waited", swept)
+			}
+			if c, ok := r.clientRow(t, tc.clientID); !ok || c.ID != old.ID {
+				t.Fatalf("after the insert and the sweep: client %+v (found %v), want the same client kept", c, ok)
+			}
+			var under int
+			if err := r.pool.QueryRow(ctx, `
+				SELECT (SELECT count(*) FROM mcp_oauth_grants WHERE client_id = $1) + (SELECT count(*) FROM mcp_oauth_authorization_requests WHERE client_id = $1)`,
+				old.ID).Scan(&under); err != nil || under != 1 {
+				t.Fatalf("rows under the client after the sweep = %d (err %v), want the committed one", under, err)
+			}
+		})
+	}
 
 	t.Run("SweepHoldsClient_AuthorizationQueuesAndIsRefusedWithAPage", func(t *testing.T) {
 		ctx := context.Background()

@@ -3070,13 +3070,17 @@ type Timeouts struct {
 	// Validate checks three ordering links: a metadata document's fetch
 	// must fit well inside the time its result is trusted
 	// (MCPClientMetadataCacheTTL > MCPClientMetadataFetchTimeout); a
-	// metadata-document client the authorization endpoint may still serve
-	// from its cache is never old enough for the unused-client sweep
-	// (MCPDynamicClientUnusedTTL > MCPClientMetadataCacheTTL); and a
+	// client counts as unused only well after its cached document could
+	// last be used (MCPDynamicClientUnusedTTL > MCPClientMetadataCacheTTL
+	// -- the sweep itself counts from the end of that time, a failed
+	// re-fetch's grace included, so a client the authorization endpoint
+	// may still serve from its cache is never a candidate whatever these
+	// are; this is sane configuration, not the guarantee); and a
 	// registered client always outlives the consent window of the
 	// authorization it registered for (MCPDynamicClientUnusedTTL >
 	// MCPAuthorizationRequestTTL -- the sweep also skips any client with a
-	// pending request, so this is sane configuration, not the guarantee).
+	// pending request, so this too is sane configuration, not the
+	// guarantee).
 	// And two positivity checks on the registration rate limit, whose zero
 	// interval would mean NO limit (rate.Every(0) is rate.Inf) -- the one
 	// field here that fails OPEN at zero -- and whose burst below one would
@@ -3100,10 +3104,11 @@ type Timeouts struct {
 	// MCPDynamicClientUnusedTTL is how long a dynamically registered or
 	// metadata-document client with no grant (and no pending authorization
 	// request) is kept before the expired-credential sweep deletes it --
-	// counted from its registration, or, for a metadata-document client,
-	// from its latest successful fetch. Pre-registered clients are never
-	// swept. It is what bounds the table growth an unauthenticated
-	// registration can cause. 24 hours.
+	// counted from the latest of its registration, its last successful
+	// fetch and the end of the time its cached document may be used (a
+	// failed re-fetch's grace included). Pre-registered clients, and
+	// clients an operator disabled, are never swept. It is what bounds the
+	// table growth an unauthenticated registration can cause. 24 hours.
 	MCPDynamicClientUnusedTTL time.Duration
 
 	// MCPRegisterRateInterval is the refill interval of the per-address
