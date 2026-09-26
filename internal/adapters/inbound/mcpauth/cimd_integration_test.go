@@ -5,6 +5,7 @@ package mcpauth_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,7 +14,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/narvidev/narvi/internal/adapters/outbound/cimdfetch"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/domain/mcpclient"
 	"github.com/narvidev/narvi/internal/platform"
@@ -86,6 +89,9 @@ func TestCIMD_AuthorizationEndpoint(t *testing.T) {
 	if r.documents.count(docClientURL) != 3 || kept.ClientName != "Editor Plugin 2" ||
 		kept.MetadataStaleAt.Time.Before(before.Add(time.Hour-time.Minute)) || kept.MetadataStaleAt.Time.After(time.Now().Add(time.Hour)) {
 		t.Fatalf("after a failed re-fetch: fetches %d, client %+v; want 3 fetches, the cached document kept for one more hour", r.documents.count(docClientURL), kept)
+	}
+	if !kept.MetadataRefetchFailedAt.Valid || !kept.MetadataStaleAt.Time.Equal(kept.MetadataRefetchFailedAt.Time.Add(time.Hour)) {
+		t.Fatalf("after a failed re-fetch: failure %v, stale %v; want the failure recorded and the grace ending an hour after it", kept.MetadataRefetchFailedAt, kept.MetadataStaleAt.Time)
 	}
 	r.startConsent(t, params, cookie)
 	if n := r.documents.count(docClientURL); n != 3 {
@@ -285,6 +291,143 @@ func TestCIMD_RefetchNeverChangesIssuedCredentials(t *testing.T) {
 	}
 }
 
+// setMetadataStamps sets a metadata-document client's cache stamps
+// outright, as the passing of time would have left them; a zero failedAt
+// records no failed re-fetch.
+func (r *asRig) setMetadataStamps(t *testing.T, clientIDURL string, fetchedAt, staleAt, failedAt time.Time) {
+	t.Helper()
+	failed := pgtype.Timestamptz{Time: failedAt, Valid: !failedAt.IsZero()}
+	tag, err := r.pool.Exec(context.Background(), `
+		UPDATE mcp_oauth_clients SET metadata_fetched_at = $2, metadata_stale_at = $3, metadata_refetch_failed_at = $4
+		WHERE client_id = $1`, clientIDURL, fetchedAt, staleAt, failed)
+	if err != nil || tag.RowsAffected() != 1 {
+		t.Fatalf("set the cache stamps of %s: rows %d err %v", clientIDURL, tag.RowsAffected(), err)
+	}
+}
+
+// TestCIMD_FailedRefetchKeptForOneGraceOnly: a stale document whose
+// re-fetch fails is kept for ONE more MCPClientMetadataCacheTTL, measured
+// from the first failure since its last successful fetch, and no longer
+// (technical plan §43.15). Inside that grace it is used -- a later
+// failure neither restarts nor extends the grace; past it, every
+// authorization is refused with a page, never a redirect, however long
+// the document keeps failing (a document withdrawn, or replaced by one
+// this deployment refuses, is never trusted indefinitely); and the first
+// fetch that succeeds again ends the failure.
+func TestCIMD_FailedRefetchKeptForOneGraceOnly(t *testing.T) {
+	r := newASRig(t)
+	_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+	ttl := platform.DefaultTimeouts().MCPClientMetadataCacheTTL
+	r.serveDocument("Editor Plugin")
+	params := forClient(r.authorizeParams(newVerifier(t)), docClientURL)
+	r.startConsent(t, params, cookie)
+
+	// The first failure: kept, and the grace starts.
+	r.staleDocument(t, docClientURL)
+	r.documents.set(docClientURL, fakeDocument{err: fmt.Errorf("%w: status %d", cimdfetch.ErrUnexpectedStatus, http.StatusNotFound)})
+	before := time.Now().Truncate(time.Microsecond) // what a timestamptz keeps
+	r.startConsent(t, params, cookie)
+	first, _ := r.clientRow(t, docClientURL)
+	failedAt := first.MetadataRefetchFailedAt.Time
+	if !first.MetadataRefetchFailedAt.Valid || failedAt.Before(before) || failedAt.After(time.Now()) || !first.MetadataStaleAt.Time.Equal(failedAt.Add(ttl)) {
+		t.Fatalf("after the first failure: failure %v, stale %v; want the failure recorded now and the grace ending one TTL after it", first.MetadataRefetchFailedAt, first.MetadataStaleAt.Time)
+	}
+
+	// A later failure inside the grace: still used, the grace unchanged.
+	r.setMetadataStamps(t, docClientURL, first.MetadataFetchedAt.Time, time.Now().Add(-time.Second), failedAt.Add(-ttl/2))
+	fetches := r.documents.count(docClientURL)
+	r.startConsent(t, params, cookie)
+	inside, _ := r.clientRow(t, docClientURL)
+	if r.documents.count(docClientURL) != fetches+1 || !inside.MetadataRefetchFailedAt.Time.Equal(failedAt.Add(-ttl/2)) || inside.MetadataStaleAt.Time.After(time.Now()) {
+		t.Fatalf("a failure inside the grace: fetches %d, failure %v, stale %v; want one more fetch, the grace neither restarted nor extended", r.documents.count(docClientURL)-fetches, inside.MetadataRefetchFailedAt.Time, inside.MetadataStaleAt.Time)
+	}
+
+	// Past the grace -- by a second, then by days on end: refused every
+	// time, a fetch tried each time, the grace never extended.
+	for _, since := range []time.Duration{ttl + time.Second, 24 * time.Hour, 5 * 24 * time.Hour, 30 * 24 * time.Hour} {
+		// Microseconds: what a timestamptz keeps, so the stored stamps
+		// compare equal to these.
+		failing := time.Now().Add(-since).Truncate(time.Microsecond)
+		r.setMetadataStamps(t, docClientURL, failing.Add(-time.Hour), failing.Add(ttl), failing)
+		fetches := r.documents.count(docClientURL)
+		assertPageNotRedirect(t, fmt.Sprintf("failing for %v", since), r.authorize(forClient(r.authorizeParams(newVerifier(t)), docClientURL), cookie))
+		c, ok := r.clientRow(t, docClientURL)
+		if !ok || r.documents.count(docClientURL) != fetches+1 || !c.MetadataRefetchFailedAt.Time.Equal(failing) || !c.MetadataStaleAt.Time.Equal(failing.Add(ttl)) {
+			t.Fatalf("failing for %v: found %v, fetches %d, failure %v, stale %v; want one fetch tried, the client kept as it was and refused", since, ok, r.documents.count(docClientURL)-fetches, c.MetadataRefetchFailedAt.Time, c.MetadataStaleAt.Time)
+		}
+	}
+
+	// The document is served again: used at once, and the failure ends.
+	r.serveDocument("Editor Plugin, back")
+	r.startConsent(t, params, cookie)
+	if c, _ := r.clientRow(t, docClientURL); c.ClientName != "Editor Plugin, back" || c.MetadataRefetchFailedAt.Valid || !c.MetadataStaleAt.Time.Equal(c.MetadataFetchedAt.Time.Add(ttl)) {
+		t.Fatalf("after a successful fetch: %+v; want the new document, no failure recorded, a fresh TTL", c)
+	}
+}
+
+// TestCIMD_FailedRefetchNeverOverridesANewerFetch: a failed re-fetch
+// records its failure only on the row it read -- if another
+// authorization's re-fetch succeeded meanwhile (here with no-store, so
+// its document may not be cached at all), the failure changes nothing:
+// the newer document stands, trusted no longer than its own response
+// allowed, and the authorization goes on with it (technical plan §43.15:
+// Cache-Control only ever shortens how long a document is trusted).
+func TestCIMD_FailedRefetchNeverOverridesANewerFetch(t *testing.T) {
+	r := newASRig(t)
+	_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+	r.serveDocument("Editor Plugin")
+	params := forClient(r.authorizeParams(newVerifier(t)), docClientURL)
+	r.startConsent(t, params, cookie)
+	r.staleDocument(t, docClientURL)
+
+	r.documents.set(docClientURL, fakeDocument{
+		err: errors.New("document host unreachable"),
+		onFetch: func() {
+			now := time.Now()
+			if _, err := r.clients.UpsertMetadataDocument(context.Background(), sqlcgen.UpsertMCPOAuthMetadataDocumentClientParams{
+				ClientID: docClientURL, ClientName: "Editor Plugin (fetched meanwhile)", RedirectUris: []string{loopbackRedirect},
+				MetadataFetchedAt: pgtype.Timestamptz{Time: now, Valid: true},
+				MetadataStaleAt:   pgtype.Timestamptz{Time: now, Valid: true}, // no-store
+			}); err != nil {
+				t.Errorf("the concurrent re-fetch: %v", err)
+			}
+		},
+	})
+	r.startConsent(t, params, cookie)
+	c, _ := r.clientRow(t, docClientURL)
+	if c.ClientName != "Editor Plugin (fetched meanwhile)" || c.MetadataRefetchFailedAt.Valid || !c.MetadataStaleAt.Time.Equal(c.MetadataFetchedAt.Time) {
+		t.Fatalf("after a failure racing a newer no-store fetch: name %q, failure %v, trusted for %v; want the newer document, no failure, trusted for 0s",
+			c.ClientName, c.MetadataRefetchFailedAt, c.MetadataStaleAt.Time.Sub(c.MetadataFetchedAt.Time))
+	}
+}
+
+// TestCIMD_LoweredCacheTTLCapsAStoredStaleTime: a stored stale time lying
+// further out than the current MCPClientMetadataCacheTTL allows from now
+// -- stored under a longer ceiling -- is not trusted past the current
+// one: the document is fetched again (technical plan §43.15).
+func TestCIMD_LoweredCacheTTLCapsAStoredStaleTime(t *testing.T) {
+	r := newASRig(t)
+	_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+	r.serveDocument("Editor Plugin")
+	params := forClient(r.authorizeParams(newVerifier(t)), docClientURL)
+	r.startConsent(t, params, cookie)
+	now := time.Now()
+	r.setMetadataStamps(t, docClientURL, now, now.Add(time.Hour), time.Time{})
+
+	lowered := platform.DefaultTimeouts()
+	lowered.MCPClientMetadataCacheTTL = 10 * time.Minute
+	if err := lowered.Validate(); err != nil {
+		t.Fatalf("the lowered timeouts do not validate: %v", err)
+	}
+	restarted := r.rebuilt(t, rigOptions{mechanisms: mcpclient.Mechanisms{MetadataDocuments: true, DynamicRegistration: true}, timeouts: &lowered})
+	restarted.serveDocument("Editor Plugin 2")
+	fetches := r.documents.count(docClientURL)
+	restarted.startConsent(t, params, cookie)
+	if n := r.documents.count(docClientURL); n != fetches+1 {
+		t.Fatalf("fetches after the ceiling was lowered below the stored stale time = %d, want 1", n-fetches)
+	}
+}
+
 // TestCIMD_DisabledClientSurvivesTheSweep: a metadata-document client an
 // operator disabled is never swept, however long unused -- its disabled
 // row IS the block, since the URL is the client's identity and a deleted
@@ -313,9 +456,7 @@ func TestCIMD_DisabledClientSurvivesTheSweep(t *testing.T) {
 	if _, err := r.pool.Exec(ctx, `UPDATE mcp_oauth_clients SET created_at = $2, disabled_at = $2 WHERE id = $1`, c.ID, old); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.pool.Exec(ctx, `UPDATE mcp_oauth_clients SET metadata_fetched_at = $2, metadata_stale_at = $3 WHERE id = $1`, c.ID, old, old.Add(time.Hour)); err != nil {
-		t.Fatal(err)
-	}
+	r.setMetadataStamps(t, blocked, old, old.Add(time.Hour), time.Time{})
 	if swept, err := r.clients.DeleteUnused(ctx, sweepCutoff()); err != nil || swept != 0 {
 		t.Fatalf("the sweep deleted %d clients (err %v), want 0: a disabled client is never swept", swept, err)
 	}

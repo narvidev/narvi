@@ -103,15 +103,19 @@ func (s *MCPOAuthClientStore) UpsertMetadataDocument(ctx context.Context, arg sq
 	return s.q.UpsertMCPOAuthMetadataDocumentClient(ctx, arg)
 }
 
-// ExtendMetadataStale keeps a metadata-document client's cached document
-// until staleAt after a re-fetch failed, provided no fetch has succeeded
-// since fetchedAt (the row the caller read). pgx.ErrNoRows means one has,
-// and the newer document stands.
-func (s *MCPOAuthClientStore) ExtendMetadataStale(ctx context.Context, id pgtype.UUID, fetchedAt, staleAt time.Time) (sqlcgen.McpOauthClient, error) {
-	return s.q.ExtendMCPOAuthMetadataDocumentStale(ctx, sqlcgen.ExtendMCPOAuthMetadataDocumentStaleParams{
-		ID:                id,
-		MetadataFetchedAt: pgtype.Timestamptz{Time: fetchedAt, Valid: true},
-		MetadataStaleAt:   pgtype.Timestamptz{Time: staleAt, Valid: true},
+// MarkMetadataRefetchFailed records the first failed re-fetch of a
+// metadata-document client's stale document since its last successful
+// fetch (queries/mcp_oauth_clients.sql's own doc comment): failedAt, and
+// graceUntil as its stale time -- provided no fetch has succeeded since
+// fetchedAt (the row the caller read) and no failure is recorded yet.
+// pgx.ErrNoRows means one of those happened (or the client is gone), and
+// what is stored now stands.
+func (s *MCPOAuthClientStore) MarkMetadataRefetchFailed(ctx context.Context, id pgtype.UUID, fetchedAt, failedAt, graceUntil time.Time) (sqlcgen.McpOauthClient, error) {
+	return s.q.MarkMCPOAuthMetadataDocumentRefetchFailed(ctx, sqlcgen.MarkMCPOAuthMetadataDocumentRefetchFailedParams{
+		ID:                      id,
+		MetadataFetchedAt:       pgtype.Timestamptz{Time: fetchedAt, Valid: true},
+		MetadataRefetchFailedAt: pgtype.Timestamptz{Time: failedAt, Valid: true},
+		MetadataStaleAt:         pgtype.Timestamptz{Time: graceUntil, Valid: true},
 	})
 }
 

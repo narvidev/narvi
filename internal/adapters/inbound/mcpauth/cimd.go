@@ -41,20 +41,26 @@ func (s *Server) resolveClient(w http.ResponseWriter, r *http.Request, clientID 
 
 // metadataDocumentClient resolves a metadata-document client (technical
 // plan §43.15). A cached document still fresh -- or one whose client an
-// operator disabled, which is never fetched for again -- is used as stored. Otherwise
-// the document is fetched through the SSRF-guarded fetcher and validated
-// (mcpclient.ParseMetadataDocument: its client_id must be clientIDURL
-// byte for byte), and the client row is created or refreshed with it,
-// trusted for MCPClientMetadataCacheTTL -- or less, if the document's own
-// Cache-Control says so (mcpclient.MetadataCacheTTL), never more. When a
-// fetch fails:
+// operator disabled, which is never fetched for again -- is used as
+// stored. Otherwise the document is fetched through the SSRF-guarded
+// fetcher and validated (mcpclient.ParseMetadataDocument: its client_id
+// must be clientIDURL byte for byte), and the client row is created or
+// refreshed with it, trusted for MCPClientMetadataCacheTTL -- or less, if
+// the document's own Cache-Control says so (mcpclient.MetadataCacheTTL),
+// never more. When a fetch fails:
 //
 //   - a document never fetched before refuses the authorization with an
 //     error page, never a redirect: nothing about the client is known,
 //     least of all where it may be sent;
-//   - a stale cached document is kept for one more TTL (logged), so a
-//     document host that is down does not break every authorization --
-//     and is not asked again on every one.
+//   - a stale cached document is kept after the FIRST failure since its
+//     last successful fetch for one more MCPClientMetadataCacheTTL,
+//     measured from that failure (logged), so a document host that is
+//     down does not break every authorization at once -- and is not asked
+//     again on every one; past that one grace, the authorization is
+//     refused with an error page until a fetch succeeds again: a document
+//     its owner withdrew, or replaced with one this deployment refuses, is
+//     not trusted for longer than the grace, however often it is asked
+//     for (keepAfterFailedRefetch).
 //
 // Refreshing the row changes what the NEXT authorization sees and nothing
 // else: every request, code, token and refresh chain already issued
@@ -115,24 +121,51 @@ func (s *Server) metadataDocumentClient(w http.ResponseWriter, r *http.Request, 
 
 	if !found {
 		logger.Warn("mcpauth: authorize refused", "outcome", "metadata_document_unusable", "client_id", clientIDURL, "error", ferr)
-		if errors.Is(ferr, mcpclient.ErrConfidentialClient) {
-			// invalid_client: this server takes public clients only.
-			s.renderError(w, r, http.StatusBadRequest, "This app is not supported", "The app's description asks to sign in with a secret or a key, and this deployment accepts only apps that use neither.")
-			return sqlcgen.McpOauthClient{}, false
-		}
-		s.renderError(w, r, http.StatusBadRequest, "This app's description could not be used", "This deployment fetched the app's description from the address it identified itself by, and could not use it. Nothing was sent anywhere.")
+		s.refuseUnusableDocument(w, r, ferr)
+		return sqlcgen.McpOauthClient{}, false
+	}
+	return s.keepAfterFailedRefetch(w, r, cached, now, ferr)
+}
+
+// keepAfterFailedRefetch decides what a failed re-fetch of cached's stale
+// document leaves the authorization (technical plan §43.15): the first
+// failure since the document was last fetched successfully keeps it for
+// one more MCPClientMetadataCacheTTL measured from that failure, recorded
+// on the row; a later failure never extends that grace -- inside it the
+// cached document is used, past it the authorization is refused with an
+// error page until a fetch succeeds (which clears the failure).
+func (s *Server) keepAfterFailedRefetch(w http.ResponseWriter, r *http.Request, cached sqlcgen.McpOauthClient, now time.Time, ferr error) (sqlcgen.McpOauthClient, bool) {
+	ctx := r.Context()
+	logger := platform.Logger(ctx)
+	fail := func(msg string, err error) (sqlcgen.McpOauthClient, bool) {
+		logger.Error("mcpauth: authorize: "+msg, "error", err)
+		s.renderError(w, r, http.StatusInternalServerError, "Something went wrong", "The authorization request could not be processed.")
+		return sqlcgen.McpOauthClient{}, false
+	}
+	refuse := func(failingSince time.Time) (sqlcgen.McpOauthClient, bool) {
+		logger.Warn("mcpauth: authorize refused", "outcome", "metadata_document_unusable", "client_id", cached.ClientID,
+			"reason", "re-fetch failing past its one grace", "failing_since", failingSince, "error", ferr)
+		s.refuseUnusableDocument(w, r, ferr)
 		return sqlcgen.McpOauthClient{}, false
 	}
 
-	logger.Warn("mcpauth: metadata document re-fetch failed; keeping the cached document for one more cache lifetime", "client_id", clientIDURL, "error", ferr)
-	kept, err := s.deps.Clients.ExtendMetadataStale(ctx, cached.ID, cached.MetadataFetchedAt.Time, now.Add(s.cfg.Timeouts.MCPClientMetadataCacheTTL))
+	if cached.MetadataRefetchFailedAt.Valid {
+		if s.withinRefetchGrace(cached, now) {
+			return cached, true
+		}
+		return refuse(cached.MetadataRefetchFailedAt.Time)
+	}
+
+	logger.Warn("mcpauth: metadata document re-fetch failed; keeping the cached document for one more cache lifetime, and no longer", "client_id", cached.ClientID, "error", ferr)
+	kept, err := s.deps.Clients.MarkMetadataRefetchFailed(ctx, cached.ID, cached.MetadataFetchedAt.Time, now, now.Add(s.cfg.Timeouts.MCPClientMetadataCacheTTL))
 	switch {
 	case err == nil:
 		return kept, true
 	case errors.Is(err, pgx.ErrNoRows):
-		// Another fetch succeeded, or the client was deleted, since the
-		// read above: use what is stored now.
-		current, gerr := s.deps.Clients.GetByClientID(ctx, clientIDURL)
+		// Another fetch succeeded, another failure started the grace
+		// first, or the client was deleted, since the read above: decide
+		// on what is stored now.
+		current, gerr := s.deps.Clients.GetByClientID(ctx, cached.ClientID)
 		if errors.Is(gerr, pgx.ErrNoRows) {
 			s.renderError(w, r, http.StatusBadRequest, "This app is not registered", "This deployment does not know the app that sent you here.")
 			return sqlcgen.McpOauthClient{}, false
@@ -140,10 +173,32 @@ func (s *Server) metadataDocumentClient(w http.ResponseWriter, r *http.Request, 
 		if gerr != nil {
 			return fail("reload client failed", gerr)
 		}
-		return current, true
+		if !current.MetadataFetchedAt.Time.Equal(cached.MetadataFetchedAt.Time) || s.withinRefetchGrace(current, now) {
+			return current, true
+		}
+		return refuse(current.MetadataRefetchFailedAt.Time)
 	default:
-		return fail("keep the cached metadata document failed", err)
+		return fail("record the failed metadata document re-fetch failed", err)
 	}
+}
+
+// withinRefetchGrace reports whether client's cached document may still
+// be used although a re-fetch of it failed: a failure is recorded, and
+// less than MCPClientMetadataCacheTTL has passed since it.
+func (s *Server) withinRefetchGrace(client sqlcgen.McpOauthClient, now time.Time) bool {
+	return client.MetadataRefetchFailedAt.Valid && now.Before(client.MetadataRefetchFailedAt.Time.Add(s.cfg.Timeouts.MCPClientMetadataCacheTTL))
+}
+
+// refuseUnusableDocument renders the error page -- never a redirect -- for
+// a metadata document that cannot be used: a confidential client's is
+// named as such, any other is not.
+func (s *Server) refuseUnusableDocument(w http.ResponseWriter, r *http.Request, ferr error) {
+	if errors.Is(ferr, mcpclient.ErrConfidentialClient) {
+		// invalid_client: this server takes public clients only.
+		s.renderError(w, r, http.StatusBadRequest, "This app is not supported", "The app's description asks to sign in with a secret or a key, and this deployment accepts only apps that use neither.")
+		return
+	}
+	s.renderError(w, r, http.StatusBadRequest, "This app's description could not be used", "This deployment fetched the app's description from the address it identified itself by, and could not use it. Nothing was sent anywhere.")
 }
 
 // metadataFresh reports whether a metadata-document client's cached

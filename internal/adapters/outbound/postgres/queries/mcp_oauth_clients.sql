@@ -62,7 +62,8 @@ RETURNING *;
 -- client the URL identifies, or replaces its cached name, redirect URIs
 -- and cache stamps in place (same id, so every grant, request, code and
 -- token under it is untouched -- and none of them reads the client's
--- redirect URIs or name to decide anything it was issued for). The WHERE
+-- redirect URIs or name to decide anything it was issued for), clearing
+-- any failed re-fetch the document had been kept through. The WHERE
 -- keeps it from ever rewriting a client of another kind; no other kind's
 -- client_id can be an https URL anyway. disabled_at is never touched: a
 -- re-fetch does not re-enable a client an operator disabled.
@@ -79,26 +80,35 @@ RETURNING *;
 INSERT INTO mcp_oauth_clients (client_id, kind, client_name, redirect_uris, metadata_fetched_at, metadata_stale_at)
 VALUES ($1, 'metadata_document', $2, $3, $4, $5)
 ON CONFLICT (client_id) DO UPDATE
-SET client_name         = EXCLUDED.client_name,
-    redirect_uris       = EXCLUDED.redirect_uris,
-    metadata_fetched_at = EXCLUDED.metadata_fetched_at,
-    metadata_stale_at   = EXCLUDED.metadata_stale_at
+SET client_name                = EXCLUDED.client_name,
+    redirect_uris              = EXCLUDED.redirect_uris,
+    metadata_fetched_at        = EXCLUDED.metadata_fetched_at,
+    metadata_stale_at          = EXCLUDED.metadata_stale_at,
+    metadata_refetch_failed_at = NULL
 WHERE mcp_oauth_clients.kind = 'metadata_document'
 RETURNING *;
 
--- ExtendMCPOAuthMetadataDocumentStale keeps a metadata-document client's
--- cached document for one more TTL after a re-fetch failed -- only if no
--- other fetch has succeeded since the caller read the row (the
--- metadata_fetched_at guard), so a failure can never push out the
--- shorter lifetime a newer successful fetch set. One statement, one row
--- lock (FOR NO KEY UPDATE on the client), like the upsert above.
--- pgx.ErrNoRows means another fetch got there first.
--- name: ExtendMCPOAuthMetadataDocumentStale :one
+-- MarkMCPOAuthMetadataDocumentRefetchFailed records the FIRST failed
+-- re-fetch of a metadata-document client's stale document since its last
+-- successful fetch: when it failed, and the stale time the one grace it
+-- starts ends at (the failure + MCPClientMetadataCacheTTL). It applies
+-- only while no fetch has succeeded since the caller read the row (the
+-- metadata_fetched_at guard) -- so a failure never pushes out the shorter
+-- lifetime a newer successful fetch set -- and only while no failure is
+-- recorded yet (the metadata_refetch_failed_at guard) -- so a later
+-- failure never extends the grace: past it, the client is refused until a
+-- fetch succeeds. One statement, one row lock (FOR NO KEY UPDATE on the
+-- client), like the upsert above. pgx.ErrNoRows means another fetch
+-- succeeded, another failure started the grace first, or the client is
+-- gone.
+-- name: MarkMCPOAuthMetadataDocumentRefetchFailed :one
 UPDATE mcp_oauth_clients
-SET metadata_stale_at = sqlc.arg(metadata_stale_at)
+SET metadata_refetch_failed_at = sqlc.arg(metadata_refetch_failed_at),
+    metadata_stale_at          = sqlc.arg(metadata_stale_at)
 WHERE id = sqlc.arg(id)
   AND kind = 'metadata_document'
   AND metadata_fetched_at = sqlc.arg(metadata_fetched_at)
+  AND metadata_refetch_failed_at IS NULL
 RETURNING *;
 
 -- The expired-credential sweep's unused-client pass (technical plan

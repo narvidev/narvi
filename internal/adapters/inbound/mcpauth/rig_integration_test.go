@@ -525,6 +525,9 @@ type fakeDocument struct {
 	maxAge    time.Duration
 	hasMaxAge bool
 	err       error
+	// onFetch, when set, runs inside the fetch, before it answers: what
+	// another authorization does meanwhile.
+	onFetch func()
 }
 
 // fakeFetcher is an in-memory mcpauth.MetadataFetcher: it serves the
@@ -541,11 +544,14 @@ func newFakeFetcher() *fakeFetcher {
 
 func (f *fakeFetcher) Fetch(_ context.Context, clientIDURL string) (cimdfetch.Result, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.fetches[clientIDURL]++
 	d, ok := f.docs[clientIDURL]
+	f.mu.Unlock()
 	if !ok {
 		return cimdfetch.Result{}, errors.New("fake fetcher: no document at this URL")
+	}
+	if d.onFetch != nil {
+		d.onFetch()
 	}
 	if d.err != nil {
 		return cimdfetch.Result{}, d.err

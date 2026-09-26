@@ -3097,8 +3097,10 @@ type Timeouts struct {
 	// fixed ceiling: the document's own Cache-Control max-age (or
 	// no-store/no-cache) may only SHORTEN it, never extend it, so a
 	// document that changes -- a redirect URI withdrawn -- is seen within
-	// this long whatever its host says. A stale re-fetch that fails keeps
-	// the cached document for one more TTL. 1 hour.
+	// this long whatever its host says. The first failed re-fetch of a
+	// stale document since its last successful fetch keeps the cached
+	// document for ONE more TTL, measured from that failure, and no
+	// longer: past it the client is refused until a fetch succeeds. 1 hour.
 	MCPClientMetadataCacheTTL time.Duration
 
 	// MCPDynamicClientUnusedTTL is how long a dynamically registered or

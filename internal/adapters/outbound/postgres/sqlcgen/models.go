@@ -1992,17 +1992,18 @@ type McpOauthAuthorizationRequest struct {
 }
 
 type McpOauthClient struct {
-	ID                pgtype.UUID        `json:"id"`
-	ClientID          string             `json:"client_id"`
-	Kind              McpOauthClientKind `json:"kind"`
-	ClientName        string             `json:"client_name"`
-	ClientUri         *string            `json:"client_uri"`
-	RedirectUris      []string           `json:"redirect_uris"`
-	CreatedBy         pgtype.UUID        `json:"created_by"`
-	CreatedAt         pgtype.Timestamptz `json:"created_at"`
-	DisabledAt        pgtype.Timestamptz `json:"disabled_at"`
-	MetadataFetchedAt pgtype.Timestamptz `json:"metadata_fetched_at"`
-	MetadataStaleAt   pgtype.Timestamptz `json:"metadata_stale_at"`
+	ID                      pgtype.UUID        `json:"id"`
+	ClientID                string             `json:"client_id"`
+	Kind                    McpOauthClientKind `json:"kind"`
+	ClientName              string             `json:"client_name"`
+	ClientUri               *string            `json:"client_uri"`
+	RedirectUris            []string           `json:"redirect_uris"`
+	CreatedBy               pgtype.UUID        `json:"created_by"`
+	CreatedAt               pgtype.Timestamptz `json:"created_at"`
+	DisabledAt              pgtype.Timestamptz `json:"disabled_at"`
+	MetadataFetchedAt       pgtype.Timestamptz `json:"metadata_fetched_at"`
+	MetadataStaleAt         pgtype.Timestamptz `json:"metadata_stale_at"`
+	MetadataRefetchFailedAt pgtype.Timestamptz `json:"metadata_refetch_failed_at"`
 }
 
 type McpOauthGrant struct {

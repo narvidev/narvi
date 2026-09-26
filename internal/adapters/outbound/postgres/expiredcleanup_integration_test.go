@@ -380,7 +380,7 @@ func TestExpiredCleanup_SweepsUnusedMCPClients(t *testing.T) {
 	// ago: the authorization endpoint still serves it from its cache for
 	// one more cache lifetime, so it is not unused.
 	inGrace := newDocument("https://in-grace.example/client.json", old, old)
-	if _, err := clients.ExtendMetadataStale(ctx, inGrace.ID, old, time.Now().Add(platform.DefaultTimeouts().MCPClientMetadataCacheTTL)); err != nil {
+	if _, err := clients.MarkMetadataRefetchFailed(ctx, inGrace.ID, old, time.Now(), time.Now().Add(platform.DefaultTimeouts().MCPClientMetadataCacheTTL)); err != nil {
 		t.Fatalf("record the failed re-fetch: %v", err)
 	}
 	disabledDynamic := newClient("narvi_mcp_d_disabled", sqlcgen.McpOauthClientKindDynamic, old)

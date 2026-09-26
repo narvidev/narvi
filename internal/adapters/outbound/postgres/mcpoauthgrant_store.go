@@ -45,9 +45,8 @@
 // users rows are never deleted.
 //
 // Client registration (technical plan §43.15) adds four writers, each
-// following the same order. A metadata document's upsert, and the
-// extension of its cache after a failed re-fetch, are each ONE statement
-// locking ONE row --
+// following the same order. A metadata document's upsert, and the record
+// of its first failed re-fetch, are each ONE statement locking ONE row --
 // the client, FOR NO KEY UPDATE: that never conflicts with the FOR KEY
 // SHARE every issuance and grant revocation takes, only with a client's
 // deletion, and a statement holding a single lock cannot be part of a
