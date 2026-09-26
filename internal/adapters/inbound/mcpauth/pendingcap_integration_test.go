@@ -4,6 +4,9 @@ package mcpauth_test
 
 import (
 	"context"
+	"encoding/json"
+	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/narvidev/narvi/internal/adapters/inbound/mcpauth"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/domain/mcpclient"
 	"github.com/narvidev/narvi/internal/platform"
@@ -75,6 +79,33 @@ func assertCapPage(t *testing.T, rec *httptest.ResponseRecorder) {
 	}
 }
 
+// captureWarnings routes slog.Default's WARN-and-above lines -- what
+// platform.Logger writes through -- into a buffer until the test ends, and
+// returns a function decoding every line so far. The cleanup restores the
+// standard log package's output and flags too: slog.SetDefault redirects
+// them, and restoring slog's default alone does not undo that.
+func captureWarnings(t *testing.T) func() []map[string]any {
+	t.Helper()
+	l := &errorLog{}
+	prev, prevOutput, prevFlags := slog.Default(), log.Writer(), log.Flags()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(l, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevOutput)
+		log.SetFlags(prevFlags)
+	})
+	return func() []map[string]any {
+		var out []map[string]any
+		for _, line := range strings.Split(strings.TrimSpace(l.String()), "\n") {
+			var e map[string]any
+			if json.Unmarshal([]byte(line), &e) == nil {
+				out = append(out, e)
+			}
+		}
+		return out
+	}
+}
+
 // holdAuthorization runs the authorization endpoint's own store
 // transaction for the rig's client -- CreatePendingAuthorizationRequest:
 // the client FOR NO KEY UPDATE, the count, the insert -- inside a
@@ -121,6 +152,48 @@ func TestAuthorize_PendingCapRefused(t *testing.T) {
 		}
 		if log := errs.String(); log != "" {
 			t.Errorf("a refusal was logged as an error:\n%s", log)
+		}
+	})
+
+	// The refusal is what an operator finds a flood by (the runbook's "too
+	// many sign-ins waiting"): one WARN line naming the client and the
+	// refused request's network, by the very key the brakes use -- an IPv6
+	// peer by its /48 -- and nothing the request carried: not its state,
+	// its challenge or its session cookie.
+	t.Run("the refusal is logged with the client and the refused request's network, and no credential", func(t *testing.T) {
+		r := newCappedRig(t, maxPending)
+		_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+		for range maxPending {
+			assertStored(t, r.startAuthorization(t))
+		}
+		warnings := captureWarnings(t)
+		params := r.authorizeParams(newVerifier(t))
+		params.Set("state", "state-not-for-logs")
+		req := httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+params.Encode(), nil)
+		req.RemoteAddr = "[2001:db8:77:1::5]:4000"
+		req.AddCookie(&http.Cookie{Name: platform.AuthSessionCookieName, Value: cookie})
+		rec := httptest.NewRecorder()
+		r.router.ServeHTTP(rec, req)
+		assertCapPage(t, rec)
+
+		var refusals []map[string]any
+		for _, e := range warnings() {
+			if e["msg"] == "mcpauth: authorize refused" && e["outcome"] == "pending_request_cap" {
+				refusals = append(refusals, e)
+			}
+		}
+		if len(refusals) != 1 {
+			t.Fatalf("pending-cap refusals logged = %d, want 1: %v", len(refusals), refusals)
+		}
+		e := refusals[0]
+		line, _ := json.Marshal(e)
+		if e["level"] != "WARN" || e["client_id"] != r.client.ClientID || e["client_address"] != "2001:db8:77::/48" || e["client_address"] != mcpauth.ClientAddressKey(req) {
+			t.Fatalf("refusal log %s: want a WARN naming the client and the network 2001:db8:77::/48 -- the brakes' own key", line)
+		}
+		for _, secret := range []string{"state-not-for-logs", params.Get("code_challenge"), cookie} {
+			if strings.Contains(string(line), secret) {
+				t.Fatalf("refusal log %s carries %q", line, secret)
+			}
 		}
 	})
 

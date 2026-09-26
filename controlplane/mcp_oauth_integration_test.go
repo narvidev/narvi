@@ -1551,13 +1551,17 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 	// The pending-request cap on the production router: a concurrent flood
 	// of authorizations of one client, each from a network of its own so no
 	// brake stands in the way, stores exactly the shipped cap; every other
-	// request gets the 503 page and never a redirect.
+	// request gets the 503 page and never a redirect, and is logged once,
+	// naming the client and that request's own network -- the lines an
+	// operator counts to find who is flooding (the runbook's "too many
+	// sign-ins waiting").
 	t.Run("Authorize_PendingCapRefused", func(t *testing.T) {
 		ctx := oauthTestCtx(t)
 		_, adminCookie := createRouterUser(ctx, t, braked.pool, sqlcgen.UserRoleAdmin)
 		client := braked.registerClientAsAdmin(t, adminCookie, "Popular Plugin")
 		maxPending := braked.cfg.Timeouts.MCPMaxPendingAuthorizationRequestsPerClient
 		flood := maxPending + 10
+		logs := captureWarnings(t)
 		results := make([]*httptest.ResponseRecorder, flood)
 		var eg errgroup.Group
 		for i := range flood {
@@ -1573,18 +1577,31 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 			t.Fatal(err)
 		}
 		stored, capped := 0, 0
-		for _, rec := range results {
+		refusedNetworks := map[string]int{}
+		for i, rec := range results {
 			switch {
 			case rec.Code == http.StatusFound:
 				stored++
 			case rec.Code == http.StatusServiceUnavailable && rec.Header().Get("Location") == "" && strings.Contains(rec.Body.String(), "This app has too many sign-ins waiting"):
 				capped++
+				refusedNetworks[fmt.Sprintf("203.0.113.%d", i+1)]++
 			default:
 				t.Errorf("an authorization of the flood answered %d Location %q", rec.Code, rec.Header().Get("Location"))
 			}
 		}
 		if stored != maxPending || capped != flood-maxPending {
 			t.Fatalf("flood of %d: %d stored, %d refused at the cap; want %d and %d", flood, stored, capped, maxPending, flood-maxPending)
+		}
+		loggedNetworks := map[string]int{}
+		for _, e := range logs.matching("mcpauth: authorize refused", "outcome", "pending_request_cap") {
+			if e["client_id"] != client.ClientId {
+				continue
+			}
+			network, _ := e["client_address"].(string)
+			loggedNetworks[network]++
+		}
+		if fmt.Sprint(loggedNetworks) != fmt.Sprint(refusedNetworks) {
+			t.Fatalf("pending-cap refusals logged per network = %v, want exactly one per refused request's network, %v", loggedNetworks, refusedNetworks)
 		}
 		var pending int
 		if err := braked.pool.QueryRow(ctx, `

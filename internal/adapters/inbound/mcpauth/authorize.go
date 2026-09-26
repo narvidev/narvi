@@ -166,8 +166,12 @@ func (s *Server) Authorize(w http.ResponseWriter, r *http.Request) {
 		// cap is a condition of the client's traffic, not of this
 		// request, so the person in the browser -- not the app, which
 		// could only start another request -- is told, and nothing was
-		// stored.
-		logger.Warn("mcpauth: authorize refused", "outcome", "pending_request_cap", "client_id", client.ClientID)
+		// stored. The line names the refused request's network by the
+		// key the brakes use (ClientAddressKey): a flood that outruns the
+		// cap has its own excess refused here, so the networks these
+		// lines name most often are the ones filling it. Never the query
+		// (its state or challenge) or a cookie.
+		logger.Warn("mcpauth: authorize refused", "outcome", "pending_request_cap", "client_id", client.ClientID, "client_address", ClientAddressKey(r))
 		s.renderError(w, r, http.StatusServiceUnavailable, "This app has too many sign-ins waiting", "Too many requests to authorize this app are waiting for a decision right now. Wait a few minutes, then start again from the app.")
 		return
 	}

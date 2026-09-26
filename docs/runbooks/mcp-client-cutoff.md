@@ -112,11 +112,23 @@ listed and revoked.
 - **"This app has too many sign-ins waiting" (503):** the client already has
   `MCPMaxPendingAuthorizationRequestsPerClient` (100) authorization requests
   waiting for a decision (§43.14). Each expires ten minutes after it was made.
-  The log line is `mcpauth: authorize refused` with `outcome=pending_request_cap`
-  and the `client_id`. A sustained flood of requests for one client keeps it
-  at the cap -- the cap bounds the table, not who fills it -- so find the
-  networks sending them (the `mcpauth: rate limited` lines below, or the
-  proxy's own logs) and block them upstream, or cut the client off.
+  A sustained flood of requests for one client keeps it at the cap -- the cap
+  bounds the table, not who fills it. Each request the cap refuses is logged
+  once, at WARN: `mcpauth: authorize refused` with
+  `outcome=pending_request_cap`, the `client_id`, and `client_address` -- the
+  network of the request that was refused, by the brakes' own key (one IPv4
+  address, or one IPv6 `/48`) -- never its query or a cookie. A request that
+  is stored is not logged, so these lines name who was refused, not who holds
+  the places. To find the flood, count the lines per `client_address` for that
+  `client_id` over the last few minutes: a flood sending faster than its
+  requests lapse has its excess refused, so its networks are named again and
+  again, while a person trying to sign in appears once or twice. Block those
+  networks upstream. A flood paced to take each place just as it frees is
+  refused only when someone else took a place first, so it may be named
+  rarely or never, and the lines then name only the people it locks out: use
+  the proxy's access log if the deployment has one, or cut the client off
+  (above). Behind a proxy that hides client addresses, every line names the
+  proxy.
 - **"Too many requests from your network" (429), or a `429` from the token
   endpoint:** one client network (one IPv4 address, or one IPv6 /48) is over
   the authorization or token endpoint's brake (§43.14). The log line is
