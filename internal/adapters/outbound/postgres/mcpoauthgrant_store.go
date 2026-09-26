@@ -49,8 +49,9 @@
 // of its first failed re-fetch, are each ONE statement locking ONE row --
 // the client, FOR NO KEY UPDATE: that never conflicts with the FOR KEY
 // SHARE every issuance and grant revocation takes, only with a client's
-// deletion, and a statement holding a single lock cannot be part of a
-// wait cycle. A dynamic registration inserts a new client row and locks
+// deletion (an administrator's or the sweep's) and with each other, and
+// a statement holding a single lock cannot be part of a wait cycle. A
+// dynamic registration inserts a new client row and locks
 // nothing that exists. The expired-credential sweep's unused-client pass
 // (MCPOAuthClientStore.DeleteUnused) deletes a client as an
 // administrator's deletion does -- the client FOR UPDATE, then its

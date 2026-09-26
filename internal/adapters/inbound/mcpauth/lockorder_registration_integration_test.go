@@ -19,6 +19,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/domain/mcpclient"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -26,7 +27,8 @@ import (
 // order (the top of internal/adapters/outbound/postgres/
 // mcpoauthgrant_store.go, technical plan §43.16) to the four writers
 // client registration adds (§43.15): a metadata document's re-fetch (the
-// upsert of its client row), the unused-client sweep, and a dynamic
+// upsert of its client row), the record of a failed re-fetch
+// (MarkMetadataRefetchFailed), the unused-client sweep, and a dynamic
 // registration. Same method: every race is made deterministic by holding
 // the one row the side that goes first needs next -- or, where the side
 // that goes first is a single statement that cannot be stopped midway,
@@ -78,6 +80,83 @@ func assertRefetched(t *testing.T, r *asRig, rec *httptest.ResponseRecorder) sql
 		t.Fatalf("client after the re-fetch = %+v (found %v), want the renamed document", c, ok)
 	}
 	return c
+}
+
+// documentHostDown is a metadata document whose host answers nothing: a
+// re-fetch of it fails.
+var documentHostDown = fakeDocument{err: errors.New("document host unreachable")}
+
+// holdRefetchFailure runs the failed re-fetch's own statement inside a
+// test-held transaction -- MarkMetadataRefetchFailed, one UPDATE of the
+// client row, FOR NO KEY UPDATE, exactly what keepAfterFailedRefetch runs
+// -- for the client carrying clientIDURL: a failure now, and the grace
+// refetchGraceEnd gives it under a cache lifetime of ttl. It returns the
+// transaction and the row as the held statement left it.
+func (r *asRig) holdRefetchFailure(ctx context.Context, t *testing.T, clientIDURL string, ttl time.Duration) (*heldTx, sqlcgen.McpOauthClient) {
+	t.Helper()
+	c, ok := r.clientRow(t, clientIDURL)
+	if !ok {
+		t.Fatalf("no client carries %s", clientIDURL)
+	}
+	var recorded sqlcgen.McpOauthClient
+	hold := holdInTx(ctx, t, r.pool, func(tx pgx.Tx) {
+		now := time.Now()
+		graceEnd := now.Add(ttl)
+		if bound := c.MetadataFetchedAt.Time.Add(2 * ttl); bound.Before(graceEnd) {
+			graceEnd = bound
+		}
+		if !now.Before(graceEnd) {
+			t.Fatalf("%s was last fetched at %v, too long ago for a failure to record any grace", clientIDURL, c.MetadataFetchedAt.Time)
+		}
+		var err error
+		if recorded, err = r.clients.WithTx(tx).MarkMetadataRefetchFailed(ctx, c.ID, c.MetadataFetchedAt.Time, now, graceEnd); err != nil {
+			t.Fatalf("held failed re-fetch: %v", err)
+		}
+	})
+	return hold, recorded
+}
+
+// assertFailureRecorded: the client carrying clientIDURL still holds the
+// document named name, and records a failed re-fetch whose grace runs past
+// now.
+func assertFailureRecorded(t *testing.T, r *asRig, clientIDURL, name string) sqlcgen.McpOauthClient {
+	t.Helper()
+	c, ok := r.clientRow(t, clientIDURL)
+	if !ok || c.ClientName != name || !c.MetadataRefetchFailedAt.Valid || !c.MetadataStaleAt.Time.After(time.Now()) {
+		t.Fatalf("client after the failed re-fetch = %+v (found %v), want %q kept, the failure recorded and its grace running", c, ok, name)
+	}
+	return c
+}
+
+// assertKeptAfterFailedRefetch: the authorization whose re-fetch failed
+// went on to the consent flow from the cached document (through sign-in:
+// it carried no cookie), which the client row still holds, the failure
+// recorded.
+func assertKeptAfterFailedRefetch(t *testing.T, r *asRig, rec *httptest.ResponseRecorder) sqlcgen.McpOauthClient {
+	t.Helper()
+	if rec.Code != http.StatusFound || !strings.HasPrefix(rec.Header().Get("Location"), "/sign-in?next=") {
+		t.Fatalf("authorization whose re-fetch failed: status %d Location %q, want a 302 on to sign-in from the cached document", rec.Code, rec.Header().Get("Location"))
+	}
+	return assertFailureRecorded(t, r, docClientURL, "Editor Plugin")
+}
+
+// newLongCacheRig is newASRig on a deployment whose
+// MCPClientMetadataCacheTTL (14 hours) is over half its
+// MCPDynamicClientUnusedTTL (24 hours). That is a valid setting, and the
+// only kind under which a failed re-fetch can meet the unused-client
+// sweep: a sweep candidate was last fetched more than
+// MCPDynamicClientUnusedTTL ago, and a failure records a grace only
+// within two cache lifetimes of the last successful fetch. Under the
+// default hour, the failure path writes nothing to such a client.
+func newLongCacheRig(t *testing.T) (*asRig, time.Duration) {
+	t.Helper()
+	long := platform.DefaultTimeouts()
+	long.MCPClientMetadataCacheTTL = 14 * time.Hour
+	if err := long.Validate(); err != nil {
+		t.Fatalf("the long cache lifetime does not validate: %v", err)
+	}
+	r := newASRigWith(t, rigOptions{mechanisms: mcpclient.Mechanisms{MetadataDocuments: true, DynamicRegistration: true}, timeouts: &long})
+	return r, long.MCPClientMetadataCacheTTL
 }
 
 // waitingFor names the one lock pid is queued for: its lock type and, for
@@ -163,6 +242,18 @@ func sweepCutoff() time.Time {
 //     behind a client deletion alone, and, the client gone, registers the
 //     document afresh; a client deletion queues on the client row behind
 //     it alone.
+//   - The record of a failed re-fetch is the same one statement and row
+//     lock, and is raced against every one of those, in both orders: it
+//     never queues behind a holder of the client's FOR KEY SHARE, nor does
+//     any queue behind it; behind a client deletion or the sweep it queues
+//     on the client row alone, then finds the client gone, and the
+//     authorization is refused with a page, never a 500; either queues
+//     behind it alone and then goes on. It and a successful re-fetch
+//     serialize on the client row whichever goes first, and the newer
+//     fetch stands; two failures serialize too, and the second uses the
+//     first one's grace, unextended. The sweep pair runs under a cache
+//     lifetime over half MCPDynamicClientUnusedTTL (newLongCacheRig): under
+//     the default, a failure writes nothing to a sweep candidate.
 //   - The unused-client sweep and a re-fetch serialize on the client row:
 //     a re-fetch behind the sweep registers the document afresh, and a
 //     sweep behind a re-fetch re-checks the row and spares it. An
@@ -175,16 +266,22 @@ func sweepCutoff() time.Time {
 //     one transaction: an insert under a candidate that comes between
 //     them waits for the sweep, then fails its foreign-key check -- it
 //     never commits under a client the second statement then deletes.
-//   - A dynamic registration inserts a new row and queues behind nothing.
+//   - A dynamic registration inserts a new row and queues behind nothing,
+//     and nothing -- a client deletion, a failed re-fetch -- queues behind
+//     it.
 func TestLockOrder_ClientRegistrationWriters(t *testing.T) {
 	// A re-fetch racing a holder of the client's FOR KEY SHARE: whichever
-	// goes first, neither waits for the other.
+	// goes first, neither waits for the other. Each race runs twice: the
+	// fetch succeeding, when the re-fetch's writer is the upsert, and the
+	// fetch failing, when it is the record of that failure -- the same one
+	// statement and one row lock.
+	ttl := platform.DefaultTimeouts().MCPClientMetadataCacheTTL
 	for _, tc := range []struct {
 		name        string
 		fixture     issuance
 		issuer      bool // the holder is the fixture's issuance; else revoker
 		revoker     revocation
-		refetchHeld bool // the re-fetch holds the client first (test-held upsert)
+		refetchHeld bool // the re-fetch holds the client first (its test-held statement)
 	}{
 		{"ConsentHoldsClient_MetadataRefetchProceeds", consentApproval, true, "", false},
 		{"ExchangeHoldsClient_MetadataRefetchProceeds", codeExchange, true, "", false},
@@ -197,156 +294,371 @@ func TestLockOrder_ClientRegistrationWriters(t *testing.T) {
 		{"MetadataRefetchHoldsClient_GrantRevocationProceeds", refreshExchange, false, grantRevocation, true},
 		{"MetadataRefetchHoldsClient_TokenRevocationProceeds", refreshExchange, false, tokenRevocation, true},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
+		for _, failing := range []bool{false, true} {
+			name, writer := tc.name, "metadata re-fetch"
+			if failing {
+				name, writer = strings.Replace(tc.name, "MetadataRefetch", "FailedMetadataRefetch", 1), "failed metadata re-fetch"
+			}
+			t.Run(name, func(t *testing.T) {
+				ctx := context.Background()
+				r := newCIMDRaceRig(t)
+				f := newRaceFixture(t, r, tc.fixture)
+				r.staleDocument(t, docClientURL)
+				if failing {
+					r.documents.set(docClientURL, documentHostDown)
+				}
+				errs := captureErrorLog(t)
+
+				var eg errgroup.Group
+				var held, refetched *httptest.ResponseRecorder
+				heldDone, refetchDone := make(chan struct{}), make(chan struct{})
+				runHolder := func() {
+					eg.Go(func() error {
+						defer close(heldDone)
+						if tc.issuer {
+							held = f.issue(r, tc.fixture)
+						} else {
+							held = f.revoke(r, tc.revoker)
+						}
+						return nil
+					})
+				}
+
+				if tc.refetchHeld {
+					var hold *heldTx
+					if failing {
+						hold, _ = r.holdRefetchFailure(ctx, t, docClientURL, ttl)
+					} else {
+						// The re-fetch's own statement, held open: the client
+						// row FOR NO KEY UPDATE, exactly what the upsert takes.
+						hold = holdInTx(ctx, t, r.pool, func(tx pgx.Tx) {
+							now := time.Now()
+							if _, err := r.clients.WithTx(tx).UpsertMetadataDocument(ctx, sqlcgen.UpsertMCPOAuthMetadataDocumentClientParams{
+								ClientID: docClientURL, ClientName: "Editor Plugin (renamed)", RedirectUris: []string{loopbackRedirect, httpsRedirect},
+								MetadataFetchedAt: pgtype.Timestamptz{Time: now, Valid: true},
+								MetadataStaleAt:   pgtype.Timestamptz{Time: now.Add(time.Hour), Valid: true},
+							}); err != nil {
+								t.Fatalf("held upsert: %v", err)
+							}
+						})
+					}
+					runHolder()
+					if pid := waitForLockWaiter(ctx, t, r.pool, []int32{hold.pid}, heldDone); pid != 0 {
+						locktype, table := waitingFor(ctx, t, r.pool, pid)
+						t.Fatalf("the %s queued (on a %s lock of %q, behind %v) behind a held %s", name, locktype, table, blockingPIDs(ctx, t, r.pool, pid), writer)
+					}
+					if err := hold.tx.Commit(ctx); err != nil {
+						t.Fatal(err)
+					}
+					if failing {
+						assertFailureRecorded(t, r, docClientURL, "Editor Plugin")
+					}
+				} else {
+					blocker, err := r.pool.Begin(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var blockerPID int32
+					if err := blocker.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&blockerPID); err != nil {
+						t.Fatal(err)
+					}
+					gateSQL, gateArg := f.gate(tc.fixture, tc.issuer)
+					if tag, err := blocker.Exec(ctx, gateSQL, gateArg); err != nil || tag.RowsAffected() != 1 {
+						t.Fatalf("blocker: hold the gate row: err %v, rows %d", err, tag.RowsAffected())
+					}
+					release := func() { _ = blocker.Rollback(ctx); _ = eg.Wait() }
+					defer release()
+
+					runHolder()
+					holderPID := waitForLockWaiter(ctx, t, r.pool, []int32{blockerPID}, heldDone)
+					if holderPID == 0 {
+						t.Fatalf("the holder finished without reaching the row the blocker holds")
+					}
+					eg.Go(func() error { defer close(refetchDone); refetched = r.refetchDocument(t); return nil })
+					if pid := waitForLockWaiter(ctx, t, r.pool, []int32{blockerPID, holderPID}, refetchDone); pid != 0 {
+						locktype, table := waitingFor(ctx, t, r.pool, pid)
+						t.Fatalf("the %s queued (on a %s lock of %q, behind %v) behind a holder of the client's FOR KEY SHARE", writer, locktype, table, blockingPIDs(ctx, t, r.pool, pid))
+					}
+					if failing {
+						assertKeptAfterFailedRefetch(t, r, refetched)
+					} else {
+						assertRefetched(t, r, refetched)
+					}
+					release()
+				}
+				if err := eg.Wait(); err != nil {
+					t.Fatal(err)
+				}
+
+				if log := errs.String(); log != "" {
+					t.Errorf("a handler failed (a deadlock victim logs SQLSTATE 40P01):\n%s", log)
+				}
+				if tc.issuer {
+					assertHolderIssued(t, tc.fixture, held)
+				} else {
+					assertRevoked(ctx, t, r, f, tc.revoker, held)
+				}
+			})
+		}
+	}
+
+	// A client deletion and a re-fetch serialize on the client row, in
+	// either order, the fetch succeeding or failing. Queued behind the
+	// deletion, a successful re-fetch registers the document afresh; a
+	// failed one finds the client gone and is refused with a page.
+	for _, failing := range []bool{false, true} {
+		failed := ""
+		if failing {
+			failed = "Failed"
+		}
+		t.Run("ClientDeletionHoldsClient_"+failed+"MetadataRefetchQueues", func(t *testing.T) {
 			ctx := context.Background()
 			r := newCIMDRaceRig(t)
-			f := newRaceFixture(t, r, tc.fixture)
+			f := newRaceFixture(t, r, refreshExchange)
 			r.staleDocument(t, docClientURL)
+			if failing {
+				r.documents.set(docClientURL, documentHostDown)
+			}
 			errs := captureErrorLog(t)
 
-			var eg errgroup.Group
-			var held, refetched *httptest.ResponseRecorder
-			heldDone, refetchDone := make(chan struct{}), make(chan struct{})
-			runHolder := func() {
-				eg.Go(func() error {
-					defer close(heldDone)
-					if tc.issuer {
-						held = f.issue(r, tc.fixture)
-					} else {
-						held = f.revoke(r, tc.revoker)
-					}
-					return nil
-				})
+			blocker, err := r.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
 			}
+			var blockerPID int32
+			if err := blocker.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&blockerPID); err != nil {
+				t.Fatal(err)
+			}
+			gateSQL, gateArg := f.gate(refreshExchange, false)
+			if tag, err := blocker.Exec(ctx, gateSQL, gateArg); err != nil || tag.RowsAffected() != 1 {
+				t.Fatalf("blocker: hold the gate row: err %v, rows %d", err, tag.RowsAffected())
+			}
+			var eg errgroup.Group
+			release := func() { _ = blocker.Rollback(ctx); _ = eg.Wait() }
+			defer release()
 
-			if tc.refetchHeld {
-				// The re-fetch's own statement, held open: the client row
-				// FOR NO KEY UPDATE, exactly what the upsert takes.
-				hold := holdInTx(ctx, t, r.pool, func(tx pgx.Tx) {
+			var deleted, refetched *httptest.ResponseRecorder
+			deletionDone, refetchDone := make(chan struct{}), make(chan struct{})
+			eg.Go(func() error { defer close(deletionDone); deleted = f.revoke(r, clientDeletion); return nil })
+			deletionPID := waitForLockWaiter(ctx, t, r.pool, []int32{blockerPID}, deletionDone)
+			if deletionPID == 0 {
+				t.Fatal("the client deletion finished without reaching the row the blocker holds")
+			}
+			eg.Go(func() error { defer close(refetchDone); refetched = r.refetchDocument(t); return nil })
+			refetchPID := waitForLockWaiter(ctx, t, r.pool, []int32{blockerPID, deletionPID}, refetchDone)
+			if refetchPID == 0 {
+				t.Fatal("the metadata re-fetch finished without queuing behind the client deletion")
+			}
+			assertQueuedOnClientBehind(ctx, t, r.pool, refetchPID, deletionPID)
+			release()
+
+			if log := errs.String(); log != "" {
+				t.Errorf("a handler failed:\n%s", log)
+			}
+			if deleted.Code != http.StatusNoContent {
+				t.Fatalf("client deletion: status %d body %s, want 204", deleted.Code, deleted.Body.String())
+			}
+			if failing {
+				assertPageNotRedirect(t, "a failed re-fetch behind the client's deletion", refetched)
+				if c, ok := r.clientRow(t, docClientURL); ok {
+					t.Fatalf("a failed re-fetch behind the client's deletion left client %+v, want none", c)
+				}
+			} else {
+				fresh := assertRefetched(t, r, refetched)
+				if fresh.ID == r.client.ID {
+					t.Fatal("the re-fetch revived the deleted client row instead of registering the document afresh")
+				}
+			}
+			assertNothingSurvives(ctx, t, r, f, clientDeletion)
+		})
+
+		t.Run(failed+"MetadataRefetchHoldsClient_ClientDeletionQueues", func(t *testing.T) {
+			ctx := context.Background()
+			r := newCIMDRaceRig(t)
+			f := newRaceFixture(t, r, refreshExchange)
+			errs := captureErrorLog(t)
+
+			var hold *heldTx
+			if failing {
+				r.staleDocument(t, docClientURL)
+				hold, _ = r.holdRefetchFailure(ctx, t, docClientURL, ttl)
+			} else {
+				hold = holdInTx(ctx, t, r.pool, func(tx pgx.Tx) {
 					now := time.Now()
 					if _, err := r.clients.WithTx(tx).UpsertMetadataDocument(ctx, sqlcgen.UpsertMCPOAuthMetadataDocumentClientParams{
-						ClientID: docClientURL, ClientName: "Editor Plugin (renamed)", RedirectUris: []string{loopbackRedirect, httpsRedirect},
+						ClientID: docClientURL, ClientName: "Editor Plugin (renamed)", RedirectUris: []string{loopbackRedirect},
 						MetadataFetchedAt: pgtype.Timestamptz{Time: now, Valid: true},
 						MetadataStaleAt:   pgtype.Timestamptz{Time: now.Add(time.Hour), Valid: true},
 					}); err != nil {
 						t.Fatalf("held upsert: %v", err)
 					}
 				})
-				runHolder()
-				if pid := waitForLockWaiter(ctx, t, r.pool, []int32{hold.pid}, heldDone); pid != 0 {
-					locktype, table := waitingFor(ctx, t, r.pool, pid)
-					t.Fatalf("the %s queued (on a %s lock of %q, behind %v) behind a held metadata re-fetch", tc.name, locktype, table, blockingPIDs(ctx, t, r.pool, pid))
-				}
-				if err := hold.tx.Commit(ctx); err != nil {
-					t.Fatal(err)
-				}
-			} else {
-				blocker, err := r.pool.Begin(ctx)
-				if err != nil {
-					t.Fatal(err)
-				}
-				var blockerPID int32
-				if err := blocker.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&blockerPID); err != nil {
-					t.Fatal(err)
-				}
-				gateSQL, gateArg := f.gate(tc.fixture, tc.issuer)
-				if tag, err := blocker.Exec(ctx, gateSQL, gateArg); err != nil || tag.RowsAffected() != 1 {
-					t.Fatalf("blocker: hold the gate row: err %v, rows %d", err, tag.RowsAffected())
-				}
-				release := func() { _ = blocker.Rollback(ctx); _ = eg.Wait() }
-				defer release()
-
-				runHolder()
-				holderPID := waitForLockWaiter(ctx, t, r.pool, []int32{blockerPID}, heldDone)
-				if holderPID == 0 {
-					t.Fatalf("the holder finished without reaching the row the blocker holds")
-				}
-				eg.Go(func() error { defer close(refetchDone); refetched = r.refetchDocument(t); return nil })
-				if pid := waitForLockWaiter(ctx, t, r.pool, []int32{blockerPID, holderPID}, refetchDone); pid != 0 {
-					locktype, table := waitingFor(ctx, t, r.pool, pid)
-					t.Fatalf("the metadata re-fetch queued (on a %s lock of %q, behind %v) behind a holder of the client's FOR KEY SHARE", locktype, table, blockingPIDs(ctx, t, r.pool, pid))
-				}
-				assertRefetched(t, r, refetched)
-				release()
+			}
+			var eg errgroup.Group
+			var deleted *httptest.ResponseRecorder
+			deletionDone := make(chan struct{})
+			eg.Go(func() error { defer close(deletionDone); deleted = f.revoke(r, clientDeletion); return nil })
+			deletionPID := waitForLockWaiter(ctx, t, r.pool, []int32{hold.pid}, deletionDone)
+			if deletionPID == 0 {
+				t.Fatal("the client deletion finished without queuing behind the held re-fetch")
+			}
+			assertQueuedOnClientBehind(ctx, t, r.pool, deletionPID, hold.pid)
+			if err := hold.tx.Commit(ctx); err != nil {
+				t.Fatal(err)
 			}
 			if err := eg.Wait(); err != nil {
 				t.Fatal(err)
 			}
-
 			if log := errs.String(); log != "" {
-				t.Errorf("a handler failed (a deadlock victim logs SQLSTATE 40P01):\n%s", log)
+				t.Errorf("a handler failed:\n%s", log)
 			}
-			if tc.issuer {
-				assertHolderIssued(t, tc.fixture, held)
+			if deleted.Code != http.StatusNoContent {
+				t.Fatalf("client deletion: status %d body %s, want 204", deleted.Code, deleted.Body.String())
+			}
+			assertNothingSurvives(ctx, t, r, f, clientDeletion)
+		})
+	}
+
+	// The unused-client sweep and a re-fetch, in either order, the fetch
+	// succeeding or failing. A failed re-fetch can only meet the sweep on
+	// a deployment whose cache lifetime is over half
+	// MCPDynamicClientUnusedTTL, so those two races run on one
+	// (newLongCacheRig).
+	for _, failing := range []bool{false, true} {
+		failed := ""
+		if failing {
+			failed = "Failed"
+		}
+		rig := func(t *testing.T) (*asRig, time.Duration) {
+			if failing {
+				return newLongCacheRig(t)
+			}
+			return newASRig(t), ttl
+		}
+		t.Run("SweepHoldsClient_"+failed+"MetadataRefetchQueues", func(t *testing.T) {
+			ctx := context.Background()
+			r, _ := rig(t)
+			const unusedURL = "https://unused.example/client.json"
+			old := r.oldUnusedClient(t, sqlcgen.McpOauthClientKindMetadataDocument, unusedURL)
+			if failing {
+				r.documents.set(unusedURL, documentHostDown)
+			}
+			errs := captureErrorLog(t)
+
+			hold := holdInTx(ctx, t, r.pool, func(tx pgx.Tx) {
+				if n, err := r.clients.WithTx(tx).DeleteUnused(ctx, sweepCutoff()); err != nil || n != 1 {
+					t.Fatalf("held sweep: deleted %d, err %v; want the one unused client", n, err)
+				}
+			})
+			var eg errgroup.Group
+			var refetched *httptest.ResponseRecorder
+			refetchDone := make(chan struct{})
+			eg.Go(func() error {
+				defer close(refetchDone)
+				refetched = r.authorize(forClient(r.authorizeParams(newVerifier(t)), unusedURL), "")
+				return nil
+			})
+			refetchPID := waitForLockWaiter(ctx, t, r.pool, []int32{hold.pid}, refetchDone)
+			if refetchPID == 0 {
+				t.Fatal("the re-fetch finished without queuing behind the sweep deleting its client")
+			}
+			assertQueuedOnClientBehind(ctx, t, r.pool, refetchPID, hold.pid)
+			if err := hold.tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := eg.Wait(); err != nil {
+				t.Fatal(err)
+			}
+			if log := errs.String(); log != "" {
+				t.Errorf("a handler failed:\n%s", log)
+			}
+			if failing {
+				assertPageNotRedirect(t, "a failed re-fetch behind the sweep", refetched)
+				if c, ok := r.clientRow(t, unusedURL); ok {
+					t.Fatalf("a failed re-fetch behind the sweep left client %+v, want none", c)
+				}
+				return
+			}
+			if refetched.Code != http.StatusFound {
+				t.Fatalf("re-fetch behind the sweep: status %d body %s, want 302", refetched.Code, refetched.Body.String())
+			}
+			if c, ok := r.clientRow(t, unusedURL); !ok || c.ID == old.ID || c.ClientName != "Old, fetched again" {
+				t.Fatalf("after the sweep and the re-fetch: client %+v (found %v), want the document registered afresh", c, ok)
+			}
+		})
+
+		t.Run(failed+"MetadataRefetchHoldsClient_SweepQueuesAndSparesIt", func(t *testing.T) {
+			ctx := context.Background()
+			r, cacheTTL := rig(t)
+			const unusedURL = "https://unused.example/client.json"
+			old := r.oldUnusedClient(t, sqlcgen.McpOauthClientKindMetadataDocument, unusedURL)
+			errs := captureErrorLog(t)
+
+			var hold *heldTx
+			if failing {
+				hold, _ = r.holdRefetchFailure(ctx, t, unusedURL, cacheTTL)
 			} else {
-				assertRevoked(ctx, t, r, f, tc.revoker, held)
+				hold = holdInTx(ctx, t, r.pool, func(tx pgx.Tx) {
+					now := time.Now()
+					if _, err := r.clients.WithTx(tx).UpsertMetadataDocument(ctx, sqlcgen.UpsertMCPOAuthMetadataDocumentClientParams{
+						ClientID: unusedURL, ClientName: "Old, fetched again", RedirectUris: []string{loopbackRedirect},
+						MetadataFetchedAt: pgtype.Timestamptz{Time: now, Valid: true},
+						MetadataStaleAt:   pgtype.Timestamptz{Time: now.Add(time.Hour), Valid: true},
+					}); err != nil {
+						t.Fatalf("held upsert: %v", err)
+					}
+				})
+			}
+			var eg errgroup.Group
+			var swept int64
+			sweepDone := make(chan struct{})
+			eg.Go(func() error {
+				defer close(sweepDone)
+				var err error
+				swept, err = r.clients.DeleteUnused(ctx, sweepCutoff())
+				return err
+			})
+			sweepPID := waitForLockWaiter(ctx, t, r.pool, []int32{hold.pid}, sweepDone)
+			if sweepPID == 0 {
+				t.Fatal("the sweep finished without queuing behind the re-fetch updating its candidate")
+			}
+			assertQueuedOnClientBehind(ctx, t, r.pool, sweepPID, hold.pid)
+			if err := hold.tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := eg.Wait(); err != nil {
+				t.Fatalf("sweep: %v", err)
+			}
+			if log := errs.String(); log != "" {
+				t.Errorf("a handler failed:\n%s", log)
+			}
+			if swept != 0 {
+				t.Fatalf("the sweep deleted %d clients, want 0: the re-fetched client is no longer unused", swept)
+			}
+			if c, ok := r.clientRow(t, unusedURL); !ok || c.ID != old.ID {
+				t.Fatalf("after the re-fetch and the sweep: client %+v (found %v), want the same client kept", c, ok)
+			}
+			if failing {
+				assertFailureRecorded(t, r, unusedURL, "Old")
 			}
 		})
 	}
 
-	// A client deletion and a re-fetch serialize on the client row, in
-	// either order.
-	t.Run("ClientDeletionHoldsClient_MetadataRefetchQueues", func(t *testing.T) {
+	// A successful re-fetch and a failed one serialize on the client row,
+	// in either order, and the newer fetch stands: a failure queued behind
+	// the upsert records nothing over it and goes on from the newer
+	// document; an upsert queued behind a failure's record clears it.
+	t.Run("MetadataRefetchHoldsClient_FailedMetadataRefetchQueuesAndUsesIt", func(t *testing.T) {
 		ctx := context.Background()
 		r := newCIMDRaceRig(t)
-		f := newRaceFixture(t, r, refreshExchange)
 		r.staleDocument(t, docClientURL)
-		errs := captureErrorLog(t)
-
-		blocker, err := r.pool.Begin(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var blockerPID int32
-		if err := blocker.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&blockerPID); err != nil {
-			t.Fatal(err)
-		}
-		gateSQL, gateArg := f.gate(refreshExchange, false)
-		if tag, err := blocker.Exec(ctx, gateSQL, gateArg); err != nil || tag.RowsAffected() != 1 {
-			t.Fatalf("blocker: hold the gate row: err %v, rows %d", err, tag.RowsAffected())
-		}
-		var eg errgroup.Group
-		release := func() { _ = blocker.Rollback(ctx); _ = eg.Wait() }
-		defer release()
-
-		var deleted, refetched *httptest.ResponseRecorder
-		deletionDone, refetchDone := make(chan struct{}), make(chan struct{})
-		eg.Go(func() error { defer close(deletionDone); deleted = f.revoke(r, clientDeletion); return nil })
-		deletionPID := waitForLockWaiter(ctx, t, r.pool, []int32{blockerPID}, deletionDone)
-		if deletionPID == 0 {
-			t.Fatal("the client deletion finished without reaching the row the blocker holds")
-		}
-		eg.Go(func() error { defer close(refetchDone); refetched = r.refetchDocument(t); return nil })
-		refetchPID := waitForLockWaiter(ctx, t, r.pool, []int32{blockerPID, deletionPID}, refetchDone)
-		if refetchPID == 0 {
-			t.Fatal("the metadata re-fetch finished without queuing behind the client deletion")
-		}
-		assertQueuedOnClientBehind(ctx, t, r.pool, refetchPID, deletionPID)
-		release()
-
-		if log := errs.String(); log != "" {
-			t.Errorf("a handler failed:\n%s", log)
-		}
-		if deleted.Code != http.StatusNoContent {
-			t.Fatalf("client deletion: status %d body %s, want 204", deleted.Code, deleted.Body.String())
-		}
-		fresh := assertRefetched(t, r, refetched)
-		if fresh.ID == r.client.ID {
-			t.Fatal("the re-fetch revived the deleted client row instead of registering the document afresh")
-		}
-		assertNothingSurvives(ctx, t, r, f, clientDeletion)
-	})
-
-	t.Run("MetadataRefetchHoldsClient_ClientDeletionQueues", func(t *testing.T) {
-		ctx := context.Background()
-		r := newCIMDRaceRig(t)
-		f := newRaceFixture(t, r, refreshExchange)
+		r.documents.set(docClientURL, documentHostDown)
 		errs := captureErrorLog(t)
 
 		hold := holdInTx(ctx, t, r.pool, func(tx pgx.Tx) {
 			now := time.Now()
 			if _, err := r.clients.WithTx(tx).UpsertMetadataDocument(ctx, sqlcgen.UpsertMCPOAuthMetadataDocumentClientParams{
-				ClientID: docClientURL, ClientName: "Editor Plugin (renamed)", RedirectUris: []string{loopbackRedirect},
+				ClientID: docClientURL, ClientName: "Editor Plugin (renamed)", RedirectUris: []string{loopbackRedirect, httpsRedirect},
 				MetadataFetchedAt: pgtype.Timestamptz{Time: now, Valid: true},
 				MetadataStaleAt:   pgtype.Timestamptz{Time: now.Add(time.Hour), Valid: true},
 			}); err != nil {
@@ -354,14 +666,14 @@ func TestLockOrder_ClientRegistrationWriters(t *testing.T) {
 			}
 		})
 		var eg errgroup.Group
-		var deleted *httptest.ResponseRecorder
-		deletionDone := make(chan struct{})
-		eg.Go(func() error { defer close(deletionDone); deleted = f.revoke(r, clientDeletion); return nil })
-		deletionPID := waitForLockWaiter(ctx, t, r.pool, []int32{hold.pid}, deletionDone)
-		if deletionPID == 0 {
-			t.Fatal("the client deletion finished without queuing behind the held re-fetch")
+		var failedRefetch *httptest.ResponseRecorder
+		failedDone := make(chan struct{})
+		eg.Go(func() error { defer close(failedDone); failedRefetch = r.refetchDocument(t); return nil })
+		failedPID := waitForLockWaiter(ctx, t, r.pool, []int32{hold.pid}, failedDone)
+		if failedPID == 0 {
+			t.Fatal("the failed re-fetch finished without queuing behind the re-fetch updating its client")
 		}
-		assertQueuedOnClientBehind(ctx, t, r.pool, deletionPID, hold.pid)
+		assertQueuedOnClientBehind(ctx, t, r.pool, failedPID, hold.pid)
 		if err := hold.tx.Commit(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -371,36 +683,25 @@ func TestLockOrder_ClientRegistrationWriters(t *testing.T) {
 		if log := errs.String(); log != "" {
 			t.Errorf("a handler failed:\n%s", log)
 		}
-		if deleted.Code != http.StatusNoContent {
-			t.Fatalf("client deletion: status %d body %s, want 204", deleted.Code, deleted.Body.String())
+		if c := assertRefetched(t, r, failedRefetch); c.MetadataRefetchFailedAt.Valid {
+			t.Fatalf("a failure queued behind a newer successful fetch was recorded over it: %+v", c)
 		}
-		assertNothingSurvives(ctx, t, r, f, clientDeletion)
 	})
 
-	// The unused-client sweep and a re-fetch, in either order.
-	t.Run("SweepHoldsClient_MetadataRefetchQueues", func(t *testing.T) {
+	t.Run("FailedMetadataRefetchHoldsClient_MetadataRefetchQueuesAndClearsIt", func(t *testing.T) {
 		ctx := context.Background()
-		r := newASRig(t)
-		const unusedURL = "https://unused.example/client.json"
-		old := r.oldUnusedClient(t, sqlcgen.McpOauthClientKindMetadataDocument, unusedURL)
+		r := newCIMDRaceRig(t)
+		r.staleDocument(t, docClientURL)
 		errs := captureErrorLog(t)
 
-		hold := holdInTx(ctx, t, r.pool, func(tx pgx.Tx) {
-			if n, err := r.clients.WithTx(tx).DeleteUnused(ctx, sweepCutoff()); err != nil || n != 1 {
-				t.Fatalf("held sweep: deleted %d, err %v; want the one unused client", n, err)
-			}
-		})
+		hold, _ := r.holdRefetchFailure(ctx, t, docClientURL, ttl)
 		var eg errgroup.Group
 		var refetched *httptest.ResponseRecorder
 		refetchDone := make(chan struct{})
-		eg.Go(func() error {
-			defer close(refetchDone)
-			refetched = r.authorize(forClient(r.authorizeParams(newVerifier(t)), unusedURL), "")
-			return nil
-		})
+		eg.Go(func() error { defer close(refetchDone); refetched = r.refetchDocument(t); return nil })
 		refetchPID := waitForLockWaiter(ctx, t, r.pool, []int32{hold.pid}, refetchDone)
 		if refetchPID == 0 {
-			t.Fatal("the re-fetch finished without queuing behind the sweep deleting its client")
+			t.Fatal("the re-fetch finished without queuing behind the failed re-fetch's record")
 		}
 		assertQueuedOnClientBehind(ctx, t, r.pool, refetchPID, hold.pid)
 		if err := hold.tx.Commit(ctx); err != nil {
@@ -412,59 +713,44 @@ func TestLockOrder_ClientRegistrationWriters(t *testing.T) {
 		if log := errs.String(); log != "" {
 			t.Errorf("a handler failed:\n%s", log)
 		}
-		if refetched.Code != http.StatusFound {
-			t.Fatalf("re-fetch behind the sweep: status %d body %s, want 302", refetched.Code, refetched.Body.String())
-		}
-		if c, ok := r.clientRow(t, unusedURL); !ok || c.ID == old.ID || c.ClientName != "Old, fetched again" {
-			t.Fatalf("after the sweep and the re-fetch: client %+v (found %v), want the document registered afresh", c, ok)
+		if c := assertRefetched(t, r, refetched); c.MetadataRefetchFailedAt.Valid {
+			t.Fatalf("a successful fetch behind a failure's record left the failure recorded: %+v", c)
 		}
 	})
 
-	t.Run("MetadataRefetchHoldsClient_SweepQueuesAndSparesIt", func(t *testing.T) {
+	// Two failed re-fetches of one client serialize on its row: the second,
+	// queued behind the first's record, records nothing and uses the grace
+	// the first started, neither restarted nor extended.
+	t.Run("FailedMetadataRefetchHoldsClient_FailedMetadataRefetchQueuesAndKeepsItsGrace", func(t *testing.T) {
 		ctx := context.Background()
-		r := newASRig(t)
-		const unusedURL = "https://unused.example/client.json"
-		old := r.oldUnusedClient(t, sqlcgen.McpOauthClientKindMetadataDocument, unusedURL)
+		r := newCIMDRaceRig(t)
+		r.staleDocument(t, docClientURL)
+		r.documents.set(docClientURL, documentHostDown)
 		errs := captureErrorLog(t)
 
-		hold := holdInTx(ctx, t, r.pool, func(tx pgx.Tx) {
-			now := time.Now()
-			if _, err := r.clients.WithTx(tx).UpsertMetadataDocument(ctx, sqlcgen.UpsertMCPOAuthMetadataDocumentClientParams{
-				ClientID: unusedURL, ClientName: "Old, fetched again", RedirectUris: []string{loopbackRedirect},
-				MetadataFetchedAt: pgtype.Timestamptz{Time: now, Valid: true},
-				MetadataStaleAt:   pgtype.Timestamptz{Time: now.Add(time.Hour), Valid: true},
-			}); err != nil {
-				t.Fatalf("held upsert: %v", err)
-			}
-		})
+		hold, first := r.holdRefetchFailure(ctx, t, docClientURL, ttl)
 		var eg errgroup.Group
-		var swept int64
-		sweepDone := make(chan struct{})
-		eg.Go(func() error {
-			defer close(sweepDone)
-			var err error
-			swept, err = r.clients.DeleteUnused(ctx, sweepCutoff())
-			return err
-		})
-		sweepPID := waitForLockWaiter(ctx, t, r.pool, []int32{hold.pid}, sweepDone)
-		if sweepPID == 0 {
-			t.Fatal("the sweep finished without queuing behind the re-fetch updating its candidate")
+		var second *httptest.ResponseRecorder
+		secondDone := make(chan struct{})
+		eg.Go(func() error { defer close(secondDone); second = r.refetchDocument(t); return nil })
+		secondPID := waitForLockWaiter(ctx, t, r.pool, []int32{hold.pid}, secondDone)
+		if secondPID == 0 {
+			t.Fatal("the second failed re-fetch finished without queuing behind the first one's record")
 		}
-		assertQueuedOnClientBehind(ctx, t, r.pool, sweepPID, hold.pid)
+		assertQueuedOnClientBehind(ctx, t, r.pool, secondPID, hold.pid)
 		if err := hold.tx.Commit(ctx); err != nil {
 			t.Fatal(err)
 		}
 		if err := eg.Wait(); err != nil {
-			t.Fatalf("sweep: %v", err)
+			t.Fatal(err)
 		}
 		if log := errs.String(); log != "" {
 			t.Errorf("a handler failed:\n%s", log)
 		}
-		if swept != 0 {
-			t.Fatalf("the sweep deleted %d clients, want 0: the re-fetched client is no longer unused", swept)
-		}
-		if c, ok := r.clientRow(t, unusedURL); !ok || c.ID != old.ID {
-			t.Fatalf("after the re-fetch and the sweep: client %+v (found %v), want the same client kept", c, ok)
+		c := assertKeptAfterFailedRefetch(t, r, second)
+		if !c.MetadataRefetchFailedAt.Time.Equal(first.MetadataRefetchFailedAt.Time) || !c.MetadataStaleAt.Time.Equal(first.MetadataStaleAt.Time) {
+			t.Fatalf("after two failures: failure %v, grace until %v; want the first one's, %v and %v",
+				c.MetadataRefetchFailedAt.Time, c.MetadataStaleAt.Time, first.MetadataRefetchFailedAt.Time, first.MetadataStaleAt.Time)
 		}
 	})
 
@@ -815,6 +1101,111 @@ func TestLockOrder_ClientRegistrationWriters(t *testing.T) {
 		if deleted.Code != http.StatusNoContent {
 			t.Fatalf("client deletion: status %d, want 204", deleted.Code)
 		}
+	})
+
+	// The other orders: a dynamic registration's own statement (register.go:
+	// one INSERT of a new client row) held open, a client deletion and a
+	// failed re-fetch -- which lock only rows that exist -- never queue
+	// behind it; and a failed re-fetch's record held open, a registration
+	// never queues behind it.
+	holdRegistration := func(ctx context.Context, t *testing.T, r *asRig) *heldTx {
+		t.Helper()
+		return holdInTx(ctx, t, r.pool, func(tx pgx.Tx) {
+			if _, err := r.clients.WithTx(tx).Create(ctx, sqlcgen.CreateMCPOAuthClientParams{
+				ClientID: "narvi_mcp_d_held", Kind: sqlcgen.McpOauthClientKindDynamic, ClientName: "Desktop Assistant", RedirectUris: []string{loopbackRedirect},
+			}); err != nil {
+				t.Fatalf("held registration: %v", err)
+			}
+		})
+	}
+
+	t.Run("RegistrationHoldsItsRow_ClientDeletionNeverQueues", func(t *testing.T) {
+		ctx := context.Background()
+		r := newASRig(t)
+		f := newRaceFixture(t, r, refreshExchange)
+		errs := captureErrorLog(t)
+
+		hold := holdRegistration(ctx, t, r)
+		var eg errgroup.Group
+		var deleted *httptest.ResponseRecorder
+		deletionDone := make(chan struct{})
+		eg.Go(func() error { defer close(deletionDone); deleted = f.revoke(r, clientDeletion); return nil })
+		if pid := waitForLockWaiter(ctx, t, r.pool, []int32{hold.pid}, deletionDone); pid != 0 {
+			t.Fatalf("the client deletion queued behind %v, a registration in flight", blockingPIDs(ctx, t, r.pool, pid))
+		}
+		if err := eg.Wait(); err != nil {
+			t.Fatal(err)
+		}
+		if err := hold.tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if log := errs.String(); log != "" {
+			t.Errorf("a handler failed:\n%s", log)
+		}
+		if deleted.Code != http.StatusNoContent {
+			t.Fatalf("client deletion: status %d, want 204", deleted.Code)
+		}
+		assertNothingSurvives(ctx, t, r, f, clientDeletion)
+	})
+
+	t.Run("RegistrationHoldsItsRow_FailedMetadataRefetchNeverQueues", func(t *testing.T) {
+		ctx := context.Background()
+		r := newCIMDRaceRig(t)
+		r.staleDocument(t, docClientURL)
+		r.documents.set(docClientURL, documentHostDown)
+		errs := captureErrorLog(t)
+
+		hold := holdRegistration(ctx, t, r)
+		var eg errgroup.Group
+		var failedRefetch *httptest.ResponseRecorder
+		failedDone := make(chan struct{})
+		eg.Go(func() error { defer close(failedDone); failedRefetch = r.refetchDocument(t); return nil })
+		if pid := waitForLockWaiter(ctx, t, r.pool, []int32{hold.pid}, failedDone); pid != 0 {
+			t.Fatalf("the failed re-fetch queued behind %v, a registration in flight", blockingPIDs(ctx, t, r.pool, pid))
+		}
+		if err := eg.Wait(); err != nil {
+			t.Fatal(err)
+		}
+		if err := hold.tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if log := errs.String(); log != "" {
+			t.Errorf("a handler failed:\n%s", log)
+		}
+		assertKeptAfterFailedRefetch(t, r, failedRefetch)
+	})
+
+	t.Run("FailedMetadataRefetchHoldsClient_RegistrationNeverQueues", func(t *testing.T) {
+		ctx := context.Background()
+		r := newCIMDRaceRig(t)
+		r.staleDocument(t, docClientURL)
+		errs := captureErrorLog(t)
+
+		hold, _ := r.holdRefetchFailure(ctx, t, docClientURL, ttl)
+		var eg errgroup.Group
+		var registered int
+		registerDone := make(chan struct{})
+		eg.Go(func() error {
+			defer close(registerDone)
+			registered, _, _, _ = r.postRegister(`{"client_name":"Desktop Assistant","redirect_uris":["`+loopbackRedirect+`"]}`, "application/json")
+			return nil
+		})
+		if pid := waitForLockWaiter(ctx, t, r.pool, []int32{hold.pid}, registerDone); pid != 0 {
+			t.Fatalf("the registration queued behind %v, a failed re-fetch's record", blockingPIDs(ctx, t, r.pool, pid))
+		}
+		if err := eg.Wait(); err != nil {
+			t.Fatal(err)
+		}
+		if registered != http.StatusCreated {
+			t.Fatalf("registration: status %d, want 201", registered)
+		}
+		if err := hold.tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if log := errs.String(); log != "" {
+			t.Errorf("a handler failed:\n%s", log)
+		}
+		assertFailureRecorded(t, r, docClientURL, "Editor Plugin")
 	})
 }
 

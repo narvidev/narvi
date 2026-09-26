@@ -7305,14 +7305,22 @@ exact: the two serialize on the client row, so each grant is audited as revoked 
 Client registration (§43.15) adds four writers to the same order. A metadata document's upsert, and the
 record of its first failed re-fetch, are each one statement taking one row lock — the client,
 `FOR NO KEY UPDATE`, which never conflicts with the `FOR KEY SHARE` every issuance and grant revocation
-takes, only with a client's deletion — so neither can be part of a wait cycle; a re-fetch queued behind a
-deletion registers the document afresh. The unused-client sweep deletes as an administrator's deletion
+takes, only with a client's deletion (an administrator's or the sweep's) and with each other — so neither
+can be part of a wait cycle. A re-fetch queued behind a deletion registers the document afresh; a failed
+one finds the client gone and is refused with a page. Two re-fetches of one client serialize, and the
+newer fetch stands: a failure queued behind a successful fetch records nothing over it, and a second
+failure uses the first one's grace. A failed re-fetch can meet the sweep only where
+`MCPClientMetadataCacheTTL` is over half `MCPDynamicClientUnusedTTL`, since a sweep candidate was last
+fetched longer ago than the latter and a failure records a grace only within two cache lifetimes of the
+last fetch; the test races the two under such a setting. The unused-client sweep deletes as an administrator's deletion
 does, client first, in two statements: it locks its candidates `FOR UPDATE` in id order, then deletes,
 with a fresh snapshot, only those still holding no grant and no request, so its cascade reaches no row.
 An authorization reaching a client the sweep holds waits, then is refused with a page; a request or grant
 whose insert holds the client (its foreign-key check's `FOR KEY SHARE`) when the sweep arrives makes the
 sweep wait, and, once committed, keeps its client. A dynamic registration inserts a new row and locks
-nothing that exists (`TestLockOrder_ClientRegistrationWriters`, both orders of every pair).
+nothing that exists: nothing queues behind it, and it queues behind nothing
+(`TestLockOrder_ClientRegistrationWriters`, both orders of every pair, each re-fetch race run with the
+fetch succeeding and failing).
 
 Lifetimes live in `platform/timeouts.go`: `MCPAuthorizationRequestTTL` (10 minutes, the consent window),
 `MCPAuthorizationCodeTTL` (60 seconds), `MCPAccessTokenTTL` (1 hour), `MCPRefreshTokenTTL` (30 days per
