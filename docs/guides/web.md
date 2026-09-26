@@ -437,8 +437,15 @@ listed and revoked. Every role, viewer included, can connect an app and
 disconnect its own; only an admin can register or delete a client. Apps
 that identify themselves by their description's address are accepted unless
 the deployment sets `NARVI_MCP_CIMD_ENABLED=false`, and apps that register
-themselves only if it sets `NARVI_MCP_DCR_ENABLED=true`; switching either
-off disconnects every app it let in, on that app's next call. Narvi never
+themselves only if it sets `NARVI_MCP_DCR_ENABLED=true`. Switching either
+off pauses every app it let in, from that app's next call: the app can no
+longer be approved, renew its access or call `/mcp`, though it can still
+disconnect itself. A pause deletes nothing — the app stays under Connected
+apps, where you can still disconnect it — and switching the setting back on
+lets the app carry on with the access it still holds, without asking you
+again, unless that access lapsed meanwhile (30 days after the app last
+renewed it, or 90 days after your approval). To cut an app off for good,
+disconnect it, or have an administrator delete it. Narvi never
 reads an app's description from this machine or a private network address,
 and an app whose description cannot be read, or names any address but its
 own, is shown an error page the first time. Narvi trusts a description it
@@ -449,7 +456,9 @@ being used for one more hour from that first failure, and no longer: after
 that the app is shown an error page until its description can be read
 again.
 Disconnecting deletes the authorization outright, and deleting a client
-deletes every authorization issued to it — there is no "paused" state.
+deletes every authorization issued to it — neither can be undone, and one
+authorization cannot be paused: the only pause is the deployment-wide one
+above, switching off how an app registered.
 An app registered with a redirect address that does not match exactly
 (except the port of a `127.0.0.1`/`[::1]` address) is shown an error page
 and your browser is never sent anywhere. Each approval is single-use and

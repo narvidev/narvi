@@ -1846,7 +1846,9 @@ type Config struct {
 	// client_id is an unknown client, the authorization-server metadata
 	// stops advertising client_id_metadata_document_supported, and every
 	// metadata-document client already stored is refused like a disabled
-	// one -- at authorization, consent, the token endpoint and on /mcp.
+	// one -- at authorization, consent, the token endpoint and on /mcp. A
+	// pause, not a deletion: nothing is deleted, and switching it back on
+	// lets those clients carry on with whatever has not expired meanwhile.
 	MCPCIMDEnabled bool
 
 	// MCPDCREnabled is whether the MCP authorization server accepts RFC
@@ -1855,7 +1857,8 @@ type Config struct {
 	// /oauth/register answers the surface's own disabled response (the
 	// route is mounted either way), the metadata omits
 	// registration_endpoint, and every dynamically registered client
-	// already stored is refused like a disabled one.
+	// already stored is refused like a disabled one -- paused, not
+	// deleted, as MCPCIMDEnabled's own comment says.
 	MCPDCREnabled bool
 
 	// GitHubAppID and GitHubAppPrivateKey are §30.4's own GitHub App

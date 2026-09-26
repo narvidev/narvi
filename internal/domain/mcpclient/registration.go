@@ -40,7 +40,9 @@ type Mechanisms struct {
 // accepted. A client registered through a mechanism the deployment has
 // switched off is refused everywhere, exactly like a disabled client, so
 // switching a mechanism off is a kill switch for every client it
-// registered, not only for new registrations. An unknown kind is refused.
+// registered, not only for new registrations. It is a pause: refusing
+// deletes nothing, so switching the mechanism back on lets those clients
+// carry on with whatever they still hold. An unknown kind is refused.
 func (m Mechanisms) Accepts(kind Kind) bool {
 	switch kind {
 	case KindPreregistered:

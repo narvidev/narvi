@@ -72,7 +72,9 @@
 //   - A client registered through a mechanism the deployment switched off
 //     is refused everywhere, like a disabled one (Server.clientUsable, and
 //     auth.RequireMCPBearer with the same mcpclient.Mechanisms) -- except
-//     that it may still give its tokens back.
+//     that it may still give its tokens back. Refusing it deletes
+//     nothing: switched back on, the mechanism's clients carry on with
+//     whatever has not expired meanwhile.
 //   - The consent page's identity line is never the client's own claim: an
 //     administrator's registration, the host a metadata document was
 //     fetched from, or the plain statement that the app registered itself.

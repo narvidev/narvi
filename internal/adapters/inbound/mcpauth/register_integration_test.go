@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -154,10 +155,14 @@ func TestRegister_ValidationAndForcedFields(t *testing.T) {
 // like a disabled one (technical plan §43.15) -- no authorization, no
 // consent, no token by code or by refresh, and its live access token stops
 // on its very next /mcp call -- while it can still give its tokens back
-// (RFC 7009). Pre-registered clients are unaffected.
+// (RFC 7009). The switch is a pause, not a disconnection: no grant is
+// deleted, the user's connected apps still list it, and with the
+// mechanism back on the same access token works and the refresh token
+// issued before the switch renews, with no consent in between.
+// Pre-registered clients are unaffected.
 func TestClientMechanismSwitchedOff_RefusedEverywhere(t *testing.T) {
 	on := newASRig(t)
-	_, cookie := on.newUser(t, sqlcgen.UserRoleMember)
+	user, cookie := on.newUser(t, sqlcgen.UserRoleMember)
 	on.serveDocument("Editor Plugin")
 	dynamicID := on.register(t, `{"client_name":"Desktop Assistant","redirect_uris":["`+loopbackRedirect+`"]}`)
 
@@ -189,8 +194,14 @@ func TestClientMechanismSwitchedOff_RefusedEverywhere(t *testing.T) {
 		return on.rebuilt(t, rigOptions{mechanisms: mcpclient.Mechanisms{MetadataDocuments: true}})
 	}
 
+	sortedGrantIDs := func(r *asRig) []string {
+		ids := r.grantIDs(t, user.ID)
+		slices.Sort(ids)
+		return ids
+	}
 	for _, c := range []issued{document, dynamic} {
 		t.Run(c.clientID, func(t *testing.T) {
+			grantsBefore := sortedGrantIDs(on)
 			off := c.switchedOff()
 			if rec := off.authorize(forClient(off.authorizeParams(newVerifier(t)), c.clientID), cookie); rec.Code != http.StatusBadRequest || rec.Header().Get("Location") != "" {
 				t.Errorf("authorize: status %d Location %q, want a 400 page", rec.Code, rec.Header().Get("Location"))
@@ -212,16 +223,42 @@ func TestClientMechanismSwitchedOff_RefusedEverywhere(t *testing.T) {
 			if status := off.callMCP(c.pair.AccessToken); status != http.StatusUnauthorized {
 				t.Errorf("/mcp with the live access token: status %d, want 401", status)
 			}
-			// Still on, the same token works: it was the switch.
-			if status := on.callMCP(c.pair.AccessToken); status != http.StatusOK {
-				t.Errorf("/mcp with the mechanism on: status %d, want 200", status)
+			// A pause deletes nothing: every grant is still there, and the
+			// user's connected apps still list this client.
+			if got := sortedGrantIDs(off); !slices.Equal(got, grantsBefore) {
+				t.Errorf("grants with the mechanism off = %v, want %v unchanged", got, grantsBefore)
 			}
-			// Giving access back is always allowed.
-			if rec := off.revoke(url.Values{"token": {c.pair.RefreshToken}, "client_id": {c.clientID}}, nil); rec.Code != http.StatusOK {
+			listed, err := off.grants.ListGrantsForUser(t.Context(), user.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.ContainsFunc(listed, func(g sqlcgen.ListMCPOAuthGrantsForUserRow) bool { return g.ClientPublicID == c.clientID }) {
+				t.Errorf("connected apps with the mechanism off do not list %s", c.clientID)
+			}
+			// Back on, the same token works: it was the switch. The refresh
+			// token issued before the switch renews with no new consent --
+			// the refusal while off spent nothing.
+			if status := on.callMCP(c.pair.AccessToken); status != http.StatusOK {
+				t.Errorf("/mcp with the mechanism back on: status %d, want 200", status)
+			}
+			renew := on.refreshForm(c.pair.RefreshToken)
+			renew.Set("client_id", c.clientID)
+			rec := on.exchange(renew, nil)
+			renewed := decodeToken(t, rec)
+			if rec.Code != http.StatusOK || renewed.AccessToken == "" {
+				t.Fatalf("refresh with the mechanism back on: status %d body %s, want 200 and a new pair", rec.Code, rec.Body.String())
+			}
+			if status := on.callMCP(renewed.AccessToken); status != http.StatusOK {
+				t.Errorf("/mcp with the renewed token: status %d, want 200", status)
+			}
+			// Giving access back is always allowed, the mechanism off.
+			if rec := off.revoke(url.Values{"token": {renewed.RefreshToken}, "client_id": {c.clientID}}, nil); rec.Code != http.StatusOK {
 				t.Errorf("RFC 7009 revocation: status %d, want 200", rec.Code)
 			}
-			if status := on.callMCP(c.pair.AccessToken); status != http.StatusUnauthorized {
-				t.Errorf("after the client revoked: status %d, want 401", status)
+			for _, token := range []string{c.pair.AccessToken, renewed.AccessToken} {
+				if status := on.callMCP(token); status != http.StatusUnauthorized {
+					t.Errorf("after the client revoked: status %d, want 401", status)
+				}
 			}
 		})
 	}
