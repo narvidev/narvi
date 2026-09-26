@@ -4,6 +4,7 @@ package mcpauth_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
@@ -168,7 +170,11 @@ func sweepCutoff() time.Time {
 //     is then refused with a page -- never a 500; a sweep reaching a client
 //     whose authorization request or grant insert is in flight queues
 //     behind it, and spares the client once the insert commits. A client
-//     whose consent is in flight is never a sweep candidate at all.
+//     whose consent is in flight is never a sweep candidate at all. On the
+//     pool-built store production uses, the sweep's two statements are
+//     one transaction: an insert under a candidate that comes between
+//     them waits for the sweep, then fails its foreign-key check -- it
+//     never commits under a client the second statement then deletes.
 //   - A dynamic registration inserts a new row and queues behind nothing.
 func TestLockOrder_ClientRegistrationWriters(t *testing.T) {
 	// A re-fetch racing a holder of the client's FOR KEY SHARE: whichever
@@ -537,6 +543,126 @@ func TestLockOrder_ClientRegistrationWriters(t *testing.T) {
 				SELECT (SELECT count(*) FROM mcp_oauth_grants WHERE client_id = $1) + (SELECT count(*) FROM mcp_oauth_authorization_requests WHERE client_id = $1)`,
 				old.ID).Scan(&under); err != nil || under != 1 {
 				t.Fatalf("rows under the client after the sweep = %d (err %v), want the committed one", under, err)
+			}
+		})
+	}
+
+	// The pool path production takes (expiredcleanup.go builds the store
+	// on the pool, not WithTx): the sweep's lock statement and its
+	// re-checking DELETE are one transaction, so its candidates stay
+	// locked FOR UPDATE from the first statement until it commits. An
+	// authorization request or grant inserted BETWEEN the two statements
+	// therefore waits on the client row behind the sweep, then fails its
+	// foreign-key check -- never commits under a client the DELETE goes on
+	// to remove, which would cascade the committed row away (round-1 C14).
+	// A test-held SHARE lock on mcp_oauth_clients stops the sweep exactly
+	// there: it lets the lock statement's ROW SHARE through and holds the
+	// DELETE's ROW EXCLUSIVE back.
+	for _, tc := range []struct {
+		name  string
+		grant bool
+	}{
+		{"SweepBetweenItsStatements_AuthorizationRequestWaitsThenFails", false},
+		{"SweepBetweenItsStatements_GrantWaitsThenFails", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			r := newASRig(t)
+			old := r.oldUnusedClient(t, sqlcgen.McpOauthClientKindDynamic, "narvi_mcp_d_old")
+			user, _ := r.newUser(t, sqlcgen.UserRoleMember)
+			errs := captureErrorLog(t)
+			expires := pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
+			insertUnder := func(tx pgx.Tx) error {
+				if tc.grant {
+					_, err := r.grants.WithTx(tx).UpsertGrant(ctx, sqlcgen.UpsertMCPOAuthGrantParams{
+						UserID: user.ID, ClientID: old.ID, Scopes: []string{"mcp:read"}, Resource: r.server.Identifiers().Resource, ExpiresAt: expires,
+					})
+					return err
+				}
+				_, err := r.grants.WithTx(tx).CreateAuthorizationRequest(ctx, sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
+					ClientID: old.ID, RedirectUri: loopbackRedirect, CodeChallenge: "c", CodeChallengeMethod: "S256",
+					Resource: r.server.Identifiers().Resource, ExpiresAt: expires,
+				})
+				return err
+			}
+			rowsUnder := func() int {
+				var n int
+				if err := r.pool.QueryRow(ctx, `
+					SELECT (SELECT count(*) FROM mcp_oauth_grants WHERE client_id = $1) + (SELECT count(*) FROM mcp_oauth_authorization_requests WHERE client_id = $1)`,
+					old.ID).Scan(&n); err != nil {
+					t.Fatal(err)
+				}
+				return n
+			}
+
+			gate := holdInTx(ctx, t, r.pool, func(tx pgx.Tx) {
+				if _, err := tx.Exec(ctx, `LOCK TABLE mcp_oauth_clients IN SHARE MODE`); err != nil {
+					t.Fatalf("gate: lock the clients table: %v", err)
+				}
+			})
+			var eg errgroup.Group
+			var swept int64
+			sweepDone := make(chan struct{})
+			eg.Go(func() error {
+				defer close(sweepDone)
+				var err error
+				swept, err = r.clients.DeleteUnused(ctx, sweepCutoff())
+				return err
+			})
+			sweepPID := waitForLockWaiter(ctx, t, r.pool, []int32{gate.pid}, sweepDone)
+			if sweepPID == 0 {
+				t.Fatal("the sweep finished without its DELETE reaching the gate")
+			}
+			if locktype, table := waitingFor(ctx, t, r.pool, sweepPID); locktype != "relation" || table != "mcp_oauth_clients" {
+				t.Fatalf("the sweep waits for a %s lock on %q, want its DELETE waiting for the clients table", locktype, table)
+			}
+
+			inserter := holdInTx(ctx, t, r.pool, func(pgx.Tx) {})
+			var insertErr error
+			insertDone := make(chan struct{})
+			eg.Go(func() error { defer close(insertDone); insertErr = insertUnder(inserter.tx); return nil })
+			insertPID := waitForLockWaiter(ctx, t, r.pool, []int32{gate.pid, sweepPID}, insertDone)
+			if insertPID == 0 {
+				// Nothing held the candidate between the two statements.
+				// What that costs: the DELETE goes on, queues behind the
+				// insert's key-share lock, and once the insert commits
+				// deletes the client and the committed row with it.
+				if insertErr != nil {
+					t.Fatalf("insert between the sweep's statements: %v", insertErr)
+				}
+				if err := gate.tx.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if pid := waitForLockWaiter(ctx, t, r.pool, []int32{inserter.pid}, sweepDone); pid == 0 {
+					t.Fatalf("an insert under the sweep's candidate went through between its two statements: nothing held the client (the sweep then deleted %d)", swept)
+				}
+				if err := inserter.tx.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+				_ = eg.Wait()
+				_, found := r.clientRow(t, old.ClientID)
+				t.Fatalf("an insert under the sweep's candidate went through between its two statements: nothing held the client; committed with the DELETE queued behind it, then: deleted %d, client found %v, committed rows left under it %d",
+					swept, found, rowsUnder())
+			}
+			assertQueuedOnClientBehind(ctx, t, r.pool, insertPID, sweepPID)
+			if err := gate.tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := eg.Wait(); err != nil {
+				t.Fatalf("sweep: %v", err)
+			}
+			if log := errs.String(); log != "" {
+				t.Errorf("a handler failed:\n%s", log)
+			}
+			var pgErr *pgconn.PgError
+			if !errors.As(insertErr, &pgErr) || pgErr.Code != "23503" {
+				t.Fatalf("insert behind the sweep = %v, want a foreign-key violation (23503): the client it names is gone", insertErr)
+			}
+			if _, found := r.clientRow(t, old.ClientID); swept != 1 || found {
+				t.Fatalf("the sweep deleted %d clients (candidate still found: %v), want its one candidate", swept, found)
+			}
+			if n := rowsUnder(); n != 0 {
+				t.Fatalf("rows under the swept client = %d, want none: the insert behind the sweep must fail, not commit", n)
 			}
 		})
 	}
