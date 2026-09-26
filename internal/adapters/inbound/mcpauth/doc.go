@@ -21,10 +21,10 @@
 //
 //	GET  /.well-known/oauth-protected-resource/mcp     metadata.go
 //	GET  /.well-known/oauth-authorization-server/oauth metadata.go
-//	GET  /oauth/authorize                              authorize.go
+//	GET  /oauth/authorize                              authorize.go, ratelimit.go
 //	GET  /oauth/consent?request=<id>                   consent.go
 //	POST /oauth/consent                                consent.go
-//	POST /oauth/token                                  token.go, refresh.go
+//	POST /oauth/token                                  token.go, refresh.go, ratelimit.go
 //	POST /oauth/revoke                                 revoke.go
 //	POST /oauth/register                               register.go, ratelimit.go
 //
@@ -37,8 +37,10 @@
 // the consent routes authenticate the cookie themselves (auth.Authenticate)
 // because a signed-out browser must be sent to sign in, not answered 401;
 // the token, revocation and registration endpoints read no cookie at all.
-// The registration endpoint is behind its own flag too (off by default)
-// and a per-network rate limit (an IPv4 address, an IPv6 /48).
+// The registration endpoint is behind its own flag too (off by default).
+// It, the authorization endpoint and the token endpoint are each braked
+// per client network (an IPv4 address, an IPv6 /48; RateLimiter), before
+// their handler, so a refused request reads and spends nothing.
 //
 // # Invariants this package is responsible for
 //
@@ -69,6 +71,15 @@
 //   - Every token and code holds the scopes fixed when it was issued.
 //   - Codes, tokens and consent nonces exist in plaintext only in the one
 //     response that hands them out.
+//   - A client never has more than
+//     platform.Timeouts.MCPMaxPendingAuthorizationRequestsPerClient
+//     authorization requests waiting for a decision: the authorization
+//     endpoint counts and stores under the client's lock
+//     (postgres.MCPOAuthGrantStore.CreatePendingAuthorizationRequest), and
+//     refuses past the cap with a page, storing nothing.
+//   - A brake's refusal is never a credential's death: the token
+//     endpoint's is temporarily_unavailable, never invalid_grant, and the
+//     authorization endpoint's is a page, never a redirect.
 //   - A client registered through a mechanism the deployment switched off
 //     is refused everywhere, like a disabled one (Server.clientUsable, and
 //     auth.RequireMCPBearer with the same mcpclient.Mechanisms) -- except

@@ -147,14 +147,16 @@ func (r *asRig) build(t *testing.T, opts rigOptions) {
 	router.Route("/.well-known/oauth-authorization-server", func(rt chi.Router) {
 		rt.Get("/oauth", r.server.AuthorizationServerMetadata)
 	})
+	// Mounted without controlplane's enabled-gate and its per-network
+	// brakes (on /authorize, /token and /register): TestOAuth_ProductionRouter
+	// proves both on the production router, and this package's tests race
+	// requests with no brake in the way.
 	router.Route("/oauth", func(rt chi.Router) {
 		rt.Get("/authorize", r.server.Authorize)
 		rt.Get("/consent", r.server.ConsentPage)
 		rt.Post("/consent", r.server.ConsentDecision)
 		rt.Post("/token", r.server.Token)
 		rt.Post("/revoke", r.server.Revoke)
-		// Mounted without controlplane's enabled-gate and rate limit:
-		// TestOAuth_ProductionRouter proves both on the production router.
 		rt.Post("/register", r.server.Register)
 	})
 	router.Route("/mcp", func(rt chi.Router) {
