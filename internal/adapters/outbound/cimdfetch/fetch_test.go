@@ -295,7 +295,7 @@ func srv0Port(r *http.Request) int {
 func TestCIMDFetch_RefusesHTTPAndOversize(t *testing.T) {
 	t.Parallel()
 	var plainHits atomic.Int32
-	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		plainHits.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(validDoc))
