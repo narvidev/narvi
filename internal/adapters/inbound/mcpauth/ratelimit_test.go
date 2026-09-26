@@ -63,7 +63,10 @@ func TestRateLimiter_BurstThenOnePerInterval(t *testing.T) {
 }
 
 // TestClientAddressKey: RemoteAddr only -- a forwarded header never
-// changes the key -- IPv4-mapped addresses unmapped, IPv6 by its /48.
+// changes the key -- IPv4-mapped addresses unmapped, an IPv6 address
+// carrying an IPv4 client's address keyed as that address, any other
+// IPv6 address by its /48. Its requests are registrations: the key is
+// every brake's, registration's included.
 func TestClientAddressKey(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

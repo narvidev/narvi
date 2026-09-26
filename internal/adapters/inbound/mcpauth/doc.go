@@ -39,8 +39,10 @@
 // the token, revocation and registration endpoints read no cookie at all.
 // The registration endpoint is behind its own flag too (off by default).
 // It, the authorization endpoint and the token endpoint are each braked
-// per client network (an IPv4 address, an IPv6 /48; RateLimiter), before
-// their handler, so a refused request reads and spends nothing.
+// per client network (an IPv4 address, whether it arrives as IPv4 or
+// inside an IPv6 address that carries it, or an IPv6 /48;
+// ClientAddressKey, RateLimiter), before their handler, so a refused
+// request reads and spends nothing.
 //
 // # Invariants this package is responsible for
 //

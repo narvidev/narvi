@@ -3120,7 +3120,9 @@ type Timeouts struct {
 	// MCPRegisterRateInterval is the refill interval of the per-network
 	// token bucket in front of POST /oauth/register: after a burst of
 	// MCPRegisterRateBurst registrations, one client network -- one IPv4
-	// address, one IPv6 /48 -- may register one more client per interval.
+	// address, whether it arrives as IPv4 or inside an IPv6 address that
+	// carries it, or one IPv6 /48 (mcpauth.ClientAddressKey) -- may
+	// register one more client per interval.
 	// In-memory, per replica -- a brake on table growth, not a correctness
 	// property. 12 minutes.
 	MCPRegisterRateInterval time.Duration
@@ -3143,13 +3145,14 @@ type Timeouts struct {
 	// MCPTokenEndpointRateInterval is the refill interval of the
 	// per-network token bucket in front of POST /oauth/token: after a burst
 	// of MCPTokenEndpointRateBurst requests, one client network -- one IPv4
-	// address, one IPv6 /48 -- may make one more token request per
-	// interval. A client in use makes one code exchange per consent and one
-	// refresh per MCPAccessTokenTTL, so many users behind one address still
-	// fit. A request the brake refuses reaches no handler and spends
-	// nothing: a refresh token refused here is not rotated and can be
-	// presented again. In-memory, per replica -- a brake on abuse, not a
-	// correctness property. 2 seconds.
+	// address, whether it arrives as IPv4 or inside an IPv6 address that
+	// carries it, or one IPv6 /48 (mcpauth.ClientAddressKey) -- may make
+	// one more token request per interval. A client in use makes one code
+	// exchange per consent and one refresh per MCPAccessTokenTTL, so many
+	// users behind one address still fit. A request the brake refuses
+	// reaches no handler and spends nothing: a refresh token refused here
+	// is not rotated and can be presented again. In-memory, per replica --
+	// a brake on abuse, not a correctness property. 2 seconds.
 	MCPTokenEndpointRateInterval time.Duration
 
 	// MCPTokenEndpointRateBurst is the per-network burst POST /oauth/token

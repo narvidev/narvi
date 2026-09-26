@@ -497,7 +497,9 @@ disconnect its own; only an admin can register, delete, disable or enable a
 client, or see and revoke another member's apps — any other role gets `403`, and an
 authorization that is not that member's is `404`, whoever it belongs to.
 Starting authorizations and renewing tokens are braked per network — the
-address Narvi sees a request come from (one address, or one IPv6 `/48`): a
+address Narvi sees a request come from (one address, or one IPv6 `/48`,
+though an app reaching Narvi through a translator the address names, such as
+NAT64's well-known prefix or Teredo, counts as its own IPv4 address): a
 burst of ten, then one every three seconds for authorizations and every two
 for tokens. Past that, the authorization page answers "Too many requests
 from your network" and never sends your browser anywhere, and an app's

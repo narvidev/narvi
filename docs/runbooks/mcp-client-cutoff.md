@@ -156,7 +156,9 @@ listed and revoked.
   once, at WARN: `mcpauth: authorize refused` with
   `outcome=pending_request_cap`, the `client_id`, and `client_address` -- the
   network of the request that was refused, by the brakes' own key (one IPv4
-  address, or one IPv6 `/48`) -- never its query or a cookie. A request that
+  address, or one IPv6 `/48`; an IPv4 client reaching Narvi inside an IPv6
+  address is named by its IPv4 address when the address says so, as the next
+  entry lists) -- never its query or a cookie. A request that
   is stored is not logged, so these lines name who was refused, not who holds
   the places. To find the flood, count the lines per `client_address` for that
   `client_id` over the last few minutes: a flood sending faster than its
