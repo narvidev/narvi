@@ -496,15 +496,23 @@ listed and revoked. Every role, viewer included, can connect an app and
 disconnect its own; only an admin can register, delete, disable or enable a
 client, or see and revoke another member's apps — any other role gets `403`, and an
 authorization that is not that member's is `404`, whoever it belongs to.
-Starting authorizations and renewing tokens are braked per network (one
-address, or one IPv6 `/48`): a burst of ten, then one every three seconds
-for authorizations and every two for tokens. Past that, the authorization
-page answers "Too many requests from your network" and never sends your
-browser anywhere, and an app's renewal is answered `429` — it keeps its
-access and simply renews a moment later; it is never sent back to the
-consent page for it. Another network is never affected by one network's
-flood. At most 100 authorizations of one app can be waiting for approval at
-once; past that, the page says the app has too many sign-ins waiting —
+Starting authorizations and renewing tokens are braked per network — the
+address Narvi sees a request come from (one address, or one IPv6 `/48`): a
+burst of ten, then one every three seconds for authorizations and every two
+for tokens. Past that, the authorization page answers "Too many requests
+from your network" and never sends your browser anywhere, and an app's
+renewal is answered `429` — it keeps its access and renews once the brake
+refills, a few seconds after the requests that emptied it stop; it is never
+sent back to the consent page for it. A flood from one network never spends
+another network's brake, but a network is only as fine as the address Narvi
+sees. Narvi serves plain HTTP, so a deployment reached over HTTPS has a
+proxy in front of it, and Narvi reads no client address a proxy forwards:
+whether to trust one is a deployment decision not made yet. Behind a proxy
+that hides client addresses, every user arrives from the proxy's one
+address and shares one brake per endpoint, so one sender's flood refuses
+everyone's authorizations and renewals for as long as it lasts. At most
+100 authorizations of one app can be waiting for approval at once; past
+that, the page says the app has too many sign-ins waiting —
 each lapses ten minutes after the app asked, so wait a few minutes and
 start again from the app. Apps
 that identify themselves by their description's address are accepted unless
