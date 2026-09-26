@@ -39,44 +39,126 @@ func TestConsent_FrameHeaders(t *testing.T) {
 
 // TestConsent_ShowsClientIdentityAndRedirectHost: the page states who
 // vouched for the client and the true host the browser returns to, with
-// a warning for this machine and none for a real https host.
+// a warning for this machine and none for a real https host -- for every
+// client kind (the confused-deputy threat row, technical plan §43.19). A
+// metadata-document client's headline is its client_id URL's HOST, the one
+// thing its document cannot choose; the name it chose itself comes second,
+// escaped; and a name with a bidi override or a control character never
+// reaches the page at all (refused when the document is validated). A
+// dynamically registered client is said to have registered itself.
 func TestConsent_ShowsClientIdentityAndRedirectHost(t *testing.T) {
-	r := newASRig(t)
-	user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+	t.Run("preregistered", func(t *testing.T) {
+		r := newASRig(t)
+		user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
 
-	loopback := r.authorizeParams(newVerifier(t))
-	requestID := r.startConsent(t, loopback, cookie)
-	rec, _ := r.renderConsent(t, requestID, cookie)
-	body := rec.Body.String()
-	for _, want := range []string{
-		"Editor Plugin",
-		"Registered by an administrator of this deployment.",
-		"<strong>127.0.0.1</strong>",
-		"That is this computer.",
-		user.PrimaryEmail,
-		`value="mcp:read" checked`,
-	} {
-		if !strings.Contains(body, want) {
-			t.Errorf("loopback consent page lacks %q", want)
+		loopback := r.authorizeParams(newVerifier(t))
+		requestID := r.startConsent(t, loopback, cookie)
+		rec, _ := r.renderConsent(t, requestID, cookie)
+		body := rec.Body.String()
+		for _, want := range []string{
+			"Editor Plugin",
+			"Registered by an administrator of this deployment.",
+			"<strong>127.0.0.1</strong>",
+			"That is this computer.",
+			user.PrimaryEmail,
+			`value="mcp:read" checked`,
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("loopback consent page lacks %q", want)
+			}
 		}
-	}
 
-	https := r.authorizeParams(newVerifier(t))
-	https.Set("redirect_uri", httpsRedirect)
-	requestID = r.startConsent(t, https, cookie)
-	rec, _ = r.renderConsent(t, requestID, cookie)
-	body = rec.Body.String()
-	if !strings.Contains(body, "<strong>client.example</strong>") || strings.Contains(body, "That is this computer.") {
-		t.Errorf("https consent page: want host client.example and no loopback warning")
-	}
+		https := r.authorizeParams(newVerifier(t))
+		https.Set("redirect_uri", httpsRedirect)
+		requestID = r.startConsent(t, https, cookie)
+		rec, _ = r.renderConsent(t, requestID, cookie)
+		body = rec.Body.String()
+		if !strings.Contains(body, "<strong>client.example</strong>") || strings.Contains(body, "That is this computer.") {
+			t.Errorf("https consent page: want host client.example and no loopback warning")
+		}
 
-	scopeless := r.authorizeParams(newVerifier(t))
-	scopeless.Del("scope")
-	requestID = r.startConsent(t, scopeless, cookie)
-	rec, _ = r.renderConsent(t, requestID, cookie)
-	if !strings.Contains(rec.Body.String(), "asked for no access") || strings.Contains(rec.Body.String(), `name="scope"`) {
-		t.Errorf("scope-less consent page: want the no-access notice and no checkbox")
-	}
+		scopeless := r.authorizeParams(newVerifier(t))
+		scopeless.Del("scope")
+		requestID = r.startConsent(t, scopeless, cookie)
+		rec, _ = r.renderConsent(t, requestID, cookie)
+		if !strings.Contains(rec.Body.String(), "asked for no access") || strings.Contains(rec.Body.String(), `name="scope"`) {
+			t.Errorf("scope-less consent page: want the no-access notice and no checkbox")
+		}
+	})
+
+	t.Run("metadata document", func(t *testing.T) {
+		r := newASRig(t)
+		_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+		const docURL = "https://tools.example:8443/mcp/client.json"
+		const spoof = `Registered by an administrator <script>alert(1)</script> & co`
+		r.documents.set(docURL, fakeDocument{body: metadataDocument(docURL, spoof, loopbackRedirect, "https://tools.example/cb")})
+
+		requestID := r.startConsent(t, forClient(r.authorizeParams(newVerifier(t)), docURL), cookie)
+		rec, _ := r.renderConsent(t, requestID, cookie)
+		body := rec.Body.String()
+		for _, want := range []string{
+			`<title>Allow the app at tools.example:8443? - Narvi</title>`,
+			`<h1>Allow the app at <strong class="host">tools.example:8443</strong> to use Narvi as you?</h1>`,
+			`It calls itself <strong>Registered by an administrator &lt;script&gt;alert(1)&lt;/script&gt; &amp; co</strong>.`,
+			"The address above is where this deployment read the app&#39;s description",
+			"<strong>127.0.0.1</strong>",
+			"That is this computer.",
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("metadata-document consent page lacks %q", want)
+			}
+		}
+		if strings.Contains(body, "<script>") || strings.Contains(body, "Registered by an administrator of this deployment.") {
+			t.Error("metadata-document consent page: the self-chosen name was not escaped, or the page claims an administrator registered the app")
+		}
+		// The identity line comes before the name, which comes second.
+		if strings.Index(body, `class="host">tools.example:8443`) > strings.Index(body, "It calls itself") {
+			t.Error("the name is shown before the host")
+		}
+
+		https := forClient(r.authorizeParams(newVerifier(t)), docURL)
+		https.Set("redirect_uri", "https://tools.example/cb")
+		requestID = r.startConsent(t, https, cookie)
+		rec, _ = r.renderConsent(t, requestID, cookie)
+		if body := rec.Body.String(); !strings.Contains(body, "<strong>tools.example</strong>") || strings.Contains(body, "That is this computer.") {
+			t.Error("https redirect: want the redirect host and no loopback warning")
+		}
+
+		for name, clientName := range map[string]string{
+			"a bidi override":     "Editor\u202eEvil",
+			"a control character": "Editor\u0007Plugin",
+			"a zero-width space":  "Edit\u200bor",
+		} {
+			url := "https://spoof.example/" + strings.ReplaceAll(name, " ", "-") + ".json"
+			r.documents.set(url, fakeDocument{body: `{"client_id":"` + url + `","client_name":"` + clientName + `","redirect_uris":["` + loopbackRedirect + `"]}`})
+			rec := r.authorize(forClient(r.authorizeParams(newVerifier(t)), url), cookie)
+			if rec.Code != http.StatusBadRequest || rec.Header().Get("Location") != "" {
+				t.Errorf("a name with %s: status %d Location %q, want a 400 page and no consent", name, rec.Code, rec.Header().Get("Location"))
+			}
+		}
+	})
+
+	t.Run("dynamic registration", func(t *testing.T) {
+		r := newASRig(t)
+		_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+		clientID := r.register(t, `{"client_name":"Desktop Assistant","redirect_uris":["`+loopbackRedirect+`"]}`)
+		requestID := r.startConsent(t, forClient(r.authorizeParams(newVerifier(t)), clientID), cookie)
+		rec, _ := r.renderConsent(t, requestID, cookie)
+		body := rec.Body.String()
+		for _, want := range []string{
+			"<h1>Allow <strong>Desktop Assistant</strong> to use Narvi as you?</h1>",
+			"This app registered itself with this deployment, so nothing vouches for its name.",
+			"<strong>127.0.0.1</strong>",
+			"That is this computer.",
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("dynamic-client consent page lacks %q", want)
+			}
+		}
+		if strings.Contains(body, "Registered by an administrator of this deployment.") {
+			t.Error("the page claims an administrator registered a self-registered app")
+		}
+	})
 }
 
 // TestConsent_ClientNameIsEscaped: the one client-influenced string on the

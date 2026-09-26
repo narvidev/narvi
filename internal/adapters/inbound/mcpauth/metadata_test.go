@@ -1,6 +1,7 @@
 package mcpauth
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -8,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/narvidev/narvi/internal/adapters/outbound/cimdfetch"
+	"github.com/narvidev/narvi/internal/domain/mcpclient"
 	"github.com/narvidev/narvi/internal/domain/mcpscope"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -45,8 +48,10 @@ func TestMetadata_CacheLifetimeComesFromTimeouts(t *testing.T) {
 // TestMetadata_Documents pins both discovery documents field by field
 // (technical plan §43.14): what they advertise -- the refresh-token grant
 // and the RFC 7009 revocation endpoint included -- and, as importantly,
-// what they must not (registration, client ID metadata documents, a
-// jwks_uri, mcp:write) before the pieces that build them exist.
+// what they must not (a jwks_uri, mcp:write, and -- with both
+// client-registration mechanisms off, as here -- no registration endpoint
+// and no client ID metadata document support;
+// TestMetadata_ClientRegistrationAdvertisedOnlyWhenOn covers them on).
 func TestMetadata_Documents(t *testing.T) {
 	t.Parallel()
 
@@ -166,5 +171,56 @@ func TestFormActionSource(t *testing.T) {
 		if got := formActionSource(tc.in); got != tc.want {
 			t.Errorf("formActionSource(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// refusingFetcher is a MetadataFetcher that fetches nothing.
+type refusingFetcher struct{}
+
+func (refusingFetcher) Fetch(context.Context, string) (cimdfetch.Result, error) {
+	return cimdfetch.Result{}, errors.New("no fetch in this test")
+}
+
+// TestMetadata_ClientRegistrationAdvertisedOnlyWhenOn: the
+// authorization-server metadata carries client_id_metadata_document_supported
+// exactly while metadata documents are accepted, and registration_endpoint
+// exactly while dynamic registration is -- each absent, never false or
+// empty, when off (technical plan §43.15) -- and New refuses metadata
+// documents with no fetcher wired.
+func TestMetadata_ClientRegistrationAdvertisedOnlyWhenOn(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name         string
+		mechanisms   mcpclient.Mechanisms
+		cimd         bool
+		registration string
+	}{
+		{"both off", mcpclient.Mechanisms{}, false, ""},
+		{"metadata documents on", mcpclient.Mechanisms{MetadataDocuments: true}, true, ""},
+		{"dynamic registration on", mcpclient.Mechanisms{DynamicRegistration: true}, false, "https://narvi.example/oauth/register"},
+		{"both on", mcpclient.Mechanisms{MetadataDocuments: true, DynamicRegistration: true}, true, "https://narvi.example/oauth/register"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s, err := New(Config{PublicBaseURL: "https://narvi.example", Enabled: true, Scopes: []mcpscope.Scope{mcpscope.Read}, Timeouts: platform.DefaultTimeouts(), Mechanisms: tc.mechanisms}, Deps{Metadata: refusingFetcher{}})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			rec := httptest.NewRecorder()
+			s.AuthorizationServerMetadata(rec, httptest.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server/oauth", nil))
+			var doc map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+				t.Fatal(err)
+			}
+			if got, present := doc["client_id_metadata_document_supported"]; present != tc.cimd || (present && got != true) {
+				t.Errorf("client_id_metadata_document_supported = %v (present %v), want present=%v and true", got, present, tc.cimd)
+			}
+			if got, present := doc["registration_endpoint"]; present != (tc.registration != "") || (present && got != tc.registration) {
+				t.Errorf("registration_endpoint = %v (present %v), want %q", got, present, tc.registration)
+			}
+		})
+	}
+	if _, err := New(Config{PublicBaseURL: "https://narvi.example", Enabled: true, Timeouts: platform.DefaultTimeouts(), Mechanisms: mcpclient.Mechanisms{MetadataDocuments: true}}, Deps{}); err == nil {
+		t.Error("New accepted metadata documents with no fetcher wired")
 	}
 }

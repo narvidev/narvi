@@ -3212,11 +3212,11 @@ export interface MCPAuthorization {
    */
   clientId: string;
   /**
-   * The client's display name, as registered.
+   * The client's display name, as registered -- chosen by the client itself unless clientKind is preregistered, so never an identity on its own (technical plan §43.15).
    */
   clientName: string;
   /**
-   * Matches Postgres mcp_oauth_client_kind exactly (migrations/000141_mcp_oauth.up.sql). An OPEN enum (manifest.json's openEnums): only preregistered is produced today -- the other two values are declared for the client-registration mechanisms technical plan §43.15 reserves -- so a consumer MUST tolerate a value it does not recognise.
+   * Matches Postgres mcp_oauth_client_kind exactly (migrations/000141_mcp_oauth.up.sql). How the client came to be registered (technical plan §43.15): preregistered by an administrator; metadata_document, identified by an https URL whose client ID metadata document the server fetched (clientId is that URL, and its host is the client's identity); or dynamic, registered by the client itself through RFC 7591 (off by default). An OPEN enum (manifest.json's openEnums): a consumer MUST tolerate a value it does not recognise.
    */
   clientKind: 'preregistered' | 'dynamic' | 'metadata_document';
   /**
@@ -3265,7 +3265,7 @@ export interface MCPClient {
    */
   clientName: string;
   /**
-   * Matches Postgres mcp_oauth_client_kind exactly (migrations/000141_mcp_oauth.up.sql). An OPEN enum (manifest.json's openEnums): only preregistered is produced today -- the other two values are declared for the client-registration mechanisms technical plan §43.15 reserves -- so a consumer MUST tolerate a value it does not recognise.
+   * Matches Postgres mcp_oauth_client_kind exactly (migrations/000141_mcp_oauth.up.sql). How the client came to be registered (technical plan §43.15): preregistered by an administrator; metadata_document, identified by an https URL whose client ID metadata document the server fetched (clientId is that URL, and its host is the client's identity); or dynamic, registered by the client itself through RFC 7591 (off by default). An OPEN enum (manifest.json's openEnums): a consumer MUST tolerate a value it does not recognise.
    */
   kind: 'preregistered' | 'dynamic' | 'metadata_document';
   /**
@@ -3292,7 +3292,7 @@ export interface ListMCPClientsResponse {
   clients: MCPClient[];
 }
 /**
- * POST /api/mcp-clients's own request body (technical plan §43.15): pre-register an MCP client. The server generates the client_id. Every redirect URI must be https with any host, or http on 127.0.0.1, [::1] or localhost, with no fragment and no userinfo -- anything else is refused 400 (internal/domain/mcpclient). clientName is trimmed and must be 1 to 100 characters with no control or invisible formatting character.
+ * POST /api/mcp-clients's own request body (technical plan §43.15): pre-register an MCP client. The server generates the client_id. Every redirect URI must be https with any host, or http on 127.0.0.1, [::1] or localhost, with no fragment and no userinfo -- anything else is refused 400 (internal/domain/mcpclient). clientName is trimmed and must be 1 to 100 printable characters: no control, invisible formatting or otherwise unprintable character (the rule every registration path shares, technical plan §43.15).
  *
  * This interface was referenced by `RestDtos`'s JSON-Schema
  * via the `definition` "CreateMCPClientRequest".

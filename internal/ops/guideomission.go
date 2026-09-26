@@ -168,6 +168,10 @@ var RouteGuideExemptions = []RouteGuideExemption{
 		Route:  "POST /oauth/revoke",
 		Reason: "OAuth token revocation endpoint (RFC 7009) for MCP clients (internal/adapters/inbound/mcpauth's Revoke): an MCP client program gives back one of its own tokens here, for instance when the person signs out of it -- no page of this web app posts to it and it reads no cookie; a person disconnects an app from Settings instead (DELETE /api/me/mcp-authorizations/{authorizationID}, documented in web.md).",
 	},
+	{
+		Route:  "POST /oauth/register",
+		Reason: "RFC 7591 dynamic client registration for MCP clients (internal/adapters/inbound/mcpauth's Register), off unless the deployment sets NARVI_MCP_DCR_ENABLED: an MCP client program's own OAuth library registers itself here, before it opens the authorization page, when it has neither a pre-registered client ID nor a client ID metadata document -- no page of this web app posts to it and it reads no cookie. What a person then sees, the consent page, is documented in web.md.",
+	},
 }
 
 // minExemptionReasonLen is the length floor validateRouteGuideExemptions

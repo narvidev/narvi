@@ -8,7 +8,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/narvidev/narvi/internal/adapters/inbound/auth"
@@ -38,6 +38,15 @@ func singleParam(q url.Values, name string) (string, bool) {
 		return "", true
 	}
 	return vals[0], true
+}
+
+// foreignKeyViolation is Postgres's SQLSTATE for an insert whose parent
+// row is gone.
+const foreignKeyViolation = "23503"
+
+func isForeignKeyViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == foreignKeyViolation
 }
 
 // storableText reports whether s can be sent to Postgres as TEXT: valid
@@ -72,20 +81,13 @@ func (s *Server) Authorize(w http.ResponseWriter, r *http.Request) {
 		s.renderError(w, r, http.StatusBadRequest, "This app is not registered", "This deployment does not know the app that sent you here.")
 		return
 	}
-	client, err := s.deps.Clients.GetByClientID(ctx, clientIDParam)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		logger.Warn("mcpauth: authorize refused", "outcome", "unknown_client")
-		s.renderError(w, r, http.StatusBadRequest, "This app is not registered", "This deployment does not know the app that sent you here.")
-		return
-	case err != nil:
-		logger.Error("mcpauth: authorize: load client failed", "error", err)
-		s.renderError(w, r, http.StatusInternalServerError, "Something went wrong", "The authorization request could not be processed.")
+	client, ok := s.resolveClient(w, r, clientIDParam)
+	if !ok {
 		return
 	}
-	if client.DisabledAt.Valid || client.Kind != sqlcgen.McpOauthClientKindPreregistered {
+	if !s.clientUsable(client) {
 		logger.Warn("mcpauth: authorize refused", "outcome", "client_not_usable", "client_id", client.ClientID)
-		s.renderError(w, r, http.StatusBadRequest, "This app is not available", "An administrator of this deployment has disabled this app.")
+		s.renderError(w, r, http.StatusBadRequest, "This app is not available", "This deployment has disabled this app, or no longer accepts the way it was registered.")
 		return
 	}
 
@@ -155,6 +157,15 @@ func (s *Server) Authorize(w http.ResponseWriter, r *http.Request) {
 		Resource:            s.ids.Resource,
 		ExpiresAt:           pgtype.Timestamptz{Time: time.Now().Add(s.cfg.Timeouts.MCPAuthorizationRequestTTL), Valid: true},
 	})
+	if isForeignKeyViolation(err) {
+		// The client was deleted -- by an administrator, or by the unused-
+		// client sweep -- between the read above and this insert. Its
+		// redirect URI is no longer anyone's: an error page, never a
+		// redirect.
+		logger.Warn("mcpauth: authorize refused", "outcome", "client_deleted", "client_id", client.ClientID)
+		s.renderError(w, r, http.StatusBadRequest, "This app is not registered", "This deployment does not know the app that sent you here.")
+		return
+	}
 	if err != nil {
 		logger.Error("mcpauth: authorize: store request failed", "error", err)
 		s.redirectError(w, r, redirectURI, errServerError, "the request could not be stored", state)

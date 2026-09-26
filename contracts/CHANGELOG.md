@@ -9,6 +9,36 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.5.0]
+
+### controlplane/testdata/routes.golden
+
+- Added: `POST /oauth/register` -- the MCP authorization server's RFC 7591
+  dynamic client registration endpoint (technical plan §43.14/§43.15).
+  Mounted unconditionally like every `/oauth` route; it answers the
+  surface's disabled response unless the deployment sets
+  `NARVI_MCP_DCR_ENABLED` (off by default), and is rate-limited per client
+  address. A route added, graded MINOR (row 41). Its request and response
+  are RFC 7591's own JSON shapes, not `/contracts` schemas.
+- Unchanged as routes, changed in behaviour: `GET /oauth/authorize` now
+  also accepts an `https` `client_id` -- a client ID metadata document,
+  fetched through an SSRF-guarded fetcher (`NARVI_MCP_CIMD_ENABLED`, on by
+  default) -- and `GET /.well-known/oauth-authorization-server/oauth`
+  advertises `client_id_metadata_document_supported` and
+  `registration_endpoint` while each mechanism is on.
+
+### rest/v1/dtos.schema.json
+
+- Changed (descriptions only, annotation-only PATCH):
+  `MCPAuthorization.clientKind` and `MCPClient.kind` no longer say only
+  `preregistered` is produced: `metadata_document` and `dynamic` are
+  produced now, and each value is described. Both stay open enums, with
+  the same three values. `MCPAuthorization.clientName` now says a
+  self-registered client chose its own name. `CreateMCPClientRequest`
+  describes the stricter client-name rule every registration path now
+  shares (printable characters only). No field, type, enum value or
+  requiredness changed.
+
 ## [1.4.1]
 
 ### rest/v1/dtos.schema.json

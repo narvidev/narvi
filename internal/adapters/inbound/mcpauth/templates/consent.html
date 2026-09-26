@@ -3,12 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Allow {{.ClientName}}? - Narvi</title>
+<title>{{if .IdentityHost}}Allow the app at {{.IdentityHost}}?{{else}}Allow {{.ClientName}}?{{end}} - Narvi</title>
 <style>
   body { margin: 0; background: #f6f7f9; color: #1c1f24; font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   main { max-width: 520px; margin: 48px auto; background: #fff; border: 1px solid #dfe2e7; border-radius: 10px; padding: 28px 32px; }
   h1 { font-size: 20px; margin: 0 0 12px; }
   .identity { margin: 0 0 16px; color: #3d4452; }
+  .host { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
   .meta { color: #5a6272; font-size: 14px; margin: 0 0 8px; }
   .redirect { border-top: 1px solid #eceef2; margin-top: 16px; padding-top: 12px; }
   .warn { background: #fff6e5; border: 1px solid #f0c36d; border-radius: 6px; padding: 10px 12px; font-size: 14px; }
@@ -24,8 +25,13 @@
 </head>
 <body>
 <main>
+  {{if .IdentityHost}}
+  <h1>Allow the app at <strong class="host">{{.IdentityHost}}</strong> to use Narvi as you?</h1>
+  <p class="identity">It calls itself <strong>{{.ClientName}}</strong>. {{.ClientIdentity}}</p>
+  {{else}}
   <h1>Allow <strong>{{.ClientName}}</strong> to use Narvi as you?</h1>
   <p class="identity">{{.ClientIdentity}}</p>
+  {{end}}
   {{if .ClientHomepageHost}}<p class="meta">Homepage: {{.ClientHomepageHost}}</p>{{end}}
   <p class="meta">Signed in as <strong>{{.UserEmail}}</strong>. Not you? <a href="/sign-in">Switch account</a>, then start again from the app.</p>
   <section class="redirect">

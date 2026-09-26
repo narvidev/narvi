@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/domain/mcpclient"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -40,6 +41,12 @@ type MCPBearerConfig struct {
 	// LastUsedWriteInterval is platform.Timeouts.
 	// MCPGrantLastUsedWriteInterval.
 	LastUsedWriteInterval time.Duration
+	// ClientMechanisms is which client-registration mechanisms the
+	// deployment accepts (technical plan §43.15): a token issued to a
+	// client registered through one that is switched off is refused, like
+	// a disabled client's -- the same mcpclient.Mechanisms the
+	// authorization server itself was built with.
+	ClientMechanisms mcpclient.Mechanisms
 }
 
 // RequireMCPBearer is the /mcp route group's authentication gate (technical
@@ -52,7 +59,8 @@ type MCPBearerConfig struct {
 // kind in front of that read, so a revoked grant, a deleted or disabled
 // client, a disabled user or a changed role all take effect on the very
 // next call. It refuses unless the token and grant are unexpired, the
-// client and user are not disabled, and the grant's resource is this
+// client and user are not disabled, the client's registration mechanism
+// is one the deployment accepts, and the grant's resource is this
 // deployment's own.
 //
 // A refusal is the same 401 {"error":"unauthorized"} body every other
@@ -145,6 +153,8 @@ func refusalReason(p postgres.MCPAccessTokenPrincipal, cfg MCPBearerConfig, now 
 		return "grant expired"
 	case p.ClientDisabled:
 		return "client disabled"
+	case !cfg.ClientMechanisms.Accepts(mcpclient.Kind(p.ClientKind)):
+		return "client registration mechanism switched off"
 	case p.UserDisabled:
 		return "user disabled"
 	case p.GrantResource != cfg.Resource:

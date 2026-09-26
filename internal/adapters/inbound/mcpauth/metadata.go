@@ -18,15 +18,18 @@ type protectedResourceMetadataDoc struct {
 // authorizationServerMetadataDoc is this server's own RFC 8414 document
 // -- deliberately its own struct, not the SDK's oauthex.AuthServerMeta,
 // whose jwks_uri field has no omitempty (no token here is a JWT, so
-// there is no key set to point at). It advertises only what is built:
-// the authorization-code and refresh-token grants and the RFC 7009
-// revocation endpoint, but no registration endpoint and no client ID
-// metadata document support.
+// there is no key set to point at). It advertises only what is built and
+// switched on: the authorization-code and refresh-token grants, the RFC
+// 7009 revocation endpoint, client ID metadata document support while
+// that mechanism is on, and the RFC 7591 registration endpoint while
+// dynamic registration is on -- each ABSENT, never false or empty, when
+// off (technical plan §43.15).
 type authorizationServerMetadataDoc struct {
 	Issuer                                     string   `json:"issuer"`
 	AuthorizationEndpoint                      string   `json:"authorization_endpoint"`
 	TokenEndpoint                              string   `json:"token_endpoint"`
 	RevocationEndpoint                         string   `json:"revocation_endpoint"`
+	RegistrationEndpoint                       string   `json:"registration_endpoint,omitempty"`
 	ScopesSupported                            []string `json:"scopes_supported"`
 	ResponseTypesSupported                     []string `json:"response_types_supported"`
 	ResponseModesSupported                     []string `json:"response_modes_supported"`
@@ -35,6 +38,7 @@ type authorizationServerMetadataDoc struct {
 	RevocationEndpointAuthMethodsSupported     []string `json:"revocation_endpoint_auth_methods_supported"`
 	CodeChallengeMethodsSupported              []string `json:"code_challenge_methods_supported"`
 	AuthorizationResponseIssParameterSupported bool     `json:"authorization_response_iss_parameter_supported"`
+	ClientIDMetadataDocumentSupported          bool     `json:"client_id_metadata_document_supported,omitempty"`
 }
 
 func (s *Server) protectedResourceMetadata() protectedResourceMetadataDoc {
@@ -48,11 +52,16 @@ func (s *Server) protectedResourceMetadata() protectedResourceMetadataDoc {
 }
 
 func (s *Server) authorizationServerMetadata() authorizationServerMetadataDoc {
+	registration := ""
+	if s.cfg.Mechanisms.DynamicRegistration {
+		registration = s.ids.RegistrationEndpoint
+	}
 	return authorizationServerMetadataDoc{
 		Issuer:                                     s.ids.Issuer,
 		AuthorizationEndpoint:                      s.ids.AuthorizationEndpoint,
 		TokenEndpoint:                              s.ids.TokenEndpoint,
 		RevocationEndpoint:                         s.ids.RevocationEndpoint,
+		RegistrationEndpoint:                       registration,
 		ScopesSupported:                            mcpscope.Strings(s.scopes),
 		ResponseTypesSupported:                     []string{"code"},
 		ResponseModesSupported:                     []string{"query"},
@@ -61,6 +70,7 @@ func (s *Server) authorizationServerMetadata() authorizationServerMetadataDoc {
 		RevocationEndpointAuthMethodsSupported:     []string{"none"},
 		CodeChallengeMethodsSupported:              []string{"S256"},
 		AuthorizationResponseIssParameterSupported: true,
+		ClientIDMetadataDocumentSupported:          s.cfg.Mechanisms.MetadataDocuments,
 	}
 }
 

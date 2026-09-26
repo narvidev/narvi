@@ -62,7 +62,7 @@ func (s *Server) Token(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if client.DisabledAt.Valid || client.Kind != sqlcgen.McpOauthClientKindPreregistered {
+	if !s.clientUsable(client) {
 		logger.Warn("mcpauth: token refused", "outcome", "client_not_usable", "client_id", client.ClientID)
 		writeTokenError(w, errInvalidClient, "this client is not available", basicAttempted)
 		return

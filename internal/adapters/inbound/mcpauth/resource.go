@@ -20,6 +20,7 @@ const (
 	consentPath                       = issuerPath + "/consent"
 	tokenPath                         = issuerPath + "/token"
 	revokePath                        = issuerPath + "/revoke"
+	registerPath                      = issuerPath + "/register"
 	protectedResourceMetadataPrefix   = "/.well-known/oauth-protected-resource"
 	authorizationServerMetadataPrefix = "/.well-known/oauth-authorization-server"
 )
@@ -47,10 +48,13 @@ type Identifiers struct {
 	// (path insertion of Issuer's path).
 	AuthorizationServerMetadataURL string
 	// AuthorizationEndpoint, TokenEndpoint and RevocationEndpoint are the
-	// endpoints the authorization server metadata advertises.
+	// endpoints the authorization server metadata advertises;
+	// RegistrationEndpoint is the RFC 7591 one, advertised only while
+	// dynamic client registration is on (technical plan §43.15).
 	AuthorizationEndpoint string
 	TokenEndpoint         string
 	RevocationEndpoint    string
+	RegistrationEndpoint  string
 }
 
 // DeriveIdentifiers computes Identifiers from publicBaseURL. It fails only
@@ -77,6 +81,7 @@ func DeriveIdentifiers(publicBaseURL string) (Identifiers, error) {
 		AuthorizationEndpoint:          base + authorizePath,
 		TokenEndpoint:                  base + tokenPath,
 		RevocationEndpoint:             base + revokePath,
+		RegistrationEndpoint:           base + registerPath,
 	}, nil
 }
 
