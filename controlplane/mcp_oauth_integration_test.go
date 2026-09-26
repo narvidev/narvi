@@ -69,12 +69,14 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1304,6 +1306,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 	// registrations, then 429 with Retry-After and nothing written.
 	t.Run("Register_RateLimited", func(t *testing.T) {
 		burst := cimdRig.cfg.Timeouts.MCPRegisterRateBurst
+		start := time.Now()
 		for i := range burst {
 			if rec := cimdRig.registerFrom(t, "198.51.100.23:40000", "", "Rate Limit Probe"); rec.Code != http.StatusCreated {
 				t.Fatalf("registration %d of the burst: status %d body %s, want 201", i+1, rec.Code, rec.Body.String())
@@ -1314,9 +1317,11 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 			{"a forwarded header naming another address changes nothing", "198.51.100.23:40002", "198.51.100.99"},
 		} {
 			rec := cimdRig.registerFrom(t, tc.remote, tc.forwarded, "Rate Limit Probe")
+			elapsed := time.Since(start)
 			if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" || !strings.Contains(rec.Body.String(), `"error":"temporarily_unavailable"`) {
 				t.Fatalf("%s: status %d Retry-After %q body %s, want 429 with Retry-After", tc.name, rec.Code, rec.Header().Get("Retry-After"), rec.Body.String())
 			}
+			assertRetryAfterPinsInterval(t, tc.name, rec.Header().Get("Retry-After"), cimdRig.cfg.Timeouts.MCPRegisterRateInterval, elapsed)
 		}
 		if rec := cimdRig.registerFrom(t, "198.51.100.24:40000", "", "Rate Limit Probe"); rec.Code != http.StatusCreated {
 			t.Fatalf("another address: status %d, want 201", rec.Code)
@@ -1403,6 +1408,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		logs := captureWarnings(t)
 		const flooder = "198.51.100.61"
 		junk := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {"narvi_mcp_rt_junk"}, "client_id": {"narvi_mcp_c_unknown"}}
+		start := time.Now()
 		for i := range braked.cfg.Timeouts.MCPTokenEndpointRateBurst {
 			if rec := braked.tokenFrom(t, flooder+":4000", "", junk); rec.Code != http.StatusBadRequest {
 				t.Fatalf("token request %d of the burst: status %d body %s, want the handler's own 400", i+1, rec.Code, rec.Body.String())
@@ -1418,10 +1424,12 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 			{"a real refresh token from the braked network", flooder + ":4003", "", asFlow},
 		} {
 			rec := braked.tokenFrom(t, tc.remote, tc.forwarded, tc.form)
+			elapsed := time.Since(start)
 			if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" || rec.Header().Get("Content-Type") != "application/json" || rec.Header().Get("Cache-Control") != "no-store" ||
 				rec.Body.String() != `{"error":"temporarily_unavailable","error_description":"too many token requests from this network; retry later"}`+"\n" {
 				t.Fatalf("%s: status %d headers %v body %s, want 429 temporarily_unavailable with Retry-After", tc.name, rec.Code, rec.Header(), rec.Body.String())
 			}
+			assertRetryAfterPinsInterval(t, tc.name, rec.Header().Get("Retry-After"), braked.cfg.Timeouts.MCPTokenEndpointRateInterval, elapsed)
 		}
 		var rotated bool
 		if err := braked.pool.QueryRow(ctx, `SELECT rotated_at IS NOT NULL FROM mcp_oauth_refresh_tokens WHERE token_hash = $1`, platform.HashToken(refresh)).Scan(&rotated); err != nil || rotated {
@@ -1461,6 +1469,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 			"client_id": {client.ClientId}, "redirect_uri": {"http://127.0.0.1:1/callback"}, "response_type": {"code"},
 			"code_challenge": {challenge}, "code_challenge_method": {"S256"}, "resource": {braked.server.URL + "/mcp"}, "state": {state},
 		}
+		start := time.Now()
 		for i := range braked.cfg.Timeouts.MCPAuthorizeRateBurst {
 			if rec := braked.authorizeFrom(t, flooder+":5000", valid); rec.Code != http.StatusFound || !strings.HasPrefix(rec.Header().Get("Location"), "/sign-in?next=") {
 				t.Fatalf("authorization %d of the burst: status %d Location %q, want a 302 on to sign-in", i+1, rec.Code, rec.Header().Get("Location"))
@@ -1473,10 +1482,12 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		unregistered.Set("redirect_uri", "https://elsewhere.example/cb")
 		for name, q := range map[string]url.Values{"a valid request": valid, "an unregistered redirect_uri": unregistered} {
 			rec := braked.authorizeFrom(t, flooder+":5001", q)
+			elapsed := time.Since(start)
 			if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Location") != "" || rec.Header().Get("Retry-After") == "" ||
 				rec.Header().Get("Content-Type") != "text/html; charset=utf-8" || !strings.Contains(rec.Body.String(), "Too many requests from your network") {
 				t.Fatalf("%s past the burst: status %d Location %q Retry-After %q, want the 429 page and no redirect", name, rec.Code, rec.Header().Get("Location"), rec.Header().Get("Retry-After"))
 			}
+			assertRetryAfterPinsInterval(t, name, rec.Header().Get("Retry-After"), braked.cfg.Timeouts.MCPAuthorizeRateInterval, elapsed)
 		}
 		if rec := braked.authorizeFrom(t, "198.51.100.72:5000", valid); rec.Code != http.StatusFound {
 			t.Fatalf("another network: status %d, want 302", rec.Code)
@@ -1686,6 +1697,29 @@ func (r *oauthRouterRig) authorizeFrom(t *testing.T, remote string, q url.Values
 	rec := httptest.NewRecorder()
 	r.server.Config.Handler.ServeHTTP(rec, req)
 	return rec
+}
+
+// assertRetryAfterPinsInterval proves, from a brake's refusal alone, the
+// refill interval the production router built that brake with. The
+// limiter's delay is the interval less the time since the network's bucket
+// began its burst, rounded up to whole seconds and never below one
+// (mcpauth's setRetryAfter). elapsed bounds that time from above --
+// measured from before the burst's first request to after the refusal --
+// so Retry-After lies between ceil(interval - elapsed) and ceil(interval):
+// exactly the interval in seconds whenever the burst and the refusal took
+// under a second, as they do here, so a brake wired with any other
+// interval -- the 12-minute registration one on the token endpoint, the
+// token endpoint's 2 seconds on the authorization endpoint -- fails. A
+// slower run only widens the lower bound by the time it took; nothing here
+// sleeps or depends on a clock seam.
+func assertRetryAfterPinsInterval(t *testing.T, what, retryAfter string, interval, elapsed time.Duration) {
+	t.Helper()
+	ceilSeconds := func(d time.Duration) int { return int(math.Ceil(d.Seconds())) }
+	highest := ceilSeconds(interval)
+	lowest := max(1, ceilSeconds(interval-elapsed))
+	if got, err := strconv.Atoi(retryAfter); err != nil || got < lowest || got > highest {
+		t.Fatalf("%s: Retry-After %q, want between %d and %d seconds: the brake's %s refill interval, less the %s its burst and this refusal took", what, retryAfter, lowest, highest, interval, elapsed)
+	}
 }
 
 // registerClientAsAdmin pre-registers a client named name, redirecting to

@@ -7539,8 +7539,10 @@ and the grant under any other user's path `404`, its token still working — and
 call through the SDK session refused, its refresh token refreshing nothing. On a router built with the
 shipped brakes (the shared router of the proofs above lifts the two new ones, since every SDK client there
 dials from one loopback address and would otherwise meet them whenever it ran faster than they refill):
-`RateLimit_TokenEndpoint429` and `RateLimit_AuthorizeEndpoint` prove each brake's answer, its log line and
-that a refused request spends and stores nothing; `RateLimit_OneNetworkCannotLockOutAnotherRefresh` has
+`RateLimit_TokenEndpoint429` and `RateLimit_AuthorizeEndpoint` prove each brake's answer, its log line,
+that a refused request spends and stores nothing, and — from the refusal's `Retry-After`, bounded by the
+time the burst took — the refill interval the router built the brake with, as `Register_RateLimited` does
+for registration's; `RateLimit_OneNetworkCannotLockOutAnotherRefresh` has
 an IPv4 flood and an IPv6 /48 flood each spend their own bucket while the SDK client refreshes and carries
 on; `RateLimit_RefusedRefreshSpendsNothing_SDK` has the SDK client's own refresh braked — the call fails,
 no consent, the refresh token kept and still good; and `Authorize_PendingCapRefused` floods one client
