@@ -24,8 +24,9 @@
 // code's grant (LockGrantKeyShare), before consuming its code; the refresh
 // grant takes the client, then the refresh token's grant, before rotating
 // its refresh token (RotateRefreshToken). Deleting a grant -- by its user,
-// on code reuse, on refresh-token reuse, or at its client's request (RFC
-// 7009) -- takes the grant's client FOR KEY SHARE before the grant. A
+// by an administrator on the user's behalf, on code reuse, on
+// refresh-token reuse, or at its client's request (RFC 7009) -- takes the
+// grant's client FOR KEY SHARE before the grant. A
 // revocation racing an issuance therefore waits on the parent the
 // issuance already holds and then deletes what it issued, or the issuance
 // waits on the revocation and then finds its parent gone; neither ever
@@ -44,6 +45,18 @@
 // too; nothing here locks a users row except those foreign-key checks, and
 // users rows are never deleted.
 //
+// The authorization endpoint stores a request in a transaction of its own
+// (CreatePendingAuthorizationRequest, technical plan §43.14's
+// pending-request cap): the client FOR NO KEY UPDATE, then a count of the
+// client's pending requests, then the insert. It locks one existing row,
+// first, and after it only the row it inserts, which no other transaction
+// can know of yet -- so it waits at most once, holding nothing, and can
+// never be part of a wait cycle. FOR NO KEY UPDATE conflicts with another
+// authorization of the same client (so their counts and inserts never
+// interleave), with a metadata document's upsert and failed re-fetch
+// record, and with a client's deletion -- never with the FOR KEY SHARE an
+// issuance or a grant revocation takes.
+//
 // Client registration (technical plan §43.15) adds four writers, each
 // following the same order. A metadata document's upsert, and the record
 // of its first failed re-fetch, are each ONE statement locking ONE row --
@@ -57,11 +70,12 @@
 // administrator's deletion does -- the client FOR UPDATE, then its
 // cascade -- in two statements: it locks its candidates first (in id
 // order), then deletes only those a fresh look still finds with no grant
-// and no authorization request, so its cascade reaches no row at all. A
-// request or grant whose insert holds the client FOR KEY SHARE (its
-// foreign-key check) when the sweep arrives makes the sweep wait, and,
-// once committed, keeps its client; one that arrives after the lock waits
-// for the sweep, then finds its client gone. A consent in flight always
+// and no authorization request, so its cascade reaches no row at all. An
+// authorization holding the client (FOR NO KEY UPDATE) or a grant whose
+// insert holds it (FOR KEY SHARE, its foreign-key check) when the sweep
+// arrives makes the sweep wait, and, once committed, keeps its client; one
+// that arrives after the lock waits for the sweep, then finds its client
+// gone. A consent in flight always
 // has its request, so its client is never even a candidate
 // (TestLockOrder_ClientRegistrationWriters).
 //
@@ -77,6 +91,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -98,17 +113,27 @@ import (
 // already-hashed secrets (platform.HashToken).
 type MCPOAuthGrantStore struct {
 	q *sqlcgen.Queries
+	// db is what q runs on -- the pool, or the transaction WithTx was
+	// given -- for the one method that needs a transaction of its own
+	// (CreatePendingAuthorizationRequest; on a caller's transaction, a
+	// savepoint in it).
+	db txBeginner
 }
 
 // NewMCPOAuthGrantStore builds an MCPOAuthGrantStore backed by pool.
 func NewMCPOAuthGrantStore(pool *pgxpool.Pool) *MCPOAuthGrantStore {
-	return &MCPOAuthGrantStore{q: sqlcgen.New(pool)}
+	return &MCPOAuthGrantStore{q: sqlcgen.New(pool), db: pool}
 }
 
 // WithTx returns an MCPOAuthGrantStore whose queries run on tx.
 func (s *MCPOAuthGrantStore) WithTx(tx pgx.Tx) *MCPOAuthGrantStore {
-	return &MCPOAuthGrantStore{q: s.q.WithTx(tx)}
+	return &MCPOAuthGrantStore{q: s.q.WithTx(tx), db: tx}
 }
+
+// ErrPendingAuthorizationRequestCap is CreatePendingAuthorizationRequest's
+// refusal: the client already has as many pending authorization requests
+// as the cap allows, and nothing was written.
+var ErrPendingAuthorizationRequestCap = errors.New("postgres: the client already has the most pending MCP authorization requests allowed")
 
 // nonNilScopes stores an empty scope set as '{}', never NULL: pgx encodes
 // a nil []string as SQL NULL, and every scopes column is NOT NULL. A
@@ -121,11 +146,38 @@ func nonNilScopes(scopes []string) []string {
 	return scopes
 }
 
-// CreateAuthorizationRequest inserts one validated GET /oauth/authorize
-// request.
-func (s *MCPOAuthGrantStore) CreateAuthorizationRequest(ctx context.Context, arg sqlcgen.CreateMCPOAuthAuthorizationRequestParams) (sqlcgen.McpOauthAuthorizationRequest, error) {
+// CreatePendingAuthorizationRequest inserts one validated GET
+// /oauth/authorize request -- unless its client already has maxPending
+// requests waiting for a decision (unexpired, not consumed), when it
+// writes nothing and returns ErrPendingAuthorizationRequestCap (technical
+// plan §43.14). One transaction, three statements, in the lock order at
+// the top of this file: the client FOR NO KEY UPDATE
+// (LockMCPOAuthClientForNewRequest), then the count, taken under that lock
+// by a statement of its own so it sees every request an earlier holder
+// committed, then the insert. Two authorizations of one client therefore
+// count and insert one after the other, and however many race, the
+// client never holds more than maxPending pending requests. On a store
+// built WithTx, the transaction is a savepoint in the caller's, whose
+// locks the caller then holds. pgx.ErrNoRows means the client is gone.
+func (s *MCPOAuthGrantStore) CreatePendingAuthorizationRequest(ctx context.Context, arg sqlcgen.CreateMCPOAuthAuthorizationRequestParams, maxPending int) (sqlcgen.McpOauthAuthorizationRequest, error) {
 	arg.Scopes = nonNilScopes(arg.Scopes)
-	return s.q.CreateMCPOAuthAuthorizationRequest(ctx, arg)
+	var row sqlcgen.McpOauthAuthorizationRequest
+	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		q := s.q.WithTx(tx)
+		if _, err := q.LockMCPOAuthClientForNewRequest(ctx, arg.ClientID); err != nil {
+			return err
+		}
+		pending, err := q.CountPendingMCPOAuthAuthorizationRequests(ctx, arg.ClientID)
+		if err != nil {
+			return err
+		}
+		if pending >= int64(maxPending) {
+			return ErrPendingAuthorizationRequestCap
+		}
+		row, err = q.CreateMCPOAuthAuthorizationRequest(ctx, arg)
+		return err
+	})
+	return row, err
 }
 
 // GetAuthorizationRequest fetches one authorization request by id.

@@ -3127,6 +3127,56 @@ type Timeouts struct {
 	// admits before MCPRegisterRateInterval paces it. A count, kept beside
 	// its interval. 5.
 	MCPRegisterRateBurst int
+
+	// -- technical plan §43.14 (the token and authorization endpoints'
+	// brakes, and the pending-request cap) --
+	//
+	// No ordering links: each brake is keyed and refilled on its own. Four
+	// positivity checks, one per brake, the registration limit's own shape:
+	// a zero interval would be NO limit at all (rate.Every(0) is rate.Inf,
+	// failing OPEN), and a burst below one would refuse every request. And
+	// one on the cap, whose value below one would refuse every
+	// authorization.
+
+	// MCPTokenEndpointRateInterval is the refill interval of the
+	// per-network token bucket in front of POST /oauth/token: after a burst
+	// of MCPTokenEndpointRateBurst requests, one client network -- one IPv4
+	// address, one IPv6 /48 -- may make one more token request per
+	// interval. A client in use makes one code exchange per consent and one
+	// refresh per MCPAccessTokenTTL, so many users behind one address still
+	// fit. A request the brake refuses reaches no handler and spends
+	// nothing: a refresh token refused here is not rotated and can be
+	// presented again. In-memory, per replica -- a brake on abuse, not a
+	// correctness property. 2 seconds.
+	MCPTokenEndpointRateInterval time.Duration
+
+	// MCPTokenEndpointRateBurst is the per-network burst POST /oauth/token
+	// admits before MCPTokenEndpointRateInterval paces it. A count, kept
+	// beside its interval. 10.
+	MCPTokenEndpointRateBurst int
+
+	// MCPAuthorizeRateInterval is the refill interval of the per-network
+	// token bucket in front of GET /oauth/authorize, where every valid
+	// request stores a row until MCPAuthorizationRequestTTL: after a burst
+	// of MCPAuthorizeRateBurst requests, one client network may start one
+	// more authorization per interval. A person starts one per consent.
+	// In-memory, per replica. 3 seconds.
+	MCPAuthorizeRateInterval time.Duration
+
+	// MCPAuthorizeRateBurst is the per-network burst GET /oauth/authorize
+	// admits before MCPAuthorizeRateInterval paces it. A count, kept beside
+	// its interval. 10.
+	MCPAuthorizeRateBurst int
+
+	// MCPMaxPendingAuthorizationRequestsPerClient is how many authorization
+	// requests one client may have waiting for a decision -- unexpired and
+	// not consumed -- at once: past it, GET /oauth/authorize for that
+	// client is refused with a page, storing nothing, until one of them is
+	// decided or expires (MCPAuthorizationRequestTTL). Unlike the in-memory
+	// brakes above, a bound Postgres enforces, whatever the number of
+	// replicas or of networks the requests come from. A count, kept beside
+	// the TTL that bounds how long each request waits. 100.
+	MCPMaxPendingAuthorizationRequestsPerClient int
 }
 
 // DefaultTimeouts returns the shipped defaults for every field, each
@@ -3404,6 +3454,12 @@ func DefaultTimeouts() Timeouts {
 		MCPDynamicClientUnusedTTL:     24 * time.Hour,   // §43.15; unused registered clients are swept after this
 		MCPRegisterRateInterval:       12 * time.Minute, // §43.15; per-network refill of the registration bucket
 		MCPRegisterRateBurst:          5,                // §43.15; per-network registration burst
+
+		MCPTokenEndpointRateInterval:                2 * time.Second, // §43.14; per-network refill of the token endpoint's bucket
+		MCPTokenEndpointRateBurst:                   10,              // §43.14; per-network token-endpoint burst
+		MCPAuthorizeRateInterval:                    3 * time.Second, // §43.14; per-network refill of the authorization endpoint's bucket
+		MCPAuthorizeRateBurst:                       10,              // §43.14; per-network authorization-endpoint burst
+		MCPMaxPendingAuthorizationRequestsPerClient: 100,             // §43.14; pending authorization requests one client may have
 	}
 }
 
@@ -3619,9 +3675,22 @@ func (t Timeouts) Validate() error {
 	// every registration, which is a broken configuration rather than a
 	// stricter one.
 	mustBePositive("MCPRegisterRateInterval", t.MCPRegisterRateInterval)
-	if t.MCPRegisterRateBurst < 1 {
-		errs = append(errs, &CountMustBePositiveError{Field: "MCPRegisterRateBurst", Value: t.MCPRegisterRateBurst})
+	countMustBePositive := func(field string, value int) {
+		if value < 1 {
+			errs = append(errs, &CountMustBePositiveError{Field: field, Value: value})
+		}
 	}
+	countMustBePositive("MCPRegisterRateBurst", t.MCPRegisterRateBurst)
+
+	// §43.14: the token and authorization endpoints' brakes, the same shape
+	// as the registration limit's (fail OPEN at a zero interval, refuse
+	// everything below a burst of one), and the pending-request cap, which
+	// below one would refuse every authorization.
+	mustBePositive("MCPTokenEndpointRateInterval", t.MCPTokenEndpointRateInterval)
+	countMustBePositive("MCPTokenEndpointRateBurst", t.MCPTokenEndpointRateBurst)
+	mustBePositive("MCPAuthorizeRateInterval", t.MCPAuthorizeRateInterval)
+	countMustBePositive("MCPAuthorizeRateBurst", t.MCPAuthorizeRateBurst)
+	countMustBePositive("MCPMaxPendingAuthorizationRequestsPerClient", t.MCPMaxPendingAuthorizationRequestsPerClient)
 
 	// U1 audit fix, HIGH (confirmed finding: "the total budget is smaller
 	// than the retry chain it contains"). Derived from the SAME three

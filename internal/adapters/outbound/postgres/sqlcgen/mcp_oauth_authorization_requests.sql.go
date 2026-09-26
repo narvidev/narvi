@@ -85,6 +85,27 @@ func (q *Queries) ConsumeMCPOAuthAuthorizationRequest(ctx context.Context, arg C
 	return i, err
 }
 
+const countPendingMCPOAuthAuthorizationRequests = `-- name: CountPendingMCPOAuthAuthorizationRequests :one
+SELECT count(*) FROM mcp_oauth_authorization_requests
+WHERE client_id = $1
+  AND consumed_at IS NULL
+  AND expires_at > now()
+`
+
+// CountPendingMCPOAuthAuthorizationRequests counts the client's requests
+// still waiting for a decision -- unexpired and not consumed, bound to a
+// user or not -- which the pending-request cap bounds (technical plan
+// §43.14). Run it under LockMCPOAuthClientForNewRequest, as a statement of
+// its own: its snapshot is then taken once the lock is granted, so it
+// counts every request an authorization that held the lock before it
+// committed.
+func (q *Queries) CountPendingMCPOAuthAuthorizationRequests(ctx context.Context, clientID pgtype.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countPendingMCPOAuthAuthorizationRequests, clientID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createMCPOAuthAuthorizationRequest = `-- name: CreateMCPOAuthAuthorizationRequest :one
 
 INSERT INTO mcp_oauth_authorization_requests

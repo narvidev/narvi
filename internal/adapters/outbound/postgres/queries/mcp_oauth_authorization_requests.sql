@@ -17,6 +17,19 @@ INSERT INTO mcp_oauth_authorization_requests
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING *;
 
+-- CountPendingMCPOAuthAuthorizationRequests counts the client's requests
+-- still waiting for a decision -- unexpired and not consumed, bound to a
+-- user or not -- which the pending-request cap bounds (technical plan
+-- §43.14). Run it under LockMCPOAuthClientForNewRequest, as a statement of
+-- its own: its snapshot is then taken once the lock is granted, so it
+-- counts every request an authorization that held the lock before it
+-- committed.
+-- name: CountPendingMCPOAuthAuthorizationRequests :one
+SELECT count(*) FROM mcp_oauth_authorization_requests
+WHERE client_id = $1
+  AND consumed_at IS NULL
+  AND expires_at > now();
+
 -- name: GetMCPOAuthAuthorizationRequest :one
 SELECT * FROM mcp_oauth_authorization_requests
 WHERE id = $1;

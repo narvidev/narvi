@@ -51,6 +51,22 @@ SELECT * FROM mcp_oauth_clients
 WHERE id = $1
 FOR KEY SHARE;
 
+-- LockMCPOAuthClientForNewRequest takes the client row's FOR NO KEY UPDATE
+-- lock for the rest of the transaction: what GET /oauth/authorize takes
+-- before it counts the client's pending authorization requests and
+-- inserts one more (technical plan §43.14's pending-request cap), so two
+-- authorizations of one client count and insert one after the other and
+-- the cap is never exceeded. It conflicts with another authorization's,
+-- with a metadata document's upsert or failed re-fetch record (each an
+-- UPDATE of the row) and with the client's deletion (FOR UPDATE), never
+-- with the FOR KEY SHARE every issuance and grant revocation takes: a
+-- consent, a code exchange or a refresh never waits for an authorization
+-- of its client, nor it for them. pgx.ErrNoRows means the client is gone.
+-- name: LockMCPOAuthClientForNewRequest :one
+SELECT id FROM mcp_oauth_clients
+WHERE id = $1
+FOR NO KEY UPDATE;
+
 -- name: DeleteMCPOAuthClient :one
 DELETE FROM mcp_oauth_clients
 WHERE id = $1

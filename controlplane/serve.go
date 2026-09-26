@@ -2651,10 +2651,23 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	})
 	router.Route("/oauth", func(r chi.Router) {
 		r.Use(mcpadapter.RequireEnabled(cfg.MCPEnabled))
-		r.Get("/authorize", mcpAuthServer.Authorize)
+		// The authorization and token endpoints are braked per client
+		// network (§43.14) -- RemoteAddr only, never a forwarded header,
+		// each route with its own bucket table -- after the enabled-gate (a
+		// surface that is off spends no bucket) and before the handler, so
+		// a refused request reads nothing and spends nothing: the
+		// authorization endpoint answers its error page, never a redirect
+		// to a redirect_uri nobody has validated yet, and the token
+		// endpoint temporarily_unavailable, which leaves a client its
+		// refresh token. One network's flood never touches another's bucket.
+		r.With(
+			mcpauth.NewRateLimiter(cfg.Timeouts.MCPAuthorizeRateInterval, cfg.Timeouts.MCPAuthorizeRateBurst).Limit(mcpAuthServer.AuthorizeRateLimited),
+		).Get("/authorize", mcpAuthServer.Authorize)
 		r.Get("/consent", mcpAuthServer.ConsentPage)
 		r.Post("/consent", mcpAuthServer.ConsentDecision)
-		r.Post("/token", mcpAuthServer.Token)
+		r.With(
+			mcpauth.NewRateLimiter(cfg.Timeouts.MCPTokenEndpointRateInterval, cfg.Timeouts.MCPTokenEndpointRateBurst).Limit(mcpauth.TokenRateLimited),
+		).Post("/token", mcpAuthServer.Token)
 		r.Post("/revoke", mcpAuthServer.Revoke)
 		// RFC 7591 dynamic client registration (§43.15): mounted
 		// unconditionally like every route here, and answering the same

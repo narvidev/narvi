@@ -1,13 +1,19 @@
 package mcpauth
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/narvidev/narvi/internal/domain/mcpscope"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -192,5 +198,104 @@ func TestRegisterRateLimited_Answer(t *testing.T) {
 	}
 	if body := rec.Body.String(); body != `{"error":"temporarily_unavailable","error_description":"too many client registrations from this address; retry later"}`+"\n" {
 		t.Fatalf("body = %q", body)
+	}
+}
+
+// TestTokenRateLimited_Answer: POST /oauth/token's refusal is 429 with
+// Retry-After in whole seconds rounded up, never cached, in the token
+// endpoint's own JSON error shape, and its code is temporarily_unavailable --
+// never invalid_grant, which an OAuth client reads as "this refresh token is
+// dead" (the MCP Go SDK's client then drops it and sends its user back
+// through consent).
+func TestTokenRateLimited_Answer(t *testing.T) {
+	t.Parallel()
+	rec := httptest.NewRecorder()
+	TokenRateLimited(rec, httptest.NewRequest(http.MethodPost, "/oauth/token", nil), 1500*time.Millisecond)
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") != "2" ||
+		rec.Header().Get("Content-Type") != "application/json" || rec.Header().Get("Cache-Control") != "no-store" || rec.Header().Get("Location") != "" {
+		t.Fatalf("answer: status %d headers %v", rec.Code, rec.Header())
+	}
+	if body := rec.Body.String(); body != `{"error":"temporarily_unavailable","error_description":"too many token requests from this network; retry later"}`+"\n" {
+		t.Fatalf("body = %q", body)
+	}
+}
+
+// TestAuthorizeRateLimited_Answer: GET /oauth/authorize's refusal is the
+// error page -- 429, Retry-After, the page headers every page here carries
+// -- and never a redirect, even for a request naming a redirect_uri: the
+// brake runs before anything validated it.
+func TestAuthorizeRateLimited_Answer(t *testing.T) {
+	t.Parallel()
+	s, err := New(Config{PublicBaseURL: "https://narvi.example", Enabled: true, Scopes: []mcpscope.Scope{mcpscope.Read}, Timeouts: platform.DefaultTimeouts()}, Deps{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+url.Values{
+		"client_id": {"narvi_mcp_c_x"}, "redirect_uri": {"https://tools.example/cb"}, "response_type": {"code"}, "state": {"s"},
+	}.Encode(), nil)
+	rec := httptest.NewRecorder()
+	s.AuthorizeRateLimited(rec, req, 2*time.Second+time.Millisecond)
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") != "3" || rec.Header().Get("Location") != "" {
+		t.Fatalf("answer: status %d Retry-After %q Location %q, want 429, 3, none", rec.Code, rec.Header().Get("Retry-After"), rec.Header().Get("Location"))
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" || !strings.Contains(rec.Header().Get("Content-Security-Policy"), "frame-ancestors 'none'") || rec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("page headers: %v", rec.Header())
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "Too many requests from your network") || strings.Contains(body, "tools.example") {
+		t.Fatalf("page body = %s", body)
+	}
+}
+
+// TestRateLimiter_RefusalLogCarriesNoCredential: a refused request is
+// logged at WARN with its path and client network, and with nothing the
+// request carried -- neither its query (an authorization request's state
+// and PKCE challenge) nor its body (a code, a refresh token), which the
+// brake never reads. Not parallel: it swaps the default logger, and puts
+// back the standard log package's output and flags too (slog.SetDefault
+// points that package at the handler it installs).
+func TestRateLimiter_RefusalLogCarriesNoCredential(t *testing.T) {
+	var buf bytes.Buffer
+	prev, prevOutput, prevFlags := slog.Default(), log.Writer(), log.Flags()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevOutput)
+		log.SetFlags(prevFlags)
+	})
+
+	const refresh, state, challenge = "narvi_mcp_rt_secretsecretsecret", "state-secret-value", "challenge-secret-value"
+	l, _ := newTestLimiter(time.Minute, 1)
+	var reached int
+	h := l.Limit(TokenRateLimited)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached++
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	send := func() int {
+		r := httptest.NewRequest(http.MethodPost, "/oauth/token?state="+state+"&code_challenge="+challenge,
+			strings.NewReader(url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refresh}}.Encode()))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		r.RemoteAddr = "[2001:db8:77:1::5]:4000"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		return rec.Code
+	}
+	if code := send(); code != http.StatusBadRequest {
+		t.Fatalf("first request: status %d, want it to reach the handler", code)
+	}
+	if code := send(); code != http.StatusTooManyRequests || reached != 1 {
+		t.Fatalf("second request: status %d (handler reached %d times), want 429 and the handler never reached", code, reached)
+	}
+	line := strings.TrimSpace(buf.String())
+	var entry map[string]any
+	if err := json.Unmarshal([]byte(line), &entry); err != nil || strings.Count(line, "\n") != 0 {
+		t.Fatalf("log = %q, want exactly one JSON line", line)
+	}
+	if entry["level"] != "WARN" || entry["msg"] != "mcpauth: rate limited" || entry["path"] != "/oauth/token" || entry["client_address"] != "2001:db8:77::/48" {
+		t.Fatalf("log entry = %v, want a WARN naming the path and the client network", entry)
+	}
+	for _, secret := range []string{refresh, state, challenge, "refresh_token", "state="} {
+		if strings.Contains(line, secret) {
+			t.Fatalf("the refusal log carries %q: %s", secret, line)
+		}
 	}
 }

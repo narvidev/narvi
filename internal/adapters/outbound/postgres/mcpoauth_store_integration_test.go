@@ -63,6 +63,78 @@ func newMCPOAuthFixture(ctx context.Context, t *testing.T) mcpOAuthFixture {
 
 func mcpTS(t time.Time) pgtype.Timestamptz { return pgtype.Timestamptz{Time: t, Valid: true} }
 
+// mcpTestPendingCap is the pending-request cap the store tests that are
+// not about it pass: far above anything they create.
+const mcpTestPendingCap = 100
+
+// TestMCPOAuthGrantStore_PendingAuthorizationRequestCap: a client holds at
+// most maxPending requests waiting for a decision. The next is refused
+// with ErrPendingAuthorizationRequestCap and writes nothing; an expired or
+// a consumed request does not count, nor does another client's; and a
+// client that is gone is pgx.ErrNoRows (technical plan §43.14).
+func TestMCPOAuthGrantStore_PendingAuthorizationRequestCap(t *testing.T) {
+	ctx := context.Background()
+	f := newMCPOAuthFixture(ctx, t)
+	const maxPending = 3
+	other, err := f.clients.Create(ctx, sqlcgen.CreateMCPOAuthClientParams{
+		ClientID: "narvi_mcp_c_store_other", Kind: sqlcgen.McpOauthClientKindPreregistered,
+		ClientName: "Other", RedirectUris: []string{"http://127.0.0.1/callback"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := func(client pgtype.UUID, expires time.Time) sqlcgen.CreateMCPOAuthAuthorizationRequestParams {
+		return sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
+			ClientID: client, RedirectUri: "http://127.0.0.1/callback", CodeChallenge: "challenge",
+			CodeChallengeMethod: "S256", Resource: "http://127.0.0.1:9/mcp", ExpiresAt: mcpTS(expires),
+		}
+	}
+	pending := func(client pgtype.UUID) int {
+		var n int
+		if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM mcp_oauth_authorization_requests WHERE client_id = $1`, client).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	// An expired request and a consumed one: stored, never counted.
+	if _, err := f.grants.CreatePendingAuthorizationRequest(ctx, request(f.client.ID, time.Now().Add(time.Minute)), maxPending); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(ctx, `UPDATE mcp_oauth_authorization_requests SET expires_at = now() - interval '1 second' WHERE client_id = $1`, f.client.ID); err != nil {
+		t.Fatal(err)
+	}
+	consumed, err := f.grants.CreatePendingAuthorizationRequest(ctx, request(f.client.ID, time.Now().Add(time.Minute)), maxPending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(ctx, `UPDATE mcp_oauth_authorization_requests SET consumed_at = now() WHERE id = $1`, consumed.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := range maxPending {
+		if _, err := f.grants.CreatePendingAuthorizationRequest(ctx, request(f.client.ID, time.Now().Add(time.Minute)), maxPending); err != nil {
+			t.Fatalf("pending request %d of %d: %v", i+1, maxPending, err)
+		}
+	}
+	if _, err := f.grants.CreatePendingAuthorizationRequest(ctx, request(f.client.ID, time.Now().Add(time.Minute)), maxPending); !errors.Is(err, narvipg.ErrPendingAuthorizationRequestCap) {
+		t.Fatalf("request past the cap: err = %v, want ErrPendingAuthorizationRequestCap", err)
+	}
+	if n := pending(f.client.ID); n != maxPending+2 {
+		t.Fatalf("rows for the client = %d, want %d pending plus the expired and the consumed one: the refused request wrote a row", n, maxPending)
+	}
+	if _, err := f.grants.CreatePendingAuthorizationRequest(ctx, request(other.ID, time.Now().Add(time.Minute)), maxPending); err != nil {
+		t.Fatalf("another client's request while this one is at its cap: %v", err)
+	}
+	var gone pgtype.UUID
+	if err := gone.Scan("00000000-0000-0000-0000-00000000dead"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.grants.CreatePendingAuthorizationRequest(ctx, request(gone, time.Now().Add(time.Minute)), maxPending); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("request for a client that is gone: err = %v, want pgx.ErrNoRows", err)
+	}
+}
+
 // createGrantWithToken inserts a grant plus one access token under it,
 // returning both.
 func (f mcpOAuthFixture) createGrantWithToken(ctx context.Context, t *testing.T, scopes []string, tokenHash string, grantExpires, tokenExpires time.Time) (sqlcgen.McpOauthGrant, sqlcgen.McpOauthAccessToken) {
@@ -110,7 +182,7 @@ func TestMCPOAuthGrantStore_EmptyScopesStoredAsEmptyArray(t *testing.T) {
 		t.Fatalf("principal scopes = %#v, want a non-nil empty slice", p.TokenScopes)
 	}
 
-	req, err := f.grants.CreateAuthorizationRequest(ctx, sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
+	req, err := f.grants.CreatePendingAuthorizationRequest(ctx, sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
 		ClientID:            f.client.ID,
 		RedirectUri:         "http://127.0.0.1/callback",
 		Scopes:              nil,
@@ -118,9 +190,9 @@ func TestMCPOAuthGrantStore_EmptyScopesStoredAsEmptyArray(t *testing.T) {
 		CodeChallengeMethod: "S256",
 		Resource:            "http://127.0.0.1:9/mcp",
 		ExpiresAt:           mcpTS(time.Now().Add(time.Minute)),
-	})
+	}, mcpTestPendingCap)
 	if err != nil {
-		t.Fatalf("CreateAuthorizationRequest with nil scopes: %v", err)
+		t.Fatalf("CreatePendingAuthorizationRequest with nil scopes: %v", err)
 	}
 	if req.Scopes == nil || len(req.Scopes) != 0 {
 		t.Fatalf("request scopes = %#v, want a non-nil empty slice", req.Scopes)
@@ -142,7 +214,7 @@ func TestMCPOAuthGrantStore_AuthorizationRequestBindAndConsume(t *testing.T) {
 
 	newReq := func(expires time.Time) sqlcgen.McpOauthAuthorizationRequest {
 		t.Helper()
-		r, err := f.grants.CreateAuthorizationRequest(ctx, sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
+		r, err := f.grants.CreatePendingAuthorizationRequest(ctx, sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
 			ClientID:            f.client.ID,
 			RedirectUri:         "http://127.0.0.1/callback",
 			Scopes:              []string{"mcp:read"},
@@ -150,9 +222,9 @@ func TestMCPOAuthGrantStore_AuthorizationRequestBindAndConsume(t *testing.T) {
 			CodeChallengeMethod: "S256",
 			Resource:            "http://127.0.0.1:9/mcp",
 			ExpiresAt:           mcpTS(expires),
-		})
+		}, mcpTestPendingCap)
 		if err != nil {
-			t.Fatalf("CreateAuthorizationRequest: %v", err)
+			t.Fatalf("CreatePendingAuthorizationRequest: %v", err)
 		}
 		return r
 	}

@@ -8,10 +8,11 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/narvidev/narvi/internal/adapters/inbound/auth"
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/domain/mcpclient"
 	"github.com/narvidev/narvi/internal/domain/mcpscope"
@@ -38,15 +39,6 @@ func singleParam(q url.Values, name string) (string, bool) {
 		return "", true
 	}
 	return vals[0], true
-}
-
-// foreignKeyViolation is Postgres's SQLSTATE for an insert whose parent
-// row is gone.
-const foreignKeyViolation = "23503"
-
-func isForeignKeyViolation(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == foreignKeyViolation
 }
 
 // storableText reports whether s can be sent to Postgres as TEXT: valid
@@ -147,7 +139,10 @@ func (s *Server) Authorize(w http.ResponseWriter, r *http.Request) {
 	if state != "" {
 		statePtr = &state
 	}
-	row, err := s.deps.Grants.CreateAuthorizationRequest(ctx, sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
+	// Stored under the client's lock, after counting the requests it
+	// already has waiting (technical plan §43.14): at the cap, nothing is
+	// stored and the answer is a page.
+	row, err := s.deps.Grants.CreatePendingAuthorizationRequest(ctx, sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
 		ClientID:            client.ID,
 		RedirectUri:         redirectURI,
 		Scopes:              mcpscope.Strings(scopes),
@@ -156,14 +151,24 @@ func (s *Server) Authorize(w http.ResponseWriter, r *http.Request) {
 		CodeChallengeMethod: "S256",
 		Resource:            s.ids.Resource,
 		ExpiresAt:           pgtype.Timestamptz{Time: time.Now().Add(s.cfg.Timeouts.MCPAuthorizationRequestTTL), Valid: true},
-	})
-	if isForeignKeyViolation(err) {
+	}, s.cfg.Timeouts.MCPMaxPendingAuthorizationRequestsPerClient)
+	if errors.Is(err, pgx.ErrNoRows) {
 		// The client was deleted -- by an administrator, or by the unused-
-		// client sweep -- between the read above and this insert. Its
-		// redirect URI is no longer anyone's: an error page, never a
+		// client sweep -- since the read above: its lock found no row.
+		// Its redirect URI is no longer anyone's: an error page, never a
 		// redirect.
 		logger.Warn("mcpauth: authorize refused", "outcome", "client_deleted", "client_id", client.ClientID)
 		s.renderError(w, r, http.StatusBadRequest, "This app is not registered", "This deployment does not know the app that sent you here.")
+		return
+	}
+	if errors.Is(err, postgres.ErrPendingAuthorizationRequestCap) {
+		// temporarily_unavailable, as a page rather than a redirect: the
+		// cap is a condition of the client's traffic, not of this
+		// request, so the person in the browser -- not the app, which
+		// could only start another request -- is told, and nothing was
+		// stored.
+		logger.Warn("mcpauth: authorize refused", "outcome", "pending_request_cap", "client_id", client.ClientID)
+		s.renderError(w, r, http.StatusServiceUnavailable, "This app has too many sign-ins waiting", "Too many requests to authorize this app are waiting for a decision right now. Wait a few minutes, then start again from the app.")
 		return
 	}
 	if err != nil {
