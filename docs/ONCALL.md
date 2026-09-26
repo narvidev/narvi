@@ -44,8 +44,15 @@ open it directly — every alert this system can raise is a row there,
 next to the runbook that backs it and, where one exists, the §9.3
 resilience scenario that reproduces it.
 
-**Two entries in that table have no alert behind them** (nothing pages
-for either — each is a routine admin procedure, not a failure mode).
+**Three entries in that table have no alert behind them** (nothing pages
+for any of them). Two are routine admin procedures, not failure modes:
+cutting off an MCP client and signing-key rotation, both below. The third
+is a failure mode that no metric reports yet: **sandbox capability
+refusals** — a session refused `422` because its `docker` or egress-policy
+requirement is one the configured provider cannot honor, or a sandbox
+refused at every dispatch and never spawning. Nothing pages for it; it is
+found only through the symptom someone reports. See
+[sandbox-capability-refusals.md](runbooks/sandbox-capability-refusals.md).
 
 **Cutting off an MCP client** — an editor plugin or assistant connected
 through Narvi's own OAuth authorization server that must stop acting for
