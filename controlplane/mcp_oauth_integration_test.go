@@ -24,14 +24,17 @@
 // routers: with the shipped defaults, dynamic registration answers the
 // disabled response and is not advertised, while metadata documents are;
 // the SDK client identifying itself by a metadata document on an in-test
-// HTTPS server is refused by the production fetch guard before a packet
-// reaches that server, and completes the whole flow on a router whose
+// HTTPS server is refused by the production fetch guard before a single
+// connection reaches that server -- counted, and the refusal's logged cause
+// is the guard's own -- and completes the whole flow on a router whose
 // guard was built with the one test seam allowing that server's exact
 // address -- the consent page naming the document's host first; with
 // dynamic registration on, the SDK registers itself and completes the flow
-// too; registration is braked per client address; and with metadata
-// documents off, an https client_id is unknown and a stored
-// metadata-document client's token stops on its next call.
+// too; registration is braked per client network; and with either
+// mechanism switched off, on a router serving the very resource both
+// clients' live tokens were issued for, that mechanism's token stops on
+// its next call while the other's still works (and with metadata
+// documents off, an https client_id is unknown).
 //
 // With the surface OFF, the discovery documents and every /oauth route
 // answer the documented disabled response (§43.11/§43.14), while the
@@ -43,11 +46,14 @@
 package controlplane
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -1028,11 +1034,16 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 	// The production guard: the official SDK client identifying itself by
 	// a metadata document on loopback is refused before a single packet
 	// reaches the document's server -- a page, never a redirect -- and
-	// nothing is stored.
+	// nothing is stored. Proven by its CAUSE, not only its outcome: this
+	// rig's fetcher trusts only the system roots, so a guard that let the
+	// dial through would fail the same way one step later, at the TLS
+	// handshake. No connection is ever accepted, and every refusal logged
+	// names the guard's own error.
 	t.Run("MetadataDocument_ProductionGuardRefusesLoopback", func(t *testing.T) {
 		ctx := oauthTestCtx(t)
 		member, cookie := createRouterUser(ctx, t, rig.pool, sqlcgen.UserRoleMember)
-		before := doc.hits.Load()
+		logs := captureWarnings(t)
+		hitsBefore, connsBefore := doc.hits.Load(), doc.conns.Load()
 		flow, err := rig.dialSDKClient(ctx, t, member, cookie, nil, doc.register)
 		if err == nil {
 			t.Fatal("the SDK client connected through a metadata document on loopback")
@@ -1041,8 +1052,20 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		if n := flow.driver.calls.Load(); n < 1 || !strings.Contains(err.Error(), "status 400") {
 			t.Fatalf("authorization attempts %d, err %v; want each refused with a 400 page", n, err)
 		}
-		if doc.hits.Load() != before {
+		if n := doc.conns.Load() - connsBefore; n != 0 {
+			t.Fatalf("the production fetcher opened %d connections to the loopback document server, want none", n)
+		}
+		if doc.hits.Load() != hitsBefore {
 			t.Fatal("the production fetcher reached the loopback document server")
+		}
+		refusals := logs.matching("mcpauth: authorize refused", "outcome", "metadata_document_unusable")
+		if len(refusals) == 0 {
+			t.Fatal("no refused metadata document was logged")
+		}
+		for _, e := range refusals {
+			if cause, _ := e["error"].(string); !strings.Contains(cause, cimdfetch.ErrForbiddenAddress.Error()) {
+				t.Errorf("a refusal was caused by %q, want the guard's own %q", cause, cimdfetch.ErrForbiddenAddress)
+			}
 		}
 		if n := rig.countClients(t, doc.clientID); n != 0 {
 			t.Fatalf("%d clients stored for a document the guard refused", n)
@@ -1050,7 +1073,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 	})
 
 	cimdRig := newOAuthRouterRigWith(t, pool, map[string]string{"NARVI_MCP_DCR_ENABLED": "true"}, doc.seam())
-	var cimdToken string
+	var cimdToken, dcrToken string
 
 	// A client identified by a metadata document, end to end through the
 	// official SDK (which prefers it once the metadata advertises it): the
@@ -1083,8 +1106,8 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 				t.Errorf("consent page lacks %q", want)
 			}
 		}
-		if doc.hits.Load() == 0 {
-			t.Fatal("the document server was never reached")
+		if doc.hits.Load() == 0 || doc.conns.Load() == 0 {
+			t.Fatalf("the document server was reached by %d connections and %d requests, want both: the counters must see what the production guard is proven to prevent", doc.conns.Load(), doc.hits.Load())
 		}
 		var kind string
 		var grants int
@@ -1122,6 +1145,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		if res, err := callListModels(ctx, flow.session); err != nil || res.IsError {
 			t.Fatalf("CallTool narvi_list_models: res %+v err %v", res, err)
 		}
+		dcrToken = flow.recorder.lastBearer()
 		if page := flow.driver.lastPage(); !strings.Contains(page, "This app registered itself with this deployment, so nothing vouches for its name.") {
 			t.Error("the consent page does not say the app registered itself")
 		}
@@ -1160,11 +1184,24 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		}
 	})
 
+	// Each mechanism switched off, on a router serving cimdRig's own
+	// public base URL -- so its resource is the one both live tokens were
+	// issued for, and the mechanism switch is the only thing that can
+	// refuse either: each router accepts the token of the mechanism it
+	// kept and refuses the other's on its very next call.
+	sameResource := map[string]string{"NARVI_PUBLIC_BASE_URL": cimdRig.cfg.PublicBaseURL}
+	offCIMD := newOAuthRouterRigWith(t, pool, withEnv(sameResource, "NARVI_MCP_CIMD_ENABLED", "false", "NARVI_MCP_DCR_ENABLED", "true"), doc.seam())
+	offDCR := newOAuthRouterRigWith(t, pool, withEnv(sameResource, "NARVI_MCP_CIMD_ENABLED", "true", "NARVI_MCP_DCR_ENABLED", "false"), doc.seam())
+	for _, r := range []*oauthRouterRig{offCIMD, offDCR} {
+		if r.cfg.PublicBaseURL != cimdRig.cfg.PublicBaseURL {
+			t.Fatalf("an off-flag router serves %s, want cimdRig's own %s", r.cfg.PublicBaseURL, cimdRig.cfg.PublicBaseURL)
+		}
+	}
+
 	// Metadata documents switched off: the metadata stops advertising them,
 	// an https client_id is an unknown client (no fetch at all), and a
 	// metadata-document client already stored -- with a live token -- is
 	// refused on its very next call.
-	offCIMD := newOAuthRouterRigWith(t, pool, map[string]string{"NARVI_MCP_CIMD_ENABLED": "false"}, doc.seam())
 	t.Run("MetadataDocuments_Disabled", func(t *testing.T) {
 		if _, present := offCIMD.authorizationServerMetadata(t)["client_id_metadata_document_supported"]; present {
 			t.Error("client_id_metadata_document_supported advertised while metadata documents are off")
@@ -1179,11 +1216,89 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		if rec.Code != http.StatusBadRequest || rec.Header().Get("Location") != "" || doc.hits.Load() != before {
 			t.Fatalf("authorize with an https client_id while off: status %d Location %q, fetched %v; want a 400 page, no fetch", rec.Code, rec.Header().Get("Location"), doc.hits.Load() != before)
 		}
-		if cimdToken == "" {
-			t.Fatal("no metadata-document token from EndToEnd_SDKClient_MetadataDocument")
+		if cimdToken == "" || dcrToken == "" {
+			t.Fatal("no metadata-document or dynamic-client token from the end-to-end subtests")
 		}
+		offCIMD.acceptedCall(t, dcrToken)
 		offCIMD.revokedCallFails(t, cimdToken)
 	})
+
+	// Dynamic registration switched off: a dynamically registered client
+	// already stored -- with a live token -- is refused on its very next
+	// call, while a metadata-document client's token still works.
+	t.Run("DynamicRegistration_Disabled", func(t *testing.T) {
+		if _, present := offDCR.authorizationServerMetadata(t)["registration_endpoint"]; present {
+			t.Error("registration_endpoint advertised while dynamic registration is off")
+		}
+		offDCR.acceptedCall(t, cimdToken)
+		offDCR.revokedCallFails(t, dcrToken)
+	})
+}
+
+// withEnv is base plus the name/value pairs kv, in a new map.
+func withEnv(base map[string]string, kv ...string) map[string]string {
+	out := make(map[string]string, len(base)+len(kv)/2)
+	for k, v := range base {
+		out[k] = v
+	}
+	for i := 0; i+1 < len(kv); i += 2 {
+		out[kv[i]] = kv[i+1]
+	}
+	return out
+}
+
+// acceptedCall asserts token is accepted at /mcp: a raw tools/call answers
+// 200.
+func (r *oauthRouterRig) acceptedCall(t *testing.T, token string) {
+	t.Helper()
+	body := `{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"narvi_list_models","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`
+	if status, _, raw := r.postMCP(t, "tools/call", "narvi_list_models", body, token); status != http.StatusOK {
+		t.Fatalf("call with a live token of a mechanism still on: status %d body %s, want 200", status, raw)
+	}
+}
+
+// warningLog records every Warn-or-above log line written while it is
+// installed as the default logger, decoded.
+type warningLog struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *warningLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+// captureWarnings installs a warningLog as the default logger -- the one
+// platform.Logger hands every handler -- until the calling test ends.
+// TestOAuth_ProductionRouter's subtests run one at a time, so nothing else
+// logs through it meanwhile.
+func captureWarnings(t *testing.T) *warningLog {
+	t.Helper()
+	l := &warningLog{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(l, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return l
+}
+
+// matching returns the recorded entries with message msg whose field
+// key is value.
+func (l *warningLog) matching(msg, key, value string) []map[string]any {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(l.buf.String()), "\n") {
+		var e map[string]any
+		if json.Unmarshal([]byte(line), &e) != nil {
+			continue
+		}
+		if e["msg"] == msg && e[key] == value {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // metadataDocumentServer is an in-test HTTPS server on loopback serving
@@ -1193,7 +1308,11 @@ type metadataDocumentServer struct {
 	clientID string
 	addr     netip.AddrPort
 	roots    *x509.CertPool
-	hits     atomic.Int32
+	// hits counts requests served; conns counts TCP connections accepted,
+	// handshake or not -- what "no packet reached the server" is measured
+	// by.
+	hits  atomic.Int32
+	conns atomic.Int32
 }
 
 func newMetadataDocumentServer(t *testing.T) *metadataDocumentServer {
@@ -1214,6 +1333,11 @@ func newMetadataDocumentServer(t *testing.T) *metadataDocumentServer {
 			"token_endpoint_auth_method": "none",
 		})
 	}))
+	d.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			d.conns.Add(1)
+		}
+	}
 	d.StartTLS()
 	t.Cleanup(d.Close)
 	d.clientID = d.URL + "/mcp/client.json"
