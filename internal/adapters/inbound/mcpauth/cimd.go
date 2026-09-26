@@ -40,7 +40,8 @@ func (s *Server) resolveClient(w http.ResponseWriter, r *http.Request, clientID 
 }
 
 // metadataDocumentClient resolves a metadata-document client (technical
-// plan §43.15). A cached document still fresh is used as stored. Otherwise
+// plan §43.15). A cached document still fresh -- or one whose client an
+// operator disabled, which is never fetched for again -- is used as stored. Otherwise
 // the document is fetched through the SSRF-guarded fetcher and validated
 // (mcpclient.ParseMetadataDocument: its client_id must be clientIDURL
 // byte for byte), and the client row is created or refreshed with it,
@@ -85,6 +86,12 @@ func (s *Server) metadataDocumentClient(w http.ResponseWriter, r *http.Request, 
 		logger.Error("mcpauth: authorize: an https client_id belongs to a client of another kind", "client_id", clientIDURL, "kind", cached.Kind)
 		s.renderError(w, r, http.StatusBadRequest, "This app is not available", "This deployment cannot use the app that sent you here.")
 		return sqlcgen.McpOauthClient{}, false
+	}
+	if found && cached.DisabledAt.Valid {
+		// An operator disabled this client: the caller refuses it
+		// (clientUsable), and no request is made on its behalf, however
+		// stale its cached document.
+		return cached, true
 	}
 	now := time.Now()
 	if found && s.metadataFresh(cached, now) {

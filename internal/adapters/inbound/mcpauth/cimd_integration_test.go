@@ -135,6 +135,23 @@ func TestCIMD_AuthorizationEndpoint(t *testing.T) {
 		p.Set("redirect_uri", "https://attacker.test/cb")
 		assertPageNotRedirect(t, "unregistered redirect_uri", r.authorize(p, cookie))
 	})
+
+	// An operator disabled the client: refused with a page, and its
+	// document is not fetched again however stale its cache.
+	t.Run("a disabled client is refused without a fetch", func(t *testing.T) {
+		const disabledURL = "https://disabled.example/client.json"
+		r.documents.set(disabledURL, fakeDocument{body: metadataDocument(disabledURL, "Disabled Plugin", loopbackRedirect)})
+		r.startConsent(t, forClient(r.authorizeParams(newVerifier(t)), disabledURL), cookie)
+		if _, err := r.pool.Exec(context.Background(), `UPDATE mcp_oauth_clients SET disabled_at = now() WHERE client_id = $1`, disabledURL); err != nil {
+			t.Fatal(err)
+		}
+		r.staleDocument(t, disabledURL)
+		before := r.documents.count(disabledURL)
+		assertPageNotRedirect(t, "disabled client", r.authorize(forClient(r.authorizeParams(newVerifier(t)), disabledURL), cookie))
+		if n := r.documents.count(disabledURL); n != before {
+			t.Fatalf("fetches for a disabled client = %d, want still %d", n, before)
+		}
+	})
 }
 
 // TestCIMD_ClientIDMismatchRejectedAtAuthorization: at the authorization
