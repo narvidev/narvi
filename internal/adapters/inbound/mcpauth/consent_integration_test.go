@@ -194,9 +194,9 @@ func TestConsent_NoNonASCIIHostReachesThePage(t *testing.T) {
 		redirect       string // the document's one redirect URI, and the request's
 		fetched        bool
 	}{
-		{"a percent-encoded Cyrillic look-alike client_id", "https://%D0%B0pple.example/mcp/client.json", loopbackRedirect, false},
+		{"a percent-encoded Cyrillic look-alike client_id", "https://%D0%B0lpha.example/mcp/client.json", loopbackRedirect, false},
 		{"a percent-encoded right-to-left override client_id", "https://%E2%80%AEtset.elpmaxe/x", loopbackRedirect, false},
-		{"a document registering a percent-encoded look-alike redirect URI", "https://lookalike.example/mcp/client.json", "https://%D0%B0pple.example/cb", true},
+		{"a document registering a percent-encoded look-alike redirect URI", "https://lookalike.example/mcp/client.json", "https://%D0%B0lpha.example/cb", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r.documents.set(tc.clientID, fakeDocument{body: metadataDocument(tc.clientID, "Editor", tc.redirect)})
@@ -215,16 +215,16 @@ func TestConsent_NoNonASCIIHostReachesThePage(t *testing.T) {
 	}
 
 	t.Run("the same host in its xn-- form is shown exactly so", func(t *testing.T) {
-		const clientID, redirect = "https://xn--pple-43d.example/mcp/client.json", "https://xn--pple-43d.example/cb"
+		const clientID, redirect = "https://xn--lpha-43d.example/mcp/client.json", "https://xn--lpha-43d.example/cb"
 		r.documents.set(clientID, fakeDocument{body: metadataDocument(clientID, "Editor", redirect)})
 		p := forClient(r.authorizeParams(newVerifier(t)), clientID)
 		p.Set("redirect_uri", redirect)
 		rec, _ := r.renderConsent(t, r.startConsent(t, p, cookie), cookie)
 		body := rec.Body.String()
 		for _, want := range []string{
-			`<title>Allow the app at xn--pple-43d.example? - Narvi</title>`,
-			`<h1>Allow the app at <strong class="host">xn--pple-43d.example</strong> to use Narvi as you?</h1>`,
-			`sent back to <strong>xn--pple-43d.example</strong>`,
+			`<title>Allow the app at xn--lpha-43d.example? - Narvi</title>`,
+			`<h1>Allow the app at <strong class="host">xn--lpha-43d.example</strong> to use Narvi as you?</h1>`,
+			`sent back to <strong>xn--lpha-43d.example</strong>`,
 		} {
 			if !strings.Contains(body, want) {
 				t.Errorf("consent page lacks %q", want)
@@ -239,7 +239,7 @@ func TestConsent_NoNonASCIIHostReachesThePage(t *testing.T) {
 	t.Run("a row planted past validation is refused, never shown", func(t *testing.T) {
 		ctx := context.Background()
 		now := time.Now()
-		const plantedID, plantedRedirect = "https://%D0%B0pple.example/planted.json", "https://%D0%B0pple.example/cb"
+		const plantedID, plantedRedirect = "https://%D0%B0lpha.example/planted.json", "https://%D0%B0lpha.example/cb"
 		planted, err := r.clients.UpsertMetadataDocument(ctx, sqlcgen.UpsertMCPOAuthMetadataDocumentClientParams{
 			ClientID: plantedID, ClientName: "Editor", RedirectUris: []string{plantedRedirect},
 			MetadataFetchedAt: pgtype.Timestamptz{Time: now, Valid: true},

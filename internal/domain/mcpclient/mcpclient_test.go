@@ -31,8 +31,8 @@ func TestValidateRedirectURI(t *testing.T) {
 		{"https:client.example", false},              // opaque
 		{"https://client.example/c b", false},        // space
 		{"https://client.example/caf\u00e9", false},  // non-ASCII
-		{"https://%D0%B0pple.example/cb", false},     // ASCII as written, a Cyrillic host once parsed
-		{"https://xn--pple-43d.example/cb", true},    // the same host in its xn-- form
+		{"https://%D0%B0lpha.example/cb", false},     // ASCII as written, a Cyrillic host once parsed
+		{"https://xn--lpha-43d.example/cb", true},    // the same host in its xn-- form
 		{"https://client.example/cb\x00", false},     // control
 		{"http://127.0.0.1:0/cb", false},             // port 0
 		{"http://127.0.0.1:99999/cb", false},         // port out of range
@@ -175,8 +175,8 @@ func TestValidateClientURI(t *testing.T) {
 		{"javascript:alert(1)", false},
 		{"https://user@client.example", false},
 		{"https://client.example/a b", false},
-		{"https://%D0%B0pple.example", false},
-		{"https://xn--pple-43d.example", true},
+		{"https://%D0%B0lpha.example", false},
+		{"https://xn--lpha-43d.example", true},
 		{"", false},
 	}
 	for _, tc := range tests {

@@ -78,9 +78,9 @@ var (
 //
 // A raw-byte check alone is not enough: url.Parse decodes a
 // percent-encoded byte of 0x80 or above in a host, so
-// "https://%D0%B0pple.example/" -- ASCII as written -- parses to a host
+// "https://%D0%B0lpha.example/" -- ASCII as written -- parses to a host
 // beginning with a Cyrillic letter, which net/http then converts to its
-// IDNA ASCII form (xn--pple-43d.example) to resolve, dial and verify.
+// IDNA ASCII form (xn--lpha-43d.example) to resolve, dial and verify.
 // Shown decoded, that host reads as another one while the request goes to
 // a third. With this rule the host every page shows -- the consent
 // page's identity headline, its redirect line, the homepage line, the

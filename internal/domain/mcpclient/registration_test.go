@@ -176,7 +176,7 @@ func TestValidateClientIDURL(t *testing.T) {
 		{"https://client.example/client.json?v=2", true},
 		{"https://127.0.0.1:8443/client.json", true}, // the fetch guard, not this rule, refuses loopback
 		{"https://xn--bcher-kva.example/client.json", true},
-		{"https://%D0%B0pple.example/client.json", false}, // ASCII as written, a Cyrillic host once parsed
+		{"https://%D0%B0lpha.example/client.json", false}, // ASCII as written, a Cyrillic host once parsed
 		{"https://client.example", false},
 		{"https://client.example/", false},
 		{"http://client.example/client.json", false},
@@ -211,9 +211,9 @@ func TestValidateClientIDURL(t *testing.T) {
 // every host a page shows is the very string a fetch resolves and dials
 // (technical plan §43.15). Go's url.Parse decodes a percent-encoded byte
 // of 0x80 or above in a host, and net/http then dials that host's xn--
-// form: "https://%D0%B0pple.example/" would be SHOWN as a Cyrillic
+// form: "https://%D0%B0lpha.example/" would be SHOWN as a Cyrillic
 // look-alike of a Latin host while the document came from
-// xn--pple-43d.example. Each row -- a look-alike, a right-to-left
+// xn--lpha-43d.example. Each row -- a look-alike, a right-to-left
 // override, a whole-script look-alike, a percent-encoded ASCII byte, an
 // IPv6 zone -- is refused BECAUSE its authority is percent-encoded, by
 // the validator, by the document and registration parsers, and yields no
@@ -223,10 +223,10 @@ func TestHostsWrittenInPlainASCII(t *testing.T) {
 	for _, tc := range []struct {
 		name, host string // host: what the URIs below put in their authority
 	}{
-		{"a percent-encoded Cyrillic look-alike", "%D0%B0pple.example"},
+		{"a percent-encoded Cyrillic look-alike", "%D0%B0lpha.example"},
 		{"a percent-encoded right-to-left override", "%E2%80%AEtset.elpmaxe"},
-		{"a percent-encoded look-alike with a port", "%D0%B0pple.example:8443"},
-		{"a whole-script look-alike", "%D0%B0%D1%80%D1%80%D3%8F%D0%B5.example"},
+		{"a percent-encoded look-alike with a port", "%D0%B0lpha.example:8443"},
+		{"a whole-script look-alike", "%D1%95%D1%80%D0%B0%D1%81%D0%B5.example"},
 		{"a percent-encoded percent sign", "client%25example"},
 		{"an IPv6 zone", "[fe80::1%25en0]"},
 	} {
@@ -269,7 +269,7 @@ func TestHostsWrittenInPlainASCII(t *testing.T) {
 
 	// The same hosts written in their xn-- form are accepted, and shown
 	// exactly as written: plain ASCII, the string a fetch resolves.
-	for _, host := range []string{"xn--pple-43d.example", "xn--80ak6aa92e.example", "client.example"} {
+	for _, host := range []string{"xn--lpha-43d.example", "xn--80ak5af1h.example", "client.example"} {
 		for _, got := range []string{
 			mcpclient.IdentityHost("https://" + host + "/mcp/client.json"),
 			mcpclient.RedirectHost("https://" + host + "/cb"),
