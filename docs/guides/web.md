@@ -375,8 +375,10 @@ itself. An app an administrator of this deployment registered says so under
 its name. An app that identifies itself by the web address of its own
 description (a client ID metadata document) is headed by that address's
 host — the one thing about it the app cannot make up, since Narvi read the
-description from there — with the name it chose shown second; check that
-host before you allow it. An app that registered itself (possible only when
+description from that very host, following no redirect to any other — with
+the name it chose shown second; check that host before you allow it. A host
+with non-Latin letters is always shown in its `xn--` form, exactly as Narvi
+looks it up, never as letters that could pass for another host's. An app that registered itself (possible only when
 the deployment turns dynamic registration on) says so: nothing vouches for
 its name. The page also shows the host your browser is sent back to — with
 a warning when that is your own computer — and one checkbox per kind of
@@ -439,10 +441,13 @@ themselves only if it sets `NARVI_MCP_DCR_ENABLED=true`; switching either
 off disconnects every app it let in, on that app's next call. Narvi never
 reads an app's description from this machine or a private network address,
 and an app whose description cannot be read, or names any address but its
-own, is shown an error page the first time — later, while its host is
-down, the description Narvi last read keeps being used for up to an hour
-more. Narvi trusts a description it read for at most an hour before
-reading it again; a change to it affects only approvals made afterwards.
+own, is shown an error page the first time. Narvi trusts a description it
+read for at most an hour before reading it again; a change to it affects
+only approvals made afterwards. If that re-read fails — the host down, the
+description gone or no longer valid — the description Narvi last read keeps
+being used for one more hour from that first failure, and no longer: after
+that the app is shown an error page until its description can be read
+again.
 Disconnecting deletes the authorization outright, and deleting a client
 deletes every authorization issued to it — there is no "paused" state.
 An app registered with a redirect address that does not match exactly
