@@ -52,6 +52,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -1273,14 +1274,43 @@ func (l *warningLog) Write(p []byte) (int, error) {
 // captureWarnings installs a warningLog as the default logger -- the one
 // platform.Logger hands every handler -- until the calling test ends.
 // TestOAuth_ProductionRouter's subtests run one at a time, so nothing else
-// logs through it meanwhile.
+// logs through it meanwhile. The cleanup puts back the standard log
+// package's output and flags as well as slog's default: slog.SetDefault
+// points the log package at the handler it installs, and setting the
+// original default back does not undo that -- every later line of the
+// test binary, slog's included, would go on into the dead capture
+// handler, which drops it.
 func captureWarnings(t *testing.T) *warningLog {
 	t.Helper()
 	l := &warningLog{}
-	prev := slog.Default()
+	prev, prevOutput, prevFlags := slog.Default(), log.Writer(), log.Flags()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(l, &slog.HandlerOptions{Level: slog.LevelWarn})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevOutput)
+		log.SetFlags(prevFlags)
+	})
 	return l
+}
+
+// TestCaptureWarnings_RestoresTheStandardLogger: once the test that
+// captured warnings ends, logging is as it was -- slog's default, the
+// standard log package's output and flags -- and a line logged then
+// reaches that output.
+func TestCaptureWarnings_RestoresTheStandardLogger(t *testing.T) {
+	prev, prevOutput, prevFlags := slog.Default(), log.Writer(), log.Flags()
+	t.Run("capturing", func(t *testing.T) { captureWarnings(t) })
+	if slog.Default() != prev || log.Writer() != prevOutput || log.Flags() != prevFlags {
+		t.Fatalf("after the capture: slog default restored %v, log output %T (was %T), flags %d (were %d)",
+			slog.Default() == prev, log.Writer(), prevOutput, log.Flags(), prevFlags)
+	}
+	var out bytes.Buffer
+	log.SetOutput(&out)
+	defer log.SetOutput(prevOutput)
+	slog.Warn("logged after the capture")
+	if !strings.Contains(out.String(), "logged after the capture") {
+		t.Fatalf("a warning logged after the capture never reached the log output: %q", out.String())
+	}
 }
 
 // matching returns the recorded entries with message msg whose field
