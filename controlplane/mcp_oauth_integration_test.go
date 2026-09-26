@@ -104,6 +104,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/cimdfetch"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/domain/authz"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -845,9 +846,10 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 	// member's behalf, and the very next call through the member's SDK
 	// session is refused -- 401 invalid_token, the SDK's one Authorize retry
 	// declined -- and the refresh token refreshes nothing. Before that: no
-	// other role may list or revoke through the admin routes (403, the
-	// member included), and the grant under any other user's path is a 404
-	// that leaves the member's token working.
+	// other role may list or revoke through the admin routes -- every role
+	// authz.AllRoles names but admin gets 403, the member themselves for
+	// theirs and a new user for each other -- and the grant under any other
+	// user's path is a 404 that leaves the member's token working.
 	t.Run("RevokedAuthorizationStopsOnNextCall_Admin", func(t *testing.T) {
 		ctx := oauthTestCtx(t)
 		flow := rig.connectSDKClient(ctx, t, func(d *consentDriver) {
@@ -866,8 +868,15 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		}
 		grantID := list.Authorizations[0].Id
 
-		_, maintainerCookie := createRouterUser(ctx, t, rig.pool, sqlcgen.UserRoleMaintainer)
-		for who, cookie := range map[string]string{"the member": flow.cookie, "a maintainer": maintainerCookie} {
+		for _, role := range authz.AllRoles {
+			if role == authz.RoleAdmin {
+				continue
+			}
+			who, cookie := "the member", flow.cookie
+			if role != authz.Role(flow.member.Role) {
+				who = "a " + string(role)
+				_, cookie = createRouterUser(ctx, t, rig.pool, sqlcgen.UserRole(role))
+			}
 			if status := rig.doJSON(t, http.MethodGet, memberPath, nil, nil, cookie); status != http.StatusForbidden {
 				t.Fatalf("%s listing through the admin route: status %d, want 403", who, status)
 			}
