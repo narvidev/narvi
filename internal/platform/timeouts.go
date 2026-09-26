@@ -3111,8 +3111,10 @@ type Timeouts struct {
 	// counted from the latest of its registration, its last successful
 	// fetch and the end of the time its cached document may be used (a
 	// failed re-fetch's grace included). Pre-registered clients, and
-	// clients an operator disabled, are never swept. It is what bounds the
-	// table growth an unauthenticated registration can cause. 24 hours.
+	// clients an operator disabled, are never swept. It bounds how long a
+	// client an unauthenticated registration created outlives its last use,
+	// not how many such clients there are: only the brakes limit that, per
+	// network (technical plan §43.14). 24 hours.
 	MCPDynamicClientUnusedTTL time.Duration
 
 	// MCPRegisterRateInterval is the refill interval of the per-network
@@ -3174,8 +3176,11 @@ type Timeouts struct {
 	// client is refused with a page, storing nothing, until one of them is
 	// decided or expires (MCPAuthorizationRequestTTL). Unlike the in-memory
 	// brakes above, a bound Postgres enforces, whatever the number of
-	// replicas or of networks the requests come from. A count, kept beside
-	// the TTL that bounds how long each request waits. 100.
+	// replicas or of networks the requests come from -- on one client's
+	// requests, not on the table: while metadata documents or dynamic
+	// registration let a party mint clients, each new one starts with an
+	// empty cap (technical plan §43.14). A count, kept beside the TTL that
+	// bounds how long each request waits. 100.
 	MCPMaxPendingAuthorizationRequestsPerClient int
 }
 

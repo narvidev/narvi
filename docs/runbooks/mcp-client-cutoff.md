@@ -144,8 +144,15 @@ listed and revoked.
 - **"This app has too many sign-ins waiting" (503):** the client already has
   `MCPMaxPendingAuthorizationRequestsPerClient` (100) authorization requests
   waiting for a decision (§43.14). Each expires ten minutes after it was made.
-  A sustained flood of requests for one client keeps it at the cap -- the cap
-  bounds the table, not who fills it. Each request the cap refuses is logged
+  A sustained flood of requests for one client keeps it at the cap. The cap
+  bounds how many requests one client has waiting, not who fills them, and
+  not the table (§43.14): while metadata documents or dynamic registration
+  are on, a flood can name a new client each time -- another URL on a host
+  it serves documents from, or a fresh registration -- each with an empty
+  cap, and only the ten-minute expiry and the hourly expired-credential
+  sweep limit how long each request stays. Switching the mechanism off
+  (**Every client of one registration mechanism**, above) is the only hard
+  bound. Each request the cap refuses is logged
   once, at WARN: `mcpauth: authorize refused` with
   `outcome=pending_request_cap`, the `client_id`, and `client_address` -- the
   network of the request that was refused, by the brakes' own key (one IPv4
