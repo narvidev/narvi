@@ -24,7 +24,9 @@
 //     holds the cloud metadata address), CGNAT shared space, multicast,
 //     unspecified, documentation, benchmarking and every other
 //     special-purpose block, and the IPv4-mapped and NAT64-embedded IPv6
-//     forms of each (addressPolicy has the list).
+//     forms of each. guard.go has the list: refusedIPv4, the global
+//     unicast globalIPv6 minus refusedIPv6, and nat64 for the embedded
+//     form, all applied by checkAddr.
 //   - https only, on the first request and every redirect: never a
 //     downgrade to http, never another scheme. At most MaxRedirects
 //     redirects, each within the first URL's own origin (scheme, host,
