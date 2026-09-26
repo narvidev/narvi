@@ -7102,16 +7102,23 @@ switch the bearer check honors on every call.
 The redirect URI rule (`internal/domain/mcpclient`) is enforced identically at registration and at
 authorization, so the consent page can never see a URI that could not have been registered: `https://`
 with any host; `http://` only on the loopback IP literals `127.0.0.1` and `[::1]` or on `localhost`; no
-other scheme, no fragment, no userinfo, printable ASCII only. Matching is exact string comparison, with
+other scheme, no fragment, no userinfo, printable ASCII only, and the host written in plain ASCII — no
+percent sign in the authority, the parsed host exactly the bytes written — so an internationalized host
+is registered, matched and shown in its `xn--` form, never decoded into a look-alike (the same rule holds
+for a pre-registered client's homepage URI and for a metadata-document `client_id`). Matching is exact string comparison, with
 the one exception RFC 8252 §7.3 requires for native clients: for a registered loopback IP literal, the
 presented port is ignored (everything else must still be identical). `localhost` gets no such exception.
 
 **Client ID metadata documents** (`NARVI_MCP_CIMD_ENABLED`, on by default — the mechanism the current MCP
 authorization specification recommends, and the one a client with no prior relationship prefers). A
 `client_id` that is an `https://` URL with a path identifies its client by the JSON document at that
-URL. The URL must be printable ASCII — so an internationalized host is only ever seen in its `xn--` form
-— with a host and a path other than `/`, and no userinfo, fragment or dot segment; it is the client's
-identity and is compared byte for byte, never normalized. The authorization endpoint is the only place a
+URL. The URL must be printable ASCII with its host written in plain ASCII — no percent sign in the
+authority, the parsed host exactly the bytes written — so an internationalized host is only ever seen,
+and shown, in its `xn--` form, the very string the fetch resolves: Go's URL parser decodes a
+percent-encoded byte of `0x80` or above in a host, so `https://%D0%B0pple.example/` would otherwise be
+shown as a Cyrillic look-alike of a Latin host while the fetch dialled `xn--pple-43d.example`. It has a
+host and a path other than `/`, and no userinfo, fragment or dot segment; it is the client's identity and
+is compared byte for byte, never normalized. The authorization endpoint is the only place a
 document is fetched, and only through `internal/adapters/outbound/cimdfetch`, whose one constructor
 builds the guarded HTTP client it requires (a fetcher built without one refuses every fetch). The URL
 comes from an unauthenticated request, so the guard assumes it is aimed at the deployment's own network:
@@ -7121,7 +7128,10 @@ exact address the socket is about to reach, after resolution, and refused if it 
 unspecified, documentation, benchmarking or any other special-purpose block, or the IPv4-mapped or
 NAT64-embedded form of one. Keep-alives are off, so every request resolves and is checked afresh, and a
 DNS answer that changes between two dials (rebinding) is refused on the second. `https` only, never a
-downgrade and never another scheme on a redirect; at most three redirects; no proxy from the environment
+downgrade and never another scheme on a redirect; at most three redirects, each within the URL's own
+origin — scheme, host and port — so the document is served by the host the consent page names, and an
+open redirect on one host can never lend its name to a document served by another; no proxy from the
+environment
 (a proxy would dial out of the guard's reach); `200` with `Content-Type: application/json` only; at most
 64 KiB (one byte more is read, and refused); one timeout, `MCPClientMetadataFetchTimeout`, for the whole
 fetch.
@@ -7134,10 +7144,15 @@ a document cannot claim another client's identity. The client row is then create
 shorten it (`max-age`, or zero for `no-store`/`no-cache`), never extend it — a deliberate narrowing of
 the specification's "respect cache headers", so a document that withdraws a redirect URI is seen within
 the hour whatever its host says. A document that cannot be fetched or used the first time it is needed
-refuses the authorization with an error page, never a redirect. A stale document whose re-fetch fails —
-the host down, or the new document invalid — is kept for one more `MCPClientMetadataCacheTTL` and
-logged, so a document host that is down neither breaks every authorization nor is asked again on each
-one. A disabled client's document is never fetched again. **A re-fetch changes what the next
+refuses the authorization with an error page, never a redirect. The first failed re-fetch of a stale
+document since its last successful fetch — the host down, the document withdrawn, or the new document
+invalid — is recorded, and the cached document is kept for one more `MCPClientMetadataCacheTTL` measured
+from that failure, and logged, so a document host that is down neither breaks every authorization at once
+nor is asked again on each one. A later failure neither restarts nor extends that grace: past it, the
+authorization is refused with an error page, never a redirect, until a fetch succeeds, which clears the
+failure — a document withdrawn, or replaced by one this deployment refuses, is never trusted
+indefinitely. A failure is recorded only on the row as it was read, so it never overrides the shorter
+lifetime a newer successful fetch set. A disabled client's document is never fetched again. **A re-fetch changes what the next
 authorization sees and nothing else:** every request, code, access token and refresh chain already
 issued carries its own redirect URI, scopes and resource (§43.16), and none of them re-reads the
 client's, so a code issued before the document changed its redirect URIs still exchanges only for the
@@ -7148,8 +7163,9 @@ default — an unauthenticated table write whose client name nothing verifies, a
 specification deprecates, needed only by clients that can use neither a metadata document nor a
 pre-registered `client_id`). The JSON request is validated by the rules both self-registration paths
 share: `client_name` present, trimmed, 1 to 100 printable characters (no control, format —
-bidirectional overrides, zero-width characters — or otherwise unprintable character, the rule
-pre-registration applies too); `redirect_uris` present, non-empty, each registrable under the redirect
+bidirectional overrides, zero-width characters — or otherwise unprintable character, and at most three
+combining marks stacked on one character, so a name cannot paint over the identity shown above it; the
+rule pre-registration applies too); `redirect_uris` present, non-empty, each registrable under the redirect
 rule above; `token_endpoint_auth_method` absent or `none` (anything else asks for a confidential client,
 refused); `grant_types` absent or including `authorization_code`; `response_types` absent or including
 `code`. Field names match exactly, and every other field — `application_type`, `client_uri` and
@@ -7163,10 +7179,16 @@ audited. The route sits behind the surface's enabled gate, its own flag and a pe
 never the cookie middleware: a token bucket (`golang.org/x/time/rate`, in memory per replica — a brake
 on table growth, not a correctness property, so no second authority over any state) admitting
 `MCPRegisterRateBurst` registrations refilled one per `MCPRegisterRateInterval`, keyed on the connecting
-peer's address alone (`RemoteAddr`, an IPv6 address by its /64) and never a forwarded header, whose
-trust is a deployment decision about the proxy chain not yet made. Over its budget the answer is `429`
-with `Retry-After`. The limiter bounds its own memory and fails closed when full; it is built to be
-reused for the token and authorization endpoints in piece (d).
+peer's network alone — `RemoteAddr`: an IPv4 address, or an IPv6 address by its /48, the block one site
+is usually assigned, so a flood from one site lands in one bucket however many addresses it sprays from
+— and never a forwarded header, whose trust is a deployment decision about the proxy chain not yet made.
+Over its budget the answer is `429` with `Retry-After`. The limiter bounds its own memory at a fixed
+number of networks; when full it forgets the network seen least recently rather than refusing a
+newcomer, so no network can use the bound to lock out another. The cost is accepted and stated: a party
+rotating through more networks than the limiter holds gets each one's burst afresh — a per-address
+brake is beaten by enough addresses whatever it does when full, and refusing everyone when full only
+turned that into a lockout of everyone else. It is built to be reused for the token and authorization
+endpoints in piece (d).
 
 **A mechanism switched off** refuses every client it registered wherever a disabled client is refused —
 the authorization endpoint, both consent routes, the token endpoint by code and by refresh, and every
@@ -7176,10 +7198,14 @@ Pre-registered clients are unaffected by either flag.
 
 **Unused self-registered clients are swept.** Neither self-registration path has an owner who deletes
 what it created, so the expired-credential sweep deletes a dynamically registered or metadata-document
-client with no grant and no authorization request once it was registered — or, for a metadata-document
-client, last fetched — more than `MCPDynamicClientUnusedTTL` (24 hours) ago. Pre-registered clients are
-never swept, and a client whose consent is in flight always has its request, so it is never a
-candidate.
+client with no grant and no authorization request once it was last used — the latest of its
+registration, its last successful fetch and the end of the time its cached document may be used, a
+failed re-fetch's grace included — more than `MCPDynamicClientUnusedTTL` (24 hours) ago. Pre-registered
+clients are never swept, and neither is a client an operator disabled: a metadata-document client's URL
+is its identity, so its disabled row IS the block — deleting it would let the next authorization register
+the same URL afresh, enabled. A client whose consent is in flight always has its request, so it is never
+a candidate; and the sweep locks its candidates before deleting only those a fresh look still finds
+unused, so a request or grant that committed while it waited keeps its client (§43.16).
 
 ### 43.16 Grants, tokens, and revocation
 
@@ -7251,14 +7277,16 @@ exact: the two serialize on the client row, so each grant is audited as revoked 
 (`TestLockOrder_RevocationRacingClientDeletion`).
 
 Client registration (§43.15) adds four writers to the same order. A metadata document's upsert, and the
-extension of its cache after a failed re-fetch, are each one statement taking one row lock — the client,
+record of its first failed re-fetch, are each one statement taking one row lock — the client,
 `FOR NO KEY UPDATE`, which never conflicts with the `FOR KEY SHARE` every issuance and grant revocation
 takes, only with a client's deletion — so neither can be part of a wait cycle; a re-fetch queued behind a
-deletion registers the document afresh. The unused-client sweep deletes exactly as an administrator's
-deletion does, client first, and only a client with no grant and no request, so its cascade reaches no
-row; an authorization racing it waits, then is refused with a page. A dynamic registration inserts a new
-row and locks nothing that exists (`TestLockOrder_ClientRegistrationWriters`, both orders of every
-pair).
+deletion registers the document afresh. The unused-client sweep deletes as an administrator's deletion
+does, client first, in two statements: it locks its candidates `FOR UPDATE` in id order, then deletes,
+with a fresh snapshot, only those still holding no grant and no request, so its cascade reaches no row.
+An authorization reaching a client the sweep holds waits, then is refused with a page; a request or grant
+whose insert holds the client (its foreign-key check's `FOR KEY SHARE`) when the sweep arrives makes the
+sweep wait, and, once committed, keeps its client. A dynamic registration inserts a new row and locks
+nothing that exists (`TestLockOrder_ClientRegistrationWriters`, both orders of every pair).
 
 Lifetimes live in `platform/timeouts.go`: `MCPAuthorizationRequestTTL` (10 minutes, the consent window),
 `MCPAuthorizationCodeTTL` (60 seconds), `MCPAccessTokenTTL` (1 hour), `MCPRefreshTokenTTL` (30 days per
@@ -7365,14 +7393,14 @@ other users' authorizations — and revocation on their behalf — is piece (d).
 | Token passthrough | the bearer gate strips the header; the twin's synthesized request carries no header at all | `TestRequireMCPBearer_AttachesPrincipalAndStripsToken`, `TestBridge_NoAuthorizationHeaderReachesTwin` |
 | Consent clickjacking and CSRF | frame headers; SameSite cookie, hashed per-render nonce, same-origin check, request bound to one user | `TestConsent_FrameHeaders`, `TestConsent_MissingOrWrongNonceRefused`, `TestConsent_CrossSiteOriginRefused`, `TestConsent_OtherUserCannotDecide` |
 | Scope escalation, at consent and on refresh | consent narrows only; unadvertised scopes refused; a token's scopes are fixed at issuance, so a later consent can neither widen nor narrow it — the refresh token a code is exchanged for holds the code's scopes, never the grant's; a refresh narrows only relative to the presented refresh token, never to the grant's scopes, so a later wider consent never widens a refresh chain | `TestConsent_CannotAddUnrequestedScope`, `TestAuthorize_UnadvertisedScopeRefused`, `TestToken_ScopesFixedAtIssuance_LaterConsentCannotWiden`, `TestToken_ScopesFixedAtIssuance_LaterConsentCannotNarrow`, `TestRefresh_CannotWidenScope`, `TestCovers_Matrix` |
-| Client identity spoofing (confused deputy at registration) | the page shows who vouches for the client — an administrator; for a metadata document, its URL's host as the headline and the self-chosen name second, escaped; for a dynamic registration, nobody — and the true redirect host, with a loopback warning; a document's `client_id` must equal its URL byte for byte; a name with a control, bidi-override or other unprintable character is refused on every registration path; dynamic registration is off by default | `TestConsent_ShowsClientIdentityAndRedirectHost`, `TestCIMD_ClientIDMismatchRejected`, `TestCIMD_ClientIDMismatchRejectedAtAuthorization`, `TestCIMD_ValidationTable`, `TestValidateClientName`, `TestRegister_ValidationAndForcedFields`, `TestOAuth_ProductionRouter/Register_DisabledByDefault` |
-| Metadata-document fetch as SSRF | one outbound adapter, constructible only with its guard; every address checked at dial time, after resolution, on every redirect and every re-resolution (loopback, private, link-local and the cloud metadata address, CGNAT, multicast, unspecified, reserved, and their IPv4-mapped and NAT64 forms); `https` only with no downgrade, at most three redirects, no environment proxy, `application/json` only, 64 KiB, one timeout; the only way past the guard is a test seam production never sets | `TestCIMDFetch_RefusesPrivateTargets`, `TestCIMDFetch_RefusesHTTPAndOversize`, `TestCIMDFetch_FetchesThroughTheSeamOnly`, `TestCheckAddr_Table`, `TestControl_ChecksTheConnectingAddress`, `TestOAuth_ProductionRouter/MetadataDocument_ProductionGuardRefusesLoopback` |
-| A changed client document changing issued credentials | a re-fetched document changes what the next authorization sees, never an issued code's redirect binding, a token's scopes or a refresh chain; the cache is a fixed hour that cache headers only shorten; a stale document whose re-fetch fails is kept one more hour | `TestCIMD_RefetchNeverChangesIssuedCredentials`, `TestCIMD_CacheTTLOnlyShortened`, `TestCIMD_CacheTTLOnlyShortened_Stored`, `TestCIMD_AuthorizationEndpoint` |
-| A registration mechanism switched off | every client it registered is refused like a disabled one — authorization, consent, token endpoint, `/mcp` — and may still revoke; a disabled metadata-document client's document is never fetched again | `TestClientMechanismSwitchedOff_RefusedEverywhere`, `TestMechanisms_Accepts`, `TestRequireMCPBearer_Table`, `TestOAuth_ProductionRouter/MetadataDocuments_Disabled` |
+| Client identity spoofing (confused deputy at registration) | the page shows who vouches for the client — an administrator; for a metadata document, its URL's host as the headline and the self-chosen name second, escaped; for a dynamic registration, nobody — and the true redirect host, with a loopback warning; a document's `client_id` must equal its URL byte for byte; a name with a control, bidi-override or other unprintable character, or a tall stack of combining marks, is refused on every registration path; every host the page shows is plain ASCII exactly as written — a percent-encoded host (a look-alike, a right-to-left override) is refused in a `client_id`, a redirect URI and a homepage URI — so it is the very string a fetch resolves; the document is served by the `client_id` URL's own origin, never through a redirect to another; dynamic registration is off by default | `TestConsent_ShowsClientIdentityAndRedirectHost`, `TestHostsWrittenInPlainASCII`, `TestConsent_NoNonASCIIHostReachesThePage`, `TestCIMDFetch_RefusesCrossOriginRedirects`, `TestCIMD_ClientIDMismatchRejected`, `TestCIMD_ClientIDMismatchRejectedAtAuthorization`, `TestCIMD_ValidationTable`, `TestValidateClientName`, `TestRegister_ValidationAndForcedFields`, `TestOAuth_ProductionRouter/Register_DisabledByDefault` |
+| Metadata-document fetch as SSRF | one outbound adapter, constructible only with its guard; every address checked at dial time, after resolution, on every redirect and every re-resolution (loopback, private, link-local and the cloud metadata address, CGNAT, multicast, unspecified, reserved, and their IPv4-mapped and NAT64 forms); `https` only with no downgrade, at most three redirects, each within the first URL's own origin, no environment proxy, `application/json` only, 64 KiB of decoded document, one timeout; the only way past the guard is a test seam production never sets | `TestCIMDFetch_RefusesPrivateTargets`, `TestCIMDFetch_RefusesCrossOriginRedirects`, `TestCIMDFetch_RefusesHTTPAndOversize`, `TestCIMDFetch_IgnoresEnvironmentProxy`, `TestCIMDFetch_FetchesThroughTheSeamOnly`, `TestCheckAddr_Table`, `TestControl_ChecksTheConnectingAddress`, `TestOAuth_ProductionRouter/MetadataDocument_ProductionGuardRefusesLoopback` (no connection accepted, the refusal's cause the guard's own) |
+| A changed client document changing issued credentials | a re-fetched document changes what the next authorization sees, never an issued code's redirect binding, a token's scopes or a refresh chain; the cache is a fixed hour that cache headers only shorten, and a lowered ceiling caps a stored stale time; a stale document whose re-fetch fails is kept one more hour from the first failure, then refused until a fetch succeeds, and a failure never overrides a newer fetch | `TestCIMD_RefetchNeverChangesIssuedCredentials`, `TestCIMD_CacheTTLOnlyShortened`, `TestCIMD_CacheTTLOnlyShortened_Stored`, `TestCIMD_LoweredCacheTTLCapsAStoredStaleTime`, `TestCIMD_AuthorizationEndpoint`, `TestCIMD_FailedRefetchKeptForOneGraceOnly`, `TestCIMD_FailedRefetchNeverOverridesANewerFetch` |
+| A registration mechanism switched off | every client it registered is refused like a disabled one — authorization, consent, token endpoint, `/mcp` — and may still revoke; a disabled metadata-document client's document is never fetched again, and a disabled client is never swept, so its block outlives any idle time | `TestClientMechanismSwitchedOff_RefusedEverywhere`, `TestMechanisms_Accepts`, `TestRequireMCPBearer_Table`, `TestCIMD_DisabledClientSurvivesTheSweep`, `TestOAuth_ProductionRouter/MetadataDocuments_Disabled`, `TestOAuth_ProductionRouter/DynamicRegistration_Disabled` (each on the very resource the refused token was issued for) |
 | Revoked, disabled or deleted principals | one join per call, no cache; deleting a client cascades its grants and every refresh chain under them, each grant audited; a disabled client gets no consent page and no token, by code or by refresh; a client's RFC 7009 revocation of either token type, expired or rotated or not, deletes the grant, and never another client's; a revocation racing a consent, code exchange or refresh waits for it, then deletes what it issued (§43.16's lock order) | `TestBearer_NoCacheBetweenCalls`, `TestLockOrder_RevocationRacingIssuance`, `TestLockOrder_RevocationRacingClientDeletion`, `TestRevoke_RFC7009_StopsOnNextCall`, `TestRevoke_ExpiredOrRotatedTokenStillRevokes`, `TestRevoke_Refusals`, `TestRefresh_DisabledClientCannotRefresh`, `TestMCPOAuthGrantStore_RevocationCascadesRefreshChain`, `TestOAuth_ProductionRouter/RevokedAuthorizationStopsOnNextCall_User`, `_RFC7009`, `_ClientDeleted`, `_DisabledUser`, `TestOAuth_ProductionRouter/DisabledClientIs401NextCall`, `TestClient_DeleteCascadesGrants`, `TestClient_DeleteAuditsGrantAddedByConcurrentConsent`, `TestConsent_ClientDisabledBeforeRenderRefused`, `TestLockOrder_ClientRegistrationWriters` |
 | Discovery leak | per-request tool registration by scope; composed instructions; empty defect server | `TestToolsList_ScopeFilter_Table`, `TestInstructions_NameOnlyVisibleTools`, `TestHiddenToolCall_IsIndistinguishableFromUnknownTool`, `TestOAuth_ProductionRouter/ScopelessGrant_ToolsListEmpty` |
 | Phishing through the login return path | the sign-in view accepts only `/oauth/consent?request=<uuid>` as a server-rendered return target; both login handlers accept only same-origin paths | `TestLogin_NextAcceptsConsentPath`, `TestOIDCLogin_NextReturnsToConsentPage`, the sign-in view's own return-to test |
-| Table growth | a TTL on every row kind, rotated refresh tokens included, swept; unused self-registered clients swept; dynamic registration braked per client address (`RemoteAddr` only), with bounded limiter memory | `TestExpiredCleanup_SweepsMCPRows`, `TestExpiredCleanup_SweepsUnusedMCPClients`, `TestRateLimiter_BurstThenOnePerInterval`, `TestRateLimiter_BoundedMemoryFailsClosed`, `TestClientAddressKey`, `TestOAuth_ProductionRouter/Register_RateLimited` |
+| Table growth | a TTL on every row kind, rotated refresh tokens included, swept; unused, enabled self-registered clients swept, never one whose request or grant committed while the sweep waited; dynamic registration braked per client network (`RemoteAddr` only; IPv6 by /48), with bounded limiter memory that no network can use to lock out another | `TestExpiredCleanup_SweepsMCPRows`, `TestExpiredCleanup_SweepsUnusedMCPClients`, `TestLockOrder_ClientRegistrationWriters`, `TestRateLimiter_BurstThenOnePerInterval`, `TestRateLimiter_BoundedMemoryEvictsLeastRecentlyUsed`, `TestRateLimiter_OneNetworkCannotLockOutOthers`, `TestClientAddressKey`, `TestOAuth_ProductionRouter/Register_RateLimited` |
 | A token doing more than its user | same twins, same authz check, role read per call | `TestParity_BearerEqualsCookieForEveryRole` |
 
 The row's exit criterion is proven end to end by `TestOAuth_ProductionRouter/EndToEnd_SDKClient`, on
@@ -7389,6 +7417,9 @@ over bearer principals minted per role. Piece (c)'s proofs run on the same route
 `EndToEnd_SDKClient_MetadataDocument` has the SDK client identify itself by a metadata document served by
 an in-test HTTPS server on loopback, reachable only through the fetch guard's test seam, while
 `MetadataDocument_ProductionGuardRefusesLoopback` has the production guard refuse that very server before a
-packet reaches it; `EndToEnd_SDKClient_DynamicRegistration` has the SDK client register itself with the
-flag on; and `Register_DisabledByDefault`, `Register_RateLimited` and `MetadataDocuments_Disabled` prove
-the defaults, the brake and the kill switch.
+single connection reaches it — the connections it accepts counted, and every refusal logged with the
+guard's own cause; `EndToEnd_SDKClient_DynamicRegistration` has the SDK client register itself with the
+flag on; and `Register_DisabledByDefault`, `Register_RateLimited`, `MetadataDocuments_Disabled` and
+`DynamicRegistration_Disabled` prove the defaults, the brake and each kill switch — the last two on a
+router serving the very resource the refused token was issued for, which accepts the other mechanism's
+token, so the switch is the only thing that can refuse it.
