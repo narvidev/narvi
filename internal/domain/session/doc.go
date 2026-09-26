@@ -41,4 +41,13 @@
 // parenthetically lists it alongside the status enum but gives it no
 // transition rule of its own) — this package invents no transition logic
 // for it.
+//
+// DeriveActivity (activity.go) is a second, read-time derivation, not a
+// second store: Status is persisted only when a turn reaches a terminal
+// state, so it cannot say that a follow-up turn is queued or running.
+// Activity (queued, running, awaiting_approval, idle, finished) is derived
+// from the turn queue and the session's human gates, all read in one
+// snapshot, whenever a client asks (technical plan §43.20), and is never
+// written back. SuggestedReadDelay maps it to how long a client should
+// wait before asking again.
 package session

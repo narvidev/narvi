@@ -3185,6 +3185,53 @@ type Timeouts struct {
 	// empty cap (technical plan §43.14). A count, kept beside the TTL that
 	// bounds how long each request waits. 100.
 	MCPMaxPendingAuthorizationRequestsPerClient int
+
+	// -- technical plan §43.20 (a session's status and the suggested delay
+	// before reading it again) --
+	//
+	// GET /api/sessions/{sessionID}/status, and narvi_get_session_status
+	// over it, answer suggestedDelaySeconds: how long a client should wait
+	// before its next read, from session.SuggestedReadDelay's per-activity
+	// table below, clamped to [MCPStatusDelayFloor, MCPStatusDelayCeiling].
+	// A hint that keeps a polling client quiet, never a brake: nothing
+	// refuses a read that comes sooner.
+	//
+	// Links (no margin, unlike this file's slower chains -- these values are
+	// seconds apart): the floor is positive (a zero floor tells a client to
+	// read again at once), and every per-activity value lies inside
+	// [MCPStatusDelayFloor, MCPStatusDelayCeiling], so the clamp in
+	// SuggestedReadDelay is a defense, never the thing that decides a
+	// shipped value.
+
+	// MCPStatusDelayStarting is the suggestion while a session is queued
+	// and no warm sandbox can take the turn yet (none, starting, or being
+	// replaced): a cold start is bounded by FirstConnectBudget, minutes
+	// rather than seconds. 15 seconds.
+	MCPStatusDelayStarting time.Duration
+
+	// MCPStatusDelayQueued is the suggestion while a session is queued on a
+	// warm sandbox: dispatch is imminent. 5 seconds.
+	MCPStatusDelayQueued time.Duration
+
+	// MCPStatusDelayRunning is the suggestion while a turn is in flight.
+	// 10 seconds.
+	MCPStatusDelayRunning time.Duration
+
+	// MCPStatusDelayAwaitingHuman is the suggestion while nothing is queued
+	// or running and a person must act (a plan awaiting approval, a
+	// workflow step awaiting a decision, a run escalated for review): human
+	// latency. 60 seconds.
+	MCPStatusDelayAwaitingHuman time.Duration
+
+	// MCPStatusDelaySettled is the suggestion once a session is finished
+	// or idle: nothing changes without new input. 300 seconds.
+	MCPStatusDelaySettled time.Duration
+
+	// MCPStatusDelayFloor is the least delay ever suggested. 2 seconds.
+	MCPStatusDelayFloor time.Duration
+
+	// MCPStatusDelayCeiling is the most delay ever suggested. 300 seconds.
+	MCPStatusDelayCeiling time.Duration
 }
 
 // DefaultTimeouts returns the shipped defaults for every field, each
@@ -3468,6 +3515,14 @@ func DefaultTimeouts() Timeouts {
 		MCPAuthorizeRateInterval:                    3 * time.Second, // §43.14; per-network refill of the authorization endpoint's bucket
 		MCPAuthorizeRateBurst:                       10,              // §43.14; per-network authorization-endpoint burst
 		MCPMaxPendingAuthorizationRequestsPerClient: 100,             // §43.14; pending authorization requests one client may have
+
+		MCPStatusDelayStarting:      15 * time.Second,  // §43.20; queued behind a cold start
+		MCPStatusDelayQueued:        5 * time.Second,   // §43.20; queued on a warm sandbox
+		MCPStatusDelayRunning:       10 * time.Second,  // §43.20; a turn in flight
+		MCPStatusDelayAwaitingHuman: 60 * time.Second,  // §43.20; human latency
+		MCPStatusDelaySettled:       300 * time.Second, // §43.20; finished or idle
+		MCPStatusDelayFloor:         2 * time.Second,   // §43.20; least suggestion
+		MCPStatusDelayCeiling:       300 * time.Second, // §43.20; most suggestion
 	}
 }
 
@@ -3699,6 +3754,40 @@ func (t Timeouts) Validate() error {
 	mustBePositive("MCPAuthorizeRateInterval", t.MCPAuthorizeRateInterval)
 	countMustBePositive("MCPAuthorizeRateBurst", t.MCPAuthorizeRateBurst)
 	countMustBePositive("MCPMaxPendingAuthorizationRequestsPerClient", t.MCPMaxPendingAuthorizationRequestsPerClient)
+
+	// §43.20: the status delay table (the MCPStatusDelay* fields' own block
+	// comment on the struct). The floor is positive -- a zero floor tells a
+	// client to read again at once -- and every per-activity value lies
+	// inside [floor, ceiling], checked with no margin: these values are
+	// seconds apart, far below MinTimeoutMargin, and the relation is an
+	// ordering, not a race. floor <= ceiling follows from any one value
+	// lying between them, so it needs no link of its own.
+	mustBePositive("MCPStatusDelayFloor", t.MCPStatusDelayFloor)
+	withinStatusDelayBounds := func(field string, value time.Duration) {
+		if value < t.MCPStatusDelayFloor {
+			errs = append(errs, &TimeoutInvariantError{
+				Chain:        field + " >= MCPStatusDelayFloor",
+				LesserField:  "MCPStatusDelayFloor",
+				LesserValue:  t.MCPStatusDelayFloor,
+				GreaterField: field,
+				GreaterValue: value,
+			})
+		}
+		if value > t.MCPStatusDelayCeiling {
+			errs = append(errs, &TimeoutInvariantError{
+				Chain:        "MCPStatusDelayCeiling >= " + field,
+				LesserField:  field,
+				LesserValue:  value,
+				GreaterField: "MCPStatusDelayCeiling",
+				GreaterValue: t.MCPStatusDelayCeiling,
+			})
+		}
+	}
+	withinStatusDelayBounds("MCPStatusDelayStarting", t.MCPStatusDelayStarting)
+	withinStatusDelayBounds("MCPStatusDelayQueued", t.MCPStatusDelayQueued)
+	withinStatusDelayBounds("MCPStatusDelayRunning", t.MCPStatusDelayRunning)
+	withinStatusDelayBounds("MCPStatusDelayAwaitingHuman", t.MCPStatusDelayAwaitingHuman)
+	withinStatusDelayBounds("MCPStatusDelaySettled", t.MCPStatusDelaySettled)
 
 	// U1 audit fix, HIGH (confirmed finding: "the total budget is smaller
 	// than the retry chain it contains"). Derived from the SAME three

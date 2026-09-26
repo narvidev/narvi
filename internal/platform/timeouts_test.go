@@ -1809,3 +1809,107 @@ func TestValidate_MCPEndpointBrakes(t *testing.T) {
 		})
 	}
 }
+
+// TestDefaultTimeouts_MCPStatusDelayFields pins the status delay table
+// (technical plan §43.20): 15 s starting, 5 s queued, 10 s running, 60 s
+// awaiting a person, 300 s settled, clamped to [2 s, 300 s].
+func TestDefaultTimeouts_MCPStatusDelayFields(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+	for _, tc := range []struct {
+		name string
+		got  time.Duration
+		want time.Duration
+	}{
+		{"MCPStatusDelayStarting", to.MCPStatusDelayStarting, 15 * time.Second},
+		{"MCPStatusDelayQueued", to.MCPStatusDelayQueued, 5 * time.Second},
+		{"MCPStatusDelayRunning", to.MCPStatusDelayRunning, 10 * time.Second},
+		{"MCPStatusDelayAwaitingHuman", to.MCPStatusDelayAwaitingHuman, 60 * time.Second},
+		{"MCPStatusDelaySettled", to.MCPStatusDelaySettled, 300 * time.Second},
+		{"MCPStatusDelayFloor", to.MCPStatusDelayFloor, 2 * time.Second},
+		{"MCPStatusDelayCeiling", to.MCPStatusDelayCeiling, 300 * time.Second},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %v, want %v", tc.name, tc.got, tc.want)
+		}
+	}
+	if err := to.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+}
+
+// TestTimeouts_Validate_MCPStatusDelay proves every status-delay link is
+// checked on its own and reported by name (technical plan §43.20): each
+// per-activity value below the floor, each above the ceiling, and a
+// non-positive floor. A value exactly on a bound is accepted -- the links
+// carry no margin.
+func TestTimeouts_Validate_MCPStatusDelay(t *testing.T) {
+	t.Parallel()
+
+	fields := []struct {
+		name string
+		ptr  func(*platform.Timeouts) *time.Duration
+	}{
+		{"MCPStatusDelayStarting", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelayStarting }},
+		{"MCPStatusDelayQueued", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelayQueued }},
+		{"MCPStatusDelayRunning", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelayRunning }},
+		{"MCPStatusDelayAwaitingHuman", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelayAwaitingHuman }},
+		{"MCPStatusDelaySettled", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelaySettled }},
+	}
+	for _, f := range fields {
+		t.Run(f.name+" below the floor", func(t *testing.T) {
+			t.Parallel()
+			to := platform.DefaultTimeouts()
+			*f.ptr(&to) = to.MCPStatusDelayFloor - time.Millisecond
+			want := f.name + " >= MCPStatusDelayFloor"
+			var inv *platform.TimeoutInvariantError
+			if err := to.Validate(); !errors.As(err, &inv) || inv.Chain != want {
+				t.Fatalf("Validate() = %v, want exactly the broken link %q", err, want)
+			}
+		})
+		t.Run(f.name+" above the ceiling", func(t *testing.T) {
+			t.Parallel()
+			to := platform.DefaultTimeouts()
+			*f.ptr(&to) = to.MCPStatusDelayCeiling + time.Millisecond
+			want := "MCPStatusDelayCeiling >= " + f.name
+			var inv *platform.TimeoutInvariantError
+			if err := to.Validate(); !errors.As(err, &inv) || inv.Chain != want {
+				t.Fatalf("Validate() = %v, want exactly the broken link %q", err, want)
+			}
+		})
+		t.Run(f.name+" on either bound is accepted", func(t *testing.T) {
+			t.Parallel()
+			for _, bound := range []string{"floor", "ceiling"} {
+				to := platform.DefaultTimeouts()
+				if bound == "floor" {
+					*f.ptr(&to) = to.MCPStatusDelayFloor
+				} else {
+					*f.ptr(&to) = to.MCPStatusDelayCeiling
+				}
+				if err := to.Validate(); err != nil {
+					t.Fatalf("%s on the %s: Validate() = %v, want nil", f.name, bound, err)
+				}
+			}
+		})
+	}
+
+	t.Run("a zero floor suggests reading again at once", func(t *testing.T) {
+		t.Parallel()
+		to := platform.DefaultTimeouts()
+		to.MCPStatusDelayFloor = 0
+		var pos *platform.TimeoutMustBePositiveError
+		if err := to.Validate(); !errors.As(err, &pos) || pos.Field != "MCPStatusDelayFloor" {
+			t.Fatalf("Validate() = %v, want MCPStatusDelayFloor refused as non-positive", err)
+		}
+	})
+	t.Run("a ceiling below the floor breaks a link", func(t *testing.T) {
+		t.Parallel()
+		to := platform.DefaultTimeouts()
+		to.MCPStatusDelayCeiling = to.MCPStatusDelayFloor - time.Millisecond
+		var inv *platform.TimeoutInvariantError
+		if err := to.Validate(); !errors.As(err, &inv) {
+			t.Fatalf("Validate() = %v, want a broken status-delay link", err)
+		}
+	})
+}
