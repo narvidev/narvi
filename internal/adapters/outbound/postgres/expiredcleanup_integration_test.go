@@ -21,6 +21,7 @@ import (
 
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // TestRunExpiredTokenCleanup_DeletesExpiredLeavesLive proves
@@ -88,7 +89,7 @@ func TestRunExpiredTokenCleanup_DeletesExpiredLeavesLive(t *testing.T) {
 	cleanupCtx, cancel := context.WithCancel(ctx)
 	var eg errgroup.Group
 	eg.Go(func() error {
-		err := narvipg.RunExpiredTokenCleanup(cleanupCtx, pool, 20*time.Millisecond)
+		err := narvipg.RunExpiredTokenCleanup(cleanupCtx, pool, 20*time.Millisecond, platform.DefaultTimeouts().MCPDynamicClientUnusedTTL)
 		if errors.Is(err, context.Canceled) {
 			return nil
 		}
@@ -242,7 +243,7 @@ func TestExpiredCleanup_SweepsMCPRows(t *testing.T) {
 	cleanupCtx, cancel := context.WithCancel(ctx)
 	var eg errgroup.Group
 	eg.Go(func() error {
-		err := narvipg.RunExpiredTokenCleanup(cleanupCtx, pool, 20*time.Millisecond)
+		err := narvipg.RunExpiredTokenCleanup(cleanupCtx, pool, 20*time.Millisecond, platform.DefaultTimeouts().MCPDynamicClientUnusedTTL)
 		if errors.Is(err, context.Canceled) {
 			return nil
 		}
@@ -289,5 +290,156 @@ func TestExpiredCleanup_SweepsMCPRows(t *testing.T) {
 	}
 	if row, err := grants.GetRefreshTokenByHash(ctx, "live-rotated-refresh"); err != nil || !row.RotatedAt.Valid || row.SupersededBy.Valid {
 		t.Errorf("live rotated refresh token = %+v (err %v), want kept, still rotated, superseded_by cleared", row, err)
+	}
+}
+
+// TestExpiredCleanup_SweepsUnusedMCPClients proves the sweep's
+// unused-client pass (technical plan §43.15): a dynamically registered or
+// metadata-document client with no grant and no authorization request,
+// last used more than MCPDynamicClientUnusedTTL ago -- registered, last
+// fetched, or last usable from its cache -- is deleted, including one
+// whose only grant expired on the same tick; a younger one, one with a
+// live grant, one with a pending request, a metadata-document client
+// fetched again recently, one fetched long ago but still served from its
+// cache through a failed re-fetch's grace (on a deployment whose cache
+// lifetime is long enough to allow that), a disabled client of either
+// kind however old (the disabled row IS the operator's block), and every
+// pre-registered client, however old and unused, survive.
+func TestExpiredCleanup_SweepsUnusedMCPClients(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	clients := narvipg.NewMCPOAuthClientStore(pool)
+	grants := narvipg.NewMCPOAuthGrantStore(pool)
+	ttl := platform.DefaultTimeouts().MCPDynamicClientUnusedTTL
+	old := time.Now().Add(-ttl - 2*time.Hour)
+	recent := time.Now().Add(-time.Hour)
+
+	user, err := narvipg.NewUserStore(pool).Create(ctx, sqlcgen.CreateUserParams{
+		PrimaryEmail: "mcp-client-sweep@example.com", DisplayName: "MCP Client Sweep", Role: sqlcgen.UserRoleMember,
+	})
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	newClient := func(clientID string, kind sqlcgen.McpOauthClientKind, createdAt time.Time) sqlcgen.McpOauthClient {
+		t.Helper()
+		c, err := clients.Create(ctx, sqlcgen.CreateMCPOAuthClientParams{
+			ClientID: clientID, Kind: kind, ClientName: clientID, RedirectUris: []string{"http://127.0.0.1/cb"},
+		})
+		if err != nil {
+			t.Fatalf("create client %s: %v", clientID, err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE mcp_oauth_clients SET created_at = $2 WHERE id = $1`, c.ID, createdAt); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	newDocument := func(clientID string, createdAt, fetchedAt time.Time) sqlcgen.McpOauthClient {
+		t.Helper()
+		c, err := clients.UpsertMetadataDocument(ctx, sqlcgen.UpsertMCPOAuthMetadataDocumentClientParams{
+			ClientID: clientID, ClientName: "Doc", RedirectUris: []string{"http://127.0.0.1/cb"},
+			MetadataFetchedAt: pgtype.Timestamptz{Time: fetchedAt, Valid: true},
+			MetadataStaleAt:   pgtype.Timestamptz{Time: fetchedAt.Add(time.Hour), Valid: true},
+		})
+		if err != nil {
+			t.Fatalf("upsert metadata-document client %s: %v", clientID, err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE mcp_oauth_clients SET created_at = $2 WHERE id = $1`, c.ID, createdAt); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	grant := func(clientID pgtype.UUID, expiresAt time.Time) {
+		t.Helper()
+		if _, err := grants.UpsertGrant(ctx, sqlcgen.UpsertMCPOAuthGrantParams{
+			UserID: user.ID, ClientID: clientID, Scopes: []string{"mcp:read"}, Resource: "http://127.0.0.1:9/mcp",
+			ExpiresAt: pgtype.Timestamptz{Time: expiresAt, Valid: true},
+		}); err != nil {
+			t.Fatalf("create grant: %v", err)
+		}
+	}
+
+	swept := []sqlcgen.McpOauthClient{
+		newClient("narvi_mcp_d_unused", sqlcgen.McpOauthClientKindDynamic, old),
+		newDocument("https://unused.example/client.json", old, old),
+	}
+	lapsed := newClient("narvi_mcp_d_lapsed", sqlcgen.McpOauthClientKindDynamic, old)
+	grant(lapsed.ID, time.Now().Add(-time.Minute))
+	swept = append(swept, lapsed)
+
+	young := newClient("narvi_mcp_d_young", sqlcgen.McpOauthClientKindDynamic, recent)
+	granted := newClient("narvi_mcp_d_granted", sqlcgen.McpOauthClientKindDynamic, old)
+	grant(granted.ID, time.Now().Add(time.Hour))
+	pending := newClient("narvi_mcp_d_pending", sqlcgen.McpOauthClientKindDynamic, old)
+	if _, err := grants.CreateAuthorizationRequest(ctx, sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
+		ClientID: pending.ID, RedirectUri: "http://127.0.0.1/cb", CodeChallenge: "c", CodeChallengeMethod: "S256",
+		Resource: "http://127.0.0.1:9/mcp", ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Minute), Valid: true},
+	}); err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	refetched := newDocument("https://refetched.example/client.json", old, recent)
+	// Fetched successfully long ago, its re-fetch failing since a moment
+	// ago, on a deployment whose MCPClientMetadataCacheTTL is over half
+	// MCPDynamicClientUnusedTTL (a valid setting: 14 hours against 24).
+	// That fetch is then less than two cache lifetimes old, so the
+	// authorization endpoint still serves the cached document until the
+	// end of the grace mcpauth's refetchGraceEnd gives -- the failure plus
+	// one TTL, never past the last successful fetch plus two -- and the
+	// client is not unused. With the default hour-long lifetime, no
+	// document read this long ago gets any grace.
+	const cacheTTL = 14 * time.Hour
+	failedAt := time.Now()
+	graceEnd := failedAt.Add(cacheTTL)
+	if bound := old.Add(2 * cacheTTL); bound.Before(graceEnd) {
+		graceEnd = bound
+	}
+	inGrace := newDocument("https://in-grace.example/client.json", old, old)
+	if _, err := clients.MarkMetadataRefetchFailed(ctx, inGrace.ID, old, failedAt, graceEnd); err != nil {
+		t.Fatalf("record the failed re-fetch: %v", err)
+	}
+	disabledDynamic := newClient("narvi_mcp_d_disabled", sqlcgen.McpOauthClientKindDynamic, old)
+	disabledDocument := newDocument("https://disabled.example/client.json", old, old)
+	for _, c := range []sqlcgen.McpOauthClient{disabledDynamic, disabledDocument} {
+		if _, err := pool.Exec(ctx, `UPDATE mcp_oauth_clients SET disabled_at = $2 WHERE id = $1`, c.ID, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	preregistered := newClient("narvi_mcp_c_old", sqlcgen.McpOauthClientKindPreregistered, old)
+	kept := []sqlcgen.McpOauthClient{young, granted, pending, refetched, inGrace, disabledDynamic, disabledDocument, preregistered}
+
+	cleanupCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var eg errgroup.Group
+	eg.Go(func() error {
+		err := narvipg.RunExpiredTokenCleanup(cleanupCtx, pool, 20*time.Millisecond, ttl)
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
+	})
+	// Wait for the observed outcome, not for a fixed time: every client
+	// that must go is gone (a failure deadline, not a pacing delay).
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		remaining := 0
+		for _, c := range swept {
+			if _, err := clients.GetByID(ctx, c.ID); err == nil {
+				remaining++
+			}
+		}
+		if remaining == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d unused clients still present after the sweep ran", remaining)
+		}
+	}
+	cancel()
+	if err := eg.Wait(); err != nil {
+		t.Fatalf("RunExpiredTokenCleanup: %v", err)
+	}
+	for _, c := range kept {
+		if _, err := clients.GetByID(ctx, c.ID); err != nil {
+			t.Errorf("client %s was swept (err %v), want kept", c.ClientID, err)
+		}
 	}
 }

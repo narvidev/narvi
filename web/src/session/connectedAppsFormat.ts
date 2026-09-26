@@ -37,13 +37,42 @@ export function scopesSummary(scopes: string[]): string {
 }
 
 /**
- * clientIdentityLabel says who vouched for the client -- the same line the
- * consent page shows. Only admin-registered clients exist today; any other
- * kind (reserved for later registration mechanisms) says so rather than
- * borrowing that claim.
+ * clientIdentityLabel says who vouched for the client -- the same identity
+ * the consent page shows (technical plan §43.15). An admin-registered client
+ * says so. A client identified by a client ID metadata document is known by
+ * the host its document was fetched from -- its clientId is that URL, and
+ * the host is the one thing about it the app could not choose (the name
+ * beside it, it could). A client that registered itself says only that.
+ * An unknown kind never borrows either claim.
  */
-export function clientIdentityLabel(kind: MCPAuthorization['clientKind'] | string): string {
-  return kind === 'preregistered' ? 'Registered by an administrator of this deployment' : 'Registered by the app itself'
+export function clientIdentityLabel(kind: MCPAuthorization['clientKind'] | string, clientId: string): string {
+  if (kind === 'preregistered') return 'Registered by an administrator of this deployment'
+  if (kind === 'metadata_document') {
+    const host = metadataDocumentHost(clientId)
+    if (host) return `Identified by ${host}`
+  }
+  return 'Registered by the app itself'
+}
+
+/**
+ * metadataDocumentHost is the host (with any port) of a metadata-document
+ * client's https clientId exactly as the clientId writes it -- the string
+ * the consent page showed (mcpclient.IdentityHost), since the server stored
+ * the clientId only once its host was plain printable ASCII, written
+ * exactly so -- or '' when it is not one. Never new URL(): its host is
+ * normalized (lower-cased, a default :443 dropped), and its IDNA
+ * processing throws on an xn-- label that is not valid punycode, which
+ * would make a host the consent page named read as no host at all.
+ */
+function metadataDocumentHost(clientId: string): string {
+  if (!clientId.startsWith('https://')) return ''
+  const rest = clientId.slice('https://'.length)
+  const end = rest.search(/[/?#]/)
+  const host = end === -1 ? rest : rest.slice(0, end)
+  // Printable ASCII only, with no percent sign and no user information:
+  // the rule the server stored it under, checked again rather than trusted.
+  if (!/^[\x21-\x7e]+$/.test(host) || /[%@]/.test(host)) return ''
+  return host
 }
 
 /** parseRedirectUris turns the register form's one-per-line textarea into the request's list: trimmed, blank lines dropped, duplicates kept once. The server validates every entry; this only shapes the list. */

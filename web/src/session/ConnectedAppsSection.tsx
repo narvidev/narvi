@@ -49,7 +49,9 @@ export function ConnectedAppRow({ authorization, onRevoke, revoking }: { authori
         <b>
           <T text={authorization.clientName} />
         </b>
-        <div className="ph">{clientIdentityLabel(authorization.clientKind)}</div>
+        <div className="ph">
+          <T text={clientIdentityLabel(authorization.clientKind, authorization.clientId)} />
+        </div>
       </td>
       <td>
         <T text={scopesSummary(authorization.scopes)} />

@@ -3063,6 +3063,70 @@ type Timeouts struct {
 	// offered after an upgrade needs a new consent anyway, since a refresh
 	// can only narrow. 5 minutes.
 	MCPDiscoveryCacheMaxAge time.Duration
+
+	// -- technical plan §43.15 ("Clients: pre-registration, metadata
+	// documents, dynamic registration") --
+	//
+	// Validate checks three ordering links: a metadata document's fetch
+	// must fit well inside the time its result is trusted
+	// (MCPClientMetadataCacheTTL > MCPClientMetadataFetchTimeout); a
+	// client counts as unused only well after its cached document could
+	// last be used (MCPDynamicClientUnusedTTL > MCPClientMetadataCacheTTL
+	// -- the sweep itself counts from the end of that time, a failed
+	// re-fetch's grace included, so a client the authorization endpoint
+	// may still serve from its cache is never a candidate whatever these
+	// are; this is sane configuration, not the guarantee); and a
+	// registered client always outlives the consent window of the
+	// authorization it registered for (MCPDynamicClientUnusedTTL >
+	// MCPAuthorizationRequestTTL -- the sweep also skips any client with a
+	// pending request, so this too is sane configuration, not the
+	// guarantee).
+	// And two positivity checks on the registration rate limit, whose zero
+	// interval would mean NO limit (rate.Every(0) is rate.Inf) -- the one
+	// field here that fails OPEN at zero -- and whose burst below one would
+	// refuse every registration.
+
+	// MCPClientMetadataFetchTimeout bounds one whole client ID metadata
+	// document fetch -- every redirect, the TLS handshakes, and the body
+	// -- so an unresponsive or trickling document host holds a GET
+	// /oauth/authorize for at most this long. 5 seconds.
+	MCPClientMetadataFetchTimeout time.Duration
+
+	// MCPClientMetadataCacheTTL is how long a fetched client ID metadata
+	// document is trusted before the next authorization re-fetches it. A
+	// fixed ceiling: the document's own Cache-Control max-age (or
+	// no-store/no-cache) may only SHORTEN it, never extend it, so a
+	// document that changes -- a redirect URI withdrawn -- is seen within
+	// this long whatever its host says. The first failed re-fetch of a
+	// stale document since its last successful fetch keeps the cached
+	// document for ONE more TTL, measured from that failure, and no
+	// longer -- and never past TWO TTLs after that last successful fetch,
+	// so a document not read for longer gets no grace at all: past it the
+	// client is refused until a fetch succeeds. 1 hour.
+	MCPClientMetadataCacheTTL time.Duration
+
+	// MCPDynamicClientUnusedTTL is how long a dynamically registered or
+	// metadata-document client with no grant (and no pending authorization
+	// request) is kept before the expired-credential sweep deletes it --
+	// counted from the latest of its registration, its last successful
+	// fetch and the end of the time its cached document may be used (a
+	// failed re-fetch's grace included). Pre-registered clients, and
+	// clients an operator disabled, are never swept. It is what bounds the
+	// table growth an unauthenticated registration can cause. 24 hours.
+	MCPDynamicClientUnusedTTL time.Duration
+
+	// MCPRegisterRateInterval is the refill interval of the per-network
+	// token bucket in front of POST /oauth/register: after a burst of
+	// MCPRegisterRateBurst registrations, one client network -- one IPv4
+	// address, one IPv6 /48 -- may register one more client per interval.
+	// In-memory, per replica -- a brake on table growth, not a correctness
+	// property. 12 minutes.
+	MCPRegisterRateInterval time.Duration
+
+	// MCPRegisterRateBurst is the per-network burst POST /oauth/register
+	// admits before MCPRegisterRateInterval paces it. A count, kept beside
+	// its interval. 5.
+	MCPRegisterRateBurst int
 }
 
 // DefaultTimeouts returns the shipped defaults for every field, each
@@ -3334,6 +3398,12 @@ func DefaultTimeouts() Timeouts {
 		MCPGrantMaxLifetime:           90 * 24 * time.Hour, // §43.16; absolute, re-consent after
 		MCPGrantLastUsedWriteInterval: 5 * time.Minute,     // §43.16; write coalescing
 		MCPDiscoveryCacheMaxAge:       5 * time.Minute,     // §43.14; discovery documents' Cache-Control max-age
+
+		MCPClientMetadataFetchTimeout: 5 * time.Second,  // §43.15; one whole metadata document fetch
+		MCPClientMetadataCacheTTL:     time.Hour,        // §43.15; fixed ceiling, Cache-Control only shortens it
+		MCPDynamicClientUnusedTTL:     24 * time.Hour,   // §43.15; unused registered clients are swept after this
+		MCPRegisterRateInterval:       12 * time.Minute, // §43.15; per-network refill of the registration bucket
+		MCPRegisterRateBurst:          5,                // §43.15; per-network registration burst
 	}
 }
 
@@ -3499,6 +3569,18 @@ func (t Timeouts) Validate() error {
 	check("MCPGrantMaxLifetime > MCPRefreshTokenTTL",
 		"MCPGrantMaxLifetime", t.MCPGrantMaxLifetime, "MCPRefreshTokenTTL", t.MCPRefreshTokenTTL)
 
+	// §43.15: a metadata document's fetch fits inside the time it is
+	// trusted, a cached metadata-document client is never old enough to
+	// sweep, and a registered client outlives the consent window of the
+	// authorization it registered for (the client-registration fields'
+	// own block comment on the struct).
+	check("MCPClientMetadataCacheTTL > MCPClientMetadataFetchTimeout",
+		"MCPClientMetadataCacheTTL", t.MCPClientMetadataCacheTTL, "MCPClientMetadataFetchTimeout", t.MCPClientMetadataFetchTimeout)
+	check("MCPDynamicClientUnusedTTL > MCPClientMetadataCacheTTL",
+		"MCPDynamicClientUnusedTTL", t.MCPDynamicClientUnusedTTL, "MCPClientMetadataCacheTTL", t.MCPClientMetadataCacheTTL)
+	check("MCPDynamicClientUnusedTTL > MCPAuthorizationRequestTTL",
+		"MCPDynamicClientUnusedTTL", t.MCPDynamicClientUnusedTTL, "MCPAuthorizationRequestTTL", t.MCPAuthorizationRequestTTL)
+
 	// U2 audit fix, SECURITY (confirmed HIGH finding: "the gate creates the
 	// identity it then checks" batch's own sibling finding -- "the
 	// anti-abuse throttle fails open on the zero value of its window").
@@ -3530,6 +3612,16 @@ func (t Timeouts) Validate() error {
 	mustBePositive("AutomationDispatchThrottleWindow", t.AutomationDispatchThrottleWindow)
 	mustBePositive("CircuitBreakerWindow", t.CircuitBreakerWindow)
 	mustBePositive("RepoAccessCheckBreakerWindow", t.RepoAccessCheckBreakerWindow)
+
+	// §43.15: the registration rate limit. A zero refill interval is no
+	// limit at all (rate.Every(0) is rate.Inf) -- the same fail-OPEN-at-zero
+	// shape as the three windows above -- and a burst below one refuses
+	// every registration, which is a broken configuration rather than a
+	// stricter one.
+	mustBePositive("MCPRegisterRateInterval", t.MCPRegisterRateInterval)
+	if t.MCPRegisterRateBurst < 1 {
+		errs = append(errs, &CountMustBePositiveError{Field: "MCPRegisterRateBurst", Value: t.MCPRegisterRateBurst})
+	}
 
 	// U1 audit fix, HIGH (confirmed finding: "the total budget is smaller
 	// than the retry chain it contains"). Derived from the SAME three
@@ -3582,6 +3674,17 @@ func (e *TimeoutMustBePositiveError) Error() string {
 		"timeout invariant violated: %s=%s, want > 0 -- the zero value silently disables or unbounds the control this field governs, see that field's own doc comment",
 		e.Field, e.Value,
 	)
+}
+
+// CountMustBePositiveError reports a count field of Timeouts -- one kept
+// beside the interval it paces -- that Validate requires to be at least 1.
+type CountMustBePositiveError struct {
+	Field string
+	Value int
+}
+
+func (e *CountMustBePositiveError) Error() string {
+	return fmt.Sprintf("timeout invariant violated: %s=%d, want >= 1 -- see that field's own doc comment", e.Field, e.Value)
 }
 
 // SecondsToDuration converts a raw whole-seconds count -- e.g. an OAuth

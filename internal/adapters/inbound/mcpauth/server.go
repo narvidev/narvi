@@ -1,6 +1,7 @@
 package mcpauth
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -10,7 +11,10 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/narvidev/narvi/internal/adapters/outbound/cimdfetch"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/domain/mcpclient"
 	"github.com/narvidev/narvi/internal/domain/mcpscope"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -34,8 +38,22 @@ type Config struct {
 	// AdvertisedScopes). The authorization endpoint refuses anything
 	// else.
 	Scopes []mcpscope.Scope
-	// Timeouts supplies the MCP lifetimes (technical plan §43.16).
+	// Timeouts supplies the MCP lifetimes (technical plan §43.16) and the
+	// metadata-document cache ceiling (§43.15).
 	Timeouts platform.Timeouts
+	// Mechanisms is which client-registration mechanisms this deployment
+	// accepts beside pre-registration (platform.Config.MCPCIMDEnabled,
+	// MCPDCREnabled; technical plan §43.15). A client registered through a
+	// mechanism that is off is refused everywhere, like a disabled one.
+	Mechanisms mcpclient.Mechanisms
+}
+
+// MetadataFetcher fetches one client ID metadata document --
+// *cimdfetch.Fetcher in production, the only implementation that may ever
+// reach the network (its SSRF guard is the reason it exists); tests serve
+// documents from memory through the same interface.
+type MetadataFetcher interface {
+	Fetch(ctx context.Context, clientIDURL string) (cimdfetch.Result, error)
 }
 
 // Deps are the stores the authorization server reads and writes.
@@ -46,6 +64,9 @@ type Deps struct {
 	UserSessions *postgres.UserSessionStore
 	Users        *postgres.UserStore
 	AuditLog     *postgres.AuditLogStore
+	// Metadata fetches client ID metadata documents. Required while
+	// Config.Mechanisms.MetadataDocuments is on, unused otherwise.
+	Metadata MetadataFetcher
 }
 
 // Server is the MCP authorization server's HTTP surface (technical plan
@@ -78,6 +99,9 @@ func New(cfg Config, deps Deps) (*Server, error) {
 			return nil, err
 		}
 	}
+	if cfg.Mechanisms.MetadataDocuments && deps.Metadata == nil {
+		return nil, errors.New("mcpauth: client ID metadata documents are enabled but no metadata fetcher is wired")
+	}
 	scopes := make([]mcpscope.Scope, 0, len(cfg.Scopes))
 	for _, sc := range cfg.Scopes {
 		if !mcpscope.Known(sc) {
@@ -106,6 +130,17 @@ func New(cfg Config, deps Deps) (*Server, error) {
 
 // Identifiers returns the identifiers this server advertises.
 func (s *Server) Identifiers() Identifiers { return s.ids }
+
+// clientUsable reports whether client may take part in an authorization
+// right now: not disabled by an operator, and registered through a
+// mechanism this deployment accepts (mcpclient.Mechanisms.Accepts). Every
+// place that lets a client act -- the authorization endpoint, both consent
+// routes, the token endpoint -- asks this one question, and
+// auth.RequireMCPBearer asks the same of every /mcp call; only RFC 7009
+// revocation does not, since giving access back is always allowed.
+func (s *Server) clientUsable(client sqlcgen.McpOauthClient) bool {
+	return !client.DisabledAt.Valid && s.cfg.Mechanisms.Accepts(mcpclient.Kind(client.Kind))
+}
 
 // scopeDescriptions is what the consent page says each scope allows. Every
 // scope in mcpscope.Vocabulary must have one (TestScopeDescriptions_Cover

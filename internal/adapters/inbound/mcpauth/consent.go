@@ -38,7 +38,17 @@ type consentScope struct {
 // consentPage is consent.html's own data. Every field is rendered through
 // html/template's contextual escaping.
 type consentPage struct {
-	ClientName         string
+	ClientName string
+	// IdentityHost is set for a metadata-document client only: the host
+	// of its client_id URL, which the page shows as the headline -- the
+	// client's true identity -- with the name it gave itself second.
+	IdentityHost string
+	// SelfRegistered is set for a dynamically registered client only. Its
+	// name is the unauthenticated registrant's free choice -- it could copy
+	// the very wording the page keeps for a verified host -- so the title
+	// and headline are fixed words saying the app registered itself, and
+	// the name comes second, quoted, marked as the name it gave itself.
+	SelfRegistered     bool
 	ClientIdentity     string
 	ClientHomepageHost string
 	UserEmail          string
@@ -49,10 +59,45 @@ type consentPage struct {
 	Nonce              string
 }
 
-// preregisteredIdentity is the identity line shown for a client an
-// administrator registered: the consent page states who vouched for the
-// client, never only the name the client goes by.
-const preregisteredIdentity = "Registered by an administrator of this deployment."
+// The identity line the consent page shows for each client kind (technical
+// plan §43.14/§43.15): who vouched for the client, never only the name it
+// goes by -- which, for every kind but a pre-registered one, the client
+// chose itself.
+const (
+	// preregisteredIdentity: an administrator of this deployment
+	// registered it.
+	preregisteredIdentity = "Registered by an administrator of this deployment."
+	// metadataDocumentIdentity follows the client_id URL's host, which the
+	// page shows as its headline.
+	metadataDocumentIdentity = "That name is the app's own choice. The address above is where this deployment read the app's description, over a verified connection, and it is what identifies the app."
+	// dynamicIdentity: it registered itself, and nothing vouches for it.
+	dynamicIdentity = "This app registered itself with this deployment, so nothing vouches for its name. Check where your browser is sent back to before you allow it."
+)
+
+// identityFor fills page's identity for client: what heads the page (the
+// verified host, the fixed self-registered headline, or an administrator's
+// name) and the identity line.
+func identityFor(page *consentPage, client sqlcgen.McpOauthClient) bool {
+	switch mcpclient.Kind(client.Kind) {
+	case mcpclient.KindPreregistered:
+		page.ClientIdentity = preregisteredIdentity
+		if client.ClientUri != nil {
+			page.ClientHomepageHost = mcpclient.ClientURIHost(*client.ClientUri)
+		}
+	case mcpclient.KindMetadataDocument:
+		page.IdentityHost = mcpclient.IdentityHost(client.ClientID)
+		page.ClientIdentity = metadataDocumentIdentity
+		if page.IdentityHost == "" {
+			return false
+		}
+	case mcpclient.KindDynamic:
+		page.SelfRegistered = true
+		page.ClientIdentity = dynamicIdentity
+	default:
+		return false
+	}
+	return true
+}
 
 // parseRequestID parses a consent request id.
 func parseRequestID(raw string) (pgtype.UUID, bool) {
@@ -134,7 +179,7 @@ func (s *Server) ConsentPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	client, err := s.deps.Clients.GetByID(ctx, row.ClientID)
-	if err != nil || client.DisabledAt.Valid || client.Kind != sqlcgen.McpOauthClientKindPreregistered {
+	if err != nil || !s.clientUsable(client) {
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			logger.Error("mcpauth: consent: load client failed", "error", err)
 		}
@@ -171,7 +216,6 @@ func (s *Server) ConsentPage(w http.ResponseWriter, r *http.Request) {
 
 	page := consentPage{
 		ClientName:       client.ClientName,
-		ClientIdentity:   preregisteredIdentity,
 		UserEmail:        user.Email,
 		RedirectHost:     mcpclient.RedirectHost(row.RedirectUri),
 		RedirectLoopback: mcpclient.IsLoopbackRedirect(row.RedirectUri),
@@ -179,10 +223,15 @@ func (s *Server) ConsentPage(w http.ResponseWriter, r *http.Request) {
 		RequestID:        requestID.String(),
 		Nonce:            nonce,
 	}
-	if client.ClientUri != nil {
-		if u, err := url.Parse(*client.ClientUri); err == nil {
-			page.ClientHomepageHost = u.Hostname()
-		}
+	if !identityFor(&page, client) || page.RedirectHost == "" {
+		// Unreachable for a stored client and request: every kind has an
+		// identity, a metadata-document client_id was validated before it
+		// was ever stored, and so was every redirect URI a request
+		// carries. A row that bypassed that validation is refused rather
+		// than shown with a host a user cannot check.
+		logger.Error("mcpauth: consent: client has no displayable identity", "client_id", client.ClientID, "kind", client.Kind)
+		s.renderError(w, r, http.StatusInternalServerError, "Something went wrong", "The authorization request could not be displayed.")
+		return
 	}
 	var buf bytes.Buffer
 	if err := s.consentTpl.Execute(&buf, page); err != nil {
@@ -372,8 +421,9 @@ func (s *Server) decide(w http.ResponseWriter, r *http.Request, requestID, clien
 		return
 	}
 
-	if client.DisabledAt.Valid || client.Kind != sqlcgen.McpOauthClientKindPreregistered {
-		// Disabled after the page was rendered: nothing is granted. The
+	if !s.clientUsable(client) {
+		// Disabled -- or its registration mechanism switched off -- after
+		// the page was rendered: nothing is granted. The
 		// row is the one the lock above returned, and the client cannot
 		// be deleted before this transaction ends. The rollback also
 		// leaves the request unconsumed, but the page's own render

@@ -7,12 +7,14 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,8 +25,10 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/inbound/auth"
 	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 	"github.com/narvidev/narvi/internal/adapters/inbound/mcpauth"
+	"github.com/narvidev/narvi/internal/adapters/outbound/cimdfetch"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/domain/mcpclient"
 	"github.com/narvidev/narvi/internal/domain/mcpscope"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -58,9 +62,28 @@ type asRig struct {
 	server       *mcpauth.Server
 	router       http.Handler
 	client       sqlcgen.McpOauthClient
+	// documents is the rig's metadata fetcher: the client ID metadata
+	// documents it serves, from memory -- no test here reaches the network
+	// (cimdfetch's own tests prove the real fetcher's guard).
+	documents *fakeFetcher
 }
 
+// rigOptions configures newASRigWith.
+type rigOptions struct {
+	// mechanisms is the authorization server's (and the /mcp stand-in's)
+	// accepted registration mechanisms.
+	mechanisms mcpclient.Mechanisms
+	// timeouts, when set, replaces platform.DefaultTimeouts().
+	timeouts *platform.Timeouts
+}
+
+// newASRig is the rig with both client-registration mechanisms on.
 func newASRig(t *testing.T) *asRig {
+	t.Helper()
+	return newASRigWith(t, rigOptions{mechanisms: mcpclient.Mechanisms{MetadataDocuments: true, DynamicRegistration: true}})
+}
+
+func newASRigWith(t *testing.T, opts rigOptions) *asRig {
 	t.Helper()
 	pool := IntegrationTestPool(t)
 	r := &asRig{
@@ -70,13 +93,38 @@ func newASRig(t *testing.T) *asRig {
 		clients:      postgres.NewMCPOAuthClientStore(pool),
 		grants:       postgres.NewMCPOAuthGrantStore(pool),
 		auditLog:     postgres.NewAuditLogStore(pool),
+		documents:    newFakeFetcher(),
+	}
+	r.build(t, opts)
+	r.client = r.newClient(t, "narvi_mcp_c_rig", "Editor Plugin", loopbackRedirect, httpsRedirect, localhostRedirect)
+	return r
+}
+
+// rebuilt is r with its server and router built again for opts, on the
+// same database, stores, client and documents -- a deployment restarted
+// with other settings.
+func (r *asRig) rebuilt(t *testing.T, opts rigOptions) *asRig {
+	t.Helper()
+	next := *r
+	next.build(t, opts)
+	return &next
+}
+
+// build constructs r's authorization server and router for opts.
+func (r *asRig) build(t *testing.T, opts rigOptions) {
+	t.Helper()
+	pool := r.pool
+	timeouts := platform.DefaultTimeouts()
+	if opts.timeouts != nil {
+		timeouts = *opts.timeouts
 	}
 	var err error
 	r.server, err = mcpauth.New(mcpauth.Config{
 		PublicBaseURL: rigBase,
 		Enabled:       true,
 		Scopes:        []mcpscope.Scope{mcpscope.Read},
-		Timeouts:      platform.DefaultTimeouts(),
+		Timeouts:      timeouts,
+		Mechanisms:    opts.mechanisms,
 	}, mcpauth.Deps{
 		Pool:         pool,
 		Clients:      r.clients,
@@ -84,11 +132,11 @@ func newASRig(t *testing.T) *asRig {
 		UserSessions: r.userSessions,
 		Users:        r.users,
 		AuditLog:     r.auditLog,
+		Metadata:     r.documents,
 	})
 	if err != nil {
 		t.Fatalf("mcpauth.New: %v", err)
 	}
-	r.client = r.newClient(t, "narvi_mcp_c_rig", "Editor Plugin", loopbackRedirect, httpsRedirect, localhostRedirect)
 
 	ids := r.server.Identifiers()
 	router := chi.NewRouter()
@@ -104,6 +152,9 @@ func newASRig(t *testing.T) *asRig {
 		rt.Post("/consent", r.server.ConsentDecision)
 		rt.Post("/token", r.server.Token)
 		rt.Post("/revoke", r.server.Revoke)
+		// Mounted without controlplane's enabled-gate and rate limit:
+		// TestOAuth_ProductionRouter proves both on the production router.
+		rt.Post("/register", r.server.Register)
 	})
 	router.Route("/mcp", func(rt chi.Router) {
 		rt.Use(auth.RequireMCPBearer(r.grants, auth.MCPBearerConfig{
@@ -111,6 +162,7 @@ func newASRig(t *testing.T) *asRig {
 			ResourceMetadataURL:   ids.ProtectedResourceMetadataURL,
 			Scopes:                []string{"mcp:read"},
 			LastUsedWriteInterval: platform.DefaultTimeouts().MCPGrantLastUsedWriteInterval,
+			ClientMechanisms:      opts.mechanisms,
 		}))
 		// The stand-in answers 200 with the scopes the bearer gate
 		// attached to the request: exactly what tool visibility is
@@ -132,7 +184,6 @@ func newASRig(t *testing.T) *asRig {
 		rt.Delete("/{clientID}", httpapi.DeleteMCPClient(pool, r.clients, r.grants, r.auditLog))
 	})
 	r.router = router
-	return r
 }
 
 func (r *asRig) newClient(t *testing.T, clientID, name string, redirects ...string) sqlcgen.McpOauthClient {
@@ -466,4 +517,99 @@ func (r *asRig) grantIDs(t *testing.T, userID pgtype.UUID) []string {
 		ids = append(ids, id)
 	}
 	return ids
+}
+
+// fakeDocument is one document the fake fetcher serves.
+type fakeDocument struct {
+	body      string
+	maxAge    time.Duration
+	hasMaxAge bool
+	err       error
+	// onFetch, when set, runs inside the fetch, before it answers: what
+	// another authorization does meanwhile.
+	onFetch func()
+}
+
+// fakeFetcher is an in-memory mcpauth.MetadataFetcher: it serves the
+// documents a test set, counting fetches per URL.
+type fakeFetcher struct {
+	mu      sync.Mutex
+	docs    map[string]fakeDocument
+	fetches map[string]int
+}
+
+func newFakeFetcher() *fakeFetcher {
+	return &fakeFetcher{docs: map[string]fakeDocument{}, fetches: map[string]int{}}
+}
+
+func (f *fakeFetcher) Fetch(_ context.Context, clientIDURL string) (cimdfetch.Result, error) {
+	f.mu.Lock()
+	f.fetches[clientIDURL]++
+	d, ok := f.docs[clientIDURL]
+	f.mu.Unlock()
+	if !ok {
+		return cimdfetch.Result{}, errors.New("fake fetcher: no document at this URL")
+	}
+	if d.onFetch != nil {
+		d.onFetch()
+	}
+	if d.err != nil {
+		return cimdfetch.Result{}, d.err
+	}
+	return cimdfetch.Result{Body: []byte(d.body), MaxAge: d.maxAge, HasMaxAge: d.hasMaxAge}, nil
+}
+
+func (f *fakeFetcher) set(clientIDURL string, d fakeDocument) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.docs[clientIDURL] = d
+}
+
+func (f *fakeFetcher) count(clientIDURL string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fetches[clientIDURL]
+}
+
+// metadataDocument renders a valid client ID metadata document for
+// clientIDURL naming name and redirects.
+func metadataDocument(clientIDURL, name string, redirects ...string) string {
+	b, err := json.Marshal(map[string]any{"client_id": clientIDURL, "client_name": name, "redirect_uris": redirects})
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
+// docClientURL is the metadata-document client the rig's CIMD tests use.
+const docClientURL = "https://client.example/mcp/client.json"
+
+// serveDocument makes the fake fetcher serve a valid document for
+// docClientURL naming name, with the rig's loopback and https redirect
+// URIs.
+func (r *asRig) serveDocument(name string) {
+	r.documents.set(docClientURL, fakeDocument{body: metadataDocument(docClientURL, name, loopbackRedirect, httpsRedirect)})
+}
+
+// forClient returns params with client_id replaced.
+func forClient(params url.Values, clientID string) url.Values {
+	out := url.Values{}
+	for k, v := range params {
+		out[k] = append([]string(nil), v...)
+	}
+	out.Set("client_id", clientID)
+	return out
+}
+
+// staleDocument marks clientIDURL's cached document stale now, as a
+// short Cache-Control max-age leaves a document a minute after its fetch:
+// stale, and read recently enough that a failed re-fetch still earns its
+// whole grace (technical plan §43.15 bounds that grace by the last
+// successful fetch).
+func (r *asRig) staleDocument(t *testing.T, clientIDURL string) {
+	t.Helper()
+	tag, err := r.pool.Exec(context.Background(), `UPDATE mcp_oauth_clients SET metadata_stale_at = now() - interval '1 second', metadata_fetched_at = now() - interval '1 minute' WHERE client_id = $1`, clientIDURL)
+	if err != nil || tag.RowsAffected() != 1 {
+		t.Fatalf("mark %s stale: rows %d err %v", clientIDURL, tag.RowsAffected(), err)
+	}
 }

@@ -15,7 +15,7 @@ const createMCPOAuthClient = `-- name: CreateMCPOAuthClient :one
 
 INSERT INTO mcp_oauth_clients (client_id, kind, client_name, client_uri, redirect_uris, created_by)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at
+RETURNING id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at, metadata_fetched_at, metadata_stale_at, metadata_refetch_failed_at
 `
 
 type CreateMCPOAuthClientParams struct {
@@ -54,6 +54,9 @@ func (q *Queries) CreateMCPOAuthClient(ctx context.Context, arg CreateMCPOAuthCl
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.DisabledAt,
+		&i.MetadataFetchedAt,
+		&i.MetadataStaleAt,
+		&i.MetadataRefetchFailedAt,
 	)
 	return i, err
 }
@@ -61,7 +64,7 @@ func (q *Queries) CreateMCPOAuthClient(ctx context.Context, arg CreateMCPOAuthCl
 const deleteMCPOAuthClient = `-- name: DeleteMCPOAuthClient :one
 DELETE FROM mcp_oauth_clients
 WHERE id = $1
-RETURNING id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at
+RETURNING id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at, metadata_fetched_at, metadata_stale_at, metadata_refetch_failed_at
 `
 
 func (q *Queries) DeleteMCPOAuthClient(ctx context.Context, id pgtype.UUID) (McpOauthClient, error) {
@@ -77,12 +80,45 @@ func (q *Queries) DeleteMCPOAuthClient(ctx context.Context, id pgtype.UUID) (Mcp
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.DisabledAt,
+		&i.MetadataFetchedAt,
+		&i.MetadataStaleAt,
+		&i.MetadataRefetchFailedAt,
 	)
 	return i, err
 }
 
+const deleteUnusedMCPOAuthClients = `-- name: DeleteUnusedMCPOAuthClients :execrows
+DELETE FROM mcp_oauth_clients c
+WHERE c.id = ANY($1::uuid[])
+  AND c.kind IN ('dynamic', 'metadata_document')
+  AND c.disabled_at IS NULL
+  AND GREATEST(c.created_at, c.metadata_fetched_at, c.metadata_stale_at) < $2::timestamptz
+  AND NOT EXISTS (SELECT 1 FROM mcp_oauth_grants g WHERE g.client_id = c.id)
+  AND NOT EXISTS (SELECT 1 FROM mcp_oauth_authorization_requests r WHERE r.client_id = c.id)
+`
+
+type DeleteUnusedMCPOAuthClientsParams struct {
+	Ids          []pgtype.UUID      `json:"ids"`
+	UnusedBefore pgtype.Timestamptz `json:"unused_before"`
+}
+
+// DeleteUnusedMCPOAuthClients deletes the candidates the transaction
+// locked above that are STILL candidates: a new statement, so a new
+// snapshot, which sees every request or grant committed before the lock
+// was taken -- the one that committed while the lock waited included --
+// and, the client held FOR UPDATE, none can be added until the
+// transaction ends (its insert's foreign-key check waits, then finds the
+// client gone). Its cascade therefore reaches no row.
+func (q *Queries) DeleteUnusedMCPOAuthClients(ctx context.Context, arg DeleteUnusedMCPOAuthClientsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteUnusedMCPOAuthClients, arg.Ids, arg.UnusedBefore)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getMCPOAuthClientByClientID = `-- name: GetMCPOAuthClientByClientID :one
-SELECT id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at FROM mcp_oauth_clients
+SELECT id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at, metadata_fetched_at, metadata_stale_at, metadata_refetch_failed_at FROM mcp_oauth_clients
 WHERE client_id = $1
 `
 
@@ -99,12 +135,15 @@ func (q *Queries) GetMCPOAuthClientByClientID(ctx context.Context, clientID stri
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.DisabledAt,
+		&i.MetadataFetchedAt,
+		&i.MetadataStaleAt,
+		&i.MetadataRefetchFailedAt,
 	)
 	return i, err
 }
 
 const getMCPOAuthClientByID = `-- name: GetMCPOAuthClientByID :one
-SELECT id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at FROM mcp_oauth_clients
+SELECT id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at, metadata_fetched_at, metadata_stale_at, metadata_refetch_failed_at FROM mcp_oauth_clients
 WHERE id = $1
 `
 
@@ -121,12 +160,15 @@ func (q *Queries) GetMCPOAuthClientByID(ctx context.Context, id pgtype.UUID) (Mc
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.DisabledAt,
+		&i.MetadataFetchedAt,
+		&i.MetadataStaleAt,
+		&i.MetadataRefetchFailedAt,
 	)
 	return i, err
 }
 
 const listMCPOAuthClients = `-- name: ListMCPOAuthClients :many
-SELECT id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at FROM mcp_oauth_clients
+SELECT id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at, metadata_fetched_at, metadata_stale_at, metadata_refetch_failed_at FROM mcp_oauth_clients
 ORDER BY created_at, id
 `
 
@@ -149,6 +191,9 @@ func (q *Queries) ListMCPOAuthClients(ctx context.Context) ([]McpOauthClient, er
 			&i.CreatedBy,
 			&i.CreatedAt,
 			&i.DisabledAt,
+			&i.MetadataFetchedAt,
+			&i.MetadataStaleAt,
+			&i.MetadataRefetchFailedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -161,7 +206,7 @@ func (q *Queries) ListMCPOAuthClients(ctx context.Context) ([]McpOauthClient, er
 }
 
 const lockMCPOAuthClient = `-- name: LockMCPOAuthClient :one
-SELECT id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at FROM mcp_oauth_clients
+SELECT id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at, metadata_fetched_at, metadata_stale_at, metadata_refetch_failed_at FROM mcp_oauth_clients
 WHERE id = $1
 FOR UPDATE
 `
@@ -190,12 +235,15 @@ func (q *Queries) LockMCPOAuthClient(ctx context.Context, id pgtype.UUID) (McpOa
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.DisabledAt,
+		&i.MetadataFetchedAt,
+		&i.MetadataStaleAt,
+		&i.MetadataRefetchFailedAt,
 	)
 	return i, err
 }
 
 const lockMCPOAuthClientKeyShare = `-- name: LockMCPOAuthClientKeyShare :one
-SELECT id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at FROM mcp_oauth_clients
+SELECT id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at, metadata_fetched_at, metadata_stale_at, metadata_refetch_failed_at FROM mcp_oauth_clients
 WHERE id = $1
 FOR KEY SHARE
 `
@@ -220,6 +268,187 @@ func (q *Queries) LockMCPOAuthClientKeyShare(ctx context.Context, id pgtype.UUID
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.DisabledAt,
+		&i.MetadataFetchedAt,
+		&i.MetadataStaleAt,
+		&i.MetadataRefetchFailedAt,
+	)
+	return i, err
+}
+
+const lockUnusedMCPOAuthClients = `-- name: LockUnusedMCPOAuthClients :many
+SELECT c.id FROM mcp_oauth_clients c
+WHERE c.kind IN ('dynamic', 'metadata_document')
+  AND c.disabled_at IS NULL
+  AND GREATEST(c.created_at, c.metadata_fetched_at, c.metadata_stale_at) < $1::timestamptz
+  AND NOT EXISTS (SELECT 1 FROM mcp_oauth_grants g WHERE g.client_id = c.id)
+  AND NOT EXISTS (SELECT 1 FROM mcp_oauth_authorization_requests r WHERE r.client_id = c.id)
+ORDER BY c.id
+FOR UPDATE OF c
+`
+
+// The expired-credential sweep's unused-client pass (technical plan
+// §43.15) is these two statements, in one transaction
+// (MCPOAuthClientStore.DeleteUnused). A candidate is a dynamically
+// registered or metadata-document client that no operator disabled -- a
+// disabled row IS the block: deleting it would let the next authorization
+// register the same URL afresh, enabled -- holding no grant and no
+// authorization request (pending, or consumed and not yet swept), last
+// used before unused_before (now - MCPDynamicClientUnusedTTL): the latest
+// of its registration, its last successful fetch and the end of the time
+// its cached document may be used without a fetch -- which a failed
+// re-fetch's grace pushes out, so a client still served from its cache is
+// never a candidate. Pre-registered clients never are.
+//
+// LockUnusedMCPOAuthClients takes every candidate FOR UPDATE, in id order
+// (the lock order at the top of mcpoauthgrant_store.go: the client
+// first). A candidate a re-fetch is updating is re-checked once the
+// re-fetch commits, and skipped. A candidate an authorization request's
+// (or a grant's) insert holds FOR KEY SHARE -- its foreign-key check --
+// is waited for, and returned: a row only locked, not updated, is not
+// re-checked.
+func (q *Queries) LockUnusedMCPOAuthClients(ctx context.Context, unusedBefore pgtype.Timestamptz) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, lockUnusedMCPOAuthClients, unusedBefore)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []pgtype.UUID
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const markMCPOAuthMetadataDocumentRefetchFailed = `-- name: MarkMCPOAuthMetadataDocumentRefetchFailed :one
+UPDATE mcp_oauth_clients
+SET metadata_refetch_failed_at = $1,
+    metadata_stale_at          = $2
+WHERE id = $3
+  AND kind = 'metadata_document'
+  AND metadata_fetched_at = $4
+  AND metadata_refetch_failed_at IS NULL
+RETURNING id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at, metadata_fetched_at, metadata_stale_at, metadata_refetch_failed_at
+`
+
+type MarkMCPOAuthMetadataDocumentRefetchFailedParams struct {
+	MetadataRefetchFailedAt pgtype.Timestamptz `json:"metadata_refetch_failed_at"`
+	MetadataStaleAt         pgtype.Timestamptz `json:"metadata_stale_at"`
+	ID                      pgtype.UUID        `json:"id"`
+	MetadataFetchedAt       pgtype.Timestamptz `json:"metadata_fetched_at"`
+}
+
+// MarkMCPOAuthMetadataDocumentRefetchFailed records the FIRST failed
+// re-fetch of a metadata-document client's stale document since its last
+// successful fetch: when it failed, and the stale time the one grace it
+// starts ends at, which the caller computes (mcpauth's refetchGraceEnd):
+// the failure + MCPClientMetadataCacheTTL, but never later than the last
+// successful fetch + two MCPClientMetadataCacheTTL. A first failure that
+// comes when that bound has already passed gets no grace, and the caller
+// records nothing: this statement is never run for it. It applies
+// only while no fetch has succeeded since the caller read the row (the
+// metadata_fetched_at guard) -- so a failure never pushes out the shorter
+// lifetime a newer successful fetch set -- and only while no failure is
+// recorded yet (the metadata_refetch_failed_at guard) -- so a later
+// failure never extends the grace: past it, the client is refused until a
+// fetch succeeds. One statement, one row lock (FOR NO KEY UPDATE on the
+// client), like the upsert above. pgx.ErrNoRows means another fetch
+// succeeded, another failure started the grace first, or the client is
+// gone.
+func (q *Queries) MarkMCPOAuthMetadataDocumentRefetchFailed(ctx context.Context, arg MarkMCPOAuthMetadataDocumentRefetchFailedParams) (McpOauthClient, error) {
+	row := q.db.QueryRow(ctx, markMCPOAuthMetadataDocumentRefetchFailed,
+		arg.MetadataRefetchFailedAt,
+		arg.MetadataStaleAt,
+		arg.ID,
+		arg.MetadataFetchedAt,
+	)
+	var i McpOauthClient
+	err := row.Scan(
+		&i.ID,
+		&i.ClientID,
+		&i.Kind,
+		&i.ClientName,
+		&i.ClientUri,
+		&i.RedirectUris,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.DisabledAt,
+		&i.MetadataFetchedAt,
+		&i.MetadataStaleAt,
+		&i.MetadataRefetchFailedAt,
+	)
+	return i, err
+}
+
+const upsertMCPOAuthMetadataDocumentClient = `-- name: UpsertMCPOAuthMetadataDocumentClient :one
+INSERT INTO mcp_oauth_clients (client_id, kind, client_name, redirect_uris, metadata_fetched_at, metadata_stale_at)
+VALUES ($1, 'metadata_document', $2, $3, $4, $5)
+ON CONFLICT (client_id) DO UPDATE
+SET client_name                = EXCLUDED.client_name,
+    redirect_uris              = EXCLUDED.redirect_uris,
+    metadata_fetched_at        = EXCLUDED.metadata_fetched_at,
+    metadata_stale_at          = EXCLUDED.metadata_stale_at,
+    metadata_refetch_failed_at = NULL
+WHERE mcp_oauth_clients.kind = 'metadata_document'
+RETURNING id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at, metadata_fetched_at, metadata_stale_at, metadata_refetch_failed_at
+`
+
+type UpsertMCPOAuthMetadataDocumentClientParams struct {
+	ClientID          string             `json:"client_id"`
+	ClientName        string             `json:"client_name"`
+	RedirectUris      []string           `json:"redirect_uris"`
+	MetadataFetchedAt pgtype.Timestamptz `json:"metadata_fetched_at"`
+	MetadataStaleAt   pgtype.Timestamptz `json:"metadata_stale_at"`
+}
+
+// UpsertMCPOAuthMetadataDocumentClient records one successfully fetched
+// and validated client ID metadata document (technical plan §43.15,
+// migrations/000143_mcp_oauth_client_metadata.up.sql): it creates the
+// client the URL identifies, or replaces its cached name, redirect URIs
+// and cache stamps in place (same id, so every grant, request, code and
+// token under it is untouched -- and none of them reads the client's
+// redirect URIs or name to decide anything it was issued for), clearing
+// any failed re-fetch the document had been kept through. The WHERE
+// keeps it from ever rewriting a client of another kind; no other kind's
+// client_id can be an https URL anyway. disabled_at is never touched: a
+// re-fetch does not re-enable a client an operator disabled.
+//
+// Its locks, in the order at the top of mcpoauthgrant_store.go: ONE
+// statement, ONE row -- the client -- taken FOR NO KEY UPDATE (no key
+// column changes). That conflicts with a client's deletion and the
+// unused-client sweep (FOR UPDATE), never with the FOR KEY SHARE every
+// consent, code exchange, refresh and grant revocation takes on the
+// client; and holding nothing else, it can never be part of a wait cycle.
+// If the row it would update is deleted while it waits, it inserts a
+// fresh client instead (INSERT ... ON CONFLICT's own retry).
+func (q *Queries) UpsertMCPOAuthMetadataDocumentClient(ctx context.Context, arg UpsertMCPOAuthMetadataDocumentClientParams) (McpOauthClient, error) {
+	row := q.db.QueryRow(ctx, upsertMCPOAuthMetadataDocumentClient,
+		arg.ClientID,
+		arg.ClientName,
+		arg.RedirectUris,
+		arg.MetadataFetchedAt,
+		arg.MetadataStaleAt,
+	)
+	var i McpOauthClient
+	err := row.Scan(
+		&i.ID,
+		&i.ClientID,
+		&i.Kind,
+		&i.ClientName,
+		&i.ClientUri,
+		&i.RedirectUris,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.DisabledAt,
+		&i.MetadataFetchedAt,
+		&i.MetadataStaleAt,
+		&i.MetadataRefetchFailedAt,
 	)
 	return i, err
 }

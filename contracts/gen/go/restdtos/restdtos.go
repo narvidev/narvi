@@ -1916,16 +1916,26 @@ func (j *CreateCloudIdentityBindingRequest) UnmarshalJSON(value []byte) error {
 }
 
 // POST /api/mcp-clients's own request body (technical plan §43.15): pre-register
-// an MCP client. The server generates the client_id. Every redirect URI must be
-// https with any host, or http on 127.0.0.1, [::1] or localhost, with no fragment
-// and no userinfo -- anything else is refused 400 (internal/domain/mcpclient).
-// clientName is trimmed and must be 1 to 100 characters with no control or
-// invisible formatting character.
+// an MCP client. The server generates the client_id. Every redirect URI must be at
+// most 2048 bytes of printable ASCII: https with any host, or http on 127.0.0.1,
+// [::1] or localhost, with a valid port if it names one, no fragment and no
+// userinfo, and its host written in plain ASCII -- no percent sign in the
+// authority, so an internationalized host is written in its xn-- form -- anything
+// else is refused 400 (internal/domain/mcpclient). clientName is trimmed and must
+// be 1 to 100 printable characters -- letters, marks, numbers, punctuation,
+// symbols and the ASCII space -- so a control or invisible formatting character, a
+// space other than U+0020 (a no-break, ideographic or thin space; white space at
+// either end is trimmed, not refused), a line or paragraph separator, and a
+// private-use or unassigned code point are all refused 400, as is a name stacking
+// more than three combining marks on one character (the rule every registration
+// path shares, technical plan §43.15).
 type CreateMCPClientRequest struct {
 	// ClientName corresponds to the JSON schema field "clientName".
 	ClientName string `json:"clientName" yaml:"clientName" mapstructure:"clientName"`
 
-	// Optional https homepage of the client; the consent page shows its host.
+	// Optional https homepage of the client: at most 2048 bytes of printable ASCII,
+	// with a host and no userinfo, its host written in plain ASCII like a redirect
+	// URI's -- anything else is refused 400. The consent page shows its host.
 	ClientUri *string `json:"clientUri,omitempty,omitzero" yaml:"clientUri,omitempty" mapstructure:"clientUri,omitempty"`
 
 	// 1 to 10 redirect URIs, each checked by the rule above.
@@ -4889,13 +4899,18 @@ type MCPAuthorization struct {
 	ClientId string `json:"clientId" yaml:"clientId" mapstructure:"clientId"`
 
 	// Matches Postgres mcp_oauth_client_kind exactly
-	// (migrations/000141_mcp_oauth.up.sql). An OPEN enum (manifest.json's openEnums):
-	// only preregistered is produced today -- the other two values are declared for
-	// the client-registration mechanisms technical plan §43.15 reserves -- so a
-	// consumer MUST tolerate a value it does not recognise.
+	// (migrations/000141_mcp_oauth.up.sql). How the client came to be registered
+	// (technical plan §43.15): preregistered by an administrator; metadata_document,
+	// identified by an https URL whose client ID metadata document the server fetched
+	// (clientId is that URL, and its host is the client's identity); or dynamic,
+	// registered by the client itself through RFC 7591 (off by default). An OPEN enum
+	// (manifest.json's openEnums): a consumer MUST tolerate a value it does not
+	// recognise.
 	ClientKind MCPAuthorizationClientKind `json:"clientKind" yaml:"clientKind" mapstructure:"clientKind"`
 
-	// The client's display name, as registered.
+	// The client's display name, as registered -- chosen by the client itself unless
+	// clientKind is preregistered, so never an identity on its own (technical plan
+	// §43.15).
 	ClientName string `json:"clientName" yaml:"clientName" mapstructure:"clientName"`
 
 	// When the user first authorized this client.
@@ -5024,10 +5039,13 @@ type MCPClient struct {
 	Id string `json:"id" yaml:"id" mapstructure:"id"`
 
 	// Matches Postgres mcp_oauth_client_kind exactly
-	// (migrations/000141_mcp_oauth.up.sql). An OPEN enum (manifest.json's openEnums):
-	// only preregistered is produced today -- the other two values are declared for
-	// the client-registration mechanisms technical plan §43.15 reserves -- so a
-	// consumer MUST tolerate a value it does not recognise.
+	// (migrations/000141_mcp_oauth.up.sql). How the client came to be registered
+	// (technical plan §43.15): preregistered by an administrator; metadata_document,
+	// identified by an https URL whose client ID metadata document the server fetched
+	// (clientId is that URL, and its host is the client's identity); or dynamic,
+	// registered by the client itself through RFC 7591 (off by default). An OPEN enum
+	// (manifest.json's openEnums): a consumer MUST tolerate a value it does not
+	// recognise.
 	Kind MCPClientKind `json:"kind" yaml:"kind" mapstructure:"kind"`
 
 	// Every registered redirect URI. The authorization endpoint compares a presented

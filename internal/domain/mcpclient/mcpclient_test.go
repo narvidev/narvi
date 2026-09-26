@@ -31,6 +31,8 @@ func TestValidateRedirectURI(t *testing.T) {
 		{"https:client.example", false},              // opaque
 		{"https://client.example/c b", false},        // space
 		{"https://client.example/caf\u00e9", false},  // non-ASCII
+		{"https://%D0%B0lpha.example/cb", false},     // ASCII as written, a Cyrillic host once parsed
+		{"https://xn--lpha-43d.example/cb", true},    // the same host in its xn-- form
 		{"https://client.example/cb\x00", false},     // control
 		{"http://127.0.0.1:0/cb", false},             // port 0
 		{"http://127.0.0.1:99999/cb", false},         // port out of range
@@ -130,10 +132,35 @@ func TestValidateClientName(t *testing.T) {
 		{"bad\nname", "", false},
 		{"zero\u200bwidth", "", false},
 		{"bidi\u202eoverride", "", false},
+		{"isolate\u2066name", "", false},
+		{"line\u2028separator", "", false},
+		{"no\u00a0break", "", false},
+		{"private\ue000use", "", false},
+		{"unassigned\u0378", "", false},
+		{"tab\tinside", "", false},
 		{"Caf\u00e9 Plugin", "Caf\u00e9 Plugin", true},
+		{"\u7de8\u96c6\u30d7\u30e9\u30b0\u30a4\u30f3", "\u7de8\u96c6\u30d7\u30e9\u30b0\u30a4\u30f3", true},
 		{strings.Repeat("x", mcpclient.MaxClientNameRunes), strings.Repeat("x", mcpclient.MaxClientNameRunes), true},
 		{strings.Repeat("x", mcpclient.MaxClientNameRunes+1), "", false},
 		{"\xff", "", false},
+		// Combining marks: what written text stacks on one character is
+		// allowed; a tall stack, which paints over the identity headline
+		// above the name, is not (§43.15).
+		{"Vi\u0065\u0323\u0302t", "Vi\u0065\u0323\u0302t", true}, // e + dot below + circumflex
+		{"Key 1\ufe0f\u20e3", "Key 1\ufe0f\u20e3", true},         // keycap: variation selector + enclosing mark
+		{"a\u0301\u0302\u0303", "a\u0301\u0302\u0303", true},     // exactly the limit
+		// The count is per character: a name may carry more marks in all
+		// than the limit, so long as no one character stacks more. One
+		// per character, four in all; the limit on one, then one more;
+		// Thai, four marks and two at most on one letter; Vietnamese
+		// decomposed (NFD), four marks, two on each e.
+		{"a\u0301b\u0301c\u0301d\u0301", "a\u0301b\u0301c\u0301d\u0301", true},
+		{"a\u0301\u0302\u0303b\u0301", "a\u0301\u0302\u0303b\u0301", true},
+		{"\u0e1c\u0e39\u0e49\u0e0a\u0e48\u0e27\u0e22\u0e40\u0e02\u0e35\u0e22\u0e19", "\u0e1c\u0e39\u0e49\u0e0a\u0e48\u0e27\u0e22\u0e40\u0e02\u0e35\u0e22\u0e19", true},
+		{"Tie\u0302\u0301ng Vie\u0323\u0302t", "Tie\u0302\u0301ng Vie\u0323\u0302t", true},
+		{"a\u0301\u0302\u0303\u0304", "", false},             // one past the limit
+		{"x\u20dd\u20dd\u20dd\u20dd", "", false},             // enclosing marks count too
+		{"Editor" + strings.Repeat("\u030d", 94), "", false}, // 100 runes: 94 marks on one letter
 	}
 	for _, tc := range tests {
 		got, err := mcpclient.ValidateClientName(tc.in)
@@ -156,6 +183,8 @@ func TestValidateClientURI(t *testing.T) {
 		{"javascript:alert(1)", false},
 		{"https://user@client.example", false},
 		{"https://client.example/a b", false},
+		{"https://%D0%B0lpha.example", false},
+		{"https://xn--lpha-43d.example", true},
 		{"", false},
 	}
 	for _, tc := range tests {

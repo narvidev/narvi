@@ -6,8 +6,12 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 )
@@ -39,44 +43,270 @@ func TestConsent_FrameHeaders(t *testing.T) {
 
 // TestConsent_ShowsClientIdentityAndRedirectHost: the page states who
 // vouched for the client and the true host the browser returns to, with
-// a warning for this machine and none for a real https host.
+// a warning for this machine and none for a real https host -- for every
+// client kind (the confused-deputy threat row, technical plan §43.19). A
+// metadata-document client's headline is its client_id URL's HOST, the one
+// thing its document cannot choose; the name it chose itself comes second,
+// escaped; and a name with a bidi override or a control character never
+// reaches the page at all (refused when the document is validated). A
+// dynamically registered client is headed by fixed words saying it
+// registered itself, with the name it gave itself second, quoted (never in
+// the title or headline: TestConsentPage_SelfRegisteredNameNeverHeadsThePage).
 func TestConsent_ShowsClientIdentityAndRedirectHost(t *testing.T) {
-	r := newASRig(t)
-	user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+	t.Run("preregistered", func(t *testing.T) {
+		r := newASRig(t)
+		user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
 
-	loopback := r.authorizeParams(newVerifier(t))
-	requestID := r.startConsent(t, loopback, cookie)
-	rec, _ := r.renderConsent(t, requestID, cookie)
-	body := rec.Body.String()
-	for _, want := range []string{
-		"Editor Plugin",
-		"Registered by an administrator of this deployment.",
-		"<strong>127.0.0.1</strong>",
-		"That is this computer.",
-		user.PrimaryEmail,
-		`value="mcp:read" checked`,
-	} {
-		if !strings.Contains(body, want) {
-			t.Errorf("loopback consent page lacks %q", want)
+		loopback := r.authorizeParams(newVerifier(t))
+		requestID := r.startConsent(t, loopback, cookie)
+		rec, _ := r.renderConsent(t, requestID, cookie)
+		body := rec.Body.String()
+		for _, want := range []string{
+			"Editor Plugin",
+			"Registered by an administrator of this deployment.",
+			"<strong>127.0.0.1</strong>",
+			"That is this computer.",
+			user.PrimaryEmail,
+			`value="mcp:read" checked`,
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("loopback consent page lacks %q", want)
+			}
+		}
+
+		https := r.authorizeParams(newVerifier(t))
+		https.Set("redirect_uri", httpsRedirect)
+		requestID = r.startConsent(t, https, cookie)
+		rec, _ = r.renderConsent(t, requestID, cookie)
+		body = rec.Body.String()
+		if !strings.Contains(body, "<strong>client.example</strong>") || strings.Contains(body, "That is this computer.") {
+			t.Errorf("https consent page: want host client.example and no loopback warning")
+		}
+
+		scopeless := r.authorizeParams(newVerifier(t))
+		scopeless.Del("scope")
+		requestID = r.startConsent(t, scopeless, cookie)
+		rec, _ = r.renderConsent(t, requestID, cookie)
+		if !strings.Contains(rec.Body.String(), "asked for no access") || strings.Contains(rec.Body.String(), `name="scope"`) {
+			t.Errorf("scope-less consent page: want the no-access notice and no checkbox")
+		}
+	})
+
+	t.Run("metadata document", func(t *testing.T) {
+		r := newASRig(t)
+		_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+		const docURL = "https://tools.example:8443/mcp/client.json"
+		const spoof = `Registered by an administrator <script>alert(1)</script> & co`
+		r.documents.set(docURL, fakeDocument{body: metadataDocument(docURL, spoof, loopbackRedirect, "https://tools.example/cb")})
+
+		requestID := r.startConsent(t, forClient(r.authorizeParams(newVerifier(t)), docURL), cookie)
+		rec, _ := r.renderConsent(t, requestID, cookie)
+		body := rec.Body.String()
+		for _, want := range []string{
+			`<title>Allow the app at tools.example:8443? - Narvi</title>`,
+			`<h1>Allow the app at <strong class="host">tools.example:8443</strong> to use Narvi as you?</h1>`,
+			`It calls itself <strong>Registered by an administrator &lt;script&gt;alert(1)&lt;/script&gt; &amp; co</strong>.`,
+			"The address above is where this deployment read the app&#39;s description",
+			"<strong>127.0.0.1</strong>",
+			"That is this computer.",
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("metadata-document consent page lacks %q", want)
+			}
+		}
+		if strings.Contains(body, "<script>") || strings.Contains(body, "Registered by an administrator of this deployment.") {
+			t.Error("metadata-document consent page: the self-chosen name was not escaped, or the page claims an administrator registered the app")
+		}
+		// The identity line comes before the name, which comes second.
+		if strings.Index(body, `class="host">tools.example:8443`) > strings.Index(body, "It calls itself") {
+			t.Error("the name is shown before the host")
+		}
+
+		https := forClient(r.authorizeParams(newVerifier(t)), docURL)
+		https.Set("redirect_uri", "https://tools.example/cb")
+		requestID = r.startConsent(t, https, cookie)
+		rec, _ = r.renderConsent(t, requestID, cookie)
+		if body := rec.Body.String(); !strings.Contains(body, "<strong>tools.example</strong>") || strings.Contains(body, "That is this computer.") {
+			t.Error("https redirect: want the redirect host and no loopback warning")
+		}
+
+		for name, clientName := range map[string]string{
+			"a bidi override":     "Editor\u202eEvil",
+			"a control character": "Editor\u0007Plugin",
+			"a zero-width space":  "Edit\u200bor",
+		} {
+			url := "https://spoof.example/" + strings.ReplaceAll(name, " ", "-") + ".json"
+			r.documents.set(url, fakeDocument{body: `{"client_id":"` + url + `","client_name":"` + clientName + `","redirect_uris":["` + loopbackRedirect + `"]}`})
+			rec := r.authorize(forClient(r.authorizeParams(newVerifier(t)), url), cookie)
+			if rec.Code != http.StatusBadRequest || rec.Header().Get("Location") != "" {
+				t.Errorf("a name with %s: status %d Location %q, want a 400 page and no consent", name, rec.Code, rec.Header().Get("Location"))
+			}
+		}
+	})
+
+	t.Run("dynamic registration", func(t *testing.T) {
+		r := newASRig(t)
+		_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+		clientID := r.register(t, `{"client_name":"Desktop Assistant","redirect_uris":["`+loopbackRedirect+`"]}`)
+		requestID := r.startConsent(t, forClient(r.authorizeParams(newVerifier(t)), clientID), cookie)
+		rec, _ := r.renderConsent(t, requestID, cookie)
+		body := rec.Body.String()
+		for _, want := range []string{
+			"<title>Allow an app that registered itself? - Narvi</title>",
+			"<h1>Allow an app that registered itself to use Narvi as you?</h1>",
+			`It calls itself <strong>"Desktop Assistant"</strong>, a name it gave itself. This app registered itself with this deployment, so nothing vouches for its name.`,
+			"<strong>127.0.0.1</strong>",
+			"That is this computer.",
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("dynamic-client consent page lacks %q", want)
+			}
+		}
+		if strings.Contains(body, "Registered by an administrator of this deployment.") {
+			t.Error("the page claims an administrator registered a self-registered app")
+		}
+	})
+}
+
+// assertASCIIPage: body carries no byte outside ASCII -- with every client
+// name in play plain ASCII and the templates plain ASCII too, a non-ASCII
+// byte could only be a host decoded into a look-alike.
+func assertASCIIPage(t *testing.T, what, body string) {
+	t.Helper()
+	for i := 0; i < len(body); i++ {
+		if body[i] >= 0x80 {
+			t.Errorf("%s: the page carries a non-ASCII byte at %d: %q", what, i, body[max(0, i-40):min(len(body), i+40)])
+			return
 		}
 	}
+}
 
-	https := r.authorizeParams(newVerifier(t))
-	https.Set("redirect_uri", httpsRedirect)
-	requestID = r.startConsent(t, https, cookie)
-	rec, _ = r.renderConsent(t, requestID, cookie)
-	body = rec.Body.String()
-	if !strings.Contains(body, "<strong>client.example</strong>") || strings.Contains(body, "That is this computer.") {
-		t.Errorf("https consent page: want host client.example and no loopback warning")
+// TestConsent_NoNonASCIIHostReachesThePage: every host the consent flow
+// shows -- the identity headline and title, the redirect line, a
+// pre-registered client's homepage line -- is plain ASCII, the very string
+// a fetch resolves (technical plan §43.15). A
+// percent-encoded client_id host (a Cyrillic look-alike, a right-to-left
+// override) is refused before any fetch; a document registering a
+// percent-encoded redirect URI is refused and nothing is stored; the same
+// host written in its xn-- form is shown in exactly that form; a row
+// planted past every validation is refused rather than shown; and a
+// pre-registered client's homepage stored with a percent-encoded host is
+// left off the page rather than shown decoded.
+func TestConsent_NoNonASCIIHostReachesThePage(t *testing.T) {
+	r := newASRig(t)
+	_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+
+	for _, tc := range []struct {
+		name, clientID string
+		redirect       string // the document's one redirect URI, and the request's
+		fetched        bool
+	}{
+		{"a percent-encoded Cyrillic look-alike client_id", "https://%D0%B0lpha.example/mcp/client.json", loopbackRedirect, false},
+		{"a percent-encoded right-to-left override client_id", "https://%E2%80%AEtset.elpmaxe/x", loopbackRedirect, false},
+		{"a document registering a percent-encoded look-alike redirect URI", "https://lookalike.example/mcp/client.json", "https://%D0%B0lpha.example/cb", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r.documents.set(tc.clientID, fakeDocument{body: metadataDocument(tc.clientID, "Editor", tc.redirect)})
+			p := forClient(r.authorizeParams(newVerifier(t)), tc.clientID)
+			p.Set("redirect_uri", tc.redirect)
+			rec := r.authorize(p, cookie)
+			assertPageNotRedirect(t, tc.name, rec)
+			assertASCIIPage(t, tc.name, rec.Body.String())
+			if _, stored := r.clientRow(t, tc.clientID); stored {
+				t.Errorf("a client was stored for %s", tc.clientID)
+			}
+			if fetched := r.documents.count(tc.clientID) > 0; fetched != tc.fetched {
+				t.Errorf("fetched = %v, want %v", fetched, tc.fetched)
+			}
+		})
 	}
 
-	scopeless := r.authorizeParams(newVerifier(t))
-	scopeless.Del("scope")
-	requestID = r.startConsent(t, scopeless, cookie)
-	rec, _ = r.renderConsent(t, requestID, cookie)
-	if !strings.Contains(rec.Body.String(), "asked for no access") || strings.Contains(rec.Body.String(), `name="scope"`) {
-		t.Errorf("scope-less consent page: want the no-access notice and no checkbox")
-	}
+	t.Run("the same host in its xn-- form is shown exactly so", func(t *testing.T) {
+		const clientID, redirect = "https://xn--lpha-43d.example/mcp/client.json", "https://xn--lpha-43d.example/cb"
+		r.documents.set(clientID, fakeDocument{body: metadataDocument(clientID, "Editor", redirect)})
+		p := forClient(r.authorizeParams(newVerifier(t)), clientID)
+		p.Set("redirect_uri", redirect)
+		rec, _ := r.renderConsent(t, r.startConsent(t, p, cookie), cookie)
+		body := rec.Body.String()
+		for _, want := range []string{
+			`<title>Allow the app at xn--lpha-43d.example? - Narvi</title>`,
+			`<h1>Allow the app at <strong class="host">xn--lpha-43d.example</strong> to use Narvi as you?</h1>`,
+			`sent back to <strong>xn--lpha-43d.example</strong>`,
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("consent page lacks %q", want)
+			}
+		}
+		assertASCIIPage(t, "xn-- consent page", body)
+	})
+
+	// Rows no registration path can write any more -- written straight to
+	// the tables, as a row stored before the rule would be: the page
+	// refuses to show a host it cannot show as written.
+	t.Run("a row planted past validation is refused, never shown", func(t *testing.T) {
+		ctx := context.Background()
+		now := time.Now()
+		const plantedID, plantedRedirect = "https://%D0%B0lpha.example/planted.json", "https://%D0%B0lpha.example/cb"
+		planted, err := r.clients.UpsertMetadataDocument(ctx, sqlcgen.UpsertMCPOAuthMetadataDocumentClientParams{
+			ClientID: plantedID, ClientName: "Editor", RedirectUris: []string{plantedRedirect},
+			MetadataFetchedAt: pgtype.Timestamptz{Time: now, Valid: true},
+			MetadataStaleAt:   pgtype.Timestamptz{Time: now.Add(time.Hour), Valid: true},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name, row := range map[string]sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
+			"a planted metadata-document client":  {ClientID: planted.ID, RedirectUri: loopbackRedirect},
+			"a planted redirect URI on a request": {ClientID: r.client.ID, RedirectUri: plantedRedirect},
+		} {
+			row.CodeChallenge, row.CodeChallengeMethod = "c", "S256"
+			row.Resource = r.server.Identifiers().Resource
+			row.ExpiresAt = pgtype.Timestamptz{Time: now.Add(time.Minute), Valid: true}
+			req, err := r.grants.CreateAuthorizationRequest(ctx, row)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec, _ := r.renderConsent(t, req.ID.String(), cookie)
+			if rec.Code == http.StatusOK {
+				t.Errorf("%s: the consent page rendered: %s", name, rec.Body.String())
+			}
+			assertASCIIPage(t, name, rec.Body.String())
+		}
+	})
+
+	// A homepage URI the admin API refuses today but stored an earlier
+	// release's rule accepted: its host would decode to a look-alike, so
+	// the page shows no homepage line for it; a plain-ASCII homepage, the
+	// xn-- form included, is shown exactly as written.
+	t.Run("a pre-registered client's homepage", func(t *testing.T) {
+		for i, tc := range []struct {
+			clientURI, want string // want "": no homepage line
+		}{
+			{"https://%D0%B0lpha.example/about", ""},
+			{"https://alpha.example/about", "alpha.example"},
+			{"https://xn--lpha-43d.example/about", "xn--lpha-43d.example"},
+		} {
+			uri := tc.clientURI
+			c, err := r.clients.Create(context.Background(), sqlcgen.CreateMCPOAuthClientParams{
+				ClientID: "narvi_mcp_c_homepage_" + strconv.Itoa(i), Kind: sqlcgen.McpOauthClientKindPreregistered,
+				ClientName: "Editor", RedirectUris: []string{loopbackRedirect}, ClientUri: &uri,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec, _ := r.renderConsent(t, r.startConsent(t, forClient(r.authorizeParams(newVerifier(t)), c.ClientID), cookie), cookie)
+			body := rec.Body.String()
+			line := `<p class="meta">Homepage: ` + tc.want + `</p>`
+			_, shown, hasLine := strings.Cut(body, "Homepage:")
+			switch {
+			case tc.want == "" && hasLine:
+				t.Errorf("%s: the page shows a homepage line: Homepage:%q", tc.clientURI, shown[:min(len(shown), 40)])
+			case tc.want != "" && !strings.Contains(body, line):
+				t.Errorf("%s: the page lacks %q", tc.clientURI, line)
+			}
+			assertASCIIPage(t, tc.clientURI, body)
+		}
+	})
 }
 
 // TestConsent_ClientNameIsEscaped: the one client-influenced string on the

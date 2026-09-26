@@ -28,6 +28,7 @@ func TestDeriveIdentifiers(t *testing.T) {
 				AuthorizationEndpoint:          "https://narvi.example/oauth/authorize",
 				TokenEndpoint:                  "https://narvi.example/oauth/token",
 				RevocationEndpoint:             "https://narvi.example/oauth/revoke",
+				RegistrationEndpoint:           "https://narvi.example/oauth/register",
 			},
 		},
 		{
@@ -41,6 +42,7 @@ func TestDeriveIdentifiers(t *testing.T) {
 				AuthorizationEndpoint:          "https://narvi.example/oauth/authorize",
 				TokenEndpoint:                  "https://narvi.example/oauth/token",
 				RevocationEndpoint:             "https://narvi.example/oauth/revoke",
+				RegistrationEndpoint:           "https://narvi.example/oauth/register",
 			},
 		},
 		{
@@ -54,6 +56,7 @@ func TestDeriveIdentifiers(t *testing.T) {
 				AuthorizationEndpoint:          "http://127.0.0.1:52345/oauth/authorize",
 				TokenEndpoint:                  "http://127.0.0.1:52345/oauth/token",
 				RevocationEndpoint:             "http://127.0.0.1:52345/oauth/revoke",
+				RegistrationEndpoint:           "http://127.0.0.1:52345/oauth/register",
 			},
 		},
 		{
@@ -68,6 +71,7 @@ func TestDeriveIdentifiers(t *testing.T) {
 				AuthorizationEndpoint:          "https://narvi.example/prefix/oauth/authorize",
 				TokenEndpoint:                  "https://narvi.example/prefix/oauth/token",
 				RevocationEndpoint:             "https://narvi.example/prefix/oauth/revoke",
+				RegistrationEndpoint:           "https://narvi.example/prefix/oauth/register",
 			},
 		},
 	}

@@ -293,6 +293,54 @@ func TestSchemaSqlcStoresPipeline(t *testing.T) {
 		t.Fatalf("stored fires_at = %v, want %v (the re-armed value, proving update-in-place)", gotTimer.FiresAt.Time, secondFiresAt)
 	}
 
+	// (d2) migration 000143 round-trips with data it describes stored: a
+	// metadata-document client, its re-fetch failing. The down keeps the
+	// client (and whatever was issued under it) while dropping its cache
+	// stamps; re-applying the up must stamp it stale -- fetched when it was
+	// registered, re-fetched on its next use -- rather than refuse it and
+	// leave the schema dirty, which would block every boot after a rollback
+	// followed by a roll-forward (technical plan §43.15).
+	const clientMetadataVersion = 143
+	const docClientID = "https://client.example/mcp/client.json"
+	clientStore := narvipg.NewMCPOAuthClientStore(pool)
+	fetchedAt := time.Now().Add(-2 * time.Hour)
+	docClient, err := clientStore.UpsertMetadataDocument(ctx, sqlcgen.UpsertMCPOAuthMetadataDocumentClientParams{
+		ClientID: docClientID, ClientName: "Editor Plugin", RedirectUris: []string{"http://127.0.0.1/callback"},
+		MetadataFetchedAt: pgtype.Timestamptz{Time: fetchedAt, Valid: true},
+		MetadataStaleAt:   pgtype.Timestamptz{Time: fetchedAt.Add(time.Hour), Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("UpsertMetadataDocument: %v", err)
+	}
+	if _, err := clientStore.MarkMetadataRefetchFailed(ctx, docClient.ID, fetchedAt, time.Now(), time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("MarkMetadataRefetchFailed: %v", err)
+	}
+	if err := m.Migrate(clientMetadataVersion - 1); err != nil {
+		t.Fatalf("migrate down past %d with a metadata-document client stored: %v", clientMetadataVersion, err)
+	}
+	if err := m.Migrate(clientMetadataVersion); err != nil {
+		t.Fatalf("re-apply migration %d with a metadata-document client stored: %v", clientMetadataVersion, err)
+	}
+	if v, dirty, err := m.Version(); err != nil || dirty || v != clientMetadataVersion {
+		t.Fatalf("after the round trip: version %d dirty %v err %v, want %d clean", v, dirty, err, clientMetadataVersion)
+	}
+	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		t.Fatalf("migrate up after the round trip: %v", err)
+	}
+	// Read through the migration's own connection: the pool's cached
+	// statements describe the table as it was before the round trip.
+	var (
+		sameClient, stampedAtRegistration, noFailure bool
+	)
+	if err := migrateDB.QueryRowContext(ctx, `
+		SELECT id = $2::uuid, metadata_fetched_at = created_at AND metadata_stale_at = created_at, metadata_refetch_failed_at IS NULL
+		FROM mcp_oauth_clients WHERE client_id = $1`, docClientID, docClient.ID.String()).Scan(&sameClient, &stampedAtRegistration, &noFailure); err != nil {
+		t.Fatalf("read the metadata-document client after the round trip: %v", err)
+	}
+	if !sameClient || !stampedAtRegistration || !noFailure {
+		t.Fatalf("after the round trip: same client %v, stamped stale at registration %v, no failure recorded %v; want all three", sameClient, stampedAtRegistration, noFailure)
+	}
+
 	// (e) run migrations Down() all the way and assert no error.
 	if err := m.Down(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 		t.Fatalf("migrate down: %v", err)

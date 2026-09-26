@@ -14,6 +14,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/oauthex"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/domain/mcpclient"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -84,6 +85,7 @@ func livePrincipal(t *testing.T) postgres.MCPAccessTokenPrincipal {
 		GrantResource:  testResource,
 		GrantExpiresAt: time.Now().Add(24 * time.Hour),
 		ClientID:       "narvi_mcp_c_test",
+		ClientKind:     "preregistered",
 		UserID:         mustUUID(t, "11111111-1111-1111-1111-111111111111"),
 		UserRole:       "member",
 		UserEmail:      "member@example.com",
@@ -96,6 +98,9 @@ func testBearerConfig() MCPBearerConfig {
 		ResourceMetadataURL:   testResourceMetaURL,
 		Scopes:                []string{"mcp:read"},
 		LastUsedWriteInterval: 5 * time.Minute,
+		// The shipped defaults: metadata documents on, dynamic
+		// registration off.
+		ClientMechanisms: mcpclient.Mechanisms{MetadataDocuments: true},
 	}
 }
 
@@ -141,6 +146,7 @@ func TestRequireMCPBearer_Table(t *testing.T) {
 	tests := []struct {
 		name         string
 		mutate       func(*postgres.MCPAccessTokenPrincipal)
+		configure    func(*MCPBearerConfig)
 		headers      map[string][]string
 		target       string
 		wantStatus   int
@@ -161,6 +167,11 @@ func TestRequireMCPBearer_Table(t *testing.T) {
 		{name: "grant expired", mutate: func(p *postgres.MCPAccessTokenPrincipal) { p.GrantExpiresAt = time.Now().Add(-time.Second) }, headers: bearer, wantStatus: http.StatusUnauthorized, wantInvalid: true},
 		{name: "client disabled", mutate: func(p *postgres.MCPAccessTokenPrincipal) { p.ClientDisabled = true }, headers: bearer, wantStatus: http.StatusUnauthorized, wantInvalid: true},
 		{name: "user disabled", mutate: func(p *postgres.MCPAccessTokenPrincipal) { p.UserDisabled = true }, headers: bearer, wantStatus: http.StatusUnauthorized, wantInvalid: true},
+		{name: "metadata-document client, mechanism on", mutate: func(p *postgres.MCPAccessTokenPrincipal) { p.ClientKind = "metadata_document" }, headers: bearer, wantStatus: http.StatusOK, wantPassThru: true},
+		{name: "metadata-document client, mechanism switched off", mutate: func(p *postgres.MCPAccessTokenPrincipal) { p.ClientKind = "metadata_document" }, configure: func(c *MCPBearerConfig) { c.ClientMechanisms.MetadataDocuments = false }, headers: bearer, wantStatus: http.StatusUnauthorized, wantInvalid: true},
+		{name: "dynamic client, mechanism off by default", mutate: func(p *postgres.MCPAccessTokenPrincipal) { p.ClientKind = "dynamic" }, headers: bearer, wantStatus: http.StatusUnauthorized, wantInvalid: true},
+		{name: "dynamic client, mechanism on", mutate: func(p *postgres.MCPAccessTokenPrincipal) { p.ClientKind = "dynamic" }, configure: func(c *MCPBearerConfig) { c.ClientMechanisms.DynamicRegistration = true }, headers: bearer, wantStatus: http.StatusOK, wantPassThru: true},
+		{name: "pre-registered client with every other mechanism off", configure: func(c *MCPBearerConfig) { c.ClientMechanisms = mcpclient.Mechanisms{} }, headers: bearer, wantStatus: http.StatusOK, wantPassThru: true},
 		{name: "grant for another resource", mutate: func(p *postgres.MCPAccessTokenPrincipal) { p.GrantResource = "https://other.example/mcp" }, headers: bearer, wantStatus: http.StatusUnauthorized, wantInvalid: true},
 		{name: "grant resource differs only by a trailing slash", mutate: func(p *postgres.MCPAccessTokenPrincipal) { p.GrantResource = testResource + "/" }, headers: bearer, wantStatus: http.StatusUnauthorized, wantInvalid: true},
 	}
@@ -174,7 +185,11 @@ func TestRequireMCPBearer_Table(t *testing.T) {
 			}
 			store.set(testBearerToken, p)
 			var got seen
-			h := RequireMCPBearer(store, testBearerConfig())(protectedHandler(&got))
+			cfg := testBearerConfig()
+			if tc.configure != nil {
+				tc.configure(&cfg)
+			}
+			h := RequireMCPBearer(store, cfg)(protectedHandler(&got))
 			target := tc.target
 			if target == "" {
 				target = "/mcp"

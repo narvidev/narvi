@@ -1,6 +1,8 @@
 // connectedAppsRendering.test.tsx -- ConnectedAppsSection.tsx's own
-// defining risks: clientName and redirect URIs are admin-supplied strings
-// (text, never markup, never an href), a scope-less authorization must say
+// defining risks: clientName and redirect URIs are admin-supplied -- or,
+// for a self-registered client, app-supplied -- strings (text, never
+// markup, never an href), the identity line never borrows an
+// administrator's claim, a scope-less authorization must say
 // plainly that it sees nothing, and both destructive actions (revoke,
 // delete) must never be a single bare click. Mirrors
 // integrationsRendering.test.tsx's own pattern: assert on specific visible
@@ -87,6 +89,21 @@ describe('ConnectedAppRow', () => {
     const html = renderAuthorization(baseAuthorization({ clientName: XSS }))
     expect(html).not.toContain('<script>')
     expect(html).toContain('&lt;script&gt;')
+  })
+
+  it('a metadata-document client is identified by its host, its self-chosen name only beside it', () => {
+    const html = renderAuthorization(
+      baseAuthorization({ clientKind: 'metadata_document', clientId: 'https://tools.example/mcp/client.json', clientName: `Registered by an administrator ${XSS}` }),
+    )
+    expect(html).toContain('Identified by tools.example')
+    expect(html).not.toContain('<script>')
+    expect(html).not.toContain('Registered by an administrator of this deployment')
+  })
+
+  it('a self-registered client never claims an administrator vouched for it', () => {
+    const html = renderAuthorization(baseAuthorization({ clientKind: 'dynamic', clientId: 'narvi_mcp_d_abc' }))
+    expect(html).toContain('Registered by the app itself')
+    expect(html).not.toContain('administrator')
   })
 
   it('revoking starts behind a confirmation, never a single click', () => {

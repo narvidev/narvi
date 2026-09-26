@@ -370,15 +370,28 @@ you decide on the consent page.
 {"name": "Allow or deny the MCP client (the consent page's own form)", "route": "POST /oauth/consent"}
 ```
 
-The consent page shows the app's name and who vouched for it (an
-administrator of this deployment registers every app), the host your
-browser is sent back to — with a warning when that is your own computer —
-and one checkbox per kind of access; you can uncheck any of them, never add
-one. An app never does more than your own role allows: its tools call the
+The consent page shows who the app is, never only the name it gives
+itself. An app an administrator of this deployment registered says so under
+its name. An app that identifies itself by the web address of its own
+description (a client ID metadata document) is headed by that address's
+host — the one thing about it the app cannot make up, since Narvi read the
+description from that very host, following no redirect to any other — with
+the name it chose shown second; check that host before you allow it. A host
+with non-Latin letters is always shown in its `xn--` form, exactly as Narvi
+looks it up, never as letters that could pass for another host's. An app that registered itself (possible only when
+the deployment turns dynamic registration on) is headed by just that — "an
+app that registered itself" — with the name it gave itself shown second, in
+quotes: nothing vouches for that name, so never take it for a host Narvi
+checked. The page also shows the host your browser is sent back to — with
+a warning when that is your own computer — and one checkbox per kind of
+access; you can uncheck any of them, never add one. An app never does more than your own role allows: its tools call the
 same routes this guide documents, checked against your role on every call.
 
 Once an app is connected, you manage it in Settings → Integrations →
-Connected apps: what you last allowed it, when you connected it, when it
+Connected apps, which says who vouches for it just as the consent page did
+(an administrator; the host of its description's address, written exactly
+as the consent page wrote it; or nobody): what
+you last allowed it, when you connected it, when it
 last called, and when the authorization lapses, 90 days after your latest
 approval of it. That date is the latest any copy of the app can keep
 working without asking you again. A copy connected by an earlier approval
@@ -424,9 +437,32 @@ Administrators decide which apps may ask at all, in the same panel:
 `NARVI_MCP_ENABLED=true`; while it is off, `/oauth/...` answers `503` — but
 the Settings routes above keep working, so an authorization can always be
 listed and revoked. Every role, viewer included, can connect an app and
-disconnect its own; only an admin can register or delete a client.
+disconnect its own; only an admin can register or delete a client. Apps
+that identify themselves by their description's address are accepted unless
+the deployment sets `NARVI_MCP_CIMD_ENABLED=false`, and apps that register
+themselves only if it sets `NARVI_MCP_DCR_ENABLED=true`. Switching either
+off pauses every app it let in, from that app's next call: the app can no
+longer be approved, renew its access or call `/mcp`, though it can still
+disconnect itself. A pause deletes nothing — the app stays under Connected
+apps, where you can still disconnect it — and switching the setting back on
+lets the app carry on with the access it still holds, without asking you
+again, unless that access lapsed meanwhile (30 days after the app last
+renewed it, or 90 days after your approval). To cut an app off for good,
+disconnect it, or have an administrator delete it. Narvi never
+reads an app's description from this machine or a private network address,
+and an app whose description cannot be read, or names any address but its
+own, is shown an error page the first time. Narvi trusts a description it
+read for at most an hour before reading it again; a change to it affects
+only approvals made afterwards. If that re-read fails — the host down, the
+description gone or no longer valid — the description Narvi last read keeps
+being used for one more hour from that first failure, and no longer — and
+never more than two hours after Narvi last read it: a description Narvi
+has not read for longer than that is not used at all. After that the app
+is shown an error page until its description can be read again.
 Disconnecting deletes the authorization outright, and deleting a client
-deletes every authorization issued to it — there is no "paused" state.
+deletes every authorization issued to it — neither can be undone, and one
+authorization cannot be paused: the only pause is the deployment-wide one
+above, switching off how an app registered.
 An app registered with a redirect address that does not match exactly
 (except the port of a `127.0.0.1`/`[::1]` address) is shown an error page
 and your browser is never sent anywhere. Each approval is single-use and

@@ -44,6 +44,27 @@
 // too; nothing here locks a users row except those foreign-key checks, and
 // users rows are never deleted.
 //
+// Client registration (technical plan §43.15) adds four writers, each
+// following the same order. A metadata document's upsert, and the record
+// of its first failed re-fetch, are each ONE statement locking ONE row --
+// the client, FOR NO KEY UPDATE: that never conflicts with the FOR KEY
+// SHARE every issuance and grant revocation takes, only with a client's
+// deletion (an administrator's or the sweep's) and with each other, and
+// a statement holding a single lock cannot be part of a wait cycle. A
+// dynamic registration inserts a new client row and locks
+// nothing that exists. The expired-credential sweep's unused-client pass
+// (MCPOAuthClientStore.DeleteUnused) deletes a client as an
+// administrator's deletion does -- the client FOR UPDATE, then its
+// cascade -- in two statements: it locks its candidates first (in id
+// order), then deletes only those a fresh look still finds with no grant
+// and no authorization request, so its cascade reaches no row at all. A
+// request or grant whose insert holds the client FOR KEY SHARE (its
+// foreign-key check) when the sweep arrives makes the sweep wait, and,
+// once committed, keeps its client; one that arrives after the lock waits
+// for the sweep, then finds its client gone. A consent in flight always
+// has its request, so its client is never even a candidate
+// (TestLockOrder_ClientRegistrationWriters).
+//
 // Refresh tokens also reference each other (superseded_by, ON DELETE SET
 // NULL), which adds no cycle. Under its grant, the refresh grant locks
 // only the token it inserts -- a row no other transaction can know of yet
@@ -263,11 +284,15 @@ type MCPAccessTokenPrincipal struct {
 	// GrantLastUsedAt is the zero time when the grant was never used.
 	GrantLastUsedAt time.Time
 	ClientID        string
-	ClientDisabled  bool
-	UserID          pgtype.UUID
-	UserRole        string
-	UserEmail       string
-	UserDisabled    bool
+	// ClientKind is the client's registration mechanism
+	// (mcp_oauth_client_kind): the bearer check refuses a client whose
+	// mechanism the deployment has switched off (mcpclient.Mechanisms).
+	ClientKind     string
+	ClientDisabled bool
+	UserID         pgtype.UUID
+	UserRole       string
+	UserEmail      string
+	UserDisabled   bool
 }
 
 // LookupAccessToken resolves an access token's hash into its full
@@ -286,6 +311,7 @@ func (s *MCPOAuthGrantStore) LookupAccessToken(ctx context.Context, tokenHash st
 		GrantResource:  row.Resource,
 		GrantExpiresAt: row.GrantExpiresAt.Time,
 		ClientID:       row.ClientPublicID,
+		ClientKind:     string(row.ClientKind),
 		ClientDisabled: row.ClientDisabledAt.Valid,
 		UserID:         row.UserID,
 		UserRole:       string(row.UserRole),

@@ -56,6 +56,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/inbound/webui"
 	"github.com/narvidev/narvi/internal/adapters/inbound/wshub"
 	"github.com/narvidev/narvi/internal/adapters/outbound/chatgptoauth"
+	"github.com/narvidev/narvi/internal/adapters/outbound/cimdfetch"
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapp"
 	"github.com/narvidev/narvi/internal/adapters/outbound/linearapi"
@@ -91,6 +92,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/shadowslack"
 	"github.com/narvidev/narvi/internal/app/uploadsweep"
 	"github.com/narvidev/narvi/internal/domain/integrations"
+	"github.com/narvidev/narvi/internal/domain/mcpclient"
 	"github.com/narvidev/narvi/internal/domain/mcpscope"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/platform"
@@ -2605,14 +2607,27 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// themselves (a signed-out browser is sent to sign in, not answered
 	// 401), and the token and revocation endpoints must never accept a
 	// cookie at all.
+	//
+	// Clients without a prior relationship (§43.15): which registration
+	// mechanisms are accepted beside pre-registration is
+	// cfg.MCPCIMDEnabled/MCPDCREnabled, handed as ONE mcpclient.Mechanisms
+	// to both the authorization server and the bearer gate below, so a
+	// mechanism switched off refuses its clients everywhere at once. Client
+	// ID metadata documents are fetched ONLY through cimdfetch's guarded
+	// client -- the dial-time SSRF guard is the one way that adapter can be
+	// built (cimdfetch.NewGuardedClient, the same capability-token shape as
+	// githubapi.NewGatedClient above), never http.DefaultClient.
 	mcpOAuthClientStore := postgres.NewMCPOAuthClientStore(pool)
 	mcpOAuthGrantStore := postgres.NewMCPOAuthGrantStore(pool)
 	mcpAdvertisedScopes := mcpadapter.AdvertisedScopes()
+	mcpClientMechanisms := mcpclient.Mechanisms{MetadataDocuments: cfg.MCPCIMDEnabled, DynamicRegistration: cfg.MCPDCREnabled}
+	mcpMetadataFetcher := cimdfetch.New(cimdfetch.NewGuardedClient(cimdFetchGuard), cfg.Timeouts.MCPClientMetadataFetchTimeout)
 	mcpAuthServer, err := mcpauth.New(mcpauth.Config{
 		PublicBaseURL: cfg.PublicBaseURL,
 		Enabled:       cfg.MCPEnabled,
 		Scopes:        mcpAdvertisedScopes,
 		Timeouts:      cfg.Timeouts,
+		Mechanisms:    mcpClientMechanisms,
 	}, mcpauth.Deps{
 		Pool:         pool,
 		Clients:      mcpOAuthClientStore,
@@ -2620,6 +2635,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		UserSessions: userSessionStore,
 		Users:        userStore,
 		AuditLog:     auditLogStore,
+		Metadata:     mcpMetadataFetcher,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("build mcp authorization server: %w", err)
@@ -2640,6 +2656,15 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		r.Post("/consent", mcpAuthServer.ConsentDecision)
 		r.Post("/token", mcpAuthServer.Token)
 		r.Post("/revoke", mcpAuthServer.Revoke)
+		// RFC 7591 dynamic client registration (§43.15): mounted
+		// unconditionally like every route here, and answering the same
+		// disabled 503 unless cfg.MCPDCREnabled (off by default) -- then
+		// braked per client address (RemoteAddr only, never a forwarded
+		// header) before a single row is written.
+		r.With(
+			mcpadapter.RequireEnabled(cfg.MCPDCREnabled),
+			mcpauth.NewRateLimiter(cfg.Timeouts.MCPRegisterRateInterval, cfg.Timeouts.MCPRegisterRateBurst).Limit(mcpauth.RegisterRateLimited),
+		).Post("/register", mcpAuthServer.Register)
 	})
 
 	// /mcp (technical plan §43, "the MCP surface"): the Streamable HTTP
@@ -2688,6 +2713,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		ResourceMetadataURL:   mcpIdentifiers.ProtectedResourceMetadataURL,
 		Scopes:                mcpscope.Strings(mcpAdvertisedScopes),
 		LastUsedWriteInterval: cfg.Timeouts.MCPGrantLastUsedWriteInterval,
+		ClientMechanisms:      mcpClientMechanisms,
 	})
 	router.Route("/mcp", func(r chi.Router) {
 		r.Use(mcpOriginGate)
@@ -3110,7 +3136,7 @@ func (a *App) Run(ctx context.Context, addr string) error {
 	// comment). Started/shut down through this SAME errgroup as every
 	// other background loop above -- no naked goroutine (§11).
 	group.Go(func() error {
-		if err := postgres.RunExpiredTokenCleanup(groupCtx, pool, cfg.Timeouts.ExpiredCredentialCleanupInterval); err != nil && !errors.Is(err, context.Canceled) {
+		if err := postgres.RunExpiredTokenCleanup(groupCtx, pool, cfg.Timeouts.ExpiredCredentialCleanupInterval, cfg.Timeouts.MCPDynamicClientUnusedTTL); err != nil && !errors.Is(err, context.Canceled) {
 			return fmt.Errorf("expired credential cleanup: %w", err)
 		}
 		return nil

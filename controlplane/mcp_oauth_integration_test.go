@@ -20,6 +20,22 @@
 // working on the very next call; and a scope-less approval's tool list is
 // empty.
 //
+// Clients without a prior relationship (§43.15), on the same production
+// routers: with the shipped defaults, dynamic registration answers the
+// disabled response and is not advertised, while metadata documents are;
+// the SDK client identifying itself by a metadata document on an in-test
+// HTTPS server is refused by the production fetch guard before a single
+// connection reaches that server -- counted, and the refusal's logged cause
+// is the guard's own -- and completes the whole flow on a router whose
+// guard was built with the one test seam allowing that server's exact
+// address -- the consent page naming the document's host first; with
+// dynamic registration on, the SDK registers itself and completes the flow
+// too; registration is braked per client network; and with either
+// mechanism switched off, on a router serving the very resource both
+// clients' live tokens were issued for, that mechanism's token stops on
+// its next call while the other's still works (and with metadata
+// documents off, an https client_id is unknown).
+//
 // With the surface OFF, the discovery documents and every /oauth route
 // answer the documented disabled response (§43.11/§43.14), while the
 // Settings routes keep serving, so an authorization can always be listed
@@ -30,12 +46,18 @@
 package controlplane
 
 import (
+	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strings"
@@ -52,6 +74,7 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
+	"github.com/narvidev/narvi/internal/adapters/outbound/cimdfetch"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/platform"
@@ -118,18 +141,38 @@ type oauthRouterRig struct {
 // and serves its router on that listener.
 func newOAuthRouterRig(t *testing.T, pool *pgxpool.Pool) *oauthRouterRig {
 	t.Helper()
+	return newOAuthRouterRigWith(t, pool, nil, cimdfetch.GuardConfig{})
+}
+
+// newOAuthRouterRigWith is newOAuthRouterRig with more environment set for
+// the Build, and the client ID metadata document fetcher's SSRF guard
+// built with guard -- the one test seam Build has (cimdFetchGuard). The
+// seam is set for the Build alone and restored before this returns: every
+// other router in the test, and every production boot, gets the full
+// guard.
+func newOAuthRouterRigWith(t *testing.T, pool *pgxpool.Pool, env map[string]string, guard cimdfetch.GuardConfig) *oauthRouterRig {
+	t.Helper()
 	server := httptest.NewUnstartedServer(nil)
 	t.Setenv("NARVI_PUBLIC_BASE_URL", "http://"+server.Listener.Addr().String())
 	t.Setenv("NARVI_MCP_ENABLED", "true")
+	for k, v := range env {
+		t.Setenv(k, v)
+	}
 	cfg, err := platform.Load()
 	if err != nil {
 		server.Close()
 		t.Fatalf("platform.Load: %v", err)
 	}
+	cimdFetchGuard = guard
 	app, err := Build(context.Background(), cfg, pool)
+	cimdFetchGuard = cimdfetch.GuardConfig{}
 	if err != nil {
 		server.Close()
 		t.Fatalf("Build: %v", err)
+	}
+	for k := range env {
+		// Only this Build reads them: later rigs start from the defaults.
+		t.Setenv(k, "")
 	}
 	server.Config.Handler = app.Router
 	server.Start()
@@ -276,6 +319,17 @@ type consentDriver struct {
 	// stay checked; nil keeps every one.
 	keepScopes func(offered []string) []string
 	calls      atomic.Int32
+
+	mu sync.Mutex
+	// page is the last consent page rendered.
+	page []byte
+}
+
+// lastPage is the last consent page the driver saw.
+func (d *consentDriver) lastPage() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return string(d.page)
 }
 
 func (d *consentDriver) fetch(ctx context.Context, args *sdkauth.AuthorizationArgs) (*sdkauth.AuthorizationResult, error) {
@@ -314,6 +368,9 @@ func (d *consentDriver) fetch(ctx context.Context, args *sdkauth.AuthorizationAr
 	if err != nil {
 		return nil, err
 	}
+	d.mu.Lock()
+	d.page = page
+	d.mu.Unlock()
 	nonce := consentNoncePattern.FindSubmatch(page)
 	if resp.StatusCode != http.StatusOK || nonce == nil {
 		return nil, fmt.Errorf("consent page: status %d, no nonce in %s", resp.StatusCode, page)
@@ -439,6 +496,24 @@ func (r *oauthRouterRig) connectSDKClient(ctx context.Context, t *testing.T, con
 		t.Fatalf("register client: status %d", status)
 	}
 
+	flow, err := r.dialSDKClient(ctx, t, member, memberCookie, configure, func(c *sdkauth.AuthorizationCodeHandlerConfig) {
+		c.PreregisteredClient = &oauthex.ClientCredentials{ClientID: client.ClientId}
+		c.RedirectURL = "http://127.0.0.1:1/callback"
+	})
+	if err != nil {
+		t.Fatalf("SDK Connect: %v", err)
+	}
+	flow.adminCookie, flow.client = adminCookie, client
+	return flow
+}
+
+// dialSDKClient connects the official SDK client as member, whose consent
+// the driver gives, registering however register configures the SDK's
+// OAuth handler: a pre-registered client, a client ID metadata document,
+// or dynamic client registration. Connect's own error is returned, so a
+// refused registration can be asserted.
+func (r *oauthRouterRig) dialSDKClient(ctx context.Context, t *testing.T, member sqlcgen.User, memberCookie string, configure func(*consentDriver), register func(*sdkauth.AuthorizationCodeHandlerConfig)) (*sdkFlow, error) {
+	t.Helper()
 	driver := &consentDriver{baseURL: r.server.URL, cookie: memberCookie}
 	if configure != nil {
 		configure(driver)
@@ -446,17 +521,18 @@ func (r *oauthRouterRig) connectSDKClient(ctx context.Context, t *testing.T, con
 	recorder := &recordingTransport{}
 	httpClient := &http.Client{Transport: recorder}
 	clock := &clientClock{}
-	handler, err := sdkauth.NewAuthorizationCodeHandler(&sdkauth.AuthorizationCodeHandlerConfig{
-		PreregisteredClient:      &oauthex.ClientCredentials{ClientID: client.ClientId},
-		RedirectURL:              "http://127.0.0.1:1/callback",
+	cfg := &sdkauth.AuthorizationCodeHandlerConfig{
 		AuthorizationCodeFetcher: driver.fetch,
 		Client:                   httpClient,
 		NewTokenSource:           clock.newTokenSource,
-	})
+	}
+	register(cfg)
+	handler, err := sdkauth.NewAuthorizationCodeHandler(cfg)
 	if err != nil {
 		t.Fatalf("NewAuthorizationCodeHandler: %v", err)
 	}
 	sdkClient := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "sdk-e2e", Version: "1"}, nil)
+	flow := &sdkFlow{driver: driver, clock: clock, recorder: recorder, member: member, cookie: memberCookie}
 	session, err := sdkClient.Connect(ctx, &sdkmcp.StreamableClientTransport{
 		Endpoint:             r.server.URL + "/mcp",
 		HTTPClient:           httpClient,
@@ -464,10 +540,11 @@ func (r *oauthRouterRig) connectSDKClient(ctx context.Context, t *testing.T, con
 		DisableStandaloneSSE: true,
 	}, nil)
 	if err != nil {
-		t.Fatalf("SDK Connect: %v", err)
+		return flow, err
 	}
 	t.Cleanup(func() { _ = session.Close() })
-	return &sdkFlow{session: session, driver: driver, clock: clock, recorder: recorder, member: member, cookie: memberCookie, adminCookie: adminCookie, client: client}
+	flow.session = session
+	return flow, nil
 }
 
 func toolNames(ctx context.Context, t *testing.T, s *sdkmcp.ClientSession) []string {
@@ -523,6 +600,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 			{http.MethodPost, "/oauth/consent"},
 			{http.MethodPost, "/oauth/token"},
 			{http.MethodPost, "/oauth/revoke"},
+			{http.MethodPost, "/oauth/register"},
 		} {
 			rec := serveRouter(off.Router, route.method, route.path, "")
 			if rec.Code != http.StatusServiceUnavailable || rec.Body.String() != mcpDisabledBody || rec.Header().Get("Content-Type") != "application/json" {
@@ -921,4 +999,437 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 			t.Fatalf("hidden tool response %s, want a -32602 JSON-RPC error", hidden)
 		}
 	})
+
+	// --- Clients without a prior relationship (§43.15) ---
+	//
+	// doc is an in-test HTTPS server on loopback serving one client ID
+	// metadata document. Only a router built with the fetcher's test seam
+	// (cimdFetchGuard, allowing this server's exact address and trusting
+	// its certificate) can fetch it; every other router here -- rig
+	// included -- runs the production guard, which refuses it.
+	doc := newMetadataDocumentServer(t)
+
+	// The shipped defaults: metadata documents ON, dynamic registration
+	// OFF. The metadata says so, and POST /oauth/register answers the
+	// surface's own disabled response while writing nothing.
+	t.Run("Register_DisabledByDefault", func(t *testing.T) {
+		if rig.cfg.MCPDCREnabled || !rig.cfg.MCPCIMDEnabled {
+			t.Fatalf("defaults: MCPCIMDEnabled %v MCPDCREnabled %v, want true, false", rig.cfg.MCPCIMDEnabled, rig.cfg.MCPDCREnabled)
+		}
+		asm := rig.authorizationServerMetadata(t)
+		if _, present := asm["registration_endpoint"]; present {
+			t.Errorf("registration_endpoint advertised while dynamic registration is off: %v", asm["registration_endpoint"])
+		}
+		if asm["client_id_metadata_document_supported"] != true {
+			t.Errorf("client_id_metadata_document_supported = %v, want true by default", asm["client_id_metadata_document_supported"])
+		}
+		rec := rig.registerFrom(t, "198.51.100.40:5000", "", "Disabled Probe")
+		if rec.Code != http.StatusServiceUnavailable || rec.Body.String() != mcpDisabledBody || rec.Header().Get("Content-Type") != "application/json" {
+			t.Fatalf("POST /oauth/register with dynamic registration off: status %d body %s, want 503 %s", rec.Code, rec.Body.String(), mcpDisabledBody)
+		}
+		if n := rig.countClientsNamed(t, "Disabled Probe"); n != 0 {
+			t.Fatalf("%d clients registered while dynamic registration is off", n)
+		}
+	})
+
+	// The production guard: the official SDK client identifying itself by
+	// a metadata document on loopback is refused before a single packet
+	// reaches the document's server -- a page, never a redirect -- and
+	// nothing is stored. Proven by its CAUSE, not only its outcome: this
+	// rig's fetcher trusts only the system roots, so a guard that let the
+	// dial through would fail the same way one step later, at the TLS
+	// handshake. No connection is ever accepted, and every refusal logged
+	// names the guard's own error.
+	t.Run("MetadataDocument_ProductionGuardRefusesLoopback", func(t *testing.T) {
+		ctx := oauthTestCtx(t)
+		member, cookie := createRouterUser(ctx, t, rig.pool, sqlcgen.UserRoleMember)
+		logs := captureWarnings(t)
+		hitsBefore, connsBefore := doc.hits.Load(), doc.conns.Load()
+		flow, err := rig.dialSDKClient(ctx, t, member, cookie, nil, doc.register)
+		if err == nil {
+			t.Fatal("the SDK client connected through a metadata document on loopback")
+		}
+		// The SDK may try more than once; every attempt is refused.
+		if n := flow.driver.calls.Load(); n < 1 || !strings.Contains(err.Error(), "status 400") {
+			t.Fatalf("authorization attempts %d, err %v; want each refused with a 400 page", n, err)
+		}
+		if n := doc.conns.Load() - connsBefore; n != 0 {
+			t.Fatalf("the production fetcher opened %d connections to the loopback document server, want none", n)
+		}
+		if doc.hits.Load() != hitsBefore {
+			t.Fatal("the production fetcher reached the loopback document server")
+		}
+		refusals := logs.matching("mcpauth: authorize refused", "outcome", "metadata_document_unusable")
+		if len(refusals) == 0 {
+			t.Fatal("no refused metadata document was logged")
+		}
+		for _, e := range refusals {
+			if cause, _ := e["error"].(string); !strings.Contains(cause, cimdfetch.ErrForbiddenAddress.Error()) {
+				t.Errorf("a refusal was caused by %q, want the guard's own %q", cause, cimdfetch.ErrForbiddenAddress)
+			}
+		}
+		if n := rig.countClients(t, doc.clientID); n != 0 {
+			t.Fatalf("%d clients stored for a document the guard refused", n)
+		}
+	})
+
+	cimdRig := newOAuthRouterRigWith(t, pool, map[string]string{"NARVI_MCP_DCR_ENABLED": "true"}, doc.seam())
+	var cimdToken, dcrToken string
+
+	// A client identified by a metadata document, end to end through the
+	// official SDK (which prefers it once the metadata advertises it): the
+	// document is fetched through the guard's test seam, the consent page
+	// names the document's HOST first and the name it chose second, and the
+	// token lists and calls the tools.
+	t.Run("EndToEnd_SDKClient_MetadataDocument", func(t *testing.T) {
+		ctx := oauthTestCtx(t)
+		member, cookie := createRouterUser(ctx, t, cimdRig.pool, sqlcgen.UserRoleMember)
+		flow, err := cimdRig.dialSDKClient(ctx, t, member, cookie, nil, doc.register)
+		if err != nil {
+			t.Fatalf("SDK Connect with a metadata document: %v", err)
+		}
+		want := []string{"narvi_get_session", "narvi_list_models", "narvi_list_sessions"}
+		if got := toolNames(ctx, t, flow.session); strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("ListTools = %v, want %v", got, want)
+		}
+		if res, err := callListModels(ctx, flow.session); err != nil || res.IsError {
+			t.Fatalf("CallTool narvi_list_models: res %+v err %v", res, err)
+		}
+		cimdToken = flow.recorder.lastBearer()
+		page := flow.driver.lastPage()
+		host := doc.addr.String()
+		for _, want := range []string{
+			`<h1>Allow the app at <strong class="host">` + host + `</strong> to use Narvi as you?</h1>`,
+			`It calls itself <strong>Editor Plugin (metadata document)</strong>.`,
+			"That is this computer.",
+		} {
+			if !strings.Contains(page, want) {
+				t.Errorf("consent page lacks %q", want)
+			}
+		}
+		if doc.hits.Load() == 0 || doc.conns.Load() == 0 {
+			t.Fatalf("the document server was reached by %d connections and %d requests, want both: the counters must see what the production guard is proven to prevent", doc.conns.Load(), doc.hits.Load())
+		}
+		var kind string
+		var grants int
+		if err := cimdRig.pool.QueryRow(ctx, `
+			SELECT c.kind::text, count(g.id)
+			FROM mcp_oauth_clients c LEFT JOIN mcp_oauth_grants g ON g.client_id = c.id AND g.user_id = $2
+			WHERE c.client_id = $1 GROUP BY c.kind`, doc.clientID, member.ID).Scan(&kind, &grants); err != nil || kind != "metadata_document" || grants != 1 {
+			t.Fatalf("client kind %q with %d grants for the member (err %v), want one metadata_document client with one grant", kind, grants, err)
+		}
+	})
+
+	// Dynamic registration end to end through the official SDK, the flag
+	// on: the metadata advertises the registration endpoint, the SDK
+	// registers, and the flow completes with the client registered as a
+	// public client.
+	t.Run("EndToEnd_SDKClient_DynamicRegistration", func(t *testing.T) {
+		ctx := oauthTestCtx(t)
+		if got := cimdRig.authorizationServerMetadata(t)["registration_endpoint"]; got != cimdRig.server.URL+"/oauth/register" {
+			t.Fatalf("registration_endpoint = %v, want %s/oauth/register", got, cimdRig.server.URL)
+		}
+		member, cookie := createRouterUser(ctx, t, cimdRig.pool, sqlcgen.UserRoleMember)
+		flow, err := cimdRig.dialSDKClient(ctx, t, member, cookie, nil, func(c *sdkauth.AuthorizationCodeHandlerConfig) {
+			c.DynamicClientRegistrationConfig = &sdkauth.DynamicClientRegistrationConfig{Metadata: &oauthex.ClientRegistrationMetadata{
+				RedirectURIs: []string{"http://127.0.0.1:1/callback"},
+				ClientName:   "Desktop Assistant (dynamic)",
+				GrantTypes:   []string{"authorization_code", "refresh_token"},
+			}}
+		})
+		if err != nil {
+			t.Fatalf("SDK Connect with dynamic registration: %v", err)
+		}
+		if got := toolNames(ctx, t, flow.session); len(got) != 3 {
+			t.Fatalf("ListTools = %v, want the three tools", got)
+		}
+		if res, err := callListModels(ctx, flow.session); err != nil || res.IsError {
+			t.Fatalf("CallTool narvi_list_models: res %+v err %v", res, err)
+		}
+		dcrToken = flow.recorder.lastBearer()
+		if page := flow.driver.lastPage(); !strings.Contains(page, "This app registered itself with this deployment, so nothing vouches for its name.") {
+			t.Error("the consent page does not say the app registered itself")
+		}
+		var clientID, method string
+		if err := cimdRig.pool.QueryRow(ctx, `
+			SELECT c.client_id, c.kind::text FROM mcp_oauth_clients c JOIN mcp_oauth_grants g ON g.client_id = c.id
+			WHERE g.user_id = $1`, member.ID).Scan(&clientID, &method); err != nil || method != "dynamic" || !strings.HasPrefix(clientID, "narvi_mcp_d_") {
+			t.Fatalf("the member's grant is for client %q of kind %q (err %v), want one dynamic narvi_mcp_d_ client", clientID, method, err)
+		}
+	})
+
+	// The brake on an unauthenticated table write: per client address --
+	// RemoteAddr, never a forwarded header -- MCPRegisterRateBurst
+	// registrations, then 429 with Retry-After and nothing written.
+	t.Run("Register_RateLimited", func(t *testing.T) {
+		burst := cimdRig.cfg.Timeouts.MCPRegisterRateBurst
+		for i := range burst {
+			if rec := cimdRig.registerFrom(t, "198.51.100.23:40000", "", "Rate Limit Probe"); rec.Code != http.StatusCreated {
+				t.Fatalf("registration %d of the burst: status %d body %s, want 201", i+1, rec.Code, rec.Body.String())
+			}
+		}
+		for _, tc := range []struct{ name, remote, forwarded string }{
+			{"past the burst, another source port", "198.51.100.23:40001", ""},
+			{"a forwarded header naming another address changes nothing", "198.51.100.23:40002", "198.51.100.99"},
+		} {
+			rec := cimdRig.registerFrom(t, tc.remote, tc.forwarded, "Rate Limit Probe")
+			if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" || !strings.Contains(rec.Body.String(), `"error":"temporarily_unavailable"`) {
+				t.Fatalf("%s: status %d Retry-After %q body %s, want 429 with Retry-After", tc.name, rec.Code, rec.Header().Get("Retry-After"), rec.Body.String())
+			}
+		}
+		if rec := cimdRig.registerFrom(t, "198.51.100.24:40000", "", "Rate Limit Probe"); rec.Code != http.StatusCreated {
+			t.Fatalf("another address: status %d, want 201", rec.Code)
+		}
+		if n := cimdRig.countClientsNamed(t, "Rate Limit Probe"); n != burst+1 {
+			t.Fatalf("clients registered = %d, want %d: a refused registration wrote a row", n, burst+1)
+		}
+	})
+
+	// Each mechanism switched off, on a router serving cimdRig's own
+	// public base URL -- so its resource is the one both live tokens were
+	// issued for, and the mechanism switch is the only thing that can
+	// refuse either: each router accepts the token of the mechanism it
+	// kept and refuses the other's on its very next call.
+	sameResource := map[string]string{"NARVI_PUBLIC_BASE_URL": cimdRig.cfg.PublicBaseURL}
+	offCIMD := newOAuthRouterRigWith(t, pool, withEnv(sameResource, "NARVI_MCP_CIMD_ENABLED", "false", "NARVI_MCP_DCR_ENABLED", "true"), doc.seam())
+	offDCR := newOAuthRouterRigWith(t, pool, withEnv(sameResource, "NARVI_MCP_CIMD_ENABLED", "true", "NARVI_MCP_DCR_ENABLED", "false"), doc.seam())
+	for _, r := range []*oauthRouterRig{offCIMD, offDCR} {
+		if r.cfg.PublicBaseURL != cimdRig.cfg.PublicBaseURL {
+			t.Fatalf("an off-flag router serves %s, want cimdRig's own %s", r.cfg.PublicBaseURL, cimdRig.cfg.PublicBaseURL)
+		}
+	}
+
+	// Metadata documents switched off: the metadata stops advertising them,
+	// an https client_id is an unknown client (no fetch at all), and a
+	// metadata-document client already stored -- with a live token -- is
+	// refused on its very next call.
+	t.Run("MetadataDocuments_Disabled", func(t *testing.T) {
+		if _, present := offCIMD.authorizationServerMetadata(t)["client_id_metadata_document_supported"]; present {
+			t.Error("client_id_metadata_document_supported advertised while metadata documents are off")
+		}
+		const fresh = "https://fresh.example/client.json"
+		before := doc.hits.Load()
+		req := httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+url.Values{
+			"client_id": {fresh}, "redirect_uri": {"http://127.0.0.1:1/callback"}, "response_type": {"code"},
+		}.Encode(), nil)
+		rec := httptest.NewRecorder()
+		offCIMD.server.Config.Handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest || rec.Header().Get("Location") != "" || doc.hits.Load() != before {
+			t.Fatalf("authorize with an https client_id while off: status %d Location %q, fetched %v; want a 400 page, no fetch", rec.Code, rec.Header().Get("Location"), doc.hits.Load() != before)
+		}
+		if cimdToken == "" || dcrToken == "" {
+			t.Fatal("no metadata-document or dynamic-client token from the end-to-end subtests")
+		}
+		offCIMD.acceptedCall(t, dcrToken)
+		offCIMD.revokedCallFails(t, cimdToken)
+	})
+
+	// Dynamic registration switched off: a dynamically registered client
+	// already stored -- with a live token -- is refused on its very next
+	// call, while a metadata-document client's token still works.
+	t.Run("DynamicRegistration_Disabled", func(t *testing.T) {
+		if _, present := offDCR.authorizationServerMetadata(t)["registration_endpoint"]; present {
+			t.Error("registration_endpoint advertised while dynamic registration is off")
+		}
+		offDCR.acceptedCall(t, cimdToken)
+		offDCR.revokedCallFails(t, dcrToken)
+	})
+}
+
+// withEnv is base plus the name/value pairs kv, in a new map.
+func withEnv(base map[string]string, kv ...string) map[string]string {
+	out := make(map[string]string, len(base)+len(kv)/2)
+	for k, v := range base {
+		out[k] = v
+	}
+	for i := 0; i+1 < len(kv); i += 2 {
+		out[kv[i]] = kv[i+1]
+	}
+	return out
+}
+
+// acceptedCall asserts token is accepted at /mcp: a raw tools/call answers
+// 200.
+func (r *oauthRouterRig) acceptedCall(t *testing.T, token string) {
+	t.Helper()
+	body := `{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"narvi_list_models","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`
+	if status, _, raw := r.postMCP(t, "tools/call", "narvi_list_models", body, token); status != http.StatusOK {
+		t.Fatalf("call with a live token of a mechanism still on: status %d body %s, want 200", status, raw)
+	}
+}
+
+// warningLog records every Warn-or-above log line written while it is
+// installed as the default logger, decoded.
+type warningLog struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *warningLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+// captureWarnings installs a warningLog as the default logger -- the one
+// platform.Logger hands every handler -- until the calling test ends.
+// TestOAuth_ProductionRouter's subtests run one at a time, so nothing else
+// logs through it meanwhile. The cleanup puts back the standard log
+// package's output and flags as well as slog's default: slog.SetDefault
+// points the log package at the handler it installs, and setting the
+// original default back does not undo that -- every later line of the
+// test binary, slog's included, would go on into the dead capture
+// handler, which drops it.
+func captureWarnings(t *testing.T) *warningLog {
+	t.Helper()
+	l := &warningLog{}
+	prev, prevOutput, prevFlags := slog.Default(), log.Writer(), log.Flags()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(l, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevOutput)
+		log.SetFlags(prevFlags)
+	})
+	return l
+}
+
+// TestCaptureWarnings_RestoresTheStandardLogger: once the test that
+// captured warnings ends, logging is as it was -- slog's default, the
+// standard log package's output and flags -- and a line logged then
+// reaches that output.
+func TestCaptureWarnings_RestoresTheStandardLogger(t *testing.T) {
+	prev, prevOutput, prevFlags := slog.Default(), log.Writer(), log.Flags()
+	t.Run("capturing", func(t *testing.T) { captureWarnings(t) })
+	if slog.Default() != prev || log.Writer() != prevOutput || log.Flags() != prevFlags {
+		t.Fatalf("after the capture: slog default restored %v, log output %T (was %T), flags %d (were %d)",
+			slog.Default() == prev, log.Writer(), prevOutput, log.Flags(), prevFlags)
+	}
+	var out bytes.Buffer
+	log.SetOutput(&out)
+	defer log.SetOutput(prevOutput)
+	slog.Warn("logged after the capture")
+	if !strings.Contains(out.String(), "logged after the capture") {
+		t.Fatalf("a warning logged after the capture never reached the log output: %q", out.String())
+	}
+}
+
+// matching returns the recorded entries with message msg whose field
+// key is value.
+func (l *warningLog) matching(msg, key, value string) []map[string]any {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(l.buf.String()), "\n") {
+		var e map[string]any
+		if json.Unmarshal([]byte(line), &e) != nil {
+			continue
+		}
+		if e["msg"] == msg && e[key] == value {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// metadataDocumentServer is an in-test HTTPS server on loopback serving
+// one client ID metadata document at /mcp/client.json, counting requests.
+type metadataDocumentServer struct {
+	*httptest.Server
+	clientID string
+	addr     netip.AddrPort
+	roots    *x509.CertPool
+	// hits counts requests served; conns counts TCP connections accepted,
+	// handshake or not -- what "no packet reached the server" is measured
+	// by.
+	hits  atomic.Int32
+	conns atomic.Int32
+}
+
+func newMetadataDocumentServer(t *testing.T) *metadataDocumentServer {
+	t.Helper()
+	d := &metadataDocumentServer{}
+	d.Server = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		d.hits.Add(1)
+		if r.URL.Path != "/mcp/client.json" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"client_id":                  d.clientID,
+			"client_name":                "Editor Plugin (metadata document)",
+			"redirect_uris":              []string{"http://127.0.0.1/callback"},
+			"grant_types":                []string{"authorization_code", "refresh_token"},
+			"token_endpoint_auth_method": "none",
+		})
+	}))
+	d.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			d.conns.Add(1)
+		}
+	}
+	d.StartTLS()
+	t.Cleanup(d.Close)
+	d.clientID = d.URL + "/mcp/client.json"
+	d.addr = netip.MustParseAddrPort(d.Listener.Addr().String())
+	d.roots = x509.NewCertPool()
+	d.roots.AddCert(d.Certificate())
+	return d
+}
+
+// seam is the fetcher guard that can reach this server, and nothing else
+// the production guard refuses.
+func (d *metadataDocumentServer) seam() cimdfetch.GuardConfig {
+	return cimdfetch.GuardConfig{AllowAddrPorts: []netip.AddrPort{d.addr}, RootCAs: d.roots}
+}
+
+// register configures the SDK's OAuth handler to identify the client by
+// this server's metadata document.
+func (d *metadataDocumentServer) register(c *sdkauth.AuthorizationCodeHandlerConfig) {
+	c.ClientIDMetadataDocumentConfig = &sdkauth.ClientIDMetadataDocumentConfig{URL: d.clientID}
+	c.RedirectURL = "http://127.0.0.1:1/callback"
+}
+
+// authorizationServerMetadata GETs the RFC 8414 document.
+func (r *oauthRouterRig) authorizationServerMetadata(t *testing.T) map[string]any {
+	t.Helper()
+	var asm map[string]any
+	if status := r.doJSON(t, http.MethodGet, "/.well-known/oauth-authorization-server/oauth", nil, &asm, ""); status != http.StatusOK {
+		t.Fatalf("authorization-server metadata: status %d", status)
+	}
+	return asm
+}
+
+// registerFrom posts one valid dynamic registration naming name, as the
+// peer remote -- in process, so the address the rate limit keys on is
+// chosen -- with an X-Forwarded-For of forwarded when non-empty.
+func (r *oauthRouterRig) registerFrom(t *testing.T, remote, forwarded, name string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/oauth/register", strings.NewReader(`{"client_name":"`+name+`","redirect_uris":["http://127.0.0.1/callback"]}`))
+	req.RemoteAddr = remote
+	req.Header.Set("Content-Type", "application/json")
+	if forwarded != "" {
+		req.Header.Set("X-Forwarded-For", forwarded)
+	}
+	rec := httptest.NewRecorder()
+	r.server.Config.Handler.ServeHTTP(rec, req)
+	return rec
+}
+
+func (r *oauthRouterRig) countClientsNamed(t *testing.T, name string) int {
+	t.Helper()
+	var n int
+	if err := r.pool.QueryRow(context.Background(), `SELECT count(*) FROM mcp_oauth_clients WHERE client_name = $1`, name).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func (r *oauthRouterRig) countClients(t *testing.T, clientID string) int {
+	t.Helper()
+	var n int
+	if err := r.pool.QueryRow(context.Background(), `SELECT count(*) FROM mcp_oauth_clients WHERE client_id = $1`, clientID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }

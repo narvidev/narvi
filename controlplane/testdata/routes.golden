@@ -121,6 +121,7 @@ POST /api/workflow-runs/{runId}/steps/{stepRunId}/decide
 POST /auth/logout
 POST /mcp
 POST /oauth/consent
+POST /oauth/register
 POST /oauth/revoke
 POST /oauth/token
 POST /sessions/{sessionID}/automation-env-vars

@@ -9,6 +9,53 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.5.0]
+
+### controlplane/testdata/routes.golden
+
+- Added: `POST /oauth/register` -- the MCP authorization server's RFC 7591
+  dynamic client registration endpoint (technical plan §43.14/§43.15).
+  Mounted unconditionally like every `/oauth` route; it answers the
+  surface's disabled response unless the deployment sets
+  `NARVI_MCP_DCR_ENABLED` (off by default), and is rate-limited per client
+  address. A route added, graded MINOR (row 41). Its request and response
+  are RFC 7591's own JSON shapes, not `/contracts` schemas.
+- Unchanged as routes, changed in behaviour: `GET /oauth/authorize` now
+  also accepts an `https` `client_id` -- a client ID metadata document,
+  fetched through an SSRF-guarded fetcher (`NARVI_MCP_CIMD_ENABLED`, on by
+  default) -- and `GET /.well-known/oauth-authorization-server/oauth`
+  advertises `client_id_metadata_document_supported` and
+  `registration_endpoint` while each mechanism is on.
+
+### rest/v1/dtos.schema.json
+
+- Changed (descriptions only, annotation-only PATCH):
+  `MCPAuthorization.clientKind` and `MCPClient.kind` no longer say only
+  `preregistered` is produced: `metadata_document` and `dynamic` are
+  produced now, and each value is described. Both stay open enums, with
+  the same three values. `MCPAuthorization.clientName` now says a
+  self-registered client chose its own name. `CreateMCPClientRequest`
+  describes the stricter client-name rule every registration path now
+  shares -- printable characters only, spelled out, and at most three
+  combining marks stacked on one character -- and the redirect-URI and
+  `clientUri` rules as they now stand: printable ASCII of at most 2048
+  bytes, and the host written in plain ASCII (no percent sign in the
+  authority; an internationalized host in its `xn--` form). Three kinds of
+  `POST /api/mcp-clients` request that 1.4.1 accepted are now refused 400:
+  - a client name with, anywhere but at either end, a character 1.4.1 let
+    through that is not printable: a space other than U+0020 (a no-break,
+    ideographic or thin space, and the other Unicode spaces), a line or
+    paragraph separator (U+2028, U+2029), or a private-use or unassigned
+    code point. 1.4.1 refused only control and invisible formatting
+    characters. White space at either end is still trimmed, not refused;
+  - a client name stacking more than three combining marks on one
+    character;
+  - a redirect or homepage URI with a percent sign in its authority: a
+    percent-encoded host, or an IPv6 zone identifier.
+
+  Nothing 1.4.1 refused is accepted now. In the schema only descriptions
+  changed: no field, type, enum value or requiredness.
+
 ## [1.4.1]
 
 ### rest/v1/dtos.schema.json
