@@ -7591,7 +7591,7 @@ keeps working, twice, with no second consent, and `RevokedAuthorizationStopsOnNe
 client revoke its refresh token at the advertised revocation endpoint and its very next call refused.
 The same test proves the surface switched off: the discovery documents and every `/oauth` route answer
 the disabled `503`, and the Settings routes still list and revoke. The parity suite of §43.12 now runs
-over bearer principals minted per role. Piece (c)'s proofs run on the same router:
+over bearer principals minted per role. Piece (c)'s proofs run on the production router too:
 `EndToEnd_SDKClient_MetadataDocument` has the SDK client identify itself by a metadata document served by
 an in-test HTTPS server on loopback, reachable only through the fetch guard's test seam, while
 `MetadataDocument_ProductionGuardRefusesLoopback` has the production guard refuse that very server before a
@@ -7609,10 +7609,21 @@ has an administrator disable a dynamically registered client through the admin r
 `403` first — and its access token refused on its next call and its refresh token `invalid_client`, both
 carrying on once it is enabled; `DisabledMetadataDocumentClient_SurvivesTheSweepNeverFetched` has the
 unused-client sweep, run a day past the client's last use, delete an enabled metadata-document client and
-keep the disabled one, whose URL the next authorization is refused for without a fetch. On a router built with the
-shipped brakes (the shared router of the proofs above lifts the two new ones, since every SDK client there
-dials from one loopback address and would otherwise meet them whenever it ran faster than they refill):
-`RateLimit_TokenEndpoint429` and `RateLimit_AuthorizeEndpoint` prove each brake's answer, its log line,
+keep the disabled one, whose URL the next authorization is refused for without a fetch. Every router
+named here is `controlplane.Build`'s own; they differ in their flags and in the token and authorization
+endpoints' brakes, which one of them alone lifts: the shared router of `EndToEnd_SDKClient`,
+`RefreshAfterAccessTokenExpires_NoSecondConsent`, `RevokedAuthorizationStopsOnNextCall_User`, `_Admin`,
+`_RFC7009`, `_ClientDeleted` and `_DisabledUser`, `DisabledClientIs401NextCall`,
+`ScopelessGrant_ToolsListEmpty`, `Register_DisabledByDefault` and
+`MetadataDocument_ProductionGuardRefusesLoopback`, whose many SDK clients all dial from one loopback
+address and would otherwise meet the brakes whenever they ran faster than the brakes refill. Every other
+router keeps the shipped brakes — among them the one with dynamic registration on, which serves
+`EndToEnd_SDKClient_MetadataDocument`, `EndToEnd_SDKClient_DynamicRegistration`, `Register_RateLimited`,
+`DisabledDynamicClient_RefusedNextCall` and `DisabledMetadataDocumentClient_SurvivesTheSweepNeverFetched`,
+whose two SDK clients dial from loopback too and stay inside the shipped bursts only because there are
+just two of them: a flow added there spends from the same buckets; the two with a mechanism switched off, of
+`MetadataDocuments_Disabled` and `DynamicRegistration_Disabled`; and those of the brakes' own proofs.
+There, `RateLimit_TokenEndpoint429` and `RateLimit_AuthorizeEndpoint` prove each brake's answer, its log line,
 that a refused request spends and stores nothing, and — from the refusal's `Retry-After`, bounded by the
 time the burst took — the refill interval the router built the brake with, as `Register_RateLimited` does
 for registration's; `RateLimit_OneNetworkCannotLockOutAnotherRefresh` has
