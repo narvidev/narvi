@@ -36,10 +36,25 @@
 // its next call while the other's still works (and with metadata
 // documents off, an https client_id is unknown).
 //
+// The admin view and the brakes (§43.14/§43.18): an administrator lists a
+// member's authorizations and revokes one on the member's behalf -- after
+// every other role is refused and the grant under any other user's path
+// is a 404 -- and the member's SDK session stops on its very next call.
+// On a router built with the shipped brakes (the shared rig lifts the two
+// new ones: newOAuthRouterRig's own doc comment says why), each of the
+// authorization and token endpoints refuses a network past its burst --
+// a page, never a redirect; 429 temporarily_unavailable -- spending and
+// storing nothing and logging no credential; one network's flood never
+// spends another's bucket, the SDK client refreshing through it; the SDK
+// client whose own refresh is braked keeps its refresh token and is never
+// sent back to consent; and a concurrent flood of authorizations of one
+// client stores exactly the pending-request cap.
+//
 // With the surface OFF, the discovery documents and every /oauth route
 // answer the documented disabled response (§43.11/§43.14), while the
-// Settings routes keep serving, so an authorization can always be listed
-// and revoked (§43.18).
+// Settings routes -- the admin view of a member's authorizations included
+// -- keep serving, so an authorization can always be listed and revoked
+// (§43.18).
 //
 // One Postgres container backs every subtest; each subtest creates its
 // own users and clients.
