@@ -663,7 +663,7 @@ func TestToken_ScopesFixedAtIssuance_LaterConsentCannotNarrow(t *testing.T) {
 // gets no page -- 400, no nonce minted, the request left unbound -- so
 // it can be neither approved nor denied (denying would redirect to the
 // disabled client). decide()'s own re-check is the second layer
-// (TestConsent_ClientDisabledAfterRenderGrantsNothing).
+// (TestConsent_ClientDisabledAfterRenderRefusesApproveAndDeny).
 func TestConsent_ClientDisabledBeforeRenderRefused(t *testing.T) {
 	r := newASRig(t)
 	_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
@@ -681,26 +681,47 @@ func TestConsent_ClientDisabledBeforeRenderRefused(t *testing.T) {
 	}
 }
 
-// TestConsent_ClientDisabledAfterRenderGrantsNothing: a client an
-// operator disables while its consent page is open cannot be approved --
-// no grant, no code, no redirect.
-func TestConsent_ClientDisabledAfterRenderGrantsNothing(t *testing.T) {
-	r := newASRig(t)
-	user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
-	requestID := r.startConsent(t, r.authorizeParams(newVerifier(t)), cookie)
-	_, nonce := r.renderConsent(t, requestID, cookie)
-	if _, err := r.pool.Exec(context.Background(), `UPDATE mcp_oauth_clients SET disabled_at = now() WHERE id = $1`, r.client.ID); err != nil {
-		t.Fatal(err)
+// TestConsent_ClientDisabledAfterRenderRefusesApproveAndDeny: a client an
+// operator disables while its consent page is open gets an error page
+// for either button -- 400, no redirect, no grant, no code, the request
+// left unconsumed. A Deny that redirected would send the browser to the
+// disabled client's own redirect URI.
+func TestConsent_ClientDisabledAfterRenderRefusesApproveAndDeny(t *testing.T) {
+	cases := []struct {
+		name string
+		form url.Values
+	}{
+		{name: "approve", form: url.Values{"decision": {"approve"}, "scope": {"mcp:read"}}},
+		{name: "deny", form: url.Values{"decision": {"deny"}}},
 	}
-	form := url.Values{"request": {requestID}, "nonce": {nonce}, "decision": {"approve"}, "scope": {"mcp:read"}}
-	if rec := r.postConsent(form, sameOriginHeaders(), cookie); rec.Code != http.StatusBadRequest || rec.Header().Get("Location") != "" {
-		t.Fatalf("status %d Location %q, want 400 and no redirect", rec.Code, rec.Header().Get("Location"))
-	}
-	if ids := r.grantIDs(t, user.ID); len(ids) != 0 {
-		t.Fatalf("grants = %v, want none", ids)
-	}
-	var codes int
-	if err := r.pool.QueryRow(context.Background(), `SELECT count(*) FROM mcp_oauth_authorization_codes`).Scan(&codes); err != nil || codes != 0 {
-		t.Fatalf("codes = %d (err %v), want none", codes, err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newASRig(t)
+			user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+			requestID := r.startConsent(t, r.authorizeParams(newVerifier(t)), cookie)
+			_, nonce := r.renderConsent(t, requestID, cookie)
+			if _, err := r.pool.Exec(context.Background(), `UPDATE mcp_oauth_clients SET disabled_at = now() WHERE id = $1`, r.client.ID); err != nil {
+				t.Fatal(err)
+			}
+			form := url.Values{"request": {requestID}, "nonce": {nonce}}
+			for k, v := range tc.form {
+				form[k] = v
+			}
+			rec := r.postConsent(form, sameOriginHeaders(), cookie)
+			if rec.Code != http.StatusBadRequest || rec.Header().Get("Location") != "" || !strings.Contains(rec.Body.String(), "This app is not available") {
+				t.Fatalf("%s: status %d Location %q, want 400, the not-available page and no redirect", tc.name, rec.Code, rec.Header().Get("Location"))
+			}
+			if ids := r.grantIDs(t, user.ID); len(ids) != 0 {
+				t.Fatalf("grants = %v, want none", ids)
+			}
+			var codes int
+			if err := r.pool.QueryRow(context.Background(), `SELECT count(*) FROM mcp_oauth_authorization_codes`).Scan(&codes); err != nil || codes != 0 {
+				t.Fatalf("codes = %d (err %v), want none", codes, err)
+			}
+			var consumed bool
+			if err := r.pool.QueryRow(context.Background(), `SELECT consumed_at IS NOT NULL FROM mcp_oauth_authorization_requests WHERE id = $1`, requestID).Scan(&consumed); err != nil || consumed {
+				t.Fatalf("request after a refused %s: consumed = %v (err %v), want unconsumed", tc.name, consumed, err)
+			}
+		})
 	}
 }
