@@ -1,6 +1,8 @@
 package cimdfetch_test
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -15,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,11 +36,15 @@ const testFetchTimeout = 2 * time.Second
 // or reaches the network -- a refused address is refused before its
 // socket connects.
 const (
-	docHost      = "doc.example"
-	internalHost = "internal.example"
-	mixedHost    = "mixed.example"
-	loopHost     = "loop.example"
-	rebindHost   = "rebind.example"
+	docHost          = "doc.example"
+	internalHost     = "internal.example"
+	mixedHost        = "mixed.example"
+	loopHost         = "loop.example"
+	rebindHost       = "rebind.example"
+	toPrivateHost    = "to-private.example"
+	toMetadataHost   = "to-metadata.example"
+	otherHost        = "other.example"
+	docHostOtherCase = "DOC.example"
 )
 
 // fakeResolver answers each host from a fixed sequence of answers (the
@@ -94,6 +101,7 @@ func addrs(list ...string) []netip.Addr {
 type docServer struct {
 	*httptest.Server
 	addr  netip.AddrPort
+	leaf  *x509.Certificate
 	roots *x509.CertPool
 	hits  atomic.Int32
 }
@@ -113,7 +121,7 @@ func newDocServer(t *testing.T, h http.Handler) *docServer {
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 		IsCA:                  true,
-		DNSNames:              []string{docHost, internalHost, mixedHost, loopHost, rebindHost},
+		DNSNames:              []string{docHost, internalHost, mixedHost, loopHost, rebindHost, toPrivateHost, toMetadataHost, otherHost},
 		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1)},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
@@ -124,7 +132,7 @@ func newDocServer(t *testing.T, h http.Handler) *docServer {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &docServer{roots: x509.NewCertPool()}
+	s := &docServer{leaf: leaf, roots: x509.NewCertPool()}
 	s.roots.AddCert(leaf)
 	s.Server = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.hits.Add(1)
@@ -203,21 +211,17 @@ func TestCIMDFetch_FetchesThroughTheSeamOnly(t *testing.T) {
 
 // TestCIMDFetch_RefusesPrivateTargets is the SSRF threat row's own proof
 // (technical plan §43.19): every non-public target is refused at dial
-// time -- as a literal, as a name resolving to it, as a redirect target,
-// and as a name whose answer changes between two dials -- and the error
-// says so.
+// time -- as a literal, as a name resolving to it, as the target of a
+// redirect (which stays on the first URL's own origin, so a redirect
+// reaches a private address only through its host's name resolving there
+// on the redirect's own dial), and as a name whose answer changes between
+// two dials -- and the error says so.
 func TestCIMDFetch_RefusesPrivateTargets(t *testing.T) {
 	t.Parallel()
 	srv := newDocServer(t, documentHandler(func(w http.ResponseWriter, r *http.Request) bool {
 		switch r.URL.Path {
-		case "/to-private":
-			http.Redirect(w, r, "https://10.0.0.9/client.json", http.StatusFound)
-		case "/to-metadata":
-			http.Redirect(w, r, "https://169.254.169.254/latest/meta-data/", http.StatusTemporaryRedirect)
-		case "/to-loop-name":
-			// The same loopback address as this server, but another port:
-			// the seam allows one exact pair and nothing else.
-			http.Redirect(w, r, fmt.Sprintf("https://%s:%d/client.json", loopHost, srv0Port(r)+1), http.StatusFound)
+		case "/to-self":
+			http.Redirect(w, r, "/client.json", http.StatusFound)
 		case "/rebind-first":
 			http.Redirect(w, r, "/rebind-second", http.StatusFound)
 		default:
@@ -229,10 +233,12 @@ func TestCIMDFetch_RefusesPrivateTargets(t *testing.T) {
 	res.set(docHost, addrs("127.0.0.1"))
 	res.set(internalHost, addrs("10.0.0.7"))
 	res.set(mixedHost, addrs("192.168.0.9", "172.16.3.4", "fd00::5"))
-	res.set(loopHost, addrs("127.0.0.1"))
-	// rebind.example answers the test server's own (allowed) address on
-	// the first lookup and the cloud metadata address on every later one:
-	// what an attacker's DNS does to a check-then-connect fetcher.
+	// Each of these answers the test server's own (allowed) address on
+	// the first lookup and a refused one on every later one -- what an
+	// attacker's DNS does to a check-then-connect fetcher, and the only
+	// way a same-origin redirect can lead into a private address.
+	res.set(toPrivateHost, addrs("127.0.0.1"), addrs("10.0.0.9"))
+	res.set(toMetadataHost, addrs("127.0.0.1"), addrs("169.254.169.254"))
 	res.set(rebindHost, addrs("127.0.0.1"), addrs("169.254.169.254"))
 	fetch := srv.seamed(res)
 
@@ -256,9 +262,8 @@ func TestCIMDFetch_RefusesPrivateTargets(t *testing.T) {
 		{"unspecified", "https://0.0.0.0/client.json"},
 		{"a name resolving to a private address", "https://" + internalHost + "/client.json"},
 		{"a name resolving only to private addresses", "https://" + mixedHost + "/client.json"},
-		{"a redirect into a private address", srv.url(docHost, "/to-private")},
-		{"a redirect into the cloud metadata address", srv.url(docHost, "/to-metadata")},
-		{"a redirect to another port on loopback", srv.url(docHost, "/to-loop-name")},
+		{"a redirect into a private address", srv.url(toPrivateHost, "/to-self")},
+		{"a redirect into the cloud metadata address", srv.url(toMetadataHost, "/to-self")},
 		{"a DNS answer that changes between checks", srv.url(rebindHost, "/rebind-first")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -269,23 +274,86 @@ func TestCIMDFetch_RefusesPrivateTargets(t *testing.T) {
 		})
 	}
 
-	// The rebinding case was refused on its SECOND dial, after the first
-	// reached the server: each dial resolved and was checked afresh.
-	if n := res.lookups(rebindHost); n != 2 {
-		t.Errorf("rebind.example was resolved %d times, want 2 (once per dial)", n)
+	// Each redirect and rebinding case was refused on its SECOND dial,
+	// after the first reached the server: each dial resolved and was
+	// checked afresh.
+	for _, host := range []string{toPrivateHost, toMetadataHost, rebindHost} {
+		if n := res.lookups(host); n != 2 {
+			t.Errorf("%s was resolved %d times, want 2 (once per dial)", host, n)
+		}
 	}
 }
 
-// srv0Port is the port the request arrived on.
-func srv0Port(r *http.Request) int {
-	ap, err := netip.ParseAddrPort(r.Host)
-	if err == nil {
-		return int(ap.Port())
+// TestCIMDFetch_RefusesCrossOriginRedirects: a redirect is followed only
+// within the origin -- scheme, host and port -- the fetch began with
+// (technical plan §43.15). The host of the client_id URL is what the
+// consent page shows as the client's identity, so the document must be
+// served by that origin: an open redirect on one host must never lend its
+// name to a document served by another. A redirect to another host --
+// even one the guard would let the fetch reach, on the same allowed
+// address and port with a certificate that verifies -- or to another
+// port is refused before it is followed; a same-origin redirect, the
+// host differing only in case, is followed.
+func TestCIMDFetch_RefusesCrossOriginRedirects(t *testing.T) {
+	t.Parallel()
+	var otherHostHits atomic.Int32
+	other := newDocServer(t, documentHandler(nil))
+	srv := newDocServer(t, documentHandler(func(w http.ResponseWriter, r *http.Request) bool {
+		if strings.HasPrefix(r.Host, otherHost) {
+			otherHostHits.Add(1)
+		}
+		if r.URL.Path == "/out" {
+			// An open redirect: wherever "to" says.
+			http.Redirect(w, r, r.URL.Query().Get("to"), http.StatusFound)
+			return true
+		}
+		return false
+	}))
+	res := newFakeResolver()
+	res.set(docHost, addrs("127.0.0.1"))
+	res.set(docHostOtherCase, addrs("127.0.0.1"))
+	res.set(otherHost, addrs("127.0.0.1"))
+	roots := x509.NewCertPool()
+	roots.AddCert(srv.leaf)
+	roots.AddCert(other.leaf)
+	// Both servers are reachable and trusted: nothing but the redirect
+	// policy can refuse what follows.
+	fetch := cimdfetch.New(cimdfetch.NewGuardedClient(cimdfetch.GuardConfig{
+		Resolver:       res,
+		AllowAddrPorts: []netip.AddrPort{srv.addr, other.addr},
+		RootCAs:        roots,
+	}), testFetchTimeout)
+	out := func(to string) string { return srv.url(docHost, "/out?to="+url.QueryEscape(to)) }
+
+	for _, tc := range []struct {
+		name    string
+		url     string
+		wantErr error // nil: the fetch succeeds
+	}{
+		{"another host on the same allowed address and port", out(srv.url(otherHost, "/client.json")), cimdfetch.ErrCrossOriginRedirect},
+		{"the same host on another port", out(other.url(docHost, "/client.json")), cimdfetch.ErrCrossOriginRedirect},
+		{"another host after a same-origin hop", out(out(srv.url(otherHost, "/client.json"))), cimdfetch.ErrCrossOriginRedirect},
+		{"another scheme", out("http://" + docHost + "/client.json"), cimdfetch.ErrNotHTTPS},
+		{"a relative redirect", out("/client.json"), nil},
+		{"an absolute same-origin redirect", out(srv.url(docHost, "/client.json")), nil},
+		{"the same origin with the host in another case", out(srv.url(docHostOtherCase, "/client.json")), nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := fetch.Fetch(context.Background(), tc.url)
+			switch {
+			case tc.wantErr == nil && (err != nil || string(got.Body) != validDoc):
+				t.Fatalf("Fetch(%s) = %q, %v, want the document", tc.url, got.Body, err)
+			case tc.wantErr != nil && !errors.Is(err, tc.wantErr):
+				t.Fatalf("Fetch(%s) = %v, want %v", tc.url, err, tc.wantErr)
+			}
+		})
 	}
-	_, port, _ := net.SplitHostPort(r.Host)
-	var n int
-	_, _ = fmt.Sscanf(port, "%d", &n)
-	return n
+	if n := otherHostHits.Load(); n != 0 {
+		t.Errorf("a redirect reached %s %d times, want never", otherHost, n)
+	}
+	if n := other.hits.Load(); n != 0 {
+		t.Errorf("a redirect reached the server on another port %d times, want never", n)
+	}
 }
 
 // TestCIMDFetch_RefusesHTTPAndOversize: https only, first and redirected;
@@ -328,6 +396,21 @@ func TestCIMDFetch_RefusesHTTPAndOversize(t *testing.T) {
 			_, _ = w.Write([]byte(validDoc))
 		case path == "/untyped":
 			_, _ = w.Write([]byte(validDoc))
+		case path == "/gzip-doc", path == "/gzip-over-cap":
+			// Compressed whatever was asked, as a hostile host would: the
+			// cap is on the DECODED document, so a small compressed body
+			// inflating past it is refused.
+			body := []byte(validDoc)
+			if path == "/gzip-over-cap" {
+				body = []byte(strings.Repeat(" ", 1<<20))
+			}
+			var zipped bytes.Buffer
+			zw := gzip.NewWriter(&zipped)
+			_, _ = zw.Write(body)
+			_ = zw.Close()
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Encoding", "gzip")
+			_, _ = w.Write(zipped.Bytes())
 		case path == "/at-cap", path == "/over-cap":
 			size := cimdfetch.MaxDocumentBytes
 			if path == "/over-cap" {
@@ -377,6 +460,7 @@ func TestCIMDFetch_RefusesHTTPAndOversize(t *testing.T) {
 		{"application/json with a charset", srv.url(docHost, "/json-charset"), nil},
 		{"exactly 64 KiB", srv.url(docHost, "/at-cap"), nil},
 		{"64 KiB + 1", srv.url(docHost, "/over-cap"), cimdfetch.ErrTooLarge},
+		{"1 MiB compressed to about 1 KiB", srv.url(docHost, "/gzip-over-cap"), cimdfetch.ErrTooLarge},
 		{"404", srv.url(docHost, "/not-found"), cimdfetch.ErrUnexpectedStatus},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -392,6 +476,13 @@ func TestCIMDFetch_RefusesHTTPAndOversize(t *testing.T) {
 	if n := plainHits.Load(); n != 0 {
 		t.Errorf("the plain-HTTP server was reached %d times, want never", n)
 	}
+
+	t.Run("a compressed document is decoded, then capped", func(t *testing.T) {
+		got, err := fetcher.Fetch(context.Background(), srv.url(docHost, "/gzip-doc"))
+		if err != nil || string(got.Body) != validDoc {
+			t.Fatalf("Fetch of a gzip-encoded document = %q, %v, want the decoded document", got.Body, err)
+		}
+	})
 
 	t.Run("the whole fetch is bounded by one timeout", func(t *testing.T) {
 		short := cimdfetch.New(cimdfetch.NewGuardedClient(cimdfetch.GuardConfig{

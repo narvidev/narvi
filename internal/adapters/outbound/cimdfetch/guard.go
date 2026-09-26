@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strconv"
+	"strings"
 	"syscall"
 )
 
@@ -25,6 +26,10 @@ var ErrNotHTTPS = errors.New("cimdfetch: only https URLs are fetched")
 // ErrTooManyRedirects is wrapped when a fetch would follow more than
 // MaxRedirects redirects.
 var ErrTooManyRedirects = errors.New("cimdfetch: too many redirects")
+
+// ErrCrossOriginRedirect is wrapped when a redirect would leave the
+// origin -- scheme, host and port -- of the URL the fetch began with.
+var ErrCrossOriginRedirect = errors.New("cimdfetch: refused a redirect to another origin")
 
 // MaxRedirects is how many redirects one fetch follows at most.
 const MaxRedirects = 3
@@ -258,13 +263,37 @@ func requireHTTPS(u *url.URL) error {
 }
 
 // checkRedirect is the client's redirect policy: at most MaxRedirects,
-// each to an https URL (never a downgrade, never another scheme). The
-// target's address is checked when it is dialed, like any other.
+// each to an https URL (never a downgrade, never another scheme) on the
+// very origin -- scheme, host, port -- the fetch began with. The document
+// is identified by its URL, and the host of that URL is what the consent
+// page shows as the client's identity: were a redirect allowed to leave
+// that origin, an open redirect on a reputable host would let a document
+// served anywhere else appear under the reputable host's name. The
+// target's address is checked when it is dialed, like any other: a
+// same-origin redirect resolves, and is checked, afresh.
 func checkRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) > MaxRedirects {
 		return fmt.Errorf("%w: more than %d", ErrTooManyRedirects, MaxRedirects)
 	}
-	return requireHTTPS(req.URL)
+	if err := requireHTTPS(req.URL); err != nil {
+		return err
+	}
+	if to, from := origin(req.URL), origin(via[0].URL); to != from {
+		return fmt.Errorf("%w: %s, from %s", ErrCrossOriginRedirect, to, from)
+	}
+	return nil
+}
+
+// origin is u's scheme, host and port as RFC 6454 compares them: scheme
+// and host lower-cased, the port spelled out (443 when an https URL names
+// none).
+func origin(u *url.URL) string {
+	scheme := strings.ToLower(u.Scheme)
+	port := u.Port()
+	if port == "" && scheme == "https" {
+		port = "443"
+	}
+	return scheme + "://" + net.JoinHostPort(strings.ToLower(u.Hostname()), port)
 }
 
 // httpsOnly refuses any request that is not https before it reaches the

@@ -27,8 +27,12 @@
 //     forms of each (addressPolicy has the list).
 //   - https only, on the first request and every redirect: never a
 //     downgrade to http, never another scheme. At most MaxRedirects
-//     redirects. No proxy from the environment -- a proxy would dial on
-//     the guard's behalf, out of its reach.
+//     redirects, each within the first URL's own origin (scheme, host,
+//     port): the document is served by the origin its URL names, so the
+//     host shown as the client's identity is the host it came from -- an
+//     open redirect elsewhere cannot lend another host's name to it. No
+//     proxy from the environment -- a proxy would dial on the guard's
+//     behalf, out of its reach.
 //   - The answer must be 200 with Content-Type application/json, and at most
 //     MaxDocumentBytes long (one byte more is read, and refused). One timeout
 //     (platform.Timeouts.MCPClientMetadataFetchTimeout) bounds the whole
