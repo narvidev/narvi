@@ -45,7 +45,9 @@
 // authorization and token endpoints refuses a network past its burst --
 // a page, never a redirect; 429 temporarily_unavailable -- spending and
 // storing nothing and logging no credential; one network's flood never
-// spends another's bucket, the SDK client refreshing through it; the SDK
+// spends another's bucket, the SDK client refreshing through it -- a
+// network being the connecting address, which a forwarded header naming
+// another does not change, so behind a proxy everyone shares one; the SDK
 // client whose own refresh is braked keeps its refresh token and is never
 // sent back to consent; and a concurrent flood of authorizations of one
 // client stores exactly the pending-request cap.

@@ -2676,7 +2676,9 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// authorization endpoint answers its error page, never a redirect
 		// to a redirect_uri nobody has validated yet, and the token
 		// endpoint temporarily_unavailable, which leaves a client its
-		// refresh token. One network's flood never touches another's bucket.
+		// refresh token. One network's flood never touches another's bucket
+		// -- a network being the connecting address, so behind a proxy that
+		// hides client addresses every user shares the proxy's one.
 		r.With(
 			mcpauth.NewRateLimiter(cfg.Timeouts.MCPAuthorizeRateInterval, cfg.Timeouts.MCPAuthorizeRateBurst).Limit(mcpAuthServer.AuthorizeRateLimited),
 		).Get("/authorize", mcpAuthServer.Authorize)

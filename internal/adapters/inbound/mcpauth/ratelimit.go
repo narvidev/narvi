@@ -42,11 +42,14 @@ const maxTrackedAddresses = 10_000
 // more networks than the table holds only evicts the buckets seen least
 // recently, so a client from any other network -- registering, refreshing
 // its token, or starting an authorization -- always gets a bucket of its
-// own. The price is stated, not hidden: a party rotating through
-// more networks than the table holds gets each one's burst afresh. A
-// per-address brake is beaten by enough addresses whatever it does when
-// full; refusing every newcomer when full only turned that into a lockout
-// of everyone else.
+// own. A network is only what ClientAddressKey reads from the connecting
+// address: behind a proxy that hides client addresses, every client is
+// the proxy's one network and shares its one bucket, so one sender's
+// flood refuses them all. The price is stated, not hidden: a party
+// rotating through more networks than the table holds gets each one's
+// burst afresh. A per-address brake is beaten by enough addresses
+// whatever it does when full; refusing every newcomer when full only
+// turned that into a lockout of everyone else.
 type RateLimiter struct {
 	interval time.Duration
 	limit    rate.Limit
