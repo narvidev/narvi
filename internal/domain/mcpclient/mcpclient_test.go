@@ -31,6 +31,8 @@ func TestValidateRedirectURI(t *testing.T) {
 		{"https:client.example", false},              // opaque
 		{"https://client.example/c b", false},        // space
 		{"https://client.example/caf\u00e9", false},  // non-ASCII
+		{"https://%D0%B0pple.example/cb", false},     // ASCII as written, a Cyrillic host once parsed
+		{"https://xn--pple-43d.example/cb", true},    // the same host in its xn-- form
 		{"https://client.example/cb\x00", false},     // control
 		{"http://127.0.0.1:0/cb", false},             // port 0
 		{"http://127.0.0.1:99999/cb", false},         // port out of range
@@ -141,6 +143,16 @@ func TestValidateClientName(t *testing.T) {
 		{strings.Repeat("x", mcpclient.MaxClientNameRunes), strings.Repeat("x", mcpclient.MaxClientNameRunes), true},
 		{strings.Repeat("x", mcpclient.MaxClientNameRunes+1), "", false},
 		{"\xff", "", false},
+		// Combining marks: what written text stacks on one character is
+		// allowed; a tall stack, which paints over the identity headline
+		// above the name, is not (§43.15).
+		{"Vi\u0065\u0323\u0302t", "Vi\u0065\u0323\u0302t", true}, // e + dot below + circumflex
+		{"Key 1\ufe0f\u20e3", "Key 1\ufe0f\u20e3", true},         // keycap: variation selector + enclosing mark
+		{"a\u0301\u0302\u0303", "a\u0301\u0302\u0303", true},     // exactly the limit
+		{"a\u0301b\u0301c\u0301", "a\u0301b\u0301c\u0301", true}, // one per character, any number of characters
+		{"a\u0301\u0302\u0303\u0304", "", false},                 // one past the limit
+		{"x\u20dd\u20dd\u20dd\u20dd", "", false},                 // enclosing marks count too
+		{"Editor" + strings.Repeat("\u030d", 94), "", false},     // 100 runes: 94 marks on one letter
 	}
 	for _, tc := range tests {
 		got, err := mcpclient.ValidateClientName(tc.in)
@@ -163,6 +175,8 @@ func TestValidateClientURI(t *testing.T) {
 		{"javascript:alert(1)", false},
 		{"https://user@client.example", false},
 		{"https://client.example/a b", false},
+		{"https://%D0%B0pple.example", false},
+		{"https://xn--pple-43d.example", true},
 		{"", false},
 	}
 	for _, tc := range tests {

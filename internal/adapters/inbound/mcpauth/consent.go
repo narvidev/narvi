@@ -75,9 +75,7 @@ func identityFor(page *consentPage, client sqlcgen.McpOauthClient) bool {
 	case mcpclient.KindPreregistered:
 		page.ClientIdentity = preregisteredIdentity
 		if client.ClientUri != nil {
-			if u, err := url.Parse(*client.ClientUri); err == nil {
-				page.ClientHomepageHost = u.Hostname()
-			}
+			page.ClientHomepageHost = mcpclient.ClientURIHost(*client.ClientUri)
 		}
 	case mcpclient.KindMetadataDocument:
 		page.IdentityHost = mcpclient.IdentityHost(client.ClientID)
@@ -217,10 +215,12 @@ func (s *Server) ConsentPage(w http.ResponseWriter, r *http.Request) {
 		RequestID:        requestID.String(),
 		Nonce:            nonce,
 	}
-	if !identityFor(&page, client) {
-		// Unreachable for a stored client: every kind has an identity,
-		// and a metadata-document client_id was validated before it was
-		// ever stored.
+	if !identityFor(&page, client) || page.RedirectHost == "" {
+		// Unreachable for a stored client and request: every kind has an
+		// identity, a metadata-document client_id was validated before it
+		// was ever stored, and so was every redirect URI a request
+		// carries. A row that bypassed that validation is refused rather
+		// than shown with a host a user cannot check.
 		logger.Error("mcpauth: consent: client has no displayable identity", "client_id", client.ClientID, "kind", client.Kind)
 		s.renderError(w, r, http.StatusInternalServerError, "Something went wrong", "The authorization request could not be displayed.")
 		return

@@ -8,6 +8,9 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 )
@@ -157,6 +160,110 @@ func TestConsent_ShowsClientIdentityAndRedirectHost(t *testing.T) {
 		}
 		if strings.Contains(body, "Registered by an administrator of this deployment.") {
 			t.Error("the page claims an administrator registered a self-registered app")
+		}
+	})
+}
+
+// assertASCIIPage: body carries no byte outside ASCII -- with every client
+// name in play plain ASCII and the templates plain ASCII too, a non-ASCII
+// byte could only be a host decoded into a look-alike.
+func assertASCIIPage(t *testing.T, what, body string) {
+	t.Helper()
+	for i := 0; i < len(body); i++ {
+		if body[i] >= 0x80 {
+			t.Errorf("%s: the page carries a non-ASCII byte at %d: %q", what, i, body[max(0, i-40):min(len(body), i+40)])
+			return
+		}
+	}
+}
+
+// TestConsent_NoNonASCIIHostReachesThePage: every host the consent flow
+// shows -- the identity headline and title, the redirect line -- is plain
+// ASCII, the very string a fetch resolves (technical plan §43.15). A
+// percent-encoded client_id host (a Cyrillic look-alike, a right-to-left
+// override) is refused before any fetch; a document registering a
+// percent-encoded redirect URI is refused and nothing is stored; the same
+// host written in its xn-- form is shown in exactly that form; and a row
+// planted past every validation is refused rather than shown.
+func TestConsent_NoNonASCIIHostReachesThePage(t *testing.T) {
+	r := newASRig(t)
+	_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+
+	for _, tc := range []struct {
+		name, clientID string
+		redirect       string // the document's one redirect URI, and the request's
+		fetched        bool
+	}{
+		{"a percent-encoded Cyrillic look-alike client_id", "https://%D0%B0pple.example/mcp/client.json", loopbackRedirect, false},
+		{"a percent-encoded right-to-left override client_id", "https://%E2%80%AEtset.elpmaxe/x", loopbackRedirect, false},
+		{"a document registering a percent-encoded look-alike redirect URI", "https://lookalike.example/mcp/client.json", "https://%D0%B0pple.example/cb", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r.documents.set(tc.clientID, fakeDocument{body: metadataDocument(tc.clientID, "Editor", tc.redirect)})
+			p := forClient(r.authorizeParams(newVerifier(t)), tc.clientID)
+			p.Set("redirect_uri", tc.redirect)
+			rec := r.authorize(p, cookie)
+			assertPageNotRedirect(t, tc.name, rec)
+			assertASCIIPage(t, tc.name, rec.Body.String())
+			if _, stored := r.clientRow(t, tc.clientID); stored {
+				t.Errorf("a client was stored for %s", tc.clientID)
+			}
+			if fetched := r.documents.count(tc.clientID) > 0; fetched != tc.fetched {
+				t.Errorf("fetched = %v, want %v", fetched, tc.fetched)
+			}
+		})
+	}
+
+	t.Run("the same host in its xn-- form is shown exactly so", func(t *testing.T) {
+		const clientID, redirect = "https://xn--pple-43d.example/mcp/client.json", "https://xn--pple-43d.example/cb"
+		r.documents.set(clientID, fakeDocument{body: metadataDocument(clientID, "Editor", redirect)})
+		p := forClient(r.authorizeParams(newVerifier(t)), clientID)
+		p.Set("redirect_uri", redirect)
+		rec, _ := r.renderConsent(t, r.startConsent(t, p, cookie), cookie)
+		body := rec.Body.String()
+		for _, want := range []string{
+			`<title>Allow the app at xn--pple-43d.example? - Narvi</title>`,
+			`<h1>Allow the app at <strong class="host">xn--pple-43d.example</strong> to use Narvi as you?</h1>`,
+			`sent back to <strong>xn--pple-43d.example</strong>`,
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("consent page lacks %q", want)
+			}
+		}
+		assertASCIIPage(t, "xn-- consent page", body)
+	})
+
+	// Rows no registration path can write any more -- written straight to
+	// the tables, as a row stored before the rule would be: the page
+	// refuses to show a host it cannot show as written.
+	t.Run("a row planted past validation is refused, never shown", func(t *testing.T) {
+		ctx := context.Background()
+		now := time.Now()
+		const plantedID, plantedRedirect = "https://%D0%B0pple.example/planted.json", "https://%D0%B0pple.example/cb"
+		planted, err := r.clients.UpsertMetadataDocument(ctx, sqlcgen.UpsertMCPOAuthMetadataDocumentClientParams{
+			ClientID: plantedID, ClientName: "Editor", RedirectUris: []string{plantedRedirect},
+			MetadataFetchedAt: pgtype.Timestamptz{Time: now, Valid: true},
+			MetadataStaleAt:   pgtype.Timestamptz{Time: now.Add(time.Hour), Valid: true},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name, row := range map[string]sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
+			"a planted metadata-document client":  {ClientID: planted.ID, RedirectUri: loopbackRedirect},
+			"a planted redirect URI on a request": {ClientID: r.client.ID, RedirectUri: plantedRedirect},
+		} {
+			row.CodeChallenge, row.CodeChallengeMethod = "c", "S256"
+			row.Resource = r.server.Identifiers().Resource
+			row.ExpiresAt = pgtype.Timestamptz{Time: now.Add(time.Minute), Valid: true}
+			req, err := r.grants.CreateAuthorizationRequest(ctx, row)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec, _ := r.renderConsent(t, req.ID.String(), cookie)
+			if rec.Code == http.StatusOK {
+				t.Errorf("%s: the consent page rendered: %s", name, rec.Body.String())
+			}
+			assertASCIIPage(t, name, rec.Body.String())
 		}
 	})
 }

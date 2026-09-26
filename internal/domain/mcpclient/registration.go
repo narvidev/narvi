@@ -70,9 +70,12 @@ func IsClientIDURL(clientID string) bool {
 }
 
 // ValidateClientIDURL checks a metadata-document client_id: printable
-// ASCII (so an internationalized host is only ever seen, and shown, in its
-// xn-- form, never as a look-alike), at most MaxClientIDURLLength bytes,
-// the literal scheme "https://", a host, a path other than "/", no
+// ASCII throughout, and its host written in plain ASCII -- no
+// percent-encoding in the authority, the parsed host exactly the bytes
+// written (plainASCIIAuthority) -- so an internationalized host is only
+// ever seen, and shown, in its xn-- form, the very string the fetch
+// resolves, never decoded into a look-alike; at most MaxClientIDURLLength
+// bytes, the literal scheme "https://", a host, a path other than "/", no
 // single- or double-dot path segment (encoded or not), no userinfo, no
 // fragment. A query and a port are allowed, as the client ID metadata
 // document draft allows them. The URL is the client's identity and is
@@ -102,6 +105,9 @@ func ValidateClientIDURL(raw string) error {
 	if u.User != nil {
 		return fmt.Errorf("%w: must not carry user information", ErrInvalidClientIDURL)
 	}
+	if err := plainASCIIAuthority(raw, u); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidClientIDURL, err)
+	}
 	if p := u.Port(); p != "" {
 		n, err := strconv.Atoi(p)
 		if err != nil || n < 1 || n > 65535 {
@@ -122,8 +128,11 @@ func ValidateClientIDURL(raw string) error {
 // IdentityHost is what the consent page shows as a metadata-document
 // client's identity: the host of its client_id URL, with its port when it
 // names one -- the one thing about the client its own document cannot
-// choose, since the document was fetched from there over TLS. "" when raw
-// is not a valid client ID URL.
+// choose, since the document was fetched from that very origin over TLS
+// (the fetcher follows a redirect only within the client_id URL's own
+// scheme, host and port). Always plain ASCII, byte for byte as the URL
+// writes it and as the fetch resolves it (ValidateClientIDURL). "" when
+// raw is not a valid client ID URL.
 func IdentityHost(clientIDURL string) string {
 	if ValidateClientIDURL(clientIDURL) != nil {
 		return ""

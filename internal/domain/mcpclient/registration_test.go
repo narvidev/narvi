@@ -108,6 +108,7 @@ func TestCIMD_ValidationTable(t *testing.T) {
 		{"client_name with a zero-width space", map[string]string{"client_name": `"Edit\u200bor"`}, mcpclient.ErrInvalidClientName},
 		{"client_name of 101 runes", map[string]string{"client_name": `"` + strings.Repeat("é", mcpclient.MaxClientNameRunes+1) + `"`}, mcpclient.ErrInvalidClientName},
 		{"client_name not a string", map[string]string{"client_name": `["Editor"]`}, mcpclient.ErrMalformedMetadata},
+		{"client_name stacking combining marks", map[string]string{"client_name": `"Editor` + strings.Repeat(`\u030d`, 94) + `"`}, mcpclient.ErrInvalidClientName},
 
 		{"redirect_uris missing", map[string]string{"redirect_uris": ""}, mcpclient.ErrInvalidRedirectURI},
 		{"redirect_uris empty", map[string]string{"redirect_uris": `[]`}, mcpclient.ErrInvalidRedirectURI},
@@ -175,6 +176,7 @@ func TestValidateClientIDURL(t *testing.T) {
 		{"https://client.example/client.json?v=2", true},
 		{"https://127.0.0.1:8443/client.json", true}, // the fetch guard, not this rule, refuses loopback
 		{"https://xn--bcher-kva.example/client.json", true},
+		{"https://%D0%B0pple.example/client.json", false}, // ASCII as written, a Cyrillic host once parsed
 		{"https://client.example", false},
 		{"https://client.example/", false},
 		{"http://client.example/client.json", false},
@@ -200,6 +202,83 @@ func TestValidateClientIDURL(t *testing.T) {
 	}
 	if got := mcpclient.IdentityHost("https://client.example/"); got != "" {
 		t.Errorf("IdentityHost of an invalid client ID URL = %q, want empty", got)
+	}
+}
+
+// TestHostsWrittenInPlainASCII: every URI a registration stores -- a
+// metadata-document client_id, any client's redirect URIs, a
+// pre-registered client's homepage -- writes its host in plain ASCII, so
+// every host a page shows is the very string a fetch resolves and dials
+// (technical plan §43.15). Go's url.Parse decodes a percent-encoded byte
+// of 0x80 or above in a host, and net/http then dials that host's xn--
+// form: "https://%D0%B0pple.example/" would be SHOWN as a Cyrillic
+// look-alike of a Latin host while the document came from
+// xn--pple-43d.example. Each row -- a look-alike, a right-to-left
+// override, a whole-script look-alike, a percent-encoded ASCII byte, an
+// IPv6 zone -- is refused BECAUSE its authority is percent-encoded, by
+// the validator, by the document and registration parsers, and yields no
+// host to display.
+func TestHostsWrittenInPlainASCII(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, host string // host: what the URIs below put in their authority
+	}{
+		{"a percent-encoded Cyrillic look-alike", "%D0%B0pple.example"},
+		{"a percent-encoded right-to-left override", "%E2%80%AEtset.elpmaxe"},
+		{"a percent-encoded look-alike with a port", "%D0%B0pple.example:8443"},
+		{"a whole-script look-alike", "%D0%B0%D1%80%D1%80%D3%8F%D0%B5.example"},
+		{"a percent-encoded percent sign", "client%25example"},
+		{"an IPv6 zone", "[fe80::1%25en0]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			clientID := "https://" + tc.host + "/mcp/client.json"
+			if err := mcpclient.ValidateClientIDURL(clientID); !errors.Is(err, mcpclient.ErrInvalidClientIDURL) || !errors.Is(err, mcpclient.ErrPercentEncodedHost) {
+				t.Errorf("ValidateClientIDURL(%q) = %v, want ErrInvalidClientIDURL for ErrPercentEncodedHost", clientID, err)
+			}
+			if got := mcpclient.IdentityHost(clientID); got != "" {
+				t.Errorf("IdentityHost(%q) = %q, want no host to show", clientID, got)
+			}
+			// The redirect-URI variant: a self-registered client supplies it.
+			redirect := "https://" + tc.host + "/cb"
+			if err := mcpclient.ValidateRedirectURI(redirect); !errors.Is(err, mcpclient.ErrInvalidRedirectURI) || !errors.Is(err, mcpclient.ErrPercentEncodedHost) {
+				t.Errorf("ValidateRedirectURI(%q) = %v, want ErrInvalidRedirectURI for ErrPercentEncodedHost", redirect, err)
+			}
+			if got := mcpclient.RedirectHost(redirect); got != "" {
+				t.Errorf("RedirectHost(%q) = %q, want no host to show", redirect, got)
+			}
+			if mcpclient.MatchRedirectURI([]string{redirect}, redirect) {
+				t.Errorf("MatchRedirectURI matched %q, which could never have been registered", redirect)
+			}
+			body := doc(map[string]string{"redirect_uris": `["` + redirect + `"]`})
+			if _, err := mcpclient.ParseMetadataDocument(docURL, body); !errors.Is(err, mcpclient.ErrPercentEncodedHost) {
+				t.Errorf("ParseMetadataDocument with redirect URI %q = %v, want ErrPercentEncodedHost", redirect, err)
+			}
+			if _, err := mcpclient.ParseRegistrationRequest([]byte(`{"client_name":"Editor","redirect_uris":["` + redirect + `"]}`)); !errors.Is(err, mcpclient.ErrPercentEncodedHost) {
+				t.Errorf("ParseRegistrationRequest with redirect URI %q = %v, want ErrPercentEncodedHost", redirect, err)
+			}
+			homepage := "https://" + tc.host + "/about"
+			if err := mcpclient.ValidateClientURI(homepage); !errors.Is(err, mcpclient.ErrPercentEncodedHost) {
+				t.Errorf("ValidateClientURI(%q) = %v, want ErrPercentEncodedHost", homepage, err)
+			}
+			if got := mcpclient.ClientURIHost(homepage); got != "" {
+				t.Errorf("ClientURIHost(%q) = %q, want no host to show", homepage, got)
+			}
+		})
+	}
+
+	// The same hosts written in their xn-- form are accepted, and shown
+	// exactly as written: plain ASCII, the string a fetch resolves.
+	for _, host := range []string{"xn--pple-43d.example", "xn--80ak6aa92e.example", "client.example"} {
+		for _, got := range []string{
+			mcpclient.IdentityHost("https://" + host + "/mcp/client.json"),
+			mcpclient.RedirectHost("https://" + host + "/cb"),
+			mcpclient.ClientURIHost("https://" + host + "/about"),
+		} {
+			if got != host {
+				t.Errorf("host shown for %s = %q, want %q exactly", host, got, host)
+			}
+		}
 	}
 }
 
