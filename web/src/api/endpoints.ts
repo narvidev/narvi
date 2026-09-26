@@ -432,6 +432,16 @@ export function revokeMyMCPAuthorization(authorizationId: string, signal?: Abort
   return request<undefined>(`/api/me/mcp-authorizations/${encodeURIComponent(authorizationId)}`, { method: 'DELETE', signal })
 }
 
+/** listMemberMCPAuthorizations calls GET /api/members/:userId/mcp-authorizations -- one member's connected MCP clients, exactly what that member sees of their own (admin only, authz.ActionManageMembers; 403 otherwise, 404 for an unknown member). Never a token: none exists in plaintext. */
+export function listMemberMCPAuthorizations(userId: string, signal?: AbortSignal): Promise<ListMCPAuthorizationsResponse> {
+  return request<ListMCPAuthorizationsResponse>(`/api/members/${encodeURIComponent(userId)}/mcp-authorizations`, { signal })
+}
+
+/** revokeMemberMCPAuthorization calls DELETE /api/members/:userId/mcp-authorizations/:id -- an administrator revokes one of the member's authorizations on the member's behalf; the client's very next /mcp call is refused. Admin only; 404 for an id that is not that member's own. Audited server-side (reason admin). */
+export function revokeMemberMCPAuthorization(userId: string, authorizationId: string, signal?: AbortSignal): Promise<undefined> {
+  return request<undefined>(`/api/members/${encodeURIComponent(userId)}/mcp-authorizations/${encodeURIComponent(authorizationId)}`, { method: 'DELETE', signal })
+}
+
 /** listMCPClients calls GET /api/mcp-clients -- every registered MCP client (admin only, authz.ActionManageIntegrations; 403 otherwise). */
 export function listMCPClients(signal?: AbortSignal): Promise<ListMCPClientsResponse> {
   return request<ListMCPClientsResponse>('/api/mcp-clients', { signal })

@@ -4,14 +4,19 @@
 // registered clients that may ask at all. Same connect/verify/liveness/
 // disconnect shape as the ChatGPT-account card beside it.
 //
-// Two sections, two independently-gated backend surfaces:
+// Three views, three independently-gated backend surfaces, one table:
 //
 //   1. ConnectedAppsSection: every role (authz.ActionViewOwnProfile to
 //      list, authz.ActionRevokeOwnMCPAuthorization to revoke) -- the
 //      caller's OWN authorizations only. Revoking deletes the
 //      authorization server-side; the app's very next /mcp call is
 //      refused. Behind an explicit confirm, never a bare button.
-//   2. MCPClientsSection: admin only (authz.ActionManageIntegrations) --
+//   2. MemberConnectedApps: admin only (authz.ActionManageMembers) -- the
+//      Members & access screen's per-member drawer (MembersPanel.tsx): the
+//      very list that member sees in (1), through the same table and row,
+//      and revocation on the member's behalf, audited server-side. Never a
+//      token -- none exists in plaintext anywhere to show.
+//   3. MCPClientsSection: admin only (authz.ActionManageIntegrations) --
 //      register a client (the server generates its public client ID and
 //      refuses any redirect URI the consent flow could not use) or delete
 //      one, which disconnects every user of it.
@@ -25,11 +30,19 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import type { MCPAuthorization, MCPClient } from '@narvi/contracts/rest-dtos'
+import type { MCPAuthorization, MCPClient, Member } from '@narvi/contracts/rest-dtos'
 
-import { createMCPClient, deleteMCPClient, listMCPClients, listMyMCPAuthorizations, revokeMyMCPAuthorization } from '../api/endpoints'
+import {
+  createMCPClient,
+  deleteMCPClient,
+  listMCPClients,
+  listMemberMCPAuthorizations,
+  listMyMCPAuthorizations,
+  revokeMemberMCPAuthorization,
+  revokeMyMCPAuthorization,
+} from '../api/endpoints'
 import { ApiError } from '../api/http'
-import { mcpAuthorizationQueryKeys, mcpClientQueryKeys } from '../api/queryKeys'
+import { auditLogQueryKeys, mcpAuthorizationQueryKeys, mcpClientQueryKeys } from '../api/queryKeys'
 import { apiErrorMessage, clientIdentityLabel, parseRedirectUris, scopesSummary } from './connectedAppsFormat'
 import { formatDateTime } from './settingsFormat'
 import { truncateForDisplay } from './textSafety'
@@ -104,28 +117,76 @@ export function ConnectedAppsSection() {
         <p className="rail-empty">No connected apps. An app appears here after you approve it on its consent page.</p>
       )}
       {query.isSuccess && query.data.authorizations.length > 0 && (
-        <table className="sectable">
-          <thead>
-            <tr>
-              <th>App</th>
-              <th>Access</th>
-              <th>Connected</th>
-              <th>Last used</th>
-              <th>Expires</th>
-              <th />
-            </tr>
-          </thead>
-          <tbody>
-            {query.data.authorizations.map((a) => (
-              <ConnectedAppRow
-                key={a.id}
-                authorization={a}
-                revoking={revokeMutation.isPending && revokeMutation.variables === a.id}
-                onRevoke={() => revokeMutation.mutate(a.id)}
-              />
-            ))}
-          </tbody>
-        </table>
+        <ConnectedAppsTable authorizations={query.data.authorizations} revokingId={revokeMutation.isPending ? revokeMutation.variables : undefined} onRevoke={(id) => revokeMutation.mutate(id)} />
+      )}
+      {revokeMutation.isError && <p className="sidebar-notice">{apiErrorMessage(revokeMutation.error, "Couldn't revoke. Try again.")}</p>}
+    </div>
+  )
+}
+
+/** ConnectedAppsTable renders a user's MCP authorizations, one ConnectedAppRow each -- the caller's own (ConnectedAppsSection) and, for an admin, a member's (MemberConnectedApps) go through this one table, so both say exactly the same thing about an app. Exported for direct render testing. */
+export function ConnectedAppsTable({ authorizations, revokingId, onRevoke }: { authorizations: MCPAuthorization[]; revokingId: string | undefined; onRevoke: (authorizationId: string) => void }) {
+  return (
+    <table className="sectable">
+      <thead>
+        <tr>
+          <th>App</th>
+          <th>Access</th>
+          <th>Connected</th>
+          <th>Last used</th>
+          <th>Expires</th>
+          <th />
+        </tr>
+      </thead>
+      <tbody>
+        {authorizations.map((a) => (
+          <ConnectedAppRow key={a.id} authorization={a} revoking={revokingId === a.id} onRevoke={() => onRevoke(a.id)} />
+        ))}
+      </tbody>
+    </table>
+  )
+}
+
+/**
+ * MemberConnectedApps is the Members & access screen's per-member "Connected
+ * apps" drawer (technical plan §43.18): an admin's view of one member's MCP
+ * authorizations -- the list that member sees, never a token -- and a
+ * Revoke behind the same confirmation, which disconnects the app on the
+ * member's behalf from its very next call. The member can approve the app
+ * again; keeping an app out is deleting or disabling its client.
+ */
+export function MemberConnectedApps({ member }: { member: Member }) {
+  const queryClient = useQueryClient()
+  const query = useQuery({
+    queryKey: mcpAuthorizationQueryKeys.member(member.id),
+    queryFn: ({ signal }) => listMemberMCPAuthorizations(member.id, signal),
+    retry: false,
+  })
+  const revokeMutation = useMutation({
+    mutationFn: (authorizationId: string) => revokeMemberMCPAuthorization(member.id, authorizationId),
+    onSuccess: () => {
+      // Every cached list: the member's, and the admin's own when an admin
+      // revokes one of their own apps from here.
+      void queryClient.invalidateQueries({ queryKey: mcpAuthorizationQueryKeys.all() })
+      // The revocation is an audit row (mcp_authorization.revoked, reason
+      // admin), and the audit log renders on this same screen.
+      void queryClient.invalidateQueries({ queryKey: auditLogQueryKeys.list() })
+    },
+  })
+
+  return (
+    <div className="memberdrawer">
+      <b>
+        Connected apps · <T text={member.displayName} />
+      </b>
+      <p className="ph">
+        The MCP apps this member allowed to use Narvi as them -- the same list they see under Integrations; no token is ever shown. Revoking disconnects the app on their behalf from its very next call, and is audited. They can approve it again: to keep an app out, delete or disable its client.
+      </p>
+      {query.isPending && <p className="rail-empty">Loading connected apps…</p>}
+      {query.isError && <p className="rail-empty">{apiErrorMessage(query.error, "Couldn't load this member's connected apps.")}</p>}
+      {query.isSuccess && query.data.authorizations.length === 0 && <p className="rail-empty">No connected apps.</p>}
+      {query.isSuccess && query.data.authorizations.length > 0 && (
+        <ConnectedAppsTable authorizations={query.data.authorizations} revokingId={revokeMutation.isPending ? revokeMutation.variables : undefined} onRevoke={(id) => revokeMutation.mutate(id)} />
       )}
       {revokeMutation.isError && <p className="sidebar-notice">{apiErrorMessage(revokeMutation.error, "Couldn't revoke. Try again.")}</p>}
     </div>
@@ -222,7 +283,9 @@ export function MCPClientsSection() {
     mutationFn: (clientId: string) => deleteMCPClient(clientId),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: mcpClientQueryKeys.list() })
-      void queryClient.invalidateQueries({ queryKey: mcpAuthorizationQueryKeys.mine() })
+      // Deleting a client revokes every user's authorization of it: every
+      // cached list, the caller's own and any member's, is stale.
+      void queryClient.invalidateQueries({ queryKey: mcpAuthorizationQueryKeys.all() })
     },
   })
 

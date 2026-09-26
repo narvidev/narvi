@@ -1,5 +1,17 @@
 // MembersPanel.tsx -- Settings -> Members & access (§13.2/§13.3): role
-// management, linked-identity chips, and the audit log.
+// management, linked-identity chips, the audit log, and, per member, a
+// "Connected apps" drawer (technical plan §43.18).
+//
+// # The Connected apps drawer
+//
+// mockups.html's Members view has no per-member drawer; its rows end in a
+// small button (the "Audit log" one). The drawer follows that: a second
+// button of the same kind beside "Audit log", opening an inset row under
+// the member's own that renders ConnectedAppsSection.tsx's own
+// MemberConnectedApps -- the same table, row and formatting the member's
+// Connected apps section uses, never a second copy -- with revocation on
+// the member's behalf behind the same confirmation. Admin only, like the
+// rest of this panel; no token is ever shown (none exists in plaintext).
 //
 // # A real shape difference from the mockup, stated here rather than
 // # silently reproduced
@@ -36,6 +48,7 @@ import { listAuditLog, listMembers, updateMemberRole } from '../api/endpoints'
 import { ApiError } from '../api/http'
 import { auditLogQueryKeys, memberQueryKeys } from '../api/queryKeys'
 import { meQueryOptions } from '../auth/session'
+import { MemberConnectedApps } from './ConnectedAppsSection'
 import { formatDateTime, identityLinkProof, identityProviderLabel, roleTone } from './settingsFormat'
 import { safeJsonPreview, truncateForDisplay } from './textSafety'
 
@@ -46,9 +59,10 @@ function T({ text }: { text: string }) {
   return <>{truncateForDisplay(text, MAX_FIELD_CHARS)}</>
 }
 
-/** MemberRow renders one member's own table row -- exported for direct render-safety testing (mirrors AutomationsView.tsx's own AutomationRow precedent): member.displayName is admin-editable free text (github display name, §13.1), never Narvi-validated, and must render as plain text only. */
+/** MemberRow renders one member's own table row, and, once an admin opens it, the member's Connected apps drawer beneath -- exported for direct render-safety testing (mirrors AutomationsView.tsx's own AutomationRow precedent): member.displayName is admin-editable free text (github display name, §13.1), never Narvi-validated, and must render as plain text only. */
 export function MemberRow({ member, canManage, onShowAudit }: { member: Member; canManage: boolean; onShowAudit: (userId: string) => void }) {
   const queryClient = useQueryClient()
+  const [showApps, setShowApps] = useState(false)
   const roleMutation = useMutation({
     mutationFn: (role: string) => updateMemberRole(member.id, { role }),
     onSuccess: () => {
@@ -64,60 +78,76 @@ export function MemberRow({ member, canManage, onShowAudit }: { member: Member; 
   })
 
   return (
-    <tr>
-      <td>
-        <T text={member.displayName} /> {member.disabled && <span className="chip warn">disabled</span>}
-      </td>
-      <td>
-        {canManage ? (
-          <>
-            <select className="sel-select" value={member.role} disabled={roleMutation.isPending} onChange={(e) => roleMutation.mutate(e.target.value)}>
-              {ROLES.map((r) => (
-                <option key={r} value={r}>
-                  {r}
-                </option>
-              ))}
-            </select>
-            {/*
-              A rejected role change used to be completely silent: the select
-              is bound to the server's own member.role, so it just snapped
-              back with nothing rendered anywhere. UpdateMemberRole refuses
-              deliberately and usefully -- 409 "cannot demote the last
-              remaining admin" is the case an admin is most likely to hit,
-              and the one where a silent revert looks like a broken dropdown.
-              The server's message is a server-authored constant, never model
-              or user text, but it still goes through the same plain-text
-              path as every other string on this screen.
-            */}
-            {roleMutation.isError && <span className="rolefail">{roleMutation.error instanceof ApiError ? <T text={roleMutation.error.message} /> : 'Role change failed.'}</span>}
-          </>
-        ) : (
-          <span className={`chip ${roleTone(member.role)}`}>
-            <span className="dot" />
-            {member.role}
-          </span>
-        )}
-      </td>
-      <td>
-        {member.identities.length === 0 && <span style={{ color: 'var(--faint)' }}>none linked</span>}
-        {member.identities.map((id) => {
-          // The mark and tone come from linkedVia, never from a constant: see
-          // identityLinkProof's own doc comment on why an admin force-link must
-          // not wear the same check mark as a verified one.
-          const proof = identityLinkProof(id.linkedVia)
-          return (
-            <span key={id.id} className={`idchip ${proof.tone}`} style={{ marginRight: 4 }} title={proof.title}>
-              {identityProviderLabel(id.provider)} {proof.mark}
+    <>
+      <tr>
+        <td>
+          <T text={member.displayName} /> {member.disabled && <span className="chip warn">disabled</span>}
+        </td>
+        <td>
+          {canManage ? (
+            <>
+              <select className="sel-select" value={member.role} disabled={roleMutation.isPending} onChange={(e) => roleMutation.mutate(e.target.value)}>
+                {ROLES.map((r) => (
+                  <option key={r} value={r}>
+                    {r}
+                  </option>
+                ))}
+              </select>
+              {/*
+                A rejected role change used to be completely silent: the select
+                is bound to the server's own member.role, so it just snapped
+                back with nothing rendered anywhere. UpdateMemberRole refuses
+                deliberately and usefully -- 409 "cannot demote the last
+                remaining admin" is the case an admin is most likely to hit,
+                and the one where a silent revert looks like a broken dropdown.
+                The server's message is a server-authored constant, never model
+                or user text, but it still goes through the same plain-text
+                path as every other string on this screen.
+              */}
+              {roleMutation.isError && <span className="rolefail">{roleMutation.error instanceof ApiError ? <T text={roleMutation.error.message} /> : 'Role change failed.'}</span>}
+            </>
+          ) : (
+            <span className={`chip ${roleTone(member.role)}`}>
+              <span className="dot" />
+              {member.role}
             </span>
-          )
-        })}
-      </td>
-      <td style={{ textAlign: 'right' }}>
-        <button type="button" className="btn" style={{ padding: '2px 9px', fontSize: 11 }} onClick={() => onShowAudit(member.id)}>
-          Audit log
-        </button>
-      </td>
-    </tr>
+          )}
+        </td>
+        <td>
+          {member.identities.length === 0 && <span style={{ color: 'var(--faint)' }}>none linked</span>}
+          {member.identities.map((id) => {
+            // The mark and tone come from linkedVia, never from a constant: see
+            // identityLinkProof's own doc comment on why an admin force-link must
+            // not wear the same check mark as a verified one.
+            const proof = identityLinkProof(id.linkedVia)
+            return (
+              <span key={id.id} className={`idchip ${proof.tone}`} style={{ marginRight: 4 }} title={proof.title}>
+                {identityProviderLabel(id.provider)} {proof.mark}
+              </span>
+            )
+          })}
+        </td>
+        <td style={{ textAlign: 'right' }}>
+          {canManage && (
+            <>
+              <button type="button" className="btn" style={{ padding: '2px 9px', fontSize: 11 }} aria-expanded={showApps} onClick={() => setShowApps(!showApps)}>
+                Connected apps
+              </button>{' '}
+            </>
+          )}
+          <button type="button" className="btn" style={{ padding: '2px 9px', fontSize: 11 }} onClick={() => onShowAudit(member.id)}>
+            Audit log
+          </button>
+        </td>
+      </tr>
+      {canManage && showApps && (
+        <tr>
+          <td colSpan={4} className="memberdrawercell">
+            <MemberConnectedApps member={member} />
+          </td>
+        </tr>
+      )}
+    </>
   )
 }
 

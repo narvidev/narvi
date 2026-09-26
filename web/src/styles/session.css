@@ -1738,6 +1738,36 @@
 }
 
 /*
+ * .memberdrawer is a member's "Connected apps" drawer in Members & access
+ * (technical plan §43.18): an inset box in a row of its own under the
+ * member's, holding the same .sectable the member's own Connected apps
+ * section renders. It borrows .envcard's border and radius -- the inset
+ * card this screen's panels already use -- rather than a look of its own.
+ * .memberdrawercell undoes .sectable's first-column mono/bold, which would
+ * otherwise apply to the whole drawer: its cell is its row's first and only
+ * one.
+ */
+.sectable td.memberdrawercell {
+  font-family: inherit;
+  font-size: inherit;
+  font-weight: normal;
+  padding-top: 0;
+}
+.memberdrawer {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: var(--space-5) var(--space-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.memberdrawer > .ph {
+  color: var(--faint);
+  font-size: var(--text-sm-alt);
+  margin: 0;
+}
+
+/*
  * decision inbox (§16, decisions 32-34, mockups.html's own `v-inbox`) --
  * every selector AND value below is copied from mockups.html's own
  * `.inbox`/`.qhead`/`.qcount`/`.qrows`/`.qrow`/`.qkind`/`.qt`/`.qage`/
