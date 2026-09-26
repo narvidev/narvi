@@ -9,11 +9,14 @@
 -- the document's own Cache-Control. metadata_refetch_failed_at is when a
 -- re-fetch of the stale document first failed since that last successful
 -- fetch (NULL while none has): the cached document is then kept for ONE
--- more MCPClientMetadataCacheTTL measured from that first failure -- so a
--- document host that is down does not break every authorization at once
--- -- and metadata_stale_at moves to the end of that grace; past it, the
--- client is refused until a fetch succeeds again, which clears the
--- failure. The cache only ever decides what the NEXT authorization sees:
+-- more MCPClientMetadataCacheTTL measured from that first failure, but
+-- never past two MCPClientMetadataCacheTTL after that last successful
+-- fetch -- so a document host that is down does not break every
+-- authorization at once -- and metadata_stale_at moves to the end of that
+-- grace. A first failure that comes when that bound has already passed
+-- gets no grace, and nothing is recorded. Past the grace, the client is
+-- refused until a fetch succeeds again, which clears the failure. The
+-- cache only ever decides what the NEXT authorization sees:
 -- every code, token and refresh chain already issued carries its own
 -- redirect URI, scopes and resource, so re-fetching a document never
 -- changes what an issued credential can do.

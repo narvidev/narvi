@@ -47,8 +47,10 @@ func (r *asRig) clientRow(t *testing.T, clientID string) (sqlcgen.McpOauthClient
 // TestCIMD_AuthorizationEndpoint: an https client_id is resolved through
 // its metadata document (technical plan §43.15) -- fetched on first use and
 // stored as a metadata-document client, used from the cache while fresh,
-// fetched again once stale; a stale document whose re-fetch fails is kept
-// for one more cache lifetime; a document never fetched before that
+// fetched again once stale; a stale document read a minute ago whose
+// re-fetch fails is kept for one more cache lifetime (never past two after
+// its last successful fetch:
+// TestCIMD_FailedRefetchNeverTrustedPastTwoCacheLifetimes); a document never fetched before that
 // cannot be fetched or used refuses the authorization with a page, never a
 // redirect, and stores nothing.
 func TestCIMD_AuthorizationEndpoint(t *testing.T) {
@@ -305,10 +307,13 @@ func (r *asRig) setMetadataStamps(t *testing.T, clientIDURL string, fetchedAt, s
 	}
 }
 
-// TestCIMD_FailedRefetchKeptForOneGraceOnly: a stale document whose
-// re-fetch fails is kept for ONE more MCPClientMetadataCacheTTL, measured
-// from the first failure since its last successful fetch, and no longer
-// (technical plan §43.15). Inside that grace it is used -- a later
+// TestCIMD_FailedRefetchKeptForOneGraceOnly: a stale document last read
+// recently whose re-fetch fails is kept for ONE more
+// MCPClientMetadataCacheTTL, measured from the first failure since its
+// last successful fetch, and no longer (technical plan §43.15; a grace
+// never runs past two MCPClientMetadataCacheTTL after that fetch, which
+// TestCIMD_FailedRefetchNeverTrustedPastTwoCacheLifetimes proves). Inside
+// that grace it is used -- a later
 // failure neither restarts nor extends the grace; past it, every
 // authorization is refused with a page, never a redirect, however long
 // the document keeps failing (a document withdrawn, or replaced by one

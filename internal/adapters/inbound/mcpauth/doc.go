@@ -84,8 +84,13 @@
 //     name is shown second, escaped (and quoted, for a self-registered
 //     app), and was refused at registration if it could render
 //     deceptively.
-//   - A metadata document is trusted for at most MCPClientMetadataCacheTTL
-//     -- its own Cache-Control only shortens that -- and re-fetching it
+//   - A metadata document is used without a re-fetch for at most
+//     MCPClientMetadataCacheTTL -- its own Cache-Control only shortens
+//     that. When a re-fetch fails, the first failure keeps the cached copy
+//     for one more MCPClientMetadataCacheTTL from that failure, but never
+//     past two MCPClientMetadataCacheTTL after the last successful fetch
+//     (refetchGraceEnd). A first failure past that bound gets no grace, so
+//     no document is ever trusted longer than that. Re-fetching a document
 //     changes what the next authorization sees, never what an issued code
 //     or token can do.
 package mcpauth

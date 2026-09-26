@@ -91,7 +91,11 @@ RETURNING *;
 -- MarkMCPOAuthMetadataDocumentRefetchFailed records the FIRST failed
 -- re-fetch of a metadata-document client's stale document since its last
 -- successful fetch: when it failed, and the stale time the one grace it
--- starts ends at (the failure + MCPClientMetadataCacheTTL). It applies
+-- starts ends at, which the caller computes (mcpauth's refetchGraceEnd):
+-- the failure + MCPClientMetadataCacheTTL, but never later than the last
+-- successful fetch + two MCPClientMetadataCacheTTL. A first failure that
+-- comes when that bound has already passed gets no grace, and the caller
+-- records nothing: this statement is never run for it. It applies
 -- only while no fetch has succeeded since the caller read the row (the
 -- metadata_fetched_at guard) -- so a failure never pushes out the shorter
 -- lifetime a newer successful fetch set -- and only while no failure is
