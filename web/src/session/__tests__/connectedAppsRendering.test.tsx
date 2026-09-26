@@ -7,9 +7,13 @@
 // delete, disable) must never be a single bare click. Mirrors
 // integrationsRendering.test.tsx's own pattern: assert on specific visible
 // text, never the whole rendered HTML. Every row here is rendered with no
-// request in flight and no confirmation open. What the views SEND, what
-// each button does when clicked, and what a row offers while its request
-// is in flight ("Deleting…", "Disabling…", "Enabling…", "Revoking…") are
+// confirmation open -- a static render never opens one -- and with no
+// request in flight, but for one: the ConnectedAppsTable test that hands
+// its second row a revocation in flight, and checks only that both rows,
+// their confirmations closed, still offer the bare Revoke. What the views
+// SEND, what each button does when clicked, and what a row offers with its
+// confirmation open while its request is in flight ("Deleting…",
+// "Disabling…", "Enabling…", "Revoking…") are
 // connectedAppsWiring.test.tsx's.
 import { describe, expect, it } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
