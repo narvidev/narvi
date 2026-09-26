@@ -4483,9 +4483,11 @@ func (j *ListIntegrationsResponse) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
-// GET /api/me/mcp-authorizations's own response body (technical plan §43.18): the
-// caller's own unexpired MCP authorizations, most recently created first. Readable
-// by every role (authz.ActionViewOwnProfile).
+// The response body of GET /api/me/mcp-authorizations and GET
+// /api/members/{userID}/mcp-authorizations (technical plan §43.18): one user's
+// unexpired MCP authorizations, most recently created first -- the caller's own,
+// readable by every role (authz.ActionViewOwnProfile), or a member's, readable by
+// an administrator (authz.ActionManageMembers).
 type ListMCPAuthorizationsResponse struct {
 	// Authorizations corresponds to the JSON schema field "authorizations".
 	Authorizations []MCPAuthorization `json:"authorizations" yaml:"authorizations" mapstructure:"authorizations"`
@@ -4887,13 +4889,16 @@ func (j *ListWorkflowRunsResponse) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
-// One MCP client authorization the caller granted (technical plan §43.18) -- one
-// row of GET /api/me/mcp-authorizations, and what DELETE
-// /api/me/mcp-authorizations/{authorizationID} revokes (by id). A user holds at
-// most one per client: consenting to the same client again renews its expiry in
-// place and records that approval's scopes. Never carries a token, a code, or any
-// other secret -- none exists in plaintext anywhere once it has been handed to the
-// client.
+// One MCP client authorization a user granted (technical plan §43.18) -- one row
+// of GET /api/me/mcp-authorizations (the caller's own) or, for an administrator,
+// of GET /api/members/{userID}/mcp-authorizations (a member's), and what DELETE
+// /api/me/mcp-authorizations/{authorizationID} or DELETE
+// /api/members/{userID}/mcp-authorizations/{authorizationID} revokes (by id). A
+// user holds at most one per client: consenting to the same client again renews
+// its expiry in place and records that approval's scopes. Never carries a token, a
+// code, or any other secret -- none exists in plaintext anywhere once it has been
+// handed to the client, so an administrator's view of a member's authorizations is
+// exactly what the member sees, and no more.
 type MCPAuthorization struct {
 	// The client's own public OAuth client_id (never a secret).
 	ClientId string `json:"clientId" yaml:"clientId" mapstructure:"clientId"`

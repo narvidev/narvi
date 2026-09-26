@@ -507,3 +507,125 @@ func TestMyMCPAuthorizations_ListAndRevoke(t *testing.T) {
 		})
 	}
 }
+
+// TestMemberMCPAuthorizations_AdminListAndRevoke: an administrator lists a
+// member's MCP authorizations -- exactly what the member's own list shows,
+// never token material -- and revokes one on the member's behalf; every
+// other role is refused 403 and nothing is deleted. A grant is revoked only
+// through the member it belongs to: the same grant id under any other
+// member's path is a 404 that leaves it (and its token) alive. The
+// revocation deletes the grant -- its token stops resolving -- and is
+// audited as mcp_authorization.revoked, reason "admin", by the
+// administrator, naming the member (technical plan §43.18).
+func TestMemberMCPAuthorizations_AdminListAndRevoke(t *testing.T) {
+	ctx := context.Background()
+	r := newTestRig(t)
+	admin, adminCookie := createUserWithRole(ctx, t, r, sqlcgen.UserRoleAdmin)
+	client := createMCPClientViaAPI(t, r, adminCookie, `{"clientName":"Editor Plugin","redirectUris":["http://127.0.0.1/cb"]}`)
+	member, memberCookie := createUserWithRole(ctx, t, r, sqlcgen.UserRoleMember)
+	other, _ := createUserWithRole(ctx, t, r, sqlcgen.UserRoleMember)
+	grantID, tokenHash := grantWithToken(ctx, t, r, member.ID, mustUUID(t, client.Id))
+	listPath := "/api/members/" + member.ID.String() + "/mcp-authorizations"
+	revokePath := listPath + "/" + grantID.String()
+	alive := func() {
+		t.Helper()
+		if _, err := r.mcpGrants.LookupAccessToken(ctx, tokenHash); err != nil {
+			t.Fatalf("the member's token: %v, want still alive", err)
+		}
+	}
+
+	t.Run("every role but admin is refused", func(t *testing.T) {
+		for _, role := range []sqlcgen.UserRole{sqlcgen.UserRoleViewer, sqlcgen.UserRoleMember, sqlcgen.UserRoleMaintainer} {
+			_, cookie := createUserWithRole(ctx, t, r, role)
+			if s := r.doJSON(t, http.MethodGet, listPath, nil, nil, cookie); s != http.StatusForbidden {
+				t.Errorf("%s list: status %d, want 403", role, s)
+			}
+			if s := r.doJSON(t, http.MethodDelete, revokePath, nil, nil, cookie); s != http.StatusForbidden {
+				t.Errorf("%s revoke: status %d, want 403", role, s)
+			}
+		}
+		// The member too: their own grant is theirs to revoke through
+		// their own route, never through the administrators'.
+		if s := r.doJSON(t, http.MethodDelete, revokePath, nil, nil, memberCookie); s != http.StatusForbidden {
+			t.Errorf("the member through the admin route: status %d, want 403", s)
+		}
+		alive()
+	})
+
+	t.Run("the admin sees exactly the member's own list", func(t *testing.T) {
+		var raw json.RawMessage
+		if s := r.doJSON(t, http.MethodGet, listPath, nil, &raw, adminCookie); s != http.StatusOK {
+			t.Fatalf("admin list: status %d", s)
+		}
+		var mine json.RawMessage
+		if s := r.doJSON(t, http.MethodGet, "/api/me/mcp-authorizations", nil, &mine, memberCookie); s != http.StatusOK {
+			t.Fatalf("member's own list: status %d", s)
+		}
+		if string(raw) != string(mine) {
+			t.Fatalf("the admin's view differs from the member's own:\n admin:  %s\n member: %s", raw, mine)
+		}
+		var list restdtos.ListMCPAuthorizationsResponse
+		if err := json.Unmarshal(raw, &list); err != nil || len(list.Authorizations) != 1 || list.Authorizations[0].Id != grantID.String() {
+			t.Fatalf("admin list = %s (err %v), want the member's one authorization", raw, err)
+		}
+		if strings.Contains(string(raw), tokenHash) || strings.Contains(string(raw), "narvi_mcp_at_") {
+			t.Fatalf("the admin's list leaked token material: %s", raw)
+		}
+		var empty restdtos.ListMCPAuthorizationsResponse
+		if s := r.doJSON(t, http.MethodGet, "/api/members/"+other.ID.String()+"/mcp-authorizations", nil, &empty, adminCookie); s != http.StatusOK || len(empty.Authorizations) != 0 {
+			t.Fatalf("another member's list = %+v (status %d), want empty", empty, s)
+		}
+		if s := r.doJSON(t, http.MethodGet, "/api/members/00000000-0000-0000-0000-000000000000/mcp-authorizations", nil, nil, adminCookie); s != http.StatusNotFound {
+			t.Fatalf("an unknown member's list: status %d, want 404", s)
+		}
+		if s := r.doJSON(t, http.MethodGet, "/api/members/not-a-uuid/mcp-authorizations", nil, nil, adminCookie); s != http.StatusBadRequest {
+			t.Fatalf("a malformed member id: status %d, want 400", s)
+		}
+	})
+
+	t.Run("a grant is revoked only through the member it belongs to", func(t *testing.T) {
+		for _, path := range []string{
+			"/api/members/" + other.ID.String() + "/mcp-authorizations/" + grantID.String(),
+			"/api/members/" + admin.ID.String() + "/mcp-authorizations/" + grantID.String(),
+			"/api/members/00000000-0000-0000-0000-000000000000/mcp-authorizations/" + grantID.String(),
+		} {
+			if s := r.doJSON(t, http.MethodDelete, path, nil, nil, adminCookie); s != http.StatusNotFound {
+				t.Errorf("DELETE %s: status %d, want 404", path, s)
+			}
+		}
+		if s := r.doJSON(t, http.MethodDelete, listPath+"/not-a-uuid", nil, nil, adminCookie); s != http.StatusBadRequest {
+			t.Errorf("malformed authorization id: status %d, want 400", s)
+		}
+		alive()
+		if rows := mcpAuditRows(ctx, t, r, "mcp_authorization", grantID.String()); len(rows) != 0 {
+			t.Fatalf("audit rows after refused revocations = %+v, want none", rows)
+		}
+	})
+
+	t.Run("the admin revokes it, and it is gone and audited", func(t *testing.T) {
+		if s := r.doJSON(t, http.MethodDelete, revokePath, nil, nil, adminCookie); s != http.StatusNoContent {
+			t.Fatalf("admin revoke: status %d, want 204", s)
+		}
+		if _, err := r.mcpGrants.LookupAccessToken(ctx, tokenHash); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("token after the admin's revocation: err = %v, want pgx.ErrNoRows", err)
+		}
+		var actor pgtype.UUID
+		var reason, target, clientID string
+		if err := r.pool.QueryRow(ctx, `
+			SELECT actor_user_id, detail_json->>'reason', detail_json->>'target_user_id', detail_json->>'client_id'
+			FROM audit_log WHERE action = 'mcp_authorization.revoked' AND resource_type = 'mcp_authorization' AND resource_id = $1`,
+			grantID.String()).Scan(&actor, &reason, &target, &clientID); err != nil {
+			t.Fatalf("read the revocation's audit row: %v", err)
+		}
+		if actor != admin.ID || reason != "admin" || target != member.ID.String() || clientID != client.ClientId {
+			t.Fatalf("audit row: actor %v reason %q target %q client %q; want the admin, admin, the member, the client", actor, reason, target, clientID)
+		}
+		if s := r.doJSON(t, http.MethodDelete, revokePath, nil, nil, adminCookie); s != http.StatusNotFound {
+			t.Fatalf("second revoke: status %d, want 404", s)
+		}
+		var list restdtos.ListMCPAuthorizationsResponse
+		if s := r.doJSON(t, http.MethodGet, listPath, nil, &list, adminCookie); s != http.StatusOK || len(list.Authorizations) != 0 {
+			t.Fatalf("admin list after the revocation = %+v (status %d), want empty", list, s)
+		}
+	})
+}

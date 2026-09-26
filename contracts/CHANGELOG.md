@@ -9,6 +9,40 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.6.0]
+
+### controlplane/testdata/routes.golden
+
+- Added: `GET /api/members/{userID}/mcp-authorizations` and
+  `DELETE /api/members/{userID}/mcp-authorizations/{authorizationID}` --
+  an administrator's view of one member's MCP authorizations, and their
+  revocation on the member's behalf (technical plan §43.18), admin only
+  (`authz.ActionManageMembers`, `403` for every other role). The list
+  answers the existing `ListMCPAuthorizationsResponse`, the very shape
+  `GET /api/me/mcp-authorizations` answers; `404` when `userID` names no
+  user. The revocation answers `204`, or `404` for an authorization that is
+  not that member's -- whoever's it is -- and is audited as
+  `mcp_authorization.revoked` with reason `admin`. Two routes added,
+  graded MINOR (row 41).
+- Unchanged as routes, changed in behaviour: `GET /oauth/authorize` and
+  `POST /oauth/token` are now braked per client network (technical plan
+  §43.14). Over the budget, the authorization endpoint answers its HTML
+  error page with `429` and `Retry-After` (never a redirect), and the
+  token endpoint `429` with `Retry-After` and the JSON body
+  `{"error":"temporarily_unavailable",...}`. `GET /oauth/authorize` also
+  refuses a client that already has 100 authorization requests waiting for
+  a decision, with an HTML error page (`503`), storing nothing. Neither
+  route's request or success response changed, and neither is a
+  `/contracts` schema.
+
+### rest/v1/dtos.schema.json
+
+- Changed (descriptions only, annotation-only PATCH):
+  `MCPAuthorization` and `ListMCPAuthorizationsResponse` now also name the
+  two admin routes above, and say that an administrator's view of a
+  member's authorizations is exactly what the member sees. No field, type,
+  enum value or requiredness changed.
+
 ## [1.5.0]
 
 ### controlplane/testdata/routes.golden

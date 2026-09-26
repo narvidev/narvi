@@ -1783,12 +1783,27 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// itself renders the REAL admin-only §13.3 verdict via
 	// domain/authz.Authorize. The actual Settings -> Members UI is Phase 7
 	// and out of scope here -- see httpapi/members.go's own doc comment.
+	//
+	// The admin view of a member's MCP authorizations (technical plan
+	// §43.18) lives here too, gated by the same admin-only
+	// authz.ActionManageMembers: list them, and revoke one on the member's
+	// behalf -- the grant must be that member's (404 otherwise), and its
+	// deletion stops every token under it on the next call. Like the
+	// member's own Settings routes below, deliberately NOT behind
+	// mcpadapter.RequireEnabled: an operator who turns the MCP surface off
+	// can still see and revoke what it issued. The MCP authorization
+	// server's stores are built here for it, and shared with that server
+	// below.
+	mcpOAuthClientStore := postgres.NewMCPOAuthClientStore(pool)
+	mcpOAuthGrantStore := postgres.NewMCPOAuthGrantStore(pool)
 	router.Route("/api/members", func(r chi.Router) {
 		r.Use(auth.Middleware(userSessionStore, userStore))
 		r.Get("/", httpapi.ListMembers(userStore, identityStore, identityLinkPromptStore))
 		r.Patch("/{userID}/role", httpapi.UpdateMemberRole(pool, userStore, identityStore, auditLogStore))
 		r.Post("/{userID}/identities", httpapi.LinkMemberIdentity(pool, userStore, identityStore, auditLogStore))
 		r.Delete("/{userID}/identities/{identityID}", httpapi.UnlinkMemberIdentity(pool, identityStore, auditLogStore))
+		r.Get("/{userID}/mcp-authorizations", httpapi.ListMemberMCPAuthorizations(userStore, mcpOAuthGrantStore))
+		r.Delete("/{userID}/mcp-authorizations/{authorizationID}", httpapi.RevokeMemberMCPAuthorization(pool, mcpOAuthGrantStore, mcpOAuthClientStore, auditLogStore))
 	})
 
 	// /api/integrations (§12.5's own "integrations read model & routes"
@@ -2617,8 +2632,10 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// client -- the dial-time SSRF guard is the one way that adapter can be
 	// built (cimdfetch.NewGuardedClient, the same capability-token shape as
 	// githubapi.NewGatedClient above), never http.DefaultClient.
-	mcpOAuthClientStore := postgres.NewMCPOAuthClientStore(pool)
-	mcpOAuthGrantStore := postgres.NewMCPOAuthGrantStore(pool)
+	//
+	// Its two stores (mcpOAuthClientStore, mcpOAuthGrantStore) are built
+	// above, with the members API, whose admin view of a member's MCP
+	// authorizations reads and revokes through the same ones.
 	mcpAdvertisedScopes := mcpadapter.AdvertisedScopes()
 	mcpClientMechanisms := mcpclient.Mechanisms{MetadataDocuments: cfg.MCPCIMDEnabled, DynamicRegistration: cfg.MCPDCREnabled}
 	mcpMetadataFetcher := cimdfetch.New(cimdfetch.NewGuardedClient(cimdFetchGuard), cfg.Timeouts.MCPClientMetadataFetchTimeout)

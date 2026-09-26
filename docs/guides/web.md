@@ -433,11 +433,46 @@ Administrators decide which apps may ask at all, in the same panel:
 {"name": "Delete a registered MCP client, disconnecting every user of it (admin)", "route": "DELETE /api/mcp-clients/{clientID}"}
 ```
 
+Administrators also see every member's connected apps, in Settings →
+Members & access, under the "Connected apps" button on the member's row: the
+same list the member sees under Integrations — never a token, which exists
+nowhere in plaintext once the app received it — and a Revoke action behind
+a confirmation that disconnects the app on the member's behalf. The app's
+very next call is refused, exactly as when the member disconnects it, and
+the audit log records it as revoked by that administrator, naming the
+member. It withdraws what was approved, not the app itself: the member can
+approve the app again. To keep an app out, an administrator deletes its
+client — or, for an app known by its description's address, which a
+deletion would let register again, disables it; the on-call runbook
+[`mcp-client-cutoff.md`](../runbooks/mcp-client-cutoff.md) says how, and what
+each step does on the app's next call.
+
+```json narvi-command
+{"name": "List a member's connected MCP apps (admin)", "route": "GET /api/members/{userID}/mcp-authorizations"}
+```
+
+```json narvi-command
+{"name": "Revoke one of a member's MCP apps on their behalf, its very next call refused (admin)", "route": "DELETE /api/members/{userID}/mcp-authorizations/{authorizationID}"}
+```
+
 **Negatives.** The MCP surface is off unless the deployment sets
 `NARVI_MCP_ENABLED=true`; while it is off, `/oauth/...` answers `503` — but
 the Settings routes above keep working, so an authorization can always be
 listed and revoked. Every role, viewer included, can connect an app and
-disconnect its own; only an admin can register or delete a client. Apps
+disconnect its own; only an admin can register or delete a client, or see
+and revoke another member's apps — any other role gets `403`, and an
+authorization that is not that member's is `404`, whoever it belongs to.
+Starting authorizations and renewing tokens are braked per network (one
+address, or one IPv6 `/48`): a burst of ten, then one every three seconds
+for authorizations and every two for tokens. Past that, the authorization
+page answers "Too many requests from your network" and never sends your
+browser anywhere, and an app's renewal is answered `429` — it keeps its
+access and simply renews a moment later; it is never sent back to the
+consent page for it. Another network is never affected by one network's
+flood. At most 100 authorizations of one app can be waiting for approval at
+once; past that, the page says the app has too many sign-ins waiting —
+each lapses ten minutes after the app asked, so wait a few minutes and
+start again from the app. Apps
 that identify themselves by their description's address are accepted unless
 the deployment sets `NARVI_MCP_CIMD_ENABLED=false`, and apps that register
 themselves only if it sets `NARVI_MCP_DCR_ENABLED=true`. Switching either

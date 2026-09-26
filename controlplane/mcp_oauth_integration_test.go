@@ -501,6 +501,7 @@ type sdkFlow struct {
 	recorder    *recordingTransport
 	member      sqlcgen.User
 	cookie      string
+	admin       sqlcgen.User
 	adminCookie string
 	client      restdtos.MCPClient
 }
@@ -510,7 +511,7 @@ type sdkFlow struct {
 // signed-in member, whose consent the driver gives.
 func (r *oauthRouterRig) connectSDKClient(ctx context.Context, t *testing.T, configure func(*consentDriver)) *sdkFlow {
 	t.Helper()
-	_, adminCookie := createRouterUser(ctx, t, r.pool, sqlcgen.UserRoleAdmin)
+	admin, adminCookie := createRouterUser(ctx, t, r.pool, sqlcgen.UserRoleAdmin)
 	member, memberCookie := createRouterUser(ctx, t, r.pool, sqlcgen.UserRoleMember)
 
 	var client restdtos.MCPClient
@@ -526,7 +527,7 @@ func (r *oauthRouterRig) connectSDKClient(ctx context.Context, t *testing.T, con
 	if err != nil {
 		t.Fatalf("SDK Connect: %v", err)
 	}
-	flow.adminCookie, flow.client = adminCookie, client
+	flow.admin, flow.adminCookie, flow.client = admin, adminCookie, client
 	return flow
 }
 
@@ -659,6 +660,23 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		}
 		if clientID == "" {
 			t.Fatalf("GET /api/mcp-clients while off = %+v, want the authorization's client listed", clients)
+		}
+		// The admin view of a member's authorizations too, and revocation
+		// on a member's behalf.
+		rec = serveRouter(off.Router, http.MethodGet, "/api/members/"+member.ID.String()+"/mcp-authorizations", adminCookie)
+		var theirs restdtos.ListMCPAuthorizationsResponse
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &theirs) != nil || len(theirs.Authorizations) != 1 || theirs.Authorizations[0].Id != mine.Authorizations[0].Id {
+			t.Fatalf("GET /api/members/{userID}/mcp-authorizations while off: status %d body %s, want 200 listing the member's one authorization", rec.Code, rec.Body.String())
+		}
+		second, _ := createRouterUser(ctx, t, pool, sqlcgen.UserRoleMember)
+		mintBuildBearer(ctx, t, pool, offCfg, second.ID)
+		rec = serveRouter(off.Router, http.MethodGet, "/api/members/"+second.ID.String()+"/mcp-authorizations", adminCookie)
+		var secondList restdtos.ListMCPAuthorizationsResponse
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &secondList) != nil || len(secondList.Authorizations) != 1 {
+			t.Fatalf("GET /api/members/{userID}/mcp-authorizations while off: status %d body %s", rec.Code, rec.Body.String())
+		}
+		if rec := serveRouter(off.Router, http.MethodDelete, "/api/members/"+second.ID.String()+"/mcp-authorizations/"+secondList.Authorizations[0].Id, adminCookie); rec.Code != http.StatusNoContent {
+			t.Fatalf("DELETE /api/members/{userID}/mcp-authorizations/{id} while off: status %d body %s, want 204", rec.Code, rec.Body.String())
 		}
 		if rec := serveRouter(off.Router, http.MethodDelete, "/api/me/mcp-authorizations/"+mine.Authorizations[0].Id, memberCookie); rec.Code != http.StatusNoContent {
 			t.Fatalf("DELETE /api/me/mcp-authorizations/{id} while off: status %d body %s, want 204", rec.Code, rec.Body.String())
@@ -793,6 +811,91 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		var tokens int
 		if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM mcp_oauth_access_tokens WHERE grant_id = $1`, grantID).Scan(&tokens); err != nil || tokens != 0 {
 			t.Fatalf("access tokens left for the revoked grant = %d (err %v), want 0", tokens, err)
+		}
+	})
+
+	// The revocation exit criterion through an administrator (§43.18): the
+	// admin lists the member's authorizations and revokes one on the
+	// member's behalf, and the very next call through the member's SDK
+	// session is refused -- 401 invalid_token, the SDK's one Authorize retry
+	// declined -- and the refresh token refreshes nothing. Before that: no
+	// other role may list or revoke through the admin routes (403, the
+	// member included), and the grant under any other user's path is a 404
+	// that leaves the member's token working.
+	t.Run("RevokedAuthorizationStopsOnNextCall_Admin", func(t *testing.T) {
+		ctx := oauthTestCtx(t)
+		flow := rig.connectSDKClient(ctx, t, func(d *consentDriver) {
+			d.deny = func(n int32) bool { return n > 1 }
+		})
+		if res, err := callListModels(ctx, flow.session); err != nil || res.IsError {
+			t.Fatalf("call before revocation: res %+v err %v", res, err)
+		}
+		token := flow.recorder.lastBearer()
+		refresh := flow.clock.current().RefreshToken
+		memberPath := "/api/members/" + flow.member.ID.String() + "/mcp-authorizations"
+
+		var list restdtos.ListMCPAuthorizationsResponse
+		if status := rig.doJSON(t, http.MethodGet, memberPath, nil, &list, flow.adminCookie); status != http.StatusOK || len(list.Authorizations) != 1 || list.Authorizations[0].ClientId != flow.client.ClientId {
+			t.Fatalf("admin list: status %d body %+v, want the member's one authorization", status, list)
+		}
+		grantID := list.Authorizations[0].Id
+
+		_, maintainerCookie := createRouterUser(ctx, t, rig.pool, sqlcgen.UserRoleMaintainer)
+		for who, cookie := range map[string]string{"the member": flow.cookie, "a maintainer": maintainerCookie} {
+			if status := rig.doJSON(t, http.MethodGet, memberPath, nil, nil, cookie); status != http.StatusForbidden {
+				t.Fatalf("%s listing through the admin route: status %d, want 403", who, status)
+			}
+			if status := rig.doJSON(t, http.MethodDelete, memberPath+"/"+grantID, nil, nil, cookie); status != http.StatusForbidden {
+				t.Fatalf("%s revoking through the admin route: status %d, want 403", who, status)
+			}
+		}
+		other, _ := createRouterUser(ctx, t, rig.pool, sqlcgen.UserRoleMember)
+		for _, owner := range []string{other.ID.String(), flow.admin.ID.String()} {
+			if status := rig.doJSON(t, http.MethodDelete, "/api/members/"+owner+"/mcp-authorizations/"+grantID, nil, nil, flow.adminCookie); status != http.StatusNotFound {
+				t.Fatalf("admin revoking the member's grant under user %s: status %d, want 404", owner, status)
+			}
+		}
+		rig.acceptedCall(t, token)
+
+		if status := rig.doJSON(t, http.MethodDelete, memberPath+"/"+grantID, nil, nil, flow.adminCookie); status != http.StatusNoContent {
+			t.Fatalf("admin revoke: status %d, want 204", status)
+		}
+		before := len(flow.recorder.snapshot())
+		if _, err := callListModels(ctx, flow.session); err == nil {
+			t.Fatalf("the very next CallTool after the admin's revocation succeeded")
+		}
+		after := flow.recorder.snapshot()[before:]
+		if len(after) == 0 || after[0].status != http.StatusUnauthorized || after[0].authorization != "Bearer "+token {
+			t.Fatalf("exchanges after revocation = %+v, want the old token refused 401 first", after)
+		}
+		if n := flow.driver.calls.Load(); n != 2 {
+			t.Fatalf("consent flow ran %d times, want 2 (the SDK's single Authorize retry)", n)
+		}
+		rig.revokedCallFails(t, token)
+
+		resp, err := http.PostForm(rig.server.URL+"/oauth/token", url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refresh}, "client_id": {flow.client.ClientId}})
+		if err != nil {
+			t.Fatalf("refresh after revocation: %v", err)
+		}
+		var refused struct {
+			Error string `json:"error"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&refused)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest || refused.Error != "invalid_grant" {
+			t.Fatalf("refresh after revocation: status %d error %q, want 400 invalid_grant", resp.StatusCode, refused.Error)
+		}
+		var grants, tokens, audited int
+		if err := rig.pool.QueryRow(ctx, `
+			SELECT (SELECT count(*) FROM mcp_oauth_grants WHERE user_id = $1),
+			       (SELECT count(*) FROM mcp_oauth_access_tokens t JOIN mcp_oauth_grants g ON g.id = t.grant_id WHERE g.user_id = $1),
+			       (SELECT count(*) FROM audit_log WHERE action = 'mcp_authorization.revoked' AND resource_id = $2
+			          AND actor_user_id = $3 AND detail_json->>'reason' = 'admin' AND detail_json->>'target_user_id' = $4)`,
+			flow.member.ID, grantID, flow.admin.ID, flow.member.ID.String()).Scan(&grants, &tokens, &audited); err != nil {
+			t.Fatal(err)
+		}
+		if grants != 0 || tokens != 0 || audited != 1 {
+			t.Fatalf("after the admin's revocation: grants %d, access tokens %d, admin revocation audit rows %d; want 0, 0, 1", grants, tokens, audited)
 		}
 	})
 

@@ -288,11 +288,13 @@ func TestLockOrder_ClientRegistrationWriters(t *testing.T) {
 		{"ExchangeHoldsClient_MetadataRefetchProceeds", codeExchange, true, "", false},
 		{"RefreshHoldsClient_MetadataRefetchProceeds", refreshExchange, true, "", false},
 		{"GrantRevocationHoldsClient_MetadataRefetchProceeds", refreshExchange, false, grantRevocation, false},
+		{"AdminRevocationHoldsClient_MetadataRefetchProceeds", refreshExchange, false, adminRevocation, false},
 		{"TokenRevocationHoldsClient_MetadataRefetchProceeds", refreshExchange, false, tokenRevocation, false},
 		{"MetadataRefetchHoldsClient_ConsentProceeds", consentApproval, true, "", true},
 		{"MetadataRefetchHoldsClient_ExchangeProceeds", codeExchange, true, "", true},
 		{"MetadataRefetchHoldsClient_RefreshProceeds", refreshExchange, true, "", true},
 		{"MetadataRefetchHoldsClient_GrantRevocationProceeds", refreshExchange, false, grantRevocation, true},
+		{"MetadataRefetchHoldsClient_AdminRevocationProceeds", refreshExchange, false, adminRevocation, true},
 		{"MetadataRefetchHoldsClient_TokenRevocationProceeds", refreshExchange, false, tokenRevocation, true},
 	} {
 		for _, failing := range []bool{false, true} {

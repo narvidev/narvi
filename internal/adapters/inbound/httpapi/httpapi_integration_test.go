@@ -664,6 +664,8 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		r.Patch("/{userID}/role", httpapi.UpdateMemberRole(rig.pool, rig.users, rig.identities, rig.auditLog))
 		r.Post("/{userID}/identities", httpapi.LinkMemberIdentity(rig.pool, rig.users, rig.identities, rig.auditLog))
 		r.Delete("/{userID}/identities/{identityID}", httpapi.UnlinkMemberIdentity(rig.pool, rig.identities, rig.auditLog))
+		r.Get("/{userID}/mcp-authorizations", httpapi.ListMemberMCPAuthorizations(rig.users, rig.mcpGrants))
+		r.Delete("/{userID}/mcp-authorizations/{authorizationID}", httpapi.RevokeMemberMCPAuthorization(rig.pool, rig.mcpGrants, rig.mcpClients, rig.auditLog))
 	})
 	router.Route("/api/audit-log", func(r chi.Router) {
 		r.Use(auth.Middleware(rig.userSessions, rig.users))
