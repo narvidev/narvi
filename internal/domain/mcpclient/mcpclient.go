@@ -1,9 +1,11 @@
 // Package mcpclient holds the registration and redirect rules for the MCP
 // authorization server's OAuth clients (technical plan §43.15) -- pure
-// functions, no I/O, shared by the two places that must agree on them:
-// the admin route that registers a client (a URI it would later refuse is
-// never stored) and GET /oauth/authorize (a presented redirect URI is
-// matched against what was stored).
+// functions, no I/O, shared by every place that must agree on them: the
+// three ways a client is registered -- an administrator's route, a
+// fetched client ID metadata document, a dynamic registration request
+// (registration.go) -- so a URI or name one of them would refuse is never
+// stored by another, and GET /oauth/authorize, which matches a presented
+// redirect URI against what was stored.
 //
 // # The redirect URI rule
 //
@@ -169,12 +171,18 @@ func IsLoopbackRedirect(raw string) bool {
 }
 
 // ValidateClientName trims name and checks it is non-empty, at most
-// MaxClientNameRunes runes, valid UTF-8 and free of control and format
-// characters, returning the trimmed value. Format characters (Unicode
-// category Cf: bidirectional overrides, zero-width joiners and spaces) are
-// refused because the name is what the consent page shows a user deciding
-// whether to trust the client: a right-to-left override or an invisible
-// character is a way to make one name read as another.
+// MaxClientNameRunes runes, valid UTF-8 and printable throughout,
+// returning the trimmed value. Printable is unicode.IsPrint: letters,
+// marks, numbers, punctuation, symbols and the ASCII space -- so control
+// and format characters (Unicode category Cf: bidirectional overrides,
+// zero-width joiners and spaces), line and paragraph separators, every
+// space but U+0020, and private-use and unassigned code points are all
+// refused. The name is what the consent page shows a user deciding whether
+// to trust the client, and for a client that registered itself (§43.15)
+// it is chosen by whoever registered it: a right-to-left override, an
+// invisible character or a glyph no font defines is a way to make one
+// name read as another. The same rule holds for every client kind, so a
+// name any registration path stores is one the consent page can show.
 func ValidateClientName(name string) (string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -187,8 +195,8 @@ func ValidateClientName(name string) (string, error) {
 		return "", fmt.Errorf("client name is longer than %d characters", MaxClientNameRunes)
 	}
 	for _, r := range name {
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
-			return "", errors.New("client name contains a control or invisible formatting character")
+		if !unicode.IsPrint(r) {
+			return "", errors.New("client name contains a control, invisible formatting or otherwise unprintable character")
 		}
 	}
 	return name, nil
