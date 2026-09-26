@@ -3107,7 +3107,7 @@ func (a *App) Run(ctx context.Context, addr string) error {
 	// comment). Started/shut down through this SAME errgroup as every
 	// other background loop above -- no naked goroutine (§11).
 	group.Go(func() error {
-		if err := postgres.RunExpiredTokenCleanup(groupCtx, pool, cfg.Timeouts.ExpiredCredentialCleanupInterval); err != nil && !errors.Is(err, context.Canceled) {
+		if err := postgres.RunExpiredTokenCleanup(groupCtx, pool, cfg.Timeouts.ExpiredCredentialCleanupInterval, cfg.Timeouts.MCPDynamicClientUnusedTTL); err != nil && !errors.Is(err, context.Canceled) {
 			return fmt.Errorf("expired credential cleanup: %w", err)
 		}
 		return nil

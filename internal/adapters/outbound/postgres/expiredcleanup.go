@@ -3,7 +3,9 @@
 // user_sessions rows (audit-remediation, config/platform-hardening
 // batch) and the MCP authorization server's own expired rows (technical
 // plan §43.16: authorization requests, codes, access tokens, refresh
-// tokens, grants). Every one of these tables
+// tokens, grants), plus its unused self-registered clients (§43.15:
+// dynamically registered and metadata-document clients with nothing
+// under them, which have no expires_at of their own). Every one of these tables
 // (migrations/000016_ws_tokens.up.sql, migrations/000017_auth_v1.up.sql,
 // migrations/000141_mcp_oauth.up.sql,
 // migrations/000142_mcp_oauth_refresh_tokens.up.sql) has an expires_at TIMESTAMPTZ NOT NULL column that is checked only at
@@ -33,8 +35,10 @@ import (
 // platform.Timeouts.ExpiredCredentialCleanupInterval). On each tick it
 // deletes every ws_tokens/user_sessions row and every expired MCP
 // authorization-server row (cleanupExpiredCredentialsOnce lists them)
-// whose expires_at has already passed, logging the deleted row counts at
-// Info level for observability.
+// whose expires_at has already passed, and every self-registered MCP
+// client unused for mcpUnusedClientTTL
+// (platform.Timeouts.MCPDynamicClientUnusedTTL), logging the deleted row
+// counts at Info level for observability.
 // A single tick's failure is logged, never propagated -- exactly like
 // RunTimerPump's own per-tick error handling -- so one bad tick never
 // takes down the whole loop.
@@ -42,7 +46,7 @@ import (
 // The caller is expected to start this via its own errgroup.Go (§11: no
 // naked `go` statements) exactly once per process, independent of any
 // session actor.
-func RunExpiredTokenCleanup(ctx context.Context, pool *pgxpool.Pool, interval time.Duration) error {
+func RunExpiredTokenCleanup(ctx context.Context, pool *pgxpool.Pool, interval, mcpUnusedClientTTL time.Duration) error {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -51,7 +55,7 @@ func RunExpiredTokenCleanup(ctx context.Context, pool *pgxpool.Pool, interval ti
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if err := cleanupExpiredCredentialsOnce(ctx, pool); err != nil {
+			if err := cleanupExpiredCredentialsOnce(ctx, pool, mcpUnusedClientTTL); err != nil {
 				platform.Logger(ctx).Error("postgres: expired credential cleanup tick failed", "error", err)
 			}
 		}
@@ -61,7 +65,8 @@ func RunExpiredTokenCleanup(ctx context.Context, pool *pgxpool.Pool, interval ti
 // cleanupExpiredCredentialsOnce runs exactly one cleanup tick: deletes
 // every expired ws_tokens row, then every expired user_sessions row, then
 // every expired MCP authorization request, authorization code, access
-// token, refresh token and grant (independent statements -- deliberately not one shared
+// token, refresh token and grant, then every unused self-registered MCP
+// client (independent statements -- deliberately not one shared
 // transaction, since no table's cleanup depends on another's outcome, and
 // a failure in one must not roll back an already-successful delete in
 // another), logging every deleted row count together. Unexported: PumpOnce's own
@@ -69,7 +74,7 @@ func RunExpiredTokenCleanup(ctx context.Context, pool *pgxpool.Pool, interval ti
 // precedent isn't needed here since the integration test drives cleanup
 // through RunExpiredTokenCleanup's own loop instead (see
 // expiredcleanup_integration_test.go).
-func cleanupExpiredCredentialsOnce(ctx context.Context, pool *pgxpool.Pool) error {
+func cleanupExpiredCredentialsOnce(ctx context.Context, pool *pgxpool.Pool, mcpUnusedClientTTL time.Duration) error {
 	q := sqlcgen.New(pool)
 
 	wsTokensDeleted, err := q.DeleteExpiredWSTokens(ctx)
@@ -110,6 +115,15 @@ func cleanupExpiredCredentialsOnce(ctx context.Context, pool *pgxpool.Pool) erro
 	if err != nil {
 		return err
 	}
+	// Last, after the grants and requests above: a dynamically registered
+	// or metadata-document client whose last grant just lapsed, and whose
+	// requests are gone, is unused as of this same tick (§43.15). The
+	// store method, not the bare query, so the lock-order proof exercises
+	// exactly this statement.
+	mcpClientsDeleted, err := NewMCPOAuthClientStore(pool).DeleteUnused(ctx, time.Now().Add(-mcpUnusedClientTTL))
+	if err != nil {
+		return err
+	}
 
 	platform.Logger(ctx).Info("postgres: expired credential cleanup",
 		"ws_tokens_deleted", wsTokensDeleted,
@@ -119,6 +133,7 @@ func cleanupExpiredCredentialsOnce(ctx context.Context, pool *pgxpool.Pool) erro
 		"mcp_access_tokens_deleted", mcpTokensDeleted,
 		"mcp_refresh_tokens_deleted", mcpRefreshTokensDeleted,
 		"mcp_grants_deleted", mcpGrantsDeleted,
+		"mcp_unused_clients_deleted", mcpClientsDeleted,
 	)
 	return nil
 }
