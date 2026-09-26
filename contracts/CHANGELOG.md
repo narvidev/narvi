@@ -36,8 +36,15 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   the same three values. `MCPAuthorization.clientName` now says a
   self-registered client chose its own name. `CreateMCPClientRequest`
   describes the stricter client-name rule every registration path now
-  shares (printable characters only). No field, type, enum value or
-  requiredness changed.
+  shares -- printable characters only, and at most three combining marks
+  stacked on one character -- and the redirect-URI and `clientUri` rules
+  as they now stand: printable ASCII of at most 2048 bytes, and the host
+  written in plain ASCII (no percent sign in the authority; an
+  internationalized host in its `xn--` form). Two of those refusals are new
+  in this release: a name stacking more than three marks on one character,
+  and a redirect or homepage URI with a percent sign in its authority, are
+  now refused 400 where 1.4.1 accepted them. In the schema only
+  descriptions changed: no field, type, enum value or requiredness.
 
 ## [1.4.1]
 

@@ -1916,17 +1916,22 @@ func (j *CreateCloudIdentityBindingRequest) UnmarshalJSON(value []byte) error {
 }
 
 // POST /api/mcp-clients's own request body (technical plan §43.15): pre-register
-// an MCP client. The server generates the client_id. Every redirect URI must be
-// https with any host, or http on 127.0.0.1, [::1] or localhost, with no fragment
-// and no userinfo -- anything else is refused 400 (internal/domain/mcpclient).
-// clientName is trimmed and must be 1 to 100 printable characters: no control,
-// invisible formatting or otherwise unprintable character (the rule every
-// registration path shares, technical plan §43.15).
+// an MCP client. The server generates the client_id. Every redirect URI must be at
+// most 2048 bytes of printable ASCII: https with any host, or http on 127.0.0.1,
+// [::1] or localhost, with a valid port if it names one, no fragment and no
+// userinfo, and its host written in plain ASCII -- no percent sign in the
+// authority, so an internationalized host is written in its xn-- form -- anything
+// else is refused 400 (internal/domain/mcpclient). clientName is trimmed and must
+// be 1 to 100 printable characters: no control, invisible formatting or otherwise
+// unprintable character, and at most three combining marks stacked on one
+// character (the rule every registration path shares, technical plan §43.15).
 type CreateMCPClientRequest struct {
 	// ClientName corresponds to the JSON schema field "clientName".
 	ClientName string `json:"clientName" yaml:"clientName" mapstructure:"clientName"`
 
-	// Optional https homepage of the client; the consent page shows its host.
+	// Optional https homepage of the client: at most 2048 bytes of printable ASCII,
+	// with a host and no userinfo, its host written in plain ASCII like a redirect
+	// URI's -- anything else is refused 400. The consent page shows its host.
 	ClientUri *string `json:"clientUri,omitempty,omitzero" yaml:"clientUri,omitempty" mapstructure:"clientUri,omitempty"`
 
 	// 1 to 10 redirect URIs, each checked by the rule above.
