@@ -6,8 +6,8 @@
 // plainly that it sees nothing, and the destructive actions (revoke,
 // delete, disable) must never be a single bare click. Mirrors
 // integrationsRendering.test.tsx's own pattern: assert on specific visible
-// text, never the whole rendered HTML. What the admin views SEND -- their
-// own queryFn and mutationFn -- is connectedAppsWiring.test.tsx's.
+// text, never the whole rendered HTML. What the views SEND, and what each
+// button does when clicked, is connectedAppsWiring.test.tsx's.
 import { describe, expect, it } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
