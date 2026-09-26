@@ -51,9 +51,55 @@ SELECT * FROM mcp_oauth_clients
 WHERE id = $1
 FOR KEY SHARE;
 
+-- LockMCPOAuthClientForNewRequest takes the client row's FOR NO KEY UPDATE
+-- lock for the rest of the transaction: what GET /oauth/authorize takes
+-- before it counts the client's pending authorization requests and
+-- inserts one more (technical plan §43.14's pending-request cap), so two
+-- authorizations of one client count and insert one after the other and
+-- the cap is never exceeded. It conflicts with another authorization's,
+-- with a metadata document's upsert or failed re-fetch record (each an
+-- UPDATE of the row) and with the client's deletion (FOR UPDATE), never
+-- with the FOR KEY SHARE every issuance and grant revocation takes: a
+-- consent, a code exchange or a refresh never waits for an authorization
+-- of its client, nor it for them. pgx.ErrNoRows means the client is gone.
+-- name: LockMCPOAuthClientForNewRequest :one
+SELECT id FROM mcp_oauth_clients
+WHERE id = $1
+FOR NO KEY UPDATE;
+
 -- name: DeleteMCPOAuthClient :one
 DELETE FROM mcp_oauth_clients
 WHERE id = $1
+RETURNING *;
+
+-- DisableMCPOAuthClient and EnableMCPOAuthClient back an administrator's
+-- POST /api/mcp-clients/{clientID}/disable and /enable (technical plan
+-- §43.15). A disabled client is refused wherever a client acts -- the
+-- authorization endpoint, both consent routes, the token endpoint by code
+-- and by refresh, every /mcp call -- from its next request, and may still
+-- give its tokens back; nothing under it is deleted. Its row is the durable
+-- block: the unused-client sweep never deletes a disabled client, and a
+-- disabled metadata-document client's document is never fetched again, so
+-- the next authorization naming its URL finds it, still disabled. Enabling
+-- lets it carry on with whatever it still holds.
+--
+-- Each is ONE statement taking ONE row lock -- the client, FOR NO KEY
+-- UPDATE (disabled_at is no key column) -- like the metadata document's
+-- upsert (the lock order at the top of mcpoauthgrant_store.go): it
+-- conflicts with an authorization storing a request, the upsert, a failed
+-- re-fetch's record, a deletion and the sweep, never with the FOR KEY SHARE
+-- an issuance or a grant revocation takes. pgx.ErrNoRows means no such
+-- client, or one already in the state asked for.
+-- name: DisableMCPOAuthClient :one
+UPDATE mcp_oauth_clients
+SET disabled_at = now()
+WHERE id = $1 AND disabled_at IS NULL
+RETURNING *;
+
+-- name: EnableMCPOAuthClient :one
+UPDATE mcp_oauth_clients
+SET disabled_at = NULL
+WHERE id = $1 AND disabled_at IS NOT NULL
 RETURNING *;
 
 -- UpsertMCPOAuthMetadataDocumentClient records one successfully fetched

@@ -25,6 +25,7 @@ automated outbox dead-letter replay) is stated as a gap, not glossed over.
 | [turn-false-failures.md](turn-false-failures.md) | `TurnFalseFailureAny` | #4 (late `execution_complete`), adjacent not identical — see entry |
 | [sandbox-capability-refusals.md](sandbox-capability-refusals.md) | none (no metric exists yet — see entry) | #17 (restore-with-docker) |
 | [signing-key-rotation.md](signing-key-rotation.md) | none (routine admin procedure, not a failure) | n/a |
+| [mcp-client-cutoff.md](mcp-client-cutoff.md) | none (routine admin procedure, not a failure) | n/a |
 
 ## Cross-references, not duplicated here
 
@@ -42,6 +43,10 @@ automated outbox dead-letter replay) is stated as a gap, not glossed over.
   simply isn't enrolled yet).
 - **Signing-key rotation** (Step 73a, §27.3): see
   [signing-key-rotation.md](signing-key-rotation.md) below.
+- **Cutting off an MCP client** (§43.13-§43.19): revoking one user's
+  authorization, deleting or disabling a client, pausing a registration
+  mechanism, revoking every authorization, and what each does on the
+  client's next call -- see [mcp-client-cutoff.md](mcp-client-cutoff.md).
 
 ## Instruments these runbooks rely on
 

@@ -169,10 +169,10 @@ func TestExpiredCleanup_SweepsMCPRows(t *testing.T) {
 
 	newRequest := func(expires pgtype.Timestamptz) pgtype.UUID {
 		t.Helper()
-		r, err := grants.CreateAuthorizationRequest(ctx, sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
+		r, err := grants.CreatePendingAuthorizationRequest(ctx, sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
 			ClientID: client.ID, RedirectUri: "http://127.0.0.1/cb", CodeChallenge: "c", CodeChallengeMethod: "S256",
 			Resource: "http://127.0.0.1:9/mcp", ExpiresAt: expires,
-		})
+		}, mcpTestPendingCap)
 		if err != nil {
 			t.Fatalf("create request: %v", err)
 		}
@@ -370,10 +370,10 @@ func TestExpiredCleanup_SweepsUnusedMCPClients(t *testing.T) {
 	granted := newClient("narvi_mcp_d_granted", sqlcgen.McpOauthClientKindDynamic, old)
 	grant(granted.ID, time.Now().Add(time.Hour))
 	pending := newClient("narvi_mcp_d_pending", sqlcgen.McpOauthClientKindDynamic, old)
-	if _, err := grants.CreateAuthorizationRequest(ctx, sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
+	if _, err := grants.CreatePendingAuthorizationRequest(ctx, sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
 		ClientID: pending.ID, RedirectUri: "http://127.0.0.1/cb", CodeChallenge: "c", CodeChallengeMethod: "S256",
 		Resource: "http://127.0.0.1:9/mcp", ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Minute), Valid: true},
-	}); err != nil {
+	}, mcpTestPendingCap); err != nil {
 		t.Fatalf("create request: %v", err)
 	}
 	refetched := newDocument("https://refetched.example/client.json", old, recent)

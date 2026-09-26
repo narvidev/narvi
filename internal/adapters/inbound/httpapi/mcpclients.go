@@ -261,3 +261,108 @@ func DeleteMCPClient(pool *pgxpool.Pool, clients *postgres.MCPOAuthClientStore, 
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
+
+// DisableMCPClient backs POST /api/mcp-clients/{clientID}/disable
+// (technical plan §43.15, clientID = the client's internal id): the
+// operator's cut-off of one client of any kind, short of deleting it. From
+// its next request the client is refused wherever a client acts -- the
+// authorization endpoint and both consent routes show an error page and
+// never redirect, the token endpoint answers invalid_client by code and by
+// refresh, and every /mcp call with one of its tokens is 401 -- while it
+// may still give its tokens back (POST /oauth/revoke). Nothing is deleted:
+// every authorization stays listed, and each user can still revoke theirs.
+// The row is the durable block a deletion is not: the unused-client sweep
+// never deletes a disabled client, and a disabled metadata-document
+// client's document is never fetched again, so the app cannot come back
+// under the same URL. A dynamically registered app can still register
+// afresh, under a new client_id, while dynamic registration is on. Admin
+// only (authz.ActionManageIntegrations); 404 for no such client, 409 for
+// one already disabled. Audited as mcp_client.disabled in the same
+// transaction. Answers the client as it now stands.
+func DisableMCPClient(pool *pgxpool.Pool, clients *postgres.MCPOAuthClientStore, auditLog *postgres.AuditLogStore) http.HandlerFunc {
+	return setMCPClientDisabled(pool, clients, auditLog, true)
+}
+
+// EnableMCPClient backs POST /api/mcp-clients/{clientID}/enable (technical
+// plan §43.15): undoes DisableMCPClient. The client carries on with
+// whatever it still holds -- what lapsed meanwhile stays lapsed -- with no
+// new consent. Admin only (authz.ActionManageIntegrations); 404 for no such
+// client, 409 for one not disabled. Audited as mcp_client.enabled in the
+// same transaction.
+func EnableMCPClient(pool *pgxpool.Pool, clients *postgres.MCPOAuthClientStore, auditLog *postgres.AuditLogStore) http.HandlerFunc {
+	return setMCPClientDisabled(pool, clients, auditLog, false)
+}
+
+// setMCPClientDisabled is DisableMCPClient (disable) and EnableMCPClient
+// (!disable): one statement changes the row (queries/mcp_oauth_clients.sql:
+// one row lock, the client's), then its audit row, in one transaction.
+func setMCPClientDisabled(pool *pgxpool.Pool, clients *postgres.MCPOAuthClientStore, auditLog *postgres.AuditLogStore, disable bool) http.HandlerFunc {
+	verb, action, unchanged := "enable", "mcp_client.enabled", "client is not disabled"
+	if disable {
+		verb, action, unchanged = "disable", "mcp_client.disabled", "client is already disabled"
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !authorize(w, r, authz.ActionManageIntegrations, authz.Resource{}) {
+			return
+		}
+		ctx := r.Context()
+		logger := platform.Logger(ctx)
+		actorUserID, ok := authenticatedUserID(w, r)
+		if !ok {
+			return
+		}
+		clientID, ok := parseUUIDParam(w, r, "clientID", "malformed client id")
+		if !ok {
+			return
+		}
+
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			logger.Error("httpapi: "+verb+" mcp client: begin tx failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+
+		store := clients.WithTx(tx)
+		var row sqlcgen.McpOauthClient
+		if disable {
+			row, err = store.Disable(ctx, clientID)
+		} else {
+			row, err = store.Enable(ctx, clientID)
+		}
+		if errors.Is(err, pgx.ErrNoRows) {
+			// No row changed: no such client, or one already in the state
+			// asked for.
+			if _, gerr := store.GetByID(ctx, clientID); errors.Is(gerr, pgx.ErrNoRows) {
+				writeError(w, http.StatusNotFound, "client not found")
+			} else if gerr != nil {
+				logger.Error("httpapi: "+verb+" mcp client: get client failed", "error", gerr)
+				writeError(w, http.StatusInternalServerError, "internal error")
+			} else {
+				writeError(w, http.StatusConflict, unchanged)
+			}
+			return
+		}
+		if err != nil {
+			logger.Error("httpapi: "+verb+" mcp client: update failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if err := recordAuditLog(ctx, auditLog.WithTx(tx), actorUserID, action, "mcp_client", row.ID.String(), map[string]any{
+			"client_id":   row.ClientID,
+			"client_name": row.ClientName,
+			"kind":        string(row.Kind),
+		}); err != nil {
+			logger.Error("httpapi: "+verb+" mcp client: record audit log failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if err := tx.Commit(ctx); err != nil {
+			logger.Error("httpapi: "+verb+" mcp client: commit failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		writeJSON(w, http.StatusOK, mcpClientToDTO(row))
+	}
+}

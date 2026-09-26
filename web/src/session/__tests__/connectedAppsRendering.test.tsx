@@ -3,16 +3,19 @@
 // for a self-registered client, app-supplied -- strings (text, never
 // markup, never an href), the identity line never borrows an
 // administrator's claim, a scope-less authorization must say
-// plainly that it sees nothing, and both destructive actions (revoke,
-// delete) must never be a single bare click. Mirrors
+// plainly that it sees nothing, and the destructive actions (revoke,
+// delete, disable) must never be a single bare click. Mirrors
 // integrationsRendering.test.tsx's own pattern: assert on specific visible
-// text, never the whole rendered HTML.
+// text, never the whole rendered HTML. What the admin views SEND -- their
+// own queryFn and mutationFn -- is connectedAppsWiring.test.tsx's.
 import { describe, expect, it } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
-import type { MCPAuthorization, MCPClient } from '@narvi/contracts/rest-dtos'
+import type { MCPAuthorization, MCPClient, Member } from '@narvi/contracts/rest-dtos'
 
-import { ConnectedAppRow, MCPClientRow } from '../ConnectedAppsSection'
+import { mcpAuthorizationQueryKeys } from '../../api/queryKeys'
+import { ConnectedAppRow, ConnectedAppsTable, MCPClientRow, MemberConnectedApps } from '../ConnectedAppsSection'
 
 const XSS = '<script>alert(document.cookie)</script>'
 const noop = () => {}
@@ -59,7 +62,7 @@ function renderClient(c: MCPClient): string {
   return renderToStaticMarkup(
     <table>
       <tbody>
-        <MCPClientRow client={c} onDelete={noop} deleting={false} />
+        <MCPClientRow client={c} onDelete={noop} deleting={false} onSetDisabled={noop} settingDisabled={false} />
       </tbody>
     </table>,
   )
@@ -138,5 +141,107 @@ describe('MCPClientRow', () => {
     const html = renderClient(baseClient())
     expect(html).toContain('>Delete<')
     expect(html).not.toContain('Confirm delete')
+  })
+
+  it('an enabled client offers Disable, behind a confirmation', () => {
+    const html = renderClient(baseClient())
+    expect(html).toContain('>Disable<')
+    expect(html).not.toContain('Confirm disable')
+    expect(html).not.toContain('>Enable<')
+  })
+
+  it('a disabled client offers Enable instead, and still Delete', () => {
+    const html = renderClient(baseClient({ disabledAt: '2026-09-22T00:00:00Z' }))
+    expect(html).toContain('>Enable<')
+    expect(html).not.toContain('>Disable<')
+    expect(html).toContain('>Delete<')
+  })
+})
+
+describe('ConnectedAppsTable', () => {
+  it('renders one row per authorization, each saying exactly what ConnectedAppRow says', () => {
+    const own = baseAuthorization()
+    const document = baseAuthorization({ id: '3f2504e0-4f89-11d3-9a0c-0305e82c3303', clientKind: 'metadata_document', clientId: 'https://tools.example/mcp/client.json', clientName: 'Tools' })
+    const html = renderToStaticMarkup(<ConnectedAppsTable authorizations={[own, document]} revokingId={undefined} onRevoke={noop} />)
+    expect(html.match(/<tr>/g)?.length).toBe(3)
+    expect(html).toContain('Registered by an administrator of this deployment')
+    expect(html).toContain('Identified by tools.example')
+    expect(html).not.toContain('Revoking…')
+  })
+
+  it('a revocation in flight never skips another row\'s confirmation', () => {
+    const other = baseAuthorization({ id: '3f2504e0-4f89-11d3-9a0c-0305e82c3304' })
+    const html = renderToStaticMarkup(<ConnectedAppsTable authorizations={[baseAuthorization(), other]} revokingId={other.id} onRevoke={noop} />)
+    // A row shows "Revoking…" only once its confirmation is open, which a
+    // static render never is: both rows still offer the bare first step.
+    expect(html.match(/>Revoke</g)?.length).toBe(2)
+  })
+})
+
+function baseMember(overrides: Partial<Member> = {}): Member {
+  return {
+    id: 'user/1?x',
+    email: 'sarah@example.invalid',
+    displayName: 'Sarah K.',
+    role: 'member',
+    disabled: false,
+    createdAt: '2026-08-20T02:00:00Z',
+    identities: [],
+    ...overrides,
+  }
+}
+
+describe('MemberConnectedApps -- an admin\'s view of a member\'s connected apps', () => {
+  it('renders the list cached under the member\'s own key -- the app, who vouches for it, no token -- with Revoke behind a confirmation', () => {
+    const member = baseMember()
+    const queryClient = new QueryClient()
+    queryClient.setQueryData(mcpAuthorizationQueryKeys.member(member.id), { authorizations: [baseAuthorization()] })
+
+    const html = renderToStaticMarkup(
+      <QueryClientProvider client={queryClient}>
+        <MemberConnectedApps member={member} />
+      </QueryClientProvider>,
+    )
+    expect(html).toContain('Connected apps · Sarah K.')
+    expect(html).toContain('Editor Plugin')
+    expect(html).toContain('Registered by an administrator of this deployment')
+    expect(html).toContain('no token is ever shown')
+    // Revoking starts behind the same confirmation as the member's own.
+    expect(html).toContain('>Revoke<')
+    expect(html).not.toContain('Confirm revoke')
+  })
+
+  it('a member with no connected apps says so', () => {
+    const member = baseMember()
+    const queryClient = new QueryClient()
+    queryClient.setQueryData(mcpAuthorizationQueryKeys.member(member.id), { authorizations: [] })
+    const html = renderToStaticMarkup(
+      <QueryClientProvider client={queryClient}>
+        <MemberConnectedApps member={member} />
+      </QueryClientProvider>,
+    )
+    expect(html).toContain('No connected apps.')
+    expect(html).not.toContain('<table')
+  })
+
+  it('a hostile display name or client name renders as text', () => {
+    const member = baseMember({ displayName: `Sarah ${XSS}` })
+    const queryClient = new QueryClient()
+    queryClient.setQueryData(mcpAuthorizationQueryKeys.member(member.id), { authorizations: [baseAuthorization({ clientName: XSS })] })
+    const html = renderToStaticMarkup(
+      <QueryClientProvider client={queryClient}>
+        <MemberConnectedApps member={member} />
+      </QueryClientProvider>,
+    )
+    expect(html).not.toContain('<script>')
+    expect(html).toContain('&lt;script&gt;')
+  })
+
+  it('every list key shares one prefix, so a revocation or a client deletion invalidates them all', () => {
+    const all = mcpAuthorizationQueryKeys.all()
+    for (const key of [mcpAuthorizationQueryKeys.mine(), mcpAuthorizationQueryKeys.member('u1')]) {
+      expect(key.slice(0, all.length)).toEqual([...all])
+    }
+    expect(mcpAuthorizationQueryKeys.member('u1')).not.toEqual(mcpAuthorizationQueryKeys.member('u2'))
   })
 })

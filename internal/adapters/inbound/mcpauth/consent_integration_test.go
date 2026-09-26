@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // TestConsent_FrameHeaders: the consent page cannot be framed, cached,
@@ -262,7 +263,7 @@ func TestConsent_NoNonASCIIHostReachesThePage(t *testing.T) {
 			row.CodeChallenge, row.CodeChallengeMethod = "c", "S256"
 			row.Resource = r.server.Identifiers().Resource
 			row.ExpiresAt = pgtype.Timestamptz{Time: now.Add(time.Minute), Valid: true}
-			req, err := r.grants.CreateAuthorizationRequest(ctx, row)
+			req, err := r.grants.CreatePendingAuthorizationRequest(ctx, row, platform.DefaultTimeouts().MCPMaxPendingAuthorizationRequestsPerClient)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -36,10 +36,32 @@
 // its next call while the other's still works (and with metadata
 // documents off, an https client_id is unknown).
 //
+// The admin view and the brakes (§43.14/§43.18): an administrator lists a
+// member's authorizations and revokes one on the member's behalf -- after
+// every other role is refused and the grant under any other user's path
+// is a 404 -- and the member's SDK session stops on its very next call.
+// On a router built with the shipped brakes (the shared rig lifts the two
+// new ones: newOAuthRouterRig's own doc comment says why), each of the
+// authorization and token endpoints refuses a network past its burst --
+// a page, never a redirect; 429 temporarily_unavailable -- spending and
+// storing nothing and logging no credential; one network's flood never
+// spends another's bucket, the SDK client refreshing through it; the SDK
+// client whose own refresh is braked keeps its refresh token and is never
+// sent back to consent; and a concurrent flood of authorizations of one
+// client stores exactly the pending-request cap.
+//
 // With the surface OFF, the discovery documents and every /oauth route
 // answer the documented disabled response (§43.11/§43.14), while the
-// Settings routes keep serving, so an authorization can always be listed
-// and revoked (§43.18).
+// Settings routes -- the admin view of a member's authorizations included
+// -- keep serving, so an authorization can always be listed and revoked
+// (§43.18).
+//
+// An administrator's disable of one client (§43.15), through the admin
+// route: a dynamically registered client's access and refresh tokens are
+// refused on their next use and carry on once it is enabled; a disabled
+// metadata-document client survives the unused-client sweep that deletes
+// an enabled one in the same state, and the next authorization naming its
+// URL is refused without its document being fetched.
 //
 // One Postgres container backs every subtest; each subtest creates its
 // own users and clients.
@@ -54,12 +76,14 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -72,6 +96,7 @@ import (
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/modelcontextprotocol/go-sdk/oauthex"
 	"golang.org/x/oauth2"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/outbound/cimdfetch"
@@ -138,19 +163,34 @@ type oauthRouterRig struct {
 // newOAuthRouterRig sets NARVI_MCP_ENABLED and a PublicBaseURL equal to a
 // fresh listener's own address for the rest of t, builds the composition
 // root through platform.Load and Build exactly as production boot does,
-// and serves its router on that listener.
+// and serves its router on that listener -- with the shipped timeouts,
+// except the token and authorization endpoints' brakes, lifted
+// (liftEndpointBrakes): every official-SDK client in this file dials from
+// the same loopback address, so on the shipped values this rig's many
+// flows would meet the brake whenever they ran faster than it refills --
+// an outcome decided by timing, never by the code under test. The brakes
+// themselves are proven on routers built with the shipped values (the
+// "brakes" section of TestOAuth_ProductionRouter).
 func newOAuthRouterRig(t *testing.T, pool *pgxpool.Pool) *oauthRouterRig {
 	t.Helper()
-	return newOAuthRouterRigWith(t, pool, nil, cimdfetch.GuardConfig{})
+	return newOAuthRouterRigWith(t, pool, nil, cimdfetch.GuardConfig{}, liftEndpointBrakes)
+}
+
+// liftEndpointBrakes raises the token and authorization endpoints' bursts
+// far past anything one test makes (newOAuthRouterRig's own doc comment
+// says why), leaving every other timeout as shipped.
+func liftEndpointBrakes(to *platform.Timeouts) {
+	to.MCPTokenEndpointRateBurst = 1_000_000
+	to.MCPAuthorizeRateBurst = 1_000_000
 }
 
 // newOAuthRouterRigWith is newOAuthRouterRig with more environment set for
-// the Build, and the client ID metadata document fetcher's SSRF guard
-// built with guard -- the one test seam Build has (cimdFetchGuard). The
-// seam is set for the Build alone and restored before this returns: every
-// other router in the test, and every production boot, gets the full
-// guard.
-func newOAuthRouterRigWith(t *testing.T, pool *pgxpool.Pool, env map[string]string, guard cimdfetch.GuardConfig) *oauthRouterRig {
+// the Build, the client ID metadata document fetcher's SSRF guard built
+// with guard -- the one test seam Build has (cimdFetchGuard) -- and the
+// timeouts adjusted by adjust (nil: exactly as shipped). The seam is set
+// for the Build alone and restored before this returns: every other
+// router in the test, and every production boot, gets the full guard.
+func newOAuthRouterRigWith(t *testing.T, pool *pgxpool.Pool, env map[string]string, guard cimdfetch.GuardConfig, adjust func(*platform.Timeouts)) *oauthRouterRig {
 	t.Helper()
 	server := httptest.NewUnstartedServer(nil)
 	t.Setenv("NARVI_PUBLIC_BASE_URL", "http://"+server.Listener.Addr().String())
@@ -162,6 +202,13 @@ func newOAuthRouterRigWith(t *testing.T, pool *pgxpool.Pool, env map[string]stri
 	if err != nil {
 		server.Close()
 		t.Fatalf("platform.Load: %v", err)
+	}
+	if adjust != nil {
+		adjust(&cfg.Timeouts)
+		if err := cfg.Timeouts.Validate(); err != nil {
+			server.Close()
+			t.Fatalf("adjusted timeouts: %v", err)
+		}
 	}
 	cimdFetchGuard = guard
 	app, err := Build(context.Background(), cfg, pool)
@@ -478,6 +525,7 @@ type sdkFlow struct {
 	recorder    *recordingTransport
 	member      sqlcgen.User
 	cookie      string
+	admin       sqlcgen.User
 	adminCookie string
 	client      restdtos.MCPClient
 }
@@ -487,7 +535,7 @@ type sdkFlow struct {
 // signed-in member, whose consent the driver gives.
 func (r *oauthRouterRig) connectSDKClient(ctx context.Context, t *testing.T, configure func(*consentDriver)) *sdkFlow {
 	t.Helper()
-	_, adminCookie := createRouterUser(ctx, t, r.pool, sqlcgen.UserRoleAdmin)
+	admin, adminCookie := createRouterUser(ctx, t, r.pool, sqlcgen.UserRoleAdmin)
 	member, memberCookie := createRouterUser(ctx, t, r.pool, sqlcgen.UserRoleMember)
 
 	var client restdtos.MCPClient
@@ -503,7 +551,7 @@ func (r *oauthRouterRig) connectSDKClient(ctx context.Context, t *testing.T, con
 	if err != nil {
 		t.Fatalf("SDK Connect: %v", err)
 	}
-	flow.adminCookie, flow.client = adminCookie, client
+	flow.admin, flow.adminCookie, flow.client = admin, adminCookie, client
 	return flow
 }
 
@@ -636,6 +684,23 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		}
 		if clientID == "" {
 			t.Fatalf("GET /api/mcp-clients while off = %+v, want the authorization's client listed", clients)
+		}
+		// The admin view of a member's authorizations too, and revocation
+		// on a member's behalf.
+		rec = serveRouter(off.Router, http.MethodGet, "/api/members/"+member.ID.String()+"/mcp-authorizations", adminCookie)
+		var theirs restdtos.ListMCPAuthorizationsResponse
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &theirs) != nil || len(theirs.Authorizations) != 1 || theirs.Authorizations[0].Id != mine.Authorizations[0].Id {
+			t.Fatalf("GET /api/members/{userID}/mcp-authorizations while off: status %d body %s, want 200 listing the member's one authorization", rec.Code, rec.Body.String())
+		}
+		second, _ := createRouterUser(ctx, t, pool, sqlcgen.UserRoleMember)
+		mintBuildBearer(ctx, t, pool, offCfg, second.ID)
+		rec = serveRouter(off.Router, http.MethodGet, "/api/members/"+second.ID.String()+"/mcp-authorizations", adminCookie)
+		var secondList restdtos.ListMCPAuthorizationsResponse
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &secondList) != nil || len(secondList.Authorizations) != 1 {
+			t.Fatalf("GET /api/members/{userID}/mcp-authorizations while off: status %d body %s", rec.Code, rec.Body.String())
+		}
+		if rec := serveRouter(off.Router, http.MethodDelete, "/api/members/"+second.ID.String()+"/mcp-authorizations/"+secondList.Authorizations[0].Id, adminCookie); rec.Code != http.StatusNoContent {
+			t.Fatalf("DELETE /api/members/{userID}/mcp-authorizations/{id} while off: status %d body %s, want 204", rec.Code, rec.Body.String())
 		}
 		if rec := serveRouter(off.Router, http.MethodDelete, "/api/me/mcp-authorizations/"+mine.Authorizations[0].Id, memberCookie); rec.Code != http.StatusNoContent {
 			t.Fatalf("DELETE /api/me/mcp-authorizations/{id} while off: status %d body %s, want 204", rec.Code, rec.Body.String())
@@ -770,6 +835,91 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		var tokens int
 		if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM mcp_oauth_access_tokens WHERE grant_id = $1`, grantID).Scan(&tokens); err != nil || tokens != 0 {
 			t.Fatalf("access tokens left for the revoked grant = %d (err %v), want 0", tokens, err)
+		}
+	})
+
+	// The revocation exit criterion through an administrator (§43.18): the
+	// admin lists the member's authorizations and revokes one on the
+	// member's behalf, and the very next call through the member's SDK
+	// session is refused -- 401 invalid_token, the SDK's one Authorize retry
+	// declined -- and the refresh token refreshes nothing. Before that: no
+	// other role may list or revoke through the admin routes (403, the
+	// member included), and the grant under any other user's path is a 404
+	// that leaves the member's token working.
+	t.Run("RevokedAuthorizationStopsOnNextCall_Admin", func(t *testing.T) {
+		ctx := oauthTestCtx(t)
+		flow := rig.connectSDKClient(ctx, t, func(d *consentDriver) {
+			d.deny = func(n int32) bool { return n > 1 }
+		})
+		if res, err := callListModels(ctx, flow.session); err != nil || res.IsError {
+			t.Fatalf("call before revocation: res %+v err %v", res, err)
+		}
+		token := flow.recorder.lastBearer()
+		refresh := flow.clock.current().RefreshToken
+		memberPath := "/api/members/" + flow.member.ID.String() + "/mcp-authorizations"
+
+		var list restdtos.ListMCPAuthorizationsResponse
+		if status := rig.doJSON(t, http.MethodGet, memberPath, nil, &list, flow.adminCookie); status != http.StatusOK || len(list.Authorizations) != 1 || list.Authorizations[0].ClientId != flow.client.ClientId {
+			t.Fatalf("admin list: status %d body %+v, want the member's one authorization", status, list)
+		}
+		grantID := list.Authorizations[0].Id
+
+		_, maintainerCookie := createRouterUser(ctx, t, rig.pool, sqlcgen.UserRoleMaintainer)
+		for who, cookie := range map[string]string{"the member": flow.cookie, "a maintainer": maintainerCookie} {
+			if status := rig.doJSON(t, http.MethodGet, memberPath, nil, nil, cookie); status != http.StatusForbidden {
+				t.Fatalf("%s listing through the admin route: status %d, want 403", who, status)
+			}
+			if status := rig.doJSON(t, http.MethodDelete, memberPath+"/"+grantID, nil, nil, cookie); status != http.StatusForbidden {
+				t.Fatalf("%s revoking through the admin route: status %d, want 403", who, status)
+			}
+		}
+		other, _ := createRouterUser(ctx, t, rig.pool, sqlcgen.UserRoleMember)
+		for _, owner := range []string{other.ID.String(), flow.admin.ID.String()} {
+			if status := rig.doJSON(t, http.MethodDelete, "/api/members/"+owner+"/mcp-authorizations/"+grantID, nil, nil, flow.adminCookie); status != http.StatusNotFound {
+				t.Fatalf("admin revoking the member's grant under user %s: status %d, want 404", owner, status)
+			}
+		}
+		rig.acceptedCall(t, token)
+
+		if status := rig.doJSON(t, http.MethodDelete, memberPath+"/"+grantID, nil, nil, flow.adminCookie); status != http.StatusNoContent {
+			t.Fatalf("admin revoke: status %d, want 204", status)
+		}
+		before := len(flow.recorder.snapshot())
+		if _, err := callListModels(ctx, flow.session); err == nil {
+			t.Fatalf("the very next CallTool after the admin's revocation succeeded")
+		}
+		after := flow.recorder.snapshot()[before:]
+		if len(after) == 0 || after[0].status != http.StatusUnauthorized || after[0].authorization != "Bearer "+token {
+			t.Fatalf("exchanges after revocation = %+v, want the old token refused 401 first", after)
+		}
+		if n := flow.driver.calls.Load(); n != 2 {
+			t.Fatalf("consent flow ran %d times, want 2 (the SDK's single Authorize retry)", n)
+		}
+		rig.revokedCallFails(t, token)
+
+		resp, err := http.PostForm(rig.server.URL+"/oauth/token", url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refresh}, "client_id": {flow.client.ClientId}})
+		if err != nil {
+			t.Fatalf("refresh after revocation: %v", err)
+		}
+		var refused struct {
+			Error string `json:"error"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&refused)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest || refused.Error != "invalid_grant" {
+			t.Fatalf("refresh after revocation: status %d error %q, want 400 invalid_grant", resp.StatusCode, refused.Error)
+		}
+		var grants, tokens, audited int
+		if err := rig.pool.QueryRow(ctx, `
+			SELECT (SELECT count(*) FROM mcp_oauth_grants WHERE user_id = $1),
+			       (SELECT count(*) FROM mcp_oauth_access_tokens t JOIN mcp_oauth_grants g ON g.id = t.grant_id WHERE g.user_id = $1),
+			       (SELECT count(*) FROM audit_log WHERE action = 'mcp_authorization.revoked' AND resource_id = $2
+			          AND actor_user_id = $3 AND detail_json->>'reason' = 'admin' AND detail_json->>'target_user_id' = $4)`,
+			flow.member.ID, grantID, flow.admin.ID, flow.member.ID.String()).Scan(&grants, &tokens, &audited); err != nil {
+			t.Fatal(err)
+		}
+		if grants != 0 || tokens != 0 || audited != 1 {
+			t.Fatalf("after the admin's revocation: grants %d, access tokens %d, admin revocation audit rows %d; want 0, 0, 1", grants, tokens, audited)
 		}
 	})
 
@@ -1073,8 +1223,8 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		}
 	})
 
-	cimdRig := newOAuthRouterRigWith(t, pool, map[string]string{"NARVI_MCP_DCR_ENABLED": "true"}, doc.seam())
-	var cimdToken, dcrToken string
+	cimdRig := newOAuthRouterRigWith(t, pool, map[string]string{"NARVI_MCP_DCR_ENABLED": "true"}, doc.seam(), nil)
+	var cimdToken, dcrToken, dcrRefresh string
 
 	// A client identified by a metadata document, end to end through the
 	// official SDK (which prefers it once the metadata advertises it): the
@@ -1147,6 +1297,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 			t.Fatalf("CallTool narvi_list_models: res %+v err %v", res, err)
 		}
 		dcrToken = flow.recorder.lastBearer()
+		dcrRefresh = flow.clock.current().RefreshToken
 		if page := flow.driver.lastPage(); !strings.Contains(page, "This app registered itself with this deployment, so nothing vouches for its name.") {
 			t.Error("the consent page does not say the app registered itself")
 		}
@@ -1163,6 +1314,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 	// registrations, then 429 with Retry-After and nothing written.
 	t.Run("Register_RateLimited", func(t *testing.T) {
 		burst := cimdRig.cfg.Timeouts.MCPRegisterRateBurst
+		start := time.Now()
 		for i := range burst {
 			if rec := cimdRig.registerFrom(t, "198.51.100.23:40000", "", "Rate Limit Probe"); rec.Code != http.StatusCreated {
 				t.Fatalf("registration %d of the burst: status %d body %s, want 201", i+1, rec.Code, rec.Body.String())
@@ -1173,9 +1325,11 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 			{"a forwarded header naming another address changes nothing", "198.51.100.23:40002", "198.51.100.99"},
 		} {
 			rec := cimdRig.registerFrom(t, tc.remote, tc.forwarded, "Rate Limit Probe")
+			elapsed := time.Since(start)
 			if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" || !strings.Contains(rec.Body.String(), `"error":"temporarily_unavailable"`) {
 				t.Fatalf("%s: status %d Retry-After %q body %s, want 429 with Retry-After", tc.name, rec.Code, rec.Header().Get("Retry-After"), rec.Body.String())
 			}
+			assertRetryAfterPinsInterval(t, tc.name, rec.Header().Get("Retry-After"), cimdRig.cfg.Timeouts.MCPRegisterRateInterval, elapsed)
 		}
 		if rec := cimdRig.registerFrom(t, "198.51.100.24:40000", "", "Rate Limit Probe"); rec.Code != http.StatusCreated {
 			t.Fatalf("another address: status %d, want 201", rec.Code)
@@ -1191,8 +1345,8 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 	// refuse either: each router accepts the token of the mechanism it
 	// kept and refuses the other's on its very next call.
 	sameResource := map[string]string{"NARVI_PUBLIC_BASE_URL": cimdRig.cfg.PublicBaseURL}
-	offCIMD := newOAuthRouterRigWith(t, pool, withEnv(sameResource, "NARVI_MCP_CIMD_ENABLED", "false", "NARVI_MCP_DCR_ENABLED", "true"), doc.seam())
-	offDCR := newOAuthRouterRigWith(t, pool, withEnv(sameResource, "NARVI_MCP_CIMD_ENABLED", "true", "NARVI_MCP_DCR_ENABLED", "false"), doc.seam())
+	offCIMD := newOAuthRouterRigWith(t, pool, withEnv(sameResource, "NARVI_MCP_CIMD_ENABLED", "false", "NARVI_MCP_DCR_ENABLED", "true"), doc.seam(), nil)
+	offDCR := newOAuthRouterRigWith(t, pool, withEnv(sameResource, "NARVI_MCP_CIMD_ENABLED", "true", "NARVI_MCP_DCR_ENABLED", "false"), doc.seam(), nil)
 	for _, r := range []*oauthRouterRig{offCIMD, offDCR} {
 		if r.cfg.PublicBaseURL != cimdRig.cfg.PublicBaseURL {
 			t.Fatalf("an off-flag router serves %s, want cimdRig's own %s", r.cfg.PublicBaseURL, cimdRig.cfg.PublicBaseURL)
@@ -1234,6 +1388,488 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		offDCR.acceptedCall(t, cimdToken)
 		offDCR.revokedCallFails(t, dcrToken)
 	})
+
+	// An administrator disabling a dynamically registered client, through
+	// the admin route: its access token is refused on its very next /mcp
+	// call and its refresh token at the token endpoint (invalid_client),
+	// nothing is deleted, and enabling it lets both carry on -- the refused
+	// refresh spent nothing. A member asking is refused 403 and changes
+	// nothing.
+	t.Run("DisabledDynamicClient_RefusedNextCall", func(t *testing.T) {
+		ctx := oauthTestCtx(t)
+		if dcrToken == "" || dcrRefresh == "" {
+			t.Fatal("no dynamic-client tokens from EndToEnd_SDKClient_DynamicRegistration")
+		}
+		_, adminCookie := createRouterUser(ctx, t, cimdRig.pool, sqlcgen.UserRoleAdmin)
+		_, memberCookie := createRouterUser(ctx, t, cimdRig.pool, sqlcgen.UserRoleMember)
+		var internalID, clientID, kind string
+		if err := cimdRig.pool.QueryRow(ctx, `
+			SELECT c.id::text, c.client_id, c.kind::text FROM mcp_oauth_clients c
+			JOIN mcp_oauth_grants g ON g.client_id = c.id JOIN mcp_oauth_access_tokens t ON t.grant_id = g.id
+			WHERE t.token_hash = $1`, platform.HashToken(dcrToken)).Scan(&internalID, &clientID, &kind); err != nil || kind != "dynamic" {
+			t.Fatalf("the dynamic token's client: kind %q (err %v), want dynamic", kind, err)
+		}
+		disable, enable := "/api/mcp-clients/"+internalID+"/disable", "/api/mcp-clients/"+internalID+"/enable"
+		cimdRig.acceptedCall(t, dcrToken)
+		if status := cimdRig.doJSON(t, http.MethodPost, disable, nil, nil, memberCookie); status != http.StatusForbidden {
+			t.Fatalf("a member disabling the client: status %d, want 403", status)
+		}
+		cimdRig.acceptedCall(t, dcrToken)
+
+		var disabled restdtos.MCPClient
+		if status := cimdRig.doJSON(t, http.MethodPost, disable, nil, &disabled, adminCookie); status != http.StatusOK || disabled.DisabledAt == nil || disabled.ClientId != clientID {
+			t.Fatalf("disable: status %d client %+v, want 200 and disabledAt set", status, disabled)
+		}
+		cimdRig.revokedCallFails(t, dcrToken)
+		refresh := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {dcrRefresh}, "client_id": {clientID}}
+		if rec := cimdRig.tokenFrom(t, "198.51.100.121:4000", "", refresh); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"error":"invalid_client"`) {
+			t.Fatalf("refresh while disabled: status %d body %s, want 400 invalid_client", rec.Code, rec.Body.String())
+		}
+
+		if status := cimdRig.doJSON(t, http.MethodPost, enable, nil, nil, adminCookie); status != http.StatusOK {
+			t.Fatalf("enable: status %d, want 200", status)
+		}
+		cimdRig.acceptedCall(t, dcrToken)
+		if rec := cimdRig.tokenFrom(t, "198.51.100.121:4001", "", refresh); rec.Code != http.StatusOK {
+			t.Fatalf("refresh once enabled: status %d body %s, want 200 -- the refusal spent nothing", rec.Code, rec.Body.String())
+		}
+	})
+
+	// A metadata-document client an administrator disabled stays out,
+	// where deleting it would not: the next authorization naming its URL
+	// would register it afresh, enabled. Arranged as it stands a day later
+	// -- its only authorization revoked, its requests gone, its cached
+	// document long stale -- the unused-client sweep, run with its own
+	// cutoff (now less MCPDynamicClientUnusedTTL), deletes an enabled
+	// metadata-document client in exactly that state and never the disabled
+	// one; the next authorization naming the disabled one's URL is an error
+	// page, and its document is never fetched. Enabled again, the same
+	// authorization fetches the stale document and goes on to sign-in.
+	t.Run("DisabledMetadataDocumentClient_SurvivesTheSweepNeverFetched", func(t *testing.T) {
+		ctx := oauthTestCtx(t)
+		if cimdToken == "" {
+			t.Fatal("no metadata-document token from EndToEnd_SDKClient_MetadataDocument")
+		}
+		_, adminCookie := createRouterUser(ctx, t, cimdRig.pool, sqlcgen.UserRoleAdmin)
+		var internalID string
+		if err := cimdRig.pool.QueryRow(ctx, `SELECT id::text FROM mcp_oauth_clients WHERE client_id = $1`, doc.clientID).Scan(&internalID); err != nil {
+			t.Fatalf("the metadata-document client: %v", err)
+		}
+		var disabled restdtos.MCPClient
+		if status := cimdRig.doJSON(t, http.MethodPost, "/api/mcp-clients/"+internalID+"/disable", nil, &disabled, adminCookie); status != http.StatusOK || disabled.DisabledAt == nil {
+			t.Fatalf("disable: status %d client %+v, want 200 and disabledAt set", status, disabled)
+		}
+		cimdRig.revokedCallFails(t, cimdToken)
+
+		const control = "https://unused.example/client.json"
+		now := time.Now()
+		if _, err := narvipg.NewMCPOAuthClientStore(cimdRig.pool).UpsertMetadataDocument(ctx, sqlcgen.UpsertMCPOAuthMetadataDocumentClientParams{
+			ClientID: control, ClientName: "Unused", RedirectUris: []string{"http://127.0.0.1/callback"},
+			MetadataFetchedAt: pgtype.Timestamptz{Time: now, Valid: true}, MetadataStaleAt: pgtype.Timestamptz{Time: now.Add(time.Hour), Valid: true},
+		}); err != nil {
+			t.Fatalf("store the control client: %v", err)
+		}
+		ttl := cimdRig.cfg.Timeouts.MCPDynamicClientUnusedTTL
+		longAgo := now.Add(-ttl - time.Hour)
+		both := []string{doc.clientID, control}
+		for _, stmt := range []string{
+			`DELETE FROM mcp_oauth_grants WHERE client_id IN (SELECT id FROM mcp_oauth_clients WHERE client_id = ANY($1))`,
+			`DELETE FROM mcp_oauth_authorization_requests WHERE client_id IN (SELECT id FROM mcp_oauth_clients WHERE client_id = ANY($1))`,
+		} {
+			if _, err := cimdRig.pool.Exec(ctx, stmt, both); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if tag, err := cimdRig.pool.Exec(ctx, `
+			UPDATE mcp_oauth_clients SET created_at = $2, metadata_fetched_at = $2, metadata_stale_at = $2
+			WHERE client_id = ANY($1)`, both, longAgo); err != nil || tag.RowsAffected() != 2 {
+			t.Fatalf("age both clients: rows %d err %v", tag.RowsAffected(), err)
+		}
+
+		if _, err := narvipg.NewMCPOAuthClientStore(cimdRig.pool).DeleteUnused(ctx, time.Now().Add(-ttl)); err != nil {
+			t.Fatalf("the unused-client sweep: %v", err)
+		}
+		if n := cimdRig.countClients(t, control); n != 0 {
+			t.Fatalf("the enabled control client survived the sweep (%d rows): the arrangement is not one the sweep deletes", n)
+		}
+		var stillDisabled bool
+		if err := cimdRig.pool.QueryRow(ctx, `SELECT disabled_at IS NOT NULL FROM mcp_oauth_clients WHERE client_id = $1`, doc.clientID).Scan(&stillDisabled); err != nil || !stillDisabled {
+			t.Fatalf("the disabled client after the sweep: disabled %v (err %v), want its row kept, disabled", stillDisabled, err)
+		}
+
+		authorize := url.Values{
+			"client_id": {doc.clientID}, "redirect_uri": {"http://127.0.0.1:1/callback"}, "response_type": {"code"},
+			"code_challenge": {"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"}, "code_challenge_method": {"S256"}, "resource": {cimdRig.server.URL + "/mcp"},
+		}
+		hits, conns := doc.hits.Load(), doc.conns.Load()
+		rec := cimdRig.authorizeFrom(t, "198.51.100.122:7000", authorize)
+		if rec.Code != http.StatusBadRequest || rec.Header().Get("Location") != "" || !strings.Contains(rec.Body.String(), "This app is not available") {
+			t.Fatalf("authorize naming the disabled client's URL: status %d Location %q, want the 400 page and no redirect", rec.Code, rec.Header().Get("Location"))
+		}
+		if doc.hits.Load() != hits || doc.conns.Load() != conns {
+			t.Fatal("the disabled client's document was fetched")
+		}
+
+		if status := cimdRig.doJSON(t, http.MethodPost, "/api/mcp-clients/"+internalID+"/enable", nil, nil, adminCookie); status != http.StatusOK {
+			t.Fatalf("enable: status %d, want 200", status)
+		}
+		rec = cimdRig.authorizeFrom(t, "198.51.100.122:7001", authorize)
+		if rec.Code != http.StatusFound || !strings.HasPrefix(rec.Header().Get("Location"), "/sign-in?next=") || doc.hits.Load() == hits {
+			t.Fatalf("authorize once enabled: status %d Location %q, fetched %v; want the stale document fetched and a 302 on to sign-in", rec.Code, rec.Header().Get("Location"), doc.hits.Load() != hits)
+		}
+	})
+
+	// --- The brakes and the pending-request cap (§43.14) ---
+	//
+	// On a router built with the shipped values, never the shared rig's
+	// lifted ones. Requests are served in process where the test must choose
+	// the client network the brake keys on (RemoteAddr); the official SDK
+	// client dials from loopback, a network of its own.
+	braked := newOAuthRouterRigWith(t, pool, nil, cimdfetch.GuardConfig{}, nil)
+	shipped := platform.DefaultTimeouts()
+	if got := braked.cfg.Timeouts; got.MCPTokenEndpointRateInterval != shipped.MCPTokenEndpointRateInterval || got.MCPTokenEndpointRateBurst != shipped.MCPTokenEndpointRateBurst ||
+		got.MCPAuthorizeRateInterval != shipped.MCPAuthorizeRateInterval || got.MCPAuthorizeRateBurst != shipped.MCPAuthorizeRateBurst ||
+		got.MCPMaxPendingAuthorizationRequestsPerClient != shipped.MCPMaxPendingAuthorizationRequestsPerClient {
+		t.Fatalf("the braked router's brakes are not the shipped ones: %+v", got)
+	}
+
+	// The token endpoint's brake: a network's burst reaches the handler;
+	// past it, 429 with Retry-After and temporarily_unavailable, whatever
+	// the source port or a forwarded header says. A real refresh token
+	// presented from that network is refused before it is read -- not
+	// rotated, still good from any other network -- and each refusal is
+	// logged at WARN with the path and the network, never the token.
+	t.Run("RateLimit_TokenEndpoint429", func(t *testing.T) {
+		ctx := oauthTestCtx(t)
+		flow := braked.connectSDKClient(ctx, t, nil)
+		refresh := flow.clock.current().RefreshToken
+		logs := captureWarnings(t)
+		const flooder = "198.51.100.61"
+		junk := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {"narvi_mcp_rt_junk"}, "client_id": {"narvi_mcp_c_unknown"}}
+		start := time.Now()
+		for i := range braked.cfg.Timeouts.MCPTokenEndpointRateBurst {
+			if rec := braked.tokenFrom(t, flooder+":4000", "", junk); rec.Code != http.StatusBadRequest {
+				t.Fatalf("token request %d of the burst: status %d body %s, want the handler's own 400", i+1, rec.Code, rec.Body.String())
+			}
+		}
+		asFlow := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refresh}, "client_id": {flow.client.ClientId}}
+		for _, tc := range []struct {
+			name, remote, forwarded string
+			form                    url.Values
+		}{
+			{"past the burst, another source port", flooder + ":4001", "", junk},
+			{"a forwarded header naming another address changes nothing", flooder + ":4002", "203.0.113.9", junk},
+			{"a real refresh token from the braked network", flooder + ":4003", "", asFlow},
+		} {
+			rec := braked.tokenFrom(t, tc.remote, tc.forwarded, tc.form)
+			elapsed := time.Since(start)
+			if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" || rec.Header().Get("Content-Type") != "application/json" || rec.Header().Get("Cache-Control") != "no-store" ||
+				rec.Body.String() != `{"error":"temporarily_unavailable","error_description":"too many token requests from this network; retry later"}`+"\n" {
+				t.Fatalf("%s: status %d headers %v body %s, want 429 temporarily_unavailable with Retry-After", tc.name, rec.Code, rec.Header(), rec.Body.String())
+			}
+			assertRetryAfterPinsInterval(t, tc.name, rec.Header().Get("Retry-After"), braked.cfg.Timeouts.MCPTokenEndpointRateInterval, elapsed)
+		}
+		var rotated bool
+		if err := braked.pool.QueryRow(ctx, `SELECT rotated_at IS NOT NULL FROM mcp_oauth_refresh_tokens WHERE token_hash = $1`, platform.HashToken(refresh)).Scan(&rotated); err != nil || rotated {
+			t.Fatalf("the refresh token the brake refused: rotated %v (err %v), want untouched", rotated, err)
+		}
+		rec := braked.tokenFrom(t, "198.51.100.62:4000", "", asFlow)
+		var refreshed struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+		}
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &refreshed) != nil || refreshed.AccessToken == "" || refreshed.RefreshToken == refresh {
+			t.Fatalf("the same refresh token from another network: status %d body %s, want 200 and new tokens -- the refusal spent nothing", rec.Code, rec.Body.String())
+		}
+		refusals := logs.matching("mcpauth: rate limited", "path", "/oauth/token")
+		if len(refusals) != 3 {
+			t.Fatalf("rate-limit refusals logged = %d, want 3", len(refusals))
+		}
+		for _, e := range refusals {
+			line, _ := json.Marshal(e)
+			if e["level"] != "WARN" || e["client_address"] != flooder || strings.Contains(string(line), refresh) || strings.Contains(string(line), "narvi_mcp_rt_") {
+				t.Fatalf("refusal log %s: want a WARN naming the network and no token", line)
+			}
+		}
+	})
+
+	// The authorization endpoint's brake: a network's burst is served;
+	// past it, the error page with 429 and Retry-After -- never a redirect,
+	// even for a request whose client and redirect_uri are registered --
+	// logged without the request's query. Another network is served.
+	t.Run("RateLimit_AuthorizeEndpoint", func(t *testing.T) {
+		ctx := oauthTestCtx(t)
+		_, adminCookie := createRouterUser(ctx, t, braked.pool, sqlcgen.UserRoleAdmin)
+		client := braked.registerClientAsAdmin(t, adminCookie, "Braked Plugin")
+		logs := captureWarnings(t)
+		const flooder, state, challenge = "198.51.100.71", "state-not-for-logs", "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+		valid := url.Values{
+			"client_id": {client.ClientId}, "redirect_uri": {"http://127.0.0.1:1/callback"}, "response_type": {"code"},
+			"code_challenge": {challenge}, "code_challenge_method": {"S256"}, "resource": {braked.server.URL + "/mcp"}, "state": {state},
+		}
+		start := time.Now()
+		for i := range braked.cfg.Timeouts.MCPAuthorizeRateBurst {
+			if rec := braked.authorizeFrom(t, flooder+":5000", valid); rec.Code != http.StatusFound || !strings.HasPrefix(rec.Header().Get("Location"), "/sign-in?next=") {
+				t.Fatalf("authorization %d of the burst: status %d Location %q, want a 302 on to sign-in", i+1, rec.Code, rec.Header().Get("Location"))
+			}
+		}
+		unregistered := url.Values{}
+		for k, v := range valid {
+			unregistered[k] = v
+		}
+		unregistered.Set("redirect_uri", "https://elsewhere.example/cb")
+		for name, q := range map[string]url.Values{"a valid request": valid, "an unregistered redirect_uri": unregistered} {
+			rec := braked.authorizeFrom(t, flooder+":5001", q)
+			elapsed := time.Since(start)
+			if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Location") != "" || rec.Header().Get("Retry-After") == "" ||
+				rec.Header().Get("Content-Type") != "text/html; charset=utf-8" || !strings.Contains(rec.Body.String(), "Too many requests from your network") {
+				t.Fatalf("%s past the burst: status %d Location %q Retry-After %q, want the 429 page and no redirect", name, rec.Code, rec.Header().Get("Location"), rec.Header().Get("Retry-After"))
+			}
+			assertRetryAfterPinsInterval(t, name, rec.Header().Get("Retry-After"), braked.cfg.Timeouts.MCPAuthorizeRateInterval, elapsed)
+		}
+		if rec := braked.authorizeFrom(t, "198.51.100.72:5000", valid); rec.Code != http.StatusFound {
+			t.Fatalf("another network: status %d, want 302", rec.Code)
+		}
+		var stored int
+		if err := braked.pool.QueryRow(ctx, `SELECT count(*) FROM mcp_oauth_authorization_requests r JOIN mcp_oauth_clients c ON c.id = r.client_id WHERE c.client_id = $1`, client.ClientId).Scan(&stored); err != nil || stored != braked.cfg.Timeouts.MCPAuthorizeRateBurst+1 {
+			t.Fatalf("requests stored = %d (err %v), want the burst and the other network's one: a braked request stored nothing", stored, err)
+		}
+		refusals := logs.matching("mcpauth: rate limited", "path", "/oauth/authorize")
+		if len(refusals) != 2 {
+			t.Fatalf("rate-limit refusals logged = %d, want 2", len(refusals))
+		}
+		for _, e := range refusals {
+			line, _ := json.Marshal(e)
+			if e["client_address"] != flooder || strings.Contains(string(line), state) || strings.Contains(string(line), challenge) {
+				t.Fatalf("refusal log %s: want the network and nothing from the query", line)
+			}
+		}
+	})
+
+	// A flood of token requests from one network -- an IPv4 address, or
+	// one IPv6 /48 spraying a different /64 each time -- spends that
+	// network's bucket alone: another /48 still reaches the handler, and
+	// the official SDK client, on its own network, refreshes and carries
+	// on with no 429 and no second consent.
+	t.Run("RateLimit_OneNetworkCannotLockOutAnotherRefresh", func(t *testing.T) {
+		ctx := oauthTestCtx(t)
+		flow := braked.connectSDKClient(ctx, t, nil)
+		if res, err := callListModels(ctx, flow.session); err != nil || res.IsError {
+			t.Fatalf("call before the flood: res %+v err %v", res, err)
+		}
+		junk := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {"narvi_mcp_rt_junk"}, "client_id": {"narvi_mcp_c_unknown"}}
+		burst := braked.cfg.Timeouts.MCPTokenEndpointRateBurst
+		for _, network := range []func(i int) string{
+			func(int) string { return "198.51.100.81:4000" },
+			func(i int) string { return fmt.Sprintf("[2001:db8:81:%x::1]:4000", i) },
+		} {
+			for i := range burst {
+				if rec := braked.tokenFrom(t, network(i), "", junk); rec.Code != http.StatusBadRequest {
+					t.Fatalf("flood request %d from %s: status %d, want the handler's own 400", i+1, network(i), rec.Code)
+				}
+			}
+			if rec := braked.tokenFrom(t, network(burst), "", junk); rec.Code != http.StatusTooManyRequests {
+				t.Fatalf("the flood from %s past its burst: status %d, want 429", network(burst), rec.Code)
+			}
+		}
+		if rec := braked.tokenFrom(t, "[2001:db8:82::1]:4000", "", junk); rec.Code != http.StatusBadRequest {
+			t.Fatalf("another /48 after the flood: status %d, want the handler's own 400", rec.Code)
+		}
+
+		lapsed := flow.recorder.lastBearer()
+		held := flow.clock.current().RefreshToken
+		tag, err := braked.pool.Exec(ctx, `UPDATE mcp_oauth_access_tokens SET expires_at = now() - interval '1 second' WHERE token_hash = $1`, platform.HashToken(lapsed))
+		if err != nil || tag.RowsAffected() != 1 {
+			t.Fatalf("expire the access token on the server: rows %d err %v", tag.RowsAffected(), err)
+		}
+		flow.clock.expire()
+		before := len(flow.recorder.snapshot())
+		if res, err := callListModels(ctx, flow.session); err != nil || res.IsError {
+			t.Fatalf("the SDK client's call after the flood: res %+v err %v, want its refresh to go through", res, err)
+		}
+		for _, o := range flow.recorder.snapshot()[before:] {
+			if o.status != http.StatusOK || o.authorization == "Bearer "+lapsed {
+				t.Fatalf("/mcp exchanges after the flood = %+v, want only 200s with a refreshed token", flow.recorder.snapshot()[before:])
+			}
+		}
+		if flow.clock.current().RefreshToken == held || flow.driver.calls.Load() != 1 {
+			t.Fatalf("the SDK client did not refresh (refresh token unchanged %v) or consented again (%d consents)", flow.clock.current().RefreshToken == held, flow.driver.calls.Load())
+		}
+	})
+
+	// The pending-request cap on the production router: a concurrent flood
+	// of authorizations of one client, each from a network of its own so no
+	// brake stands in the way, stores exactly the shipped cap; every other
+	// request gets the 503 page and never a redirect, and is logged once,
+	// naming the client and that request's own network -- the lines an
+	// operator counts to find who is flooding (the runbook's "too many
+	// sign-ins waiting").
+	t.Run("Authorize_PendingCapRefused", func(t *testing.T) {
+		ctx := oauthTestCtx(t)
+		_, adminCookie := createRouterUser(ctx, t, braked.pool, sqlcgen.UserRoleAdmin)
+		client := braked.registerClientAsAdmin(t, adminCookie, "Popular Plugin")
+		maxPending := braked.cfg.Timeouts.MCPMaxPendingAuthorizationRequestsPerClient
+		flood := maxPending + 10
+		logs := captureWarnings(t)
+		results := make([]*httptest.ResponseRecorder, flood)
+		var eg errgroup.Group
+		for i := range flood {
+			eg.Go(func() error {
+				results[i] = braked.authorizeFrom(t, fmt.Sprintf("203.0.113.%d:6000", i+1), url.Values{
+					"client_id": {client.ClientId}, "redirect_uri": {"http://127.0.0.1:1/callback"}, "response_type": {"code"},
+					"code_challenge": {"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"}, "code_challenge_method": {"S256"}, "resource": {braked.server.URL + "/mcp"},
+				})
+				return nil
+			})
+		}
+		if err := eg.Wait(); err != nil {
+			t.Fatal(err)
+		}
+		stored, capped := 0, 0
+		refusedNetworks := map[string]int{}
+		for i, rec := range results {
+			switch {
+			case rec.Code == http.StatusFound:
+				stored++
+			case rec.Code == http.StatusServiceUnavailable && rec.Header().Get("Location") == "" && strings.Contains(rec.Body.String(), "This app has too many sign-ins waiting"):
+				capped++
+				refusedNetworks[fmt.Sprintf("203.0.113.%d", i+1)]++
+			default:
+				t.Errorf("an authorization of the flood answered %d Location %q", rec.Code, rec.Header().Get("Location"))
+			}
+		}
+		if stored != maxPending || capped != flood-maxPending {
+			t.Fatalf("flood of %d: %d stored, %d refused at the cap; want %d and %d", flood, stored, capped, maxPending, flood-maxPending)
+		}
+		loggedNetworks := map[string]int{}
+		for _, e := range logs.matching("mcpauth: authorize refused", "outcome", "pending_request_cap") {
+			if e["client_id"] != client.ClientId {
+				continue
+			}
+			network, _ := e["client_address"].(string)
+			loggedNetworks[network]++
+		}
+		if fmt.Sprint(loggedNetworks) != fmt.Sprint(refusedNetworks) {
+			t.Fatalf("pending-cap refusals logged per network = %v, want exactly one per refused request's network, %v", loggedNetworks, refusedNetworks)
+		}
+		var pending int
+		if err := braked.pool.QueryRow(ctx, `
+			SELECT count(*) FROM mcp_oauth_authorization_requests r JOIN mcp_oauth_clients c ON c.id = r.client_id
+			WHERE c.client_id = $1 AND r.consumed_at IS NULL AND r.expires_at > now()`, client.ClientId).Scan(&pending); err != nil || pending != maxPending {
+			t.Fatalf("pending requests after the flood = %d (err %v), want exactly %d", pending, err, maxPending)
+		}
+	})
+
+	// What the official SDK client does with the token endpoint's 429 --
+	// on a router of its own, since it spends the loopback network's whole
+	// token budget: a refresh refused by the brake fails that one call and
+	// nothing else. The client keeps its refresh token (temporarily_unavailable
+	// is not invalid_grant, the one error it drops its tokens for), is never
+	// sent back to consent, and the token it kept is unspent: it still
+	// refreshes.
+	t.Run("RateLimit_RefusedRefreshSpendsNothing_SDK", func(t *testing.T) {
+		ctx := oauthTestCtx(t)
+		own := newOAuthRouterRigWith(t, pool, nil, cimdfetch.GuardConfig{}, nil)
+		flow := own.connectSDKClient(ctx, t, nil)
+		if res, err := callListModels(ctx, flow.session); err != nil || res.IsError {
+			t.Fatalf("call before the brake: res %+v err %v", res, err)
+		}
+		held := flow.clock.current().RefreshToken
+		lapsed := flow.recorder.lastBearer()
+		// The code exchange spent one of loopback's token requests; spend
+		// the rest.
+		junk := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {"narvi_mcp_rt_junk"}, "client_id": {"narvi_mcp_c_unknown"}}
+		for i := range own.cfg.Timeouts.MCPTokenEndpointRateBurst - 1 {
+			if rec := own.tokenFrom(t, "127.0.0.1:4000", "", junk); rec.Code != http.StatusBadRequest {
+				t.Fatalf("loopback token request %d: status %d, want the handler's own 400", i+2, rec.Code)
+			}
+		}
+		tag, err := own.pool.Exec(ctx, `UPDATE mcp_oauth_access_tokens SET expires_at = now() - interval '1 second' WHERE token_hash = $1`, platform.HashToken(lapsed))
+		if err != nil || tag.RowsAffected() != 1 {
+			t.Fatalf("expire the access token on the server: rows %d err %v", tag.RowsAffected(), err)
+		}
+		flow.clock.expire()
+		before := len(flow.recorder.snapshot())
+		_, err = callListModels(ctx, flow.session)
+		if err == nil || !strings.Contains(err.Error(), "temporarily_unavailable") {
+			t.Fatalf("the SDK client's call with its refresh braked: err %v, want the token endpoint's temporarily_unavailable", err)
+		}
+		if seen := flow.recorder.snapshot()[before:]; len(seen) != 0 {
+			t.Fatalf("/mcp exchanges after the braked refresh = %+v, want none: the SDK sends no request it holds no valid token for", seen)
+		}
+		if n := flow.driver.calls.Load(); n != 1 {
+			t.Fatalf("consent flow ran %d times, want 1: a braked refresh never sends the user back to consent", n)
+		}
+		if flow.clock.current().RefreshToken != held {
+			t.Fatal("the SDK client lost the refresh token it held")
+		}
+		rec := own.tokenFrom(t, "198.51.100.91:4000", "", url.Values{"grant_type": {"refresh_token"}, "refresh_token": {held}, "client_id": {flow.client.ClientId}})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("the refresh token the SDK kept, from another network: status %d body %s, want 200 -- the braked refresh spent nothing", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+// tokenFrom posts form to /oauth/token as the peer remote -- in process,
+// so the address the brake keys on is chosen -- with an X-Forwarded-For of
+// forwarded when non-empty.
+func (r *oauthRouterRig) tokenFrom(t *testing.T, remote, forwarded string, form url.Values) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader(form.Encode()))
+	req.RemoteAddr = remote
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if forwarded != "" {
+		req.Header.Set("X-Forwarded-For", forwarded)
+	}
+	rec := httptest.NewRecorder()
+	r.server.Config.Handler.ServeHTTP(rec, req)
+	return rec
+}
+
+// authorizeFrom GETs /oauth/authorize with query q as the peer remote, in
+// process and signed out.
+func (r *oauthRouterRig) authorizeFrom(t *testing.T, remote string, q url.Values) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil)
+	req.RemoteAddr = remote
+	rec := httptest.NewRecorder()
+	r.server.Config.Handler.ServeHTTP(rec, req)
+	return rec
+}
+
+// assertRetryAfterPinsInterval proves, from a brake's refusal alone, the
+// refill interval the production router built that brake with. The
+// limiter's delay is the interval less the time since the network's bucket
+// began its burst, rounded up to whole seconds and never below one
+// (mcpauth's setRetryAfter). elapsed bounds that time from above --
+// measured from before the burst's first request to after the refusal --
+// so Retry-After lies between ceil(interval - elapsed) and ceil(interval):
+// exactly the interval in seconds whenever the burst and the refusal took
+// under a second, as they do here, so a brake wired with any other
+// interval -- the 12-minute registration one on the token endpoint, the
+// token endpoint's 2 seconds on the authorization endpoint -- fails. A
+// slower run only widens the lower bound by the time it took; nothing here
+// sleeps or depends on a clock seam.
+func assertRetryAfterPinsInterval(t *testing.T, what, retryAfter string, interval, elapsed time.Duration) {
+	t.Helper()
+	ceilSeconds := func(d time.Duration) int { return int(math.Ceil(d.Seconds())) }
+	highest := ceilSeconds(interval)
+	lowest := max(1, ceilSeconds(interval-elapsed))
+	if got, err := strconv.Atoi(retryAfter); err != nil || got < lowest || got > highest {
+		t.Fatalf("%s: Retry-After %q, want between %d and %d seconds: the brake's %s refill interval, less the %s its burst and this refusal took", what, retryAfter, lowest, highest, interval, elapsed)
+	}
+}
+
+// registerClientAsAdmin pre-registers a client named name, redirecting to
+// loopback, through the admin route.
+func (r *oauthRouterRig) registerClientAsAdmin(t *testing.T, adminCookie, name string) restdtos.MCPClient {
+	t.Helper()
+	var client restdtos.MCPClient
+	body := []byte(`{"clientName":"` + name + `","redirectUris":["http://127.0.0.1/callback"]}`)
+	if status := r.doJSON(t, http.MethodPost, "/api/mcp-clients", body, &client, adminCookie); status != http.StatusCreated {
+		t.Fatalf("register client: status %d", status)
+	}
+	return client
 }
 
 // withEnv is base plus the name/value pairs kv, in a new map.

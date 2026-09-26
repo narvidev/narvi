@@ -135,9 +135,11 @@ export const chatgptLinkQueryKeys = {
   status: () => ['chatgpt-link', 'status'] as const,
 }
 
-// mcpAuthorizationQueryKeys (technical plan §43.18) -- the Integrations screen's own "Connected apps" list, scoped to the current caller like chatgptLinkQueryKeys above (there is no admin view of another member's authorizations in this piece).
+// mcpAuthorizationQueryKeys (technical plan §43.18) -- the Integrations screen's own "Connected apps" list, scoped to the current caller like chatgptLinkQueryKeys above (mine), and the Members & access screen's per-member "Connected apps" drawer, an admin's view of one member's (member). all() is the prefix both share, so a change that can touch any user's list -- deleting a client, revoking on a member's behalf -- invalidates every cached one at once.
 export const mcpAuthorizationQueryKeys = {
+  all: () => ['mcp-authorizations'] as const,
   mine: () => ['mcp-authorizations', 'mine'] as const,
+  member: (userId: string) => ['mcp-authorizations', 'member', userId] as const,
 }
 
 // mcpClientQueryKeys (technical plan §43.15) -- the admin-only registered MCP clients list, deployment-wide like integrationQueryKeys above.

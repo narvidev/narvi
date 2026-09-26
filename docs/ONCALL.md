@@ -1,14 +1,14 @@
 # On-call entry point
 
 Start here. This page tells you how to figure out what's broken, which of
-the seven existing runbooks to open, and what to do when none of them
+the eight existing runbooks to open, and what to do when none of them
 fit. It does not duplicate any runbook's own content — every link below
 goes to the single source of truth for that procedure.
 
 ## 1. Is the control plane even up?
 
 `GET /health` — a non-`200` (or no response at all) means this is an infrastructure/
-deploy problem, not one of the seven failure modes below — check the
+deploy problem, not one of the failure modes below — check the
 deployment platform's own status (pod restarts, recent deploys, resource
 limits) before looking at anything else on this page. A `200` here only
 proves the process is up and can reach Postgres (`healthHandler` pings
@@ -44,10 +44,30 @@ open it directly — every alert this system can raise is a row there,
 next to the runbook that backs it and, where one exists, the §9.3
 resilience scenario that reproduces it.
 
-**The one entry in that table with no alert behind it** (nothing pages
-for it — it is a routine admin procedure, not a failure mode) is signing-
-key rotation, and it covers only ONE of the two kinds of signing key this
-system has:
+**Three entries in that table have no alert behind them** (nothing pages
+for any of them). Two are routine admin procedures, not failure modes:
+cutting off an MCP client and signing-key rotation, both below. The third
+is a failure mode that no metric reports yet: **sandbox capability
+refusals** — a session refused `422` because its `docker` or egress-policy
+requirement is one the configured provider cannot honor, or a sandbox
+refused at every dispatch and never spawning. Nothing pages for it; it is
+found only through the symptom someone reports. See
+[sandbox-capability-refusals.md](runbooks/sandbox-capability-refusals.md).
+
+**Cutting off an MCP client** — an editor plugin or assistant connected
+through Narvi's own OAuth authorization server that must stop acting for
+the users who approved it: see
+[mcp-client-cutoff.md](runbooks/mcp-client-cutoff.md) for revoking one
+user's authorization, deleting or disabling a client (which one keeps an
+app out depends on how it registered: a client identified by a metadata
+document must be disabled, never deleted, and an app that registered
+itself is kept out only by switching dynamic registration off),
+pausing a registration mechanism, revoking every authorization, and what
+each does on the client's next call — and for an app whose users are
+refused "too many sign-ins waiting" or "too many requests".
+
+**Signing-key rotation** covers only ONE of the two kinds of signing key
+this system has:
 
 - **Cloud-identity OIDC signing key** (Step 73a, §27.3 — `POST
   /api/cloud-identity/signing-keys/rotate`, a database-backed asymmetric
@@ -77,7 +97,7 @@ value is actually a problem before a formal alert fires.
 
 ## 4. A cohort-rollout incident (repo refusing, or refusing to STOP)
 
-This is the one class of incident that is not one of the seven runbooks
+This is the one class of incident that is not one of the eight runbooks
 above, and it is not duplicated here either — the full operator
 procedure (enroll, arm/disarm cohort mode, roll back one repo or
 platform-wide, and — critically — how to verify a rollback actually took
@@ -105,7 +125,7 @@ just because one already-running turn is still going.
 
 ## 5. When none of the above fits
 
-The seven runbooks and §32.9 above cover every failure mode this system
+The eight runbooks and §32.9 above cover every failure mode this system
 is currently known to have a real signal for. If your symptom genuinely
 matches none of them:
 

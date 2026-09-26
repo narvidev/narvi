@@ -263,9 +263,10 @@ func sweepCutoff() time.Time {
 //     behind it, and spares the client once the insert commits. A client
 //     whose consent is in flight is never a sweep candidate at all. On the
 //     pool-built store production uses, the sweep's two statements are
-//     one transaction: an insert under a candidate that comes between
-//     them waits for the sweep, then fails its foreign-key check -- it
-//     never commits under a client the second statement then deletes.
+//     one transaction: an authorization or a grant under a candidate that
+//     comes between them waits for the sweep, then finds the client gone
+//     -- it never commits under a client the second statement then
+//     deletes.
 //   - A dynamic registration inserts a new row and queues behind nothing,
 //     and nothing -- a client deletion, a failed re-fetch -- queues behind
 //     it.
@@ -287,11 +288,13 @@ func TestLockOrder_ClientRegistrationWriters(t *testing.T) {
 		{"ExchangeHoldsClient_MetadataRefetchProceeds", codeExchange, true, "", false},
 		{"RefreshHoldsClient_MetadataRefetchProceeds", refreshExchange, true, "", false},
 		{"GrantRevocationHoldsClient_MetadataRefetchProceeds", refreshExchange, false, grantRevocation, false},
+		{"AdminRevocationHoldsClient_MetadataRefetchProceeds", refreshExchange, false, adminRevocation, false},
 		{"TokenRevocationHoldsClient_MetadataRefetchProceeds", refreshExchange, false, tokenRevocation, false},
 		{"MetadataRefetchHoldsClient_ConsentProceeds", consentApproval, true, "", true},
 		{"MetadataRefetchHoldsClient_ExchangeProceeds", codeExchange, true, "", true},
 		{"MetadataRefetchHoldsClient_RefreshProceeds", refreshExchange, true, "", true},
 		{"MetadataRefetchHoldsClient_GrantRevocationProceeds", refreshExchange, false, grantRevocation, true},
+		{"MetadataRefetchHoldsClient_AdminRevocationProceeds", refreshExchange, false, adminRevocation, true},
 		{"MetadataRefetchHoldsClient_TokenRevocationProceeds", refreshExchange, false, tokenRevocation, true},
 	} {
 		for _, failing := range []bool{false, true} {
@@ -754,12 +757,14 @@ func TestLockOrder_ClientRegistrationWriters(t *testing.T) {
 		}
 	})
 
-	// The other order of the pair below: an authorization request -- or a
-	// grant -- inserted under an unused client holds that client FOR KEY
-	// SHARE (its foreign-key check) when the sweep reaches it. The sweep
-	// queues on the client row behind the insert alone, then, the insert
-	// committed, looks again under the client's lock and spares it: the
-	// row just committed keeps its client, never cascaded away.
+	// The other order of the pair below: an authorization's own
+	// transaction holds an unused client FOR NO KEY UPDATE (the lock it
+	// counts the client's pending requests under, then inserts one), or a
+	// grant's insert holds it FOR KEY SHARE (its foreign-key check), when
+	// the sweep reaches it. The sweep queues on the client row behind that
+	// transaction alone, then, the insert committed, looks again under the
+	// client's lock and spares it: the row just committed keeps its client,
+	// never cascaded away.
 	for _, tc := range []struct {
 		name     string
 		kind     sqlcgen.McpOauthClientKind
@@ -786,10 +791,10 @@ func TestLockOrder_ClientRegistrationWriters(t *testing.T) {
 						UserID: user.ID, ClientID: old.ID, Scopes: []string{"mcp:read"}, Resource: r.server.Identifiers().Resource, ExpiresAt: expires,
 					})
 				} else {
-					_, err = r.grants.WithTx(tx).CreateAuthorizationRequest(ctx, sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
+					_, err = r.grants.WithTx(tx).CreatePendingAuthorizationRequest(ctx, sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
 						ClientID: old.ID, RedirectUri: loopbackRedirect, CodeChallenge: "c", CodeChallengeMethod: "S256",
 						Resource: r.server.Identifiers().Resource, ExpiresAt: expires,
-					})
+					}, platform.DefaultTimeouts().MCPMaxPendingAuthorizationRequestsPerClient)
 				}
 				if err != nil {
 					t.Fatalf("held insert: %v", err)
@@ -838,9 +843,11 @@ func TestLockOrder_ClientRegistrationWriters(t *testing.T) {
 	// re-checking DELETE are one transaction, so its candidates stay
 	// locked FOR UPDATE from the first statement until it commits. An
 	// authorization request or grant inserted BETWEEN the two statements
-	// therefore waits on the client row behind the sweep, then fails its
-	// foreign-key check -- never commits under a client the DELETE goes on
-	// to remove, which would cascade the committed row away (round-1 C14).
+	// therefore waits on the client row behind the sweep, then finds the
+	// client gone -- the authorization's own lock finds no row
+	// (pgx.ErrNoRows), and the grant's insert fails its foreign-key check --
+	// and never commits under a client the DELETE goes on to remove, which
+	// would cascade the committed row away (round-1 C14).
 	// A test-held SHARE lock on mcp_oauth_clients stops the sweep exactly
 	// there: it lets the lock statement's ROW SHARE through and holds the
 	// DELETE's ROW EXCLUSIVE back.
@@ -865,10 +872,10 @@ func TestLockOrder_ClientRegistrationWriters(t *testing.T) {
 					})
 					return err
 				}
-				_, err := r.grants.WithTx(tx).CreateAuthorizationRequest(ctx, sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
+				_, err := r.grants.WithTx(tx).CreatePendingAuthorizationRequest(ctx, sqlcgen.CreateMCPOAuthAuthorizationRequestParams{
 					ClientID: old.ID, RedirectUri: loopbackRedirect, CodeChallenge: "c", CodeChallengeMethod: "S256",
 					Resource: r.server.Identifiers().Resource, ExpiresAt: expires,
-				})
+				}, platform.DefaultTimeouts().MCPMaxPendingAuthorizationRequestsPerClient)
 				return err
 			}
 			rowsUnder := func() int {
@@ -941,8 +948,11 @@ func TestLockOrder_ClientRegistrationWriters(t *testing.T) {
 				t.Errorf("a handler failed:\n%s", log)
 			}
 			var pgErr *pgconn.PgError
-			if !errors.As(insertErr, &pgErr) || pgErr.Code != "23503" {
-				t.Fatalf("insert behind the sweep = %v, want a foreign-key violation (23503): the client it names is gone", insertErr)
+			if tc.grant && (!errors.As(insertErr, &pgErr) || pgErr.Code != "23503") {
+				t.Fatalf("grant insert behind the sweep = %v, want a foreign-key violation (23503): the client it names is gone", insertErr)
+			}
+			if !tc.grant && !errors.Is(insertErr, pgx.ErrNoRows) {
+				t.Fatalf("authorization behind the sweep = %v, want pgx.ErrNoRows: its lock finds the client gone", insertErr)
 			}
 			if _, found := r.clientRow(t, old.ClientID); swept != 1 || found {
 				t.Fatalf("the sweep deleted %d clients (candidate still found: %v), want its one candidate", swept, found)

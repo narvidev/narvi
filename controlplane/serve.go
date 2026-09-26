@@ -1783,12 +1783,27 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// itself renders the REAL admin-only §13.3 verdict via
 	// domain/authz.Authorize. The actual Settings -> Members UI is Phase 7
 	// and out of scope here -- see httpapi/members.go's own doc comment.
+	//
+	// The admin view of a member's MCP authorizations (technical plan
+	// §43.18) lives here too, gated by the same admin-only
+	// authz.ActionManageMembers: list them, and revoke one on the member's
+	// behalf -- the grant must be that member's (404 otherwise), and its
+	// deletion stops every token under it on the next call. Like the
+	// member's own Settings routes below, deliberately NOT behind
+	// mcpadapter.RequireEnabled: an operator who turns the MCP surface off
+	// can still see and revoke what it issued. The MCP authorization
+	// server's stores are built here for it, and shared with that server
+	// below.
+	mcpOAuthClientStore := postgres.NewMCPOAuthClientStore(pool)
+	mcpOAuthGrantStore := postgres.NewMCPOAuthGrantStore(pool)
 	router.Route("/api/members", func(r chi.Router) {
 		r.Use(auth.Middleware(userSessionStore, userStore))
 		r.Get("/", httpapi.ListMembers(userStore, identityStore, identityLinkPromptStore))
 		r.Patch("/{userID}/role", httpapi.UpdateMemberRole(pool, userStore, identityStore, auditLogStore))
 		r.Post("/{userID}/identities", httpapi.LinkMemberIdentity(pool, userStore, identityStore, auditLogStore))
 		r.Delete("/{userID}/identities/{identityID}", httpapi.UnlinkMemberIdentity(pool, identityStore, auditLogStore))
+		r.Get("/{userID}/mcp-authorizations", httpapi.ListMemberMCPAuthorizations(userStore, mcpOAuthGrantStore))
+		r.Delete("/{userID}/mcp-authorizations/{authorizationID}", httpapi.RevokeMemberMCPAuthorization(pool, mcpOAuthGrantStore, mcpOAuthClientStore, auditLogStore))
 	})
 
 	// /api/integrations (§12.5's own "integrations read model & routes"
@@ -2617,8 +2632,10 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// client -- the dial-time SSRF guard is the one way that adapter can be
 	// built (cimdfetch.NewGuardedClient, the same capability-token shape as
 	// githubapi.NewGatedClient above), never http.DefaultClient.
-	mcpOAuthClientStore := postgres.NewMCPOAuthClientStore(pool)
-	mcpOAuthGrantStore := postgres.NewMCPOAuthGrantStore(pool)
+	//
+	// Its two stores (mcpOAuthClientStore, mcpOAuthGrantStore) are built
+	// above, with the members API, whose admin view of a member's MCP
+	// authorizations reads and revokes through the same ones.
 	mcpAdvertisedScopes := mcpadapter.AdvertisedScopes()
 	mcpClientMechanisms := mcpclient.Mechanisms{MetadataDocuments: cfg.MCPCIMDEnabled, DynamicRegistration: cfg.MCPDCREnabled}
 	mcpMetadataFetcher := cimdfetch.New(cimdfetch.NewGuardedClient(cimdFetchGuard), cfg.Timeouts.MCPClientMetadataFetchTimeout)
@@ -2651,10 +2668,23 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	})
 	router.Route("/oauth", func(r chi.Router) {
 		r.Use(mcpadapter.RequireEnabled(cfg.MCPEnabled))
-		r.Get("/authorize", mcpAuthServer.Authorize)
+		// The authorization and token endpoints are braked per client
+		// network (§43.14) -- RemoteAddr only, never a forwarded header,
+		// each route with its own bucket table -- after the enabled-gate (a
+		// surface that is off spends no bucket) and before the handler, so
+		// a refused request reads nothing and spends nothing: the
+		// authorization endpoint answers its error page, never a redirect
+		// to a redirect_uri nobody has validated yet, and the token
+		// endpoint temporarily_unavailable, which leaves a client its
+		// refresh token. One network's flood never touches another's bucket.
+		r.With(
+			mcpauth.NewRateLimiter(cfg.Timeouts.MCPAuthorizeRateInterval, cfg.Timeouts.MCPAuthorizeRateBurst).Limit(mcpAuthServer.AuthorizeRateLimited),
+		).Get("/authorize", mcpAuthServer.Authorize)
 		r.Get("/consent", mcpAuthServer.ConsentPage)
 		r.Post("/consent", mcpAuthServer.ConsentDecision)
-		r.Post("/token", mcpAuthServer.Token)
+		r.With(
+			mcpauth.NewRateLimiter(cfg.Timeouts.MCPTokenEndpointRateInterval, cfg.Timeouts.MCPTokenEndpointRateBurst).Limit(mcpauth.TokenRateLimited),
+		).Post("/token", mcpAuthServer.Token)
 		r.Post("/revoke", mcpAuthServer.Revoke)
 		// RFC 7591 dynamic client registration (§43.15): mounted
 		// unconditionally like every route here, and answering the same
@@ -2725,11 +2755,13 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// /api/me/mcp-authorizations, /api/mcp-clients (technical plan
 	// §43.15/§43.18): Settings' own view of the MCP authorization server --
 	// a user's own connected clients (list, revoke) and the admin-only
-	// pre-registration of clients. Ordinary cookie-authenticated /api
-	// groups, each handler rendering its own authz verdict. Deliberately
-	// NOT behind mcpadapter.RequireEnabled: an operator who turns the
-	// surface off must still be able to see and revoke every
-	// authorization it issued, and to remove a client.
+	// pre-registration, deletion, disabling and enabling of clients (a
+	// client of any kind may be disabled: the durable block a deletion is
+	// not for a client that can come back). Ordinary cookie-authenticated
+	// /api groups, each handler rendering its own authz verdict.
+	// Deliberately NOT behind mcpadapter.RequireEnabled: an operator who
+	// turns the surface off must still be able to see and revoke every
+	// authorization it issued, and to remove or disable a client.
 	router.Route("/api/me/mcp-authorizations", func(r chi.Router) {
 		r.Use(auth.Middleware(userSessionStore, userStore))
 		r.Get("/", httpapi.ListMyMCPAuthorizations(mcpOAuthGrantStore))
@@ -2740,6 +2772,8 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		r.Get("/", httpapi.ListMCPClients(mcpOAuthClientStore))
 		r.Post("/", httpapi.CreateMCPClient(pool, mcpOAuthClientStore, auditLogStore))
 		r.Delete("/{clientID}", httpapi.DeleteMCPClient(pool, mcpOAuthClientStore, mcpOAuthGrantStore, auditLogStore))
+		r.Post("/{clientID}/disable", httpapi.DisableMCPClient(pool, mcpOAuthClientStore, auditLogStore))
+		r.Post("/{clientID}/enable", httpapi.EnableMCPClient(pool, mcpOAuthClientStore, auditLogStore))
 	})
 
 	// Module routes (docs/design/boundaries-design.md, section 3.2): mounted

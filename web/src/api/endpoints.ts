@@ -432,6 +432,16 @@ export function revokeMyMCPAuthorization(authorizationId: string, signal?: Abort
   return request<undefined>(`/api/me/mcp-authorizations/${encodeURIComponent(authorizationId)}`, { method: 'DELETE', signal })
 }
 
+/** listMemberMCPAuthorizations calls GET /api/members/:userId/mcp-authorizations -- one member's connected MCP clients, exactly what that member sees of their own (admin only, authz.ActionManageMembers; 403 otherwise, 404 for an unknown member). Never a token: none exists in plaintext. */
+export function listMemberMCPAuthorizations(userId: string, signal?: AbortSignal): Promise<ListMCPAuthorizationsResponse> {
+  return request<ListMCPAuthorizationsResponse>(`/api/members/${encodeURIComponent(userId)}/mcp-authorizations`, { signal })
+}
+
+/** revokeMemberMCPAuthorization calls DELETE /api/members/:userId/mcp-authorizations/:id -- an administrator revokes one of the member's authorizations on the member's behalf; the client's very next /mcp call is refused. Admin only; 404 for an id that is not that member's own. Audited server-side (reason admin). */
+export function revokeMemberMCPAuthorization(userId: string, authorizationId: string, signal?: AbortSignal): Promise<undefined> {
+  return request<undefined>(`/api/members/${encodeURIComponent(userId)}/mcp-authorizations/${encodeURIComponent(authorizationId)}`, { method: 'DELETE', signal })
+}
+
 /** listMCPClients calls GET /api/mcp-clients -- every registered MCP client (admin only, authz.ActionManageIntegrations; 403 otherwise). */
 export function listMCPClients(signal?: AbortSignal): Promise<ListMCPClientsResponse> {
   return request<ListMCPClientsResponse>('/api/mcp-clients', { signal })
@@ -445,6 +455,16 @@ export function createMCPClient(body: CreateMCPClientRequest, signal?: AbortSign
 /** deleteMCPClient calls DELETE /api/mcp-clients/:id -- removes the client and every authorization issued to it (admin only). */
 export function deleteMCPClient(clientId: string, signal?: AbortSignal): Promise<undefined> {
   return request<undefined>(`/api/mcp-clients/${encodeURIComponent(clientId)}`, { method: 'DELETE', signal })
+}
+
+/** disableMCPClient calls POST /api/mcp-clients/:id/disable -- refuses the client wherever a client acts from its next request, deleting nothing (admin only; 409 when it is already disabled). Answers the client as it now stands. */
+export function disableMCPClient(clientId: string, signal?: AbortSignal): Promise<MCPClient> {
+  return request<MCPClient>(`/api/mcp-clients/${encodeURIComponent(clientId)}/disable`, { method: 'POST', signal })
+}
+
+/** enableMCPClient calls POST /api/mcp-clients/:id/enable -- undoes disableMCPClient; the client carries on with whatever it still holds (admin only; 409 when it is not disabled). */
+export function enableMCPClient(clientId: string, signal?: AbortSignal): Promise<MCPClient> {
+  return request<MCPClient>(`/api/mcp-clients/${encodeURIComponent(clientId)}/enable`, { method: 'POST', signal })
 }
 
 // -- environments (§14.1) --

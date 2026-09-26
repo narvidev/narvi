@@ -47,9 +47,10 @@ const (
 // controlplane/serve.go mounts it (no cookie middleware on any /oauth
 // route), plus a /mcp stand-in behind the real auth.RequireMCPBearer so a
 // test can ask "does this token still work" -- and, through the scopes
-// the stand-in echoes back, "what may it see" -- and the two Settings
-// revocation routes, the real httpapi handlers behind the real cookie
-// middleware, so a test can race a revocation against an issuance.
+// the stand-in echoes back, "what may it see" -- and the three Settings
+// revocation routes (a user's own, an administrator's on a member's
+// behalf, a client's deletion), the real httpapi handlers behind the real
+// cookie middleware, so a test can race a revocation against an issuance.
 // controlplane's own TestOAuth_ProductionRouter proves the production
 // wiring itself.
 type asRig struct {
@@ -146,14 +147,16 @@ func (r *asRig) build(t *testing.T, opts rigOptions) {
 	router.Route("/.well-known/oauth-authorization-server", func(rt chi.Router) {
 		rt.Get("/oauth", r.server.AuthorizationServerMetadata)
 	})
+	// Mounted without controlplane's enabled-gate and its per-network
+	// brakes (on /authorize, /token and /register): TestOAuth_ProductionRouter
+	// proves both on the production router, and this package's tests race
+	// requests with no brake in the way.
 	router.Route("/oauth", func(rt chi.Router) {
 		rt.Get("/authorize", r.server.Authorize)
 		rt.Get("/consent", r.server.ConsentPage)
 		rt.Post("/consent", r.server.ConsentDecision)
 		rt.Post("/token", r.server.Token)
 		rt.Post("/revoke", r.server.Revoke)
-		// Mounted without controlplane's enabled-gate and rate limit:
-		// TestOAuth_ProductionRouter proves both on the production router.
 		rt.Post("/register", r.server.Register)
 	})
 	router.Route("/mcp", func(rt chi.Router) {
@@ -175,6 +178,11 @@ func (r *asRig) build(t *testing.T, opts rigOptions) {
 	})
 	// Mounted exactly like controlplane/serve.go (technical plan
 	// §43.15/§43.18).
+	router.Route("/api/members", func(rt chi.Router) {
+		rt.Use(auth.Middleware(r.userSessions, r.users))
+		rt.Get("/{userID}/mcp-authorizations", httpapi.ListMemberMCPAuthorizations(r.users, r.grants))
+		rt.Delete("/{userID}/mcp-authorizations/{authorizationID}", httpapi.RevokeMemberMCPAuthorization(pool, r.grants, r.clients, r.auditLog))
+	})
 	router.Route("/api/me/mcp-authorizations", func(rt chi.Router) {
 		rt.Use(auth.Middleware(r.userSessions, r.users))
 		rt.Delete("/{authorizationID}", httpapi.RevokeMyMCPAuthorization(pool, r.grants, r.clients, r.auditLog))

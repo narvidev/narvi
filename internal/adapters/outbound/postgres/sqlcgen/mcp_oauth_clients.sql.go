@@ -117,6 +117,78 @@ func (q *Queries) DeleteUnusedMCPOAuthClients(ctx context.Context, arg DeleteUnu
 	return result.RowsAffected(), nil
 }
 
+const disableMCPOAuthClient = `-- name: DisableMCPOAuthClient :one
+UPDATE mcp_oauth_clients
+SET disabled_at = now()
+WHERE id = $1 AND disabled_at IS NULL
+RETURNING id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at, metadata_fetched_at, metadata_stale_at, metadata_refetch_failed_at
+`
+
+// DisableMCPOAuthClient and EnableMCPOAuthClient back an administrator's
+// POST /api/mcp-clients/{clientID}/disable and /enable (technical plan
+// §43.15). A disabled client is refused wherever a client acts -- the
+// authorization endpoint, both consent routes, the token endpoint by code
+// and by refresh, every /mcp call -- from its next request, and may still
+// give its tokens back; nothing under it is deleted. Its row is the durable
+// block: the unused-client sweep never deletes a disabled client, and a
+// disabled metadata-document client's document is never fetched again, so
+// the next authorization naming its URL finds it, still disabled. Enabling
+// lets it carry on with whatever it still holds.
+//
+// Each is ONE statement taking ONE row lock -- the client, FOR NO KEY
+// UPDATE (disabled_at is no key column) -- like the metadata document's
+// upsert (the lock order at the top of mcpoauthgrant_store.go): it
+// conflicts with an authorization storing a request, the upsert, a failed
+// re-fetch's record, a deletion and the sweep, never with the FOR KEY SHARE
+// an issuance or a grant revocation takes. pgx.ErrNoRows means no such
+// client, or one already in the state asked for.
+func (q *Queries) DisableMCPOAuthClient(ctx context.Context, id pgtype.UUID) (McpOauthClient, error) {
+	row := q.db.QueryRow(ctx, disableMCPOAuthClient, id)
+	var i McpOauthClient
+	err := row.Scan(
+		&i.ID,
+		&i.ClientID,
+		&i.Kind,
+		&i.ClientName,
+		&i.ClientUri,
+		&i.RedirectUris,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.DisabledAt,
+		&i.MetadataFetchedAt,
+		&i.MetadataStaleAt,
+		&i.MetadataRefetchFailedAt,
+	)
+	return i, err
+}
+
+const enableMCPOAuthClient = `-- name: EnableMCPOAuthClient :one
+UPDATE mcp_oauth_clients
+SET disabled_at = NULL
+WHERE id = $1 AND disabled_at IS NOT NULL
+RETURNING id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at, metadata_fetched_at, metadata_stale_at, metadata_refetch_failed_at
+`
+
+func (q *Queries) EnableMCPOAuthClient(ctx context.Context, id pgtype.UUID) (McpOauthClient, error) {
+	row := q.db.QueryRow(ctx, enableMCPOAuthClient, id)
+	var i McpOauthClient
+	err := row.Scan(
+		&i.ID,
+		&i.ClientID,
+		&i.Kind,
+		&i.ClientName,
+		&i.ClientUri,
+		&i.RedirectUris,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.DisabledAt,
+		&i.MetadataFetchedAt,
+		&i.MetadataStaleAt,
+		&i.MetadataRefetchFailedAt,
+	)
+	return i, err
+}
+
 const getMCPOAuthClientByClientID = `-- name: GetMCPOAuthClientByClientID :one
 SELECT id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at, metadata_fetched_at, metadata_stale_at, metadata_refetch_failed_at FROM mcp_oauth_clients
 WHERE client_id = $1
@@ -240,6 +312,30 @@ func (q *Queries) LockMCPOAuthClient(ctx context.Context, id pgtype.UUID) (McpOa
 		&i.MetadataRefetchFailedAt,
 	)
 	return i, err
+}
+
+const lockMCPOAuthClientForNewRequest = `-- name: LockMCPOAuthClientForNewRequest :one
+SELECT id FROM mcp_oauth_clients
+WHERE id = $1
+FOR NO KEY UPDATE
+`
+
+// LockMCPOAuthClientForNewRequest takes the client row's FOR NO KEY UPDATE
+// lock for the rest of the transaction: what GET /oauth/authorize takes
+// before it counts the client's pending authorization requests and
+// inserts one more (technical plan §43.14's pending-request cap), so two
+// authorizations of one client count and insert one after the other and
+// the cap is never exceeded. It conflicts with another authorization's,
+// with a metadata document's upsert or failed re-fetch record (each an
+// UPDATE of the row) and with the client's deletion (FOR UPDATE), never
+// with the FOR KEY SHARE every issuance and grant revocation takes: a
+// consent, a code exchange or a refresh never waits for an authorization
+// of its client, nor it for them. pgx.ErrNoRows means the client is gone.
+func (q *Queries) LockMCPOAuthClientForNewRequest(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, lockMCPOAuthClientForNewRequest, id)
+	var id_2 pgtype.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
 }
 
 const lockMCPOAuthClientKeyShare = `-- name: LockMCPOAuthClientKeyShare :one
