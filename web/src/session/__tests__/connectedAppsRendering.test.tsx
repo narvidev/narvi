@@ -6,14 +6,14 @@
 // plainly that it sees nothing, and both destructive actions (revoke,
 // delete) must never be a single bare click. Mirrors
 // integrationsRendering.test.tsx's own pattern: assert on specific visible
-// text, never the whole rendered HTML.
-import { afterEach, describe, expect, it, vi } from 'vitest'
+// text, never the whole rendered HTML. What the admin drawer SENDS -- its
+// own queryFn and mutationFn -- is connectedAppsWiring.test.tsx's.
+import { describe, expect, it } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import type { MCPAuthorization, MCPClient, Member } from '@narvi/contracts/rest-dtos'
 
-import { listMemberMCPAuthorizations, revokeMemberMCPAuthorization } from '../../api/endpoints'
 import { mcpAuthorizationQueryKeys } from '../../api/queryKeys'
 import { ConnectedAppRow, ConnectedAppsTable, MCPClientRow, MemberConnectedApps } from '../ConnectedAppsSection'
 
@@ -177,30 +177,11 @@ function baseMember(overrides: Partial<Member> = {}): Member {
   }
 }
 
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
-}
-
 describe('MemberConnectedApps -- an admin\'s view of a member\'s connected apps', () => {
-  afterEach(() => {
-    vi.unstubAllGlobals()
-  })
-
-  it('lists the member\'s authorizations from the admin route, and revokes through it, the ids escaped into the path', async () => {
+  it('renders the list cached under the member\'s own key -- the app, who vouches for it, no token -- with Revoke behind a confirmation', () => {
     const member = baseMember()
-    const fetchSpy = vi.fn(async (_url: string, init?: RequestInit) => {
-      if (init?.method === 'DELETE') return new Response(null, { status: 204 })
-      return jsonResponse({ authorizations: [baseAuthorization()] })
-    })
-    vi.stubGlobal('fetch', fetchSpy)
-
     const queryClient = new QueryClient()
-    await queryClient.fetchQuery({ queryKey: mcpAuthorizationQueryKeys.member(member.id), queryFn: () => listMemberMCPAuthorizations(member.id) })
-    await revokeMemberMCPAuthorization(member.id, 'auth/2')
-    const [listCall, revokeCall] = fetchSpy.mock.calls
-    expect(String(listCall[0])).toContain('/api/members/user%2F1%3Fx/mcp-authorizations')
-    expect(String(revokeCall[0])).toContain('/api/members/user%2F1%3Fx/mcp-authorizations/auth%2F2')
-    expect((revokeCall[1] as RequestInit).method).toBe('DELETE')
+    queryClient.setQueryData(mcpAuthorizationQueryKeys.member(member.id), { authorizations: [baseAuthorization()] })
 
     const html = renderToStaticMarkup(
       <QueryClientProvider client={queryClient}>
