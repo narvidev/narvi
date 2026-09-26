@@ -7115,8 +7115,8 @@ authorization specification recommends, and the one a client with no prior relat
 URL. The URL must be printable ASCII with its host written in plain ASCII — no percent sign in the
 authority, the parsed host exactly the bytes written — so an internationalized host is only ever seen,
 and shown, in its `xn--` form, the very string the fetch resolves: Go's URL parser decodes a
-percent-encoded byte of `0x80` or above in a host, so `https://%D0%B0pple.example/` would otherwise be
-shown as a Cyrillic look-alike of a Latin host while the fetch dialled `xn--pple-43d.example`. It has a
+percent-encoded byte of `0x80` or above in a host, so `https://%D0%B0lpha.example/` would otherwise be
+shown as a Cyrillic look-alike of a Latin host while the fetch dialled `xn--lpha-43d.example`. It has a
 host and a path other than `/`, and no userinfo, fragment or dot segment; it is the client's identity and
 is compared byte for byte, never normalized. The authorization endpoint is the only place a
 document is fetched, and only through `internal/adapters/outbound/cimdfetch`, whose one constructor
