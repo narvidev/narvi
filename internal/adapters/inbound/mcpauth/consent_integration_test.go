@@ -6,6 +6,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -178,13 +179,16 @@ func assertASCIIPage(t *testing.T, what, body string) {
 }
 
 // TestConsent_NoNonASCIIHostReachesThePage: every host the consent flow
-// shows -- the identity headline and title, the redirect line -- is plain
-// ASCII, the very string a fetch resolves (technical plan §43.15). A
+// shows -- the identity headline and title, the redirect line, a
+// pre-registered client's homepage line -- is plain ASCII, the very string
+// a fetch resolves (technical plan §43.15). A
 // percent-encoded client_id host (a Cyrillic look-alike, a right-to-left
 // override) is refused before any fetch; a document registering a
 // percent-encoded redirect URI is refused and nothing is stored; the same
-// host written in its xn-- form is shown in exactly that form; and a row
-// planted past every validation is refused rather than shown.
+// host written in its xn-- form is shown in exactly that form; a row
+// planted past every validation is refused rather than shown; and a
+// pre-registered client's homepage stored with a percent-encoded host is
+// left off the page rather than shown decoded.
 func TestConsent_NoNonASCIIHostReachesThePage(t *testing.T) {
 	r := newASRig(t)
 	_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
@@ -264,6 +268,39 @@ func TestConsent_NoNonASCIIHostReachesThePage(t *testing.T) {
 				t.Errorf("%s: the consent page rendered: %s", name, rec.Body.String())
 			}
 			assertASCIIPage(t, name, rec.Body.String())
+		}
+	})
+
+	// A homepage URI the admin API refuses today but stored an earlier
+	// release's rule accepted: its host would decode to a look-alike, so
+	// the page shows no homepage line for it; a plain-ASCII homepage, the
+	// xn-- form included, is shown exactly as written.
+	t.Run("a pre-registered client's homepage", func(t *testing.T) {
+		for i, tc := range []struct {
+			clientURI, want string // want "": no homepage line
+		}{
+			{"https://%D0%B0lpha.example/about", ""},
+			{"https://alpha.example/about", "alpha.example"},
+			{"https://xn--lpha-43d.example/about", "xn--lpha-43d.example"},
+		} {
+			uri := tc.clientURI
+			c, err := r.clients.Create(context.Background(), sqlcgen.CreateMCPOAuthClientParams{
+				ClientID: "narvi_mcp_c_homepage_" + strconv.Itoa(i), Kind: sqlcgen.McpOauthClientKindPreregistered,
+				ClientName: "Editor", RedirectUris: []string{loopbackRedirect}, ClientUri: &uri,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec, _ := r.renderConsent(t, r.startConsent(t, forClient(r.authorizeParams(newVerifier(t)), c.ClientID), cookie), cookie)
+			body := rec.Body.String()
+			line := `<p class="meta">Homepage: ` + tc.want + `</p>`
+			switch {
+			case tc.want == "" && strings.Contains(body, "Homepage:"):
+				t.Errorf("%s: the page shows a homepage line: %q", tc.clientURI, body[strings.Index(body, "Homepage:"):][:40])
+			case tc.want != "" && !strings.Contains(body, line):
+				t.Errorf("%s: the page lacks %q", tc.clientURI, line)
+			}
+			assertASCIIPage(t, tc.clientURI, body)
 		}
 	})
 }
