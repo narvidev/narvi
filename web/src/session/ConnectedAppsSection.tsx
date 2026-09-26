@@ -18,8 +18,11 @@
 //      token -- none exists in plaintext anywhere to show.
 //   3. MCPClientsSection: admin only (authz.ActionManageIntegrations) --
 //      register a client (the server generates its public client ID and
-//      refuses any redirect URI the consent flow could not use) or delete
-//      one, which disconnects every user of it.
+//      refuses any redirect URI the consent flow could not use), delete
+//      one, which disconnects every user of it, or disable one -- every
+//      user of it refused from its next call, nothing deleted -- and enable
+//      it again. Disabling, not deleting, keeps out an app identified by its
+//      description's address, which a deletion would let register again.
 //
 // # Adversarial rendering
 //
@@ -35,6 +38,8 @@ import type { MCPAuthorization, MCPClient, Member } from '@narvi/contracts/rest-
 import {
   createMCPClient,
   deleteMCPClient,
+  disableMCPClient,
+  enableMCPClient,
   listMCPClients,
   listMemberMCPAuthorizations,
   listMyMCPAuthorizations,
@@ -153,7 +158,9 @@ export function ConnectedAppsTable({ authorizations, revokingId, onRevoke }: { a
  * authorizations -- the list that member sees, never a token -- and a
  * Revoke behind the same confirmation, which disconnects the app on the
  * member's behalf from its very next call. The member can approve the app
- * again; keeping an app out is deleting or disabling its client.
+ * again; keeping it out is disabling its client (MCPClientsSection), which
+ * holds for every kind but an app that registered itself -- that one can
+ * register again under a new client ID while self-registration is on.
  */
 export function MemberConnectedApps({ member }: { member: Member }) {
   const queryClient = useQueryClient()
@@ -180,7 +187,7 @@ export function MemberConnectedApps({ member }: { member: Member }) {
         Connected apps · <T text={member.displayName} />
       </b>
       <p className="ph">
-        The MCP apps this member allowed to use Narvi as them -- the same list they see under Integrations; no token is ever shown. Revoking disconnects the app on their behalf from its very next call, and is audited. They can approve it again: to keep an app out, delete or disable its client.
+        The MCP apps this member allowed to use Narvi as them -- the same list they see under Integrations; no token is ever shown. Revoking disconnects the app on their behalf from its very next call, and is audited. They can approve it again. To keep the app out for everyone, disable its client under Integrations → MCP clients -- except an app that registered itself, which can register again under a new client ID while the deployment allows self-registration.
       </p>
       {query.isPending && <p className="rail-empty">Loading connected apps…</p>}
       {query.isError && <p className="rail-empty">{apiErrorMessage(query.error, "Couldn't load this member's connected apps.")}</p>}
@@ -193,9 +200,25 @@ export function MemberConnectedApps({ member }: { member: Member }) {
   )
 }
 
-/** MCPClientRow renders one registered MCP client (admin view) -- exported for direct render-safety testing. Delete disconnects every user of the client, so it asks for confirmation first and says so. */
-export function MCPClientRow({ client, onDelete, deleting }: { client: MCPClient; onDelete: () => void; deleting: boolean }) {
-  const [confirming, setConfirming] = useState(false)
+/** MCPClientRow renders one registered MCP client (admin view) -- exported for direct render-safety testing. Delete disconnects every user of the client, and Disable refuses every one of them from its next call, so each asks for confirmation first and says so; Enable, which only lets a disabled client carry on, does not. */
+export function MCPClientRow({
+  client,
+  onDelete,
+  deleting,
+  onSetDisabled,
+  settingDisabled,
+}: {
+  client: MCPClient
+  onDelete: () => void
+  deleting: boolean
+  onSetDisabled: (disabled: boolean) => void
+  settingDisabled: boolean
+}) {
+  const [confirming, setConfirming] = useState<'delete' | 'disable' | null>(null)
+  // The disable confirmation stays open while the request runs, and gives
+  // way to the Enable button once the list shows the client disabled.
+  const confirmingDisable = confirming === 'disable' && !client.disabledAt
+  const idle = confirming === null || (confirming === 'disable' && client.disabledAt !== null)
   return (
     <tr>
       <td>
@@ -227,22 +250,55 @@ export function MCPClientRow({ client, onDelete, deleting }: { client: MCPClient
       </td>
       <td>{formatDateTime(client.createdAt)}</td>
       <td>
-        {confirming ? (
+        {confirming === 'delete' && (
           <div className="confirmbox">
             <p>Deleting this client disconnects every user of it.</p>
             <span className="btnrow">
               <button type="button" className="btn danger" disabled={deleting} onClick={onDelete}>
                 {deleting ? 'Deleting…' : 'Confirm delete'}
               </button>
-              <button type="button" className="btn" onClick={() => setConfirming(false)}>
+              <button type="button" className="btn" onClick={() => setConfirming(null)}>
                 Cancel
               </button>
             </span>
           </div>
-        ) : (
-          <button type="button" className="btn danger" onClick={() => setConfirming(true)}>
-            Delete
-          </button>
+        )}
+        {confirmingDisable && (
+          <div className="confirmbox">
+            <p>Disabling this client refuses every user of it from its next call. Nothing is deleted, and Enable undoes it.</p>
+            <span className="btnrow">
+              <button type="button" className="btn danger" disabled={settingDisabled} onClick={() => onSetDisabled(true)}>
+                {settingDisabled ? 'Disabling…' : 'Confirm disable'}
+              </button>
+              <button type="button" className="btn" onClick={() => setConfirming(null)}>
+                Cancel
+              </button>
+            </span>
+          </div>
+        )}
+        {idle && (
+          <span className="btnrow">
+            {client.disabledAt ? (
+              <button
+                type="button"
+                className="btn"
+                disabled={settingDisabled}
+                onClick={() => {
+                  setConfirming(null)
+                  onSetDisabled(false)
+                }}
+              >
+                {settingDisabled ? 'Enabling…' : 'Enable'}
+              </button>
+            ) : (
+              <button type="button" className="btn danger" onClick={() => setConfirming('disable')}>
+                Disable
+              </button>
+            )}
+            <button type="button" className="btn danger" onClick={() => setConfirming('delete')}>
+              Delete
+            </button>
+          </span>
         )}
       </td>
     </tr>
@@ -288,6 +344,11 @@ export function MCPClientsSection() {
       void queryClient.invalidateQueries({ queryKey: mcpAuthorizationQueryKeys.all() })
     },
   })
+  // Disabling deletes no authorization, so only the clients list changes.
+  const setDisabledMutation = useMutation({
+    mutationFn: ({ clientId, disabled }: { clientId: string; disabled: boolean }) => (disabled ? disableMCPClient(clientId) : enableMCPClient(clientId)),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: mcpClientQueryKeys.list() }),
+  })
 
   const forbidden = query.isError && query.error instanceof ApiError && query.error.status === 403
   const canSubmit = name.trim().length > 0 && parseRedirectUris(redirects).length > 0 && !createMutation.isPending
@@ -296,7 +357,7 @@ export function MCPClientsSection() {
     <div className="panel">
       <h4>MCP clients</h4>
       <p className="ph">
-        The apps that may ask this deployment's users for access. Configure the client ID below in the app; each user still approves it themselves. Redirect URIs must be https, or http on 127.0.0.1, [::1] or localhost -- the port of a 127.0.0.1 or [::1] URI may vary.
+        The apps that may ask this deployment's users for access. Configure the client ID below in the app; each user still approves it themselves. Redirect URIs must be https, or http on 127.0.0.1, [::1] or localhost -- the port of a 127.0.0.1 or [::1] URI may vary. Disabling a client refuses every user of it from its next call and deletes nothing; it is how to keep out an app identified by its description's address (a client ID that is an https URL), which a deletion would let register again.
       </p>
       {forbidden && <p className="notavailable">MCP client registration is admin-only -- enforced server-side, not merely hidden here.</p>}
       {!forbidden && (
@@ -334,12 +395,20 @@ export function MCPClientsSection() {
           </thead>
           <tbody>
             {query.data.clients.map((c) => (
-              <MCPClientRow key={c.id} client={c} deleting={deleteMutation.isPending && deleteMutation.variables === c.id} onDelete={() => deleteMutation.mutate(c.id)} />
+              <MCPClientRow
+                key={c.id}
+                client={c}
+                deleting={deleteMutation.isPending && deleteMutation.variables === c.id}
+                onDelete={() => deleteMutation.mutate(c.id)}
+                settingDisabled={setDisabledMutation.isPending && setDisabledMutation.variables?.clientId === c.id}
+                onSetDisabled={(disabled) => setDisabledMutation.mutate({ clientId: c.id, disabled })}
+              />
             ))}
           </tbody>
         </table>
       )}
       {deleteMutation.isError && <p className="sidebar-notice">{apiErrorMessage(deleteMutation.error, "Couldn't delete the client.")}</p>}
+      {setDisabledMutation.isError && <p className="sidebar-notice">{apiErrorMessage(setDisabledMutation.error, "Couldn't change whether the client is disabled.")}</p>}
     </div>
   )
 }

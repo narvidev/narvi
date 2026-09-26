@@ -3,10 +3,10 @@
 // for a self-registered client, app-supplied -- strings (text, never
 // markup, never an href), the identity line never borrows an
 // administrator's claim, a scope-less authorization must say
-// plainly that it sees nothing, and both destructive actions (revoke,
-// delete) must never be a single bare click. Mirrors
+// plainly that it sees nothing, and the destructive actions (revoke,
+// delete, disable) must never be a single bare click. Mirrors
 // integrationsRendering.test.tsx's own pattern: assert on specific visible
-// text, never the whole rendered HTML. What the admin drawer SENDS -- its
+// text, never the whole rendered HTML. What the admin views SEND -- their
 // own queryFn and mutationFn -- is connectedAppsWiring.test.tsx's.
 import { describe, expect, it } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
@@ -62,7 +62,7 @@ function renderClient(c: MCPClient): string {
   return renderToStaticMarkup(
     <table>
       <tbody>
-        <MCPClientRow client={c} onDelete={noop} deleting={false} />
+        <MCPClientRow client={c} onDelete={noop} deleting={false} onSetDisabled={noop} settingDisabled={false} />
       </tbody>
     </table>,
   )
@@ -141,6 +141,20 @@ describe('MCPClientRow', () => {
     const html = renderClient(baseClient())
     expect(html).toContain('>Delete<')
     expect(html).not.toContain('Confirm delete')
+  })
+
+  it('an enabled client offers Disable, behind a confirmation', () => {
+    const html = renderClient(baseClient())
+    expect(html).toContain('>Disable<')
+    expect(html).not.toContain('Confirm disable')
+    expect(html).not.toContain('>Enable<')
+  })
+
+  it('a disabled client offers Enable instead, and still Delete', () => {
+    const html = renderClient(baseClient({ disabledAt: '2026-09-22T00:00:00Z' }))
+    expect(html).toContain('>Enable<')
+    expect(html).not.toContain('>Disable<')
+    expect(html).toContain('>Delete<')
   })
 })
 

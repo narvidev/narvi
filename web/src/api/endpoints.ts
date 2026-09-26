@@ -457,6 +457,16 @@ export function deleteMCPClient(clientId: string, signal?: AbortSignal): Promise
   return request<undefined>(`/api/mcp-clients/${encodeURIComponent(clientId)}`, { method: 'DELETE', signal })
 }
 
+/** disableMCPClient calls POST /api/mcp-clients/:id/disable -- refuses the client wherever a client acts from its next request, deleting nothing (admin only; 409 when it is already disabled). Answers the client as it now stands. */
+export function disableMCPClient(clientId: string, signal?: AbortSignal): Promise<MCPClient> {
+  return request<MCPClient>(`/api/mcp-clients/${encodeURIComponent(clientId)}/disable`, { method: 'POST', signal })
+}
+
+/** enableMCPClient calls POST /api/mcp-clients/:id/enable -- undoes disableMCPClient; the client carries on with whatever it still holds (admin only; 409 when it is not disabled). */
+export function enableMCPClient(clientId: string, signal?: AbortSignal): Promise<MCPClient> {
+  return request<MCPClient>(`/api/mcp-clients/${encodeURIComponent(clientId)}/enable`, { method: 'POST', signal })
+}
+
 // -- environments (§14.1) --
 
 /** listEnvironments calls GET /api/environments -- every environments row, newest-first. Maintainer+ only server-side (authz.ActionManageEnvironments); see httpapi/environments.go's own doc comment for why this is list-only, no create/update. */

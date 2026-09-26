@@ -1,7 +1,7 @@
 // connectedAppsWiring.test.tsx -- what ConnectedAppsSection.tsx's admin
-// drawer SENDS, from its own wiring: the options MemberConnectedApps (the
-// Members & access drawer) hands to TanStack Query, captured as the
-// component passes them and run against a stubbed fetch.
+// views SEND, from their own wiring: the options MemberConnectedApps (the
+// Members & access drawer) and MCPClientsSection hand to TanStack Query,
+// captured as the component passes them and run against a stubbed fetch.
 //
 // Why capture: this suite runs in plain Node (vitest.config.ts: no DOM), and
 // a static render never runs a queryFn or fires a mutation. A test that
@@ -19,7 +19,7 @@ import type * as ReactQuery from '@tanstack/react-query'
 import type { Member } from '@narvi/contracts/rest-dtos'
 
 import { mcpAuthorizationQueryKeys } from '../../api/queryKeys'
-import { MemberConnectedApps } from '../ConnectedAppsSection'
+import { MCPClientsSection, MemberConnectedApps } from '../ConnectedAppsSection'
 
 // The options of every useQuery and useMutation call, in call order.
 const captured = vi.hoisted(() => ({ queries: [] as unknown[], mutations: [] as unknown[] }))
@@ -108,5 +108,23 @@ describe('MemberConnectedApps -- the drawer sends its own list and revoke to the
     const calls = stubFetch()
     await revoke.mutationFn('auth/2')
     expect(calls).toEqual([{ url: '/api/members/user%2F1%3Fx/mcp-authorizations/auth%2F2', method: 'DELETE' }])
+  })
+})
+
+describe('MCPClientsSection -- Disable and Enable send the client\'s own admin routes', () => {
+  it('disables with POST .../disable and enables with POST .../enable, the client id escaped', async () => {
+    render(<MCPClientsSection />)
+    // The section's mutations, in the order it declares them: register,
+    // delete, then disable/enable.
+    expect(captured.mutations).toHaveLength(3)
+    const setDisabled = captured.mutations[2] as CapturedMutation<{ clientId: string; disabled: boolean }>
+
+    const calls = stubFetch()
+    await setDisabled.mutationFn({ clientId: 'client/1', disabled: true })
+    await setDisabled.mutationFn({ clientId: 'client/1', disabled: false })
+    expect(calls).toEqual([
+      { url: '/api/mcp-clients/client%2F1/disable', method: 'POST' },
+      { url: '/api/mcp-clients/client%2F1/enable', method: 'POST' },
+    ])
   })
 })
