@@ -3,7 +3,8 @@
 All notable changes to `/contracts` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this
 bundle's own version lives in `contracts/VERSION` (kept equal to
-`contracts/package.json`'s `"version"` field). See `COMPATIBILITY.md` for
+`contracts/package.json`'s and `contracts/manifest.json`'s `"version"`
+fields). See `COMPATIBILITY.md` for
 what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 (PATCH) change, and for the VERSION/CHANGELOG discipline
 `make contracts-compat` enforces on every PR that touches a schema,

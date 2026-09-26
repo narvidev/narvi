@@ -17,6 +17,7 @@ import (
 // into a shipped binary one day (README.md's own "single source of wire
 // truth"), never depends on a tools/ package.
 type manifest struct {
+	Version  string `json:"version"`
 	Surfaces []struct {
 		Path string `json:"path"`
 	} `json:"surfaces"`
@@ -244,5 +245,29 @@ func TestVersionMatchesPackageJSON(t *testing.T) {
 	}
 	if pkg.Version != version {
 		t.Fatalf("contracts/package.json version (%q) does not match contracts/VERSION (%q)", pkg.Version, version)
+	}
+}
+
+// TestVersionMatchesManifest pins contracts/manifest.json's own "version"
+// field to contracts/VERSION: the third place the bundle's version is
+// written, moved with the other two by every bump. Nothing else reads it
+// (tools/contractscompat decodes it and never looks at it), so without this
+// test a bump that forgets it passes every other check.
+func TestVersionMatchesManifest(t *testing.T) {
+	versionData, err := os.ReadFile("../VERSION")
+	if err != nil {
+		t.Fatalf("read VERSION: %v", err)
+	}
+	version := strings.TrimSpace(string(versionData))
+	data, err := os.ReadFile("../manifest.json")
+	if err != nil {
+		t.Fatalf("read manifest.json: %v", err)
+	}
+	var m manifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("parse manifest.json: %v", err)
+	}
+	if m.Version != version {
+		t.Fatalf("contracts/manifest.json version (%q) does not match contracts/VERSION (%q)", m.Version, version)
 	}
 }
