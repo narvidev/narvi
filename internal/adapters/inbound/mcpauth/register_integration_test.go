@@ -209,8 +209,25 @@ func TestClientMechanismSwitchedOff_RefusedEverywhere(t *testing.T) {
 			if rec := off.do(http.MethodGet, "/oauth/consent?request="+c.pendingID, "", nil, cookie); rec.Code != http.StatusBadRequest {
 				t.Errorf("consent page: status %d, want 400", rec.Code)
 			}
-			if rec := off.postConsent(url.Values{"request": {c.pendingID}, "nonce": {c.nonce}, "decision": {"approve"}, "scope": {"mcp:read"}}, sameOriginHeaders(), cookie); rec.Code != http.StatusBadRequest || rec.Header().Get("Location") != "" {
-				t.Errorf("consent decision: status %d Location %q, want a 400 page", rec.Code, rec.Header().Get("Location"))
+			// Either button on a consent page rendered before the switch
+			// gets the not-available page: Deny as well as Approve, since a
+			// Deny would otherwise send the browser to the paused client's
+			// redirect URI. Neither decision consumes the request.
+			for _, decision := range []url.Values{
+				{"decision": {"approve"}, "scope": {"mcp:read"}},
+				{"decision": {"deny"}},
+			} {
+				form := url.Values{"request": {c.pendingID}, "nonce": {c.nonce}}
+				for k, v := range decision {
+					form[k] = v
+				}
+				if rec := off.postConsent(form, sameOriginHeaders(), cookie); rec.Code != http.StatusBadRequest || rec.Header().Get("Location") != "" || !strings.Contains(rec.Body.String(), "This app is not available") {
+					t.Errorf("consent %s: status %d Location %q, want 400, the not-available page and no redirect", decision.Get("decision"), rec.Code, rec.Header().Get("Location"))
+				}
+			}
+			var consumed bool
+			if err := off.pool.QueryRow(t.Context(), `SELECT consumed_at IS NOT NULL FROM mcp_oauth_authorization_requests WHERE id = $1`, c.pendingID).Scan(&consumed); err != nil || consumed {
+				t.Errorf("request after a refused Approve and Deny: consumed = %v (err %v), want unconsumed", consumed, err)
 			}
 			if rec := off.exchange(forClient(off.exchangeForm(c.code, c.verifier), c.clientID), nil); decodeToken(t, rec).Error != "invalid_client" {
 				t.Errorf("code exchange: status %d body %s, want invalid_client", rec.Code, rec.Body.String())
