@@ -3113,14 +3113,15 @@ type Timeouts struct {
 	// table growth an unauthenticated registration can cause. 24 hours.
 	MCPDynamicClientUnusedTTL time.Duration
 
-	// MCPRegisterRateInterval is the refill interval of the per-address
+	// MCPRegisterRateInterval is the refill interval of the per-network
 	// token bucket in front of POST /oauth/register: after a burst of
-	// MCPRegisterRateBurst registrations, one client address may register
-	// one more client per interval. In-memory, per replica -- a brake on
-	// table growth, not a correctness property. 12 minutes.
+	// MCPRegisterRateBurst registrations, one client network -- one IPv4
+	// address, one IPv6 /48 -- may register one more client per interval.
+	// In-memory, per replica -- a brake on table growth, not a correctness
+	// property. 12 minutes.
 	MCPRegisterRateInterval time.Duration
 
-	// MCPRegisterRateBurst is the per-address burst POST /oauth/register
+	// MCPRegisterRateBurst is the per-network burst POST /oauth/register
 	// admits before MCPRegisterRateInterval paces it. A count, kept beside
 	// its interval. 5.
 	MCPRegisterRateBurst int
@@ -3399,8 +3400,8 @@ func DefaultTimeouts() Timeouts {
 		MCPClientMetadataFetchTimeout: 5 * time.Second,  // §43.15; one whole metadata document fetch
 		MCPClientMetadataCacheTTL:     time.Hour,        // §43.15; fixed ceiling, Cache-Control only shortens it
 		MCPDynamicClientUnusedTTL:     24 * time.Hour,   // §43.15; unused registered clients are swept after this
-		MCPRegisterRateInterval:       12 * time.Minute, // §43.15; per-address refill of the registration bucket
-		MCPRegisterRateBurst:          5,                // §43.15; per-address registration burst
+		MCPRegisterRateInterval:       12 * time.Minute, // §43.15; per-network refill of the registration bucket
+		MCPRegisterRateBurst:          5,                // §43.15; per-network registration burst
 	}
 }
 

@@ -1,6 +1,7 @@
 package mcpauth
 
 import (
+	"container/list"
 	"math"
 	"net"
 	"net/http"
@@ -14,30 +15,47 @@ import (
 	"github.com/narvidev/narvi/internal/platform"
 )
 
-// maxTrackedAddresses bounds how many client addresses one RateLimiter
-// keeps a bucket for, so a spray of source addresses cannot grow its
-// memory without limit. Past it, buckets that have refilled completely
-// (their address has been idle long enough to be forgotten) are dropped;
-// if none has, a new address is refused until one does -- failing closed,
-// since this limiter is a brake on an unauthenticated write.
+// maxTrackedAddresses bounds how many client networks (ClientAddressKey)
+// one RateLimiter keeps a bucket for, so a spray of source addresses
+// cannot grow its memory without limit. Past it, the network seen least
+// recently is forgotten to make room (its next request starts a fresh
+// bucket) -- a newcomer is never refused because the table is full.
 const maxTrackedAddresses = 10_000
 
-// RateLimiter is a per-client-address token bucket (technical plan §43.15;
-// golang.org/x/time/rate): each address may make burst requests at once,
-// then one per interval. It lives in memory, one per replica -- a brake on
-// abuse (table growth, spam), not a correctness property, so it creates no
-// second authority over any state (§5.1). It is built for every
-// unauthenticated MCP authorization-server route that needs one: POST
-// /oauth/register uses it now.
+// RateLimiter is a per-client-network token bucket (technical plan
+// §43.15; golang.org/x/time/rate): each network may make burst requests
+// at once, then one per interval. It lives in memory, one per replica --
+// a brake on abuse (table growth, spam), not a correctness property, so
+// it creates no second authority over any state (§5.1). It is built for
+// every unauthenticated MCP authorization-server route that needs one:
+// POST /oauth/register uses it now.
+//
+// Its memory is bounded at maxTrackedAddresses buckets, and no one
+// network can use that bound to lock out another: a flood from a single
+// network -- one IPv4 address, or one IPv6 /48 however many addresses it
+// sprays from -- lands in that network's one bucket, and a flood from
+// more networks than the table holds only evicts the buckets seen least
+// recently, so a registrant from any other network always gets a bucket
+// of its own. The price is stated, not hidden: a party rotating through
+// more networks than the table holds gets each one's burst afresh. A
+// per-address brake is beaten by enough addresses whatever it does when
+// full; refusing every newcomer when full only turned that into a lockout
+// of everyone else.
 type RateLimiter struct {
 	interval time.Duration
 	limit    rate.Limit
 	burst    int
 	now      func() time.Time
 
-	mu        sync.Mutex
-	buckets   map[string]*rate.Limiter
-	lastPrune time.Time
+	mu      sync.Mutex
+	buckets map[string]*list.Element // each a *trackedBucket in recency
+	recency *list.List               // front: the network seen most recently
+}
+
+// trackedBucket is one network's bucket in RateLimiter.recency.
+type trackedBucket struct {
+	key     string
+	limiter *rate.Limiter
 }
 
 // NewRateLimiter builds a RateLimiter refilling one request per interval
@@ -49,7 +67,8 @@ func NewRateLimiter(interval time.Duration, burst int) *RateLimiter {
 		limit:    rate.Every(interval),
 		burst:    burst,
 		now:      time.Now,
-		buckets:  map[string]*rate.Limiter{},
+		buckets:  map[string]*list.Element{},
+		recency:  list.New(),
 	}
 }
 
@@ -57,8 +76,9 @@ func NewRateLimiter(interval time.Duration, burst int) *RateLimiter {
 // r.RemoteAddr, the peer that actually connected -- never X-Forwarded-For
 // or any other header a client can write (trusting a proxy's header needs
 // a deployment decision about the proxy chain, not made yet) -- with an
-// IPv6 address reduced to its /64, the smallest block one party usually
-// holds.
+// IPv6 address reduced to its /48, the block one site is usually
+// assigned: a party holding a /48 holds its 65,536 /64s too, and keyed
+// any finer it would spend a bucket on each.
 func ClientAddressKey(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -70,7 +90,7 @@ func ClientAddressKey(r *http.Request) string {
 	}
 	a = a.Unmap().WithZone("")
 	if a.Is6() {
-		if p, err := a.Prefix(64); err == nil {
+		if p, err := a.Prefix(48); err == nil {
 			return p.String()
 		}
 	}
@@ -83,16 +103,18 @@ func (l *RateLimiter) Allow(key string) (ok bool, retryAfter time.Duration) {
 	now := l.now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	bucket, tracked := l.buckets[key]
-	if !tracked {
-		if len(l.buckets) >= maxTrackedAddresses {
-			l.prune(now)
-		}
-		if len(l.buckets) >= maxTrackedAddresses {
-			return false, l.interval
+	var bucket *rate.Limiter
+	if el, tracked := l.buckets[key]; tracked {
+		l.recency.MoveToFront(el)
+		bucket = el.Value.(*trackedBucket).limiter
+	} else {
+		if l.recency.Len() >= maxTrackedAddresses {
+			oldest := l.recency.Back()
+			l.recency.Remove(oldest)
+			delete(l.buckets, oldest.Value.(*trackedBucket).key)
 		}
 		bucket = rate.NewLimiter(l.limit, l.burst)
-		l.buckets[key] = bucket
+		l.buckets[key] = l.recency.PushFront(&trackedBucket{key: key, limiter: bucket})
 	}
 	res := bucket.ReserveN(now, 1)
 	if !res.OK() {
@@ -103,21 +125,6 @@ func (l *RateLimiter) Allow(key string) (ok bool, retryAfter time.Duration) {
 		return false, delay
 	}
 	return true, 0
-}
-
-// prune drops every bucket that has refilled completely -- an address idle
-// for burst intervals, indistinguishable from one never seen -- at most
-// once per interval.
-func (l *RateLimiter) prune(now time.Time) {
-	if !l.lastPrune.IsZero() && now.Sub(l.lastPrune) < l.interval {
-		return
-	}
-	l.lastPrune = now
-	for key, bucket := range l.buckets {
-		if bucket.TokensAt(now) >= float64(l.burst) {
-			delete(l.buckets, key)
-		}
-	}
 }
 
 // Limit is the middleware: a request whose address (ClientAddressKey) has

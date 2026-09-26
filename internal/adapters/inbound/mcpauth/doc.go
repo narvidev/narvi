@@ -38,7 +38,7 @@
 // because a signed-out browser must be sent to sign in, not answered 401;
 // the token, revocation and registration endpoints read no cookie at all.
 // The registration endpoint is behind its own flag too (off by default)
-// and a per-address rate limit.
+// and a per-network rate limit (an IPv4 address, an IPv6 /48).
 //
 // # Invariants this package is responsible for
 //
