@@ -1922,9 +1922,13 @@ func (j *CreateCloudIdentityBindingRequest) UnmarshalJSON(value []byte) error {
 // userinfo, and its host written in plain ASCII -- no percent sign in the
 // authority, so an internationalized host is written in its xn-- form -- anything
 // else is refused 400 (internal/domain/mcpclient). clientName is trimmed and must
-// be 1 to 100 printable characters: no control, invisible formatting or otherwise
-// unprintable character, and at most three combining marks stacked on one
-// character (the rule every registration path shares, technical plan §43.15).
+// be 1 to 100 printable characters -- letters, marks, numbers, punctuation,
+// symbols and the ASCII space -- so a control or invisible formatting character, a
+// space other than U+0020 (a no-break, ideographic or thin space; white space at
+// either end is trimmed, not refused), a line or paragraph separator, and a
+// private-use or unassigned code point are all refused 400, as is a name stacking
+// more than three combining marks on one character (the rule every registration
+// path shares, technical plan §43.15).
 type CreateMCPClientRequest struct {
 	// ClientName corresponds to the JSON schema field "clientName".
 	ClientName string `json:"clientName" yaml:"clientName" mapstructure:"clientName"`

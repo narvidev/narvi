@@ -36,15 +36,25 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   the same three values. `MCPAuthorization.clientName` now says a
   self-registered client chose its own name. `CreateMCPClientRequest`
   describes the stricter client-name rule every registration path now
-  shares -- printable characters only, and at most three combining marks
-  stacked on one character -- and the redirect-URI and `clientUri` rules
-  as they now stand: printable ASCII of at most 2048 bytes, and the host
-  written in plain ASCII (no percent sign in the authority; an
-  internationalized host in its `xn--` form). Two of those refusals are new
-  in this release: a name stacking more than three marks on one character,
-  and a redirect or homepage URI with a percent sign in its authority, are
-  now refused 400 where 1.4.1 accepted them. In the schema only
-  descriptions changed: no field, type, enum value or requiredness.
+  shares -- printable characters only, spelled out, and at most three
+  combining marks stacked on one character -- and the redirect-URI and
+  `clientUri` rules as they now stand: printable ASCII of at most 2048
+  bytes, and the host written in plain ASCII (no percent sign in the
+  authority; an internationalized host in its `xn--` form). Three kinds of
+  `POST /api/mcp-clients` request that 1.4.1 accepted are now refused 400:
+  - a client name with, anywhere but at either end, a character 1.4.1 let
+    through that is not printable: a space other than U+0020 (a no-break,
+    ideographic or thin space, and the other Unicode spaces), a line or
+    paragraph separator (U+2028, U+2029), or a private-use or unassigned
+    code point. 1.4.1 refused only control and invisible formatting
+    characters. White space at either end is still trimmed, not refused;
+  - a client name stacking more than three combining marks on one
+    character;
+  - a redirect or homepage URI with a percent sign in its authority: a
+    percent-encoded host, or an IPv6 zone identifier.
+
+  Nothing 1.4.1 refused is accepted now. In the schema only descriptions
+  changed: no field, type, enum value or requiredness.
 
 ## [1.4.1]
 
