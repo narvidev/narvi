@@ -294,9 +294,10 @@ func TestConsent_NoNonASCIIHostReachesThePage(t *testing.T) {
 			rec, _ := r.renderConsent(t, r.startConsent(t, forClient(r.authorizeParams(newVerifier(t)), c.ClientID), cookie), cookie)
 			body := rec.Body.String()
 			line := `<p class="meta">Homepage: ` + tc.want + `</p>`
+			_, shown, hasLine := strings.Cut(body, "Homepage:")
 			switch {
-			case tc.want == "" && strings.Contains(body, "Homepage:"):
-				t.Errorf("%s: the page shows a homepage line: %q", tc.clientURI, body[strings.Index(body, "Homepage:"):][:40])
+			case tc.want == "" && hasLine:
+				t.Errorf("%s: the page shows a homepage line: Homepage:%q", tc.clientURI, shown[:min(len(shown), 40)])
 			case tc.want != "" && !strings.Contains(body, line):
 				t.Errorf("%s: the page lacks %q", tc.clientURI, line)
 			}
