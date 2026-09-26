@@ -6,8 +6,11 @@
 // plainly that it sees nothing, and the destructive actions (revoke,
 // delete, disable) must never be a single bare click. Mirrors
 // integrationsRendering.test.tsx's own pattern: assert on specific visible
-// text, never the whole rendered HTML. What the views SEND, and what each
-// button does when clicked, is connectedAppsWiring.test.tsx's.
+// text, never the whole rendered HTML. Every row here is rendered with no
+// request in flight and no confirmation open. What the views SEND, what
+// each button does when clicked, and what a row offers while its request
+// is in flight ("Deleting…", "Disabling…", "Enabling…", "Revoking…") are
+// connectedAppsWiring.test.tsx's.
 import { describe, expect, it } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -176,6 +179,7 @@ describe('ConnectedAppsTable', () => {
     const html = renderToStaticMarkup(<ConnectedAppsTable authorizations={[baseAuthorization(), other]} revokingId={other.id} onRevoke={noop} />)
     // A row shows "Revoking…" only once its confirmation is open, which a
     // static render never is: both rows still offer the bare first step.
+    // connectedAppsWiring.test.tsx opens it, with the revocation in flight.
     expect(html.match(/>Revoke</g)?.length).toBe(2)
   })
 })
