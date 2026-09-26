@@ -725,3 +725,52 @@ func TestConsent_ClientDisabledAfterRenderRefusesApproveAndDeny(t *testing.T) {
 		})
 	}
 }
+
+// TestConsent_ClientDeletedAfterRenderGetsTheExpiredPage: a client an
+// operator deletes while its consent page is open takes its pending
+// request with it (the request's client reference cascades), so either
+// button finds no request and gets the page a reload would show -- 400,
+// "This authorization request has expired", no redirect -- and nothing is
+// recorded. Only a deletion that commits between the decision's read of
+// the request and its lock on the client gets the not-available page.
+func TestConsent_ClientDeletedAfterRenderGetsTheExpiredPage(t *testing.T) {
+	cases := []struct {
+		name string
+		form url.Values
+	}{
+		{name: "approve", form: url.Values{"decision": {"approve"}, "scope": {"mcp:read"}}},
+		{name: "deny", form: url.Values{"decision": {"deny"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			r := newASRig(t)
+			user, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+			requestID := r.startConsent(t, r.authorizeParams(newVerifier(t)), cookie)
+			_, nonce := r.renderConsent(t, requestID, cookie)
+			if tag, err := r.pool.Exec(ctx, `DELETE FROM mcp_oauth_clients WHERE id = $1`, r.client.ID); err != nil || tag.RowsAffected() != 1 {
+				t.Fatalf("delete the client: rows %d err %v", tag.RowsAffected(), err)
+			}
+			var requests int
+			if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM mcp_oauth_authorization_requests WHERE id = $1`, requestID).Scan(&requests); err != nil || requests != 0 {
+				t.Fatalf("requests left after the client's deletion = %d (err %v), want none: the request goes with its client", requests, err)
+			}
+			form := url.Values{"request": {requestID}, "nonce": {nonce}}
+			for k, v := range tc.form {
+				form[k] = v
+			}
+			rec := r.postConsent(form, sameOriginHeaders(), cookie)
+			body := rec.Body.String()
+			if rec.Code != http.StatusBadRequest || rec.Header().Get("Location") != "" || !strings.Contains(body, "This authorization request has expired") || strings.Contains(body, "This app is not available") {
+				t.Fatalf("%s: status %d Location %q, want 400, the expired page and no redirect; body:\n%s", tc.name, rec.Code, rec.Header().Get("Location"), body)
+			}
+			if ids := r.grantIDs(t, user.ID); len(ids) != 0 {
+				t.Fatalf("grants = %v, want none", ids)
+			}
+			var codes int
+			if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM mcp_oauth_authorization_codes`).Scan(&codes); err != nil || codes != 0 {
+				t.Fatalf("codes = %d (err %v), want none", codes, err)
+			}
+		})
+	}
+}
