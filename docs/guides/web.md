@@ -387,7 +387,8 @@ same routes this guide documents, checked against your role on every call.
 
 Once an app is connected, you manage it in Settings → Integrations →
 Connected apps, which says who vouches for it just as the consent page did
-(an administrator, the host of its description's address, or nobody): what
+(an administrator; the host of its description's address, written exactly
+as the consent page wrote it; or nobody): what
 you last allowed it, when you connected it, when it
 last called, and when the authorization lapses, 90 days after your latest
 approval of it. That date is the latest any copy of the app can keep

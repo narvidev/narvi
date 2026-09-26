@@ -33,6 +33,20 @@ describe('connectedAppsFormat', () => {
     expect(clientIdentityLabel('metadata_document', 'https://')).toBe('Registered by the app itself')
   })
 
+  it('clientIdentityLabel shows the host exactly as the consent page did, never re-parsed', () => {
+    // An xn-- label a WHATWG URL parser refuses as invalid punycode is still
+    // the host the consent page named, and the list names it too.
+    expect(clientIdentityLabel('metadata_document', 'https://xn--a.example/mcp/client.json')).toBe('Identified by xn--a.example')
+    expect(clientIdentityLabel('metadata_document', 'https://xn--lpha-43d.example/mcp/client.json')).toBe('Identified by xn--lpha-43d.example')
+    // Case and an explicit default port are kept, as the consent page keeps them.
+    expect(clientIdentityLabel('metadata_document', 'https://CLIENT.example:443/client.json')).toBe('Identified by CLIENT.example:443')
+    expect(clientIdentityLabel('metadata_document', 'https://tools.example?x=1')).toBe('Identified by tools.example')
+    // A host the server would never have stored is not claimed.
+    expect(clientIdentityLabel('metadata_document', 'https://%D0%B0lpha.example/client.json')).toBe('Registered by the app itself')
+    expect(clientIdentityLabel('metadata_document', 'https://someone@tools.example/client.json')).toBe('Registered by the app itself')
+    expect(clientIdentityLabel('metadata_document', 'https://\u0430lpha.example/client.json')).toBe('Registered by the app itself')
+  })
+
   it('parseRedirectUris trims, drops blank lines and keeps each URI once', () => {
     expect(parseRedirectUris('  http://127.0.0.1/cb \n\nhttps://x.example/cb\nhttp://127.0.0.1/cb\n')).toEqual(['http://127.0.0.1/cb', 'https://x.example/cb'])
     expect(parseRedirectUris('   \n  ')).toEqual([])
