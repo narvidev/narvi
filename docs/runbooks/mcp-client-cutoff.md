@@ -13,14 +13,23 @@ restart -- except where a step says it changes the deployment's configuration.
 
 ## Find the client
 
-- **Settings → Integrations → MCP clients** (admin; `GET /api/mcp-clients`)
-  lists every client of every kind: its internal `id`, its public `clientId`,
-  its name, its kind -- `preregistered`, `metadata_document` (the `clientId` is
-  the https URL of its metadata document) or `dynamic` -- and whether it is
-  disabled.
-- **Settings → Members & access → Connected apps** on a member's row (admin;
-  `GET /api/members/{userID}/mcp-authorizations`) lists what one member has
-  approved, with each app's `clientId`.
+Each Settings screen shows only some of a client's fields; the API behind it
+answers all of them.
+
+- **Settings → Integrations → MCP clients** (admin) lists every client of
+  every kind: its name, its public `clientId`, its redirect URIs, when it was
+  registered and, when it is disabled, since when -- with its Delete
+  action. It does not show the internal `id` or the kind. The kind shows in the `clientId`: `narvi_mcp_c_...` is
+  pre-registered, `narvi_mcp_d_...` registered itself (dynamic), and an https
+  URL is a metadata-document client, the URL being its document's.
+  `GET /api/mcp-clients` answers each client's `id` and `kind` too.
+- **Settings → Members & access → Connected apps** on a member's row (admin)
+  lists what one member has approved: each app's name and who vouches for it
+  -- "Registered by an administrator of this deployment" (pre-registered),
+  "Identified by <host>" (a metadata-document client, the host of its URL)
+  or "Registered by the app itself" (dynamic) -- never its `clientId`.
+  `GET /api/members/{userID}/mcp-authorizations` answers each
+  authorization's `clientId` and `clientKind`.
 - In SQL, on the control plane's database (the one `NARVI_DATABASE_URL`
   names): `SELECT id, client_id, kind, client_name, disabled_at FROM
   mcp_oauth_clients WHERE client_id = '<clientId>';`
