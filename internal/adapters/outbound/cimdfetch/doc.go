@@ -33,10 +33,14 @@
 //     open redirect elsewhere cannot lend another host's name to it. No
 //     proxy from the environment -- a proxy would dial on the guard's
 //     behalf, out of its reach.
-//   - The answer must be 200 with Content-Type application/json, and at most
-//     MaxDocumentBytes long (one byte more is read, and refused). One timeout
-//     (platform.Timeouts.MCPClientMetadataFetchTimeout) bounds the whole
-//     fetch, body included.
+//   - The answer must be 200 with Content-Type application/json, say where
+//     its body ends -- a Content-Length or chunked: a body only the
+//     connection closing ends reads, cut short, exactly like a whole one --
+//     and be at most MaxDocumentBytes long (one byte more is read, and
+//     refused). One timeout (platform.Timeouts.MCPClientMetadataFetchTimeout)
+//     bounds the whole fetch, body included, and the body must be read to
+//     its end within it: a body its server ends only because the fetch gave
+//     up is a timeout, never a document.
 //
 // What the document must SAY is not this package's business: parsing and
 // validating it is internal/domain/mcpclient's ParseMetadataDocument, and

@@ -1,6 +1,7 @@
 package cimdfetch
 
 import (
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -30,6 +31,13 @@ var ErrNotJSON = errors.New("cimdfetch: the document is not application/json")
 // ErrTooLarge is wrapped when the document is longer than
 // MaxDocumentBytes.
 var ErrTooLarge = errors.New("cimdfetch: the document is too large")
+
+// ErrUnframedBody is wrapped when the document's response does not say
+// where its body ends -- neither a Content-Length nor the chunked transfer
+// coding -- so that only the connection closing would end it: such a body,
+// cut short, reads exactly like a whole one (TLS itself takes a bare close
+// at a record boundary for a clean end), so none is ever used.
+var ErrUnframedBody = errors.New("cimdfetch: the document's response does not say where it ends")
 
 // errNoClient is what a Fetcher built with no GuardedClient answers.
 var errNoClient = errors.New("cimdfetch: this fetcher was built with no guarded client, so it can make no requests")
@@ -83,6 +91,10 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string) (Result, error) {
 		return Result{}, fmt.Errorf("cimdfetch: build the request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
+	// Asked for here, not by the transport, so the transport hands the body
+	// over as it was framed -- one it decompressed itself would no longer
+	// say whether a Content-Length ended it -- and Fetch decodes it below.
+	req.Header.Set("Accept-Encoding", "gzip")
 	resp, err := f.client.Do(req)
 	if err != nil {
 		return Result{}, fmt.Errorf("cimdfetch: fetch the document: %w", err)
@@ -96,15 +108,51 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string) (Result, error) {
 	if err != nil || mediaType != "application/json" {
 		return Result{}, fmt.Errorf("%w: Content-Type %q", ErrNotJSON, resp.Header.Get("Content-Type"))
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxDocumentBytes+1))
+	if !framed(resp) {
+		return Result{}, fmt.Errorf("%w: neither a Content-Length nor chunked", ErrUnframedBody)
+	}
+	var doc io.Reader = resp.Body
+	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+		// Compressed whether or not it was asked for, as a hostile host
+		// may: the cap below is on the decoded document.
+		zr, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return Result{}, fmt.Errorf("cimdfetch: read the document: %w", err)
+		}
+		doc = zr
+	}
+	body, err := io.ReadAll(io.LimitReader(doc, MaxDocumentBytes+1))
 	if err != nil {
 		return Result{}, fmt.Errorf("cimdfetch: read the document: %w", err)
+	}
+	// The read must have ENDED within the timeout, not merely stopped.
+	// When the timeout fires the transport closes the connection, and a
+	// TLS close begins with a close_notify the server sees as the client
+	// leaving: a server that answers it by ending the body cleanly -- a
+	// handler returning when its request's context is cancelled -- hands
+	// the transport a clean end after the deadline, which it reports as
+	// one (only a read ERROR is turned into the context's). That body was
+	// cut short by the fetch's own giving up, and is never a document.
+	if err := ctx.Err(); err != nil {
+		return Result{}, fmt.Errorf("cimdfetch: the document was not read within the fetch's timeout: %w", err)
 	}
 	if len(body) > MaxDocumentBytes {
 		return Result{}, fmt.Errorf("%w: more than %d bytes", ErrTooLarge, MaxDocumentBytes)
 	}
 	maxAge, hasMaxAge := cacheMaxAge(resp.Header)
 	return Result{Body: body, MaxAge: maxAge, HasMaxAge: hasMaxAge}, nil
+}
+
+// framed reports whether resp says where its body ends -- a Content-Length
+// or the chunked transfer coding -- so that a body cut short ends in an
+// error, never in what reads as a clean end. The guarded client speaks
+// HTTP/1.1 only; a response framed any other way fails closed.
+func framed(resp *http.Response) bool {
+	if resp.ContentLength >= 0 {
+		return true
+	}
+	te := resp.TransferEncoding
+	return len(te) > 0 && te[len(te)-1] == "chunked"
 }
 
 // maxAgeSeconds caps a max-age directive before it becomes a Duration, so

@@ -12,6 +12,7 @@ import (
 	"crypto/x509/pkix"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -356,10 +357,16 @@ func TestCIMDFetch_RefusesCrossOriginRedirects(t *testing.T) {
 	}
 }
 
+// stallTimeout is the fetch timeout of the stalled-body case: long enough
+// for a loopback handshake under load to reach the body, where the
+// deadline must strike.
+const stallTimeout = 250 * time.Millisecond
+
 // TestCIMDFetch_RefusesHTTPAndOversize: https only, first and redirected;
 // at most three redirects; application/json only; 64 KiB at most, the
-// cap itself allowed; 200 only; a whole-fetch timeout; and a fetcher
-// built with no guarded client fetches nothing.
+// cap itself allowed; 200 only; a body that says where it ends (a
+// Content-Length or chunked) and is read to that end; a whole-fetch
+// timeout; and a fetcher built with no guarded client fetches nothing.
 func TestCIMDFetch_RefusesHTTPAndOversize(t *testing.T) {
 	t.Parallel()
 	var plainHits atomic.Int32
@@ -371,8 +378,11 @@ func TestCIMDFetch_RefusesHTTPAndOversize(t *testing.T) {
 	t.Cleanup(plain.Close)
 	plainAddr := netip.MustParseAddrPort(plain.Listener.Addr().String())
 
+	// The stalled body stays stalled until the stall case lets it go,
+	// after its fetch has returned: nothing but the client giving up can
+	// end that fetch.
 	release := make(chan struct{})
-	t.Cleanup(func() { close(release) })
+	stalled := make(chan struct{}, 1)
 	srv := newDocServer(t, documentHandler(func(w http.ResponseWriter, r *http.Request) bool {
 		path := r.URL.Path
 		switch {
@@ -418,6 +428,34 @@ func TestCIMDFetch_RefusesHTTPAndOversize(t *testing.T) {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(strings.Repeat(" ", size)))
+		case path == "/sized":
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Length", fmt.Sprint(len(validDoc)))
+			_, _ = w.Write([]byte(validDoc))
+		case path == "/chunked":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(validDoc))
+			w.(http.Flusher).Flush()
+		case path == "/close-delimited":
+			// No length and no chunking: only the connection closing ends
+			// this body.
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Transfer-Encoding", "identity")
+			_, _ = w.Write([]byte(validDoc))
+		case path == "/short-of-its-length":
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Length", fmt.Sprint(len(validDoc)+10))
+			_, _ = w.Write([]byte(validDoc))
+		case path == "/chunked-cut-short":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(validDoc[:len(validDoc)/2]))
+			w.(http.Flusher).Flush()
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				_ = conn.Close()
+			}
 		case path == "/not-found":
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
@@ -425,11 +463,15 @@ func TestCIMDFetch_RefusesHTTPAndOversize(t *testing.T) {
 		case path == "/stall":
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(validDoc[:len(validDoc)/2]))
 			w.(http.Flusher).Flush()
-			select {
-			case <-release:
-			case <-r.Context().Done():
-			}
+			stalled <- struct{}{}
+			// Not r.Context(): the server cancels it when the client's
+			// TLS close_notify arrives, and a handler returning then ends
+			// the body cleanly -- the very end a timed-out fetch must not
+			// take for a document (deadline_test.go makes that race
+			// certain). Here the stall outlasts the client.
+			<-release
 		default:
 			return false
 		}
@@ -462,6 +504,11 @@ func TestCIMDFetch_RefusesHTTPAndOversize(t *testing.T) {
 		{"64 KiB + 1", srv.url(docHost, "/over-cap"), cimdfetch.ErrTooLarge},
 		{"1 MiB compressed to about 1 KiB", srv.url(docHost, "/gzip-over-cap"), cimdfetch.ErrTooLarge},
 		{"404", srv.url(docHost, "/not-found"), cimdfetch.ErrUnexpectedStatus},
+		{"a body with a Content-Length", srv.url(docHost, "/sized"), nil},
+		{"a chunked body", srv.url(docHost, "/chunked"), nil},
+		{"a body only the connection closing ends", srv.url(docHost, "/close-delimited"), cimdfetch.ErrUnframedBody},
+		{"a body short of its Content-Length", srv.url(docHost, "/short-of-its-length"), io.ErrUnexpectedEOF},
+		{"a chunked body cut short", srv.url(docHost, "/chunked-cut-short"), io.ErrUnexpectedEOF},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := fetcher.Fetch(context.Background(), tc.url)
@@ -485,11 +532,20 @@ func TestCIMDFetch_RefusesHTTPAndOversize(t *testing.T) {
 	})
 
 	t.Run("the whole fetch is bounded by one timeout", func(t *testing.T) {
+		defer close(release)
 		short := cimdfetch.New(cimdfetch.NewGuardedClient(cimdfetch.GuardConfig{
 			Resolver: res, AllowAddrPorts: []netip.AddrPort{srv.addr}, RootCAs: srv.roots,
-		}), 100*time.Millisecond)
-		if _, err := short.Fetch(context.Background(), srv.url(docHost, "/stall")); !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("Fetch of a stalled body = %v, want context.DeadlineExceeded", err)
+		}), stallTimeout)
+		got, err := short.Fetch(context.Background(), srv.url(docHost, "/stall"))
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Fetch of a stalled body = %q, %v, want context.DeadlineExceeded", got.Body, err)
+		}
+		// The deadline struck the body: the server had sent half the
+		// document and was still stalled when the fetch gave up.
+		select {
+		case <-stalled:
+		default:
+			t.Fatalf("the fetch timed out before the server began the body: %v", err)
 		}
 	})
 
