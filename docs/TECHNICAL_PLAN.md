@@ -6926,9 +6926,10 @@ discovery, pre-registered clients, authorization with consent, code-for-token ex
 verification on every call, scope-gated discovery, and user revocation in Settings. (b) adds refresh
 tokens with rotation and reuse detection, and an RFC 7009 revocation endpoint through which a client
 gives its tokens back. (c) lets a client with no prior relationship register itself: through a client ID
-metadata document, or through dynamic client registration (§43.15). This section describes all three as
-built; (d) adds the admin view of other users' authorizations, the rate limits of the token and
-authorization endpoints, and the pending-request cap. A client in use refreshes its access token with the refresh token issued
+metadata document, or through dynamic client registration (§43.15). (d) adds an administrator's view of
+other users' authorizations and revocation on their behalf (§43.18), per-network brakes on the authorization
+and token endpoints, and a cap on each client's pending authorization requests (§43.14). This section
+describes all four as built. A client in use refreshes its access token with the refresh token issued
 beside it and goes back through consent only when that refresh token lapses unused
 (`MCPRefreshTokenTTL`), when the consent that began its refresh chain reaches its absolute lifetime
 (`MCPGrantMaxLifetime` — a later consent never extends a chain an earlier one began, §43.16), or after
@@ -6974,7 +6975,7 @@ is a metadata-document client, resolved first from its cached or freshly fetched
 missing, unknown or disabled `client_id` — one registered through a mechanism switched off included — a
 metadata document that cannot be fetched or used the first time it is needed, or a `redirect_uri` that
 does not match one registered for it (§43.15), renders an HTML error page (400) and **never redirects** —
-a redirect to an unvalidated URI is the open-redirect this rule exists to prevent. Every later failure redirects to the validated `redirect_uri` with `error`,
+a redirect to an unvalidated URI is the open-redirect this rule exists to prevent. Every later failure of the request itself redirects to the validated `redirect_uri` with `error`,
 `error_description`, the client's `state`, and `iss`: `response_type` other than `code` is
 `unsupported_response_type`; a missing or malformed `code_challenge`, or a `code_challenge_method` other
 than `S256` (absent and `plain` included), is `invalid_request` — PKCE is mandatory for every client; a
@@ -6984,7 +6985,13 @@ this build does not advertise is `invalid_scope`; a `state` over 512 bytes, a `s
 UTF-8 or carries a NUL byte, or any parameter repeated, is `invalid_request` (such a `client_id` is an
 unknown client: text Postgres cannot store is the caller's error, never a server fault). An absent or empty `scope` is legitimate: it asks for a scope-less approval, whose token sees no tools (§43.17). A
 valid request is stored (`mcp_oauth_authorization_requests`, expiring after
-`MCPAuthorizationRequestTTL`) and the browser is redirected to `/oauth/consent?request=<id>` — through
+`MCPAuthorizationRequestTTL`) — unless its client already has `MCPMaxPendingAuthorizationRequestsPerClient`
+(100) requests waiting for a decision (unexpired, not consumed): then nothing is stored, and the answer is
+`temporarily_unavailable` as a `503` error page, never a redirect. The cap is a condition of the client's
+traffic, not of this request, so the one to tell is the person in the browser, not the app, which could
+only start another request. The count and the insert run in one transaction under the client's row lock,
+taken first (`FOR NO KEY UPDATE`, §43.16), so however many authorizations of one client race, the cap is
+never exceeded, and a decided or expired request frees its place. Stored, the browser is redirected to `/oauth/consent?request=<id>` — through
 `/sign-in?next=` first when it carries no valid session. Only the request id travels through sign-in,
 never the raw OAuth query. The sign-in view's own return-to allowlist gains exactly that one shape,
 `/oauth/consent?request=<uuid>` (reached with a full page load, since the SPA does not render it); both
@@ -7073,6 +7080,31 @@ nothing, so a client can correct a `scope` or `resource` and retry with the same
 tripping reuse detection. Success rotates the presented token and answers exactly like the code
 grant: a new access token and a new refresh token, both holding the presented token's scopes or the
 narrowing asked for.
+
+**The brakes.** The authorization and token endpoints are braked per client network, as dynamic
+registration is (§43.15): the same in-memory token bucket, keyed on the connecting peer alone
+(`RemoteAddr`: an IPv4 address, or an IPv6 address by its /48 — never a forwarded header), one bounded
+table per route that forgets the network seen least recently rather than refusing a newcomer, so one
+network's flood never touches another network's bucket. `GET /oauth/authorize` admits a burst of
+`MCPAuthorizeRateBurst` (10) requests, then one per `MCPAuthorizeRateInterval` (3 seconds); `POST
+/oauth/token` a burst of `MCPTokenEndpointRateBurst` (10), then one per `MCPTokenEndpointRateInterval` (2
+seconds). The brake runs after the enabled-gate and before the handler, so a refused request reads nothing
+and spends nothing: no code is consumed and no refresh token rotated. Over its budget, the authorization
+endpoint renders its error page with `429` and `Retry-After` — never a redirect, since nothing has
+validated the request's `redirect_uri` yet — and the token endpoint answers `429` with `Retry-After` and
+its own JSON error, `temporarily_unavailable`: never `invalid_grant`, which tells an OAuth client its
+credential is dead (the MCP Go SDK's client, handed `invalid_grant` by a refresh, drops its tokens and
+sends its user back through consent, while any other error only fails that one call and keeps its refresh
+token for the next). Each refusal is logged at WARN with the route's path and the client network, never
+the request's query or body. The price is stated, not hidden: everyone behind one address shares one
+bucket — behind a proxy that hides client addresses, everyone shares one — and a party rotating through
+more networks than a table holds gets each one's burst afresh; the pending-request cap and every row's
+TTL are the bounds that hold whatever the brakes do. The cap has a price of its own: it is per client, so
+a sustained flood of authorization requests for one client — even from one network at its brake's pace,
+since a request every six seconds keeps a hundred pending — holds that client at its cap and refuses its
+new authorizations while the flood lasts. It never touches an app already connected, whose calls and
+refreshes go on, nor any other client; blocking the flooding networks, or cutting the client off, is the
+operator's answer (`docs/runbooks/mcp-client-cutoff.md`).
 
 **The revocation endpoint** (`POST /oauth/revoke`, RFC 7009) takes `token`, an optional
 `token_type_hint`, and the same public-client identification as the token endpoint. A request that
@@ -7206,8 +7238,8 @@ number of networks; when full it forgets the network seen least recently rather 
 newcomer, so no network can use the bound to lock out another. The cost is accepted and stated: a party
 rotating through more networks than the limiter holds gets each one's burst afresh — a per-address
 brake is beaten by enough addresses whatever it does when full, and refusing everyone when full only
-turned that into a lockout of everyone else. It is built to be reused for the token and authorization
-endpoints in piece (d).
+turned that into a lockout of everyone else. The authorization and token endpoints are braked the same
+way (§43.14).
 
 **A mechanism switched off** refuses every client it registered wherever a disabled client is refused —
 the authorization endpoint, both consent routes, the token endpoint by code and by refresh, and every
@@ -7294,13 +7326,26 @@ the grant, then the requests, codes and tokens under them (written down once, at
 `internal/adapters/outbound/postgres/mcpoauthgrant_store.go`): the consent decision locks the client; the
 code exchange the client and then the code's grant; the refresh the client and then the refresh token's
 grant — each `FOR KEY SHARE`, before consuming its request or code or rotating its refresh token — while
-every revocation (a user's, a client deletion, a code or refresh-token replay, a client's RFC 7009
-request) locks the client or the grant before its cascade reaches the rows under it. So a revocation
-racing an issuance waits for it and then deletes what it issued — or the issuance waits and finds its
-parent gone — instead of the two deadlocking (`TestLockOrder_RevocationRacingIssuance`, both orders of
-every pair). Taking the client first in a grant's revocation also keeps a client deletion's audit
-exact: the two serialize on the client row, so each grant is audited as revoked exactly once
-(`TestLockOrder_RevocationRacingClientDeletion`).
+every revocation (a user's, an administrator's on a user's behalf, a client deletion, a code or
+refresh-token replay, a client's RFC 7009 request) locks the client or the grant before its cascade
+reaches the rows under it. So a revocation racing an issuance waits for it and then deletes what it
+issued — or the issuance waits and finds its parent gone — instead of the two deadlocking
+(`TestLockOrder_RevocationRacingIssuance`, both orders of every pair). Taking the client first in a
+grant's revocation also keeps a client deletion's audit exact: the two serialize on the client row, so
+each grant is audited as revoked exactly once (`TestLockOrder_RevocationRacingClientDeletion`); an
+administrator's revocation and the user's own of one grant share the client and serialize on the grant,
+and the second finds it gone (`TestLockOrder_AdminAndUserRevokeOneGrant`).
+
+The authorization endpoint stores a request in a transaction of its own (§43.14's pending-request cap):
+the client `FOR NO KEY UPDATE`, then a count of the client's pending requests — a statement of its own,
+so its snapshot is taken once the lock is granted and sees whatever an earlier holder committed — then
+the insert. It locks one existing row, first, and then only the row it inserts, which no other
+transaction can know of yet, so it waits at most once, holding nothing. `FOR NO KEY UPDATE` conflicts
+with another authorization of the same client — so their counts and inserts never interleave — with a
+metadata document's upsert and failed re-fetch record, and with a client's deletion or the sweep; never
+with the `FOR KEY SHARE` of an issuance or a grant revocation, so the cap never slows a consent, a code
+exchange, a refresh or a revocation, nor they an authorization (`TestLockOrder_AuthorizationRequestWriter`,
+both orders of every pair; `TestAuthorize_PendingCapRefused` for two authorizations of one client).
 
 Client registration (§43.15) adds four writers to the same order. A metadata document's upsert, and the
 record of its first failed re-fetch, are each one statement taking one row lock — the client,
@@ -7315,9 +7360,9 @@ fetched longer ago than the latter and a failure records a grace only within two
 last fetch; the test races the two under such a setting. The unused-client sweep deletes as an administrator's deletion
 does, client first, in two statements: it locks its candidates `FOR UPDATE` in id order, then deletes,
 with a fresh snapshot, only those still holding no grant and no request, so its cascade reaches no row.
-An authorization reaching a client the sweep holds waits, then is refused with a page; a request or grant
-whose insert holds the client (its foreign-key check's `FOR KEY SHARE`) when the sweep arrives makes the
-sweep wait, and, once committed, keeps its client. A dynamic registration inserts a new row and locks
+An authorization reaching a client the sweep holds waits, then is refused with a page; an authorization
+holding the client (its `FOR NO KEY UPDATE`) or a grant whose insert holds it (its foreign-key check's `FOR
+KEY SHARE`) when the sweep arrives makes the sweep wait, and, once committed, keeps its client. A dynamic registration inserts a new row and locks
 nothing that exists: nothing queues behind it, and it queues behind nothing
 (`TestLockOrder_ClientRegistrationWriters`, both orders of every pair, each re-fetch race run with the
 fetch succeeding and failing).
@@ -7329,11 +7374,15 @@ refresh chain its code begins), `MCPGrantLastUsedWriteInterval` (5 minutes),
 `MCPDiscoveryCacheMaxAge` (5 minutes, the discovery documents' `Cache-Control` max-age), and for client
 registration (§43.15) `MCPClientMetadataFetchTimeout` (5 seconds), `MCPClientMetadataCacheTTL` (1 hour),
 `MCPDynamicClientUnusedTTL` (24 hours) and the registration limit's `MCPRegisterRateInterval` (12
-minutes) with its burst `MCPRegisterRateBurst` (5); `Validate` requires the code to expire inside the
+minutes) with its burst `MCPRegisterRateBurst` (5), and for the brakes and the cap (§43.14)
+`MCPAuthorizeRateInterval` (3 seconds) with its burst `MCPAuthorizeRateBurst` (10),
+`MCPTokenEndpointRateInterval` (2 seconds) with its burst `MCPTokenEndpointRateBurst` (10), and
+`MCPMaxPendingAuthorizationRequestsPerClient` (100, a count kept beside the consent window); `Validate`
+requires the code to expire inside the
 consent window, the access token inside the refresh token, and the refresh token inside the grant; a
 metadata fetch inside the time its result is trusted, that time inside the unused-client TTL, and the
-consent window inside it too; and a positive registration interval and burst — a zero interval would be
-no limit at all. The discovery cache is ordered against no token lifetime: a client
+consent window inside it too; and a positive interval and burst for each of the three brakes — a zero
+interval would be no limit at all — and a cap of at least one. The discovery cache is ordered against no token lifetime: a client
 refreshes at the token endpoint it already knows and never re-reads the documents to do so, so no token
 lifetime bounds when it next reads them — the max-age only bounds how stale they are when a client next
 authorizes, and a scope newly offered after an upgrade needs a new consent anyway, since a refresh can
@@ -7405,14 +7454,30 @@ one of the caller's own grants — another user's id is indistinguishable from a
 records `mcp_authorization.revoked` (reason `user`). Administrators register and delete clients in the
 same panel (`/api/mcp-clients`, §43.15).
 
+An administrator sees every member's authorizations in Settings → Members & access, in a "Connected apps"
+drawer on the member's row, and revokes one on the member's behalf. `GET
+/api/members/{userID}/mcp-authorizations` (`authz.ActionManageMembers`, admin only like every members
+route; `404` for a user that does not exist) answers exactly the `MCPAuthorization` rows the member sees
+of their own, through the same list — never a token, which exists nowhere in plaintext once the client
+received it, so an administrator can neither see nor use one. `DELETE
+/api/members/{userID}/mcp-authorizations/{authorizationID}` runs the member's own revocation transaction
+(§43.16): the grant and everything issued under it are deleted, and the client's next call is refused. It
+reaches only a grant belonging to that member — any other id, another member's grant included, is the
+same `404` as a missing one — and records `mcp_authorization.revoked`, reason `admin`, attributed to the
+administrator, with `detail.target_user_id` naming the member. It withdraws what was approved, not the app:
+the member can approve it again, and keeping an app out is deleting or disabling its client
+(`docs/runbooks/mcp-client-cutoff.md`). Like the member's own routes, neither is behind the MCP
+enabled-gate, and every other role is refused `403`.
+
 Audit rows, each written in the same transaction as the change: `mcp_client.created`,
 `mcp_client.deleted` (resource type `mcp_client`); `mcp_authorization.granted` and
-`mcp_authorization.revoked` with `detail.reason` one of `user`, `client_deleted`, `code_reuse`,
-`refresh_reuse`, `client` (resource type `mcp_authorization`). A `code_reuse` or `refresh_reuse` row is
+`mcp_authorization.revoked` with `detail.reason` one of `user`, `admin`, `client_deleted`, `code_reuse`,
+`refresh_reuse`, `client` (resource type `mcp_authorization`); an `admin` row is attributed to the
+administrator, with `detail.target_user_id`. A `code_reuse` or `refresh_reuse` row is
 attributed to the grant's user with `detail.actor = "system"`; a `client` row (the client's own RFC 7009
 revocation) to the grant's user with `detail.actor = "client"`. Not audited: denials, failed token
-requests, token issuance and refresh, and a revocation request that revoked nothing. The admin view of
-other users' authorizations — and revocation on their behalf — is piece (d).
+requests, token issuance and refresh, a revocation request that revoked nothing, and a request refused by
+a brake or the pending-request cap (§43.14), which is logged instead.
 
 ### 43.19 Threat model and tests
 
@@ -7431,10 +7496,11 @@ other users' authorizations — and revocation on their behalf — is piece (d).
 | Metadata-document fetch as SSRF | one outbound adapter, constructible only with its guard; every address checked at dial time, after resolution, on every redirect and every re-resolution (loopback, private, link-local and the cloud metadata address, CGNAT, multicast, unspecified, reserved, and their IPv4-mapped and NAT64 forms); `https` only with no downgrade, at most three redirects, each within the first URL's own origin, every host written in plain ASCII and compared by ASCII case only (the string the fetch resolves), no environment proxy, `application/json` only, a body that says where it ends, 64 KiB of decoded document, one timeout the body must be read to its end within; the only way past the guard is a test seam production never sets | `TestCIMDFetch_RefusesPrivateTargets`, `TestCIMDFetch_RefusesCrossOriginRedirects`, `TestCheckRedirect_Table`, `TestOrigin_Table`, `TestCIMDFetch_RefusesHTTPAndOversize`, `TestCIMDFetch_IgnoresEnvironmentProxy`, `TestCIMDFetch_FetchesThroughTheSeamOnly`, `TestCheckAddr_Table`, `TestControl_ChecksTheConnectingAddress`, `TestFetch_ABodyEndedBecauseTheFetchGaveUpIsATimeout`, `TestOAuth_ProductionRouter/MetadataDocument_ProductionGuardRefusesLoopback` (no connection accepted, the refusal's cause the guard's own) |
 | A changed client document changing issued credentials | a re-fetched document changes what the next authorization sees, never an issued code's redirect binding, a token's scopes or a refresh chain; the cache is a fixed hour that cache headers only shorten, and a lowered ceiling caps a stored stale time; a stale document whose re-fetch fails is kept one more hour from the first failure, never past two hours after its last successful fetch, then refused until a fetch succeeds, and a failure never overrides a newer fetch | `TestCIMD_RefetchNeverChangesIssuedCredentials`, `TestCIMD_FailedRefetchNeverTrustedPastTwoCacheLifetimes`, `TestCIMD_CacheTTLOnlyShortened`, `TestCIMD_CacheTTLOnlyShortened_Stored`, `TestCIMD_LoweredCacheTTLCapsAStoredStaleTime`, `TestCIMD_AuthorizationEndpoint`, `TestCIMD_FailedRefetchKeptForOneGraceOnly`, `TestCIMD_FailedRefetchNeverOverridesANewerFetch` |
 | A registration mechanism switched off | every client it registered is refused like a disabled one — authorization, consent, token endpoint, `/mcp` — and may still revoke; a pause, not a deletion: nothing is deleted, and switching the mechanism back on resumes each client's unexpired access with no new consent; a disabled metadata-document client's document is never fetched again, and a disabled client is never swept, so its block outlives any idle time | `TestClientMechanismSwitchedOff_RefusedEverywhere`, `TestMechanisms_Accepts`, `TestRequireMCPBearer_Table`, `TestCIMD_DisabledClientSurvivesTheSweep`, `TestOAuth_ProductionRouter/MetadataDocuments_Disabled`, `TestOAuth_ProductionRouter/DynamicRegistration_Disabled` (each on the very resource the refused token was issued for) |
-| Revoked, disabled or deleted principals | one join per call, no cache; deleting a client cascades its grants and every refresh chain under them, each grant audited; a disabled client gets no consent page and no token, by code or by refresh; a client's RFC 7009 revocation of either token type, expired or rotated or not, deletes the grant, and never another client's; a revocation racing a consent, code exchange or refresh waits for it, then deletes what it issued (§43.16's lock order) | `TestBearer_NoCacheBetweenCalls`, `TestLockOrder_RevocationRacingIssuance`, `TestLockOrder_RevocationRacingClientDeletion`, `TestRevoke_RFC7009_StopsOnNextCall`, `TestRevoke_ExpiredOrRotatedTokenStillRevokes`, `TestRevoke_Refusals`, `TestRefresh_DisabledClientCannotRefresh`, `TestMCPOAuthGrantStore_RevocationCascadesRefreshChain`, `TestOAuth_ProductionRouter/RevokedAuthorizationStopsOnNextCall_User`, `_RFC7009`, `_ClientDeleted`, `_DisabledUser`, `TestOAuth_ProductionRouter/DisabledClientIs401NextCall`, `TestClient_DeleteCascadesGrants`, `TestClient_DeleteAuditsGrantAddedByConcurrentConsent`, `TestConsent_ClientDisabledBeforeRenderRefused`, `TestLockOrder_ClientRegistrationWriters` |
+| Revoked, disabled or deleted principals | one join per call, no cache; deleting a client cascades its grants and every refresh chain under them, each grant audited; a disabled client gets no consent page and no token, by code or by refresh; a client's RFC 7009 revocation of either token type, expired or rotated or not, deletes the grant, and never another client's; an administrator's revocation on a member's behalf deletes that member's grant and no other — any other id is a `404` — is audited as the administrator's, and shows the administrator no token, since none exists in plaintext; a revocation racing a consent, code exchange or refresh waits for it, then deletes what it issued, and two revocations of one grant audit it once (§43.16's lock order) | `TestBearer_NoCacheBetweenCalls`, `TestLockOrder_RevocationRacingIssuance`, `TestLockOrder_RevocationRacingClientDeletion`, `TestLockOrder_AdminAndUserRevokeOneGrant`, `TestMemberMCPAuthorizations_AdminListAndRevoke`, `TestOAuth_ProductionRouter/RevokedAuthorizationStopsOnNextCall_Admin`, `TestRevoke_RFC7009_StopsOnNextCall`, `TestRevoke_ExpiredOrRotatedTokenStillRevokes`, `TestRevoke_Refusals`, `TestRefresh_DisabledClientCannotRefresh`, `TestMCPOAuthGrantStore_RevocationCascadesRefreshChain`, `TestOAuth_ProductionRouter/RevokedAuthorizationStopsOnNextCall_User`, `_RFC7009`, `_ClientDeleted`, `_DisabledUser`, `TestOAuth_ProductionRouter/DisabledClientIs401NextCall`, `TestClient_DeleteCascadesGrants`, `TestClient_DeleteAuditsGrantAddedByConcurrentConsent`, `TestConsent_ClientDisabledBeforeRenderRefused`, `TestLockOrder_ClientRegistrationWriters` |
 | Discovery leak | per-request tool registration by scope; composed instructions; empty defect server | `TestToolsList_ScopeFilter_Table`, `TestInstructions_NameOnlyVisibleTools`, `TestHiddenToolCall_IsIndistinguishableFromUnknownTool`, `TestOAuth_ProductionRouter/ScopelessGrant_ToolsListEmpty` |
 | Phishing through the login return path | the sign-in view accepts only `/oauth/consent?request=<uuid>` as a server-rendered return target; both login handlers accept only same-origin paths | `TestLogin_NextAcceptsConsentPath`, `TestOIDCLogin_NextReturnsToConsentPage`, the sign-in view's own return-to test |
-| Table growth | a TTL on every row kind, rotated refresh tokens included, swept; unused, enabled self-registered clients swept, never one whose request or grant committed while the sweep waited; dynamic registration braked per client network (`RemoteAddr` only; IPv6 by /48), with bounded limiter memory that no network can use to lock out another | `TestExpiredCleanup_SweepsMCPRows`, `TestExpiredCleanup_SweepsUnusedMCPClients`, `TestLockOrder_ClientRegistrationWriters`, `TestRateLimiter_BurstThenOnePerInterval`, `TestRateLimiter_BoundedMemoryEvictsLeastRecentlyUsed`, `TestRateLimiter_OneNetworkCannotLockOutOthers`, `TestClientAddressKey`, `TestOAuth_ProductionRouter/Register_RateLimited` |
+| Table growth | a TTL on every row kind, rotated refresh tokens included, swept; unused, enabled self-registered clients swept, never one whose request or grant committed while the sweep waited; dynamic registration and the authorization endpoint braked per client network (`RemoteAddr` only; IPv6 by /48), with bounded limiter memory that no network can use to lock out another; at most `MCPMaxPendingAuthorizationRequestsPerClient` requests of one client pending, counted and stored under the client's lock so no race exceeds it, refused past it with a page that stores nothing — a flood for one client can hold that client at its cap, stated in §43.14, never touching a connected app or another client | `TestExpiredCleanup_SweepsMCPRows`, `TestExpiredCleanup_SweepsUnusedMCPClients`, `TestLockOrder_ClientRegistrationWriters`, `TestLockOrder_AuthorizationRequestWriter`, `TestAuthorize_PendingCapRefused`, `TestMCPOAuthGrantStore_PendingAuthorizationRequestCap`, `TestRateLimiter_BurstThenOnePerInterval`, `TestRateLimiter_BoundedMemoryEvictsLeastRecentlyUsed`, `TestRateLimiter_OneNetworkCannotLockOutOthers`, `TestClientAddressKey`, `TestAuthorizeRateLimited_Answer`, `TestOAuth_ProductionRouter/Register_RateLimited`, `TestOAuth_ProductionRouter/RateLimit_AuthorizeEndpoint`, `TestOAuth_ProductionRouter/Authorize_PendingCapRefused` |
+| Abuse of the token endpoint, and a brake that locks users out | the token endpoint braked per client network; a refused request is read no further — no code consumed, no refresh token rotated — and answered `429` `temporarily_unavailable`, never `invalid_grant`, so a client keeps its refresh token and is never sent back to consent by the brake; one network's flood, an IPv6 /48 spraying /64s included, never spends another's bucket; the refusal is logged with the path and the network, never a token or a query | `TestTokenRateLimited_Answer`, `TestRateLimiter_RefusalLogCarriesNoCredential`, `TestOAuth_ProductionRouter/RateLimit_TokenEndpoint429`, `TestOAuth_ProductionRouter/RateLimit_OneNetworkCannotLockOutAnotherRefresh`, `TestOAuth_ProductionRouter/RateLimit_RefusedRefreshSpendsNothing_SDK` |
 | A token doing more than its user | same twins, same authz check, role read per call | `TestParity_BearerEqualsCookieForEveryRole` |
 
 The row's exit criterion is proven end to end by `TestOAuth_ProductionRouter/EndToEnd_SDKClient`, on
@@ -7456,4 +7522,16 @@ guard's own cause; `EndToEnd_SDKClient_DynamicRegistration` has the SDK client r
 flag on; and `Register_DisabledByDefault`, `Register_RateLimited`, `MetadataDocuments_Disabled` and
 `DynamicRegistration_Disabled` prove the defaults, the brake and each kill switch — the last two on a
 router serving the very resource the refused token was issued for, which accepts the other mechanism's
-token, so the switch is the only thing that can refuse it.
+token, so the switch is the only thing that can refuse it. Piece (d)'s proofs run on the production router
+too. `RevokedAuthorizationStopsOnNextCall_Admin` has an administrator list the member's authorizations
+and revoke one on the member's behalf — after every other role, the member included, was refused `403`
+and the grant under any other user's path `404`, its token still working — and the member's very next
+call through the SDK session refused, its refresh token refreshing nothing. On a router built with the
+shipped brakes (the shared router of the proofs above lifts the two new ones, since every SDK client there
+dials from one loopback address and would otherwise meet them whenever it ran faster than they refill):
+`RateLimit_TokenEndpoint429` and `RateLimit_AuthorizeEndpoint` prove each brake's answer, its log line and
+that a refused request spends and stores nothing; `RateLimit_OneNetworkCannotLockOutAnotherRefresh` has
+an IPv4 flood and an IPv6 /48 flood each spend their own bucket while the SDK client refreshes and carries
+on; `RateLimit_RefusedRefreshSpendsNothing_SDK` has the SDK client's own refresh braked — the call fails,
+no consent, the refresh token kept and still good; and `Authorize_PendingCapRefused` floods one client
+with concurrent authorizations from as many networks and finds exactly the cap stored.
