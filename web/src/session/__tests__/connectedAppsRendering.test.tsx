@@ -143,7 +143,9 @@ describe('MCPClientRow', () => {
     expect(html).not.toContain('Confirm delete')
   })
 
-  it('an enabled client offers Disable, behind a confirmation', () => {
+  // That Disable alone sends nothing, and its confirmation does, is
+  // connectedAppsWiring.test.tsx's: it clicks them.
+  it('an enabled client first offers Disable, never Confirm disable or Enable', () => {
     const html = renderClient(baseClient())
     expect(html).toContain('>Disable<')
     expect(html).not.toContain('Confirm disable')
