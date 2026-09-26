@@ -452,9 +452,10 @@ own, is shown an error page the first time. Narvi trusts a description it
 read for at most an hour before reading it again; a change to it affects
 only approvals made afterwards. If that re-read fails — the host down, the
 description gone or no longer valid — the description Narvi last read keeps
-being used for one more hour from that first failure, and no longer: after
-that the app is shown an error page until its description can be read
-again.
+being used for one more hour from that first failure, and no longer — and
+never more than two hours after Narvi last read it: a description Narvi
+has not read for longer than that is not used at all. After that the app
+is shown an error page until its description can be read again.
 Disconnecting deletes the authorization outright, and deleting a client
 deletes every authorization issued to it — neither can be undone, and one
 authorization cannot be paused: the only pause is the deployment-wide one

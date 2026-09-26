@@ -3100,7 +3100,9 @@ type Timeouts struct {
 	// this long whatever its host says. The first failed re-fetch of a
 	// stale document since its last successful fetch keeps the cached
 	// document for ONE more TTL, measured from that failure, and no
-	// longer: past it the client is refused until a fetch succeeds. 1 hour.
+	// longer -- and never past TWO TTLs after that last successful fetch,
+	// so a document not read for longer gets no grace at all: past it the
+	// client is refused until a fetch succeeds. 1 hour.
 	MCPClientMetadataCacheTTL time.Duration
 
 	// MCPDynamicClientUnusedTTL is how long a dynamically registered or

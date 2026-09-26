@@ -56,11 +56,15 @@ func (s *Server) resolveClient(w http.ResponseWriter, r *http.Request, clientID 
 //     last successful fetch for one more MCPClientMetadataCacheTTL,
 //     measured from that failure (logged), so a document host that is
 //     down does not break every authorization at once -- and is not asked
-//     again on every one; past that one grace, the authorization is
-//     refused with an error page until a fetch succeeds again: a document
-//     its owner withdrew, or replaced with one this deployment refuses, is
-//     not trusted for longer than the grace, however often it is asked
-//     for (keepAfterFailedRefetch).
+//     again on every one -- but never past two MCPClientMetadataCacheTTL
+//     after that last successful fetch (refetchGraceEnd): a document not
+//     read for longer than that gets no grace at all. Past the grace, the
+//     authorization is refused with an error page until a fetch succeeds
+//     again: a document its owner withdrew, or replaced with one this
+//     deployment refuses, is not trusted for longer than the grace,
+//     however often it is asked for, nor given new trust however long
+//     after its withdrawal it is first asked for again
+//     (keepAfterFailedRefetch).
 //
 // Refreshing the row changes what the NEXT authorization sees and nothing
 // else: every request, code, token and refresh chain already issued
@@ -130,10 +134,14 @@ func (s *Server) metadataDocumentClient(w http.ResponseWriter, r *http.Request, 
 // keepAfterFailedRefetch decides what a failed re-fetch of cached's stale
 // document leaves the authorization (technical plan §43.15): the first
 // failure since the document was last fetched successfully keeps it for
-// one more MCPClientMetadataCacheTTL measured from that failure, recorded
-// on the row; a later failure never extends that grace -- inside it the
-// cached document is used, past it the authorization is refused with an
-// error page until a fetch succeeds (which clears the failure).
+// one more MCPClientMetadataCacheTTL measured from that failure, but
+// never past two after that last successful fetch (refetchGraceEnd),
+// recorded on the row; a later failure never extends that grace -- inside
+// it the cached document is used, past it the authorization is refused
+// with an error page until a fetch succeeds (which clears the failure). A
+// first failure that comes when that bound has already passed -- the row
+// sat unread, its document gone, until someone asked for it -- gets no
+// grace, and records nothing that would make the document look fresh.
 func (s *Server) keepAfterFailedRefetch(w http.ResponseWriter, r *http.Request, cached sqlcgen.McpOauthClient, now time.Time, ferr error) (sqlcgen.McpOauthClient, bool) {
 	ctx := r.Context()
 	logger := platform.Logger(ctx)
@@ -142,9 +150,10 @@ func (s *Server) keepAfterFailedRefetch(w http.ResponseWriter, r *http.Request, 
 		s.renderError(w, r, http.StatusInternalServerError, "Something went wrong", "The authorization request could not be processed.")
 		return sqlcgen.McpOauthClient{}, false
 	}
-	refuse := func(failingSince time.Time) (sqlcgen.McpOauthClient, bool) {
-		logger.Warn("mcpauth: authorize refused", "outcome", "metadata_document_unusable", "client_id", cached.ClientID,
-			"reason", "re-fetch failing past its one grace", "failing_since", failingSince, "error", ferr)
+	refuse := func(client sqlcgen.McpOauthClient) (sqlcgen.McpOauthClient, bool) {
+		logger.Warn("mcpauth: authorize refused", "outcome", "metadata_document_unusable", "client_id", client.ClientID,
+			"reason", "re-fetch failing past its one grace", "last_fetched", client.MetadataFetchedAt.Time,
+			"failing_since", client.MetadataRefetchFailedAt.Time, "error", ferr)
 		s.refuseUnusableDocument(w, r, ferr)
 		return sqlcgen.McpOauthClient{}, false
 	}
@@ -153,11 +162,18 @@ func (s *Server) keepAfterFailedRefetch(w http.ResponseWriter, r *http.Request, 
 		if s.withinRefetchGrace(cached, now) {
 			return cached, true
 		}
-		return refuse(cached.MetadataRefetchFailedAt.Time)
+		return refuse(cached)
 	}
 
-	logger.Warn("mcpauth: metadata document re-fetch failed; keeping the cached document for one more cache lifetime, and no longer", "client_id", cached.ClientID, "error", ferr)
-	kept, err := s.deps.Clients.MarkMetadataRefetchFailed(ctx, cached.ID, cached.MetadataFetchedAt.Time, now, now.Add(s.cfg.Timeouts.MCPClientMetadataCacheTTL))
+	graceEnd := s.refetchGraceEnd(cached.MetadataFetchedAt.Time, now)
+	if !now.Before(graceEnd) {
+		// Last read successfully too long ago for any grace: nothing is
+		// recorded, so the next authorization tries the fetch again.
+		return refuse(cached)
+	}
+	logger.Warn("mcpauth: metadata document re-fetch failed; keeping the cached document for one more cache lifetime at most, and no longer",
+		"client_id", cached.ClientID, "last_fetched", cached.MetadataFetchedAt.Time, "kept_until", graceEnd, "error", ferr)
+	kept, err := s.deps.Clients.MarkMetadataRefetchFailed(ctx, cached.ID, cached.MetadataFetchedAt.Time, now, graceEnd)
 	switch {
 	case err == nil:
 		return kept, true
@@ -176,7 +192,7 @@ func (s *Server) keepAfterFailedRefetch(w http.ResponseWriter, r *http.Request, 
 		if !current.MetadataFetchedAt.Time.Equal(cached.MetadataFetchedAt.Time) || s.withinRefetchGrace(current, now) {
 			return current, true
 		}
-		return refuse(current.MetadataRefetchFailedAt.Time)
+		return refuse(current)
 	default:
 		return fail("record the failed metadata document re-fetch failed", err)
 	}
@@ -184,9 +200,32 @@ func (s *Server) keepAfterFailedRefetch(w http.ResponseWriter, r *http.Request, 
 
 // withinRefetchGrace reports whether client's cached document may still
 // be used although a re-fetch of it failed: a failure is recorded, and
-// less than MCPClientMetadataCacheTTL has passed since it.
+// its grace (refetchGraceEnd) has not ended.
 func (s *Server) withinRefetchGrace(client sqlcgen.McpOauthClient, now time.Time) bool {
-	return client.MetadataRefetchFailedAt.Valid && now.Before(client.MetadataRefetchFailedAt.Time.Add(s.cfg.Timeouts.MCPClientMetadataCacheTTL))
+	return client.MetadataRefetchFailedAt.Valid &&
+		now.Before(s.refetchGraceEnd(client.MetadataFetchedAt.Time, client.MetadataRefetchFailedAt.Time))
+}
+
+// refetchGraceEnd is when the grace a failed re-fetch at failedAt gives a
+// document last fetched successfully at fetchedAt ends: one
+// MCPClientMetadataCacheTTL after the failure, and never later than
+// trustedUntil(fetchedAt). The grace exists for a document host that went
+// down shortly after it was last read; one whose document has not been
+// read for longer than that is refused, however long ago it failed.
+func (s *Server) refetchGraceEnd(fetchedAt, failedAt time.Time) time.Time {
+	end := failedAt.Add(s.cfg.Timeouts.MCPClientMetadataCacheTTL)
+	if limit := s.trustedUntil(fetchedAt); limit.Before(end) {
+		return limit
+	}
+	return end
+}
+
+// trustedUntil is the latest a document last fetched successfully at
+// fetchedAt is ever trusted, whatever its row says: two
+// MCPClientMetadataCacheTTL after that fetch -- its own lifetime, then at
+// most one grace (technical plan §43.15).
+func (s *Server) trustedUntil(fetchedAt time.Time) time.Time {
+	return fetchedAt.Add(2 * s.cfg.Timeouts.MCPClientMetadataCacheTTL)
 }
 
 // refuseUnusableDocument renders the error page -- never a redirect -- for
@@ -205,10 +244,12 @@ func (s *Server) refuseUnusableDocument(w http.ResponseWriter, r *http.Request, 
 // document may still be used without a re-fetch: before its stale time,
 // and -- should the stored stale time lie further out than the current
 // ceiling allows from now, because an operator lowered
-// MCPClientMetadataCacheTTL -- never trusted past the current ceiling.
+// MCPClientMetadataCacheTTL -- never trusted past the current ceiling,
+// nor past trustedUntil its last successful fetch.
 func (s *Server) metadataFresh(client sqlcgen.McpOauthClient, now time.Time) bool {
 	stale := client.MetadataStaleAt.Time
-	return client.MetadataStaleAt.Valid && now.Before(stale) && !stale.After(now.Add(s.cfg.Timeouts.MCPClientMetadataCacheTTL))
+	return client.MetadataStaleAt.Valid && now.Before(stale) && !stale.After(now.Add(s.cfg.Timeouts.MCPClientMetadataCacheTTL)) &&
+		now.Before(s.trustedUntil(client.MetadataFetchedAt.Time))
 }
 
 // fetchMetadataDocument fetches and validates the document at clientIDURL,

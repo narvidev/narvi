@@ -365,6 +365,78 @@ func TestCIMD_FailedRefetchKeptForOneGraceOnly(t *testing.T) {
 	}
 }
 
+// TestCIMD_FailedRefetchNeverTrustedPastTwoCacheLifetimes: the grace a
+// failed re-fetch gives never takes a document past two
+// MCPClientMetadataCacheTTL after its last successful fetch (technical
+// plan §43.15). A document last read a month ago, and gone since, gets no
+// grace when someone first asks for it again -- an unauthenticated
+// request included, which would otherwise choose when a fresh hour of
+// trust began: refused with a page, nothing stored, no stamp moved, so
+// the next authorization tries the fetch again. A document last read
+// almost two lifetimes ago is kept only for what is left of them. A
+// failure already recorded never keeps a document past that bound,
+// whatever stale time its row holds.
+func TestCIMD_FailedRefetchNeverTrustedPastTwoCacheLifetimes(t *testing.T) {
+	r := newASRig(t)
+	_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+	ttl := platform.DefaultTimeouts().MCPClientMetadataCacheTTL
+	r.serveDocument("Editor Plugin")
+	// A user connected it: a client holding a grant is never swept, so
+	// its row can sit unread for as long as nobody asks for it.
+	r.approve(t, forClient(r.authorizeParams(newVerifier(t)), docClientURL), cookie, "mcp:read")
+	gone := fakeDocument{err: fmt.Errorf("%w: status %d", cimdfetch.ErrUnexpectedStatus, http.StatusNotFound)}
+	pendingRequests := func() int {
+		var n int
+		if err := r.pool.QueryRow(context.Background(), `SELECT count(*) FROM mcp_oauth_authorization_requests`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	t.Run("last read a month ago: no grace", func(t *testing.T) {
+		// Microseconds: what a timestamptz keeps.
+		fetched := time.Now().Add(-30 * 24 * time.Hour).Truncate(time.Microsecond)
+		r.setMetadataStamps(t, docClientURL, fetched, fetched.Add(ttl), time.Time{})
+		r.documents.set(docClientURL, gone)
+		requests, fetches := pendingRequests(), r.documents.count(docClientURL)
+		for _, who := range []struct{ name, cookie string }{{"unauthenticated", ""}, {"signed in", cookie}} {
+			assertPageNotRedirect(t, who.name, r.authorize(forClient(r.authorizeParams(newVerifier(t)), docClientURL), who.cookie))
+		}
+		c, _ := r.clientRow(t, docClientURL)
+		if n := r.documents.count(docClientURL) - fetches; n != 2 || pendingRequests() != requests || c.MetadataRefetchFailedAt.Valid ||
+			!c.MetadataFetchedAt.Time.Equal(fetched) || !c.MetadataStaleAt.Time.Equal(fetched.Add(ttl)) {
+			t.Fatalf("fetches %d, requests stored %d, failure %v, fetched %v, stale %v; want a fetch each time, nothing stored, the row as it was",
+				n, pendingRequests()-requests, c.MetadataRefetchFailedAt, c.MetadataFetchedAt.Time, c.MetadataStaleAt.Time)
+		}
+	})
+
+	t.Run("last read almost two lifetimes ago: only what is left of them", func(t *testing.T) {
+		fetched := time.Now().Add(-2*ttl + 10*time.Minute).Truncate(time.Microsecond)
+		r.setMetadataStamps(t, docClientURL, fetched, fetched.Add(ttl), time.Time{})
+		r.documents.set(docClientURL, gone)
+		r.startConsent(t, forClient(r.authorizeParams(newVerifier(t)), docClientURL), cookie)
+		c, _ := r.clientRow(t, docClientURL)
+		if !c.MetadataRefetchFailedAt.Valid || !c.MetadataStaleAt.Time.Equal(fetched.Add(2*ttl)) {
+			t.Fatalf("failure %v, kept until %v; want the failure recorded and the document kept until %v, two lifetimes after its last fetch",
+				c.MetadataRefetchFailedAt, c.MetadataStaleAt.Time, fetched.Add(2*ttl))
+		}
+	})
+
+	t.Run("a recorded failure never outlasts the bound", func(t *testing.T) {
+		now := time.Now().Truncate(time.Microsecond)
+		// As a grace measured from the failure alone would leave the row:
+		// failed ten minutes ago, kept for fifty more -- but last read two
+		// lifetimes and a minute ago.
+		r.setMetadataStamps(t, docClientURL, now.Add(-2*ttl-time.Minute), now.Add(ttl-10*time.Minute), now.Add(-10*time.Minute))
+		r.documents.set(docClientURL, gone)
+		fetches := r.documents.count(docClientURL)
+		assertPageNotRedirect(t, "a failure recorded, past the bound", r.authorize(forClient(r.authorizeParams(newVerifier(t)), docClientURL), cookie))
+		if n := r.documents.count(docClientURL) - fetches; n != 1 {
+			t.Fatalf("fetches = %d, want 1: a document past its bound is fetched again, never used as fresh", n)
+		}
+	})
+}
+
 // TestCIMD_FailedRefetchNeverOverridesANewerFetch: a failed re-fetch
 // records its failure only on the row it read -- if another
 // authorization's re-fetch succeeded meanwhile (here with no-store, so

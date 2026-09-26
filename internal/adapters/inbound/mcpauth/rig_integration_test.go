@@ -601,10 +601,14 @@ func forClient(params url.Values, clientID string) url.Values {
 	return out
 }
 
-// staleDocument marks clientIDURL's cached document stale now.
+// staleDocument marks clientIDURL's cached document stale now, as a
+// short Cache-Control max-age leaves a document a minute after its fetch:
+// stale, and read recently enough that a failed re-fetch still earns its
+// whole grace (technical plan §43.15 bounds that grace by the last
+// successful fetch).
 func (r *asRig) staleDocument(t *testing.T, clientIDURL string) {
 	t.Helper()
-	tag, err := r.pool.Exec(context.Background(), `UPDATE mcp_oauth_clients SET metadata_stale_at = now() - interval '1 second', metadata_fetched_at = now() - interval '2 hours' WHERE client_id = $1`, clientIDURL)
+	tag, err := r.pool.Exec(context.Background(), `UPDATE mcp_oauth_clients SET metadata_stale_at = now() - interval '1 second', metadata_fetched_at = now() - interval '1 minute' WHERE client_id = $1`, clientIDURL)
 	if err != nil || tag.RowsAffected() != 1 {
 		t.Fatalf("mark %s stale: rows %d err %v", clientIDURL, tag.RowsAffected(), err)
 	}
