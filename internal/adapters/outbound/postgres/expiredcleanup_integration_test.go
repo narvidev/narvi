@@ -301,7 +301,8 @@ func TestExpiredCleanup_SweepsMCPRows(t *testing.T) {
 // whose only grant expired on the same tick; a younger one, one with a
 // live grant, one with a pending request, a metadata-document client
 // fetched again recently, one fetched long ago but still served from its
-// cache through a failed re-fetch's grace, a disabled client of either
+// cache through a failed re-fetch's grace (on a deployment whose cache
+// lifetime is long enough to allow that), a disabled client of either
 // kind however old (the disabled row IS the operator's block), and every
 // pre-registered client, however old and unused, survive.
 func TestExpiredCleanup_SweepsUnusedMCPClients(t *testing.T) {
@@ -377,10 +378,22 @@ func TestExpiredCleanup_SweepsUnusedMCPClients(t *testing.T) {
 	}
 	refetched := newDocument("https://refetched.example/client.json", old, recent)
 	// Fetched successfully long ago, its re-fetch failing since a moment
-	// ago: the authorization endpoint still serves it from its cache for
-	// one more cache lifetime, so it is not unused.
+	// ago, on a deployment whose MCPClientMetadataCacheTTL is over half
+	// MCPDynamicClientUnusedTTL (a valid setting: 14 hours against 24).
+	// That fetch is then less than two cache lifetimes old, so the
+	// authorization endpoint still serves the cached document until the
+	// end of the grace mcpauth's refetchGraceEnd gives -- the failure plus
+	// one TTL, never past the last successful fetch plus two -- and the
+	// client is not unused. With the default hour-long lifetime, no
+	// document read this long ago gets any grace.
+	const cacheTTL = 14 * time.Hour
+	failedAt := time.Now()
+	graceEnd := failedAt.Add(cacheTTL)
+	if bound := old.Add(2 * cacheTTL); bound.Before(graceEnd) {
+		graceEnd = bound
+	}
 	inGrace := newDocument("https://in-grace.example/client.json", old, old)
-	if _, err := clients.MarkMetadataRefetchFailed(ctx, inGrace.ID, old, time.Now(), time.Now().Add(platform.DefaultTimeouts().MCPClientMetadataCacheTTL)); err != nil {
+	if _, err := clients.MarkMetadataRefetchFailed(ctx, inGrace.ID, old, failedAt, graceEnd); err != nil {
 		t.Fatalf("record the failed re-fetch: %v", err)
 	}
 	disabledDynamic := newClient("narvi_mcp_d_disabled", sqlcgen.McpOauthClientKindDynamic, old)
