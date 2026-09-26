@@ -25,6 +25,17 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   not that member's -- whoever's it is -- and is audited as
   `mcp_authorization.revoked` with reason `admin`. Two routes added,
   graded MINOR (row 41).
+- Added: `POST /api/mcp-clients/{clientID}/disable` and
+  `POST /api/mcp-clients/{clientID}/enable` -- an administrator disables
+  or enables one MCP client of any kind (technical plan §43.15), admin only
+  (`authz.ActionManageIntegrations`, `403` for every other role). No
+  request body; each answers `200` with the existing `MCPClient`, as it now
+  stands, `404` when `clientID` names no client, and `409` when the client
+  is already in the state asked for. A disabled client is refused wherever
+  a client acts from its next request, and nothing under it is deleted;
+  its row is never swept, and a disabled metadata-document client's
+  document is never fetched again. Audited as `mcp_client.disabled` and
+  `mcp_client.enabled`. Two routes added, graded MINOR (row 41).
 - Unchanged as routes, changed in behaviour: `GET /oauth/authorize` and
   `POST /oauth/token` are now braked per client network (technical plan
   §43.14). Over the budget, the authorization endpoint answers its HTML
@@ -41,7 +52,9 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 - Changed (descriptions only, annotation-only PATCH):
   `MCPAuthorization` and `ListMCPAuthorizationsResponse` now also name the
   two admin routes above, and say that an administrator's view of a
-  member's authorizations is exactly what the member sees. No field, type,
+  member's authorizations is exactly what the member sees. `MCPClient`, its
+  `id` and its `disabledAt` now name the disable and enable routes, and
+  `disabledAt` says what a disabled client is refused. No field, type,
   enum value or requiredness changed.
 
 ## [1.5.0]

@@ -3246,14 +3246,14 @@ export interface ListMCPAuthorizationsResponse {
   authorizations: MCPAuthorization[];
 }
 /**
- * One OAuth client an MCP client program identifies itself as (technical plan §43.15) -- returned by POST /api/mcp-clients and listed by GET /api/mcp-clients (admin only, authz.ActionManageIntegrations). clientId is public (a public OAuth client with PKCE has no secret), so there is no write-only field here.
+ * One OAuth client an MCP client program identifies itself as (technical plan §43.15) -- returned by POST /api/mcp-clients, POST /api/mcp-clients/{clientID}/disable and POST /api/mcp-clients/{clientID}/enable, and listed by GET /api/mcp-clients (admin only, authz.ActionManageIntegrations). clientId is public (a public OAuth client with PKCE has no secret), so there is no write-only field here.
  *
  * This interface was referenced by `RestDtos`'s JSON-Schema
  * via the `definition` "MCPClient".
  */
 export interface MCPClient {
   /**
-   * The internal id DELETE /api/mcp-clients/{clientID} takes.
+   * The internal id DELETE /api/mcp-clients/{clientID}, POST /api/mcp-clients/{clientID}/disable and POST /api/mcp-clients/{clientID}/enable take.
    */
   id: string;
   /**
@@ -3278,7 +3278,7 @@ export interface MCPClient {
   clientUri: string | null;
   createdAt: string;
   /**
-   * Set when an operator disabled the client: its authorizations stop working on their next call. Null for an active client. goJSONSchema forces the literal *time.Time for the same named-pointer-type reason Plan.decidedAt documents in full.
+   * Set when an administrator disabled the client (POST /api/mcp-clients/{clientID}/disable; POST /api/mcp-clients/{clientID}/enable clears it): from its next request it is refused wherever a client acts, its authorizations included, and nothing under it is deleted. Null for an active client. goJSONSchema forces the literal *time.Time for the same named-pointer-type reason Plan.decidedAt documents in full.
    */
   disabledAt: string | null;
 }

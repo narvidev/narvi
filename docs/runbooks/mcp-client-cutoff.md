@@ -18,8 +18,9 @@ answers all of them.
 
 - **Settings → Integrations → MCP clients** (admin) lists every client of
   every kind: its name, its public `clientId`, its redirect URIs, when it was
-  registered and, when it is disabled, since when -- with its Delete
-  action. It does not show the internal `id` or the kind. The kind shows in the `clientId`: `narvi_mcp_c_...` is
+  registered and, when it is disabled, since when -- with its Delete and
+  Disable (or Enable) actions. It does not show the internal `id` or the
+  kind. The kind shows in the `clientId`: `narvi_mcp_c_...` is
   pre-registered, `narvi_mcp_d_...` registered itself (dynamic), and an https
   URL is a metadata-document client, the URL being its document's.
   `GET /api/mcp-clients` answers each client's `id` and `kind` too.
@@ -55,38 +56,44 @@ consent page. To keep an app out, cut off the client itself (next section).
 
 ## Stop an app for everyone: cut off its client
 
-**A pre-registered client, or a dynamically registered one** -- delete it:
-Settings → Integrations → MCP clients → Delete (`DELETE
-/api/mcp-clients/{clientID}`, the internal `id`). Every authorization, pending
-request, code and token issued to it goes with it. **Next call:** every
-user's access token gets `401`; a refresh, a code exchange or an
-authorization naming its `clientId` is refused as an unknown client. Audited:
-`mcp_client.deleted`, plus one `mcp_authorization.revoked` (reason
-`client_deleted`) per authorization it took. Permanent. A dynamically
-registered app can register afresh -- under a new `clientId`, and only while
-`NARVI_MCP_DCR_ENABLED=true` -- and its users would then have to approve it
-again.
+Two actions, both under Settings → Integrations → MCP clients (admin), both
+audited, both taking the internal `id`:
 
-**A metadata-document client -- do not delete it to keep it out.** Its
-`clientId` is its URL, and the next authorization naming that URL registers it
-again, enabled. Disable its row instead; a disabled row is the block: it is
-never swept, and its document is never fetched again (§43.15).
+- **Disable** (`POST /api/mcp-clients/{clientID}/disable`; audited
+  `mcp_client.disabled`). **Next call:** every token issued to the client
+  gets `401`; its refresh gets `invalid_client`; its authorization and
+  consent pages show an error page and never redirect; it may still give its
+  tokens back (`POST /oauth/revoke`). Nothing is deleted: every
+  authorization stays listed, and each user can still revoke theirs. A
+  disabled row is never swept as unused, and a disabled metadata-document
+  client's document is never fetched again. **Enable**
+  (`POST /api/mcp-clients/{clientID}/enable`; audited `mcp_client.enabled`)
+  undoes it: the client carries on with whatever has not lapsed meanwhile,
+  with no new consent. Either answers `409` when the client is already in
+  that state.
+- **Delete** (`DELETE /api/mcp-clients/{clientID}`; audited
+  `mcp_client.deleted`, plus one `mcp_authorization.revoked`, reason
+  `client_deleted`, per authorization it took). Every authorization, pending
+  request, code and token issued to the client goes with it. **Next call:**
+  every user's access token gets `401`; a refresh, a code exchange or an
+  authorization naming its `clientId` is refused as an unknown client --
+  until something registers that `clientId` again (below). Cannot be undone.
 
-**Any single client, paused rather than deleted** -- disable its row. There
-is no API for it; in SQL:
+What keeps the app out depends on how its client was registered (the kind:
+"Find the client" above):
 
-```sql
-UPDATE mcp_oauth_clients SET disabled_at = now()
-WHERE client_id = '<clientId>' AND disabled_at IS NULL;
-```
+| Kind | Disable | Delete |
+|---|---|---|
+| pre-registered (`narvi_mcp_c_...`) | keeps it out until enabled | keeps it out for good: only an administrator can register it again, and a new registration gets a new `clientId` |
+| metadata document (an https URL) | keeps it out until enabled: the disabled row is the block | does **not** keep it out: the next authorization naming the URL fetches its document and registers it afresh, enabled -- disable it instead |
+| dynamic (`narvi_mcp_d_...`) | stops that `clientId` only | stops that `clientId` only |
 
-**Next call:** every token issued to it gets `401`; its refresh gets
-`invalid_client`; its authorization and consent pages show an error page and
-never redirect; it may still give its tokens back (`POST /oauth/revoke`).
-Nothing is deleted: every authorization stays listed, and each user can still
-revoke theirs. Undo with `SET disabled_at = NULL`: the client carries on with
-whatever has not lapsed meanwhile, with no new consent. A direct database
-write is **not** audited -- record it in the incident notes.
+A dynamically registered app is kept out by neither: while
+`NARVI_MCP_DCR_ENABLED=true` it can register afresh under a new `clientId`,
+and nothing ties that registration to the old one. Each of its users would
+have to approve the new registration, and until they do it can do nothing.
+To keep such apps out, switch dynamic registration off (next item), which
+pauses every one of them.
 
 **Every client of one registration mechanism** -- set
 `NARVI_MCP_CIMD_ENABLED=false` (metadata-document clients) or
@@ -104,8 +111,8 @@ listed and revoked.
 ## Revoke every authorization
 
 - **Of one client:** delete the client (above). For a metadata-document
-  client, disable it first, then revoke its authorizations one by one through
-  the members' Connected apps drawers (audited), or in SQL:
+  client, disable it instead, then revoke its authorizations one by one
+  through the members' Connected apps drawers (audited), or in SQL:
   `DELETE FROM mcp_oauth_grants WHERE client_id = (SELECT id FROM
   mcp_oauth_clients WHERE client_id = '<clientId>');` (not audited).
 - **Of every client, deployment-wide:** there is no single API call. The

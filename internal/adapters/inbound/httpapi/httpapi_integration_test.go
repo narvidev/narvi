@@ -692,6 +692,8 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		r.Get("/", httpapi.ListMCPClients(rig.mcpClients))
 		r.Post("/", httpapi.CreateMCPClient(rig.pool, rig.mcpClients, rig.auditLog))
 		r.Delete("/{clientID}", httpapi.DeleteMCPClient(rig.pool, rig.mcpClients, rig.mcpGrants, rig.auditLog))
+		r.Post("/{clientID}/disable", httpapi.DisableMCPClient(rig.pool, rig.mcpClients, rig.auditLog))
+		r.Post("/{clientID}/enable", httpapi.EnableMCPClient(rig.pool, rig.mcpClients, rig.auditLog))
 	})
 	router.Route("/api/me/chatgpt-link", func(r chi.Router) {
 		r.Use(auth.Middleware(rig.userSessions, rig.users))

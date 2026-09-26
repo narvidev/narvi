@@ -58,8 +58,10 @@ found only through the symptom someone reports. See
 through Narvi's own OAuth authorization server that must stop acting for
 the users who approved it: see
 [mcp-client-cutoff.md](runbooks/mcp-client-cutoff.md) for revoking one
-user's authorization, deleting or disabling a client (a client identified
-by a metadata document must be disabled, never deleted, to keep it out),
+user's authorization, deleting or disabling a client (which one keeps an
+app out depends on how it registered: a client identified by a metadata
+document must be disabled, never deleted, and an app that registered
+itself is kept out only by switching dynamic registration off),
 pausing a registration mechanism, revoking every authorization, and what
 each does on the client's next call — and for an app whose users are
 refused "too many sign-ins waiting" or "too many requests".

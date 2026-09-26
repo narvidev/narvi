@@ -433,6 +433,34 @@ Administrators decide which apps may ask at all, in the same panel:
 {"name": "Delete a registered MCP client, disconnecting every user of it (admin)", "route": "DELETE /api/mcp-clients/{clientID}"}
 ```
 
+```json narvi-command
+{"name": "Disable an MCP client, refusing every user of it from its next call (admin)", "route": "POST /api/mcp-clients/{clientID}/disable"}
+```
+
+```json narvi-command
+{"name": "Enable a disabled MCP client again (admin)", "route": "POST /api/mcp-clients/{clientID}/enable"}
+```
+
+Deleting and disabling a client differ, and which one keeps an app out
+depends on how the app came to be known. Deleting removes the client and
+every authorization issued to it, for good. That keeps out an app an
+administrator registered, since only an administrator can register it
+again. It does not keep out an app known by its description's address:
+the next time anyone starts to connect it, Narvi reads its description
+again and registers it afresh. Nor does it keep out an app that registered
+itself, which can register again under a new client ID for as long as the
+deployment allows that. Disabling refuses the client from its very next
+call — it can no longer be approved, renew its access or call `/mcp`,
+though it can still disconnect itself — and deletes nothing: each approval
+stays listed and can still be revoked, and enabling the client lets it
+carry on with the access it still holds, without asking anyone again,
+unless that access lapsed meanwhile. A disabled client stays as it is:
+Narvi never reads a disabled app's description again and never removes it
+as unused, so disabling is how an app known by its description's address
+is kept out. An app that registered itself can register again under a new
+client ID whichever you do; only switching self-registration off (below)
+keeps such apps out, and it pauses every one of them.
+
 Administrators also see every member's connected apps, in Settings →
 Members & access, under the "Connected apps" button on the member's row: the
 same list the member sees under Integrations — never a token, which exists
@@ -441,9 +469,9 @@ a confirmation that disconnects the app on the member's behalf. The app's
 very next call is refused, exactly as when the member disconnects it, and
 the audit log records it as revoked by that administrator, naming the
 member. It withdraws what was approved, not the app itself: the member can
-approve the app again. To keep an app out, an administrator deletes its
-client — or, for an app known by its description's address, which a
-deletion would let register again, disables it; the on-call runbook
+approve the app again. To keep an app out, an administrator disables its
+client, or deletes it if an administrator registered it — for an app that
+registered itself, neither holds (above); the on-call runbook
 [`mcp-client-cutoff.md`](../runbooks/mcp-client-cutoff.md) says how, and what
 each step does on the app's next call.
 
@@ -459,8 +487,8 @@ each step does on the app's next call.
 `NARVI_MCP_ENABLED=true`; while it is off, `/oauth/...` answers `503` — but
 the Settings routes above keep working, so an authorization can always be
 listed and revoked. Every role, viewer included, can connect an app and
-disconnect its own; only an admin can register or delete a client, or see
-and revoke another member's apps — any other role gets `403`, and an
+disconnect its own; only an admin can register, delete, disable or enable a
+client, or see and revoke another member's apps — any other role gets `403`, and an
 authorization that is not that member's is `404`, whoever it belongs to.
 Starting authorizations and renewing tokens are braked per network (one
 address, or one IPv6 `/48`): a burst of ten, then one every three seconds
@@ -482,8 +510,9 @@ disconnect itself. A pause deletes nothing — the app stays under Connected
 apps, where you can still disconnect it — and switching the setting back on
 lets the app carry on with the access it still holds, without asking you
 again, unless that access lapsed meanwhile (30 days after the app last
-renewed it, or 90 days after your approval). To cut an app off for good,
-disconnect it, or have an administrator delete it. Narvi never
+renewed it, or 90 days after your approval). To withdraw your own access
+for good, disconnect the app; to cut an app off for everyone, an
+administrator disables or deletes its client (above). Narvi never
 reads an app's description from this machine or a private network address,
 and an app whose description cannot be read, or names any address but its
 own, is shown an error page the first time. Narvi trusts a description it
@@ -496,8 +525,9 @@ has not read for longer than that is not used at all. After that the app
 is shown an error page until its description can be read again.
 Disconnecting deletes the authorization outright, and deleting a client
 deletes every authorization issued to it — neither can be undone, and one
-authorization cannot be paused: the only pause is the deployment-wide one
-above, switching off how an app registered.
+authorization cannot be paused: the pauses are an administrator disabling
+one client, and the deployment-wide one above, switching off how an app
+registered.
 An app registered with a redirect address that does not match exactly
 (except the port of a `127.0.0.1`/`[::1]` address) is shown an error page
 and your browser is never sent anywhere. Each approval is single-use and

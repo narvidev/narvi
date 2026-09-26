@@ -79,6 +79,14 @@
 // has its request, so its client is never even a candidate
 // (TestLockOrder_ClientRegistrationWriters).
 //
+// An administrator's disable or enable of a client
+// (MCPOAuthClientStore.Disable/Enable, technical plan §43.15) is, like the
+// upsert, ONE statement locking ONE row -- the client, FOR NO KEY UPDATE,
+// since disabled_at is no key column -- followed only by its audit row,
+// outside this schema. It waits at most once, holding nothing, so it can
+// never be part of a wait cycle, and it never conflicts with the FOR KEY
+// SHARE an issuance or a grant revocation takes.
+//
 // Refresh tokens also reference each other (superseded_by, ON DELETE SET
 // NULL), which adds no cycle. Under its grant, the refresh grant locks
 // only the token it inserts -- a row no other transaction can know of yet

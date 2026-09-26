@@ -2755,11 +2755,13 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// /api/me/mcp-authorizations, /api/mcp-clients (technical plan
 	// §43.15/§43.18): Settings' own view of the MCP authorization server --
 	// a user's own connected clients (list, revoke) and the admin-only
-	// pre-registration of clients. Ordinary cookie-authenticated /api
-	// groups, each handler rendering its own authz verdict. Deliberately
-	// NOT behind mcpadapter.RequireEnabled: an operator who turns the
-	// surface off must still be able to see and revoke every
-	// authorization it issued, and to remove a client.
+	// pre-registration, deletion, disabling and enabling of clients (a
+	// client of any kind may be disabled: the durable block a deletion is
+	// not for a client that can come back). Ordinary cookie-authenticated
+	// /api groups, each handler rendering its own authz verdict.
+	// Deliberately NOT behind mcpadapter.RequireEnabled: an operator who
+	// turns the surface off must still be able to see and revoke every
+	// authorization it issued, and to remove or disable a client.
 	router.Route("/api/me/mcp-authorizations", func(r chi.Router) {
 		r.Use(auth.Middleware(userSessionStore, userStore))
 		r.Get("/", httpapi.ListMyMCPAuthorizations(mcpOAuthGrantStore))
@@ -2770,6 +2772,8 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		r.Get("/", httpapi.ListMCPClients(mcpOAuthClientStore))
 		r.Post("/", httpapi.CreateMCPClient(pool, mcpOAuthClientStore, auditLogStore))
 		r.Delete("/{clientID}", httpapi.DeleteMCPClient(pool, mcpOAuthClientStore, mcpOAuthGrantStore, auditLogStore))
+		r.Post("/{clientID}/disable", httpapi.DisableMCPClient(pool, mcpOAuthClientStore, auditLogStore))
+		r.Post("/{clientID}/enable", httpapi.EnableMCPClient(pool, mcpOAuthClientStore, auditLogStore))
 	})
 
 	// Module routes (docs/design/boundaries-design.md, section 3.2): mounted

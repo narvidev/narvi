@@ -5018,9 +5018,11 @@ func (j *MCPAuthorization) UnmarshalJSON(value []byte) error {
 }
 
 // One OAuth client an MCP client program identifies itself as (technical plan
-// §43.15) -- returned by POST /api/mcp-clients and listed by GET /api/mcp-clients
-// (admin only, authz.ActionManageIntegrations). clientId is public (a public OAuth
-// client with PKCE has no secret), so there is no write-only field here.
+// §43.15) -- returned by POST /api/mcp-clients, POST
+// /api/mcp-clients/{clientID}/disable and POST /api/mcp-clients/{clientID}/enable,
+// and listed by GET /api/mcp-clients (admin only, authz.ActionManageIntegrations).
+// clientId is public (a public OAuth client with PKCE has no secret), so there is
+// no write-only field here.
 type MCPClient struct {
 	// The public OAuth client_id to configure in the MCP client program.
 	ClientId string `json:"clientId" yaml:"clientId" mapstructure:"clientId"`
@@ -5034,13 +5036,17 @@ type MCPClient struct {
 	// CreatedAt corresponds to the JSON schema field "createdAt".
 	CreatedAt time.Time `json:"createdAt" yaml:"createdAt" mapstructure:"createdAt"`
 
-	// Set when an operator disabled the client: its authorizations stop working on
-	// their next call. Null for an active client. goJSONSchema forces the literal
-	// *time.Time for the same named-pointer-type reason Plan.decidedAt documents in
-	// full.
+	// Set when an administrator disabled the client (POST
+	// /api/mcp-clients/{clientID}/disable; POST /api/mcp-clients/{clientID}/enable
+	// clears it): from its next request it is refused wherever a client acts, its
+	// authorizations included, and nothing under it is deleted. Null for an active
+	// client. goJSONSchema forces the literal *time.Time for the same
+	// named-pointer-type reason Plan.decidedAt documents in full.
 	DisabledAt *time.Time `json:"disabledAt" yaml:"disabledAt" mapstructure:"disabledAt"`
 
-	// The internal id DELETE /api/mcp-clients/{clientID} takes.
+	// The internal id DELETE /api/mcp-clients/{clientID}, POST
+	// /api/mcp-clients/{clientID}/disable and POST /api/mcp-clients/{clientID}/enable
+	// take.
 	Id string `json:"id" yaml:"id" mapstructure:"id"`
 
 	// Matches Postgres mcp_oauth_client_kind exactly

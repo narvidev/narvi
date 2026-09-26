@@ -117,6 +117,78 @@ func (q *Queries) DeleteUnusedMCPOAuthClients(ctx context.Context, arg DeleteUnu
 	return result.RowsAffected(), nil
 }
 
+const disableMCPOAuthClient = `-- name: DisableMCPOAuthClient :one
+UPDATE mcp_oauth_clients
+SET disabled_at = now()
+WHERE id = $1 AND disabled_at IS NULL
+RETURNING id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at, metadata_fetched_at, metadata_stale_at, metadata_refetch_failed_at
+`
+
+// DisableMCPOAuthClient and EnableMCPOAuthClient back an administrator's
+// POST /api/mcp-clients/{clientID}/disable and /enable (technical plan
+// §43.15). A disabled client is refused wherever a client acts -- the
+// authorization endpoint, both consent routes, the token endpoint by code
+// and by refresh, every /mcp call -- from its next request, and may still
+// give its tokens back; nothing under it is deleted. Its row is the durable
+// block: the unused-client sweep never deletes a disabled client, and a
+// disabled metadata-document client's document is never fetched again, so
+// the next authorization naming its URL finds it, still disabled. Enabling
+// lets it carry on with whatever it still holds.
+//
+// Each is ONE statement taking ONE row lock -- the client, FOR NO KEY
+// UPDATE (disabled_at is no key column) -- like the metadata document's
+// upsert (the lock order at the top of mcpoauthgrant_store.go): it
+// conflicts with an authorization storing a request, the upsert, a failed
+// re-fetch's record, a deletion and the sweep, never with the FOR KEY SHARE
+// an issuance or a grant revocation takes. pgx.ErrNoRows means no such
+// client, or one already in the state asked for.
+func (q *Queries) DisableMCPOAuthClient(ctx context.Context, id pgtype.UUID) (McpOauthClient, error) {
+	row := q.db.QueryRow(ctx, disableMCPOAuthClient, id)
+	var i McpOauthClient
+	err := row.Scan(
+		&i.ID,
+		&i.ClientID,
+		&i.Kind,
+		&i.ClientName,
+		&i.ClientUri,
+		&i.RedirectUris,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.DisabledAt,
+		&i.MetadataFetchedAt,
+		&i.MetadataStaleAt,
+		&i.MetadataRefetchFailedAt,
+	)
+	return i, err
+}
+
+const enableMCPOAuthClient = `-- name: EnableMCPOAuthClient :one
+UPDATE mcp_oauth_clients
+SET disabled_at = NULL
+WHERE id = $1 AND disabled_at IS NOT NULL
+RETURNING id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at, metadata_fetched_at, metadata_stale_at, metadata_refetch_failed_at
+`
+
+func (q *Queries) EnableMCPOAuthClient(ctx context.Context, id pgtype.UUID) (McpOauthClient, error) {
+	row := q.db.QueryRow(ctx, enableMCPOAuthClient, id)
+	var i McpOauthClient
+	err := row.Scan(
+		&i.ID,
+		&i.ClientID,
+		&i.Kind,
+		&i.ClientName,
+		&i.ClientUri,
+		&i.RedirectUris,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.DisabledAt,
+		&i.MetadataFetchedAt,
+		&i.MetadataStaleAt,
+		&i.MetadataRefetchFailedAt,
+	)
+	return i, err
+}
+
 const getMCPOAuthClientByClientID = `-- name: GetMCPOAuthClientByClientID :one
 SELECT id, client_id, kind, client_name, client_uri, redirect_uris, created_by, created_at, disabled_at, metadata_fetched_at, metadata_stale_at, metadata_refetch_failed_at FROM mcp_oauth_clients
 WHERE client_id = $1

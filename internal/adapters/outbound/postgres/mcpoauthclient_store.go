@@ -146,6 +146,21 @@ func (s *MCPOAuthClientStore) DeleteUnused(ctx context.Context, unusedBefore tim
 	return deleted, err
 }
 
+// Disable sets the client's disabled_at and returns the row
+// (queries/mcp_oauth_clients.sql's own doc comment): from its next request
+// the client is refused wherever a client acts, and nothing under it is
+// deleted. One statement, one row lock. pgx.ErrNoRows means no such client,
+// or one already disabled.
+func (s *MCPOAuthClientStore) Disable(ctx context.Context, id pgtype.UUID) (sqlcgen.McpOauthClient, error) {
+	return s.q.DisableMCPOAuthClient(ctx, id)
+}
+
+// Enable clears the client's disabled_at and returns the row. pgx.ErrNoRows
+// means no such client, or one not disabled.
+func (s *MCPOAuthClientStore) Enable(ctx context.Context, id pgtype.UUID) (sqlcgen.McpOauthClient, error) {
+	return s.q.EnableMCPOAuthClient(ctx, id)
+}
+
 // Delete removes a client by internal id and returns the deleted row
 // (pgx.ErrNoRows when there was none). Every grant, pending authorization
 // request, code, access token and refresh token issued to the client

@@ -7141,8 +7141,22 @@ optional homepage, and its registered redirect URIs. There are three ways to cre
 generates the `client_id` and records `mcp_client.created`; `DELETE /api/mcp-clients/{clientID}` removes
 the client and, by cascade, every grant, pending request, code and token issued to it, auditing
 `mcp_client.deleted` and one `mcp_authorization.revoked` (reason `client_deleted`) per grant it took with
-it. Every affected user's client stops working on its next call. `disabled_at` is an operator kill
-switch the bearer check honors on every call.
+it. Every affected user's client stops working on its next call. An administrator disables or enables
+any client, of any kind: `POST /api/mcp-clients/{clientID}/disable` and `/enable`
+(`authz.ActionManageIntegrations`; `404` for no such client, `409` for one already in that state), each
+one statement on the client row that sets or clears `disabled_at`, audited as `mcp_client.disabled` or
+`mcp_client.enabled`. A disabled client is refused wherever a client acts, from its next request — the
+authorization endpoint and both consent routes show an error page and never redirect, the token endpoint
+answers `invalid_client` by code and by refresh, and every `/mcp` call with one of its tokens is `401`,
+the bearer check reading `disabled_at` on every call — while it may still give its tokens back (§43.14).
+Nothing is deleted: every grant stays listed, and each user may still revoke theirs; enabling the client
+lets it carry on with whatever it still holds, with no new consent. What keeps an app out depends on how
+its client was registered. Deleting keeps out a pre-registered client, which only an administrator can
+register again. It does not keep out a metadata-document client, which the next authorization naming its
+URL registers afresh, enabled; disabling does, since a disabled client is never swept and its document
+never fetched again (below). Neither keeps out a dynamically registered app: it can register afresh under
+a new `client_id` while dynamic registration is on, and nothing ties the new registration to the old one;
+only switching dynamic registration off keeps such apps out, pausing every one of them.
 
 The redirect URI rule (`internal/domain/mcpclient`) is enforced identically at registration and at
 authorization, so the consent page can never see a URI that could not have been registered: `https://`
@@ -7269,7 +7283,7 @@ what it created, so the expired-credential sweep deletes a dynamically registere
 client with no grant and no authorization request once it was last used — the latest of its
 registration, its last successful fetch and the end of the time its cached document may be used, a
 failed re-fetch's grace included — more than `MCPDynamicClientUnusedTTL` (24 hours) ago. Pre-registered
-clients are never swept, and neither is a client an operator disabled: a metadata-document client's URL
+clients are never swept, and neither is a client an administrator disabled: a metadata-document client's URL
 is its identity, so its disabled row IS the block — deleting it would let the next authorization register
 the same URL afresh, enabled. A client whose consent is in flight always has its request, so it is never
 a candidate; and the sweep locks its candidates before deleting only those a fresh look still finds
@@ -7375,7 +7389,10 @@ holding the client (its `FOR NO KEY UPDATE`) or a grant whose insert holds it (i
 KEY SHARE`) when the sweep arrives makes the sweep wait, and, once committed, keeps its client. A dynamic registration inserts a new row and locks
 nothing that exists: nothing queues behind it, and it queues behind nothing
 (`TestLockOrder_ClientRegistrationWriters`, both orders of every pair, each re-fetch race run with the
-fetch succeeding and failing).
+fetch succeeding and failing). An administrator's disable or enable of a client is, like the upsert, one
+statement taking one row lock — the client, `FOR NO KEY UPDATE`, since `disabled_at` is no key column —
+followed only by its audit row, outside this schema: it waits at most once, holding nothing, so it can
+never be part of a wait cycle, and it never waits on nor holds up an issuance or a grant revocation.
 
 Lifetimes live in `platform/timeouts.go`: `MCPAuthorizationRequestTTL` (10 minutes, the consent window),
 `MCPAuthorizationCodeTTL` (60 seconds), `MCPAccessTokenTTL` (1 hour), `MCPRefreshTokenTTL` (30 days per
@@ -7461,8 +7478,8 @@ app again never takes back what an earlier approval issued, refresh chains inclu
 /api/me/mcp-authorizations/{authorizationID}` (`authz.ActionRevokeOwnMCPAuthorization`, open to every
 role and deliberately separate from the connect action so disconnecting can never be taken away) deletes
 one of the caller's own grants — another user's id is indistinguishable from a missing one (404) — and
-records `mcp_authorization.revoked` (reason `user`). Administrators register and delete clients in the
-same panel (`/api/mcp-clients`, §43.15).
+records `mcp_authorization.revoked` (reason `user`). Administrators register, delete, disable and enable
+clients in the same panel (`/api/mcp-clients`, §43.15).
 
 An administrator sees every member's authorizations in Settings → Members & access, in a "Connected apps"
 drawer on the member's row, and revokes one on the member's behalf. `GET
@@ -7475,12 +7492,14 @@ received it, so an administrator can neither see nor use one. `DELETE
 reaches only a grant belonging to that member — any other id, another member's grant included, is the
 same `404` as a missing one — and records `mcp_authorization.revoked`, reason `admin`, attributed to the
 administrator, with `detail.target_user_id` naming the member. It withdraws what was approved, not the app:
-the member can approve it again, and keeping an app out is deleting or disabling its client
-(`docs/runbooks/mcp-client-cutoff.md`). Like the member's own routes, neither is behind the MCP
-enabled-gate, and every other role is refused `403`.
+the member can approve it again. Keeping the app out is cutting off its client, and what does that
+depends on the client's kind (§43.15): disabling holds for a pre-registered or metadata-document client,
+deleting only for a pre-registered one, and neither for a dynamically registered app, which can register
+afresh while dynamic registration is on (`docs/runbooks/mcp-client-cutoff.md`). Like the member's own
+routes, neither is behind the MCP enabled-gate, and every other role is refused `403`.
 
 Audit rows, each written in the same transaction as the change: `mcp_client.created`,
-`mcp_client.deleted` (resource type `mcp_client`); `mcp_authorization.granted` and
+`mcp_client.deleted`, `mcp_client.disabled`, `mcp_client.enabled` (resource type `mcp_client`); `mcp_authorization.granted` and
 `mcp_authorization.revoked` with `detail.reason` one of `user`, `admin`, `client_deleted`, `code_reuse`,
 `refresh_reuse`, `client` (resource type `mcp_authorization`); an `admin` row is attributed to the
 administrator, with `detail.target_user_id`. A `code_reuse` or `refresh_reuse` row is
@@ -7506,7 +7525,7 @@ a brake or the pending-request cap (§43.14), which is logged instead.
 | Metadata-document fetch as SSRF | one outbound adapter, constructible only with its guard; every address checked at dial time, after resolution, on every redirect and every re-resolution (loopback, private, link-local and the cloud metadata address, CGNAT, multicast, unspecified, reserved, and their IPv4-mapped and NAT64 forms); `https` only with no downgrade, at most three redirects, each within the first URL's own origin, every host written in plain ASCII and compared by ASCII case only (the string the fetch resolves), no environment proxy, `application/json` only, a body that says where it ends, 64 KiB of decoded document, one timeout the body must be read to its end within; the only way past the guard is a test seam production never sets | `TestCIMDFetch_RefusesPrivateTargets`, `TestCIMDFetch_RefusesCrossOriginRedirects`, `TestCheckRedirect_Table`, `TestOrigin_Table`, `TestCIMDFetch_RefusesHTTPAndOversize`, `TestCIMDFetch_IgnoresEnvironmentProxy`, `TestCIMDFetch_FetchesThroughTheSeamOnly`, `TestCheckAddr_Table`, `TestControl_ChecksTheConnectingAddress`, `TestFetch_ABodyEndedBecauseTheFetchGaveUpIsATimeout`, `TestOAuth_ProductionRouter/MetadataDocument_ProductionGuardRefusesLoopback` (no connection accepted, the refusal's cause the guard's own) |
 | A changed client document changing issued credentials | a re-fetched document changes what the next authorization sees, never an issued code's redirect binding, a token's scopes or a refresh chain; the cache is a fixed hour that cache headers only shorten, and a lowered ceiling caps a stored stale time; a stale document whose re-fetch fails is kept one more hour from the first failure, never past two hours after its last successful fetch, then refused until a fetch succeeds, and a failure never overrides a newer fetch | `TestCIMD_RefetchNeverChangesIssuedCredentials`, `TestCIMD_FailedRefetchNeverTrustedPastTwoCacheLifetimes`, `TestCIMD_CacheTTLOnlyShortened`, `TestCIMD_CacheTTLOnlyShortened_Stored`, `TestCIMD_LoweredCacheTTLCapsAStoredStaleTime`, `TestCIMD_AuthorizationEndpoint`, `TestCIMD_FailedRefetchKeptForOneGraceOnly`, `TestCIMD_FailedRefetchNeverOverridesANewerFetch` |
 | A registration mechanism switched off | every client it registered is refused like a disabled one — authorization, consent, token endpoint, `/mcp` — and may still revoke; a pause, not a deletion: nothing is deleted, and switching the mechanism back on resumes each client's unexpired access with no new consent; a disabled metadata-document client's document is never fetched again, and a disabled client is never swept, so its block outlives any idle time | `TestClientMechanismSwitchedOff_RefusedEverywhere`, `TestMechanisms_Accepts`, `TestRequireMCPBearer_Table`, `TestCIMD_DisabledClientSurvivesTheSweep`, `TestOAuth_ProductionRouter/MetadataDocuments_Disabled`, `TestOAuth_ProductionRouter/DynamicRegistration_Disabled` (each on the very resource the refused token was issued for) |
-| Revoked, disabled or deleted principals | one join per call, no cache; deleting a client cascades its grants and every refresh chain under them, each grant audited; a disabled client gets no consent page and no token, by code or by refresh; a client's RFC 7009 revocation of either token type, expired or rotated or not, deletes the grant, and never another client's; an administrator's revocation on a member's behalf deletes that member's grant and no other — any other id is a `404` — is audited as the administrator's, and shows the administrator no token, since none exists in plaintext; a revocation racing a consent, code exchange or refresh waits for it, then deletes what it issued, and two revocations of one grant audit it once (§43.16's lock order) | `TestBearer_NoCacheBetweenCalls`, `TestLockOrder_RevocationRacingIssuance`, `TestLockOrder_RevocationRacingClientDeletion`, `TestLockOrder_AdminAndUserRevokeOneGrant`, `TestMemberMCPAuthorizations_AdminListAndRevoke`, `TestOAuth_ProductionRouter/RevokedAuthorizationStopsOnNextCall_Admin`, `TestRevoke_RFC7009_StopsOnNextCall`, `TestRevoke_ExpiredOrRotatedTokenStillRevokes`, `TestRevoke_Refusals`, `TestRefresh_DisabledClientCannotRefresh`, `TestMCPOAuthGrantStore_RevocationCascadesRefreshChain`, `TestOAuth_ProductionRouter/RevokedAuthorizationStopsOnNextCall_User`, `_RFC7009`, `_ClientDeleted`, `_DisabledUser`, `TestOAuth_ProductionRouter/DisabledClientIs401NextCall`, `TestClient_DeleteCascadesGrants`, `TestClient_DeleteAuditsGrantAddedByConcurrentConsent`, `TestConsent_ClientDisabledBeforeRenderRefused`, `TestLockOrder_ClientRegistrationWriters` |
+| Revoked, disabled or deleted principals | one join per call, no cache; deleting a client cascades its grants and every refresh chain under them, each grant audited; a disabled client gets no consent page and no token, by code or by refresh; a client's RFC 7009 revocation of either token type, expired or rotated or not, deletes the grant, and never another client's; an administrator's revocation on a member's behalf deletes that member's grant and no other — any other id is a `404` — is audited as the administrator's, and shows the administrator no token, since none exists in plaintext; an administrator's disable of any client refuses its tokens on their next use and deletes nothing, and a disabled metadata-document client is never swept nor its document fetched again, so it stays out where a deletion would let it register afresh; a revocation racing a consent, code exchange or refresh waits for it, then deletes what it issued, and two revocations of one grant audit it once (§43.16's lock order) | `TestBearer_NoCacheBetweenCalls`, `TestLockOrder_RevocationRacingIssuance`, `TestLockOrder_RevocationRacingClientDeletion`, `TestLockOrder_AdminAndUserRevokeOneGrant`, `TestMemberMCPAuthorizations_AdminListAndRevoke`, `TestOAuth_ProductionRouter/RevokedAuthorizationStopsOnNextCall_Admin`, `TestRevoke_RFC7009_StopsOnNextCall`, `TestRevoke_ExpiredOrRotatedTokenStillRevokes`, `TestRevoke_Refusals`, `TestRefresh_DisabledClientCannotRefresh`, `TestMCPOAuthGrantStore_RevocationCascadesRefreshChain`, `TestOAuth_ProductionRouter/RevokedAuthorizationStopsOnNextCall_User`, `_RFC7009`, `_ClientDeleted`, `_DisabledUser`, `TestOAuth_ProductionRouter/DisabledClientIs401NextCall`, `TestMCPClients_DisableEnable`, `TestOAuth_ProductionRouter/DisabledDynamicClient_RefusedNextCall`, `TestOAuth_ProductionRouter/DisabledMetadataDocumentClient_SurvivesTheSweepNeverFetched`, `TestClient_DeleteCascadesGrants`, `TestClient_DeleteAuditsGrantAddedByConcurrentConsent`, `TestConsent_ClientDisabledBeforeRenderRefused`, `TestLockOrder_ClientRegistrationWriters` |
 | Discovery leak | per-request tool registration by scope; composed instructions; empty defect server | `TestToolsList_ScopeFilter_Table`, `TestInstructions_NameOnlyVisibleTools`, `TestHiddenToolCall_IsIndistinguishableFromUnknownTool`, `TestOAuth_ProductionRouter/ScopelessGrant_ToolsListEmpty` |
 | Phishing through the login return path | the sign-in view accepts only `/oauth/consent?request=<uuid>` as a server-rendered return target; both login handlers accept only same-origin paths | `TestLogin_NextAcceptsConsentPath`, `TestOIDCLogin_NextReturnsToConsentPage`, the sign-in view's own return-to test |
 | Table growth | a TTL on every row kind, rotated refresh tokens included, swept; unused, enabled self-registered clients swept, never one whose request or grant committed while the sweep waited; dynamic registration and the authorization endpoint braked per client network (`RemoteAddr` only; IPv6 by /48), with bounded limiter memory that no network can use to lock out another; at most `MCPMaxPendingAuthorizationRequestsPerClient` requests of one client pending, counted and stored under the client's lock so no race exceeds it, refused past it with a page that stores nothing and a WARN line naming the client and the refused request's network — a flood for one client can hold that client at its cap, stated in §43.14, never touching a connected app or another client | `TestExpiredCleanup_SweepsMCPRows`, `TestExpiredCleanup_SweepsUnusedMCPClients`, `TestLockOrder_ClientRegistrationWriters`, `TestLockOrder_AuthorizationRequestWriter`, `TestAuthorize_PendingCapRefused`, `TestMCPOAuthGrantStore_PendingAuthorizationRequestCap`, `TestRateLimiter_BurstThenOnePerInterval`, `TestRateLimiter_BoundedMemoryEvictsLeastRecentlyUsed`, `TestRateLimiter_OneNetworkCannotLockOutOthers`, `TestClientAddressKey`, `TestAuthorizeRateLimited_Answer`, `TestOAuth_ProductionRouter/Register_RateLimited`, `TestOAuth_ProductionRouter/RateLimit_AuthorizeEndpoint`, `TestOAuth_ProductionRouter/Authorize_PendingCapRefused` |
@@ -7536,7 +7555,12 @@ token, so the switch is the only thing that can refuse it. Piece (d)'s proofs ru
 too. `RevokedAuthorizationStopsOnNextCall_Admin` has an administrator list the member's authorizations
 and revoke one on the member's behalf — after every other role, the member included, was refused `403`
 and the grant under any other user's path `404`, its token still working — and the member's very next
-call through the SDK session refused, its refresh token refreshing nothing. On a router built with the
+call through the SDK session refused, its refresh token refreshing nothing. `DisabledDynamicClient_RefusedNextCall`
+has an administrator disable a dynamically registered client through the admin route — a member refused
+`403` first — and its access token refused on its next call and its refresh token `invalid_client`, both
+carrying on once it is enabled; `DisabledMetadataDocumentClient_SurvivesTheSweepNeverFetched` has the
+unused-client sweep, run a day past the client's last use, delete an enabled metadata-document client and
+keep the disabled one, whose URL the next authorization is refused for without a fetch. On a router built with the
 shipped brakes (the shared router of the proofs above lifts the two new ones, since every SDK client there
 dials from one loopback address and would otherwise meet them whenever it ran faster than they refill):
 `RateLimit_TokenEndpoint429` and `RateLimit_AuthorizeEndpoint` prove each brake's answer, its log line,

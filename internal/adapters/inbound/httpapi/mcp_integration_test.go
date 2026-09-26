@@ -208,6 +208,101 @@ func TestClient_DeleteCascadesGrants(t *testing.T) {
 	}
 }
 
+// TestMCPClients_DisableEnable: disabling and enabling a client is
+// authz.ActionManageIntegrations -- admin only, every other role refused
+// 403 and nothing changed. Disabling sets disabled_at -- which the bearer
+// lookup reads on every call -- deletes nothing (the authorization and its
+// token stay), answers the client as it now stands and is audited once;
+// enabling clears it. Asking for the state a client is already in is 409
+// and writes no audit row; a client that does not exist is 404.
+func TestMCPClients_DisableEnable(t *testing.T) {
+	ctx := context.Background()
+	r := newTestRig(t)
+	_, admin := createUserWithRole(ctx, t, r, sqlcgen.UserRoleAdmin)
+	member, _ := createUserWithRole(ctx, t, r, sqlcgen.UserRoleMember)
+	client := createMCPClientViaAPI(t, r, admin, `{"clientName":"Paused Plugin","redirectUris":["http://127.0.0.1/cb"]}`)
+	grantID, tokenHash := grantWithToken(ctx, t, r, member.ID, mustUUID(t, client.Id))
+	clientDisabled := func() bool {
+		t.Helper()
+		p, err := r.mcpGrants.LookupAccessToken(ctx, tokenHash)
+		if err != nil {
+			t.Fatalf("token lookup: %v -- disabling must delete nothing", err)
+		}
+		return p.ClientDisabled
+	}
+	disable, enable := "/api/mcp-clients/"+client.Id+"/disable", "/api/mcp-clients/"+client.Id+"/enable"
+
+	for _, role := range []sqlcgen.UserRole{sqlcgen.UserRoleViewer, sqlcgen.UserRoleMember, sqlcgen.UserRoleMaintainer} {
+		_, cookie := createUserWithRole(ctx, t, r, role)
+		for _, path := range []string{disable, enable} {
+			if s := r.doJSON(t, http.MethodPost, path, nil, nil, cookie); s != http.StatusForbidden {
+				t.Errorf("%s POST %s: status %d, want 403", role, path, s)
+			}
+		}
+	}
+	if s := r.doJSON(t, http.MethodPost, disable, nil, nil, ""); s != http.StatusUnauthorized {
+		t.Errorf("signed out: status %d, want 401", s)
+	}
+	if clientDisabled() {
+		t.Fatal("a refused request disabled the client")
+	}
+	for _, tc := range []struct {
+		path string
+		want int
+	}{
+		{"/api/mcp-clients/not-a-uuid/disable", http.StatusBadRequest},
+		{"/api/mcp-clients/00000000-0000-0000-0000-000000000000/disable", http.StatusNotFound},
+		{"/api/mcp-clients/00000000-0000-0000-0000-000000000000/enable", http.StatusNotFound},
+		{enable, http.StatusConflict},
+	} {
+		if s := r.doJSON(t, http.MethodPost, tc.path, nil, nil, admin); s != tc.want {
+			t.Errorf("POST %s: status %d, want %d", tc.path, s, tc.want)
+		}
+	}
+
+	var got restdtos.MCPClient
+	if s := r.doJSON(t, http.MethodPost, disable, nil, &got, admin); s != http.StatusOK || got.Id != client.Id || got.DisabledAt == nil {
+		t.Fatalf("disable: status %d client %+v, want 200 and disabledAt set", s, got)
+	}
+	if !clientDisabled() {
+		t.Fatal("after disable, the bearer lookup does not see the client disabled")
+	}
+	if _, err := r.mcpGrants.GetGrant(ctx, grantID); err != nil {
+		t.Fatalf("grant after disable: %v, want it kept", err)
+	}
+	if s := r.doJSON(t, http.MethodPost, disable, nil, nil, admin); s != http.StatusConflict {
+		t.Fatalf("second disable: status %d, want 409", s)
+	}
+	var list restdtos.ListMCPClientsResponse
+	if s := r.doJSON(t, http.MethodGet, "/api/mcp-clients", nil, &list, admin); s != http.StatusOK || len(list.Clients) != 1 || list.Clients[0].DisabledAt == nil {
+		t.Fatalf("list after disable: status %d body %+v, want the client listed disabled", s, list)
+	}
+
+	if s := r.doJSON(t, http.MethodPost, enable, nil, &got, admin); s != http.StatusOK || got.DisabledAt != nil {
+		t.Fatalf("enable: status %d client %+v, want 200 and disabledAt null", s, got)
+	}
+	if clientDisabled() {
+		t.Fatal("after enable, the bearer lookup still sees the client disabled")
+	}
+	if s := r.doJSON(t, http.MethodPost, enable, nil, nil, admin); s != http.StatusConflict {
+		t.Fatalf("second enable: status %d, want 409", s)
+	}
+
+	rows := mcpAuditRows(ctx, t, r, "mcp_client", client.Id)
+	var actions []string
+	for _, row := range rows {
+		actions = append(actions, row.action)
+	}
+	if strings.Join(actions, ",") != "mcp_client.created,mcp_client.disabled,mcp_client.enabled" {
+		t.Fatalf("client audit rows = %v, want created, disabled, enabled -- one per change, none for a refused or repeated request", actions)
+	}
+	for _, row := range rows[1:] {
+		if row.detail["client_id"] != client.ClientId || row.detail["kind"] != "preregistered" {
+			t.Fatalf("audit row %s detail = %v, want the client_id and kind", row.action, row.detail)
+		}
+	}
+}
+
 // lockWaitObservationTimeout bounds how long a test waits to SEE a backend
 // queued on a lock. It is a failure deadline, not a pacing delay: the poll
 // returns on the first observation, normally within a few round trips.

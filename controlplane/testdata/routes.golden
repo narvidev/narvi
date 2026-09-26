@@ -97,6 +97,8 @@ POST /api/environments/{environmentID}/sandbox-secrets
 POST /api/intent-templates
 POST /api/intent-templates/preview
 POST /api/mcp-clients
+POST /api/mcp-clients/{clientID}/disable
+POST /api/mcp-clients/{clientID}/enable
 POST /api/me/chatgpt-link
 POST /api/members/{userID}/identities
 POST /api/provider-credentials

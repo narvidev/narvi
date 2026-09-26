@@ -56,6 +56,13 @@
 // -- keep serving, so an authorization can always be listed and revoked
 // (§43.18).
 //
+// An administrator's disable of one client (§43.15), through the admin
+// route: a dynamically registered client's access and refresh tokens are
+// refused on their next use and carry on once it is enabled; a disabled
+// metadata-document client survives the unused-client sweep that deletes
+// an enabled one in the same state, and the next authorization naming its
+// URL is refused without its document being fetched.
+//
 // One Postgres container backs every subtest; each subtest creates its
 // own users and clients.
 package controlplane
@@ -1217,7 +1224,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 	})
 
 	cimdRig := newOAuthRouterRigWith(t, pool, map[string]string{"NARVI_MCP_DCR_ENABLED": "true"}, doc.seam(), nil)
-	var cimdToken, dcrToken string
+	var cimdToken, dcrToken, dcrRefresh string
 
 	// A client identified by a metadata document, end to end through the
 	// official SDK (which prefers it once the metadata advertises it): the
@@ -1290,6 +1297,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 			t.Fatalf("CallTool narvi_list_models: res %+v err %v", res, err)
 		}
 		dcrToken = flow.recorder.lastBearer()
+		dcrRefresh = flow.clock.current().RefreshToken
 		if page := flow.driver.lastPage(); !strings.Contains(page, "This app registered itself with this deployment, so nothing vouches for its name.") {
 			t.Error("the consent page does not say the app registered itself")
 		}
@@ -1379,6 +1387,136 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		}
 		offDCR.acceptedCall(t, cimdToken)
 		offDCR.revokedCallFails(t, dcrToken)
+	})
+
+	// An administrator disabling a dynamically registered client, through
+	// the admin route: its access token is refused on its very next /mcp
+	// call and its refresh token at the token endpoint (invalid_client),
+	// nothing is deleted, and enabling it lets both carry on -- the refused
+	// refresh spent nothing. A member asking is refused 403 and changes
+	// nothing.
+	t.Run("DisabledDynamicClient_RefusedNextCall", func(t *testing.T) {
+		ctx := oauthTestCtx(t)
+		if dcrToken == "" || dcrRefresh == "" {
+			t.Fatal("no dynamic-client tokens from EndToEnd_SDKClient_DynamicRegistration")
+		}
+		_, adminCookie := createRouterUser(ctx, t, cimdRig.pool, sqlcgen.UserRoleAdmin)
+		_, memberCookie := createRouterUser(ctx, t, cimdRig.pool, sqlcgen.UserRoleMember)
+		var internalID, clientID, kind string
+		if err := cimdRig.pool.QueryRow(ctx, `
+			SELECT c.id::text, c.client_id, c.kind::text FROM mcp_oauth_clients c
+			JOIN mcp_oauth_grants g ON g.client_id = c.id JOIN mcp_oauth_access_tokens t ON t.grant_id = g.id
+			WHERE t.token_hash = $1`, platform.HashToken(dcrToken)).Scan(&internalID, &clientID, &kind); err != nil || kind != "dynamic" {
+			t.Fatalf("the dynamic token's client: kind %q (err %v), want dynamic", kind, err)
+		}
+		disable, enable := "/api/mcp-clients/"+internalID+"/disable", "/api/mcp-clients/"+internalID+"/enable"
+		cimdRig.acceptedCall(t, dcrToken)
+		if status := cimdRig.doJSON(t, http.MethodPost, disable, nil, nil, memberCookie); status != http.StatusForbidden {
+			t.Fatalf("a member disabling the client: status %d, want 403", status)
+		}
+		cimdRig.acceptedCall(t, dcrToken)
+
+		var disabled restdtos.MCPClient
+		if status := cimdRig.doJSON(t, http.MethodPost, disable, nil, &disabled, adminCookie); status != http.StatusOK || disabled.DisabledAt == nil || disabled.ClientId != clientID {
+			t.Fatalf("disable: status %d client %+v, want 200 and disabledAt set", status, disabled)
+		}
+		cimdRig.revokedCallFails(t, dcrToken)
+		refresh := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {dcrRefresh}, "client_id": {clientID}}
+		if rec := cimdRig.tokenFrom(t, "198.51.100.121:4000", "", refresh); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"error":"invalid_client"`) {
+			t.Fatalf("refresh while disabled: status %d body %s, want 400 invalid_client", rec.Code, rec.Body.String())
+		}
+
+		if status := cimdRig.doJSON(t, http.MethodPost, enable, nil, nil, adminCookie); status != http.StatusOK {
+			t.Fatalf("enable: status %d, want 200", status)
+		}
+		cimdRig.acceptedCall(t, dcrToken)
+		if rec := cimdRig.tokenFrom(t, "198.51.100.121:4001", "", refresh); rec.Code != http.StatusOK {
+			t.Fatalf("refresh once enabled: status %d body %s, want 200 -- the refusal spent nothing", rec.Code, rec.Body.String())
+		}
+	})
+
+	// A metadata-document client an administrator disabled stays out,
+	// where deleting it would not: the next authorization naming its URL
+	// would register it afresh, enabled. Arranged as it stands a day later
+	// -- its only authorization revoked, its requests gone, its cached
+	// document long stale -- the unused-client sweep, run with its own
+	// cutoff (now less MCPDynamicClientUnusedTTL), deletes an enabled
+	// metadata-document client in exactly that state and never the disabled
+	// one; the next authorization naming the disabled one's URL is an error
+	// page, and its document is never fetched. Enabled again, the same
+	// authorization fetches the stale document and goes on to sign-in.
+	t.Run("DisabledMetadataDocumentClient_SurvivesTheSweepNeverFetched", func(t *testing.T) {
+		ctx := oauthTestCtx(t)
+		if cimdToken == "" {
+			t.Fatal("no metadata-document token from EndToEnd_SDKClient_MetadataDocument")
+		}
+		_, adminCookie := createRouterUser(ctx, t, cimdRig.pool, sqlcgen.UserRoleAdmin)
+		var internalID string
+		if err := cimdRig.pool.QueryRow(ctx, `SELECT id::text FROM mcp_oauth_clients WHERE client_id = $1`, doc.clientID).Scan(&internalID); err != nil {
+			t.Fatalf("the metadata-document client: %v", err)
+		}
+		var disabled restdtos.MCPClient
+		if status := cimdRig.doJSON(t, http.MethodPost, "/api/mcp-clients/"+internalID+"/disable", nil, &disabled, adminCookie); status != http.StatusOK || disabled.DisabledAt == nil {
+			t.Fatalf("disable: status %d client %+v, want 200 and disabledAt set", status, disabled)
+		}
+		cimdRig.revokedCallFails(t, cimdToken)
+
+		const control = "https://unused.example/client.json"
+		now := time.Now()
+		if _, err := narvipg.NewMCPOAuthClientStore(cimdRig.pool).UpsertMetadataDocument(ctx, sqlcgen.UpsertMCPOAuthMetadataDocumentClientParams{
+			ClientID: control, ClientName: "Unused", RedirectUris: []string{"http://127.0.0.1/callback"},
+			MetadataFetchedAt: pgtype.Timestamptz{Time: now, Valid: true}, MetadataStaleAt: pgtype.Timestamptz{Time: now.Add(time.Hour), Valid: true},
+		}); err != nil {
+			t.Fatalf("store the control client: %v", err)
+		}
+		ttl := cimdRig.cfg.Timeouts.MCPDynamicClientUnusedTTL
+		longAgo := now.Add(-ttl - time.Hour)
+		both := []string{doc.clientID, control}
+		for _, stmt := range []string{
+			`DELETE FROM mcp_oauth_grants WHERE client_id IN (SELECT id FROM mcp_oauth_clients WHERE client_id = ANY($1))`,
+			`DELETE FROM mcp_oauth_authorization_requests WHERE client_id IN (SELECT id FROM mcp_oauth_clients WHERE client_id = ANY($1))`,
+		} {
+			if _, err := cimdRig.pool.Exec(ctx, stmt, both); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if tag, err := cimdRig.pool.Exec(ctx, `
+			UPDATE mcp_oauth_clients SET created_at = $2, metadata_fetched_at = $2, metadata_stale_at = $2
+			WHERE client_id = ANY($1)`, both, longAgo); err != nil || tag.RowsAffected() != 2 {
+			t.Fatalf("age both clients: rows %d err %v", tag.RowsAffected(), err)
+		}
+
+		if _, err := narvipg.NewMCPOAuthClientStore(cimdRig.pool).DeleteUnused(ctx, time.Now().Add(-ttl)); err != nil {
+			t.Fatalf("the unused-client sweep: %v", err)
+		}
+		if n := cimdRig.countClients(t, control); n != 0 {
+			t.Fatalf("the enabled control client survived the sweep (%d rows): the arrangement is not one the sweep deletes", n)
+		}
+		var stillDisabled bool
+		if err := cimdRig.pool.QueryRow(ctx, `SELECT disabled_at IS NOT NULL FROM mcp_oauth_clients WHERE client_id = $1`, doc.clientID).Scan(&stillDisabled); err != nil || !stillDisabled {
+			t.Fatalf("the disabled client after the sweep: disabled %v (err %v), want its row kept, disabled", stillDisabled, err)
+		}
+
+		authorize := url.Values{
+			"client_id": {doc.clientID}, "redirect_uri": {"http://127.0.0.1:1/callback"}, "response_type": {"code"},
+			"code_challenge": {"E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"}, "code_challenge_method": {"S256"}, "resource": {cimdRig.server.URL + "/mcp"},
+		}
+		hits, conns := doc.hits.Load(), doc.conns.Load()
+		rec := cimdRig.authorizeFrom(t, "198.51.100.122:7000", authorize)
+		if rec.Code != http.StatusBadRequest || rec.Header().Get("Location") != "" || !strings.Contains(rec.Body.String(), "This app is not available") {
+			t.Fatalf("authorize naming the disabled client's URL: status %d Location %q, want the 400 page and no redirect", rec.Code, rec.Header().Get("Location"))
+		}
+		if doc.hits.Load() != hits || doc.conns.Load() != conns {
+			t.Fatal("the disabled client's document was fetched")
+		}
+
+		if status := cimdRig.doJSON(t, http.MethodPost, "/api/mcp-clients/"+internalID+"/enable", nil, nil, adminCookie); status != http.StatusOK {
+			t.Fatalf("enable: status %d, want 200", status)
+		}
+		rec = cimdRig.authorizeFrom(t, "198.51.100.122:7001", authorize)
+		if rec.Code != http.StatusFound || !strings.HasPrefix(rec.Header().Get("Location"), "/sign-in?next=") || doc.hits.Load() == hits {
+			t.Fatalf("authorize once enabled: status %d Location %q, fetched %v; want the stale document fetched and a 302 on to sign-in", rec.Code, rec.Header().Get("Location"), doc.hits.Load() != hits)
+		}
 	})
 
 	// --- The brakes and the pending-request cap (§43.14) ---
