@@ -379,8 +379,10 @@ description from that very host, following no redirect to any other — with
 the name it chose shown second; check that host before you allow it. A host
 with non-Latin letters is always shown in its `xn--` form, exactly as Narvi
 looks it up, never as letters that could pass for another host's. An app that registered itself (possible only when
-the deployment turns dynamic registration on) says so: nothing vouches for
-its name. The page also shows the host your browser is sent back to — with
+the deployment turns dynamic registration on) is headed by just that — "an
+app that registered itself" — with the name it gave itself shown second, in
+quotes: nothing vouches for that name, so never take it for a host Narvi
+checked. The page also shows the host your browser is sent back to — with
 a warning when that is your own computer — and one checkbox per kind of
 access; you can uncheck any of them, never add one. An app never does more than your own role allows: its tools call the
 same routes this guide documents, checked against your role on every call.

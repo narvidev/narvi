@@ -42,7 +42,13 @@ type consentPage struct {
 	// IdentityHost is set for a metadata-document client only: the host
 	// of its client_id URL, which the page shows as the headline -- the
 	// client's true identity -- with the name it gave itself second.
-	IdentityHost       string
+	IdentityHost string
+	// SelfRegistered is set for a dynamically registered client only. Its
+	// name is the unauthenticated registrant's free choice -- it could copy
+	// the very wording the page keeps for a verified host -- so the title
+	// and headline are fixed words saying the app registered itself, and
+	// the name comes second, quoted, marked as the name it gave itself.
+	SelfRegistered     bool
 	ClientIdentity     string
 	ClientHomepageHost string
 	UserEmail          string
@@ -68,8 +74,9 @@ const (
 	dynamicIdentity = "This app registered itself with this deployment, so nothing vouches for its name. Check where your browser is sent back to before you allow it."
 )
 
-// identityFor fills page's identity for client: the headline host and the
-// identity line.
+// identityFor fills page's identity for client: what heads the page (the
+// verified host, the fixed self-registered headline, or an administrator's
+// name) and the identity line.
 func identityFor(page *consentPage, client sqlcgen.McpOauthClient) bool {
 	switch mcpclient.Kind(client.Kind) {
 	case mcpclient.KindPreregistered:
@@ -84,6 +91,7 @@ func identityFor(page *consentPage, client sqlcgen.McpOauthClient) bool {
 			return false
 		}
 	case mcpclient.KindDynamic:
+		page.SelfRegistered = true
 		page.ClientIdentity = dynamicIdentity
 	default:
 		return false

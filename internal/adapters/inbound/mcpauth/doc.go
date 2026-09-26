@@ -78,8 +78,12 @@
 //   - The consent page's identity line is never the client's own claim: an
 //     administrator's registration, the host a metadata document was
 //     fetched from, or the plain statement that the app registered itself.
-//     The name a client chose is shown second, escaped, and was refused at
-//     registration if it could render deceptively.
+//     A name the client chose itself never heads the page or its title --
+//     a self-registered app's are fixed words saying it registered itself,
+//     since its name could copy the words kept for a verified host. That
+//     name is shown second, escaped (and quoted, for a self-registered
+//     app), and was refused at registration if it could render
+//     deceptively.
 //   - A metadata document is trusted for at most MCPClientMetadataCacheTTL
 //     -- its own Cache-Control only shortens that -- and re-fetching it
 //     changes what the next authorization sees, never what an issued code

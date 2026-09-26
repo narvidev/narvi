@@ -49,7 +49,9 @@ func TestConsent_FrameHeaders(t *testing.T) {
 // thing its document cannot choose; the name it chose itself comes second,
 // escaped; and a name with a bidi override or a control character never
 // reaches the page at all (refused when the document is validated). A
-// dynamically registered client is said to have registered itself.
+// dynamically registered client is headed by fixed words saying it
+// registered itself, with the name it gave itself second, quoted (never in
+// the title or headline: TestConsentPage_SelfRegisteredNameNeverHeadsThePage).
 func TestConsent_ShowsClientIdentityAndRedirectHost(t *testing.T) {
 	t.Run("preregistered", func(t *testing.T) {
 		r := newASRig(t)
@@ -150,8 +152,9 @@ func TestConsent_ShowsClientIdentityAndRedirectHost(t *testing.T) {
 		rec, _ := r.renderConsent(t, requestID, cookie)
 		body := rec.Body.String()
 		for _, want := range []string{
-			"<h1>Allow <strong>Desktop Assistant</strong> to use Narvi as you?</h1>",
-			"This app registered itself with this deployment, so nothing vouches for its name.",
+			"<title>Allow an app that registered itself? - Narvi</title>",
+			"<h1>Allow an app that registered itself to use Narvi as you?</h1>",
+			`It calls itself <strong>"Desktop Assistant"</strong>, a name it gave itself. This app registered itself with this deployment, so nothing vouches for its name.`,
 			"<strong>127.0.0.1</strong>",
 			"That is this computer.",
 		} {
