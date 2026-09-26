@@ -1,8 +1,9 @@
 # Compatibility policy (§6.3)
 
 `/contracts` is versioned as a bundle, independent of the Go module and of
-`web/`. `contracts/VERSION` (kept equal to `contracts/package.json`'s own
-`"version"` field, enforced by `contracts/contractstest`) is the single
+`web/`. `contracts/VERSION` (kept equal to `contracts/package.json`'s and
+`contracts/manifest.json`'s own `"version"` fields, enforced by
+`contracts/contractstest`) is the single
 number that moves; `contracts/CHANGELOG.md` explains why every time it
 does. `make contracts-compat` (CI job `contracts-compat`, required on every
 PR) computes the same classification a human reviewer would have to

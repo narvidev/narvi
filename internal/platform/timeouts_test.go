@@ -1729,3 +1729,83 @@ func TestValidate_MCPClientRegistrationChain(t *testing.T) {
 		}
 	})
 }
+
+// TestDefaultTimeouts_MCPEndpointBrakeFields pins the token and
+// authorization endpoints' brakes and the pending-request cap (technical
+// plan §43.14): 2 s and 10, 3 s and 10, 100.
+func TestDefaultTimeouts_MCPEndpointBrakeFields(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+	for _, tc := range []struct {
+		name string
+		got  time.Duration
+		want time.Duration
+	}{
+		{"MCPTokenEndpointRateInterval", to.MCPTokenEndpointRateInterval, 2 * time.Second},
+		{"MCPAuthorizeRateInterval", to.MCPAuthorizeRateInterval, 3 * time.Second},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %v, want %v", tc.name, tc.got, tc.want)
+		}
+	}
+	for _, tc := range []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"MCPTokenEndpointRateBurst", to.MCPTokenEndpointRateBurst, 10},
+		{"MCPAuthorizeRateBurst", to.MCPAuthorizeRateBurst, 10},
+		{"MCPMaxPendingAuthorizationRequestsPerClient", to.MCPMaxPendingAuthorizationRequestsPerClient, 100},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %d, want %d", tc.name, tc.got, tc.want)
+		}
+	}
+	if err := to.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+}
+
+// TestValidate_MCPEndpointBrakes proves each brake and the cap is checked
+// on its own and reported by name (technical plan §43.14): a zero interval
+// is no limit at all, and a burst or cap below one refuses everything.
+func TestValidate_MCPEndpointBrakes(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		field  string
+		mutate func(*platform.Timeouts)
+	}{
+		{"MCPTokenEndpointRateInterval", func(to *platform.Timeouts) { to.MCPTokenEndpointRateInterval = 0 }},
+		{"MCPAuthorizeRateInterval", func(to *platform.Timeouts) { to.MCPAuthorizeRateInterval = -time.Second }},
+	} {
+		t.Run(tc.field, func(t *testing.T) {
+			t.Parallel()
+			to := platform.DefaultTimeouts()
+			tc.mutate(&to)
+			var pos *platform.TimeoutMustBePositiveError
+			if err := to.Validate(); !errors.As(err, &pos) || pos.Field != tc.field {
+				t.Fatalf("Validate() = %v, want %s refused as non-positive", err, tc.field)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		field  string
+		mutate func(*platform.Timeouts)
+	}{
+		{"MCPTokenEndpointRateBurst", func(to *platform.Timeouts) { to.MCPTokenEndpointRateBurst = 0 }},
+		{"MCPAuthorizeRateBurst", func(to *platform.Timeouts) { to.MCPAuthorizeRateBurst = 0 }},
+		{"MCPMaxPendingAuthorizationRequestsPerClient", func(to *platform.Timeouts) { to.MCPMaxPendingAuthorizationRequestsPerClient = 0 }},
+	} {
+		t.Run(tc.field, func(t *testing.T) {
+			t.Parallel()
+			to := platform.DefaultTimeouts()
+			tc.mutate(&to)
+			var cnt *platform.CountMustBePositiveError
+			if err := to.Validate(); !errors.As(err, &cnt) || cnt.Field != tc.field {
+				t.Fatalf("Validate() = %v, want %s refused as below one", err, tc.field)
+			}
+		})
+	}
+}

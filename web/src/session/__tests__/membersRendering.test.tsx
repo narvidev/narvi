@@ -56,6 +56,21 @@ describe('MemberRow rendering -- adversarial displayName stays text', () => {
   })
 })
 
+describe('MemberRow -- the Connected apps drawer', () => {
+  it('an admin gets a Connected apps button beside the audit log, its drawer closed until opened', () => {
+    const html = withQueryClient(<table><tbody><MemberRow member={baseMember()} canManage={true} onShowAudit={() => {}} /></tbody></table>)
+    expect(html).toContain('>Connected apps<')
+    expect(html).toContain('aria-expanded="false"')
+    expect(html).toContain('>Audit log<')
+    expect(html).not.toContain('memberdrawer')
+  })
+
+  it('no one else gets the button', () => {
+    const html = withQueryClient(<table><tbody><MemberRow member={baseMember()} canManage={false} onShowAudit={() => {}} /></tbody></table>)
+    expect(html).not.toContain('Connected apps')
+  })
+})
+
 describe('AuditLogRow rendering -- adversarial action/resource/detail stays text, never markup', () => {
   it('a hostile action renders as text', () => {
     const html = renderToStaticMarkup(<table><tbody><AuditLogRow entry={baseAuditEntry({ action: `weird.action ${XSS_SCRIPT}` })} /></tbody></table>)

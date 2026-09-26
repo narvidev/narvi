@@ -9,6 +9,7 @@ DELETE /api/mcp-clients/{clientID}
 DELETE /api/me/chatgpt-link
 DELETE /api/me/mcp-authorizations/{authorizationID}
 DELETE /api/members/{userID}/identities/{identityID}
+DELETE /api/members/{userID}/mcp-authorizations/{authorizationID}
 DELETE /api/opencode-config
 DELETE /api/provider-credentials/{credentialID}
 DELETE /api/repos/{owner}/{repo}/provider-credentials/{credentialID}
@@ -41,6 +42,7 @@ GET /api/me
 GET /api/me/chatgpt-link
 GET /api/me/mcp-authorizations
 GET /api/members
+GET /api/members/{userID}/mcp-authorizations
 GET /api/models
 GET /api/opencode-config
 GET /api/provider-credentials
@@ -95,6 +97,8 @@ POST /api/environments/{environmentID}/sandbox-secrets
 POST /api/intent-templates
 POST /api/intent-templates/preview
 POST /api/mcp-clients
+POST /api/mcp-clients/{clientID}/disable
+POST /api/mcp-clients/{clientID}/enable
 POST /api/me/chatgpt-link
 POST /api/members/{userID}/identities
 POST /api/provider-credentials

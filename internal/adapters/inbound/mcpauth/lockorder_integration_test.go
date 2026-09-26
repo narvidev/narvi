@@ -64,6 +64,10 @@ const (
 	// grantRevocation is the member's own DELETE
 	// /api/me/mcp-authorizations/{id}.
 	grantRevocation revocation = "grant revocation"
+	// adminRevocation is an administrator's DELETE
+	// /api/members/{userID}/mcp-authorizations/{id}, revoking the member's
+	// grant on the member's behalf.
+	adminRevocation revocation = "admin revocation"
 	// codeReuse is POST /oauth/token replaying the member's already-spent
 	// code, which revokes the grant it was issued under.
 	codeReuse revocation = "code reuse"
@@ -89,6 +93,7 @@ func (v revocation) parentTable() string {
 type raceFixture struct {
 	member       sqlcgen.User
 	memberCookie string
+	admin        sqlcgen.User
 	adminCookie  string
 	// heldToken is a live token under what the revocation deletes that the
 	// issuance never touches: the row the blocker holds to stop a
@@ -116,7 +121,7 @@ func newRaceFixture(t *testing.T, r *asRig, issuer issuance) raceFixture {
 	t.Helper()
 	var f raceFixture
 	f.member, f.memberCookie = r.newUser(t, sqlcgen.UserRoleMember)
-	_, f.adminCookie = r.newUser(t, sqlcgen.UserRoleAdmin)
+	f.admin, f.adminCookie = r.newUser(t, sqlcgen.UserRoleAdmin)
 	f.verifier = newVerifier(t)
 	switch issuer {
 	case consentApproval:
@@ -177,6 +182,8 @@ func (f raceFixture) revoke(r *asRig, revoker revocation) *httptest.ResponseReco
 	switch revoker {
 	case grantRevocation:
 		return r.do(http.MethodDelete, "/api/me/mcp-authorizations/"+f.grantID.String(), "", nil, f.memberCookie)
+	case adminRevocation:
+		return r.do(http.MethodDelete, "/api/members/"+f.member.ID.String()+"/mcp-authorizations/"+f.grantID.String(), "", nil, f.adminCookie)
 	case codeReuse:
 		return r.exchange(r.exchangeForm(f.spentCode, f.spentVerifier), nil)
 	case refreshReuse:
@@ -191,8 +198,9 @@ func (f raceFixture) revoke(r *asRig, revoker revocation) *httptest.ResponseReco
 // assertRevoked: the revocation succeeded -- 204 from a Settings route; 200
 // and an empty body from the revocation endpoint; a replayed code or
 // refresh token is refused invalid_grant -- and a revocation of the
-// member's grant by the token endpoint or the revocation endpoint is
-// audited with its own reason.
+// member's grant by the token endpoint, the revocation endpoint or an
+// administrator is audited with its own reason (an administrator's
+// attributed to the administrator, naming the member).
 func assertRevoked(ctx context.Context, t *testing.T, r *asRig, f raceFixture, revoker revocation, rec *httptest.ResponseRecorder) {
 	t.Helper()
 	reason := ""
@@ -207,6 +215,19 @@ func assertRevoked(ctx context.Context, t *testing.T, r *asRig, f raceFixture, r
 			t.Errorf("%s: status %d body %q, want 200 and an empty body", revoker, rec.Code, rec.Body.String())
 		}
 		reason = "client"
+	case adminRevocation:
+		if rec.Code != http.StatusNoContent {
+			t.Errorf("%s: status %d body %s, want 204", revoker, rec.Code, rec.Body.String())
+		}
+		var audited int
+		if err := r.pool.QueryRow(ctx, `
+			SELECT count(*) FROM audit_log
+			WHERE action = 'mcp_authorization.revoked' AND resource_id = $1 AND actor_user_id = $2
+			  AND detail_json->>'reason' = 'admin' AND detail_json->>'target_user_id' = $3`,
+			f.grantID.String(), f.admin.ID, f.member.ID.String()).Scan(&audited); err != nil || audited != 1 {
+			t.Errorf("admin revocation audit rows for the grant = %d (err %v), want 1, by the admin, naming the member", audited, err)
+		}
+		return
 	default:
 		if rec.Code != http.StatusNoContent {
 			t.Errorf("%s: status %d body %s, want 204", revoker, rec.Code, rec.Body.String())
@@ -261,6 +282,10 @@ func TestLockOrder_RevocationRacingIssuance(t *testing.T) {
 		{"TokenRevocationHoldsGrant_ExchangeQueues", codeExchange, tokenRevocation, false},
 		{"RefreshHoldsGrant_GrantRevocationQueues", refreshExchange, grantRevocation, true},
 		{"GrantRevocationHoldsGrant_RefreshQueues", refreshExchange, grantRevocation, false},
+		{"ExchangeHoldsGrant_AdminRevocationQueues", codeExchange, adminRevocation, true},
+		{"AdminRevocationHoldsGrant_ExchangeQueues", codeExchange, adminRevocation, false},
+		{"RefreshHoldsGrant_AdminRevocationQueues", refreshExchange, adminRevocation, true},
+		{"AdminRevocationHoldsGrant_RefreshQueues", refreshExchange, adminRevocation, false},
 		{"RefreshHoldsClient_ClientDeletionQueues", refreshExchange, clientDeletion, true},
 		{"ClientDeletionHoldsClient_RefreshQueues", refreshExchange, clientDeletion, false},
 		{"RefreshHoldsGrant_RefreshReuseQueues", refreshExchange, refreshReuse, true},
@@ -470,8 +495,9 @@ func queuedOnTables(ctx context.Context, t *testing.T, pool *pgxpool.Pool, pid i
 }
 
 // TestLockOrder_RevocationRacingClientDeletion: every revocation that
-// deletes one grant -- the user's own, a code or refresh-token replay, the
-// client's RFC 7009 request -- takes the grant's client FOR KEY SHARE
+// deletes one grant -- the user's own, an administrator's on the user's
+// behalf, a code or refresh-token replay, the client's RFC 7009 request --
+// takes the grant's client FOR KEY SHARE
 // before the grant, so it and a deletion of that client serialize on the
 // CLIENT row, never deeper. Whichever goes first, the other queues on the
 // client behind it alone, nothing deadlocks, and the grant's revocation is
@@ -489,6 +515,8 @@ func TestLockOrder_RevocationRacingClientDeletion(t *testing.T) {
 	}{
 		{"GrantRevocationHoldsClient_ClientDeletionQueues", refreshExchange, grantRevocation, true},
 		{"ClientDeletionHoldsClient_GrantRevocationQueues", refreshExchange, grantRevocation, false},
+		{"AdminRevocationHoldsClient_ClientDeletionQueues", refreshExchange, adminRevocation, true},
+		{"ClientDeletionHoldsClient_AdminRevocationQueues", refreshExchange, adminRevocation, false},
 		{"CodeReuseHoldsClient_ClientDeletionQueues", codeExchange, codeReuse, true},
 		{"ClientDeletionHoldsClient_CodeReuseQueues", codeExchange, codeReuse, false},
 		{"RefreshReuseHoldsClient_ClientDeletionQueues", refreshExchange, refreshReuse, true},
@@ -566,7 +594,7 @@ func TestLockOrder_RevocationRacingClientDeletion(t *testing.T) {
 			wantReason := "client_deleted"
 			if tc.revocationFirst {
 				assertRevoked(ctx, t, r, f, tc.revoker, revoked)
-				wantReason = map[revocation]string{grantRevocation: "user", codeReuse: "code_reuse", refreshReuse: "refresh_reuse", tokenRevocation: "client"}[tc.revoker]
+				wantReason = map[revocation]string{grantRevocation: "user", adminRevocation: "admin", codeReuse: "code_reuse", refreshReuse: "refresh_reuse", tokenRevocation: "client"}[tc.revoker]
 			} else {
 				assertLateRevocation(t, tc.revoker, revoked)
 			}
@@ -592,7 +620,7 @@ func TestLockOrder_RevocationRacingClientDeletion(t *testing.T) {
 func assertLateRevocation(t *testing.T, revoker revocation, rec *httptest.ResponseRecorder) {
 	t.Helper()
 	switch revoker {
-	case grantRevocation:
+	case grantRevocation, adminRevocation:
 		if rec.Code != http.StatusNotFound {
 			t.Errorf("%s after the client's deletion: status %d body %s, want 404", revoker, rec.Code, rec.Body.String())
 		}
@@ -604,5 +632,91 @@ func assertLateRevocation(t *testing.T, revoker revocation, rec *httptest.Respon
 		if body := decodeToken(t, rec); rec.Code != http.StatusBadRequest || body.Error != "invalid_grant" {
 			t.Errorf("%s after the client's deletion: status %d body %s, want 400 invalid_grant", revoker, rec.Code, rec.Body.String())
 		}
+	}
+}
+
+// TestLockOrder_AdminAndUserRevokeOneGrant: an administrator's revocation
+// of a member's grant and the member's own revocation of it follow the same
+// order -- the client FOR KEY SHARE, then the grant -- so they share the
+// client and serialize on the GRANT row: whichever goes first, the other
+// queues on it behind the first alone, nothing deadlocks, the first
+// answers 204 and the second 404 (the grant is gone), and the grant is
+// audited as revoked exactly once, with the first one's reason (technical
+// plan §43.16/§43.18).
+func TestLockOrder_AdminAndUserRevokeOneGrant(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		first, second revocation
+	}{
+		{"AdminRevocationHoldsGrant_UserRevocationQueues", adminRevocation, grantRevocation},
+		{"UserRevocationHoldsGrant_AdminRevocationQueues", grantRevocation, adminRevocation},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			r := newASRig(t)
+			f := newRaceFixture(t, r, refreshExchange)
+			errs := captureErrorLog(t)
+
+			// The blocker holds a token inside the grant's cascade, so the
+			// first revocation stops there, holding the grant.
+			blocker, err := r.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var blockerPID int32
+			if err := blocker.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&blockerPID); err != nil {
+				t.Fatal(err)
+			}
+			if tag, err := blocker.Exec(ctx, `SELECT 1 FROM mcp_oauth_access_tokens WHERE token_hash = $1 FOR UPDATE`, platform.HashToken(f.heldToken)); err != nil || tag.RowsAffected() != 1 {
+				t.Fatalf("blocker: hold the gate row: err %v, rows %d", err, tag.RowsAffected())
+			}
+			var eg errgroup.Group
+			release := func() {
+				_ = blocker.Rollback(ctx)
+				_ = eg.Wait()
+			}
+			defer release()
+
+			var firstRec, secondRec *httptest.ResponseRecorder
+			firstDone, secondDone := make(chan struct{}), make(chan struct{})
+			eg.Go(func() error { defer close(firstDone); firstRec = f.revoke(r, tc.first); return nil })
+			firstPID := waitForLockWaiter(ctx, t, r.pool, []int32{blockerPID}, firstDone)
+			if firstPID == 0 {
+				t.Fatalf("the %s finished without reaching the row the blocker holds", tc.first)
+			}
+			eg.Go(func() error { defer close(secondDone); secondRec = f.revoke(r, tc.second); return nil })
+			if secondPID := waitForLockWaiter(ctx, t, r.pool, []int32{blockerPID, firstPID}, secondDone); secondPID == 0 {
+				t.Errorf("the %s finished without queuing behind the %s", tc.second, tc.first)
+			} else {
+				by := blockingPIDs(ctx, t, r.pool, secondPID)
+				on := queuedOnTables(ctx, t, r.pool, secondPID)
+				if len(by) != 1 || by[0] != firstPID || len(on) != 1 || on[0] != "mcp_oauth_grants" {
+					t.Errorf("the %s (pid %d) is queued on a row of %v behind %v, want on mcp_oauth_grants behind the %s (pid %d) alone",
+						tc.second, secondPID, on, by, tc.first, firstPID)
+				}
+			}
+			release()
+
+			if log := errs.String(); log != "" {
+				t.Errorf("a handler failed (a deadlock victim logs SQLSTATE 40P01):\n%s", log)
+			}
+			assertRevoked(ctx, t, r, f, tc.first, firstRec)
+			if secondRec.Code != http.StatusNotFound {
+				t.Errorf("the %s after the %s: status %d body %s, want 404", tc.second, tc.first, secondRec.Code, secondRec.Body.String())
+			}
+			rows, err := r.pool.Query(ctx, `SELECT detail_json->>'reason' FROM audit_log WHERE action = 'mcp_authorization.revoked' AND resource_id = $1`, f.grantID.String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			reasons, err := pgx.CollectRows(rows, pgx.RowTo[string])
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := map[revocation]string{adminRevocation: "admin", grantRevocation: "user"}[tc.first]
+			if len(reasons) != 1 || reasons[0] != want {
+				t.Errorf("revocation audit rows for the grant = %v, want exactly one, reason %s", reasons, want)
+			}
+			assertNothingSurvives(ctx, t, r, f, tc.first)
+		})
 	}
 }

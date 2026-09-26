@@ -363,8 +363,9 @@ func (s *Server) ConsentDecision(w http.ResponseWriter, r *http.Request) {
 
 // decide records one consent decision in a single transaction and
 // redirects to the request's STORED redirect URI -- never a URI read from
-// the form. clientID is the request's client (a request's client never
-// changes).
+// the form. A client no longer usable gets an error page instead, for
+// either decision. clientID is the request's client (a request's client
+// never changes).
 func (s *Server) decide(w http.ResponseWriter, r *http.Request, requestID, clientID, userID pgtype.UUID, approve bool, selected []mcpscope.Scope) {
 	ctx := r.Context()
 	logger := platform.Logger(ctx)
@@ -412,24 +413,27 @@ func (s *Server) decide(w http.ResponseWriter, r *http.Request, requestID, clien
 		state = *consumed.State
 	}
 
+	if !s.clientUsable(client) {
+		// Disabled -- or its registration mechanism switched off -- after
+		// the page was rendered: refused whichever button was pressed, with
+		// an error page and never a redirect, like the page's own render.
+		// A Deny must not send the browser to the disabled client's
+		// redirect URI either. The row is the one the lock above returned,
+		// and the client cannot be deleted before this transaction ends.
+		// The rollback grants nothing and leaves the request unconsumed,
+		// as a refused render leaves it: should the client be enabled
+		// again before the request expires, it can still be decided.
+		logger.Warn("mcpauth: consent decision refused", "outcome", "client_not_usable", "client_id", client.ClientID, "approve", approve)
+		s.renderError(w, r, http.StatusBadRequest, "This app is not available", "An administrator of this deployment has disabled this app.")
+		return
+	}
+
 	if !approve {
 		if err := tx.Commit(ctx); err != nil {
 			fail("commit denial failed", err)
 			return
 		}
 		s.redirectError(w, r, consumed.RedirectUri, errAccessDenied, "the user denied the request", state)
-		return
-	}
-
-	if !s.clientUsable(client) {
-		// Disabled -- or its registration mechanism switched off -- after
-		// the page was rendered: nothing is granted. The
-		// row is the one the lock above returned, and the client cannot
-		// be deleted before this transaction ends. The rollback also
-		// leaves the request unconsumed, but the page's own render
-		// refuses a disabled client, so it can never be decided again.
-		logger.Warn("mcpauth: consent decision refused", "outcome", "client_not_usable", "client_id", client.ClientID)
-		s.renderError(w, r, http.StatusBadRequest, "This app is not available", "An administrator of this deployment has disabled this app.")
 		return
 	}
 	// The grant records this approval's scopes for display only; what the

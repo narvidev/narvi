@@ -3200,7 +3200,7 @@ export interface GetSessionToolRequest {
   sessionId: string;
 }
 /**
- * One MCP client authorization the caller granted (technical plan §43.18) -- one row of GET /api/me/mcp-authorizations, and what DELETE /api/me/mcp-authorizations/{authorizationID} revokes (by id). A user holds at most one per client: consenting to the same client again renews its expiry in place and records that approval's scopes. Never carries a token, a code, or any other secret -- none exists in plaintext anywhere once it has been handed to the client.
+ * One MCP client authorization a user granted (technical plan §43.18) -- one row of GET /api/me/mcp-authorizations (the caller's own) or, for an administrator, of GET /api/members/{userID}/mcp-authorizations (a member's), and what DELETE /api/me/mcp-authorizations/{authorizationID} or DELETE /api/members/{userID}/mcp-authorizations/{authorizationID} revokes (by id). A user holds at most one per client: consenting to the same client again renews its expiry in place and records that approval's scopes. Never carries a token, a code, or any other secret -- none exists in plaintext anywhere once it has been handed to the client, so an administrator's view of a member's authorizations is exactly what the member sees, and no more.
  *
  * This interface was referenced by `RestDtos`'s JSON-Schema
  * via the `definition` "MCPAuthorization".
@@ -3237,7 +3237,7 @@ export interface MCPAuthorization {
   lastUsedAt: string | null;
 }
 /**
- * GET /api/me/mcp-authorizations's own response body (technical plan §43.18): the caller's own unexpired MCP authorizations, most recently created first. Readable by every role (authz.ActionViewOwnProfile).
+ * The response body of GET /api/me/mcp-authorizations and GET /api/members/{userID}/mcp-authorizations (technical plan §43.18): one user's unexpired MCP authorizations, most recently created first -- the caller's own, readable by every role (authz.ActionViewOwnProfile), or a member's, readable by an administrator (authz.ActionManageMembers).
  *
  * This interface was referenced by `RestDtos`'s JSON-Schema
  * via the `definition` "ListMCPAuthorizationsResponse".
@@ -3246,14 +3246,14 @@ export interface ListMCPAuthorizationsResponse {
   authorizations: MCPAuthorization[];
 }
 /**
- * One OAuth client an MCP client program identifies itself as (technical plan §43.15) -- returned by POST /api/mcp-clients and listed by GET /api/mcp-clients (admin only, authz.ActionManageIntegrations). clientId is public (a public OAuth client with PKCE has no secret), so there is no write-only field here.
+ * One OAuth client an MCP client program identifies itself as (technical plan §43.15) -- returned by POST /api/mcp-clients, POST /api/mcp-clients/{clientID}/disable and POST /api/mcp-clients/{clientID}/enable, and listed by GET /api/mcp-clients (admin only, authz.ActionManageIntegrations). clientId is public (a public OAuth client with PKCE has no secret), so there is no write-only field here.
  *
  * This interface was referenced by `RestDtos`'s JSON-Schema
  * via the `definition` "MCPClient".
  */
 export interface MCPClient {
   /**
-   * The internal id DELETE /api/mcp-clients/{clientID} takes.
+   * The internal id DELETE /api/mcp-clients/{clientID}, POST /api/mcp-clients/{clientID}/disable and POST /api/mcp-clients/{clientID}/enable take.
    */
   id: string;
   /**
@@ -3278,7 +3278,7 @@ export interface MCPClient {
   clientUri: string | null;
   createdAt: string;
   /**
-   * Set when an operator disabled the client: its authorizations stop working on their next call. Null for an active client. goJSONSchema forces the literal *time.Time for the same named-pointer-type reason Plan.decidedAt documents in full.
+   * Set when an administrator disabled the client (POST /api/mcp-clients/{clientID}/disable; POST /api/mcp-clients/{clientID}/enable clears it): from its next request it is refused wherever a client acts, its authorizations included, and nothing under it is deleted. Null for an active client. goJSONSchema forces the literal *time.Time for the same named-pointer-type reason Plan.decidedAt documents in full.
    */
   disabledAt: string | null;
 }

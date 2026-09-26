@@ -22,6 +22,11 @@ const (
 	errInvalidClient           = "invalid_client"
 	errInvalidGrant            = "invalid_grant"
 	errUnsupportedGrantType    = "unsupported_grant_type"
+	// errTemporarilyUnavailable is RFC 6749 section 4.1.2.1's code for a
+	// server that cannot handle the request right now; the token and
+	// registration endpoints answer it with 429 when a client network is
+	// over its brake (technical plan §43.14/§43.15).
+	errTemporarilyUnavailable = "temporarily_unavailable"
 )
 
 // setPageHeaders sets the headers every HTML page this package renders
