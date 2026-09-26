@@ -42,8 +42,9 @@
 // SHARE throughout, so the only transaction that could lock them the other
 // way round -- the client's deletion, which needs the client FOR UPDATE --
 // never interleaves with it. users(id) is a parent of grants and requests
-// too; nothing here locks a users row except those foreign-key checks, and
-// users rows are never deleted.
+// too; nothing here locks a users row except foreign-key checks -- those,
+// and each audit row's on its actor -- and none before its transaction's
+// client, if it locks one; users rows are never deleted.
 //
 // The authorization endpoint stores a request in a transaction of its own
 // (CreatePendingAuthorizationRequest, technical plan §43.14's
@@ -82,10 +83,19 @@
 // An administrator's disable or enable of a client
 // (MCPOAuthClientStore.Disable/Enable, technical plan §43.15) is, like the
 // upsert, ONE statement locking ONE row -- the client, FOR NO KEY UPDATE,
-// since disabled_at is no key column -- followed only by its audit row,
-// outside this schema. It waits at most once, holding nothing, so it can
-// never be part of a wait cycle, and it never conflicts with the FOR KEY
-// SHARE an issuance or a grant revocation takes.
+// since disabled_at is no key column -- but its transaction then inserts
+// its audit row, whose foreign-key check takes the acting administrator's
+// users row FOR KEY SHARE. So it can wait twice: for the client, holding
+// nothing; then, holding the client, for that users row, which only a role
+// change's last-admin guard (UserStore.ListActiveAdminIDsForUpdate, FOR
+// UPDATE on every active administrator) holds against it -- no statement
+// deletes a users row or changes its key -- while anything else that locks
+// that client FOR NO KEY UPDATE or FOR UPDATE queues behind it. Neither
+// wait can close a cycle: the role change locks no row of these tables,
+// and every transaction that locks an existing client does so before any
+// users row, as this one does, so none waits for a client while holding a
+// users row. It never conflicts with the FOR KEY SHARE an issuance or a
+// grant revocation takes, on the client or on a users row.
 //
 // Refresh tokens also reference each other (superseded_by, ON DELETE SET
 // NULL), which adds no cycle. Under its grant, the refresh grant locks

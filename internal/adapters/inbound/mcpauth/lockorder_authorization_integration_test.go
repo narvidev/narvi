@@ -48,9 +48,12 @@ import (
 // pair; the unused-client sweep is TestLockOrder_ClientRegistrationWriters'.
 // An administrator's disable or enable of the client, which also takes it
 // FOR NO KEY UPDATE and so serializes with an authorization, is raced by
-// no test: it is one statement locking one row, and it waits at most
-// once, holding nothing, so it can never be part of a wait cycle (the
-// lock-order comment at the top of mcpoauthgrant_store.go).
+// no test: its one statement locks one row, and the one other lock its
+// transaction takes -- its audit row's FOR KEY SHARE on the acting
+// administrator's users row -- can make it wait, holding the client, only
+// for a role change's last-admin guard, which locks no row of these
+// tables, so it can never close a wait cycle (the lock-order comment at
+// the top of mcpoauthgrant_store.go).
 func TestLockOrder_AuthorizationRequestWriter(t *testing.T) {
 	maxPending := platform.DefaultTimeouts().MCPMaxPendingAuthorizationRequestsPerClient
 

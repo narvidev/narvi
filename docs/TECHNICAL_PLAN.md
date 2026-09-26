@@ -7426,8 +7426,15 @@ nothing that exists: nothing queues behind it, and it queues behind nothing
 (`TestLockOrder_ClientRegistrationWriters`, both orders of every pair, each re-fetch race run with the
 fetch succeeding and failing). An administrator's disable or enable of a client is, like the upsert, one
 statement taking one row lock — the client, `FOR NO KEY UPDATE`, since `disabled_at` is no key column —
-followed only by its audit row, outside this schema: it waits at most once, holding nothing, so it can
-never be part of a wait cycle, and it never waits on nor holds up an issuance or a grant revocation.
+but its transaction then inserts its audit row, whose foreign-key check takes the acting administrator's
+`users` row `FOR KEY SHARE`. So it can wait twice: for the client, holding nothing; then, holding the
+client, for that `users` row, which only a role change's last-admin guard holds against it (`FOR UPDATE` on
+every active administrator; no statement deletes a `users` row or changes its key), while an
+authorization, a re-fetch, a deletion, the sweep or another disable or enable of that client queues behind
+it. Neither wait can close a cycle: the role change locks no row of this schema, and every transaction
+that locks an existing client does so before any `users` row, as the disable does, so none waits for a
+client while holding a `users` row. It never waits on nor holds up an issuance or a grant revocation,
+whose `FOR KEY SHARE`, on the client and on a `users` row, conflicts with neither of its locks.
 
 Lifetimes live in `platform/timeouts.go`: `MCPAuthorizationRequestTTL` (10 minutes, the consent window),
 `MCPAuthorizationCodeTTL` (60 seconds), `MCPAccessTokenTTL` (1 hour), `MCPRefreshTokenTTL` (30 days per

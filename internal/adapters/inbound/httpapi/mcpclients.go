@@ -298,7 +298,10 @@ func EnableMCPClient(pool *pgxpool.Pool, clients *postgres.MCPOAuthClientStore, 
 
 // setMCPClientDisabled is DisableMCPClient (disable) and EnableMCPClient
 // (!disable): one statement changes the row (queries/mcp_oauth_clients.sql:
-// one row lock, the client's), then its audit row, in one transaction.
+// one row lock, the client's), then its audit row, in one transaction --
+// whose foreign-key check takes the acting administrator's users row FOR
+// KEY SHARE, the client still held (the lock order at the top of
+// postgres/mcpoauthgrant_store.go).
 func setMCPClientDisabled(pool *pgxpool.Pool, clients *postgres.MCPOAuthClientStore, auditLog *postgres.AuditLogStore, disable bool) http.HandlerFunc {
 	verb, action, unchanged := "enable", "mcp_client.enabled", "client is not disabled"
 	if disable {
