@@ -19,9 +19,18 @@ describe('connectedAppsFormat', () => {
   })
 
   it('clientIdentityLabel claims admin registration only for preregistered clients', () => {
-    expect(clientIdentityLabel('preregistered')).toBe('Registered by an administrator of this deployment')
-    expect(clientIdentityLabel('dynamic')).not.toContain('administrator')
-    expect(clientIdentityLabel('metadata_document')).not.toContain('administrator')
+    expect(clientIdentityLabel('preregistered', 'narvi_mcp_c_abc')).toBe('Registered by an administrator of this deployment')
+    expect(clientIdentityLabel('dynamic', 'narvi_mcp_d_abc')).toBe('Registered by the app itself')
+    expect(clientIdentityLabel('metadata_document', 'https://tools.example/mcp/client.json')).not.toContain('administrator')
+    expect(clientIdentityLabel('some_future_kind', 'https://tools.example/mcp/client.json')).toBe('Registered by the app itself')
+  })
+
+  it('clientIdentityLabel names a metadata-document client by its host, never by a name it chose', () => {
+    expect(clientIdentityLabel('metadata_document', 'https://tools.example/mcp/client.json')).toBe('Identified by tools.example')
+    expect(clientIdentityLabel('metadata_document', 'https://tools.example:8443/client.json')).toBe('Identified by tools.example:8443')
+    // A clientId that is not an https URL (never stored, but never trusted): no host is claimed.
+    expect(clientIdentityLabel('metadata_document', 'narvi_mcp_c_abc')).toBe('Registered by the app itself')
+    expect(clientIdentityLabel('metadata_document', 'https://')).toBe('Registered by the app itself')
   })
 
   it('parseRedirectUris trims, drops blank lines and keeps each URI once', () => {
