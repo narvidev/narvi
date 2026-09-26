@@ -46,6 +46,15 @@ const (
 	toMetadataHost   = "to-metadata.example"
 	otherHost        = "other.example"
 	docHostOtherCase = "DOC.example"
+	// dottedIHost has an "i", which a Location may spell U+0130 (capital
+	// I with a dot): strings.ToLower folds that to "i", but IDNA -- what
+	// net/http resolves and dials -- maps it to "i" and a combining dot,
+	// dottedIHostIDNA, another domain altogether.
+	dottedIHost     = "info.example"
+	dottedIHostIDNA = "xn--info-qwc.example"
+	// kelvinHost has a "k", which a Location may spell U+212A (the Kelvin
+	// sign): folded to "k" by both strings.ToLower and IDNA.
+	kelvinHost = "kilo.example"
 )
 
 // fakeResolver answers each host from a fixed sequence of answers (the
@@ -122,7 +131,7 @@ func newDocServer(t *testing.T, h http.Handler) *docServer {
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 		IsCA:                  true,
-		DNSNames:              []string{docHost, internalHost, mixedHost, loopHost, rebindHost, toPrivateHost, toMetadataHost, otherHost},
+		DNSNames:              []string{docHost, internalHost, mixedHost, loopHost, rebindHost, toPrivateHost, toMetadataHost, otherHost, dottedIHost, dottedIHostIDNA, kelvinHost},
 		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1)},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
@@ -294,18 +303,28 @@ func TestCIMDFetch_RefusesPrivateTargets(t *testing.T) {
 // even one the guard would let the fetch reach, on the same allowed
 // address and port with a certificate that verifies -- or to another
 // port is refused before it is followed; a same-origin redirect, the
-// host differing only in case, is followed.
+// host differing only in ASCII case, is followed. A Location whose host is
+// not written in plain ASCII is refused too, percent-encoded or raw UTF-8
+// (technical plan §43.15): U+0130 in place of an "i" lower-cases to the
+// very host the fetch began on, while net/http resolves, dials and
+// verifies another one -- which this test makes reachable and trusted, so
+// only the redirect policy stands in the way.
 func TestCIMDFetch_RefusesCrossOriginRedirects(t *testing.T) {
 	t.Parallel()
-	var otherHostHits atomic.Int32
+	var otherHostHits, idnaHostHits atomic.Int32
 	other := newDocServer(t, documentHandler(nil))
 	srv := newDocServer(t, documentHandler(func(w http.ResponseWriter, r *http.Request) bool {
 		if strings.HasPrefix(r.Host, otherHost) {
 			otherHostHits.Add(1)
 		}
+		if r.TLS != nil && strings.HasPrefix(r.TLS.ServerName, "xn--") {
+			idnaHostHits.Add(1)
+		}
 		if r.URL.Path == "/out" {
-			// An open redirect: wherever "to" says.
-			http.Redirect(w, r, r.URL.Query().Get("to"), http.StatusFound)
+			// An open redirect: wherever "to" says, byte for byte (not
+			// http.Redirect, which would percent-encode a raw UTF-8 host).
+			w.Header().Set("Location", r.URL.Query().Get("to"))
+			w.WriteHeader(http.StatusFound)
 			return true
 		}
 		return false
@@ -314,6 +333,9 @@ func TestCIMDFetch_RefusesCrossOriginRedirects(t *testing.T) {
 	res.set(docHost, addrs("127.0.0.1"))
 	res.set(docHostOtherCase, addrs("127.0.0.1"))
 	res.set(otherHost, addrs("127.0.0.1"))
+	res.set(dottedIHost, addrs("127.0.0.1"))
+	res.set(dottedIHostIDNA, addrs("127.0.0.1"))
+	res.set(kelvinHost, addrs("127.0.0.1"))
 	roots := x509.NewCertPool()
 	roots.AddCert(srv.leaf)
 	roots.AddCert(other.leaf)
@@ -325,6 +347,8 @@ func TestCIMDFetch_RefusesCrossOriginRedirects(t *testing.T) {
 		RootCAs:        roots,
 	}), testFetchTimeout)
 	out := func(to string) string { return srv.url(docHost, "/out?to="+url.QueryEscape(to)) }
+	outOn := func(host, to string) string { return srv.url(host, "/out?to="+url.QueryEscape(to)) }
+	port := fmt.Sprint(srv.addr.Port())
 
 	for _, tc := range []struct {
 		name    string
@@ -338,6 +362,14 @@ func TestCIMDFetch_RefusesCrossOriginRedirects(t *testing.T) {
 		{"a relative redirect", out("/client.json"), nil},
 		{"an absolute same-origin redirect", out(srv.url(docHost, "/client.json")), nil},
 		{"the same origin with the host in another case", out(srv.url(docHostOtherCase, "/client.json")), nil},
+		{"a scheme-relative same-origin redirect", out("//" + docHost + ":" + port + "/client.json"), nil},
+		{"U+0130 for the i, percent-encoded", outOn(dottedIHost, "https://%C4%B0nfo.example:"+port+"/client.json"), cimdfetch.ErrHostNotPlainASCII},
+		{"U+0130 for the i, raw UTF-8", outOn(dottedIHost, "https://\u0130nfo.example:"+port+"/client.json"), cimdfetch.ErrHostNotPlainASCII},
+		{"U+0130 for the i, scheme-relative", outOn(dottedIHost, "//\u0130nfo.example:"+port+"/client.json"), cimdfetch.ErrHostNotPlainASCII},
+		{"U+212A for the k, percent-encoded", outOn(kelvinHost, "https://%E2%84%AAilo.example:"+port+"/client.json"), cimdfetch.ErrHostNotPlainASCII},
+		{"U+212A for the k, raw UTF-8", outOn(kelvinHost, "https://\u212Ailo.example:"+port+"/client.json"), cimdfetch.ErrHostNotPlainASCII},
+		{"no redirect: U+0130 in the first URL, percent-encoded", "https://%C4%B0nfo.example:" + port + "/client.json", cimdfetch.ErrHostNotPlainASCII},
+		{"no redirect: U+0130 in the first URL, raw UTF-8", "https://\u0130nfo.example:" + port + "/client.json", cimdfetch.ErrHostNotPlainASCII},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := fetch.Fetch(context.Background(), tc.url)
@@ -354,6 +386,9 @@ func TestCIMDFetch_RefusesCrossOriginRedirects(t *testing.T) {
 	}
 	if n := other.hits.Load(); n != 0 {
 		t.Errorf("a redirect reached the server on another port %d times, want never", n)
+	}
+	if n, m := idnaHostHits.Load(), res.lookups(dottedIHostIDNA); n != 0 || m != 0 {
+		t.Errorf("a redirect reached %s (%d requests, %d lookups), want never", dottedIHostIDNA, n, m)
 	}
 }
 

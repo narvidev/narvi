@@ -30,7 +30,15 @@
 //     redirects, each within the first URL's own origin (scheme, host,
 //     port): the document is served by the origin its URL names, so the
 //     host shown as the client's identity is the host it came from -- an
-//     open redirect elsewhere cannot lend another host's name to it. No
+//     open redirect elsewhere cannot lend another host's name to it. Every
+//     host -- the first URL's and each redirect's Location's -- must be
+//     written in plain ASCII (no percent sign in the authority, the parsed
+//     host exactly the bytes written), the client_id host rule, and hosts
+//     are compared folding ASCII case only: net/http resolves a non-ASCII
+//     host by its IDNA form, which no comparison of the host as parsed
+//     can stand for (U+0130 lower-cases to "i", but IDNA makes it "i" and
+//     a combining dot, another domain), so the host compared is always
+//     the very string the transport resolves. No
 //     proxy from the environment -- a proxy would dial on the guard's
 //     behalf, out of its reach.
 //   - The answer must be 200 with Content-Type application/json, say where

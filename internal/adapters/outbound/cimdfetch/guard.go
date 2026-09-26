@@ -31,6 +31,12 @@ var ErrTooManyRedirects = errors.New("cimdfetch: too many redirects")
 // origin -- scheme, host and port -- of the URL the fetch began with.
 var ErrCrossOriginRedirect = errors.New("cimdfetch: refused a redirect to another origin")
 
+// ErrHostNotPlainASCII is wrapped when a URL the fetch would follow -- the
+// first, or a redirect's Location -- does not write its host in plain
+// ASCII: a percent sign in the authority, a parsed host that is not the
+// authority's own bytes, or a byte outside printable ASCII.
+var ErrHostNotPlainASCII = errors.New("cimdfetch: the host must be written in plain ASCII, exactly as it is resolved")
+
 // MaxRedirects is how many redirects one fetch follows at most.
 const MaxRedirects = 3
 
@@ -263,14 +269,24 @@ func requireHTTPS(u *url.URL) error {
 }
 
 // checkRedirect is the client's redirect policy: at most MaxRedirects,
-// each to an https URL (never a downgrade, never another scheme) on the
-// very origin -- scheme, host, port -- the fetch began with. The document
-// is identified by its URL, and the host of that URL is what the consent
+// each to an https URL (never a downgrade, never another scheme) whose
+// Location writes its host in plain ASCII (hostAsWritten), on the very
+// origin -- scheme, host, port -- the fetch began with. The document is
+// identified by its URL, and the host of that URL is what the consent
 // page shows as the client's identity: were a redirect allowed to leave
 // that origin, an open redirect on a reputable host would let a document
 // served anywhere else appear under the reputable host's name. The
 // target's address is checked when it is dialed, like any other: a
 // same-origin redirect resolves, and is checked, afresh.
+//
+// The ASCII rule is what makes the origin comparison sound. net/http
+// resolves, dials, and sends as SNI the IDNA ASCII form of a non-ASCII
+// host, a string no comparison of the host as parsed can stand for:
+// Unicode case folding turns U+0130 (capital I with a dot) into a plain
+// "i", while IDNA maps it to "i" and a combining dot -- another domain
+// altogether. With every host plain ASCII, the host compared is the very
+// string the transport resolves, and ASCII case, which DNS and
+// certificate names both ignore, is the only folding needed.
 func checkRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) > MaxRedirects {
 		return fmt.Errorf("%w: more than %d", ErrTooManyRedirects, MaxRedirects)
@@ -278,22 +294,90 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 	if err := requireHTTPS(req.URL); err != nil {
 		return err
 	}
+	var location string
+	if req.Response != nil {
+		location = req.Response.Header.Get("Location")
+	}
+	written, err := url.Parse(location)
+	if err != nil {
+		return fmt.Errorf("%w: the redirect's Location does not parse", ErrHostNotPlainASCII)
+	}
+	if err := hostAsWritten(location, written); err != nil {
+		return fmt.Errorf("%w (redirect)", err)
+	}
+	if err := hostAsWritten(req.URL.String(), req.URL); err != nil {
+		return fmt.Errorf("%w (redirect)", err)
+	}
 	if to, from := origin(req.URL), origin(via[0].URL); to != from {
 		return fmt.Errorf("%w: %s, from %s", ErrCrossOriginRedirect, to, from)
 	}
 	return nil
 }
 
+// hostAsWritten is the client_id host rule (internal/domain/mcpclient's
+// plainASCIIAuthority), applied to every URL a fetch follows: raw, a URL
+// or a redirect's Location as written, with u its parse, writes its
+// authority with no percent sign, the parsed host exactly the authority's
+// own bytes, and that host printable ASCII. url.Parse decodes a
+// percent-encoded byte of 0x80 or above in a host, and takes raw UTF-8
+// as it comes, so neither spelling of a non-ASCII host gets past the
+// first two checks, whichever way it is written. A reference with no
+// authority -- a relative redirect -- names no host: it keeps the one
+// already checked.
+func hostAsWritten(raw string, u *url.URL) error {
+	rest := raw
+	if u.Scheme != "" {
+		rest = raw[len(u.Scheme)+1:]
+	}
+	if !strings.HasPrefix(rest, "//") {
+		if u.Host != "" {
+			return fmt.Errorf("%w: a host the URL does not write", ErrHostNotPlainASCII)
+		}
+		return nil
+	}
+	authority := rest[len("//"):]
+	if end := strings.IndexAny(authority, "/?#"); end >= 0 {
+		authority = authority[:end]
+	}
+	if strings.Contains(authority, "%") {
+		return fmt.Errorf("%w: a percent sign in %q", ErrHostNotPlainASCII, authority)
+	}
+	if authority != u.Host {
+		return fmt.Errorf("%w: %q parses to another host", ErrHostNotPlainASCII, authority)
+	}
+	for i := 0; i < len(u.Host); i++ {
+		if u.Host[i] <= 0x20 || u.Host[i] >= 0x7f {
+			return fmt.Errorf("%w: %q", ErrHostNotPlainASCII, u.Host)
+		}
+	}
+	return nil
+}
+
 // origin is u's scheme, host and port as RFC 6454 compares them: scheme
-// and host lower-cased, the port spelled out (443 when an https URL names
-// none).
+// and host with ASCII letters lower-cased and nothing else folded, the
+// port spelled out (443 when an https URL names none). Every host it is
+// given is plain ASCII (hostAsWritten), so its host is the very string
+// the transport resolves.
 func origin(u *url.URL) string {
-	scheme := strings.ToLower(u.Scheme)
+	scheme := asciiLower(u.Scheme)
 	port := u.Port()
 	if port == "" && scheme == "https" {
 		port = "443"
 	}
-	return scheme + "://" + net.JoinHostPort(strings.ToLower(u.Hostname()), port)
+	return scheme + "://" + net.JoinHostPort(asciiLower(u.Hostname()), port)
+}
+
+// asciiLower lower-cases the ASCII letters A to Z in s and leaves every
+// other byte as it is -- unlike strings.ToLower, which folds some
+// non-ASCII letters (U+0130, U+212A) into ASCII ones.
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
 }
 
 // httpsOnly refuses any request that is not https before it reaches the

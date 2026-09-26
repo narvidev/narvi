@@ -84,6 +84,9 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string) (Result, error) {
 	if err := requireHTTPS(u); err != nil {
 		return Result{}, err
 	}
+	if err := hostAsWritten(rawURL, u); err != nil {
+		return Result{}, err
+	}
 	ctx, cancel := context.WithTimeout(ctx, f.timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)

@@ -9,7 +9,8 @@ import (
 
 // TestOrigin_Table is origin() as RFC 6454 compares origins: an https URL
 // naming no port is on 443, so the implicit and the explicit spelling are
-// one origin; ASCII letters fold.
+// one origin; ASCII letters fold, and nothing else does -- a non-ASCII
+// letter that strings.ToLower would fold into ASCII stays as it is.
 func TestOrigin_Table(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -20,6 +21,8 @@ func TestOrigin_Table(t *testing.T) {
 		{"another port", "https://doc.example:8443/client.json", "https://doc.example:8443"},
 		{"ASCII case folds, scheme and host", "HTTPS://DOC.Example/client.json", "https://doc.example:443"},
 		{"an IPv6 literal", "https://[2001:db8::1]/client.json", "https://[2001:db8::1]:443"},
+		{"U+0130 is not folded into an i", "https://\u0130nfo.example/client.json", "https://\u0130nfo.example:443"},
+		{"U+212A is not folded into a k", "https://\u212Ailo.example/client.json", "https://\u212Ailo.example:443"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			u, err := url.Parse(tc.url)
@@ -35,7 +38,8 @@ func TestOrigin_Table(t *testing.T) {
 
 // TestCheckRedirect_Table is the redirect policy on its own, given the
 // Location as the client hands it over: the implicit and the explicit
-// 443 are one origin, both ways.
+// 443 are one origin, both ways; a Location's host is refused unless it
+// is written in plain ASCII, whichever way a non-ASCII host is spelled.
 func TestCheckRedirect_Table(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -49,6 +53,11 @@ func TestCheckRedirect_Table(t *testing.T) {
 		{"a scheme-relative Location", "https://doc.example/client.json", "//doc.example/moved/client.json", nil},
 		{"ASCII case only", "https://doc.example/client.json", "https://DOC.EXAMPLE/moved/client.json", nil},
 		{"another host", "https://doc.example/client.json", "https://other.example/client.json", ErrCrossOriginRedirect},
+		{"U+0130, percent-encoded", "https://info.example/client.json", "https://%C4%B0nfo.example/client.json", ErrHostNotPlainASCII},
+		{"U+0130, raw UTF-8", "https://info.example/client.json", "https://\u0130nfo.example/client.json", ErrHostNotPlainASCII},
+		{"U+212A, percent-encoded", "https://kilo.example/client.json", "https://%E2%84%AAilo.example/client.json", ErrHostNotPlainASCII},
+		{"U+212A, raw UTF-8", "https://kilo.example/client.json", "https://\u212Ailo.example/client.json", ErrHostNotPlainASCII},
+		{"user information in the Location", "https://doc.example/client.json", "https://someone@doc.example/client.json", ErrHostNotPlainASCII},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			from, err := url.Parse(tc.from)
