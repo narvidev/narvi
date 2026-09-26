@@ -26,6 +26,16 @@ ALTER TABLE mcp_oauth_clients
     ADD COLUMN metadata_stale_at          TIMESTAMPTZ,
     ADD COLUMN metadata_refetch_failed_at TIMESTAMPTZ;
 
+-- A metadata-document client row can already exist here: the kind dates
+-- from 000141, and this migration's down keeps the clients (and every
+-- grant under them) while dropping the stamps. Such a row is stamped as
+-- fetched when it was registered and stale since then, so the CHECK below
+-- holds and its document is fetched afresh the next time it is used.
+UPDATE mcp_oauth_clients
+SET metadata_fetched_at = created_at,
+    metadata_stale_at   = created_at
+WHERE kind = 'metadata_document';
+
 ALTER TABLE mcp_oauth_clients
     ADD CONSTRAINT mcp_oauth_clients_metadata_stamps_check CHECK (
         (kind = 'metadata_document' AND metadata_fetched_at IS NOT NULL AND metadata_stale_at IS NOT NULL)
