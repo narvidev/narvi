@@ -717,7 +717,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 
 	// The exit criterion end to end (§43.19): the official SDK client
 	// discovers everything from one live 401, the member approves on the
-	// consent page, and the resulting token lists exactly the three tools
+	// consent page, and the resulting token lists exactly the five tools
 	// and calls one with the same bytes the REST twin gives the member's
 	// own cookie. The SDK's own RFC 9207 issuer check passes along the way.
 	t.Run("EndToEnd_SDKClient", func(t *testing.T) {
@@ -751,7 +751,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 			t.Fatalf("consent flow ran %d times, want 1", n)
 		}
 
-		want := []string{"narvi_get_session", "narvi_list_models", "narvi_list_sessions"}
+		want := []string{"narvi_get_session", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions"}
 		if got := toolNames(ctx, t, flow.session); strings.Join(got, ",") != strings.Join(want, ",") {
 			t.Fatalf("ListTools = %v, want %v", got, want)
 		}
@@ -1161,6 +1161,17 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		}
 	})
 
+	// Row 182's piece (a), on this same shared router (technical plan
+	// §43.20): the status and transcript tools answer their twins' bytes
+	// through the official SDK client, and a grant without mcp:read is told
+	// neither exists.
+	t.Run("SessionStatusAndTranscript_SDKClient", func(t *testing.T) {
+		sdkSessionStatusAndTranscript(t, rig)
+	})
+	t.Run("SessionStatusAndTranscript_ScopelessGrantSeesNeither", func(t *testing.T) {
+		sdkSessionStatusAndTranscriptScopeless(t, rig)
+	})
+
 	// --- Clients without a prior relationship (§43.15) ---
 	//
 	// doc is an in-test HTTPS server on loopback serving one client ID
@@ -1249,7 +1260,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SDK Connect with a metadata document: %v", err)
 		}
-		want := []string{"narvi_get_session", "narvi_list_models", "narvi_list_sessions"}
+		want := []string{"narvi_get_session", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions"}
 		if got := toolNames(ctx, t, flow.session); strings.Join(got, ",") != strings.Join(want, ",") {
 			t.Fatalf("ListTools = %v, want %v", got, want)
 		}
@@ -1301,8 +1312,8 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SDK Connect with dynamic registration: %v", err)
 		}
-		if got := toolNames(ctx, t, flow.session); len(got) != 3 {
-			t.Fatalf("ListTools = %v, want the three tools", got)
+		if got := toolNames(ctx, t, flow.session); len(got) != 5 {
+			t.Fatalf("ListTools = %v, want the five tools", got)
 		}
 		if res, err := callListModels(ctx, flow.session); err != nil || res.IsError {
 			t.Fatalf("CallTool narvi_list_models: res %+v err %v", res, err)

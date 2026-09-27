@@ -3859,6 +3859,34 @@ func (j *FalsePositivePattern) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// The narvi_get_session_status MCP tool's own input (technical plan §43.20) -- the
+// tool bridge's twin of GET /api/sessions/{sessionID}/status, carrying the path
+// parameter as a plain required field exactly like GetSessionToolRequest.
+type GetSessionStatusToolRequest struct {
+	// The session id, matching Session.id's own format exactly. A malformed value
+	// fails argument validation before the twin is invoked, reported as a tool
+	// execution error (isError:true).
+	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *GetSessionStatusToolRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["sessionId"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionId in GetSessionStatusToolRequest: required")
+	}
+	type Plain GetSessionStatusToolRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = GetSessionStatusToolRequest(plain)
+	return nil
+}
+
 // The narvi_get_session MCP tool's own input (technical plan §43.7) -- the tool
 // bridge's twin of GET /api/sessions/{sessionID}, carrying the path parameter as a
 // plain required field the bridge maps onto chi's own URLParams before invoking
@@ -3888,6 +3916,56 @@ func (j *GetSessionToolRequest) UnmarshalJSON(value []byte) error {
 		return err
 	}
 	*j = GetSessionToolRequest(plain)
+	return nil
+}
+
+// The narvi_get_session_transcript MCP tool's own input (technical plan §43.20) --
+// the tool bridge's twin of GET /api/sessions/{sessionID}/events?cursor=&limit=,
+// the paginated event history. sessionId becomes the path parameter; cursor and
+// limit, when set, become the route's own query parameters, and when omitted leave
+// the route's own defaults to run unchanged (from the beginning, 100 events per
+// page).
+type GetSessionTranscriptToolRequest struct {
+	// Where the page starts: the previous page's EventsResponse.nextCursor, verbatim,
+	// or "0" (the default) for the beginning. An event id in decimal, a string like
+	// nextCursor itself; a value that names no 64-bit event id is the route's own
+	// 400, reported as a tool execution error.
+	Cursor *string `json:"cursor,omitempty,omitzero" yaml:"cursor,omitempty" mapstructure:"cursor,omitempty"`
+
+	// How many events per page. Omitted means the route's own default (100). minimum
+	// matches the route's own rejection of a value below one. Deliberately no
+	// "maximum": the route does not reject a larger value, it clamps it to 500, and
+	// tools/contractscompat's closed keyword allowlist does not recognize "maximum"
+	// (ListSessionsToolRequest.limit's own reasoning).
+	Limit *int `json:"limit,omitempty,omitzero" yaml:"limit,omitempty" mapstructure:"limit,omitempty"`
+
+	// The session id, matching Session.id's own format exactly.
+	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *GetSessionTranscriptToolRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["sessionId"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionId in GetSessionTranscriptToolRequest: required")
+	}
+	type Plain GetSessionTranscriptToolRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if plain.Cursor != nil {
+		if matched, _ := regexp.MatchString(`^(0|[1-9][0-9]{0,18})$`, string(*plain.Cursor)); !matched {
+			return fmt.Errorf("field %s pattern match: must match %s", "Cursor", `^(0|[1-9][0-9]{0,18})$`)
+		}
+	}
+	if plain.Limit != nil && 1 > *plain.Limit {
+		return fmt.Errorf("field %s: must be >= %v", "limit", 1)
+	}
+	*j = GetSessionTranscriptToolRequest(plain)
 	return nil
 }
 
@@ -11011,7 +11089,15 @@ type Session struct {
 	// Matches Postgres session_spawn_source exactly.
 	SpawnSource SessionSpawnSource `json:"spawnSource" yaml:"spawnSource" mapstructure:"spawnSource"`
 
-	// Matches Postgres session_status exactly.
+	// Matches Postgres session_status exactly: derived each time a turn reaches a
+	// terminal state -- 'created' until one has, 'active' when another turn was still
+	// queued or running at that moment, otherwise that turn's outcome: 'completed',
+	// 'failed' or 'cancelled'. It is not re-derived when a turn is queued or
+	// dispatched, so it does not show queued or running work, and a queued or running
+	// turn can sit under any of the five values: a first turn runs its whole life
+	// under 'created', and a follow-up under whatever the last derivation left. What
+	// the session is doing now is SessionActivity.activity, GET
+	// /api/sessions/{sessionID}/status.
 	Status SessionStatus `json:"status" yaml:"status" mapstructure:"status"`
 
 	// Null until the session_title WS event (§6.1) sets it.
@@ -11019,6 +11105,518 @@ type Session struct {
 
 	// UpdatedAt corresponds to the JSON schema field "updatedAt".
 	UpdatedAt time.Time `json:"updatedAt" yaml:"updatedAt" mapstructure:"updatedAt"`
+}
+
+// GET /api/sessions/{sessionID}/status (technical plan §43.20): what one session's
+// work is doing now, and how long to wait before reading it again. Derived at read
+// time from the session's turn queue, a completed turn's push and pull request
+// still under way, work the server holds that can create a turn on the session
+// with no new input, and its human gates, all read in ONE database snapshot --
+// never from Session.status, which is re-derived only when a turn reaches a
+// terminal state and so can hold any of its five values while a turn is queued or
+// running. Carries no events and no transcript: the event history is GET
+// /api/sessions/{sessionID}/events (EventsResponse), a separate, paginated read.
+type SessionActivity struct {
+	// In precedence order: 'running' when a turn is dispatched or processing (turns
+	// may be queued behind it); else 'queued' when a turn is pending -- including the
+	// gap between one turn finishing and the next being dispatched, and a whole
+	// sandbox cold start; else 'delivering' when a turn that completed is still being
+	// delivered -- its branch pushed, then its pull request opened, which happens
+	// with no new input -- for at most the deployment's delivery window from when
+	// that turn completed (10 minutes as shipped: a push that never reports back
+	// stops counting then); else 'scheduled' when the server holds work that can
+	// create a turn on this session with no new input and has neither created it nor
+	// declined yet -- an automatic re-review armed by a push to the session's pull
+	// request (a debounce, 2 minutes as shipped, counted only while the pull
+	// request's repository has opted in and its automatic re-review budget is not
+	// spent: the two conditions under which it can create a turn), or a release pull
+	// request's manifest check still to come or still running (it can add a
+	// composition review turn); else 'awaiting_approval' when a person must act (a
+	// plan awaiting approval, a workflow step awaiting a decision, or a custom
+	// workflow's run escalated for review until a turn is created on the session
+	// after it escalated -- see awaiting.kind); else 'idle' when the session has no
+	// turn at all; else 'finished' (at least one turn, every one terminal, nothing
+	// being delivered, nothing scheduled). A queued or running turn is never reported
+	// as idle or finished. 'delivering' ends once the pull request is recorded, or
+	// once the delivery ends without one: the push failed or could not be sent, the
+	// pull request could not be opened (the creator may no longer open one, or their
+	// GitHub token is no longer usable, or GitHub refused it), or the window passed.
+	// A pull request that is opened is recorded before activity leaves 'delivering',
+	// except when two pushes overlap: a sandbox records one delivery at a time, so if
+	// a later turn completes before an earlier turn's push has reported back, the
+	// earlier push's pull request ends the later delivery, and the later pull request
+	// can appear after 'finished'. 'scheduled' ends when its work comes due and
+	// either creates its turn ('queued' follows) or declines (the session reads
+	// whatever else it holds). One stated limit: when this session is a pull
+	// request's review session and its own push moves that pull request's head (a
+	// same-repository pull request whose head branch is the session's), the automatic
+	// re-review that push causes is armed only when the code host's notification of
+	// the push arrives -- until then activity can read 'finished', and once it lands
+	// 'scheduled', then 'queued' or 'running'. The same holds after a push that
+	// reached the remote but reported a failure.
+	Activity SessionActivityActivity `json:"activity" yaml:"activity" mapstructure:"activity"`
+
+	// Archived corresponds to the JSON schema field "archived".
+	Archived bool `json:"archived" yaml:"archived" mapstructure:"archived"`
+
+	// The human gate open on this session, if any, whatever activity says: activity
+	// is 'awaiting_approval' only when nothing is also queued, running, being
+	// delivered or scheduled. When more than one gate is open, a plan is reported
+	// first, then a workflow step, then an escalated workflow run.
+	Awaiting *SessionActivityAwaiting `json:"awaiting" yaml:"awaiting" mapstructure:"awaiting"`
+
+	// The turn dispatched to a sandbox or being processed; null when none is.
+	InFlightTurn *SessionActivityInFlightTurn `json:"inFlightTurn" yaml:"inFlightTurn" mapstructure:"inFlightTurn"`
+
+	// The most recently created turn that reached a terminal state; null when none
+	// has.
+	LastRun *SessionActivityLastRun `json:"lastRun" yaml:"lastRun" mapstructure:"lastRun"`
+
+	// The database's clock when the snapshot was taken.
+	ObservedAt time.Time `json:"observedAt" yaml:"observedAt" mapstructure:"observedAt"`
+
+	// How many turns are queued (pending), not yet dispatched to a sandbox.
+	PendingTurns int `json:"pendingTurns" yaml:"pendingTurns" mapstructure:"pendingTurns"`
+
+	// The session's sandbox status in the same snapshot, with Session.sandboxStatus's
+	// values; null when the session has no sandbox yet. Informational, and an input
+	// to suggestedDelaySeconds while queued: activity never derives from it.
+	SandboxStatus *SessionActivitySandboxStatus `json:"sandboxStatus" yaml:"sandboxStatus" mapstructure:"sandboxStatus"`
+
+	// SessionId corresponds to the JSON schema field "sessionId".
+	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+
+	// true exactly when activity is idle, awaiting_approval or finished: nothing
+	// progresses server-side until a person acts or sends new input. Never true while
+	// a turn is queued or running, while a completed turn's push and pull request are
+	// being delivered, or while work that can create a turn is scheduled. One stated
+	// limit (see activity): after a pull request review session's own push to that
+	// pull request's head, settled can be true before the code host's notification of
+	// that push arms an automatic re-review.
+	Settled bool `json:"settled" yaml:"settled" mapstructure:"settled"`
+
+	// How long to wait before reading this status again, in whole seconds (rounded
+	// up): short while a turn is queued on a warm sandbox, running or being
+	// delivered, longer while a sandbox starts or work is scheduled (never past the
+	// moment that work comes due, plus a few seconds for it to act), longer still
+	// while a person must act, longest once finished or idle -- always within the
+	// deployment's configured floor and ceiling (2 and 300 seconds as shipped). A
+	// hint that keeps polling quiet, never a limit: an earlier read is answered all
+	// the same.
+	SuggestedDelaySeconds int `json:"suggestedDelaySeconds" yaml:"suggestedDelaySeconds" mapstructure:"suggestedDelaySeconds"`
+}
+
+type SessionActivityActivity string
+
+const SessionActivityActivityAwaitingApproval SessionActivityActivity = "awaiting_approval"
+const SessionActivityActivityDelivering SessionActivityActivity = "delivering"
+const SessionActivityActivityFinished SessionActivityActivity = "finished"
+const SessionActivityActivityIdle SessionActivityActivity = "idle"
+const SessionActivityActivityQueued SessionActivityActivity = "queued"
+const SessionActivityActivityRunning SessionActivityActivity = "running"
+const SessionActivityActivityScheduled SessionActivityActivity = "scheduled"
+
+var enumValues_SessionActivityActivity = []interface{}{
+	"idle",
+	"queued",
+	"running",
+	"delivering",
+	"scheduled",
+	"awaiting_approval",
+	"finished",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionActivityActivity) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_SessionActivityActivity {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_SessionActivityActivity, v)
+	}
+	*j = SessionActivityActivity(v)
+	return nil
+}
+
+// The human gate open on this session, if any, whatever activity says: activity is
+// 'awaiting_approval' only when nothing is also queued, running, being delivered
+// or scheduled. When more than one gate is open, a plan is reported first, then a
+// workflow step, then an escalated workflow run.
+type SessionActivityAwaiting struct {
+	// Id corresponds to the JSON schema field "id".
+	Id string `json:"id" yaml:"id" mapstructure:"id"`
+
+	// 'plan': a plan awaiting approval (id is the plan's, decided through POST
+	// /api/sessions/{sessionID}/plans/{planId}/approve or reject); 'workflow_step': a
+	// workflow step awaiting a decision (id is the step run's);
+	// 'workflow_escalation': a custom workflow's run escalated for review (id is the
+	// run's), reported until a turn is created on the session after it escalated:
+	// while it is the session's newest workflow run and no turn other than the run's
+	// own attempts has been created since. New work sent to the session answers it; a
+	// turn created before the escalation never does, whether it is still queued,
+	// running or has ended (such as one queued behind the turn whose end escalated
+	// the run, or one sent while a step awaited the decision that escalated it), so
+	// while such a turn runs, activity says running and awaiting still reports the
+	// escalation. A built-in workflow's escalation is never reported: no person or
+	// route can act on it, and when its turn failed or was stopped, lastRun already
+	// says so.
+	Kind SessionActivityAwaitingKind `json:"kind" yaml:"kind" mapstructure:"kind"`
+
+	// When the gate opened.
+	Since time.Time `json:"since" yaml:"since" mapstructure:"since"`
+}
+
+type SessionActivityAwaitingKind string
+
+const SessionActivityAwaitingKindPlan SessionActivityAwaitingKind = "plan"
+const SessionActivityAwaitingKindWorkflowEscalation SessionActivityAwaitingKind = "workflow_escalation"
+const SessionActivityAwaitingKindWorkflowStep SessionActivityAwaitingKind = "workflow_step"
+
+var enumValues_SessionActivityAwaitingKind = []interface{}{
+	"plan",
+	"workflow_step",
+	"workflow_escalation",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionActivityAwaitingKind) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_SessionActivityAwaitingKind {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_SessionActivityAwaitingKind, v)
+	}
+	*j = SessionActivityAwaitingKind(v)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionActivityAwaiting) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["id"]; raw != nil && !ok {
+		return fmt.Errorf("field id in SessionActivityAwaiting: required")
+	}
+	if _, ok := raw["kind"]; raw != nil && !ok {
+		return fmt.Errorf("field kind in SessionActivityAwaiting: required")
+	}
+	if _, ok := raw["since"]; raw != nil && !ok {
+		return fmt.Errorf("field since in SessionActivityAwaiting: required")
+	}
+	type Plain SessionActivityAwaiting
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = SessionActivityAwaiting(plain)
+	return nil
+}
+
+// The turn dispatched to a sandbox or being processed; null when none is.
+type SessionActivityInFlightTurn struct {
+	// When the turn was dispatched.
+	DispatchedAt SessionActivityInFlightTurnDispatchedAt `json:"dispatchedAt" yaml:"dispatchedAt" mapstructure:"dispatchedAt"`
+
+	// 'dispatched': handed to the sandbox, not yet confirmed started; 'processing':
+	// the agent is working on it.
+	State SessionActivityInFlightTurnState `json:"state" yaml:"state" mapstructure:"state"`
+
+	// TurnId corresponds to the JSON schema field "turnId".
+	TurnId string `json:"turnId" yaml:"turnId" mapstructure:"turnId"`
+}
+
+// When the turn was dispatched.
+type SessionActivityInFlightTurnDispatchedAt = *time.Time
+
+type SessionActivityInFlightTurnState string
+
+const SessionActivityInFlightTurnStateDispatched SessionActivityInFlightTurnState = "dispatched"
+const SessionActivityInFlightTurnStateProcessing SessionActivityInFlightTurnState = "processing"
+
+var enumValues_SessionActivityInFlightTurnState = []interface{}{
+	"dispatched",
+	"processing",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionActivityInFlightTurnState) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_SessionActivityInFlightTurnState {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_SessionActivityInFlightTurnState, v)
+	}
+	*j = SessionActivityInFlightTurnState(v)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionActivityInFlightTurn) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["dispatchedAt"]; raw != nil && !ok {
+		return fmt.Errorf("field dispatchedAt in SessionActivityInFlightTurn: required")
+	}
+	if _, ok := raw["state"]; raw != nil && !ok {
+		return fmt.Errorf("field state in SessionActivityInFlightTurn: required")
+	}
+	if _, ok := raw["turnId"]; raw != nil && !ok {
+		return fmt.Errorf("field turnId in SessionActivityInFlightTurn: required")
+	}
+	type Plain SessionActivityInFlightTurn
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = SessionActivityInFlightTurn(plain)
+	return nil
+}
+
+// The most recently created turn that reached a terminal state; null when none
+// has.
+type SessionActivityLastRun struct {
+	// Why the run did not complete, with Session.failureReason's values. A turn
+	// carries no reason of its own, so this is the session's recorded reason, given
+	// only when it can describe nothing but this run: the run is the session's newest
+	// turn, did not complete, and the session's recorded outcome is this run's. Null
+	// otherwise, and always null when the run completed.
+	FailureReason *SessionActivityLastRunFailureReason `json:"failureReason" yaml:"failureReason" mapstructure:"failureReason"`
+
+	// When the run reached its terminal state; null when that was not recorded.
+	FinishedAt SessionActivityLastRunFinishedAt `json:"finishedAt" yaml:"finishedAt" mapstructure:"finishedAt"`
+
+	// Outcome corresponds to the JSON schema field "outcome".
+	Outcome SessionActivityLastRunOutcome `json:"outcome" yaml:"outcome" mapstructure:"outcome"`
+
+	// TurnId corresponds to the JSON schema field "turnId".
+	TurnId string `json:"turnId" yaml:"turnId" mapstructure:"turnId"`
+}
+
+type SessionActivityLastRunFailureReason struct {
+	Value interface{}
+}
+
+// MarshalJSON implements json.Marshaler.
+func (j *SessionActivityLastRunFailureReason) MarshalJSON() ([]byte, error) {
+	return json.Marshal(j.Value)
+}
+
+var enumValues_SessionActivityLastRunFailureReason = []interface{}{
+	"cancelled",
+	"failed",
+	"timeout",
+	"never_started",
+	nil,
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionActivityLastRunFailureReason) UnmarshalJSON(value []byte) error {
+	var v struct {
+		Value interface{}
+	}
+	if err := json.Unmarshal(value, &v.Value); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_SessionActivityLastRunFailureReason {
+		if reflect.DeepEqual(v.Value, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_SessionActivityLastRunFailureReason, v.Value)
+	}
+	*j = SessionActivityLastRunFailureReason(v)
+	return nil
+}
+
+// When the run reached its terminal state; null when that was not recorded.
+type SessionActivityLastRunFinishedAt = *time.Time
+
+type SessionActivityLastRunOutcome string
+
+const SessionActivityLastRunOutcomeCancelled SessionActivityLastRunOutcome = "cancelled"
+const SessionActivityLastRunOutcomeCompleted SessionActivityLastRunOutcome = "completed"
+const SessionActivityLastRunOutcomeFailed SessionActivityLastRunOutcome = "failed"
+
+var enumValues_SessionActivityLastRunOutcome = []interface{}{
+	"completed",
+	"failed",
+	"cancelled",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionActivityLastRunOutcome) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_SessionActivityLastRunOutcome {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_SessionActivityLastRunOutcome, v)
+	}
+	*j = SessionActivityLastRunOutcome(v)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionActivityLastRun) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["failureReason"]; raw != nil && !ok {
+		return fmt.Errorf("field failureReason in SessionActivityLastRun: required")
+	}
+	if _, ok := raw["finishedAt"]; raw != nil && !ok {
+		return fmt.Errorf("field finishedAt in SessionActivityLastRun: required")
+	}
+	if _, ok := raw["outcome"]; raw != nil && !ok {
+		return fmt.Errorf("field outcome in SessionActivityLastRun: required")
+	}
+	if _, ok := raw["turnId"]; raw != nil && !ok {
+		return fmt.Errorf("field turnId in SessionActivityLastRun: required")
+	}
+	type Plain SessionActivityLastRun
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = SessionActivityLastRun(plain)
+	return nil
+}
+
+type SessionActivitySandboxStatus struct {
+	Value interface{}
+}
+
+// MarshalJSON implements json.Marshaler.
+func (j *SessionActivitySandboxStatus) MarshalJSON() ([]byte, error) {
+	return json.Marshal(j.Value)
+}
+
+var enumValues_SessionActivitySandboxStatus = []interface{}{
+	"pending",
+	"spawning",
+	"connecting",
+	"booting",
+	"ready",
+	"snapshotting",
+	"suspect",
+	"stopped",
+	"failed",
+	nil,
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionActivitySandboxStatus) UnmarshalJSON(value []byte) error {
+	var v struct {
+		Value interface{}
+	}
+	if err := json.Unmarshal(value, &v.Value); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_SessionActivitySandboxStatus {
+		if reflect.DeepEqual(v.Value, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_SessionActivitySandboxStatus, v.Value)
+	}
+	*j = SessionActivitySandboxStatus(v)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionActivity) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["activity"]; raw != nil && !ok {
+		return fmt.Errorf("field activity in SessionActivity: required")
+	}
+	if _, ok := raw["archived"]; raw != nil && !ok {
+		return fmt.Errorf("field archived in SessionActivity: required")
+	}
+	if _, ok := raw["awaiting"]; raw != nil && !ok {
+		return fmt.Errorf("field awaiting in SessionActivity: required")
+	}
+	if _, ok := raw["inFlightTurn"]; raw != nil && !ok {
+		return fmt.Errorf("field inFlightTurn in SessionActivity: required")
+	}
+	if _, ok := raw["lastRun"]; raw != nil && !ok {
+		return fmt.Errorf("field lastRun in SessionActivity: required")
+	}
+	if _, ok := raw["observedAt"]; raw != nil && !ok {
+		return fmt.Errorf("field observedAt in SessionActivity: required")
+	}
+	if _, ok := raw["pendingTurns"]; raw != nil && !ok {
+		return fmt.Errorf("field pendingTurns in SessionActivity: required")
+	}
+	if _, ok := raw["sandboxStatus"]; raw != nil && !ok {
+		return fmt.Errorf("field sandboxStatus in SessionActivity: required")
+	}
+	if _, ok := raw["sessionId"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionId in SessionActivity: required")
+	}
+	if _, ok := raw["settled"]; raw != nil && !ok {
+		return fmt.Errorf("field settled in SessionActivity: required")
+	}
+	if _, ok := raw["suggestedDelaySeconds"]; raw != nil && !ok {
+		return fmt.Errorf("field suggestedDelaySeconds in SessionActivity: required")
+	}
+	type Plain SessionActivity
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if 0 > plain.PendingTurns {
+		return fmt.Errorf("field %s: must be >= %v", "pendingTurns", 0)
+	}
+	if 0 > plain.SuggestedDelaySeconds {
+		return fmt.Errorf("field %s: must be >= %v", "suggestedDelaySeconds", 0)
+	}
+	*j = SessionActivity(plain)
+	return nil
 }
 
 // The reasoning effort the approval-dispatched IMPLEMENTATION turn uses (or used),
@@ -13508,22 +14106,6 @@ func (j *WorkflowStepRunOutcomeStatus) UnmarshalJSON(value []byte) error {
 // data once posted (§25.6), same discipline as PostReviewVerdictRequest.summary.
 type WorkflowStepRunOutcomeSummary *string
 
-type WorkflowStepRunStatus string
-
-const WorkflowStepRunStatusAwaitingDecision WorkflowStepRunStatus = "awaiting_decision"
-const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
-const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
-const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
-const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
-
-var enumValues_WorkflowStepRunStatus = []interface{}{
-	"awaiting_decision",
-	"running",
-	"completed",
-	"failed",
-	"cancelled",
-}
-
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 	var v string
@@ -13542,6 +14124,24 @@ func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 	}
 	*j = WorkflowStepRunStatus(v)
 	return nil
+}
+
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
+
+type WorkflowStepRunStatus string
+
+const WorkflowStepRunStatusAwaitingDecision WorkflowStepRunStatus = "awaiting_decision"
+const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
+const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
+const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
+const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
+
+var enumValues_WorkflowStepRunStatus = []interface{}{
+	"awaiting_decision",
+	"running",
+	"completed",
+	"failed",
+	"cancelled",
 }
 
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
@@ -13605,5 +14205,3 @@ func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
 	*j = WorkflowStepRun(plain)
 	return nil
 }
-
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict

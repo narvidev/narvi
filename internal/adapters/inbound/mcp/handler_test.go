@@ -16,6 +16,10 @@ func testTwins() Twins {
 		ListModels:   stubHandler(http.StatusOK, `{"providers":[]}`),
 		ListSessions: stubHandler(http.StatusOK, `{"sessions":[]}`),
 		GetSession:   stubHandler(http.StatusOK, `{"id":"x"}`),
+		// The two row-182 twins answer their own shapes, so a tool wired to
+		// the wrong one shows it.
+		GetSessionStatus: stubHandler(http.StatusOK, `{"activity":"idle"}`),
+		ListEvents:       stubHandler(http.StatusOK, `{"events":[],"nextCursor":null}`),
 	}
 }
 

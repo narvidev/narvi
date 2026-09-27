@@ -24,12 +24,14 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
 // pendingBatchSize bounds how many release_manifest_pending rows a
-// single Worker tick claims -- deliberately much smaller than
+// single Worker tick processes -- deliberately much smaller than
 // outboxworker.pumpBatchSize/imagebuild.pumpBatchSize (20): each row here
 // can take up to platform.Timeouts.ReleaseManifestCheckTimeout (minutes)
 // to process, sequentially, so a small batch keeps one tick's own
@@ -42,7 +44,17 @@ const pendingBatchSize = 5
 // MergedPRLister precedent: a small, locally-defined interface so a unit
 // test can inject a fake with no real DB round trip.
 type PendingLister interface {
+	// ClaimDue deletes up to limit rows, oldest first, and records each
+	// one's check as running (release_manifest_checks_running) in the
+	// same transaction; a claimed row is never returned again, by this
+	// binary's claim or an earlier one's.
 	ClaimDue(ctx context.Context, limit int32) ([]sqlcgen.ReleaseManifestPending, error)
+	// Finish deletes the running row of one claimed check once it has
+	// returned.
+	Finish(ctx context.Context, id pgtype.UUID) error
+	// PurgeStaleClaimed deletes running rows claimed longer ago than
+	// maxAge.
+	PurgeStaleClaimed(ctx context.Context, maxAge time.Duration) (int64, error)
 }
 
 // Worker is constructed once per process (NewWorker), then run via its
@@ -93,27 +105,58 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 }
 
-// PumpOnce runs exactly one pump tick: claims a batch of due
-// release_manifest_pending rows and runs the actual manifest check for
-// each, sequentially. Exported (rather than only reachable through Run's
-// own loop) so tests can drive exactly one tick deterministically,
-// matching outboxworker.Builder.PumpOnce/imagebuild.Builder.PumpOnce's
-// own precedent.
+// PumpOnce runs exactly one pump tick: up to pendingBatchSize times, it
+// claims the oldest release_manifest_pending row (deleting it, and
+// recording its check as running), runs the actual manifest check for it,
+// then finishes it (deleting the running row). Exported (rather than only
+// reachable through Run's own loop) so tests can drive exactly one tick
+// deterministically, matching outboxworker.Builder.PumpOnce/
+// imagebuild.Builder.PumpOnce's own precedent.
 //
-// A failure in the batch-level claim step aborts the tick and returns the
-// error (Run logs it) -- but once a batch is successfully claimed, each
-// row's own Run call is unconditionally attempted: Run itself has no
-// error return at all (it is already fully best-effort/void, per its own
-// doc comment), so there is nothing here to isolate a per-row failure
-// FROM -- every claimed row simply gets its one attempt.
+// One row at a time, so a running row's claimed_at is the instant its own
+// check starts: the session's status (technical plan §43.20) reads a
+// running check as work that can still add a composition review turn to
+// the session, but only within ReleaseManifestCheckTimeout plus
+// MCPStatusScheduledMargin of its claim -- a row claimed in a batch and
+// left waiting behind the others would outlive that bound before its
+// check even began. Finished only after Run returns, so any composition
+// turn Run inserted has already committed when the running row goes: a
+// snapshot that no longer counts the check already counts that turn. A
+// tick first purges running rows claimed longer ago than that same bound
+// (their worker died mid-check), which the status has already stopped
+// counting.
+//
+// A failure in the claim step aborts the tick and returns the error (Run
+// logs it) -- but once a row is claimed, its Run call is unconditionally
+// attempted: Run itself has no error return at all (it is already fully
+// best-effort/void, per its own doc comment), so there is nothing here to
+// isolate a per-row failure FROM -- every claimed row simply gets its one
+// attempt. A purge or finish failure is logged and never aborts the tick:
+// a running row left behind is bounded by the status and purged on a
+// later tick.
 func (w *Worker) PumpOnce(ctx context.Context) error {
-	claimed, err := w.store.ClaimDue(ctx, pendingBatchSize)
-	if err != nil {
-		return fmt.Errorf("releasereview: claim due release manifest pending checks: %w", err)
+	logger := platform.Logger(ctx)
+	if purged, err := w.store.PurgeStaleClaimed(ctx, w.timeouts.ReleaseManifestCheckTimeout+w.timeouts.MCPStatusScheduledMargin); err != nil {
+		logger.Warn("releasereview: purge stale claimed release manifest checks failed", "error", err)
+	} else if purged > 0 {
+		logger.Warn("releasereview: purged release manifest checks whose worker never finished them", "count", purged)
 	}
 
-	for _, row := range claimed {
-		w.process(ctx, row)
+	for i := 0; i < pendingBatchSize; i++ {
+		claimed, err := w.store.ClaimDue(ctx, 1)
+		if err != nil {
+			return fmt.Errorf("releasereview: claim due release manifest pending check: %w", err)
+		}
+		if len(claimed) == 0 {
+			return nil
+		}
+		for _, row := range claimed {
+			w.process(ctx, row)
+			if err := w.store.Finish(ctx, row.ID); err != nil {
+				logger.Warn("releasereview: delete finished release manifest check failed; it reads as running until purged",
+					"error", err, "release_manifest_pending_id", row.ID.String())
+			}
+		}
 	}
 	return nil
 }

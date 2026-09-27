@@ -115,3 +115,57 @@ func (q *Queries) CreateReleaseManifestPending(ctx context.Context, arg CreateRe
 	)
 	return i, err
 }
+
+const finishReleaseManifestCheck = `-- name: FinishReleaseManifestCheck :exec
+DELETE FROM release_manifest_checks_running WHERE pending_id = $1
+`
+
+// The worker's own last step for one claimed check: it has returned, and
+// any composition review turn it inserted has already committed, so the
+// running row -- which the session's status reads as work still able to
+// create a turn -- goes now. A session whose status no longer counts the
+// check therefore already counts that turn.
+func (q *Queries) FinishReleaseManifestCheck(ctx context.Context, pendingID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, finishReleaseManifestCheck, pendingID)
+	return err
+}
+
+const purgeStaleReleaseManifestChecks = `-- name: PurgeStaleReleaseManifestChecks :execrows
+DELETE FROM release_manifest_checks_running
+WHERE claimed_at < now() - $1::interval
+`
+
+// Deletes running rows claimed longer ago than max_age: their one attempt
+// is over -- ReleaseManifestCheckTimeout bounds it -- but their worker died
+// before FinishReleaseManifestCheck ran. The session's status has already
+// stopped counting such a row (the same bound, measured on the same
+// database clock); this keeps them from piling up. Never touches a
+// release_manifest_pending row: those are only ever claimed.
+func (q *Queries) PurgeStaleReleaseManifestChecks(ctx context.Context, maxAge pgtype.Interval) (int64, error) {
+	result, err := q.db.Exec(ctx, purgeStaleReleaseManifestChecks, maxAge)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const startReleaseManifestCheck = `-- name: StartReleaseManifestCheck :exec
+INSERT INTO release_manifest_checks_running (pending_id, session_id)
+VALUES ($1, $2)
+`
+
+type StartReleaseManifestCheckParams struct {
+	PendingID pgtype.UUID `json:"pending_id"`
+	SessionID pgtype.UUID `json:"session_id"`
+}
+
+// Technical plan §43.20 (migrations/000146_release_manifest_checks_running
+// .up.sql): records that the check claimed from pending row pending_id is
+// now running on session_id, stamped with the database's now(). Called by
+// ReleaseManifestPendingStore.ClaimDue in the SAME transaction as
+// ClaimDueReleaseManifestPending's delete, so every snapshot sees a
+// claimed check either waiting or running until it finishes.
+func (q *Queries) StartReleaseManifestCheck(ctx context.Context, arg StartReleaseManifestCheckParams) error {
+	_, err := q.db.Exec(ctx, startReleaseManifestCheck, arg.PendingID, arg.SessionID)
+	return err
+}

@@ -534,7 +534,7 @@ const openFindingsUnknownFailClosed = 1
 // alongside this function's own ref-level check, before ever setting
 // AcceptanceID. Before that caller-side fix, a push that landed with no
 // new review attempt yet dispatched (the auto-retrigger is debounced and
-// budget-capped, reviewAutoRetriggerBudget -- once that budget is spent,
+// budget-capped, ReviewAutoRetriggerBudget -- once that budget is spent,
 // NO new attempt ever arrives to invalidate the acceptance) left this
 // function's own ref-level check trivially satisfied (base ref/ancestor
 // chain unchanged) while the PR's live head SHA had already moved past
@@ -646,7 +646,7 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 			// call site already holds, alongside pr.HeadSHA -- no new I/O).
 			// Without this check, a push landing with no new review attempt
 			// yet dispatched (the auto-retrigger is debounced and capped by
-			// reviewAutoRetriggerBudget -- once that budget is spent, no new
+			// ReviewAutoRetriggerBudget -- once that budget is spent, no new
 			// attempt ever arrives to invalidate the acceptance) left
 			// record.ID/hasNewerAttempt/acceptanceContextStillFresh all
 			// trivially satisfied while the live head SHA had already moved

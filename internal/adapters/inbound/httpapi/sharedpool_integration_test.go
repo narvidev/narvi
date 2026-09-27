@@ -140,7 +140,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -154,7 +157,6 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"golang.org/x/sync/errgroup"
 
-	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/migrations"
 )
 
@@ -189,7 +191,14 @@ func TestMain(m *testing.M) {
 		log.Fatalf("httpapi: run migrations against shared integration-test container: %v", err)
 	}
 
-	pool, err := narvipg.NewPool(ctx, connStr)
+	// narvipg.NewPoolWithMaxConns's own steps, plus the guard's tracer.
+	config, err := pgxpool.ParseConfig(connStr)
+	if err != nil {
+		log.Fatalf("httpapi: parse shared integration-test pool config: %v", err)
+	}
+	config.MaxConns = sharedPoolMaxConns
+	config.ConnConfig.Tracer = sharedPoolGuard
+	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		log.Fatalf("httpapi: open shared integration-test pool: %v", err)
 	}
@@ -203,7 +212,19 @@ func TestMain(m *testing.M) {
 
 	code := m.Run()
 
-	pool.Close()
+	// pool.Close waits for every connection out to come back, which a
+	// leaked one never does -- past the package's -timeout, which stops
+	// with m.Run. poolGuard has failed the test that leaked it, and
+	// terminating the container ends the connection anyway; a leak it
+	// missed still fails the run.
+	if out := pool.Stat().AcquiredConns(); out == 0 {
+		pool.Close()
+	} else {
+		fmt.Fprintf(os.Stderr, "httpapi: %d shared-pool connections still out at exit; not closing the pool\n", out)
+		if code == 0 {
+			code = 1
+		}
+	}
 	if err := testcontainers.TerminateContainer(container); err != nil {
 		log.Printf("httpapi: terminate shared integration-test container: %v", err)
 	}
@@ -472,7 +493,164 @@ func IntegrationTestPoolAndConnStr(t *testing.T) (*pgxpool.Pool, string) {
 	// ordering, combined with Go's own LIFO t.Cleanup semantics, is what
 	// makes this safe.
 	t.Cleanup(func() { resetSharedTestDatabase(t) })
+	// Registered after the reset, so it runs before it -- reporting before a
+	// leaked transaction's locks can hold the TRUNCATE up -- and after every
+	// cleanup the caller registers from here on, its Registry's Shutdown
+	// included.
+	sharedPoolGuard.watch(t, sharedPool)
 	return sharedPool, sharedConnStr
+}
+
+// sharedPoolMaxConns is the shared pool's size, pinned. pgx's own default
+// is max(4, runtime.NumCPU()): 4 on CI's runners, usually more on a
+// developer's machine, so a test holding more connections at once than CI
+// has passes locally and hangs CI. Every live session actor holds one
+// connection, its advisory lock's, until its Registry shuts down
+// (sessionactor's hydrateAndAcquire). The subtests of
+// TestGetSessionStatus_EscalatedTurnNeverGatesForGood once spawned one
+// actor each on a rig they shared: the fourth hung CI, and all eight
+// passed on twelve cores.
+const sharedPoolMaxConns = 4
+
+// poolAcquireBound bounds every acquire on the shared pool. No test here
+// holds connections for seconds, so an acquire that waits this long has
+// found the pool exhausted -- connections leaked, or held by session
+// actors nobody shut down -- and would otherwise wait until the package
+// times out. It fails instead, and so does the test it happened in, with
+// where every connection then out was acquired.
+const poolAcquireBound = 10 * time.Second
+
+// poolSettleGrace is how long a test's end waits for the shared pool to
+// return to where the test found it: pgxpool destroys a connection
+// released mid-query (a session actor's, cancelled by Registry.Shutdown)
+// on a goroutine of its own, and counts it acquired until then.
+const poolSettleGrace = 5 * time.Second
+
+// errPoolExhausted is the cause of an acquire poolAcquireBound ended.
+var errPoolExhausted = errors.New("shared integration-test pool exhausted")
+
+// sharedPoolGuard is the shared pool's tracer; see poolGuard.
+var sharedPoolGuard = &poolGuard{held: map[*pgx.Conn]heldConn{}}
+
+// poolGuard fails the test that leaks a shared-pool connection, naming the
+// code that acquired it, rather than letting a later test hang on the
+// exhausted pool. As the pool's tracer (pgxpool's AcquireTracer and
+// ReleaseTracer, which Acquire and Release call synchronously) it keeps
+// where each connection now out was acquired, and bounds every acquire at
+// poolAcquireBound; watch checks each test's end. It is a pgx.QueryTracer
+// too, as ConnConfig.Tracer must be -- one that does nothing.
+type poolGuard struct {
+	mu        sync.Mutex
+	held      map[*pgx.Conn]heldConn
+	exhausted []string // reports of acquires that hit poolAcquireBound
+	test      string   // the test now running, for those reports
+}
+
+type heldConn struct {
+	at  time.Time
+	pcs []uintptr
+}
+
+type acquireCancelKey struct{}
+
+func (g *poolGuard) TraceQueryStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceQueryStartData) context.Context {
+	return ctx
+}
+
+func (g *poolGuard) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+func (g *poolGuard) TraceAcquireStart(ctx context.Context, _ *pgxpool.Pool, _ pgxpool.TraceAcquireStartData) context.Context {
+	ctx, cancel := context.WithTimeoutCause(ctx, poolAcquireBound, errPoolExhausted)
+	return context.WithValue(ctx, acquireCancelKey{}, cancel)
+}
+
+// TraceAcquireEnd receives the context TraceAcquireStart returned.
+func (g *poolGuard) TraceAcquireEnd(ctx context.Context, pool *pgxpool.Pool, data pgxpool.TraceAcquireEndData) {
+	if cancel, ok := ctx.Value(acquireCancelKey{}).(context.CancelFunc); ok {
+		defer cancel()
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if data.Err == nil {
+		pcs := make([]uintptr, 48)
+		g.held[data.Conn] = heldConn{at: time.Now(), pcs: pcs[:runtime.Callers(3, pcs)]}
+		return
+	}
+	if errors.Is(context.Cause(ctx), errPoolExhausted) {
+		report := fmt.Sprintf("%s: an acquire waited %s on the shared pool, all %d connections out, acquired at:\n%s",
+			g.test, poolAcquireBound, pool.Stat().MaxConns(), g.heldSinceLocked(time.Time{}))
+		if len(g.exhausted) == 0 {
+			// Now, as the test may never end; to stderr, as a test may have
+			// redirected log's output (slog.SetDefault does, for good).
+			fmt.Fprintln(os.Stderr, "httpapi: "+report)
+		}
+		g.exhausted = append(g.exhausted, report)
+	}
+}
+
+func (g *poolGuard) TraceRelease(_ *pgxpool.Pool, data pgxpool.TraceReleaseData) {
+	g.mu.Lock()
+	delete(g.held, data.Conn)
+	g.mu.Unlock()
+}
+
+// watch fails t, once its cleanups registered after this call have run, if
+// the pool has more connections out than when t began -- a transaction
+// never ended, rows never closed, a connection never released, a session
+// actor whose Registry never shut down -- or if an acquire hit
+// poolAcquireBound meanwhile. The baseline keeps one test's leak from
+// failing every test after it.
+func (g *poolGuard) watch(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	baseline, start := pool.Stat().AcquiredConns(), time.Now()
+	g.mu.Lock()
+	outer := g.test
+	g.test = t.Name()
+	g.mu.Unlock()
+	t.Cleanup(func() {
+		for deadline := time.Now().Add(poolSettleGrace); pool.Stat().AcquiredConns() > baseline && time.Now().Before(deadline); {
+			time.Sleep(10 * time.Millisecond)
+		}
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		if n := len(g.exhausted); n > 0 {
+			t.Errorf("httpapi: %d acquires hit poolAcquireBound; the first:\n%s", n, g.exhausted[0])
+		}
+		g.exhausted = nil
+		if out := pool.Stat().AcquiredConns(); out > baseline {
+			t.Errorf("httpapi: %d shared-pool connections out after this test and its cleanups, %d before it; acquired during it and never released:\n%s",
+				out, baseline, g.heldSinceLocked(start))
+		}
+		g.test = outer
+	})
+}
+
+// heldSinceLocked lists where each connection still out, acquired at or
+// after since, was acquired, oldest first, without pgx's own frames. g.mu
+// is held.
+func (g *poolGuard) heldSinceLocked(since time.Time) string {
+	var conns []heldConn
+	for _, h := range g.held {
+		if !h.at.Before(since) {
+			conns = append(conns, h)
+		}
+	}
+	slices.SortFunc(conns, func(a, b heldConn) int { return a.at.Compare(b.at) })
+	var b strings.Builder
+	for i, h := range conns {
+		fmt.Fprintf(&b, "  connection %d:\n", i+1)
+		frames := runtime.CallersFrames(h.pcs)
+		for {
+			f, more := frames.Next()
+			if !strings.HasPrefix(f.Function, "github.com/jackc/") {
+				fmt.Fprintf(&b, "    %s\n        %s:%d\n", f.Function, f.File, f.Line)
+			}
+			if !more {
+				break
+			}
+		}
+	}
+	return b.String()
 }
 
 // resetSharedTestDatabase truncates every real table and restores

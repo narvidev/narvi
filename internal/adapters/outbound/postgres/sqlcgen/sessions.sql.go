@@ -167,6 +167,304 @@ func (q *Queries) GetSession(ctx context.Context, id pgtype.UUID) (Session, erro
 	return i, err
 }
 
+const getSessionActivityFacts = `-- name: GetSessionActivityFacts :one
+SELECT
+    s.id AS session_id,
+    s.status AS session_status,
+    s.failure_reason AS session_failure_reason,
+    s.archived AS archived,
+    sb.status AS sandbox_status,
+    sb.pr_delivery_started_at AS pr_delivery_started_at,
+    statement_timestamp()::timestamptz AS observed_at,
+    COALESCE(tc.turn_counts, '{}'::jsonb)::jsonb AS turn_counts,
+    inflight.id AS in_flight_turn_id,
+    COALESCE(inflight.status::text, '')::text AS in_flight_turn_status,
+    inflight.dispatched_at AS in_flight_dispatched_at,
+    lastrun.id AS last_run_turn_id,
+    COALESCE(lastrun.status::text, '')::text AS last_run_status,
+    lastrun.completed_at AS last_run_completed_at,
+    newest.id AS newest_turn_id,
+    awaitingplan.id AS awaiting_plan_id,
+    awaitingplan.created_at AS awaiting_plan_since,
+    awaitingstep.id AS awaiting_step_id,
+    awaitingstep.updated_at AS awaiting_step_since,
+    escalated.id AS escalated_run_id,
+    escalated.updated_at AS escalated_run_since,
+    COALESCE(armed.names, '{}'::text[])::text[] AS armed_timer_names,
+    COALESCE(armed.fires_at, '{}'::timestamptz[])::timestamptz[] AS armed_timer_fires_at,
+    COALESCE(reretrigger.can_fire, false)::boolean AS review_retrigger_can_fire,
+    releasepending.pending_since::timestamptz AS release_check_pending_since,
+    releaserunning.claimed_at::timestamptz AS release_check_claimed_at
+FROM sessions s
+LEFT JOIN sandboxes sb ON sb.session_id = s.id
+LEFT JOIN LATERAL (
+    SELECT jsonb_object_agg(c.status, c.n) AS turn_counts
+    FROM (
+        SELECT t.status::text AS status, count(*) AS n
+        FROM turns t
+        WHERE t.session_id = s.id
+        GROUP BY t.status
+    ) c
+) tc ON true
+LEFT JOIN LATERAL (
+    SELECT t.id, t.status, t.dispatched_at
+    FROM turns t
+    WHERE t.session_id = s.id AND t.status IN ('dispatched', 'processing')
+    ORDER BY t.created_at, t.id
+    LIMIT 1
+) inflight ON true
+LEFT JOIN LATERAL (
+    SELECT t.id, t.status, t.completed_at
+    FROM turns t
+    WHERE t.session_id = s.id AND t.status IN ('completed', 'failed', 'cancelled')
+    ORDER BY t.created_at DESC, t.id DESC
+    LIMIT 1
+) lastrun ON true
+LEFT JOIN LATERAL (
+    SELECT t.id
+    FROM turns t
+    WHERE t.session_id = s.id
+    ORDER BY t.created_at DESC, t.id DESC
+    LIMIT 1
+) newest ON true
+LEFT JOIN LATERAL (
+    SELECT p.id, p.created_at
+    FROM plans p
+    WHERE p.session_id = s.id AND p.status = 'awaiting_approval'
+    ORDER BY p.created_at, p.id
+    LIMIT 1
+) awaitingplan ON true
+LEFT JOIN LATERAL (
+    SELECT sr.id, sr.updated_at
+    FROM workflow_step_runs sr
+    JOIN workflow_runs wr ON wr.id = sr.workflow_run_id
+    WHERE wr.session_id = s.id AND sr.status = 'awaiting_decision'
+    ORDER BY sr.updated_at, sr.id
+    LIMIT 1
+) awaitingstep ON true
+LEFT JOIN LATERAL (
+    SELECT wr.id, wr.updated_at
+    FROM (
+        SELECT r.id, r.status, r.workflow_definition_id, r.updated_at
+        FROM workflow_runs r
+        WHERE r.session_id = s.id
+        ORDER BY r.created_at DESC, r.id DESC
+        LIMIT 1
+    ) wr
+    JOIN workflow_definitions d ON d.id = wr.workflow_definition_id
+    WHERE wr.status = 'needs_review'
+      AND NOT d.is_built_in
+      AND EXISTS (
+          SELECT 1
+          FROM workflow_step_runs sr
+          WHERE sr.workflow_run_id = wr.id AND sr.turn_id IS NOT NULL
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM turns t
+          WHERE t.session_id = s.id
+            AND t.created_at >= wr.updated_at
+            AND NOT EXISTS (
+                SELECT 1
+                FROM workflow_step_runs sr
+                WHERE sr.workflow_run_id = wr.id AND sr.turn_id = t.id
+            )
+      )
+) escalated ON true
+LEFT JOIN LATERAL (
+    SELECT
+        array_agg(st.name ORDER BY st.fires_at, st.name) AS names,
+        array_agg(st.fires_at ORDER BY st.fires_at, st.name) AS fires_at
+    FROM session_timers st
+    WHERE st.session_id = s.id
+) armed ON true
+LEFT JOIN LATERAL (
+    SELECT bool_or(
+        COALESCE(rs.auto_retrigger_review_enabled, false)
+        AND gps.auto_retrigger_count < $1::integer
+    ) AS can_fire
+    FROM github_pr_sessions gps
+    LEFT JOIN repo_settings rs ON rs.repo_full_name = gps.repo_full_name
+    WHERE gps.session_id = s.id
+) reretrigger ON true
+LEFT JOIN LATERAL (
+    SELECT min(rmp.created_at) AS pending_since
+    FROM release_manifest_pending rmp
+    WHERE rmp.session_id = s.id
+) releasepending ON true
+LEFT JOIN LATERAL (
+    SELECT max(rcr.claimed_at) AS claimed_at
+    FROM release_manifest_checks_running rcr
+    WHERE rcr.session_id = s.id
+) releaserunning ON true
+WHERE s.id = $2
+`
+
+type GetSessionActivityFactsParams struct {
+	ReviewAutoRetriggerBudget int32       `json:"review_auto_retrigger_budget"`
+	SessionID                 pgtype.UUID `json:"session_id"`
+}
+
+type GetSessionActivityFactsRow struct {
+	SessionID                pgtype.UUID           `json:"session_id"`
+	SessionStatus            SessionStatus         `json:"session_status"`
+	SessionFailureReason     *SessionFailureReason `json:"session_failure_reason"`
+	Archived                 bool                  `json:"archived"`
+	SandboxStatus            *SandboxStatus        `json:"sandbox_status"`
+	PrDeliveryStartedAt      pgtype.Timestamptz    `json:"pr_delivery_started_at"`
+	ObservedAt               pgtype.Timestamptz    `json:"observed_at"`
+	TurnCounts               []byte                `json:"turn_counts"`
+	InFlightTurnID           pgtype.UUID           `json:"in_flight_turn_id"`
+	InFlightTurnStatus       string                `json:"in_flight_turn_status"`
+	InFlightDispatchedAt     pgtype.Timestamptz    `json:"in_flight_dispatched_at"`
+	LastRunTurnID            pgtype.UUID           `json:"last_run_turn_id"`
+	LastRunStatus            string                `json:"last_run_status"`
+	LastRunCompletedAt       pgtype.Timestamptz    `json:"last_run_completed_at"`
+	NewestTurnID             pgtype.UUID           `json:"newest_turn_id"`
+	AwaitingPlanID           pgtype.UUID           `json:"awaiting_plan_id"`
+	AwaitingPlanSince        pgtype.Timestamptz    `json:"awaiting_plan_since"`
+	AwaitingStepID           pgtype.UUID           `json:"awaiting_step_id"`
+	AwaitingStepSince        pgtype.Timestamptz    `json:"awaiting_step_since"`
+	EscalatedRunID           pgtype.UUID           `json:"escalated_run_id"`
+	EscalatedRunSince        pgtype.Timestamptz    `json:"escalated_run_since"`
+	ArmedTimerNames          []string              `json:"armed_timer_names"`
+	ArmedTimerFiresAt        []pgtype.Timestamptz  `json:"armed_timer_fires_at"`
+	ReviewRetriggerCanFire   bool                  `json:"review_retrigger_can_fire"`
+	ReleaseCheckPendingSince pgtype.Timestamptz    `json:"release_check_pending_since"`
+	ReleaseCheckClaimedAt    pgtype.Timestamptz    `json:"release_check_claimed_at"`
+}
+
+// Every fact GET /api/sessions/{sessionID}/status derives a session's
+// activity from (technical plan §43.20), in ONE statement and so one MVCC
+// snapshot: two statements under READ COMMITTED could interleave with the
+// transaction that completes a plan-mode turn and inserts its plan
+// (sessionactor's recordPlanIfNeeded) and see "turn completed, no plan
+// yet" -- a false "finished". Deliberately NOT sessions.status: that
+// column is re-derived only when a turn reaches a terminal state, so a
+// queued or running turn can sit under any of its five values; it is
+// selected here only to decide whether sessions.failure_reason still
+// describes the last run (the handler's own rule), never the activity.
+//
+// turn_counts is the per-state turn histogram as a JSON object (state ->
+// count), not one column per known state: a state added to turn_status
+// later still reaches internal/domain/session.DeriveActivity, which counts
+// an unknown state as work in flight, instead of being silently dropped.
+// Aggregates and single-row lookups only -- never the turns themselves
+// (turns per session are unbounded, and each row carries its prompt).
+// Every lookup leads with session_id on an existing index (turns_session_
+// id_dispatched_message_id_idx, plans_one_awaiting_approval_per_session,
+// workflow_runs_session_id_idx, workflow_step_runs_one_live_per_run,
+// session_timers' UNIQUE (session_id, name), github_pr_sessions_session_
+// id_idx, release_manifest_pending_session_id_idx,
+// release_manifest_checks_running_session_id_idx); the escalation's
+// follow-up checks go by primary key, by session_id over turns, and by
+// workflow_run_id (workflow_step_runs_run_step_idx), and repo_settings by
+// its primary key.
+//
+// escalated is the session's LIVE workflow escalation, never merely a run
+// in needs_review: nothing moves a run out of needs_review, and the next
+// turn starts a fresh run beside the parked one (migrations/000057), so
+// counting every such run would gate the session for good. A needs_review
+// run is reported only while no turn has been CREATED on the session since
+// it escalated, and its definition is not a built-in one, whose escalation
+// no person or route can act on (technical plan §43.20 gives the reasons).
+// That is: it is the session's newest workflow run (a turn that started a
+// run of its own supersedes it), it ran at least one attempt of its own (a
+// run no turn ever ran is no state the session reached), and no turn other
+// than that run's own attempts (workflow_step_runs.turn_id -- among them
+// the turn whose end escalated it, in the same transaction) was created at
+// or after the instant the run escalated (workflow_runs.updated_at, which
+// EscalateWorkflowRun stamps; the notice claim that also writes it runs in
+// the escalating transaction itself, workflowengine's escalateRun, and a
+// needs_review run is never written again unless it escalates again). New
+// work sent to the session after the escalation answers it; a turn created
+// before it never does, whether it is still queued, running or has ended --
+// one queued behind the turn whose end escalated the run, or one sent while
+// a step awaited the decision that escalated it -- so whether such a turn
+// ended a moment before or after the escalation never changes the answer.
+// Both instants are the database's own now(), each its transaction's
+// start (turns.created_at, workflow_runs.updated_at); two transactions that
+// overlap are ordered by which began first.
+//
+// armed_timer_names/armed_timer_fires_at are the session's armed named
+// timers (session_timers, one row per name at most -- its UNIQUE
+// (session_id, name) index), two arrays in the same order. Every kind is
+// returned, never only the ones some list here names: the handler
+// classifies each through sessionactor.TimerCountsAsScheduledWork, whose
+// table covers every kind the code declares and counts a name it does not
+// know as work, so a kind added later can never read as settled by being
+// filtered out here. review_retrigger_can_fire is whether the §24
+// re-review debounce's fire can still insert a turn at all, on the
+// conditions it reads from rows alone: the pull request's repository
+// opted in (repo_settings.auto_retrigger_review_enabled; no row means
+// off) and its automatic re-review budget is not spent
+// (github_pr_sessions.auto_retrigger_count below
+// review_auto_retrigger_budget, which the caller passes from
+// sessionactor.ReviewAutoRetriggerBudget -- the one definition the fire
+// itself compares with). Both are necessary for the fire to insert a turn,
+// so a debounce armed while either fails can only decline; the fire's
+// other decline rules -- the head already reviewed, a plan awaiting
+// approval, a live fetch that fails -- are deliberately not copied here,
+// so the status errs toward scheduled on them, never toward settled.
+// release_check_pending_since/_claimed_at are a release PR's manifest
+// check still to come or still running on this session: the oldest
+// release_manifest_pending row's created_at, and the newest
+// release_manifest_checks_running row's claimed_at (migrations/000146).
+// Both the debounce and the check can create a turn on this session with
+// no new input -- technical plan §43.20's inventory -- and the handler
+// reads them as scheduled work, never settled; each is written in (or
+// before) the transaction that arms it, and removed only after the turn
+// it creates has committed.
+//
+// pr_delivery_started_at is the push and pull request a completed turn
+// handed off and that have not finished (migrations/000145): the handler
+// reads it as delivering, never settled, only within
+// platform.Timeouts.MCPStatusDeliveryWindow of observed_at, so a push that
+// never reports back cannot hold the session unsettled for good. It is
+// stamped in the transaction that completes the turn, so no snapshot holds
+// that completed turn without it.
+//
+// Turn order is created_at, then id -- ListTurnsForSession's own order,
+// with id breaking a tie; workflow runs are ordered the same way.
+// observed_at is the database's own statement time, the instant the
+// snapshot was taken. The two turn statuses are text, ” when their turn
+// is absent (its id is then NULL): an enum column from an outer-joined
+// subquery would be generated as a non-nullable type that cannot scan
+// NULL.
+func (q *Queries) GetSessionActivityFacts(ctx context.Context, arg GetSessionActivityFactsParams) (GetSessionActivityFactsRow, error) {
+	row := q.db.QueryRow(ctx, getSessionActivityFacts, arg.ReviewAutoRetriggerBudget, arg.SessionID)
+	var i GetSessionActivityFactsRow
+	err := row.Scan(
+		&i.SessionID,
+		&i.SessionStatus,
+		&i.SessionFailureReason,
+		&i.Archived,
+		&i.SandboxStatus,
+		&i.PrDeliveryStartedAt,
+		&i.ObservedAt,
+		&i.TurnCounts,
+		&i.InFlightTurnID,
+		&i.InFlightTurnStatus,
+		&i.InFlightDispatchedAt,
+		&i.LastRunTurnID,
+		&i.LastRunStatus,
+		&i.LastRunCompletedAt,
+		&i.NewestTurnID,
+		&i.AwaitingPlanID,
+		&i.AwaitingPlanSince,
+		&i.AwaitingStepID,
+		&i.AwaitingStepSince,
+		&i.EscalatedRunID,
+		&i.EscalatedRunSince,
+		&i.ArmedTimerNames,
+		&i.ArmedTimerFiresAt,
+		&i.ReviewRetriggerCanFire,
+		&i.ReleaseCheckPendingSince,
+		&i.ReleaseCheckClaimedAt,
+	)
+	return i, err
+}
+
 const getSessionActorEpochForUpdate = `-- name: GetSessionActorEpochForUpdate :one
 SELECT actor_epoch FROM sessions
 WHERE id = $1

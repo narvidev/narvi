@@ -184,6 +184,41 @@ var toolCallArgs = map[string]struct {
 			{keywords: []string{"/properties/sessionId/format"}, arguments: `{"sessionId":"not-a-uuid"}`, realRefusal: "invalid arguments: - at '/sessionId': 'not-a-uuid' is not valid uuid: must have 5 elements"},
 		},
 	},
+	"narvi_get_session_status": {
+		realValid: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a"}`,
+		realInvalid: []keywordProbe{
+			// buildGetSessionStatusRequest decodes through the generated
+			// GetSessionStatusToolRequest, exactly as narvi_get_session
+			// does through GetSessionToolRequest: the same rows hold.
+			{keywords: []string{"/type"}, arguments: `null`, realRefusal: "invalid arguments: - at '': got null, want object"},
+			{keywords: []string{"/additionalProperties"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","bogus":1}`, realRefusal: "invalid arguments: - at '': additional properties 'bogus' not allowed"},
+			{keywords: []string{"/properties/sessionId/type"}, arguments: `{"sessionId":null}`, realRefusal: "invalid arguments: - at '/sessionId': got null, want string"},
+			{keywords: []string{"/properties/sessionId/format"}, arguments: `{"sessionId":"not-a-uuid"}`, realRefusal: "invalid arguments: - at '/sessionId': 'not-a-uuid' is not valid uuid: must have 5 elements"},
+		},
+	},
+	"narvi_get_session_transcript": {
+		realValid: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","cursor":"42","limit":5}`,
+		realInvalid: []keywordProbe{
+			// buildGetSessionTranscriptRequest decodes into its own plain
+			// struct, like buildListSessionsRequest: null arguments are a
+			// no-op, an absent or null sessionId leaves it "", a null
+			// cursor or limit leaves it unset, and a quoted limit decodes
+			// into a json.Number -- each carried through to the twin.
+			{keywords: []string{"/type"}, arguments: `null`, realRefusal: "invalid arguments: - at '': got null, want object"},
+			{keywords: []string{"/additionalProperties"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","bogus":1}`, realRefusal: "invalid arguments: - at '': additional properties 'bogus' not allowed"},
+			{keywords: []string{"/required"}, arguments: `{"limit":5}`, realRefusal: "invalid arguments: - at '': missing property 'sessionId'"},
+			{keywords: []string{"/properties/sessionId/type"}, arguments: `{"sessionId":null}`, realRefusal: "invalid arguments: - at '/sessionId': got null, want string"},
+			{keywords: []string{"/properties/sessionId/format"}, arguments: `{"sessionId":"not-a-uuid"}`, realRefusal: "invalid arguments: - at '/sessionId': 'not-a-uuid' is not valid uuid: must have 5 elements"},
+			{keywords: []string{"/properties/cursor/type"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","cursor":null}`, realRefusal: "invalid arguments: - at '/cursor': got null, want string"},
+			// The twin parses the cursor itself; the bridge passes it on.
+			{keywords: []string{"/properties/cursor/pattern"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","cursor":"07"}`, realRefusal: "invalid arguments: - at '/cursor': '07' does not match pattern '^(0|[1-9][0-9]{0,18})$'"},
+			{keywords: []string{"/properties/limit/type"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","limit":"5"}`, realRefusal: "invalid arguments: - at '/limit': got string, want integer"},
+			{keywords: []string{"/properties/limit/type"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","limit":null}`, realRefusal: "invalid arguments: - at '/limit': got null, want integer"},
+			// buildGetSessionTranscriptRequest range-checks limit against
+			// int only, never against minimum.
+			{keywords: []string{"/properties/limit/minimum"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","limit":0}`, realRefusal: "invalid arguments: - at '/limit': minimum: got 0, want 1"},
+		},
+	},
 }
 
 // buildRequestEnforces lists, per tool, the keywords of its real input
@@ -199,17 +234,23 @@ var buildRequestEnforces = map[string]map[string]string{
 		"/required": "restdtos.GetSessionToolRequest.UnmarshalJSON refuses every object without a sessionId key; " +
 			"the one value it carries through without one, null, is not an object, and required constrains objects only",
 	},
+	"narvi_get_session_status": {
+		"/required": "restdtos.GetSessionStatusToolRequest.UnmarshalJSON refuses every object without a sessionId key; " +
+			"the one value it carries through without one, null, is not an object, and required constrains objects only",
+	},
 }
 
 // twinBodies is the 200 body each tool's counting twin answers with --
 // distinct per tool, so a successful result also shows WHICH twin ran.
 var twinBodies = map[string]string{
-	"narvi_list_models":   `{"providers":[]}`,
-	"narvi_list_sessions": `{"sessions":[]}`,
-	"narvi_get_session":   `{"id":"x"}`,
+	"narvi_list_models":            `{"providers":[]}`,
+	"narvi_list_sessions":          `{"sessions":[]}`,
+	"narvi_get_session":            `{"id":"x"}`,
+	"narvi_get_session_status":     `{"activity":"idle"}`,
+	"narvi_get_session_transcript": `{"events":[],"nextCursor":null}`,
 }
 
-// countingTwins returns Twins whose three handlers each add one to
+// countingTwins returns Twins whose handlers each add one to
 // *calls and answer 200 with their own tool's twinBodies entry. calls is
 // atomic because the SDK runs a tool handler on its own goroutine.
 func countingTwins(calls *atomic.Int32) Twins {
@@ -225,6 +266,9 @@ func countingTwins(calls *atomic.Int32) Twins {
 		ListModels:   twin("narvi_list_models"),
 		ListSessions: twin("narvi_list_sessions"),
 		GetSession:   twin("narvi_get_session"),
+		// Row 182's two twins (technical plan §43.20).
+		GetSessionStatus: twin("narvi_get_session_status"),
+		ListEvents:       twin("narvi_get_session_transcript"),
 	}
 }
 

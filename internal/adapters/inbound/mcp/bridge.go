@@ -15,7 +15,7 @@ import (
 // registers for the browser-facing route of the same name, never a
 // second implementation (doc.go's own "one authorization path" section).
 type twin struct {
-	// method is the twin's own HTTP method ("GET" for every 180 tool;
+	// method is the twin's own HTTP method ("GET" for every tool so far;
 	// later tools may need "POST").
 	method string
 	// pathTemplate is the twin's own chi route pattern, e.g.

@@ -2037,7 +2037,7 @@ func TestBuild_AcceptedVerdict_BaseMoved_HidesStaleAcceptance(t *testing.T) {
 // TestBuild_AcceptedVerdict_HeadMoved_HidesStaleAcceptance pins finding R2
 // (round 3, adversarial review): a PUSH -- with no new review attempt yet
 // dispatched (the auto-retrigger is debounced and capped by
-// reviewAutoRetriggerBudget, so once that budget is spent no new attempt
+// ReviewAutoRetriggerBudget, so once that budget is spent no new attempt
 // EVER arrives to invalidate the acceptance) -- must ALSO hide a stale
 // acceptance, exactly like a moved base already does above. Before this
 // fix, buildPROpenItem's own acceptance-display condition compared only

@@ -89,7 +89,7 @@ import (
 	"github.com/narvidev/narvi/internal/platform"
 )
 
-// reviewAutoRetriggerBudget is §24.6's own per-PR budget on the AUTOMATIC
+// ReviewAutoRetriggerBudget is §24.6's own per-PR budget on the AUTOMATIC
 // re-review path only -- a human's manual label/button re-trigger
 // (internal/adapters/inbound/httpapi/reviewretrigger.go) is never subject
 // to it and always works, regardless of this count (§24.6: "two
@@ -100,7 +100,13 @@ import (
 // a documented, reasoned default, not a per-repo override surface. Not
 // given an explicit figure in the plan; chosen as 10 -- the plan's own
 // proposed figure (§24.6: "propose 10 per PR").
-const reviewAutoRetriggerBudget = 10
+//
+// Exported because it is the ONE definition of the budget: the fire below
+// declines at or above it, and the session's status (technical plan
+// §43.20, internal/adapters/inbound/httpapi's GetSessionStatus) passes it
+// into GetSessionActivityFacts, which counts an armed debounce as work
+// that can still create a turn only below it.
+const ReviewAutoRetriggerBudget = 10
 
 // autoRetriggerPromptText is this feature's own fixed, deterministically-
 // synthesized turn prompt -- a webhook-driven re-review carries no human
@@ -491,7 +497,7 @@ func (a *Actor) readReviewRetriggerState(ctx context.Context) (*reviewRetriggerD
 			// manual re-trigger, or an earlier automatic one) -- nothing
 			// to do.
 			base.action = reviewRetriggerActionHeadsMatch
-		case prSession.AutoRetriggerCount >= reviewAutoRetriggerBudget:
+		case prSession.AutoRetriggerCount >= ReviewAutoRetriggerBudget:
 			base.action = reviewRetriggerActionBudgetExhausted
 		default:
 			base.action = reviewRetriggerActionEnqueue
@@ -944,7 +950,7 @@ func (a *Actor) enqueueAutoRetriggerBudgetExhaustedNotice(ctx context.Context, t
 		return nil
 	}
 
-	body := fmt.Sprintf(autoRetriggerBudgetExhaustedBodyFormat, reviewAutoRetriggerBudget, reviewpost.RerunGuidance(a.githubBotHandle))
+	body := fmt.Sprintf(autoRetriggerBudgetExhaustedBodyFormat, ReviewAutoRetriggerBudget, reviewpost.RerunGuidance(a.githubBotHandle))
 
 	payload, err := json.Marshal(githubapi.VerdictPayload{
 		Owner:     owner,

@@ -111,6 +111,55 @@ treatment).
 {"name": "Get a session", "route": "GET /api/sessions/{sessionID}"}
 ```
 
+A session's `status` is worked out again each time a turn finishes —
+`created` until one has, `active` if another turn was still waiting or
+running at that moment, otherwise that turn's outcome: `completed`,
+`failed` or `cancelled`. It is not updated when a turn is queued or
+starts, so it does not tell you whether the session is busy: a turn can
+wait and run under any of those five values. The status route answers
+that instead. Its `activity` is `queued` (a turn waits, including while a
+sandbox starts), `running`, `delivering` (the last turn is done, and its
+branch is being pushed and its pull request opened), `scheduled` (nothing
+queued, running or being delivered, but the server holds work that may
+start a turn on its own and has not yet started or dropped it: an
+automatic re-review after a push to the pull request, while the
+repository has opted in and the pull request still has automatic
+re-reviews left, or a release pull request's manifest check, which can
+add a composition review), `awaiting_approval` (nothing
+queued, running, being delivered or scheduled, and a plan or a workflow
+step waits for a person, or a custom workflow stopped and handed its run
+to a person — until a turn is created on the session after that; a turn
+sent before it, even one that runs or ends afterwards, does not close
+it), `idle` (no turn yet) or `finished` — a queued or running turn is
+never reported as idle or finished, and `settled` is true only for
+`idle`, `awaiting_approval` and `finished`.
+
+One known limit: when a pull request's review session pushes its work to
+that pull request's own branch, the automatic re-review that push causes
+is set up only when GitHub's notice of the push arrives. Until then the
+session can read `finished` and `settled`; once it arrives, `scheduled`,
+then `queued` and `running` when the re-review starts. The same happens
+when the push reached GitHub but the sandbox reported it as failed.
+
+A pull request that a delivery opens is listed before `delivering` ends,
+except when two pushes overlap: a sandbox tracks one delivery at a time,
+so if a later turn finishes before an earlier turn's push has reported
+back, the earlier push's pull request ends the later delivery, and the
+later pull request can appear after `finished`. `delivering` can also end
+with no pull request at all: the push failed or could not be sent, the
+pull request could not be opened (its creator can no longer open one,
+their GitHub token no longer works, or GitHub refused it), or ten minutes
+passed with no word from the push. So `finished` with no pull request and
+no failed push does not mean one is listed. It also says how many turns
+wait, which turn is running, what waits for a person and since when, how
+the last finished turn ended, and `suggestedDelaySeconds`: how long to
+wait before asking again (2 to 300 seconds). It never carries the
+session's events — read those, a page at a time, from the events route.
+
+```json narvi-command
+{"name": "Get what a session is doing now, and when to ask again", "route": "GET /api/sessions/{sessionID}/status"}
+```
+
 ```json narvi-command
 {"name": "List a session's events", "route": "GET /api/sessions/{sessionID}/events"}
 ```

@@ -476,6 +476,23 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 			if err := a.handleSnapshotReadyEvent(ctx, tx, row, cmd.Raw, now); err != nil {
 				return err
 			}
+		case "push_error":
+			// Technical plan §43.20: the push failed, so no push_complete
+			// and no pull request will follow -- the delivery
+			// completeProcessingTurn stamped is over, and the session's
+			// status must read finished now, not once MCPStatusDeliveryWindow
+			// runs out. In this SAME transact as the event itself. Gated on
+			// inserted: a wire-level redelivery of an old push_error must
+			// never clear a later push's stamp. A push that reached the
+			// remote before its report failed has still moved the branch:
+			// for a pull request's review session, the code host's
+			// synchronize for it can then arm §24's re-review after this
+			// reads finished -- §43.20's stated limit.
+			if inserted {
+				if err := a.stores.sandbox.WithTx(tx).EndPRDelivery(ctx, a.sessionID); err != nil {
+					return fmt.Errorf("sessionactor: clear push/PR delivery stamp on push_error: %w", err)
+				}
+			}
 		case "git_sync":
 			// §3.4 ("gitstate in-sandbox", §3.4 design section 6): a
 			// git_sync event needs no DB-side mutation of its own at all --
@@ -632,7 +649,7 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 		// committed successfully regardless of what either side effect
 		// does next.
 		if pushAfterCommit != nil {
-			a.sendPushBestEffort(a.sessionID.String(), pushAfterCommit)
+			a.sendPushBestEffort(ctx, a.sessionID.String(), pushAfterCommit)
 		}
 		// Audit fix (correctness): push_complete is an at-least-once wire
 		// event (internal/sandboxagent/wsbridge's own doc.go/buffer.go --

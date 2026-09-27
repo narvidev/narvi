@@ -3199,6 +3199,102 @@ type Timeouts struct {
 	// empty cap (technical plan §43.14). A count, kept beside the TTL that
 	// bounds how long each request waits. 100.
 	MCPMaxPendingAuthorizationRequestsPerClient int
+
+	// -- technical plan §43.20 (a session's status and the suggested delay
+	// before reading it again) --
+	//
+	// GET /api/sessions/{sessionID}/status, and narvi_get_session_status
+	// over it, answer suggestedDelaySeconds: how long a client should wait
+	// before its next read, from session.SuggestedReadDelay's per-activity
+	// table below, clamped to [MCPStatusDelayFloor, MCPStatusDelayCeiling].
+	// A hint that keeps a polling client quiet, never a brake: nothing
+	// refuses a read that comes sooner.
+	//
+	// Links (no margin, unlike this file's slower chains -- these values are
+	// seconds apart): the floor is positive (a zero floor tells a client to
+	// read again at once), and every per-activity value lies inside
+	// [MCPStatusDelayFloor, MCPStatusDelayCeiling], so the clamp in
+	// SuggestedReadDelay is a defense, never the thing that decides a
+	// shipped value.
+
+	// MCPStatusDelayStarting is the suggestion while a session is queued
+	// and no warm sandbox can take the turn yet (none, starting, or being
+	// replaced): a cold start is bounded by FirstConnectBudget, minutes
+	// rather than seconds. 15 seconds.
+	MCPStatusDelayStarting time.Duration
+
+	// MCPStatusDelayQueued is the suggestion while a session is queued on a
+	// warm sandbox: dispatch is imminent. 5 seconds.
+	MCPStatusDelayQueued time.Duration
+
+	// MCPStatusDelayRunning is the suggestion while a turn is in flight.
+	// 10 seconds.
+	MCPStatusDelayRunning time.Duration
+
+	// MCPStatusDelayDelivering is the suggestion while nothing is queued or
+	// running but a completed turn's branch is being pushed and its pull
+	// request opened: a git push and a few API calls. 5 seconds.
+	MCPStatusDelayDelivering time.Duration
+
+	// MCPStatusDelayScheduled is the most the suggestion waits while
+	// nothing is queued, running or being delivered but the server holds
+	// work that can create a turn with no new input (technical plan
+	// §43.20's inventory: a timer whose kind can create one, a release
+	// manifest check still to come or still running) -- a debounce of
+	// minutes, or a check of minutes: polled like a cold start. Never past
+	// that work's own due instant plus MCPStatusScheduledMargin. 15
+	// seconds.
+	MCPStatusDelayScheduled time.Duration
+
+	// MCPStatusScheduledMargin is how long after scheduled work comes due
+	// its handler is given to act -- insert the turn, or decline -- before
+	// a read should see the result: the scheduled suggestion never reaches
+	// past the due instant plus this margin. It also bounds a release
+	// manifest check whose worker died mid-run: a claimed check stops
+	// counting once ReleaseManifestCheckTimeout plus this margin has passed
+	// since its claim (the worker's own context ends the check at
+	// ReleaseManifestCheckTimeout). 5 seconds.
+	MCPStatusScheduledMargin time.Duration
+
+	// MCPStatusDelayAwaitingHuman is the suggestion while nothing is queued
+	// or running and a person must act (a plan awaiting approval, a
+	// workflow step awaiting a decision, a run escalated for review): human
+	// latency. 60 seconds.
+	MCPStatusDelayAwaitingHuman time.Duration
+
+	// MCPStatusDelaySettled is the suggestion once a session is finished
+	// or idle: nothing changes without new input. 300 seconds.
+	MCPStatusDelaySettled time.Duration
+
+	// MCPStatusDelayFloor is the least delay ever suggested. 2 seconds.
+	MCPStatusDelayFloor time.Duration
+
+	// MCPStatusDelayCeiling is the most delay ever suggested. 300 seconds.
+	MCPStatusDelayCeiling time.Duration
+
+	// MCPStatusDeliveryWindow bounds how long a completed turn's push and
+	// pull request keep its session "delivering" -- never settled -- after
+	// they began (sandboxes.pr_delivery_started_at, migrations/000145;
+	// session.PRDeliveryOpen). The stamp is cleared as soon as the pull
+	// request is created, the push fails or the push cannot be sent, so
+	// this bound matters only for a push that never reports back (its
+	// sandbox gone, its push_complete lost): past it, the session reads
+	// finished whatever the stamp says, and cannot stay unsettled for good.
+	// The stamp is taken when the turn completes, so everything between
+	// that and the pull request counts against it. Validate keeps it above
+	// one repo's whole chain at its own limits, plus MinTimeoutMargin, so a
+	// slow delivery still within its own timeouts never reads finished
+	// early: SnapshotMintTimeout (the snapshot command is sent just before
+	// the push, and the sandbox agent handles commands one at a time, so
+	// the push waits behind the mint -- which, even when it times out, does
+	// not stop the push), then in the sandbox RepoSHADiscoveryTimeout (the
+	// runtime's own remote URL, for a remote other than origin),
+	// RepoCloneTimeout (git push) and RepoSHADiscoveryTimeout again (the
+	// pushed head's sha), then on the control plane RepoSHAResolutionTimeout
+	// and PRCreateTimeout (createPRBestEffort). A session's repositories
+	// are pushed one after another, so several slow ones can outlast it.
+	// 10 minutes.
+	MCPStatusDeliveryWindow time.Duration
 }
 
 // DefaultTimeouts returns the shipped defaults for every field, each
@@ -3482,6 +3578,18 @@ func DefaultTimeouts() Timeouts {
 		MCPAuthorizeRateInterval:                    3 * time.Second, // §43.14; per-network refill of the authorization endpoint's bucket
 		MCPAuthorizeRateBurst:                       10,              // §43.14; per-network authorization-endpoint burst
 		MCPMaxPendingAuthorizationRequestsPerClient: 100,             // §43.14; pending authorization requests one client may have
+
+		MCPStatusDelayStarting:      15 * time.Second,  // §43.20; queued behind a cold start
+		MCPStatusDelayQueued:        5 * time.Second,   // §43.20; queued on a warm sandbox
+		MCPStatusDelayRunning:       10 * time.Second,  // §43.20; a turn in flight
+		MCPStatusDelayDelivering:    5 * time.Second,   // §43.20; a completed turn's push and pull request under way
+		MCPStatusDelayScheduled:     15 * time.Second,  // §43.20; work that can create a turn armed server-side
+		MCPStatusScheduledMargin:    5 * time.Second,   // §43.20; a handler's time to act once its work is due
+		MCPStatusDelayAwaitingHuman: 60 * time.Second,  // §43.20; human latency
+		MCPStatusDelaySettled:       300 * time.Second, // §43.20; finished or idle
+		MCPStatusDelayFloor:         2 * time.Second,   // §43.20; least suggestion
+		MCPStatusDelayCeiling:       300 * time.Second, // §43.20; most suggestion
+		MCPStatusDeliveryWindow:     10 * time.Minute,  // §43.20; a push that never reports back stops holding the session unsettled
 	}
 }
 
@@ -3713,6 +3821,60 @@ func (t Timeouts) Validate() error {
 	mustBePositive("MCPAuthorizeRateInterval", t.MCPAuthorizeRateInterval)
 	countMustBePositive("MCPAuthorizeRateBurst", t.MCPAuthorizeRateBurst)
 	countMustBePositive("MCPMaxPendingAuthorizationRequestsPerClient", t.MCPMaxPendingAuthorizationRequestsPerClient)
+
+	// §43.20: the status delay table (the MCPStatusDelay* fields' own block
+	// comment on the struct). The floor is positive -- a zero floor tells a
+	// client to read again at once -- and every per-activity value lies
+	// inside [floor, ceiling], checked with no margin: these values are
+	// seconds apart, far below MinTimeoutMargin, and the relation is an
+	// ordering, not a race. floor <= ceiling follows from any one value
+	// lying between them, so it needs no link of its own.
+	mustBePositive("MCPStatusDelayFloor", t.MCPStatusDelayFloor)
+	withinStatusDelayBounds := func(field string, value time.Duration) {
+		if value < t.MCPStatusDelayFloor {
+			errs = append(errs, &TimeoutInvariantError{
+				Chain:        field + " >= MCPStatusDelayFloor",
+				LesserField:  "MCPStatusDelayFloor",
+				LesserValue:  t.MCPStatusDelayFloor,
+				GreaterField: field,
+				GreaterValue: value,
+			})
+		}
+		if value > t.MCPStatusDelayCeiling {
+			errs = append(errs, &TimeoutInvariantError{
+				Chain:        "MCPStatusDelayCeiling >= " + field,
+				LesserField:  field,
+				LesserValue:  value,
+				GreaterField: "MCPStatusDelayCeiling",
+				GreaterValue: t.MCPStatusDelayCeiling,
+			})
+		}
+	}
+	withinStatusDelayBounds("MCPStatusDelayStarting", t.MCPStatusDelayStarting)
+	withinStatusDelayBounds("MCPStatusDelayQueued", t.MCPStatusDelayQueued)
+	withinStatusDelayBounds("MCPStatusDelayRunning", t.MCPStatusDelayRunning)
+	withinStatusDelayBounds("MCPStatusDelayDelivering", t.MCPStatusDelayDelivering)
+	withinStatusDelayBounds("MCPStatusDelayScheduled", t.MCPStatusDelayScheduled)
+	// A zero margin would suggest reading again at the very instant
+	// scheduled work comes due, before its handler has run, and would drop
+	// a claimed release manifest check from the status at the instant its
+	// worker's own deadline ends it.
+	mustBePositive("MCPStatusScheduledMargin", t.MCPStatusScheduledMargin)
+	withinStatusDelayBounds("MCPStatusDelayAwaitingHuman", t.MCPStatusDelayAwaitingHuman)
+	withinStatusDelayBounds("MCPStatusDelaySettled", t.MCPStatusDelaySettled)
+
+	// §43.20: a completed turn's push and pull request read as delivering
+	// only within MCPStatusDeliveryWindow of the turn's completion (the
+	// field's own doc comment). One repo's whole chain from that instant,
+	// each step at its own limit -- the snapshot mint the push waits
+	// behind, the remote URL read, the push, the head sha read, the branch
+	// sha resolution and the pull request -- must fit inside it with
+	// margin, or a slow delivery still within its own timeouts would read
+	// finished -- settled -- before its pull request appears.
+	check("MCPStatusDeliveryWindow > SnapshotMintTimeout + RepoSHADiscoveryTimeout + RepoCloneTimeout + RepoSHADiscoveryTimeout + RepoSHAResolutionTimeout + PRCreateTimeout",
+		"MCPStatusDeliveryWindow", t.MCPStatusDeliveryWindow,
+		"SnapshotMintTimeout+2*RepoSHADiscoveryTimeout+RepoCloneTimeout+RepoSHAResolutionTimeout+PRCreateTimeout",
+		t.SnapshotMintTimeout+2*t.RepoSHADiscoveryTimeout+t.RepoCloneTimeout+t.RepoSHAResolutionTimeout+t.PRCreateTimeout)
 
 	// U1 audit fix, HIGH (confirmed finding: "the total budget is smaller
 	// than the retry chain it contains"). Derived from the SAME three

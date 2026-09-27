@@ -165,6 +165,20 @@ func (s *SandboxStore) CancelPendingPush(ctx context.Context, sessionID pgtype.U
 	return s.q.CancelSandboxPendingPush(ctx, sessionID)
 }
 
+// StartPRDelivery stamps the instant a completed turn's push and pull
+// request began (technical plan §43.20) -- see StartSandboxPRDelivery's
+// own generated doc comment. The session's status reads it as delivering,
+// never settled, within platform.Timeouts.MCPStatusDeliveryWindow.
+func (s *SandboxStore) StartPRDelivery(ctx context.Context, sessionID pgtype.UUID) error {
+	return s.q.StartSandboxPRDelivery(ctx, sessionID)
+}
+
+// EndPRDelivery clears the stamp StartPRDelivery set, once that delivery
+// is over -- see EndSandboxPRDelivery's own generated doc comment.
+func (s *SandboxStore) EndPRDelivery(ctx context.Context, sessionID pgtype.UUID) error {
+	return s.q.EndSandboxPRDelivery(ctx, sessionID)
+}
+
 // ListLiveWithSessionRepos returns every live sandbox alongside its
 // owning session's own raw repos JSONB -- the repo-demotion sweep's
 // (internal/app/seed) own input; see ListLiveSandboxesWithSessionRepos's

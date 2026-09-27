@@ -10,6 +10,67 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.7.0]
+
+### controlplane/testdata/routes.golden
+
+- Added: `GET /api/sessions/{sessionID}/status` -- what one session's work
+  is doing now, and how long to wait before reading it again (technical
+  plan §43.20). Answers the new `SessionActivity`; the same gate as
+  `GET /api/sessions/{sessionID}` (signed in, `400` for a malformed id,
+  `404` for a session that does not exist, no per-session visibility). It
+  is also the twin of the new `narvi_get_session_status` MCP tool. A route
+  added, graded MINOR (row 41).
+- Unchanged as a route: `GET /api/sessions/{sessionID}/events` is now also
+  the twin of the new `narvi_get_session_transcript` MCP tool; its request
+  and response are unchanged.
+
+### rest/v1/dtos.schema.json
+
+- Added: `SessionActivity` -- the response of the status route above:
+  `activity` (`idle`, `queued`, `running`, `delivering` -- a completed
+  turn's branch being pushed and its pull request opened, bounded by the
+  deployment's delivery window; a pull request it opens is recorded before
+  it ends, except when two pushes overlap, and it can end with none --
+  `scheduled` -- the server holds work that may create a turn with no new
+  input and has neither created it nor declined yet: an automatic
+  re-review's debounce, counted only while the pull request's repository
+  has opted in and its automatic re-review budget is not spent; a release
+  manifest check waiting or running --
+  `awaiting_approval`, `finished`), `settled` (never while queued,
+  running, delivering or scheduled; one stated limit: when a pull
+  request's review session pushes to that pull request's head, the
+  automatic re-review the push causes is armed only when the code host's
+  notification of it arrives, so the session can read `finished` and
+  settled until then, then `scheduled` and `queued` -- the same after a
+  push that reached the remote but reported a failure), `pendingTurns`,
+  `inFlightTurn`,
+  `awaiting` (the open human gate: a plan, a workflow step, or a custom
+  workflow's escalated run until a turn is created on the session after
+  it escalated -- never a built-in workflow's; a turn created before the
+  escalation, queued, running or ended, never closes it), `lastRun`,
+  `sandboxStatus`, `archived`,
+  `suggestedDelaySeconds` and `observedAt`. Derived from the session's
+  turn queue, its push/PR delivery, the work armed to create a turn and
+  its human gates in one database snapshot, never from `Session.status`,
+  and carrying no events. A `$defs` entry added, graded MINOR (row 32).
+- Added: `GetSessionStatusToolRequest` and `GetSessionTranscriptToolRequest`
+  -- the input schemas of the `narvi_get_session_status` and
+  `narvi_get_session_transcript` MCP tools (technical plan §43.20), whose
+  outputs are the existing `SessionActivity` and `EventsResponse`.
+  `sessionId` is a required uuid in both; the transcript's optional
+  `cursor` is a decimal event id (the previous page's `nextCursor`) and its
+  optional `limit` has `minimum: 1` and no maximum (the route clamps at
+  500). Two `$defs` entries added, graded MINOR (row 32).
+- Changed (description only, annotation-only PATCH): `Session.status` now
+  says what it is -- derived each time a turn reaches a terminal state
+  (`created` until one has, `active` when another turn was still open,
+  otherwise that turn's outcome), not re-derived when a turn is queued or
+  dispatched, so it does not show queued or running work and a queued or
+  running turn can sit under any of its five values -- and points at
+  `SessionActivity.activity` for what a session is doing now. No field,
+  type, enum value or requiredness changed.
+
 ## [1.6.0]
 
 ### controlplane/testdata/routes.golden

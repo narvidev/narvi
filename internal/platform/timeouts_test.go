@@ -1809,3 +1809,190 @@ func TestValidate_MCPEndpointBrakes(t *testing.T) {
 		})
 	}
 }
+
+// TestDefaultTimeouts_MCPStatusDelayFields pins the status delay table
+// (technical plan §43.20): 15 s starting, 5 s queued, 10 s running, 5 s
+// delivering, 60 s awaiting a person, 300 s settled, clamped to [2 s,
+// 300 s] -- and the 10-minute bound on a push/PR delivery.
+func TestDefaultTimeouts_MCPStatusDelayFields(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+	for _, tc := range []struct {
+		name string
+		got  time.Duration
+		want time.Duration
+	}{
+		{"MCPStatusDelayStarting", to.MCPStatusDelayStarting, 15 * time.Second},
+		{"MCPStatusDelayQueued", to.MCPStatusDelayQueued, 5 * time.Second},
+		{"MCPStatusDelayRunning", to.MCPStatusDelayRunning, 10 * time.Second},
+		{"MCPStatusDelayDelivering", to.MCPStatusDelayDelivering, 5 * time.Second},
+		{"MCPStatusDelayAwaitingHuman", to.MCPStatusDelayAwaitingHuman, 60 * time.Second},
+		{"MCPStatusDelaySettled", to.MCPStatusDelaySettled, 300 * time.Second},
+		{"MCPStatusDelayFloor", to.MCPStatusDelayFloor, 2 * time.Second},
+		{"MCPStatusDelayCeiling", to.MCPStatusDelayCeiling, 300 * time.Second},
+		{"MCPStatusDeliveryWindow", to.MCPStatusDeliveryWindow, 10 * time.Minute},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %v, want %v", tc.name, tc.got, tc.want)
+		}
+	}
+	if err := to.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+}
+
+// TestTimeouts_Validate_MCPStatusDelay proves every status-delay link is
+// checked on its own and reported by name (technical plan §43.20): each
+// per-activity value below the floor, each above the ceiling, and a
+// non-positive floor. A value exactly on a bound is accepted -- the links
+// carry no margin.
+func TestTimeouts_Validate_MCPStatusDelay(t *testing.T) {
+	t.Parallel()
+
+	fields := []struct {
+		name string
+		ptr  func(*platform.Timeouts) *time.Duration
+	}{
+		{"MCPStatusDelayStarting", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelayStarting }},
+		{"MCPStatusDelayQueued", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelayQueued }},
+		{"MCPStatusDelayRunning", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelayRunning }},
+		{"MCPStatusDelayDelivering", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelayDelivering }},
+		{"MCPStatusDelayScheduled", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelayScheduled }},
+		{"MCPStatusDelayAwaitingHuman", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelayAwaitingHuman }},
+		{"MCPStatusDelaySettled", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelaySettled }},
+	}
+	for _, f := range fields {
+		t.Run(f.name+" below the floor", func(t *testing.T) {
+			t.Parallel()
+			to := platform.DefaultTimeouts()
+			*f.ptr(&to) = to.MCPStatusDelayFloor - time.Millisecond
+			want := f.name + " >= MCPStatusDelayFloor"
+			var inv *platform.TimeoutInvariantError
+			if err := to.Validate(); !errors.As(err, &inv) || inv.Chain != want {
+				t.Fatalf("Validate() = %v, want exactly the broken link %q", err, want)
+			}
+		})
+		t.Run(f.name+" above the ceiling", func(t *testing.T) {
+			t.Parallel()
+			to := platform.DefaultTimeouts()
+			*f.ptr(&to) = to.MCPStatusDelayCeiling + time.Millisecond
+			want := "MCPStatusDelayCeiling >= " + f.name
+			var inv *platform.TimeoutInvariantError
+			if err := to.Validate(); !errors.As(err, &inv) || inv.Chain != want {
+				t.Fatalf("Validate() = %v, want exactly the broken link %q", err, want)
+			}
+		})
+		t.Run(f.name+" on either bound is accepted", func(t *testing.T) {
+			t.Parallel()
+			for _, bound := range []string{"floor", "ceiling"} {
+				to := platform.DefaultTimeouts()
+				if bound == "floor" {
+					*f.ptr(&to) = to.MCPStatusDelayFloor
+				} else {
+					*f.ptr(&to) = to.MCPStatusDelayCeiling
+				}
+				if err := to.Validate(); err != nil {
+					t.Fatalf("%s on the %s: Validate() = %v, want nil", f.name, bound, err)
+				}
+			}
+		})
+	}
+
+	t.Run("a zero floor suggests reading again at once", func(t *testing.T) {
+		t.Parallel()
+		to := platform.DefaultTimeouts()
+		to.MCPStatusDelayFloor = 0
+		var pos *platform.TimeoutMustBePositiveError
+		if err := to.Validate(); !errors.As(err, &pos) || pos.Field != "MCPStatusDelayFloor" {
+			t.Fatalf("Validate() = %v, want MCPStatusDelayFloor refused as non-positive", err)
+		}
+	})
+	t.Run("a zero scheduled margin suggests reading before the handler has run", func(t *testing.T) {
+		t.Parallel()
+		for _, margin := range []time.Duration{0, -time.Second} {
+			to := platform.DefaultTimeouts()
+			to.MCPStatusScheduledMargin = margin
+			var pos *platform.TimeoutMustBePositiveError
+			if err := to.Validate(); !errors.As(err, &pos) || pos.Field != "MCPStatusScheduledMargin" {
+				t.Fatalf("margin %v: Validate() = %v, want MCPStatusScheduledMargin refused as non-positive", margin, err)
+			}
+		}
+	})
+	t.Run("a ceiling below the floor breaks a link", func(t *testing.T) {
+		t.Parallel()
+		to := platform.DefaultTimeouts()
+		to.MCPStatusDelayCeiling = to.MCPStatusDelayFloor - time.Millisecond
+		var inv *platform.TimeoutInvariantError
+		if err := to.Validate(); !errors.As(err, &inv) {
+			t.Fatalf("Validate() = %v, want a broken status-delay link", err)
+		}
+	})
+}
+
+// TestTimeouts_Validate_MCPStatusDeliveryWindow proves the bound on a
+// push/PR delivery (technical plan §43.20) stays above one repo's whole
+// chain from the turn's completion at its own limits -- the snapshot mint
+// the push waits behind, the remote URL read, the push, the head sha read,
+// the branch sha resolution and the pull request -- with MinTimeoutMargin:
+// a window that would let a slow but still-healthy delivery read finished
+// before its pull request appears is refused, by name, and so is any one
+// of those limits raised beneath an unchanged window (review round 3's P5:
+// the snapshot mint was missing, so a 5-minute mint passed Validate with a
+// 10m45s chain against a 10-minute window). Exactly on the margin is
+// accepted.
+func TestTimeouts_Validate_MCPStatusDeliveryWindow(t *testing.T) {
+	t.Parallel()
+
+	const chain = "MCPStatusDeliveryWindow > SnapshotMintTimeout + RepoSHADiscoveryTimeout + RepoCloneTimeout + RepoSHADiscoveryTimeout + RepoSHAResolutionTimeout + PRCreateTimeout"
+	inside := func(to platform.Timeouts) time.Duration {
+		return to.SnapshotMintTimeout + 2*to.RepoSHADiscoveryTimeout + to.RepoCloneTimeout + to.RepoSHAResolutionTimeout + to.PRCreateTimeout
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*platform.Timeouts)
+		broken bool
+	}{
+		{"the shipped defaults hold", func(*platform.Timeouts) {}, false},
+		{"exactly the margin above is accepted", func(to *platform.Timeouts) { to.MCPStatusDeliveryWindow = inside(*to) + platform.MinTimeoutMargin }, false},
+		{"one millisecond short of the margin", func(to *platform.Timeouts) {
+			to.MCPStatusDeliveryWindow = inside(*to) + platform.MinTimeoutMargin - time.Millisecond
+		}, true},
+		{"a window shorter than one push", func(to *platform.Timeouts) { to.MCPStatusDeliveryWindow = time.Minute }, true},
+		{"a push limit raised beneath the window", func(to *platform.Timeouts) { to.RepoCloneTimeout = to.MCPStatusDeliveryWindow }, true},
+		{"a PR creation limit raised beneath the window", func(to *platform.Timeouts) { to.PRCreateTimeout = to.MCPStatusDeliveryWindow }, true},
+		{"the reviewers' case: a 5-minute snapshot mint the push waits behind", func(to *platform.Timeouts) { to.SnapshotMintTimeout = 5 * time.Minute }, true},
+		{"a snapshot mint limit raised to exactly fill the margin", func(to *platform.Timeouts) {
+			to.SnapshotMintTimeout += to.MCPStatusDeliveryWindow - inside(*to) - platform.MinTimeoutMargin + time.Millisecond
+		}, true},
+		{"a sha discovery limit raised beneath the window (counted twice: remote URL and pushed head)", func(to *platform.Timeouts) {
+			to.RepoSHADiscoveryTimeout += (to.MCPStatusDeliveryWindow-inside(*to)-platform.MinTimeoutMargin)/2 + time.Millisecond
+		}, true},
+		{"a sha resolution limit raised beneath the window", func(to *platform.Timeouts) {
+			to.RepoSHAResolutionTimeout += to.MCPStatusDeliveryWindow - inside(*to) - platform.MinTimeoutMargin + time.Millisecond
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			to := platform.DefaultTimeouts()
+			tc.mutate(&to)
+			err := to.Validate()
+			var errs []error
+			if joined, ok := err.(interface{ Unwrap() []error }); ok {
+				errs = joined.Unwrap()
+			} else if err != nil {
+				errs = []error{err}
+			}
+			found := false
+			for _, e := range errs {
+				var inv *platform.TimeoutInvariantError
+				if errors.As(e, &inv) && inv.Chain == chain {
+					found = true
+				}
+			}
+			if found != tc.broken {
+				t.Fatalf("Validate() = %v; link %q broken = %v, want %v", err, chain, found, tc.broken)
+			}
+		})
+	}
+}

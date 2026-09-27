@@ -2135,6 +2135,12 @@ type ReleaseManifestCheck struct {
 	CompositionDiffTruncated      *bool              `json:"composition_diff_truncated"`
 }
 
+type ReleaseManifestChecksRunning struct {
+	PendingID pgtype.UUID        `json:"pending_id"`
+	SessionID pgtype.UUID        `json:"session_id"`
+	ClaimedAt pgtype.Timestamptz `json:"claimed_at"`
+}
+
 type ReleaseManifestPending struct {
 	ID            pgtype.UUID        `json:"id"`
 	SessionID     pgtype.UUID        `json:"session_id"`
@@ -2322,6 +2328,7 @@ type Sandbox struct {
 	ImageDigest                   *string              `json:"image_digest"`
 	ImageDecisionReason           *ImageDecisionReason `json:"image_decision_reason"`
 	ImageDecisionFingerprint      *string              `json:"image_decision_fingerprint"`
+	PrDeliveryStartedAt           pgtype.Timestamptz   `json:"pr_delivery_started_at"`
 }
 
 type SandboxHistory struct {

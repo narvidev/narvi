@@ -95,6 +95,13 @@ RETURNING *;
 -- "outside any transaction, immediately before the provider is ever
 -- called" sequencing) -- NULL here is simply the honest gap between that
 -- gen bump and this gen's own first real decision.
+--
+-- pr_delivery_started_at (technical plan §43.20, migrations/000145) is
+-- cleared here too: a push the previous gen was sent can never report back
+-- once that gen is replaced -- its push_complete or push_error would be
+-- rejected as stale-gen -- so its delivery is over, and the session's
+-- status must not keep reading it as under way until
+-- MCPStatusDeliveryWindow runs out.
 INSERT INTO sandboxes (session_id, gen, status, token_hash)
 VALUES ($1, 1, 'spawning', $2)
 ON CONFLICT (session_id) DO UPDATE
@@ -106,6 +113,7 @@ SET gen = sandboxes.gen + 1,
     image_digest = NULL,
     image_decision_reason = NULL,
     image_decision_fingerprint = NULL,
+    pr_delivery_started_at = NULL,
     updated_at = now()
 RETURNING *;
 
@@ -299,6 +307,27 @@ UPDATE sandboxes
 SET pending_push_cancelled = true, updated_at = now()
 WHERE session_id = $1 AND pending_push_suppressed_in_shadow IS NOT NULL
 RETURNING *;
+
+-- name: StartSandboxPRDelivery :exec
+-- Technical plan §43.20 (migrations/000145_sandbox_pr_delivery_started_at.
+-- up.sql): stamps the instant a completed turn's push, and the pull
+-- request that follows it, began -- called by completeProcessingTurn
+-- (app/sessionactor/pushpr.go) in the SAME transaction that completes the
+-- turn, and only when a push will really be sent. now() is the database's
+-- clock, the one GetSessionActivityFacts' observed_at is read from. A
+-- later cycle's stamp overwrites an earlier one.
+UPDATE sandboxes
+SET pr_delivery_started_at = now(), updated_at = now()
+WHERE session_id = $1;
+
+-- name: EndSandboxPRDelivery :exec
+-- Technical plan §43.20: the delivery StartSandboxPRDelivery stamped is
+-- over -- its pull request's creation finished (createPRBestEffort, after
+-- the artifact row is written), its push failed (push_error), or its push
+-- command could not be sent. A no-op when nothing is outstanding.
+UPDATE sandboxes
+SET pr_delivery_started_at = NULL, updated_at = now()
+WHERE session_id = $1 AND pr_delivery_started_at IS NOT NULL;
 
 -- name: ListLiveSandboxesWithSessionRepos :many
 -- §30.4's own repo-demotion sweep (internal/app/seed): every LIVE sandbox

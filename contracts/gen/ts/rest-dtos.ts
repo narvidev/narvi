@@ -34,7 +34,7 @@ export interface Session {
    */
   title: string | null;
   /**
-   * Matches Postgres session_status exactly.
+   * Matches Postgres session_status exactly: derived each time a turn reaches a terminal state -- 'created' until one has, 'active' when another turn was still queued or running at that moment, otherwise that turn's outcome: 'completed', 'failed' or 'cancelled'. It is not re-derived when a turn is queued or dispatched, so it does not show queued or running work, and a queued or running turn can sit under any of the five values: a first turn runs its whole life under 'created', and a follow-up under whatever the last derivation left. What the session is doing now is SessionActivity.activity, GET /api/sessions/{sessionID}/status.
    */
   status: 'created' | 'active' | 'completed' | 'failed' | 'cancelled';
   /**
@@ -3198,6 +3198,125 @@ export interface GetSessionToolRequest {
    * The session id, matching Session.id's own format exactly. "format":"uuid" is enforced by this package's own bridge (internal/adapters/inbound/mcp/schemas.go's validateArguments compiles this schema with format assertions on), so a malformed value never reaches the twin at all -- reported as a tool execution error (isError:true), not a JSON-RPC protocol code.
    */
   sessionId: string;
+}
+/**
+ * The narvi_get_session_status MCP tool's own input (technical plan §43.20) -- the tool bridge's twin of GET /api/sessions/{sessionID}/status, carrying the path parameter as a plain required field exactly like GetSessionToolRequest.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "GetSessionStatusToolRequest".
+ */
+export interface GetSessionStatusToolRequest {
+  /**
+   * The session id, matching Session.id's own format exactly. A malformed value fails argument validation before the twin is invoked, reported as a tool execution error (isError:true).
+   */
+  sessionId: string;
+}
+/**
+ * The narvi_get_session_transcript MCP tool's own input (technical plan §43.20) -- the tool bridge's twin of GET /api/sessions/{sessionID}/events?cursor=&limit=, the paginated event history. sessionId becomes the path parameter; cursor and limit, when set, become the route's own query parameters, and when omitted leave the route's own defaults to run unchanged (from the beginning, 100 events per page).
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "GetSessionTranscriptToolRequest".
+ */
+export interface GetSessionTranscriptToolRequest {
+  /**
+   * The session id, matching Session.id's own format exactly.
+   */
+  sessionId: string;
+  /**
+   * Where the page starts: the previous page's EventsResponse.nextCursor, verbatim, or "0" (the default) for the beginning. An event id in decimal, a string like nextCursor itself; a value that names no 64-bit event id is the route's own 400, reported as a tool execution error.
+   */
+  cursor?: string;
+  /**
+   * How many events per page. Omitted means the route's own default (100). minimum matches the route's own rejection of a value below one. Deliberately no "maximum": the route does not reject a larger value, it clamps it to 500, and tools/contractscompat's closed keyword allowlist does not recognize "maximum" (ListSessionsToolRequest.limit's own reasoning).
+   */
+  limit?: number;
+}
+/**
+ * GET /api/sessions/{sessionID}/status (technical plan §43.20): what one session's work is doing now, and how long to wait before reading it again. Derived at read time from the session's turn queue, a completed turn's push and pull request still under way, work the server holds that can create a turn on the session with no new input, and its human gates, all read in ONE database snapshot -- never from Session.status, which is re-derived only when a turn reaches a terminal state and so can hold any of its five values while a turn is queued or running. Carries no events and no transcript: the event history is GET /api/sessions/{sessionID}/events (EventsResponse), a separate, paginated read.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "SessionActivity".
+ */
+export interface SessionActivity {
+  sessionId: string;
+  /**
+   * In precedence order: 'running' when a turn is dispatched or processing (turns may be queued behind it); else 'queued' when a turn is pending -- including the gap between one turn finishing and the next being dispatched, and a whole sandbox cold start; else 'delivering' when a turn that completed is still being delivered -- its branch pushed, then its pull request opened, which happens with no new input -- for at most the deployment's delivery window from when that turn completed (10 minutes as shipped: a push that never reports back stops counting then); else 'scheduled' when the server holds work that can create a turn on this session with no new input and has neither created it nor declined yet -- an automatic re-review armed by a push to the session's pull request (a debounce, 2 minutes as shipped, counted only while the pull request's repository has opted in and its automatic re-review budget is not spent: the two conditions under which it can create a turn), or a release pull request's manifest check still to come or still running (it can add a composition review turn); else 'awaiting_approval' when a person must act (a plan awaiting approval, a workflow step awaiting a decision, or a custom workflow's run escalated for review until a turn is created on the session after it escalated -- see awaiting.kind); else 'idle' when the session has no turn at all; else 'finished' (at least one turn, every one terminal, nothing being delivered, nothing scheduled). A queued or running turn is never reported as idle or finished. 'delivering' ends once the pull request is recorded, or once the delivery ends without one: the push failed or could not be sent, the pull request could not be opened (the creator may no longer open one, or their GitHub token is no longer usable, or GitHub refused it), or the window passed. A pull request that is opened is recorded before activity leaves 'delivering', except when two pushes overlap: a sandbox records one delivery at a time, so if a later turn completes before an earlier turn's push has reported back, the earlier push's pull request ends the later delivery, and the later pull request can appear after 'finished'. 'scheduled' ends when its work comes due and either creates its turn ('queued' follows) or declines (the session reads whatever else it holds). One stated limit: when this session is a pull request's review session and its own push moves that pull request's head (a same-repository pull request whose head branch is the session's), the automatic re-review that push causes is armed only when the code host's notification of the push arrives -- until then activity can read 'finished', and once it lands 'scheduled', then 'queued' or 'running'. The same holds after a push that reached the remote but reported a failure.
+   */
+  activity: 'idle' | 'queued' | 'running' | 'delivering' | 'scheduled' | 'awaiting_approval' | 'finished';
+  /**
+   * true exactly when activity is idle, awaiting_approval or finished: nothing progresses server-side until a person acts or sends new input. Never true while a turn is queued or running, while a completed turn's push and pull request are being delivered, or while work that can create a turn is scheduled. One stated limit (see activity): after a pull request review session's own push to that pull request's head, settled can be true before the code host's notification of that push arms an automatic re-review.
+   */
+  settled: boolean;
+  /**
+   * How many turns are queued (pending), not yet dispatched to a sandbox.
+   */
+  pendingTurns: number;
+  /**
+   * The turn dispatched to a sandbox or being processed; null when none is.
+   */
+  inFlightTurn: {
+    turnId: string;
+    /**
+     * 'dispatched': handed to the sandbox, not yet confirmed started; 'processing': the agent is working on it.
+     */
+    state: 'dispatched' | 'processing';
+    /**
+     * When the turn was dispatched.
+     */
+    dispatchedAt: string | null;
+  } | null;
+  /**
+   * The human gate open on this session, if any, whatever activity says: activity is 'awaiting_approval' only when nothing is also queued, running, being delivered or scheduled. When more than one gate is open, a plan is reported first, then a workflow step, then an escalated workflow run.
+   */
+  awaiting: {
+    /**
+     * 'plan': a plan awaiting approval (id is the plan's, decided through POST /api/sessions/{sessionID}/plans/{planId}/approve or reject); 'workflow_step': a workflow step awaiting a decision (id is the step run's); 'workflow_escalation': a custom workflow's run escalated for review (id is the run's), reported until a turn is created on the session after it escalated: while it is the session's newest workflow run and no turn other than the run's own attempts has been created since. New work sent to the session answers it; a turn created before the escalation never does, whether it is still queued, running or has ended (such as one queued behind the turn whose end escalated the run, or one sent while a step awaited the decision that escalated it), so while such a turn runs, activity says running and awaiting still reports the escalation. A built-in workflow's escalation is never reported: no person or route can act on it, and when its turn failed or was stopped, lastRun already says so.
+     */
+    kind: 'plan' | 'workflow_step' | 'workflow_escalation';
+    id: string;
+    /**
+     * When the gate opened.
+     */
+    since: string;
+  } | null;
+  /**
+   * The most recently created turn that reached a terminal state; null when none has.
+   */
+  lastRun: {
+    turnId: string;
+    outcome: 'completed' | 'failed' | 'cancelled';
+    /**
+     * Why the run did not complete, with Session.failureReason's values. A turn carries no reason of its own, so this is the session's recorded reason, given only when it can describe nothing but this run: the run is the session's newest turn, did not complete, and the session's recorded outcome is this run's. Null otherwise, and always null when the run completed.
+     */
+    failureReason: 'cancelled' | 'failed' | 'timeout' | 'never_started' | null;
+    /**
+     * When the run reached its terminal state; null when that was not recorded.
+     */
+    finishedAt: string | null;
+  } | null;
+  /**
+   * The session's sandbox status in the same snapshot, with Session.sandboxStatus's values; null when the session has no sandbox yet. Informational, and an input to suggestedDelaySeconds while queued: activity never derives from it.
+   */
+  sandboxStatus:
+    | 'pending'
+    | 'spawning'
+    | 'connecting'
+    | 'booting'
+    | 'ready'
+    | 'snapshotting'
+    | 'suspect'
+    | 'stopped'
+    | 'failed'
+    | null;
+  archived: boolean;
+  /**
+   * How long to wait before reading this status again, in whole seconds (rounded up): short while a turn is queued on a warm sandbox, running or being delivered, longer while a sandbox starts or work is scheduled (never past the moment that work comes due, plus a few seconds for it to act), longer still while a person must act, longest once finished or idle -- always within the deployment's configured floor and ceiling (2 and 300 seconds as shipped). A hint that keeps polling quiet, never a limit: an earlier read is answered all the same.
+   */
+  suggestedDelaySeconds: number;
+  /**
+   * The database's clock when the snapshot was taken.
+   */
+  observedAt: string;
 }
 /**
  * One MCP client authorization a user granted (technical plan §43.18) -- one row of GET /api/me/mcp-authorizations (the caller's own) or, for an administrator, of GET /api/members/{userID}/mcp-authorizations (a member's), and what DELETE /api/me/mcp-authorizations/{authorizationID} or DELETE /api/members/{userID}/mcp-authorizations/{authorizationID} revokes (by id). A user holds at most one per client: consenting to the same client again renews its expiry in place and records that approval's scopes. Never carries a token, a code, or any other secret -- none exists in plaintext anywhere once it has been handed to the client, so an administrator's view of a member's authorizations is exactly what the member sees, and no more.

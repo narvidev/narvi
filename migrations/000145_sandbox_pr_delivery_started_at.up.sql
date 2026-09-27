@@ -1,0 +1,29 @@
+-- A session's status (technical plan §43.20) must not read settled while
+-- the push and pull request of a turn that just completed are still under
+-- way: settled means nothing progresses server-side until a person acts,
+-- and a pull request appearing with no new input is progress.
+--
+-- That work runs after the turn's own terminal commit, in two separate
+-- wire-event handler invocations (internal/app/sessionactor/pushpr.go):
+-- the push command is sent once the execution_complete transaction has
+-- committed, and the pull request is created only when that push's
+-- push_complete arrives. Nothing the status read already sees records it.
+-- pending_push_suppressed_in_shadow (migrations/000107) is the push's
+-- egress decision, not its progress: it is stamped for shadow and blocked
+-- cycles that send no push at all, and cleared only when a push_complete
+-- is consumed, so it stays set after a failed push.
+--
+-- pr_delivery_started_at is that progress, bounded. It is set to now() in
+-- the SAME transaction that completes the turn, and only when a push will
+-- really be sent (live egress, a creator whose push can authenticate, at
+-- least one repo with an explicit branch), so no snapshot ever holds the
+-- completed turn without it. It is cleared once createPRBestEffort has
+-- finished (after the pull request's artifact row is written), when a
+-- push_error arrives, when the push command could not be sent, and when
+-- the sandbox is respawned (UpsertSandboxForSpawn: a replaced generation's
+-- push can never report back). A push that never reports back otherwise
+-- leaves it set; the status reads it as delivering only within
+-- platform.Timeouts.MCPStatusDeliveryWindow of this instant, so it can
+-- never hold a session unsettled for longer. NULL means no delivery is
+-- outstanding.
+ALTER TABLE sandboxes ADD COLUMN pr_delivery_started_at TIMESTAMPTZ;

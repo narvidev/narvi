@@ -51,10 +51,11 @@ func listToolNames(t *testing.T, handler http.Handler) []string {
 // omits what it cannot call" exit criterion at the unit level, driven
 // through the real NewHandler: each grant sees exactly the tools its
 // scopes satisfy -- none for a scope-less, unknown-scope or missing grant,
-// all three for mcp:read, and all three for mcp:write (which implies
-// mcp:read).
+// every one for mcp:read, and every one for mcp:write (which implies
+// mcp:read). Row 182's status and transcript tools are mcp:read like the
+// rest: a grant without it is told neither exists (technical plan §43.20).
 func TestToolsList_ScopeFilter_Table(t *testing.T) {
-	all := []string{"narvi_get_session", "narvi_list_models", "narvi_list_sessions"}
+	all := []string{"narvi_get_session", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions"}
 	tests := []struct {
 		name   string
 		scopes *[]string
@@ -133,11 +134,17 @@ func TestInstructionsFor_Composition(t *testing.T) {
 	if !strings.Contains(two, "two READ-ONLY tools over") || !strings.Contains(two, specs[0].Instruction+" and "+specs[1].Instruction) {
 		t.Errorf("instructionsFor(two) = %q", two)
 	}
-	three := instructionsFor(specs)
+	three := instructionsFor(specs[:3])
 	want := "This server exposes three READ-ONLY tools over this deployment's session data: " +
 		specs[0].Instruction + ", " + specs[1].Instruction + ", and " + specs[2].Instruction + ". None of these tools writes anything."
 	if three != want {
-		t.Errorf("instructionsFor(all) =\n %q\nwant\n %q", three, want)
+		t.Errorf("instructionsFor(three) =\n %q\nwant\n %q", three, want)
+	}
+	all := instructionsFor(specs)
+	want = "This server exposes five READ-ONLY tools over this deployment's session data: " +
+		specs[0].Instruction + ", " + specs[1].Instruction + ", " + specs[2].Instruction + ", " + specs[3].Instruction + ", and " + specs[4].Instruction + ". None of these tools writes anything."
+	if all != want {
+		t.Errorf("instructionsFor(all) =\n %q\nwant\n %q", all, want)
 	}
 }
 
@@ -153,24 +160,32 @@ func TestHiddenToolCall_IsIndistinguishableFromUnknownTool(t *testing.T) {
 		status, body := rawPost(t, newTestHandlerWithGrant(t, testTwins(), grant), "/mcp", callToolBody(7, tool, "{}"), callToolHeaders(tool))
 		return status, string(body)
 	}
-	const hidden, unknown = "narvi_list_models", "narvi_does_not_exist"
-
-	hiddenStatus, hiddenBody := call(scopes(), hidden)
+	const unknown = "narvi_does_not_exist"
 	unknownStatus, unknownBody := call(scopes("mcp:read"), unknown)
-	if hiddenStatus != unknownStatus {
-		t.Fatalf("HTTP status: hidden %d, unknown %d -- must be identical", hiddenStatus, unknownStatus)
-	}
-	if want := strings.ReplaceAll(unknownBody, unknown, hidden); hiddenBody != want {
-		t.Fatalf("hidden tool's response differs from an unknown tool's:\n hidden:  %s\n unknown: %s", hiddenBody, want)
-	}
-	var env jsonrpcEnvelope
-	if err := json.Unmarshal([]byte(hiddenBody), &env); err != nil || env.Error == nil || env.Error.Code != -32602 {
-		t.Fatalf("hidden tool response = %s, want a JSON-RPC -32602 error", hiddenBody)
-	}
-	// The same holds under no grant at all.
-	noGrantStatus, noGrantBody := call(nil, hidden)
-	if noGrantStatus != hiddenStatus || noGrantBody != hiddenBody {
-		t.Fatalf("no-grant response differs from the scope-less one:\n %s\n %s", noGrantBody, hiddenBody)
+
+	// Every tool in the table, row 182's status and transcript tools
+	// included: each is hidden from a scope-less grant exactly as a name
+	// that never existed is.
+	for _, spec := range toolSpecs(Twins{}) {
+		hidden := spec.Name
+		t.Run(hidden, func(t *testing.T) {
+			hiddenStatus, hiddenBody := call(scopes(), hidden)
+			if hiddenStatus != unknownStatus {
+				t.Fatalf("HTTP status: hidden %d, unknown %d -- must be identical", hiddenStatus, unknownStatus)
+			}
+			if want := strings.ReplaceAll(unknownBody, unknown, hidden); hiddenBody != want {
+				t.Fatalf("hidden tool's response differs from an unknown tool's:\n hidden:  %s\n unknown: %s", hiddenBody, want)
+			}
+			var env jsonrpcEnvelope
+			if err := json.Unmarshal([]byte(hiddenBody), &env); err != nil || env.Error == nil || env.Error.Code != -32602 {
+				t.Fatalf("hidden tool response = %s, want a JSON-RPC -32602 error", hiddenBody)
+			}
+			// The same holds under no grant at all.
+			noGrantStatus, noGrantBody := call(nil, hidden)
+			if noGrantStatus != hiddenStatus || noGrantBody != hiddenBody {
+				t.Fatalf("no-grant response differs from the scope-less one:\n %s\n %s", noGrantBody, hiddenBody)
+			}
+		})
 	}
 }
 

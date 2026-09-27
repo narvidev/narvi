@@ -35,3 +35,31 @@ WHERE id IN (
     FOR UPDATE SKIP LOCKED
 )
 RETURNING *;
+
+-- name: StartReleaseManifestCheck :exec
+-- Technical plan §43.20 (migrations/000146_release_manifest_checks_running
+-- .up.sql): records that the check claimed from pending row pending_id is
+-- now running on session_id, stamped with the database's now(). Called by
+-- ReleaseManifestPendingStore.ClaimDue in the SAME transaction as
+-- ClaimDueReleaseManifestPending's delete, so every snapshot sees a
+-- claimed check either waiting or running until it finishes.
+INSERT INTO release_manifest_checks_running (pending_id, session_id)
+VALUES ($1, $2);
+
+-- name: FinishReleaseManifestCheck :exec
+-- The worker's own last step for one claimed check: it has returned, and
+-- any composition review turn it inserted has already committed, so the
+-- running row -- which the session's status reads as work still able to
+-- create a turn -- goes now. A session whose status no longer counts the
+-- check therefore already counts that turn.
+DELETE FROM release_manifest_checks_running WHERE pending_id = $1;
+
+-- name: PurgeStaleReleaseManifestChecks :execrows
+-- Deletes running rows claimed longer ago than max_age: their one attempt
+-- is over -- ReleaseManifestCheckTimeout bounds it -- but their worker died
+-- before FinishReleaseManifestCheck ran. The session's status has already
+-- stopped counting such a row (the same bound, measured on the same
+-- database clock); this keeps them from piling up. Never touches a
+-- release_manifest_pending row: those are only ever claimed.
+DELETE FROM release_manifest_checks_running
+WHERE claimed_at < now() - sqlc.arg('max_age')::interval;
