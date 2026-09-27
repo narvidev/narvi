@@ -3795,6 +3795,81 @@ the runtime still shares the network namespace (arbitrary egress remains §30.1'
 empty-handed), and kernel-level escalation is the substrate's concern (the provider's isolation
 layer), not this Step's.
 
+**Preserving the workspace tree means re-owning it — and the re-own walk is root acting on a tree
+the runtime can change under it.** Everything sandbox-agent writes into the workspace (the clone,
+setup hooks, the generated manifest and config) is written as sandbox-agent, so the runtime keeps
+working access only because sandbox-agent, as root, re-owns the tree to the runtime's uid
+(`boot.ChownWorkspaceForRuntime`, `internal/sandboxagent/boot/workspaceowner.go`): per freshly
+cloned repository, per repository that has `services.yml` commands just before they start, and over
+the whole workspace after boot, before the first prompt. The later passes run while `services.yml` processes
+are already running as the runtime uid and writing in the tree, so the walk must hold against a
+writer that swaps any directory for a symlink at any instant. A path-based walk does not:
+`filepath.WalkDir` with `Lchown` resolves every parent component again at each call (`Lchown`
+declines to follow only the last one), and `os.ReadDir` follows a directory swapped for a symlink
+after it was listed — reproduced with an atomic swapper, root listed and re-owned a directory
+outside the workspace, where the credential cache is a plausible target. **The guarantee: the re-own
+walk is fd-relative.** The root is opened `O_DIRECTORY|O_NOFOLLOW`; each directory is listed from
+its own open fd, and each entry in it is looked at with `fstatat(dirfd, name, AT_SYMLINK_NOFOLLOW)`;
+the walk descends only through `openat(dirfd, name, O_DIRECTORY|O_NOFOLLOW)` and re-owns each
+directory through the fd that opened it; every other entry is re-owned with
+`fchownat(dirfd, name, AT_SYMLINK_NOFOLLOW)`. It therefore re-owns exactly the inodes reachable as
+entries of directories it opened by descent from the root, never follows or descends through a
+symlink, and never lists, looks at, opens or re-owns anything through a path the runtime can change;
+an entry that vanishes mid-walk is skipped, never re-resolved by path. On kernel overlayfs, re-owning
+an entry still only in a lower layer copies it up, and a removal during that copy-up has three
+outcomes, set by how the copy-up puts the entry in place over the whiteout the removal left. A regular
+file is linked into place from an `O_TMPFILE`, and `fchownat` fails with `EEXIST` (where the upper
+filesystem supports `O_TMPFILE`; where it does not, a regular file goes the third way). A directory is
+renamed into place from overlayfs's work directory, and its `fchown` fails with `ENOTDIR`. For these
+two, the walk skips the entry only once a second look through the same fd (`fstatat` for the name, a
+listing for the directory) says it is gone, and fails otherwise. Every other entry (a symlink,
+measured; by the same code path, unmeasured, a device node, FIFO or socket) is renamed into place too,
+and that rename replaces the whiteout: `fchownat` succeeds, and the removed entry is back, as the
+image had it, owned by the runtime. That third outcome is silent, and is a residual, stated below. The root is the exception to
+skipping: its own name is looked up once more when the walk is done, acting on nothing, and a root
+removed, renamed away or replaced while the walk ran fails it, and boot, because the tree the caller
+named is no longer there. Residuals stated. The given root path's own components above the last are
+resolved by name once and trusted, which holds because they sit in directories only root can write
+(for the default `/workspace`, the only such name is `workspace`, an entry of `/`). And hard links:
+an inode hard-linked into the tree is re-owned under every name it has, so what that exposes depends
+on what the kernel lets the runtime hard-link: a kernel-global rule that Narvi does not set, and that
+an image or pod spec cannot. The walk asks the kernel rather than a setting that stands for it. Once
+per process and runtime identity, a short-lived child running as the runtime (the sandbox-agent
+binary re-executed, dropped by the same credential the runtime gets) tries to hard-link a root-owned
+`0600` file into a directory of its own, and answers only through its exit status. `EPERM` means the
+kernel bounds hard links (the runtime can link only a file it owns or can already read and write); a
+link made means it does not; anything else (another errno, a child that could not start or gave no
+answer within `platform.HardLinkProbeTimeout`) is inconclusive, and `fs.protected_hardlinks` then
+decides, bounded only at `1`. The setting alone is not enough: gVisor, which Modal sandboxes run on
+by default, publishes no `/proc/sys/fs/protected_hardlinks` and enforces the rule unconditionally.
+The verdict is logged once, at INFO. Bounded, a hard-linked entry is re-owned like any other, as a
+package store linked into `node_modules` by a root-run setup hook, or a build's hard-linked outputs,
+need. Not bounded, the walk leaves every non-directory entry with more than one link to its owner,
+and each walk that left any logs once, at WARN, how many it left that the runtime does not already
+own, naming at most five, relative to the root. Only there does a race remain: the link count is read
+by name through the held directory fd and the entry then re-owned the same way, two calls apart, so
+on a kernel that does not bound hard links a writer can still rename a hard link over an entry
+between them. The probe runs against the real kernel in the walk's tests, including with
+`/proc/sys/fs` masked as gVisor presents it, where the production entry point must still re-own
+hard-linked entries. And a removal the walk undoes on overlayfs: a runtime-uid process that removes
+lower-layer symlinks from a subtree while the walk is the first to re-own it can see one come back,
+owned by the runtime, and its `rm -rf` of their directory fail with `ENOTEMPTY`. Nothing tells the
+walk, and boot does not fail. It grants nothing the walk does not grant every entry, and it is not new:
+the path-based walk re-owned with `os.Lchown`, which reaches the same kernel path and brings symlinks
+back the same way. The walk still re-owns symlinks, since a symlink's owner decides who may remove it
+in a sticky directory and whether `fs.protected_symlinks` lets it be followed there. The reach is a
+workspace that came with the sandbox's image (`repo_image`, `snapshot_restore`) on kernel overlayfs,
+during the first pass over a subtree, since each pass copies up everything it re-owns: `RunBoot`'s pass
+over a repository with `services.yml` commands, or the post-boot pass over one without. gVisor's own
+overlay is unmeasured. `TestChownTree_OverlayLowerLayerRemovals` races a remover through a
+symlink-heavy lower-layer tree and holds every entry left, those brought back included, to the
+runtime's ownership. The walk's swap tests
+(`workspaceowner_redirect_test.go`, including a real concurrent atomic swapper) replace a directory,
+or its parent, with a symlink before a descent, after a directory is opened and before it is listed,
+before an entry is looked at, and before an entry is re-owned, and the outside tree of the
+list-and-look cases differs from the inside one in names and types; they go red if any listing,
+look, descent or re-own goes by a path instead of through the fd the walk holds.
+
 ### 30.6 The recording model: what a suppressed effect becomes
 
 Recording is the *product* of shadow mode — it is what the operator evaluates. The load-bearing

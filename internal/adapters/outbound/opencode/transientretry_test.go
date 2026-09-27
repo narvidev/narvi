@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"testing"
 
 	"golang.org/x/sync/errgroup"
@@ -122,7 +121,7 @@ func TestTransientRetry_SucceedsAfterTransientAPIError(t *testing.T) {
 		return err
 	})
 
-	ts := waitForTurnRegistered(t, a, "ses_fake")
+	ts := waitForTurnDispatched(t, f, a, "ses_fake")
 
 	// The original turn's own assistant message reports a transient
 	// APIError, then the turn goes idle.
@@ -162,7 +161,7 @@ func TestTransientRetry_SucceedsAfterTransientAPIError(t *testing.T) {
 	// immediately after waitForCount would race dispatchEvent's own
 	// isCompacting guard (sse.go) into silently and permanently dropping the
 	// retry's own completion.
-	waitForNotCompacting(t, f, ts)
+	waitForNotCompacting(t, f, a, ts)
 
 	// Now script the RETRY's own clean completion.
 	f.broadcast(plainAssistantMessageUpdated(t, "ses_fake", "msg_retry"))
@@ -230,7 +229,7 @@ func TestTransientRetry_PermanentAPIErrorNeverRetried(t *testing.T) {
 		return err
 	})
 
-	waitForTurnRegistered(t, a, "ses_fake")
+	waitForTurnDispatched(t, f, a, "ses_fake")
 
 	// apiErrorMessageUpdatedWithModel, not the bare apiErrorMessageUpdated:
 	// cmd.Model is never set on this turn (the default configuration), so
@@ -345,7 +344,7 @@ func TestTransientRetry_RetryAlsoFailsFinalizesFailedExactlyOnce(t *testing.T) {
 		return err
 	})
 
-	ts := waitForTurnRegistered(t, a, "ses_fake")
+	ts := waitForTurnDispatched(t, f, a, "ses_fake")
 
 	// First transient error -- triggers the one and only retry.
 	f.broadcast(apiErrorMessageUpdated(t, "ses_fake", "msg_original", true))
@@ -363,7 +362,7 @@ func TestTransientRetry_RetryAlsoFailsFinalizesFailedExactlyOnce(t *testing.T) {
 	// dispatchEvent's own isCompacting guard (sse.go) into silently and
 	// PERMANENTLY dropping this event (there is no replay), leaving nothing
 	// to finalize this turn within the test's own testWait ctx budget.
-	waitForNotCompacting(t, f, ts)
+	waitForNotCompacting(t, f, a, ts)
 
 	// The RETRIED prompt ALSO hits a transient APIError.
 	f.broadcast(apiErrorMessageUpdated(t, "ses_fake", "msg_retry", true))
@@ -452,13 +451,10 @@ func TestTransientRetry_RetryDispatchFailsIsNeverRetriedAgain(t *testing.T) {
 		return err
 	})
 
-	waitForTurnRegistered(t, a, "ses_fake")
-
-	// The ORIGINAL dispatch (call #1) must keep succeeding -- only arm the
-	// failure AFTER it has already gone out (setPromptAsyncOK's own field
-	// comment, fake_server_test.go), or the transient-error scenario this
-	// test needs could never even get triggered in the first place.
-	waitForCount(t, "promptCallCount", f.promptCallCount, 1)
+	// The ORIGINAL dispatch (call #1) must keep succeeding: arm the failure
+	// only once waitForTurnDispatched has seen it recorded (see
+	// setPromptAsyncOK's own doc comment).
+	waitForTurnDispatched(t, f, a, "ses_fake")
 	f.setPromptAsyncOK(false)
 
 	// apiErrorMessageUpdatedWithModel, not the bare apiErrorMessageUpdated:
@@ -569,7 +565,7 @@ func TestTransientRetry_SharesOneShotBudgetWithCompactionRetry(t *testing.T) {
 		return err
 	})
 
-	ts := waitForTurnRegistered(t, a, "ses_fake")
+	ts := waitForTurnDispatched(t, f, a, "ses_fake")
 
 	// First-time transient APIError -- consumes the shared latch via the
 	// transient-retry path (no compaction).
@@ -587,7 +583,7 @@ func TestTransientRetry_SharesOneShotBudgetWithCompactionRetry(t *testing.T) {
 	// closes: waitForCount above only proves the retry's own prompt_async
 	// call was recorded server-side, strictly EARLIER than ts.compacting
 	// actually clearing client-side.
-	waitForNotCompacting(t, f, ts)
+	waitForNotCompacting(t, f, a, ts)
 
 	// The RETRIED prompt overflows instead of hitting another transient
 	// error -- must NOT trigger a compaction retry: the shared latch is
@@ -661,16 +657,6 @@ func TestCompactionRetry_SharesOneShotBudgetWithTransientRetry(t *testing.T) {
 	f := newFakeOpenCodeServer(t)
 	f.setSummarizeOK(true)
 	gate := f.armPromptAsyncGateForCall(2)
-	// Guarantees gate is closed exactly once even if an assertion below
-	// calls t.Fatal before this test's own explicit close(gate) is reached
-	// -- otherwise the fake server's own gated prompt_async handler
-	// goroutine would stay blocked forever, and f.srv.Close() (registered
-	// by newFakeOpenCodeServer, which therefore runs AFTER this cleanup
-	// thanks to t.Cleanup's own LIFO ordering) would hang the whole test
-	// binary waiting for that outstanding request to finish.
-	var closeGateOnce sync.Once
-	closeGate := func() { closeGateOnce.Do(func() { close(gate) }) }
-	t.Cleanup(closeGate)
 
 	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
@@ -697,7 +683,7 @@ func TestCompactionRetry_SharesOneShotBudgetWithTransientRetry(t *testing.T) {
 		return err
 	})
 
-	ts := waitForTurnRegistered(t, a, "ses_fake")
+	ts := waitForTurnDispatched(t, f, a, "ses_fake")
 
 	// First-time ContextOverflowError -- consumes the shared latch via the
 	// compaction path.
@@ -720,9 +706,9 @@ func TestCompactionRetry_SharesOneShotBudgetWithTransientRetry(t *testing.T) {
 	// TestCompactionRetry_RetryAlsoOverflowsFinalizesFailedExactlyOnce's own
 	// doc comment, compactionretry_test.go, for why this must run BEFORE
 	// releasing the gate).
-	waitForDrained(t, f, ts)
+	waitForDrained(t, f, a)
 
-	closeGate() // only now let the gated retry dispatch finally return
+	close(gate) // only now let the gated retry dispatch finally return
 
 	// Deterministically wait for ts.compacting to have actually cleared
 	// before broadcasting the RETRIED prompt's own second failure below --
@@ -731,7 +717,7 @@ func TestCompactionRetry_SharesOneShotBudgetWithTransientRetry(t *testing.T) {
 	// closes: waitForCount above only proves the retry's own prompt_async
 	// call was recorded server-side, strictly EARLIER than ts.compacting
 	// actually clearing client-side.
-	waitForNotCompacting(t, f, ts)
+	waitForNotCompacting(t, f, a, ts)
 
 	// The RETRIED prompt hits a transient APIError instead of overflowing
 	// again -- must NOT trigger a transient-error retry: the shared latch
@@ -834,7 +820,7 @@ func TestTransientRetry_NilModelOmitsWireModelFieldOnRetryDispatch(t *testing.T)
 		return err
 	})
 
-	ts := waitForTurnRegistered(t, a, "ses_fake")
+	ts := waitForTurnDispatched(t, f, a, "ses_fake")
 
 	// The original turn's own assistant message reports a transient
 	// APIError (no model planted -- irrelevant to this test, which only
@@ -860,7 +846,7 @@ func TestTransientRetry_NilModelOmitsWireModelFieldOnRetryDispatch(t *testing.T)
 
 	// Let the retry complete cleanly so the turn finalizes and this test
 	// doesn't leak a goroutine waiting on group.Wait() below.
-	waitForNotCompacting(t, f, ts)
+	waitForNotCompacting(t, f, a, ts)
 	f.broadcast(plainAssistantMessageUpdated(t, "ses_fake", "msg_retry"))
 	f.broadcast(assistantTextPart(t, "ses_fake", "msg_retry", "prt_retry", "all good now"))
 	f.broadcast(sessionIdleLine(t, "ses_fake"))

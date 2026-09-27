@@ -12,7 +12,7 @@ import (
 
 // lchownUID reports the on-disk owner of path via os.Lstat's own
 // FileInfo.Sys() -- NEVER following a symlink, mirroring
-// ChownWorkspaceForRuntime's own Lchown choice exactly, so this test
+// ChownWorkspaceForRuntime's own AT_SYMLINK_NOFOLLOW exactly, so this test
 // observes the same thing that function changes. *syscall.Stat_t's own
 // Uid field is uint32 on both linux and darwin (verified: `go doc
 // syscall.Stat_t` on both GOOS) -- no build tag needed.
@@ -112,47 +112,63 @@ func TestChownWorkspaceForRuntime_ActuallyChangesOwnership(t *testing.T) {
 // TestChownWorkspaceForRuntime_DoesNotFollowSymlinks is this Step's own
 // real, executed proof that a repo-authored symlink pointing OUTSIDE
 // workspaceDir cannot cause this function to re-own (or even touch)
-// whatever it points at: Lchown changes the symlink's own inode, never
-// its target -- os.Chown, by contrast, follows the link and operates on
-// the target instead.
+// whatever it points at: the walk re-owns the symlink's own inode
+// (fchownat with AT_SYMLINK_NOFOLLOW), never its target.
 //
-// The link deliberately points at a path that does NOT exist, rather
-// than comparing a real target's before/after owner: this test's own
-// self-uid/gid mutation would be a no-op OWNERSHIP-VALUE change either
-// way (chowning a file to the uid/gid it already has), so an
-// ownership-equality assertion cannot actually distinguish "never
-// touched" from "touched, but to an identical value" -- confirmed live
-// (an earlier version of this test compared owner values around a real
-// outside file and PASSED even after deliberately mutating
-// ChownWorkspaceForRuntime to os.Chown, i.e. it was vacuous). A DANGLING
-// symlink instead makes the two behaviors diverge on a completely
-// different, unambiguous axis: Lchown never needs to resolve the link at
-// all and succeeds; os.Chown must resolve it first and fails with ENOENT
-// (the target does not exist), which surfaces as a real, non-nil error
-// from the whole WalkDir call. See this Step's own report for the exact
-// mutation that caught the first version's vacuousness and motivated
-// this rewrite.
+// Re-owning to the caller's own uid/gid proves nothing here: chowning a
+// file to the owner it already has looks exactly like never touching it
+// (an earlier version compared owner values around a real outside file
+// that way and PASSED with the walk mutated to a symlink-following chown).
+// The next version relied on a DANGLING link instead, on which a
+// following chown fails with ENOENT -- which stopped being a failure once
+// the walk had to skip entries that vanish mid-walk, since that ENOENT is
+// indistinguishable from one. So this re-owns to an owner the entries do
+// not already have (boot.ObservableOwner), and reads the result off both
+// sides: each link's own inode must carry it, and neither target may.
 func TestChownWorkspaceForRuntime_DoesNotFollowSymlinks(t *testing.T) {
-	root := t.TempDir()
-	danglingTarget := filepath.Join(t.TempDir(), "this-path-is-never-created")
+	root, outside := t.TempDir(), t.TempDir()
+	realTarget := filepath.Join(outside, "outside-file")
+	if err := os.WriteFile(realTarget, []byte("not the workspace's\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	links := map[string]string{
+		"escape-link":   filepath.Join(outside, "this-path-is-never-created"),
+		"outside-alias": realTarget,
+	}
+	for name, target := range links {
+		if err := os.Symlink(target, filepath.Join(root, name)); err != nil {
+			t.Fatalf("Symlink: %v", err)
+		}
+	}
+	uid, gid := boot.ObservableOwner(t, root)
+	targetUID, targetGID := lchownOwner(t, realTarget)
 
-	linkPath := filepath.Join(root, "escape-link")
-	if err := os.Symlink(danglingTarget, linkPath); err != nil {
-		t.Fatalf("Symlink: %v", err)
+	if err := boot.ChownWorkspaceForRuntime(root, uid, gid); err != nil {
+		t.Fatalf("ChownWorkspaceForRuntime() error = %v, want nil", err)
 	}
 
-	selfUID := uint32(os.Getuid())
-	selfGID := uint32(os.Getgid())
-	if err := boot.ChownWorkspaceForRuntime(root, selfUID, selfGID); err != nil {
-		t.Fatalf("ChownWorkspaceForRuntime() error = %v, want nil (Lchown must re-own the dangling symlink's own inode without ever needing to resolve its nonexistent target)", err)
+	for name := range links {
+		if u, g := lchownOwner(t, filepath.Join(root, name)); u != uid || g != gid {
+			t.Errorf("owner of the symlink %s itself = %d:%d, want %d:%d", name, u, g, uid, gid)
+		}
 	}
+	if u, g := lchownOwner(t, realTarget); u != targetUID || g != targetGID {
+		t.Errorf("the symlink's OUTSIDE target was re-owned: %d:%d -> %d:%d", targetUID, targetGID, u, g)
+	}
+}
 
-	// The symlink's OWN inode (not its nonexistent target, which Lstat
-	// also never tries to resolve) must have been visited/re-owned, same
-	// as every other entry.
-	if got := lchownUID(t, linkPath); got != selfUID {
-		t.Errorf("owner of the symlink itself = %d, want %d", got, selfUID)
+// lchownOwner is lchownUID with the gid as well.
+func lchownOwner(t *testing.T, path string) (uid, gid uint32) {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("Lstat(%s): %v", path, err)
 	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("Lstat(%s).Sys() = %T, want *syscall.Stat_t", path, info.Sys())
+	}
+	return st.Uid, st.Gid
 }
 
 // TestChownWorkspaceForRuntime_NonexistentDir proves a nonexistent

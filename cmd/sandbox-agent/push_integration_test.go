@@ -22,7 +22,8 @@
 // clone (its own real boot sequence, unmodified) -- the test never
 // pre-populates the workspace directory itself (that would collide with
 // `git clone` refusing to clone into an already-non-empty directory). It
-// instead polls the filesystem for the clone to complete, makes ONE new
+// instead waits for the subprocess to log that its whole boot has
+// completed (waitForBootComplete), makes ONE new
 // local commit itself (standing in for "the agent did some work"), and
 // only then signals the fake control-plane to send the "push" command --
 // otherwise the WS bridge (started BEFORE cloning/booting, by main.go's
@@ -57,6 +58,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -175,6 +177,13 @@ type fakeControlPlane struct {
 	credentialShouldFail bool
 	readyToPush          chan struct{}
 	result               chan json.RawMessage
+
+	// credentialRequests counts scm-credentials requests. The clone is
+	// anonymous, so only a push that reached authentication asks -- which
+	// lets TestHandlePush_CredentialRefused_ProducesPushError tell a push
+	// refused for its credential from one that failed before ever needing
+	// one (it passed on any push_error while pushes could still race boot).
+	credentialRequests atomic.Int32
 }
 
 func newFakeControlPlane(t *testing.T, sessionID string, credentialShouldFail bool) *fakeControlPlane {
@@ -187,7 +196,8 @@ func newFakeControlPlane(t *testing.T, sessionID string, credentialShouldFail bo
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/sessions/"+sessionID+"/scm-credentials", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/sessions/"+sessionID+"/scm-credentials", func(w http.ResponseWriter, _ *http.Request) {
+		fcp.credentialRequests.Add(1)
 		if fcp.credentialShouldFail {
 			http.Error(w, "no credential available for this session", http.StatusForbidden)
 			return
@@ -305,35 +315,77 @@ func setUpBareRepoAndServer(t *testing.T) (gitServerURL string) {
 	return gitServer.URL
 }
 
-// waitForRealClone polls for the sandbox-agent subprocess's OWN real
-// `git clone` (internal/sandboxagent/gitclone.CloneAll, unmodified) to
-// FULLY finish populating workspaceDir/widgets, bounded by
-// pushTestTimeout. Polls for the seed file (README.md) rather than just
-// the .git directory's own existence: `git clone` creates .git fairly
-// early (once objects are fetched) but finishes checking out working-tree
-// files -- and writing HEAD -- afterward; racing that window with this
-// test's own `git commit` in the SAME repo produced a real, observed
-// "cannot lock ref 'HEAD': reference already exists" failure during this
-// test's own development. Waiting for the checked-out working-tree file
-// itself is a strictly later, unambiguous completion signal.
-func waitForRealClone(t *testing.T, workspaceDir string) {
+// waitForBootComplete blocks until the sandbox-agent subprocess logs
+// bootCompleteLogMsg (main.go), bounded by pushTestTimeout. It fails at once,
+// with the subprocess's output, on either sign that boot will never complete:
+// the subprocess logging shuttingDownLogMsg first, or exiting (exited, from
+// runSandboxAgent). A failed boot gives one or the other: run() either
+// returns early -- before its supervised group exists, as when opencode
+// fails to spawn, which logs nothing this could wait on -- or shuts that
+// group down first. The records it reads are Info records, which is why
+// runSandboxAgent pins the subprocess's log level.
+//
+// The tests below stand in for the agent runtime: they edit and commit in
+// the workspace, then ask for a push. The runtime gets no prompt before
+// boot has finished, so they must not touch the workspace before then
+// either. This used to wait only for the clone's own README.md, which
+// exists as soon as `git clone` has checked it out -- while boot still has
+// gitdir.Seed and every ChownWorkspaceForRuntime pass ahead of it (per repo
+// inside gitclone.CloneAll, then over the whole workspace in main.go). The
+// test's `git add`/`git commit` then ran inside those walks, creating and
+// removing .git/index.lock and .git/HEAD.lock under them; in CI a walk hit
+// "lchown .../.git/HEAD.lock: no such file or directory", boot failed, and
+// the test waited out pushTestTimeout for a push result that could never
+// come. This wait had already moved once, from the .git directory to
+// README.md, when the same race surfaced as "cannot lock ref 'HEAD'"; any
+// clone milestone short of boot completion leaves the rest of it open.
+func waitForBootComplete(t *testing.T, out *syncBuffer, exited <-chan struct{}) {
 	t.Helper()
-	seedFile := filepath.Join(workspaceDir, "widgets", "README.md")
-	deadline := time.Now().Add(pushTestTimeout)
+	deadline := time.NewTimer(pushTestTimeout)
+	defer deadline.Stop()
+	poll := time.NewTicker(100 * time.Millisecond)
+	defer poll.Stop()
 	for {
-		if _, err := os.Stat(seedFile); err == nil {
+		switch firstBootOutcome(out.String()) {
+		case bootCompleteLogMsg:
 			return
+		case shuttingDownLogMsg:
+			t.Fatalf("sandbox-agent shut down before completing boot; sandbox-agent output:\n%s", out.String())
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for the real sandbox-agent clone to check out %s", seedFile)
+		select {
+		case <-exited:
+			// Its output is complete by now: exited closes only once
+			// cmd.Wait has returned, which is after copying all of it.
+			t.Fatalf("sandbox-agent exited while the test waited for it to complete boot; sandbox-agent output:\n%s", out.String())
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for sandbox-agent to log %q; sandbox-agent output:\n%s", bootCompleteLogMsg, out.String())
+		case <-poll.C:
 		}
-		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// firstBootOutcome returns whichever of bootCompleteLogMsg and
+// shuttingDownLogMsg appears first as a log record's own "msg" in output
+// (sandbox-agent logs one JSON object per line, platform.NewLogger), or ""
+// if neither does yet. Lines that are not JSON log records are skipped.
+func firstBootOutcome(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		var record struct {
+			Msg string `json:"msg"`
+		}
+		if json.Unmarshal([]byte(line), &record) != nil {
+			continue
+		}
+		if record.Msg == bootCompleteLogMsg || record.Msg == shuttingDownLogMsg {
+			return record.Msg
+		}
+	}
+	return ""
 }
 
 // runSandboxAgent starts the real sandbox-agent binary against a real
 // SESSION_CONFIG pointing at fcp, returning a buffer capturing its
-// combined output for diagnostics.
+// combined output for diagnostics, and a channel closed once it has exited.
 //
 // Both the normal per-test-completion path (t.Cleanup below) and the
 // pushTestTimeout path (cmd.Cancel/cmd.WaitDelay) stop it via
@@ -400,7 +452,7 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-func runSandboxAgent(t *testing.T, binPath, gitServerURL, workspaceDir string, fcp *fakeControlPlane) *syncBuffer {
+func runSandboxAgent(t *testing.T, binPath, gitServerURL, workspaceDir string, fcp *fakeControlPlane) (out *syncBuffer, exited <-chan struct{}) {
 	t.Helper()
 
 	sessionConfigJSON := fmt.Sprintf(`{
@@ -465,6 +517,10 @@ func runSandboxAgent(t *testing.T, binPath, gitServerURL, workspaceDir string, f
 		// (clone, push, rev-parse) via supervisor.Spec's own nil-Env
 		// "inherit this process's environment" convention.
 		"GIT_SSL_NO_VERIFY=true",
+		// waitForBootComplete reads boot's outcome from Info records, so an
+		// NARVI_LOG_LEVEL inherited from the caller's shell above info
+		// would hide them. os/exec keeps the last value of a duplicated key.
+		"NARVI_LOG_LEVEL=info",
 	)
 	// syncBuffer, not bytes.Buffer: os/exec writes this from its own copier
 	// goroutine while the tests below read it back from the test goroutine.
@@ -472,9 +528,9 @@ func runSandboxAgent(t *testing.T, binPath, gitServerURL, workspaceDir string, f
 	// Stdout and Stderr additionally makes os/exec reuse ONE pipe and ONE
 	// copier goroutine for the pair (it compares the two interface values),
 	// so the interleaving of the child's stdout and stderr is preserved.
-	var out syncBuffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	out = &syncBuffer{}
+	cmd.Stdout = out
+	cmd.Stderr = out
 
 	// Own process group (mirrors internal/sandboxagent/supervisor.Spawn's
 	// own SysProcAttr{Setpgid: true} for every child IT spawns) so
@@ -525,7 +581,7 @@ func runSandboxAgent(t *testing.T, binPath, gitServerURL, workspaceDir string, f
 		stopProcessGroup(cmd.Process.Pid, waitDone, timeouts.SupervisorShutdownTimeout)
 	})
 
-	return &out
+	return out, waitDone
 }
 
 // TestHandlePush_RealGitPush_Success proves a real `git push` (via the
@@ -538,9 +594,9 @@ func TestHandlePush_RealGitPush_Success(t *testing.T) {
 	workspaceDir := t.TempDir()
 
 	fcp := newFakeControlPlane(t, "push-success-session", false /* credentialShouldFail */)
-	out := runSandboxAgent(t, binPath, gitServerURL, workspaceDir, fcp)
+	out, exited := runSandboxAgent(t, binPath, gitServerURL, workspaceDir, fcp)
 
-	waitForRealClone(t, workspaceDir)
+	waitForBootComplete(t, out, exited)
 
 	repoDir := filepath.Join(workspaceDir, "widgets")
 	if err := os.WriteFile(filepath.Join(repoDir, "change.txt"), []byte("a real change\n"), 0o644); err != nil {
@@ -596,9 +652,9 @@ func TestHandlePush_CredentialRefused_ProducesPushError(t *testing.T) {
 	workspaceDir := t.TempDir()
 
 	fcp := newFakeControlPlane(t, "push-failure-session", true /* credentialShouldFail */)
-	out := runSandboxAgent(t, binPath, gitServerURL, workspaceDir, fcp)
+	out, exited := runSandboxAgent(t, binPath, gitServerURL, workspaceDir, fcp)
 
-	waitForRealClone(t, workspaceDir)
+	waitForBootComplete(t, out, exited)
 
 	repoDir := filepath.Join(workspaceDir, "widgets")
 	if err := os.WriteFile(filepath.Join(repoDir, "change.txt"), []byte("a real change\n"), 0o644); err != nil {
@@ -632,5 +688,9 @@ func TestHandlePush_CredentialRefused_ProducesPushError(t *testing.T) {
 	}
 	if pushErr.Error == "" {
 		t.Error("PushError.Error is empty, want a real error message")
+	}
+	if fcp.credentialRequests.Load() == 0 {
+		t.Errorf("push_error (%q) arrived without the push ever asking for a credential -- it failed before "+
+			"authentication, so it says nothing about a refused credential; sandbox-agent output:\n%s", pushErr.Error, out.String())
 	}
 }
