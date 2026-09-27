@@ -36,9 +36,11 @@ func repoRoot(t testing.TB) string {
 // missing piece: each tool's route, named once, independently of
 // toolSpecs itself.
 var wantTwinRoutes = map[string]string{
-	"narvi_list_models":   "GET /api/models",
-	"narvi_list_sessions": "GET /api/sessions",
-	"narvi_get_session":   "GET /api/sessions/{sessionID}",
+	"narvi_list_models":            "GET /api/models",
+	"narvi_list_sessions":          "GET /api/sessions",
+	"narvi_get_session":            "GET /api/sessions/{sessionID}",
+	"narvi_get_session_status":     "GET /api/sessions/{sessionID}/status",
+	"narvi_get_session_transcript": "GET /api/sessions/{sessionID}/events",
 }
 
 // TestEveryToolHasARegisteredTwin pins technical plan §43.9 item 2: a
@@ -91,7 +93,7 @@ func canonicalJSON(t testing.TB, v any) []byte {
 }
 
 // realToolsList calls tools/list against a real *sdkmcp.Server built the
-// SAME way buildServer builds one for a full-scope grant (three tools,
+// SAME way buildServer builds one for a full-scope grant (every tool,
 // stub Twins since this test never actually invokes a twin), by
 // constructing the server directly and calling its own ListTools method
 // in-process -- no HTTP, no client transport, since only the SHAPE of
@@ -101,9 +103,11 @@ func canonicalJSON(t testing.TB, v any) []byte {
 func realToolsListTools(t testing.TB) []*sdkmcp.Tool {
 	t.Helper()
 	twins := Twins{
-		ListModels:   stubHandler(200, `{}`),
-		ListSessions: stubHandler(200, `{}`),
-		GetSession:   stubHandler(200, `{}`),
+		ListModels:       stubHandler(200, `{}`),
+		ListSessions:     stubHandler(200, `{}`),
+		GetSession:       stubHandler(200, `{}`),
+		GetSessionStatus: stubHandler(200, `{}`),
+		ListEvents:       stubHandler(200, `{}`),
 	}
 	tools := make([]*sdkmcp.Tool, 0, len(toolSpecs(twins)))
 	for _, spec := range toolSpecs(twins) {
@@ -135,12 +139,12 @@ func TestToolsList_MatchesGolden(t *testing.T) {
 	}
 }
 
-// TestToolsList_ExactlyThreeToolsDeterministicOrder pins the full table:
-// a grant holding every advertised scope sees exactly these three tools,
+// TestToolsList_ExactlyFiveToolsDeterministicOrder pins the full table:
+// a grant holding every advertised scope sees exactly these five tools,
 // in this order. Which subset a narrower grant sees is
 // TestToolsList_ScopeFilter_Table's (technical plan §43.17).
-func TestToolsList_ExactlyThreeToolsDeterministicOrder(t *testing.T) {
-	want := []string{"narvi_list_models", "narvi_list_sessions", "narvi_get_session"}
+func TestToolsList_ExactlyFiveToolsDeterministicOrder(t *testing.T) {
+	want := []string{"narvi_list_models", "narvi_list_sessions", "narvi_get_session", "narvi_get_session_status", "narvi_get_session_transcript"}
 	tools := realToolsListTools(t)
 	if len(tools) != len(want) {
 		t.Fatalf("len(tools) = %d, want %d", len(tools), len(want))
@@ -152,7 +156,7 @@ func TestToolsList_ExactlyThreeToolsDeterministicOrder(t *testing.T) {
 	}
 }
 
-// TestToolAnnotations pins technical plan §43.8: every 180 tool is
+// TestToolAnnotations pins technical plan §43.8: every tool is
 // read-only, non-destructive, idempotent, and closed-world.
 func TestToolAnnotations(t *testing.T) {
 	for _, tool := range realToolsListTools(t) {

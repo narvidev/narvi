@@ -137,7 +137,7 @@ func writeOriginForbidden(w http.ResponseWriter) {
 // OUR OWN version gate (versions.go) wrapping the official SDK's
 // Streamable HTTP handler, stateless, JSON-response, Origin-protected,
 // body-size-capped at the same MaxRequestBodyBytes httpapi uses. twins
-// are the pre-built REST handlers this build's three tools invoke
+// are the pre-built REST handlers this build's tools invoke
 // in-process (Twins' own doc comment) -- constructed by controlplane,
 // the composition root, which alone holds the Postgres stores those
 // closures capture.
@@ -153,7 +153,7 @@ func writeOriginForbidden(w http.ResponseWriter) {
 // depends on being a real absolute URL -- see Config.PublicBaseURL's own
 // doc comment); a real deployment's own boot-time GitHub OAuth wiring
 // already depends on that same assumption holding. Also returns an error
-// if any of the three 180 tools' own input $defs fails to compile
+// if any tool's own input $def fails to compile
 // (schemas.go's compileInputSchemas) -- deliberately here, at BOOT, not
 // discovered lazily on some later request: round 2 review of PR #324,
 // findings N1/N3/N4. See compileInputSchemas' own doc comment for why
@@ -213,7 +213,7 @@ func newHandler(cfg Config, twins Twins, inputSchemas map[string]*jsonschema.Sch
 			// would be a second authority over state (§5.1 forbids
 			// exactly that).
 			Stateless: true,
-			// JSONResponse (§43.3): every 180 tool is a short DB read: a
+			// JSONResponse (§43.3): every tool is a short DB read: a
 			// plain application/json response avoids SSE plumbing and
 			// keep-alive timers entirely, so no new platform/timeouts.go
 			// constant is needed for this Step.

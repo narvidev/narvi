@@ -96,7 +96,7 @@ func mintBuildBearer(ctx context.Context, t *testing.T, pool *pgxpool.Pool, cfg 
 //  4. flag on, a valid session COOKIE and nothing else -> 401: the cookie
 //     is not a credential on /mcp (§43.2).
 //  5. flag on, a valid bearer token, trusted Origin -> 200, a real
-//     tools/list naming this build's own three tools and a real call.
+//     tools/list naming every tool this build declares and a real call.
 func TestBuild_MCPSurface_RealRouter(t *testing.T) {
 	setRequiredEnv(t)
 	pool, connStr := newTestPool(t)
@@ -316,7 +316,7 @@ func TestBuild_MCPSurface_RealRouter(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, body = %s, want 200", rec.Code, rec.Body.String())
 		}
-		for _, want := range []string{"narvi_list_models", "narvi_list_sessions", "narvi_get_session"} {
+		for _, want := range []string{"narvi_list_models", "narvi_list_sessions", "narvi_get_session", "narvi_get_session_status", "narvi_get_session_transcript"} {
 			if !strings.Contains(rec.Body.String(), want) {
 				t.Errorf("tools/list body does not mention %q: %s", want, rec.Body.String())
 			}
@@ -357,7 +357,7 @@ func TestBuild_MCPSurface_RealRouter(t *testing.T) {
 //
 // This test instead calls the REST route directly (with the user's cookie)
 // AND the matching tools/call (with a bearer token for the SAME user), for
-// all three tools, and
+// every tool, and
 // requires the two bodies to be canonically equal JSON -- a swapped twin
 // returns the wrong SHAPE, which fails this comparison immediately,
 // regardless of whether the wrong shape happens to contain "error".
@@ -417,6 +417,9 @@ func TestBuild_MCPSurface_TwinParity(t *testing.T) {
 	}
 	sessionID := session.ID.String()
 	bearer := mintBuildBearer(ctx, t, pool, cfg, user.ID)
+	// A second session with live work and a history, so the status and
+	// transcript rows compare real content.
+	busyID := seedLaggingSession(ctx, t, pool, user.ID, 3).String()
 
 	tests := []struct {
 		name        string
@@ -427,6 +430,8 @@ func TestBuild_MCPSurface_TwinParity(t *testing.T) {
 		{"narvi_list_models", "/api/models", "narvi_list_models", "{}"},
 		{"narvi_list_sessions", "/api/sessions?filter=all", "narvi_list_sessions", `{"filter":"all"}`},
 		{"narvi_get_session", "/api/sessions/" + sessionID, "narvi_get_session", fmt.Sprintf(`{"sessionId":%q}`, sessionID)},
+		{"narvi_get_session_status", "/api/sessions/" + busyID + "/status", "narvi_get_session_status", fmt.Sprintf(`{"sessionId":%q}`, busyID)},
+		{"narvi_get_session_transcript", "/api/sessions/" + busyID + "/events?limit=2", "narvi_get_session_transcript", fmt.Sprintf(`{"sessionId":%q,"limit":2}`, busyID)},
 	}
 
 	for _, tt := range tests {
@@ -464,6 +469,23 @@ func TestBuild_MCPSurface_TwinParity(t *testing.T) {
 			}
 			if env.Result == nil || env.Result.IsError {
 				t.Fatalf("tools/call %s: result = %+v, want a successful result", tt.toolName, env.Result)
+			}
+
+			if tt.toolName == "narvi_get_session_status" {
+				// observedAt is each snapshot's own clock; every other
+				// byte must match (assertStatusBytesEqual's doc comment).
+				var text struct {
+					Result struct {
+						Content []struct {
+							Text string `json:"text"`
+						} `json:"content"`
+					} `json:"result"`
+				}
+				if err := json.Unmarshal(callRec.Body.Bytes(), &text); err != nil || len(text.Result.Content) != 1 {
+					t.Fatalf("tools/call %s: body %s", tt.toolName, callRec.Body.String())
+				}
+				assertStatusBytesEqual(t, tt.name, restRec.Body.Bytes(), []byte(text.Result.Content[0].Text))
+				return
 			}
 
 			var restBody, mcpBody any

@@ -294,7 +294,7 @@
               "type": "string"
             },
             "status": {
-              "description": "Matches Postgres session_status exactly.",
+              "description": "Matches Postgres session_status exactly: the outcome derived when a turn last reached a terminal state -- 'created' until one has. It is not re-derived when a turn is queued or dispatched, so it does not show queued or running work: a first turn runs its whole life under 'created', and a follow-up turn is queued and runs under 'completed' or 'failed'. What the session is doing now is SessionActivity.activity, GET /api/sessions/{sessionID}/status.",
               "enum": [
                 "created",
                 "active",
@@ -346,7 +346,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Get one session's full detail by id -- the same detail GET /api/sessions/{sessionID} returns. Any authenticated role may read any session's detail; there is no per-session visibility restriction in this codebase today.",
+    "description": "Get one session's full detail by id -- the same detail GET /api/sessions/{sessionID} returns. Any authenticated role may read any session's detail; there is no per-session visibility restriction in this codebase today. Its status is the outcome derived when a turn last finished: it does not show queued or running work -- use narvi_get_session_status for what the session is doing now.",
     "inputSchema": {
       "additionalProperties": false,
       "description": "The narvi_get_session MCP tool's own input (technical plan §43.7) -- the tool bridge's twin of GET /api/sessions/{sessionID}, carrying the path parameter as a plain required field the bridge maps onto chi's own URLParams before invoking the twin handler in-process (technical plan §43.7's bridge).",
@@ -478,7 +478,7 @@
               "type": "string"
             },
             "status": {
-              "description": "Matches Postgres session_status exactly.",
+              "description": "Matches Postgres session_status exactly: the outcome derived when a turn last reached a terminal state -- 'created' until one has. It is not re-derived when a turn is queued or dispatched, so it does not show queued or running work: a first turn runs its whole life under 'created', and a follow-up turn is queued and runs under 'completed' or 'failed'. What the session is doing now is SessionActivity.activity, GET /api/sessions/{sessionID}/status.",
               "enum": [
                 "created",
                 "active",
@@ -519,6 +519,299 @@
         }
       },
       "$ref": "#/$defs/Session",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Compact state of one session -- the same state GET /api/sessions/{sessionID}/status returns: whether its work is queued, running, awaiting approval by a person, idle or finished (a queued or running turn is never reported as idle or finished), with suggestedDelaySeconds, how long to wait before reading it again. Does not include the transcript.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "description": "The narvi_get_session_status MCP tool's own input (technical plan §43.20) -- the tool bridge's twin of GET /api/sessions/{sessionID}/status, carrying the path parameter as a plain required field exactly like GetSessionToolRequest.",
+      "properties": {
+        "sessionId": {
+          "description": "The session id, matching Session.id's own format exactly. A malformed value fails argument validation before the twin is invoked, reported as a tool execution error (isError:true).",
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "type": "object"
+    },
+    "name": "narvi_get_session_status",
+    "outputSchema": {
+      "$defs": {
+        "SessionActivity": {
+          "additionalProperties": false,
+          "description": "GET /api/sessions/{sessionID}/status (technical plan §43.20): what one session's work is doing now, and how long to wait before reading it again. Derived at read time from the session's turn queue and its human gates, all read in ONE database snapshot -- never from Session.status, which is re-derived only when a turn reaches a terminal state and so reads 'created' or 'completed' while a turn is queued or running. Carries no events and no transcript: the event history is GET /api/sessions/{sessionID}/events (EventsResponse), a separate, paginated read.",
+          "properties": {
+            "activity": {
+              "description": "In precedence order: 'running' when a turn is dispatched or processing (turns may be queued behind it); else 'queued' when a turn is pending -- including the gap between one turn finishing and the next being dispatched, and a whole sandbox cold start; else 'awaiting_approval' when a person must act (a plan awaiting approval, a workflow step awaiting a decision, or a workflow run escalated for review); else 'idle' when the session has no turn at all; else 'finished' (at least one turn, every one terminal). A queued or running turn is never reported as idle or finished.",
+              "enum": [
+                "idle",
+                "queued",
+                "running",
+                "awaiting_approval",
+                "finished"
+              ],
+              "type": "string"
+            },
+            "archived": {
+              "type": "boolean"
+            },
+            "awaiting": {
+              "additionalProperties": false,
+              "description": "The human gate open on this session, if any, whatever activity says: activity is 'awaiting_approval' only when no turn is also queued or running. When more than one gate is open, a plan is reported first, then a workflow step, then an escalated workflow run.",
+              "properties": {
+                "id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "kind": {
+                  "description": "'plan': a plan awaiting approval (id is the plan's, decided through POST /api/sessions/{sessionID}/plans/{planId}/approve or reject); 'workflow_step': a workflow step awaiting a decision (id is the step run's); 'workflow_escalation': a workflow run escalated for review (id is the run's).",
+                  "enum": [
+                    "plan",
+                    "workflow_step",
+                    "workflow_escalation"
+                  ],
+                  "type": "string"
+                },
+                "since": {
+                  "description": "When the gate opened.",
+                  "format": "date-time",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "id",
+                "since"
+              ],
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "inFlightTurn": {
+              "additionalProperties": false,
+              "description": "The turn dispatched to a sandbox or being processed; null when none is.",
+              "properties": {
+                "dispatchedAt": {
+                  "description": "When the turn was dispatched.",
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "state": {
+                  "description": "'dispatched': handed to the sandbox, not yet confirmed started; 'processing': the agent is working on it.",
+                  "enum": [
+                    "dispatched",
+                    "processing"
+                  ],
+                  "type": "string"
+                },
+                "turnId": {
+                  "format": "uuid",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "turnId",
+                "state",
+                "dispatchedAt"
+              ],
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "lastRun": {
+              "additionalProperties": false,
+              "description": "The most recently created turn that reached a terminal state; null when none has.",
+              "properties": {
+                "failureReason": {
+                  "description": "Why the run did not complete, with Session.failureReason's values. A turn carries no reason of its own, so this is the session's recorded reason, given only when it can describe nothing but this run: the run is the session's newest turn, did not complete, and the session's recorded outcome is this run's. Null otherwise, and always null when the run completed.",
+                  "enum": [
+                    "cancelled",
+                    "failed",
+                    "timeout",
+                    "never_started",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "finishedAt": {
+                  "description": "When the run reached its terminal state; null when that was not recorded.",
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "outcome": {
+                  "enum": [
+                    "completed",
+                    "failed",
+                    "cancelled"
+                  ],
+                  "type": "string"
+                },
+                "turnId": {
+                  "format": "uuid",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "turnId",
+                "outcome",
+                "failureReason",
+                "finishedAt"
+              ],
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "observedAt": {
+              "description": "The database's clock when the snapshot was taken.",
+              "format": "date-time",
+              "type": "string"
+            },
+            "pendingTurns": {
+              "description": "How many turns are queued (pending), not yet dispatched to a sandbox.",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "sandboxStatus": {
+              "description": "The session's sandbox status in the same snapshot, with Session.sandboxStatus's values; null when the session has no sandbox yet. Informational, and an input to suggestedDelaySeconds while queued: activity never derives from it.",
+              "enum": [
+                "pending",
+                "spawning",
+                "connecting",
+                "booting",
+                "ready",
+                "snapshotting",
+                "suspect",
+                "stopped",
+                "failed",
+                null
+              ],
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sessionId": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "settled": {
+              "description": "true exactly when activity is idle, awaiting_approval or finished: nothing progresses server-side until a person acts or sends new input. Never true while a turn is queued or running.",
+              "type": "boolean"
+            },
+            "suggestedDelaySeconds": {
+              "description": "How long to wait before reading this status again, in whole seconds (rounded up): short while a turn is queued on a warm sandbox or running, longer while a sandbox starts or a person must act, longest once finished or idle -- always within the deployment's configured floor and ceiling (2 and 300 seconds as shipped). A hint that keeps polling quiet, never a limit: an earlier read is answered all the same.",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "sessionId",
+            "activity",
+            "settled",
+            "pendingTurns",
+            "inFlightTurn",
+            "awaiting",
+            "lastRun",
+            "sandboxStatus",
+            "archived",
+            "suggestedDelaySeconds",
+            "observedAt"
+          ],
+          "type": "object"
+        }
+      },
+      "$ref": "#/$defs/SessionActivity",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Paginated event history of one session -- the same page GET /api/sessions/{sessionID}/events returns, oldest first. Pass the previous page's nextCursor as cursor to read on; nextCursor is null on the last page. limit defaults to 100 and is capped at 500. Request it only when the detail is needed: narvi_get_session_status answers what the session is doing.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "description": "The narvi_get_session_transcript MCP tool's own input (technical plan §43.20) -- the tool bridge's twin of GET /api/sessions/{sessionID}/events?cursor=\u0026limit=, the paginated event history. sessionId becomes the path parameter; cursor and limit, when set, become the route's own query parameters, and when omitted leave the route's own defaults to run unchanged (from the beginning, 100 events per page).",
+      "properties": {
+        "cursor": {
+          "description": "Where the page starts: the previous page's EventsResponse.nextCursor, verbatim, or \"0\" (the default) for the beginning. An event id in decimal, a string like nextCursor itself; a value that names no 64-bit event id is the route's own 400, reported as a tool execution error.",
+          "pattern": "^(0|[1-9][0-9]{0,18})$",
+          "type": "string"
+        },
+        "limit": {
+          "description": "How many events per page. Omitted means the route's own default (100). minimum matches the route's own rejection of a value below one. Deliberately no \"maximum\": the route does not reject a larger value, it clamps it to 500, and tools/contractscompat's closed keyword allowlist does not recognize \"maximum\" (ListSessionsToolRequest.limit's own reasoning).",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "sessionId": {
+          "description": "The session id, matching Session.id's own format exactly.",
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "type": "object"
+    },
+    "name": "narvi_get_session_transcript",
+    "outputSchema": {
+      "$defs": {
+        "EventsResponse": {
+          "additionalProperties": false,
+          "description": "GET /api/sessions/:id/events (§6.3). Mirrors client-ws/v1's own FetchHistoryResponse shape exactly, for the same reason that schema gives: the full event-payload shape is assembled by later PRs, and REST/WS should not diverge on this envelope.",
+          "properties": {
+            "events": {
+              "items": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "nextCursor": {
+              "description": "Null when there are no more pages.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "events",
+            "nextCursor"
+          ],
+          "type": "object"
+        }
+      },
+      "$ref": "#/$defs/EventsResponse",
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "object"
     }

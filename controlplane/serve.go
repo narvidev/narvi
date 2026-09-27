@@ -2706,7 +2706,9 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 
 	// /mcp (technical plan §43, "the MCP surface"): the Streamable HTTP
 	// entry point for the read-only MCP tools -- narvi_list_models,
-	// narvi_list_sessions, narvi_get_session. Deliberately NOT under /api/
+	// narvi_list_sessions, narvi_get_session, and row 182's
+	// narvi_get_session_status and narvi_get_session_transcript (§43.20).
+	// Deliberately NOT under /api/
 	// (a protocol endpoint, the same category as /sessions/{sessionID}/ws
 	// or /webhooks/*) and mounted UNCONDITIONALLY regardless of
 	// cfg.MCPEnabled -- a surface that is off must be OBSERVABLE as off
@@ -2729,18 +2731,20 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// uses (§43.2) -- it reads token, grant, client and user in one lookup
 	// on every call, with no cache, and attaches the grant whose scopes
 	// decide which tools the request can see (§43.16/§43.17). Twins are the
-	// SAME three httpapi handlers /api/models and
-	// /api/sessions[/{sessionID}] above already register -- the bridge
-	// invokes them in-process, never a second implementation (§43.7;
-	// mcp/bridge.go's own doc comment).
+	// SAME httpapi handlers /api/models, /api/sessions[/{sessionID}] and
+	// /api/sessions/{sessionID}/{status,events} above already register --
+	// the bridge invokes them in-process, never a second implementation
+	// (§43.7; mcp/bridge.go's own doc comment).
 	mcpOriginGate, err := mcpadapter.RequireTrustedOrigin(mcpadapter.Config{PublicBaseURL: cfg.PublicBaseURL})
 	if err != nil {
 		return nil, fmt.Errorf("build mcp origin gate: %w", err)
 	}
 	mcpHandler, err := mcpadapter.NewHandler(mcpadapter.Config{PublicBaseURL: cfg.PublicBaseURL}, mcpadapter.Twins{
-		ListModels:   httpapi.GetModelCatalog(),
-		ListSessions: httpapi.ListSessions(sessionStore),
-		GetSession:   httpapi.GetSession(sessionStore),
+		ListModels:       httpapi.GetModelCatalog(),
+		ListSessions:     httpapi.ListSessions(sessionStore),
+		GetSession:       httpapi.GetSession(sessionStore),
+		GetSessionStatus: httpapi.GetSessionStatus(sessionStore, cfg.Timeouts),
+		ListEvents:       httpapi.ListEvents(sessionStore, eventStore),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("build mcp handler: %w", err)

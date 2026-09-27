@@ -557,7 +557,7 @@ func TestToolCall_TwinPanicIsRecovered(t *testing.T) {
 // never shared with an earlier one -- newTestHandler calls NewHandler
 // itself, which now compiles every tool's input schema EAGERLY, before
 // this function ever returns) receiving many concurrent, independent
-// tools/call requests, spread across all three tools and released
+// tools/call requests, spread across every tool and released
 // together, must run cleanly under -race and never crash the process.
 //
 // A prior revision of schemas.go compiled each tool's input $def LAZILY,
@@ -589,7 +589,7 @@ func TestToolCall_TwinPanicIsRecovered(t *testing.T) {
 // T1): see a PACKAGE-LEVEL lazy cache in the full suite. The handler
 // here is fresh, but a package-level cache outlives every handler, and
 // earlier tests in the same binary (Go runs them in file order, with no
-// shuffling by default) have already called all three tools and warmed
+// shuffling by default) have already called every tool and warmed
 // it -- so under `go test -race ./...` a reintroduced package-level lazy
 // compile passes this test; only an isolated run shows the race. A
 // cold-process re-exec would close that, but it needs os/exec, which
@@ -619,6 +619,8 @@ func TestToolCall_ConcurrentFirstCalls_NoRace(t *testing.T) {
 		{"narvi_list_models", "{}"},
 		{"narvi_list_sessions", `{"filter":"all","limit":5}`},
 		{"narvi_get_session", `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a"}`},
+		{"narvi_get_session_status", `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a"}`},
+		{"narvi_get_session_transcript", `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","cursor":"0","limit":10}`},
 	}
 
 	// Launched through errgroup.Group.Go, per technical plan §11 (no naked

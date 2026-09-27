@@ -30,11 +30,10 @@ import (
 // constructed by controlplane (the composition root), which alone holds
 // the Postgres stores those closures capture. This package never sees a
 // store type at all -- tools/lint/narvichecks' mcpimportban analyzer
-// enforces that structurally, and Twins' own shape (three
-// http.HandlerFunc fields, nothing else) is why the ban is possible: a
-// caller cannot even ATTEMPT to hand this package a *postgres.
-// SessionStore instead of a handler, because there is no field to put it
-// in.
+// enforces that structurally, and Twins' own shape (http.HandlerFunc
+// fields, nothing else) is why the ban is possible: a caller cannot even
+// ATTEMPT to hand this package a *postgres.SessionStore instead of a
+// handler, because there is no field to put it in.
 type Twins struct {
 	// ListModels is httpapi.GetModelCatalog() -- narvi_list_models' own
 	// twin.
@@ -45,6 +44,13 @@ type Twins struct {
 	// GetSession is httpapi.GetSession(sessionStore) -- narvi_get_session's
 	// own twin.
 	GetSession http.HandlerFunc
+	// GetSessionStatus is httpapi.GetSessionStatus(sessionStore, timeouts)
+	// -- narvi_get_session_status' own twin (technical plan §43.20).
+	GetSessionStatus http.HandlerFunc
+	// ListEvents is httpapi.ListEvents(sessionStore, eventStore) --
+	// narvi_get_session_transcript's own twin, the paginated event
+	// history (technical plan §43.20).
+	ListEvents http.HandlerFunc
 }
 
 // toolSpec is the ONLY place a tool is declared: its wire name, the
@@ -227,6 +233,59 @@ func buildGetSessionRequest(arguments json.RawMessage) (map[string]string, url.V
 	return map[string]string{"sessionID": in.SessionId}, nil, nil
 }
 
+// buildGetSessionStatusRequest is buildGetSessionRequest for
+// narvi_get_session_status: restdtos.GetSessionStatusToolRequest (whose
+// generated UnmarshalJSON enforces "sessionId" is present) mapped onto the
+// twin's own chi URL param, "sessionID". No query: the status twin reads
+// none.
+func buildGetSessionStatusRequest(arguments json.RawMessage) (map[string]string, url.Values, error) {
+	var in restdtos.GetSessionStatusToolRequest
+	if err := json.Unmarshal(arguments, &in); err != nil {
+		return nil, nil, err
+	}
+	return map[string]string{"sessionID": in.SessionId}, nil, nil
+}
+
+// transcriptArgs is buildGetSessionTranscriptRequest's own decode target
+// -- not restdtos.GetSessionTranscriptToolRequest, for listSessionsArgs'
+// reason: limit is a *json.Number so every integer spelling the schema
+// accepts reaches intFromJSONNumber, never encoding/json's narrower int
+// decoder.
+type transcriptArgs struct {
+	SessionID string       `json:"sessionId"`
+	Cursor    *string      `json:"cursor"`
+	Limit     *json.Number `json:"limit"`
+}
+
+// buildGetSessionTranscriptRequest maps narvi_get_session_transcript's
+// arguments onto GET /api/sessions/{sessionID}/events?cursor=&limit=
+// exactly as a client calling the route directly would: sessionId becomes
+// the chi URL param, and cursor/limit become query keys only when the
+// caller set them, so the twin's own defaults (from the beginning, 100 per
+// page, clamped at 500) run unchanged otherwise. cursor is passed through
+// verbatim -- the twin itself parses it and answers 400 for a value that
+// names no event id.
+func buildGetSessionTranscriptRequest(arguments json.RawMessage) (map[string]string, url.Values, error) {
+	var in transcriptArgs
+	if len(arguments) > 0 {
+		if err := json.Unmarshal(arguments, &in); err != nil {
+			return nil, nil, err
+		}
+	}
+	query := url.Values{}
+	if in.Cursor != nil {
+		query.Set("cursor", *in.Cursor)
+	}
+	if in.Limit != nil {
+		limit, ok := intFromJSONNumber(*in.Limit)
+		if !ok {
+			return nil, nil, &invalidArgumentError{msg: fmt.Sprintf("limit %s is not representable as a bounded whole number", in.Limit.String())}
+		}
+		query.Set("limit", strconv.Itoa(limit))
+	}
+	return map[string]string{"sessionID": in.SessionID}, query, nil
+}
+
 // toolSpecs is the tool table itself -- registerTools below and
 // TestEveryToolHasARegisteredTwin both read this SAME function (the
 // latter with a zero-value Twins{}, since it only ever inspects Twin.
@@ -255,7 +314,7 @@ func toolSpecs(twins Twins) []toolSpec {
 		},
 		{
 			Name:         "narvi_get_session",
-			Description:  "Get one session's full detail by id -- the same detail GET /api/sessions/{sessionID} returns. Any authenticated role may read any session's detail; there is no per-session visibility restriction in this codebase today.",
+			Description:  "Get one session's full detail by id -- the same detail GET /api/sessions/{sessionID} returns. Any authenticated role may read any session's detail; there is no per-session visibility restriction in this codebase today. Its status is the outcome derived when a turn last finished: it does not show queued or running work -- use narvi_get_session_status for what the session is doing now.",
 			Scope:        mcpscope.Read,
 			Instruction:  "narvi_get_session (one session's full detail)",
 			Twin:         twin{method: http.MethodGet, pathTemplate: "/api/sessions/{sessionID}", handler: twins.GetSession},
@@ -263,10 +322,30 @@ func toolSpecs(twins Twins) []toolSpec {
 			OutputDef:    "Session",
 			BuildRequest: buildGetSessionRequest,
 		},
+		{
+			Name:         "narvi_get_session_status",
+			Description:  "Compact state of one session -- the same state GET /api/sessions/{sessionID}/status returns: whether its work is queued, running, awaiting approval by a person, idle or finished (a queued or running turn is never reported as idle or finished), with suggestedDelaySeconds, how long to wait before reading it again. Does not include the transcript.",
+			Scope:        mcpscope.Read,
+			Instruction:  "narvi_get_session_status (what one session is doing now, and when to ask again)",
+			Twin:         twin{method: http.MethodGet, pathTemplate: "/api/sessions/{sessionID}/status", handler: twins.GetSessionStatus},
+			InputDef:     "GetSessionStatusToolRequest",
+			OutputDef:    "SessionActivity",
+			BuildRequest: buildGetSessionStatusRequest,
+		},
+		{
+			Name:         "narvi_get_session_transcript",
+			Description:  "Paginated event history of one session -- the same page GET /api/sessions/{sessionID}/events returns, oldest first. Pass the previous page's nextCursor as cursor to read on; nextCursor is null on the last page. limit defaults to 100 and is capped at 500. Request it only when the detail is needed: narvi_get_session_status answers what the session is doing.",
+			Scope:        mcpscope.Read,
+			Instruction:  "narvi_get_session_transcript (one session's event history, a page at a time)",
+			Twin:         twin{method: http.MethodGet, pathTemplate: "/api/sessions/{sessionID}/events", handler: twins.ListEvents},
+			InputDef:     "GetSessionTranscriptToolRequest",
+			OutputDef:    "EventsResponse",
+			BuildRequest: buildGetSessionTranscriptRequest,
+		},
 	}
 }
 
-// readOnlyAnnotations is shared by all three 180 tools (technical plan
+// readOnlyAnnotations is shared by every tool in the table (technical plan
 // §43.8): every one is a plain read, never destructive, always
 // idempotent, and never reaches outside this deployment ("open world").
 var readOnlyAnnotations = &sdkmcp.ToolAnnotations{
@@ -278,7 +357,7 @@ var readOnlyAnnotations = &sdkmcp.ToolAnnotations{
 
 func boolPtr(b bool) *bool { return &b }
 
-// toolInputDefs returns every 180 tool's own InputDef name, in table
+// toolInputDefs returns every tool's own InputDef name, in table
 // order -- the exact, complete set NewHandler must compile EAGERLY at
 // boot (schemas.go's own compileInputSchemas doc comment) before this
 // build can serve a single /mcp request, and the set newHandler

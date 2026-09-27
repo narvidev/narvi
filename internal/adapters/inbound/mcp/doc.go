@@ -1,6 +1,6 @@
 // Package mcp implements the MCP (Model Context Protocol) surface: the
-// entry point, transport, protocol-version gate, and the first three
-// tools (technical plan §43, "the MCP surface").
+// entry point, transport, protocol-version gate, and its read-only tools
+// (technical plan §43, "the MCP surface").
 //
 // # What this is, plainly
 //
@@ -15,9 +15,10 @@
 // issued (§43.16) -- decide which tools a request can even SEE
 // (§43.17, buildServer); they never widen what a tool may do, because
 // every tool runs its REST twin's own authorization against the user's
-// own role. Result/verdict tools, bounded wait, transcript paging, and the
-// plan/prompt/stop/delegate tools belong to later rows of the plan; none
-// of that is here.
+// own role. A session's live status and its paginated transcript are
+// here (§43.20, two bridges like the rest); the result/verdict tools, the
+// bounded wait, and the plan/prompt/stop/delegate tools belong to later
+// pieces and rows of the plan, and none of that is here.
 //
 // # Registration (controlplane/serve.go)
 //
@@ -130,7 +131,8 @@
 // # What is emphatically NOT here
 //
 // No repository discovery (needs a REST route this codebase does not
-// have yet, §43 D5). No result/verdict/wait/poll tools (182). No plan/
+// have yet, §43 D5). No result/verdict tool and no bounded wait (row 182's
+// later pieces). No plan/
 // delegate/prompt/stop tools (183). No OAuth endpoint of its own (the
 // authorization server is internal/adapters/inbound/mcpauth; this package
 // only reads the grant auth.RequireMCPBearer attached). No resources, no

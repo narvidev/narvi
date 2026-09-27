@@ -20,6 +20,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -28,6 +29,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/narvidev/narvi/contracts"
 	"github.com/narvidev/narvi/internal/adapters/inbound/auth"
 	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 	mcpadapter "github.com/narvidev/narvi/internal/adapters/inbound/mcp"
@@ -40,7 +42,8 @@ import (
 
 // mcpTestRig is this package's own rig: just enough real Postgres stores
 // to construct BOTH the REST routes (/api/models, /api/sessions,
-// /api/sessions/{sessionID}, cookie-authenticated) and the MCP route
+// /api/sessions/{sessionID}[/status|/events], cookie-authenticated) and
+// the MCP route
 // (/mcp) behind the same gates, in the same order, controlplane/serve.go
 // wires -- mcpadapter.RequireTrustedOrigin first, then RequireEnabled,
 // then auth.RequireMCPBearer (§43.2/§43.6) -- so a parity test compares
@@ -60,6 +63,8 @@ type mcpTestRig struct {
 	identities   *narvipg.IdentityStore
 	userSessions *narvipg.UserSessionStore
 	sessions     *narvipg.SessionStore
+	events       *narvipg.EventStore
+	turns        *narvipg.TurnStore
 	clients      *narvipg.MCPOAuthClientStore
 	grants       *narvipg.MCPOAuthGrantStore
 	ids          mcpauth.Identifiers
@@ -79,6 +84,8 @@ func newMCPTestRig(t *testing.T) *mcpTestRig {
 		identities:   narvipg.NewIdentityStore(pool),
 		userSessions: narvipg.NewUserSessionStore(pool),
 		sessions:     narvipg.NewSessionStore(pool),
+		events:       narvipg.NewEventStore(pool),
+		turns:        narvipg.NewTurnStore(pool),
 		clients:      narvipg.NewMCPOAuthClientStore(pool),
 		grants:       narvipg.NewMCPOAuthGrantStore(pool),
 	}
@@ -89,9 +96,11 @@ func newMCPTestRig(t *testing.T) *mcpTestRig {
 	rig.server = server
 
 	mcpHandler, err := mcpadapter.NewHandler(mcpadapter.Config{PublicBaseURL: baseURL}, mcpadapter.Twins{
-		ListModels:   httpapi.GetModelCatalog(),
-		ListSessions: httpapi.ListSessions(rig.sessions),
-		GetSession:   httpapi.GetSession(rig.sessions),
+		ListModels:       httpapi.GetModelCatalog(),
+		ListSessions:     httpapi.ListSessions(rig.sessions),
+		GetSession:       httpapi.GetSession(rig.sessions),
+		GetSessionStatus: httpapi.GetSessionStatus(rig.sessions, platform.DefaultTimeouts()),
+		ListEvents:       httpapi.ListEvents(rig.sessions, rig.events),
 	})
 	if err != nil {
 		t.Fatalf("mcpadapter.NewHandler: %v", err)
@@ -114,6 +123,8 @@ func newMCPTestRig(t *testing.T) *mcpTestRig {
 		r.Use(auth.Middleware(rig.userSessions, rig.users))
 		r.Get("/", httpapi.ListSessions(rig.sessions))
 		r.Get("/{sessionID}", httpapi.GetSession(rig.sessions))
+		r.Get("/{sessionID}/status", httpapi.GetSessionStatus(rig.sessions, platform.DefaultTimeouts()))
+		r.Get("/{sessionID}/events", httpapi.ListEvents(rig.sessions, rig.events))
 	})
 	router.Route("/mcp", func(r chi.Router) {
 		r.Use(mcpOriginGate)
@@ -690,7 +701,7 @@ func TestParity_ToolsListIsRoleIndependent(t *testing.T) {
 	// against the same fixed slice for all four roles below. Role does not
 	// gate discovery today (technical plan §43.17): every read tool is
 	// open to every role.
-	want := []string{"narvi_get_session", "narvi_list_models", "narvi_list_sessions"}
+	want := []string{"narvi_get_session", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions"}
 	for _, role := range []sqlcgen.UserRole{sqlcgen.UserRoleViewer, sqlcgen.UserRoleMember, sqlcgen.UserRoleMaintainer, sqlcgen.UserRoleAdmin} {
 		t.Run(string(role), func(t *testing.T) {
 			user, _ := createUserWithRole(ctx, t, rig, role)
@@ -783,6 +794,11 @@ func TestParity_BearerEqualsCookieForEveryRole(t *testing.T) {
 	rig := newMCPTestRig(t)
 	owner, _ := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMember)
 	othersSession := createSessionForUser(ctx, t, rig, owner.ID)
+	// Another user's session with live work and a history: a completed
+	// turn, a queued follow-up, and a few events -- so the status and
+	// transcript rows compare real content, not empty shapes.
+	seedBusySession(ctx, t, rig, othersSession.ID, 3)
+	const unknown = "00000000-0000-0000-0000-000000000000"
 
 	for _, role := range []sqlcgen.UserRole{sqlcgen.UserRoleViewer, sqlcgen.UserRoleMember, sqlcgen.UserRoleMaintainer, sqlcgen.UserRoleAdmin} {
 		t.Run(string(role), func(t *testing.T) {
@@ -799,6 +815,16 @@ func TestParity_BearerEqualsCookieForEveryRole(t *testing.T) {
 				{"get my session", "/api/sessions/" + own.ID.String(), "narvi_get_session", fmt.Sprintf(`{"sessionId":%q}`, own.ID.String())},
 				{"get another user's session", "/api/sessions/" + othersSession.ID.String(), "narvi_get_session", fmt.Sprintf(`{"sessionId":%q}`, othersSession.ID.String())},
 				{"get an unknown session", "/api/sessions/00000000-0000-0000-0000-000000000000", "narvi_get_session", `{"sessionId":"00000000-0000-0000-0000-000000000000"}`},
+				// Row 182 (technical plan §43.20): the status and the
+				// transcript, of the caller's own session, of another
+				// user's, and of one that does not exist.
+				{"status of my session", "/api/sessions/" + own.ID.String() + "/status", "narvi_get_session_status", fmt.Sprintf(`{"sessionId":%q}`, own.ID.String())},
+				{"status of another user's session", "/api/sessions/" + othersSession.ID.String() + "/status", "narvi_get_session_status", fmt.Sprintf(`{"sessionId":%q}`, othersSession.ID.String())},
+				{"status of an unknown session", "/api/sessions/" + unknown + "/status", "narvi_get_session_status", fmt.Sprintf(`{"sessionId":%q}`, unknown)},
+				{"transcript of my session", "/api/sessions/" + own.ID.String() + "/events", "narvi_get_session_transcript", fmt.Sprintf(`{"sessionId":%q}`, own.ID.String())},
+				{"transcript of another user's session", "/api/sessions/" + othersSession.ID.String() + "/events?limit=2", "narvi_get_session_transcript", fmt.Sprintf(`{"sessionId":%q,"limit":2}`, othersSession.ID.String())},
+				{"transcript of an unknown session", "/api/sessions/" + unknown + "/events", "narvi_get_session_transcript", fmt.Sprintf(`{"sessionId":%q}`, unknown)},
+				{"transcript with a cursor naming no event id", "/api/sessions/" + othersSession.ID.String() + "/events?cursor=9999999999999999999", "narvi_get_session_transcript", fmt.Sprintf(`{"sessionId":%q,"cursor":"9999999999999999999"}`, othersSession.ID.String())},
 			}
 			for _, tc := range cases {
 				var restBody json.RawMessage
@@ -811,6 +837,10 @@ func TestParity_BearerEqualsCookieForEveryRole(t *testing.T) {
 				case http.StatusOK:
 					if env.Result.IsError {
 						t.Fatalf("%s: REST 200 but MCP isError: %+v", tc.name, env.Result.Content)
+					}
+					if tc.tool == "narvi_get_session_status" {
+						assertStatusParity(t, tc.name, restBody, env.Result.StructuredContent)
+						continue
 					}
 					assertCanonicalJSONEqual(t, tc.name, restBody, env.Result.StructuredContent)
 				default:
@@ -846,5 +876,164 @@ func TestParity_DisabledUser(t *testing.T) {
 	}
 	if status, _ := rig.callTool(t, "narvi_list_models", "{}", bearer); status != http.StatusUnauthorized {
 		t.Fatalf("MCP after disable: status %d, want 401", status)
+	}
+}
+
+// seedBusySession gives sessionID a completed turn, a queued follow-up,
+// and n events -- a session whose row still says "created" while a turn
+// waits, and a transcript longer than one small page.
+func seedBusySession(ctx context.Context, t *testing.T, r *mcpTestRig, sessionID pgtype.UUID, n int) {
+	t.Helper()
+	done, err := r.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: sessionID, Status: sqlcgen.TurnStatusPending})
+	if err != nil {
+		t.Fatalf("create turn: %v", err)
+	}
+	if _, err := r.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: done.ID, Status: sqlcgen.TurnStatusCompleted, CompletedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true}}); err != nil {
+		t.Fatalf("complete turn: %v", err)
+	}
+	if _, err := r.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: sessionID, Status: sqlcgen.TurnStatusPending}); err != nil {
+		t.Fatalf("create follow-up: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		if _, err := r.events.Create(ctx, sqlcgen.CreateEventParams{
+			SessionID: sessionID,
+			Type:      "token",
+			MessageID: fmt.Sprintf("parity-%s-%d", sessionID.String(), i),
+			Payload:   []byte(fmt.Sprintf(`{"n":%d}`, i)),
+		}); err != nil {
+			t.Fatalf("create event %d: %v", i, err)
+		}
+	}
+}
+
+// sessionActivityProperties is SessionActivity's own property set, read
+// from the embedded contract: the status body carries exactly these keys,
+// so no transcript (or anything else) rides along with it.
+func sessionActivityProperties(t *testing.T) []string {
+	t.Helper()
+	data, err := contracts.FS.ReadFile("rest/v1/dtos.schema.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Defs map[string]struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+		} `json:"$defs"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(doc.Defs["SessionActivity"].Properties))
+	for name := range doc.Defs["SessionActivity"].Properties {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// assertStatusParity is assertCanonicalJSONEqual for a status body:
+// observedAt is each snapshot's own database clock, so two reads never
+// share it -- it is compared for order (the REST read came first), and
+// every other byte must be equal. Both bodies carry exactly
+// SessionActivity's keys: no events, no transcript.
+func assertStatusParity(t *testing.T, label string, restBody, mcpBody []byte) {
+	t.Helper()
+	var rest, viaMCP map[string]any
+	if err := json.Unmarshal(restBody, &rest); err != nil {
+		t.Fatalf("%s: unmarshal REST body: %v (%s)", label, err, restBody)
+	}
+	if err := json.Unmarshal(mcpBody, &viaMCP); err != nil {
+		t.Fatalf("%s: unmarshal MCP structuredContent: %v (%s)", label, err, mcpBody)
+	}
+	want := sessionActivityProperties(t)
+	for side, body := range map[string]map[string]any{"REST": rest, "MCP": viaMCP} {
+		keys := make([]string, 0, len(body))
+		for k := range body {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		if strings.Join(keys, ",") != strings.Join(want, ",") {
+			t.Fatalf("%s: %s status keys = %v, want exactly SessionActivity's %v", label, side, keys, want)
+		}
+	}
+	restAt, err1 := time.Parse(time.RFC3339Nano, fmt.Sprint(rest["observedAt"]))
+	mcpAt, err2 := time.Parse(time.RFC3339Nano, fmt.Sprint(viaMCP["observedAt"]))
+	if err1 != nil || err2 != nil || mcpAt.Before(restAt) {
+		t.Fatalf("%s: observedAt REST %v MCP %v (errs %v, %v), want two timestamps, the MCP read's not before the REST read's", label, rest["observedAt"], viaMCP["observedAt"], err1, err2)
+	}
+	delete(rest, "observedAt")
+	delete(viaMCP, "observedAt")
+	restCanon, _ := json.Marshal(rest)
+	mcpCanon, _ := json.Marshal(viaMCP)
+	if string(restCanon) != string(mcpCanon) {
+		t.Errorf("%s: REST and MCP status bodies differ beyond observedAt.\nREST: %s\nMCP:  %s", label, restCanon, mcpCanon)
+	}
+}
+
+// TestParity_GetSessionTranscript_CursorWalkEqualsREST walks a session's
+// whole transcript a page at a time twice -- through the REST route with a
+// cookie, and through narvi_get_session_transcript with a bearer token for
+// the same user, each following its own nextCursor -- for every role: the
+// pages, and the cursors between them, are identical, and both walks end
+// on the same last page with nextCursor null.
+func TestParity_GetSessionTranscript_CursorWalkEqualsREST(t *testing.T) {
+	ctx := context.Background()
+	rig := newMCPTestRig(t)
+	owner, _ := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMember)
+	sess := createSessionForUser(ctx, t, rig, owner.ID)
+	seedBusySession(ctx, t, rig, sess.ID, 7)
+
+	type page struct {
+		Events     []json.RawMessage `json:"events"`
+		NextCursor *string           `json:"nextCursor"`
+	}
+	for _, role := range []sqlcgen.UserRole{sqlcgen.UserRoleViewer, sqlcgen.UserRoleMember, sqlcgen.UserRoleMaintainer, sqlcgen.UserRoleAdmin} {
+		t.Run(string(role), func(t *testing.T) {
+			user, cookie := createUserWithRole(ctx, t, rig, role)
+			bearer := mintMCPToken(ctx, t, rig, user.ID, []string{"mcp:read"})
+
+			var restCursor, mcpCursor *string
+			pages, events := 0, 0
+			for {
+				path := "/api/sessions/" + sess.ID.String() + "/events?limit=3"
+				args := fmt.Sprintf(`{"sessionId":%q,"limit":3}`, sess.ID.String())
+				if restCursor != nil {
+					path += "&cursor=" + *restCursor
+					args = fmt.Sprintf(`{"sessionId":%q,"limit":3,"cursor":%q}`, sess.ID.String(), *mcpCursor)
+				}
+				var restRaw json.RawMessage
+				if status := rig.doJSON(t, http.MethodGet, path, nil, &restRaw, cookie); status != http.StatusOK {
+					t.Fatalf("REST page %d: status %d", pages, status)
+				}
+				mcpStatus, env := rig.callTool(t, "narvi_get_session_transcript", args, bearer)
+				if mcpStatus != http.StatusOK || env.Result == nil || env.Result.IsError {
+					t.Fatalf("MCP page %d: status %d result %+v", pages, mcpStatus, env.Result)
+				}
+				assertCanonicalJSONEqual(t, fmt.Sprintf("page %d", pages), restRaw, env.Result.StructuredContent)
+
+				var restPage, mcpPage page
+				if err := json.Unmarshal(restRaw, &restPage); err != nil {
+					t.Fatal(err)
+				}
+				if err := json.Unmarshal(env.Result.StructuredContent, &mcpPage); err != nil {
+					t.Fatal(err)
+				}
+				pages++
+				events += len(restPage.Events)
+				restCursor, mcpCursor = restPage.NextCursor, mcpPage.NextCursor
+				if (restCursor == nil) != (mcpCursor == nil) || (restCursor != nil && *restCursor != *mcpCursor) {
+					t.Fatalf("page %d: nextCursor REST %v MCP %v, want equal", pages, restCursor, mcpCursor)
+				}
+				if restCursor == nil {
+					break
+				}
+				if pages > 10 {
+					t.Fatal("the walk did not end")
+				}
+			}
+			if pages != 3 || events != 7 {
+				t.Fatalf("walked %d pages and %d events, want 3 pages (3+3+1) and 7 events", pages, events)
+			}
+		})
 	}
 }

@@ -45,9 +45,10 @@ var loadedRestDefs = sync.OnceValues(func() (map[string]json.RawMessage, error) 
 // inputSchema returns name's own $def entry from rest/v1/dtos.schema.json
 // VERBATIM -- unmarshaled into a map so the SDK's own mcp.Tool.InputSchema
 // field (type any) can hold it directly, but otherwise untouched: no
-// bundling, no rewriting. This is deliberate (technical plan §43.10): our
-// three input shapes (ListModelsToolRequest, ListSessionsToolRequest,
-// GetSessionToolRequest) reference no OTHER $def, so the wire inputSchema
+// bundling, no rewriting. This is deliberate (technical plan §43.10): no
+// tool's input shape (ListModelsToolRequest, ListSessionsToolRequest,
+// GetSessionToolRequest, GetSessionStatusToolRequest,
+// GetSessionTranscriptToolRequest) references another $def, so the wire inputSchema
 // a client sees is byte-derived from /contracts with nothing added or
 // removed. TestToolInputSchemas_ComeFromContracts pins exactly this: each
 // tool's InputSchema deep-equals this function's own return value.
@@ -74,9 +75,9 @@ func inputSchema(name string) (map[string]any, error) {
 // "ModelCatalogCost"), so a client holding ONLY this document -- with no
 // access to fetch rest/v1/dtos.schema.json itself -- can still resolve
 // every "#/$defs/<Name>" reference name's own sub-schema contains. Used
-// for the three tools' OutputSchema (Session, ListSessionsResponse,
-// ModelCatalog are all reused UNCHANGED from /contracts, never a
-// hand-written shape -- technical plan §43.10).
+// for every tool's OutputSchema (Session, ListSessionsResponse,
+// ModelCatalog, SessionActivity, EventsResponse are all reused UNCHANGED
+// from /contracts, never a hand-written shape -- technical plan §43.10).
 //
 // The bundled document's shape is:
 //
@@ -276,8 +277,8 @@ var errArgumentsNotJSONObject = fmt.Errorf("arguments must be a JSON object")
 // time -- never here, and never against a schema this function compiles
 // itself: see compileInputSchemas' own doc comment for why compiling on
 // the request path at all is the defect this closes). An empty/absent
-// value is treated as "{}": every one of this package's three input
-// $defs is {"type":"object",...}, and GetSessionToolRequest's own
+// value is treated as "{}": every one of this package's input $defs is
+// {"type":"object",...}, and GetSessionToolRequest's own
 // "required": ["sessionId"] must still fire when the caller sends no
 // arguments at all, exactly as it would for a truly empty object.
 // Concurrent calls against the SAME schema value need no lock --
@@ -309,14 +310,15 @@ func validateArguments(schema *jsonschema.Schema, raw json.RawMessage) error {
 // own MAGNITUDE, not by how many bytes it took to write it: an exponent
 // form like "1e1000000" is 9 bytes on the wire but a natural with roughly
 // 2.3 million BITS, computed from scratch, three times, for a single
-// request -- roughly 50ms of CPU measured against the real stack, for a
-// tool whose only numeric field (ListSessionsToolRequest.limit) has no
-// legitimate use for a value outside 1..200. MaxRequestBodyBytes
+// request -- roughly 50ms of CPU measured against the real stack, for
+// tools whose only numeric fields (ListSessionsToolRequest.limit,
+// GetSessionTranscriptToolRequest.limit) have no legitimate use for a
+// value outside 1..500. MaxRequestBodyBytes
 // (versions.go) bounds a LONG DIGIT STRING (finding N7's own original
 // vector) because that shape's cost genuinely scales with its own text
 // length; it does nothing for an exponent, whose text stays tiny while
 // its value explodes. Both bounds here are deliberately far more
-// generous than anything this package's three schemas could ever
+// generous than anything this package's input schemas could ever
 // legitimately need, so nothing legitimate is lost.
 const (
 	maxJSONNumberTokenLen = 32
