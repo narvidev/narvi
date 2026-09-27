@@ -144,6 +144,53 @@ func TestWait_ClampsToMaxDuration(t *testing.T) {
 	}
 }
 
+// TestWait_TakesAFreshReadAtTheClamp (review round 1's P3): when the bound
+// comes, the wait reads once more and answers that read, so a session that
+// settled after the last poll and before the clamp is answered settled,
+// never a stale timeout. The fake settles right after a given read returns
+// unsettled -- deterministic, no race against the clock. Two shapes: the
+// shipped waitSeconds=1 against a one-second poll, scaled down, where the
+// clamp comes before the first poll and is the only read after the first;
+// and a poll the clamp cuts short. Mutation: the loop answering "timeout"
+// once the deadline has passed at a timer, without that last read (one
+// read short, reason timeout).
+func TestWait_TakesAFreshReadAtTheClamp(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		maxDuration time.Duration
+		poll        time.Duration
+		settleAfter int64 // the session settles once this read has returned unsettled
+		wantReads   int64
+	}{
+		{"the clamp comes before the first poll", 200 * time.Millisecond, time.Second, 1, 2},
+		{"the clamp cuts the last poll short", 700 * time.Millisecond, 500 * time.Millisecond, 2, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config()
+			cfg.MaxDuration, cfg.PollInterval = tc.maxDuration, tc.poll
+			w := sessionactivity.NewWaiter(cfg)
+			var settled atomic.Bool
+			var reads atomic.Int64
+			out, err := w.Wait(context.Background(), k, 1, func(context.Context) (bool, error) {
+				now := settled.Load()
+				if reads.Add(1) == tc.settleAfter {
+					settled.Store(true)
+				}
+				return now, nil
+			})
+			if err != nil || out.Reason != sessionactivity.ReasonSettled {
+				t.Fatalf("Wait = %+v, %v after %d reads, want the read at the clamp answered: settled", out, err, reads.Load())
+			}
+			if reads.Load() != tc.wantReads {
+				t.Fatalf("%d reads, want %d: the last one at the clamp", reads.Load(), tc.wantReads)
+			}
+			if out.Waited < tc.maxDuration {
+				t.Fatalf("Waited = %v, want the answer taken at the clamp, %v", out.Waited, tc.maxDuration)
+			}
+		})
+	}
+}
+
 // TestWait_ReturnsWithinOnePollOfSettling: the wait blocks while the
 // session is unsettled and answers "settled" within about one poll of it
 // settling, with the time it waited.
