@@ -156,6 +156,19 @@ the last finished turn ended, and `suggestedDelaySeconds`: how long to
 wait before asking again (2 to 300 seconds). It never carries the
 session's events — read those, a page at a time, from the events route.
 
+To wait for a session instead of asking again and again, add
+`?waitSeconds=N`: the route reads the status at once and then about
+every second, and answers as soon as `settled` is true — or, once N
+seconds have passed (25 at most), with the latest status. A queued,
+running, delivering or scheduled session never ends the wait early. The
+answer is the same status with a `wait` object: its `reason` is
+`settled`, `timeout` (still not settled — wait again), `interrupted`
+(the server is restarting — wait again) or `capacity` (two of your waits
+are already running, or the server runs as many as it allows, so this
+one answered at once), and `waitedMs` says
+how long it waited. No `waitSeconds`, or `0`, is the plain read; a
+negative or malformed value is refused.
+
 ```json narvi-command
 {"name": "Get what a session is doing now, and when to ask again", "route": "GET /api/sessions/{sessionID}/status"}
 ```
