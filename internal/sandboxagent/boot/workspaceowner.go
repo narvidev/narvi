@@ -12,6 +12,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+
+	"golang.org/x/sys/unix"
 )
 
 // On the asymmetry between this and the credential itself, which is why
@@ -37,114 +39,313 @@ import (
 // credential has a privilege-free guard and this does not -- but the
 // reason had to be corrected before it could be relied on again.
 
-// ChownWorkspaceForRuntime recursively changes the owner of every entry
-// under workspaceDir to uid/gid -- the SAME uid/gid
+// ChownWorkspaceForRuntime recursively changes the owner of workspaceDir
+// and of every entry under it to uid/gid -- the SAME uid/gid
 // cmd/sandbox-agent/main.go builds the agent runtime's own *syscall.
 // Credential from (boot.Config.RuntimeUID/RuntimeGID).
 //
-// Why this exists at all: everything under workspaceDir up to this point
-// -- the clone itself (internal/sandboxagent/gitclone.CloneAll), every
-// repo-configured setup hook, every services.yml command, the generated
-// AGENTS.md manifest and opencode.json config -- is written by
-// sandbox-agent's OWN trusted process (git clone/hooks/services all run
-// via supervisor.Spec's own nil-Credential default, sandbox-agent's own
-// identity; see supervisor.Spec.Credential's own doc comment for why
-// that is correct, not an oversight). Left untouched, those files would
-// stay owned by sandbox-agent's own uid with an ordinary umask -- world
-// or group READABLE in the common case, but not group/other WRITABLE --
-// which would leave the isolated runtime able to read the workspace but
-// not edit files, `git commit`, or run a build, silently breaking the one
-// piece of legitimate agent behavior §30.5 explicitly requires be
-// preserved. This call closes that gap by re-owning the entire tree to
-// the runtime's own uid/gid, once, after every boot-time writer
-// (gitclone, hooks, services, the manifest writer) has already finished
-// and before the WS bridge would ever let a "prompt" command reach the
-// runtime -- see this function's own call site in
-// cmd/sandbox-agent/main.go for the exact ordering.
+// Why this exists at all: the clone (internal/sandboxagent/gitclone.
+// CloneAll), every repo-configured setup hook, and the generated AGENTS.md
+// manifest and opencode.json config are written by sandbox-agent's OWN
+// process, under its own identity (supervisor.Spec's nil-Credential
+// default; see supervisor.Spec.Credential's own doc comment for why that
+// is correct, not an oversight). services.yml commands are the exception:
+// RunBoot drops them to the runtime's credential. Left untouched, what
+// sandbox-agent wrote would stay owned by sandbox-agent's own uid with an
+// ordinary umask -- world or group READABLE in the common case, but not
+// group/other WRITABLE -- which would leave the isolated runtime able to
+// read the workspace but not edit files, `git commit`, or run a build,
+// silently breaking the one piece of legitimate agent behavior §30.5
+// explicitly requires be preserved.
 //
-// Lchown (never Chown/os.Chown, which follows a symlink to its target)
-// is deliberate: workspaceDir's own content is CUSTOMER-CONTROLLED git
-// repo content by the time this walks it, and a repo-authored symlink
-// pointing outside workspaceDir (e.g. at an arbitrary absolute path) must
-// never cause this call to re-own a file outside the tree it was asked
-// to re-own -- Lchown changes the ownership of the symlink INODE ITSELF,
-// never whatever it points at.
+// It can run several times per boot, and never on a tree it can assume is
+// quiet. Its callers are gitclone.CloneAll's chownRepo (per freshly cloned
+// repo), RunBoot's chownWorkspace (per repo that has services.yml commands,
+// just before they start) and run()'s post-boot pass over the whole
+// workspace in cmd/sandbox-agent, which precedes the WS bridge ever letting
+// a "prompt" reach the runtime. By RunBoot's pass for a repo, the
+// services.yml processes of the repos before it are already running as
+// the runtime uid; by the post-boot pass all of them are, alongside
+// opencode serve. Those processes own what the earlier passes handed
+// them, and write in it while this walks it: lock and temp files created
+// and removed, cache directories reset -- and, if a repo's own services.yml
+// is hostile, a directory swapped for a symlink.
 //
-// A partial failure (one entry's Lchown erroring, e.g. a filesystem
-// quirk) aborts the whole walk immediately and returns that error,
-// wrapped -- this function's own caller treats any error here as fatal
-// to boot (see that call site's own comment for why: a partially
-// re-owned workspace is worse than a clearly-failed boot).
+// So the walk never resolves a path through a name such a writer could
+// have changed (chownTree). workspaceDir is opened O_DIRECTORY|O_NOFOLLOW;
+// every directory is listed from its own open fd; the walk descends only
+// through openat(dirfd, name, O_DIRECTORY|O_NOFOLLOW) and re-owns each
+// directory through the fd that opened it; and every other entry is
+// re-owned with fchownat(dirfd, name, AT_SYMLINK_NOFOLLOW). A symlink --
+// repo-authored, or planted where a directory was listed a moment before --
+// is never followed, listed or descended through (if it is there when its
+// name is re-owned, the link's own inode is what gets re-owned), and a
+// parent renamed away or swapped mid-walk changes nothing for the entries
+// under it, because the walk holds the directory it actually opened rather
+// than the name it opened it by. What the walk re-owns is exactly the set
+// of inodes reachable as entries of directories it opened by descent from
+// workspaceDir. The path-based walk this replaced (filepath.WalkDir with
+// os.Lchown) resolved every parent component again at each call: Lchown
+// declines to follow only the LAST component, and os.ReadDir follows a
+// directory swapped for a symlink after it was listed, so a runtime-uid
+// writer could make root list and re-own a directory outside the
+// workspace, of which the credential cache is a plausible choice.
 //
-// An entry that disappears between being listed and being re-owned is
-// not such a failure: there is nothing left to re-own. The walk runs
-// while other processes may be writing in the tree -- cmd/sandbox-agent's
-// post-boot pass covers every repository after RunBoot has already started
-// its services.yml processes, and opencode serve is already running -- and
-// a lock or temp file created and removed under it (git's own index.lock
-// and HEAD.lock among them) used to fail the whole boot with ENOENT. See
-// lchownEntry for how a vanished entry is told apart from any other
-// ENOENT. workspaceDir itself must still exist.
+// Two limits, named so they are not mistaken for closed. The components of
+// the path this is given, other than the last, are resolved by name once,
+// at the first open, and trusted: every directory holding one of them must
+// be writable by root alone. That holds for the default /workspace, where
+// the only such name in a per-repo call's /workspace/<repo> is workspace
+// itself, an entry of /. And an inode hard-linked into the tree is
+// re-owned under every name it has, inside the tree or not -- what that
+// allows is bounded by what the kernel lets the runtime hard-link
+// (fs.protected_hardlinks), not by this walk.
+//
+// An entry that disappears before the walk reaches it is not a failure:
+// there is nothing left to re-own. ENOENT for a name in a directory the
+// walk holds open -- from fstatat, fchownat or openat -- skips that entry,
+// and ENOENT on a directory's own fd, once the directory has been removed
+// after the walk opened it, skips that directory; no path is resolved
+// again to double-check either. An entry created after the walk listed its
+// directory is not re-owned by this pass, which re-owns a
+// snapshot: the writers it runs beside are the runtime's own processes, so
+// what they create is already the runtime's. workspaceDir itself must
+// still exist, and must be a directory rather than a symlink to one.
+//
+// Any other failure (an entry that cannot be re-owned, a directory that
+// cannot be opened or listed, a tree deeper than maxChownDepth) aborts the
+// whole walk immediately and returns that error, wrapped -- this
+// function's own callers treat any error here as fatal to boot (see the
+// post-boot call site's own comment for why: a partially re-owned
+// workspace is worse than a clearly-failed boot).
 func ChownWorkspaceForRuntime(workspaceDir string, uid, gid uint32) error {
-	return chownTree(workspaceDir, uid, gid, os.Lchown)
+	return chownTree(workspaceDir, uid, gid, maxChownDepth, nil)
 }
 
-// chownTree is ChownWorkspaceForRuntime with its Lchown call injectable, so
-// a test can make an entry vanish at exactly the point a concurrent writer
-// would.
-func chownTree(workspaceDir string, uid, gid uint32, lchown func(path string, uid, gid int) error) error {
-	err := filepath.WalkDir(workspaceDir, func(path string, _ fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			// A directory listed by its parent but removed before it could
-			// be read. Never the root: a missing workspaceDir is an error.
-			if path != workspaceDir && errors.Is(walkErr, fs.ErrNotExist) && isGone(path) {
-				return nil
-			}
-			return walkErr
-		}
-		return lchownEntry(path, int(uid), int(gid), lchown)
-	})
-	if err != nil {
+// maxChownDepth bounds how many directory levels below workspaceDir the
+// walk descends. The walk holds one open directory fd per level between
+// workspaceDir and the directory it is in -- that is what makes it immune
+// to a parent being renamed -- so this is also the bound on how many fds
+// it holds at once. A deeper tree fails the walk, and boot, rather than
+// being re-owned in part. Not a timeout: nothing here waits.
+const maxChownDepth = 1024
+
+// errTreeTooDeep is what the walk reports for a tree deeper than its bound.
+var errTreeTooDeep = errors.New("directory tree is deeper than the re-own walk descends")
+
+// walkPoint names a moment in the walk at which a concurrent writer's
+// change to the tree matters. A test hooks each one to make that change
+// happen exactly there; production passes no hook.
+type walkPoint int
+
+const (
+	// beforeEntry: an entry has been listed, and the walk is about to look
+	// at what it is.
+	beforeEntry walkPoint = iota
+	// beforeChown: an entry that was not a directory when the walk looked
+	// is about to be re-owned.
+	beforeChown
+	// beforeDescend: an entry that was a directory is about to be opened,
+	// re-owned through that fd, and listed.
+	beforeDescend
+	// beforeList: a directory has been opened and re-owned and is about to
+	// be listed.
+	beforeList
+)
+
+// chownTree is ChownWorkspaceForRuntime with its depth bound and a hook
+// injectable. hook, when non-nil, is called with the entry's path at each
+// walkPoint; the path is for the hook and for error messages only, and is
+// never passed to a system call.
+func chownTree(workspaceDir string, uid, gid uint32, maxDepth int, hook func(walkPoint, string)) error {
+	w := treeWalker{uid: int(uid), gid: int(gid), maxDepth: maxDepth, hook: hook}
+	if err := w.walk(workspaceDir); err != nil {
 		return fmt.Errorf("boot: chown workspace %s for runtime uid=%d gid=%d: %w", workspaceDir, uid, gid, err)
 	}
 	return nil
 }
 
-// lchownVanishAttempts bounds how many times lchownEntry retries a path that
-// reported ENOENT yet still exists -- a name recreated by a concurrent writer
-// between the failed call and the check (git recreates index.lock on every
-// operation). Not a timeout: nothing here waits.
-const lchownVanishAttempts = 3
-
-// lchownEntry re-owns one walked entry, treating "it no longer exists" as
-// done rather than as an error.
-//
-// Lchown never resolves a symlink, so an ENOENT from it can only mean the
-// entry itself was gone at the moment of the call. That is confirmed with a
-// fresh Lstat before anything is skipped. An entry that is still there was
-// recreated in between and is re-owned again; one that keeps reporting
-// ENOENT while existing -- which only a symlink-FOLLOWING chown can do, on a
-// dangling link -- is returned as the error it is, so replacing Lchown with
-// Chown still fails loudly (TestChownWorkspaceForRuntime_DoesNotFollowSymlinks).
-func lchownEntry(path string, uid, gid int, lchown func(path string, uid, gid int) error) error {
-	var err error
-	for range lchownVanishAttempts {
-		err = lchown(path, uid, gid)
-		if err == nil || !errors.Is(err, fs.ErrNotExist) {
-			return err
-		}
-		if isGone(path) {
-			return nil
-		}
-	}
-	return err
+type treeWalker struct {
+	uid, gid int
+	maxDepth int
+	hook     func(walkPoint, string)
 }
 
-// isGone reports whether path does not exist right now (never following a
-// symlink).
-func isGone(path string) bool {
-	_, err := os.Lstat(path)
-	return errors.Is(err, fs.ErrNotExist)
+// dirFrame is one directory the walk holds open.
+type dirFrame struct {
+	dir  *os.File // owns fd
+	fd   int
+	path string // for errors and hooks only
+	// subdirs are the entries that were directories when the walk looked,
+	// still to be opened, re-owned and descended into.
+	subdirs []string
+}
+
+func (w *treeWalker) at(point walkPoint, path string) {
+	if w.hook != nil {
+		w.hook(point, path)
+	}
+}
+
+// walk re-owns root and everything under it, depth first, with an explicit
+// stack rather than recursion: the stack holds one frame per open level.
+func (w *treeWalker) walk(root string) error {
+	rootDir, err := openDirNoFollow(unix.AT_FDCWD, root, root)
+	if err != nil {
+		return &fs.PathError{Op: "open", Path: root, Err: err}
+	}
+	stack := []dirFrame{{dir: rootDir, fd: int(rootDir.Fd()), path: root}}
+	defer func() {
+		for i := range stack {
+			_ = stack[i].dir.Close()
+		}
+	}()
+
+	// Unlike any directory under it, the root vanishing is an error.
+	if _, err := w.enter(&stack[0]); err != nil {
+		return err
+	}
+
+	for len(stack) > 0 {
+		top := len(stack) - 1
+		if len(stack[top].subdirs) == 0 {
+			_ = stack[top].dir.Close()
+			stack = stack[:top]
+			continue
+		}
+		parentFD, parentPath := stack[top].fd, stack[top].path
+		name := stack[top].subdirs[0]
+		stack[top].subdirs = stack[top].subdirs[1:]
+		path := filepath.Join(parentPath, name)
+
+		w.at(beforeDescend, path)
+		child, err := openDirNoFollow(parentFD, name, path)
+		switch {
+		case err == nil:
+		case errors.Is(err, unix.ENOENT), errors.Is(err, unix.ENOTDIR), errors.Is(err, unix.ELOOP):
+			// Gone, or no longer a directory, since the walk looked at it: a
+			// symlink or anything else put in its place is never descended
+			// through, and was put there after the walk had passed.
+			continue
+		default:
+			return &fs.PathError{Op: "openat", Path: path, Err: err}
+		}
+		stack = append(stack, dirFrame{dir: child, fd: int(child.Fd()), path: path})
+		if depth := len(stack) - 1; depth > w.maxDepth {
+			return fmt.Errorf("%s: %w (more than %d levels)", path, errTreeTooDeep, w.maxDepth)
+		}
+		if gone, err := w.enter(&stack[len(stack)-1]); gone {
+			// Removed after it was opened: every entry it had went with it,
+			// since a directory is only removed once it is empty.
+			continue
+		} else if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// enter re-owns the directory open in f, lists it from that same fd, and
+// re-owns every entry in it that is not a directory, recording the ones
+// that are: each of those is opened, and re-owned through that fd, when
+// the walk descends into it. A directory is re-owned through its fd rather
+// than by name so that the directory re-owned is the one whose entries the
+// walk then re-owns, whatever its name names by now -- and because APFS
+// answers a chown by name of a directory being removed during the call
+// with EINVAL instead of ENOENT, where a chown through an fd it already
+// holds succeeds.
+//
+// gone reports that the directory itself was removed after it was opened,
+// and err is then the error that said so. Only an operation on the
+// directory's own fd can say that -- fchown, which APFS fails with ENOENT
+// when the directory is removed while it runs, or listing, which Linux
+// fails with ENOENT on a removed directory (darwin lists it as empty). An
+// ENOENT for an entry in it is skipped here, never returned, so it is never
+// mistaken for the whole directory being gone.
+func (w *treeWalker) enter(f *dirFrame) (gone bool, err error) {
+	if err := fchown(f.fd, w.uid, w.gid); err != nil {
+		return errors.Is(err, unix.ENOENT), &fs.PathError{Op: "fchown", Path: f.path, Err: err}
+	}
+	w.at(beforeList, f.path)
+	names, err := f.dir.Readdirnames(-1)
+	if err != nil {
+		return errors.Is(err, fs.ErrNotExist), err // an *fs.PathError naming f.path
+	}
+	for _, name := range names {
+		path := filepath.Join(f.path, name)
+		w.at(beforeEntry, path)
+		isDir, err := isDirNoFollow(f.fd, name)
+		switch {
+		case err == nil:
+		case errors.Is(err, unix.ENOENT):
+			continue // gone since it was listed
+		default:
+			return false, &fs.PathError{Op: "fstatat", Path: path, Err: err}
+		}
+		if isDir {
+			f.subdirs = append(f.subdirs, name)
+			continue
+		}
+		w.at(beforeChown, path)
+		switch err := fchownatNoFollow(f.fd, name, w.uid, w.gid); {
+		case err == nil:
+		case errors.Is(err, unix.ENOENT):
+			continue // gone since it was looked at
+		default:
+			return false, &fs.PathError{Op: "fchownat", Path: path, Err: err}
+		}
+	}
+	return false, nil
+}
+
+// openDirNoFollow opens name, relative to dirfd, as a directory -- failing
+// with ELOOP or ENOTDIR, never following, if name is a symlink. path is
+// only the name the returned *os.File reports in its errors.
+func openDirNoFollow(dirfd int, name, path string) (*os.File, error) {
+	for {
+		fd, err := unix.Openat(dirfd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		return os.NewFile(uintptr(fd), path), nil
+	}
+}
+
+// fchownatNoFollow re-owns the entry name in the directory open as dirfd --
+// the entry itself, never what it points at if it is a symlink.
+func fchownatNoFollow(dirfd int, name string, uid, gid int) error {
+	for {
+		if err := unix.Fchownat(dirfd, name, uid, gid, unix.AT_SYMLINK_NOFOLLOW); err != unix.EINTR {
+			return err
+		}
+	}
+}
+
+func fchown(fd, uid, gid int) error {
+	for {
+		if err := unix.Fchown(fd, uid, gid); err != unix.EINTR {
+			return err
+		}
+	}
+}
+
+// isDirNoFollow reports whether the entry name in the directory open as
+// dirfd is a directory -- a symlink to one is not.
+func isDirNoFollow(dirfd int, name string) (bool, error) {
+	var st unix.Stat_t
+	for {
+		err := unix.Fstatat(dirfd, name, &st, unix.AT_SYMLINK_NOFOLLOW)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		return st.Mode&unix.S_IFMT == unix.S_IFDIR, nil
+	}
 }
 
 // RuntimeHomeDir is where the dropped agent runtime's own home lives, and
