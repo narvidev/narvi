@@ -229,7 +229,8 @@ These are the canonical contracts the web UI and the sandbox agent speak. Formal
 ### 6.1 Sandbox WS (sandbox-agent ↔ control plane)
 - Connect: `wss://…/sessions/{id}/ws?type=sandbox`, `Authorization: Bearer <sandbox_token>`, `X-Sandbox-ID` (+ NEW: `X-Sandbox-Gen`). Server: 410 when session stopped, 403 on id/gen mismatch. Agent treats 401/403/404/410 as fatal (no retry); else exponential-backoff reconnect.
 - CP→agent commands: `prompt` (with author scmName/scmEmail for git attribution), `stop`, `push` (per-repo spec; CP awaits `push_complete`, 360s), `snapshot`, `shutdown`, `ack`, `git_sync_complete`.
-- Agent→CP events: `ready`, `heartbeat` (30s, carries conversation id + `last_boot_phase`), `boot_progress`, `token` (cumulative text, upsert-by-messageId not append; additionally carries an **optional** part id, §35.6 — one stored row per `(messageId, partId)`, absent meaning today's exact single-row behavior, so an older sandbox-agent degrades rather than breaks), `tool_call`/`tool_result`, `step_start`/`step_finish` (carries `cost`; NOTE: `tokens` is an **object**, not a number — a number-vs-object mismatch here silently zeroes cost tracking, so pin it in the contract test), `sub_task_start`/`sub_task_finish` (§7.1; `sub_task_start` additionally carries an optional `subAgentType`, Step 71, §26.4 — the task tool's own real `subagent_type` dispatch parameter, distinct from `label`'s freeform text, used to corroborate a self-reported `counter-reviewer` dispatch against the persisted trace), `git_sync`, `artifact`, `execution_complete`, `push_complete`/`push_error`, `session_title`, `warning`, `error`, `snapshot_ready`.
+- Agent→CP events: `ready`, `heartbeat` (30s, carries conversation id + `last_boot_phase`), `boot_progress`, `token` (the cumulative text of one text part so far, keyed by `messageId` — the pinned runtime's adapter puts the part id there — each frame superseding the earlier ones of its `messageId` for every reader; stored append-only, one row per **distinct** frame, see **Stored `token` frames** below; the **optional** part id of §35.6 remains only for a runtime whose `messageId` is not already per part), `tool_call`/`tool_result`, `step_start`/`step_finish` (carries `cost`; NOTE: `tokens` is an **object**, not a number — a number-vs-object mismatch here silently zeroes cost tracking, so pin it in the contract test), `sub_task_start`/`sub_task_finish` (§7.1; `sub_task_start` additionally carries an optional `subAgentType`, Step 71, §26.4 — the task tool's own real `subagent_type` dispatch parameter, distinct from `label`'s freeform text, used to corroborate a self-reported `counter-reviewer` dispatch against the persisted trace), `git_sync`, `artifact`, `execution_complete`, `push_complete`/`push_error`, `session_title`, `warning`, `error`, `snapshot_ready`.
+- **Stored `token` frames** (defect found and fixed 2026-09-27). Every other event type is stored first-wins on `(session_id, messageId)`, the receiver-side dedupe the ack protocol below relies on. Applied to `token`, that rule kept the **first** frame of every text part and dropped the rest, unbroadcast, from 2026-07-20 (migration 000019) until the fix: the pinned runtime sends each part twice, empty when it opens and full when it closes, so stored, live and replayed text parts read as blank or as a prefix, plan-approval notifications carried the placeholder or a prefix, and approved plan snapshots froze that text with NULL structured steps. The fix stores each distinct frame as its own row, under `messageId + "#" + a hash of its text`, so the log stays append-only for every `id > cursor` reader; replacing the payload in place was rejected because the row would keep its id and no cursor-based reader would ever see the newer text. A byte-identical resend still dedupes, and a frame that is the newest stored one again, or an older one replayed late (a strict prefix of it that is missing non-whitespace text), adds no row. The sandbox-agent holds live sends while it replays its buffer after a reconnect, so a replayed older frame never overtakes a newer one on the wire. Rows per part are bounded by the runtime's cadence: two, measured against the real binary and pinned by a contract test that needs no credential, so a part's stored bytes stay linear in its final length; a runtime that sends more frames must coalesce them in the adapter before it is pinned (Step 175). History stored before the fix stays truncated: the later frames were never written anywhere, so it cannot be backfilled.
 - **Ack protocol**: 6 critical types (`execution_complete`, `error`, `snapshot_ready`, `push_complete`, `push_error`, `sub_task_finish`) carry deterministic `ackId = "{type}:{messageId}"`; sender buffers (1000 events, evict oldest non-critical) and re-sends on reconnect until acked; receiver dedupes by upsert-on-messageId. `sub_task_finish` joins the critical set because it closes an "active" state the UI tracks (§12.2 item 1's live sub-lane count) exactly like `execution_complete` does at the turn level — a dropped, never-redelivered `sub_task_finish` would leave a sub-lane stuck active forever, live and in history, with no reconciliation path (the same failure class §3.2's two-phase terminalization and §9.3 #4/#7 exist to prevent at the turn level).
 - **Sub-task fan-out** (§7.1): every event type emitted during turn processing additionally accepts an optional `subTaskId` (absent/null = the turn's main lane), for envelope uniformity — session/connection-lifecycle events (`ready`, `heartbeat`, `boot_progress`, `git_sync`, `session_title`, `warning`, `snapshot_ready`) never populate it, only turn/tool/step-scoped events do — so a lane is always unambiguous even when several sub-tasks' events interleave on the wire. `sub_task_start` (`subTaskId`, `label`, `parentMessageId` — the `messageId` of the main-lane `tool_call` event whose invocation spawned this sub-task) and `sub_task_finish` (`subTaskId`, `outcome`: `completed | failed | cancelled`, reusing the turn's own taxonomy, §3.3) bracket a sub-task's lifetime. The model is flat — a sub-task cannot itself spawn a further-nested sub-task.
 
@@ -5737,19 +5738,25 @@ and a staged migration for them is worth building only if the answer is yes. Ste
 this.
 
 ### 35.6 One stored row per text part
-§6.1 pins the `token` event as cumulative text, upsert-by-`messageId`. Under that contract a
-sandbox lost mid-turn keeps only the **last text fragment** of a multi-part answer, and §35.5's
-recap is built from exactly those stored events — so the contract that makes the recap possible is
-also the one that makes it lossy. The event gains an **optional** part identifier and the
-repository stores one row per `(messageId, partId)`, with a part-scoped row's `created_at` pinned
-at first emission so narration sorts before the tool calls it introduced. Optional is the whole
-compatibility story in both directions: an older `sandbox-agent` sends no part id and degrades to
-today's exact behavior, which matters here for the same reason §35.2 does.
+§6.1 pins the `token` event as cumulative text keyed by `messageId`. This section was written on
+the premise that the store keeps the **last text fragment** of a multi-part answer, so that §35.5's
+recap, built from stored events, would lose every earlier part. The store did something else. The
+adapter already sends each text part under its own part id as `messageId`, so rows were already
+per part; and first-wins dedupe kept each part's **first** frame — empty or a prefix — rather than
+its last (§6.1, **Stored `token` frames**). Since that fix every distinct frame of every part is its
+own row, so the log holds each part's final text, and a part's first row lands when the part opens,
+before the tool calls it introduced.
 
-This is an additive amendment to an already-merged `/contracts` schema, not a breaking one. The
-notification surfaces keep reading the last part and their posts stay byte-identical; what gains a
-consumer is the recap, and any replay of a wide session now needs a byte budget rather than only a
-row count.
+What is left of this amendment is narrower than first written, and needed only for a runtime
+adapter whose `messageId` is not already per part: an **optional** part identifier on `token` and
+one stored row per `(messageId, partId)`, with a part-scoped row's `created_at` pinned at first
+emission. Optional is still the whole compatibility story in both directions: an older
+`sandbox-agent` sends no part id and degrades to today's behavior, for the same reason §35.2 gives.
+It is an additive amendment to an already-merged `/contracts` schema, not a breaking one. The
+notification surfaces keep reading the last part and their posts stay byte-identical to today's;
+the subscribe replay already has a byte budget besides its row count, and a wide session now
+spends it on up to two rows per text part. History stored before the §6.1 fix stays truncated
+whatever this section does.
 
 ### 35.7 Phasing
 By content this is §3.2/§3.3 resilience work, and Phase 2 is its substrate. It lands appended
