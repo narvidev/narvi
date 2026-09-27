@@ -77,20 +77,31 @@ type Bridge struct {
 
 	// connMu guards conn, the CURRENT live connection (nil when
 	// disconnected, and also while a fresh connection is still replaying
-	// the buffer) -- read by SendCritical/SendBestEffort, which may be
-	// called concurrently with Run's own reconnect loop swapping it out.
-	// It also makes "buffer an entry and read conn" (enqueue) atomic with
-	// flushBuffer's "nothing left to replay, publish conn" step, which is
-	// what keeps a live send from overtaking an older buffered entry after
-	// a reconnect: see flushBuffer (run.go).
+	// the buffer), and replayDone -- read by SendCritical/SendBestEffort,
+	// which may be called concurrently with Run's own reconnect loop
+	// swapping them. It also makes "buffer an entry and read conn and
+	// replayDone" (enqueue) atomic with flushBuffer's "nothing left to
+	// replay, publish conn, end the replay" step, which is what keeps a
+	// live send from overtaking an older buffered entry after a reconnect,
+	// and an entry held behind the replay from being skipped by it: see
+	// flushBuffer (run.go).
 	connMu sync.Mutex
 	conn   *websocket.Conn
+	// replayDone is non-nil while a fresh connection replays the buffer,
+	// and closed when that replay ends, whether it caught up or failed. A
+	// send made meanwhile buffers its entry, then waits on it (enqueue).
+	replayDone chan struct{}
 
 	// flushWriteHook, when non-nil, runs after flushBuffer writes each
-	// entry. Always nil in production; set only through
-	// SetFlushWriteHookForTest (export_test.go) so a test can send a live
-	// event at a deterministic point mid-replay.
-	flushWriteHook func()
+	// entry; enqueueHeldHook runs when a send has buffered its entry and is
+	// about to wait for a running replay; replayCaughtUpHook runs inside
+	// flushBuffer's final critical section, connMu held, right after its
+	// last snapshot came back empty and before it publishes conn. All
+	// three are always nil in production; set only through export_test.go
+	// so a test can place a send at a deterministic point of a replay.
+	flushWriteHook     func()
+	enqueueHeldHook    func()
+	replayCaughtUpHook func()
 
 	// bootMu guards lastBootPhase, read by the heartbeat loop and written
 	// by SendBootProgress/MarkBootComplete.
@@ -162,17 +173,48 @@ func (b *Bridge) setConn(c *websocket.Conn) {
 }
 
 // enqueue buffers entry and returns the connection to write it on right
-// now, or nil when there is none -- including while a fresh connection is
-// still replaying the buffer, in which case flushBuffer itself writes the
-// entry, after every older one. Buffering and reading conn happen under
-// the one connMu critical section flushBuffer publishes conn in, so an
-// entry is always either picked up by the replay or written live after
-// it, never live in the middle of it.
-func (b *Bridge) enqueue(entry outboundEntry) *websocket.Conn {
+// now, or nil when there is none.
+//
+// While a fresh connection is still replaying the buffer, the replay
+// itself writes the entry, after every older one, and enqueue HOLDS the
+// caller until that replay has ended (or ctx is done), then returns nil:
+// there is nothing left for the caller to write. Holding is what bounds a
+// replay -- each sending goroutine adds at most one entry per replay, so a
+// sender faster than the connection cannot keep it replaying, and delay
+// the reading of commands, indefinitely -- and what keeps the replay from
+// evicting entries it has not written yet (doc.go, "The replay after a
+// (re)connect").
+//
+// Buffering, reading conn and reading replayDone happen in one connMu
+// critical section, and flushBuffer checks that nothing is left and ends
+// the replay in one too, so an entry is always either written by the
+// replay or written live after it -- never live in the middle of it, and
+// never buffered behind a replay that has already made its last check.
+func (b *Bridge) enqueue(ctx context.Context, entry outboundEntry) *websocket.Conn {
 	b.connMu.Lock()
-	defer b.connMu.Unlock()
 	b.buffer.add(entry)
-	return b.conn
+	conn, replay := b.conn, b.replayDone
+	b.connMu.Unlock()
+	if replay == nil {
+		return conn
+	}
+	if b.enqueueHeldHook != nil {
+		b.enqueueHeldHook()
+	}
+	select {
+	case <-replay:
+	case <-ctx.Done():
+	}
+	return nil
+}
+
+// endReplay closes and clears replayDone, releasing every send held behind
+// the replay that just ended. connMu must be held.
+func (b *Bridge) endReplay() {
+	if b.replayDone != nil {
+		close(b.replayDone)
+		b.replayDone = nil
+	}
 }
 
 func (b *Bridge) getLastBootPhase() *string {
