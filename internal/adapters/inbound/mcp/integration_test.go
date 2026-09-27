@@ -36,7 +36,9 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/inbound/mcpauth"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactivity"
+	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/mcpscope"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -71,6 +73,11 @@ type mcpTestRig struct {
 	ids          mcpauth.Identifiers
 	server       *httptest.Server
 	waiter       *sessionactivity.Waiter
+	// artifacts/prSessions/reviewVerdicts back row 182's result (technical
+	// plan §43.20), whose verdicts' freshness is read from codeHost.
+	artifacts      *narvipg.ArtifactStore
+	prSessions     *narvipg.GitHubPRSessionStore
+	reviewVerdicts *narvipg.ReviewVerdictStore
 	// tokenClient is the pre-registered client mintMCPToken issues
 	// tokens under, created on first use.
 	tokenClient *sqlcgen.McpOauthClient
@@ -90,6 +97,10 @@ func newMCPTestRig(t *testing.T) *mcpTestRig {
 		turns:        narvipg.NewTurnStore(pool),
 		clients:      narvipg.NewMCPOAuthClientStore(pool),
 		grants:       narvipg.NewMCPOAuthGrantStore(pool),
+
+		artifacts:      narvipg.NewArtifactStore(pool),
+		prSessions:     narvipg.NewGitHubPRSessionStore(pool),
+		reviewVerdicts: narvipg.NewReviewVerdictStore(pool),
 	}
 
 	router := chi.NewRouter()
@@ -99,6 +110,20 @@ func newMCPTestRig(t *testing.T) *mcpTestRig {
 	// One waiter for the REST route and the MCP twin alike, as
 	// controlplane wires it: one replica's caps.
 	rig.waiter = sessionactivity.NewWaiter(sessionactivity.ConfigFrom(platform.DefaultTimeouts()))
+	// One result handler for the REST route and the MCP twin alike, as
+	// controlplane wires it, reading freshness from a fixed fake code host.
+	getSessionResult := httpapi.GetSessionResult(httpapi.SessionResultDeps{
+		Pool:           pool,
+		Sessions:       rig.sessions,
+		Turns:          rig.turns,
+		Events:         rig.events,
+		Artifacts:      rig.artifacts,
+		PRSessions:     rig.prSessions,
+		ReviewVerdicts: rig.reviewVerdicts,
+		SourceControl:  parityCodeHost{},
+		BotToken:       "parity-bot-token",
+		Timeouts:       platform.DefaultTimeouts(),
+	})
 
 	mcpHandler, err := mcpadapter.NewHandler(mcpadapter.Config{PublicBaseURL: baseURL}, mcpadapter.Twins{
 		ListModels:       httpapi.GetModelCatalog(),
@@ -106,6 +131,7 @@ func newMCPTestRig(t *testing.T) *mcpTestRig {
 		GetSession:       httpapi.GetSession(rig.sessions),
 		GetSessionStatus: httpapi.GetSessionStatus(rig.sessions, rig.waiter, platform.DefaultTimeouts()),
 		ListEvents:       httpapi.ListEvents(rig.sessions, rig.events),
+		GetSessionResult: getSessionResult,
 	})
 	if err != nil {
 		t.Fatalf("mcpadapter.NewHandler: %v", err)
@@ -130,6 +156,7 @@ func newMCPTestRig(t *testing.T) *mcpTestRig {
 		r.Get("/{sessionID}", httpapi.GetSession(rig.sessions))
 		r.Get("/{sessionID}/status", httpapi.GetSessionStatus(rig.sessions, rig.waiter, platform.DefaultTimeouts()))
 		r.Get("/{sessionID}/events", httpapi.ListEvents(rig.sessions, rig.events))
+		r.Get("/{sessionID}/result", getSessionResult)
 	})
 	router.Route("/mcp", func(r chi.Router) {
 		r.Use(mcpOriginGate)
@@ -706,7 +733,7 @@ func TestParity_ToolsListIsRoleIndependent(t *testing.T) {
 	// against the same fixed slice for all four roles below. Role does not
 	// gate discovery today (technical plan §43.17): every read tool is
 	// open to every role.
-	want := []string{"narvi_get_session", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions", "narvi_wait_for_session"}
+	want := []string{"narvi_get_session", "narvi_get_session_result", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions", "narvi_wait_for_session"}
 	for _, role := range []sqlcgen.UserRole{sqlcgen.UserRoleViewer, sqlcgen.UserRoleMember, sqlcgen.UserRoleMaintainer, sqlcgen.UserRoleAdmin} {
 		t.Run(string(role), func(t *testing.T) {
 			user, _ := createUserWithRole(ctx, t, rig, role)
@@ -803,6 +830,10 @@ func TestParity_BearerEqualsCookieForEveryRole(t *testing.T) {
 	// turn, a queued follow-up, and a few events -- so the status and
 	// transcript rows compare real content, not empty shapes.
 	seedBusySession(ctx, t, rig, othersSession.ID, 3)
+	// Another user's review session with an assessed verdict, whose
+	// freshness the fake code host confirms live -- so the result rows
+	// compare a real review, its live freshness included.
+	othersReview := seedReviewedSession(ctx, t, rig, owner.ID)
 	const unknown = "00000000-0000-0000-0000-000000000000"
 
 	for _, role := range []sqlcgen.UserRole{sqlcgen.UserRoleViewer, sqlcgen.UserRoleMember, sqlcgen.UserRoleMaintainer, sqlcgen.UserRoleAdmin} {
@@ -833,6 +864,13 @@ func TestParity_BearerEqualsCookieForEveryRole(t *testing.T) {
 				{"wait on my session", "/api/sessions/" + own.ID.String() + "/status?waitSeconds=1", "narvi_wait_for_session", fmt.Sprintf(`{"sessionId":%q,"waitSeconds":1}`, own.ID.String())},
 				{"wait on another user's session", "/api/sessions/" + othersSession.ID.String() + "/status?waitSeconds=1", "narvi_wait_for_session", fmt.Sprintf(`{"sessionId":%q,"waitSeconds":1}`, othersSession.ID.String())},
 				{"wait on an unknown session", "/api/sessions/" + unknown + "/status?waitSeconds=1", "narvi_wait_for_session", fmt.Sprintf(`{"sessionId":%q,"waitSeconds":1}`, unknown)},
+				// Row 182's result (piece (c)): the caller's own session (no
+				// run, no pull request: reviewScope none), another user's
+				// review session with a live-confirmed verdict, and one that
+				// does not exist.
+				{"result of my session", "/api/sessions/" + own.ID.String() + "/result", "narvi_get_session_result", fmt.Sprintf(`{"sessionId":%q}`, own.ID.String())},
+				{"result of another user's session", "/api/sessions/" + othersReview.ID.String() + "/result", "narvi_get_session_result", fmt.Sprintf(`{"sessionId":%q}`, othersReview.ID.String())},
+				{"result of an unknown session", "/api/sessions/" + unknown + "/result", "narvi_get_session_result", fmt.Sprintf(`{"sessionId":%q}`, unknown)},
 				{"transcript of my session", "/api/sessions/" + own.ID.String() + "/events", "narvi_get_session_transcript", fmt.Sprintf(`{"sessionId":%q}`, own.ID.String())},
 				{"transcript of another user's session", "/api/sessions/" + othersSession.ID.String() + "/events?limit=2", "narvi_get_session_transcript", fmt.Sprintf(`{"sessionId":%q,"limit":2}`, othersSession.ID.String())},
 				{"transcript of an unknown session", "/api/sessions/" + unknown + "/events", "narvi_get_session_transcript", fmt.Sprintf(`{"sessionId":%q}`, unknown)},
@@ -855,6 +893,9 @@ func TestParity_BearerEqualsCookieForEveryRole(t *testing.T) {
 						continue
 					}
 					assertCanonicalJSONEqual(t, tc.name, restBody, env.Result.StructuredContent)
+					if tc.name == "result of another user's session" && !strings.Contains(string(restBody), `"freshness":{"reason":null,"state":"current"}`) {
+						t.Fatalf("%s: body %s, want the reviewed verdict current -- read live through the same twin on both sides", tc.name, restBody)
+					}
 				default:
 					var restErr struct {
 						Error string `json:"error"`
@@ -1066,4 +1107,70 @@ func TestParity_GetSessionTranscript_CursorWalkEqualsREST(t *testing.T) {
 			}
 		})
 	}
+}
+
+// parityCodeHost is the result's code host in this rig: every pull request
+// open at head h1 on main, main's tip b1 -- so a verdict recorded at h1 on
+// main at b1 reads current, the same on the REST route and through the
+// tool. Any other port method panics: the result never calls one.
+type parityCodeHost struct{ ports.SourceControl }
+
+func (parityCodeHost) GetOpenPR(_ context.Context, owner, repo string, number int, _ string) (ports.OpenPR, bool, error) {
+	return ports.OpenPR{Owner: owner, Repo: repo, Number: number, HeadSHA: "h1", BaseRef: "main"}, true, nil
+}
+
+func (parityCodeHost) ResolveBranchSHA(_ context.Context, spec ports.ResolveBranchSHASpec) (string, string, error) {
+	return "b1", spec.Branch, nil
+}
+
+// seedReviewedSession creates ownerID's review session for acme/widgets#7
+// with an ended run that streamed text, a pull request it opened, and an
+// assessed verdict recorded at h1 on main at b1 under the current policy.
+func seedReviewedSession(ctx context.Context, t *testing.T, r *mcpTestRig, ownerID pgtype.UUID) sqlcgen.Session {
+	t.Helper()
+	sess := createSessionForUser(ctx, t, r, ownerID)
+	if err := r.prSessions.EnsureRow(ctx, "acme/widgets", 7); err != nil {
+		t.Fatalf("ensure claim: %v", err)
+	}
+	if err := r.prSessions.SetSessionID(ctx, "acme/widgets", 7, sess.ID); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	attempt, err := r.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: sess.ID, Status: sqlcgen.TurnStatusPending, IsReviewAttempt: true})
+	if err != nil {
+		t.Fatalf("create attempt: %v", err)
+	}
+	watermark, err := r.events.MaxEventIDForSession(ctx, sess.ID)
+	if err != nil {
+		t.Fatalf("watermark: %v", err)
+	}
+	now := pgtype.Timestamptz{Time: time.Now(), Valid: true}
+	if _, err := r.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: attempt.ID, Status: sqlcgen.TurnStatusDispatched, DispatchedAt: now, DispatchedEventID: &watermark}); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if _, err := r.events.Create(ctx, sqlcgen.CreateEventParams{SessionID: sess.ID, Type: "token", MessageID: "prt_final", Payload: []byte(`{"type":"token","messageId":"prt_final","text":"Reviewed: low risk."}`)}); err != nil {
+		t.Fatalf("token: %v", err)
+	}
+	for _, status := range []sqlcgen.TurnStatus{sqlcgen.TurnStatusProcessing, sqlcgen.TurnStatusCompleted} {
+		arg := sqlcgen.UpdateTurnStatusParams{ID: attempt.ID, Status: status}
+		if status == sqlcgen.TurnStatusCompleted {
+			arg.CompletedAt = now
+		}
+		if _, err := r.turns.UpdateStatus(ctx, arg); err != nil {
+			t.Fatalf("end attempt: %v", err)
+		}
+	}
+	if _, err := r.artifacts.Create(ctx, sqlcgen.CreateArtifactParams{SessionID: sess.ID, Type: sqlcgen.ArtifactTypePr, Url: "https://github.com/acme/widgets/pull/8", Metadata: []byte(`{"repo":"widgets","number":8}`)}); err != nil {
+		t.Fatalf("pull request artifact: %v", err)
+	}
+	baseRef, baseSHA := "main", "b1"
+	if _, err := r.reviewVerdicts.Insert(ctx, sqlcgen.InsertReviewVerdictParams{
+		RepoFullName: "acme/widgets", PrNumber: 7, HeadSha: "h1",
+		RiskLevel: "low", Premise: "ok", BlastRadius: []byte(`[]`), FilesChanged: 1,
+		TestsCoverage: "adequate", DocsDrift: "none", ProposedShippable: "auto", Shippable: "auto",
+		SessionID: sess.ID, ArchDecisionTags: []byte(`[]`), ArchDecisionRoots: []byte(`[]`), AncestorChain: []byte(`[]`),
+		BaseRef: &baseRef, BaseSha: &baseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion, AttemptID: attempt.ID,
+	}); err != nil {
+		t.Fatalf("verdict: %v", err)
+	}
+	return sess
 }

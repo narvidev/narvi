@@ -2748,8 +2748,9 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// entry point for the read-only MCP tools -- narvi_list_models,
 	// narvi_list_sessions, narvi_get_session, and row 182's
 	// narvi_get_session_status, narvi_wait_for_session (the status twin
-	// with ?waitSeconds=, on the same sessionWaiter as the REST route) and
-	// narvi_get_session_transcript (§43.20).
+	// with ?waitSeconds=, on the same sessionWaiter as the REST route),
+	// narvi_get_session_result (on the same sessionResultDeps as the REST
+	// route) and narvi_get_session_transcript (§43.20).
 	// Deliberately NOT under /api/
 	// (a protocol endpoint, the same category as /sessions/{sessionID}/ws
 	// or /webhooks/*) and mounted UNCONDITIONALLY regardless of
@@ -2774,7 +2775,8 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// on every call, with no cache, and attaches the grant whose scopes
 	// decide which tools the request can see (§43.16/§43.17). Twins are the
 	// SAME httpapi handlers /api/models, /api/sessions[/{sessionID}] and
-	// /api/sessions/{sessionID}/{status,events} above already register --
+	// /api/sessions/{sessionID}/{status,result,events} above already
+	// register --
 	// the bridge invokes them in-process, never a second implementation
 	// (§43.7; mcp/bridge.go's own doc comment).
 	mcpOriginGate, err := mcpadapter.RequireTrustedOrigin(mcpadapter.Config{PublicBaseURL: cfg.PublicBaseURL})
@@ -2787,6 +2789,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		GetSession:       httpapi.GetSession(sessionStore),
 		GetSessionStatus: httpapi.GetSessionStatus(sessionStore, sessionWaiter, cfg.Timeouts),
 		ListEvents:       httpapi.ListEvents(sessionStore, eventStore),
+		GetSessionResult: httpapi.GetSessionResult(sessionResultDeps),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("build mcp handler: %w", err)

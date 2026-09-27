@@ -20,6 +20,7 @@ func testTwins() Twins {
 		// the wrong one shows it.
 		GetSessionStatus: stubHandler(http.StatusOK, `{"activity":"idle"}`),
 		ListEvents:       stubHandler(http.StatusOK, `{"events":[],"nextCursor":null}`),
+		GetSessionResult: stubHandler(http.StatusOK, `{"reviewScope":"none"}`),
 	}
 }
 

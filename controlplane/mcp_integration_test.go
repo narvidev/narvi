@@ -316,7 +316,7 @@ func TestBuild_MCPSurface_RealRouter(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, body = %s, want 200", rec.Code, rec.Body.String())
 		}
-		for _, want := range []string{"narvi_list_models", "narvi_list_sessions", "narvi_get_session", "narvi_get_session_status", "narvi_wait_for_session", "narvi_get_session_transcript"} {
+		for _, want := range []string{"narvi_list_models", "narvi_list_sessions", "narvi_get_session", "narvi_get_session_status", "narvi_wait_for_session", "narvi_get_session_result", "narvi_get_session_transcript"} {
 			if !strings.Contains(rec.Body.String(), want) {
 				t.Errorf("tools/list body does not mention %q: %s", want, rec.Body.String())
 			}
@@ -420,6 +420,10 @@ func TestBuild_MCPSurface_TwinParity(t *testing.T) {
 	// A second session with live work and a history, so the status and
 	// transcript rows compare real content.
 	busyID := seedLaggingSession(ctx, t, pool, user.ID, 3).String()
+	// A session whose result resolves every review from the record alone
+	// (seedResultSession): this router's source control is the real code
+	// host adapter, which no test may reach.
+	resultID := seedResultSession(ctx, t, pool, user.ID).String()
 
 	tests := []struct {
 		name        string
@@ -435,6 +439,7 @@ func TestBuild_MCPSurface_TwinParity(t *testing.T) {
 		// session with no turn (idle, settled) both answer at once, so
 		// the bytes compare like the status row's.
 		{"narvi_wait_for_session", "/api/sessions/" + sessionID + "/status?waitSeconds=5", "narvi_wait_for_session", fmt.Sprintf(`{"sessionId":%q,"waitSeconds":5}`, sessionID)},
+		{"narvi_get_session_result", "/api/sessions/" + resultID + "/result", "narvi_get_session_result", fmt.Sprintf(`{"sessionId":%q}`, resultID)},
 		{"narvi_get_session_transcript", "/api/sessions/" + busyID + "/events?limit=2", "narvi_get_session_transcript", fmt.Sprintf(`{"sessionId":%q,"limit":2}`, busyID)},
 	}
 
