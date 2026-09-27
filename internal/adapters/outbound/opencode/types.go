@@ -331,7 +331,10 @@ type compactionPart struct {
 // textPart is a `"type":"text"` part — VERIFIED live: Text is the FULL
 // CUMULATIVE text so far for this part id (a later update replaces an
 // earlier, shorter/empty one), matching wire Token's own cumulative
-// contract exactly.
+// contract exactly. The pinned runtime sends exactly two updates per text
+// part, measured against the real binary (tokencadence_realbinary_test.go):
+// an empty one when the part opens and the full text when it closes, with
+// the model's deltas in between carried only by message.part.delta.
 type textPart struct {
 	ID        string `json:"id"`
 	MessageID string `json:"messageID"`

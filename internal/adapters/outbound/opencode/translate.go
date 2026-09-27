@@ -54,6 +54,11 @@ func subTaskIDPtr(subTaskID string) *string {
 	return &subTaskID
 }
 
+// translateToken carries one cumulative update of a text part. Every
+// frame of the same part shares the part id as its messageId; the control
+// plane stores each DISTINCT frame as its own row and readers keep the
+// newest (internal/app/sessionactor/tokenframe.go), so the last frame sent
+// for a part must be its final text.
 func translateToken(cmd sandboxws.Prompt, p textPart, subTaskID string) sandboxws.Token {
 	return sandboxws.Token{
 		Type:      "token",
