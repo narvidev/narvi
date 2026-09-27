@@ -33,7 +33,9 @@ func openAt(head string, chain ...ports.PRAncestorLink) ports.OpenPR {
 var pr7 = reviewfreshness.PullRequest{Owner: "acme", Repo: "widgets", Number: 7}
 
 // TestAssess_Table pins every state Assess reports, the reason it gives,
-// and which reads it needed: none for what the record alone decides.
+// and which reads it needed: the pull request read alone for what the
+// merge path's probe decides (the record, against the live head and base
+// ref), none at all with no code host.
 func TestAssess_Table(t *testing.T) {
 	t.Parallel()
 	failed := errors.New("code host unavailable")
@@ -47,36 +49,76 @@ func TestAssess_Table(t *testing.T) {
 		wantCalls int
 	}{
 		{
-			name:   "policy bumped: stale, no live read",
-			record: func(r *reviewverdict.Record) { r.Context.PolicyVersion = autoapproval.CurrentPolicyVersion - 1 },
-			sc:     &fakeSourceControl{},
-			want:   reviewfreshness.Assessment{State: reviewfreshness.StateStale, Reason: string(autoapproval.ReasonPolicyVersionMismatch)},
+			name:      "policy bumped: stale, from the probe after the pull request read",
+			record:    func(r *reviewverdict.Record) { r.Context.PolicyVersion = autoapproval.CurrentPolicyVersion - 1 },
+			sc:        &fakeSourceControl{found: true, openPR: openAt("h1")},
+			want:      reviewfreshness.Assessment{State: reviewfreshness.StateStale, Reason: string(autoapproval.ReasonPolicyVersionMismatch)},
+			wantCalls: 1,
 		},
 		{
-			name:   "no context recorded: unconfirmed, no live read",
-			record: func(r *reviewverdict.Record) { r.Context = reviewverdict.Context{} },
-			sc:     &fakeSourceControl{},
-			want:   reviewfreshness.Assessment{State: reviewfreshness.StateUnconfirmed, Reason: string(autoapproval.ReasonContextUnknown)},
+			name:      "no context recorded: unconfirmed, from the probe",
+			record:    func(r *reviewverdict.Record) { r.Context = reviewverdict.Context{} },
+			sc:        &fakeSourceControl{found: true, openPR: openAt("h1")},
+			want:      reviewfreshness.Assessment{State: reviewfreshness.StateUnconfirmed, Reason: string(autoapproval.ReasonContextUnknown)},
+			wantCalls: 1,
 		},
 		{
-			name:   "recorded base commit unknown: unconfirmed, no live read",
-			record: func(r *reviewverdict.Record) { r.Context.BaseSHA = "" },
-			sc:     &fakeSourceControl{},
-			want:   reviewfreshness.Assessment{State: reviewfreshness.StateUnconfirmed, Reason: string(autoapproval.ReasonBaseSHAUnknown)},
+			// The merge path's probe compares the live head first: a verdict
+			// that recorded no context and whose head moved is stale there,
+			// and so here (finding P8).
+			name:      "no context recorded and the head moved: stale, as the merge path says",
+			record:    func(r *reviewverdict.Record) { r.Context = reviewverdict.Context{} },
+			sc:        &fakeSourceControl{found: true, openPR: openAt("h2")},
+			want:      reviewfreshness.Assessment{State: reviewfreshness.StateStale, Reason: string(autoapproval.ReasonStaleVerdict)},
+			wantCalls: 1,
 		},
 		{
-			name: "recorded ancestor link unknown: unconfirmed, no live read",
+			name:      "recorded base commit unknown: unconfirmed, from the probe",
+			record:    func(r *reviewverdict.Record) { r.Context.BaseSHA = "" },
+			sc:        &fakeSourceControl{found: true, openPR: openAt("h1")},
+			want:      reviewfreshness.Assessment{State: reviewfreshness.StateUnconfirmed, Reason: string(autoapproval.ReasonBaseSHAUnknown)},
+			wantCalls: 1,
+		},
+		{
+			name:      "recorded base commit unknown and the head moved: stale",
+			record:    func(r *reviewverdict.Record) { r.Context.BaseSHA = "" },
+			sc:        &fakeSourceControl{found: true, openPR: openAt("h2")},
+			want:      reviewfreshness.Assessment{State: reviewfreshness.StateStale, Reason: string(autoapproval.ReasonStaleVerdict)},
+			wantCalls: 1,
+		},
+		{
+			name: "recorded ancestor link unknown: unconfirmed, from the probe",
 			record: func(r *reviewverdict.Record) {
 				r.Context.AncestorChain = []review.AncestorLink{{Ref: "parent", SHA: ""}}
 			},
-			sc:   &fakeSourceControl{},
-			want: reviewfreshness.Assessment{State: reviewfreshness.StateUnconfirmed, Reason: string(autoapproval.ReasonAncestorChainUnknown)},
+			sc:        &fakeSourceControl{found: true, openPR: openAt("h1")},
+			want:      reviewfreshness.Assessment{State: reviewfreshness.StateUnconfirmed, Reason: string(autoapproval.ReasonAncestorChainUnknown)},
+			wantCalls: 1,
 		},
 		{
-			name:   "no head recorded: stale, no live read",
-			record: func(r *reviewverdict.Record) { r.HeadSHA = "" },
-			sc:     &fakeSourceControl{},
-			want:   reviewfreshness.Assessment{State: reviewfreshness.StateStale, Reason: string(autoapproval.ReasonStaleVerdict)},
+			// A retargeted base refuses before the chain is looked at, on the
+			// merge path's probe as here.
+			name: "recorded ancestor link unknown and the base retargeted: stale",
+			record: func(r *reviewverdict.Record) {
+				r.Context.AncestorChain = []review.AncestorLink{{Ref: "parent", SHA: ""}}
+			},
+			sc:        &fakeSourceControl{found: true, openPR: func() ports.OpenPR { p := openAt("h1"); p.BaseRef = "release"; return p }()},
+			want:      reviewfreshness.Assessment{State: reviewfreshness.StateStale, Reason: string(autoapproval.ReasonBaseMoved)},
+			wantCalls: 1,
+		},
+		{
+			name:      "no head recorded: stale, from the probe",
+			record:    func(r *reviewverdict.Record) { r.HeadSHA = "" },
+			sc:        &fakeSourceControl{found: true, openPR: openAt("h1")},
+			want:      reviewfreshness.Assessment{State: reviewfreshness.StateStale, Reason: string(autoapproval.ReasonStaleVerdict)},
+			wantCalls: 1,
+		},
+		{
+			name:      "a record the probe decides, on a pull request no longer open: not applicable",
+			record:    func(r *reviewverdict.Record) { r.Context = reviewverdict.Context{} },
+			sc:        &fakeSourceControl{found: false},
+			want:      reviewfreshness.Assessment{State: reviewfreshness.StateNotApplicable, Reason: reviewfreshness.ReasonNoLongerOpen},
+			wantCalls: 1,
 		},
 		{
 			name:  "no code host configured: unconfirmed",
@@ -96,10 +138,11 @@ func TestAssess_Table(t *testing.T) {
 			wantCalls: 1,
 		},
 		{
-			name:      "the head moved: stale",
+			// The probe catches it: no base or chain read, as on the merge path.
+			name:      "the head moved: stale, from the probe",
 			sc:        &fakeSourceControl{found: true, openPR: openAt("h2"), branches: map[string]string{"main": "b1"}},
 			want:      reviewfreshness.Assessment{State: reviewfreshness.StateStale, Reason: string(autoapproval.ReasonStaleVerdict)},
-			wantCalls: 2,
+			wantCalls: 1,
 		},
 		{
 			name:      "the base resolution fails: unconfirmed",
@@ -220,5 +263,26 @@ func TestAssess_NeverCurrentWithoutLiveConfirmation(t *testing.T) {
 	}
 	if got := reviewfreshness.Assess(context.Background(), deps(nil), record, pr7); got.State == reviewfreshness.StateCurrent {
 		t.Errorf("no code host: Assess = %+v, want anything but current", got)
+	}
+}
+
+// TestAssess_OutOfTimeSaysSo pins the caller's own deadline -- a session
+// result's live-read budget -- as its own reason: a read it cuts short is
+// unconfirmed with ReasonOutOfTime, never the cut call's reason and never
+// current. A read cut short by the pull request read's own bound, with the
+// caller's deadline still ahead, keeps saying the pull request could not be
+// read (TestAssess_PartialReadTimeoutIsUnconfirmed).
+func TestAssess_OutOfTimeSaysSo(t *testing.T) {
+	t.Parallel()
+	sc := &fakeSourceControl{found: true, openPR: openAt("h1"), branches: map[string]string{"main": "b1"}, openDelay: time.Second}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	got := reviewfreshness.Assess(ctx, reviewfreshness.Deps{SourceControl: sc, Token: "t", Timeouts: platform.DefaultTimeouts()}, freshRecord(), pr7)
+	want := reviewfreshness.Assessment{State: reviewfreshness.StateUnconfirmed, Reason: reviewfreshness.ReasonOutOfTime}
+	if got != want {
+		t.Fatalf("Assess = %+v, want %+v", got, want)
+	}
+	if calls := sc.callList(); len(calls) != 1 {
+		t.Errorf("live calls = %v, want the one cut-short read and nothing after it", calls)
 	}
 }

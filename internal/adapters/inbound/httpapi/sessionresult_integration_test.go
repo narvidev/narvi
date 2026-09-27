@@ -16,24 +16,30 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/contracts"
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/reviewfreshness"
+	"github.com/narvidev/narvi/internal/app/shadowscm"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/turn"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // resultCodeHost is a fake code host for the result's live freshness read,
@@ -287,10 +293,13 @@ func reasonOf(f restdtos.SessionOutcomeReviewFreshness) string {
 // TestResult_ReviewStatus_Table is row 182's result exit on real Postgres:
 // absent, in_progress, not_assessed, stale, unconfirmed and not_applicable
 // are distinct on the wire; a verdict is current only when the live read
-// confirms it; the record alone decides what it can (a bumped policy, a
-// context never recorded, a merged pull request) with no live read at all;
-// and a session with no pull request says reviewScope none, never an empty
-// list that could read as clean.
+// confirms it; a merged pull request is decided from its claim with no live
+// read at all, while one closed without merging -- perhaps reopened since
+// -- is read live; a verdict the merge path's probe decides (a bumped
+// policy, a context never recorded) costs the pull request read alone and
+// gets the merge path's own reason, a moved head included; and a session
+// with no pull request says reviewScope none, never an empty list that
+// could read as clean.
 func TestResult_ReviewStatus_Table(t *testing.T) {
 	ctx := context.Background()
 	host := newResultCodeHost()
@@ -373,7 +382,7 @@ func TestResult_ReviewStatus_Table(t *testing.T) {
 			want: want{scope: restdtos.SessionOutcomeReviewScopeReviewed, state: restdtos.SessionOutcomeReviewStateAssessed, verdict: true, freshness: restdtos.SessionOutcomeReviewFreshnessStateUnconfirmed, reason: reviewfreshness.ReasonPullRequestUnread, reads: 1},
 		},
 		{
-			name: "the policy was bumped: stale, with no live read",
+			name: "the policy was bumped: stale, from the probe on the pull request read alone",
 			n:    106,
 			setup: func() sqlcgen.Session {
 				host.open(owner, repo, 106, "h1", "main")
@@ -381,7 +390,7 @@ func TestResult_ReviewStatus_Table(t *testing.T) {
 				rc.policy = autoapproval.CurrentPolicyVersion - 1
 				return assessed(106, rc)
 			},
-			want: want{scope: restdtos.SessionOutcomeReviewScopeReviewed, state: restdtos.SessionOutcomeReviewStateAssessed, verdict: true, freshness: restdtos.SessionOutcomeReviewFreshnessStateStale, reason: string(autoapproval.ReasonPolicyVersionMismatch)},
+			want: want{scope: restdtos.SessionOutcomeReviewScopeReviewed, state: restdtos.SessionOutcomeReviewStateAssessed, verdict: true, freshness: restdtos.SessionOutcomeReviewFreshnessStateStale, reason: string(autoapproval.ReasonPolicyVersionMismatch), reads: 1},
 		},
 		{
 			name: "everything as recorded: current",
@@ -405,13 +414,53 @@ func TestResult_ReviewStatus_Table(t *testing.T) {
 			want: want{scope: restdtos.SessionOutcomeReviewScopeReviewed, state: restdtos.SessionOutcomeReviewStateAssessed, verdict: true, freshness: restdtos.SessionOutcomeReviewFreshnessStateNotApplicable, reason: "the pull request has been merged"},
 		},
 		{
-			name: "no context recorded: unconfirmed, with no live read",
+			name: "no context recorded: unconfirmed, from the probe on the pull request read alone",
 			n:    109,
 			setup: func() sqlcgen.Session {
 				host.open(owner, repo, 109, "h1", "main")
 				return assessed(109, recordedContext{policy: autoapproval.CurrentPolicyVersion})
 			},
-			want: want{scope: restdtos.SessionOutcomeReviewScopeReviewed, state: restdtos.SessionOutcomeReviewStateAssessed, verdict: true, freshness: restdtos.SessionOutcomeReviewFreshnessStateUnconfirmed, reason: string(autoapproval.ReasonContextUnknown)},
+			want: want{scope: restdtos.SessionOutcomeReviewScopeReviewed, state: restdtos.SessionOutcomeReviewStateAssessed, verdict: true, freshness: restdtos.SessionOutcomeReviewFreshnessStateUnconfirmed, reason: string(autoapproval.ReasonContextUnknown), reads: 1},
+		},
+		{
+			// The merge path's probe compares the live head before anything
+			// the record lacks (finding P8): stale, as the merge path says.
+			name: "no context recorded and the head moved: stale, the merge path's reason",
+			n:    115,
+			setup: func() sqlcgen.Session {
+				host.open(owner, repo, 115, "h2", "main")
+				return assessed(115, recordedContext{policy: autoapproval.CurrentPolicyVersion})
+			},
+			want: want{scope: restdtos.SessionOutcomeReviewScopeReviewed, state: restdtos.SessionOutcomeReviewStateAssessed, verdict: true, freshness: restdtos.SessionOutcomeReviewFreshnessStateStale, reason: string(autoapproval.ReasonStaleVerdict), reads: 1},
+		},
+		{
+			// The closed webhook stamps the claim once and nothing clears it
+			// on reopen (finding P2): a pull request closed without merging is
+			// read live, and reopened it reads current.
+			name: "closed without merging, then reopened: read live, current",
+			n:    116,
+			setup: func() sqlcgen.Session {
+				sess := assessed(116, currentContext())
+				if _, err := rig.prSessions.RecordMergeOutcome(ctx, full, 116, false, time.Now()); err != nil {
+					t.Fatalf("record the close: %v", err)
+				}
+				host.open(owner, repo, 116, "h1", "main")
+				return sess
+			},
+			want: want{scope: restdtos.SessionOutcomeReviewScopeReviewed, state: restdtos.SessionOutcomeReviewStateAssessed, verdict: true, freshness: restdtos.SessionOutcomeReviewFreshnessStateCurrent, reads: 1},
+		},
+		{
+			name: "closed without merging and still closed: not_applicable, from the live read",
+			n:    117,
+			setup: func() sqlcgen.Session {
+				sess := assessed(117, currentContext())
+				if _, err := rig.prSessions.RecordMergeOutcome(ctx, full, 117, false, time.Now()); err != nil {
+					t.Fatalf("record the close: %v", err)
+				}
+				host.set(owner, repo, 117, resultHostPR{found: false})
+				return sess
+			},
+			want: want{scope: restdtos.SessionOutcomeReviewScopeReviewed, state: restdtos.SessionOutcomeReviewStateAssessed, verdict: true, freshness: restdtos.SessionOutcomeReviewFreshnessStateNotApplicable, reason: reviewfreshness.ReasonNoLongerOpen, reads: 1},
 		},
 		{
 			name: "the base moved forward only: current",
@@ -952,5 +1001,455 @@ func TestResult_UnknownAndMalformedSession(t *testing.T) {
 	}
 	if status := rig.doJSON(t, http.MethodGet, "/api/sessions/not-a-uuid/result", nil, nil, cookie); status != http.StatusBadRequest {
 		t.Errorf("malformed id: %d, want 400", status)
+	}
+}
+
+// neverCreates is the live side under the production shadow decorator in
+// the tests below: a suppressed creation must never reach it.
+type neverCreates struct {
+	ports.SourceControl
+	t *testing.T
+}
+
+func (n neverCreates) CreatePR(context.Context, ports.CreatePRSpec) (ports.PRRef, error) {
+	n.t.Error("the live CreatePR was called for a creation the decorator suppresses")
+	return ports.PRRef{}, errors.New("never")
+}
+
+// suppressedPRArtifact makes the production shadow decorator suppress a
+// pull request creation on owner/repo -- the repository resolving to
+// shadow, as a repository never promoted does -- and records the ref it
+// hands back exactly as the session actor's recordPRArtifact records any
+// created pull request: the bare repository name and the ref's number as
+// metadata, the ref's URL as the URL.
+func suppressedPRArtifact(ctx context.Context, t *testing.T, r testRig, sessionID pgtype.UUID, owner, repo string) ports.PRRef {
+	t.Helper()
+	decorator, err := shadowscm.New(neverCreates{t: t}, r.shadowLedger, func(context.Context, string) bool { return false })
+	if err != nil {
+		t.Fatalf("build the shadow decorator: %v", err)
+	}
+	ref, err := decorator.CreatePR(ctx, ports.CreatePRSpec{Owner: owner, Repo: repo, Head: "narvi/shadow-" + repo, Base: "main", Title: "t", Body: "b", Token: "creator-token"})
+	if err != nil {
+		t.Fatalf("suppressed CreatePR: %v", err)
+	}
+	if !shadowscm.IsSyntheticPRRef(ref) {
+		t.Fatalf("the decorator answered %+v, want its synthetic ref -- this test proves nothing otherwise", ref)
+	}
+	meta, err := json.Marshal(map[string]any{"repo": repo, "number": ref.Number})
+	if err != nil {
+		t.Fatalf("marshal metadata: %v", err)
+	}
+	if _, err := r.artifacts.Create(ctx, sqlcgen.CreateArtifactParams{SessionID: sessionID, Type: sqlcgen.ArtifactTypePr, Url: ref.URL, Metadata: meta}); err != nil {
+		t.Fatalf("record the suppressed pull request artifact: %v", err)
+	}
+	return ref
+}
+
+// endedRun records a run that completed, so the result has a lastRun.
+func endedRun(ctx context.Context, t *testing.T, r testRig, sessionID pgtype.UUID) sqlcgen.Turn {
+	t.Helper()
+	run := createTurn(ctx, t, r.turns, sessionID, false)
+	state := turn.StatePending
+	for _, trig := range endedCompleted {
+		state = transitionTurn(ctx, t, r.turns, run.ID, state, trig)
+	}
+	return run
+}
+
+// TestResult_ExcludedPullRequestsNeverFailTheResult is finding P1's
+// regression on real Postgres: the artifact the production shadow decorator
+// leaves when it suppresses a pull request creation -- the default for
+// every repository never promoted -- and a record this build cannot read
+// each answer 200, listed in excludedPullRequests with why, never as a pull
+// request and never dropped, while the rest of the result -- the last run,
+// a real pull request beside them and its verdict's live freshness --
+// stands.
+func TestResult_ExcludedPullRequestsNeverFailTheResult(t *testing.T) {
+	ctx := context.Background()
+	host := newResultCodeHost()
+	rig, user, cookie := newResultRig(t, host)
+	repos := map[string]string{"widgets": "https://github.com/acme/widgets.git", "gadgets": "https://github.com/acme/gadgets.git"}
+
+	// exclusionsOf reads the result and returns its excluded entries, with
+	// the raw ones, asserting no pull request is the synthetic one.
+	exclusionsOf := func(t *testing.T, sessionID pgtype.UUID) (restdtos.SessionOutcome, []map[string]any) {
+		t.Helper()
+		got, raw := getResult(t, rig, sessionID, cookie)
+		for _, pr := range got.PullRequests {
+			if pr.Number < 1 || strings.HasPrefix(pr.Url, "shadow-suppressed://") {
+				t.Fatalf("pullRequests lists %+v, which is no pull request", pr)
+			}
+		}
+		list, ok := raw["excludedPullRequests"].([]any)
+		if !ok {
+			t.Fatalf("excludedPullRequests = %#v, want an array on the wire", raw["excludedPullRequests"])
+		}
+		var entries []map[string]any
+		for _, e := range list {
+			entries = append(entries, e.(map[string]any))
+		}
+		if got.LastRun == nil {
+			t.Fatal("lastRun is null: the result did not stand around the excluded record")
+		}
+		return got, entries
+	}
+	wantShadow := func(t *testing.T, got restdtos.SessionOutcomeExcludedPullRequest, raw map[string]any) {
+		t.Helper()
+		if got.Kind != restdtos.SessionOutcomeExcludedPullRequestKindShadowSuppressed || got.RepoFullName == nil || *got.RepoFullName != "acme/widgets" || got.Reason == "" {
+			t.Fatalf("excluded = %+v, want shadow_suppressed on acme/widgets with a reason", got)
+		}
+		if v, ok := raw["url"]; !ok || v != nil {
+			t.Fatalf("a suppressed creation's url = %#v (present %v), want null: no pull request exists", v, ok)
+		}
+	}
+
+	t.Run("a suppressed creation alone", func(t *testing.T) {
+		sess := sessionWithRepos(ctx, t, rig, user.ID, repos)
+		endedRun(ctx, t, rig, sess.ID)
+		suppressedPRArtifact(ctx, t, rig, sess.ID, "acme", "widgets")
+		got, raw := exclusionsOf(t, sess.ID)
+		if len(got.PullRequests) != 0 || got.ReviewScope != restdtos.SessionOutcomeReviewScopeNone || len(got.ExcludedPullRequests) != 1 {
+			t.Fatalf("pullRequests %+v scope %q excluded %+v, want none opened, scope none, the suppressed one excluded", got.PullRequests, got.ReviewScope, got.ExcludedPullRequests)
+		}
+		wantShadow(t, got.ExcludedPullRequests[0], raw[0])
+	})
+
+	t.Run("a suppressed creation beside a real pull request and its verdict", func(t *testing.T) {
+		sess := sessionWithRepos(ctx, t, rig, user.ID, repos)
+		endedRun(ctx, t, rig, sess.ID)
+		suppressedPRArtifact(ctx, t, rig, sess.ID, "acme", "widgets")
+		prArtifact(ctx, t, rig, sess.ID, "gadgets", 7, "https://github.com/acme/gadgets/pull/7")
+		reviewer := reviewSession(ctx, t, rig, user.ID, "acme/gadgets", 7)
+		a := reviewAttempt(ctx, t, rig, reviewer.ID, endedCompleted...)
+		verdictAt(ctx, t, rig, reviewer.ID, "acme/gadgets", 7, a.ID, "h1", currentContext())
+		host.open("acme", "gadgets", 7, "h1", "main")
+		host.branch("acme", "gadgets", "main", "b1")
+
+		got, raw := exclusionsOf(t, sess.ID)
+		if len(got.PullRequests) != 1 || got.PullRequests[0].RepoFullName != "acme/gadgets" || got.PullRequests[0].Number != 7 {
+			t.Fatalf("pullRequests = %+v, want acme/gadgets#7 alone", got.PullRequests)
+		}
+		if f := got.PullRequests[0].Review.Freshness; got.PullRequests[0].Review.State != restdtos.SessionOutcomeReviewStateAssessed || f.State != restdtos.SessionOutcomeReviewFreshnessStateCurrent {
+			t.Fatalf("acme/gadgets#7 review = %+v, want assessed and current, read live", got.PullRequests[0].Review)
+		}
+		if got.ReviewScope != restdtos.SessionOutcomeReviewScopeProduced || len(got.ExcludedPullRequests) != 1 {
+			t.Fatalf("scope %q excluded %+v, want produced, the suppressed one excluded", got.ReviewScope, got.ExcludedPullRequests)
+		}
+		wantShadow(t, got.ExcludedPullRequests[0], raw[0])
+	})
+
+	t.Run("a record this build cannot read, beside a real pull request", func(t *testing.T) {
+		sess := sessionWithRepos(ctx, t, rig, user.ID, repos)
+		endedRun(ctx, t, rig, sess.ID)
+		// Valid JSON (the column is jsonb), of no shape the actor writes.
+		if _, err := rig.artifacts.Create(ctx, sqlcgen.CreateArtifactParams{SessionID: sess.ID, Type: sqlcgen.ArtifactTypePr, Url: "https://code.example.invalid/somewhere", Metadata: []byte(`{"repo":["not","a","name"],"number":"seven"}`)}); err != nil {
+			t.Fatalf("record the garbage artifact: %v", err)
+		}
+		prArtifact(ctx, t, rig, sess.ID, "gadgets", 8, "https://github.com/acme/gadgets/pull/8")
+
+		got, raw := exclusionsOf(t, sess.ID)
+		if len(got.PullRequests) != 1 || got.PullRequests[0].Number != 8 {
+			t.Fatalf("pullRequests = %+v, want acme/gadgets#8 alone", got.PullRequests)
+		}
+		if len(got.ExcludedPullRequests) != 1 {
+			t.Fatalf("excluded = %+v, want the garbage record", got.ExcludedPullRequests)
+		}
+		e := got.ExcludedPullRequests[0]
+		if e.Kind != restdtos.SessionOutcomeExcludedPullRequestKindUnreadable || e.Reason == "" || e.Url == nil || *e.Url != "https://code.example.invalid/somewhere" {
+			t.Fatalf("excluded = %+v, want unreadable, with a reason and the URL it holds", e)
+		}
+		if v, ok := raw[0]["repoFullName"]; !ok || v != nil {
+			t.Fatalf("an unreadable record's repoFullName = %#v (present %v), want null", v, ok)
+		}
+	})
+
+	t.Run("no pull request record at all: an empty array, never absent", func(t *testing.T) {
+		sess := sessionWithRepos(ctx, t, rig, user.ID, repos)
+		endedRun(ctx, t, rig, sess.ID)
+		if got, entries := exclusionsOf(t, sess.ID); len(entries) != 0 || len(got.ExcludedPullRequests) != 0 {
+			t.Fatalf("excluded = %+v, want []", got.ExcludedPullRequests)
+		}
+	})
+}
+
+// stallingCodeHost never answers a pull request read before its caller
+// gives up, and counts the reads it was asked for.
+type stallingCodeHost struct {
+	ports.SourceControl
+	started atomic.Int32
+}
+
+func (h *stallingCodeHost) GetOpenPR(ctx context.Context, _, _ string, _ int, _ string) (ports.OpenPR, bool, error) {
+	h.started.Add(1)
+	<-ctx.Done()
+	return ports.OpenPR{}, false, ctx.Err()
+}
+
+// TestResult_LiveReadBudgetBoundsTheCall is finding P4's bound: a code host
+// that never answers holds a result call for SessionResultLiveReadBudget --
+// every assessed pull request's read at once, not one after another -- and
+// not for the per-read bounds, which add up past the MCP wait bound; each
+// verdict then reads unconfirmed, saying it ran out of time.
+func TestResult_LiveReadBudgetBoundsTheCall(t *testing.T) {
+	ctx := context.Background()
+	host := &stallingCodeHost{}
+	const budget = 300 * time.Millisecond
+	rig := newTestRig(t, func(r *testRig) {
+		r.resultSourceControl = host
+		r.resultTimeouts.SessionResultLiveReadBudget = budget
+	})
+	user, cookie := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMember)
+	if per := rig.resultTimeouts.GitHubGetOpenPRTimeout; per < 10*budget {
+		t.Fatalf("GitHubGetOpenPRTimeout %v is not far above the budget %v: this test could not tell them apart", per, budget)
+	}
+
+	// A review session of acme/slow#1 that also opened acme/slow#2, both
+	// assessed: two live reads.
+	sess := sessionWithRepos(ctx, t, rig, user.ID, map[string]string{"slow": "https://github.com/acme/slow.git"})
+	if err := rig.prSessions.EnsureRow(ctx, "acme/slow", 1); err != nil {
+		t.Fatalf("ensure claim row: %v", err)
+	}
+	if err := rig.prSessions.SetSessionID(ctx, "acme/slow", 1, sess.ID); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	a := reviewAttempt(ctx, t, rig, sess.ID, endedCompleted...)
+	verdictAt(ctx, t, rig, sess.ID, "acme/slow", 1, a.ID, "h1", currentContext())
+	prArtifact(ctx, t, rig, sess.ID, "slow", 2, "https://github.com/acme/slow/pull/2")
+	verdictAt(ctx, t, rig, sess.ID, "acme/slow", 2, pgtype.UUID{}, "h1", currentContext())
+
+	began := time.Now()
+	got, _ := getResult(t, rig, sess.ID, cookie)
+	elapsed := time.Since(began)
+
+	if elapsed < budget || elapsed > budget+5*time.Second {
+		t.Fatalf("the call took %v, want the budget %v and little more", elapsed, budget)
+	}
+	if n := host.started.Load(); n != 2 {
+		t.Fatalf("pull request reads begun = %d, want both, at once", n)
+	}
+	if got.ReviewedPullRequest == nil || len(got.PullRequests) != 1 {
+		t.Fatalf("result = %+v, want the reviewed and the opened pull request", got)
+	}
+	for _, review := range []restdtos.SessionOutcomeReview{got.ReviewedPullRequest.Review, got.PullRequests[0].Review} {
+		if review.Freshness.State != restdtos.SessionOutcomeReviewFreshnessStateUnconfirmed || reasonOf(review.Freshness) != reviewfreshness.ReasonOutOfTime {
+			t.Fatalf("freshness = %q (%q), want unconfirmed, out of time", review.Freshness.State, reasonOf(review.Freshness))
+		}
+	}
+	if got.SuggestedDelaySeconds != int(rig.resultTimeouts.SessionResultDelayLiveRead/time.Second) {
+		t.Fatalf("suggestedDelaySeconds = %d, want the settled, read-live value", got.SuggestedDelaySeconds)
+	}
+}
+
+// TestResult_SuggestedDelay pins suggestedDelaySeconds on the wire: the
+// unsettled value while the session can still change, the read-live value
+// once settled with a verdict's freshness read live, the settled value when
+// nothing was -- including when no code host is configured, so nothing
+// could be.
+func TestResult_SuggestedDelay(t *testing.T) {
+	ctx := context.Background()
+	to := platform.DefaultTimeouts()
+	seconds := func(d time.Duration) int { return int(d / time.Second) }
+	assessedAndCurrent := func(t *testing.T, rig testRig, user sqlcgen.User, host *resultCodeHost) sqlcgen.Session {
+		sess := reviewSession(ctx, t, rig, user.ID, "acme/delays", 3)
+		a := reviewAttempt(ctx, t, rig, sess.ID, endedCompleted...)
+		verdictAt(ctx, t, rig, sess.ID, "acme/delays", 3, a.ID, "h1", currentContext())
+		if host != nil {
+			host.open("acme", "delays", 3, "h1", "main")
+			host.branch("acme", "delays", "main", "b1")
+		}
+		return sess
+	}
+
+	host := newResultCodeHost()
+	rig, user, cookie := newResultRig(t, host)
+	queued := createSessionForUser(ctx, t, rig, user.ID, nil)
+	createTurn(ctx, t, rig.turns, queued.ID, false)
+	finished := createSessionForUser(ctx, t, rig, user.ID, nil)
+	endedRun(ctx, t, rig, finished.ID)
+	live := assessedAndCurrent(t, rig, user, host)
+
+	for _, tc := range []struct {
+		name string
+		sess sqlcgen.Session
+		want int
+	}{
+		{"queued: unsettled", queued, seconds(to.SessionResultDelayUnsettled)},
+		{"finished, nothing to read live: settled", finished, seconds(to.SessionResultDelaySettled)},
+		{"finished, a verdict read live: read-live", live, seconds(to.SessionResultDelayLiveRead)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, raw := getResult(t, rig, tc.sess.ID, cookie)
+			if got.SuggestedDelaySeconds != tc.want {
+				t.Fatalf("suggestedDelaySeconds = %d, want %d", got.SuggestedDelaySeconds, tc.want)
+			}
+			if _, ok := raw["suggestedDelaySeconds"].(float64); !ok {
+				t.Fatalf("suggestedDelaySeconds = %#v on the wire, want a number", raw["suggestedDelaySeconds"])
+			}
+		})
+	}
+
+	t.Run("no code host: nothing is read live, settled", func(t *testing.T) {
+		bare, member, memberCookie := newResultRig(t, nil)
+		sess := assessedAndCurrent(t, bare, member, nil)
+		got, _ := getResult(t, bare, sess.ID, memberCookie)
+		if got.SuggestedDelaySeconds != seconds(to.SessionResultDelaySettled) {
+			t.Fatalf("suggestedDelaySeconds = %d, want the settled value", got.SuggestedDelaySeconds)
+		}
+	})
+}
+
+// TestResult_OneSnapshot_NeverMixesInstants proves the handler's one
+// repeatable-read snapshot (finding P5): the result's first read is taken,
+// then -- while the handler waits on review_verdicts, locked by another
+// transaction -- a newer review attempt and that attempt's verdict are
+// committed. The result must report the review exactly as it stood at its
+// snapshot: the older attempt's verdict, assessed. Read outside the
+// snapshot (a store bound to the pool, or a weaker isolation level), the
+// newer verdict would be paired with the older attempt.
+func TestResult_OneSnapshot_NeverMixesInstants(t *testing.T) {
+	ctx := context.Background()
+	rig, user, cookie := newResultRig(t, nil)
+	const full, n = "acme/snapshot", 5
+
+	sess := reviewSession(ctx, t, rig, user.ID, full, n)
+	older := reviewAttempt(ctx, t, rig, sess.ID, endedCompleted...)
+	olderVerdict := verdictAt(ctx, t, rig, sess.ID, full, n, older.ID, "h1", currentContext())
+
+	lockTx, err := rig.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin the locking transaction: %v", err)
+	}
+	defer func() { _ = lockTx.Rollback(ctx) }()
+	if _, err := lockTx.Exec(ctx, "LOCK TABLE review_verdicts IN ACCESS EXCLUSIVE MODE"); err != nil {
+		t.Fatalf("lock review_verdicts: %v", err)
+	}
+
+	var got restdtos.SessionOutcome
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		// Not rig.doJSON: that fails the test from its own goroutine.
+		req, err := http.NewRequestWithContext(gctx, http.MethodGet, rig.server.URL+"/api/sessions/"+sess.ID.String()+"/result", nil)
+		if err != nil {
+			return err
+		}
+		req.AddCookie(&http.Cookie{Name: platform.AuthSessionCookieName, Value: cookie})
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = resp.Body.Close() }()
+		raw, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("GET result: %d (%s)", resp.StatusCode, raw)
+		}
+		return json.Unmarshal(raw, &got)
+	})
+
+	// Wait until the handler, its snapshot already taken, waits on the lock.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var waiting int
+		if err := lockTx.QueryRow(ctx, "SELECT count(*) FROM pg_locks WHERE relation = 'review_verdicts'::regclass AND NOT granted").Scan(&waiting); err != nil {
+			t.Fatalf("read pg_locks: %v", err)
+		}
+		if waiting > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the result never waited on review_verdicts: this test proves nothing")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// A newer attempt, and its verdict, committed after the snapshot.
+	newer, err := rig.turns.WithTx(lockTx).Create(ctx, sqlcgen.CreateTurnParams{SessionID: sess.ID, Status: sqlcgen.TurnStatusPending, IsReviewAttempt: true})
+	if err != nil {
+		t.Fatalf("create the newer attempt: %v", err)
+	}
+	newerVerdict := insertVerdictOn(ctx, t, rig.reviewVerdicts.WithTx(lockTx), sess.ID, full, n, newer.ID, "h2")
+	if err := lockTx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	if err := g.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	r := got.ReviewedPullRequest
+	if r == nil || r.Review.State != restdtos.SessionOutcomeReviewStateAssessed || r.Review.Verdict == nil {
+		t.Fatalf("reviewedPullRequest = %+v, want assessed, as at the snapshot", r)
+	}
+	if id := r.Review.Verdict.VerdictId; id != olderVerdict.ID.String() {
+		t.Fatalf("verdict = %s, want the older attempt's %s -- not %s, committed after the snapshot", id, olderVerdict.ID.String(), newerVerdict.ID.String())
+	}
+}
+
+// insertVerdictOn records a verdict for repoFullName#n posted by attemptID
+// at head through store (bound to the caller's transaction).
+func insertVerdictOn(ctx context.Context, t *testing.T, store interface {
+	Insert(context.Context, sqlcgen.InsertReviewVerdictParams) (sqlcgen.ReviewVerdict, error)
+}, sessionID pgtype.UUID, repoFullName string, n int32, attemptID pgtype.UUID, head string) sqlcgen.ReviewVerdict {
+	t.Helper()
+	rc := currentContext()
+	row, err := store.Insert(ctx, sqlcgen.InsertReviewVerdictParams{
+		RepoFullName: repoFullName, PrNumber: n, HeadSha: head,
+		RiskLevel: "low", Premise: "ok", BlastRadius: []byte(`[]`), FilesChanged: 1, TestsCoverage: "adequate", DocsDrift: "none",
+		ProposedShippable: "auto", Shippable: "auto", SessionID: sessionID,
+		ArchDecisionTags: []byte(`[]`), ArchDecisionRoots: []byte(`[]`), AncestorChain: []byte(`[]`),
+		BaseRef: rc.baseRef, BaseSha: rc.baseSHA, PolicyVersion: rc.policy, AttemptID: attemptID,
+	})
+	if err != nil {
+		t.Fatalf("insert verdict: %v", err)
+	}
+	return row
+}
+
+// TestResult_LastRunValues pins lastRun's values, not only their presence
+// (finding P6): planMode is the run's, costUsd the total of its recorded
+// step costs, startedAt its dispatch and finishedAt its completion -- two
+// different instants.
+func TestResult_LastRunValues(t *testing.T) {
+	ctx := context.Background()
+	rig, user, cookie := newResultRig(t, nil)
+	sess := createSessionForUser(ctx, t, rig, user.ID, nil)
+	run := createTurn(ctx, t, rig.turns, sess.ID, true)
+
+	dispatchedAt := time.Now().Add(-time.Hour).Truncate(time.Microsecond)
+	if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: run.ID, Status: sqlcgen.TurnStatusDispatched, DispatchedAt: pgtype.Timestamptz{Time: dispatchedAt, Valid: true}}); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	transitionTurn(ctx, t, rig.turns, run.ID, turn.StateDispatched, turn.TriggerStartProcessing)
+	for step, cost := range map[string]float64{"step-1": 1.00, "step-2": 0.23} {
+		if n, err := rig.turns.RecordStepCostUSD(ctx, sess.ID, step, cost); err != nil || n != 1 {
+			t.Fatalf("record %s's cost: %d rows, %v", step, n, err)
+		}
+	}
+	transitionTurn(ctx, t, rig.turns, run.ID, turn.StateProcessing, turn.TriggerComplete)
+	row, err := rig.turns.Get(ctx, run.ID)
+	if err != nil || !row.CompletedAt.Valid {
+		t.Fatalf("read the ended run: %v (completed %v)", err, row.CompletedAt.Valid)
+	}
+
+	got, raw := getResult(t, rig, sess.ID, cookie)
+	lr := got.LastRun
+	if lr == nil || lr.TurnId != run.ID.String() {
+		t.Fatalf("lastRun = %+v, want the run", lr)
+	}
+	if !lr.PlanMode {
+		t.Error("planMode = false, want the plan-mode run's true")
+	}
+	if lr.CostUsd == nil || math.Abs(*lr.CostUsd-1.23) > 1e-9 {
+		t.Errorf("costUsd = %v, want 1.23, the sum of the run's step costs", lr.CostUsd)
+	}
+	if lr.StartedAt == nil || !lr.StartedAt.Equal(dispatchedAt) {
+		t.Errorf("startedAt = %v, want the dispatch at %v", lr.StartedAt, dispatchedAt)
+	}
+	if lr.FinishedAt == nil || !lr.FinishedAt.Equal(row.CompletedAt.Time) || lr.FinishedAt.Equal(dispatchedAt) {
+		t.Errorf("finishedAt = %v, want the completion at %v, not the dispatch", lr.FinishedAt, row.CompletedAt.Time)
+	}
+	if v, ok := raw["lastRun"].(map[string]any)["costUsd"].(float64); !ok || math.Abs(v-1.23) > 1e-9 {
+		t.Errorf("costUsd on the wire = %#v, want the number 1.23", raw["lastRun"].(map[string]any)["costUsd"])
 	}
 }

@@ -11813,8 +11813,13 @@ func (j *SessionFailureReason) UnmarshalJSON(value []byte) error {
 // context -- head, base ref and commit, ancestor chain, policy version -- is
 // compared with the pull request as the code host reports it now, by the same
 // comparison the merge path runs, and a read that fails or times out reports the
-// verdict unconfirmed, never current. Verdicts are read as the code-review view
-// reads them (GET /api/sessions/{sessionID}/review). The same gate as GET
+// verdict unconfirmed, never current. All of one call's live reads share one time
+// budget (20 seconds as shipped), so the answer never waits on a slow code host
+// past it. A pull request record the session holds that is not a pull request it
+// opened -- one whose creation was suppressed in shadow mode, or one this server
+// cannot read -- is listed in excludedPullRequests with why, never dropped and
+// never failing the result. Verdicts are read as the code-review view reads them
+// (GET /api/sessions/{sessionID}/review). The same gate as GET
 // /api/sessions/{sessionID}: signed in, 400 for a malformed id, 404 for a session
 // that does not exist, no per-session visibility. Carries no events and no
 // transcript: the event history is GET /api/sessions/{sessionID}/events
@@ -11827,20 +11832,29 @@ type SessionOutcome struct {
 	// /api/sessions/{sessionID}/status) or wait on it to know when it is settled.
 	Activity SessionOutcomeActivity `json:"activity" yaml:"activity" mapstructure:"activity"`
 
+	// The session's pull request records that pullRequests does not list, oldest
+	// first, each with why -- so a record is never silently dropped, and one this
+	// server cannot read never fails the rest of the result. Empty when every record
+	// is a pull request the session opened.
+	ExcludedPullRequests []SessionOutcomeExcludedPullRequest `json:"excludedPullRequests" yaml:"excludedPullRequests" mapstructure:"excludedPullRequests"`
+
 	// The most recently created turn that reached a terminal state --
 	// SessionActivity.lastRun's turn -- with what it cost and a summary of what it
 	// said; null when no turn has ended.
 	LastRun *SessionOutcomeLastRun `json:"lastRun" yaml:"lastRun" mapstructure:"lastRun"`
 
 	// The pull requests this session opened (its pull request artifacts), oldest
-	// first; empty when it opened none.
+	// first; empty when it opened none. Only pull requests that exist: a record
+	// naming no real pull request is in excludedPullRequests instead.
 	PullRequests []SessionOutcomePullRequest `json:"pullRequests" yaml:"pullRequests" mapstructure:"pullRequests"`
 
 	// Which pull requests this result reports a verdict for. 'none': the session
 	// opened no pull request and is no pull request's review session, so there is no
 	// verdict to report -- which is not a clean review: pullRequests is empty and
-	// reviewedPullRequest null. 'produced': the session opened the pull requests in
-	// pullRequests and reviews none. 'reviewed': the session is the review session of
+	// reviewedPullRequest null (excludedPullRequests may still list a pull request
+	// the session would have opened in shadow mode, or a record that could not be
+	// read). 'produced': the session opened the pull requests in pullRequests and
+	// reviews none. 'reviewed': the session is the review session of
 	// reviewedPullRequest (pullRequests lists any it also opened, such as its own
 	// push's).
 	ReviewScope SessionOutcomeReviewScope `json:"reviewScope" yaml:"reviewScope" mapstructure:"reviewScope"`
@@ -11851,6 +11865,16 @@ type SessionOutcome struct {
 
 	// SessionId corresponds to the JSON schema field "sessionId".
 	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+
+	// How long to wait before reading this result again, in whole seconds (rounded
+	// up): 30 while the session can still change (activity is not settled -- to learn
+	// when it settles, wait on its status instead, a much cheaper read); 60 once
+	// settled when a verdict's freshness was read live in this call, since every read
+	// of the result asks the code host again; 300 once settled with nothing read live
+	// -- always within the deployment's configured floor and ceiling (30 and 300
+	// seconds as shipped). A hint that keeps polling quiet, never a limit: an earlier
+	// read is answered all the same.
+	SuggestedDelaySeconds int `json:"suggestedDelaySeconds" yaml:"suggestedDelaySeconds" mapstructure:"suggestedDelaySeconds"`
 }
 
 type SessionOutcomeActivity string
@@ -11890,6 +11914,106 @@ func (j *SessionOutcomeActivity) UnmarshalJSON(value []byte) error {
 		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_SessionOutcomeActivity, v)
 	}
 	*j = SessionOutcomeActivity(v)
+	return nil
+}
+
+// One pull request record of a session that is not a pull request it opened
+// (SessionOutcome.excludedPullRequests), and why. It has no review: there is
+// either no pull request to review, or none this server can name.
+type SessionOutcomeExcludedPullRequest struct {
+	// When the session recorded it.
+	CreatedAt time.Time `json:"createdAt" yaml:"createdAt" mapstructure:"createdAt"`
+
+	// 'shadow_suppressed': the session would have opened this pull request, but
+	// outbound writes to its repository were in shadow mode, so the creation was
+	// recorded and suppressed -- no pull request exists, and there is nothing to
+	// review. 'unreadable': this server could not read the record; it may name a real
+	// pull request, whose review this result therefore cannot report (reason says
+	// what could not be read). An OPEN enum (manifest.json's openEnums): a consumer
+	// MUST tolerate a value it does not recognise.
+	Kind SessionOutcomeExcludedPullRequestKind `json:"kind" yaml:"kind" mapstructure:"kind"`
+
+	// Why it is not in pullRequests, for a person to read.
+	Reason string `json:"reason" yaml:"reason" mapstructure:"reason"`
+
+	// owner/repo, for 'shadow_suppressed': the owner of the session's own repository
+	// of the recorded name, as for pullRequests. Null when the session's repositories
+	// cannot say, and always for 'unreadable'.
+	RepoFullName SessionOutcomeExcludedPullRequestRepoFullName `json:"repoFullName" yaml:"repoFullName" mapstructure:"repoFullName"`
+
+	// The URL the record holds, for 'unreadable' (null when it holds none). Always
+	// null for 'shadow_suppressed': no pull request exists, so there is no URL to
+	// follow.
+	Url SessionOutcomeExcludedPullRequestUrl `json:"url" yaml:"url" mapstructure:"url"`
+}
+
+type SessionOutcomeExcludedPullRequestKind string
+
+const SessionOutcomeExcludedPullRequestKindShadowSuppressed SessionOutcomeExcludedPullRequestKind = "shadow_suppressed"
+const SessionOutcomeExcludedPullRequestKindUnreadable SessionOutcomeExcludedPullRequestKind = "unreadable"
+
+var enumValues_SessionOutcomeExcludedPullRequestKind = []interface{}{
+	"shadow_suppressed",
+	"unreadable",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeExcludedPullRequestKind) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_SessionOutcomeExcludedPullRequestKind {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_SessionOutcomeExcludedPullRequestKind, v)
+	}
+	*j = SessionOutcomeExcludedPullRequestKind(v)
+	return nil
+}
+
+// owner/repo, for 'shadow_suppressed': the owner of the session's own repository
+// of the recorded name, as for pullRequests. Null when the session's repositories
+// cannot say, and always for 'unreadable'.
+type SessionOutcomeExcludedPullRequestRepoFullName *string
+
+// The URL the record holds, for 'unreadable' (null when it holds none). Always
+// null for 'shadow_suppressed': no pull request exists, so there is no URL to
+// follow.
+type SessionOutcomeExcludedPullRequestUrl *string
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeExcludedPullRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["createdAt"]; raw != nil && !ok {
+		return fmt.Errorf("field createdAt in SessionOutcomeExcludedPullRequest: required")
+	}
+	if _, ok := raw["kind"]; raw != nil && !ok {
+		return fmt.Errorf("field kind in SessionOutcomeExcludedPullRequest: required")
+	}
+	if _, ok := raw["reason"]; raw != nil && !ok {
+		return fmt.Errorf("field reason in SessionOutcomeExcludedPullRequest: required")
+	}
+	if _, ok := raw["repoFullName"]; raw != nil && !ok {
+		return fmt.Errorf("field repoFullName in SessionOutcomeExcludedPullRequest: required")
+	}
+	if _, ok := raw["url"]; raw != nil && !ok {
+		return fmt.Errorf("field url in SessionOutcomeExcludedPullRequest: required")
+	}
+	type Plain SessionOutcomeExcludedPullRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = SessionOutcomeExcludedPullRequest(plain)
 	return nil
 }
 
@@ -12179,28 +12303,32 @@ type SessionOutcomeReview struct {
 // Whether verdict still describes the pull request as it stands.
 type SessionOutcomeReviewFreshness struct {
 	// Why, for 'stale' and 'unconfirmed': the merge path's own reason text for the
-	// comparison's answer, or what could not be read. For 'not_applicable', why a
-	// merged or closed pull request's verdict is moot; null otherwise, and always
-	// null for 'current'.
+	// comparison's answer -- the same reason the merge path gives the same pull
+	// request -- or what could not be read, or that the time budget ran out. For
+	// 'not_applicable', why a merged or no-longer-open pull request's verdict is
+	// moot; null otherwise, and always null for 'current'.
 	Reason SessionOutcomeReviewFreshnessReason `json:"reason" yaml:"reason" mapstructure:"reason"`
 
 	// 'current': the verdict's recorded context -- head, base ref and commit,
 	// ancestor chain, policy version -- matched the pull request's live facts, read
 	// from the code host during this call; never from the record alone. 'stale': the
 	// comparison proved the verdict describes other code, or was produced under other
-	// rules -- the head moved (a push, the session's own included), the base changed,
-	// the ancestor chain changed, or the policy version is older (this last known
-	// without a live read). 'unconfirmed': freshness could not be established -- the
+	// rules -- the head moved (a push, the session's own included, whatever else the
+	// verdict recorded), the base changed, the ancestor chain changed, or the policy
+	// version is older. 'unconfirmed': freshness could not be established -- the
 	// verdict recorded no context, a commit on either side is unknown, or the live
-	// read failed or timed out. 'not_applicable': state is not 'assessed', or the
-	// pull request is merged or closed.
+	// read failed, timed out, or ran past this call's time budget for live reads.
+	// 'not_applicable': state is not 'assessed', or the pull request is merged (per
+	// this system's records, with no live read) or no longer open (per the live read)
+	// -- a pull request once closed and since reopened is read live like any other.
 	State SessionOutcomeReviewFreshnessState `json:"state" yaml:"state" mapstructure:"state"`
 }
 
 // Why, for 'stale' and 'unconfirmed': the merge path's own reason text for the
-// comparison's answer, or what could not be read. For 'not_applicable', why a
-// merged or closed pull request's verdict is moot; null otherwise, and always null
-// for 'current'.
+// comparison's answer -- the same reason the merge path gives the same pull
+// request -- or what could not be read, or that the time budget ran out. For
+// 'not_applicable', why a merged or no-longer-open pull request's verdict is moot;
+// null otherwise, and always null for 'current'.
 type SessionOutcomeReviewFreshnessReason *string
 
 type SessionOutcomeReviewFreshnessState string
@@ -12688,6 +12816,9 @@ func (j *SessionOutcome) UnmarshalJSON(value []byte) error {
 	if _, ok := raw["activity"]; raw != nil && !ok {
 		return fmt.Errorf("field activity in SessionOutcome: required")
 	}
+	if _, ok := raw["excludedPullRequests"]; raw != nil && !ok {
+		return fmt.Errorf("field excludedPullRequests in SessionOutcome: required")
+	}
 	if _, ok := raw["lastRun"]; raw != nil && !ok {
 		return fmt.Errorf("field lastRun in SessionOutcome: required")
 	}
@@ -12703,10 +12834,16 @@ func (j *SessionOutcome) UnmarshalJSON(value []byte) error {
 	if _, ok := raw["sessionId"]; raw != nil && !ok {
 		return fmt.Errorf("field sessionId in SessionOutcome: required")
 	}
+	if _, ok := raw["suggestedDelaySeconds"]; raw != nil && !ok {
+		return fmt.Errorf("field suggestedDelaySeconds in SessionOutcome: required")
+	}
 	type Plain SessionOutcome
 	var plain Plain
 	if err := json.Unmarshal(value, &plain); err != nil {
 		return err
+	}
+	if 0 > plain.SuggestedDelaySeconds {
+		return fmt.Errorf("field %s: must be >= %v", "suggestedDelaySeconds", 0)
 	}
 	*j = SessionOutcome(plain)
 	return nil
@@ -15185,7 +15322,19 @@ type WorkflowStepRunOutcomeSummary *string
 
 type WorkflowStepRunStatus string
 
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
+const WorkflowStepRunStatusAwaitingDecision WorkflowStepRunStatus = "awaiting_decision"
+const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
+const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
+const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
+const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
+
+var enumValues_WorkflowStepRunStatus = []interface{}{
+	"awaiting_decision",
+	"running",
+	"completed",
+	"failed",
+	"cancelled",
+}
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
@@ -15209,24 +15358,14 @@ func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 
 type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict
 
-const WorkflowStepRunStatusAwaitingDecision WorkflowStepRunStatus = "awaiting_decision"
-const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
-const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
-const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
-const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
-
-var enumValues_WorkflowStepRunStatus = []interface{}{
-	"awaiting_decision",
-	"running",
-	"completed",
-	"failed",
-	"cancelled",
-}
-
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
 // sequential turn'). Null while an awaiting_decision (hitlBefore-gated) attempt
 // exists before any turn does.
 type WorkflowStepRunTurnId *string
+
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
+
+type SessionOutcomeReviewVerdict_0 = SessionOutcomeVerdict
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
@@ -15284,5 +15423,3 @@ func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
 	*j = WorkflowStepRun(plain)
 	return nil
 }
-
-type SessionOutcomeReviewVerdict_0 = SessionOutcomeVerdict

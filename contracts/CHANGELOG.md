@@ -34,9 +34,16 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   never written by a model, cut at 4,000 characters with `truncated`);
   `reviewScope` (`none`, `produced` or `reviewed`: `none` says there is
   no pull request to review, so an empty list never reads as a clean
-  review); `pullRequests` (the pull requests the session opened); and
-  `reviewedPullRequest` (the one it is the review session of). Carries no
-  events. A `$defs` entry added, graded MINOR (row 32).
+  review); `pullRequests` (the pull requests the session opened);
+  `excludedPullRequests` (the session's pull request records that name no
+  pull request it opened -- a creation suppressed in shadow mode, or a
+  record the server cannot read -- each listed with why, so none is
+  dropped and none fails the result); `reviewedPullRequest` (the one it is
+  the review session of); and `suggestedDelaySeconds` (how long to wait
+  before reading the result again: 30 seconds while the session can still
+  change, 60 once settled when a freshness was read live, 300 when nothing
+  was, as shipped). Carries no events. A `$defs` entry added, graded MINOR
+  (row 32).
 - Added: `SessionOutcomePullRequest`, `SessionOutcomeReview` and
   `SessionOutcomeVerdict` -- a pull request with its review:
   `state` (`absent`, `in_progress`, `not_assessed` -- with the older
@@ -44,11 +51,25 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   `verdict`, `supersededVerdict`, and `freshness` (`current` only when the
   verdict's recorded context matched the pull request's live facts, read
   from the code host in that call; `stale` or `unconfirmed` with a
-  `reason`; `not_applicable` for any state but `assessed`, or a merged or
-  closed pull request). A verdict copies its record: id, attempt, head,
+  `reason` -- the merge path's own for a verdict the record decides, the
+  head read live first, and `unconfirmed` when the call's time budget for
+  live reads ran out; `not_applicable` for any state but `assessed`, a
+  pull request merged per this system's records, or one the live read
+  finds no longer open). A verdict copies its record: id, attempt, head,
   risk level, shippable, when it was posted, and its context (base ref
   and commit, null when never recorded; policy version; ancestor chain
   length). `$defs` entries added, graded MINOR (row 32).
+- Added: `SessionOutcomeExcludedPullRequest` -- one entry of
+  `excludedPullRequests`: `kind` (`shadow_suppressed`: the creation was
+  suppressed because egress to the repository was in shadow mode, so no
+  pull request exists; `unreadable`: the record could not be read),
+  `repoFullName` (null when it cannot be named), `url` (the one an
+  unreadable record holds; always null for a suppressed creation),
+  `createdAt` and `reason`. It has no review. A `$defs` entry added, graded
+  MINOR (row 32).
+- Added: `rest/v1/dtos.schema.json#/$defs/SessionOutcomeExcludedPullRequest/properties/kind`
+  to `manifest.json`'s `openEnums`, so a later kind of excluded record
+  grades MINOR: a consumer MUST tolerate a `kind` it does not recognise.
 - Added: `GetSessionResultToolRequest` -- the input schema of the new
   `narvi_get_session_result` MCP tool (`sessionId`), whose output is
   `SessionOutcome`. A `$defs` entry added, graded MINOR (row 32).

@@ -3360,7 +3360,7 @@ export interface SessionActivity {
   };
 }
 /**
- * GET /api/sessions/{sessionID}/result (technical plan §43.20, row 182's result): what one session has produced -- its last run, with a bounded summary of it; the pull requests it opened; and each one's review verdict, with that verdict's freshness, or its absence. Everything but freshness is read from what the database already holds, in one snapshot: the session's turns and events, its pull request artifacts, the review verdicts and review attempts on record. Freshness is the one live read: on every call, each assessed verdict's recorded context -- head, base ref and commit, ancestor chain, policy version -- is compared with the pull request as the code host reports it now, by the same comparison the merge path runs, and a read that fails or times out reports the verdict unconfirmed, never current. Verdicts are read as the code-review view reads them (GET /api/sessions/{sessionID}/review). The same gate as GET /api/sessions/{sessionID}: signed in, 400 for a malformed id, 404 for a session that does not exist, no per-session visibility. Carries no events and no transcript: the event history is GET /api/sessions/{sessionID}/events (EventsResponse), a separate, paginated read.
+ * GET /api/sessions/{sessionID}/result (technical plan §43.20, row 182's result): what one session has produced -- its last run, with a bounded summary of it; the pull requests it opened; and each one's review verdict, with that verdict's freshness, or its absence. Everything but freshness is read from what the database already holds, in one snapshot: the session's turns and events, its pull request artifacts, the review verdicts and review attempts on record. Freshness is the one live read: on every call, each assessed verdict's recorded context -- head, base ref and commit, ancestor chain, policy version -- is compared with the pull request as the code host reports it now, by the same comparison the merge path runs, and a read that fails or times out reports the verdict unconfirmed, never current. All of one call's live reads share one time budget (20 seconds as shipped), so the answer never waits on a slow code host past it. A pull request record the session holds that is not a pull request it opened -- one whose creation was suppressed in shadow mode, or one this server cannot read -- is listed in excludedPullRequests with why, never dropped and never failing the result. Verdicts are read as the code-review view reads them (GET /api/sessions/{sessionID}/review). The same gate as GET /api/sessions/{sessionID}: signed in, 400 for a malformed id, 404 for a session that does not exist, no per-session visibility. Carries no events and no transcript: the event history is GET /api/sessions/{sessionID}/events (EventsResponse), a separate, paginated read.
  *
  * This interface was referenced by `RestDtos`'s JSON-Schema
  * via the `definition` "SessionOutcome".
@@ -3412,13 +3412,17 @@ export interface SessionOutcome {
     };
   } | null;
   /**
-   * Which pull requests this result reports a verdict for. 'none': the session opened no pull request and is no pull request's review session, so there is no verdict to report -- which is not a clean review: pullRequests is empty and reviewedPullRequest null. 'produced': the session opened the pull requests in pullRequests and reviews none. 'reviewed': the session is the review session of reviewedPullRequest (pullRequests lists any it also opened, such as its own push's).
+   * Which pull requests this result reports a verdict for. 'none': the session opened no pull request and is no pull request's review session, so there is no verdict to report -- which is not a clean review: pullRequests is empty and reviewedPullRequest null (excludedPullRequests may still list a pull request the session would have opened in shadow mode, or a record that could not be read). 'produced': the session opened the pull requests in pullRequests and reviews none. 'reviewed': the session is the review session of reviewedPullRequest (pullRequests lists any it also opened, such as its own push's).
    */
   reviewScope: 'none' | 'produced' | 'reviewed';
   /**
-   * The pull requests this session opened (its pull request artifacts), oldest first; empty when it opened none.
+   * The pull requests this session opened (its pull request artifacts), oldest first; empty when it opened none. Only pull requests that exist: a record naming no real pull request is in excludedPullRequests instead.
    */
   pullRequests: SessionOutcomePullRequest[];
+  /**
+   * The session's pull request records that pullRequests does not list, oldest first, each with why -- so a record is never silently dropped, and one this server cannot read never fails the rest of the result. Empty when every record is a pull request the session opened.
+   */
+  excludedPullRequests: SessionOutcomeExcludedPullRequest[];
   /**
    * The pull request this session is the review session of (the per-pull-request claim that routes its reviews here); null when it is none's.
    */
@@ -3430,6 +3434,10 @@ export interface SessionOutcome {
     number: number;
     review: SessionOutcomeReview;
   } | null;
+  /**
+   * How long to wait before reading this result again, in whole seconds (rounded up): 30 while the session can still change (activity is not settled -- to learn when it settles, wait on its status instead, a much cheaper read); 60 once settled when a verdict's freshness was read live in this call, since every read of the result asks the code host again; 300 once settled with nothing read live -- always within the deployment's configured floor and ceiling (30 and 300 seconds as shipped). A hint that keeps polling quiet, never a limit: an earlier read is answered all the same.
+   */
+  suggestedDelaySeconds: number;
 }
 /**
  * One pull request a session opened, and its review verdict (SessionOutcome.pullRequests).
@@ -3477,11 +3485,11 @@ export interface SessionOutcomeReview {
    */
   freshness: {
     /**
-     * 'current': the verdict's recorded context -- head, base ref and commit, ancestor chain, policy version -- matched the pull request's live facts, read from the code host during this call; never from the record alone. 'stale': the comparison proved the verdict describes other code, or was produced under other rules -- the head moved (a push, the session's own included), the base changed, the ancestor chain changed, or the policy version is older (this last known without a live read). 'unconfirmed': freshness could not be established -- the verdict recorded no context, a commit on either side is unknown, or the live read failed or timed out. 'not_applicable': state is not 'assessed', or the pull request is merged or closed.
+     * 'current': the verdict's recorded context -- head, base ref and commit, ancestor chain, policy version -- matched the pull request's live facts, read from the code host during this call; never from the record alone. 'stale': the comparison proved the verdict describes other code, or was produced under other rules -- the head moved (a push, the session's own included, whatever else the verdict recorded), the base changed, the ancestor chain changed, or the policy version is older. 'unconfirmed': freshness could not be established -- the verdict recorded no context, a commit on either side is unknown, or the live read failed, timed out, or ran past this call's time budget for live reads. 'not_applicable': state is not 'assessed', or the pull request is merged (per this system's records, with no live read) or no longer open (per the live read) -- a pull request once closed and since reopened is read live like any other.
      */
     state: 'current' | 'stale' | 'unconfirmed' | 'not_applicable';
     /**
-     * Why, for 'stale' and 'unconfirmed': the merge path's own reason text for the comparison's answer, or what could not be read. For 'not_applicable', why a merged or closed pull request's verdict is moot; null otherwise, and always null for 'current'.
+     * Why, for 'stale' and 'unconfirmed': the merge path's own reason text for the comparison's answer -- the same reason the merge path gives the same pull request -- or what could not be read, or that the time budget ran out. For 'not_applicable', why a merged or no-longer-open pull request's verdict is moot; null otherwise, and always null for 'current'.
      */
     reason: string | null;
   };
@@ -3529,6 +3537,34 @@ export interface SessionOutcomeVerdict {
      */
     ancestorChainLength: number;
   };
+}
+/**
+ * One pull request record of a session that is not a pull request it opened (SessionOutcome.excludedPullRequests), and why. It has no review: there is either no pull request to review, or none this server can name.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "SessionOutcomeExcludedPullRequest".
+ */
+export interface SessionOutcomeExcludedPullRequest {
+  /**
+   * 'shadow_suppressed': the session would have opened this pull request, but outbound writes to its repository were in shadow mode, so the creation was recorded and suppressed -- no pull request exists, and there is nothing to review. 'unreadable': this server could not read the record; it may name a real pull request, whose review this result therefore cannot report (reason says what could not be read). An OPEN enum (manifest.json's openEnums): a consumer MUST tolerate a value it does not recognise.
+   */
+  kind: 'shadow_suppressed' | 'unreadable';
+  /**
+   * owner/repo, for 'shadow_suppressed': the owner of the session's own repository of the recorded name, as for pullRequests. Null when the session's repositories cannot say, and always for 'unreadable'.
+   */
+  repoFullName: string | null;
+  /**
+   * The URL the record holds, for 'unreadable' (null when it holds none). Always null for 'shadow_suppressed': no pull request exists, so there is no URL to follow.
+   */
+  url: string | null;
+  /**
+   * When the session recorded it.
+   */
+  createdAt: string;
+  /**
+   * Why it is not in pullRequests, for a person to read.
+   */
+  reason: string;
 }
 /**
  * One MCP client authorization a user granted (technical plan §43.18) -- one row of GET /api/me/mcp-authorizations (the caller's own) or, for an administrator, of GET /api/members/{userID}/mcp-authorizations (a member's), and what DELETE /api/me/mcp-authorizations/{authorizationID} or DELETE /api/members/{userID}/mcp-authorizations/{authorizationID} revokes (by id). A user holds at most one per client: consenting to the same client again renews its expiry in place and records that approval's scopes. Never carries a token, a code, or any other secret -- none exists in plaintext anywhere once it has been handed to the client, so an administrator's view of a member's authorizations is exactly what the member sees, and no more.

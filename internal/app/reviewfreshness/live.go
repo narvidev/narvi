@@ -1,14 +1,23 @@
 // Package reviewfreshness reads the live facts a review verdict's recorded
-// context is compared against (§21.1's amendment, §21.1b), in ONE place:
-// the pull request's current head, base ref and base commit, its ancestor
-// chain, and whether each moved only forward since the verdict. The merge
-// path (internal/app/decisioninbox's revalidateCore, behind both the
-// human-clicked Merge and the auto-merge worker) and a session's result
-// (row 182, technical plan §43.20) both call ReadLive, and both compare
-// through autoapproval.CheckFreshness -- so no consumer builds a context of
-// its own, and the two can never disagree about whether a verdict is still
-// about the code as it stands ("no consumer re-derives a context of its
-// own", §21.1b).
+// context is compared against (§21.1's amendment, §21.1b): the pull
+// request's current head, base ref and base commit, its ancestor chain, and
+// whether each moved only forward since the verdict. Two consumers read
+// them here, through ReadLive: the merge path (internal/app/decisioninbox's
+// revalidateCore, behind both the human-clicked Merge and the auto-merge
+// worker) and a session's result (row 182, technical plan §43.20, through
+// Assess). Both compare through autoapproval.CheckFreshness, so those two
+// cannot disagree about whether a verdict is still about the code as it
+// stands.
+//
+// What is shared with every consumer is the comparison, not this read. The
+// decision inbox's read model (decisioninbox's computeRealEligibility)
+// still assembles the same facts itself, through its TTL cache
+// (decisioninbox.SCMCache), and handles a failed call differently: it
+// blanks the value, marks the read degraded and carries on to the
+// comparison, where ReadLive stops and reports the step. A change to
+// ReadLive's calls, skip conditions or empty-commit handling therefore
+// does not reach the inbox; routing the inbox through ReadLive is a
+// recorded follow-up (§21.1b).
 //
 // Every live call is bounded by the platform.Timeouts constants the merge
 // path has always used (DecisionInboxResolveBranchSHATimeout,

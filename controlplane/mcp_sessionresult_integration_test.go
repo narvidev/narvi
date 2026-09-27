@@ -8,11 +8,12 @@
 //
 // The production router's source control is the real code host adapter,
 // so nothing here may make a live read: every pull request seeded below
-// resolves its review from the record alone -- absent, not assessed, or a
-// verdict produced under an older policy (stale with no live read,
-// reviewfreshness.Assess's record-only pass). The live read itself is
-// proven against a fake code host in internal/adapters/inbound/httpapi and
-// internal/adapters/inbound/mcp.
+// resolves its review from the record alone -- absent, not assessed, or
+// assessed on a pull request its claim records merged (not_applicable, the
+// one freshness the record decides; any other assessed verdict is read
+// live, even one the merge path's probe refuses, since that probe compares
+// the live head). The live read itself is proven against a fake code host
+// in internal/adapters/inbound/httpapi and internal/adapters/inbound/mcp.
 package controlplane
 
 import (
@@ -33,15 +34,17 @@ import (
 	"github.com/narvidev/narvi/contracts"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/domain/shadowsentinel"
 )
 
 // seedResultSession creates a session for userID whose result needs no
 // live read: it is the review session of acme/widgets#7, whose newest
 // review attempt -- a run that streamed text -- ended without posting over
 // an older verdict (not_assessed); it opened acme/widgets#8, never reviewed
-// (absent), and acme/widgets#9, whose only verdict was produced under a
-// policy version older than the current one (stale, decided on the record
-// alone).
+// (absent), and acme/widgets#9, assessed and merged per its claim
+// (not_applicable, decided on the record alone); and it holds the record a
+// pull request creation suppressed in shadow mode leaves
+// (excludedPullRequests).
 func seedResultSession(ctx context.Context, t *testing.T, pool *pgxpool.Pool, userID pgtype.UUID) pgtype.UUID {
 	t.Helper()
 	sessions := narvipg.NewSessionStore(pool)
@@ -119,6 +122,18 @@ func seedResultSession(ctx context.Context, t *testing.T, pool *pgxpool.Pool, us
 		}
 	}
 	verdict(9, pgtype.UUID{}, 0)
+	if err := claims.EnsureRow(ctx, "acme/widgets", 9); err != nil {
+		t.Fatalf("ensure claim #9: %v", err)
+	}
+	if _, err := claims.RecordMergeOutcome(ctx, "acme/widgets", 9, true, time.Now()); err != nil {
+		t.Fatalf("record #9 merged: %v", err)
+	}
+	// The ref the shadow decorator hands back for a suppressed creation,
+	// recorded as the session actor records any created pull request.
+	suppressed := fmt.Sprintf(`{"repo":"widgets","number":%d}`, shadowsentinel.PRNumber)
+	if _, err := artifacts.Create(ctx, sqlcgen.CreateArtifactParams{SessionID: sess.ID, Type: sqlcgen.ArtifactTypePr, Url: shadowsentinel.URLScheme + "acme/widgets/pull/not-created", Metadata: []byte(suppressed)}); err != nil {
+		t.Fatalf("suppressed pull request artifact: %v", err)
+	}
 	return sess.ID
 }
 
@@ -148,8 +163,9 @@ func sessionOutcomeKeys(t *testing.T) []string {
 
 // assertResultShape checks the seeded result as the tool returned it: the
 // review of #7 not assessed with its older verdict superseded, #8 absent,
-// #9 stale from the record alone, the summary the second attempt's text,
-// and exactly SessionOutcome's keys.
+// #9 merged per its claim, the suppressed creation excluded, the summary
+// the second attempt's text, the settled delay (nothing read live), and
+// exactly SessionOutcome's keys.
 func assertResultShape(t *testing.T, body []byte) {
 	t.Helper()
 	var got struct {
@@ -180,6 +196,12 @@ func assertResultShape(t *testing.T, body []byte) {
 				SupersededVerdict json.RawMessage `json:"supersededVerdict"`
 			} `json:"review"`
 		} `json:"reviewedPullRequest"`
+		ExcludedPullRequests []struct {
+			Kind         string          `json:"kind"`
+			RepoFullName *string         `json:"repoFullName"`
+			URL          json.RawMessage `json:"url"`
+		} `json:"excludedPullRequests"`
+		SuggestedDelaySeconds int `json:"suggestedDelaySeconds"`
 	}
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatalf("result %s: %v", body, err)
@@ -211,9 +233,16 @@ func assertResultShape(t *testing.T, body []byte) {
 	if pr8.RepoFullName != "acme/widgets" || pr8.Number != 8 || pr8.Review.State != "absent" || pr8.Review.Freshness.State != "not_applicable" {
 		t.Fatalf("#8 = %+v, want absent", pr8)
 	}
-	if pr9.Number != 9 || pr9.Review.State != "assessed" || pr9.Review.Freshness.State != "stale" || pr9.Review.Freshness.Reason == nil ||
-		!strings.Contains(*pr9.Review.Freshness.Reason, "earlier eligibility policy") {
-		t.Fatalf("#9 = %+v, want assessed and stale on the policy, decided with no live read", pr9)
+	if pr9.Number != 9 || pr9.Review.State != "assessed" || pr9.Review.Freshness.State != "not_applicable" || pr9.Review.Freshness.Reason == nil ||
+		*pr9.Review.Freshness.Reason != "the pull request has been merged" {
+		t.Fatalf("#9 = %+v, want assessed and not applicable, merged per its claim, decided with no live read", pr9)
+	}
+	if len(got.ExcludedPullRequests) != 1 || got.ExcludedPullRequests[0].Kind != "shadow_suppressed" || got.ExcludedPullRequests[0].RepoFullName == nil ||
+		*got.ExcludedPullRequests[0].RepoFullName != "acme/widgets" || string(got.ExcludedPullRequests[0].URL) != "null" {
+		t.Fatalf("excludedPullRequests = %+v, want the suppressed creation on acme/widgets, with no URL", got.ExcludedPullRequests)
+	}
+	if got.SuggestedDelaySeconds != 300 {
+		t.Fatalf("suggestedDelaySeconds = %d, want 300: settled, nothing read live", got.SuggestedDelaySeconds)
 	}
 }
 

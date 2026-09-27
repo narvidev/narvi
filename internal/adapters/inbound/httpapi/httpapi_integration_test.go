@@ -187,6 +187,10 @@ type testRig struct {
 	// that exercises the live read sets its own fake through newTestRig's
 	// mutate func (sessionresult_integration_test.go).
 	resultSourceControl ports.SourceControl
+	// resultTimeouts are the result route's own bounds -- the shipped
+	// defaults unless a test shortens one (the live-read budget) through
+	// newTestRig's mutate func.
+	resultTimeouts platform.Timeouts
 
 	// positionResolver (§22.1.1) is review/verdict's own
 	// relocation-fallback dependency -- nil by default (this rig's own
@@ -456,6 +460,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		promptTemplates:       narvipg.NewPromptTemplateStore(pool),
 		digestChannels:        narvipg.NewDigestChannelStore(pool),
 		prSessions:            narvipg.NewGitHubPRSessionStore(pool),
+		resultTimeouts:        platform.DefaultTimeouts(),
 		repoSettings:          narvipg.NewRepoSettingsStore(pool),
 		botHandle:             "narvi-test-bot",
 		shadowLedger:          narvipg.NewShadowSCMWriteStore(pool),
@@ -605,7 +610,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 			ReviewVerdicts: rig.reviewVerdicts,
 			SourceControl:  rig.resultSourceControl,
 			BotToken:       "result-bot-token",
-			Timeouts:       platform.DefaultTimeouts(),
+			Timeouts:       rig.resultTimeouts,
 		}))
 		r.Get("/{sessionID}/events", httpapi.ListEvents(rig.sessions, rig.events))
 		r.Get("/{sessionID}/artifacts", httpapi.ListArtifacts(rig.sessions, rig.artifacts))

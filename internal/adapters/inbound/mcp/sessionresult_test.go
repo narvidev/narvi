@@ -30,7 +30,7 @@ func TestResultOutputSchema_HasNoEvents(t *testing.T) {
 		names = append(names, n)
 	}
 	sort.Strings(names)
-	if want := []string{"SessionOutcome", "SessionOutcomePullRequest", "SessionOutcomeReview", "SessionOutcomeVerdict"}; !reflect.DeepEqual(names, want) {
+	if want := []string{"SessionOutcome", "SessionOutcomeExcludedPullRequest", "SessionOutcomePullRequest", "SessionOutcomeReview", "SessionOutcomeVerdict"}; !reflect.DeepEqual(names, want) {
 		t.Fatalf("result output bundles $defs %v, want %v", names, want)
 	}
 	var walk func(path string, node any)
@@ -96,8 +96,9 @@ func TestToolCall_GetSessionResult_ReachesTheResultTwin(t *testing.T) {
 // TestGetSessionResultText_SaysWhatCurrentMeans pins the tool's own text on
 // what a client most needs not to misread: current only with the code
 // host's confirmation in that call, reviewScope none is not a clean
-// review, the summary is bounded and never model-written, and the result
-// carries no transcript.
+// review, a record naming no pull request is listed apart rather than
+// dropped, the summary is bounded and never model-written, the delay hint
+// points at the wait, and the result carries no transcript.
 func TestGetSessionResultText_SaysWhatCurrentMeans(t *testing.T) {
 	spec := specNamed(t, "narvi_get_session_result")
 	for _, want := range []string{
@@ -105,6 +106,9 @@ func TestGetSessionResultText_SaysWhatCurrentMeans(t *testing.T) {
 		"reviewScope none means there is no pull request to review, which is not a clean review",
 		"never written by a model, at most 4,000 characters",
 		"not_assessed (the older verdict is in supersededVerdict and is not the answer)",
+		"listed apart in excludedPullRequests, with why (shadow_suppressed: the repository was in shadow mode, so no pull request was created",
+		"merged or no longer open",
+		"suggestedDelaySeconds how long to wait before reading it again: every read asks the code host, so to learn when the session settles, prefer narvi_wait_for_session",
 		"Does not include the transcript.",
 	} {
 		if !strings.Contains(spec.Description, want) {

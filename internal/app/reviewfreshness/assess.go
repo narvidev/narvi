@@ -24,17 +24,17 @@ const (
 	// or was produced under other rules.
 	StateStale State = "stale"
 	// StateUnconfirmed: freshness could not be established -- a fact is
-	// missing from the record, or the live read failed or timed out.
+	// missing from the record, or the live read failed or ran out of time.
 	StateUnconfirmed State = "unconfirmed"
 	// StateNotApplicable: there is no assessed verdict to be fresh, or the
-	// pull request is merged or closed.
+	// pull request is merged or no longer open.
 	StateNotApplicable State = "not_applicable"
 )
 
 // Assessment is Assess's answer: the state, and why -- the comparison's
-// own autoapproval.Reason text for stale and unconfirmed-by-the-record,
-// what could not be read for unconfirmed-by-the-live-read, why the verdict
-// is moot for not_applicable. Reason is "" for current.
+// own autoapproval.Reason text for stale and for unconfirmed-by-the-
+// comparison, what could not be read for unconfirmed-by-the-live-read, why
+// the verdict is moot for not_applicable. Reason is "" for current.
 type Assessment struct {
 	State  State
 	Reason string
@@ -46,6 +46,11 @@ const (
 	ReasonNoCodeHost        = "no code host connection is configured to read the pull request's live state"
 	ReasonPullRequestUnread = "the pull request's live state could not be read from the code host"
 	ReasonNoLongerOpen      = "the pull request is no longer open"
+	// ReasonOutOfTime: the caller's own deadline -- for a session's
+	// result, platform.Timeouts.SessionResultLiveReadBudget, all of its
+	// pull requests together -- passed before the live read established
+	// the verdict's freshness.
+	ReasonOutOfTime = "the code host did not answer within the time this read allows for live checks"
 )
 
 // Describe says which live fact a Failure could not establish, for a
@@ -86,34 +91,36 @@ type PullRequest struct {
 
 // Assess reports whether record, an assessed verdict for pr, still
 // describes pr as it stands -- by the one comparison
-// (autoapproval.CheckFreshness) over the one live read (ReadLive), exactly
-// as the merge path decides it.
+// (autoapproval.CheckFreshness), in the order the merge path
+// (decisioninbox.revalidateCore) runs it, so the two give the same answer
+// and the same reason for the same pull request:
 //
-//  1. The record alone first: CheckFreshness with the live side assumed
-//     equal to the recorded one -- the merge path's own probe. A verdict
-//     that predates context tracking, recorded an unknown commit or link,
-//     never recorded its head, or was produced under an older policy
-//     version fails on the record whatever the pull request looks like
-//     now, so it is reported (stale or unconfirmed) with no live read.
-//     This step can never answer current: a probe that passes only means
-//     the live read decides.
-//  2. The pull request, read live (GetOpenPR, bounded by
+//  1. The pull request, read live (GetOpenPR, bounded by
 //     GitHubGetOpenPRTimeout, the auto-merge worker's own read): an error,
 //     or a deadline that cut its composite read short, is unconfirmed; a
 //     pull request no longer open is not applicable.
+//  2. The merge path's own probe (ProbeInput): CheckFreshness with the
+//     pull request's live head and base ref, and its base commit and
+//     ancestor chain assumed equal to the recorded ones. A verdict whose
+//     head moved is stale here, whatever else it recorded; one that
+//     predates context tracking, recorded an unknown commit or link, or
+//     was produced under an older policy version fails here too, with no
+//     further live read. A probe that passes only means the live facts
+//     decide: this step never answers current.
 //  3. ReadLive: a fact it cannot establish is unconfirmed, naming it.
 //  4. CheckFreshness over the recorded context and the live facts: current
 //     only when it passes; otherwise stale or unconfirmed by
 //     autoapproval.ClassifyFreshness, with the comparison's own reason.
 //
+// A live read that fails because ctx's own deadline passed -- a session
+// result's budget for all of its live reads -- is unconfirmed with
+// ReasonOutOfTime rather than the failed call's own reason.
+//
 // Never an error, never current without step 4 passing on live facts read
 // in this call. The caller decides not_applicable for a verdict that is
-// not assessed, or a pull request its own records show merged or closed,
-// before calling.
+// not assessed, or a pull request its own records show merged, before
+// calling.
 func Assess(ctx context.Context, deps Deps, record reviewverdict.Record, pr PullRequest) Assessment {
-	if reason := autoapproval.CheckFreshness(recordedAsLive(record)); reason != autoapproval.ReasonNone {
-		return classified(reason)
-	}
 	if deps.SourceControl == nil {
 		return Assessment{State: StateUnconfirmed, Reason: ReasonNoCodeHost}
 	}
@@ -124,7 +131,7 @@ func Assess(ctx context.Context, deps Deps, record reviewverdict.Record, pr Pull
 	cancel()
 	if err != nil {
 		logger.Warn("reviewfreshness: live pull request read failed, freshness unconfirmed", "error", err, "owner", pr.Owner, "repo", pr.Repo, "pr_number", pr.Number)
-		return Assessment{State: StateUnconfirmed, Reason: ReasonPullRequestUnread}
+		return unconfirmed(ctx, ReasonPullRequestUnread)
 	}
 	// GetOpenPR is a composite of several reads: a deadline that fired
 	// partway returns err == nil with whatever the later reads left blank
@@ -132,16 +139,20 @@ func Assess(ctx context.Context, deps Deps, record reviewverdict.Record, pr Pull
 	// specifically: cancel() above sets Canceled on the ordinary path.
 	if errors.Is(readCtx.Err(), context.DeadlineExceeded) {
 		logger.Warn("reviewfreshness: live pull request read timed out partway, freshness unconfirmed", "owner", pr.Owner, "repo", pr.Repo, "pr_number", pr.Number)
-		return Assessment{State: StateUnconfirmed, Reason: ReasonPullRequestUnread}
+		return unconfirmed(ctx, ReasonPullRequestUnread)
 	}
 	if !found {
 		return Assessment{State: StateNotApplicable, Reason: ReasonNoLongerOpen}
 	}
 
+	if reason := autoapproval.CheckFreshness(ProbeInput(record, target)); reason != autoapproval.ReasonNone {
+		return classified(reason)
+	}
+
 	live, failure := ReadLive(ctx, deps.Timeouts, deps.SourceControl, deps.Token, target, record.Context)
 	if failure != nil {
 		logger.Warn("reviewfreshness: live freshness read failed, freshness unconfirmed", "step", string(failure.Step), "error", failure.Err, "owner", pr.Owner, "repo", pr.Repo, "pr_number", pr.Number)
-		return Assessment{State: StateUnconfirmed, Reason: failure.Describe()}
+		return unconfirmed(ctx, failure.Describe())
 	}
 	return classified(autoapproval.CheckFreshness(FreshnessInput(record, live)))
 }
@@ -168,18 +179,32 @@ func FreshnessInput(record reviewverdict.Record, live LiveFacts) autoapproval.Fr
 	}
 }
 
-// recordedAsLive is the probe's input: the record compared with itself,
-// the live side assumed equal to what was recorded and every movement
-// assumed forward -- so only what fails on the record alone can fail.
-func recordedAsLive(record reviewverdict.Record) autoapproval.FreshnessInput {
+// ProbeInput is the merge path's own probe (decisioninbox.revalidateCore's
+// probeInput, its freshness half): the pull request's live head and base
+// ref, read with target, against the record -- and the base commit and
+// ancestor chain, which cost further live calls, assumed equal to the
+// recorded ones, every movement assumed forward. So what fails here fails
+// whatever those calls would answer, and a moved head is stale before
+// anything else is looked at, exactly as it is for the merge path
+// (TestAssess_AgreesWithTheMergePathOnRecordDecidedVerdicts).
+func ProbeInput(record reviewverdict.Record, target ports.OpenPR) autoapproval.FreshnessInput {
 	return FreshnessInput(record, LiveFacts{
-		HeadSHA:                             record.HeadSHA,
-		BaseRef:                             record.Context.BaseRef,
+		HeadSHA:                             target.HeadSHA,
+		BaseRef:                             target.BaseRef,
 		BaseSHA:                             record.Context.BaseSHA,
 		AncestorChain:                       record.Context.AncestorChain,
 		BaseAdvancedWithoutRewrite:          true,
 		AncestorChainAdvancedWithoutRewrite: true,
 	})
+}
+
+// unconfirmed reports a live read that failed: with ReasonOutOfTime when
+// the caller's own deadline is what ended it, else with reason.
+func unconfirmed(ctx context.Context, reason string) Assessment {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return Assessment{State: StateUnconfirmed, Reason: ReasonOutOfTime}
+	}
+	return Assessment{State: StateUnconfirmed, Reason: reason}
 }
 
 // classified renders a comparison's answer as an Assessment.

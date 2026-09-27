@@ -37,10 +37,13 @@
 //     GetSessionResult (technical plan §43.20, row 182's piece (c)): 404 if
 //     not found, else 200 with restdtos.SessionOutcome -- the activity, the
 //     last run with its summary (its final text, capped), the pull requests
-//     the session opened or reviews, and each one's review state read from
+//     the session opened or reviews (a record naming none -- a creation
+//     suppressed in shadow mode, or a row it cannot read -- listed apart,
+//     never failing the result), and each one's review state read from
 //     the record, all in one read-only snapshot; each assessed verdict's
 //     freshness read live (reviewfreshness.Assess, the merge path's own
-//     read and comparison). No events.
+//     read and comparison), all within one budget; and how long to wait
+//     before reading it again. No events.
 //   - GET /api/sessions/{sessionID}/events?cursor=&limit= -- events.go's
 //     ListEvents: 404 if the session doesn't exist, else 200 with
 //     restdtos.EventsResponse (shaped exactly like client-ws/v1's own

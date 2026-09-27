@@ -24,6 +24,7 @@ import (
 	appreviewtriage "github.com/narvidev/narvi/internal/app/reviewtriage"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/shadowscm"
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/reviewverdict"
@@ -44,7 +45,9 @@ const resultSummaryMaxChars = 4000
 // it), and the code host for the one live read, a verdict's freshness --
 // SourceControl (nil when none is configured: freshness then reads
 // unconfirmed) with BotToken, the credential the code-review view and the
-// auto-merge worker read pull requests with.
+// auto-merge worker read pull requests with. Timeouts bounds each live call
+// and all of them together (SessionResultLiveReadBudget), and holds the
+// suggested-delay table (the SessionResultDelay* fields).
 type SessionResultDeps struct {
 	Pool           *pgxpool.Pool
 	Sessions       *postgres.SessionStore
@@ -81,8 +84,16 @@ type SessionResultDeps struct {
 // before anything else happens. Then, outside it, each assessed verdict's
 // freshness is read live (reviewfreshness.Assess: the merge path's own
 // live read and comparison), concurrently, each read bounded by the
-// platform.Timeouts constants the merge path uses; a failed or timed-out
-// read reports the verdict unconfirmed, never current (owner decision D6).
+// platform.Timeouts constants the merge path uses and all of them together
+// by SessionResultLiveReadBudget; a failed, timed-out or out-of-budget read
+// reports the verdict unconfirmed, never current (owner decision D6). The
+// answer carries suggestedDelaySeconds (resultReadDelay).
+//
+// No single pull request record can fail the result: one that names no
+// pull request the session opened -- a creation suppressed in shadow mode
+// (shadowscm.IsSyntheticPRRef), or a row this build cannot read -- is
+// reported in excludedPullRequests with why (readPRArtifact), and the rest
+// of the result stands.
 //
 // The response carries no events: the summary is the last run's final
 // text, read by plandomain.FinalText -- the one reader of a turn's final
@@ -124,8 +135,11 @@ func GetSessionResult(deps SessionResultDeps) http.HandlerFunc {
 		}
 
 		// The live reads, outside the transaction: one per assessed
-		// verdict, each writing only its own review's freshness.
-		g, gctx := errgroup.WithContext(ctx)
+		// verdict, each writing only its own review's freshness, all of
+		// them within one budget -- a read it cuts short reports its
+		// verdict unconfirmed (reviewfreshness.ReasonOutOfTime).
+		liveCtx, cancelLive := context.WithTimeout(ctx, deps.Timeouts.SessionResultLiveReadBudget)
+		g, gctx := errgroup.WithContext(liveCtx)
 		for _, pending := range snap.live {
 			g.Go(func() error {
 				pending.review.Freshness = freshnessDTO(reviewfreshness.Assess(gctx, freshnessDeps, pending.record, pending.pr))
@@ -133,7 +147,10 @@ func GetSessionResult(deps SessionResultDeps) http.HandlerFunc {
 			})
 		}
 		_ = g.Wait() // no goroutine returns an error: Assess never fails
+		cancelLive()
 
+		readLive := len(snap.live) > 0 && deps.SourceControl != nil
+		snap.outcome.SuggestedDelaySeconds = wholeSecondsRoundedUp(resultReadDelay(snap.activity, readLive, deps.Timeouts))
 		writeJSON(w, http.StatusOK, snap.outcome)
 	}
 }
@@ -149,8 +166,9 @@ func (e *unreadableResultError) Unwrap() error { return e.err }
 // every stored fact filled in, and the verdicts whose freshness is still
 // to be read live, each pointing at the review it belongs to.
 type resultSnapshot struct {
-	outcome *restdtos.SessionOutcome
-	live    []pendingFreshness
+	outcome  *restdtos.SessionOutcome
+	activity session.Activity
+	live     []pendingFreshness
 }
 
 // pendingFreshness is one assessed verdict whose freshness is read live.
@@ -196,16 +214,19 @@ func readResultSnapshot(ctx context.Context, deps SessionResultDeps, tx pgx.Tx, 
 		return resultSnapshot{}, err
 	}
 
+	activity := session.DeriveActivity(in)
 	outcome := &restdtos.SessionOutcome{
-		SessionId:    sessionID.String(),
-		Activity:     restdtos.SessionOutcomeActivity(session.DeriveActivity(in)),
-		PullRequests: []restdtos.SessionOutcomePullRequest{},
+		SessionId:            sessionID.String(),
+		Activity:             restdtos.SessionOutcomeActivity(activity),
+		PullRequests:         []restdtos.SessionOutcomePullRequest{},
+		ExcludedPullRequests: []restdtos.SessionOutcomeExcludedPullRequest{},
 	}
 	if outcome.LastRun, err = readLastRun(ctx, st, sessionID, facts); err != nil {
 		return resultSnapshot{}, err
 	}
 
-	// The pull requests the session opened, oldest first.
+	// The pull requests the session opened, oldest first -- and, apart,
+	// every pull request record that names none, each said explicitly.
 	artifacts, err := st.artifacts.ListForSession(ctx, sessionID)
 	if err != nil {
 		return resultSnapshot{}, err
@@ -215,9 +236,13 @@ func readResultSnapshot(ctx context.Context, deps SessionResultDeps, tx pgx.Tx, 
 		if a.Type != sqlcgen.ArtifactTypePr {
 			continue
 		}
-		pr, err := producedPRFromArtifact(a, sessionRow.Repos)
-		if err != nil {
-			return resultSnapshot{}, &unreadableResultError{err: err}
+		pr, excluded := readPRArtifact(a, sessionRow.Repos)
+		if excluded != nil {
+			if excluded.Kind == restdtos.SessionOutcomeExcludedPullRequestKindUnreadable {
+				platform.Logger(ctx).Warn("httpapi: session result: a pull request artifact is unreadable, reported as such", "artifact_id", a.ID.String(), "reason", excluded.Reason)
+			}
+			outcome.ExcludedPullRequests = append(outcome.ExcludedPullRequests, *excluded)
+			continue
 		}
 		produced = append(produced, pr)
 	}
@@ -265,12 +290,13 @@ func readResultSnapshot(ctx context.Context, deps SessionResultDeps, tx pgx.Tx, 
 	}
 
 	outcome.ReviewScope = reviewScope(outcome)
-	return resultSnapshot{outcome: outcome, live: live}, nil
+	return resultSnapshot{outcome: outcome, activity: activity, live: live}, nil
 }
 
 // reviewScope says which pull requests the result reports verdicts for:
 // the one the session reviews, else the ones it opened, else none -- said
-// explicitly, so an empty list never reads as a clean review.
+// explicitly, so an empty list never reads as a clean review. An excluded
+// record has no verdict, so it never makes the scope produced.
 func reviewScope(outcome *restdtos.SessionOutcome) restdtos.SessionOutcomeReviewScope {
 	switch {
 	case outcome.ReviewedPullRequest != nil:
@@ -359,8 +385,8 @@ func capSummary(text string) (string, bool) {
 // else looked up), that session's newest review attempt, whether that
 // attempt posted, and the latest verdict (GetLatestRecord, the review
 // readout's own read) -- and renders it. A verdict that is assessed and
-// whose pull request the claim does not record as merged or closed is
-// returned as pending: its freshness is read live after the snapshot.
+// whose pull request the claim does not record as merged is returned as
+// pending: its freshness is read live after the snapshot.
 func readReview(ctx context.Context, st resultStores, repoFullName string, number int32, claim *sqlcgen.GithubPrSession) (restdtos.SessionOutcomeReview, *pendingFreshness, error) {
 	if claim == nil {
 		row, err := st.prSessions.GetByRepoAndPRNumber(ctx, repoFullName, number)
@@ -415,8 +441,8 @@ func readReview(ctx context.Context, st resultStores, repoFullName string, numbe
 	if status.State != reviewverdict.ReviewAssessed {
 		return review, nil, nil
 	}
-	if reason, closed := closedPerClaim(claim); closed {
-		review.Freshness = freshnessDTO(reviewfreshness.Assessment{State: reviewfreshness.StateNotApplicable, Reason: reason})
+	if mergedPerClaim(claim) {
+		review.Freshness = freshnessDTO(reviewfreshness.Assessment{State: reviewfreshness.StateNotApplicable, Reason: reasonMergedPerClaim})
 		return review, nil, nil
 	}
 	owner, repo, ok := reposource.SplitFullName(repoFullName)
@@ -426,19 +452,21 @@ func readReview(ctx context.Context, st resultStores, repoFullName string, numbe
 	return review, &pendingFreshness{record: *status.Verdict, pr: reviewfreshness.PullRequest{Owner: owner, Repo: repo, Number: int(number)}}, nil
 }
 
-// closedPerClaim reports a pull request the claim records as merged or
-// closed: its verdict's freshness is then moot, and nothing is read live.
-func closedPerClaim(claim *sqlcgen.GithubPrSession) (string, bool) {
-	switch {
-	case claim == nil:
-		return "", false
-	case claim.PrMerged != nil && *claim.PrMerged:
-		return "the pull request has been merged", true
-	case claim.PrClosedAt.Valid:
-		return "the pull request is closed", true
-	default:
-		return "", false
-	}
+// reasonMergedPerClaim is why a merged pull request's verdict freshness is
+// not applicable.
+const reasonMergedPerClaim = "the pull request has been merged"
+
+// mergedPerClaim reports a pull request the claim records as merged: its
+// verdict's freshness is then moot, decided with no live read. A merge is
+// the one outcome the record can decide, because a merged pull request
+// cannot be reopened. The claim's closed stamp cannot: the closed webhook
+// writes it once and nothing clears it when the pull request is reopened
+// (RecordMergeOutcome is its only writer), so it says the pull request was
+// closed at some point, not that it is closed now. A pull request closed
+// without merging is read live like any other, and the live read says so
+// when it really is no longer open (reviewfreshness.ReasonNoLongerOpen).
+func mergedPerClaim(claim *sqlcgen.GithubPrSession) bool {
+	return claim != nil && claim.PrMerged != nil && *claim.PrMerged
 }
 
 // freshnessDTO renders an Assessment; an empty reason is null.
@@ -449,6 +477,28 @@ func freshnessDTO(a reviewfreshness.Assessment) restdtos.SessionOutcomeReviewFre
 		out.Reason = &reason
 	}
 	return out
+}
+
+// resultReadDelay is the suggested delay before a client reads a result
+// again, from platform.Timeouts' SessionResultDelay* table: while the
+// session is not settled, the result can still change, and the status is
+// the cheap way to watch it; once settled, a result that read a verdict's
+// freshness live changes only when a pull request or its base moves, and
+// asks the code host again on every read; one that read nothing live
+// changes only with new input. Clamped to [SessionResultDelayFloor,
+// SessionResultDelayCeiling] -- a defense: Validate keeps every table value
+// inside them.
+func resultReadDelay(activity session.Activity, readLive bool, t platform.Timeouts) time.Duration {
+	var d time.Duration
+	switch {
+	case !activity.Settled():
+		d = t.SessionResultDelayUnsettled
+	case readLive:
+		d = t.SessionResultDelayLiveRead
+	default:
+		d = t.SessionResultDelaySettled
+	}
+	return min(max(d, t.SessionResultDelayFloor), t.SessionResultDelayCeiling)
 }
 
 // verdictDTO copies one verdict record; a context field never recorded is
@@ -497,20 +547,98 @@ type prArtifactMetadata struct {
 	Number int32  `json:"number"`
 }
 
-// producedPRFromArtifact resolves a pull request artifact. The artifact
-// records the repository's bare name only; its owner is that of the
-// session's own repository of that name -- the exact derivation that
-// opened the pull request (reposource.ParseOwnerRepo over the repo URL) --
-// when exactly one of the session's repositories has it, else the one the
-// pull request's URL names (github.com/owner/repo/pull/N). The number is
-// the artifact's, else the URL's.
-func producedPRFromArtifact(a sqlcgen.Artifact, sessionRepos []byte) (producedPR, error) {
+// The reasons a pull request artifact is excluded from pullRequests.
+const (
+	reasonShadowSuppressed      = "outbound writes to this repository were in shadow mode when the session tried to open this pull request, so its creation was recorded and suppressed: no pull request was created"
+	reasonArtifactMetadata      = "the record's metadata could not be decoded"
+	reasonArtifactNoPullRequest = "the record names no repository and pull request number"
+)
+
+// readPRArtifact reads one pull request artifact: the pull request the
+// session opened (producedPRFromArtifact), or -- never an error that fails
+// the result -- why it names none, for excludedPullRequests:
+//
+//   - shadow_suppressed: the ref a suppressed creation hands back, which the
+//     session actor records like any other (sessionactor's
+//     createPRBestEffort: "the direct trace of this one hop"), recognised by
+//     shadowscm.IsSyntheticPRRef, the one predicate every layer that
+//     suppresses agrees on (internal/domain/shadowsentinel). No pull request
+//     exists: its URL points nowhere and is not reported.
+//   - unreadable: a row this build cannot resolve, with the reason.
+func readPRArtifact(a sqlcgen.Artifact, sessionRepos []byte) (producedPR, *restdtos.SessionOutcomeExcludedPullRequest) {
+	meta, ok := decodePRArtifactMetadata(a)
+	if !ok {
+		return producedPR{}, unreadablePRArtifact(a, reasonArtifactMetadata)
+	}
+	if shadowscm.IsSyntheticPRRef(ports.PRRef{Number: int(meta.Number), URL: a.Url}) {
+		out := &restdtos.SessionOutcomeExcludedPullRequest{
+			Kind:      restdtos.SessionOutcomeExcludedPullRequestKindShadowSuppressed,
+			CreatedAt: a.CreatedAt.Time,
+			Reason:    reasonShadowSuppressed,
+		}
+		if owners := sessionRepoOwners(meta.Repo, sessionRepos); meta.Repo != "" && len(owners) == 1 {
+			for owner := range owners {
+				full := owner + "/" + meta.Repo
+				out.RepoFullName = &full
+			}
+		}
+		return producedPR{}, out
+	}
+	pr, reason := producedPRFromArtifact(a, meta, sessionRepos)
+	if reason != "" {
+		return producedPR{}, unreadablePRArtifact(a, reason)
+	}
+	return pr, nil
+}
+
+// unreadablePRArtifact reports a pull request artifact this build cannot
+// resolve, with the URL it holds (null when it holds none).
+func unreadablePRArtifact(a sqlcgen.Artifact, reason string) *restdtos.SessionOutcomeExcludedPullRequest {
+	out := &restdtos.SessionOutcomeExcludedPullRequest{
+		Kind:      restdtos.SessionOutcomeExcludedPullRequestKindUnreadable,
+		CreatedAt: a.CreatedAt.Time,
+		Reason:    reason,
+	}
+	if a.Url != "" {
+		u := a.Url
+		out.Url = &u
+	}
+	return out
+}
+
+// decodePRArtifactMetadata decodes an artifact's metadata; none at all is
+// the zero value.
+func decodePRArtifactMetadata(a sqlcgen.Artifact) (prArtifactMetadata, bool) {
 	var meta prArtifactMetadata
 	if len(a.Metadata) > 0 {
 		if err := json.Unmarshal(a.Metadata, &meta); err != nil {
-			return producedPR{}, fmt.Errorf("pull request artifact %s: metadata: %w", a.ID.String(), err)
+			return prArtifactMetadata{}, false
 		}
 	}
+	return meta, true
+}
+
+// sessionRepoOwners is the set of owners of the session's repositories
+// named name, each read by reposource.ParseOwnerRepo over its URL -- the
+// exact derivation that opened the pull request.
+func sessionRepoOwners(name string, sessionRepos []byte) map[string]bool {
+	owners := map[string]bool{}
+	for _, repo := range decodeSessionRepos(sessionRepos) {
+		if owner, repoName, err := reposource.ParseOwnerRepo(repo.Url); err == nil && repoName == name {
+			owners[owner] = true
+		}
+	}
+	return owners
+}
+
+// producedPRFromArtifact resolves a pull request artifact whose metadata
+// is meta. The artifact records the repository's bare name only; its owner
+// is that of the session's own repository of that name (sessionRepoOwners)
+// when exactly one of the session's repositories has it, else the one the
+// pull request's URL names (github.com/owner/repo/pull/N). The number is
+// the artifact's, else the URL's. A non-empty reason says why it names no
+// pull request this build can resolve.
+func producedPRFromArtifact(a sqlcgen.Artifact, meta prArtifactMetadata, sessionRepos []byte) (producedPR, string) {
 	urlOwner, urlRepo, urlNumber, urlOK := parsePRURL(a.Url)
 	if meta.Repo == "" && urlOK {
 		meta.Repo = urlRepo
@@ -519,15 +647,10 @@ func producedPRFromArtifact(a sqlcgen.Artifact, sessionRepos []byte) (producedPR
 		meta.Number = urlNumber
 	}
 	if meta.Repo == "" || meta.Number <= 0 {
-		return producedPR{}, fmt.Errorf("pull request artifact %s names no repository and number", a.ID.String())
+		return producedPR{}, reasonArtifactNoPullRequest
 	}
 
-	owners := map[string]bool{}
-	for _, repo := range decodeSessionRepos(sessionRepos) {
-		if owner, name, err := reposource.ParseOwnerRepo(repo.Url); err == nil && name == meta.Repo {
-			owners[owner] = true
-		}
-	}
+	owners := sessionRepoOwners(meta.Repo, sessionRepos)
 	var owner string
 	switch {
 	case len(owners) == 1:
@@ -537,14 +660,14 @@ func producedPRFromArtifact(a sqlcgen.Artifact, sessionRepos []byte) (producedPR
 	case urlOK && urlRepo == meta.Repo:
 		owner = urlOwner
 	default:
-		return producedPR{}, fmt.Errorf("pull request artifact %s: the owner of %q is named by neither the session's repositories nor the URL", a.ID.String(), meta.Repo)
+		return producedPR{}, fmt.Sprintf("the owner of repository %q is named by neither the session's repositories nor the record's URL", meta.Repo)
 	}
 	return producedPR{
 		repoFullName: owner + "/" + meta.Repo,
 		number:       meta.Number,
 		url:          a.Url,
 		createdAt:    a.CreatedAt.Time,
-	}, nil
+	}, ""
 }
 
 // parsePRURL reads owner, repo and number from a pull request URL of the

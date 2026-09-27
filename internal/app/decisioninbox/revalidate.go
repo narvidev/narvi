@@ -555,6 +555,11 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		TouchedBlastRadius:                  touchedBlastRadius,
 		TouchedBlastRadiusKnown:             touchedBlastRadiusKnown,
 	}
+	// A session's result runs this probe's freshness half too
+	// (reviewfreshness.ProbeInput), so the two answer a verdict the record
+	// decides with the same reason
+	// (TestAssess_AgreesWithTheMergePathOnRecordDecidedVerdicts).
+	//
 	// ComputeEligibleWithAcceptance, never a bare probeReason != ReasonNone
 	// check: an applicable acceptance (accepted=true) can make eligible
 	// true while STILL reporting the waived Reason (ReasonNotShippableAuto/
@@ -570,9 +575,11 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	// ancestor chain's, and, where either moved, whether it moved only
 	// forward -- now genuinely decide whether it stays eligible.
 	//
-	// reviewfreshness.ReadLive is the ONE read of those facts (row 182,
-	// §21.1b: a session's result reads them through the same function and
-	// compares them through the same autoapproval.CheckFreshness), and it
+	// reviewfreshness.ReadLive reads those facts (row 182, §21.1b: a
+	// session's result reads them through the same function and compares
+	// them through the same autoapproval.CheckFreshness; the decision
+	// inbox's cached read model still assembles its own copy -- see the
+	// reviewfreshness package doc), and it
 	// makes exactly the calls this function used to make inline, in the
 	// same order, bounded by the same platform.Timeouts constants
 	// (DecisionInboxResolveBranchSHATimeout, DecisionInboxIsAncestorTimeout
