@@ -122,8 +122,18 @@ func seedResultSession(ctx context.Context, t *testing.T, pool *pgxpool.Pool, us
 		}
 	}
 	verdict(9, pgtype.UUID{}, 0)
+	// #9 is reviewed by a session of its own -- a merge outcome is recorded
+	// only on a claim with a review session (RecordMergeOutcome) -- and has
+	// merged since.
+	reviewer, err := sessions.Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub, CreatedBy: userID})
+	if err != nil {
+		t.Fatalf("create #9's review session: %v", err)
+	}
 	if err := claims.EnsureRow(ctx, "acme/widgets", 9); err != nil {
 		t.Fatalf("ensure claim #9: %v", err)
+	}
+	if err := claims.SetSessionID(ctx, "acme/widgets", 9, reviewer.ID); err != nil {
+		t.Fatalf("claim #9: %v", err)
 	}
 	if _, err := claims.RecordMergeOutcome(ctx, "acme/widgets", 9, true, time.Now()); err != nil {
 		t.Fatalf("record #9 merged: %v", err)
