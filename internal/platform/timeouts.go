@@ -3353,6 +3353,63 @@ type Timeouts struct {
 	// once, all callers together; past it a wait degrades exactly as past
 	// the per-key cap. A count. 32.
 	MCPWaitMaxConcurrentPerReplica int
+
+	// -- technical plan §43.20 (a session's result, row 182's piece (c)) --
+	//
+	// GET /api/sessions/{sessionID}/result, and narvi_get_session_result
+	// over it, read each assessed verdict's freshness live on every call
+	// (reviewfreshness.Assess): the pull request, then the base branch and
+	// ancestor link where they can change the answer -- a sequence whose
+	// per-call bounds (GitHubGetOpenPRTimeout, then
+	// DecisionInboxResolveBranchSHATimeout and DecisionInboxIsAncestorTimeout
+	// twice each) add up to about 70 seconds. With the tool's JSON responses
+	// nothing is written until the answer, so the whole live phase of one
+	// call is bounded by SessionResultLiveReadBudget: a verdict not
+	// established within it reads unconfirmed, saying it ran out of time.
+	// The answer then carries suggestedDelaySeconds, from the small table
+	// below, clamped to [SessionResultDelayFloor, SessionResultDelayCeiling]
+	// -- a hint that keeps a polling client quiet, never a brake.
+	//
+	// Links (orderings with no margin, like the status delay table's): the
+	// budget is positive and strictly below MCPWaitMaxDuration, the bound
+	// already chosen to stay under common proxies' idle timeouts -- the
+	// headroom covers the one snapshot read before the live phase and the
+	// encoding after it; the floor is strictly above the budget, so a client
+	// that waits the least suggested delay never starts a result call while
+	// its previous call's live reads can still be running; and every table
+	// value lies inside [floor, ceiling], so the clamp is a defense, never
+	// the thing that decides a shipped value.
+
+	// SessionResultLiveReadBudget is the most one result call spends on its
+	// live reads, all pull requests together (they run concurrently). 20
+	// seconds.
+	SessionResultLiveReadBudget time.Duration
+
+	// SessionResultDelayUnsettled is the suggestion while the session is
+	// not settled (queued, running, delivering, scheduled): the result can
+	// still change, and the status -- or the bounded wait -- is the cheap
+	// way to learn when it has. 30 seconds.
+	SessionResultDelayUnsettled time.Duration
+
+	// SessionResultDelayLiveRead is the suggestion once the session is
+	// settled and at least one verdict's freshness was read live: it
+	// changes only when a pull request or its base moves, and every read of
+	// the result asks the code host again, on the deployment's shared bot
+	// token. 60 seconds.
+	SessionResultDelayLiveRead time.Duration
+
+	// SessionResultDelaySettled is the suggestion once the session is
+	// settled and nothing was read live: nothing in it changes without new
+	// input. 300 seconds.
+	SessionResultDelaySettled time.Duration
+
+	// SessionResultDelayFloor is the least delay a result ever suggests.
+	// 30 seconds.
+	SessionResultDelayFloor time.Duration
+
+	// SessionResultDelayCeiling is the most delay a result ever suggests.
+	// 300 seconds.
+	SessionResultDelayCeiling time.Duration
 }
 
 // DefaultTimeouts returns the shipped defaults for every field, each
@@ -3654,6 +3711,13 @@ func DefaultTimeouts() Timeouts {
 		MCPWaitMaxConcurrentPerKey:     2,                // §43.20 (182b, D4); waits one grant (or user) runs at once per replica
 		MCPWaitMaxConcurrentPerUser:    4,                // §43.20 (182b, D4 strengthened); waits one user runs at once per replica, every grant and the browser together
 		MCPWaitMaxConcurrentPerReplica: 32,               // §43.20 (182b, D4); waits one replica runs at once
+
+		SessionResultLiveReadBudget: 20 * time.Second,  // §43.20 (182c); a result's live reads, all together, under MCPWaitMaxDuration
+		SessionResultDelayUnsettled: 30 * time.Second,  // §43.20 (182c); the session can still change: watch the status instead
+		SessionResultDelayLiveRead:  60 * time.Second,  // §43.20 (182c); settled, freshness read live on the shared bot token
+		SessionResultDelaySettled:   300 * time.Second, // §43.20 (182c); settled, nothing read live
+		SessionResultDelayFloor:     30 * time.Second,  // §43.20 (182c); least suggestion, above the live-read budget
+		SessionResultDelayCeiling:   300 * time.Second, // §43.20 (182c); most suggestion
 	}
 }
 
@@ -3992,6 +4056,41 @@ func (t Timeouts) Validate() error {
 		"MCPWaitMaxConcurrentPerKey", t.MCPWaitMaxConcurrentPerKey, "MCPWaitMaxConcurrentPerUser", t.MCPWaitMaxConcurrentPerUser)
 	countAtMost("MCPWaitMaxConcurrentPerReplica >= MCPWaitMaxConcurrentPerUser",
 		"MCPWaitMaxConcurrentPerUser", t.MCPWaitMaxConcurrentPerUser, "MCPWaitMaxConcurrentPerReplica", t.MCPWaitMaxConcurrentPerReplica)
+
+	// §43.20 (182c): a session's result (the SessionResult* fields' own
+	// block comment on the struct). A zero budget would report every
+	// verdict unconfirmed without asking the code host; one at or above
+	// MCPWaitMaxDuration would let a result call outlast the bound chosen
+	// to stay under proxies' idle timeouts. A floor at or below the budget
+	// would let a client following the hint overlap its own live reads.
+	mustBePositive("SessionResultLiveReadBudget", t.SessionResultLiveReadBudget)
+	strictlyBelow("MCPWaitMaxDuration > SessionResultLiveReadBudget",
+		"SessionResultLiveReadBudget", t.SessionResultLiveReadBudget, "MCPWaitMaxDuration", t.MCPWaitMaxDuration)
+	strictlyBelow("SessionResultDelayFloor > SessionResultLiveReadBudget",
+		"SessionResultLiveReadBudget", t.SessionResultLiveReadBudget, "SessionResultDelayFloor", t.SessionResultDelayFloor)
+	withinResultDelayBounds := func(field string, value time.Duration) {
+		if value < t.SessionResultDelayFloor {
+			errs = append(errs, &TimeoutInvariantError{
+				Chain:        field + " >= SessionResultDelayFloor",
+				LesserField:  "SessionResultDelayFloor",
+				LesserValue:  t.SessionResultDelayFloor,
+				GreaterField: field,
+				GreaterValue: value,
+			})
+		}
+		if value > t.SessionResultDelayCeiling {
+			errs = append(errs, &TimeoutInvariantError{
+				Chain:        "SessionResultDelayCeiling >= " + field,
+				LesserField:  field,
+				LesserValue:  value,
+				GreaterField: "SessionResultDelayCeiling",
+				GreaterValue: t.SessionResultDelayCeiling,
+			})
+		}
+	}
+	withinResultDelayBounds("SessionResultDelayUnsettled", t.SessionResultDelayUnsettled)
+	withinResultDelayBounds("SessionResultDelayLiveRead", t.SessionResultDelayLiveRead)
+	withinResultDelayBounds("SessionResultDelaySettled", t.SessionResultDelaySettled)
 
 	// U1 audit fix, HIGH (confirmed finding: "the total budget is smaller
 	// than the retry chain it contains"). Derived from the SAME three

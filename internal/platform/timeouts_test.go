@@ -2037,6 +2037,9 @@ func TestTimeouts_Validate_MCPWait(t *testing.T) {
 		{"an interval just below the maximum is accepted", func(to *platform.Timeouts) {
 			to.MCPWaitMaxDuration = 2 * time.Second
 			to.MCPWaitPollInterval = 2*time.Second - time.Millisecond
+			// A session result's live-read budget stays below the wait
+			// bound (TestTimeouts_Validate_SessionResult), so it follows.
+			to.SessionResultLiveReadBudget = time.Second
 		}, nil},
 		{"an interval equal to the maximum", func(to *platform.Timeouts) { to.MCPWaitMaxDuration = to.MCPWaitPollInterval },
 			&want{chain: "MCPWaitMaxDuration > MCPWaitPollInterval"}},
@@ -2098,6 +2101,108 @@ func TestTimeouts_Validate_MCPWait(t *testing.T) {
 				case tc.want.field != "" && errors.As(e, &pos) && pos.Field == tc.want.field:
 					found = true
 				case tc.want.field != "" && errors.As(e, &count) && count.Field == tc.want.field:
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("Validate() = %v, want the broken link %+v reported", err, *tc.want)
+			}
+		})
+	}
+}
+
+func TestDefaultTimeouts_SessionResultFields(t *testing.T) {
+	t.Parallel()
+	to := platform.DefaultTimeouts()
+	for _, f := range []struct {
+		name string
+		got  time.Duration
+		want time.Duration
+	}{
+		{"SessionResultLiveReadBudget", to.SessionResultLiveReadBudget, 20 * time.Second},
+		{"SessionResultDelayUnsettled", to.SessionResultDelayUnsettled, 30 * time.Second},
+		{"SessionResultDelayLiveRead", to.SessionResultDelayLiveRead, 60 * time.Second},
+		{"SessionResultDelaySettled", to.SessionResultDelaySettled, 300 * time.Second},
+		{"SessionResultDelayFloor", to.SessionResultDelayFloor, 30 * time.Second},
+		{"SessionResultDelayCeiling", to.SessionResultDelayCeiling, 300 * time.Second},
+	} {
+		if f.got != f.want {
+			t.Errorf("%s = %v, want %v", f.name, f.got, f.want)
+		}
+	}
+}
+
+// TestTimeouts_Validate_SessionResult proves every link of a session
+// result's block (the SessionResult* fields' own doc comment) is enforced
+// on its own and reported by name: the live-read budget positive and
+// strictly below MCPWaitMaxDuration, the delay floor strictly above the
+// budget, and every table value inside [floor, ceiling]. Each boundary that
+// is still valid is accepted.
+func TestTimeouts_Validate_SessionResult(t *testing.T) {
+	t.Parallel()
+
+	type want struct {
+		chain string // a *TimeoutInvariantError with this Chain
+		field string // or a positive-value error naming this field
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*platform.Timeouts)
+		want   *want
+	}{
+		{"the shipped defaults hold", func(*platform.Timeouts) {}, nil},
+		{"a budget just below the wait bound is accepted", func(to *platform.Timeouts) {
+			to.SessionResultLiveReadBudget = to.MCPWaitMaxDuration - time.Millisecond
+		}, nil},
+		{"a budget equal to the wait bound", func(to *platform.Timeouts) { to.SessionResultLiveReadBudget = to.MCPWaitMaxDuration },
+			&want{chain: "MCPWaitMaxDuration > SessionResultLiveReadBudget"}},
+		{"a budget above the wait bound", func(to *platform.Timeouts) {
+			to.SessionResultLiveReadBudget = to.MCPWaitMaxDuration + time.Second
+		}, &want{chain: "MCPWaitMaxDuration > SessionResultLiveReadBudget"}},
+		{"a zero budget reads nothing live", func(to *platform.Timeouts) { to.SessionResultLiveReadBudget = 0 }, &want{field: "SessionResultLiveReadBudget"}},
+		{"a negative budget", func(to *platform.Timeouts) { to.SessionResultLiveReadBudget = -time.Second }, &want{field: "SessionResultLiveReadBudget"}},
+		{"a floor equal to the budget", func(to *platform.Timeouts) { to.SessionResultDelayFloor = to.SessionResultLiveReadBudget },
+			&want{chain: "SessionResultDelayFloor > SessionResultLiveReadBudget"}},
+		{"a floor just above the budget is accepted", func(to *platform.Timeouts) {
+			to.SessionResultDelayFloor = to.SessionResultLiveReadBudget + time.Millisecond
+		}, nil},
+		{"a value below the floor", func(to *platform.Timeouts) {
+			to.SessionResultDelayUnsettled = to.SessionResultDelayFloor - time.Millisecond
+		}, &want{chain: "SessionResultDelayUnsettled >= SessionResultDelayFloor"}},
+		{"a value equal to the floor is accepted", func(to *platform.Timeouts) { to.SessionResultDelayLiveRead = to.SessionResultDelayFloor }, nil},
+		{"a value above the ceiling", func(to *platform.Timeouts) {
+			to.SessionResultDelaySettled = to.SessionResultDelayCeiling + time.Millisecond
+		}, &want{chain: "SessionResultDelayCeiling >= SessionResultDelaySettled"}},
+		{"a ceiling below the live-read value", func(to *platform.Timeouts) {
+			to.SessionResultDelayCeiling = to.SessionResultDelayLiveRead - time.Millisecond
+		}, &want{chain: "SessionResultDelayCeiling >= SessionResultDelayLiveRead"}},
+		{"a value equal to the ceiling is accepted", func(to *platform.Timeouts) { to.SessionResultDelayUnsettled = to.SessionResultDelayCeiling }, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			to := platform.DefaultTimeouts()
+			tc.mutate(&to)
+			err := to.Validate()
+			if tc.want == nil {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			var errs []error
+			if joined, ok := err.(interface{ Unwrap() []error }); ok {
+				errs = joined.Unwrap()
+			} else if err != nil {
+				errs = []error{err}
+			}
+			found := false
+			for _, e := range errs {
+				var inv *platform.TimeoutInvariantError
+				var pos *platform.TimeoutMustBePositiveError
+				switch {
+				case tc.want.chain != "" && errors.As(e, &inv) && inv.Chain == tc.want.chain:
+					found = true
+				case tc.want.field != "" && errors.As(e, &pos) && pos.Field == tc.want.field:
 					found = true
 				}
 			}
