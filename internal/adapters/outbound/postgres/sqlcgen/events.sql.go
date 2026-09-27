@@ -201,7 +201,14 @@ func (q *Queries) GetBootP95InWindow(ctx context.Context, createdAt pgtype.Times
 }
 
 const getLatestTokenFrameForPart = `-- name: GetLatestTokenFrameForPart :one
-SELECT id, COALESCE(payload->>'text', '')::text AS text
+SELECT id, COALESCE(payload->>'text', '')::text AS text,
+    (SELECT first_frame.id
+     FROM events AS first_frame
+     WHERE first_frame.session_id = $1
+       AND first_frame.type = 'token'
+       AND first_frame.payload->>'messageId' = $2::text
+     ORDER BY first_frame.id ASC
+     LIMIT 1)::bigint AS first_id
 FROM events
 WHERE session_id = $1
   AND type = 'token'
@@ -216,24 +223,34 @@ type GetLatestTokenFrameForPartParams struct {
 }
 
 type GetLatestTokenFrameForPartRow struct {
-	ID   int64  `json:"id"`
-	Text string `json:"text"`
+	ID      int64  `json:"id"`
+	Text    string `json:"text"`
+	FirstID int64  `json:"first_id"`
 }
 
-// The newest stored frame (highest id) of one streamed text part, found
-// by the payload's own messageId (the part id) rather than by the storage
-// key, which carries a per-frame suffix (CreateEvent above). The session
-// actor reads it before storing a `token` frame, to add no row for a
-// frame that is the stored one again or an older one replayed late
-// (sessionactor/tokenframe.go). events_token_part_idx
-// (migrations/000144_events_token_part_idx.up.sql) serves it: the literal
-// type = 'token' matches that partial index's predicate, and the
-// expression must stay byte-for-byte payload->>'messageId' for the index
-// to apply. pgx.ErrNoRows means no frame of this part is stored yet.
+// The newest stored frame (highest id) of one streamed text part, plus the
+// id of the part's FIRST stored frame, found by the payload's own
+// messageId (the part id) rather than by the storage key, which carries a
+// per-frame suffix (CreateEvent above). The session actor reads both
+// before storing a `token` frame (sessionactor/tokenframe.go): first_id
+// places the part in a turn's window -- a part first stored at or below
+// the Processing turn's dispatched_event_id belongs to an earlier turn,
+// and a late frame of it adds no row -- and text lets it add no row for a
+// frame that is the stored one again or an older one replayed late.
+//
+// events_token_part_idx (migrations/000144_events_token_part_idx.up.sql)
+// serves both halves, the outer one as a backward scan and first_id as a
+// forward one: the literal type = 'token' matches that partial index's
+// predicate, and the expression must stay byte-for-byte
+// payload->>'messageId' for the index to apply.
+// TestEventStore_StoredTokenPart_UsesPartIndex EXPLAINs the SQL this store
+// actually sends, so a drift here fails there. first_id is never NULL: the
+// outer row is itself a frame of the part. pgx.ErrNoRows means no frame of
+// this part is stored yet.
 func (q *Queries) GetLatestTokenFrameForPart(ctx context.Context, arg GetLatestTokenFrameForPartParams) (GetLatestTokenFrameForPartRow, error) {
 	row := q.db.QueryRow(ctx, getLatestTokenFrameForPart, arg.SessionID, arg.PartID)
 	var i GetLatestTokenFrameForPartRow
-	err := row.Scan(&i.ID, &i.Text)
+	err := row.Scan(&i.ID, &i.Text, &i.FirstID)
 	return i, err
 }
 

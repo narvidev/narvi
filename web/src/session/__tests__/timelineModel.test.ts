@@ -222,3 +222,103 @@ describe('buildTimelineModel', () => {
     expect(model.turns[0]!.steps[0]!.toolCalls[0]!.input).toEqual(bigInput)
   })
 })
+
+// What a sandbox's reconnect replay can put in the log. The sandbox-agent
+// keeps best-effort events in its outbound buffer and resends all of them
+// on every reconnect, long after their turn's execution_complete; this
+// model opens a turn at any turn-scoped event that follows one, so a
+// `token` row stored there would read as a new turn still running (and,
+// since the route derives hasOpenTurn from the last turn's `live`, disable
+// the composer). The session actor therefore stores a `token` frame only
+// while its turn is Processing (internal/app/sessionactor/tokenframe.go,
+// pinned end to end by TestHandleSandboxEvent_TokenFrames_
+// LateFramesOfAnEndedTurnAddNoRow): a replay after the turn ended adds no
+// row, and one during the next turn adds nothing of the earlier turn's
+// parts. These are the logs that leaves, fed to this model.
+describe('buildTimelineModel over the log a reconnect replay can leave', () => {
+  // A turn as the server stores it: a step, its text parts (each stored as
+  // one row per distinct frame), the step's end and the turn's end.
+  function storedTurn(step: string, parts: Record<string, string[]>): EventEnvelope[] {
+    const events = [env('step_start', { messageId: `msg_${step}`, stepId: step })]
+    for (const [partId, frames] of Object.entries(parts)) {
+      for (const text of frames) events.push(env('token', { messageId: partId, text }))
+    }
+    events.push(env('step_finish', { messageId: `msg_${step}`, stepId: step, cost: { tokens: { input: 1, output: 1 } } }))
+    events.push(env('execution_complete', { messageId: `done_${step}`, outcome: 'completed', reason: null }))
+    return events
+  }
+
+  // hasOpenTurn exactly as routes/session/$sessionId.tsx derives it.
+  function hasOpenTurn(events: EventEnvelope[]): boolean {
+    const { turns } = buildTimelineModel(events)
+    return turns.length > 0 && (turns[turns.length - 1]?.live ?? false)
+  }
+
+  // Every prefix of the log is a state the page renders, live or on a
+  // reload: a turn may be live only while it has no execution_complete,
+  // only if it is the last turn, and never right after an
+  // execution_complete.
+  function expectNoPhantomTurn(events: EventEnvelope[]): void {
+    for (let n = 1; n <= events.length; n++) {
+      const prefix = events.slice(0, n)
+      const { turns } = buildTimelineModel(prefix)
+      const live = turns.filter((t) => t.live)
+      expect(live.length, `prefix of ${n} events`).toBeLessThanOrEqual(1)
+      if (live.length === 1) expect(turns[turns.length - 1]!.live, `prefix of ${n} events`).toBe(true)
+      if (prefix[n - 1]!.type === 'execution_complete') expect(hasOpenTurn(prefix), `prefix of ${n} events`).toBe(false)
+    }
+  }
+
+  it('a replay after the turns ended leaves them closed: no live turn, the composer open', () => {
+    // History stored before per-frame keys (first frame only: prt_legacy is
+    // blank for good) and after (prt_fixed kept both frames); the replay of
+    // either adds no row.
+    const events = [...storedTurn('s1', { prt_legacy: [''] }), ...storedTurn('s2', { prt_fixed: ['', 'Turn two note.'] })]
+    const model = buildTimelineModel(events)
+    expect(model.turns.map((t) => [t.live, t.outcome?.outcome])).toEqual([
+      [false, 'completed'],
+      [false, 'completed'],
+    ])
+    expect(model.turns[1]!.steps[0]!.tokens).toEqual([{ messageId: 'prt_fixed', text: 'Turn two note.' }])
+    expect(hasOpenTurn(events)).toBe(false)
+    expectNoPhantomTurn(events)
+  })
+
+  it('a replay during the next turn leaves that turn holding only its own text, live until its execution_complete', () => {
+    const earlier = storedTurn('s1', { prt_legacy: [''] })
+    const next = storedTurn('s2', { prt_next: ['', 'Turn two answer.'] })
+    const running = [...earlier, ...next.slice(0, -2)] // the next turn's step still open
+    let model = buildTimelineModel(running)
+    expect(model.turns).toHaveLength(2)
+    expect(model.turns[1]!.live).toBe(true)
+    expect(model.turns[1]!.steps.flatMap((s) => s.tokens)).toEqual([{ messageId: 'prt_next', text: 'Turn two answer.' }])
+
+    const done = [...earlier, ...next]
+    model = buildTimelineModel(done)
+    expect(model.turns.every((t) => !t.live)).toBe(true)
+    expect(hasOpenTurn(done)).toBe(false)
+    expectNoPhantomTurn(done)
+  })
+
+  // The shape the actor refuses to write, and why: frames of an ended
+  // turn's part stored after its execution_complete become a turn of their
+  // own that never ends, holding old text, and the next real turn is folded
+  // into it.
+  it('late rows of an ended turn stored after its execution_complete would read as a phantom live turn', () => {
+    const late = [
+      ...storedTurn('s1', { prt_legacy: [''] }),
+      env('token', { messageId: 'prt_legacy', text: 'Turn one final answer.' }),
+    ]
+    const model = buildTimelineModel(late)
+    expect(model.turns).toHaveLength(2)
+    expect(model.turns[1]!.live).toBe(true)
+    expect(model.turns[1]!.outcome).toBeNull()
+    expect(model.turns[1]!.steps[0]!.tokens).toEqual([{ messageId: 'prt_legacy', text: 'Turn one final answer.' }])
+    expect(hasOpenTurn(late)).toBe(true)
+
+    const thenNextTurn = [...late, ...storedTurn('s2', { prt_next: ['', 'Turn two answer.'] })]
+    const folded = buildTimelineModel(thenNextTurn)
+    expect(folded.turns).toHaveLength(2) // the next turn is folded into the phantom one
+    expect(folded.turns[1]!.steps.map((s) => s.stepId)).toEqual([expect.stringMatching(/^implicit:/), 's2'])
+  })
+})

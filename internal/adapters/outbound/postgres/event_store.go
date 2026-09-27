@@ -53,24 +53,35 @@ func (s *EventStore) Create(ctx context.Context, arg sqlcgen.CreateEventParams) 
 	return s.q.CreateEvent(ctx, arg)
 }
 
-// LatestTokenFrameText returns the text of the newest stored `token` frame
-// (highest id) whose payload messageId is partID in sessionID, and whether
-// one exists at all -- no stored frame is found=false, never an error.
-// The session actor calls it inside its own transaction before storing a
-// frame (sessionactor/tokenframe.go); events_token_part_idx keeps it an
-// index probe however long the session's log is.
-func (s *EventStore) LatestTokenFrameText(ctx context.Context, sessionID pgtype.UUID, partID string) (text string, found bool, err error) {
+// StoredTokenPart is what is already stored of one streamed text part:
+// the id of its first stored `token` frame and the text of its newest one.
+type StoredTokenPart struct {
+	// FirstFrameID is the lowest events.id among the part's stored frames:
+	// where the part entered the log, which places it in a turn's window.
+	FirstFrameID int64
+	// LatestText is the text of the part's highest-id stored frame, the
+	// one every reader shows.
+	LatestText string
+}
+
+// StoredTokenPart returns what is stored of the `token` part whose payload
+// messageId is partID in sessionID, and whether any frame of it is stored
+// at all -- none is found=false, never an error. The session actor calls
+// it inside its own transaction before storing a frame
+// (sessionactor/tokenframe.go); events_token_part_idx keeps both halves
+// of it index probes however long the session's log is.
+func (s *EventStore) StoredTokenPart(ctx context.Context, sessionID pgtype.UUID, partID string) (part StoredTokenPart, found bool, err error) {
 	row, err := s.q.GetLatestTokenFrameForPart(ctx, sqlcgen.GetLatestTokenFrameForPartParams{
 		SessionID: sessionID,
 		PartID:    partID,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", false, nil
+		return StoredTokenPart{}, false, nil
 	}
 	if err != nil {
-		return "", false, err
+		return StoredTokenPart{}, false, err
 	}
-	return row.Text, true, nil
+	return StoredTokenPart{FirstFrameID: row.FirstID, LatestText: row.Text}, true, nil
 }
 
 // ListForSession returns up to limit events for sessionID with id >

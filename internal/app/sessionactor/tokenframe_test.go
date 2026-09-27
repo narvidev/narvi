@@ -66,3 +66,33 @@ func TestTokenFrameAddsNoRow(t *testing.T) {
 		})
 	}
 }
+
+// TestTokenPartFromEarlierTurn pins where a stored part sits against the
+// Processing turn's window: every event that turn produces has an id above
+// its dispatched_event_id, so a part first stored at or below it entered
+// the log before the turn existed.
+func TestTokenPartFromEarlierTurn(t *testing.T) {
+	t.Parallel()
+
+	watermark := func(id int64) *int64 { return &id }
+	tests := []struct {
+		name              string
+		firstFrameID      int64
+		dispatchedEventID *int64
+		want              bool
+	}{
+		{name: "part first stored inside the turn's window", firstFrameID: 11, dispatchedEventID: watermark(10), want: false},
+		{name: "part first stored at the watermark itself", firstFrameID: 10, dispatchedEventID: watermark(10), want: true},
+		{name: "part first stored before the turn was dispatched", firstFrameID: 3, dispatchedEventID: watermark(10), want: true},
+		{name: "turn dispatched into an empty log", firstFrameID: 1, dispatchedEventID: watermark(0), want: false},
+		{name: "no watermark places no window", firstFrameID: 1, dispatchedEventID: nil, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tokenPartFromEarlierTurn(tt.firstFrameID, tt.dispatchedEventID); got != tt.want {
+				t.Errorf("tokenPartFromEarlierTurn(%d, %v) = %v, want %v", tt.firstFrameID, tt.dispatchedEventID, got, tt.want)
+			}
+		})
+	}
+}

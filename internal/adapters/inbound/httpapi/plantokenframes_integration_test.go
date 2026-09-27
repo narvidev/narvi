@@ -41,11 +41,22 @@ func TestApprovePlan_MultiFrameStreamedPlan_SnapshotsFullContentAndStructuredSte
 			owner, token := rig.createAuthenticatedUser(ctx, t)
 			session := createSessionForUser(ctx, t, rig, owner.ID, nil)
 
-			turn, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusCompleted, PlanMode: true})
+			// The producing turn is Processing while its frames arrive, as a
+			// dispatched turn is (the session actor stores a frame only then),
+			// and completes afterwards.
+			turn, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing, PlanMode: true})
 			if err != nil {
 				t.Fatalf("create producing turn: %v", err)
 			}
-			dispatchTurn(ctx, t, rig, session.ID, turn.ID)
+			watermark, err := rig.events.MaxEventIDForSession(ctx, session.ID)
+			if err != nil {
+				t.Fatalf("MaxEventIDForSession: %v", err)
+			}
+			if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+				ID: turn.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedEventID: &watermark,
+			}); err != nil {
+				t.Fatalf("stamp dispatched_event_id: %v", err)
+			}
 			if _, err := rig.sandboxes.Create(ctx, session.ID); err != nil {
 				t.Fatalf("create sandbox: %v", err)
 			}
@@ -71,6 +82,10 @@ func TestApprovePlan_MultiFrameStreamedPlan_SnapshotsFullContentAndStructuredSte
 				case <-time.After(5 * time.Second):
 					t.Fatalf("timed out waiting for frame %d's outcome", i)
 				}
+			}
+
+			if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: turn.ID, Status: sqlcgen.TurnStatusCompleted}); err != nil {
+				t.Fatalf("complete producing turn: %v", err)
 			}
 
 			plan, err := rig.plans.Create(ctx, sqlcgen.CreatePlanParams{SessionID: session.ID, TurnID: turn.ID, Version: 1, Status: sqlcgen.PlanStatusAwaitingApproval})

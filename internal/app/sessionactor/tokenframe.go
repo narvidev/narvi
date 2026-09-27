@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -29,8 +30,9 @@ import (
 // broadcast either (appendRawEvent broadcasts only an inserted row), and a
 // plan-approval notification or approved plan snapshot built from them
 // froze that text. That was the case from 2026-07-20 until this file, and
-// the history stored in that window cannot be repaired: the later frames
-// were never written anywhere.
+// the history stored in that window stays truncated: the later frames were
+// never stored, and the turn-window rule below refuses them when a sandbox
+// that still holds them replays them (see "Only while its turn is live").
 //
 // Replacing the stored payload in place was rejected: the row would keep
 // its id, so every `id > cursor` reader (the web client's backfill,
@@ -49,6 +51,57 @@ import (
 // make both rows and bytes grow with every delta, cumulative bytes
 // quadratically; the real-binary test above fails first, and adapter-side
 // coalescing is the answer then, not a change here.
+//
+// # Only while its turn is live
+//
+// A frame adds a row only while the turn that produced it is the one
+// Processing. The log has no other way to say which turn a row belongs
+// to: readers place a row by its id. The web timeline
+// (web/src/session/timelineModel.ts) closes a turn at its
+// execution_complete and opens a new one at the next turn-scoped event,
+// and plan.ExtractContent reads a turn's text from the rows above its
+// dispatched_event_id. So a frame stored after its turn ended does not
+// repair that turn: it lands at the tail of the log, where the timeline
+// shows it as a new turn that is still running (which also disables the
+// composer, since a turn looks open) and a later turn's window reads it
+// as that turn's text. The log is append-only, so the damage would be
+// permanent.
+//
+// Late frames are not hypothetical. The sandbox-agent keeps best-effort
+// entries in its outbound buffer until they are evicted (up to 1000 of
+// them, internal/sandboxagent/wsbridge) and replays the whole buffer on
+// every reconnect, so a control-plane restart gets back every frame the
+// sandbox still holds -- including, on the first reconnect after this
+// file shipped, the full-text frames the first-wins rule had swallowed. A
+// frame whose transaction failed comes back the same way.
+//
+// The rule, read inside the actor's transaction, under the session row
+// lock every event insert takes before drawing its id (CreateEvent,
+// queries/events.sql), so ids are in commit order within the session:
+//   - no turn Processing: no row. Every frame of a turn arrives while it
+//     Processes -- dispatch moves it Pending -> Dispatched -> Processing in
+//     one transaction, before the prompt is sent, and the runtime sends a
+//     part's frames before the turn's execution_complete -- so a frame
+//     with no live turn is a late one.
+//   - the part's FIRST stored frame at or below the Processing turn's
+//     dispatched_event_id (the log's high-water mark when it was
+//     dispatched, migrations/000089): the part entered the log before this
+//     turn existed, so it belongs to an earlier one. No row. The first
+//     frame decides, not the newest: a part cannot begin in one turn and
+//     continue in the next.
+//
+// A late frame of a part NONE of whose frames was ever stored cannot be
+// placed: a `token` names no turn on the wire (§6.1's contract is fixed),
+// so if a later turn is Processing when it arrives, it is stored in that
+// turn's window. That takes a lost first frame AND a replay during a
+// later turn, and it is the same for every event type whose first
+// delivery failed; it is not something this file introduced.
+//
+// A NULL dispatched_event_id places no window, exactly as
+// plan.ExtractContent reads a NULL lower bound: every dispatch stamps it
+// in the same write that makes the turn Processing (dispatch.go,
+// tryPlanDispatch and tryPlanReenqueue), so a Processing turn without one
+// does not occur outside tests that seed a turn row directly.
 
 // tokenFrameKeyHashBytes is how many bytes of the text's SHA-256 the
 // storage key keeps: 128 bits, so two distinct frames of one part never
@@ -64,6 +117,16 @@ const tokenFrameKeyHashBytes = 16
 func tokenFrameStorageKey(partID, text string) string {
 	sum := sha256.Sum256([]byte(text))
 	return partID + "#" + hex.EncodeToString(sum[:tokenFrameKeyHashBytes])
+}
+
+// tokenPartFromEarlierTurn reports whether a stored part whose first frame
+// has id firstFrameID entered the log before the Processing turn whose
+// dispatched_event_id is dispatchedEventID -- i.e. belongs to an earlier
+// turn, so that a late frame of it must add no row (see "Only while its
+// turn is live" above). Every event the Processing turn produces has an id
+// above its dispatched_event_id; nil places no window.
+func tokenPartFromEarlierTurn(firstFrameID int64, dispatchedEventID *int64) bool {
+	return dispatchedEventID != nil && firstFrameID <= *dispatchedEventID
 }
 
 // tokenFrameAddsNoRow reports whether a `token` frame whose text is
@@ -103,17 +166,29 @@ func tokenFrameAddsNoRow(incoming, latest string) bool {
 // token-only branch of handleSandboxEvent's "persist ALWAYS" step, which
 // calls appendRawEvent directly for every other type. Returns whether a
 // row was inserted (and so queued for broadcast), exactly like
-// appendRawEvent: false for a deduped resend and for a frame
-// tokenFrameAddsNoRow rejects.
+// appendRawEvent: false for a deduped resend, for a frame that arrives
+// with no turn Processing or belongs to an earlier turn's part (see "Only
+// while its turn is live" above), and for a frame tokenFrameAddsNoRow
+// rejects.
 //
 // The part id is read from the payload itself -- the same bytes wshub
 // took cmd.MessageID from, and the value events_token_part_idx indexes --
-// so the storage key and the latest-frame lookup always name the same
+// so the storage key and the stored-part lookup always name the same
 // part. A payload whose fields cannot be decoded (never produced by a real
 // sandbox: the wire schema requires both as strings) is stored under
 // cmd.MessageID as it was before per-frame keys existed, so it is still
-// persisted rather than dropped.
+// persisted rather than dropped, provided a turn is Processing.
 func (a *Actor) appendTokenFrame(ctx context.Context, tx pgx.Tx, cmd SandboxEvent) (bool, error) {
+	processing, err := a.stores.turn.WithTx(tx).GetProcessingTurnForSession(ctx, a.sessionID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		a.logger.Debug("sessionactor: token frame with no turn processing; adding no row",
+			"message_id", cmd.MessageID)
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("sessionactor: read processing turn for token frame: %w", err)
+	}
+
 	var frame struct {
 		MessageID string `json:"messageId"`
 		Text      string `json:"text"`
@@ -124,12 +199,20 @@ func (a *Actor) appendTokenFrame(ctx context.Context, tx pgx.Tx, cmd SandboxEven
 		return a.appendRawEvent(ctx, tx, cmd.Type, cmd.MessageID, cmd.Raw)
 	}
 
-	latest, found, err := a.stores.event.WithTx(tx).LatestTokenFrameText(ctx, a.sessionID, frame.MessageID)
+	part, found, err := a.stores.event.WithTx(tx).StoredTokenPart(ctx, a.sessionID, frame.MessageID)
 	if err != nil {
-		return false, fmt.Errorf("sessionactor: read latest token frame: %w", err)
+		return false, fmt.Errorf("sessionactor: read stored token part: %w", err)
 	}
-	if found && tokenFrameAddsNoRow(frame.Text, latest) {
-		return false, nil
+	if found {
+		if tokenPartFromEarlierTurn(part.FirstFrameID, processing.DispatchedEventID) {
+			a.logger.Debug("sessionactor: token frame of a part from an earlier turn; adding no row",
+				"message_id", frame.MessageID, "first_frame_id", part.FirstFrameID,
+				"turn_id", processing.ID.String())
+			return false, nil
+		}
+		if tokenFrameAddsNoRow(frame.Text, part.LatestText) {
+			return false, nil
+		}
 	}
 	return a.appendRawEvent(ctx, tx, cmd.Type, tokenFrameStorageKey(frame.MessageID, frame.Text), cmd.Raw)
 }

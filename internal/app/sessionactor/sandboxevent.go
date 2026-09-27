@@ -285,7 +285,8 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 		//
 		// `token` is the one type not stored under its wire messageId as
 		// is: every frame of a streamed text part shares that id, so each
-		// distinct frame gets its own storage key instead (tokenframe.go).
+		// distinct frame gets its own storage key instead, and a frame is
+		// stored only while its turn is Processing (tokenframe.go).
 		var inserted bool
 		if cmd.Type == "token" {
 			inserted, err = a.appendTokenFrame(ctx, tx, cmd)

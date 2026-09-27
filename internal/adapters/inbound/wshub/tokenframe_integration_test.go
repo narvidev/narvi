@@ -16,6 +16,7 @@ import (
 
 	"github.com/narvidev/narvi/contracts/gen/go/clientws"
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -75,6 +76,22 @@ func TestTokenFrames_SandboxToClients_EveryReaderGetsTheFinalText(t *testing.T) 
 	sessionID := sessionRow.ID.String()
 	if _, err := rig.sandboxes.Create(ctx, sessionRow.ID); err != nil {
 		t.Fatalf("create test sandbox: %v", err)
+	}
+	// The frames belong to a turn that is Processing, dispatched the way
+	// tryPlanDispatch stamps one: the session actor stores a `token` frame
+	// only then (sessionactor/tokenframe.go).
+	turn, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: sessionRow.ID, Status: sqlcgen.TurnStatusProcessing})
+	if err != nil {
+		t.Fatalf("create processing turn: %v", err)
+	}
+	watermark, err := rig.events.MaxEventIDForSession(ctx, sessionRow.ID)
+	if err != nil {
+		t.Fatalf("read events high-water mark: %v", err)
+	}
+	if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+		ID: turn.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedEventID: &watermark,
+	}); err != nil {
+		t.Fatalf("stamp dispatched_event_id: %v", err)
 	}
 
 	const (
