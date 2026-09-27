@@ -314,7 +314,7 @@ func toolSpecs(twins Twins) []toolSpec {
 		},
 		{
 			Name:         "narvi_get_session",
-			Description:  "Get one session's full detail by id -- the same detail GET /api/sessions/{sessionID} returns. Any authenticated role may read any session's detail; there is no per-session visibility restriction in this codebase today. Its status is the outcome derived when a turn last finished: it does not show queued or running work -- use narvi_get_session_status for what the session is doing now.",
+			Description:  "Get one session's full detail by id -- the same detail GET /api/sessions/{sessionID} returns. Any authenticated role may read any session's detail; there is no per-session visibility restriction in this codebase today. Its status is re-derived only when a turn finishes, so it does not show queued or running work -- use narvi_get_session_status for what the session is doing now.",
 			Scope:        mcpscope.Read,
 			Instruction:  "narvi_get_session (one session's full detail)",
 			Twin:         twin{method: http.MethodGet, pathTemplate: "/api/sessions/{sessionID}", handler: twins.GetSession},

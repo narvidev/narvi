@@ -294,7 +294,7 @@
               "type": "string"
             },
             "status": {
-              "description": "Matches Postgres session_status exactly: the outcome derived when a turn last reached a terminal state -- 'created' until one has. It is not re-derived when a turn is queued or dispatched, so it does not show queued or running work: a first turn runs its whole life under 'created', and a follow-up turn is queued and runs under 'completed' or 'failed'. What the session is doing now is SessionActivity.activity, GET /api/sessions/{sessionID}/status.",
+              "description": "Matches Postgres session_status exactly: derived each time a turn reaches a terminal state -- 'created' until one has, 'active' when another turn was still queued or running at that moment, otherwise that turn's outcome: 'completed', 'failed' or 'cancelled'. It is not re-derived when a turn is queued or dispatched, so it does not show queued or running work, and a queued or running turn can sit under any of the five values: a first turn runs its whole life under 'created', and a follow-up under whatever the last derivation left. What the session is doing now is SessionActivity.activity, GET /api/sessions/{sessionID}/status.",
               "enum": [
                 "created",
                 "active",
@@ -346,7 +346,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Get one session's full detail by id -- the same detail GET /api/sessions/{sessionID} returns. Any authenticated role may read any session's detail; there is no per-session visibility restriction in this codebase today. Its status is the outcome derived when a turn last finished: it does not show queued or running work -- use narvi_get_session_status for what the session is doing now.",
+    "description": "Get one session's full detail by id -- the same detail GET /api/sessions/{sessionID} returns. Any authenticated role may read any session's detail; there is no per-session visibility restriction in this codebase today. Its status is re-derived only when a turn finishes, so it does not show queued or running work -- use narvi_get_session_status for what the session is doing now.",
     "inputSchema": {
       "additionalProperties": false,
       "description": "The narvi_get_session MCP tool's own input (technical plan §43.7) -- the tool bridge's twin of GET /api/sessions/{sessionID}, carrying the path parameter as a plain required field the bridge maps onto chi's own URLParams before invoking the twin handler in-process (technical plan §43.7's bridge).",
@@ -478,7 +478,7 @@
               "type": "string"
             },
             "status": {
-              "description": "Matches Postgres session_status exactly: the outcome derived when a turn last reached a terminal state -- 'created' until one has. It is not re-derived when a turn is queued or dispatched, so it does not show queued or running work: a first turn runs its whole life under 'created', and a follow-up turn is queued and runs under 'completed' or 'failed'. What the session is doing now is SessionActivity.activity, GET /api/sessions/{sessionID}/status.",
+              "description": "Matches Postgres session_status exactly: derived each time a turn reaches a terminal state -- 'created' until one has, 'active' when another turn was still queued or running at that moment, otherwise that turn's outcome: 'completed', 'failed' or 'cancelled'. It is not re-derived when a turn is queued or dispatched, so it does not show queued or running work, and a queued or running turn can sit under any of the five values: a first turn runs its whole life under 'created', and a follow-up under whatever the last derivation left. What the session is doing now is SessionActivity.activity, GET /api/sessions/{sessionID}/status.",
               "enum": [
                 "created",
                 "active",
@@ -551,10 +551,10 @@
       "$defs": {
         "SessionActivity": {
           "additionalProperties": false,
-          "description": "GET /api/sessions/{sessionID}/status (technical plan §43.20): what one session's work is doing now, and how long to wait before reading it again. Derived at read time from the session's turn queue and its human gates, all read in ONE database snapshot -- never from Session.status, which is re-derived only when a turn reaches a terminal state and so reads 'created' or 'completed' while a turn is queued or running. Carries no events and no transcript: the event history is GET /api/sessions/{sessionID}/events (EventsResponse), a separate, paginated read.",
+          "description": "GET /api/sessions/{sessionID}/status (technical plan §43.20): what one session's work is doing now, and how long to wait before reading it again. Derived at read time from the session's turn queue and its human gates, all read in ONE database snapshot -- never from Session.status, which is re-derived only when a turn reaches a terminal state and so can hold any of its five values while a turn is queued or running. Carries no events and no transcript: the event history is GET /api/sessions/{sessionID}/events (EventsResponse), a separate, paginated read.",
           "properties": {
             "activity": {
-              "description": "In precedence order: 'running' when a turn is dispatched or processing (turns may be queued behind it); else 'queued' when a turn is pending -- including the gap between one turn finishing and the next being dispatched, and a whole sandbox cold start; else 'awaiting_approval' when a person must act (a plan awaiting approval, a workflow step awaiting a decision, or a workflow run escalated for review); else 'idle' when the session has no turn at all; else 'finished' (at least one turn, every one terminal). A queued or running turn is never reported as idle or finished.",
+              "description": "In precedence order: 'running' when a turn is dispatched or processing (turns may be queued behind it); else 'queued' when a turn is pending -- including the gap between one turn finishing and the next being dispatched, and a whole sandbox cold start; else 'awaiting_approval' when a person must act (a plan awaiting approval, a workflow step awaiting a decision, or a custom workflow's run escalated for review with nothing on the session since -- see awaiting.kind); else 'idle' when the session has no turn at all; else 'finished' (at least one turn, every one terminal). A queued or running turn is never reported as idle or finished.",
               "enum": [
                 "idle",
                 "queued",
@@ -576,7 +576,7 @@
                   "type": "string"
                 },
                 "kind": {
-                  "description": "'plan': a plan awaiting approval (id is the plan's, decided through POST /api/sessions/{sessionID}/plans/{planId}/approve or reject); 'workflow_step': a workflow step awaiting a decision (id is the step run's); 'workflow_escalation': a workflow run escalated for review (id is the run's).",
+                  "description": "'plan': a plan awaiting approval (id is the plan's, decided through POST /api/sessions/{sessionID}/plans/{planId}/approve or reject); 'workflow_step': a workflow step awaiting a decision (id is the step run's); 'workflow_escalation': a custom workflow's run escalated for review (id is the run's), reported only while it is the session's latest state -- its newest workflow run, with no turn after that run's own. Any newer turn closes it, so a person answers it by sending the session new work. A built-in workflow's escalation is never reported: no person or route can act on it, and when its turn failed or was stopped, lastRun already says so.",
                   "enum": [
                     "plan",
                     "workflow_step",

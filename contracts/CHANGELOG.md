@@ -30,7 +30,9 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 - Added: `SessionActivity` -- the response of the status route above:
   `activity` (`idle`, `queued`, `running`, `awaiting_approval`,
   `finished`), `settled`, `pendingTurns`, `inFlightTurn`, `awaiting` (the
-  open human gate: a plan, a workflow step, or an escalated workflow run),
+  open human gate: a plan, a workflow step, or a custom workflow's
+  escalated run while it is the session's latest state -- never a built-in
+  workflow's, and never once a newer turn exists),
   `lastRun`, `sandboxStatus`, `archived`, `suggestedDelaySeconds` and
   `observedAt`. Derived from the session's turn queue and human gates in
   one database snapshot, never from `Session.status`, and carrying no
@@ -44,9 +46,11 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   optional `limit` has `minimum: 1` and no maximum (the route clamps at
   500). Two `$defs` entries added, graded MINOR (row 32).
 - Changed (description only, annotation-only PATCH): `Session.status` now
-  says what it is -- the outcome derived when a turn last reached a
-  terminal state, not re-derived when a turn is queued or dispatched, so
-  it does not show queued or running work -- and points at
+  says what it is -- derived each time a turn reaches a terminal state
+  (`created` until one has, `active` when another turn was still open,
+  otherwise that turn's outcome), not re-derived when a turn is queued or
+  dispatched, so it does not show queued or running work and a queued or
+  running turn can sit under any of its five values -- and points at
   `SessionActivity.activity` for what a session is doing now. No field,
   type, enum value or requiredness changed.
 

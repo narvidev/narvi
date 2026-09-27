@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,8 +20,10 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
+	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/workflowengine"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -215,6 +218,92 @@ func newSeen() map[restdtos.SessionActivityActivity]*atomic.Int64 {
 func inTx(ctx context.Context, t *testing.T, rig testRig, fn func(tx pgx.Tx) error) error {
 	t.Helper()
 	return pgx.BeginFunc(ctx, rig.pool, fn)
+}
+
+// createTurnThroughCore creates a turn the way every ingress does
+// (httpapi.CreateTurnCore, RejectIfOpen), so the workflow engine resolves
+// it and tracks it as an attempt of a workflow run.
+func createTurnThroughCore(ctx context.Context, t *testing.T, rig testRig, sessionID pgtype.UUID) sqlcgen.Turn {
+	t.Helper()
+	created, wasCreated, cerr := httpapi.CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry,
+		sessionID, "carry on", nil, false, false, pgtype.UUID{}, httpapi.RejectIfOpen)
+	if cerr != nil {
+		t.Fatalf("CreateTurnCore: %d %s", cerr.Status, cerr.Message)
+	}
+	if !wasCreated {
+		t.Fatal("CreateTurnCore created no turn")
+	}
+	return created
+}
+
+// endTurnThroughEngine runs a pending turn to its end the way the session
+// actor does: dispatched, then processing, then -- in ONE transaction, as
+// completeProcessingTurn (pushpr.go), handleTurnDeadlineTimer
+// (timerfired.go) and failDispatchedTurn (dispatch.go) each do -- the
+// terminal edge trig takes from processing, followed by
+// workflowengine.OnTurnCompleted.
+func endTurnThroughEngine(ctx context.Context, t *testing.T, rig testRig, sessionID, turnID pgtype.UUID, trig turn.Trigger) {
+	t.Helper()
+	state := transitionTurn(ctx, t, rig.turns, turnID, turn.StatePending, turn.TriggerDispatch)
+	transitionTurn(ctx, t, rig.turns, turnID, state, turn.TriggerStartProcessing)
+	if err := inTx(ctx, t, rig, func(tx pgx.Tx) error {
+		transitionTurn(ctx, t, rig.turns.WithTx(tx), turnID, turn.StateProcessing, trig)
+		sessionRow, err := rig.sessions.WithTx(tx).Get(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+		workflowengine.OnTurnCompleted(ctx, workflowengine.Deps{
+			Workflows:           rig.workflows.WithTx(tx),
+			Turns:               rig.turns.WithTx(tx),
+			SlackThreadSessions: narvipg.NewSlackThreadSessionStore(rig.pool).WithTx(tx),
+			LinearAgentSessions: rig.linearAgentSessions.WithTx(tx),
+			GitHubPRSessions:    narvipg.NewGitHubPRSessionStore(rig.pool).WithTx(tx),
+			Outbox:              rig.outbox.WithTx(tx),
+		}, sessionRow, turnID, trig)
+		return nil
+	}); err != nil {
+		t.Fatalf("end turn %v via %s: %v", turnID, trig, err)
+	}
+}
+
+// sessionRuns is the session's workflow runs, oldest first.
+func sessionRuns(ctx context.Context, t *testing.T, rig testRig, sessionID pgtype.UUID) []sqlcgen.WorkflowRun {
+	t.Helper()
+	runs, err := rig.workflows.ListRunsForSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("list workflow runs: %v", err)
+	}
+	slices.Reverse(runs)
+	return runs
+}
+
+// customWorkflowSession binds a custom request-lane workflow -- one step,
+// no edge, no human gate, the shape of a duplicated built-in -- to a
+// repository of its own (a repo override, so no other test's global
+// binding changes), and returns a session on that repository, whose turns
+// the engine runs under it, and the workflow's id.
+func customWorkflowSession(ctx context.Context, t *testing.T, rig testRig, ownerID pgtype.UUID) (sqlcgen.Session, pgtype.UUID) {
+	t.Helper()
+	repo := fmt.Sprintf("example/status-escalation-%d", time.Now().UnixNano())
+	var defID pgtype.UUID
+	if err := rig.pool.QueryRow(ctx, `INSERT INTO workflow_definitions (lane, name, is_built_in, version) VALUES ('request', $1, false, 1) RETURNING id`, repo).Scan(&defID); err != nil {
+		t.Fatalf("insert custom workflow definition: %v", err)
+	}
+	if _, err := rig.pool.Exec(ctx, `INSERT INTO workflow_step_definitions (workflow_definition_id, step_order, kind, prompt_template) VALUES ($1, 1, 'agent', '{{prompt}}')`, defID); err != nil {
+		t.Fatalf("insert custom step definition: %v", err)
+	}
+	if _, err := rig.pool.Exec(ctx, `INSERT INTO workflow_bindings (lane, repo_full_name, workflow_definition_id, definition_version) VALUES ('request', $1, $2, 1)`, repo, defID); err != nil {
+		t.Fatalf("bind the custom workflow to %s: %v", repo, err)
+	}
+	sess, err := rig.sessions.Create(ctx, sqlcgen.CreateSessionParams{
+		SpawnSource: sqlcgen.SessionSpawnSourceWeb,
+		CreatedBy:   ownerID,
+		Repos:       []byte(`[{"name":"repo","url":"https://github.com/` + repo + `.git","branch":null}]`),
+	})
+	if err != nil {
+		t.Fatalf("create session on %s: %v", repo, err)
+	}
+	return sess, defID
 }
 
 // TestGetSessionStatus_PlanCompletionNeverObservedAsFinished_Race: a
@@ -466,20 +555,44 @@ func TestGetSessionStatus_Gates(t *testing.T) {
 		}
 	})
 
-	t.Run("a workflow run escalated for review", func(t *testing.T) {
-		sess := completedSession(t)
-		run, err := rig.workflows.CreateRun(ctx, sess.ID, "request", defID, 1)
-		if err != nil {
-			t.Fatal(err)
+	// A custom workflow's run escalated by its failed turn gates the session
+	// while it is the latest thing that happened -- and no longer once any
+	// newer turn exists. The newer turn here starts no run of its own (as a
+	// plan's implementation turn, or a turn queued behind a running one,
+	// does not), so the escalated run stays the session's newest run
+	// throughout: it is the newer TURN that supersedes it.
+	// TestGetSessionStatus_EscalatedTurnNeverGatesForGood covers a follow-up
+	// that starts a run of its own, and the built-in workflow.
+	t.Run("a workflow run escalated for review, until a newer turn supersedes it", func(t *testing.T) {
+		sess, customDef := customWorkflowSession(ctx, t, rig, user.ID)
+		first := createTurnThroughCore(ctx, t, rig, sess.ID)
+		endTurnThroughEngine(ctx, t, rig, sess.ID, first.ID, turn.TriggerFail)
+		runs := sessionRuns(ctx, t, rig, sess.ID)
+		if len(runs) != 1 || runs[0].WorkflowDefinitionID != customDef || runs[0].Status != sqlcgen.WorkflowRunStatusNeedsReview {
+			t.Fatalf("runs = %+v, want one run of the custom workflow, escalated", runs)
 		}
-		escalated, err := rig.workflows.EscalateRun(ctx, run.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
+		escalated := runs[0]
+
 		got := getStatus(t, rig, sess.ID, cookie)
-		if got.Activity != restdtos.SessionActivityActivityAwaitingApproval || got.Awaiting == nil || got.Awaiting.Kind != restdtos.SessionActivityAwaitingKindWorkflowEscalation ||
-			got.Awaiting.Id != run.ID.String() || !got.Awaiting.Since.Equal(escalated.UpdatedAt.Time) {
-			t.Fatalf("got activity %q awaiting %+v, want awaiting_approval on the escalated run", got.Activity, got.Awaiting)
+		if got.Activity != restdtos.SessionActivityActivityAwaitingApproval || !got.Settled || got.SuggestedDelaySeconds != 60 || got.Awaiting == nil ||
+			got.Awaiting.Kind != restdtos.SessionActivityAwaitingKindWorkflowEscalation || got.Awaiting.Id != escalated.ID.String() || !got.Awaiting.Since.Equal(escalated.UpdatedAt.Time) {
+			t.Errorf("escalated: activity %q settled %v delay %d awaiting %+v, want awaiting_approval, settled, 60, on run %v since it escalated", got.Activity, got.Settled, got.SuggestedDelaySeconds, got.Awaiting, escalated.ID)
+		}
+
+		newer := createTurn(ctx, t, rig.turns, sess.ID, false)
+		got = getStatus(t, rig, sess.ID, cookie)
+		if got.Activity != restdtos.SessionActivityActivityQueued || got.Awaiting != nil {
+			t.Errorf("a newer turn queued: activity %q awaiting %+v, want queued and no gate", got.Activity, got.Awaiting)
+		}
+		state := transitionTurn(ctx, t, rig.turns, newer.ID, turn.StatePending, turn.TriggerDispatch)
+		state = transitionTurn(ctx, t, rig.turns, newer.ID, state, turn.TriggerStartProcessing)
+		transitionTurn(ctx, t, rig.turns, newer.ID, state, turn.TriggerComplete)
+		if runs := sessionRuns(ctx, t, rig, sess.ID); len(runs) != 1 || runs[0].ID != escalated.ID || runs[0].Status != sqlcgen.WorkflowRunStatusNeedsReview {
+			t.Fatalf("runs = %+v, want the escalated run still the only one, still in needs_review", runs)
+		}
+		got = getStatus(t, rig, sess.ID, cookie)
+		if got.Activity != restdtos.SessionActivityActivityFinished || !got.Settled || got.Awaiting != nil || got.SuggestedDelaySeconds != 300 {
+			t.Errorf("the newer turn completed: activity %q settled %v awaiting %+v delay %d, want finished, settled, no gate, 300", got.Activity, got.Settled, got.Awaiting, got.SuggestedDelaySeconds)
 		}
 	})
 
@@ -551,4 +664,95 @@ func TestGetSessionStatus_Gates(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestGetSessionStatus_EscalatedTurnNeverGatesForGood: a workflow run in
+// needs_review is never moved out of it, and every follow-up turn is an
+// attempt of a workflow run -- the built-in single-step one by default --
+// that a failed, timed-out, abandoned or stopped turn escalates. Driven
+// through the production paths (CreateTurnCore; turn.Transition and
+// workflowengine.OnTurnCompleted in one terminal transaction), for each way
+// a turn ends short of completing, under the built-in and under a custom
+// workflow:
+//
+//   - right after the turn ends, the built-in run's escalation reads
+//     finished (it never gates: technical plan §43.20) and the custom run's
+//     reads awaiting_approval on that run -- each pinned;
+//   - a follow-up turn supersedes it at once, while it is still queued;
+//   - once the follow-up completes the session reads finished, the
+//     escalated run still parked in needs_review beside the completed one.
+func TestGetSessionStatus_EscalatedTurnNeverGatesForGood(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	user, cookie := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMember)
+	builtIn := mustUUID(t, builtInRequestDefID)
+
+	ends := []struct {
+		name    string
+		trigger turn.Trigger
+		outcome restdtos.SessionActivityLastRunOutcome
+	}{
+		// pushpr.go: an execution_complete reporting cancelled (the user's Stop).
+		{"stopped by the user", turn.TriggerCancel, restdtos.SessionActivityLastRunOutcomeCancelled},
+		// pushpr.go: an execution_complete reporting failed.
+		{"failed", turn.TriggerFail, restdtos.SessionActivityLastRunOutcomeFailed},
+		// timerfired.go: the turn deadline expired.
+		{"timed out", turn.TriggerTimeout, restdtos.SessionActivityLastRunOutcomeFailed},
+		// dispatch.go's failDispatchedTurn: the prompt never reached the
+		// sandbox, and the actor ends the turn on the deadline's own edge.
+		{"abandoned at dispatch", turn.TriggerTimeout, restdtos.SessionActivityLastRunOutcomeFailed},
+	}
+	for _, custom := range []bool{false, true} {
+		for _, end := range ends {
+			name := "built-in workflow/" + end.name
+			if custom {
+				name = "custom workflow/" + end.name
+			}
+			t.Run(name, func(t *testing.T) {
+				sess, wantDef := createSessionForUser(ctx, t, rig, user.ID, nil), builtIn
+				if custom {
+					sess, wantDef = customWorkflowSession(ctx, t, rig, user.ID)
+				}
+
+				first := createTurnThroughCore(ctx, t, rig, sess.ID)
+				endTurnThroughEngine(ctx, t, rig, sess.ID, first.ID, end.trigger)
+				runs := sessionRuns(ctx, t, rig, sess.ID)
+				if len(runs) != 1 || runs[0].WorkflowDefinitionID != wantDef || runs[0].Status != sqlcgen.WorkflowRunStatusNeedsReview {
+					t.Fatalf("after the first turn: runs %+v, want one run of %v, escalated", runs, wantDef)
+				}
+				escalated := runs[0]
+
+				got := getStatus(t, rig, sess.ID, cookie)
+				if got.LastRun == nil || got.LastRun.TurnId != first.ID.String() || got.LastRun.Outcome != end.outcome {
+					t.Errorf("after the first turn: lastRun %+v, want turn %v, %s", got.LastRun, first.ID, end.outcome)
+				}
+				if custom {
+					if got.Activity != restdtos.SessionActivityActivityAwaitingApproval || !got.Settled || got.SuggestedDelaySeconds != 60 || got.Awaiting == nil ||
+						got.Awaiting.Kind != restdtos.SessionActivityAwaitingKindWorkflowEscalation || got.Awaiting.Id != escalated.ID.String() || !got.Awaiting.Since.Equal(escalated.UpdatedAt.Time) {
+						t.Errorf("custom escalation, the latest state: activity %q settled %v delay %d awaiting %+v, want awaiting_approval, settled, 60, on run %v", got.Activity, got.Settled, got.SuggestedDelaySeconds, got.Awaiting, escalated.ID)
+					}
+				} else if got.Activity != restdtos.SessionActivityActivityFinished || !got.Settled || got.SuggestedDelaySeconds != 300 || got.Awaiting != nil {
+					t.Errorf("built-in escalation, the latest state: activity %q settled %v delay %d awaiting %+v, want finished, settled, 300, no gate", got.Activity, got.Settled, got.SuggestedDelaySeconds, got.Awaiting)
+				}
+
+				followUp := createTurnThroughCore(ctx, t, rig, sess.ID)
+				if got := getStatus(t, rig, sess.ID, cookie); got.Activity != restdtos.SessionActivityActivityQueued || got.Awaiting != nil {
+					t.Errorf("follow-up queued: activity %q awaiting %+v, want queued and no gate", got.Activity, got.Awaiting)
+				}
+
+				endTurnThroughEngine(ctx, t, rig, sess.ID, followUp.ID, turn.TriggerComplete)
+				runs = sessionRuns(ctx, t, rig, sess.ID)
+				if len(runs) != 2 || runs[0].ID != escalated.ID || runs[0].Status != sqlcgen.WorkflowRunStatusNeedsReview ||
+					runs[1].WorkflowDefinitionID != wantDef || runs[1].Status != sqlcgen.WorkflowRunStatusCompleted {
+					t.Fatalf("after the follow-up: runs %+v, want [the escalated run still in needs_review, a completed run of %v]", runs, wantDef)
+				}
+				got = getStatus(t, rig, sess.ID, cookie)
+				if got.Activity != restdtos.SessionActivityActivityFinished || !got.Settled || got.SuggestedDelaySeconds != 300 || got.Awaiting != nil ||
+					got.LastRun == nil || got.LastRun.TurnId != followUp.ID.String() || got.LastRun.Outcome != restdtos.SessionActivityLastRunOutcomeCompleted {
+					t.Errorf("after the follow-up: activity %q settled %v delay %d awaiting %+v lastRun %+v, want finished, settled, 300, no gate, the follow-up completed",
+						got.Activity, got.Settled, got.SuggestedDelaySeconds, got.Awaiting, got.LastRun)
+				}
+			})
+		}
+	}
 }

@@ -11089,12 +11089,15 @@ type Session struct {
 	// Matches Postgres session_spawn_source exactly.
 	SpawnSource SessionSpawnSource `json:"spawnSource" yaml:"spawnSource" mapstructure:"spawnSource"`
 
-	// Matches Postgres session_status exactly: the outcome derived when a turn last
-	// reached a terminal state -- 'created' until one has. It is not re-derived when
-	// a turn is queued or dispatched, so it does not show queued or running work: a
-	// first turn runs its whole life under 'created', and a follow-up turn is queued
-	// and runs under 'completed' or 'failed'. What the session is doing now is
-	// SessionActivity.activity, GET /api/sessions/{sessionID}/status.
+	// Matches Postgres session_status exactly: derived each time a turn reaches a
+	// terminal state -- 'created' until one has, 'active' when another turn was still
+	// queued or running at that moment, otherwise that turn's outcome: 'completed',
+	// 'failed' or 'cancelled'. It is not re-derived when a turn is queued or
+	// dispatched, so it does not show queued or running work, and a queued or running
+	// turn can sit under any of the five values: a first turn runs its whole life
+	// under 'created', and a follow-up under whatever the last derivation left. What
+	// the session is doing now is SessionActivity.activity, GET
+	// /api/sessions/{sessionID}/status.
 	Status SessionStatus `json:"status" yaml:"status" mapstructure:"status"`
 
 	// Null until the session_title WS event (§6.1) sets it.
@@ -11108,7 +11111,7 @@ type Session struct {
 // work is doing now, and how long to wait before reading it again. Derived at read
 // time from the session's turn queue and its human gates, all read in ONE database
 // snapshot -- never from Session.status, which is re-derived only when a turn
-// reaches a terminal state and so reads 'created' or 'completed' while a turn is
+// reaches a terminal state and so can hold any of its five values while a turn is
 // queued or running. Carries no events and no transcript: the event history is GET
 // /api/sessions/{sessionID}/events (EventsResponse), a separate, paginated read.
 type SessionActivity struct {
@@ -11116,8 +11119,9 @@ type SessionActivity struct {
 	// may be queued behind it); else 'queued' when a turn is pending -- including the
 	// gap between one turn finishing and the next being dispatched, and a whole
 	// sandbox cold start; else 'awaiting_approval' when a person must act (a plan
-	// awaiting approval, a workflow step awaiting a decision, or a workflow run
-	// escalated for review); else 'idle' when the session has no turn at all; else
+	// awaiting approval, a workflow step awaiting a decision, or a custom workflow's
+	// run escalated for review with nothing on the session since -- see
+	// awaiting.kind); else 'idle' when the session has no turn at all; else
 	// 'finished' (at least one turn, every one terminal). A queued or running turn is
 	// never reported as idle or finished.
 	Activity SessionActivityActivity `json:"activity" yaml:"activity" mapstructure:"activity"`
@@ -11213,7 +11217,12 @@ type SessionActivityAwaiting struct {
 	// 'plan': a plan awaiting approval (id is the plan's, decided through POST
 	// /api/sessions/{sessionID}/plans/{planId}/approve or reject); 'workflow_step': a
 	// workflow step awaiting a decision (id is the step run's);
-	// 'workflow_escalation': a workflow run escalated for review (id is the run's).
+	// 'workflow_escalation': a custom workflow's run escalated for review (id is the
+	// run's), reported only while it is the session's latest state -- its newest
+	// workflow run, with no turn after that run's own. Any newer turn closes it, so a
+	// person answers it by sending the session new work. A built-in workflow's
+	// escalation is never reported: no person or route can act on it, and when its
+	// turn failed or was stopped, lastRun already says so.
 	Kind SessionActivityAwaitingKind `json:"kind" yaml:"kind" mapstructure:"kind"`
 
 	// When the gate opened.

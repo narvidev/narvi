@@ -44,7 +44,8 @@
 //
 // DeriveActivity (activity.go) is a second, read-time derivation, not a
 // second store: Status is persisted only when a turn reaches a terminal
-// state, so it cannot say that a follow-up turn is queued or running.
+// state, never when one is queued or dispatched, so it does not tell
+// whether a follow-up turn is queued or running.
 // Activity (queued, running, awaiting_approval, idle, finished) is derived
 // from the turn queue and the session's human gates, all read in one
 // snapshot, whenever a client asks (technical plan §43.20), and is never

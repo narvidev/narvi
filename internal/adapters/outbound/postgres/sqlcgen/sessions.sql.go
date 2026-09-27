@@ -238,10 +238,21 @@ LEFT JOIN LATERAL (
 ) awaitingstep ON true
 LEFT JOIN LATERAL (
     SELECT wr.id, wr.updated_at
-    FROM workflow_runs wr
-    WHERE wr.session_id = s.id AND wr.status = 'needs_review'
-    ORDER BY wr.updated_at, wr.id
-    LIMIT 1
+    FROM (
+        SELECT r.id, r.status, r.workflow_definition_id, r.updated_at
+        FROM workflow_runs r
+        WHERE r.session_id = s.id
+        ORDER BY r.created_at DESC, r.id DESC
+        LIMIT 1
+    ) wr
+    JOIN workflow_definitions d ON d.id = wr.workflow_definition_id
+    WHERE wr.status = 'needs_review'
+      AND NOT d.is_built_in
+      AND EXISTS (
+          SELECT 1
+          FROM workflow_step_runs sr
+          WHERE sr.workflow_run_id = wr.id AND sr.turn_id = newest.id
+      )
 ) escalated ON true
 WHERE s.id = $1
 `
@@ -275,8 +286,8 @@ type GetSessionActivityFactsRow struct {
 // transaction that completes a plan-mode turn and inserts its plan
 // (sessionactor's recordPlanIfNeeded) and see "turn completed, no plan
 // yet" -- a false "finished". Deliberately NOT sessions.status: that
-// column is re-derived only when a turn reaches a terminal state, so it
-// reads "created" or "completed" while a turn is queued or running; it is
+// column is re-derived only when a turn reaches a terminal state, so a
+// queued or running turn can sit under any of its five values; it is
 // selected here only to decide whether sessions.failure_reason still
 // describes the last run (the handler's own rule), never the activity.
 //
@@ -288,10 +299,24 @@ type GetSessionActivityFactsRow struct {
 // (turns per session are unbounded, and each row carries its prompt).
 // Every lookup leads with session_id on an existing index (turns_session_
 // id_dispatched_message_id_idx, plans_one_awaiting_approval_per_session,
-// workflow_runs_session_id_idx, workflow_step_runs_one_live_per_run).
+// workflow_runs_session_id_idx, workflow_step_runs_one_live_per_run); the
+// escalation's two follow-up checks go by primary key and by
+// workflow_run_id (workflow_step_runs_run_step_idx).
+//
+// escalated is the session's LIVE workflow escalation, never merely a run
+// in needs_review: nothing moves a run out of needs_review, and the next
+// turn starts a fresh run beside the parked one (migrations/000057), so
+// counting every such run would gate the session for good. A needs_review
+// run is reported only when all three hold: it is the session's newest
+// workflow run; the session's newest turn is one of that run's own
+// attempts (workflow_step_runs.turn_id), so no turn has come after it --
+// whether that turn started a run of its own or none (a turn queued behind
+// a running one, a plan's implementation turn); and its definition is not
+// a built-in one, whose escalation no person or route can act on
+// (technical plan §43.20 gives the reasons).
 //
 // Turn order is created_at, then id -- ListTurnsForSession's own order,
-// with id breaking a tie. observed_at is the database's own statement time,
+// with id breaking a tie; workflow runs are ordered the same way. observed_at is the database's own statement time,
 // the instant the snapshot was taken. The two turn statuses are text, ”
 // when their turn is absent (its id is then NULL): an enum column from an
 // outer-joined subquery would be generated as a non-nullable type that

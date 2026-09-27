@@ -50,8 +50,8 @@ func TestDeriveActivity_Table(t *testing.T) {
 		{"plan awaiting + processing turn -> running", session.ActivityInput{TurnCounts: counts(turn.StateProcessing, 1), PlanAwaitingApproval: true}, session.ActivityRunning},
 		{"workflow step awaiting_decision -> awaiting_approval", session.ActivityInput{TurnCounts: counts(turn.StateCompleted, 1), WorkflowStepAwaitingDecision: true}, session.ActivityAwaitingApproval},
 		{"workflow step awaiting + pending next step -> queued", session.ActivityInput{TurnCounts: counts(turn.StateCompleted, 1, turn.StatePending, 1), WorkflowStepAwaitingDecision: true}, session.ActivityQueued},
-		{"workflow run needs_review -> awaiting_approval", session.ActivityInput{TurnCounts: counts(turn.StateFailed, 2), WorkflowRunNeedsReview: true}, session.ActivityAwaitingApproval},
-		{"a gate with no turn at all -> awaiting_approval, not idle", session.ActivityInput{WorkflowRunNeedsReview: true}, session.ActivityAwaitingApproval},
+		{"open workflow escalation -> awaiting_approval", session.ActivityInput{TurnCounts: counts(turn.StateFailed, 2), WorkflowEscalationOpen: true}, session.ActivityAwaitingApproval},
+		{"a gate with no turn at all -> awaiting_approval, not idle", session.ActivityInput{WorkflowEscalationOpen: true}, session.ActivityAwaitingApproval},
 		{"unknown turn state -> running", session.ActivityInput{TurnCounts: counts(turn.State("warming_up"), 1)}, session.ActivityRunning},
 		{"unknown turn state among terminal ones -> running, never finished", session.ActivityInput{TurnCounts: counts(turn.StateCompleted, 4, turn.State("warming_up"), 1)}, session.ActivityRunning},
 		{"unknown turn state with a plan awaiting -> running", session.ActivityInput{TurnCounts: counts(turn.State(""), 1), PlanAwaitingApproval: true}, session.ActivityRunning},
@@ -83,7 +83,7 @@ func TestDeriveActivity_NonEmptyQueueNeverIdleOrFinished(t *testing.T) {
 					TurnCounts:                   counts(state, 1, turn.StateCompleted, terminal),
 					PlanAwaitingApproval:         gates&1 != 0,
 					WorkflowStepAwaitingDecision: gates&2 != 0,
-					WorkflowRunNeedsReview:       gates&4 != 0,
+					WorkflowEscalationOpen:       gates&4 != 0,
 				}
 				got := session.DeriveActivity(in)
 				if got != session.ActivityQueued && got != session.ActivityRunning {

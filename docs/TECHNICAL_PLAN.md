@@ -7642,8 +7642,10 @@ client that reads the wrong field sees a busy session as idle. `sessions.status`
 for "what is it doing now": it is re-derived only when a turn reaches a terminal state (§3.1's
 derivation, run by the session actor on completion, deadline, abandon and the terminal-grace
 re-derive), never when a turn is created or dispatched. So a session's first turn runs its whole life
-under `created`, and a follow-up turn is queued and runs under `completed` or `failed` — and
-`narvi_get_session`, which returns the row, shows that work as idle. Writing `active` on enqueue and
+under `created`, and a follow-up turn is queued and runs under whatever the last derivation left —
+`active` when another turn was still open as the previous one ended, otherwise that turn's
+`completed`, `failed` or `cancelled` — and `narvi_get_session`, which returns the row, does not show
+that work. Writing `active` on enqueue and
 dispatch is a separate actor-path change (owner decision D8 of the row's design: not in 182); this
 section derives the live state at read time instead, from the rows Postgres already holds, and stores
 nothing.
@@ -7655,7 +7657,7 @@ does not exist, and no per-session visibility beyond that, because there is none
 
 **The derivation.** `session.DeriveActivity` is a pure function over one snapshot: how many of the
 session's turns are in each state, and whether a plan awaits approval, a workflow step awaits a
-decision, or a workflow run was escalated to `needs_review`. Highest first: a turn `dispatched` or
+decision, or a workflow escalation is still open (below). Highest first: a turn `dispatched` or
 `processing` → `running` (turns may be pending behind it); else a turn `pending` → `queued` — which
 covers the gap between one turn finishing and the next being dispatched, and a whole sandbox cold
 start; else a gate open → `awaiting_approval`; else no turn at all → `idle` (a session created without
@@ -7665,6 +7667,31 @@ does not recognize. A non-empty queue is therefore always `queued` or `running`,
 `finished`. `settled` is true for `idle`, `awaiting_approval` and `finished`: nothing progresses
 server-side until a person acts or sends new input.
 
+**Which escalation is a gate.** A workflow run escalated to `needs_review` (§25.9) stays there: no
+route or job moves a run out of it — `/decide` acts only on a step awaiting a decision — and the next
+turn starts a fresh run beside the parked one (migration `000057`: a parked run must not freeze the
+session). Counting every such run would let one failed turn gate a session for good. So an escalation
+is a gate only while it is still the latest thing that happened on the session: its run is the
+session's newest workflow run, and the session's newest turn is one of that run's own attempts
+(`workflow_step_runs.turn_id`; runs and turns both ordered by `created_at`, then id, in the same
+snapshot). Any newer turn closes it — one that starts a run of its own, or one that starts none, such
+as a turn queued behind a running one or a plan's implementation turn. A person acts on an
+escalation by sending the session new work, and the gate is gone as soon as that work is queued.
+
+A **built-in** workflow's escalation is never a gate. The built-ins are one passthrough step with no
+edge and no human gate of their own (§25.8), so their run escalates whenever that step's outcome is
+anything but `ok`: when its turn failed, hit its deadline, was abandoned at dispatch or was stopped
+by the user (`implicitOutcome` maps each to `blocked`), or when the agent itself posted `needs_fix` or
+`blocked`. The first four are ordinary terminal turns (§3.3: the turn ends, the session's status is
+re-derived, the next pending turn is dispatched; nothing waits on a person), and `lastRun` already
+reports them. Plan mode is the only approval authority on a built-in lane (§8.1, §25.8), and no route
+can close a built-in escalation: `/decide` answers `409` for a step that is not awaiting a decision,
+and the run view offers no action. Reading it as `awaiting_approval` would tell a client — and the
+wait of row 182's piece (b) — that a person must approve something no one can approve, the user who
+pressed Stop included. A **custom** workflow's escalation is the opposite case: its author chose
+"stop and hand it to a person" (§25.9's one notice). While it is the session's latest state it reads
+`awaiting_approval`, with `awaiting.kind` `workflow_escalation`.
+
 Every fact comes from one SQL statement (`GetSessionActivityFacts`), so one MVCC snapshot. That is
 load-bearing: a plan-mode turn's completion and its `awaiting_approval` plan are written in one
 transaction, as are a plan's approval and the implementation turn it creates, and a workflow step's
@@ -7673,14 +7700,16 @@ awaiting" between a turn and its follow-on, but two statements under READ COMMIT
 such a commit and report a false `finished`. The statement reads aggregates and single rows only —
 the per-state turn counts as one JSON object (so a state added to the enum later still reaches the
 derivation as unknown, rather than being dropped), the first in-flight turn, the newest terminal turn,
-the newest turn, the oldest open gate of each kind, the sandbox status — never the turn list, whose
-length is unbounded and whose rows carry prompts. Every lookup leads with `session_id` on an index that
-already exists; no migration.
+the newest turn, the oldest open plan and workflow step, the newest workflow run when it is an open
+escalation, the sandbox status — never the turn list, whose length is unbounded and whose rows carry
+prompts. Every lookup leads with `session_id` (or, for the escalation's own checks, a primary key or
+`workflow_run_id`) on an index that already exists; no migration.
 
 Beside `activity`, the response says how many turns are pending, which turn is in flight (and since
 when it was dispatched), which gate is open and since when (a plan first, then a workflow step, then
-an escalated run — reported whatever `activity` says, since a gate can be open while a turn is also
-queued), how the newest terminal turn ended (`lastRun`), the sandbox status in the same snapshot
+an escalated run — a plan or a step reported whatever `activity` says, since either can be open while
+a turn is also queued, and an escalation no longer once a newer turn exists), how the newest terminal
+turn ended (`lastRun`), the sandbox status in the same snapshot
 (informational; `activity` never derives from it), whether the session is archived, and `observedAt`,
 the database's clock at the snapshot. A turn row has no failure-reason column, so `lastRun.failureReason`
 is the session's recorded reason, given only when it can describe nothing else: the last run is the
@@ -7712,8 +7741,9 @@ State and transcript are separate reads, and the transcript is served only on ex
 `SessionActivity` carries no events, and the event history is reached only through its own paginated
 tool, with the route's own page size (100 by default, clamped at 500 — decision D12). A grant without
 `mcp:read` is told neither tool exists (§43.17), and `narvi_get_session`'s description and
-`Session.status`'s now say that `status` does not show queued or running work and point at the status
-route. The adapter gains two `Twins` fields and two table rows, nothing else: its import ban is
+`Session.status`'s now say that `status` does not show queued or running work (`Session.status`'s
+lists which of its five values a queued or running turn can sit under: any of them) and point at the
+status route. The adapter gains two `Twins` fields and two table rows, nothing else: its import ban is
 unchanged. Row 182's other pieces are not here: the bounded wait (b) — the status tool's blocking
 form, which returns only on a settled state and never on a queue that has not started — and the
 result (c) — the last run's summary, the pull requests the session produced, and each one's verdict
@@ -7725,13 +7755,23 @@ queued follow-up under a completed history → queued), `TestDeriveActivity_NonE
 (every gate combination under every non-empty queue), `TestSuggestedReadDelay_Table`,
 `TestSuggestedReadDelay_AlwaysWithinBounds` (every activity × every sandbox status, with a table whose
 values fall outside the bounds). Timeouts: `TestTimeouts_Validate_MCPStatusDelay` (each link broken
-alone, reported by name). Postgres: `TestSessionActivityFacts_OneStatement`. REST, on real Postgres:
+alone, reported by name). Postgres: `TestSessionActivityFacts_OneStatement` (an escalation a newer
+run and newer turns superseded is not reported beside the open plan and step),
+`TestSessionActivityFacts_LiveEscalation` (reported: a custom run whose own turn is the newest,
+including a later step's; not reported: a built-in run, a newer run with or without a turn of its own,
+a newer turn with no run, a run with no turn). REST, on real Postgres:
 `TestGetSessionStatus_FollowUpQueuedUnderCompletedRow` (the row says `completed` while a follow-up is
 queued, then dispatched, then processing: `queued`, `running`, `running`, then `finished` only once
 the turn is terminal), `TestGetSessionStatus_PlanCompletionNeverObservedAsFinished_Race` and
 `TestGetSessionStatus_WorkflowAdvanceNeverObservedAsFinished_Race` (a writer commits a completion and
 its follow-on in one transaction, over and over, while readers poll; `finished` is never observed),
-`TestGetSessionStatus_Gates`. MCP: `TestEveryToolHasARegisteredTwin`, the tool-list golden,
+`TestGetSessionStatus_Gates` (including a custom run's escalation, open until a newer turn with no
+run of its own supersedes it), `TestGetSessionStatus_EscalatedTurnNeverGatesForGood` (through
+`CreateTurnCore`, `turn.Transition` and `workflowengine.OnTurnCompleted` in one terminal transaction,
+for a turn stopped by the user, failed, timed out and abandoned at dispatch, under the built-in and
+under a custom workflow: the built-in escalation reads `finished` at once, the custom one
+`awaiting_approval` until the follow-up is queued, and both `finished` once it completes). MCP:
+`TestEveryToolHasARegisteredTwin`, the tool-list golden,
 `TestToolsList_ScopeFilter_Table`, `TestHiddenToolCall_IsIndistinguishableFromUnknownTool`,
 `TestStatusOutputSchema_HasNoEvents`, `TestParity_BearerEqualsCookieForEveryRole` (both tools, every
 role), `TestParity_GetSessionTranscript_CursorWalkEqualsREST`. On the production router, through the

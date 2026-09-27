@@ -35,8 +35,8 @@ import (
 // Every fact comes from ONE statement (SessionStore.ActivityFacts), and the
 // activity is session.DeriveActivity over the turn queue and the human
 // gates in that snapshot -- never sessions.status, which is re-derived
-// only when a turn reaches a terminal state and so reads "created" or
-// "completed" while a turn is queued or running. The response carries no
+// only when a turn reaches a terminal state and so can hold any of its
+// five values while a turn is queued or running. The response carries no
 // events: the transcript is GET /api/sessions/{sessionID}/events, a
 // separate, paginated read.
 func GetSessionStatus(sessions *postgres.SessionStore, timeouts platform.Timeouts) http.HandlerFunc {
@@ -100,7 +100,7 @@ func activityInput(facts sqlcgen.GetSessionActivityFactsRow) (session.ActivityIn
 		TurnCounts:                   counts,
 		PlanAwaitingApproval:         facts.AwaitingPlanID.Valid,
 		WorkflowStepAwaitingDecision: facts.AwaitingStepID.Valid,
-		WorkflowRunNeedsReview:       facts.EscalatedRunID.Valid,
+		WorkflowEscalationOpen:       facts.EscalatedRunID.Valid,
 	}, nil
 }
 
@@ -162,7 +162,9 @@ func inFlightTurnDTO(facts sqlcgen.GetSessionActivityFactsRow) *restdtos.Session
 }
 
 // awaitingDTO reports the human gate open on the session, whatever the
-// activity: a plan first, then a workflow step, then an escalated run.
+// activity: a plan first, then a workflow step, then an escalated run --
+// which the facts row carries only while that escalation is still open
+// (GetSessionActivityFacts' escalated lookup).
 func awaitingDTO(facts sqlcgen.GetSessionActivityFactsRow) *restdtos.SessionActivityAwaiting {
 	switch {
 	case facts.AwaitingPlanID.Valid:

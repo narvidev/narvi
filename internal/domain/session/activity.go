@@ -12,9 +12,10 @@ import (
 // queue and its human gates, all read in one snapshot, and never from
 // Status. Status is re-derived only when a turn reaches a terminal state
 // (DeriveStatus's own callers), so it keeps saying "created" through a
-// first turn's whole life and "completed" while a follow-up turn is queued
-// or running. Activity is the answer to "is anything happening, and is it
-// waiting on a person?" that Status cannot give.
+// first turn's whole life, and a follow-up turn is queued and runs under
+// whatever the last derivation left -- any of the five Status values.
+// Activity is the answer to "is anything happening, and is it waiting on a
+// person?" that Status cannot give.
 type Activity string
 
 // The five Activity values, in the precedence DeriveActivity applies.
@@ -28,7 +29,8 @@ const (
 	ActivityQueued Activity = "queued"
 	// ActivityAwaitingApproval: no turn is queued or running, and a person
 	// must act: a plan awaits approval, a workflow step awaits a decision,
-	// or a workflow run was escalated for review.
+	// or a workflow escalation is still open (ActivityInput.
+	// WorkflowEscalationOpen).
 	ActivityAwaitingApproval Activity = "awaiting_approval"
 	// ActivityIdle: the session has no turn at all (created without a
 	// prompt) and nothing awaits a person.
@@ -67,9 +69,12 @@ type ActivityInput struct {
 	// WorkflowStepAwaitingDecision: a step run of one of this session's
 	// workflow runs is awaiting_decision (the HITL gate).
 	WorkflowStepAwaitingDecision bool
-	// WorkflowRunNeedsReview: one of this session's workflow runs was
-	// escalated to needs_review (the circuit breaker).
-	WorkflowRunNeedsReview bool
+	// WorkflowEscalationOpen: the session's workflow escalation is still
+	// open -- NOT "some run is in needs_review", which never ends (nothing
+	// moves a run out of it) and so would gate the session for good. Which
+	// escalation counts is the facts query's decision
+	// (GetSessionActivityFacts' escalated lookup, technical plan §43.20).
+	WorkflowEscalationOpen bool
 }
 
 // DeriveActivity applies the precedence of technical plan §43.20, highest
@@ -79,7 +84,7 @@ type ActivityInput struct {
 //     does not know -> Running (pending turns may wait behind it);
 //  2. else any turn pending -> Queued;
 //  3. else a plan awaiting approval, a workflow step awaiting a decision,
-//     or a workflow run needing review -> AwaitingApproval;
+//     or an open workflow escalation -> AwaitingApproval;
 //  4. else no turn at all -> Idle;
 //  5. else (at least one turn, all terminal) -> Finished.
 //
@@ -106,7 +111,7 @@ func DeriveActivity(in ActivityInput) Activity {
 		return ActivityRunning
 	case pending > 0:
 		return ActivityQueued
-	case in.PlanAwaitingApproval || in.WorkflowStepAwaitingDecision || in.WorkflowRunNeedsReview:
+	case in.PlanAwaitingApproval || in.WorkflowStepAwaitingDecision || in.WorkflowEscalationOpen:
 		return ActivityAwaitingApproval
 	case total == 0:
 		return ActivityIdle

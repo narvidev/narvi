@@ -111,14 +111,17 @@ treatment).
 {"name": "Get a session", "route": "GET /api/sessions/{sessionID}"}
 ```
 
-A session's `status` is the outcome of its most recent finished turn —
-`created` until one finishes. It is not updated when a turn is queued or
-starts, so it does not tell you whether the session is busy: a follow-up
-turn waits and runs under `completed`. The status route answers that
-instead. Its `activity` is `queued` (a turn waits, including while a
+A session's `status` is worked out again each time a turn finishes —
+`created` until one has, `active` if another turn was still waiting or
+running at that moment, otherwise that turn's outcome: `completed`,
+`failed` or `cancelled`. It is not updated when a turn is queued or
+starts, so it does not tell you whether the session is busy: a turn can
+wait and run under any of those five values. The status route answers
+that instead. Its `activity` is `queued` (a turn waits, including while a
 sandbox starts), `running`, `awaiting_approval` (nothing queued or
-running, and a plan, a workflow step or an escalated workflow run waits
-for a person), `idle` (no turn yet) or `finished` — a queued or running
+running, and a plan or a workflow step waits for a person, or a custom
+workflow stopped and handed its run to a person — until the session gets
+a new turn), `idle` (no turn yet) or `finished` — a queued or running
 turn is never reported as idle or finished. It also says how many turns
 wait, which turn is running, what waits for a person and since when, how
 the last finished turn ended, and `suggestedDelaySeconds`: how long to

@@ -21,13 +21,15 @@ import (
 
 // TestSessionActivityFacts_OneStatement seeds one session with every kind
 // of fact the status route reads -- turns in five states, a sandbox, a
-// plan awaiting approval, a workflow step awaiting a decision and an
-// escalated run -- and proves the single ActivityFacts read returns each
-// one: the per-state histogram, the in-flight turn, the newest terminal
-// turn, the newest turn, each gate with the time it opened, the sandbox
-// status and the session's own row. A session with no turn and no gate
-// reads an empty histogram and no ids; an unknown session is
-// pgx.ErrNoRows.
+// plan awaiting approval, a workflow step awaiting a decision, and an
+// escalated run that a newer run and newer turns have since superseded --
+// and proves the single ActivityFacts read returns each one: the
+// per-state histogram, the in-flight turn, the newest terminal turn, the
+// newest turn, each open gate with the time it opened (the superseded
+// escalation is not one; TestSessionActivityFacts_LiveEscalation pins
+// when an escalation is), the sandbox status and the session's own row. A
+// session with no turn and no gate reads an empty histogram and no ids; an
+// unknown session is pgx.ErrNoRows.
 func TestSessionActivityFacts_OneStatement(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
@@ -88,12 +90,12 @@ func TestSessionActivityFacts_OneStatement(t *testing.T) {
 	}
 	// One run escalated for review, then -- at most one run per session is
 	// ever running -- a second, running one whose step awaits a decision.
+	// The second run (and the newer turns) supersede the escalation.
 	escalatedRun, err := workflows.CreateRun(ctx, sessionID, "request", defID, 1)
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
-	escalated, err := workflows.EscalateRun(ctx, escalatedRun.ID)
-	if err != nil {
+	if _, err := workflows.EscalateRun(ctx, escalatedRun.ID); err != nil {
 		t.Fatalf("escalate run: %v", err)
 	}
 	gatedRun, err := workflows.CreateRun(ctx, sessionID, "request", defID, 1)
@@ -141,8 +143,8 @@ func TestSessionActivityFacts_OneStatement(t *testing.T) {
 	if facts.AwaitingStepID != awaitingStep.ID || !facts.AwaitingStepSince.Time.Equal(awaitingStep.UpdatedAt.Time) {
 		t.Errorf("awaiting step = (%v, %v), want (%v, %v)", facts.AwaitingStepID, facts.AwaitingStepSince.Time, awaitingStep.ID, awaitingStep.UpdatedAt.Time)
 	}
-	if facts.EscalatedRunID != escalated.ID || !facts.EscalatedRunSince.Time.Equal(escalated.UpdatedAt.Time) {
-		t.Errorf("escalated run = (%v, %v), want (%v, %v)", facts.EscalatedRunID, facts.EscalatedRunSince.Time, escalated.ID, escalated.UpdatedAt.Time)
+	if facts.EscalatedRunID.Valid || facts.EscalatedRunSince.Valid {
+		t.Errorf("escalated run = (%v, %v), want none: a newer run and newer turns superseded run %v", facts.EscalatedRunID, facts.EscalatedRunSince, escalatedRun.ID)
 	}
 	if !facts.ObservedAt.Valid || facts.ObservedAt.Time.Before(before) {
 		t.Errorf("observed_at = %v, want the statement's own time", facts.ObservedAt)
@@ -169,4 +171,158 @@ func TestSessionActivityFacts_OneStatement(t *testing.T) {
 			t.Fatalf("ActivityFacts(unknown) err = %v, want pgx.ErrNoRows", err)
 		}
 	})
+}
+
+// TestSessionActivityFacts_LiveEscalation pins which workflow escalation
+// ActivityFacts reports (technical plan §43.20). A run in needs_review is
+// never moved out of it, so each case below is a state that would gate the
+// session for good if every such run counted. It is reported only while
+// it is the session's newest workflow run, the session's newest turn is
+// one of that run's own attempts, and its definition is not a built-in
+// one. Rows are written the way the workflow engine writes them -- a run,
+// one attempt per turn with the turn attached and then finished, then the
+// escalation -- with created_at set explicitly so the order is
+// unambiguous.
+func TestSessionActivityFacts_LiveEscalation(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessions := narvipg.NewSessionStore(pool)
+	turns := narvipg.NewTurnStore(pool)
+	workflows := narvipg.NewWorkflowStore(pool)
+
+	var builtInDef, builtInStep pgtype.UUID
+	var builtIn bool
+	if err := pool.QueryRow(ctx, `SELECT d.id, d.is_built_in, s.id FROM workflow_definitions d JOIN workflow_step_definitions s ON s.workflow_definition_id = d.id WHERE d.id = $1`,
+		builtInRequestDefID).Scan(&builtInDef, &builtIn, &builtInStep); err != nil || !builtIn {
+		t.Fatalf("read the built-in request workflow: built-in %v, %v", builtIn, err)
+	}
+	var customDef, customStep1, customStep2 pgtype.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO workflow_definitions (lane, name, is_built_in, version) VALUES ('request', $1, false, 1) RETURNING id`,
+		fmt.Sprintf("live-escalation-%d", time.Now().UnixNano())).Scan(&customDef); err != nil {
+		t.Fatalf("insert custom workflow definition: %v", err)
+	}
+	for i, step := range []*pgtype.UUID{&customStep1, &customStep2} {
+		if err := pool.QueryRow(ctx, `INSERT INTO workflow_step_definitions (workflow_definition_id, step_order, kind, prompt_template) VALUES ($1, $2, 'agent', '{{prompt}}') RETURNING id`,
+			customDef, i+1).Scan(step); err != nil {
+			t.Fatalf("insert custom step %d: %v", i+1, err)
+		}
+	}
+
+	base := time.Now().Add(-time.Hour).UTC().Truncate(time.Millisecond)
+	newTurn := func(t *testing.T, sessionID pgtype.UUID, status sqlcgen.TurnStatus, minute int) pgtype.UUID {
+		t.Helper()
+		row, err := turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: sessionID, Status: status})
+		if err != nil {
+			t.Fatalf("create %s turn: %v", status, err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE turns SET created_at = $2 WHERE id = $1`, row.ID, base.Add(time.Duration(minute)*time.Minute)); err != nil {
+			t.Fatalf("set turn created_at: %v", err)
+		}
+		return row.ID
+	}
+	newRun := func(t *testing.T, sessionID, def pgtype.UUID, minute int) pgtype.UUID {
+		t.Helper()
+		run, err := workflows.CreateRun(ctx, sessionID, "request", def, 1)
+		if err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE workflow_runs SET created_at = $2 WHERE id = $1`, run.ID, base.Add(time.Duration(minute)*time.Minute)); err != nil {
+			t.Fatalf("set run created_at: %v", err)
+		}
+		return run.ID
+	}
+	// attempt records one finished attempt of step within run, dispatched
+	// as turnID.
+	attempt := func(t *testing.T, run, step, turnID pgtype.UUID, status, outcome string) {
+		t.Helper()
+		sr, err := workflows.CreateStepRun(ctx, run, step)
+		if err != nil {
+			t.Fatalf("create step run: %v", err)
+		}
+		if err := workflows.AttachTurn(ctx, sr.ID, turnID); err != nil {
+			t.Fatalf("attach turn: %v", err)
+		}
+		if _, err := workflows.FinishStepRun(ctx, sr.ID, status, outcome); err != nil {
+			t.Fatalf("finish step run: %v", err)
+		}
+	}
+	escalate := func(t *testing.T, run pgtype.UUID) sqlcgen.WorkflowRun {
+		t.Helper()
+		row, err := workflows.EscalateRun(ctx, run)
+		if err != nil {
+			t.Fatalf("escalate run: %v", err)
+		}
+		return row
+	}
+	// escalatedCustomRun is the live case every "superseded" case below
+	// starts from: a custom run whose one turn failed at minute 0.
+	escalatedCustomRun := func(t *testing.T, sessionID pgtype.UUID) sqlcgen.WorkflowRun {
+		t.Helper()
+		run := newRun(t, sessionID, customDef, 0)
+		attempt(t, run, customStep1, newTurn(t, sessionID, sqlcgen.TurnStatusFailed, 0), "failed", "blocked")
+		return escalate(t, run)
+	}
+
+	cases := []struct {
+		name string
+		// seed writes the case's rows and returns the escalated run, and
+		// whether ActivityFacts must report it.
+		seed func(t *testing.T, sessionID pgtype.UUID) (sqlcgen.WorkflowRun, bool)
+	}{
+		{"a custom run whose own turn is the newest is reported", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
+			return escalatedCustomRun(t, s), true
+		}},
+		{"a custom run escalated by its later step's turn is reported (a turn newer than the run's creation is its own)", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
+			run := newRun(t, s, customDef, 0)
+			attempt(t, run, customStep1, newTurn(t, s, sqlcgen.TurnStatusCompleted, 0), "completed", "ok")
+			attempt(t, run, customStep2, newTurn(t, s, sqlcgen.TurnStatusFailed, 1), "failed", "blocked")
+			return escalate(t, run), true
+		}},
+		{"a built-in run whose own turn is the newest is not reported", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
+			run := newRun(t, s, builtInDef, 0)
+			attempt(t, run, builtInStep, newTurn(t, s, sqlcgen.TurnStatusCancelled, 0), "cancelled", "blocked")
+			return escalate(t, run), false
+		}},
+		{"a newer run with its own turn supersedes it", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
+			escalated := escalatedCustomRun(t, s)
+			next := newRun(t, s, customDef, 1)
+			attempt(t, next, customStep1, newTurn(t, s, sqlcgen.TurnStatusCompleted, 1), "completed", "ok")
+			if _, err := workflows.CompleteRun(ctx, next); err != nil {
+				t.Fatalf("complete run: %v", err)
+			}
+			return escalated, false
+		}},
+		{"a newer turn with no run of its own supersedes it (queued behind a running turn, or a plan's implementation turn)", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
+			escalated := escalatedCustomRun(t, s)
+			newTurn(t, s, sqlcgen.TurnStatusPending, 1)
+			return escalated, false
+		}},
+		{"a newer run supersedes it even before any turn of its own", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
+			escalated := escalatedCustomRun(t, s)
+			newRun(t, s, customDef, 1)
+			return escalated, false
+		}},
+		{"a run with no turn of its own is not reported", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
+			return escalate(t, newRun(t, s, customDef, 0)), false
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sessionID := createTestSession(ctx, t, pool)
+			run, reported := tc.seed(t, sessionID)
+			if run.Status != sqlcgen.WorkflowRunStatusNeedsReview {
+				t.Fatalf("seeded run status %q, want needs_review", run.Status)
+			}
+			facts, err := sessions.ActivityFacts(ctx, sessionID)
+			if err != nil {
+				t.Fatalf("ActivityFacts: %v", err)
+			}
+			switch {
+			case reported && (facts.EscalatedRunID != run.ID || !facts.EscalatedRunSince.Time.Equal(run.UpdatedAt.Time)):
+				t.Errorf("escalated run = (%v, %v), want (%v, %v)", facts.EscalatedRunID, facts.EscalatedRunSince.Time, run.ID, run.UpdatedAt.Time)
+			case !reported && (facts.EscalatedRunID.Valid || facts.EscalatedRunSince.Valid):
+				t.Errorf("escalated run = (%v, %v), want none (run %v is not the session's live escalation)", facts.EscalatedRunID, facts.EscalatedRunSince, run.ID)
+			}
+		})
+	}
 }
