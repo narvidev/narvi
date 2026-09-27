@@ -3374,8 +3374,11 @@ func (a *App) Run(ctx context.Context, addr string) error {
 // wait of up to MCPWaitMaxDuration, 25 s -- is never held by one
 // (technical plan §43.20). No WriteTimeout, deliberately: were one set, it
 // would have to exceed MCPWaitMaxDuration, or a full-length wait would be
-// cut before its answer is written (the MCPWait* fields' own doc comment;
-// TestNewHTTPServer_ShutdownInterruptsWaits pins both).
+// cut before its answer is written (the MCPWait* fields' own doc comment).
+// TestOAuth_ProductionRouter/Wait_ShutdownInterruptsPromptly_RunServer --
+// registered in mcp_oauth_integration_test.go, its body
+// waitShutdownInterruptsPromptly in mcp_sessionwait_integration_test.go --
+// pins both.
 func newHTTPServer(addr string, handler http.Handler, waiter *sessionactivity.Waiter) *http.Server {
 	srv := &http.Server{
 		Addr:    addr,
