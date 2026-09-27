@@ -34,6 +34,10 @@ type fakeSourceControl struct {
 	found     bool
 	openErr   error
 	openDelay time.Duration
+	// stall names calls (as recorded: "resolve <branch>", "ancestor
+	// <a>..<b>") that never answer before their context ends, then answer
+	// its error -- a code host that stops responding mid-read.
+	stall map[string]bool
 
 	calls []string
 	// deadlines is how far each call's deadline was from its start.
@@ -51,8 +55,21 @@ func (f *fakeSourceControl) record(ctx context.Context, call string) {
 	}
 }
 
+// stalled waits out ctx when call is one of f.stall, reporting whether it
+// did.
+func (f *fakeSourceControl) stalled(ctx context.Context, call string) bool {
+	if !f.stall[call] {
+		return false
+	}
+	<-ctx.Done()
+	return true
+}
+
 func (f *fakeSourceControl) ResolveBranchSHA(ctx context.Context, spec ports.ResolveBranchSHASpec) (string, string, error) {
 	f.record(ctx, "resolve "+spec.Branch)
+	if f.stalled(ctx, "resolve "+spec.Branch) {
+		return "", "", ctx.Err()
+	}
 	sha, ok := f.branches[spec.Branch]
 	if !ok {
 		if f.branchErr != nil {
@@ -65,6 +82,9 @@ func (f *fakeSourceControl) ResolveBranchSHA(ctx context.Context, spec ports.Res
 
 func (f *fakeSourceControl) IsAncestor(ctx context.Context, spec ports.IsAncestorSpec) (bool, error) {
 	f.record(ctx, "ancestor "+spec.Ancestor+".."+spec.Descendant)
+	if f.stalled(ctx, "ancestor "+spec.Ancestor+".."+spec.Descendant) {
+		return false, ctx.Err()
+	}
 	if f.ancestryErr != nil {
 		return false, f.ancestryErr
 	}

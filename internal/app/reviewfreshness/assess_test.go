@@ -286,3 +286,74 @@ func TestAssess_OutOfTimeSaysSo(t *testing.T) {
 		t.Errorf("live calls = %v, want the one cut-short read and nothing after it", calls)
 	}
 }
+
+// TestAssess_OutOfTimeDuringReadLiveSaysSo pins the caller's deadline when
+// it runs out after the pull request read, inside ReadLive (round 2's
+// finding P3): at the base resolution, the base's ancestry check, the
+// ancestor link's resolution or the link's ancestry check. A read cut
+// short there is unconfirmed with ReasonOutOfTime -- never the step's own
+// reason, which would tell a client the code host failed on that fact. The
+// same call cut short by its own bound, with the caller's deadline still
+// ahead, keeps the step's reason: the caller's context decides, not the
+// call's.
+func TestAssess_OutOfTimeDuringReadLiveSaysSo(t *testing.T) {
+	t.Parallel()
+	// The base and the ancestor link both moved forward since the verdict,
+	// so ReadLive makes every one of its calls.
+	record := freshRecord()
+	record.Context.AncestorChain = []review.AncestorLink{{Ref: "parent", SHA: "p1"}}
+	moved := func(stall string) *fakeSourceControl {
+		return &fakeSourceControl{found: true, openPR: openAt("h1", prLink("parent", "")),
+			branches: map[string]string{"main": "b2", "parent": "p2"}, ancestry: map[string]bool{"b1..b2": true, "p1..p2": true},
+			stall: map[string]bool{stall: true}}
+	}
+	baseline := moved("")
+	if got := reviewfreshness.Assess(context.Background(), reviewfreshness.Deps{SourceControl: baseline, Token: "t", Timeouts: platform.DefaultTimeouts()}, record, pr7); got.State != reviewfreshness.StateCurrent || len(baseline.callList()) != 5 {
+		t.Fatalf("baseline: Assess = %+v after %v, want current after all five calls -- the rows below prove nothing otherwise", got, baseline.callList())
+	}
+
+	tests := []struct {
+		stall string
+		step  reviewfreshness.Step
+		calls int // up to and including the stalled one
+	}{
+		{"resolve main", reviewfreshness.StepResolveBase, 2},
+		{"ancestor b1..b2", reviewfreshness.StepBaseAncestry, 3},
+		{"resolve parent", reviewfreshness.StepResolveAncestor, 4},
+		{"ancestor p1..p2", reviewfreshness.StepAncestorAncestry, 5},
+	}
+	for _, tc := range tests {
+		t.Run(tc.stall, func(t *testing.T) {
+			t.Parallel()
+			stepReason := (&reviewfreshness.Failure{Step: tc.step}).Describe()
+
+			t.Run("the caller's deadline passes: out of time", func(t *testing.T) {
+				t.Parallel()
+				sc := moved(tc.stall)
+				ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+				defer cancel()
+				got := reviewfreshness.Assess(ctx, reviewfreshness.Deps{SourceControl: sc, Token: "t", Timeouts: platform.DefaultTimeouts()}, record, pr7)
+				want := reviewfreshness.Assessment{State: reviewfreshness.StateUnconfirmed, Reason: reviewfreshness.ReasonOutOfTime}
+				if got != want {
+					t.Fatalf("Assess = %+v, want %+v -- not the step's own %q", got, want, stepReason)
+				}
+				if calls := sc.callList(); len(calls) != tc.calls || calls[len(calls)-1] != tc.stall {
+					t.Errorf("live calls = %v, want %d, ending at the stalled %q", calls, tc.calls, tc.stall)
+				}
+			})
+
+			t.Run("the call's own bound passes first: the step's reason", func(t *testing.T) {
+				t.Parallel()
+				sc := moved(tc.stall)
+				timeouts := platform.DefaultTimeouts()
+				timeouts.DecisionInboxResolveBranchSHATimeout = 20 * time.Millisecond
+				timeouts.DecisionInboxIsAncestorTimeout = 20 * time.Millisecond
+				got := reviewfreshness.Assess(context.Background(), reviewfreshness.Deps{SourceControl: sc, Token: "t", Timeouts: timeouts}, record, pr7)
+				want := reviewfreshness.Assessment{State: reviewfreshness.StateUnconfirmed, Reason: stepReason}
+				if got != want {
+					t.Fatalf("Assess = %+v, want %+v", got, want)
+				}
+			})
+		})
+	}
+}
