@@ -5737,7 +5737,7 @@ being distinguishable. Whether historic unversioned snapshots exist at all is an
 and a staged migration for them is worth building only if the answer is yes. Steps 136 and 139 carry
 this.
 
-### 35.6 One stored row per text part
+### 35.6 One stored row per distinct frame of a text part
 §6.1 pins the `token` event as cumulative text keyed by `messageId`. This section was written on
 the premise that the store keeps the **last text fragment** of a multi-part answer, so that §35.5's
 recap, built from stored events, would lose every earlier part. The store did something else. The
@@ -5748,10 +5748,15 @@ own row, so the log holds each part's final text, and a part's first row lands w
 before the tool calls it introduced.
 
 What is left of this amendment is narrower than first written, and needed only for a runtime
-adapter whose `messageId` is not already per part: an **optional** part identifier on `token` and
-one stored row per `(messageId, partId)`, with a part-scoped row's `created_at` pinned at first
-emission. Optional is still the whole compatibility story in both directions: an older
-`sandbox-agent` sends no part id and degrades to today's behavior, for the same reason §35.2 gives.
+adapter whose `messageId` is not already per part: an **optional** part identifier on `token`, and
+the storage §6.1 already applies, keyed by `(messageId, partId)` instead of `messageId` alone — one
+stored row per **distinct frame** of each `(messageId, partId)`, append-only, never a row updated in
+place, for the reason §6.1 gives: a row updated in place keeps its id, so no `id > cursor` reader
+ever sees its newer text. No `created_at` needs pinning: a part's first frame is stored when the part opens, so its
+first row already sorts before the tool calls it introduced, and each later frame gets its own later
+id, which is how every reader finds the newest one. Optional is still the whole compatibility story
+in both directions: an older `sandbox-agent` sends no part id and degrades to today's behavior, for
+the same reason §35.2 gives.
 It is an additive amendment to an already-merged `/contracts` schema, not a breaking one. The
 notification surfaces keep reading the last part and their posts stay byte-identical to today's;
 the subscribe replay already has a byte budget besides its row count, and a wide session now
