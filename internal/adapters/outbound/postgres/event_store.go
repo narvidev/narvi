@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -50,6 +51,26 @@ func (s *EventStore) WithTx(tx pgx.Tx) *EventStore {
 // pgx.ErrNoRows.
 func (s *EventStore) Create(ctx context.Context, arg sqlcgen.CreateEventParams) (sqlcgen.CreateEventRow, error) {
 	return s.q.CreateEvent(ctx, arg)
+}
+
+// LatestTokenFrameText returns the text of the newest stored `token` frame
+// (highest id) whose payload messageId is partID in sessionID, and whether
+// one exists at all -- no stored frame is found=false, never an error.
+// The session actor calls it inside its own transaction before storing a
+// frame (sessionactor/tokenframe.go); events_token_part_idx keeps it an
+// index probe however long the session's log is.
+func (s *EventStore) LatestTokenFrameText(ctx context.Context, sessionID pgtype.UUID, partID string) (text string, found bool, err error) {
+	row, err := s.q.GetLatestTokenFrameForPart(ctx, sqlcgen.GetLatestTokenFrameForPartParams{
+		SessionID: sessionID,
+		PartID:    partID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return row.Text, true, nil
 }
 
 // ListForSession returns up to limit events for sessionID with id >

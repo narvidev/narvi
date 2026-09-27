@@ -1,0 +1,32 @@
+-- events_token_part_idx: backs GetLatestTokenFrameForPart
+-- (queries/events.sql), the one lookup the session actor makes before it
+-- stores a streamed `token` frame.
+--
+-- A `token` event carries the CUMULATIVE text of one assistant text part,
+-- and the agent runtime sends several frames for the same part, all under
+-- the same wire messageId (the part id; the pinned runtime sends two, an
+-- empty one when the part opens and the full text when it closes).
+-- events_session_id_message_id_idx (migrations/000019) makes the first
+-- frame win, so from 2026-07-20 until this migration every stored text
+-- part was its first frame: an empty string or a prefix. The premise
+-- written into 000019 -- "a single session can never legitimately see the
+-- same messageId twice from two DIFFERENT genuine events" -- does not hold
+-- for `token`. The actor now stores each DISTINCT frame as its own row,
+-- under the storage key messageId + "#" + a hash of the frame's text
+-- (sessionactor/tokenframe.go), so the log stays append-only and a
+-- byte-identical resend still dedupes on 000019's index.
+--
+-- Before it stores a frame, the actor reads the newest frame already
+-- stored for the same part (by id) and adds no row when the incoming one
+-- is that frame again or an older, shorter one replayed late. That read
+-- is keyed by the payload's own messageId -- the storage key has a
+-- per-frame suffix, and the frames stored before this migration have
+-- none -- which no existing index covers: this one does, and only for
+-- `token` rows, so the rest of the table (every other event type) pays
+-- nothing for it. id is the last column so the newest frame of a part is
+-- the first entry of a backward scan.
+--
+-- Frames stored before this migration stay as they were: the later
+-- frames of those parts were never written, so nothing here or anywhere
+-- else can restore them.
+CREATE INDEX events_token_part_idx ON events (session_id, (payload->>'messageId'), id) WHERE type = 'token';

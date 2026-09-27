@@ -370,8 +370,11 @@ func (a *Actor) drainMailbox() {
 // map[string]any this package would otherwise have to marshal itself --
 // skipping that round-trip means the append-only event log holds precisely
 // what the sandbox sent, not a lossy re-encoding through an intermediate Go
-// value. messageID is the wire event's own top-level "messageId" (cmd.
-// MessageID, command.go) -- CreateEvent upserts on (session_id, messageID)
+// value. messageID is the storage key: the wire event's own top-level
+// "messageId" (cmd.MessageID, command.go) for every type but `token`,
+// whose frames share one messageId per text part and are each stored
+// under a per-frame key instead (appendTokenFrame, tokenframe.go).
+// CreateEvent upserts on (session_id, messageID)
 // (§6.1), so a genuine resend of an already-persisted event is deduped
 // (Inserted false) rather than appended as an indistinguishable duplicate
 // row; see this function's own broadcast-queueing guard below for why a

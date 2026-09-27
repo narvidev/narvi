@@ -19,6 +19,13 @@
 -- after any update) -- callers use it to decide whether to (re-)broadcast
 -- this event to live subscribers.
 --
+-- message_id is the wire messageId for every event type but one: the
+-- session actor stores each distinct cumulative frame of a `token` part
+-- under messageId + "#" + a hash of its text (sessionactor/tokenframe.go),
+-- because every frame of a part shares the part's messageId and a plain
+-- first-wins key would keep only the first one. Readers never see the
+-- storage key -- they read the payload, whose messageId is untouched.
+--
 -- # Why the session row is locked before the id is drawn
 --
 -- Every `id > cursor` reader of this table -- ListEventsForSession's own
@@ -105,6 +112,25 @@ SELECT * FROM events
 WHERE session_id = $1
 ORDER BY id DESC
 LIMIT $2;
+
+-- name: GetLatestTokenFrameForPart :one
+-- The newest stored frame (highest id) of one streamed text part, found
+-- by the payload's own messageId (the part id) rather than by the storage
+-- key, which carries a per-frame suffix (CreateEvent above). The session
+-- actor reads it before storing a `token` frame, to add no row for a
+-- frame that is the stored one again or an older one replayed late
+-- (sessionactor/tokenframe.go). events_token_part_idx
+-- (migrations/000144_events_token_part_idx.up.sql) serves it: the literal
+-- type = 'token' matches that partial index's predicate, and the
+-- expression must stay byte-for-byte payload->>'messageId' for the index
+-- to apply. pgx.ErrNoRows means no frame of this part is stored yet.
+SELECT id, COALESCE(payload->>'text', '')::text AS text
+FROM events
+WHERE session_id = sqlc.arg(session_id)
+  AND type = 'token'
+  AND payload->>'messageId' = sqlc.arg(part_id)::text
+ORDER BY id DESC
+LIMIT 1;
 
 -- (§26.4/§7.1's own post-hoc sub-task corroboration): the two
 -- queries below are this codebase's FIRST use of a payload->>'gen' JSONB

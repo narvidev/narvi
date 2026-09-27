@@ -59,6 +59,13 @@ type CreateEventRow struct {
 // after any update) -- callers use it to decide whether to (re-)broadcast
 // this event to live subscribers.
 //
+// message_id is the wire messageId for every event type but one: the
+// session actor stores each distinct cumulative frame of a `token` part
+// under messageId + "#" + a hash of its text (sessionactor/tokenframe.go),
+// because every frame of a part shares the part's messageId and a plain
+// first-wins key would keep only the first one. Readers never see the
+// storage key -- they read the payload, whose messageId is untouched.
+//
 // # Why the session row is locked before the id is drawn
 //
 // Every `id > cursor` reader of this table -- ListEventsForSession's own
@@ -190,6 +197,43 @@ func (q *Queries) GetBootP95InWindow(ctx context.Context, createdAt pgtype.Times
 	row := q.db.QueryRow(ctx, getBootP95InWindow, createdAt)
 	var i GetBootP95InWindowRow
 	err := row.Scan(&i.P95Seconds, &i.SampleSize)
+	return i, err
+}
+
+const getLatestTokenFrameForPart = `-- name: GetLatestTokenFrameForPart :one
+SELECT id, COALESCE(payload->>'text', '')::text AS text
+FROM events
+WHERE session_id = $1
+  AND type = 'token'
+  AND payload->>'messageId' = $2::text
+ORDER BY id DESC
+LIMIT 1
+`
+
+type GetLatestTokenFrameForPartParams struct {
+	SessionID pgtype.UUID `json:"session_id"`
+	PartID    string      `json:"part_id"`
+}
+
+type GetLatestTokenFrameForPartRow struct {
+	ID   int64  `json:"id"`
+	Text string `json:"text"`
+}
+
+// The newest stored frame (highest id) of one streamed text part, found
+// by the payload's own messageId (the part id) rather than by the storage
+// key, which carries a per-frame suffix (CreateEvent above). The session
+// actor reads it before storing a `token` frame, to add no row for a
+// frame that is the stored one again or an older one replayed late
+// (sessionactor/tokenframe.go). events_token_part_idx
+// (migrations/000144_events_token_part_idx.up.sql) serves it: the literal
+// type = 'token' matches that partial index's predicate, and the
+// expression must stay byte-for-byte payload->>'messageId' for the index
+// to apply. pgx.ErrNoRows means no frame of this part is stored yet.
+func (q *Queries) GetLatestTokenFrameForPart(ctx context.Context, arg GetLatestTokenFrameForPartParams) (GetLatestTokenFrameForPartRow, error) {
+	row := q.db.QueryRow(ctx, getLatestTokenFrameForPart, arg.SessionID, arg.PartID)
+	var i GetLatestTokenFrameForPartRow
+	err := row.Scan(&i.ID, &i.Text)
 	return i, err
 }
 

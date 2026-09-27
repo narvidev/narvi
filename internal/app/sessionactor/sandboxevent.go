@@ -282,7 +282,16 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 		// the cmd.Type == "push_complete" post-commit side effect below can
 		// consume the SAME signal for the SAME reason, once this closure
 		// has already returned.
-		inserted, err := a.appendRawEvent(ctx, tx, cmd.Type, cmd.MessageID, cmd.Raw)
+		//
+		// `token` is the one type not stored under its wire messageId as
+		// is: every frame of a streamed text part shares that id, so each
+		// distinct frame gets its own storage key instead (tokenframe.go).
+		var inserted bool
+		if cmd.Type == "token" {
+			inserted, err = a.appendTokenFrame(ctx, tx, cmd)
+		} else {
+			inserted, err = a.appendRawEvent(ctx, tx, cmd.Type, cmd.MessageID, cmd.Raw)
+		}
 		if err != nil {
 			return err
 		}
