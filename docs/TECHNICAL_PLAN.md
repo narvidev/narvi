@@ -3814,23 +3814,37 @@ directory through the fd that opened it; every other entry is re-owned with
 `fchownat(dirfd, name, AT_SYMLINK_NOFOLLOW)`. It therefore re-owns exactly the inodes reachable as
 entries of directories it opened by descent from the root, never follows or descends through a
 symlink, and never lists, looks at, opens or re-owns anything through a path the runtime can change;
-an entry that vanishes mid-walk is skipped, never re-resolved. The root is the exception to
+an entry that vanishes mid-walk is skipped, never re-resolved by path. On overlayfs, re-owning an
+entry still only in a lower layer copies it up, and a removal during that copy-up surfaces as `EEXIST`
+from `fchownat`, or as `ENOTDIR` from a directory's `fchown`: the walk skips such an entry only once a
+second look through the same fd (`fstatat` for the name, a listing for the directory) says it is gone,
+and fails otherwise. The root is the exception to
 skipping: its own name is looked up once more when the walk is done, acting on nothing, and a root
 removed, renamed away or replaced while the walk ran fails it, and boot, because the tree the caller
 named is no longer there. Residuals stated. The given root path's own components above the last are
 resolved by name once and trusted, which holds because they sit in directories only root can write
 (for the default `/workspace`, the only such name is `workspace`, an entry of `/`). And hard links:
 an inode hard-linked into the tree is re-owned under every name it has, so what that exposes depends
-on what the kernel lets the runtime hard-link, which `fs.protected_hardlinks` decides: a
-kernel-global setting that Narvi does not set, and that an image or pod spec cannot. The walk reads
-it when it starts and logs it. At `1` (the runtime can link only a file it owns or can already read
-and write) a hard-linked entry is re-owned like any other, as a package store linked into
-`node_modules` by a root-run setup hook needs. At any other value, or when it cannot be read, the
-walk leaves every non-directory entry with more than one link to its owner, and logs once, at WARN,
-how many it left that the runtime does not already own, by names relative to the root. That narrows
-the residual and does not close it: the link count is read by name through the held directory fd and
-the entry then re-owned the same way, two calls apart, so on a kernel that does not read `1` a
-writer can still rename a hard link over an entry between them. The walk's swap tests
+on what the kernel lets the runtime hard-link: a kernel-global rule that Narvi does not set, and that
+an image or pod spec cannot. The walk asks the kernel rather than a setting that stands for it. Once
+per process and runtime identity, a short-lived child running as the runtime (the sandbox-agent
+binary re-executed, dropped by the same credential the runtime gets) tries to hard-link a root-owned
+`0600` file into a directory of its own, and answers only through its exit status. `EPERM` means the
+kernel bounds hard links (the runtime can link only a file it owns or can already read and write); a
+link made means it does not; anything else (another errno, a child that could not start or gave no
+answer within `platform.HardLinkProbeTimeout`) is inconclusive, and `fs.protected_hardlinks` then
+decides, bounded only at `1`. The setting alone is not enough: gVisor, which Modal sandboxes run on
+by default, publishes no `/proc/sys/fs/protected_hardlinks` and enforces the rule unconditionally.
+The verdict is logged once, at INFO. Bounded, a hard-linked entry is re-owned like any other, as a
+package store linked into `node_modules` by a root-run setup hook, or a build's hard-linked outputs,
+need. Not bounded, the walk leaves every non-directory entry with more than one link to its owner,
+and each walk that left any logs once, at WARN, how many it left that the runtime does not already
+own, naming at most five, relative to the root. Only there does a race remain: the link count is read
+by name through the held directory fd and the entry then re-owned the same way, two calls apart, so
+on a kernel that does not bound hard links a writer can still rename a hard link over an entry
+between them. The probe runs against the real kernel in the walk's tests, including with
+`/proc/sys/fs` masked as gVisor presents it, where the production entry point must still re-own
+hard-linked entries. The walk's swap tests
 (`workspaceowner_redirect_test.go`, including a real concurrent atomic swapper) replace a directory,
 or its parent, with a symlink before a descent, after a directory is opened and before it is listed,
 before an entry is looked at, and before an entry is re-owned, and the outside tree of the
