@@ -77,7 +77,7 @@ func TestDispatchEvent_AbortedTurnCarriesNoProviderFailureDiagnostic(t *testing.
 		return err
 	})
 
-	waitForTurnRegistered(t, a, "ses_fake")
+	waitForTurnDispatched(t, f, a, "ses_fake")
 
 	f.broadcast(abortedMessageUpdated(t, "ses_fake", "msg_original"))
 	f.broadcast(sessionIdleLine(t, "ses_fake"))

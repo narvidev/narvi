@@ -4,12 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
-	"time"
 
 	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
-	"github.com/narvidev/narvi/internal/app/ports"
 )
 
 // This file pins E1 (turn.go's own modelForOutcome) and part of E2/E5
@@ -146,7 +144,7 @@ func TestRealOrdering_ModelSurvivesLateArrivingAssistantError(t *testing.T) {
 		return err
 	})
 
-	waitForTurnRegistered(t, a, "ses_fake")
+	waitForTurnDispatched(t, f, a, "ses_fake")
 
 	// The REAL captured ordering, in the REAL captured order: the
 	// model-bearing, error-less message.updated FIRST, then session.error,
@@ -229,11 +227,9 @@ func TestRealOrdering_ModelSurvivesLateArrivingAssistantError(t *testing.T) {
 	// otherwise THIS snapshot can just as easily race ahead of the late
 	// wave's own processing as the "before" one used to, and the length
 	// comparison below would still pass vacuously either way, regardless
-	// of what the late wave did. See waitForLateWaveDrained's own doc
-	// comment (below) for why waitForDrained (fake_server_test.go), the
-	// existing helper for exactly this class of race, cannot be reused
-	// as-is here.
-	waitForLateWaveDrained(t, f, a)
+	// of what the late wave did. waitForDrained's barrier does not need
+	// "ses_fake" to still be registered (see its own doc comment).
+	waitForDrained(t, f, a)
 
 	// The late, second wave of events must not have produced any
 	// additional execution_complete -- exactly one turn, exactly one
@@ -244,52 +240,4 @@ func TestRealOrdering_ModelSurvivesLateArrivingAssistantError(t *testing.T) {
 			"the late message.updated/session.idle must be silently dropped, not produce a second execution_complete",
 			got, len(events))
 	}
-}
-
-// waitForLateWaveDrained proves the adapter's own SSE-reader goroutine has
-// actually read a just-broadcast late wave off the socket, even though the
-// wave's own target session ("ses_fake" in this file's one caller) is by
-// then unregistered and so produces no observable side effect of its own
-// to poll for (F3). waitForDrained (fake_server_test.go) already solves
-// the general version of this "prove a broadcast has actually been
-// dispatched" race, but its own barrier deliberately targets THE SAME
-// session under test, via ts.lastActivityTime() -- which cannot prove
-// anything here, since a barrier broadcast for "ses_fake" would be
-// dropped by dispatchEvent's own resolveEvent (sse.go) the EXACT same way
-// the late wave itself is, for the EXACT same reason (no registered
-// turn), and so would never advance anything either.
-//
-// Registers a SECOND, throwaway turnState under its own distinct session
-// id on the adapter's one persistent connection, then broadcasts one
-// inert sentinel for THAT session and waits for its own lastActivityTime
-// to advance -- every event for every session travels over the single
-// shared /event connection, read by the single SSE-reader goroutine
-// strictly in the order broadcast (no reordering across a live,
-// undropped connection: connectAndConsume's own bufio.Reader.ReadString
-// loop, sse.go), so observing this barrier dispatched proves whatever was
-// broadcast before it -- here, the late wave for "ses_fake" -- was
-// already read off the socket first, regardless of whether processing it
-// produced any observable effect of its own.
-func waitForLateWaveDrained(t *testing.T, f *fakeOpenCodeServer, a *Adapter) {
-	t.Helper()
-
-	const barrierSessionID = "ses_late_wave_drain_barrier"
-	barrierTS := newTurnState(sandboxws.Prompt{SessionId: testSessionID, Gen: 1}, func(ports.AgentEvent) {})
-	a.registerTurn(barrierSessionID, barrierTS)
-	defer a.unregisterTurn(barrierSessionID)
-
-	before := barrierTS.lastActivityTime()
-	f.broadcast(sseLine(t, "message.updated", messageUpdatedProps{
-		SessionID: barrierSessionID,
-		Info:      openCodeMessageInfo{ID: "msg_late_wave_drain_barrier", Role: "user"},
-	}))
-
-	deadline := time.Now().Add(testWait)
-	for time.Now().Before(deadline) {
-		if barrierTS.lastActivityTime().After(before) {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatal("waitForLateWaveDrained: barrier broadcast was never dispatched (barrierTS.lastActivityTime never advanced) within testWait")
 }

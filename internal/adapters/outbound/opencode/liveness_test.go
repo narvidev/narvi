@@ -149,7 +149,7 @@ func TestWaitForTurn_ReconnectWinsRaceAgainstFallback(t *testing.T) {
 		return err
 	})
 
-	ts := waitForTurnRegistered(t, a, sessionID)
+	ts := waitForTurnDispatched(t, fake, a, sessionID)
 
 	// Establish a real assistant text part BEFORE the drop, so the turn's
 	// own eventual session.idle derives "completed" via genuine sawText --
@@ -459,6 +459,9 @@ func TestWaitForTurn_ConnectionNeverReturnsFallsBackWithinBoundedWait(t *testing
 		return err
 	})
 
+	// Registration only: this test scripts no reaction to the prompt, and the
+	// drop below must land early in the turn's first idle window (see
+	// waitForTurnRegistered).
 	waitForTurnRegistered(t, a, sessionID)
 
 	// Arm the permanent outage BEFORE dropping the current connection, so

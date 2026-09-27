@@ -112,6 +112,28 @@ func sessionIdleLine(t *testing.T, sessionID string) string {
 	return sseLine(t, "session.idle", sessionIdleProps{SessionID: sessionID})
 }
 
+// setRetryCompletedFixture points f's GET /session/{id}/message fixture at
+// the compaction retry's own completed assistant message -- the same
+// msg_retry/"all good now" completion these tests script over SSE.
+//
+// A test built with a short SSE-inactivity timeout keeps Adapter.waitForTurn's
+// fallback ticker live. Once the retry's re-dispatch returns and
+// ts.compacting clears, that ticker may legitimately fetch again before the
+// scripted completion has been dispatched. A real server would answer with
+// the retry's own messages; a fixture still holding the pre-retry
+// ContextOverflowError snapshot, or nothing, makes that fetch finalize the
+// turn Failed instead -- a fixture artifact, not the property any of these
+// tests exists for. Call it while ts.compacting is still true (before
+// releasing the retry's gated dispatch): shouldFinalizeByFallback lets no
+// new fetch start then, and the fake server snapshots f.messages at request
+// time, so a fetch already in flight keeps the data it was sent.
+func setRetryCompletedFixture(t *testing.T, f *fakeOpenCodeServer) {
+	t.Helper()
+	f.setMessages([]messageListEntry{
+		{Info: openCodeMessageInfo{ID: "msg_retry", Role: "assistant"}, Parts: []json.RawMessage{textPartJSON(t, "prt_retry", "msg_retry", "all good now")}},
+	})
+}
+
 // TestCompactionRetry_SucceedsAfterOverflow proves the full round trip:
 // overflow -> exactly one /summarize call -> exactly one retried
 // prompt_async call (same prompt text) -> a clean retry completion ->
@@ -172,7 +194,7 @@ func TestCompactionRetry_SucceedsAfterOverflow(t *testing.T) {
 		return err
 	})
 
-	ts := waitForTurnRegistered(t, a, "ses_fake")
+	ts := waitForTurnDispatched(t, f, a, "ses_fake")
 
 	// The original turn's own assistant message reports a
 	// ContextOverflowError, then the turn goes idle -- the exact
@@ -232,7 +254,7 @@ func TestCompactionRetry_SucceedsAfterOverflow(t *testing.T) {
 	// cannot possibly have cleared yet, since postPromptAsync (and
 	// therefore this goroutine's own ts.setCompacting(false)) is still
 	// blocked on the gate.
-	waitForDrained(t, f, ts)
+	waitForDrained(t, f, a)
 	if ts.isAssistantMessage("msg_compaction_ses_fake") {
 		t.Error("compaction-internal message.updated was treated as a real assistant message -- " +
 			"dispatchEvent's own isCompacting guard (sse.go) did not suppress it")
@@ -252,7 +274,7 @@ func TestCompactionRetry_SucceedsAfterOverflow(t *testing.T) {
 	// ts.setCompacting(false) has run, which would otherwise race
 	// dispatchEvent's own isCompacting guard (sse.go) into silently dropping
 	// the retry's own real completion.
-	waitForNotCompacting(t, f, ts)
+	waitForNotCompacting(t, f, a, ts)
 
 	// Now script the RETRY's own clean completion: a fresh assistant
 	// message, a real text part, then session.idle.
@@ -324,9 +346,6 @@ func TestCompactionRetry_StepStartDuringCompactionIsSuppressed(t *testing.T) {
 	// session.idle as this turn's real completion instead of the retry's
 	// genuine one scripted below.
 	promptGate := f.armPromptAsyncGateForCall(2)
-	var closePromptGateOnce sync.Once
-	closePromptGate := func() { closePromptGateOnce.Do(func() { close(promptGate) }) }
-	t.Cleanup(closePromptGate)
 
 	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
@@ -353,7 +372,7 @@ func TestCompactionRetry_StepStartDuringCompactionIsSuppressed(t *testing.T) {
 		return err
 	})
 
-	ts := waitForTurnRegistered(t, a, "ses_fake")
+	ts := waitForTurnDispatched(t, f, a, "ses_fake")
 
 	f.broadcast(overflowMessageUpdated(t, "ses_fake", "msg_original"))
 	f.broadcast(sessionIdleLine(t, "ses_fake"))
@@ -416,9 +435,9 @@ func TestCompactionRetry_StepStartDuringCompactionIsSuppressed(t *testing.T) {
 	// goroutine WHILE ts.compacting is still PROVABLY true (see
 	// TestCompactionRetry_RetryAlsoOverflowsFinalizesFailedExactlyOnce's own
 	// doc comment for why this must run BEFORE releasing promptGate).
-	waitForDrained(t, f, ts)
+	waitForDrained(t, f, a)
 
-	closePromptGate() // let the gated retry dispatch finally return
+	close(promptGate) // let the gated retry dispatch finally return
 
 	// Deterministically wait for ts.compacting to have actually cleared
 	// before broadcasting the retry's own real completion below -- the
@@ -435,7 +454,7 @@ func TestCompactionRetry_StepStartDuringCompactionIsSuppressed(t *testing.T) {
 	// silently and PERMANENTLY dropping the retry's own completion (there
 	// is no replay), leaving nothing to finalize this turn within the
 	// test's own testWait ctx budget.
-	waitForNotCompacting(t, f, ts)
+	waitForNotCompacting(t, f, a, ts)
 
 	f.broadcast(plainAssistantMessageUpdated(t, "ses_fake", "msg_retry"))
 	f.broadcast(assistantTextPart(t, "ses_fake", "msg_retry", "prt_retry", "all good now"))
@@ -495,9 +514,6 @@ func TestCompactionRetry_StepFinishCostDuringCompactionIsCounted(t *testing.T) {
 	// identical addition (above) for the race this closes, independent of
 	// this test's own (already fully deterministic) step-finish assertions.
 	promptGate := f.armPromptAsyncGateForCall(2)
-	var closePromptGateOnce sync.Once
-	closePromptGate := func() { closePromptGateOnce.Do(func() { close(promptGate) }) }
-	t.Cleanup(closePromptGate)
 
 	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
@@ -524,7 +540,7 @@ func TestCompactionRetry_StepFinishCostDuringCompactionIsCounted(t *testing.T) {
 		return err
 	})
 
-	ts := waitForTurnRegistered(t, a, "ses_fake")
+	ts := waitForTurnDispatched(t, f, a, "ses_fake")
 
 	f.broadcast(overflowMessageUpdated(t, "ses_fake", "msg_original"))
 	f.broadcast(sessionIdleLine(t, "ses_fake"))
@@ -606,15 +622,15 @@ func TestCompactionRetry_StepFinishCostDuringCompactionIsCounted(t *testing.T) {
 	// goroutine WHILE ts.compacting is still PROVABLY true (see
 	// TestCompactionRetry_RetryAlsoOverflowsFinalizesFailedExactlyOnce's own
 	// doc comment for why this must run BEFORE releasing promptGate).
-	waitForDrained(t, f, ts)
+	waitForDrained(t, f, a)
 
-	closePromptGate() // let the gated retry dispatch finally return
+	close(promptGate) // let the gated retry dispatch finally return
 
 	// Deterministically wait for ts.compacting to have actually cleared
 	// before broadcasting the retry's own real completion below (see this
 	// file's own established waitForNotCompacting precedent, e.g.
 	// TestCompactionRetry_SucceedsAfterOverflow above, for why this matters).
-	waitForNotCompacting(t, f, ts)
+	waitForNotCompacting(t, f, a, ts)
 
 	f.broadcast(plainAssistantMessageUpdated(t, "ses_fake", "msg_retry"))
 	f.broadcast(assistantTextPart(t, "ses_fake", "msg_retry", "prt_retry", "all good now"))
@@ -730,7 +746,7 @@ func TestCompactionRetry_RetryAlsoOverflowsFinalizesFailedExactlyOnce(t *testing
 		return err
 	})
 
-	ts := waitForTurnRegistered(t, a, "ses_fake")
+	ts := waitForTurnDispatched(t, f, a, "ses_fake")
 
 	// First overflow -- triggers the one and only compaction attempt.
 	f.broadcast(overflowMessageUpdated(t, "ses_fake", "msg_original"))
@@ -757,7 +773,7 @@ func TestCompactionRetry_RetryAlsoOverflowsFinalizesFailedExactlyOnce(t *testing
 	// test's own doc comment describes; see waitForDrained's own doc
 	// comment for why this must run BEFORE releasing the gate, not merely
 	// before ts.compacting is observed false).
-	waitForDrained(t, f, ts)
+	waitForDrained(t, f, a)
 
 	close(gate) // only now let the gated retry dispatch finally return
 
@@ -773,7 +789,7 @@ func TestCompactionRetry_RetryAlsoOverflowsFinalizesFailedExactlyOnce(t *testing
 	// finalize this turn within the test's own testWait ctx budget -- the
 	// intermittent "cancelled / turn context canceled before completion"
 	// flake this closes.
-	waitForNotCompacting(t, f, ts)
+	waitForNotCompacting(t, f, a, ts)
 
 	// The RETRIED prompt ALSO overflows.
 	f.broadcast(overflowMessageUpdated(t, "ses_fake", "msg_retry"))
@@ -847,7 +863,7 @@ func TestCompactionRetry_ForceCompactionFails(t *testing.T) {
 		return err
 	})
 
-	ts := waitForTurnRegistered(t, a, "ses_fake")
+	ts := waitForTurnDispatched(t, f, a, "ses_fake")
 
 	f.broadcast(overflowMessageUpdated(t, "ses_fake", "msg_original"))
 	f.broadcast(sessionIdleLine(t, "ses_fake"))
@@ -929,9 +945,6 @@ func TestCompactionRetry_SessionErrorDuringCompactionIsSuppressed(t *testing.T) 
 	// identical addition (above) for the race this closes, independent of
 	// this test's own (already fully deterministic) session.error assertion.
 	promptGate := f.armPromptAsyncGateForCall(2)
-	var closePromptGateOnce sync.Once
-	closePromptGate := func() { closePromptGateOnce.Do(func() { close(promptGate) }) }
-	t.Cleanup(closePromptGate)
 
 	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
@@ -958,7 +971,7 @@ func TestCompactionRetry_SessionErrorDuringCompactionIsSuppressed(t *testing.T) 
 		return err
 	})
 
-	ts := waitForTurnRegistered(t, a, "ses_fake")
+	ts := waitForTurnDispatched(t, f, a, "ses_fake")
 
 	f.broadcast(overflowMessageUpdated(t, "ses_fake", "msg_original"))
 	f.broadcast(sessionIdleLine(t, "ses_fake"))
@@ -1013,9 +1026,9 @@ func TestCompactionRetry_SessionErrorDuringCompactionIsSuppressed(t *testing.T) 
 	// goroutine WHILE ts.compacting is still PROVABLY true (see
 	// TestCompactionRetry_RetryAlsoOverflowsFinalizesFailedExactlyOnce's own
 	// doc comment for why this must run BEFORE releasing promptGate).
-	waitForDrained(t, f, ts)
+	waitForDrained(t, f, a)
 
-	closePromptGate() // let the gated retry dispatch finally return
+	close(promptGate) // let the gated retry dispatch finally return
 
 	// Deterministically wait for ts.compacting to have actually cleared
 	// (attemptCompactionRetry's own postPromptAsync call genuinely returned,
@@ -1027,7 +1040,7 @@ func TestCompactionRetry_SessionErrorDuringCompactionIsSuppressed(t *testing.T) 
 	// retry's own completion (mirroring this file's own established
 	// waitForNotCompacting precedent, e.g.
 	// TestCompactionRetry_LateCompactionTailEventDuringRetryDispatchIsSuppressed).
-	waitForNotCompacting(t, f, ts)
+	waitForNotCompacting(t, f, a, ts)
 	f.broadcast(plainAssistantMessageUpdated(t, "ses_fake", "msg_retry"))
 	f.broadcast(assistantTextPart(t, "ses_fake", "msg_retry", "prt_retry", "all good now"))
 	f.broadcast(sessionIdleLine(t, "ses_fake"))
@@ -1205,16 +1218,6 @@ func TestCompactionRetry_ConcurrentOverflowDetectionNeverFinalizesPrematurely(t 
 	f := newFakeOpenCodeServer(t)
 	f.setSummarizeOK(true)
 	summarizeGate := f.armSummarizeGate()
-	// Guarantees summarizeGate is closed exactly once even if an assertion
-	// below calls t.Fatal before this test's own explicit close(summarizeGate)
-	// is reached -- otherwise the fake server's own gated /summarize handler
-	// goroutine would stay blocked forever, and f.srv.Close() (registered by
-	// newFakeOpenCodeServer, which therefore runs AFTER this cleanup thanks
-	// to t.Cleanup's own LIFO ordering) would hang the whole test binary
-	// waiting for that outstanding request to finish.
-	var closeSummarizeGateOnce sync.Once
-	closeSummarizeGate := func() { closeSummarizeGateOnce.Do(func() { close(summarizeGate) }) }
-	t.Cleanup(closeSummarizeGate)
 	// promptGate additionally gates the winning retry's own re-dispatch --
 	// this test's ONLY prompt_async call (call #1: unlike the other tests in
 	// this file, this one drives finalizeOrRecoverFromOverflow directly
@@ -1232,9 +1235,6 @@ func TestCompactionRetry_ConcurrentOverflowDetectionNeverFinalizesPrematurely(t 
 	// session.idle as this turn's real completion instead of the winning
 	// retry's genuine one scripted below.
 	promptGate := f.armPromptAsyncGateForCall(1)
-	var closePromptGateOnce sync.Once
-	closePromptGate := func() { closePromptGateOnce.Do(func() { close(promptGate) }) }
-	t.Cleanup(closePromptGate)
 
 	a := New(f.URL(), testSSEInactivityTimeout, testReconnectInterval, testRequestTimeout, testSummarizeTimeout, testTransientRetryBackoff, testRuntimeVersion, testSandboxID)
 	t.Cleanup(a.Close)
@@ -1288,7 +1288,7 @@ func TestCompactionRetry_ConcurrentOverflowDetectionNeverFinalizesPrematurely(t 
 		t.Fatalf("summarizeCallCount = %d, want exactly 1", got)
 	}
 
-	closeSummarizeGate() // let the one genuine winner's own gated forceCompaction finally proceed
+	close(summarizeGate) // let the one genuine winner's own gated forceCompaction finally proceed
 
 	// The winning retry's own re-dispatch (call #1) is now gated/blocked --
 	// proving the compaction-success wave has already been queued onto this
@@ -1300,11 +1300,11 @@ func TestCompactionRetry_ConcurrentOverflowDetectionNeverFinalizesPrematurely(t 
 	// goroutine WHILE ts.compacting is still PROVABLY true (see
 	// TestCompactionRetry_RetryAlsoOverflowsFinalizesFailedExactlyOnce's own
 	// doc comment for why this must run BEFORE releasing promptGate).
-	waitForDrained(t, f, ts)
+	waitForDrained(t, f, a)
 
-	closePromptGate() // let the gated retry dispatch finally return
+	close(promptGate) // let the gated retry dispatch finally return
 
-	waitForNotCompacting(t, f, ts)
+	waitForNotCompacting(t, f, a, ts)
 
 	// Script the real retry's own clean completion.
 	f.broadcast(plainAssistantMessageUpdated(t, "ses_fake", "msg_retry"))
@@ -1429,18 +1429,6 @@ func TestCompactionRetry_FallbackAbandonsWhenRetryFullyCompletesDuringFetch(t *t
 	f.setSummarizeOK(true)
 	messageGate := f.armMessageGate()
 	promptGate := f.armPromptAsyncGateForCall(2)
-	// Guarantee promptGate is closed exactly once even if an assertion below
-	// calls t.Fatal before this test's own explicit close(promptGate) is
-	// reached -- otherwise the fake server's own gated prompt_async handler
-	// goroutine would stay blocked forever, and f.srv.Close() (registered by
-	// newFakeOpenCodeServer, which therefore runs AFTER this cleanup thanks
-	// to t.Cleanup's own LIFO ordering) would hang the whole test binary
-	// waiting for that outstanding request to finish -- mirroring
-	// TestCompactionRetry_ConcurrentOverflowDetectionNeverFinalizesPrematurely's
-	// own closeSummarizeGateOnce precedent.
-	var closePromptGateOnce sync.Once
-	closePromptGate := func() { closePromptGateOnce.Do(func() { close(promptGate) }) }
-	t.Cleanup(closePromptGate)
 
 	// A stale snapshot: as if GET /session/{id}/message had been read before
 	// the live compaction retry ever touched anything -- still showing the
@@ -1482,7 +1470,7 @@ func TestCompactionRetry_FallbackAbandonsWhenRetryFullyCompletesDuringFetch(t *t
 		return err
 	})
 
-	ts := waitForTurnRegistered(t, a, "ses_fake")
+	ts := waitForTurnDispatched(t, f, a, "ses_fake")
 
 	// Deterministically wait for waitForTurn's own fallback ticker to have
 	// actually reached (and blocked inside) its own fetchFinalMessages call
@@ -1518,11 +1506,11 @@ func TestCompactionRetry_FallbackAbandonsWhenRetryFullyCompletesDuringFetch(t *t
 	// goroutine WHILE ts.compacting is still PROVABLY true (see
 	// TestCompactionRetry_RetryAlsoOverflowsFinalizesFailedExactlyOnce's own
 	// doc comment for why this must run BEFORE releasing promptGate).
-	waitForDrained(t, f, ts)
+	waitForDrained(t, f, a)
 
-	closePromptGate() // let the gated retry dispatch finally return
+	close(promptGate) // let the gated retry dispatch finally return
 
-	waitForNotCompacting(t, f, ts) // proves the retry's own re-dispatch has actually returned
+	waitForNotCompacting(t, f, a, ts) // proves the retry's own re-dispatch has actually returned
 
 	// Update the fake server's own fixture to reflect the retry's real,
 	// genuine completion BEFORE releasing the gate -- shortInactivity is
@@ -1540,9 +1528,7 @@ func TestCompactionRetry_FallbackAbandonsWhenRetryFullyCompletesDuringFetch(t *t
 	// preFetchActivity was snapshotted BEFORE any of this activity
 	// happened, so resolveOverflowAction's staleness check fires for it
 	// regardless of what the fixture now says.
-	f.setMessages([]messageListEntry{
-		{Info: openCodeMessageInfo{ID: "msg_retry", Role: "assistant"}, Parts: []json.RawMessage{textPartJSON(t, "prt_retry", "msg_retry", "all good now")}},
-	})
+	setRetryCompletedFixture(t, f)
 
 	// Release the fallback's own stale fetch NOW -- strictly AFTER the
 	// retry above has both begun and fully completed its re-dispatch, so
@@ -1616,9 +1602,6 @@ func TestCompactionRetry_FallbackDoesNotFinalizeWhileCompacting(t *testing.T) {
 	// gives the SSE-reader no deliberately-extended grace period to drain
 	// the compaction-success wave before ts.compacting clears.
 	promptGate := f.armPromptAsyncGateForCall(2)
-	var closePromptGateOnce sync.Once
-	closePromptGate := func() { closePromptGateOnce.Do(func() { close(promptGate) }) }
-	t.Cleanup(closePromptGate)
 
 	// Deliberately much shorter than testSSEInactivityTimeout -- waitForTurn's
 	// own fallback ticker (pollInterval = this / ssePollDivisor) must tick,
@@ -1652,7 +1635,7 @@ func TestCompactionRetry_FallbackDoesNotFinalizeWhileCompacting(t *testing.T) {
 		return err
 	})
 
-	ts := waitForTurnRegistered(t, a, "ses_fake")
+	ts := waitForTurnDispatched(t, f, a, "ses_fake")
 
 	f.broadcast(overflowMessageUpdated(t, "ses_fake", "msg_original"))
 	f.broadcast(sessionIdleLine(t, "ses_fake"))
@@ -1696,9 +1679,13 @@ func TestCompactionRetry_FallbackDoesNotFinalizeWhileCompacting(t *testing.T) {
 	// goroutine WHILE ts.compacting is still PROVABLY true (see
 	// TestCompactionRetry_RetryAlsoOverflowsFinalizesFailedExactlyOnce's own
 	// doc comment for why this must run BEFORE releasing promptGate).
-	waitForDrained(t, f, ts)
+	waitForDrained(t, f, a)
 
-	closePromptGate() // let the gated retry dispatch finally return
+	// See setRetryCompletedFixture: this test's shortInactivity fallback may
+	// fetch again once the retry is released.
+	setRetryCompletedFixture(t, f)
+
+	close(promptGate) // let the gated retry dispatch finally return
 
 	// Deterministically wait for ts.compacting to have actually cleared
 	// before broadcasting the retry's own real completion below -- see
@@ -1708,7 +1695,7 @@ func TestCompactionRetry_FallbackDoesNotFinalizeWhileCompacting(t *testing.T) {
 	// server's handler recorded the retry's own prompt_async call, strictly
 	// EARLIER than the adapter's own client-side postPromptAsync call
 	// actually returning and clearing ts.compacting (§7.2 Finding 3).
-	waitForNotCompacting(t, f, ts)
+	waitForNotCompacting(t, f, a, ts)
 
 	// Script the retry's own clean completion, exactly like
 	// TestCompactionRetry_SucceedsAfterOverflow.
@@ -1774,7 +1761,7 @@ func TestCompactionRetry_LateCompactionTailEventDuringRetryDispatchIsSuppressed(
 		return err
 	})
 
-	ts := waitForTurnRegistered(t, a, "ses_fake")
+	ts := waitForTurnDispatched(t, f, a, "ses_fake")
 
 	// Real pre-overflow output, so ts.sawText is ALREADY true before the
 	// overflow -- exactly the stale signal Finding 3's failure scenario
@@ -1813,7 +1800,7 @@ func TestCompactionRetry_LateCompactionTailEventDuringRetryDispatchIsSuppressed(
 	// assertion MEANINGFUL regardless of exactly how long draining takes:
 	// postPromptAsync (and therefore any chance of a LEGITIMATE completion)
 	// cannot possibly have returned yet, since it is still blocked on gate.
-	waitForDrained(t, f, ts)
+	waitForDrained(t, f, a)
 
 	select {
 	case <-ts.done:
@@ -1842,7 +1829,7 @@ func TestCompactionRetry_LateCompactionTailEventDuringRetryDispatchIsSuppressed(
 	// close ts.done within this test's own testWait ctx budget: exactly the
 	// intermittent "cancelled / turn context canceled before completion"
 	// flake this fix eliminates.
-	waitForNotCompacting(t, f, ts)
+	waitForNotCompacting(t, f, a, ts)
 
 	// Script the retry's own REAL clean completion.
 	f.broadcast(plainAssistantMessageUpdated(t, "ses_fake", "msg_retry"))
@@ -1904,7 +1891,7 @@ func TestCompactionRetry_StopDuringCompactionAbortsRetry(t *testing.T) {
 		return err
 	})
 
-	ts := waitForTurnRegistered(t, a, "ses_fake")
+	ts := waitForTurnDispatched(t, f, a, "ses_fake")
 
 	f.broadcast(overflowMessageUpdated(t, "ses_fake", "msg_original"))
 	f.broadcast(sessionIdleLine(t, "ses_fake"))
@@ -2019,7 +2006,7 @@ func TestCompactionRetry_StopDuringRetryDispatchAbortsRedispatchedPrompt(t *test
 		return err
 	})
 
-	waitForTurnRegistered(t, a, "ses_fake")
+	waitForTurnDispatched(t, f, a, "ses_fake")
 
 	f.broadcast(overflowMessageUpdated(t, "ses_fake", "msg_original"))
 	f.broadcast(sessionIdleLine(t, "ses_fake"))
@@ -2132,15 +2119,10 @@ func TestCompactionRetry_RetryPostPromptAsyncFails(t *testing.T) {
 		return err
 	})
 
-	waitForTurnRegistered(t, a, "ses_fake")
-
-	// The ORIGINAL dispatch (call #1) must keep succeeding -- registerTurn
-	// happens BEFORE StartTurn's own postPromptAsync call, so
-	// waitForTurnRegistered alone does not yet prove call #1 has actually
-	// been sent; wait for it explicitly before arming the failure, or the
-	// overflow scenario this test needs could never even get triggered in
-	// the first place (see setPromptAsyncOK's own doc comment).
-	waitForCount(t, "promptCallCount", f.promptCallCount, 1)
+	// The ORIGINAL dispatch (call #1) must keep succeeding: arm the failure
+	// only once waitForTurnDispatched has seen it recorded (see
+	// setPromptAsyncOK's own doc comment).
+	waitForTurnDispatched(t, f, a, "ses_fake")
 	f.setPromptAsyncOK(false)
 
 	// overflowMessageUpdatedWithModel, not the bare overflowMessageUpdated:
@@ -2282,14 +2264,18 @@ func TestCompactionRetry_FallbackAbandonsOnStaleRaceWithLiveRetry(t *testing.T) 
 	// fires -- and, once compacting flips back to false after the real
 	// retry's own redispatch succeeds but before its completion has been
 	// broadcast/dispatched yet, calls finalizeByFallback (a REAL HTTP fetch)
-	// -- extremely often for as long as that narrow window lasts. Every one
-	// of those calls correctly abandons (compactionAlreadyAttempted() is
-	// permanently true from that point on -- the round-2 Finding 2 fix
-	// above), so this is harmless BY CONSTRUCTION, never a correctness
-	// concern -- but under genuine host contention (confirmed empirically:
-	// this exact test observed failing via testWait/ctx expiring, Outcome
-	// reported Cancelled instead of Completed, NOT via the wrong-Failed
-	// symptom round-1's own fix left unguarded) that harmless polling storm
+	// -- extremely often for as long as that narrow window lasts. Those
+	// calls are NOT inert: with compacting cleared and no activity since
+	// their own snapshot, each one finalizes the turn from whatever the
+	// fixture returns (resolveOverflowAction, turn.go -- the behavior
+	// TestCompactionRetry_SilentRetryStillFinalizesViaFallback pins as
+	// intended). Against the stale pre-retry snapshot above they finalized
+	// Failed ("a compaction retry was already attempted"), reproduced under
+	// load, so the tail below calls setRetryCompletedFixture before
+	// releasing the retry. Separately, under genuine host contention
+	// (confirmed empirically: this exact test observed failing via
+	// testWait/ctx expiring, Outcome reported Cancelled instead of
+	// Completed) that polling storm
 	// can itself consume enough scheduler time to delay the SSE-reader
 	// goroutine's own processing of the retry's scripted completion past a
 	// tight ctx budget. Nothing here is unboundedly stuck -- the storm
@@ -2314,7 +2300,7 @@ func TestCompactionRetry_FallbackAbandonsOnStaleRaceWithLiveRetry(t *testing.T) 
 		return err
 	})
 
-	ts := waitForTurnRegistered(t, a, "ses_fake")
+	ts := waitForTurnDispatched(t, f, a, "ses_fake")
 
 	// Deterministically wait for waitForTurn's own fallback ticker to have
 	// actually reached (and blocked inside) its own fetchFinalMessages call
@@ -2384,7 +2370,12 @@ func TestCompactionRetry_FallbackAbandonsOnStaleRaceWithLiveRetry(t *testing.T) 
 	// goroutine WHILE ts.compacting is still PROVABLY true (see
 	// TestCompactionRetry_RetryAlsoOverflowsFinalizesFailedExactlyOnce's own
 	// doc comment for why this must run BEFORE releasing promptGate).
-	waitForDrained(t, f, ts)
+	waitForDrained(t, f, a)
+
+	// See setRetryCompletedFixture: this test's shortInactivity fallback may
+	// fetch again once the retry is released, and would otherwise read the
+	// stale pre-retry snapshot set at the top of this test.
+	setRetryCompletedFixture(t, f)
 
 	close(promptGate) // let the gated retry dispatch finally return
 
@@ -2393,7 +2384,7 @@ func TestCompactionRetry_FallbackAbandonsOnStaleRaceWithLiveRetry(t *testing.T) 
 	// genuinely returned) BEFORE broadcasting the retry's own completion --
 	// round-2 Finding 3's own fix, see waitForNotCompacting's own doc
 	// comment (fake_server_test.go) for the exact race this closes.
-	waitForNotCompacting(t, f, ts)
+	waitForNotCompacting(t, f, a, ts)
 
 	// Script the REAL retry's own clean completion.
 	f.broadcast(plainAssistantMessageUpdated(t, "ses_fake", "msg_retry"))
@@ -2571,20 +2562,6 @@ func TestCompactionRetry_FallbackReleaseRacesLiveOverflowAtomically(t *testing.T
 	// released -- see TestCompactionRetry_FallbackAbandonsOnStaleRaceWithLiveRetry's
 	// own doc comment (round-2 Finding 3) for why this matters.
 	promptGate := f.armPromptAsyncGateForCall(2)
-	// Guarantee every gate is closed exactly once even if an assertion below
-	// calls t.Fatalf before this test's own explicit close calls are
-	// reached -- otherwise the fake server's own gated handler goroutines
-	// stay blocked forever, and f.srv.Close() (registered by
-	// newFakeOpenCodeServer, which runs AFTER these thanks to t.Cleanup's own
-	// LIFO ordering) would hang the whole test binary waiting for those
-	// outstanding requests to finish. messageGate itself is always closed
-	// unconditionally by its own barrier goroutine below regardless of any
-	// assertion outcome, so it needs no such guard.
-	var closeSummarizeGateOnce, closePromptGateOnce sync.Once
-	closeSummarizeGate := func() { closeSummarizeGateOnce.Do(func() { close(summarizeGate) }) }
-	closePromptGate := func() { closePromptGateOnce.Do(func() { close(promptGate) }) }
-	t.Cleanup(closePromptGate)
-	t.Cleanup(closeSummarizeGate)
 
 	// A stale snapshot: as if GET /session/{id}/message had been read
 	// before the live compaction retry ever touched anything -- still
@@ -2628,7 +2605,7 @@ func TestCompactionRetry_FallbackReleaseRacesLiveOverflowAtomically(t *testing.T
 		return err
 	})
 
-	ts := waitForTurnRegistered(t, a, "ses_fake")
+	ts := waitForTurnDispatched(t, f, a, "ses_fake")
 
 	// Deterministically wait for waitForTurn's own fallback ticker to have
 	// actually reached (and blocked inside) its own fetchFinalMessages call
@@ -2693,7 +2670,7 @@ func TestCompactionRetry_FallbackReleaseRacesLiveOverflowAtomically(t *testing.T
 			"cleanly abandoning)", got)
 	}
 
-	closeSummarizeGate() // let the winning, gated compaction attempt finally proceed
+	close(summarizeGate) // let the winning, gated compaction attempt finally proceed
 
 	waitForCount(t, "promptCallCount", f.promptCallCount, 2)
 	if got := f.lastPromptText(); got != promptText {
@@ -2704,11 +2681,16 @@ func TestCompactionRetry_FallbackReleaseRacesLiveOverflowAtomically(t *testing.T
 	// goroutine WHILE ts.compacting is still PROVABLY true (see
 	// TestCompactionRetry_RetryAlsoOverflowsFinalizesFailedExactlyOnce's own
 	// doc comment for why this must run BEFORE releasing promptGate).
-	waitForDrained(t, f, ts)
+	waitForDrained(t, f, a)
 
-	closePromptGate() // let the gated retry dispatch finally return
+	// See setRetryCompletedFixture: this test's shortInactivity fallback may
+	// fetch again once the retry is released, and would otherwise read the
+	// stale pre-retry snapshot set at the top of this test.
+	setRetryCompletedFixture(t, f)
 
-	waitForNotCompacting(t, f, ts)
+	close(promptGate) // let the gated retry dispatch finally return
+
+	waitForNotCompacting(t, f, a, ts)
 
 	// Script the REAL retry's own clean completion.
 	f.broadcast(plainAssistantMessageUpdated(t, "ses_fake", "msg_retry"))
@@ -2796,9 +2778,6 @@ func TestCompactionRetry_SilentRetryStillFinalizesViaFallback(t *testing.T) {
 	f := newFakeOpenCodeServer(t)
 	f.setSummarizeOK(true)
 	promptGate := f.armPromptAsyncGateForCall(2)
-	var closePromptGateOnce sync.Once
-	closePromptGate := func() { closePromptGateOnce.Do(func() { close(promptGate) }) }
-	t.Cleanup(closePromptGate)
 
 	// Deliberately short so the SSE-inactivity fallback's own real
 	// threshold is reached in well under a second -- see this test's own
@@ -2838,7 +2817,7 @@ func TestCompactionRetry_SilentRetryStillFinalizesViaFallback(t *testing.T) {
 		return err
 	})
 
-	ts := waitForTurnRegistered(t, a, "ses_fake")
+	ts := waitForTurnDispatched(t, f, a, "ses_fake")
 
 	f.broadcast(overflowMessageUpdated(t, "ses_fake", "msg_original"))
 	f.broadcast(sessionIdleLine(t, "ses_fake"))
@@ -2855,15 +2834,15 @@ func TestCompactionRetry_SilentRetryStillFinalizesViaFallback(t *testing.T) {
 	// goroutine WHILE ts.compacting is still PROVABLY true (see
 	// TestCompactionRetry_RetryAlsoOverflowsFinalizesFailedExactlyOnce's own
 	// doc comment for why this must run BEFORE releasing promptGate).
-	waitForDrained(t, f, ts)
+	waitForDrained(t, f, a)
 
-	closePromptGate() // let the gated retry dispatch finally return
+	close(promptGate) // let the gated retry dispatch finally return
 
 	// Wait for ts.compacting to have cleared back to false -- the ordinary
 	// steady state this test targets: overflow -> compaction succeeded ->
 	// retry re-dispatched -> now waiting on the RETRIED prompt's own
 	// session.idle, exactly like any normal turn.
-	waitForNotCompacting(t, f, ts)
+	waitForNotCompacting(t, f, a, ts)
 
 	if !ts.compactionAlreadyAttempted() {
 		t.Fatal("ts.compactionAlreadyAttempted() = false after a completed compaction retry, want true " +

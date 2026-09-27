@@ -82,9 +82,10 @@ type fakeOpenCodeServer struct {
 	// handler's own original, unconditional-200 behavior for every OTHER
 	// test in this package that never calls setPromptAsyncOK at all --
 	// checked at request time, so a test must call setPromptAsyncOK(false)
-	// AFTER the turn's own ORIGINAL dispatch has already happened (that
-	// first call must keep succeeding, or the overflow scenario a test like
-	// this needs could never even get triggered in the first place).
+	// AFTER the turn's own ORIGINAL dispatch has already been recorded --
+	// i.e. after waitForTurnDispatched returns (that first call must keep
+	// succeeding, or the overflow scenario a test like this needs could
+	// never even get triggered in the first place).
 	promptAsyncFail bool
 
 	// messageGate, when non-nil, blocks the GET /session/{id}/message
@@ -106,12 +107,14 @@ type fakeOpenCodeServer struct {
 	summarizeGate chan struct{}
 
 	// promptAsyncGateFrom/promptAsyncGate let a test block a SPECIFIC,
-	// numbered (1-based) POST .../prompt_async call -- e.g. only the
-	// RETRY's own re-dispatch, not the turn's original one -- until
-	// released, deterministically (§7.2 Finding 3's own regression test:
-	// proving a late compaction-tail SSE event arriving while that retry
-	// dispatch is still in flight is correctly suppressed). 0 means "gate
-	// nothing" (the default).
+	// numbered (1-based, in the order this server RECORDS them) POST
+	// .../prompt_async call -- e.g. only the RETRY's own re-dispatch, not
+	// the turn's original one -- until released, deterministically (§7.2
+	// Finding 3's own regression test: proving a late compaction-tail SSE
+	// event arriving while that retry dispatch is still in flight is
+	// correctly suppressed). 0 means "gate nothing" (the default). See
+	// armPromptAsyncGateForCall for what makes a number name a specific
+	// call.
 	promptAsyncGateFrom int
 	promptAsyncGate     chan struct{}
 
@@ -120,6 +123,18 @@ type fakeOpenCodeServer struct {
 	// block on this to know precisely when a (re)connect has actually
 	// landed, instead of guessing via a sleep.
 	connected chan int
+
+	// teardown is closed by the t.Cleanup newFakeOpenCodeServer registers
+	// right AFTER f.srv.Close's own, so it runs just BEFORE that Close
+	// (t.Cleanup is last-registered-first). Every handler that parks on a
+	// test-armed gate (awaitGate) or on a live /event connection also
+	// selects on it, so a test that fails before releasing a gate still
+	// tears down promptly and reports its own failure. Without it, a
+	// gated handler parks forever, httptest.Server.Close waits on it
+	// forever, and the package dies at `go test`'s own -timeout with the
+	// failing test's message never printed (the package-timeout form of
+	// TestCompactionRetry_SucceedsAfterOverflow's CI failure).
+	teardown chan struct{}
 }
 
 // fakeSSEConn is one live GET /event connection's own outbound queue and
@@ -137,6 +152,7 @@ func newFakeOpenCodeServer(t *testing.T) *fakeOpenCodeServer {
 	f := &fakeOpenCodeServer{
 		t:         t,
 		connected: make(chan int, 64),
+		teardown:  make(chan struct{}),
 	}
 
 	mux := http.NewServeMux()
@@ -146,7 +162,21 @@ func newFakeOpenCodeServer(t *testing.T) *fakeOpenCodeServer {
 
 	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)
+	// Registered after f.srv.Close, so it runs before it -- see teardown.
+	t.Cleanup(func() { close(f.teardown) })
 	return f
+}
+
+// awaitGate blocks until the test releases gate, reporting true, or until
+// the fake server is being torn down, reporting false -- in which case the
+// caller must return at once without doing the gated work (see teardown).
+func (f *fakeOpenCodeServer) awaitGate(gate chan struct{}) bool {
+	select {
+	case <-gate:
+		return true
+	case <-f.teardown:
+		return false
+	}
 }
 
 func (f *fakeOpenCodeServer) URL() string { return f.srv.URL }
@@ -205,6 +235,8 @@ func (f *fakeOpenCodeServer) handleEvent(w http.ResponseWriter, r *http.Request)
 			return
 		case <-r.Context().Done():
 			return
+		case <-f.teardown:
+			return
 		}
 	}
 }
@@ -235,8 +267,9 @@ func (f *fakeOpenCodeServer) handleSessionSubroutes(w http.ResponseWriter, r *ht
 		gate := f.promptAsyncGate
 		fail := f.promptAsyncFail
 		f.mu.Unlock()
-		if gateFrom != 0 && callIndex >= gateFrom {
-			<-gate
+		if gateFrom != 0 && callIndex >= gateFrom && !f.awaitGate(gate) {
+			http.Error(w, "fake server torn down while this call was gated", http.StatusServiceUnavailable)
+			return
 		}
 		if fail {
 			// Finding 5's own precedent, applied to prompt_async: a real
@@ -259,8 +292,10 @@ func (f *fakeOpenCodeServer) handleSessionSubroutes(w http.ResponseWriter, r *ht
 		gate := f.messageGate
 		f.messageCalls++ // recorded BEFORE the gate wait -- see messageCalls' own field comment
 		f.mu.Unlock()
-		if gate != nil {
-			<-gate // §7.2 Finding 2's own regression test: block until released
+		// §7.2 Finding 2's own regression test: block until released.
+		if gate != nil && !f.awaitGate(gate) {
+			http.Error(w, "fake server torn down while this call was gated", http.StatusServiceUnavailable)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if entries == nil {
@@ -278,8 +313,10 @@ func (f *fakeOpenCodeServer) handleSessionSubroutes(w http.ResponseWriter, r *ht
 		ok := f.summarizeOK
 		gate := f.summarizeGate
 		f.mu.Unlock()
-		if gate != nil {
-			<-gate // Finding 1's own regression test: block until released
+		// Finding 1's own regression test: block until released.
+		if gate != nil && !f.awaitGate(gate) {
+			http.Error(w, "fake server torn down while this call was gated", http.StatusServiceUnavailable)
+			return
 		}
 
 		sessionID := summarizeSessionIDFromPath(r.URL.Path)
@@ -347,7 +384,7 @@ func (f *fakeOpenCodeServer) setSummarizeOK(ok bool) {
 // own Finding 5 precedent, so a test can deterministically exercise
 // attemptCompactionRetry's own THIRD documented failure branch: compaction
 // succeeds, but the RETRIED postPromptAsync dispatch itself fails. Call
-// this AFTER the turn's own ORIGINAL dispatch has already happened -- see
+// this only after waitForTurnDispatched has returned -- see
 // promptAsyncFail's own field comment for why.
 func (f *fakeOpenCodeServer) setPromptAsyncOK(ok bool) {
 	f.mu.Lock()
@@ -369,7 +406,7 @@ func (f *fakeOpenCodeServer) armMessageGate() chan struct{} {
 }
 
 // armSummarizeGate arms the fake server to block the /summarize handler
-// (after it has already recorded the call and broadcast whatever
+// (after it has already recorded the call, and BEFORE it broadcasts whatever
 // compaction-internal wave applies) until the returned channel is closed --
 // §7.2 Finding 1's own regression test uses this to deterministically hold a
 // compaction retry "in flight" for as long as it likes, rather than relying
@@ -389,6 +426,12 @@ func (f *fakeOpenCodeServer) armSummarizeGate() chan struct{} {
 // (e.g. n=2, the compaction retry's own re-dispatch, leaving the turn's
 // ORIGINAL dispatch at n=1 unaffected) returns to its caller, rather than
 // relying on wall-clock sleeps (§7.2 Finding 3's own regression test).
+//
+// N counts calls in the order this server RECORDS them, not the order the
+// adapter issues them, so n=2 names the retry only if the original has
+// already been recorded as call #1 before anything can trigger a retry --
+// which is what waitForTurnDispatched guarantees; see its doc comment for
+// the CI failures that ordering assumption caused without it.
 func (f *fakeOpenCodeServer) armPromptAsyncGateForCall(n int) chan struct{} {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -526,6 +569,21 @@ func (f *fakeOpenCodeServer) promptCallCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.promptCalls)
+}
+
+// promptCallsWithText counts the recorded POST .../prompt_async calls whose
+// text is exactly text -- waitForTurnDispatched's own signal that a specific
+// turn's original dispatch has reached this server.
+func (f *fakeOpenCodeServer) promptCallsWithText(text string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, got := range f.promptCalls {
+		if got == text {
+			n++
+		}
+	}
+	return n
 }
 
 // messageCallCount reports how many GET /session/{id}/message calls have
@@ -684,12 +742,45 @@ func waitForConnNumber(t *testing.T, f *fakeOpenCodeServer, n int) {
 	}
 }
 
+// waitForTurnDispatched polls until a.lookupTurn(sessionID) is non-nil AND f
+// has recorded that turn's own ORIGINAL POST .../prompt_async call, returning
+// the turnState, or fails the test after testWait. A test that scripts
+// OpenCode's reaction to a just-started turn (broadcasting its events,
+// arming armPromptAsyncGateForCall, or calling setPromptAsyncOK(false)) needs
+// both before it may proceed:
+//
+//   - registration, because an SSE event broadcast for a session with no
+//     registered turn yet is silently dropped (sse.go's own dispatchEvent doc
+//     comment);
+//   - the recorded dispatch, because Adapter.StartTurn registers the turn
+//     BEFORE it sends that prompt. Proceeding on registration alone scripts a
+//     reaction to a prompt the server has not received yet -- which no real
+//     OpenCode can produce -- and under CPU contention a recovery retry's own
+//     re-dispatch can then reach f FIRST, as call #1. The original becomes
+//     call #2, so armPromptAsyncGateForCall(2) gates the ORIGINAL instead of
+//     the retry, and the window the gate exists to hold open never happens:
+//     TestCompactionRetry_SucceedsAfterOverflow then reads ts.isCompacting()
+//     false, and TestCompactionRetry_StopDuringRetryDispatchAbortsRedispatchedPrompt
+//     sees its retry accepted before Stop, so it waits out its whole ctx.
+//
+// Matching on the turn's own prompt text, not on promptCallCount alone, ties
+// the wait to THIS turn's dispatch: its retry carries the same text but
+// cannot exist until the test scripts the failure that triggers it.
+func waitForTurnDispatched(t *testing.T, f *fakeOpenCodeServer, a *Adapter, sessionID string) *turnState {
+	t.Helper()
+	ts := waitForTurnRegistered(t, a, sessionID)
+	waitForCount(t, "prompt_async calls carrying this turn's own prompt text",
+		func() int { return f.promptCallsWithText(ts.cmd.Text) }, 1)
+	return ts
+}
+
 // waitForTurnRegistered polls until a.lookupTurn(sessionID) is non-nil (and
-// returns it), or fails the test after testWait -- an SSE event broadcast
-// for a session with no registered turn yet is silently dropped (sse.go's
-// own dispatchEvent doc comment), so tests that broadcast events for a
-// just-started turn must wait for registration first rather than racing
-// StartTurn's own resolveSession/registerTurn sequence.
+// returns it), or fails the test after testWait. Registration alone is the
+// right precondition ONLY for a test that scripts no reaction to the turn's
+// prompt at all -- e.g. one that merely drops the /event connection under a
+// turn that must already exist, and would only widen its own timing window by
+// also waiting on the dispatch. Every test that scripts a reaction must use
+// waitForTurnDispatched instead; see its doc comment for why.
 func waitForTurnRegistered(t *testing.T, a *Adapter, sessionID string) *turnState {
 	t.Helper()
 	deadline := time.Now().Add(testWait)
@@ -775,12 +866,14 @@ func waitForSawText(t *testing.T, ts *turnState) {
 // failures reproduced this with ZERO such reconnect log line ever printed.
 //
 // waitForDrained broadcasts one more, deliberately inert sentinel event and
-// waits for IT to be dispatched -- since every event for one session
-// travels over the SAME single persistent connection, drained by the SAME
-// single SSE-reader goroutine strictly in the order broadcast (no
-// reordering across a live, undropped connection), observing the sentinel
-// dispatched proves everything broadcast before it -- including whatever
-// the /summarize handler already queued -- has been dispatched too. This
+// waits for IT to be dispatched -- since every event travels over the SAME
+// single persistent connection, drained by the SAME single SSE-reader
+// goroutine strictly in the order broadcast (no reordering across a live,
+// undropped connection), observing the sentinel dispatched proves
+// everything broadcast before it -- including whatever the /summarize
+// handler already queued -- has been dispatched too (see waitForDrained's
+// own doc comment for what makes the sentinel's dispatch observable on its
+// own). This
 // generalizes the same "poll lastActivityTime past a snapshot" proof
 // TestCompactionRetry_StepStartDuringCompactionIsSuppressed/
 // TestCompactionRetry_SessionErrorDuringCompactionIsSuppressed already
@@ -792,12 +885,12 @@ func waitForSawText(t *testing.T, ts *turnState) {
 // than requiring a human to notice and patch each new call site
 // individually the way this package's own four prior rounds of this exact
 // bug already did.
-func waitForNotCompacting(t *testing.T, f *fakeOpenCodeServer, ts *turnState) {
+func waitForNotCompacting(t *testing.T, f *fakeOpenCodeServer, a *Adapter, ts *turnState) {
 	t.Helper()
 	deadline := time.Now().Add(testWait)
 	for time.Now().Before(deadline) {
 		if !ts.isCompacting() {
-			waitForDrained(t, f, ts)
+			waitForDrained(t, f, a)
 			return
 		}
 		time.Sleep(time.Millisecond)
@@ -818,33 +911,50 @@ func waitForNotCompacting(t *testing.T, f *fakeOpenCodeServer, ts *turnState) {
 // doc comment, compactionretry_test.go, for why that ordering is what
 // actually closes the race, not merely detecting it after the fact).
 //
-// Broadcasts a message.updated whose Role is deliberately "user", never
-// "assistant" -- dispatchEvent's own "message.updated" case (sse.go) calls
-// ts.touch() UNCONDITIONALLY as the very first thing it does, before even
-// checking isCompacting(), but only mutates any OTHER tracked field
-// (markAssistantMessageID/setLastAssistantError) when Info.Role ==
-// "assistant" -- so this sentinel is provably a no-op for every other
-// tracked field or wire-visible event (dispatchEvent's "message.updated"
-// case never itself calls ts.emit at all) regardless of ts.isCompacting()
-// at the moment it is actually processed, for "ses_fake", the fake server's
-// own single hardcoded OpenCode session id (handleCreateSession above) --
-// the same id every caller of this helper already registered its own
-// turnState under.
-func waitForDrained(t *testing.T, f *fakeOpenCodeServer, ts *turnState) {
+// The sentinel targets a throwaway turnState registered under its own
+// session id for the duration of this call, and this waits for THAT turn's
+// lastActivityTime to advance -- never the turn under test's. Every
+// dispatched event for a registered session calls ts.touch() first
+// (dispatchEvent, sse.go), so a sentinel sent for "ses_fake" itself would be
+// indistinguishable from any earlier "ses_fake" event still queued ahead of
+// it: when the reader lags, the compaction wave's own first message.updated
+// advances the turn's clock, the wait returns while that wave's
+// session.idle is still undelivered, and the caller goes on to release the
+// retry's gate -- reopening exactly the race waitForNotCompacting's own doc
+// comment describes (reproduced: TestCompactionRetry_SucceedsAfterOverflow
+// finalized Failed/"opencode: turn produced no output", or its turn was
+// already unregistered when the next barrier arrived). Only the sentinel is
+// ever sent for the barrier session, so its turn's clock can only move on
+// the sentinel's own dispatch. Because it never needs the turn under test to
+// still be registered either, it also proves a wave was drained for a
+// session whose turn is already gone (realbinarycapture_test.go's
+// late-wave test).
+//
+// The sentinel is a message.updated whose Role is "user": dispatchEvent's
+// own "message.updated" case (sse.go) only mutates any tracked field other
+// than lastActivity when Info.Role == "assistant", and never emits a wire
+// event, so it is inert even for its own throwaway turn.
+func waitForDrained(t *testing.T, f *fakeOpenCodeServer, a *Adapter) {
 	t.Helper()
-	before := ts.lastActivityTime()
+
+	const barrierSessionID = "ses_drain_barrier"
+	barrierTS := newTurnState(sandboxws.Prompt{SessionId: testSessionID, Gen: 1}, func(ports.AgentEvent) {})
+	a.registerTurn(barrierSessionID, barrierTS)
+	defer a.unregisterTurn(barrierSessionID)
+
+	before := barrierTS.lastActivityTime()
 	f.broadcast(sseLine(t, "message.updated", messageUpdatedProps{
-		SessionID: "ses_fake",
+		SessionID: barrierSessionID,
 		Info:      openCodeMessageInfo{ID: "msg_drain_barrier", Role: "user"},
 	}))
 	deadline := time.Now().Add(testWait)
 	for time.Now().Before(deadline) {
-		if ts.lastActivityTime().After(before) {
+		if barrierTS.lastActivityTime().After(before) {
 			return
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatal("waitForDrained: barrier broadcast was never dispatched (ts.lastActivityTime never advanced) within testWait")
+	t.Fatal("waitForDrained: barrier broadcast was never dispatched (barrierTS.lastActivityTime never advanced) within testWait")
 }
 
 // lastExecutionComplete asserts events' own last entry is a
