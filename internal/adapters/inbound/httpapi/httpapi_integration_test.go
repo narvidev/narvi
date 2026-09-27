@@ -180,6 +180,14 @@ type testRig struct {
 	diffFetcher reviewcontext.Fetcher
 	botToken    string
 
+	// resultSourceControl is the code host GET /api/sessions/{sessionID}/
+	// result reads a verdict's freshness from (technical plan §43.20) -- nil
+	// by default, which the route reads as "no code host configured": every
+	// assessed verdict then reads unconfirmed, with no live read. A test
+	// that exercises the live read sets its own fake through newTestRig's
+	// mutate func (sessionresult_integration_test.go).
+	resultSourceControl ports.SourceControl
+
 	// positionResolver (§22.1.1) is review/verdict's own
 	// relocation-fallback dependency -- nil by default (this rig's own
 	// pre-existing tests never care about it, and a nil resolver is a
@@ -587,6 +595,18 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		r.Post("/", httpapi.CreateSession(rig.pool, rig.sessions, rig.turns, rig.environments, rig.auditLog, rig.registry, nil, false, rig.rolloutMode, rig.repoSettings, rig.prSessions))
 		r.Get("/{sessionID}", httpapi.GetSession(rig.sessions))
 		r.Get("/{sessionID}/status", httpapi.GetSessionStatus(rig.sessions, sessionactivity.NewWaiter(sessionactivity.ConfigFrom(platform.DefaultTimeouts())), platform.DefaultTimeouts()))
+		r.Get("/{sessionID}/result", httpapi.GetSessionResult(httpapi.SessionResultDeps{
+			Pool:           rig.pool,
+			Sessions:       rig.sessions,
+			Turns:          rig.turns,
+			Events:         rig.events,
+			Artifacts:      rig.artifacts,
+			PRSessions:     rig.prSessions,
+			ReviewVerdicts: rig.reviewVerdicts,
+			SourceControl:  rig.resultSourceControl,
+			BotToken:       "result-bot-token",
+			Timeouts:       platform.DefaultTimeouts(),
+		}))
 		r.Get("/{sessionID}/events", httpapi.ListEvents(rig.sessions, rig.events))
 		r.Get("/{sessionID}/artifacts", httpapi.ListArtifacts(rig.sessions, rig.artifacts))
 		// uploads ("uploads, blob storage & the in-sandbox
@@ -1234,6 +1254,7 @@ func TestRoutes_RequireAuth(t *testing.T) {
 		{name: "CreateSession", method: http.MethodPost, path: "/api/sessions"},
 		{name: "GetSession", method: http.MethodGet, path: "/api/sessions/" + session.ID.String()},
 		{name: "GetSessionStatus", method: http.MethodGet, path: "/api/sessions/" + session.ID.String() + "/status"},
+		{name: "GetSessionResult", method: http.MethodGet, path: "/api/sessions/" + session.ID.String() + "/result"},
 		{name: "ListEvents", method: http.MethodGet, path: "/api/sessions/" + session.ID.String() + "/events"},
 		{name: "ListArtifacts", method: http.MethodGet, path: "/api/sessions/" + session.ID.String() + "/artifacts"},
 		{name: "ListPlans", method: http.MethodGet, path: "/api/sessions/" + session.ID.String() + "/plans"},

@@ -304,3 +304,39 @@ func TestComputeEligibleCore_ComparesFreshnessOnlyThroughCheckFreshness(t *testi
 		t.Errorf("computeEligibleCore calls CheckFreshness %d times, want exactly once", calls)
 	}
 }
+
+// TestClassifyFreshness_EveryReason sorts every Reason this package
+// defines: the four "changed" reasons are stale, the three "could not be
+// established" ones unconfirmed, a pass current -- and everything else,
+// the eligibility-only reasons and an unknown value included, unconfirmed,
+// never current.
+func TestClassifyFreshness_EveryReason(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		reason autoapproval.Reason
+		want   autoapproval.FreshnessClass
+	}{
+		{autoapproval.ReasonNone, autoapproval.FreshnessCurrent},
+		{autoapproval.ReasonStaleVerdict, autoapproval.FreshnessStale},
+		{autoapproval.ReasonBaseMoved, autoapproval.FreshnessStale},
+		{autoapproval.ReasonAncestorChainChanged, autoapproval.FreshnessStale},
+		{autoapproval.ReasonPolicyVersionMismatch, autoapproval.FreshnessStale},
+		{autoapproval.ReasonContextUnknown, autoapproval.FreshnessUnconfirmed},
+		{autoapproval.ReasonBaseSHAUnknown, autoapproval.FreshnessUnconfirmed},
+		{autoapproval.ReasonAncestorChainUnknown, autoapproval.FreshnessUnconfirmed},
+		{autoapproval.ReasonNotAssessed, autoapproval.FreshnessUnconfirmed},
+		{autoapproval.ReasonNeedsHumanLabel, autoapproval.FreshnessUnconfirmed},
+		{autoapproval.ReasonCINotGreen, autoapproval.FreshnessUnconfirmed},
+		{autoapproval.Reason("a reason this build does not know"), autoapproval.FreshnessUnconfirmed},
+	}
+	for _, tc := range tests {
+		if got := autoapproval.ClassifyFreshness(tc.reason); got != tc.want {
+			t.Errorf("ClassifyFreshness(%q) = %q, want %q", tc.reason, got, tc.want)
+		}
+	}
+	for reason := range freshnessReasons {
+		if got := autoapproval.ClassifyFreshness(reason); got == autoapproval.FreshnessCurrent {
+			t.Errorf("ClassifyFreshness(%q) = current for a refusal", reason)
+		}
+	}
+}
