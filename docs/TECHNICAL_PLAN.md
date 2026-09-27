@@ -3794,6 +3794,34 @@ the runtime still shares the network namespace (arbitrary egress remains §30.1'
 empty-handed), and kernel-level escalation is the substrate's concern (the provider's isolation
 layer), not this Step's.
 
+**Preserving the workspace tree means re-owning it — and the re-own walk is root acting on a tree
+the runtime can change under it.** Everything sandbox-agent writes into the workspace (the clone,
+setup hooks, the generated manifest and config) is written as sandbox-agent, so the runtime keeps
+working access only because sandbox-agent, as root, re-owns the tree to the runtime's uid
+(`boot.ChownWorkspaceForRuntime`, `internal/sandboxagent/boot/workspaceowner.go`): per freshly
+cloned repository, per repository that has `services.yml` commands just before they start, and over
+the whole workspace after boot, before the first prompt. The later passes run while `services.yml` processes
+are already running as the runtime uid and writing in the tree, so the walk must hold against a
+writer that swaps any directory for a symlink at any instant. A path-based walk does not:
+`filepath.WalkDir` with `Lchown` resolves every parent component again at each call (`Lchown`
+declines to follow only the last one), and `os.ReadDir` follows a directory swapped for a symlink
+after it was listed — reproduced with an atomic swapper, root listed and re-owned a directory
+outside the workspace, where the credential cache is a plausible target. **The guarantee: the
+re-own walk is fd-relative.** The root is opened `O_DIRECTORY|O_NOFOLLOW`; each directory is
+listed from its own open fd; the walk descends only through
+`openat(dirfd, name, O_DIRECTORY|O_NOFOLLOW)` and re-owns each directory through the fd that
+opened it; every other entry is re-owned with `fchownat(dirfd, name, AT_SYMLINK_NOFOLLOW)`. It
+therefore re-owns exactly the inodes reachable as entries of directories it opened by descent
+from the root, never follows or descends through a symlink, and never resolves a path through a
+name the runtime can change; an entry that vanishes mid-walk is skipped, never re-resolved.
+Residuals stated: the given root path's own components above the last are resolved by name once
+and trusted, which holds because they sit in directories only root can write (for the default
+`/workspace`, the only such name is `workspace`, an entry of `/`); and an inode hard-linked into the
+tree is re-owned under every name it has, so what that exposes is bounded by what the kernel lets
+the runtime hard-link (`fs.protected_hardlinks`), not by the walk. The walk's swap tests
+(`workspaceowner_redirect_test.go`, including a real concurrent atomic swapper) go red if it ever
+resolves a path through such a name again.
+
 ### 30.6 The recording model: what a suppressed effect becomes
 
 Recording is the *product* of shadow mode — it is what the operator evaluates. The load-bearing
