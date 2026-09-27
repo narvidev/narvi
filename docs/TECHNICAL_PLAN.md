@@ -6621,7 +6621,8 @@ only by a script client in this repository's own tests, because no off-the-shelf
 browser cookie. Row 181 replaced the cookie with a bearer token from Narvi's own OAuth authorization
 server and made the tool list depend on the token's scopes (§43.13–§43.19), which is what makes the surface
 reachable by a real client. Everything past that is later rows' own work, not this section's: 182 adds
-result/verdict tools, bounded wait, and transcript paging; 183 adds plan read/approve/reject,
+a session's live status and its transcript paging (piece (a), §43.20), then the bounded wait and the
+result/verdict tools; 183 adds plan read/approve/reject,
 prompt-while-running, stop, and delegate (create session). Repository discovery (`narvi_list_repositories`)
 is deliberately absent from 180 too: this codebase has no `GET /api/repos` route for it to sit over,
 and the one-adapter rule (§43.7) means a tool ships only once its HTTP twin exists.
@@ -7489,8 +7490,8 @@ every call is still governed by the narrowed role.
 
 ### 43.17 Scopes and discovery gating
 
-The scope vocabulary is `internal/domain/mcpscope`: `mcp:read` covers every read-only tool (all three
-of 180's), `mcp:write` will cover every state-changing tool and implies `mcp:read`. A scope is advertised
+The scope vocabulary is `internal/domain/mcpscope`: `mcp:read` covers every read-only tool (180's three
+and 182's status and transcript, §43.20), `mcp:write` will cover every state-changing tool and implies `mcp:read`. A scope is advertised
 — in `scopes_supported`, in the 401 challenge, and as acceptable at the authorization endpoint — only
 when at least one registered tool requires it, so today exactly `mcp:read` is offered and `mcp:write` is
 refused as `invalid_scope`; no contract promises a scope nothing consumes. Repository restriction is not
@@ -7584,8 +7585,8 @@ a brake or the pending-request cap (§43.14), which is logged instead.
 The row's exit criterion is proven end to end by `TestOAuth_ProductionRouter/EndToEnd_SDKClient`, on
 the production router itself — `controlplane.Build`'s own, the surface on, served at `PublicBaseURL` —
 never a copy of its routes: the official Go SDK's own client discovers the resource and the
-authorization server from a live `401`, drives consent, exchanges the code, lists exactly the three
-tools, and calls one. On the same router, `RefreshAfterAccessTokenExpires_NoSecondConsent` lets the
+authorization server from a live `401`, drives consent, exchanges the code, lists exactly the tools
+its `mcp:read` grant allows, and calls one. On the same router, `RefreshAfterAccessTokenExpires_NoSecondConsent` lets the
 access token lapse — on the server and in the client's own clock — and the SDK client refreshes and
 keeps working, twice, with no second consent, and `RevokedAuthorizationStopsOnNextCall_RFC7009` has the
 client revoke its refresh token at the advertised revocation endpoint and its very next call refused.
@@ -7614,7 +7615,8 @@ named here is `controlplane.Build`'s own; they differ in their flags and in the 
 endpoints' brakes, which one of them alone lifts: the shared router of `EndToEnd_SDKClient`,
 `RefreshAfterAccessTokenExpires_NoSecondConsent`, `RevokedAuthorizationStopsOnNextCall_User`, `_Admin`,
 `_RFC7009`, `_ClientDeleted` and `_DisabledUser`, `DisabledClientIs401NextCall`,
-`ScopelessGrant_ToolsListEmpty`, `Register_DisabledByDefault` and
+`ScopelessGrant_ToolsListEmpty`, §43.20's `SessionStatusAndTranscript_SDKClient` and
+`SessionStatusAndTranscript_ScopelessGrantSeesNeither`, `Register_DisabledByDefault` and
 `MetadataDocument_ProductionGuardRefusesLoopback`, whose many SDK clients all dial from one loopback
 address and would otherwise meet the brakes whenever they ran faster than the brakes refill. Every other
 router keeps the shipped brakes — among them the one with dynamic registration on, which serves
@@ -7734,5 +7736,8 @@ its follow-on in one transaction, over and over, while readers poll; `finished` 
 `TestStatusOutputSchema_HasNoEvents`, `TestParity_BearerEqualsCookieForEveryRole` (both tools, every
 role), `TestParity_GetSessionTranscript_CursorWalkEqualsREST`. On the production router, through the
 official SDK client: `TestOAuth_ProductionRouter/SessionStatusAndTranscript_SDKClient` (both tools
-answer what their twins answer the same user's cookie, and the status response has no transcript
-field) and `…/SessionStatusAndTranscript_ScopelessGrantSeesNeither`.
+answer their twins' bytes for the same user's cookie -- the status's every byte but `observedAt`,
+which is each snapshot's own clock, and every transcript page exactly, cursor after cursor -- and the
+status carries exactly `SessionActivity`'s keys, no transcript) and
+`…/SessionStatusAndTranscript_ScopelessGrantSeesNeither`; `TestBuild_MCPSurface_TwinParity` pins the
+same wiring for both tools.
