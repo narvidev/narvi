@@ -127,8 +127,11 @@ func nextBackoff(current, maxBackoff time.Duration) time.Duration {
 // done and the other loop must stop too. Returns the first error either
 // loop returned; the sentinel ErrShutdownRequested specifically means the
 // read loop saw a valid shutdown command, not a disconnect.
+//
+// conn is published for live sends (b.conn) only by flushBuffer, once the
+// replay has caught up -- never before it starts, or a live send would be
+// written ahead of older entries still waiting to be replayed.
 func (b *Bridge) runConnection(ctx context.Context, conn *websocket.Conn) error {
-	b.setConn(conn)
 	defer b.setConn(nil)
 	defer func() { _ = conn.CloseNow() }()
 
@@ -173,14 +176,44 @@ func (b *Bridge) sendReady(ctx context.Context, conn *websocket.Conn) error {
 }
 
 // flushBuffer replays every still-buffered entry, in original order, BEFORE
-// any other traffic resumes on this connection.
+// any other traffic resumes on this connection, then publishes conn for
+// live sends.
+//
+// Live sends are held for the whole replay: conn is not published yet, so
+// SendCritical/SendBestEffort only buffer (enqueue returns nil), and this
+// loop writes what they added after everything older. It publishes conn
+// only in the same connMu critical section in which it sees nothing left
+// to write, so no entry can land in between and be missed. Publishing
+// before the replay (as this package once did) let a live `token` frame
+// reach the control plane ahead of an older, never-delivered buffered
+// frame of the same text part; replayed after it, the older frame became
+// the part's newest stored row, which is the text every reader shows.
+//
+// The loop ends as soon as the writes catch up with the senders; a sender
+// that outpaces the connection indefinitely keeps it writing, in order,
+// exactly as live sends would have.
 func (b *Bridge) flushBuffer(ctx context.Context, conn *websocket.Conn) error {
-	for _, entry := range b.buffer.snapshot() {
-		if err := conn.Write(ctx, websocket.MessageText, entry.payload); err != nil {
-			return err
+	var nextSeq uint64
+	for {
+		b.connMu.Lock()
+		pending := b.buffer.snapshotFrom(nextSeq)
+		if len(pending) == 0 {
+			b.conn = conn
+			b.connMu.Unlock()
+			return nil
+		}
+		b.connMu.Unlock()
+
+		for _, entry := range pending {
+			if err := conn.Write(ctx, websocket.MessageText, entry.payload); err != nil {
+				return err
+			}
+			nextSeq = entry.seq + 1
+			if b.flushWriteHook != nil {
+				b.flushWriteHook()
+			}
 		}
 	}
-	return nil
 }
 
 // sendHeartbeatNow builds and sends exactly one heartbeat frame directly

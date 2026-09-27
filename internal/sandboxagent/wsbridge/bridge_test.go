@@ -1103,3 +1103,90 @@ func TestRun_StaleGenShutdownIsIgnored(t *testing.T) {
 		t.Fatalf("Run() error = %v, want nil (stale-gen shutdown must be ignored, ctx timeout should be what ends Run)", err)
 	}
 }
+
+// --- replay ordering on (re)connect ---------------------------------------
+
+// TestRun_LiveSendDuringReplayIsWrittenAfterEveryBufferedEntry pins the
+// ordering flushBuffer guarantees: an event sent while a fresh connection
+// is still replaying the buffer reaches the wire after every older
+// buffered entry, never in the middle of the replay. The live send is
+// made from inside the replay itself (right after its first write), the
+// deterministic version of a `token` frame emitted while the sandbox is
+// reconnecting. Were it written ahead of an older, never-delivered frame
+// of the same text part, the control plane would store that older frame
+// last -- and the newest stored frame is the text every reader shows.
+func TestRun_LiveSendDuringReplayIsWrittenAfterEveryBufferedEntry(t *testing.T) {
+	t.Parallel()
+
+	const buffered = 5
+	gotCh := make(chan []string, 1)
+	conn1 := func(conn *websocket.Conn) {
+		if _, err := serverRead(conn, testWait); err != nil {
+			t.Errorf("conn1: read ready: %v", err)
+			gotCh <- nil
+			return
+		}
+		var got []string
+		for i := 0; i < buffered+1; i++ {
+			data, err := serverRead(conn, testWait)
+			if err != nil {
+				t.Errorf("conn1: read frame %d: %v", i, err)
+				break
+			}
+			var env testEnvelope
+			if err := json.Unmarshal(data, &env); err != nil {
+				t.Errorf("conn1: malformed frame %d: %v", i, err)
+				break
+			}
+			got = append(got, env.MessageID)
+		}
+		gotCh <- got
+		absorbForever(conn)
+	}
+	fake := &stepServer{
+		steps:    []func(*websocket.Conn){conn1},
+		fallback: func(conn *websocket.Conn) { absorbForever(conn) },
+	}
+	server := httptest.NewServer(fake)
+	t.Cleanup(server.Close)
+
+	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", "test-agent-version", "test-image-digest", noopHandler{},
+		testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	frame := func(messageID, text string) sandboxws.Token {
+		return sandboxws.Token{Type: "token", MessageId: messageID, SessionId: testSessionID, Gen: testGen, Text: text}
+	}
+
+	// Sent before any connection exists: buffered only, the replay's backlog.
+	var want []string
+	for i := 0; i < buffered; i++ {
+		id := fmt.Sprintf("buffered-%d", i)
+		want = append(want, id)
+		if err := bridge.SendBestEffort(ctx, frame(id, strings.Repeat("x", i))); err != nil {
+			t.Fatalf("SendBestEffort(%s) error = %v", id, err)
+		}
+	}
+	want = append(want, "live")
+
+	var once sync.Once
+	wsbridge.SetFlushWriteHookForTest(bridge, func() {
+		once.Do(func() {
+			if err := bridge.SendBestEffort(ctx, frame("live", "sent mid-replay")); err != nil {
+				t.Errorf("SendBestEffort(live) error = %v", err)
+			}
+		})
+	})
+
+	wait := runInBackground(ctx, bridge)
+
+	got := waitChan(t, gotCh, testWait)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("frames on the wire = %v, want %v (every buffered entry before the live send)", got, want)
+	}
+
+	cancel()
+	if err := wait(); err != nil {
+		t.Errorf("Run() error = %v, want nil after ctx cancellation", err)
+	}
+}

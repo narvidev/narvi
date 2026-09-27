@@ -33,8 +33,7 @@ func (b *Bridge) SendCritical(ctx context.Context, msg any, ackID string) error 
 		return fmt.Errorf("wsbridge: marshal critical event %q: %w", ackID, err)
 	}
 
-	b.buffer.add(outboundEntry{ackID: ackID, critical: true, payload: payload})
-	b.bestEffortSend(ctx, payload)
+	b.bestEffortSend(ctx, b.enqueue(outboundEntry{ackID: ackID, critical: true, payload: payload}), payload)
 	return nil
 }
 
@@ -48,8 +47,7 @@ func (b *Bridge) SendBestEffort(ctx context.Context, msg any) error {
 		return fmt.Errorf("wsbridge: marshal best-effort event: %w", err)
 	}
 
-	b.buffer.add(outboundEntry{critical: false, payload: payload})
-	b.bestEffortSend(ctx, payload)
+	b.bestEffortSend(ctx, b.enqueue(outboundEntry{critical: false, payload: payload}), payload)
 	return nil
 }
 
@@ -85,14 +83,15 @@ func (b *Bridge) SendBootProgress(ctx context.Context, event services.BootProgre
 	return b.SendBestEffort(ctx, msg)
 }
 
-// bestEffortSend attempts to write payload on whatever the CURRENT
-// connection is right now, silently doing nothing if there isn't one or
-// the write fails -- the caller (SendCritical/SendBestEffort) has already
-// buffered payload, so eventual delivery is guaranteed via the next
-// (re)connect's flushBuffer regardless of whether THIS immediate attempt
-// succeeds.
-func (b *Bridge) bestEffortSend(ctx context.Context, payload []byte) {
-	conn := b.getConn()
+// bestEffortSend attempts to write payload on conn, the connection
+// enqueue returned when it buffered payload, silently doing nothing if
+// there was none or the write fails -- the caller (SendCritical/
+// SendBestEffort) has already buffered payload, so eventual delivery is
+// guaranteed via the next (re)connect's flushBuffer regardless of whether
+// THIS immediate attempt succeeds. conn is nil while a fresh connection is
+// still replaying the buffer: the replay then writes payload itself, after
+// every older entry (see enqueue).
+func (b *Bridge) bestEffortSend(ctx context.Context, conn *websocket.Conn, payload []byte) {
 	if conn == nil {
 		return
 	}

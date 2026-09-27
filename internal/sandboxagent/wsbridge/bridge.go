@@ -76,10 +76,21 @@ type Bridge struct {
 	buffer *outboundBuffer
 
 	// connMu guards conn, the CURRENT live connection (nil when
-	// disconnected) -- read by SendCritical/SendBestEffort, which may be
+	// disconnected, and also while a fresh connection is still replaying
+	// the buffer) -- read by SendCritical/SendBestEffort, which may be
 	// called concurrently with Run's own reconnect loop swapping it out.
-	connMu sync.RWMutex
+	// It also makes "buffer an entry and read conn" (enqueue) atomic with
+	// flushBuffer's "nothing left to replay, publish conn" step, which is
+	// what keeps a live send from overtaking an older buffered entry after
+	// a reconnect: see flushBuffer (run.go).
+	connMu sync.Mutex
 	conn   *websocket.Conn
+
+	// flushWriteHook, when non-nil, runs after flushBuffer writes each
+	// entry. Always nil in production; set only through
+	// SetFlushWriteHookForTest (export_test.go) so a test can send a live
+	// event at a deterministic point mid-replay.
+	flushWriteHook func()
 
 	// bootMu guards lastBootPhase, read by the heartbeat loop and written
 	// by SendBootProgress/MarkBootComplete.
@@ -144,16 +155,24 @@ func New(
 	}
 }
 
-func (b *Bridge) getConn() *websocket.Conn {
-	b.connMu.RLock()
-	defer b.connMu.RUnlock()
-	return b.conn
-}
-
 func (b *Bridge) setConn(c *websocket.Conn) {
 	b.connMu.Lock()
 	defer b.connMu.Unlock()
 	b.conn = c
+}
+
+// enqueue buffers entry and returns the connection to write it on right
+// now, or nil when there is none -- including while a fresh connection is
+// still replaying the buffer, in which case flushBuffer itself writes the
+// entry, after every older one. Buffering and reading conn happen under
+// the one connMu critical section flushBuffer publishes conn in, so an
+// entry is always either picked up by the replay or written live after
+// it, never live in the middle of it.
+func (b *Bridge) enqueue(entry outboundEntry) *websocket.Conn {
+	b.connMu.Lock()
+	defer b.connMu.Unlock()
+	b.buffer.add(entry)
+	return b.conn
 }
 
 func (b *Bridge) getLastBootPhase() *string {
