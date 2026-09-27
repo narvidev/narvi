@@ -3806,21 +3806,36 @@ writer that swaps any directory for a symlink at any instant. A path-based walk 
 `filepath.WalkDir` with `Lchown` resolves every parent component again at each call (`Lchown`
 declines to follow only the last one), and `os.ReadDir` follows a directory swapped for a symlink
 after it was listed — reproduced with an atomic swapper, root listed and re-owned a directory
-outside the workspace, where the credential cache is a plausible target. **The guarantee: the
-re-own walk is fd-relative.** The root is opened `O_DIRECTORY|O_NOFOLLOW`; each directory is
-listed from its own open fd; the walk descends only through
-`openat(dirfd, name, O_DIRECTORY|O_NOFOLLOW)` and re-owns each directory through the fd that
-opened it; every other entry is re-owned with `fchownat(dirfd, name, AT_SYMLINK_NOFOLLOW)`. It
-therefore re-owns exactly the inodes reachable as entries of directories it opened by descent
-from the root, never follows or descends through a symlink, and never resolves a path through a
-name the runtime can change; an entry that vanishes mid-walk is skipped, never re-resolved.
-Residuals stated: the given root path's own components above the last are resolved by name once
-and trusted, which holds because they sit in directories only root can write (for the default
-`/workspace`, the only such name is `workspace`, an entry of `/`); and an inode hard-linked into the
-tree is re-owned under every name it has, so what that exposes is bounded by what the kernel lets
-the runtime hard-link (`fs.protected_hardlinks`), not by the walk. The walk's swap tests
-(`workspaceowner_redirect_test.go`, including a real concurrent atomic swapper) go red if it ever
-resolves a path through such a name again.
+outside the workspace, where the credential cache is a plausible target. **The guarantee: the re-own
+walk is fd-relative.** The root is opened `O_DIRECTORY|O_NOFOLLOW`; each directory is listed from
+its own open fd, and each entry in it is looked at with `fstatat(dirfd, name, AT_SYMLINK_NOFOLLOW)`;
+the walk descends only through `openat(dirfd, name, O_DIRECTORY|O_NOFOLLOW)` and re-owns each
+directory through the fd that opened it; every other entry is re-owned with
+`fchownat(dirfd, name, AT_SYMLINK_NOFOLLOW)`. It therefore re-owns exactly the inodes reachable as
+entries of directories it opened by descent from the root, never follows or descends through a
+symlink, and never lists, looks at, opens or re-owns anything through a path the runtime can change;
+an entry that vanishes mid-walk is skipped, never re-resolved. The root is the exception to
+skipping: its own name is looked up once more when the walk is done, acting on nothing, and a root
+removed, renamed away or replaced while the walk ran fails it, and boot, because the tree the caller
+named is no longer there. Residuals stated. The given root path's own components above the last are
+resolved by name once and trusted, which holds because they sit in directories only root can write
+(for the default `/workspace`, the only such name is `workspace`, an entry of `/`). And hard links:
+an inode hard-linked into the tree is re-owned under every name it has, so what that exposes depends
+on what the kernel lets the runtime hard-link, which `fs.protected_hardlinks` decides: a
+kernel-global setting that Narvi does not set, and that an image or pod spec cannot. The walk reads
+it when it starts and logs it. At `1` (the runtime can link only a file it owns or can already read
+and write) a hard-linked entry is re-owned like any other, as a package store linked into
+`node_modules` by a root-run setup hook needs. At any other value, or when it cannot be read, the
+walk leaves every non-directory entry with more than one link to its owner, and logs once, at WARN,
+how many it left that the runtime does not already own, by names relative to the root. That narrows
+the residual and does not close it: the link count is read by name through the held directory fd and
+the entry then re-owned the same way, two calls apart, so on a kernel that does not read `1` a
+writer can still rename a hard link over an entry between them. The walk's swap tests
+(`workspaceowner_redirect_test.go`, including a real concurrent atomic swapper) replace a directory,
+or its parent, with a symlink before a descent, after a directory is opened and before it is listed,
+before an entry is looked at, and before an entry is re-owned, and the outside tree of the
+list-and-look cases differs from the inside one in names and types; they go red if any listing,
+look, descent or re-own goes by a path instead of through the fd the walk holds.
 
 ### 30.6 The recording model: what a suppressed effect becomes
 
