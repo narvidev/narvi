@@ -186,6 +186,171 @@ func TestReleaseManifestCheck_ClaimFinishPurge(t *testing.T) {
 	}
 }
 
+// claimObservation is what claimObserver saw at one edge of one statement
+// the claim sent: the statement, the connection it went out on and whether
+// that connection was inside a transaction, and whether a snapshot taken
+// through ANOTHER connection at that instant still held the claimed check,
+// waiting or running.
+type claimObservation struct {
+	edge    string // "start" or "end"
+	sql     string
+	conn    *pgx.Conn
+	inTx    bool
+	visible bool
+}
+
+type claimObserverSQLKey struct{}
+
+// claimObserver is a pgx.QueryTracer on the pool ClaimDue runs on. At the
+// start and at the end of every statement that pool sends while it is
+// armed -- begin, the claim's delete, the running row's insert, commit --
+// it reads the session's status facts through reader, a separate pool, so
+// another connection and another transaction, before the statement goes
+// out or after its result is in.
+type claimObserver struct {
+	reader    *narvipg.SessionStore
+	sessionID pgtype.UUID
+
+	mu    sync.Mutex
+	armed bool
+	seen  []claimObservation
+	errs  []error
+}
+
+func (o *claimObserver) observe(ctx context.Context, edge string, conn *pgx.Conn, sql string) {
+	o.mu.Lock()
+	armed := o.armed
+	o.mu.Unlock()
+	if !armed {
+		return
+	}
+	facts, err := o.reader.ActivityFacts(context.WithoutCancel(ctx), o.sessionID, sessionactor.ReviewAutoRetriggerBudget)
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if err != nil {
+		o.errs = append(o.errs, fmt.Errorf("read facts at the %s of %q: %w", edge, sql, err))
+		return
+	}
+	o.seen = append(o.seen, claimObservation{
+		edge: edge, sql: sql, conn: conn, inTx: conn.PgConn().TxStatus() == 'T',
+		visible: facts.ReleaseCheckPendingSince.Valid || facts.ReleaseCheckClaimedAt.Valid,
+	})
+}
+
+func (o *claimObserver) TraceQueryStart(ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	o.observe(ctx, "start", conn, data.SQL)
+	return context.WithValue(ctx, claimObserverSQLKey{}, data.SQL)
+}
+
+func (o *claimObserver) TraceQueryEnd(ctx context.Context, conn *pgx.Conn, _ pgx.TraceQueryEndData) {
+	sql, _ := ctx.Value(claimObserverSQLKey{}).(string)
+	o.observe(ctx, "end", conn, sql)
+}
+
+func (o *claimObserver) arm(on bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.armed = on
+}
+
+// TestReleaseManifestCheck_ClaimRecordsTheRunningCheckInTheSameTransaction
+// is review round 5's P8 pin, deterministic where the race tests are
+// probabilistic: the real ClaimDue deletes the pending row and inserts the
+// running row in ONE transaction, so no snapshot ever lacks both and a
+// session whose turns have all ended never reads finished while its check
+// is being claimed. ClaimDue runs on a pool traced by claimObserver, which
+// reads the status facts from a second connection at both edges of every
+// statement the claim sends -- between the delete and the insert included
+// -- and each read must still hold the check. It also asserts the two
+// writes go out on one connection, each inside a transaction, with no
+// commit between them. Splitting them into two transactions fails it on
+// every run: the read after the first commit holds neither row.
+func TestReleaseManifestCheck_ClaimRecordsTheRunningCheckInTheSameTransaction(t *testing.T) {
+	ctx := context.Background()
+	shared, connStr := IntegrationTestPoolAndConnStr(t)
+	sessionID := createTestSession(ctx, t, shared)
+	emptyReleaseManifestQueue(ctx, t, shared)
+	pending, err := narvipg.NewReleaseManifestPendingStore(shared).Create(ctx, sqlcgen.CreateReleaseManifestPendingParams{SessionID: sessionID, Owner: "acme", Repo: "widgets", PrNumber: 1, BaseRef: "main", HeadRef: "release/x"})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	observer := &claimObserver{reader: narvipg.NewSessionStore(shared), sessionID: sessionID}
+	cfg, err := pgxpool.ParseConfig(connStr)
+	if err != nil {
+		t.Fatalf("parse connection string: %v", err)
+	}
+	cfg.ConnConfig.Tracer = observer
+	traced, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("open traced pool: %v", err)
+	}
+	t.Cleanup(traced.Close)
+	if err := traced.Ping(ctx); err != nil {
+		t.Fatalf("ping: %v", err)
+	}
+
+	observer.arm(true)
+	claimed, err := narvipg.NewReleaseManifestPendingStore(traced).ClaimDue(ctx, 1)
+	observer.arm(false)
+	if err != nil || len(claimed) != 1 || claimed[0].ID != pending.ID {
+		t.Fatalf("ClaimDue(1) = %+v, %v; want the one waiting check", claimed, err)
+	}
+	if len(observer.errs) > 0 {
+		t.Fatalf("reading the facts during the claim: %v", observer.errs)
+	}
+
+	claimAt, startAt := -1, -1
+	for i, o := range observer.seen {
+		if !o.visible {
+			t.Errorf("at the %s of %q: a snapshot from another connection holds neither the waiting nor the running check -- the session would read finished while its check is claimed", o.edge, firstLine(o.sql))
+		}
+		if o.edge != "start" {
+			continue
+		}
+		switch {
+		case strings.Contains(o.sql, "name: ClaimDueReleaseManifestPending"):
+			claimAt = i
+		case strings.Contains(o.sql, "name: StartReleaseManifestCheck"):
+			startAt = i
+		}
+	}
+	if claimAt < 0 || startAt < 0 || startAt < claimAt {
+		t.Fatalf("statements seen %q: want the claim's delete, then the running row's insert", sentStatements(observer.seen))
+	}
+	claim, start := observer.seen[claimAt], observer.seen[startAt]
+	if claim.conn != start.conn || !claim.inTx || !start.inTx {
+		t.Fatalf("the delete went out in a transaction %v and the insert %v, on the same connection %v; want both in one transaction", claim.inTx, start.inTx, claim.conn == start.conn)
+	}
+	for _, o := range observer.seen[claimAt:startAt] {
+		if s := strings.ToLower(strings.TrimSpace(o.sql)); s == "commit" || s == "rollback" {
+			t.Fatalf("statements seen %q: the transaction ended between the delete and the insert", sentStatements(observer.seen))
+		}
+	}
+
+	if pendingExists(ctx, t, shared, pending.ID) {
+		t.Fatal("the claimed row is still pending")
+	}
+	if _, _, found := runningCheck(ctx, t, shared, pending.ID); !found {
+		t.Fatal("the claimed check is not recorded as running")
+	}
+}
+
+func firstLine(sql string) string {
+	line, _, _ := strings.Cut(strings.TrimSpace(sql), "\n")
+	return line
+}
+
+func sentStatements(seen []claimObservation) []string {
+	var out []string
+	for _, o := range seen {
+		if o.edge == "start" {
+			out = append(out, firstLine(o.sql))
+		}
+	}
+	return out
+}
+
 // TestReleaseManifestCheck_PreviousClaimNeverTakesARunningCheck is review
 // round 4's P2/P4 case: during a rolling deploy, pods still on the previous
 // binary claim with previousClaimReleaseManifestPending while new pods

@@ -185,7 +185,7 @@ func TestTimerCountsAsScheduledWork_Table(t *testing.T) {
 // could slip in, for the two arming forms the code uses: in every non-test
 // Go file under internal/, controlplane/ and cmd/ (sqlcgen excluded), the
 // name argument of every armTimer call, and the keyed Name of every
-// UpsertSessionTimerParams composite literal (RecordPullRequestPush's), must
+// UpsertSessionTimerParams composite literal (the synchronize webhook's), must
 // be a classified Timer* constant. It cannot see a params value filled by
 // field assignment, the params type used through an alias, a positional
 // literal (go vet's composites check flags that one), or SQL that writes

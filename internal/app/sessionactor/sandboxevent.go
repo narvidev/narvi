@@ -483,26 +483,14 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 			// status must read finished now, not once MCPStatusDeliveryWindow
 			// runs out. In this SAME transact as the event itself. Gated on
 			// inserted: a wire-level redelivery of an old push_error must
-			// never clear a later push's stamp.
+			// never clear a later push's stamp. A push that reached the
+			// remote before its report failed has still moved the branch:
+			// for a pull request's review session, the code host's
+			// synchronize for it can then arm §24's re-review after this
+			// reads finished -- §43.20's stated limit.
 			if inserted {
 				if err := a.stores.sandbox.WithTx(tx).EndPRDelivery(ctx, a.sessionID); err != nil {
 					return fmt.Errorf("sessionactor: clear push/PR delivery stamp on push_error: %w", err)
-				}
-			}
-		case "push_complete":
-			// Technical plan §43.20: when this session backs a pull request
-			// and the push moved that pull request's own head, GitHub will
-			// echo it back as pull_request/synchronize, which arms an
-			// automatic re-review of this same session. Record that work
-			// now, in this SAME transact as the event -- before
-			// createPRBestEffort (below, after commit) clears the delivery
-			// stamp -- with the very write the webhook will repeat, so no
-			// snapshot reads the session settled in between. Gated on
-			// inserted, like createPRBestEffort: a wire-level redelivery of
-			// this push_complete records nothing twice.
-			if inserted {
-				if err := a.recordOwnPullRequestPush(ctx, tx, cmd.Raw, now); err != nil {
-					return err
 				}
 			}
 		case "git_sync":

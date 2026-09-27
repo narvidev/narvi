@@ -11127,20 +11127,19 @@ type SessionActivity struct {
 	// stops counting then); else 'scheduled' when the server holds work that can
 	// create a turn on this session with no new input and has neither created it nor
 	// declined yet -- an automatic re-review armed by a push to the session's pull
-	// request, the session's own push to that pull request's head included (a
-	// debounce, 2 minutes as shipped, counted only while the pull request's
-	// repository has opted in and its automatic re-review budget is not spent: the
-	// two conditions under which it can create a turn), or a release pull request's
-	// manifest check still to come or still running (it can add a composition review
-	// turn); else 'awaiting_approval' when a person must act (a plan awaiting
-	// approval, a workflow step awaiting a decision, or a custom workflow's run
-	// escalated for review until a turn is created on the session after it escalated
-	// -- see awaiting.kind); else 'idle' when the session has no turn at all; else
-	// 'finished' (at least one turn, every one terminal, nothing being delivered,
-	// nothing scheduled). A queued or running turn is never reported as idle or
-	// finished. 'delivering' ends once the pull request is recorded, or once the
-	// delivery ends without one: the push failed or could not be sent, the pull
-	// request could not be opened (the creator may no longer open one, or their
+	// request (a debounce, 2 minutes as shipped, counted only while the pull
+	// request's repository has opted in and its automatic re-review budget is not
+	// spent: the two conditions under which it can create a turn), or a release pull
+	// request's manifest check still to come or still running (it can add a
+	// composition review turn); else 'awaiting_approval' when a person must act (a
+	// plan awaiting approval, a workflow step awaiting a decision, or a custom
+	// workflow's run escalated for review until a turn is created on the session
+	// after it escalated -- see awaiting.kind); else 'idle' when the session has no
+	// turn at all; else 'finished' (at least one turn, every one terminal, nothing
+	// being delivered, nothing scheduled). A queued or running turn is never reported
+	// as idle or finished. 'delivering' ends once the pull request is recorded, or
+	// once the delivery ends without one: the push failed or could not be sent, the
+	// pull request could not be opened (the creator may no longer open one, or their
 	// GitHub token is no longer usable, or GitHub refused it), or the window passed.
 	// A pull request that is opened is recorded before activity leaves 'delivering',
 	// except when two pushes overlap: a sandbox records one delivery at a time, so if
@@ -11148,7 +11147,13 @@ type SessionActivity struct {
 	// earlier push's pull request ends the later delivery, and the later pull request
 	// can appear after 'finished'. 'scheduled' ends when its work comes due and
 	// either creates its turn ('queued' follows) or declines (the session reads
-	// whatever else it holds).
+	// whatever else it holds). One stated limit: when this session is a pull
+	// request's review session and its own push moves that pull request's head (a
+	// same-repository pull request whose head branch is the session's), the automatic
+	// re-review that push causes is armed only when the code host's notification of
+	// the push arrives -- until then activity can read 'finished', and once it lands
+	// 'scheduled', then 'queued' or 'running'. The same holds after a push that
+	// reached the remote but reported a failure.
 	Activity SessionActivityActivity `json:"activity" yaml:"activity" mapstructure:"activity"`
 
 	// Archived corresponds to the JSON schema field "archived".
@@ -11184,7 +11189,10 @@ type SessionActivity struct {
 	// true exactly when activity is idle, awaiting_approval or finished: nothing
 	// progresses server-side until a person acts or sends new input. Never true while
 	// a turn is queued or running, while a completed turn's push and pull request are
-	// being delivered, or while work that can create a turn is scheduled.
+	// being delivered, or while work that can create a turn is scheduled. One stated
+	// limit (see activity): after a pull request review session's own push to that
+	// pull request's head, settled can be true before the code host's notification of
+	// that push arms an automatic re-review.
 	Settled bool `json:"settled" yaml:"settled" mapstructure:"settled"`
 
 	// How long to wait before reading this status again, in whole seconds (rounded

@@ -121,25 +121,6 @@ func (s *GitHubPRSessionStore) UpsertPendingRetriggerHeadSHA(ctx context.Context
 	})
 }
 
-// SessionHasTurnForReviewHead reports whether a turn of sessionID was
-// already created against headSHA -- see SessionHasTurnForReviewHead's own
-// generated doc comment (technical plan §43.20, §24).
-func (s *GitHubPRSessionStore) SessionHasTurnForReviewHead(ctx context.Context, sessionID pgtype.UUID, headSHA string) (bool, error) {
-	return s.q.SessionHasTurnForReviewHead(ctx, sqlcgen.SessionHasTurnForReviewHeadParams{SessionID: sessionID, HeadSha: headSHA})
-}
-
-// IsKnownPullRequestHead reports whether headSHA is a head the server
-// already knows repoFullName#prNumber had -- see IsKnownPullRequestHead's
-// own generated doc comment (technical plan §43.20).
-func (s *GitHubPRSessionStore) IsKnownPullRequestHead(ctx context.Context, repoFullName string, prNumber int32, sessionID pgtype.UUID, headSHA string) (bool, error) {
-	return s.q.IsKnownPullRequestHead(ctx, sqlcgen.IsKnownPullRequestHeadParams{
-		RepoFullName: repoFullName,
-		PrNumber:     prNumber,
-		HeadSha:      headSHA,
-		SessionID:    sessionID,
-	})
-}
-
 // ClearPendingRetriggerHeadSHA is the review_retrigger_debounce timer's
 // own guarded clear (§24.3 steps 3-4) -- expectedHeadSHA must still equal
 // the column's CURRENT value for the clear to apply; pgx.ErrNoRows

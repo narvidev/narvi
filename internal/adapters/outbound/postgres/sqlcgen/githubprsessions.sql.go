@@ -261,51 +261,6 @@ func (q *Queries) IncrementGitHubPRSessionMentionCount(ctx context.Context, arg 
 	return i, err
 }
 
-const isKnownPullRequestHead = `-- name: IsKnownPullRequestHead :one
-SELECT (
-    EXISTS (
-        SELECT 1 FROM github_pr_sessions gps
-        WHERE gps.repo_full_name = $1 AND gps.pr_number = $2
-          AND gps.pending_retrigger_head_sha = $3::text
-    )
-    OR EXISTS (
-        SELECT 1 FROM review_verdicts rv
-        WHERE rv.repo_full_name = $1 AND rv.pr_number = $2
-          AND rv.head_sha = $3::text
-    )
-    OR EXISTS (
-        SELECT 1 FROM turns t
-        WHERE t.session_id = $4 AND t.review_head_sha = $3::text
-    )
-)::boolean AS known
-`
-
-type IsKnownPullRequestHeadParams struct {
-	RepoFullName string      `json:"repo_full_name"`
-	PrNumber     int32       `json:"pr_number"`
-	HeadSha      string      `json:"head_sha"`
-	SessionID    pgtype.UUID `json:"session_id"`
-}
-
-// Technical plan §43.20: whether head_sha is a head the server already
-// knows this pull request had -- the pending re-review head, a posted
-// verdict's head, or a head a turn of its review session was created
-// against. sessionactor reads it when the session's own push completes:
-// git push reports the branch's head whether or not the push moved it, so
-// a known head means the push created no new commit and no
-// pull_request/synchronize will follow.
-func (q *Queries) IsKnownPullRequestHead(ctx context.Context, arg IsKnownPullRequestHeadParams) (bool, error) {
-	row := q.db.QueryRow(ctx, isKnownPullRequestHead,
-		arg.RepoFullName,
-		arg.PrNumber,
-		arg.HeadSha,
-		arg.SessionID,
-	)
-	var known bool
-	err := row.Scan(&known)
-	return known, err
-}
-
 const lockGitHubPRSessionForUpdate = `-- name: LockGitHubPRSessionForUpdate :one
 SELECT session_id FROM github_pr_sessions
 WHERE repo_full_name = $1 AND pr_number = $2
@@ -454,33 +409,6 @@ func (q *Queries) RepoKnownToDeployment(ctx context.Context, repoFullName string
 	var repo_known bool
 	err := row.Scan(&repo_known)
 	return repo_known, err
-}
-
-const sessionHasTurnForReviewHead = `-- name: SessionHasTurnForReviewHead :one
-SELECT EXISTS (
-    SELECT 1 FROM turns
-    WHERE session_id = $1 AND review_head_sha = $2::text
-)::boolean AS has_turn
-`
-
-type SessionHasTurnForReviewHeadParams struct {
-	SessionID pgtype.UUID `json:"session_id"`
-	HeadSha   string      `json:"head_sha"`
-}
-
-// Technical plan §43.20 and §24: whether a turn of session_id was already
-// created against head_sha (turns.review_head_sha, the pull request's
-// head resolved when that turn was created) -- a review of that head is
-// then already queued, running or done on the session.
-// sessionactor.RecordPullRequestPush reads it so a push it is told about
-// after that turn exists -- the synchronize webhook echoing a push the
-// session made itself, arriving after the re-review it pre-armed has
-// already inserted its turn -- never arms a second review of the same head.
-func (q *Queries) SessionHasTurnForReviewHead(ctx context.Context, arg SessionHasTurnForReviewHeadParams) (bool, error) {
-	row := q.db.QueryRow(ctx, sessionHasTurnForReviewHead, arg.SessionID, arg.HeadSha)
-	var has_turn bool
-	err := row.Scan(&has_turn)
-	return has_turn, err
 }
 
 const setGitHubPRSessionID = `-- name: SetGitHubPRSessionID :exec

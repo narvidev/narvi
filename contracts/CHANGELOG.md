@@ -34,12 +34,17 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   it ends, except when two pushes overlap, and it can end with none --
   `scheduled` -- the server holds work that may create a turn with no new
   input and has neither created it nor declined yet: an automatic
-  re-review's debounce, the session's own push to its pull request's head
-  included, counted only while the pull request's repository has opted in
-  and its automatic re-review budget is not spent; a release manifest
-  check waiting or running --
+  re-review's debounce, counted only while the pull request's repository
+  has opted in and its automatic re-review budget is not spent; a release
+  manifest check waiting or running --
   `awaiting_approval`, `finished`), `settled` (never while queued,
-  running, delivering or scheduled), `pendingTurns`, `inFlightTurn`,
+  running, delivering or scheduled; one stated limit: when a pull
+  request's review session pushes to that pull request's head, the
+  automatic re-review the push causes is armed only when the code host's
+  notification of it arrives, so the session can read `finished` and
+  settled until then, then `scheduled` and `queued` -- the same after a
+  push that reached the remote but reported a failure), `pendingTurns`,
+  `inFlightTurn`,
   `awaiting` (the open human gate: a plan, a workflow step, or a custom
   workflow's escalated run until a turn is created on the session after
   it escalated -- never a built-in workflow's; a turn created before the
