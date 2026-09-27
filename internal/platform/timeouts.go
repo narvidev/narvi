@@ -3385,22 +3385,27 @@ type Timeouts struct {
 	// seconds.
 	SessionResultLiveReadBudget time.Duration
 
-	// SessionResultDelayUnsettled is the suggestion while the session is
-	// not settled (queued, running, delivering, scheduled): the result can
-	// still change, and the status -- or the bounded wait -- is the cheap
-	// way to learn when it has. 30 seconds.
+	// SessionResultDelayUnsettled is the suggestion while the result can
+	// still change with no new input: the session is not settled (queued,
+	// running, delivering, scheduled) -- its status, or the bounded wait,
+	// is then the cheap way to learn when it has -- or the review session
+	// behind the review of a pull request it opened is not, so that review
+	// can start, end or run again on its own (an attempt queued or running,
+	// the review reading in_progress; a re-review scheduled). 30 seconds.
 	SessionResultDelayUnsettled time.Duration
 
-	// SessionResultDelayLiveRead is the suggestion once the session is
-	// settled and at least one verdict's freshness was read live: it
-	// changes only when a pull request or its base moves, and every read of
-	// the result asks the code host again, on the deployment's shared bot
-	// token. 60 seconds.
+	// SessionResultDelayLiveRead is the suggestion once nothing in the
+	// result can change on its own but at least one verdict's freshness
+	// was read live: it changes only when a pull request or its base
+	// moves, and every read of the result asks the code host again, on the
+	// deployment's shared bot token. 60 seconds.
 	SessionResultDelayLiveRead time.Duration
 
-	// SessionResultDelaySettled is the suggestion once the session is
-	// settled and nothing was read live: nothing in it changes without new
-	// input. 300 seconds.
+	// SessionResultDelaySettled is the suggestion once nothing in the
+	// result can change on its own and nothing was read live: the session
+	// and every review session behind a review it reports are settled, so
+	// the result changes only with new input -- a prompt, a review
+	// requested, a push. 300 seconds.
 	SessionResultDelaySettled time.Duration
 
 	// SessionResultDelayFloor is the least delay a result ever suggests.
@@ -3713,9 +3718,9 @@ func DefaultTimeouts() Timeouts {
 		MCPWaitMaxConcurrentPerReplica: 32,               // §43.20 (182b, D4); waits one replica runs at once
 
 		SessionResultLiveReadBudget: 20 * time.Second,  // §43.20 (182c); a result's live reads, all together, under MCPWaitMaxDuration
-		SessionResultDelayUnsettled: 30 * time.Second,  // §43.20 (182c); the session can still change: watch the status instead
+		SessionResultDelayUnsettled: 30 * time.Second,  // §43.20 (182c); the session, or a review it reports, can still change on its own
 		SessionResultDelayLiveRead:  60 * time.Second,  // §43.20 (182c); settled, freshness read live on the shared bot token
-		SessionResultDelaySettled:   300 * time.Second, // §43.20 (182c); settled, nothing read live
+		SessionResultDelaySettled:   300 * time.Second, // §43.20 (182c); nothing changes on its own, nothing read live
 		SessionResultDelayFloor:     30 * time.Second,  // §43.20 (182c); least suggestion, above the live-read budget
 		SessionResultDelayCeiling:   300 * time.Second, // §43.20 (182c); most suggestion
 	}

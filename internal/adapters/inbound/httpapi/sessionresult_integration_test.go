@@ -32,9 +32,11 @@ import (
 
 	"github.com/narvidev/narvi/contracts"
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
+	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/reviewfreshness"
+	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/app/shadowscm"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/review"
@@ -1241,10 +1243,14 @@ func TestResult_LiveReadBudgetBoundsTheCall(t *testing.T) {
 }
 
 // TestResult_SuggestedDelay pins suggestedDelaySeconds on the wire: the
-// unsettled value while the session can still change, the read-live value
-// once settled with a verdict's freshness read live, the settled value when
-// nothing was -- including when no code host is configured, so nothing
-// could be.
+// unsettled value while the result can still change on its own -- the
+// session is not settled, or the review session behind the review of a
+// pull request it opened is not (round 2's finding P5: a review running,
+// queued, or re-run on a schedule changes the result with no new input,
+// so the 300 seconds "nothing changes" is wrong there) -- the read-live
+// value once nothing can and a verdict's freshness was read live, and the
+// settled value when nothing was: including when no code host is
+// configured, so nothing could be.
 func TestResult_SuggestedDelay(t *testing.T) {
 	ctx := context.Background()
 	to := platform.DefaultTimeouts()
@@ -1262,23 +1268,74 @@ func TestResult_SuggestedDelay(t *testing.T) {
 
 	host := newResultCodeHost()
 	rig, user, cookie := newResultRig(t, host)
-	queued := createSessionForUser(ctx, t, rig, user.ID, nil)
-	createTurn(ctx, t, rig.turns, queued.ID, false)
-	finished := createSessionForUser(ctx, t, rig, user.ID, nil)
-	endedRun(ctx, t, rig, finished.ID)
-	live := assessedAndCurrent(t, rig, user, host)
+	timers := narvipg.NewTimerStore(rig.pool)
 
-	for _, tc := range []struct {
-		name string
-		sess sqlcgen.Session
-		want int
+	// opened is a finished session that opened acme/<repo>#1, and that pull
+	// request's own review session -- another session, whose activity is
+	// the producer's result's only way to change on its own.
+	opened := func(t *testing.T, repo string) (producer, reviewer sqlcgen.Session) {
+		t.Helper()
+		producer = sessionWithRepos(ctx, t, rig, user.ID, map[string]string{repo: "https://github.com/acme/" + repo + ".git"})
+		endedRun(ctx, t, rig, producer.ID)
+		prArtifact(ctx, t, rig, producer.ID, repo, 1, "https://github.com/acme/"+repo+"/pull/1")
+		return producer, reviewSession(ctx, t, rig, user.ID, "acme/"+repo, 1)
+	}
+
+	tests := []struct {
+		name  string
+		setup func(t *testing.T) sqlcgen.Session
+		state restdtos.SessionOutcomeReviewState // the opened pull request's, when there is one
+		want  int
 	}{
-		{"queued: unsettled", queued, seconds(to.SessionResultDelayUnsettled)},
-		{"finished, nothing to read live: settled", finished, seconds(to.SessionResultDelaySettled)},
-		{"finished, a verdict read live: read-live", live, seconds(to.SessionResultDelayLiveRead)},
-	} {
+		{"queued: unsettled", func(t *testing.T) sqlcgen.Session {
+			queued := createSessionForUser(ctx, t, rig, user.ID, nil)
+			createTurn(ctx, t, rig.turns, queued.ID, false)
+			return queued
+		}, "", seconds(to.SessionResultDelayUnsettled)},
+		{"finished, nothing to read live: settled", func(t *testing.T) sqlcgen.Session {
+			finished := createSessionForUser(ctx, t, rig, user.ID, nil)
+			endedRun(ctx, t, rig, finished.ID)
+			return finished
+		}, "", seconds(to.SessionResultDelaySettled)},
+		{"finished, a verdict read live: read-live", func(t *testing.T) sqlcgen.Session {
+			return assessedAndCurrent(t, rig, user, host)
+		}, "", seconds(to.SessionResultDelayLiveRead)},
+		{"finished, the review of a pull request it opened is running: unsettled", func(t *testing.T) sqlcgen.Session {
+			producer, reviewer := opened(t, "delays-running")
+			reviewAttempt(ctx, t, rig, reviewer.ID, turn.TriggerDispatch, turn.TriggerStartProcessing)
+			return producer
+		}, restdtos.SessionOutcomeReviewStateInProgress, seconds(to.SessionResultDelayUnsettled)},
+		{"finished, the review of a pull request it opened is queued: unsettled", func(t *testing.T) sqlcgen.Session {
+			producer, reviewer := opened(t, "delays-queued")
+			reviewAttempt(ctx, t, rig, reviewer.ID)
+			return producer
+		}, restdtos.SessionOutcomeReviewStateInProgress, seconds(to.SessionResultDelayUnsettled)},
+		{"finished, a re-review of a pull request it opened is scheduled: unsettled", func(t *testing.T) sqlcgen.Session {
+			producer, reviewer := opened(t, "delays-scheduled")
+			reviewAttempt(ctx, t, rig, reviewer.ID, endedCompleted...)
+			// The repository opted in, its budget unspent, and a push's
+			// debounce armed: the review runs again with no new input.
+			if _, err := rig.pool.Exec(ctx, `INSERT INTO repo_settings (repo_full_name, auto_retrigger_review_enabled) VALUES ('acme/delays-scheduled', true)`); err != nil {
+				t.Fatalf("opt the repository in: %v", err)
+			}
+			if _, err := timers.Upsert(ctx, sqlcgen.UpsertSessionTimerParams{SessionID: reviewer.ID, Name: sessionactor.TimerReviewRetriggerDebounce, FiresAt: pgtype.Timestamptz{Time: time.Now().Add(2 * time.Minute), Valid: true}}); err != nil {
+				t.Fatalf("arm the re-review: %v", err)
+			}
+			return producer
+		}, restdtos.SessionOutcomeReviewStateNotAssessed, seconds(to.SessionResultDelayUnsettled)},
+		{"finished, the review of a pull request it opened ended, nothing to read live: settled", func(t *testing.T) sqlcgen.Session {
+			producer, reviewer := opened(t, "delays-ended")
+			reviewAttempt(ctx, t, rig, reviewer.ID, endedCompleted...)
+			return producer
+		}, restdtos.SessionOutcomeReviewStateNotAssessed, seconds(to.SessionResultDelaySettled)},
+	}
+	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, raw := getResult(t, rig, tc.sess.ID, cookie)
+			sess := tc.setup(t)
+			got, raw := getResult(t, rig, sess.ID, cookie)
+			if tc.state != "" && (len(got.PullRequests) != 1 || got.PullRequests[0].Review.State != tc.state || got.Activity != restdtos.SessionOutcomeActivityFinished) {
+				t.Fatalf("activity %q pullRequests %+v, want finished with one opened pull request whose review is %q -- this row proves nothing otherwise", got.Activity, got.PullRequests, tc.state)
+			}
 			if got.SuggestedDelaySeconds != tc.want {
 				t.Fatalf("suggestedDelaySeconds = %d, want %d", got.SuggestedDelaySeconds, tc.want)
 			}
@@ -1287,6 +1344,26 @@ func TestResult_SuggestedDelay(t *testing.T) {
 			}
 		})
 	}
+
+	// The finding's own sequence: nothing new reaches the producing
+	// session, yet its result changes when the review ends -- short while
+	// it runs, the live-read value once its verdict is read live.
+	t.Run("the review ends with no new input: short while it runs, then read-live", func(t *testing.T) {
+		producer, reviewer := opened(t, "delays-sequence")
+		attempt := reviewAttempt(ctx, t, rig, reviewer.ID, turn.TriggerDispatch, turn.TriggerStartProcessing)
+		got, _ := getResult(t, rig, producer.ID, cookie)
+		if got.PullRequests[0].Review.State != restdtos.SessionOutcomeReviewStateInProgress || got.SuggestedDelaySeconds != seconds(to.SessionResultDelayUnsettled) {
+			t.Fatalf("while the review runs: %q, %ds, want in_progress, %ds", got.PullRequests[0].Review.State, got.SuggestedDelaySeconds, seconds(to.SessionResultDelayUnsettled))
+		}
+		transitionTurn(ctx, t, rig.turns, attempt.ID, turn.StateProcessing, turn.TriggerComplete)
+		verdictAt(ctx, t, rig, reviewer.ID, "acme/delays-sequence", 1, attempt.ID, "h1", currentContext())
+		host.open("acme", "delays-sequence", 1, "h1", "main")
+		host.branch("acme", "delays-sequence", "main", "b1")
+		got, _ = getResult(t, rig, producer.ID, cookie)
+		if r := got.PullRequests[0].Review; r.State != restdtos.SessionOutcomeReviewStateAssessed || r.Freshness.State != restdtos.SessionOutcomeReviewFreshnessStateCurrent || got.SuggestedDelaySeconds != seconds(to.SessionResultDelayLiveRead) {
+			t.Fatalf("once the review ended: %q/%q, %ds, want assessed/current, %ds", r.State, r.Freshness.State, got.SuggestedDelaySeconds, seconds(to.SessionResultDelayLiveRead))
+		}
+	})
 
 	t.Run("no code host: nothing is read live, settled", func(t *testing.T) {
 		bare, member, memberCookie := newResultRig(t, nil)

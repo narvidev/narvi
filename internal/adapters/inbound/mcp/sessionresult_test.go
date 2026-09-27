@@ -97,8 +97,10 @@ func TestToolCall_GetSessionResult_ReachesTheResultTwin(t *testing.T) {
 // what a client most needs not to misread: current only with the code
 // host's confirmation in that call, reviewScope none is not a clean
 // review, a record naming no pull request is listed apart rather than
-// dropped, the summary is bounded and never model-written, the delay hint
-// points at the wait, and the result carries no transcript.
+// dropped, the summary is bounded and never model-written, activity is the
+// session's own say on change, the delay hint stays short while a review
+// of a pull request the session opened is still to come and points at the
+// wait, and the result carries no transcript.
 func TestGetSessionResultText_SaysWhatCurrentMeans(t *testing.T) {
 	spec := specNamed(t, "narvi_get_session_result")
 	for _, want := range []string{
@@ -108,7 +110,8 @@ func TestGetSessionResultText_SaysWhatCurrentMeans(t *testing.T) {
 		"not_assessed (the older verdict is in supersededVerdict and is not the answer)",
 		"listed apart in excludedPullRequests, with why (shadow_suppressed: the repository was in shadow mode, so no pull request was created",
 		"merged or no longer open",
-		"suggestedDelaySeconds how long to wait before reading it again: every read asks the code host, so to learn when the session settles, prefer narvi_wait_for_session",
+		"activity says whether the session can still change the result",
+		"suggestedDelaySeconds how long to wait before reading it again -- short while it can, or while the review of a pull request it opened is still to come: every read asks the code host, so to learn when the session settles, prefer narvi_wait_for_session",
 		"Does not include the transcript.",
 	} {
 		if !strings.Contains(spec.Description, want) {

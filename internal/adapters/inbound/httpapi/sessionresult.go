@@ -78,16 +78,20 @@ type SessionResultDeps struct {
 // Every stored fact comes from ONE repeatable-read, read-only transaction:
 // the activity (the status route's own statement and derivation), the last
 // run, its events, the pull request artifacts, the review claims, attempts
-// and verdicts -- one snapshot, so the summary is read inside the run's own
-// window as the snapshot saw it, and a review state never mixes an attempt
-// from one instant with a verdict from another. The transaction ends
-// before anything else happens. Then, outside it, each assessed verdict's
-// freshness is read live (reviewfreshness.Assess: the merge path's own
-// live read and comparison), concurrently, each read bounded by the
-// platform.Timeouts constants the merge path uses and all of them together
-// by SessionResultLiveReadBudget; a failed, timed-out or out-of-budget read
-// reports the verdict unconfirmed, never current (owner decision D6). The
-// answer carries suggestedDelaySeconds (resultReadDelay).
+// and verdicts, and the activity of each review session behind the review
+// of a pull request it opened -- one snapshot, so the summary is read
+// inside the run's own window as the snapshot saw it, and a review state
+// never mixes an attempt from one instant with a verdict from another.
+// The transaction ends before anything else happens. Then, outside it,
+// each assessed verdict's freshness is read live (reviewfreshness.Assess:
+// the merge path's own live read and comparison), concurrently, each read
+// bounded by the platform.Timeouts constants the merge path uses and all
+// of them together by SessionResultLiveReadBudget; a failed, timed-out or
+// out-of-budget read reports the verdict unconfirmed, never current (owner
+// decision D6). The answer carries suggestedDelaySeconds
+// (resultReadDelay), short while anything the result reports can still
+// change on its own -- the session, or the review session behind the
+// review of a pull request it opened.
 //
 // No single pull request record can fail the result: one that names no
 // pull request the session opened -- a creation suppressed in shadow mode
@@ -150,7 +154,7 @@ func GetSessionResult(deps SessionResultDeps) http.HandlerFunc {
 		cancelLive()
 
 		readLive := len(snap.live) > 0 && deps.SourceControl != nil
-		snap.outcome.SuggestedDelaySeconds = wholeSecondsRoundedUp(resultReadDelay(snap.activity, readLive, deps.Timeouts))
+		snap.outcome.SuggestedDelaySeconds = wholeSecondsRoundedUp(resultReadDelay(snap.activity, snap.reviewsSettled, readLive, deps.Timeouts))
 		writeJSON(w, http.StatusOK, snap.outcome)
 	}
 }
@@ -163,12 +167,14 @@ func (e *unreadableResultError) Error() string { return e.err.Error() }
 func (e *unreadableResultError) Unwrap() error { return e.err }
 
 // resultSnapshot is what the snapshot transaction read: the response with
-// every stored fact filled in, and the verdicts whose freshness is still
-// to be read live, each pointing at the review it belongs to.
+// every stored fact filled in, the verdicts whose freshness is still to be
+// read live, each pointing at the review it belongs to, and whether every
+// other session behind a review it reports is settled (reviewSessionsSettled).
 type resultSnapshot struct {
-	outcome  *restdtos.SessionOutcome
-	activity session.Activity
-	live     []pendingFreshness
+	outcome        *restdtos.SessionOutcome
+	activity       session.Activity
+	live           []pendingFreshness
+	reviewsSettled bool
 }
 
 // pendingFreshness is one assessed verdict whose freshness is read live.
@@ -248,9 +254,10 @@ func readResultSnapshot(ctx context.Context, deps SessionResultDeps, tx pgx.Tx, 
 	}
 
 	var live []pendingFreshness
+	var reviewers []pgtype.UUID
 	outcome.PullRequests = make([]restdtos.SessionOutcomePullRequest, len(produced))
 	for i, pr := range produced {
-		review, pending, err := readReview(ctx, st, pr.repoFullName, pr.number, nil)
+		read, err := readReview(ctx, st, pr.repoFullName, pr.number, nil)
 		if err != nil {
 			return resultSnapshot{}, err
 		}
@@ -259,11 +266,14 @@ func readResultSnapshot(ctx context.Context, deps SessionResultDeps, tx pgx.Tx, 
 			Number:       int(pr.number),
 			Url:          pr.url,
 			CreatedAt:    pr.createdAt,
-			Review:       review,
+			Review:       read.review,
 		}
-		if pending != nil {
-			pending.review = &outcome.PullRequests[i].Review
-			live = append(live, *pending)
+		if read.pending != nil {
+			read.pending.review = &outcome.PullRequests[i].Review
+			live = append(live, *read.pending)
+		}
+		if read.reviewer.Valid && read.reviewer != sessionID {
+			reviewers = append(reviewers, read.reviewer)
 		}
 	}
 
@@ -274,23 +284,66 @@ func readResultSnapshot(ctx context.Context, deps SessionResultDeps, tx pgx.Tx, 
 	case err != nil:
 		return resultSnapshot{}, err
 	default:
-		review, pending, err := readReview(ctx, st, claim.RepoFullName, claim.PrNumber, &claim)
+		// Its review session is this session: the activity above is its.
+		read, err := readReview(ctx, st, claim.RepoFullName, claim.PrNumber, &claim)
 		if err != nil {
 			return resultSnapshot{}, err
 		}
 		outcome.ReviewedPullRequest = &restdtos.SessionOutcomeReviewedPullRequest{
 			RepoFullName: claim.RepoFullName,
 			Number:       int(claim.PrNumber),
-			Review:       review,
+			Review:       read.review,
 		}
-		if pending != nil {
-			pending.review = &outcome.ReviewedPullRequest.Review
-			live = append(live, *pending)
+		if read.pending != nil {
+			read.pending.review = &outcome.ReviewedPullRequest.Review
+			live = append(live, *read.pending)
 		}
 	}
 
+	reviewsSettled, err := reviewSessionsSettled(ctx, st, reviewers, bounds)
+	if err != nil {
+		return resultSnapshot{}, err
+	}
+
 	outcome.ReviewScope = reviewScope(outcome)
-	return resultSnapshot{outcome: outcome, activity: activity, live: live}, nil
+	return resultSnapshot{outcome: outcome, activity: activity, live: live, reviewsSettled: reviewsSettled}, nil
+}
+
+// reviewSessionsSettled reports whether every one of reviewers -- the
+// review sessions behind the reviews of the pull requests this session
+// opened -- is settled, each by its own activity: the status route's own
+// statement and derivation (session.DeriveActivity), in this snapshot.
+// One that is not can change its pull request's review with no new input
+// -- an attempt queued or running (the review reads in_progress), a
+// re-review scheduled, a delivery under way -- so the result can change on
+// its own, and resultReadDelay suggests the short delay. A review session
+// whose facts this build cannot read counts as not settled, logged at
+// WARN: a hint errs toward a shorter wait, and never fails the result.
+func reviewSessionsSettled(ctx context.Context, st resultStores, reviewers []pgtype.UUID, bounds statusBounds) (bool, error) {
+	seen := make(map[pgtype.UUID]bool, len(reviewers))
+	for _, reviewer := range reviewers {
+		if seen[reviewer] {
+			continue
+		}
+		seen[reviewer] = true
+		facts, err := st.sessions.ActivityFacts(ctx, reviewer, sessionactor.ReviewAutoRetriggerBudget)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			// No such session any more: nothing of it can progress.
+			continue
+		case err != nil:
+			return false, err
+		}
+		in, _, err := activityInput(facts, bounds)
+		if err != nil {
+			platform.Logger(ctx).Warn("httpapi: session result: a review session's activity is unreadable, its review counted as able to change", "review_session_id", reviewer.String(), "error", err)
+			return false, nil
+		}
+		if !session.DeriveActivity(in).Settled() {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // reviewScope says which pull requests the result reports verdicts for:
@@ -380,6 +433,16 @@ func capSummary(text string) (string, bool) {
 	return text, false
 }
 
+// reviewRead is one pull request's review as readReview read it: the
+// review, the verdict whose freshness is still to be read live (nil when
+// none is), and the review session the claim names (invalid when there is
+// no claim, or it names no session).
+type reviewRead struct {
+	review   restdtos.SessionOutcomeReview
+	pending  *pendingFreshness
+	reviewer pgtype.UUID
+}
+
 // readReview reads one pull request's review state from the record --
 // its review session's claim (claim, when the caller already holds it,
 // else looked up), that session's newest review attempt, whether that
@@ -387,16 +450,20 @@ func capSummary(text string) (string, bool) {
 // readout's own read) -- and renders it. A verdict that is assessed and
 // whose pull request the claim does not record as merged is returned as
 // pending: its freshness is read live after the snapshot.
-func readReview(ctx context.Context, st resultStores, repoFullName string, number int32, claim *sqlcgen.GithubPrSession) (restdtos.SessionOutcomeReview, *pendingFreshness, error) {
+func readReview(ctx context.Context, st resultStores, repoFullName string, number int32, claim *sqlcgen.GithubPrSession) (reviewRead, error) {
 	if claim == nil {
 		row, err := st.prSessions.GetByRepoAndPRNumber(ctx, repoFullName, number)
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):
 		case err != nil:
-			return restdtos.SessionOutcomeReview{}, nil, err
+			return reviewRead{}, err
 		default:
 			claim = &row
 		}
+	}
+	var reviewer pgtype.UUID
+	if claim != nil {
+		reviewer = claim.SessionID
 	}
 
 	var attempt *reviewverdict.Attempt
@@ -405,12 +472,12 @@ func readReview(ctx context.Context, st resultStores, repoFullName string, numbe
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):
 		case err != nil:
-			return restdtos.SessionOutcomeReview{}, nil, err
+			return reviewRead{}, err
 		default:
 			attempt = &reviewverdict.Attempt{ID: row.ID.String(), Terminal: turn.IsTerminal(turn.State(row.Status))}
 			if attempt.Terminal {
 				if attempt.Posted, err = st.reviewVerdicts.ExistsForAttempt(ctx, row.ID); err != nil {
-					return restdtos.SessionOutcomeReview{}, nil, err
+					return reviewRead{}, err
 				}
 			}
 		}
@@ -419,7 +486,7 @@ func readReview(ctx context.Context, st resultStores, repoFullName string, numbe
 	var latest *reviewverdict.Record
 	record, ok, err := appreviewverdict.GetLatestRecord(ctx, appreviewverdict.Deps{ReviewVerdicts: st.reviewVerdicts}, repoFullName, number)
 	if err != nil {
-		return restdtos.SessionOutcomeReview{}, nil, err
+		return reviewRead{}, err
 	}
 	if ok {
 		latest = &record
@@ -439,17 +506,17 @@ func readReview(ctx context.Context, st resultStores, repoFullName string, numbe
 		review.SupersededVerdict = &v
 	}
 	if status.State != reviewverdict.ReviewAssessed {
-		return review, nil, nil
+		return reviewRead{review: review, reviewer: reviewer}, nil
 	}
 	if mergedPerClaim(claim) {
 		review.Freshness = freshnessDTO(reviewfreshness.Assessment{State: reviewfreshness.StateNotApplicable, Reason: reasonMergedPerClaim})
-		return review, nil, nil
+		return reviewRead{review: review, reviewer: reviewer}, nil
 	}
 	owner, repo, ok := reposource.SplitFullName(repoFullName)
 	if !ok {
-		return restdtos.SessionOutcomeReview{}, nil, &unreadableResultError{err: fmt.Errorf("pull request repo %q is not owner/repo", repoFullName)}
+		return reviewRead{}, &unreadableResultError{err: fmt.Errorf("pull request repo %q is not owner/repo", repoFullName)}
 	}
-	return review, &pendingFreshness{record: *status.Verdict, pr: reviewfreshness.PullRequest{Owner: owner, Repo: repo, Number: int(number)}}, nil
+	return reviewRead{review: review, reviewer: reviewer, pending: &pendingFreshness{record: *status.Verdict, pr: reviewfreshness.PullRequest{Owner: owner, Repo: repo, Number: int(number)}}}, nil
 }
 
 // reasonMergedPerClaim is why a merged pull request's verdict freshness is
@@ -480,18 +547,21 @@ func freshnessDTO(a reviewfreshness.Assessment) restdtos.SessionOutcomeReviewFre
 }
 
 // resultReadDelay is the suggested delay before a client reads a result
-// again, from platform.Timeouts' SessionResultDelay* table: while the
-// session is not settled, the result can still change, and the status is
-// the cheap way to watch it; once settled, a result that read a verdict's
+// again, from platform.Timeouts' SessionResultDelay* table. While the
+// result can still change on its own -- the session is not settled, or
+// reviewsSettled is false: a review session behind a review it reports is
+// not (an attempt queued or running, whose review reads in_progress; a
+// re-review scheduled) -- the unsettled value: for the session, its status
+// is the cheap way to watch it. Otherwise, a result that read a verdict's
 // freshness live changes only when a pull request or its base moves, and
 // asks the code host again on every read; one that read nothing live
-// changes only with new input. Clamped to [SessionResultDelayFloor,
-// SessionResultDelayCeiling] -- a defense: Validate keeps every table value
-// inside them.
-func resultReadDelay(activity session.Activity, readLive bool, t platform.Timeouts) time.Duration {
+// changes only with new input -- a prompt, a review requested, a push.
+// Clamped to [SessionResultDelayFloor, SessionResultDelayCeiling] -- a
+// defense: Validate keeps every table value inside them.
+func resultReadDelay(activity session.Activity, reviewsSettled, readLive bool, t platform.Timeouts) time.Duration {
 	var d time.Duration
 	switch {
-	case !activity.Settled():
+	case !activity.Settled() || !reviewsSettled:
 		d = t.SessionResultDelayUnsettled
 	case readLive:
 		d = t.SessionResultDelayLiveRead

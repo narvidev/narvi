@@ -192,38 +192,49 @@ func TestMergedPerClaim_Table(t *testing.T) {
 }
 
 // TestResultReadDelay_Table pins the suggested delay: the unsettled value
-// whenever the session can still change, whatever was read live; once
-// settled, the live-read value when a freshness was read live, else the
-// settled value; always within [floor, ceiling].
+// whenever the result can still change on its own -- the session is not
+// settled, or a review session behind a review it reports is not (round
+// 2's finding P5: a review in progress changes the result by itself) --
+// whatever was read live; otherwise the live-read value when a freshness
+// was read live, else the settled value; always within [floor, ceiling].
 func TestResultReadDelay_Table(t *testing.T) {
 	to := platform.DefaultTimeouts()
 	tests := []struct {
-		activity session.Activity
-		readLive bool
-		want     time.Duration
+		activity       session.Activity
+		reviewsSettled bool
+		readLive       bool
+		want           time.Duration
 	}{
-		{session.ActivityRunning, true, to.SessionResultDelayUnsettled},
-		{session.ActivityQueued, false, to.SessionResultDelayUnsettled},
-		{session.ActivityDelivering, false, to.SessionResultDelayUnsettled},
-		{session.ActivityScheduled, true, to.SessionResultDelayUnsettled},
-		{session.Activity("a value this build does not know"), false, to.SessionResultDelayUnsettled},
-		{session.ActivityFinished, true, to.SessionResultDelayLiveRead},
-		{session.ActivityAwaitingApproval, true, to.SessionResultDelayLiveRead},
-		{session.ActivityFinished, false, to.SessionResultDelaySettled},
-		{session.ActivityIdle, false, to.SessionResultDelaySettled},
+		{session.ActivityRunning, true, true, to.SessionResultDelayUnsettled},
+		{session.ActivityQueued, true, false, to.SessionResultDelayUnsettled},
+		{session.ActivityDelivering, true, false, to.SessionResultDelayUnsettled},
+		{session.ActivityScheduled, true, true, to.SessionResultDelayUnsettled},
+		{session.Activity("a value this build does not know"), true, false, to.SessionResultDelayUnsettled},
+		{session.ActivityRunning, false, false, to.SessionResultDelayUnsettled},
+		{session.ActivityFinished, true, true, to.SessionResultDelayLiveRead},
+		{session.ActivityAwaitingApproval, true, true, to.SessionResultDelayLiveRead},
+		{session.ActivityFinished, true, false, to.SessionResultDelaySettled},
+		{session.ActivityIdle, true, false, to.SessionResultDelaySettled},
+		{session.ActivityAwaitingApproval, true, false, to.SessionResultDelaySettled},
+		// Settled, but a review it reports can still start, end or run
+		// again: never the settled value, read live or not.
+		{session.ActivityFinished, false, false, to.SessionResultDelayUnsettled},
+		{session.ActivityFinished, false, true, to.SessionResultDelayUnsettled},
+		{session.ActivityIdle, false, false, to.SessionResultDelayUnsettled},
+		{session.ActivityAwaitingApproval, false, false, to.SessionResultDelayUnsettled},
 	}
 	for _, tc := range tests {
-		if got := resultReadDelay(tc.activity, tc.readLive, to); got != tc.want {
-			t.Errorf("resultReadDelay(%q, live %v) = %v, want %v", tc.activity, tc.readLive, got, tc.want)
+		if got := resultReadDelay(tc.activity, tc.reviewsSettled, tc.readLive, to); got != tc.want {
+			t.Errorf("resultReadDelay(%q, reviews settled %v, live %v) = %v, want %v", tc.activity, tc.reviewsSettled, tc.readLive, got, tc.want)
 		}
 	}
 	clamped := to
 	clamped.SessionResultDelayUnsettled = time.Second
 	clamped.SessionResultDelaySettled = time.Hour
-	if got := resultReadDelay(session.ActivityRunning, false, clamped); got != to.SessionResultDelayFloor {
+	if got := resultReadDelay(session.ActivityRunning, true, false, clamped); got != to.SessionResultDelayFloor {
 		t.Errorf("below the floor: %v, want the floor %v", got, to.SessionResultDelayFloor)
 	}
-	if got := resultReadDelay(session.ActivityFinished, false, clamped); got != to.SessionResultDelayCeiling {
+	if got := resultReadDelay(session.ActivityFinished, true, false, clamped); got != to.SessionResultDelayCeiling {
 		t.Errorf("above the ceiling: %v, want the ceiling %v", got, to.SessionResultDelayCeiling)
 	}
 }

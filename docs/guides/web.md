@@ -181,7 +181,7 @@ what it cost, and a `summary` — the turn's final text, copied as the
 agent wrote it, cut at 4,000 characters with `truncated` set. It is
 never written by a model; the whole text stays in the events route.
 `activity` is the status's, from the same moment, so you can tell
-whether the result can still change.
+whether the session can still change the result.
 
 `pullRequests` lists the pull requests the session opened, and
 `reviewedPullRequest` the one it reviews, if it is a pull request's
@@ -205,8 +205,11 @@ check it, or GitHub did not answer in time, with the reason) or
 `not_applicable` (no assessed verdict, or the pull request is merged or
 no longer open). A verdict is never `current` unless GitHub confirmed it
 during that read. Because every read asks GitHub again,
-`suggestedDelaySeconds` says how long to wait before the next one; to
-learn when a session settles, wait on its status instead. The result
+`suggestedDelaySeconds` says how long to wait before the next one. It
+stays short while the session can still change the result, and while
+the review of a pull request it opened is still to come — running,
+queued, or due to run again — since the result then changes on its own.
+To learn when a session settles, wait on its status instead. The result
 never carries the session's events.
 
 ```json narvi-command

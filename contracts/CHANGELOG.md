@@ -40,10 +40,11 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   record the server cannot read -- each listed with why, so none is
   dropped and none fails the result); `reviewedPullRequest` (the one it is
   the review session of); and `suggestedDelaySeconds` (how long to wait
-  before reading the result again: 30 seconds while the session can still
-  change, 60 once settled when a freshness was read live, 300 when nothing
-  was, as shipped). Carries no events. A `$defs` entry added, graded MINOR
-  (row 32).
+  before reading the result again: 30 seconds while the result can still
+  change on its own -- the session is not settled, or the review of a pull
+  request it opened is still to come -- 60 once neither holds and a
+  freshness was read live, 300 when nothing was either, as shipped).
+  Carries no events. A `$defs` entry added, graded MINOR (row 32).
 - Added: `SessionOutcomePullRequest`, `SessionOutcomeReview` and
   `SessionOutcomeVerdict` -- a pull request with its review:
   `state` (`absent`, `in_progress`, `not_assessed` -- with the older

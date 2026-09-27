@@ -3368,7 +3368,7 @@ export interface SessionActivity {
 export interface SessionOutcome {
   sessionId: string;
   /**
-   * SessionActivity.activity, read in the same snapshot as the rest of this result: whether it can still change. Read while the session is queued, running, delivering or scheduled, this is not the session's final result -- a later run, or a pull request still being opened, can change it; read the status (GET /api/sessions/{sessionID}/status) or wait on it to know when it is settled.
+   * SessionActivity.activity, read in the same snapshot as the rest of this result: whether the session itself can still change it. Read while the session is queued, running, delivering or scheduled, this is not the session's final result -- a later run, or a pull request still being opened, can change it; read the status (GET /api/sessions/{sessionID}/status) or wait on it to know when it is settled. A settled session's result can still change on its own while the review of a pull request it opened is still to come; suggestedDelaySeconds is short then.
    */
   activity: 'idle' | 'queued' | 'running' | 'delivering' | 'scheduled' | 'awaiting_approval' | 'finished';
   /**
@@ -3435,7 +3435,7 @@ export interface SessionOutcome {
     review: SessionOutcomeReview;
   } | null;
   /**
-   * How long to wait before reading this result again, in whole seconds (rounded up): 30 while the session can still change (activity is not settled -- to learn when it settles, wait on its status instead, a much cheaper read); 60 once settled when a verdict's freshness was read live in this call, since every read of the result asks the code host again; 300 once settled with nothing read live -- always within the deployment's configured floor and ceiling (30 and 300 seconds as shipped). A hint that keeps polling quiet, never a limit: an earlier read is answered all the same.
+   * How long to wait before reading this result again, in whole seconds (rounded up): 30 while the result can still change on its own -- the session is not settled (activity; to learn when it settles, wait on its status instead, a much cheaper read), or the review of a pull request it opened is still to come, its review session not settled (an attempt queued or running, the review reading in_progress; a re-review scheduled); 60 once neither holds and a verdict's freshness was read live in this call, since every read of the result asks the code host again; 300 when nothing was either, as nothing in the result then changes without new input -- always within the deployment's configured floor and ceiling (30 and 300 seconds as shipped). A hint that keeps polling quiet, never a limit: an earlier read is answered all the same.
    */
   suggestedDelaySeconds: number;
 }
