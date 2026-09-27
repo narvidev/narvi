@@ -71,7 +71,7 @@ func (f *fakeSourceControl) IsAncestor(ctx context.Context, spec ports.IsAncesto
 	return f.ancestry[spec.Ancestor+".."+spec.Descendant], nil
 }
 
-func (f *fakeSourceControl) GetOpenPR(ctx context.Context, owner, repo string, number int, token string) (ports.OpenPR, bool, error) {
+func (f *fakeSourceControl) GetOpenPR(ctx context.Context, _, _ string, _ int, _ string) (ports.OpenPR, bool, error) {
 	f.record(ctx, "open")
 	if f.openDelay > 0 {
 		select {
