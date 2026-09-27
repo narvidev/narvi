@@ -54,11 +54,15 @@ func (s *EventStore) Create(ctx context.Context, arg sqlcgen.CreateEventParams) 
 }
 
 // StoredTokenPart is what is already stored of one streamed text part:
-// the id of its first stored `token` frame and the text of its newest one.
+// the id and text of its first stored `token` frame and the text of its
+// newest one.
 type StoredTokenPart struct {
 	// FirstFrameID is the lowest events.id among the part's stored frames:
 	// where the part entered the log, which places it in a turn's window.
 	FirstFrameID int64
+	// FirstText is the text of that first frame -- the one stored under
+	// the bare part id, which a resend of it no longer matches by key.
+	FirstText string
 	// LatestText is the text of the part's highest-id stored frame, the
 	// one every reader shows.
 	LatestText string
@@ -81,7 +85,7 @@ func (s *EventStore) StoredTokenPart(ctx context.Context, sessionID pgtype.UUID,
 	if err != nil {
 		return StoredTokenPart{}, false, err
 	}
-	return StoredTokenPart{FirstFrameID: row.FirstID, LatestText: row.Text}, true, nil
+	return StoredTokenPart{FirstFrameID: row.FirstID, FirstText: row.FirstText, LatestText: row.Text}, true, nil
 }
 
 // ListForSession returns up to limit events for sessionID with id >

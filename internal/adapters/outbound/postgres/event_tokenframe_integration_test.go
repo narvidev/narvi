@@ -37,10 +37,11 @@ func seedTokenPartEvent(ctx context.Context, t *testing.T, events *narvipg.Event
 
 // TestEventStore_StoredTokenPart pins the lookup the session actor makes
 // before storing a streamed `token` frame: for ONE part, matched by the
-// payload's own messageId whatever the storage key is -- a per-frame key
-// or, for frames stored before per-frame keys existed, the bare part id --
-// the id of its first stored frame and the text of its newest one, and
-// never a frame of another part, another event type or another session.
+// payload's own messageId whatever the storage key is -- the bare part id
+// a part's first frame is stored under, or a later frame's per-frame key
+// -- the id and text of its first stored frame and the text of its newest
+// one, and never a frame of another part, another event type or another
+// session.
 func TestEventStore_StoredTokenPart(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
@@ -51,8 +52,8 @@ func TestEventStore_StoredTokenPart(t *testing.T) {
 	// Another session's frame of the same part id, stored first so a lookup
 	// that ignored the session would report it as the first frame.
 	seedTokenPartEvent(ctx, t, events, otherSession, "token", "prt_a#9", "prt_a", "Other session")
-	// A frame stored before per-frame keys: storage key == part id.
-	legacyA := seedTokenPartEvent(ctx, t, events, sessionID, "token", "prt_a", "prt_a", "")
+	// A part's first frame: storage key == part id.
+	firstA := seedTokenPartEvent(ctx, t, events, sessionID, "token", "prt_a", "prt_a", "")
 	seedTokenPartEvent(ctx, t, events, sessionID, "token", "prt_a#2", "prt_a", "Hello")
 	firstB := seedTokenPartEvent(ctx, t, events, sessionID, "token", "prt_b#1", "prt_b", "Other part")
 	seedTokenPartEvent(ctx, t, events, sessionID, "tool_call", "call-1", "prt_a", "not a token")
@@ -63,8 +64,8 @@ func TestEventStore_StoredTokenPart(t *testing.T) {
 		want      narvipg.StoredTokenPart
 		wantFound bool
 	}{
-		{name: "first frame and newest text of the part", partID: "prt_a", want: narvipg.StoredTokenPart{FirstFrameID: legacyA, LatestText: "Hello"}, wantFound: true},
-		{name: "another part is its own", partID: "prt_b", want: narvipg.StoredTokenPart{FirstFrameID: firstB, LatestText: "Other part"}, wantFound: true},
+		{name: "first frame and newest text of the part", partID: "prt_a", want: narvipg.StoredTokenPart{FirstFrameID: firstA, FirstText: "", LatestText: "Hello"}, wantFound: true},
+		{name: "another part is its own", partID: "prt_b", want: narvipg.StoredTokenPart{FirstFrameID: firstB, FirstText: "Other part", LatestText: "Other part"}, wantFound: true},
 		{name: "a part with no stored frame", partID: "prt_none", wantFound: false},
 	}
 	for _, tt := range tests {
@@ -79,10 +80,11 @@ func TestEventStore_StoredTokenPart(t *testing.T) {
 		})
 	}
 
-	// The legacy row alone is found too.
+	// A part stored as its first frame alone -- every part stored before
+	// per-frame keys -- is both its first and its newest frame.
 	legacy := createTestSession(ctx, t, pool)
 	legacyID := seedTokenPartEvent(ctx, t, events, legacy, "token", "prt_old", "prt_old", "first frame only")
-	want := narvipg.StoredTokenPart{FirstFrameID: legacyID, LatestText: "first frame only"}
+	want := narvipg.StoredTokenPart{FirstFrameID: legacyID, FirstText: "first frame only", LatestText: "first frame only"}
 	if got, found, err := events.StoredTokenPart(ctx, legacy, "prt_old"); err != nil || !found || got != want {
 		t.Errorf("legacy frame: StoredTokenPart = (%+v, %v, %v), want (%+v, true, nil)", got, found, err, want)
 	}

@@ -223,6 +223,14 @@ func TestHandleSandboxEvent_TokenFrames_PersistEachDistinctFrame(t *testing.T) {
 			frames:     []string{tokenTestFullText, ""},
 			wantStored: []string{tokenTestFullText},
 		},
+		{
+			// The first frame is stored under the bare part id, so a resend of
+			// it no longer dedupes by key; nor is it a prefix of a final frame
+			// the runtime trimmed. It is the part's first frame again.
+			name:       "the first frame replayed after a trimmed final frame adds no row",
+			frames:     []string{tokenTestPrefix + " \n\n", tokenTestPrefix, tokenTestPrefix + " \n\n", tokenTestPrefix},
+			wantStored: []string{tokenTestPrefix + " \n\n", tokenTestPrefix},
+		},
 	}
 
 	for _, tt := range tests {
@@ -260,16 +268,22 @@ func TestHandleSandboxEvent_TokenFrames_PersistEachDistinctFrame(t *testing.T) {
 				}
 			}
 
+			// The first frame under the bare part id, as every binary before
+			// per-frame keys stored it (tokenframe.go); each later one under
+			// a distinct per-frame key.
 			stored := listStoredTokenRows(ctx, t, pool, sessionID)
 			var gotTexts []string
 			seenKeys := map[string]bool{}
-			for _, row := range stored {
+			for i, row := range stored {
 				gotTexts = append(gotTexts, row.payloadText)
 				if row.payloadMsgID != tokenTestPartID {
 					t.Errorf("stored payload messageId = %q, want %q (the payload is stored verbatim)", row.payloadMsgID, tokenTestPartID)
 				}
-				if !strings.HasPrefix(row.storageKey, tokenTestPartID+"#") || seenKeys[row.storageKey] {
-					t.Errorf("storage key %q: want a distinct %q-prefixed key per frame", row.storageKey, tokenTestPartID+"#")
+				switch {
+				case i == 0 && row.storageKey != tokenTestPartID:
+					t.Errorf("first frame's storage key %q, want the bare part id %q", row.storageKey, tokenTestPartID)
+				case i > 0 && (!strings.HasPrefix(row.storageKey, tokenTestPartID+"#") || seenKeys[row.storageKey]):
+					t.Errorf("later frame's storage key %q: want a distinct %q-prefixed key per frame", row.storageKey, tokenTestPartID+"#")
 				}
 				seenKeys[row.storageKey] = true
 			}

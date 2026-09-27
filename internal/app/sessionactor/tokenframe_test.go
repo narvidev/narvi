@@ -5,15 +5,23 @@ import (
 	"testing"
 )
 
-// TestTokenFrameStorageKey pins the per-frame storage key: the part id
-// first (so the key still names the part it belongs to), one key per
-// distinct text, the same key for the same text.
+// TestTokenFrameStorageKey pins the storage keys. A part's first frame is
+// stored under the bare part id, the key a binary predating per-frame keys
+// dedupes every frame of the part on; each later frame under the part id
+// (so the key still names the part it belongs to), one key per distinct
+// text, the same key for the same text.
 func TestTokenFrameStorageKey(t *testing.T) {
 	t.Parallel()
 
-	empty := tokenFrameStorageKey("prt_plan", "")
-	prefix := tokenFrameStorageKey("prt_plan", "1. Add the")
-	full := tokenFrameStorageKey("prt_plan", "1. Add the migration\n2. Wire the store")
+	for _, text := range []string{"", "1. Add the", "1. Add the migration\n2. Wire the store"} {
+		if got := tokenFrameStorageKey("prt_plan", text, false); got != "prt_plan" {
+			t.Errorf("first frame %q keyed %q, want the bare part id %q", text, got, "prt_plan")
+		}
+	}
+
+	empty := tokenFrameStorageKey("prt_plan", "", true)
+	prefix := tokenFrameStorageKey("prt_plan", "1. Add the", true)
+	full := tokenFrameStorageKey("prt_plan", "1. Add the migration\n2. Wire the store", true)
 
 	for _, k := range []string{empty, prefix, full} {
 		if !strings.HasPrefix(k, "prt_plan#") {
@@ -26,10 +34,10 @@ func TestTokenFrameStorageKey(t *testing.T) {
 	if empty == prefix || prefix == full || empty == full {
 		t.Errorf("distinct frames share a key: empty=%q prefix=%q full=%q", empty, prefix, full)
 	}
-	if again := tokenFrameStorageKey("prt_plan", "1. Add the"); again != prefix {
+	if again := tokenFrameStorageKey("prt_plan", "1. Add the", true); again != prefix {
 		t.Errorf("same frame keyed twice: %q then %q, want equal (a resend must dedupe)", prefix, again)
 	}
-	if other := tokenFrameStorageKey("prt_note", "1. Add the"); other == prefix {
+	if other := tokenFrameStorageKey("prt_note", "1. Add the", true); other == prefix {
 		t.Errorf("same text in two parts shares key %q, want distinct", other)
 	}
 }
@@ -44,24 +52,27 @@ func TestTokenFrameAddsNoRow(t *testing.T) {
 	tests := []struct {
 		name     string
 		incoming string
+		first    string
 		latest   string
 		want     bool
 	}{
-		{name: "the stored frame again", incoming: full, latest: full, want: true},
-		{name: "empty frame again", incoming: "", latest: "", want: true},
-		{name: "newer frame extends the stored empty one", incoming: full, latest: "", want: false},
-		{name: "newer frame extends the stored prefix", incoming: full, latest: "1. Add the", want: false},
-		{name: "empty frame replayed after the full one", incoming: "", latest: full, want: true},
-		{name: "prefix frame replayed after the full one", incoming: "1. Add the", latest: full, want: true},
-		{name: "final frame with trailing whitespace trimmed", incoming: "1. Add the", latest: "1. Add the \n\n", want: false},
-		{name: "rewrite that is not a prefix", incoming: "Plan withdrawn.", latest: full, want: false},
-		{name: "same length, different text", incoming: "1. Add thX", latest: "1. Add the", want: false},
+		{name: "the stored frame again", incoming: full, first: "", latest: full, want: true},
+		{name: "empty frame again", incoming: "", first: "", latest: "", want: true},
+		{name: "newer frame extends the stored empty one", incoming: full, first: "", latest: "", want: false},
+		{name: "newer frame extends the stored prefix", incoming: full, first: "1. Add the", latest: "1. Add the", want: false},
+		{name: "empty frame replayed after the full one", incoming: "", first: "", latest: full, want: true},
+		{name: "prefix frame replayed after the full one", incoming: "1. Add the", first: "", latest: full, want: true},
+		{name: "final frame with trailing whitespace trimmed", incoming: "1. Add the", first: "", latest: "1. Add the \n\n", want: false},
+		{name: "first frame replayed after a trimmed final frame", incoming: "1. Add the \n\n", first: "1. Add the \n\n", latest: "1. Add the", want: true},
+		{name: "first frame replayed after a rewrite", incoming: "1. Add the", first: "1. Add the", latest: "Plan withdrawn.", want: true},
+		{name: "rewrite that is not a prefix", incoming: "Plan withdrawn.", first: "", latest: full, want: false},
+		{name: "same length, different text", incoming: "1. Add thX", first: "", latest: "1. Add the", want: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if got := tokenFrameAddsNoRow(tt.incoming, tt.latest); got != tt.want {
-				t.Errorf("tokenFrameAddsNoRow(%q, %q) = %v, want %v", tt.incoming, tt.latest, got, tt.want)
+			if got := tokenFrameAddsNoRow(tt.incoming, tt.first, tt.latest); got != tt.want {
+				t.Errorf("tokenFrameAddsNoRow(%q, %q, %q) = %v, want %v", tt.incoming, tt.first, tt.latest, got, tt.want)
 			}
 		})
 	}

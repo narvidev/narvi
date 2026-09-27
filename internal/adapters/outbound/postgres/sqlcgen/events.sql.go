@@ -59,12 +59,15 @@ type CreateEventRow struct {
 // after any update) -- callers use it to decide whether to (re-)broadcast
 // this event to live subscribers.
 //
-// message_id is the wire messageId for every event type but one: the
-// session actor stores each distinct cumulative frame of a `token` part
-// under messageId + "#" + a hash of its text (sessionactor/tokenframe.go),
-// because every frame of a part shares the part's messageId and a plain
-// first-wins key would keep only the first one. Readers never see the
-// storage key -- they read the payload, whose messageId is untouched.
+// message_id is the wire messageId, with one exception: every frame of a
+// `token` part shares the part's messageId, and a plain first-wins key
+// would keep only the first one. So the session actor stores a part's
+// FIRST frame under the bare messageId, like any other event, and each
+// later distinct frame under messageId + "#" + a hash of its text
+// (sessionactor/tokenframe.go). The first frame keeps the bare key so
+// that a binary predating per-frame keys, which dedupes every frame on
+// it, still finds it. Readers never see the storage key -- they read the
+// payload, whose messageId is untouched.
 //
 // # Why the session row is locked before the id is drawn
 //
@@ -201,19 +204,23 @@ func (q *Queries) GetBootP95InWindow(ctx context.Context, createdAt pgtype.Times
 }
 
 const getLatestTokenFrameForPart = `-- name: GetLatestTokenFrameForPart :one
-SELECT id, COALESCE(payload->>'text', '')::text AS text,
-    (SELECT first_frame.id
-     FROM events AS first_frame
-     WHERE first_frame.session_id = $1
-       AND first_frame.type = 'token'
-       AND first_frame.payload->>'messageId' = $2::text
-     ORDER BY first_frame.id ASC
-     LIMIT 1)::bigint AS first_id
-FROM events
-WHERE session_id = $1
-  AND type = 'token'
-  AND payload->>'messageId' = $2::text
-ORDER BY id DESC
+SELECT latest.id, COALESCE(latest.payload->>'text', '')::text AS text,
+    first_frame.id AS first_id,
+    COALESCE(first_frame.payload->>'text', '')::text AS first_text
+FROM events AS latest
+CROSS JOIN LATERAL (
+    SELECT part_frame.id, part_frame.payload
+    FROM events AS part_frame
+    WHERE part_frame.session_id = $1
+      AND part_frame.type = 'token'
+      AND part_frame.payload->>'messageId' = $2::text
+    ORDER BY part_frame.id ASC
+    LIMIT 1
+) AS first_frame
+WHERE latest.session_id = $1
+  AND latest.type = 'token'
+  AND latest.payload->>'messageId' = $2::text
+ORDER BY latest.id DESC
 LIMIT 1
 `
 
@@ -223,34 +230,44 @@ type GetLatestTokenFrameForPartParams struct {
 }
 
 type GetLatestTokenFrameForPartRow struct {
-	ID      int64  `json:"id"`
-	Text    string `json:"text"`
-	FirstID int64  `json:"first_id"`
+	ID        int64  `json:"id"`
+	Text      string `json:"text"`
+	FirstID   int64  `json:"first_id"`
+	FirstText string `json:"first_text"`
 }
 
 // The newest stored frame (highest id) of one streamed text part, plus the
-// id of the part's FIRST stored frame, found by the payload's own
+// id and text of the part's FIRST stored frame, found by the payload's own
 // messageId (the part id) rather than by the storage key, which carries a
-// per-frame suffix (CreateEvent above). The session actor reads both
-// before storing a `token` frame (sessionactor/tokenframe.go): first_id
-// places the part in a turn's window -- a part first stored at or below
-// the Processing turn's dispatched_event_id belongs to an earlier turn,
-// and a late frame of it adds no row -- and text lets it add no row for a
-// frame that is the stored one again or an older one replayed late.
+// per-frame suffix on every frame but the first (CreateEvent above). The
+// session actor reads them before storing a `token` frame
+// (sessionactor/tokenframe.go): first_id places the part in a turn's
+// window -- a part first stored at or below the Processing turn's
+// dispatched_event_id belongs to an earlier turn, and a late frame of it
+// adds no row -- and text and first_text let it add no row for a frame
+// that is a stored one again or an older one replayed late. first_text is
+// needed because the first frame is stored under the bare part id, which
+// a resend of it, keyed like any later frame, no longer matches.
 //
 // events_token_part_idx (migrations/000144_events_token_part_idx.up.sql)
-// serves both halves, the outer one as a backward scan and first_id as a
-// forward one: the literal type = 'token' matches that partial index's
-// predicate, and the expression must stay byte-for-byte
+// serves both halves, the newest frame as a backward scan and the first
+// one as a forward one: the literal type = 'token' matches that partial
+// index's predicate, and the expression must stay byte-for-byte
 // payload->>'messageId' for the index to apply.
 // TestEventStore_StoredTokenPart_UsesPartIndex EXPLAINs the SQL this store
-// actually sends, so a drift here fails there. first_id is never NULL: the
-// outer row is itself a frame of the part. pgx.ErrNoRows means no frame of
-// this part is stored yet.
+// actually sends, so a drift here fails there. The first frame always
+// exists when the newest does -- the newest is itself a frame of the part
+// -- so the join never drops a row. pgx.ErrNoRows means no frame of this
+// part is stored yet.
 func (q *Queries) GetLatestTokenFrameForPart(ctx context.Context, arg GetLatestTokenFrameForPartParams) (GetLatestTokenFrameForPartRow, error) {
 	row := q.db.QueryRow(ctx, getLatestTokenFrameForPart, arg.SessionID, arg.PartID)
 	var i GetLatestTokenFrameForPartRow
-	err := row.Scan(&i.ID, &i.Text, &i.FirstID)
+	err := row.Scan(
+		&i.ID,
+		&i.Text,
+		&i.FirstID,
+		&i.FirstText,
+	)
 	return i, err
 }
 
