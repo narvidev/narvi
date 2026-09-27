@@ -41,6 +41,12 @@ import (
 // decode can finally tell "OpenCode said $0" apart from "OpenCode said
 // nothing" -- before that fix both collapsed to the same wire value and
 // no assertion here could have told them apart either.
+//
+// It also pins the `token` contract per text part against a real model:
+// at most maxTokenFramesPerTextPart frames (tokencadence_realbinary_test.go
+// measures the same bound with no credential), the last of which is
+// exactly the part's final text as GET /session/{id}/message reports it --
+// the frame every reader of the stored event log shows.
 func TestRealTurn_PlainTextPrompt(t *testing.T) {
 	skipIfNoProvider(t)
 	// Deliberately NOT t.Parallel(): these are the tests that make a REAL
@@ -84,7 +90,7 @@ func TestRealTurn_PlainTextPrompt(t *testing.T) {
 		switch v := e.Payload.(type) {
 		case sandboxws.Token:
 			sawToken = true
-			lastCumulativeText = v.Text // upsert-by-messageId: later == more complete
+			lastCumulativeText = v.Text // cumulative per part: the later frame is the more complete one
 			if v.SessionId != testSessionID || v.Gen != 1 {
 				t.Errorf("Token SessionId/Gen = %q/%d, want %q/1", v.SessionId, v.Gen, testSessionID)
 			}
@@ -152,6 +158,19 @@ func TestRealTurn_PlainTextPrompt(t *testing.T) {
 	}
 	if _, ok := events[len(events)-1].Payload.(sandboxws.ExecutionComplete); !ok {
 		t.Errorf("last event was %T, want execution_complete to be the final event", events[len(events)-1].Payload)
+	}
+
+	finals := finalTextParts(ctx, t, a, convID)
+	frames, order := tokenFramesByPart(events)
+	for _, part := range order {
+		got := frames[part]
+		t.Logf("text part %s: %d token frames", part, len(got))
+		if len(got) > maxTokenFramesPerTextPart {
+			t.Errorf("text part %s: %d token frames, want at most %d", part, len(got), maxTokenFramesPerTextPart)
+		}
+		if want, ok := finals[part]; !ok || got[len(got)-1] != want {
+			t.Errorf("text part %s: last frame = %q, want the part's final text %q (present: %v)", part, got[len(got)-1], want, ok)
+		}
 	}
 }
 

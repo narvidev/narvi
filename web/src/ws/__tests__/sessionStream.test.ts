@@ -2,6 +2,7 @@ import { QueryClient } from '@tanstack/react-query'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { sessionQueryKeys } from '../../api/queryKeys'
+import { buildTimelineModel } from '../../session/timelineModel'
 import { SessionStream } from '../sessionStream'
 import { FakeClientWsServer, type FakeConnection, fakeEvent, subscribedPayload } from './fakeServer'
 
@@ -207,6 +208,36 @@ describe('SessionStream', () => {
     await waitFor(() => stream!.getSnapshot().events.length === 2)
     await waitFor(() => stream!.getSnapshot().syncState === 'complete')
     expect(stream.getSnapshot().events.map((e) => e.id)).toEqual([1, 2])
+  })
+
+  // Every frame of a streamed text part is its own row, sharing the part's
+  // messageId (internal/app/sessionactor/tokenframe.go). A client whose log
+  // already holds the part's first frame learns of the next one only as a
+  // live signal, and must backfill it from its cursor and show it -- the
+  // append-only property a payload replaced in place (same row id, so never
+  // past any cursor) would break.
+  it('backfills a later frame of an already-seen text part from its cursor and folds the part to the newest frame', async () => {
+    server = await FakeClientWsServer.start()
+    const queryClient = new QueryClient()
+    stream = newStream('sess-frames', queryClient)
+
+    const connPromise = server.waitForConnection()
+    stream.start()
+    const conn = await connPromise
+    await conn.nextMessage()
+    conn.send(subscribedPayload('sess-frames', [fakeEvent(1, 'token', { messageId: 'prt_plan', text: '' })]))
+    await drainOneBackfillRound(conn, [], null)
+    await waitFor(() => stream!.getSnapshot().syncState === 'complete')
+
+    const finalText = '1. Add the migration\n2. Wire the store'
+    conn.send({ type: 'token', messageId: 'prt_plan', sessionId: 'sess-frames', gen: 1, text: finalText })
+
+    const request = await drainOneBackfillRound(conn, [fakeEvent(2, 'token', { messageId: 'prt_plan', text: finalText })], null)
+    expect(request).toMatchObject({ type: 'fetch_history', cursor: '1' })
+
+    await waitFor(() => stream!.getSnapshot().events.length === 2)
+    const tokens = buildTimelineModel(stream.getSnapshot().events).turns[0]!.steps[0]!.tokens
+    expect(tokens).toEqual([{ messageId: 'prt_plan', text: finalText }])
   })
 
   it('a malformed element inside an otherwise-valid events array is dropped, not applied and not fatal -- its valid siblings still land', async () => {

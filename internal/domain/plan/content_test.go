@@ -136,6 +136,136 @@ func TestExtractContent(t *testing.T) {
 			upperBoundEventID: nil,
 			want:              "very old",
 		},
+
+		// Text parts, told apart by the payload's messageId. The turn's
+		// text is its last part -- the one whose first in-window frame is
+		// newest -- read as that part's newest non-empty frame.
+		{
+			name: "parts in order: the last part's final frame",
+			events: []ContentEvent{
+				{ID: 16, Type: "execution_complete"},
+				{ID: 15, Type: "token", MessageID: "prt_b", Text: "1. Add the migration\n2. Wire the store"},
+				{ID: 14, Type: "token", MessageID: "prt_b", Text: ""},
+				{ID: 13, Type: "step_start"},
+				{ID: 12, Type: "token", MessageID: "prt_a", Text: "Let me look at the repository first."},
+				{ID: 11, Type: "token", MessageID: "prt_a", Text: ""},
+			},
+			lowerBoundEventID: i64(10),
+			want:              "1. Add the migration\n2. Wire the store",
+		},
+		{
+			// The turn running at deploy, on a sandbox-agent that sends live
+			// ahead of its replay: the previous binary stored each part's
+			// empty first frame, prt_b's final frame then arrived live, and
+			// prt_a's full frame, replayed, was stored after it. The newest
+			// row is prt_a's; prt_b opened last.
+			name: "a later part's frame stored before an earlier part's replayed frame: the part that opened last",
+			events: []ContentEvent{
+				{ID: 18, Type: "execution_complete"},
+				{ID: 17, Type: "token", MessageID: "prt_a", Text: "I'll start by reading the store and its migrations."},
+				{ID: 16, Type: "token", MessageID: "prt_b", Text: "1. Add the migration\n2. Wire the store\n3. Tests"},
+				{ID: 14, Type: "token", MessageID: "prt_b", Text: ""},
+				{ID: 13, Type: "step_start"},
+				{ID: 12, Type: "token", MessageID: "prt_a", Text: ""},
+				{ID: 11, Type: "step_start"},
+			},
+			lowerBoundEventID: i64(10),
+			want:              "1. Add the migration\n2. Wire the store\n3. Tests",
+		},
+		{
+			// The same wire order, where the later part's frames all arrived
+			// live after the replay had stored only the earlier part's empty
+			// first frame.
+			name: "a later part stored whole before an earlier part's replayed frame: the part that opened last",
+			events: []ContentEvent{
+				{ID: 19, Type: "execution_complete"},
+				{ID: 18, Type: "token", MessageID: "prt_n", Text: "Let me look at the repository first."},
+				{ID: 17, Type: "token", MessageID: "prt_p", Text: "1. Add the migration\n2. Wire the store"},
+				{ID: 16, Type: "token", MessageID: "prt_p", Text: ""},
+				{ID: 15, Type: "step_start"},
+				{ID: 12, Type: "token", MessageID: "prt_n", Text: ""},
+			},
+			lowerBoundEventID: i64(10),
+			want:              "1. Add the migration\n2. Wire the store",
+		},
+		{
+			name: "the chosen part's newest non-empty frame, not its first non-empty one",
+			events: []ContentEvent{
+				{ID: 17, Type: "token", MessageID: "prt_a", Text: "Narration, recovered late."},
+				{ID: 16, Type: "token", MessageID: "prt_b", Text: "1. Add the migration\n2. Wire the store\n3. Tests"},
+				{ID: 15, Type: "token", MessageID: "prt_b", Text: "1. Add the migration"},
+				{ID: 14, Type: "token", MessageID: "prt_b", Text: ""},
+				{ID: 12, Type: "token", MessageID: "prt_a", Text: ""},
+			},
+			lowerBoundEventID: i64(10),
+			want:              "1. Add the migration\n2. Wire the store\n3. Tests",
+		},
+		{
+			// prt_b opened last, but none of its frames beyond the empty
+			// first one reached the log: it has no text, so the newest-
+			// opened part WITH text is read, as an empty row always was
+			// skipped.
+			name: "a part whose only frames are empty is passed over, even when it opened last",
+			events: []ContentEvent{
+				{ID: 14, Type: "token", MessageID: "prt_b", Text: ""},
+				{ID: 13, Type: "step_start"},
+				{ID: 12, Type: "token", MessageID: "prt_a", Text: "The plan, in the first part."},
+				{ID: 11, Type: "token", MessageID: "prt_a", Text: ""},
+			},
+			lowerBoundEventID: i64(10),
+			want:              "The plan, in the first part.",
+		},
+		{
+			name: "an empty-only part between two text parts does not hide the last text part",
+			events: []ContentEvent{
+				{ID: 17, Type: "token", MessageID: "prt_a", Text: "Narration, recovered late."},
+				{ID: 16, Type: "token", MessageID: "prt_c", Text: "The plan."},
+				{ID: 15, Type: "token", MessageID: "prt_c", Text: ""},
+				{ID: 13, Type: "token", MessageID: "prt_b", Text: ""},
+				{ID: 11, Type: "token", MessageID: "prt_a", Text: ""},
+			},
+			lowerBoundEventID: i64(10),
+			want:              "The plan.",
+		},
+		{
+			name: "every part empty falls back",
+			events: []ContentEvent{
+				{ID: 13, Type: "token", MessageID: "prt_b", Text: ""},
+				{ID: 12, Type: "step_start"},
+				{ID: 11, Type: "token", MessageID: "prt_a", Text: ""},
+			},
+			lowerBoundEventID: i64(10),
+			want:              ContentFallbackText,
+		},
+		{
+			name: "a single-part turn: its newest non-empty frame",
+			events: []ContentEvent{
+				{ID: 15, Type: "execution_complete"},
+				{ID: 14, Type: "token", MessageID: "prt_only", Text: "The whole plan."},
+				{ID: 13, Type: "tool_call"},
+				{ID: 12, Type: "token", MessageID: "prt_only", Text: "The whole"},
+				{ID: 11, Type: "token", MessageID: "prt_only", Text: ""},
+			},
+			lowerBoundEventID: i64(10),
+			want:              "The whole plan.",
+		},
+		{
+			// A frame at or below the lower bound is an earlier turn's and
+			// places nothing: prt_b is ordered by its first frame in the
+			// window. (The session actor stores no frame in a later window
+			// for a part first stored in an earlier one, so the log does not
+			// hold this; it pins what the window alone decides.)
+			name: "a frame below the lower bound does not place a part",
+			events: []ContentEvent{
+				{ID: 14, Type: "token", MessageID: "prt_b", Text: "The plan."},
+				{ID: 13, Type: "token", MessageID: "prt_b", Text: ""},
+				{ID: 12, Type: "token", MessageID: "prt_a", Text: "Narration."},
+				{ID: 11, Type: "token", MessageID: "prt_a", Text: ""},
+				{ID: 9, Type: "token", MessageID: "prt_b", Text: ""},
+			},
+			lowerBoundEventID: i64(10),
+			want:              "The plan.",
+		},
 	}
 
 	for _, tt := range tests {

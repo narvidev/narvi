@@ -36,6 +36,17 @@
 // the event would be a worse failure than showing it under a synthetic
 // step).
 //
+// A text part is the exception, once it has a row: a `token` whose
+// messageId (the part id) already has an entry in the current turn updates
+// THAT entry, in whatever step it sits, rather than landing in the open
+// step. A part is placed where its first frame appeared. Its later frames
+// are normally right behind it, but not always: the turn still running
+// when the control plane is deployed onto per-frame storage gets its
+// parts' later frames back at the tail of the turn, after the steps that
+// followed them (internal/app/sessionactor/tokenframe.go, "The turn
+// running at deploy"). Placed by the open step, that text would show under
+// the wrong step, or a synthesized one, and its own step would stay blank.
+//
 // sub_task_start.parentMessageId correlates against a tool_call's own
 // `messageId` (NOT `callId` -- callId is what tool_result correlates
 // against instead, a distinct id on the very same event, §6.1). A
@@ -159,6 +170,7 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
   let stepsByStepId = new Map<string, StepNode>()
   let pendingSubTasksByParent = new Map<string, SubTaskNode[]>()
   let subTasksById = new Map<string, SubTaskNode>()
+  let tokensByMessageId = new Map<string, TokenStream>()
   let openStepId: string | null = null
 
   function resetTurnState(): void {
@@ -167,6 +179,7 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
     stepsByStepId = new Map()
     pendingSubTasksByParent = new Map()
     subTasksById = new Map()
+    tokensByMessageId = new Map()
     openStepId = null
   }
 
@@ -374,13 +387,16 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
     if (token !== null) {
       const turn = ensureTurn(event.id)
       if (token.subTaskId) continue
-      const step = ensureOpenStep(turn, event)
-      const existing = step.tokens.find((t) => t.messageId === token.messageId)
+      // Upsert-by-messageId, cumulative replace (§6.1), wherever in this
+      // turn the part's first frame placed it (this file's top comment).
+      const existing = tokensByMessageId.get(token.messageId)
       if (existing) {
-        existing.text = token.text // upsert-by-messageId, cumulative replace (§6.1)
-      } else {
-        step.tokens.push({ messageId: token.messageId, text: token.text })
+        existing.text = token.text
+        continue
       }
+      const stream: TokenStream = { messageId: token.messageId, text: token.text }
+      ensureOpenStep(turn, event).tokens.push(stream)
+      tokensByMessageId.set(stream.messageId, stream)
       continue
     }
     const executionComplete = asExecutionComplete(event)

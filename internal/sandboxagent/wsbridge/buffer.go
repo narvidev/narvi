@@ -20,6 +20,10 @@ type outboundEntry struct {
 	ackID    string
 	critical bool
 	payload  []byte
+	// seq is the entry's position in send order, assigned by add and never
+	// reused: flushBuffer uses it to pick up exactly the entries added
+	// while it was already writing, and eviction/ack never reorder it.
+	seq uint64
 }
 
 // evictionDecision is the pure, deterministic policy backing the outbound
@@ -65,14 +69,15 @@ func evictionDecision(current []outboundEntry, newEntry outboundEntry, capacity 
 type outboundBuffer struct {
 	mu      sync.Mutex
 	entries []outboundEntry
+	nextSeq uint64
 }
 
 func newOutboundBuffer() *outboundBuffer {
 	return &outboundBuffer{}
 }
 
-// add appends entry, evicting one existing entry first if evictionDecision
-// says to.
+// add appends entry, stamped with the next send-order seq, evicting one
+// existing entry first if evictionDecision says to.
 func (b *outboundBuffer) add(entry outboundEntry) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -80,6 +85,8 @@ func (b *outboundBuffer) add(entry outboundEntry) {
 	if idx, evict := evictionDecision(b.entries, entry, outboundBufferCap); evict {
 		b.entries = append(b.entries[:idx], b.entries[idx+1:]...)
 	}
+	entry.seq = b.nextSeq
+	b.nextSeq++
 	b.entries = append(b.entries, entry)
 }
 
@@ -99,14 +106,26 @@ func (b *outboundBuffer) ack(ackID string) {
 }
 
 // snapshot returns a stable copy of every currently-buffered entry, in
-// original order, for replay on (re)connect. A copy (not the live slice) so
-// the caller can range over it while add/ack continue to run concurrently
-// against the real buffer.
+// original order. A copy (not the live slice) so the caller can range over
+// it while add/ack continue to run concurrently against the real buffer.
 func (b *outboundBuffer) snapshot() []outboundEntry {
+	return b.snapshotFrom(0)
+}
+
+// snapshotFrom is snapshot restricted to the entries whose seq is at least
+// fromSeq -- still in original order, since seq only ever grows and
+// eviction/ack only remove entries. flushBuffer (run.go) calls it with the
+// seq just past the last entry it wrote, to pick up what was added while
+// it was writing.
+func (b *outboundBuffer) snapshotFrom(fromSeq uint64) []outboundEntry {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	out := make([]outboundEntry, len(b.entries))
-	copy(out, b.entries)
+	out := make([]outboundEntry, 0, len(b.entries))
+	for _, e := range b.entries {
+		if e.seq >= fromSeq {
+			out = append(out, e)
+		}
+	}
 	return out
 }

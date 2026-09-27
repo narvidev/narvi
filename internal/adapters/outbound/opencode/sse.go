@@ -341,9 +341,12 @@ func (a *Adapter) dispatchEvent(env sseEnvelope) {
 
 	default:
 		// server.heartbeat, session.updated, session.status, session.diff,
-		// message.part.delta (a redundant delta view of the SAME text
-		// message.part.updated already reports cumulatively -- translating
-		// it too would double-report the same content), catalog.updated,
+		// message.part.delta (a delta view of the SAME text
+		// message.part.updated reports cumulatively -- translating it too
+		// would double-report the same content; on the pinned runtime
+		// message.part.updated fires only when a text part opens, empty,
+		// and when it closes, full, so each part reaches the wire as two
+		// token frames, see textPart, types.go), catalog.updated,
 		// bare busy/idle, plugin.*, integration.*, reference.updated, and
 		// anything else a future OpenCode version adds: silently ignored,
 		// exactly matching §7's own "no wire event exists for it, this is
