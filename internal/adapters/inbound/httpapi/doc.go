@@ -27,7 +27,12 @@
 //     from its turn queue, its push/PR delivery, the work armed to create a
 //     turn and its human gates in one snapshot (never sessions.status), and
 //     a suggested delay before the next read. No events: the transcript is
-//     the events route below.
+//     the events route below. ?waitSeconds=N makes it the bounded wait
+//     (row 182's piece (b)): the same read at once and every
+//     MCPWaitPollInterval until settled or N seconds (clamped to
+//     MCPWaitMaxDuration) have passed, on the replica's one
+//     sessionactivity.Waiter, answered with restdtos.SessionActivity.Wait
+//     set; 400 on a negative or malformed value.
 //   - GET /api/sessions/{sessionID}/events?cursor=&limit= -- events.go's
 //     ListEvents: 404 if the session doesn't exist, else 200 with
 //     restdtos.EventsResponse (shaped exactly like client-ws/v1's own

@@ -161,6 +161,10 @@ type oauthRouterRig struct {
 	pool   *pgxpool.Pool
 	cfg    *platform.Config
 	server *httptest.Server
+	// app is what Build returned, for a test that needs its unexported
+	// wiring -- the replica's one bounded-wait service, or Run's own
+	// HTTP server (newHTTPServer).
+	app *App
 }
 
 // newOAuthRouterRig sets NARVI_MCP_ENABLED and a PublicBaseURL equal to a
@@ -227,7 +231,7 @@ func newOAuthRouterRigWith(t *testing.T, pool *pgxpool.Pool, env map[string]stri
 	server.Config.Handler = app.Router
 	server.Start()
 	t.Cleanup(server.Close)
-	return &oauthRouterRig{pool: pool, cfg: cfg, server: server}
+	return &oauthRouterRig{pool: pool, cfg: cfg, server: server, app: app}
 }
 
 // doJSON makes one REST call with an optional session cookie, decoding
@@ -717,7 +721,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 
 	// The exit criterion end to end (§43.19): the official SDK client
 	// discovers everything from one live 401, the member approves on the
-	// consent page, and the resulting token lists exactly the five tools
+	// consent page, and the resulting token lists exactly the six tools
 	// and calls one with the same bytes the REST twin gives the member's
 	// own cookie. The SDK's own RFC 9207 issuer check passes along the way.
 	t.Run("EndToEnd_SDKClient", func(t *testing.T) {
@@ -751,7 +755,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 			t.Fatalf("consent flow ran %d times, want 1", n)
 		}
 
-		want := []string{"narvi_get_session", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions"}
+		want := []string{"narvi_get_session", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions", "narvi_wait_for_session"}
 		if got := toolNames(ctx, t, flow.session); strings.Join(got, ",") != strings.Join(want, ",") {
 			t.Fatalf("ListTools = %v, want %v", got, want)
 		}
@@ -1172,6 +1176,45 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		sdkSessionStatusAndTranscriptScopeless(t, rig)
 	})
 
+	// Row 182's piece (b), the bounded wait (§43.20), and the row's own
+	// exit: on a router of its own whose wait polls every 100 ms
+	// (waitTestTimeouts), and -- for the long call -- on rig, whose wait is
+	// the shipped 25 s at one read a second. Wait_CrossReplica adds a
+	// second router on the same database; Wait_ShutdownInterruptsPromptly
+	// a third, since the shutdown it drives interrupts that router's waits
+	// for good. mcp_sessionwait_integration_test.go has each one's doc.
+	waitRig := newOAuthRouterRigWith(t, pool, nil, cimdfetch.GuardConfig{}, waitTestTimeouts)
+	t.Run("Wait_ReturnsOnRealTerminalState_SDKClient", func(t *testing.T) {
+		sdkWaitReturnsOnRealTerminalState(t, waitRig)
+	})
+	t.Run("Wait_NeverReturnsOnAQueueThatHasNotStarted_SDKClient", func(t *testing.T) {
+		sdkWaitNeverReturnsOnAQueueThatHasNotStarted(t, waitRig)
+	})
+	t.Run("Wait_ReturnsOnAwaitingApproval_SDKClient", func(t *testing.T) {
+		sdkWaitReturnsOnAwaitingApproval(t, waitRig)
+	})
+	t.Run("Wait_UnsettledThroughDeliveringAndScheduled_SDKClient", func(t *testing.T) {
+		sdkWaitUnsettledThroughDeliveringAndScheduled(t, waitRig)
+	})
+	t.Run("Wait_BytesEqualTheRESTTwin_SDKClient", func(t *testing.T) {
+		sdkWaitParityWithTheRESTTwin(t, waitRig)
+	})
+	t.Run("Wait_CapacityDegradesToSnapshot_PerGrant", func(t *testing.T) {
+		sdkWaitCapacityPerGrant(t, waitRig)
+	})
+	t.Run("Wait_ScopelessGrantDoesNotSeeIt", func(t *testing.T) {
+		sdkWaitScopelessGrantDoesNotSeeIt(t, waitRig)
+	})
+	t.Run("Wait_CrossReplica", func(t *testing.T) {
+		sdkWaitCrossReplica(t, waitRig, newOAuthRouterRigWith(t, pool, nil, cimdfetch.GuardConfig{}, waitTestTimeouts))
+	})
+	t.Run("Wait_LongCallThroughSDK", func(t *testing.T) {
+		sdkWaitLongCallThroughSDK(t, rig)
+	})
+	t.Run("Wait_ShutdownInterruptsPromptly_RunServer", func(t *testing.T) {
+		waitShutdownInterruptsPromptly(t, newOAuthRouterRigWith(t, pool, nil, cimdfetch.GuardConfig{}, liftEndpointBrakes))
+	})
+
 	// --- Clients without a prior relationship (§43.15) ---
 	//
 	// doc is an in-test HTTPS server on loopback serving one client ID
@@ -1260,7 +1303,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SDK Connect with a metadata document: %v", err)
 		}
-		want := []string{"narvi_get_session", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions"}
+		want := []string{"narvi_get_session", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions", "narvi_wait_for_session"}
 		if got := toolNames(ctx, t, flow.session); strings.Join(got, ",") != strings.Join(want, ",") {
 			t.Fatalf("ListTools = %v, want %v", got, want)
 		}
@@ -1312,8 +1355,8 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SDK Connect with dynamic registration: %v", err)
 		}
-		if got := toolNames(ctx, t, flow.session); len(got) != 5 {
-			t.Fatalf("ListTools = %v, want the five tools", got)
+		if got := toolNames(ctx, t, flow.session); len(got) != 6 {
+			t.Fatalf("ListTools = %v, want the six tools", got)
 		}
 		if res, err := callListModels(ctx, flow.session); err != nil || res.IsError {
 			t.Fatalf("CallTool narvi_list_models: res %+v err %v", res, err)

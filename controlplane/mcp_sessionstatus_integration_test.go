@@ -104,8 +104,9 @@ func toolText(t *testing.T, res *sdkmcp.CallToolResult) []byte {
 }
 
 // sessionActivityKeys is SessionActivity's own property set, from the
-// embedded contract.
-func sessionActivityKeys(t *testing.T) []string {
+// embedded contract: every key of a plain read, and -- waited -- the wait
+// object too, which only a read that waited carries (§43.20, piece (b)).
+func sessionActivityKeys(t *testing.T, waited bool) []string {
 	t.Helper()
 	data, err := contracts.FS.ReadFile("rest/v1/dtos.schema.json")
 	if err != nil {
@@ -121,6 +122,9 @@ func sessionActivityKeys(t *testing.T) []string {
 	}
 	keys := make([]string, 0)
 	for k := range doc.Defs["SessionActivity"].Properties {
+		if k == "wait" && !waited {
+			continue
+		}
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
@@ -132,8 +136,9 @@ func sessionActivityKeys(t *testing.T) []string {
 // each snapshot's own database clock, so two reads never share it. The
 // MCP read came second, so its observedAt is not earlier; substituting it
 // into the REST bytes must then give the MCP bytes exactly. Both bodies
-// carry exactly SessionActivity's keys: no events, no transcript.
-func assertStatusBytesEqual(t *testing.T, label string, restBody, mcpBody []byte) map[string]any {
+// carry exactly SessionActivity's keys -- the wait object exactly when
+// waited -- and so no events, no transcript.
+func assertStatusBytesEqual(t *testing.T, label string, restBody, mcpBody []byte, waited bool) map[string]any {
 	t.Helper()
 	var rest, viaMCP map[string]any
 	if err := json.Unmarshal(restBody, &rest); err != nil {
@@ -142,7 +147,7 @@ func assertStatusBytesEqual(t *testing.T, label string, restBody, mcpBody []byte
 	if err := json.Unmarshal(mcpBody, &viaMCP); err != nil {
 		t.Fatalf("%s: MCP body %s: %v", label, mcpBody, err)
 	}
-	want := sessionActivityKeys(t)
+	want := sessionActivityKeys(t, waited)
 	for side, body := range map[string]map[string]any{"REST": rest, "MCP": viaMCP} {
 		keys := make([]string, 0, len(body))
 		for k := range body {
@@ -191,7 +196,7 @@ func sdkSessionStatusAndTranscript(t *testing.T, rig *oauthRouterRig) {
 	if err != nil {
 		t.Fatalf("CallTool narvi_get_session_status: %v", err)
 	}
-	got := assertStatusBytesEqual(t, "narvi_get_session_status", restStatus, toolText(t, res))
+	got := assertStatusBytesEqual(t, "narvi_get_session_status", restStatus, toolText(t, res), false)
 	structured, err := json.Marshal(res.StructuredContent)
 	if err != nil {
 		t.Fatal(err)

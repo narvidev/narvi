@@ -1,11 +1,13 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -13,6 +15,7 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/sessionactivity"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/domain/sandbox"
 	"github.com/narvidev/narvi/internal/domain/session"
@@ -42,7 +45,25 @@ import (
 // five values while a turn is queued or running. The response carries no
 // events: the transcript is GET /api/sessions/{sessionID}/events, a
 // separate, paginated read.
-func GetSessionStatus(sessions *postgres.SessionStore, timeouts platform.Timeouts) http.HandlerFunc {
+//
+// ?waitSeconds=N makes it the bounded wait (row 182's piece (b)), and the
+// twin of narvi_wait_for_session too: waiter reads the same snapshot at
+// once and, while it is not settled, again every MCPWaitPollInterval, for
+// at most N seconds clamped to MCPWaitMaxDuration, and the answer is the
+// latest snapshot with wait set to how the wait ended
+// (sessionactivity.Waiter). Every read is this route's own plain read --
+// one statement on a pool connection taken for it and given back before
+// the sleep -- behind the same gate: a wait sees exactly what a read
+// does, only later. A caller already running MCPWaitMaxConcurrentPerKey
+// waits (per MCP grant, or per user for a cookie), or a replica running
+// MCPWaitMaxConcurrentPerReplica, gets its first read at once, reason
+// "capacity". Absent or 0 is the plain read, byte for byte (wait is
+// omitted); a negative or malformed value is a 400.
+//
+// waiter is one per replica (controlplane builds it once, for this route
+// and the MCP twin alike, and wires its Interrupt to the HTTP server's
+// shutdown).
+func GetSessionStatus(sessions *postgres.SessionStore, waiter *sessionactivity.Waiter, timeouts platform.Timeouts) http.HandlerFunc {
 	delays := statusDelayTable(timeouts)
 	bounds := statusBoundsFrom(timeouts)
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -50,28 +71,123 @@ func GetSessionStatus(sessions *postgres.SessionStore, timeouts platform.Timeout
 		if !ok {
 			return
 		}
+		waitSeconds, ok := parseWaitSeconds(w, r)
+		if !ok {
+			return
+		}
 		ctx := platform.WithSessionID(r.Context(), sessionID.String())
 		logger := platform.Logger(ctx)
 
-		facts, err := sessions.ActivityFacts(ctx, sessionID, sessionactor.ReviewAutoRetriggerBudget)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				writeError(w, http.StatusNotFound, "session not found")
+		read := func(ctx context.Context) (restdtos.SessionActivity, error) {
+			facts, err := sessions.ActivityFacts(ctx, sessionID, sessionactor.ReviewAutoRetriggerBudget)
+			if err != nil {
+				return restdtos.SessionActivity{}, err
+			}
+			dto, err := sessionActivityToDTO(facts, delays, bounds)
+			if err != nil {
+				return restdtos.SessionActivity{}, &unreadableActivityError{err: err}
+			}
+			return dto, nil
+		}
+
+		if waitSeconds == 0 {
+			dto, err := read(ctx)
+			if err != nil {
+				writeStatusReadError(ctx, w, err)
 				return
 			}
-			logger.Error("httpapi: read session activity facts failed", "error", err)
-			writeError(w, http.StatusInternalServerError, "internal error")
+			writeJSON(w, http.StatusOK, dto)
 			return
 		}
 
-		dto, err := sessionActivityToDTO(facts, delays, bounds)
+		var latest restdtos.SessionActivity
+		outcome, err := waiter.Wait(ctx, waitKey(ctx), waitSeconds, func(ctx context.Context) (bool, error) {
+			dto, err := read(ctx)
+			if err != nil {
+				return false, err
+			}
+			latest = dto
+			return dto.Settled, nil
+		})
 		if err != nil {
-			logger.Error("httpapi: session activity facts are unreadable", "error", err)
-			writeError(w, http.StatusInternalServerError, "internal error")
+			writeStatusReadError(ctx, w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, dto)
+		latest.Wait = &restdtos.SessionActivityWait{
+			Reason:   restdtos.SessionActivityWaitReason(outcome.Reason),
+			WaitedMs: int(outcome.Waited.Milliseconds()),
+		}
+		logger.Debug("httpapi: session status wait ended", "reason", string(outcome.Reason), "waited_ms", latest.Wait.WaitedMs, "activity", string(latest.Activity))
+		writeJSON(w, http.StatusOK, latest)
 	}
+}
+
+// unreadableActivityError marks a facts row sessionActivityToDTO could not
+// decode -- this build's defect, not the database's -- so it is logged as
+// such.
+type unreadableActivityError struct{ err error }
+
+func (e *unreadableActivityError) Error() string { return e.err.Error() }
+func (e *unreadableActivityError) Unwrap() error { return e.err }
+
+// writeStatusReadError answers a status read (or a wait's read) that
+// failed: 404 when the session does not exist; when the request itself
+// ended first -- the client went away mid-wait -- a 503 nobody reads,
+// logged at DEBUG only, since that is an ordinary way for a wait to end;
+// otherwise 500, logged.
+func writeStatusReadError(ctx context.Context, w http.ResponseWriter, err error) {
+	logger := platform.Logger(ctx)
+	var unreadable *unreadableActivityError
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		writeError(w, http.StatusNotFound, "session not found")
+	case ctx.Err() != nil:
+		logger.Debug("httpapi: session status read ended with its request", "error", err)
+		writeError(w, http.StatusServiceUnavailable, "request cancelled")
+	case errors.As(err, &unreadable):
+		logger.Error("httpapi: session activity facts are unreadable", "error", unreadable.err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+	default:
+		logger.Error("httpapi: read session activity facts failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+	}
+}
+
+// parseWaitSeconds reads ?waitSeconds=: absent or 0 is no wait (0 is
+// returned, the plain read); a positive whole number of seconds is a wait
+// of that long, clamped later by the Waiter to MCPWaitMaxDuration -- one
+// too large for an int64 included, which is the maximum like any other
+// large value, never a refusal. A negative value, an empty one, or
+// anything but a decimal integer writes 400 and returns ok=false.
+func parseWaitSeconds(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	values, present := r.URL.Query()["waitSeconds"]
+	if !present {
+		return 0, true
+	}
+	// Out of range, ParseInt returns math.MaxInt64 (or math.MinInt64) with
+	// strconv.ErrRange: the first is a large wait the Waiter clamps like
+	// any other, the second negative.
+	n, err := strconv.ParseInt(values[0], 10, 64)
+	if (err != nil && !errors.Is(err, strconv.ErrRange)) || n < 0 {
+		writeError(w, http.StatusBadRequest, "malformed waitSeconds")
+		return 0, false
+	}
+	return n, true
+}
+
+// waitKey is whose cap a wait counts against: the MCP grant the request was
+// authenticated under (auth.RequireMCPBearer attaches it; every token of
+// one client authorization shares it), or, for a cookie request, the
+// signed-in user. It is a count's key and nothing more -- no permission
+// ever derives from it.
+func waitKey(ctx context.Context) string {
+	if grant, ok := platform.MCPGrantFromContext(ctx); ok {
+		return "grant:" + grant.GrantID
+	}
+	if user, ok := platform.UserFromContext(ctx); ok {
+		return "user:" + user.ID
+	}
+	return ""
 }
 
 // statusDelayTable is session.DelayTable from the MCPStatusDelay* fields

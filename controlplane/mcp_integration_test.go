@@ -316,7 +316,7 @@ func TestBuild_MCPSurface_RealRouter(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, body = %s, want 200", rec.Code, rec.Body.String())
 		}
-		for _, want := range []string{"narvi_list_models", "narvi_list_sessions", "narvi_get_session", "narvi_get_session_status", "narvi_get_session_transcript"} {
+		for _, want := range []string{"narvi_list_models", "narvi_list_sessions", "narvi_get_session", "narvi_get_session_status", "narvi_wait_for_session", "narvi_get_session_transcript"} {
 			if !strings.Contains(rec.Body.String(), want) {
 				t.Errorf("tools/list body does not mention %q: %s", want, rec.Body.String())
 			}
@@ -431,6 +431,10 @@ func TestBuild_MCPSurface_TwinParity(t *testing.T) {
 		{"narvi_list_sessions", "/api/sessions?filter=all", "narvi_list_sessions", `{"filter":"all"}`},
 		{"narvi_get_session", "/api/sessions/" + sessionID, "narvi_get_session", fmt.Sprintf(`{"sessionId":%q}`, sessionID)},
 		{"narvi_get_session_status", "/api/sessions/" + busyID + "/status", "narvi_get_session_status", fmt.Sprintf(`{"sessionId":%q}`, busyID)},
+		// The wait's twin is the status route with ?waitSeconds=; on a
+		// session with no turn (idle, settled) both answer at once, so
+		// the bytes compare like the status row's.
+		{"narvi_wait_for_session", "/api/sessions/" + sessionID + "/status?waitSeconds=5", "narvi_wait_for_session", fmt.Sprintf(`{"sessionId":%q,"waitSeconds":5}`, sessionID)},
 		{"narvi_get_session_transcript", "/api/sessions/" + busyID + "/events?limit=2", "narvi_get_session_transcript", fmt.Sprintf(`{"sessionId":%q,"limit":2}`, busyID)},
 	}
 
@@ -471,7 +475,7 @@ func TestBuild_MCPSurface_TwinParity(t *testing.T) {
 				t.Fatalf("tools/call %s: result = %+v, want a successful result", tt.toolName, env.Result)
 			}
 
-			if tt.toolName == "narvi_get_session_status" {
+			if tt.toolName == "narvi_get_session_status" || tt.toolName == "narvi_wait_for_session" {
 				// observedAt is each snapshot's own clock; every other
 				// byte must match (assertStatusBytesEqual's doc comment).
 				var text struct {
@@ -484,7 +488,7 @@ func TestBuild_MCPSurface_TwinParity(t *testing.T) {
 				if err := json.Unmarshal(callRec.Body.Bytes(), &text); err != nil || len(text.Result.Content) != 1 {
 					t.Fatalf("tools/call %s: body %s", tt.toolName, callRec.Body.String())
 				}
-				assertStatusBytesEqual(t, tt.name, restRec.Body.Bytes(), []byte(text.Result.Content[0].Text))
+				assertStatusBytesEqual(t, tt.name, restRec.Body.Bytes(), []byte(text.Result.Content[0].Text), tt.toolName == "narvi_wait_for_session")
 				return
 			}
 

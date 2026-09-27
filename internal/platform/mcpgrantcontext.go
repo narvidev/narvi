@@ -3,10 +3,12 @@
 // AuthenticatedUser authcontext.go already carries. internal/adapters/
 // inbound/auth's RequireMCPBearer attaches both after verifying a bearer
 // access token; internal/adapters/inbound/mcp reads the grant to decide
-// which tools the request may see. Nothing else reads it: the REST twins
-// a tool invokes see only the AuthenticatedUser, exactly as for a cookie
-// request, so a grant can only ever SUBTRACT (hide tools), never add a
-// permission the user does not already hold.
+// which tools the request may see. The REST twins a tool invokes authorize
+// from the AuthenticatedUser alone, exactly as for a cookie request, so a
+// grant can only ever SUBTRACT (hide tools), never add a permission the
+// user does not already hold. The one twin that reads it is the status
+// route's bounded wait (technical plan §43.20), and only its GrantID, as
+// the key its per-caller cap counts against -- never a permission.
 
 package platform
 

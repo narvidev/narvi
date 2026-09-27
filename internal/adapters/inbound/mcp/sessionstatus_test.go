@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -164,5 +165,83 @@ func TestToolCall_SessionStatusAndTranscript_ReachTheirTwins(t *testing.T) {
 	sort.Slice(transcript, func(i, j int) bool { return transcript[i].query < transcript[j].query })
 	if want := []seen{{id, ""}, {id, "cursor=41&limit=2"}}; !reflect.DeepEqual(transcript, want) {
 		t.Errorf("transcript twin saw %+v, want %+v", transcript, want)
+	}
+}
+
+// TestBuildWaitForSessionRequest_Table pins how narvi_wait_for_session's
+// arguments reach GET /api/sessions/{sessionID}/status: the session id as
+// the chi param, and waitSeconds ALWAYS on the query -- so the twin tells
+// the wait from a plain read -- the caller's value in any integer spelling
+// the schema accepts, or the largest the route parses (which it clamps to
+// the deployment's maximum) when omitted or past int64: a large wait is
+// clamped, never an argument error.
+func TestBuildWaitForSessionRequest_Table(t *testing.T) {
+	const id = "5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a"
+	const longest = "9223372036854775807"
+	tests := []struct {
+		name      string
+		arguments string
+		want      string
+	}{
+		{"omitted: the longest wait", `{"sessionId":"` + id + `"}`, longest},
+		{"one second", `{"sessionId":"` + id + `","waitSeconds":1}`, "1"},
+		{"the shipped maximum", `{"sessionId":"` + id + `","waitSeconds":25}`, "25"},
+		{"past the maximum, left to the twin's clamp", `{"sessionId":"` + id + `","waitSeconds":600}`, "600"},
+		{"an exponent", `{"sessionId":"` + id + `","waitSeconds":1e1}`, "10"},
+		{"a zero fraction", `{"sessionId":"` + id + `","waitSeconds":3.0}`, "3"},
+		{"past int64: the longest wait, not a refusal", `{"sessionId":"` + id + `","waitSeconds":1e30}`, longest},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			params, query, err := buildWaitForSessionRequest(json.RawMessage(tc.arguments))
+			if err != nil {
+				t.Fatalf("err = %v", err)
+			}
+			if !reflect.DeepEqual(params, map[string]string{"sessionID": id}) {
+				t.Errorf("urlParams = %v, want sessionID only", params)
+			}
+			if want := (url.Values{"waitSeconds": {tc.want}}); !reflect.DeepEqual(query, want) {
+				t.Errorf("query = %v, want %v", query, want)
+			}
+		})
+	}
+}
+
+// TestToolCall_WaitForSession_ReachesTheStatusTwin drives the wait through
+// the full handler: it invokes the SAME twin as narvi_get_session_status
+// -- the status route -- with ?waitSeconds= set, the status tool with no
+// query at all, and the twin's body comes back verbatim, wait object
+// included; a waitSeconds below one is refused before the twin runs.
+func TestToolCall_WaitForSession_ReachesTheStatusTwin(t *testing.T) {
+	const id = "5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a"
+	const body = `{"activity":"finished","wait":{"reason":"settled","waitedMs":1200}}`
+	var seen []string
+	twins := testTwins()
+	twins.GetSessionStatus = func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, chi.URLParam(r, "sessionID")+"?"+r.URL.RawQuery)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(body))
+	}
+	handler := newTestHandler(t, true, true, twins)
+
+	for _, call := range []struct{ tool, args string }{
+		{"narvi_wait_for_session", `{"sessionId":"` + id + `","waitSeconds":7}`},
+		{"narvi_wait_for_session", `{"sessionId":"` + id + `"}`},
+		{"narvi_get_session_status", `{"sessionId":"` + id + `"}`},
+	} {
+		if text, isError := postToolCall(t, handler, call.tool, call.args); isError || text != body {
+			t.Fatalf("%s %s = (IsError %v, %q), want the twin's body", call.tool, call.args, isError, text)
+		}
+	}
+	want := []string{id + "?waitSeconds=7", id + "?waitSeconds=9223372036854775807", id + "?"}
+	if !reflect.DeepEqual(seen, want) {
+		t.Fatalf("the status twin saw %v, want %v", seen, want)
+	}
+	if text, isError := postToolCall(t, handler, "narvi_wait_for_session", `{"sessionId":"`+id+`","waitSeconds":0}`); !isError || !strings.Contains(text, "minimum") {
+		t.Fatalf("waitSeconds 0 = (IsError %v, %q), want an argument refusal naming the minimum", isError, text)
+	}
+	if len(seen) != 3 {
+		t.Fatalf("the twin ran for a refused argument: %v", seen)
 	}
 }

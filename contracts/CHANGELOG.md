@@ -10,6 +10,30 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.8.0]
+
+### rest/v1/dtos.schema.json
+
+- Added: `SessionActivity.wait` -- how a wait on
+  `GET /api/sessions/{sessionID}/status?waitSeconds=N` ended (technical
+  plan §43.20, row 182's bounded wait): `reason` (`settled`, `timeout`,
+  `interrupted` -- the server began shutting down -- or `capacity` -- the
+  caller, or the replica, already runs the most waits it may, so the read
+  did not wait: a normal answer, never an error) and `waitedMs`. Present
+  only on a read that waited; a plain read (no `waitSeconds`, or `0`) is
+  byte-for-byte what it was. A property added, not required, to a
+  platform-to-client shape, graded MINOR (row 2).
+- Changed: `SessionActivity`'s description now documents the route's new
+  `waitSeconds` query parameter: a whole number of seconds, clamped to the
+  deployment's maximum (25 as shipped); absent or `0` is the plain read, a
+  negative or malformed value a `400`. The route itself is unchanged in
+  `routes.golden`. A description changed, graded PATCH (row 35).
+- Added: `WaitForSessionToolRequest` -- the input schema of the new
+  `narvi_wait_for_session` MCP tool (`sessionId`, and an optional
+  `waitSeconds` with `minimum: 1`, omitted meaning the longest wait the
+  deployment allows), whose output is `SessionActivity` with `wait` set. A
+  `$defs` entry added, graded MINOR (row 32).
+
 ## [1.7.0]
 
 ### controlplane/testdata/routes.golden
