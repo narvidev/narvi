@@ -2059,7 +2059,7 @@ func run() error {
 		if bridge != nil {
 			bridge.MarkBootComplete()
 		}
-		slog.Info("sandbox-agent: boot sequence complete")
+		slog.Info(bootCompleteLogMsg)
 	}
 
 	runErr := group.Wait()
@@ -2094,7 +2094,7 @@ func run() error {
 	// services already started (Setpgid'd process groups have no
 	// Pdeathsig; nothing else reaps them if sandbox-agent exits without
 	// running this).
-	slog.Info("sandbox-agent: shutting down", "grace_period", timeouts.SupervisorShutdownTimeout.String())
+	slog.Info(shuttingDownLogMsg, "grace_period", timeouts.SupervisorShutdownTimeout.String())
 
 	// Deliberately a fresh background context, not ctx: by this point ctx
 	// is already canceled (that's exactly what triggers this shutdown),
@@ -2165,6 +2165,18 @@ func run() error {
 // produced no warning at all, so nothing could be excluded by matching on
 // one).
 const warmBootSecondaryFailedMsg = "sandbox-agent: warm-boot git-dir seed: secondary repo failed, continuing (will be reported by sync)"
+
+// bootCompleteLogMsg is what run() logs once boot has fully finished -- after
+// runBootSequence and the post-boot ChownWorkspaceForRuntime pass, right
+// after bridge.MarkBootComplete -- and shuttingDownLogMsg what it logs when it
+// begins its supervised shutdown, which before boot completes means boot
+// failed. Named, like warmBootSecondaryFailedMsg above, so the tests that
+// wait on them (push_integration_test.go's waitForBootComplete) read the
+// messages run() actually logs rather than copies that can drift.
+const (
+	bootCompleteLogMsg = "sandbox-agent: boot sequence complete"
+	shuttingDownLogMsg = "sandbox-agent: shutting down"
+)
 
 // warmBootSeedWarning is one non-fatal outcome of seedWarmBootRepos' own
 // loop (an invalid repo name, or a secondary repo's failed Seed call) --
