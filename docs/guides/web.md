@@ -163,10 +163,11 @@ seconds have passed (25 at most), with the latest status. A queued,
 running, delivering or scheduled session never ends the wait early. The
 answer is the same status with a `wait` object: its `reason` is
 `settled`, `timeout` (still not settled — wait again), `interrupted`
-(the server is restarting — wait again) or `capacity` (two of your waits
-are already running, or the server runs as many as it allows, so this
-one answered at once), and `waitedMs` says
-how long it waited. No `waitSeconds`, or `0`, is the plain read; a
+(the server is restarting — wait again) or `capacity` (the server that
+took the request already runs two of your waits from the browser, four of
+yours in all — your MCP clients' included — or 32 from everyone, so this
+one read the status once and answered at once), and `waitedMs` says how
+long it waited. No `waitSeconds`, or `0`, is the plain read; a
 negative or malformed value is refused.
 
 ```json narvi-command

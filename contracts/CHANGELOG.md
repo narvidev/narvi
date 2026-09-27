@@ -18,8 +18,11 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   `GET /api/sessions/{sessionID}/status?waitSeconds=N` ended (technical
   plan §43.20, row 182's bounded wait): `reason` (`settled`, `timeout`,
   `interrupted` -- the server began shutting down -- or `capacity` -- the
-  caller, or the replica, already runs the most waits it may, so the read
-  did not wait: a normal answer, never an error) and `waitedMs`. Present
+  replica serving it already runs the most waits one of its three caps
+  allows: the caller's (per MCP authorization, or per user for a browser),
+  the user's across all of their authorizations and their browser, or all
+  callers' -- so the read did not wait: a normal answer, never an error)
+  and `waitedMs`. Present
   only on a read that waited; a plain read (no `waitSeconds`, or `0`) is
   byte-for-byte what it was. A property added, not required, to a
   platform-to-client shape, graded MINOR (row 2).

@@ -3,14 +3,20 @@ package mcp
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
+
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // specNamed returns the table's own spec for name.
@@ -243,5 +249,65 @@ func TestToolCall_WaitForSession_ReachesTheStatusTwin(t *testing.T) {
 	}
 	if len(seen) != 3 {
 		t.Fatalf("the twin ran for a refused argument: %v", seen)
+	}
+}
+
+// TestWaitForSessionText_StatesTheShippedBounds (review round 1's P2 and
+// P6): the texts an MCP client's model reads about narvi_wait_for_session
+// -- the tool's description, its line of the server instructions, and
+// SessionActivity.wait.reason's description in the contract -- state the
+// wait's length and every cause of "capacity" with the values
+// platform.DefaultTimeouts ships, so none of them can drift from the
+// Waiter they describe: the poll, the longest wait and the last read taken
+// at it, and the three caps -- this authorization's, this user's across
+// all of their authorizations and their browser, and the replica's.
+func TestWaitForSessionText_StatesTheShippedBounds(t *testing.T) {
+	to := platform.DefaultTimeouts()
+	if to.MCPWaitPollInterval != time.Second {
+		t.Fatalf("MCPWaitPollInterval = %v: the texts say one second, update them with it", to.MCPWaitPollInterval)
+	}
+	longest := fmt.Sprintf("%d seconds as shipped", platform.DurationToSeconds(to.MCPWaitMaxDuration))
+	spec := specNamed(t, "narvi_wait_for_session")
+	for _, want := range []string{
+		"then again one second after each read (as shipped)",
+		"the longest: " + longest,
+		"then reads the state once more and returns that read",
+		fmt.Sprintf("%d under this authorization", to.MCPWaitMaxConcurrentPerKey),
+		fmt.Sprintf("%d of this user's across all of their authorizations and their browser", to.MCPWaitMaxConcurrentPerUser),
+		fmt.Sprintf("%d from all callers together", to.MCPWaitMaxConcurrentPerReplica),
+	} {
+		if !strings.Contains(spec.Description, want) {
+			t.Errorf("the tool description does not state %q:\n%s", want, spec.Description)
+		}
+	}
+	if want := "up to " + longest; !strings.Contains(spec.Instruction, want) {
+		t.Errorf("the tool's instruction %q does not state %q", spec.Instruction, want)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(repoRoot(t), "contracts", "rest", "v1", "dtos.schema.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema struct {
+		Defs map[string]struct {
+			Properties map[string]struct {
+				Properties map[string]struct {
+					Description string `json:"description"`
+				} `json:"properties"`
+			} `json:"properties"`
+		} `json:"$defs"`
+	}
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatal(err)
+	}
+	reason := schema.Defs["SessionActivity"].Properties["wait"].Properties["reason"].Description
+	for _, want := range []string{
+		fmt.Sprintf("the caller's (%d as shipped, counted per MCP authorization, or per user for a signed-in browser)", to.MCPWaitMaxConcurrentPerKey),
+		fmt.Sprintf("the user's across all of their MCP authorizations and their browser together (%d)", to.MCPWaitMaxConcurrentPerUser),
+		fmt.Sprintf("all callers' together (%d)", to.MCPWaitMaxConcurrentPerReplica),
+	} {
+		if !strings.Contains(reason, want) {
+			t.Errorf("SessionActivity.wait.reason's description does not state %q:\n%s", want, reason)
+		}
 	}
 }

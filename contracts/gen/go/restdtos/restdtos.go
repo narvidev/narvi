@@ -11591,12 +11591,13 @@ type SessionActivityWait struct {
 	// finished, idle or awaiting_approval). 'timeout': the wait ran to its bound and
 	// the session is still not settled -- call the wait again, rather than sleeping.
 	// 'interrupted': the server began shutting down, and answered the latest read at
-	// once -- call again, another replica will serve it. 'capacity': the caller
-	// already has the most waits one caller may have running on this replica (2 as
-	// shipped, counted per MCP authorization, or per user for a signed-in browser),
-	// or the replica the most it runs (32), so this read did not wait -- a normal
-	// answer, never an error; the snapshot is current, and calling again once a wait
-	// has returned will wait.
+	// once -- call again, another replica will serve it. 'capacity': the replica
+	// serving the call already runs as many concurrent waits as one of its three caps
+	// allows -- the caller's (2 as shipped, counted per MCP authorization, or per
+	// user for a signed-in browser), the user's across all of their MCP
+	// authorizations and their browser together (4), or all callers' together (32) --
+	// so the status was read once and this read did not wait: a normal answer, never
+	// an error; the snapshot is current, and a later call waits once a slot is free.
 	Reason SessionActivityWaitReason `json:"reason" yaml:"reason" mapstructure:"reason"`
 
 	// How long the wait blocked, in milliseconds, from its first read to its answer:
