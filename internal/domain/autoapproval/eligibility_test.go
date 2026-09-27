@@ -71,15 +71,37 @@ func cleanInput() autoapproval.EligibilityInput {
 func TestComputeEligible(t *testing.T) {
 	t.Parallel()
 
+	tests := computeEligibleCases()
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			gotEligible, gotReason := autoapproval.ComputeEligible(tc.in, tc.cfg)
+			if gotEligible != tc.wantEligible {
+				t.Errorf("ComputeEligible(...) eligible = %v, want %v", gotEligible, tc.wantEligible)
+			}
+			if gotReason != tc.wantReason {
+				t.Errorf("ComputeEligible(...) reason = %q, want %q", gotReason, tc.wantReason)
+			}
+		})
+	}
+}
+
+// computeEligibleCase is one row of TestComputeEligible's table. The table
+// is a function of its own so TestCheckFreshness_EquivalentToEligibilityPrefix
+// (freshness_test.go) can run CheckFreshness over the very same inputs.
+type computeEligibleCase struct {
+	name         string
+	in           autoapproval.EligibilityInput
+	cfg          autoapproval.EligibilityConfig
+	wantEligible bool
+	wantReason   autoapproval.Reason
+}
+
+func computeEligibleCases() []computeEligibleCase {
 	cfg := autoapproval.DefaultEligibilityConfig()
 
-	tests := []struct {
-		name         string
-		in           autoapproval.EligibilityInput
-		cfg          autoapproval.EligibilityConfig
-		wantEligible bool
-		wantReason   autoapproval.Reason
-	}{
+	return []computeEligibleCase{
 		{
 			name:         "a clean, low-risk, fresh, CI-green verdict is eligible",
 			in:           cleanInput(),
@@ -555,19 +577,6 @@ func TestComputeEligible(t *testing.T) {
 			wantEligible: false,
 			wantReason:   autoapproval.ReasonSensitivePathTouched,
 		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			gotEligible, gotReason := autoapproval.ComputeEligible(tc.in, tc.cfg)
-			if gotEligible != tc.wantEligible {
-				t.Errorf("ComputeEligible(...) eligible = %v, want %v", gotEligible, tc.wantEligible)
-			}
-			if gotReason != tc.wantReason {
-				t.Errorf("ComputeEligible(...) reason = %q, want %q", gotReason, tc.wantReason)
-			}
-		})
 	}
 }
 
