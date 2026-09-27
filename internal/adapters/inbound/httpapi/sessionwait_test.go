@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/narvidev/narvi/internal/app/sessionactivity"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -54,21 +55,35 @@ func TestParseWaitSeconds_Table(t *testing.T) {
 	}
 }
 
-// TestWaitKey_GrantThenUser: a wait counts against the MCP grant it was
+// TestWaitCaller_GrantThenUser: a wait's key is the MCP grant it was
 // authenticated under, else the signed-in user -- two grants of one user
-// are two keys, and a grant and its user's cookie are two keys.
-func TestWaitKey_GrantThenUser(t *testing.T) {
+// are two keys, and a grant and its user's cookie are two keys -- while its
+// user is the signed-in user on every surface, so all of them count
+// against the one per-user cap. Mutation: a bearer wait's user taken from
+// the grant (each grant its own user) fails the shared-user check.
+func TestWaitCaller_GrantThenUser(t *testing.T) {
 	t.Parallel()
 	user := platform.WithUser(context.Background(), platform.AuthenticatedUser{ID: "u1", Role: "member"})
-	if got := waitKey(user); got != "user:u1" {
-		t.Fatalf("cookie request key = %q, want user:u1", got)
-	}
 	g1 := platform.WithMCPGrant(user, platform.MCPGrant{GrantID: "g1", Scopes: []string{"mcp:read"}})
 	g2 := platform.WithMCPGrant(user, platform.MCPGrant{GrantID: "g2", Scopes: []string{"mcp:read"}})
-	if waitKey(g1) != "grant:g1" || waitKey(g2) != "grant:g2" {
-		t.Fatalf("bearer keys = %q, %q, want grant:g1 and grant:g2", waitKey(g1), waitKey(g2))
-	}
-	if got := waitKey(context.Background()); got != "" {
-		t.Fatalf("no principal key = %q, want empty", got)
+	other := platform.WithMCPGrant(platform.WithUser(context.Background(), platform.AuthenticatedUser{ID: "u2", Role: "member"}),
+		platform.MCPGrant{GrantID: "g3", Scopes: []string{"mcp:read"}})
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		want sessionactivity.Caller
+	}{
+		{"a cookie request counts against its user, as key and as user", user, sessionactivity.Caller{Key: "user:u1", User: "u1"}},
+		{"a bearer request counts against its grant, and its grant's user", g1, sessionactivity.Caller{Key: "grant:g1", User: "u1"}},
+		{"another grant of the same user is another key, the same user", g2, sessionactivity.Caller{Key: "grant:g2", User: "u1"}},
+		{"another user's grant is neither", other, sessionactivity.Caller{Key: "grant:g3", User: "u2"}},
+		{"no principal counts against nobody in particular", context.Background(), sessionactivity.Caller{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := waitCaller(tc.ctx); got != tc.want {
+				t.Fatalf("waitCaller = %+v, want %+v", got, tc.want)
+			}
+		})
 	}
 }

@@ -46,15 +46,24 @@ func eventually(d time.Duration, cond func() bool) bool {
 // every 10 ms, and caps high enough not to matter unless a test lowers
 // them.
 func config() sessionactivity.Config {
-	return sessionactivity.Config{MaxDuration: 200 * time.Millisecond, PollInterval: 10 * time.Millisecond, MaxPerKey: 64, MaxPerReplica: 64}
+	return sessionactivity.Config{MaxDuration: 200 * time.Millisecond, PollInterval: 10 * time.Millisecond, MaxPerKey: 64, MaxPerUser: 64, MaxPerReplica: 64}
 }
+
+// as is the Caller of a wait by user under key (a grant's, or the user's
+// own for a cookie request).
+func as(user, key string) sessionactivity.Caller {
+	return sessionactivity.Caller{Key: key, User: user}
+}
+
+// k is the caller of the tests that need only one.
+var k = as("u", "k")
 
 // TestConfigFrom_ReadsTheMCPWaitFields: the Waiter's bounds are the
 // platform.Timeouts MCPWait* fields, and nothing else.
 func TestConfigFrom_ReadsTheMCPWaitFields(t *testing.T) {
 	to := platform.DefaultTimeouts()
 	got := sessionactivity.ConfigFrom(to)
-	want := sessionactivity.Config{MaxDuration: to.MCPWaitMaxDuration, PollInterval: to.MCPWaitPollInterval, MaxPerKey: to.MCPWaitMaxConcurrentPerKey, MaxPerReplica: to.MCPWaitMaxConcurrentPerReplica}
+	want := sessionactivity.Config{MaxDuration: to.MCPWaitMaxDuration, PollInterval: to.MCPWaitPollInterval, MaxPerKey: to.MCPWaitMaxConcurrentPerKey, MaxPerUser: to.MCPWaitMaxConcurrentPerUser, MaxPerReplica: to.MCPWaitMaxConcurrentPerReplica}
 	if got != want {
 		t.Fatalf("ConfigFrom = %+v, want %+v", got, want)
 	}
@@ -96,7 +105,7 @@ func TestWait_SettledOnFirstReadAnswersAtOnce(t *testing.T) {
 	w := sessionactivity.NewWaiter(config())
 	s := &session{}
 	s.settled.Store(true)
-	out, err := w.Wait(context.Background(), "k", 10, s.read)
+	out, err := w.Wait(context.Background(), k, 10, s.read)
 	if err != nil || out.Reason != sessionactivity.ReasonSettled || out.Waited != 0 {
 		t.Fatalf("Wait = %+v, %v, want settled with nothing waited", out, err)
 	}
@@ -116,7 +125,7 @@ func TestWait_ClampsToMaxDuration(t *testing.T) {
 	w := sessionactivity.NewWaiter(cfg)
 	s := &session{}
 	start := time.Now()
-	out, err := w.Wait(context.Background(), "k", 10, s.read)
+	out, err := w.Wait(context.Background(), k, 10, s.read)
 	elapsed := time.Since(start)
 	if err != nil || out.Reason != sessionactivity.ReasonTimeout {
 		t.Fatalf("Wait = %+v, %v, want timeout", out, err)
@@ -147,7 +156,7 @@ func TestWait_ReturnsWithinOnePollOfSettling(t *testing.T) {
 	var out sessionactivity.Outcome
 	g.Go(func() error {
 		var err error
-		out, err = w.Wait(context.Background(), "k", 5, s.read)
+		out, err = w.Wait(context.Background(), k, 5, s.read)
 		return err
 	})
 	if !eventually(time.Second, func() bool { return s.reads.Load() >= 3 }) {
@@ -183,7 +192,7 @@ func TestWait_ClientDisconnectEndsPolling(t *testing.T) {
 	var g errgroup.Group
 	var waitErr error
 	g.Go(func() error {
-		_, waitErr = w.Wait(ctx, "k", 10, s.read)
+		_, waitErr = w.Wait(ctx, k, 10, s.read)
 		return nil
 	})
 	if !eventually(time.Second, func() bool { return w.Active() == 1 && s.reads.Load() >= 2 }) {
@@ -210,7 +219,7 @@ func TestWait_ClientDisconnectEndsPolling(t *testing.T) {
 // once -- "settled" when it is, "interrupted" when it is not -- so no wait
 // can hold the drain.
 func TestWait_ShutdownInterruptsPromptly(t *testing.T) {
-	cfg := sessionactivity.Config{MaxDuration: 20 * time.Second, PollInterval: time.Second, MaxPerKey: 8, MaxPerReplica: 8}
+	cfg := sessionactivity.Config{MaxDuration: 20 * time.Second, PollInterval: time.Second, MaxPerKey: 8, MaxPerUser: 8, MaxPerReplica: 8}
 	w := sessionactivity.NewWaiter(cfg)
 	s := &session{}
 	var g errgroup.Group
@@ -218,7 +227,7 @@ func TestWait_ShutdownInterruptsPromptly(t *testing.T) {
 	for i := range outs {
 		g.Go(func() error {
 			var err error
-			outs[i], err = w.Wait(context.Background(), "k", 20, s.read)
+			outs[i], err = w.Wait(context.Background(), k, 20, s.read)
 			return err
 		})
 	}
@@ -244,12 +253,12 @@ func TestWait_ShutdownInterruptsPromptly(t *testing.T) {
 	}
 
 	start := time.Now()
-	out, err := w.Wait(context.Background(), "k", 20, s.read)
+	out, err := w.Wait(context.Background(), k, 20, s.read)
 	if err != nil || out.Reason != sessionactivity.ReasonInterrupted || time.Since(start) > 250*time.Millisecond {
 		t.Fatalf("a wait after Interrupt = %+v, %v after %v, want interrupted at once", out, err, time.Since(start))
 	}
 	s.settled.Store(true)
-	if out, err := w.Wait(context.Background(), "k", 20, s.read); err != nil || out.Reason != sessionactivity.ReasonSettled {
+	if out, err := w.Wait(context.Background(), k, 20, s.read); err != nil || out.Reason != sessionactivity.ReasonSettled {
 		t.Fatalf("a settled wait after Interrupt = %+v, %v, want settled", out, err)
 	}
 }
@@ -270,7 +279,8 @@ func TestWait_ConcurrentWaitersSameSession_Race(t *testing.T) {
 	var g errgroup.Group
 	for i := range n {
 		g.Go(func() error {
-			out, err := w.Wait(context.Background(), string(rune('a'+i)), 5, s.read)
+			who := string(rune('a' + i))
+			out, err := w.Wait(context.Background(), as(who, who), 5, s.read)
 			if err != nil {
 				return err
 			}
@@ -306,29 +316,31 @@ func TestWait_PerKeyCapDegradesToSnapshot(t *testing.T) {
 	cfg := config()
 	cfg.MaxDuration = 10 * time.Second
 	cfg.MaxPerKey = 2
+	cfg.MaxPerUser = 3
 	cfg.MaxPerReplica = 3
 	w := sessionactivity.NewWaiter(cfg)
 	s := &session{}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var g errgroup.Group
-	block := func(key string) {
+	block := func(c sessionactivity.Caller) {
 		g.Go(func() error {
-			_, _ = w.Wait(ctx, key, 10, s.read)
+			_, _ = w.Wait(ctx, c, 10, s.read)
 			return nil
 		})
 	}
-	block("grant:a")
-	block("grant:a")
+	block(as("alice", "grant:a"))
+	block(as("alice", "grant:a"))
 	if !eventually(time.Second, func() bool { return w.Active() == 2 }) {
 		t.Fatalf("Active = %d, want the caller's two waits blocked", w.Active())
 	}
 
-	over := func(key string) {
+	over := func(c sessionactivity.Caller) {
 		t.Helper()
+		key := c.Key
 		own := &session{}
 		start := time.Now()
-		out, err := w.Wait(ctx, key, 10, own.read)
+		out, err := w.Wait(ctx, c, 10, own.read)
 		if err != nil || out.Reason != sessionactivity.ReasonCapacity || out.Waited != 0 {
 			t.Fatalf("over-cap wait for %s = %+v, %v, want capacity with nothing waited, and no error", key, out, err)
 		}
@@ -339,17 +351,17 @@ func TestWait_PerKeyCapDegradesToSnapshot(t *testing.T) {
 			t.Fatalf("over-cap wait for %s read %d times, want exactly one snapshot", key, own.reads.Load())
 		}
 	}
-	over("grant:a")
+	over(as("alice", "grant:a"))
 
-	block("grant:b")
+	block(as("bob", "grant:b"))
 	if !eventually(time.Second, func() bool { return w.Active() == 3 }) {
 		t.Fatalf("Active = %d, want another caller admitted", w.Active())
 	}
-	over("grant:c") // the replica's cap
+	over(as("carol", "grant:c")) // the replica's cap
 
 	settled := &session{}
 	settled.settled.Store(true)
-	if out, err := w.Wait(ctx, "grant:a", 10, settled.read); err != nil || out.Reason != sessionactivity.ReasonSettled {
+	if out, err := w.Wait(ctx, as("alice", "grant:a"), 10, settled.read); err != nil || out.Reason != sessionactivity.ReasonSettled {
 		t.Fatalf("a settled session over the cap = %+v, %v, want settled", out, err)
 	}
 	if w.Active() != 3 {
@@ -366,7 +378,7 @@ func TestWait_PerKeyCapDegradesToSnapshot(t *testing.T) {
 	var g2 errgroup.Group
 	for range 2 {
 		g2.Go(func() error {
-			_, _ = w.Wait(ctx2, "grant:a", 10, s.read)
+			_, _ = w.Wait(ctx2, as("alice", "grant:a"), 10, s.read)
 			return nil
 		})
 	}
@@ -382,11 +394,11 @@ func TestWait_PerKeyCapDegradesToSnapshot(t *testing.T) {
 func TestWait_ReadErrorEndsTheWait(t *testing.T) {
 	boom := errors.New("boom")
 	w := sessionactivity.NewWaiter(config())
-	if _, err := w.Wait(context.Background(), "k", 10, func(context.Context) (bool, error) { return false, boom }); !errors.Is(err, boom) {
+	if _, err := w.Wait(context.Background(), k, 10, func(context.Context) (bool, error) { return false, boom }); !errors.Is(err, boom) {
 		t.Fatalf("first read failing: err = %v, want boom", err)
 	}
 	var calls atomic.Int64
-	_, err := w.Wait(context.Background(), "k", 10, func(context.Context) (bool, error) {
+	_, err := w.Wait(context.Background(), k, 10, func(context.Context) (bool, error) {
 		if calls.Add(1) == 3 {
 			return false, boom
 		}

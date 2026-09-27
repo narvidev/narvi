@@ -1202,6 +1202,9 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 	t.Run("Wait_CapacityDegradesToSnapshot_PerGrant", func(t *testing.T) {
 		sdkWaitCapacityPerGrant(t, waitRig)
 	})
+	t.Run("Wait_CapacityDegradesToSnapshot_PerUser", func(t *testing.T) {
+		sdkWaitCapacityPerUser(t, waitRig)
+	})
 	t.Run("Wait_ScopelessGrantDoesNotSeeIt", func(t *testing.T) {
 		sdkWaitScopelessGrantDoesNotSeeIt(t, waitRig)
 	})

@@ -22,11 +22,14 @@
 //     when Interrupt is called (the server is shutting down), so a wait
 //     never outlives the drain.
 //
-// Waits are capped in memory, per replica: MCPWaitMaxConcurrentPerKey per
-// caller and MCPWaitMaxConcurrentPerReplica in all. A wait past either cap
-// does not wait -- it answers its first read at once, with ReasonCapacity,
-// a normal answer, never an error -- so a busy replica degrades to plain
-// status reads rather than refusing them.
+// Waits are capped in memory, per replica, by three nested caps checked and
+// taken together: MCPWaitMaxConcurrentPerKey per key (the MCP grant, or
+// the user for a cookie request), MCPWaitMaxConcurrentPerUser per user
+// across every grant of theirs and their browser, and
+// MCPWaitMaxConcurrentPerReplica in all. A wait past any of them does not
+// wait -- it answers its first read at once, with ReasonCapacity, a normal
+// answer, never an error -- so a busy replica degrades to plain status
+// reads rather than refusing them.
 package sessionactivity
 
 import (
@@ -55,9 +58,11 @@ const (
 	// ReasonInterrupted means the server began shutting down (Interrupt). The
 	// latest read is answered at once.
 	ReasonInterrupted Reason = "interrupted"
-	// ReasonCapacity means the caller already had MCPWaitMaxConcurrentPerKey
-	// waits running on this replica, or the replica
-	// MCPWaitMaxConcurrentPerReplica; the first read is answered at once.
+	// ReasonCapacity means one of the three caps was reached on this
+	// replica: the caller's key already had MCPWaitMaxConcurrentPerKey
+	// waits running, its user MCPWaitMaxConcurrentPerUser across all of
+	// their keys, or the replica MCPWaitMaxConcurrentPerReplica; the first
+	// read is answered at once.
 	ReasonCapacity Reason = "capacity"
 )
 
@@ -77,11 +82,27 @@ type Outcome struct {
 type Read func(ctx context.Context) (settled bool, err error)
 
 // Config is the Waiter's bounds: the platform.Timeouts MCPWait* fields.
+// The caps nest, MaxPerKey <= MaxPerUser <= MaxPerReplica
+// (platform.Timeouts.Validate).
 type Config struct {
 	MaxDuration   time.Duration
 	PollInterval  time.Duration
 	MaxPerKey     int
+	MaxPerUser    int
 	MaxPerReplica int
+}
+
+// Caller is whose caps one wait counts against. Neither field is a
+// permission: the wait is authorized exactly as the plain read is, by its
+// caller, before it ever reaches the Waiter.
+type Caller struct {
+	// Key is what MaxPerKey counts: the MCP grant the request was
+	// authenticated under, or the signed-in user for a cookie request.
+	Key string
+	// User is what MaxPerUser counts: the signed-in user, whichever
+	// surface the wait came through -- so every grant of one user and
+	// their browser share it, however many clients they have authorized.
+	User string
 }
 
 // ConfigFrom is Config from the MCPWait* fields of t, the only place those
@@ -91,6 +112,7 @@ func ConfigFrom(t platform.Timeouts) Config {
 		MaxDuration:   t.MCPWaitMaxDuration,
 		PollInterval:  t.MCPWaitPollInterval,
 		MaxPerKey:     t.MCPWaitMaxConcurrentPerKey,
+		MaxPerUser:    t.MCPWaitMaxConcurrentPerUser,
 		MaxPerReplica: t.MCPWaitMaxConcurrentPerReplica,
 	}
 }
@@ -102,9 +124,12 @@ func ConfigFrom(t platform.Timeouts) Config {
 type Waiter struct {
 	cfg Config
 
-	mu     sync.Mutex
-	active int
-	perKey map[string]int
+	// mu guards the three counts, which admit checks and takes, and
+	// release gives back, in one critical section each.
+	mu      sync.Mutex
+	active  int
+	perUser map[string]int
+	perKey  map[string]int
 
 	interrupted   chan struct{}
 	interruptOnce sync.Once
@@ -114,6 +139,7 @@ type Waiter struct {
 func NewWaiter(cfg Config) *Waiter {
 	return &Waiter{
 		cfg:         cfg,
+		perUser:     map[string]int{},
 		perKey:      map[string]int{},
 		interrupted: make(chan struct{}),
 	}
@@ -152,11 +178,11 @@ func (w *Waiter) Bound(waitSeconds int64) time.Duration {
 
 // Wait reads at once through read and, while the session is not settled,
 // again every PollInterval, for at most Bound(waitSeconds), counting
-// against key's cap (the MCP grant, or the user; the caller's choice). It
-// returns how the wait ended; the caller answers the snapshot its read
-// retained last. An error is read's own -- the wait ends on it -- or ctx's
-// when the request ended first: then nothing is left to answer.
-func (w *Waiter) Wait(ctx context.Context, key string, waitSeconds int64, read Read) (Outcome, error) {
+// against caller's key, caller's user and the replica. It returns how the
+// wait ended; the caller answers the snapshot its read retained last. An
+// error is read's own -- the wait ends on it -- or ctx's when the request
+// ended first: then nothing is left to answer.
+func (w *Waiter) Wait(ctx context.Context, caller Caller, waitSeconds int64, read Read) (Outcome, error) {
 	start := time.Now()
 	settled, err := read(ctx)
 	if err != nil {
@@ -170,7 +196,7 @@ func (w *Waiter) Wait(ctx context.Context, key string, waitSeconds int64, read R
 		return Outcome{Reason: ReasonInterrupted}, nil
 	default:
 	}
-	release, ok := w.admit(ctx, key)
+	release, ok := w.admit(ctx, caller)
 	if !ok {
 		return Outcome{Reason: ReasonCapacity}, nil
 	}
@@ -202,16 +228,20 @@ func (w *Waiter) Wait(ctx context.Context, key string, waitSeconds int64, read R
 	}
 }
 
-// admit takes one of key's slots and one of the replica's, or neither when
-// either cap is reached. release gives both back.
-func (w *Waiter) admit(ctx context.Context, key string) (release func(), ok bool) {
+// admit takes one of the replica's slots, one of c.User's and one of
+// c.Key's, or none when any of the three caps is reached: the three checks
+// and the three increments are one critical section, so concurrent
+// admissions can never overshoot a cap. release gives all three back, in
+// one critical section too.
+func (w *Waiter) admit(ctx context.Context, c Caller) (release func(), ok bool) {
 	w.mu.Lock()
-	if w.active >= w.cfg.MaxPerReplica || w.perKey[key] >= w.cfg.MaxPerKey {
+	if w.active >= w.cfg.MaxPerReplica || w.perUser[c.User] >= w.cfg.MaxPerUser || w.perKey[c.Key] >= w.cfg.MaxPerKey {
 		w.mu.Unlock()
 		return nil, false
 	}
 	w.active++
-	w.perKey[key]++
+	w.perUser[c.User]++
+	w.perKey[c.Key]++
 	w.mu.Unlock()
 	gauge := activeWaitsGauge()
 	if gauge != nil {
@@ -220,9 +250,8 @@ func (w *Waiter) admit(ctx context.Context, key string) (release func(), ok bool
 	return func() {
 		w.mu.Lock()
 		w.active--
-		if w.perKey[key]--; w.perKey[key] <= 0 {
-			delete(w.perKey, key)
-		}
+		giveBack(w.perUser, c.User)
+		giveBack(w.perKey, c.Key)
 		w.mu.Unlock()
 		if gauge != nil {
 			// A fresh context: the request's may already be done, and
@@ -230,6 +259,15 @@ func (w *Waiter) admit(ctx context.Context, key string) (release func(), ok bool
 			gauge.Add(context.Background(), -1)
 		}
 	}, true
+}
+
+// giveBack takes one from counts[k], deleting the entry once it is spent,
+// so the maps hold only the keys and users with a wait running. Called
+// with the Waiter's mu held.
+func giveBack(counts map[string]int, k string) {
+	if counts[k]--; counts[k] <= 0 {
+		delete(counts, k)
+	}
 }
 
 // meterName follows this codebase's "narvi/<package>" meter-name

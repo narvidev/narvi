@@ -10,8 +10,10 @@
 // scheduled; any replica serves it, because it wakes by reading Postgres;
 // a long wait runs to its bound through the SDK with nothing cutting it;
 // the shutdown of Run's own HTTP server interrupts every wait at once;
-// over the per-grant cap a wait degrades to the plain status, never an
-// error; and a grant without mcp:read is told the tool does not exist.
+// over the per-grant cap, and over the per-user cap that spans every grant
+// of one user and their browser, a wait degrades to the plain status,
+// never an error; and a grant without mcp:read is told the tool does not
+// exist.
 //
 // Every state change below is written the way the session actor writes it
 // -- one transaction, the turn moved through turn.Transition -- straight to
@@ -36,7 +38,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	sdkauth "github.com/modelcontextprotocol/go-sdk/auth"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/modelcontextprotocol/go-sdk/oauthex"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
@@ -537,6 +541,111 @@ func sdkWaitCapacityPerGrant(t *testing.T, rig *oauthRouterRig) {
 		}
 		if code != http.StatusOK || !strings.Contains(string(body), `"reason":"timeout"`) {
 			return fmt.Errorf("the member's cookie wait = %d %s, want admitted and timed out", code, body)
+		}
+		return nil
+	})
+	if err := g.Wait(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// sdkWaitCapacityPerUser is TestOAuth_ProductionRouter's
+// Wait_CapacityDegradesToSnapshot_PerUser (review round 1's P1): a member
+// who authorized three clients holds three grants, and the per-grant cap
+// alone would give them two waits each. With two waits blocked under each
+// of the first two grants -- the shipped four per user -- a wait under the
+// third grant, which runs none of its own, and the member's own cookie
+// wait each answer at once: the queued status, reason "capacity", 0 ms, a
+// normal result. Another member's wait on the same replica is admitted and
+// runs to its bound. Mutation: the per-user check dropped (the third
+// grant's wait is admitted and times out).
+func sdkWaitCapacityPerUser(t *testing.T, rig *oauthRouterRig) {
+	ctx := oauthTestCtx(t)
+	perKey, perUser := rig.cfg.Timeouts.MCPWaitMaxConcurrentPerKey, rig.cfg.Timeouts.MCPWaitMaxConcurrentPerUser
+	if perKey != 2 || perUser != 4 {
+		t.Fatalf("MCPWaitMaxConcurrentPerKey %d, MCPWaitMaxConcurrentPerUser %d, want the shipped 2 and 4 on this router", perKey, perUser)
+	}
+	first := rig.connectSDKClient(ctx, t, nil)
+	bearers := []string{first.recorder.lastBearer()}
+	for i := range 2 {
+		var client restdtos.MCPClient
+		body := fmt.Sprintf(`{"clientName":"Editor Plugin %d","redirectUris":["http://127.0.0.1/callback"]}`, i+2)
+		if status := rig.doJSON(t, http.MethodPost, "/api/mcp-clients", []byte(body), &client, first.adminCookie); status != http.StatusCreated {
+			t.Fatalf("register client %d: status %d", i+2, status)
+		}
+		flow, err := rig.dialSDKClient(ctx, t, first.member, first.cookie, nil, func(c *sdkauth.AuthorizationCodeHandlerConfig) {
+			c.PreregisteredClient = &oauthex.ClientCredentials{ClientID: client.ClientId}
+			c.RedirectURL = "http://127.0.0.1:1/callback"
+		})
+		if err != nil {
+			t.Fatalf("SDK Connect under client %d: %v", i+2, err)
+		}
+		bearers = append(bearers, flow.recorder.lastBearer())
+	}
+	sid := seedLaggingSession(ctx, t, rig.pool, first.member.ID, 0)
+	other := rig.connectSDKClient(ctx, t, nil)
+	otherSid := seedLaggingSession(ctx, t, rig.pool, other.member.ID, 0)
+	waiter := rig.app.sessionWaiter
+	base := waiter.Active()
+
+	var g errgroup.Group
+	for _, bearer := range bearers[:2] {
+		for range perKey {
+			g.Go(func() error {
+				text, isError, err := rawWait(ctx, rig, bearer, sid, 4)
+				if err != nil {
+					return err
+				}
+				if isError || !strings.Contains(text, `"reason":"timeout"`) {
+					return fmt.Errorf("an admitted wait answered %s (isError %v), want a timeout", text, isError)
+				}
+				return nil
+			})
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for waiter.Active() < base+perUser && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if waiter.Active() != base+perUser {
+		t.Fatalf("Active = %d, want the member's %d waits blocked", waiter.Active()-base, perUser)
+	}
+
+	capacity := func(surface string, code int, body []byte, took time.Duration) {
+		t.Helper()
+		var over restdtos.SessionActivity
+		if code != http.StatusOK || json.Unmarshal(body, &over) != nil || over.Wait == nil {
+			t.Fatalf("the member's wait through %s = %d %s, want a normal status answer", surface, code, body)
+		}
+		if over.Wait.Reason != restdtos.SessionActivityWaitReasonCapacity || over.Wait.WaitedMs != 0 || took > time.Second || over.Activity != restdtos.SessionActivityActivityQueued {
+			t.Fatalf("the member's wait through %s = %+v after %v, want the queued status at once, reason capacity, 0 ms", surface, over, took)
+		}
+	}
+	start := time.Now()
+	text, isError, err := rawWait(ctx, rig, bearers[2], sid, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if isError {
+		t.Fatalf("the third grant's wait = %s, a tool error, want a normal result", text)
+	}
+	capacity("a third grant with no wait of its own", http.StatusOK, []byte(text), time.Since(start))
+	start = time.Now()
+	code, body, err := getWithCookieE(ctx, rig.server.URL+"/api/sessions/"+sid.String()+"/status?waitSeconds=4", first.cookie)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capacity("the browser", code, body, time.Since(start))
+
+	g.Go(func() error {
+		text, isError, err := rawWait(ctx, rig, other.recorder.lastBearer(), otherSid, 1)
+		if err != nil {
+			return err
+		}
+		var got restdtos.SessionActivity
+		if isError || json.Unmarshal([]byte(text), &got) != nil || got.Wait == nil ||
+			got.Wait.Reason != restdtos.SessionActivityWaitReasonTimeout || got.Wait.WaitedMs < 900 {
+			return fmt.Errorf("another member's wait = %s (isError %v), want admitted and waited to its one-second bound", text, isError)
 		}
 		return nil
 	})

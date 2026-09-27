@@ -55,10 +55,11 @@ import (
 // one statement on a pool connection taken for it and given back before
 // the sleep -- behind the same gate: a wait sees exactly what a read
 // does, only later. A caller already running MCPWaitMaxConcurrentPerKey
-// waits (per MCP grant, or per user for a cookie), or a replica running
-// MCPWaitMaxConcurrentPerReplica, gets its first read at once, reason
-// "capacity". Absent or 0 is the plain read, byte for byte (wait is
-// omitted); a negative or malformed value is a 400.
+// waits (per MCP grant, or per user for a cookie), a user already running
+// MCPWaitMaxConcurrentPerUser across every grant and the browser, or a
+// replica running MCPWaitMaxConcurrentPerReplica, gets its first read at
+// once, reason "capacity". Absent or 0 is the plain read, byte for byte
+// (wait is omitted); a negative or malformed value is a 400.
 //
 // waiter is one per replica (controlplane builds it once, for this route
 // and the MCP twin alike, and wires its Interrupt to the HTTP server's
@@ -101,7 +102,7 @@ func GetSessionStatus(sessions *postgres.SessionStore, waiter *sessionactivity.W
 		}
 
 		var latest restdtos.SessionActivity
-		outcome, err := waiter.Wait(ctx, waitKey(ctx), waitSeconds, func(ctx context.Context) (bool, error) {
+		outcome, err := waiter.Wait(ctx, waitCaller(ctx), waitSeconds, func(ctx context.Context) (bool, error) {
 			dto, err := read(ctx)
 			if err != nil {
 				return false, err
@@ -175,19 +176,25 @@ func parseWaitSeconds(w http.ResponseWriter, r *http.Request) (int64, bool) {
 	return n, true
 }
 
-// waitKey is whose cap a wait counts against: the MCP grant the request was
-// authenticated under (auth.RequireMCPBearer attaches it; every token of
-// one client authorization shares it), or, for a cookie request, the
-// signed-in user. It is a count's key and nothing more -- no permission
-// ever derives from it.
-func waitKey(ctx context.Context) string {
-	if grant, ok := platform.MCPGrantFromContext(ctx); ok {
-		return "grant:" + grant.GrantID
-	}
+// waitCaller is whose caps a wait counts against (sessionactivity.Caller).
+// Its key is the MCP grant the request was authenticated under
+// (auth.RequireMCPBearer attaches it; every token of one client
+// authorization shares it), or, for a cookie request, the signed-in user.
+// Its user is the signed-in user either way -- RequireMCPBearer attaches
+// the grant's user as the AuthenticatedUser, exactly as the cookie gate
+// does -- so every grant of one user and their browser count against the
+// one per-user cap, however many clients that user has authorized. Both
+// are counts' keys and nothing more: no permission ever derives from them.
+func waitCaller(ctx context.Context) sessionactivity.Caller {
+	var c sessionactivity.Caller
 	if user, ok := platform.UserFromContext(ctx); ok {
-		return "user:" + user.ID
+		c.User = user.ID
+		c.Key = "user:" + user.ID
 	}
-	return ""
+	if grant, ok := platform.MCPGrantFromContext(ctx); ok {
+		c.Key = "grant:" + grant.GrantID
+	}
+	return c
 }
 
 // statusDelayTable is session.DelayTable from the MCPStatusDelay* fields

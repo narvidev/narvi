@@ -1998,17 +1998,19 @@ func TestTimeouts_Validate_MCPStatusDeliveryWindow(t *testing.T) {
 }
 
 // TestDefaultTimeouts_MCPWaitFields pins the bounded wait's shipped values
-// (technical plan §43.20, row 182's piece (b), owner decisions D2 and D4):
-// a 25-second maximum polled every second, two waits per grant (or user)
-// and 32 per replica.
+// (technical plan §43.20, row 182's piece (b), owner decisions D2 and D4,
+// the latter strengthened by review round 1): a 25-second maximum polled
+// every second, two waits per grant (or per user for a cookie), four per
+// user across every grant and the browser, and 32 per replica.
 func TestDefaultTimeouts_MCPWaitFields(t *testing.T) {
 	t.Parallel()
 	to := platform.DefaultTimeouts()
 	if to.MCPWaitMaxDuration != 25*time.Second || to.MCPWaitPollInterval != time.Second {
 		t.Fatalf("MCPWaitMaxDuration %v, MCPWaitPollInterval %v, want 25s and 1s", to.MCPWaitMaxDuration, to.MCPWaitPollInterval)
 	}
-	if to.MCPWaitMaxConcurrentPerKey != 2 || to.MCPWaitMaxConcurrentPerReplica != 32 {
-		t.Fatalf("MCPWaitMaxConcurrentPerKey %d, MCPWaitMaxConcurrentPerReplica %d, want 2 and 32", to.MCPWaitMaxConcurrentPerKey, to.MCPWaitMaxConcurrentPerReplica)
+	if to.MCPWaitMaxConcurrentPerKey != 2 || to.MCPWaitMaxConcurrentPerUser != 4 || to.MCPWaitMaxConcurrentPerReplica != 32 {
+		t.Fatalf("MCPWaitMaxConcurrentPerKey %d, MCPWaitMaxConcurrentPerUser %d, MCPWaitMaxConcurrentPerReplica %d, want 2, 4 and 32",
+			to.MCPWaitMaxConcurrentPerKey, to.MCPWaitMaxConcurrentPerUser, to.MCPWaitMaxConcurrentPerReplica)
 	}
 }
 
@@ -2016,13 +2018,14 @@ func TestDefaultTimeouts_MCPWaitFields(t *testing.T) {
 // block (the MCPWait* fields' own doc comment) is enforced on its own and
 // reported by name: the interval positive and strictly below the maximum,
 // no longer than the status delay floor and strictly below the shutdown
-// grace period, and both caps at least one. Each boundary that is still
+// grace period, every cap at least one, and the caps nested -- per key at
+// most per user, per user at most per replica. Each boundary that is still
 // valid is accepted.
 func TestTimeouts_Validate_MCPWait(t *testing.T) {
 	t.Parallel()
 
 	type want struct {
-		chain string // a *TimeoutInvariantError with this Chain
+		chain string // a *TimeoutInvariantError or *CountInvariantError with this Chain
 		field string // or a positive-value error naming this field
 	}
 	for _, tc := range []struct {
@@ -2048,11 +2051,21 @@ func TestTimeouts_Validate_MCPWait(t *testing.T) {
 		{"a zero interval polls in a hot loop", func(to *platform.Timeouts) { to.MCPWaitPollInterval = 0 }, &want{field: "MCPWaitPollInterval"}},
 		{"a negative interval", func(to *platform.Timeouts) { to.MCPWaitPollInterval = -time.Second }, &want{field: "MCPWaitPollInterval"}},
 		{"a per-key cap of zero refuses every wait", func(to *platform.Timeouts) { to.MCPWaitMaxConcurrentPerKey = 0 }, &want{field: "MCPWaitMaxConcurrentPerKey"}},
+		{"a per-user cap of zero refuses every wait", func(to *platform.Timeouts) { to.MCPWaitMaxConcurrentPerUser = 0 }, &want{field: "MCPWaitMaxConcurrentPerUser"}},
 		{"a per-replica cap of zero refuses every wait", func(to *platform.Timeouts) { to.MCPWaitMaxConcurrentPerReplica = 0 }, &want{field: "MCPWaitMaxConcurrentPerReplica"}},
 		{"caps of one are accepted", func(to *platform.Timeouts) {
 			to.MCPWaitMaxConcurrentPerKey = 1
+			to.MCPWaitMaxConcurrentPerUser = 1
 			to.MCPWaitMaxConcurrentPerReplica = 1
 		}, nil},
+		{"a per-key cap equal to the per-user cap is accepted", func(to *platform.Timeouts) { to.MCPWaitMaxConcurrentPerKey = to.MCPWaitMaxConcurrentPerUser }, nil},
+		{"a per-key cap above the per-user cap", func(to *platform.Timeouts) { to.MCPWaitMaxConcurrentPerKey = to.MCPWaitMaxConcurrentPerUser + 1 },
+			&want{chain: "MCPWaitMaxConcurrentPerUser >= MCPWaitMaxConcurrentPerKey"}},
+		{"a per-user cap equal to the per-replica cap is accepted", func(to *platform.Timeouts) { to.MCPWaitMaxConcurrentPerUser = to.MCPWaitMaxConcurrentPerReplica }, nil},
+		{"a per-user cap above the per-replica cap", func(to *platform.Timeouts) { to.MCPWaitMaxConcurrentPerUser = to.MCPWaitMaxConcurrentPerReplica + 1 },
+			&want{chain: "MCPWaitMaxConcurrentPerReplica >= MCPWaitMaxConcurrentPerUser"}},
+		{"a per-user cap below the shipped per-key cap", func(to *platform.Timeouts) { to.MCPWaitMaxConcurrentPerUser = to.MCPWaitMaxConcurrentPerKey - 1 },
+			&want{chain: "MCPWaitMaxConcurrentPerUser >= MCPWaitMaxConcurrentPerKey"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -2074,10 +2087,13 @@ func TestTimeouts_Validate_MCPWait(t *testing.T) {
 			found := false
 			for _, e := range errs {
 				var inv *platform.TimeoutInvariantError
+				var order *platform.CountInvariantError
 				var pos *platform.TimeoutMustBePositiveError
 				var count *platform.CountMustBePositiveError
 				switch {
 				case tc.want.chain != "" && errors.As(e, &inv) && inv.Chain == tc.want.chain:
+					found = true
+				case tc.want.chain != "" && errors.As(e, &order) && order.Chain == tc.want.chain:
 					found = true
 				case tc.want.field != "" && errors.As(e, &pos) && pos.Field == tc.want.field:
 					found = true

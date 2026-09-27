@@ -55,9 +55,10 @@ func waitServer(t *testing.T, pool *pgxpool.Pool, waiter *sessionactivity.Waiter
 }
 
 // testWaiter is a Waiter polling every 100 ms, for at most five seconds,
-// with room for perKey waits per caller.
+// with room for perKey waits per caller -- and per user, since every wait
+// here is one cookie user's.
 func testWaiter(perKey int) *sessionactivity.Waiter {
-	return sessionactivity.NewWaiter(sessionactivity.Config{MaxDuration: 5 * time.Second, PollInterval: 100 * time.Millisecond, MaxPerKey: perKey, MaxPerReplica: 32})
+	return sessionactivity.NewWaiter(sessionactivity.Config{MaxDuration: 5 * time.Second, PollInterval: 100 * time.Millisecond, MaxPerKey: perKey, MaxPerUser: perKey, MaxPerReplica: 32})
 }
 
 // getWithCookie GETs url as the cookie's user, on ctx, and returns the

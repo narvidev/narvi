@@ -3312,8 +3312,11 @@ type Timeouts struct {
 	// polling the status at the least suggested delay never reads faster
 	// than a wait does); and it is below ShutdownGracePeriod (a wait that
 	// began a read as the drain started is still well inside it). The
-	// HTTP server sets no WriteTimeout (controlplane.newHTTPServer; pinned
-	// by its test): were one added, it must exceed MCPWaitMaxDuration, or a
+	// three caps nest: per key at most per user, per user at most per
+	// replica -- a cap above the one that contains it could never bind.
+	// The HTTP server sets no WriteTimeout (controlplane.newHTTPServer;
+	// TestOAuth_ProductionRouter/Wait_ShutdownInterruptsPromptly_RunServer
+	// pins it): were one added, it must exceed MCPWaitMaxDuration, or a
 	// full-length wait would be cut before its answer is written.
 
 	// MCPWaitMaxDuration is the most one wait blocks: a longer
@@ -3336,6 +3339,15 @@ type Timeouts struct {
 	// memory, per replica, like the other MCP brakes. A count, kept beside
 	// the wait's own durations. 2.
 	MCPWaitMaxConcurrentPerKey int
+
+	// MCPWaitMaxConcurrentPerUser is how many waits one signed-in user may
+	// have running at once on one replica, whatever surface they came
+	// through: every MCP grant of theirs and their browser, together. A
+	// user holds one grant per MCP client and may authorize any number of
+	// clients, so the per-key cap alone would let one user hold every slot
+	// of the replica; this one bounds them all. Past it a wait degrades
+	// exactly as past the per-key cap. A count. 4.
+	MCPWaitMaxConcurrentPerUser int
 
 	// MCPWaitMaxConcurrentPerReplica is how many waits one replica runs at
 	// once, all callers together; past it a wait degrades exactly as past
@@ -3640,6 +3652,7 @@ func DefaultTimeouts() Timeouts {
 		MCPWaitMaxDuration:             25 * time.Second, // §43.20 (182b, D2); under the 30 s idle timeout of common proxies
 		MCPWaitPollInterval:            time.Second,      // §43.20 (182b, D2); one Postgres read per second per wait
 		MCPWaitMaxConcurrentPerKey:     2,                // §43.20 (182b, D4); waits one grant (or user) runs at once per replica
+		MCPWaitMaxConcurrentPerUser:    4,                // §43.20 (182b, D4 strengthened); waits one user runs at once per replica, every grant and the browser together
 		MCPWaitMaxConcurrentPerReplica: 32,               // §43.20 (182b, D4); waits one replica runs at once
 	}
 }
@@ -3931,9 +3944,11 @@ func (t Timeouts) Validate() error {
 	// comment on the struct). Orderings with no margin, like the status
 	// delay table's: these values are seconds apart. A zero or negative
 	// interval would poll Postgres in a hot loop, so it is refused; the
-	// maximum is positive because it lies above the interval. Both caps
-	// below one would refuse every wait, which is a broken configuration
-	// rather than a stricter one.
+	// maximum is positive because it lies above the interval. A cap below
+	// one would refuse every wait, which is a broken configuration rather
+	// than a stricter one; and the caps nest, per key <= per user <= per
+	// replica, since a cap above the one containing it never binds -- a
+	// user's waits are some keys' waits, and a replica's are some users'.
 	mustBePositive("MCPWaitPollInterval", t.MCPWaitPollInterval)
 	strictlyBelow := func(chain, lesserField string, lesser time.Duration, greaterField string, greater time.Duration) {
 		if lesser >= greater {
@@ -3960,7 +3975,23 @@ func (t Timeouts) Validate() error {
 	strictlyBelow("ShutdownGracePeriod > MCPWaitPollInterval",
 		"MCPWaitPollInterval", t.MCPWaitPollInterval, "ShutdownGracePeriod", t.ShutdownGracePeriod)
 	countMustBePositive("MCPWaitMaxConcurrentPerKey", t.MCPWaitMaxConcurrentPerKey)
+	countMustBePositive("MCPWaitMaxConcurrentPerUser", t.MCPWaitMaxConcurrentPerUser)
 	countMustBePositive("MCPWaitMaxConcurrentPerReplica", t.MCPWaitMaxConcurrentPerReplica)
+	countAtMost := func(chain, lesserField string, lesser int, greaterField string, greater int) {
+		if lesser > greater {
+			errs = append(errs, &CountInvariantError{
+				Chain:        chain,
+				LesserField:  lesserField,
+				LesserValue:  lesser,
+				GreaterField: greaterField,
+				GreaterValue: greater,
+			})
+		}
+	}
+	countAtMost("MCPWaitMaxConcurrentPerUser >= MCPWaitMaxConcurrentPerKey",
+		"MCPWaitMaxConcurrentPerKey", t.MCPWaitMaxConcurrentPerKey, "MCPWaitMaxConcurrentPerUser", t.MCPWaitMaxConcurrentPerUser)
+	countAtMost("MCPWaitMaxConcurrentPerReplica >= MCPWaitMaxConcurrentPerUser",
+		"MCPWaitMaxConcurrentPerUser", t.MCPWaitMaxConcurrentPerUser, "MCPWaitMaxConcurrentPerReplica", t.MCPWaitMaxConcurrentPerReplica)
 
 	// U1 audit fix, HIGH (confirmed finding: "the total budget is smaller
 	// than the retry chain it contains"). Derived from the SAME three
@@ -4024,6 +4055,27 @@ type CountMustBePositiveError struct {
 
 func (e *CountMustBePositiveError) Error() string {
 	return fmt.Sprintf("timeout invariant violated: %s=%d, want >= 1 -- see that field's own doc comment", e.Field, e.Value)
+}
+
+// CountInvariantError reports one broken ordering between two count fields
+// of Timeouts -- caps that nest, so the lesser may equal the greater but
+// never exceed it (e.g. "MCPWaitMaxConcurrentPerUser >=
+// MCPWaitMaxConcurrentPerKey").
+type CountInvariantError struct {
+	// Chain names the ordering, greater field first.
+	Chain string
+
+	LesserField  string
+	LesserValue  int
+	GreaterField string
+	GreaterValue int
+}
+
+func (e *CountInvariantError) Error() string {
+	return fmt.Sprintf(
+		"timeout invariant violated (%s): %s=%d is above %s=%d -- see those fields' own doc comments",
+		e.Chain, e.LesserField, e.LesserValue, e.GreaterField, e.GreaterValue,
+	)
 }
 
 // SecondsToDuration converts a raw whole-seconds count -- e.g. an OAuth
