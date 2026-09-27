@@ -3295,6 +3295,52 @@ type Timeouts struct {
 	// are pushed one after another, so several slow ones can outlast it.
 	// 10 minutes.
 	MCPStatusDeliveryWindow time.Duration
+
+	// -- technical plan §43.20 (the bounded wait, row 182's piece (b)) --
+	//
+	// GET /api/sessions/{sessionID}/status?waitSeconds=N, and
+	// narvi_wait_for_session over it, read the session's status at once
+	// and, while it is not settled, again every MCPWaitPollInterval, until
+	// it is or MCPWaitMaxDuration has passed (sessionactivity.Waiter). Each
+	// read takes a pool connection for its one statement and gives it back
+	// before the sleep, so a wait never holds a connection, and it wakes by
+	// polling Postgres -- the only authority (§5.1) -- never through the
+	// in-process event hub, which hears only the actors of its own replica.
+	//
+	// Links: the interval is positive and below the maximum (a wait polls
+	// at least twice); it is no longer than MCPStatusDelayFloor (a client
+	// polling the status at the least suggested delay never reads faster
+	// than a wait does); and it is below ShutdownGracePeriod (a wait that
+	// began a read as the drain started is still well inside it). The
+	// HTTP server sets no WriteTimeout (controlplane.newHTTPServer; pinned
+	// by its test): were one added, it must exceed MCPWaitMaxDuration, or a
+	// full-length wait would be cut before its answer is written.
+
+	// MCPWaitMaxDuration is the most one wait blocks: a longer
+	// waitSeconds, or none through the tool, is clamped to it, and the
+	// wait then answers the latest status with wait.reason "timeout".
+	// With the tool's JSON responses nothing is written until the answer,
+	// so it stays under the 30-60 s idle timeouts common reverse proxies
+	// and load balancers apply by default. 25 seconds.
+	MCPWaitMaxDuration time.Duration
+
+	// MCPWaitPollInterval is how long a wait sleeps between two reads of
+	// the session's status. 1 second.
+	MCPWaitPollInterval time.Duration
+
+	// MCPWaitMaxConcurrentPerKey is how many waits one caller may have
+	// running at once on one replica -- the key being the MCP grant the
+	// request was authenticated under, or the signed-in user for a cookie
+	// request. A wait past it does not wait: it answers the status at once
+	// with wait.reason "capacity", a normal result, never an error. In
+	// memory, per replica, like the other MCP brakes. A count, kept beside
+	// the wait's own durations. 2.
+	MCPWaitMaxConcurrentPerKey int
+
+	// MCPWaitMaxConcurrentPerReplica is how many waits one replica runs at
+	// once, all callers together; past it a wait degrades exactly as past
+	// the per-key cap. A count. 32.
+	MCPWaitMaxConcurrentPerReplica int
 }
 
 // DefaultTimeouts returns the shipped defaults for every field, each
@@ -3590,6 +3636,11 @@ func DefaultTimeouts() Timeouts {
 		MCPStatusDelayFloor:         2 * time.Second,   // §43.20; least suggestion
 		MCPStatusDelayCeiling:       300 * time.Second, // §43.20; most suggestion
 		MCPStatusDeliveryWindow:     10 * time.Minute,  // §43.20; a push that never reports back stops holding the session unsettled
+
+		MCPWaitMaxDuration:             25 * time.Second, // §43.20 (182b, D2); under the 30 s idle timeout of common proxies
+		MCPWaitPollInterval:            time.Second,      // §43.20 (182b, D2); one Postgres read per second per wait
+		MCPWaitMaxConcurrentPerKey:     2,                // §43.20 (182b, D4); waits one grant (or user) runs at once per replica
+		MCPWaitMaxConcurrentPerReplica: 32,               // §43.20 (182b, D4); waits one replica runs at once
 	}
 }
 
@@ -3875,6 +3926,41 @@ func (t Timeouts) Validate() error {
 		"MCPStatusDeliveryWindow", t.MCPStatusDeliveryWindow,
 		"SnapshotMintTimeout+2*RepoSHADiscoveryTimeout+RepoCloneTimeout+RepoSHAResolutionTimeout+PRCreateTimeout",
 		t.SnapshotMintTimeout+2*t.RepoSHADiscoveryTimeout+t.RepoCloneTimeout+t.RepoSHAResolutionTimeout+t.PRCreateTimeout)
+
+	// §43.20 (182b): the bounded wait (the MCPWait* fields' own block
+	// comment on the struct). Orderings with no margin, like the status
+	// delay table's: these values are seconds apart. A zero or negative
+	// interval would poll Postgres in a hot loop, so it is refused; the
+	// maximum is positive because it lies above the interval. Both caps
+	// below one would refuse every wait, which is a broken configuration
+	// rather than a stricter one.
+	mustBePositive("MCPWaitPollInterval", t.MCPWaitPollInterval)
+	strictlyBelow := func(chain, lesserField string, lesser time.Duration, greaterField string, greater time.Duration) {
+		if lesser >= greater {
+			errs = append(errs, &TimeoutInvariantError{
+				Chain:        chain,
+				LesserField:  lesserField,
+				LesserValue:  lesser,
+				GreaterField: greaterField,
+				GreaterValue: greater,
+			})
+		}
+	}
+	strictlyBelow("MCPWaitMaxDuration > MCPWaitPollInterval",
+		"MCPWaitPollInterval", t.MCPWaitPollInterval, "MCPWaitMaxDuration", t.MCPWaitMaxDuration)
+	if t.MCPWaitPollInterval > t.MCPStatusDelayFloor {
+		errs = append(errs, &TimeoutInvariantError{
+			Chain:        "MCPStatusDelayFloor >= MCPWaitPollInterval",
+			LesserField:  "MCPWaitPollInterval",
+			LesserValue:  t.MCPWaitPollInterval,
+			GreaterField: "MCPStatusDelayFloor",
+			GreaterValue: t.MCPStatusDelayFloor,
+		})
+	}
+	strictlyBelow("ShutdownGracePeriod > MCPWaitPollInterval",
+		"MCPWaitPollInterval", t.MCPWaitPollInterval, "ShutdownGracePeriod", t.ShutdownGracePeriod)
+	countMustBePositive("MCPWaitMaxConcurrentPerKey", t.MCPWaitMaxConcurrentPerKey)
+	countMustBePositive("MCPWaitMaxConcurrentPerReplica", t.MCPWaitMaxConcurrentPerReplica)
 
 	// U1 audit fix, HIGH (confirmed finding: "the total budget is smaller
 	// than the retry chain it contains"). Derived from the SAME three
