@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+
 import { describe, expect, it } from 'vitest'
 
 import type { EventEnvelope } from '../../ws/types'
@@ -433,6 +435,23 @@ describe('buildTimelineModel over the log a reconnect replay can leave', () => {
       ],
     ])
     expect(hasOpenTurn(events)).toBe(true) // still running: no execution_complete yet
+    expectNoPhantomTurn(events, 1)
+  })
+
+  // The rows the session actor stores for that turn, through Actor.Send on
+  // real Postgres, written by TestHandleSandboxEvent_TokenFrames_
+  // ReplayDuringTheTurnRunningAtDeploy (internal/app/sessionactor), which
+  // fails if what it stores stops matching this file.
+  it('the log the actor stores for the turn running at deploy shows each part in its own step', () => {
+    const fixture = new URL('./fixtures/tokenReplayDuringRunningTurn.json', import.meta.url)
+    const events = JSON.parse(readFileSync(fixture, 'utf8')) as EventEnvelope[]
+    expect(tokensByStep(events)).toEqual([
+      ['s1', [['prt_a', 'Step one narration.']]],
+      ['s2', [['prt_b', 'Step two answer.']]],
+    ])
+    const [turn] = buildTimelineModel(events).turns
+    expect([turn!.live, turn!.outcome?.outcome]).toEqual([false, 'completed'])
+    expect(hasOpenTurn(events)).toBe(false)
     expectNoPhantomTurn(events, 1)
   })
 })
