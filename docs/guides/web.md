@@ -187,6 +187,11 @@ whether the result can still change.
 `reviewedPullRequest` the one it reviews, if it is a pull request's
 review session. `reviewScope` says which of these apply — `none` means
 there is nothing to review, which is not the same as a clean review.
+`excludedPullRequests` lists, apart, the session's pull request records
+that are not pull requests it opened, each with a `kind` and a
+`reason`: `shadow_suppressed` when the repository was in shadow mode, so the pull
+request was never created, and `unreadable` when the record could not
+be read. They never make the rest of the result fail.
 Each pull request carries its `review`: `absent` (never reviewed),
 `in_progress` (a review is running), `not_assessed` (the latest review
 ended without a verdict; an older one, if any, is in
@@ -196,10 +201,13 @@ every read, the same check a merge makes: `current` (the pull request
 still matches what was reviewed), `stale` (it has moved on — a new push,
 a changed base, or an older policy — with the reason), `unconfirmed` (it
 could not be checked, or the verdict predates the details needed to
-check it, with the reason) or `not_applicable` (no assessed verdict, or
-the pull request is merged or closed). A verdict is never `current`
-unless GitHub confirmed it during that read. The result never carries
-the session's events.
+check it, or GitHub did not answer in time, with the reason) or
+`not_applicable` (no assessed verdict, or the pull request is merged or
+no longer open). A verdict is never `current` unless GitHub confirmed it
+during that read. Because every read asks GitHub again,
+`suggestedDelaySeconds` says how long to wait before the next one; to
+learn when a session settles, wait on its status instead. The result
+never carries the session's events.
 
 ```json narvi-command
 {"name": "Get what a session produced, and its review verdicts", "route": "GET /api/sessions/{sessionID}/result"}
