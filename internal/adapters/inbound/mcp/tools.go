@@ -52,6 +52,11 @@ type Twins struct {
 	// narvi_get_session_transcript's own twin, the paginated event
 	// history (technical plan §43.20).
 	ListEvents http.HandlerFunc
+	// GetSessionResult is httpapi.GetSessionResult(deps) --
+	// narvi_get_session_result's own twin: the last run, the pull requests
+	// and each verdict's freshness or absence (technical plan §43.20, row
+	// 182's result).
+	GetSessionResult http.HandlerFunc
 }
 
 // toolSpec is the ONLY place a tool is declared: its wire name, the
@@ -247,6 +252,19 @@ func buildGetSessionStatusRequest(arguments json.RawMessage) (map[string]string,
 	return map[string]string{"sessionID": in.SessionId}, nil, nil
 }
 
+// buildGetSessionResultRequest is buildGetSessionStatusRequest for
+// narvi_get_session_result: restdtos.GetSessionResultToolRequest (whose
+// generated UnmarshalJSON enforces "sessionId" is present) mapped onto the
+// twin's own chi URL param, "sessionID". No query: the result twin reads
+// none.
+func buildGetSessionResultRequest(arguments json.RawMessage) (map[string]string, url.Values, error) {
+	var in restdtos.GetSessionResultToolRequest
+	if err := json.Unmarshal(arguments, &in); err != nil {
+		return nil, nil, err
+	}
+	return map[string]string{"sessionID": in.SessionId}, nil, nil
+}
+
 // waitArgs is buildWaitForSessionRequest's own decode target -- not
 // restdtos.WaitForSessionToolRequest, for listSessionsArgs' reason:
 // waitSeconds is a *json.Number so every integer spelling the schema
@@ -381,6 +399,16 @@ func toolSpecs(twins Twins) []toolSpec {
 			InputDef:     "WaitForSessionToolRequest",
 			OutputDef:    "SessionActivity",
 			BuildRequest: buildWaitForSessionRequest,
+		},
+		{
+			Name:         "narvi_get_session_result",
+			Description:  "What one session has produced -- the same result GET /api/sessions/{sessionID}/result returns: how its last run ended, with a summary of that run's final text (copied as the agent wrote it, never written by a model, at most 4,000 characters; truncated says when it was cut); the pull requests it opened, or the one it reviews (reviewScope none means there is no pull request to review, which is not a clean review); and each pull request's review state -- absent, in_progress, not_assessed (the older verdict is in supersededVerdict and is not the answer) or assessed -- with the verdict's freshness: current only when the code host confirmed, during this call, that the pull request still matches what was reviewed (its head, base, ancestor chain and the review policy); stale or unconfirmed with a reason; not_applicable when there is no assessed verdict or the pull request is merged or closed. activity says whether the result can still change. Does not include the transcript.",
+			Scope:        mcpscope.Read,
+			Instruction:  "narvi_get_session_result (what one session produced: its last run, its pull requests, and each one's review verdict and whether it is still current)",
+			Twin:         twin{method: http.MethodGet, pathTemplate: "/api/sessions/{sessionID}/result", handler: twins.GetSessionResult},
+			InputDef:     "GetSessionResultToolRequest",
+			OutputDef:    "SessionOutcome",
+			BuildRequest: buildGetSessionResultRequest,
 		},
 		{
 			Name:         "narvi_get_session_transcript",

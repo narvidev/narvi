@@ -41,6 +41,7 @@ var wantTwinRoutes = map[string]string{
 	"narvi_get_session":            "GET /api/sessions/{sessionID}",
 	"narvi_get_session_status":     "GET /api/sessions/{sessionID}/status",
 	"narvi_wait_for_session":       "GET /api/sessions/{sessionID}/status",
+	"narvi_get_session_result":     "GET /api/sessions/{sessionID}/result",
 	"narvi_get_session_transcript": "GET /api/sessions/{sessionID}/events",
 }
 
@@ -109,6 +110,7 @@ func realToolsListTools(t testing.TB) []*sdkmcp.Tool {
 		GetSession:       stubHandler(200, `{}`),
 		GetSessionStatus: stubHandler(200, `{}`),
 		ListEvents:       stubHandler(200, `{}`),
+		GetSessionResult: stubHandler(200, `{}`),
 	}
 	tools := make([]*sdkmcp.Tool, 0, len(toolSpecs(twins)))
 	for _, spec := range toolSpecs(twins) {
@@ -140,12 +142,12 @@ func TestToolsList_MatchesGolden(t *testing.T) {
 	}
 }
 
-// TestToolsList_ExactlySixToolsDeterministicOrder pins the full table:
-// a grant holding every advertised scope sees exactly these six tools,
+// TestToolsList_ExactlySevenToolsDeterministicOrder pins the full table:
+// a grant holding every advertised scope sees exactly these seven tools,
 // in this order. Which subset a narrower grant sees is
 // TestToolsList_ScopeFilter_Table's (technical plan §43.17).
-func TestToolsList_ExactlySixToolsDeterministicOrder(t *testing.T) {
-	want := []string{"narvi_list_models", "narvi_list_sessions", "narvi_get_session", "narvi_get_session_status", "narvi_wait_for_session", "narvi_get_session_transcript"}
+func TestToolsList_ExactlySevenToolsDeterministicOrder(t *testing.T) {
+	want := []string{"narvi_list_models", "narvi_list_sessions", "narvi_get_session", "narvi_get_session_status", "narvi_wait_for_session", "narvi_get_session_result", "narvi_get_session_transcript"}
 	tools := realToolsListTools(t)
 	if len(tools) != len(want) {
 		t.Fatalf("len(tools) = %d, want %d", len(tools), len(want))

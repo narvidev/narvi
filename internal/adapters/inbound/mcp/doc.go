@@ -16,11 +16,13 @@
 // (§43.17, buildServer); they never widen what a tool may do, because
 // every tool runs its REST twin's own authorization against the user's
 // own role. A session's live status, the bounded wait for it to settle,
-// and its paginated transcript are here (§43.20, bridges like the rest:
-// the wait is the status twin with ?waitSeconds=, whose blocking lives in
-// the twin -- this package only builds the query); the result/verdict
-// tools and the plan/prompt/stop/delegate tools belong to later pieces
-// and rows of the plan, and none of that is here.
+// its result -- the last run, the pull requests, each verdict's freshness
+// or absence -- and its paginated transcript are here (§43.20, bridges
+// like the rest: the wait is the status twin with ?waitSeconds=, whose
+// blocking lives in the twin -- this package only builds the query -- and
+// the result's live freshness read lives in its twin too); the
+// plan/prompt/stop/delegate tools belong to later rows of the plan, and
+// none of that is here.
 //
 // # Registration (controlplane/serve.go)
 //
@@ -133,7 +135,7 @@
 // # What is emphatically NOT here
 //
 // No repository discovery (needs a REST route this codebase does not
-// have yet, §43 D5). No result/verdict tool (row 182's piece (c)). No plan/
+// have yet, §43 D5). No plan/
 // delegate/prompt/stop tools (183). No OAuth endpoint of its own (the
 // authorization server is internal/adapters/inbound/mcpauth; this package
 // only reads the grant auth.RequireMCPBearer attached). No resources, no

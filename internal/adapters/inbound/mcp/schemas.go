@@ -48,6 +48,7 @@ var loadedRestDefs = sync.OnceValues(func() (map[string]json.RawMessage, error) 
 // bundling, no rewriting. This is deliberate (technical plan §43.10): no
 // tool's input shape (ListModelsToolRequest, ListSessionsToolRequest,
 // GetSessionToolRequest, GetSessionStatusToolRequest,
+// WaitForSessionToolRequest, GetSessionResultToolRequest,
 // GetSessionTranscriptToolRequest) references another $def, so the wire inputSchema
 // a client sees is byte-derived from /contracts with nothing added or
 // removed. TestToolInputSchemas_ComeFromContracts pins exactly this: each
@@ -76,7 +77,8 @@ func inputSchema(name string) (map[string]any, error) {
 // access to fetch rest/v1/dtos.schema.json itself -- can still resolve
 // every "#/$defs/<Name>" reference name's own sub-schema contains. Used
 // for every tool's OutputSchema (Session, ListSessionsResponse,
-// ModelCatalog, SessionActivity, EventsResponse are all reused UNCHANGED
+// ModelCatalog, SessionActivity, SessionOutcome, EventsResponse are all
+// reused UNCHANGED
 // from /contracts, never a hand-written shape -- technical plan §43.10).
 //
 // The bundled document's shape is:

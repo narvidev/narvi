@@ -196,6 +196,18 @@ var toolCallArgs = map[string]struct {
 			{keywords: []string{"/properties/sessionId/format"}, arguments: `{"sessionId":"not-a-uuid"}`, realRefusal: "invalid arguments: - at '/sessionId': 'not-a-uuid' is not valid uuid: must have 5 elements"},
 		},
 	},
+	"narvi_get_session_result": {
+		realValid: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a"}`,
+		realInvalid: []keywordProbe{
+			// buildGetSessionResultRequest decodes through the generated
+			// GetSessionResultToolRequest, exactly as narvi_get_session_status
+			// does through its own: the same rows hold.
+			{keywords: []string{"/type"}, arguments: `null`, realRefusal: "invalid arguments: - at '': got null, want object"},
+			{keywords: []string{"/additionalProperties"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","bogus":1}`, realRefusal: "invalid arguments: - at '': additional properties 'bogus' not allowed"},
+			{keywords: []string{"/properties/sessionId/type"}, arguments: `{"sessionId":null}`, realRefusal: "invalid arguments: - at '/sessionId': got null, want string"},
+			{keywords: []string{"/properties/sessionId/format"}, arguments: `{"sessionId":"not-a-uuid"}`, realRefusal: "invalid arguments: - at '/sessionId': 'not-a-uuid' is not valid uuid: must have 5 elements"},
+		},
+	},
 	"narvi_wait_for_session": {
 		realValid: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","waitSeconds":5}`,
 		realInvalid: []keywordProbe{
@@ -257,6 +269,10 @@ var buildRequestEnforces = map[string]map[string]string{
 		"/required": "restdtos.GetSessionStatusToolRequest.UnmarshalJSON refuses every object without a sessionId key; " +
 			"the one value it carries through without one, null, is not an object, and required constrains objects only",
 	},
+	"narvi_get_session_result": {
+		"/required": "restdtos.GetSessionResultToolRequest.UnmarshalJSON refuses every object without a sessionId key; " +
+			"the one value it carries through without one, null, is not an object, and required constrains objects only",
+	},
 }
 
 // twinBodies is the 200 body each tool's counting twin answers with --
@@ -269,6 +285,7 @@ var twinBodies = map[string]string{
 	"narvi_get_session":            `{"id":"x"}`,
 	"narvi_get_session_status":     `{"activity":"idle"}`,
 	"narvi_wait_for_session":       `{"activity":"idle"}`,
+	"narvi_get_session_result":     `{"reviewScope":"none"}`,
 	"narvi_get_session_transcript": `{"events":[],"nextCursor":null}`,
 }
 
@@ -292,6 +309,8 @@ func countingTwins(calls *atomic.Int32) Twins {
 		// serves narvi_wait_for_session too.
 		GetSessionStatus: twin("narvi_get_session_status"),
 		ListEvents:       twin("narvi_get_session_transcript"),
+		// Row 182's result (piece (c)).
+		GetSessionResult: twin("narvi_get_session_result"),
 	}
 }
 
