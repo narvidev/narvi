@@ -7,6 +7,7 @@
 package boot
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -74,17 +75,76 @@ import (
 // wrapped -- this function's own caller treats any error here as fatal
 // to boot (see that call site's own comment for why: a partially
 // re-owned workspace is worse than a clearly-failed boot).
+//
+// An entry that disappears between being listed and being re-owned is
+// not such a failure: there is nothing left to re-own. The walk runs
+// while other processes may be writing in the tree -- cmd/sandbox-agent's
+// post-boot pass covers every repository after RunBoot has already started
+// its services.yml processes, and opencode serve is already running -- and
+// a lock or temp file created and removed under it (git's own index.lock
+// and HEAD.lock among them) used to fail the whole boot with ENOENT. See
+// lchownEntry for how a vanished entry is told apart from any other
+// ENOENT. workspaceDir itself must still exist.
 func ChownWorkspaceForRuntime(workspaceDir string, uid, gid uint32) error {
+	return chownTree(workspaceDir, uid, gid, os.Lchown)
+}
+
+// chownTree is ChownWorkspaceForRuntime with its Lchown call injectable, so
+// a test can make an entry vanish at exactly the point a concurrent writer
+// would.
+func chownTree(workspaceDir string, uid, gid uint32, lchown func(path string, uid, gid int) error) error {
 	err := filepath.WalkDir(workspaceDir, func(path string, _ fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
+			// A directory listed by its parent but removed before it could
+			// be read. Never the root: a missing workspaceDir is an error.
+			if path != workspaceDir && errors.Is(walkErr, fs.ErrNotExist) && isGone(path) {
+				return nil
+			}
 			return walkErr
 		}
-		return os.Lchown(path, int(uid), int(gid))
+		return lchownEntry(path, int(uid), int(gid), lchown)
 	})
 	if err != nil {
 		return fmt.Errorf("boot: chown workspace %s for runtime uid=%d gid=%d: %w", workspaceDir, uid, gid, err)
 	}
 	return nil
+}
+
+// lchownVanishAttempts bounds how many times lchownEntry retries a path that
+// reported ENOENT yet still exists -- a name recreated by a concurrent writer
+// between the failed call and the check (git recreates index.lock on every
+// operation). Not a timeout: nothing here waits.
+const lchownVanishAttempts = 3
+
+// lchownEntry re-owns one walked entry, treating "it no longer exists" as
+// done rather than as an error.
+//
+// Lchown never resolves a symlink, so an ENOENT from it can only mean the
+// entry itself was gone at the moment of the call. That is confirmed with a
+// fresh Lstat before anything is skipped. An entry that is still there was
+// recreated in between and is re-owned again; one that keeps reporting
+// ENOENT while existing -- which only a symlink-FOLLOWING chown can do, on a
+// dangling link -- is returned as the error it is, so replacing Lchown with
+// Chown still fails loudly (TestChownWorkspaceForRuntime_DoesNotFollowSymlinks).
+func lchownEntry(path string, uid, gid int, lchown func(path string, uid, gid int) error) error {
+	var err error
+	for range lchownVanishAttempts {
+		err = lchown(path, uid, gid)
+		if err == nil || !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		if isGone(path) {
+			return nil
+		}
+	}
+	return err
+}
+
+// isGone reports whether path does not exist right now (never following a
+// symlink).
+func isGone(path string) bool {
+	_, err := os.Lstat(path)
+	return errors.Is(err, fs.ErrNotExist)
 }
 
 // RuntimeHomeDir is where the dropped agent runtime's own home lives, and
