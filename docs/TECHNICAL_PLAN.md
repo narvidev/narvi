@@ -7632,3 +7632,107 @@ on; `RateLimit_RefusedRefreshSpendsNothing_SDK` has the SDK client's own refresh
 no consent, the refresh token kept and still good; and `Authorize_PendingCapRefused` floods one client
 with concurrent authorizations from as many networks and finds exactly the cap stored, and one refusal
 line per refused request, naming that request's network.
+
+### 43.20 A session's live status, and its transcript apart from it
+
+Row 182's first piece, (a). A client that polls hard gets rate-limited into looking broken, and a
+client that reads the wrong field sees a busy session as idle. `sessions.status` is that wrong field
+for "what is it doing now": it is re-derived only when a turn reaches a terminal state (§3.1's
+derivation, run by the session actor on completion, deadline, abandon and the terminal-grace
+re-derive), never when a turn is created or dispatched. So a session's first turn runs its whole life
+under `created`, and a follow-up turn is queued and runs under `completed` or `failed` — and
+`narvi_get_session`, which returns the row, shows that work as idle. Writing `active` on enqueue and
+dispatch is a separate actor-path change (owner decision D8 of the row's design: not in 182); this
+section derives the live state at read time instead, from the rows Postgres already holds, and stores
+nothing.
+
+**The route.** `GET /api/sessions/{sessionID}/status` answers `SessionActivity`, behind exactly the
+gate of `GET /api/sessions/{sessionID}`: signed in, `400` for a malformed id, `404` for a session that
+does not exist, and no per-session visibility beyond that, because there is none in this codebase
+(§43.12) — a bearer token reaching it through the bridge never reads more than its user's cookie.
+
+**The derivation.** `session.DeriveActivity` is a pure function over one snapshot: how many of the
+session's turns are in each state, and whether a plan awaits approval, a workflow step awaits a
+decision, or a workflow run was escalated to `needs_review`. Highest first: a turn `dispatched` or
+`processing` → `running` (turns may be pending behind it); else a turn `pending` → `queued` — which
+covers the gap between one turn finishing and the next being dispatched, and a whole sandbox cold
+start; else a gate open → `awaiting_approval`; else no turn at all → `idle` (a session created without
+a prompt); else `finished`. A turn state the table does not know counts as in flight, mirroring
+`turn.IsTerminal`'s deny-list, so a busy session never reads settled because of a value this code
+does not recognize. A non-empty queue is therefore always `queued` or `running`, never `idle` or
+`finished`. `settled` is true for `idle`, `awaiting_approval` and `finished`: nothing progresses
+server-side until a person acts or sends new input.
+
+Every fact comes from one SQL statement (`GetSessionActivityFacts`), so one MVCC snapshot. That is
+load-bearing: a plan-mode turn's completion and its `awaiting_approval` plan are written in one
+transaction, as are a plan's approval and the implementation turn it creates, and a workflow step's
+completion and the next step's turn — so no committed state is ever "every turn terminal, nothing
+awaiting" between a turn and its follow-on, but two statements under READ COMMITTED could straddle
+such a commit and report a false `finished`. The statement reads aggregates and single rows only —
+the per-state turn counts as one JSON object (so a state added to the enum later still reaches the
+derivation as unknown, rather than being dropped), the first in-flight turn, the newest terminal turn,
+the newest turn, the oldest open gate of each kind, the sandbox status — never the turn list, whose
+length is unbounded and whose rows carry prompts. Every lookup leads with `session_id` on an index that
+already exists; no migration.
+
+Beside `activity`, the response says how many turns are pending, which turn is in flight (and since
+when it was dispatched), which gate is open and since when (a plan first, then a workflow step, then
+an escalated run — reported whatever `activity` says, since a gate can be open while a turn is also
+queued), how the newest terminal turn ended (`lastRun`), the sandbox status in the same snapshot
+(informational; `activity` never derives from it), whether the session is archived, and `observedAt`,
+the database's clock at the snapshot. A turn row has no failure-reason column, so `lastRun.failureReason`
+is the session's recorded reason, given only when it can describe nothing else: the last run is the
+newest turn, did not complete, and the session's recorded outcome is that run's; otherwise `null`.
+
+**The suggested delay.** `suggestedDelaySeconds` is how long a client should wait before reading
+again, from `session.SuggestedReadDelay`'s per-activity table: queued while no warm sandbox can take
+the turn (none yet, starting, suspect, stopped, failed — a cold start is bounded by
+`FirstConnectBudget`, minutes) 15 s; queued on a ready (or snapshotting) sandbox 5 s; running 10 s;
+awaiting a person 60 s; finished or idle 300 s — every suggestion clamped to [2 s, 300 s] and rounded
+up to whole seconds. All seven values are `platform.Timeouts` fields (`MCPStatusDelayStarting`,
+`…Queued`, `…Running`, `…AwaitingHuman`, `…Settled`, `…Floor`, `…Ceiling`), and `Validate` keeps the
+floor positive and every per-activity value inside the bounds, with no margin (these are seconds
+apart). It is a hint that keeps polling quiet, never a brake: a read that comes sooner is answered all
+the same, because a `429` from a twin would reach an MCP client as `-32603` (§43.8), the very "looks
+broken" failure the row names. No jitter: the domain has no randomness (§11), and nothing at this
+scale needs it.
+
+**The tools.** Two read-only tools join the table, both `mcp:read`, both bridges with the four §43.8
+annotations, their inputs new `*Request` `$defs` and their outputs existing REST response shapes
+(§43.10):
+
+| Tool | Twin | Input `$def` | Output |
+|---|---|---|---|
+| `narvi_get_session_status` | `GET /api/sessions/{sessionID}/status` | `GetSessionStatusToolRequest` (`sessionId`, uuid) | `SessionActivity` |
+| `narvi_get_session_transcript` | `GET /api/sessions/{sessionID}/events` | `GetSessionTranscriptToolRequest` (`sessionId`; optional `cursor`, a decimal event id matching `nextCursor`; optional `limit`, `minimum: 1`, no `maximum` — the route clamps at 500) | `EventsResponse` |
+
+State and transcript are separate reads, and the transcript is served only on explicit request:
+`SessionActivity` carries no events, and the event history is reached only through its own paginated
+tool, with the route's own page size (100 by default, clamped at 500 — decision D12). A grant without
+`mcp:read` is told neither tool exists (§43.17), and `narvi_get_session`'s description and
+`Session.status`'s now say that `status` does not show queued or running work and point at the status
+route. The adapter gains two `Twins` fields and two table rows, nothing else: its import ban is
+unchanged. Row 182's other pieces are not here: the bounded wait (b) — the status tool's blocking
+form, which returns only on a settled state and never on a queue that has not started — and the
+result (c) — the last run's summary, the pull requests the session produced, and each one's verdict
+with its freshness or its absence. The wait's interval and caps join this block of `platform.Timeouts`
+with it.
+
+**Tests.** Domain: `TestDeriveActivity_Table` (every combination above, unknown state → running, a
+queued follow-up under a completed history → queued), `TestDeriveActivity_NonEmptyQueueNeverIdleOrFinished`
+(every gate combination under every non-empty queue), `TestSuggestedReadDelay_Table`,
+`TestSuggestedReadDelay_AlwaysWithinBounds` (every activity × every sandbox status, with a table whose
+values fall outside the bounds). Timeouts: `TestTimeouts_Validate_MCPStatusDelay` (each link broken
+alone, reported by name). Postgres: `TestSessionActivityFacts_OneStatement`. REST, on real Postgres:
+`TestGetSessionStatus_FollowUpQueuedUnderCompletedRow` (the row says `completed` while a follow-up is
+queued, then dispatched, then processing: `queued`, `running`, `running`, then `finished` only once
+the turn is terminal), `TestGetSessionStatus_PlanCompletionNeverObservedAsFinished_Race` and
+`TestGetSessionStatus_WorkflowAdvanceNeverObservedAsFinished_Race` (a writer commits a completion and
+its follow-on in one transaction, over and over, while readers poll; `finished` is never observed),
+`TestGetSessionStatus_Gates`. MCP: `TestEveryToolHasARegisteredTwin`, the tool-list golden,
+`TestToolsList_ScopeFilter_Table`, `TestHiddenToolCall_IsIndistinguishableFromUnknownTool`,
+`TestStatusOutputSchema_HasNoEvents`, `TestParity_BearerEqualsCookieForEveryRole` (both tools, every
+role), `TestParity_GetSessionTranscript_CursorWalkEqualsREST`. On the production router, through the
+official SDK client: `TestOAuth_ProductionRouter/SessionStatusAndTranscript_SDKClient` (both tools
+answer what their twins answer the same user's cookie, and the status response has no transcript
+field) and `…/SessionStatusAndTranscript_ScopelessGrantSeesNeither`.
