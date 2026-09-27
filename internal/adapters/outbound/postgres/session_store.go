@@ -86,6 +86,17 @@ func (s *SessionStore) UpdateIntentDecisionIfNull(ctx context.Context, id pgtype
 	return rows == 1, nil
 }
 
+// ActivityFacts reads every fact a session's live activity is derived from
+// -- its turn histogram, in-flight turn, last terminal turn, newest turn,
+// open human gates and sandbox status -- in ONE statement, so one MVCC
+// snapshot (technical plan §43.20; GetSessionActivityFacts' own doc
+// comment says why two statements would not do). Backs GET
+// /api/sessions/{sessionID}/status. pgx.ErrNoRows when the session does
+// not exist.
+func (s *SessionStore) ActivityFacts(ctx context.Context, id pgtype.UUID) (sqlcgen.GetSessionActivityFactsRow, error) {
+	return s.q.GetSessionActivityFacts(ctx, id)
+}
+
 // ListFailed returns up to limit currently-'failed', unarchived sessions,
 // most-recently-failed first -- §16's own needs_attention row source
 // (see ListFailedSessions' own generated doc comment for the full design:

@@ -206,3 +206,108 @@ FROM sessions
 WHERE created_at >= $1
 GROUP BY (date_trunc('day', created_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')::timestamptz, status, failure_reason
 ORDER BY day;
+
+-- name: GetSessionActivityFacts :one
+-- Every fact GET /api/sessions/{sessionID}/status derives a session's
+-- activity from (technical plan §43.20), in ONE statement and so one MVCC
+-- snapshot: two statements under READ COMMITTED could interleave with the
+-- transaction that completes a plan-mode turn and inserts its plan
+-- (sessionactor's recordPlanIfNeeded) and see "turn completed, no plan
+-- yet" -- a false "finished". Deliberately NOT sessions.status: that
+-- column is re-derived only when a turn reaches a terminal state, so it
+-- reads "created" or "completed" while a turn is queued or running; it is
+-- selected here only to decide whether sessions.failure_reason still
+-- describes the last run (the handler's own rule), never the activity.
+--
+-- turn_counts is the per-state turn histogram as a JSON object (state ->
+-- count), not one column per known state: a state added to turn_status
+-- later still reaches internal/domain/session.DeriveActivity, which counts
+-- an unknown state as work in flight, instead of being silently dropped.
+-- Aggregates and single-row lookups only -- never the turns themselves
+-- (turns per session are unbounded, and each row carries its prompt).
+-- Every lookup leads with session_id on an existing index (turns_session_
+-- id_dispatched_message_id_idx, plans_one_awaiting_approval_per_session,
+-- workflow_runs_session_id_idx, workflow_step_runs_one_live_per_run).
+--
+-- Turn order is created_at, then id -- ListTurnsForSession's own order,
+-- with id breaking a tie. observed_at is the database's own statement time,
+-- the instant the snapshot was taken. The two turn statuses are text, ''
+-- when their turn is absent (its id is then NULL): an enum column from an
+-- outer-joined subquery would be generated as a non-nullable type that
+-- cannot scan NULL.
+SELECT
+    s.id AS session_id,
+    s.status AS session_status,
+    s.failure_reason AS session_failure_reason,
+    s.archived AS archived,
+    sb.status AS sandbox_status,
+    statement_timestamp()::timestamptz AS observed_at,
+    COALESCE(tc.turn_counts, '{}'::jsonb)::jsonb AS turn_counts,
+    inflight.id AS in_flight_turn_id,
+    COALESCE(inflight.status::text, '')::text AS in_flight_turn_status,
+    inflight.dispatched_at AS in_flight_dispatched_at,
+    lastrun.id AS last_run_turn_id,
+    COALESCE(lastrun.status::text, '')::text AS last_run_status,
+    lastrun.completed_at AS last_run_completed_at,
+    newest.id AS newest_turn_id,
+    awaitingplan.id AS awaiting_plan_id,
+    awaitingplan.created_at AS awaiting_plan_since,
+    awaitingstep.id AS awaiting_step_id,
+    awaitingstep.updated_at AS awaiting_step_since,
+    escalated.id AS escalated_run_id,
+    escalated.updated_at AS escalated_run_since
+FROM sessions s
+LEFT JOIN sandboxes sb ON sb.session_id = s.id
+LEFT JOIN LATERAL (
+    SELECT jsonb_object_agg(c.status, c.n) AS turn_counts
+    FROM (
+        SELECT t.status::text AS status, count(*) AS n
+        FROM turns t
+        WHERE t.session_id = s.id
+        GROUP BY t.status
+    ) c
+) tc ON true
+LEFT JOIN LATERAL (
+    SELECT t.id, t.status, t.dispatched_at
+    FROM turns t
+    WHERE t.session_id = s.id AND t.status IN ('dispatched', 'processing')
+    ORDER BY t.created_at, t.id
+    LIMIT 1
+) inflight ON true
+LEFT JOIN LATERAL (
+    SELECT t.id, t.status, t.completed_at
+    FROM turns t
+    WHERE t.session_id = s.id AND t.status IN ('completed', 'failed', 'cancelled')
+    ORDER BY t.created_at DESC, t.id DESC
+    LIMIT 1
+) lastrun ON true
+LEFT JOIN LATERAL (
+    SELECT t.id
+    FROM turns t
+    WHERE t.session_id = s.id
+    ORDER BY t.created_at DESC, t.id DESC
+    LIMIT 1
+) newest ON true
+LEFT JOIN LATERAL (
+    SELECT p.id, p.created_at
+    FROM plans p
+    WHERE p.session_id = s.id AND p.status = 'awaiting_approval'
+    ORDER BY p.created_at, p.id
+    LIMIT 1
+) awaitingplan ON true
+LEFT JOIN LATERAL (
+    SELECT sr.id, sr.updated_at
+    FROM workflow_step_runs sr
+    JOIN workflow_runs wr ON wr.id = sr.workflow_run_id
+    WHERE wr.session_id = s.id AND sr.status = 'awaiting_decision'
+    ORDER BY sr.updated_at, sr.id
+    LIMIT 1
+) awaitingstep ON true
+LEFT JOIN LATERAL (
+    SELECT wr.id, wr.updated_at
+    FROM workflow_runs wr
+    WHERE wr.session_id = s.id AND wr.status = 'needs_review'
+    ORDER BY wr.updated_at, wr.id
+    LIMIT 1
+) escalated ON true
+WHERE s.id = $1;
