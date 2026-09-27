@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -18,12 +20,14 @@ import (
 
 // The walk runs as root while services.yml processes run as the runtime
 // uid and own the tree it walks. The tests in this file stand in for a
-// hostile one: at the exact moment a directory has been listed, or an
-// entry in it is about to be re-owned, a directory is replaced by a
-// symlink to a directory OUTSIDE the workspace. The property under test is
-// that nothing outside is ever re-owned. A path-based walk fails every one
-// of these: Lchown resolves each parent component again, and os.ReadDir
-// follows a directory swapped for a symlink after it was listed.
+// hostile one: at the exact moment a directory has been opened, listed,
+// or has an entry about to be looked at or re-owned, a directory is
+// replaced by a symlink to a directory OUTSIDE the workspace. The
+// properties under test are that nothing outside is ever re-owned, and
+// that what the walk re-owns is what it opened, not what a name now
+// holds. A path-based walk fails these: Lchown resolves each parent
+// component again, and os.ReadDir follows a directory swapped for a
+// symlink after it was listed.
 
 // ObservableOwner is observableOwner, for the boot_test package's tests.
 var ObservableOwner = observableOwner
@@ -209,6 +213,101 @@ func TestChownTree_SwappedDirectoryNeverRedirectsOutside(t *testing.T) {
 	}
 }
 
+// The list-and-look cases below walk a tree whose outside copy differs
+// from it on purpose, where redirectTree mirrors it: inside, d holds a
+// file (flip) where the outside d holds a directory, a directory (flop)
+// where it holds a file, and a name it lacks (inside-only); outside, d
+// holds a name inside lacks (outside-only). A walk that listed d, or
+// looked at an entry of d, by a path through a planted symlink rather than
+// through the fd it holds would see those names and types instead of the
+// ones it must re-own, and leave some of the tree un-re-owned, or fail.
+var (
+	listTreeInsideDirs   = []string{"repo/d/flop"}
+	listTreeInsideFiles  = []string{"repo/a.txt", "repo/d/flip", "repo/d/inside-only", "repo/d/flop/deep"}
+	listTreeOutsideDirs  = []string{"repo/d/flip"}
+	listTreeOutsideFiles = []string{"repo/a.txt", "repo/d/flip/x", "repo/d/flop", "repo/d/outside-only"}
+)
+
+// TestChownTree_SwapBeforeListOrLookChangesNothingReowned swaps a directory,
+// or its parent, for a symlink to that differing outside tree once the
+// walk has opened it and before it lists it, and once it has listed it and
+// before it looks at its first entry. Every entry the tree held must be
+// re-owned, under wherever the swap moved it, and nothing outside may be.
+// Listing d by its path instead of from the fd the walk holds leaves
+// inside-only and flop's content un-re-owned, or fails the walk listing
+// the outside flop, a file; looking at d's entries by path types flip as a
+// directory and flop as a file, and leaves both un-re-owned.
+func TestChownTree_SwapBeforeListOrLookChangesNothingReowned(t *testing.T) {
+	tests := []struct {
+		name  string
+		point walkPoint
+		// at is the entry at whose hook point the swap happens, relative to
+		// the root; one ending in "/*" is whichever entry of that directory
+		// the walk reaches first.
+		at string
+		// swap is the directory replaced by a symlink, relative to the
+		// root; linkTo is where the symlink points, relative to outside.
+		swap, linkTo string
+	}{
+		{
+			name: "directory swapped after it was opened, before it is listed", point: beforeList, at: "repo/d",
+			swap: "repo/d", linkTo: "repo/d",
+		},
+		{
+			name: "parent swapped after the directory was opened, before it is listed", point: beforeList, at: "repo/d",
+			swap: "repo", linkTo: "repo",
+		},
+		{
+			name: "directory swapped after it was listed, before its first entry is looked at", point: beforeEntry, at: "repo/d/*",
+			swap: "repo/d", linkTo: "repo/d",
+		},
+		{
+			name: "parent swapped after the directory was listed, before its first entry is looked at", point: beforeEntry, at: "repo/d/*",
+			swap: "repo", linkTo: "repo",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root, outside := t.TempDir(), t.TempDir()
+			buildTree(t, root, listTreeInsideDirs, listTreeInsideFiles)
+			buildTree(t, outside, listTreeOutsideDirs, listTreeOutsideFiles)
+			uid, gid := observableOwner(t, root)
+			inside, outsideBefore := owners(t, root), owners(t, outside)
+			matches := func(path string) bool { return path == filepath.Join(root, tc.at) }
+			if dir, ok := strings.CutSuffix(tc.at, "/*"); ok {
+				matches = func(path string) bool { return filepath.Dir(path) == filepath.Join(root, dir) }
+			}
+			swapped := filepath.Join(root, tc.swap)
+
+			acted := false
+			hook := func(point walkPoint, path string) {
+				if point == tc.point && matches(path) && !acted {
+					acted = true
+					swapForSymlink(t, swapped, filepath.Join(outside, tc.linkTo))
+				}
+			}
+			if err := chownTree(root, uid, gid, quietly(hook)); err != nil {
+				t.Fatalf("chownTree() error = %v, want nil", err)
+			}
+			if !acted {
+				t.Fatalf("the walk never reached %s at the hooked point, so this case proved nothing", tc.at)
+			}
+
+			requireUntouched(t, outside, outsideBefore)
+			for path := range inside {
+				now := path
+				if rest, ok := strings.CutPrefix(path, swapped); ok && (rest == "" || strings.HasPrefix(rest, string(filepath.Separator))) {
+					now = swapped + ".moved" + rest
+				}
+				if u, g := ownerOf(t, now); u != uid || g != gid {
+					t.Errorf("%s = %d:%d, want %d:%d -- the walk must list, and look at, the directory it opened, not what its name holds", now, u, g, uid, gid)
+				}
+			}
+		})
+	}
+}
+
 // TestChownTree_RepoSymlinksAreReownedNeverFollowed pins the symlinks a
 // repository can carry from the start, with no race at all: to a file
 // outside, to a directory outside, and dangling. Each link's own inode is
@@ -292,6 +391,70 @@ func TestChownTree_DepthBound(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestChownTree_ClosesEveryDirectoryItOpens pins that the walk closes each
+// directory frame it pops instead of leaving it to a finalizer: a leaked
+// frame is an fd per directory (two on darwin, whose listing holds a
+// duplicate) until the garbage collector happens to run, and a wide or deep
+// workspace can run sandbox-agent out of them first. It counts the
+// process's open fds around a walk of a tree both wide and deep, with the
+// garbage collector off so that no finalizer closes what the walk leaks.
+func TestChownTree_ClosesEveryDirectoryItOpens(t *testing.T) {
+	var fdDir string
+	switch runtime.GOOS {
+	case "linux":
+		fdDir = "/proc/self/fd"
+	case "darwin":
+		fdDir = "/dev/fd"
+	default:
+		t.Skipf("no per-process fd directory known on %s", runtime.GOOS)
+	}
+	const wide, deep = 200, 200
+	var dirs, files []string
+	for i := range wide {
+		dir := fmt.Sprintf("wide/d%03d", i)
+		dirs, files = append(dirs, dir), append(files, dir+"/f")
+	}
+	chain := "deep"
+	for range deep {
+		chain = filepath.Join(chain, "d")
+	}
+	dirs, files = append(dirs, chain), append(files, chain+"/f")
+	root := t.TempDir()
+	buildTree(t, root, dirs, files)
+	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
+	walk := func() {
+		t.Helper()
+		if err := chownTree(root, uid, gid, quietly(nil)); err != nil {
+			t.Fatalf("chownTree() error = %v, want nil", err)
+		}
+	}
+
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	walk() // whatever the process opens once, rather than per walk, is open from here on
+	before := openFDs(t, fdDir)
+	walk()
+	if leaked := openFDs(t, fdDir) - before; leaked > 2 {
+		t.Errorf("%d more fds are open after a walk of %d directories than before it -- the walk must close each directory it pops", leaked, wide+deep+3)
+	}
+}
+
+// openFDs counts the entries of dir, the process's own fd directory. By
+// name only: a stat of each, as os.ReadDir makes on darwin, fails on the
+// entry for the fd the listing itself used, closed by then.
+func openFDs(t *testing.T, dir string) int {
+	t.Helper()
+	d, err := os.Open(dir)
+	if err != nil {
+		t.Fatalf("Open(%s): %v", dir, err)
+	}
+	defer func() { _ = d.Close() }()
+	names, err := d.Readdirnames(-1)
+	if err != nil {
+		t.Fatalf("Readdirnames(%s): %v", dir, err)
+	}
+	return len(names)
 }
 
 // TestChownTree_ConcurrentAtomicSwapNeverRedirects is the review's own
