@@ -215,6 +215,20 @@ func newSeen() map[restdtos.SessionActivityActivity]*atomic.Int64 {
 	return seen
 }
 
+// newSubtestRig is a rig of its own, with a member user, for a subtest that
+// spawns a session actor. A live session actor pins one pool connection --
+// the one holding its advisory lock (sessionactor's hydrateAndAcquire) --
+// until its Registry shuts down, which a rig's does when its test ends.
+// Subtests sharing their parent's rig would pin one more each, and the
+// package's shared pool has four connections: the fourth subtest's actor
+// would take the last one, then wait for a second that never frees.
+func newSubtestRig(ctx context.Context, t *testing.T) (testRig, sqlcgen.User, string) {
+	t.Helper()
+	rig := newTestRig(t)
+	user, cookie := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMember)
+	return rig, user, cookie
+}
+
 // inTx runs fn in one transaction.
 func inTx(ctx context.Context, t *testing.T, rig testRig, fn func(tx pgx.Tx) error) error {
 	t.Helper()
@@ -734,10 +748,11 @@ func TestGetSessionStatus_Gates(t *testing.T) {
 //   - a follow-up turn supersedes it at once, while it is still queued;
 //   - once the follow-up completes the session reads finished, the
 //     escalated run still parked in needs_review beside the completed one.
+//
+// Each subtest spawns its session's actor, so each has a rig of its own
+// (newSubtestRig).
 func TestGetSessionStatus_EscalatedTurnNeverGatesForGood(t *testing.T) {
-	rig := newTestRig(t)
 	ctx := context.Background()
-	user, cookie := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMember)
 	builtIn := mustUUID(t, builtInRequestDefID)
 
 	ends := []struct {
@@ -762,6 +777,7 @@ func TestGetSessionStatus_EscalatedTurnNeverGatesForGood(t *testing.T) {
 				name = "custom workflow/" + end.name
 			}
 			t.Run(name, func(t *testing.T) {
+				rig, user, cookie := newSubtestRig(ctx, t)
 				sess, wantDef := createSessionForUser(ctx, t, rig, user.ID, nil), builtIn
 				if custom {
 					sess, wantDef = customWorkflowSession(ctx, t, rig, user.ID)
@@ -823,11 +839,10 @@ func TestGetSessionStatus_EscalatedTurnNeverGatesForGood(t *testing.T) {
 // awaiting_approval on the escalation once that turn has ended -- the same
 // answer both ways -- and running, with the escalation reported, while it
 // still runs. A turn created after the escalation closes it. The control
-// has no untracked turn.
+// has no untracked turn. Each variant spawns its session's actor, so each
+// has a rig of its own (newSubtestRig).
 func TestGetSessionStatus_EscalationAfterAnUntrackedTurn(t *testing.T) {
-	rig := newTestRig(t)
 	ctx := context.Background()
-	user, cookie := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMember)
 
 	const (
 		noUntracked = iota
@@ -843,6 +858,7 @@ func TestGetSessionStatus_EscalationAfterAnUntrackedTurn(t *testing.T) {
 		{"escalated by a decision while an untracked turn runs, which ends after it (round 4's P5)", untrackedEndsAfterTheDecision},
 	} {
 		t.Run(variant.name, func(t *testing.T) {
+			rig, user, cookie := newSubtestRig(ctx, t)
 			sess, _ := customWorkflowSessionGated(ctx, t, rig, user.ID, true)
 			first := createTurnThroughCore(ctx, t, rig, sess.ID)
 			endTurnThroughEngine(ctx, t, rig, sess.ID, first.ID, turn.TriggerCancel)
