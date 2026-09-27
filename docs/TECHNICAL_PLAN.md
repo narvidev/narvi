@@ -3814,11 +3814,17 @@ directory through the fd that opened it; every other entry is re-owned with
 `fchownat(dirfd, name, AT_SYMLINK_NOFOLLOW)`. It therefore re-owns exactly the inodes reachable as
 entries of directories it opened by descent from the root, never follows or descends through a
 symlink, and never lists, looks at, opens or re-owns anything through a path the runtime can change;
-an entry that vanishes mid-walk is skipped, never re-resolved by path. On overlayfs, re-owning an
-entry still only in a lower layer copies it up, and a removal during that copy-up surfaces as `EEXIST`
-from `fchownat`, or as `ENOTDIR` from a directory's `fchown`: the walk skips such an entry only once a
-second look through the same fd (`fstatat` for the name, a listing for the directory) says it is gone,
-and fails otherwise. The root is the exception to
+an entry that vanishes mid-walk is skipped, never re-resolved by path. On kernel overlayfs, re-owning
+an entry still only in a lower layer copies it up, and a removal during that copy-up has three
+outcomes, set by how the copy-up puts the entry in place over the whiteout the removal left. A regular
+file is linked into place from an `O_TMPFILE`, and `fchownat` fails with `EEXIST` (where the upper
+filesystem supports `O_TMPFILE`; where it does not, a regular file goes the third way). A directory is
+renamed into place from overlayfs's work directory, and its `fchown` fails with `ENOTDIR`. For these
+two, the walk skips the entry only once a second look through the same fd (`fstatat` for the name, a
+listing for the directory) says it is gone, and fails otherwise. Every other entry (a symlink,
+measured; by the same code path, unmeasured, a device node, FIFO or socket) is renamed into place too,
+and that rename replaces the whiteout: `fchownat` succeeds, and the removed entry is back, as the
+image had it, owned by the runtime. That third outcome is silent, and is a residual, stated below. The root is the exception to
 skipping: its own name is looked up once more when the walk is done, acting on nothing, and a root
 removed, renamed away or replaced while the walk ran fails it, and boot, because the tree the caller
 named is no longer there. Residuals stated. The given root path's own components above the last are
@@ -3844,7 +3850,19 @@ by name through the held directory fd and the entry then re-owned the same way, 
 on a kernel that does not bound hard links a writer can still rename a hard link over an entry
 between them. The probe runs against the real kernel in the walk's tests, including with
 `/proc/sys/fs` masked as gVisor presents it, where the production entry point must still re-own
-hard-linked entries. The walk's swap tests
+hard-linked entries. And a removal the walk undoes on overlayfs: a runtime-uid process that removes
+lower-layer symlinks from a subtree while the walk is the first to re-own it can see one come back,
+owned by the runtime, and its `rm -rf` of their directory fail with `ENOTEMPTY`. Nothing tells the
+walk, and boot does not fail. It grants nothing the walk does not grant every entry, and it is not new:
+the path-based walk re-owned with `os.Lchown`, which reaches the same kernel path and brings symlinks
+back the same way. The walk still re-owns symlinks, since a symlink's owner decides who may remove it
+in a sticky directory and whether `fs.protected_symlinks` lets it be followed there. The reach is a
+workspace that came with the sandbox's image (`repo_image`, `snapshot_restore`) on kernel overlayfs,
+during the first pass over a subtree, since each pass copies up everything it re-owns: `RunBoot`'s pass
+over a repository with `services.yml` commands, or the post-boot pass over one without. gVisor's own
+overlay is unmeasured. `TestChownTree_OverlayLowerLayerRemovals` races a remover through a
+symlink-heavy lower-layer tree and holds every entry left, those brought back included, to the
+runtime's ownership. The walk's swap tests
 (`workspaceowner_redirect_test.go`, including a real concurrent atomic swapper) replace a directory,
 or its parent, with a symlink before a descent, after a directory is opened and before it is listed,
 before an entry is looked at, and before an entry is re-owned, and the outside tree of the

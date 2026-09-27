@@ -132,26 +132,73 @@ import (
 // there is nothing left to re-own. ENOENT for a name in a directory the
 // walk holds open -- from fstatat, fchownat or openat -- skips that entry,
 // and ENOENT on a directory's own fd, once the directory has been removed
-// after the walk opened it, skips that directory. overlayfs reports a
-// removal two more ways. Re-owning an entry still only in a lower layer
-// copies it up first, and the copy-up of an entry removed during the call
-// collides with the whiteout its removal left: fchownat fails with EEXIST,
-// and fchown through the fd of a directory removed since the walk opened
-// it fails with ENOTDIR. So an EEXIST from fchownat skips the entry only if
-// a second fstatat through the same directory fd finds nothing by that
-// name, and an ENOTDIR from a directory's fchown skips the directory only
-// if listing it through that fd says it was removed. Otherwise the error
-// stands, so a name removed and created again while its copy-up ran still
-// fails the walk. Opening a directory to descend, looking at an entry and
-// listing a directory copy nothing up. No path is resolved again to
-// double-check any of this. An entry created after the
-// walk listed its directory is not re-owned by this pass, which re-owns a
-// snapshot: the writers it runs beside are the runtime's own processes, so
-// what they create is already the runtime's. workspaceDir itself is the
-// exception. It must be a directory rather than a symlink to one, and when
-// the walk is done it must still be the directory the walk opened: removed,
-// renamed away or replaced while the walk ran, it fails the walk
+// after the walk opened it, skips that directory. workspaceDir itself is
+// the exception. It must be a directory rather than a symlink to one, and
+// when the walk is done it must still be the directory the walk opened:
+// removed, renamed away or replaced while the walk ran, it fails the walk
 // (errRootChanged), because the tree the caller named is no longer there.
+// An entry created after the walk listed its directory is not re-owned by
+// this pass, which re-owns a snapshot: the writers it runs beside are the
+// runtime's own processes, so what they create is already the runtime's.
+//
+// Kernel overlayfs gives a removal during the walk three more outcomes.
+// Re-owning an entry still only in a lower layer copies it up first, and a
+// removal during the call has left a whiteout, in the upper layer, under
+// the name the copy-up is about to fill. What follows depends on how the
+// copy-up fills it:
+//
+//   - A regular file is made with O_TMPFILE and linked into place, and the
+//     link collides with the whiteout: fchownat fails with EEXIST. That is
+//     overlayfs's path where the upper layer's filesystem supports
+//     O_TMPFILE, as the one measured did; where it does not, a regular file
+//     takes the third path.
+//   - A directory is made in overlayfs's work directory and renamed into
+//     place, and a directory cannot be renamed over the whiteout: fchown
+//     through the fd of a directory removed since the walk opened it fails
+//     with ENOTDIR, where the directory was empty in the lower layer. One
+//     with entries was copied up by their own removal, and its fchown
+//     succeeds.
+//   - Any other entry -- a symlink, as measured, and by the same code path
+//     in overlayfs, unmeasured, a device node, a FIFO or a socket -- is
+//     made in the work directory too, and its rename replaces the
+//     whiteout. fchownat succeeds, and the removed entry is back, as the
+//     image had it, owned by the runtime.
+//
+// The first two are checked, not assumed: an EEXIST from fchownat skips the
+// entry only if a second fstatat through the same directory fd finds
+// nothing by that name, and an ENOTDIR from a directory's fchown skips the
+// directory only if listing it through that fd says it was removed.
+// Otherwise the error stands, so a name removed and created again while
+// its copy-up ran still fails the walk. Opening a directory to descend,
+// looking at an entry and listing a directory copy nothing up. No path is
+// resolved again to double-check any of this.
+//
+// The third is silent, and is left as it is. Nothing tells the walk: it
+// records nothing, returns no error, and boot goes on. What the writer
+// sees is its removal undone. A lower-layer symlink it removed while the
+// walk re-owned it is there again, owned by the runtime, so an rm -rf of
+// the directory holding it can fail with ENOTEMPTY, and creating something
+// else under its name fails with EEXIST. It grants nothing the walk does
+// not grant every entry: what comes back is what the image had there,
+// re-owned. It is not new either: the path-based walk this replaced
+// re-owned with os.Lchown, which reaches the same kernel path, and
+// measured the same way, it brings symlinks back too. The walk still
+// re-owns symlinks. Skipping them would avoid this, but would change what
+// the walk hands the runtime: a symlink's owner decides who may remove or
+// rename it in a sticky directory, and whether fs.protected_symlinks lets
+// it be followed there. Its reach is narrow. The tree must sit in a kernel
+// overlayfs lower layer: a workspace that came with the sandbox's image
+// (the repo_image and snapshot_restore boot modes) on a root filesystem
+// that is overlayfs. And a runtime-uid process must remove entries in a
+// subtree while the walk is the first to re-own it, since each pass copies
+// up everything it re-owns. That is RunBoot's pass over a repository with
+// services.yml commands, beside the services of the repositories before
+// it, or the post-boot pass over a repository without them, beside every
+// repository's services and opencode serve. gVisor, which Modal sandboxes
+// run on by default, implements its own overlay, and none of the three
+// outcomes has been measured there. TestChownTree_OverlayLowerLayerRemovals
+// drives the second through a hook, and races a remover against the walk
+// for the other two.
 //
 // Any other failure (an entry that cannot be re-owned, a directory that
 // cannot be opened or listed, a tree deeper than maxChownDepth) aborts the
@@ -453,15 +500,20 @@ func (w *treeWalker) enter(f *dirFrame) (gone bool, err error) {
 		w.at(beforeChown, path)
 		switch err := fchownatNoFollow(f.fd, name, w.uid, w.gid); {
 		case err == nil:
+			// On Linux overlayfs this includes a lower-layer entry other
+			// than a regular file whose removal overlapped the call: its
+			// copy-up renamed it back over the removal's whiteout, and it
+			// stays, re-owned. ChownWorkspaceForRuntime's doc comment says
+			// why that is left as it is.
 		case errors.Is(err, unix.ENOENT):
 			continue // gone since it was looked at
 		case errors.Is(err, unix.EEXIST) && nameGone(f.fd, name):
-			// Linux overlayfs only: the entry was still only in a lower
-			// layer, fchownat looked its name up before a removal and
-			// copied it up after, and the copy-up collided with the
-			// whiteout the removal left. No hook point sits inside a
-			// system call, so only the concurrent remover of
-			// TestChownTree_OverlayLowerLayerRemovals reaches it.
+			// Linux overlayfs only: the entry was a regular file still
+			// only in a lower layer, fchownat looked its name up before a
+			// removal and copied it up after, and the copy-up's link
+			// collided with the whiteout the removal left. No hook point
+			// sits inside a system call, so only the concurrent remover
+			// of TestChownTree_OverlayLowerLayerRemovals reaches it.
 			continue
 		default:
 			return false, &fs.PathError{Op: "fchownat", Path: path, Err: err}
