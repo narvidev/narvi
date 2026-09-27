@@ -42,7 +42,7 @@ const (
 	cadenceDeltaInterval    = 10 * time.Millisecond
 )
 
-// fakeChatCompletionsHandler is an OpenAI-compatible
+// fakeChatCompletionsHandler is a chat-completions-compatible
 // /v1/chat/completions endpoint that streams scripted replies, so the real
 // runtime can run a full turn with no credential and no outside call. A
 // request without tools is the runtime's own title generation; the first
@@ -113,7 +113,7 @@ func startServerWithFakeProvider(t *testing.T, providerURL string) string {
 	work := t.TempDir()
 	cfg := map[string]any{
 		"provider": map[string]any{"fakeprov": map[string]any{
-			"npm":     "@ai-sdk/openai-compatible",
+			"npm":     "@ai-sdk/openai-compatible", // the runtime's bundled chat-completions provider package id
 			"name":    "Fake provider",
 			"options": map[string]any{"baseURL": providerURL + "/v1", "apiKey": "not-a-credential"},
 			"models":  map[string]any{"fake-model": map[string]any{"name": "Fake model"}},
@@ -197,7 +197,7 @@ func tokenFramesByPart(events []ports.AgentEvent) (frames map[string][]string, o
 
 // TestTokenCadence_RealBinary_BoundedFramesPerTextPart pins the pinned
 // runtime's `token` cadence against the real binary with no credential: a
-// local OpenAI-compatible fake streams two long text parts (one before a
+// local chat-completions-compatible fake streams two long text parts (one before a
 // real bash tool call, one after), and the test asserts, per text part,
 // that the adapter sent at most maxTokenFramesPerTextPart frames and that
 // the LAST one is exactly the part's final text as GET
