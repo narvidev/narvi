@@ -39,6 +39,7 @@ import (
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/app/sessionactivity"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -214,7 +215,7 @@ func newOwnPushFixture(ctx context.Context, t *testing.T) ownPushFixture {
 	}
 
 	router := chi.NewRouter()
-	router.Get("/api/sessions/{sessionID}/status", httpapi.GetSessionStatus(sessions, platform.DefaultTimeouts()))
+	router.Get("/api/sessions/{sessionID}/status", httpapi.GetSessionStatus(sessions, sessionactivity.NewWaiter(sessionactivity.ConfigFrom(platform.DefaultTimeouts())), platform.DefaultTimeouts()))
 	return ownPushFixture{
 		rig: rig, timers: timers, registry: registry, actor: actor, commander: commander, scm: scm, status: router,
 		sessionID: sess.ID, turnID: processing.ID, repoFullName: repoFullName, prNumber: prNumber,

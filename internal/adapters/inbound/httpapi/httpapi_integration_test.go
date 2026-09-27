@@ -54,6 +54,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
 	appreviewtriage "github.com/narvidev/narvi/internal/app/reviewtriage"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
+	"github.com/narvidev/narvi/internal/app/sessionactivity"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/app/shadowledger"
 	"github.com/narvidev/narvi/internal/domain/integrations"
@@ -585,7 +586,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		r.Use(auth.Middleware(rig.userSessions, rig.users))
 		r.Post("/", httpapi.CreateSession(rig.pool, rig.sessions, rig.turns, rig.environments, rig.auditLog, rig.registry, nil, false, rig.rolloutMode, rig.repoSettings, rig.prSessions))
 		r.Get("/{sessionID}", httpapi.GetSession(rig.sessions))
-		r.Get("/{sessionID}/status", httpapi.GetSessionStatus(rig.sessions, platform.DefaultTimeouts()))
+		r.Get("/{sessionID}/status", httpapi.GetSessionStatus(rig.sessions, sessionactivity.NewWaiter(sessionactivity.ConfigFrom(platform.DefaultTimeouts())), platform.DefaultTimeouts()))
 		r.Get("/{sessionID}/events", httpapi.ListEvents(rig.sessions, rig.events))
 		r.Get("/{sessionID}/artifacts", httpapi.ListArtifacts(rig.sessions, rig.artifacts))
 		// uploads ("uploads, blob storage & the in-sandbox

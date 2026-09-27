@@ -52,10 +52,10 @@ func listToolNames(t *testing.T, handler http.Handler) []string {
 // through the real NewHandler: each grant sees exactly the tools its
 // scopes satisfy -- none for a scope-less, unknown-scope or missing grant,
 // every one for mcp:read, and every one for mcp:write (which implies
-// mcp:read). Row 182's status and transcript tools are mcp:read like the
-// rest: a grant without it is told neither exists (technical plan §43.20).
+// mcp:read). Row 182's status, wait and transcript tools are mcp:read like the
+// rest: a grant without it is told none of them exists (technical plan §43.20).
 func TestToolsList_ScopeFilter_Table(t *testing.T) {
-	all := []string{"narvi_get_session", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions"}
+	all := []string{"narvi_get_session", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions", "narvi_wait_for_session"}
 	tests := []struct {
 		name   string
 		scopes *[]string
@@ -141,8 +141,8 @@ func TestInstructionsFor_Composition(t *testing.T) {
 		t.Errorf("instructionsFor(three) =\n %q\nwant\n %q", three, want)
 	}
 	all := instructionsFor(specs)
-	want = "This server exposes five READ-ONLY tools over this deployment's session data: " +
-		specs[0].Instruction + ", " + specs[1].Instruction + ", " + specs[2].Instruction + ", " + specs[3].Instruction + ", and " + specs[4].Instruction + ". None of these tools writes anything."
+	want = "This server exposes six READ-ONLY tools over this deployment's session data: " +
+		specs[0].Instruction + ", " + specs[1].Instruction + ", " + specs[2].Instruction + ", " + specs[3].Instruction + ", " + specs[4].Instruction + ", and " + specs[5].Instruction + ". None of these tools writes anything."
 	if all != want {
 		t.Errorf("instructionsFor(all) =\n %q\nwant\n %q", all, want)
 	}
@@ -163,7 +163,7 @@ func TestHiddenToolCall_IsIndistinguishableFromUnknownTool(t *testing.T) {
 	const unknown = "narvi_does_not_exist"
 	unknownStatus, unknownBody := call(scopes("mcp:read"), unknown)
 
-	// Every tool in the table, row 182's status and transcript tools
+	// Every tool in the table, row 182's status, wait and transcript tools
 	// included: each is hidden from a scope-less grant exactly as a name
 	// that never existed is.
 	for _, spec := range toolSpecs(Twins{}) {

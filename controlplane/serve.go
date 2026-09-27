@@ -86,6 +86,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/releasereview"
 	appreviewtriage "github.com/narvidev/narvi/internal/app/reviewtriage"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
+	"github.com/narvidev/narvi/internal/app/sessionactivity"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/app/shadowlinear"
 	"github.com/narvidev/narvi/internal/app/shadowscm"
@@ -173,6 +174,12 @@ type App struct {
 	uploadSweeper           *uploadsweep.Sweeper
 	providerCredentialStore *postgres.ProviderCredentialStore
 	chatGPTDeviceFlow       *chatgptoauth.Client
+
+	// sessionWaiter is the replica's one bounded-wait service (technical
+	// plan §43.20, row 182's piece (b)), shared by the status route and
+	// its MCP twin; Run hands it to newHTTPServer, which interrupts it
+	// when the server's shutdown begins.
+	sessionWaiter *sessionactivity.Waiter
 
 	// capabilities is docs/design/boundaries-design.md, section 1's own
 	// capability registry -- built once, here, from cfg.LicenseKey and the union of
@@ -657,6 +664,12 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	turnStore := postgres.NewTurnStore(pool)
 	sandboxStore := postgres.NewSandboxStore(pool)
 	eventStore := postgres.NewEventStore(pool)
+	// sessionWaiter (technical plan §43.20, row 182's bounded wait): ONE per
+	// replica, handed to GET /api/sessions/{sessionID}/status and to the
+	// MCP twin below alike, so a wait counts against the same per-caller
+	// and per-replica caps whichever surface it came through; Run wires
+	// its Interrupt to the HTTP server's shutdown (newHTTPServer).
+	sessionWaiter := sessionactivity.NewWaiter(sessionactivity.ConfigFrom(cfg.Timeouts))
 	// falseFailureStore (§12.2 item 6's own "analytics: platform-wide
 	// rollup") is the durable sibling of turn_false_failure_total --
 	// this pool-scoped instance backs the platform-analytics read model
@@ -2024,8 +2037,10 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// status (technical plan §43.20): what the session's work is doing
 		// now, derived from its turn queue in one snapshot, and a suggested
 		// delay before the next read -- the same gate as GET /{sessionID}
-		// just above, and narvi_get_session_status's own twin.
-		r.Get("/{sessionID}/status", httpapi.GetSessionStatus(sessionStore, cfg.Timeouts))
+		// just above, and narvi_get_session_status's own twin. With
+		// ?waitSeconds= it is the bounded wait, narvi_wait_for_session's
+		// twin, on the replica's one sessionWaiter.
+		r.Get("/{sessionID}/status", httpapi.GetSessionStatus(sessionStore, sessionWaiter, cfg.Timeouts))
 		r.Get("/{sessionID}/events", httpapi.ListEvents(sessionStore, eventStore))
 		r.Get("/{sessionID}/artifacts", httpapi.ListArtifacts(sessionStore, artifactStore))
 		// uploads ("uploads, blob storage & the in-sandbox
@@ -2707,7 +2722,9 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// /mcp (technical plan §43, "the MCP surface"): the Streamable HTTP
 	// entry point for the read-only MCP tools -- narvi_list_models,
 	// narvi_list_sessions, narvi_get_session, and row 182's
-	// narvi_get_session_status and narvi_get_session_transcript (§43.20).
+	// narvi_get_session_status, narvi_wait_for_session (the status twin
+	// with ?waitSeconds=, on the same sessionWaiter as the REST route) and
+	// narvi_get_session_transcript (§43.20).
 	// Deliberately NOT under /api/
 	// (a protocol endpoint, the same category as /sessions/{sessionID}/ws
 	// or /webhooks/*) and mounted UNCONDITIONALLY regardless of
@@ -2743,7 +2760,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		ListModels:       httpapi.GetModelCatalog(),
 		ListSessions:     httpapi.ListSessions(sessionStore),
 		GetSession:       httpapi.GetSession(sessionStore),
-		GetSessionStatus: httpapi.GetSessionStatus(sessionStore, cfg.Timeouts),
+		GetSessionStatus: httpapi.GetSessionStatus(sessionStore, sessionWaiter, cfg.Timeouts),
 		ListEvents:       httpapi.ListEvents(sessionStore, eventStore),
 	})
 	if err != nil {
@@ -3120,6 +3137,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		uploadSweeper:           uploadSweeper,
 		providerCredentialStore: providerCredentialStore,
 		chatGPTDeviceFlow:       chatGPTDeviceFlow,
+		sessionWaiter:           sessionWaiter,
 
 		capabilities:    capabilities,
 		knowledgeRanker: knowledgeRanker,
@@ -3148,10 +3166,7 @@ func (a *App) Run(ctx context.Context, addr string) error {
 	chatGPTDeviceFlow := a.chatGPTDeviceFlow
 	moduleWorkers := a.moduleWorkers
 
-	srv := &http.Server{
-		Addr:    addr,
-		Handler: router,
-	}
+	srv := newHTTPServer(addr, router, a.sessionWaiter)
 
 	group, groupCtx := errgroup.WithContext(ctx)
 
@@ -3350,6 +3365,27 @@ func (a *App) Run(ctx context.Context, addr string) error {
 	})
 
 	return group.Wait()
+}
+
+// newHTTPServer is Run's HTTP server: addr and handler, and the replica's
+// bounded-wait service interrupted the moment Shutdown begins
+// (RegisterOnShutdown), so every wait answers at once with reason
+// "interrupted" and the drain -- ShutdownGracePeriod, 10 s, against a
+// wait of up to MCPWaitMaxDuration, 25 s -- is never held by one
+// (technical plan §43.20). No WriteTimeout, deliberately: were one set, it
+// would have to exceed MCPWaitMaxDuration, or a full-length wait would be
+// cut before its answer is written (the MCPWait* fields' own doc comment).
+// TestOAuth_ProductionRouter/Wait_ShutdownInterruptsPromptly_RunServer --
+// registered in mcp_oauth_integration_test.go, its body
+// waitShutdownInterruptsPromptly in mcp_sessionwait_integration_test.go --
+// pins both.
+func newHTTPServer(addr string, handler http.Handler, waiter *sessionactivity.Waiter) *http.Server {
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: handler,
+	}
+	srv.RegisterOnShutdown(waiter.Interrupt)
+	return srv
 }
 
 // shutdownControlPlaneOTel bounds one call to shutdown (platform.SetupOTel's

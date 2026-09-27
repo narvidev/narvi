@@ -11116,6 +11116,11 @@ type Session struct {
 // terminal state and so can hold any of its five values while a turn is queued or
 // running. Carries no events and no transcript: the event history is GET
 // /api/sessions/{sessionID}/events (EventsResponse), a separate, paginated read.
+// With ?waitSeconds=N (a whole number of seconds; absent or 0 is the plain read, a
+// negative or malformed value is a 400) the route waits, at most N seconds clamped
+// to the deployment's maximum (25 as shipped), for the session to be settled, and
+// answers the same shape with wait set: the snapshot it answers is its latest
+// read.
 type SessionActivity struct {
 	// In precedence order: 'running' when a turn is dispatched or processing (turns
 	// may be queued behind it); else 'queued' when a turn is pending -- including the
@@ -11204,6 +11209,15 @@ type SessionActivity struct {
 	// hint that keeps polling quiet, never a limit: an earlier read is answered all
 	// the same.
 	SuggestedDelaySeconds int `json:"suggestedDelaySeconds" yaml:"suggestedDelaySeconds" mapstructure:"suggestedDelaySeconds"`
+
+	// How the wait ended, present only when the read waited (?waitSeconds= one or
+	// more; narvi_wait_for_session) and absent from a plain read, whose bytes are
+	// unchanged by it. The wait reads the status at once and, while it is not
+	// settled, again every second (as shipped), so it answers a session that is
+	// queued, running, delivering or scheduled only with reason timeout, interrupted
+	// or capacity -- never settled. It wakes by reading the database, so any replica
+	// serves it.
+	Wait *SessionActivityWait `json:"wait,omitempty,omitzero" yaml:"wait,omitempty" mapstructure:"wait,omitempty"`
 }
 
 type SessionActivityActivity string
@@ -11562,6 +11576,90 @@ func (j *SessionActivitySandboxStatus) UnmarshalJSON(value []byte) error {
 		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_SessionActivitySandboxStatus, v.Value)
 	}
 	*j = SessionActivitySandboxStatus(v)
+	return nil
+}
+
+// How the wait ended, present only when the read waited (?waitSeconds= one or
+// more; narvi_wait_for_session) and absent from a plain read, whose bytes are
+// unchanged by it. The wait reads the status at once and, while it is not settled,
+// again every second (as shipped), so it answers a session that is queued,
+// running, delivering or scheduled only with reason timeout, interrupted or
+// capacity -- never settled. It wakes by reading the database, so any replica
+// serves it.
+type SessionActivityWait struct {
+	// 'settled': a read found the session settled (settled true; activity says which:
+	// finished, idle or awaiting_approval). 'timeout': the wait ran to its bound and
+	// the session is still not settled -- call the wait again, rather than sleeping.
+	// 'interrupted': the server began shutting down, and answered the latest read at
+	// once -- call again, another replica will serve it. 'capacity': the replica
+	// serving the call already runs as many concurrent waits as one of its three caps
+	// allows -- the caller's (2 as shipped, counted per MCP authorization, or per
+	// user for a signed-in browser), the user's across all of their MCP
+	// authorizations and their browser together (4), or all callers' together (32) --
+	// so the status was read once and this read did not wait: a normal answer, never
+	// an error; the snapshot is current, and a later call waits once a slot is free.
+	Reason SessionActivityWaitReason `json:"reason" yaml:"reason" mapstructure:"reason"`
+
+	// How long the wait blocked, in milliseconds, from its first read to its answer:
+	// 0 when the first read was answered at once (settled, or over capacity).
+	WaitedMs int `json:"waitedMs" yaml:"waitedMs" mapstructure:"waitedMs"`
+}
+
+type SessionActivityWaitReason string
+
+const SessionActivityWaitReasonCapacity SessionActivityWaitReason = "capacity"
+const SessionActivityWaitReasonInterrupted SessionActivityWaitReason = "interrupted"
+const SessionActivityWaitReasonSettled SessionActivityWaitReason = "settled"
+const SessionActivityWaitReasonTimeout SessionActivityWaitReason = "timeout"
+
+var enumValues_SessionActivityWaitReason = []interface{}{
+	"settled",
+	"timeout",
+	"interrupted",
+	"capacity",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionActivityWaitReason) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_SessionActivityWaitReason {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_SessionActivityWaitReason, v)
+	}
+	*j = SessionActivityWaitReason(v)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionActivityWait) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["reason"]; raw != nil && !ok {
+		return fmt.Errorf("field reason in SessionActivityWait: required")
+	}
+	if _, ok := raw["waitedMs"]; raw != nil && !ok {
+		return fmt.Errorf("field waitedMs in SessionActivityWait: required")
+	}
+	type Plain SessionActivityWait
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if 0 > plain.WaitedMs {
+		return fmt.Errorf("field %s: must be >= %v", "waitedMs", 0)
+	}
+	*j = SessionActivityWait(plain)
 	return nil
 }
 
@@ -12921,6 +13019,47 @@ func (j *WSTokenResponse) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// The narvi_wait_for_session MCP tool's own input (technical plan §43.20, row
+// 182's bounded wait) -- the tool bridge's twin of GET
+// /api/sessions/{sessionID}/status?waitSeconds=N, the blocking form of the status
+// read: sessionId becomes the path parameter and waitSeconds the query parameter.
+// The answer is SessionActivity with its wait object set.
+type WaitForSessionToolRequest struct {
+	// The session id, matching Session.id's own format exactly. A malformed value
+	// fails argument validation before the twin is invoked, reported as a tool
+	// execution error (isError:true).
+	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+
+	// The most seconds to wait for the session to settle. Omitted means the longest
+	// wait the deployment allows (25 seconds as shipped); a larger value is clamped
+	// to it, never refused. minimum: a wait of zero seconds is
+	// narvi_get_session_status. Deliberately no "maximum": the route clamps rather
+	// than rejects, and tools/contractscompat's closed keyword allowlist does not
+	// recognize "maximum" (ListSessionsToolRequest.limit's own reasoning).
+	WaitSeconds *int `json:"waitSeconds,omitempty,omitzero" yaml:"waitSeconds,omitempty" mapstructure:"waitSeconds,omitempty"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *WaitForSessionToolRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["sessionId"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionId in WaitForSessionToolRequest: required")
+	}
+	type Plain WaitForSessionToolRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if plain.WaitSeconds != nil && 1 > *plain.WaitSeconds {
+		return fmt.Errorf("field %s: must be >= %v", "waitSeconds", 1)
+	}
+	*j = WaitForSessionToolRequest(plain)
+	return nil
+}
+
 // One workflow_bindings row (§25.10): which definition, at which version, a (lane,
 // repoFullName) pair resolves to. repoFullName null is the GLOBAL binding for that
 // lane -- §25.4: exactly one per lane, seeded by migration 000057 to point at the
@@ -14106,6 +14245,21 @@ func (j *WorkflowStepRunOutcomeStatus) UnmarshalJSON(value []byte) error {
 // data once posted (§25.6), same discipline as PostReviewVerdictRequest.summary.
 type WorkflowStepRunOutcomeSummary *string
 
+type WorkflowStepRunStatus string
+
+const WorkflowStepRunStatusAwaitingDecision WorkflowStepRunStatus = "awaiting_decision"
+const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
+const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
+const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
+
+var enumValues_WorkflowStepRunStatus = []interface{}{
+	"awaiting_decision",
+	"running",
+	"completed",
+	"failed",
+	"cancelled",
+}
+
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 	var v string
@@ -14128,21 +14282,7 @@ func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 
 type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
 
-type WorkflowStepRunStatus string
-
-const WorkflowStepRunStatusAwaitingDecision WorkflowStepRunStatus = "awaiting_decision"
-const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
-const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
 const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
-const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
-
-var enumValues_WorkflowStepRunStatus = []interface{}{
-	"awaiting_decision",
-	"running",
-	"completed",
-	"failed",
-	"cancelled",
-}
 
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
 // sequential turn'). Null while an awaiting_decision (hitlBefore-gated) attempt

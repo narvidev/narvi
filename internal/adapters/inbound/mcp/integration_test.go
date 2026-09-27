@@ -36,6 +36,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/inbound/mcpauth"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/sessionactivity"
 	"github.com/narvidev/narvi/internal/domain/mcpscope"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -69,6 +70,7 @@ type mcpTestRig struct {
 	grants       *narvipg.MCPOAuthGrantStore
 	ids          mcpauth.Identifiers
 	server       *httptest.Server
+	waiter       *sessionactivity.Waiter
 	// tokenClient is the pre-registered client mintMCPToken issues
 	// tokens under, created on first use.
 	tokenClient *sqlcgen.McpOauthClient
@@ -94,12 +96,15 @@ func newMCPTestRig(t *testing.T) *mcpTestRig {
 	server := httptest.NewUnstartedServer(router)
 	baseURL := "http://" + server.Listener.Addr().String()
 	rig.server = server
+	// One waiter for the REST route and the MCP twin alike, as
+	// controlplane wires it: one replica's caps.
+	rig.waiter = sessionactivity.NewWaiter(sessionactivity.ConfigFrom(platform.DefaultTimeouts()))
 
 	mcpHandler, err := mcpadapter.NewHandler(mcpadapter.Config{PublicBaseURL: baseURL}, mcpadapter.Twins{
 		ListModels:       httpapi.GetModelCatalog(),
 		ListSessions:     httpapi.ListSessions(rig.sessions),
 		GetSession:       httpapi.GetSession(rig.sessions),
-		GetSessionStatus: httpapi.GetSessionStatus(rig.sessions, platform.DefaultTimeouts()),
+		GetSessionStatus: httpapi.GetSessionStatus(rig.sessions, rig.waiter, platform.DefaultTimeouts()),
 		ListEvents:       httpapi.ListEvents(rig.sessions, rig.events),
 	})
 	if err != nil {
@@ -123,7 +128,7 @@ func newMCPTestRig(t *testing.T) *mcpTestRig {
 		r.Use(auth.Middleware(rig.userSessions, rig.users))
 		r.Get("/", httpapi.ListSessions(rig.sessions))
 		r.Get("/{sessionID}", httpapi.GetSession(rig.sessions))
-		r.Get("/{sessionID}/status", httpapi.GetSessionStatus(rig.sessions, platform.DefaultTimeouts()))
+		r.Get("/{sessionID}/status", httpapi.GetSessionStatus(rig.sessions, rig.waiter, platform.DefaultTimeouts()))
 		r.Get("/{sessionID}/events", httpapi.ListEvents(rig.sessions, rig.events))
 	})
 	router.Route("/mcp", func(r chi.Router) {
@@ -701,7 +706,7 @@ func TestParity_ToolsListIsRoleIndependent(t *testing.T) {
 	// against the same fixed slice for all four roles below. Role does not
 	// gate discovery today (technical plan §43.17): every read tool is
 	// open to every role.
-	want := []string{"narvi_get_session", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions"}
+	want := []string{"narvi_get_session", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions", "narvi_wait_for_session"}
 	for _, role := range []sqlcgen.UserRole{sqlcgen.UserRoleViewer, sqlcgen.UserRoleMember, sqlcgen.UserRoleMaintainer, sqlcgen.UserRoleAdmin} {
 		t.Run(string(role), func(t *testing.T) {
 			user, _ := createUserWithRole(ctx, t, rig, role)
@@ -821,6 +826,13 @@ func TestParity_BearerEqualsCookieForEveryRole(t *testing.T) {
 				{"status of my session", "/api/sessions/" + own.ID.String() + "/status", "narvi_get_session_status", fmt.Sprintf(`{"sessionId":%q}`, own.ID.String())},
 				{"status of another user's session", "/api/sessions/" + othersSession.ID.String() + "/status", "narvi_get_session_status", fmt.Sprintf(`{"sessionId":%q}`, othersSession.ID.String())},
 				{"status of an unknown session", "/api/sessions/" + unknown + "/status", "narvi_get_session_status", fmt.Sprintf(`{"sessionId":%q}`, unknown)},
+				// Row 182's wait (piece (b)): the same twin with
+				// ?waitSeconds=. The caller's own session has no turn
+				// (idle, settled: answered at once); another user's is
+				// queued, so both sides wait out the second and time out.
+				{"wait on my session", "/api/sessions/" + own.ID.String() + "/status?waitSeconds=1", "narvi_wait_for_session", fmt.Sprintf(`{"sessionId":%q,"waitSeconds":1}`, own.ID.String())},
+				{"wait on another user's session", "/api/sessions/" + othersSession.ID.String() + "/status?waitSeconds=1", "narvi_wait_for_session", fmt.Sprintf(`{"sessionId":%q,"waitSeconds":1}`, othersSession.ID.String())},
+				{"wait on an unknown session", "/api/sessions/" + unknown + "/status?waitSeconds=1", "narvi_wait_for_session", fmt.Sprintf(`{"sessionId":%q,"waitSeconds":1}`, unknown)},
 				{"transcript of my session", "/api/sessions/" + own.ID.String() + "/events", "narvi_get_session_transcript", fmt.Sprintf(`{"sessionId":%q}`, own.ID.String())},
 				{"transcript of another user's session", "/api/sessions/" + othersSession.ID.String() + "/events?limit=2", "narvi_get_session_transcript", fmt.Sprintf(`{"sessionId":%q,"limit":2}`, othersSession.ID.String())},
 				{"transcript of an unknown session", "/api/sessions/" + unknown + "/events", "narvi_get_session_transcript", fmt.Sprintf(`{"sessionId":%q}`, unknown)},
@@ -838,8 +850,8 @@ func TestParity_BearerEqualsCookieForEveryRole(t *testing.T) {
 					if env.Result.IsError {
 						t.Fatalf("%s: REST 200 but MCP isError: %+v", tc.name, env.Result.Content)
 					}
-					if tc.tool == "narvi_get_session_status" {
-						assertStatusParity(t, tc.name, restBody, env.Result.StructuredContent)
+					if tc.tool == "narvi_get_session_status" || tc.tool == "narvi_wait_for_session" {
+						assertStatusParity(t, tc.name, restBody, env.Result.StructuredContent, tc.tool == "narvi_wait_for_session")
 						continue
 					}
 					assertCanonicalJSONEqual(t, tc.name, restBody, env.Result.StructuredContent)
@@ -908,8 +920,9 @@ func seedBusySession(ctx context.Context, t *testing.T, r *mcpTestRig, sessionID
 
 // sessionActivityProperties is SessionActivity's own property set, read
 // from the embedded contract: the status body carries exactly these keys,
-// so no transcript (or anything else) rides along with it.
-func sessionActivityProperties(t *testing.T) []string {
+// so no transcript (or anything else) rides along with it -- the wait
+// object only when waited (a read that waited, §43.20 piece (b)).
+func sessionActivityProperties(t *testing.T, waited bool) []string {
 	t.Helper()
 	data, err := contracts.FS.ReadFile("rest/v1/dtos.schema.json")
 	if err != nil {
@@ -925,6 +938,9 @@ func sessionActivityProperties(t *testing.T) []string {
 	}
 	names := make([]string, 0, len(doc.Defs["SessionActivity"].Properties))
 	for name := range doc.Defs["SessionActivity"].Properties {
+		if name == "wait" && !waited {
+			continue
+		}
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -935,8 +951,11 @@ func sessionActivityProperties(t *testing.T) []string {
 // observedAt is each snapshot's own database clock, so two reads never
 // share it -- it is compared for order (the REST read came first), and
 // every other byte must be equal. Both bodies carry exactly
-// SessionActivity's keys: no events, no transcript.
-func assertStatusParity(t *testing.T, label string, restBody, mcpBody []byte) {
+// SessionActivity's keys -- wait exactly when waited -- so no events, no
+// transcript. Two waits that timed out never blocked for exactly the same
+// time, so their waitedMs is compared for reason only; every other wait
+// (settled or over capacity: 0 ms) compares whole.
+func assertStatusParity(t *testing.T, label string, restBody, mcpBody []byte, waited bool) {
 	t.Helper()
 	var rest, viaMCP map[string]any
 	if err := json.Unmarshal(restBody, &rest); err != nil {
@@ -945,7 +964,7 @@ func assertStatusParity(t *testing.T, label string, restBody, mcpBody []byte) {
 	if err := json.Unmarshal(mcpBody, &viaMCP); err != nil {
 		t.Fatalf("%s: unmarshal MCP structuredContent: %v (%s)", label, err, mcpBody)
 	}
-	want := sessionActivityProperties(t)
+	want := sessionActivityProperties(t, waited)
 	for side, body := range map[string]map[string]any{"REST": rest, "MCP": viaMCP} {
 		keys := make([]string, 0, len(body))
 		for k := range body {
@@ -963,6 +982,17 @@ func assertStatusParity(t *testing.T, label string, restBody, mcpBody []byte) {
 	}
 	delete(rest, "observedAt")
 	delete(viaMCP, "observedAt")
+	if waited {
+		restWait, _ := rest["wait"].(map[string]any)
+		mcpWait, _ := viaMCP["wait"].(map[string]any)
+		if restWait == nil || mcpWait == nil || restWait["reason"] != mcpWait["reason"] {
+			t.Fatalf("%s: wait REST %v MCP %v, want the same reason on both", label, rest["wait"], viaMCP["wait"])
+		}
+		if restWait["reason"] == "timeout" {
+			delete(restWait, "waitedMs")
+			delete(mcpWait, "waitedMs")
+		}
+	}
 	restCanon, _ := json.Marshal(rest)
 	mcpCanon, _ := json.Marshal(viaMCP)
 	if string(restCanon) != string(mcpCanon) {

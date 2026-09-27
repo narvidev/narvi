@@ -196,6 +196,25 @@ var toolCallArgs = map[string]struct {
 			{keywords: []string{"/properties/sessionId/format"}, arguments: `{"sessionId":"not-a-uuid"}`, realRefusal: "invalid arguments: - at '/sessionId': 'not-a-uuid' is not valid uuid: must have 5 elements"},
 		},
 	},
+	"narvi_wait_for_session": {
+		realValid: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","waitSeconds":5}`,
+		realInvalid: []keywordProbe{
+			// buildWaitForSessionRequest decodes into its own plain
+			// struct, like buildGetSessionTranscriptRequest: null
+			// arguments are a no-op, an absent or null sessionId leaves it
+			// "", a null waitSeconds leaves it unset (the longest wait),
+			// a quoted one decodes into a json.Number, and zero is carried
+			// through as it is -- each reaches the twin.
+			{keywords: []string{"/type"}, arguments: `null`, realRefusal: "invalid arguments: - at '': got null, want object"},
+			{keywords: []string{"/additionalProperties"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","bogus":1}`, realRefusal: "invalid arguments: - at '': additional properties 'bogus' not allowed"},
+			{keywords: []string{"/required"}, arguments: `{"waitSeconds":5}`, realRefusal: "invalid arguments: - at '': missing property 'sessionId'"},
+			{keywords: []string{"/properties/sessionId/type"}, arguments: `{"sessionId":null}`, realRefusal: "invalid arguments: - at '/sessionId': got null, want string"},
+			{keywords: []string{"/properties/sessionId/format"}, arguments: `{"sessionId":"not-a-uuid"}`, realRefusal: "invalid arguments: - at '/sessionId': 'not-a-uuid' is not valid uuid: must have 5 elements"},
+			{keywords: []string{"/properties/waitSeconds/type"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","waitSeconds":"5"}`, realRefusal: "invalid arguments: - at '/waitSeconds': got string, want integer"},
+			{keywords: []string{"/properties/waitSeconds/type"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","waitSeconds":null}`, realRefusal: "invalid arguments: - at '/waitSeconds': got null, want integer"},
+			{keywords: []string{"/properties/waitSeconds/minimum"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","waitSeconds":0}`, realRefusal: "invalid arguments: - at '/waitSeconds': minimum: got 0, want 1"},
+		},
+	},
 	"narvi_get_session_transcript": {
 		realValid: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","cursor":"42","limit":5}`,
 		realInvalid: []keywordProbe{
@@ -241,12 +260,15 @@ var buildRequestEnforces = map[string]map[string]string{
 }
 
 // twinBodies is the 200 body each tool's counting twin answers with --
-// distinct per tool, so a successful result also shows WHICH twin ran.
+// distinct per twin, so a successful result also shows WHICH twin ran.
+// narvi_wait_for_session's twin is narvi_get_session_status' own (the
+// status route, with ?waitSeconds=), so the two share one body.
 var twinBodies = map[string]string{
 	"narvi_list_models":            `{"providers":[]}`,
 	"narvi_list_sessions":          `{"sessions":[]}`,
 	"narvi_get_session":            `{"id":"x"}`,
 	"narvi_get_session_status":     `{"activity":"idle"}`,
+	"narvi_wait_for_session":       `{"activity":"idle"}`,
 	"narvi_get_session_transcript": `{"events":[],"nextCursor":null}`,
 }
 
@@ -266,7 +288,8 @@ func countingTwins(calls *atomic.Int32) Twins {
 		ListModels:   twin("narvi_list_models"),
 		ListSessions: twin("narvi_list_sessions"),
 		GetSession:   twin("narvi_get_session"),
-		// Row 182's two twins (technical plan §43.20).
+		// Row 182's two twins (technical plan §43.20); the status twin
+		// serves narvi_wait_for_session too.
 		GetSessionStatus: twin("narvi_get_session_status"),
 		ListEvents:       twin("narvi_get_session_transcript"),
 	}

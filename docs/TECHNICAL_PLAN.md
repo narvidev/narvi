@@ -6715,8 +6715,8 @@ only by a script client in this repository's own tests, because no off-the-shelf
 browser cookie. Row 181 replaced the cookie with a bearer token from Narvi's own OAuth authorization
 server and made the tool list depend on the token's scopes (§43.13–§43.19), which is what makes the surface
 reachable by a real client. Everything past that is later rows' own work, not this section's: 182 adds
-a session's live status and its transcript paging (piece (a), §43.20), then the bounded wait and the
-result/verdict tools; 183 adds plan read/approve/reject,
+a session's live status and its transcript paging (piece (a), §43.20), the bounded wait (piece (b),
+§43.20), then the result/verdict tools; 183 adds plan read/approve/reject,
 prompt-while-running, stop, and delegate (create session). Repository discovery (`narvi_list_repositories`)
 is deliberately absent from 180 too: this codebase has no `GET /api/repos` route for it to sit over,
 and the one-adapter rule (§43.7) means a tool ships only once its HTTP twin exists.
@@ -6764,7 +6764,9 @@ the current protocol revision is served only in stateless mode by the pinned SDK
 is declared stateless, and a protocol-level session table would be a second authority over state
 (§5.1 forbids exactly that). `JSONResponse: true`: every 180 tool is a short DB read, so a plain
 `application/json` response avoids SSE plumbing and keep-alive timers entirely — no new
-`platform/timeouts.go` constant for this Step. The request body is capped at 64 KiB — deliberately far
+`platform/timeouts.go` constant for this Step. Row 182's wait (§43.20) is the one long call: it holds
+its response for at most `MCPWaitMaxDuration` (25 s) and writes nothing until it answers, which keeps it
+under the 30–60 s idle timeouts common proxies apply, still with no keep-alive timer. The request body is capped at 64 KiB — deliberately far
 below `httpapi.MaxRequestBodyBytes`'s own 1 MiB (every other REST body this codebase decodes): a tool
 call's own arguments are a handful of small fields, never a file upload, so the larger cap bought no
 legitimate room, only attack surface. A round 2 review of this Step's own fix measured a single ~1 MiB
@@ -7585,7 +7587,7 @@ every call is still governed by the narrowed role.
 ### 43.17 Scopes and discovery gating
 
 The scope vocabulary is `internal/domain/mcpscope`: `mcp:read` covers every read-only tool (180's three
-and 182's status and transcript, §43.20), `mcp:write` will cover every state-changing tool and implies `mcp:read`. A scope is advertised
+and 182's status, wait and transcript, §43.20), `mcp:write` will cover every state-changing tool and implies `mcp:read`. A scope is advertised
 — in `scopes_supported`, in the 401 challenge, and as acceptable at the authorization endpoint — only
 when at least one registered tool requires it, so today exactly `mcp:read` is offered and `mcp:write` is
 refused as `invalid_scope`; no contract promises a scope nothing consumes. Repository restriction is not
@@ -7731,7 +7733,9 @@ line per refused request, naming that request's network.
 
 ### 43.20 A session's live status, and its transcript apart from it
 
-Row 182's first piece, (a). A client that polls hard gets rate-limited into looking broken, and a
+Row 182's first two pieces: (a), the status and the transcript, which this opening and the tables
+after it specify, and (b), the bounded wait for a session to settle, specified under its own heading
+below. A client that polls hard gets rate-limited into looking broken, and a
 client that reads the wrong field sees a busy session as idle. `sessions.status` is that wrong field
 for "what is it doing now": it is re-derived only when a turn reaches a terminal state (§3.1's
 derivation, run by the session actor on completion, deadline, abandon and the terminal-grace
@@ -8036,11 +8040,86 @@ tool, with the route's own page size (100 by default, clamped at 500 — decisio
 `Session.status`'s now say that `status` does not show queued or running work (`Session.status`'s
 lists which of its five values a queued or running turn can sit under: any of them) and point at the
 status route. The adapter gains two `Twins` fields and two table rows, nothing else: its import ban is
-unchanged. Row 182's other pieces are not here: the bounded wait (b) — the status tool's blocking
-form, which returns only on a settled state and never on a queue that has not started — and the
-result (c) — the last run's summary, the pull requests the session produced, and each one's verdict
-with its freshness or its absence. The wait's interval and caps join this block of `platform.Timeouts`
-with it.
+unchanged. The bounded wait (b) is the next part of this section. The result (c) is not here: the last
+run's summary, the pull requests the session produced, and each one's verdict with its freshness or its
+absence.
+
+**The bounded wait (piece (b)).** A client that wants to know when a session is done should not poll:
+`GET /api/sessions/{sessionID}/status?waitSeconds=N` is the status route's blocking form, and
+`narvi_wait_for_session` its tool. The wait answers on `settled` and on nothing else (owner decision
+D1): `finished`, `idle` or `awaiting_approval` — `activity` says which — and never while the session is
+`queued`, `running`, `delivering` or `scheduled`, so a queue that has not started never ends it. It lives
+in one application service, `internal/app/sessionactivity.Waiter`, behind the existing handler: the
+route is the one adapter (§43.7), and every read the wait makes is that route's plain read — the one
+statement, `DeriveActivity` over it, the same gate — so a wait sees exactly what a read sees, only later.
+`?waitSeconds` absent or `0` is the plain read, byte for byte; a negative or malformed value is a `400`;
+a value past the maximum, one too large for an int64 included, is clamped, never refused.
+
+The loop reads at once and returns if the session is settled (`waitedMs` 0); otherwise it sleeps
+`MCPWaitPollInterval` (1 s) on a timer, reads again, and repeats until the session is settled or
+`waitSeconds` clamped to `MCPWaitMaxDuration` (25 s) has passed, then answers the latest read with
+`wait.reason` `timeout` — a normal answer, `settled: false`, after which the documented next step is to
+wait again, not to sleep (owner decision D2). It wakes by polling Postgres only (owner decision D3): the
+event hub reaches only the connections registered in the process whose actor persisted an event
+(cross-pod fan-out is unsolved, `wshub`'s own package doc), and any replica may serve a wait, so a hub hint would work on one replica and not on
+another; no `LISTEN/NOTIFY` exists in this codebase, and a poll of one indexed statement a second per
+wait needs none. Each read acquires a pool connection for its statement and releases it before the
+sleep: no connection or transaction is held across a sleep, which matters because the session actors
+already pin one connection each (`hydrateAndAcquire`), so waits must never add to that.
+
+Waits are capped in memory, per replica, like the other MCP brakes (owner decision D4), by three
+nested caps: `MCPWaitMaxConcurrentPerKey` (2) per key — the MCP grant the request was authenticated
+under, else the signed-in user for a cookie — `MCPWaitMaxConcurrentPerUser` (4) per signed-in user
+across every grant of theirs and their browser, and `MCPWaitMaxConcurrentPerReplica` (32). The per-user
+cap strengthens D4 as written (review round 1): a grant is one row per user and client, a member may
+authorize any number of clients (with client ID metadata documents on, anyone can mint one), so under
+the per-key cap alone one member's sixteen grants held all 32 of a replica's slots and every other
+user's wait degraded to a read. `Waiter.admit` checks the three counts and takes one of each in one
+critical section, and the release gives all three back in another, on every way a wait ends — a
+settled read, its bound, a read error, the client leaving, an interrupt, a panic in the read. A wait
+past any cap does not wait: it answers its first read at once with `wait.reason` `capacity`, a `200`
+and a normal tool result, never an error — so a busy replica degrades to plain status reads rather
+than refusing them, and never to the `429` that would reach an MCP client as `-32603` (§43.8). A settled
+session is answered `settled` whatever the caps, since its first read needs no slot. The key and the
+user are counts' keys and nothing more: no permission derives from them, and the wait is authorized
+exactly as the status read is. The tool's description, `SessionActivity.wait.reason`'s and the web
+guide each name all three causes of `capacity`, with the shipped figures.
+
+Shutdown: a 25 s wait outlives the 10 s drain (`ShutdownGracePeriod`), so `Run`'s HTTP server
+(`newHTTPServer`) registers the Waiter's `Interrupt` with `http.Server.RegisterOnShutdown`: when
+`Shutdown` begins, every running wait answers at once with `wait.reason` `interrupted` and its latest
+read, any wait arriving afterwards after its first read, and the drain is never held by one. The server
+sets no `WriteTimeout`; were one added it would have to exceed `MCPWaitMaxDuration`. Cancellation: the
+Waiter selects on the request's context, which `net/http` cancels when the client closes the connection
+— the 2026-07-28 revision's cancellation on Streamable HTTP — and the tool's twin receives that same
+context through the bridge (§43.7), so an abandoned wait stops polling within a poll. Under the older
+revisions a client may instead send `notifications/cancelled` on a new POST, which in stateless mode
+builds a new server that cannot reach the running wait: that wait runs to its bound, at most 25 s, read
+only — a residual accepted, not closed.
+
+`platform.Timeouts` gains the five fields, with `Validate` links in the style of the status delay
+block: the interval positive and below the maximum, no longer than `MCPStatusDelayFloor` (a client
+polling at the least suggested delay never reads faster than a wait does) and below
+`ShutdownGracePeriod`, every cap at least one, and the caps nested — per key at most per user, per user
+at most per replica (`CountInvariantError`), since a cap above the one containing it never binds. The
+active-wait count is the OTel up-down counter `mcp_session_waits_active` (meter
+`narvi/sessionactivity`).
+
+The tool is a separate one, sharing the status tool's twin and output (owner decision D9):
+
+| Tool | Twin | Input `$def` | Output |
+|---|---|---|---|
+| `narvi_wait_for_session` | `GET /api/sessions/{sessionID}/status?waitSeconds=N` | `WaitForSessionToolRequest` (`sessionId`; optional `waitSeconds`, `minimum: 1`, no `maximum` — the route clamps) | `SessionActivity`, `wait` set |
+
+`mcp:read`, the four §43.8 annotations, and nothing new in the adapter beyond the table row: its twin is
+the existing `Twins.GetSessionStatus`, and its import ban is unchanged. Its `BuildRequest` always sets
+`waitSeconds` on the twin's query, so the twin can tell a wait from a plain read: the caller's value, or,
+when the caller omits it (or sends one past an int64), the largest value the route parses, which the
+route clamps to the deployment's maximum — the adapter never learns that maximum. `SessionActivity` gains
+`wait` — `{reason: settled | timeout | interrupted | capacity, waitedMs}` — as an optional property,
+present only on a read that waited, so the plain read's bytes are unchanged (contracts 1.8.0, MINOR).
+The route and the tool share one Waiter per replica, built once in `Build`, so a wait counts against the
+same caps whichever surface it came through.
 
 **Tests.** Domain: `TestDeriveActivity_Table` (every combination above, unknown state → running, a
 queued follow-up under a completed history → queued), `TestDeriveActivity_NonEmptyQueueNeverIdleOrFinished`
@@ -8135,3 +8214,54 @@ which is each snapshot's own clock, and every transcript page exactly, cursor af
 status carries exactly `SessionActivity`'s keys, no transcript) and
 `…/SessionStatusAndTranscript_ScopelessGrantSeesNeither`; `TestBuild_MCPSurface_TwinParity` pins the
 same wiring for both tools.
+
+**Tests of the wait.** The Waiter, under `-race`: `TestWait_ClampsToMaxDuration` (ten seconds asked,
+200 ms maximum: answered within the maximum plus a poll, having polled several times),
+`TestWait_ClientDisconnectEndsPolling` (the active count back to zero within two polls, no read after),
+`TestWait_ShutdownInterruptsPromptly` (`Interrupt` answers blocked waits well inside a one-second poll,
+and a later wait after its first read), `TestWait_ConcurrentWaitersSameSession_Race` (sixteen waits each
+answer once), `TestWait_PerKeyCapDegradesToSnapshot` (the third wait of one key and a wait past the
+replica's cap answer at once, `capacity`, one read, no error; a settled session is `settled` over a cap;
+slots come back), `TestWait_ReadErrorEndsTheWait`, `TestBound_Table`. Review round 1 added, on the
+shipped caps: `TestWait_PerUserCapSpansEveryGrantAndTheBrowser` (one user's 32 waits over sixteen grants
+take exactly four slots; a fresh grant of theirs and their browser answer `capacity`; another user's
+wait really waits; the four slots come back), `TestWait_ConcurrentAdmissionsNeverOvershootACap_Race`
+(bursts far past each cap, released by a barrier: admitted exactly up to the binding cap, no key, user
+or replica ever counted past its cap), `TestWait_EveryPathGivesItsSlotsBack` and
+`TestWait_ActiveGaugeReturnsToZeroOnEveryPath` (every way a wait ends — settled at once or later, its
+bound, a read error first or later, the client leaving, an interrupt during or before, a panic in the
+read, a refusal by each cap — gives back its replica, user and key counts, and the exported
+`mcp_session_waits_active`, read through a `ManualReader`, counts it while it runs and is back to zero
+after), and `TestWait_TakesAFreshReadAtTheClamp` (a session that settles after the last poll and before
+the bound is answered `settled` by one last read at the clamp). REST, on real Postgres:
+`TestWait_HoldsNoPoolConnectionWhileSleeping` (on a pool of two connections, eight waits all sleep at
+once, the pool seen with none out, and an unrelated read answers at once while they wait),
+`TestGetSessionStatus_WaitOnRealPostgres` (plain read and `waitSeconds=0` equal but for `observedAt`,
+no `wait`; the `400`s and the `404`; a running session waited on until its turn completes),
+`TestWait_ConcurrentWaitersSameSession_Race` (sixteen waits on a pool of four),
+`TestWait_ClientDisconnectEndsPolling_HTTP`, `TestParseWaitSeconds_Table`, `TestWaitCaller_GrantThenUser`
+(the key per grant, else per user; the user the same on every surface).
+Timeouts: `TestTimeouts_Validate_MCPWait`, `TestDefaultTimeouts_MCPWaitFields`. MCP:
+`TestBuildWaitForSessionRequest_Table`, `TestToolCall_WaitForSession_ReachesTheStatusTwin`,
+`TestWaitForSessionText_StatesTheShippedBounds` (the tool's description and instruction and
+`wait.reason`'s description state the poll, the longest wait and its last read, and the three caps with
+`DefaultTimeouts`' figures), the tool-list
+golden, `TestToolsList_ScopeFilter_Table`, `TestHiddenToolCall_IsIndistinguishableFromUnknownTool`,
+`TestParity_BearerEqualsCookieForEveryRole` (the wait on the caller's session, another user's and an
+unknown one, every role). On the production router, through the official SDK client — the row's own
+exit: `TestOAuth_ProductionRouter/Wait_ReturnsOnRealTerminalState_SDKClient` (a processing turn keeps the
+wait blocked through three polls; completed as the actor completes it, the wait answers `finished`
+within about a poll), `…/Wait_NeverReturnsOnAQueueThatHasNotStarted_SDKClient` (a follow-up queued under a
+`completed` row and a first turn queued under a `created` row each wait out their second: `timeout`,
+`queued`, one pending turn), `…/Wait_ReturnsOnAwaitingApproval_SDKClient` (a plan-mode turn's completion
+and its plan in one transaction: `awaiting_approval`, naming the plan),
+`…/Wait_UnsettledThroughDeliveringAndScheduled_SDKClient` (blocked through `delivering`, then
+`scheduled`, then a running release check, and `finished` only after), `…/Wait_LongCallThroughSDK` (the
+shipped 25 s, end to end, nothing cutting it), and `…/Wait_BytesEqualTheRESTTwin_SDKClient`,
+`…/Wait_CapacityDegradesToSnapshot_PerGrant`, `…/Wait_CapacityDegradesToSnapshot_PerUser` (a member with
+three grants: two waits blocked under each of two, the third grant's wait and the member's cookie wait
+answer `capacity` at once, another member's wait runs to its bound), `…/Wait_ScopelessGrantDoesNotSeeIt`, `…/Wait_CrossReplica`
+(two routers on one database: a wait through each, the change committed by neither process, both
+`finished`) and `…/Wait_ShutdownInterruptsPromptly_RunServer` (`newHTTPServer` on a real listener:
+`Shutdown` answers the blocked wait `interrupted` and drains at once); `TestBuild_MCPSurface_TwinParity`
+pins the wait's wiring too.

@@ -30,6 +30,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/releasereview"
+	"github.com/narvidev/narvi/internal/app/sessionactivity"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -80,7 +81,7 @@ func TestSessionStatus_ReleaseManifestCheckIsScheduledUntilItsCompositionTurnExi
 	turns := narvipg.NewTurnStore(pool)
 	pendingStore := narvipg.NewReleaseManifestPendingStore(pool)
 	router := chi.NewRouter()
-	router.Get("/api/sessions/{sessionID}/status", httpapi.GetSessionStatus(sessions, platform.DefaultTimeouts()))
+	router.Get("/api/sessions/{sessionID}/status", httpapi.GetSessionStatus(sessions, sessionactivity.NewWaiter(sessionactivity.ConfigFrom(platform.DefaultTimeouts())), platform.DefaultTimeouts()))
 	fixture := retriggerStatusFixture{status: router}
 
 	for _, tc := range []struct {

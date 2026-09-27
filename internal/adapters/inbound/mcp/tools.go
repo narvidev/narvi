@@ -44,8 +44,9 @@ type Twins struct {
 	// GetSession is httpapi.GetSession(sessionStore) -- narvi_get_session's
 	// own twin.
 	GetSession http.HandlerFunc
-	// GetSessionStatus is httpapi.GetSessionStatus(sessionStore, timeouts)
-	// -- narvi_get_session_status' own twin (technical plan §43.20).
+	// GetSessionStatus is httpapi.GetSessionStatus(sessionStore, waiter,
+	// timeouts) -- the twin of both narvi_get_session_status and, with
+	// ?waitSeconds=, narvi_wait_for_session (technical plan §43.20).
 	GetSessionStatus http.HandlerFunc
 	// ListEvents is httpapi.ListEvents(sessionStore, eventStore) --
 	// narvi_get_session_transcript's own twin, the paginated event
@@ -246,6 +247,45 @@ func buildGetSessionStatusRequest(arguments json.RawMessage) (map[string]string,
 	return map[string]string{"sessionID": in.SessionId}, nil, nil
 }
 
+// waitArgs is buildWaitForSessionRequest's own decode target -- not
+// restdtos.WaitForSessionToolRequest, for listSessionsArgs' reason:
+// waitSeconds is a *json.Number so every integer spelling the schema
+// accepts reaches intFromJSONNumber.
+type waitArgs struct {
+	SessionID   string       `json:"sessionId"`
+	WaitSeconds *json.Number `json:"waitSeconds"`
+}
+
+// longestWait is the waitSeconds narvi_wait_for_session sends its twin
+// when the caller asked for no particular bound, or for one past what an
+// int64 holds: the largest value the route parses, which it clamps to the
+// deployment's MCPWaitMaxDuration like any other -- this package never
+// learns that value, and never needs to.
+var longestWait = strconv.FormatInt(math.MaxInt64, 10)
+
+// buildWaitForSessionRequest maps narvi_wait_for_session's arguments onto
+// GET /api/sessions/{sessionID}/status?waitSeconds=N: sessionId becomes the
+// chi URL param, and waitSeconds is ALWAYS set, so the twin can tell a wait
+// from a plain read -- the caller's value (validateArguments has already
+// held it to a whole number of at least one), or longestWait when omitted
+// or past int64. Never an argument error: a large wait is clamped, not
+// refused.
+func buildWaitForSessionRequest(arguments json.RawMessage) (map[string]string, url.Values, error) {
+	var in waitArgs
+	if len(arguments) > 0 {
+		if err := json.Unmarshal(arguments, &in); err != nil {
+			return nil, nil, err
+		}
+	}
+	waitSeconds := longestWait
+	if in.WaitSeconds != nil {
+		if n, ok := intFromJSONNumber(*in.WaitSeconds); ok {
+			waitSeconds = strconv.Itoa(n)
+		}
+	}
+	return map[string]string{"sessionID": in.SessionID}, url.Values{"waitSeconds": {waitSeconds}}, nil
+}
+
 // transcriptArgs is buildGetSessionTranscriptRequest's own decode target
 // -- not restdtos.GetSessionTranscriptToolRequest, for listSessionsArgs'
 // reason: limit is a *json.Number so every integer spelling the schema
@@ -324,13 +364,23 @@ func toolSpecs(twins Twins) []toolSpec {
 		},
 		{
 			Name:         "narvi_get_session_status",
-			Description:  "Compact state of one session -- the same state GET /api/sessions/{sessionID}/status returns: whether its work is queued, running, delivering (a completed turn's branch being pushed and its pull request opened), scheduled (the server holds work that may start a turn on its own and has neither started nor declined it yet: an automatic re-review after a push to a pull request whose repository has opted in and whose re-review budget is not spent, or a release pull request's manifest check), awaiting approval by a person, idle or finished (a queued or running turn is never reported as idle or finished; settled is true only for idle, awaiting approval and finished), with suggestedDelaySeconds, how long to wait before reading it again. Does not include the transcript.",
+			Description:  "Compact state of one session -- the same state GET /api/sessions/{sessionID}/status returns: whether its work is queued, running, delivering (a completed turn's branch being pushed and its pull request opened), scheduled (the server holds work that may start a turn on its own and has neither started nor declined it yet: an automatic re-review after a push to a pull request whose repository has opted in and whose re-review budget is not spent, or a release pull request's manifest check), awaiting approval by a person, idle or finished (a queued or running turn is never reported as idle or finished; settled is true only for idle, awaiting approval and finished), with suggestedDelaySeconds, how long to wait before reading it again. Does not include the transcript. To wait for the session to settle, prefer narvi_wait_for_session to repeated reads.",
 			Scope:        mcpscope.Read,
 			Instruction:  "narvi_get_session_status (what one session is doing now, and when to ask again)",
 			Twin:         twin{method: http.MethodGet, pathTemplate: "/api/sessions/{sessionID}/status", handler: twins.GetSessionStatus},
 			InputDef:     "GetSessionStatusToolRequest",
 			OutputDef:    "SessionActivity",
 			BuildRequest: buildGetSessionStatusRequest,
+		},
+		{
+			Name:         "narvi_wait_for_session",
+			Description:  "Wait, server-side and bounded, until one session is settled -- finished, idle, or awaiting a person -- then return its state: the same state narvi_get_session_status returns (GET /api/sessions/{sessionID}/status?waitSeconds=N), with wait.reason and wait.waitedMs. The state is read at once, then again one second after each read (as shipped), and the call returns as soon as a read finds the session settled; a session that is queued, running, delivering a completed turn's pull request, or holding scheduled work never ends the wait early. Otherwise the call blocks for waitSeconds seconds -- omitted, or larger than the deployment allows, means the longest: 25 seconds as shipped -- then reads the state once more and returns that read. wait.reason: settled; timeout (still not settled at the end of the wait -- call this tool again rather than sleeping); interrupted (the server is restarting and returned its latest read at once -- call again); capacity (the state was read once and returned at once, without waiting, because the server replica that took the call already runs as many concurrent waits as one of its three caps allows: 2 under this authorization, 4 of this user's across all of their authorizations and their browser, or 32 from all callers together -- the caps as shipped; a later call waits once a slot is free). Does not include the transcript.",
+			Scope:        mcpscope.Read,
+			Instruction:  "narvi_wait_for_session (wait, server-side, up to 25 seconds as shipped, until one session is finished, idle or awaiting a person)",
+			Twin:         twin{method: http.MethodGet, pathTemplate: "/api/sessions/{sessionID}/status", handler: twins.GetSessionStatus},
+			InputDef:     "WaitForSessionToolRequest",
+			OutputDef:    "SessionActivity",
+			BuildRequest: buildWaitForSessionRequest,
 		},
 		{
 			Name:         "narvi_get_session_transcript",
