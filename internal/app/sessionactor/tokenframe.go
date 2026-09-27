@@ -29,10 +29,9 @@ import (
 // the rows read as blank or as a prefix, the later frames were never
 // broadcast either (appendRawEvent broadcasts only an inserted row), and a
 // plan-approval notification or approved plan snapshot built from them
-// froze that text. That was the case from 2026-07-20 until this file, and
-// the history stored in that window stays truncated: the later frames were
-// never stored, and the turn-window rule below refuses them when a sandbox
-// that still holds them replays them (see "Only while its turn is live").
+// froze that text. That was the case from 2026-07-20 until this file; what
+// becomes of the history stored in that window is under "The turn running
+// at deploy" below.
 //
 // Replacing the stored payload in place was rejected: the row would keep
 // its id, so every `id > cursor` reader (the web client's backfill,
@@ -128,6 +127,26 @@ import (
 // in the same write that makes the turn Processing (dispatch.go,
 // tryPlanDispatch and tryPlanReenqueue), so a Processing turn without one
 // does not occur outside tests that seed a turn row directly.
+//
+// # The turn running at deploy
+//
+// History stored before this file keeps one row per part, its first frame,
+// and the sandbox replays the rest on its first reconnect to this binary.
+// For a turn that had ended by then, the rules above refuse every such
+// frame: that history stays truncated. The turn still Processing when the
+// control plane restarts onto this binary is different: nothing ends it
+// (a rolling deploy fails no session, §9.3), a reconnect at the same gen
+// does not move its dispatched_event_id, and its parts' first frames lie
+// above that watermark -- so the rules admit the replayed frames, and each
+// part's later frames are stored as new rows at the tail of the turn's own
+// window, after the steps that followed the part. That is what the rules
+// are for: the frames belong to the live turn, and plan.ExtractContent
+// reads the right text, since the replay keeps the sandbox's order. The
+// web timeline places a part where its FIRST row is, not where a later row
+// lands (timelineModel.ts), so the recovered text shows in the step the
+// part belongs to. TestHandleSandboxEvent_TokenFrames_
+// ReplayDuringTheTurnRunningAtDeploy pins the stored rows, and the web
+// test reads the same rows from its checked-in fixture.
 
 // tokenFrameKeyHashBytes is how many bytes of the text's SHA-256 the
 // storage key keeps: 128 bits, so two distinct frames of one part never

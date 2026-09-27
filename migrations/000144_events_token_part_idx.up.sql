@@ -11,27 +11,33 @@
 -- part was its first frame: an empty string or a prefix. The premise
 -- written into 000019 -- "a single session can never legitimately see the
 -- same messageId twice from two DIFFERENT genuine events" -- does not hold
--- for `token`. The actor now stores each DISTINCT frame as its own row,
--- under the storage key messageId + "#" + a hash of the frame's text
--- (sessionactor/tokenframe.go), so the log stays append-only and a
--- byte-identical resend still dedupes on 000019's index.
+-- for `token`. The actor now stores each DISTINCT frame as its own row
+-- (sessionactor/tokenframe.go), so the log stays append-only: a part's
+-- first frame under its bare messageId, as before, and each later one
+-- under messageId + "#" + a hash of the frame's text. The first frame
+-- keeps the bare key so that a control plane from before this migration
+-- -- one the down migration lets an operator roll back to, or an old pod
+-- mid-rollout -- still dedupes a sandbox's replay of the part on it.
 --
 -- Before it stores a frame, the actor reads the part's newest stored frame
 -- (by id) and its first one: it adds no row when the incoming frame is
--- that newest frame again or an older one replayed late, nor when the
--- part's first frame lies at or below the Processing turn's
--- dispatched_event_id -- a frame of a part from an earlier turn. Both
--- reads are keyed by the payload's own messageId -- the storage key has a
--- per-frame suffix, and the frames stored before this migration have none
--- -- which no existing index covers: this one does, and only for `token`
--- rows, so the rest of the table (every other event type) pays nothing
--- for it. id is the last column, so a part's newest frame is the first
--- entry of a backward scan and its first frame the first of a forward one.
+-- either of them again or an older one replayed late, nor when the part's
+-- first frame lies at or below the Processing turn's dispatched_event_id
+-- -- a frame of a part from an earlier turn. Both reads are keyed by the
+-- payload's own messageId -- a later frame's storage key has a per-frame
+-- suffix -- which no existing index covers: this one does, and only for
+-- `token` rows, so the rest of the table (every other event type) pays
+-- nothing for it. id is the last column, so a part's newest frame is the
+-- first entry of a backward scan and its first frame the first of a
+-- forward one.
 --
--- Frames stored before this migration stay as they were. Their later
--- frames were never stored, and a sandbox that still holds them in its
--- outbound buffer replays them only after their turn has ended, when the
--- actor adds no row for them: that history stays truncated.
+-- Frames stored before this migration stay as they were: each part's first
+-- frame, under its bare messageId. A sandbox that still holds a part's
+-- later frames in its outbound buffer replays them on its first reconnect
+-- after the deploy. For a turn that had ended by then the actor adds no
+-- row for them, and that history stays truncated. For the turn still
+-- Processing at the deploy they are stored, at the tail of that turn's
+-- own window, and the web timeline shows each with its part.
 --
 -- # A plain build, not CONCURRENTLY
 --
