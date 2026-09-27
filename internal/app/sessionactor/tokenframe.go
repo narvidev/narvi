@@ -38,9 +38,11 @@ import (
 // fetch_history, REST ?cursor=) would never see the newer text, and a
 // frame replayed out of order would overwrite a newer one. Each DISTINCT
 // frame is instead stored as its own row, so the log stays append-only and
-// every frame is broadcast once. Readers are unchanged: they fold `token`
-// rows by the PAYLOAD's messageId, newest id wins (web timelineModel,
-// plan.ExtractContent); the storage key never leaves the store.
+// every frame is broadcast once. Readers fold `token` rows by the
+// PAYLOAD's messageId: a part reads as its newest frame, and sits where its
+// FIRST frame is (web timelineModel, plan.ExtractContent; see "The turn
+// running at deploy" for why the first); the storage key never leaves the
+// store.
 //
 // # Storage keys, and the binary before this one
 //
@@ -137,16 +139,50 @@ import (
 // control plane restarts onto this binary is different: nothing ends it
 // (a rolling deploy fails no session, §9.3), a reconnect at the same gen
 // does not move its dispatched_event_id, and its parts' first frames lie
-// above that watermark -- so the rules admit the replayed frames, and each
-// part's later frames are stored as new rows at the tail of the turn's own
-// window, after the steps that followed the part. That is what the rules
-// are for: the frames belong to the live turn, and plan.ExtractContent
-// reads the right text, since the replay keeps the sandbox's order. The
-// web timeline places a part where its FIRST row is, not where a later row
-// lands (timelineModel.ts), so the recovered text shows in the step the
-// part belongs to. TestHandleSandboxEvent_TokenFrames_
-// ReplayDuringTheTurnRunningAtDeploy pins the stored rows, and the web
-// test reads the same rows from its checked-in fixture.
+// above that watermark -- so the rules admit the replayed frames that
+// arrive while it is still Processing, and each part's later frames are
+// stored as new rows at the tail of the turn's own window, after the steps
+// that followed the part. That is what the rules are for: the frames
+// belong to the live turn. Every reader places a part where its FIRST row
+// is, not where a later row lands: the web timeline (timelineModel.ts)
+// shows the recovered text in the step the part belongs to, and
+// plan.ExtractContent reads the part that opened last.
+//
+// The order the frames arrive in depends on the sandbox-agent, and every
+// sandbox alive at the deploy runs the one baked into its image, built
+// before this file. The agent built with this file holds live sends while
+// it replays its buffer (internal/sandboxagent/wsbridge): the replay keeps
+// the sandbox's order, and the turn's execution_complete comes after every
+// replayed frame, so the turn gets back every frame its sandbox still
+// holds. The agent before it publishes its connection before it replays,
+// so a frame the turn sends during the replay can overtake older buffered
+// ones, and so can the turn's execution_complete:
+//   - A later part's frame sent live is stored before an earlier part's
+//     replayed one, so the newest row is the earlier part's. Placing parts
+//     by their first row keeps both readers right: the timeline shows each
+//     part's text in its own step, and plan.ExtractContent reads the plan.
+//   - An execution_complete sent live ends the turn before the rest of the
+//     replay arrives, and the rules refuse every frame behind it: the
+//     running turn does not get those parts back. Each keeps what the
+//     previous binary stored, its first frame only -- blank for the pinned
+//     runtime. The timeline shows those parts blank in their steps, with
+//     the turn closed at its execution_complete and no row after it.
+//     plan.ExtractContent passes over a part with no text and reads the
+//     newest-opened part that has some: the plan when its final frame
+//     reached this binary before the execution_complete; otherwise an
+//     earlier part whose replayed frame did -- narration, where the
+//     previous binary read the placeholder -- or the placeholder when none
+//     did.
+//
+// Such a sandbox reorders the same way at any later mid-turn reconnect,
+// for frames it buffered while disconnected; that reorder predates this
+// file, and the agent built with it removes it.
+// TestHandleSandboxEvent_TokenFrames_ReplayDuringTheTurnRunningAtDeploy
+// pins the stored rows for the agent that holds live sends, and the web
+// test reads the same rows from its checked-in fixture;
+// TestHandleSandboxEvent_TokenFrames_OldAgentOrderDuringTheTurnRunningAtDeploy
+// pins the orders the agent before it was recorded sending, and what
+// planContentText reads from each.
 
 // tokenFrameKeyHashBytes is how many bytes of the text's SHA-256 the
 // storage key keeps: 128 bits, so two distinct frames of one part never
