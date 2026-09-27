@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -103,6 +104,15 @@ func requireUntouched(t *testing.T, dir string, before map[string][2]uint32) {
 	}
 }
 
+// discardLogger swallows the walk's records, for the tests that do not
+// read them: the stress tests alone walk thousands of times.
+var discardLogger = slog.New(slog.DiscardHandler)
+
+// quietly is production's walkOptions with hook, logging to discardLogger.
+func quietly(hook func(walkPoint, string)) walkOptions {
+	return walkOptions{hook: hook, logger: discardLogger}
+}
+
 // swapForSymlink moves the directory at path aside (to path+".moved",
 // still inside the tree) and plants, under its name, a symlink to target.
 func swapForSymlink(t *testing.T, path, target string) {
@@ -182,7 +192,7 @@ func TestChownTree_SwappedDirectoryNeverRedirectsOutside(t *testing.T) {
 					swapForSymlink(t, filepath.Join(root, tc.swap), filepath.Join(outside, tc.linkTo))
 				}
 			}
-			if err := chownTree(root, uid, gid, maxChownDepth, hook); err != nil {
+			if err := chownTree(root, uid, gid, quietly(hook)); err != nil {
 				t.Fatalf("chownTree() error = %v, want nil", err)
 			}
 			if !acted {
@@ -221,7 +231,7 @@ func TestChownTree_RepoSymlinksAreReownedNeverFollowed(t *testing.T) {
 	uid, gid := observableOwner(t, root)
 	outsideBefore := owners(t, outside)
 
-	if err := chownTree(root, uid, gid, maxChownDepth, nil); err != nil {
+	if err := chownTree(root, uid, gid, quietly(nil)); err != nil {
 		t.Fatalf("chownTree() error = %v, want nil", err)
 	}
 
@@ -247,7 +257,7 @@ func TestChownTree_SymlinkedRootIsRefused(t *testing.T) {
 	uid, gid := observableOwner(t, parent)
 	outsideBefore := owners(t, outside)
 
-	err := chownTree(root, uid, gid, maxChownDepth, nil)
+	err := chownTree(root, uid, gid, quietly(nil))
 	if !errors.Is(err, syscall.ELOOP) && !errors.Is(err, syscall.ENOTDIR) {
 		t.Fatalf("chownTree(symlinked root) error = %v, want one wrapping ELOOP or ENOTDIR", err)
 	}
@@ -273,7 +283,7 @@ func TestChownTree_DepthBound(t *testing.T) {
 			if err := os.MkdirAll(deepest, 0o755); err != nil {
 				t.Fatalf("MkdirAll: %v", err)
 			}
-			err := chownTree(root, uid, gid, bound, nil)
+			err := chownTree(root, uid, gid, walkOptions{maxDepth: bound, logger: discardLogger})
 			if gotErr := errors.Is(err, errTreeTooDeep); gotErr != tc.wantErr {
 				t.Fatalf("chownTree(%d levels, bound %d) error = %v, want errTreeTooDeep: %t", tc.levels, bound, err, tc.wantErr)
 			}
@@ -355,7 +365,7 @@ func TestChownTree_ConcurrentAtomicSwapNeverRedirects(t *testing.T) {
 	var failures []error
 	redirected := 0
 	for range walks {
-		if err := chownTree(root, uid, gid, maxChownDepth, hook); err != nil {
+		if err := chownTree(root, uid, gid, quietly(hook)); err != nil {
 			failures = append(failures, err)
 		}
 		if u, g := ownerOf(t, victim); [2]uint32{u, g} != victimBefore {

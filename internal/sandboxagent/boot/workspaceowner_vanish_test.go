@@ -114,6 +114,13 @@ func TestChownTree_EntriesThatVanishMidWalk(t *testing.T) {
 			act: remove,
 		},
 		{
+			// darwin re-owns the removed directory through its fd and lists
+			// it as empty; Linux re-owns it and fails the listing with
+			// ENOENT, which the walk takes as the directory being gone.
+			name: "directory removed after it was opened, before it is re-owned", point: beforeReown, rel: cache,
+			act: remove,
+		},
+		{
 			name: "directory removed after it was opened, before it is listed", point: beforeList, rel: cache,
 			act: remove,
 		},
@@ -137,6 +144,10 @@ func TestChownTree_EntriesThatVanishMidWalk(t *testing.T) {
 			name: "directory recreated under the same name after it was opened, before it is listed", point: beforeList, rel: cache,
 			act: recreate, stale: []string{cache, cache + "/fresh", cache + "/fresh/file"},
 		},
+		{
+			name: "directory recreated under the same name after it was opened, before it is re-owned", point: beforeReown, rel: cache,
+			act: recreate, stale: []string{cache, cache + "/fresh", cache + "/fresh/file"},
+		},
 	}
 
 	for _, tc := range tests {
@@ -158,7 +169,7 @@ func TestChownTree_EntriesThatVanishMidWalk(t *testing.T) {
 					tc.act(t, path)
 				}
 			}
-			if err := chownTree(root, uid, gid, maxChownDepth, hook); err != nil {
+			if err := chownTree(root, uid, gid, quietly(hook)); err != nil {
 				t.Fatalf("chownTree() error = %v, want nil -- an entry that vanished or was replaced mid-walk must not fail boot", err)
 			}
 			if !acted {
@@ -215,7 +226,7 @@ func TestChownTree_ConcurrentSameNameResetNeverFailsBoot(t *testing.T) {
 	const walks = 2000
 	var failures []error
 	for range walks {
-		if err := chownTree(root, uid, gid, maxChownDepth, nil); err != nil {
+		if err := chownTree(root, uid, gid, quietly(nil)); err != nil {
 			failures = append(failures, err)
 		}
 	}
@@ -235,9 +246,85 @@ func TestChownTree_ConcurrentSameNameResetNeverFailsBoot(t *testing.T) {
 // entries never extends to workspaceDir itself.
 func TestChownTree_MissingRootIsStillAnError(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "does-not-exist")
-	err := chownTree(missing, uint32(os.Getuid()), uint32(os.Getgid()), maxChownDepth, nil)
+	err := chownTree(missing, uint32(os.Getuid()), uint32(os.Getgid()), quietly(nil))
 	if !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("chownTree(missing root) error = %v, want one wrapping fs.ErrNotExist", err)
+	}
+}
+
+// TestChownTree_RootChangedMidWalkFailsTheWalk pins what the walk does when
+// the directory it was given is removed, renamed away or replaced while it
+// runs. Its callers each re-own a tree the rest of boot then uses -- a
+// freshly cloned repository, one about to start its services.yml
+// commands, the workspace itself -- and treat any error as fatal to boot.
+// A tree taken out from under the walk is a boot that failed, not a
+// success with nothing, or something else, re-owned. Removed before it is
+// listed, Linux fails the listing and darwin lists it as empty; either
+// way, the walk must report it once it is done.
+func TestChownTree_RootChangedMidWalkFailsTheWalk(t *testing.T) {
+	remove := func(t *testing.T, root string) {
+		t.Helper()
+		if err := os.RemoveAll(root); err != nil {
+			t.Fatalf("RemoveAll(%s): %v", root, err)
+		}
+	}
+	renameAway := func(t *testing.T, root string) {
+		t.Helper()
+		if err := os.Rename(root, root+".moved"); err != nil {
+			t.Fatalf("Rename(%s): %v", root, err)
+		}
+	}
+	replaceWithDir := func(t *testing.T, root string) {
+		t.Helper()
+		renameAway(t, root)
+		if err := os.Mkdir(root, 0o755); err != nil {
+			t.Fatalf("Mkdir(%s): %v", root, err)
+		}
+	}
+	replaceWithLink := func(t *testing.T, root string) {
+		t.Helper()
+		renameAway(t, root)
+		if err := os.Symlink(root+".moved", root); err != nil {
+			t.Fatalf("Symlink(%s): %v", root, err)
+		}
+	}
+
+	tests := []struct {
+		name  string
+		point walkPoint
+		rel   string // the entry at whose hook point the root changes, relative to it
+		act   func(t *testing.T, root string)
+	}{
+		{name: "removed after it was opened, before it is re-owned", point: beforeReown, rel: ".", act: remove},
+		{name: "removed after it was re-owned, before it is listed", point: beforeList, rel: ".", act: remove},
+		{name: "removed while the walk is below it", point: beforeDescend, rel: "repo/.git", act: remove},
+		{name: "renamed away before it is listed", point: beforeList, rel: ".", act: renameAway},
+		{name: "renamed away while the walk is below it", point: beforeDescend, rel: "repo/.git", act: renameAway},
+		{name: "replaced by another directory under its name", point: beforeDescend, rel: "repo/.git", act: replaceWithDir},
+		{name: "replaced by a symlink to where it went", point: beforeList, rel: ".", act: replaceWithLink},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "ws")
+			buildTree(t, root, vanishTreeDirs, vanishTreeFiles)
+			target := filepath.Join(root, tc.rel)
+
+			acted := false
+			hook := func(point walkPoint, path string) {
+				if point == tc.point && path == target && !acted {
+					acted = true
+					tc.act(t, root)
+				}
+			}
+			err := chownTree(root, uint32(os.Getuid()), uint32(os.Getgid()), quietly(hook))
+			if !acted {
+				t.Fatalf("the walk never reached %s at the hooked point, so this case proved nothing", tc.rel)
+			}
+			if !errors.Is(err, errRootChanged) {
+				t.Fatalf("chownTree() error = %v, want one wrapping errRootChanged -- a root taken away mid-walk must fail boot", err)
+			}
+		})
 	}
 }
 
@@ -260,7 +347,7 @@ func TestChownTree_OtherErrorsStillAbortTheWalk(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
 
-		err := chownTree(root, uid, gid, maxChownDepth, nil)
+		err := chownTree(root, uid, gid, quietly(nil))
 		if !errors.Is(err, syscall.EACCES) {
 			t.Fatalf("chownTree() error = %v, want one wrapping EACCES", err)
 		}
@@ -269,7 +356,7 @@ func TestChownTree_OtherErrorsStillAbortTheWalk(t *testing.T) {
 	t.Run("a chown the caller is not allowed", func(t *testing.T) {
 		root := t.TempDir()
 		buildTree(t, root, vanishTreeDirs, vanishTreeFiles)
-		err := chownTree(root, uid, groupNotHeld(t), maxChownDepth, nil)
+		err := chownTree(root, uid, groupNotHeld(t), quietly(nil))
 		if !errors.Is(err, syscall.EPERM) {
 			t.Fatalf("chownTree() error = %v, want one wrapping EPERM", err)
 		}
