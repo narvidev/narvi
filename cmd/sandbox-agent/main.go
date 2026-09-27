@@ -178,6 +178,12 @@ import (
 )
 
 func main() {
+	// First, before anything else runs: the workspace re-own walk
+	// re-executes this binary, as the agent runtime, to ask the kernel
+	// whether it bounds what the runtime can hard-link, and that child
+	// must answer and exit here (boot.RunHardlinkProbeIfRequested).
+	boot.RunHardlinkProbeIfRequested(os.Args)
+
 	// A bare-bones dispatch, not a flag-parsing library, mirroring
 	// cmd/control-plane/main.go's own subcommand pattern: ONE alternate
 	// subcommand exists today -- "credential-helper" (the process git

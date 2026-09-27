@@ -28,6 +28,20 @@ import (
 // seconds (SSE inactivity) to hours (provider hard cap).
 const MinTimeoutMargin = 30 * time.Second
 
+// HardLinkProbeTimeout bounds the one short-lived process the sandbox
+// agent's workspace re-own walk runs as the agent runtime's uid, to learn
+// whether the kernel refuses that uid a hard link to a file it neither
+// owns nor can read and write (boot.ChownWorkspaceForRuntime's doc says
+// what depends on the answer). The process execs, makes one link(2) call
+// and exits, so it needs milliseconds. One with no answer by then is
+// killed, and the walk falls back to reading fs.protected_hardlinks. The
+// probe runs once per sandbox-agent process, so this is also the most it
+// can add to a boot. A package-level constant rather than a Timeouts
+// field: nothing orders it against another timeout, and the walk that
+// needs it takes no Timeouts. Not specified in the plan; chosen with a
+// wide margin over one exec on a loaded sandbox.
+const HardLinkProbeTimeout = 10 * time.Second
+
 // Timeouts is the single struct holding every timeout/interval this PR
 // covers, wired into two independent invariant chains:
 //

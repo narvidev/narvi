@@ -13,8 +13,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strings"
 
 	"golang.org/x/sys/unix"
 )
@@ -106,29 +104,48 @@ import (
 // And hard links. A non-directory entry with more than one link is also a
 // name somewhere else, possibly outside the tree, and re-owning the entry
 // re-owns the inode under every name it has. What the runtime can link
-// into the tree is the kernel's to bound: with fs.protected_hardlinks at 1,
-// only a file it owns or can already read and write, so re-owning such a
-// link gives it nothing it did not have. Nothing in Narvi sets that value,
-// and nothing can -- it is global, not per namespace -- so the walk reads
-// it when it starts, and logs it. At 1, such an entry is re-owned like any
+// into the tree is the kernel's to bound: where it refuses the runtime a
+// link to a file it neither owns nor can read and write, re-owning such a
+// link gives it nothing it did not have. Nothing in Narvi sets that rule,
+// and nothing can -- it is global, not per namespace -- so the walk asks
+// the kernel, once per process and runtime identity: a short-lived child
+// running as the runtime tries exactly such a link (hardlinkprobe.go). A
+// refusal (EPERM) means bounded, a link made means not, and anything else
+// is inconclusive, which leaves it to fs.protected_hardlinks: bounded at
+// 1, not otherwise, nor when it cannot be read. The setting alone is not
+// enough: gVisor, the runtime Modal sandboxes use by default, publishes
+// none and bounds hard links unconditionally. The verdict is logged once,
+// at INFO. Bounded, an entry with more than one link is re-owned like any
 // other: a package store hard-linked into node_modules by a root-run setup
-// hook is the ordinary case. At any other value, or when it cannot be
-// read, every non-directory entry with more than one link is left to its
-// owner, and the walk logs once, at WARN, how many it left that the
-// runtime does not already own, naming at most leftSampleSize of them
-// relative to workspaceDir. That gate narrows the limit and does not close
-// it: the link count is read by name through the held directory fd and
-// the entry then re-owned the same way, two calls apart, so a writer the
-// kernel lets hard-link any file can still rename such a link over an
-// entry between them.
+// hook, or a pair of build outputs hard-linked inside the tree, is the
+// ordinary case. Not bounded, every non-directory entry with more than one
+// link is left to its owner, and each walk that left any logs once, at
+// WARN, how many it left that the runtime does not already own, naming at
+// most leftSampleSize of them relative to workspaceDir. Only there, where
+// the kernel does not bound hard links, does a race remain: the link count
+// is read by name through the held directory fd and the entry then
+// re-owned the same way, two calls apart, so a writer the kernel lets
+// hard-link any file can still rename such a link over an entry between
+// them.
 //
 // An entry that disappears before the walk reaches it is not a failure:
 // there is nothing left to re-own. ENOENT for a name in a directory the
 // walk holds open -- from fstatat, fchownat or openat -- skips that entry,
 // and ENOENT on a directory's own fd, once the directory has been removed
-// after the walk opened it, skips that directory; no path is resolved
-// again to double-check either. An entry created after the walk listed its
-// directory is not re-owned by this pass, which re-owns a
+// after the walk opened it, skips that directory. overlayfs reports a
+// removal two more ways. Re-owning an entry still only in a lower layer
+// copies it up first, and the copy-up of an entry removed during the call
+// collides with the whiteout its removal left: fchownat fails with EEXIST,
+// and fchown through the fd of a directory removed since the walk opened
+// it fails with ENOTDIR. So an EEXIST from fchownat skips the entry only if
+// a second fstatat through the same directory fd finds nothing by that
+// name, and an ENOTDIR from a directory's fchown skips the directory only
+// if listing it through that fd says it was removed. Otherwise the error
+// stands, so a name removed and created again while its copy-up ran still
+// fails the walk. Opening a directory to descend, looking at an entry and
+// listing a directory copy nothing up. No path is resolved again to
+// double-check any of this. An entry created after the
+// walk listed its directory is not re-owned by this pass, which re-owns a
 // snapshot: the writers it runs beside are the runtime's own processes, so
 // what they create is already the runtime's. workspaceDir itself is the
 // exception. It must be a directory rather than a symlink to one, and when
@@ -157,9 +174,6 @@ const maxChownDepth = 1024
 // leftSampleSize bounds how many of the entries a walk left to their owner
 // its WARN names.
 const leftSampleSize = 5
-
-// protectedHardlinksPath is where Linux publishes fs.protected_hardlinks.
-const protectedHardlinksPath = "/proc/sys/fs/protected_hardlinks"
 
 // errTreeTooDeep is what the walk reports for a tree deeper than its bound.
 var errTreeTooDeep = errors.New("directory tree is deeper than the re-own walk descends")
@@ -200,10 +214,16 @@ type walkOptions struct {
 	// walkPoint. The path is for the hook and for error messages only,
 	// and is never passed to a system call.
 	hook func(walkPoint, string)
-	// protectedHardlinks reads fs.protected_hardlinks; nil means
-	// readProtectedHardlinks.
+	// probe runs the hard-link probe for the runtime's uid and gid, and
+	// protectedHardlinks reads fs.protected_hardlinks, which decides when
+	// the probe is inconclusive. With both nil, as in production, the walk
+	// acts on productionHardLinkVerdict, computed and logged once per
+	// process and runtime identity. With either set, the verdict is
+	// computed and logged for this walk alone, and a nil one of the two
+	// means productionHardLinkProbe.run or readProtectedHardlinks.
+	probe              func(uid, gid int) probeResult
 	protectedHardlinks func() (string, error)
-	// logger receives the walk's two records; nil means slog.Default().
+	// logger receives the walk's records; nil means slog.Default().
 	logger *slog.Logger
 }
 
@@ -213,28 +233,17 @@ func chownTree(workspaceDir string, uid, gid uint32, opts walkOptions) error {
 	if opts.maxDepth == 0 {
 		opts.maxDepth = maxChownDepth
 	}
-	if opts.protectedHardlinks == nil {
-		opts.protectedHardlinks = readProtectedHardlinks
-	}
 	if opts.logger == nil {
 		opts.logger = slog.Default()
 	}
 
 	w := treeWalker{uid: int(uid), gid: int(gid), maxDepth: opts.maxDepth, hook: opts.hook}
-	setting, err := opts.protectedHardlinks()
-	w.reownHardLinked = err == nil && setting == "1"
-	if err != nil {
-		opts.logger.Info("boot: re-own walk: fs.protected_hardlinks unreadable",
-			"root", workspaceDir, "error", err, "reown_hard_linked", w.reownHardLinked)
-	} else {
-		opts.logger.Info("boot: re-own walk: fs.protected_hardlinks",
-			"root", workspaceDir, "value", setting, "reown_hard_linked", w.reownHardLinked)
-	}
+	w.reownHardLinked = hardLinkVerdictFor(w.uid, w.gid, opts).bounded
 
 	walkErr := w.walk(workspaceDir)
 	if w.leftLinked > 0 {
-		opts.logger.Warn("boot: re-own walk left entries with more than one link to an owner other than the runtime: fs.protected_hardlinks is not 1",
-			"count", w.leftLinked, "sample", w.leftSample)
+		opts.logger.Warn("boot: re-own walk left entries with more than one link to an owner other than the runtime: the kernel is not known to bound what the runtime can hard-link",
+			"root", workspaceDir, "count", w.leftLinked, "sample", w.leftSample)
 	}
 	if walkErr != nil {
 		return fmt.Errorf("boot: chown workspace %s for runtime uid=%d gid=%d: %w", workspaceDir, uid, gid, walkErr)
@@ -242,26 +251,31 @@ func chownTree(workspaceDir string, uid, gid uint32, opts walkOptions) error {
 	return nil
 }
 
-// readProtectedHardlinks returns the kernel's fs.protected_hardlinks
-// setting, trimmed. Only Linux has one; anywhere else this is an error,
-// which the walk treats like any setting it cannot read.
-func readProtectedHardlinks() (string, error) {
-	if runtime.GOOS != "linux" {
-		return "", fmt.Errorf("%s: no such setting on %s", protectedHardlinksPath, runtime.GOOS)
+// hardLinkVerdictFor is the verdict a walk with opts acts on: see
+// walkOptions.probe.
+func hardLinkVerdictFor(uid, gid int, opts walkOptions) hardLinkVerdict {
+	if opts.probe == nil && opts.protectedHardlinks == nil {
+		return productionHardLinkVerdict(uid, gid, opts.logger)
 	}
-	b, err := os.ReadFile(protectedHardlinksPath)
-	if err != nil {
-		return "", err
+	probe, readSetting := opts.probe, opts.protectedHardlinks
+	if probe == nil {
+		probe = productionHardLinkProbe.run
 	}
-	return strings.TrimSpace(string(b)), nil
+	if readSetting == nil {
+		readSetting = readProtectedHardlinks
+	}
+	v := decideHardLinks(probe(uid, gid), readSetting)
+	v.log(opts.logger, uid, gid)
+	return v
 }
 
 type treeWalker struct {
 	uid, gid int
 	maxDepth int
 	hook     func(walkPoint, string)
-	// reownHardLinked: fs.protected_hardlinks reads 1, so a non-directory
-	// entry with more than one link is re-owned like any other.
+	// reownHardLinked: the kernel bounds what the runtime can hard-link
+	// (hardLinkVerdict), so a non-directory entry with more than one link
+	// is re-owned like any other.
 	reownHardLinked bool
 	// leftLinked counts the non-directory entries with more than one link
 	// the walk left to an owner other than the runtime; leftSample names
@@ -386,12 +400,26 @@ func rootUnchanged(root string, opened *unix.Stat_t) error {
 func (w *treeWalker) enter(f *dirFrame) (gone bool, err error) {
 	w.at(beforeReown, f.path)
 	if err := fchown(f.fd, w.uid, w.gid); err != nil {
+		if errors.Is(err, unix.ENOTDIR) && dirRemoved(f.dir) {
+			// Linux overlayfs only. fchown through the fd of a directory
+			// still only in a lower layer copies it up, and the copy-up of
+			// one removed since the walk opened it cannot rename the new
+			// directory over the whiteout its removal left: ENOTDIR,
+			// measured, where the directory was empty in that layer (one
+			// with entries was copied up by their own removal, so its
+			// fchown succeeds). The beforeReown seam of
+			// TestChownTree_OverlayLowerLayerRemovals reaches it. Listing
+			// through the fd is what tells a removed directory from any
+			// other failure.
+			return true, &fs.PathError{Op: "fchown", Path: f.path, Err: err}
+		}
 		// darwin only. APFS fails the fchown with ENOENT when the
 		// directory's removal overlaps the call itself; through the fd of a
 		// directory already removed, fchown succeeds, as it always does on
-		// Linux, where this branch never fires. No hook point sits inside
-		// a system call, so only the concurrent reset test
-		// (TestChownTree_ConcurrentSameNameResetNeverFailsBoot) reaches it.
+		// Linux outside the overlayfs case above, where this never fires.
+		// No hook point sits inside a system call, so only the concurrent
+		// reset test (TestChownTree_ConcurrentSameNameResetNeverFailsBoot)
+		// reaches it.
 		return errors.Is(err, unix.ENOENT), &fs.PathError{Op: "fchown", Path: f.path, Err: err}
 	}
 	w.at(beforeList, f.path)
@@ -427,11 +455,37 @@ func (w *treeWalker) enter(f *dirFrame) (gone bool, err error) {
 		case err == nil:
 		case errors.Is(err, unix.ENOENT):
 			continue // gone since it was looked at
+		case errors.Is(err, unix.EEXIST) && nameGone(f.fd, name):
+			// Linux overlayfs only: the entry was still only in a lower
+			// layer, fchownat looked its name up before a removal and
+			// copied it up after, and the copy-up collided with the
+			// whiteout the removal left. No hook point sits inside a
+			// system call, so only the concurrent remover of
+			// TestChownTree_OverlayLowerLayerRemovals reaches it.
+			continue
 		default:
 			return false, &fs.PathError{Op: "fchownat", Path: path, Err: err}
 		}
 	}
 	return false, nil
+}
+
+// nameGone reports whether the directory open as dirfd no longer holds an
+// entry called name, by looking again through that same fd.
+func nameGone(dirfd int, name string) bool {
+	_, err := lstatAt(dirfd, name)
+	return errors.Is(err, unix.ENOENT)
+}
+
+// dirRemoved reports whether the directory open as dir has been removed,
+// by listing it through that fd: Linux lists a removed directory with
+// ENOENT. darwin lists it as empty instead, and never gets here, since
+// only overlayfs fails a directory's fchown with ENOTDIR. The
+// listing consumes dir's entries, which is harmless: the caller is about
+// to return either way.
+func dirRemoved(dir *os.File) bool {
+	_, err := dir.Readdirnames(-1)
+	return errors.Is(err, fs.ErrNotExist)
 }
 
 // leaveLinked records a non-directory entry with more than one link that
