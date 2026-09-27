@@ -26,30 +26,32 @@ import (
 // right now), that is NOT an error from this method -- the entry is
 // already buffered, so Run's own flushBuffer will deliver it on the next
 // (re)connect regardless. Only a msg marshal failure (a genuine caller
-// bug) is returned as an error.
+// bug) is returned as an error. While a fresh connection replays the
+// buffer, the call waits for that replay to end, which writes the entry
+// itself (enqueue, bridge.go).
 func (b *Bridge) SendCritical(ctx context.Context, msg any, ackID string) error {
 	payload, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("wsbridge: marshal critical event %q: %w", ackID, err)
 	}
 
-	b.buffer.add(outboundEntry{ackID: ackID, critical: true, payload: payload})
-	b.bestEffortSend(ctx, payload)
+	b.bestEffortSend(ctx, b.enqueue(ctx, outboundEntry{ackID: ackID, critical: true, payload: payload}), payload)
 	return nil
 }
 
 // SendBestEffort marshals and sends msg, buffering it too (so it's resent
 // on reconnect, relying on the receiver's own upsert-by-messageId
 // idempotency per §6.1), but IS subject to eviction once the buffer is
-// over cap and no non-critical entry is left to prefer evicting instead.
+// at cap and it is the oldest non-critical entry left (doc.go, "The replay
+// after a (re)connect", lists exactly when that can happen). Like
+// SendCritical, it waits while a fresh connection replays the buffer.
 func (b *Bridge) SendBestEffort(ctx context.Context, msg any) error {
 	payload, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("wsbridge: marshal best-effort event: %w", err)
 	}
 
-	b.buffer.add(outboundEntry{critical: false, payload: payload})
-	b.bestEffortSend(ctx, payload)
+	b.bestEffortSend(ctx, b.enqueue(ctx, outboundEntry{critical: false, payload: payload}), payload)
 	return nil
 }
 
@@ -85,14 +87,15 @@ func (b *Bridge) SendBootProgress(ctx context.Context, event services.BootProgre
 	return b.SendBestEffort(ctx, msg)
 }
 
-// bestEffortSend attempts to write payload on whatever the CURRENT
-// connection is right now, silently doing nothing if there isn't one or
-// the write fails -- the caller (SendCritical/SendBestEffort) has already
-// buffered payload, so eventual delivery is guaranteed via the next
-// (re)connect's flushBuffer regardless of whether THIS immediate attempt
-// succeeds.
-func (b *Bridge) bestEffortSend(ctx context.Context, payload []byte) {
-	conn := b.getConn()
+// bestEffortSend attempts to write payload on conn, the connection
+// enqueue returned when it buffered payload, silently doing nothing if
+// there was none or the write fails -- the caller (SendCritical/
+// SendBestEffort) has already buffered payload, so eventual delivery is
+// guaranteed via the next (re)connect's flushBuffer regardless of whether
+// THIS immediate attempt succeeds. conn is nil when the entry was buffered
+// while a fresh connection was replaying the buffer: that replay wrote
+// payload itself, after every older entry (see enqueue).
+func (b *Bridge) bestEffortSend(ctx context.Context, conn *websocket.Conn, payload []byte) {
 	if conn == nil {
 		return
 	}

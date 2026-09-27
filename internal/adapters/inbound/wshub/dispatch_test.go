@@ -148,6 +148,12 @@ func TestDispatch_EndToEnd(t *testing.T) {
 
 	sid := sessionID.String()
 
+	// A `token` is stored only while a turn is Processing
+	// (sessionactor/tokenframe.go); (b)'s execution_complete ends it.
+	if _, err := narvipg.NewTurnStore(pool).Create(ctx, sqlcgen.CreateTurnParams{SessionID: sessionID, Status: sqlcgen.TurnStatusProcessing}); err != nil {
+		t.Fatalf("create processing turn: %v", err)
+	}
+
 	// --- (a) non-critical event: persists, no ack. ---
 	send(t, fmt.Sprintf(`{"type":"token","messageId":"tok-1","sessionId":%q,"gen":1,"text":"hello"}`, sid))
 	waitUntil(t, dispatchTestWait, func() bool {

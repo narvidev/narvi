@@ -60,6 +60,40 @@
 // (evictionDecision, buffer.go) precisely so it can be exhaustively
 // table-tested without any WS/network machinery in the loop.
 //
+// # The replay after a (re)connect: order, bound, and what can be evicted
+//
+// A best-effort entry leaves the buffer only by eviction, so a connection
+// normally comes up with the buffer at its cap, and flushBuffer (run.go)
+// replays all of it, in send order, before any live send is written and
+// before commands are read. A send made while that replay runs is
+// buffered, then HELD: it returns only once the replay has ended, and the
+// replay itself writes its entry after every older one (enqueue,
+// bridge.go). Three properties follow, each pinned by a test in
+// bridge_test.go:
+//
+//   - Order. Nothing is written live ahead of an older buffered entry. A
+//     live `token` frame overtaking an older, never-delivered frame of the
+//     same text part would make the control plane store the older text
+//     last, and the newest stored frame is what every reader shows.
+//   - Bound. Each sending goroutine adds at most one entry per replay, so
+//     a replay is one pass over what was buffered when the connection came
+//     up plus at most one entry per sender. Commands and acks, read once
+//     the replay ends, wait for that and no longer, however fast a sender
+//     is. The hold is also the backpressure a live conn.Write gives when
+//     the socket is full.
+//   - Nothing unwritten is evicted by the replay. An add evicts only when
+//     the buffer holds at least outboundBufferCap entries, and then only
+//     the oldest best-effort one. The replay writes from its own copy of
+//     the buffer, so an eviction cannot take an entry of the pass in
+//     progress, and the one entry a held sender added is newer than all of
+//     them, so it is evicted only if every older entry is critical.
+//
+// What eviction can drop, therefore: while disconnected, best-effort
+// entries more than outboundBufferCap events old, never delivered -- the
+// soft cap §6.1 states; while connected, entries every one of which was
+// already written on this connection, by the replay or live; never a
+// critical entry, which leaves the buffer only when its ack arrives.
+//
 // # Dispatch-by-type-field is this package's own necessary pattern
 //
 // contracts/gen/go/sandboxws has no generated discriminated-union wrapper

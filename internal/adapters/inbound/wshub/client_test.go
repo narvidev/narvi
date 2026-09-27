@@ -1014,6 +1014,12 @@ func TestClientHandler_LiveBroadcast(t *testing.T) {
 		t.Fatalf("create test sandbox: %v", err)
 	}
 
+	// A `token` is stored, and so broadcast, only while a turn is
+	// Processing (sessionactor/tokenframe.go).
+	if _, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: sessionRow.ID, Status: sqlcgen.TurnStatusProcessing}); err != nil {
+		t.Fatalf("create processing turn: %v", err)
+	}
+
 	token := createTestWSToken(ctx, t, rig.pool, sessionRow.ID, time.Now().Add(24*time.Hour))
 	conn := subscribeClient(ctx, t, rig.wsURL, sessionRow.ID.String(), token)
 	defer func() { _ = conn.CloseNow() }()

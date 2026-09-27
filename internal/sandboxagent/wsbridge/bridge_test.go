@@ -1103,3 +1103,381 @@ func TestRun_StaleGenShutdownIsIgnored(t *testing.T) {
 		t.Fatalf("Run() error = %v, want nil (stale-gen shutdown must be ignored, ctx timeout should be what ends Run)", err)
 	}
 }
+
+// --- the replay on (re)connect: order, bound, nothing lost ---------------
+
+// replayFrame is the `token` frame this section's tests send, told apart by
+// its messageId.
+func replayFrame(messageID string) sandboxws.Token {
+	return sandboxws.Token{Type: "token", MessageId: messageID, SessionId: testSessionID, Gen: testGen, Text: "t"}
+}
+
+// readMessageIDs reads conn's `ready`, then n more frames, and returns
+// those frames' messageIds in wire order -- for fake-server goroutines,
+// which report errors rather than failing the test themselves.
+func readMessageIDs(conn *websocket.Conn, n int) ([]string, error) {
+	if _, err := serverRead(conn, testWait); err != nil {
+		return nil, fmt.Errorf("read ready: %w", err)
+	}
+	got := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		data, err := serverRead(conn, testWait)
+		if err != nil {
+			return got, fmt.Errorf("read frame %d: %w", i, err)
+		}
+		var env testEnvelope
+		if err := json.Unmarshal(data, &env); err != nil {
+			return got, fmt.Errorf("malformed frame %d: %w", i, err)
+		}
+		got = append(got, env.MessageID)
+	}
+	return got, nil
+}
+
+// startSend makes one SendBestEffort on a goroutine of senders and returns
+// a channel closed once that call has returned.
+func startSend(ctx context.Context, senders *errgroup.Group, bridge *wsbridge.Bridge, messageID string) <-chan struct{} {
+	done := make(chan struct{})
+	senders.Go(func() error {
+		defer close(done)
+		return bridge.SendBestEffort(ctx, replayFrame(messageID))
+	})
+	return done
+}
+
+// heldSignal installs an enqueue-held hook on bridge and returns the
+// channel it signals on, once per held send.
+func heldSignal(bridge *wsbridge.Bridge) <-chan struct{} {
+	held := make(chan struct{}, 64)
+	wsbridge.SetEnqueueHeldHookForTest(bridge, func() { held <- struct{}{} })
+	return held
+}
+
+// TestRun_LiveSendDuringReplayIsWrittenAfterEveryBufferedEntry pins the
+// ordering flushBuffer guarantees: an event sent while a fresh connection
+// is still replaying the buffer reaches the wire after every older
+// buffered entry, never in the middle of the replay. The send is made
+// right after the replay's first write -- the deterministic version of a
+// `token` frame emitted while the sandbox is reconnecting -- and is held
+// until the replay has written it. Were it written ahead of an older,
+// never-delivered frame of the same text part, the control plane would
+// store that older frame last, and the newest stored frame is the text
+// every reader shows.
+func TestRun_LiveSendDuringReplayIsWrittenAfterEveryBufferedEntry(t *testing.T) {
+	t.Parallel()
+
+	const buffered = 5
+	gotCh := make(chan []string, 1)
+	conn1 := func(conn *websocket.Conn) {
+		got, err := readMessageIDs(conn, buffered+1)
+		if err != nil {
+			t.Errorf("conn1: %v", err)
+		}
+		gotCh <- got
+		absorbForever(conn)
+	}
+	fake := &stepServer{steps: []func(*websocket.Conn){conn1}, fallback: absorbForever}
+	server := httptest.NewServer(fake)
+	t.Cleanup(server.Close)
+
+	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", "test-agent-version", "test-image-digest", noopHandler{},
+		testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
+	ctx, cancel := context.WithCancel(context.Background())
+	held := heldSignal(bridge)
+
+	// Sent before any connection exists: buffered only, the replay's backlog.
+	var want []string
+	for i := 0; i < buffered; i++ {
+		id := fmt.Sprintf("buffered-%d", i)
+		want = append(want, id)
+		if err := bridge.SendBestEffort(ctx, replayFrame(id)); err != nil {
+			t.Fatalf("SendBestEffort(%s) error = %v", id, err)
+		}
+	}
+	want = append(want, "live")
+
+	var senders errgroup.Group
+	var once sync.Once
+	wsbridge.SetFlushWriteHookForTest(bridge, func() {
+		once.Do(func() {
+			done := startSend(ctx, &senders, bridge, "live")
+			select {
+			case <-held:
+			case <-done:
+			case <-time.After(testWait):
+				t.Error("the send made mid-replay was neither held nor returned")
+			}
+		})
+	})
+
+	wait := runInBackground(ctx, bridge)
+	got := waitChan(t, gotCh, 2*testWait)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("frames on the wire = %v, want %v (every buffered entry before the live send)", got, want)
+	}
+
+	cancel()
+	if err := wait(); err != nil {
+		t.Errorf("Run() error = %v, want nil after ctx cancellation", err)
+	}
+	if err := senders.Wait(); err != nil {
+		t.Errorf("SendBestEffort error = %v", err)
+	}
+}
+
+// TestRun_SendAtTheReplaysLastCheckIsWrittenOnTheSameConnection pins the
+// one property of flushBuffer's end the ordering test above cannot see:
+// its last check (nothing left to write) happens in the same critical
+// section that publishes the connection and releases held sends. The
+// send is started from inside that section (the replay-caught-up hook
+// runs with the lock held), so it can buffer its entry only once the
+// connection is published and goes out live, after every replayed entry.
+// Were the check and the publish two critical sections, the send would
+// buffer its entry between them and be held by a replay that has already
+// made its last check -- released with nothing having written it, so the
+// entry would reach the control plane only on the next reconnect, behind
+// every newer frame. The hook waits until the send is held or returns, or
+// a grace period passes: with one critical section neither can happen
+// while the hook runs.
+func TestRun_SendAtTheReplaysLastCheckIsWrittenOnTheSameConnection(t *testing.T) {
+	t.Parallel()
+
+	const (
+		buffered = 3
+		grace    = 250 * time.Millisecond
+	)
+	gotCh := make(chan []string, 1)
+	conn1 := func(conn *websocket.Conn) {
+		got, err := readMessageIDs(conn, buffered+1)
+		if err != nil {
+			t.Errorf("conn1: %v", err)
+		}
+		gotCh <- got
+		absorbForever(conn)
+	}
+	fake := &stepServer{steps: []func(*websocket.Conn){conn1}, fallback: absorbForever}
+	server := httptest.NewServer(fake)
+	t.Cleanup(server.Close)
+
+	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", "test-agent-version", "test-image-digest", noopHandler{},
+		testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
+	ctx, cancel := context.WithCancel(context.Background())
+	held := heldSignal(bridge)
+
+	var want []string
+	for i := 0; i < buffered; i++ {
+		id := fmt.Sprintf("buffered-%d", i)
+		want = append(want, id)
+		if err := bridge.SendBestEffort(ctx, replayFrame(id)); err != nil {
+			t.Fatalf("SendBestEffort(%s) error = %v", id, err)
+		}
+	}
+	want = append(want, "at-last-check")
+
+	var senders errgroup.Group
+	var once sync.Once
+	wsbridge.SetReplayCaughtUpHookForTest(bridge, func() {
+		once.Do(func() {
+			done := startSend(ctx, &senders, bridge, "at-last-check")
+			select {
+			case <-held:
+			case <-done:
+			case <-time.After(grace):
+			}
+		})
+	})
+
+	wait := runInBackground(ctx, bridge)
+	got := waitChan(t, gotCh, 2*testWait)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("frames on conn1 = %v, want %v (the send racing the replay's last check written on the same connection, last)", got, want)
+	}
+
+	cancel()
+	if err := wait(); err != nil {
+		t.Errorf("Run() error = %v, want nil after ctx cancellation", err)
+	}
+	if err := senders.Wait(); err != nil {
+		t.Errorf("SendBestEffort error = %v", err)
+	}
+}
+
+// TestRun_ReplayIsBoundedAndLosesNothingWhileASenderFloodsIt pins what the
+// hold buys when a connection comes up with the buffer at its cap -- the
+// normal case, since best-effort entries leave the buffer only by
+// eviction -- and a sender keeps sending as fast as it can:
+//   - the replay is bounded: it writes the entries buffered when the
+//     connection came up plus the one the held sender added, and ends;
+//     the sender's later sends go out live;
+//   - nothing is lost: every frame reaches the connection, in send order.
+//     Buffering the sender's frames during the replay instead would evict
+//     entries the replay had not written yet and keep it replaying for as
+//     long as the sender kept pace;
+//   - a command sent right after `ready` is handled, since the read loop
+//     starts as soon as the bounded replay ends.
+//
+// The sender starts right after the replay's first write, and that write
+// waits until it is held -- or, were sends not held, until it has made
+// every send, which is the flood the replay would then have to absorb.
+func TestRun_ReplayIsBoundedAndLosesNothingWhileASenderFloodsIt(t *testing.T) {
+	t.Parallel()
+
+	const flood = 2000
+	capacity := wsbridge.OutboundBufferCapForTest
+	gotCh := make(chan []string, 1)
+	conn1 := func(conn *websocket.Conn) {
+		if _, err := serverRead(conn, testWait); err != nil {
+			t.Errorf("conn1: read ready: %v", err)
+			gotCh <- nil
+			return
+		}
+		stop := fmt.Sprintf(`{"type":"stop","messageId":"stop-during-replay","sessionId":%q,"gen":%d}`, testSessionID, testGen)
+		if err := conn.Write(context.Background(), websocket.MessageText, []byte(stop)); err != nil {
+			t.Errorf("conn1: write stop: %v", err)
+		}
+		var got []string
+		for i := 0; i < capacity+flood; i++ {
+			data, err := serverRead(conn, testWait)
+			if err != nil {
+				t.Errorf("conn1: read frame %d: %v", i, err)
+				break
+			}
+			var env testEnvelope
+			if err := json.Unmarshal(data, &env); err != nil {
+				t.Errorf("conn1: malformed frame %d: %v", i, err)
+				break
+			}
+			got = append(got, env.MessageID)
+		}
+		gotCh <- got
+		absorbForever(conn)
+	}
+	fake := &stepServer{steps: []func(*websocket.Conn){conn1}, fallback: absorbForever}
+	server := httptest.NewServer(fake)
+	t.Cleanup(server.Close)
+
+	spy := &spyHandler{}
+	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", "test-agent-version", "test-image-digest", spy,
+		testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
+	ctx, cancel := context.WithCancel(context.Background())
+	held := heldSignal(bridge)
+
+	var want []string
+	for i := 0; i < capacity; i++ {
+		id := fmt.Sprintf("buffered-%d", i)
+		want = append(want, id)
+		if err := bridge.SendBestEffort(ctx, replayFrame(id)); err != nil {
+			t.Fatalf("SendBestEffort(%s) error = %v", id, err)
+		}
+	}
+	for i := 0; i < flood; i++ {
+		want = append(want, fmt.Sprintf("live-%d", i))
+	}
+
+	var replayWrites atomic.Int64
+	var senders errgroup.Group
+	floodDone := make(chan struct{})
+	var once sync.Once
+	wsbridge.SetFlushWriteHookForTest(bridge, func() {
+		replayWrites.Add(1)
+		once.Do(func() {
+			senders.Go(func() error {
+				defer close(floodDone)
+				for i := 0; i < flood; i++ {
+					if err := bridge.SendBestEffort(ctx, replayFrame(fmt.Sprintf("live-%d", i))); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			select {
+			case <-held:
+			case <-floodDone:
+			case <-time.After(testWait):
+				t.Error("the flooding sender was neither held nor done")
+			}
+		})
+	})
+
+	wait := runInBackground(ctx, bridge)
+	got := waitChan(t, gotCh, 30*time.Second)
+
+	if n := replayWrites.Load(); n != int64(capacity)+1 {
+		t.Errorf("the replay wrote %d entries, want %d (the %d buffered at connect, plus the held sender's one)", n, capacity+1, capacity)
+	}
+	if len(got) != len(want) {
+		t.Errorf("conn1 received %d frames, want %d (every buffered and every flooded frame)", len(got), len(want))
+	} else if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("conn1 received the frames out of send order")
+	}
+	deadline := time.Now().Add(testWait)
+	for time.Now().Before(deadline) && len(spy.stopsSnapshot()) == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if stops := spy.stopsSnapshot(); len(stops) != 1 {
+		t.Errorf("HandleStop called %d times, want 1 (the stop sent right after ready, read once the replay ended)", len(stops))
+	}
+
+	cancel()
+	if err := wait(); err != nil {
+		t.Errorf("Run() error = %v, want nil after ctx cancellation", err)
+	}
+	if err := senders.Wait(); err != nil {
+		t.Errorf("SendBestEffort error = %v", err)
+	}
+}
+
+// TestRun_HeldSendIsReleasedWhenTheReplayFails pins the other way a replay
+// ends: a failed write. The send held behind it must return then, not wait
+// for a replay that will never catch up -- a sender stuck there would stall
+// whatever produced the event (the runtime's event stream) until the
+// process ended. Its entry stays buffered for the next connection. The
+// sender's context stays live throughout, so only the replay's end can
+// release it.
+func TestRun_HeldSendIsReleasedWhenTheReplayFails(t *testing.T) {
+	t.Parallel()
+
+	fake := &stepServer{fallback: absorbForever}
+	server := httptest.NewServer(fake)
+	t.Cleanup(server.Close)
+
+	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", "test-agent-version", "test-image-digest", noopHandler{},
+		testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
+	held := heldSignal(bridge)
+	for i := 0; i < 50; i++ {
+		if err := bridge.SendBestEffort(context.Background(), replayFrame(fmt.Sprintf("buffered-%d", i))); err != nil {
+			t.Fatalf("SendBestEffort(buffered-%d) error = %v", i, err)
+		}
+	}
+
+	// Run's context is canceled mid-replay, so the replay's next write fails.
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	var senders errgroup.Group
+	var sendDone <-chan struct{}
+	var once sync.Once
+	wsbridge.SetFlushWriteHookForTest(bridge, func() {
+		once.Do(func() {
+			sendDone = startSend(context.Background(), &senders, bridge, "held")
+			select {
+			case <-held:
+			case <-sendDone:
+				t.Error("the send made mid-replay returned before the replay ended, want it held")
+			case <-time.After(testWait):
+				t.Error("the send made mid-replay was never held")
+			}
+			cancelRun()
+		})
+	})
+
+	if err := runInBackground(runCtx, bridge)(); err != nil {
+		t.Errorf("Run() error = %v, want nil after ctx cancellation", err)
+	}
+	select {
+	case <-sendDone:
+	case <-time.After(testWait):
+		t.Fatal("the held send never returned after its replay failed")
+	}
+	if err := senders.Wait(); err != nil {
+		t.Errorf("SendBestEffort error = %v", err)
+	}
+}

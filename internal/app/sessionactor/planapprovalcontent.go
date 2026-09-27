@@ -68,12 +68,16 @@ const planContentEventFetchLimit = 2000
 // tokenEventPayload is the minimal shape this function reads out of a
 // "token" event's own raw payload (contracts/sandbox-ws/v1/events.schema.
 // json's own Token shape) -- Text is CUMULATIVE per messageId (§6.1: "text
-// is CUMULATIVE, not a delta"), so the LAST token event (by event id, i.e.
-// arrival order) for the producing turn's own span is already the full,
-// final rendered text of whichever assistant message it belongs to.
+// is CUMULATIVE, not a delta"), so a text part's newest frame is already
+// its full text so far. MessageID is the part's id, which every frame of
+// the part carries in its payload, unlike the events.message_id storage
+// key (sessionactor/tokenframe.go): plandomain.ExtractContent groups the
+// frames by it to tell which part opened last, since the newest row
+// is not always the last part's (see that function's doc comment).
 type tokenEventPayload struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type      string `json:"type"`
+	MessageID string `json:"messageId"`
+	Text      string `json:"text"`
 }
 
 // planContentText best-effort recovers processing's own final streamed
@@ -117,10 +121,12 @@ func (a *Actor) planContentText(ctx context.Context, processing sqlcgen.Turn) st
 // UI's own second caller (internal/adapters/inbound/httpapi/plans.go) also reuses,
 // so the sqlcgen.Event -> plandomain.ContentEvent boundary conversion
 // itself never drifts between the two call sites either. A "token" event
-// whose payload fails to decode degrades to an empty Text (silently
-// skipped by ExtractContent, exactly like this function's own prior
-// inline `continue` on a decode error), never propagated as an error --
-// matching this file's own "never fails the caller" discipline.
+// carries its payload's messageId (the text part's id) and text; every
+// other event type carries neither. A "token" event whose payload fails to
+// decode degrades to an empty Text (silently skipped by ExtractContent,
+// exactly like this function's own prior inline `continue` on a decode
+// error), never propagated as an error -- matching this file's own "never
+// fails the caller" discipline.
 func ToContentEvents(events []sqlcgen.Event) []plandomain.ContentEvent {
 	out := make([]plandomain.ContentEvent, len(events))
 	for i, e := range events {
@@ -128,6 +134,7 @@ func ToContentEvents(events []sqlcgen.Event) []plandomain.ContentEvent {
 		if e.Type == "token" {
 			var tok tokenEventPayload
 			if err := json.Unmarshal(e.Payload, &tok); err == nil {
+				ce.MessageID = tok.MessageID
 				ce.Text = tok.Text
 			}
 		}

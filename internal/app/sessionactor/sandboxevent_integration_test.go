@@ -96,7 +96,18 @@ func TestHandleSandboxEvent_FullRoundTrip(t *testing.T) {
 	}
 
 	// --- (a) a non-critical, non-transitioning event still persists and
-	// bumps last_seen_at, produces no ack. ---
+	// bumps last_seen_at, produces no ack. `token` is stored only while a
+	// turn is Processing (tokenframe.go): with none, the frame is still
+	// handled -- liveness bumped, no ack -- but adds no row. ---
+	lateRaw := json.RawMessage(`{"type":"token","messageId":"tok-0","sessionId":"s","gen":1}`)
+	if outcome := send(t, SandboxEvent{Type: "token", Gen: 1, MessageID: "tok-0", Raw: lateRaw}); !outcome.Persisted || outcome.AckID != "" {
+		t.Errorf("token with no turn Processing: outcome = %+v, want handled (Persisted) with no ack", outcome)
+	}
+	if got := countEvents("token"); got != 0 {
+		t.Errorf("token event count with no turn Processing = %d, want 0", got)
+	}
+	createProcessingTurn(ctx, t, narvipg.NewTurnStore(pool), sessionID)
+
 	beforeToken, err := sandboxStore.Get(ctx, sessionID)
 	if err != nil {
 		t.Fatalf("get sandbox: %v", err)

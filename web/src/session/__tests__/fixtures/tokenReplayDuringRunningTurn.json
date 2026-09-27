@@ -1,0 +1,88 @@
+[
+  {
+    "id": 1,
+    "type": "step_start",
+    "payload": {
+      "gen": 1,
+      "messageId": "msg_s1",
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "stepId": "s1",
+      "type": "step_start"
+    },
+    "createdAt": "2026-09-27T10:00:00Z"
+  },
+  {
+    "id": 2,
+    "type": "token",
+    "payload": {
+      "gen": 1,
+      "messageId": "prt_a",
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "text": "",
+      "type": "token"
+    },
+    "createdAt": "2026-09-27T10:00:00Z"
+  },
+  {
+    "id": 3,
+    "type": "step_start",
+    "payload": {
+      "gen": 1,
+      "messageId": "msg_s2",
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "stepId": "s2",
+      "type": "step_start"
+    },
+    "createdAt": "2026-09-27T10:00:00Z"
+  },
+  {
+    "id": 4,
+    "type": "token",
+    "payload": {
+      "gen": 1,
+      "messageId": "prt_b",
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "text": "",
+      "type": "token"
+    },
+    "createdAt": "2026-09-27T10:00:00Z"
+  },
+  {
+    "id": 5,
+    "type": "token",
+    "payload": {
+      "gen": 1,
+      "messageId": "prt_a",
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "text": "Step one narration.",
+      "type": "token"
+    },
+    "createdAt": "2026-09-27T10:00:00Z"
+  },
+  {
+    "id": 6,
+    "type": "token",
+    "payload": {
+      "gen": 1,
+      "messageId": "prt_b",
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "text": "Step two answer.",
+      "type": "token"
+    },
+    "createdAt": "2026-09-27T10:00:00Z"
+  },
+  {
+    "id": 7,
+    "type": "execution_complete",
+    "payload": {
+      "ackId": "execution_complete:msg_done",
+      "gen": 1,
+      "messageId": "msg_done",
+      "outcome": "completed",
+      "reason": null,
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "type": "execution_complete"
+    },
+    "createdAt": "2026-09-27T10:00:00Z"
+  }
+]
