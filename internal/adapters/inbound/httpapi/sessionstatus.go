@@ -424,13 +424,24 @@ func lastRunDTO(facts sqlcgen.GetSessionActivityFactsRow) *restdtos.SessionActiv
 	return out
 }
 
-// lastRunFailureReason is sessions.failure_reason, and only when it can
-// describe nothing but the last run: a turn row has no reason column, and
-// the session's reason is that of whichever turn its status was last
+// lastRunFailureReason is SessionActivity.lastRun.failureReason:
+// lastRunFailureReasonValue, on the wire.
+func lastRunFailureReason(facts sqlcgen.GetSessionActivityFactsRow) *restdtos.SessionActivityLastRunFailureReason {
+	reason := lastRunFailureReasonValue(facts)
+	if reason == nil {
+		return nil
+	}
+	return &restdtos.SessionActivityLastRunFailureReason{Value: *reason}
+}
+
+// lastRunFailureReasonValue is sessions.failure_reason, and only when it
+// can describe nothing but the last run: a turn row has no reason column,
+// and the session's reason is that of whichever turn its status was last
 // derived from. So it is given only when the last run is the session's
 // newest turn, did not complete, and the session's recorded outcome is
-// that very outcome (failed or cancelled); nil otherwise.
-func lastRunFailureReason(facts sqlcgen.GetSessionActivityFactsRow) *restdtos.SessionActivityLastRunFailureReason {
+// that very outcome (failed or cancelled); nil otherwise. The one rule for
+// both the status's lastRun and the result's (sessionresult.go).
+func lastRunFailureReasonValue(facts sqlcgen.GetSessionActivityFactsRow) *string {
 	if !facts.LastRunTurnID.Valid || facts.LastRunTurnID != facts.NewestTurnID || facts.SessionFailureReason == nil {
 		return nil
 	}
@@ -446,5 +457,6 @@ func lastRunFailureReason(facts sqlcgen.GetSessionActivityFactsRow) *restdtos.Se
 	if facts.SessionStatus != recorded {
 		return nil
 	}
-	return &restdtos.SessionActivityLastRunFailureReason{Value: string(*facts.SessionFailureReason)}
+	reason := string(*facts.SessionFailureReason)
+	return &reason
 }

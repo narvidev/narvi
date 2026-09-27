@@ -174,6 +174,37 @@ negative or malformed value is refused.
 {"name": "Get what a session is doing now, and when to ask again", "route": "GET /api/sessions/{sessionID}/status"}
 ```
 
+The result route says what a session has produced. `lastRun` is the
+last turn that ended: how it ended (and why, when the session's own
+recorded reason can only be that turn's), when it started and finished,
+what it cost, and a `summary` — the turn's final text, copied as the
+agent wrote it, cut at 4,000 characters with `truncated` set. It is
+never written by a model; the whole text stays in the events route.
+`activity` is the status's, from the same moment, so you can tell
+whether the result can still change.
+
+`pullRequests` lists the pull requests the session opened, and
+`reviewedPullRequest` the one it reviews, if it is a pull request's
+review session. `reviewScope` says which of these apply — `none` means
+there is nothing to review, which is not the same as a clean review.
+Each pull request carries its `review`: `absent` (never reviewed),
+`in_progress` (a review is running), `not_assessed` (the latest review
+ended without a verdict; an older one, if any, is in
+`supersededVerdict`, and is not the answer) or `assessed`, with the
+verdict. An assessed verdict has a `freshness`, checked against GitHub on
+every read, the same check a merge makes: `current` (the pull request
+still matches what was reviewed), `stale` (it has moved on — a new push,
+a changed base, or an older policy — with the reason), `unconfirmed` (it
+could not be checked, or the verdict predates the details needed to
+check it, with the reason) or `not_applicable` (no assessed verdict, or
+the pull request is merged or closed). A verdict is never `current`
+unless GitHub confirmed it during that read. The result never carries
+the session's events.
+
+```json narvi-command
+{"name": "Get what a session produced, and its review verdicts", "route": "GET /api/sessions/{sessionID}/result"}
+```
+
 ```json narvi-command
 {"name": "List a session's events", "route": "GET /api/sessions/{sessionID}/events"}
 ```

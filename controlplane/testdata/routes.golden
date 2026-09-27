@@ -61,6 +61,7 @@ GET /api/sessions/{sessionID}/artifacts
 GET /api/sessions/{sessionID}/events
 GET /api/sessions/{sessionID}/plans
 GET /api/sessions/{sessionID}/release-manifest
+GET /api/sessions/{sessionID}/result
 GET /api/sessions/{sessionID}/review
 GET /api/sessions/{sessionID}/status
 GET /api/sessions/{sessionID}/uploads/{uploadID}/content

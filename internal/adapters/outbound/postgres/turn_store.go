@@ -61,6 +61,15 @@ func (s *TurnStore) ExistsNewerReviewAttempt(ctx context.Context, sessionID pgty
 	})
 }
 
+// NewestReviewAttempt returns sessionID's newest genuine review attempt
+// (is_review_attempt = true): its id, state and creation time -- see
+// GetNewestReviewAttempt's own generated doc comment (queries/turns.sql).
+// pgx.ErrNoRows means the session has run no review attempt. Its caller is
+// row 182's result (httpapi.GetSessionResult, technical plan §43.20).
+func (s *TurnStore) NewestReviewAttempt(ctx context.Context, sessionID pgtype.UUID) (sqlcgen.GetNewestReviewAttemptRow, error) {
+	return s.q.GetNewestReviewAttempt(ctx, sessionID)
+}
+
 // UpdateStatus sets a turn's status, plus dispatched_at/completed_at when
 // the caller supplies one (see UpdateTurnStatusParams' generated doc for
 // the COALESCE semantics).

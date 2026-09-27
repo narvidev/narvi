@@ -1,0 +1,566 @@
+package httpapi
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/app/reviewfreshness"
+	appreviewtriage "github.com/narvidev/narvi/internal/app/reviewtriage"
+	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
+	"github.com/narvidev/narvi/internal/app/sessionactor"
+	plandomain "github.com/narvidev/narvi/internal/domain/plan"
+	"github.com/narvidev/narvi/internal/domain/reposource"
+	"github.com/narvidev/narvi/internal/domain/reviewverdict"
+	"github.com/narvidev/narvi/internal/domain/session"
+	"github.com/narvidev/narvi/internal/domain/turn"
+	"github.com/narvidev/narvi/internal/platform"
+)
+
+// resultSummaryMaxChars is the most characters (Unicode code points) a
+// result's summary carries (row 182's owner decision D7): the last run's
+// final text, cut here and marked truncated, so a result stays a bounded
+// read and never grows into the transcript. The full text stays in the
+// event history (GET /api/sessions/{sessionID}/events).
+const resultSummaryMaxChars = 4000
+
+// SessionResultDeps is what GET /api/sessions/{sessionID}/result reads:
+// Postgres (Pool, for the one read-only snapshot, and the stores read in
+// it), and the code host for the one live read, a verdict's freshness --
+// SourceControl (nil when none is configured: freshness then reads
+// unconfirmed) with BotToken, the credential the code-review view and the
+// auto-merge worker read pull requests with.
+type SessionResultDeps struct {
+	Pool           *pgxpool.Pool
+	Sessions       *postgres.SessionStore
+	Turns          *postgres.TurnStore
+	Events         *postgres.EventStore
+	Artifacts      *postgres.ArtifactStore
+	PRSessions     *postgres.GitHubPRSessionStore
+	ReviewVerdicts *postgres.ReviewVerdictStore
+	SourceControl  ports.SourceControl
+	BotToken       string
+	Timeouts       platform.Timeouts
+}
+
+// GetSessionResult backs GET /api/sessions/{sessionID}/result (technical
+// plan §43.20, row 182's result): what one session has produced, as
+// restdtos.SessionOutcome -- its activity, its last run with a bounded
+// summary, the pull requests it opened, the pull request it reviews, and
+// each one's review verdict with that verdict's freshness, or its absence.
+// It is also the twin of the narvi_get_session_result MCP tool.
+//
+// The same gate as GetSession (get.go) and GetSessionStatus, deliberately:
+// signed in, 400 on a malformed id, 404 when the session does not exist,
+// no per-session visibility beyond that, because this codebase has none.
+// The verdict data it copies is what GET /api/sessions/{sessionID}/review
+// shows every role (authz.ActionViewAnalytics), read the same way
+// (GetLatestRecord, owner decision D10).
+//
+// Every stored fact comes from ONE repeatable-read, read-only transaction:
+// the activity (the status route's own statement and derivation), the last
+// run, its events, the pull request artifacts, the review claims, attempts
+// and verdicts -- one snapshot, so the summary is read inside the run's own
+// window as the snapshot saw it, and a review state never mixes an attempt
+// from one instant with a verdict from another. The transaction ends
+// before anything else happens. Then, outside it, each assessed verdict's
+// freshness is read live (reviewfreshness.Assess: the merge path's own
+// live read and comparison), concurrently, each read bounded by the
+// platform.Timeouts constants the merge path uses; a failed or timed-out
+// read reports the verdict unconfirmed, never current (owner decision D6).
+//
+// The response carries no events: the summary is the last run's final
+// text, read by plandomain.FinalText -- the one reader of a turn's final
+// text, which the plan views use too -- and cut at resultSummaryMaxChars
+// (owner decision D7).
+func GetSessionResult(deps SessionResultDeps) http.HandlerFunc {
+	bounds := statusBoundsFrom(deps.Timeouts)
+	freshnessDeps := reviewfreshness.Deps{SourceControl: deps.SourceControl, Token: deps.BotToken, Timeouts: deps.Timeouts}
+	return func(w http.ResponseWriter, r *http.Request) {
+		sessionID, ok := parseSessionID(w, r)
+		if !ok {
+			return
+		}
+		ctx := platform.WithSessionID(r.Context(), sessionID.String())
+		logger := platform.Logger(ctx)
+
+		var snap resultSnapshot
+		err := pgx.BeginTxFunc(ctx, deps.Pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
+			var err error
+			snap, err = readResultSnapshot(ctx, deps, tx, sessionID, bounds)
+			return err
+		})
+		if err != nil {
+			var unreadable *unreadableResultError
+			switch {
+			case errors.Is(err, pgx.ErrNoRows):
+				writeError(w, http.StatusNotFound, "session not found")
+			case ctx.Err() != nil:
+				logger.Debug("httpapi: session result read ended with its request", "error", err)
+				writeError(w, http.StatusServiceUnavailable, "request cancelled")
+			case errors.As(err, &unreadable):
+				logger.Error("httpapi: session result facts are unreadable", "error", unreadable.err)
+				writeError(w, http.StatusInternalServerError, "internal error")
+			default:
+				logger.Error("httpapi: read session result failed", "error", err)
+				writeError(w, http.StatusInternalServerError, "internal error")
+			}
+			return
+		}
+
+		// The live reads, outside the transaction: one per assessed
+		// verdict, each writing only its own review's freshness.
+		g, gctx := errgroup.WithContext(ctx)
+		for _, pending := range snap.live {
+			g.Go(func() error {
+				pending.review.Freshness = freshnessDTO(reviewfreshness.Assess(gctx, freshnessDeps, pending.record, pending.pr))
+				return nil
+			})
+		}
+		_ = g.Wait() // no goroutine returns an error: Assess never fails
+
+		writeJSON(w, http.StatusOK, snap.outcome)
+	}
+}
+
+// unreadableResultError marks a row this build could not decode -- this
+// build's defect, not the database's -- so it is logged as such.
+type unreadableResultError struct{ err error }
+
+func (e *unreadableResultError) Error() string { return e.err.Error() }
+func (e *unreadableResultError) Unwrap() error { return e.err }
+
+// resultSnapshot is what the snapshot transaction read: the response with
+// every stored fact filled in, and the verdicts whose freshness is still
+// to be read live, each pointing at the review it belongs to.
+type resultSnapshot struct {
+	outcome *restdtos.SessionOutcome
+	live    []pendingFreshness
+}
+
+// pendingFreshness is one assessed verdict whose freshness is read live.
+type pendingFreshness struct {
+	review *restdtos.SessionOutcomeReview
+	record reviewverdict.Record
+	pr     reviewfreshness.PullRequest
+}
+
+// resultStores are the stores bound to the snapshot transaction.
+type resultStores struct {
+	sessions       *postgres.SessionStore
+	turns          *postgres.TurnStore
+	events         *postgres.EventStore
+	artifacts      *postgres.ArtifactStore
+	prSessions     *postgres.GitHubPRSessionStore
+	reviewVerdicts *postgres.ReviewVerdictStore
+}
+
+// readResultSnapshot reads every stored fact of the result on tx.
+func readResultSnapshot(ctx context.Context, deps SessionResultDeps, tx pgx.Tx, sessionID pgtype.UUID, bounds statusBounds) (resultSnapshot, error) {
+	st := resultStores{
+		sessions:       deps.Sessions.WithTx(tx),
+		turns:          deps.Turns.WithTx(tx),
+		events:         deps.Events.WithTx(tx),
+		artifacts:      deps.Artifacts.WithTx(tx),
+		prSessions:     deps.PRSessions.WithTx(tx),
+		reviewVerdicts: deps.ReviewVerdicts.WithTx(tx),
+	}
+
+	// The activity: the status route's own statement and derivation, so the
+	// result says exactly what the status would at this snapshot.
+	facts, err := st.sessions.ActivityFacts(ctx, sessionID, sessionactor.ReviewAutoRetriggerBudget)
+	if err != nil {
+		return resultSnapshot{}, err
+	}
+	in, _, err := activityInput(facts, bounds)
+	if err != nil {
+		return resultSnapshot{}, &unreadableResultError{err: err}
+	}
+	sessionRow, err := st.sessions.Get(ctx, sessionID)
+	if err != nil {
+		return resultSnapshot{}, err
+	}
+
+	outcome := &restdtos.SessionOutcome{
+		SessionId:    sessionID.String(),
+		Activity:     restdtos.SessionOutcomeActivity(session.DeriveActivity(in)),
+		PullRequests: []restdtos.SessionOutcomePullRequest{},
+	}
+	if outcome.LastRun, err = readLastRun(ctx, st, sessionID, facts); err != nil {
+		return resultSnapshot{}, err
+	}
+
+	// The pull requests the session opened, oldest first.
+	artifacts, err := st.artifacts.ListForSession(ctx, sessionID)
+	if err != nil {
+		return resultSnapshot{}, err
+	}
+	var produced []producedPR
+	for _, a := range artifacts {
+		if a.Type != sqlcgen.ArtifactTypePr {
+			continue
+		}
+		pr, err := producedPRFromArtifact(a, sessionRow.Repos)
+		if err != nil {
+			return resultSnapshot{}, &unreadableResultError{err: err}
+		}
+		produced = append(produced, pr)
+	}
+
+	var live []pendingFreshness
+	outcome.PullRequests = make([]restdtos.SessionOutcomePullRequest, len(produced))
+	for i, pr := range produced {
+		review, pending, err := readReview(ctx, st, pr.repoFullName, pr.number, nil)
+		if err != nil {
+			return resultSnapshot{}, err
+		}
+		outcome.PullRequests[i] = restdtos.SessionOutcomePullRequest{
+			RepoFullName: pr.repoFullName,
+			Number:       int(pr.number),
+			Url:          pr.url,
+			CreatedAt:    pr.createdAt,
+			Review:       review,
+		}
+		if pending != nil {
+			pending.review = &outcome.PullRequests[i].Review
+			live = append(live, *pending)
+		}
+	}
+
+	// The pull request this session is the review session of, if any.
+	claim, err := st.prSessions.GetBySessionID(ctx, sessionID)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+	case err != nil:
+		return resultSnapshot{}, err
+	default:
+		review, pending, err := readReview(ctx, st, claim.RepoFullName, claim.PrNumber, &claim)
+		if err != nil {
+			return resultSnapshot{}, err
+		}
+		outcome.ReviewedPullRequest = &restdtos.SessionOutcomeReviewedPullRequest{
+			RepoFullName: claim.RepoFullName,
+			Number:       int(claim.PrNumber),
+			Review:       review,
+		}
+		if pending != nil {
+			pending.review = &outcome.ReviewedPullRequest.Review
+			live = append(live, *pending)
+		}
+	}
+
+	outcome.ReviewScope = reviewScope(outcome)
+	return resultSnapshot{outcome: outcome, live: live}, nil
+}
+
+// reviewScope says which pull requests the result reports verdicts for:
+// the one the session reviews, else the ones it opened, else none -- said
+// explicitly, so an empty list never reads as a clean review.
+func reviewScope(outcome *restdtos.SessionOutcome) restdtos.SessionOutcomeReviewScope {
+	switch {
+	case outcome.ReviewedPullRequest != nil:
+		return restdtos.SessionOutcomeReviewScopeReviewed
+	case len(outcome.PullRequests) > 0:
+		return restdtos.SessionOutcomeReviewScopeProduced
+	default:
+		return restdtos.SessionOutcomeReviewScopeNone
+	}
+}
+
+// readLastRun renders the facts row's last run -- the newest terminal turn
+// -- with its turn row's timing, cost and mode, the status's own
+// failure-reason rule, and its summary; nil when no turn has ended.
+func readLastRun(ctx context.Context, st resultStores, sessionID pgtype.UUID, facts sqlcgen.GetSessionActivityFactsRow) (*restdtos.SessionOutcomeLastRun, error) {
+	if !facts.LastRunTurnID.Valid {
+		return nil, nil
+	}
+	turns, err := st.turns.ListForSession(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	var run *sqlcgen.Turn
+	for i := range turns {
+		if turns[i].ID == facts.LastRunTurnID {
+			run = &turns[i]
+			break
+		}
+	}
+	if run == nil {
+		return nil, &unreadableResultError{err: fmt.Errorf("last run %s is not among the session's turns", facts.LastRunTurnID.String())}
+	}
+
+	out := &restdtos.SessionOutcomeLastRun{
+		TurnId:   run.ID.String(),
+		Outcome:  restdtos.SessionOutcomeLastRunOutcome(run.Status),
+		PlanMode: run.PlanMode,
+	}
+	if reason := lastRunFailureReasonValue(facts); reason != nil {
+		out.FailureReason = &restdtos.SessionOutcomeLastRunFailureReason{Value: *reason}
+	}
+	if run.DispatchedAt.Valid {
+		at := run.DispatchedAt.Time
+		out.StartedAt = &at
+	}
+	if run.CompletedAt.Valid {
+		at := run.CompletedAt.Time
+		out.FinishedAt = &at
+	}
+	if cost, ok := appreviewtriage.NumericToFloat64(run.CostUsd); ok {
+		out.CostUsd = &cost
+	}
+
+	// The summary: the run's final text within its own window of the event
+	// log (turnContentBounds: its dispatch watermark, up to the next
+	// dispatched turn's), read by the one reader of a turn's final text. A
+	// run never dispatched has no window, and no text.
+	if lower, upper, ok := turnContentBounds(turns, run.ID); ok {
+		events, err := st.events.ListRecentForSession(ctx, sessionID, planContentEventFetchLimit)
+		if err != nil {
+			return nil, err
+		}
+		if text, found := plandomain.FinalText(sessionactor.ToContentEvents(events), lower, upper); found {
+			capped, truncated := capSummary(text)
+			out.Summary = restdtos.SessionOutcomeLastRunSummary{Text: &capped, Truncated: truncated}
+		}
+	}
+	return out, nil
+}
+
+// capSummary cuts text to at most resultSummaryMaxChars characters (code
+// points, never inside one), reporting whether it cut anything.
+func capSummary(text string) (string, bool) {
+	count := 0
+	for i := range text {
+		if count == resultSummaryMaxChars {
+			return text[:i], true
+		}
+		count++
+	}
+	return text, false
+}
+
+// readReview reads one pull request's review state from the record --
+// its review session's claim (claim, when the caller already holds it,
+// else looked up), that session's newest review attempt, whether that
+// attempt posted, and the latest verdict (GetLatestRecord, the review
+// readout's own read) -- and renders it. A verdict that is assessed and
+// whose pull request the claim does not record as merged or closed is
+// returned as pending: its freshness is read live after the snapshot.
+func readReview(ctx context.Context, st resultStores, repoFullName string, number int32, claim *sqlcgen.GithubPrSession) (restdtos.SessionOutcomeReview, *pendingFreshness, error) {
+	if claim == nil {
+		row, err := st.prSessions.GetByRepoAndPRNumber(ctx, repoFullName, number)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+		case err != nil:
+			return restdtos.SessionOutcomeReview{}, nil, err
+		default:
+			claim = &row
+		}
+	}
+
+	var attempt *reviewverdict.Attempt
+	if claim != nil && claim.SessionID.Valid {
+		row, err := st.turns.NewestReviewAttempt(ctx, claim.SessionID)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+		case err != nil:
+			return restdtos.SessionOutcomeReview{}, nil, err
+		default:
+			attempt = &reviewverdict.Attempt{ID: row.ID.String(), Terminal: turn.IsTerminal(turn.State(row.Status))}
+			if attempt.Terminal {
+				if attempt.Posted, err = st.reviewVerdicts.ExistsForAttempt(ctx, row.ID); err != nil {
+					return restdtos.SessionOutcomeReview{}, nil, err
+				}
+			}
+		}
+	}
+
+	var latest *reviewverdict.Record
+	record, ok, err := appreviewverdict.GetLatestRecord(ctx, appreviewverdict.Deps{ReviewVerdicts: st.reviewVerdicts}, repoFullName, number)
+	if err != nil {
+		return restdtos.SessionOutcomeReview{}, nil, err
+	}
+	if ok {
+		latest = &record
+	}
+
+	status := reviewverdict.DeriveReviewStatus(latest, attempt)
+	review := restdtos.SessionOutcomeReview{
+		State:     restdtos.SessionOutcomeReviewState(status.State),
+		Freshness: freshnessDTO(reviewfreshness.Assessment{State: reviewfreshness.StateNotApplicable}),
+	}
+	if status.Verdict != nil {
+		v := restdtos.SessionOutcomeReviewVerdict(verdictDTO(*status.Verdict))
+		review.Verdict = &v
+	}
+	if status.Superseded != nil {
+		v := restdtos.SessionOutcomeReviewSupersededVerdict(verdictDTO(*status.Superseded))
+		review.SupersededVerdict = &v
+	}
+	if status.State != reviewverdict.ReviewAssessed {
+		return review, nil, nil
+	}
+	if reason, closed := closedPerClaim(claim); closed {
+		review.Freshness = freshnessDTO(reviewfreshness.Assessment{State: reviewfreshness.StateNotApplicable, Reason: reason})
+		return review, nil, nil
+	}
+	owner, repo, ok := reposource.SplitFullName(repoFullName)
+	if !ok {
+		return restdtos.SessionOutcomeReview{}, nil, &unreadableResultError{err: fmt.Errorf("pull request repo %q is not owner/repo", repoFullName)}
+	}
+	return review, &pendingFreshness{record: *status.Verdict, pr: reviewfreshness.PullRequest{Owner: owner, Repo: repo, Number: int(number)}}, nil
+}
+
+// closedPerClaim reports a pull request the claim records as merged or
+// closed: its verdict's freshness is then moot, and nothing is read live.
+func closedPerClaim(claim *sqlcgen.GithubPrSession) (string, bool) {
+	switch {
+	case claim == nil:
+		return "", false
+	case claim.PrMerged != nil && *claim.PrMerged:
+		return "the pull request has been merged", true
+	case claim.PrClosedAt.Valid:
+		return "the pull request is closed", true
+	default:
+		return "", false
+	}
+}
+
+// freshnessDTO renders an Assessment; an empty reason is null.
+func freshnessDTO(a reviewfreshness.Assessment) restdtos.SessionOutcomeReviewFreshness {
+	out := restdtos.SessionOutcomeReviewFreshness{State: restdtos.SessionOutcomeReviewFreshnessState(a.State)}
+	if a.Reason != "" {
+		reason := a.Reason
+		out.Reason = &reason
+	}
+	return out
+}
+
+// verdictDTO copies one verdict record; a context field never recorded is
+// null.
+func verdictDTO(rec reviewverdict.Record) restdtos.SessionOutcomeVerdict {
+	out := restdtos.SessionOutcomeVerdict{
+		VerdictId: rec.ID,
+		HeadSha:   rec.HeadSHA,
+		RiskLevel: restdtos.SessionOutcomeVerdictRiskLevel(rec.Verdict.RiskLevel),
+		Shippable: restdtos.SessionOutcomeVerdictShippable(rec.Verdict.Shippable),
+		PostedAt:  rec.CreatedAt,
+		Context: restdtos.SessionOutcomeVerdictContext{
+			PolicyVersion:       rec.Context.PolicyVersion,
+			AncestorChainLength: len(rec.Context.AncestorChain),
+		},
+	}
+	if rec.AttemptID != "" {
+		attempt := rec.AttemptID
+		out.AttemptId = &attempt
+	}
+	if rec.Context.BaseRef != "" {
+		ref := rec.Context.BaseRef
+		out.Context.BaseRef = &ref
+	}
+	if rec.Context.BaseSHA != "" {
+		sha := rec.Context.BaseSHA
+		out.Context.BaseSha = &sha
+	}
+	return out
+}
+
+// producedPR is one pull request artifact, resolved.
+type producedPR struct {
+	repoFullName string
+	number       int32
+	url          string
+	createdAt    time.Time
+}
+
+// prArtifactMetadata is what the session actor records on a pull request
+// artifact (sessionactor.recordPRArtifact): the repository's bare name, as
+// reposource.ParseOwnerRepo read it from the session's own repo URL, and
+// the number.
+type prArtifactMetadata struct {
+	Repo   string `json:"repo"`
+	Number int32  `json:"number"`
+}
+
+// producedPRFromArtifact resolves a pull request artifact. The artifact
+// records the repository's bare name only; its owner is that of the
+// session's own repository of that name -- the exact derivation that
+// opened the pull request (reposource.ParseOwnerRepo over the repo URL) --
+// when exactly one of the session's repositories has it, else the one the
+// pull request's URL names (github.com/owner/repo/pull/N). The number is
+// the artifact's, else the URL's.
+func producedPRFromArtifact(a sqlcgen.Artifact, sessionRepos []byte) (producedPR, error) {
+	var meta prArtifactMetadata
+	if len(a.Metadata) > 0 {
+		if err := json.Unmarshal(a.Metadata, &meta); err != nil {
+			return producedPR{}, fmt.Errorf("pull request artifact %s: metadata: %w", a.ID.String(), err)
+		}
+	}
+	urlOwner, urlRepo, urlNumber, urlOK := parsePRURL(a.Url)
+	if meta.Repo == "" && urlOK {
+		meta.Repo = urlRepo
+	}
+	if meta.Number <= 0 && urlOK {
+		meta.Number = urlNumber
+	}
+	if meta.Repo == "" || meta.Number <= 0 {
+		return producedPR{}, fmt.Errorf("pull request artifact %s names no repository and number", a.ID.String())
+	}
+
+	owners := map[string]bool{}
+	for _, repo := range decodeSessionRepos(sessionRepos) {
+		if owner, name, err := reposource.ParseOwnerRepo(repo.Url); err == nil && name == meta.Repo {
+			owners[owner] = true
+		}
+	}
+	var owner string
+	switch {
+	case len(owners) == 1:
+		for o := range owners {
+			owner = o
+		}
+	case urlOK && urlRepo == meta.Repo:
+		owner = urlOwner
+	default:
+		return producedPR{}, fmt.Errorf("pull request artifact %s: the owner of %q is named by neither the session's repositories nor the URL", a.ID.String(), meta.Repo)
+	}
+	return producedPR{
+		repoFullName: owner + "/" + meta.Repo,
+		number:       meta.Number,
+		url:          a.Url,
+		createdAt:    a.CreatedAt.Time,
+	}, nil
+}
+
+// parsePRURL reads owner, repo and number from a pull request URL of the
+// form https://<host>/<owner>/<repo>/pull/<number>.
+func parsePRURL(raw string) (owner, repo string, number int32, ok bool) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", "", 0, false
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) != 4 || parts[0] == "" || parts[1] == "" || parts[2] != "pull" {
+		return "", "", 0, false
+	}
+	n, err := strconv.ParseInt(parts[3], 10, 32)
+	if err != nil || n <= 0 {
+		return "", "", 0, false
+	}
+	return parts[0], parts[1], int32(n), true
+}

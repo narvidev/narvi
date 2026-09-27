@@ -10,6 +10,49 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.9.0]
+
+### controlplane/testdata/routes.golden
+
+- Added: `GET /api/sessions/{sessionID}/result` -- what one session has
+  produced (technical plan §43.20, row 182's result). Answers the new
+  `SessionOutcome`; the same gate as `GET /api/sessions/{sessionID}`
+  (signed in, `400` for a malformed id, `404` for a session that does not
+  exist, no per-session visibility). It is also the twin of the new
+  `narvi_get_session_result` MCP tool. A route added, graded MINOR (row
+  41).
+
+### rest/v1/dtos.schema.json
+
+- Added: `SessionOutcome` -- the response of the result route above:
+  `activity` (`SessionActivity.activity` at the same snapshot, so a
+  reader knows whether the result can still change); `lastRun` (the last
+  turn that ended: outcome, `failureReason` under
+  `SessionActivity.lastRun.failureReason`'s rule, `startedAt`,
+  `finishedAt`, `costUsd` as `WorkflowStepRun.costUsd` reads it,
+  `planMode`, and `summary` -- the run's final text, copied as streamed,
+  never written by a model, cut at 4,000 characters with `truncated`);
+  `reviewScope` (`none`, `produced` or `reviewed`: `none` says there is
+  no pull request to review, so an empty list never reads as a clean
+  review); `pullRequests` (the pull requests the session opened); and
+  `reviewedPullRequest` (the one it is the review session of). Carries no
+  events. A `$defs` entry added, graded MINOR (row 32).
+- Added: `SessionOutcomePullRequest`, `SessionOutcomeReview` and
+  `SessionOutcomeVerdict` -- a pull request with its review:
+  `state` (`absent`, `in_progress`, `not_assessed` -- with the older
+  verdict in `supersededVerdict`, never the answer -- or `assessed`),
+  `verdict`, `supersededVerdict`, and `freshness` (`current` only when the
+  verdict's recorded context matched the pull request's live facts, read
+  from the code host in that call; `stale` or `unconfirmed` with a
+  `reason`; `not_applicable` for any state but `assessed`, or a merged or
+  closed pull request). A verdict copies its record: id, attempt, head,
+  risk level, shippable, when it was posted, and its context (base ref
+  and commit, null when never recorded; policy version; ancestor chain
+  length). `$defs` entries added, graded MINOR (row 32).
+- Added: `GetSessionResultToolRequest` -- the input schema of the new
+  `narvi_get_session_result` MCP tool (`sessionId`), whose output is
+  `SessionOutcome`. A `$defs` entry added, graded MINOR (row 32).
+
 ## [1.8.0]
 
 ### rest/v1/dtos.schema.json

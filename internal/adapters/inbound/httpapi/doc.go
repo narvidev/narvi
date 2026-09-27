@@ -33,6 +33,14 @@
 //     MCPWaitMaxDuration) have passed, on the replica's one
 //     sessionactivity.Waiter, answered with restdtos.SessionActivity.Wait
 //     set; 400 on a negative or malformed value.
+//   - GET /api/sessions/{sessionID}/result -- sessionresult.go's
+//     GetSessionResult (technical plan §43.20, row 182's piece (c)): 404 if
+//     not found, else 200 with restdtos.SessionOutcome -- the activity, the
+//     last run with its summary (its final text, capped), the pull requests
+//     the session opened or reviews, and each one's review state read from
+//     the record, all in one read-only snapshot; each assessed verdict's
+//     freshness read live (reviewfreshness.Assess, the merge path's own
+//     read and comparison). No events.
 //   - GET /api/sessions/{sessionID}/events?cursor=&limit= -- events.go's
 //     ListEvents: 404 if the session doesn't exist, else 200 with
 //     restdtos.EventsResponse (shaped exactly like client-ws/v1's own

@@ -151,3 +151,41 @@ func CheckFreshness(in FreshnessInput) Reason {
 	}
 	return ReasonNone
 }
+
+// FreshnessClass is what a CheckFreshness answer says about a verdict: that
+// it still describes the pull request, that it provably does not, or that
+// this could not be established.
+type FreshnessClass string
+
+// The three FreshnessClass values.
+const (
+	// FreshnessCurrent: the comparison passed. Only meaningful when the
+	// Current* side was live (CheckFreshness's own doc comment).
+	FreshnessCurrent FreshnessClass = "current"
+	// FreshnessStale: a recorded fact and a live one disagree -- the head
+	// moved, the base or the ancestor chain changed in a way not confirmed
+	// forward-only, or the policy that produced the verdict is not the
+	// current one.
+	FreshnessStale FreshnessClass = "stale"
+	// FreshnessUnconfirmed: a fact the comparison needs is missing on one
+	// side -- no context was recorded, a base commit or an ancestor link is
+	// unknown -- so it proves neither.
+	FreshnessUnconfirmed FreshnessClass = "unconfirmed"
+)
+
+// ClassifyFreshness sorts a CheckFreshness reason into its FreshnessClass,
+// following each Reason's own doc comment: the "changed" reasons are
+// stale; the "could not be established" reasons are unconfirmed. Any other
+// value -- ReasonNotAssessed, which a caller asking about an assessed
+// verdict never gets, or a reason this function does not know -- is
+// unconfirmed: never current by default.
+func ClassifyFreshness(reason Reason) FreshnessClass {
+	switch reason {
+	case ReasonNone:
+		return FreshnessCurrent
+	case ReasonStaleVerdict, ReasonBaseMoved, ReasonAncestorChainChanged, ReasonPolicyVersionMismatch:
+		return FreshnessStale
+	default:
+		return FreshnessUnconfirmed
+	}
+}

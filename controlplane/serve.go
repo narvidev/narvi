@@ -2025,6 +2025,23 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// itself behind a cookie check would break the sandbox-agent's own
 	// connection, which carries no cookie at all, only its own
 	// Authorization header.
+	// sessionResultDeps backs GET /api/sessions/{sessionID}/result and, in
+	// the /mcp wiring below, narvi_get_session_result's twin: the SAME
+	// stores every other session read uses, and the SAME sourceControl and
+	// bot token the auto-merge worker reads pull requests with, for the
+	// verdicts' live freshness (technical plan §43.20).
+	sessionResultDeps := httpapi.SessionResultDeps{
+		Pool:           pool,
+		Sessions:       sessionStore,
+		Turns:          turnStore,
+		Events:         eventStore,
+		Artifacts:      artifactStore,
+		PRSessions:     githubPRSessionStore,
+		ReviewVerdicts: reviewVerdictStore,
+		SourceControl:  sourceControl,
+		BotToken:       cfg.GitHubBotToken,
+		Timeouts:       cfg.Timeouts,
+	}
 	router.Route("/api/sessions", func(r chi.Router) {
 		r.Use(auth.Middleware(userSessionStore, userStore))
 		r.Post("/", httpapi.CreateSession(pool, sessionStore, turnStore, environmentStore, auditLogStore, registry, intentClassifierSvc, cfg.EpistemicCheckDefault, cfg.RolloutMode, repoSettingsStore, githubPRSessionStore))
@@ -2041,6 +2058,14 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// ?waitSeconds= it is the bounded wait, narvi_wait_for_session's
 		// twin, on the replica's one sessionWaiter.
 		r.Get("/{sessionID}/status", httpapi.GetSessionStatus(sessionStore, sessionWaiter, cfg.Timeouts))
+		// result (technical plan §43.20, row 182's result): the last run and
+		// its bounded summary, the pull requests the session opened or
+		// reviews, and each one's verdict with its freshness or its absence
+		// -- the same gate as GET /{sessionID}, and narvi_get_session_result's
+		// own twin. Stored facts come from one read-only snapshot; a verdict's
+		// freshness is read live through the SAME sourceControl and bot token
+		// the auto-merge worker and the code-review view use.
+		r.Get("/{sessionID}/result", httpapi.GetSessionResult(sessionResultDeps))
 		r.Get("/{sessionID}/events", httpapi.ListEvents(sessionStore, eventStore))
 		r.Get("/{sessionID}/artifacts", httpapi.ListArtifacts(sessionStore, artifactStore))
 		// uploads ("uploads, blob storage & the in-sandbox
