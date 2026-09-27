@@ -7656,27 +7656,67 @@ does not exist, and no per-session visibility beyond that, because there is none
 (§43.12) — a bearer token reaching it through the bridge never reads more than its user's cookie.
 
 **The derivation.** `session.DeriveActivity` is a pure function over one snapshot: how many of the
-session's turns are in each state, and whether a plan awaits approval, a workflow step awaits a
-decision, or a workflow escalation is still open (below). Highest first: a turn `dispatched` or
-`processing` → `running` (turns may be pending behind it); else a turn `pending` → `queued` — which
-covers the gap between one turn finishing and the next being dispatched, and a whole sandbox cold
-start; else a gate open → `awaiting_approval`; else no turn at all → `idle` (a session created without
-a prompt); else `finished`. A turn state the table does not know counts as in flight, mirroring
-`turn.IsTerminal`'s deny-list, so a busy session never reads settled because of a value this code
-does not recognize. A non-empty queue is therefore always `queued` or `running`, never `idle` or
+session's turns are in each state, whether a completed turn's push and pull request are still under
+way (below), and whether a plan awaits approval, a workflow step awaits a decision, or a workflow
+escalation is still open (below). Highest first: a turn `dispatched` or `processing` → `running`
+(turns may be pending behind it); else a turn `pending` → `queued` — which covers the gap between one
+turn finishing and the next being dispatched, and a whole sandbox cold start; else a delivery under way
+→ `delivering`; else a gate open → `awaiting_approval`; else no turn at all → `idle` (a session
+created without a prompt); else `finished`. A turn state the table does not know counts as in flight,
+mirroring `turn.IsTerminal`'s deny-list, so a busy session never reads settled because of a value this
+code does not recognize. A non-empty queue is therefore always `queued` or `running`, never `idle` or
 `finished`. `settled` is true for `idle`, `awaiting_approval` and `finished`: nothing progresses
 server-side until a person acts or sends new input.
+
+**A completed turn's delivery.** A successful turn's work is not done when the turn is: its branch is
+pushed and its pull request opened afterwards, outside the turn's own terminal transaction. The actor
+sends the push command once `execution_complete` has committed, and creates the pull request only when
+that push's `push_complete` arrives (`pushpr.go`: `sendPushBestEffort`, then `createPRBestEffort` —
+`ResolveBranchSHA`, `CreatePR`, the artifact row). Between the two a pull request appears with no new
+input from anyone, so that phase cannot read settled — `delivering`, with a 5 s delay. The existing
+`sandboxes.pending_push_suppressed_in_shadow` is the push's egress decision, not its progress: it is
+stamped for shadow and blocked cycles that send nothing, and it stays set after a failed push, so it
+cannot serve. The progress is its own column, `sandboxes.pr_delivery_started_at` (migration `000145`):
+stamped with the database's `now()` in the same transaction that completes the turn — so no snapshot
+holds that completed turn without it — and only when a push will really be sent (live egress, a creator
+whose push can authenticate, at least one repository with a branch); cleared once `createPRBestEffort`
+has finished, after the pull request's artifact row is written, so a status that no longer says
+`delivering` already lists the pull request; cleared as well when a `push_error` commits, when the
+push command cannot be sent, and when the sandbox is respawned (a replaced generation's push can never
+report back: its events are rejected as stale). A push that never reports back otherwise — its
+`push_complete` lost — leaves the stamp set, so the status reads it as a delivery only within
+`MCPStatusDeliveryWindow` of the snapshot's own instant (10 minutes; `session.PRDeliveryOpen`,
+measured in either direction so no clock step stretches it), and `finished` after that: it can never
+hold a session unsettled for good. `Validate` keeps that window above one repository's push and pull
+request at their own limits (`RepoCloneTimeout` + `RepoSHAResolutionTimeout` + `PRCreateTimeout`, with
+`MinTimeoutMargin`), so a slow one-repository delivery still within its timeouts never reads
+`finished` early (a session's repositories are pushed one after another, so several slow ones can
+outlast it). A
+delivery outranks a gate: the pull request appears whether or not a person acts on the plan or step
+beside it (`awaiting` still reports that gate). Narrowing `settled` to exclude this phase instead was
+rejected: row 182's wait (b) returns on `settled`, and its result (c) reports "the pull requests the
+session produced", so a `settled` that can precede the pull request would make both wrong. One stamp
+per sandbox describes the latest cycle: should a later turn complete before an earlier turn's
+`push_complete` arrives, the earlier one's pull request clears the later stamp, and that later delivery
+reads `finished` early — the behaviour before this phase existed, and only when two pushes overlap.
 
 **Which escalation is a gate.** A workflow run escalated to `needs_review` (§25.9) stays there: no
 route or job moves a run out of it — `/decide` acts only on a step awaiting a decision — and the next
 turn starts a fresh run beside the parked one (migration `000057`: a parked run must not freeze the
 session). Counting every such run would let one failed turn gate a session for good. So an escalation
-is a gate only while it is still the latest thing that happened on the session: its run is the
-session's newest workflow run, and the session's newest turn is one of that run's own attempts
-(`workflow_step_runs.turn_id`; runs and turns both ordered by `created_at`, then id, in the same
-snapshot). Any newer turn closes it — one that starts a run of its own, or one that starts none, such
-as a turn queued behind a running one or a plan's implementation turn. A person acts on an
-escalation by sending the session new work, and the gate is gone as soon as that work is queued.
+is a gate only while it is still the latest thing that happened on the session — no turn created since
+it escalated: its run is the session's newest workflow run, and the session's newest turn either is
+one of that run's own attempts (`workflow_step_runs.turn_id`, the turn whose end escalated it in the
+same transaction) or was created before the run escalated (`workflow_runs.updated_at`, which the
+escalation stamps and nothing writes again; runs and turns both ordered by `created_at`, then id, in
+the same snapshot). The second arm is a decision that escalates the run after a turn that is none of
+its attempts: one sent while a step awaited that decision, which the engine leaves untracked (no step
+run, no new run); `/decide approve` on a `blocked` outcome with no edge then escalates the run, and that
+escalation is the session's latest state. Any newer turn closes it — one that starts a run of its own,
+or one created after the escalation that starts none, such as a turn queued behind a running one or a
+plan's implementation turn. Both instants are the database's `now()`, each its transaction's start, so
+two transactions that overlap are ordered by which began first. A person acts on an escalation by
+sending the session new work, and the gate is gone as soon as that work is queued.
 
 A **built-in** workflow's escalation is never a gate. The built-ins are one passthrough step with no
 edge and no human gate of their own (§25.8), so their run escalates whenever that step's outcome is
@@ -7701,14 +7741,16 @@ such a commit and report a false `finished`. The statement reads aggregates and 
 the per-state turn counts as one JSON object (so a state added to the enum later still reaches the
 derivation as unknown, rather than being dropped), the first in-flight turn, the newest terminal turn,
 the newest turn, the oldest open plan and workflow step, the newest workflow run when it is an open
-escalation, the sandbox status — never the turn list, whose length is unbounded and whose rows carry
-prompts. Every lookup leads with `session_id` (or, for the escalation's own checks, a primary key or
-`workflow_run_id`) on an index that already exists; no migration.
+escalation, the sandbox status and its delivery stamp — never the turn list, whose length is unbounded
+and whose rows carry prompts. Every lookup leads with `session_id` (or, for the escalation's own
+checks, a primary key or `workflow_run_id`) on an index that already exists; the one migration is the
+delivery stamp's column (`000145`), read from the sandbox row the statement already joins.
 
 Beside `activity`, the response says how many turns are pending, which turn is in flight (and since
 when it was dispatched), which gate is open and since when (a plan first, then a workflow step, then
 an escalated run — a plan or a step reported whatever `activity` says, since either can be open while
-a turn is also queued, and an escalation no longer once a newer turn exists), how the newest terminal
+a turn is also queued or a delivery under way, and an escalation no longer once a turn has been created
+since it escalated), how the newest terminal
 turn ended (`lastRun`), the sandbox status in the same snapshot
 (informational; `activity` never derives from it), whether the session is archived, and `observedAt`,
 the database's clock at the snapshot. A turn row has no failure-reason column, so `lastRun.failureReason`
@@ -7719,11 +7761,12 @@ newest turn, did not complete, and the session's recorded outcome is that run's;
 again, from `session.SuggestedReadDelay`'s per-activity table: queued while no warm sandbox can take
 the turn (none yet, starting, suspect, stopped, failed — a cold start is bounded by
 `FirstConnectBudget`, minutes) 15 s; queued on a ready (or snapshotting) sandbox 5 s; running 10 s;
-awaiting a person 60 s; finished or idle 300 s — every suggestion clamped to [2 s, 300 s] and rounded
-up to whole seconds. All seven values are `platform.Timeouts` fields (`MCPStatusDelayStarting`,
-`…Queued`, `…Running`, `…AwaitingHuman`, `…Settled`, `…Floor`, `…Ceiling`), and `Validate` keeps the
-floor positive and every per-activity value inside the bounds, with no margin (these are seconds
-apart). It is a hint that keeps polling quiet, never a brake: a read that comes sooner is answered all
+delivering 5 s; awaiting a person 60 s; finished or idle 300 s — every suggestion clamped to [2 s,
+300 s] and rounded up to whole seconds. All eight values are `platform.Timeouts` fields
+(`MCPStatusDelayStarting`, `…Queued`, `…Running`, `…Delivering`, `…AwaitingHuman`, `…Settled`,
+`…Floor`, `…Ceiling`), and `Validate` keeps the floor positive and every per-activity value inside the
+bounds, with no margin (these are seconds apart); the delivery's bound, `MCPStatusDeliveryWindow`, is
+the ninth field, with its own link above. It is a hint that keeps polling quiet, never a brake: a read that comes sooner is answered all
 the same, because a `429` from a twin would reach an MCP client as `-32603` (§43.8), the very "looks
 broken" failure the row names. No jitter: the domain has no randomness (§11), and nothing at this
 scale needs it.
@@ -7752,14 +7795,21 @@ with it.
 
 **Tests.** Domain: `TestDeriveActivity_Table` (every combination above, unknown state → running, a
 queued follow-up under a completed history → queued), `TestDeriveActivity_NonEmptyQueueNeverIdleOrFinished`
-(every gate combination under every non-empty queue), `TestSuggestedReadDelay_Table`,
+(every gate and delivery combination under every non-empty queue), `TestPRDeliveryOpen_Table` (the
+window, both directions, no stamp, no window), `TestSuggestedReadDelay_Table`,
 `TestSuggestedReadDelay_AlwaysWithinBounds` (every activity × every sandbox status, with a table whose
 values fall outside the bounds). Timeouts: `TestTimeouts_Validate_MCPStatusDelay` (each link broken
-alone, reported by name). Postgres: `TestSessionActivityFacts_OneStatement` (an escalation a newer
-run and newer turns superseded is not reported beside the open plan and step),
-`TestSessionActivityFacts_LiveEscalation` (reported: a custom run whose own turn is the newest,
-including a later step's; not reported: a built-in run, a newer run with or without a turn of its own,
-a newer turn with no run, a run with no turn). REST, on real Postgres:
+alone, reported by name), `TestTimeouts_Validate_MCPStatusDeliveryWindow` (the window above one push
+and pull request with margin). Postgres: `TestSessionActivityFacts_OneStatement` (an escalation a newer
+run and newer turns superseded is not reported beside the open plan and step; the delivery stamp is
+read), `TestSessionActivityFacts_LiveEscalation` (reported: a custom run whose own turn is the newest,
+including a later step's, and one escalated after an untracked turn; not reported: a built-in run,
+even after an untracked turn, a newer run with or without a turn of its own, a newer turn with no run,
+a turn created after the escalation, a run with no turn), `TestSandboxPRDelivery_StartAndEnd`.
+The handler's decode, on synthetic rows: `TestSessionActivityToDTO_UnknownTurnStateReachesTheDerivation`
+(a state `turn_status` does not have yet reads `running`, never dropped),
+`TestSessionActivityToDTO_AwaitingPrecedence` (every gate combination: plan, then step, then
+escalation), `TestSessionActivityToDTO_DeliveryWindow`. REST, on real Postgres:
 `TestGetSessionStatus_FollowUpQueuedUnderCompletedRow` (the row says `completed` while a follow-up is
 queued, then dispatched, then processing: `queued`, `running`, `running`, then `finished` only once
 the turn is terminal), `TestGetSessionStatus_PlanCompletionNeverObservedAsFinished_Race` and
@@ -7770,7 +7820,17 @@ run of its own supersedes it), `TestGetSessionStatus_EscalatedTurnNeverGatesForG
 `CreateTurnCore`, `turn.Transition` and `workflowengine.OnTurnCompleted` in one terminal transaction,
 for a turn stopped by the user, failed, timed out and abandoned at dispatch, under the built-in and
 under a custom workflow: the built-in escalation reads `finished` at once, the custom one
-`awaiting_approval` until the follow-up is queued, and both `finished` once it completes). MCP:
+`awaiting_approval` until the follow-up is queued, and both `finished` once it completes),
+`TestGetSessionStatus_EscalationAfterAnUntrackedTurn` (a step awaiting a decision, a turn sent and
+completed meanwhile, then `/decide approve` escalating the run: `awaiting_approval` on the escalation),
+`TestGetSessionStatus_EscalationNeverObservedAsFinished_Race` (a turn's failure and its run's
+escalation in one transaction, the follow-up and its run in another, over and over, while readers
+poll: `finished` is never observed — reading the escalation in a second statement, in either order,
+is), `TestGetSessionStatus_DeliveryAfterACompletedTurn` (a real session actor: `delivering` from
+`execution_complete` until the pull request is recorded, the status read while `CreatePR` is held open
+included, then `finished` with the pull request listed; `finished` as soon as a `push_error` commits,
+at once for a shadow push and for a session with no branch, once the send fails, and once the window
+has passed for a push that never reports back). MCP:
 `TestEveryToolHasARegisteredTwin`, the tool-list golden,
 `TestToolsList_ScopeFilter_Table`, `TestHiddenToolCall_IsIndistinguishableFromUnknownTool`,
 `TestStatusOutputSchema_HasNoEvents`, `TestParity_BearerEqualsCookieForEveryRole` (both tools, every

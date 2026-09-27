@@ -41,6 +41,7 @@ import (
 // separate, paginated read.
 func GetSessionStatus(sessions *postgres.SessionStore, timeouts platform.Timeouts) http.HandlerFunc {
 	delays := statusDelayTable(timeouts)
+	deliveryWindow := timeouts.MCPStatusDeliveryWindow
 	return func(w http.ResponseWriter, r *http.Request) {
 		sessionID, ok := parseSessionID(w, r)
 		if !ok {
@@ -60,7 +61,7 @@ func GetSessionStatus(sessions *postgres.SessionStore, timeouts platform.Timeout
 			return
 		}
 
-		dto, err := sessionActivityToDTO(facts, delays)
+		dto, err := sessionActivityToDTO(facts, delays, deliveryWindow)
 		if err != nil {
 			logger.Error("httpapi: session activity facts are unreadable", "error", err)
 			writeError(w, http.StatusInternalServerError, "internal error")
@@ -77,6 +78,7 @@ func statusDelayTable(t platform.Timeouts) session.DelayTable {
 		Starting:      t.MCPStatusDelayStarting,
 		Queued:        t.MCPStatusDelayQueued,
 		Running:       t.MCPStatusDelayRunning,
+		Delivering:    t.MCPStatusDelayDelivering,
 		AwaitingHuman: t.MCPStatusDelayAwaitingHuman,
 		Settled:       t.MCPStatusDelaySettled,
 		Floor:         t.MCPStatusDelayFloor,
@@ -85,9 +87,13 @@ func statusDelayTable(t platform.Timeouts) session.DelayTable {
 }
 
 // activityInput is session.ActivityInput from one facts row: the turn
-// histogram as the snapshot counted it, and each human gate as "an id was
-// found". sessions.status is not an input.
-func activityInput(facts sqlcgen.GetSessionActivityFactsRow) (session.ActivityInput, error) {
+// histogram as the snapshot counted it -- every state it holds, one this
+// code does not know included, so DeriveActivity can count that one as in
+// flight -- each human gate as "an id was found", and a completed turn's
+// push/PR delivery as under way while its stamp is within deliveryWindow
+// of the snapshot's own instant (session.PRDeliveryOpen; both instants are
+// the database's clock). sessions.status is not an input.
+func activityInput(facts sqlcgen.GetSessionActivityFactsRow, deliveryWindow time.Duration) (session.ActivityInput, error) {
 	var raw map[string]int64
 	if err := json.Unmarshal(facts.TurnCounts, &raw); err != nil {
 		return session.ActivityInput{}, fmt.Errorf("decode turn counts %q: %w", facts.TurnCounts, err)
@@ -96,18 +102,23 @@ func activityInput(facts sqlcgen.GetSessionActivityFactsRow) (session.ActivityIn
 	for state, n := range raw {
 		counts[turn.State(state)] = int(n)
 	}
+	var deliveryStartedAt time.Time
+	if facts.PrDeliveryStartedAt.Valid {
+		deliveryStartedAt = facts.PrDeliveryStartedAt.Time
+	}
 	return session.ActivityInput{
 		TurnCounts:                   counts,
 		PlanAwaitingApproval:         facts.AwaitingPlanID.Valid,
 		WorkflowStepAwaitingDecision: facts.AwaitingStepID.Valid,
 		WorkflowEscalationOpen:       facts.EscalatedRunID.Valid,
+		PRDeliveryInProgress:         session.PRDeliveryOpen(deliveryStartedAt, facts.ObservedAt.Time, deliveryWindow),
 	}, nil
 }
 
 // sessionActivityToDTO derives the activity and the suggested delay from
 // one facts row and renders restdtos.SessionActivity.
-func sessionActivityToDTO(facts sqlcgen.GetSessionActivityFactsRow, delays session.DelayTable) (restdtos.SessionActivity, error) {
-	in, err := activityInput(facts)
+func sessionActivityToDTO(facts sqlcgen.GetSessionActivityFactsRow, delays session.DelayTable, deliveryWindow time.Duration) (restdtos.SessionActivity, error) {
+	in, err := activityInput(facts, deliveryWindow)
 	if err != nil {
 		return restdtos.SessionActivity{}, err
 	}

@@ -207,7 +207,7 @@ func newSeen() map[restdtos.SessionActivityActivity]*atomic.Int64 {
 	seen := map[restdtos.SessionActivityActivity]*atomic.Int64{}
 	for _, a := range []restdtos.SessionActivityActivity{
 		restdtos.SessionActivityActivityIdle, restdtos.SessionActivityActivityQueued, restdtos.SessionActivityActivityRunning,
-		restdtos.SessionActivityActivityAwaitingApproval, restdtos.SessionActivityActivityFinished,
+		restdtos.SessionActivityActivityDelivering, restdtos.SessionActivityActivityAwaitingApproval, restdtos.SessionActivityActivityFinished,
 	} {
 		seen[a] = &atomic.Int64{}
 	}
@@ -284,12 +284,20 @@ func sessionRuns(ctx context.Context, t *testing.T, rig testRig, sessionID pgtyp
 // the engine runs under it, and the workflow's id.
 func customWorkflowSession(ctx context.Context, t *testing.T, rig testRig, ownerID pgtype.UUID) (sqlcgen.Session, pgtype.UUID) {
 	t.Helper()
+	return customWorkflowSessionGated(ctx, t, rig, ownerID, false)
+}
+
+// customWorkflowSessionGated is customWorkflowSession whose one step can
+// carry a human gate after it (hitlAfter): its turn's end then parks the
+// step awaiting a decision, which POST .../decide settles.
+func customWorkflowSessionGated(ctx context.Context, t *testing.T, rig testRig, ownerID pgtype.UUID, hitlAfter bool) (sqlcgen.Session, pgtype.UUID) {
+	t.Helper()
 	repo := fmt.Sprintf("example/status-escalation-%d", time.Now().UnixNano())
 	var defID pgtype.UUID
 	if err := rig.pool.QueryRow(ctx, `INSERT INTO workflow_definitions (lane, name, is_built_in, version) VALUES ('request', $1, false, 1) RETURNING id`, repo).Scan(&defID); err != nil {
 		t.Fatalf("insert custom workflow definition: %v", err)
 	}
-	if _, err := rig.pool.Exec(ctx, `INSERT INTO workflow_step_definitions (workflow_definition_id, step_order, kind, prompt_template) VALUES ($1, 1, 'agent', '{{prompt}}')`, defID); err != nil {
+	if _, err := rig.pool.Exec(ctx, `INSERT INTO workflow_step_definitions (workflow_definition_id, step_order, kind, prompt_template, hitl_after) VALUES ($1, 1, 'agent', '{{prompt}}', $2)`, defID, hitlAfter); err != nil {
 		t.Fatalf("insert custom step definition: %v", err)
 	}
 	if _, err := rig.pool.Exec(ctx, `INSERT INTO workflow_bindings (lane, repo_full_name, workflow_definition_id, definition_version) VALUES ('request', $1, $2, 1)`, repo, defID); err != nil {
@@ -555,6 +563,41 @@ func TestGetSessionStatus_Gates(t *testing.T) {
 		}
 	})
 
+	// Review round 2, O4: a plan and a workflow step can be open at once
+	// (a custom plan-lane workflow with a human gate after its step: the
+	// turn's completion records the plan and parks the step in one
+	// transaction). The plan is reported first, as the schema says.
+	t.Run("a plan and a workflow step open together: the plan is reported", func(t *testing.T) {
+		sess := completedSession(t)
+		var turnID pgtype.UUID
+		if err := rig.pool.QueryRow(ctx, `SELECT id FROM turns WHERE session_id = $1`, sess.ID).Scan(&turnID); err != nil {
+			t.Fatal(err)
+		}
+		plan, err := rig.plans.Create(ctx, sqlcgen.CreatePlanParams{SessionID: sess.ID, TurnID: turnID, Version: 1, Status: sqlcgen.PlanStatusAwaitingApproval})
+		if err != nil {
+			t.Fatal(err)
+		}
+		run, err := rig.workflows.CreateRun(ctx, sess.ID, "request", defID, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		step, err := rig.workflows.CreateStepRun(ctx, run.ID, stepDefID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := rig.workflows.AttachTurn(ctx, step.ID, turnID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := rig.workflows.MarkAwaitingDecision(ctx, step.ID, "ok"); err != nil {
+			t.Fatal(err)
+		}
+		got := getStatus(t, rig, sess.ID, cookie)
+		if got.Activity != restdtos.SessionActivityActivityAwaitingApproval || got.Awaiting == nil ||
+			got.Awaiting.Kind != restdtos.SessionActivityAwaitingKindPlan || got.Awaiting.Id != plan.ID.String() {
+			t.Fatalf("got activity %q awaiting %+v, want awaiting_approval on the plan %v, reported before the step %v", got.Activity, got.Awaiting, plan.ID, step.ID)
+		}
+	})
+
 	// A custom workflow's run escalated by its failed turn gates the session
 	// while it is the latest thing that happened -- and no longer once any
 	// newer turn exists. The newer turn here starts no run of its own (as a
@@ -755,4 +798,199 @@ func TestGetSessionStatus_EscalatedTurnNeverGatesForGood(t *testing.T) {
 			})
 		}
 	}
+}
+
+// TestGetSessionStatus_EscalationAfterAnUntrackedTurn is review round 2's
+// O2, through the production paths: a custom workflow whose one step has a
+// human gate after it; its turn is stopped, so the step awaits a decision
+// on a blocked outcome; a second turn is sent while it waits -- the engine
+// leaves that turn untracked, an attempt of no run -- and completes; then a
+// person approves the step, and with no edge for a blocked outcome the
+// decision escalates the run (/decide's own transaction). The escalation
+// is then the session's latest state and its only open hand-off, so the
+// status reads awaiting_approval on it -- not finished -- until a newer
+// turn supersedes it. The control has no untracked turn.
+func TestGetSessionStatus_EscalationAfterAnUntrackedTurn(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	user, cookie := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMember)
+
+	for _, untracked := range []bool{false, true} {
+		name := "escalated by a decision, no turn in between (the control)"
+		if untracked {
+			name = "escalated by a decision after an untracked turn"
+		}
+		t.Run(name, func(t *testing.T) {
+			sess, _ := customWorkflowSessionGated(ctx, t, rig, user.ID, true)
+			first := createTurnThroughCore(ctx, t, rig, sess.ID)
+			endTurnThroughEngine(ctx, t, rig, sess.ID, first.ID, turn.TriggerCancel)
+			runs := sessionRuns(ctx, t, rig, sess.ID)
+			if len(runs) != 1 || runs[0].Status != sqlcgen.WorkflowRunStatusRunning {
+				t.Fatalf("after the first turn: runs %+v, want one run, still running (its step awaits a decision)", runs)
+			}
+			run := runs[0]
+			steps, err := rig.workflows.ListStepRunsForRun(ctx, run.ID)
+			if err != nil || len(steps) != 1 || steps[0].Status != sqlcgen.WorkflowStepRunStatusAwaitingDecision {
+				t.Fatalf("after the first turn: step runs %+v (%v), want one awaiting a decision", steps, err)
+			}
+			stepRun := steps[0]
+			if got := getStatus(t, rig, sess.ID, cookie); got.Activity != restdtos.SessionActivityActivityAwaitingApproval ||
+				got.Awaiting == nil || got.Awaiting.Kind != restdtos.SessionActivityAwaitingKindWorkflowStep {
+				t.Fatalf("the step awaits a decision: activity %q awaiting %+v, want awaiting_approval on the step", got.Activity, got.Awaiting)
+			}
+
+			if untracked {
+				second := createTurnThroughCore(ctx, t, rig, sess.ID)
+				if runs := sessionRuns(ctx, t, rig, sess.ID); len(runs) != 1 {
+					t.Fatalf("a turn sent while the step awaits a decision started a run: %+v", runs)
+				}
+				var attempts int
+				if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM workflow_step_runs WHERE turn_id = $1`, second.ID).Scan(&attempts); err != nil || attempts != 0 {
+					t.Fatalf("the second turn is an attempt of %d step runs (%v), want none: it must be untracked", attempts, err)
+				}
+				endTurnThroughEngine(ctx, t, rig, sess.ID, second.ID, turn.TriggerComplete)
+				if got := getStatus(t, rig, sess.ID, cookie); got.Activity != restdtos.SessionActivityActivityAwaitingApproval ||
+					got.Awaiting == nil || got.Awaiting.Kind != restdtos.SessionActivityAwaitingKindWorkflowStep {
+					t.Fatalf("the untracked turn completed: activity %q awaiting %+v, want the step still awaiting its decision", got.Activity, got.Awaiting)
+				}
+			}
+
+			var decided restdtos.WorkflowStepDecideResponse
+			if status := rig.doJSON(t, http.MethodPost, decidePath(run.ID, stepRun.ID), []byte(`{"verdict":"approve","text":null}`), &decided, cookie); status != http.StatusOK {
+				t.Fatalf("decide approve: %d, want 200", status)
+			}
+			runs = sessionRuns(ctx, t, rig, sess.ID)
+			if len(runs) != 1 || runs[0].Status != sqlcgen.WorkflowRunStatusNeedsReview {
+				t.Fatalf("after the decision: runs %+v, want the one run escalated to needs_review", runs)
+			}
+			escalated := runs[0]
+
+			got := getStatus(t, rig, sess.ID, cookie)
+			if got.Activity != restdtos.SessionActivityActivityAwaitingApproval || !got.Settled || got.SuggestedDelaySeconds != 60 || got.Awaiting == nil ||
+				got.Awaiting.Kind != restdtos.SessionActivityAwaitingKindWorkflowEscalation || got.Awaiting.Id != escalated.ID.String() || !got.Awaiting.Since.Equal(escalated.UpdatedAt.Time) {
+				t.Fatalf("escalated by the decision: activity %q settled %v delay %d awaiting %+v, want awaiting_approval, settled, 60, on run %v since it escalated",
+					got.Activity, got.Settled, got.SuggestedDelaySeconds, got.Awaiting, escalated.ID)
+			}
+
+			// New work supersedes it, as for any escalation.
+			followUp := createTurnThroughCore(ctx, t, rig, sess.ID)
+			if got := getStatus(t, rig, sess.ID, cookie); got.Activity != restdtos.SessionActivityActivityQueued || got.Awaiting != nil {
+				t.Fatalf("follow-up queued: activity %q awaiting %+v, want queued and no gate", got.Activity, got.Awaiting)
+			}
+			endTurnThroughEngine(ctx, t, rig, sess.ID, followUp.ID, turn.TriggerComplete)
+			got = getStatus(t, rig, sess.ID, cookie)
+			if got.Activity == restdtos.SessionActivityActivityAwaitingApproval && got.Awaiting != nil && got.Awaiting.Kind == restdtos.SessionActivityAwaitingKindWorkflowEscalation {
+				t.Fatalf("after the follow-up: the escalation of run %v still gates: %+v", escalated.ID, got.Awaiting)
+			}
+		})
+	}
+}
+
+// TestGetSessionStatus_EscalationNeverObservedAsFinished_Race is review
+// round 2's O3: the escalation gate's own one-snapshot property. A writer
+// loops through a custom workflow's escalations the way the application
+// commits them -- a turn's failure AND its run's escalation in one
+// transaction (turn.Transition, then workflowengine.OnTurnCompleted), then
+// the follow-up turn AND the fresh run it starts in one transaction
+// (CreateTurnCore) -- while readers poll the status route. No committed
+// state is ever "every turn terminal, nothing awaiting", so a reader that
+// sees one snapshot never reads finished (or idle). Read in two statements,
+// the turns could be seen before the follow-up commits and the escalation
+// after it (closed by the newer run), or the escalation before the failure
+// commits and the turns after it -- a false finished either way.
+func TestGetSessionStatus_EscalationNeverObservedAsFinished_Race(t *testing.T) {
+	rig := newTestRig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	user, cookie := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMember)
+	sess, _ := customWorkflowSession(ctx, t, rig, user.ID)
+
+	current := createTurnThroughCore(ctx, t, rig, sess.ID)
+	state := transitionTurn(ctx, t, rig.turns, current.ID, turn.StatePending, turn.TriggerDispatch)
+	transitionTurn(ctx, t, rig.turns, current.ID, state, turn.TriggerStartProcessing)
+
+	seen := newSeen()
+	stop := make(chan struct{})
+	var readers errgroup.Group
+	pollUntil(ctx, &readers, rig, sess.ID, cookie, stop, seen)
+
+	const cycles = 60
+	writerErr := func() error {
+		defer close(stop)
+		for i := 0; i < cycles; i++ {
+			if err := inTx(ctx, t, rig, func(tx pgx.Tx) error {
+				to, err := turn.Transition(turn.StateProcessing, turn.TriggerFail)
+				if err != nil {
+					return err
+				}
+				if _, err := rig.turns.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+					ID: current.ID, Status: sqlcgen.TurnStatus(to), CompletedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+				}); err != nil {
+					return err
+				}
+				sessionRow, err := rig.sessions.WithTx(tx).Get(ctx, sess.ID)
+				if err != nil {
+					return err
+				}
+				workflowengine.OnTurnCompleted(ctx, workflowengine.Deps{
+					Workflows:           rig.workflows.WithTx(tx),
+					Turns:               rig.turns.WithTx(tx),
+					SlackThreadSessions: narvipg.NewSlackThreadSessionStore(rig.pool).WithTx(tx),
+					LinearAgentSessions: rig.linearAgentSessions.WithTx(tx),
+					GitHubPRSessions:    narvipg.NewGitHubPRSessionStore(rig.pool).WithTx(tx),
+					Outbox:              rig.outbox.WithTx(tx),
+				}, sessionRow, current.ID, turn.TriggerFail)
+				return nil
+			}); err != nil {
+				return fmt.Errorf("fail the turn + escalate its run: %w", err)
+			}
+			created, wasCreated, cerr := httpapi.CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry,
+				sess.ID, "carry on", nil, false, false, pgtype.UUID{}, httpapi.RejectIfOpen)
+			if cerr != nil || !wasCreated {
+				return fmt.Errorf("follow-up through CreateTurnCore: created %v, %v", wasCreated, cerr)
+			}
+			current = created
+			for _, trig := range []turn.Trigger{turn.TriggerDispatch, turn.TriggerStartProcessing} {
+				row, err := rig.turns.Get(ctx, current.ID)
+				if err != nil {
+					return err
+				}
+				to, err := turn.Transition(turn.State(row.Status), trig)
+				if err != nil {
+					return err
+				}
+				arg := sqlcgen.UpdateTurnStatusParams{ID: current.ID, Status: sqlcgen.TurnStatus(to)}
+				if to == turn.StateDispatched {
+					arg.DispatchedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+				}
+				if _, err := rig.turns.UpdateStatus(ctx, arg); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}()
+	if writerErr != nil {
+		t.Fatal(writerErr)
+	}
+	if err := readers.Wait(); err != nil {
+		t.Fatalf("reader: %v", err)
+	}
+	if n := seen[restdtos.SessionActivityActivityFinished].Load() + seen[restdtos.SessionActivityActivityIdle].Load(); n != 0 {
+		t.Fatalf("observed finished or idle %d times while every failed turn's escalation stayed open until its follow-up was queued", n)
+	}
+	if seen[restdtos.SessionActivityActivityAwaitingApproval].Load() == 0 {
+		t.Fatalf("readers never observed an escalation: the race was not exercised")
+	}
+	runs := sessionRuns(ctx, t, rig, sess.ID)
+	escalatedRuns := 0
+	for _, r := range runs {
+		if r.Status == sqlcgen.WorkflowRunStatusNeedsReview {
+			escalatedRuns++
+		}
+	}
+	if len(runs) != cycles+1 || escalatedRuns != cycles {
+		t.Fatalf("runs %d (%d escalated), want %d with %d escalated: each failure escalated its run and each follow-up started one", len(runs), escalatedRuns, cycles+1, cycles)
+	}
+	t.Logf("snapshots observed: running %d, queued %d, awaiting_approval %d", seen[restdtos.SessionActivityActivityRunning].Load(), seen[restdtos.SessionActivityActivityQueued].Load(), seen[restdtos.SessionActivityActivityAwaitingApproval].Load())
 }

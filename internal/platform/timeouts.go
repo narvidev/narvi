@@ -3217,6 +3217,11 @@ type Timeouts struct {
 	// 10 seconds.
 	MCPStatusDelayRunning time.Duration
 
+	// MCPStatusDelayDelivering is the suggestion while nothing is queued or
+	// running but a completed turn's branch is being pushed and its pull
+	// request opened: a git push and a few API calls. 5 seconds.
+	MCPStatusDelayDelivering time.Duration
+
 	// MCPStatusDelayAwaitingHuman is the suggestion while nothing is queued
 	// or running and a person must act (a plan awaiting approval, a
 	// workflow step awaiting a decision, a run escalated for review): human
@@ -3232,6 +3237,21 @@ type Timeouts struct {
 
 	// MCPStatusDelayCeiling is the most delay ever suggested. 300 seconds.
 	MCPStatusDelayCeiling time.Duration
+
+	// MCPStatusDeliveryWindow bounds how long a completed turn's push and
+	// pull request keep its session "delivering" -- never settled -- after
+	// they began (sandboxes.pr_delivery_started_at, migrations/000145;
+	// session.PRDeliveryOpen). The stamp is cleared as soon as the pull
+	// request is created, the push fails or the push cannot be sent, so
+	// this bound matters only for a push that never reports back (its
+	// sandbox gone, its push_complete lost): past it, the session reads
+	// finished whatever the stamp says, and cannot stay unsettled for good.
+	// Validate keeps it above one repo's push and pull request at their own
+	// limits -- RepoCloneTimeout (the sandbox's git push, cmd/sandbox-agent),
+	// then RepoSHAResolutionTimeout and PRCreateTimeout (createPRBestEffort)
+	// -- plus MinTimeoutMargin, so a slow delivery that is still within its
+	// own timeouts never reads finished early. 10 minutes.
+	MCPStatusDeliveryWindow time.Duration
 }
 
 // DefaultTimeouts returns the shipped defaults for every field, each
@@ -3519,10 +3539,12 @@ func DefaultTimeouts() Timeouts {
 		MCPStatusDelayStarting:      15 * time.Second,  // §43.20; queued behind a cold start
 		MCPStatusDelayQueued:        5 * time.Second,   // §43.20; queued on a warm sandbox
 		MCPStatusDelayRunning:       10 * time.Second,  // §43.20; a turn in flight
+		MCPStatusDelayDelivering:    5 * time.Second,   // §43.20; a completed turn's push and pull request under way
 		MCPStatusDelayAwaitingHuman: 60 * time.Second,  // §43.20; human latency
 		MCPStatusDelaySettled:       300 * time.Second, // §43.20; finished or idle
 		MCPStatusDelayFloor:         2 * time.Second,   // §43.20; least suggestion
 		MCPStatusDelayCeiling:       300 * time.Second, // §43.20; most suggestion
+		MCPStatusDeliveryWindow:     10 * time.Minute,  // §43.20; a push that never reports back stops holding the session unsettled
 	}
 }
 
@@ -3786,8 +3808,19 @@ func (t Timeouts) Validate() error {
 	withinStatusDelayBounds("MCPStatusDelayStarting", t.MCPStatusDelayStarting)
 	withinStatusDelayBounds("MCPStatusDelayQueued", t.MCPStatusDelayQueued)
 	withinStatusDelayBounds("MCPStatusDelayRunning", t.MCPStatusDelayRunning)
+	withinStatusDelayBounds("MCPStatusDelayDelivering", t.MCPStatusDelayDelivering)
 	withinStatusDelayBounds("MCPStatusDelayAwaitingHuman", t.MCPStatusDelayAwaitingHuman)
 	withinStatusDelayBounds("MCPStatusDelaySettled", t.MCPStatusDelaySettled)
+
+	// §43.20: a completed turn's push and pull request read as delivering
+	// only within MCPStatusDeliveryWindow of their start (the field's own
+	// doc comment). One repo's push and pull request, each at its own limit,
+	// must fit inside it with margin, or a slow delivery still within its
+	// own timeouts would read finished -- settled -- before its pull
+	// request appears.
+	check("MCPStatusDeliveryWindow > RepoCloneTimeout + RepoSHAResolutionTimeout + PRCreateTimeout",
+		"MCPStatusDeliveryWindow", t.MCPStatusDeliveryWindow,
+		"RepoCloneTimeout+RepoSHAResolutionTimeout+PRCreateTimeout", t.RepoCloneTimeout+t.RepoSHAResolutionTimeout+t.PRCreateTimeout)
 
 	// U1 audit fix, HIGH (confirmed finding: "the total budget is smaller
 	// than the retry chain it contains"). Derived from the SAME three

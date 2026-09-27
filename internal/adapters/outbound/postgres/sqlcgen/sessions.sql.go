@@ -174,6 +174,7 @@ SELECT
     s.failure_reason AS session_failure_reason,
     s.archived AS archived,
     sb.status AS sandbox_status,
+    sb.pr_delivery_started_at AS pr_delivery_started_at,
     statement_timestamp()::timestamptz AS observed_at,
     COALESCE(tc.turn_counts, '{}'::jsonb)::jsonb AS turn_counts,
     inflight.id AS in_flight_turn_id,
@@ -215,7 +216,7 @@ LEFT JOIN LATERAL (
     LIMIT 1
 ) lastrun ON true
 LEFT JOIN LATERAL (
-    SELECT t.id
+    SELECT t.id, t.created_at
     FROM turns t
     WHERE t.session_id = s.id
     ORDER BY t.created_at DESC, t.id DESC
@@ -248,10 +249,13 @@ LEFT JOIN LATERAL (
     JOIN workflow_definitions d ON d.id = wr.workflow_definition_id
     WHERE wr.status = 'needs_review'
       AND NOT d.is_built_in
-      AND EXISTS (
-          SELECT 1
-          FROM workflow_step_runs sr
-          WHERE sr.workflow_run_id = wr.id AND sr.turn_id = newest.id
+      AND (
+          EXISTS (
+              SELECT 1
+              FROM workflow_step_runs sr
+              WHERE sr.workflow_run_id = wr.id AND sr.turn_id = newest.id
+          )
+          OR newest.created_at < wr.updated_at
       )
 ) escalated ON true
 WHERE s.id = $1
@@ -263,6 +267,7 @@ type GetSessionActivityFactsRow struct {
 	SessionFailureReason *SessionFailureReason `json:"session_failure_reason"`
 	Archived             bool                  `json:"archived"`
 	SandboxStatus        *SandboxStatus        `json:"sandbox_status"`
+	PrDeliveryStartedAt  pgtype.Timestamptz    `json:"pr_delivery_started_at"`
 	ObservedAt           pgtype.Timestamptz    `json:"observed_at"`
 	TurnCounts           []byte                `json:"turn_counts"`
 	InFlightTurnID       pgtype.UUID           `json:"in_flight_turn_id"`
@@ -307,20 +312,40 @@ type GetSessionActivityFactsRow struct {
 // in needs_review: nothing moves a run out of needs_review, and the next
 // turn starts a fresh run beside the parked one (migrations/000057), so
 // counting every such run would gate the session for good. A needs_review
-// run is reported only when all three hold: it is the session's newest
-// workflow run; the session's newest turn is one of that run's own
-// attempts (workflow_step_runs.turn_id), so no turn has come after it --
-// whether that turn started a run of its own or none (a turn queued behind
-// a running one, a plan's implementation turn); and its definition is not
-// a built-in one, whose escalation no person or route can act on
-// (technical plan §43.20 gives the reasons).
+// run is reported only while no turn has been created since it escalated,
+// and its definition is not a built-in one, whose escalation no person or
+// route can act on (technical plan §43.20 gives the reasons). "No turn
+// since" is: it is the session's newest workflow run (a turn that started
+// a run of its own supersedes it), and the session's newest turn either is
+// one of that run's own attempts (workflow_step_runs.turn_id -- the turn
+// whose end escalated it, in the same transaction) or was created before
+// the run escalated (workflow_runs.updated_at, which EscalateWorkflowRun
+// stamps; the notice claim that also writes it runs in the escalating
+// transaction itself, workflowengine's escalateRun, and a needs_review run
+// is never written again unless it escalates again). The second arm
+// covers a decision that escalates the run AFTER an untracked turn -- one
+// created while a step awaited that decision, which starts no run and is
+// no attempt -- and still lets a turn created after the escalation that
+// starts no run (a turn queued behind a running one, a plan's
+// implementation turn) close it. Both instants are the database's own
+// now(), each its transaction's start; two transactions that overlap are
+// ordered by which began first.
+//
+// pr_delivery_started_at is the push and pull request a completed turn
+// handed off and that have not finished (migrations/000145): the handler
+// reads it as delivering, never settled, only within
+// platform.Timeouts.MCPStatusDeliveryWindow of observed_at, so a push that
+// never reports back cannot hold the session unsettled for good. It is
+// stamped in the transaction that completes the turn, so no snapshot holds
+// that completed turn without it.
 //
 // Turn order is created_at, then id -- ListTurnsForSession's own order,
-// with id breaking a tie; workflow runs are ordered the same way. observed_at is the database's own statement time,
-// the instant the snapshot was taken. The two turn statuses are text, ”
-// when their turn is absent (its id is then NULL): an enum column from an
-// outer-joined subquery would be generated as a non-nullable type that
-// cannot scan NULL.
+// with id breaking a tie; workflow runs are ordered the same way.
+// observed_at is the database's own statement time, the instant the
+// snapshot was taken. The two turn statuses are text, ” when their turn
+// is absent (its id is then NULL): an enum column from an outer-joined
+// subquery would be generated as a non-nullable type that cannot scan
+// NULL.
 func (q *Queries) GetSessionActivityFacts(ctx context.Context, id pgtype.UUID) (GetSessionActivityFactsRow, error) {
 	row := q.db.QueryRow(ctx, getSessionActivityFacts, id)
 	var i GetSessionActivityFactsRow
@@ -330,6 +355,7 @@ func (q *Queries) GetSessionActivityFacts(ctx context.Context, id pgtype.UUID) (
 		&i.SessionFailureReason,
 		&i.Archived,
 		&i.SandboxStatus,
+		&i.PrDeliveryStartedAt,
 		&i.ObservedAt,
 		&i.TurnCounts,
 		&i.InFlightTurnID,

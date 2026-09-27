@@ -530,7 +530,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Compact state of one session -- the same state GET /api/sessions/{sessionID}/status returns: whether its work is queued, running, awaiting approval by a person, idle or finished (a queued or running turn is never reported as idle or finished), with suggestedDelaySeconds, how long to wait before reading it again. Does not include the transcript.",
+    "description": "Compact state of one session -- the same state GET /api/sessions/{sessionID}/status returns: whether its work is queued, running, delivering (a completed turn's branch being pushed and its pull request opened), awaiting approval by a person, idle or finished (a queued or running turn is never reported as idle or finished; settled is true only for idle, awaiting approval and finished), with suggestedDelaySeconds, how long to wait before reading it again. Does not include the transcript.",
     "inputSchema": {
       "additionalProperties": false,
       "description": "The narvi_get_session_status MCP tool's own input (technical plan §43.20) -- the tool bridge's twin of GET /api/sessions/{sessionID}/status, carrying the path parameter as a plain required field exactly like GetSessionToolRequest.",
@@ -551,14 +551,15 @@
       "$defs": {
         "SessionActivity": {
           "additionalProperties": false,
-          "description": "GET /api/sessions/{sessionID}/status (technical plan §43.20): what one session's work is doing now, and how long to wait before reading it again. Derived at read time from the session's turn queue and its human gates, all read in ONE database snapshot -- never from Session.status, which is re-derived only when a turn reaches a terminal state and so can hold any of its five values while a turn is queued or running. Carries no events and no transcript: the event history is GET /api/sessions/{sessionID}/events (EventsResponse), a separate, paginated read.",
+          "description": "GET /api/sessions/{sessionID}/status (technical plan §43.20): what one session's work is doing now, and how long to wait before reading it again. Derived at read time from the session's turn queue, a completed turn's push and pull request still under way, and its human gates, all read in ONE database snapshot -- never from Session.status, which is re-derived only when a turn reaches a terminal state and so can hold any of its five values while a turn is queued or running. Carries no events and no transcript: the event history is GET /api/sessions/{sessionID}/events (EventsResponse), a separate, paginated read.",
           "properties": {
             "activity": {
-              "description": "In precedence order: 'running' when a turn is dispatched or processing (turns may be queued behind it); else 'queued' when a turn is pending -- including the gap between one turn finishing and the next being dispatched, and a whole sandbox cold start; else 'awaiting_approval' when a person must act (a plan awaiting approval, a workflow step awaiting a decision, or a custom workflow's run escalated for review with nothing on the session since -- see awaiting.kind); else 'idle' when the session has no turn at all; else 'finished' (at least one turn, every one terminal). A queued or running turn is never reported as idle or finished.",
+              "description": "In precedence order: 'running' when a turn is dispatched or processing (turns may be queued behind it); else 'queued' when a turn is pending -- including the gap between one turn finishing and the next being dispatched, and a whole sandbox cold start; else 'delivering' when a turn that completed is still being delivered -- its branch pushed, then its pull request opened, which happens with no new input -- for at most the deployment's delivery window from when that began (10 minutes as shipped: a push that never reports back stops counting then); else 'awaiting_approval' when a person must act (a plan awaiting approval, a workflow step awaiting a decision, or a custom workflow's run escalated for review with nothing on the session since -- see awaiting.kind); else 'idle' when the session has no turn at all; else 'finished' (at least one turn, every one terminal, nothing being delivered). A queued or running turn is never reported as idle or finished, and a pull request a delivery opens within that window is recorded before activity leaves 'delivering'.",
               "enum": [
                 "idle",
                 "queued",
                 "running",
+                "delivering",
                 "awaiting_approval",
                 "finished"
               ],
@@ -576,7 +577,7 @@
                   "type": "string"
                 },
                 "kind": {
-                  "description": "'plan': a plan awaiting approval (id is the plan's, decided through POST /api/sessions/{sessionID}/plans/{planId}/approve or reject); 'workflow_step': a workflow step awaiting a decision (id is the step run's); 'workflow_escalation': a custom workflow's run escalated for review (id is the run's), reported only while it is the session's latest state -- its newest workflow run, with no turn after that run's own. Any newer turn closes it, so a person answers it by sending the session new work. A built-in workflow's escalation is never reported: no person or route can act on it, and when its turn failed or was stopped, lastRun already says so.",
+                  "description": "'plan': a plan awaiting approval (id is the plan's, decided through POST /api/sessions/{sessionID}/plans/{planId}/approve or reject); 'workflow_step': a workflow step awaiting a decision (id is the step run's); 'workflow_escalation': a custom workflow's run escalated for review (id is the run's), reported only while it is the session's latest state -- its newest workflow run, with no turn created since it escalated (a turn created before it, such as one sent while a step awaited the decision that escalated the run, does not close it). Any newer turn closes it, so a person answers it by sending the session new work. A built-in workflow's escalation is never reported: no person or route can act on it, and when its turn failed or was stopped, lastRun already says so.",
                   "enum": [
                     "plan",
                     "workflow_step",
@@ -719,11 +720,11 @@
               "type": "string"
             },
             "settled": {
-              "description": "true exactly when activity is idle, awaiting_approval or finished: nothing progresses server-side until a person acts or sends new input. Never true while a turn is queued or running.",
+              "description": "true exactly when activity is idle, awaiting_approval or finished: nothing progresses server-side until a person acts or sends new input. Never true while a turn is queued or running, or while a completed turn's push and pull request are being delivered.",
               "type": "boolean"
             },
             "suggestedDelaySeconds": {
-              "description": "How long to wait before reading this status again, in whole seconds (rounded up): short while a turn is queued on a warm sandbox or running, longer while a sandbox starts or a person must act, longest once finished or idle -- always within the deployment's configured floor and ceiling (2 and 300 seconds as shipped). A hint that keeps polling quiet, never a limit: an earlier read is answered all the same.",
+              "description": "How long to wait before reading this status again, in whole seconds (rounded up): short while a turn is queued on a warm sandbox, running or being delivered, longer while a sandbox starts or a person must act, longest once finished or idle -- always within the deployment's configured floor and ceiling (2 and 300 seconds as shipped). A hint that keeps polling quiet, never a limit: an earlier read is answered all the same.",
               "minimum": 0,
               "type": "integer"
             }

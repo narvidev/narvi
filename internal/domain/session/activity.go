@@ -18,7 +18,7 @@ import (
 // person?" that Status cannot give.
 type Activity string
 
-// The five Activity values, in the precedence DeriveActivity applies.
+// The six Activity values, in the precedence DeriveActivity applies.
 const (
 	// ActivityRunning: a turn is dispatched or processing (or in a state
 	// the turn machine does not know).
@@ -27,23 +27,29 @@ const (
 	// including the gap between one turn finishing and the next being
 	// dispatched, and a whole sandbox cold start.
 	ActivityQueued Activity = "queued"
-	// ActivityAwaitingApproval: no turn is queued or running, and a person
-	// must act: a plan awaits approval, a workflow step awaits a decision,
-	// or a workflow escalation is still open (ActivityInput.
-	// WorkflowEscalationOpen).
+	// ActivityDelivering: no turn is queued or running, but a turn that
+	// completed is still being delivered -- its branch pushed, then its
+	// pull request opened (ActivityInput.PRDeliveryInProgress). That work
+	// ends on its own, with no new input, so it is never settled.
+	ActivityDelivering Activity = "delivering"
+	// ActivityAwaitingApproval: no turn is queued, running or being
+	// delivered, and a person must act: a plan awaits approval, a workflow
+	// step awaits a decision, or a workflow escalation is still open
+	// (ActivityInput.WorkflowEscalationOpen).
 	ActivityAwaitingApproval Activity = "awaiting_approval"
 	// ActivityIdle: the session has no turn at all (created without a
 	// prompt) and nothing awaits a person.
 	ActivityIdle Activity = "idle"
-	// ActivityFinished: at least one turn, every one of them terminal, and
-	// nothing awaits a person.
+	// ActivityFinished: at least one turn, every one of them terminal, no
+	// delivery under way, and nothing awaits a person.
 	ActivityFinished Activity = "finished"
 )
 
 // Settled reports whether nothing progresses server-side without new input
-// from a person: finished, idle, or awaiting approval. Queued and running
-// are never settled, and neither is a value this package does not define
-// (an allow-list, so an unknown value reads as work still going on).
+// from a person: finished, idle, or awaiting approval. Queued, running and
+// delivering are never settled, and neither is a value this package does
+// not define (an allow-list, so an unknown value reads as work still going
+// on).
 func (a Activity) Settled() bool {
 	switch a {
 	case ActivityFinished, ActivityIdle, ActivityAwaitingApproval:
@@ -75,6 +81,28 @@ type ActivityInput struct {
 	// escalation counts is the facts query's decision
 	// (GetSessionActivityFacts' escalated lookup, technical plan §43.20).
 	WorkflowEscalationOpen bool
+	// PRDeliveryInProgress: a completed turn's push, and the pull request
+	// that follows it, were handed off and have not finished -- the
+	// sandbox's delivery stamp, read through PRDeliveryOpen so that a push
+	// that never reports back stops counting once the window has passed.
+	PRDeliveryInProgress bool
+}
+
+// PRDeliveryOpen reports whether a push/PR delivery stamped at startedAt
+// still counts as under way at observedAt, the snapshot's own instant: a
+// stamp (non-zero startedAt) less than window away from observedAt. The
+// bound is what keeps a push that never reports back -- its sandbox gone,
+// its push_complete lost -- from holding a session unsettled for good. It
+// is measured in either direction, so a clock stepped backwards between
+// the stamp and the read cannot stretch it either. A non-positive window
+// counts nothing. Both instants must come from the same clock (the
+// database's, in GetSessionActivityFacts).
+func PRDeliveryOpen(startedAt, observedAt time.Time, window time.Duration) bool {
+	if startedAt.IsZero() || window <= 0 {
+		return false
+	}
+	d := observedAt.Sub(startedAt)
+	return d < window && d > -window
 }
 
 // DeriveActivity applies the precedence of technical plan §43.20, highest
@@ -83,13 +111,17 @@ type ActivityInput struct {
 //  1. any turn dispatched or processing, or in a state the turn machine
 //     does not know -> Running (pending turns may wait behind it);
 //  2. else any turn pending -> Queued;
-//  3. else a plan awaiting approval, a workflow step awaiting a decision,
+//  3. else a completed turn's push and pull request still under way ->
+//     Delivering;
+//  4. else a plan awaiting approval, a workflow step awaiting a decision,
 //     or an open workflow escalation -> AwaitingApproval;
-//  4. else no turn at all -> Idle;
-//  5. else (at least one turn, all terminal) -> Finished.
+//  5. else no turn at all -> Idle;
+//  6. else (at least one turn, all terminal) -> Finished.
 //
 // So a non-empty queue is always Queued or Running, never Idle or Finished,
-// whatever else the snapshot holds. A non-positive count is ignored.
+// whatever else the snapshot holds, and a delivery under way is never
+// settled: it outranks a gate, since the pull request it opens appears
+// whether or not a person acts. A non-positive count is ignored.
 func DeriveActivity(in ActivityInput) Activity {
 	var total, pending, inFlight int
 	for state, n := range in.TurnCounts {
@@ -111,6 +143,8 @@ func DeriveActivity(in ActivityInput) Activity {
 		return ActivityRunning
 	case pending > 0:
 		return ActivityQueued
+	case in.PRDeliveryInProgress:
+		return ActivityDelivering
 	case in.PlanAwaitingApproval || in.WorkflowStepAwaitingDecision || in.WorkflowEscalationOpen:
 		return ActivityAwaitingApproval
 	case total == 0:
@@ -132,6 +166,9 @@ type DelayTable struct {
 	Queued time.Duration
 	// Running: a turn is in flight.
 	Running time.Duration
+	// Delivering: a completed turn's push and pull request are under way
+	// -- a git push and a few API calls, seconds.
+	Delivering time.Duration
 	// AwaitingHuman: a person must act; human latency.
 	AwaitingHuman time.Duration
 	// Settled: finished or idle; nothing changes without new input.
@@ -167,6 +204,8 @@ func SuggestedReadDelay(a Activity, sandboxState *sandbox.State, t DelayTable) t
 		} else {
 			d = t.Starting
 		}
+	case ActivityDelivering:
+		d = t.Delivering
 	case ActivityAwaitingApproval:
 		d = t.AwaitingHuman
 	case ActivityFinished, ActivityIdle:

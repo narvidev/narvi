@@ -52,6 +52,13 @@ func TestDeriveActivity_Table(t *testing.T) {
 		{"workflow step awaiting + pending next step -> queued", session.ActivityInput{TurnCounts: counts(turn.StateCompleted, 1, turn.StatePending, 1), WorkflowStepAwaitingDecision: true}, session.ActivityQueued},
 		{"open workflow escalation -> awaiting_approval", session.ActivityInput{TurnCounts: counts(turn.StateFailed, 2), WorkflowEscalationOpen: true}, session.ActivityAwaitingApproval},
 		{"a gate with no turn at all -> awaiting_approval, not idle", session.ActivityInput{WorkflowEscalationOpen: true}, session.ActivityAwaitingApproval},
+		{"completed, its push and pull request under way -> delivering, never finished", session.ActivityInput{TurnCounts: counts(turn.StateCompleted, 1), PRDeliveryInProgress: true}, session.ActivityDelivering},
+		{"delivery under way beside an open plan -> delivering (the pull request appears whatever the person does)", session.ActivityInput{TurnCounts: counts(turn.StateCompleted, 1), PRDeliveryInProgress: true, PlanAwaitingApproval: true}, session.ActivityDelivering},
+		{"delivery under way beside a step decision and an escalation -> delivering", session.ActivityInput{TurnCounts: counts(turn.StateCompleted, 2), PRDeliveryInProgress: true, WorkflowStepAwaitingDecision: true, WorkflowEscalationOpen: true}, session.ActivityDelivering},
+		{"delivery under way + pending follow-up -> queued", session.ActivityInput{TurnCounts: counts(turn.StateCompleted, 1, turn.StatePending, 1), PRDeliveryInProgress: true}, session.ActivityQueued},
+		{"delivery under way + processing follow-up -> running", session.ActivityInput{TurnCounts: counts(turn.StateCompleted, 1, turn.StateProcessing, 1), PRDeliveryInProgress: true}, session.ActivityRunning},
+		{"delivery under way + unknown turn state -> running", session.ActivityInput{TurnCounts: counts(turn.StateCompleted, 1, turn.State("warming_up"), 1), PRDeliveryInProgress: true}, session.ActivityRunning},
+		{"no delivery, all terminal -> finished", session.ActivityInput{TurnCounts: counts(turn.StateCompleted, 1), PRDeliveryInProgress: false}, session.ActivityFinished},
 		{"unknown turn state -> running", session.ActivityInput{TurnCounts: counts(turn.State("warming_up"), 1)}, session.ActivityRunning},
 		{"unknown turn state among terminal ones -> running, never finished", session.ActivityInput{TurnCounts: counts(turn.StateCompleted, 4, turn.State("warming_up"), 1)}, session.ActivityRunning},
 		{"unknown turn state with a plan awaiting -> running", session.ActivityInput{TurnCounts: counts(turn.State(""), 1), PlanAwaitingApproval: true}, session.ActivityRunning},
@@ -78,12 +85,13 @@ func TestDeriveActivity_NonEmptyQueueNeverIdleOrFinished(t *testing.T) {
 	live := []turn.State{turn.StatePending, turn.StateDispatched, turn.StateProcessing, turn.State("unknown")}
 	for _, state := range live {
 		for _, terminal := range []int{0, 1, 5} {
-			for gates := 0; gates < 8; gates++ {
+			for gates := 0; gates < 16; gates++ {
 				in := session.ActivityInput{
 					TurnCounts:                   counts(state, 1, turn.StateCompleted, terminal),
 					PlanAwaitingApproval:         gates&1 != 0,
 					WorkflowStepAwaitingDecision: gates&2 != 0,
 					WorkflowEscalationOpen:       gates&4 != 0,
+					PRDeliveryInProgress:         gates&8 != 0,
 				}
 				got := session.DeriveActivity(in)
 				if got != session.ActivityQueued && got != session.ActivityRunning {
@@ -109,6 +117,7 @@ func TestActivity_Settled(t *testing.T) {
 		{session.ActivityAwaitingApproval, true},
 		{session.ActivityQueued, false},
 		{session.ActivityRunning, false},
+		{session.ActivityDelivering, false},
 		{session.Activity("something_new"), false},
 		{session.Activity(""), false},
 	} {
@@ -124,6 +133,7 @@ var shippedTable = session.DelayTable{
 	Starting:      15 * time.Second,
 	Queued:        5 * time.Second,
 	Running:       10 * time.Second,
+	Delivering:    5 * time.Second,
 	AwaitingHuman: 60 * time.Second,
 	Settled:       300 * time.Second,
 	Floor:         2 * time.Second,
@@ -154,6 +164,8 @@ func TestSuggestedReadDelay_Table(t *testing.T) {
 		{"queued, sandbox snapshotting -> queued", session.ActivityQueued, sandboxState(sandbox.StateSnapshotting), 5 * time.Second},
 		{"running -> running", session.ActivityRunning, sandboxState(sandbox.StateReady), 10 * time.Second},
 		{"running, sandbox ignored -> running", session.ActivityRunning, nil, 10 * time.Second},
+		{"delivering -> delivering", session.ActivityDelivering, sandboxState(sandbox.StateSnapshotting), 5 * time.Second},
+		{"delivering, sandbox ignored -> delivering", session.ActivityDelivering, nil, 5 * time.Second},
 		{"awaiting approval -> human latency", session.ActivityAwaitingApproval, nil, 60 * time.Second},
 		{"finished -> settled", session.ActivityFinished, sandboxState(sandbox.StateStopped), 300 * time.Second},
 		{"idle -> settled", session.ActivityIdle, nil, 300 * time.Second},
@@ -181,13 +193,14 @@ func TestSuggestedReadDelay_AlwaysWithinBounds(t *testing.T) {
 		Starting:      time.Hour,        // above the ceiling
 		Queued:        time.Millisecond, // below the floor
 		Running:       0,                // below the floor
+		Delivering:    10 * time.Minute, // above the ceiling
 		AwaitingHuman: 45 * time.Second, // inside
 		Settled:       24 * time.Hour,   // above the ceiling
 		Floor:         3 * time.Second,
 		Ceiling:       120 * time.Second,
 	}
 	activities := []session.Activity{
-		session.ActivityIdle, session.ActivityQueued, session.ActivityRunning,
+		session.ActivityIdle, session.ActivityQueued, session.ActivityRunning, session.ActivityDelivering,
 		session.ActivityAwaitingApproval, session.ActivityFinished, session.Activity("unknown"),
 	}
 	sandboxes := []*sandbox.State{nil}
@@ -214,11 +227,51 @@ func TestSuggestedReadDelay_AlwaysWithinBounds(t *testing.T) {
 		{session.ActivityQueued, nil, wild.Ceiling},
 		{session.ActivityQueued, sandboxState(sandbox.StateReady), wild.Floor},
 		{session.ActivityRunning, nil, wild.Floor},
+		{session.ActivityDelivering, nil, wild.Ceiling},
 		{session.ActivityAwaitingApproval, nil, 45 * time.Second},
 		{session.ActivityFinished, nil, wild.Ceiling},
 	} {
 		if got := session.SuggestedReadDelay(tc.a, tc.sb, wild); got != tc.want {
 			t.Errorf("SuggestedReadDelay(%q, %v) = %v, want %v", tc.a, tc.sb, got, tc.want)
 		}
+	}
+}
+
+// TestPRDeliveryOpen_Table pins the bound on a push/PR delivery (technical
+// plan §43.20): a stamp counts only while it is less than the window away
+// from the snapshot's own instant, in either direction, so a push that
+// never reports back -- or a clock stepped backwards -- cannot hold a
+// session unsettled for good. No stamp, or no positive window, counts
+// nothing.
+func TestPRDeliveryOpen_Table(t *testing.T) {
+	t.Parallel()
+
+	observed := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
+	window := 10 * time.Minute
+	tests := []struct {
+		name    string
+		started time.Time
+		window  time.Duration
+		want    bool
+	}{
+		{"no stamp", time.Time{}, window, false},
+		{"stamped at the snapshot's instant", observed, window, true},
+		{"stamped seconds ago", observed.Add(-7 * time.Second), window, true},
+		{"stamped just inside the window", observed.Add(-window + time.Microsecond), window, true},
+		{"stamped exactly one window ago: over", observed.Add(-window), window, false},
+		{"stamped long ago: a push that never reported back", observed.Add(-24 * time.Hour), window, false},
+		{"stamped slightly after the snapshot's instant (clock skew)", observed.Add(time.Second), window, true},
+		{"stamped a whole window after the snapshot's instant: never sticks", observed.Add(window), window, false},
+		{"stamped far in the future: never sticks", observed.Add(48 * time.Hour), window, false},
+		{"a zero window counts nothing", observed, 0, false},
+		{"a negative window counts nothing", observed, -time.Minute, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := session.PRDeliveryOpen(tc.started, observed, tc.window); got != tc.want {
+				t.Fatalf("PRDeliveryOpen(%v, %v, %v) = %v, want %v", tc.started, observed, tc.window, got, tc.want)
+			}
+		})
 	}
 }

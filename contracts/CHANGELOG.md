@@ -28,15 +28,18 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 ### rest/v1/dtos.schema.json
 
 - Added: `SessionActivity` -- the response of the status route above:
-  `activity` (`idle`, `queued`, `running`, `awaiting_approval`,
-  `finished`), `settled`, `pendingTurns`, `inFlightTurn`, `awaiting` (the
-  open human gate: a plan, a workflow step, or a custom workflow's
-  escalated run while it is the session's latest state -- never a built-in
-  workflow's, and never once a newer turn exists),
-  `lastRun`, `sandboxStatus`, `archived`, `suggestedDelaySeconds` and
-  `observedAt`. Derived from the session's turn queue and human gates in
-  one database snapshot, never from `Session.status`, and carrying no
-  events. A `$defs` entry added, graded MINOR (row 32).
+  `activity` (`idle`, `queued`, `running`, `delivering` -- a completed
+  turn's branch being pushed and its pull request opened, bounded by the
+  deployment's delivery window -- `awaiting_approval`, `finished`),
+  `settled` (never while queued, running or delivering), `pendingTurns`,
+  `inFlightTurn`, `awaiting` (the open human gate: a plan, a workflow
+  step, or a custom workflow's escalated run while it is the session's
+  latest state -- never a built-in workflow's, and never once a turn has
+  been created since it escalated), `lastRun`, `sandboxStatus`,
+  `archived`, `suggestedDelaySeconds` and `observedAt`. Derived from the
+  session's turn queue, its push/PR delivery and its human gates in one
+  database snapshot, never from `Session.status`, and carrying no events.
+  A `$defs` entry added, graded MINOR (row 32).
 - Added: `GetSessionStatusToolRequest` and `GetSessionTranscriptToolRequest`
   -- the input schemas of the `narvi_get_session_status` and
   `narvi_get_session_transcript` MCP tools (technical plan §43.20), whose

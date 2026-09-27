@@ -73,6 +73,10 @@ func TestSessionActivityFacts_OneStatement(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'ready' WHERE session_id = $1`, sessionID); err != nil {
 		t.Fatal(err)
 	}
+	deliveryAt := base.Add(16 * time.Minute)
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET pr_delivery_started_at = $2 WHERE session_id = $1`, sessionID, deliveryAt); err != nil {
+		t.Fatal(err)
+	}
 
 	plan, err := plans.Create(ctx, sqlcgen.CreatePlanParams{SessionID: sessionID, TurnID: first.ID, Version: 1, Status: sqlcgen.PlanStatusAwaitingApproval})
 	if err != nil {
@@ -128,6 +132,9 @@ func TestSessionActivityFacts_OneStatement(t *testing.T) {
 	if facts.SandboxStatus == nil || *facts.SandboxStatus != sqlcgen.SandboxStatusReady {
 		t.Errorf("sandbox_status = %v, want ready", facts.SandboxStatus)
 	}
+	if !facts.PrDeliveryStartedAt.Valid || !facts.PrDeliveryStartedAt.Time.Equal(deliveryAt) {
+		t.Errorf("pr_delivery_started_at = %v, want %v", facts.PrDeliveryStartedAt, deliveryAt)
+	}
 	if facts.InFlightTurnID != processing.ID || facts.InFlightTurnStatus != "processing" || !facts.InFlightDispatchedAt.Time.Equal(dispatchedAt) {
 		t.Errorf("in-flight turn = (%v, %q, %v), want (%v, processing, %v)", facts.InFlightTurnID, facts.InFlightTurnStatus, facts.InFlightDispatchedAt.Time, processing.ID, dispatchedAt)
 	}
@@ -160,8 +167,8 @@ func TestSessionActivityFacts_OneStatement(t *testing.T) {
 			t.Errorf("turn_counts = %v, want {}", got)
 		}
 		if facts.InFlightTurnID.Valid || facts.InFlightTurnStatus != "" || facts.LastRunTurnID.Valid || facts.LastRunStatus != "" || facts.NewestTurnID.Valid ||
-			facts.AwaitingPlanID.Valid || facts.AwaitingStepID.Valid || facts.EscalatedRunID.Valid || facts.SandboxStatus != nil {
-			t.Errorf("facts = %+v, want no turn, no gate, no sandbox", facts)
+			facts.AwaitingPlanID.Valid || facts.AwaitingStepID.Valid || facts.EscalatedRunID.Valid || facts.SandboxStatus != nil || facts.PrDeliveryStartedAt.Valid {
+			t.Errorf("facts = %+v, want no turn, no gate, no sandbox, no delivery", facts)
 		}
 	})
 
@@ -177,12 +184,14 @@ func TestSessionActivityFacts_OneStatement(t *testing.T) {
 // ActivityFacts reports (technical plan §43.20). A run in needs_review is
 // never moved out of it, so each case below is a state that would gate the
 // session for good if every such run counted. It is reported only while
-// it is the session's newest workflow run, the session's newest turn is
-// one of that run's own attempts, and its definition is not a built-in
-// one. Rows are written the way the workflow engine writes them -- a run,
-// one attempt per turn with the turn attached and then finished, then the
-// escalation -- with created_at set explicitly so the order is
-// unambiguous.
+// no turn has been created since it escalated -- it is the session's
+// newest workflow run, and the session's newest turn is one of that run's
+// own attempts or was created before the escalation -- and its definition
+// is not a built-in one. Rows are written the way the workflow engine
+// writes them -- a run, one attempt per turn with the turn attached and
+// then finished, then the escalation -- with every instant (turns' and
+// runs' created_at, the escalation's updated_at) set explicitly on one
+// timeline, so the order is unambiguous.
 func TestSessionActivityFacts_LiveEscalation(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
@@ -246,21 +255,29 @@ func TestSessionActivityFacts_LiveEscalation(t *testing.T) {
 			t.Fatalf("finish step run: %v", err)
 		}
 	}
-	escalate := func(t *testing.T, run pgtype.UUID) sqlcgen.WorkflowRun {
+	// escalate escalates run the way the engine does, at base+at on the
+	// same timeline as every turn and run above: the instant the
+	// escalation reads as, and the one a turn's creation is ordered
+	// against.
+	escalate := func(t *testing.T, run pgtype.UUID, at time.Duration) sqlcgen.WorkflowRun {
 		t.Helper()
 		row, err := workflows.EscalateRun(ctx, run)
 		if err != nil {
 			t.Fatalf("escalate run: %v", err)
 		}
+		if err := pool.QueryRow(ctx, `UPDATE workflow_runs SET updated_at = $2 WHERE id = $1 RETURNING updated_at`, run, base.Add(at)).Scan(&row.UpdatedAt); err != nil {
+			t.Fatalf("set the escalation's instant: %v", err)
+		}
 		return row
 	}
 	// escalatedCustomRun is the live case every "superseded" case below
-	// starts from: a custom run whose one turn failed at minute 0.
+	// starts from: a custom run whose one turn, created at minute 0,
+	// failed and escalated the run half a minute later.
 	escalatedCustomRun := func(t *testing.T, sessionID pgtype.UUID) sqlcgen.WorkflowRun {
 		t.Helper()
 		run := newRun(t, sessionID, customDef, 0)
 		attempt(t, run, customStep1, newTurn(t, sessionID, sqlcgen.TurnStatusFailed, 0), "failed", "blocked")
-		return escalate(t, run)
+		return escalate(t, run, 30*time.Second)
 	}
 
 	cases := []struct {
@@ -276,12 +293,47 @@ func TestSessionActivityFacts_LiveEscalation(t *testing.T) {
 			run := newRun(t, s, customDef, 0)
 			attempt(t, run, customStep1, newTurn(t, s, sqlcgen.TurnStatusCompleted, 0), "completed", "ok")
 			attempt(t, run, customStep2, newTurn(t, s, sqlcgen.TurnStatusFailed, 1), "failed", "blocked")
-			return escalate(t, run), true
+			return escalate(t, run, 90*time.Second), true
+		}},
+		// Review round 2, O2: a decision escalates the run AFTER a turn that
+		// is none of its attempts -- one sent while the step awaited that
+		// decision, which the engine leaves untracked (no step run, no new
+		// run). Nothing has come after the escalation, so it is the
+		// session's latest state.
+		{"a custom run escalated after an untracked turn is reported (the turn came before the escalation)", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
+			run := newRun(t, s, customDef, 0)
+			attempt(t, run, customStep1, newTurn(t, s, sqlcgen.TurnStatusCancelled, 0), "cancelled", "blocked")
+			newTurn(t, s, sqlcgen.TurnStatusCompleted, 1)
+			return escalate(t, run, 2*time.Minute), true
+		}},
+		{"a turn created after that escalation supersedes it again", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
+			run := newRun(t, s, customDef, 0)
+			attempt(t, run, customStep1, newTurn(t, s, sqlcgen.TurnStatusCancelled, 0), "cancelled", "blocked")
+			newTurn(t, s, sqlcgen.TurnStatusCompleted, 1)
+			escalated := escalate(t, run, 2*time.Minute)
+			newTurn(t, s, sqlcgen.TurnStatusPending, 3)
+			return escalated, false
+		}},
+		// Each arm alone: the run's own attempt being the newest turn
+		// reports it even with the escalation's instant placed before that
+		// turn's creation (clocks aside, its own attempt cannot supersede
+		// it); and a turn created before the escalation reports it without
+		// being an attempt (the case above).
+		{"the run's own attempt as the newest turn is reported, whatever the instants say", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
+			run := newRun(t, s, customDef, 0)
+			attempt(t, run, customStep1, newTurn(t, s, sqlcgen.TurnStatusFailed, 1), "failed", "blocked")
+			return escalate(t, run, 30*time.Second), true
+		}},
+		{"a built-in run escalated after an untracked turn is still not reported", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
+			run := newRun(t, s, builtInDef, 0)
+			attempt(t, run, builtInStep, newTurn(t, s, sqlcgen.TurnStatusFailed, 0), "failed", "blocked")
+			newTurn(t, s, sqlcgen.TurnStatusCompleted, 1)
+			return escalate(t, run, 2*time.Minute), false
 		}},
 		{"a built-in run whose own turn is the newest is not reported", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
 			run := newRun(t, s, builtInDef, 0)
 			attempt(t, run, builtInStep, newTurn(t, s, sqlcgen.TurnStatusCancelled, 0), "cancelled", "blocked")
-			return escalate(t, run), false
+			return escalate(t, run, 30*time.Second), false
 		}},
 		{"a newer run with its own turn supersedes it", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
 			escalated := escalatedCustomRun(t, s)
@@ -303,7 +355,7 @@ func TestSessionActivityFacts_LiveEscalation(t *testing.T) {
 			return escalated, false
 		}},
 		{"a run with no turn of its own is not reported", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
-			return escalate(t, newRun(t, s, customDef, 0)), false
+			return escalate(t, newRun(t, s, customDef, 0), 30*time.Second), false
 		}},
 	}
 	for _, tc := range cases {
@@ -324,5 +376,82 @@ func TestSessionActivityFacts_LiveEscalation(t *testing.T) {
 				t.Errorf("escalated run = (%v, %v), want none (run %v is not the session's live escalation)", facts.EscalatedRunID, facts.EscalatedRunSince, run.ID)
 			}
 		})
+	}
+}
+
+// TestSandboxPRDelivery_StartAndEnd pins the push/PR delivery stamp's own
+// writes (technical plan §43.20, migrations/000145): StartPRDelivery stamps
+// the database's now() -- the clock ActivityFacts' observed_at reads -- and
+// a later start overwrites an earlier one; EndPRDelivery clears it, and is
+// a no-op when nothing is outstanding. ActivityFacts reads the stamp in its
+// one statement.
+func TestSandboxPRDelivery_StartAndEnd(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessions := narvipg.NewSessionStore(pool)
+	sandboxes := narvipg.NewSandboxStore(pool)
+
+	sessionID := createTestSession(ctx, t, pool)
+	if _, err := sandboxes.Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+	stamp := func() pgtype.Timestamptz {
+		t.Helper()
+		facts, err := sessions.ActivityFacts(ctx, sessionID)
+		if err != nil {
+			t.Fatalf("ActivityFacts: %v", err)
+		}
+		return facts.PrDeliveryStartedAt
+	}
+	if got := stamp(); got.Valid {
+		t.Fatalf("a new sandbox: stamp %v, want none", got)
+	}
+
+	if err := sandboxes.StartPRDelivery(ctx, sessionID); err != nil {
+		t.Fatalf("StartPRDelivery: %v", err)
+	}
+	first := stamp()
+	facts, err := sessions.ActivityFacts(ctx, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Valid || first.Time.After(facts.ObservedAt.Time) || facts.ObservedAt.Time.Sub(first.Time) > time.Minute {
+		t.Fatalf("started: stamp %v observed %v, want the database's now(), at or just before the read", first, facts.ObservedAt)
+	}
+
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET pr_delivery_started_at = pr_delivery_started_at - interval '1 hour' WHERE session_id = $1`, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := sandboxes.StartPRDelivery(ctx, sessionID); err != nil {
+		t.Fatalf("StartPRDelivery again: %v", err)
+	}
+	if again := stamp(); !again.Valid || !again.Time.After(first.Time.Add(-time.Minute)) {
+		t.Fatalf("a later start: stamp %v, want it overwritten with now() (not the hour-old one)", again)
+	}
+
+	for i := 0; i < 2; i++ {
+		if err := sandboxes.EndPRDelivery(ctx, sessionID); err != nil {
+			t.Fatalf("EndPRDelivery #%d: %v", i+1, err)
+		}
+		if got := stamp(); got.Valid {
+			t.Fatalf("ended #%d: stamp %v, want none", i+1, got)
+		}
+	}
+
+	// A respawn replaces the generation the push was sent to: that push
+	// can never report back, so its delivery is over.
+	if err := sandboxes.StartPRDelivery(ctx, sessionID); err != nil {
+		t.Fatalf("StartPRDelivery before the respawn: %v", err)
+	}
+	if got := stamp(); !got.Valid {
+		t.Fatal("before the respawn: no stamp")
+	}
+	tokenHash := "respawn-token-hash"
+	respawned, err := sandboxes.UpsertForSpawn(ctx, sqlcgen.UpsertSandboxForSpawnParams{SessionID: sessionID, TokenHash: &tokenHash})
+	if err != nil {
+		t.Fatalf("UpsertForSpawn: %v", err)
+	}
+	if respawned.Gen < 2 || respawned.PrDeliveryStartedAt.Valid {
+		t.Fatalf("respawned: gen %d stamp %v, want a new generation and no stamp", respawned.Gen, respawned.PrDeliveryStartedAt)
 	}
 }

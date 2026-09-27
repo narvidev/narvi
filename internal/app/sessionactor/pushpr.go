@@ -614,6 +614,20 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 			}
 			return &pushSignal{gen: int(sandboxRow.Gen), repos: repos, blockedNoGitHubIdentity: true}, nil
 		}
+
+		// Technical plan §43.20: a push is about to be sent, and a pull
+		// request will follow its push_complete -- work that progresses
+		// with no new input, so the session's status must not read settled
+		// until it is over. Stamped HERE, in the transaction that completes
+		// the turn, so no snapshot ever holds this completed turn without
+		// it; the shadow and blocked cycles above send nothing and are
+		// never stamped. Cleared once createPRBestEffort has finished, when
+		// a push_error arrives, or by sendPushBestEffort when nothing could
+		// be sent; a push that never reports back is bounded by
+		// MCPStatusDeliveryWindow on the read side.
+		if err := a.stores.sandbox.WithTx(tx).StartPRDelivery(ctx, a.sessionID); err != nil {
+			return nil, fmt.Errorf("sessionactor: stamp push/PR delivery start: %w", err)
+		}
 	}
 
 	return &pushSignal{gen: int(sandboxRow.Gen), repos: repos}, nil
@@ -828,7 +842,16 @@ func (a *Actor) recordFalseFailureIfApplicable(ctx context.Context, tx pgx.Tx) e
 // changes whether that failure is attempted, surfaced as an error, and
 // left unrecorded, or skipped, recorded, and read by the evaluator as the
 // product working as designed.
-func (a *Actor) sendPushBestEffort(sessionID string, sig *pushSignal) {
+//
+// # Technical plan §43.20: a push that is not sent ends its delivery
+//
+// completeProcessingTurn stamped the delivery's start (StartPRDelivery)
+// for every signal that reaches past the shadow and blocked returns below.
+// If no push command leaves here after all -- no commander, no repo with
+// a branch, a marshal or send failure -- no push_complete or push_error
+// will ever come back, so the stamp is cleared now rather than holding
+// the session's status unsettled until MCPStatusDeliveryWindow runs out.
+func (a *Actor) sendPushBestEffort(ctx context.Context, sessionID string, sig *pushSignal) {
 	if sig == nil {
 		return
 	}
@@ -849,6 +872,13 @@ func (a *Actor) sendPushBestEffort(sessionID string, sig *pushSignal) {
 		// obtain (review round 2, finding P1).
 		return
 	}
+
+	sent := false
+	defer func() {
+		if !sent {
+			a.endPRDeliveryBestEffort(ctx)
+		}
+	}()
 
 	if a.commander == nil {
 		a.logger.Warn("sessionactor: turn completed but no SandboxCommander is configured; skipping push")
@@ -881,6 +911,19 @@ func (a *Actor) sendPushBestEffort(sessionID string, sig *pushSignal) {
 	}
 	if err := a.commander.SendCommand(sessionID, payload); err != nil {
 		a.logger.Warn("sessionactor: send push command failed", "error", err)
+		return
+	}
+	sent = true
+}
+
+// endPRDeliveryBestEffort clears this session's push/PR delivery stamp
+// (technical plan §43.20; SandboxStore.EndPRDelivery) once that delivery
+// is over. Best-effort, like the delivery itself: a failure is logged, and
+// the status read's MCPStatusDeliveryWindow still bounds how long the
+// stamp can hold the session unsettled.
+func (a *Actor) endPRDeliveryBestEffort(ctx context.Context) {
+	if err := a.stores.sandbox.EndPRDelivery(ctx, a.sessionID); err != nil {
+		a.logger.Warn("sessionactor: clear push/PR delivery stamp failed", "error", err)
 	}
 }
 
@@ -988,7 +1031,16 @@ func redactedURLIdentity(rawURL string) string {
 //
 // The decrypted OAuth token is NEVER logged, here or anywhere it might
 // propagate to.
+//
+// Technical plan §43.20: this push's delivery ends when this function
+// returns, by whichever path -- deferred, so the stamp completeProcessingTurn
+// set (StartPRDelivery) is cleared only AFTER every pull request of this
+// push_complete has been created and its artifact row written. A status
+// read that no longer sees the stamp therefore already sees the pull
+// request.
 func (a *Actor) createPRBestEffort(ctx context.Context, raw json.RawMessage) {
+	defer a.endPRDeliveryBestEffort(ctx)
+
 	if a.sourceControl == nil {
 		a.logger.Warn("sessionactor: push_complete arrived but no SourceControl is configured; skipping PR creation")
 		return

@@ -11109,21 +11109,28 @@ type Session struct {
 
 // GET /api/sessions/{sessionID}/status (technical plan §43.20): what one session's
 // work is doing now, and how long to wait before reading it again. Derived at read
-// time from the session's turn queue and its human gates, all read in ONE database
-// snapshot -- never from Session.status, which is re-derived only when a turn
-// reaches a terminal state and so can hold any of its five values while a turn is
-// queued or running. Carries no events and no transcript: the event history is GET
+// time from the session's turn queue, a completed turn's push and pull request
+// still under way, and its human gates, all read in ONE database snapshot -- never
+// from Session.status, which is re-derived only when a turn reaches a terminal
+// state and so can hold any of its five values while a turn is queued or running.
+// Carries no events and no transcript: the event history is GET
 // /api/sessions/{sessionID}/events (EventsResponse), a separate, paginated read.
 type SessionActivity struct {
 	// In precedence order: 'running' when a turn is dispatched or processing (turns
 	// may be queued behind it); else 'queued' when a turn is pending -- including the
 	// gap between one turn finishing and the next being dispatched, and a whole
-	// sandbox cold start; else 'awaiting_approval' when a person must act (a plan
+	// sandbox cold start; else 'delivering' when a turn that completed is still being
+	// delivered -- its branch pushed, then its pull request opened, which happens
+	// with no new input -- for at most the deployment's delivery window from when
+	// that began (10 minutes as shipped: a push that never reports back stops
+	// counting then); else 'awaiting_approval' when a person must act (a plan
 	// awaiting approval, a workflow step awaiting a decision, or a custom workflow's
 	// run escalated for review with nothing on the session since -- see
 	// awaiting.kind); else 'idle' when the session has no turn at all; else
-	// 'finished' (at least one turn, every one terminal). A queued or running turn is
-	// never reported as idle or finished.
+	// 'finished' (at least one turn, every one terminal, nothing being delivered). A
+	// queued or running turn is never reported as idle or finished, and a pull
+	// request a delivery opens within that window is recorded before activity leaves
+	// 'delivering'.
 	Activity SessionActivityActivity `json:"activity" yaml:"activity" mapstructure:"activity"`
 
 	// Archived corresponds to the JSON schema field "archived".
@@ -11158,21 +11165,23 @@ type SessionActivity struct {
 
 	// true exactly when activity is idle, awaiting_approval or finished: nothing
 	// progresses server-side until a person acts or sends new input. Never true while
-	// a turn is queued or running.
+	// a turn is queued or running, or while a completed turn's push and pull request
+	// are being delivered.
 	Settled bool `json:"settled" yaml:"settled" mapstructure:"settled"`
 
 	// How long to wait before reading this status again, in whole seconds (rounded
-	// up): short while a turn is queued on a warm sandbox or running, longer while a
-	// sandbox starts or a person must act, longest once finished or idle -- always
-	// within the deployment's configured floor and ceiling (2 and 300 seconds as
-	// shipped). A hint that keeps polling quiet, never a limit: an earlier read is
-	// answered all the same.
+	// up): short while a turn is queued on a warm sandbox, running or being
+	// delivered, longer while a sandbox starts or a person must act, longest once
+	// finished or idle -- always within the deployment's configured floor and ceiling
+	// (2 and 300 seconds as shipped). A hint that keeps polling quiet, never a limit:
+	// an earlier read is answered all the same.
 	SuggestedDelaySeconds int `json:"suggestedDelaySeconds" yaml:"suggestedDelaySeconds" mapstructure:"suggestedDelaySeconds"`
 }
 
 type SessionActivityActivity string
 
 const SessionActivityActivityAwaitingApproval SessionActivityActivity = "awaiting_approval"
+const SessionActivityActivityDelivering SessionActivityActivity = "delivering"
 const SessionActivityActivityFinished SessionActivityActivity = "finished"
 const SessionActivityActivityIdle SessionActivityActivity = "idle"
 const SessionActivityActivityQueued SessionActivityActivity = "queued"
@@ -11182,6 +11191,7 @@ var enumValues_SessionActivityActivity = []interface{}{
 	"idle",
 	"queued",
 	"running",
+	"delivering",
 	"awaiting_approval",
 	"finished",
 }
@@ -11219,10 +11229,12 @@ type SessionActivityAwaiting struct {
 	// workflow step awaiting a decision (id is the step run's);
 	// 'workflow_escalation': a custom workflow's run escalated for review (id is the
 	// run's), reported only while it is the session's latest state -- its newest
-	// workflow run, with no turn after that run's own. Any newer turn closes it, so a
-	// person answers it by sending the session new work. A built-in workflow's
-	// escalation is never reported: no person or route can act on it, and when its
-	// turn failed or was stopped, lastRun already says so.
+	// workflow run, with no turn created since it escalated (a turn created before
+	// it, such as one sent while a step awaited the decision that escalated the run,
+	// does not close it). Any newer turn closes it, so a person answers it by sending
+	// the session new work. A built-in workflow's escalation is never reported: no
+	// person or route can act on it, and when its turn failed or was stopped, lastRun
+	// already says so.
 	Kind SessionActivityAwaitingKind `json:"kind" yaml:"kind" mapstructure:"kind"`
 
 	// When the gate opened.
@@ -14061,22 +14073,6 @@ func (j *WorkflowStepRunOutcomeStatus) UnmarshalJSON(value []byte) error {
 // data once posted (§25.6), same discipline as PostReviewVerdictRequest.summary.
 type WorkflowStepRunOutcomeSummary *string
 
-type WorkflowStepRunStatus string
-
-const WorkflowStepRunStatusAwaitingDecision WorkflowStepRunStatus = "awaiting_decision"
-const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
-const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
-const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
-const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
-
-var enumValues_WorkflowStepRunStatus = []interface{}{
-	"awaiting_decision",
-	"running",
-	"completed",
-	"failed",
-	"cancelled",
-}
-
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 	var v string
@@ -14095,6 +14091,24 @@ func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 	}
 	*j = WorkflowStepRunStatus(v)
 	return nil
+}
+
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
+
+type WorkflowStepRunStatus string
+
+const WorkflowStepRunStatusAwaitingDecision WorkflowStepRunStatus = "awaiting_decision"
+const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
+const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
+const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
+const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
+
+var enumValues_WorkflowStepRunStatus = []interface{}{
+	"awaiting_decision",
+	"running",
+	"completed",
+	"failed",
+	"cancelled",
 }
 
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
@@ -14158,5 +14172,3 @@ func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
 	*j = WorkflowStepRun(plain)
 	return nil
 }
-
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict

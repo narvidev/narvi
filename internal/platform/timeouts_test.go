@@ -1811,8 +1811,9 @@ func TestValidate_MCPEndpointBrakes(t *testing.T) {
 }
 
 // TestDefaultTimeouts_MCPStatusDelayFields pins the status delay table
-// (technical plan §43.20): 15 s starting, 5 s queued, 10 s running, 60 s
-// awaiting a person, 300 s settled, clamped to [2 s, 300 s].
+// (technical plan §43.20): 15 s starting, 5 s queued, 10 s running, 5 s
+// delivering, 60 s awaiting a person, 300 s settled, clamped to [2 s,
+// 300 s] -- and the 10-minute bound on a push/PR delivery.
 func TestDefaultTimeouts_MCPStatusDelayFields(t *testing.T) {
 	t.Parallel()
 
@@ -1825,10 +1826,12 @@ func TestDefaultTimeouts_MCPStatusDelayFields(t *testing.T) {
 		{"MCPStatusDelayStarting", to.MCPStatusDelayStarting, 15 * time.Second},
 		{"MCPStatusDelayQueued", to.MCPStatusDelayQueued, 5 * time.Second},
 		{"MCPStatusDelayRunning", to.MCPStatusDelayRunning, 10 * time.Second},
+		{"MCPStatusDelayDelivering", to.MCPStatusDelayDelivering, 5 * time.Second},
 		{"MCPStatusDelayAwaitingHuman", to.MCPStatusDelayAwaitingHuman, 60 * time.Second},
 		{"MCPStatusDelaySettled", to.MCPStatusDelaySettled, 300 * time.Second},
 		{"MCPStatusDelayFloor", to.MCPStatusDelayFloor, 2 * time.Second},
 		{"MCPStatusDelayCeiling", to.MCPStatusDelayCeiling, 300 * time.Second},
+		{"MCPStatusDeliveryWindow", to.MCPStatusDeliveryWindow, 10 * time.Minute},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("%s = %v, want %v", tc.name, tc.got, tc.want)
@@ -1854,6 +1857,7 @@ func TestTimeouts_Validate_MCPStatusDelay(t *testing.T) {
 		{"MCPStatusDelayStarting", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelayStarting }},
 		{"MCPStatusDelayQueued", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelayQueued }},
 		{"MCPStatusDelayRunning", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelayRunning }},
+		{"MCPStatusDelayDelivering", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelayDelivering }},
 		{"MCPStatusDelayAwaitingHuman", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelayAwaitingHuman }},
 		{"MCPStatusDelaySettled", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelaySettled }},
 	}
@@ -1912,4 +1916,56 @@ func TestTimeouts_Validate_MCPStatusDelay(t *testing.T) {
 			t.Fatalf("Validate() = %v, want a broken status-delay link", err)
 		}
 	})
+}
+
+// TestTimeouts_Validate_MCPStatusDeliveryWindow proves the bound on a
+// push/PR delivery (technical plan §43.20) stays above one repo's push and
+// pull request at their own limits, with MinTimeoutMargin: a window that
+// would let a slow but still-healthy delivery read finished before its
+// pull request appears is refused, by name, and so is a limit raised
+// beneath an unchanged window. Exactly on the margin is accepted.
+func TestTimeouts_Validate_MCPStatusDeliveryWindow(t *testing.T) {
+	t.Parallel()
+
+	const chain = "MCPStatusDeliveryWindow > RepoCloneTimeout + RepoSHAResolutionTimeout + PRCreateTimeout"
+	inside := func(to platform.Timeouts) time.Duration {
+		return to.RepoCloneTimeout + to.RepoSHAResolutionTimeout + to.PRCreateTimeout
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*platform.Timeouts)
+		broken bool
+	}{
+		{"the shipped defaults hold", func(*platform.Timeouts) {}, false},
+		{"exactly the margin above is accepted", func(to *platform.Timeouts) { to.MCPStatusDeliveryWindow = inside(*to) + platform.MinTimeoutMargin }, false},
+		{"one millisecond short of the margin", func(to *platform.Timeouts) {
+			to.MCPStatusDeliveryWindow = inside(*to) + platform.MinTimeoutMargin - time.Millisecond
+		}, true},
+		{"a window shorter than one push", func(to *platform.Timeouts) { to.MCPStatusDeliveryWindow = time.Minute }, true},
+		{"a push limit raised beneath the window", func(to *platform.Timeouts) { to.RepoCloneTimeout = to.MCPStatusDeliveryWindow }, true},
+		{"a PR creation limit raised beneath the window", func(to *platform.Timeouts) { to.PRCreateTimeout = to.MCPStatusDeliveryWindow }, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			to := platform.DefaultTimeouts()
+			tc.mutate(&to)
+			err := to.Validate()
+			var errs []error
+			if joined, ok := err.(interface{ Unwrap() []error }); ok {
+				errs = joined.Unwrap()
+			} else if err != nil {
+				errs = []error{err}
+			}
+			found := false
+			for _, e := range errs {
+				var inv *platform.TimeoutInvariantError
+				if errors.As(e, &inv) && inv.Chain == chain {
+					found = true
+				}
+			}
+			if found != tc.broken {
+				t.Fatalf("Validate() = %v; link %q broken = %v, want %v", err, chain, found, tc.broken)
+			}
+		})
+	}
 }
