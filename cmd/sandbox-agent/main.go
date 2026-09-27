@@ -2170,9 +2170,11 @@ const warmBootSecondaryFailedMsg = "sandbox-agent: warm-boot git-dir seed: secon
 // runBootSequence and the post-boot ChownWorkspaceForRuntime pass, right
 // after bridge.MarkBootComplete -- and shuttingDownLogMsg what it logs when it
 // begins its supervised shutdown, which before boot completes means boot
-// failed. Named, like warmBootSecondaryFailedMsg above, so the tests that
-// wait on them (push_integration_test.go's waitForBootComplete) read the
-// messages run() actually logs rather than copies that can drift.
+// failed. Not every failed boot logs it: one that fails before the
+// supervised group starts (opencode failing to spawn, say) returns from
+// run() without it. Named, like warmBootSecondaryFailedMsg above, so the
+// tests that wait on them (push_integration_test.go's waitForBootComplete)
+// read the messages run() actually logs rather than copies that can drift.
 const (
 	bootCompleteLogMsg = "sandbox-agent: boot sequence complete"
 	shuttingDownLogMsg = "sandbox-agent: shutting down"

@@ -316,9 +316,14 @@ func setUpBareRepoAndServer(t *testing.T) (gitServerURL string) {
 }
 
 // waitForBootComplete blocks until the sandbox-agent subprocess logs
-// bootCompleteLogMsg (main.go), bounded by pushTestTimeout, failing at once
-// with the subprocess's output if it logs shuttingDownLogMsg first -- a
-// failed boot.
+// bootCompleteLogMsg (main.go), bounded by pushTestTimeout. It fails at once,
+// with the subprocess's output, on either sign that boot will never complete:
+// the subprocess logging shuttingDownLogMsg first, or exiting (exited, from
+// runSandboxAgent). A failed boot gives one or the other: run() either
+// returns early -- before its supervised group exists, as when opencode
+// fails to spawn, which logs nothing this could wait on -- or shuts that
+// group down first. The records it reads are Info records, which is why
+// runSandboxAgent pins the subprocess's log level.
 //
 // The tests below stand in for the agent runtime: they edit and commit in
 // the workspace, then ask for a push. The runtime gets no prompt before
@@ -334,9 +339,12 @@ func setUpBareRepoAndServer(t *testing.T) (gitServerURL string) {
 // come. This wait had already moved once, from the .git directory to
 // README.md, when the same race surfaced as "cannot lock ref 'HEAD'"; any
 // clone milestone short of boot completion leaves the rest of it open.
-func waitForBootComplete(t *testing.T, out *syncBuffer) {
+func waitForBootComplete(t *testing.T, out *syncBuffer, exited <-chan struct{}) {
 	t.Helper()
-	deadline := time.Now().Add(pushTestTimeout)
+	deadline := time.NewTimer(pushTestTimeout)
+	defer deadline.Stop()
+	poll := time.NewTicker(100 * time.Millisecond)
+	defer poll.Stop()
 	for {
 		switch firstBootOutcome(out.String()) {
 		case bootCompleteLogMsg:
@@ -344,10 +352,15 @@ func waitForBootComplete(t *testing.T, out *syncBuffer) {
 		case shuttingDownLogMsg:
 			t.Fatalf("sandbox-agent shut down before completing boot; sandbox-agent output:\n%s", out.String())
 		}
-		if time.Now().After(deadline) {
+		select {
+		case <-exited:
+			// Its output is complete by now: exited closes only once
+			// cmd.Wait has returned, which is after copying all of it.
+			t.Fatalf("sandbox-agent exited while the test waited for it to complete boot; sandbox-agent output:\n%s", out.String())
+		case <-deadline.C:
 			t.Fatalf("timed out waiting for sandbox-agent to log %q; sandbox-agent output:\n%s", bootCompleteLogMsg, out.String())
+		case <-poll.C:
 		}
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -372,7 +385,7 @@ func firstBootOutcome(output string) string {
 
 // runSandboxAgent starts the real sandbox-agent binary against a real
 // SESSION_CONFIG pointing at fcp, returning a buffer capturing its
-// combined output for diagnostics.
+// combined output for diagnostics, and a channel closed once it has exited.
 //
 // Both the normal per-test-completion path (t.Cleanup below) and the
 // pushTestTimeout path (cmd.Cancel/cmd.WaitDelay) stop it via
@@ -439,7 +452,7 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-func runSandboxAgent(t *testing.T, binPath, gitServerURL, workspaceDir string, fcp *fakeControlPlane) *syncBuffer {
+func runSandboxAgent(t *testing.T, binPath, gitServerURL, workspaceDir string, fcp *fakeControlPlane) (out *syncBuffer, exited <-chan struct{}) {
 	t.Helper()
 
 	sessionConfigJSON := fmt.Sprintf(`{
@@ -504,6 +517,10 @@ func runSandboxAgent(t *testing.T, binPath, gitServerURL, workspaceDir string, f
 		// (clone, push, rev-parse) via supervisor.Spec's own nil-Env
 		// "inherit this process's environment" convention.
 		"GIT_SSL_NO_VERIFY=true",
+		// waitForBootComplete reads boot's outcome from Info records, so an
+		// NARVI_LOG_LEVEL inherited from the caller's shell above info
+		// would hide them. os/exec keeps the last value of a duplicated key.
+		"NARVI_LOG_LEVEL=info",
 	)
 	// syncBuffer, not bytes.Buffer: os/exec writes this from its own copier
 	// goroutine while the tests below read it back from the test goroutine.
@@ -511,9 +528,9 @@ func runSandboxAgent(t *testing.T, binPath, gitServerURL, workspaceDir string, f
 	// Stdout and Stderr additionally makes os/exec reuse ONE pipe and ONE
 	// copier goroutine for the pair (it compares the two interface values),
 	// so the interleaving of the child's stdout and stderr is preserved.
-	var out syncBuffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	out = &syncBuffer{}
+	cmd.Stdout = out
+	cmd.Stderr = out
 
 	// Own process group (mirrors internal/sandboxagent/supervisor.Spawn's
 	// own SysProcAttr{Setpgid: true} for every child IT spawns) so
@@ -564,7 +581,7 @@ func runSandboxAgent(t *testing.T, binPath, gitServerURL, workspaceDir string, f
 		stopProcessGroup(cmd.Process.Pid, waitDone, timeouts.SupervisorShutdownTimeout)
 	})
 
-	return &out
+	return out, waitDone
 }
 
 // TestHandlePush_RealGitPush_Success proves a real `git push` (via the
@@ -577,9 +594,9 @@ func TestHandlePush_RealGitPush_Success(t *testing.T) {
 	workspaceDir := t.TempDir()
 
 	fcp := newFakeControlPlane(t, "push-success-session", false /* credentialShouldFail */)
-	out := runSandboxAgent(t, binPath, gitServerURL, workspaceDir, fcp)
+	out, exited := runSandboxAgent(t, binPath, gitServerURL, workspaceDir, fcp)
 
-	waitForBootComplete(t, out)
+	waitForBootComplete(t, out, exited)
 
 	repoDir := filepath.Join(workspaceDir, "widgets")
 	if err := os.WriteFile(filepath.Join(repoDir, "change.txt"), []byte("a real change\n"), 0o644); err != nil {
@@ -635,9 +652,9 @@ func TestHandlePush_CredentialRefused_ProducesPushError(t *testing.T) {
 	workspaceDir := t.TempDir()
 
 	fcp := newFakeControlPlane(t, "push-failure-session", true /* credentialShouldFail */)
-	out := runSandboxAgent(t, binPath, gitServerURL, workspaceDir, fcp)
+	out, exited := runSandboxAgent(t, binPath, gitServerURL, workspaceDir, fcp)
 
-	waitForBootComplete(t, out)
+	waitForBootComplete(t, out, exited)
 
 	repoDir := filepath.Join(workspaceDir, "widgets")
 	if err := os.WriteFile(filepath.Join(repoDir, "change.txt"), []byte("a real change\n"), 0o644); err != nil {
