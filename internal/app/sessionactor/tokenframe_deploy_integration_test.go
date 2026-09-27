@@ -397,3 +397,156 @@ func TestHandleSandboxEvent_TokenFrames_ReplayDuringTheTurnRunningAtDeploy(t *te
 		t.Errorf("stored log differs from %s, which the web timeline test reads; got:\n%s", path, gotJSON)
 	}
 }
+
+// TestHandleSandboxEvent_TokenFrames_OldAgentOrderDuringTheTurnRunningAtDeploy
+// is the turn running at deploy on a sandbox still running a sandbox-agent
+// built before per-frame storage -- every sandbox alive at the deploy runs
+// the agent baked into its image. That agent publishes its connection for
+// live sends before it replays its buffer, so a frame the turn sends
+// meanwhile, execution_complete included, can reach the control plane
+// ahead of older frames the replay has not written yet (tokenframe.go,
+// "The turn running at deploy"). Each wire below is an order that agent
+// was recorded sending; every event goes through Actor.Send.
+//
+// The previous binary stored `stored` before the deploy, first-wins: each
+// part keeps its empty first frame. Parts are placed by their first frame,
+// so prt_b is the turn's last part whatever order its frames land in, and
+// planContentText -- the text behind the Slack/Linear plan approval, and
+// through the same ExtractContent, GET /plans and the approved snapshot --
+// reads it. Before ExtractContent ordered parts by their first frame, the
+// first two wires read prt_a's narration: its replayed frame is the newest
+// row.
+func TestHandleSandboxEvent_TokenFrames_OldAgentOrderDuringTheTurnRunningAtDeploy(t *testing.T) {
+	const (
+		narration = "I'll start by reading the store and its migrations."
+		plan      = "1. Add the migration\n2. Wire the store\n3. Tests"
+	)
+	tests := []struct {
+		name   string
+		stored []string // what the previous binary received, in order
+		wire   []string // what this binary then receives, in order
+		// wantLog is every stored row, oldest first.
+		wantLog  []string
+		wantPlan string
+	}{
+		{
+			name:   "the last part's final frame sent live ahead of the replay",
+			stored: []string{"s1", "a0", "aN", "f1", "s2", "b0"},
+			wire:   []string{"bP" /* live */, "s1", "a0", "aN", "f1", "s2", "b0" /* replay */, "f2", "done" /* live */},
+			wantLog: []string{
+				"step_start:msg_s1=", "token:prt_a=", "step_start:msg_s2=", "token:prt_b=",
+				"token:prt_b=" + plan, "token:prt_a=" + narration, "execution_complete:msg_done=",
+			},
+			wantPlan: plan,
+		},
+		{
+			name:   "the last part opened and closed live in the middle of the replay",
+			stored: []string{"s1", "a0", "aN"},
+			wire:   []string{"s1", "a0" /* replay */, "s2", "b0", "bP" /* live */, "aN", "f1" /* replay */, "f2", "done" /* live */},
+			wantLog: []string{
+				"step_start:msg_s1=", "token:prt_a=", "step_start:msg_s2=", "token:prt_b=",
+				"token:prt_b=" + plan, "token:prt_a=" + narration, "execution_complete:msg_done=",
+			},
+			wantPlan: plan,
+		},
+		{
+			// The turn ends before the replay reaches prt_a's full frame,
+			// so that frame is refused: prt_a keeps the empty first frame
+			// the previous binary left, the timeline shows it blank in s1,
+			// and no row lands after execution_complete.
+			name:   "execution_complete sent live in the middle of the replay",
+			stored: []string{"s1", "a0", "aN", "f1", "s2", "b0"},
+			wire:   []string{"bP" /* live */, "s1", "a0" /* replay */, "f2", "done" /* live */, "aN", "f1", "s2", "b0" /* replay */},
+			wantLog: []string{
+				"step_start:msg_s1=", "token:prt_a=", "step_start:msg_s2=", "token:prt_b=",
+				"token:prt_b=" + plan, "execution_complete:msg_done=",
+			},
+			wantPlan: plan,
+		},
+		{
+			// A known limitation. prt_b closed before the reconnect, so its
+			// full frame waits in the replay behind prt_a's; the turn ends
+			// between the two. prt_a's frame is stored, prt_b's is refused,
+			// and prt_b keeps its empty first frame. A part with no text
+			// is passed over, so the plan reader reads prt_a, the newest-
+			// opened part with text. The previous binary stores neither
+			// full frame and reads the placeholder.
+			name:   "execution_complete sent live while the last part's final frame is still in the replay",
+			stored: []string{"s1", "a0", "aN", "f1", "s2", "b0", "bP"},
+			wire:   []string{"s1", "a0", "aN" /* replay */, "f2", "done" /* live */, "f1", "s2", "b0", "bP" /* replay */},
+			wantLog: []string{
+				"step_start:msg_s1=", "token:prt_a=", "step_start:msg_s2=", "token:prt_b=",
+				"token:prt_a=" + narration, "execution_complete:msg_done=",
+			},
+			wantPlan: narration,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			pool := newTestPool(t)
+			sessionID := createTestSession(ctx, t, pool)
+			if _, err := narvipg.NewSandboxStore(pool).Create(ctx, sessionID); err != nil {
+				t.Fatalf("create sandbox: %v", err)
+			}
+			turn := createDispatchedProcessingTurn(ctx, t, pool, sessionID)
+
+			completeRaw, err := json.Marshal(sandboxws.ExecutionComplete{
+				Type: "execution_complete", MessageId: "msg_done", SessionId: sessionID.String(), Gen: 1,
+				AckId: "execution_complete:msg_done", Outcome: sandboxws.ExecutionCompleteOutcomeCompleted,
+			})
+			if err != nil {
+				t.Fatalf("marshal execution_complete: %v", err)
+			}
+			events := map[string]SandboxEvent{
+				"s1":   stepStartEvent(t, sessionID, "s1"),
+				"a0":   tokenEvent(t, sessionID, "prt_a", ""),
+				"aN":   tokenEvent(t, sessionID, "prt_a", narration),
+				"f1":   stepFinishEvent(t, sessionID, "s1"),
+				"s2":   stepStartEvent(t, sessionID, "s2"),
+				"b0":   tokenEvent(t, sessionID, "prt_b", ""),
+				"bP":   tokenEvent(t, sessionID, "prt_b", plan),
+				"f2":   stepFinishEvent(t, sessionID, "s2"),
+				"done": {Type: "execution_complete", Gen: 1, MessageID: "msg_done", Raw: completeRaw},
+			}
+			event := func(name string) SandboxEvent {
+				t.Helper()
+				cmd, ok := events[name]
+				if !ok {
+					t.Fatalf("no event %q", name)
+				}
+				return cmd
+			}
+
+			prev := newPreviousBinary(ctx, t, pool, sessionID)
+			for _, name := range tt.stored {
+				prev.store(ctx, t, event(name))
+			}
+
+			r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), &fakeBroadcaster{}, nil, nil, "", nil, nil, "", nil, false)
+			if err != nil {
+				t.Fatalf("NewRegistry: %v", err)
+			}
+			t.Cleanup(func() { _ = r.Shutdown() })
+			a, err := r.GetOrSpawn(ctx, sessionID)
+			if err != nil {
+				t.Fatalf("GetOrSpawn: %v", err)
+			}
+			for _, name := range tt.wire {
+				sendSandboxEventForTest(ctx, t, a, event(name))
+			}
+
+			var gotLog []string
+			for _, row := range listEventRows(ctx, t, pool, sessionID) {
+				gotLog = append(gotLog, row.eventType+":"+row.payloadMsgID+"="+row.payloadText)
+			}
+			if strings.Join(gotLog, "|") != strings.Join(tt.wantLog, "|") {
+				t.Fatalf("stored log = %q, want %q", gotLog, tt.wantLog)
+			}
+			if got := a.planContentText(ctx, turn); got != tt.wantPlan {
+				t.Errorf("planContentText = %q, want %q", got, tt.wantPlan)
+			}
+		})
+	}
+}
