@@ -134,6 +134,33 @@ describe('buildTimelineModel', () => {
     expect(step.tokens).toEqual([{ messageId: 'm1', text: 'Hello world' }])
   })
 
+  // The event log's own shape since each distinct cumulative frame became its
+  // own row (internal/app/sessionactor/tokenframe.go): the pinned runtime
+  // sends every text part twice -- empty when the part opens, full when it
+  // closes -- as two rows sharing the part's messageId, both inside the step
+  // that produced them. The step must show one entry per part, holding the
+  // newest frame.
+  it('folds a text part stored as several rows (empty first frame, then the full text) into one entry per part, per step', () => {
+    const events = [
+      env('step_start', { messageId: 'msg_1', stepId: 's1' }),
+      env('token', { messageId: 'prt_a', text: '' }),
+      env('token', { messageId: 'prt_a', text: 'Let me check the tests.' }),
+      env('tool_call', { messageId: 'msg_1', callId: 'c1', toolName: 'bash', input: { command: 'go test' } }),
+      env('tool_result', { messageId: 'msg_1', callId: 'c1', output: { ok: true }, isError: false }),
+      env('step_finish', { messageId: 'msg_1', stepId: 's1', cost: { tokens: { input: 10, output: 5 } } }),
+      env('step_start', { messageId: 'msg_2', stepId: 's2' }),
+      env('token', { messageId: 'prt_b', text: '' }),
+      env('token', { messageId: 'prt_b', text: 'All tests pass.' }),
+      env('step_finish', { messageId: 'msg_2', stepId: 's2', cost: { tokens: { input: 10, output: 5 } } }),
+      env('execution_complete', { messageId: 'm9', outcome: 'completed', reason: null }),
+    ]
+    const model = buildTimelineModel(events)
+    expect(model.turns).toHaveLength(1)
+    const [first, second] = model.turns[0]!.steps
+    expect(first!.tokens).toEqual([{ messageId: 'prt_a', text: 'Let me check the tests.' }])
+    expect(second!.tokens).toEqual([{ messageId: 'prt_b', text: 'All tests pass.' }])
+  })
+
   it('routes session_title/warning/error without opening a spurious turn', () => {
     const events = [
       env('session_title', { messageId: 'm1', title: 'Fix the scheduler' }),
