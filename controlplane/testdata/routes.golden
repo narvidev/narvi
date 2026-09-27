@@ -62,6 +62,7 @@ GET /api/sessions/{sessionID}/events
 GET /api/sessions/{sessionID}/plans
 GET /api/sessions/{sessionID}/release-manifest
 GET /api/sessions/{sessionID}/review
+GET /api/sessions/{sessionID}/status
 GET /api/sessions/{sessionID}/uploads/{uploadID}/content
 GET /api/sessions/{sessionID}/workflow-runs
 GET /api/workflow-bindings

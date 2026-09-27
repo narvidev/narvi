@@ -21,6 +21,12 @@
 //     filter value.
 //   - GET /api/sessions/{sessionID} -- get.go's GetSession: 404 if not
 //     found, else 200 with restdtos.Session.
+//   - GET /api/sessions/{sessionID}/status -- sessionstatus.go's
+//     GetSessionStatus (technical plan §43.20): 404 if not found, else 200
+//     with restdtos.SessionActivity -- the session's live activity, derived
+//     from its turn queue and human gates in one snapshot (never
+//     sessions.status), and a suggested delay before the next read. No
+//     events: the transcript is the events route below.
 //   - GET /api/sessions/{sessionID}/events?cursor=&limit= -- events.go's
 //     ListEvents: 404 if the session doesn't exist, else 200 with
 //     restdtos.EventsResponse (shaped exactly like client-ws/v1's own

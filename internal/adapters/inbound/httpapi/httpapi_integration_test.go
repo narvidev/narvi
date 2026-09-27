@@ -585,6 +585,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		r.Use(auth.Middleware(rig.userSessions, rig.users))
 		r.Post("/", httpapi.CreateSession(rig.pool, rig.sessions, rig.turns, rig.environments, rig.auditLog, rig.registry, nil, false, rig.rolloutMode, rig.repoSettings, rig.prSessions))
 		r.Get("/{sessionID}", httpapi.GetSession(rig.sessions))
+		r.Get("/{sessionID}/status", httpapi.GetSessionStatus(rig.sessions, platform.DefaultTimeouts()))
 		r.Get("/{sessionID}/events", httpapi.ListEvents(rig.sessions, rig.events))
 		r.Get("/{sessionID}/artifacts", httpapi.ListArtifacts(rig.sessions, rig.artifacts))
 		// uploads ("uploads, blob storage & the in-sandbox
@@ -1231,6 +1232,7 @@ func TestRoutes_RequireAuth(t *testing.T) {
 	}{
 		{name: "CreateSession", method: http.MethodPost, path: "/api/sessions"},
 		{name: "GetSession", method: http.MethodGet, path: "/api/sessions/" + session.ID.String()},
+		{name: "GetSessionStatus", method: http.MethodGet, path: "/api/sessions/" + session.ID.String() + "/status"},
 		{name: "ListEvents", method: http.MethodGet, path: "/api/sessions/" + session.ID.String() + "/events"},
 		{name: "ListArtifacts", method: http.MethodGet, path: "/api/sessions/" + session.ID.String() + "/artifacts"},
 		{name: "ListPlans", method: http.MethodGet, path: "/api/sessions/" + session.ID.String() + "/plans"},

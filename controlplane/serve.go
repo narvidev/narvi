@@ -2021,6 +2021,11 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// path never matching that param segment.
 		r.Get("/", httpapi.ListSessions(sessionStore))
 		r.Get("/{sessionID}", httpapi.GetSession(sessionStore))
+		// status (technical plan §43.20): what the session's work is doing
+		// now, derived from its turn queue in one snapshot, and a suggested
+		// delay before the next read -- the same gate as GET /{sessionID}
+		// just above, and narvi_get_session_status's own twin.
+		r.Get("/{sessionID}/status", httpapi.GetSessionStatus(sessionStore, cfg.Timeouts))
 		r.Get("/{sessionID}/events", httpapi.ListEvents(sessionStore, eventStore))
 		r.Get("/{sessionID}/artifacts", httpapi.ListArtifacts(sessionStore, artifactStore))
 		// uploads ("uploads, blob storage & the in-sandbox

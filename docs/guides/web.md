@@ -111,6 +111,24 @@ treatment).
 {"name": "Get a session", "route": "GET /api/sessions/{sessionID}"}
 ```
 
+A session's `status` is the outcome of its most recent finished turn —
+`created` until one finishes. It is not updated when a turn is queued or
+starts, so it does not tell you whether the session is busy: a follow-up
+turn waits and runs under `completed`. The status route answers that
+instead. Its `activity` is `queued` (a turn waits, including while a
+sandbox starts), `running`, `awaiting_approval` (nothing queued or
+running, and a plan, a workflow step or an escalated workflow run waits
+for a person), `idle` (no turn yet) or `finished` — a queued or running
+turn is never reported as idle or finished. It also says how many turns
+wait, which turn is running, what waits for a person and since when, how
+the last finished turn ended, and `suggestedDelaySeconds`: how long to
+wait before asking again (2 to 300 seconds). It never carries the
+session's events — read those, a page at a time, from the events route.
+
+```json narvi-command
+{"name": "Get what a session is doing now, and when to ask again", "route": "GET /api/sessions/{sessionID}/status"}
+```
+
 ```json narvi-command
 {"name": "List a session's events", "route": "GET /api/sessions/{sessionID}/events"}
 ```
