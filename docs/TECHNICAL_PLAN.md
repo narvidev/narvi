@@ -8289,7 +8289,7 @@ read the same way. The adapter gains one `Twins` field and one table row; its im
 
 | Field | What it is |
 |---|---|
-| `activity` | the status's own `activity`, from the status's own statement and derivation in the same snapshot: whether this result can still change |
+| `activity` | the status's own `activity`, from the status's own statement and derivation in the same snapshot: whether the session can still change this result (the review of a pull request it opened can too; `suggestedDelaySeconds` says so) |
 | `lastRun` | the newest terminal turn: `outcome`, `failureReason` (the status's one rule, `lastRunFailureReasonValue`), `startedAt`, `finishedAt`, `costUsd` (`turns.cost_usd`, a number as `WorkflowStepRun.costUsd` renders it), `planMode`, `summary` |
 | `summary` | the run's final text and `truncated` -- never model-written (owner decision D7) |
 | `pullRequests` | the pull requests the session opened (its `pr` artifacts), oldest first, each with its `review` |
@@ -8316,13 +8316,20 @@ the result, which answers everything else it read; neither counts toward `review
 row's review found that one such row failed the whole result with a 500, for good, since nothing removes
 an artifact; `TestResult_ExcludedPullRequestsNeverFailTheResult` pins the fix.)
 
-Every stored fact comes from one repeatable-read, read-only transaction: the activity facts, the last
+Every stored fact comes from one repeatable-read, read-only transaction: the activity facts (the
+session's, and those of the review sessions behind the reviews of the pull requests it opened), the last
 run's turn row and the session's turns, the events, the artifacts, the claims, the review attempts and
 the verdicts -- so the summary is read inside the run's own window as the snapshot saw it, and a review
-state never mixes an attempt from one instant with a verdict from another
-(`TestResult_OneSnapshot_NeverMixesInstants`: a newer attempt and its verdict committed while the handler
-waits on a lock after its first read are not seen). The transaction ends before any code-host call;
-nothing holds a connection across one.
+state never mixes an attempt from one instant with a verdict from another.
+`TestResult_OneSnapshot_NeverMixesInstants` holds the handler at one lock-point per table its stores
+read -- `sessions`, `turns`, `events`, `artifacts`, `github_pr_sessions`, `review_verdicts` -- each
+reached with the snapshot already taken (the first three are read by the activity facts, the first
+statement, whose snapshot is taken as it starts), commits there a change that store's reads would show,
+and requires the result byte for byte as it was before the change, and a later read to show it. A store
+bound to the pool, a weaker isolation level, or the activity read before the transaction begins each
+fail it. (Round 2 of this row's review found an earlier version locking `review_verdicts` alone, which
+none of the others failed.) The transaction ends before any code-host call; nothing holds a connection
+across one.
 
 **The summary.** It is read by the one reader of a turn's final text, `plan.FinalText` -- the rule plan
 content has used since #334: among the text parts in the run's own window of the event log, the one that
@@ -8382,17 +8389,38 @@ every live head and base ref through both, and requires the same reason.
 and all of one call's live reads together by `SessionResultLiveReadBudget` (20 seconds, kept below
 `MCPWaitMaxDuration` by `Validate`): the per-call bounds add up to about 70 seconds, and with JSON
 responses nothing is written until the answer, which a proxy's idle timeout would cut first. A read the
-budget cuts short is `unconfirmed`, saying it ran out of time (`reviewfreshness.ReasonOutOfTime`); a
-failure never becomes `current`. A pull request read is `GetOpenPR`, a composite of several code-host
-requests of which freshness uses only the head, the base ref and the ancestor link; the source-control
-port has no narrower read that yields them (`GetPRBody` is the body alone, and the review readout's
-`GetPullRequest` is outside the port and carries neither the pull request's state nor its stack link), so
-this row adds no port method and keeps `GetOpenPR`. What slows a polling client is the answer's
-`suggestedDelaySeconds`, from a small table clamped to `[SessionResultDelayFloor,
-SessionResultDelayCeiling]` (30 and 300 seconds): 30 while the session is not settled (its status, or
-the bounded wait, is the cheap way to watch it), 60 once settled when a freshness was read live, 300
-when nothing was. The floor sits above the budget, so a client that follows the hint never overlaps its
-own live reads. No rate limit is added here: owner decision D5 defers one on the MCP surface to row 183.
+budget cuts short is `unconfirmed`, saying it ran out of time (`reviewfreshness.ReasonOutOfTime`),
+whether it cut the pull request read or a call inside `ReadLive`; a failure never becomes `current`.
+The reads run all at once under one deadline for the call, never one after another or one budget per
+pull request (`TestResult_LiveReadBudgetBoundsTheCall`).
+
+A pull request read is `GetOpenPR`: the pull request itself, then its reviews, its CI conclusion and its
+changed files -- several code-host requests, of which freshness uses only the head, the base ref, the
+ancestor link and whether the pull request is still open. No read on the source-control port yields
+those more narrowly: `GetPRBody` is the body alone, and `ListOpenPRsForUser` lists one person's open
+pull requests. The review readout's `GetPullRequest` is the one request that nearly does: it carries the
+head, the base ref and the stack object the ancestor link comes from (`reviewcontext.Fetch` derives the
+link from it), but not the pull request's state, so it cannot tell an open pull request from a closed or
+merged one, which freshness must report `not_applicable` rather than compare; and it is a GitHub adapter
+method outside the port, which the result -- reading through the port and its shadow decorator -- could
+reach only through a new port method. This row adds none and keeps `GetOpenPR`; a port read of that one
+request, with the state it lacks, is what a narrower read would be. (Round 2 of this row's review found
+an earlier version of this paragraph saying `GetPullRequest` also lacked the stack link. It does not:
+only the missing state and the port boundary rule it out.)
+
+What slows a polling client is the answer's `suggestedDelaySeconds`, from a small table clamped to
+`[SessionResultDelayFloor, SessionResultDelayCeiling]` (30 and 300 seconds): 30 while the result can
+still change on its own -- the session is not settled (its status, or the bounded wait, is the cheap way
+to watch it), or the review session behind the review of a pull request it opened is not, by that
+session's own facts and derivation in the same snapshot, so the review can start, end or run again with
+no new input (an attempt queued or running, the review reading `in_progress`; a re-review scheduled);
+60 once neither holds and a freshness was read live; 300 when nothing was either, as nothing in the
+result then changes without new input -- a prompt, a review requested, a push. A review session whose
+facts cannot be read counts as not settled: the hint errs short, and never fails the result. (Round 2
+of this row's review found a produced pull request's running review answered 300, the value whose stated
+reason -- nothing changes without new input -- was false there.) The floor sits above the budget, so a
+client that follows the hint never overlaps its own live reads. No rate limit is added here: owner
+decision D5 defers one on the MCP surface to row 183.
 
 The comparison and the read are the merge path's own, not copies of them (§21.1b): `CheckFreshness` is the
 freshness prefix of `computeEligibleCore`, moved out verbatim and called by it right after the
@@ -8418,6 +8446,8 @@ last, not the newest row; the placeholder text itself is still found text). App:
 (every fact, every call in order and only where it can change the answer, each call's bound, where it
 stops), `TestAssess_Table` (the pull request read alone for what the probe decides, a moved head
 included), `TestAssess_PartialReadTimeoutIsUnconfirmed`, `TestAssess_OutOfTimeSaysSo`,
+`TestAssess_OutOfTimeDuringReadLiveSaysSo` (the caller's deadline passing at each `ReadLive` call says
+out of time; the call's own bound passing first keeps the step's reason),
 `TestAssess_NeverCurrentWithoutLiveConfirmation`, `TestRevalidateCore_ReadsLiveFactsOnlyThroughReviewFreshness`,
 and, on real Postgres against the merge path itself, `TestAssess_AgreesWithTheMergePathOnRecordDecidedVerdicts`.
 Platform: `TestDefaultTimeouts_SessionResultFields`, `TestTimeouts_Validate_SessionResult`.
@@ -8435,9 +8465,14 @@ a later turn's text; cut at 4,000 characters; exactly 4,000 not truncated; no te
 `TestResult_ProducedPRRepoFullNameFromSessionRepos`, `TestResult_UnknownAndMalformedSession`,
 `TestResult_ExcludedPullRequestsNeverFailTheResult` (the production shadow decorator's own suppressed
 creation, alone and beside a real pull request whose verdict still reads live, and a garbage row: 200
-every time, each listed explicitly), `TestResult_LiveReadBudgetBoundsTheCall` (a code host that never
-answers holds the call for the budget, not the per-read bounds), `TestResult_SuggestedDelay`,
-`TestResult_OneSnapshot_NeverMixesInstants`, `TestResult_LastRunValues` (`costUsd`, `planMode`,
+every time, each listed explicitly; and four such records at once -- both suppressing layers' shapes and
+two unreadable rows, among two real pull requests: every one listed, oldest first),
+`TestResult_LiveReadBudgetBoundsTheCall` (a code host that stops answering, at the pull request read or
+inside `ReadLive`, holds the call for the budget, not the per-read bounds: both reads begin before it
+runs out, run at once, and share one deadline), `TestResult_SuggestedDelay` (each row of the table, and
+a produced pull request's review running, queued or scheduled to run again: 30),
+`TestResult_OneSnapshot_NeverMixesInstants` (one lock-point per table),
+`TestResult_LastRunValues` (`costUsd`, `planMode`,
 `startedAt` and `finishedAt` by value); unit, `TestReadPRArtifact_Table`, `TestMergedPerClaim_Table`,
 `TestResultReadDelay_Table`. MCP:
 `TestEveryToolHasARegisteredTwin`, the tool-list golden, `TestToolsList_ScopeFilter_Table`,
