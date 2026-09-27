@@ -608,16 +608,15 @@ func TestGetSessionStatus_Gates(t *testing.T) {
 	})
 
 	// A custom workflow's run escalated by its failed turn gates the session
-	// while it is the latest thing that happened -- and no longer once any
-	// newer turn exists. The newer turn here starts no run of its own (as a
-	// plan's implementation turn, or an automatic re-review turn the engine
-	// never tracks, does not), so the escalated run stays the session's
-	// newest run throughout: it is the newer TURN that supersedes it. A turn
-	// queued BEFORE the escalation that runs after it is
-	// TestGetSessionStatus_TurnQueuedBehindTheEscalatingTurnClosesItOnceItRuns.
+	// until a turn is created after it. The newer turn here starts no run of
+	// its own (as a plan's implementation turn, or an automatic re-review
+	// turn the engine never tracks, does not), so the escalated run stays the
+	// session's newest run throughout: it is the newer TURN that supersedes
+	// it. A turn queued BEFORE the escalation, which never closes it, is
+	// TestGetSessionStatus_TurnQueuedBehindTheEscalatingTurnNeverClosesIt.
 	// TestGetSessionStatus_EscalatedTurnNeverGatesForGood covers a follow-up
 	// that starts a run of its own, and the built-in workflow.
-	t.Run("a workflow run escalated for review, until a newer turn supersedes it", func(t *testing.T) {
+	t.Run("a workflow run escalated for review, until a turn created after it supersedes it", func(t *testing.T) {
 		sess, customDef := customWorkflowSession(ctx, t, rig, user.ID)
 		first := createTurnThroughCore(ctx, t, rig, sess.ID)
 		endTurnThroughEngine(ctx, t, rig, sess.ID, first.ID, turn.TriggerFail)
@@ -812,26 +811,38 @@ func TestGetSessionStatus_EscalatedTurnNeverGatesForGood(t *testing.T) {
 }
 
 // TestGetSessionStatus_EscalationAfterAnUntrackedTurn is review round 2's
-// O2, through the production paths: a custom workflow whose one step has a
-// human gate after it; its turn is stopped, so the step awaits a decision
-// on a blocked outcome; a second turn is sent while it waits -- the engine
-// leaves that turn untracked, an attempt of no run -- and completes; then a
-// person approves the step, and with no edge for a blocked outcome the
-// decision escalates the run (/decide's own transaction). The escalation
-// is then the session's latest state and its only open hand-off, so the
-// status reads awaiting_approval on it -- not finished -- until a newer
-// turn supersedes it. The control has no untracked turn.
+// O2 and review round 4's P5, through the production paths: a custom
+// workflow whose one step has a human gate after it; its turn is stopped,
+// so the step awaits a decision on a blocked outcome; a second turn is sent
+// while it waits -- the engine leaves that turn untracked, an attempt of no
+// run; then a person approves the step, and with no edge for a blocked
+// outcome the decision escalates the run (/decide's own transaction). The
+// escalation stays open until a turn is CREATED after it, so whether the
+// untracked turn ended a moment before the approval (O2) or was still
+// running and ended a moment after it (P5), the session reads
+// awaiting_approval on the escalation once that turn has ended -- the same
+// answer both ways -- and running, with the escalation reported, while it
+// still runs. A turn created after the escalation closes it. The control
+// has no untracked turn.
 func TestGetSessionStatus_EscalationAfterAnUntrackedTurn(t *testing.T) {
 	rig := newTestRig(t)
 	ctx := context.Background()
 	user, cookie := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMember)
 
-	for _, untracked := range []bool{false, true} {
-		name := "escalated by a decision, no turn in between (the control)"
-		if untracked {
-			name = "escalated by a decision after an untracked turn"
-		}
-		t.Run(name, func(t *testing.T) {
+	const (
+		noUntracked = iota
+		untrackedEndsBeforeTheDecision
+		untrackedEndsAfterTheDecision
+	)
+	for _, variant := range []struct {
+		name  string
+		shape int
+	}{
+		{"escalated by a decision, no turn in between (the control)", noUntracked},
+		{"escalated by a decision after an untracked turn ended (round 2's O2)", untrackedEndsBeforeTheDecision},
+		{"escalated by a decision while an untracked turn runs, which ends after it (round 4's P5)", untrackedEndsAfterTheDecision},
+	} {
+		t.Run(variant.name, func(t *testing.T) {
 			sess, _ := customWorkflowSessionGated(ctx, t, rig, user.ID, true)
 			first := createTurnThroughCore(ctx, t, rig, sess.ID)
 			endTurnThroughEngine(ctx, t, rig, sess.ID, first.ID, turn.TriggerCancel)
@@ -850,8 +861,9 @@ func TestGetSessionStatus_EscalationAfterAnUntrackedTurn(t *testing.T) {
 				t.Fatalf("the step awaits a decision: activity %q awaiting %+v, want awaiting_approval on the step", got.Activity, got.Awaiting)
 			}
 
-			if untracked {
-				second := createTurnThroughCore(ctx, t, rig, sess.ID)
+			var second sqlcgen.Turn
+			if variant.shape != noUntracked {
+				second = createTurnThroughCore(ctx, t, rig, sess.ID)
 				if runs := sessionRuns(ctx, t, rig, sess.ID); len(runs) != 1 {
 					t.Fatalf("a turn sent while the step awaits a decision started a run: %+v", runs)
 				}
@@ -859,10 +871,15 @@ func TestGetSessionStatus_EscalationAfterAnUntrackedTurn(t *testing.T) {
 				if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM workflow_step_runs WHERE turn_id = $1`, second.ID).Scan(&attempts); err != nil || attempts != 0 {
 					t.Fatalf("the second turn is an attempt of %d step runs (%v), want none: it must be untracked", attempts, err)
 				}
-				endTurnThroughEngine(ctx, t, rig, sess.ID, second.ID, turn.TriggerComplete)
-				if got := getStatus(t, rig, sess.ID, cookie); got.Activity != restdtos.SessionActivityActivityAwaitingApproval ||
-					got.Awaiting == nil || got.Awaiting.Kind != restdtos.SessionActivityAwaitingKindWorkflowStep {
-					t.Fatalf("the untracked turn completed: activity %q awaiting %+v, want the step still awaiting its decision", got.Activity, got.Awaiting)
+				if variant.shape == untrackedEndsBeforeTheDecision {
+					endTurnThroughEngine(ctx, t, rig, sess.ID, second.ID, turn.TriggerComplete)
+					if got := getStatus(t, rig, sess.ID, cookie); got.Activity != restdtos.SessionActivityActivityAwaitingApproval ||
+						got.Awaiting == nil || got.Awaiting.Kind != restdtos.SessionActivityAwaitingKindWorkflowStep {
+						t.Fatalf("the untracked turn completed: activity %q awaiting %+v, want the step still awaiting its decision", got.Activity, got.Awaiting)
+					}
+				} else {
+					state := transitionTurn(ctx, t, rig.turns, second.ID, turn.StatePending, turn.TriggerDispatch)
+					transitionTurn(ctx, t, rig.turns, second.ID, state, turn.TriggerStartProcessing)
 				}
 			}
 
@@ -875,12 +892,28 @@ func TestGetSessionStatus_EscalationAfterAnUntrackedTurn(t *testing.T) {
 				t.Fatalf("after the decision: runs %+v, want the one run escalated to needs_review", runs)
 			}
 			escalated := runs[0]
+			reportsTheEscalation := func(got restdtos.SessionActivity) bool {
+				return got.Awaiting != nil && got.Awaiting.Kind == restdtos.SessionActivityAwaitingKindWorkflowEscalation &&
+					got.Awaiting.Id == escalated.ID.String() && got.Awaiting.Since.Equal(escalated.UpdatedAt.Time)
+			}
+
+			if variant.shape == untrackedEndsAfterTheDecision {
+				if got := getStatus(t, rig, sess.ID, cookie); got.Activity != restdtos.SessionActivityActivityRunning || got.Settled || !reportsTheEscalation(got) {
+					t.Fatalf("escalated while the untracked turn runs: activity %q settled %v awaiting %+v, want running with the escalation of run %v reported", got.Activity, got.Settled, got.Awaiting, escalated.ID)
+				}
+				endProcessingTurnThroughEngine(ctx, t, rig, sess.ID, second.ID, turn.TriggerComplete)
+				if runs := sessionRuns(ctx, t, rig, sess.ID); len(runs) != 1 || runs[0].Status != sqlcgen.WorkflowRunStatusNeedsReview {
+					t.Fatalf("after the untracked turn ended: runs %+v, want the one run, still escalated", runs)
+				}
+			}
 
 			got := getStatus(t, rig, sess.ID, cookie)
-			if got.Activity != restdtos.SessionActivityActivityAwaitingApproval || !got.Settled || got.SuggestedDelaySeconds != 60 || got.Awaiting == nil ||
-				got.Awaiting.Kind != restdtos.SessionActivityAwaitingKindWorkflowEscalation || got.Awaiting.Id != escalated.ID.String() || !got.Awaiting.Since.Equal(escalated.UpdatedAt.Time) {
-				t.Fatalf("escalated by the decision: activity %q settled %v delay %d awaiting %+v, want awaiting_approval, settled, 60, on run %v since it escalated",
+			if got.Activity != restdtos.SessionActivityActivityAwaitingApproval || !got.Settled || got.SuggestedDelaySeconds != 60 || !reportsTheEscalation(got) {
+				t.Fatalf("escalated by the decision, nothing created since: activity %q settled %v delay %d awaiting %+v, want awaiting_approval, settled, 60, on run %v since it escalated",
 					got.Activity, got.Settled, got.SuggestedDelaySeconds, got.Awaiting, escalated.ID)
+			}
+			if variant.shape != noUntracked && (got.LastRun == nil || got.LastRun.TurnId != second.ID.String()) {
+				t.Fatalf("lastRun = %+v, want the untracked turn %v", got.LastRun, second.ID)
 			}
 
 			// New work supersedes it, as for any escalation.

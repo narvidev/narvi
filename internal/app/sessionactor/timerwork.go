@@ -29,9 +29,17 @@ const (
 )
 
 // ClassifyTimer is the one classification of every named timer this code
-// declares (timerwork_test.go fails when a Timer* constant, or a timer name
-// written anywhere else, is missing from it). ok is false for a name it
-// does not know. Each case says why:
+// declares. timerwork_test.go fails when a Timer* constant of this package
+// is missing from it, and when an armTimer call or a keyed
+// UpsertSessionTimerParams literal in non-test code names anything but a
+// classified constant; it cannot see a params value filled by field
+// assignment or through a type alias, or SQL that writes session_timers
+// (a raw Exec, a new sqlc query, a migration). The runtime backstop covers
+// those: ok is false for a name it does not know, and TimerCanCreateWork
+// counts such a name as work, so the status errs toward scheduled, never
+// settled (and handleTimerFired leaves an unknown name armed, so the pump
+// redelivers it and the session keeps reading scheduled). Each case says
+// why:
 //
 //   - connecting_deadline (armed at spawn, dispatch.go), liveness_check and
 //     inactivity (armed at Booting->Ready, sandboxevent.go; each re-arms
@@ -48,12 +56,14 @@ const (
 //     workflow's next step in the same transaction -- and otherwise deletes
 //     itself. The turn it acts on is in flight, so the session already
 //     reads running whenever it can do anything.
-//   - review_retrigger_debounce (armed by the pull_request/synchronize
-//     webhook on every push to a PR with a review session, opted in or
-//     not; §24): when it fires, an opted-in repo whose head moved and whose
-//     budget allows gets a new review turn, inserted by the actor with no
-//     further input (reviewretrigger.go). Otherwise it declines and deletes
-//     itself -- the opt-in, the head and the budget are read only then.
+//   - review_retrigger_debounce (armed by RecordPullRequestPush, from the
+//     pull_request/synchronize webhook on every push to a PR with a review
+//     session, opted in or not, and from the actor when that session's own
+//     push moves the PR's head; §24): when it fires, an opted-in repo whose
+//     head moved and whose budget allows gets a new review turn, inserted
+//     by the actor with no further input (reviewretrigger.go). Otherwise it
+//     declines and deletes itself. TimerCountsAsScheduledWork narrows it by
+//     the opt-in and the budget, which the status reads in its snapshot.
 func ClassifyTimer(name string) (work TimerWork, ok bool) {
 	switch name {
 	case TimerConnectingDeadline, TimerLivenessCheck, TimerInactivity, TimerTerminalGrace:
@@ -77,4 +87,24 @@ func ClassifyTimer(name string) (work TimerWork, ok bool) {
 func TimerCanCreateWork(name string) bool {
 	work, ok := ClassifyTimer(name)
 	return !ok || work == TimerWorkCreatesTurn
+}
+
+// TimerCountsAsScheduledWork is TimerCanCreateWork narrowed by the one
+// kind whose fire has necessary conditions a row can show: the session's
+// status (technical plan §43.20) reads every armed timer through it.
+// review_retrigger_debounce inserts a turn only for a repository that
+// opted in and a pull request whose automatic re-review budget
+// (ReviewAutoRetriggerBudget) is not spent, so it counts only while
+// reviewRetriggerCanFire -- GetSessionActivityFacts'
+// review_retrigger_can_fire, read in the same snapshot -- says both hold.
+// The budget only grows and only a person switches the opt-in, so a
+// debounce this says cannot fire can create a turn later only after that
+// person's own input. Its other decline rules (the head already reviewed,
+// a plan awaiting approval, a live fetch that fails) are not read, so
+// they err toward scheduled. Every other kind is TimerCanCreateWork's.
+func TimerCountsAsScheduledWork(name string, reviewRetriggerCanFire bool) bool {
+	if name == TimerReviewRetriggerDebounce {
+		return reviewRetriggerCanFire
+	}
+	return TimerCanCreateWork(name)
 }

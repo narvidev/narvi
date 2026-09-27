@@ -53,7 +53,7 @@ func GetSessionStatus(sessions *postgres.SessionStore, timeouts platform.Timeout
 		ctx := platform.WithSessionID(r.Context(), sessionID.String())
 		logger := platform.Logger(ctx)
 
-		facts, err := sessions.ActivityFacts(ctx, sessionID)
+		facts, err := sessions.ActivityFacts(ctx, sessionID, sessionactor.ReviewAutoRetriggerBudget)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				writeError(w, http.StatusNotFound, "session not found")
@@ -122,14 +122,17 @@ func statusBoundsFrom(t platform.Timeouts) statusBounds {
 // it nor declined yet (technical plan §43.20's inventory), and returns
 // whether any is armed and the earliest instant one comes due:
 //
-//   - every armed session timer whose kind sessionactor.TimerCanCreateWork
-//     says can create a turn -- a kind it does not know included, so an
-//     unclassified kind reads as work, never as settled -- due at its
+//   - every armed session timer sessionactor.TimerCountsAsScheduledWork
+//     says can still create a turn -- a kind it does not know included, so
+//     an unclassified kind reads as work, never as settled; the re-review
+//     debounce only while its repository opted in and its budget is not
+//     spent (review_retrigger_can_fire, the same snapshot) -- due at its
 //     fires_at (which the timer pump pushes forward while it delivers it);
-//   - a release manifest check not yet claimed, due at the worker's next
-//     tick after it was enqueued;
-//   - a release manifest check claimed within releaseCheckWindow of the
-//     snapshot, due when its worker's deadline ends it.
+//   - a release manifest check not yet claimed (release_manifest_pending),
+//     due at the worker's next tick after it was enqueued;
+//   - a release manifest check running (release_manifest_checks_running)
+//     and claimed within releaseCheckWindow of the snapshot, due when its
+//     worker's deadline ends it.
 //
 // Both instants in every comparison are the database's clock.
 func scheduledWork(facts sqlcgen.GetSessionActivityFactsRow, bounds statusBounds) (armed bool, dueAt time.Time, err error) {
@@ -143,7 +146,7 @@ func scheduledWork(facts sqlcgen.GetSessionActivityFactsRow, bounds statusBounds
 		armed = true
 	}
 	for i, name := range facts.ArmedTimerNames {
-		if sessionactor.TimerCanCreateWork(name) {
+		if sessionactor.TimerCountsAsScheduledWork(name, facts.ReviewRetriggerCanFire) {
 			consider(facts.ArmedTimerFiresAt[i].Time)
 		}
 	}

@@ -183,10 +183,13 @@ func stampAt(at time.Time) *time.Time { return &at }
 // kind can create a turn -- or a kind sessionactor does not know -- and a
 // release manifest check still to come or still running read scheduled,
 // never settled, whatever gate is open; timers that only watch a sandbox
-// or an in-flight turn do not; a claimed check whose worker died stops
-// counting once ReleaseManifestCheckTimeout plus MCPStatusScheduledMargin
-// has passed. The suggestion never reaches past the work's due instant plus
-// the margin, and is otherwise the scheduled 15 s.
+// or an in-flight turn do not; the re-review debounce counts only while
+// review_retrigger_can_fire says its fire can insert a turn (review round
+// 4's P3: the repository opted in, the budget unspent); a claimed check
+// whose worker died stops counting once ReleaseManifestCheckTimeout plus
+// MCPStatusScheduledMargin has passed. The suggestion never reaches past
+// the work's due instant plus the margin, and is otherwise the scheduled
+// 15 s.
 func TestSessionActivityToDTO_ScheduledWork(t *testing.T) {
 	t.Parallel()
 
@@ -207,30 +210,38 @@ func TestSessionActivityToDTO_ScheduledWork(t *testing.T) {
 		claimedAgo   *time.Duration
 		stampAgo     *time.Duration
 		plan         bool
+		// cannotFire is review_retrigger_can_fire false: the repository has
+		// not opted in, or the budget is spent.
+		cannotFire   bool
 		wantActivity restdtos.SessionActivityActivity
 		wantDelay    int
 	}{
-		{"nothing armed -> finished", `{"completed":1}`, nil, nil, nil, nil, false, restdtos.SessionActivityActivityFinished, 300},
-		{"the reviewers' case: a re-review debounce armed 2 min out -> scheduled", `{"completed":1}`, []timer{{"review_retrigger_debounce", 2 * time.Minute}}, nil, nil, nil, false, restdtos.SessionActivityActivityScheduled, 15},
-		{"a debounce due in 3 s -> due plus the margin", `{"completed":1}`, []timer{{"review_retrigger_debounce", 3 * time.Second}}, nil, nil, nil, false, restdtos.SessionActivityActivityScheduled, 8},
-		{"a debounce overdue (the pump has not claimed it yet) -> the margin", `{"completed":1}`, []timer{{"review_retrigger_debounce", -2 * time.Second}}, nil, nil, nil, false, restdtos.SessionActivityActivityScheduled, 5},
-		{"every sandbox-only and in-flight-only kind armed -> finished", `{"completed":1}`, []timer{{"connecting_deadline", time.Second}, {"liveness_check", time.Second}, {"inactivity", time.Minute}, {"terminal_grace", time.Second}, {"turn_deadline", time.Hour}}, nil, nil, nil, false, restdtos.SessionActivityActivityFinished, 300},
-		{"a kind this binary does not know -> scheduled, never settled", `{"completed":1}`, []timer{{"a_kind_from_a_newer_binary", time.Minute}}, nil, nil, nil, false, restdtos.SessionActivityActivityScheduled, 15},
-		{"the earliest work-creating timer decides the delay", `{"completed":1}`, []timer{{"liveness_check", time.Second}, {"a_kind_from_a_newer_binary", 4 * time.Second}, {"review_retrigger_debounce", time.Minute}}, nil, nil, nil, false, restdtos.SessionActivityActivityScheduled, 9},
-		{"a debounce beside an open plan -> scheduled, the plan still reported", `{"completed":1}`, []timer{{"review_retrigger_debounce", time.Minute}}, nil, nil, nil, true, restdtos.SessionActivityActivityScheduled, 15},
-		{"a debounce while a delivery is under way -> delivering", `{"completed":1}`, []timer{{"review_retrigger_debounce", time.Minute}}, nil, nil, durationPtr(-3 * time.Second), false, restdtos.SessionActivityActivityDelivering, 5},
-		{"a debounce behind a queued turn -> queued", `{"completed":1,"pending":1}`, []timer{{"review_retrigger_debounce", time.Minute}}, nil, nil, nil, false, restdtos.SessionActivityActivityQueued, 15},
-		{"a release check enqueued beside the review turn still queued -> queued", `{"pending":1}`, nil, durationPtr(-time.Second), nil, nil, false, restdtos.SessionActivityActivityQueued, 15},
-		{"a release check enqueued, the review turn done -> scheduled", `{"completed":1}`, nil, durationPtr(-time.Second), nil, nil, false, restdtos.SessionActivityActivityScheduled, 14},
-		{"a release check waiting long past a tick (the worker is busy) -> scheduled, the margin", `{"completed":1}`, nil, durationPtr(-time.Hour), nil, nil, false, restdtos.SessionActivityActivityScheduled, 5},
-		{"a release check claimed a minute ago -> scheduled", `{"completed":1}`, nil, nil, durationPtr(time.Minute), nil, false, restdtos.SessionActivityActivityScheduled, 15},
-		{"a release check claimed just inside its bound -> scheduled", `{"completed":1}`, nil, nil, durationPtr(timeouts.ReleaseManifestCheckTimeout + timeouts.MCPStatusScheduledMargin - time.Second), nil, false, restdtos.SessionActivityActivityScheduled, 5},
-		{"a release check claimed past its bound (its worker died) -> finished", `{"completed":1}`, nil, nil, durationPtr(timeouts.ReleaseManifestCheckTimeout + timeouts.MCPStatusScheduledMargin), nil, false, restdtos.SessionActivityActivityFinished, 300},
-		{"a dead claim beside an open plan -> awaiting_approval", `{"completed":1}`, nil, nil, durationPtr(time.Hour), nil, true, restdtos.SessionActivityActivityAwaitingApproval, 60},
+		{"nothing armed -> finished", `{"completed":1}`, nil, nil, nil, nil, false, false, restdtos.SessionActivityActivityFinished, 300},
+		{"the reviewers' case: a re-review debounce armed 2 min out -> scheduled", `{"completed":1}`, []timer{{"review_retrigger_debounce", 2 * time.Minute}}, nil, nil, nil, false, false, restdtos.SessionActivityActivityScheduled, 15},
+		{"a debounce due in 3 s -> due plus the margin", `{"completed":1}`, []timer{{"review_retrigger_debounce", 3 * time.Second}}, nil, nil, nil, false, false, restdtos.SessionActivityActivityScheduled, 8},
+		{"a debounce overdue (the pump has not claimed it yet) -> the margin", `{"completed":1}`, []timer{{"review_retrigger_debounce", -2 * time.Second}}, nil, nil, nil, false, false, restdtos.SessionActivityActivityScheduled, 5},
+		{"every sandbox-only and in-flight-only kind armed -> finished", `{"completed":1}`, []timer{{"connecting_deadline", time.Second}, {"liveness_check", time.Second}, {"inactivity", time.Minute}, {"terminal_grace", time.Second}, {"turn_deadline", time.Hour}}, nil, nil, nil, false, false, restdtos.SessionActivityActivityFinished, 300},
+		{"a kind this binary does not know -> scheduled, never settled", `{"completed":1}`, []timer{{"a_kind_from_a_newer_binary", time.Minute}}, nil, nil, nil, false, false, restdtos.SessionActivityActivityScheduled, 15},
+		{"the earliest work-creating timer decides the delay", `{"completed":1}`, []timer{{"liveness_check", time.Second}, {"a_kind_from_a_newer_binary", 4 * time.Second}, {"review_retrigger_debounce", time.Minute}}, nil, nil, nil, false, false, restdtos.SessionActivityActivityScheduled, 9},
+		{"a debounce beside an open plan -> scheduled, the plan still reported", `{"completed":1}`, []timer{{"review_retrigger_debounce", time.Minute}}, nil, nil, nil, true, false, restdtos.SessionActivityActivityScheduled, 15},
+		{"a debounce while a delivery is under way -> delivering", `{"completed":1}`, []timer{{"review_retrigger_debounce", time.Minute}}, nil, nil, durationPtr(-3 * time.Second), false, false, restdtos.SessionActivityActivityDelivering, 5},
+		{"a debounce behind a queued turn -> queued", `{"completed":1,"pending":1}`, []timer{{"review_retrigger_debounce", time.Minute}}, nil, nil, nil, false, false, restdtos.SessionActivityActivityQueued, 15},
+		{"a release check enqueued beside the review turn still queued -> queued", `{"pending":1}`, nil, durationPtr(-time.Second), nil, nil, false, false, restdtos.SessionActivityActivityQueued, 15},
+		{"a release check enqueued, the review turn done -> scheduled", `{"completed":1}`, nil, durationPtr(-time.Second), nil, nil, false, false, restdtos.SessionActivityActivityScheduled, 14},
+		{"a release check waiting long past a tick (the worker is busy) -> scheduled, the margin", `{"completed":1}`, nil, durationPtr(-time.Hour), nil, nil, false, false, restdtos.SessionActivityActivityScheduled, 5},
+		{"a release check claimed a minute ago -> scheduled", `{"completed":1}`, nil, nil, durationPtr(time.Minute), nil, false, false, restdtos.SessionActivityActivityScheduled, 15},
+		{"a release check claimed just inside its bound -> scheduled", `{"completed":1}`, nil, nil, durationPtr(timeouts.ReleaseManifestCheckTimeout + timeouts.MCPStatusScheduledMargin - time.Second), nil, false, false, restdtos.SessionActivityActivityScheduled, 5},
+		{"a release check claimed past its bound (its worker died) -> finished", `{"completed":1}`, nil, nil, durationPtr(timeouts.ReleaseManifestCheckTimeout + timeouts.MCPStatusScheduledMargin), nil, false, false, restdtos.SessionActivityActivityFinished, 300},
+		{"a dead claim beside an open plan -> awaiting_approval", `{"completed":1}`, nil, nil, durationPtr(time.Hour), nil, true, false, restdtos.SessionActivityActivityAwaitingApproval, 60},
+		{"a debounce that cannot fire (not opted in, or the budget spent) -> finished at once", `{"completed":1}`, []timer{{"review_retrigger_debounce", 2 * time.Minute}}, nil, nil, nil, false, true, restdtos.SessionActivityActivityFinished, 300},
+		{"a debounce that cannot fire beside an open plan -> awaiting_approval", `{"completed":1}`, []timer{{"review_retrigger_debounce", time.Minute}}, nil, nil, nil, true, true, restdtos.SessionActivityActivityAwaitingApproval, 60},
+		{"a debounce that cannot fire beside an unknown kind -> scheduled on the unknown kind", `{"completed":1}`, []timer{{"review_retrigger_debounce", 3 * time.Second}, {"a_kind_from_a_newer_binary", time.Minute}}, nil, nil, nil, false, true, restdtos.SessionActivityActivityScheduled, 15},
+		{"a debounce that cannot fire beside a release check waiting -> scheduled on the check", `{"completed":1}`, []timer{{"review_retrigger_debounce", 3 * time.Second}}, durationPtr(-time.Second), nil, nil, false, true, restdtos.SessionActivityActivityScheduled, 14},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			facts := statusFactsRow(tc.turnCounts)
+			facts.ReviewRetriggerCanFire = !tc.cannotFire
 			facts.ArmedTimerNames = []string{}
 			facts.ArmedTimerFiresAt = []pgtype.Timestamptz{}
 			for _, tm := range tc.timers {

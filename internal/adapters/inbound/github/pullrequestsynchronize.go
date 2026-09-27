@@ -18,7 +18,10 @@
 // comment event); (2) if one does, upsert
 // github_pr_sessions.pending_retrigger_head_sha to this event's own
 // pull_request.head.sha and re-arm the review_retrigger_debounce named
-// timer (session_timers, §2), atomically, in ONE transaction. It NEVER
+// timer (session_timers, §2), atomically, in ONE transaction -- unless a
+// turn of that session was already created against that head, so a
+// review of it is already queued, running or done (see
+// sessionactor.RecordPullRequestPush). It NEVER
 // decides whether to actually re-review (that is §24.3's own job, running
 // later, in the review session's own actor, once the debounce timer
 // fires) and it NEVER checks the per-repo opt-in (§24.5) -- that check
@@ -34,20 +37,25 @@
 // represents an inbound "new commits pushed" signal an HTTP-layer webhook
 // handler could hand into a session actor's mailbox. This handler
 // therefore writes directly, mirroring how coalesce.go already writes
-// github_pr_sessions directly today, bypassing the actor entirely: via
-// postgres.GitHubPRSessionStore.UpsertPendingRetriggerHeadSHA and the
-// EXPORTED postgres.TimerStore.Upsert, in the SAME transaction. Both
-// commit atomically as one unit or neither does, so a crash between them
-// can never leave a pushed commit with no armed timer.
+// github_pr_sessions directly today, bypassing the actor entirely:
+// through sessionactor.RecordPullRequestPush, in ONE transaction, so the
+// pending head and the armed timer commit as one unit or not at all, and
+// a crash between them can never leave a pushed commit with no armed
+// timer. That function is the one copy of this write: the session actor
+// performs it too, when a review session's own push moves this pull
+// request's head (technical plan §43.20) -- this webhook is then the echo
+// of the server's own output, and repeats the same write for the same
+// head, re-arming the debounce from its own later instant.
 //
 // The armed timer is also what the session's status reads (technical plan
 // §43.20): sessionactor.ClassifyTimer classes this kind as one whose
-// firing can create a turn, so from this commit until the timer fires --
-// and inserts the review turn, or declines -- the session reads
-// "scheduled", never settled. Armed here for every push whatever the
-// opt-in, it reads scheduled on a repository that has not opted in too,
-// until the fire declines: erring toward unsettled, never toward a false
-// settled.
+// firing can create a turn, and the status counts it while the pull
+// request's repository has opted in and its automatic re-review budget is
+// unspent -- the fire's two conditions a row can show -- so from this
+// commit until the timer fires, and inserts the review turn or declines,
+// such a session reads "scheduled", never settled. On a repository that
+// has not opted in, or a pull request whose budget is spent, the fire can
+// only decline, and the status does not count it.
 
 package github
 
@@ -59,11 +67,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
-	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -135,34 +141,23 @@ func handlePullRequestSynchronize(
 		}
 	}()
 
-	// §24.1: no github_pr_sessions row, or a row whose session_id is
-	// still NULL, means there is no review session to re-trigger --
-	// acknowledged, untouched, exactly like today's "no mention" no-op
-	// for a comment event. See UpsertPendingRetriggerHeadSHA's own
-	// generated doc comment for the guarded UPDATE this is.
-	row, err := prSessions.WithTx(tx).UpsertPendingRetriggerHeadSHA(ctx, payload.Repository.FullName, payload.PullRequest.Number, payload.PullRequest.Head.SHA)
-	if err != nil {
+	// §24.1/§24.2: record this push -- pending_retrigger_head_sha set to
+	// the event's own head sha and the review_retrigger_debounce timer
+	// (re-)armed, the SAME upsert-on-UNIQUE(session_id, name) idiom every
+	// named timer uses, so a second push before the first debounce fires
+	// simply pushes fires_at further out -- through
+	// sessionactor.RecordPullRequestPush, the one write the session actor
+	// also performs when a review session's own push moves this pull
+	// request's head (technical plan §43.20). pgx.ErrNoRows: no
+	// github_pr_sessions row, or a row whose session_id is still NULL --
+	// no review session to re-trigger, acknowledged and untouched, exactly
+	// like today's "no mention" no-op for a comment event.
+	if _, _, err := sessionactor.RecordPullRequestPush(ctx, tx, prSessions, timers, timeouts, payload.Repository.FullName, payload.PullRequest.Number, payload.PullRequest.Head.SHA, time.Now()); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		logger.Error("github: upsert pending retrigger head sha failed", "error", err, "delivery_id", deliveryID)
-		releaseAndFail(http.StatusInternalServerError)
-		return
-	}
-
-	// §24.2: re-arm (or arm, for this PR's own first push since its
-	// review session was created) the trailing-edge debounce timer -- the
-	// SAME upsert-on-UNIQUE(session_id, name) idiom the 5 pre-existing
-	// named timers already use (session_timers.sql's own
-	// UpsertSessionTimer), so a second push before the first debounce
-	// fires simply pushes fires_at further out.
-	if _, err := timers.WithTx(tx).Upsert(ctx, sqlcgen.UpsertSessionTimerParams{
-		SessionID: row.SessionID,
-		Name:      sessionactor.TimerReviewRetriggerDebounce,
-		FiresAt:   pgtype.Timestamptz{Time: time.Now().Add(timeouts.ReviewRetriggerDebounce), Valid: true},
-	}); err != nil {
-		logger.Error("github: arm review_retrigger_debounce timer failed", "error", err, "delivery_id", deliveryID)
+		logger.Error("github: record pull request push for the automatic re-review failed", "error", err, "delivery_id", deliveryID)
 		releaseAndFail(http.StatusInternalServerError)
 		return
 	}

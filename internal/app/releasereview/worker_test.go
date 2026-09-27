@@ -18,9 +18,9 @@ import (
 // DB round trip, mirroring fakeMergedPRLister/fakeOutboxEnqueuer's own
 // precedent (run_test.go) exactly. Simulates a queue: ClaimDue takes up to
 // limit rows off the front -- a claimed row is never returned again,
-// exactly like the real ClaimDueReleaseManifestPending query's own
-// "claimed_at IS NULL" filter (queries/releasemanifestpending.sql) -- and
-// Finish records which claimed rows were deleted, and after how many
+// exactly like the real ClaimDueReleaseManifestPending query, which
+// deletes it (queries/releasemanifestpending.sql) -- and Finish records
+// which claimed checks' running rows were deleted, and after how many
 // ListMergedBetween calls (the check's own first step), so a test can tell
 // whether a row went before or after its check ran.
 type fakePendingLister struct {
@@ -169,14 +169,14 @@ func TestWorker_PumpOnce_ClaimBatchFails_PropagatesErrorNeverRunsAnything(t *tes
 
 // TestWorker_PumpOnce_ClaimsOneRowAtATimeAndFinishesItAfterItsCheck pins
 // the order the session's status relies on (technical plan §43.20,
-// migrations/000147): each row is claimed alone -- so its claimed_at is
-// when its own check starts, and the status's bound on a claimed row
-// measures that check -- and deleted only after its check has run (any
-// composition turn the check inserts is committed by then, so no snapshot
-// sees neither the row nor the turn). A tick first purges rows claimed
-// longer ago than ReleaseManifestCheckTimeout plus MCPStatusScheduledMargin
-// -- the same bound the status applies -- and stops after pendingBatchSize
-// rows.
+// migrations/000146): each row is claimed alone -- so its running row's
+// claimed_at is when its own check starts, and the status's bound on a
+// running check measures that check -- and finished only after its check
+// has run (any composition turn the check inserts is committed by then, so
+// a snapshot that no longer counts the check already counts the turn). A
+// tick first purges running rows claimed longer ago than
+// ReleaseManifestCheckTimeout plus MCPStatusScheduledMargin -- the same
+// bound the status applies -- and stops after pendingBatchSize rows.
 func TestWorker_PumpOnce_ClaimsOneRowAtATimeAndFinishesItAfterItsCheck(t *testing.T) {
 	t.Parallel()
 

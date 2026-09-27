@@ -11127,17 +11127,19 @@ type SessionActivity struct {
 	// stops counting then); else 'scheduled' when the server holds work that can
 	// create a turn on this session with no new input and has neither created it nor
 	// declined yet -- an automatic re-review armed by a push to the session's pull
-	// request (a debounce, 2 minutes as shipped, armed on every push whether or not
-	// the repository has opted in: the opt-in is read only when it fires), or a
-	// release pull request's manifest check still to come or still running (it can
-	// add a composition review turn); else 'awaiting_approval' when a person must act
-	// (a plan awaiting approval, a workflow step awaiting a decision, or a custom
-	// workflow's run escalated for review while it is still the session's latest
-	// state -- see awaiting.kind); else 'idle' when the session has no turn at all;
-	// else 'finished' (at least one turn, every one terminal, nothing being
-	// delivered, nothing scheduled). A queued or running turn is never reported as
-	// idle or finished. 'delivering' ends once the pull request is recorded, or once
-	// the delivery ends without one: the push failed or could not be sent, the pull
+	// request, the session's own push to that pull request's head included (a
+	// debounce, 2 minutes as shipped, counted only while the pull request's
+	// repository has opted in and its automatic re-review budget is not spent: the
+	// two conditions under which it can create a turn), or a release pull request's
+	// manifest check still to come or still running (it can add a composition review
+	// turn); else 'awaiting_approval' when a person must act (a plan awaiting
+	// approval, a workflow step awaiting a decision, or a custom workflow's run
+	// escalated for review until a turn is created on the session after it escalated
+	// -- see awaiting.kind); else 'idle' when the session has no turn at all; else
+	// 'finished' (at least one turn, every one terminal, nothing being delivered,
+	// nothing scheduled). A queued or running turn is never reported as idle or
+	// finished. 'delivering' ends once the pull request is recorded, or once the
+	// delivery ends without one: the push failed or could not be sent, the pull
 	// request could not be opened (the creator may no longer open one, or their
 	// GitHub token is no longer usable, or GitHub refused it), or the window passed.
 	// A pull request that is opened is recorded before activity leaves 'delivering',
@@ -11248,16 +11250,16 @@ type SessionActivityAwaiting struct {
 	// /api/sessions/{sessionID}/plans/{planId}/approve or reject); 'workflow_step': a
 	// workflow step awaiting a decision (id is the step run's);
 	// 'workflow_escalation': a custom workflow's run escalated for review (id is the
-	// run's), reported only while it is the session's latest state -- its newest
-	// workflow run, with no turn other than the run's own attempts created, started,
-	// ended or cancelled since it escalated. So a turn created after the escalation
-	// closes it, and so does a turn queued before it that runs after it (such as one
-	// queued behind the turn whose end escalated the run) as soon as it starts; a
-	// turn that had already ended when a decision escalated the run (one sent and run
-	// while a step awaited that decision) does not. A person answers it by sending
-	// the session new work. A built-in workflow's escalation is never reported: no
-	// person or route can act on it, and when its turn failed or was stopped, lastRun
-	// already says so.
+	// run's), reported until a turn is created on the session after it escalated:
+	// while it is the session's newest workflow run and no turn other than the run's
+	// own attempts has been created since. New work sent to the session answers it; a
+	// turn created before the escalation never does, whether it is still queued,
+	// running or has ended (such as one queued behind the turn whose end escalated
+	// the run, or one sent while a step awaited the decision that escalated it), so
+	// while such a turn runs, activity says running and awaiting still reports the
+	// escalation. A built-in workflow's escalation is never reported: no person or
+	// route can act on it, and when its turn failed or was stopped, lastRun already
+	// says so.
 	Kind SessionActivityAwaitingKind `json:"kind" yaml:"kind" mapstructure:"kind"`
 
 	// When the gate opened.

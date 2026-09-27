@@ -148,16 +148,8 @@ SELECT EXISTS(
 -- what a verdict-posting request resolves ITS OWN turn by, instead of
 -- "whichever turn is processing for this session right now". Follows the
 -- identical sqlc.narg + COALESCE convention.
---
--- status_changed_at (migrations/000146_turns_status_changed_at.up.sql,
--- technical plan §43.20) is the database's now() at a real status change
--- -- the one instant of a turn's run on the SAME clock as a workflow run's
--- escalation, which the session status compares it with. SET sees the
--- row's old status, so a call that passes the current status back
--- unchanged (tryPlanReenqueue above) leaves it alone.
 UPDATE turns
-SET status_changed_at = CASE WHEN turns.status IS DISTINCT FROM $2 THEN now() ELSE turns.status_changed_at END,
-    status = $2,
+SET status = $2,
     dispatched_at = COALESCE(sqlc.narg('dispatched_at'), dispatched_at),
     completed_at = COALESCE(sqlc.narg('completed_at'), completed_at),
     dispatched_sandbox_gen = COALESCE(sqlc.narg('dispatched_sandbox_gen'), dispatched_sandbox_gen),

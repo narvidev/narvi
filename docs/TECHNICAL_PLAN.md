@@ -1204,6 +1204,8 @@ This is a genuinely new GitHub ingress lane, not a small addition to the existin
 
 This event carries no comment body and no commenting actor at all, so the existing mention-detection step (doc.go's step 5: detecting whether the comment body actually mentions `Config.BotHandle`) does not apply here — routing is by `(repo, PR)` identity alone, never by text.
 
+**Amended by §43.20 (review round 4 of row 182's status).** That write is one function, `sessionactor.RecordPullRequestPush`, with two callers: this webhook, and the session actor when the session's own push moves its pull request's head — the push is the server's own output, which GitHub echoes back as this very event, and the actor records it in the transaction that persists the push's `push_complete`, so the re-review it causes is armed from the moment the server creates its cause (§43.20 says why). It upserts `pending_retrigger_head_sha` as before, and arms the debounce unless a turn of the session was already created against that head (`turns.review_head_sha`): a review of that head is then already queued, running or done — a synchronize echoing the session's own push that lands only after the review it pre-armed has been inserted, or one that lands after a mention already reviewed the new head — and a second one would review the same commits again.
+
 ### 24.2 Trailing-edge debounce, via the existing timer primitive
 A burst of pushes (a rebase, a sequence of small fixup commits) must review once, at the burst's own final head, after a quiet period — not once per push, and not the first push in the burst. This means debouncing on the **trailing** edge, not the leading one: leading-edge throttling marks the moment of the FIRST push and then silently drops every later push inside the window, which recreates exactly the problem this feature exists to solve (unreviewed commits) at the window's own edge — the very last, most current push in a burst would be the one never reviewed.
 
@@ -7701,7 +7703,10 @@ stamped with the database's `now()` in the same transaction that completes the t
 holds that completed turn without it — and only when a push will really be sent (live egress, a creator
 whose push can authenticate, at least one repository with a branch); cleared once `createPRBestEffort`
 has returned, after the pull request's artifact row is written, so a status that no longer says
-`delivering` already lists the pull request it opened. `createPRBestEffort` clears it on every return
+`delivering` already lists the pull request it opened. When the session is a pull request's review
+session and the push moved that pull request's own head, the transaction that persists its
+`push_complete` also records the automatic re-review that push causes (below), so the stamp clears into
+`scheduled`, never `finished`. `createPRBestEffort` clears it on every return
 (deferred), including the ones that open no pull request — no `SourceControl` configured, a
 `push_complete` listing no repository, a creator who may no longer open one (disabled, or now a
 viewer), a token that no longer decrypts, GitHub refusing the request — so `finished` can come with no
@@ -7734,7 +7739,8 @@ reads `finished` early — the behaviour before this phase existed, and only whe
 so review round 3 inventoried every mechanism that can create a turn, or change what the status
 reports, on a session with no new human input — every `session_timers` kind and its handler, the
 background workers, and all six places a turn is inserted (`createTurnLocked`, session creation, plan
-approval, the workflow engine's advance, the re-review debounce's handler, the composition dispatch):
+approval, the workflow engine's advance, the re-review debounce's handler, the composition dispatch) —
+and review round 4 added the input the server produces itself: its own output coming back as a webhook.
 
 | Mechanism | What arms it | What fires it | Can it create work from a settled snapshot? |
 |---|---|---|---|
@@ -7743,70 +7749,111 @@ approval, the workflow engine's advance, the re-review debounce's handler, the c
 | `inactivity` timer | the sandbox reaching `ready`; re-armed | timer pump → session actor | No — `ready` → `suspect` (a warning event on an extension) |
 | `terminal_grace` timer | `transitionSandboxToSuspect` (the three watchdogs, a permanent spawn failure) | timer pump → session actor | No — `suspect` → `failed`, the status re-derived with its reason unchanged, then dispatch re-run for a turn that is already pending (already `queued`) |
 | `turn_deadline` timer | a turn's dispatch; deleted at its completion | timer pump → session actor | No — it times out the turn that is processing, whose end can queue the workflow's next step in the same transaction, so it acts only while the snapshot already reads `running`; with no processing turn it deletes itself |
-| `review_retrigger_debounce` timer (§24) | the `pull_request`/`synchronize` webhook, on every push to a PR with a review session, opted in or not | timer pump → session actor, `ReviewRetriggerDebounce` (2 min) after the last push | **Yes** — inserts a review turn with no further input when the repository opted in, the head moved and the budget allows; otherwise declines and deletes itself |
+| `review_retrigger_debounce` timer (§24) | `sessionactor.RecordPullRequestPush`: the `pull_request`/`synchronize` webhook, on every push to a PR with a review session, opted in or not; and the session actor, when that session's own push moves the PR's head (next row) | timer pump → session actor, `ReviewRetriggerDebounce` (2 min) after the last push | **Yes** — inserts a review turn with no further input when the repository opted in, the head moved and the budget allows; otherwise declines and deletes itself |
+| A PR review session's own push to its PR's head (§24.1's amendment) | the session's completed turn: its push, reported by `push_complete` | GitHub's `pull_request`/`synchronize` for that push — the server's own output echoed back — which arms the debounce above on the same session | **Yes, through the debounce** — so the actor arms it itself, with the webhook's own write, in the transaction that persists the `push_complete`, before the delivery stamp clears: for a same-repository PR (the pushed repository's owner/repo is the PR's, on the session's branch, the head ref), with the sha the push reports, unless the server already knows that sha as the PR's head (the pending head, a posted verdict's head, a head one of the session's turns was created against — git reports the head whether or not the push moved it, so a known head means nothing new was pushed and no webhook will follow). The webhook then repeats the write for the same head, re-arming the debounce from its own later instant (§24's "2 minutes after the last push"); if it lands only after the review turn exists, it arms nothing, since a turn was created against that head |
 | Release manifest check (§15) | a new review session on a release PR (`release_manifest_pending`, enqueued by the webhook) | `releasereview.Worker`, every `ReleaseManifestCheckPumpInterval` | **Yes** — when the aggregate review triggers, inserts the composition review turn on that same session |
 | A workflow's next step (§25) | a step's turn ending, or `/decide` | the same transaction | No gap — inserted in the transaction that ends the previous step's turn |
 | A plan's implementation turn (§8.1) | a person approving the plan | the same transaction | Human input |
 | Mentions, the review label, the re-review button, REST, Slack and Linear turns | a person | the request itself | Human input; the turn is inserted before the request returns |
-| A completed turn's push and pull request | the turn's completion | its `push_complete` | Covered by `delivering` (above) |
+| A completed turn's push and pull request | the turn's completion | its `push_complete` | Covered by `delivering` (above); a PR review session's own push to its PR's head, by the row two above |
 | Dispatch and spawn retries, turn recovery | a pending or in-flight turn | the session actor | Only acts on a turn the snapshot already reads `queued` or `running` |
 | Automations (cron, GitHub including `check_run`, Linear), sentinel auto-fix, child sessions | their triggers | their pumps | Create a new session, its first turn in the same transaction — never a turn on an existing one |
 
-The two that can create work are read in the status's one statement, and a session holding either reads
-`scheduled` — never settled — with `awaiting` still reporting any gate open beside it. Timers are read
-by kind: the statement returns every armed timer of the session (`session_timers`, one row per name),
-and `sessionactor.ClassifyTimer` is the one table that says what each kind can do (the three classes
-above: sandbox only, a turn already in flight only, creates a turn). It is exhaustive by test:
-`TestClassifyTimer_EveryDeclaredKindIsClassified` parses the package's `Timer*` constants and fails for
-one without a classification, and `TestClassifyTimer_EveryArmedNameIsClassified` fails for a timer armed
-anywhere in the module under a name that is not a classified constant. A name the table does not know —
-written by a newer binary — counts as work, never as settled. A work-creating timer counts while it is
-armed; its handler deletes it in the transaction that inserts the turn, or declines, so no snapshot
-holds neither. A handler that keeps failing leaves it armed, retried every `TimerClaimDuration`, and the
-status keeps reading `scheduled`: the server is still trying. A release manifest check counts while its
-row waits to be claimed, and while it runs: a claim now stamps `claimed_at` (migration `000147`)
-instead of deleting the row, the worker deletes it once the check has returned — after any composition
-turn it inserted has committed — and claims one row at a time, so `claimed_at` is when that check
-started. A claimed row counts only within `ReleaseManifestCheckTimeout` + `MCPStatusScheduledMargin` of
-its claim (the worker's own context ends the check at `ReleaseManifestCheckTimeout`), so a worker that
-died mid-check cannot hold the session unsettled for good, and the next tick purges such rows; a
-claimed row is never claimed again, so the check still runs at most once. `scheduled` suggests
-`MCPStatusDelayScheduled` (15 s), but never past the earliest armed work's due instant plus
-`MCPStatusScheduledMargin` (5 s): a timer's `fires_at` (which the pump pushes forward by
-`TimerClaimDuration` while it delivers it), an unclaimed check's enqueue plus
-`ReleaseManifestCheckPumpInterval`, a claimed check's claim plus `ReleaseManifestCheckTimeout`. Two
-consequences err toward unsettled, and are the stated limits: the debounce is armed on every push to a
-pull request with a review session whether or not its repository opted in (the opt-in, the head and
-the budget are read only when it fires, §24.3), so on a repository that has not opted in a push reads
-`scheduled` for the debounce, then settled once the fire declines; and a release PR's review session
-reads `scheduled` until its check has run, whether or not the check triggers the composition pass.
-Reading the opt-in in the status instead was rejected: it would copy one handler's decline rules into
-the status, and any rule it failed to copy would read `settled` while a turn was still coming.
+The server's other outputs were checked for the same echo — something it posts coming back as a
+webhook that creates a turn on the same session — and none does. The pull request `createPRBestEffort`
+opens for a review session already exists, and no `pull_request` action other than `synchronize` and
+`labeled` reaches a lane that creates a turn (`closed` feeds merge gating and the merge-outcome
+capture; `opened` and the rest are acknowledged and ignored). Its own comments — verdicts, turn
+outcomes, the budget notice, the release manifest — are dropped by the mention lane's self-comment
+filter before any turn, and the capture commands that read comments create none. The labels it applies
+(the risk tiers, `handoff`) are never the configured re-review label, and a label its own identity
+applies is filtered the same way. The check runs it posts reach only the automation dispatcher, which
+creates new sessions. What it posts to Slack is a bot message Slack ingress drops, and Linear ingress
+acts only on the agent-session events a person causes (`created`, `prompted`).
+
+The mechanisms that can create work are read in the status's one statement, and a session holding any
+of them reads `scheduled` — never settled — with `awaiting` still reporting any gate open beside it.
+Timers are read by kind: the statement returns every armed timer of the session (`session_timers`, one
+row per name), and `sessionactor.ClassifyTimer` is the one table that says what each kind can do (the
+three classes above: sandbox only, a turn already in flight only, creates a turn). Two tests keep it
+complete for the forms the code arms timers with: `TestClassifyTimer_EveryDeclaredKindIsClassified`
+parses the package's `Timer*` constants and fails for one without a classification, and
+`TestClassifyTimer_EveryArmedNameIsClassified` fails when an `armTimer` call or a keyed
+`UpsertSessionTimerParams` literal in non-test code under `internal/`, `controlplane/` or `cmd/`
+(generated code aside) names anything but a classified constant. Neither sees a params value filled by
+field assignment or through a type alias, or SQL that writes `session_timers` — a raw `Exec`, a new
+sqlc query, a migration or backfill; today the one writer is `UpsertSessionTimer`, reached only through
+`armTimer` and `RecordPullRequestPush`. The runtime backstop covers what the tests cannot: a name the
+table does not know counts as work, never as settled, and its handler leaves it armed, so the session
+reads `scheduled` while it is — erring toward unsettled. A database `CHECK` on the kind was considered
+and not added: it would make every new timer kind a schema change with its own rollout order and
+down-migration, for a gap the backstop already keeps on the safe side.
+
+The re-review debounce counts only while its fire can insert a turn at all, on the fire's two
+conditions a row shows: the pull request's repository opted in
+(`repo_settings.auto_retrigger_review_enabled`; no row reads as off, as it does for the fire) and its
+automatic re-review count is below `sessionactor.ReviewAutoRetriggerBudget` — the one constant the fire compares
+with, passed into the statement rather than written there again — read in one lateral over
+`github_pr_sessions` and `repo_settings` (`review_retrigger_can_fire`). The count only grows and only
+the admin toggle writes the opt-in, so a debounce read as unable to fire can create a turn later only
+after a person switches the opt-in on: new input. The fire's other decline rules are deliberately not
+copied — the head already reviewed (the latest verdict's head, which a turn already marked failed can
+still post), a plan awaiting approval, a live fetch that fails. Leaving a decline rule out errs toward
+`scheduled`, never toward settled: a false settled needs a copied rule stricter than the fire's own, or
+one that drifts from it, and `TestSessionStatus_ReReviewFireAndStatusAgree` runs the real fire and the
+status over one table of opt-ins and counts around the budget and asserts they agree on every row. A
+work-creating timer counts while it is armed; its handler deletes it in the transaction that inserts
+the turn, or declines, so no snapshot holds neither. A handler that keeps failing leaves it armed,
+retried every `TimerClaimDuration`, and the status keeps reading `scheduled`: the server is still
+trying.
+
+A release manifest check counts while its row waits to be claimed, and while it runs. The claim still
+deletes the pending row — the claim every earlier binary runs, unchanged — and in the same transaction
+records the check in `release_manifest_checks_running` (migration `000146`), stamped with the
+database's `now()`; the worker deletes that row once the check has returned — after any composition
+turn it inserted has committed — and claims one row at a time, so the stamp is when that check started.
+Keeping the claim a delete keeps the check at most once in any fleet: during the rolling deploy that
+ships the table, a pod still on the previous binary claims with the previous delete, which can never
+return a check a newer pod is running (its pending row is already gone), and a rollback drops the table,
+losing at most the status of checks in flight. A check an old pod claims during that one deploy is not
+counted while it runs, as before this table existed. A running check counts only within
+`ReleaseManifestCheckTimeout` + `MCPStatusScheduledMargin` of its claim (the worker's own context ends
+the check at `ReleaseManifestCheckTimeout`), so a worker that died mid-check cannot hold the session
+unsettled for good, and the next tick purges such rows. `scheduled` suggests `MCPStatusDelayScheduled`
+(15 s), but never past the earliest armed work's due instant plus `MCPStatusScheduledMargin` (5 s): a
+timer's `fires_at` (which the pump pushes forward by `TimerClaimDuration` while it delivers it), a
+waiting check's enqueue plus `ReleaseManifestCheckPumpInterval`, a running check's claim plus
+`ReleaseManifestCheckTimeout`. The stated limits: a debounce whose fire then declines on a rule the
+status does not copy reads `scheduled` until it fires, toward unsettled; a release PR's review session
+reads `scheduled` until its check has run, whether or not the check triggers the composition pass, also
+toward unsettled; and a fork pull request's head lives in another repository, so the session's own push
+is never pre-armed there — should one reach that head, the webhook arms the re-review only when it
+lands.
 
 **Which escalation is a gate.** A workflow run escalated to `needs_review` (§25.9) stays there: no
 route or job moves a run out of it — `/decide` acts only on a step awaiting a decision — and the next
 turn starts a fresh run beside the parked one (migration `000057`: a parked run must not freeze the
 session). Counting every such run would let one failed turn gate a session for good. So an escalation
-is a gate only while it is still the latest thing that happened on the session: its run is the
-session's newest workflow run (runs ordered by `created_at`, then id), it ran an attempt of its own,
-and no turn other than its own attempts (`workflow_step_runs.turn_id`, among them the turn whose end
-escalated it in the same transaction) has been created, or has changed status — dispatched, ended,
-cancelled — since it escalated. The instants compared are all the database's clock, each its
-transaction's start: `turns.created_at`; `turns.status_changed_at` (migration `000146`:
-`UpdateTurnStatus`, the one query that changes a turn's status, stamps `now()` on every real change —
-`dispatched_at` and `completed_at` are the control plane's clock, and are never compared with a
-database instant); and `workflow_runs.updated_at`, which the escalation stamps and nothing writes
-again. Two transactions that overlap are ordered by which began first. What closes it, then: a turn
-created after the escalation, whether it starts a run of its own or none (an automatic re-review turn,
-which the engine never tracks, or a plan's implementation turn); and a turn created before it that runs
-after it — one queued behind the turn whose end escalated the run (`AlwaysQueue`: a GitHub mention, a
-re-review), which starts no run and is no attempt, closes it as soon as it is dispatched. While that
-turn still waits, the escalation is still reported (`queued`, `awaiting` on the escalation): nothing
-has run since. What does not close it: a turn that had already ended when a decision escalated the run
-— one sent while a step awaited that decision, which the engine leaves untracked (no step run, no new
-run); `/decide approve` on a `blocked` outcome with no edge then escalates the run, and that escalation
-is the session's latest state. A person acts on an escalation by sending the session new work, and the
-gate is gone as soon as that work is queued.
+stays open until a turn is created on the session after the run escalated: it is a gate while its run
+is the session's newest workflow run (runs ordered by `created_at`, then id), it ran an attempt of its
+own, and no turn other than its own attempts (`workflow_step_runs.turn_id`, among them the turn whose
+end escalated it in the same transaction) has been created since it escalated. Both instants are the
+database's clock, each its transaction's start: `turns.created_at`, and `workflow_runs.updated_at`,
+which the escalation stamps and nothing writes again; two transactions that overlap are ordered by
+which began first. New work sent to the session answers the escalation — a person's message, mention
+or plan approval, or an automatic re-review the server inserts after a new push — and the gate is gone
+as soon as that work is queued. A turn created before the escalation never answers it, whether it is
+still queued, running or has ended: one queued behind the turn whose end escalated the run
+(`AlwaysQueue`: a GitHub mention, a re-review), which starts no run and is no attempt, or one sent
+while a step awaited the decision that then escalated the run (`/decide approve` on a `blocked`
+outcome with no edge), which the engine leaves untracked. While such a turn waits or runs, `activity`
+says `queued` or `running` and `awaiting` still reports the escalation; once it has ended, the session
+reads `awaiting_approval` on the escalation. Review round 3 briefly closed the gate on such a turn's
+dispatch or end as well, and review round 4 reverted it: an untracked turn already running when
+`/decide` escalated the run then closed the escalation if it ended a moment after the click and left it
+open if it ended a moment before — the same actions, two answers, and neither a response to the
+escalation. A turn's creation is the one instant that orders it against the escalation whatever it
+does afterwards.
 
 A **built-in** workflow's escalation is never a gate. The built-ins are one passthrough step with no
 edge and no human gate of their own (§25.8), so their run escalates whenever that step's outcome is
@@ -7831,14 +7878,18 @@ such a commit and report a false `finished`. The statement reads aggregates and 
 the per-state turn counts as one JSON object (so a state added to the enum later still reaches the
 derivation as unknown, rather than being dropped), the first in-flight turn, the newest terminal turn,
 the newest turn, the oldest open plan and workflow step, the newest workflow run when it is an open
-escalation, the sandbox status and its delivery stamp, the armed timers and the release checks still
-to come or running — never the turn list, whose length is unbounded and whose rows carry prompts (the
-escalation's check scans the session's turns for one created or changed since, as the histogram does,
-returning none of them). Every lookup leads with `session_id` (or, for the escalation's own checks, a
-primary key or `workflow_run_id`) on an index: `session_timers`' own `UNIQUE (session_id, name)`, and
-`release_manifest_pending_session_id_idx`, which migration `000147` adds. The migrations are three: the
-delivery stamp's column (`000145`), the turn's `status_changed_at` (`000146`), and the release check's
-`claimed_at` with that index (`000147`).
+escalation, the sandbox status and its delivery stamp, the armed timers, whether the re-review debounce
+can fire, and the release checks still to come or running — never the turn list, whose length is
+unbounded and whose rows carry prompts (the escalation's check scans the session's turns for one
+created since, as the histogram does, returning none of them). Every lookup leads with `session_id` (or,
+for the escalation's own checks, a primary key or `workflow_run_id`, and for the opt-in `repo_settings`'
+primary key) on an index: `session_timers`' own `UNIQUE (session_id, name)`,
+`github_pr_sessions_session_id_idx`, and `release_manifest_pending_session_id_idx` and
+`release_manifest_checks_running_session_id_idx`, which migration `000146` adds. The migrations are
+two: the delivery stamp's column (`000145`), and the running release checks' table with both indexes
+(`000146`). That the store sends exactly one statement is pinned deterministically, not only by the
+race tests below: `TestSessionActivityFacts_IssuesExactlyOneStatement` counts what the pool sends, so a
+second statement before or after the facts fails it on every run.
 
 Beside `activity`, the response says how many turns are pending, which turn is in flight (and since
 when it was dispatched), which gate is open and since when (a plan first, then a workflow step, then
@@ -7898,37 +7949,46 @@ directions, no stamp, no window; `ClaimedWorkOpen` on the same table), `TestSugg
 `TestSuggestedReadDelay_AlwaysWithinBounds` (every activity × every sandbox status × due instants on
 either side, with a table whose values fall outside the bounds). Timer kinds:
 `TestClassifyTimer_EveryDeclaredKindIsClassified`, `TestClassifyTimer_EveryArmedNameIsClassified`,
-`TestClassifyTimer_Table`. Timeouts: `TestTimeouts_Validate_MCPStatusDelay` (each link broken alone,
+`TestClassifyTimer_Table`, `TestTimerCountsAsScheduledWork_Table` (the debounce counted only while it
+can fire, every other kind as classified). Timeouts: `TestTimeouts_Validate_MCPStatusDelay` (each link broken alone,
 reported by name; the scheduled margin kept positive), `TestTimeouts_Validate_MCPStatusDeliveryWindow`
 (the window above one repository's whole chain with margin, each limit raised alone, the reviewers'
 5-minute mint included). Release worker: `TestWorker_PumpOnce_ClaimsOneRowAtATimeAndFinishesItAfterItsCheck`,
 `TestWorker_PumpOnce_FinishFailureNeverAbortsTheTick`. Postgres: `TestSessionActivityFacts_OneStatement` (an escalation a newer
-run and newer turns superseded is not reported beside the open plan and step; the delivery stamp is
-read), `TestSessionActivityFacts_LiveEscalation` (reported: a custom run whose own turn is the newest,
-including a later step's, and one escalated after an untracked turn; not reported: a built-in run,
-even after an untracked turn, a newer run with or without a turn of its own, a newer turn with no run,
-a turn created after the escalation, a turn queued before it that was dispatched, ran or was cancelled
-after it, a run with no turn; a turn queued before it and still pending, or one that had ended before
-it, leaves it reported), `TestSandboxPRDelivery_StartAndEnd`, `TestUpdateTurnStatus_StampsStatusChangedAt`,
-`TestReleaseManifestPending_ClaimFinishPurge`.
+run and newer turns superseded is not reported beside the open plan and step; the delivery stamp, the
+armed timers, a waiting and a running release check and the debounce's opt-in are read),
+`TestSessionActivityFacts_LiveEscalation` (reported: a custom run whose own turn is the newest,
+including a later step's; one escalated after an untracked turn that ended before the decision, and
+after one that ended after it; a turn queued before the escalation, whether still pending, dispatched
+after it, run to completion after it or cancelled after it; not reported: a built-in run, even after an
+untracked turn, a newer run with or without a turn of its own, a newer turn with no run, a turn created
+after the escalation or at its very instant, a run with no turn), `TestSessionActivityFacts_ReviewRetriggerCanFire`
+(no pull request, no settings row, opted out, the count on either side of the budget passed in),
+`TestSessionActivityFacts_IssuesExactlyOneStatement`, `TestSandboxPRDelivery_StartAndEnd`,
+`TestReleaseManifestCheck_ClaimFinishPurge`, `TestReleaseManifestCheck_PreviousClaimNeverTakesARunningCheck`
+(the previous binary's verbatim claim, after and racing the new one over 200 rows: every row claimed
+exactly once, never a running check, which the status keeps counting), `TestMigration000146_UpDownUp`.
 The handler's decode, on synthetic rows: `TestSessionActivityToDTO_UnknownTurnStateReachesTheDerivation`
 (a state `turn_status` does not have yet reads `running`, never dropped),
 `TestSessionActivityToDTO_AwaitingPrecedence` (every gate combination: plan, then step, then
 escalation), `TestSessionActivityToDTO_DeliveryWindow`, `TestSessionActivityToDTO_ScheduledWork` (every
-timer class, an unknown kind, a release check waiting, claimed, and claimed by a dead worker). REST, on real Postgres:
+timer class, an unknown kind, a debounce that cannot fire alone and beside other work, a release check
+waiting, running, and claimed by a dead worker). REST, on real Postgres:
 `TestGetSessionStatus_FollowUpQueuedUnderCompletedRow` (the row says `completed` while a follow-up is
 queued, then dispatched, then processing: `queued`, `running`, `running`, then `finished` only once
 the turn is terminal), `TestGetSessionStatus_PlanCompletionNeverObservedAsFinished_Race` and
 `TestGetSessionStatus_WorkflowAdvanceNeverObservedAsFinished_Race` (a writer commits a completion and
 its follow-on in one transaction, over and over, while readers poll; `finished` is never observed),
-`TestGetSessionStatus_Gates` (including a custom run's escalation, open until a newer turn with no
-run of its own supersedes it), `TestGetSessionStatus_EscalatedTurnNeverGatesForGood` (through
+`TestGetSessionStatus_Gates` (including a custom run's escalation, open until a turn created after it
+with no run of its own supersedes it), `TestGetSessionStatus_EscalatedTurnNeverGatesForGood` (through
 `CreateTurnCore`, `turn.Transition` and `workflowengine.OnTurnCompleted` in one terminal transaction,
 for a turn stopped by the user, failed, timed out and abandoned at dispatch, under the built-in and
 under a custom workflow: the built-in escalation reads `finished` at once, the custom one
 `awaiting_approval` until the follow-up is queued, and both `finished` once it completes),
-`TestGetSessionStatus_EscalationAfterAnUntrackedTurn` (a step awaiting a decision, a turn sent and
-completed meanwhile, then `/decide approve` escalating the run: `awaiting_approval` on the escalation),
+`TestGetSessionStatus_EscalationAfterAnUntrackedTurn` (a step awaiting a decision, a turn sent
+meanwhile, then `/decide approve` escalating the run: `awaiting_approval` on the escalation whether
+that turn ended before the click or was still running and ended after it — `running` with the
+escalation reported while it runs),
 `TestGetSessionStatus_EscalationNeverObservedAsFinished_Race` (a turn's failure and its run's
 escalation in one transaction, the follow-up and its run in another, over and over, while readers
 poll: `finished` is never observed — reading the escalation in a second statement, in either order,
@@ -7942,14 +8002,21 @@ never reports back), `TestGetSessionStatus_DeliveryNeverObservedAsFinished_Race`
 `TestGetSessionStatus_ScheduledWorkNeverObservedAsFinished_Race` (a re-review armed then inserted as
 its timer goes, and a release check enqueued, claimed and finished, each with a turn ending between,
 while readers poll: `finished` is never observed — reading the stamp, the timers or the release rows
-in a second statement is),
-`TestGetSessionStatus_TurnQueuedBehindTheEscalatingTurnClosesItOnceItRuns` (review round 3's P2
-reproduction through the engine: the escalation reported while the queued turn waits, gone once it is
-dispatched, `finished` once it completes). GitHub ingress, end to end:
+in a second statement after the facts is; one before them is caught by the one-statement pin),
+`TestGetSessionStatus_TurnQueuedBehindTheEscalatingTurnNeverClosesIt` (review round 3's P2
+reproduction through the engine: the escalation reported while the queued turn waits, while it runs
+and after it completes — `awaiting_approval` — and gone only once a turn is created after it). GitHub
+ingress, end to end:
 `TestSessionStatus_AutomaticReReviewIsScheduledUntilItsTurnExists` (a real signed `synchronize`
 delivery, the real timer pump and actor: `finished`, then `scheduled` from the webhook's commit until
 the review turn exists — never settled in between — then `queued`),
-`TestSessionStatus_DeclinedReReviewSettlesWithinTheBound`,
+`TestSessionStatus_ReReviewThatCannotFireReadsSettledAtOnce` (not opted in: armed, yet `finished` right
+after the push and through the fire, which declines), `TestSessionStatus_ReReviewFireAndStatusAgree`,
+`TestSessionStatus_OwnPushIsScheduledUntilItsReReviewExists` (review round 4's P1: a real actor,
+execution_complete, push_complete and CreatePR held open, the real signed webhook and pump — never
+settled from the turn's end until the review turn exists, with the webhook landing late, or only after
+that turn exists, and no second review; armed but `finished` when not opted in; nothing pre-armed for a
+fork pull request, or for a push reporting a head already known by a turn, a verdict or the webhook),
 `TestSessionStatus_ReleaseManifestCheckIsScheduledUntilItsCompositionTurnExists` (the real worker:
 `scheduled` while the check waits and while it runs, `queued` with the composition turn, settled at once
 when nothing triggers it). MCP:

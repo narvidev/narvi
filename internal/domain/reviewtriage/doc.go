@@ -80,7 +80,7 @@
 // named shape literally: DeepPaths is a real per-repo override surface,
 // but the 600-line/3-root thresholds are fixed package constants
 // (maxChangedLinesLight/minDistinctRootsForDeep, decide.go), not exposed
-// via any config column -- mirroring reviewAutoRetriggerBudget's own
+// via any config column -- mirroring ReviewAutoRetriggerBudget's own
 // identical precedent (internal/app/sessionactor/reviewretrigger.go:
 // "a plain package constant... §24.6 itself only asks for a documented,
 // reasoned default, not a per-repo override surface"). This resolution

@@ -260,13 +260,13 @@ func TestSessionStatus_AutomaticReReviewIsScheduledUntilItsTurnExists(t *testing
 	}
 }
 
-// TestSessionStatus_DeclinedReReviewSettlesWithinTheBound: a repository
+// TestSessionStatus_ReReviewThatCannotFireReadsSettledAtOnce: a repository
 // that has not opted in still gets the debounce armed on every push (the
-// webhook reads no opt-in, §24), so the session reads scheduled -- the
-// safe side -- until the timer fires and declines; then settled again, at
-// once, well within the bound the suggested delay promised (the due
-// instant plus MCPStatusScheduledMargin), with no turn created.
-func TestSessionStatus_DeclinedReReviewSettlesWithinTheBound(t *testing.T) {
+// webhook reads no opt-in, §24), but the fire can only decline, so the
+// status does not count it (technical plan §43.20; review round 4's P3):
+// finished and settled right after the push, all through the fire, and
+// after it, with no turn created.
+func TestSessionStatus_ReReviewThatCannotFireReadsSettledAtOnce(t *testing.T) {
 	ctx := context.Background()
 	f := newRetriggerStatusFixture(ctx, t, false)
 
@@ -274,22 +274,82 @@ func TestSessionStatus_DeclinedReReviewSettlesWithinTheBound(t *testing.T) {
 	if _, armed := f.debounceArmed(ctx, t); !armed {
 		t.Fatal("the synchronize webhook armed no debounce")
 	}
-	wantScheduled(t, "not opted in, the debounce armed", f.mustRead(t), 15, f.lastTurnID)
+	wantFinishedRetrigger := func(stage string, got restdtos.SessionActivity) {
+		t.Helper()
+		if got.Activity != restdtos.SessionActivityActivityFinished || !got.Settled || got.SuggestedDelaySeconds != 300 {
+			t.Fatalf("%s: activity %q settled %v delay %d, want finished, settled, 300", stage, got.Activity, got.Settled, got.SuggestedDelaySeconds)
+		}
+	}
+	wantFinishedRetrigger("not opted in, the debounce armed", f.mustRead(t))
 
 	f.comeDue(ctx, t)
-	due := time.Now()
-	wantScheduled(t, "the debounce due", f.mustRead(t), 5, f.lastTurnID)
-
-	f.fireWhileWatching(ctx, t)
-	got := f.mustRead(t)
-	margin := platform.DefaultTimeouts().MCPStatusScheduledMargin
-	if elapsed := time.Since(due); elapsed > margin {
-		t.Fatalf("the declined fire took %v past its due instant, beyond the %v margin the suggestion promised", elapsed, margin)
+	for i, got := range f.fireWhileWatching(ctx, t) {
+		wantFinishedRetrigger(fmt.Sprintf("read %d while the fire declined", i), got)
 	}
-	if got.Activity != restdtos.SessionActivityActivityFinished || !got.Settled || got.SuggestedDelaySeconds != 300 {
-		t.Fatalf("declined: activity %q settled %v delay %d, want finished, settled, 300", got.Activity, got.Settled, got.SuggestedDelaySeconds)
-	}
+	wantFinishedRetrigger("declined", f.mustRead(t))
 	if turns, err := f.rig.turns.ListForSession(ctx, f.sessionID); err != nil || len(turns) != 1 {
 		t.Fatalf("declined: %d turns (err %v), want only the old review", len(turns), err)
+	}
+}
+
+// TestSessionStatus_ReReviewFireAndStatusAgree runs the debounce's real
+// fire and the status's read over one fixture table -- the opt-in (on,
+// off, no repo_settings row) and the automatic re-review count around
+// sessionactor.ReviewAutoRetriggerBudget, every other condition set so the
+// fire would insert a turn -- and asserts they agree on every row: the
+// status reads the armed debounce as scheduled exactly when the fire then
+// inserts the review turn, and finished exactly when it declines. The
+// budget is the one constant both compare with.
+func TestSessionStatus_ReReviewFireAndStatusAgree(t *testing.T) {
+	ctx := context.Background()
+	budget := int32(sessionactor.ReviewAutoRetriggerBudget)
+	for _, row := range []struct {
+		name      string
+		optedIn   bool
+		noSetting bool
+		count     int32
+	}{
+		{"opted in, nothing spent", true, false, 0},
+		{"opted in, one re-review left", true, false, budget - 1},
+		{"opted in, budget spent", true, false, budget},
+		{"opted in, past the budget", true, false, budget + 1},
+		{"opted out, nothing spent", false, false, 0},
+		{"opted out, budget spent", false, false, budget},
+		{"no repo settings row", false, true, 0},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			f := newRetriggerStatusFixture(ctx, t, row.optedIn)
+			if _, err := f.rig.pool.Exec(ctx, `UPDATE github_pr_sessions SET auto_retrigger_count = $3 WHERE repo_full_name = $1 AND pr_number = $2`, f.repoFullName, f.prNumber, row.count); err != nil {
+				t.Fatalf("set the re-review count: %v", err)
+			}
+			if row.noSetting {
+				if _, err := f.rig.pool.Exec(ctx, `DELETE FROM repo_settings WHERE repo_full_name = $1`, f.repoFullName); err != nil {
+					t.Fatalf("drop the repo settings row: %v", err)
+				}
+			}
+			f.push(t, "sha-agreement-"+row.name)
+			if _, armed := f.debounceArmed(ctx, t); !armed {
+				t.Fatal("the synchronize webhook armed no debounce")
+			}
+			got := f.mustRead(t)
+			statusCountsIt := got.Activity == restdtos.SessionActivityActivityScheduled
+			if !statusCountsIt && (got.Activity != restdtos.SessionActivityActivityFinished || !got.Settled) {
+				t.Fatalf("the status read %q settled %v, want scheduled or finished", got.Activity, got.Settled)
+			}
+
+			f.comeDue(ctx, t)
+			f.fireWhileWatching(ctx, t)
+			turns, err := f.rig.turns.ListForSession(ctx, f.sessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fireInserted := len(turns) == 2
+			if len(turns) > 2 {
+				t.Fatalf("%d turns after one fire", len(turns))
+			}
+			if statusCountsIt != fireInserted {
+				t.Fatalf("the status counted the debounce: %v; the fire inserted a turn: %v -- they must agree", statusCountsIt, fireInserted)
+			}
+		})
 	}
 }

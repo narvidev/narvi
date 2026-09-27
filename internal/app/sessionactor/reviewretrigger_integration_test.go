@@ -689,7 +689,7 @@ func TestReviewRetriggerDebounceTimer_BudgetExhausted_PostsNoticeOnce(t *testing
 	if _, err := f.repoSettings.UpsertAutoRetriggerReviewToggle(ctx, f.repoFullName, true); err != nil {
 		t.Fatalf("enable auto-retrigger-review: %v", err)
 	}
-	for i := 0; i < reviewAutoRetriggerBudget; i++ {
+	for i := 0; i < ReviewAutoRetriggerBudget; i++ {
 		if _, err := f.prSessions.IncrementAutoRetriggerCount(ctx, f.repoFullName, f.prNumber); err != nil {
 			t.Fatalf("seed auto_retrigger_count: %v", err)
 		}
@@ -717,8 +717,8 @@ func TestReviewRetriggerDebounceTimer_BudgetExhausted_PostsNoticeOnce(t *testing
 	if row.PendingRetriggerHeadSha != nil {
 		t.Errorf("pending_retrigger_head_sha = %v, want nil (cleared even though nothing was enqueued)", row.PendingRetriggerHeadSha)
 	}
-	if row.AutoRetriggerCount != reviewAutoRetriggerBudget {
-		t.Errorf("auto_retrigger_count = %d, want unchanged %d (budget-exhausted branch never increments further)", row.AutoRetriggerCount, reviewAutoRetriggerBudget)
+	if row.AutoRetriggerCount != ReviewAutoRetriggerBudget {
+		t.Errorf("auto_retrigger_count = %d, want unchanged %d (budget-exhausted branch never increments further)", row.AutoRetriggerCount, ReviewAutoRetriggerBudget)
 	}
 
 	// Second firing: still exhausted -- must NOT post a second notice.

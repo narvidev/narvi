@@ -7,8 +7,8 @@
 // inserts one more turn -- the composition review -- on that same session
 // when the aggregate review is triggered. On real Postgres, through the
 // real worker and the real status handler: the session reads scheduled
-// while the check waits AND while it runs (the claim keeps the row until
-// the check returns, migrations/000147), queued once the composition turn
+// while the check waits AND while it runs (the claim records the check as
+// running until it returns, migrations/000146), queued once the composition turn
 // exists, and settled again at once when the check triggers nothing.
 package github_test
 
@@ -67,8 +67,10 @@ func TestSessionStatus_ReleaseManifestCheckIsScheduledUntilItsCompositionTurnExi
 	// The worker claims the oldest row in the whole table: start from an
 	// empty queue so the row it claims is this test's.
 	clearQueue := func() {
-		if _, err := pool.Exec(ctx, `DELETE FROM release_manifest_pending`); err != nil {
-			t.Fatalf("clear release_manifest_pending: %v", err)
+		for _, table := range []string{"release_manifest_pending", "release_manifest_checks_running"} {
+			if _, err := pool.Exec(ctx, `DELETE FROM `+table); err != nil {
+				t.Fatalf("clear %s: %v", table, err)
+			}
 		}
 	}
 	clearQueue()
@@ -167,10 +169,10 @@ func TestSessionStatus_ReleaseManifestCheckIsScheduledUntilItsCompositionTurnExi
 				close(stop)
 				t.Fatalf("while the check runs: activity %q settled %v pending %d, want scheduled, not settled, no turn yet", running.Activity, running.Settled, running.PendingTurns)
 			}
-			var claimed bool
-			if err := pool.QueryRow(ctx, `SELECT claimed_at IS NOT NULL FROM release_manifest_pending WHERE session_id = $1`, sess.ID).Scan(&claimed); err != nil || !claimed {
+			var pending, runningRows int
+			if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM release_manifest_pending WHERE session_id = $1), (SELECT count(*) FROM release_manifest_checks_running WHERE session_id = $1)`, sess.ID).Scan(&pending, &runningRows); err != nil || pending != 0 || runningRows != 1 {
 				close(stop)
-				t.Fatalf("while the check runs: row claimed %v (%v), want the row kept, claimed", claimed, err)
+				t.Fatalf("while the check runs: %d pending, %d running (%v), want the pending row claimed (deleted) and the check recorded as running", pending, runningRows, err)
 			}
 			close(lister.release)
 
@@ -178,7 +180,7 @@ func TestSessionStatus_ReleaseManifestCheckIsScheduledUntilItsCompositionTurnExi
 			deadline := time.Now().Add(10 * time.Second)
 			for {
 				var left int
-				if err := pool.QueryRow(ctx, `SELECT count(*) FROM release_manifest_pending WHERE session_id = $1`, sess.ID).Scan(&left); err != nil {
+				if err := pool.QueryRow(ctx, `SELECT count(*) FROM release_manifest_checks_running WHERE session_id = $1`, sess.ID).Scan(&left); err != nil {
 					t.Fatal(err)
 				}
 				if left == 0 {
@@ -186,7 +188,7 @@ func TestSessionStatus_ReleaseManifestCheckIsScheduledUntilItsCompositionTurnExi
 				}
 				if time.Now().After(deadline) {
 					close(stop)
-					t.Fatal("the worker never finished the check's row")
+					t.Fatal("the worker never finished the check's running row")
 				}
 				time.Sleep(10 * time.Millisecond)
 			}

@@ -120,17 +120,19 @@ wait and run under any of those five values. The status route answers
 that instead. Its `activity` is `queued` (a turn waits, including while a
 sandbox starts), `running`, `delivering` (the last turn is done, and its
 branch is being pushed and its pull request opened), `scheduled` (nothing
-queued, running or being delivered, but the server will start a turn on
-its own: an automatic re-review after a push to the pull request — armed
-on every push, then dropped when it fires if the repository has not opted
-in — or a release pull request's manifest check, which can add a
-composition review), `awaiting_approval` (nothing queued, running, being
-delivered or scheduled, and a plan or a workflow step waits for a person,
-or a custom workflow stopped and handed its run to a person — until a
-turn is created, or starts, on the session again), `idle` (no turn yet)
-or `finished` — a queued or running turn is never reported as idle or
-finished, and `settled` is true only for `idle`, `awaiting_approval` and
-`finished`.
+queued, running or being delivered, but the server holds work that may
+start a turn on its own and has not yet started or dropped it: an
+automatic re-review after a push to the pull request — the session's own
+push included — while the repository has opted in and the pull request
+still has automatic re-reviews left, or a release pull request's manifest
+check, which can add a composition review), `awaiting_approval` (nothing
+queued, running, being delivered or scheduled, and a plan or a workflow
+step waits for a person, or a custom workflow stopped and handed its run
+to a person — until a turn is created on the session after that; a turn
+sent before it, even one that runs or ends afterwards, does not close
+it), `idle` (no turn yet) or `finished` — a queued or running turn is
+never reported as idle or finished, and `settled` is true only for
+`idle`, `awaiting_approval` and `finished`.
 
 A pull request that a delivery opens is listed before `delivering` ends,
 except when two pushes overlap: a sandbox tracks one delivery at a time,

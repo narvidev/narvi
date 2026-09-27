@@ -1,8 +1,9 @@
 //go:build integration
 
-// Review round 3 of the status route (technical plan §43.20), on real
-// Postgres: P2's escalation ordering pinned through the real workflow
-// engine, and P1's scheduled work read in the statement's one snapshot.
+// Review rounds 3 and 4 of the status route (technical plan §43.20), on
+// real Postgres: the escalation's closing rule pinned through the real
+// workflow engine, and the scheduled work read in the statement's one
+// snapshot.
 package httpapi_test
 
 import (
@@ -23,18 +24,17 @@ import (
 	"github.com/narvidev/narvi/internal/domain/turn"
 )
 
-// TestGetSessionStatus_TurnQueuedBehindTheEscalatingTurnClosesItOnceItRuns
-// is the reviewers' P2 reproduction, with the behaviour §43.20 now states:
-// a turn that ran after the escalation closes it. Turn A (a custom
-// workflow's tracked attempt) is processing; turn B is queued behind it
-// with AlwaysQueue (a GitHub mention, a re-review) -- untracked, no step
-// run, no run of its own; A fails and escalates the run in its terminal
-// transaction. B was created before the escalation, but it runs after it:
-// while B waits, the escalation is still the latest state (queued, the
-// escalation reported); from B's dispatch on it is not (running, no gate);
-// and once B completes the session reads finished -- not awaiting a person
-// for an escalation that later work already ran past.
-func TestGetSessionStatus_TurnQueuedBehindTheEscalatingTurnClosesItOnceItRuns(t *testing.T) {
+// TestGetSessionStatus_TurnQueuedBehindTheEscalatingTurnNeverClosesIt is
+// review round 3's P2 reproduction, with the rule §43.20 states since
+// review round 4: an escalation stays open until a turn is CREATED after
+// it. Turn A (a custom workflow's tracked attempt) is processing; turn B is
+// queued behind it with AlwaysQueue (a GitHub mention, a re-review) --
+// untracked, no step run, no run of its own; A fails and escalates the run
+// in its terminal transaction. B was created before the escalation, so it
+// is no answer to it: the escalation is reported while B waits (queued),
+// while B runs (running), and once B has completed (awaiting_approval,
+// settled). Only a turn created afterwards closes it.
+func TestGetSessionStatus_TurnQueuedBehindTheEscalatingTurnNeverClosesIt(t *testing.T) {
 	rig := newTestRig(t)
 	ctx := context.Background()
 	user, cookie := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMember)
@@ -63,29 +63,36 @@ func TestGetSessionStatus_TurnQueuedBehindTheEscalatingTurnClosesItOnceItRuns(t 
 		t.Fatalf("runs = %+v, want the custom run escalated by A's failure", runs)
 	}
 	escalated := runs[0]
+	reportsTheEscalation := func(got restdtos.SessionActivity) bool {
+		return got.Awaiting != nil && got.Awaiting.Kind == restdtos.SessionActivityAwaitingKindWorkflowEscalation && got.Awaiting.Id == escalated.ID.String()
+	}
 
-	got := getStatus(t, rig, sess.ID, cookie)
-	if got.Activity != restdtos.SessionActivityActivityQueued || got.Awaiting == nil || got.Awaiting.Kind != restdtos.SessionActivityAwaitingKindWorkflowEscalation || got.Awaiting.Id != escalated.ID.String() {
-		t.Fatalf("B still queued: activity %q awaiting %+v, want queued with the escalation reported -- B has not run yet", got.Activity, got.Awaiting)
+	if got := getStatus(t, rig, sess.ID, cookie); got.Activity != restdtos.SessionActivityActivityQueued || !reportsTheEscalation(got) {
+		t.Fatalf("B still queued: activity %q awaiting %+v, want queued with the escalation reported", got.Activity, got.Awaiting)
 	}
 
 	state = transitionTurn(ctx, t, rig.turns, b.ID, turn.StatePending, turn.TriggerDispatch)
-	got = getStatus(t, rig, sess.ID, cookie)
-	if got.Activity != restdtos.SessionActivityActivityRunning || got.Awaiting != nil {
-		t.Fatalf("B dispatched after the escalation: activity %q awaiting %+v, want running and no gate", got.Activity, got.Awaiting)
+	if got := getStatus(t, rig, sess.ID, cookie); got.Activity != restdtos.SessionActivityActivityRunning || !reportsTheEscalation(got) {
+		t.Fatalf("B dispatched after the escalation: activity %q awaiting %+v, want running with the escalation still reported -- B was created before it", got.Activity, got.Awaiting)
 	}
 	state = transitionTurn(ctx, t, rig.turns, b.ID, state, turn.TriggerStartProcessing)
 	transitionTurn(ctx, t, rig.turns, b.ID, state, turn.TriggerComplete)
 
-	got = getStatus(t, rig, sess.ID, cookie)
-	if got.Activity != restdtos.SessionActivityActivityFinished || !got.Settled || got.Awaiting != nil || got.SuggestedDelaySeconds != 300 {
-		t.Fatalf("B ran to completion after the escalation: activity %q settled %v awaiting %+v delay %d, want finished, settled, no gate, 300", got.Activity, got.Settled, got.Awaiting, got.SuggestedDelaySeconds)
+	got := getStatus(t, rig, sess.ID, cookie)
+	if got.Activity != restdtos.SessionActivityActivityAwaitingApproval || !got.Settled || got.SuggestedDelaySeconds != 60 || !reportsTheEscalation(got) {
+		t.Fatalf("B ran to completion after the escalation: activity %q settled %v awaiting %+v delay %d, want awaiting_approval, settled, the escalation, 60", got.Activity, got.Settled, got.Awaiting, got.SuggestedDelaySeconds)
 	}
 	if got.LastRun == nil || got.LastRun.TurnId != b.ID.String() {
 		t.Fatalf("lastRun = %+v, want B", got.LastRun)
 	}
-	if runs := sessionRuns(ctx, t, rig, sess.ID); len(runs) != 1 || runs[0].Status != sqlcgen.WorkflowRunStatusNeedsReview {
-		t.Fatalf("runs = %+v, want the escalated run untouched -- it is the gate that closed, not the run", runs)
+
+	c := createTurnThroughCore(ctx, t, rig, sess.ID)
+	if got := getStatus(t, rig, sess.ID, cookie); got.Activity != restdtos.SessionActivityActivityQueued || got.Awaiting != nil {
+		t.Fatalf("a turn created after the escalation: activity %q awaiting %+v, want queued and no gate", got.Activity, got.Awaiting)
+	}
+	endTurnThroughEngine(ctx, t, rig, sess.ID, c.ID, turn.TriggerComplete)
+	if runs := sessionRuns(ctx, t, rig, sess.ID); len(runs) != 2 || runs[0].ID != escalated.ID || runs[0].Status != sqlcgen.WorkflowRunStatusNeedsReview {
+		t.Fatalf("runs = %+v, want the escalated run untouched beside C's own -- it is the gate that closed, not the run", runs)
 	}
 }
 
@@ -96,8 +103,11 @@ func TestGetSessionStatus_TurnQueuedBehindTheEscalatingTurnClosesItOnceItRuns(t 
 // with a turn ending in between, while readers poll the status route. No
 // committed state is ever "every turn terminal, nothing armed", so a
 // reader that sees one snapshot never reads finished; the scheduled state
-// is observed. Reading the armed work in a second statement, in either
-// order, can straddle a commit and report a false finished.
+// is observed. Reading the armed work in a second statement after the
+// facts can straddle a commit and report a false finished (a second
+// statement before them is caught deterministically instead, by
+// postgres' TestSessionActivityFacts_IssuesExactlyOneStatement: the window
+// it would need here is too narrow to hit reliably).
 func TestGetSessionStatus_ScheduledWorkNeverObservedAsFinished_Race(t *testing.T) {
 	rig := newTestRig(t)
 	user, cookie := createUserWithRole(context.Background(), t, rig, sqlcgen.UserRoleMember)
@@ -111,8 +121,12 @@ func TestGetSessionStatus_ScheduledWorkNeverObservedAsFinished_Race(t *testing.T
 		cycle func(ctx context.Context, sessionID, processing pgtype.UUID) (pgtype.UUID, error)
 	}{
 		{
-			name:  "an automatic re-review: debounce armed, the turn ends, the review inserted as the debounce goes",
-			setup: func(context.Context, pgtype.UUID) error { return nil },
+			name: "an automatic re-review: debounce armed, the turn ends, the review inserted as the debounce goes",
+			// The session backs a pull request on a repository that opted
+			// in, its budget unspent: the debounce can insert a turn.
+			setup: func(ctx context.Context, sessionID pgtype.UUID) error {
+				return linkOptedInPullRequest(ctx, rig, sessionID)
+			},
 			cycle: func(ctx context.Context, sessionID, processing pgtype.UUID) (pgtype.UUID, error) {
 				// The synchronize webhook's own write.
 				if _, err := timers.Upsert(ctx, sqlcgen.UpsertSessionTimerParams{SessionID: sessionID, Name: sessionactor.TimerReviewRetriggerDebounce, FiresAt: pgtype.Timestamptz{Time: time.Now().Add(2 * time.Minute), Valid: true}}); err != nil {
@@ -137,7 +151,7 @@ func TestGetSessionStatus_ScheduledWorkNeverObservedAsFinished_Race(t *testing.T
 			},
 		},
 		{
-			name: "a release manifest check: enqueued, the turn ends, claimed, the composition turn inserted, the row finished",
+			name: "a release manifest check: enqueued, the turn ends, claimed, the composition turn inserted, the check finished",
 			setup: func(ctx context.Context, sessionID pgtype.UUID) error {
 				return enqueueReleaseCheck(ctx, rig, sessionID)
 			},
@@ -145,14 +159,24 @@ func TestGetSessionStatus_ScheduledWorkNeverObservedAsFinished_Race(t *testing.T
 				if err := completeTurn(ctx, rig.turns, processing); err != nil {
 					return pgtype.UUID{}, err
 				}
-				if _, err := rig.pool.Exec(ctx, `UPDATE release_manifest_pending SET claimed_at = now() WHERE session_id = $1 AND claimed_at IS NULL`, sessionID); err != nil {
+				// The claim: the pending row deleted and the check recorded
+				// as running in one transaction (ClaimDue), for this
+				// session's row alone.
+				var pendingID pgtype.UUID
+				if err := pgx.BeginFunc(ctx, rig.pool, func(tx pgx.Tx) error {
+					if err := tx.QueryRow(ctx, `DELETE FROM release_manifest_pending WHERE session_id = $1 RETURNING id`, sessionID).Scan(&pendingID); err != nil {
+						return err
+					}
+					_, err := tx.Exec(ctx, `INSERT INTO release_manifest_checks_running (pending_id, session_id) VALUES ($1, $2)`, pendingID, sessionID)
+					return err
+				}); err != nil {
 					return pgtype.UUID{}, err
 				}
 				next, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: sessionID, Status: sqlcgen.TurnStatusPending})
 				if err != nil {
 					return pgtype.UUID{}, err
 				}
-				if _, err := rig.pool.Exec(ctx, `DELETE FROM release_manifest_pending WHERE session_id = $1 AND claimed_at IS NOT NULL`, sessionID); err != nil {
+				if err := narvipg.NewReleaseManifestPendingStore(rig.pool).Finish(ctx, pendingID); err != nil {
 					return pgtype.UUID{}, err
 				}
 				if err := enqueueReleaseCheck(ctx, rig, sessionID); err != nil {
@@ -215,6 +239,18 @@ func startTurn(ctx context.Context, turns *narvipg.TurnStore, id pgtype.UUID) er
 		return err
 	}
 	_, err := turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: id, Status: sqlcgen.TurnStatusProcessing})
+	return err
+}
+
+// linkOptedInPullRequest makes sessionID a pull request's review session on
+// a repository opted in to the automatic re-review, its budget unspent --
+// the two conditions under which the status counts an armed debounce.
+func linkOptedInPullRequest(ctx context.Context, rig testRig, sessionID pgtype.UUID) error {
+	repo := "example/opted-in-" + sessionID.String()
+	if _, err := rig.pool.Exec(ctx, `INSERT INTO github_pr_sessions (repo_full_name, pr_number, session_id) VALUES ($1, 1, $2)`, repo, sessionID); err != nil {
+		return err
+	}
+	_, err := rig.pool.Exec(ctx, `INSERT INTO repo_settings (repo_full_name, auto_retrigger_review_enabled) VALUES ($1, true)`, repo)
 	return err
 }
 

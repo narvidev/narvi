@@ -88,13 +88,20 @@ func (s *SessionStore) UpdateIntentDecisionIfNull(ctx context.Context, id pgtype
 
 // ActivityFacts reads every fact a session's live activity is derived from
 // -- its turn histogram, in-flight turn, last terminal turn, newest turn,
-// open human gates and sandbox status -- in ONE statement, so one MVCC
-// snapshot (technical plan §43.20; GetSessionActivityFacts' own doc
-// comment says why two statements would not do). Backs GET
+// open human gates, sandbox status, and the work armed to create a turn --
+// in ONE statement, so one MVCC snapshot (technical plan §43.20;
+// GetSessionActivityFacts' own doc comment says why two statements would
+// not do). reviewAutoRetriggerBudget is the §24 automatic re-review budget
+// the debounce's fire compares with (sessionactor.ReviewAutoRetriggerBudget,
+// passed in because this package cannot import that one): the statement
+// reads the debounce as able to insert a turn only below it. Backs GET
 // /api/sessions/{sessionID}/status. pgx.ErrNoRows when the session does
 // not exist.
-func (s *SessionStore) ActivityFacts(ctx context.Context, id pgtype.UUID) (sqlcgen.GetSessionActivityFactsRow, error) {
-	return s.q.GetSessionActivityFacts(ctx, id)
+func (s *SessionStore) ActivityFacts(ctx context.Context, id pgtype.UUID, reviewAutoRetriggerBudget int32) (sqlcgen.GetSessionActivityFactsRow, error) {
+	return s.q.GetSessionActivityFacts(ctx, sqlcgen.GetSessionActivityFactsParams{
+		SessionID:                 id,
+		ReviewAutoRetriggerBudget: reviewAutoRetriggerBudget,
+	})
 }
 
 // ListFailed returns up to limit currently-'failed', unarchived sessions,

@@ -32,15 +32,19 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   turn's branch being pushed and its pull request opened, bounded by the
   deployment's delivery window; a pull request it opens is recorded before
   it ends, except when two pushes overlap, and it can end with none --
-  `scheduled` -- the server holds work that will create a turn with no new
-  input: an automatic re-review's debounce, a release manifest check --
+  `scheduled` -- the server holds work that may create a turn with no new
+  input and has neither created it nor declined yet: an automatic
+  re-review's debounce, the session's own push to its pull request's head
+  included, counted only while the pull request's repository has opted in
+  and its automatic re-review budget is not spent; a release manifest
+  check waiting or running --
   `awaiting_approval`, `finished`), `settled` (never while queued,
   running, delivering or scheduled), `pendingTurns`, `inFlightTurn`,
   `awaiting` (the open human gate: a plan, a workflow step, or a custom
-  workflow's escalated run while it is the session's latest state --
-  never a built-in workflow's, and never once a turn other than the run's
-  own attempts has been created, started, ended or cancelled since it
-  escalated), `lastRun`, `sandboxStatus`, `archived`,
+  workflow's escalated run until a turn is created on the session after
+  it escalated -- never a built-in workflow's; a turn created before the
+  escalation, queued, running or ended, never closes it), `lastRun`,
+  `sandboxStatus`, `archived`,
   `suggestedDelaySeconds` and `observedAt`. Derived from the session's
   turn queue, its push/PR delivery, the work armed to create a turn and
   its human gates in one database snapshot, never from `Session.status`,

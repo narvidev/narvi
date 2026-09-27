@@ -44,12 +44,16 @@ const pendingBatchSize = 5
 // MergedPRLister precedent: a small, locally-defined interface so a unit
 // test can inject a fake with no real DB round trip.
 type PendingLister interface {
-	// ClaimDue stamps claimed_at on up to limit unclaimed rows, oldest
-	// first, and returns them; a claimed row is never returned again.
+	// ClaimDue deletes up to limit rows, oldest first, and records each
+	// one's check as running (release_manifest_checks_running) in the
+	// same transaction; a claimed row is never returned again, by this
+	// binary's claim or an earlier one's.
 	ClaimDue(ctx context.Context, limit int32) ([]sqlcgen.ReleaseManifestPending, error)
-	// Finish deletes one claimed row once its check has returned.
+	// Finish deletes the running row of one claimed check once it has
+	// returned.
 	Finish(ctx context.Context, id pgtype.UUID) error
-	// PurgeStaleClaimed deletes rows claimed longer ago than maxAge.
+	// PurgeStaleClaimed deletes running rows claimed longer ago than
+	// maxAge.
 	PurgeStaleClaimed(ctx context.Context, maxAge time.Duration) (int64, error)
 }
 
@@ -102,22 +106,25 @@ func (w *Worker) Run(ctx context.Context) error {
 }
 
 // PumpOnce runs exactly one pump tick: up to pendingBatchSize times, it
-// claims the oldest unclaimed release_manifest_pending row, runs the
-// actual manifest check for it, then deletes it. Exported (rather than
-// only reachable through Run's own loop) so tests can drive exactly one
-// tick deterministically, matching outboxworker.Builder.PumpOnce/
+// claims the oldest release_manifest_pending row (deleting it, and
+// recording its check as running), runs the actual manifest check for it,
+// then finishes it (deleting the running row). Exported (rather than only
+// reachable through Run's own loop) so tests can drive exactly one tick
+// deterministically, matching outboxworker.Builder.PumpOnce/
 // imagebuild.Builder.PumpOnce's own precedent.
 //
-// One row at a time, so a row's claimed_at is the instant its own check
-// starts: the session's status (technical plan §43.20) reads a claimed row
-// as work that can still add a composition review turn to the session,
-// but only within ReleaseManifestCheckTimeout plus MCPStatusScheduledMargin
-// of its claim -- a row claimed in a batch and left waiting behind the
-// others would outlive that bound before its check even began. Finished
-// only after Run returns, so any composition turn Run inserted has already
-// committed when the row goes: no snapshot sees neither. A tick first
-// purges rows claimed longer ago than that same bound (their worker died
-// mid-check), which the status has already stopped counting.
+// One row at a time, so a running row's claimed_at is the instant its own
+// check starts: the session's status (technical plan §43.20) reads a
+// running check as work that can still add a composition review turn to
+// the session, but only within ReleaseManifestCheckTimeout plus
+// MCPStatusScheduledMargin of its claim -- a row claimed in a batch and
+// left waiting behind the others would outlive that bound before its
+// check even began. Finished only after Run returns, so any composition
+// turn Run inserted has already committed when the running row goes: a
+// snapshot that no longer counts the check already counts that turn. A
+// tick first purges running rows claimed longer ago than that same bound
+// (their worker died mid-check), which the status has already stopped
+// counting.
 //
 // A failure in the claim step aborts the tick and returns the error (Run
 // logs it) -- but once a row is claimed, its Run call is unconditionally
@@ -125,7 +132,8 @@ func (w *Worker) Run(ctx context.Context) error {
 // best-effort/void, per its own doc comment), so there is nothing here to
 // isolate a per-row failure FROM -- every claimed row simply gets its one
 // attempt. A purge or finish failure is logged and never aborts the tick:
-// a row left claimed is bounded by the status and purged on a later tick.
+// a running row left behind is bounded by the status and purged on a
+// later tick.
 func (w *Worker) PumpOnce(ctx context.Context) error {
 	logger := platform.Logger(ctx)
 	if purged, err := w.store.PurgeStaleClaimed(ctx, w.timeouts.ReleaseManifestCheckTimeout+w.timeouts.MCPStatusScheduledMargin); err != nil {
@@ -145,7 +153,7 @@ func (w *Worker) PumpOnce(ctx context.Context) error {
 		for _, row := range claimed {
 			w.process(ctx, row)
 			if err := w.store.Finish(ctx, row.ID); err != nil {
-				logger.Warn("releasereview: delete finished release manifest check failed; it stays claimed until purged",
+				logger.Warn("releasereview: delete finished release manifest check failed; it reads as running until purged",
 					"error", err, "release_manifest_pending_id", row.ID.String())
 			}
 		}

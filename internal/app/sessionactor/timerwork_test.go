@@ -160,11 +160,37 @@ func timerNameArg(expr ast.Expr, kinds map[string]string) (value, display string
 	}
 }
 
+// TestTimerCountsAsScheduledWork_Table pins the status's reading of an
+// armed timer (technical plan §43.20, review round 4's P3): the re-review
+// debounce counts only while its fire can insert a turn (the repository
+// opted in, the budget unspent -- reviewRetriggerCanFire); every other kind
+// is TimerCanCreateWork's, whatever that flag says, an unknown kind
+// included.
+func TestTimerCountsAsScheduledWork_Table(t *testing.T) {
+	t.Parallel()
+
+	for _, canFire := range []bool{false, true} {
+		if got := sessionactor.TimerCountsAsScheduledWork(sessionactor.TimerReviewRetriggerDebounce, canFire); got != canFire {
+			t.Errorf("TimerCountsAsScheduledWork(debounce, canFire %v) = %v, want %v", canFire, got, canFire)
+		}
+		for _, name := range []string{sessionactor.TimerConnectingDeadline, sessionactor.TimerLivenessCheck, sessionactor.TimerInactivity, sessionactor.TimerTerminalGrace, sessionactor.TimerTurnDeadline, "a_kind_from_a_newer_binary"} {
+			if got, want := sessionactor.TimerCountsAsScheduledWork(name, canFire), sessionactor.TimerCanCreateWork(name); got != want {
+				t.Errorf("TimerCountsAsScheduledWork(%q, canFire %v) = %v, want TimerCanCreateWork's %v", name, canFire, got, want)
+			}
+		}
+	}
+}
+
 // TestClassifyTimer_EveryArmedNameIsClassified closes the other way a kind
-// could slip in: a timer armed from anywhere in the module -- the actor's
-// armTimer, or a session_timers upsert like the synchronize webhook's --
-// under a name that is not a classified Timer* constant. Every such call
-// site in non-test code must name one.
+// could slip in, for the two arming forms the code uses: in every non-test
+// Go file under internal/, controlplane/ and cmd/ (sqlcgen excluded), the
+// name argument of every armTimer call, and the keyed Name of every
+// UpsertSessionTimerParams composite literal (RecordPullRequestPush's), must
+// be a classified Timer* constant. It cannot see a params value filled by
+// field assignment, the params type used through an alias, a positional
+// literal (go vet's composites check flags that one), or SQL that writes
+// session_timers -- a raw Exec, a new sqlc query, a migration or backfill;
+// technical plan §43.20 states the runtime backstop for those.
 func TestClassifyTimer_EveryArmedNameIsClassified(t *testing.T) {
 	t.Parallel()
 

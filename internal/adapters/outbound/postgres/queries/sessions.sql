@@ -228,56 +228,67 @@ ORDER BY day;
 -- Every lookup leads with session_id on an existing index (turns_session_
 -- id_dispatched_message_id_idx, plans_one_awaiting_approval_per_session,
 -- workflow_runs_session_id_idx, workflow_step_runs_one_live_per_run,
--- session_timers' UNIQUE (session_id, name), release_manifest_pending_
--- session_id_idx); the escalation's follow-up checks go by primary key, by
--- session_id over turns, and by workflow_run_id
--- (workflow_step_runs_run_step_idx).
+-- session_timers' UNIQUE (session_id, name), github_pr_sessions_session_
+-- id_idx, release_manifest_pending_session_id_idx,
+-- release_manifest_checks_running_session_id_idx); the escalation's
+-- follow-up checks go by primary key, by session_id over turns, and by
+-- workflow_run_id (workflow_step_runs_run_step_idx), and repo_settings by
+-- its primary key.
 --
 -- escalated is the session's LIVE workflow escalation, never merely a run
 -- in needs_review: nothing moves a run out of needs_review, and the next
 -- turn starts a fresh run beside the parked one (migrations/000057), so
 -- counting every such run would gate the session for good. A needs_review
--- run is reported only while it is still the latest thing that happened on
--- the session, and its definition is not a built-in one, whose escalation
+-- run is reported only while no turn has been CREATED on the session since
+-- it escalated, and its definition is not a built-in one, whose escalation
 -- no person or route can act on (technical plan §43.20 gives the reasons).
--- "Latest" is: it is the session's newest workflow run (a turn that
--- started a run of its own supersedes it), it ran at least one attempt of
--- its own (a run no turn ever ran is no state the session reached), and
--- no turn other than that run's own attempts (workflow_step_runs.turn_id -- among them the turn
--- whose end escalated it, in the same transaction) was created, or changed
--- status, at or after the instant the run escalated
--- (workflow_runs.updated_at, which EscalateWorkflowRun stamps; the notice
--- claim that also writes it runs in the escalating transaction itself,
--- workflowengine's escalateRun, and a needs_review run is never written
--- again unless it escalates again). So a turn created after the escalation
--- closes it, and so does one created before it that runs after it -- a
--- turn queued behind the turn whose end escalated the run is dispatched
--- only once that turn has ended -- as soon as it is dispatched (or ended,
--- or cancelled). A turn that had already ended when a decision escalated
--- the run -- one sent and run while a step awaited that decision, which
--- starts no run and is no attempt -- does not. The instants compared are
--- all the database's own now(), each its transaction's start:
--- turns.created_at, turns.status_changed_at (migrations/000146, stamped
--- by UpdateTurnStatus -- never dispatched_at or completed_at, the control
--- plane's clock) and workflow_runs.updated_at. Two transactions that
+-- That is: it is the session's newest workflow run (a turn that started a
+-- run of its own supersedes it), it ran at least one attempt of its own (a
+-- run no turn ever ran is no state the session reached), and no turn other
+-- than that run's own attempts (workflow_step_runs.turn_id -- among them
+-- the turn whose end escalated it, in the same transaction) was created at
+-- or after the instant the run escalated (workflow_runs.updated_at, which
+-- EscalateWorkflowRun stamps; the notice claim that also writes it runs in
+-- the escalating transaction itself, workflowengine's escalateRun, and a
+-- needs_review run is never written again unless it escalates again). New
+-- work sent to the session after the escalation answers it; a turn created
+-- before it never does, whether it is still queued, running or has ended --
+-- one queued behind the turn whose end escalated the run, or one sent while
+-- a step awaited the decision that escalated it -- so whether such a turn
+-- ended a moment before or after the escalation never changes the answer.
+-- Both instants are the database's own now(), each its transaction's
+-- start (turns.created_at, workflow_runs.updated_at); two transactions that
 -- overlap are ordered by which began first.
 --
 -- armed_timer_names/armed_timer_fires_at are the session's armed named
 -- timers (session_timers, one row per name at most -- its UNIQUE
 -- (session_id, name) index), two arrays in the same order. Every kind is
 -- returned, never only the ones some list here names: the handler
--- classifies each through sessionactor.TimerCanCreateWork, whose table is
--- exhaustive over the kinds the code declares and counts a name it does
--- not know as work, so a kind added later can never read as settled by
--- being filtered out here. release_check_pending_since/_claimed_at are a
--- release PR's manifest check still to come or still running on this
--- session (release_manifest_pending, migrations/000147,
--- release_manifest_pending_session_id_idx): the oldest unclaimed row's
--- created_at and the newest claimed row's claimed_at. Both can create a
--- turn on this session with no new input -- technical plan §43.20's
--- inventory -- and the handler reads them as scheduled work, never
--- settled; each is written in (or before) the transaction that arms it,
--- and removed only after the turn it creates has committed.
+-- classifies each through sessionactor.TimerCountsAsScheduledWork, whose
+-- table covers every kind the code declares and counts a name it does not
+-- know as work, so a kind added later can never read as settled by being
+-- filtered out here. review_retrigger_can_fire is whether the §24
+-- re-review debounce's fire can still insert a turn at all, on the
+-- conditions it reads from rows alone: the pull request's repository
+-- opted in (repo_settings.auto_retrigger_review_enabled; no row means
+-- off) and its automatic re-review budget is not spent
+-- (github_pr_sessions.auto_retrigger_count below
+-- review_auto_retrigger_budget, which the caller passes from
+-- sessionactor.ReviewAutoRetriggerBudget -- the one definition the fire
+-- itself compares with). Both are necessary for the fire to insert a turn,
+-- so a debounce armed while either fails can only decline; the fire's
+-- other decline rules -- the head already reviewed, a plan awaiting
+-- approval, a live fetch that fails -- are deliberately not copied here,
+-- so the status errs toward scheduled on them, never toward settled.
+-- release_check_pending_since/_claimed_at are a release PR's manifest
+-- check still to come or still running on this session: the oldest
+-- release_manifest_pending row's created_at, and the newest
+-- release_manifest_checks_running row's claimed_at (migrations/000146).
+-- Both the debounce and the check can create a turn on this session with
+-- no new input -- technical plan §43.20's inventory -- and the handler
+-- reads them as scheduled work, never settled; each is written in (or
+-- before) the transaction that arms it, and removed only after the turn
+-- it creates has committed.
 --
 -- pr_delivery_started_at is the push and pull request a completed turn
 -- handed off and that have not finished (migrations/000145): the handler
@@ -318,8 +329,9 @@ SELECT
     escalated.updated_at AS escalated_run_since,
     COALESCE(armed.names, '{}'::text[])::text[] AS armed_timer_names,
     COALESCE(armed.fires_at, '{}'::timestamptz[])::timestamptz[] AS armed_timer_fires_at,
-    releasecheck.pending_since::timestamptz AS release_check_pending_since,
-    releasecheck.claimed_at::timestamptz AS release_check_claimed_at
+    COALESCE(reretrigger.can_fire, false)::boolean AS review_retrigger_can_fire,
+    releasepending.pending_since::timestamptz AS release_check_pending_since,
+    releaserunning.claimed_at::timestamptz AS release_check_claimed_at
 FROM sessions s
 LEFT JOIN sandboxes sb ON sb.session_id = s.id
 LEFT JOIN LATERAL (
@@ -388,7 +400,7 @@ LEFT JOIN LATERAL (
           SELECT 1
           FROM turns t
           WHERE t.session_id = s.id
-            AND (t.created_at >= wr.updated_at OR t.status_changed_at >= wr.updated_at)
+            AND t.created_at >= wr.updated_at
             AND NOT EXISTS (
                 SELECT 1
                 FROM workflow_step_runs sr
@@ -404,10 +416,22 @@ LEFT JOIN LATERAL (
     WHERE st.session_id = s.id
 ) armed ON true
 LEFT JOIN LATERAL (
-    SELECT
-        min(rmp.created_at) FILTER (WHERE rmp.claimed_at IS NULL) AS pending_since,
-        max(rmp.claimed_at) AS claimed_at
+    SELECT bool_or(
+        COALESCE(rs.auto_retrigger_review_enabled, false)
+        AND gps.auto_retrigger_count < sqlc.arg('review_auto_retrigger_budget')::integer
+    ) AS can_fire
+    FROM github_pr_sessions gps
+    LEFT JOIN repo_settings rs ON rs.repo_full_name = gps.repo_full_name
+    WHERE gps.session_id = s.id
+) reretrigger ON true
+LEFT JOIN LATERAL (
+    SELECT min(rmp.created_at) AS pending_since
     FROM release_manifest_pending rmp
     WHERE rmp.session_id = s.id
-) releasecheck ON true
-WHERE s.id = $1;
+) releasepending ON true
+LEFT JOIN LATERAL (
+    SELECT max(rcr.claimed_at) AS claimed_at
+    FROM release_manifest_checks_running rcr
+    WHERE rcr.session_id = s.id
+) releaserunning ON true
+WHERE s.id = sqlc.arg('session_id');
