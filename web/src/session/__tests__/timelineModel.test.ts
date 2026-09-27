@@ -235,7 +235,10 @@ describe('buildTimelineModel', () => {
 // pinned end to end by TestHandleSandboxEvent_TokenFrames_
 // LateFramesOfAnEndedTurnAddNoRow): a replay after the turn ended adds no
 // row, and one during the next turn adds nothing of the earlier turn's
-// parts. These are the logs that leaves, fed to this model.
+// parts. The replay for the turn still running when the control plane was
+// deployed onto per-frame storage does add rows: its parts' later frames,
+// at the tail of that turn (tokenframe.go, "The turn running at deploy").
+// These are the logs all that leaves, fed to this model.
 describe('buildTimelineModel over the log a reconnect replay can leave', () => {
   // A turn as the server stores it: a step, its text parts (each stored as
   // one row per distinct frame), the step's end and the turn's end.
@@ -354,5 +357,82 @@ describe('buildTimelineModel over the log a reconnect replay can leave', () => {
     const folded = buildTimelineModel(thenNextTurn)
     expect(folded.turns).toHaveLength(2) // the next turn is folded into the phantom one
     expect(folded.turns[1]!.steps.map((s) => s.stepId)).toEqual([expect.stringMatching(/^implicit:/), 's2'])
+  })
+
+  // The turn running at deploy. Before it, first-wins kept each part's
+  // first frame only; the replay stores the later frames while the turn
+  // still runs, at its tail, after the steps that followed the part. Each
+  // part must show its text in the step its first frame opened it in.
+  function tokensByStep(events: EventEnvelope[]): [string, [string, string][]][] {
+    const [turn, ...others] = buildTimelineModel(events).turns
+    expect(others).toEqual([])
+    return turn!.steps.map((s) => [s.stepId, s.tokens.map((t): [string, string] => [t.messageId, t.text])])
+  }
+
+  it("a part's late frame after a step boundary updates the part in its own step", () => {
+    const events = [
+      env('step_start', { messageId: 'msg_s1', stepId: 's1' }),
+      env('token', { messageId: 'prt_a', text: '' }),
+      env('step_start', { messageId: 'msg_s2', stepId: 's2' }),
+      env('token', { messageId: 'prt_b', text: '' }),
+      env('token', { messageId: 'prt_a', text: 'Step one narration.' }),
+      env('token', { messageId: 'prt_b', text: 'Step two answer.' }),
+      env('execution_complete', { messageId: 'done', outcome: 'completed', reason: null }),
+    ]
+    expect(tokensByStep(events)).toEqual([
+      ['s1', [['prt_a', 'Step one narration.']]],
+      ['s2', [['prt_b', 'Step two answer.']]],
+    ])
+    expectNoPhantomTurn(events, 1)
+  })
+
+  it("a part's late frame with no step open updates the part in place and synthesizes no step", () => {
+    const events = [
+      env('step_start', { messageId: 'msg_s1', stepId: 's1' }),
+      env('token', { messageId: 'prt_a', text: '' }),
+      env('step_finish', { messageId: 'msg_s1_end', stepId: 's1', cost: { tokens: { input: 1, output: 1 } } }),
+      env('token', { messageId: 'prt_a', text: 'Step one narration.' }),
+      env('execution_complete', { messageId: 'done', outcome: 'completed', reason: null }),
+    ]
+    expect(tokensByStep(events)).toEqual([['s1', [['prt_a', 'Step one narration.']]]])
+    expectNoPhantomTurn(events, 1)
+  })
+
+  it('several recovered parts across steps each land in their own step, in their own order', () => {
+    const events = [
+      env('step_start', { messageId: 'msg_s1', stepId: 's1' }),
+      env('token', { messageId: 'prt_a1', text: '' }),
+      env('token', { messageId: 'prt_a2', text: '' }),
+      env('step_start', { messageId: 'msg_s2', stepId: 's2' }),
+      env('token', { messageId: 'prt_b1', text: 'Step two, first' }),
+      env('step_start', { messageId: 'msg_s3', stepId: 's3' }),
+      env('token', { messageId: 'prt_c1', text: '' }),
+      // The replay, in the order the sandbox sent the frames.
+      env('token', { messageId: 'prt_a1', text: 'Step one, first part.' }),
+      env('token', { messageId: 'prt_a2', text: 'Step one, second part.' }),
+      env('token', { messageId: 'prt_b1', text: 'Step two, first part.' }),
+      // The turn goes on in the step it is in.
+      env('token', { messageId: 'prt_c1', text: 'Step three answer.' }),
+      env('token', { messageId: 'prt_c2', text: 'Step three, a new part.' }),
+    ]
+    expect(tokensByStep(events)).toEqual([
+      [
+        's1',
+        [
+          ['prt_a1', 'Step one, first part.'],
+          ['prt_a2', 'Step one, second part.'],
+        ],
+      ],
+      ['s2', [['prt_b1', 'Step two, first part.']]],
+      [
+        's3',
+        [
+          ['prt_c1', 'Step three answer.'],
+          ['prt_c2', 'Step three, a new part.'],
+        ],
+      ],
+    ])
+    expect(hasOpenTurn(events)).toBe(true) // still running: no execution_complete yet
+    expectNoPhantomTurn(events, 1)
   })
 })
