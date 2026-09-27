@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -18,15 +19,17 @@ import (
 // TestChownTree_HardLinkedEntriesFollowTheKernelsBound pins what the walk
 // does with a non-directory entry that has more than one link, for each
 // way the verdict on hard links can come out. The tree holds a file from
-// outside the workspace hard-linked into it, a pair of hard links that are
-// both inside, and a pair the runtime already owns, as one its own
+// outside the workspace hard-linked into it, hard-link pairs that are both
+// inside (as a build's uplifted outputs are), a symlink hard-linked to a
+// second name, and a pair the runtime already owns, as one its own
 // processes linked would be. Bounded, every entry is re-owned, the outside
 // file with its inside name, since they are one inode: a kernel that
 // refuses the runtime a link to a file it cannot read and write let it
 // plant nothing it could not already change. Not bounded, no entry with
-// more than one link is re-owned, the outside file keeps its owner, and
-// one WARN counts the linked entries not already the runtime's, by their
-// names relative to the root.
+// more than one link is re-owned, whatever its type, the outside file
+// keeps its owner, and one WARN counts the linked entries not already the
+// runtime's, naming leftSampleSize of them -- there are more than that --
+// by their names relative to the root.
 //
 // Only an inconclusive probe reads fs.protected_hardlinks: a refusal or a
 // link made decides alone, whatever the setting says.
@@ -51,18 +54,37 @@ func TestChownTree_HardLinkedEntriesFollowTheKernelsBound(t *testing.T) {
 		{name: "the probe is inconclusive and protected_hardlinks cannot be read", probe: inconclusive, readErr: fs.ErrNotExist, wantProbe: "inconclusive", wantRead: true, reownLinked: false},
 	}
 	// linked are the entries with more than one link whose owner is not
-	// the runtime's before the walk.
-	linked := []string{"repo/from-outside", "repo/pair-a", "repo/sub/pair-b"}
+	// the runtime's before the walk: more than leftSampleSize of them, and
+	// a symlink among them.
+	linked := []string{"repo/from-outside", "repo/pair-a", "repo/sub/pair-b", "repo/link-a", "repo/sub/link-b"}
+	for i := range 3 {
+		linked = append(linked, fmt.Sprintf("repo/build/out-%d", i), fmt.Sprintf("repo/build/deps/out-%d-0123abcd", i))
+	}
+	slices.Sort(linked)
+	if len(linked) <= leftSampleSize {
+		t.Fatalf("the fixture has %d linked entries, want more than leftSampleSize (%d), or the sample bound is not exercised", len(linked), leftSampleSize)
+	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			root, outside := t.TempDir(), t.TempDir()
-			buildTree(t, root, []string{"repo/sub"}, []string{"repo/plain", "repo/pair-a", "repo/owned-a"})
+			buildTree(t, root, []string{"repo/sub", "repo/build/deps"}, []string{"repo/plain", "repo/pair-a", "repo/owned-a"})
 			buildTree(t, outside, nil, []string{"secret"})
 			secret := filepath.Join(outside, "secret")
 			hardLink(t, secret, filepath.Join(root, "repo", "from-outside"))
 			hardLink(t, filepath.Join(root, "repo", "pair-a"), filepath.Join(root, "repo", "sub", "pair-b"))
 			hardLink(t, filepath.Join(root, "repo", "owned-a"), filepath.Join(root, "repo", "sub", "owned-b"))
+			for i := range 3 {
+				out := filepath.Join(root, "repo", "build", fmt.Sprintf("out-%d", i))
+				if err := os.WriteFile(out, []byte("artifact\n"), 0o755); err != nil {
+					t.Fatalf("WriteFile(%s): %v", out, err)
+				}
+				hardLink(t, out, filepath.Join(root, "repo", "build", "deps", fmt.Sprintf("out-%d-0123abcd", i)))
+			}
+			if err := os.Symlink("plain", filepath.Join(root, "repo", "link-a")); err != nil {
+				t.Fatalf("Symlink: %v", err)
+			}
+			hardLinkItself(t, filepath.Join(root, "repo", "link-a"), filepath.Join(root, "repo", "sub", "link-b"))
 
 			uid, gid := observableOwner(t, root)
 			if err := os.Lchown(filepath.Join(root, "repo", "owned-a"), int(uid), int(gid)); err != nil {
@@ -89,7 +111,7 @@ func TestChownTree_HardLinkedEntriesFollowTheKernelsBound(t *testing.T) {
 				u, g := ownerOf(t, filepath.Join(root, rel))
 				return u == uid && g == gid
 			}
-			for _, rel := range []string{".", "repo", "repo/sub", "repo/plain", "repo/owned-a", "repo/sub/owned-b"} {
+			for _, rel := range []string{".", "repo", "repo/sub", "repo/build", "repo/build/deps", "repo/plain", "repo/owned-a", "repo/sub/owned-b"} {
 				if !reowned(rel) {
 					t.Errorf("%s was not re-owned -- a directory, or an entry with one link, is re-owned whatever the verdict", rel)
 				}
@@ -147,9 +169,15 @@ func TestChownTree_HardLinkedEntriesFollowTheKernelsBound(t *testing.T) {
 			for _, name := range warns[0]["sample"].([]any) {
 				sample = append(sample, name.(string))
 			}
-			slices.Sort(sample)
-			if !slices.Equal(sample, linked) {
-				t.Errorf("WARN sample = %q, want %q, relative to the root", sample, linked)
+			if len(sample) != leftSampleSize {
+				t.Errorf("WARN sample = %q (%d names), want exactly leftSampleSize (%d) of the %d left", sample, len(sample), leftSampleSize, len(linked))
+			}
+			seen := map[string]bool{}
+			for _, name := range sample {
+				if !slices.Contains(linked, name) || seen[name] {
+					t.Errorf("WARN sample names %q, want distinct linked entries, relative to the root, from %q", name, linked)
+				}
+				seen[name] = true
 			}
 		})
 	}
@@ -300,6 +328,22 @@ func hardLink(t *testing.T, oldname, newname string) {
 	t.Helper()
 	if err := os.Link(oldname, newname); err != nil {
 		t.Fatalf("Link(%s, %s): %v", oldname, newname, err)
+	}
+}
+
+// hardLinkItself links newname to oldname's own inode even when oldname is
+// a symlink, which os.Link would follow on darwin.
+func hardLinkItself(t *testing.T, oldname, newname string) {
+	t.Helper()
+	if err := unix.Linkat(unix.AT_FDCWD, oldname, unix.AT_FDCWD, newname, 0); err != nil {
+		t.Fatalf("Linkat(%s, %s): %v", oldname, newname, err)
+	}
+	var st unix.Stat_t
+	if err := unix.Lstat(newname, &st); err != nil {
+		t.Fatalf("Lstat(%s): %v", newname, err)
+	}
+	if st.Nlink < 2 {
+		t.Fatalf("%s has %d links after Linkat, want 2", newname, st.Nlink)
 	}
 }
 
