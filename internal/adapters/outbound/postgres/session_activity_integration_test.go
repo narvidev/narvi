@@ -115,6 +115,29 @@ func TestSessionActivityFacts_OneStatement(t *testing.T) {
 		t.Fatalf("mark step awaiting decision: %v", err)
 	}
 
+	// Armed timers of both classes, out of name order, and a release
+	// manifest check still to come beside one already claimed: the
+	// statement returns every armed timer, earliest first, and the oldest
+	// unclaimed check's enqueue instant and the newest claim.
+	timers := narvipg.NewTimerStore(pool)
+	livenessAt, debounceAt := base.Add(30*time.Minute), base.Add(25*time.Minute)
+	for name, at := range map[string]time.Time{"liveness_check": livenessAt, "review_retrigger_debounce": debounceAt} {
+		if _, err := timers.Upsert(ctx, sqlcgen.UpsertSessionTimerParams{SessionID: sessionID, Name: name, FiresAt: pgtype.Timestamptz{Time: at, Valid: true}}); err != nil {
+			t.Fatalf("arm %s: %v", name, err)
+		}
+	}
+	pendingSince, claimedAt := base.Add(5*time.Minute), base.Add(7*time.Minute)
+	for i, row := range []struct{ created, claimed *time.Time }{{&pendingSince, nil}, {ptrTime(base.Add(6 * time.Minute)), &claimedAt}, {ptrTime(base.Add(8 * time.Minute)), nil}} {
+		var claimed any
+		if row.claimed != nil {
+			claimed = *row.claimed
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO release_manifest_pending (session_id, owner, repo, pr_number, base_ref, head_ref, created_at, claimed_at) VALUES ($1, 'acme', 'widgets', $2, 'main', 'release/x', $3, $4)`,
+			sessionID, 900+i, *row.created, claimed); err != nil {
+			t.Fatalf("seed release manifest check %d: %v", i, err)
+		}
+	}
+
 	before := time.Now().Add(-time.Minute)
 	facts, err := sessions.ActivityFacts(ctx, sessionID)
 	if err != nil {
@@ -156,6 +179,17 @@ func TestSessionActivityFacts_OneStatement(t *testing.T) {
 	if !facts.ObservedAt.Valid || facts.ObservedAt.Time.Before(before) {
 		t.Errorf("observed_at = %v, want the statement's own time", facts.ObservedAt)
 	}
+	if len(facts.ArmedTimerNames) != 2 || len(facts.ArmedTimerFiresAt) != 2 ||
+		facts.ArmedTimerNames[0] != "review_retrigger_debounce" || !facts.ArmedTimerFiresAt[0].Time.Equal(debounceAt) ||
+		facts.ArmedTimerNames[1] != "liveness_check" || !facts.ArmedTimerFiresAt[1].Time.Equal(livenessAt) {
+		t.Errorf("armed timers = %v at %v, want review_retrigger_debounce at %v then liveness_check at %v -- every kind, earliest first", facts.ArmedTimerNames, facts.ArmedTimerFiresAt, debounceAt, livenessAt)
+	}
+	if !facts.ReleaseCheckPendingSince.Valid || !facts.ReleaseCheckPendingSince.Time.Equal(pendingSince) {
+		t.Errorf("release_check_pending_since = %v, want the oldest unclaimed check's %v", facts.ReleaseCheckPendingSince, pendingSince)
+	}
+	if !facts.ReleaseCheckClaimedAt.Valid || !facts.ReleaseCheckClaimedAt.Time.Equal(claimedAt) {
+		t.Errorf("release_check_claimed_at = %v, want %v", facts.ReleaseCheckClaimedAt, claimedAt)
+	}
 
 	t.Run("a session with no turn and no gate", func(t *testing.T) {
 		empty := createTestSession(ctx, t, pool)
@@ -167,8 +201,9 @@ func TestSessionActivityFacts_OneStatement(t *testing.T) {
 			t.Errorf("turn_counts = %v, want {}", got)
 		}
 		if facts.InFlightTurnID.Valid || facts.InFlightTurnStatus != "" || facts.LastRunTurnID.Valid || facts.LastRunStatus != "" || facts.NewestTurnID.Valid ||
-			facts.AwaitingPlanID.Valid || facts.AwaitingStepID.Valid || facts.EscalatedRunID.Valid || facts.SandboxStatus != nil || facts.PrDeliveryStartedAt.Valid {
-			t.Errorf("facts = %+v, want no turn, no gate, no sandbox, no delivery", facts)
+			facts.AwaitingPlanID.Valid || facts.AwaitingStepID.Valid || facts.EscalatedRunID.Valid || facts.SandboxStatus != nil || facts.PrDeliveryStartedAt.Valid ||
+			len(facts.ArmedTimerNames) != 0 || len(facts.ArmedTimerFiresAt) != 0 || facts.ReleaseCheckPendingSince.Valid || facts.ReleaseCheckClaimedAt.Valid {
+			t.Errorf("facts = %+v, want no turn, no gate, no sandbox, no delivery, nothing armed", facts)
 		}
 	})
 
@@ -183,15 +218,16 @@ func TestSessionActivityFacts_OneStatement(t *testing.T) {
 // TestSessionActivityFacts_LiveEscalation pins which workflow escalation
 // ActivityFacts reports (technical plan §43.20). A run in needs_review is
 // never moved out of it, so each case below is a state that would gate the
-// session for good if every such run counted. It is reported only while
-// no turn has been created since it escalated -- it is the session's
-// newest workflow run, and the session's newest turn is one of that run's
-// own attempts or was created before the escalation -- and its definition
-// is not a built-in one. Rows are written the way the workflow engine
-// writes them -- a run, one attempt per turn with the turn attached and
-// then finished, then the escalation -- with every instant (turns' and
-// runs' created_at, the escalation's updated_at) set explicitly on one
-// timeline, so the order is unambiguous.
+// session for good if every such run counted. It is reported only while it
+// is the latest thing that happened on the session -- it is the session's
+// newest workflow run, it ran an attempt of its own, and no turn other
+// than its own attempts was created, or changed status (dispatched,
+// ended, cancelled), at or after the escalation -- and its definition is
+// not a built-in one. Rows are written the way the workflow engine writes
+// them -- a run, one attempt per turn with the turn attached and then
+// finished, then the escalation -- with every instant (turns' created_at
+// and status_changed_at, runs' created_at, the escalation's updated_at)
+// set explicitly on one timeline, so the order is unambiguous.
 func TestSessionActivityFacts_LiveEscalation(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
@@ -270,6 +306,24 @@ func TestSessionActivityFacts_LiveEscalation(t *testing.T) {
 		}
 		return row
 	}
+	// statusChanged stamps a turn's status_changed_at (migrations/000146) at
+	// base+at, on the same timeline -- as UpdateTurnStatus does with the
+	// database's now() when the turn is dispatched, ends or is cancelled.
+	statusChanged := func(t *testing.T, turnID pgtype.UUID, at time.Duration) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, `UPDATE turns SET status_changed_at = $2 WHERE id = $1`, turnID, base.Add(at)); err != nil {
+			t.Fatalf("set turn status_changed_at: %v", err)
+		}
+	}
+	// newTurnAt is newTurn at base+at, for instants finer than a minute.
+	newTurnAt := func(t *testing.T, sessionID pgtype.UUID, status sqlcgen.TurnStatus, at time.Duration) pgtype.UUID {
+		t.Helper()
+		id := newTurn(t, sessionID, status, 0)
+		if _, err := pool.Exec(ctx, `UPDATE turns SET created_at = $2 WHERE id = $1`, id, base.Add(at)); err != nil {
+			t.Fatalf("set turn created_at: %v", err)
+		}
+		return id
+	}
 	// escalatedCustomRun is the live case every "superseded" case below
 	// starts from: a custom run whose one turn, created at minute 0,
 	// failed and escalated the run half a minute later.
@@ -344,10 +398,52 @@ func TestSessionActivityFacts_LiveEscalation(t *testing.T) {
 			}
 			return escalated, false
 		}},
-		{"a newer turn with no run of its own supersedes it (queued behind a running turn, or a plan's implementation turn)", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
+		{"a newer turn with no run of its own supersedes it (an automatic re-review turn, which the engine never tracks, or a plan's implementation turn)", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
 			escalated := escalatedCustomRun(t, s)
 			newTurn(t, s, sqlcgen.TurnStatusPending, 1)
 			return escalated, false
+		}},
+		// Review round 3, P2: a turn queued behind the turn whose end
+		// escalates the run (AlwaysQueue: a GitHub mention, a re-review) is
+		// created BEFORE the escalation and starts no run, but it runs
+		// AFTER it. The escalation is the latest state only until that turn
+		// starts: a turn that ran after the escalation closes it.
+		{"a turn queued behind the escalating turn, still pending, leaves it reported (it has not run yet)", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
+			escalated := escalatedCustomRun(t, s)
+			newTurnAt(t, s, sqlcgen.TurnStatusPending, 15*time.Second)
+			return escalated, true
+		}},
+		{"a turn queued behind the escalating turn closes it once it is dispatched after it", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
+			escalated := escalatedCustomRun(t, s)
+			queued := newTurnAt(t, s, sqlcgen.TurnStatusDispatched, 15*time.Second)
+			statusChanged(t, queued, 45*time.Second)
+			return escalated, false
+		}},
+		{"a turn queued behind the escalating turn stays closed once it has run to completion", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
+			escalated := escalatedCustomRun(t, s)
+			queued := newTurnAt(t, s, sqlcgen.TurnStatusCompleted, 15*time.Second)
+			statusChanged(t, queued, 5*time.Minute)
+			return escalated, false
+		}},
+		{"an older turn cancelled after the escalation closes it too (something happened on the session since)", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
+			escalated := escalatedCustomRun(t, s)
+			queued := newTurnAt(t, s, sqlcgen.TurnStatusCancelled, 15*time.Second)
+			statusChanged(t, queued, time.Minute)
+			return escalated, false
+		}},
+		{"a turn that had already ended when the run escalated leaves it reported (review round 2's O2, by its status change)", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
+			run := newRun(t, s, customDef, 0)
+			attempt(t, run, customStep1, newTurn(t, s, sqlcgen.TurnStatusCompleted, 0), "completed", "blocked")
+			untracked := newTurnAt(t, s, sqlcgen.TurnStatusCompleted, 10*time.Second)
+			statusChanged(t, untracked, 20*time.Second)
+			return escalate(t, run, 2*time.Minute), true
+		}},
+		{"the escalating attempt's own status change, in the escalating transaction, never closes it", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
+			run := newRun(t, s, customDef, 0)
+			own := newTurn(t, s, sqlcgen.TurnStatusFailed, 0)
+			attempt(t, run, customStep1, own, "failed", "blocked")
+			statusChanged(t, own, 30*time.Second)
+			return escalate(t, run, 30*time.Second), true
 		}},
 		{"a newer run supersedes it even before any turn of its own", func(t *testing.T, s pgtype.UUID) (sqlcgen.WorkflowRun, bool) {
 			escalated := escalatedCustomRun(t, s)
@@ -455,3 +551,5 @@ func TestSandboxPRDelivery_StartAndEnd(t *testing.T) {
 		t.Fatalf("respawned: gen %d stamp %v, want a new generation and no stamp", respawned.Gen, respawned.PrDeliveryStartedAt)
 	}
 }
+
+func ptrTime(t time.Time) *time.Time { return &t }

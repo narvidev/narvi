@@ -13,6 +13,7 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/domain/sandbox"
 	"github.com/narvidev/narvi/internal/domain/session"
 	"github.com/narvidev/narvi/internal/domain/turn"
@@ -21,9 +22,10 @@ import (
 
 // GetSessionStatus backs GET /api/sessions/{sessionID}/status (technical
 // plan §43.20): what one session's work is doing now -- queued, running,
-// awaiting approval, idle or finished -- and how long a client should wait
-// before asking again, as restdtos.SessionActivity. It is also the twin of
-// the narvi_get_session_status MCP tool.
+// delivering, scheduled, awaiting approval, idle or finished -- and how
+// long a client should wait before asking again, as
+// restdtos.SessionActivity. It is also the twin of the
+// narvi_get_session_status MCP tool.
 //
 // The same gate as GetSession (get.go), deliberately: signed in (the
 // /api/sessions group's own auth.Middleware), 400 on a malformed id, 404
@@ -33,15 +35,16 @@ import (
 // could.
 //
 // Every fact comes from ONE statement (SessionStore.ActivityFacts), and the
-// activity is session.DeriveActivity over the turn queue and the human
-// gates in that snapshot -- never sessions.status, which is re-derived
+// activity is session.DeriveActivity over the turn queue, the delivery
+// stamp, the server-side work armed to create a turn, and the human gates
+// in that snapshot -- never sessions.status, which is re-derived
 // only when a turn reaches a terminal state and so can hold any of its
 // five values while a turn is queued or running. The response carries no
 // events: the transcript is GET /api/sessions/{sessionID}/events, a
 // separate, paginated read.
 func GetSessionStatus(sessions *postgres.SessionStore, timeouts platform.Timeouts) http.HandlerFunc {
 	delays := statusDelayTable(timeouts)
-	deliveryWindow := timeouts.MCPStatusDeliveryWindow
+	bounds := statusBoundsFrom(timeouts)
 	return func(w http.ResponseWriter, r *http.Request) {
 		sessionID, ok := parseSessionID(w, r)
 		if !ok {
@@ -61,7 +64,7 @@ func GetSessionStatus(sessions *postgres.SessionStore, timeouts platform.Timeout
 			return
 		}
 
-		dto, err := sessionActivityToDTO(facts, delays, deliveryWindow)
+		dto, err := sessionActivityToDTO(facts, delays, bounds)
 		if err != nil {
 			logger.Error("httpapi: session activity facts are unreadable", "error", err)
 			writeError(w, http.StatusInternalServerError, "internal error")
@@ -75,28 +78,105 @@ func GetSessionStatus(sessions *postgres.SessionStore, timeouts platform.Timeout
 // of platform.Timeouts, the only place those values live.
 func statusDelayTable(t platform.Timeouts) session.DelayTable {
 	return session.DelayTable{
-		Starting:      t.MCPStatusDelayStarting,
-		Queued:        t.MCPStatusDelayQueued,
-		Running:       t.MCPStatusDelayRunning,
-		Delivering:    t.MCPStatusDelayDelivering,
-		AwaitingHuman: t.MCPStatusDelayAwaitingHuman,
-		Settled:       t.MCPStatusDelaySettled,
-		Floor:         t.MCPStatusDelayFloor,
-		Ceiling:       t.MCPStatusDelayCeiling,
+		Starting:        t.MCPStatusDelayStarting,
+		Queued:          t.MCPStatusDelayQueued,
+		Running:         t.MCPStatusDelayRunning,
+		Delivering:      t.MCPStatusDelayDelivering,
+		Scheduled:       t.MCPStatusDelayScheduled,
+		ScheduledMargin: t.MCPStatusScheduledMargin,
+		AwaitingHuman:   t.MCPStatusDelayAwaitingHuman,
+		Settled:         t.MCPStatusDelaySettled,
+		Floor:           t.MCPStatusDelayFloor,
+		Ceiling:         t.MCPStatusDelayCeiling,
 	}
+}
+
+// statusBounds are the platform.Timeouts values that decide which work
+// recorded in a facts row still counts, measured on the database's clock
+// against the snapshot's own instant.
+type statusBounds struct {
+	// deliveryWindow bounds a push/PR delivery stamp (MCPStatusDeliveryWindow).
+	deliveryWindow time.Duration
+	// releaseCheckPumpInterval is how soon the release manifest worker
+	// claims a row that is waiting: an unclaimed check comes due then.
+	releaseCheckPumpInterval time.Duration
+	// releaseCheckTimeout ends a claimed check (the worker's own context),
+	// so a claimed check comes due then at the latest.
+	releaseCheckTimeout time.Duration
+	// releaseCheckWindow bounds a claimed check whose worker died:
+	// ReleaseManifestCheckTimeout plus MCPStatusScheduledMargin.
+	releaseCheckWindow time.Duration
+}
+
+func statusBoundsFrom(t platform.Timeouts) statusBounds {
+	return statusBounds{
+		deliveryWindow:           t.MCPStatusDeliveryWindow,
+		releaseCheckPumpInterval: t.ReleaseManifestCheckPumpInterval,
+		releaseCheckTimeout:      t.ReleaseManifestCheckTimeout,
+		releaseCheckWindow:       t.ReleaseManifestCheckTimeout + t.MCPStatusScheduledMargin,
+	}
+}
+
+// scheduledWork reads the server-side work in one facts row that can
+// create a turn on the session with no new input and has neither created
+// it nor declined yet (technical plan §43.20's inventory), and returns
+// whether any is armed and the earliest instant one comes due:
+//
+//   - every armed session timer whose kind sessionactor.TimerCanCreateWork
+//     says can create a turn -- a kind it does not know included, so an
+//     unclassified kind reads as work, never as settled -- due at its
+//     fires_at (which the timer pump pushes forward while it delivers it);
+//   - a release manifest check not yet claimed, due at the worker's next
+//     tick after it was enqueued;
+//   - a release manifest check claimed within releaseCheckWindow of the
+//     snapshot, due when its worker's deadline ends it.
+//
+// Both instants in every comparison are the database's clock.
+func scheduledWork(facts sqlcgen.GetSessionActivityFactsRow, bounds statusBounds) (armed bool, dueAt time.Time, err error) {
+	if len(facts.ArmedTimerNames) != len(facts.ArmedTimerFiresAt) {
+		return false, time.Time{}, fmt.Errorf("armed timers: %d names for %d instants", len(facts.ArmedTimerNames), len(facts.ArmedTimerFiresAt))
+	}
+	consider := func(at time.Time) {
+		if !armed || at.Before(dueAt) {
+			dueAt = at
+		}
+		armed = true
+	}
+	for i, name := range facts.ArmedTimerNames {
+		if sessionactor.TimerCanCreateWork(name) {
+			consider(facts.ArmedTimerFiresAt[i].Time)
+		}
+	}
+	if facts.ReleaseCheckPendingSince.Valid {
+		consider(facts.ReleaseCheckPendingSince.Time.Add(bounds.releaseCheckPumpInterval))
+	}
+	if facts.ReleaseCheckClaimedAt.Valid && session.ClaimedWorkOpen(facts.ReleaseCheckClaimedAt.Time, facts.ObservedAt.Time, bounds.releaseCheckWindow) {
+		consider(facts.ReleaseCheckClaimedAt.Time.Add(bounds.releaseCheckTimeout))
+	}
+	return armed, dueAt, nil
 }
 
 // activityInput is session.ActivityInput from one facts row: the turn
 // histogram as the snapshot counted it -- every state it holds, one this
 // code does not know included, so DeriveActivity can count that one as in
-// flight -- each human gate as "an id was found", and a completed turn's
-// push/PR delivery as under way while its stamp is within deliveryWindow
-// of the snapshot's own instant (session.PRDeliveryOpen; both instants are
-// the database's clock). sessions.status is not an input.
-func activityInput(facts sqlcgen.GetSessionActivityFactsRow, deliveryWindow time.Duration) (session.ActivityInput, error) {
+// flight -- each human gate as "an id was found", a completed turn's
+// push/PR delivery as under way while its stamp is within the delivery
+// window of the snapshot's own instant (session.PRDeliveryOpen; both
+// instants are the database's clock), and the work armed to create a turn
+// as scheduledWork reads it. It also returns how long until that work
+// comes due, measured from the snapshot. sessions.status is not an input.
+func activityInput(facts sqlcgen.GetSessionActivityFactsRow, bounds statusBounds) (session.ActivityInput, time.Duration, error) {
 	var raw map[string]int64
 	if err := json.Unmarshal(facts.TurnCounts, &raw); err != nil {
-		return session.ActivityInput{}, fmt.Errorf("decode turn counts %q: %w", facts.TurnCounts, err)
+		return session.ActivityInput{}, 0, fmt.Errorf("decode turn counts %q: %w", facts.TurnCounts, err)
+	}
+	scheduled, dueAt, err := scheduledWork(facts, bounds)
+	if err != nil {
+		return session.ActivityInput{}, 0, err
+	}
+	var dueIn time.Duration
+	if scheduled {
+		dueIn = dueAt.Sub(facts.ObservedAt.Time)
 	}
 	counts := make(map[turn.State]int, len(raw))
 	for state, n := range raw {
@@ -111,14 +191,15 @@ func activityInput(facts sqlcgen.GetSessionActivityFactsRow, deliveryWindow time
 		PlanAwaitingApproval:         facts.AwaitingPlanID.Valid,
 		WorkflowStepAwaitingDecision: facts.AwaitingStepID.Valid,
 		WorkflowEscalationOpen:       facts.EscalatedRunID.Valid,
-		PRDeliveryInProgress:         session.PRDeliveryOpen(deliveryStartedAt, facts.ObservedAt.Time, deliveryWindow),
-	}, nil
+		PRDeliveryInProgress:         session.PRDeliveryOpen(deliveryStartedAt, facts.ObservedAt.Time, bounds.deliveryWindow),
+		ScheduledWork:                scheduled,
+	}, dueIn, nil
 }
 
 // sessionActivityToDTO derives the activity and the suggested delay from
 // one facts row and renders restdtos.SessionActivity.
-func sessionActivityToDTO(facts sqlcgen.GetSessionActivityFactsRow, delays session.DelayTable, deliveryWindow time.Duration) (restdtos.SessionActivity, error) {
-	in, err := activityInput(facts, deliveryWindow)
+func sessionActivityToDTO(facts sqlcgen.GetSessionActivityFactsRow, delays session.DelayTable, bounds statusBounds) (restdtos.SessionActivity, error) {
+	in, scheduledDueIn, err := activityInput(facts, bounds)
 	if err != nil {
 		return restdtos.SessionActivity{}, err
 	}
@@ -131,7 +212,7 @@ func sessionActivityToDTO(facts sqlcgen.GetSessionActivityFactsRow, delays sessi
 		sandboxState = &s
 		sandboxStatus = &restdtos.SessionActivitySandboxStatus{Value: string(*facts.SandboxStatus)}
 	}
-	delay := session.SuggestedReadDelay(activity, sandboxState, delays)
+	delay := session.SuggestedReadDelay(activity, sandboxState, scheduledDueIn, delays)
 
 	return restdtos.SessionActivity{
 		SessionId:             facts.SessionID.String(),

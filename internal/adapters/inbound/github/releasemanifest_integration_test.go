@@ -242,10 +242,12 @@ func TestGitHubIntegration_WorkerPumpOnce_ClaimsPendingCheckAndEnqueuesOutboxRow
 
 // TestGitHubIntegration_WorkerPumpOnce_ConcurrentPodsNeverDoubleProcess
 // proves the concurrency guarantee blocking-finding fix #1's own claim
-// query (ClaimDueReleaseManifestPending, DELETE ... WHERE id IN (SELECT
-// ... FOR UPDATE SKIP LOCKED)) rests on: several "pods" (goroutines here)
-// calling Worker.PumpOnce CONCURRENTLY against the SAME real Postgres
-// release_manifest_pending table must each claim a DISJOINT batch --
+// query (ClaimDueReleaseManifestPending, UPDATE ... SET claimed_at = now()
+// WHERE id IN (SELECT ... WHERE claimed_at IS NULL ... FOR UPDATE SKIP
+// LOCKED), the row deleted once its check returns) rests on: several
+// "pods" (goroutines here) calling Worker.PumpOnce CONCURRENTLY against
+// the SAME real Postgres release_manifest_pending table must each claim
+// DISJOINT rows --
 // every seeded row gets processed EXACTLY once (never zero, never twice)
 // -- run under -race so a genuine data race in this path would also be
 // caught, not just a logical double-claim.

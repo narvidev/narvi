@@ -3,6 +3,7 @@ package releasereview_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -15,15 +16,25 @@ import (
 
 // fakePendingLister is a test-only releasereview.PendingLister -- no real
 // DB round trip, mirroring fakeMergedPRLister/fakeOutboxEnqueuer's own
-// precedent (run_test.go) exactly. Simulates a queue: ClaimDue pops up to
-// limit rows off the front, exactly like the real
-// ClaimDueReleaseManifestPending query's own "claim removes the row"
-// semantics (queries/releasemanifestpending.sql).
+// precedent (run_test.go) exactly. Simulates a queue: ClaimDue takes up to
+// limit rows off the front -- a claimed row is never returned again,
+// exactly like the real ClaimDueReleaseManifestPending query's own
+// "claimed_at IS NULL" filter (queries/releasemanifestpending.sql) -- and
+// Finish records which claimed rows were deleted, and after how many
+// ListMergedBetween calls (the check's own first step), so a test can tell
+// whether a row went before or after its check ran.
 type fakePendingLister struct {
 	rows      []sqlcgen.ReleaseManifestPending
 	err       error
 	calls     int
 	lastLimit int32
+
+	lister       *fakeMergedPRLister
+	finished     []pgtype.UUID
+	finishedAt   []int
+	finishErr    error
+	purgeCalls   int
+	purgeMaxAges []time.Duration
 }
 
 func (f *fakePendingLister) ClaimDue(_ context.Context, limit int32) ([]sqlcgen.ReleaseManifestPending, error) {
@@ -39,6 +50,20 @@ func (f *fakePendingLister) ClaimDue(_ context.Context, limit int32) ([]sqlcgen.
 	claimed := f.rows[:n]
 	f.rows = f.rows[n:]
 	return claimed, nil
+}
+
+func (f *fakePendingLister) Finish(_ context.Context, id pgtype.UUID) error {
+	f.finished = append(f.finished, id)
+	if f.lister != nil {
+		f.finishedAt = append(f.finishedAt, f.lister.calls)
+	}
+	return f.finishErr
+}
+
+func (f *fakePendingLister) PurgeStaleClaimed(_ context.Context, maxAge time.Duration) (int64, error) {
+	f.purgeCalls++
+	f.purgeMaxAges = append(f.purgeMaxAges, maxAge)
+	return 0, nil
 }
 
 func testWorkerSessionID(t *testing.T, raw string) pgtype.UUID {
@@ -139,6 +164,79 @@ func TestWorker_PumpOnce_ClaimBatchFails_PropagatesErrorNeverRunsAnything(t *tes
 	}
 	if lister.calls != 0 || outbox.calls != 0 {
 		t.Errorf("ListMergedBetween/Outbox.Create calls = %d/%d, want 0/0 (claim batch itself failed)", lister.calls, outbox.calls)
+	}
+}
+
+// TestWorker_PumpOnce_ClaimsOneRowAtATimeAndFinishesItAfterItsCheck pins
+// the order the session's status relies on (technical plan §43.20,
+// migrations/000147): each row is claimed alone -- so its claimed_at is
+// when its own check starts, and the status's bound on a claimed row
+// measures that check -- and deleted only after its check has run (any
+// composition turn the check inserts is committed by then, so no snapshot
+// sees neither the row nor the turn). A tick first purges rows claimed
+// longer ago than ReleaseManifestCheckTimeout plus MCPStatusScheduledMargin
+// -- the same bound the status applies -- and stops after pendingBatchSize
+// rows.
+func TestWorker_PumpOnce_ClaimsOneRowAtATimeAndFinishesItAfterItsCheck(t *testing.T) {
+	t.Parallel()
+
+	var rows []sqlcgen.ReleaseManifestPending
+	for i := 1; i <= 7; i++ {
+		id := testWorkerSessionID(t, fmt.Sprintf("00000000-0000-0000-0000-%012d", i))
+		rows = append(rows, sqlcgen.ReleaseManifestPending{ID: id, SessionID: id, Owner: "acme", Repo: "widgets", PrNumber: int32(i), BaseRef: "main", HeadRef: "release/x"})
+	}
+	lister := &fakeMergedPRLister{}
+	store := &fakePendingLister{rows: rows, lister: lister}
+	timeouts := platform.DefaultTimeouts()
+	worker := releasereview.NewWorker(store, releasereview.Deps{
+		SourceControl: lister,
+		Outbox:        &fakeOutboxEnqueuer{},
+		Timeouts:      timeouts,
+	}, "gho_bottoken", timeouts)
+
+	if err := worker.PumpOnce(context.Background()); err != nil {
+		t.Fatalf("PumpOnce() error = %v", err)
+	}
+	if store.lastLimit != 1 {
+		t.Errorf("ClaimDue limit = %d, want 1: a row claimed in a batch waits behind the others with its claimed_at already running", store.lastLimit)
+	}
+	if len(store.finished) != 5 || lister.calls != 5 || len(store.rows) != 2 {
+		t.Fatalf("finished %d rows after %d checks with %d left, want 5, 5 and 2: one tick handles pendingBatchSize rows", len(store.finished), lister.calls, len(store.rows))
+	}
+	for i, id := range store.finished {
+		if id != rows[i].ID {
+			t.Errorf("finished[%d] = %v, want %v (oldest first)", i, id, rows[i].ID)
+		}
+		if store.finishedAt[i] != i+1 {
+			t.Errorf("row %d finished after %d checks, want %d: a row must go only after its own check has run", i, store.finishedAt[i], i+1)
+		}
+	}
+	if store.purgeCalls != 1 || store.purgeMaxAges[0] != timeouts.ReleaseManifestCheckTimeout+timeouts.MCPStatusScheduledMargin {
+		t.Errorf("purge calls %d with %v, want one, with ReleaseManifestCheckTimeout + MCPStatusScheduledMargin", store.purgeCalls, store.purgeMaxAges)
+	}
+}
+
+// TestWorker_PumpOnce_FinishFailureNeverAbortsTheTick: a row whose delete
+// fails stays claimed -- never claimed again, bounded by the status, and
+// purged on a later tick -- and the tick goes on to the next row.
+func TestWorker_PumpOnce_FinishFailureNeverAbortsTheTick(t *testing.T) {
+	t.Parallel()
+
+	lister := &fakeMergedPRLister{}
+	store := &fakePendingLister{lister: lister, finishErr: errors.New("db hiccup"), rows: []sqlcgen.ReleaseManifestPending{
+		{ID: testWorkerSessionID(t, "00000000-0000-0000-0000-000000000011"), Owner: "acme", Repo: "widgets", PrNumber: 1, BaseRef: "main", HeadRef: "release/1"},
+		{ID: testWorkerSessionID(t, "00000000-0000-0000-0000-000000000012"), Owner: "acme", Repo: "widgets", PrNumber: 2, BaseRef: "main", HeadRef: "release/2"},
+	}}
+	worker := releasereview.NewWorker(store, releasereview.Deps{
+		SourceControl: lister,
+		Outbox:        &fakeOutboxEnqueuer{},
+		Timeouts:      platform.DefaultTimeouts(),
+	}, "gho_bottoken", platform.DefaultTimeouts())
+	if err := worker.PumpOnce(context.Background()); err != nil {
+		t.Fatalf("PumpOnce() error = %v, want a finish failure logged, never returned", err)
+	}
+	if lister.calls != 2 || len(store.finished) != 2 {
+		t.Fatalf("%d checks, %d finish attempts, want both rows checked and a finish tried for each", lister.calls, len(store.finished))
 	}
 }
 

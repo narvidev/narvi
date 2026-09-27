@@ -39,6 +39,15 @@
 // EXPORTED postgres.TimerStore.Upsert, in the SAME transaction. Both
 // commit atomically as one unit or neither does, so a crash between them
 // can never leave a pushed commit with no armed timer.
+//
+// The armed timer is also what the session's status reads (technical plan
+// §43.20): sessionactor.ClassifyTimer classes this kind as one whose
+// firing can create a turn, so from this commit until the timer fires --
+// and inserts the review turn, or declines -- the session reads
+// "scheduled", never settled. Armed here for every push whatever the
+// opt-in, it reads scheduled on a repository that has not opted in too,
+// until the fire declines: erring toward unsettled, never toward a false
+// settled.
 
 package github
 

@@ -117,6 +117,7 @@ func (c *deliveryCommander) sent() int {
 type deliveryFixture struct {
 	rig       testRig
 	cookie    string
+	userID    pgtype.UUID
 	sessionID pgtype.UUID
 	turnID    pgtype.UUID
 	actor     *sessionactor.Actor
@@ -125,6 +126,14 @@ type deliveryFixture struct {
 }
 
 func newDeliveryFixture(ctx context.Context, t *testing.T, rig testRig, live, withBranch bool, sendErr error) deliveryFixture {
+	t.Helper()
+	return newDeliveryFixtureWith(ctx, t, rig, live, withBranch, sendErr, true)
+}
+
+// newDeliveryFixtureWith is newDeliveryFixture, optionally with no
+// SourceControl configured on the actor (withSourceControl false): the
+// fixture's scm is then nil.
+func newDeliveryFixtureWith(ctx context.Context, t *testing.T, rig testRig, live, withBranch bool, sendErr error, withSourceControl bool) deliveryFixture {
 	t.Helper()
 	user, cookie := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMember)
 	encrypted, err := platform.EncryptToken(deliveryTokenKey, []byte("gh-fake-oauth-token"))
@@ -162,8 +171,13 @@ func newDeliveryFixture(ctx context.Context, t *testing.T, rig testRig, live, wi
 	}
 
 	commander := &deliveryCommander{err: sendErr}
-	scm := &deliverySourceControl{ref: ports.PRRef{Number: 7, URL: "https://github.com/" + repo + "/pull/7"}}
-	registry, err := sessionactor.NewRegistry(ctx, rig.pool, platform.DefaultTimeouts(), nil, commander, nil, "", scm, deliveryTokenKey, "", nil, false)
+	var scm *deliverySourceControl
+	var sourceControl ports.SourceControl // an untyped nil unless configured
+	if withSourceControl {
+		scm = &deliverySourceControl{ref: ports.PRRef{Number: 7, URL: "https://github.com/" + repo + "/pull/7"}}
+		sourceControl = scm
+	}
+	registry, err := sessionactor.NewRegistry(ctx, rig.pool, platform.DefaultTimeouts(), nil, commander, nil, "", sourceControl, deliveryTokenKey, "", nil, false)
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
@@ -172,7 +186,7 @@ func newDeliveryFixture(ctx context.Context, t *testing.T, rig testRig, live, wi
 	if err != nil {
 		t.Fatalf("GetOrSpawn: %v", err)
 	}
-	return deliveryFixture{rig: rig, cookie: cookie, sessionID: sess.ID, turnID: processing.ID, actor: actor, commander: commander, scm: scm}
+	return deliveryFixture{rig: rig, cookie: cookie, userID: user.ID, sessionID: sess.ID, turnID: processing.ID, actor: actor, commander: commander, scm: scm}
 }
 
 // send delivers one wire event to the actor, with its own message id (the
@@ -212,6 +226,20 @@ func (f deliveryFixture) pushComplete(ctx context.Context, t *testing.T) {
 	raw, err := json.Marshal(sandboxws.PushComplete{
 		Type: "push_complete", MessageId: id, SessionId: f.sessionID.String(), Gen: 1, AckId: "push_complete:" + id,
 		Repos: []sandboxws.PushCompleteReposElem{{Name: "repo1", Branch: "feature-x", Sha: "0123456789abcdef0123456789abcdef01234567"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.send(ctx, t, "push_complete", raw, id)
+}
+
+// pushCompleteNoRepos is a push_complete that lists no repository.
+func (f deliveryFixture) pushCompleteNoRepos(ctx context.Context, t *testing.T) {
+	t.Helper()
+	id := uuid.NewString()
+	raw, err := json.Marshal(sandboxws.PushComplete{
+		Type: "push_complete", MessageId: id, SessionId: f.sessionID.String(), Gen: 1, AckId: "push_complete:" + id,
+		Repos: []sandboxws.PushCompleteReposElem{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -411,6 +439,83 @@ func TestGetSessionStatus_DeliveryAfterACompletedTurn(t *testing.T) {
 		eventually(t, 5*time.Second, func() bool { return f.commander.sent() == 1 && !f.stampSet(ctx, t) })
 		wantFinished(t, "the send failed", f.status(t))
 	})
+
+	// Review round 3, P4: a live session whose creator has no linked GitHub
+	// identity (an OIDC-only member) is a blocked cycle -- the push is
+	// certain to be refused, so completeProcessingTurn records the warning
+	// and sends nothing. It must never be stamped: sendPushBestEffort
+	// returns on a blocked signal before its own "nothing was sent" clear,
+	// so a stamp taken here would hold the session delivering, unsettled,
+	// for the whole window with nothing under way.
+	t.Run("a blocked push (the creator has no linked GitHub identity) reads finished at once, never stamped", func(t *testing.T) {
+		f := newDeliveryFixture(ctx, t, rig, true, true, nil)
+		if _, err := rig.pool.Exec(ctx, `DELETE FROM identities WHERE user_id = $1 AND provider = 'github'`, f.userID); err != nil {
+			t.Fatalf("unlink the creator's GitHub identity: %v", err)
+		}
+		f.executionComplete(ctx, t)
+		wantFinished(t, "blocked: the turn completed", f.status(t))
+		if f.stampSet(ctx, t) {
+			t.Fatal("blocked: a delivery stamp was set for a push that is never sent")
+		}
+		time.Sleep(200 * time.Millisecond)
+		if f.commander.sent() != 0 {
+			t.Fatalf("blocked: %d commands sent, want none", f.commander.sent())
+		}
+		wantFinished(t, "blocked: settled for good", f.status(t))
+		if f.stampSet(ctx, t) {
+			t.Fatal("blocked: the delivery stamp appeared later")
+		}
+	})
+
+	// Review round 3, P4: createPRBestEffort returns early -- no pull
+	// request -- in several ways once the push has been sent and has
+	// reported back. Every one of them must end the delivery (the deferred
+	// clear), or the session would read delivering, unsettled, until the
+	// window runs out with nothing under way.
+	for _, tc := range []struct {
+		name  string
+		scm   bool
+		setup func(t *testing.T, f deliveryFixture)
+		push  func(t *testing.T, f deliveryFixture)
+	}{
+		{"the creator's GitHub token no longer decrypts", true, func(t *testing.T, f deliveryFixture) {
+			if _, err := rig.pool.Exec(ctx, `UPDATE identities SET access_token_encrypted = $2 WHERE user_id = $1 AND provider = 'github'`, f.userID, []byte("not a sealed token at all")); err != nil {
+				t.Fatalf("corrupt the creator's token: %v", err)
+			}
+		}, nil},
+		{"the creator may no longer open a pull request (now a viewer)", true, func(t *testing.T, f deliveryFixture) {
+			if _, err := rig.pool.Exec(ctx, `UPDATE users SET role = 'viewer' WHERE id = $1`, f.userID); err != nil {
+				t.Fatalf("demote the creator: %v", err)
+			}
+		}, nil},
+		{"the push_complete lists no repository", true, func(*testing.T, deliveryFixture) {}, func(t *testing.T, f deliveryFixture) { f.pushCompleteNoRepos(ctx, t) }},
+		{"no SourceControl is configured", false, func(*testing.T, deliveryFixture) {}, nil},
+	} {
+		t.Run("an early return in createPRBestEffort ends the delivery: "+tc.name, func(t *testing.T) {
+			f := newDeliveryFixtureWith(ctx, t, rig, true, true, nil, tc.scm)
+			f.executionComplete(ctx, t)
+			eventually(t, 5*time.Second, func() bool { return f.commander.sent() == 1 })
+			wantDelivering(t, "the push sent", f.status(t), f.turnID)
+
+			tc.setup(t, f)
+			if tc.push != nil {
+				tc.push(t, f)
+			} else {
+				f.pushComplete(ctx, t)
+			}
+			got := f.untilFinished(t, "push_complete with no pull request to open")
+			wantFinished(t, "push_complete with no pull request to open", got)
+			if f.stampSet(ctx, t) {
+				t.Fatal("finished, yet the delivery stamp is still set")
+			}
+			if n := f.prArtifacts(ctx, t); n != 0 {
+				t.Fatalf("%d pull request artifacts, want none", n)
+			}
+			if f.scm != nil && f.scm.calls() != 0 {
+				t.Fatalf("%d CreatePR calls, want none", f.scm.calls())
+			}
+		})
+	}
 
 	// No repository names a branch: the push sends nothing (the actor skips
 	// every repo), so there is no delivery to report.

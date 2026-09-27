@@ -11110,10 +11110,11 @@ type Session struct {
 // GET /api/sessions/{sessionID}/status (technical plan §43.20): what one session's
 // work is doing now, and how long to wait before reading it again. Derived at read
 // time from the session's turn queue, a completed turn's push and pull request
-// still under way, and its human gates, all read in ONE database snapshot -- never
-// from Session.status, which is re-derived only when a turn reaches a terminal
-// state and so can hold any of its five values while a turn is queued or running.
-// Carries no events and no transcript: the event history is GET
+// still under way, work the server holds that can create a turn on the session
+// with no new input, and its human gates, all read in ONE database snapshot --
+// never from Session.status, which is re-derived only when a turn reaches a
+// terminal state and so can hold any of its five values while a turn is queued or
+// running. Carries no events and no transcript: the event history is GET
 // /api/sessions/{sessionID}/events (EventsResponse), a separate, paginated read.
 type SessionActivity struct {
 	// In precedence order: 'running' when a turn is dispatched or processing (turns
@@ -11122,24 +11123,39 @@ type SessionActivity struct {
 	// sandbox cold start; else 'delivering' when a turn that completed is still being
 	// delivered -- its branch pushed, then its pull request opened, which happens
 	// with no new input -- for at most the deployment's delivery window from when
-	// that began (10 minutes as shipped: a push that never reports back stops
-	// counting then); else 'awaiting_approval' when a person must act (a plan
-	// awaiting approval, a workflow step awaiting a decision, or a custom workflow's
-	// run escalated for review with nothing on the session since -- see
-	// awaiting.kind); else 'idle' when the session has no turn at all; else
-	// 'finished' (at least one turn, every one terminal, nothing being delivered). A
-	// queued or running turn is never reported as idle or finished, and a pull
-	// request a delivery opens within that window is recorded before activity leaves
-	// 'delivering'.
+	// that turn completed (10 minutes as shipped: a push that never reports back
+	// stops counting then); else 'scheduled' when the server holds work that can
+	// create a turn on this session with no new input and has neither created it nor
+	// declined yet -- an automatic re-review armed by a push to the session's pull
+	// request (a debounce, 2 minutes as shipped, armed on every push whether or not
+	// the repository has opted in: the opt-in is read only when it fires), or a
+	// release pull request's manifest check still to come or still running (it can
+	// add a composition review turn); else 'awaiting_approval' when a person must act
+	// (a plan awaiting approval, a workflow step awaiting a decision, or a custom
+	// workflow's run escalated for review while it is still the session's latest
+	// state -- see awaiting.kind); else 'idle' when the session has no turn at all;
+	// else 'finished' (at least one turn, every one terminal, nothing being
+	// delivered, nothing scheduled). A queued or running turn is never reported as
+	// idle or finished. 'delivering' ends once the pull request is recorded, or once
+	// the delivery ends without one: the push failed or could not be sent, the pull
+	// request could not be opened (the creator may no longer open one, or their
+	// GitHub token is no longer usable, or GitHub refused it), or the window passed.
+	// A pull request that is opened is recorded before activity leaves 'delivering',
+	// except when two pushes overlap: a sandbox records one delivery at a time, so if
+	// a later turn completes before an earlier turn's push has reported back, the
+	// earlier push's pull request ends the later delivery, and the later pull request
+	// can appear after 'finished'. 'scheduled' ends when its work comes due and
+	// either creates its turn ('queued' follows) or declines (the session reads
+	// whatever else it holds).
 	Activity SessionActivityActivity `json:"activity" yaml:"activity" mapstructure:"activity"`
 
 	// Archived corresponds to the JSON schema field "archived".
 	Archived bool `json:"archived" yaml:"archived" mapstructure:"archived"`
 
 	// The human gate open on this session, if any, whatever activity says: activity
-	// is 'awaiting_approval' only when no turn is also queued or running. When more
-	// than one gate is open, a plan is reported first, then a workflow step, then an
-	// escalated workflow run.
+	// is 'awaiting_approval' only when nothing is also queued, running, being
+	// delivered or scheduled. When more than one gate is open, a plan is reported
+	// first, then a workflow step, then an escalated workflow run.
 	Awaiting *SessionActivityAwaiting `json:"awaiting" yaml:"awaiting" mapstructure:"awaiting"`
 
 	// The turn dispatched to a sandbox or being processed; null when none is.
@@ -11165,16 +11181,18 @@ type SessionActivity struct {
 
 	// true exactly when activity is idle, awaiting_approval or finished: nothing
 	// progresses server-side until a person acts or sends new input. Never true while
-	// a turn is queued or running, or while a completed turn's push and pull request
-	// are being delivered.
+	// a turn is queued or running, while a completed turn's push and pull request are
+	// being delivered, or while work that can create a turn is scheduled.
 	Settled bool `json:"settled" yaml:"settled" mapstructure:"settled"`
 
 	// How long to wait before reading this status again, in whole seconds (rounded
 	// up): short while a turn is queued on a warm sandbox, running or being
-	// delivered, longer while a sandbox starts or a person must act, longest once
-	// finished or idle -- always within the deployment's configured floor and ceiling
-	// (2 and 300 seconds as shipped). A hint that keeps polling quiet, never a limit:
-	// an earlier read is answered all the same.
+	// delivered, longer while a sandbox starts or work is scheduled (never past the
+	// moment that work comes due, plus a few seconds for it to act), longer still
+	// while a person must act, longest once finished or idle -- always within the
+	// deployment's configured floor and ceiling (2 and 300 seconds as shipped). A
+	// hint that keeps polling quiet, never a limit: an earlier read is answered all
+	// the same.
 	SuggestedDelaySeconds int `json:"suggestedDelaySeconds" yaml:"suggestedDelaySeconds" mapstructure:"suggestedDelaySeconds"`
 }
 
@@ -11186,12 +11204,14 @@ const SessionActivityActivityFinished SessionActivityActivity = "finished"
 const SessionActivityActivityIdle SessionActivityActivity = "idle"
 const SessionActivityActivityQueued SessionActivityActivity = "queued"
 const SessionActivityActivityRunning SessionActivityActivity = "running"
+const SessionActivityActivityScheduled SessionActivityActivity = "scheduled"
 
 var enumValues_SessionActivityActivity = []interface{}{
 	"idle",
 	"queued",
 	"running",
 	"delivering",
+	"scheduled",
 	"awaiting_approval",
 	"finished",
 }
@@ -11217,9 +11237,9 @@ func (j *SessionActivityActivity) UnmarshalJSON(value []byte) error {
 }
 
 // The human gate open on this session, if any, whatever activity says: activity is
-// 'awaiting_approval' only when no turn is also queued or running. When more than
-// one gate is open, a plan is reported first, then a workflow step, then an
-// escalated workflow run.
+// 'awaiting_approval' only when nothing is also queued, running, being delivered
+// or scheduled. When more than one gate is open, a plan is reported first, then a
+// workflow step, then an escalated workflow run.
 type SessionActivityAwaiting struct {
 	// Id corresponds to the JSON schema field "id".
 	Id string `json:"id" yaml:"id" mapstructure:"id"`
@@ -11229,9 +11249,12 @@ type SessionActivityAwaiting struct {
 	// workflow step awaiting a decision (id is the step run's);
 	// 'workflow_escalation': a custom workflow's run escalated for review (id is the
 	// run's), reported only while it is the session's latest state -- its newest
-	// workflow run, with no turn created since it escalated (a turn created before
-	// it, such as one sent while a step awaited the decision that escalated the run,
-	// does not close it). Any newer turn closes it, so a person answers it by sending
+	// workflow run, with no turn other than the run's own attempts created, started,
+	// ended or cancelled since it escalated. So a turn created after the escalation
+	// closes it, and so does a turn queued before it that runs after it (such as one
+	// queued behind the turn whose end escalated the run) as soon as it starts; a
+	// turn that had already ended when a decision escalated the run (one sent and run
+	// while a step awaited that decision) does not. A person answers it by sending
 	// the session new work. A built-in workflow's escalation is never reported: no
 	// person or route can act on it, and when its turn failed or was stopped, lastRun
 	// already says so.

@@ -31,7 +31,7 @@ func statusFactsRow(turnCounts string) sqlcgen.GetSessionActivityFactsRow {
 func statusDTO(t *testing.T, facts sqlcgen.GetSessionActivityFactsRow) restdtos.SessionActivity {
 	t.Helper()
 	timeouts := platform.DefaultTimeouts()
-	got, err := sessionActivityToDTO(facts, statusDelayTable(timeouts), timeouts.MCPStatusDeliveryWindow)
+	got, err := sessionActivityToDTO(facts, statusDelayTable(timeouts), statusBoundsFrom(timeouts))
 	if err != nil {
 		t.Fatalf("sessionActivityToDTO: %v", err)
 	}
@@ -177,3 +177,97 @@ func TestSessionActivityToDTO_DeliveryWindow(t *testing.T) {
 }
 
 func stampAt(at time.Time) *time.Time { return &at }
+
+// TestSessionActivityToDTO_ScheduledWork pins the handler's half of review
+// round 3's P1 (technical plan §43.20's inventory): an armed timer whose
+// kind can create a turn -- or a kind sessionactor does not know -- and a
+// release manifest check still to come or still running read scheduled,
+// never settled, whatever gate is open; timers that only watch a sandbox
+// or an in-flight turn do not; a claimed check whose worker died stops
+// counting once ReleaseManifestCheckTimeout plus MCPStatusScheduledMargin
+// has passed. The suggestion never reaches past the work's due instant plus
+// the margin, and is otherwise the scheduled 15 s.
+func TestSessionActivityToDTO_ScheduledWork(t *testing.T) {
+	t.Parallel()
+
+	timeouts := platform.DefaultTimeouts()
+	at := func(d time.Duration) pgtype.Timestamptz {
+		return pgtype.Timestamptz{Time: statusObservedAt.Add(d), Valid: true}
+	}
+	planID := pgtype.UUID{Bytes: [16]byte{0xa}, Valid: true}
+	type timer struct {
+		name string
+		in   time.Duration
+	}
+	for _, tc := range []struct {
+		name         string
+		turnCounts   string
+		timers       []timer
+		pendingSince *time.Duration
+		claimedAgo   *time.Duration
+		stampAgo     *time.Duration
+		plan         bool
+		wantActivity restdtos.SessionActivityActivity
+		wantDelay    int
+	}{
+		{"nothing armed -> finished", `{"completed":1}`, nil, nil, nil, nil, false, restdtos.SessionActivityActivityFinished, 300},
+		{"the reviewers' case: a re-review debounce armed 2 min out -> scheduled", `{"completed":1}`, []timer{{"review_retrigger_debounce", 2 * time.Minute}}, nil, nil, nil, false, restdtos.SessionActivityActivityScheduled, 15},
+		{"a debounce due in 3 s -> due plus the margin", `{"completed":1}`, []timer{{"review_retrigger_debounce", 3 * time.Second}}, nil, nil, nil, false, restdtos.SessionActivityActivityScheduled, 8},
+		{"a debounce overdue (the pump has not claimed it yet) -> the margin", `{"completed":1}`, []timer{{"review_retrigger_debounce", -2 * time.Second}}, nil, nil, nil, false, restdtos.SessionActivityActivityScheduled, 5},
+		{"every sandbox-only and in-flight-only kind armed -> finished", `{"completed":1}`, []timer{{"connecting_deadline", time.Second}, {"liveness_check", time.Second}, {"inactivity", time.Minute}, {"terminal_grace", time.Second}, {"turn_deadline", time.Hour}}, nil, nil, nil, false, restdtos.SessionActivityActivityFinished, 300},
+		{"a kind this binary does not know -> scheduled, never settled", `{"completed":1}`, []timer{{"a_kind_from_a_newer_binary", time.Minute}}, nil, nil, nil, false, restdtos.SessionActivityActivityScheduled, 15},
+		{"the earliest work-creating timer decides the delay", `{"completed":1}`, []timer{{"liveness_check", time.Second}, {"a_kind_from_a_newer_binary", 4 * time.Second}, {"review_retrigger_debounce", time.Minute}}, nil, nil, nil, false, restdtos.SessionActivityActivityScheduled, 9},
+		{"a debounce beside an open plan -> scheduled, the plan still reported", `{"completed":1}`, []timer{{"review_retrigger_debounce", time.Minute}}, nil, nil, nil, true, restdtos.SessionActivityActivityScheduled, 15},
+		{"a debounce while a delivery is under way -> delivering", `{"completed":1}`, []timer{{"review_retrigger_debounce", time.Minute}}, nil, nil, durationPtr(-3 * time.Second), false, restdtos.SessionActivityActivityDelivering, 5},
+		{"a debounce behind a queued turn -> queued", `{"completed":1,"pending":1}`, []timer{{"review_retrigger_debounce", time.Minute}}, nil, nil, nil, false, restdtos.SessionActivityActivityQueued, 15},
+		{"a release check enqueued beside the review turn still queued -> queued", `{"pending":1}`, nil, durationPtr(-time.Second), nil, nil, false, restdtos.SessionActivityActivityQueued, 15},
+		{"a release check enqueued, the review turn done -> scheduled", `{"completed":1}`, nil, durationPtr(-time.Second), nil, nil, false, restdtos.SessionActivityActivityScheduled, 14},
+		{"a release check waiting long past a tick (the worker is busy) -> scheduled, the margin", `{"completed":1}`, nil, durationPtr(-time.Hour), nil, nil, false, restdtos.SessionActivityActivityScheduled, 5},
+		{"a release check claimed a minute ago -> scheduled", `{"completed":1}`, nil, nil, durationPtr(time.Minute), nil, false, restdtos.SessionActivityActivityScheduled, 15},
+		{"a release check claimed just inside its bound -> scheduled", `{"completed":1}`, nil, nil, durationPtr(timeouts.ReleaseManifestCheckTimeout + timeouts.MCPStatusScheduledMargin - time.Second), nil, false, restdtos.SessionActivityActivityScheduled, 5},
+		{"a release check claimed past its bound (its worker died) -> finished", `{"completed":1}`, nil, nil, durationPtr(timeouts.ReleaseManifestCheckTimeout + timeouts.MCPStatusScheduledMargin), nil, false, restdtos.SessionActivityActivityFinished, 300},
+		{"a dead claim beside an open plan -> awaiting_approval", `{"completed":1}`, nil, nil, durationPtr(time.Hour), nil, true, restdtos.SessionActivityActivityAwaitingApproval, 60},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			facts := statusFactsRow(tc.turnCounts)
+			facts.ArmedTimerNames = []string{}
+			facts.ArmedTimerFiresAt = []pgtype.Timestamptz{}
+			for _, tm := range tc.timers {
+				facts.ArmedTimerNames = append(facts.ArmedTimerNames, tm.name)
+				facts.ArmedTimerFiresAt = append(facts.ArmedTimerFiresAt, at(tm.in))
+			}
+			if tc.pendingSince != nil {
+				facts.ReleaseCheckPendingSince = at(*tc.pendingSince)
+			}
+			if tc.claimedAgo != nil {
+				facts.ReleaseCheckClaimedAt = at(-*tc.claimedAgo)
+			}
+			if tc.stampAgo != nil {
+				facts.PrDeliveryStartedAt = at(*tc.stampAgo)
+			}
+			if tc.plan {
+				facts.AwaitingPlanID, facts.AwaitingPlanSince = planID, at(-time.Minute)
+			}
+			got := statusDTO(t, facts)
+			wantSettled := tc.wantActivity == restdtos.SessionActivityActivityFinished || tc.wantActivity == restdtos.SessionActivityActivityAwaitingApproval
+			if got.Activity != tc.wantActivity || got.Settled != wantSettled || got.SuggestedDelaySeconds != tc.wantDelay {
+				t.Fatalf("activity %q settled %v delay %d, want %q, %v, %d", got.Activity, got.Settled, got.SuggestedDelaySeconds, tc.wantActivity, wantSettled, tc.wantDelay)
+			}
+			if tc.plan && (got.Awaiting == nil || got.Awaiting.Kind != restdtos.SessionActivityAwaitingKindPlan) {
+				t.Fatalf("awaiting = %+v, want the plan reported whatever the activity", got.Awaiting)
+			}
+		})
+	}
+
+	t.Run("names and instants out of step are refused, never guessed", func(t *testing.T) {
+		t.Parallel()
+		facts := statusFactsRow(`{"completed":1}`)
+		facts.ArmedTimerNames = []string{"review_retrigger_debounce"}
+		if _, err := sessionActivityToDTO(facts, statusDelayTable(timeouts), statusBoundsFrom(timeouts)); err == nil {
+			t.Fatal("sessionActivityToDTO accepted one timer name with no instant")
+		}
+	})
+}
+
+func durationPtr(d time.Duration) *time.Duration { return &d }

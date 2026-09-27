@@ -46,10 +46,11 @@
 // second store: Status is persisted only when a turn reaches a terminal
 // state, never when one is queued or dispatched, so it does not tell
 // whether a follow-up turn is queued or running.
-// Activity (queued, running, delivering, awaiting_approval, idle,
-// finished) is derived from the turn queue, a completed turn's push and
-// pull request still under way, and the session's human gates, all read in
-// one snapshot, whenever a client asks (technical plan §43.20), and is
-// never written back. SuggestedReadDelay maps it to how long a client should
+// Activity (queued, running, delivering, scheduled, awaiting_approval,
+// idle, finished) is derived from the turn queue, a completed turn's push
+// and pull request still under way, server-side work armed to create a
+// turn with no new input, and the session's human gates, all read in one
+// snapshot, whenever a client asks (technical plan §43.20), and is never
+// written back. SuggestedReadDelay maps it to how long a client should
 // wait before asking again.
 package session

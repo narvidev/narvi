@@ -324,7 +324,7 @@ func toolSpecs(twins Twins) []toolSpec {
 		},
 		{
 			Name:         "narvi_get_session_status",
-			Description:  "Compact state of one session -- the same state GET /api/sessions/{sessionID}/status returns: whether its work is queued, running, delivering (a completed turn's branch being pushed and its pull request opened), awaiting approval by a person, idle or finished (a queued or running turn is never reported as idle or finished; settled is true only for idle, awaiting approval and finished), with suggestedDelaySeconds, how long to wait before reading it again. Does not include the transcript.",
+			Description:  "Compact state of one session -- the same state GET /api/sessions/{sessionID}/status returns: whether its work is queued, running, delivering (a completed turn's branch being pushed and its pull request opened), scheduled (the server holds work that will start a turn on its own, such as an automatic re-review after a push), awaiting approval by a person, idle or finished (a queued or running turn is never reported as idle or finished; settled is true only for idle, awaiting approval and finished), with suggestedDelaySeconds, how long to wait before reading it again. Does not include the transcript.",
 			Scope:        mcpscope.Read,
 			Instruction:  "narvi_get_session_status (what one session is doing now, and when to ask again)",
 			Twin:         twin{method: http.MethodGet, pathTemplate: "/api/sessions/{sessionID}/status", handler: twins.GetSessionStatus},

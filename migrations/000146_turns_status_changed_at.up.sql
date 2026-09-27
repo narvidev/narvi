@@ -1,0 +1,20 @@
+-- A session's status (technical plan §43.20) reports a custom workflow's
+-- escalated run as a gate only while that escalation is still the latest
+-- thing that happened on the session. A turn created after it closes it,
+-- and so does a turn that RUNS after it -- one queued behind the turn whose
+-- end escalated the run is created before the escalation but dispatched
+-- after it. Telling the two apart needs an instant on the same clock as
+-- the escalation's own (workflow_runs.updated_at, the database's now()):
+-- turns.dispatched_at and turns.completed_at are the control plane's
+-- clock, stamped by the session actor, so comparing them with a database
+-- instant would order two events by two different clocks.
+--
+-- status_changed_at is that instant: the database's now() -- its
+-- transaction's start -- at a turn's latest status change, written by
+-- UpdateTurnStatus, the one query that changes turns.status. A call that
+-- passes the turn's current status back unchanged (tryPlanReenqueue
+-- re-stamping a processing turn's sandbox generation) leaves it alone.
+-- NULL means the turn has not changed status since it was created
+-- (created_at stands for that), or last changed before this column
+-- existed.
+ALTER TABLE turns ADD COLUMN status_changed_at TIMESTAMPTZ;

@@ -2145,6 +2145,7 @@ type ReleaseManifestPending struct {
 	HeadRef       string             `json:"head_ref"`
 	CorrelationID *string            `json:"correlation_id"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	ClaimedAt     pgtype.Timestamptz `json:"claimed_at"`
 }
 
 type RepoSetting struct {
@@ -2438,6 +2439,7 @@ type Turn struct {
 	ReviewVerdictContext    []byte                `json:"review_verdict_context"`
 	DispatchedMessageID     *string               `json:"dispatched_message_id"`
 	IsReviewAttempt         bool                  `json:"is_review_attempt"`
+	StatusChangedAt         pgtype.Timestamptz    `json:"status_changed_at"`
 }
 
 type TurnStepCost struct {

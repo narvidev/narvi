@@ -207,7 +207,8 @@ func newSeen() map[restdtos.SessionActivityActivity]*atomic.Int64 {
 	seen := map[restdtos.SessionActivityActivity]*atomic.Int64{}
 	for _, a := range []restdtos.SessionActivityActivity{
 		restdtos.SessionActivityActivityIdle, restdtos.SessionActivityActivityQueued, restdtos.SessionActivityActivityRunning,
-		restdtos.SessionActivityActivityDelivering, restdtos.SessionActivityActivityAwaitingApproval, restdtos.SessionActivityActivityFinished,
+		restdtos.SessionActivityActivityDelivering, restdtos.SessionActivityActivityScheduled, restdtos.SessionActivityActivityAwaitingApproval,
+		restdtos.SessionActivityActivityFinished,
 	} {
 		seen[a] = &atomic.Int64{}
 	}
@@ -246,6 +247,14 @@ func endTurnThroughEngine(ctx context.Context, t *testing.T, rig testRig, sessio
 	t.Helper()
 	state := transitionTurn(ctx, t, rig.turns, turnID, turn.StatePending, turn.TriggerDispatch)
 	transitionTurn(ctx, t, rig.turns, turnID, state, turn.TriggerStartProcessing)
+	endProcessingTurnThroughEngine(ctx, t, rig, sessionID, turnID, trig)
+}
+
+// endProcessingTurnThroughEngine is endTurnThroughEngine's last step alone,
+// for a turn already processing: the terminal edge and OnTurnCompleted in
+// one transaction.
+func endProcessingTurnThroughEngine(ctx context.Context, t *testing.T, rig testRig, sessionID, turnID pgtype.UUID, trig turn.Trigger) {
+	t.Helper()
 	if err := inTx(ctx, t, rig, func(tx pgx.Tx) error {
 		transitionTurn(ctx, t, rig.turns.WithTx(tx), turnID, turn.StateProcessing, trig)
 		sessionRow, err := rig.sessions.WithTx(tx).Get(ctx, sessionID)
@@ -601,9 +610,11 @@ func TestGetSessionStatus_Gates(t *testing.T) {
 	// A custom workflow's run escalated by its failed turn gates the session
 	// while it is the latest thing that happened -- and no longer once any
 	// newer turn exists. The newer turn here starts no run of its own (as a
-	// plan's implementation turn, or a turn queued behind a running one,
-	// does not), so the escalated run stays the session's newest run
-	// throughout: it is the newer TURN that supersedes it.
+	// plan's implementation turn, or an automatic re-review turn the engine
+	// never tracks, does not), so the escalated run stays the session's
+	// newest run throughout: it is the newer TURN that supersedes it. A turn
+	// queued BEFORE the escalation that runs after it is
+	// TestGetSessionStatus_TurnQueuedBehindTheEscalatingTurnClosesItOnceItRuns.
 	// TestGetSessionStatus_EscalatedTurnNeverGatesForGood covers a follow-up
 	// that starts a run of its own, and the built-in workflow.
 	t.Run("a workflow run escalated for review, until a newer turn supersedes it", func(t *testing.T) {

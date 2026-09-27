@@ -20,7 +20,8 @@ func counts(pairs ...any) map[turn.State]int {
 
 // TestDeriveActivity_Table is table-driven over every combination
 // technical plan §43.20 names: the precedence (in flight, then pending,
-// then a human gate, then no turn at all, then finished), an unknown turn
+// then a delivery, then scheduled work, then a human gate, then no turn at
+// all, then finished), an unknown turn
 // state read as running, and -- the failure this exists to prevent -- a
 // non-empty queue never reading as idle or finished, whatever else the
 // snapshot holds. The input carries no session Status at all: the
@@ -59,6 +60,13 @@ func TestDeriveActivity_Table(t *testing.T) {
 		{"delivery under way + processing follow-up -> running", session.ActivityInput{TurnCounts: counts(turn.StateCompleted, 1, turn.StateProcessing, 1), PRDeliveryInProgress: true}, session.ActivityRunning},
 		{"delivery under way + unknown turn state -> running", session.ActivityInput{TurnCounts: counts(turn.StateCompleted, 1, turn.State("warming_up"), 1), PRDeliveryInProgress: true}, session.ActivityRunning},
 		{"no delivery, all terminal -> finished", session.ActivityInput{TurnCounts: counts(turn.StateCompleted, 1), PRDeliveryInProgress: false}, session.ActivityFinished},
+		{"completed, work armed to create a turn -> scheduled, never finished", session.ActivityInput{TurnCounts: counts(turn.StateCompleted, 1), ScheduledWork: true}, session.ActivityScheduled},
+		{"work armed on a session with no turn yet -> scheduled, not idle", session.ActivityInput{ScheduledWork: true}, session.ActivityScheduled},
+		{"work armed beside an open plan -> scheduled (the turn comes whatever the person does)", session.ActivityInput{TurnCounts: counts(turn.StateCompleted, 1), ScheduledWork: true, PlanAwaitingApproval: true}, session.ActivityScheduled},
+		{"work armed beside a step decision and an escalation -> scheduled", session.ActivityInput{TurnCounts: counts(turn.StateFailed, 1), ScheduledWork: true, WorkflowStepAwaitingDecision: true, WorkflowEscalationOpen: true}, session.ActivityScheduled},
+		{"work armed while a delivery is under way -> delivering", session.ActivityInput{TurnCounts: counts(turn.StateCompleted, 1), ScheduledWork: true, PRDeliveryInProgress: true}, session.ActivityDelivering},
+		{"work armed + pending turn -> queued", session.ActivityInput{TurnCounts: counts(turn.StateCompleted, 1, turn.StatePending, 1), ScheduledWork: true}, session.ActivityQueued},
+		{"work armed + processing turn -> running", session.ActivityInput{TurnCounts: counts(turn.StateProcessing, 1), ScheduledWork: true}, session.ActivityRunning},
 		{"unknown turn state -> running", session.ActivityInput{TurnCounts: counts(turn.State("warming_up"), 1)}, session.ActivityRunning},
 		{"unknown turn state among terminal ones -> running, never finished", session.ActivityInput{TurnCounts: counts(turn.StateCompleted, 4, turn.State("warming_up"), 1)}, session.ActivityRunning},
 		{"unknown turn state with a plan awaiting -> running", session.ActivityInput{TurnCounts: counts(turn.State(""), 1), PlanAwaitingApproval: true}, session.ActivityRunning},
@@ -74,8 +82,9 @@ func TestDeriveActivity_Table(t *testing.T) {
 	}
 }
 
-// TestDeriveActivity_NonEmptyQueueNeverIdleOrFinished sweeps every gate
-// combination under every non-empty queue shape: a pending, dispatched,
+// TestDeriveActivity_NonEmptyQueueNeverIdleOrFinished sweeps every gate,
+// delivery and scheduled-work combination under every non-empty queue
+// shape: a pending, dispatched,
 // processing or unknown-state turn, with or without terminal turns beside
 // it, must never read idle, finished or awaiting approval -- the row's own
 // "a non-empty queue must never render as idle".
@@ -85,13 +94,14 @@ func TestDeriveActivity_NonEmptyQueueNeverIdleOrFinished(t *testing.T) {
 	live := []turn.State{turn.StatePending, turn.StateDispatched, turn.StateProcessing, turn.State("unknown")}
 	for _, state := range live {
 		for _, terminal := range []int{0, 1, 5} {
-			for gates := 0; gates < 16; gates++ {
+			for gates := 0; gates < 32; gates++ {
 				in := session.ActivityInput{
 					TurnCounts:                   counts(state, 1, turn.StateCompleted, terminal),
 					PlanAwaitingApproval:         gates&1 != 0,
 					WorkflowStepAwaitingDecision: gates&2 != 0,
 					WorkflowEscalationOpen:       gates&4 != 0,
 					PRDeliveryInProgress:         gates&8 != 0,
+					ScheduledWork:                gates&16 != 0,
 				}
 				got := session.DeriveActivity(in)
 				if got != session.ActivityQueued && got != session.ActivityRunning {
@@ -100,6 +110,30 @@ func TestDeriveActivity_NonEmptyQueueNeverIdleOrFinished(t *testing.T) {
 				if got.Settled() {
 					t.Errorf("DeriveActivity(%+v) = %q reads settled", in, got)
 				}
+			}
+		}
+	}
+}
+
+// TestDeriveActivity_ScheduledWorkNeverSettled: whatever else the
+// snapshot holds -- any gate, any history of terminal turns, or none --
+// armed work that can create a turn never reads settled (technical plan
+// §43.20, review round 3's P1: a session told "settled, come back in five
+// minutes" must not start a turn meanwhile with no new input).
+func TestDeriveActivity_ScheduledWorkNeverSettled(t *testing.T) {
+	t.Parallel()
+
+	for _, terminal := range []int{0, 1, 5} {
+		for gates := 0; gates < 8; gates++ {
+			in := session.ActivityInput{
+				TurnCounts:                   counts(turn.StateCompleted, terminal),
+				PlanAwaitingApproval:         gates&1 != 0,
+				WorkflowStepAwaitingDecision: gates&2 != 0,
+				WorkflowEscalationOpen:       gates&4 != 0,
+				ScheduledWork:                true,
+			}
+			if got := session.DeriveActivity(in); got != session.ActivityScheduled || got.Settled() {
+				t.Errorf("DeriveActivity(%+v) = %q (settled %v), want scheduled, never settled", in, got, got.Settled())
 			}
 		}
 	}
@@ -118,6 +152,7 @@ func TestActivity_Settled(t *testing.T) {
 		{session.ActivityQueued, false},
 		{session.ActivityRunning, false},
 		{session.ActivityDelivering, false},
+		{session.ActivityScheduled, false},
 		{session.Activity("something_new"), false},
 		{session.Activity(""), false},
 	} {
@@ -130,14 +165,16 @@ func TestActivity_Settled(t *testing.T) {
 // shippedTable mirrors the shipped defaults (platform.DefaultTimeouts's
 // MCPStatusDelay* fields) without importing platform.
 var shippedTable = session.DelayTable{
-	Starting:      15 * time.Second,
-	Queued:        5 * time.Second,
-	Running:       10 * time.Second,
-	Delivering:    5 * time.Second,
-	AwaitingHuman: 60 * time.Second,
-	Settled:       300 * time.Second,
-	Floor:         2 * time.Second,
-	Ceiling:       300 * time.Second,
+	Starting:        15 * time.Second,
+	Queued:          5 * time.Second,
+	Running:         10 * time.Second,
+	Delivering:      5 * time.Second,
+	Scheduled:       15 * time.Second,
+	ScheduledMargin: 5 * time.Second,
+	AwaitingHuman:   60 * time.Second,
+	Settled:         300 * time.Second,
+	Floor:           2 * time.Second,
+	Ceiling:         300 * time.Second,
 }
 
 func sandboxState(s sandbox.State) *sandbox.State { return &s }
@@ -149,33 +186,40 @@ func TestSuggestedReadDelay_Table(t *testing.T) {
 		name    string
 		a       session.Activity
 		sandbox *sandbox.State
+		dueIn   time.Duration
 		want    time.Duration
 	}{
-		{"queued, no sandbox yet -> starting", session.ActivityQueued, nil, 15 * time.Second},
-		{"queued, sandbox pending -> starting", session.ActivityQueued, sandboxState(sandbox.StatePending), 15 * time.Second},
-		{"queued, sandbox spawning -> starting", session.ActivityQueued, sandboxState(sandbox.StateSpawning), 15 * time.Second},
-		{"queued, sandbox connecting -> starting", session.ActivityQueued, sandboxState(sandbox.StateConnecting), 15 * time.Second},
-		{"queued, sandbox booting -> starting", session.ActivityQueued, sandboxState(sandbox.StateBooting), 15 * time.Second},
-		{"queued, sandbox stopped (respawn ahead) -> starting", session.ActivityQueued, sandboxState(sandbox.StateStopped), 15 * time.Second},
-		{"queued, sandbox failed (respawn ahead) -> starting", session.ActivityQueued, sandboxState(sandbox.StateFailed), 15 * time.Second},
-		{"queued, sandbox suspect -> starting", session.ActivityQueued, sandboxState(sandbox.StateSuspect), 15 * time.Second},
-		{"queued, unknown sandbox state -> starting", session.ActivityQueued, sandboxState(sandbox.State("new_state")), 15 * time.Second},
-		{"queued, sandbox ready -> queued", session.ActivityQueued, sandboxState(sandbox.StateReady), 5 * time.Second},
-		{"queued, sandbox snapshotting -> queued", session.ActivityQueued, sandboxState(sandbox.StateSnapshotting), 5 * time.Second},
-		{"running -> running", session.ActivityRunning, sandboxState(sandbox.StateReady), 10 * time.Second},
-		{"running, sandbox ignored -> running", session.ActivityRunning, nil, 10 * time.Second},
-		{"delivering -> delivering", session.ActivityDelivering, sandboxState(sandbox.StateSnapshotting), 5 * time.Second},
-		{"delivering, sandbox ignored -> delivering", session.ActivityDelivering, nil, 5 * time.Second},
-		{"awaiting approval -> human latency", session.ActivityAwaitingApproval, nil, 60 * time.Second},
-		{"finished -> settled", session.ActivityFinished, sandboxState(sandbox.StateStopped), 300 * time.Second},
-		{"idle -> settled", session.ActivityIdle, nil, 300 * time.Second},
-		{"unknown activity -> running, never settled", session.Activity("mystery"), nil, 10 * time.Second},
+		{"queued, no sandbox yet -> starting", session.ActivityQueued, nil, 0, 15 * time.Second},
+		{"queued, sandbox pending -> starting", session.ActivityQueued, sandboxState(sandbox.StatePending), 0, 15 * time.Second},
+		{"queued, sandbox spawning -> starting", session.ActivityQueued, sandboxState(sandbox.StateSpawning), 0, 15 * time.Second},
+		{"queued, sandbox connecting -> starting", session.ActivityQueued, sandboxState(sandbox.StateConnecting), 0, 15 * time.Second},
+		{"queued, sandbox booting -> starting", session.ActivityQueued, sandboxState(sandbox.StateBooting), 0, 15 * time.Second},
+		{"queued, sandbox stopped (respawn ahead) -> starting", session.ActivityQueued, sandboxState(sandbox.StateStopped), 0, 15 * time.Second},
+		{"queued, sandbox failed (respawn ahead) -> starting", session.ActivityQueued, sandboxState(sandbox.StateFailed), 0, 15 * time.Second},
+		{"queued, sandbox suspect -> starting", session.ActivityQueued, sandboxState(sandbox.StateSuspect), 0, 15 * time.Second},
+		{"queued, unknown sandbox state -> starting", session.ActivityQueued, sandboxState(sandbox.State("new_state")), 0, 15 * time.Second},
+		{"queued, sandbox ready -> queued", session.ActivityQueued, sandboxState(sandbox.StateReady), 0, 5 * time.Second},
+		{"queued, sandbox snapshotting -> queued", session.ActivityQueued, sandboxState(sandbox.StateSnapshotting), 0, 5 * time.Second},
+		{"running -> running", session.ActivityRunning, sandboxState(sandbox.StateReady), 0, 10 * time.Second},
+		{"running, sandbox ignored -> running", session.ActivityRunning, nil, 0, 10 * time.Second},
+		{"delivering -> delivering", session.ActivityDelivering, sandboxState(sandbox.StateSnapshotting), 0, 5 * time.Second},
+		{"delivering, sandbox ignored -> delivering", session.ActivityDelivering, nil, 0, 5 * time.Second},
+		{"awaiting approval -> human latency", session.ActivityAwaitingApproval, nil, 0, 60 * time.Second},
+		{"finished -> settled", session.ActivityFinished, sandboxState(sandbox.StateStopped), 0, 300 * time.Second},
+		{"idle -> settled", session.ActivityIdle, nil, 0, 300 * time.Second},
+		{"unknown activity -> running, never settled", session.Activity("mystery"), nil, 0, 10 * time.Second},
+		{"scheduled, due far off -> the scheduled cap", session.ActivityScheduled, nil, 2 * time.Minute, 15 * time.Second},
+		{"scheduled, due in 4s -> due plus the margin", session.ActivityScheduled, nil, 4 * time.Second, 9 * time.Second},
+		{"scheduled, due now -> the margin", session.ActivityScheduled, sandboxState(sandbox.StateReady), 0, 5 * time.Second},
+		{"scheduled, overdue -> the margin, never less", session.ActivityScheduled, nil, -time.Minute, 5 * time.Second},
+		{"scheduled, due exactly at cap minus margin -> the cap", session.ActivityScheduled, nil, 10 * time.Second, 15 * time.Second},
+		{"not scheduled: dueIn ignored", session.ActivityFinished, nil, time.Second, 300 * time.Second},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := session.SuggestedReadDelay(tc.a, tc.sandbox, shippedTable); got != tc.want {
-				t.Fatalf("SuggestedReadDelay(%q, %v) = %v, want %v", tc.a, tc.sandbox, got, tc.want)
+			if got := session.SuggestedReadDelay(tc.a, tc.sandbox, tc.dueIn, shippedTable); got != tc.want {
+				t.Fatalf("SuggestedReadDelay(%q, %v, %v) = %v, want %v", tc.a, tc.sandbox, tc.dueIn, got, tc.want)
 			}
 		})
 	}
@@ -190,19 +234,22 @@ func TestSuggestedReadDelay_AlwaysWithinBounds(t *testing.T) {
 	t.Parallel()
 
 	wild := session.DelayTable{
-		Starting:      time.Hour,        // above the ceiling
-		Queued:        time.Millisecond, // below the floor
-		Running:       0,                // below the floor
-		Delivering:    10 * time.Minute, // above the ceiling
-		AwaitingHuman: 45 * time.Second, // inside
-		Settled:       24 * time.Hour,   // above the ceiling
-		Floor:         3 * time.Second,
-		Ceiling:       120 * time.Second,
+		Starting:        time.Hour,        // above the ceiling
+		Queued:          time.Millisecond, // below the floor
+		Running:         0,                // below the floor
+		Delivering:      10 * time.Minute, // above the ceiling
+		Scheduled:       time.Hour,        // above the ceiling
+		ScheduledMargin: 0,                // bound below the floor once due
+		AwaitingHuman:   45 * time.Second, // inside
+		Settled:         24 * time.Hour,   // above the ceiling
+		Floor:           3 * time.Second,
+		Ceiling:         120 * time.Second,
 	}
 	activities := []session.Activity{
 		session.ActivityIdle, session.ActivityQueued, session.ActivityRunning, session.ActivityDelivering,
-		session.ActivityAwaitingApproval, session.ActivityFinished, session.Activity("unknown"),
+		session.ActivityScheduled, session.ActivityAwaitingApproval, session.ActivityFinished, session.Activity("unknown"),
 	}
+	dues := []time.Duration{-time.Hour, 0, time.Second, time.Minute, 24 * time.Hour}
 	sandboxes := []*sandbox.State{nil}
 	for _, s := range []sandbox.State{
 		sandbox.StatePending, sandbox.StateSpawning, sandbox.StateConnecting, sandbox.StateBooting,
@@ -213,26 +260,32 @@ func TestSuggestedReadDelay_AlwaysWithinBounds(t *testing.T) {
 	}
 	for _, a := range activities {
 		for _, sb := range sandboxes {
-			got := session.SuggestedReadDelay(a, sb, wild)
-			if got < wild.Floor || got > wild.Ceiling {
-				t.Errorf("SuggestedReadDelay(%q, %v) = %v, outside [%v, %v]", a, sb, got, wild.Floor, wild.Ceiling)
+			for _, due := range dues {
+				got := session.SuggestedReadDelay(a, sb, due, wild)
+				if got < wild.Floor || got > wild.Ceiling {
+					t.Errorf("SuggestedReadDelay(%q, %v, %v) = %v, outside [%v, %v]", a, sb, due, got, wild.Floor, wild.Ceiling)
+				}
 			}
 		}
 	}
 	for _, tc := range []struct {
 		a    session.Activity
 		sb   *sandbox.State
+		due  time.Duration
 		want time.Duration
 	}{
-		{session.ActivityQueued, nil, wild.Ceiling},
-		{session.ActivityQueued, sandboxState(sandbox.StateReady), wild.Floor},
-		{session.ActivityRunning, nil, wild.Floor},
-		{session.ActivityDelivering, nil, wild.Ceiling},
-		{session.ActivityAwaitingApproval, nil, 45 * time.Second},
-		{session.ActivityFinished, nil, wild.Ceiling},
+		{session.ActivityQueued, nil, 0, wild.Ceiling},
+		{session.ActivityQueued, sandboxState(sandbox.StateReady), 0, wild.Floor},
+		{session.ActivityRunning, nil, 0, wild.Floor},
+		{session.ActivityDelivering, nil, 0, wild.Ceiling},
+		{session.ActivityScheduled, nil, 24 * time.Hour, wild.Ceiling},
+		{session.ActivityScheduled, nil, 0, wild.Floor},
+		{session.ActivityScheduled, nil, time.Minute, time.Minute},
+		{session.ActivityAwaitingApproval, nil, 0, 45 * time.Second},
+		{session.ActivityFinished, nil, 0, wild.Ceiling},
 	} {
-		if got := session.SuggestedReadDelay(tc.a, tc.sb, wild); got != tc.want {
-			t.Errorf("SuggestedReadDelay(%q, %v) = %v, want %v", tc.a, tc.sb, got, tc.want)
+		if got := session.SuggestedReadDelay(tc.a, tc.sb, tc.due, wild); got != tc.want {
+			t.Errorf("SuggestedReadDelay(%q, %v, %v) = %v, want %v", tc.a, tc.sb, tc.due, got, tc.want)
 		}
 	}
 }
@@ -271,6 +324,11 @@ func TestPRDeliveryOpen_Table(t *testing.T) {
 			t.Parallel()
 			if got := session.PRDeliveryOpen(tc.started, observed, tc.window); got != tc.want {
 				t.Fatalf("PRDeliveryOpen(%v, %v, %v) = %v, want %v", tc.started, observed, tc.window, got, tc.want)
+			}
+			// A release manifest check a worker claimed is bounded by the
+			// same rule: a claim whose worker died stops counting.
+			if got := session.ClaimedWorkOpen(tc.started, observed, tc.window); got != tc.want {
+				t.Fatalf("ClaimedWorkOpen(%v, %v, %v) = %v, want %v", tc.started, observed, tc.window, got, tc.want)
 			}
 		})
 	}

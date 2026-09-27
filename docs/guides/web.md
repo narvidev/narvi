@@ -119,14 +119,29 @@ starts, so it does not tell you whether the session is busy: a turn can
 wait and run under any of those five values. The status route answers
 that instead. Its `activity` is `queued` (a turn waits, including while a
 sandbox starts), `running`, `delivering` (the last turn is done, and its
-branch is being pushed and its pull request opened — `finished` follows
-once the pull request is listed, or once the push fails),
-`awaiting_approval` (nothing queued, running or being delivered, and a
-plan or a workflow step waits for a person, or a custom workflow stopped
-and handed its run to a person — until the session gets a new turn),
-`idle` (no turn yet) or `finished` — a queued or running turn is never
-reported as idle or finished, and `settled` is true only for `idle`,
-`awaiting_approval` and `finished`. It also says how many turns
+branch is being pushed and its pull request opened), `scheduled` (nothing
+queued, running or being delivered, but the server will start a turn on
+its own: an automatic re-review after a push to the pull request — armed
+on every push, then dropped when it fires if the repository has not opted
+in — or a release pull request's manifest check, which can add a
+composition review), `awaiting_approval` (nothing queued, running, being
+delivered or scheduled, and a plan or a workflow step waits for a person,
+or a custom workflow stopped and handed its run to a person — until a
+turn is created, or starts, on the session again), `idle` (no turn yet)
+or `finished` — a queued or running turn is never reported as idle or
+finished, and `settled` is true only for `idle`, `awaiting_approval` and
+`finished`.
+
+A pull request that a delivery opens is listed before `delivering` ends,
+except when two pushes overlap: a sandbox tracks one delivery at a time,
+so if a later turn finishes before an earlier turn's push has reported
+back, the earlier push's pull request ends the later delivery, and the
+later pull request can appear after `finished`. `delivering` can also end
+with no pull request at all: the push failed or could not be sent, the
+pull request could not be opened (its creator can no longer open one,
+their GitHub token no longer works, or GitHub refused it), or ten minutes
+passed with no word from the push. So `finished` with no pull request and
+no failed push does not mean one is listed. It also says how many turns
 wait, which turn is running, what waits for a person and since when, how
 the last finished turn ended, and `suggestedDelaySeconds`: how long to
 wait before asking again (2 to 300 seconds). It never carries the

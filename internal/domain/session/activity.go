@@ -18,7 +18,7 @@ import (
 // person?" that Status cannot give.
 type Activity string
 
-// The six Activity values, in the precedence DeriveActivity applies.
+// The seven Activity values, in the precedence DeriveActivity applies.
 const (
 	// ActivityRunning: a turn is dispatched or processing (or in a state
 	// the turn machine does not know).
@@ -32,24 +32,31 @@ const (
 	// pull request opened (ActivityInput.PRDeliveryInProgress). That work
 	// ends on its own, with no new input, so it is never settled.
 	ActivityDelivering Activity = "delivering"
+	// ActivityScheduled: no turn is queued or running and nothing is being
+	// delivered, but the server holds work that can create a turn on this
+	// session with no new input (ActivityInput.ScheduledWork) -- an armed
+	// timer of a kind that can create one, or a release manifest check not
+	// yet done. When it comes due it either creates that turn or declines;
+	// either way no person has to act first, so it is never settled.
+	ActivityScheduled Activity = "scheduled"
 	// ActivityAwaitingApproval: no turn is queued, running or being
-	// delivered, and a person must act: a plan awaits approval, a workflow
-	// step awaits a decision, or a workflow escalation is still open
-	// (ActivityInput.WorkflowEscalationOpen).
+	// delivered, nothing is scheduled, and a person must act: a plan awaits
+	// approval, a workflow step awaits a decision, or a workflow escalation
+	// is still open (ActivityInput.WorkflowEscalationOpen).
 	ActivityAwaitingApproval Activity = "awaiting_approval"
 	// ActivityIdle: the session has no turn at all (created without a
 	// prompt) and nothing awaits a person.
 	ActivityIdle Activity = "idle"
 	// ActivityFinished: at least one turn, every one of them terminal, no
-	// delivery under way, and nothing awaits a person.
+	// delivery under way, nothing scheduled, and nothing awaits a person.
 	ActivityFinished Activity = "finished"
 )
 
 // Settled reports whether nothing progresses server-side without new input
-// from a person: finished, idle, or awaiting approval. Queued, running and
-// delivering are never settled, and neither is a value this package does
-// not define (an allow-list, so an unknown value reads as work still going
-// on).
+// from a person: finished, idle, or awaiting approval. Queued, running,
+// delivering and scheduled are never settled, and neither is a value this
+// package does not define (an allow-list, so an unknown value reads as work
+// still going on).
 func (a Activity) Settled() bool {
 	switch a {
 	case ActivityFinished, ActivityIdle, ActivityAwaitingApproval:
@@ -86,6 +93,13 @@ type ActivityInput struct {
 	// sandbox's delivery stamp, read through PRDeliveryOpen so that a push
 	// that never reports back stops counting once the window has passed.
 	PRDeliveryInProgress bool
+	// ScheduledWork: the server holds work, armed in this same snapshot,
+	// that can create a turn on this session with no new input and has
+	// neither created it nor declined yet (technical plan §43.20's
+	// inventory: a timer whose kind can create a turn, a release manifest
+	// check still to come or still running). Which armed work counts is
+	// the caller's decision; this package only orders it.
+	ScheduledWork bool
 }
 
 // PRDeliveryOpen reports whether a push/PR delivery stamped at startedAt
@@ -98,10 +112,25 @@ type ActivityInput struct {
 // counts nothing. Both instants must come from the same clock (the
 // database's, in GetSessionActivityFacts).
 func PRDeliveryOpen(startedAt, observedAt time.Time, window time.Duration) bool {
-	if startedAt.IsZero() || window <= 0 {
+	return withinWindow(startedAt, observedAt, window)
+}
+
+// ClaimedWorkOpen reports whether work claimed at claimedAt -- a release
+// manifest check a worker took, whose worker may have died mid-run --
+// still counts as under way at observedAt: PRDeliveryOpen's rule, for the
+// same reason (a claim that never finishes must not hold a session
+// unsettled for good). Both instants must come from the same clock.
+func ClaimedWorkOpen(claimedAt, observedAt time.Time, window time.Duration) bool {
+	return withinWindow(claimedAt, observedAt, window)
+}
+
+// withinWindow: a non-zero start less than window away from observedAt, in
+// either direction; a non-positive window counts nothing.
+func withinWindow(start, observedAt time.Time, window time.Duration) bool {
+	if start.IsZero() || window <= 0 {
 		return false
 	}
-	d := observedAt.Sub(startedAt)
+	d := observedAt.Sub(start)
 	return d < window && d > -window
 }
 
@@ -113,15 +142,19 @@ func PRDeliveryOpen(startedAt, observedAt time.Time, window time.Duration) bool 
 //  2. else any turn pending -> Queued;
 //  3. else a completed turn's push and pull request still under way ->
 //     Delivering;
-//  4. else a plan awaiting approval, a workflow step awaiting a decision,
+//  4. else server-side work armed that can create a turn with no new
+//     input -> Scheduled;
+//  5. else a plan awaiting approval, a workflow step awaiting a decision,
 //     or an open workflow escalation -> AwaitingApproval;
-//  5. else no turn at all -> Idle;
-//  6. else (at least one turn, all terminal) -> Finished.
+//  6. else no turn at all -> Idle;
+//  7. else (at least one turn, all terminal) -> Finished.
 //
 // So a non-empty queue is always Queued or Running, never Idle or Finished,
-// whatever else the snapshot holds, and a delivery under way is never
-// settled: it outranks a gate, since the pull request it opens appears
-// whether or not a person acts. A non-positive count is ignored.
+// whatever else the snapshot holds, and neither a delivery under way nor
+// scheduled work is ever settled: each outranks a gate, since the pull
+// request or the turn it brings appears whether or not a person acts. A
+// delivery outranks scheduled work: it is under way now. A non-positive
+// count is ignored.
 func DeriveActivity(in ActivityInput) Activity {
 	var total, pending, inFlight int
 	for state, n := range in.TurnCounts {
@@ -145,6 +178,8 @@ func DeriveActivity(in ActivityInput) Activity {
 		return ActivityQueued
 	case in.PRDeliveryInProgress:
 		return ActivityDelivering
+	case in.ScheduledWork:
+		return ActivityScheduled
 	case in.PlanAwaitingApproval || in.WorkflowStepAwaitingDecision || in.WorkflowEscalationOpen:
 		return ActivityAwaitingApproval
 	case total == 0:
@@ -169,6 +204,14 @@ type DelayTable struct {
 	// Delivering: a completed turn's push and pull request are under way
 	// -- a git push and a few API calls, seconds.
 	Delivering time.Duration
+	// Scheduled: work that can create a turn is armed server-side -- the
+	// most a suggestion waits while it is, however far off it comes due.
+	Scheduled time.Duration
+	// ScheduledMargin: how long after scheduled work comes due its handler
+	// is given to act -- create the turn, or decline -- before a read that
+	// should see the result. The Scheduled suggestion never reaches past
+	// the work's due instant plus this margin.
+	ScheduledMargin time.Duration
 	// AwaitingHuman: a person must act; human latency.
 	AwaitingHuman time.Duration
 	// Settled: finished or idle; nothing changes without new input.
@@ -193,9 +236,15 @@ var warmSandboxStates = map[sandbox.State]bool{
 // this session's status again, from a small per-activity table, clamped to
 // [t.Floor, t.Ceiling]. sandboxState is the session's sandbox status in the
 // same snapshot, nil when it has no sandbox row; it only matters while the
-// session is Queued. An Activity this package does not define gets the
-// Running delay: it is never treated as settled.
-func SuggestedReadDelay(a Activity, sandboxState *sandbox.State, t DelayTable) time.Duration {
+// session is Queued. scheduledDueIn is how long until the earliest
+// scheduled work comes due, measured in the snapshot (zero or negative
+// once it is due); it only matters while the session is Scheduled, whose
+// suggestion is t.Scheduled but never past that instant plus
+// t.ScheduledMargin -- so a read at the suggested time sees the turn that
+// work created, or the settled state it left by declining. An Activity
+// this package does not define gets the Running delay: it is never treated
+// as settled.
+func SuggestedReadDelay(a Activity, sandboxState *sandbox.State, scheduledDueIn time.Duration, t DelayTable) time.Duration {
 	var d time.Duration
 	switch a {
 	case ActivityQueued:
@@ -206,6 +255,14 @@ func SuggestedReadDelay(a Activity, sandboxState *sandbox.State, t DelayTable) t
 		}
 	case ActivityDelivering:
 		d = t.Delivering
+	case ActivityScheduled:
+		d = t.Scheduled
+		if scheduledDueIn < 0 {
+			scheduledDueIn = 0
+		}
+		if bound := scheduledDueIn + t.ScheduledMargin; bound < d {
+			d = bound
+		}
 	case ActivityAwaitingApproval:
 		d = t.AwaitingHuman
 	case ActivityFinished, ActivityIdle:

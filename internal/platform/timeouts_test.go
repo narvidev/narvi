@@ -1858,6 +1858,7 @@ func TestTimeouts_Validate_MCPStatusDelay(t *testing.T) {
 		{"MCPStatusDelayQueued", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelayQueued }},
 		{"MCPStatusDelayRunning", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelayRunning }},
 		{"MCPStatusDelayDelivering", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelayDelivering }},
+		{"MCPStatusDelayScheduled", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelayScheduled }},
 		{"MCPStatusDelayAwaitingHuman", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelayAwaitingHuman }},
 		{"MCPStatusDelaySettled", func(to *platform.Timeouts) *time.Duration { return &to.MCPStatusDelaySettled }},
 	}
@@ -1907,6 +1908,17 @@ func TestTimeouts_Validate_MCPStatusDelay(t *testing.T) {
 			t.Fatalf("Validate() = %v, want MCPStatusDelayFloor refused as non-positive", err)
 		}
 	})
+	t.Run("a zero scheduled margin suggests reading before the handler has run", func(t *testing.T) {
+		t.Parallel()
+		for _, margin := range []time.Duration{0, -time.Second} {
+			to := platform.DefaultTimeouts()
+			to.MCPStatusScheduledMargin = margin
+			var pos *platform.TimeoutMustBePositiveError
+			if err := to.Validate(); !errors.As(err, &pos) || pos.Field != "MCPStatusScheduledMargin" {
+				t.Fatalf("margin %v: Validate() = %v, want MCPStatusScheduledMargin refused as non-positive", margin, err)
+			}
+		}
+	})
 	t.Run("a ceiling below the floor breaks a link", func(t *testing.T) {
 		t.Parallel()
 		to := platform.DefaultTimeouts()
@@ -1919,17 +1931,22 @@ func TestTimeouts_Validate_MCPStatusDelay(t *testing.T) {
 }
 
 // TestTimeouts_Validate_MCPStatusDeliveryWindow proves the bound on a
-// push/PR delivery (technical plan §43.20) stays above one repo's push and
-// pull request at their own limits, with MinTimeoutMargin: a window that
-// would let a slow but still-healthy delivery read finished before its
-// pull request appears is refused, by name, and so is a limit raised
-// beneath an unchanged window. Exactly on the margin is accepted.
+// push/PR delivery (technical plan §43.20) stays above one repo's whole
+// chain from the turn's completion at its own limits -- the snapshot mint
+// the push waits behind, the remote URL read, the push, the head sha read,
+// the branch sha resolution and the pull request -- with MinTimeoutMargin:
+// a window that would let a slow but still-healthy delivery read finished
+// before its pull request appears is refused, by name, and so is any one
+// of those limits raised beneath an unchanged window (review round 3's P5:
+// the snapshot mint was missing, so a 5-minute mint passed Validate with a
+// 10m45s chain against a 10-minute window). Exactly on the margin is
+// accepted.
 func TestTimeouts_Validate_MCPStatusDeliveryWindow(t *testing.T) {
 	t.Parallel()
 
-	const chain = "MCPStatusDeliveryWindow > RepoCloneTimeout + RepoSHAResolutionTimeout + PRCreateTimeout"
+	const chain = "MCPStatusDeliveryWindow > SnapshotMintTimeout + RepoSHADiscoveryTimeout + RepoCloneTimeout + RepoSHADiscoveryTimeout + RepoSHAResolutionTimeout + PRCreateTimeout"
 	inside := func(to platform.Timeouts) time.Duration {
-		return to.RepoCloneTimeout + to.RepoSHAResolutionTimeout + to.PRCreateTimeout
+		return to.SnapshotMintTimeout + 2*to.RepoSHADiscoveryTimeout + to.RepoCloneTimeout + to.RepoSHAResolutionTimeout + to.PRCreateTimeout
 	}
 	for _, tc := range []struct {
 		name   string
@@ -1944,6 +1961,16 @@ func TestTimeouts_Validate_MCPStatusDeliveryWindow(t *testing.T) {
 		{"a window shorter than one push", func(to *platform.Timeouts) { to.MCPStatusDeliveryWindow = time.Minute }, true},
 		{"a push limit raised beneath the window", func(to *platform.Timeouts) { to.RepoCloneTimeout = to.MCPStatusDeliveryWindow }, true},
 		{"a PR creation limit raised beneath the window", func(to *platform.Timeouts) { to.PRCreateTimeout = to.MCPStatusDeliveryWindow }, true},
+		{"the reviewers' case: a 5-minute snapshot mint the push waits behind", func(to *platform.Timeouts) { to.SnapshotMintTimeout = 5 * time.Minute }, true},
+		{"a snapshot mint limit raised to exactly fill the margin", func(to *platform.Timeouts) {
+			to.SnapshotMintTimeout += to.MCPStatusDeliveryWindow - inside(*to) - platform.MinTimeoutMargin + time.Millisecond
+		}, true},
+		{"a sha discovery limit raised beneath the window (counted twice: remote URL and pushed head)", func(to *platform.Timeouts) {
+			to.RepoSHADiscoveryTimeout += (to.MCPStatusDeliveryWindow-inside(*to)-platform.MinTimeoutMargin)/2 + time.Millisecond
+		}, true},
+		{"a sha resolution limit raised beneath the window", func(to *platform.Timeouts) {
+			to.RepoSHAResolutionTimeout += to.MCPStatusDeliveryWindow - inside(*to) - platform.MinTimeoutMargin + time.Millisecond
+		}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
