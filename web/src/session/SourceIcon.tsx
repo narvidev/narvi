@@ -3,7 +3,17 @@
 // unchanged) from docs/design/mockups.html's own .srcicon examples in the
 // Session view (web/slack/linear/github, lines ~664-690 at the time this
 // was extracted) -- never redrawn independently of the visual spec.
+//
+// Session.spawnSource is an OPEN enum (contracts/manifest.json's
+// openEnums), so a source this bundle does not know gets a neutral glyph
+// and a neutral tooltip (sourceLabel.ts) rather than an empty, untitled
+// slot. The neutral glyph is the one shape here that is not in the
+// mockups: they only draw the four known sources.
+import type { ComponentType } from 'react'
+
 import type { Session } from '@narvi/contracts/rest-dtos'
+
+import { isKnownSpawnSource, sourceTitle } from './sourceLabel'
 
 function WebGlobeIcon() {
   return (
@@ -48,21 +58,28 @@ function GithubOctocatIcon() {
   )
 }
 
-const SOURCE_LABELS: Record<Session['spawnSource'], string> = {
-  web: 'Started from the web app',
-  slack: 'Started from Slack',
-  linear: 'Started from Linear',
-  github: 'Started from GitHub',
+/** OtherSourceIcon is the neutral glyph for a source this bundle does not know: a dashed ring, claiming no product. */
+function OtherSourceIcon() {
+  return (
+    <svg width="11" height="11" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+      <circle cx="7" cy="7" r="5" stroke="currentColor" strokeWidth="1.1" strokeDasharray="2 1.6" />
+    </svg>
+  )
+}
+
+const SOURCE_GLYPHS: Record<Session['spawnSource'], ComponentType> = {
+  web: WebGlobeIcon,
+  slack: SlackBubbleIcon,
+  linear: LinearRectIcon,
+  github: GithubOctocatIcon,
 }
 
 /** SourceIcon renders the right glyph + an honest title tooltip for a session's spawnSource (decision 31) -- the ONE place this mapping is made, so the sidebar and the session header can never disagree on what icon a given source gets. */
-export function SourceIcon({ source }: { source: Session['spawnSource'] }) {
+export function SourceIcon({ source }: { source: Session['spawnSource'] | string }) {
+  const Glyph = isKnownSpawnSource(source) ? SOURCE_GLYPHS[source] : OtherSourceIcon
   return (
-    <span className="srcicon" title={SOURCE_LABELS[source]}>
-      {source === 'web' && <WebGlobeIcon />}
-      {source === 'slack' && <SlackBubbleIcon />}
-      {source === 'linear' && <LinearRectIcon />}
-      {source === 'github' && <GithubOctocatIcon />}
+    <span className="srcicon" title={sourceTitle(source)}>
+      <Glyph />
     </span>
   )
 }
