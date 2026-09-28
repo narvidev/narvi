@@ -429,7 +429,7 @@ The two-mode knowledge capability: approved-plan durability; the per-repository 
 The path from an emitted metric to a backend that can evaluate an alert on it: a config-gated OTLP exporter in `platform.SetupOTel`, and the relay that carries the four sandbox-emitted histograms out of the sandbox.
 *Exit: an alert defined on a control-plane instrument fires from a real backend rather than from a process's own stdout, which is what closes P6's own exit criterion above. Step 112 gates no phase.*
 
-**Phase 11 — Named gaps (Steps 113-131, and the rows appended since: 152-156, 160-161, 171-179, 189, 198-205)**
+**Phase 11 — Named gaps (Steps 113-131, and the rows appended since: 152-156, 160-161, 171-179, 189, 198-205, 216)**
 Real, non-speculative work that each shipping Step declared it was leaving out. A holding list until the owner chose to work it through in full, at which point it gained an execution order and a milestone like any other; the filing rule still governs what may enter it.
 *Exit: every row either shipped, or closed by a recorded decision saying why it will not be — never a silent omission.*
 
