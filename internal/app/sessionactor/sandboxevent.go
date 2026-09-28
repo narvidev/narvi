@@ -393,14 +393,16 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 		// A null phase from a gen with no evidence is absence of
 		// information, not boot completion. A fixed agent always shows
 		// evidence before it sends one, so in practice this is an agent
-		// built before the rule; one built before boot_timing, booting a
-		// repo with no service and no Docker, never shows any. §3.2's
-		// fallback (bootevidence.go) bounds that: once this gen has been
-		// Booting longer than BootEvidenceFallback -- longer than any boot
-		// such an agent can still be running -- with its heartbeats still
-		// arriving (this is one), its null phase is accepted after all.
-		// Before that the sandbox stays Booting, logged on each such
-		// heartbeat.
+		// built before the rule, booting a repo with no service and no
+		// Docker: one built before boot_timing never shows any, and one
+		// built since shows it only with the boot_duration that ends its
+		// boot. §3.2's fallback (bootevidence.go) bounds that: once this
+		// gen has been Booting longer than BootEvidenceFallback -- longer
+		// than any one-repo boot the older agent can still be running --
+		// with its heartbeats still arriving (this is one), its null phase
+		// is accepted after all, mid-boot when that boot is still running;
+		// bootevidence.go states who gets here, and when. Before that the
+		// sandbox stays Booting, logged on each such heartbeat.
 		nullPhaseIsCompletion := bootEvidenceSeen
 		if !bootEvidenceSeen && cmd.Type == "heartbeat" && cmd.LastBootPhase == nil && sandbox.State(row.Status) == sandbox.StateBooting {
 			bootingFor, err := a.unevidencedBootingFor(ctx, tx, row.Gen)

@@ -40,8 +40,35 @@
 // heartbeat, only after the bound. The heartbeat that finds the bound
 // passed is the one that moves the sandbox, so heartbeats are flowing by
 // construction. It is logged at WARN and counted
-// (sandbox_boot_evidence_fallback_total). A fixed agent never gets there:
-// it shows evidence before it can send a null phase.
+// (sandbox_boot_evidence_fallback_total).
+//
+// Who reaches the fallback, and when. Always a sandbox whose boot starts no
+// service and no Docker, since a service or dockerd reports a
+// boot_progress:
+//
+//   - An agent built before boot_timing existed (2026-08-20), at every such
+//     boot, once the bound has passed. If that boot is still running then
+//     -- several repos, each within the bound, together past it -- its null
+//     phase is read as completion mid-boot: an hour in, where a control
+//     plane without the rule read it at 30s.
+//   - An agent built from 2026-08-20 up to the fix (2026-09-28). Its only
+//     evidence is the successful boot_duration it sends once its boot
+//     sequence has returned, so it gets here whenever that boot_duration
+//     has not reached the control plane by the bound -- in practice, a
+//     boot still running then, read as complete mid-boot as above: several
+//     long repos, or, for an agent built from 2026-09-24 (b0bab4a, which
+//     added gitdir.Seed's steps to every sync), even one repo with every
+//     step at its timeout. The bound does not count that agent's steps
+//     (platform.Timeouts.PreEvidenceAgentBootCeiling). A boot_duration it
+//     did send is not lost on the way: it stays in the agent's buffer, and
+//     every reconnect replays it, until evicted at the 1000-entry cap,
+//     which a boot's own events do not reach. A failed boot never gets
+//     here: that agent exits on it, and its heartbeats stop.
+//   - A fixed agent does not: every connection it makes carries its boot's
+//     start phase ahead of its first null phase
+//     (wsbridge.Bridge.ReportBootStarted). Only a control plane that
+//     failed to record every one of those start phases could bring it
+//     here, and by then its boot has completed.
 
 package sessionactor
 
@@ -64,11 +91,13 @@ import (
 //   - "boot_progress": a named phase was reported. Every agent build keeps
 //     its tracked phase non-null from then until its boot completes.
 //   - "heartbeat" with a non-null lastBootPhase: the same, observed
-//     directly. A fixed agent sends one on every heartbeat of its boot, and
-//     the first heartbeat after its boot starts always carries the start
-//     phase, even when the boot has completed before the connection is up
-//     (wsbridge.Bridge.ReportBootStarted) -- so its own evidence never
-//     waits for the first 30s tick or depends on boot_timing.
+//     directly. A fixed agent sends one on every heartbeat of its boot, one
+//     as its boot starts, and one on every connection ahead of that
+//     connection's first null -- even when its boot has completed before
+//     the connection is up, or an earlier connection lost its frames in
+//     flight (wsbridge.Bridge.ReportBootStarted) -- so its evidence reaches
+//     the control plane ahead of its null phase, and never depends on
+//     boot_timing.
 //   - "boot_timing" for "boot_duration" with failed=false: the agent's own
 //     statement that its boot finished (§33.3), which covers a pre-fix
 //     agent booting a repo with no service to report a phase. The fixed

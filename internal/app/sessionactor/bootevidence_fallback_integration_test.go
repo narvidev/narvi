@@ -3,10 +3,13 @@
 // §3.2's boot-evidence fallback (bootevidence.go) against a real Postgres:
 // a generation that shows no boot evidence, Booting with its heartbeats
 // still arriving for longer than platform.Timeouts.BootEvidenceFallback,
-// has its null boot phase accepted as boot completion. Only a
-// sandbox-agent built before boot_timing existed, booting a repo with no
-// service and no Docker, sends that wire -- and every snapshot descended
-// from a sandbox it booted keeps sending it, restore after restore.
+// has its null boot phase accepted as boot completion. A sandbox-agent
+// built before boot_timing existed, booting a repo with no service and no
+// Docker, sends that wire for its whole boot -- and every snapshot
+// descended from a sandbox it booted keeps sending it, restore after
+// restore. One built from then up to the fix sends it until the
+// boot_duration that ends its boot, so a boot of it that outlasts the
+// bound gets here too.
 package sessionactor
 
 import (

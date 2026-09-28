@@ -167,11 +167,17 @@ type opsMetrics struct {
 	// showed no boot evidence, Booting past
 	// platform.Timeouts.BootEvidenceFallback with its heartbeats still
 	// arriving, whose null boot phase was then accepted as boot
-	// completion. Only a sandbox-agent built before boot_timing existed
-	// reaches it, so a non-zero rate says such agents are still booting --
-	// most likely from an old snapshot lineage -- and each of those boots
-	// held its first turn for the whole bound. Carries no attribute: which
-	// sandbox is in the WARN line logged with it.
+	// completion. Only a sandbox-agent built before the fix (2026-09-28),
+	// booting with no service and no Docker, reaches it: one built before
+	// boot_timing existed (2026-08-20) at every such boot, and one built
+	// since whenever its boot is still running at the bound -- its only
+	// evidence is the boot_duration that ends its boot -- which is then
+	// read as complete mid-boot (bootevidence.go). A non-zero rate says
+	// such agents are still booting, most likely from an old snapshot or
+	// repo image lineage: each of those boots held its first turn for the
+	// whole bound, and some may have had a turn dispatched before their
+	// boot ended. Carries no attribute: which sandbox is in the WARN line
+	// logged with it.
 	bootEvidenceFallback metric.Int64Counter
 }
 
@@ -282,7 +288,7 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 
 	bootEvidenceFallback, err := meter.Int64Counter(
 		"sandbox_boot_evidence_fallback_total",
-		metric.WithDescription("Count of every sandbox moved Booting -> Ready by §3.2's boot-evidence fallback: a generation that showed no boot evidence, Booting past platform.Timeouts.BootEvidenceFallback with its heartbeats still arriving, whose null boot phase was then accepted as boot completion. Only a sandbox-agent built before boot_timing existed (2026-08-20), booting a repo with no service and no Docker, reaches it -- typically restored from an old snapshot lineage -- and each such boot held its first turn for the whole bound."),
+		metric.WithDescription("Count of every sandbox moved Booting -> Ready by §3.2's boot-evidence fallback: a generation that showed no boot evidence, Booting past platform.Timeouts.BootEvidenceFallback with its heartbeats still arriving, whose null boot phase was then accepted as boot completion. Only a sandbox-agent built before the 2026-09-28 fix, booting with no service and no Docker, reaches it -- typically from an old snapshot or repo image lineage: one built before boot_timing existed (2026-08-20) at every such boot, holding its first turn for the whole bound; one built since whenever its boot is still running at the bound, which is then read as complete mid-boot."),
 		metric.WithUnit("{sandbox}"),
 	)
 	if err != nil {
