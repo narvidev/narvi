@@ -353,12 +353,14 @@ func serve(modules ...extension.Module) error {
 	// are read-only. An operator who pastes a broad App (or misconfigures
 	// its own permissions to include Contents: Read & write) into this
 	// slot must get a loud boot refusal, never a silent re-arming of every
-	// shadow sandbox on the first real mint.
+	// sandbox this App serves -- shadow sandboxes, build boots and every
+	// pull request review session -- on the first real mint.
 	//
 	// This client is used for the check ONLY and then discarded -- Build
 	// constructs its OWN githubAppClient (same constructor, same
 	// arguments) for the wiring that actually uses one (ScmCredentials'
-	// shadow branch, per its own doc comment). githubapp.New itself does
+	// read-only branch: a shadow sandbox, a build boot or a review
+	// session, per its own doc comment). githubapp.New itself does
 	// no I/O and holds no state a second construction could conflict
 	// with, so this is one extra allocation, not a second code path: the
 	// alternative -- threading a pre-built client into Build as a
