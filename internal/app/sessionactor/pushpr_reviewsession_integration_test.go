@@ -126,6 +126,12 @@ func createReviewPushFixtureCreator(ctx context.Context, t *testing.T, pool *pgx
 // without the github_pr_sessions row, and must push: it proves this harness
 // observes a push when one is sent, so the review rows' "none" is not an
 // artefact of the harness.
+//
+// Work in a review session is not dropped silently either: a turn that is
+// not a review attempt (a follow-up mention, a web prompt, a plan's
+// implementation) records exactly one session-visible warning saying the
+// session is read-only, so its changes are not pushed. A review attempt
+// records none.
 func TestCompleteProcessingTurn_ReviewSessionNeverPushes(t *testing.T) {
 	tests := []struct {
 		name string
@@ -135,13 +141,20 @@ func TestCompleteProcessingTurn_ReviewSessionNeverPushes(t *testing.T) {
 		// stays shadow, repo_settings' own default.
 		live bool
 		// linked: the creator has a linked GitHub identity with a token.
-		linked   bool
-		wantPush bool
+		linked bool
+		// reviewAttempt: the completing turn is a review attempt
+		// (turns.is_review_attempt).
+		reviewAttempt bool
+		wantPush      bool
+		// wantReadOnlyWarning: the completion records the review
+		// session's read-only warning, and no other warning.
+		wantReadOnlyWarning bool
 	}{
 		{name: "control: not a review session, live repository, linked creator", review: false, live: true, linked: true, wantPush: true},
-		{name: "review session, live repository, linked creator", review: true, live: true, linked: true},
-		{name: "review session, live repository, creator with no GitHub identity", review: true, live: true, linked: false},
-		{name: "review session, shadow repository, linked creator", review: true, live: false, linked: true},
+		{name: "review session, live repository, linked creator", review: true, live: true, linked: true, wantReadOnlyWarning: true},
+		{name: "review session, live repository, creator with no GitHub identity", review: true, live: true, linked: false, wantReadOnlyWarning: true},
+		{name: "review session, shadow repository, linked creator", review: true, live: false, linked: true, wantReadOnlyWarning: true},
+		{name: "review session, the turn is a review attempt: no warning", review: true, live: true, linked: true, reviewAttempt: true},
 	}
 	for i, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -177,7 +190,14 @@ func TestCompleteProcessingTurn_ReviewSessionNeverPushes(t *testing.T) {
 				t.Fatalf("create sandbox: %v", err)
 			}
 			turnStore := narvipg.NewTurnStore(pool)
-			processing := createProcessingTurn(ctx, t, turnStore, session.ID)
+			processing, err := turnStore.Create(ctx, sqlcgen.CreateTurnParams{
+				SessionID:       session.ID,
+				Status:          sqlcgen.TurnStatusProcessing,
+				IsReviewAttempt: tc.reviewAttempt,
+			})
+			if err != nil {
+				t.Fatalf("create processing turn: %v", err)
+			}
 
 			commander := &fakeSendCommander{}
 			r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, commander, nil, "", nil, testTokenEncryptionKey, "", nil, false)
@@ -240,10 +260,25 @@ func TestCompleteProcessingTurn_ReviewSessionNeverPushes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("list events: %v", err)
 			}
+			var warnings []sandboxws.Warning
 			for _, e := range events {
-				if e.Type == "warning" {
-					t.Errorf("a warning event was recorded (%s): no push was ever going to be attempted, so none was blocked", e.Payload)
+				if e.Type != "warning" {
+					continue
 				}
+				var w sandboxws.Warning
+				if err := json.Unmarshal(e.Payload, &w); err != nil {
+					t.Fatalf("decode warning event %s: %v", e.Payload, err)
+				}
+				warnings = append(warnings, w)
+			}
+			if !tc.wantReadOnlyWarning {
+				if len(warnings) != 0 {
+					t.Errorf("warnings = %+v, want none: a review attempt is what a review session is for", warnings)
+				}
+				return
+			}
+			if len(warnings) != 1 || warnings[0].Message != reviewSessionReadOnlyWarning || warnings[0].SessionId != session.ID.String() {
+				t.Fatalf("warnings = %+v, want exactly the read-only warning %q -- and never the push-blocked one: no push was ever going to be attempted", warnings, reviewSessionReadOnlyWarning)
 			}
 		})
 	}

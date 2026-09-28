@@ -135,6 +135,7 @@ func TestCompleteProcessingTurn_NoGitHubIdentity_BlocksPushAndRecordsWarning(t *
 // A review session never reaches this gate at all: completeProcessingTurn
 // returns before it, since a review session never pushes. That case --
 // including a review session whose creator has no linked GitHub identity,
-// which gets no push and no warning -- is covered by
+// which gets no push and never this push-blocked warning (only the
+// read-only one, when its turn is not a review attempt) -- is covered by
 // TestCompleteProcessingTurn_ReviewSessionNeverPushes
 // (pushpr_reviewsession_integration_test.go).

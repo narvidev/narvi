@@ -548,11 +548,25 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 	// handed a read-only credential (internal/adapters/inbound/httpapi's
 	// ScmCredentials), so this is not the only guard -- it is the one
 	// that keeps the control plane from asking.
+	//
+	// A turn here that is not a review attempt (turns.is_review_attempt
+	// false: a follow-up mention, a web prompt, a plan's implementation)
+	// may well have been asked to change code. Its end is not silent: it
+	// records a session-visible warning saying the session is a pull
+	// request review, read-only, so changes made in it are not pushed. A
+	// review attempt records nothing -- reviewing is exactly what it was
+	// for. A lookup failure fails the whole completion (rolled back, the
+	// event left unacked for redelivery): no push is ever sent on a guess.
 	review, err := a.isReviewSession(ctx, a.stores.githubPRSession.WithTx(tx))
 	if err != nil {
 		return nil, err
 	}
 	if review {
+		if !processing.IsReviewAttempt {
+			if err := a.recordSessionWarning(ctx, tx, int(sandboxRow.Gen), reviewSessionReadOnlyWarning); err != nil {
+				return nil, err
+			}
+		}
 		return nil, nil
 	}
 
@@ -720,19 +734,37 @@ func (a *Actor) pushBlockedByMissingGitHubIdentity(ctx context.Context, createdB
 // ever appends), with a freshly minted messageId (this event
 // originates here, it does not echo any wire message's own id).
 func (a *Actor) recordPushBlockedNoGitHubIdentity(ctx context.Context, tx pgx.Tx, gen int) error {
+	return a.recordSessionWarning(ctx, tx, gen, pushBlockedNoGitHubIdentityWarning)
+}
+
+// pushBlockedNoGitHubIdentityWarning is recordPushBlockedNoGitHubIdentity's
+// session-visible text.
+const pushBlockedNoGitHubIdentityWarning = "This session's creator has no linked GitHub account, so this push could not be authenticated. Sign in with GitHub (the ordinary GitHub sign-in) to link one, then retry."
+
+// reviewSessionReadOnlyWarning is what a pull request's review session
+// records when a turn that is not a review attempt completes in it
+// (completeProcessingTurn): the session is read-only, so whatever that
+// turn changed stays in the sandbox.
+const reviewSessionReadOnlyWarning = "This session is a pull request review, which is read-only: changes made in it are not pushed, and no pull request is opened for them."
+
+// recordSessionWarning appends one session-visible "warning" wire event
+// carrying message -- recordPushBlockedNoGitHubIdentity's own mechanism
+// (see its doc comment), shared so every warning this package originates
+// is built, appended and broadcast the same way.
+func (a *Actor) recordSessionWarning(ctx context.Context, tx pgx.Tx, gen int, message string) error {
 	msg := sandboxws.Warning{
 		Type:      "warning",
 		MessageId: uuid.NewString(),
 		SessionId: a.sessionID.String(),
 		Gen:       gen,
-		Message:   "This session's creator has no linked GitHub account, so this push could not be authenticated. Sign in with GitHub (the ordinary GitHub sign-in) to link one, then retry.",
+		Message:   message,
 	}
 	raw, err := json.Marshal(msg)
 	if err != nil {
-		return fmt.Errorf("sessionactor: marshal push-blocked warning event: %w", err)
+		return fmt.Errorf("sessionactor: marshal warning event: %w", err)
 	}
 	if _, err := a.appendRawEvent(ctx, tx, "warning", msg.MessageId, raw); err != nil {
-		return fmt.Errorf("sessionactor: append push-blocked warning event: %w", err)
+		return fmt.Errorf("sessionactor: append warning event: %w", err)
 	}
 	return nil
 }
