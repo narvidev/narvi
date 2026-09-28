@@ -43,7 +43,7 @@ export interface Session {
   failureReason: 'cancelled' | 'failed' | 'timeout' | 'never_started' | null;
   archived: boolean;
   /**
-   * Matches Postgres session_spawn_source exactly.
+   * Matches Postgres session_spawn_source exactly. An OPEN enum (manifest.json's openEnums): a consumer MUST tolerate a value it does not recognise.
    */
   spawnSource: 'web' | 'slack' | 'linear' | 'github';
   /**

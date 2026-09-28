@@ -11115,7 +11115,8 @@ type Session struct {
 	// verbatim), never from a second, potentially-stale read of this column.
 	SandboxStatus *SessionSandboxStatus `json:"sandboxStatus" yaml:"sandboxStatus" mapstructure:"sandboxStatus"`
 
-	// Matches Postgres session_spawn_source exactly.
+	// Matches Postgres session_spawn_source exactly. An OPEN enum (manifest.json's
+	// openEnums): a consumer MUST tolerate a value it does not recognise.
 	SpawnSource SessionSpawnSource `json:"spawnSource" yaml:"spawnSource" mapstructure:"spawnSource"`
 
 	// Matches Postgres session_status exactly: derived each time a turn reaches a
