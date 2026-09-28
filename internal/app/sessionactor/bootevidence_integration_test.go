@@ -113,7 +113,7 @@ func TestBootEvidence_NullPhaseMarksReadyOnlyAfterEvidence(t *testing.T) {
 		{name: "a git_sync: the boot is still running", before: []SandboxEvent{gitSyncEvent("gs", 1)}, wantReady: false},
 		{name: "a hook_rerun_duration: the boot is still running", before: []SandboxEvent{bootTimingEvent("bt", 1, "hook_rerun_duration", "false")}, wantReady: false},
 		{name: "a failed boot_duration", before: []SandboxEvent{bootTimingEvent("bt", 1, "boot_duration", "true")}, wantReady: false},
-		{name: "a successful boot_duration: a pre-fix agent with no service, after its boot", before: []SandboxEvent{bootTimingEvent("bt", 1, "boot_duration", "false")}, wantReady: true},
+		{name: "a successful boot_duration: a pre-fix agent with no service, after its boot sequence", before: []SandboxEvent{bootTimingEvent("bt", 1, "boot_duration", "false")}, wantReady: true},
 		{name: "a boot_progress: a service reported its phase", before: []SandboxEvent{bootProgressEvent("bp", 1, "web:starting")}, wantReady: true},
 		{name: "a heartbeat carrying a phase: a fixed agent mid-boot", before: []SandboxEvent{phaseHeartbeat("h-p", 1, "starting")}, wantReady: true},
 	}
@@ -196,6 +196,53 @@ func TestBootEvidence_ScopedToGeneration(t *testing.T) {
 	sendSandboxEventForTest(ctx, t, a, nullPhaseHeartbeat("g2-h2", 2))
 	if got := sandboxStatusNow(ctx, t, sandboxes, sessionID).Status; got != sqlcgen.SandboxStatusReady {
 		t.Fatalf("gen 2 after its own evidence: status = %s, want %s", got, sqlcgen.SandboxStatusReady)
+	}
+}
+
+// TestBootEvidence_StaleGenEventIsFencedOut is the other half of scoping
+// evidence to a generation: after a respawn, an evidence event from the
+// previous gen -- still in flight on the old connection, or replayed by
+// the old agent -- is fenced out per message before it can be recorded,
+// so it cannot become the new gen's evidence. The per-message gen fence is
+// the only thing that stops it: evidence is recorded against the row's
+// live gen, not the event's.
+func TestBootEvidence_StaleGenEventIsFencedOut(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+
+	for _, tc := range []struct {
+		name  string
+		stale SandboxEvent
+	}{
+		{name: "a boot_progress", stale: bootProgressEvent("g1-bp", 1, "web:ready")},
+		{name: "a heartbeat carrying a phase", stale: phaseHeartbeat("g1-hp", 1, "starting")},
+		{name: "a successful boot_duration", stale: bootTimingEvent("g1-bt", 1, "boot_duration", "false")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sessionID := createTestSession(ctx, t, pool)
+			_, a, sandboxes := newBootEvidenceActor(ctx, t, pool, sessionID, sqlcgen.SandboxStatusBooting)
+
+			if _, err := sandboxes.UpsertForSpawn(ctx, sqlcgen.UpsertSandboxForSpawnParams{SessionID: sessionID}); err != nil {
+				t.Fatalf("respawn: %v", err)
+			}
+			if _, err := sandboxes.UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{SessionID: sessionID, Status: sqlcgen.SandboxStatusConnecting}); err != nil {
+				t.Fatalf("move to connecting: %v", err)
+			}
+			sendSandboxEventForTest(ctx, t, a, readyEvent("g2-r", 2))
+
+			if outcome := sendSandboxEventForTest(ctx, t, a, tc.stale); outcome.Persisted {
+				t.Fatalf("stale gen-1 %s: Persisted = true, want false (fenced out)", tc.stale.Type)
+			}
+			sendSandboxEventForTest(ctx, t, a, nullPhaseHeartbeat("g2-h", 2))
+
+			row := sandboxStatusNow(ctx, t, sandboxes, sessionID)
+			if row.BootEvidenceGen != nil {
+				t.Errorf("boot_evidence_gen = %d, want NULL: gen 1's event is not gen 2's evidence", *row.BootEvidenceGen)
+			}
+			if row.Status != sqlcgen.SandboxStatusBooting {
+				t.Errorf("gen 2 status after its first null-phase heartbeat = %s, want %s", row.Status, sqlcgen.SandboxStatusBooting)
+			}
+		})
 	}
 }
 
