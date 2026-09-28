@@ -322,6 +322,19 @@ func TestConnectingDeadlineHandoff_ToLivenessCheck(t *testing.T) {
 		t.Fatalf("GetOrSpawn: %v", err)
 	}
 
+	// This gen's boot evidence (§3.2): the agent's own successful
+	// boot_duration, sent once its boot sequence has finished.
+	btRaw := json.RawMessage(`{"type":"boot_timing","messageId":"bt1","sessionId":"s","gen":1,"metric":"boot_duration","seconds":42,"failed":false}`)
+	btReply := make(chan SandboxEventOutcome, 1)
+	if err := a.Send(ctx, SandboxEvent{Type: "boot_timing", Gen: int(created.Gen), MessageID: "bt1", Raw: btRaw, Reply: btReply}); err != nil {
+		t.Fatalf("Send boot_timing: %v", err)
+	}
+	select {
+	case <-btReply:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for boot_timing outcome")
+	}
+
 	// The real Booting->Ready trigger (sandboxTransitionTrigger's own (b)
 	// mapping): this batch's fix arms liveness_check/inactivity in the
 	// SAME transact as this transition.

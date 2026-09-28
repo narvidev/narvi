@@ -221,6 +221,19 @@ SET status = $2,
 WHERE session_id = $1
 RETURNING *;
 
+-- name: MarkSandboxBootEvidence :exec
+-- Records that gen $2's boot has actually run (technical plan §3.2,
+-- migrations/000147_sandbox_boot_evidence_gen.up.sql): handleSandboxEvent
+-- (sandboxevent.go) calls it, in the transaction that stores the event, on
+-- the first event of a gen that is boot evidence. Guarded on gen so
+-- evidence can only ever be recorded for the gen that is live, never
+-- carried into the next one.
+UPDATE sandboxes
+SET boot_evidence_gen = gen,
+    updated_at = now()
+WHERE session_id = $1
+  AND gen = $2;
+
 -- name: ListLiveSandboxProviderIDs :many
 -- §5.3 ("reconciler + GC", §5.3): the reconciler's own "expected still
 -- alive" set -- the provider_id of every sandbox row currently in a LIVE

@@ -66,6 +66,13 @@ func (s *SandboxStore) RecoverFromSuspect(ctx context.Context, arg sqlcgen.Recov
 	return s.q.RecoverSandboxFromSuspect(ctx, arg)
 }
 
+// MarkBootEvidence records that gen's boot has actually run, when gen is
+// still the sandbox's live gen, and does nothing otherwise -- §3.2, see
+// MarkSandboxBootEvidence's own generated doc comment.
+func (s *SandboxStore) MarkBootEvidence(ctx context.Context, sessionID pgtype.UUID, gen int32) error {
+	return s.q.MarkSandboxBootEvidence(ctx, sqlcgen.MarkSandboxBootEvidenceParams{SessionID: sessionID, Gen: gen})
+}
+
 // UpsertForSpawn creates the sandbox row (if none exists) or bumps its gen
 // and resets it to spawning (if one already does) -- see
 // UpsertSandboxForSpawnParams' generated doc comment (§9.3, design

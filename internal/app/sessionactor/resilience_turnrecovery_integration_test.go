@@ -155,10 +155,10 @@ func TestResilience_KillSandboxMidTurn_SuspectGraceRespawnReenqueueSameConversat
 	}
 
 	// --- The new gen-2 sandbox connects and boots: "ready" (Connecting ->
-	// Booting), then a nil-lastBootPhase "heartbeat" (Booting -> Ready) --
-	// mirroring sandboxevent_integration_test.go's own identical two-event
-	// boot sequence. Each event's own post-commit block re-evaluates
-	// EnsureDispatched (sandboxevent.go's own established design). ---
+	// Booting), its boot_timing (gen 2's own boot evidence, §3.2), then a
+	// nil-lastBootPhase "heartbeat" (Booting -> Ready). Each event's own
+	// post-commit block re-evaluates EnsureDispatched (sandboxevent.go's
+	// own established design). ---
 	readyRaw := json.RawMessage(`{"type":"ready","messageId":"scenario2-ready","sessionId":"s","gen":2}`)
 	readyOutcome := sendSandboxEventForTest(ctx, t, a, SandboxEvent{
 		Type: "ready", Gen: 2, MessageID: "scenario2-ready", Raw: readyRaw,
@@ -171,6 +171,13 @@ func TestResilience_KillSandboxMidTurn_SuspectGraceRespawnReenqueueSameConversat
 		got, err := sandboxStore.Get(ctx, sessionID)
 		return err == nil && got.Status == sqlcgen.SandboxStatusBooting
 	})
+
+	btRaw := json.RawMessage(`{"type":"boot_timing","messageId":"scenario2-bt","sessionId":"s","gen":2,"metric":"boot_duration","seconds":42,"failed":false}`)
+	if btOutcome := sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "boot_timing", Gen: 2, MessageID: "scenario2-bt", Raw: btRaw,
+	}); !btOutcome.Persisted {
+		t.Fatal("boot_timing event: Persisted = false, want true")
+	}
 
 	hbRaw := json.RawMessage(`{"type":"heartbeat","messageId":"scenario2-hb","sessionId":"s","gen":2,"conversationId":null,"lastBootPhase":null}`)
 	hbOutcome := sendSandboxEventForTest(ctx, t, a, SandboxEvent{

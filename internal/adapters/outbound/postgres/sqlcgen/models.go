@@ -2329,6 +2329,7 @@ type Sandbox struct {
 	ImageDecisionReason           *ImageDecisionReason `json:"image_decision_reason"`
 	ImageDecisionFingerprint      *string              `json:"image_decision_fingerprint"`
 	PrDeliveryStartedAt           pgtype.Timestamptz   `json:"pr_delivery_started_at"`
+	BootEvidenceGen               *int32               `json:"boot_evidence_gen"`
 }
 
 type SandboxHistory struct {

@@ -1,0 +1,28 @@
+-- A sandbox moves Booting -> Ready on a heartbeat whose lastBootPhase is
+-- null, the sandbox-ws contract's "boot has completed" (technical plan
+-- §3.2, §6.1). A sandbox-agent built before 2026-09-28 sends that null
+-- from the moment it connects until its first service reports a phase:
+-- it dials before it clones, and the clone, the git-dir sync and the repo
+-- hooks report no phase at all. Its first heartbeat, 30s after connect,
+-- therefore marked the sandbox Ready while its boot was still running, and
+-- dispatch sent a turn to a workspace that was not there yet. A fixed
+-- agent never sends null before its boot has completed, but the agent is
+-- baked into the sandbox image, so every snapshot and repo image taken
+-- before the fix keeps running the old one against this control plane.
+--
+-- boot_evidence_gen is the gen for which this sandbox has shown that its
+-- boot actually ran: a boot_progress event, a heartbeat with a non-null
+-- lastBootPhase, or a boot_timing boot_duration with failed=false
+-- (internal/app/sessionactor's bootEvidence). A null phase is read as
+-- boot completion only when boot_evidence_gen = gen; before that it is
+-- absence of information. Storing the gen rather than a flag scopes the
+-- evidence to one generation with nothing to reset: UpsertSandboxForSpawn
+-- bumps gen, and the previous gen's evidence stops matching on its own.
+-- NULL means no evidence yet for any gen.
+--
+-- No backfill. The only rows that could need one are sandboxes Booting
+-- when this migration runs whose evidence event was already stored; their
+-- agent replays every best-effort event it still buffers on its next
+-- reconnect, which the deploy itself causes, and the evidence is recorded
+-- on a replayed event as on a first delivery.
+ALTER TABLE sandboxes ADD COLUMN boot_evidence_gen INTEGER;
