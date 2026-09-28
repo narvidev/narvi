@@ -113,6 +113,22 @@ SELECT EXISTS(
     WHERE session_id = $1 AND is_review_attempt = true AND created_at > $2
 ) AS has_newer_review_attempt;
 
+-- name: GetNewestReviewAttempt :one
+-- The newest genuine review attempt (is_review_attempt = true, the same
+-- gate ExistsNewerReviewAttempt and the review-check outbox apply) in
+-- sessionID's own turn history -- its id, state and creation time, never
+-- the prompt. Row 182's result (technical plan §43.20) reads a pull
+-- request's review state from it: in progress while it has not ended, not
+-- assessed once it has ended without ExistsReviewVerdictForAttempt, and
+-- assessed once it has posted. Ordered like GetLatestReviewVerdict orders
+-- attempts (the producing turn's created_at), id breaking an exact tie so
+-- the pick is reproducible. pgx.ErrNoRows means the session has run no
+-- review attempt at all.
+SELECT id, status, created_at FROM turns
+WHERE session_id = $1 AND is_review_attempt = true
+ORDER BY created_at DESC, id DESC
+LIMIT 1;
+
 -- name: UpdateTurnStatus :one
 -- Sets a turn's status, plus dispatched_at/completed_at/
 -- dispatched_sandbox_gen when the caller supplies one (sqlc.narg +

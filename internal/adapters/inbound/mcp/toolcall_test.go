@@ -621,6 +621,7 @@ func TestToolCall_ConcurrentFirstCalls_NoRace(t *testing.T) {
 		{"narvi_get_session", `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a"}`},
 		{"narvi_get_session_status", `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a"}`},
 		{"narvi_get_session_transcript", `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","cursor":"0","limit":10}`},
+		{"narvi_get_session_result", `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a"}`},
 	}
 
 	// Launched through errgroup.Group.Go, per technical plan §11 (no naked

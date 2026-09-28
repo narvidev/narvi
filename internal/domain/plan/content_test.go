@@ -277,3 +277,74 @@ func TestExtractContent(t *testing.T) {
 		})
 	}
 }
+
+// TestFinalText pins the one reader of a turn's final text without its
+// plan-specific placeholder: the text ExtractContent returns, and ok=false
+// exactly where ExtractContent would fall back -- so a session's result
+// summary (row 182) can say "no text" as null instead of the plan
+// placeholder, while reading the very same text.
+func TestFinalText(t *testing.T) {
+	tests := []struct {
+		name   string
+		events []ContentEvent
+		lower  *int64
+		upper  *int64
+		want   string
+		wantOK bool
+	}{
+		{name: "no events: nothing found", lower: i64(10)},
+		{
+			name: "only empty frames: nothing found",
+			events: []ContentEvent{
+				{ID: 12, Type: "token", MessageID: "prt_a", Text: ""},
+				{ID: 11, Type: "tool_call"},
+			},
+			lower: i64(10),
+		},
+		{
+			name: "outside the window only: nothing found",
+			events: []ContentEvent{
+				{ID: 30, Type: "token", MessageID: "prt_later", Text: "a later turn"},
+				{ID: 5, Type: "token", MessageID: "prt_earlier", Text: "an earlier turn"},
+			},
+			lower: i64(10), upper: i64(20),
+		},
+		{
+			// The newest row is an earlier part's replayed frame; the part
+			// that opened last is the turn's final text. A reader taking the
+			// newest row would answer "Narration, replayed.".
+			name: "the part that opened last, not the newest row",
+			events: []ContentEvent{
+				{ID: 16, Type: "token", MessageID: "prt_a", Text: "Narration, replayed."},
+				{ID: 15, Type: "token", MessageID: "prt_b", Text: "The final answer."},
+				{ID: 13, Type: "token", MessageID: "prt_b", Text: "The final"},
+				{ID: 12, Type: "token", MessageID: "prt_a", Text: "Narration"},
+			},
+			lower: i64(10),
+			want:  "The final answer.", wantOK: true,
+		},
+		{
+			name: "text equal to the plan placeholder is still found text",
+			events: []ContentEvent{
+				{ID: 11, Type: "token", MessageID: "prt_a", Text: ContentFallbackText},
+			},
+			lower: i64(10),
+			want:  ContentFallbackText, wantOK: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := FinalText(tt.events, tt.lower, tt.upper)
+			if got != tt.want || ok != tt.wantOK {
+				t.Errorf("FinalText() = (%q, %v), want (%q, %v)", got, ok, tt.want, tt.wantOK)
+			}
+			wantContent := tt.want
+			if !tt.wantOK {
+				wantContent = ContentFallbackText
+			}
+			if content := ExtractContent(tt.events, tt.lower, tt.upper); content != wantContent {
+				t.Errorf("ExtractContent() = %q, want FinalText's text or the placeholder, %q", content, wantContent)
+			}
+		})
+	}
+}

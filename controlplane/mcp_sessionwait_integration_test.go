@@ -51,12 +51,14 @@ import (
 )
 
 // waitTestTimeouts is liftEndpointBrakes (newOAuthRouterRig's reason) with
-// the wait in test time: a read every 100 ms, for at most five seconds.
-// Every other timeout is as shipped.
+// the wait in test time: a read every 100 ms, for at most five seconds. A
+// session result's live-read budget follows the wait bound down, since
+// Validate keeps it below. Every other timeout is as shipped.
 func waitTestTimeouts(to *platform.Timeouts) {
 	liftEndpointBrakes(to)
 	to.MCPWaitPollInterval = 100 * time.Millisecond
 	to.MCPWaitMaxDuration = 5 * time.Second
+	to.SessionResultLiveReadBudget = 4 * time.Second
 }
 
 // waitSeed writes session state through the stores, as the session actor

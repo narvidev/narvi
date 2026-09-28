@@ -6,10 +6,10 @@ import (
 	"fmt"
 
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/app/reviewfreshness"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/reposource"
-	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -555,6 +555,11 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		TouchedBlastRadius:                  touchedBlastRadius,
 		TouchedBlastRadiusKnown:             touchedBlastRadiusKnown,
 	}
+	// A session's result runs this probe's freshness half too
+	// (reviewfreshness.ProbeInput), so the two answer a verdict the record
+	// decides with the same reason
+	// (TestAssess_AgreesWithTheMergePathOnRecordDecidedVerdicts).
+	//
 	// ComputeEligibleWithAcceptance, never a bare probeReason != ReasonNone
 	// check: an applicable acceptance (accepted=true) can make eligible
 	// true while STILL reporting the waived Reason (ReasonNotShippableAuto/
@@ -566,244 +571,58 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	}
 
 	// The probe passed: on every criterion except base freshness, this PR
-	// clears the bar, so the live base-branch-tip resolution (and, if
-	// needed, the fast-forward-ancestry confirmation) now genuinely
-	// decides whether it stays eligible.
+	// clears the bar, so the live facts -- the base branch's live tip, the
+	// ancestor chain's, and, where either moved, whether it moved only
+	// forward -- now genuinely decide whether it stays eligible.
 	//
-	// CurrentBaseSHA (finding F1 (§21.1's amendment)) is deliberately NOT
-	// target.BaseSHA -- that field is GitHub's own per-PR CACHED
-	// `base.sha` snapshot (ports.OpenPR.BaseSHA's own doc comment),
-	// refreshed on GitHub's own schedule rather than on every push to the
-	// base branch, and verified against real GitHub PRs to lag by an
-	// unknown, sometimes month-scale margin. Comparing that cached field
-	// against ITSELF (the verdict side reads the identical field, via
-	// reviewcontext.Fetch's own pre-fix sourcing) detects nothing: the
-	// SHA half of the freshness gate would pass whether or not the base
-	// branch had actually moved. This calls the SAME ResolveBranchSHA a
-	// verdict's own context was anchored to (internal/app/reviewcontext.
-	// Fetch), so a genuine advance of the base branch's real tip between
-	// verdict-time and merge-time now surfaces as a real SHA mismatch --
-	// closing the exact hazard base_ref alone could never see: "whose
-	// parent moved beneath it."
+	// reviewfreshness.ReadLive reads those facts (row 182, §21.1b: a
+	// session's result reads them through the same function and compares
+	// them through the same autoapproval.CheckFreshness; the decision
+	// inbox's cached read model still assembles its own copy -- see the
+	// reviewfreshness package doc), and it
+	// makes exactly the calls this function used to make inline, in the
+	// same order, bounded by the same platform.Timeouts constants
+	// (DecisionInboxResolveBranchSHATimeout, DecisionInboxIsAncestorTimeout
+	// -- G4, fourth round, and E4, third round, bounded them): see its own
+	// doc comment for why each fact is resolved live (finding F1 for the
+	// base commit, round-10 finding B for the chain) and why an ancestry
+	// check runs only where it could change the answer (D3, round-11 A3).
 	//
-	// A resolution failure fails CLOSED, but (H2, fifth adversarial-review
-	// round) with its own dedicated, logged, early return immediately
-	// below -- never by silently blanking CurrentBaseSHA and letting
-	// execution fall through to autoapproval.ComputeEligible's own
-	// empty-base-sha guard (finding F2, ReasonBaseSHAUnknown), which is
-	// worded for a fact that was never recorded at all, not for a live
-	// lookup that failed just now.
-	//
-	// Bounded by platform.Timeouts.DecisionInboxResolveBranchSHATimeout
-	// (G4, fourth adversarial-review round): this call previously ran on
-	// the bare, unbounded ctx this function was handed -- the SAME
-	// unbounded-live-GitHub-call-on-the-merge-gate-action-path shape E4
-	// (third round) had already fixed for the IsAncestor call below, one
-	// call site over. See that field's own doc comment
-	// (platform/timeouts.go) for which call site(s) it bounds.
-	resolveCtx, cancel := context.WithTimeout(ctx, deps.Timeouts.DecisionInboxResolveBranchSHATimeout)
-	currentBaseSHA, _, resolveErr := sourceControl.ResolveBranchSHA(resolveCtx, ports.ResolveBranchSHASpec{
-		Owner:  target.Owner,
-		Repo:   target.Repo,
-		Branch: target.BaseRef,
-		Token:  token,
-	})
-	cancel()
-	if resolveErr != nil {
-		// H2 (fifth adversarial-review round): previously swallowed with
-		// no log, and currentBaseSHA fell through blank to
-		// ComputeEligible's own ReasonBaseSHAUnknown ("this pull request's
-		// base commit could not be established") -- a message written for
-		// a fact that was NEVER recorded (VerdictBaseSHA/CurrentBaseSHA
-		// never populated at all), not for a live lookup that simply
-		// failed just now, and therefore indistinguishable to whoever
-		// read it from a permanent refusal. Mirrors the IsAncestor
-		// failure a few lines below (E6, third round; ordering fixed G3,
-		// fourth round): logged, and returned EARLY with its own honest,
-		// distinctly-worded reason, never falling through to a reason
-		// that never mentions a live check failed at all. The probe above
-		// already confirmed every OTHER criterion passes, so a failure
-		// here really is the one and only thing standing between this PR
-		// and eligibility -- the same "try again shortly" honesty
-		// guarantee G3 established for the ancestor check below applies
-		// here too.
-		platform.Logger(ctx).Warn("decisioninbox: resolve base branch's live tip failed, refusing merge -- could not confirm the pull request's current base commit", "error", resolveErr, "repo_full_name", repoFullName, "pr_number", prNumber)
-		return false, "", reasonBaseCommitUnconfirmed, false, "", nil
-	}
-
-	// baseAdvancedWithoutRewrite (D3, second adversarial-review round;
-	// timeout/logging/message fixed, E4/E6, third round) tolerates an
-	// ORDINARY, unrelated merge landing on the base branch between review
-	// and merge -- "any unrelated merge to trunk permanently disqualifies
-	// a verdict" is the exact failure this closes. Only even attempted
-	// when it could possibly matter: the base ref is unchanged (a real
-	// retarget still refuses unconditionally, autoapproval.
-	// ComputeEligible's own doc comment) and the base sha genuinely
-	// differs on both sides (both non-empty, since an empty side already
-	// fails its own ReasonBaseSHAUnknown check regardless of this field).
-	// See autoapproval.BaseAdvancedWithoutRewrite's own doc comment
-	// (eligibility.go) for what a confirmed "yes" here actually
-	// establishes and what it does not -- corrected twice over (E2, then
-	// G1, fourth round) after two successive claims that this call's own
-	// "yes" provably bounds the fresh diff were shown false against real
-	// git; this call site deliberately never repeats either claim
-	// itself, so there is exactly one place left to keep correct.
-	//
-	// Bounded by platform.Timeouts.DecisionInboxIsAncestorTimeout (E4,
-	// third round): this call previously ran on the bare, unbounded ctx
-	// this function was handed -- an unbounded live GitHub call sitting
-	// on the merge-gate action path, the one place in this package that
-	// is NOT allowed to serve a stale/cached answer (this function's own
-	// top doc comment). SCMCache.IsAncestor's identical call
-	// (scmcache.go) already bounds itself with this SAME field; this call
-	// site was the one place that field's own doc comment claimed to
-	// cover but did not.
-	//
-	// A resolution failure is logged (E6, third round: this call
-	// previously swallowed ancestorErr with no log at all, unlike its
-	// read-model sibling in aggregate.go, which already logs) and returns
-	// EARLY with its own distinct, honest reason -- never falling through
-	// to ComputeEligible's generic ReasonBaseMoved, which reads "the pull
-	// request's base has changed since this verdict was produced" and
-	// would otherwise tell the caller a fact this function never actually
-	// established here: the base SHA genuinely did change (that part is
-	// confirmed, or this branch would not be reached at all), but
-	// whether that change was a safe, ordinary fast-forward or a genuine
-	// rewrite is exactly what this failed call could not determine.
-	// "The base changed" and "we could not check whether tolerating that
-	// change was safe" are different facts, and conflating them tells an
-	// operator retrying is pointless when it may well not be. Mirrors
-	// ReviewDecisionDegraded's own identical "a degraded read fails
-	// closed with a reason naming the degradation, not a fabricated
-	// verdict" precedent a few lines above in this same function.
-	//
-	// G3 (fourth adversarial-review round): unlike before this fix, the
-	// "try again shortly" reason returned below is now ALWAYS the honest
-	// one -- the probe above already confirmed every OTHER criterion
-	// passes, so a failure here really is the one and only thing
-	// standing between this PR and eligibility, never a transient
-	// message papering over some unrelated, permanent refusal (a
-	// needs-human label, a stale verdict, an already-red build, ...) the
-	// caller was never told about.
-	var baseAdvancedWithoutRewrite bool
-	if record.Context.BaseRef == target.BaseRef && record.Context.BaseSHA != "" && currentBaseSHA != "" && record.Context.BaseSHA != currentBaseSHA {
-		ancestorCtx, cancel := context.WithTimeout(ctx, deps.Timeouts.DecisionInboxIsAncestorTimeout)
-		confirmed, ancestorErr := sourceControl.IsAncestor(ancestorCtx, ports.IsAncestorSpec{
-			Owner:      target.Owner,
-			Repo:       target.Repo,
-			Ancestor:   record.Context.BaseSHA,
-			Descendant: currentBaseSHA,
-			Token:      token,
-		})
-		cancel()
-		if ancestorErr != nil {
-			platform.Logger(ctx).Warn("decisioninbox: resolve base-advanced-without-rewrite ancestry failed, refusing merge -- could not confirm whether the base's forward movement was safe to tolerate", "error", ancestorErr, "repo_full_name", repoFullName, "pr_number", prNumber)
+	// A live check that fails refuses the merge here, logged, with its own
+	// honest reason naming the check (H2, fifth round; E6, third round;
+	// round-11 A1; round-12 D1) -- never by letting a blank value fall
+	// through to a reason worded for a fact that was never recorded
+	// (ReasonBaseSHAUnknown), or to ReasonBaseMoved, which would tell the
+	// caller "the base changed" when what failed is whether tolerating
+	// that change was safe, or to a nil chain, indistinguishable once
+	// compared from "this PR was never in a stack at all". G3 (fourth
+	// round): the probe above already confirmed every OTHER criterion
+	// passes, so a failure here really is the one thing standing between
+	// this PR and eligibility, and "try again shortly" is always the
+	// honest thing to say.
+	live, failure := reviewfreshness.ReadLive(ctx, deps.Timeouts, sourceControl, token, target, record.Context)
+	if failure != nil {
+		switch failure.Step {
+		case reviewfreshness.StepResolveBase:
+			platform.Logger(ctx).Warn("decisioninbox: resolve base branch's live tip failed, refusing merge -- could not confirm the pull request's current base commit", "error", failure.Err, "repo_full_name", repoFullName, "pr_number", prNumber)
+			return false, "", reasonBaseCommitUnconfirmed, false, "", nil
+		case reviewfreshness.StepBaseAncestry:
+			platform.Logger(ctx).Warn("decisioninbox: resolve base-advanced-without-rewrite ancestry failed, refusing merge -- could not confirm whether the base's forward movement was safe to tolerate", "error", failure.Err, "repo_full_name", repoFullName, "pr_number", prNumber)
 			return false, "", "this pull request's base has changed since this verdict was produced, and whether that change was safe to tolerate could not be confirmed (a live check failed) -- try again shortly", false, "", nil
-		}
-		baseAdvancedWithoutRewrite = confirmed
-	}
-
-	// currentAncestorChain (round-10 finding B) mirrors currentBaseSHA's
-	// own identical "never the cached field, always a live resolution"
-	// discipline immediately above, one link further: target.AncestorChain
-	// (ports.OpenPR's own field) is GitHub's per-PR CACHED stack object,
-	// the exact shape finding F1 already proved stale-by-design for the
-	// immediate base -- comparing it against record.Context.AncestorChain
-	// (itself now ALSO live-resolved at review-context-fetch time,
-	// internal/app/reviewcontext.Fetch) would otherwise compare a live
-	// fact against a cached one, unequal by construction, exactly the
-	// hazard F1 closed for CurrentBaseSHA. §17.6 bounds this to AT MOST
-	// ONE link today, so this is at most one further live call -- the
-	// ref itself (a branch name) is trusted from the cached read, exactly
-	// like BaseRef is; only the SHA is re-resolved live.
-	//
-	// currentAncestorChain's own zero value (nil) is the correct answer
-	// ONLY when target.AncestorChain reports no link at all -- a
-	// CONFIRMED fact (this PR is not currently stacked, or sits at its
-	// own bottom). A live resolution that fails, OR one that succeeds
-	// with an empty sha (this production adapter's own ResolveBranchSHA
-	// never returns that combination, ports.SourceControl's own doc
-	// comment, but a defensive symmetric check costs nothing), is NEITHER
-	// of those things -- round-11 finding A1's own fix applies here
-	// exactly as it does at review-context-fetch time
-	// (internal/app/reviewcontext.Fetch): both now return EARLY with
-	// their own honest, distinctly-worded reason (mirroring the resolveErr
-	// early-return a few lines above this one, H2, fifth adversarial-
-	// review round) rather than letting currentAncestorChain fall through
-	// to nil, which the PREVIOUS version of this comment claimed was
-	// "never a link with a stale or empty SHA" as though that were a safe
-	// degradation -- it is not: a nil currentAncestorChain here is
-	// INDISTINGUISHABLE, once compared, from "this PR was never in a
-	// stack at all", so a genuinely-stacked PR whose live ancestor
-	// resolve merely failed just now could otherwise read as a clean,
-	// confirmed-empty match against a verdict recorded before it was ever
-	// stacked -- exactly the silent-match hole finding A1 closed one
-	// layer down.
-	//
-	// D1 (round-12 sweep): target.AncestorChain[0].Ref can ITSELF be
-	// empty -- the adapter's own degraded-stack-read case, where GitHub
-	// reported position > 1 (proving a link exists) but the stack's own
-	// base ref could not be decoded (ancestorChainFromDetailStack's own
-	// doc comment, listopenprs.go, now mirrors review.
-	// AncestorChainFromStack exactly). That is not "no link" (nil) and it
-	// is not a link this code can live-resolve (there is no ref to
-	// resolve against) -- refuse immediately, on the SAME honest reason
-	// the live-resolution-failed branch below gives for a KNOWN ref,
-	// rather than falling through to nil (the PREVIOUS version of this
-	// guard's Ref != "" clause did exactly that, collapsing this case
-	// into "this PR was never in a stack at all").
-	var currentAncestorChain []review.AncestorLink
-	if len(target.AncestorChain) > 0 && target.AncestorChain[0].Ref == "" {
-		platform.Logger(ctx).Warn("decisioninbox: ancestor chain link reported with no ref at all (a degraded stack read), refusing merge -- could not confirm the pull request's current ancestor chain", "repo_full_name", repoFullName, "pr_number", prNumber)
-		return false, "", "this pull request's ancestor chain could not be confirmed (a live check failed) -- try again shortly", false, "", nil
-	}
-	if len(target.AncestorChain) > 0 {
-		ancestorSHACtx, cancel := context.WithTimeout(ctx, deps.Timeouts.DecisionInboxResolveBranchSHATimeout)
-		liveAncestorSHA, _, liveAncestorErr := sourceControl.ResolveBranchSHA(ancestorSHACtx, ports.ResolveBranchSHASpec{
-			Owner:  target.Owner,
-			Repo:   target.Repo,
-			Branch: target.AncestorChain[0].Ref,
-			Token:  token,
-		})
-		cancel()
-		if liveAncestorErr != nil || liveAncestorSHA == "" {
-			platform.Logger(ctx).Warn("decisioninbox: resolve ancestor chain's own live tip failed, refusing merge -- could not confirm the pull request's current ancestor chain", "error", liveAncestorErr, "repo_full_name", repoFullName, "pr_number", prNumber)
+		case reviewfreshness.StepAncestorRefUnreadable:
+			platform.Logger(ctx).Warn("decisioninbox: ancestor chain link reported with no ref at all (a degraded stack read), refusing merge -- could not confirm the pull request's current ancestor chain", "repo_full_name", repoFullName, "pr_number", prNumber)
 			return false, "", "this pull request's ancestor chain could not be confirmed (a live check failed) -- try again shortly", false, "", nil
-		}
-		currentAncestorChain = []review.AncestorLink{{Ref: target.AncestorChain[0].Ref, SHA: liveAncestorSHA}}
-	}
-
-	// ancestorChainAdvancedWithoutRewrite (round-11 finding A3) mirrors
-	// baseAdvancedWithoutRewrite's own identical fast-forward tolerance,
-	// one link further out -- see autoapproval.
-	// EligibilityInput.AncestorChainAdvancedWithoutRewrite's own doc
-	// comment (eligibility.go) for what a confirmed "yes" here actually
-	// establishes and what residual it carries. Only even attempted when
-	// it could possibly matter: both sides report a link, that link's REF
-	// is unchanged (a real restructure still refuses unconditionally,
-	// ancestorChainEqual's own doc comment), and the sha genuinely
-	// differs on both sides (both non-empty, since an empty side already
-	// fails its own ReasonAncestorChainUnknown check regardless of this
-	// field).
-	var ancestorChainAdvancedWithoutRewrite bool
-	if len(record.Context.AncestorChain) > 0 && len(currentAncestorChain) > 0 &&
-		record.Context.AncestorChain[0].Ref == currentAncestorChain[0].Ref &&
-		record.Context.AncestorChain[0].SHA != "" && currentAncestorChain[0].SHA != "" &&
-		record.Context.AncestorChain[0].SHA != currentAncestorChain[0].SHA {
-		ancestorChainAncestorCtx, cancel := context.WithTimeout(ctx, deps.Timeouts.DecisionInboxIsAncestorTimeout)
-		confirmed, ancestorErr := sourceControl.IsAncestor(ancestorChainAncestorCtx, ports.IsAncestorSpec{
-			Owner:      target.Owner,
-			Repo:       target.Repo,
-			Ancestor:   record.Context.AncestorChain[0].SHA,
-			Descendant: currentAncestorChain[0].SHA,
-			Token:      token,
-		})
-		cancel()
-		if ancestorErr != nil {
-			platform.Logger(ctx).Warn("decisioninbox: resolve ancestor-chain-advanced-without-rewrite ancestry failed, refusing merge -- could not confirm whether the ancestor chain's forward movement was safe to tolerate", "error", ancestorErr, "repo_full_name", repoFullName, "pr_number", prNumber)
+		case reviewfreshness.StepResolveAncestor:
+			platform.Logger(ctx).Warn("decisioninbox: resolve ancestor chain's own live tip failed, refusing merge -- could not confirm the pull request's current ancestor chain", "error", failure.Err, "repo_full_name", repoFullName, "pr_number", prNumber)
+			return false, "", "this pull request's ancestor chain could not be confirmed (a live check failed) -- try again shortly", false, "", nil
+		case reviewfreshness.StepAncestorAncestry:
+			platform.Logger(ctx).Warn("decisioninbox: resolve ancestor-chain-advanced-without-rewrite ancestry failed, refusing merge -- could not confirm whether the ancestor chain's forward movement was safe to tolerate", "error", failure.Err, "repo_full_name", repoFullName, "pr_number", prNumber)
 			return false, "", "this pull request's ancestor chain has changed since this verdict was produced, and whether that change was safe to tolerate could not be confirmed (a live check failed) -- try again shortly", false, "", nil
+		default:
+			// Unreachable: ReadLive reports only the steps above. Fails
+			// closed, as an error, never as a pass.
+			return false, "", "", false, "", fmt.Errorf("decisioninbox: revalidate for merge: live freshness read failed at an unknown step %q: %w", failure.Step, failure.Err)
 		}
-		ancestorChainAdvancedWithoutRewrite = confirmed
 	}
 
 	// ComputeEligibleWithAcceptance, threading the SAME accepted this
@@ -829,12 +648,12 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		VerdictBaseSHA:                      record.Context.BaseSHA,
 		VerdictAncestorChain:                record.Context.AncestorChain,
 		VerdictPolicyVersion:                record.Context.PolicyVersion,
-		CurrentHeadSHA:                      target.HeadSHA,
-		CurrentBaseRef:                      target.BaseRef,
-		CurrentBaseSHA:                      currentBaseSHA,
-		CurrentAncestorChain:                currentAncestorChain,
-		BaseAdvancedWithoutRewrite:          baseAdvancedWithoutRewrite,
-		AncestorChainAdvancedWithoutRewrite: ancestorChainAdvancedWithoutRewrite,
+		CurrentHeadSHA:                      live.HeadSHA,
+		CurrentBaseRef:                      live.BaseRef,
+		CurrentBaseSHA:                      live.BaseSHA,
+		CurrentAncestorChain:                live.AncestorChain,
+		BaseAdvancedWithoutRewrite:          live.BaseAdvancedWithoutRewrite,
+		AncestorChainAdvancedWithoutRewrite: live.AncestorChainAdvancedWithoutRewrite,
 		CIGreen:                             ciGreen,
 		CIConclusionDegraded:                ciConclusionDegraded,
 		HasNeedsHumanLabel:                  hasNeedsHuman,

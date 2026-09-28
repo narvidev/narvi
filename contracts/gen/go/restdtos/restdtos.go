@@ -3859,6 +3859,35 @@ func (j *FalsePositivePattern) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// The narvi_get_session_result MCP tool's own input (technical plan §43.20, row
+// 182's result) -- the tool bridge's twin of GET /api/sessions/{sessionID}/result,
+// carrying the path parameter as a plain required field exactly like
+// GetSessionToolRequest. The answer is SessionOutcome.
+type GetSessionResultToolRequest struct {
+	// The session id, matching Session.id's own format exactly. A malformed value
+	// fails argument validation before the twin is invoked, reported as a tool
+	// execution error (isError:true).
+	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *GetSessionResultToolRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["sessionId"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionId in GetSessionResultToolRequest: required")
+	}
+	type Plain GetSessionResultToolRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = GetSessionResultToolRequest(plain)
+	return nil
+}
+
 // The narvi_get_session_status MCP tool's own input (technical plan §43.20) -- the
 // tool bridge's twin of GET /api/sessions/{sessionID}/status, carrying the path
 // parameter as a plain required field exactly like GetSessionToolRequest.
@@ -11774,6 +11803,1058 @@ func (j *SessionFailureReason) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// GET /api/sessions/{sessionID}/result (technical plan §43.20, row 182's result):
+// what one session has produced -- its last run, with a bounded summary of it; the
+// pull requests it opened; and each one's review verdict, with that verdict's
+// freshness, or its absence. Everything but freshness is read from what the
+// database already holds, in one snapshot: the session's turns and events, its
+// pull request artifacts, the review verdicts and review attempts on record.
+// Freshness is the one live read: on every call, each assessed verdict's recorded
+// context -- head, base ref and commit, ancestor chain, policy version -- is
+// compared with the pull request as the code host reports it now, by the same
+// comparison the merge path runs, and a read that fails or times out reports the
+// verdict unconfirmed, never current. All of one call's live reads share one time
+// budget (20 seconds as shipped), so the answer never waits on a slow code host
+// past it. A pull request record the session holds that is not a pull request it
+// opened -- one whose creation was suppressed in shadow mode, or one this server
+// cannot read -- is listed in excludedPullRequests with why, never dropped and
+// never failing the result. Verdicts are read as the code-review view reads them
+// (GET /api/sessions/{sessionID}/review). The same gate as GET
+// /api/sessions/{sessionID}: signed in, 400 for a malformed id, 404 for a session
+// that does not exist, no per-session visibility. Carries no events and no
+// transcript: the event history is GET /api/sessions/{sessionID}/events
+// (EventsResponse), a separate, paginated read.
+type SessionOutcome struct {
+	// SessionActivity.activity, read in the same snapshot as the rest of this result:
+	// whether the session itself can still change it. Read while the session is
+	// queued, running, delivering or scheduled, this is not the session's final
+	// result -- a later run, or a pull request still being opened, can change it;
+	// read the status (GET /api/sessions/{sessionID}/status) or wait on it to know
+	// when it is settled. A settled session's result can still change on its own
+	// while the review of a pull request it opened is still to come;
+	// suggestedDelaySeconds is short then.
+	Activity SessionOutcomeActivity `json:"activity" yaml:"activity" mapstructure:"activity"`
+
+	// The session's pull request records that pullRequests does not list, oldest
+	// first, each with why -- so a record is never silently dropped, and one this
+	// server cannot read never fails the rest of the result. Empty when every record
+	// is a pull request the session opened.
+	ExcludedPullRequests []SessionOutcomeExcludedPullRequest `json:"excludedPullRequests" yaml:"excludedPullRequests" mapstructure:"excludedPullRequests"`
+
+	// The most recently created turn that reached a terminal state --
+	// SessionActivity.lastRun's turn -- with what it cost and a summary of what it
+	// said; null when no turn has ended.
+	LastRun *SessionOutcomeLastRun `json:"lastRun" yaml:"lastRun" mapstructure:"lastRun"`
+
+	// The pull requests this session opened (its pull request artifacts), oldest
+	// first; empty when it opened none. Only pull requests that exist: a record
+	// naming no real pull request is in excludedPullRequests instead.
+	PullRequests []SessionOutcomePullRequest `json:"pullRequests" yaml:"pullRequests" mapstructure:"pullRequests"`
+
+	// Which pull requests this result reports a verdict for. 'none': the session
+	// opened no pull request and is no pull request's review session, so there is no
+	// verdict to report -- which is not a clean review: pullRequests is empty and
+	// reviewedPullRequest null (excludedPullRequests may still list a pull request
+	// the session would have opened in shadow mode, or a record that could not be
+	// read). 'produced': the session opened the pull requests in pullRequests and
+	// reviews none. 'reviewed': the session is the review session of
+	// reviewedPullRequest (pullRequests lists any it also opened, such as its own
+	// push's).
+	ReviewScope SessionOutcomeReviewScope `json:"reviewScope" yaml:"reviewScope" mapstructure:"reviewScope"`
+
+	// The pull request this session is the review session of (the per-pull-request
+	// claim that routes its reviews here); null when it is none's.
+	ReviewedPullRequest *SessionOutcomeReviewedPullRequest `json:"reviewedPullRequest" yaml:"reviewedPullRequest" mapstructure:"reviewedPullRequest"`
+
+	// SessionId corresponds to the JSON schema field "sessionId".
+	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+
+	// How long to wait before reading this result again, in whole seconds (rounded
+	// up): 30 while the result can still change on its own -- the session is not
+	// settled (activity; to learn when it settles, wait on its status instead, a much
+	// cheaper read), or the review of a pull request it opened is still to come, its
+	// review session not settled (an attempt queued or running, the review reading
+	// in_progress; a re-review scheduled); 60 once neither holds and a verdict's
+	// freshness was read live in this call, since every read of the result asks the
+	// code host again; 300 when nothing was either, as nothing in the result then
+	// changes without new input -- always within the deployment's configured floor
+	// and ceiling (30 and 300 seconds as shipped). A hint that keeps polling quiet,
+	// never a limit: an earlier read is answered all the same.
+	SuggestedDelaySeconds int `json:"suggestedDelaySeconds" yaml:"suggestedDelaySeconds" mapstructure:"suggestedDelaySeconds"`
+}
+
+type SessionOutcomeActivity string
+
+const SessionOutcomeActivityAwaitingApproval SessionOutcomeActivity = "awaiting_approval"
+const SessionOutcomeActivityDelivering SessionOutcomeActivity = "delivering"
+const SessionOutcomeActivityFinished SessionOutcomeActivity = "finished"
+const SessionOutcomeActivityIdle SessionOutcomeActivity = "idle"
+const SessionOutcomeActivityQueued SessionOutcomeActivity = "queued"
+const SessionOutcomeActivityRunning SessionOutcomeActivity = "running"
+const SessionOutcomeActivityScheduled SessionOutcomeActivity = "scheduled"
+
+var enumValues_SessionOutcomeActivity = []interface{}{
+	"idle",
+	"queued",
+	"running",
+	"delivering",
+	"scheduled",
+	"awaiting_approval",
+	"finished",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeActivity) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_SessionOutcomeActivity {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_SessionOutcomeActivity, v)
+	}
+	*j = SessionOutcomeActivity(v)
+	return nil
+}
+
+// One pull request record of a session that is not a pull request it opened
+// (SessionOutcome.excludedPullRequests), and why. It has no review: there is
+// either no pull request to review, or none this server can name.
+type SessionOutcomeExcludedPullRequest struct {
+	// When the session recorded it.
+	CreatedAt time.Time `json:"createdAt" yaml:"createdAt" mapstructure:"createdAt"`
+
+	// 'shadow_suppressed': the session would have opened this pull request, but
+	// outbound writes to its repository were in shadow mode, so the creation was
+	// recorded and suppressed -- no pull request exists, and there is nothing to
+	// review. 'unreadable': this server could not read the record; it may name a real
+	// pull request, whose review this result therefore cannot report (reason says
+	// what could not be read). An OPEN enum (manifest.json's openEnums): a consumer
+	// MUST tolerate a value it does not recognise.
+	Kind SessionOutcomeExcludedPullRequestKind `json:"kind" yaml:"kind" mapstructure:"kind"`
+
+	// Why it is not in pullRequests, for a person to read.
+	Reason string `json:"reason" yaml:"reason" mapstructure:"reason"`
+
+	// owner/repo, for 'shadow_suppressed': the owner of the session's own repository
+	// of the recorded name, as for pullRequests. Null when the session's repositories
+	// cannot say, and always for 'unreadable'.
+	RepoFullName SessionOutcomeExcludedPullRequestRepoFullName `json:"repoFullName" yaml:"repoFullName" mapstructure:"repoFullName"`
+
+	// The URL the record holds, for 'unreadable' (null when it holds none). Always
+	// null for 'shadow_suppressed': no pull request exists, so there is no URL to
+	// follow.
+	Url SessionOutcomeExcludedPullRequestUrl `json:"url" yaml:"url" mapstructure:"url"`
+}
+
+type SessionOutcomeExcludedPullRequestKind string
+
+const SessionOutcomeExcludedPullRequestKindShadowSuppressed SessionOutcomeExcludedPullRequestKind = "shadow_suppressed"
+const SessionOutcomeExcludedPullRequestKindUnreadable SessionOutcomeExcludedPullRequestKind = "unreadable"
+
+var enumValues_SessionOutcomeExcludedPullRequestKind = []interface{}{
+	"shadow_suppressed",
+	"unreadable",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeExcludedPullRequestKind) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_SessionOutcomeExcludedPullRequestKind {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_SessionOutcomeExcludedPullRequestKind, v)
+	}
+	*j = SessionOutcomeExcludedPullRequestKind(v)
+	return nil
+}
+
+// owner/repo, for 'shadow_suppressed': the owner of the session's own repository
+// of the recorded name, as for pullRequests. Null when the session's repositories
+// cannot say, and always for 'unreadable'.
+type SessionOutcomeExcludedPullRequestRepoFullName *string
+
+// The URL the record holds, for 'unreadable' (null when it holds none). Always
+// null for 'shadow_suppressed': no pull request exists, so there is no URL to
+// follow.
+type SessionOutcomeExcludedPullRequestUrl *string
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeExcludedPullRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["createdAt"]; raw != nil && !ok {
+		return fmt.Errorf("field createdAt in SessionOutcomeExcludedPullRequest: required")
+	}
+	if _, ok := raw["kind"]; raw != nil && !ok {
+		return fmt.Errorf("field kind in SessionOutcomeExcludedPullRequest: required")
+	}
+	if _, ok := raw["reason"]; raw != nil && !ok {
+		return fmt.Errorf("field reason in SessionOutcomeExcludedPullRequest: required")
+	}
+	if _, ok := raw["repoFullName"]; raw != nil && !ok {
+		return fmt.Errorf("field repoFullName in SessionOutcomeExcludedPullRequest: required")
+	}
+	if _, ok := raw["url"]; raw != nil && !ok {
+		return fmt.Errorf("field url in SessionOutcomeExcludedPullRequest: required")
+	}
+	type Plain SessionOutcomeExcludedPullRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = SessionOutcomeExcludedPullRequest(plain)
+	return nil
+}
+
+// The most recently created turn that reached a terminal state --
+// SessionActivity.lastRun's turn -- with what it cost and a summary of what it
+// said; null when no turn has ended.
+type SessionOutcomeLastRun struct {
+	// The run's own cost in USD, accumulated onto the turn as its steps finished
+	// (turns.cost_usd, the same total WorkflowStepRun.costUsd reads). Null when no
+	// cost was ever recorded for it -- never rendered as a free run.
+	CostUsd SessionOutcomeLastRunCostUsd `json:"costUsd" yaml:"costUsd" mapstructure:"costUsd"`
+
+	// Why the run did not complete, with Session.failureReason's values, under
+	// SessionActivity.lastRun.failureReason's rule: a turn carries no reason of its
+	// own, so this is the session's recorded reason, given only when it can describe
+	// nothing but this run -- the run is the session's newest turn, did not complete,
+	// and the session's recorded outcome is this run's. Null otherwise, and always
+	// null when the run completed.
+	FailureReason *SessionOutcomeLastRunFailureReason `json:"failureReason" yaml:"failureReason" mapstructure:"failureReason"`
+
+	// When the run reached its terminal state; null when that was not recorded.
+	FinishedAt SessionOutcomeLastRunFinishedAt `json:"finishedAt" yaml:"finishedAt" mapstructure:"finishedAt"`
+
+	// Outcome corresponds to the JSON schema field "outcome".
+	Outcome SessionOutcomeLastRunOutcome `json:"outcome" yaml:"outcome" mapstructure:"outcome"`
+
+	// Whether the run was a plan-mode turn (it produced a plan to approve rather than
+	// changes).
+	PlanMode bool `json:"planMode" yaml:"planMode" mapstructure:"planMode"`
+
+	// When the run was dispatched to a sandbox; null when it never was.
+	StartedAt SessionOutcomeLastRunStartedAt `json:"startedAt" yaml:"startedAt" mapstructure:"startedAt"`
+
+	// The run's final assistant text: deterministic, copied from what the run itself
+	// streamed, never written by a model.
+	Summary SessionOutcomeLastRunSummary `json:"summary" yaml:"summary" mapstructure:"summary"`
+
+	// TurnId corresponds to the JSON schema field "turnId".
+	TurnId string `json:"turnId" yaml:"turnId" mapstructure:"turnId"`
+}
+
+// The run's own cost in USD, accumulated onto the turn as its steps finished
+// (turns.cost_usd, the same total WorkflowStepRun.costUsd reads). Null when no
+// cost was ever recorded for it -- never rendered as a free run.
+type SessionOutcomeLastRunCostUsd *float64
+
+type SessionOutcomeLastRunFailureReason struct {
+	Value interface{}
+}
+
+// MarshalJSON implements json.Marshaler.
+func (j *SessionOutcomeLastRunFailureReason) MarshalJSON() ([]byte, error) {
+	return json.Marshal(j.Value)
+}
+
+var enumValues_SessionOutcomeLastRunFailureReason = []interface{}{
+	"cancelled",
+	"failed",
+	"timeout",
+	"never_started",
+	nil,
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeLastRunFailureReason) UnmarshalJSON(value []byte) error {
+	var v struct {
+		Value interface{}
+	}
+	if err := json.Unmarshal(value, &v.Value); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_SessionOutcomeLastRunFailureReason {
+		if reflect.DeepEqual(v.Value, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_SessionOutcomeLastRunFailureReason, v.Value)
+	}
+	*j = SessionOutcomeLastRunFailureReason(v)
+	return nil
+}
+
+// When the run reached its terminal state; null when that was not recorded.
+type SessionOutcomeLastRunFinishedAt = *time.Time
+
+type SessionOutcomeLastRunOutcome string
+
+const SessionOutcomeLastRunOutcomeCancelled SessionOutcomeLastRunOutcome = "cancelled"
+const SessionOutcomeLastRunOutcomeCompleted SessionOutcomeLastRunOutcome = "completed"
+const SessionOutcomeLastRunOutcomeFailed SessionOutcomeLastRunOutcome = "failed"
+
+var enumValues_SessionOutcomeLastRunOutcome = []interface{}{
+	"completed",
+	"failed",
+	"cancelled",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeLastRunOutcome) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_SessionOutcomeLastRunOutcome {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_SessionOutcomeLastRunOutcome, v)
+	}
+	*j = SessionOutcomeLastRunOutcome(v)
+	return nil
+}
+
+// When the run was dispatched to a sandbox; null when it never was.
+type SessionOutcomeLastRunStartedAt = *time.Time
+
+// The run's final assistant text: deterministic, copied from what the run itself
+// streamed, never written by a model.
+type SessionOutcomeLastRunSummary struct {
+	// The run's last text part, verbatim -- among the parts the run streamed with any
+	// text, the one that opened last, read at its newest frame: the one rule this
+	// system uses to read a turn's final text (the same one GET
+	// /api/sessions/{sessionID}/plans reads a plan with). Cut to at most 4,000
+	// characters (Unicode code points). Null when the run left no text in the
+	// session's recent event history.
+	Text SessionOutcomeLastRunSummaryText `json:"text" yaml:"text" mapstructure:"text"`
+
+	// true when text was cut at 4,000 characters; the full text is in the transcript.
+	Truncated bool `json:"truncated" yaml:"truncated" mapstructure:"truncated"`
+}
+
+// The run's last text part, verbatim -- among the parts the run streamed with any
+// text, the one that opened last, read at its newest frame: the one rule this
+// system uses to read a turn's final text (the same one GET
+// /api/sessions/{sessionID}/plans reads a plan with). Cut to at most 4,000
+// characters (Unicode code points). Null when the run left no text in the
+// session's recent event history.
+type SessionOutcomeLastRunSummaryText *string
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeLastRunSummary) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["text"]; raw != nil && !ok {
+		return fmt.Errorf("field text in SessionOutcomeLastRunSummary: required")
+	}
+	if _, ok := raw["truncated"]; raw != nil && !ok {
+		return fmt.Errorf("field truncated in SessionOutcomeLastRunSummary: required")
+	}
+	type Plain SessionOutcomeLastRunSummary
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = SessionOutcomeLastRunSummary(plain)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeLastRun) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["costUsd"]; raw != nil && !ok {
+		return fmt.Errorf("field costUsd in SessionOutcomeLastRun: required")
+	}
+	if _, ok := raw["failureReason"]; raw != nil && !ok {
+		return fmt.Errorf("field failureReason in SessionOutcomeLastRun: required")
+	}
+	if _, ok := raw["finishedAt"]; raw != nil && !ok {
+		return fmt.Errorf("field finishedAt in SessionOutcomeLastRun: required")
+	}
+	if _, ok := raw["outcome"]; raw != nil && !ok {
+		return fmt.Errorf("field outcome in SessionOutcomeLastRun: required")
+	}
+	if _, ok := raw["planMode"]; raw != nil && !ok {
+		return fmt.Errorf("field planMode in SessionOutcomeLastRun: required")
+	}
+	if _, ok := raw["startedAt"]; raw != nil && !ok {
+		return fmt.Errorf("field startedAt in SessionOutcomeLastRun: required")
+	}
+	if _, ok := raw["summary"]; raw != nil && !ok {
+		return fmt.Errorf("field summary in SessionOutcomeLastRun: required")
+	}
+	if _, ok := raw["turnId"]; raw != nil && !ok {
+		return fmt.Errorf("field turnId in SessionOutcomeLastRun: required")
+	}
+	type Plain SessionOutcomeLastRun
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = SessionOutcomeLastRun(plain)
+	return nil
+}
+
+// One pull request a session opened, and its review verdict
+// (SessionOutcome.pullRequests).
+type SessionOutcomePullRequest struct {
+	// When the session recorded the pull request.
+	CreatedAt time.Time `json:"createdAt" yaml:"createdAt" mapstructure:"createdAt"`
+
+	// Number corresponds to the JSON schema field "number".
+	Number int `json:"number" yaml:"number" mapstructure:"number"`
+
+	// owner/repo: the owner of the session's own repository of that name -- the one
+	// the pull request was opened from -- or, when the session's repositories cannot
+	// say, the one the pull request's URL names.
+	RepoFullName string `json:"repoFullName" yaml:"repoFullName" mapstructure:"repoFullName"`
+
+	// Review corresponds to the JSON schema field "review".
+	Review SessionOutcomeReview `json:"review" yaml:"review" mapstructure:"review"`
+
+	// The pull request's URL, as the code host returned it when it was opened.
+	Url string `json:"url" yaml:"url" mapstructure:"url"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomePullRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["createdAt"]; raw != nil && !ok {
+		return fmt.Errorf("field createdAt in SessionOutcomePullRequest: required")
+	}
+	if _, ok := raw["number"]; raw != nil && !ok {
+		return fmt.Errorf("field number in SessionOutcomePullRequest: required")
+	}
+	if _, ok := raw["repoFullName"]; raw != nil && !ok {
+		return fmt.Errorf("field repoFullName in SessionOutcomePullRequest: required")
+	}
+	if _, ok := raw["review"]; raw != nil && !ok {
+		return fmt.Errorf("field review in SessionOutcomePullRequest: required")
+	}
+	if _, ok := raw["url"]; raw != nil && !ok {
+		return fmt.Errorf("field url in SessionOutcomePullRequest: required")
+	}
+	type Plain SessionOutcomePullRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if 1 > plain.Number {
+		return fmt.Errorf("field %s: must be >= %v", "number", 1)
+	}
+	*j = SessionOutcomePullRequest(plain)
+	return nil
+}
+
+// One pull request's review verdict, read from the verdicts and review attempts on
+// record -- never re-derived -- with its freshness, or its absence (technical plan
+// §43.20, §21.1b).
+type SessionOutcomeReview struct {
+	// Whether verdict still describes the pull request as it stands.
+	Freshness SessionOutcomeReviewFreshness `json:"freshness" yaml:"freshness" mapstructure:"freshness"`
+
+	// 'absent': no verdict is on record for the pull request and no review attempt
+	// has run on it. 'in_progress': the pull request's newest review attempt has not
+	// ended. 'not_assessed': the newest review attempt ended without posting a
+	// verdict -- a review that did not complete has no risk level, and an older
+	// verdict is not its answer (supersededVerdict). 'assessed': the newest review
+	// attempt posted the verdict in verdict (or a verdict is on record with no
+	// attempt, as for verdicts recorded before attempts were).
+	State SessionOutcomeReviewState `json:"state" yaml:"state" mapstructure:"state"`
+
+	// The latest verdict of an EARLIER attempt, when a newer one is running
+	// ('in_progress') or ended without posting ('not_assessed'); null otherwise.
+	// Never the current answer: the attempt after it has not confirmed it.
+	SupersededVerdict *SessionOutcomeReviewSupersededVerdict `json:"supersededVerdict" yaml:"supersededVerdict" mapstructure:"supersededVerdict"`
+
+	// The verdict that answers for the pull request -- set only when state is
+	// 'assessed'.
+	Verdict *SessionOutcomeReviewVerdict `json:"verdict" yaml:"verdict" mapstructure:"verdict"`
+}
+
+// Whether verdict still describes the pull request as it stands.
+type SessionOutcomeReviewFreshness struct {
+	// Why, for 'stale' and 'unconfirmed': the merge path's own reason text for the
+	// comparison's answer -- the same reason the merge path gives the same pull
+	// request -- or what could not be read, or that the time budget ran out. For
+	// 'not_applicable', why a merged or no-longer-open pull request's verdict is
+	// moot; null otherwise, and always null for 'current'.
+	Reason SessionOutcomeReviewFreshnessReason `json:"reason" yaml:"reason" mapstructure:"reason"`
+
+	// 'current': the verdict's recorded context -- head, base ref and commit,
+	// ancestor chain, policy version -- matched the pull request's live facts, read
+	// from the code host during this call; never from the record alone. 'stale': the
+	// comparison proved the verdict describes other code, or was produced under other
+	// rules -- the head moved (a push, the session's own included, whatever else the
+	// verdict recorded), the base changed, the ancestor chain changed, or the policy
+	// version is older. 'unconfirmed': freshness could not be established -- the
+	// verdict recorded no context, a commit on either side is unknown, or the live
+	// read failed, timed out, or ran past this call's time budget for live reads.
+	// 'not_applicable': state is not 'assessed', or the pull request is merged (per
+	// this system's records, with no live read) or no longer open (per the live read)
+	// -- a pull request once closed and since reopened is read live like any other.
+	State SessionOutcomeReviewFreshnessState `json:"state" yaml:"state" mapstructure:"state"`
+}
+
+// Why, for 'stale' and 'unconfirmed': the merge path's own reason text for the
+// comparison's answer -- the same reason the merge path gives the same pull
+// request -- or what could not be read, or that the time budget ran out. For
+// 'not_applicable', why a merged or no-longer-open pull request's verdict is moot;
+// null otherwise, and always null for 'current'.
+type SessionOutcomeReviewFreshnessReason *string
+
+type SessionOutcomeReviewFreshnessState string
+
+const SessionOutcomeReviewFreshnessStateCurrent SessionOutcomeReviewFreshnessState = "current"
+const SessionOutcomeReviewFreshnessStateNotApplicable SessionOutcomeReviewFreshnessState = "not_applicable"
+const SessionOutcomeReviewFreshnessStateStale SessionOutcomeReviewFreshnessState = "stale"
+const SessionOutcomeReviewFreshnessStateUnconfirmed SessionOutcomeReviewFreshnessState = "unconfirmed"
+
+var enumValues_SessionOutcomeReviewFreshnessState = []interface{}{
+	"current",
+	"stale",
+	"unconfirmed",
+	"not_applicable",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeReviewFreshnessState) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_SessionOutcomeReviewFreshnessState {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_SessionOutcomeReviewFreshnessState, v)
+	}
+	*j = SessionOutcomeReviewFreshnessState(v)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeReviewFreshness) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["reason"]; raw != nil && !ok {
+		return fmt.Errorf("field reason in SessionOutcomeReviewFreshness: required")
+	}
+	if _, ok := raw["state"]; raw != nil && !ok {
+		return fmt.Errorf("field state in SessionOutcomeReviewFreshness: required")
+	}
+	type Plain SessionOutcomeReviewFreshness
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = SessionOutcomeReviewFreshness(plain)
+	return nil
+}
+
+type SessionOutcomeReviewScope string
+
+const SessionOutcomeReviewScopeNone SessionOutcomeReviewScope = "none"
+const SessionOutcomeReviewScopeProduced SessionOutcomeReviewScope = "produced"
+const SessionOutcomeReviewScopeReviewed SessionOutcomeReviewScope = "reviewed"
+
+var enumValues_SessionOutcomeReviewScope = []interface{}{
+	"none",
+	"produced",
+	"reviewed",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeReviewScope) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_SessionOutcomeReviewScope {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_SessionOutcomeReviewScope, v)
+	}
+	*j = SessionOutcomeReviewScope(v)
+	return nil
+}
+
+type SessionOutcomeReviewState string
+
+const SessionOutcomeReviewStateAbsent SessionOutcomeReviewState = "absent"
+const SessionOutcomeReviewStateAssessed SessionOutcomeReviewState = "assessed"
+const SessionOutcomeReviewStateInProgress SessionOutcomeReviewState = "in_progress"
+const SessionOutcomeReviewStateNotAssessed SessionOutcomeReviewState = "not_assessed"
+
+var enumValues_SessionOutcomeReviewState = []interface{}{
+	"absent",
+	"in_progress",
+	"not_assessed",
+	"assessed",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeReviewState) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_SessionOutcomeReviewState {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_SessionOutcomeReviewState, v)
+	}
+	*j = SessionOutcomeReviewState(v)
+	return nil
+}
+
+// The latest verdict of an EARLIER attempt, when a newer one is running
+// ('in_progress') or ended without posting ('not_assessed'); null otherwise. Never
+// the current answer: the attempt after it has not confirmed it.
+type SessionOutcomeReviewSupersededVerdict struct {
+	// The review attempt (turn) that posted it; null for a verdict recorded before
+	// attempts were.
+	AttemptId SessionOutcomeVerdictAttemptId `json:"attemptId" yaml:"attemptId" mapstructure:"attemptId"`
+
+	// The rest of what the verdict examined (§21.1's amendment), beside headSha.
+	Context SessionOutcomeVerdictContext `json:"context" yaml:"context" mapstructure:"context"`
+
+	// The commit the verdict was produced against (§21.1).
+	HeadSha string `json:"headSha" yaml:"headSha" mapstructure:"headSha"`
+
+	// PostedAt corresponds to the JSON schema field "postedAt".
+	PostedAt time.Time `json:"postedAt" yaml:"postedAt" mapstructure:"postedAt"`
+
+	// RiskLevel corresponds to the JSON schema field "riskLevel".
+	RiskLevel SessionOutcomeVerdictRiskLevel `json:"riskLevel" yaml:"riskLevel" mapstructure:"riskLevel"`
+
+	// The server-computed classification, as ReviewReadoutVerdict.shippable.
+	Shippable SessionOutcomeVerdictShippable `json:"shippable" yaml:"shippable" mapstructure:"shippable"`
+
+	// VerdictId corresponds to the JSON schema field "verdictId".
+	VerdictId string `json:"verdictId" yaml:"verdictId" mapstructure:"verdictId"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeReviewSupersededVerdict) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	var sessionOutcomeReviewSupersededVerdict_0 SessionOutcomeReviewSupersededVerdict_0
+	var errs []error
+	if err := sessionOutcomeReviewSupersededVerdict_0.UnmarshalJSON(value); err != nil {
+		errs = append(errs, err)
+	}
+	if len(errs) == 1 {
+		return fmt.Errorf("all validators failed: %s", errors.Join(errs...))
+	}
+	type Plain SessionOutcomeReviewSupersededVerdict
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = SessionOutcomeReviewSupersededVerdict(plain)
+	return nil
+}
+
+// The verdict that answers for the pull request -- set only when state is
+// 'assessed'.
+type SessionOutcomeReviewVerdict struct {
+	// The review attempt (turn) that posted it; null for a verdict recorded before
+	// attempts were.
+	AttemptId SessionOutcomeVerdictAttemptId `json:"attemptId" yaml:"attemptId" mapstructure:"attemptId"`
+
+	// The rest of what the verdict examined (§21.1's amendment), beside headSha.
+	Context SessionOutcomeVerdictContext `json:"context" yaml:"context" mapstructure:"context"`
+
+	// The commit the verdict was produced against (§21.1).
+	HeadSha string `json:"headSha" yaml:"headSha" mapstructure:"headSha"`
+
+	// PostedAt corresponds to the JSON schema field "postedAt".
+	PostedAt time.Time `json:"postedAt" yaml:"postedAt" mapstructure:"postedAt"`
+
+	// RiskLevel corresponds to the JSON schema field "riskLevel".
+	RiskLevel SessionOutcomeVerdictRiskLevel `json:"riskLevel" yaml:"riskLevel" mapstructure:"riskLevel"`
+
+	// The server-computed classification, as ReviewReadoutVerdict.shippable.
+	Shippable SessionOutcomeVerdictShippable `json:"shippable" yaml:"shippable" mapstructure:"shippable"`
+
+	// VerdictId corresponds to the JSON schema field "verdictId".
+	VerdictId string `json:"verdictId" yaml:"verdictId" mapstructure:"verdictId"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeReviewVerdict) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	var sessionOutcomeReviewVerdict_0 SessionOutcomeReviewVerdict_0
+	var errs []error
+	if err := sessionOutcomeReviewVerdict_0.UnmarshalJSON(value); err != nil {
+		errs = append(errs, err)
+	}
+	if len(errs) == 1 {
+		return fmt.Errorf("all validators failed: %s", errors.Join(errs...))
+	}
+	type Plain SessionOutcomeReviewVerdict
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = SessionOutcomeReviewVerdict(plain)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeReview) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["freshness"]; raw != nil && !ok {
+		return fmt.Errorf("field freshness in SessionOutcomeReview: required")
+	}
+	if _, ok := raw["state"]; raw != nil && !ok {
+		return fmt.Errorf("field state in SessionOutcomeReview: required")
+	}
+	if _, ok := raw["supersededVerdict"]; raw != nil && !ok {
+		return fmt.Errorf("field supersededVerdict in SessionOutcomeReview: required")
+	}
+	if _, ok := raw["verdict"]; raw != nil && !ok {
+		return fmt.Errorf("field verdict in SessionOutcomeReview: required")
+	}
+	type Plain SessionOutcomeReview
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = SessionOutcomeReview(plain)
+	return nil
+}
+
+// The pull request this session is the review session of (the per-pull-request
+// claim that routes its reviews here); null when it is none's.
+type SessionOutcomeReviewedPullRequest struct {
+	// Number corresponds to the JSON schema field "number".
+	Number int `json:"number" yaml:"number" mapstructure:"number"`
+
+	// owner/repo.
+	RepoFullName string `json:"repoFullName" yaml:"repoFullName" mapstructure:"repoFullName"`
+
+	// Review corresponds to the JSON schema field "review".
+	Review SessionOutcomeReview `json:"review" yaml:"review" mapstructure:"review"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeReviewedPullRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["number"]; raw != nil && !ok {
+		return fmt.Errorf("field number in SessionOutcomeReviewedPullRequest: required")
+	}
+	if _, ok := raw["repoFullName"]; raw != nil && !ok {
+		return fmt.Errorf("field repoFullName in SessionOutcomeReviewedPullRequest: required")
+	}
+	if _, ok := raw["review"]; raw != nil && !ok {
+		return fmt.Errorf("field review in SessionOutcomeReviewedPullRequest: required")
+	}
+	type Plain SessionOutcomeReviewedPullRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if 1 > plain.Number {
+		return fmt.Errorf("field %s: must be >= %v", "number", 1)
+	}
+	*j = SessionOutcomeReviewedPullRequest(plain)
+	return nil
+}
+
+// One posted review verdict, copied from its record
+// (SessionOutcomeReview.verdict/supersededVerdict).
+type SessionOutcomeVerdict struct {
+	// The review attempt (turn) that posted it; null for a verdict recorded before
+	// attempts were.
+	AttemptId SessionOutcomeVerdictAttemptId `json:"attemptId" yaml:"attemptId" mapstructure:"attemptId"`
+
+	// The rest of what the verdict examined (§21.1's amendment), beside headSha.
+	Context SessionOutcomeVerdictContext `json:"context" yaml:"context" mapstructure:"context"`
+
+	// The commit the verdict was produced against (§21.1).
+	HeadSha string `json:"headSha" yaml:"headSha" mapstructure:"headSha"`
+
+	// PostedAt corresponds to the JSON schema field "postedAt".
+	PostedAt time.Time `json:"postedAt" yaml:"postedAt" mapstructure:"postedAt"`
+
+	// RiskLevel corresponds to the JSON schema field "riskLevel".
+	RiskLevel SessionOutcomeVerdictRiskLevel `json:"riskLevel" yaml:"riskLevel" mapstructure:"riskLevel"`
+
+	// The server-computed classification, as ReviewReadoutVerdict.shippable.
+	Shippable SessionOutcomeVerdictShippable `json:"shippable" yaml:"shippable" mapstructure:"shippable"`
+
+	// VerdictId corresponds to the JSON schema field "verdictId".
+	VerdictId string `json:"verdictId" yaml:"verdictId" mapstructure:"verdictId"`
+}
+
+// The review attempt (turn) that posted it; null for a verdict recorded before
+// attempts were.
+type SessionOutcomeVerdictAttemptId *string
+
+// The rest of what the verdict examined (§21.1's amendment), beside headSha.
+type SessionOutcomeVerdictContext struct {
+	// How many stacked ancestors it recorded (at most one today).
+	AncestorChainLength int `json:"ancestorChainLength" yaml:"ancestorChainLength" mapstructure:"ancestorChainLength"`
+
+	// The base branch; null when the verdict predates context tracking (its freshness
+	// then reads unconfirmed).
+	BaseRef SessionOutcomeVerdictContextBaseRef `json:"baseRef" yaml:"baseRef" mapstructure:"baseRef"`
+
+	// The base branch's commit the verdict was anchored to; null when it was not
+	// recorded or could not be established.
+	BaseSha SessionOutcomeVerdictContextBaseSha `json:"baseSha" yaml:"baseSha" mapstructure:"baseSha"`
+
+	// The eligibility policy version it was produced under; 0 for a verdict that
+	// predates the field.
+	PolicyVersion int `json:"policyVersion" yaml:"policyVersion" mapstructure:"policyVersion"`
+}
+
+// The base branch; null when the verdict predates context tracking (its freshness
+// then reads unconfirmed).
+type SessionOutcomeVerdictContextBaseRef *string
+
+// The base branch's commit the verdict was anchored to; null when it was not
+// recorded or could not be established.
+type SessionOutcomeVerdictContextBaseSha *string
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeVerdictContext) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["ancestorChainLength"]; raw != nil && !ok {
+		return fmt.Errorf("field ancestorChainLength in SessionOutcomeVerdictContext: required")
+	}
+	if _, ok := raw["baseRef"]; raw != nil && !ok {
+		return fmt.Errorf("field baseRef in SessionOutcomeVerdictContext: required")
+	}
+	if _, ok := raw["baseSha"]; raw != nil && !ok {
+		return fmt.Errorf("field baseSha in SessionOutcomeVerdictContext: required")
+	}
+	if _, ok := raw["policyVersion"]; raw != nil && !ok {
+		return fmt.Errorf("field policyVersion in SessionOutcomeVerdictContext: required")
+	}
+	type Plain SessionOutcomeVerdictContext
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if 0 > plain.AncestorChainLength {
+		return fmt.Errorf("field %s: must be >= %v", "ancestorChainLength", 0)
+	}
+	if 0 > plain.PolicyVersion {
+		return fmt.Errorf("field %s: must be >= %v", "policyVersion", 0)
+	}
+	*j = SessionOutcomeVerdictContext(plain)
+	return nil
+}
+
+type SessionOutcomeVerdictRiskLevel string
+
+const SessionOutcomeVerdictRiskLevelHigh SessionOutcomeVerdictRiskLevel = "high"
+const SessionOutcomeVerdictRiskLevelLow SessionOutcomeVerdictRiskLevel = "low"
+const SessionOutcomeVerdictRiskLevelMedium SessionOutcomeVerdictRiskLevel = "medium"
+
+var enumValues_SessionOutcomeVerdictRiskLevel = []interface{}{
+	"low",
+	"medium",
+	"high",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeVerdictRiskLevel) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_SessionOutcomeVerdictRiskLevel {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_SessionOutcomeVerdictRiskLevel, v)
+	}
+	*j = SessionOutcomeVerdictRiskLevel(v)
+	return nil
+}
+
+type SessionOutcomeVerdictShippable string
+
+const SessionOutcomeVerdictShippableAuto SessionOutcomeVerdictShippable = "auto"
+const SessionOutcomeVerdictShippableBlock SessionOutcomeVerdictShippable = "block"
+const SessionOutcomeVerdictShippableNeedsHuman SessionOutcomeVerdictShippable = "needs_human"
+
+var enumValues_SessionOutcomeVerdictShippable = []interface{}{
+	"auto",
+	"needs_human",
+	"block",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeVerdictShippable) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_SessionOutcomeVerdictShippable {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_SessionOutcomeVerdictShippable, v)
+	}
+	*j = SessionOutcomeVerdictShippable(v)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeVerdict) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["attemptId"]; raw != nil && !ok {
+		return fmt.Errorf("field attemptId in SessionOutcomeVerdict: required")
+	}
+	if _, ok := raw["context"]; raw != nil && !ok {
+		return fmt.Errorf("field context in SessionOutcomeVerdict: required")
+	}
+	if _, ok := raw["headSha"]; raw != nil && !ok {
+		return fmt.Errorf("field headSha in SessionOutcomeVerdict: required")
+	}
+	if _, ok := raw["postedAt"]; raw != nil && !ok {
+		return fmt.Errorf("field postedAt in SessionOutcomeVerdict: required")
+	}
+	if _, ok := raw["riskLevel"]; raw != nil && !ok {
+		return fmt.Errorf("field riskLevel in SessionOutcomeVerdict: required")
+	}
+	if _, ok := raw["shippable"]; raw != nil && !ok {
+		return fmt.Errorf("field shippable in SessionOutcomeVerdict: required")
+	}
+	if _, ok := raw["verdictId"]; raw != nil && !ok {
+		return fmt.Errorf("field verdictId in SessionOutcomeVerdict: required")
+	}
+	type Plain SessionOutcomeVerdict
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = SessionOutcomeVerdict(plain)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcome) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["activity"]; raw != nil && !ok {
+		return fmt.Errorf("field activity in SessionOutcome: required")
+	}
+	if _, ok := raw["excludedPullRequests"]; raw != nil && !ok {
+		return fmt.Errorf("field excludedPullRequests in SessionOutcome: required")
+	}
+	if _, ok := raw["lastRun"]; raw != nil && !ok {
+		return fmt.Errorf("field lastRun in SessionOutcome: required")
+	}
+	if _, ok := raw["pullRequests"]; raw != nil && !ok {
+		return fmt.Errorf("field pullRequests in SessionOutcome: required")
+	}
+	if _, ok := raw["reviewScope"]; raw != nil && !ok {
+		return fmt.Errorf("field reviewScope in SessionOutcome: required")
+	}
+	if _, ok := raw["reviewedPullRequest"]; raw != nil && !ok {
+		return fmt.Errorf("field reviewedPullRequest in SessionOutcome: required")
+	}
+	if _, ok := raw["sessionId"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionId in SessionOutcome: required")
+	}
+	if _, ok := raw["suggestedDelaySeconds"]; raw != nil && !ok {
+		return fmt.Errorf("field suggestedDelaySeconds in SessionOutcome: required")
+	}
+	type Plain SessionOutcome
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if 0 > plain.SuggestedDelaySeconds {
+		return fmt.Errorf("field %s: must be >= %v", "suggestedDelaySeconds", 0)
+	}
+	*j = SessionOutcome(plain)
+	return nil
+}
+
 type SessionSandboxStatus struct {
 	Value interface{}
 }
@@ -14250,6 +15331,7 @@ type WorkflowStepRunStatus string
 const WorkflowStepRunStatusAwaitingDecision WorkflowStepRunStatus = "awaiting_decision"
 const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
 const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
+const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
 const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
 
 var enumValues_WorkflowStepRunStatus = []interface{}{
@@ -14280,14 +15362,16 @@ func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
-
-const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
+type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict
 
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
 // sequential turn'). Null while an awaiting_decision (hitlBefore-gated) attempt
 // exists before any turn does.
 type WorkflowStepRunTurnId *string
+
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
+
+type SessionOutcomeReviewVerdict_0 = SessionOutcomeVerdict
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {

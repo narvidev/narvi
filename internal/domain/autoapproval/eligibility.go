@@ -588,80 +588,15 @@ func computeEligibleCore(in EligibilityInput, cfg EligibilityConfig, waiveHumanJ
 	if in.HasNeedsHumanLabel {
 		return false, ReasonNeedsHumanLabel, false
 	}
-	// §21.1's amendment: "a review that did not complete has no risk
-	// level, and inventing one ... is the same defect as a truncated scan
-	// rendering as a clean one." Checked before anything else looks at
-	// in.Verdict at all -- a not-assessed PR has no Verdict worth
-	// reasoning about.
-	if !in.VerdictAssessed {
-		return false, ReasonNotAssessed, false
-	}
-	if in.VerdictHeadSHA == "" || in.VerdictHeadSHA != in.CurrentHeadSHA {
-		return false, ReasonStaleVerdict, false
-	}
-	// §21.1's amendment: "head equality is necessary and not
-	// sufficient... the gate is the verdict's whole persisted context --
-	// head, base, ancestor chain and policy version -- matching the PR as
-	// it stands now." VerdictBaseRef == "" means this row predates the
-	// amendment: no context was ever recorded, so there is nothing to
-	// confirm fresh -- treated as UNKNOWN, never as a match, exactly
-	// because "treating unknown context as matching would reopen the
-	// hole for every verdict already stored" (backfill: an old verdict
-	// means exactly this, and forces a fresh review, never a silent
-	// grandfather-in).
-	if in.VerdictBaseRef == "" {
-		return false, ReasonContextUnknown, false
-	}
-	// Finding F2: an empty base SHA on EITHER side is refused here, on its
-	// own dedicated reason, BEFORE the equality comparison below ever runs
-	// -- "" == "" would otherwise read as a trivially-matching pair,
-	// exactly the same hole VerdictHeadSHA's own dedicated empty-string
-	// check (above) already closes for the head sha. This also fails
-	// closed the day a decoder regression, or a second SourceControl
-	// adapter (CLAUDE.md: "don't couple a port to a single adapter" --
-	// this port is EXPECTED to gain one), stops emitting either field:
-	// both sides reading "" must never be indistinguishable from both
-	// sides genuinely, confirmedly agreeing.
-	if in.VerdictBaseSHA == "" || in.CurrentBaseSHA == "" {
-		return false, ReasonBaseSHAUnknown, false
-	}
-	// D3 (second adversarial-review round): a base REF change (a retarget,
-	// or a stacked PR's own parent merging and GitHub re-targeting onto
-	// the grandparent) always refuses -- unconditionally, regardless of
-	// BaseAdvancedWithoutRewrite, which says nothing about a DIFFERENT
-	// branch. Split from the base-SHA comparison immediately below
-	// (previously one combined condition) specifically so the ref check
-	// can stay unconditional while the sha check alone gains the
-	// fast-forward tolerance.
-	if in.VerdictBaseRef != in.CurrentBaseRef {
-		return false, ReasonBaseMoved, false
-	}
-	// The base SHA changed under an UNCHANGED ref -- refuse UNLESS the
-	// caller has positively confirmed (BaseAdvancedWithoutRewrite) this
-	// was an ordinary, unrelated fast-forward: "any unrelated merge to
-	// trunk permanently disqualifies a verdict" is exactly the failure D3
-	// exists to close, and BaseAdvancedWithoutRewrite's own doc comment
-	// covers why this is a strict widening, never a loosening, of what
-	// this engine already refuses.
-	if in.VerdictBaseSHA != in.CurrentBaseSHA && !in.BaseAdvancedWithoutRewrite {
-		return false, ReasonBaseMoved, false
-	}
-	// Round-11 finding A1: an unknown link (SHA == "") on EITHER side is
-	// refused here, on its own dedicated reason, BEFORE the equality
-	// comparison below ever runs -- exactly the same discipline the
-	// VerdictBaseSHA/CurrentBaseSHA empty-string guard above already
-	// applies one level up (finding F2): an unresolved link must never
-	// silently degrade to "no ancestor chain to compare", which the
-	// equality check below would otherwise treat as trivially matching a
-	// genuinely-empty chain on the other side.
-	if ancestorChainHasUnknownLink(in.VerdictAncestorChain) || ancestorChainHasUnknownLink(in.CurrentAncestorChain) {
-		return false, ReasonAncestorChainUnknown, false
-	}
-	if !ancestorChainEqual(in.VerdictAncestorChain, in.CurrentAncestorChain, in.AncestorChainAdvancedWithoutRewrite) {
-		return false, ReasonAncestorChainChanged, false
-	}
-	if in.VerdictPolicyVersion != CurrentPolicyVersion {
-		return false, ReasonPolicyVersionMismatch, false
+	// The freshness prefix (doc.go, items 2 to 4): assessed, head, context,
+	// base, ancestor chain, policy version -- CheckFreshness (freshness.go),
+	// the one comparison of a verdict's recorded context against live
+	// facts, which a session's result also runs. Called right after the
+	// escape hatch above, so every freshness refusal is exactly
+	// CheckFreshness's answer, in its order, before anything below reads
+	// in.Verdict at all.
+	if reason := CheckFreshness(in.Freshness()); reason != ReasonNone {
+		return false, reason, false
 	}
 	// EligibilityInput.CIConclusionDegraded's own doc comment: CIGreen is
 	// already false whenever this is true, so this check changes no

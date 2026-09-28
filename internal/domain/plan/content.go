@@ -68,7 +68,21 @@ type ContentEvent struct {
 }
 
 // ExtractContent recovers the final, rendered assistant text of ONE
-// plan-mode turn's own streamed output from events (a session's own event
+// plan-mode turn's own streamed output: FinalText's text, or
+// ContentFallbackText when FinalText finds none. See FinalText for the
+// window, the bounds, and which text is the turn's final one.
+//
+// Never fails: finding nothing in-window returns ContentFallbackText,
+// exactly like the original best-effort extraction this generalizes.
+func ExtractContent(events []ContentEvent, lowerBoundEventID, upperBoundEventID *int64) string {
+	if text, ok := FinalText(events, lowerBoundEventID, upperBoundEventID); ok {
+		return text
+	}
+	return ContentFallbackText
+}
+
+// FinalText recovers the final, rendered assistant text of ONE turn's
+// own streamed output from events (a session's own event
 // log, scanned NEWEST-EVENT-FIRST -- callers MUST supply it already sorted
 // that way, mirroring EventStore.ListRecentForSession's own descending-id
 // query; this function never sorts).
@@ -120,9 +134,15 @@ type ContentEvent struct {
 // reached the log -- has no text to offer and is passed over, exactly as
 // an empty row always was.
 //
-// Never fails: finding nothing in-window returns ContentFallbackText,
-// exactly like the original best-effort extraction this generalizes.
-func ExtractContent(events []ContentEvent, lowerBoundEventID, upperBoundEventID *int64) string {
+// It is the ONE reader of a turn's final text: plan content
+// (ExtractContent, for the plan views, the approval snapshot and the
+// cross-channel notifiers) and a session's result summary (row 182,
+// technical plan §43.20) both read through it, so the two can never
+// disagree about which text a turn ended on. ok is false when no text part
+// in the window has any text; text is then "", and the caller says so its
+// own way (ExtractContent with ContentFallbackText, the result with a null
+// summary). Never fails.
+func FinalText(events []ContentEvent, lowerBoundEventID, upperBoundEventID *int64) (text string, ok bool) {
 	type textPart struct {
 		firstID  int64 // its oldest in-window frame, empty or not
 		hasText  bool  // whether any in-window frame of it is non-empty
@@ -160,7 +180,7 @@ func ExtractContent(events []ContentEvent, lowerBoundEventID, upperBoundEventID 
 		}
 	}
 	if last == nil {
-		return ContentFallbackText
+		return "", false
 	}
-	return last.text
+	return last.text, true
 }

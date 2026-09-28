@@ -1042,7 +1042,17 @@ recomputes is not sharing a source of truth with the others, it is a second one,
 without anything reporting it — the failure §5.1 exists to prevent for session state, asked here of
 review state. Where a consumer needs live facts the verdict cannot carry (the PR's current head, its
 current CI conclusion), it reads them live and compares them against the recorded context; it never
-folds them back into the record.
+folds them back into the record. The comparison exists once, so no two consumers can compare
+differently: `autoapproval.CheckFreshness` is the freshness prefix of the eligibility engine, which calls
+it, so every consumer of eligibility -- the decision inbox included -- compares through it. The live read
+is shared by two consumers only: `reviewfreshness.ReadLive` reads the facts the comparison needs (the base
+branch's live tip, the ancestor link's, and whether each moved only forward) for the merge path's
+revalidation and for a session's result (§43.20, row 182), which also reads the pull request itself live,
+as the auto-merge worker does, and runs the merge path's own probe on it. The decision inbox's read model
+(`decisioninbox`'s `computeRealEligibility`) still assembles the same facts itself, through its TTL cache,
+and handles a failed call differently -- it blanks the value, marks the read degraded and carries on to the
+comparison, where `ReadLive` stops and names the step -- so a change to `ReadLive` does not reach it.
+Routing the inbox through `ReadLive` is a follow-up recorded on row 182.
 
 **Publication is concurrent, and the losing writer must know it lost.** Two attempts can be in
 flight for one pull request, and a base can move under an unchanged head, so the record a publisher
@@ -6716,7 +6726,8 @@ browser cookie. Row 181 replaced the cookie with a bearer token from Narvi's own
 server and made the tool list depend on the token's scopes (§43.13–§43.19), which is what makes the surface
 reachable by a real client. Everything past that is later rows' own work, not this section's: 182 adds
 a session's live status and its transcript paging (piece (a), §43.20), the bounded wait (piece (b),
-§43.20), then the result/verdict tools; 183 adds plan read/approve/reject,
+§43.20), and a session's result -- its last run, the pull requests it produced, and each one's verdict
+with its freshness or its absence (piece (c), §43.20); 183 adds plan read/approve/reject,
 prompt-while-running, stop, and delegate (create session). Repository discovery (`narvi_list_repositories`)
 is deliberately absent from 180 too: this codebase has no `GET /api/repos` route for it to sit over,
 and the one-adapter rule (§43.7) means a tool ships only once its HTTP twin exists.
@@ -7587,7 +7598,7 @@ every call is still governed by the narrowed role.
 ### 43.17 Scopes and discovery gating
 
 The scope vocabulary is `internal/domain/mcpscope`: `mcp:read` covers every read-only tool (180's three
-and 182's status, wait and transcript, §43.20), `mcp:write` will cover every state-changing tool and implies `mcp:read`. A scope is advertised
+and 182's status, wait, result and transcript, §43.20), `mcp:write` will cover every state-changing tool and implies `mcp:read`. A scope is advertised
 — in `scopes_supported`, in the 401 challenge, and as acceptable at the authorization endpoint — only
 when at least one registered tool requires it, so today exactly `mcp:read` is offered and `mcp:write` is
 refused as `invalid_scope`; no contract promises a scope nothing consumes. Repository restriction is not
@@ -7711,8 +7722,9 @@ named here is `controlplane.Build`'s own; they differ in their flags and in the 
 endpoints' brakes, which one of them alone lifts: the shared router of `EndToEnd_SDKClient`,
 `RefreshAfterAccessTokenExpires_NoSecondConsent`, `RevokedAuthorizationStopsOnNextCall_User`, `_Admin`,
 `_RFC7009`, `_ClientDeleted` and `_DisabledUser`, `DisabledClientIs401NextCall`,
-`ScopelessGrant_ToolsListEmpty`, §43.20's `SessionStatusAndTranscript_SDKClient` and
-`SessionStatusAndTranscript_ScopelessGrantSeesNeither`, `Register_DisabledByDefault` and
+`ScopelessGrant_ToolsListEmpty`, §43.20's `SessionStatusAndTranscript_SDKClient`,
+`SessionStatusAndTranscript_ScopelessGrantSeesNeither`, `SessionResult_SDKClient` and
+`SessionResult_ScopelessGrantDoesNotSeeIt`, `Register_DisabledByDefault` and
 `MetadataDocument_ProductionGuardRefusesLoopback`, whose many SDK clients all dial from one loopback
 address and would otherwise meet the brakes whenever they ran faster than the brakes refill. Every other
 router keeps the shipped brakes — among them the one with dynamic registration on, which serves
@@ -7731,11 +7743,12 @@ no consent, the refresh token kept and still good; and `Authorize_PendingCapRefu
 with concurrent authorizations from as many networks and finds exactly the cap stored, and one refusal
 line per refused request, naming that request's network.
 
-### 43.20 A session's live status, and its transcript apart from it
+### 43.20 A session's live status, its result, and its transcript apart from them
 
-Row 182's first two pieces: (a), the status and the transcript, which this opening and the tables
-after it specify, and (b), the bounded wait for a session to settle, specified under its own heading
-below. A client that polls hard gets rate-limited into looking broken, and a
+Row 182's three pieces: (a), the status and the transcript, which this opening and the tables
+after it specify; (b), the bounded wait for a session to settle; and (c), the result -- the last run,
+the pull requests the session produced, and each one's verdict with its freshness or its absence --
+each specified under its own heading below. A client that polls hard gets rate-limited into looking broken, and a
 client that reads the wrong field sees a busy session as idle. `sessions.status` is that wrong field
 for "what is it doing now": it is re-derived only when a turn reaches a terminal state (§3.1's
 derivation, run by the session actor on completion, deadline, abandon and the terminal-grace
@@ -7921,9 +7934,10 @@ remote accepted the update: the stamp clears on the `push_error`, and the head h
 It matters only where the re-review can fire (the repository opted in, the budget not spent); elsewhere
 the fire declines and the status is right to read settled. What a client sees: once the webhook lands,
 `scheduled`, then `queued` and `running` once the fire inserts the review turn — a session that read
-settled reads unsettled again with no new input from anyone. Row 182's result (c) is specified to report
-each pull request's verdict with its freshness, its recorded context compared with the pull request's
-live head (§21.1b), so a verdict produced before the push does not read as fresh there. Review round 4
+settled reads unsettled again with no new input from anyone. Row 182's result (c) reports each pull
+request's verdict with its freshness, its recorded context compared with the pull request's live head
+(§21.1b), so a verdict produced before the push does not read as fresh there
+(`TestResult_OwnPushMovedHeadIsNotCurrent`, piece (c) below). Review round 4
 closed the gap by performing the webhook's write in the transaction that persists `push_complete`;
 review round 5 reverted that entirely, because it changed what §24 does and how its webhook locks: the
 actor's transaction and the webhook's took the session row and the pull request's row in opposite orders
@@ -8040,9 +8054,7 @@ tool, with the route's own page size (100 by default, clamped at 500 — decisio
 `Session.status`'s now say that `status` does not show queued or running work (`Session.status`'s
 lists which of its five values a queued or running turn can sit under: any of them) and point at the
 status route. The adapter gains two `Twins` fields and two table rows, nothing else: its import ban is
-unchanged. The bounded wait (b) is the next part of this section. The result (c) is not here: the last
-run's summary, the pull requests the session produced, and each one's verdict with its freshness or its
-absence.
+unchanged. The bounded wait (b) is the next part of this section, and the result (c) the one after it.
 
 **The bounded wait (piece (b)).** A client that wants to know when a session is done should not poll:
 `GET /api/sessions/{sessionID}/status?waitSeconds=N` is the status route's blocking form, and
@@ -8265,3 +8277,211 @@ answer `capacity` at once, another member's wait runs to its bound), `…/Wait_S
 `finished`) and `…/Wait_ShutdownInterruptsPromptly_RunServer` (`newHTTPServer` on a real listener:
 `Shutdown` answers the blocked wait `interrupted` and drains at once); `TestBuild_MCPSurface_TwinParity`
 pins the wait's wiring too.
+
+**The result (piece (c)).** State, summarised result and detailed transcript are three separate reads,
+and the result is the second: `GET /api/sessions/{sessionID}/result` answers `SessionOutcome`, and
+`narvi_get_session_result` is its tool -- `mcp:read`, the four §43.8 annotations (`openWorldHint` stays
+`false`, owner decision D11: its domain is this deployment's sessions, even though one field is read from
+the code host), a bridge like the rest. The same gate as `GET /api/sessions/{sessionID}`: signed in,
+`400` for a malformed id, `404` for a session that does not exist, no per-session visibility. The verdict
+data it copies is what the code-review view (`GET /api/sessions/{sessionID}/review`) shows every role,
+read the same way. The adapter gains one `Twins` field and one table row; its import ban is unchanged.
+
+| Field | What it is |
+|---|---|
+| `activity` | the status's own `activity`, from the status's own statement and derivation in the same snapshot: whether the session can still change this result (the review of a pull request it opened can too; `suggestedDelaySeconds` says so) |
+| `lastRun` | the newest terminal turn: `outcome`, `failureReason` (the status's one rule, `lastRunFailureReasonValue`), `startedAt`, `finishedAt`, `costUsd` (`turns.cost_usd`, a number as `WorkflowStepRun.costUsd` renders it), `planMode`, `summary` |
+| `summary` | the run's final text and `truncated` -- never model-written (owner decision D7) |
+| `pullRequests` | the pull requests the session opened (its `pr` artifacts), oldest first, each with its `review` |
+| `excludedPullRequests` | the session's `pr` artifacts that name no pull request it opened, oldest first, each with its `kind` (`shadow_suppressed` or `unreadable`) and `reason` -- never dropped, never failing the result |
+| `reviewedPullRequest` | the pull request the session is the review session of (its claim), with its `review` |
+| `reviewScope` | `reviewed` when there is such a claim, else `produced` when the session opened one, else `none` |
+| `suggestedDelaySeconds` | how long to wait before reading the result again, from a small table (below) |
+
+`reviewScope` is explicit because an empty list must never read as a clean review: `none` says there is
+nothing to review. The owner of a produced pull request comes from the session's own repository of the
+bare name the artifact records -- `reposource.ParseOwnerRepo` over its URL, the derivation that opened the
+pull request -- and from the pull request's URL only when the session's repositories name none or several.
+
+**Records that name no pull request.** A `pr` artifact is not always a pull request. When a pull request's
+creation is suppressed because egress to its repository is in shadow (§30), the session actor records the
+ref the suppression hands back like any created pull request (`sessionactor`'s `createPRBestEffort`, the
+direct trace of that one hop): number `shadowsentinel.PRNumber`, a `shadow-suppressed://` URL. The result
+recognises it by `shadowscm.IsSyntheticPRRef`, the one predicate every suppressing layer agrees on, and
+lists it in `excludedPullRequests` as `shadow_suppressed`: its repository when the session's repositories
+name the owner, and no URL, since none exists to follow. A row this build cannot resolve -- metadata it
+cannot decode, no repository and number, an owner neither the session's repositories nor the URL names --
+is listed as `unreadable`, with the reason and the URL it holds, and logged at WARN. Neither ever fails
+the result, which answers everything else it read; neither counts toward `reviewScope`. (Round 1 of this
+row's review found that one such row failed the whole result with a 500, for good, since nothing removes
+an artifact; `TestResult_ExcludedPullRequestsNeverFailTheResult` pins the fix.)
+
+Every stored fact comes from one repeatable-read, read-only transaction: the activity facts (the
+session's, and those of the review sessions behind the reviews of the pull requests it opened), the last
+run's turn row and the session's turns, the events, the artifacts, the claims, the review attempts and
+the verdicts -- so the summary is read inside the run's own window as the snapshot saw it, and a review
+state never mixes an attempt from one instant with a verdict from another.
+`TestResult_OneSnapshot_NeverMixesInstants` holds the handler at one lock-point per table its stores
+read -- `sessions`, `turns`, `events`, `artifacts`, `github_pr_sessions`, `review_verdicts` -- each
+reached with the snapshot already taken (the first three are read by the activity facts, the first
+statement, whose snapshot is taken as it starts), commits there a change that store's reads would show,
+and requires the result byte for byte as it was before the change, and a later read to show it. A store
+bound to the pool, a weaker isolation level, or the activity read before the transaction begins each
+fail it. (Round 2 of this row's review found an earlier version locking `review_verdicts` alone, which
+none of the others failed.) The transaction ends before any code-host call; nothing holds a connection
+across one.
+
+**The summary.** It is read by the one reader of a turn's final text, `plan.FinalText` -- the rule plan
+content has used since #334: among the text parts in the run's own window of the event log, the one that
+opened last, read at its newest frame. `plan.ExtractContent` is now `FinalText` with the plan
+placeholder, so the plan views, the approval snapshot, the cross-channel notifiers and the result read
+one rule; the result reports "no text" as `null` rather than the placeholder. The window is
+`turnContentBounds` (the run's dispatch watermark up to the next dispatched turn's) over the session's
+newest `planContentEventFetchLimit` events, as the plan views read it. The text is cut at 4,000
+characters (code points, never inside one), `truncated` saying so; the whole text stays in the events
+route. The spec's owner decision D13 (whether a part's stored row held its first frame, not its last) is
+settled by #334's per-frame storage.
+
+**The review state, from the record.** Each pull request's `review.state` is read, never re-derived,
+from the newest review attempt of its review session (`GetNewestReviewAttempt`: the newest turn with
+`is_review_attempt`), whether that attempt posted (`ExistsForAttempt`), and the latest verdict
+(`GetLatestRecord`, ordered by the producing attempt, owner decision D10: as the code-review view reads it,
+with nothing extra about shadow verdicts) -- `reviewverdict.DeriveReviewStatus`, a pure table:
+
+| `state` | When | `verdict` | `supersededVerdict` |
+|---|---|---|---|
+| `absent` | no verdict on record, no attempt | null | null |
+| `in_progress` | the newest attempt has not ended (a state the turn machine does not know counts as not ended) | null -- a verdict the running attempt already posted is reported once it ends | the latest verdict of an earlier attempt, if any |
+| `not_assessed` | the newest attempt ended without posting | null | the latest earlier verdict, if any -- never the answer |
+| `assessed` | the newest attempt posted, or a verdict is on record with no attempt (recorded before attempts were) | the latest verdict | null |
+
+**Freshness: one comparison, the merge path's order.** `freshness.state` is `not_applicable` for every
+state but `assessed`, and for a pull request its claim records merged -- with no live read, because a
+merged pull request cannot be reopened. The claim's closed stamp decides nothing: the closed webhook writes
+it once and nothing clears it on a reopen, so it says the pull request was closed at some point, not that
+it is closed now; a pull request closed without merging is read live like any other, and the live read
+says when it really is no longer open. Every other verdict's freshness is read live on every call (owner
+decision D6), by `reviewfreshness.Assess`, in the order the merge path runs the same checks:
+
+1. The pull request, read live: `GetOpenPR` with the deployment's bot token, bounded by
+   `GitHubGetOpenPRTimeout`, with the auto-merge worker's own guard against a deadline that cut its
+   composite read short. An error or a timeout is `unconfirmed`; a pull request no longer open is
+   `not_applicable`.
+2. The merge path's own probe (`reviewfreshness.ProbeInput`, the freshness half of `revalidateCore`'s
+   probe): `CheckFreshness` with the pull request's live head and base ref, and its base commit and
+   ancestor chain assumed equal to the recorded ones. A moved head is `stale` here whatever else the
+   verdict recorded; a verdict produced under an older policy version is `stale`; one that recorded no
+   context, or an unknown base commit or ancestor link, is `unconfirmed` -- with no further live read, and
+   with the reason the merge path gives the same pull request. This step can never answer `current`.
+3. `reviewfreshness.ReadLive`: the base branch's live tip, the ancestor link's, and each fast-forward
+   check where one could change the answer, bounded by `DecisionInboxResolveBranchSHATimeout` and
+   `DecisionInboxIsAncestorTimeout`. A fact it cannot establish is `unconfirmed`, naming it.
+4. `CheckFreshness` over the recorded context and those live facts: `current` only when it passes;
+   otherwise `stale` (the base or ancestor chain changed in a way not confirmed forward-only) or
+   `unconfirmed`, by `autoapproval.ClassifyFreshness`, with the comparison's own reason text.
+
+Before round 1 of this row's review, step 2 compared the record with itself and ran first, so a verdict
+with no context whose head had moved read `unconfirmed` here while the merge path said `stale`;
+`TestAssess_AgreesWithTheMergePathOnRecordDecidedVerdicts` now runs every record-decided defect against
+every live head and base ref through both, and requires the same reason.
+
+**The cost of a result call.** Each assessed pull request is read concurrently, each call bounded as above,
+and all of one call's live reads together by `SessionResultLiveReadBudget` (20 seconds, kept below
+`MCPWaitMaxDuration` by `Validate`): the per-call bounds add up to about 70 seconds, and with JSON
+responses nothing is written until the answer, which a proxy's idle timeout would cut first. A read the
+budget cuts short is `unconfirmed`, saying it ran out of time (`reviewfreshness.ReasonOutOfTime`),
+whether it cut the pull request read or a call inside `ReadLive`; a failure never becomes `current`.
+The reads run all at once under one deadline for the call, never one after another or one budget per
+pull request (`TestResult_LiveReadBudgetBoundsTheCall`).
+
+A pull request read is `GetOpenPR`: the pull request itself, then its reviews, its CI conclusion and its
+changed files -- several code-host requests, of which freshness uses only the head, the base ref, the
+ancestor link and whether the pull request is still open. No read on the source-control port yields
+those more narrowly: `GetPRBody` is the body alone, and `ListOpenPRsForUser` lists one person's open
+pull requests. The review readout's `GetPullRequest` is the one request that nearly does: it carries the
+head, the base ref and the stack object the ancestor link comes from (`reviewcontext.Fetch` derives the
+link from it), but not the pull request's state, so it cannot tell an open pull request from a closed or
+merged one, which freshness must report `not_applicable` rather than compare; and it is a GitHub adapter
+method outside the port, which the result -- reading through the port and its shadow decorator -- could
+reach only through a new port method. This row adds none and keeps `GetOpenPR`; a port read of that one
+request, with the state it lacks, is what a narrower read would be. (Round 2 of this row's review found
+an earlier version of this paragraph saying `GetPullRequest` also lacked the stack link. It does not:
+only the missing state and the port boundary rule it out.)
+
+What slows a polling client is the answer's `suggestedDelaySeconds`, from a small table clamped to
+`[SessionResultDelayFloor, SessionResultDelayCeiling]` (30 and 300 seconds): 30 while the result can
+still change on its own -- the session is not settled (its status, or the bounded wait, is the cheap way
+to watch it), or the review session behind the review of a pull request it opened is not, by that
+session's own facts and derivation in the same snapshot, so the review can start, end or run again with
+no new input (an attempt queued or running, the review reading `in_progress`; a re-review scheduled);
+60 once neither holds and a freshness was read live; 300 when nothing was either, as nothing in the
+result then changes without new input -- a prompt, a review requested, a push. A review session whose
+facts cannot be read counts as not settled: the hint errs short, and never fails the result. (Round 2
+of this row's review found a produced pull request's running review answered 300, the value whose stated
+reason -- nothing changes without new input -- was false there.) The floor sits above the budget, so a
+client that follows the hint never overlaps its own live reads. No rate limit is added here: owner
+decision D5 defers one on the MCP surface to row 183.
+
+The comparison and the read are the merge path's own, not copies of them (§21.1b): `CheckFreshness` is the
+freshness prefix of `computeEligibleCore`, moved out verbatim and called by it right after the
+needs-human escape hatch (a human override, not a freshness fact, so it stays first); `ReadLive` is the
+live-fact assembly moved out of `decisioninbox.revalidateCore` -- the same calls in the same order, with
+the same skip conditions and timeouts -- which reports the step that failed, so the merge path keeps its
+own refusal reason and log line for each, byte for byte. The decision inbox's cached read model is not
+among its callers (§21.1b): it still assembles the same facts itself, which row 182 records as a
+follow-up. That refactor changed no behaviour of the merge path: every eligibility, revalidation,
+decision-inbox, auto-merge and merge-endpoint test passes, by name, before and after it. `TestCheckFreshness_EquivalentToEligibilityPrefix` runs every input of the
+eligibility tables, and an exhaustive product of the freshness fields, through both, and two structural
+tests pin that `computeEligibleCore` compares no freshness field itself and that `revalidateCore` makes no
+base or ancestry call of its own.
+
+The stated limit above -- a review session's own push moving its pull request's head while the status
+reads settled -- is visible here: the result reads the live head, so the pre-push verdict is `stale`
+while the status still reads `finished` (`TestResult_OwnPushMovedHeadIsNotCurrent`).
+
+**Tests of the result.** Domain: `TestCheckFreshness_EquivalentToEligibilityPrefix`,
+`TestCheckFreshness_EveryReason`, `TestComputeEligibleCore_ComparesFreshnessOnlyThroughCheckFreshness`,
+`TestClassifyFreshness_EveryReason`, `TestDeriveReviewStatus_Table`, `TestFinalText` (the part that opened
+last, not the newest row; the placeholder text itself is still found text). App: `TestReadLive_Table`
+(every fact, every call in order and only where it can change the answer, each call's bound, where it
+stops), `TestAssess_Table` (the pull request read alone for what the probe decides, a moved head
+included), `TestAssess_PartialReadTimeoutIsUnconfirmed`, `TestAssess_OutOfTimeSaysSo`,
+`TestAssess_OutOfTimeDuringReadLiveSaysSo` (the caller's deadline passing at each `ReadLive` call says
+out of time; the call's own bound passing first keeps the step's reason),
+`TestAssess_NeverCurrentWithoutLiveConfirmation`, `TestRevalidateCore_ReadsLiveFactsOnlyThroughReviewFreshness`,
+and, on real Postgres against the merge path itself, `TestAssess_AgreesWithTheMergePathOnRecordDecidedVerdicts`.
+Platform: `TestDefaultTimeouts_SessionResultFields`, `TestTimeouts_Validate_SessionResult`.
+REST, on real Postgres with a fake code host: `TestResult_ReviewStatus_Table` (absent, in progress and not
+assessed with the older verdict superseded, head moved, read failed, policy bumped and no context
+recorded each decided by the probe on the pull request read alone, no context with the head moved
+`stale`, current, merged per the claim with no live read, closed without merging then reopened read live
+and `current`, closed and still closed `not_applicable` from the live read, base moved forward, base
+rewritten, retargeted onto another base at the same commit, stacked since the verdict, no longer open;
+and `reviewScope` `none` with an empty list and a null reviewed pull request),
+`TestResult_NeverCurrentWithoutLiveConfirmation`, `TestResult_OwnPushMovedHeadIsNotCurrent`,
+`TestResult_LastRunFailureReasonOnlyWhenDerivable` (and the status's own answer for the same session),
+`TestResult_SummaryBoundedAndNoTranscript` (exactly `SessionOutcome`'s keys; the last-opened part, never
+a later turn's text; cut at 4,000 characters; exactly 4,000 not truncated; no text null),
+`TestResult_ProducedPRRepoFullNameFromSessionRepos`, `TestResult_UnknownAndMalformedSession`,
+`TestResult_ExcludedPullRequestsNeverFailTheResult` (the production shadow decorator's own suppressed
+creation, alone and beside a real pull request whose verdict still reads live, and a garbage row: 200
+every time, each listed explicitly; and four such records at once -- both suppressing layers' shapes and
+two unreadable rows, among two real pull requests: every one listed, oldest first),
+`TestResult_LiveReadBudgetBoundsTheCall` (a code host that stops answering, at the pull request read or
+inside `ReadLive`, holds the call for the budget, not the per-read bounds: both reads begin before it
+runs out, run at once, and share one deadline), `TestResult_SuggestedDelay` (each row of the table, and
+a produced pull request's review running, queued or scheduled to run again: 30),
+`TestResult_OneSnapshot_NeverMixesInstants` (one lock-point per table),
+`TestResult_LastRunValues` (`costUsd`, `planMode`,
+`startedAt` and `finishedAt` by value); unit, `TestReadPRArtifact_Table`, `TestMergedPerClaim_Table`,
+`TestResultReadDelay_Table`. MCP:
+`TestEveryToolHasARegisteredTwin`, the tool-list golden, `TestToolsList_ScopeFilter_Table`,
+`TestHiddenToolCall_IsIndistinguishableFromUnknownTool`, `TestResultOutputSchema_HasNoEvents`,
+`TestToolCall_GetSessionResult_ReachesTheResultTwin`, `TestParity_BearerEqualsCookieForEveryRole` (the
+caller's session, another user's review session whose verdict the fake code host confirms `current`, an
+unknown one, every role). On the production router, through the official SDK client:
+`TestOAuth_ProductionRouter/SessionResult_SDKClient` (the tool's bytes are the REST twin's) and
+`…/SessionResult_ScopelessGrantDoesNotSeeIt`; `TestBuild_MCPSurface_TwinParity` pins the wiring. That
+router's source control is the real code host adapter, so its seed resolves every review from the record
+alone -- absent, not assessed, merged per the claim -- and carries a suppressed creation; the live read is
+proven against the fake code host above.

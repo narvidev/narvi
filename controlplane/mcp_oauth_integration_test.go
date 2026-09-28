@@ -721,7 +721,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 
 	// The exit criterion end to end (§43.19): the official SDK client
 	// discovers everything from one live 401, the member approves on the
-	// consent page, and the resulting token lists exactly the six tools
+	// consent page, and the resulting token lists exactly the seven tools
 	// and calls one with the same bytes the REST twin gives the member's
 	// own cookie. The SDK's own RFC 9207 issuer check passes along the way.
 	t.Run("EndToEnd_SDKClient", func(t *testing.T) {
@@ -755,7 +755,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 			t.Fatalf("consent flow ran %d times, want 1", n)
 		}
 
-		want := []string{"narvi_get_session", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions", "narvi_wait_for_session"}
+		want := []string{"narvi_get_session", "narvi_get_session_result", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions", "narvi_wait_for_session"}
 		if got := toolNames(ctx, t, flow.session); strings.Join(got, ",") != strings.Join(want, ",") {
 			t.Fatalf("ListTools = %v, want %v", got, want)
 		}
@@ -1175,6 +1175,18 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 	t.Run("SessionStatusAndTranscript_ScopelessGrantSeesNeither", func(t *testing.T) {
 		sdkSessionStatusAndTranscriptScopeless(t, rig)
 	})
+	// Row 182's piece (c), on this same shared router (technical plan
+	// §43.20): the result tool answers its twin's bytes through the
+	// official SDK client, with no transcript, and a grant without
+	// mcp:read is told it does not exist. Every pull request seeded
+	// resolves its review from the record alone: this router's source
+	// control is the real code host adapter, which no test may reach.
+	t.Run("SessionResult_SDKClient", func(t *testing.T) {
+		sdkSessionResult(t, rig)
+	})
+	t.Run("SessionResult_ScopelessGrantDoesNotSeeIt", func(t *testing.T) {
+		sdkSessionResultScopeless(t, rig)
+	})
 
 	// Row 182's piece (b), the bounded wait (§43.20), and the row's own
 	// exit: on a router of its own whose wait polls every 100 ms
@@ -1306,7 +1318,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SDK Connect with a metadata document: %v", err)
 		}
-		want := []string{"narvi_get_session", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions", "narvi_wait_for_session"}
+		want := []string{"narvi_get_session", "narvi_get_session_result", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions", "narvi_wait_for_session"}
 		if got := toolNames(ctx, t, flow.session); strings.Join(got, ",") != strings.Join(want, ",") {
 			t.Fatalf("ListTools = %v, want %v", got, want)
 		}
@@ -1358,8 +1370,8 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SDK Connect with dynamic registration: %v", err)
 		}
-		if got := toolNames(ctx, t, flow.session); len(got) != 6 {
-			t.Fatalf("ListTools = %v, want the six tools", got)
+		if got := toolNames(ctx, t, flow.session); len(got) != 7 {
+			t.Fatalf("ListTools = %v, want the seven tools", got)
 		}
 		if res, err := callListModels(ctx, flow.session); err != nil || res.IsError {
 			t.Fatalf("CallTool narvi_list_models: res %+v err %v", res, err)

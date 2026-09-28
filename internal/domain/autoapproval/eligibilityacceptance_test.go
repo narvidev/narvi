@@ -15,14 +15,7 @@ func TestComputeEligibleWithAcceptance_AcceptedFalseMatchesComputeEligible(t *te
 	t.Parallel()
 
 	cfg := autoapproval.DefaultEligibilityConfig()
-	cases := map[string]autoapproval.EligibilityInput{
-		"clean":                cleanInput(),
-		"not shippable auto":   withVerdict(cleanInput(), func(v review.Verdict) review.Verdict { v.Shippable = review.ShippableNeedsHuman; return v }),
-		"diff too large":       withChangedFileCount(cleanInput(), 999),
-		"ci not green":         withCIGreen(cleanInput(), false),
-		"sensitive path":       withTouchedBlastRadius(cleanInput(), []review.Tag{review.TagAuth}),
-		"blast radius unknown": withTouchedBlastRadiusKnown(cleanInput(), false),
-	}
+	cases := acceptedFalseCases()
 	for name, in := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -38,6 +31,19 @@ func TestComputeEligibleWithAcceptance_AcceptedFalseMatchesComputeEligible(t *te
 	}
 }
 
+// acceptedFalseCases is TestComputeEligibleWithAcceptance_AcceptedFalseMatchesComputeEligible's
+// table, a function of its own for TestCheckFreshness_EquivalentToEligibilityPrefix.
+func acceptedFalseCases() map[string]autoapproval.EligibilityInput {
+	return map[string]autoapproval.EligibilityInput{
+		"clean":                cleanInput(),
+		"not shippable auto":   withVerdict(cleanInput(), func(v review.Verdict) review.Verdict { v.Shippable = review.ShippableNeedsHuman; return v }),
+		"diff too large":       withChangedFileCount(cleanInput(), 999),
+		"ci not green":         withCIGreen(cleanInput(), false),
+		"sensitive path":       withTouchedBlastRadius(cleanInput(), []review.Tag{review.TagAuth}),
+		"blast radius unknown": withTouchedBlastRadiusKnown(cleanInput(), false),
+	}
+}
+
 // TestComputeEligibleWithAcceptance_WaivesOnlyShippableAndDiffSize is
 // this file's own core coverage: accepted=true waives EXACTLY
 // ReasonNotShippableAuto and ReasonDiffTooLarge, and every other
@@ -50,13 +56,37 @@ func TestComputeEligibleWithAcceptance_WaivesOnlyShippableAndDiffSize(t *testing
 
 	cfg := autoapproval.DefaultEligibilityConfig()
 
-	tests := []struct {
-		name          string
-		in            autoapproval.EligibilityInput
-		wantEligible  bool
-		wantReason    autoapproval.Reason
-		wantViaAccept bool
-	}{
+	tests := waivesOnlyCases()
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			gotEligible, gotReason, gotVia := autoapproval.ComputeEligibleWithAcceptance(tc.in, cfg, true)
+			if gotEligible != tc.wantEligible {
+				t.Errorf("eligible = %v, want %v", gotEligible, tc.wantEligible)
+			}
+			if gotReason != tc.wantReason {
+				t.Errorf("reason = %q, want %q", gotReason, tc.wantReason)
+			}
+			if gotVia != tc.wantViaAccept {
+				t.Errorf("viaAcceptance = %v, want %v", gotVia, tc.wantViaAccept)
+			}
+		})
+	}
+}
+
+// waivesOnlyCase is one row of TestComputeEligibleWithAcceptance_WaivesOnlyShippableAndDiffSize's
+// table, a function of its own for TestCheckFreshness_EquivalentToEligibilityPrefix.
+type waivesOnlyCase struct {
+	name          string
+	in            autoapproval.EligibilityInput
+	wantEligible  bool
+	wantReason    autoapproval.Reason
+	wantViaAccept bool
+}
+
+func waivesOnlyCases() []waivesOnlyCase {
+	return []waivesOnlyCase{
 		{
 			name:          "clean input: eligible, but not because of any waiver",
 			in:            cleanInput(),
@@ -153,22 +183,6 @@ func TestComputeEligibleWithAcceptance_WaivesOnlyShippableAndDiffSize(t *testing
 			wantViaAccept: false,
 		},
 	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			gotEligible, gotReason, gotVia := autoapproval.ComputeEligibleWithAcceptance(tc.in, cfg, true)
-			if gotEligible != tc.wantEligible {
-				t.Errorf("eligible = %v, want %v", gotEligible, tc.wantEligible)
-			}
-			if gotReason != tc.wantReason {
-				t.Errorf("reason = %q, want %q", gotReason, tc.wantReason)
-			}
-			if gotVia != tc.wantViaAccept {
-				t.Errorf("viaAcceptance = %v, want %v", gotVia, tc.wantViaAccept)
-			}
-		})
-	}
 }
 
 // TestComputeEligibleWithAcceptance_EveryCriterionEnumerated pins finding
@@ -204,11 +218,84 @@ func TestComputeEligibleWithAcceptance_EveryCriterionEnumerated(t *testing.T) {
 
 	cfg := autoapproval.DefaultEligibilityConfig()
 
-	tests := []struct {
-		reason        autoapproval.Reason
-		in            autoapproval.EligibilityInput
-		wantWaiveable bool
-	}{
+	tests := everyCriterionCases()
+
+	seen := make(map[autoapproval.Reason]bool, len(tests))
+	for _, tc := range tests {
+		seen[tc.reason] = true
+	}
+	// allKnownReasons mirrors eligibility.go's own const block verbatim,
+	// EXCLUDING ReasonNone (not a refusal reason at all -- nothing to
+	// waive). Asserted against `tests` above so a Reason added to
+	// eligibility.go without a corresponding row here fails LOUDLY,
+	// rather than this test silently proving less than its own doc
+	// comment claims.
+	allKnownReasons := []autoapproval.Reason{
+		autoapproval.ReasonNeedsHumanLabel,
+		autoapproval.ReasonNotAssessed,
+		autoapproval.ReasonStaleVerdict,
+		autoapproval.ReasonContextUnknown,
+		autoapproval.ReasonBaseMoved,
+		autoapproval.ReasonAncestorChainChanged,
+		autoapproval.ReasonAncestorChainUnknown,
+		autoapproval.ReasonPolicyVersionMismatch,
+		autoapproval.ReasonBaseSHAUnknown,
+		autoapproval.ReasonCIConclusionDegraded,
+		autoapproval.ReasonCINotGreen,
+		autoapproval.ReasonNotShippableAuto,
+		autoapproval.ReasonDiffTooLarge,
+		autoapproval.ReasonBlastRadiusUnknown,
+		autoapproval.ReasonSensitivePathTouched,
+	}
+	for _, r := range allKnownReasons {
+		if !seen[r] {
+			t.Fatalf("Reason %q is not covered by this test's own table -- add a row for it", r)
+		}
+	}
+	if len(tests) != len(allKnownReasons) {
+		t.Fatalf("tests has %d entries, allKnownReasons has %d -- keep them in exact 1:1 correspondence", len(tests), len(allKnownReasons))
+	}
+
+	for _, tc := range tests {
+		t.Run(string(tc.reason), func(t *testing.T) {
+			t.Parallel()
+
+			// Sanity: accepted=false must refuse THIS test's own input
+			// with THIS test's own named reason -- otherwise the case
+			// below (accepted=true) would be proving nothing about the
+			// criterion it claims to.
+			baselineEligible, baselineReason := autoapproval.ComputeEligible(tc.in, cfg)
+			if baselineEligible {
+				t.Fatalf("fixture bug: ComputeEligible(accepted=false) = eligible, want refused on %q", tc.reason)
+			}
+			if baselineReason != tc.reason {
+				t.Fatalf("fixture bug: ComputeEligible(accepted=false) reason = %q, want %q -- this input does not isolate the criterion this case claims to", baselineReason, tc.reason)
+			}
+
+			gotEligible, gotReason, gotVia := autoapproval.ComputeEligibleWithAcceptance(tc.in, cfg, true)
+			if tc.wantWaiveable {
+				if !gotEligible || gotReason != tc.reason || !gotVia {
+					t.Errorf("ComputeEligibleWithAcceptance(accepted=true) = (eligible=%v, reason=%q, via=%v), want (true, %q, true) -- %q is one of §21.1b's exactly-two waivable criteria", gotEligible, gotReason, gotVia, tc.reason, tc.reason)
+				}
+			} else {
+				if gotEligible || gotReason != tc.reason || gotVia {
+					t.Errorf("ComputeEligibleWithAcceptance(accepted=true) = (eligible=%v, reason=%q, via=%v), want (false, %q, false) -- %q is NOT waivable and must refuse identically whether or not accepted is true", gotEligible, gotReason, gotVia, tc.reason, tc.reason)
+				}
+			}
+		})
+	}
+}
+
+// everyCriterionCase is one row of TestComputeEligibleWithAcceptance_EveryCriterionEnumerated's
+// table, a function of its own for TestCheckFreshness_EquivalentToEligibilityPrefix.
+type everyCriterionCase struct {
+	reason        autoapproval.Reason
+	in            autoapproval.EligibilityInput
+	wantWaiveable bool
+}
+
+func everyCriterionCases() []everyCriterionCase {
+	return []everyCriterionCase{
 		{
 			reason:        autoapproval.ReasonNeedsHumanLabel,
 			in:            withNeedsHuman(cleanInput(), true),
@@ -286,70 +373,5 @@ func TestComputeEligibleWithAcceptance_EveryCriterionEnumerated(t *testing.T) {
 			in:            withTouchedBlastRadius(cleanInput(), []review.Tag{review.TagAuth}),
 			wantWaiveable: false,
 		},
-	}
-
-	seen := make(map[autoapproval.Reason]bool, len(tests))
-	for _, tc := range tests {
-		seen[tc.reason] = true
-	}
-	// allKnownReasons mirrors eligibility.go's own const block verbatim,
-	// EXCLUDING ReasonNone (not a refusal reason at all -- nothing to
-	// waive). Asserted against `tests` above so a Reason added to
-	// eligibility.go without a corresponding row here fails LOUDLY,
-	// rather than this test silently proving less than its own doc
-	// comment claims.
-	allKnownReasons := []autoapproval.Reason{
-		autoapproval.ReasonNeedsHumanLabel,
-		autoapproval.ReasonNotAssessed,
-		autoapproval.ReasonStaleVerdict,
-		autoapproval.ReasonContextUnknown,
-		autoapproval.ReasonBaseMoved,
-		autoapproval.ReasonAncestorChainChanged,
-		autoapproval.ReasonAncestorChainUnknown,
-		autoapproval.ReasonPolicyVersionMismatch,
-		autoapproval.ReasonBaseSHAUnknown,
-		autoapproval.ReasonCIConclusionDegraded,
-		autoapproval.ReasonCINotGreen,
-		autoapproval.ReasonNotShippableAuto,
-		autoapproval.ReasonDiffTooLarge,
-		autoapproval.ReasonBlastRadiusUnknown,
-		autoapproval.ReasonSensitivePathTouched,
-	}
-	for _, r := range allKnownReasons {
-		if !seen[r] {
-			t.Fatalf("Reason %q is not covered by this test's own table -- add a row for it", r)
-		}
-	}
-	if len(tests) != len(allKnownReasons) {
-		t.Fatalf("tests has %d entries, allKnownReasons has %d -- keep them in exact 1:1 correspondence", len(tests), len(allKnownReasons))
-	}
-
-	for _, tc := range tests {
-		t.Run(string(tc.reason), func(t *testing.T) {
-			t.Parallel()
-
-			// Sanity: accepted=false must refuse THIS test's own input
-			// with THIS test's own named reason -- otherwise the case
-			// below (accepted=true) would be proving nothing about the
-			// criterion it claims to.
-			baselineEligible, baselineReason := autoapproval.ComputeEligible(tc.in, cfg)
-			if baselineEligible {
-				t.Fatalf("fixture bug: ComputeEligible(accepted=false) = eligible, want refused on %q", tc.reason)
-			}
-			if baselineReason != tc.reason {
-				t.Fatalf("fixture bug: ComputeEligible(accepted=false) reason = %q, want %q -- this input does not isolate the criterion this case claims to", baselineReason, tc.reason)
-			}
-
-			gotEligible, gotReason, gotVia := autoapproval.ComputeEligibleWithAcceptance(tc.in, cfg, true)
-			if tc.wantWaiveable {
-				if !gotEligible || gotReason != tc.reason || !gotVia {
-					t.Errorf("ComputeEligibleWithAcceptance(accepted=true) = (eligible=%v, reason=%q, via=%v), want (true, %q, true) -- %q is one of §21.1b's exactly-two waivable criteria", gotEligible, gotReason, gotVia, tc.reason, tc.reason)
-				}
-			} else {
-				if gotEligible || gotReason != tc.reason || gotVia {
-					t.Errorf("ComputeEligibleWithAcceptance(accepted=true) = (eligible=%v, reason=%q, via=%v), want (false, %q, false) -- %q is NOT waivable and must refuse identically whether or not accepted is true", gotEligible, gotReason, gotVia, tc.reason, tc.reason)
-				}
-			}
-		})
 	}
 }

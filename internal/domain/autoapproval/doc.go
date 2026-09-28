@@ -75,6 +75,13 @@
 //     onto a different base, or whose parent moved beneath it via an
 //     actual rewrite, that CurrentHeadSHA alone cannot see.
 //
+//     Items 2 to 4 are the freshness prefix, and they live in ONE exported
+//     function, CheckFreshness (freshness.go), which ComputeEligible calls
+//     right after item 1. It is exported because a session's result (row
+//     182, technical plan §43.20) asks the same question -- is this
+//     verdict still about the code as it stands -- and must get the merge
+//     path's answer, never a second comparison's.
+//
 //  5. EligibilityInput.CIConclusionDegraded must be false -- the live CI
 //     read (check 6 below) must have actually been FULLY performed
 //     before its own answer is trusted for anything: ports.OpenPR.

@@ -204,6 +204,36 @@ func (q *Queries) ExistsNewerReviewAttempt(ctx context.Context, arg ExistsNewerR
 	return has_newer_review_attempt, err
 }
 
+const getNewestReviewAttempt = `-- name: GetNewestReviewAttempt :one
+SELECT id, status, created_at FROM turns
+WHERE session_id = $1 AND is_review_attempt = true
+ORDER BY created_at DESC, id DESC
+LIMIT 1
+`
+
+type GetNewestReviewAttemptRow struct {
+	ID        pgtype.UUID        `json:"id"`
+	Status    TurnStatus         `json:"status"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+// The newest genuine review attempt (is_review_attempt = true, the same
+// gate ExistsNewerReviewAttempt and the review-check outbox apply) in
+// sessionID's own turn history -- its id, state and creation time, never
+// the prompt. Row 182's result (technical plan §43.20) reads a pull
+// request's review state from it: in progress while it has not ended, not
+// assessed once it has ended without ExistsReviewVerdictForAttempt, and
+// assessed once it has posted. Ordered like GetLatestReviewVerdict orders
+// attempts (the producing turn's created_at), id breaking an exact tie so
+// the pick is reproducible. pgx.ErrNoRows means the session has run no
+// review attempt at all.
+func (q *Queries) GetNewestReviewAttempt(ctx context.Context, sessionID pgtype.UUID) (GetNewestReviewAttemptRow, error) {
+	row := q.db.QueryRow(ctx, getNewestReviewAttempt, sessionID)
+	var i GetNewestReviewAttemptRow
+	err := row.Scan(&i.ID, &i.Status, &i.CreatedAt)
+	return i, err
+}
+
 const getPlatformCostSummaryInWindow = `-- name: GetPlatformCostSummaryInWindow :one
 WITH per_session AS (
     SELECT session_id, SUM(cost_usd) AS total
